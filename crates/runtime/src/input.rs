@@ -170,7 +170,31 @@ pub fn press_now(names: &str, hold: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Presses held for a wall-clock duration (control channel `press <b> 4s`):
+/// frame rates differ about sixfold between runs with and without GPU
+/// execution, so holds counted in flips do not transfer between them.
+static LIVE_TIMED: parking_lot::Mutex<Vec<(std::time::Instant, Step)>> = parking_lot::Mutex::new(Vec::new());
+
+/// Presses `names` from now for `dur`.
+pub fn press_for(names: &str, dur: std::time::Duration) -> Result<(), String> {
+    let steps = parse_script(&format!("0:{names}:1"))?;
+    let now = std::time::Instant::now();
+    let mut live = LIVE_TIMED.lock();
+    live.retain(|x| x.0 > now);
+    live.extend(steps.into_iter().map(|s| (now + dur, s)));
+    Ok(())
+}
+
 fn scripted(st: &mut PadState, flip: u64) {
+    let now = std::time::Instant::now();
+    for (until, step) in LIVE_TIMED.lock().iter() {
+        if now < *until {
+            st.buttons |= step.buttons;
+            for &s in &step.sticks {
+                apply_stick(st, s);
+            }
+        }
+    }
     for step in LIVE.lock().iter() {
         if flip >= step.flip && flip < step.flip + step.hold {
             st.buttons |= step.buttons;

@@ -435,6 +435,9 @@ pub fn finalize(m: &LoadedModule) -> Result<PatchStats, String> {
     if m.code.1 > m.code.0 {
         p.patch_raw_fs_zero(m.code.1 - m.base, &mut stats);
     }
+    if m.is_main {
+        crate::exception::install_text_hooks(&mut p, &ranges);
+    }
     let tramp_used = p.tramp_used;
     // Protections. Segments can share a page (PS5: the end of .bss and the
     // no-access dynamic-link data), so each page gets the union of the

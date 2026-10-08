@@ -173,11 +173,13 @@ fn prune_runs(runs: &Path, keep: usize) {
 
 /// Development control channel (`--control <file>`): executes complete lines
 /// appended to the file since the last poll.
-///   press <buttons> [hold]   e.g. `press down`, `press cross 10`, `press ls_up+r1 30`
+///   press <buttons> [hold]   e.g. `press down`, `press cross 10`, `press ls_up+r1 30`; the hold
+///                            is in flips (default 6), or wall-clock with a suffix: `4s`, `300ms`
 ///   shot <name>              screenshot of the next presented flip -> shot_<name>.png
 ///   dump                     dump all GPU images at the next flip
 ///   trace                    log every draw/dispatch of an upcoming flip (FRAME lines)
 ///   loglevel trace|debug|info  change logging at run time (trace = every HLE call)
+///   textreset                log text-hook strings again (`DS_TEXT_HOOK`)
 ///   quit                     orderly shutdown
 fn poll_control(path: &Path, offset: &mut u64) {
     use std::io::{Read, Seek, SeekFrom};
@@ -202,8 +204,17 @@ fn poll_control(path: &Path, offset: &mut u64) {
         let result = match cmd {
             "press" => {
                 let names = parts.next().unwrap_or("");
-                let hold = parts.next().and_then(|h| h.parse().ok()).unwrap_or(6);
-                input::press_now(names, hold)
+                match parts.next() {
+                    Some(h) if h.ends_with("ms") => match h.trim_end_matches("ms").parse::<u64>() {
+                        Ok(ms) => input::press_for(names, Duration::from_millis(ms)),
+                        Err(_) => Err(format!("bad hold '{h}'")),
+                    },
+                    Some(h) if h.ends_with('s') => match h.trim_end_matches('s').parse::<f64>() {
+                        Ok(s) if s > 0.0 && s < 3600.0 => input::press_for(names, Duration::from_secs_f64(s)),
+                        _ => Err(format!("bad hold '{h}'")),
+                    },
+                    h => input::press_now(names, h.and_then(|h| h.parse().ok()).unwrap_or(6)),
+                }
             }
             "shot" => {
                 let name: String = parts.next().unwrap_or("x").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
@@ -237,6 +248,10 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 // Text for a pending system IME dialog (e.g. the character name).
                 let text = line.trim_start().strip_prefix("ime").unwrap_or("").trim().to_string();
                 *hle::libs::ime_dialog::CONTROL_TEXT.lock() = Some(text);
+                Ok(())
+            }
+            "textreset" => {
+                exception::text_reset();
                 Ok(())
             }
             "stacks" => {
