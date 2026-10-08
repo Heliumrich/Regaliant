@@ -172,12 +172,119 @@ fn compare(func: u32, value: u64, reference: u64) -> bool {
 static LAST_WRITE: parking_lot::Mutex<Option<std::collections::HashMap<u64, (String, u64, u64)>>> = parking_lot::Mutex::new(None);
 
 fn note_write(queue: &str, addr: u64, value: u64, at: u64) {
-    let mut g = LAST_WRITE.lock();
-    let m = g.get_or_insert_with(Default::default);
-    if m.len() > 1 << 16 {
-        m.clear();
+    {
+        let mut g = LAST_WRITE.lock();
+        let m = g.get_or_insert_with(Default::default);
+        if m.len() > 1 << 16 {
+            m.clear();
+        }
+        m.insert(addr & !7, (queue.to_string(), value, at));
     }
-    m.insert(addr & !7, (queue.to_string(), value, at));
+    latch_waits(addr & !7, 8);
+    label_event(queue, b'W', addr, value, 0, at);
+}
+
+/// A WAIT_REG_MEM in progress. Hardware polls continuously, so a label one
+/// queue sets is seen by a queue already waiting on it even if the CPU
+/// resets it soon after (the title resets per-frame labels while building
+/// the next frame). Our pollers sleep between checks and missed such
+/// short-lived values, leaving every queue waiting on another (runs
+/// 20261008-185032, -204128, -210312). CP writes therefore evaluate the
+/// waits on the written word at once and latch the ones they satisfy.
+struct ActiveWait {
+    addr: u64,
+    wide: bool,
+    func: u32,
+    mask: u64,
+    reference: u64,
+    hit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+static ACTIVE_WAITS: parking_lot::Mutex<Vec<ActiveWait>> = parking_lot::Mutex::new(Vec::new());
+/// Waits satisfied by a latched CP write whose value was gone by the time
+/// the waiter looked again (diagnostics).
+pub static LATCHED: AtomicU64 = AtomicU64::new(0);
+
+/// Latches the active waits overlapping [addr, addr+bytes) that the
+/// current memory contents satisfy (called right after a CP write).
+fn latch_waits(addr: u64, bytes: u64) {
+    let g = ACTIVE_WAITS.lock();
+    for w in g.iter() {
+        let n = if w.wide { 8 } else { 4 };
+        if w.addr < addr + bytes && addr < w.addr + n {
+            let v = if w.wide { unsafe { rd64(w.addr) } } else { (unsafe { rd32(w.addr) }) as u64 };
+            if compare(w.func, v & w.mask, w.reference & w.mask) {
+                w.hit.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+/// Label activity of all queues (CP writes, waits) on addresses some
+/// WAIT_REG_MEM polls: a flight recorder dumped for the label when a wait
+/// stalls. A value that changes between CP events was written by the CPU
+/// (or by shader work).
+struct LabelEvent {
+    us: u64,
+    queue: String,
+    /// W = CP write, I = wait satisfied at once, S = wait blocks, E = wait
+    /// satisfied, L = wait satisfied by a latched CP write.
+    kind: u8,
+    addr: u64,
+    value: u64,
+    reference: u64,
+    packet: u64,
+}
+
+static LABEL_LOG: parking_lot::Mutex<std::collections::VecDeque<LabelEvent>> = parking_lot::Mutex::new(std::collections::VecDeque::new());
+static WAITED: parking_lot::Mutex<Option<HashSet<u64>>> = parking_lot::Mutex::new(None);
+const LABEL_LOG_CAP: usize = 1 << 15;
+
+fn label_event(queue: &str, kind: u8, addr: u64, value: u64, reference: u64, packet: u64) {
+    let a = addr & !7;
+    if kind == b'W' && !WAITED.lock().as_ref().is_some_and(|w| w.contains(&a)) {
+        return;
+    }
+    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let us = T0.get_or_init(Instant::now).elapsed().as_micros() as u64;
+    let mut g = LABEL_LOG.lock();
+    if g.len() >= LABEL_LOG_CAP {
+        g.pop_front();
+    }
+    g.push_back(LabelEvent { us, queue: queue.to_string(), kind, addr: a, value, reference, packet });
+}
+
+/// The recorded history of one label (newest last).
+fn label_history(addr: u64, max: usize) -> String {
+    let a = addr & !7;
+    let g = LABEL_LOG.lock();
+    let ev: Vec<&LabelEvent> = g.iter().filter(|e| e.addr == a).collect();
+    let mut out = String::new();
+    for e in &ev[ev.len().saturating_sub(max)..] {
+        let what = match e.kind {
+            b'W' => format!("wrote {:#x}", e.value),
+            b'I' => format!("wait ref {:#x}: satisfied at once (value {:#x})", e.reference, e.value),
+            b'S' => format!("wait ref {:#x}: blocks (value {:#x})", e.reference, e.value),
+            b'L' => format!("wait ref {:#x}: satisfied by a CP write it latched (value now {:#x})", e.reference, e.value),
+            _ => format!("wait ref {:#x}: satisfied (value {:#x})", e.reference, e.value),
+        };
+        out.push_str(&format!("\n    {:>10.3} ms {} {what} (packet {:#x})", e.us as f64 / 1000.0, e.queue, e.packet));
+    }
+    out
+}
+
+/// Records the label-sized words of a block the CP wrote (DMA fills and
+/// copies up to 16 KiB; larger blocks are data, not labels).
+fn note_block(queue: &str, addr: u64, bytes: u64, at: u64) {
+    if bytes > 16 << 10 {
+        return;
+    }
+    let mut a = addr & !7;
+    while a < addr + bytes {
+        let v = if valid(a, 8) { unsafe { std::ptr::read_volatile(a as *const u64) } } else { 0 };
+        note_write(queue, a, v, at);
+        a += 8;
+    }
 }
 
 fn last_write(addr: u64) -> Option<(String, u64, u64)> {
@@ -853,13 +960,14 @@ impl Cp {
                     false,
                     range,
                     Box::new(move || {
-                        note_write(&name, dst, v as u64, at);
                         if daic {
                             unsafe { wr32(dst, v) };
+                            note_write(&name, dst, v as u64, at);
                         } else {
                             for i in 0..bytes / 4 {
                                 unsafe { wr32(dst + 4 * i, v) };
                             }
+                            note_block(&name, dst, bytes, at);
                         }
                     }),
                 );
@@ -882,6 +990,7 @@ impl Cp {
                         } else {
                             unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, bytes as usize) };
                         }
+                        note_block(&name, dst, if daic { 4 } else { bytes }, at);
                     }),
                 );
             }
@@ -948,9 +1057,13 @@ impl Cp {
             return Flow::Next;
         }
         let read = move || if wide { unsafe { rd64(a) } } else { (unsafe { rd32(a) }) as u64 };
-        if compare(func, read() & mask, reference & mask) {
+        WAITED.lock().get_or_insert_with(HashSet::new).insert(a & !7);
+        let v0 = read();
+        if compare(func, v0 & mask, reference & mask) {
+            label_event(&self.name, b'I', a, v0, reference, at);
             return Flow::Next;
         }
+        label_event(&self.name, b'S', a, v0, reference, at);
         let what = format!("WAIT_REG_MEM at {at:#x}: [{a:#x}] & {mask:#x} func {func} ref {reference:#x}");
         self.waiting_on = a;
         // Submitters stop waiting for this queue only when the label is not
@@ -959,10 +1072,18 @@ impl Cp {
         if let (Some(f), false) = (self.wait_flag, own) {
             f.store(true, Ordering::SeqCst);
         }
-        let r = self.poll_until(at, &what, || compare(func, read() & mask, reference & mask));
+        let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        ACTIVE_WAITS.lock().push(ActiveWait { addr: a, wide, func, mask, reference, hit: hit.clone() });
+        let r = self.poll_until(at, &what, || hit.load(Ordering::SeqCst) || compare(func, read() & mask, reference & mask));
+        ACTIVE_WAITS.lock().retain(|w| !std::sync::Arc::ptr_eq(&w.hit, &hit));
         if let Some(f) = self.wait_flag {
             f.store(false, Ordering::SeqCst);
         }
+        let latched = hit.load(Ordering::SeqCst) && !compare(func, read() & mask, reference & mask);
+        if latched {
+            LATCHED.fetch_add(1, Ordering::Relaxed);
+        }
+        label_event(&self.name, if latched { b'L' } else { b'E' }, a, read(), reference, at);
         match r {
             Flow::Stop => Flow::Stop,
             _ => Flow::Next,
@@ -1000,7 +1121,8 @@ impl Cp {
                 } else {
                     String::new()
                 };
-                crate::warn!("gpu[{}]: waiting > 3 s: {what}{}{detail}", self.name, if marker.is_empty() { String::new() } else { format!(" (marker '{marker}')") });
+                let history = if a != 0 { format!("; label history:{}", label_history(a, 16)) } else { String::new() };
+                crate::warn!("gpu[{}]: waiting > 3 s: {what}{}{detail}{history}", self.name, if marker.is_empty() { String::new() } else { format!(" (marker '{marker}')") });
             }
         }
         set_state(&self.name, "running".into());
