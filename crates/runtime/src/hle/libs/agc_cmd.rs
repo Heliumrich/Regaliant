@@ -158,7 +158,16 @@ fn marker_payload(color: u32, s: &str) -> Vec<u32> {
 fn marker(cb: u64, compute: bool, operation: u32, s: *const u8, color: u32) -> u64 {
     let text: String = if s.is_null() { String::new() } else { unsafe { cstr(s) }.chars().take(255).collect() };
     if text == "BinkGPU" && std::env::var("DS_TRACE_SUBMIT").ok().as_deref() == Some("1") {
-        crate::info!("bink build: cb {cb:#x} by {}", crate::exception::current_guest_frames(10).join(" <- "));
+        // The cursor relative to the buffer start: the title resets it just
+        // before pushing this marker.
+        let rd = |o: u64| unsafe { std::ptr::read_volatile((cb + o) as *const u64) };
+        let (bottom, top, up, down) = (rd(0), rd(8), rd(0x10), rd(0x18));
+        crate::info!(
+            "bink build: cb {cb:#x} (start {bottom:#x}, cursor +{} dw, top-down {} dw) by {}",
+            (up.wrapping_sub(bottom) as i64) / 4,
+            (top.wrapping_sub(down) as i64) / 4,
+            crate::exception::current_guest_frames(10).join(" <- ")
+        );
     }
     private(cb, compute, operation, &marker_payload(color, &text))
 }

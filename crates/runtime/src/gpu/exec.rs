@@ -19,7 +19,7 @@ use super::vk::ctx;
 use ash::vk;
 use parking_lot::Mutex;
 use rdna::translate::{BindingKind, RES_INFO_DWORDS};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod draw;
@@ -429,20 +429,30 @@ struct Bound {
 /// A guest buffer range shadowed in device memory for one dispatch: GPU
 /// atomics on host memory cross PCIe one by one (the title's compaction
 /// kernels spent 17-33 ms on ~60k atomics to a few counters) and small GPU
-/// stores to host memory run at ~0.2 GB/s; copies in and out use the DMA path.
+/// stores to host memory run at ~0.2 GB/s; copies in use the DMA path.
+///
+/// Write-back stores only the dwords the dispatch changed (the merge kernel
+/// compares with a pristine copy taken with the working copy): a buffer's
+/// range is often much larger than what the shader writes, and the CPU keeps
+/// using the rest. The Bink decoder's DC pass binds 0x68300 bytes that end in
+/// the decoder's own CPU state; copying the whole range back reverted the
+/// title's slot index and command-buffer cursor (decodes appended to stale
+/// command buffers until one overflowed) and its data pointers.
 struct Shadow {
     host: vk::Buffer,
     /// Bound range within `host` (aligned start) and its offset in the shadow ring.
     host_off: u64,
     range: u64,
     shadow_off: u64,
+    /// Offset of the pristine copy in the shadow ring.
+    pristine_off: u64,
     /// The resource's own bytes within the range (copied back).
     bias: u64,
     size: u64,
 }
 
-/// Device-local shadow space per slot.
-const SHADOW_BYTES: u64 = 16 << 20;
+/// Device-local shadow space per slot (working and pristine copies).
+const SHADOW_BYTES: u64 = 32 << 20;
 /// Largest buffer shadowed (larger atomic targets stay in host memory).
 const SHADOW_MAX: u64 = 4 << 20;
 
@@ -455,6 +465,45 @@ static SHADOW_FULL: AtomicU64 = AtomicU64::new(0);
 fn shadow_writes() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("DS_GPU_SHADOW").ok().as_deref() != Some("0"))
+}
+
+/// `DS_GPU_SHADOW_MERGE=0` copies whole shadows back (the earlier behaviour,
+/// for A/B comparisons) instead of only the dwords a dispatch changed.
+fn shadow_merge() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_GPU_SHADOW_MERGE").ok().as_deref() != Some("0"))
+}
+
+/// The shadow write-back kernel (`rdna::kernels::shadow_merge`).
+struct MergePipe {
+    pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+    set_layout: vk::DescriptorSetLayout,
+}
+
+fn merge_pipe() -> Result<&'static MergePipe, String> {
+    static PIPE: std::sync::OnceLock<Result<MergePipe, String>> = std::sync::OnceLock::new();
+    PIPE.get_or_init(|| {
+        let c = ctx();
+        unsafe {
+            let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..3)
+                .map(|b| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
+                .collect();
+            let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("merge set layout: {e}"))?;
+            let layouts = [set_layout];
+            let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 8 }];
+            let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("merge layout: {e}"))?;
+            let code = rdna::kernels::shadow_merge();
+            let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("merge module: {e}"))?;
+            let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+            let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
+            let pipeline = c.device.create_compute_pipelines(vk::PipelineCache::null(), &[ci], None).map_err(|(_, e)| format!("merge pipeline: {e}"));
+            c.device.destroy_shader_module(module, None);
+            Ok(MergePipe { pipeline: pipeline?[0], layout, set_layout })
+        }
+    })
+    .as_ref()
+    .map_err(|e| e.clone())
 }
 
 /// Guest ranges of a stage's textures (uploads read them).
@@ -931,14 +980,22 @@ impl Exec {
                 }
             }
         }
-        // Shadow space for written buffers (dispatches; see bind_stage).
+        // Shadow space for written buffers (dispatches; see bind_stage): a
+        // working and a pristine copy, and a descriptor set for the merge.
         let mut shadow = 0u64;
         for p in stages {
             for b in &p.tr.out.bindings {
                 if let BindingKind::Buffer(i) = b.kind {
-                    if let (Some(Resolved::Buffer(v)), true) = (p.resources.get(i), p.tr.plan.resources[i].written) {
+                    if !p.tr.plan.resources[i].written {
+                        continue;
+                    }
+                    // Any written buffer may be shadowed (pointer-addressed
+                    // ones when their mapping ends within SHADOW_MAX).
+                    need[0] += 1;
+                    need[1] += 3;
+                    if let Some(Resolved::Buffer(v)) = p.resources.get(i) {
                         if let Some(n) = v.byte_size().filter(|&n| n + 16 <= SHADOW_MAX) {
-                            shadow += n + 16 + 256;
+                            shadow += 2 * (n + 16 + 256);
                         }
                     }
                 }
@@ -997,13 +1054,23 @@ impl Exec {
                                     // Written buffers: a device-local copy for this dispatch
                                     // (GPU atomics and stores to host memory are slow).
                                     let s_off = self.shadow_used.next_multiple_of(256);
+                                    let span = range.next_multiple_of(256);
                                     let want = allow_shadow && shadow_writes() && p.tr.plan.resources[i].written && range <= SHADOW_MAX;
-                                    if want && s_off + range > seg {
+                                    if want && s_off + 2 * span > seg {
                                         SHADOW_FULL.fetch_add(1, Ordering::Relaxed);
                                     }
-                                    if want && s_off + range <= seg {
-                                        self.shadow_used = s_off + range;
-                                        bound.shadows.push(Shadow { host: buffer, host_off: off, range, shadow_off: shadow_base + s_off, bias, size });
+                                    if want && s_off + 2 * span <= seg {
+                                        // DS_TRACE_SHADOW=1: each shadowed range once per shader.
+                                        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                                        if *TRACE.get_or_init(|| std::env::var("DS_TRACE_SHADOW").ok().as_deref() == Some("1")) {
+                                            static SEEN: std::sync::Mutex<Option<HashSet<(u64, u64)>>> = std::sync::Mutex::new(None);
+                                            if SEEN.lock().unwrap().get_or_insert_with(HashSet::new).insert((p.addr, base)) {
+                                                let global = matches!(p.resources[i], Resolved::Global(_));
+                                                crate::info!("shadow: {:?} shader {:#x} writes {base:#x}+{size:#x} (bound {range:#x}{})", p.stage, p.addr, if global { ", global pointer" } else { "" });
+                                            }
+                                        }
+                                        self.shadow_used = s_off + 2 * span;
+                                        bound.shadows.push(Shadow { host: buffer, host_off: off, range, shadow_off: shadow_base + s_off, pristine_off: shadow_base + s_off + span, bias, size });
                                         info = vk::DescriptorBufferInfo { buffer: self.shadow, offset: shadow_base + s_off, range };
                                         SHADOWED.fetch_add(1, Ordering::Relaxed);
                                     }
@@ -1130,6 +1197,14 @@ impl Exec {
         self.bind_sgpr(&p, &mut bound)?;
         let t_bind = t0.elapsed();
         let set = self.alloc_set(set_layout)?;
+        // Shadow write-back kernel and its descriptor sets (see Shadow).
+        let merge = if !bound.shadows.is_empty() && shadow_merge() { Some(merge_pipe()?) } else { None };
+        let mut merge_sets = Vec::new();
+        if let Some(m) = merge {
+            for _ in &bound.shadows {
+                merge_sets.push(self.alloc_set(m.set_layout)?);
+            }
+        }
         let writes_here = std::mem::take(&mut bound.writes);
         self.write_set(set, std::slice::from_ref(&bound));
         self.end_rendering();
@@ -1147,9 +1222,25 @@ impl Exec {
             // Shadows get the guest data first (earlier writes are ordered by
             // the barrier after every dispatch).
             unsafe {
-                for sh in &bound.shadows {
-                    let r = vk::BufferCopy { src_offset: sh.host_off, dst_offset: sh.shadow_off, size: sh.range };
-                    c.device.cmd_copy_buffer(self.cmd(), sh.host, self.shadow, &[r]);
+                if shadow_merge() {
+                    // One read of guest memory (the pristine copy), then the
+                    // working copy from it: two reads could see different CPU
+                    // writes, and the merge would store the older value.
+                    for sh in &bound.shadows {
+                        let r = vk::BufferCopy { src_offset: sh.host_off, dst_offset: sh.pristine_off, size: sh.range };
+                        c.device.cmd_copy_buffer(self.cmd(), sh.host, self.shadow, &[r]);
+                    }
+                    let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                    c.device.cmd_pipeline_barrier(self.cmd(), vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+                    for sh in &bound.shadows {
+                        let r = vk::BufferCopy { src_offset: sh.pristine_off, dst_offset: sh.shadow_off, size: sh.range };
+                        c.device.cmd_copy_buffer(self.cmd(), self.shadow, self.shadow, &[r]);
+                    }
+                } else {
+                    for sh in &bound.shadows {
+                        let r = vk::BufferCopy { src_offset: sh.host_off, dst_offset: sh.shadow_off, size: sh.range };
+                        c.device.cmd_copy_buffer(self.cmd(), sh.host, self.shadow, &[r]);
+                    }
                 }
                 let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
                 c.device.cmd_pipeline_barrier(self.cmd(), vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
@@ -1172,11 +1263,39 @@ impl Exec {
         global_barrier(self.cmd());
         if !bound.shadows.is_empty() {
             super::vk::checkpoint(self.cmd(), super::vk::mark::SHADOW_OUT, p.addr);
-            // Results back to guest memory (the resource's own bytes only).
-            unsafe {
-                for sh in &bound.shadows {
-                    let r = vk::BufferCopy { src_offset: sh.shadow_off + sh.bias, dst_offset: sh.host_off + sh.bias, size: sh.size.min(sh.range - sh.bias) };
-                    c.device.cmd_copy_buffer(self.cmd(), self.shadow, sh.host, &[r]);
+            // Results back to guest memory: the dwords the dispatch changed
+            // within the resource's own bytes (see Shadow).
+            for (k, sh) in bound.shadows.iter().enumerate() {
+                let own = sh.size.min(sh.range - sh.bias);
+                match merge {
+                    Some(m) => {
+                        let set = merge_sets[k];
+                        let infos = [
+                            vk::DescriptorBufferInfo { buffer: self.shadow, offset: sh.shadow_off, range: sh.range },
+                            vk::DescriptorBufferInfo { buffer: self.shadow, offset: sh.pristine_off, range: sh.range },
+                            vk::DescriptorBufferInfo { buffer: sh.host, offset: sh.host_off, range: sh.range },
+                        ];
+                        let writes: Vec<vk::WriteDescriptorSet> = infos
+                            .iter()
+                            .enumerate()
+                            .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
+                            .collect();
+                        let first = (sh.bias / 4) as u32;
+                        let end = ((sh.bias + own).div_ceil(4)).min(sh.range / 4) as u32;
+                        let pc: Vec<u8> = [first, end].iter().flat_map(|x| x.to_le_bytes()).collect();
+                        unsafe {
+                            let cmd = self.cmd();
+                            c.device.update_descriptor_sets(&writes, &[]);
+                            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, m.pipeline);
+                            c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, m.layout, 0, &[set], &[]);
+                            c.device.cmd_push_constants(cmd, m.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
+                            c.device.cmd_dispatch(cmd, end.saturating_sub(first).div_ceil(rdna::kernels::MERGE_LOCAL_SIZE).max(1), 1, 1);
+                        }
+                    }
+                    None => unsafe {
+                        let r = vk::BufferCopy { src_offset: sh.shadow_off + sh.bias, dst_offset: sh.host_off + sh.bias, size: own };
+                        c.device.cmd_copy_buffer(self.cmd(), self.shadow, sh.host, &[r]);
+                    },
                 }
             }
             global_barrier(self.cmd());

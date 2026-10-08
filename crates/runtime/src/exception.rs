@@ -498,7 +498,8 @@ unsafe fn handle_breakpoint(ctx: &mut CONTEXT) -> bool {
 /// Single-step after a non-`push rbp` breakpoint: re-arms it.
 /// `DS_WATCH=<hex address>`: a hardware write watchpoint (DR0, 8 bytes) armed
 /// on every guest thread and runtime worker thread; each hit is logged with
-/// the written value and the writer's frames (first 64 hits).
+/// the written value and the writer's frames (first `DS_WATCH_MAX`, default
+/// 64, hits).
 static WATCH: OnceLock<u64> = OnceLock::new();
 static WATCH_HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -537,8 +538,9 @@ unsafe fn handle_watch_hit(ctx: &mut CONTEXT) -> bool {
         return false;
     }
     ctx.Dr6 = 0;
+    static MAX: OnceLock<u32> = OnceLock::new();
     let n = WATCH_HITS.fetch_add(1, Ordering::Relaxed);
-    if n < 64 {
+    if n < *MAX.get_or_init(|| std::env::var("DS_WATCH_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(64)) {
         let a = watch_addr();
         let v = unsafe { *(a as *const u64) };
         let frames = unsafe { frames_line(ctx) };

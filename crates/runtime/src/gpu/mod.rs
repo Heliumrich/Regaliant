@@ -81,14 +81,12 @@ fn buffer_hash(addr: u64, size: u32) -> u64 {
     w.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x100_0000_01b3))
 }
 
-/// Submission backpressure (`DS_SUBMIT_THROTTLE=1`, experimental): a submit
+/// Submission backpressure (`DS_SUBMIT_THROTTLE=1`, diagnostic): a submit
 /// first waits (up to `THROTTLE_MAX`) until the queue completed all earlier
-/// submissions, GPU work included. Titles reuse buffers on the assumption
-/// that the GPU executes a submission within milliseconds (the Bink video
-/// decoder refills its two data sets without waiting for the GPU); our
-/// command processor can lag behind by much more (pipeline compilation),
-/// which corrupted video frames. Not while the CP polls a label (it may be
-/// waiting for the submitting thread).
+/// submissions, GPU work included, to test whether a problem depends on how
+/// far the command processor lags behind the submitting threads (it can lag
+/// by much more than hardware, e.g. during pipeline compilation). Not while
+/// the CP polls a label (it may be waiting for the submitting thread).
 fn throttle() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("DS_SUBMIT_THROTTLE").ok().as_deref() == Some("1"))
@@ -96,6 +94,38 @@ fn throttle() -> bool {
 const THROTTLE_MAX: std::time::Duration = std::time::Duration::from_millis(250);
 /// Submissions up to this many dwords wait for their completion (see `submit`).
 const SMALL_SUBMIT: u64 = 512;
+
+/// The packets of a command buffer copy, one token each (diagnostics).
+fn pm4_summary(w: &[u32]) -> String {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < w.len() {
+        let h = w[i];
+        if h >> 30 != 3 {
+            out.push(format!("{i}:t{}", h >> 30));
+            i += 1;
+            continue;
+        }
+        let n = ((h >> 16) & 0x3FFF) as usize + 1;
+        let p = |k: usize| w.get(i + 1 + k).copied().unwrap_or(0);
+        let a64 = |k: usize| p(k) as u64 | (p(k + 1) as u64) << 32;
+        let s = match (h >> 8) & 0xFF {
+            0x10 if p(0) == crate::hle::libs::agc_cmd::DS_MAGIC => format!("mk{}", p(1)),
+            0x93 => format!("wait64[{:#x}]>={:#x}", a64(1), a64(3)),
+            0x3C => format!("wait[{:#x}]={:#x}", a64(1), p(3)),
+            0x37 => format!("wd[{:#x}]={:#x}", a64(1), p(3)),
+            0x49 => format!("rel[{:#x}]={:#x}", a64(2), a64(4)),
+            0x15 => format!("disp{}x{}x{}", p(0), p(1), p(2)),
+            0x76 => format!("sh{:#x}+{}", p(0), n - 1),
+            0x46 => format!("ev{:#x}", p(0) & 0x3F),
+            0x58 => "acq".to_string(),
+            o => format!("op{o:#x}/{n}"),
+        };
+        out.push(format!("{i}:{s}"));
+        i += n + 1;
+    }
+    out.join(" ")
+}
 
 /// (dispatches, draws, other packets) of a command buffer's top level.
 fn packet_mix(addr: u64, size: u32) -> (u32, u32, u32) {
@@ -271,16 +301,22 @@ pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
     if trace_submit() {
         let (d, w, o) = buffers.iter().map(|&(a, n)| packet_mix(a, n)).fold((0, 0, 0), |x, y| (x.0 + y.0, x.1 + y.1, x.2 + y.2));
         crate::info!("submit trace: queue {queue_id:#x} #{index} {:#x}+{} (done {}) dispatches {d} draws {w} other {o}", buffers[0].0, buffers[0].1, q.done.load(Ordering::SeqCst));
+        // Bink decodes (they start with a "BinkGPU" marker): list the
+        // packets of the first one and of ones with other sizes.
+        static LISTED: AtomicU64 = AtomicU64::new(0);
+        if let Some(w) = copies.first() {
+            let bink = w.len() > 3 && w[1] == crate::hle::libs::agc_cmd::DS_MAGIC && w[2] == crate::hle::libs::agc_cmd::pop::PUSH_MARKER && w.get(4) == Some(&u32::from_le_bytes(*b"Bink"));
+            if bink && (w.len() != 277 || LISTED.load(Ordering::Relaxed) == 0) && LISTED.fetch_add(1, Ordering::Relaxed) < 10 {
+                crate::info!("submit trace: #{index} packets: {}", pm4_summary(w));
+            }
+        }
     }
     g.push_back(Submission { bufs: buffers, hashes, copies, at: std::time::Instant::now() });
     q.cv.notify_one();
-    // DS_SUBMIT_SYNC=small (up to SMALL_SUBMIT dwords) or =1 (all): the
-    // submit returns once its work completed. Titles reuse small command
-    // buffers, and the data they use, as soon as the GPU would have run them
-    // on hardware (the Bink video decoder rebuilds the slot of a decode
-    // while it still runs on our busier command processor); experimental,
-    // it halves the frame rate. Bounded, and not while the CP polls a label
-    // that may come from the submitter.
+    // DS_SUBMIT_SYNC=small (up to SMALL_SUBMIT dwords) or =1 (all),
+    // diagnostic: the submit returns once its work completed (no CPU/GPU
+    // overlap for those submissions; about halves the frame rate). Bounded,
+    // and not while the CP polls a label that may come from the submitter.
     if waits_for_completion(&g.back().map(|b| b.bufs.clone()).unwrap_or_default()) {
         let t0 = std::time::Instant::now();
         while q.done.load(Ordering::SeqCst) < index && !q.cp_waiting.load(Ordering::SeqCst) && t0.elapsed() < THROTTLE_MAX {

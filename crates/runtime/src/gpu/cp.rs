@@ -381,14 +381,13 @@ impl Cp {
         }
     }
 
-    /// Executes `size` dwords at `addr`.
-    /// Executes a command buffer. Small buffers (up to `FETCH_DWORDS`) are
-    /// copied when execution starts, as the hardware's prefetch does: the
-    /// Bink video decoder reuses its small command buffers as soon as the
-    /// GPU has started them, and reading them lazily executed a mix of two
-    /// frames' packets. Larger buffers are read as they execute: titles patch
-    /// submitted frame command buffers until the GPU reaches the patched
-    /// packets (copying them at submission broke rendering).
+    /// Executes a command buffer (`size` dwords at `addr`). Small buffers (up
+    /// to `FETCH_DWORDS`) are copied when execution starts, as the hardware's
+    /// prefetch would have fetched them (a CPU rewrite of a started buffer is
+    /// not seen; `DS_CP_FETCH=0` reads them lazily). Larger buffers are read
+    /// as they execute: titles patch submitted frame command buffers until
+    /// the GPU reaches the patched packets (copying them at submission broke
+    /// rendering).
     pub fn run(&mut self, addr: u64, size: u32) {
         if self.depth > 8 {
             crate::error!("gpu[{}]: indirect buffer nesting too deep at {addr:#x}", self.name);
