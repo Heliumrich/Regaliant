@@ -1,0 +1,362 @@
+//! Write tracking of guest memory regions (texture cache invalidation).
+//! Regions are marked dirty by announced writes: file reads and driver
+//! imports (`host_write`), GPU work (`gpu_write`) and mapping changes
+//! (`remapped`).
+//!
+//! CPU writes by guest code can additionally be caught by page protection
+//! (`DS_TRACK=1`, experimental): a watched region's pages are made read-only,
+//! the first CPU write faults, the exception handler marks the regions on the
+//! page dirty and restores its protection, and the write is retried. It is off
+//! by default: changing the protection of guest pages that are imported into
+//! the GPU (VK_EXT_external_memory_host) led to device losses on the RTX 4090
+//! (3 of 5 runs with it, 0 of 5 without), so consumers detect CPU writes by
+//! sampled hashing instead (`protected()` tells which applies).
+//!
+//! Protocol for a consumer: `take_dirty(id)`; if dirty, `rearm(id)` and then
+//! read the memory (writes after re-arming fault again).
+
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READONLY, PAGE_READWRITE};
+
+const PAGE: u64 = 4096;
+
+struct Region {
+    base: u64,
+    size: u64,
+    /// Written by the CPU (or mapping changes) since armed.
+    dirty: bool,
+    /// Written by GPU work since last checked (contents may be unchanged).
+    gpu: bool,
+    /// What made it dirty last (diagnostics).
+    why: Why,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Why {
+    None,
+    Fault(u64),
+    HostWrite(u64),
+    GpuWrite(u64, u64),
+    Remap(u64, u64),
+    Unmapped,
+}
+
+#[derive(Default)]
+struct Tracker {
+    regions: Vec<Option<Region>>,
+    /// Watched page -> (regions on it, protection to restore, protected now).
+    pages: HashMap<u64, (Vec<u32>, u32, bool)>,
+    /// Ranges being written by code that cannot fault (kernel reads, driver
+    /// imports): their pages stay writable until the writer is done.
+    busy: Vec<(u64, u64, u64)>,
+    next_busy: u64,
+}
+
+static TRACK: Mutex<Option<Tracker>> = Mutex::new(None);
+pub static FAULTS: AtomicU64 = AtomicU64::new(0);
+
+fn read_only(prot: u32) -> u32 {
+    match prot {
+        PAGE_READWRITE => PAGE_READONLY,
+        PAGE_EXECUTE_READWRITE => PAGE_EXECUTE_READ,
+        p => p,
+    }
+}
+
+fn set_prot(page: u64, n: u64, prot: u32) -> bool {
+    let mut old = 0u32;
+    unsafe { VirtualProtect(page as _, (n * PAGE) as usize, prot, &mut old) != 0 }
+}
+
+/// Writable guest mappings covering [base, base+size): (start, end, Windows
+/// protection) runs, or None if any page is unmapped or not writable.
+fn spans(base: u64, size: u64) -> Option<Vec<(u64, u64, u32)>> {
+    let first = base & !(PAGE - 1);
+    let end = (base + size).next_multiple_of(PAGE);
+    let mut v = Vec::new();
+    let st = crate::mem::MEM.lock();
+    let mut a = first;
+    while a < end {
+        let m = st.find(a)?;
+        if m.kind == crate::mem::VmaKind::Reserved {
+            return None;
+        }
+        let e = m.end().min(end);
+        let prot = crate::mem::win_prot(m.prot);
+        if prot != PAGE_READWRITE && prot != PAGE_EXECUTE_READWRITE {
+            return None;
+        }
+        v.push((a, e, prot));
+        a = e;
+    }
+    Some(v)
+}
+
+/// Starts watching [base, base+size); returns its id. Pages must be mapped,
+/// readable and writable guest memory (others are not watched).
+/// CPU writes are caught by page protection (`DS_TRACK=1`).
+pub fn protected() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_TRACK").ok().as_deref() == Some("1"))
+}
+
+pub fn watch(base: u64, size: u64) -> Option<u32> {
+    if !protected() {
+        let mut g = TRACK.lock();
+        let t = g.get_or_insert_with(Tracker::default);
+        let id = t.regions.len() as u32;
+        t.regions.push(Some(Region { base, size, dirty: false, gpu: false, why: Why::None }));
+        return Some(id);
+    }
+    let sp = spans(base, size)?;
+    let mut g = TRACK.lock();
+    let t = g.get_or_insert_with(Tracker::default);
+    let id = t.regions.len() as u32;
+    t.regions.push(Some(Region { base, size, dirty: false, gpu: false, why: Why::None }));
+    arm_locked(t, id, &sp);
+    Some(id)
+}
+
+/// Registers the region's pages (current protections) and write-protects
+/// the unprotected ones.
+fn arm_locked(t: &mut Tracker, id: u32, spans: &[(u64, u64, u32)]) {
+    for &(a, e, prot) in spans {
+        let mut p = a;
+        while p < e {
+            let ent = t.pages.entry(p).or_insert((Vec::new(), prot, false));
+            if !ent.0.contains(&id) {
+                ent.0.push(id);
+            }
+            p += PAGE;
+        }
+    }
+    for &(a, e, _) in spans {
+        let mut p = a;
+        while p < e {
+            let (prot, protected) = match t.pages.get(&p) {
+                Some(x) => (x.1, x.2),
+                None => {
+                    p += PAGE;
+                    continue;
+                }
+            };
+            if protected {
+                p += PAGE;
+                continue;
+            }
+            if t.busy.iter().any(|&(_, b, n)| p < b + n && b < p + PAGE) {
+                // A non-faulting writer is active here: stay writable, and
+                // re-arm on the next check.
+                if let Some(Some(r)) = t.regions.get_mut(id as usize) {
+                    r.dirty = true;
+                }
+                p += PAGE;
+                continue;
+            }
+            let mut q = p + PAGE;
+            while q < e && t.pages.get(&q).is_some_and(|x| !x.2 && x.1 == prot) && !t.busy.iter().any(|&(_, b, n)| q < b + n && b < q + PAGE) {
+                q += PAGE;
+            }
+            if set_prot(p, (q - p) / PAGE, read_only(prot)) {
+                let mut x = p;
+                while x < q {
+                    if let Some(en) = t.pages.get_mut(&x) {
+                        en.2 = true;
+                    }
+                    x += PAGE;
+                }
+            }
+            p = q;
+        }
+    }
+}
+
+/// Whether the region was written by the CPU since it was last armed (call
+/// `rearm` before reading the memory), and why.
+pub fn take_dirty(id: u32) -> Option<Why> {
+    let mut g = TRACK.lock();
+    let t = g.as_mut()?;
+    match t.regions.get_mut(id as usize).and_then(|r| r.as_mut()) {
+        Some(r) if r.dirty => {
+            r.dirty = false;
+            r.gpu = false;
+            Some(r.why)
+        }
+        _ => None,
+    }
+}
+
+/// A region's guest range.
+pub fn range(id: u32) -> Option<(u64, u64)> {
+    let g = TRACK.lock();
+    g.as_ref()?.regions.get(id as usize)?.as_ref().map(|r| (r.base, r.size))
+}
+
+/// Whether GPU work wrote the region since the last call.
+pub fn take_gpu_written(id: u32) -> bool {
+    let mut g = TRACK.lock();
+    let Some(t) = g.as_mut() else { return false };
+    match t.regions.get_mut(id as usize).and_then(|r| r.as_mut()) {
+        Some(r) => std::mem::replace(&mut r.gpu, false),
+        None => false,
+    }
+}
+
+/// Write-protects the region again (pages re-registered with their current
+/// protections, so mapping changes are followed).
+pub fn rearm(id: u32) {
+    if !protected() {
+        return;
+    }
+    let range = {
+        let g = TRACK.lock();
+        g.as_ref().and_then(|t| t.regions.get(id as usize)).and_then(|r| r.as_ref()).map(|r| (r.base, r.size))
+    };
+    let Some((base, size)) = range else { return };
+    let sp = spans(base, size);
+    let mut g = TRACK.lock();
+    let Some(t) = g.as_mut() else { return };
+    match sp {
+        Some(sp) => arm_locked(t, id, &sp),
+        // Unmapped or not writable now: report dirty on every check.
+        None => {
+            if let Some(Some(r)) = t.regions.get_mut(id as usize) {
+                r.dirty = true;
+                r.why = Why::Unmapped;
+            }
+        }
+    }
+}
+
+/// Marks the regions on `page` dirty and makes it writable.
+fn unprotect_page(t: &mut Tracker, page: u64, why: Why) -> bool {
+    let Some(e) = t.pages.get_mut(&page) else { return false };
+    if e.2 {
+        if !set_prot(page, 1, e.1) {
+            return false;
+        }
+        e.2 = false;
+    }
+    let ids = e.0.clone();
+    for id in ids {
+        if let Some(Some(r)) = t.regions.get_mut(id as usize) {
+            r.dirty = true;
+            r.why = why;
+        }
+    }
+    true
+}
+
+/// Exception handler hook: a CPU write to a watched page. Returns true when
+/// the write may be retried.
+pub fn on_write_fault(addr: u64) -> bool {
+    let mut g = TRACK.lock();
+    let Some(t) = g.as_mut() else { return false };
+    let ok = unprotect_page(t, addr & !(PAGE - 1), Why::Fault(addr));
+    if ok {
+        FAULTS.fetch_add(1, Ordering::Relaxed);
+    }
+    ok
+}
+
+/// A write that cannot fault is in progress (see `host_write`).
+pub struct HostWrite(Option<u64>);
+
+impl Drop for HostWrite {
+    fn drop(&mut self) {
+        if let Some(id) = self.0 {
+            if let Some(t) = TRACK.lock().as_mut() {
+                t.busy.retain(|b| b.0 != id);
+            }
+        }
+    }
+}
+
+/// Announces a write that cannot fault (kernel-mode writes such as file
+/// reads into guest memory, the driver pinning pages for an import): watched
+/// pages in the range become writable, their regions dirty, and they stay
+/// writable while the returned guard lives.
+pub fn host_write(base: u64, len: u64) -> HostWrite {
+    if len == 0 {
+        return HostWrite(None);
+    }
+    let mut g = TRACK.lock();
+    let Some(t) = g.as_mut() else { return HostWrite(None) };
+    if t.regions.is_empty() {
+        return HostWrite(None);
+    }
+    let (first, end) = (base & !(PAGE - 1), base + len);
+    if (end - first) / PAGE > t.pages.len() as u64 {
+        let pages: Vec<u64> = t.pages.keys().copied().filter(|&p| p >= first && p < end).collect();
+        for p in pages {
+            unprotect_page(t, p, Why::HostWrite(base));
+        }
+    } else {
+        let mut p = first;
+        while p < end {
+            unprotect_page(t, p, Why::HostWrite(base));
+            p += PAGE;
+        }
+    }
+    // Regions without watched pages (no page protection) learn of the
+    // write here.
+    for r in t.regions.iter_mut().flatten() {
+        if r.base < base + len && base < r.base + r.size {
+            r.dirty = true;
+            r.why = Why::HostWrite(base);
+        }
+    }
+    t.next_busy += 1;
+    let id = t.next_busy;
+    t.busy.push((id, base, len));
+    HostWrite(Some(id))
+}
+
+/// Announces a GPU write to [base, base+len): overlapping regions are dirty
+/// (their pages need no change).
+pub fn gpu_write(base: u64, len: u64) {
+    let mut g = TRACK.lock();
+    let Some(t) = g.as_mut() else { return };
+    for r in t.regions.iter_mut().flatten() {
+        if r.base < base + len && base < r.base + r.size {
+            r.gpu = true;
+            r.why = Why::GpuWrite(base, len);
+        }
+    }
+}
+
+/// The memory manager changed the mapping or protection of [base,
+/// base+len): its page states are forgotten (re-registered on re-arming)
+/// and overlapping regions are dirty.
+pub fn remapped(base: u64, len: u64) {
+    let mut g = TRACK.lock();
+    let Some(t) = g.as_mut() else { return };
+    if t.regions.is_empty() {
+        return;
+    }
+    let (first, end) = (base & !(PAGE - 1), base.saturating_add(len));
+    if (end - first) / PAGE > t.pages.len() as u64 {
+        t.pages.retain(|&p, _| p < first || p >= end);
+    } else {
+        let mut p = first;
+        while p < end {
+            t.pages.remove(&p);
+            p += PAGE;
+        }
+    }
+    for r in t.regions.iter_mut().flatten() {
+        if r.base < base + len && base < r.base + r.size {
+            r.dirty = true;
+            r.why = Why::Remap(base, len);
+        }
+    }
+}
+
+/// One status line.
+pub fn status() -> String {
+    let g = TRACK.lock();
+    let (regions, pages) = g.as_ref().map(|t| (t.regions.iter().flatten().count(), t.pages.len())).unwrap_or((0, 0));
+    format!("    write tracking: {regions} regions, {pages} pages, {} write faults\n", FAULTS.load(Ordering::Relaxed))
+}

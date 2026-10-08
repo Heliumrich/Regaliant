@@ -23,6 +23,9 @@ pub struct Ctx {
     pub push_desc: ash::khr::push_descriptor::Device,
     /// VK_EXT_external_memory_host (zero-copy access to guest memory).
     pub ext_host: Option<ash::ext::external_memory_host::Device>,
+    /// VK_NV_device_diagnostic_checkpoints (DS_GPU_CHECKPOINTS=1): markers
+    /// read back after a device loss.
+    pub checkpoints: Option<ash::nv::device_diagnostic_checkpoints::Device>,
     pub device_name: String,
     pub validation: bool,
 }
@@ -112,6 +115,18 @@ pub fn init() -> Result<(), String> {
         if host_import {
             dexts.push(ash::ext::external_memory_host::NAME.as_ptr());
         }
+        let want_ckpt = std::env::var("DS_GPU_CHECKPOINTS").ok().as_deref() == Some("1");
+        let has_ckpt = want_ckpt
+            && instance
+                .enumerate_device_extension_properties(pdev)
+                .unwrap_or_default()
+                .iter()
+                .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::nv::device_diagnostic_checkpoints::NAME);
+        if has_ckpt {
+            dexts.push(ash::nv::device_diagnostic_checkpoints::NAME.as_ptr());
+        } else if want_ckpt {
+            crate::warn!("DS_GPU_CHECKPOINTS=1 but VK_NV_device_diagnostic_checkpoints is unavailable");
+        }
         // Out-of-range buffer/image accesses must not fault: GCN bounds-checks
         // buffer accesses against the descriptor (loads return 0, stores are
         // dropped), and titles rely on it. robustness2 gives exactly that.
@@ -184,6 +199,7 @@ pub fn init() -> Result<(), String> {
             swapchain_d: ash::khr::swapchain::Device::new(&instance, &device),
             push_desc: ash::khr::push_descriptor::Device::new(&instance, &device),
             ext_host: host_import.then(|| ash::ext::external_memory_host::Device::new(&instance, &device)),
+            checkpoints: has_ckpt.then(|| ash::nv::device_diagnostic_checkpoints::Device::new(&instance, &device)),
             entry,
             instance,
             pdev,
@@ -213,6 +229,54 @@ pub fn init() -> Result<(), String> {
         }
         CTX.set(ctx).ok();
         Ok(())
+    }
+}
+
+/// Checkpoint marker kinds (high byte of the marker value).
+pub mod mark {
+    pub const DISPATCH: u64 = 1;
+    pub const DRAW: u64 = 2;
+    pub const SHADOW_IN: u64 = 3;
+    pub const SHADOW_OUT: u64 = 4;
+    pub const UPLOAD: u64 = 5;
+    pub const BATCH: u64 = 6;
+}
+
+/// Records a diagnostic checkpoint (DS_GPU_CHECKPOINTS=1): `kind` and a
+/// 56-bit value (shader or guest address, sequence number).
+pub fn checkpoint(cmd: vk::CommandBuffer, kind: u64, value: u64) {
+    if let Some(c) = try_ctx() {
+        if let Some(cp) = &c.checkpoints {
+            unsafe { cp.cmd_set_checkpoint(cmd, ((kind << 56) | (value & ((1 << 56) - 1))) as *const std::ffi::c_void) };
+        }
+    }
+}
+
+/// The queue's last checkpoints per pipeline stage, after a device loss.
+pub fn checkpoint_report() -> String {
+    let Some(c) = try_ctx() else { return String::new() };
+    let Some(cp) = &c.checkpoints else { return "(DS_GPU_CHECKPOINTS=1 names the failing command)".into() };
+    let q = c.queue.lock();
+    unsafe {
+        let n = cp.get_queue_checkpoint_data_len(*q);
+        let mut v = vec![vk::CheckpointDataNV::default(); n];
+        cp.get_queue_checkpoint_data(*q, &mut v);
+        v.iter()
+            .map(|d| {
+                let m = d.p_checkpoint_marker as u64;
+                let kind = match m >> 56 {
+                    mark::DISPATCH => "dispatch cs",
+                    mark::DRAW => "draw ps",
+                    mark::SHADOW_IN => "shadow copy in",
+                    mark::SHADOW_OUT => "shadow copy out",
+                    mark::UPLOAD => "image upload",
+                    mark::BATCH => "batch",
+                    _ => "?",
+                };
+                format!("{:?}: {kind} {:#x}", d.stage, m & ((1 << 56) - 1))
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 }
 

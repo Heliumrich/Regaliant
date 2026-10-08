@@ -541,7 +541,7 @@ impl Exec {
         self.reserve(&stages.iter().map(|p| &**p).collect::<Vec<_>>());
         let mut bounds = Vec::new();
         for p in stages.iter_mut() {
-            let mut b = self.bind_stage(p)?;
+            let mut b = self.bind_stage(p, false)?;
             self.bind_sgpr(p, &mut b)?;
             bounds.push(b);
         }
@@ -558,6 +558,7 @@ impl Exec {
         }
         let c = ctx();
         let cmd = self.cmd();
+        crate::gpu::vk::checkpoint(cmd, crate::gpu::vk::mark::DRAW, ps_addr);
         unsafe {
             c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
             c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, layout, 0, &[set], &[]);
@@ -650,6 +651,9 @@ impl Exec {
             }
         }
         for b in bounds {
+            for &(base, n) in &b.writes {
+                crate::gpu::track::gpu_write(base, n);
+            }
             self.pending_writes.extend(b.writes);
         }
         Ok(true)

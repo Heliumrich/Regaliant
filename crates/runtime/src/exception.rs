@@ -556,6 +556,10 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
     unsafe {
         let rec = &*(*info).ExceptionRecord;
         let code = rec.ExceptionCode as u32;
+        // A CPU write to a write-tracked guest page (texture cache).
+        if code == 0xC0000005 && rec.NumberParameters >= 2 && rec.ExceptionInformation[0] == 1 && crate::gpu::track::on_write_fault(rec.ExceptionInformation[1] as u64) {
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
         if code == 0x80000003 && handle_breakpoint(&mut *(*info).ContextRecord) {
             return -1; // EXCEPTION_CONTINUE_EXECUTION
         }

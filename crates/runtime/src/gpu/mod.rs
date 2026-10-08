@@ -13,6 +13,7 @@ pub mod desc;
 pub mod exec;
 pub mod images;
 pub mod png;
+pub mod track;
 pub mod shaders;
 pub mod swizzle_tables;
 pub mod tiling;

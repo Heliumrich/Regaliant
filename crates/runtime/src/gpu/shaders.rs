@@ -26,6 +26,8 @@ pub struct Translated {
     pub plan: Arc<Plan>,
     /// Cache key (program hash ^ specialization hash).
     pub key: u64,
+    /// Buffer resources targeted by atomic instructions.
+    pub atomic_res: Vec<usize>,
 }
 
 fn hash_words(w: &[u32]) -> u64 {
@@ -428,7 +430,14 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
                 for w in &out.warnings {
                     crate::warn!("{:?} shader {addr:#x}: {w}", spec.stage);
                 }
-                let t = Arc::new(Translated { out, plan: plan.clone(), key: plan_key ^ spec_hash.rotate_left(1) });
+                let mut atomic_res: Vec<usize> = insts
+                    .iter()
+                    .filter(|i| i.name().is_some_and(|n| n.starts_with("buffer_atomic_") || n.starts_with("global_atomic_")))
+                    .filter_map(|i| plan.inst_res.get(&i.pc).map(|r| r.0))
+                    .collect();
+                atomic_res.sort_unstable();
+                atomic_res.dedup();
+                let t = Arc::new(Translated { out, plan: plan.clone(), key: plan_key ^ spec_hash.rotate_left(1), atomic_res });
                 TRANSLATIONS.lock().get_or_insert_with(HashMap::new).insert((plan_key, spec_hash), t.clone());
                 t
             }

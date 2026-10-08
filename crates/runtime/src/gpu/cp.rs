@@ -511,7 +511,7 @@ impl Cp {
                 }
                 if super::capture::capturing() {
                     let what = if opcode == op::DISPATCH_DIRECT {
-                        format!("DISPATCH_DIRECT {}x{}x{}", p(0), p(1), p(2))
+                        format!("DISPATCH_DIRECT {}x{}x{} initiator {:#x}", p(0), p(1), p(2), p(3))
                     } else {
                         format!("DISPATCH_INDIRECT {:#x} base {:#x}", p(0), self.dispatch_indirect_base)
                     };

@@ -406,6 +406,8 @@ fn read_into(file_id: u32, dest: u64, size: u64, offset: u64) -> Result<(), i32>
             crate::info!("apr: read {} [{offset:#x}+{size:#x}] -> {dest:#x}", f.path);
         }
     }
+    // The kernel writes the buffer: write-tracked pages cannot fault.
+    let _w = crate::gpu::track::host_write(dest, size);
     let buf = unsafe { std::slice::from_raw_parts_mut(dest as *mut u8, size as usize) };
     let mut done = 0usize;
     while done < buf.len() {

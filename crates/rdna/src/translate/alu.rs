@@ -1448,6 +1448,49 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
             let a = bsrc(tr, ins, &v, 0)?;
             uout(tr, &v, a)?;
         }
+        "v_movreld_b32" | "v_movrels_b32" | "v_movrelsd_b32" | "v_movrelsd_2_b32" => {
+            // Relative VGPR addressing: index offsets from M0 (movrelsd_2:
+            // source offset M0[9:0], destination offset M0[25:16]).
+            let m0 = tr.sreg(crate::OP_M0 as u32)?;
+            let (soff, doff) = match name {
+                "v_movrelsd_2_b32" => {
+                    let k = tr.u(0x3FF);
+                    let k16 = tr.u(16);
+                    let so = e(tr.b.bitwise_and(u, None, m0, k))?;
+                    let d = e(tr.b.shift_right_logical(u, None, m0, k16))?;
+                    let dof = e(tr.b.bitwise_and(u, None, d, k))?;
+                    (Some(so), Some(dof))
+                }
+                "v_movrels_b32" => (Some(m0), None),
+                "v_movreld_b32" => (None, Some(m0)),
+                _ => (Some(m0), Some(m0)),
+            };
+            let pt = tr.t.fn_u32;
+            let k255 = tr.u(255);
+            let val = match (soff, v.src[0]) {
+                (Some(off), sv) if sv >= 256 => {
+                    let base = tr.u((sv - 256) as u32);
+                    let idx = e(tr.b.i_add(u, None, base, off))?;
+                    let idx = e(tr.b.bitwise_and(u, None, idx, k255))?;
+                    let p = e(tr.b.access_chain(pt, None, tr.vgpr, [idx]))?;
+                    e(tr.b.load(u, None, p, None, []))?
+                }
+                _ => bsrc(tr, ins, &v, 0)?,
+            };
+            match doff {
+                Some(off) => {
+                    let base = tr.u(v.dst as u32);
+                    let idx = e(tr.b.i_add(u, None, base, off))?;
+                    let idx = e(tr.b.bitwise_and(u, None, idx, k255))?;
+                    let p = e(tr.b.access_chain(pt, None, tr.vgpr, [idx]))?;
+                    let act = tr.active()?;
+                    let old = e(tr.b.load(u, None, p, None, []))?;
+                    let nv = e(tr.b.select(u, None, act, val, old))?;
+                    ok(tr.b.store(p, nv, None, []))?;
+                }
+                None => uout(tr, &v, val)?,
+            }
+        }
         "v_cndmask_b32" => {
             let a = bsrc(tr, ins, &v, 0)?;
             let b = bsrc(tr, ins, &v, 1)?;

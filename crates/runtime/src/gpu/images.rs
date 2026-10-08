@@ -307,10 +307,56 @@ pub struct Image {
     views: HashMap<(vk::Format, vk::ImageViewType, u32, u32, u32, u32, [u8; 4], u8), vk::ImageView>,
     /// Written by the GPU: guest memory is no longer its source.
     pub gpu_written: bool,
-    /// Guest bytes the upload came from (re-checked once per frame).
-    source: Option<(u64, u64, u32, u16)>,
-    hash: u64,
+    /// Write-tracking region of the guest bytes the upload came from.
+    source: Option<u32>,
+    /// Sampled hashes of those bytes, one per page slice (see slice_hash).
+    hashes: [u64; SLICES],
+    /// Frame of the last slice check.
     checked_frame: u64,
+}
+
+/// Pages of a texture are checked for CPU writes in SLICES interleaved
+/// slices, one slice per frame (a change is seen within SLICES frames).
+const SLICES: usize = 8;
+
+/// Hash of `n` bytes at `a` (four independent lanes over 64-bit words).
+fn hash_bytes(a: u64, n: usize) -> u64 {
+    let mut h = [0x9E37_79B9_7F4A_7C15u64, 0xC2B2_AE3D_27D4_EB4F, 0x1656_67B1_9E37_79F9, 0x27D4_EB2F_1656_67C5];
+    let words = n / 8;
+    let p = a as *const u64;
+    let mut i = 0;
+    while i + 4 <= words {
+        for (l, hl) in h.iter_mut().enumerate() {
+            let x = unsafe { p.add(i + l).read_unaligned() };
+            *hl = (*hl ^ x).wrapping_mul(0x0000_0100_0000_01B3).rotate_left(29);
+        }
+        i += 4;
+    }
+    let mut tail = 0u64;
+    for k in i * 8..n {
+        tail = tail.rotate_left(8) ^ unsafe { *((a + k as u64) as *const u8) } as u64;
+    }
+    h[0] ^ h[1].rotate_left(17) ^ h[2].rotate_left(31) ^ h[3].rotate_left(47) ^ tail.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// Sampled hash of one slice of a guest range: the first 256 bytes of every
+/// SLICES-th 4 KiB page starting at page `slice`.
+fn slice_hash(base: u64, size: u64, slice: usize) -> u64 {
+    if !super::cp::guest_readable(base, size) {
+        return 0;
+    }
+    let mut h = 0u64;
+    let mut a = base + 4096 * slice as u64;
+    while a < base + size {
+        let n = 256.min(base + size - a) as usize;
+        h = h.rotate_left(5) ^ hash_bytes(a, n);
+        a += 4096 * SLICES as u64;
+    }
+    h
+}
+
+fn all_hashes(base: u64, size: u64) -> [u64; SLICES] {
+    std::array::from_fn(|s| slice_hash(base, size, s))
 }
 
 pub struct Images {
@@ -321,6 +367,9 @@ pub struct Images {
     fence: vk::Fence,
     reported: HashMap<String, u64>,
     pub uploads: u64,
+    pub reuploads: u64,
+    pub upload_bytes: u64,
+    pub upload_ns: u64,
 }
 
 unsafe impl Send for Images {}
@@ -339,35 +388,10 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
                 .expect("image pool");
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
-            *g = Some(Images { map: HashMap::new(), samplers: HashMap::new(), pool, cmd, fence, reported: HashMap::new(), uploads: 0 });
+            *g = Some(Images { map: HashMap::new(), samplers: HashMap::new(), pool, cmd, fence, reported: HashMap::new(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0 });
         }
     }
     f(g.as_mut().unwrap())
-}
-
-fn hash_bytes(b: &[u8]) -> u64 {
-    // FNV-1a over 64-bit words (cheap; detects content changes).
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for c in b.chunks(8) {
-        let mut w = [0u8; 8];
-        w[..c.len()].copy_from_slice(c);
-        h ^= u64::from_le_bytes(w);
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h
-}
-
-/// Sampled hash of a guest range: every 4 KiB page's first 256 bytes.
-fn sample_hash(base: u64, size: u64) -> u64 {
-    let mut h = 0u64;
-    let mut a = base;
-    while a < base + size {
-        let n = 256.min(base + size - a) as usize;
-        let s = unsafe { std::slice::from_raw_parts(a as *const u8, n) };
-        h = h.rotate_left(5) ^ hash_bytes(s);
-        a += 4096;
-    }
-    h
 }
 
 impl Images {
@@ -440,13 +464,13 @@ impl Images {
                 Ok(()) => {
                     if let Err(e) = c.device.wait_for_fences(&[self.fence], true, 10_000_000_000) {
                         if !super::exec::DEVICE_LOST.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                            crate::error!("images: upload/transition failed: {e}; GPU execution stops");
+                            crate::error!("images: upload/transition failed: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
                         }
                     }
                 }
                 Err(e) => {
                     if !super::exec::DEVICE_LOST.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                        crate::error!("images: submit failed: {e}; GPU execution stops");
+                        crate::error!("images: submit failed: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
                     }
                 }
             }
@@ -479,6 +503,17 @@ impl Images {
 
     /// Uploads all mips/layers of a guest texture (detiled) into `image`.
     fn upload(&mut self, image: vk::Image, key: ImageKey, t: &Tsharp) -> Result<(u64, u64), String> {
+        let t0 = std::time::Instant::now();
+        let r = self.upload_inner(image, key, t);
+        if let Ok((_, n)) = &r {
+            self.upload_bytes += n;
+        }
+        self.upload_ns += t0.elapsed().as_nanos() as u64;
+        r
+    }
+
+    fn upload_inner(&mut self, image: vk::Image, key: ImageKey, t: &Tsharp) -> Result<(u64, u64), String> {
+        let first = !self.map.contains_key(&key);
         if key.ty3d {
             return Err("3D (thick) texture layouts are not implemented".into());
         }
@@ -518,15 +553,22 @@ impl Images {
         let c = ctx();
         let (buf, mem, ptr) = c.host_buffer(staging.len().max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
         unsafe { std::ptr::copy_nonoverlapping(staging.as_ptr(), ptr, staging.len()) };
+        let base = t.base;
         self.one_shot(|cmd| unsafe {
+            super::vk::checkpoint(cmd, super::vk::mark::UPLOAD, base);
+            // A first upload starts from UNDEFINED; a re-upload keeps the
+            // layout and waits for earlier work using the image.
             let b = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
+                .old_layout(if first { vk::ImageLayout::UNDEFINED } else { vk::ImageLayout::GENERAL })
                 .new_layout(vk::ImageLayout::GENERAL)
                 .image(image)
                 .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS })
+                .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[b]);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[b]);
             c.device.cmd_copy_buffer_to_image(cmd, buf, image, vk::ImageLayout::GENERAL, &regions);
+            let a = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[a], &[], &[]);
         });
         unsafe {
             c.device.destroy_buffer(buf, None);
@@ -571,30 +613,70 @@ impl Images {
                 None
             }
         };
-        let hash = source.map(|(b, n)| sample_hash(b, n)).unwrap_or(0);
-        self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: false, source: source.map(|(b, n)| (b, n, t.sw_mode, t.format)), hash, checked_frame: frame });
+        let _ = frame;
+        // CPU writes to the source re-upload it (write tracking).
+        let region = source.and_then(|(b, n)| super::track::watch(b, n));
+        if source.is_some() && region.is_none() {
+            self.report(format!("texture {:#x} is not write-tracked (read-only or unmapped pages): later CPU updates are not seen", t.base));
+        }
+        let hashes = source.map(|(b, n)| all_hashes(b, n)).unwrap_or([0; SLICES]);
+        self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: false, source: region, hashes, checked_frame: frame });
         Ok(key)
     }
 
-    /// Re-uploads a CPU-sourced texture whose guest bytes changed (checked
-    /// once per frame).
+    /// Re-uploads a CPU-sourced texture whose guest bytes were written
+    /// since its upload (write tracking: CPU faults, file reads, GPU writes).
     fn refresh(&mut self, key: ImageKey, t: &Tsharp, frame: u64) -> Result<(), String> {
-        let (image, check) = {
-            let img = self.map.get_mut(&key).unwrap();
-            if img.gpu_written || img.checked_frame == frame {
-                return Ok(());
-            }
-            img.checked_frame = frame;
-            (img.image, img.source)
-        };
-        let Some((b, n, _, _)) = check else { return Ok(()) };
-        if !super::cp::guest_readable(b, n) {
+        let img = &self.map[&key];
+        if img.gpu_written {
             return Ok(());
         }
-        let h = sample_hash(b, n);
-        if h != self.map[&key].hash {
+        let (image, Some(region)) = (img.image, img.source) else { return Ok(()) };
+        let (b, n) = super::track::range(region).unwrap_or((0, 0));
+        if super::track::take_gpu_written(region) {
+            // GPU buffer writes (e.g. per-frame clears): re-upload only if
+            // the contents changed.
+            let h = all_hashes(b, n);
+            if h != self.map[&key].hashes {
+                self.reuploads += 1;
+                self.report(format!("texture {:#x} {}x{} re-uploaded (GPU write)", t.base, t.width, t.height));
+                self.upload(image, key, t)?;
+                self.map.get_mut(&key).unwrap().hashes = h;
+            }
+        }
+        if !super::track::protected() && self.map[&key].checked_frame != frame {
+            // CPU writes: one slice of the sampled hash per frame.
+            let img = self.map.get_mut(&key).unwrap();
+            img.checked_frame = frame;
+            let s = (frame as usize) % SLICES;
+            if slice_hash(b, n, s) != img.hashes[s] {
+                self.reuploads += 1;
+                self.report(format!("texture {:#x} {}x{} re-uploaded (CPU write)", t.base, t.width, t.height));
+                self.upload(image, key, t)?;
+                self.map.get_mut(&key).unwrap().hashes = all_hashes(b, n);
+            }
+        }
+        if let Some(why) = super::track::take_dirty(region) {
+            // Re-armed first: writes during the upload mark it dirty again.
+            super::track::rearm(region);
+            self.reuploads += 1;
+            if self.reuploads <= 12 {
+                crate::info!(
+                    "images: re-upload of {:#x} ({}x{}x{} format {} type {} sw_mode {} levels {} key {:?}): {why:?}",
+                    t.base, t.width, t.height, t.depth, t.format, t.ty, t.sw_mode, t.max_mip + 1, key
+                );
+            }
+            let msg = format!("texture {:#x} {}x{} re-uploaded ({})", t.base, t.width, t.height, match why {
+                super::track::Why::Fault(_) => "CPU write",
+                super::track::Why::HostWrite(_) => "file read or import",
+                super::track::Why::GpuWrite(..) => "GPU write",
+                super::track::Why::Remap(..) => "mapping change",
+                super::track::Why::Unmapped => "unmapped",
+                super::track::Why::None => "?",
+            });
+            self.report(msg);
             self.upload(image, key, t)?;
-            self.map.get_mut(&key).unwrap().hash = h;
+            self.map.get_mut(&key).unwrap().hashes = all_hashes(b, n);
         }
         Ok(())
     }
@@ -630,7 +712,7 @@ impl Images {
         } else {
             let image = self.create(key)?;
             self.to_general(image, key.format);
-            self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: true, source: None, hash: 0, checked_frame: 0 });
+            self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0 });
             key
         };
         self.map.get_mut(&k).unwrap().gpu_written = true;
@@ -851,5 +933,10 @@ impl Images {
 
     pub fn count(&self) -> usize {
         self.map.len()
+    }
+
+    /// One status line (hang reports).
+    pub fn status(&self) -> String {
+        format!("    images: {} cached, {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying)\n", self.map.len(), self.uploads, self.reuploads, self.upload_bytes >> 20, self.upload_ns / 1_000_000)
     }
 }

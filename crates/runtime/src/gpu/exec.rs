@@ -183,6 +183,10 @@ impl Shared {
             return None;
         }
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER;
+        // The driver pins the pages for writing: write-tracked (read-only)
+        // pages must be writable while importing (their regions turn dirty
+        // and are re-armed on their next use).
+        let _w = super::track::protected().then(|| super::track::host_write(start, end - start));
         let t0 = std::time::Instant::now();
         match ctx().import_host(start, end - start, usage) {
             Ok((buffer, _mem)) => {
@@ -375,6 +379,22 @@ const RING_BYTES: u64 = 8 << 20;
 const POOL_LIMITS: [u32; 5] = [4096, 32768, 8192, 2048, 8192];
 const POOL_TYPES: [vk::DescriptorType; 4] = [vk::DescriptorType::STORAGE_BUFFER, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorType::STORAGE_IMAGE, vk::DescriptorType::SAMPLER];
 
+/// `DS_TRACE_CS=<hex address>`: logs that compute shader's scalar-load
+/// values whenever they change (diagnosing data-dependent hangs).
+fn trace_loads(queue: &str, p: &Prepared, groups: [u32; 3]) {
+    static ADDR: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let a = *ADDR.get_or_init(|| std::env::var("DS_TRACE_CS").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()));
+    if a != Some(p.addr) {
+        return;
+    }
+    static LAST: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    let mut last = LAST.lock();
+    if *last != p.sgpr_data {
+        *last = p.sgpr_data.clone();
+        crate::info!("trace cs {:#x} [{queue}] {}x{}x{}: {}", p.addr, groups[0], groups[1], groups[2], shaders::describe_loads(p).join(" | "));
+    }
+}
+
 /// Descriptor writes of one shader stage.
 struct Bound {
     bufs: Vec<(u32, vk::DescriptorBufferInfo)>,
@@ -383,6 +403,39 @@ struct Bound {
     writes: Vec<(u64, u64)>,
     /// Images it samples or stores to.
     images: Vec<vk::Image>,
+    /// Buffers bound through a VRAM shadow (copied in before, out after).
+    shadows: Vec<Shadow>,
+}
+
+/// A guest buffer range shadowed in device memory for one dispatch: GPU
+/// atomics on host memory cross PCIe one by one (the title's compaction
+/// kernels spent 17-33 ms on ~60k atomics to a few counters) and small GPU
+/// stores to host memory run at ~0.2 GB/s; copies in and out use the DMA path.
+struct Shadow {
+    host: vk::Buffer,
+    /// Bound range within `host` (aligned start) and its offset in the shadow ring.
+    host_off: u64,
+    range: u64,
+    shadow_off: u64,
+    /// The resource's own bytes within the range (copied back).
+    bias: u64,
+    size: u64,
+}
+
+/// Device-local shadow space per slot.
+const SHADOW_BYTES: u64 = 16 << 20;
+/// Largest buffer shadowed (larger atomic targets stay in host memory).
+const SHADOW_MAX: u64 = 4 << 20;
+
+static SHADOWED: AtomicU64 = AtomicU64::new(0);
+/// Shadow candidates bound in host memory because the slot's shadow ring was full.
+static SHADOW_FULL: AtomicU64 = AtomicU64::new(0);
+
+/// `DS_GPU_SHADOW=0` binds written buffers in host memory directly (A/B
+/// comparisons of the shadow path).
+fn shadow_writes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_GPU_SHADOW").ok().as_deref() != Some("0"))
 }
 
 /// Guest ranges of a stage's textures (uploads read them).
@@ -474,7 +527,7 @@ fn completion_thread() {
             if let Err(e) = r {
                 if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
                     let list: Vec<String> = b.shaders.iter().map(|a| format!("{a:#x}")).collect();
-                    crate::error!("gpu[{}]: waiting for GPU work: {e}; GPU execution stops (batch shaders: {})", b.name, list.join(" "));
+                    crate::error!("gpu[{}]: waiting for GPU work: {e}; GPU execution stops (batch shaders: {}); checkpoints: {}", b.name, list.join(" "), super::vk::checkpoint_report());
                 }
             }
             FLUSHES.fetch_add(1, Ordering::Relaxed);
@@ -515,29 +568,52 @@ fn profiling() -> bool {
     *ON.get_or_init(|| std::env::var("DS_PROFILE_GPU").ok().as_deref() == Some("1"))
 }
 
-/// GPU time per shader (DS_PROFILE_GPU=1): address -> (dispatches, ns).
-static SHADER_TIME: Mutex<Option<HashMap<u64, (u64, u64)>>> = Mutex::new(None);
+/// Timestamps per timed dispatch (all BOTTOM_OF_PIPE): before the shadow
+/// copies in, before the dispatch, after it, after the copies out.
+const STAMPS: u32 = 4;
+
+/// GPU time per shader (DS_PROFILE_GPU=1): address -> [dispatches, dispatch
+/// ns, copy-in ns, copy-out ns].
+static SHADER_TIME: Mutex<Option<HashMap<u64, [u64; 4]>>> = Mutex::new(None);
+/// GPU time between timed dispatches (draws, CP copies, barriers), ns.
+static GAP_NS: AtomicU64 = AtomicU64::new(0);
+
+/// GPU time inside batches (first to last command), ns.
+static BATCH_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Reads a completed batch's dispatch timestamps into SHADER_TIME.
 fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64]) {
-    let n = (shaders.len() as u32).min(MAX_TIMED);
-    if pool == vk::QueryPool::null() || n == 0 {
+    if pool == vk::QueryPool::null() {
         return;
     }
     let c = ctx();
-    let mut data = vec![0u64; 2 * n as usize];
+    let mut be = [0u64; 2];
+    if unsafe { c.device.get_query_pool_results(pool, STAMPS * MAX_TIMED, &mut be, vk::QueryResultFlags::TYPE_64) }.is_ok() {
+        BATCH_NS.fetch_add((be[1].saturating_sub(be[0]) as f64 * c.limits.timestamp_period as f64) as u64, Ordering::Relaxed);
+    }
+    let n = (shaders.len() as u32).min(MAX_TIMED);
+    if n == 0 {
+        return;
+    }
+    let mut data = vec![0u64; (STAMPS * n) as usize];
     let r = unsafe { c.device.get_query_pool_results(pool, 0, &mut data, vk::QueryResultFlags::TYPE_64) };
     if r.is_err() {
         return;
     }
     let period = c.limits.timestamp_period as f64;
+    let ns = |a: u64, b: u64| (b.saturating_sub(a) as f64 * period) as u64;
     let mut g = SHADER_TIME.lock();
     let m = g.get_or_insert_with(HashMap::new);
     for (i, &a) in shaders.iter().take(n as usize).enumerate() {
-        let ns = (data[2 * i + 1].saturating_sub(data[2 * i]) as f64 * period) as u64;
-        let e = m.entry(a).or_insert((0, 0));
-        e.0 += 1;
-        e.1 += ns;
+        let q = &data[STAMPS as usize * i..STAMPS as usize * (i + 1)];
+        let e = m.entry(a).or_insert([0; 4]);
+        e[0] += 1;
+        e[1] += ns(q[1], q[2]);
+        e[2] += ns(q[0], q[1]);
+        e[3] += ns(q[2], q[3]);
+        if i > 0 {
+            GAP_NS.fetch_add(ns(data[STAMPS as usize * i - 1], q[0]), Ordering::Relaxed);
+        }
     }
 }
 
@@ -545,12 +621,20 @@ fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64]) {
 pub fn shader_profile() -> String {
     let g = SHADER_TIME.lock();
     let Some(m) = g.as_ref() else { return String::new() };
-    let mut v: Vec<(&u64, &(u64, u64))> = m.iter().collect();
-    v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
-    let total: u64 = m.values().map(|x| x.1).sum();
-    let mut s = format!("    gpu time by shader ({} ms in total):\n", total / 1_000_000);
-    for (a, (n, ns)) in v.iter().take(15) {
-        s.push_str(&format!("      cs {a:#x}: {} ms in {n} dispatches ({} us each)\n", ns / 1_000_000, ns / 1000 / (*n).max(1)));
+    let mut v: Vec<(&u64, &[u64; 4])> = m.iter().collect();
+    v.sort_by(|a, b| (b.1[1] + b.1[2] + b.1[3]).cmp(&(a.1[1] + a.1[2] + a.1[3])));
+    let tot = |k: usize| m.values().map(|x| x[k]).sum::<u64>() / 1_000_000;
+    let mut s = format!(
+        "    gpu time: batches {} ms; dispatches {} ms, shadow copies in {} ms / out {} ms, between timed dispatches {} ms\n",
+        BATCH_NS.load(Ordering::Relaxed) / 1_000_000,
+        tot(1),
+        tot(2),
+        tot(3),
+        GAP_NS.load(Ordering::Relaxed) / 1_000_000
+    );
+    for (a, x) in v.iter().take(15) {
+        let n = x[0].max(1);
+        s.push_str(&format!("      cs {a:#x}: {} dispatches, {} us each (+ copies {} / {} us)\n", x[0], x[1] / 1000 / n, x[2] / 1000 / n, x[3] / 1000 / n));
     }
     s
 }
@@ -586,6 +670,9 @@ pub struct Exec {
     rendering: Option<draw::Rendering>,
     /// Descriptor pool usage of the recording slot (see POOL_LIMITS).
     pool_use: [u32; 5],
+    /// Device-local shadow ring (SHADOW_BYTES per slot) and its use in the recording slot.
+    shadow: vk::Buffer,
+    shadow_used: u64,
 }
 
 unsafe impl Send for Exec {}
@@ -608,13 +695,14 @@ impl Exec {
                     desc_pool: c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(POOL_LIMITS[0]).pool_sizes(&sizes), None).map_err(|e| e.to_string())?,
                     seq: 0,
                     queries: if profiling() {
-                        c.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(2 * MAX_TIMED), None).map_err(|e| e.to_string())?
+                        c.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(STAMPS * MAX_TIMED + 2), None).map_err(|e| e.to_string())?
                     } else {
                         vk::QueryPool::null()
                     },
                 });
             }
             let (ring, _mem, ring_ptr) = c.host_buffer(RING_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let (shadow, _smem) = c.device_buffer(SHADOW_BYTES * SLOTS as u64, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)?;
             Ok(Exec {
                 pool,
                 slots,
@@ -636,6 +724,8 @@ impl Exec {
                 batch_shaders: Vec::new(),
                 rendering: None,
                 pool_use: [0; 5],
+                shadow,
+                shadow_used: 0,
             })
         }
     }
@@ -672,12 +762,17 @@ impl Exec {
             ctx().device.begin_command_buffer(self.cmd(), &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
             let qp = self.slots[self.cur].queries;
             if qp != vk::QueryPool::null() {
-                ctx().device.cmd_reset_query_pool(self.cmd(), qp, 0, 2 * MAX_TIMED);
+                ctx().device.cmd_reset_query_pool(self.cmd(), qp, 0, STAMPS * MAX_TIMED + 2);
             }
         }
         global_barrier(self.cmd());
+        let qp = self.slots[self.cur].queries;
+        if qp != vk::QueryPool::null() {
+            unsafe { ctx().device.cmd_write_timestamp(self.cmd(), vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED) };
+        }
         self.recording = true;
         self.pool_use = [0; 5];
+        self.shadow_used = 0;
     }
 
     /// Submits the recorded batch without waiting for it (its actions run
@@ -694,6 +789,9 @@ impl Exec {
         let c = ctx();
         let i = self.cur;
         let (cmd, fence) = (self.slots[i].cmd, self.slots[i].fence);
+        if self.slots[i].queries != vk::QueryPool::null() {
+            unsafe { c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.slots[i].queries, STAMPS * MAX_TIMED + 1) };
+        }
         unsafe {
             // Make shader writes to imported memory visible to the host.
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
@@ -709,7 +807,7 @@ impl Exec {
             }
             if let Err(e) = c.submit(cmd, &[], &[], fence) {
                 if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
-                    crate::error!("gpu[{name}]: {e}; GPU execution stops");
+                    crate::error!("gpu[{name}]: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
                 }
             }
         });
@@ -807,8 +905,23 @@ impl Exec {
                 }
             }
         }
+        // Shadow space for written buffers (dispatches; see bind_stage).
+        let mut shadow = 0u64;
+        for p in stages {
+            for b in &p.tr.out.bindings {
+                if let BindingKind::Buffer(i) = b.kind {
+                    if let (Some(Resolved::Buffer(v)), true) = (p.resources.get(i), p.tr.plan.resources[i].written) {
+                        if let Some(n) = v.byte_size().filter(|&n| n + 16 <= SHADOW_MAX) {
+                            shadow += n + 16 + 256;
+                        }
+                    }
+                }
+            }
+        }
         let seg = RING_BYTES / SLOTS as u64;
-        let fits = self.ring_used.next_multiple_of(self.ring_align) + ring <= seg && (0..5).all(|k| self.pool_use[k] + need[k] <= POOL_LIMITS[k]);
+        let fits = self.ring_used.next_multiple_of(self.ring_align) + ring <= seg
+            && (0..5).all(|k| self.pool_use[k] + need[k] <= POOL_LIMITS[k])
+            && (shadow == 0 || self.shadow_used + shadow <= SHADOW_BYTES);
         if !fits {
             self.submit();
             self.begin();
@@ -820,9 +933,11 @@ impl Exec {
 
     /// Buffer, image and sampler bindings of a stage; fills the resource
     /// info blocks of its SGPR data.
-    fn bind_stage(&mut self, p: &mut Prepared) -> Result<Bound, String> {
+    fn bind_stage(&mut self, p: &mut Prepared, allow_shadow: bool) -> Result<Bound, String> {
         let res_info = rdna::translate::res_info_offset(&p.tr.plan) as usize;
-        let mut bound = Bound { bufs: Vec::new(), imgs: Vec::new(), writes: Vec::new(), images: Vec::new() };
+        let mut bound = Bound { bufs: Vec::new(), imgs: Vec::new(), writes: Vec::new(), images: Vec::new(), shadows: Vec::new() };
+        let seg = SHADOW_BYTES;
+        let shadow_base = seg * self.cur as u64;
         {
             let mut sh = shared();
             for b in &p.tr.out.bindings {
@@ -852,6 +967,19 @@ impl Exec {
                                     bound_size = size;
                                     if p.tr.plan.resources[i].written {
                                         bound.writes.push((base, size));
+                                    }
+                                    // Written buffers: a device-local copy for this dispatch
+                                    // (GPU atomics and stores to host memory are slow).
+                                    let s_off = self.shadow_used.next_multiple_of(256);
+                                    let want = allow_shadow && shadow_writes() && p.tr.plan.resources[i].written && range <= SHADOW_MAX;
+                                    if want && s_off + range > seg {
+                                        SHADOW_FULL.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    if want && s_off + range <= seg {
+                                        self.shadow_used = s_off + range;
+                                        bound.shadows.push(Shadow { host: buffer, host_off: off, range, shadow_off: shadow_base + s_off, bias, size });
+                                        info = vk::DescriptorBufferInfo { buffer: self.shadow, offset: shadow_base + s_off, range };
+                                        SHADOWED.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
                                 None => {
@@ -967,10 +1095,11 @@ impl Exec {
             return Ok(());
         }
         let t_prep = t0.elapsed();
+        trace_loads(&self.name, &p, groups);
         let (pipeline, layout, set_layout) = shared().pipeline(&p)?;
         let t_pipe = t0.elapsed();
         self.reserve(&[&p]);
-        let mut bound = self.bind_stage(&mut p)?;
+        let mut bound = self.bind_stage(&mut p, true)?;
         self.bind_sgpr(&p, &mut bound)?;
         let t_bind = t0.elapsed();
         let set = self.alloc_set(set_layout)?;
@@ -978,14 +1107,32 @@ impl Exec {
         self.write_set(set, std::slice::from_ref(&bound));
         self.end_rendering();
         let c = ctx();
+        let qp = self.slots[self.cur].queries;
+        let ti = self.batch_shaders.len() as u32;
+        let stamp = |k: u32| {
+            if qp != vk::QueryPool::null() && ti < MAX_TIMED {
+                unsafe { ctx().device.cmd_write_timestamp(self.cmd(), vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * ti + k) };
+            }
+        };
+        stamp(0);
+        if !bound.shadows.is_empty() {
+            super::vk::checkpoint(self.cmd(), super::vk::mark::SHADOW_IN, p.addr);
+            // Shadows get the guest data first (earlier writes are ordered by
+            // the barrier after every dispatch).
+            unsafe {
+                for sh in &bound.shadows {
+                    let r = vk::BufferCopy { src_offset: sh.host_off, dst_offset: sh.shadow_off, size: sh.range };
+                    c.device.cmd_copy_buffer(self.cmd(), sh.host, self.shadow, &[r]);
+                }
+                let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                c.device.cmd_pipeline_barrier(self.cmd(), vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            }
+        }
+        stamp(1);
+        super::vk::checkpoint(self.cmd(), super::vk::mark::DISPATCH, p.addr);
         let start = [cp.reg(Space::Sh, 0x204), cp.reg(Space::Sh, 0x205), cp.reg(Space::Sh, 0x206)];
         unsafe {
             let cmd = self.cmd();
-            let qp = self.slots[self.cur].queries;
-            let ti = self.batch_shaders.len() as u32;
-            if qp != vk::QueryPool::null() && ti < MAX_TIMED {
-                c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, qp, 2 * ti);
-            }
             c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
             if start != [0, 0, 0] {
@@ -993,11 +1140,24 @@ impl Exec {
             } else {
                 c.device.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
             }
-            if qp != vk::QueryPool::null() && ti < MAX_TIMED {
-                c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, 2 * ti + 1);
-            }
         }
+        stamp(2);
         global_barrier(self.cmd());
+        if !bound.shadows.is_empty() {
+            super::vk::checkpoint(self.cmd(), super::vk::mark::SHADOW_OUT, p.addr);
+            // Results back to guest memory (the resource's own bytes only).
+            unsafe {
+                for sh in &bound.shadows {
+                    let r = vk::BufferCopy { src_offset: sh.shadow_off + sh.bias, dst_offset: sh.host_off + sh.bias, size: sh.size.min(sh.range - sh.bias) };
+                    c.device.cmd_copy_buffer(self.cmd(), self.shadow, sh.host, &[r]);
+                }
+            }
+            global_barrier(self.cmd());
+        }
+        stamp(3);
+        for &(b, n) in &writes_here {
+            super::track::gpu_write(b, n);
+        }
         self.pending_writes.extend(writes_here);
         EXECUTED.fetch_add(1, Ordering::Relaxed);
         self.batch_shaders.push(p.addr);
@@ -1037,8 +1197,10 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed, {} skipped; {} draws executed, {} without effect, {} skipped; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} buffers shadowed in VRAM, {} not for lack of space), {} skipped; {} draws executed, {} without effect, {} skipped; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
+        SHADOWED.load(Ordering::Relaxed),
+        SHADOW_FULL.load(Ordering::Relaxed),
         SKIPPED.load(Ordering::Relaxed),
         draw::DRAWN.load(Ordering::Relaxed),
         draw::DRAW_NOOP.load(Ordering::Relaxed),
@@ -1046,6 +1208,8 @@ pub fn status() -> String {
         FLUSHES.load(Ordering::Relaxed),
         verify::status(),
         super::cp::sync_summary()
-    ) + &format!("    gpu completion: {} ms waiting for fences, {} ms in actions
+    ) + &super::images::IMAGES.try_lock().and_then(|g| g.as_ref().map(|i| i.status())).unwrap_or_default()
+        + &super::track::status()
+        + &format!("    gpu completion: {} ms waiting for fences, {} ms in actions
 ", FENCE_NS.load(Ordering::Relaxed) / 1_000_000, ACTION_NS.load(Ordering::Relaxed) / 1_000_000)
 }

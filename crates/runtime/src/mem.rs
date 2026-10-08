@@ -154,17 +154,20 @@ pub fn reserve_guest_range() -> Result<(), String> {
 }
 
 fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
+    crate::gpu::track::remapped(addr, size);
     let p = unsafe { VirtualAlloc(addr as _, size as usize, MEM_COMMIT, win_prot(prot)) };
     if p.is_null() { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
 }
 
 fn host_decommit(addr: u64, size: u64) {
+    crate::gpu::track::remapped(addr, size);
     unsafe {
         VirtualFree(addr as _, size as usize, MEM_DECOMMIT);
     }
 }
 
 pub fn host_protect(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
+    crate::gpu::track::remapped(addr, size);
     let mut old = 0u32;
     let ok = unsafe { VirtualProtect(addr as _, size as usize, win_prot(prot), &mut old) };
     if ok == 0 { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
