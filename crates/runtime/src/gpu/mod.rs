@@ -4,12 +4,16 @@
 //! Command buffers submitted through libSceAgcDriver are queued per hardware
 //! queue (graphics, or a compute queue id) and executed in submission order
 //! by one command-processor thread per queue, concurrently with the CPU, as
-//! on the console. Draws and dispatches are decoded but not rendered yet
-//! (docs/STATUS.md).
+//! on the console. Dispatches run on Vulkan with `DS_GPU=1` (`exec`); draws
+//! are decoded but not rendered yet (docs/STATUS.md).
 
 pub mod capture;
 pub mod cp;
+pub mod desc;
+pub mod exec;
 pub mod png;
+pub mod shaders;
+pub mod verify;
 pub mod vk;
 
 use parking_lot::{Condvar, Mutex};
@@ -42,6 +46,8 @@ struct Queue {
     cv: Condvar,
     /// Submissions completed (diagnostics).
     done: AtomicU64,
+    /// Host thread id of the queue's command processor (stack samples).
+    tid: std::sync::atomic::AtomicU32,
 }
 
 static QUEUES: Mutex<Vec<&'static Queue>> = Mutex::new(Vec::new());
@@ -51,7 +57,7 @@ fn queue(id: u32) -> &'static Queue {
     if let Some(q) = qs.iter().find(|q| q.id == id) {
         return q;
     }
-    let q: &'static Queue = Box::leak(Box::new(Queue { id, pending: Mutex::new(VecDeque::new()), cv: Condvar::new(), done: AtomicU64::new(0) }));
+    let q: &'static Queue = Box::leak(Box::new(Queue { id, pending: Mutex::new(VecDeque::new()), cv: Condvar::new(), done: AtomicU64::new(0), tid: std::sync::atomic::AtomicU32::new(0) }));
     qs.push(q);
     let name = if id == GFX { "gpu-gfx".to_string() } else { format!("gpu-acb{id:#x}") };
     crate::info!("gpu: {name} command processor started");
@@ -61,6 +67,7 @@ fn queue(id: u32) -> &'static Queue {
 
 fn worker(q: &'static Queue, name: &str) {
     crate::log::set_thread_name(name);
+    q.tid.store(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }, Ordering::Relaxed);
     crate::exception::arm_watch_current_thread();
     let mut cp = cp::Cp::new(name, q.id != GFX);
     loop {
@@ -91,8 +98,57 @@ pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
     q.cv.notify_one();
 }
 
+/// `DS_PROFILE_GPU=1`: samples the GPU queue threads every 10 ms; the most
+/// frequent host stacks (top 3 frames) are listed in hang reports.
+static PROFILE: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(None);
+
+pub fn start_profiler() {
+    if std::env::var("DS_PROFILE_GPU").ok().as_deref() != Some("1") {
+        return;
+    }
+    *PROFILE.lock() = Some(std::collections::HashMap::new());
+    let _ = crate::thread::spawn_host(
+        "gpu-profiler",
+        1 << 20,
+        Box::new(|| {
+            crate::log::set_thread_name("gpu-profiler");
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let qs: Vec<&'static Queue> = QUEUES.lock().clone();
+                for q in qs {
+                    let Some(st) = crate::exception::sample_thread(q.tid.load(Ordering::Relaxed), 0) else { continue };
+                    let host = st.lines().next().unwrap_or("").trim().trim_start_matches("host: ").to_string();
+                    let key: Vec<&str> = host.split(" <- ").take(4).collect();
+                    let name = if q.id == GFX { "gfx".to_string() } else { format!("acb{:#x}", q.id) };
+                    let k = format!("{name}: {}", key.join(" <- "));
+                    if let Some(m) = PROFILE.lock().as_mut() {
+                        *m.entry(k).or_default() += 1;
+                    }
+                }
+            }
+        }),
+    );
+}
+
+fn profile_summary() -> String {
+    let g = PROFILE.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(&String, &u64)> = m.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1));
+    let mut s = String::from("    gpu profile (10 ms samples):\n");
+    for (k, n) in v.iter().take(20) {
+        s.push_str(&format!("      {n:6}  {k}\n"));
+    }
+    s
+}
+
 /// One line per queue for hang reports.
 pub fn status() -> String {
+    status_ex(false)
+}
+
+/// Queue lines, with host stack samples of the command processors.
+pub fn status_ex(with_stacks: bool) -> String {
     let mut s = String::new();
     let qs: Vec<&'static Queue> = match QUEUES.try_lock() {
         Some(g) => g.clone(),
@@ -103,6 +159,11 @@ pub fn status() -> String {
         let name = if q.id == GFX { "gpu-gfx".to_string() } else { format!("gpu-acb{:#x}", q.id) };
         let state = cp::STATE.try_lock().and_then(|g| g.iter().find(|(n, _)| *n == name).map(|(_, s)| s.clone())).unwrap_or_else(|| "idle".into());
         s.push_str(&format!("    {name}: {} submission(s) done, {pending} pending; {state}\n", q.done.load(Ordering::Relaxed)));
+        if with_stacks {
+            if let Some(st) = crate::exception::sample_thread(q.tid.load(Ordering::Relaxed), 16) {
+                s.push_str(&format!("        {st}\n"));
+            }
+        }
     }
     s.push_str(&format!(
         "    gpu totals: {} submits, {} packets, {} draws, {} dispatches, {} EOP interrupts, {} flips\n",
@@ -113,5 +174,8 @@ pub fn status() -> String {
         cp::EOP_INTERRUPTS.load(Ordering::Relaxed),
         FRAMES.load(Ordering::Relaxed)
     ));
+    s.push_str(&exec::status());
+    s.push_str(&profile_summary());
+    s.push_str(&exec::shader_profile());
     s
 }

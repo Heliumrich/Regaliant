@@ -252,6 +252,12 @@ pub(crate) struct T<'a> {
     pub mrt_mask: u32,
     pub pc_var: Word,
     pub sb_struct: Option<Word>,
+    /// Binding of each raw buffer variable, and its uvec2/uvec4 views
+    /// (aliases of the same binding for aligned 8/16-byte accesses).
+    pub buffer_binding: HashMap<Word, u32>,
+    pub buffer_views: HashMap<(Word, u32), Word>,
+    /// Block struct types of the vector views (created once: types are deduplicated).
+    pub view_structs: HashMap<u32, Word>,
 }
 
 pub type R<T> = Result<T, String>;
@@ -450,6 +456,34 @@ impl<'a> T<'a> {
         };
         let pt = self.b.type_pointer(None, StorageClass::StorageBuffer, st);
         self.global_var(pt, StorageClass::StorageBuffer)
+    }
+
+    /// `struct { uvecN data[]; }` view (N = 2 or 4) of the binding of raw
+    /// buffer variable `var`, for aligned 8/16-byte accesses.
+    pub fn vec_view(&mut self, var: Word, n: u32) -> Option<Word> {
+        if let Some(&v) = self.buffer_views.get(&(var, n)) {
+            return Some(v);
+        }
+        let binding = *self.buffer_binding.get(&var)?;
+        let st = match self.view_structs.get(&n) {
+            Some(&s) => s,
+            None => {
+                let vt = if n == 2 { self.t.v2u } else { self.t.v4u };
+                let rta = self.b.type_runtime_array(vt);
+                self.b.decorate(rta, Decoration::ArrayStride, [Operand::LiteralBit32(4 * n)]);
+                let st = self.b.type_struct([rta]);
+                self.b.decorate(st, Decoration::Block, []);
+                self.b.member_decorate(st, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
+                self.view_structs.insert(n, st);
+                st
+            }
+        };
+        let pt = self.b.type_pointer(None, StorageClass::StorageBuffer, st);
+        let v = self.global_var(pt, StorageClass::StorageBuffer);
+        self.decorate_binding(v, binding);
+        self.b.decorate(v, Decoration::Aliased, []);
+        self.buffer_views.insert((var, n), v);
+        Some(v)
     }
 
     /// This invocation's index in its subgroup (for cross-lane operations).
@@ -708,6 +742,9 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         mrt_mask: 0,
         pc_var: 0,
         sb_struct: None,
+        buffer_binding: HashMap::new(),
+        buffer_views: HashMap::new(),
+        view_structs: HashMap::new(),
     };
     // SGPR data buffer (binding base + 0).
     let sd = tr.sb_var();
@@ -727,6 +764,9 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
                 let v = tr.sb_var();
                 let bnd = tr.alloc_binding(BindingKind::Buffer(i));
                 tr.decorate_binding(v, bnd);
+                // Vector views of the same binding alias it.
+                tr.b.decorate(v, Decoration::Aliased, []);
+                tr.buffer_binding.insert(v, bnd);
                 tr.buffers.insert(i, v);
             }
             (ResKind::Image, Some(ResSpec::Image { dim, class })) => {

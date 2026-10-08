@@ -4,6 +4,7 @@
 //! generated `tables` (Mesa ACO's opcode table, gfx10 column).
 
 pub mod analysis;
+pub mod capture;
 pub mod format;
 pub mod translate;
 pub mod tables;

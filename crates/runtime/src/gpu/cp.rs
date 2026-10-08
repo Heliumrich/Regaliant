@@ -7,10 +7,10 @@
 //! COPY_DATA, DMA_DATA), flips and the private Agc packets
 //! (`hle::libs::agc_cmd`).
 //!
-//! Draws and dispatches are decoded and counted; they are not rendered yet
-//! (no shader translation or Vulkan pipeline exists). Memory and labels are
-//! written exactly as the packets request, so CPU/GPU synchronisation runs
-//! as on hardware.
+//! With `DS_GPU=1`, dispatches run on Vulkan (`exec`); the recorded GPU work
+//! is completed before any packet that touches memory or synchronizes, so
+//! labels and CPU/GPU synchronisation stay ordered as on hardware. Draws are
+//! decoded and counted but not rendered yet.
 
 use crate::hle::libs::agc_cmd::{DS_MAGIC, op, pop};
 use std::collections::HashSet;
@@ -28,6 +28,15 @@ pub static DRAWS: AtomicU64 = AtomicU64::new(0);
 pub static DISPATCHES: AtomicU64 = AtomicU64::new(0);
 pub static PACKETS: AtomicU64 = AtomicU64::new(0);
 pub static EOP_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+/// GPU completions waited for, by the PM4 opcode that required them.
+pub static SYNC_BY_OPCODE: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+
+/// Most frequent synchronizing opcodes (diagnostics).
+pub fn sync_summary() -> String {
+    let mut v: Vec<(u64, usize)> = SYNC_BY_OPCODE.iter().enumerate().map(|(i, c)| (c.load(Ordering::Relaxed), i)).filter(|x| x.0 > 0).collect();
+    v.sort_by(|a, b| b.cmp(a));
+    v.iter().take(6).map(|(n, op)| format!("{op:#x}: {n}")).collect::<Vec<_>>().join(", ")
+}
 
 /// Register file of one queue.
 pub struct Regs {
@@ -62,10 +71,18 @@ pub struct Cp {
     ctx_stack: Vec<Vec<u32>>,
     /// Address of the packet being executed / address being polled.
     cur_packet: u64,
+    /// Opcode of the packet being executed (private packets: 0x100 + op).
+    cur_opcode: u32,
     waiting_on: u64,
     unknown_seen: HashSet<u32>,
     notes_seen: HashSet<&'static str>,
     depth: u32,
+    /// Vulkan executor (created on the first dispatch when enabled).
+    exec: Option<super::exec::Exec>,
+    exec_failed: bool,
+    /// A partial flush / acquire was requested: the next CP memory write
+    /// must wait for the GPU work before it.
+    fence_pending: bool,
 }
 
 unsafe fn rd32(a: u64) -> u32 {
@@ -92,7 +109,7 @@ fn valid(a: u64, len: u64) -> bool {
 
 /// Whether guest memory [a, a+len) is mapped and readable.
 pub fn guest_readable(a: u64, len: u64) -> bool {
-    valid(a, len) && crate::exception::readable(a) && crate::exception::readable((a + len.saturating_sub(1)) & !0xFFF)
+    valid(a, len) && crate::mem::mapped(a, len)
 }
 
 /// GPU timestamp (100 MHz, like the console's GPU clock counter).
@@ -157,11 +174,77 @@ impl Cp {
             markers: Vec::new(),
             ctx_stack: Vec::new(),
             cur_packet: 0,
+            cur_opcode: 0,
             waiting_on: 0,
             unknown_seen: HashSet::new(),
             notes_seen: HashSet::new(),
             depth: 0,
+            exec: None,
+            exec_failed: false,
+            fence_pending: false,
         }
+    }
+
+    /// Completes recorded GPU work (at synchronization points: the CP waits
+    /// for shader work only where the packet stream asks it to).
+    fn sync(&mut self) {
+        self.fence_pending = false;
+        if let Some(e) = self.exec.as_mut() {
+            if e.busy() {
+                let k = (self.cur_opcode as usize).min(255);
+                SYNC_BY_OPCODE[k].fetch_add(1, Ordering::Relaxed);
+            }
+            e.flush();
+        }
+    }
+
+    /// Runs a CP memory effect now, or after this queue's outstanding GPU
+    /// work and earlier deferred effects. `end_of_pipe` effects (RELEASE_MEM)
+    /// always follow the GPU work; other CP writes follow it only after a
+    /// partial flush or acquire (otherwise the CP does not wait for shaders),
+    /// and later GPU work then waits for them (it may read what they write).
+    fn effect(&mut self, end_of_pipe: bool, write: Option<(u64, u64)>, f: Box<dyn FnOnce() + Send>) {
+        let needs_prior = end_of_pipe || self.fence_pending;
+        match self.exec.as_mut() {
+            Some(e) if e.busy() && (needs_prior || e.deferred_pending()) => {
+                self.fence_pending = false;
+                e.after_gpu(f, write, !end_of_pipe);
+            }
+            _ => {
+                if needs_prior {
+                    self.fence_pending = false;
+                }
+                f()
+            }
+        }
+    }
+
+    /// Hands recorded GPU work to the device without waiting.
+    fn submit_gpu(&mut self) {
+        if let Some(e) = self.exec.as_mut() {
+            e.submit();
+        }
+    }
+
+    /// Executes a dispatch (when GPU execution is enabled).
+    fn dispatch(&mut self, groups: [u32; 3], initiator: u32) {
+        if !super::exec::enabled() || self.exec_failed {
+            self.note("dispatches are decoded but not executed (set DS_GPU=1 to run them)");
+            return;
+        }
+        if self.exec.is_none() {
+            match super::exec::Exec::new(&self.name) {
+                Ok(e) => self.exec = Some(e),
+                Err(e) => {
+                    crate::error!("gpu[{}]: no executor: {e}", self.name);
+                    self.exec_failed = true;
+                    return;
+                }
+            }
+        }
+        let mut e = self.exec.take().unwrap();
+        e.dispatch(self, groups, initiator);
+        self.exec = Some(e);
     }
 
     fn note(&mut self, what: &'static str) {
@@ -247,6 +330,7 @@ impl Cp {
             }
             PACKETS.fetch_add(1, Ordering::Relaxed);
             self.cur_packet = cur;
+            self.cur_opcode = opcode;
             let p = |i: u64| unsafe { rd32(cur + 4 * (1 + i)) };
             match self.packet(opcode, h, cur, n, &p) {
                 Flow::Next => cur = next,
@@ -259,6 +343,9 @@ impl Cp {
             }
         }
         self.depth -= 1;
+        if self.depth == 0 {
+            self.submit_gpu();
+        }
     }
 
     fn packet(&mut self, opcode: u32, h: u32, at: u64, n: u64, p: &dyn Fn(u64) -> u32) -> Flow {
@@ -279,7 +366,11 @@ impl Cp {
             op::CLEAR_STATE => {
                 self.regs.ctx.fill(0);
             }
-            op::CONTEXT_CONTROL | op::PFP_SYNC_ME | op::EVENT_WRITE | op::ACQUIRE_MEM => {}
+            op::CONTEXT_CONTROL | op::PFP_SYNC_ME => {}
+            // Partial flushes, cache actions and acquires order later work
+            // after earlier work: GPU work is already ordered by barriers, so
+            // only a following CP memory write has to wait (see `fence`).
+            op::EVENT_WRITE | op::ACQUIRE_MEM => self.fence_pending = true,
             op::INDEX_TYPE => self.set_reg(Space::Uc, crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE, p(0)),
             op::INDEX_BASE => self.index_base = addr64(p(0), p(1)),
             op::INDEX_BUFFER_SIZE => self.index_count = p(0),
@@ -311,7 +402,17 @@ impl Cp {
             }
             op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT => {
                 DISPATCHES.fetch_add(1, Ordering::Relaxed);
-                self.note("dispatches are decoded but not executed yet (no shader translation)");
+                if opcode == op::DISPATCH_DIRECT {
+                    self.dispatch([p(0), p(1), p(2)], p(3));
+                } else {
+                    // Arguments may have been written by earlier GPU work.
+                    self.sync();
+                    let a = self.dispatch_indirect_base + p(0) as u64;
+                    if valid(a, 12) {
+                        let g = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8)] };
+                        self.dispatch(g, p(1));
+                    }
+                }
                 if super::capture::capturing() {
                     let what = if opcode == op::DISPATCH_DIRECT {
                         format!("DISPATCH_DIRECT {}x{}x{}", p(0), p(1), p(2))
@@ -321,19 +422,25 @@ impl Cp {
                     super::capture::dispatch(self, &what);
                 }
             }
+            // CP memory writes wait for shaders only after a partial flush or
+            // acquire (titles synchronize with those or RELEASE_MEM first).
             op::WRITE_DATA => self.write_data(n, p),
             op::COPY_DATA => self.copy_data(p),
             op::DMA_DATA => self.dma_data(p),
             op::RELEASE_MEM => self.release_mem(p),
             op::WAIT_REG_MEM => {
+                // Let recorded work and deferred effects progress while polling.
+                self.submit_gpu();
                 let c = p(0);
                 return self.wait(c, addr64(p(1), p(2)), false, p(3) as u64, p(4) as u64, at);
             }
             op::WAIT_REG_MEM64 => {
+                self.submit_gpu();
                 let c = p(0);
                 return self.wait(c, addr64(p(1), p(2)), true, addr64(p(3), p(4)), addr64(p(5), p(6)), at);
             }
             op::COND_EXEC => {
+                self.sync();
                 let a = addr64(p(0), p(1));
                 let skip = p(3) & 0x3FFF;
                 if valid(a, 4) && unsafe { rd32(a) } == 0 {
@@ -398,13 +505,25 @@ impl Cp {
                     crate::error!("gpu[{}]: WRITE_DATA to {a:#x} outside guest memory", self.name);
                     return;
                 }
-                for i in 0..count {
-                    let d = if no_incr { a } else { a + 4 * i };
-                    unsafe { wr32(d, p(3 + i)) };
+                if count == 0 {
+                    return;
                 }
-                if count <= 4 {
-                    note_write(&self.name, a, p(3) as u64 | ((if count > 1 { p(4) } else { 0 }) as u64) << 32, self.cur_packet);
-                }
+                let vals: Vec<u32> = (0..count).map(|i| p(3 + i)).collect();
+                let (name, at) = (self.name.clone(), self.cur_packet);
+                let len = if no_incr { 4 } else { 4 * count };
+                self.effect(
+                    false,
+                    Some((a, len)),
+                    Box::new(move || {
+                        for (i, v) in vals.iter().enumerate() {
+                            let d = if no_incr { a } else { a + 4 * i as u64 };
+                            unsafe { wr32(d, *v) };
+                        }
+                        if vals.len() <= 4 {
+                            note_write(&name, a, vals[0] as u64 | (vals.get(1).copied().unwrap_or(0) as u64) << 32, at);
+                        }
+                    }),
+                );
             }
             0 => {
                 for i in 0..count {
@@ -439,20 +558,23 @@ impl Cp {
         let wide = (c >> 16) & 1 != 0;
         let src_v = addr64(p(1), p(2));
         let dst_a = addr64(p(3), p(4));
-        let value: u64 = match src {
-            0 => self.reg_by_addr(src_v as u32) as u64,
-            1 | 2 => {
-                if !valid(src_v, 8) {
-                    crate::error!("gpu[{}]: COPY_DATA from {src_v:#x} outside guest memory", self.name);
-                    return;
+        if matches!(src, 1 | 2) && !valid(src_v, 8) {
+            crate::error!("gpu[{}]: COPY_DATA from {src_v:#x} outside guest memory", self.name);
+            return;
+        }
+        if !matches!(src, 0 | 1 | 2 | 5 | 9) {
+            self.note("COPY_DATA from GDS/perf counters reads 0");
+        }
+        let reg = if src == 0 { self.reg_by_addr(src_v as u32) as u64 } else { 0 };
+        let read = move || -> u64 {
+            match src {
+                0 => reg,
+                1 | 2 => {
+                    if wide { unsafe { rd64(src_v) } } else { (unsafe { rd32(src_v) }) as u64 }
                 }
-                if wide { unsafe { rd64(src_v) } } else { (unsafe { rd32(src_v) }) as u64 }
-            }
-            5 => src_v,
-            9 => gpu_clock(),
-            _ => {
-                self.note("COPY_DATA from GDS/perf counters reads 0");
-                0
+                5 => src_v,
+                9 => gpu_clock(),
+                _ => 0,
             }
         };
         match dst {
@@ -461,10 +583,25 @@ impl Cp {
                     crate::error!("gpu[{}]: COPY_DATA to {dst_a:#x} outside guest memory", self.name);
                     return;
                 }
-                if wide { unsafe { wr64(dst_a, value) } } else { unsafe { wr32(dst_a, value as u32) } }
-                note_write(&self.name, dst_a, value, self.cur_packet);
+                let (name, at) = (self.name.clone(), self.cur_packet);
+                self.effect(
+                    false,
+                    Some((dst_a, if wide { 8 } else { 4 })),
+                    Box::new(move || {
+                        let value = read();
+                        if wide { unsafe { wr64(dst_a, value) } } else { unsafe { wr32(dst_a, value as u32) } }
+                        note_write(&name, dst_a, value, at);
+                    }),
+                );
             }
-            0 => self.write_reg_addr(dst_a as u32, value as u32),
+            0 => {
+                // A register needs the value now: memory sources must be current.
+                if matches!(src, 1 | 2) && self.exec.as_ref().is_some_and(|e| e.busy()) {
+                    self.sync();
+                }
+                let v = read();
+                self.write_reg_addr(dst_a as u32, v as u32);
+            }
             _ => self.note("COPY_DATA to GDS/other ignored"),
         }
     }
@@ -492,33 +629,47 @@ impl Cp {
             crate::error!("gpu[{}]: DMA_DATA to {dst:#x}+{bytes:#x} outside guest memory", self.name);
             return;
         }
+        let (name, at) = (self.name.clone(), self.cur_packet);
+        let range = Some((dst, if daic { 4 } else { bytes }));
         match src_sel {
             2 => {
                 // Fill with the immediate dword.
                 let v = src as u32;
-                note_write(&self.name, dst, v as u64, self.cur_packet);
-                if daic {
-                    unsafe { wr32(dst, v) };
-                } else {
-                    for i in 0..bytes / 4 {
-                        unsafe { wr32(dst + 4 * i, v) };
-                    }
-                }
+                self.effect(
+                    false,
+                    range,
+                    Box::new(move || {
+                        note_write(&name, dst, v as u64, at);
+                        if daic {
+                            unsafe { wr32(dst, v) };
+                        } else {
+                            for i in 0..bytes / 4 {
+                                unsafe { wr32(dst + 4 * i, v) };
+                            }
+                        }
+                    }),
+                );
             }
             0 | 3 if !sas => {
                 if !valid(src, if saic { 4 } else { bytes }) {
                     crate::error!("gpu[{}]: DMA_DATA from {src:#x}+{bytes:#x} outside guest memory", self.name);
                     return;
                 }
-                if saic || daic {
-                    for i in 0..bytes / 4 {
-                        let s = if saic { src } else { src + 4 * i };
-                        let d = if daic { dst } else { dst + 4 * i };
-                        unsafe { wr32(d, rd32(s)) };
-                    }
-                } else {
-                    unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, bytes as usize) };
-                }
+                self.effect(
+                    false,
+                    range,
+                    Box::new(move || {
+                        if saic || daic {
+                            for i in 0..bytes / 4 {
+                                let s = if saic { src } else { src + 4 * i };
+                                let d = if daic { dst } else { dst + 4 * i };
+                                unsafe { wr32(d, rd32(s)) };
+                            }
+                        } else {
+                            unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, bytes as usize) };
+                        }
+                    }),
+                );
             }
             _ => {
                 // Register or GDS source: register values / counters.
@@ -538,26 +689,33 @@ impl Cp {
         let a = addr64(p(2) & !3, p(3));
         let data = addr64(p(4), p(5));
         let ctx = p(6);
-        match data_sel {
-            0 => {}
-            1 | 2 | 3 | 4 => {
-                if !valid(a, 8) {
-                    crate::error!("gpu[{}]: RELEASE_MEM to {a:#x} outside guest memory", self.name);
-                } else {
+        if data_sel > 4 {
+            self.note("RELEASE_MEM with GDS data ignored");
+        }
+        let write = matches!(data_sel, 1..=4);
+        if write && !valid(a, 8) {
+            crate::error!("gpu[{}]: RELEASE_MEM to {a:#x} outside guest memory", self.name);
+            return;
+        }
+        let (name, at) = (self.name.clone(), self.cur_packet);
+        self.effect(
+            true,
+            write.then_some((a, 8)),
+            Box::new(move || {
+                if write {
                     match data_sel {
                         1 => unsafe { wr32(a, data as u32) },
                         2 => unsafe { wr64(a, data) },
                         _ => unsafe { wr64(a, gpu_clock()) },
                     }
-                    note_write(&self.name, a, data, self.cur_packet);
+                    note_write(&name, a, data, at);
                 }
-            }
-            _ => self.note("RELEASE_MEM with GDS data ignored"),
-        }
-        if int_sel != 0 && int_sel != 3 {
-            EOP_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
-            crate::hle::libs::agcdriver::raise_eop(ctx);
-        }
+                if int_sel != 0 && int_sel != 3 {
+                    EOP_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+                    crate::hle::libs::agcdriver::raise_eop(ctx);
+                }
+            }),
+        );
     }
 
     /// Polls `addr` until the comparison holds (WAIT_REG_MEM).
@@ -630,6 +788,7 @@ impl Cp {
     fn private(&mut self, operation: u32, at: u64, n: u64, a: &dyn Fn(u64) -> u32) -> Flow {
         match operation {
             pop::FLIP => {
+                self.sync();
                 let handle = a(0) as i32;
                 let index = a(1) as i32;
                 let arg = addr64(a(3), a(4)) as i64;
@@ -692,6 +851,7 @@ impl Cp {
                 self.markers.pop();
             }
             pop::BRANCH => {
+                self.sync();
                 let ctl = a(0);
                 let cmp = addr64(a(1), a(2));
                 let mask = addr64(a(3), a(4));

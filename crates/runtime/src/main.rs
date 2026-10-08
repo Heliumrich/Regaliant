@@ -29,6 +29,8 @@ pub struct Config {
     pub seconds: Option<u64>,
     /// Development control channel (see `poll_control`).
     pub control: Option<PathBuf>,
+    /// `--pipeline-test <capture.txt>`: create pipelines for a captured frame and exit.
+    pub pipeline_test: Option<String>,
     pub trace: bool,
     pub lenient: bool,
     pub debug: bool,
@@ -117,6 +119,7 @@ fn parse_args() -> Config {
     let mut headless = false;
     let mut control = None;
     let mut app = None;
+    let mut pipeline_test = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -128,6 +131,7 @@ fn parse_args() -> Config {
             "--root" => root = PathBuf::from(args.next().expect("--root needs a path")),
             "--control" => control = Some(PathBuf::from(args.next().expect("--control needs a path"))),
             "--app" => app = Some(PathBuf::from(args.next().expect("--app needs a path"))),
+            "--pipeline-test" => pipeline_test = Some(args.next().expect("--pipeline-test needs a capture file")),
             other => {
                 eprintln!("unknown argument {other}");
                 std::process::exit(2);
@@ -147,6 +151,7 @@ fn parse_args() -> Config {
         debug,
         headless,
         control,
+        pipeline_test,
     }
 }
 
@@ -306,7 +311,7 @@ fn thread_summary_ex(with_stacks: bool) -> String {
             }
         }
     }
-    s.push_str(&gpu::status());
+    s.push_str(&gpu::status_ex(with_stacks));
     s.push_str(&audio::status());
     s.push_str(&hle::libs::ajm::status());
     s
@@ -391,7 +396,13 @@ fn main() {
     hle::LENIENT_IMPORTS.store(cfg.lenient, std::sync::atomic::Ordering::Relaxed);
     info!("dsport {} | run dir {} | TLS slot {}", env!("CARGO_PKG_VERSION"), cfg.run_dir.display(), slot);
     exception::install();
+    if let Some(c) = &cfg.pipeline_test {
+        let code = gpu::exec::pipeline_test(c);
+        log::flush();
+        std::process::exit(code);
+    }
     gpu::capture::init_from_env();
+    gpu::start_profiler();
     if std::env::var_os("DS_TEST_FAULT").is_some() {
         info!("DS_TEST_FAULT: writing to an invalid address from host code");
         unsafe { std::ptr::write_volatile(0x32c3be8 as *mut u64, 1) };

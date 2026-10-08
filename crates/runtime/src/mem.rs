@@ -72,6 +72,22 @@ pub struct MemState {
 /// memory are revalidated against it).
 pub static MAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether guest [a, a+len) is covered by accessible mappings (from the
+/// mapping table: VirtualQuery walks page tables and is very slow on the
+/// title's multi-GiB mappings).
+pub fn mapped(a: u64, len: u64) -> bool {
+    let st = MEM.lock();
+    let end = a.saturating_add(len.max(1));
+    let mut p = a;
+    while p < end {
+        match st.find(p) {
+            Some(v) if v.kind != VmaKind::Reserved && v.prot != 0 => p = v.end(),
+            _ => return false,
+        }
+    }
+    true
+}
+
 pub static MEM: Mutex<MemState> = Mutex::new(MemState {
     vmas: BTreeMap::new(),
     dmem: BTreeMap::new(),

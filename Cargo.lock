@@ -65,6 +65,7 @@ dependencies = [
  "iced-x86",
  "miniz_oxide",
  "parking_lot",
+ "rdna",
  "sce-elf",
  "serde_json",
  "windows",

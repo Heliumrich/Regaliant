@@ -126,6 +126,103 @@ fn store_dword(tr: &mut T, var: Word, idx: Word, v: Word) -> R<()> {
     ok(tr.b.store(p, v, None, []))
 }
 
+/// Loads `n` dwords at byte address `addr`: one 8/16-byte access when the
+/// address is aligned to it (n = 2 or 4), else dword by dword (`bytes`:
+/// unaligned-safe byte loads instead of dword-truncated addresses).
+fn load_dwords(tr: &mut T, var: Word, addr: Word, n: u32, bytes: bool) -> R<Vec<Word>> {
+    let u = tr.t.u32;
+    let scalar = |tr: &mut T| -> R<Vec<Word>> {
+        let mut v = Vec::new();
+        if bytes {
+            for k in 0..n {
+                let o = tr.u(4 * k);
+                let a = e(tr.b.i_add(u, None, addr, o))?;
+                v.push(load_bytes(tr, var, a, 4)?);
+            }
+        } else {
+            let two = tr.u(2);
+            let idx = e(tr.b.shift_right_logical(u, None, addr, two))?;
+            for k in 0..n {
+                let kk = tr.u(k);
+                let i = e(tr.b.i_add(u, None, idx, kk))?;
+                v.push(load_dword(tr, var, i)?);
+            }
+        }
+        Ok(v)
+    };
+    let view = if n == 2 || n == 4 { tr.vec_view(var, n) } else { None };
+    let Some(view) = view else { return scalar(tr) };
+    let mask = tr.u(4 * n - 1);
+    let low = e(tr.b.bitwise_and(u, None, addr, mask))?;
+    let z = tr.u(0);
+    let aligned = e(tr.b.i_equal(tr.t.bool_, None, low, z))?;
+    let (merge, then_b, else_b) = (tr.b.id(), tr.b.id(), tr.b.id());
+    ok(tr.b.selection_merge(merge, spirv::SelectionControl::NONE))?;
+    ok(tr.b.branch_conditional(aligned, then_b, else_b, []))?;
+    e(tr.b.begin_block(Some(then_b)))?;
+    let vt = if n == 2 { tr.t.v2u } else { tr.t.v4u };
+    let sh = tr.u(if n == 2 { 3 } else { 4 });
+    let idx = e(tr.b.shift_right_logical(u, None, addr, sh))?;
+    let pt = tr.b.type_pointer(None, StorageClass::StorageBuffer, vt);
+    let p = e(tr.b.access_chain(pt, None, view, [z, idx]))?;
+    let vv = e(tr.b.load(vt, None, p, None, []))?;
+    let mut va = Vec::new();
+    for k in 0..n {
+        va.push(e(tr.b.composite_extract(u, None, vv, [k]))?);
+    }
+    ok(tr.b.branch(merge))?;
+    e(tr.b.begin_block(Some(else_b)))?;
+    let vs = scalar(tr)?;
+    // The scalar path creates no blocks: it ends in else_b.
+    let else_end = else_b;
+    ok(tr.b.branch(merge))?;
+    e(tr.b.begin_block(Some(merge)))?;
+    let mut out = Vec::new();
+    for k in 0..n as usize {
+        out.push(e(tr.b.phi(u, None, [(va[k], then_b), (vs[k], else_end)]))?);
+    }
+    Ok(out)
+}
+
+/// Stores dwords at byte address `addr` (one 8/16-byte store when aligned).
+fn store_dwords(tr: &mut T, var: Word, addr: Word, vals: &[Word]) -> R<()> {
+    let u = tr.t.u32;
+    let n = vals.len() as u32;
+    let scalar = |tr: &mut T| -> R<()> {
+        let two = tr.u(2);
+        let idx = e(tr.b.shift_right_logical(u, None, addr, two))?;
+        for (k, v) in vals.iter().enumerate() {
+            let kk = tr.u(k as u32);
+            let i = e(tr.b.i_add(u, None, idx, kk))?;
+            store_dword(tr, var, i, *v)?;
+        }
+        Ok(())
+    };
+    let view = if n == 2 || n == 4 { tr.vec_view(var, n) } else { None };
+    let Some(view) = view else { return scalar(tr) };
+    let mask = tr.u(4 * n - 1);
+    let low = e(tr.b.bitwise_and(u, None, addr, mask))?;
+    let z = tr.u(0);
+    let aligned = e(tr.b.i_equal(tr.t.bool_, None, low, z))?;
+    let (merge, then_b, else_b) = (tr.b.id(), tr.b.id(), tr.b.id());
+    ok(tr.b.selection_merge(merge, spirv::SelectionControl::NONE))?;
+    ok(tr.b.branch_conditional(aligned, then_b, else_b, []))?;
+    e(tr.b.begin_block(Some(then_b)))?;
+    let vt = if n == 2 { tr.t.v2u } else { tr.t.v4u };
+    let sh = tr.u(if n == 2 { 3 } else { 4 });
+    let idx = e(tr.b.shift_right_logical(u, None, addr, sh))?;
+    let pt = tr.b.type_pointer(None, StorageClass::StorageBuffer, vt);
+    let p = e(tr.b.access_chain(pt, None, view, [z, idx]))?;
+    let vv = e(tr.b.composite_construct(vt, None, vals.to_vec()))?;
+    ok(tr.b.store(p, vv, None, []))?;
+    ok(tr.b.branch(merge))?;
+    e(tr.b.begin_block(Some(else_b)))?;
+    scalar(tr)?;
+    ok(tr.b.branch(merge))?;
+    e(tr.b.begin_block(Some(merge)))?;
+    Ok(())
+}
+
 /// Loads `nbytes` (1..=4) little-endian bytes at an arbitrary byte address.
 fn load_bytes(tr: &mut T, var: Word, addr: Word, nbytes: u32) -> R<Word> {
     let u = tr.t.u32;
@@ -401,12 +498,17 @@ fn load_formatted(tr: &mut T, var: Word, addr: Word, fmt: u16) -> R<[Word; 4]> {
     let u = tr.t.u32;
     let size = fm.bytes();
     let ndw = size.div_ceil(4);
-    let mut dws = Vec::new();
-    for k in 0..ndw {
-        let off = tr.u(k * 4);
-        let a = e(tr.b.i_add(u, None, addr, off))?;
-        dws.push(load_bytes(tr, var, a, size.min(4))?);
-    }
+    let dws = if size == 8 || size == 16 {
+        load_dwords(tr, var, addr, ndw, true)?
+    } else {
+        let mut dws = Vec::new();
+        for k in 0..ndw {
+            let off = tr.u(k * 4);
+            let a = e(tr.b.i_add(u, None, addr, off))?;
+            dws.push(load_bytes(tr, var, a, size.min(4))?);
+        }
+        dws
+    };
     let one_f = tr.u(1.0f32.to_bits());
     let one_i = tr.u(1);
     let z = tr.u(0);
@@ -500,14 +602,7 @@ fn store_formatted(tr: &mut T, var: Word, addr: Word, vals: &[Word], fmt: u16) -
         bo += bw;
     }
     if size >= 4 {
-        let two = tr.u(2);
-        let idx = e(tr.b.shift_right_logical(u, None, addr, two))?;
-        for (k, dw) in dws.iter().enumerate() {
-            let kk = tr.u(k as u32);
-            let i = e(tr.b.i_add(u, None, idx, kk))?;
-            store_dword(tr, var, i, *dw)?;
-        }
-        Ok(())
+        store_dwords(tr, var, addr, &dws)
     } else {
         store_bytes(tr, var, addr, dws[0], size)
     }
@@ -675,12 +770,9 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, var: Word, addr: Word, fmt: u1
                     "dwordx3" => 3,
                     _ => 4,
                 };
-                let idx = e(tr.b.shift_right_logical(u, None, addr, two))?;
-                for k in 0..n {
-                    let kk = tr.u(k);
-                    let i = e(tr.b.i_add(u, None, idx, kk))?;
-                    let v = load_dword(tr, var, i)?;
-                    tr.set_vreg(rdst + k, v)?;
+                let vals = load_dwords(tr, var, addr, n, false)?;
+                for (k, v) in vals.into_iter().enumerate() {
+                    tr.set_vreg(rdst + k as u32, v)?;
                 }
             }
             "ubyte_d16" | "ubyte_d16_hi" | "sbyte_d16" | "sbyte_d16_hi" | "short_d16" | "short_d16_hi" => {
@@ -725,13 +817,11 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, var: Word, addr: Word, fmt: u1
                         "dwordx3" => 3,
                         _ => 4,
                     };
-                    let idx = e(tr.b.shift_right_logical(u, None, addr, two))?;
+                    let mut vals = Vec::new();
                     for k in 0..n {
-                        let kk = tr.u(k);
-                        let i = e(tr.b.i_add(u, None, idx, kk))?;
-                        let v = tr.vreg(vd + k)?;
-                        store_dword(tr, var, i, v)?;
+                        vals.push(tr.vreg(vd + k)?);
                     }
+                    store_dwords(tr, var, addr, &vals)?;
                 }
                 "byte" | "short" | "byte_d16_hi" | "short_d16_hi" => {
                     let nb = if kind.starts_with("byte") { 1 } else { 2 };
