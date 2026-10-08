@@ -4,7 +4,10 @@
 //! generated `tables` (Mesa ACO's opcode table, gfx10 column).
 
 pub mod analysis;
+pub mod format;
+pub mod translate;
 pub mod tables;
+pub mod uniform;
 
 use std::fmt::Write;
 
@@ -182,6 +185,14 @@ impl Inst {
                 return None;
             }
             Some((false, v - OP_VGPR0, lane))
+        }
+    }
+
+    /// SDWA compare (VOPC) with an explicit SGPR destination (SD bit).
+    pub fn sdwa_sdst(&self) -> Option<u16> {
+        match (self.enc, self.ext) {
+            (Enc::Vopc, Ext::Sdwa(d)) if bits(d, 15, 1) != 0 => Some(bits(d, 8, 7) as u16),
+            _ => None,
         }
     }
 
@@ -713,11 +724,14 @@ pub fn disasm(inst: &Inst) -> String {
         Enc::Vop3 | Enc::Vop3p => {
             let kind = if inst.enc == Enc::Vop3 { vop3_kind(inst.op) } else { Vop3Kind::Native };
             let mut parts = Vec::new();
-            if kind == Vop3Kind::FromVopc {
-                parts.push(operand_name(inst.vop3_sdst()));
+            // VOP3A: compares, v_readlane and v_readfirstlane write the SGPR
+            // in the VDST field; VOP3B adds a carry-out SGPR in [14:8].
+            let sgpr_dst = kind == Vop3Kind::FromVopc || matches!(inst.base_name(), Some("v_readlane_b32" | "v_readfirstlane_b32"));
+            if sgpr_dst {
+                parts.push(operand_name(inst.vdst()));
             } else {
                 parts.push(format!("v{}", inst.vdst()));
-                if inst.enc == Enc::Vop3 && (name.contains("_co_") || name.contains("addc") || name.contains("subb") || name.contains("div_scale") || name.ends_with("_e64") || name.starts_with("v_mad_u64") || name.starts_with("v_mad_i64")) {
+                if inst.is_vop3b() {
                     parts.push(operand_name(inst.vop3_sdst()));
                 }
             }

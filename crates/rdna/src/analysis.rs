@@ -43,12 +43,15 @@ pub enum ResKind {
     Image,
     /// S# used by sampling instructions.
     Sampler,
+    /// 64-bit base address (SGPR pair `saddr`) of GLOBAL instructions.
+    Global,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Resource {
     pub kind: ResKind,
-    /// Provenance of each descriptor dword (4 for V#/S#, 8 for T#).
+    /// Provenance of each descriptor dword (4 for V#/S#, 8 for T#, 2 for a
+    /// global base address).
     pub dwords: Vec<Prov>,
     /// Buffer is written by the shader / image is a storage image.
     pub written: bool,
@@ -150,11 +153,14 @@ fn writes_pair(name: &str) -> bool {
     name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64") || name == "s_getpc_b64" || name == "s_swappc_b64"
 }
 
-/// Runs the analysis. `user_sgprs` is the number of user-data SGPRs (s0..).
-pub fn analyze(code: &[Inst], user_sgprs: u16, code_base: u64) -> Plan {
+/// Runs the analysis. User-data dword `i` (of `user_sgprs`) is loaded into
+/// SGPR `user_base + i` (8 for merged/NGG shaders, 0 otherwise).
+pub fn analyze(code: &[Inst], user_sgprs: u16, user_base: u16, code_base: u64) -> Plan {
     let mut init = State { s: vec![Prov::Unknown; 128], lanes: Vec::new() };
     for i in 0..user_sgprs.min(32) {
-        init.s[i as usize] = Prov::User(i);
+        if let Some(s) = init.s.get_mut((user_base + i) as usize) {
+            *s = Prov::User(i);
+        }
     }
     let n = code.len();
     if n == 0 {
@@ -418,7 +424,8 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
         Enc::Vop1 if name == "v_readfirstlane_b32" => st.set(ins.vdst(), Prov::Unknown),
         Enc::Vop3 => {
             if crate::vop3_kind(ins.op) == crate::Vop3Kind::FromVopc {
-                let d = ins.vop3_sdst();
+                // Compare result: SGPR pair in the VDST field.
+                let d = ins.vdst();
                 st.set(d, Prov::Unknown);
                 st.set(d + 1, Prov::Unknown);
             } else if ins.is_vop3b() {
@@ -430,8 +437,17 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
             }
         }
         Enc::Vopc => {
-            st.set(crate::OP_VCC_LO, Prov::Unknown);
-            st.set(crate::OP_VCC_HI, Prov::Unknown);
+            let d = ins.sdwa_sdst().unwrap_or(crate::OP_VCC_LO);
+            st.set(d, Prov::Unknown);
+            st.set(d + 1, Prov::Unknown);
+        }
+        Enc::Global if ins.flat_saddr() != crate::OP_NULL => {
+            let sa = ins.flat_saddr();
+            let dwords = vec![st.get(sa), st.get(sa + 1)];
+            let store = name.starts_with("global_store") || name.starts_with("global_atomic");
+            let atomic = name.starts_with("global_atomic");
+            let r = plan.resource(Resource { kind: ResKind::Global, dwords, written: store, read: !store || atomic, formatted: false });
+            plan.inst_res.insert(ins.pc, (r, None));
         }
         _ => {}
     }

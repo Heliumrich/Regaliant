@@ -123,8 +123,11 @@ pub fn draw(cp: &Cp, what: &str) {
         ctx(0x28B54),
         cp.reg(Space::Uc, 0x25B)
     );
-    for (name, lo, user) in [("ps", 0x08, 0x0C), ("vs", 0x48, 0x4C), ("gs", 0x88, 0x8C), ("es", 0xC8, 0xCC), ("hs", 0x108, 0x10C), ("ls", 0x148, 0x14C)] {
-        stage(cp, &mut s, &mut c.shaders, name, lo, lo + 2, user);
+    // NGG primitive shaders: program in the ES registers, resources and user
+    // data in the GS ones (gfx10.3 register database: RSRC1/2_GS 0x8A/0x8B,
+    // USER_DATA_GS_0 0x8C).
+    for (name, lo, rsrc, user) in [("ps", 0x08, 0x0A, 0x0C), ("vs", 0x48, 0x4A, 0x4C), ("gs", 0x88, 0x8A, 0x8C), ("es", 0xC8, 0x8A, 0x8C), ("hs", 0x108, 0x10A, 0x10C), ("ls", 0x148, 0x14A, 0x14C)] {
+        stage(cp, &mut s, &mut c.shaders, name, lo, rsrc, user);
     }
     let mask = ctx(0x28238);
     for i in 0..8u32 {
