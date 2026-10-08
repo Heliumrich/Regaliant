@@ -377,6 +377,16 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
                             st.set(d + k as u16, Prov::Mem(p.clone(), o + 4 * k));
                         }
                     }
+                    (Some((p, bias)), None) => {
+                        // Known base, dynamic offset (e.g. a loop over a constant
+                        // table): the base is bound as a buffer and read at run time.
+                        let dwords = vec![Prov::PtrLo(p.clone(), bias), Prov::PtrHi(p, bias)];
+                        let r = plan.resource(Resource { kind: ResKind::Global, dwords, written: false, read: true, formatted: false });
+                        plan.inst_res.insert(ins.pc, (r, None));
+                        for k in 0..n {
+                            st.set(d + k as u16, Prov::Unknown);
+                        }
+                    }
                     _ => {
                         plan.errors.push(format!("{:#x}: s_load with unresolvable address", ins.pc));
                         for k in 0..n {

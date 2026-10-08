@@ -386,3 +386,4 @@ sceVideoOutSetBufferAttribute2
 sceVideoOutSubmitChangeBufferAttribute2
 sincos
 sincosf
+_open

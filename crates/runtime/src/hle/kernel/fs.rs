@@ -639,6 +639,7 @@ sysv! {
     fn open(path: *const u8, flags: i32, mode: u32) -> i32 { posix_ret(vfs_open(cstr(path), flags, mode)) }
     fn close(fd: i32) -> i32 { posix_ret(vfs_close(fd)) }
     fn read(fd: i32, buf: *mut u8, n: u64) -> i64 { posix_len(vfs_read(fd, std::slice::from_raw_parts_mut(buf, n as usize))) }
+    fn _open(path: *const u8, flags: i32, mode: u32) -> i32 { posix_ret(vfs_open(cstr(path), flags, mode)) }
     fn _read(fd: i32, buf: *mut u8, n: u64) -> i64 { posix_len(vfs_read(fd, std::slice::from_raw_parts_mut(buf, n as usize))) }
     fn write(fd: i32, buf: *const u8, n: u64) -> i64 { posix_len(pwrite_fd(fd, std::slice::from_raw_parts(buf, n as usize), None)) }
     fn _write(fd: i32, buf: *const u8, n: u64) -> i64 { posix_len(pwrite_fd(fd, std::slice::from_raw_parts(buf, n as usize), None)) }
@@ -670,7 +671,7 @@ pub fn register(r: &mut Registry) {
         sceKernelOpen, sceKernelClose, sceKernelRead, sceKernelWrite, sceKernelPread, sceKernelPwrite, sceKernelLseek,
         sceKernelStat, sceKernelFstat, sceKernelMkdir, sceKernelRmdir, sceKernelUnlink, sceKernelRename,
         sceKernelGetdirentries, sceKernelGetdents, sceKernelFtruncate, sceKernelTruncate, sceKernelFsync,
-        sceKernelCheckReachability, _read, _write,
+        sceKernelCheckReachability, _open, _read, _write,
     ]);
     reg!(r, "libScePosix", [open, close, read, write, pread, pwrite, lseek, stat, fstat, mkdir, rmdir, unlink, rename, getdents, fsync]);
 }

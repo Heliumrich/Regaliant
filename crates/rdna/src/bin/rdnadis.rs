@@ -41,6 +41,11 @@ fn main() {
         for (i, l) in plan.loads.iter().enumerate() {
             println!("load {i}: {:?} + {:#x} x{}", l.ptr, l.offset, l.dwords);
         }
+        let mut uses: Vec<(u32, usize, Option<usize>)> = plan.inst_res.iter().map(|(&pc, &(r, s))| (pc, r, s)).collect();
+        uses.sort();
+        for (pc, r, s) in uses {
+            println!("use {pc:#x}: resource {r}{}", s.map(|x| format!(", sampler {x}")).unwrap_or_default());
+        }
         for e in &plan.errors {
             println!("error: {e}");
         }

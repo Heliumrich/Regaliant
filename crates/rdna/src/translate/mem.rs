@@ -286,7 +286,10 @@ pub fn smem(tr: &mut T, ins: &Inst) -> R<()> {
     let name = ins.name().unwrap_or("");
     let u = tr.t.u32;
     let d = ins.sdst() as u32;
-    if name.starts_with("s_load_dword") {
+    // Dynamic-offset s_load from a known base: read through its binding
+    // (same path as s_buffer_load).
+    let dynamic_load = name.starts_with("s_load_dword") && !tr.plan.inst_load.contains_key(&ins.pc) && tr.plan.inst_res.contains_key(&ins.pc);
+    if name.starts_with("s_load_dword") && !dynamic_load {
         let n = smem_dwords(name);
         let Some(&k) = tr.plan.inst_load.get(&ins.pc) else {
             tr.warn(format!("{:#x}: s_load without resolved address (zero)", ins.pc));
@@ -303,7 +306,7 @@ pub fn smem(tr: &mut T, ins: &Inst) -> R<()> {
         }
         return Ok(());
     }
-    if name.starts_with("s_buffer_load_dword") {
+    if name.starts_with("s_buffer_load_dword") || dynamic_load {
         let n = smem_dwords(name);
         let Some(&(r, _)) = tr.plan.inst_res.get(&ins.pc) else { return Err(format!("{:#x}: s_buffer_load without resource", ins.pc)) };
         let var = tr.buffers[&r];

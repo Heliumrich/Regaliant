@@ -713,9 +713,16 @@ impl Images {
             let image = self.create(key)?;
             self.to_general(image, key.format);
             self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0 });
+            crate::info!("images: new render target {:#x} {}x{} {:?} at flip {}", key.base, key.width, key.height, key.format, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
             key
         };
-        self.map.get_mut(&k).unwrap().gpu_written = true;
+        let img = self.map.get_mut(&k).unwrap();
+        if !img.gpu_written {
+            crate::info!("images: {:#x} {}x{} {:?} becomes a render target", k.base, k.width, k.height, k.format);
+        }
+        // GPU-owned from now on: guest memory is no longer its source.
+        img.gpu_written = true;
+        img.source = None;
         Ok(k)
     }
 
@@ -840,7 +847,11 @@ impl Images {
         let vkey = (fmt, vt, t.base_level, levels.saturating_sub(t.base_level).max(1), base_layer, layer_count, swz, storage as u8);
         let img = self.map.get_mut(&key).unwrap();
         if storage {
+            if !img.gpu_written {
+                crate::info!("images: {:#x} {}x{} {:?} becomes a storage image (was uploaded: {})", key.base, key.width, key.height, key.format, img.source.is_some());
+            }
             img.gpu_written = true;
+            img.source = None;
         }
         if let Some(&v) = img.views.get(&vkey) {
             return Ok((v, img.image));
