@@ -38,9 +38,15 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
     unsafe {
         let caps = c.surface_i.get_physical_device_surface_capabilities(c.pdev, p.surface).map_err(|e| format!("surface caps: {e}"))?;
         let formats = c.surface_i.get_physical_device_surface_formats(c.pdev, p.surface).map_err(|e| format!("surface formats: {e}"))?;
+        // Display buffers hold display-encoded values (the title applies its
+        // own transfer function): UNORM swapchain formats show them as is,
+        // 10-bit first (the title's display buffers are 10:10:10:2).
+        let srgb_space = |f: &&vk::SurfaceFormatKHR| f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR;
         let fmt = formats
             .iter()
-            .find(|f| f.format == vk::Format::B8G8R8A8_SRGB)
+            .filter(srgb_space)
+            .find(|f| f.format == vk::Format::A2B10G10R10_UNORM_PACK32)
+            .or_else(|| formats.iter().filter(srgb_space).find(|f| f.format == vk::Format::B8G8R8A8_UNORM))
             .or_else(|| formats.first())
             .copied()
             .ok_or("no surface format")?;
@@ -176,9 +182,10 @@ pub fn present(src: Source) -> bool {
         barrier(c, cmd, dst, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
         let (src_img, src_layout, sw, sh) = match src {
             Source::Image { image, layout, width, height } => {
-                if layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
-                    barrier(c, cmd, image, layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-                }
+                // GENERAL images are blitted in place (after a barrier that
+                // makes earlier GPU writes visible).
+                let to = if layout == vk::ImageLayout::GENERAL { layout } else { vk::ImageLayout::TRANSFER_SRC_OPTIMAL };
+                barrier(c, cmd, image, layout, to);
                 (image, layout, width, height)
             }
             Source::Pixels { data, width, height } => match upload_pixels(p, cmd, &data, width, height) {
@@ -196,8 +203,9 @@ pub fn present(src: Source) -> bool {
             dst_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
             dst_offsets: [vk::Offset3D::default(), vk::Offset3D { x: p.extent.width as i32, y: p.extent.height as i32, z: 1 }],
         };
-        c.device.cmd_blit_image(cmd, src_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR);
-        if src_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL && src_img != vk::Image::null() {
+        let blit_layout = if src_layout == vk::ImageLayout::GENERAL { src_layout } else { vk::ImageLayout::TRANSFER_SRC_OPTIMAL };
+        c.device.cmd_blit_image(cmd, src_img, blit_layout, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR);
+        if src_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL && src_layout != vk::ImageLayout::GENERAL && src_img != vk::Image::null() {
             barrier(c, cmd, src_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, src_layout);
         }
         barrier(c, cmd, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR);

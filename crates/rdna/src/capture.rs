@@ -116,6 +116,7 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         m.export_format = ((u.col_format >> (4 * i)) & 0xF) as u8;
     }
     let spec = Spec {
+        probe: None,
         stage: u.stage,
         user_sgprs: users,
         user_base,

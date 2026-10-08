@@ -72,7 +72,10 @@ fn finish(c: Capture) {
         }
     }
     let tex = dump_textures(&dir, &c.textures);
-    crate::info!("capture: {} event(s) -> {} ({dumped} shader binaries in shaders/, {tex} texture(s) in textures/)", c.events, path.display());
+    // Render targets as rendered (GPU execution): the graphics queue's work
+    // of the frame completed before its flip.
+    let rts = if super::exec::enabled() { super::images::with(|im| im.dump_targets(&dir.join("targets"))) } else { 0 };
+    crate::info!("capture: {} event(s) -> {} ({dumped} shader binaries in shaders/, {tex} texture(s) in textures/, {rts} render target(s) in targets/)", c.events, path.display());
 }
 
 /// Writes viewable textures (RGBA8/R8/RG8 in standard swizzles) of the frame
@@ -145,6 +148,31 @@ fn stage(cp: &Cp, out: &mut String, shaders: &mut BTreeSet<u64>, name: &str, lo:
     let _ = writeln!(out, "    {name} {a:#x} rsrc1 {rsrc1:#010x} rsrc2 {rsrc2:#010x} user[{n}] {}", ud.join(" "));
 }
 
+/// First records of the vertex stage's formatted buffers (vertex data).
+fn vertex_data(out: &mut String, p: &super::shaders::Prepared) {
+    for (i, r) in p.resources.iter().enumerate() {
+        let super::shaders::Resolved::Buffer(v) = r else { continue };
+        if v.stride == 0 || v.stride > 64 || v.format == 0 {
+            continue;
+        }
+        let n = v.num_records.min(6) as u64;
+        if !crate::gpu::cp::guest_readable(v.base, n * v.stride as u64) {
+            continue;
+        }
+        let mut recs = Vec::new();
+        for k in 0..n {
+            let a = v.base + k * v.stride as u64;
+            let words: Vec<u32> = (0..(v.stride as u64 / 4).min(4)).map(|j| unsafe { std::ptr::read_volatile((a + 4 * j) as *const u32) }).collect();
+            recs.push(match v.format {
+                // 32-bit float components.
+                64 | 74 | 77 | 22 => format!("({})", words.iter().map(|w| format!("{}", f32::from_bits(*w))).collect::<Vec<_>>().join(", ")),
+                _ => format!("[{}]", words.iter().map(|w| format!("{w:08x}")).collect::<Vec<_>>().join(" ")),
+            });
+        }
+        let _ = writeln!(out, "      es {i} data: {}", recs.join(" "));
+    }
+}
+
 fn note_textures(map: &mut std::collections::BTreeMap<u64, super::desc::Tsharp>, p: &super::shaders::Prepared) {
     for r in &p.resources {
         if let super::shaders::Resolved::Image(t) = r {
@@ -157,6 +185,36 @@ fn f(v: u32) -> f32 {
     f32::from_bits(v)
 }
 
+/// `DS_CAPTURE_DRAWS=1`: also dump each captured draw's first color target
+/// after the draw (draws/<event>_<address>.png).
+pub fn draw_dumps() -> bool {
+    dumps_env() && capturing()
+}
+
+fn dumps_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_CAPTURE_DRAWS").ok().as_deref() == Some("1"))
+}
+
+fn dump_draw_target(cp: &Cp, event: u64) -> Option<String> {
+    let s = super::exec::color_surface(cp, 0).ok().flatten()?;
+    let dir = crate::run_dir()?.join("draws");
+    let _ = std::fs::create_dir_all(&dir);
+    let r = super::images::with(|im| -> Result<(Vec<u8>, u32, u32), String> {
+        let t = im.target(&s)?;
+        let raw = im.read_back(t.image, t.key.format, t.key.width, t.key.height)?;
+        Ok((super::images::to_rgba8(t.key.format, &raw).ok_or("format")?, t.key.width, t.key.height))
+    });
+    match r {
+        Ok((rgba, w, h)) => {
+            let name = format!("{event:04}_{:010x}.png", s.base);
+            std::fs::write(dir.join(&name), super::png::encode(w, h, &rgba)).ok()?;
+            Some(name)
+        }
+        Err(e) => Some(format!("(dump failed: {e})")),
+    }
+}
+
 /// Records one draw (`what` names the packet and its arguments).
 pub fn draw(cp: &Cp, what: &str) {
     let mut g = ACTIVE.lock();
@@ -166,13 +224,19 @@ pub fn draw(cp: &Cp, what: &str) {
     let ctx = |a: u32| cp.reg(Space::Ctx, (a - 0x28000) / 4);
     let _ = writeln!(
         s,
-        "draw #{} [{}] {what} prim {} stages {:#x} ge_cntl {:#x}",
+        "draw #{} [{}] {what} prim {} stages {:#x} ge_cntl {:#x} -> {}",
         c.events,
         cp.name,
         cp.reg(Space::Uc, 0x242),
         ctx(0x28B54),
-        cp.reg(Space::Uc, 0x25B)
+        cp.reg(Space::Uc, 0x25B),
+        cp.last_draw
     );
+    if dumps_env() {
+        if let Some(n) = dump_draw_target(cp, c.events) {
+            let _ = writeln!(s, "    target after draw: {n}");
+        }
+    }
     // NGG primitive shaders: program in the ES registers, resources and user
     // data in the GS ones (gfx10.3 register database: RSRC1/2_GS 0x8A/0x8B,
     // USER_DATA_GS_0 0x8C).
@@ -206,6 +270,31 @@ pub fn draw(cp: &Cp, what: &str) {
                 for l in super::shaders::describe_resources(&p) {
                     let _ = writeln!(s, "      {name} {l}");
                 }
+                if super::exec::enabled() {
+                    for r in &p.resources {
+                        if let super::shaders::Resolved::Image(t) = r {
+                            let d = super::images::with(|im| im.describe(t));
+                            let _ = writeln!(s, "      {name} image {:#x}: {d}", t.base);
+                        }
+                    }
+                }
+                if name == "es" {
+                    vertex_data(&mut s, &p);
+                }
+                for l in super::shaders::describe_loads(&p) {
+                    let _ = writeln!(s, "      {name} {l}");
+                }
+                // The SPIR-V used at run time (specialized to this draw).
+                if let Some(dir) = crate::run_dir() {
+                    let sdir = dir.join("shaders");
+                    let _ = std::fs::create_dir_all(&sdir);
+                    let path = sdir.join(format!("{:012x}-{:016x}.spv", p.addr, p.tr.key));
+                    if !path.exists() {
+                        let bytes: Vec<u8> = p.tr.out.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+                        let _ = std::fs::write(&path, bytes);
+                    }
+                    let _ = writeln!(s, "      {name} spirv {}", path.file_name().unwrap().to_string_lossy());
+                }
                 note_textures(&mut c.textures, &p);
             }
             Err(e) => {
@@ -234,6 +323,46 @@ pub fn draw(cp: &Cp, what: &str) {
         ctx(0x28780),
         ctx(0x286CC),
         ctx(0x286D0)
+    );
+    let inputs: Vec<String> = (0..(ctx(0x286D8) & 0x3F).min(8)).map(|n| format!("{:#x}", ctx(0x28644 + 4 * n))).collect();
+    let _ = writeln!(s, "    ps_in_control {:#x} input_cntl [{}] z_format {:#x}", ctx(0x286D8), inputs.join(" "), ctx(0x28710));
+    // Raster, depth/stencil and blend state.
+    let blends: Vec<String> = (0..8u32).filter(|i| (mask >> (4 * i)) & 0xF != 0).map(|i| format!("{i}:{:#x}", ctx(0x28780 + 4 * i))).collect();
+    let _ = writeln!(
+        s,
+        "    state vte {:#x} clip {:#x} su_sc_mode {:#x} sc_mode0 {:#x} aa {:#x} win_off {:#x} | screen_sc {:#x}..{:#x} generic_sc {:#x}..{:#x} vport_sc {:#x}..{:#x} zrange {}..{} | db_render {:#x} db_shader {:#x} depth_ctl {:#x} stencil_ctl {:#x} ref {:#x}/{:#x} z_read {:#x} s_info {:#x} | target_mask {mask:#x} blend [{}] blend_color ({}, {}, {}, {}) | index_type {:#x} instances {} reset_en {:#x} gb_clip {}/{}",
+        ctx(0x28818),
+        ctx(0x28810),
+        ctx(0x28814),
+        ctx(0x28A48),
+        ctx(0x28BE0),
+        ctx(0x28200),
+        ctx(0x28030),
+        ctx(0x28034),
+        ctx(0x28240),
+        ctx(0x28244),
+        ctx(0x28250),
+        ctx(0x28254),
+        f(ctx(0x282D0)),
+        f(ctx(0x282D4)),
+        ctx(0x28000),
+        ctx(0x2880C),
+        ctx(0x28800),
+        ctx(0x2842C),
+        ctx(0x28430),
+        ctx(0x28434),
+        ((ctx(0x28048) as u64) << 8) | ((ctx(0x28068) as u64 & 0xFF) << 40),
+        ctx(0x28044),
+        blends.join(" "),
+        f(ctx(0x28414)),
+        f(ctx(0x28418)),
+        f(ctx(0x2841C)),
+        f(ctx(0x28420)),
+        cp.reg(Space::Uc, 0x243),
+        cp.num_instances(),
+        ctx(0x28A94),
+        f(ctx(0x28BE8)),
+        f(ctx(0x28BF0))
     );
     c.text.push_str(&s);
 }

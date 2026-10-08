@@ -177,6 +177,7 @@ pub fn prepare_compute(cp: &Cp, wave64: bool) -> Result<Prepared, String> {
         cs_rsrc2: rsrc2,
         resources: Vec::new(),
         binding_base: 0,
+        probe: None,
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
 }
@@ -236,8 +237,25 @@ pub fn prepare_ps(cp: &Cp) -> Result<Prepared, String> {
         cs_rsrc2: 0,
         resources: Vec::new(),
         binding_base: PS_BINDING_BASE,
+        probe: probe_for(addr),
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
+}
+
+/// `DS_PROBE=<shader address>:<pc>:<vgpr>` (hex address and pc, decimal
+/// VGPR): that pixel shader exports the VGPR's value after the instruction
+/// at pc as its color (debugging).
+fn probe_for(addr: u64) -> Option<(u32, u32)> {
+    static P: std::sync::OnceLock<Option<(u64, u32, u32)>> = std::sync::OnceLock::new();
+    let p = P.get_or_init(|| {
+        let v = std::env::var("DS_PROBE").ok()?;
+        let mut it = v.split(':');
+        let a = u64::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
+        let pc = u32::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
+        let vg = it.next()?.parse().ok()?;
+        Some((a, pc, vg))
+    });
+    p.and_then(|(a, pc, vg)| (a == addr).then_some((pc, vg)))
 }
 
 /// Binding numbers of the pixel stage start here (vertex stage from 0).
@@ -272,6 +290,7 @@ pub fn prepare_ngg(cp: &Cp) -> Result<Prepared, String> {
         cs_rsrc2: 0,
         resources: Vec::new(),
         binding_base: 0,
+        probe: None,
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
 }
@@ -308,6 +327,28 @@ pub fn describe_resources(p: &Prepared) -> Vec<String> {
                 ),
                 Resolved::Sampler(w) => format!("{i}: S# {:08x} {:08x} {:08x} {:08x} {rw}", w[0], w[1], w[2], w[3]),
             }
+        })
+        .collect()
+}
+
+/// One line per resolved scalar load: pointer provenance, offset and the
+/// loaded dwords (hex, and as floats) (frame captures).
+pub fn describe_loads(p: &Prepared) -> Vec<String> {
+    let offs = translate::load_offsets(&p.tr.plan);
+    p.tr
+        .plan
+        .loads
+        .iter()
+        .zip(offs)
+        .map(|(l, o)| {
+            let vals: Vec<String> = (0..l.dwords as usize)
+                .map(|k| {
+                    let w = p.sgpr_data.get(o as usize + k).copied().unwrap_or(0);
+                    let f = f32::from_bits(w);
+                    if f.is_finite() && f != 0.0 && (f.abs() < 1e6 && f.abs() > 1e-6) { format!("{w:08x}({f})") } else { format!("{w:08x}") }
+                })
+                .collect();
+            format!("load {:?} + {:#x}: {}", l.ptr, l.offset, vals.join(" "))
         })
         .collect()
 }

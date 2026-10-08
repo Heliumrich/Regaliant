@@ -90,6 +90,191 @@ fn is_block(fmt: u16) -> bool {
     (169..=182).contains(&fmt)
 }
 
+/// Bytes per texel (per 4x4 block for compressed formats); 0 if unknown.
+pub fn texel_bytes(f: vk::Format) -> u32 {
+    use vk::Format as F;
+    match f {
+        F::R8_UNORM | F::R8_SNORM | F::R8_UINT | F::R8_SINT | F::R8_SRGB | F::S8_UINT => 1,
+        F::R16_UNORM | F::R16_SNORM | F::R16_UINT | F::R16_SINT | F::R16_SFLOAT | F::R8G8_UNORM | F::R8G8_SNORM | F::R8G8_UINT | F::R8G8_SINT | F::R8G8_SRGB | F::B5G6R5_UNORM_PACK16 | F::D16_UNORM => 2,
+        F::R32_UINT | F::R32_SINT | F::R32_SFLOAT | F::R16G16_UNORM | F::R16G16_SNORM | F::R16G16_UINT | F::R16G16_SINT | F::R16G16_SFLOAT | F::B10G11R11_UFLOAT_PACK32 | F::A2B10G10R10_UNORM_PACK32 | F::A2B10G10R10_UINT_PACK32
+        | F::A2R10G10B10_UNORM_PACK32 | F::R8G8B8A8_UNORM | F::R8G8B8A8_SNORM | F::R8G8B8A8_UINT | F::R8G8B8A8_SINT | F::R8G8B8A8_SRGB | F::B8G8R8A8_UNORM | F::B8G8R8A8_SRGB | F::E5B9G9R9_UFLOAT_PACK32 | F::D32_SFLOAT => 4,
+        F::R32G32_UINT | F::R32G32_SINT | F::R32G32_SFLOAT | F::R16G16B16A16_UNORM | F::R16G16B16A16_SNORM | F::R16G16B16A16_UINT | F::R16G16B16A16_SINT | F::R16G16B16A16_SFLOAT | F::D32_SFLOAT_S8_UINT => 8,
+        F::R32G32B32A32_UINT | F::R32G32B32A32_SINT | F::R32G32B32A32_SFLOAT => 16,
+        F::BC1_RGBA_UNORM_BLOCK | F::BC1_RGBA_SRGB_BLOCK | F::BC4_UNORM_BLOCK | F::BC4_SNORM_BLOCK => 8,
+        F::BC2_UNORM_BLOCK | F::BC2_SRGB_BLOCK | F::BC3_UNORM_BLOCK | F::BC3_SRGB_BLOCK | F::BC5_UNORM_BLOCK | F::BC5_SNORM_BLOCK | F::BC6H_UFLOAT_BLOCK | F::BC6H_SFLOAT_BLOCK | F::BC7_UNORM_BLOCK | F::BC7_SRGB_BLOCK => 16,
+        _ => 0,
+    }
+}
+
+pub fn is_depth(f: vk::Format) -> bool {
+    matches!(f, vk::Format::D16_UNORM | vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT | vk::Format::D16_UNORM_S8_UINT | vk::Format::D24_UNORM_S8_UINT | vk::Format::S8_UINT)
+}
+
+pub fn has_stencil(f: vk::Format) -> bool {
+    matches!(f, vk::Format::D32_SFLOAT_S8_UINT | vk::Format::D16_UNORM_S8_UINT | vk::Format::D24_UNORM_S8_UINT | vk::Format::S8_UINT)
+}
+
+/// All aspects of a format.
+pub fn aspects(f: vk::Format) -> vk::ImageAspectFlags {
+    match f {
+        vk::Format::D16_UNORM | vk::Format::D32_SFLOAT => vk::ImageAspectFlags::DEPTH,
+        vk::Format::S8_UINT => vk::ImageAspectFlags::STENCIL,
+        f if is_depth(f) => vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+        _ => vk::ImageAspectFlags::COLOR,
+    }
+}
+
+fn is_compressed(f: vk::Format) -> bool {
+    (vk::Format::BC1_RGB_UNORM_BLOCK.as_raw()..=vk::Format::BC7_SRGB_BLOCK.as_raw()).contains(&f.as_raw())
+}
+
+/// Two formats can view the same image (MUTABLE_FORMAT): same texel size,
+/// both color, both compressed or both not.
+fn view_compatible(a: vk::Format, b: vk::Format) -> bool {
+    a == b || (texel_bytes(a) != 0 && texel_bytes(a) == texel_bytes(b) && !is_depth(a) && !is_depth(b) && is_compressed(a) == is_compressed(b))
+}
+
+/// CB color format (CB_COLORn_INFO FORMAT, NUMBER_TYPE, COMP_SWAP) -> Vulkan format.
+pub fn cb_format(fmt: u32, ntype: u32, swap: u32) -> Option<vk::Format> {
+    use vk::Format as F;
+    // NUMBER_TYPE: 0 unorm, 1 snorm, 4 uint, 5 sint, 6 srgb, 7 float.
+    let f = match (fmt, ntype) {
+        (1, 0) => F::R8_UNORM,
+        (1, 1) => F::R8_SNORM,
+        (1, 4) => F::R8_UINT,
+        (1, 5) => F::R8_SINT,
+        (1, 6) => F::R8_SRGB,
+        (2, 0) => F::R16_UNORM,
+        (2, 1) => F::R16_SNORM,
+        (2, 4) => F::R16_UINT,
+        (2, 5) => F::R16_SINT,
+        (2, 7) => F::R16_SFLOAT,
+        (3, 0) => F::R8G8_UNORM,
+        (3, 1) => F::R8G8_SNORM,
+        (3, 4) => F::R8G8_UINT,
+        (3, 5) => F::R8G8_SINT,
+        (3, 6) => F::R8G8_SRGB,
+        (4, 4) => F::R32_UINT,
+        (4, 5) => F::R32_SINT,
+        (4, 7) => F::R32_SFLOAT,
+        (5, 0) => F::R16G16_UNORM,
+        (5, 1) => F::R16G16_SNORM,
+        (5, 4) => F::R16G16_UINT,
+        (5, 5) => F::R16G16_SINT,
+        (5, 7) => F::R16G16_SFLOAT,
+        (6, 7) => F::B10G11R11_UFLOAT_PACK32,
+        (9, 0) => F::A2B10G10R10_UNORM_PACK32,
+        (9, 4) => F::A2B10G10R10_UINT_PACK32,
+        (10, 0) => F::R8G8B8A8_UNORM,
+        (10, 1) => F::R8G8B8A8_SNORM,
+        (10, 4) => F::R8G8B8A8_UINT,
+        (10, 5) => F::R8G8B8A8_SINT,
+        (10, 6) => F::R8G8B8A8_SRGB,
+        (11, 4) => F::R32G32_UINT,
+        (11, 5) => F::R32G32_SINT,
+        (11, 7) => F::R32G32_SFLOAT,
+        (12, 0) => F::R16G16B16A16_UNORM,
+        (12, 1) => F::R16G16B16A16_SNORM,
+        (12, 4) => F::R16G16B16A16_UINT,
+        (12, 5) => F::R16G16B16A16_SINT,
+        (12, 7) => F::R16G16B16A16_SFLOAT,
+        (14, 4) => F::R32G32B32A32_UINT,
+        (14, 5) => F::R32G32B32A32_SINT,
+        (14, 7) => F::R32G32B32A32_SFLOAT,
+        (16, 0) => F::B5G6R5_UNORM_PACK16,
+        _ => return None,
+    };
+    // COMP_SWAP 1 (ALT) on 4-component formats stores BGRA.
+    Some(match (f, swap) {
+        (_, 0) => f,
+        (F::R8G8B8A8_UNORM, 1) => F::B8G8R8A8_UNORM,
+        (F::R8G8B8A8_SRGB, 1) => F::B8G8R8A8_SRGB,
+        (F::A2B10G10R10_UNORM_PACK32, 1) => F::A2R10G10B10_UNORM_PACK32,
+        _ => return None,
+    })
+}
+
+fn half_to_f32(h: u16) -> f32 {
+    let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let e = ((h >> 10) & 0x1F) as i32;
+    let m = (h & 0x3FF) as f32;
+    s * match e {
+        0 => m * 2f32.powi(-24),
+        31 => f32::INFINITY,
+        _ => (1.0 + m / 1024.0) * 2f32.powi(e - 15),
+    }
+}
+
+/// Converts tightly packed texels to RGBA8 (screenshots, dumps).
+pub fn to_rgba8(format: vk::Format, raw: &[u8]) -> Option<Vec<u8>> {
+    use vk::Format as F;
+    let unit = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    Some(match format {
+        F::R8G8B8A8_UNORM | F::R8G8B8A8_SRGB => raw.to_vec(),
+        F::B8G8R8A8_UNORM | F::B8G8R8A8_SRGB => raw.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect(),
+        F::A2B10G10R10_UNORM_PACK32 | F::A2R10G10B10_UNORM_PACK32 => raw
+            .chunks_exact(4)
+            .flat_map(|p| {
+                let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+                let lo = ((v & 0x3FF) >> 2) as u8;
+                let g = (((v >> 10) & 0x3FF) >> 2) as u8;
+                let hi = (((v >> 20) & 0x3FF) >> 2) as u8;
+                let a = ((v >> 30) * 85) as u8;
+                if format == F::A2B10G10R10_UNORM_PACK32 { [lo, g, hi, a] } else { [hi, g, lo, a] }
+            })
+            .collect(),
+        F::R16G16B16A16_SFLOAT => raw
+            .chunks_exact(8)
+            .flat_map(|p| {
+                let h = |i: usize| half_to_f32(u16::from_le_bytes([p[2 * i], p[2 * i + 1]]));
+                [unit(h(0)), unit(h(1)), unit(h(2)), unit(h(3))]
+            })
+            .collect(),
+        F::R8_UNORM => raw.iter().flat_map(|&v| [v, v, v, 255]).collect(),
+        F::R32_SFLOAT => raw
+            .chunks_exact(4)
+            .flat_map(|p| {
+                let v = unit(f32::from_le_bytes([p[0], p[1], p[2], p[3]]));
+                [v, v, v, 255]
+            })
+            .collect(),
+        F::R16G16_SFLOAT => raw
+            .chunks_exact(4)
+            .flat_map(|p| [unit(half_to_f32(u16::from_le_bytes([p[0], p[1]]))), unit(half_to_f32(u16::from_le_bytes([p[2], p[3]]))), 0, 255])
+            .collect(),
+        F::R32_UINT => raw.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+        _ => return None,
+    })
+}
+
+/// A render target or depth/stencil attachment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub key: ImageKey,
+    pub image: vk::Image,
+    pub view: vk::ImageView,
+    /// Attachment (view) format.
+    pub format: vk::Format,
+    /// Size of the attached mip level.
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Color or depth surface described by CB/DB registers.
+#[derive(Clone, Copy, Debug)]
+pub struct Surface {
+    pub base: u64,
+    pub format: vk::Format,
+    pub width: u32,
+    pub height: u32,
+    /// Array layers of the resource (3D: depth).
+    pub layers: u32,
+    pub levels: u32,
+    pub ty3d: bool,
+    pub mip: u32,
+    pub slice: u32,
+}
+
 /// UNORM equivalent of sRGB formats (storage views cannot be sRGB).
 fn storage_format(f: vk::Format) -> vk::Format {
     match f {
@@ -116,7 +301,10 @@ pub struct ImageKey {
 pub struct Image {
     pub image: vk::Image,
     pub key: ImageKey,
-    views: HashMap<(vk::Format, vk::ImageViewType, u32, u32, u32, u32, [u8; 4]), vk::ImageView>,
+    /// Views by (format, type, base mip, mips, base layer, layers, swizzle,
+    /// usage: 0 sampled, 1 storage, 2 attachment). Usage is part of the key:
+    /// a view created for one usage is not valid for another.
+    views: HashMap<(vk::Format, vk::ImageViewType, u32, u32, u32, u32, [u8; 4], u8), vk::ImageView>,
     /// Written by the GPU: guest memory is no longer its source.
     pub gpu_written: bool,
     /// Guest bytes the upload came from (re-checked once per frame).
@@ -127,7 +315,7 @@ pub struct Image {
 
 pub struct Images {
     map: HashMap<ImageKey, Image>,
-    samplers: HashMap<[u32; 4], vk::Sampler>,
+    samplers: HashMap<([u32; 4], bool), vk::Sampler>,
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
@@ -200,14 +388,19 @@ impl Images {
         if f.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE) {
             usage |= vk::ImageUsageFlags::SAMPLED;
         }
-        let sprops = unsafe { c.instance.get_physical_device_format_properties(c.pdev, storage_format(key.format)) };
-        if sprops.optimal_tiling_features.contains(vk::FormatFeatureFlags::STORAGE_IMAGE) {
-            usage |= vk::ImageUsageFlags::STORAGE;
+        if !is_depth(key.format) {
+            let sprops = unsafe { c.instance.get_physical_device_format_properties(c.pdev, storage_format(key.format)) };
+            if sprops.optimal_tiling_features.contains(vk::FormatFeatureFlags::STORAGE_IMAGE) {
+                usage |= vk::ImageUsageFlags::STORAGE;
+            }
         }
         if f.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT) {
             usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
         }
-        let mut flags = vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE;
+        if f.contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT) {
+            usage |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+        }
+        let mut flags = if is_depth(key.format) { vk::ImageCreateFlags::empty() } else { vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE };
         if key.cube && key.layers % 6 == 0 {
             flags |= vk::ImageCreateFlags::CUBE_COMPATIBLE;
         }
@@ -262,15 +455,25 @@ impl Images {
         }
     }
 
-    fn to_general(&mut self, image: vk::Image) {
+    /// Moves a new image to GENERAL and zero-fills it (depth: 0, stencil: 0).
+    fn to_general(&mut self, image: vk::Image, format: vk::Format) {
         self.one_shot(|cmd| unsafe {
+            let range = vk::ImageSubresourceRange { aspect_mask: aspects(format), base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS };
             let b = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::GENERAL)
                 .image(image)
-                .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS })
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
-            ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[b]);
+                .subresource_range(range)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            let d = &ctx().device;
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[b]);
+            if is_depth(format) {
+                d.cmd_clear_depth_stencil_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearDepthStencilValue { depth: 0.0, stencil: 0 }, &[range]);
+            } else if !is_compressed(format) {
+                d.cmd_clear_color_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearColorValue::default(), &[range]);
+            }
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
         });
     }
 
@@ -356,7 +559,7 @@ impl Images {
             return Ok(key);
         }
         // A GPU-written image of the same address and size (other format).
-        if let Some(k) = self.map.iter().find(|(k, i)| i.gpu_written && k.base == key.base && k.width == key.width && k.height == key.height && k.layers >= key.layers).map(|(k, _)| *k) {
+        if let Some(k) = self.alias(&key, true) {
             return Ok(k);
         }
         let image = self.create(key)?;
@@ -364,7 +567,7 @@ impl Images {
             Ok(s) => Some(s),
             Err(e) => {
                 self.report(format!("texture {:#x} ({}x{} format {} sw_mode {}): {e}; contents undefined", t.base, t.width, t.height, t.format, t.sw_mode));
-                self.to_general(image);
+                self.to_general(image, key.format);
                 None
             }
         };
@@ -396,10 +599,146 @@ impl Images {
         Ok(())
     }
 
+    /// An existing image at `key`'s address with the same size that can be
+    /// viewed in `key`'s format (optionally only GPU-written ones).
+    fn alias(&self, key: &ImageKey, gpu_written_only: bool) -> Option<ImageKey> {
+        self.map
+            .iter()
+            .filter(|(k, i)| {
+                (!gpu_written_only || i.gpu_written)
+                    && k.base == key.base
+                    && k.width == key.width
+                    && k.height == key.height
+                    && k.layers >= key.layers
+                    && k.levels >= key.levels
+                    && k.ty3d == key.ty3d
+                    && view_compatible(k.format, key.format)
+            })
+            .map(|(k, _)| *k)
+            .max_by_key(|k| (k.format == key.format, k.levels, k.layers))
+    }
+
+    /// Image for a render target or depth surface: the image of that exact
+    /// surface, an alias of it (same address and size, compatible format), or
+    /// a new zero-filled image. Marked GPU-written.
+    fn surface_image(&mut self, s: &Surface) -> Result<ImageKey, String> {
+        let key = ImageKey { base: s.base, format: s.format, width: s.width, height: s.height, layers: s.layers.max(1), levels: s.levels.max(1), ty3d: s.ty3d, cube: false };
+        let k = if self.map.contains_key(&key) {
+            key
+        } else if let Some(k) = self.alias(&key, false) {
+            k
+        } else {
+            let image = self.create(key)?;
+            self.to_general(image, key.format);
+            self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: true, source: None, hash: 0, checked_frame: 0 });
+            key
+        };
+        self.map.get_mut(&k).unwrap().gpu_written = true;
+        Ok(k)
+    }
+
+    /// Attachment for a color or depth/stencil surface (one mip level, one layer).
+    pub fn target(&mut self, s: &Surface) -> Result<Target, String> {
+        let k = self.surface_image(s)?;
+        let img = self.map.get_mut(&k).unwrap();
+        let mip = s.mip.min(img.key.levels - 1);
+        let layer = if img.key.ty3d { 0 } else { s.slice.min(img.key.layers - 1) };
+        let vkey = (s.format, vk::ImageViewType::TYPE_2D, mip, 1, layer, 1, [4u8, 5, 6, 7], 2u8);
+        let view = match img.views.get(&vkey) {
+            Some(&v) => v,
+            None => {
+                let depth = is_depth(s.format);
+                let ci = vk::ImageViewCreateInfo::default()
+                    .image(img.image)
+                    .view_type(if img.key.ty3d { vk::ImageViewType::TYPE_2D_ARRAY } else { vk::ImageViewType::TYPE_2D })
+                    .format(s.format)
+                    .subresource_range(vk::ImageSubresourceRange { aspect_mask: aspects(s.format), base_mip_level: mip, level_count: 1, base_array_layer: layer, layer_count: 1 });
+                let mut usage = vk::ImageViewUsageCreateInfo::default().usage(if depth { vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT } else { vk::ImageUsageFlags::COLOR_ATTACHMENT });
+                let ci = if depth { ci } else { ci.push_next(&mut usage) };
+                let v = unsafe { ctx().device.create_image_view(&ci, None) }.map_err(|e| format!("attachment view {vkey:?}: {e}"))?;
+                img.views.insert(vkey, v);
+                v
+            }
+        };
+        Ok(Target { key: k, image: img.image, view, format: s.format, width: (img.key.width >> mip).max(1), height: (img.key.height >> mip).max(1) })
+    }
+
+    /// The GPU image last rendered at `base` (display buffers).
+    pub fn rendered_at(&self, base: u64) -> Option<(vk::Image, vk::Format, u32, u32)> {
+        self.map
+            .values()
+            .filter(|i| i.key.base == base && i.gpu_written && !is_depth(i.key.format))
+            .max_by_key(|i| i.key.width as u64 * i.key.height as u64)
+            .map(|i| (i.image, i.key.format, i.key.width, i.key.height))
+    }
+
+    /// Reads mip 0 / layer 0 of a color image back (tightly packed texels).
+    pub fn read_back(&mut self, image: vk::Image, format: vk::Format, width: u32, height: u32) -> Result<Vec<u8>, String> {
+        let bpp = texel_bytes(format) as u64;
+        if bpp == 0 || is_compressed(format) || is_depth(format) {
+            return Err(format!("read back of {format:?} unsupported"));
+        }
+        let size = bpp * width as u64 * height as u64;
+        let c = ctx();
+        let (buf, mem, ptr) = c.host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST)?;
+        self.one_shot(|cmd| unsafe {
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 })
+                .image_extent(vk::Extent3D { width, height, depth: 1 });
+            c.device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::GENERAL, buf, &[region]);
+            let hb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[hb], &[], &[]);
+        });
+        let out = unsafe { std::slice::from_raw_parts(ptr, size as usize).to_vec() };
+        unsafe {
+            c.device.destroy_buffer(buf, None);
+            c.device.unmap_memory(mem);
+            c.device.free_memory(mem, None);
+        }
+        Ok(out)
+    }
+
+    /// Writes the GPU-written color images (mip 0, layer 0) to `dir` as PNG
+    /// files named <address>_<width>x<height>_<format>.png (frame captures).
+    pub fn dump_targets(&mut self, dir: &std::path::Path) -> usize {
+        let mut keys: Vec<ImageKey> = self.map.values().filter(|i| i.gpu_written && !is_depth(i.key.format)).map(|i| i.key).collect();
+        keys.sort_by_key(|k| (k.base, k.format.as_raw()));
+        let _ = std::fs::create_dir_all(dir);
+        let mut n = 0;
+        for k in keys.into_iter().take(64) {
+            let image = self.map[&k].image;
+            let Ok(raw) = self.read_back(image, k.format, k.width, k.height) else { continue };
+            let Some(rgba) = to_rgba8(k.format, &raw) else { continue };
+            let name = format!("{:010x}_{}x{}_{:?}.png", k.base, k.width, k.height, k.format);
+            if std::fs::write(dir.join(name), super::png::encode(k.width, k.height, &rgba)).is_ok() {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Which cached image a T# resolves to now (frame captures).
+    pub fn describe(&self, t: &Tsharp) -> String {
+        let Some(key) = Self::key_of(t) else { return "unsupported format".into() };
+        let all: Vec<String> = self
+            .map
+            .values()
+            .filter(|i| i.key.base == t.base)
+            .map(|i| format!("{}x{}x{} {:?} l{} m{}{}{}", i.key.width, i.key.height, i.key.layers, i.key.format, i.key.layers, i.key.levels, if i.gpu_written { " gpu" } else { "" }, if i.key == key { " =key" } else { "" }))
+            .collect();
+        let pick = if self.map.contains_key(&key) { "exact".to_string() } else if let Some(k) = self.alias(&key, true) { format!("alias {:?} l{} m{}", k.format, k.layers, k.levels) } else { "new upload".into() };
+        format!("{pick}; images at base: [{}]", all.join(", "))
+    }
+
     /// View of a T# (format, type, levels/layers, swizzle) for sampling or storage.
-    pub fn view(&mut self, t: &Tsharp, storage: bool, frame: u64) -> Result<vk::ImageView, String> {
+    pub fn view(&mut self, t: &Tsharp, storage: bool, frame: u64) -> Result<(vk::ImageView, vk::Image), String> {
         let key = self.image_for(t, frame)?;
         let req = vk_format(t.format).unwrap();
+        if is_depth(key.format) {
+            return Err(format!("texture {:#x} aliases a depth surface (not supported yet)", t.base));
+        }
         let fmt = if storage { storage_format(req) } else { req };
         let levels = (t.last_level + 1).max(1);
         let _ = levels;
@@ -416,13 +755,13 @@ impl Images {
         };
         let sel = |s: u16| -> u8 { (s & 7) as u8 };
         let swz = if storage { [4, 5, 6, 7] } else { [sel(t.dst_sel), sel(t.dst_sel >> 3), sel(t.dst_sel >> 6), sel(t.dst_sel >> 9)] };
-        let vkey = (fmt, vt, t.base_level, levels.saturating_sub(t.base_level).max(1), base_layer, layer_count, swz);
+        let vkey = (fmt, vt, t.base_level, levels.saturating_sub(t.base_level).max(1), base_layer, layer_count, swz, storage as u8);
         let img = self.map.get_mut(&key).unwrap();
         if storage {
             img.gpu_written = true;
         }
         if let Some(&v) = img.views.get(&vkey) {
-            return Ok(v);
+            return Ok((v, img.image));
         }
         let comp = |s: u8| match s {
             0 => vk::ComponentSwizzle::ZERO,
@@ -450,12 +789,13 @@ impl Images {
         let ci = ci.push_next(&mut usage);
         let v = unsafe { ctx().device.create_image_view(&ci, None) }.map_err(|e| format!("image view {vkey:?}: {e}"))?;
         img.views.insert(vkey, v);
-        Ok(v)
+        Ok((v, img.image))
     }
 
-    /// Sampler of an S#.
-    pub fn sampler(&mut self, s: [u32; 4]) -> Result<vk::Sampler, String> {
-        if let Some(&v) = self.samplers.get(&s) {
+    /// Sampler of an S#; `compare`: used by depth-compare instructions (the
+    /// S# compare function applies only to those).
+    pub fn sampler(&mut self, s: [u32; 4], compare_use: bool) -> Result<vk::Sampler, String> {
+        if let Some(&v) = self.samplers.get(&(s, compare_use)) {
             return Ok(v);
         }
         let b = |v: u32, lo: u32, n: u32| (v >> lo) & ((1 << n) - 1);
@@ -489,7 +829,7 @@ impl Images {
             .mip_lod_bias(lod_bias.clamp(-15.0, 15.0))
             .anisotropy_enable(aniso > 0 && b(s[2], 22, 2) >= 2)
             .max_anisotropy((1u32 << aniso.min(4)) as f32)
-            .compare_enable(compare != 0)
+            .compare_enable(compare_use)
             .compare_op(match compare {
                 1 => vk::CompareOp::LESS,
                 2 => vk::CompareOp::EQUAL,
@@ -505,7 +845,7 @@ impl Images {
             .border_color(border)
             .unnormalized_coordinates(false);
         let v = unsafe { ctx().device.create_sampler(&ci, None) }.map_err(|e| format!("sampler: {e}"))?;
-        self.samplers.insert(s, v);
+        self.samplers.insert((s, compare_use), v);
         Ok(v)
     }
 

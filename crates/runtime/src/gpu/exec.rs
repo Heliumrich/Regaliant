@@ -22,6 +22,10 @@ use rdna::translate::{BindingKind, RES_INFO_DWORDS};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod draw;
+pub(crate) use draw::color_surface;
+pub use draw::DrawArgs;
+
 pub static EXECUTED: AtomicU64 = AtomicU64::new(0);
 /// The Vulkan device was lost: GPU execution stops (reported once).
 pub static DEVICE_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -77,6 +81,8 @@ struct Shared {
     spans: Vec<Span>,
     map_gen: u64,
     pipes: HashMap<u64, Pipe>,
+    /// Graphics pipelines by state hash.
+    gfx: HashMap<u64, Pipe>,
     gds: vk::Buffer,
     /// Zero-filled buffer bound for empty or unmapped resources.
     dummy: vk::Buffer,
@@ -122,6 +128,7 @@ fn shared() -> parking_lot::MappedMutexGuard<'static, Shared> {
             spans: Vec::new(),
             map_gen: crate::mem::MAP_GEN.load(Ordering::SeqCst),
             pipes: HashMap::new(),
+            gfx: HashMap::new(),
             gds,
             dummy,
             import_align: host.min_imported_host_pointer_alignment.max(4096),
@@ -364,6 +371,30 @@ fn global_barrier(cmd: vk::CommandBuffer) {
 }
 
 const RING_BYTES: u64 = 8 << 20;
+/// Descriptor pool of a slot: sets, then descriptors of each POOL_TYPES type.
+const POOL_LIMITS: [u32; 5] = [4096, 32768, 8192, 2048, 8192];
+const POOL_TYPES: [vk::DescriptorType; 4] = [vk::DescriptorType::STORAGE_BUFFER, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorType::STORAGE_IMAGE, vk::DescriptorType::SAMPLER];
+
+/// Descriptor writes of one shader stage.
+struct Bound {
+    bufs: Vec<(u32, vk::DescriptorBufferInfo)>,
+    imgs: Vec<(u32, vk::DescriptorType, vk::DescriptorImageInfo)>,
+    /// Guest ranges the stage writes.
+    writes: Vec<(u64, u64)>,
+    /// Images it samples or stores to.
+    images: Vec<vk::Image>,
+}
+
+/// Guest ranges of a stage's textures (uploads read them).
+fn texture_ranges(p: &Prepared) -> Vec<(u64, u64)> {
+    p.resources
+        .iter()
+        .filter_map(|r| match r {
+            Resolved::Image(t) => Some((t.base, (t.width as u64 * t.height as u64 * t.depth.max(1) as u64 * 16).min(1 << 30))),
+            _ => None,
+        })
+        .collect()
+}
 /// Batches in flight per queue: one recording while the other executes.
 const SLOTS: usize = 2;
 
@@ -551,6 +582,10 @@ pub struct Exec {
     name: String,
     /// Shaders recorded in the current batch (slow-batch reports).
     batch_shaders: Vec<u64>,
+    /// Active dynamic-rendering instance (draws).
+    rendering: Option<draw::Rendering>,
+    /// Descriptor pool usage of the recording slot (see POOL_LIMITS).
+    pool_use: [u32; 5],
 }
 
 unsafe impl Send for Exec {}
@@ -564,18 +599,13 @@ impl Exec {
                 .create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(c.queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
                 .map_err(|e| e.to_string())?;
             let cmds = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(SLOTS as u32)).map_err(|e| e.to_string())?;
-            let sizes = [
-                vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 16384 },
-                vk::DescriptorPoolSize { ty: vk::DescriptorType::SAMPLED_IMAGE, descriptor_count: 4096 },
-                vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 1024 },
-                vk::DescriptorPoolSize { ty: vk::DescriptorType::SAMPLER, descriptor_count: 4096 },
-            ];
+            let sizes: Vec<vk::DescriptorPoolSize> = POOL_TYPES.iter().zip(&POOL_LIMITS[1..]).map(|(&ty, &n)| vk::DescriptorPoolSize { ty, descriptor_count: n }).collect();
             let mut slots = Vec::new();
             for cmd in cmds {
                 slots.push(Slot {
                     cmd,
                     fence: c.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| e.to_string())?,
-                    desc_pool: c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(2048).pool_sizes(&sizes), None).map_err(|e| e.to_string())?,
+                    desc_pool: c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(POOL_LIMITS[0]).pool_sizes(&sizes), None).map_err(|e| e.to_string())?,
                     seq: 0,
                     queries: if profiling() {
                         c.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(2 * MAX_TIMED), None).map_err(|e| e.to_string())?
@@ -604,6 +634,8 @@ impl Exec {
                 reported: HashMap::new(),
                 name: name.to_string(),
                 batch_shaders: Vec::new(),
+                rendering: None,
+                pool_use: [0; 5],
             })
         }
     }
@@ -645,6 +677,7 @@ impl Exec {
         }
         global_barrier(self.cmd());
         self.recording = true;
+        self.pool_use = [0; 5];
     }
 
     /// Submits the recorded batch without waiting for it (its actions run
@@ -657,6 +690,7 @@ impl Exec {
             // Deferred CP writes that this work may read come first.
             wait_done(self.submit_after);
         }
+        self.end_rendering();
         let c = ctx();
         let i = self.cur;
         let (cmd, fence) = (self.slots[i].cmd, self.slots[i].fence);
@@ -758,6 +792,140 @@ impl Exec {
         Some(seg * self.cur as u64 + off)
     }
 
+    /// Makes room in the recording slot for the SGPR data and descriptors of
+    /// `stages` (submits the batch and starts the next one otherwise).
+    fn reserve(&mut self, stages: &[&Prepared]) {
+        self.begin();
+        let mut need = [stages.len() as u32, 0, 0, 0, 0];
+        let mut ring = 0u64;
+        for p in stages {
+            ring += 4 * p.sgpr_data.len() as u64 + self.ring_align;
+            for b in &p.tr.out.bindings {
+                let ty = descriptor_type(b.kind);
+                if let Some(k) = POOL_TYPES.iter().position(|&t| t == ty) {
+                    need[1 + k] += 1;
+                }
+            }
+        }
+        let seg = RING_BYTES / SLOTS as u64;
+        let fits = self.ring_used.next_multiple_of(self.ring_align) + ring <= seg && (0..5).all(|k| self.pool_use[k] + need[k] <= POOL_LIMITS[k]);
+        if !fits {
+            self.submit();
+            self.begin();
+        }
+        for k in 0..5 {
+            self.pool_use[k] += need[k];
+        }
+    }
+
+    /// Buffer, image and sampler bindings of a stage; fills the resource
+    /// info blocks of its SGPR data.
+    fn bind_stage(&mut self, p: &mut Prepared) -> Result<Bound, String> {
+        let res_info = rdna::translate::res_info_offset(&p.tr.plan) as usize;
+        let mut bound = Bound { bufs: Vec::new(), imgs: Vec::new(), writes: Vec::new(), images: Vec::new() };
+        {
+            let mut sh = shared();
+            for b in &p.tr.out.bindings {
+                match b.kind {
+                    BindingKind::Buffer(i) => {
+                        let (base, size, stride) = match &p.resources[i] {
+                            Resolved::Buffer(v) => (v.base, v.byte_size(), v.stride),
+                            Resolved::Global(a) => (*a, None, 0),
+                            _ => return Err("binding/resource mismatch".into()),
+                        };
+                        let size = match size {
+                            Some(n) => n,
+                            None => Shared::mapping(base).map(|(_, e)| (e - base).min(UNBOUNDED_MAX)).unwrap_or(0),
+                        };
+                        let mut info = vk::DescriptorBufferInfo { buffer: sh.dummy, offset: 0, range: DUMMY_BYTES };
+                        let mut bias = 0u64;
+                        let mut bound_size = 0u64;
+                        if size > 0 {
+                            match sh.span(base, size) {
+                                Some((buffer, start, end)) => {
+                                    let rel = base - start;
+                                    let align = ctx().limits.min_storage_buffer_offset_alignment.max(4);
+                                    let off = rel & !(align - 1);
+                                    bias = rel - off;
+                                    let range = (bias + size).next_multiple_of(4).min(end - start - off);
+                                    info = vk::DescriptorBufferInfo { buffer, offset: off, range };
+                                    bound_size = size;
+                                    if p.tr.plan.resources[i].written {
+                                        bound.writes.push((base, size));
+                                    }
+                                }
+                                None => {
+                                    drop(sh);
+                                    self.report(format!("{:?} shader {:#x}: buffer {base:#x}+{size:#x} is not mapped GPU memory (bound as zeros)", p.stage, p.addr));
+                                    sh = shared();
+                                }
+                            }
+                        }
+                        let ri = res_info + RES_INFO_DWORDS as usize * i;
+                        p.sgpr_data[ri] = bias as u32;
+                        p.sgpr_data[ri + 1] = stride;
+                        p.sgpr_data[ri + 2] = bound_size.min(u32::MAX as u64) as u32;
+                        bound.bufs.push((b.binding, info));
+                    }
+                    BindingKind::Gds => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: sh.gds, offset: 0, range: rdna::translate::GDS_BYTES as u64 })),
+                    _ => {}
+                }
+            }
+        }
+        let frame = super::FRAMES.load(Ordering::Relaxed);
+        for b in &p.tr.out.bindings {
+            match (b.kind, b.kind_resource().and_then(|i| p.resources.get(i))) {
+                (BindingKind::Image(_) | BindingKind::StorageImage(_), Some(Resolved::Image(t))) => {
+                    let storage = matches!(b.kind, BindingKind::StorageImage(_));
+                    let (view, image) = super::images::with(|im| im.view(t, storage, frame))?;
+                    let ty = if storage { vk::DescriptorType::STORAGE_IMAGE } else { vk::DescriptorType::SAMPLED_IMAGE };
+                    bound.imgs.push((b.binding, ty, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }));
+                    bound.images.push(image);
+                }
+                (BindingKind::Sampler(i), Some(Resolved::Sampler(sm))) => {
+                    let compare = p.tr.out.compare_samplers.contains(&i);
+                    let smp = super::images::with(|im| im.sampler(*sm, compare))?;
+                    bound.imgs.push((b.binding, vk::DescriptorType::SAMPLER, vk::DescriptorImageInfo { sampler: smp, image_view: vk::ImageView::null(), image_layout: vk::ImageLayout::UNDEFINED }));
+                }
+                (BindingKind::Image(_) | BindingKind::StorageImage(_) | BindingKind::Sampler(_), _) => return Err("binding/resource mismatch".into()),
+                _ => {}
+            }
+        }
+        Ok(bound)
+    }
+
+    /// Copies a stage's SGPR data into the ring (space reserved) and binds it.
+    fn bind_sgpr(&mut self, p: &Prepared, bound: &mut Bound) -> Result<(), String> {
+        let bytes: Vec<u8> = p.sgpr_data.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let off = self.ring_alloc(bytes.len() as u64).ok_or("SGPR data ring exhausted")?;
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ring_ptr.add(off as usize), bytes.len()) };
+        for b in &p.tr.out.bindings {
+            if b.kind == BindingKind::SgprData {
+                bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: self.ring, offset: off, range: bytes.len() as u64 }));
+            }
+        }
+        Ok(())
+    }
+
+    fn alloc_set(&mut self, layout: vk::DescriptorSetLayout) -> Result<vk::DescriptorSet, String> {
+        let layouts = [layout];
+        let ai = vk::DescriptorSetAllocateInfo::default().descriptor_pool(self.slots[self.cur].desc_pool).set_layouts(&layouts);
+        unsafe { ctx().device.allocate_descriptor_sets(&ai) }.map(|v| v[0]).map_err(|e| format!("descriptor set: {e}"))
+    }
+
+    fn write_set(&self, set: vk::DescriptorSet, bounds: &[Bound]) {
+        let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
+        for b in bounds {
+            for (binding, info) in &b.bufs {
+                writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)));
+            }
+            for (binding, ty, info) in &b.imgs {
+                writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(*ty).image_info(std::slice::from_ref(info)));
+            }
+        }
+        unsafe { ctx().device.update_descriptor_sets(&writes, &[]) };
+    }
+
     /// Executes a dispatch of `groups` thread groups with the compute state of `cp`.
     pub fn dispatch(&mut self, cp: &Cp, groups: [u32; 3], initiator: u32) {
         if DEVICE_LOST.load(Ordering::Relaxed) {
@@ -785,15 +953,7 @@ impl Exec {
             p = shaders::prepare_compute(cp, wave64)?;
         }
         // Textures are uploaded from guest memory: earlier GPU writes first.
-        let tex_ranges: Vec<(u64, u64)> = p
-            .resources
-            .iter()
-            .filter_map(|r| match r {
-                Resolved::Image(t) => Some((t.base, (t.width as u64 * t.height as u64 * t.depth.max(1) as u64 * 16).min(1 << 30))),
-                _ => None,
-            })
-            .collect();
-        if self.overlaps_pending(&tex_ranges) {
+        if self.overlaps_pending(&texture_ranges(&p)) {
             self.flush();
         }
         let local = [cp.reg(Space::Sh, 0x207) & 0xFFFF, cp.reg(Space::Sh, 0x208) & 0xFFFF, cp.reg(Space::Sh, 0x209) & 0xFFFF];
@@ -809,124 +969,17 @@ impl Exec {
         let t_prep = t0.elapsed();
         let (pipeline, layout, set_layout) = shared().pipeline(&p)?;
         let t_pipe = t0.elapsed();
-        // Buffer bindings (and the resource info blocks of the SGPR data).
-        let res_info = rdna::translate::res_info_offset(&p.tr.plan) as usize;
-        let mut buf_infos: Vec<(u32, vk::DescriptorBufferInfo)> = Vec::new();
-        let mut writes_here: Vec<(u64, u64)> = Vec::new();
-        {
-            let mut sh = shared();
-            for b in &p.tr.out.bindings {
-                match b.kind {
-                    BindingKind::Buffer(i) => {
-                        let (base, size, stride) = match &p.resources[i] {
-                            Resolved::Buffer(v) => (v.base, v.byte_size(), v.stride),
-                            Resolved::Global(a) => (*a, None, 0),
-                            _ => return Err("binding/resource mismatch".into()),
-                        };
-                        let size = match size {
-                            Some(n) => n,
-                            None => Shared::mapping(base).map(|(_, e)| (e - base).min(UNBOUNDED_MAX)).unwrap_or(0),
-                        };
-                        let mut info = vk::DescriptorBufferInfo { buffer: sh.dummy, offset: 0, range: DUMMY_BYTES };
-                        let mut bias = 0u64;
-                        let mut bound = 0u64;
-                        if size > 0 {
-                            match sh.span(base, size) {
-                                Some((buffer, start, end)) => {
-                                    let rel = base - start;
-                                    let align = ctx().limits.min_storage_buffer_offset_alignment.max(4);
-                                    let off = rel & !(align - 1);
-                                    bias = rel - off;
-                                    let range = (bias + size).next_multiple_of(4).min(end - start - off);
-                                    info = vk::DescriptorBufferInfo { buffer, offset: off, range };
-                                    bound = size;
-                                    if p.tr.plan.resources[i].written {
-                                        writes_here.push((base, size));
-                                    }
-                                }
-                                None => self.report(format!("cs {:#x}: buffer {base:#x}+{size:#x} is not mapped GPU memory (bound as zeros)", p.addr)),
-                            }
-                        }
-                        let ri = res_info + RES_INFO_DWORDS as usize * i;
-                        p.sgpr_data[ri] = bias as u32;
-                        p.sgpr_data[ri + 1] = stride;
-                        p.sgpr_data[ri + 2] = bound.min(u32::MAX as u64) as u32;
-                        buf_infos.push((b.binding, info));
-                    }
-                    BindingKind::Gds => buf_infos.push((b.binding, vk::DescriptorBufferInfo { buffer: sh.gds, offset: 0, range: rdna::translate::GDS_BYTES as u64 })),
-                    _ => {}
-                }
-            }
-        }
-        // Images and samplers.
-        let frame = super::FRAMES.load(Ordering::Relaxed);
-        let mut img_infos: Vec<(u32, vk::DescriptorType, vk::DescriptorImageInfo)> = Vec::new();
-        for b in &p.tr.out.bindings {
-            match (b.kind, b.kind_resource().and_then(|i| p.resources.get(i))) {
-                (BindingKind::Image(_) | BindingKind::StorageImage(_), Some(Resolved::Image(t))) => {
-                    let storage = matches!(b.kind, BindingKind::StorageImage(_));
-                    let view = super::images::with(|im| im.view(t, storage, frame))?;
-                    let ty = if storage { vk::DescriptorType::STORAGE_IMAGE } else { vk::DescriptorType::SAMPLED_IMAGE };
-                    img_infos.push((b.binding, ty, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }));
-                }
-                (BindingKind::Sampler(_), Some(Resolved::Sampler(sm))) => {
-                    let smp = super::images::with(|im| im.sampler(*sm))?;
-                    img_infos.push((b.binding, vk::DescriptorType::SAMPLER, vk::DescriptorImageInfo { sampler: smp, image_view: vk::ImageView::null(), image_layout: vk::ImageLayout::UNDEFINED }));
-                }
-                (BindingKind::Image(_) | BindingKind::StorageImage(_) | BindingKind::Sampler(_), _) => return Err("binding/resource mismatch".into()),
-                _ => {}
-            }
-        }
+        self.reserve(&[&p]);
+        let mut bound = self.bind_stage(&mut p)?;
+        self.bind_sgpr(&p, &mut bound)?;
         let t_bind = t0.elapsed();
-        // The slot must be free before its ring segment is written.
-        self.begin();
-        // SGPR data.
-        let bytes: Vec<u8> = p.sgpr_data.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let off = match self.ring_alloc(bytes.len() as u64) {
-            Some(o) => o,
-            None => {
-                self.flush();
-                self.begin();
-                self.ring_alloc(bytes.len() as u64).ok_or("SGPR data larger than the ring")?
-            }
-        };
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ring_ptr.add(off as usize), bytes.len()) };
-        for b in &p.tr.out.bindings {
-            if b.kind == BindingKind::SgprData {
-                buf_infos.push((b.binding, vk::DescriptorBufferInfo { buffer: self.ring, offset: off, range: bytes.len() as u64 }));
-            }
-        }
-        self.begin();
+        let set = self.alloc_set(set_layout)?;
+        let writes_here = std::mem::take(&mut bound.writes);
+        self.write_set(set, std::slice::from_ref(&bound));
+        self.end_rendering();
         let c = ctx();
-        let layouts = [set_layout];
-        let ai = vk::DescriptorSetAllocateInfo::default().set_layouts(&layouts);
-        let set = match unsafe { c.device.allocate_descriptor_sets(&ai.descriptor_pool(self.slots[self.cur].desc_pool)) } {
-            Ok(v) => v[0],
-            Err(_) => {
-                // Pool exhausted: complete the recorded work (resets the pool).
-                // The SGPR data was written to the ring, which flush resets: rewrite it.
-                self.flush();
-                let off2 = self.ring_alloc(bytes.len() as u64).ok_or("ring")?;
-                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ring_ptr.add(off2 as usize), bytes.len()) };
-                for (binding, info) in buf_infos.iter_mut() {
-                    if p.tr.out.bindings.iter().any(|b| b.binding == *binding && b.kind == BindingKind::SgprData) {
-                        info.offset = off2;
-                    }
-                }
-                self.begin();
-                unsafe { c.device.allocate_descriptor_sets(&ai.descriptor_pool(self.slots[self.cur].desc_pool)) }.map_err(|e| format!("descriptor set: {e}"))?[0]
-            }
-        };
-        let mut writes: Vec<vk::WriteDescriptorSet> = buf_infos
-            .iter()
-            .map(|(binding, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
-            .collect();
-        for (binding, ty, info) in &img_infos {
-            writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(*ty).image_info(std::slice::from_ref(info)));
-        }
         let start = [cp.reg(Space::Sh, 0x204), cp.reg(Space::Sh, 0x205), cp.reg(Space::Sh, 0x206)];
         unsafe {
-            c.device.update_descriptor_sets(&writes, &[]);
             let cmd = self.cmd();
             let qp = self.slots[self.cur].queries;
             let ti = self.batch_shaders.len() as u32;
@@ -984,9 +1037,12 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed, {} skipped, {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed, {} skipped; {} draws executed, {} without effect, {} skipped; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         SKIPPED.load(Ordering::Relaxed),
+        draw::DRAWN.load(Ordering::Relaxed),
+        draw::DRAW_NOOP.load(Ordering::Relaxed),
+        draw::DRAW_SKIPPED.load(Ordering::Relaxed),
         FLUSHES.load(Ordering::Relaxed),
         verify::status(),
         super::cp::sync_summary()

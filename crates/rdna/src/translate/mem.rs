@@ -1141,6 +1141,13 @@ fn sample(tr: &mut T, ins: &Inst, name: &str, image: Word, img_ty: Word, si: Opt
     let has_cl = has("cl");
     let has_lz = has("lz");
     let Some(sidx) = si else { return Err(format!("{:#x}: sample without sampler", ins.pc)) };
+    if !get_lod {
+        let (mine, other) = if has_c { (&mut tr.compare_samplers, &tr.plain_samplers) } else { (&mut tr.plain_samplers, &tr.compare_samplers) };
+        mine.insert(sidx);
+        if other.contains(&sidx) {
+            tr.warn(format!("{:#x}: sampler {sidx} used with and without depth comparison", ins.pc));
+        }
+    }
     let svar = tr.samplers[&sidx];
     let sampler = e(tr.b.load(tr.sampler_ty, None, svar, None, []))?;
     let si_ty = tr.b.type_sampled_image(img_ty);
@@ -1466,7 +1473,13 @@ pub fn export(tr: &mut T, ins: &Inst) -> R<()> {
             while cs.len() < 4 {
                 cs.push(if ty == tr.t.v4f { tr.f(0.0) } else if ty == tr.t.v4i { tr.i(0) } else { tr.u(0) });
             }
-            let v = e(tr.b.composite_construct(ty, None, cs))?;
+            let mut v = e(tr.b.composite_construct(ty, None, cs))?;
+            if let (Some(pv), true) = (tr.probe_var, ty == tr.t.v4f) {
+                let pu = e(tr.b.load(tr.t.u32, None, pv, None, []))?;
+                let pf = tr.to_f(pu)?;
+                let one = tr.f(1.0);
+                v = e(tr.b.composite_construct(ty, None, [pf, pf, pf, one]))?;
+            }
             tr.guarded(act, &mut |tr| ok(tr.b.store(var, v, None, [])))?;
         }
         8 => {

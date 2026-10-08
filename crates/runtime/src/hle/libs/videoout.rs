@@ -344,12 +344,18 @@ pub fn register(r: &mut Registry) {
     ]);
 }
 
-/// Presents a flipped display buffer. GPU rendering is not implemented yet,
-/// so a black frame of the buffer's size is shown (never raw guest memory,
-/// which is tiled and not produced by the title's GPU work).
+/// Presents a flipped display buffer: the GPU image the title rendered at
+/// the buffer's address (`DS_GPU=1`), else a black frame of the buffer's size
+/// (never raw guest memory, which is tiled).
 fn present_buffer(b: &DisplayBuffer) {
     if crate::gpu::vk::try_ctx().is_none() {
         return;
+    }
+    if crate::gpu::exec::enabled() {
+        if let Some((image, _, width, height)) = crate::gpu::images::with(|im| im.rendered_at(b.addr)) {
+            crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Image { image, layout: ash::vk::ImageLayout::GENERAL, width, height });
+            return;
+        }
     }
     let (w, h) = PORT
         .lock()
@@ -370,5 +376,26 @@ fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
     if requested.is_none() && !listed {
         return;
     }
-    crate::warn!("screenshot of flip {flip} ({:?}) unavailable: GPU rendering is not implemented yet (buffer {:#x})", requested, b.addr);
+    let shot = || -> Result<std::path::PathBuf, String> {
+        if crate::gpu::vk::try_ctx().is_none() || !crate::gpu::exec::enabled() {
+            return Err("GPU execution is off (DS_GPU=1 renders frames)".into());
+        }
+        let (rgba, w, h) = crate::gpu::images::with(|im| -> Result<(Vec<u8>, u32, u32), String> {
+            let (image, format, w, h) = im.rendered_at(b.addr).ok_or("nothing was rendered to the buffer")?;
+            let raw = im.read_back(image, format, w, h)?;
+            Ok((crate::gpu::images::to_rgba8(format, &raw).ok_or_else(|| format!("no RGBA8 conversion for {format:?}"))?, w, h))
+        })?;
+        let dir = crate::run_dir().ok_or("no run directory")?;
+        let name = match &requested {
+            Some(n) if !n.is_empty() => format!("{n}.png"),
+            _ => format!("screenshot-{flip}.png"),
+        };
+        let path = dir.join(name);
+        std::fs::write(&path, crate::gpu::png::encode(w, h, &rgba)).map_err(|e| e.to_string())?;
+        Ok(path)
+    };
+    match shot() {
+        Ok(p) => crate::info!("screenshot of flip {flip} (buffer {:#x}): {}", b.addr, p.display()),
+        Err(e) => crate::warn!("screenshot of flip {flip} (buffer {:#x}) unavailable: {e}", b.addr),
+    }
 }

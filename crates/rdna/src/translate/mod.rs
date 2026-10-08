@@ -11,6 +11,7 @@
 //! cross 32-lane halves are approximated and reported as warnings.
 
 mod alu;
+pub mod gs;
 mod mem;
 
 use crate::analysis::{Plan, ResKind};
@@ -116,6 +117,9 @@ pub struct Spec {
     pub resources: Vec<ResSpec>,
     /// Binding index of the first binding (stages share one descriptor set).
     pub binding_base: u32,
+    /// Debugging: (pc, vgpr): the value of `vgpr` after the instruction at
+    /// `pc` replaces the color of every MRT export ((v, v, v, 1) as float).
+    pub probe: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,6 +162,11 @@ pub struct Output {
     pub params: u32,
     /// Bit mask of MRTs written (fragment).
     pub mrt_mask: u32,
+    /// Bit mask of parameter locations exported (vertex).
+    pub param_mask: u32,
+    /// Sampler resources used by depth-compare instructions (their Vulkan
+    /// samplers need compareEnable; others must not have it).
+    pub compare_samplers: Vec<usize>,
     pub writes_depth: bool,
     pub warnings: Vec<String>,
 }
@@ -240,6 +249,9 @@ pub(crate) struct T<'a> {
     // stage interface
     pub out_pos: Option<Word>,
     pub out_params: HashMap<u32, Word>,
+    /// Sampler resources used with / without depth comparison.
+    pub compare_samplers: BTreeSet<usize>,
+    pub plain_samplers: BTreeSet<usize>,
     pub out_mrt: HashMap<u32, (Word, Word)>,
     pub out_depth: Option<Word>,
     pub in_attrs: HashMap<u32, Word>,
@@ -264,6 +276,8 @@ pub(crate) struct T<'a> {
     pub params: u32,
     pub mrt_mask: u32,
     pub pc_var: Word,
+    /// Probe value (see `Spec::probe`).
+    pub probe_var: Option<Word>,
     pub sb_struct: Option<Word>,
     /// Binding of each raw buffer variable, and its uvec2/uvec4 views
     /// (aliases of the same binding for aligned 8/16-byte accesses).
@@ -738,6 +752,8 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         next_binding: 0,
         out_pos: None,
         out_params: HashMap::new(),
+        compare_samplers: BTreeSet::new(),
+        plain_samplers: BTreeSet::new(),
         out_mrt: HashMap::new(),
         out_depth: None,
         in_attrs: HashMap::new(),
@@ -754,6 +770,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         params: 0,
         mrt_mask: 0,
         pc_var: 0,
+        probe_var: None,
         sb_struct: None,
         buffer_binding: HashMap::new(),
         buffer_views: HashMap::new(),
@@ -836,6 +853,10 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     tr.vgpr = tr.b.variable(p_arr_v, None, StorageClass::Function, None);
     tr.scc = tr.b.variable(tr.t.fn_bool, None, StorageClass::Function, None);
     tr.pc_var = tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, None);
+    if tr.spec.probe.is_some() {
+        let z = tr.u(0);
+        tr.probe_var = Some(tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, Some(z)));
+    }
     for ins in code {
         if let Some((true, vgpr, lane)) = ins.const_lane_op() {
             if !tr.lane_slots.contains_key(&(vgpr as u32, lane)) {
@@ -898,7 +919,9 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         Stage::Vertex => {}
     }
     let spirv = tr.b.module().assemble();
-    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings })
+    let param_mask = tr.out_params.keys().filter(|&&p| p < 32).fold(0u32, |m, &p| m | 1 << p);
+    let compare_samplers = tr.compare_samplers.iter().copied().collect();
+    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, compare_samplers, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings })
 }
 
 const PC_EXIT: u32 = 0xFFFF_FFFF;
@@ -1001,6 +1024,17 @@ fn emit_dispatch_loop(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>) -> R<()
 }
 
 fn translate_inst(tr: &mut T, ins: &Inst) -> R<()> {
+    translate_one(tr, ins)?;
+    if let (Some((pc, vg)), Some(var)) = (tr.spec.probe, tr.probe_var) {
+        if ins.pc == pc {
+            let v = tr.vreg(vg)?;
+            ok(tr.b.store(var, v, None, []))?;
+        }
+    }
+    Ok(())
+}
+
+fn translate_one(tr: &mut T, ins: &Inst) -> R<()> {
     match ins.enc {
         Enc::Sop2 | Enc::Sop1 | Enc::Sopc | Enc::Sopk | Enc::Sopp => alu::scalar(tr, ins),
         Enc::Vop1 | Enc::Vop2 | Enc::Vopc | Enc::Vop3 | Enc::Vop3p => alu::vector(tr, ins),

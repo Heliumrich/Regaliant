@@ -60,6 +60,8 @@ pub enum Space {
 
 pub struct Cp {
     pub name: String,
+    /// Outcome of the last draw (frame captures).
+    pub last_draw: String,
     pub compute: bool,
     pub regs: Regs,
     index_base: u64,
@@ -164,6 +166,7 @@ impl Cp {
     pub fn new(name: &str, compute: bool) -> Cp {
         Cp {
             name: name.to_string(),
+            last_draw: String::new(),
             compute,
             regs: Regs::new(),
             index_base: 0,
@@ -247,6 +250,58 @@ impl Cp {
         self.exec = Some(e);
     }
 
+    /// Resets the context registers to their clear-state values: zero, except
+    /// the registers with a non-zero Agc register default (assumed to be the
+    /// hardware clear state; e.g. CB_COLOR_CONTROL = 0x00CC0010, scissor
+    /// bottom-right corners 0x40004000: the title leaves these unprogrammed
+    /// for ordinary draws).
+    fn clear_context(&mut self) {
+        static DEFAULTS: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
+        let d = DEFAULTS.get_or_init(|| {
+            let mut v = Vec::new();
+            for def in crate::hle::libs::agc_defaults::PUBLIC.iter().chain(crate::hle::libs::agc_defaults::INTERNAL) {
+                if matches!(def.table(), 0 | 3) {
+                    v.extend(def.regs.iter().filter(|r| r.1 != 0).copied());
+                }
+            }
+            v
+        });
+        self.regs.ctx.fill(0);
+        for &(i, val) in d {
+            self.set_reg(Space::Ctx, i, val);
+        }
+    }
+
+    /// Executes a draw (when GPU execution is enabled).
+    fn draw(&mut self, args: super::exec::DrawArgs) {
+        if !super::exec::enabled() || self.exec_failed {
+            self.note("draws are decoded but not rendered (set DS_GPU=1 to render them)");
+            return;
+        }
+        if self.exec.is_none() {
+            match super::exec::Exec::new(&self.name) {
+                Ok(e) => self.exec = Some(e),
+                Err(e) => {
+                    crate::error!("gpu[{}]: no executor: {e}", self.name);
+                    self.exec_failed = true;
+                    return;
+                }
+            }
+        }
+        let mut e = self.exec.take().unwrap();
+        self.last_draw = e.draw(self, args);
+        self.exec = Some(e);
+    }
+
+    /// Index size in bytes (VGT_INDEX_TYPE), None for 8-bit indices.
+    fn index_size(&self) -> Option<u32> {
+        match self.reg(Space::Uc, crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE) & 3 {
+            0 => Some(2),
+            1 => Some(4),
+            _ => None,
+        }
+    }
+
     fn note(&mut self, what: &'static str) {
         if self.notes_seen.insert(what) {
             crate::info!("gpu[{}]: {what}", self.name);
@@ -262,6 +317,10 @@ impl Cp {
         if (index as usize) < n {
             v[index as usize] = value;
         }
+    }
+
+    pub fn num_instances(&self) -> u32 {
+        self.num_instances
     }
 
     pub fn reg(&self, space: Space, index: u32) -> u32 {
@@ -363,9 +422,7 @@ impl Cp {
             op::LOAD_CONTEXT_REG_INDEX => self.load_pairs(Space::Ctx, addr64(p(0), p(1)), p(2)),
             op::LOAD_SH_REG_INDEX => self.load_pairs(Space::Sh, addr64(p(0), p(1)), p(2)),
             op::LOAD_UCONFIG_REG => self.load_pairs(Space::Uc, addr64(p(0), p(1)), p(2)),
-            op::CLEAR_STATE => {
-                self.regs.ctx.fill(0);
-            }
+            op::CLEAR_STATE => self.clear_context(),
             op::CONTEXT_CONTROL | op::PFP_SYNC_ME => {}
             // Partial flushes, cache actions and acquires order later work
             // after earlier work: GPU work is already ordered by barriers, so
@@ -383,7 +440,46 @@ impl Cp {
             op::DRAW_INDEX_2 | op::DRAW_INDEX_AUTO | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT
             | op::DRAW_INDIRECT_MULTI | op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDEX_MULTI_AUTO => {
                 DRAWS.fetch_add(1, Ordering::Relaxed);
-                self.note("draws are decoded but not rendered yet (no shader translation)");
+                let instances = self.num_instances;
+                let args = match opcode {
+                    op::DRAW_INDEX_AUTO => Some(super::exec::DrawArgs { count: p(0), instances, index: None, base_vertex: None, first_instance: 0 }),
+                    op::DRAW_INDEX_2 => self.index_size().map(|sz| super::exec::DrawArgs { count: p(3), instances, index: Some((addr64(p(1), p(2)), sz)), base_vertex: None, first_instance: 0 }),
+                    op::DRAW_INDEX_OFFSET_2 => self.index_size().map(|sz| super::exec::DrawArgs { count: p(2), instances, index: Some((self.index_base + p(1) as u64 * sz as u64, sz)), base_vertex: None, first_instance: 0 }),
+                    op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT => {
+                        // Arguments may have been written by earlier GPU work.
+                        self.sync();
+                        let a = self.draw_indirect_base + p(0) as u64;
+                        if opcode == op::DRAW_INDIRECT && valid(a, 16) {
+                            let w = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12)] };
+                            Some(super::exec::DrawArgs { count: w[0], instances: w[1], index: None, base_vertex: Some(w[2] as i32), first_instance: w[3] })
+                        } else if opcode == op::DRAW_INDEX_INDIRECT && valid(a, 20) {
+                            let w = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), rd32(a + 16)] };
+                            self.index_size().map(|sz| super::exec::DrawArgs { count: w[0], instances: w[1], index: Some((self.index_base + w[2] as u64 * sz as u64, sz)), base_vertex: Some(w[3] as i32), first_instance: w[4] })
+                        } else {
+                            None
+                        }
+                    }
+                    _ => {
+                        self.note("multi-draw packets are not rendered yet");
+                        None
+                    }
+                };
+                self.last_draw = "not executed".into();
+                match args {
+                    Some(a) => {
+                        self.draw(a);
+                        if super::capture::draw_dumps() {
+                            // Per-draw target dumps: complete the draw first.
+                            if let Some(e) = self.exec.as_mut() {
+                                e.flush();
+                            }
+                        }
+                    }
+                    None if matches!(opcode, op::DRAW_INDEX_2 | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDEX_INDIRECT) && self.index_size().is_none() => {
+                        self.note("draws with 8-bit indices are not rendered yet")
+                    }
+                    None => {}
+                }
                 if super::capture::capturing() {
                     let what = match opcode {
                         op::DRAW_INDEX_2 => format!(
@@ -818,7 +914,7 @@ impl Cp {
             }
             pop::WORKLOADS_ACTIVE | pop::WORKLOAD_COMPLETE | pop::LOD_STATS => {}
             pop::CONTEXT_STATE => match a(0) {
-                0 => self.regs.ctx.fill(0),
+                0 => self.clear_context(),
                 1 => self.ctx_stack.push(self.regs.ctx.clone()),
                 2 => match self.ctx_stack.pop() {
                     Some(c) => self.regs.ctx = c,
@@ -826,7 +922,7 @@ impl Cp {
                 },
                 3 => {
                     self.ctx_stack.push(self.regs.ctx.clone());
-                    self.regs.ctx.fill(0);
+                    self.clear_context();
                 }
                 other => crate::warn!("gpu[{}]: unknown context state operation {other}", self.name),
             },
@@ -866,6 +962,7 @@ impl Cp {
             }
             pop::DRAW_INDEX_MULTI_INSTANCED => {
                 DRAWS.fetch_add(1, Ordering::Relaxed);
+                self.note("multi-instanced draws are not rendered yet");
             }
             _ => {
                 crate::warn!("gpu[{}]: unknown private packet op {operation} at {at:#x}", self.name);

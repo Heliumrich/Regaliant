@@ -14,6 +14,16 @@ fn main() {
         }
         std::process::exit(translate_capture(&files[1], &files[2]));
     }
+    // --spvdis <file.spv>: SPIR-V disassembly (rspirv).
+    if files.first().is_some_and(|f| f == "--spvdis") && files.len() == 2 {
+        use rspirv::binary::Disassemble;
+        let bytes = std::fs::read(&files[1]).expect("read spv");
+        let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let mut loader = rspirv::dr::Loader::new();
+        rspirv::binary::parse_words(&words, &mut loader).expect("parse spv");
+        println!("{}", loader.module().disassemble());
+        return;
+    }
     // --plan <file> [user sgprs] [user base]: resources and scalar loads with provenance.
     if files.first().is_some_and(|f| f == "--plan") && files.len() >= 2 {
         let bytes = std::fs::read(&files[1]).expect("read shader");
@@ -121,6 +131,11 @@ fn translate_capture(capture: &str, out_dir: &str) -> i32 {
                 ok += 1;
                 let bytes: Vec<u8> = out.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
                 let _ = std::fs::write(std::path::Path::new(out_dir).join(format!("{:012x}.spv", it.addr)), bytes);
+                if it.stage == rdna::translate::Stage::Vertex {
+                    // The rect-list expansion stage for this vertex shader's outputs.
+                    let gs: Vec<u8> = rdna::translate::gs::rect_list_gs(out.param_mask).iter().flat_map(|w| w.to_le_bytes()).collect();
+                    let _ = std::fs::write(std::path::Path::new(out_dir).join(format!("{:012x}-rect-gs.spv", it.addr)), gs);
+                }
                 for w in &out.warnings {
                     // Group warnings by message (without the pc prefix).
                     let k = match w.split_once(": ") {
