@@ -61,7 +61,7 @@ pub fn sample_thread(host_tid: u32, depth: usize) -> Option<String> {
 #[repr(C, align(16))]
 struct AlignedContext(CONTEXT);
 
-fn readable(a: u64) -> bool {
+pub fn readable(a: u64) -> bool {
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
     if a < 0x10000 {
         return false;

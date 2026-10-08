@@ -1,0 +1,9 @@
+[package]
+name = "rdna"
+version = "0.1.0"
+description = "AMD RDNA (gfx10) shader instruction decoder and disassembler"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]

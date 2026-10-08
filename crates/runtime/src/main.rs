@@ -37,6 +37,11 @@ pub struct Config {
 
 static RUN_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+/// This run's output directory (logs, captures).
+pub fn run_dir() -> Option<&'static Path> {
+    RUN_DIR.get().map(|p| p.as_path())
+}
+
 /// System allocator that reports implausibly large requests (almost always a
 /// guest value misread as a size) with the requesting host frames, before the
 /// request fails and aborts the process.
@@ -233,6 +238,10 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 info!("guest thread stacks:\n{}", thread_summary_ex(true));
                 Ok(())
             }
+            "capture" => {
+                gpu::capture::arm_next();
+                Ok(())
+            }
             "vmas" => {
                 // Debug: guest address space layout.
                 let m = crate::mem::MEM.lock();
@@ -382,6 +391,7 @@ fn main() {
     hle::LENIENT_IMPORTS.store(cfg.lenient, std::sync::atomic::Ordering::Relaxed);
     info!("dsport {} | run dir {} | TLS slot {}", env!("CARGO_PKG_VERSION"), cfg.run_dir.display(), slot);
     exception::install();
+    gpu::capture::init_from_env();
     if std::env::var_os("DS_TEST_FAULT").is_some() {
         info!("DS_TEST_FAULT: writing to an invalid address from host code");
         unsafe { std::ptr::write_volatile(0x32c3be8 as *mut u64, 1) };

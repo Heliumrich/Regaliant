@@ -143,6 +143,14 @@ static DEFAULTS_PTR: Mutex<(u64, u64)> = Mutex::new((0, 0));
 // u16 special_sizes, u8 type, u8 num_cx_registers, u8 num_sh_registers}.
 // Pointers are stored self-relative until sceAgcCreateShader relocates them.
 
+/// Shader programs created by the title: program address -> (stage, code bytes).
+static SHADERS: Mutex<std::collections::BTreeMap<u64, (u8, usize)>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Code size of the program at `addr` (from its shader object), if known.
+pub fn shader_code_size(addr: u64) -> Option<usize> {
+    SHADERS.lock().get(&addr).map(|&(_, n)| n).filter(|&n| n > 0 && n < 1 << 20)
+}
+
 pub mod shader {
     pub const MAGIC: u32 = 0x3433_3231; // "1234"
     pub const VERSION: u32 = 0x18;
@@ -339,6 +347,20 @@ sysv! {
             }
         }
         crate::debug!("agc: shader {h:#x} stage {stage} code {code:#x} size {:#x}", rd32(h + SHADER_SIZE));
+        if let Some(lo_reg) = program_register(stage) {
+            // Program address as programmed (code may hold data before it).
+            let regs = rd64(h + SH_REGS);
+            let n = *((h + NUM_SH) as *const u8) as u64;
+            for i in 0..n.saturating_sub(1) {
+                let e = regs + 8 * i;
+                if rd32(e) == lo_reg {
+                    let addr = ((rd32(e + 4) as u64) << 8) | (((rd32(e + 12) & 0xFF) as u64) << 40);
+                    let size = (code + rd32(h + SHADER_SIZE) as u64).saturating_sub(addr);
+                    SHADERS.lock().insert(addr, (stage, size as usize));
+                    break;
+                }
+            }
+        }
         *out = h;
         0
     }

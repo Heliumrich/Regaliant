@@ -7,6 +7,7 @@
 //! on the console. Draws and dispatches are decoded but not rendered yet
 //! (docs/STATUS.md).
 
+pub mod capture;
 pub mod cp;
 pub mod png;
 pub mod vk;

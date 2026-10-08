@@ -90,6 +90,11 @@ fn valid(a: u64, len: u64) -> bool {
     a >= crate::mem::GUEST_BASE && a.checked_add(len).is_some_and(|e| e <= crate::mem::GUEST_END)
 }
 
+/// Whether guest memory [a, a+len) is mapped and readable.
+pub fn guest_readable(a: u64, len: u64) -> bool {
+    valid(a, len) && crate::exception::readable(a) && crate::exception::readable((a + len.saturating_sub(1)) & !0xFFF)
+}
+
 /// GPU timestamp (100 MHz, like the console's GPU clock counter).
 pub fn gpu_clock() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -176,7 +181,7 @@ impl Cp {
         }
     }
 
-    fn reg(&self, space: Space, index: u32) -> u32 {
+    pub fn reg(&self, space: Space, index: u32) -> u32 {
         let v = match space {
             Space::Ctx => &self.regs.ctx,
             Space::Sh => &self.regs.sh,
@@ -288,10 +293,33 @@ impl Cp {
             | op::DRAW_INDIRECT_MULTI | op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDEX_MULTI_AUTO => {
                 DRAWS.fetch_add(1, Ordering::Relaxed);
                 self.note("draws are decoded but not rendered yet (no shader translation)");
+                if super::capture::capturing() {
+                    let what = match opcode {
+                        op::DRAW_INDEX_2 => format!(
+                            "DRAW_INDEX_2 count {} index {:#x} type {} instances {}",
+                            p(3),
+                            addr64(p(1), p(2)),
+                            self.reg(Space::Uc, crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE) & 3,
+                            self.num_instances
+                        ),
+                        op::DRAW_INDEX_AUTO => format!("DRAW_INDEX_AUTO count {} instances {}", p(0), self.num_instances),
+                        op::DRAW_INDEX_OFFSET_2 => format!("DRAW_INDEX_OFFSET_2 count {} offset {} base {:#x}", p(2), p(1), self.index_base),
+                        _ => format!("indirect draw opcode {opcode:#x} offset {:#x} base {:#x}", p(0), self.draw_indirect_base),
+                    };
+                    super::capture::draw(self, &what);
+                }
             }
             op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT => {
                 DISPATCHES.fetch_add(1, Ordering::Relaxed);
                 self.note("dispatches are decoded but not executed yet (no shader translation)");
+                if super::capture::capturing() {
+                    let what = if opcode == op::DISPATCH_DIRECT {
+                        format!("DISPATCH_DIRECT {}x{}x{}", p(0), p(1), p(2))
+                    } else {
+                        format!("DISPATCH_INDIRECT {:#x} base {:#x}", p(0), self.dispatch_indirect_base)
+                    };
+                    super::capture::dispatch(self, &what);
+                }
             }
             op::WRITE_DATA => self.write_data(n, p),
             op::COPY_DATA => self.copy_data(p),
@@ -619,7 +647,8 @@ impl Cp {
                 if r != 0 {
                     crate::warn!("gpu[{}]: flip of buffer {index} failed ({r:#x})", self.name);
                 }
-                crate::gpu::FRAMES.fetch_add(1, Ordering::Relaxed);
+                let n = crate::gpu::FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+                super::capture::on_flip(n);
             }
             pop::WAIT_SAFE_FOR_RENDERING => {
                 let (handle, index) = (a(0) as i32, a(1) as i32);
