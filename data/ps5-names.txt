@@ -387,3 +387,7 @@ sceVideoOutSubmitChangeBufferAttribute2
 sincos
 sincosf
 _open
+_close
+_nanosleep
+sceKernelMlock
+sceKernelUtimes

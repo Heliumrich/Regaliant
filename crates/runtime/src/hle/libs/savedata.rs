@@ -4,14 +4,18 @@
 //!
 //! PS5 API (Mount3/Umount2/Prepare/Commit with transaction resources):
 //! structure layouts and error codes per public sources (docs/PROVENANCE.md).
-//! Writes go straight to the host directory; Prepare/Commit are accepted
-//! (no staging copy yet). The save-data dialog (system UI) is answered
+//! Transactions: a title mounts read-only (mode 1), calls Prepare, writes,
+//! and calls Commit. Prepare gives the mount point a writable staging copy
+//! (`<title>/.staging/<dir>`); Commit swaps it in by two renames (a crash
+//! leaves the old or the new directory; `recover` completes it at the next
+//! mount); unmounting without a commit discards it. Mounts without mode 1
+//! are written directly. The save-data dialog (system UI) is answered
 //! automatically and logged; prompts of the delete type are declined.
 
 use crate::hle::{Registry, cstr};
 use crate::{fixed, reg, sysv};
 use parking_lot::Mutex;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const ERR_PARAMETER: i32 = 0x809F_0000u32 as i32;
@@ -30,7 +34,16 @@ const MOUNT_CREATE: u32 = 4;
 const MOUNT_CREATE2: u32 = 32;
 
 static ROOT: OnceLock<PathBuf> = OnceLock::new();
-static MOUNTS: Mutex<[Option<PathBuf>; 16]> = Mutex::new([const { None }; 16]);
+/// A mounted save directory and, between Prepare and Commit, its staging
+/// copy (with the transaction resource that prepared it).
+#[derive(Clone)]
+struct Mounted {
+    dir: PathBuf,
+    writable: bool,
+    staging: Option<(PathBuf, i32)>,
+}
+
+static MOUNTS: Mutex<[Option<Mounted>; 16]> = Mutex::new([const { None }; 16]);
 
 pub fn init(root: PathBuf) {
     ROOT.set(root).ok();
@@ -62,14 +75,107 @@ fn dir_name_match(name: &[u8], pat: &[u8]) -> bool {
 /// Mounts `path` at the first free /savedataN point.
 fn mount_at_free_slot(path: PathBuf, writable: bool) -> Result<String, i32> {
     let mut mounts = MOUNTS.lock();
-    if mounts.iter().any(|m| m.as_ref() == Some(&path)) {
+    if is_mounted(&mounts, &path) {
         return Err(ERR_BUSY);
     }
     let Some(slot) = mounts.iter().position(|s| s.is_none()) else { return Err(ERR_MOUNT_FULL) };
-    mounts[slot] = Some(path.clone());
+    mounts[slot] = Some(Mounted { dir: path.clone(), writable, staging: None });
     let mp = format!("/savedata{slot}");
     crate::hle::kernel::fs::mount(&mp, vec![path], writable);
     Ok(mp)
+}
+
+fn is_mounted(mounts: &[Option<Mounted>; 16], path: &Path) -> bool {
+    mounts.iter().flatten().any(|m| m.dir == path)
+}
+
+/// Unmounts slot `i`, discarding uncommitted writes.
+fn unmount_slot(mounts: &mut [Option<Mounted>; 16], i: usize, mp: &str) -> bool {
+    let Some(m) = mounts[i].take() else { return false };
+    crate::hle::kernel::fs::unmount(mp);
+    if let Some((staging, resource)) = m.staging {
+        let _ = std::fs::remove_dir_all(&staging);
+        crate::info!("savedata: {mp} unmounted without commit: staged writes of '{}' (resource {resource}) discarded", dir_label(&m.dir));
+    }
+    true
+}
+
+fn dir_label(dir: &Path) -> String {
+    dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// `<title root>/.staging/<dir>`: hidden from directory searches (not a
+/// valid directory name).
+fn staging_path(dir: &Path) -> PathBuf {
+    dir.parent().unwrap_or(dir).join(".staging").join(dir.file_name().unwrap_or_default())
+}
+
+fn old_path(dir: &Path) -> PathBuf {
+    let mut p = staging_path(dir).into_os_string();
+    p.push(".old");
+    PathBuf::from(p)
+}
+
+/// Copies a directory tree; returns the number of files.
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<u64> {
+    std::fs::create_dir_all(to)?;
+    let mut n = 0;
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let target = to.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            n += copy_dir(&e.path(), &target)?;
+        } else {
+            std::fs::copy(e.path(), &target)?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Makes `staging` the content of `dir`: dir -> old, staging -> dir, old
+/// removed. Renaming a directory fails on Windows while a file in it is
+/// open; then the files are copied over instead (not atomic, logged).
+fn commit_dir(staging: &Path, dir: &Path) -> std::io::Result<()> {
+    let old = old_path(dir);
+    let _ = std::fs::remove_dir_all(&old);
+    let had_dir = dir.exists();
+    if had_dir {
+        if let Err(e) = std::fs::rename(dir, &old) {
+            crate::warn!("savedata: commit of '{}' could not rename ({e}); copying the files instead (not atomic)", dir_label(dir));
+            copy_dir(staging, dir)?;
+            let _ = std::fs::remove_dir_all(staging);
+            return Ok(());
+        }
+    }
+    if let Err(e) = std::fs::rename(staging, dir) {
+        if had_dir {
+            let _ = std::fs::rename(&old, dir);
+        }
+        return Err(e);
+    }
+    let _ = std::fs::remove_dir_all(&old);
+    Ok(())
+}
+
+/// Finishes or rolls back a commit a crash interrupted (see `commit_dir`)
+/// and drops staged writes that were never committed. Not for mounted
+/// directories.
+fn recover(dir: &Path) {
+    let (staging, old) = (staging_path(dir), old_path(dir));
+    if !dir.exists() && old.exists() {
+        // Between the two renames: the staging copy was complete.
+        let new = staging.exists() && std::fs::rename(&staging, dir).is_ok();
+        if !new {
+            let _ = std::fs::rename(&old, dir);
+        }
+        crate::warn!("savedata: completed an interrupted commit of '{}' ({} data)", dir_label(dir), if new { "new" } else { "previous" });
+    }
+    let _ = std::fs::remove_dir_all(&old);
+    if staging.exists() {
+        crate::info!("savedata: removing uncommitted staged writes of '{}'", dir_label(dir));
+        let _ = std::fs::remove_dir_all(&staging);
+    }
 }
 
 fn read_blocks(dir: &std::path::Path) -> u64 {
@@ -94,9 +200,10 @@ unsafe fn mount_point_index(mp: *const u8) -> Option<usize> {
     s.strip_prefix("/savedata").and_then(|n| n.parse::<usize>().ok()).filter(|&n| n < 16)
 }
 
+/// The directory a mount point shows (the staging copy during a transaction).
 fn mounted_dir(mp: *const u8) -> Option<PathBuf> {
     let i = unsafe { mount_point_index(mp) }?;
-    MOUNTS.lock()[i].clone()
+    MOUNTS.lock()[i].as_ref().map(|m| m.staging.as_ref().map_or_else(|| m.dir.clone(), |s| s.0.clone()))
 }
 
 #[repr(C)]
@@ -126,6 +233,8 @@ sysv! {
         let name = cstr(dir).to_string();
         if !valid_dir_name(&name) { return ERR_PARAMETER; }
         let path = user_root(user, title).join(&name);
+        if is_mounted(&MOUNTS.lock(), &path) { return ERR_BUSY; }
+        recover(&path);
         let exists = path.join("sce_sys").exists() || path.exists();
         let mut created = false;
         if !exists {
@@ -138,11 +247,7 @@ sysv! {
         } else if mode & MOUNT_CREATE != 0 && mode & MOUNT_CREATE2 == 0 {
             return ERR_EXISTS;
         }
-        let mut mounts = MOUNTS.lock();
-        let Some(slot) = mounts.iter().position(|s| s.is_none()) else { return ERR_MOUNT_FULL };
-        mounts[slot] = Some(path.clone());
-        let mp = format!("/savedata{slot}");
-        crate::hle::kernel::fs::mount(&mp, vec![path], mode & MOUNT_RDONLY == 0);
+        let mp = match mount_at_free_slot(path, mode & MOUNT_RDONLY == 0) { Ok(x) => x, Err(e) => return e };
         std::ptr::write_bytes(result, 0, 64);
         crate::hle::write_cstr(result, 16, &mp);
         *(result.add(16) as *mut u64) = blocks;
@@ -152,9 +257,7 @@ sysv! {
     }
     fn sceSaveDataUmount(mp: *const u8) -> i32 {
         let Some(i) = mount_point_index(mp) else { return ERR_PARAMETER };
-        let mut mounts = MOUNTS.lock();
-        if mounts[i].take().is_none() { return ERR_NOT_MOUNTED; }
-        crate::hle::kernel::fs::unmount(cstr(mp));
+        if !unmount_slot(&mut MOUNTS.lock(), i, cstr(mp)) { return ERR_NOT_MOUNTED; }
         0
     }
     fn sceSaveDataDirNameSearch(cond: *const u8, result: *mut u8) -> i32 {
@@ -285,6 +388,8 @@ sysv! {
         let name = cstr(dir).to_string();
         if !valid_dir_name(&name) { return ERR_PARAMETER; }
         let path = user_root(user, std::ptr::null()).join(&name);
+        if is_mounted(&MOUNTS.lock(), &path) { return ERR_BUSY; }
+        recover(&path);
         let exists = path.join("sce_sys").exists();
         let mut created = false;
         if !exists {
@@ -309,9 +414,7 @@ sysv! {
     fn sceSaveDataUmount2(mode: u32, mp: *const u8) -> i32 {
         if mp.is_null() { return ERR_PARAMETER; }
         let Some(i) = mount_point_index(mp) else { return ERR_NOT_FOUND };
-        let mut mounts = MOUNTS.lock();
-        if mounts[i].take().is_none() { return ERR_NOT_FOUND; }
-        crate::hle::kernel::fs::unmount(cstr(mp));
+        if !unmount_slot(&mut MOUNTS.lock(), i, cstr(mp)) { return ERR_NOT_FOUND; }
         crate::debug!("sceSaveDataUmount2 {} mode {mode:#x}", cstr(mp));
         0
     }
@@ -320,16 +423,56 @@ sysv! {
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
     fn sceSaveDataDeleteTransactionResource(resource: i32) -> i32 { 0 }
-    /// (mount point, {i32 resource, u32 prepare_mode, reserved})
+    /// (mount point, {i32 resource, u32 prepare_mode, reserved}): starts a
+    /// transaction; the mount point shows a writable staging copy.
     fn sceSaveDataPrepare(mp: *const u8, param: *const u8) -> i32 {
         if mp.is_null() || param.is_null() { return ERR_PARAMETER; }
-        if mounted_dir(mp).is_none() { return ERR_NOT_MOUNTED; }
+        let Some(i) = mount_point_index(mp) else { return ERR_NOT_MOUNTED };
+        let resource = *(param as *const i32);
+        let mode = *(param.add(4) as *const u32);
+        let mut mounts = MOUNTS.lock();
+        let Some(m) = mounts[i].as_mut() else { return ERR_NOT_MOUNTED };
+        if m.staging.is_none() {
+            let staging = staging_path(&m.dir);
+            let _ = std::fs::remove_dir_all(&staging);
+            match copy_dir(&m.dir, &staging) {
+                Ok(n) => crate::info!("sceSaveDataPrepare {} resource {resource} mode {mode:#x}: staging copy of '{}' ({n} files)", cstr(mp), dir_label(&m.dir)),
+                Err(e) => {
+                    crate::error!("sceSaveDataPrepare {}: staging copy of '{}' failed: {e}", cstr(mp), dir_label(&m.dir));
+                    let _ = std::fs::remove_dir_all(&staging);
+                    return ERR_INTERNAL;
+                }
+            }
+            crate::hle::kernel::fs::mount(cstr(mp), vec![staging.clone()], true);
+            m.staging = Some((staging, resource));
+        }
         0
     }
-    /// ({i32 resource, u32 commit_mode, reserved}): data is already on disk.
+    /// ({i32 resource, u32 commit_mode, reserved}): the staged writes of the
+    /// mounts the resource prepared become the save data.
     fn sceSaveDataCommit(param: *const u8) -> i32 {
         if param.is_null() { return ERR_PARAMETER; }
-        crate::debug!("sceSaveDataCommit resource {} mode {:#x}", *(param as *const i32), *(param.add(4) as *const u32));
+        let resource = *(param as *const i32);
+        let mode = *(param.add(4) as *const u32);
+        let mut mounts = MOUNTS.lock();
+        let mut done = Vec::new();
+        for (i, slot) in mounts.iter_mut().enumerate() {
+            let Some(m) = slot.as_mut() else { continue };
+            let Some((staging, r)) = m.staging.clone() else { continue };
+            if r != resource { continue; }
+            if let Err(e) = commit_dir(&staging, &m.dir) {
+                crate::error!("sceSaveDataCommit: '{}': {e}", dir_label(&m.dir));
+                return ERR_INTERNAL;
+            }
+            m.staging = None;
+            crate::hle::kernel::fs::mount(&format!("/savedata{i}"), vec![m.dir.clone()], m.writable);
+            done.push(dir_label(&m.dir));
+        }
+        if done.is_empty() {
+            crate::warn!("sceSaveDataCommit resource {resource} mode {mode:#x}: no prepared save directory");
+        } else {
+            crate::info!("sceSaveDataCommit resource {resource} mode {mode:#x}: committed {done:?}");
+        }
         0
     }
     /// (mount point, {u64 blocks, u64 free_blocks, reserved[32]})
@@ -386,6 +529,7 @@ const DLG_FINISHED: i32 = 3;
 
 const MODE_USER_MSG: i32 = 2;
 const MODE_SYSTEM_MSG: i32 = 3;
+const MODE_ERROR_CODE: i32 = 4;
 const MODE_PROGRESS_BAR: i32 = 5;
 const DISP_DELETE: i32 = 3;
 const SYSMSG_PROGRESS: i32 = 5;
@@ -451,6 +595,12 @@ sysv! {
             let t = *(sys_msg as *const i32);
             desc.push_str(&format!(" system message {t}"));
             has_buttons = t != SYSMSG_PROGRESS;
+        }
+        if mode == MODE_ERROR_CODE {
+            let err = *(p.add(96) as *const u64) as *const i32;
+            if !err.is_null() {
+                desc.push_str(&format!(" error {:#x}", *err as u32));
+            }
         }
         if mode == MODE_PROGRESS_BAR {
             if !prog.is_null() {
@@ -518,4 +668,58 @@ sysv! {
     fn sceSaveDataDialogIsReadyToDisplay() -> i32 { 1 }
     fn sceSaveDataDialogProgressBarSetValue(target: i32, rate: u32) -> i32 { 0 }
     fn sceSaveDataDialogProgressBarInc(target: i32, delta: u32) -> i32 { 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tree(root: &Path) -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        for e in std::fs::read_dir(root).unwrap().flatten() {
+            if e.path().is_dir() {
+                for (n, c) in tree(&e.path()) {
+                    v.push((format!("{}/{n}", e.file_name().to_string_lossy()), c));
+                }
+            } else {
+                v.push((e.file_name().to_string_lossy().into_owned(), std::fs::read_to_string(e.path()).unwrap()));
+            }
+        }
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn commit_and_recovery() {
+        let base = std::env::temp_dir().join(format!("dsport-savedata-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("SAVE0");
+        std::fs::create_dir_all(dir.join("sce_sys")).unwrap();
+        std::fs::write(dir.join("USR-DATA"), "old").unwrap();
+        std::fs::write(dir.join("sce_sys").join("param.bin"), "p").unwrap();
+
+        // Prepare + write + commit.
+        let staging = staging_path(&dir);
+        assert_eq!(copy_dir(&dir, &staging).unwrap(), 2);
+        std::fs::write(staging.join("USR-DATA"), "new").unwrap();
+        commit_dir(&staging, &dir).unwrap();
+        assert_eq!(tree(&dir), vec![("USR-DATA".into(), "new".into()), ("sce_sys/param.bin".into(), "p".into())]);
+        assert!(!staging.exists() && !old_path(&dir).exists());
+
+        // Crash between the renames: the staged copy wins.
+        copy_dir(&dir, &staging).unwrap();
+        std::fs::write(staging.join("USR-DATA"), "newer").unwrap();
+        std::fs::rename(&dir, old_path(&dir)).unwrap();
+        recover(&dir);
+        assert_eq!(std::fs::read_to_string(dir.join("USR-DATA")).unwrap(), "newer");
+        assert!(!staging.exists() && !old_path(&dir).exists());
+
+        // Prepared but never committed: discarded.
+        copy_dir(&dir, &staging).unwrap();
+        std::fs::write(staging.join("USR-DATA"), "lost").unwrap();
+        recover(&dir);
+        assert_eq!(std::fs::read_to_string(dir.join("USR-DATA")).unwrap(), "newer");
+        assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
