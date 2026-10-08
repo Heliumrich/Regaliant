@@ -15,6 +15,36 @@ const WEBAPI2_ERROR_INVALID_ARGUMENT: i32 = 0x8055_3402u32 as i32;
 /// NpWebApi2 "not signed in" (error codes per public sources, docs/PROVENANCE.md).
 const WEBAPI2_ERROR_NOT_SIGNED_IN: i32 = 0x8055_3407u32 as i32;
 
+const UDS_ERROR_INVALID_ARGUMENT: i32 = 0x8055_3102u32 as i32;
+const GAME_UPDATE_ERROR_INVALID_ARG: i32 = 0x8041_2803u32 as i32;
+const GAME_UPDATE_ERROR_INVALID_SIZE: i32 = 0x8041_2804u32 as i32;
+const HTTP2_ERROR_BEFORE_SEND: i32 = 0x817B_1065u32 as i32;
+const HTTP2_ERROR_TIMEOUT: i32 = 0x817B_1068u32 as i32;
+const HTTP2_ERROR_NULL_POINTER: i32 = 0x817B_1225u32 as i32;
+const NP_ERROR_SIGNED_OUT: i32 = 0x8055_0006u32 as i32;
+const SIGNIN_INITIALIZED: i32 = 1;
+const SIGNIN_RUNNING: i32 = 2;
+const SIGNIN_FINISHED: i32 = 3;
+/// (status, polled while running)
+static SIGNIN: parking_lot::Mutex<(i32, bool)> = parking_lot::Mutex::new((0, false));
+
+/// Opaque UDS handles: 64-byte host blocks.
+fn uds_alloc() -> u64 {
+    let p = Box::into_raw(Box::new([0u64; 8])) as u64;
+    UDS_LIVE.lock().insert(p);
+    p
+}
+fn uds_free(p: u64) {
+    if p != 0 && UDS_LIVE.lock().remove(&p) {
+        drop(unsafe { Box::from_raw(p as *mut [u64; 8]) });
+    }
+}
+fn uds_check(p: u64) -> i32 {
+    if p == 0 { UDS_ERROR_INVALID_ARGUMENT } else { 0 }
+}
+/// Handles allocated here (only these are freed; titles may pass their own).
+static UDS_LIVE: parking_lot::Mutex<std::collections::BTreeSet<u64>> = parking_lot::Mutex::new(std::collections::BTreeSet::new());
+
 fn cstr_or(p: *const u8) -> String {
     if p.is_null() { String::new() } else { unsafe { crate::hle::cstr(p) }.to_string() }
 }
@@ -146,6 +176,136 @@ sysv! {
         0
     }
     fn sceNpUniversalDataSystemRegisterContext(ctx: i32, h: i32, flags: u32) -> i32 { 0 }
+    // ---- UDS events: property objects/arrays and events are opaque handles
+    // (host allocations); posting discards the event.
+    fn sceNpUniversalDataSystemCreateEvent(name: *const u8, props: u64, out: *mut u64, props_out: *mut u64) -> i32 {
+        if name.is_null() || out.is_null() { return UDS_ERROR_INVALID_ARGUMENT; }
+        *out = uds_alloc();
+        if !props_out.is_null() { *props_out = if props != 0 { props } else { uds_alloc() }; }
+        0
+    }
+    fn sceNpUniversalDataSystemDestroyEvent(ev: u64) -> i32 { uds_free(ev); 0 }
+    fn sceNpUniversalDataSystemCreateEventPropertyObject(out: *mut u64) -> i32 {
+        if out.is_null() { return UDS_ERROR_INVALID_ARGUMENT; }
+        *out = uds_alloc();
+        0
+    }
+    fn sceNpUniversalDataSystemDestroyEventPropertyObject(obj: u64) -> i32 { uds_free(obj); 0 }
+    fn sceNpUniversalDataSystemCreateEventPropertyArray(out: *mut u64) -> i32 {
+        if out.is_null() { return UDS_ERROR_INVALID_ARGUMENT; }
+        *out = uds_alloc();
+        0
+    }
+    fn sceNpUniversalDataSystemDestroyEventPropertyArray(arr: u64) -> i32 { uds_free(arr); 0 }
+    fn sceNpUniversalDataSystemEventPropertyObjectSetString(obj: u64, key: *const u8, v: *const u8) -> i32 { uds_check(obj) }
+    fn sceNpUniversalDataSystemEventPropertyObjectSetInt32(obj: u64, key: *const u8, v: i32) -> i32 { uds_check(obj) }
+    fn sceNpUniversalDataSystemEventPropertyObjectSetUInt32(obj: u64, key: *const u8, v: u32) -> i32 { uds_check(obj) }
+    fn sceNpUniversalDataSystemEventPropertyObjectSetUInt64(obj: u64, key: *const u8, v: u64) -> i32 { uds_check(obj) }
+    /// (object, key, array or NULL, *array used)
+    fn sceNpUniversalDataSystemEventPropertyObjectSetArray(obj: u64, key: *const u8, v: u64, out: *mut u64) -> i32 {
+        if !out.is_null() { *out = if v != 0 { v } else { uds_alloc() }; }
+        uds_check(obj)
+    }
+    fn sceNpUniversalDataSystemEventPropertyArraySetString(arr: u64, v: *const u8) -> i32 { uds_check(arr) }
+    fn sceNpUniversalDataSystemEventPropertyArraySetFloat32(arr: u64, v: f32) -> i32 { uds_check(arr) }
+    /// (array, object or NULL, *object used)
+    fn sceNpUniversalDataSystemEventPropertyArraySetObject(arr: u64, v: u64, out: *mut u64) -> i32 {
+        if !out.is_null() { *out = if v != 0 { v } else { uds_alloc() }; }
+        uds_check(arr)
+    }
+    fn sceNpUniversalDataSystemPostEvent(ctx: i32, h: i32, ev: u64, options: u64) -> i32 {
+        stub_log("sceNpUniversalDataSystemPostEvent (offline: event discarded)", 0);
+        0
+    }
+
+    // ---- Game updates: no update is available (offline console).
+    fn sceGameUpdateCreateRequest() -> i32 { next_id() }
+    fn sceGameUpdateDeleteRequest(req: i32) -> i32 { 0 }
+    fn sceGameUpdateAbortRequest(req: i32) -> i32 { 0 }
+    /// (request, param {size_t size, ...}, result {size_t size, bool found,
+    /// bool addcont_found, ..., char content_version[11], ...})
+    fn sceGameUpdateCheck(req: i32, param: *const u64, result: *mut u64) -> i32 {
+        if param.is_null() || result.is_null() { return GAME_UPDATE_ERROR_INVALID_ARG; }
+        let size = *result;
+        if size < 16 || size > 0x400 { return GAME_UPDATE_ERROR_INVALID_SIZE; }
+        std::ptr::write_bytes(result as *mut u8, 0, size as usize);
+        *result = size;
+        stub_log("sceGameUpdateCheck (offline: no update found)", 0);
+        0
+    }
+
+    // ---- HTTP/2: templates and requests exist; nothing reaches a network,
+    // so sends complete with a timeout.
+    fn sceHttp2CreateTemplate(ctx: i32, user_agent: *const u8, version: i32, auto_proxy: i32) -> i32 { next_id() }
+    fn sceHttp2DeleteTemplate(id: i32) -> i32 { 0 }
+    fn sceHttp2CreateRequestWithURL(tmpl: i32, method: *const u8, url: *const u8, length: u64) -> i32 {
+        if method.is_null() || url.is_null() { return HTTP2_ERROR_NULL_POINTER; }
+        crate::debug!("sceHttp2CreateRequestWithURL {} {}", cstr_or(method), cstr_or(url));
+        next_id()
+    }
+    fn sceHttp2DeleteRequest(id: i32) -> i32 { 0 }
+    fn sceHttp2AddRequestHeader(id: i32, name: *const u8, value: *const u8, mode: u32) -> i32 { 0 }
+    fn sceHttp2SendRequestAsync(id: i32, data: u64, size: u64, kq: u64, opt: u64) -> i32 {
+        stub_log("sceHttp2SendRequestAsync (offline: completes with a timeout)", 0);
+        0
+    }
+    /// Async result {i32 event_type, i32 req_id, i32 result, pad, void* reserved}.
+    fn sceHttp2WaitAsync(id: i32, result: *mut i32, timeout: *mut u32, opt: u64) -> i32 {
+        if result.is_null() { return HTTP2_ERROR_NULL_POINTER; }
+        std::ptr::write_bytes(result as *mut u8, 0, 24);
+        *result.add(1) = id;
+        *result.add(2) = HTTP2_ERROR_TIMEOUT;
+        0
+    }
+    fn sceHttp2ReadDataAsync(id: i32, data: u64, size: u64, kq: u64, opt: u64) -> i32 { HTTP2_ERROR_BEFORE_SEND }
+    fn sceHttp2GetStatusCode(id: i32, status: *mut i32) -> i32 { HTTP2_ERROR_BEFORE_SEND }
+    fn sceHttp2GetResponseContentLength(id: i32, result: *mut i32, length: *mut u64) -> i32 { HTTP2_ERROR_BEFORE_SEND }
+    fn sceHttp2GetAllResponseHeaders(id: i32, header: *mut u64, size: *mut u64) -> i32 { HTTP2_ERROR_BEFORE_SEND }
+
+    // ---- NP account queries: signed out.
+    fn sceNpGetAccountIdA(user: i32, id: *mut u64) -> i32 {
+        if !id.is_null() { *id = 0; }
+        NP_ERROR_SIGNED_OUT
+    }
+    fn sceNpGetAccountCountryA(user: i32, code: *mut u8) -> i32 {
+        if !code.is_null() { std::ptr::write_bytes(code, 0, 4); }
+        NP_ERROR_SIGNED_OUT
+    }
+    fn sceNpCreateRequest() -> i32 { next_id() }
+    fn sceNpCheckPremium(req: i32, param: u64, result: *mut u8) -> i32 {
+        if !result.is_null() { std::ptr::write_bytes(result, 0, 16); }
+        NP_ERROR_SIGNED_OUT
+    }
+
+    // ---- Sign-in dialog: shown, and the user does not sign in.
+    fn sceSigninDialogInitialize() -> i32 { *SIGNIN.lock() = (SIGNIN_INITIALIZED, false); 0 }
+    fn sceSigninDialogOpen(param: u64) -> i32 {
+        crate::info!("sign-in dialog opened (offline console: the user does not sign in)");
+        *SIGNIN.lock() = (SIGNIN_RUNNING, false);
+        0
+    }
+    fn sceSigninDialogUpdateStatus() -> i32 {
+        let mut g = SIGNIN.lock();
+        if g.0 == SIGNIN_RUNNING {
+            if g.1 { g.0 = SIGNIN_FINISHED; }
+            g.1 = true;
+        }
+        g.0
+    }
+    fn sceSigninDialogGetStatus() -> i32 { SIGNIN.lock().0 }
+    /// {i32 result (1 = user canceled), i32 reserved[3]}
+    fn sceSigninDialogGetResult(result: *mut i32) -> i32 {
+        if result.is_null() { return 0x8135_0003u32 as i32; }
+        std::ptr::write_bytes(result as *mut u8, 0, 16);
+        *result = 1;
+        0
+    }
+    fn sceSigninDialogClose() -> i32 { let mut g = SIGNIN.lock(); if g.0 == SIGNIN_RUNNING { g.0 = SIGNIN_FINISHED; } 0 }
+    fn sceSigninDialogTerminate() -> i32 { *SIGNIN.lock() = (0, false); 0 }
+
+    /// Whether a system dialog is on screen (the save-data dialog).
+    fn sceCommonDialogIsUsed() -> u32 { super::savedata::dialog_running() as u32 }
+
     /// 24-byte memory statistics (the title zeroes it first, eboot+0x650132):
     /// nothing is allocated because events are discarded.
     fn sceNpUniversalDataSystemGetMemoryStat(stat: *mut u64) -> i32 {
@@ -183,5 +343,24 @@ pub fn register(r: &mut Registry) {
     reg!(r, "libSceNpUniversalDataSystem", [
         sceNpUniversalDataSystemInitialize, sceNpUniversalDataSystemCreateContext, sceNpUniversalDataSystemCreateHandle,
         sceNpUniversalDataSystemRegisterContext, sceNpUniversalDataSystemGetMemoryStat,
+        sceNpUniversalDataSystemCreateEvent, sceNpUniversalDataSystemDestroyEvent, sceNpUniversalDataSystemCreateEventPropertyObject,
+        sceNpUniversalDataSystemDestroyEventPropertyObject, sceNpUniversalDataSystemCreateEventPropertyArray,
+        sceNpUniversalDataSystemDestroyEventPropertyArray, sceNpUniversalDataSystemEventPropertyObjectSetString,
+        sceNpUniversalDataSystemEventPropertyObjectSetInt32, sceNpUniversalDataSystemEventPropertyObjectSetUInt32,
+        sceNpUniversalDataSystemEventPropertyObjectSetUInt64, sceNpUniversalDataSystemEventPropertyObjectSetArray,
+        sceNpUniversalDataSystemEventPropertyArraySetString, sceNpUniversalDataSystemEventPropertyArraySetFloat32,
+        sceNpUniversalDataSystemEventPropertyArraySetObject, sceNpUniversalDataSystemPostEvent,
     ]);
+    reg!(r, "libSceGameUpdate", [sceGameUpdateCreateRequest, sceGameUpdateDeleteRequest, sceGameUpdateAbortRequest, sceGameUpdateCheck]);
+    reg!(r, "libSceHttp2", [
+        sceHttp2CreateTemplate, sceHttp2DeleteTemplate, sceHttp2CreateRequestWithURL, sceHttp2DeleteRequest, sceHttp2AddRequestHeader,
+        sceHttp2SendRequestAsync, sceHttp2WaitAsync, sceHttp2ReadDataAsync, sceHttp2GetStatusCode, sceHttp2GetResponseContentLength,
+        sceHttp2GetAllResponseHeaders,
+    ]);
+    reg!(r, "libSceNpManager", [sceNpGetAccountIdA, sceNpGetAccountCountryA, sceNpCreateRequest, sceNpCheckPremium]);
+    reg!(r, "libSceSigninDialog", [
+        sceSigninDialogInitialize, sceSigninDialogOpen, sceSigninDialogUpdateStatus, sceSigninDialogGetStatus, sceSigninDialogGetResult,
+        sceSigninDialogClose, sceSigninDialogTerminate,
+    ]);
+    reg!(r, "libSceCommonDialog", [sceCommonDialogIsUsed]);
 }

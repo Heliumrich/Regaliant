@@ -37,6 +37,52 @@ pub struct Config {
 
 static RUN_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+/// System allocator that reports implausibly large requests (almost always a
+/// guest value misread as a size) with the requesting host frames, before the
+/// request fails and aborts the process.
+struct GuardedAlloc;
+
+const HUGE_ALLOC: usize = 4 << 30;
+
+#[cold]
+fn report_huge_alloc(size: usize) {
+    use std::io::Write;
+    let mut frames = [std::ptr::null_mut::<std::ffi::c_void>(); 24];
+    let n = unsafe { windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(1, 24, frames.as_mut_ptr(), std::ptr::null_mut()) } as usize;
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(err, "huge host allocation of {size} bytes ({size:#x}) requested; frames:");
+    for f in &frames[..n] {
+        let _ = writeln!(err, "    {}", exception::host_symbol(*f as u64));
+    }
+}
+
+unsafe impl std::alloc::GlobalAlloc for GuardedAlloc {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() > HUGE_ALLOC {
+            report_huge_alloc(l.size());
+        }
+        unsafe { std::alloc::System.alloc(l) }
+    }
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() > HUGE_ALLOC {
+            report_huge_alloc(l.size());
+        }
+        unsafe { std::alloc::System.alloc_zeroed(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(p, l) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        if new_size > HUGE_ALLOC {
+            report_huge_alloc(new_size);
+        }
+        unsafe { std::alloc::System.realloc(p, l, new_size) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: GuardedAlloc = GuardedAlloc;
+
 fn utc_stamp() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     let days = secs.div_euclid(86400);
@@ -233,7 +279,7 @@ fn thread_summary_ex(with_stacks: bool) -> String {
     for t in list {
         let state = match t.exited.try_lock() {
             Some(g) => match *g {
-                Some(v) => format!("exited({v:#x})"),
+                Some(v) => format!("exited({v:#x}) at {:.3} s", t.exit_ms.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0),
                 None => "running".into(),
             },
             None => "?".into(),
@@ -252,6 +298,8 @@ fn thread_summary_ex(with_stacks: bool) -> String {
         }
     }
     s.push_str(&gpu::status());
+    s.push_str(&audio::status());
+    s.push_str(&hle::libs::ajm::status());
     s
 }
 

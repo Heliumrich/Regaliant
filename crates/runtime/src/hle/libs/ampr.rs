@@ -211,12 +211,12 @@ fn resolve_path(guest: &str) -> Result<(u32, u64), i32> {
             return Ok((id, t.files[id as usize - 1].size));
         }
     }
-    // Filesystem queries run without the lock.
-    let Some(host) = crate::hle::kernel::fs::host_path_existing(guest) else {
+    // Filesystem queries run without the lock (cached listings for the
+    // read-only game tree).
+    let Some((host, md)) = crate::hle::kernel::fs::guest_meta(guest) else {
         return Err(ENOENT);
     };
-    let md = std::fs::metadata(&host).map_err(|_| ENOENT)?;
-    if md.is_dir() {
+    if md.is_dir {
         return Err(EISDIR);
     }
     let mut g = FILES.lock();
@@ -225,10 +225,10 @@ fn resolve_path(guest: &str) -> Result<(u32, u64), i32> {
     if let Some(&id) = t.by_path.get(guest) {
         return Ok((id, t.files[id as usize - 1].size));
     }
-    t.files.push(Arc::new(AprFile { path: guest.to_string(), host, size: md.len(), handle: Mutex::new(None) }));
+    t.files.push(Arc::new(AprFile { path: guest.to_string(), host, size: md.size, handle: Mutex::new(None) }));
     let id = t.files.len() as u32;
     t.by_path.insert(guest.to_string(), id);
-    Ok((id, md.len()))
+    Ok((id, md.size))
 }
 
 fn file(id: u32) -> Option<Arc<AprFile>> {
@@ -400,6 +400,12 @@ fn read_into(file_id: u32, dest: u64, size: u64, offset: u64) -> Result<(), i32>
         return Err(EINVAL);
     }
     let h = open_handle(&f)?;
+    if f.path.contains("/sound/") {
+        static LOGGED: AtomicU32 = AtomicU32::new(0);
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < 24 {
+            crate::info!("apr: read {} [{offset:#x}+{size:#x}] -> {dest:#x}", f.path);
+        }
+    }
     let buf = unsafe { std::slice::from_raw_parts_mut(dest as *mut u8, size as usize) };
     let mut done = 0usize;
     while done < buf.len() {
@@ -632,6 +638,9 @@ fn read_rec(file: u32, dest: u64, size: u64, offset: u64) -> Vec<u8> {
 }
 
 fn noop_len(cb: u64, opc: u8, len: u64) -> i32 {
+    if len > 1 << 20 {
+        return sce(EINVAL);
+    }
     let len = (len + 3) & !3;
     let mut rec = vec![0u8; len as usize];
     rec[..4].copy_from_slice(&((opc as u32) | (((len / 4) as u32) << 8)).to_le_bytes());

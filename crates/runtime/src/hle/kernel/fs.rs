@@ -84,7 +84,78 @@ pub fn resolve(guest: &str) -> Option<Resolved> {
 
 /// Host path for reading (first existing layer).
 pub fn host_path_existing(guest: &str) -> Option<PathBuf> {
-    resolve(guest)?.candidates.into_iter().find(|p| p.exists())
+    let r = resolve(guest)?;
+    if !r.writable {
+        return r.candidates.into_iter().find(|p| ro_meta(p).is_some());
+    }
+    r.candidates.into_iter().find(|p| p.exists())
+}
+
+/// Metadata of a path on a read-only mount.
+#[derive(Clone, Copy, Debug)]
+pub struct CachedMeta {
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime: [i64; 2],
+}
+
+/// Directory listings of read-only mounts (the protected game tree does not
+/// change during a run): each directory is enumerated once, and existence,
+/// size and stat queries become lookups. On Windows the listing carries
+/// sizes and times, so no file is opened. Names are case-insensitive, as on
+/// the host file system.
+static RO_DIRS: Mutex<Option<std::collections::HashMap<PathBuf, Arc<std::collections::HashMap<String, CachedMeta>>>>> = Mutex::new(None);
+
+fn ro_dir(dir: &Path) -> Option<Arc<std::collections::HashMap<String, CachedMeta>>> {
+    if let Some(d) = RO_DIRS.lock().as_ref().and_then(|m| m.get(dir).cloned()) {
+        return Some(d);
+    }
+    let mut listing = std::collections::HashMap::new();
+    match std::fs::read_dir(dir) {
+        Ok(rd) => {
+            for e in rd.flatten() {
+                let Ok(md) = e.metadata() else { continue };
+                let mtime = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| [d.as_secs() as i64, d.subsec_nanos() as i64])
+                    .unwrap_or([0, 0]);
+                listing.insert(e.file_name().to_string_lossy().to_lowercase(), CachedMeta { is_dir: md.is_dir(), size: md.len(), mtime });
+            }
+        }
+        Err(_) => {
+            // Missing directory: cache the empty listing too.
+        }
+    }
+    let d = Arc::new(listing);
+    RO_DIRS.lock().get_or_insert_with(Default::default).insert(dir.to_path_buf(), d.clone());
+    Some(d)
+}
+
+/// Cached metadata of a host path on a read-only mount (mount roots included).
+pub fn ro_meta(host: &Path) -> Option<CachedMeta> {
+    match (host.parent(), host.file_name()) {
+        (Some(parent), Some(name)) => ro_dir(parent)?.get(&name.to_string_lossy().to_lowercase()).copied(),
+        _ => std::fs::metadata(host).ok().map(|md| CachedMeta { is_dir: md.is_dir(), size: md.len(), mtime: [0, 0] }),
+    }
+}
+
+/// Host path and metadata of a guest path (first existing layer).
+pub fn guest_meta(guest: &str) -> Option<(PathBuf, CachedMeta)> {
+    let r = resolve(guest)?;
+    if !r.writable {
+        return r.candidates.into_iter().find_map(|p| ro_meta(&p).map(|m| (p, m)));
+    }
+    let p = r.candidates.into_iter().find(|p| p.exists())?;
+    let md = std::fs::metadata(&p).ok()?;
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| [d.as_secs() as i64, d.subsec_nanos() as i64])
+        .unwrap_or([0, 0]);
+    Some((p, CachedMeta { is_dir: md.is_dir(), size: md.len(), mtime }))
 }
 
 // ---------------------------------------------------------------------------
@@ -367,17 +438,31 @@ pub fn fill_stat(md: &std::fs::Metadata) -> Stat {
     st
 }
 
+fn stat_from_meta(m: &CachedMeta) -> Stat {
+    let mut st = Stat { atime: m.mtime, mtime: m.mtime, ctime: m.mtime, birthtime: m.mtime, blksize: 0x10000, ..Default::default() };
+    if m.is_dir {
+        st.mode = S_IFDIR | 0o777;
+        st.size = 0x10000;
+        st.nlink = 2;
+    } else {
+        st.mode = S_IFREG | 0o777;
+        st.size = m.size as i64;
+        st.nlink = 1;
+    }
+    st.blocks = (st.size + 511) / 512;
+    st
+}
+
 pub fn stat_path(path: &str, out: *mut Stat) -> i32 {
-    let Some(p) = host_path_existing(path) else {
-        crate::debug!("stat '{path}': not found");
-        return sce(ENOENT);
-    };
-    match std::fs::metadata(&p) {
-        Ok(md) => {
-            unsafe { std::ptr::write_unaligned(out, fill_stat(&md)) };
+    match guest_meta(path) {
+        Some((_, m)) => {
+            unsafe { std::ptr::write_unaligned(out, stat_from_meta(&m)) };
             0
         }
-        Err(e) => sce(io_errno(&e)),
+        None => {
+            crate::debug!("stat '{path}': not found");
+            sce(ENOENT)
+        }
     }
 }
 

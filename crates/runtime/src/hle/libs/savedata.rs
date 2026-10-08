@@ -411,6 +411,11 @@ struct Dialog {
 static DIALOG: Mutex<Dialog> =
     Mutex::new(Dialog { status: DLG_NONE, polled: false, holds: false, mode: 0, result: 0, button: 0, user_data: 0, dir_name: String::new() });
 
+/// Whether the save-data dialog is on screen (common dialog in use).
+pub fn dialog_running() -> bool {
+    DIALOG.lock().status == DLG_RUNNING
+}
+
 sysv! {
     fn sceSaveDataDialogInitialize() -> i32 {
         let mut d = DIALOG.lock();

@@ -167,6 +167,14 @@ sysv! {
         write_cstr(name, size as usize, "Hunter");
         0
     }
+    /// Game presets {u64 size, u32 fields...}: every field 0 = not set, so
+    /// the title keeps its own defaults (eboot+0x7c91e9 reads them that way).
+    fn sceUserServiceGetGamePresets(user: i32, presets: *mut u64) -> i32 {
+        if presets.is_null() { return 0x8096_0003u32 as i32; }
+        let size = (*presets).clamp(8, 0x100);
+        std::ptr::write_bytes((presets as *mut u8).add(8), 0, size as usize - 8);
+        0
+    }
     fn sceUserServiceGetEvent(ev: *mut i32) -> i32 {
         if !USER_EVENT_SENT.swap(true, Ordering::SeqCst) {
             *ev = 0; // LOGIN
@@ -308,7 +316,7 @@ pub fn register(r: &mut Registry) {
     reg!(r, "libSceAppContent", [sceAppContentInitialize, sceAppContentAppParamGetInt, sceAppContentGetAddcontInfoList]);
     reg!(r, "libSceUserService", [
         sceUserServiceInitialize, sceUserServiceTerminate, sceUserServiceGetInitialUser,
-        sceUserServiceGetLoginUserIdList, sceUserServiceGetUserName, sceUserServiceGetEvent,
+        sceUserServiceGetLoginUserIdList, sceUserServiceGetUserName, sceUserServiceGetEvent, sceUserServiceGetGamePresets,
     ]);
     reg!(r, "libSceSystemService", [
         sceSystemServiceGetStatus, sceSystemServiceReceiveEvent, sceSystemServiceParamGetInt,

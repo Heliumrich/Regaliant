@@ -66,6 +66,8 @@ pub struct GuestThread {
     pub host_tid: AtomicU64,
     /// Set while the thread is blocked inside an HLE wait (stall diagnostics).
     pub wait: Mutex<Option<WaitInfo>>,
+    /// Milliseconds since process start when the thread exited (0 = running).
+    pub exit_ms: AtomicU64,
 }
 
 /// What a guest thread is blocked on inside an HLE wait.
@@ -165,6 +167,7 @@ pub fn new_thread(name: &str, entry: u64, arg: u64, stack_size: u64, priority: i
         specific: Mutex::new(vec![0; PTHREAD_KEYS_MAX]),
         host_tid: AtomicU64::new(0),
         wait: Mutex::new(None),
+        exit_ms: AtomicU64::new(0),
     }));
     let tp = crate::tls::alloc_thread_area(t.handle());
     t.tp.store(tp, Ordering::SeqCst);
@@ -196,6 +199,7 @@ pub fn exit_current(value: u64) -> ! {
 }
 
 fn finish(t: &'static GuestThread, value: u64) {
+    t.exit_ms.store(crate::log::elapsed_ms() as u64, Ordering::SeqCst);
     *t.exited.lock() = Some(value);
     t.exit_cv.notify_all();
     crate::debug!("thread '{}' exited with {:#x}", t.name(), value);

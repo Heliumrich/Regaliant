@@ -67,6 +67,7 @@ const RESULT_INVALID_PARAMETER: i32 = 0x0000_0002;
 const RESULT_NOT_INITIALIZED: i32 = 0x0000_0008;
 const RESULT_PARTIAL_INPUT: i32 = 0x0000_0020;
 const RESULT_CODEC_ERROR: i32 = 0x4000_0000;
+const RESULT_INVALID_DATA: i32 = 0x0000_0004;
 
 const CODEC_MP3: u32 = 0;
 const CODEC_AT9: u32 = 1;
@@ -100,6 +101,13 @@ const FLAG_SIDEBAND_STREAM: u64 = 1 << 47;
 
 const CONTROL_SIZE: u64 = 48;
 const RUN_SIZE: u64 = 64;
+/// Most buffers per side of a split run job.
+const MAX_SPLIT: u64 = 16;
+
+/// Run record: 64-byte header + inline {address, size} descriptors.
+fn run_size(inputs: u64, outputs: u64) -> u64 {
+    RUN_SIZE + 16 * (inputs + outputs)
+}
 const TAG_CONTROL: u32 = 0x434D_4A41; // "AJMC"
 const TAG_RUN: u32 = 0x524D_4A41; // "AJMR"
 const OP_INIT: u32 = 1;
@@ -117,6 +125,10 @@ unsafe impl Send for Decoder {}
 
 struct Instance {
     codec: u32,
+    /// ATRAC9 instance flag (bit 32): inputs may start with the .at9 RIFF
+    /// header, which the decoder parses and consumes (fact per public sources; the
+    /// title's sound engine feeds embedded .at9 files this way).
+    parse_riff: bool,
     /// Output encoding: 0 s16, 1 s32, 2 f32.
     encoding: u32,
     max_channels: u32,
@@ -210,6 +222,63 @@ unsafe fn store_pcm(out: &mut Vec<u8>, encoding: u32, samples: impl Iterator<Ite
     }
 }
 
+/// (Re)initializes an ATRAC9 decoder from 4 config bytes.
+unsafe fn init_at9(inst: &mut Instance, cfg: [u8; 4]) -> bool {
+    let mut cfg = cfg;
+    let h = match inst.decoder {
+        Decoder::At9 { handle, .. } => handle,
+        _ => unsafe { Atrac9GetHandle() },
+    };
+    if unsafe { Atrac9InitDecoder(h, cfg.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let mut info = At9Info::default();
+    unsafe { Atrac9GetCodecInfo(h, &mut info) };
+    inst.decoder = Decoder::At9 { handle: h, info };
+    inst.total_decoded = 0;
+    inst.skipped = 0;
+    true
+}
+
+/// .at9 RIFF header: 'fmt ' (WAVE_FORMAT_EXTENSIBLE with the ATRAC9 GUID,
+/// config data at +44), optional 'fact' (total samples, skip samples), then
+/// 'data'. Returns the payload offset of 'data', or a result code.
+unsafe fn parse_at9_riff(inst: &mut Instance, input: &[u8]) -> Result<usize, i32> {
+    const AT9_GUID: [u8; 16] = [0xd2, 0x42, 0xe1, 0x47, 0xba, 0x36, 0x8d, 0x4d, 0x88, 0xfc, 0x61, 0x65, 0x4f, 0x8c, 0x83, 0x6c];
+    let le32 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+    if input.len() < 12 || &input[8..12] != b"WAVE" {
+        return Err(RESULT_INVALID_DATA);
+    }
+    let mut off = 12usize;
+    while off + 8 <= input.len() {
+        let id = &input[off..off + 4];
+        let size = le32(&input[off + 4..]);
+        let payload = off + 8;
+        if id == b"data" {
+            return Ok(payload);
+        }
+        if payload + size > input.len() {
+            return Err(RESULT_PARTIAL_INPUT);
+        }
+        let body = &input[payload..payload + size];
+        if id == b"fmt " {
+            if size < 48 || u16::from_le_bytes([body[0], body[1]]) != 0xFFFE || body[24..40] != AT9_GUID {
+                return Err(RESULT_INVALID_DATA);
+            }
+            let cfg = [body[44], body[45], body[46], body[47]];
+            if !unsafe { init_at9(inst, cfg) } {
+                return Err(RESULT_INVALID_DATA);
+            }
+        } else if id == b"fact" && size >= 12 {
+            inst.gapless_total = le32(body) as u32;
+            inst.gapless_skip = le32(&body[4..]) as u32;
+            inst.skipped = 0;
+        }
+        off = payload + size + (size & 1);
+    }
+    Err(RESULT_PARTIAL_INPUT)
+}
+
 struct Outcome {
     result: i32,
     consumed: usize,
@@ -221,6 +290,15 @@ struct Outcome {
 unsafe fn decode(inst: &mut Instance, input: &[u8], out_cap: usize, multiple: bool, out: &mut Vec<u8>) -> Outcome {
     let mut o = Outcome { result: 0, consumed: 0, produced: 0, frames: 0 };
     let bps = bytes_per_sample(inst.encoding);
+    if inst.parse_riff && input.len() >= 4 && &input[..4] == b"RIFF" {
+        match unsafe { parse_at9_riff(inst, input) } {
+            Ok(data) => o.consumed = data,
+            Err(r) => {
+                o.result |= r;
+                return o;
+            }
+        }
+    }
     loop {
         let mut pcm_f: Vec<f32> = Vec::new();
         let mut channels = 0usize;
@@ -248,7 +326,15 @@ unsafe fn decode(inst: &mut Instance, input: &[u8], out_cap: usize, multiple: bo
                     let r = unsafe { Atrac9Decode(*handle, input.as_ptr().add(o.consumed + pos), pcm.as_mut_ptr(), &mut u) };
                     if r != 0 {
                         o.result |= RESULT_CODEC_ERROR;
-                        crate::debug!("ajm: ATRAC9 decode error {r}");
+                        static REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if REPORTED.fetch_add(1, Ordering::Relaxed) < 4 {
+                            let at = o.consumed + pos;
+                            let head: Vec<String> = input[at..(at + 16).min(input.len())].iter().map(|b| format!("{b:02x}")).collect();
+                            crate::warn!(
+                                "ajm: ATRAC9 decode error {:#x} at input {at}/{} (superframe {sf} bytes, {n} frame(s) x {fs} samples, {channels} ch); input {}",
+                                r as u32, input.len(), head.join("")
+                            );
+                        }
                         return o;
                     }
                     pos += u.max(0) as usize;
@@ -316,13 +402,53 @@ unsafe fn decode(inst: &mut Instance, input: &[u8], out_cap: usize, multiple: bo
     o
 }
 
+struct Stats {
+    jobs: std::sync::atomic::AtomicU64,
+    frames: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+    failed: std::sync::atomic::AtomicU64,
+    last_error: std::sync::atomic::AtomicU64,
+}
+
+static STATS: Stats = Stats {
+    jobs: std::sync::atomic::AtomicU64::new(0),
+    frames: std::sync::atomic::AtomicU64::new(0),
+    bytes: std::sync::atomic::AtomicU64::new(0),
+    failed: std::sync::atomic::AtomicU64::new(0),
+    last_error: std::sync::atomic::AtomicU64::new(0),
+};
+
+/// Decode statistics for status reports.
+pub fn status() -> String {
+    format!(
+        "    ajm: {} run job(s), {} frame(s) decoded, {} PCM bytes, {} with errors (last result {:#x})
+",
+        STATS.jobs.load(Ordering::Relaxed),
+        STATS.frames.load(Ordering::Relaxed),
+        STATS.bytes.load(Ordering::Relaxed),
+        STATS.failed.load(Ordering::Relaxed),
+        STATS.last_error.load(Ordering::Relaxed)
+    )
+}
+
 unsafe fn run_job(p: u64) -> i32 {
     unsafe {
         let instance = *((p + 4) as *const u32);
         let flags = *((p + 8) as *const u64);
         let q = (p + 16) as *const u64;
         let (ins, nin, outs, nout, sb, sbsize) = (*q, *q.add(1), *q.add(2), *q.add(3), *q.add(4), *q.add(5));
-        // Gather input and output buffers ({address, size} arrays).
+        // Gather input and output buffers ({address, size} arrays). Sizes are
+        // bounded: a job whose descriptors do not parse is rejected and logged.
+        const MAX_BUF: u64 = 64 << 20;
+        let sane = |base: u64, n: u64| -> bool {
+            n <= 64 && (n == 0 || base != 0) && (0..n).all(|i| *((base + 16 * i + 8) as *const u64) <= MAX_BUF)
+        };
+        if !sane(ins, nin) || !sane(outs, nout) {
+            crate::hle::stub_log("ajm: run job with implausible buffer descriptors rejected (see warning)", RESULT_INVALID_PARAMETER as i64);
+            crate::warn!("ajm: rejected run job at {p:#x}: instance {instance} flags {flags:#x} inputs {ins:#x} x{nin} outputs {outs:#x} x{nout}");
+            write_result(sb, sbsize, RESULT_INVALID_PARAMETER);
+            return 0;
+        }
         let mut input = Vec::new();
         for i in 0..nin {
             let a = *((ins + 16 * i) as *const u64);
@@ -359,6 +485,13 @@ unsafe fn run_job(p: u64) -> i32 {
             off += k;
         }
         // Sideband: result, [resample], [gapless], [format], [stream], [mframe].
+        STATS.jobs.fetch_add(1, Ordering::Relaxed);
+        STATS.frames.fetch_add(outcome.frames as u64, Ordering::Relaxed);
+        STATS.bytes.fetch_add(outcome.produced as u64, Ordering::Relaxed);
+        if outcome.result != 0 {
+            STATS.failed.fetch_add(1, Ordering::Relaxed);
+            STATS.last_error.store(outcome.result as u32 as u64, Ordering::Relaxed);
+        }
         write_result(sb, sbsize, outcome.result);
         let mut at = 8u64;
         let room = |at: u64, n: u64| sb != 0 && at + n <= sbsize;
@@ -414,19 +547,7 @@ unsafe fn control_job(p: u64) {
                         }
                         let mut cfg = [0u8; 4];
                         std::ptr::copy_nonoverlapping(a as *const u8, cfg.as_mut_ptr(), 4);
-                        let h = match inst.decoder {
-                            Decoder::At9 { handle, .. } => handle,
-                            _ => Atrac9GetHandle(),
-                        };
-                        if Atrac9InitDecoder(h, cfg.as_mut_ptr()) != 0 {
-                            return RESULT_INVALID_PARAMETER;
-                        }
-                        let mut info = At9Info::default();
-                        Atrac9GetCodecInfo(h, &mut info);
-                        inst.decoder = Decoder::At9 { handle: h, info };
-                        inst.total_decoded = 0;
-                        inst.skipped = 0;
-                        0
+                        if init_at9(inst, cfg) { 0 } else { RESULT_INVALID_PARAMETER }
                     }
                     CODEC_MP3 => {
                         if matches!(inst.decoder, Decoder::None) {
@@ -504,6 +625,7 @@ sysv! {
         let id = NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed);
         let inst = Instance {
             codec,
+            parse_riff: codec == CODEC_AT9 && flags & (1 << 32) != 0,
             encoding: ((flags >> 7) & 7) as u32,
             max_channels: (flags & 0x7F) as u32,
             decoder: Decoder::None,
@@ -541,15 +663,25 @@ sysv! {
     fn sceAjmBatchJobGetStatistics(info: *mut u64, interval: f32, result: u64) -> i32 {
         control(info, OP_STATISTICS, 0, 0, 0, result, 0)
     }
+    /// The {address, size} descriptor arrays are copied into the batch (titles
+    /// build them on the stack and start the batch later); the buffers they
+    /// describe and the sideband are used when the batch runs.
     fn sceAjmBatchJobRunSplit(info: *mut u64, instance: u32, flags: u64, inputs: u64, num_inputs: u64, outputs: u64, num_outputs: u64, sideband: u64, sideband_size: u64) -> i32 {
-        let Some(p) = reserve(info, RUN_SIZE) else { return ERR_JOB_CREATION };
+        if num_inputs > MAX_SPLIT || num_outputs > MAX_SPLIT || (num_inputs != 0 && inputs == 0) || (num_outputs != 0 && outputs == 0) {
+            return ERR_INVALID_PARAMETER;
+        }
+        let Some(p) = reserve(info, run_size(num_inputs, num_outputs)) else { return ERR_JOB_CREATION };
         *(p as *mut u32) = TAG_RUN;
         *((p + 4) as *mut u32) = instance;
         *((p + 8) as *mut u64) = flags;
+        let inline_in = p + RUN_SIZE;
+        let inline_out = inline_in + 16 * num_inputs;
+        std::ptr::copy_nonoverlapping(inputs as *const u8, inline_in as *mut u8, 16 * num_inputs as usize);
+        std::ptr::copy_nonoverlapping(outputs as *const u8, inline_out as *mut u8, 16 * num_outputs as usize);
         let q = (p + 16) as *mut u64;
-        *q = inputs;
+        *q = inline_in;
         *q.add(1) = num_inputs;
-        *q.add(2) = outputs;
+        *q.add(2) = inline_out;
         *q.add(3) = num_outputs;
         *q.add(4) = sideband;
         *q.add(5) = sideband_size;
@@ -565,7 +697,11 @@ sysv! {
             let p = buf + off;
             match *(p as *const u32) {
                 TAG_CONTROL => { control_job(p); off += CONTROL_SIZE; }
-                TAG_RUN => { run_job(p); off += RUN_SIZE; }
+                TAG_RUN => {
+                    run_job(p);
+                    let q = (p + 16) as *const u64;
+                    off += run_size((*q.add(1)).min(MAX_SPLIT), (*q.add(3)).min(MAX_SPLIT));
+                }
                 other => {
                     crate::error!("ajm: unknown job tag {other:#x} at batch offset {off:#x}");
                     return ERR_INVALID_PARAMETER;

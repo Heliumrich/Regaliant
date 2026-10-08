@@ -174,7 +174,7 @@ unsafe fn frames_line(ctx: &CONTEXT) -> String {
 /// Name of a host code address: dbghelp symbol (our PDB, or a DLL's
 /// exports) + offset. The symbol search path is our executable's directory
 /// only, so no symbol server is ever contacted.
-fn host_symbol(addr: u64) -> String {
+pub fn host_symbol(addr: u64) -> String {
     use windows_sys::Win32::System::Diagnostics::Debug::{SYMBOL_INFOW, SYMOPT_DEFERRED_LOADS, SYMOPT_UNDNAME, SymFromAddrW, SymInitializeW, SymSetOptions};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     static SYM: parking_lot::Mutex<Option<bool>> = parking_lot::Mutex::new(None);

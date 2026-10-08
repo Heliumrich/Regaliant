@@ -20,6 +20,52 @@ struct Port {
     format: u32,
     next: Instant,
     volume: [i32; 8],
+    /// Host mixer stream (`crate::audio`).
+    stream: usize,
+}
+
+/// Port types routed to the speakers (main, BGM, voice); the pad speaker and
+/// personal (headphone) ports are not routed yet.
+fn routed(kind: i32) -> bool {
+    matches!(kind, 0 | 1 | 2)
+}
+
+/// Converts one output buffer to stereo f32 at 48 kHz: S16 or float, mono,
+/// stereo or 8 channels (L R C LFE + surround pairs, downmixed at -3 dB),
+/// scaled by the port volume (32768 = 0 dB).
+unsafe fn to_stereo(p: &Port, ptr: *const u8) -> Vec<f32> {
+    let frames = p.len as usize;
+    let ch = port_channels(p.format) as usize;
+    let float = matches!(p.format & 0xFF, 3 | 4 | 5 | 7);
+    let sample = |i: usize| -> f32 {
+        if float {
+            unsafe { *(ptr as *const f32).add(i) }
+        } else {
+            (unsafe { *(ptr as *const i16).add(i) }) as f32 / 32768.0
+        }
+    };
+    let vol = |c: usize| p.volume[c.min(7)] as f32 / 32768.0;
+    let mut out = Vec::with_capacity(2 * frames);
+    const K: f32 = 0.7071;
+    for f in 0..frames {
+        let b = f * ch;
+        let (l, r) = match ch {
+            1 => {
+                let m = sample(b) * vol(0);
+                (m, m)
+            }
+            2 => (sample(b) * vol(0), sample(b + 1) * vol(1)),
+            _ => {
+                let c = sample(b + 2) * vol(2) * K;
+                let l = sample(b) * vol(0) + c + K * (sample(b + 4) * vol(4) + sample(b + 6) * vol(6));
+                let r = sample(b + 1) * vol(1) + c + K * (sample(b + 5) * vol(5) + sample(b + 7) * vol(7));
+                (l, r)
+            }
+        };
+        out.push(l);
+        out.push(r);
+    }
+    out
 }
 
 static PORTS: Mutex<Vec<Option<Port>>> = Mutex::new(Vec::new());
@@ -83,7 +129,7 @@ sysv! {
     fn sceAudioOutOpen(user: i32, kind: i32, index: i32, len: u32, freq: u32, param: u32) -> i32 {
         if len == 0 || len % 256 != 0 || freq != 48000 { return 0x8026_0008u32 as i32; }
         let mut ports = PORTS.lock();
-        let p = Port { kind, len, freq, format: param, next: Instant::now(), volume: [32768; 8] };
+        let p = Port { kind, len, freq, format: param, next: Instant::now(), volume: [32768; 8], stream: crate::audio::new_stream() };
         let idx = match ports.iter().position(|p| p.is_none()) { Some(i) => { ports[i] = Some(p); i } None => { ports.push(Some(p)); ports.len() - 1 } };
         crate::info!("sceAudioOutOpen type {kind} len {len} freq {freq} format {:#x} ({} ch) -> port {}", param, port_channels(param), idx + 1);
         idx as i32 + 1
@@ -92,16 +138,24 @@ sysv! {
         let mut ports = PORTS.lock();
         match ports.get_mut((h - 1) as usize) { Some(p @ Some(_)) => { *p = None; 0 } _ => 0x8026_0004u32 as i32 }
     }
+    /// Routed ports feed the host mixer (blocking while 3 buffers are queued,
+    /// which paces the caller by the output clock); others are paced sinks.
     fn sceAudioOutOutput(h: i32, ptr: *const u8) -> i32 {
-        let wait = {
+        let (port, wait) = {
             let mut ports = PORTS.lock();
             let Some(Some(p)) = ports.get_mut((h - 1) as usize) else { return 0x8026_0004u32 as i32 };
             let dur = Duration::from_secs_f64(p.len as f64 / p.freq as f64);
             let now = Instant::now();
             let start = if p.next > now { p.next } else { now };
             p.next = start + dur;
-            start.saturating_duration_since(now)
+            (p.clone(), start.saturating_duration_since(now))
         };
+        if routed(port.kind) {
+            if !ptr.is_null() {
+                crate::audio::push_stream(port.stream, to_stereo(&port, ptr), 3);
+            }
+            return 0;
+        }
         if !wait.is_zero() { std::thread::sleep(wait); }
         0
     }

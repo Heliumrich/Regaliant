@@ -17,6 +17,10 @@ struct Stream {
     grains: VecDeque<Vec<f32>>,
     /// Frames already consumed from the front grain.
     offset: usize,
+    /// Frames pushed so far (diagnostics).
+    pushed: u64,
+    /// Peak absolute sample value pushed (diagnostics: 0 = silence).
+    peak: f32,
 }
 
 struct Mixer {
@@ -66,7 +70,29 @@ pub fn push_stream(id: usize, grain: Vec<f32>, depth: usize) {
     while s[id].grains.len() >= depth.max(1) {
         m.cv.wait(&mut s);
     }
+    s[id].pushed += (grain.len() / 2) as u64;
+    let peak = grain.iter().fold(0f32, |m, v| m.max(v.abs()));
+    if peak > s[id].peak {
+        s[id].peak = peak;
+    }
     s[id].grains.push_back(grain);
+}
+
+/// One line per stream for status reports.
+pub fn status() -> String {
+    let Some(m) = MIXER.get() else { return String::new() };
+    let Some(s) = m.streams.try_lock() else { return String::new() };
+    let mut out = format!(
+        "    audio: {:.1} s played, {:.2} s underrun
+",
+        PLAYED_FRAMES.load(Ordering::Relaxed) as f64 / RATE as f64,
+        UNDERRUN_FRAMES.load(Ordering::Relaxed) as f64 / RATE as f64
+    );
+    for (i, st) in s.iter().enumerate() {
+        out.push_str(&format!("    audio stream {i}: {:.1} s pushed, {} grain(s) queued, peak {:.3}
+", st.pushed as f64 / RATE as f64, st.grains.len(), st.peak));
+    }
+    out
 }
 
 pub fn push_grain(grain: Vec<f32>, depth: usize) {

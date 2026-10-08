@@ -53,6 +53,36 @@ fn is_object(port_type: u16) -> bool {
     port_type & 0xFF00 == 0x0100
 }
 
+/// Logs each attribute id the title uses once (diagnostics).
+fn note_attr(id: u32, value: u64, size: u64) {
+    static SEEN: Mutex<Option<std::collections::HashSet<u32>>> = Mutex::new(None);
+    if SEEN.lock().get_or_insert_with(Default::default).insert(id) {
+        let first = if value != 0 && size >= 8 { format!(" first qword {:#x}", unsafe { *(value as *const u64) }) } else { String::new() };
+        crate::info!("AudioOut2 port attribute id {id:#x} (value {value:#x}, size {size}){first}");
+    }
+}
+
+/// One-time per-port snapshot (diagnostics).
+fn dump_ports(ctx: u32, n: usize) {
+    let ports = PORTS.lock();
+    let mut s = format!("AudioOut2 context {ctx} ports after 2000 pushes:");
+    for (h, p) in ports.as_ref().into_iter().flat_map(|m| m.iter()) {
+        let ch = channels(p.format);
+        let peak = if p.latched != 0 {
+            let float = p.format & 0x7F == 0;
+            (0..n * ch).fold(0f32, |m, i| {
+                let v = if float { unsafe { *(p.latched as *const f32).add(i) } } else { (unsafe { *(p.latched as *const i16).add(i) }) as f32 / 32768.0 };
+                m.max(v.abs())
+            })
+        } else {
+            0.0
+        };
+        s.push_str(&format!("
+    port {h} ctx {} type {:#x} format {:#x} pcm {:#x} latched {:#x} peak {peak:.3} gains {:?}", p.ctx, p.port_type, p.format, p.pcm, p.latched, &p.gains[..ch.min(4)]));
+    }
+    crate::info!("{s}");
+}
+
 /// Mixes one grain of a port into a stereo accumulator.
 unsafe fn mix_port(p: &Port, n: usize, out: &mut [f32]) {
     if p.latched == 0 {
@@ -149,6 +179,10 @@ sysv! {
             return ERR_NOT_READY;
         }
         let mut mix = vec![0f32; 2 * n];
+        static PUSHES: AtomicU32 = AtomicU32::new(0);
+        if PUSHES.fetch_add(1, Ordering::Relaxed) == 2000 {
+            dump_ports(ctx, n);
+        }
         {
             let ports = PORTS.lock();
             for p in ports.as_ref().into_iter().flat_map(|m| m.values()).filter(|p| p.ctx == ctx) {
@@ -207,6 +241,7 @@ sysv! {
             let id = *(a as *const u32);
             let value = *(a.add(8) as *const u64);
             let size = *(a.add(16) as *const u64);
+            note_attr(id, value, size);
             match id {
                 ATTR_PCM => p.pcm = if value == 0 { 0 } else { *(value as *const u64) },
                 ATTR_GAIN if value != 0 => {

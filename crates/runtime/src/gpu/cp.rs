@@ -60,6 +60,9 @@ pub struct Cp {
     dispatch_indirect_base: u64,
     markers: Vec<String>,
     ctx_stack: Vec<Vec<u32>>,
+    /// Address of the packet being executed / address being polled.
+    cur_packet: u64,
+    waiting_on: u64,
     unknown_seen: HashSet<u32>,
     notes_seen: HashSet<&'static str>,
     depth: u32,
@@ -107,6 +110,23 @@ fn compare(func: u32, value: u64, reference: u64) -> bool {
     }
 }
 
+/// Last GPU write to each label-sized address: (queue, value, packet address)
+/// for wait diagnostics.
+static LAST_WRITE: parking_lot::Mutex<Option<std::collections::HashMap<u64, (String, u64, u64)>>> = parking_lot::Mutex::new(None);
+
+fn note_write(queue: &str, addr: u64, value: u64, at: u64) {
+    let mut g = LAST_WRITE.lock();
+    let m = g.get_or_insert_with(Default::default);
+    if m.len() > 1 << 16 {
+        m.clear();
+    }
+    m.insert(addr & !7, (queue.to_string(), value, at));
+}
+
+fn last_write(addr: u64) -> Option<(String, u64, u64)> {
+    LAST_WRITE.lock().as_ref()?.get(&(addr & !7)).cloned()
+}
+
 /// What the queue thread is doing (diagnostics).
 pub static STATE: parking_lot::Mutex<Vec<(String, String)>> = parking_lot::Mutex::new(Vec::new());
 
@@ -131,6 +151,8 @@ impl Cp {
             dispatch_indirect_base: 0,
             markers: Vec::new(),
             ctx_stack: Vec::new(),
+            cur_packet: 0,
+            waiting_on: 0,
             unknown_seen: HashSet::new(),
             notes_seen: HashSet::new(),
             depth: 0,
@@ -219,6 +241,7 @@ impl Cp {
                 break;
             }
             PACKETS.fetch_add(1, Ordering::Relaxed);
+            self.cur_packet = cur;
             let p = |i: u64| unsafe { rd32(cur + 4 * (1 + i)) };
             match self.packet(opcode, h, cur, n, &p) {
                 Flow::Next => cur = next,
@@ -351,6 +374,9 @@ impl Cp {
                     let d = if no_incr { a } else { a + 4 * i };
                     unsafe { wr32(d, p(3 + i)) };
                 }
+                if count <= 4 {
+                    note_write(&self.name, a, p(3) as u64 | ((if count > 1 { p(4) } else { 0 }) as u64) << 32, self.cur_packet);
+                }
             }
             0 => {
                 for i in 0..count {
@@ -408,6 +434,7 @@ impl Cp {
                     return;
                 }
                 if wide { unsafe { wr64(dst_a, value) } } else { unsafe { wr32(dst_a, value as u32) } }
+                note_write(&self.name, dst_a, value, self.cur_packet);
             }
             0 => self.write_reg_addr(dst_a as u32, value as u32),
             _ => self.note("COPY_DATA to GDS/other ignored"),
@@ -441,6 +468,7 @@ impl Cp {
             2 => {
                 // Fill with the immediate dword.
                 let v = src as u32;
+                note_write(&self.name, dst, v as u64, self.cur_packet);
                 if daic {
                     unsafe { wr32(dst, v) };
                 } else {
@@ -493,6 +521,7 @@ impl Cp {
                         2 => unsafe { wr64(a, data) },
                         _ => unsafe { wr64(a, gpu_clock()) },
                     }
+                    note_write(&self.name, a, data, self.cur_packet);
                 }
             }
             _ => self.note("RELEASE_MEM with GDS data ignored"),
@@ -523,6 +552,7 @@ impl Cp {
             return Flow::Next;
         }
         let what = format!("WAIT_REG_MEM at {at:#x}: [{a:#x}] & {mask:#x} func {func} ref {reference:#x}");
+        self.waiting_on = a;
         match self.poll_until(at, &what, || compare(func, read() & mask, reference & mask)) {
             Flow::Stop => Flow::Stop,
             _ => Flow::Next,
@@ -550,10 +580,21 @@ impl Cp {
             if !reported && start.elapsed() > Duration::from_secs(3) {
                 reported = true;
                 let marker = self.markers.last().cloned().unwrap_or_default();
-                crate::warn!("gpu[{}]: waiting > 3 s: {what}{}", self.name, if marker.is_empty() { String::new() } else { format!(" (marker '{marker}')") });
+                let a = self.waiting_on;
+                let detail = if a != 0 {
+                    let cur = unsafe { rd64(a) };
+                    match last_write(a) {
+                        Some((q, v, pk)) => format!("; value now {cur:#x}, last GPU write {v:#x} by {q} (packet {pk:#x})"),
+                        None => format!("; value now {cur:#x}, never written by the GPU"),
+                    }
+                } else {
+                    String::new()
+                };
+                crate::warn!("gpu[{}]: waiting > 3 s: {what}{}{detail}", self.name, if marker.is_empty() { String::new() } else { format!(" (marker '{marker}')") });
             }
         }
         set_state(&self.name, "running".into());
+        self.waiting_on = 0;
         let _ = at;
         Flow::Next
     }

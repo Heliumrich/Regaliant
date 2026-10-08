@@ -157,12 +157,6 @@ sysv! {
         }
         0
     }
-    fn sceSaveDataDialogOpen(param: *const u8) -> i32 {
-        if !param.is_null() {
-            crate::info!("SaveDataDialog open (mode {}, type {})", *(param.add(0x30) as *const i32), *(param.add(0x34) as *const i32));
-        }
-        0
-    }
     fn sceNpProfileDialogGetResult(result: *mut u8) -> i32 {
         if !result.is_null() { std::ptr::write_bytes(result, 0, 4); }
         0
@@ -319,9 +313,6 @@ fixed! {
     sceMsgDialogInitialize => 0,
     sceMsgDialogUpdateStatus => DIALOG_FINISHED,
     sceMsgDialogTerminate => 0,
-    sceSaveDataDialogInitialize => 0,
-    sceSaveDataDialogUpdateStatus => DIALOG_FINISHED,
-    sceSaveDataDialogTerminate => 0,
     sceNpProfileDialogInitialize => 0,
     sceNpProfileDialogOpen => 0,
     sceNpProfileDialogUpdateStatus => DIALOG_FINISHED,
@@ -400,7 +391,6 @@ pub fn register(r: &mut Registry) {
     reg!(r, "libSceSsl", [sceSslInit, sceSslTerm]);
     reg!(r, "libSceCommonDialog", [sceCommonDialogInitialize]);
     reg!(r, "libSceMsgDialog", [sceMsgDialogInitialize, sceMsgDialogOpen, sceMsgDialogUpdateStatus, sceMsgDialogTerminate]);
-    reg!(r, "libSceSaveDataDialog", [sceSaveDataDialogInitialize, sceSaveDataDialogOpen, sceSaveDataDialogUpdateStatus, sceSaveDataDialogTerminate]);
     reg!(r, "libSceNpProfileDialog", [
         sceNpProfileDialogInitialize, sceNpProfileDialogOpen, sceNpProfileDialogUpdateStatus,
         sceNpProfileDialogGetResult, sceNpProfileDialogTerminate,
