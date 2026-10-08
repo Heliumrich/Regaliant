@@ -341,7 +341,7 @@ pub struct Stat {
 const S_IFDIR: u16 = 0o040000;
 const S_IFREG: u16 = 0o100000;
 
-fn fill_stat(md: &std::fs::Metadata) -> Stat {
+pub fn fill_stat(md: &std::fs::Metadata) -> Stat {
     let mut st = Stat::default();
     let t = md
         .modified()

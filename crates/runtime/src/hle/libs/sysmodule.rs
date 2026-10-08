@@ -21,8 +21,13 @@ sysv! {
     fn sceSysmoduleIsLoaded(id: u32) -> i32 {
         if LOADED.lock().contains(&id) { 0 } else { 0x8012_0002u32 as i32 }
     }
+    /// Unwind info for system modules: none are loaded as code (all HLE), so only
+    /// addresses inside guest modules can be described; same record as libkernel's.
+    fn sceSysmoduleGetModuleInfoForUnwind(addr: u64, flags: i32, info: *mut u8) -> i32 {
+        crate::hle::kernel::misc::module_info_for_unwind(addr, info)
+    }
 }
 
 pub fn register(r: &mut Registry) {
-    reg!(r, "libSceSysmodule", [sceSysmoduleLoadModule, sceSysmoduleUnloadModule, sceSysmoduleIsLoaded]);
+    reg!(r, "libSceSysmodule", [sceSysmoduleLoadModule, sceSysmoduleUnloadModule, sceSysmoduleIsLoaded, sceSysmoduleGetModuleInfoForUnwind]);
 }

@@ -102,6 +102,31 @@ fn fill_info_ex(m: &LoadedModule, out: *mut ModuleInfoEx) {
     unsafe { std::ptr::copy_nonoverlapping(&info as *const ModuleInfoEx as *const u8, out as *mut u8, n) };
 }
 
+/// SceKernelModuleInfoForUnwind: {size, name[256], eh_frame_hdr, eh_frame,
+/// eh_frame size, code start, code size}.
+pub fn module_info_for_unwind(addr: u64, info: *mut u8) -> i32 {
+    if info.is_null() {
+        return sce(EFAULT);
+    }
+    let Some(m) = loader::module_at(addr) else { return sce(ESRCH) };
+    unsafe {
+        let size = *(info as *const u64);
+        if size < 0x130 {
+            return sce(EINVAL);
+        }
+        write_cstr(info.add(8), 256, &m.name);
+        let p = info.add(8 + 256) as *mut u64;
+        let (hdr, _) = m.eh_frame_hdr.unwrap_or((0, 0));
+        let (ef, efs) = m.eh_frame.unwrap_or((0, 0));
+        *p = hdr;
+        *p.add(1) = ef;
+        *p.add(2) = efs;
+        *p.add(3) = m.code.0;
+        *p.add(4) = m.code.1 - m.code.0;
+    }
+    0
+}
+
 fn exit_process(code: i32) -> ! {
     crate::info!("guest requested process exit with status {code}");
     crate::shutdown(code);
@@ -140,20 +165,7 @@ sysv! {
         match loader::module_at(addr) { Some(m) => { fill_info_ex(&m, info); 0 } None => sce(ESRCH) }
     }
     fn sceKernelGetModuleInfoForUnwind(addr: u64, flags: i32, info: *mut u8) -> i32 {
-        if info.is_null() { return sce(EFAULT); }
-        let Some(m) = loader::module_at(addr) else { return sce(ESRCH) };
-        let size = *(info as *const u64);
-        if size < 0x130 { return sce(EINVAL); }
-        write_cstr(info.add(8), 256, &m.name);
-        let p = info.add(8 + 256) as *mut u64;
-        let (hdr, _) = m.eh_frame_hdr.unwrap_or((0, 0));
-        let (ef, efs) = m.eh_frame.unwrap_or((0, 0));
-        *p = hdr;
-        *p.add(1) = ef;
-        *p.add(2) = efs;
-        *p.add(3) = m.code.0;
-        *p.add(4) = m.code.1 - m.code.0;
-        0
+        module_info_for_unwind(addr, info)
     }
     fn sceKernelGetModuleInfo(handle: i32, info: *mut ModuleInfo) -> i32 {
         let mods = loader::MODULES.read();
@@ -193,6 +205,9 @@ sysv! {
     fn _is_signal_return(addr: u64) -> i32 { 0 }
     fn sceKernelIsNeoMode() -> i32 { 0 }
     fn sceKernelHasNeoMode() -> i32 { 0 }
+    /// PS5 Pro ("Trinity") mode: this port presents a base PS5, so the title
+    /// takes its base-console paths (and its non-`_trinity` shader variants).
+    fn sceKernelIsTrinityMode() -> i32 { 0 }
     fn sceKernelGetCompiledSdkVersion(ver: *mut u32) -> i32 {
         if ver.is_null() { return sce(EINVAL); }
         *ver = SDK_VERSION.load(Ordering::Relaxed) as u32;
@@ -281,7 +296,7 @@ pub fn register(r: &mut Registry) {
         __error, __tls_get_addr, __stack_chk_fail, sceKernelGetProcParam, _sceKernelRtldSetApplicationHeapAPI,
         sceKernelGetModuleInfoFromAddr, sceKernelGetModuleInfoForUnwind, sceKernelGetModuleInfo,
         sceKernelGetModuleList, __elf_phdr_match_addr, __pthread_cxa_finalize, _is_signal_return, sceKernelIsNeoMode,
-        sceKernelHasNeoMode, sceKernelGetCompiledSdkVersion, sceKernelGetCpumode, sceKernelDebugRaiseException,
+        sceKernelHasNeoMode, sceKernelIsTrinityMode, sceKernelGetCompiledSdkVersion, sceKernelGetCpumode, sceKernelDebugRaiseException,
         sceKernelDebugRaiseExceptionOnReleaseMode, _exit, getpid, getppid, signal, sigaction, sigfillset,
         sigemptyset, sigaddset, sigdelset, sigprocmask, _sigprocmask, getrusage, sysctl,
         sceKernelGetSanitizerMallocReplaceExternal, sceKernelGetSanitizerNewReplaceExternal,

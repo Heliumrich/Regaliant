@@ -62,39 +62,66 @@ fn sfo_int(key: &str) -> Option<u32> {
     }
 }
 
+/// Parses `/app0/sce_sys/param.json` (PS5) once.
+pub fn param_json() -> &'static serde_json::Value {
+    static J: OnceLock<serde_json::Value> = OnceLock::new();
+    J.get_or_init(|| {
+        let Some(p) = crate::hle::kernel::fs::host_path_existing("/app0/sce_sys/param.json") else {
+            crate::warn!("param.json not found");
+            return serde_json::Value::Null;
+        };
+        match std::fs::read(&p).map_err(|e| e.to_string()).and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string())) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::warn!("param.json unreadable: {e}");
+                serde_json::Value::Null
+            }
+        }
+    })
+}
+
+fn json_int(key: &str) -> Option<i64> {
+    param_json().get(key).and_then(|v| v.as_i64())
+}
+
 pub const USER_ID: i32 = 1;
 static USER_EVENT_SENT: AtomicBool = AtomicBool::new(false);
 static PLAYGO_CHUNKS: Mutex<Option<u32>> = Mutex::new(None);
 
+/// PS5 packages define chunks in `playgo-chunkdefs.xml` (Bluepoint packaging
+/// file at the application root). Every enabled chunk is installed in the
+/// supplied tree, so all report as local.
 fn playgo_chunk_count() -> u32 {
     let mut g = PLAYGO_CHUNKS.lock();
     if let Some(n) = *g {
         return n;
     }
-    // playgo-chunk.dat: "plgo" header; chunk count at 0x0A (u16).
-    let n = crate::hle::kernel::fs::host_path_existing("/app0/sce_sys/playgo-chunk.dat")
-        .and_then(|p| std::fs::read(p).ok())
-        .filter(|b| b.len() > 0x10 && &b[0..4] == b"plgo")
-        .map(|b| u16::from_le_bytes([b[0x0A], b[0x0B]]) as u32)
+    let n = crate::hle::kernel::fs::host_path_existing("/app0/playgo-chunkdefs.xml")
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|x| x.matches("<chunk id=").count() as u32)
         .filter(|&n| n > 0)
         .unwrap_or(1);
-    crate::info!("PlayGo: {n} chunk(s), all reported installed");
+    crate::info!("PlayGo: {n} chunk definition(s), all reported installed (local)");
     *g = Some(n);
     n
 }
+
+static PLAYGO_SPEED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1); // TRICKLE
 
 sysv! {
     // ---- AppContent
     fn sceAppContentInitialize(init: *const u8, boot: *mut u8) -> i32 {
         if !boot.is_null() { std::ptr::write_bytes(boot, 0, 40); }
-        param_sfo();
+        let j = param_json();
+        crate::info!("param.json: {} {} {}", j.get("titleId").and_then(|v| v.as_str()).unwrap_or("?"),
+            j.get("contentId").and_then(|v| v.as_str()).unwrap_or("?"), j.get("contentVersion").and_then(|v| v.as_str()).unwrap_or("?"));
         0
     }
     fn sceAppContentAppParamGetInt(id: i32, value: *mut i32) -> i32 {
         if value.is_null() { return 0x80D9_0002u32 as i32; }
         *value = match id {
             0 => 3, // SKU_FLAG_FULL
-            1..=4 => sfo_int(&format!("USER_DEFINED_PARAM_{id}")).unwrap_or(0) as i32,
+            1..=4 => json_int(&format!("userDefinedParam{id}")).unwrap_or(0) as i32,
             _ => return 0x80D9_0002u32 as i32,
         };
         crate::debug!("sceAppContentAppParamGetInt({id}) = {}", *value);
@@ -176,6 +203,24 @@ sysv! {
         for i in 0..n as usize { *loci.add(i) = 3; } // LOCAL_FAST
         0
     }
+    fn scePlayGoGetInstallSpeed(handle: i32, speed: *mut i32) -> i32 {
+        if speed.is_null() { return 0x80B2_0002u32 as i32; }
+        *speed = PLAYGO_SPEED.load(Ordering::Relaxed);
+        0
+    }
+    fn scePlayGoSetInstallSpeed(handle: i32, speed: i32) -> i32 {
+        PLAYGO_SPEED.store(speed, Ordering::Relaxed);
+        0
+    }
+    fn scePlayGoGetEta(handle: i32, ids: *const u16, n: u32, eta: *mut i64) -> i32 {
+        if !eta.is_null() { *eta = 0; } // installed
+        0
+    }
+    fn scePlayGoGetToDoList(handle: i32, todo: *mut u8, n: u32, entries: *mut u32) -> i32 {
+        if !entries.is_null() { *entries = 0; } // nothing left to install
+        0
+    }
+    fn scePlayGoPrefetch(handle: i32, ids: *const u16, n: u32, min_locus: i32) -> i32 { 0 }
     fn scePlayGoGetChunkId(handle: i32, out: *mut u16, n: u32, entries: *mut u32) -> i32 {
         let count = playgo_chunk_count();
         if out.is_null() {
@@ -191,7 +236,6 @@ sysv! {
 
 fixed! {
     scePlayGoInitialize => 0,
-    scePlayGoSetInstallSpeed => 0,
     sceSystemServiceLaunchWebBrowser => 0x80A1_0002u32,
 }
 
@@ -205,6 +249,9 @@ pub fn register(r: &mut Registry) {
         sceSystemServiceGetStatus, sceSystemServiceReceiveEvent, sceSystemServiceParamGetInt,
         sceSystemServiceParamGetString, sceSystemServiceHideSplashScreen, sceSystemServiceLaunchWebBrowser,
     ]);
-    reg!(r, "libScePlayGo", [scePlayGoInitialize, scePlayGoOpen, scePlayGoGetLocus, scePlayGoGetChunkId, scePlayGoSetInstallSpeed]);
+    reg!(r, "libScePlayGo", [
+        scePlayGoInitialize, scePlayGoOpen, scePlayGoGetLocus, scePlayGoGetChunkId, scePlayGoSetInstallSpeed,
+        scePlayGoGetInstallSpeed, scePlayGoGetEta, scePlayGoGetToDoList, scePlayGoPrefetch,
+    ]);
     let _ = cstr; // shared helper import
 }

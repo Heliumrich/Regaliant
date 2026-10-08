@@ -13,13 +13,15 @@ use std::collections::BTreeMap;
 use windows_sys::Win32::System::Memory::*;
 
 pub const GUEST_BASE: u64 = 0x4_0000_0000; // 16 GiB
-pub const GUEST_END: u64 = 0x100_0000_0000; // 1 TiB
+pub const GUEST_END: u64 = 0x800_0000_0000; // 8 TiB (the title reserves ~1 TiB for virtual textures)
 pub const MODULE_BASE: u64 = 0x8_0000_0000; // eboot image base (matches reference loaders)
 pub const MODULE_END: u64 = 0x10_0000_0000;
 pub const MMAP_BASE: u64 = 0x10_0000_0000; // default search start for guest mappings
 pub const INTERNAL_BASE: u64 = 0x4_0000_0000; // runtime-owned guest-visible memory
-pub const PAGE: u64 = 0x4000; // PS4 page size
-pub const DMEM_SIZE: u64 = 5056 << 20; // direct memory available to the title
+pub const PAGE: u64 = 0x4000; // PS5 page size
+/// Direct memory available to the title: PS5 game memory of 13.5 GiB minus the
+/// default 1 GiB flexible budget (values from public reverse engineering, unconfirmed).
+pub const DMEM_SIZE: u64 = 12800 << 20;
 
 pub const PROT_CPU_READ: u32 = 0x1;
 pub const PROT_CPU_WRITE: u32 = 0x2;

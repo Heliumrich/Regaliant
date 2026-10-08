@@ -322,7 +322,7 @@ fn main() {
     // Guest file system. The supplied game tree is mounted read-only; all
     // writable state lives under local-data/.
     let rt = cfg.root.join("local-data").join("runtime");
-    for d in ["temp0", "download0", "data"] {
+    for d in ["temp0", "download0", "data", "devlog"] {
         hle::kernel::fs::ensure_dir(&rt.join(d));
     }
     info!("application root {} (read-only), code {}", cfg.app.display(), cfg.code.display());
@@ -332,6 +332,9 @@ fn main() {
     hle::kernel::fs::mount("/temp", vec![rt.join("temp0")], true);
     hle::kernel::fs::mount("/download0", vec![rt.join("download0")], true);
     hle::kernel::fs::mount("/data", vec![rt.join("data")], true);
+    // The title writes its own log files to /devlog/app when it can (useful diagnostics).
+    hle::kernel::fs::ensure_dir(&rt.join("devlog").join("logs"));
+    hle::kernel::fs::mount("/devlog/app", vec![rt.join("devlog")], true);
     hle::libs::savedata::init(cfg.root.join("local-data").join("saves"));
 
     // Modules: the decrypted executable and the title's own libraries.

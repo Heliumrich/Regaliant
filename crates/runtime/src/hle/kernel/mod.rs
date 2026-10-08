@@ -4,6 +4,7 @@ pub mod equeue;
 pub mod fs;
 pub mod memory;
 pub mod misc;
+pub mod ps5;
 pub mod pthread;
 pub mod sync;
 pub mod time;
@@ -69,4 +70,5 @@ pub fn register(r: &mut Registry) {
     time::register(r);
     equeue::register(r);
     misc::register(r);
+    ps5::register(r);
 }

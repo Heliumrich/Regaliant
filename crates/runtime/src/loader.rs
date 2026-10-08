@@ -502,12 +502,13 @@ pub fn finalize(m: &LoadedModule) -> Result<PatchStats, String> {
 
 pub fn report_patch(m: &LoadedModule, s: &PatchStats) {
     crate::info!(
-        "{}: patched {} functions: fs:[0] {} (+{} raw), fs:[disp] {}, unknown fs {}, syscall {}",
+        "{}: patched {} functions: fs:[0] {} (+{} raw), fs:[disp] {}, fs trampolines {}, unpatched fs {}, syscall {}",
         m.name,
         s.functions,
         s.fs_zero,
         s.fs_raw_extra,
         s.fs_disp,
+        s.fs_tramp,
         s.fs_unknown.len(),
         s.syscalls.len()
     );

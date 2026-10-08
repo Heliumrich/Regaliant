@@ -11,7 +11,8 @@ const MAP_NO_OVERWRITE: i32 = 0x80;
 const MAP_ANON: i32 = 0x1000;
 const MAP_FAILED: u64 = u64::MAX;
 
-const FLEXIBLE_TOTAL: u64 = 448 << 20;
+/// PS5 default flexible memory budget (param.json has no kernel override).
+const FLEXIBLE_TOTAL: u64 = 1024 << 20;
 
 /// Picks a virtual address for a new mapping following PS4 hint/fixed rules.
 fn choose_addr(st: &MemState, hint: u64, size: u64, align: u64, flags: i32) -> Result<u64, i32> {

@@ -358,6 +358,13 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
         let mut r = String::new();
         use std::fmt::Write;
         let _ = writeln!(r, "FATAL {} ({:#010x}) at {} [{}]", code_name(code), code, describe(rip), crate::log::thread_name());
+        if in_guest(rip) && *(rip as *const u8) == 0xCD && *((rip + 1) as *const u8) == 0x45 {
+            // PS5 libc's fatal-error trap: `mov dword ptr fs:[28h], code; int 45h`
+            // (the FS store is rewritten to the guest TCB).
+            let tp = crate::tls::current_tp();
+            let ec = if tp != 0 { *((tp + 0x28) as *const u32) } else { 0 };
+            let _ = writeln!(r, "  guest error trap `int 45h`: TCB error code {ec:#010x}");
+        }
         if code == 0xC0000005 && rec.NumberParameters >= 2 {
             let kind = match rec.ExceptionInformation[0] {
                 0 => "read",

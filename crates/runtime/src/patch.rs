@@ -7,7 +7,10 @@
 //!   thread pointer and then the field.
 //! * `syscall` becomes `ud2`, so a raw FreeBSD syscall can never reach the Windows
 //!   kernel; the exception handler reports the site if one is ever executed.
-//! * Any other FS-relative form is replaced by `ud2` and listed.
+//! * Any other FS-relative instruction (PS5 libc stores error codes with
+//!   `mov dword ptr fs:[28h], imm32`) jumps to a generic trampoline that
+//!   executes it against the guest thread pointer (`fs_trampoline`); forms
+//!   that cannot be rewritten are listed at load time.
 
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 
@@ -17,6 +20,8 @@ pub struct PatchStats {
     pub fs_zero: usize,
     pub fs_raw_extra: usize,
     pub fs_disp: usize,
+    /// Other FS-relative instructions rewritten through generic trampolines.
+    pub fs_tramp: usize,
     pub fs_unknown: Vec<(u64, String, (u64, u64))>,
     pub syscalls: Vec<u64>,
 }
@@ -98,11 +103,99 @@ impl<'a> Patcher<'a> {
         Some(at)
     }
 
+    /// Generic rewrite of an FS-relative instruction: a 5-byte `jmp` to a
+    /// trampoline that loads the guest thread pointer into a scratch register
+    /// the instruction does not use, executes the instruction with that
+    /// register as the base (FS prefix dropped), restores the scratch register
+    /// and jumps back. Flags are untouched (lea/push/pop/mov/jmp only) and the
+    /// System V red zone below rsp is skipped before pushing.
+    fn fs_trampoline(&mut self, ins: &Instruction) -> Result<(), String> {
+        use iced_x86::{BlockEncoder, BlockEncoderOptions, Code, FlowControl, InstructionBlock, InstructionInfoFactory, MemoryOperand};
+        if ins.len() < 5 {
+            return Err(format!("{} bytes: too short for a jump", ins.len()));
+        }
+        if ins.flow_control() != FlowControl::Next {
+            return Err("control-flow instruction".into());
+        }
+        if ins.is_ip_rel_memory_operand() {
+            return Err("rip-relative".into());
+        }
+        let mut info = InstructionInfoFactory::new();
+        let used: Vec<Register> = info.info(ins).used_registers().iter().map(|u| u.register().full_register()).collect();
+        if used.contains(&Register::RSP) || ins.memory_base() == Register::RSP || ins.memory_index() == Register::RSP {
+            return Err("uses rsp".into());
+        }
+        let candidates = [
+            Register::RAX, Register::RCX, Register::RDX, Register::RBX, Register::RSI, Register::RDI, Register::R8, Register::R9,
+            Register::R10, Register::R11, Register::R12, Register::R13, Register::R14, Register::R15,
+        ];
+        let scratch = *candidates
+            .iter()
+            .find(|r| !used.contains(r) && ins.memory_base().full_register() != **r && ins.memory_index().full_register() != **r)
+            .ok_or("no free scratch register")?;
+        let e = |r: Result<Instruction, iced_x86::IcedError>| r.map_err(|e| e.to_string());
+        let mut list = vec![
+            e(Instruction::with2(Code::Lea_r64_m, Register::RSP, MemoryOperand::with_base_displ(Register::RSP, -0x80)))?,
+            e(Instruction::with1(Code::Push_r64, scratch))?,
+            e(Instruction::with2(
+                Code::Mov_r64_rm64,
+                scratch,
+                MemoryOperand::new(Register::None, Register::None, 1, self.tls_slot_disp as i64, 4, false, Register::GS),
+            ))?,
+        ];
+        let mut rewritten = *ins;
+        rewritten.set_segment_prefix(Register::None);
+        if ins.memory_base() != Register::None {
+            // tp + base first; the instruction keeps index*scale + disp.
+            list.push(e(Instruction::with2(Code::Lea_r64_m, scratch, MemoryOperand::new(scratch, ins.memory_base(), 1, 0, 0, false, Register::None)))?);
+        }
+        if matches!(
+            ins.code(),
+            Code::Mov_AL_moffs8
+                | Code::Mov_AX_moffs16
+                | Code::Mov_EAX_moffs32
+                | Code::Mov_RAX_moffs64
+                | Code::Mov_moffs8_AL
+                | Code::Mov_moffs16_AX
+                | Code::Mov_moffs32_EAX
+                | Code::Mov_moffs64_RAX
+        ) {
+            // moffs forms (A0-A3) cannot take a base register.
+            return Err("absolute moffs form".into());
+        }
+        let disp = rewritten.memory_displacement64() as i64;
+        if i32::try_from(disp).is_err() {
+            return Err(format!("displacement {disp:#x} does not fit 32 bits"));
+        }
+        rewritten.set_memory_base(scratch);
+        // Absolute [disp32] decodes with an 8-byte displacement size in 64-bit
+        // mode; relative to a base register it is a sign-extended disp32.
+        rewritten.set_memory_displ_size(if disp == 0 { 0 } else { 4 });
+        list.push(rewritten);
+        list.push(e(Instruction::with1(Code::Pop_r64, scratch))?);
+        list.push(e(Instruction::with2(Code::Lea_r64_m, Register::RSP, MemoryOperand::with_base_displ(Register::RSP, 0x80)))?);
+        list.push(e(Instruction::with_branch(Code::Jmp_rel32_64, ins.next_ip()))?);
+        let at = self.tramp_base + self.tramp_used as u64;
+        let enc = BlockEncoder::encode(64, InstructionBlock::new(&list, at), BlockEncoderOptions::NONE).map_err(|e| e.to_string())?;
+        let t = self.emit_trampoline(&enc.code_buffer).ok_or("trampoline space exhausted")?;
+        debug_assert_eq!(t, at);
+        let j = enc_jmp(ins.ip(), t).ok_or("trampoline out of rel32 range")?;
+        let off = (ins.ip() - self.base) as usize;
+        self.image[off..off + 5].copy_from_slice(&j);
+        for b in &mut self.image[off + 5..off + ins.len()] {
+            *b = 0xCC; // never executed: control returns to next_ip
+        }
+        Ok(())
+    }
+
     fn handle_fs(&mut self, ins: &Instruction, range: (u64, u64), stats: &mut PatchStats, fmt: &mut iced_x86::FastFormatter) {
         let rel = ins.ip() - self.base;
         let off = rel as usize;
         let len = ins.len();
         let bytes = self.image[off..off + len].to_vec();
+        // `mov r64, fs:[disp32]`, possibly after padding prefixes (PS5 TLS
+        // relaxation emits `66 66 66 64 48 8b 04 25 ...`): the last 9 bytes.
+        let tail = len.checked_sub(9).map(|p| &bytes[p..]).unwrap_or(&[]);
         let simple_abs = ins.mnemonic() == Mnemonic::Mov
             && ins.op_count() == 2
             && ins.op0_kind() == OpKind::Register
@@ -110,18 +203,19 @@ impl<'a> Patcher<'a> {
             && ins.memory_base() == Register::None
             && ins.memory_index() == Register::None
             && gpr64_index(ins.op0_register()).is_some()
-            && len == 9
-            && bytes[0] == 0x64
-            && (bytes[1] & 0xF8) == 0x48
-            && bytes[2] == 0x8B
-            && (bytes[3] & 0xC7) == 0x04
-            && bytes[4] == 0x25;
+            && len >= 9
+            && bytes[..len - 9].iter().all(|&b| b == 0x66)
+            && tail[0] == 0x64
+            && (tail[1] & 0xF8) == 0x48
+            && tail[2] == 0x8B
+            && (tail[3] & 0xC7) == 0x04
+            && tail[4] == 0x25;
         if simple_abs {
             let reg = gpr64_index(ins.op0_register()).unwrap();
             let disp = ins.memory_displacement64();
             if disp == 0 {
                 let new = enc_mov_gs(reg, self.tls_slot_disp);
-                self.image[off..off + 9].copy_from_slice(&new);
+                self.image[off + len - 9..off + len].copy_from_slice(&new);
                 stats.fs_zero += 1;
                 return;
             }
@@ -145,9 +239,14 @@ impl<'a> Patcher<'a> {
         }
         let mut text = String::new();
         fmt.format(ins, &mut text);
-        // Not patched: these are usually bytes that are not instructions (decoder
-        // desynchronized inside a function range). Recorded for fault diagnostics.
-        stats.fs_unknown.push((rel, text, range));
+        match self.fs_trampoline(ins) {
+            Ok(()) => stats.fs_tramp += 1,
+            Err(why) => {
+                // Not patched: usually bytes that are not instructions (decoder
+                // desynchronized inside a function range). Recorded for fault diagnostics.
+                stats.fs_unknown.push((rel, format!("{text} ({why})"), range));
+            }
+        }
     }
 
     /// Decodes each function range and applies patches. `ranges` are module-relative.
