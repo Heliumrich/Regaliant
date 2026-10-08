@@ -3,6 +3,7 @@
 //! Encodings follow AMD's RDNA ISA; opcode names and numbers come from the
 //! generated `tables` (Mesa ACO's opcode table, gfx10 column).
 
+pub mod analysis;
 pub mod tables;
 
 use std::fmt::Write;
@@ -114,6 +115,82 @@ impl Inst {
             Enc::Scratch => lookup(SCRATCH, self.op),
         }?;
         Some(n.split('/').next().unwrap_or(n))
+    }
+
+    /// Name without ACO's `_e64` suffix (VOP3-only variants of VOP1/VOP2 ops):
+    /// the key used for semantics.
+    pub fn base_name(&self) -> Option<&'static str> {
+        self.name().map(|n| n.strip_suffix("_e64").unwrap_or(n))
+    }
+
+    pub fn is_endpgm(&self) -> bool {
+        self.enc == Enc::Sopp && self.op == 1
+    }
+
+    /// Branch target byte offset (SOPP branches): pc + 4 + simm16 * 4.
+    pub fn branch_target(&self) -> Option<u32> {
+        if self.enc != Enc::Sopp {
+            return None;
+        }
+        let n = self.name()?;
+        if n == "s_branch" || n.starts_with("s_cbranch_") {
+            Some((self.pc as i64 + 4 + 4 * (self.simm16() as i16) as i64) as u32)
+        } else {
+            None
+        }
+    }
+
+    /// VOP3B: carry/flag output SGPR in w0[14:8] instead of abs bits.
+    pub fn is_vop3b(&self) -> bool {
+        self.enc == Enc::Vop3
+            && matches!(
+                self.base_name(),
+                Some(
+                    "v_add_co_u32"
+                        | "v_sub_co_u32"
+                        | "v_subrev_co_u32"
+                        | "v_addc_co_u32"
+                        | "v_subb_co_u32"
+                        | "v_subbrev_co_u32"
+                        | "v_div_scale_f32"
+                        | "v_div_scale_f64"
+                        | "v_mad_u64_u32"
+                        | "v_mad_i64_i32"
+                )
+            )
+    }
+
+    /// SGPR spills through VGPR lanes: `(is_write, vgpr, lane)` for
+    /// v_writelane_b32 / v_readlane_b32 with an inline-constant lane.
+    pub fn const_lane_op(&self) -> Option<(bool, u16, u32)> {
+        let n = self.base_name()?;
+        let write = match n {
+            "v_writelane_b32" => true,
+            "v_readlane_b32" => false,
+            _ => return None,
+        };
+        let lane = self.src(1);
+        if !(128..=192).contains(&lane) {
+            return None;
+        }
+        let lane = (lane - 128) as u32;
+        if write {
+            Some((true, self.vdst(), lane))
+        } else {
+            let v = self.src(0);
+            if v < OP_VGPR0 {
+                return None;
+            }
+            Some((false, v - OP_VGPR0, lane))
+        }
+    }
+
+    /// Resource descriptor base SGPR of buffer/image instructions.
+    pub fn mem_srsrc(&self) -> u16 {
+        match self.enc {
+            Enc::Mimg => self.mimg_srsrc(),
+            _ => self.buf_srsrc(),
+        }
     }
 
     // Scalar fields

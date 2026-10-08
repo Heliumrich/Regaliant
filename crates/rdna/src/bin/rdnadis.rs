@@ -4,7 +4,30 @@
 use std::collections::BTreeMap;
 
 fn main() {
-    let files: Vec<String> = std::env::args().skip(1).collect();
+    let mut files: Vec<String> = std::env::args().skip(1).collect();
+    // --analyze: descriptor/scalar-load provenance per file (32 user SGPRs assumed).
+    let analyze = files.first().is_some_and(|f| f == "--analyze");
+    if analyze {
+        files.remove(0);
+        let (mut ok, mut bad) = (0, 0);
+        for f in &files {
+            let bytes = std::fs::read(f).expect("read shader");
+            let code: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let Ok(insts) = rdna::decode_program(&code) else { continue };
+            let plan = rdna::analysis::analyze(&insts, 32, 0);
+            if plan.errors.is_empty() {
+                ok += 1;
+            } else {
+                bad += 1;
+                println!("{f}: {} resource(s), {} load(s), errors:", plan.resources.len(), plan.loads.len());
+                for e in plan.errors.iter().take(4) {
+                    println!("    {e}");
+                }
+            }
+        }
+        println!("{ok} shader(s) fully resolved, {bad} with unresolved descriptors or loads");
+        return;
+    }
     if files.is_empty() {
         eprintln!("usage: rdnadis <file.bin>...");
         std::process::exit(2);
