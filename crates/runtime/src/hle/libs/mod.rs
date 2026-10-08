@@ -1,5 +1,8 @@
 //! HLE for PS5 system libraries other than libkernel.
 
+pub mod agc;
+pub mod agc_defaults;
+pub mod agcdriver;
 pub mod ajm;
 pub mod ampr;
 pub mod app;
@@ -20,6 +23,8 @@ pub fn register(r: &mut Registry) {
     sysmodule::register(r);
     libc_internal::register(r);
     ampr::register(r);
+    agc::register(r);
+    agcdriver::register(r);
     fiber::register(r);
     ps5svc::register(r);
     app::register(r);

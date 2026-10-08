@@ -188,6 +188,14 @@ sysv! {
         write_cstr(buf, size as usize, "PS4");
         0
     }
+    /// SceSystemServiceDisplaySafeAreaInfo {float ratio; reserved[128]}: the
+    /// whole display is safe (the console default).
+    fn sceSystemServiceGetDisplaySafeAreaInfo(info: *mut f32) -> i32 {
+        if info.is_null() { return 0x80A1_0002u32 as i32; }
+        std::ptr::write_bytes(info as *mut u8, 0, 4 + 128);
+        *info = 1.0;
+        0
+    }
     fn sceSystemServiceHideSplashScreen() -> i32 {
         crate::info!("sceSystemServiceHideSplashScreen");
         0
@@ -247,7 +255,7 @@ pub fn register(r: &mut Registry) {
     ]);
     reg!(r, "libSceSystemService", [
         sceSystemServiceGetStatus, sceSystemServiceReceiveEvent, sceSystemServiceParamGetInt,
-        sceSystemServiceParamGetString, sceSystemServiceHideSplashScreen, sceSystemServiceLaunchWebBrowser,
+        sceSystemServiceParamGetString, sceSystemServiceHideSplashScreen, sceSystemServiceGetDisplaySafeAreaInfo, sceSystemServiceLaunchWebBrowser,
     ]);
     reg!(r, "libScePlayGo", [
         scePlayGoInitialize, scePlayGoOpen, scePlayGoGetLocus, scePlayGoGetChunkId, scePlayGoSetInstallSpeed,

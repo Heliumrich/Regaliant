@@ -345,16 +345,30 @@ sysv! {
         create(out, attr, entry, arg, &n)
     }
     fn pthread_self() -> u64 { cur().handle() }
+    /// POSIX scheduling parameters: the priority is recorded (as scePthreadSetprio);
+    /// host scheduling is not changed.
+    fn pthread_setschedparam(t: u64, policy: i32, param: *const i32) -> i32 {
+        let Some(t) = target(t) else { return ESRCH };
+        if param.is_null() { return EINVAL; }
+        t.priority.store(*param, Ordering::Relaxed);
+        0
+    }
+    fn pthread_getschedparam(t: u64, policy: *mut i32, param: *mut i32) -> i32 {
+        let Some(t) = target(t) else { return ESRCH };
+        if !policy.is_null() { *policy = 2; } // SCHED_OTHER-like default (FIFO=1, OTHER=2, RR=3 on FreeBSD)
+        if !param.is_null() { *param = t.priority.load(Ordering::Relaxed); }
+        0
+    }
     fn pthread_equal(a: u64, b: u64) -> i32 { (a == b) as i32 }
     fn pthread_exit(value: u64) { thread::exit_current(value) }
     fn pthread_join(t: u64, value: *mut u64) -> i32 {
-        let Some(t) = thread::from_handle(t) else { return ESRCH };
+        let Some(t) = target(t) else { return ESRCH };
         let v = thread::join(t);
         if !value.is_null() { *value = v; }
         0
     }
     fn pthread_detach(t: u64) -> i32 {
-        let Some(t) = thread::from_handle(t) else { return ESRCH };
+        let Some(t) = target(t) else { return ESRCH };
         t.detached.store(true, Ordering::Relaxed);
         0
     }
@@ -380,6 +394,7 @@ pub fn register(r: &mut Registry) {
         scePthreadGetspecific, scePthreadSetspecific,
     ]);
     reg!(r, "libScePosix", [
+        pthread_setschedparam, pthread_getschedparam,
         pthread_attr_init, pthread_attr_destroy, pthread_attr_setstacksize, pthread_attr_getstacksize,
         pthread_attr_setdetachstate, pthread_attr_setschedparam, pthread_attr_getschedparam,
         pthread_attr_setschedpolicy, pthread_create, pthread_self, pthread_equal, pthread_exit, pthread_join,

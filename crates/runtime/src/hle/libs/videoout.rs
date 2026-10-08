@@ -1,5 +1,14 @@
-//! libSceVideoOut: display buffers, flip queue and flip/vblank events.
-//! A vblank thread executes queued flips at 60 Hz (scaled by the flip rate).
+//! libSceVideoOut (PS5 API): display buffer sets, flip queue, vblank pacing,
+//! output status and color settings.
+//!
+//! A vblank thread executes queued flips at 59.94 Hz (scaled by the flip rate).
+//! Until the GPU renders into display buffers, presentation shows black: the
+//! guest display memory is not produced by the title's GPU work yet, so
+//! nothing else would be truthful. Color settings are recorded, not applied.
+//!
+//! Structures (PS5 layouts; see docs/PROVENANCE.md): BufferAttribute2 (0x50),
+//! FlipStatus, VblankStatus, OutputStatus {u32 resolution, u32 dynamicRange,
+//! u64 refreshRate, u64 flags, u64 reserved[3]}, ColorSettings {f32 gamma, ...}.
 
 use crate::hle::Registry;
 use crate::{reg, sysv};
@@ -7,45 +16,50 @@ use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-const ERR_INVALID_HANDLE: i32 = 0x8029_000Bu32 as i32;
+const ERR_INVALID_VALUE: i32 = 0x8029_0001u32 as i32;
+const ERR_INVALID_ADDRESS: i32 = 0x8029_0002u32 as i32;
 const ERR_INVALID_INDEX: i32 = 0x8029_0004u32 as i32;
+const ERR_RESOURCE_BUSY: i32 = 0x8029_0009u32 as i32;
+const ERR_INVALID_HANDLE: i32 = 0x8029_000Bu32 as i32;
 const ERR_FLIP_QUEUE_FULL: i32 = 0x8029_0012u32 as i32;
-const EVENT_FLIP: u64 = 0;
+
+/// Output reported to the title: 1080p SDR at 59.94 Hz (resolution 1 = 1080p,
+/// 2 = 2160p; dynamic range 1 = SDR). A lower output keeps GPU emulation cost
+/// down during bring-up; it is a choice of this port, not a console default.
+const OUTPUT_RESOLUTION: u32 = 1;
+const OUTPUT_DYNAMIC_RANGE: u32 = 1;
+const REFRESH_59_94HZ: u64 = 3;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BufferAttr {
-    pub pixel_format: u32,
+    pub pixel_format: u64,
     pub tiling: u32,
     pub aspect: u32,
     pub width: u32,
     pub height: u32,
     pub pitch: u32,
-    pub option: u32,
+    pub option: u64,
+    pub dcc_control: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct DisplayBuffer {
     pub addr: u64,
-    pub attr: BufferAttr,
+    pub metadata: u64,
+    pub set: i32,
 }
 
 struct Flip {
     index: i32,
     arg: i64,
     submit_tsc: u64,
-    /// Requested through sceGnmSubmitAndFlipCommandBuffers.
-    gpu: bool,
 }
 
 pub struct Port {
     pub buffers: [Option<DisplayBuffer>; 16],
-    groups: u32,
+    pub sets: [Option<BufferAttr>; 16],
     flip_rate: u32,
-    flip_events: Vec<(u64, u64)>,
     pending: VecDeque<Flip>,
-    pending_per_buffer: [u32; 16],
-    /// GPU flips submitted with their command buffers but not yet reached by the GPU.
-    gc_unreached: u32,
     count: u64,
     process_time: u64,
     tsc: u64,
@@ -54,14 +68,18 @@ pub struct Port {
     current: i32,
     last_flip_vblank: u64,
     vblanks: u64,
+    vblank_time: u64,
+    vblank_tsc: u64,
+    gamma: f32,
 }
 
 static PORT: Mutex<Option<Port>> = Mutex::new(None);
 static FLIP_CV: Condvar = Condvar::new();
+static VBLANK_CV: Condvar = Condvar::new();
 
 fn vblank_thread() {
     crate::log::set_thread_name("vblank");
-    let period = Duration::from_nanos(16_666_667);
+    let period = Duration::from_nanos(16_683_333); // 59.94 Hz
     let mut next = Instant::now() + period;
     loop {
         let now = Instant::now();
@@ -69,24 +87,22 @@ fn vblank_thread() {
             std::thread::sleep(next - now);
         }
         next += period;
-        let mut fired: Vec<(u64, u64, i64)> = Vec::new();
         let mut show: Option<DisplayBuffer> = None;
         {
             let mut g = PORT.lock();
             let Some(p) = g.as_mut() else { continue };
             p.vblanks += 1;
+            p.vblank_time = crate::hle::kernel::time::process_time_us();
+            p.vblank_tsc = unsafe { core::arch::x86_64::_rdtsc() };
             let interval = p.flip_rate as u64 + 1;
             if !p.pending.is_empty() && p.vblanks - p.last_flip_vblank >= interval {
                 let f = p.pending.pop_front().unwrap();
-                if f.index >= 0 {
-                    p.pending_per_buffer[f.index as usize] -= 1;
-                }
                 p.current = f.index;
                 p.count += 1;
                 p.flip_arg = f.arg;
                 p.submit_tsc = f.submit_tsc;
-                p.process_time = crate::hle::kernel::time::process_time_us();
-                p.tsc = unsafe { core::arch::x86_64::_rdtsc() };
+                p.process_time = p.vblank_time;
+                p.tsc = p.vblank_tsc;
                 p.last_flip_vblank = p.vblanks;
                 if p.count <= 3 || p.count % 600 == 0 {
                     crate::info!("flip #{} -> buffer {} (arg {:#x})", p.count, f.index, f.arg);
@@ -94,105 +110,81 @@ fn vblank_thread() {
                 if f.index >= 0 {
                     show = p.buffers[f.index as usize];
                 }
-                for &(eq, ud) in &p.flip_events {
-                    fired.push((eq, ud, f.arg));
-                }
+                crate::gpu::FRAMES.store(p.count, std::sync::atomic::Ordering::Relaxed);
                 FLIP_CV.notify_all();
             }
+            VBLANK_CV.notify_all();
         }
         if let Some(b) = show {
             let n = PORT.lock().as_ref().map(|p| p.count).unwrap_or(0);
             maybe_screenshot(&b, n);
             present_buffer(&b);
         }
-        for (eq, _ud, arg) in fired {
-            if let Some(q) = unsafe { crate::hle::kernel::equeue::from_handle(eq) } {
-                q.trigger(EVENT_FLIP, crate::hle::kernel::equeue::EVFILT_DISPLAY, Some(arg as u64), None);
-            }
-        }
     }
 }
 
-fn submit_flip(handle: i32, index: i32, arg: i64, gpu: bool) -> i32 {
+fn port<R>(handle: i32, f: impl FnOnce(&mut Port) -> R) -> Result<R, i32> {
     if handle != 1 {
-        return ERR_INVALID_HANDLE;
+        return Err(ERR_INVALID_HANDLE);
     }
     let mut g = PORT.lock();
-    let Some(p) = g.as_mut() else { return ERR_INVALID_HANDLE };
-    if gpu {
-        p.gc_unreached = p.gc_unreached.saturating_sub(1);
-    }
-    if index >= 16 || (index >= 0 && p.buffers[index as usize].is_none()) {
-        return ERR_INVALID_INDEX;
-    }
-    if p.pending.len() >= 16 {
-        return ERR_FLIP_QUEUE_FULL;
-    }
-    if index >= 0 {
-        p.pending_per_buffer[index as usize] += 1;
-    }
-    p.pending.push_back(Flip { index, arg, submit_tsc: unsafe { core::arch::x86_64::_rdtsc() }, gpu });
-    0
-}
-
-/// Registers a flip submitted together with command buffers; it stays
-/// pending (gcQueueNum/flipPendingNum) until the GPU reaches it and the
-/// vblank thread executes it.
-pub fn gpu_flip_requested(handle: i32) {
-    if handle != 1 {
-        return;
-    }
-    if let Some(p) = PORT.lock().as_mut() {
-        p.gc_unreached += 1;
+    match g.as_mut() {
+        Some(p) => Ok(f(p)),
+        None => Err(ERR_INVALID_HANDLE),
     }
 }
 
-/// Flip requested by the GPU after its command buffers completed.
-pub fn gpu_flip(handle: i32, index: i32, _mode: u32, arg: i64) {
-    let r = submit_flip(handle, index, arg, true);
-    if r != 0 {
-        crate::error!("GPU flip of buffer {index} failed: {r:#x}");
-    }
-}
-
-/// Blocks (GPU side) until no flip of `index` is pending.
-pub fn wait_flip_done(handle: i32, index: i32) {
-    if handle != 1 || !(0..16).contains(&index) {
-        return;
-    }
-    let mut g = PORT.lock();
-    let start = Instant::now();
-    let deadline = start + Duration::from_secs(5);
-    let mut warned = false;
-    while g.as_ref().is_some_and(|p| p.pending_per_buffer[index as usize] > 0) {
-        if !warned && start.elapsed() > Duration::from_millis(250) {
-            warned = true;
-            crate::warn!("GPU wait for flip of buffer {index} blocked for 250 ms (pending {:?})", g.as_ref().map(|p| p.pending.len()));
+/// Queues a flip of `index` (-1 = blank). Used by sceVideoOutSubmitFlip and by
+/// GPU flips (sceAgcDcbSetFlip) when the command processor reaches them.
+pub fn submit_flip(handle: i32, index: i32, arg: i64) -> i32 {
+    port(handle, |p| {
+        if index >= 16 || (index >= 0 && p.buffers[index as usize].is_none()) {
+            return ERR_INVALID_INDEX;
         }
-        if FLIP_CV.wait_until(&mut g, deadline.min(Instant::now() + Duration::from_millis(100))).timed_out() && Instant::now() >= deadline {
-            crate::warn!("wait for flip of buffer {index} timed out");
-            return;
+        if p.pending.len() >= 16 {
+            return ERR_FLIP_QUEUE_FULL;
+        }
+        p.pending.push_back(Flip { index, arg, submit_tsc: unsafe { core::arch::x86_64::_rdtsc() } });
+        0
+    })
+    .unwrap_or_else(|e| e)
+}
+
+pub fn display_buffer(index: i32) -> Option<(DisplayBuffer, BufferAttr)> {
+    let g = PORT.lock();
+    let p = g.as_ref()?;
+    let b = p.buffers.get(index as usize).copied().flatten()?;
+    let a = p.sets.get(b.set as usize).copied().flatten()?;
+    Some((b, a))
+}
+
+unsafe fn read_attr(attr: *const u8) -> BufferAttr {
+    unsafe {
+        let r32 = |o: usize| *(attr.add(o) as *const u32);
+        let r64 = |o: usize| *(attr.add(o) as *const u64);
+        BufferAttr {
+            tiling: r32(0x04),
+            aspect: r32(0x08),
+            width: r32(0x0C),
+            height: r32(0x10),
+            pitch: r32(0x14),
+            option: r64(0x18),
+            pixel_format: r64(0x20),
+            dcc_control: r32(0x30),
         }
     }
-}
-
-pub fn display_buffer(index: i32) -> Option<DisplayBuffer> {
-    PORT.lock().as_ref().and_then(|p| p.buffers.get(index as usize).copied().flatten())
 }
 
 sysv! {
     fn sceVideoOutOpen(user: i32, bus: i32, index: i32, param: *const u8) -> i32 {
-        if bus != 0 { return 0x8029_0002u32 as i32; }
+        if bus != 0 { return ERR_INVALID_VALUE; }
         let mut g = PORT.lock();
-        if g.is_some() { return 0x8029_0009u32 as i32; } // resource busy
+        if g.is_some() { return ERR_RESOURCE_BUSY; }
         *g = Some(Port {
             buffers: [None; 16],
-            groups: 0,
+            sets: [None; 16],
             flip_rate: 0,
-            flip_events: Vec::new(),
             pending: VecDeque::new(),
-            pending_per_buffer: [0; 16],
-            gc_unreached: 0,
             count: 0,
             process_time: 0,
             tsc: 0,
@@ -201,114 +193,167 @@ sysv! {
             current: -1,
             last_flip_vblank: 0,
             vblanks: 0,
+            vblank_time: 0,
+            vblank_tsc: 0,
+            gamma: 1.0,
         });
         drop(g);
         crate::thread::spawn_host("vblank", 1 << 20, Box::new(vblank_thread)).expect("vblank thread");
         crate::info!("sceVideoOutOpen -> 1");
         1
     }
-    fn sceVideoOutClose(h: i32) -> i32 {
-        if h != 1 { return ERR_INVALID_HANDLE; }
-        0
-    }
+    fn sceVideoOutClose(h: i32) -> i32 { port(h, |_| 0).unwrap_or_else(|e| e) }
     fn sceVideoOutSetFlipRate(h: i32, rate: i32) -> i32 {
-        let mut g = PORT.lock();
-        let Some(p) = g.as_mut() else { return ERR_INVALID_HANDLE };
-        p.flip_rate = rate.clamp(0, 2) as u32;
-        crate::info!("sceVideoOutSetFlipRate({rate})");
+        port(h, |p| {
+            p.flip_rate = rate.clamp(0, 2) as u32;
+            crate::info!("sceVideoOutSetFlipRate({rate})");
+            0
+        }).unwrap_or_else(|e| e)
+    }
+    fn sceVideoOutColorSettingsSetGamma_(settings: *mut f32, gamma: f32, size: u64) -> i32 {
+        if settings.is_null() { return ERR_INVALID_ADDRESS; }
+        if !(0.1..=2.0).contains(&gamma) { return ERR_INVALID_VALUE; }
+        *settings = gamma;
         0
     }
-    fn sceVideoOutAddFlipEvent(eq: u64, h: i32, udata: u64) -> i32 {
-        let mut g = PORT.lock();
-        let Some(p) = g.as_mut() else { return ERR_INVALID_HANDLE };
-        let Some(q) = crate::hle::kernel::equeue::from_handle(eq) else { return 0x8029_0001u32 as i32 };
-        q.add(EVENT_FLIP, crate::hle::kernel::equeue::EVFILT_DISPLAY, 0, udata);
-        p.flip_events.push((eq, udata));
-        0
+    fn sceVideoOutAdjustColor_(h: i32, settings: *const f32, size: u64) -> i32 {
+        if settings.is_null() { return ERR_INVALID_ADDRESS; }
+        let gamma = *settings;
+        port(h, |p| {
+            p.gamma = gamma;
+            crate::info!("sceVideoOutAdjustColor: gamma {gamma} (recorded; not applied to presentation yet)");
+            0
+        }).unwrap_or_else(|e| e)
     }
-    fn sceVideoOutSetBufferAttribute(attr: *mut u32, fmt: u32, tiling: u32, aspect: u32, w: u32, h: u32, pitch: u32) {
-        let v = [fmt, tiling, aspect, w, h, pitch, 0, 0, 0, 0];
-        for (i, x) in v.iter().enumerate() { *attr.add(i) = *x; }
+    fn sceVideoOutGetOutputStatus(h: i32, st: *mut u8) -> i32 {
+        if st.is_null() { return ERR_INVALID_ADDRESS; }
+        port(h, |_| {
+            std::ptr::write_bytes(st, 0, 0x30);
+            *(st as *mut u32) = OUTPUT_RESOLUTION;
+            *(st.add(4) as *mut u32) = OUTPUT_DYNAMIC_RANGE;
+            *(st.add(8) as *mut u64) = REFRESH_59_94HZ;
+            0
+        }).unwrap_or_else(|e| e)
     }
-    fn sceVideoOutRegisterBuffers(h: i32, start: i32, addrs: *const u64, num: i32, attr: *const u32) -> i32 {
-        let mut g = PORT.lock();
-        let Some(p) = g.as_mut() else { return ERR_INVALID_HANDLE };
-        if start < 0 || num <= 0 || start + num > 16 || addrs.is_null() || attr.is_null() { return ERR_INVALID_INDEX; }
-        let a = BufferAttr {
-            pixel_format: *attr, tiling: *attr.add(1), aspect: *attr.add(2), width: *attr.add(3),
-            height: *attr.add(4), pitch: *attr.add(5), option: *attr.add(6),
-        };
-        for i in 0..num as usize {
-            p.buffers[start as usize + i] = Some(DisplayBuffer { addr: *addrs.add(i), attr: a });
-        }
-        let group = p.groups;
-        p.groups += 1;
-        crate::info!(
-            "sceVideoOutRegisterBuffers [{}..{}) {}x{} pitch {} format {:#x} tiling {} -> group {} addrs {:x?}",
-            start, start + num, a.width, a.height, a.pitch, a.pixel_format, a.tiling, group,
-            (0..num as usize).map(|i| *addrs.add(i)).collect::<Vec<_>>()
-        );
-        group as i32
+    fn sceVideoOutSetBufferAttribute2(attr: *mut u8, pixel_format: u64, tiling: u32, width: u32, height: u32, option: u64, dcc_control: u32, dcc_clear: u64) {
+        if attr.is_null() { return; }
+        std::ptr::write_bytes(attr, 0, 0x50);
+        *(attr.add(0x04) as *mut u32) = tiling;
+        *(attr.add(0x08) as *mut u32) = 0; // aspect ratio 16:9
+        *(attr.add(0x0C) as *mut u32) = width;
+        *(attr.add(0x10) as *mut u32) = height;
+        *(attr.add(0x14) as *mut u32) = width; // pitch in pixels
+        *(attr.add(0x18) as *mut u64) = option;
+        *(attr.add(0x20) as *mut u64) = pixel_format;
+        *(attr.add(0x28) as *mut u64) = dcc_clear;
+        *(attr.add(0x30) as *mut u32) = dcc_control;
+    }
+    fn sceVideoOutRegisterBuffers2(h: i32, set: i32, start: i32, bufs: *const u64, num: i32, attr: *const u8, category: i32, option: u64) -> i32 {
+        if bufs.is_null() || attr.is_null() { return ERR_INVALID_ADDRESS; }
+        if !(0..16).contains(&set) || start < 0 || num <= 0 || start + num > 16 { return ERR_INVALID_INDEX; }
+        let a = read_attr(attr);
+        port(h, |p| {
+            p.sets[set as usize] = Some(a);
+            let mut addrs = Vec::new();
+            for i in 0..num as usize {
+                // VideoOutBuffers entries: {data, metadata} (stride confirmed below by logging).
+                let data = *bufs.add(i * 2);
+                let meta = *bufs.add(i * 2 + 1);
+                p.buffers[start as usize + i] = Some(DisplayBuffer { addr: data, metadata: meta, set });
+                addrs.push((data, meta));
+            }
+            crate::info!(
+                "sceVideoOutRegisterBuffers2 set {set} [{start}..{}) {}x{} pitch {} format {:#x} tiling {} option {:#x} dcc {:#x} category {category} buffers {:x?}",
+                start + num, a.width, a.height, a.pitch, a.pixel_format, a.tiling, a.option, a.dcc_control, addrs
+            );
+            0
+        }).unwrap_or_else(|e| e)
+    }
+    fn sceVideoOutSubmitChangeBufferAttribute2(h: i32, set: i32, attr: *const u8, option: u64) -> i32 {
+        if attr.is_null() { return ERR_INVALID_ADDRESS; }
+        if !(0..16).contains(&set) { return ERR_INVALID_INDEX; }
+        let a = read_attr(attr);
+        port(h, |p| {
+            p.sets[set as usize] = Some(a);
+            crate::info!("sceVideoOutSubmitChangeBufferAttribute2 set {set}: {}x{} format {:#x}", a.width, a.height, a.pixel_format);
+            0
+        }).unwrap_or_else(|e| e)
+    }
+    fn sceVideoOutUnregisterBuffers(h: i32, set: i32) -> i32 {
+        if !(0..16).contains(&set) { return ERR_INVALID_INDEX; }
+        port(h, |p| {
+            p.sets[set as usize] = None;
+            for b in p.buffers.iter_mut() {
+                if b.is_some_and(|x| x.set == set) { *b = None; }
+            }
+            0
+        }).unwrap_or_else(|e| e)
     }
     fn sceVideoOutSubmitFlip(h: i32, index: i32, mode: u32, arg: i64) -> i32 {
-        submit_flip(h, index, arg, false)
+        submit_flip(h, index, arg)
     }
-    fn sceVideoOutGetFlipStatus(h: i32, st: *mut u64) -> i32 {
-        let g = PORT.lock();
-        let Some(p) = g.as_ref() else { return ERR_INVALID_HANDLE };
-        if st.is_null() { return 0x8029_0001u32 as i32; }
-        *st = p.count;
-        *st.add(1) = p.process_time;
-        *st.add(2) = p.tsc;
-        *st.add(3) = p.flip_arg as u64;
-        *st.add(4) = p.submit_tsc;
-        *st.add(5) = 0;
-        let i = st.add(6) as *mut i32;
-        let gpu_queued = p.pending.iter().filter(|f| f.gpu).count() as u32;
-        *i = (p.gc_unreached + gpu_queued) as i32; // gcQueueNum
-        *i.add(1) = (p.gc_unreached as usize + p.pending.len()) as i32; // flipPendingNum
-        *i.add(2) = p.current;
-        *i.add(3) = 0;
+    fn sceVideoOutIsFlipPending(h: i32) -> i32 {
+        port(h, |p| p.pending.len() as i32).unwrap_or_else(|e| e)
+    }
+    fn sceVideoOutWaitVblank(h: i32) -> i32 {
+        if h != 1 { return ERR_INVALID_HANDLE; }
+        let mut g = PORT.lock();
+        let Some(start) = g.as_ref().map(|p| p.vblanks) else { return ERR_INVALID_HANDLE };
+        while g.as_ref().is_some_and(|p| p.vblanks == start) {
+            VBLANK_CV.wait_for(&mut g, Duration::from_millis(50));
+        }
         0
     }
-    fn sceVideoOutGetResolutionStatus(h: i32, st: *mut u32) -> i32 {
-        if st.is_null() { return 0x8029_0001u32 as i32; }
-        *st = 1920; *st.add(1) = 1080; *st.add(2) = 1920; *st.add(3) = 1080;
-        *(st.add(4) as *mut u64) = 3; // 59.94 Hz class
-        *(st.add(6) as *mut f32) = 50.0;
-        0
+    fn sceVideoOutGetFlipStatus(h: i32, st: *mut u8) -> i32 {
+        if st.is_null() { return ERR_INVALID_ADDRESS; }
+        port(h, |p| {
+            std::ptr::write_bytes(st, 0, 0x88);
+            *(st as *mut u64) = p.count;
+            *(st.add(0x08) as *mut u64) = p.process_time;
+            *(st.add(0x18) as *mut i64) = p.flip_arg;
+            *(st.add(0x28) as *mut u64) = p.tsc;
+            *(st.add(0x30) as *mut i32) = 0; // gcQueueNum
+            *(st.add(0x34) as *mut i32) = p.pending.len() as i32;
+            *(st.add(0x38) as *mut i32) = p.current;
+            *(st.add(0x40) as *mut u64) = p.submit_tsc;
+            0
+        }).unwrap_or_else(|e| e)
+    }
+    fn sceVideoOutSetWindowModeMargins(h: i32, top: i32, bottom: i32) -> i32 {
+        port(h, |_| {
+            crate::info!("sceVideoOutSetWindowModeMargins(top {top}, bottom {bottom}) (recorded only)");
+            0
+        }).unwrap_or_else(|e| e)
     }
 }
 
 pub fn register(r: &mut Registry) {
     reg!(r, "libSceVideoOut", [
-        sceVideoOutOpen, sceVideoOutClose, sceVideoOutSetFlipRate, sceVideoOutAddFlipEvent,
-        sceVideoOutSetBufferAttribute, sceVideoOutRegisterBuffers, sceVideoOutSubmitFlip, sceVideoOutGetFlipStatus,
-        sceVideoOutGetResolutionStatus,
+        sceVideoOutOpen, sceVideoOutClose, sceVideoOutSetFlipRate, sceVideoOutColorSettingsSetGamma_,
+        sceVideoOutAdjustColor_, sceVideoOutGetOutputStatus, sceVideoOutSetBufferAttribute2,
+        sceVideoOutRegisterBuffers2, sceVideoOutSubmitChangeBufferAttribute2, sceVideoOutUnregisterBuffers,
+        sceVideoOutSubmitFlip, sceVideoOutIsFlipPending, sceVideoOutWaitVblank, sceVideoOutGetFlipStatus,
+        sceVideoOutSetWindowModeMargins,
     ]);
 }
 
-/// Presents a display buffer. Until the GPU renders into Vulkan images, the
-/// guest memory contents are shown directly (linear interpretation).
+/// Presents a flipped display buffer. GPU rendering is not implemented yet,
+/// so a black frame of the buffer's size is shown (never raw guest memory,
+/// which is tiled and not produced by the title's GPU work).
 fn present_buffer(b: &DisplayBuffer) {
     if crate::gpu::vk::try_ctx().is_none() {
         return;
     }
-    let (w, h, pitch) = (b.attr.width, b.attr.height, b.attr.pitch.max(b.attr.width));
-    if w == 0 || h == 0 || w > 8192 || h > 8192 {
-        return;
-    }
-    let mut data = vec![0u8; (w * h * 4) as usize];
-    unsafe {
-        for y in 0..h as usize {
-            let src = (b.addr + (y as u64) * pitch as u64 * 4) as *const u8;
-            std::ptr::copy_nonoverlapping(src, data.as_mut_ptr().add(y * w as usize * 4), w as usize * 4);
-        }
-    }
+    let (w, h) = PORT
+        .lock()
+        .as_ref()
+        .and_then(|p| p.sets.get(b.set as usize).copied().flatten())
+        .map(|a| (a.width.clamp(1, 8192), a.height.clamp(1, 8192)))
+        .unwrap_or((1920, 1080));
+    let data = vec![0u8; (w * h * 4) as usize];
     crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Pixels { data, width: w, height: h });
 }
 
-/// DS_SCREENSHOT=n1,n2,... writes the displayed image of those flips as PNG.
 /// Screenshot requested through the control channel (file name stem).
 pub static SHOT_REQUEST: Mutex<Option<String>> = Mutex::new(None);
 
@@ -318,7 +363,5 @@ fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
     if requested.is_none() && !listed {
         return;
     }
-    // No GPU renderer exists yet: the display buffer contents are not produced
-    // by the title's GPU work, so there is nothing truthful to capture.
     crate::warn!("screenshot of flip {flip} ({:?}) unavailable: GPU rendering is not implemented yet (buffer {:#x})", requested, b.addr);
 }
