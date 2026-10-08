@@ -6,7 +6,7 @@ use super::cp::{Cp, Space};
 use super::desc::{Tsharp, Vsharp};
 use parking_lot::Mutex;
 use rdna::analysis::{Plan, Prov, Ptr, ResKind};
-use rdna::translate::{self, ImageDim, MrtSpec, NumClass, Output, ResSpec, Spec, Stage};
+use rdna::translate::{self, ImageDim, MrtSpec, NumClass, Output, PsInput, ResSpec, Spec, Stage};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -131,6 +131,8 @@ pub struct Prepared {
     pub insts: Arc<Vec<rdna::Inst>>,
     pub tr: Arc<Translated>,
     pub resources: Vec<Resolved>,
+    /// Guest address of each descriptor's first dword when read from memory.
+    pub res_addrs: Vec<Option<u64>>,
     /// SGPR data buffer contents (resource info blocks filled at binding).
     pub sgpr_data: Vec<u32>,
     pub user: Vec<u32>,
@@ -179,6 +181,137 @@ pub fn prepare_compute(cp: &Cp, wave64: bool) -> Result<Prepared, String> {
     prepare(addr, insts, code_hash, &user, &mut spec)
 }
 
+/// User-data dword count of a graphics stage: RSRC2 USER_SGPR[5:1] and USER_SGPR_MSB[27].
+fn user_count(rsrc2: u32) -> u16 {
+    (((rsrc2 >> 1) & 0x1F) | (((rsrc2 >> 27) & 1) << 5)).min(32) as u16
+}
+
+/// Pixel-shader registers (SH dword indices) and context registers (byte addresses).
+const PS_PGM_LO: u32 = 0x08;
+const PS_RSRC2: u32 = 0x0B;
+const PS_USER_DATA: u32 = 0x0C;
+const SPI_PS_INPUT_CNTL_0: u32 = 0x28644;
+const SPI_PS_INPUT_ADDR: u32 = 0x286D0;
+const SPI_PS_IN_CONTROL: u32 = 0x286D8;
+const SPI_SHADER_COL_FORMAT: u32 = 0x28714;
+const CB_COLOR0_INFO: u32 = 0x28C70;
+
+/// Resolves and translates the pixel shader bound on `cp`.
+pub fn prepare_ps(cp: &Cp) -> Result<Prepared, String> {
+    let sh = |i: u32| cp.reg(Space::Sh, i);
+    let ctx = |a: u32| cp.reg(Space::Ctx, (a - 0x28000) / 4);
+    let addr = ((sh(PS_PGM_LO) as u64) | ((sh(PS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
+    let rsrc2 = sh(PS_RSRC2);
+    let user_sgprs = user_count(rsrc2);
+    let user: Vec<u32> = (0..32).map(|i| sh(PS_USER_DATA + i)).collect();
+    let (insts, code_hash) = program(addr)?;
+    let in_control = ctx(SPI_PS_IN_CONTROL);
+    let mut ps_inputs = Vec::new();
+    for n in 0..(in_control & 0x3F).min(32) {
+        let c = ctx(SPI_PS_INPUT_CNTL_0 + 4 * n);
+        let off = c & 0x3F;
+        ps_inputs.push(PsInput { param: (off & 0x1F) as u8, flat: (c >> 10) & 1 != 0, default: (off & 0x20 != 0).then_some(((c >> 8) & 3) as u8) });
+    }
+    let col = ctx(SPI_SHADER_COL_FORMAT);
+    let mut mrt = [MrtSpec::default(); 8];
+    for (m, slot) in mrt.iter_mut().enumerate() {
+        let info = ctx(CB_COLOR0_INFO + 0x3C * m as u32);
+        let class = match (info >> 8) & 7 {
+            4 => 2,
+            5 => 1,
+            _ => 0,
+        };
+        *slot = MrtSpec { export_format: ((col >> (4 * m)) & 0xF) as u8, class };
+    }
+    let mut spec = Spec {
+        stage: Stage::Fragment,
+        user_sgprs,
+        user_base: 0,
+        code_base: addr,
+        wave64: (in_control >> 15) & 1 == 0,
+        ps_input_addr: ctx(SPI_PS_INPUT_ADDR),
+        ps_inputs,
+        mrt,
+        cs_local_size: [1, 1, 1],
+        cs_rsrc2: 0,
+        resources: Vec::new(),
+        binding_base: PS_BINDING_BASE,
+    };
+    prepare(addr, insts, code_hash, &user, &mut spec)
+}
+
+/// Binding numbers of the pixel stage start here (vertex stage from 0).
+pub const PS_BINDING_BASE: u32 = 32;
+
+/// NGG primitive shader: program in the ES registers, resources and user
+/// data in the GS ones (gfx10.3 register database).
+const ES_PGM_LO: u32 = 0xC8;
+const GS_RSRC2: u32 = 0x8B;
+const GS_USER_DATA: u32 = 0x8C;
+const VGT_SHADER_STAGES_EN: u32 = 0x28B54;
+
+/// Resolves and translates the NGG (vertex) shader bound on `cp`.
+pub fn prepare_ngg(cp: &Cp) -> Result<Prepared, String> {
+    let sh = |i: u32| cp.reg(Space::Sh, i);
+    let stages = cp.reg(Space::Ctx, (VGT_SHADER_STAGES_EN - 0x28000) / 4);
+    let addr = ((sh(ES_PGM_LO) as u64) | ((sh(ES_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
+    let rsrc2 = sh(GS_RSRC2);
+    let user_sgprs = user_count(rsrc2);
+    let user: Vec<u32> = (0..32).map(|i| sh(GS_USER_DATA + i)).collect();
+    let (insts, code_hash) = program(addr)?;
+    let mut spec = Spec {
+        stage: Stage::Vertex,
+        user_sgprs,
+        user_base: 8,
+        code_base: addr,
+        wave64: (stages >> 22) & 1 == 0,
+        ps_input_addr: 0,
+        ps_inputs: Vec::new(),
+        mrt: [MrtSpec::default(); 8],
+        cs_local_size: [1, 1, 1],
+        cs_rsrc2: 0,
+        resources: Vec::new(),
+        binding_base: 0,
+    };
+    prepare(addr, insts, code_hash, &user, &mut spec)
+}
+
+/// One line per resolved resource (frame captures).
+pub fn describe_resources(p: &Prepared) -> Vec<String> {
+    p.resources
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let used = &p.tr.plan.resources[i];
+            let from = match p.res_addrs.get(i).copied().flatten() {
+                Some(a) => format!(" @{a:#x}"),
+                None => String::new(),
+            };
+            let rw = format!("{}{}{from}", if used.read { "r" } else { "" }, if used.written { "w" } else { "" });
+            match r {
+                Resolved::Buffer(v) => format!("{i}: V# {:#x} stride {} records {} format {} dst_sel {:#x} oob {} {rw}", v.base, v.stride, v.num_records, v.format, v.dst_sel, v.oob_select),
+                Resolved::Global(a) => format!("{i}: global {a:#x} {rw}"),
+                Resolved::Image(t) => format!(
+                    "{i}: T# {:#x} format {} {}x{}x{} type {} sw_mode {} levels {}..{} base_array {} dst_sel {:#x} {rw} [{}]",
+                    t.base,
+                    t.format,
+                    t.width,
+                    t.height,
+                    t.depth,
+                    t.ty,
+                    t.sw_mode,
+                    t.base_level,
+                    t.last_level,
+                    t.base_array,
+                    t.dst_sel,
+                    t.raw.iter().map(|w| format!("{w:08x}")).collect::<Vec<_>>().join(" ")
+                ),
+                Resolved::Sampler(w) => format!("{i}: S# {:08x} {:08x} {:08x} {:08x} {rw}", w[0], w[1], w[2], w[3]),
+            }
+        })
+        .collect()
+}
+
 fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32], spec: &mut Spec) -> Result<Prepared, String> {
     // The plan depends only on the program and the user-data layout.
     let plan_key = code_hash ^ (spec.user_sgprs as u64) << 48 ^ (spec.user_base as u64) << 56;
@@ -201,9 +334,15 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
     }
     let mut rd = Reader { reads: Vec::new() };
     let mut resources = Vec::with_capacity(plan.resources.len());
+    let mut res_addrs = Vec::with_capacity(plan.resources.len());
     spec.resources.clear();
     for (i, res) in plan.resources.iter().enumerate() {
         let mut w = [0u32; 8];
+        let src = match res.dwords.first() {
+            Some(Prov::Mem(ptr, off)) => rd.ptr(ptr, user).map(|b| b + *off as u64),
+            _ => None,
+        };
+        res_addrs.push(src);
         for (k, p) in res.dwords.iter().enumerate() {
             w[k] = rd.eval(p, user).ok_or_else(|| format!("{:?} shader {addr:#x}: resource {i} dword {k} unresolvable ({p:?})", spec.stage))?;
         }
@@ -219,7 +358,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
             }
             ResKind::Image => {
                 let t = Tsharp::decode(&w);
-                let dim = ImageDim::from_type(t.ty).ok_or_else(|| format!("{:?} shader {addr:#x}: image resource {i} has type {}", spec.stage, t.ty))?;
+                let dim = ImageDim::from_type(t.ty, t.depth).ok_or_else(|| format!("{:?} shader {addr:#x}: image resource {i} has type {}", spec.stage, t.ty))?;
                 spec.resources.push(ResSpec::Image { dim, class: num_class(t.format) });
                 resources.push(Resolved::Image(t));
             }
@@ -264,5 +403,5 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
         }
     }
     sgpr_data.resize(translate::sgpr_data_dwords(&tr.plan) as usize, 0);
-    Ok(Prepared { stage: spec.stage, addr, insts, tr, resources, sgpr_data, user: user.to_vec(), reads: rd.reads })
+    Ok(Prepared { stage: spec.stage, addr, insts, tr, resources, res_addrs, sgpr_data, user: user.to_vec(), reads: rd.reads })
 }

@@ -60,6 +60,8 @@ pub struct Tsharp {
     pub ty: u32,
     pub depth: u32,
     pub base_array: u32,
+    /// Mip count of the resource - 1 (word5[7:4]).
+    pub max_mip: u32,
     pub raw: [u32; 8],
 }
 
@@ -78,6 +80,7 @@ impl Tsharp {
             ty: bits(w[3], 28, 4),
             depth: bits(w[4], 0, 13) + 1,
             base_array: bits(w[4], 16, 13),
+            max_mip: bits(w[5], 4, 4),
             raw: [w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]],
         }
     }

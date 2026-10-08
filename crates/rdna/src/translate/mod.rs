@@ -39,15 +39,18 @@ pub enum ImageDim {
     D2Array,
     D2Msaa,
     D2MsaaArray,
+    CubeArray,
 }
 
 impl ImageDim {
-    /// From a T# TYPE field (word3[31:28]).
-    pub fn from_type(t: u32) -> Option<ImageDim> {
+    /// From a T# TYPE field (word3[31:28]) and its layer count (cube
+    /// descriptors count faces: more than 6 make a cube array).
+    pub fn from_type(t: u32, layers: u32) -> Option<ImageDim> {
         Some(match t {
             8 => ImageDim::D1,
             9 => ImageDim::D2,
             10 => ImageDim::D3,
+            11 if layers > 6 => ImageDim::CubeArray,
             11 => ImageDim::Cube,
             12 => ImageDim::D1Array,
             13 => ImageDim::D2Array,
@@ -136,6 +139,16 @@ pub const GDS_BYTES: u32 = 64 << 10;
 pub struct Binding {
     pub binding: u32,
     pub kind: BindingKind,
+}
+
+impl Binding {
+    /// Plan resource index of a resource binding.
+    pub fn kind_resource(&self) -> Option<usize> {
+        match self.kind {
+            BindingKind::Buffer(i) | BindingKind::Image(i) | BindingKind::StorageImage(i) | BindingKind::Sampler(i) => Some(i),
+            _ => None,
+        }
+    }
 }
 
 pub struct Output {
@@ -782,6 +795,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
                     ImageDim::D1 | ImageDim::D2 => (spirv::Dim::Dim2D, 0, 0),
                     ImageDim::D3 => (spirv::Dim::Dim3D, 0, 0),
                     ImageDim::Cube => (spirv::Dim::DimCube, 0, 0),
+                    ImageDim::CubeArray => (spirv::Dim::DimCube, 1, 0),
                     ImageDim::D1Array | ImageDim::D2Array => (spirv::Dim::Dim2D, 1, 0),
                     ImageDim::D2Msaa => (spirv::Dim::Dim2D, 0, 1),
                     ImageDim::D2MsaaArray => (spirv::Dim::Dim2D, 1, 1),

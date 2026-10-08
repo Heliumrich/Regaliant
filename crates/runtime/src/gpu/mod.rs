@@ -11,8 +11,11 @@ pub mod capture;
 pub mod cp;
 pub mod desc;
 pub mod exec;
+pub mod images;
 pub mod png;
 pub mod shaders;
+pub mod swizzle_tables;
+pub mod tiling;
 pub mod verify;
 pub mod vk;
 

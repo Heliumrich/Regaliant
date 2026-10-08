@@ -17,6 +17,8 @@ struct Capture {
     text: String,
     shaders: BTreeSet<u64>,
     events: u64,
+    /// Textures referenced in the frame (dumped as PNG when viewable).
+    textures: std::collections::BTreeMap<u64, super::desc::Tsharp>,
 }
 
 static ACTIVE: Mutex<Option<Capture>> = Mutex::new(None);
@@ -47,7 +49,7 @@ pub fn on_flip(flip: u64) {
     let armed = ARMED.load(Ordering::SeqCst);
     if armed != u64::MAX && flip >= armed {
         ARMED.store(u64::MAX, Ordering::SeqCst);
-        *g = Some(Capture { flip, text: format!("# frame after flip {flip}\n"), shaders: BTreeSet::new(), events: 0 });
+        *g = Some(Capture { flip, text: format!("# frame after flip {flip}\n"), shaders: BTreeSet::new(), events: 0, textures: Default::default() });
         crate::info!("capture: recording the frame after flip {flip}");
     }
 }
@@ -69,7 +71,47 @@ fn finish(c: Capture) {
             dumped += 1;
         }
     }
-    crate::info!("capture: {} event(s) -> {} ({dumped} shader binaries in shaders/)", c.events, path.display());
+    let tex = dump_textures(&dir, &c.textures);
+    crate::info!("capture: {} event(s) -> {} ({dumped} shader binaries in shaders/, {tex} texture(s) in textures/)", c.events, path.display());
+}
+
+/// Writes viewable textures (RGBA8/R8/RG8 in standard swizzles) of the frame
+/// as PNG files, detiled with `tiling` (mip 0, slice 0): a visual check of
+/// the swizzle implementation.
+fn dump_textures(dir: &std::path::Path, textures: &std::collections::BTreeMap<u64, super::desc::Tsharp>) -> usize {
+    let tdir = dir.join("textures");
+    let mut n = 0;
+    for (base, t) in textures {
+        if n >= 48 || t.width < 16 || t.height < 16 || !matches!(t.sw_mode, 1 | 5 | 9) {
+            continue;
+        }
+        let (elem_log2, expand): (u32, fn(&[u8]) -> [u8; 4]) = match t.format {
+            56 | 130 => (2, |p| [p[0], p[1], p[2], p[3]]),
+            1 => (0, |p| [p[0], p[0], p[0], 255]),
+            14 => (1, |p| [p[0], p[1], 0, 255]),
+            _ => continue,
+        };
+        let levels = (t.max_mip + 1).max(t.last_level + 1).max(1);
+        let Some(l) = super::tiling::layout(t.sw_mode, elem_log2, t.width, t.height, levels, false) else { continue };
+        let size = l.size(1);
+        if !crate::gpu::cp::guest_readable(*base, size) {
+            continue;
+        }
+        let src = unsafe { std::slice::from_raw_parts(*base as *const u8, size as usize) };
+        let mut lin = Vec::new();
+        l.detile(src, 0, 0, &mut lin);
+        let e = 1usize << elem_log2;
+        let mut rgba = Vec::with_capacity(lin.len() / e * 4);
+        for px in lin.chunks_exact(e) {
+            rgba.extend_from_slice(&expand(px));
+        }
+        let _ = std::fs::create_dir_all(&tdir);
+        let name = format!("{base:010x}_{}x{}_f{}_sw{}_l{levels}.png", t.width, t.height, t.format, t.sw_mode);
+        if std::fs::write(tdir.join(name), super::png::encode(t.width, t.height, &rgba)).is_ok() {
+            n += 1;
+        }
+    }
+    n
 }
 
 /// Fallback size: up to the first s_endpgm (gfx10 0xBF810000), at most 64 KiB.
@@ -101,6 +143,14 @@ fn stage(cp: &Cp, out: &mut String, shaders: &mut BTreeSet<u64>, name: &str, lo:
     let n = (((rsrc2 >> 1) & 0x1F) | (((rsrc2 >> 27) & 1) << 5)).min(32);
     let ud: Vec<String> = (0..n).map(|i| format!("{:08x}", cp.reg(Space::Sh, user + i))).collect();
     let _ = writeln!(out, "    {name} {a:#x} rsrc1 {rsrc1:#010x} rsrc2 {rsrc2:#010x} user[{n}] {}", ud.join(" "));
+}
+
+fn note_textures(map: &mut std::collections::BTreeMap<u64, super::desc::Tsharp>, p: &super::shaders::Prepared) {
+    for r in &p.resources {
+        if let super::shaders::Resolved::Image(t) = r {
+            map.entry(t.base).or_insert(*t);
+        }
+    }
 }
 
 fn f(v: u32) -> f32 {
@@ -150,6 +200,19 @@ pub fn draw(cp: &Cp, what: &str) {
             (mask >> (4 * i)) & 0xF
         );
     }
+    for (name, r) in [("es", super::shaders::prepare_ngg(cp)), ("ps", super::shaders::prepare_ps(cp))] {
+        match r {
+            Ok(p) => {
+                for l in super::shaders::describe_resources(&p) {
+                    let _ = writeln!(s, "      {name} {l}");
+                }
+                note_textures(&mut c.textures, &p);
+            }
+            Err(e) => {
+                let _ = writeln!(s, "      {name} resources unresolved: {e}");
+            }
+        }
+    }
     let zinfo = ctx(0x28040);
     if zinfo & 3 != 0 {
         let _ = writeln!(s, "    depth {:#x} z_info {zinfo:#010x} size {:#x} control {:#x}", (ctx(0x28048) as u64) << 8, ctx(0x2801C), ctx(0x28800));
@@ -191,5 +254,16 @@ pub fn dispatch(cp: &Cp, what: &str) {
         cp.reg(Space::Sh, 0x209) & 0xFFFF
     );
     stage(cp, &mut s, &mut c.shaders, "cs", 0x20C, 0x212, 0x240);
+    match super::shaders::prepare_compute(cp, true) {
+        Ok(p) => {
+            for l in super::shaders::describe_resources(&p) {
+                let _ = writeln!(s, "      {l}");
+            }
+            note_textures(&mut c.textures, &p);
+        }
+        Err(e) => {
+            let _ = writeln!(s, "      resources unresolved: {e}");
+        }
+    }
     c.text.push_str(&s);
 }

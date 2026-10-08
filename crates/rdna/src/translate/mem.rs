@@ -891,13 +891,13 @@ fn coord_count(dim: ImageDim) -> u32 {
     match dim {
         ImageDim::D1 => 1,
         ImageDim::D2 | ImageDim::D1Array => 2,
-        ImageDim::D3 | ImageDim::Cube | ImageDim::D2Array | ImageDim::D2Msaa => 3,
+        ImageDim::D3 | ImageDim::Cube | ImageDim::D2Array | ImageDim::D2Msaa | ImageDim::CubeArray => 3,
         ImageDim::D2MsaaArray => 4,
     }
 }
 
 fn is_array(dim: ImageDim) -> bool {
-    matches!(dim, ImageDim::D1Array | ImageDim::D2Array | ImageDim::D2MsaaArray)
+    matches!(dim, ImageDim::D1Array | ImageDim::D2Array | ImageDim::D2MsaaArray | ImageDim::CubeArray)
 }
 
 /// Address VGPR `k` of an image instruction (NSA or contiguous).
@@ -1090,6 +1090,7 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
             let lod = tr.to_i(lodv)?;
             let (n, sty) = match rdim {
                 ImageDim::D1 | ImageDim::D2 | ImageDim::Cube | ImageDim::D2Msaa => (2, tr.t.v2i),
+                // Cube arrays report (w, h, layers) where layers count cubes.
                 _ => (3, tr.t.v3i),
             };
             let ms = matches!(rdim, ImageDim::D2Msaa | ImageDim::D2MsaaArray);
@@ -1174,13 +1175,27 @@ fn sample(tr: &mut T, ins: &Inst, name: &str, image: Word, img_ty: Word, si: Opt
         cs.push(tr.to_f(v)?);
     }
     let lod_or_clamp = if has_l || has_cl { Some(ad.take(tr)?) } else { None };
-    let cube = matches!(rdim, ImageDim::Cube);
+    let cube = matches!(rdim, ImageDim::Cube | ImageDim::CubeArray);
     let coord = if cube {
         if idim != ImageDim::Cube {
             tr.warn(format!("{:#x}: cube image sampled with dim {:?}", ins.pc, idim));
         }
         let face = cs.get(2).copied().unwrap_or_else(|| tr.f(0.0));
-        cube_dir(tr, cs[0], cs[1], face)?
+        if rdim == ImageDim::CubeArray {
+            // Face coordinate = slice * 8 + face.
+            let k8 = tr.f(8.0);
+            let q = e(tr.b.f_div(f, None, face, k8))?;
+            let slice = tr.glsl1(f, GLOp::Floor, q)?;
+            let s8 = e(tr.b.f_mul(f, None, slice, k8))?;
+            let fc = e(tr.b.f_sub(f, None, face, s8))?;
+            let d = cube_dir(tr, cs[0], cs[1], fc)?;
+            let x = e(tr.b.composite_extract(f, None, d, [0]))?;
+            let y = e(tr.b.composite_extract(f, None, d, [1]))?;
+            let z = e(tr.b.composite_extract(f, None, d, [2]))?;
+            e(tr.b.composite_construct(tr.t.v4f, None, [x, y, z, slice]))?
+        } else {
+            cube_dir(tr, cs[0], cs[1], face)?
+        }
     } else {
         let n_space = match idim {
             ImageDim::D1 | ImageDim::D1Array => 1,

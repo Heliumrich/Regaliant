@@ -23,6 +23,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub static EXECUTED: AtomicU64 = AtomicU64::new(0);
+/// The Vulkan device was lost: GPU execution stops (reported once).
+pub static DEVICE_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `DS_GPU_SYNC=1`: complete every dispatch before the next (diagnosis of
+/// device losses: the failing dispatch is named).
+fn sync_mode() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_GPU_SYNC").ok().as_deref() == Some("1"))
+}
 pub static SKIPPED: AtomicU64 = AtomicU64::new(0);
 pub static FLUSHES: AtomicU64 = AtomicU64::new(0);
 /// Time the completion thread spent waiting for fences / running actions (ns).
@@ -427,12 +436,15 @@ fn completion_thread() {
                 BATCHES_CV.wait(&mut q);
             }
         };
-        if b.fence != vk::Fence::null() {
+        if b.fence != vk::Fence::null() && !DEVICE_LOST.load(Ordering::Relaxed) {
             let tf = std::time::Instant::now();
             let r = unsafe { ctx().device.wait_for_fences(&[b.fence], true, 10_000_000_000) };
             FENCE_NS.fetch_add(tf.elapsed().as_nanos() as u64, Ordering::Relaxed);
             if let Err(e) = r {
-                crate::error!("gpu[{}]: waiting for GPU work: {e} (GPU hang or device lost)", b.name);
+                if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
+                    let list: Vec<String> = b.shaders.iter().map(|a| format!("{a:#x}")).collect();
+                    crate::error!("gpu[{}]: waiting for GPU work: {e}; GPU execution stops (batch shaders: {})", b.name, list.join(" "));
+                }
             }
             FLUSHES.fetch_add(1, Ordering::Relaxed);
             collect_timestamps(b.queries, &b.shaders);
@@ -658,8 +670,13 @@ impl Exec {
         let has_actions = !actions.is_empty();
         let name = self.name.clone();
         let seq = push_batch(fence, self.slots[i].queries, actions, std::mem::take(&mut self.checks), std::mem::take(&mut self.batch_shaders), &self.name, || {
+            if DEVICE_LOST.load(Ordering::Relaxed) {
+                return;
+            }
             if let Err(e) = c.submit(cmd, &[], &[], fence) {
-                crate::error!("gpu[{name}]: {e}");
+                if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
+                    crate::error!("gpu[{name}]: {e}; GPU execution stops");
+                }
             }
         });
         self.slots[i].seq = seq;
@@ -743,9 +760,19 @@ impl Exec {
 
     /// Executes a dispatch of `groups` thread groups with the compute state of `cp`.
     pub fn dispatch(&mut self, cp: &Cp, groups: [u32; 3], initiator: u32) {
+        if DEVICE_LOST.load(Ordering::Relaxed) {
+            SKIPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if let Err(e) = self.dispatch_inner(cp, groups, initiator) {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             self.report(e);
+        } else if sync_mode() {
+            self.flush();
+            if DEVICE_LOST.load(Ordering::Relaxed) {
+                let cs = ((cp.reg(Space::Sh, 0x20C) as u64) | ((cp.reg(Space::Sh, 0x20D) as u64 & 0xFF) << 32)) << 8;
+                crate::error!("gpu[{}]: device lost by the dispatch of cs {cs:#x} ({}x{}x{} groups)", self.name, groups[0], groups[1], groups[2]);
+            }
         }
     }
 
@@ -757,8 +784,17 @@ impl Exec {
             self.flush();
             p = shaders::prepare_compute(cp, wave64)?;
         }
-        if p.resources.iter().any(|r| matches!(r, Resolved::Image(_) | Resolved::Sampler(_))) {
-            return Err(format!("cs {:#x}: image resources are not supported yet (dispatch skipped)", p.addr));
+        // Textures are uploaded from guest memory: earlier GPU writes first.
+        let tex_ranges: Vec<(u64, u64)> = p
+            .resources
+            .iter()
+            .filter_map(|r| match r {
+                Resolved::Image(t) => Some((t.base, (t.width as u64 * t.height as u64 * t.depth.max(1) as u64 * 16).min(1 << 30))),
+                _ => None,
+            })
+            .collect();
+        if self.overlaps_pending(&tex_ranges) {
+            self.flush();
         }
         let local = [cp.reg(Space::Sh, 0x207) & 0xFFFF, cp.reg(Space::Sh, 0x208) & 0xFFFF, cp.reg(Space::Sh, 0x209) & 0xFFFF];
         if initiator & (1 << 5) != 0 {
@@ -822,6 +858,25 @@ impl Exec {
                 }
             }
         }
+        // Images and samplers.
+        let frame = super::FRAMES.load(Ordering::Relaxed);
+        let mut img_infos: Vec<(u32, vk::DescriptorType, vk::DescriptorImageInfo)> = Vec::new();
+        for b in &p.tr.out.bindings {
+            match (b.kind, b.kind_resource().and_then(|i| p.resources.get(i))) {
+                (BindingKind::Image(_) | BindingKind::StorageImage(_), Some(Resolved::Image(t))) => {
+                    let storage = matches!(b.kind, BindingKind::StorageImage(_));
+                    let view = super::images::with(|im| im.view(t, storage, frame))?;
+                    let ty = if storage { vk::DescriptorType::STORAGE_IMAGE } else { vk::DescriptorType::SAMPLED_IMAGE };
+                    img_infos.push((b.binding, ty, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }));
+                }
+                (BindingKind::Sampler(_), Some(Resolved::Sampler(sm))) => {
+                    let smp = super::images::with(|im| im.sampler(*sm))?;
+                    img_infos.push((b.binding, vk::DescriptorType::SAMPLER, vk::DescriptorImageInfo { sampler: smp, image_view: vk::ImageView::null(), image_layout: vk::ImageLayout::UNDEFINED }));
+                }
+                (BindingKind::Image(_) | BindingKind::StorageImage(_) | BindingKind::Sampler(_), _) => return Err("binding/resource mismatch".into()),
+                _ => {}
+            }
+        }
         let t_bind = t0.elapsed();
         // The slot must be free before its ring segment is written.
         self.begin();
@@ -862,10 +917,13 @@ impl Exec {
                 unsafe { c.device.allocate_descriptor_sets(&ai.descriptor_pool(self.slots[self.cur].desc_pool)) }.map_err(|e| format!("descriptor set: {e}"))?[0]
             }
         };
-        let writes: Vec<vk::WriteDescriptorSet> = buf_infos
+        let mut writes: Vec<vk::WriteDescriptorSet> = buf_infos
             .iter()
             .map(|(binding, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
             .collect();
+        for (binding, ty, info) in &img_infos {
+            writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(*ty).image_info(std::slice::from_ref(info)));
+        }
         let start = [cp.reg(Space::Sh, 0x204), cp.reg(Space::Sh, 0x205), cp.reg(Space::Sh, 0x206)];
         unsafe {
             c.device.update_descriptor_sets(&writes, &[]);

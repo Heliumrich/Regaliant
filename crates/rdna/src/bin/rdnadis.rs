@@ -14,6 +14,28 @@ fn main() {
         }
         std::process::exit(translate_capture(&files[1], &files[2]));
     }
+    // --plan <file> [user sgprs] [user base]: resources and scalar loads with provenance.
+    if files.first().is_some_and(|f| f == "--plan") && files.len() >= 2 {
+        let bytes = std::fs::read(&files[1]).expect("read shader");
+        let code: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let insts = rdna::decode_program(&code).expect("decode");
+        let users: u16 = files.get(2).and_then(|x| x.parse().ok()).unwrap_or(32);
+        let base: u16 = files.get(3).and_then(|x| x.parse().ok()).unwrap_or(0);
+        let plan = rdna::analysis::analyze(&insts, users, base, 0);
+        for (i, r) in plan.resources.iter().enumerate() {
+            println!("resource {i}: {:?} read {} written {}", r.kind, r.read, r.written);
+            for (k, d) in r.dwords.iter().enumerate() {
+                println!("    dword {k}: {d:?}");
+            }
+        }
+        for (i, l) in plan.loads.iter().enumerate() {
+            println!("load {i}: {:?} + {:#x} x{}", l.ptr, l.offset, l.dwords);
+        }
+        for e in &plan.errors {
+            println!("error: {e}");
+        }
+        return;
+    }
     // --analyze: descriptor/scalar-load provenance per file (32 user SGPRs assumed).
     let analyze = files.first().is_some_and(|f| f == "--analyze");
     if analyze {
