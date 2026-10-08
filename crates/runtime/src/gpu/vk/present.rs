@@ -26,6 +26,13 @@ unsafe impl Send for Presenter {}
 
 static PRESENTER: Mutex<Option<Presenter>> = Mutex::new(None);
 
+/// `DS_WINDOW_SHOT=<n,...>`: presented frame numbers whose swapchain image is
+/// read back to `window-<n>.png` (what the window shows, after scaling).
+fn window_shot(frame: usize) -> bool {
+    static LIST: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| std::env::var("DS_WINDOW_SHOT").map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default()).contains(&frame)
+}
+
 pub enum Source {
     /// An image in TRANSFER_SRC_OPTIMAL-compatible state; `layout` is its current layout.
     Image { image: vk::Image, layout: vk::ImageLayout, width: u32, height: u32 },
@@ -66,7 +73,7 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
             .image_color_space(fmt.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT | (caps.supported_usage_flags & vk::ImageUsageFlags::TRANSFER_SRC))
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -208,12 +215,49 @@ pub fn present(src: Source) -> bool {
         if src_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL && src_layout != vk::ImageLayout::GENERAL && src_img != vk::Image::null() {
             barrier(c, cmd, src_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, src_layout);
         }
-        barrier(c, cmd, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR);
+        // Window shot: copy the swapchain image to a host buffer.
+        let shot = if window_shot(p.frame) {
+            let (w, h) = (p.extent.width, p.extent.height);
+            match c.host_buffer(w as u64 * h as u64 * 4, vk::BufferUsageFlags::TRANSFER_DST) {
+                Ok((buf, mem, ptr)) => {
+                    barrier(c, cmd, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+                    let region = vk::BufferImageCopy::default()
+                        .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 })
+                        .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
+                    c.device.cmd_copy_image_to_buffer(cmd, dst, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buf, &[region]);
+                    barrier(c, cmd, dst, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR);
+                    Some((buf, mem, ptr, w, h))
+                }
+                Err(e) => {
+                    crate::warn!("window shot: {e}");
+                    barrier(c, cmd, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR);
+                    None
+                }
+            }
+        } else {
+            barrier(c, cmd, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR);
+            None
+        };
         c.device.end_command_buffer(cmd).ok();
         let done = p.done[idx as usize];
         if let Err(e) = c.submit(cmd, &[(p.acquire[f], vk::PipelineStageFlags::TRANSFER)], &[done], p.fences[f]) {
             crate::error!("{e}");
             return false;
+        }
+        if let Some((buf, mem, ptr, w, h)) = shot {
+            c.device.wait_for_fences(&[p.fences[f]], true, 5_000_000_000).ok();
+            let raw = std::slice::from_raw_parts(ptr, (w * h * 4) as usize).to_vec();
+            if let Some(rgba) = crate::gpu::images::to_rgba8(p.format, &raw) {
+                if let Some(dir) = crate::run_dir() {
+                    let path = dir.join(format!("window-{}.png", p.frame));
+                    if std::fs::write(&path, crate::gpu::png::encode(w, h, &rgba)).is_ok() {
+                        crate::info!("window shot of presented frame {}: {}", p.frame, path.display());
+                    }
+                }
+            }
+            c.device.destroy_buffer(buf, None);
+            c.device.unmap_memory(mem);
+            c.device.free_memory(mem, None);
         }
         let scs = [p.swapchain];
         let idxs = [idx];
