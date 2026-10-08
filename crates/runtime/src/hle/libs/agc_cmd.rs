@@ -156,7 +156,10 @@ fn marker_payload(color: u32, s: &str) -> Vec<u32> {
 }
 
 fn marker(cb: u64, compute: bool, operation: u32, s: *const u8, color: u32) -> u64 {
-    let text = if s.is_null() { String::new() } else { unsafe { cstr(s) }.chars().take(255).collect() };
+    let text: String = if s.is_null() { String::new() } else { unsafe { cstr(s) }.chars().take(255).collect() };
+    if text == "BinkGPU" && std::env::var("DS_TRACE_SUBMIT").ok().as_deref() == Some("1") {
+        crate::info!("bink build: cb {cb:#x} by {}", crate::exception::current_guest_frames(10).join(" <- "));
+    }
     private(cb, compute, operation, &marker_payload(color, &text))
 }
 

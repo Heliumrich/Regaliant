@@ -61,6 +61,17 @@ pub fn sample_thread(host_tid: u32, depth: usize) -> Option<String> {
 #[repr(C, align(16))]
 struct AlignedContext(CONTEXT);
 
+/// Guest frames of the calling thread (for diagnostics in HLE functions):
+/// the first is the guest call site of the HLE function.
+pub fn current_guest_frames(depth: usize) -> Vec<String> {
+    use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureContext;
+    let mut c: AlignedContext = unsafe { std::mem::zeroed() };
+    unsafe { RtlCaptureContext(&mut c.0) };
+    let (mut host, mut guest) = ([0u64; 64], [0u64; 32]);
+    let (_, ng) = unsafe { unwind(&mut c, &mut host, &mut guest[..depth.min(32)]) };
+    guest[..ng].iter().map(|&a| describe(a)).collect()
+}
+
 pub fn readable(a: u64) -> bool {
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
     if a < 0x10000 {
