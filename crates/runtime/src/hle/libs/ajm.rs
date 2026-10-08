@@ -137,6 +137,10 @@ struct Instance {
     gapless_total: u32,
     gapless_skip: u32,
     skipped: u32,
+    /// Control operations received (diagnostics, first 8).
+    ops: Vec<u32>,
+    /// A decode on this instance was reported as not initialized.
+    reported: bool,
 }
 
 impl Drop for Instance {
@@ -369,8 +373,22 @@ unsafe fn decode(inst: &mut Instance, input: &[u8], out_cap: usize, multiple: bo
                     let msg = if inst.codec == CODEC_AAC { "ajm: AAC decode job failed (AAC decoding not implemented)" } else { "ajm: Opus decode job failed (Opus decoding not implemented)" };
                     crate::hle::stub_log(msg, RESULT_CODEC_ERROR as i64);
                     o.result |= RESULT_CODEC_ERROR;
+                } else if inst.parse_riff && input.len() == o.consumed {
+                    // Waiting for the RIFF header with no input: nothing to
+                    // do. Failing these jobs (as "not initialized") made the
+                    // title retry them ~370 times a second; reporting partial
+                    // input stalled its mixer (no audio in Outpost Passage).
                 } else {
                     o.result |= RESULT_NOT_INITIALIZED;
+                    static NOTED: AtomicU32 = AtomicU32::new(0);
+                    if !inst.reported && NOTED.fetch_add(1, Ordering::Relaxed) < 8 {
+                        inst.reported = true;
+                        let head: Vec<String> = input.iter().take(16).map(|b| format!("{b:02x}")).collect();
+                        crate::warn!(
+                            "ajm: decode on an uninitialized {} instance (riff {}, control ops {:?}, input {} bytes: {})",
+                            codec_name(inst.codec), inst.parse_riff, inst.ops, input.len(), head.join("")
+                        );
+                    }
                 }
                 break;
             }
@@ -538,6 +556,9 @@ unsafe fn control_job(p: u64) {
         let (a, b, result) = (*q, *q.add(1), *q.add(2));
         let r = with_instances(|m| {
             let Some(inst) = m.get_mut(&instance) else { return RESULT_INVALID_PARAMETER };
+            if inst.ops.len() < 8 {
+                inst.ops.push(op);
+            }
             match op {
                 OP_INIT => match inst.codec {
                     CODEC_AT9 => {
@@ -547,7 +568,26 @@ unsafe fn control_job(p: u64) {
                         }
                         let mut cfg = [0u8; 4];
                         std::ptr::copy_nonoverlapping(a as *const u8, cfg.as_mut_ptr(), 4);
-                        if init_at9(inst, cfg) { 0 } else { RESULT_INVALID_PARAMETER }
+                        if init_at9(inst, cfg) {
+                            0
+                        } else if inst.parse_riff && cfg[0] != 0xFE {
+                            // RIFF-fed instances get their configuration from
+                            // the .at9 header of the first input; the title
+                            // initializes some with parameters that carry no
+                            // config data ({u32 0x7ec17330, u32 0} in Outpost
+                            // Passage). Reset and wait for the header.
+                            inst.decoder = Decoder::None;
+                            inst.total_decoded = 0;
+                            inst.skipped = 0;
+                            0
+                        } else {
+                            static BAD: AtomicU32 = AtomicU32::new(0);
+                            if BAD.fetch_add(1, Ordering::Relaxed) < 4 {
+                                let raw: Vec<String> = (0..32).map(|i| format!("{:02x}", *((a + i) as *const u8))).collect();
+                                crate::warn!("ajm: instance {instance}: ATRAC9 init rejected config {:02x?} (parameters at {a:#x}: {}; b {b:#x})", cfg, raw.join(""));
+                            }
+                            RESULT_INVALID_PARAMETER
+                        }
                     }
                     CODEC_MP3 => {
                         if matches!(inst.decoder, Decoder::None) {
@@ -633,6 +673,8 @@ sysv! {
             gapless_total: 0,
             gapless_skip: 0,
             skipped: 0,
+            ops: Vec::new(),
+            reported: false,
         };
         with_instances(|m| m.insert(id, inst));
         *out = id;
