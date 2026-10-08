@@ -279,6 +279,20 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
                     st.set(d + 1, Prov::PtrHi(Ptr::Abs(pc), 0));
                 }
                 "s_mov_b32" => st.set(d, src_operand(st, ins, s)),
+                "s_not_b32" => {
+                    let v = match src_operand(st, ins, s) {
+                        Prov::Const(x) => Prov::Const(!x),
+                        _ => Prov::Unknown,
+                    };
+                    st.set(d, v);
+                }
+                "s_brev_b32" => {
+                    let v = match src_operand(st, ins, s) {
+                        Prov::Const(x) => Prov::Const(x.reverse_bits()),
+                        _ => Prov::Unknown,
+                    };
+                    st.set(d, v);
+                }
                 "s_mov_b64" => {
                     st.set(d, src_operand(st, ins, s));
                     let hi = if s < 128 { st.get(s + 1) } else { Prov::Const(0) };
@@ -314,10 +328,27 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
                     }
                 }
                 ("s_add_i32", Prov::Const(x), Prov::Const(y)) => Prov::Const(x.wrapping_add(*y)),
+                ("s_sub_u32" | "s_sub_i32", Prov::Const(x), Prov::Const(y)) => Prov::Const(x.wrapping_sub(*y)),
                 ("s_and_b32", Prov::Const(x), Prov::Const(y)) => Prov::Const(x & y),
                 ("s_or_b32", Prov::Const(x), Prov::Const(y)) => Prov::Const(x | y),
+                ("s_xor_b32", Prov::Const(x), Prov::Const(y)) => Prov::Const(x ^ y),
+                ("s_andn2_b32", Prov::Const(x), Prov::Const(y)) => Prov::Const(x & !y),
+                ("s_orn2_b32", Prov::Const(x), Prov::Const(y)) => Prov::Const(x | !y),
                 ("s_mul_i32", Prov::Const(x), Prov::Const(y)) => Prov::Const(x.wrapping_mul(*y)),
                 ("s_lshl_b32", Prov::Const(x), Prov::Const(y)) => Prov::Const(x << (y & 31)),
+                ("s_lshr_b32", Prov::Const(x), Prov::Const(y)) => Prov::Const(x >> (y & 31)),
+                ("s_ashr_i32", Prov::Const(x), Prov::Const(y)) => Prov::Const(((*x as i32) >> (y & 31)) as u32),
+                // Bitfield mask: ((1 << size) - 1) << offset.
+                ("s_bfm_b32", Prov::Const(x), Prov::Const(y)) => Prov::Const((((1u64 << (x & 31)) - 1) as u32) << (y & 31)),
+                ("s_bfe_u32", Prov::Const(x), Prov::Const(y)) => {
+                    let (off, w) = (y & 31, (y >> 16) & 0x7F);
+                    Prov::Const(if w == 0 { 0 } else { (((*x as u64) >> off) & ((1u64 << w.min(32)) - 1)) as u32 })
+                }
+                ("s_lshl1_add_u32", Prov::Const(x), Prov::Const(y)) => Prov::Const((x << 1).wrapping_add(*y)),
+                ("s_lshl2_add_u32", Prov::Const(x), Prov::Const(y)) => Prov::Const((x << 2).wrapping_add(*y)),
+                ("s_lshl3_add_u32", Prov::Const(x), Prov::Const(y)) => Prov::Const((x << 3).wrapping_add(*y)),
+                ("s_lshl4_add_u32", Prov::Const(x), Prov::Const(y)) => Prov::Const((x << 4).wrapping_add(*y)),
+                ("s_pack_ll_b32_b16", Prov::Const(x), Prov::Const(y)) => Prov::Const((x & 0xFFFF) | (y << 16)),
                 // s_and_b32 hi, ptr_hi, 0xffff (address masking keeps the pointer)
                 ("s_and_b32", Prov::PtrHi(p, bias), Prov::Const(0xFFFF)) => Prov::PtrHi(p.clone(), *bias),
                 _ => Prov::Unknown,

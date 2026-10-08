@@ -5,6 +5,7 @@
 
 pub mod analysis;
 pub mod capture;
+pub mod emu;
 pub mod format;
 pub mod translate;
 pub mod tables;

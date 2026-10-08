@@ -73,6 +73,7 @@ pub fn stage_inputs(tr: &mut T) -> R<()> {
                 tr.set_vreg_raw(k, c)?;
             }
             let w = e(tr.b.load(tr.t.v3u, None, wid, None, []))?;
+            tr.wg_id = Some(w);
             let mut s = tr.spec.user_base as u32 + tr.spec.user_sgprs as u32;
             for k in 0..3 {
                 if tr.spec.cs_rsrc2 & (1 << (7 + k)) != 0 {
@@ -747,7 +748,7 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, var: Word, addr: Word, fmt: u1
         let n = comps.len() as u32;
         let mut vals = Vec::new();
         for k in 0..n {
-            vals.push(tr.vreg(vd + k)?);
+            vals.push(tr.store_vreg(vd + k)?);
         }
         let act = tr.active()?;
         return tr.guarded(act, &mut |tr| store_formatted(tr, var, addr, &vals, fmt));
@@ -822,7 +823,7 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, var: Word, addr: Word, fmt: u1
                     };
                     let mut vals = Vec::new();
                     for k in 0..n {
-                        vals.push(tr.vreg(vd + k)?);
+                        vals.push(tr.store_vreg(vd + k)?);
                     }
                     store_dwords(tr, var, addr, &vals)?;
                 }
@@ -1015,10 +1016,12 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
     };
     let image = e(tr.b.load(img_ty, None, var, None, []))?;
     // Writes dmask-selected components of a vec4 result to consecutive VGPRs.
+    // Gathers return four texels (four VGPRs) of the component dmask selects.
+    let out_mask = if name.starts_with("image_gather4") { 0xF } else { dmask };
     let write_result = |tr: &mut T, res: Word| -> R<()> {
         let mut k = 0;
         for c in 0..4 {
-            if dmask & (1 << c) != 0 {
+            if out_mask & (1 << c) != 0 {
                 let x = e(tr.b.composite_extract(comp_ty, None, res, [c]))?;
                 let xu = tr.to_u(x)?;
                 tr.set_vreg(vd + k, xu)?;
@@ -1071,7 +1074,7 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
             let mut k = 0;
             for c in 0..4 {
                 let v = if dmask & (1 << c) != 0 {
-                    let x = tr.vreg(vd + k)?;
+                    let x = tr.store_vreg(vd + k)?;
                     k += 1;
                     x
                 } else {
@@ -1699,6 +1702,7 @@ pub fn ds(tr: &mut T, ins: &Inst) -> R<()> {
         tr.warn(format!("{:#x}: {name} without LDS", ins.pc));
         return Ok(());
     };
+    tr.lds_order(ins.pc, !name.starts_with("ds_read"))?;
     let p_wg = tr.b.type_pointer(None, StorageClass::Workgroup, u);
     let mut addr = tr.vreg(ins.ds_addr() as u32)?;
     if name.ends_with("_addtid_b32") {

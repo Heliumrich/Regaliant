@@ -243,6 +243,15 @@ pub fn to_rgba8(format: vk::Format, raw: &[u8]) -> Option<Vec<u8>> {
             .flat_map(|p| [unit(half_to_f32(u16::from_le_bytes([p[0], p[1]]))), unit(half_to_f32(u16::from_le_bytes([p[2], p[3]]))), 0, 255])
             .collect(),
         F::R32_UINT => raw.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+        F::R8_UINT => raw.iter().flat_map(|&v| [v, v, v, 255]).collect(),
+        F::R8G8_UINT | F::R8G8_UNORM => raw.chunks_exact(2).flat_map(|p| [p[0], p[1], 0, 255]).collect(),
+        F::R16_SFLOAT => raw
+            .chunks_exact(2)
+            .flat_map(|p| {
+                let v = unit(half_to_f32(u16::from_le_bytes([p[0], p[1]])));
+                [v, v, v, 255]
+            })
+            .collect(),
         _ => return None,
     })
 }
@@ -714,6 +723,14 @@ impl Images {
             self.to_general(image, key.format);
             self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0 });
             crate::info!("images: new render target {:#x} {}x{} {:?} at flip {}", key.base, key.width, key.height, key.format, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
+            // DS_CAPTURE_NEW_RT=<hex base>: capture the frame after a render
+            // target at or above that address is created.
+            static TRIGGER: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+            if let Some(t) = *TRIGGER.get_or_init(|| std::env::var("DS_CAPTURE_NEW_RT").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())) {
+                if key.base >= t {
+                    super::capture::arm_next();
+                }
+            }
             key
         };
         let img = self.map.get_mut(&k).unwrap();
@@ -796,7 +813,7 @@ impl Images {
         keys.sort_by_key(|k| (k.base, k.format.as_raw()));
         let _ = std::fs::create_dir_all(dir);
         let mut n = 0;
-        for k in keys.into_iter().take(64) {
+        for k in keys.into_iter().take(256) {
             let image = self.map[&k].image;
             let Ok(raw) = self.read_back(image, k.format, k.width, k.height) else { continue };
             let Some(rgba) = to_rgba8(k.format, &raw) else { continue };
@@ -806,6 +823,35 @@ impl Images {
             }
         }
         n
+    }
+
+    /// Whether a T# resolves to an image the GPU owns (written by GPU work;
+    /// never re-uploaded from guest memory).
+    pub fn gpu_owned(&self, t: &Tsharp) -> bool {
+        let Some(key) = Self::key_of(t) else { return false };
+        match self.map.get(&key) {
+            Some(i) => i.gpu_written,
+            None => self.alias(&key, true).is_some(),
+        }
+    }
+
+    /// The cached image a T# resolves to (mip 0, layer 0): raw texels in its
+    /// Vulkan format, width, height and bytes per texel (diagnostics).
+    pub fn snapshot_raw(&mut self, t: &Tsharp) -> Result<(Vec<u8>, u32, u32, u32), String> {
+        let key = Self::key_of(t).ok_or("unsupported format")?;
+        let key = if self.map.contains_key(&key) { key } else { self.alias(&key, false).ok_or("not cached")? };
+        let image = self.map[&key].image;
+        let raw = self.read_back(image, key.format, key.width, key.height)?;
+        Ok((raw, key.width, key.height, texel_bytes(key.format)))
+    }
+
+    /// The cached image a T# resolves to (mip 0, layer 0) as RGBA8 (captures).
+    pub fn snapshot(&mut self, t: &Tsharp) -> Result<(Vec<u8>, u32, u32), String> {
+        let key = Self::key_of(t).ok_or("unsupported format")?;
+        let key = if self.map.contains_key(&key) { key } else { self.alias(&key, false).ok_or("not cached")? };
+        let image = self.map[&key].image;
+        let raw = self.read_back(image, key.format, key.width, key.height)?;
+        Ok((to_rgba8(key.format, &raw).ok_or("format")?, key.width, key.height))
     }
 
     /// Which cached image a T# resolves to now (frame captures).

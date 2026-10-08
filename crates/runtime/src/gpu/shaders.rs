@@ -60,7 +60,7 @@ fn code_slice(addr: u64) -> Option<&'static [u32]> {
 }
 
 /// Decodes (and caches) the program at `addr`; returns it and its hash.
-fn program(addr: u64) -> Result<(Arc<Vec<rdna::Inst>>, u64), String> {
+pub(crate) fn program(addr: u64) -> Result<(Arc<Vec<rdna::Inst>>, u64), String> {
     let code = code_slice(addr).ok_or_else(|| format!("shader {addr:#x} not mapped"))?;
     let mut g = PROGRAMS.lock();
     let map = g.get_or_insert_with(HashMap::new);
@@ -179,7 +179,8 @@ pub fn prepare_compute(cp: &Cp, wave64: bool) -> Result<Prepared, String> {
         cs_rsrc2: rsrc2,
         resources: Vec::new(),
         binding_base: 0,
-        probe: None,
+        probe: probe_for(addr),
+        dump: dump_for(addr),
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
 }
@@ -240,24 +241,55 @@ pub fn prepare_ps(cp: &Cp) -> Result<Prepared, String> {
         resources: Vec::new(),
         binding_base: PS_BINDING_BASE,
         probe: probe_for(addr),
+        dump: None,
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
 }
 
 /// `DS_PROBE=<shader address>:<pc>:<vgpr>` (hex address and pc, decimal
 /// VGPR): that pixel shader exports the VGPR's value after the instruction
-/// at pc as its color (debugging).
-fn probe_for(addr: u64) -> Option<(u32, u32)> {
-    static P: std::sync::OnceLock<Option<(u64, u32, u32)>> = std::sync::OnceLock::new();
+/// at pc as its color, or that compute shader stores it as the data of its
+/// image stores (debugging). An optional fourth field `:<n>` starts probing
+/// in the n-th frame (0-based) that uses the shader, e.g. to keep a
+/// reference frame intact.
+pub(crate) fn probe_for(addr: u64) -> Option<(u32, u32)> {
+    static P: std::sync::OnceLock<Option<(u64, u32, u32, u32)>> = std::sync::OnceLock::new();
+    static USES: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((u64::MAX, 0));
     let p = P.get_or_init(|| {
         let v = std::env::var("DS_PROBE").ok()?;
         let mut it = v.split(':');
         let a = u64::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
         let pc = u32::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
         let vg = it.next()?.parse().ok()?;
-        Some((a, pc, vg))
+        let from = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        Some((a, pc, vg, from))
     });
-    p.and_then(|(a, pc, vg)| (a == addr).then_some((pc, vg)))
+    let (a, pc, vg, from) = (*p)?;
+    if a != addr {
+        return None;
+    }
+    let mut u = USES.lock().unwrap();
+    let flip = super::capture::flips();
+    if u.0 != flip {
+        *u = (flip, u.1 + 1);
+    }
+    (u.1 > from).then_some((pc, vg))
+}
+
+/// `DS_DUMP=<shader>:<pc>:<x>,<y>,<z>` (hex shader address and pc, decimal
+/// workgroup id): that compute shader's workgroup dumps its registers after
+/// the instruction at pc (`DS_EMU_CHECK` compares them with the interpreter).
+pub(crate) fn dump_for(addr: u64) -> Option<(u32, [u32; 3])> {
+    static D: std::sync::OnceLock<Option<(u64, u32, [u32; 3])>> = std::sync::OnceLock::new();
+    let d = D.get_or_init(|| {
+        let v = std::env::var("DS_DUMP").ok()?;
+        let mut it = v.split(':');
+        let a = u64::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
+        let pc = u32::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
+        let g: Vec<u32> = it.next()?.split(',').filter_map(|x| x.parse().ok()).collect();
+        Some((a, pc, [g.first().copied().unwrap_or(0), g.get(1).copied().unwrap_or(0), g.get(2).copied().unwrap_or(0)]))
+    });
+    d.and_then(|(a, pc, g)| (a == addr).then_some((pc, g)))
 }
 
 /// Binding numbers of the pixel stage start here (vertex stage from 0).
@@ -293,6 +325,7 @@ pub fn prepare_ngg(cp: &Cp) -> Result<Prepared, String> {
         resources: Vec::new(),
         binding_base: 0,
         probe: None,
+        dump: None,
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
 }

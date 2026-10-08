@@ -552,10 +552,66 @@ unsafe fn handle_single_step(ctx: &mut CONTEXT) -> bool {
     true
 }
 
+/// Pages watched for CPU writes (diagnostics, `DS_RACE_WATCH`): (page, old
+/// protection); the first write to each is recorded with its guest stack.
+static RACE_PAGES: parking_lot::Mutex<Vec<(u64, u32)>> = parking_lot::Mutex::new(Vec::new());
+static RACE_HITS: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+static RACE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Write-protects [addr, addr+len) until the first CPU write to each page.
+pub fn race_watch(addr: u64, len: u64) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    let mut g = RACE_PAGES.lock();
+    RACE_ACTIVE.store(true, Ordering::SeqCst);
+    let mut p = addr & !0xFFF;
+    while p < addr + len {
+        let mut old = 0u32;
+        if unsafe { VirtualProtect(p as *mut _, 4096, PAGE_READONLY, &mut old) } != 0 {
+            g.push((p, old));
+        }
+        p += 4096;
+    }
+}
+
+/// Restores the watched pages; returns the writes recorded so far.
+pub fn race_unwatch() -> Vec<String> {
+    use windows_sys::Win32::System::Memory::VirtualProtect;
+    let mut g = RACE_PAGES.lock();
+    for (p, old) in g.drain(..) {
+        let mut tmp = 0u32;
+        unsafe { VirtualProtect(p as *mut _, 4096, old, &mut tmp) };
+    }
+    std::mem::take(&mut *RACE_HITS.lock())
+}
+
+fn race_fault(addr: u64, ctx: &CONTEXT) -> bool {
+    use windows_sys::Win32::System::Memory::VirtualProtect;
+    if !RACE_ACTIVE.load(Ordering::Relaxed) {
+        return false;
+    }
+    let page = addr & !0xFFF;
+    let mut g = RACE_PAGES.lock();
+    let Some(i) = g.iter().position(|x| x.0 == page) else { return false };
+    let (p, old) = g.remove(i);
+    drop(g);
+    let mut tmp = 0u32;
+    unsafe { VirtualProtect(p as *mut _, 4096, old, &mut tmp) };
+    let mut c: AlignedContext = unsafe { std::mem::zeroed() };
+    c.0 = *ctx;
+    let (mut host, mut guest) = ([0u64; 4], [0u64; 12]);
+    let (_, ng) = unsafe { unwind(&mut c, &mut host, &mut guest) };
+    let frames: Vec<String> = guest[..ng].iter().map(|&a| describe(a)).collect();
+    crate::warn!("race watch: write to {addr:#x} by '{}': {}", crate::log::thread_name(), frames.join(" <- "));
+    true
+}
+
 unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
     unsafe {
         let rec = &*(*info).ExceptionRecord;
         let code = rec.ExceptionCode as u32;
+        if code == 0xC0000005 && rec.NumberParameters >= 2 && rec.ExceptionInformation[0] == 1 && race_fault(rec.ExceptionInformation[1] as u64, &*(*info).ContextRecord) {
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
         // A CPU write to a write-tracked guest page (texture cache).
         if code == 0xC0000005 && rec.NumberParameters >= 2 && rec.ExceptionInformation[0] == 1 && crate::gpu::track::on_write_fault(rec.ExceptionInformation[1] as u64) {
             return -1; // EXCEPTION_CONTINUE_EXECUTION

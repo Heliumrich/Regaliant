@@ -76,6 +76,9 @@ pub struct Cp {
     /// Opcode of the packet being executed (private packets: 0x100 + op).
     cur_opcode: u32,
     waiting_on: u64,
+    /// Set while the CP polls memory (WAIT_REG_MEM): submitters must not
+    /// wait for this queue then (the label may come from them).
+    pub wait_flag: Option<&'static std::sync::atomic::AtomicBool>,
     unknown_seen: HashSet<u32>,
     notes_seen: HashSet<&'static str>,
     depth: u32,
@@ -119,6 +122,34 @@ pub fn gpu_clock() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let s = START.get_or_init(Instant::now);
     (s.elapsed().as_nanos() / 10) as u64
+}
+
+/// Command buffers up to this size are copied when execution starts.
+const FETCH_DWORDS: u32 = 512;
+
+/// A command buffer as the CP fetched it (see `Cp::run`): small buffers are
+/// copied, larger ones read from guest memory.
+struct Fetched {
+    base: u64,
+    words: Vec<u32>,
+}
+
+impl Fetched {
+    fn new(base: u64, size: u32) -> Fetched {
+        let n = size as usize;
+        let words = if size > 0 && size <= FETCH_DWORDS && valid(base, 4 * n as u64) { unsafe { std::slice::from_raw_parts(base as *const u32, n) }.to_vec() } else { Vec::new() };
+        Fetched { base, words }
+    }
+
+    /// The dword at `a`: fetched, or live memory past the fetched range.
+    fn rd(&self, a: u64) -> u32 {
+        if a >= self.base {
+            if let Some(&w) = self.words.get(((a - self.base) / 4) as usize) {
+                return w;
+            }
+        }
+        unsafe { rd32(a) }
+    }
 }
 
 fn compare(func: u32, value: u64, reference: u64) -> bool {
@@ -179,6 +210,7 @@ impl Cp {
             cur_packet: 0,
             cur_opcode: 0,
             waiting_on: 0,
+            wait_flag: None,
             unknown_seen: HashSet::new(),
             notes_seen: HashSet::new(),
             depth: 0,
@@ -220,6 +252,11 @@ impl Cp {
                 f()
             }
         }
+    }
+
+    /// Completes all GPU work recorded so far and its deferred effects.
+    pub fn finish(&mut self) {
+        self.sync();
     }
 
     /// Hands recorded GPU work to the device without waiting.
@@ -343,6 +380,13 @@ impl Cp {
     }
 
     /// Executes `size` dwords at `addr`.
+    /// Executes a command buffer. Small buffers (up to `FETCH_DWORDS`) are
+    /// copied when execution starts, as the hardware's prefetch does: the
+    /// Bink video decoder reuses its small command buffers as soon as the
+    /// GPU has started them, and reading them lazily executed a mix of two
+    /// frames' packets. Larger buffers are read as they execute: titles patch
+    /// submitted frame command buffers until the GPU reaches the patched
+    /// packets (copying them at submission broke rendering).
     pub fn run(&mut self, addr: u64, size: u32) {
         if self.depth > 8 {
             crate::error!("gpu[{}]: indirect buffer nesting too deep at {addr:#x}", self.name);
@@ -351,12 +395,13 @@ impl Cp {
         self.depth += 1;
         let mut cur = addr;
         let mut end = addr + 4 * size as u64;
+        let mut f = Fetched::new(addr, size);
         while cur < end {
             if !valid(cur, 4) {
                 crate::error!("gpu[{}]: command pointer {cur:#x} outside guest memory", self.name);
                 break;
             }
-            let h = unsafe { rd32(cur) };
+            let h = f.rd(cur);
             match h >> 30 {
                 3 => {}
                 2 => {
@@ -390,13 +435,42 @@ impl Cp {
             PACKETS.fetch_add(1, Ordering::Relaxed);
             self.cur_packet = cur;
             self.cur_opcode = opcode;
-            let p = |i: u64| unsafe { rd32(cur + 4 * (1 + i)) };
-            match self.packet(opcode, h, cur, n, &p) {
+            let p = |i: u64| f.rd(cur + 4 * (1 + i));
+            if super::capture::capturing() {
+                // Synchronization and memory packets in frame captures.
+                let name = match opcode {
+                    op::WAIT_REG_MEM => Some("WAIT_REG_MEM"),
+                    op::WAIT_REG_MEM64 => Some("WAIT_REG_MEM64"),
+                    op::WRITE_DATA => Some("WRITE_DATA"),
+                    op::RELEASE_MEM => Some("RELEASE_MEM"),
+                    op::EVENT_WRITE => Some("EVENT_WRITE"),
+                    op::ACQUIRE_MEM => Some("ACQUIRE_MEM"),
+                    op::DMA_DATA => Some("DMA_DATA"),
+                    op::COPY_DATA => Some("COPY_DATA"),
+                    op::COND_EXEC => Some("COND_EXEC"),
+                    op::INDIRECT_BUFFER => Some("INDIRECT_BUFFER"),
+                    op::PFP_SYNC_ME => Some("PFP_SYNC_ME"),
+                    op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT | op::SET_SH_REG | op::SET_CONTEXT_REG | op::SET_UCONFIG_REG => None,
+                    _ if std::env::var("DS_CAPTURE_ALL_PACKETS").ok().as_deref() == Some("1") => Some("PACKET"),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    let args: Vec<String> = (0..n.min(8)).map(|i| format!("{:08x}", p(i))).collect();
+                    super::capture::packet(self, &format!("{name} {opcode:#x} @{cur:#x} [{}]", args.join(" ")));
+                }
+            }
+            let flow = self.packet(opcode, h, cur, n, &p);
+            if opcode == op::REWIND {
+                // The CPU streams packets behind a REWIND: read them live.
+                f = Fetched::new(next, 0);
+            }
+            match flow {
                 Flow::Next => cur = next,
                 Flow::Skip(d) => cur = next + 4 * d as u64,
                 Flow::Chain(a, s) => {
                     cur = a;
                     end = a + 4 * s as u64;
+                    f = Fetched::new(a, s);
                 }
                 Flow::Stop => break,
             }
@@ -499,7 +573,33 @@ impl Cp {
             op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT => {
                 DISPATCHES.fetch_add(1, Ordering::Relaxed);
                 if opcode == op::DISPATCH_DIRECT {
+                    // DS_DELAY_CS=<shader>:<ms>: wait before that shader's
+                    // dispatches (diagnosis of CPU/GPU data races).
+                    static DELAY: std::sync::OnceLock<Option<(Vec<u64>, u64)>> = std::sync::OnceLock::new();
+                    if let Some((list, ms)) = DELAY.get_or_init(|| {
+                        let v = std::env::var("DS_DELAY_CS").ok()?;
+                        let (a, ms) = v.split_once(':')?;
+                        Some((a.split(',').filter_map(|x| u64::from_str_radix(x.trim_start_matches("0x"), 16).ok()).collect(), ms.parse().ok()?))
+                    }) {
+                        let cs = ((self.reg(Space::Sh, 0x20C) as u64) | ((self.reg(Space::Sh, 0x20D) as u64 & 0xFF) << 32)) << 8;
+                        if list.contains(&cs) {
+                            std::thread::sleep(std::time::Duration::from_millis(*ms));
+                        }
+                    }
+                    super::emucheck::race_check(self, p(3));
+                    super::emucheck::race_watch(self, p(3));
+                    // DS_EMU_CHECK: interpret a sample of the groups first.
+                    let check = if super::exec::enabled() && super::emucheck::wanted(self) {
+                        self.sync();
+                        super::emucheck::prepare(self, [p(0), p(1), p(2)], p(3))
+                    } else {
+                        None
+                    };
                     self.dispatch([p(0), p(1), p(2)], p(3));
+                    if let Some(c) = check {
+                        self.sync();
+                        super::emucheck::compare(c);
+                    }
                 } else {
                     // Arguments may have been written by earlier GPU work.
                     self.sync();
@@ -509,6 +609,12 @@ impl Cp {
                         self.dispatch(g, p(1));
                     }
                 }
+                if super::capture::dispatch_dumps() {
+                    // Per-dispatch image dumps: complete the dispatch first.
+                    if let Some(e) = self.exec.as_mut() {
+                        e.flush();
+                    }
+                }
                 if super::capture::capturing() {
                     let what = if opcode == op::DISPATCH_DIRECT {
                         format!("DISPATCH_DIRECT {}x{}x{} initiator {:#x}", p(0), p(1), p(2), p(3))
@@ -516,6 +622,17 @@ impl Cp {
                         format!("DISPATCH_INDIRECT {:#x} base {:#x}", p(0), self.dispatch_indirect_base)
                     };
                     super::capture::dispatch(self, &what);
+                    // DS_REPEAT_CS=<shader>: run that captured direct dispatch
+                    // again on the same inputs (determinism checks with
+                    // DS_CAPTURE_DISPATCHES).
+                    let cs = ((self.reg(Space::Sh, 0x20C) as u64) | ((self.reg(Space::Sh, 0x20D) as u64 & 0xFF) << 32)) << 8;
+                    if opcode == op::DISPATCH_DIRECT && std::env::var("DS_REPEAT_CS").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()) == Some(cs) {
+                        self.dispatch([p(0), p(1), p(2)], p(3));
+                        if let Some(e) = self.exec.as_mut() {
+                            e.flush();
+                        }
+                        super::capture::dispatch(self, &format!("{what} (repeated)"));
+                    }
                 }
             }
             // CP memory writes wait for shaders only after a partial flush or
@@ -835,7 +952,17 @@ impl Cp {
         }
         let what = format!("WAIT_REG_MEM at {at:#x}: [{a:#x}] & {mask:#x} func {func} ref {reference:#x}");
         self.waiting_on = a;
-        match self.poll_until(at, &what, || compare(func, read() & mask, reference & mask)) {
+        // Submitters stop waiting for this queue only when the label is not
+        // written by its own outstanding GPU work (it may come from them).
+        let own = self.exec.as_mut().is_some_and(|e| e.will_write(a, if wide { 8 } else { 4 }));
+        if let (Some(f), false) = (self.wait_flag, own) {
+            f.store(true, Ordering::SeqCst);
+        }
+        let r = self.poll_until(at, &what, || compare(func, read() & mask, reference & mask));
+        if let Some(f) = self.wait_flag {
+            f.store(false, Ordering::SeqCst);
+        }
+        match r {
             Flow::Stop => Flow::Stop,
             _ => Flow::Next,
         }

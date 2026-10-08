@@ -9,6 +9,18 @@
 //! dispatcher over basic blocks. Cross-lane operations within 32 lanes (DPP
 //! rows, permlane, swizzles) use subgroup operations; wave64 operations that
 //! cross 32-lane halves are approximated and reported as warnings.
+//!
+//! Hardware lanes of a wave execute in lockstep, and shaders rely on it:
+//! lanes exchange data through LDS without barriers. Invocations do not run
+//! in lockstep, so LDS accesses get workgroup barriers wherever another
+//! lane's earlier access could conflict (in blocks every invocation executes
+//! alike). Compute programs that use LDS run in *lockstep mode* when their
+//! workgroup is a single wave, or when no scalar value can differ between
+//! its waves (no v_readlane / v_readfirstlane, no wave id): lane-dependent
+//! branches are decided for the whole workgroup by a vote (as the hardware
+//! decides them for each wave), so every block is uniform and all LDS
+//! accesses are ordered. With several waves a wave whose lanes are all
+//! inactive runs a region with EXEC empty instead of skipping it.
 
 mod alu;
 pub mod gs;
@@ -118,9 +130,20 @@ pub struct Spec {
     /// Binding index of the first binding (stages share one descriptor set).
     pub binding_base: u32,
     /// Debugging: (pc, vgpr): the value of `vgpr` after the instruction at
-    /// `pc` replaces the color of every MRT export ((v, v, v, 1) as float).
+    /// `pc` replaces the color of every MRT export ((v, v, v, 1) as float),
+    /// or (compute) the data of every image and buffer store.
     pub probe: Option<(u32, u32)>,
+    /// Debugging (compute): (pc, workgroup id): after each execution of the
+    /// instruction at pc, the invocations of that workgroup write their
+    /// registers to the debug binding (see [`DUMP_STRIDE`]).
+    pub dump: Option<(u32, [u32; 3])>,
 }
+
+/// Dwords per invocation in the debug binding: VGPRs 0..256, SGPRs at 256
+/// (128), SCC at 384, execution count at 385.
+pub const DUMP_STRIDE: u32 = 512;
+/// Size of the debug binding in dwords (up to 1024 invocations).
+pub const DUMP_DWORDS: u32 = 1024 * DUMP_STRIDE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BindingKind {
@@ -134,6 +157,8 @@ pub enum BindingKind {
     Sampler(usize),
     /// u32 array: the global data share (GDS_BYTES), shared by all shaders.
     Gds,
+    /// u32 array of DUMP_DWORDS: register dumps (`Spec::dump`).
+    Debug,
 }
 
 /// Size of the global data share.
@@ -267,6 +292,15 @@ pub(crate) struct T<'a> {
     pub xchg: Option<Word>,
     /// Blocks every invocation of the workgroup executes alike (barriers allowed).
     pub uniformity: crate::uniform::Uniformity,
+    /// Lockstep mode (see the module documentation).
+    pub lockstep: bool,
+    /// Lockstep ballots: workgroup u32[6] (three rotating (lo, hi) slots)
+    /// and this invocation's ballot counter (mod 3).
+    pub vote: Option<Word>,
+    pub vote_ctr: Option<Word>,
+    /// LDS accesses since the last workgroup barrier: bit 0 reads, bit 1
+    /// writes (3 at block entry: unknown).
+    pub lds_state: u8,
     /// SubgroupLocalInvocationId input (created on first use).
     pub sg_lane_var: Option<Word>,
     /// (vgpr, lane) slots written by v_writelane with constant lanes (SGPR
@@ -278,6 +312,9 @@ pub(crate) struct T<'a> {
     pub pc_var: Word,
     /// Probe value (see `Spec::probe`).
     pub probe_var: Option<Word>,
+    /// Debug binding (see `Spec::dump`) and WorkgroupId (compute).
+    pub dump_buf: Option<Word>,
+    pub wg_id: Option<Word>,
     pub sb_struct: Option<Word>,
     /// Binding of each raw buffer variable, and its uvec2/uvec4 views
     /// (aliases of the same binding for aligned 8/16-byte accesses).
@@ -579,6 +616,9 @@ impl<'a> T<'a> {
     pub fn wave_read(&mut self, ins: &Inst, v: Word, lane: Word) -> R<Word> {
         let u = self.t.u32;
         let exchange = self.spec.wave64 && self.spec.stage == Stage::Compute && self.uniformity.is_uniform(ins.pc) && self.local_index.is_some();
+        if exchange {
+            self.lds_state = 0;
+        }
         if !exchange {
             if self.spec.wave64 {
                 self.warn(format!("{:#x}: wave64 lane read within the 32-lane subgroup", ins.pc));
@@ -640,6 +680,133 @@ impl<'a> T<'a> {
         }
         self.interface.push(v);
         v
+    }
+
+    /// Data VGPR of a store; a compute probe replaces it (see `Spec::probe`).
+    pub fn store_vreg(&mut self, idx: u32) -> R<Word> {
+        match (self.spec.stage, self.probe_var) {
+            (Stage::Compute, Some(pv)) => e(self.b.load(self.t.u32, None, pv, None, [])),
+            _ => self.vreg(idx),
+        }
+    }
+
+    /// Workgroup barrier ordering workgroup memory (uniform blocks only).
+    pub fn workgroup_barrier(&mut self) -> R<()> {
+        let wg = self.u(spirv::Scope::Workgroup as u32);
+        let sem = self.u((spirv::MemorySemantics::ACQUIRE_RELEASE | spirv::MemorySemantics::WORKGROUP_MEMORY).bits());
+        ok(self.b.control_barrier(wg, wg, sem))?;
+        self.lds_state = 0;
+        Ok(())
+    }
+
+    /// Orders an LDS access after other lanes' earlier accesses, as lockstep
+    /// hardware lanes are: a barrier before a read that follows writes, or a
+    /// write that follows any access, since the last barrier.
+    pub fn lds_order(&mut self, pc: u32, write: bool) -> R<()> {
+        if self.spec.stage != Stage::Compute {
+            return Ok(());
+        }
+        if !self.uniformity.is_uniform(pc) {
+            self.warn(format!("{pc:#x}: LDS access in divergent code is not ordered across lanes"));
+            return Ok(());
+        }
+        let need = if write { self.lds_state != 0 } else { self.lds_state & 2 != 0 };
+        if need {
+            self.workgroup_barrier()?;
+        }
+        self.lds_state |= if write { 2 } else { 1 };
+        Ok(())
+    }
+
+    /// Ballot of a per-lane condition over the workgroup (lockstep mode: the
+    /// workgroup is one wave): (lo, hi) lane masks. Three rotating slots of
+    /// workgroup memory need one barrier per ballot: a slot is cleared (by
+    /// lane 0) after the barrier of the ballot following its use, when every
+    /// lane has read it, and reused after the next barrier.
+    pub fn wave_ballot(&mut self, c: Word) -> R<(Word, Word)> {
+        let (Some(vote), Some(ctr), Some(li)) = (self.vote, self.vote_ctr, self.local_index) else {
+            return Err("wave ballot outside lockstep mode".into());
+        };
+        let u = self.t.u32;
+        let k = e(self.b.load(u, None, ctr, None, []))?;
+        let one = self.u(1);
+        let two = self.u(2);
+        let three = self.u(3);
+        let kn = e(self.b.i_add(u, None, k, one))?;
+        let kn = e(self.b.u_mod(u, None, kn, three))?;
+        ok(self.b.store(ctr, kn, None, []))?;
+        let base = e(self.b.i_mul(u, None, k, two))?;
+        let k5 = self.u(5);
+        let half = e(self.b.shift_right_logical(u, None, li, k5))?;
+        let idx = e(self.b.i_add(u, None, base, half))?;
+        let k31 = self.u(31);
+        let pos = e(self.b.bitwise_and(u, None, li, k31))?;
+        let bit = e(self.b.shift_left_logical(u, None, one, pos))?;
+        let p_wg = self.b.type_pointer(None, StorageClass::Workgroup, u);
+        self.guarded(c, &mut |tr| {
+            let p = e(tr.b.access_chain(p_wg, None, vote, [idx]))?;
+            let scope = tr.u(spirv::Scope::Workgroup as u32);
+            let sem = tr.u(0);
+            e(tr.b.atomic_or(u, None, p, scope, sem, bit))?;
+            Ok(())
+        })?;
+        self.workgroup_barrier()?;
+        let p = e(self.b.access_chain(p_wg, None, vote, [base]))?;
+        let lo = e(self.b.load(u, None, p, None, []))?;
+        let base1 = e(self.b.i_add(u, None, base, one))?;
+        let p = e(self.b.access_chain(p_wg, None, vote, [base1]))?;
+        let hi = e(self.b.load(u, None, p, None, []))?;
+        let old = e(self.b.i_add(u, None, k, two))?;
+        let old = e(self.b.u_mod(u, None, old, three))?;
+        let old = e(self.b.i_mul(u, None, old, two))?;
+        let z = self.u(0);
+        let first = e(self.b.i_equal(self.t.bool_, None, li, z))?;
+        self.guarded(first, &mut |tr| {
+            let p = e(tr.b.access_chain(p_wg, None, vote, [old]))?;
+            ok(tr.b.store(p, z, None, []))?;
+            let old1 = e(tr.b.i_add(u, None, old, one))?;
+            let p = e(tr.b.access_chain(p_wg, None, vote, [old1]))?;
+            ok(tr.b.store(p, z, None, []))
+        })?;
+        Ok((lo, hi))
+    }
+
+    /// Whether any invocation of the workgroup has `c` (lockstep mode; the
+    /// slot protocol of `wave_ballot` with one dword).
+    pub fn wave_any(&mut self, c: Word) -> R<Word> {
+        let (Some(vote), Some(ctr), Some(li)) = (self.vote, self.vote_ctr, self.local_index) else {
+            return Err("vote outside lockstep mode".into());
+        };
+        let u = self.t.u32;
+        let k = e(self.b.load(u, None, ctr, None, []))?;
+        let one = self.u(1);
+        let two = self.u(2);
+        let three = self.u(3);
+        let kn = e(self.b.i_add(u, None, k, one))?;
+        let kn = e(self.b.u_mod(u, None, kn, three))?;
+        ok(self.b.store(ctr, kn, None, []))?;
+        let idx = e(self.b.i_mul(u, None, k, two))?;
+        let p_wg = self.b.type_pointer(None, StorageClass::Workgroup, u);
+        self.guarded(c, &mut |tr| {
+            let p = e(tr.b.access_chain(p_wg, None, vote, [idx]))?;
+            let scope = tr.u(spirv::Scope::Workgroup as u32);
+            let sem = tr.u(0);
+            e(tr.b.atomic_or(u, None, p, scope, sem, one))?;
+            Ok(())
+        })?;
+        self.workgroup_barrier()?;
+        let p = e(self.b.access_chain(p_wg, None, vote, [idx]))?;
+        let x = e(self.b.load(u, None, p, None, []))?;
+        let old = e(self.b.i_add(u, None, k, two))?;
+        let old = e(self.b.u_mod(u, None, old, three))?;
+        let old = e(self.b.i_mul(u, None, old, two))?;
+        let z = self.u(0);
+        let first = e(self.b.i_equal(self.t.bool_, None, li, z))?;
+        self.guarded(first, &mut |tr| {
+            let p = e(tr.b.access_chain(p_wg, None, vote, [old]))?;
+            ok(tr.b.store(p, z, None, []))
+        })?;
+        e(self.b.i_not_equal(self.t.bool_, None, x, z))
     }
 
     /// Emits `f` in a block executed only when `cond` holds.
@@ -764,6 +931,10 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         local_index: None,
         xchg: None,
         uniformity: crate::uniform::analyze(code),
+        lockstep: false,
+        vote: None,
+        vote_ctr: None,
+        lds_state: 0,
         sg_lane_var: None,
         lane_slots: HashMap::new(),
         warnings: Vec::new(),
@@ -771,6 +942,8 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         mrt_mask: 0,
         pc_var: 0,
         probe_var: None,
+        dump_buf: None,
+        wg_id: None,
         sb_struct: None,
         buffer_binding: HashMap::new(),
         buffer_views: HashMap::new(),
@@ -786,6 +959,12 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         let bnd = tr.alloc_binding(BindingKind::Gds);
         tr.decorate_binding(v, bnd);
         tr.gds = Some(v);
+    }
+    if spec.dump.is_some() && spec.stage == Stage::Compute {
+        let v = tr.sb_var();
+        let bnd = tr.alloc_binding(BindingKind::Debug);
+        tr.decorate_binding(v, bnd);
+        tr.dump_buf = Some(v);
     }
     // Resource bindings in plan order.
     for (i, r) in plan.resources.iter().enumerate() {
@@ -857,6 +1036,21 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         let z = tr.u(0);
         tr.probe_var = Some(tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, Some(z)));
     }
+    // Lockstep mode (see the module documentation).
+    let threads: u32 = spec.cs_local_size.iter().map(|&x| x.max(1)).product();
+    let uses_lds = code.iter().any(|i| i.enc == Enc::Ds && !i.ds_gds() && !matches!(i.name(), Some("ds_swizzle_b32" | "ds_bpermute_b32" | "ds_permute_b32")));
+    let one_wave = threads <= if spec.wave64 { 64 } else { 32 };
+    let wave_scalars = spec.cs_rsrc2 & (1 << 10) != 0 || code.iter().any(|i| matches!(i.base_name(), Some("v_readlane_b32" | "v_readfirstlane_b32")));
+    tr.lockstep = spec.stage == Stage::Compute && uses_lds && (one_wave || !wave_scalars) && std::env::var("DS_LOCKSTEP").ok().as_deref() != Some("0");
+    if tr.lockstep {
+        let z = tr.u(0);
+        tr.vote_ctr = Some(tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, Some(z)));
+        let len = tr.u(6);
+        let arr = tr.b.type_array(tr.t.u32, len);
+        let pt = tr.b.type_pointer(None, StorageClass::Workgroup, arr);
+        tr.vote = Some(tr.global_var(pt, StorageClass::Workgroup));
+        tr.uniformity.set_lockstep();
+    }
     for ins in code {
         if let Some((true, vgpr, lane)) = ins.const_lane_op() {
             if !tr.lane_slots.contains_key(&(vgpr as u32, lane)) {
@@ -882,6 +1076,21 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         tr.set_sreg(spec.user_base as u32 + i, v)?;
     }
     mem::stage_inputs(&mut tr)?;
+    if let (Some(vote), Some(li)) = (tr.vote, tr.local_index) {
+        // Ballot slots start cleared.
+        let z = tr.u(0);
+        let first = e(tr.b.i_equal(tr.t.bool_, None, li, z))?;
+        let p_wg = tr.b.type_pointer(None, StorageClass::Workgroup, tr.t.u32);
+        tr.guarded(first, &mut |tr| {
+            for k in 0..6 {
+                let i = tr.u(k);
+                let p = e(tr.b.access_chain(p_wg, None, vote, [i]))?;
+                ok(tr.b.store(p, z, None, []))?;
+            }
+            Ok(())
+        })?;
+        tr.workgroup_barrier()?;
+    }
 
     // Body.
     let starts = block_starts(code);
@@ -905,6 +1114,23 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     };
     let iface = tr.interface.clone();
     tr.b.entry_point(model, func, "main", iface);
+    // Hardware rounds every float multiply and add (v_mad_f32 / v_mac_f32
+    // are not fused): keep the driver from contracting them into FMAs, which
+    // changes results in the last bit (texture coordinates on texel
+    // boundaries select other texels).
+    let ids: Vec<Word> = tr
+        .b
+        .module_ref()
+        .functions
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| b.instructions.iter())
+        .filter(|i| matches!(i.class.opcode, spirv::Op::FAdd | spirv::Op::FSub | spirv::Op::FMul))
+        .filter_map(|i| i.result_id)
+        .collect();
+    for id in ids {
+        tr.b.decorate(id, Decoration::NoContraction, []);
+    }
     match spec.stage {
         Stage::Fragment => {
             tr.b.execution_mode(func, ExecutionMode::OriginUpperLeft, []);
@@ -927,9 +1153,50 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
 const PC_EXIT: u32 = 0xFFFF_FFFF;
 
 /// Branch condition of a conditional SOPP branch (None = always taken).
-fn branch_cond(tr: &mut T, ins: &Inst) -> R<Option<Word>> {
+/// `before` holds the block's instructions before the branch.
+fn branch_cond(tr: &mut T, ins: &Inst, before: &[Inst]) -> R<Option<Word>> {
     let name = ins.name().unwrap_or("");
     let bt = tr.t.bool_;
+    if tr.lockstep && tr.uniformity.divergent_branches.contains(&ins.pc) {
+        // The wave's decision: EXEC/VCC zero when no lane has its bit; SCC
+        // from lane masks is the OR of the lanes' SCC (results != 0), or the
+        // AND for equality compares.
+        let (lane, all) = match name {
+            "s_cbranch_vccz" | "s_cbranch_vccnz" | "s_cbranch_execz" | "s_cbranch_execnz" => {
+                let src = if name.contains("vcc") { crate::OP_VCC_LO } else { crate::OP_EXEC_LO } as u32;
+                let lo = tr.sreg(src)?;
+                let hi = tr.sreg(src + 1)?;
+                let o = e(tr.b.bitwise_or(tr.t.u32, None, lo, hi))?;
+                let z = tr.u(0);
+                (e(tr.b.i_not_equal(bt, None, o, z))?, false)
+            }
+            "s_cbranch_scc0" | "s_cbranch_scc1" => {
+                let all = match before.iter().rev().find(|i| crate::uniform::writes_scc(i)) {
+                    Some(w) => {
+                        let n = w.name().unwrap_or("");
+                        n.starts_with("s_cmp_eq_") || n.starts_with("s_cmpk_eq_")
+                    }
+                    None => {
+                        tr.warn(format!("{:#x}: lane-dependent SCC from another block decided as any-lane", ins.pc));
+                        false
+                    }
+                };
+                (tr.get_scc()?, all)
+            }
+            _ => return Ok(Some(tr.bool_c(false))),
+        };
+        let wave = if all {
+            let not = e(tr.b.logical_not(bt, None, lane))?;
+            let any_not = tr.wave_any(not)?;
+            e(tr.b.logical_not(bt, None, any_not))?
+        } else {
+            tr.wave_any(lane)?
+        };
+        return Ok(Some(match name {
+            "s_cbranch_scc1" | "s_cbranch_vccnz" | "s_cbranch_execnz" => wave,
+            _ => e(tr.b.logical_not(bt, None, wave))?,
+        }));
+    }
     Ok(match name {
         "s_branch" => None,
         "s_cbranch_scc0" => {
@@ -975,13 +1242,17 @@ fn emit_dispatch_loop(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>) -> R<()
     let starts_vec: Vec<u32> = starts.iter().copied().collect();
     for (bi, &(start, id)) in block_ids.iter().enumerate() {
         e(tr.b.begin_block(Some(id)))?;
+        // LDS accesses of other blocks are unknown here.
+        tr.lds_state = 3;
         let end = starts_vec.get(bi + 1).copied().unwrap_or(u32::MAX);
         let mut next_pc = PC_EXIT;
         let mut terminated = false;
+        let mut first = None;
         for (k, ins) in code.iter().enumerate() {
             if ins.pc < start || ins.pc >= end {
                 continue;
             }
+            let first = *first.get_or_insert(k);
             next_pc = code.get(k + 1).map(|n| n.pc).unwrap_or(PC_EXIT);
             if ins.is_endpgm() {
                 let x = tr.u(PC_EXIT);
@@ -990,7 +1261,7 @@ fn emit_dispatch_loop(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>) -> R<()
                 break;
             }
             if let Some(target) = ins.branch_target() {
-                let cond = branch_cond(tr, ins)?;
+                let cond = branch_cond(tr, ins, &code[first..k])?;
                 let tv = tr.u(target);
                 let val = match cond {
                     None => tv,
@@ -1031,7 +1302,55 @@ fn translate_inst(tr: &mut T, ins: &Inst) -> R<()> {
             ok(tr.b.store(var, v, None, []))?;
         }
     }
+    if let Some((pc, g)) = tr.spec.dump {
+        if ins.pc == pc {
+            emit_dump(tr, g)?;
+        }
+    }
     Ok(())
+}
+
+/// Register dump of the invocations of workgroup `g` (see `Spec::dump`).
+fn emit_dump(tr: &mut T, g: [u32; 3]) -> R<()> {
+    let (Some(buf), Some(wg), Some(li)) = (tr.dump_buf, tr.wg_id, tr.local_index) else { return Ok(()) };
+    let u = tr.t.u32;
+    let bt = tr.t.bool_;
+    let mut cond = tr.bool_c(true);
+    for (k, gk) in g.iter().enumerate() {
+        let c = e(tr.b.composite_extract(u, None, wg, [k as u32]))?;
+        let kk = tr.u(*gk);
+        let eq = e(tr.b.i_equal(bt, None, c, kk))?;
+        cond = e(tr.b.logical_and(bt, None, cond, eq))?;
+    }
+    tr.guarded(cond, &mut |tr| {
+        let stride = tr.u(DUMP_STRIDE);
+        let base = e(tr.b.i_mul(u, None, li, stride))?;
+        let z = tr.u(0);
+        let mut put = |tr: &mut T, k: u32, v: Word| -> R<()> {
+            let kk = tr.u(k);
+            let i = e(tr.b.i_add(u, None, base, kk))?;
+            let p = e(tr.b.access_chain(tr.t.sb_u32, None, buf, [z, i]))?;
+            ok(tr.b.store(p, v, None, []))
+        };
+        for k in 0..256 {
+            let v = tr.vreg(k)?;
+            put(tr, k, v)?;
+        }
+        for k in 0..128 {
+            let v = tr.sreg(k)?;
+            put(tr, 256 + k, v)?;
+        }
+        let s = tr.get_scc()?;
+        let s = tr.bool_to_u(s)?;
+        put(tr, 384, s)?;
+        let k385 = tr.u(385);
+        let i = e(tr.b.i_add(u, None, base, k385))?;
+        let p = e(tr.b.access_chain(tr.t.sb_u32, None, buf, [z, i]))?;
+        let n = e(tr.b.load(u, None, p, None, []))?;
+        let one = tr.u(1);
+        let n1 = e(tr.b.i_add(u, None, n, one))?;
+        ok(tr.b.store(p, n1, None, []))
+    })
 }
 
 fn translate_one(tr: &mut T, ins: &Inst) -> R<()> {

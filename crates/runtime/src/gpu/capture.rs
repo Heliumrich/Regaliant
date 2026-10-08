@@ -40,21 +40,41 @@ pub fn capturing() -> bool {
 }
 
 /// Called by the graphics queue for each flip packet (`flip` = flips so far).
+/// Frames still to capture after the current one (DS_CAPTURE_COUNT).
+static MORE: AtomicU64 = AtomicU64::new(0);
+
+/// Flips so far (graphics queue).
+static FLIPS: AtomicU64 = AtomicU64::new(0);
+
+pub fn flips() -> u64 {
+    FLIPS.load(Ordering::Relaxed)
+}
+
 pub fn on_flip(flip: u64) {
+    FLIPS.store(flip, Ordering::Relaxed);
     let mut g = ACTIVE.lock();
     if let Some(c) = g.take() {
-        finish(c);
+        // Consecutive captures: text only (no texture, target or draw dumps).
+        let more = MORE.load(Ordering::SeqCst);
+        let last = more == 0;
+        finish(c, last);
+        if !last {
+            MORE.store(more - 1, Ordering::SeqCst);
+            *g = Some(Capture { flip, text: format!("# frame after flip {flip}
+"), shaders: BTreeSet::new(), events: 0, textures: Default::default() });
+        }
         return;
     }
     let armed = ARMED.load(Ordering::SeqCst);
     if armed != u64::MAX && flip >= armed {
         ARMED.store(u64::MAX, Ordering::SeqCst);
+        MORE.store(std::env::var("DS_CAPTURE_COUNT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1).saturating_sub(1), Ordering::SeqCst);
         *g = Some(Capture { flip, text: format!("# frame after flip {flip}\n"), shaders: BTreeSet::new(), events: 0, textures: Default::default() });
         crate::info!("capture: recording the frame after flip {flip}");
     }
 }
 
-fn finish(c: Capture) {
+fn finish(c: Capture, dumps: bool) {
     let Some(dir) = crate::run_dir() else { return };
     let path = dir.join(format!("capture-{}.txt", c.flip));
     let _ = std::fs::write(&path, &c.text);
@@ -71,10 +91,10 @@ fn finish(c: Capture) {
             dumped += 1;
         }
     }
-    let tex = dump_textures(&dir, &c.textures);
+    let tex = if dumps { dump_textures(&dir, &c.textures) } else { 0 };
     // Render targets as rendered (GPU execution): the graphics queue's work
     // of the frame completed before its flip.
-    let rts = if super::exec::enabled() { super::images::with(|im| im.dump_targets(&dir.join("targets"))) } else { 0 };
+    let rts = if dumps && super::exec::enabled() { super::images::with(|im| im.dump_targets(&dir.join("targets"))) } else { 0 };
     crate::info!("capture: {} event(s) -> {} ({dumped} shader binaries in shaders/, {tex} texture(s) in textures/, {rts} render target(s) in targets/)", c.events, path.display());
 }
 
@@ -189,6 +209,13 @@ fn f(v: u32) -> f32 {
 /// after the draw (draws/<event>_<address>.png).
 pub fn draw_dumps() -> bool {
     dumps_env() && capturing()
+}
+
+/// `DS_CAPTURE_DISPATCHES=1`: also dump the images each captured dispatch
+/// writes, after it (dispatches/<flip>_<event>_<shader>_<image>.png).
+pub fn dispatch_dumps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_CAPTURE_DISPATCHES").ok().as_deref() == Some("1")) && capturing()
 }
 
 fn dumps_env() -> bool {
@@ -367,6 +394,13 @@ pub fn draw(cp: &Cp, what: &str) {
     c.text.push_str(&s);
 }
 
+/// Records a synchronization or memory packet.
+pub fn packet(cp: &Cp, what: &str) {
+    let mut g = ACTIVE.lock();
+    let Some(c) = g.as_mut() else { return };
+    let _ = writeln!(c.text, "packet [{}] {what}", cp.name);
+}
+
 /// Records one dispatch.
 pub fn dispatch(cp: &Cp, what: &str) {
     let mut g = ACTIVE.lock();
@@ -383,12 +417,34 @@ pub fn dispatch(cp: &Cp, what: &str) {
         cp.reg(Space::Sh, 0x209) & 0xFFFF
     );
     stage(cp, &mut s, &mut c.shaders, "cs", 0x20C, 0x212, 0x240);
+    let dumps = std::env::var("DS_CAPTURE_DISPATCHES").ok().as_deref() == Some("1");
     match super::shaders::prepare_compute(cp, true) {
         Ok(p) => {
             for l in super::shaders::describe_resources(&p) {
                 let _ = writeln!(s, "      {l}");
             }
             note_textures(&mut c.textures, &p);
+            if dumps && super::exec::enabled() {
+                for (i, r) in p.resources.iter().enumerate() {
+                    let super::shaders::Resolved::Image(t) = r else { continue };
+                    if !p.tr.plan.resources[i].written {
+                        continue;
+                    }
+                    let Some(dir) = crate::run_dir().map(|d| d.join("dispatches")) else { continue };
+                    let _ = std::fs::create_dir_all(&dir);
+                    let name = format!("{}_{:04}_{:010x}_{:010x}.png", c.flip, c.events, p.addr, t.base);
+                    let r = super::images::with(|im| im.snapshot(t));
+                    match r {
+                        Ok((rgba, w, h)) => {
+                            let _ = std::fs::write(dir.join(&name), super::png::encode(w, h, &rgba));
+                            let _ = writeln!(s, "      image after dispatch: {name}");
+                        }
+                        Err(e) => {
+                            let _ = writeln!(s, "      image after dispatch: {name} failed: {e}");
+                        }
+                    }
+                }
+            }
         }
         Err(e) => {
             let _ = writeln!(s, "      resources unresolved: {e}");

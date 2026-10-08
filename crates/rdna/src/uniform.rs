@@ -13,19 +13,27 @@
 //! hardware, and the translator makes v_readlane exact in uniform blocks).
 
 use crate::{Enc, Inst};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Basic blocks of a program: per instruction its block, and per block
 /// whether it is uniform.
 pub struct Uniformity {
     pub block_of: HashMap<u32, usize>,
     pub uniform: Vec<bool>,
+    /// Conditional branches whose condition depends on lane state.
+    pub divergent_branches: HashSet<u32>,
 }
 
 impl Uniformity {
     /// Whether the instruction at `pc` runs in a uniform block.
     pub fn is_uniform(&self, pc: u32) -> bool {
         self.block_of.get(&pc).is_some_and(|&b| self.uniform[b])
+    }
+
+    /// Every block uniform: the translation decides lane-dependent branches
+    /// for the whole workgroup (lockstep execution of a single-wave group).
+    pub fn set_lockstep(&mut self) {
+        self.uniform.iter_mut().for_each(|u| *u = true);
     }
 }
 
@@ -52,6 +60,17 @@ fn set(st: &mut Dep, r: u16, v: bool, wide: bool) {
         if wide && r < 127 {
             st[r as usize + 1] = v;
         }
+    }
+}
+
+/// Whether a scalar instruction writes SCC.
+pub fn writes_scc(ins: &Inst) -> bool {
+    let name = ins.base_name().unwrap_or("");
+    match ins.enc {
+        Enc::Sopc => true,
+        Enc::Sop1 | Enc::Sop2 => !keeps_scc(name),
+        Enc::Sopk => name.starts_with("s_cmpk_") || name == "s_addk_i32",
+        _ => false,
     }
 }
 
@@ -185,8 +204,9 @@ fn branch_divergent(st: &Dep, ins: &Inst) -> bool {
 pub fn analyze(code: &[Inst]) -> Uniformity {
     let n = code.len();
     let mut block_of = HashMap::new();
+    let mut divergent_branches = HashSet::new();
     if n == 0 {
-        return Uniformity { block_of, uniform: Vec::new() };
+        return Uniformity { block_of, uniform: Vec::new(), divergent_branches };
     }
     let index: HashMap<u32, usize> = code.iter().enumerate().map(|(i, ins)| (ins.pc, i)).collect();
     let mut starts = std::collections::BTreeSet::new();
@@ -321,7 +341,11 @@ pub fn analyze(code: &[Inst]) -> Uniformity {
             for ins in &code[starts[x]..end(x) - 1] {
                 step(&mut st, ins);
             }
-            if !(branch_divergent(&st, last) || divergent[x]) {
+            let lane_dependent = branch_divergent(&st, last);
+            if lane_dependent {
+                divergent_branches.insert(last.pc);
+            }
+            if !(lane_dependent || divergent[x]) {
                 continue;
             }
             let stop = ipdom[x];
@@ -341,5 +365,5 @@ pub fn analyze(code: &[Inst]) -> Uniformity {
         }
     }
     let uniform = (0..nb).map(|b| entry[b].is_some() && !divergent[b]).collect();
-    Uniformity { block_of, uniform }
+    Uniformity { block_of, uniform, divergent_branches }
 }

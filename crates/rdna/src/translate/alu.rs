@@ -183,6 +183,7 @@ fn sopp(tr: &mut T, ins: &Inst, name: &str) -> R<()> {
                 let wg = tr.u(spirv::Scope::Workgroup as u32);
                 let sem = tr.u((spirv::MemorySemantics::ACQUIRE_RELEASE | spirv::MemorySemantics::WORKGROUP_MEMORY | spirv::MemorySemantics::UNIFORM_MEMORY).bits());
                 ok(tr.b.control_barrier(wg, wg, sem))?;
+                tr.lds_state = 0;
             }
         }
         _ => unsupported(tr, ins),

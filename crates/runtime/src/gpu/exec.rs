@@ -84,6 +84,9 @@ struct Shared {
     /// Graphics pipelines by state hash.
     gfx: HashMap<u64, Pipe>,
     gds: vk::Buffer,
+    /// Register dumps (`DS_DUMP`), host visible.
+    debug: vk::Buffer,
+    debug_ptr: *mut u8,
     /// Zero-filled buffer bound for empty or unmapped resources.
     dummy: vk::Buffer,
     import_align: u64,
@@ -92,6 +95,19 @@ struct Shared {
 unsafe impl Send for Shared {}
 
 static SHARED: Mutex<Option<Shared>> = Mutex::new(None);
+
+/// Contents of the register-dump buffer (`DS_DUMP`); `clear` zeroes it
+/// (call with no GPU work using it in flight).
+pub fn debug_dump(clear: bool) -> Vec<u32> {
+    let sh = shared();
+    let n = rdna::translate::DUMP_DWORDS as usize;
+    let p = sh.debug_ptr as *mut u32;
+    let v = unsafe { std::slice::from_raw_parts(p, n).to_vec() };
+    if clear {
+        unsafe { std::ptr::write_bytes(p, 0, n) };
+    }
+    v
+}
 
 /// Import windows are aligned to this size within a guest mapping.
 const WINDOW: u64 = 64 << 20;
@@ -106,6 +122,7 @@ fn shared() -> parking_lot::MappedMutexGuard<'static, Shared> {
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC;
         let (gds, _) = c.device_buffer(rdna::translate::GDS_BYTES as u64, usage).expect("GDS buffer");
         let (dummy, _) = c.device_buffer(DUMMY_BYTES, usage).expect("dummy buffer");
+        let (debug, _, debug_ptr) = c.host_buffer(rdna::translate::DUMP_DWORDS as u64 * 4, usage).expect("debug buffer");
         let mut host = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
         let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
         unsafe { c.instance.get_physical_device_properties2(c.pdev, &mut p2) };
@@ -130,6 +147,8 @@ fn shared() -> parking_lot::MappedMutexGuard<'static, Shared> {
             pipes: HashMap::new(),
             gfx: HashMap::new(),
             gds,
+            debug,
+            debug_ptr,
             dummy,
             import_align: host.min_imported_host_pointer_alignment.max(4096),
         });
@@ -360,7 +379,7 @@ pub fn pipeline_test(capture: &str) -> i32 {
 
 fn descriptor_type(k: BindingKind) -> vk::DescriptorType {
     match k {
-        BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Gds => vk::DescriptorType::STORAGE_BUFFER,
+        BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Gds | BindingKind::Debug => vk::DescriptorType::STORAGE_BUFFER,
         BindingKind::Image(_) => vk::DescriptorType::SAMPLED_IMAGE,
         BindingKind::StorageImage(_) => vk::DescriptorType::STORAGE_IMAGE,
         BindingKind::Sampler(_) => vk::DescriptorType::SAMPLER,
@@ -632,7 +651,8 @@ pub fn shader_profile() -> String {
         tot(3),
         GAP_NS.load(Ordering::Relaxed) / 1_000_000
     );
-    for (a, x) in v.iter().take(15) {
+    let top = std::env::var("DS_PROFILE_TOP").ok().and_then(|x| x.parse().ok()).unwrap_or(15);
+    for (a, x) in v.iter().take(top) {
         let n = x[0].max(1);
         s.push_str(&format!("      cs {a:#x}: {} dispatches, {} us each (+ copies {} / {} us)\n", x[0], x[1] / 1000 / n, x[2] / 1000 / n, x[3] / 1000 / n));
     }
@@ -872,6 +892,12 @@ impl Exec {
         }
     }
 
+    /// Whether this queue's outstanding GPU work or deferred CP effects will
+    /// write [a, a+n) (a label the CP waits for comes from the GPU itself).
+    pub fn will_write(&mut self, a: u64, n: u64) -> bool {
+        self.overlaps_pending(&[(a, n)])
+    }
+
     fn overlaps_pending(&mut self, reads: &[(u64, u64)]) -> bool {
         let done = done_seq();
         self.inflight.retain(|(seq, _)| *seq > done);
@@ -996,6 +1022,7 @@ impl Exec {
                         bound.bufs.push((b.binding, info));
                     }
                     BindingKind::Gds => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: sh.gds, offset: 0, range: rdna::translate::GDS_BYTES as u64 })),
+                    BindingKind::Debug => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: sh.debug, offset: 0, range: rdna::translate::DUMP_DWORDS as u64 * 4 })),
                     _ => {}
                 }
             }
