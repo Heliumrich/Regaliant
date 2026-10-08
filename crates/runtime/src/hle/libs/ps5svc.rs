@@ -11,6 +11,13 @@ use crate::{reg, sysv};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 static NEXT: AtomicI32 = AtomicI32::new(1);
+const WEBAPI2_ERROR_INVALID_ARGUMENT: i32 = 0x8055_3402u32 as i32;
+/// NpWebApi2 "not signed in" (error codes per public sources, docs/PROVENANCE.md).
+const WEBAPI2_ERROR_NOT_SIGNED_IN: i32 = 0x8055_3407u32 as i32;
+
+fn cstr_or(p: *const u8) -> String {
+    if p.is_null() { String::new() } else { unsafe { crate::hle::cstr(p) }.to_string() }
+}
 fn next_id() -> i32 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
@@ -40,6 +47,38 @@ sysv! {
         id
     }
     fn sceNpWebApi2Terminate(ctx: i32) -> i32 { 0 }
+    /// (library context, user id) -> user context. Contexts exist offline;
+    /// requests made through them fail.
+    fn sceNpWebApi2CreateUserContext(lib_ctx: i32, user: i32) -> i32 {
+        let id = next_id();
+        crate::info!("sceNpWebApi2CreateUserContext(lib {lib_ctx}, user {user}) -> {id} (offline: requests will fail)");
+        id
+    }
+    fn sceNpWebApi2DeleteUserContext(user_ctx: i32) -> i32 { 0 }
+    /// (user context, api group, path, method, content parameter, *request id)
+    fn sceNpWebApi2CreateRequest(user_ctx: i32, group: *const u8, path: *const u8, method: *const u8, content: u64, out: *mut i64) -> i32 {
+        if out.is_null() { return WEBAPI2_ERROR_INVALID_ARGUMENT; }
+        *out = next_id() as i64;
+        crate::debug!("sceNpWebApi2CreateRequest {} {} {}", cstr_or(method), cstr_or(group), cstr_or(path));
+        0
+    }
+    fn sceNpWebApi2AddHttpRequestHeader(req: i64, name: *const u8, value: *const u8) -> i32 { 0 }
+    /// Offline console: the user is not signed in to PSN.
+    fn sceNpWebApi2SendRequest(req: i64, data: u64, size: u64, info: u64) -> i32 {
+        stub_log("sceNpWebApi2SendRequest (offline: not signed in)", WEBAPI2_ERROR_NOT_SIGNED_IN as i64);
+        WEBAPI2_ERROR_NOT_SIGNED_IN
+    }
+    fn sceNpWebApi2ReadData(req: i64, data: u64, size: u64) -> i32 { WEBAPI2_ERROR_NOT_SIGNED_IN }
+    fn sceNpWebApi2DeleteRequest(req: i64) -> i32 { 0 }
+    // Push events: handles, filters and callbacks exist; no event is delivered.
+    fn sceNpWebApi2PushEventCreateHandle(lib_ctx: i32) -> i32 { next_id() }
+    fn sceNpWebApi2PushEventDeleteHandle(lib_ctx: i32, handle: i32) -> i32 { 0 }
+    fn sceNpWebApi2PushEventCreateFilter(lib_ctx: i32, handle: i32, service: u64, label: u32, params: u64, count: u64) -> i32 { next_id() }
+    fn sceNpWebApi2PushEventRegisterCallback(user_ctx: i32, filter: i32, cb: u64, arg: u64) -> i32 {
+        stub_log("sceNpWebApi2PushEventRegisterCallback (offline: no push events)", 1);
+        next_id()
+    }
+    fn sceNpWebApi2PushEventDeletePushContext(user_ctx: i32, push_ctx: u64) -> i32 { 0 }
 
     fn sceGameUpdateInitialize(param: u64) -> i32 {
         stub_log("sceGameUpdateInitialize (offline: update checks report no update)", 0);
@@ -107,6 +146,13 @@ sysv! {
         0
     }
     fn sceNpUniversalDataSystemRegisterContext(ctx: i32, h: i32, flags: u32) -> i32 { 0 }
+    /// 24-byte memory statistics (the title zeroes it first, eboot+0x650132):
+    /// nothing is allocated because events are discarded.
+    fn sceNpUniversalDataSystemGetMemoryStat(stat: *mut u64) -> i32 {
+        if stat.is_null() { return 0x8155_1002u32 as i32; }
+        std::ptr::write_bytes(stat as *mut u8, 0, 24);
+        0
+    }
 }
 
 pub fn register(r: &mut Registry) {
@@ -115,7 +161,12 @@ pub fn register(r: &mut Registry) {
         _ZN3sce4Json11InitializerD1Ev, _ZN3sce4Json11Initializer10initializeEPKNS0_13InitParameterE,
     ]);
     reg!(r, "libSceHttp2", [sceHttp2Init, sceHttp2Term]);
-    reg!(r, "libSceNpWebApi2", [sceNpWebApi2Initialize, sceNpWebApi2Terminate]);
+    reg!(r, "libSceNpWebApi2", [
+        sceNpWebApi2Initialize, sceNpWebApi2Terminate, sceNpWebApi2CreateUserContext, sceNpWebApi2DeleteUserContext,
+        sceNpWebApi2CreateRequest, sceNpWebApi2AddHttpRequestHeader, sceNpWebApi2SendRequest, sceNpWebApi2ReadData,
+        sceNpWebApi2DeleteRequest, sceNpWebApi2PushEventCreateHandle, sceNpWebApi2PushEventDeleteHandle,
+        sceNpWebApi2PushEventCreateFilter, sceNpWebApi2PushEventRegisterCallback, sceNpWebApi2PushEventDeletePushContext,
+    ]);
     reg!(r, "libSceGameUpdate", [sceGameUpdateInitialize]);
     reg!(r, "libSceNpGameIntent", [sceNpGameIntentInitialize]);
     reg!(r, "libSceSystemGesture", [
@@ -131,6 +182,6 @@ pub fn register(r: &mut Registry) {
     reg!(r, "libSceNpEntitlementAccess", [sceNpEntitlementAccessInitialize, sceNpEntitlementAccessGetAddcontEntitlementInfoList]);
     reg!(r, "libSceNpUniversalDataSystem", [
         sceNpUniversalDataSystemInitialize, sceNpUniversalDataSystemCreateContext, sceNpUniversalDataSystemCreateHandle,
-        sceNpUniversalDataSystemRegisterContext,
+        sceNpUniversalDataSystemRegisterContext, sceNpUniversalDataSystemGetMemoryStat,
     ]);
 }

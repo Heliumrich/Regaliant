@@ -212,6 +212,13 @@ sysv! {
         *info = 1.0;
         0
     }
+    /// System setting to skip notice screens: off, so the title shows its
+    /// notices as on a console with default settings.
+    fn sceSystemServiceGetNoticeScreenSkipFlag(flag: *mut u8) -> i32 {
+        if flag.is_null() { return 0x80A1_0002u32 as i32; }
+        *flag = 0;
+        0
+    }
     fn sceSystemServiceHideSplashScreen() -> i32 {
         crate::info!("sceSystemServiceHideSplashScreen");
         0
@@ -306,6 +313,7 @@ pub fn register(r: &mut Registry) {
     reg!(r, "libSceSystemService", [
         sceSystemServiceGetStatus, sceSystemServiceReceiveEvent, sceSystemServiceParamGetInt,
         sceSystemServiceParamGetString, sceSystemServiceHideSplashScreen, sceSystemServiceGetDisplaySafeAreaInfo, sceSystemServiceLaunchWebBrowser,
+        sceSystemServiceGetNoticeScreenSkipFlag,
     ]);
     reg!(r, "libScePlayGo", [
         scePlayGoInitialize, scePlayGoOpen, scePlayGoGetLocus, scePlayGoGetChunkId, scePlayGoSetInstallSpeed,

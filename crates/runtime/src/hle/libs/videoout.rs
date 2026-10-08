@@ -21,7 +21,7 @@ const ERR_INVALID_ADDRESS: i32 = 0x8029_0002u32 as i32;
 const ERR_INVALID_INDEX: i32 = 0x8029_0004u32 as i32;
 const ERR_RESOURCE_BUSY: i32 = 0x8029_0009u32 as i32;
 const ERR_INVALID_HANDLE: i32 = 0x8029_000Bu32 as i32;
-const ERR_FLIP_QUEUE_FULL: i32 = 0x8029_0012u32 as i32;
+pub const ERR_FLIP_QUEUE_FULL: i32 = 0x8029_0012u32 as i32;
 
 /// Output reported to the title: 1080p SDR at 59.94 Hz (resolution 1 = 1080p,
 /// 2 = 2160p; dynamic range 1 = SDR). A lower output keeps GPU emulation cost
@@ -148,6 +148,12 @@ pub fn submit_flip(handle: i32, index: i32, arg: i64) -> i32 {
         0
     })
     .unwrap_or_else(|e| e)
+}
+
+/// Whether display buffer `index` is scanned out or waiting in the flip
+/// queue (GPU `WaitUntilSafeForRendering` waits until it is neither).
+pub fn buffer_busy(handle: i32, index: i32) -> bool {
+    port(handle, |p| p.current == index || p.pending.iter().any(|f| f.index == index)).unwrap_or(false)
 }
 
 pub fn display_buffer(index: i32) -> Option<(DisplayBuffer, BufferAttr)> {

@@ -1,5 +1,11 @@
 //! libSceAgcDriver: submission, GPU events and resource registration.
 //!
+//! Submissions go to the command processor (`crate::gpu`): DCBs to the
+//! graphics queue, ACBs to their compute queue. End-of-pipe interrupts
+//! (RELEASE_MEM with an interrupt) trigger every event added with
+//! `sceAgcDriverAddEqEvent` (filter EVFILT_GRAPHICS, ident = event id,
+//! data = interrupt context id).
+//!
 //! Resource registration (owners/resources named by the title for GPU capture
 //! tools) is recorded and used to name guest memory in GPU diagnostics.
 
@@ -23,6 +29,20 @@ pub struct Resource {
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
 static OWNERS: Mutex<BTreeMap<u32, String>> = Mutex::new(BTreeMap::new());
 static RESOURCES: Mutex<BTreeMap<u32, Resource>> = Mutex::new(BTreeMap::new());
+
+static EQ_EVENTS: Mutex<Vec<(u64, i32, u64)>> = Mutex::new(Vec::new());
+const ERR_EINVAL: i32 = 0x8002_0016u32 as i32;
+const ERR_EBADF: i32 = 0x8002_0009u32 as i32;
+
+/// Called by the command processor for RELEASE_MEM interrupts.
+pub fn raise_eop(ctx: u32) {
+    let list = EQ_EVENTS.lock().clone();
+    for (eq, id, _) in list {
+        if let Some(q) = unsafe { crate::hle::kernel::equeue::from_handle(eq) } {
+            q.trigger(id as u64, crate::hle::kernel::equeue::EVFILT_GRAPHICS, Some(ctx as u64), None);
+        }
+    }
+}
 
 /// Name of the registered resource containing `addr`, if any (diagnostics).
 pub fn resource_at(addr: u64) -> Option<Resource> {
@@ -76,6 +96,68 @@ sysv! {
     }
     /// No GPU capture tool is attached.
     fn sceAgcDriverIsCaptureInProgress() -> i32 { 0 }
+
+    // ---- submission. Packet = {u32* addr, u32 size in dwords, u8 flags}.
+    fn sceAgcDriverSubmitDcb(packet: *const u64) -> i32 {
+        if packet.is_null() { return ERR_EINVAL; }
+        let addr = *packet;
+        let size = *(packet as *const u32).add(2);
+        crate::gpu::submit(crate::gpu::GFX, vec![(addr, size)]);
+        0
+    }
+    fn sceAgcDriverSubmitMultiDcbs(addrs: *const u64, sizes: *const u32, count: u32) -> i32 {
+        if count == 0 { return 0; }
+        if addrs.is_null() || sizes.is_null() { return ERR_EINVAL; }
+        let v: Vec<(u64, u32)> = (0..count as usize).map(|i| (*addrs.add(i), *sizes.add(i))).filter(|(a, s)| *a != 0 && *s != 0).collect();
+        crate::gpu::submit(crate::gpu::GFX, v);
+        0
+    }
+    fn sceAgcDriverSubmitAcb(queue: u32, packet: *const u64) -> i32 {
+        if packet.is_null() { return ERR_EINVAL; }
+        let addr = *packet;
+        let size = *(packet as *const u32).add(2);
+        crate::gpu::submit(queue, vec![(addr, size)]);
+        0
+    }
+    fn sceAgcDriverSubmitMultiAcbs(queue: u32, addrs: *const u64, sizes: *const u32, count: u32) -> i32 {
+        if count == 0 { return 0; }
+        if addrs.is_null() || sizes.is_null() { return ERR_EINVAL; }
+        let v: Vec<(u64, u32)> = (0..count as usize).map(|i| (*addrs.add(i), *sizes.add(i))).filter(|(a, s)| *a != 0 && *s != 0).collect();
+        crate::gpu::submit(queue, v);
+        0
+    }
+
+    // ---- GPU events
+    fn sceAgcDriverAddEqEvent(eq: u64, id: i32, udata: u64) -> i32 {
+        let Some(q) = crate::hle::kernel::equeue::from_handle(eq) else { return ERR_EBADF };
+        q.add(id as u64, crate::hle::kernel::equeue::EVFILT_GRAPHICS, crate::hle::kernel::equeue::EV_CLEAR, udata);
+        let mut g = EQ_EVENTS.lock();
+        g.retain(|(e, i, _)| !(*e == eq && *i == id));
+        g.push((eq, id, udata));
+        crate::info!("sceAgcDriverAddEqEvent(equeue '{}', id {id:#x})", q.name);
+        0
+    }
+    fn sceAgcDriverDeleteEqEvent(eq: u64, id: i32) -> i32 {
+        let Some(q) = crate::hle::kernel::equeue::from_handle(eq) else { return ERR_EBADF };
+        q.remove(id as u64, crate::hle::kernel::equeue::EVFILT_GRAPHICS);
+        EQ_EVENTS.lock().retain(|(e, i, _)| !(*e == eq && *i == id));
+        0
+    }
+    /// Kevent {u64 ident, i16 filter, u16 flags, u32 fflags, u64 data, u64 udata}.
+    fn sceAgcDriverGetEqEventType(ev: *const u8) -> i32 {
+        if ev.is_null() { return 0; }
+        let filter = *(ev.add(8) as *const i16);
+        if filter == crate::hle::kernel::equeue::EVFILT_GRAPHICS { *(ev as *const u64) as i32 } else { *(ev.add(16) as *const u64) as i32 }
+    }
+    fn sceAgcDriverGetEqContextId(ev: *const u8) -> u32 {
+        if ev.is_null() { return 0; }
+        let filter = *(ev.add(8) as *const i16);
+        if filter == crate::hle::kernel::equeue::EVFILT_GRAPHICS { *(ev.add(16) as *const u64) as u32 } else { *(ev as *const u64) as u32 }
+    }
+
+    // ---- workload streams (GPU profiling of the title's workloads): accepted.
+    fn sceAgcDriverRegisterWorkloadStream(id: u32, stream: u64) -> i32 { 0 }
+    fn sceAgcDriverUnregisterWorkloadStream(id: u32) -> i32 { 0 }
 }
 
 pub fn register(r: &mut Registry) {
@@ -84,5 +166,8 @@ pub fn register(r: &mut Registry) {
         sceAgcDriverInitResourceRegistration, sceAgcDriverGetDefaultOwner, sceAgcDriverRegisterOwner,
         sceAgcDriverRegisterResource, sceAgcDriverUnregisterResource, sceAgcDriverUnregisterOwnerAndResources,
         sceAgcDriverGetResourceName, sceAgcDriverGetResourceType, sceAgcDriverIsCaptureInProgress,
+        sceAgcDriverSubmitDcb, sceAgcDriverSubmitMultiDcbs, sceAgcDriverSubmitAcb, sceAgcDriverSubmitMultiAcbs,
+        sceAgcDriverAddEqEvent, sceAgcDriverDeleteEqEvent, sceAgcDriverGetEqEventType, sceAgcDriverGetEqContextId,
+        sceAgcDriverRegisterWorkloadStream, sceAgcDriverUnregisterWorkloadStream,
     ]);
 }

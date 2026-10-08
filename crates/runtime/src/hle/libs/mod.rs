@@ -2,6 +2,7 @@
 
 pub mod acm;
 pub mod agc;
+pub mod agc_cmd;
 pub mod agc_defaults;
 pub mod agcdriver;
 pub mod ajm;
@@ -26,6 +27,7 @@ pub fn register(r: &mut Registry) {
     libc_internal::register(r);
     ampr::register(r);
     agc::register(r);
+    agc_cmd::register(r);
     agcdriver::register(r);
     fiber::register(r);
     audio2::register(r);

@@ -251,6 +251,7 @@ fn thread_summary_ex(with_stacks: bool) -> String {
             }
         }
     }
+    s.push_str(&gpu::status());
     s
 }
 
@@ -266,6 +267,7 @@ pub fn fatal_exit(code: u32, reason: &str) -> ! {
 }
 
 pub fn shutdown(code: i32) -> ! {
+    gpu::shutdown();
     info!("shutdown with status {code}\n{}", thread_summary());
     crate::log::flush();
     unsafe {
@@ -403,6 +405,14 @@ fn main() {
         }
     }
     let unresolved = hle::UNRESOLVED.read().len();
+    {
+        // Planning aid: every unresolved function import, by library.
+        let mut lines: Vec<String> = hle::UNRESOLVED.read().iter().map(|u| format!("{}	{}	{}", u.lib, u.nid, hle::describe_nid(&u.nid))).collect();
+        lines.sort();
+        let _ = std::fs::write(cfg.run_dir.join("unresolved.txt"), lines.join("
+") + "
+");
+    }
     info!("load+link+patch took {:.1} ms; {} distinct unresolved function imports", t0.elapsed().as_secs_f64() * 1000.0, unresolved);
 
     // Guest main thread.
