@@ -196,7 +196,10 @@ fn once(ctl: *mut i32, init: u64) -> i32 {
                 ONCE_CV.notify_all();
                 return 0;
             }
-            _ => ONCE_CV.wait(&mut g),
+            _ => {
+                let _w = crate::thread::waiting("pthread_once", state as *const _ as u64, None);
+                ONCE_CV.wait(&mut g)
+            }
         }
     }
 }

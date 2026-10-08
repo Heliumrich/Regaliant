@@ -193,15 +193,25 @@ struct AprFile {
     handle: Mutex<Option<Arc<File>>>,
 }
 
-static FILES: Mutex<Vec<Arc<AprFile>>> = Mutex::new(Vec::new());
-static FILE_BY_PATH: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+/// Registered files: ids index `files` (id - 1). One lock guards both maps.
+#[derive(Default)]
+struct FileTable {
+    files: Vec<Arc<AprFile>>,
+    by_path: HashMap<String, u32>,
+}
+
+static FILES: Mutex<Option<FileTable>> = Mutex::new(None);
 
 /// File ids start at 1 (0 is never valid).
 fn resolve_path(guest: &str) -> Result<(u32, u64), i32> {
-    if let Some(&id) = FILE_BY_PATH.lock().get_or_insert_with(HashMap::new).get(guest) {
-        let f = FILES.lock()[id as usize - 1].clone();
-        return Ok((id, f.size));
+    {
+        let mut g = FILES.lock();
+        let t = g.get_or_insert_with(Default::default);
+        if let Some(&id) = t.by_path.get(guest) {
+            return Ok((id, t.files[id as usize - 1].size));
+        }
     }
+    // Filesystem queries run without the lock.
     let Some(host) = crate::hle::kernel::fs::host_path_existing(guest) else {
         return Err(ENOENT);
     };
@@ -209,15 +219,20 @@ fn resolve_path(guest: &str) -> Result<(u32, u64), i32> {
     if md.is_dir() {
         return Err(EISDIR);
     }
-    let mut files = FILES.lock();
-    files.push(Arc::new(AprFile { path: guest.to_string(), host, size: md.len(), handle: Mutex::new(None) }));
-    let id = files.len() as u32;
-    FILE_BY_PATH.lock().get_or_insert_with(HashMap::new).insert(guest.to_string(), id);
+    let mut g = FILES.lock();
+    let t = g.get_or_insert_with(Default::default);
+    // Another thread may have registered the path meanwhile.
+    if let Some(&id) = t.by_path.get(guest) {
+        return Ok((id, t.files[id as usize - 1].size));
+    }
+    t.files.push(Arc::new(AprFile { path: guest.to_string(), host, size: md.len(), handle: Mutex::new(None) }));
+    let id = t.files.len() as u32;
+    t.by_path.insert(guest.to_string(), id);
     Ok((id, md.len()))
 }
 
 fn file(id: u32) -> Option<Arc<AprFile>> {
-    FILES.lock().get((id as usize).wrapping_sub(1)).cloned()
+    FILES.lock().as_ref()?.files.get((id as usize).wrapping_sub(1)).cloned()
 }
 
 fn open_handle(f: &AprFile) -> Result<Arc<File>, i32> {
@@ -345,6 +360,7 @@ fn submit(cb: u64, prio: u32, result: u64) -> Result<u32, i32> {
 
 fn worker(n: usize, q: &'static Queue) {
     crate::log::set_thread_name(&format!("apr{n}"));
+    crate::exception::arm_watch_current_thread();
     loop {
         let s = {
             let mut g = q.pending.lock();
@@ -577,6 +593,7 @@ fn execute(s: &Submission) -> (i32, u32) {
 
 fn wait_done(id: u32) -> Result<(i32, u32), i32> {
     let mut g = DONE.lock();
+    let _w = crate::thread::waiting("apr completion", id as u64, None);
     loop {
         if let Some(r) = g.get_or_insert_with(HashMap::new).remove(&id) {
             return Ok(r);

@@ -4,6 +4,7 @@
 #[macro_use]
 mod log;
 mod ehframe;
+mod audio;
 mod exception;
 mod gpu;
 mod hle;
@@ -182,6 +183,10 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 *hle::libs::ime_dialog::CONTROL_TEXT.lock() = Some(text);
                 Ok(())
             }
+            "stacks" => {
+                info!("guest thread stacks:\n{}", thread_summary_ex(true));
+                Ok(())
+            }
             "vmas" => {
                 // Debug: guest address space layout.
                 let m = crate::mem::MEM.lock();
@@ -214,17 +219,36 @@ pub fn fatal_report(text: &str) {
 }
 
 fn thread_summary() -> String {
+    thread_summary_ex(false)
+}
+
+/// Guest threads and their states; with `with_stacks`, each running thread is
+/// sampled (rip, frame chain, guest return addresses) for hang diagnosis.
+fn thread_summary_ex(with_stacks: bool) -> String {
     let mut s = String::new();
-    if let Some(threads) = thread::THREADS.try_lock() {
-        for t in threads.iter() {
-            let state = match t.exited.try_lock() {
-                Some(g) => match *g {
-                    Some(v) => format!("exited({v:#x})"),
-                    None => "running".into(),
-                },
-                None => "?".into(),
-            };
-            s.push_str(&format!("    thread {} '{}' host-tid {} {}\n", t.id, t.name(), t.host_tid.load(std::sync::atomic::Ordering::Relaxed), state));
+    let list: Vec<&'static thread::GuestThread> = match thread::THREADS.try_lock() {
+        Some(threads) => threads.iter().copied().collect(),
+        None => return s,
+    };
+    for t in list {
+        let state = match t.exited.try_lock() {
+            Some(g) => match *g {
+                Some(v) => format!("exited({v:#x})"),
+                None => "running".into(),
+            },
+            None => "?".into(),
+        };
+        let tid = t.host_tid.load(std::sync::atomic::Ordering::Relaxed);
+        s.push_str(&format!("    thread {} '{}' host-tid {} {}\n", t.id, t.name(), tid, state));
+        if state == "running" {
+            if let Some(w) = thread::describe_wait(t) {
+                s.push_str(&format!("        {w}\n"));
+            }
+        }
+        if with_stacks && state == "running" {
+            if let Some(st) = exception::sample_thread(tid as u32, 16) {
+                s.push_str(&format!("        {st}\n"));
+            }
         }
     }
     s
@@ -438,7 +462,7 @@ fn main() {
         }
         if let Some(s) = cfg.seconds {
             if start.elapsed() >= Duration::from_secs(s) {
-                info!("time limit of {s}s reached");
+                info!("time limit of {s}s reached; guest thread stacks:\n{}", thread_summary_ex(true));
                 shutdown(0);
             }
         }

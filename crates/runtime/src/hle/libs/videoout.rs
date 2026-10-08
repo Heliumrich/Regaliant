@@ -256,9 +256,10 @@ sysv! {
             p.sets[set as usize] = Some(a);
             let mut addrs = Vec::new();
             for i in 0..num as usize {
-                // VideoOutBuffers entries: {data, metadata} (stride confirmed below by logging).
-                let data = *bufs.add(i * 2);
-                let meta = *bufs.add(i * 2 + 1);
+                // SceVideoOutBuffers entries: {data, metadata, reserved[2]}
+                // (32 bytes; the title fills them at eboot+0x90a99b/0x90a9c6).
+                let data = *bufs.add(i * 4);
+                let meta = *bufs.add(i * 4 + 1);
                 p.buffers[start as usize + i] = Some(DisplayBuffer { addr: data, metadata: meta, set });
                 addrs.push((data, meta));
             }

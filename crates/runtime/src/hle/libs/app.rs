@@ -2,7 +2,6 @@
 
 use crate::hle::{Registry, cstr, write_cstr};
 use crate::{fixed, reg, sysv};
-use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -86,24 +85,41 @@ fn json_int(key: &str) -> Option<i64> {
 
 pub const USER_ID: i32 = 1;
 static USER_EVENT_SENT: AtomicBool = AtomicBool::new(false);
-static PLAYGO_CHUNKS: Mutex<Option<u32>> = Mutex::new(None);
+static PLAYGO_CHUNKS: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
 
-/// PS5 packages define chunks in `playgo-chunkdefs.xml` (Bluepoint packaging
-/// file at the application root). Every enabled chunk is installed in the
-/// supplied tree, so all report as local.
-fn playgo_chunk_count() -> u32 {
-    let mut g = PLAYGO_CHUNKS.lock();
-    if let Some(n) = *g {
-        return n;
-    }
-    let n = crate::hle::kernel::fs::host_path_existing("/app0/playgo-chunkdefs.xml")
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|x| x.matches("<chunk id=").count() as u32)
-        .filter(|&n| n > 0)
-        .unwrap_or(1);
-    crate::info!("PlayGo: {n} chunk definition(s), all reported installed (local)");
-    *g = Some(n);
-    n
+const PLAYGO_HANDLE: i32 = 1;
+const LOCUS_LOCAL_FAST: i8 = 3;
+const PG_INVALID_ARGUMENT: i32 = 0x80B2_0004u32 as i32;
+const PG_BAD_HANDLE: i32 = 0x80B2_0009u32 as i32;
+const PG_BAD_POINTER: i32 = 0x80B2_000Au32 as i32;
+const PG_BAD_SIZE: i32 = 0x80B2_000Bu32 as i32;
+const PG_BAD_CHUNK_ID: i32 = 0x80B2_000Cu32 as i32;
+const PG_BAD_SPEED: i32 = 0x80B2_000Du32 as i32;
+const PG_BAD_LOCUS: i32 = 0x80B2_0010u32 as i32;
+
+/// PS5 packages define chunks in `playgo-chunkdefs.xml` (packaging file at
+/// the application root). Every defined chunk is installed in the supplied
+/// tree, so all report as local. Returns the defined chunk ids, sorted.
+fn playgo_chunks() -> &'static [u16] {
+    PLAYGO_CHUNKS.get_or_init(|| {
+        let mut ids: Vec<u16> = crate::hle::kernel::fs::host_path_existing("/app0/playgo-chunkdefs.xml")
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|x| {
+                x.split("<chunk id=\"").skip(1).filter_map(|t| t.split('"').next()?.parse::<u16>().ok()).collect()
+            })
+            .unwrap_or_default();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            ids.push(0);
+        }
+        crate::info!("PlayGo: {} chunk definition(s) (ids {}..={}), all reported installed (local)", ids.len(), ids[0], ids[ids.len() - 1]);
+        ids
+    })
+}
+
+fn chunk_defined(id: u16) -> bool {
+    playgo_chunks().binary_search(&id).is_ok()
 }
 
 static PLAYGO_SPEED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1); // TRICKLE
@@ -201,43 +217,77 @@ sysv! {
         0
     }
 
-    // ---- PlayGo
+    // ---- PlayGo: argument checks and error codes follow the library's
+    // documented behavior (codes per public sources, docs/PROVENANCE.md). Titles
+    // probe chunk ids and rely on BAD_CHUNK_ID for undefined ones: this
+    // title collects accepted ids (0..999 probed) into a 128-bit set.
     fn scePlayGoOpen(handle: *mut i32, param: *const u8) -> i32 {
-        if !handle.is_null() { *handle = 1; }
-        playgo_chunk_count();
+        if handle.is_null() { return PG_BAD_POINTER; }
+        if !param.is_null() { return PG_INVALID_ARGUMENT; }
+        playgo_chunks();
+        *handle = PLAYGO_HANDLE;
         0
     }
     fn scePlayGoGetLocus(handle: i32, ids: *const u16, n: u32, loci: *mut i8) -> i32 {
-        for i in 0..n as usize { *loci.add(i) = 3; } // LOCAL_FAST
+        if handle != PLAYGO_HANDLE { return PG_BAD_HANDLE; }
+        if ids.is_null() || loci.is_null() { return PG_BAD_POINTER; }
+        if n == 0 { return PG_BAD_SIZE; }
+        for i in 0..n as usize {
+            if !chunk_defined(*ids.add(i)) { return PG_BAD_CHUNK_ID; }
+            *loci.add(i) = LOCUS_LOCAL_FAST;
+        }
         0
     }
     fn scePlayGoGetInstallSpeed(handle: i32, speed: *mut i32) -> i32 {
-        if speed.is_null() { return 0x80B2_0002u32 as i32; }
+        if handle != PLAYGO_HANDLE { return PG_BAD_HANDLE; }
+        if speed.is_null() { return PG_BAD_POINTER; }
         *speed = PLAYGO_SPEED.load(Ordering::Relaxed);
         0
     }
     fn scePlayGoSetInstallSpeed(handle: i32, speed: i32) -> i32 {
+        if handle != PLAYGO_HANDLE { return PG_BAD_HANDLE; }
+        if !(0..=2).contains(&speed) { return PG_BAD_SPEED; }
         PLAYGO_SPEED.store(speed, Ordering::Relaxed);
         0
     }
     fn scePlayGoGetEta(handle: i32, ids: *const u16, n: u32, eta: *mut i64) -> i32 {
-        if !eta.is_null() { *eta = 0; } // installed
+        if handle != PLAYGO_HANDLE { return PG_BAD_HANDLE; }
+        if ids.is_null() || eta.is_null() { return PG_BAD_POINTER; }
+        if n == 0 { return PG_BAD_SIZE; }
+        for i in 0..n as usize {
+            if !chunk_defined(*ids.add(i)) { return PG_BAD_CHUNK_ID; }
+        }
+        *eta = 0; // installed
         0
     }
     fn scePlayGoGetToDoList(handle: i32, todo: *mut u8, n: u32, entries: *mut u32) -> i32 {
-        if !entries.is_null() { *entries = 0; } // nothing left to install
+        if handle != PLAYGO_HANDLE { return PG_BAD_HANDLE; }
+        if entries.is_null() || (n != 0 && todo.is_null()) { return PG_BAD_POINTER; }
+        *entries = 0; // nothing left to install
         0
     }
-    fn scePlayGoPrefetch(handle: i32, ids: *const u16, n: u32, min_locus: i32) -> i32 { 0 }
+    fn scePlayGoPrefetch(handle: i32, ids: *const u16, n: u32, min_locus: i32) -> i32 {
+        if handle != PLAYGO_HANDLE { return PG_BAD_HANDLE; }
+        if ids.is_null() { return PG_BAD_POINTER; }
+        if n == 0 { return PG_BAD_SIZE; }
+        if !matches!(min_locus, 0 | 2 | 3) { return PG_BAD_LOCUS; }
+        for i in 0..n as usize {
+            if !chunk_defined(*ids.add(i)) { return PG_BAD_CHUNK_ID; }
+        }
+        0
+    }
+    /// With no list and no entries requested, reports the number of chunks.
     fn scePlayGoGetChunkId(handle: i32, out: *mut u16, n: u32, entries: *mut u32) -> i32 {
-        let count = playgo_chunk_count();
+        if handle != PLAYGO_HANDLE { return PG_BAD_HANDLE; }
+        if entries.is_null() || (n != 0 && out.is_null()) { return PG_BAD_POINTER; }
+        let chunks = playgo_chunks();
         if out.is_null() {
-            if !entries.is_null() { *entries = count; }
+            *entries = chunks.len() as u32;
             return 0;
         }
-        let k = count.min(n);
-        for i in 0..k { *out.add(i as usize) = i as u16; }
-        if !entries.is_null() { *entries = k; }
+        let k = chunks.len().min(n as usize);
+        for (i, id) in chunks[..k].iter().enumerate() { *out.add(i) = *id; }
+        *entries = k as u32;
         0
     }
 }

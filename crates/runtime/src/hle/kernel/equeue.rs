@@ -78,6 +78,7 @@ impl Equeue {
     }
     fn wait(&self, out: &mut [Kevent], deadline: Option<Instant>) -> usize {
         let mut e = self.events.lock();
+        let mut _w = None;
         loop {
             let mut n = 0;
             for x in e.iter_mut() {
@@ -92,6 +93,9 @@ impl Equeue {
             }
             if n > 0 {
                 return n;
+            }
+            if _w.is_none() {
+                _w = Some(crate::thread::waiting(if deadline.is_some() { "equeue (timed)" } else { "equeue" }, self as *const _ as u64, Some(equeue_detail)));
             }
             match deadline {
                 Some(d) => {
@@ -111,6 +115,17 @@ impl Equeue {
                 None => self.cv.wait(&mut e),
             }
         }
+    }
+}
+
+fn equeue_detail(p: u64) -> String {
+    let q = unsafe { &*(p as *const Equeue) };
+    match q.events.try_lock() {
+        Some(e) => {
+            let evs: Vec<String> = e.iter().take(8).map(|x| format!("({},{})", x.ev.ident, x.ev.filter)).collect();
+            format!("'{}' {} event(s) {}", q.name, e.len(), evs.join(" "))
+        }
+        None => format!("'{}'", q.name),
     }
 }
 

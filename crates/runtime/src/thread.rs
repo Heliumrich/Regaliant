@@ -64,6 +64,57 @@ pub struct GuestThread {
     pub affinity: AtomicU64,
     pub specific: Mutex<Vec<u64>>,
     pub host_tid: AtomicU64,
+    /// Set while the thread is blocked inside an HLE wait (stall diagnostics).
+    pub wait: Mutex<Option<WaitInfo>>,
+}
+
+/// What a guest thread is blocked on inside an HLE wait.
+pub struct WaitInfo {
+    pub what: &'static str,
+    pub obj: u64,
+    pub since: std::time::Instant,
+    /// Object-specific details (owner, count, ...); must not block.
+    pub detail: Option<fn(u64) -> String>,
+}
+
+/// Clears the current thread's wait record when dropped.
+pub struct WaitGuard(Option<&'static GuestThread>);
+
+impl Drop for WaitGuard {
+    fn drop(&mut self) {
+        if let Some(t) = self.0 {
+            *t.wait.lock() = None;
+        }
+    }
+}
+
+/// Records that the current guest thread is about to block on `obj`.
+pub fn waiting(what: &'static str, obj: u64, detail: Option<fn(u64) -> String>) -> WaitGuard {
+    let t = current();
+    if let Some(t) = t {
+        *t.wait.lock() = Some(WaitInfo { what, obj, since: std::time::Instant::now(), detail });
+    }
+    WaitGuard(t)
+}
+
+/// "blocked 1.2s in mutex 0x... <detail>" for a thread inside an HLE wait.
+pub fn describe_wait(t: &GuestThread) -> Option<String> {
+    let w = t.wait.try_lock()?;
+    let w = w.as_ref()?;
+    let mut s = format!("blocked {:.2}s in {} {:#x}", w.since.elapsed().as_secs_f64(), w.what, w.obj);
+    if let Some(d) = w.detail {
+        s.push(' ');
+        s.push_str(&d(w.obj));
+    }
+    Some(s)
+}
+
+/// Guest thread id -> name, without blocking (diagnostics).
+pub fn name_of(id: u64) -> String {
+    match THREADS.try_lock() {
+        Some(list) => list.iter().find(|t| t.id == id).map(|t| format!("{id} '{}'", t.name())).unwrap_or_else(|| id.to_string()),
+        None => id.to_string(),
+    }
 }
 
 impl GuestThread {
@@ -113,6 +164,7 @@ pub fn new_thread(name: &str, entry: u64, arg: u64, stack_size: u64, priority: i
         affinity: AtomicU64::new(0x7F),
         specific: Mutex::new(vec![0; PTHREAD_KEYS_MAX]),
         host_tid: AtomicU64::new(0),
+        wait: Mutex::new(None),
     }));
     let tp = crate::tls::alloc_thread_area(t.handle());
     t.tp.store(tp, Ordering::SeqCst);
@@ -126,6 +178,7 @@ pub fn enter(t: &'static GuestThread) {
     crate::tls::set_current_tp(t.tp.load(Ordering::SeqCst));
     crate::log::set_thread_name(&t.name());
     t.host_tid.store(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } as u64, Ordering::SeqCst);
+    crate::exception::arm_watch_current_thread();
 }
 
 /// Runs guest code `entry(a0, a1)` on the current (already entered) thread.
@@ -217,6 +270,7 @@ pub fn spawn(t: &'static GuestThread) -> std::io::Result<()> {
 
 pub fn join(t: &'static GuestThread) -> u64 {
     let mut g = t.exited.lock();
+    let _w = if g.is_none() { Some(waiting("join", t.handle(), Some(|h| format!("thread {}", unsafe { &*(h as *const GuestThread) }.name())))) } else { None };
     while g.is_none() {
         t.exit_cv.wait(&mut g);
     }

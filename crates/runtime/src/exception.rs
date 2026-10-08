@@ -14,6 +14,204 @@ static IN_HANDLER: AtomicBool = AtomicBool::new(false);
 /// Host thread id of the thread producing the fatal report.
 static REPORTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Samples a running thread: suspends it, reads its context and unwinds it
+/// (see `unwind`), then resumes it and symbolizes the frames. Nothing is
+/// allocated while the thread is suspended (it may hold the heap lock).
+/// Used for hang diagnosis (time limit, control command `stacks`).
+pub fn sample_thread(host_tid: u32, depth: usize) -> Option<String> {
+    use windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext;
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME};
+    const CONTEXT_FULL_AMD64: u32 = 0x0010_000B;
+    if host_tid == 0 || host_tid == unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } {
+        return None;
+    }
+    let mut host = [0u64; 24];
+    let mut guest = [0u64; 32];
+    let (mut nh, mut ng) = (0usize, 0usize);
+    let mut ok = false;
+    unsafe {
+        let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, host_tid);
+        if h.is_null() {
+            return None;
+        }
+        if SuspendThread(h) != u32::MAX {
+            let mut c: AlignedContext = std::mem::zeroed();
+            c.0.ContextFlags = CONTEXT_FULL_AMD64;
+            if GetThreadContext(h, &mut c.0) != 0 {
+                (nh, ng) = unwind(&mut c, &mut host, &mut guest[..depth.min(32)]);
+                ok = true;
+            }
+            ResumeThread(h);
+        }
+        windows_sys::Win32::Foundation::CloseHandle(h);
+    }
+    if !ok {
+        return None;
+    }
+    let mut s = String::new();
+    if nh > 0 {
+        let names: Vec<String> = host[..nh].iter().map(|&a| host_symbol(a)).collect();
+        s.push_str(&format!("host: {}\n        ", names.join(" <- ")));
+    }
+    let g: Vec<String> = guest[..ng].iter().map(|&a| describe(a)).collect();
+    s.push_str(&format!("guest: {}", if g.is_empty() { "(no guest frames)".to_string() } else { g.join(" <- ") }));
+    Some(s)
+}
+
+#[repr(C, align(16))]
+struct AlignedContext(CONTEXT);
+
+fn readable(a: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
+    if a < 0x10000 {
+        return false;
+    }
+    unsafe {
+        let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        VirtualQuery(a as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) != 0
+            && mbi.State == MEM_COMMIT
+            && mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
+            && mbi.Protect != 0
+            && a + 16 <= mbi.BaseAddress as u64 + mbi.RegionSize as u64
+    }
+}
+
+/// Unwinds a context of this process. Host frames are unwound with the
+/// registered unwind tables (RtlVirtualUnwind) until rip lands in guest code;
+/// that first guest frame is exact (the guest call site of the HLE function),
+/// later ones follow the guest frame-pointer chain. Fills the arrays without
+/// allocating; returns (host frames, guest frames).
+unsafe fn unwind(c: &mut AlignedContext, host: &mut [u64], guest: &mut [u64]) -> (usize, usize) {
+    use windows_sys::Win32::System::Diagnostics::Debug::{RtlLookupFunctionEntry, RtlVirtualUnwind};
+    let (mut nh, mut ng) = (0usize, 0usize);
+    for _ in 0..64 {
+        let pc = c.0.Rip;
+        if pc == 0 || in_guest(pc) {
+            break;
+        }
+        if nh < host.len() {
+            host[nh] = pc;
+            nh += 1;
+        }
+        let mut base = 0u64;
+        let fe = unsafe { RtlLookupFunctionEntry(pc, &mut base, std::ptr::null_mut()) };
+        if fe.is_null() {
+            // Leaf function or code without unwind data: return address at [rsp].
+            if !readable(c.0.Rsp) {
+                return (nh, ng);
+            }
+            c.0.Rip = unsafe { *(c.0.Rsp as *const u64) };
+            c.0.Rsp += 8;
+        } else {
+            let mut handler_data = std::ptr::null_mut();
+            let mut establisher = 0u64;
+            unsafe { RtlVirtualUnwind(0, base, pc, fe, &mut c.0, &mut handler_data, &mut establisher, std::ptr::null_mut()) };
+        }
+    }
+    if !in_guest(c.0.Rip) || guest.is_empty() {
+        return (nh, ng);
+    }
+    guest[0] = c.0.Rip;
+    ng = 1;
+    let mut bp = c.0.Rbp;
+    while ng < guest.len() && bp & 7 == 0 && readable(bp) {
+        let ret = unsafe { *((bp + 8) as *const u64) };
+        if ret < 0x10000 {
+            break;
+        }
+        guest[ng] = ret;
+        ng += 1;
+        let next = unsafe { *(bp as *const u64) };
+        if next <= bp {
+            break;
+        }
+        bp = next;
+    }
+    (nh, ng)
+}
+
+/// Whether unwinding `ctx` reaches our image or guest code within `depth` frames.
+unsafe fn called_from_our_code(ctx: &CONTEXT, depth: usize) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::{RtlLookupFunctionEntry, RtlVirtualUnwind};
+    let (b, e) = host_image();
+    let mut c: AlignedContext = unsafe { std::mem::zeroed() };
+    c.0 = *ctx;
+    for _ in 0..depth {
+        let pc = c.0.Rip;
+        let mut base = 0u64;
+        let fe = unsafe { RtlLookupFunctionEntry(pc, &mut base, std::ptr::null_mut()) };
+        if fe.is_null() {
+            if !readable(c.0.Rsp) {
+                return false;
+            }
+            c.0.Rip = unsafe { *(c.0.Rsp as *const u64) };
+            c.0.Rsp += 8;
+        } else {
+            let mut handler_data = std::ptr::null_mut();
+            let mut establisher = 0u64;
+            unsafe { RtlVirtualUnwind(0, base, pc, fe, &mut c.0, &mut handler_data, &mut establisher, std::ptr::null_mut()) };
+        }
+        let pc = c.0.Rip;
+        if (pc >= b && pc < e) || in_guest(pc) {
+            return true;
+        }
+    }
+    false
+}
+
+/// "frames: a <- b <- ..." for a fault context (no symbol lookups).
+unsafe fn frames_line(ctx: &CONTEXT) -> String {
+    let mut c: AlignedContext = unsafe { std::mem::zeroed() };
+    c.0 = *ctx;
+    let mut host = [0u64; 16];
+    let mut guest = [0u64; 16];
+    let (nh, ng) = unsafe { unwind(&mut c, &mut host, &mut guest) };
+    let mut v: Vec<String> = host[..nh].iter().map(|&a| format!("{a:#x}")).collect();
+    v.extend(guest[..ng].iter().map(|&a| describe(a)));
+    format!("frames: {}", v.join(" <- "))
+}
+
+/// Name of a host code address: dbghelp symbol (our PDB, or a DLL's
+/// exports) + offset. The symbol search path is our executable's directory
+/// only, so no symbol server is ever contacted.
+fn host_symbol(addr: u64) -> String {
+    use windows_sys::Win32::System::Diagnostics::Debug::{SYMBOL_INFOW, SYMOPT_DEFERRED_LOADS, SYMOPT_UNDNAME, SymFromAddrW, SymInitializeW, SymSetOptions};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    static SYM: parking_lot::Mutex<Option<bool>> = parking_lot::Mutex::new(None);
+    let mut g = SYM.lock();
+    let ready = *g.get_or_insert_with(|| unsafe {
+        let dir: Vec<u16> = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .map(|d| d.as_os_str().to_string_lossy().into_owned())
+            .unwrap_or_default()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        SymInitializeW(GetCurrentProcess(), dir.as_ptr(), 1) != 0
+    });
+    let (b, e) = host_image();
+    let fallback = if addr >= b && addr < e { format!("dsport+{:#x}", addr - b) } else { format!("{addr:#x}") };
+    if !ready {
+        return fallback;
+    }
+    unsafe {
+        let mut buf = [0u64; (std::mem::size_of::<SYMBOL_INFOW>() + 2 * 256) / 8 + 1];
+        let si = buf.as_mut_ptr() as *mut SYMBOL_INFOW;
+        (*si).SizeOfStruct = std::mem::size_of::<SYMBOL_INFOW>() as u32;
+        (*si).MaxNameLen = 255;
+        let mut disp = 0u64;
+        if SymFromAddrW(GetCurrentProcess(), addr, &mut disp, si) != 0 {
+            let n = ((*si).NameLen as usize).min(255);
+            let name = String::from_utf16_lossy(std::slice::from_raw_parts((*si).Name.as_ptr(), n));
+            format!("{name}+{disp:#x}")
+        } else {
+            fallback
+        }
+    }
+}
+
 /// [start, end) of our own executable image.
 pub fn host_image() -> (u64, u64) {
     *HOST_IMAGE.get_or_init(|| unsafe {
@@ -287,7 +485,64 @@ unsafe fn handle_breakpoint(ctx: &mut CONTEXT) -> bool {
 }
 
 /// Single-step after a non-`push rbp` breakpoint: re-arms it.
+/// `DS_WATCH=<hex address>`: a hardware write watchpoint (DR0, 8 bytes) armed
+/// on every guest thread and runtime worker thread; each hit is logged with
+/// the written value and the writer's frames (first 64 hits).
+static WATCH: OnceLock<u64> = OnceLock::new();
+static WATCH_HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn watch_addr() -> u64 {
+    *WATCH.get_or_init(|| {
+        std::env::var("DS_WATCH").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0) & !7
+    })
+}
+
+/// Arms the `DS_WATCH` watchpoint on the calling thread (no-op without it).
+pub fn arm_watch_current_thread() {
+    use windows_sys::Win32::System::Diagnostics::Debug::{GetThreadContext, SetThreadContext};
+    use windows_sys::Win32::System::Threading::GetCurrentThread;
+    const CONTEXT_DEBUG_REGISTERS_AMD64: u32 = 0x0010_0010;
+    let a = watch_addr();
+    if a == 0 {
+        return;
+    }
+    unsafe {
+        let mut c: AlignedContext = std::mem::zeroed();
+        c.0.ContextFlags = CONTEXT_DEBUG_REGISTERS_AMD64;
+        if GetThreadContext(GetCurrentThread(), &mut c.0) == 0 {
+            return;
+        }
+        c.0.Dr0 = a;
+        // L0 enable, RW0 = 01 (data writes), LEN0 = 10 (8 bytes).
+        c.0.Dr7 = (c.0.Dr7 & !0x000F_0003) | 1 | (1 << 16) | (2 << 18);
+        if SetThreadContext(GetCurrentThread(), &c.0) == 0 {
+            crate::warn!("DS_WATCH: SetThreadContext failed on this thread");
+        }
+    }
+}
+
+unsafe fn handle_watch_hit(ctx: &mut CONTEXT) -> bool {
+    if ctx.Dr6 & 1 == 0 || watch_addr() == 0 {
+        return false;
+    }
+    ctx.Dr6 = 0;
+    let n = WATCH_HITS.fetch_add(1, Ordering::Relaxed);
+    if n < 64 {
+        let a = watch_addr();
+        let v = unsafe { *(a as *const u64) };
+        let frames = unsafe { frames_line(ctx) };
+        crate::log::write(
+            crate::log::Level::Info,
+            format_args!("watch hit #{n}: [{a:#x}] = {v:#018x} by [{}] at {}; {frames}", crate::log::thread_name(), describe(ctx.Rip)),
+        );
+    }
+    true
+}
+
 unsafe fn handle_single_step(ctx: &mut CONTEXT) -> bool {
+    if unsafe { handle_watch_hit(ctx) } {
+        return true;
+    }
     let bp = REARM.with(|r| r.replace(0));
     if bp == 0 {
         return false;
@@ -330,12 +585,23 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
         let in_host = rip >= host.0 && rip < host.1;
         let stub = crate::loader::STUBS.try_lock().and_then(|s| s.describe(rip)).is_some();
         if !in_guest(rip) && !in_host && !stub {
-            return EXCEPTION_CONTINUE_SEARCH;
+            // A fault in another module counts as ours when the faulting
+            // function was called (almost) directly by our image or by guest
+            // code, e.g. the C runtime's memcpy given a bad guest pointer.
+            // Exceptions deeper inside system code are left to its handlers.
+            if code != 0xC0000005 || !called_from_our_code(ctx, 3) {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
         }
         let me = windows_sys::Win32::System::Threading::GetCurrentThreadId();
         if IN_HANDLER.swap(true, Ordering::SeqCst) {
             if REPORTER.load(Ordering::SeqCst) == me {
-                // A fault inside the report itself: stop immediately.
+                // A fault inside the report itself: note it and stop immediately.
+                {
+                    use std::io::Write;
+                    let _ = writeln!(std::io::stderr(), "nested fault {code:#010x} at {rip:#x} while writing a fatal report");
+                }
+                crate::log::try_flush();
                 windows_sys::Win32::System::Threading::TerminateProcess(
                     windows_sys::Win32::System::Threading::GetCurrentProcess(),
                     0xD50F,
@@ -345,8 +611,9 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
             // and park until that report terminates the process.
             crate::log::write(
                 crate::log::Level::Error,
-                format_args!("concurrent fatal fault {:#010x} at {} [{}]", code, describe(rip), crate::log::thread_name()),
+                format_args!("concurrent fatal fault {:#010x} at {} [{}]; {}", code, describe(rip), crate::log::thread_name(), frames_line(ctx)),
             );
+            crate::log::try_flush();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
@@ -358,6 +625,9 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
         let mut r = String::new();
         use std::fmt::Write;
         let _ = writeln!(r, "FATAL {} ({:#010x}) at {} [{}]", code_name(code), code, describe(rip), crate::log::thread_name());
+        // The first line goes out at once: if composing the rest faults, it survives.
+        crate::log::write(crate::log::Level::Error, format_args!("fatal fault (report follows): {}", r.trim_end()));
+        crate::log::try_flush();
         if in_guest(rip) && *(rip as *const u8) == 0xCD && *((rip + 1) as *const u8) == 0x45 {
             // PS5 libc's fatal-error trap: `mov dword ptr fs:[28h], code; int 45h`
             // (the FS store is rewritten to the guest TCB).
@@ -455,32 +725,23 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
             }
         }
         if code != 0xC00000FD {
-            let mut lo = 0usize;
-            let mut hi = 0usize;
-            windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut lo, &mut hi);
-            let (lo, hi) = (lo as u64, hi as u64);
-            // Frame-pointer chain.
-            let _ = writeln!(r, "  backtrace (rbp chain):");
-            let mut bp = ctx.Rbp;
-            for i in 0..32 {
-                if bp < lo || bp + 16 > hi || bp & 7 != 0 {
-                    break;
+            // Exact host frames (unwind tables) down to the first guest frame,
+            // then the guest frame-pointer chain (checked page by page, so it
+            // also works on guest-allocated fiber stacks).
+            let mut c: AlignedContext = std::mem::zeroed();
+            c.0 = *ctx;
+            let mut host = [0u64; 24];
+            let mut guest = [0u64; 32];
+            let (nh, ng) = unwind(&mut c, &mut host, &mut guest);
+            if nh > 0 {
+                let _ = writeln!(r, "  host frames:");
+                for &a in &host[..nh] {
+                    let _ = writeln!(r, "    {}", host_symbol(a));
                 }
-                let ret = *((bp + 8) as *const u64);
-                let _ = writeln!(r, "    #{i:<2} {}", describe(ret));
-                bp = *(bp as *const u64);
             }
-            // Stack words that point into guest code.
-            let _ = writeln!(r, "  stack scan (guest return candidates):");
-            let mut sp = ctx.Rsp & !7;
-            let mut n = 0;
-            while sp + 8 <= hi && n < 24 && sp < ctx.Rsp + 0x2000 {
-                let v = *(sp as *const u64);
-                if in_guest(v) {
-                    let _ = writeln!(r, "    [rsp+{:#06x}] {}", sp - ctx.Rsp, describe(v));
-                    n += 1;
-                }
-                sp += 8;
+            let _ = writeln!(r, "  guest frames:");
+            for &a in &guest[..ng] {
+                let _ = writeln!(r, "    {}", describe(a));
             }
         }
         crate::fatal_report(&r);

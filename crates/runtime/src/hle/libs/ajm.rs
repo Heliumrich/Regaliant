@@ -1,298 +1,612 @@
-//! libSceAjm batch execution. Batch buffers use an internal job format (both
-//! the builders and the executor are HLE). ATRAC9 is currently decoded as
-//! frame-accurate silence: stream bookkeeping (input consumed, samples written,
-//! sidebands) follows the codec configuration, but PCM output is zero. This is
-//! logged once per instance; a real ATRAC9 decoder replaces it later.
+//! libSceAjm (PS5 batch API): audio decode jobs.
+//!
+//! The title builds batches with `sceAjmBatchJob*` into its own buffer and
+//! starts them with `sceAjmBatchStart`. Jobs are encoded here in this
+//! implementation's own format, at the record sizes the system library uses
+//! (control 48 bytes, run 64 bytes; see docs/PROVENANCE.md), and executed at
+//! BatchStart (the title may fill input buffers after building the batch).
+//!
+//! Codecs: ATRAC9 via LibAtrac9 (MIT, third_party/libatrac9), MP3 via minimp3
+//! (CC0, third_party/minimp3). Other codecs fail their jobs with an explicit
+//! "not supported" result (logged).
+//!
+//! Sideband output layout used by the title (eboot+0x1de2412):
+//! SidebandResult{i32 result, i32 internal}, then SidebandStream{i32 consumed,
+//! i32 produced, u64 total_decoded_samples} (flag bit 47), then
+//! SidebandMFrame{u32 num_frames, u32} (RUN_MULTIPLE_FRAMES, bit 12).
 
 use crate::hle::Registry;
-use crate::{fixed, reg, sysv};
+use crate::{reg, sysv};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-const JOB_MAGIC: u32 = 0x4A4D_4A41; // "AJMJ"
-const KIND_CONTROL: u32 = 1;
-const KIND_RUN: u32 = 2;
-
-const ERR_INVALID: i32 = 0x8093_0003u32 as i32;
-const AT9_SAMPLE_RATES: [u32; 16] = [11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 44100, 48000, 64000, 88200, 96000, 128000, 176400, 192000];
-const AT9_FRAME_SAMPLES_POW: [u32; 16] = [6, 6, 7, 7, 7, 8, 8, 8, 6, 6, 7, 7, 7, 8, 8, 8];
-const AT9_CHANNELS: [u32; 6] = [1, 2, 2, 6, 8, 4];
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Job {
-    magic: u32,
-    kind: u32,
-    instance: u32,
-    pad: u32,
-    flags: u64,
-    sb_in: u64,
-    sb_in_size: u64,
-    data_in: u64,
-    data_in_size: u64,
-    data_out: u64,
-    data_out_size: u64,
-    sb_out: u64,
-    sb_out_size: u64,
+unsafe extern "C" {
+    fn Atrac9GetHandle() -> *mut c_void;
+    fn Atrac9ReleaseHandle(h: *mut c_void);
+    fn Atrac9InitDecoder(h: *mut c_void, config: *mut u8) -> i32;
+    fn Atrac9Decode(h: *mut c_void, data: *const u8, pcm: *mut i16, used: *mut i32) -> i32;
+    fn Atrac9GetCodecInfo(h: *mut c_void, info: *mut At9Info) -> i32;
+    fn ds_mp3_new() -> *mut c_void;
+    fn ds_mp3_free(d: *mut c_void);
+    fn ds_mp3_decode(d: *mut c_void, data: *const u8, len: i32, pcm: *mut f32, info: *mut Mp3Info) -> i32;
 }
 
-#[derive(Default, Clone)]
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct At9Info {
+    channels: i32,
+    channel_config_index: i32,
+    sampling_rate: i32,
+    superframe_size: i32,
+    frames_in_superframe: i32,
+    frame_samples: i32,
+    wlength: i32,
+    config: [u8; 4],
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct Mp3Info {
+    frame_bytes: i32,
+    frame_offset: i32,
+    channels: i32,
+    hz: i32,
+    layer: i32,
+    bitrate_kbps: i32,
+}
+
+const ERR_INVALID_CONTEXT: i32 = 0x8093_0002u32 as i32;
+const ERR_INVALID_INSTANCE: i32 = 0x8093_0003u32 as i32;
+const ERR_INVALID_PARAMETER: i32 = 0x8093_0005u32 as i32;
+const ERR_CODEC_NOT_SUPPORTED: i32 = 0x8093_0008u32 as i32;
+const ERR_JOB_CREATION: i32 = 0x8093_0012u32 as i32;
+/// Per-job result codes (SidebandResult.result).
+const RESULT_INVALID_PARAMETER: i32 = 0x0000_0002;
+const RESULT_NOT_INITIALIZED: i32 = 0x0000_0008;
+const RESULT_PARTIAL_INPUT: i32 = 0x0000_0020;
+const RESULT_CODEC_ERROR: i32 = 0x4000_0000;
+
+const CODEC_MP3: u32 = 0;
+const CODEC_AT9: u32 = 1;
+/// MPEG-4 AAC and Opus (codec 24; id per public sources, see docs/PROVENANCE.md):
+/// the title's audio engine requires both modules to register
+/// (eboot+0x1de17e0 fails its init otherwise), but these decoders are not
+/// implemented yet: their jobs fail with a codec error, logged once each.
+const CODEC_AAC: u32 = 2;
+const CODEC_OPUS: u32 = 24;
+
+fn codec_name(codec: u32) -> &'static str {
+    match codec {
+        CODEC_MP3 => "MP3",
+        CODEC_AT9 => "ATRAC9",
+        CODEC_AAC => "AAC",
+        CODEC_OPUS => "Opus",
+        _ => "unknown",
+    }
+}
+
+fn codec_known(codec: u32) -> bool {
+    matches!(codec, CODEC_MP3 | CODEC_AT9 | CODEC_AAC | CODEC_OPUS)
+}
+
+const FLAG_RUN_GET_CODEC_INFO: u64 = 1 << 11;
+const FLAG_RUN_MULTIPLE_FRAMES: u64 = 1 << 12;
+const FLAG_SIDEBAND_RESAMPLE_INFO: u64 = 1 << 44;
+const FLAG_SIDEBAND_GAPLESS: u64 = 1 << 45;
+const FLAG_SIDEBAND_FORMAT: u64 = 1 << 46;
+const FLAG_SIDEBAND_STREAM: u64 = 1 << 47;
+
+const CONTROL_SIZE: u64 = 48;
+const RUN_SIZE: u64 = 64;
+const TAG_CONTROL: u32 = 0x434D_4A41; // "AJMC"
+const TAG_RUN: u32 = 0x524D_4A41; // "AJMR"
+const OP_INIT: u32 = 1;
+const OP_CLEAR: u32 = 2;
+const OP_GAPLESS: u32 = 3;
+const OP_STATISTICS: u32 = 4;
+
+enum Decoder {
+    At9 { handle: *mut c_void, info: At9Info },
+    Mp3 { handle: *mut c_void },
+    None,
+}
+
+unsafe impl Send for Decoder {}
+
 struct Instance {
     codec: u32,
-    format: u32, // 0 s16, 1 s32, 2 float
-    channels: u32,
-    sample_rate: u32,
-    frame_bytes: u32,
-    frame_samples: u32,
-    total_samples: u64,
-    configured: bool,
-    warned: bool,
+    /// Output encoding: 0 s16, 1 s32, 2 f32.
+    encoding: u32,
+    max_channels: u32,
+    decoder: Decoder,
+    total_decoded: u64,
+    gapless_total: u32,
+    gapless_skip: u32,
+    skipped: u32,
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        unsafe {
+            match self.decoder {
+                Decoder::At9 { handle, .. } => Atrac9ReleaseHandle(handle),
+                Decoder::Mp3 { handle } => ds_mp3_free(handle),
+                Decoder::None => {}
+            }
+        }
+    }
 }
 
 static INSTANCES: Mutex<Option<HashMap<u32, Instance>>> = Mutex::new(None);
-static NEXT_BATCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+static NEXT_INSTANCE: AtomicU32 = AtomicU32::new(1);
+static NEXT_BATCH: AtomicU32 = AtomicU32::new(1);
 
 fn with_instances<R>(f: impl FnOnce(&mut HashMap<u32, Instance>) -> R) -> R {
-    let mut g = INSTANCES.lock();
-    f(g.get_or_insert_with(HashMap::new))
+    f(INSTANCES.lock().get_or_insert_with(HashMap::new))
 }
 
-// Job records: tag = 0x4A41_0000 | kind << 8 | slot size. The title's inline
-// batch code advances by fixed slot sizes (observed: control 0x40, run 0x50),
-// so each record declares exactly that size.
-const TAG_HI: u32 = 0x4A41;
-const CONTROL_SLOT: usize = 0x40;
-const RUN_SLOT: usize = 0x50;
+// ---------------------------------------------------------------------------
+// Batch building (SceAjmBatchInfo: {buffer, offset, size, last_good_job, last_good_job_ra})
 
-#[repr(C)]
-struct CtlRec {
-    tag: u32,
-    instance: u32,
-    flags: u64,
-    sb_in: u64,
-    sb_in_size: u32,
-    sb_out_size: u32,
-    sb_out: u64,
-}
-
-#[repr(C)]
-struct RunRec {
-    tag: u32,
-    instance: u32,
-    flags: u64,
-    data_in: u64,
-    in_size: u32,
-    out_size: u32,
-    data_out: u64,
-    sb_out: u64,
-    sb_out_size: u32,
-    pad: u32,
-}
-
-fn tag(kind: u32, size: usize) -> u32 {
-    (TAG_HI << 16) | (kind << 8) | size as u32
-}
-
-unsafe fn parse_job(p: u64, end: u64) -> Option<(Job, u64)> {
-    if p + 4 > end {
-        return None;
-    }
-    let t = unsafe { std::ptr::read_unaligned(p as *const u32) };
-    if t >> 16 != TAG_HI {
-        return None;
-    }
-    let size = (t & 0xFF) as u64;
-    if size == 0 || p + size > end {
-        return None;
-    }
-    let job = match (t >> 8) & 0xFF {
-        KIND_CONTROL => {
-            let r = unsafe { std::ptr::read_unaligned(p as *const CtlRec) };
-            Job { magic: JOB_MAGIC, kind: KIND_CONTROL, instance: r.instance, pad: 0, flags: r.flags, sb_in: r.sb_in, sb_in_size: r.sb_in_size as u64, data_in: 0, data_in_size: 0, data_out: 0, data_out_size: 0, sb_out: r.sb_out, sb_out_size: r.sb_out_size as u64 }
-        }
-        KIND_RUN => {
-            let r = unsafe { std::ptr::read_unaligned(p as *const RunRec) };
-            Job { magic: JOB_MAGIC, kind: KIND_RUN, instance: r.instance, pad: 0, flags: r.flags, sb_in: 0, sb_in_size: 0, data_in: r.data_in, data_in_size: r.in_size as u64, data_out: r.data_out, data_out_size: r.out_size as u64, sb_out: r.sb_out, sb_out_size: r.sb_out_size as u64 }
-        }
-        _ => return None,
-    };
-    Some((job, p + size))
-}
-fn configure_at9(inst: &mut Instance, cfg: &[u8]) -> bool {
-    if cfg.len() < 4 || cfg[0] != 0xFE {
-        return false;
-    }
-    let sr_index = (cfg[1] >> 4) as usize;
-    let ch_index = ((cfg[1] >> 1) & 7) as usize;
-    let frame_bytes = (((cfg[2] as u32) << 3) | ((cfg[3] as u32) >> 5)) + 1;
-    if ch_index >= AT9_CHANNELS.len() {
-        return false;
-    }
-    inst.sample_rate = AT9_SAMPLE_RATES[sr_index];
-    inst.frame_samples = 1 << AT9_FRAME_SAMPLES_POW[sr_index];
-    inst.channels = AT9_CHANNELS[ch_index];
-    inst.frame_bytes = frame_bytes;
-    inst.total_samples = 0;
-    inst.configured = true;
-    true
-}
-
-/// Writes sideband outputs: result, then stream/format/gapless/multi-frame as flagged.
-unsafe fn write_sideband(job: &Job, inst: &Instance, result: i32, consumed: u32, written: u32, frames: u32) {
-    if job.sb_out == 0 || job.sb_out_size < 8 {
-        return;
-    }
-    let mut p = job.sb_out;
-    let end = job.sb_out + job.sb_out_size;
+unsafe fn reserve(info: *mut u64, len: u64) -> Option<u64> {
     unsafe {
-        *(p as *mut i32) = result;
-        *((p + 4) as *mut i32) = 0;
-        p += 8;
-        let sb = job.flags >> 45;
-        if sb & 0b100 != 0 && p + 16 <= end {
-            *(p as *mut i32) = consumed as i32;
-            *((p + 4) as *mut i32) = written as i32;
-            *((p + 8) as *mut u64) = inst.total_samples;
-            p += 16;
+        if info.is_null() {
+            return None;
         }
-        if sb & 0b010 != 0 && p + 24 <= end {
-            let v = [inst.channels, 0, inst.sample_rate, inst.format, 0, 0];
-            for (i, x) in v.iter().enumerate() {
-                *((p + i as u64 * 4) as *mut u32) = *x;
-            }
-            p += 24;
+        let (buf, off, size) = (*info, *info.add(1), *info.add(2));
+        if buf == 0 || off + len > size {
+            crate::warn!("ajm: batch buffer {buf:#x} full ({off:#x}+{len:#x} > {size:#x})");
+            return None;
         }
-        if sb & 0b001 != 0 && p + 8 <= end {
-            *(p as *mut u32) = 0;
-            *((p + 4) as *mut u32) = 0;
-            p += 8;
-        }
-        let run_flags = (job.flags >> 11) & 3;
-        if run_flags & 0b10 != 0 && p + 8 <= end {
-            *(p as *mut u32) = frames;
-            *((p + 4) as *mut u32) = 0;
+        *info.add(1) = off + len;
+        *info.add(3) = buf + off;
+        Some(buf + off)
+    }
+}
+
+unsafe fn control(info: *mut u64, op: u32, instance: u32, a: u64, b: u64, result: u64, extra: u64) -> i32 {
+    unsafe {
+        let Some(p) = reserve(info, CONTROL_SIZE) else { return ERR_JOB_CREATION };
+        let w = p as *mut u32;
+        *w = TAG_CONTROL;
+        *w.add(1) = op;
+        *w.add(2) = instance;
+        *w.add(3) = 0;
+        let q = (p + 16) as *mut u64;
+        *q = a;
+        *q.add(1) = b;
+        *q.add(2) = result;
+        *q.add(3) = extra;
+        0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Execution
+
+unsafe fn write_result(sb: u64, size: u64, result: i32) {
+    if sb != 0 && size >= 8 {
+        unsafe {
+            *(sb as *mut i32) = result;
+            *((sb + 4) as *mut i32) = 0;
         }
     }
 }
 
-unsafe fn execute(job: &Job) {
-    with_instances(|insts| {
-        let inst = insts.entry(job.instance).or_default();
-        match job.kind {
-            KIND_CONTROL => {
-                let control = (job.flags >> 13) & 7;
-                let mut ok = true;
-                if control & 0b010 != 0 && job.sb_in != 0 && job.sb_in_size >= 4 {
-                    let cfg = unsafe { std::slice::from_raw_parts(job.sb_in as *const u8, 4) };
-                    ok = inst.codec != 1 || configure_at9(inst, cfg);
+fn bytes_per_sample(encoding: u32) -> usize {
+    if encoding == 0 { 2 } else { 4 }
+}
+
+/// Writes interleaved PCM in the instance encoding; returns bytes written.
+unsafe fn store_pcm(out: &mut Vec<u8>, encoding: u32, samples: impl Iterator<Item = f32>) {
+    for s in samples {
+        match encoding {
+            0 => out.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes()),
+            1 => out.extend_from_slice(&((s.clamp(-1.0, 1.0) as f64 * 2147483647.0) as i32).to_le_bytes()),
+            _ => out.extend_from_slice(&s.to_le_bytes()),
+        }
+    }
+}
+
+struct Outcome {
+    result: i32,
+    consumed: usize,
+    produced: usize,
+    frames: u32,
+}
+
+/// Decodes from `input` into `out_cap` bytes of PCM (`out`).
+unsafe fn decode(inst: &mut Instance, input: &[u8], out_cap: usize, multiple: bool, out: &mut Vec<u8>) -> Outcome {
+    let mut o = Outcome { result: 0, consumed: 0, produced: 0, frames: 0 };
+    let bps = bytes_per_sample(inst.encoding);
+    loop {
+        let mut pcm_f: Vec<f32> = Vec::new();
+        let mut channels = 0usize;
+        let used: usize;
+        match &mut inst.decoder {
+            Decoder::At9 { handle, info } => {
+                let sf = info.superframe_size as usize;
+                let n = info.frames_in_superframe as usize;
+                let fs = info.frame_samples as usize;
+                channels = info.channels as usize;
+                if input.len() - o.consumed < sf {
+                    if o.frames == 0 {
+                        o.result |= RESULT_PARTIAL_INPUT;
+                    }
+                    break;
                 }
-                if control & 0b001 != 0 {
-                    inst.total_samples = 0;
+                let need = n * fs * channels * bps;
+                if out_cap - o.produced < need {
+                    break;
                 }
-                unsafe { write_sideband(job, inst, if ok { 0 } else { ERR_INVALID }, 0, 0, 0) };
+                let mut pcm = vec![0i16; fs * channels];
+                let mut pos = 0usize;
+                for _ in 0..n {
+                    let mut u = 0i32;
+                    let r = unsafe { Atrac9Decode(*handle, input.as_ptr().add(o.consumed + pos), pcm.as_mut_ptr(), &mut u) };
+                    if r != 0 {
+                        o.result |= RESULT_CODEC_ERROR;
+                        crate::debug!("ajm: ATRAC9 decode error {r}");
+                        return o;
+                    }
+                    pos += u.max(0) as usize;
+                    pcm_f.extend(pcm.iter().map(|&s| s as f32 / 32768.0));
+                }
+                used = sf;
             }
-            _ => {
-                if !inst.warned {
-                    inst.warned = true;
-                    crate::warn!(
-                        "Ajm instance {:#x} (codec {}, {} ch @ {} Hz): decoding as silence (ATRAC9 decoder not implemented yet)",
-                        job.instance,
-                        inst.codec,
-                        inst.channels,
-                        inst.sample_rate
-                    );
+            Decoder::Mp3 { handle } => {
+                let rest = &input[o.consumed..];
+                if rest.is_empty() {
+                    break;
                 }
-                if !inst.configured || inst.frame_bytes == 0 {
-                    unsafe { write_sideband(job, inst, ERR_INVALID, 0, 0, 0) };
-                    return;
+                let mut pcm = vec![0f32; 1152 * 2];
+                let mut info = Mp3Info::default();
+                let samples = unsafe { ds_mp3_decode(*handle, rest.as_ptr(), rest.len() as i32, pcm.as_mut_ptr(), &mut info) };
+                if info.frame_bytes == 0 {
+                    if o.frames == 0 {
+                        o.result |= RESULT_PARTIAL_INPUT;
+                    }
+                    break;
                 }
-                let bps = if inst.format == 0 { 2 } else { 4 };
-                let frame_out = inst.frame_samples * inst.channels * bps;
-                let multi = (job.flags >> 11) & 0b10 != 0;
-                let mut consumed = 0u64;
-                let mut written = 0u64;
-                let mut frames = 0u32;
-                loop {
-                    if consumed + inst.frame_bytes as u64 > job.data_in_size || written + frame_out as u64 > job.data_out_size {
-                        break;
-                    }
-                    if job.data_out != 0 {
-                        unsafe { std::ptr::write_bytes((job.data_out + written) as *mut u8, 0, frame_out as usize) };
-                    }
-                    consumed += inst.frame_bytes as u64;
-                    written += frame_out as u64;
-                    frames += 1;
-                    inst.total_samples += inst.frame_samples as u64;
-                    if !multi {
-                        break;
-                    }
+                channels = info.channels.max(1) as usize;
+                let need = samples as usize * channels * bps;
+                if out_cap - o.produced < need {
+                    break;
                 }
-                unsafe { write_sideband(job, inst, 0, consumed as u32, written as u32, frames) };
+                pcm_f.extend_from_slice(&pcm[..samples as usize * channels]);
+                used = info.frame_bytes as usize;
+            }
+            Decoder::None => {
+                if inst.codec == CODEC_AAC || inst.codec == CODEC_OPUS {
+                    let msg = if inst.codec == CODEC_AAC { "ajm: AAC decode job failed (AAC decoding not implemented)" } else { "ajm: Opus decode job failed (Opus decoding not implemented)" };
+                    crate::hle::stub_log(msg, RESULT_CODEC_ERROR as i64);
+                    o.result |= RESULT_CODEC_ERROR;
+                } else {
+                    o.result |= RESULT_NOT_INITIALIZED;
+                }
+                break;
             }
         }
-    });
+        o.consumed += used;
+        o.frames += 1;
+        // Gapless: drop leading skip samples, stop at the declared total.
+        let frames_in = pcm_f.len() / channels.max(1);
+        let mut start = 0usize;
+        if inst.skipped < inst.gapless_skip {
+            let k = ((inst.gapless_skip - inst.skipped) as usize).min(frames_in);
+            inst.skipped += k as u32;
+            start = k;
+        }
+        let mut end = frames_in;
+        if inst.gapless_total != 0 && inst.gapless_total != u32::MAX {
+            let left = (inst.gapless_total as u64).saturating_sub(inst.total_decoded) as usize;
+            end = end.min(start + left);
+        }
+        let keep = &pcm_f[start * channels..end.max(start) * channels];
+        let before = out.len();
+        unsafe { store_pcm(out, inst.encoding, keep.iter().copied()) };
+        o.produced += out.len() - before;
+        inst.total_decoded += (end.max(start) - start) as u64;
+        if !multiple {
+            break;
+        }
+    }
+    o
+}
+
+unsafe fn run_job(p: u64) -> i32 {
+    unsafe {
+        let instance = *((p + 4) as *const u32);
+        let flags = *((p + 8) as *const u64);
+        let q = (p + 16) as *const u64;
+        let (ins, nin, outs, nout, sb, sbsize) = (*q, *q.add(1), *q.add(2), *q.add(3), *q.add(4), *q.add(5));
+        // Gather input and output buffers ({address, size} arrays).
+        let mut input = Vec::new();
+        for i in 0..nin {
+            let a = *((ins + 16 * i) as *const u64);
+            let n = *((ins + 16 * i + 8) as *const u64);
+            if a != 0 && n != 0 {
+                input.extend_from_slice(std::slice::from_raw_parts(a as *const u8, n as usize));
+            }
+        }
+        let out_cap: usize = (0..nout).map(|i| *((outs + 16 * i + 8) as *const u64) as usize).sum();
+        let mut pcm = Vec::with_capacity(out_cap);
+        let (outcome, fmt) = {
+            let mut g = INSTANCES.lock();
+            let m = g.get_or_insert_with(HashMap::new);
+            let Some(inst) = m.get_mut(&instance) else {
+                write_result(sb, sbsize, RESULT_INVALID_PARAMETER);
+                return 0;
+            };
+            let o = decode(inst, &input, out_cap, flags & FLAG_RUN_MULTIPLE_FRAMES != 0, &mut pcm);
+            let fmt = match &inst.decoder {
+                Decoder::At9 { info, .. } => (info.channels as u32, info.sampling_rate as u32),
+                _ => (2, 48000),
+            };
+            (o, (fmt, inst.encoding, inst.total_decoded, inst.gapless_total, inst.gapless_skip, inst.skipped))
+        };
+        // Scatter PCM into the output buffers.
+        let mut off = 0usize;
+        for i in 0..nout {
+            let a = *((outs + 16 * i) as *const u64);
+            let n = *((outs + 16 * i + 8) as *const u64) as usize;
+            let k = n.min(pcm.len().saturating_sub(off));
+            if a != 0 && k > 0 {
+                std::ptr::copy_nonoverlapping(pcm.as_ptr().add(off), a as *mut u8, k);
+            }
+            off += k;
+        }
+        // Sideband: result, [resample], [gapless], [format], [stream], [mframe].
+        write_result(sb, sbsize, outcome.result);
+        let mut at = 8u64;
+        let room = |at: u64, n: u64| sb != 0 && at + n <= sbsize;
+        if flags & FLAG_SIDEBAND_RESAMPLE_INFO != 0 && room(at, 40) {
+            std::ptr::write_bytes((sb + at) as *mut u8, 0, 40);
+            *((sb + at) as *mut f32) = 1.0;
+            at += 40;
+        }
+        if flags & FLAG_SIDEBAND_GAPLESS != 0 && room(at, 8) {
+            *((sb + at) as *mut u32) = fmt.3;
+            *((sb + at + 4) as *mut u16) = fmt.4 as u16;
+            *((sb + at + 6) as *mut u16) = fmt.5 as u16;
+            at += 8;
+        }
+        if flags & (FLAG_SIDEBAND_FORMAT | FLAG_RUN_GET_CODEC_INFO) != 0 && room(at, 24) {
+            let w = (sb + at) as *mut u32;
+            *w = (fmt.0).0;
+            *w.add(1) = if (fmt.0).0 == 1 { 0x4 } else { 0x3 };
+            *w.add(2) = (fmt.0).1;
+            *w.add(3) = fmt.1;
+            *w.add(4) = 0;
+            *w.add(5) = 0;
+            at += 24;
+        }
+        if flags & FLAG_SIDEBAND_STREAM != 0 && room(at, 16) {
+            *((sb + at) as *mut i32) = outcome.consumed as i32;
+            *((sb + at + 4) as *mut i32) = outcome.produced as i32;
+            *((sb + at + 8) as *mut u64) = fmt.2;
+            at += 16;
+        }
+        if flags & FLAG_RUN_MULTIPLE_FRAMES != 0 && room(at, 8) {
+            *((sb + at) as *mut u32) = outcome.frames;
+            *((sb + at + 4) as *mut u32) = 0;
+        }
+        0
+    }
+}
+
+unsafe fn control_job(p: u64) {
+    unsafe {
+        let op = *((p + 4) as *const u32);
+        let instance = *((p + 8) as *const u32);
+        let q = (p + 16) as *const u64;
+        let (a, b, result) = (*q, *q.add(1), *q.add(2));
+        let r = with_instances(|m| {
+            let Some(inst) = m.get_mut(&instance) else { return RESULT_INVALID_PARAMETER };
+            match op {
+                OP_INIT => match inst.codec {
+                    CODEC_AT9 => {
+                        // SceAjmDecAt9InitializeParameters: {u8 config_data[4], u32 reserved}.
+                        if a == 0 {
+                            return RESULT_INVALID_PARAMETER;
+                        }
+                        let mut cfg = [0u8; 4];
+                        std::ptr::copy_nonoverlapping(a as *const u8, cfg.as_mut_ptr(), 4);
+                        let h = match inst.decoder {
+                            Decoder::At9 { handle, .. } => handle,
+                            _ => Atrac9GetHandle(),
+                        };
+                        if Atrac9InitDecoder(h, cfg.as_mut_ptr()) != 0 {
+                            return RESULT_INVALID_PARAMETER;
+                        }
+                        let mut info = At9Info::default();
+                        Atrac9GetCodecInfo(h, &mut info);
+                        inst.decoder = Decoder::At9 { handle: h, info };
+                        inst.total_decoded = 0;
+                        inst.skipped = 0;
+                        0
+                    }
+                    CODEC_MP3 => {
+                        if matches!(inst.decoder, Decoder::None) {
+                            inst.decoder = Decoder::Mp3 { handle: ds_mp3_new() };
+                        }
+                        inst.total_decoded = 0;
+                        inst.skipped = 0;
+                        0
+                    }
+                    CODEC_AAC | CODEC_OPUS => 0,
+                    _ => RESULT_INVALID_PARAMETER,
+                },
+                OP_CLEAR => {
+                    inst.total_decoded = 0;
+                    inst.skipped = 0;
+                    if let Decoder::Mp3 { handle } = inst.decoder {
+                        ds_mp3_free(handle);
+                        inst.decoder = Decoder::Mp3 { handle: ds_mp3_new() };
+                    }
+                    0
+                }
+                OP_GAPLESS => {
+                    // SceAjmSidebandGaplessDecode {u32 total_samples, u16 skip, u16 skipped}; b = reset.
+                    if a != 0 {
+                        inst.gapless_total = *(a as *const u32);
+                        inst.gapless_skip = *((a + 4) as *const u16) as u32;
+                    }
+                    if b != 0 {
+                        inst.skipped = 0;
+                        inst.total_decoded = 0;
+                    }
+                    0
+                }
+                _ => 0,
+            }
+        });
+        if op == OP_STATISTICS && result != 0 {
+            // SceAjmGetStatisticsResult: result, engine usage (batch + 3 intervals), memory[6].
+            std::ptr::write_bytes(result as *mut u8, 0, 8 + 16 + 24);
+            return;
+        }
+        write_result(result, 8, r);
+    }
 }
 
 sysv! {
-    // Builders write one job at `pos` and return the position after it.
-    fn sceAjmBatchJobControlBufferRa(pos: u64, instance: u32, flags: u64, sb_in: u64, sb_in_size: u64, sb_out: u64, sb_out_size: u64, ra: u64) -> u64 {
-        if pos == 0 { return 0; }
-        let size = CONTROL_SLOT;
-        let r = CtlRec { tag: tag(KIND_CONTROL, size), instance, flags, sb_in, sb_in_size: sb_in_size as u32, sb_out_size: sb_out_size as u32, sb_out };
-        std::ptr::write_unaligned(pos as *mut CtlRec, r);
-        pos + size as u64
+    fn sceAjmInitialize(reserved: i64, ctx: *mut u32) -> i32 {
+        if ctx.is_null() { return ERR_INVALID_PARAMETER; }
+        *ctx = 1;
+        0
     }
-    fn sceAjmBatchJobRunBufferRa(pos: u64, instance: u32, flags: u64, data_in: u64, in_size: u64, data_out: u64, out_size: u64, sb_out: u64, sb_out_size: u64, ra: u64) -> u64 {
-        if pos == 0 { return 0; }
-        let size = RUN_SLOT;
-        let r = RunRec { tag: tag(KIND_RUN, size), instance, flags, data_in, in_size: in_size as u32, out_size: out_size as u32, data_out, sb_out, sb_out_size: sb_out_size as u32, pad: 0 };
-        std::ptr::write_unaligned(pos as *mut RunRec, r);
-        pos + size as u64
+    fn sceAjmFinalize(ctx: u32) -> i32 { 0 }
+    fn sceAjmMemoryRegister(ctx: u32, ptr: u64, pages: u64) -> i32 { if ctx != 1 { ERR_INVALID_CONTEXT } else { 0 } }
+    fn sceAjmMemoryUnregister(ctx: u32, ptr: u64) -> i32 { 0 }
+    fn sceAjmModuleRegister(ctx: u32, codec: u32, reserved: i64) -> i32 {
+        if ctx != 1 { return ERR_INVALID_CONTEXT; }
+        match codec {
+            CODEC_MP3 | CODEC_AT9 => 0,
+            CODEC_AAC | CODEC_OPUS => {
+                crate::warn!("ajm: {} module registered, but {} decoding is not implemented yet (its jobs will fail)", codec_name(codec), codec_name(codec));
+                0
+            }
+            other => {
+                crate::warn!("ajm: codec {other} is not supported");
+                ERR_CODEC_NOT_SUPPORTED
+            }
+        }
     }
-    fn sceAjmBatchStartBuffer(ctx: u32, buf: u64, size: u64, prio: i32, err: *mut u8, id: *mut u32) -> i32 {
-        let end = buf + size;
-        let mut p = buf;
-        while p < end {
-            match parse_job(p, end) {
-                Some((job, next)) => {
-                    execute(&job);
-                    p = next;
-                }
-                None => {
-                    let dump: Vec<String> = (0..(size.min(0xA0) / 8)).map(|i| format!("{:016x}", std::ptr::read_unaligned((buf + i * 8) as *const u64))).collect();
-                    crate::error!("Ajm batch at {buf:#x}+{:#x} (size {size:#x}): unknown job record; batch qwords: {}", p - buf, dump.join(" "));
-                    return ERR_INVALID;
+    fn sceAjmModuleUnregister(ctx: u32, codec: u32) -> i32 { 0 }
+    /// Instance flags: max channels [6:0], output encoding [9:7] (0 s16, 1 s32, 2 f32).
+    fn sceAjmInstanceCreate(ctx: u32, codec: u32, flags: u64, out: *mut u32) -> i32 {
+        if ctx != 1 { return ERR_INVALID_CONTEXT; }
+        if out.is_null() { return ERR_INVALID_PARAMETER; }
+        if !codec_known(codec) { return ERR_CODEC_NOT_SUPPORTED; }
+        let id = NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed);
+        let inst = Instance {
+            codec,
+            encoding: ((flags >> 7) & 7) as u32,
+            max_channels: (flags & 0x7F) as u32,
+            decoder: Decoder::None,
+            total_decoded: 0,
+            gapless_total: 0,
+            gapless_skip: 0,
+            skipped: 0,
+        };
+        with_instances(|m| m.insert(id, inst));
+        *out = id;
+        0
+    }
+    fn sceAjmInstanceDestroy(ctx: u32, instance: u32) -> i32 {
+        if with_instances(|m| m.remove(&instance)).is_none() { return ERR_INVALID_INSTANCE; }
+        0
+    }
+    fn sceAjmBatchInitialize(buffer: u64, size: u64, info: *mut u64) -> i32 {
+        if info.is_null() { return ERR_INVALID_PARAMETER; }
+        *info = buffer;
+        *info.add(1) = 0;
+        *info.add(2) = size;
+        *info.add(3) = 0;
+        *info.add(4) = 0;
+        0
+    }
+    fn sceAjmBatchJobInitialize(info: *mut u64, instance: u32, param: u64, param_size: u64, result: u64) -> i32 {
+        control(info, OP_INIT, instance, param, param_size, result, 0)
+    }
+    fn sceAjmBatchJobClearContext(info: *mut u64, instance: u32, result: u64) -> i32 {
+        control(info, OP_CLEAR, instance, 0, 0, result, 0)
+    }
+    fn sceAjmBatchJobSetGaplessDecode(info: *mut u64, instance: u32, gapless: u64, reset: i32, result: u64) -> i32 {
+        control(info, OP_GAPLESS, instance, gapless, reset as u64, result, 0)
+    }
+    fn sceAjmBatchJobGetStatistics(info: *mut u64, interval: f32, result: u64) -> i32 {
+        control(info, OP_STATISTICS, 0, 0, 0, result, 0)
+    }
+    fn sceAjmBatchJobRunSplit(info: *mut u64, instance: u32, flags: u64, inputs: u64, num_inputs: u64, outputs: u64, num_outputs: u64, sideband: u64, sideband_size: u64) -> i32 {
+        let Some(p) = reserve(info, RUN_SIZE) else { return ERR_JOB_CREATION };
+        *(p as *mut u32) = TAG_RUN;
+        *((p + 4) as *mut u32) = instance;
+        *((p + 8) as *mut u64) = flags;
+        let q = (p + 16) as *mut u64;
+        *q = inputs;
+        *q.add(1) = num_inputs;
+        *q.add(2) = outputs;
+        *q.add(3) = num_outputs;
+        *q.add(4) = sideband;
+        *q.add(5) = sideband_size;
+        0
+    }
+    /// Executes the batch synchronously; BatchWait then returns at once.
+    fn sceAjmBatchStart(ctx: u32, info: *const u64, prio: i32, error: *mut u8, batch: *mut u32) -> i32 {
+        if ctx != 1 { return ERR_INVALID_CONTEXT; }
+        if info.is_null() { return ERR_INVALID_PARAMETER; }
+        let (buf, len) = (*info, *info.add(1));
+        let mut off = 0u64;
+        while off < len {
+            let p = buf + off;
+            match *(p as *const u32) {
+                TAG_CONTROL => { control_job(p); off += CONTROL_SIZE; }
+                TAG_RUN => { run_job(p); off += RUN_SIZE; }
+                other => {
+                    crate::error!("ajm: unknown job tag {other:#x} at batch offset {off:#x}");
+                    return ERR_INVALID_PARAMETER;
                 }
             }
         }
-        if !id.is_null() { *id = NEXT_BATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if !error.is_null() { std::ptr::write_bytes(error, 0, 32); }
+        if !batch.is_null() { *batch = NEXT_BATCH.fetch_add(1, Ordering::Relaxed); }
         0
     }
-    fn sceAjmInstanceCreate(ctx: u32, codec: u32, flags: u64, inst: *mut u32) -> i32 {
-        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-        let id = (codec << 14) | NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if !inst.is_null() { *inst = id; }
-        let format = ((flags >> 7) & 7) as u32;
-        let channels = ((flags >> 3) & 0xF) as u32;
-        with_instances(|m| { m.insert(id, Instance { codec, format, channels, ..Default::default() }); });
-        crate::debug!("sceAjmInstanceCreate codec {codec} flags {flags:#x} -> {id:#x}");
+    fn sceAjmBatchWait(ctx: u32, batch: u32, timeout: u32, error: *mut u8) -> i32 {
+        if !error.is_null() { std::ptr::write_bytes(error, 0, 32); }
         0
     }
-    fn sceAjmInstanceDestroy(ctx: u32, inst: u32) -> i32 {
-        with_instances(|m| { m.remove(&inst); });
+    fn sceAjmBatchErrorDump(info: *const u64, error: *mut u8) -> i32 { 0 }
+    /// SceAjmDecAt9ConfigDataInfo: {channels, sample_rate, frame_samples_per_channel,
+    /// superframe_samples_per_channel, superframe_size}.
+    fn sceAjmDecAt9ParseConfigData(config: *const u8, out: *mut u32) -> i32 {
+        if config.is_null() || out.is_null() { return ERR_INVALID_PARAMETER; }
+        let h = Atrac9GetHandle();
+        let mut cfg = [0u8; 4];
+        std::ptr::copy_nonoverlapping(config, cfg.as_mut_ptr(), 4);
+        let mut info = At9Info::default();
+        let ok = Atrac9InitDecoder(h, cfg.as_mut_ptr()) == 0 && Atrac9GetCodecInfo(h, &mut info) == 0;
+        Atrac9ReleaseHandle(h);
+        if !ok || info.channels <= 0 { return ERR_INVALID_PARAMETER; }
+        *out = info.channels as u32;
+        *out.add(1) = info.sampling_rate as u32;
+        *out.add(2) = info.frame_samples as u32;
+        *out.add(3) = (info.frame_samples * info.frames_in_superframe) as u32;
+        *out.add(4) = info.superframe_size as u32;
         0
     }
-}
-
-fixed! {
-    sceAjmBatchWait => 0,
-    sceAjmBatchCancel => 0,
-    sceAjmBatchErrorDump => 0,
 }
 
 pub fn register(r: &mut Registry) {
     reg!(r, "libSceAjm", [
-        sceAjmBatchJobControlBufferRa, sceAjmBatchJobRunBufferRa, sceAjmBatchStartBuffer, sceAjmInstanceCreate,
-        sceAjmInstanceDestroy, sceAjmBatchWait, sceAjmBatchCancel, sceAjmBatchErrorDump,
+        sceAjmInitialize, sceAjmFinalize, sceAjmMemoryRegister, sceAjmMemoryUnregister, sceAjmModuleRegister,
+        sceAjmModuleUnregister, sceAjmInstanceCreate, sceAjmInstanceDestroy, sceAjmBatchInitialize,
+        sceAjmBatchJobInitialize, sceAjmBatchJobClearContext, sceAjmBatchJobSetGaplessDecode,
+        sceAjmBatchJobGetStatistics, sceAjmBatchJobRunSplit, sceAjmBatchStart, sceAjmBatchWait,
+        sceAjmBatchErrorDump, sceAjmDecAt9ParseConfigData,
     ]);
 }

@@ -16,6 +16,17 @@ parking_lot = "0.12"
 ash = { version = "0.38", default-features = false, features = ["loaded", "std", "debug"] }
 miniz_oxide = "0.8"
 serde_json = "1"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+] }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "instr_info", "fast_fmt"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -34,3 +45,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Graphics_Gdi",
 ] }
+
+[build-dependencies]
+cc = "1"

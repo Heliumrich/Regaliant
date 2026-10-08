@@ -1,4 +1,4 @@
-//! Audio output, audio codec engine setup, game pad (see `crate::input`), mouse, mic, voice.
+//! Audio output (AudioOut), game pad (see `crate::input`), mouse, mic, voice.
 //!
 //! AudioOut currently paces output in real time without producing sound (the
 //! host audio backend comes later); this keeps FMOD's mixer timing correct.
@@ -121,12 +121,6 @@ sysv! {
         0
     }
 
-    // ---- Ajm (context/instance management; decoding jobs are not yet supported)
-    fn sceAjmInitialize(reserved: i64, ctx: *mut u32) -> i32 {
-        if ctx.is_null() { return 0x8093_0002u32 as i32; }
-        *ctx = 1;
-        0
-    }
     // ---- Pad
     fn scePadOpen(user: i32, kind: i32, index: i32, param: *const u8) -> i32 {
         if user != super::app::USER_ID { return 0x80920005u32 as i32; }
@@ -138,6 +132,22 @@ sysv! {
         std::ptr::write_unaligned(data, read_pad());
         0
     }
+    /// Buffered read: this runtime samples the current state, so one entry is
+    /// returned per call (ScePadData is 120 bytes, as the title's buffer confirms).
+    fn scePadRead(h: i32, data: *mut PadData, num: i32) -> i32 {
+        if h != 1 || data.is_null() || num < 1 { return 0x80920003u32 as i32; }
+        std::ptr::write_unaligned(data, read_pad());
+        1
+    }
+    fn scePadGetHandle(user: i32, kind: i32, index: i32) -> i32 {
+        if user != super::app::USER_ID { return 0x80920005u32 as i32; }
+        1
+    }
+    /// DualSense light bar / adaptive triggers / motion sensors: accepted; the host
+    /// controller (XInput) has no equivalent (logged once).
+    fn scePadSetLightBar(h: i32, color: *const u8) -> i32 { crate::hle::stub_log("scePadSetLightBar (no host light bar)", 0); 0 }
+    fn scePadSetTriggerEffect(h: i32, param: *const u8) -> i32 { crate::hle::stub_log("scePadSetTriggerEffect (no adaptive triggers on the host pad)", 0); 0 }
+    fn scePadSetMotionSensorState(h: i32, enable: i32) -> i32 { crate::hle::stub_log("scePadSetMotionSensorState (no motion sensors mapped)", 0); 0 }
     fn scePadGetControllerInformation(h: i32, info: *mut u8) -> i32 {
         if info.is_null() { return 0x80920001u32 as i32; }
         std::ptr::write_bytes(info, 0, 28);
@@ -166,9 +176,6 @@ fixed! {
     scePadResetOrientation => 0,
     scePadSetAngularVelocityDeadbandState => 0,
     scePadSetTiltCorrectionState => 0,
-    sceAjmFinalize => 0,
-    sceAjmModuleRegister => 0,
-    sceAjmModuleUnregister => 0,
     sceMouseInit => 0,
     sceMouseOpen => 0x80DF_0003u32,
     sceMouseClose => 0x80DF_0003u32,
@@ -193,9 +200,9 @@ pub fn register(r: &mut Registry) {
     reg!(r, "libSceAudioOut", [
         sceAudioOutInit, sceAudioOutOpen, sceAudioOutClose, sceAudioOutOutput, sceAudioOutSetVolume, sceAudioOutGetPortState,
     ]);
-    reg!(r, "libSceAjm", [sceAjmInitialize, sceAjmFinalize, sceAjmModuleRegister, sceAjmModuleUnregister]);
     reg!(r, "libScePad", [
         scePadInit, scePadOpen, scePadClose, scePadReadState, scePadGetControllerInformation, scePadSetVibration,
+        scePadRead, scePadGetHandle, scePadSetLightBar, scePadSetTriggerEffect, scePadSetMotionSensorState,
         scePadResetOrientation, scePadSetAngularVelocityDeadbandState, scePadSetTiltCorrectionState,
     ]);
     reg!(r, "libSceMouse", [sceMouseInit, sceMouseOpen, sceMouseClose, sceMouseRead]);

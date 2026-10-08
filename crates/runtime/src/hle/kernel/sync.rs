@@ -89,9 +89,13 @@ impl GMutex {
                 }
             };
         }
+        let mut _w = None;
         while s.0 != 0 {
             if try_only {
                 return EBUSY;
+            }
+            if _w.is_none() {
+                _w = Some(crate::thread::waiting("mutex", self as *const _ as u64, Some(mutex_detail)));
             }
             match deadline {
                 Some(d) => {
@@ -138,10 +142,20 @@ impl GMutex {
     fn reacquire(&self, count: u32) {
         let me = tid();
         let mut s = self.state.lock();
+        let _w = if s.0 != 0 { Some(crate::thread::waiting("mutex (after cond wait)", self as *const _ as u64, Some(mutex_detail))) } else { None };
         while s.0 != 0 {
             self.cv.wait(&mut s);
         }
         *s = (me, count);
+    }
+}
+
+fn mutex_detail(p: u64) -> String {
+    let m = unsafe { &*(p as *const GMutex) };
+    match m.state.try_lock() {
+        Some(s) if s.0 != 0 => format!("'{}' owned by thread {} (depth {})", m.name, crate::thread::name_of(s.0), s.1),
+        Some(_) => format!("'{}' (free)", m.name),
+        None => format!("'{}'", m.name),
     }
 }
 
@@ -246,6 +260,7 @@ impl GCond {
             Err(e) => return e,
         };
         let mut timed_out = false;
+        let _w = crate::thread::waiting(if deadline.is_some() { "cond (timed)" } else { "cond" }, self as *const _ as u64, None);
         loop {
             match deadline {
                 Some(d) => {
@@ -285,6 +300,15 @@ pub struct GRwLock {
     cv: Condvar,
 }
 
+fn rw_detail(p: u64) -> String {
+    let l = unsafe { &*(p as *const GRwLock) };
+    match l.state.try_lock() {
+        Some(s) if s.1 != 0 => format!("write-locked by thread {}", crate::thread::name_of(s.1)),
+        Some(s) => format!("{} reader(s)", s.0),
+        None => String::new(),
+    }
+}
+
 unsafe fn rw_from(slot: *mut u64) -> Result<&'static GRwLock, i32> {
     if slot.is_null() {
         return Err(EINVAL);
@@ -308,12 +332,16 @@ unsafe fn rw_from(slot: *mut u64) -> Result<&'static GRwLock, i32> {
 impl GRwLock {
     fn rdlock(&self, deadline: Option<Instant>, try_only: bool) -> i32 {
         let mut s = self.state.lock();
+        let mut _w = None;
         while s.1 != 0 {
             if s.1 == tid() {
                 return EDEADLK;
             }
             if try_only {
                 return EBUSY;
+            }
+            if _w.is_none() {
+                _w = Some(crate::thread::waiting("rwlock (read)", self as *const _ as u64, Some(rw_detail)));
             }
             match deadline {
                 Some(d) => {
@@ -333,9 +361,13 @@ impl GRwLock {
         if s.1 == me {
             return EDEADLK;
         }
+        let mut _w = None;
         while s.0 != 0 || s.1 != 0 {
             if try_only {
                 return EBUSY;
+            }
+            if _w.is_none() {
+                _w = Some(crate::thread::waiting("rwlock (write)", self as *const _ as u64, Some(rw_detail)));
             }
             match deadline {
                 Some(d) => {
@@ -378,6 +410,14 @@ pub struct GSema {
     cv: Condvar,
 }
 
+fn sema_detail(p: u64) -> String {
+    let s = unsafe { &*(p as *const GSema) };
+    match s.count.try_lock() {
+        Some(c) => format!("'{}' count {}/{}", s.name, *c, s.max),
+        None => format!("'{}'", s.name),
+    }
+}
+
 unsafe fn sema_from<'a>(h: u64) -> Option<&'a GSema> {
     if h == 0 {
         return None;
@@ -400,6 +440,14 @@ const EVF_WAITMODE_AND: u32 = 0x01;
 const EVF_WAITMODE_OR: u32 = 0x02;
 const EVF_WAITMODE_CLEAR_ALL: u32 = 0x10;
 const EVF_WAITMODE_CLEAR_PAT: u32 = 0x20;
+
+fn ef_detail(p: u64) -> String {
+    let e = unsafe { &*(p as *const GEventFlag) };
+    match e.bits.try_lock() {
+        Some(b) => format!("'{}' bits {:#x}", e.name, *b),
+        None => format!("'{}'", e.name),
+    }
+}
 
 unsafe fn ef_from<'a>(h: u64) -> Option<&'a GEventFlag> {
     if h == 0 {
@@ -545,6 +593,7 @@ sysv! {
         let start = Instant::now();
         let deadline = if timeout.is_null() { None } else { Some(deadline_us(*timeout as u64)) };
         let mut c = s.count.lock();
+        let _w = if *c < need { Some(crate::thread::waiting("sema", h, Some(sema_detail))) } else { None };
         while *c < need {
             match deadline {
                 Some(d) => {
@@ -618,6 +667,7 @@ sysv! {
         if mode & (EVF_WAITMODE_AND | EVF_WAITMODE_OR) == 0 { return sce(EINVAL); }
         let deadline = if timeout.is_null() { None } else { Some(deadline_us(*timeout as u64)) };
         let mut b = e.bits.lock();
+        let _w = if !ef_satisfied(*b, pat, mode) { Some(crate::thread::waiting("event flag", h, Some(ef_detail))) } else { None };
         while !ef_satisfied(*b, pat, mode) {
             match deadline {
                 Some(d) => {
