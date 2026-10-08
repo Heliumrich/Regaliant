@@ -1,5 +1,5 @@
-//! dsport: runs a PS4 title's executable natively on Windows x86-64 with
-//! high-level emulation of the PS4 system libraries.
+//! dsport: runs the PS5 Demon's Souls executable (PPSA01341 01.007.000) natively
+//! on Windows x86-64 with high-level emulation of the PS5 system libraries.
 
 #[macro_use]
 mod log;
@@ -20,8 +20,10 @@ use std::time::{Duration, Instant};
 
 pub struct Config {
     pub root: PathBuf,
-    pub game_base: PathBuf,
-    pub game_patch: PathBuf,
+    /// Application root (`PPSA01341-app0`): read-only assets mounted at /app0.
+    pub app: PathBuf,
+    /// Directory holding the decrypted executable and `sce_module/`.
+    pub code: PathBuf,
     pub run_dir: PathBuf,
     pub seconds: Option<u64>,
     /// Development control channel (see `poll_control`).
@@ -62,13 +64,10 @@ fn parse_args() -> Config {
     let mut debug = false;
     let mut headless = false;
     let mut control = None;
+    let mut app = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--probe-media" => {
-                hle::libs::avplayer::probe(Path::new(&args.next().expect("--probe-media needs a file")));
-                std::process::exit(0);
-            }
             "--seconds" => seconds = args.next().and_then(|s| s.parse().ok()),
             "--trace" => trace = true,
             "--lenient" => lenient = true,
@@ -76,6 +75,7 @@ fn parse_args() -> Config {
             "--headless" => headless = true,
             "--root" => root = PathBuf::from(args.next().expect("--root needs a path")),
             "--control" => control = Some(PathBuf::from(args.next().expect("--control needs a path"))),
+            "--app" => app = Some(PathBuf::from(args.next().expect("--app needs a path"))),
             other => {
                 eprintln!("unknown argument {other}");
                 std::process::exit(2);
@@ -83,9 +83,10 @@ fn parse_args() -> Config {
         }
     }
     let data = root.join("local-data");
+    let app = app.unwrap_or_else(|| root.join("Game").join("Demon-Souls-Remake-PPSA01341-1.07").join("PPSA01341-app0"));
     Config {
-        game_base: data.join("game").join("CUSA03173"),
-        game_patch: data.join("game").join("CUSA03173-patch"),
+        code: app.join("decrypted"),
+        app,
         run_dir: data.join("runs").join(utc_stamp()),
         root,
         seconds,
@@ -154,10 +155,6 @@ fn poll_control(path: &Path, offset: &mut u64) {
             }
             "dump" => {
                 gpu::DUMP_REQUEST.store(true, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            }
-            "trace" => {
-                gpu::render::TRACE_REQUEST.store(flip + 2, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
             "breaklog" => {
@@ -311,54 +308,51 @@ fn main() {
     hle::LENIENT_IMPORTS.store(cfg.lenient, std::sync::atomic::Ordering::Relaxed);
     info!("dsport {} | run dir {} | TLS slot {}", env!("CARGO_PKG_VERSION"), cfg.run_dir.display(), slot);
     exception::install();
-    gpu::shader_dump::DIR.set(cfg.run_dir.join("shaders")).ok();
-    if std::env::var_os("BB_TEST_FAULT").is_some() {
-        info!("BB_TEST_FAULT: writing to an invalid address from host code");
+    if std::env::var_os("DS_TEST_FAULT").is_some() {
+        info!("DS_TEST_FAULT: writing to an invalid address from host code");
         unsafe { std::ptr::write_volatile(0x32c3be8 as *mut u64, 1) };
     }
     hle::kernel::time::init();
     if !cfg.headless {
-        if let Err(e) = gpu::vk::present::init("dsport") {
+        if let Err(e) = gpu::vk::present::init("dsport - Demon's Souls (PPSA01341)") {
             warn!("no presentation window: {e}");
-        } else if let Err(e) = gpu::render::init() {
-            warn!("renderer unavailable: {e}");
         }
     }
 
-    // Guest file system.
+    // Guest file system. The supplied game tree is mounted read-only; all
+    // writable state lives under local-data/.
     let rt = cfg.root.join("local-data").join("runtime");
-    for d in ["temp0", "download0", "data", "savedata"] {
+    for d in ["temp0", "download0", "data"] {
         hle::kernel::fs::ensure_dir(&rt.join(d));
     }
-    hle::kernel::fs::mount("/app0", vec![cfg.game_patch.clone(), cfg.game_base.clone()], false);
-    hle::kernel::fs::mount("/hostapp", vec![cfg.game_patch.clone(), cfg.game_base.clone()], false);
+    info!("application root {} (read-only), code {}", cfg.app.display(), cfg.code.display());
+    hle::kernel::fs::mount("/app0", vec![cfg.app.clone()], false);
+    hle::kernel::fs::mount("/hostapp", vec![cfg.app.clone()], false);
     hle::kernel::fs::mount("/temp0", vec![rt.join("temp0")], true);
     hle::kernel::fs::mount("/temp", vec![rt.join("temp0")], true);
     hle::kernel::fs::mount("/download0", vec![rt.join("download0")], true);
     hle::kernel::fs::mount("/data", vec![rt.join("data")], true);
     hle::libs::savedata::init(cfg.root.join("local-data").join("saves"));
 
-    // Modules.
+    // Modules: the decrypted executable and the title's own libraries.
     let t0 = Instant::now();
-    let eboot_path = if cfg.game_patch.join("eboot.bin").exists() { cfg.game_patch.join("eboot.bin") } else { cfg.game_base.join("eboot.bin") };
-    let eboot = loader::load(&eboot_path, true).unwrap_or_else(|e| {
+    let eboot = loader::load(&cfg.code.join("eboot.bin"), true).unwrap_or_else(|e| {
         error!("loading eboot failed: {e}");
         fatal_exit(1, "load failure");
     });
     let mut libs: Vec<Arc<loader::LoadedModule>> = Vec::new();
-    for name in ["libc.prx", "libSceFios2.prx"] {
-        let p = [cfg.game_patch.join("sce_module").join(name), cfg.game_base.join("sce_module").join(name)]
-            .into_iter()
-            .find(|p| p.exists());
-        match p {
-            Some(p) => match loader::load(&p, false) {
-                Ok(m) => libs.push(m),
-                Err(e) => {
-                    error!("loading {name} failed: {e}");
-                    fatal_exit(1, "load failure");
-                }
-            },
-            None => warn!("{name} not found in sce_module"),
+    for name in ["libc.prx", "libSceNpCppWebApi.prx"] {
+        let p = cfg.code.join("sce_module").join(name);
+        if !p.exists() {
+            error!("{name} not found in {}", p.display());
+            fatal_exit(1, "missing title module");
+        }
+        match loader::load(&p, false) {
+            Ok(m) => libs.push(m),
+            Err(e) => {
+                error!("loading {name} failed: {e}");
+                fatal_exit(1, "load failure");
+            }
         }
     }
     let _ = hle::registry();
@@ -406,7 +400,7 @@ fn main() {
                 *(params as *mut u32) = 1;
                 *((params + 8) as *mut u64) = mem::arena_cstr("eboot.bin");
             }
-            if let Ok(list) = std::env::var("BB_BREAK") {
+            if let Ok(list) = std::env::var("DS_BREAK") {
                 for off in list.split(',').filter_map(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()) {
                     match exception::install_breakpoint(eboot2.base + off) {
                         Ok(()) => info!("breakpoint at {}", loader::describe_addr(eboot2.base + off)),

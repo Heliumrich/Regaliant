@@ -63,21 +63,21 @@ fn describe(addr: u64) -> String {
     }
 }
 
-/// Debug breakpoints (`BB_BREAK=<eboot offsets>`): int3 patched over the
+/// Debug breakpoints (`DS_BREAK=<eboot offsets>`): int3 patched over the
 /// first byte of a guest instruction; each hit is logged. A replaced
 /// `push rbp` is emulated; any other instruction is executed by restoring its
 /// byte and single-stepping, then the int3 is re-armed (hits on other threads
 /// during that step are missed). (address, hit count, original byte)
 pub static BREAKPOINTS: parking_lot::Mutex<Vec<(u64, u64, u8)>> = parking_lot::Mutex::new(Vec::new());
 
-/// `BB_BREAK_STATS=1`: hits are counted per (breakpoint, caller chain) instead
+/// `DS_BREAK_STATS=1`: hits are counted per (breakpoint, caller chain) instead
 /// of being logged one by one (logging slows the title enough to change its
 /// behavior); `dump_break_stats` prints and resets the table.
 static BREAK_STATS: parking_lot::Mutex<Option<std::collections::HashMap<(u64, [u64; 4]), u64>>> = parking_lot::Mutex::new(None);
 
 pub fn break_stats_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BB_BREAK_STATS").is_some())
+    *ON.get_or_init(|| std::env::var_os("DS_BREAK_STATS").is_some())
 }
 
 /// Logs the breakpoint hit histogram collected since the last call.
@@ -90,9 +90,9 @@ pub fn dump_break_stats() {
     let mut s = format!("breakpoint stats: {total} hits");
     for ((bp, chain), n) in v.iter().take(40) {
         s.push_str(&format!("
-  {n:>7} {}", describe(*bp).replace("SPRJ_ps4_Master_LTO", "")));
+  {n:>7} {}", describe(*bp)));
         for &a in chain.iter().filter(|&&a| a != 0) {
-            s.push_str(&format!(" <{}", describe(a).replace("SPRJ_ps4_Master_LTO", "")));
+            s.push_str(&format!(" <{}", describe(a)));
         }
     }
     crate::log::write(crate::log::Level::Info, format_args!("{s}"));
@@ -192,7 +192,7 @@ unsafe fn handle_breakpoint(ctx: &mut CONTEXT) -> bool {
             // Return address (meaningful at function entries) and rbp chain.
             let mut key = [0u64; 4];
             key[0] = *(ctx.Rsp as *const u64);
-            let depth: usize = std::env::var("BB_BREAK_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(3);
+            let depth: usize = std::env::var("DS_BREAK_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(3);
             let mut fp = ctx.Rbp;
             for slot in key.iter_mut().skip(1).take(depth) {
                 use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, VirtualQuery};
@@ -208,10 +208,10 @@ unsafe fn handle_breakpoint(ctx: &mut CONTEXT) -> bool {
         let verbose = BREAK_VERBOSE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1)).is_ok();
         if !break_stats_enabled() && (n <= 64 || n.is_power_of_two() || verbose) {
             let ret = *(ctx.Rsp as *const u64);
-            // BB_BREAK_PEEK: comma-separated expressions logged with each hit.
+            // DS_BREAK_PEEK: comma-separated expressions logged with each hit.
             let mut extra = String::new();
-            // BB_BREAK_DEPTH: caller frames (rbp chain) appended to each hit.
-            let depth: usize = std::env::var("BB_BREAK_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            // DS_BREAK_DEPTH: caller frames (rbp chain) appended to each hit.
+            let depth: usize = std::env::var("DS_BREAK_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             if depth > 0 {
                 let mut bp_ = ctx.Rbp;
                 extra.push_str(" chain");
@@ -225,11 +225,11 @@ unsafe fn handle_breakpoint(ctx: &mut CONTEXT) -> bool {
                         break;
                     }
                     let r = *((bp_ + 8) as *const u64);
-                    extra.push_str(&format!(" <{}", describe(r).replace("SPRJ_ps4_Master_LTO", "")));
+                    extra.push_str(&format!(" <{}", describe(r)));
                     bp_ = *(bp_ as *const u64);
                 }
             }
-            if let Ok(spec) = std::env::var("BB_BREAK_PEEK") {
+            if let Ok(spec) = std::env::var("DS_BREAK_PEEK") {
                 let regs = [
                     ("rdi", ctx.Rdi),
                     ("rsi", ctx.Rsi),
@@ -338,7 +338,7 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
                 // A fault inside the report itself: stop immediately.
                 windows_sys::Win32::System::Threading::TerminateProcess(
                     windows_sys::Win32::System::Threading::GetCurrentProcess(),
-                    0xBB0F,
+                    0xD50F,
                 );
             }
             // Another thread is already reporting a fatal fault: note this one
@@ -409,9 +409,9 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
                     let _ = writeln!(r, "  [{name}] {a:#x}: {}", q.join(" "));
                 }
             }
-            // BB_CRASH_PEEK: comma-separated `base(+hex|*)*[:count]` expressions,
+            // DS_CRASH_PEEK: comma-separated `base(+hex|*)*[:count]` expressions,
             // e.g. `rbx+b4c8*:8` (load the pointer at rbx+0xb4c8, dump 8 qwords).
-            if let Ok(spec) = std::env::var("BB_CRASH_PEEK") {
+            if let Ok(spec) = std::env::var("DS_CRASH_PEEK") {
                 for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     let (expr, count) = match item.split_once(':') {
                         Some((e, c)) => (e, u64::from_str_radix(c, 16).unwrap_or(8).min(64)),
@@ -477,6 +477,6 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
             }
         }
         crate::fatal_report(&r);
-        crate::fatal_exit(0xBB01, "fatal exception");
+        crate::fatal_exit(0xD501, "fatal exception");
     }
 }

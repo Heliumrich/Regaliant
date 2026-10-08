@@ -1,4 +1,4 @@
-//! High-level emulation registry and helpers.
+//! High-level emulation registry and helpers (PS5 system libraries).
 //!
 //! HLE functions are Rust `extern "sysv64"` functions called directly by guest
 //! code. They are registered under (library name, NID). Imports that resolve to
@@ -107,12 +107,15 @@ impl Registry {
             .insert(nid, Export { addr, name: name.to_string(), is_data: true });
     }
 
-    /// Libraries exported by the same PS4 module share one HLE table.
+    /// Libraries exported by the same system module share one HLE table; PS5
+    /// "*.native"/"*_native" library names alias their plain names.
     fn canonical(lib: &str) -> &str {
         match lib {
             "libScePosix" | "libkernel_unity" | "libkernel_cpumode_platform" | "libkernel_pre250mmap"
             | "libkernel_ps2emu" | "libkernel_exception" | "libSceCoredump" | "libkernel_sysc_se" => "libkernel",
-            "libSceGnmDriver_padebug" => "libSceGnmDriver",
+            "libSceSaveData_native" => "libSceSaveData",
+            "libSceSaveDataDialog.native" => "libSceSaveDataDialog",
+            "libSceMsgDialog.native" => "libSceMsgDialog",
             other => other,
         }
     }
@@ -146,12 +149,13 @@ pub fn registry() -> &'static Registry {
     })
 }
 
-/// NID -> name table for diagnostics (built from data/ps4-names.txt and the registry).
+/// NID -> name table for diagnostics (data/ps4-names.txt + data/ps5-names.txt).
 pub fn nid_names() -> &'static HashMap<String, String> {
     static NAMES: OnceLock<HashMap<String, String>> = OnceLock::new();
     NAMES.get_or_init(|| {
         let mut m = HashMap::new();
-        for line in include_str!("../../../../data/ps4-names.txt").lines() {
+        let lists = [include_str!("../../../../data/ps4-names.txt"), include_str!("../../../../data/ps5-names.txt")];
+        for line in lists.iter().flat_map(|l| l.lines()) {
             let n = line.trim();
             if n.is_empty() || n.starts_with('#') || n.contains(' ') || n.ends_with('?') {
                 continue;
@@ -184,8 +188,8 @@ pub static UNRESOLVED: RwLock<Vec<Unresolved>> = RwLock::new(Vec::new());
 pub static LENIENT_IMPORTS: AtomicBool = AtomicBool::new(false);
 
 std::arch::global_asm!(
-    ".globl bb_unresolved_entry",
-    "bb_unresolved_entry:",
+    ".globl ds_unresolved_entry",
+    "ds_unresolved_entry:",
     "push rbp",
     "mov rbp, rsp",
     "sub rsp, 64",
@@ -207,7 +211,7 @@ std::arch::global_asm!(
 );
 
 unsafe extern "C" {
-    fn bb_unresolved_entry();
+    fn ds_unresolved_entry();
 }
 
 extern "sysv64" fn unresolved_handler(index: u64, args: *const u64, ret: u64) -> u64 {
@@ -240,7 +244,7 @@ extern "sysv64" fn unresolved_handler(index: u64, args: *const u64, ret: u64) ->
     crate::fatal_exit(3, "unimplemented import called");
 }
 
-/// Builds a 24-byte trap stub: `mov rax, index; jmp [rip+0]; dq bb_unresolved_entry`.
+/// Builds a 24-byte trap stub: `mov rax, index; jmp [rip+0]; dq ds_unresolved_entry`.
 pub fn unresolved_stub_code(index: u64) -> [u8; 24] {
     let mut c = [0u8; 24];
     c[0] = 0x48;
@@ -249,7 +253,7 @@ pub fn unresolved_stub_code(index: u64) -> [u8; 24] {
     c[10] = 0xFF;
     c[11] = 0x25;
     c[12..16].copy_from_slice(&0u32.to_le_bytes());
-    c[16..24].copy_from_slice(&(bb_unresolved_entry as usize as u64).to_le_bytes());
+    c[16..24].copy_from_slice(&(ds_unresolved_entry as usize as u64).to_le_bytes());
     c
 }
 

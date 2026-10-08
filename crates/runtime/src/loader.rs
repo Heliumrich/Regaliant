@@ -10,6 +10,34 @@ use std::path::Path;
 use std::sync::Arc;
 
 const TRAMPOLINE_SPACE: u64 = 0x10000;
+const PT_GNU_RELRO: u32 = 0x6474_E552;
+const PT_NOTE: u32 = 4;
+
+/// NT_GNU_BUILD_ID descriptor of a PT_NOTE segment (PS5 module fingerprint).
+fn build_id(m: &Module) -> Option<Vec<u8>> {
+    for (i, ph) in m.phdrs.iter().enumerate() {
+        if ph.p_type != PT_NOTE {
+            continue;
+        }
+        let d = m.segment_data(i)?;
+        let mut o = 0usize;
+        while o + 12 <= d.len() {
+            let namesz = u32::from_le_bytes(d[o..o + 4].try_into().ok()?) as usize;
+            let descsz = u32::from_le_bytes(d[o + 4..o + 8].try_into().ok()?) as usize;
+            let ty = u32::from_le_bytes(d[o + 8..o + 12].try_into().ok()?);
+            let name_end = o + 12 + namesz;
+            let desc = (name_end + 3) & !3;
+            if namesz == 0 || desc + descsz > d.len() {
+                break;
+            }
+            if ty == 3 && &d[o + 12..name_end] == b"GNU\0" {
+                return Some(d[desc..desc + descsz].to_vec());
+            }
+            o = (desc + descsz + 3) & !3;
+        }
+    }
+    None
+}
 
 pub struct LoadedModule {
     pub name: String,
@@ -52,7 +80,8 @@ pub fn main_module() -> Option<Arc<LoadedModule>> {
 /// Human-readable location of an address (guest module offset, stub, or host).
 pub fn describe_addr(addr: u64) -> String {
     if let Some(m) = module_at(addr) {
-        return format!("{}+{:#x}", m.name, addr - m.base);
+        let name = if m.is_main { "eboot" } else { m.name.as_str() };
+        return format!("{}+{:#x}", name, addr - m.base);
     }
     if let Some(s) = STUBS.lock().describe(addr) {
         return s;
@@ -112,7 +141,7 @@ pub fn load(path: &Path, is_main: bool) -> Result<Arc<LoadedModule>, String> {
                     code = (base + ph.p_vaddr, base + ph.p_vaddr + ph.p_memsz);
                 }
             }
-            sce_elf::PT_TLS => {
+            sce_elf::PT_TLS if ph.p_memsz > 0 => {
                 tls_mod = Some(tls::register_module(base + ph.p_vaddr, ph.p_filesz, ph.p_memsz, ph.p_align, ph.p_vaddr));
             }
             sce_elf::PT_GNU_EH_FRAME => eh_frame_hdr = Some((base + ph.p_vaddr, ph.p_memsz)),
@@ -138,8 +167,9 @@ pub fn load(path: &Path, is_main: bool) -> Result<Arc<LoadedModule>, String> {
     }
     let eh_frame = eh_frame_hdr.and_then(|(hdr, _)| eh_frame_extent(hdr));
     let mut fingerprint = [0u8; 20];
-    if let Some(fp) = &dynamic.fingerprint {
-        fingerprint.copy_from_slice(&fp[..20]);
+    if let Some(fp) = dynamic.fingerprint.clone().or_else(|| build_id(&m)) {
+        let n = fp.len().min(20);
+        fingerprint[..n].copy_from_slice(&fp[..n]);
     }
     let lm = Arc::new(LoadedModule {
         handle: MODULES.read().len() as i32 + 1,
@@ -406,17 +436,54 @@ pub fn finalize(m: &LoadedModule) -> Result<PatchStats, String> {
         p.patch_raw_fs_zero(m.code.1 - m.base, &mut stats);
     }
     let tramp_used = p.tramp_used;
-    // Protections.
+    // Protections. Segments can share a page (PS5: the end of .bss and the
+    // no-access dynamic-link data), so each page gets the union of the
+    // protections of all segments touching it; RELRO then drops write access
+    // only on pages that no writable PT_LOAD data shares.
     let mut st = MEM.lock();
-    for ph in &m.phdrs {
-        let prot = match ph.p_type {
-            sce_elf::PT_LOAD => prot_from_flags(ph.p_flags),
-            sce_elf::PT_SCE_RELRO => mem::PROT_CPU_READ,
-            _ => continue,
-        };
-        let start = m.base + mem::align_down(ph.p_vaddr, PAGE);
-        let end = m.base + mem::align_up(ph.p_vaddr + ph.p_memsz, PAGE);
-        st.protect(start, end, prot).map_err(|e| format!("{}: protect: {e:?}", m.name))?;
+    let pages = (m.image_size / PAGE) as usize;
+    let mut prot = vec![0u32; pages];
+    let page_range = |ph: &Phdr| -> (usize, usize) {
+        let s = (mem::align_down(ph.p_vaddr, PAGE) / PAGE) as usize;
+        let e = (mem::align_up(ph.p_vaddr + ph.p_memsz, PAGE) / PAGE) as usize;
+        (s.min(pages), e.min(pages))
+    };
+    for ph in m.phdrs.iter().filter(|p| p.p_type == sce_elf::PT_LOAD && p.p_memsz > 0) {
+        let (s, e) = page_range(ph);
+        for p in &mut prot[s..e] {
+            *p |= prot_from_flags(ph.p_flags);
+        }
+    }
+    let mut writable_data = vec![false; pages];
+    for ph in m.phdrs.iter().filter(|p| p.p_type == sce_elf::PT_LOAD && p.p_flags & PF_W != 0) {
+        // Pages holding writable bytes outside any RELRO range must stay writable.
+        let relro: Vec<(u64, u64)> = m.phdrs.iter().filter(|r| r.p_type == sce_elf::PT_SCE_RELRO || r.p_type == PT_GNU_RELRO).map(|r| (r.p_vaddr, r.p_vaddr + r.p_memsz)).collect();
+        let (s, e) = page_range(ph);
+        for i in s..e {
+            let (a, b) = ((i as u64) * PAGE, (i as u64 + 1) * PAGE);
+            let (a, b) = (a.max(ph.p_vaddr), b.min(ph.p_vaddr + ph.p_memsz));
+            if a < b && !relro.iter().any(|&(rs, re)| rs <= a && b <= re) {
+                writable_data[i] = true;
+            }
+        }
+    }
+    for ph in m.phdrs.iter().filter(|p| (p.p_type == sce_elf::PT_SCE_RELRO || p.p_type == PT_GNU_RELRO) && p.p_memsz > 0) {
+        let (s, e) = page_range(ph);
+        for i in s..e {
+            if !writable_data[i] {
+                prot[i] &= !mem::PROT_CPU_WRITE;
+            }
+        }
+    }
+    let mut i = 0;
+    while i < pages {
+        let mut j = i + 1;
+        while j < pages && prot[j] == prot[i] {
+            j += 1;
+        }
+        let (start, end) = (m.base + i as u64 * PAGE, m.base + j as u64 * PAGE);
+        st.protect(start, end, prot[i]).map_err(|e| format!("{}: protect: {e:?}", m.name))?;
+        i = j;
     }
     if tramp_used > 0 {
         st.protect(m.base + m.image_size, m.base + m.size, mem::PROT_CPU_READ | mem::PROT_CPU_EXEC)
@@ -447,7 +514,7 @@ pub fn report_patch(m: &LoadedModule, s: &PatchStats) {
     for (rel, text, range) in s.fs_unknown.iter().take(8) {
         crate::info!("{}+{:#x}: unhandled FS-prefixed decode '{}' in function {:#x}..{:#x} (left unpatched)", m.name, rel, text, range.0, range.1);
     }
-    if std::env::var_os("BB_DUMP_FS").is_some() {
+    if std::env::var_os("DS_DUMP_FS").is_some() {
         for (rel, _, range) in s.fs_unknown.iter().take(4) {
             crate::patch::dump_around(m.base, *range, *rel);
         }

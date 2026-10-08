@@ -6,9 +6,9 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 std::arch::global_asm!(
-    // u64 bb_guest_thread_call(entry, a0, a1, *mut saved_rsp)  [sysv64]
-    ".globl bb_guest_thread_call",
-    "bb_guest_thread_call:",
+    // u64 ds_guest_thread_call(entry, a0, a1, *mut saved_rsp)  [sysv64]
+    ".globl ds_guest_thread_call",
+    "ds_guest_thread_call:",
     "push rbp",
     "mov rbp, rsp",
     "push rbx",
@@ -22,7 +22,7 @@ std::arch::global_asm!(
     "mov rdi, rsi",
     "mov rsi, rdx",
     "call rax",
-    "bb_guest_thread_resume:",
+    "ds_guest_thread_resume:",
     "add rsp, 8",
     "pop r15",
     "pop r14",
@@ -31,20 +31,20 @@ std::arch::global_asm!(
     "pop rbx",
     "pop rbp",
     "ret",
-    // ! bb_guest_thread_exit(saved_rsp, value)  [sysv64]
-    ".globl bb_guest_thread_exit",
-    "bb_guest_thread_exit:",
+    // ! ds_guest_thread_exit(saved_rsp, value)  [sysv64]
+    ".globl ds_guest_thread_exit",
+    "ds_guest_thread_exit:",
     "mov rsp, rdi",
     "mov rax, rsi",
-    "jmp bb_guest_thread_resume",
+    "jmp ds_guest_thread_resume",
 );
 
 unsafe extern "sysv64" {
-    fn bb_guest_thread_call(entry: u64, a0: u64, a1: u64, saved_rsp: *mut u64) -> u64;
-    fn bb_guest_thread_exit(saved_rsp: u64, value: u64) -> !;
+    fn ds_guest_thread_call(entry: u64, a0: u64, a1: u64, saved_rsp: *mut u64) -> u64;
+    fn ds_guest_thread_exit(saved_rsp: u64, value: u64) -> !;
 }
 
-pub const THREAD_MAGIC: u64 = 0x4242_5448_5245_4144; // "BBTHREAD"
+pub const THREAD_MAGIC: u64 = 0x4453_5448_5245_4144; // "DSTHREAD"
 pub const PTHREAD_KEYS_MAX: usize = 256;
 
 pub struct GuestThread {
@@ -131,7 +131,7 @@ pub fn enter(t: &'static GuestThread) {
 /// Runs guest code `entry(a0, a1)` on the current (already entered) thread.
 /// Returns when the function returns or the thread calls pthread_exit.
 pub fn run_entry(t: &'static GuestThread, entry: u64, a0: u64, a1: u64) -> u64 {
-    unsafe { bb_guest_thread_call(entry, a0, a1, t.saved_rsp.as_ptr()) }
+    unsafe { ds_guest_thread_call(entry, a0, a1, t.saved_rsp.as_ptr()) }
 }
 
 /// Terminates the current guest thread with `value` (pthread_exit semantics).
@@ -139,7 +139,7 @@ pub fn exit_current(value: u64) -> ! {
     let t = current().expect("pthread_exit on a non-guest thread");
     run_key_destructors(t);
     let rsp = t.saved_rsp.load(Ordering::SeqCst);
-    unsafe { bb_guest_thread_exit(rsp, value) }
+    unsafe { ds_guest_thread_exit(rsp, value) }
 }
 
 fn finish(t: &'static GuestThread, value: u64) {

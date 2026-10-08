@@ -125,7 +125,7 @@ sysv! {
     fn __tls_get_addr(ti: *const u64) -> u64 { crate::tls::get_addr(*ti, *ti.add(1)) }
     fn __stack_chk_fail() {
         crate::error!("guest stack protector failure (__stack_chk_fail)");
-        crate::fatal_exit(0xBB10, "stack smashing detected");
+        crate::fatal_exit(0xD510, "stack smashing detected");
     }
     fn sceKernelGetProcParam() -> u64 {
         loader::main_module().and_then(|m| m.proc_param).unwrap_or(0)
@@ -201,11 +201,11 @@ sysv! {
     fn sceKernelGetCpumode() -> i32 { 0 }
     fn sceKernelDebugRaiseException(code: u32, param: u64) {
         crate::error!("guest sceKernelDebugRaiseException code={code:#x} param={param:#x}");
-        crate::fatal_exit(0xBB11, "guest raised a debug exception");
+        crate::fatal_exit(0xD511, "guest raised a debug exception");
     }
     fn sceKernelDebugRaiseExceptionOnReleaseMode(code: u32, param: u64) {
         crate::error!("guest sceKernelDebugRaiseExceptionOnReleaseMode code={code:#x} param={param:#x}");
-        crate::fatal_exit(0xBB12, "guest raised a debug exception");
+        crate::fatal_exit(0xD512, "guest raised a debug exception");
     }
     fn _exit(code: i32) { exit_process(code) }
     fn getpid() -> i32 { 0x42 }
@@ -273,7 +273,7 @@ sysv! {
     fn _sceKernelSetThreadDtors(f: u64) -> i32 { 0 }
     fn _sceKernelSetThreadAtexitCount(f: u64) -> i32 { 0 }
     fn _sceKernelSetThreadAtexitReport(f: u64) -> i32 { 0 }
-    fn sceKernelGetFsSandboxRandomWord() -> u64 { crate::mem::arena_cstr("bbport0000") }
+    fn sceKernelGetFsSandboxRandomWord() -> u64 { crate::mem::arena_cstr("dsport0000") }
 }
 
 pub fn register(r: &mut Registry) {

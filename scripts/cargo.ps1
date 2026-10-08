@@ -1,5 +1,6 @@
-# Runs cargo with the registry/git caches isolated under the project's .cargo-home
-# (the shared rustup toolchain in the user profile is used read-only).
+# Runs cargo with the registry/git caches isolated under <project>\.cargo-home and
+# build output under <project>\target (the shared rustup toolchain in the user
+# profile is used read-only).
 # Note: do not use ErrorActionPreference=Stop here; cargo writes progress to stderr.
 $root = Split-Path -Parent $PSScriptRoot
 $env:CARGO_HOME = Join-Path $root '.cargo-home'

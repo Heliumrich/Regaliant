@@ -1,10 +1,8 @@
-//! HLE for PS4 system libraries other than libkernel.
+//! HLE for PS5 system libraries other than libkernel.
 
 pub mod ajm;
 pub mod app;
-pub mod avplayer;
 pub mod devices;
-pub mod gnm;
 pub mod ime_dialog;
 pub mod online;
 pub mod rtc;
@@ -23,7 +21,5 @@ pub fn register(r: &mut Registry) {
     ajm::register(r);
     rtc::register(r);
     savedata::register(r);
-    avplayer::register(r);
-    gnm::register(r);
     videoout::register(r);
 }

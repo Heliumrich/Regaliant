@@ -64,12 +64,12 @@ pub fn init() -> Result<(), String> {
             .engine_name(app_name)
             .api_version(vk::API_VERSION_1_3);
         let layers_avail = entry.enumerate_instance_layer_properties().unwrap_or_default();
-        let want_validation = std::env::var_os("BB_VK_VALIDATION").is_some();
+        let want_validation = std::env::var_os("DS_VK_VALIDATION").is_some();
         let validation_name = c"VK_LAYER_KHRONOS_validation";
         let has_validation = layers_avail.iter().any(|l| CStr::from_ptr(l.layer_name.as_ptr()) == validation_name);
         let validation = want_validation && has_validation;
         if want_validation && !has_validation {
-            crate::warn!("BB_VK_VALIDATION set but the Khronos validation layer is not installed");
+            crate::warn!("DS_VK_VALIDATION set but the Khronos validation layer is not installed");
         }
         let layers: Vec<*const c_char> = if validation { vec![validation_name.as_ptr()] } else { vec![] };
         let mut exts = vec![ash::khr::surface::NAME.as_ptr(), ash::khr::win32_surface::NAME.as_ptr()];

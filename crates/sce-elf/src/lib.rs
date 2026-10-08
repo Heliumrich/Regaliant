@@ -91,6 +91,13 @@ pub mod dt {
     pub const SCE_SYMENT: u64 = 0x6100_003B;
     pub const SCE_HASHSZ: u64 = 0x6100_003D;
     pub const SCE_SYMTABSZ: u64 = 0x6100_003F;
+    // PS5 ("Prospero") modules: identity tags renumbered; tables use standard
+    // vaddr-based DT_* tags inside a no-access PT_LOAD instead of DYNLIBDATA.
+    pub const PS5_ORIGINAL_FILENAME: u64 = 0x6100_0041;
+    pub const PS5_MODULE_INFO: u64 = 0x6100_0043;
+    pub const PS5_NEEDED_MODULE: u64 = 0x6100_0045;
+    pub const PS5_EXPORT_LIB: u64 = 0x6100_0047;
+    pub const PS5_IMPORT_LIB: u64 = 0x6100_0049;
 }
 
 pub mod reloc {
@@ -362,6 +369,24 @@ impl Module {
     pub fn dynamic(&self) -> Result<DynamicInfo> {
         DynamicInfo::parse(self)
     }
+
+    /// File bytes backing virtual range [vaddr, vaddr+len) of a PT_LOAD segment.
+    pub fn vaddr_data(&self, vaddr: u64, len: u64) -> Option<&[u8]> {
+        for (i, p) in self.phdrs.iter().enumerate() {
+            if p.p_type != PT_LOAD || vaddr < p.p_vaddr || vaddr.checked_add(len)? > p.p_vaddr + p.p_filesz {
+                continue;
+            }
+            let seg = self.segment_data(i)?;
+            let off = (vaddr - p.p_vaddr) as usize;
+            return seg.get(off..off + len as usize);
+        }
+        None
+    }
+
+    /// True for PS5 modules (dynamic tables addressed by vaddr, no DYNLIBDATA).
+    pub fn is_ps5_layout(&self) -> bool {
+        self.find_phdr(PT_SCE_DYNLIBDATA).is_none() && self.find_phdr(PT_DYNAMIC).is_some()
+    }
 }
 
 pub fn align_up(v: u64, a: u64) -> u64 {
@@ -443,14 +468,76 @@ pub struct DynamicInfo {
     pub soname: Option<String>,
     pub fingerprint: Option<Vec<u8>>,
     pub original_filename: Option<String>,
+    /// PS5 layout (tables addressed by vaddr; see `dt::PS5_*`).
+    pub ps5: bool,
 }
+
+/// Tag numbers of one dynamic-metadata layout (PS4 DYNLIBDATA offsets or PS5 vaddrs).
+struct Layout {
+    strtab: u64,
+    strsz: u64,
+    symtab: u64,
+    rela: u64,
+    relasz: u64,
+    jmprel: u64,
+    pltrelsz: u64,
+    pltgot: u64,
+    original_filename: u64,
+    module_info: u64,
+    needed_module: u64,
+    export_lib: u64,
+    import_lib: u64,
+}
+
+const PS4_LAYOUT: Layout = Layout {
+    strtab: dt::SCE_STRTAB,
+    strsz: dt::SCE_STRSZ,
+    symtab: dt::SCE_SYMTAB,
+    rela: dt::SCE_RELA,
+    relasz: dt::SCE_RELASZ,
+    jmprel: dt::SCE_JMPREL,
+    pltrelsz: dt::SCE_PLTRELSZ,
+    pltgot: dt::SCE_PLTGOT,
+    original_filename: dt::SCE_ORIGINAL_FILENAME,
+    module_info: dt::SCE_MODULE_INFO,
+    needed_module: dt::SCE_NEEDED_MODULE,
+    export_lib: dt::SCE_EXPORT_LIB,
+    import_lib: dt::SCE_IMPORT_LIB,
+};
+
+const PS5_LAYOUT: Layout = Layout {
+    strtab: dt::STRTAB,
+    strsz: dt::STRSZ,
+    symtab: dt::SYMTAB,
+    rela: dt::RELA,
+    relasz: dt::RELASZ,
+    jmprel: dt::JMPREL,
+    pltrelsz: dt::PLTRELSZ,
+    pltgot: dt::PLTGOT,
+    original_filename: dt::PS5_ORIGINAL_FILENAME,
+    module_info: dt::PS5_MODULE_INFO,
+    needed_module: dt::PS5_NEEDED_MODULE,
+    export_lib: dt::PS5_EXPORT_LIB,
+    import_lib: dt::PS5_IMPORT_LIB,
+};
 
 impl DynamicInfo {
     fn parse(m: &Module) -> Result<DynamicInfo> {
         let dyn_idx = m.find_phdr(PT_DYNAMIC).ok_or_else(|| Error("no PT_DYNAMIC".into()))?;
-        let data_idx = m.find_phdr(PT_SCE_DYNLIBDATA).ok_or_else(|| Error("no PT_SCE_DYNLIBDATA".into()))?;
         let dynb = m.segment_data(dyn_idx).ok_or_else(|| Error("PT_DYNAMIC bytes not in file".into()))?;
-        let data = m.segment_data(data_idx).ok_or_else(|| Error("PT_SCE_DYNLIBDATA bytes not in file".into()))?;
+        // PS4: tables are offsets into PT_SCE_DYNLIBDATA. PS5: tables are vaddrs
+        // inside a loadable segment.
+        let dynlibdata = match m.find_phdr(PT_SCE_DYNLIBDATA) {
+            Some(i) => Some(m.segment_data(i).ok_or_else(|| Error("PT_SCE_DYNLIBDATA bytes not in file".into()))?),
+            None => None,
+        };
+        let lay = if dynlibdata.is_some() { &PS4_LAYOUT } else { &PS5_LAYOUT };
+        let table = |off: u64, len: u64| -> Option<&[u8]> {
+            match dynlibdata {
+                Some(d) => d.get(off as usize..(off as usize).checked_add(len as usize)?),
+                None => m.vaddr_data(off, len),
+            }
+        };
 
         let mut tags: Vec<(u64, u64)> = Vec::new();
         for i in 0..dynb.len() / 16 {
@@ -462,11 +549,9 @@ impl DynamicInfo {
             tags.push((tag, val));
         }
         let get = |t: u64| tags.iter().find(|(k, _)| *k == t).map(|(_, v)| *v);
-        let strtab = get(dt::SCE_STRTAB).ok_or_else(|| Error("no DT_SCE_STRTAB".into()))? as usize;
-        let strsz = get(dt::SCE_STRSZ).unwrap_or(0) as usize;
-        let strs = data
-            .get(strtab..strtab + strsz)
-            .ok_or_else(|| Error("string table out of bounds".into()))?;
+        let strtab = get(lay.strtab).ok_or_else(|| Error("no string table tag".into()))?;
+        let strsz = get(lay.strsz).unwrap_or(0);
+        let strs = table(strtab, strsz).ok_or_else(|| Error("string table out of bounds".into()))?;
         let cstr = |off: u64| -> Result<String> {
             let off = off as usize;
             let s = strs.get(off..).ok_or_else(|| Error(format!("string offset {off:#x} out of bounds")))?;
@@ -480,44 +565,45 @@ impl DynamicInfo {
         for &(tag, val) in &tags {
             let name_off = val & 0xFFFF_FFFF;
             let id = (val >> 48) as u16;
+            if tag == lay.module_info || tag == lay.needed_module {
+                let r = ModuleRef { name: cstr(name_off)?, id, version_major: (val >> 40) as u8, version_minor: (val >> 32) as u8 };
+                if tag == lay.module_info {
+                    info.module_info = Some(r);
+                } else {
+                    info.needed_modules.push(r);
+                }
+                continue;
+            }
+            if tag == lay.import_lib || tag == lay.export_lib {
+                let lib = LibraryRef { name: cstr(name_off)?, id, version: (val >> 32) as u16, attr: 0 };
+                if tag == lay.import_lib {
+                    info.import_libs.push(lib)
+                } else {
+                    info.export_libs.push(lib)
+                }
+                continue;
+            }
+            if tag == lay.original_filename {
+                info.original_filename = Some(cstr(name_off)?);
+                continue;
+            }
+            if tag == lay.pltgot {
+                info.pltgot = Some(val);
+                continue;
+            }
             match tag {
                 dt::NEEDED => info.needed.push(cstr(val)?),
                 dt::SONAME => info.soname = Some(cstr(val)?),
-                dt::SCE_MODULE_INFO => {
-                    info.module_info = Some(ModuleRef {
-                        name: cstr(name_off)?,
-                        id,
-                        version_major: (val >> 40) as u8,
-                        version_minor: (val >> 32) as u8,
-                    })
-                }
-                dt::SCE_NEEDED_MODULE => info.needed_modules.push(ModuleRef {
-                    name: cstr(name_off)?,
-                    id,
-                    version_major: (val >> 40) as u8,
-                    version_minor: (val >> 32) as u8,
-                }),
-                dt::SCE_IMPORT_LIB | dt::SCE_EXPORT_LIB => {
-                    let lib = LibraryRef { name: cstr(name_off)?, id, version: (val >> 32) as u16, attr: 0 };
-                    if tag == dt::SCE_IMPORT_LIB {
-                        info.import_libs.push(lib)
-                    } else {
-                        info.export_libs.push(lib)
-                    }
-                }
                 dt::SCE_IMPORT_LIB_ATTR => import_attr.push((id, val as u16)),
                 dt::SCE_EXPORT_LIB_ATTR => export_attr.push((id, val as u16)),
                 dt::INIT => info.init = Some(val),
                 dt::FINI => info.fini = Some(val),
                 dt::FLAGS => info.flags = val,
-                dt::SCE_PLTGOT => info.pltgot = Some(val),
-                dt::SCE_FINGERPRINT => {
-                    info.fingerprint = data.get(val as usize..val as usize + 20).map(|s| s.to_vec())
-                }
-                dt::SCE_ORIGINAL_FILENAME => info.original_filename = Some(cstr(val)?),
+                dt::SCE_FINGERPRINT => info.fingerprint = table(val, 20).map(|s| s.to_vec()),
                 _ => {}
             }
         }
+        info.ps5 = dynlibdata.is_none();
         for (id, attr) in import_attr {
             if let Some(l) = info.import_libs.iter_mut().find(|l| l.id == id) {
                 l.attr = attr;
@@ -534,15 +620,13 @@ impl DynamicInfo {
         info.preinit_array = pair(dt::PREINIT_ARRAY, dt::PREINIT_ARRAYSZ);
 
         // Symbols
-        if let Some(symtab) = get(dt::SCE_SYMTAB) {
+        if let Some(symtab) = get(lay.symtab) {
             let symsz = get(dt::SCE_SYMTABSZ).unwrap_or(0) as usize;
-            let syment = get(dt::SCE_SYMENT).unwrap_or(24) as usize;
+            let syment = get(dt::SCE_SYMENT).or(get(dt::SYMENT)).unwrap_or(24) as usize;
             if syment != 24 {
                 bail!("unexpected symbol entry size {syment}");
             }
-            let st = data
-                .get(symtab as usize..symtab as usize + symsz)
-                .ok_or_else(|| Error("symbol table out of bounds".into()))?;
+            let st = table(symtab, symsz as u64).ok_or_else(|| Error("symbol table out of bounds".into()))?;
             for i in 0..symsz / 24 {
                 let o = i * 24;
                 info.symbols.push(Symbol {
@@ -557,9 +641,7 @@ impl DynamicInfo {
         }
         let read_relas = |off: Option<u64>, sz: Option<u64>| -> Result<Vec<Rela>> {
             let (Some(off), Some(sz)) = (off, sz) else { return Ok(Vec::new()) };
-            let r = data
-                .get(off as usize..(off + sz) as usize)
-                .ok_or_else(|| Error("relocation table out of bounds".into()))?;
+            let r = table(off, sz).ok_or_else(|| Error("relocation table out of bounds".into()))?;
             let mut v = Vec::with_capacity(r.len() / 24);
             for i in 0..r.len() / 24 {
                 let o = i * 24;
@@ -567,8 +649,8 @@ impl DynamicInfo {
             }
             Ok(v)
         };
-        info.relas = read_relas(get(dt::SCE_RELA), get(dt::SCE_RELASZ))?;
-        info.plt_relas = read_relas(get(dt::SCE_JMPREL), get(dt::SCE_PLTRELSZ))?;
+        info.relas = read_relas(get(lay.rela), get(lay.relasz))?;
+        info.plt_relas = read_relas(get(lay.jmprel), get(lay.pltrelsz))?;
         Ok(info)
     }
 

@@ -157,7 +157,6 @@ pub fn gpu_flip(handle: i32, index: i32, _mode: u32, arg: i64) {
 
 /// Blocks (GPU side) until no flip of `index` is pending.
 pub fn wait_flip_done(handle: i32, index: i32) {
-    crate::gpu::set_phase(crate::gpu::phase::FLIP_WAIT, index as u64);
     if handle != 1 || !(0..16).contains(&index) {
         return;
     }
@@ -296,11 +295,6 @@ fn present_buffer(b: &DisplayBuffer) {
         return;
     }
     let (w, h, pitch) = (b.attr.width, b.attr.height, b.attr.pitch.max(b.attr.width));
-    let rendered = crate::gpu::render::RENDERER.lock().as_mut().and_then(|r| r.display_image(b.addr, w, h));
-    if let Some((image, iw, ih)) = rendered {
-        crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Image { image, layout: ash::vk::ImageLayout::GENERAL, width: iw, height: ih });
-        return;
-    }
     if w == 0 || h == 0 || w > 8192 || h > 8192 {
         return;
     }
@@ -314,28 +308,17 @@ fn present_buffer(b: &DisplayBuffer) {
     crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Pixels { data, width: w, height: h });
 }
 
-/// BB_SCREENSHOT=n1,n2,... writes the displayed image of those flips as PNG.
+/// DS_SCREENSHOT=n1,n2,... writes the displayed image of those flips as PNG.
 /// Screenshot requested through the control channel (file name stem).
 pub static SHOT_REQUEST: Mutex<Option<String>> = Mutex::new(None);
 
 fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
     let requested = SHOT_REQUEST.lock().take();
-    let listed = std::env::var("BB_SCREENSHOT").is_ok_and(|list| list.split(',').any(|s| s.trim().parse::<u64>().ok() == Some(flip)));
+    let listed = std::env::var("DS_SCREENSHOT").is_ok_and(|list| list.split(',').any(|s| s.trim().parse::<u64>().ok() == Some(flip)));
     if requested.is_none() && !listed {
         return;
     }
-    let (w, h) = (b.attr.width, b.attr.height);
-    let px = crate::gpu::render::RENDERER.lock().as_mut().and_then(|r| r.capture(b.addr, w, h));
-    let Some(px) = px else {
-        crate::warn!("screenshot of flip {flip}: no rendered image for buffer {:#x}", b.addr);
-        return;
-    };
-    if let Some(dir) = crate::gpu::shader_dump::DIR.get().and_then(|d| d.parent()) {
-        let path = match &requested {
-            Some(name) => dir.join(format!("shot_{name}.png")),
-            None => dir.join(format!("flip{flip:05}.png")),
-        };
-        let _ = std::fs::write(&path, crate::gpu::texdump::png(w, h, &px));
-        crate::info!("screenshot written: {}", path.display());
-    }
+    // No GPU renderer exists yet: the display buffer contents are not produced
+    // by the title's GPU work, so there is nothing truthful to capture.
+    crate::warn!("screenshot of flip {flip} ({:?}) unavailable: GPU rendering is not implemented yet (buffer {:#x})", requested, b.addr);
 }
