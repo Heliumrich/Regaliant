@@ -1,0 +1,8 @@
+# Runs cargo with the registry/git caches isolated under the project's .cargo-home
+# (the shared rustup toolchain in the user profile is used read-only).
+# Note: do not use ErrorActionPreference=Stop here; cargo writes progress to stderr.
+$root = Split-Path -Parent $PSScriptRoot
+$env:CARGO_HOME = Join-Path $root '.cargo-home'
+$env:CARGO_TARGET_DIR = Join-Path $root 'target'
+& "$env:USERPROFILE\.cargo\bin\cargo.exe" @args 2>&1 | ForEach-Object { "$_" }
+exit $LASTEXITCODE
