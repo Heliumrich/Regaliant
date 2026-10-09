@@ -262,7 +262,7 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 Ok(())
             }
             "probe" => {
-                // Diagnosis: `probe <shader>:<pc>:<vgpr>[:<frames>]` / `probe off`.
+                // Diagnosis: `probe <shader>:<pc>:<v<k>|s<k>>[u|i][:<frames>]` / `probe off`.
                 let rest = line.trim_start().strip_prefix("probe").unwrap_or("").trim();
                 gpu::shaders::set_probe(rest)
             }
@@ -287,12 +287,17 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 Ok(())
             }
             "capture" => {
-                // `capture [<from>-<to>] [dispatches]`: the next frame,
-                // optionally with per-draw reports for that range of its
-                // events and dumps of the images its dispatches write.
+                // `capture [<from>-<to>] [dispatches] [buffers=<shader>]`:
+                // the next frame, optionally with per-draw reports for that
+                // range of its events, dumps of the images its dispatches
+                // write and of the buffers one compute shader binds.
                 for arg in parts.by_ref() {
                     if arg == "dispatches" {
                         gpu::capture::set_dispatch_dumps(true);
+                    } else if let Some(cs) = arg.strip_prefix("buffers=") {
+                        // ... and the buffers that compute shader binds.
+                        gpu::capture::set_dispatch_dumps(true);
+                        gpu::capture::set_buffer_dumps(u64::from_str_radix(cs.trim_start_matches("0x"), 16).ok());
                     } else if let Some((a, b)) = arg.split_once('-') {
                         match (a.parse(), b.parse()) {
                             (Ok(a), Ok(b)) => gpu::capture::set_draw_range((a, b)),

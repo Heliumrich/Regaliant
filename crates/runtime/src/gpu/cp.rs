@@ -893,7 +893,13 @@ impl Cp {
                     if valid(a, 12) {
                         let g = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8)] };
                         indirect_groups = Some(g);
+                        // DS_EMU_CHECK (earlier work has completed).
+                        let check = if super::exec::enabled() && super::emucheck::wanted(self) { super::emucheck::prepare(self, g, p(1)) } else { None };
                         self.dispatch(g, p(1));
+                        if let Some(c) = check {
+                            self.sync();
+                            super::emucheck::compare(c);
+                        }
                     }
                 }
                 if super::capture::dispatch_dumps() {

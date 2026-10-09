@@ -320,7 +320,14 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
                         _ => Prov::Unknown,
                     },
                 },
-                ("s_addc_u32", _, Prov::Const(0)) => {
+                // The same with the constant first: s_getpc_b64 s[4:5];
+                // s_add_u32 s4, lit, s4; s_addc_u32 s5, 0, s5 addresses a
+                // table in the shader's code (descriptors built in the shader).
+                ("s_add_u32", Prov::Const(c), _) => match st.ptr(ins.ssrc1()) {
+                    Some((p, bias)) => Prov::PtrLo(p, bias.wrapping_add(*c)),
+                    None => Prov::Unknown,
+                },
+                ("s_addc_u32", _, Prov::Const(0)) | ("s_addc_u32", Prov::Const(0), _) => {
                     // s_addc_u32 hi, ptr_hi, 0 following the s_add_u32 above
                     match st.get(d.saturating_sub(1)) {
                         Prov::PtrLo(p, bias) => Prov::PtrHi(p, bias),
@@ -494,5 +501,26 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
             plan.inst_res.insert(ins.pc, (r, None));
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A V# built in the shader: s_getpc_b64 plus a constant given as the
+    /// first operand of s_add_u32 addresses a table in the code (cs
+    /// 0x1008898d00 of PPSA01341 01.007.000).
+    #[test]
+    fn getpc_descriptor_with_constant_first() {
+        let words = [0u32; 13];
+        let code = crate::decode_program(&words).unwrap();
+        let plan = analyze(&code, 0, 0, 0x1000);
+        assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+        let r = &plan.resources[0];
+        assert_eq!(r.kind, ResKind::Buffer);
+        // s_getpc_b64 is at pc 0xc: the next instruction's address.
+        let pc = Ptr::Abs(0x1000 + 0xc + 4);
+        assert_eq!(r.dwords, vec![Prov::PtrLo(pc.clone(), 0x474), Prov::PtrHi(pc, 0x474), Prov::Const(16), Prov::Const(0x1000_5004)]);
     }
 }

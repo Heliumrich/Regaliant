@@ -129,9 +129,11 @@ pub struct Spec {
     pub resources: Vec<ResSpec>,
     /// Binding index of the first binding (stages share one descriptor set).
     pub binding_base: u32,
-    /// Debugging: (pc, vgpr): the value of `vgpr` after the instruction at
-    /// `pc` replaces the color of every MRT export ((v, v, v, 1) as float),
-    /// or (compute) the data of every image and buffer store.
+    /// Debugging: (pc, register): the value of the register after the
+    /// instruction at `pc` replaces the color of every MRT export ((v, v, v,
+    /// 1) as float), or (compute) the data of every image and buffer store.
+    /// The register is a VGPR number, or an SGPR with PROBE_SGPR; with
+    /// PROBE_UINT / PROBE_SINT its integer value is converted to float.
     pub probe: Option<(u32, u32)>,
     /// Debugging (compute): (pc, workgroup id): after each execution of the
     /// instruction at pc, the invocations of that workgroup write their
@@ -140,6 +142,11 @@ pub struct Spec {
     /// instance with vertex indices from the first one (1024 slots) do.
     pub dump: Option<(u32, [u32; 3])>,
 }
+
+/// Probe register flags (see `Spec::probe`).
+pub const PROBE_SGPR: u32 = 1 << 12;
+pub const PROBE_UINT: u32 = 1 << 13;
+pub const PROBE_SINT: u32 = 1 << 14;
 
 /// Dwords per invocation in the debug binding: VGPRs 0..256, SGPRs at 256
 /// (128), SCC at 384, execution count at 385.
@@ -325,6 +332,9 @@ pub(crate) struct T<'a> {
     /// Lane reads that take the invocation's own value (see
     /// [`atomic_result_reads`]).
     pub own_lane_reads: BTreeSet<u32>,
+    /// Lane-0 elections: compare pc -> source operand (0/1) holding the lane
+    /// index, compared as lane 0 (see [`lane0_elections`]).
+    pub elections: HashMap<u32, usize>,
     pub warnings: Vec<String>,
     pub params: u32,
     pub mrt_mask: u32,
@@ -964,6 +974,169 @@ fn atomic_result_reads(code: &[Inst]) -> BTreeSet<u32> {
     out
 }
 
+/// Lane-0 elections of wave-aggregated atomics that count with popcounts of
+/// lane masks. Pattern (the deferred lighting's tile classification appends
+/// each 8x8 block of tiles this way):
+///
+///   v_cmp_lg_u32 vcc, 0, vL            ; vL: the lane's index in the group
+///   s_not_b64 vcc, vcc                 ; (or v_cmp_eq_u32 directly)
+///   s_mov_b64 exec, vcc                ; lane 0 only
+///   v_bcnt_u32_b32 vN, sMaskHi, 0      ; lanes taking part
+///   v_bcnt_u32_b32 vN, sMaskLo, vN
+///   buffer_atomic_add vN, ... glc      ; lane 0 reserves their slots
+///   v_readlane_b32 sBase, vN, 0        ; every lane takes the base ...
+///   ... v_mbcnt (mask) + sBase         ; ... plus its prefix
+///
+/// The workgroup is a single wave, so vL is its lane index. Here every
+/// invocation is a wave of one: its masks hold only its own bit and its
+/// prefix is 0, so it must reserve its own slot (with its own count) and read
+/// its own result (`atomic_result_reads`). The compare therefore takes lane
+/// 0's result in every lane. Lane-0 work that adds a count gathered across
+/// lanes (DPP sums read with v_readlane) is left alone.
+/// Returns compare pc -> index of the source operand holding vL.
+fn lane0_elections(code: &[Inst], spec: &Spec) -> HashMap<u32, usize> {
+    use crate::{OP_EXEC_LO, OP_VCC_LO, OP_VGPR0};
+    let mut out = HashMap::new();
+    let wave = if spec.wave64 { 64 } else { 32 };
+    let [sx, sy, sz] = spec.cs_local_size.map(|x| x.max(1));
+    if spec.stage != Stage::Compute || sx * sy * sz != wave {
+        return out;
+    }
+    // Writes of VGPR v anywhere in the program (pcs).
+    let writes = |v: u16| -> Vec<usize> { code.iter().enumerate().filter(|(_, p)| vgpr_def(p, v).is_some()).map(|(i, _)| i).collect() };
+    // Whether VGPR v holds the lane index (the linear local invocation index
+    // of a single-wave group) at instruction `at`.
+    let lane_index = |v: u16, at: usize| -> bool {
+        let w = writes(v);
+        if w.iter().any(|&i| i >= at) && w.len() != 1 {
+            return false;
+        }
+        match w.as_slice() {
+            [] => v == 0 && sy == 1 && sz == 1,
+            [i] if *i < at => {
+                let p = &code[*i];
+                // v_lshl_add_u32 vL, v1, log2(sx), v0 with v0/v1 still the
+                // local invocation id.
+                let k = p.src(1);
+                p.base_name() == Some("v_lshl_add_u32")
+                    && p.src(0) == OP_VGPR0 + 1
+                    && p.src(2) == OP_VGPR0
+                    && (129..=192).contains(&k)
+                    && 1u32 << (k - 128) == sx
+                    && sz == 1
+                    && writes(0).iter().chain(writes(1).iter()).all(|&j| j >= *i)
+            }
+            _ => false,
+        }
+    };
+    // Compare operands and destination: (cmp, src0, src1, sdst).
+    let cmp_parts = |p: &Inst| -> Option<(&'static str, u16, u16, u16)> {
+        let name = p.base_name()?;
+        let rest = name.strip_prefix("v_cmp_")?;
+        let cmp = match rest {
+            "eq_u32" | "eq_i32" => "eq",
+            "lg_u32" | "lg_i32" | "ne_u32" | "ne_i32" => "ne",
+            _ => return None,
+        };
+        match (p.enc, p.ext) {
+            (crate::Enc::Vopc, crate::Ext::Sdwa(d)) => {
+                let s0 = if d >> 23 & 1 != 0 { (d & 0xFF) as u16 } else { OP_VGPR0 + (d & 0xFF) as u16 };
+                let s1 = if d >> 31 & 1 != 0 { (p.w0 >> 9 & 0xFF) as u16 } else { OP_VGPR0 + (p.w0 >> 9 & 0xFF) as u16 };
+                Some((cmp, s0, s1, p.sdwa_sdst().unwrap_or(OP_VCC_LO)))
+            }
+            (crate::Enc::Vopc, _) => Some((cmp, p.src(0), p.src(1), OP_VCC_LO)),
+            (crate::Enc::Vop3, _) => Some((cmp, p.src(0), p.src(1), p.vdst())),
+            _ => None,
+        }
+    };
+    // Whether `p` may write SGPR `s` (pairs count both halves).
+    let writes_sgpr = |p: &Inst, s: u16| -> bool {
+        let name = p.base_name().unwrap_or("");
+        let pair = |d: u16| s == d || s == d + 1;
+        match p.enc {
+            crate::Enc::Sop1 | crate::Enc::Sop2 | crate::Enc::Sopk => {
+                let d = p.sdst();
+                d == s || (name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64")) && d + 1 == s || name.contains("saveexec") && pair(OP_EXEC_LO)
+            }
+            crate::Enc::Smem => p.sdst() <= s && s < p.sdst() + 16,
+            crate::Enc::Vopc => {
+                if name.starts_with("v_cmpx") {
+                    pair(OP_EXEC_LO)
+                } else {
+                    pair(p.sdwa_sdst().unwrap_or(OP_VCC_LO))
+                }
+            }
+            crate::Enc::Vop3 if name.starts_with("v_cmpx") => pair(OP_EXEC_LO),
+            crate::Enc::Vop3 if name.starts_with("v_cmp") => pair(p.vdst()),
+            crate::Enc::Vop3 if p.is_vop3b() => pair(p.vop3_sdst()),
+            crate::Enc::Vop3 if matches!(name, "v_readlane_b32" | "v_readfirstlane_b32") => p.vdst() == s,
+            crate::Enc::Vop1 if name == "v_readfirstlane_b32" => p.vdst() == s,
+            crate::Enc::Vop2 => (name.contains("_co_") || name.contains("_ci_")) && pair(OP_VCC_LO),
+            _ => false,
+        }
+    };
+    for (ia, a) in code.iter().enumerate() {
+        let name = a.base_name().unwrap_or("");
+        if !(name.starts_with("buffer_atomic_add") || name.starts_with("global_atomic_add")) || !a.glc() {
+            continue;
+        }
+        let d = a.vdst();
+        // The data: a popcount of SGPR lane masks.
+        let Some(id) = (0..ia).rev().take(24).find(|&i| vgpr_def(&code[i], d).is_some()) else { continue };
+        let def = &code[id];
+        if def.base_name() != Some("v_bcnt_u32_b32") || def.src(0) >= 106 {
+            continue;
+        }
+        // The result is read with v_readlane / v_readfirstlane.
+        let read = code[ia + 1..].iter().take(8).any(|p| matches!(p.base_name(), Some("v_readlane_b32" | "v_readfirstlane_b32")) && p.src(0) == OP_VGPR0 + d);
+        if !read {
+            continue;
+        }
+        // EXEC at the atomic: s_mov_b64 exec, X.
+        let Some(ie) = (0..ia).rev().take(24).find(|&i| writes_sgpr(&code[i], OP_EXEC_LO)) else { continue };
+        let e = &code[ie];
+        if e.base_name() != Some("s_mov_b64") || e.sdst() != OP_EXEC_LO {
+            continue;
+        }
+        // X from a compare, possibly inverted by s_not_b64.
+        let mut want = e.ssrc0();
+        let mut from = ie;
+        let mut negated = false;
+        let mut found = None;
+        for _ in 0..3 {
+            let Some(ix) = (0..from).rev().take(24).find(|&i| writes_sgpr(&code[i], want)) else { break };
+            let x = &code[ix];
+            if x.base_name() == Some("s_not_b64") && x.sdst() == want {
+                negated = !negated;
+                want = x.ssrc0();
+                from = ix;
+                continue;
+            }
+            if let Some((cmp, s0, s1, sd)) = cmp_parts(x) {
+                if sd == want {
+                    found = Some((ix, cmp, s0, s1));
+                }
+            }
+            break;
+        }
+        let Some((ix, cmp, s0, s1)) = found else { continue };
+        // Lane 0 must end up active: (0 == vL) or not(0 != vL).
+        if (cmp == "eq") == negated {
+            continue;
+        }
+        let zero = 128u16;
+        let lane_op = if s0 == zero && s1 >= OP_VGPR0 && lane_index(s1 - OP_VGPR0, ix) {
+            1
+        } else if s1 == zero && s0 >= OP_VGPR0 && lane_index(s0 - OP_VGPR0, ix) {
+            0
+        } else {
+            continue;
+        };
+        out.insert(code[ix].pc, lane_op);
+    }
+    out
+}
+
 /// Whether `p` may write VGPR `v`: Some(true) for an atomic returning the
 /// previous value into it, Some(false) for any other (possible) write.
 fn vgpr_def(p: &Inst, v: u16) -> Option<bool> {
@@ -1106,6 +1279,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         sg_lane_var: None,
         lane_slots: HashMap::new(),
         own_lane_reads: atomic_result_reads(code),
+        elections: lane0_elections(code, spec),
         warnings: Vec::new(),
         params: 0,
         mrt_mask: 0,
@@ -1121,6 +1295,11 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         buffer_views: HashMap::new(),
         view_structs: HashMap::new(),
     };
+    let mut elected: Vec<u32> = tr.elections.keys().copied().collect();
+    elected.sort();
+    for pc in elected {
+        tr.warn(format!("{pc:#x}: lane-0 election of a wave-aggregated atomic taken by every lane (each appends itself)"));
+    }
     // SGPR data buffer (binding base + 0).
     let sd = tr.sb_var();
     let bnd = tr.alloc_binding(BindingKind::SgprData);
@@ -1511,9 +1690,22 @@ fn emit_dispatch_loop(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>) -> R<()
 
 fn translate_inst(tr: &mut T, ins: &Inst) -> R<()> {
     translate_one(tr, ins)?;
-    if let (Some((pc, vg)), Some(var)) = (tr.spec.probe, tr.probe_var) {
+    if let (Some((pc, reg)), Some(var)) = (tr.spec.probe, tr.probe_var) {
         if ins.pc == pc {
-            let v = tr.vreg(vg)?;
+            let n = reg & 0xFFF;
+            let v = if reg & PROBE_SGPR != 0 { tr.sreg(n)? } else { tr.vreg(n)? };
+            let v = if reg & (PROBE_UINT | PROBE_SINT) != 0 {
+                let (u, f) = (tr.t.u32, tr.t.f32);
+                let x = if reg & PROBE_SINT != 0 {
+                    let i = e(tr.b.bitcast(tr.t.i32, None, v))?;
+                    e(tr.b.convert_s_to_f(f, None, i))?
+                } else {
+                    e(tr.b.convert_u_to_f(f, None, v))?
+                };
+                e(tr.b.bitcast(u, None, x))?
+            } else {
+                v
+            };
             ok(tr.b.store(var, v, None, []))?;
         }
     }
@@ -1599,5 +1791,52 @@ fn translate_one(tr: &mut T, ins: &Inst) -> R<()> {
             tr.warn(format!("{:#x}: {} unsupported", ins.pc, ins.name().unwrap_or("flat/scratch")));
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cs_spec(local: [u32; 3]) -> Spec {
+        Spec {
+            stage: Stage::Compute,
+            user_sgprs: 2,
+            user_base: 0,
+            code_base: 0x1000,
+            wave64: true,
+            ps_input_addr: 0,
+            ps_inputs: Vec::new(),
+            mrt: [MrtSpec::default(); 8],
+            cs_local_size: local,
+            cs_rsrc2: 0,
+            resources: Vec::new(),
+            binding_base: 0,
+            probe: None,
+            dump: None,
+        }
+    }
+
+    /// The tile classification's append kernel (cs 0x10088ab000 of PPSA01341
+    /// 01.007.000; one invocation per tile, 8x8 per wave): lane 0 of each
+    /// wave reserves the slots counted with v_bcnt of the class masks.
+    #[test]
+    fn lane0_election_of_mask_counted_append() {
+        let words = [0u32; 83];
+        let code = crate::decode_program(&words).unwrap();
+        let e = lane0_elections(&code, &cs_spec([8, 8, 1]));
+        // v_cmp_lg_u32 vcc, 0, v0 (v0 = ly * 8 + lx): operand 1 is the lane.
+        assert_eq!(e.into_iter().collect::<Vec<_>>(), vec![(0x9c, 1)]);
+        // Not for groups of several waves.
+        assert!(lane0_elections(&code, &cs_spec([16, 8, 1])).is_empty());
+    }
+
+    /// The counting kernel (cs 0x10088aa500) sums the class masks with DPP
+    /// and v_readlane; its lane 0 adds the wave's total: no election.
+    #[test]
+    fn lane0_election_not_for_wave_sums() {
+        let words = [0u32; 77];
+        let code = crate::decode_program(&words).unwrap();
+        assert!(lane0_elections(&code, &cs_spec([8, 8, 1])).is_empty());
     }
 }

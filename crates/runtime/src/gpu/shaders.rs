@@ -271,18 +271,38 @@ pub(crate) fn probe_for(addr: u64) -> Option<(u32, u32)> {
 /// Probe setting (see `probe_for`): None until read from `DS_PROBE`.
 static PROBE: parking_lot::Mutex<Option<Option<(u64, u32, u32, u32)>>> = parking_lot::Mutex::new(None);
 
+/// `<shader>:<pc>:<register>[:<n>]`; the register is `v<k>` (or `<k>`) or
+/// `s<k>`, with a suffix `u` / `i` to show an unsigned / signed integer as
+/// a float.
 fn parse_probe(v: &str) -> Option<(u64, u32, u32, u32)> {
+    use rdna::translate::{PROBE_SGPR, PROBE_SINT, PROBE_UINT};
     let mut it = v.split(':');
     let a = u64::from_str_radix(it.next()?.trim().trim_start_matches("0x"), 16).ok()?;
     let pc = u32::from_str_radix(it.next()?.trim().trim_start_matches("0x"), 16).ok()?;
-    let vg = it.next()?.trim().parse().ok()?;
+    let r = it.next()?.trim();
+    let (r, conv) = match r.strip_suffix('u') {
+        Some(x) => (x, PROBE_UINT),
+        None => match r.strip_suffix('i') {
+            Some(x) => (x, PROBE_SINT),
+            None => (r, 0),
+        },
+    };
+    let (r, file) = match r.strip_prefix('s') {
+        Some(x) => (x, PROBE_SGPR),
+        None => (r.strip_prefix('v').unwrap_or(r), 0),
+    };
+    let n: u32 = r.parse().ok()?;
+    if n >= if file != 0 { 128 } else { 256 } {
+        return None;
+    }
+    let vg = n | file | conv;
     let from = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
     Some((a, pc, vg, from))
 }
 
 /// `probe <shader>:<pc>:<vgpr>[:<n>]` / `probe off` (control command).
 pub fn set_probe(v: &str) -> Result<(), String> {
-    let p = if v.trim() == "off" { None } else { Some(parse_probe(v).ok_or("usage: probe <hex shader>:<hex pc>:<vgpr>[:<frames>] | off")?) };
+    let p = if v.trim() == "off" { None } else { Some(parse_probe(v).ok_or("usage: probe <hex shader>:<hex pc>:<v<k>|s<k>>[u|i][:<frames>] | off")?) };
     *PROBE.lock() = Some(p);
     Ok(())
 }

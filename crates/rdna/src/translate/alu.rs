@@ -1413,8 +1413,14 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
                 fcmp(tr, a, b, cmp)?
             }
             (_, "i32" | "u32") => {
-                let a = usrc(tr, ins, &v, 0)?;
-                let b = usrc(tr, ins, &v, 1)?;
+                let mut a = usrc(tr, ins, &v, 0)?;
+                let mut b = usrc(tr, ins, &v, 1)?;
+                // A lane-0 election: every invocation is lane 0 of its wave.
+                match tr.elections.get(&ins.pc) {
+                    Some(0) => a = tr.u(0),
+                    Some(_) => b = tr.u(0),
+                    None => {}
+                }
                 int_cmp(tr, a, b, cmp, ty == "i32")?
             }
             (_, "i64" | "u64") => {

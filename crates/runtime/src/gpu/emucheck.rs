@@ -142,6 +142,10 @@ pub struct Pending {
 /// dispatch, with earlier GPU work completed).
 pub fn prepare(cp: &Cp, groups: [u32; 3], initiator: u32) -> Option<Pending> {
     let c = cfg()?;
+    if groups.contains(&0) {
+        // An empty (indirect) dispatch: nothing to compare.
+        return None;
+    }
     let addr = cs_addr(cp);
     *DONE.lock().unwrap().get_or_insert_with(HashMap::new).entry(addr).or_insert(0) += 1;
     let (insts, _) = match super::shaders::program(addr) {
