@@ -1133,7 +1133,10 @@ impl Cp {
         let (name, at) = (self.name.clone(), self.cur_packet);
         let range = Some((dst, if daic { 4 } else { bytes }));
         if super::exec::enabled() {
-            super::images::with(|im| im.note_meta_writes(&[(dst, if daic { 4 } else { bytes as u64 })]));
+            super::images::with(|im| {
+                im.note_meta_writes(&[(dst, if daic { 4 } else { bytes as u64 })]);
+                im.note_overwrites(&[(dst, if daic { 4 } else { bytes as u64 })]);
+            });
         }
         match src_sel {
             2 => {

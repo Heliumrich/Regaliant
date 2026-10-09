@@ -49,6 +49,12 @@ pub static WATCHDOG_STOPS: AtomicU64 = AtomicU64::new(0);
 pub static FAST_CLEARS: AtomicU64 = AtomicU64::new(0);
 /// Block-compressed textures refreshed from GPU-written block views.
 pub static BLOCK_COPIES: AtomicU64 = AtomicU64::new(0);
+/// Guest-memory imports: count, bytes, how many spanned several mappings,
+/// and how many were dropped because their pages were remapped.
+static IMPORTS: AtomicU64 = AtomicU64::new(0);
+static IMPORT_BYTES: AtomicU64 = AtomicU64::new(0);
+static IMPORTS_MULTI: AtomicU64 = AtomicU64::new(0);
+static IMPORTS_STALE: AtomicU64 = AtomicU64::new(0);
 
 /// GPU execution enabled (`DS_GPU=1`) and Vulkan available.
 pub fn enabled() -> bool {
@@ -75,7 +81,8 @@ struct Span {
     start: u64,
     end: u64,
     buffer: vk::Buffer,
-    /// Still backed by a guest mapping (re-checked when mappings change).
+    /// Still backed by the pages it was imported with (cleared when guest
+    /// pages in its range are committed or decommitted).
     valid: bool,
 }
 
@@ -87,7 +94,6 @@ struct Pipe {
 
 struct Shared {
     spans: Vec<Span>,
-    map_gen: u64,
     pipes: HashMap<u64, Pipe>,
     /// Graphics pipelines by state hash.
     gfx: HashMap<u64, Pipe>,
@@ -157,7 +163,6 @@ fn shared() -> parking_lot::MappedMutexGuard<'static, Shared> {
         }
         *g = Some(Shared {
             spans: Vec::new(),
-            map_gen: crate::mem::MAP_GEN.load(Ordering::SeqCst),
             pipes: HashMap::new(),
             gfx: HashMap::new(),
             gds,
@@ -182,24 +187,79 @@ impl Shared {
         Some((v.start, v.end()))
     }
 
-    /// Imported buffer covering guest [base, base+size): (buffer, window start, window end).
-    fn span(&mut self, base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
-        let map_gen = crate::mem::MAP_GEN.load(Ordering::SeqCst);
-        if map_gen != self.map_gen {
-            self.map_gen = map_gen;
-            for s in self.spans.iter_mut().filter(|s| s.valid) {
-                let ok = Self::mapping(s.start).is_some_and(|(a, b)| a <= s.start && s.end <= b);
-                if !ok {
-                    // Kept alive: recorded work may still reference it.
-                    crate::warn!("gpu: guest range {:#x}..{:#x} imported for the GPU was unmapped", s.start, s.end);
-                    s.valid = false;
+    /// Adjacent guest mappings around `addr` that one import may cover,
+    /// clipped to [lo, hi): the title maps buffers in pieces (e.g.
+    /// sceKernelBatchMap in 64 KiB steps), and a buffer may span several.
+    /// Returns [start, end) and the number of mappings.
+    fn run(addr: u64, lo: u64, hi: u64) -> Option<(u64, u64, usize)> {
+        use crate::mem::VmaKind;
+        let st = crate::mem::MEM.lock();
+        let v = st.find(addr)?;
+        if v.kind == VmaKind::Reserved {
+            return None;
+        }
+        let usable = |p: &crate::mem::Vma| p.kind != VmaKind::Reserved && p.prot != 0;
+        let (mut start, mut end, mut n) = (v.start, v.end(), 1);
+        while start > lo {
+            match st.vmas.range(..start).next_back().map(|(_, p)| p).filter(|p| p.end() == start && usable(p)) {
+                Some(p) => {
+                    start = p.start;
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        while end < hi {
+            match st.vmas.get(&end).filter(|p| usable(p)) {
+                Some(p) => {
+                    end = p.end();
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        Some((start.max(lo), end.min(hi), n))
+    }
+
+    /// Why guest [base, base+size) cannot be imported (diagnostics).
+    fn unmapped_reason(base: u64, size: u64) -> String {
+        let st = crate::mem::MEM.lock();
+        let mut p = base;
+        while p < base + size {
+            match st.find(p) {
+                None => return format!("nothing mapped at {p:#x}"),
+                Some(v) if v.kind == crate::mem::VmaKind::Reserved => return format!("{p:#x} is only reserved ({:#x}+{:#x})", v.start, v.size),
+                Some(v) if v.prot == 0 && p != base => return format!("{p:#x} is not accessible ({:?} {:#x}+{:#x})", v.kind, v.start, v.size),
+                Some(v) => p = v.end(),
+            }
+        }
+        "mapped: the import failed".into()
+    }
+
+    /// Drops imports whose guest pages were committed or decommitted since.
+    fn revalidate(&mut self) {
+        let changed = crate::mem::take_repaged();
+        if changed.is_empty() {
+            return;
+        }
+        for s in self.spans.iter_mut().filter(|s| s.valid) {
+            if changed.iter().any(|&(a, b)| a < s.end && s.start < b) {
+                // Kept alive: recorded work may still reference it.
+                s.valid = false;
+                if IMPORTS_STALE.fetch_add(1, Ordering::Relaxed) < 20 {
+                    crate::info!("gpu: guest range {:#x}..{:#x} imported for the GPU was remapped (imported again on its next use)", s.start, s.end);
                 }
             }
         }
+    }
+
+    /// Imported buffer covering guest [base, base+size): (buffer, window start, window end).
+    fn span(&mut self, base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
+        self.revalidate();
         if let Some(s) = self.spans.iter().find(|s| s.valid && s.start <= base && base + size <= s.end) {
             return Some((s.buffer, s.start, s.end));
         }
-        let (vs, ve) = Self::mapping(base)?;
+        let (vs, ve, pieces) = Self::run(base, base & !(WINDOW - 1), (base + size).next_multiple_of(WINDOW))?;
         if base + size > ve {
             return None;
         }
@@ -211,8 +271,8 @@ impl Shared {
             }
         }
         let a = self.import_align;
-        let start = (base & !(WINDOW - 1)).max(vs) & !(a - 1);
-        let end = ((base + size).next_multiple_of(WINDOW)).min(ve).next_multiple_of(a).min(ve);
+        let start = vs & !(a - 1);
+        let end = ve.next_multiple_of(a).min(ve);
         if start < vs || end <= start {
             return None;
         }
@@ -229,6 +289,11 @@ impl Shared {
                     crate::info!("gpu: importing guest {start:#x}..{end:#x} ({} MiB) took {ms} ms", (end - start) >> 20);
                 }
                 self.spans.push(Span { start, end, buffer, valid: true });
+                IMPORTS.fetch_add(1, Ordering::Relaxed);
+                IMPORT_BYTES.fetch_add(end - start, Ordering::Relaxed);
+                if pieces > 1 {
+                    IMPORTS_MULTI.fetch_add(1, Ordering::Relaxed);
+                }
                 Some((buffer, start, end))
             }
             Err(e) => {
@@ -435,6 +500,8 @@ struct Bound {
     imgs: Vec<(u32, vk::DescriptorType, vk::DescriptorImageInfo)>,
     /// Guest ranges the stage writes.
     writes: Vec<(u64, u64)>,
+    /// Those described by buffer descriptors (not unbounded pointers).
+    sized_writes: Vec<(u64, u64)>,
     /// Images it samples or stores to.
     images: Vec<vk::Image>,
     /// Buffers bound through a VRAM shadow (copied in before, out after).
@@ -1035,6 +1102,19 @@ impl Exec {
         }
     }
 
+    /// Reloads images among `keys` whose guest bytes GPU buffer writes or CP
+    /// DMA covered since their last use (`Images::note_overwrites`), once the
+    /// writers have completed. Runs before a draw or dispatch reserves its
+    /// slot (it flushes).
+    pub(crate) fn resolve_overwrites(&mut self, keys: &[super::images::ImageKey]) {
+        if keys.is_empty() || !super::images::with(|im| im.overwrites_pending(keys)) {
+            return;
+        }
+        self.end_rendering();
+        self.flush();
+        super::images::with(|im| im.reload_overwritten(keys));
+    }
+
     /// Copies blocks that GPU work stored through an uncompressed view into
     /// the block-compressed textures among `keys` (Images::take_block_copies),
     /// before the work that samples them.
@@ -1194,7 +1274,7 @@ impl Exec {
     /// info blocks of its SGPR data.
     fn bind_stage(&mut self, p: &mut Prepared, allow_shadow: bool) -> Result<Bound, String> {
         let res_info = rdna::translate::res_info_offset(&p.tr.plan) as usize;
-        let mut bound = Bound { bufs: Vec::new(), imgs: Vec::new(), writes: Vec::new(), images: Vec::new(), shadows: Vec::new() };
+        let mut bound = Bound { bufs: Vec::new(), imgs: Vec::new(), writes: Vec::new(), sized_writes: Vec::new(), images: Vec::new(), shadows: Vec::new() };
         let seg = SHADOW_BYTES;
         let shadow_base = seg * self.cur as u64;
         {
@@ -1226,6 +1306,9 @@ impl Exec {
                                     bound_size = size;
                                     if p.tr.plan.resources[i].written {
                                         bound.writes.push((base, size));
+                                        if matches!(p.resources[i], Resolved::Buffer(_)) {
+                                            bound.sized_writes.push((base, size));
+                                        }
                                     }
                                     // Written buffers: a device-local copy for this dispatch
                                     // (GPU atomics and stores to host memory are slow).
@@ -1253,7 +1336,8 @@ impl Exec {
                                 }
                                 None => {
                                     drop(sh);
-                                    self.report(format!("{:?} shader {:#x}: buffer {base:#x}+{size:#x} is not mapped GPU memory (bound as zeros)", p.stage, p.addr));
+                                    let why = Shared::unmapped_reason(base, size);
+                                    self.report(format!("{:?} shader {:#x}: buffer {base:#x}+{size:#x} is not mapped GPU memory (bound as zeros): {why}", p.stage, p.addr));
                                     sh = shared();
                                 }
                             }
@@ -1369,6 +1453,7 @@ impl Exec {
         trace_loads(&self.name, &p, groups);
         let keys = image_keys(&p);
         self.resolve_fast_clears(&keys);
+        self.resolve_overwrites(&keys);
         self.sync_block_textures(&keys);
         let (pipeline, layout, set_layout) = shared().pipeline(&p)?;
         let t_pipe = t0.elapsed();
@@ -1386,7 +1471,11 @@ impl Exec {
             }
         }
         let writes_here = std::mem::take(&mut bound.writes);
-        super::images::with(|im| im.note_meta_writes(&writes_here));
+        let sized_here = std::mem::take(&mut bound.sized_writes);
+        super::images::with(|im| {
+            im.note_meta_writes(&writes_here);
+            im.note_overwrites(&sized_here);
+        });
         self.write_set(set, std::slice::from_ref(&bound));
         self.end_rendering();
         let c = ctx();
@@ -1539,6 +1628,14 @@ pub fn status() -> String {
         super::cp::sync_summary()
     ) + &super::images::IMAGES.try_lock().and_then(|g| g.as_ref().map(|i| i.status())).unwrap_or_default()
         + &super::track::status()
+        + &format!(
+            "    guest memory imports: {} ({} MiB), {} over several mappings, {} dropped after remapping
+",
+            IMPORTS.load(Ordering::Relaxed),
+            IMPORT_BYTES.load(Ordering::Relaxed) >> 20,
+            IMPORTS_MULTI.load(Ordering::Relaxed),
+            IMPORTS_STALE.load(Ordering::Relaxed)
+        )
         + &format!("    gpu completion: {} ms waiting for fences, {} ms in actions
 ", FENCE_NS.load(Ordering::Relaxed) / 1_000_000, ACTION_NS.load(Ordering::Relaxed) / 1_000_000)
 }

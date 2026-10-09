@@ -180,6 +180,7 @@ fn prune_runs(runs: &Path, keep: usize) {
 ///   trace                    log every draw/dispatch of an upcoming flip (FRAME lines)
 ///   loglevel trace|debug|info  change logging at run time (trace = every HLE call)
 ///   textreset                log text-hook strings again (`DS_TEXT_HOOK`)
+///   mem <addr> <len>         write guest memory (hex) to mem-<addr>.bin in the run directory
 ///   quit                     orderly shutdown
 fn poll_control(path: &Path, offset: &mut u64) {
     use std::io::{Read, Seek, SeekFrom};
@@ -301,6 +302,24 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 }
                 gpu::capture::arm_next();
                 Ok(())
+            }
+            "mem" => {
+                // Debug: `mem <hex address> <hex length>` writes guest memory
+                // to mem-<address>.bin in the run directory.
+                let hex = |s: Option<&str>| s.and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok());
+                match (hex(parts.next()), hex(parts.next())) {
+                    (Some(a), Some(n)) if n > 0 && n <= 256 << 20 => {
+                        if !gpu::cp::guest_readable(a, n) {
+                            Err(format!("{a:#x}+{n:#x} is not readable guest memory"))
+                        } else if let Some(dir) = RUN_DIR.get() {
+                            let bytes = unsafe { std::slice::from_raw_parts(a as *const u8, n as usize) };
+                            std::fs::write(dir.join(format!("mem-{a:x}.bin")), bytes).map_err(|e| e.to_string())
+                        } else {
+                            Err("no run directory".into())
+                        }
+                    }
+                    _ => Err("usage: mem <hex address> <hex length up to 0x10000000>".into()),
+                }
             }
             "vmas" => {
                 // Debug: guest address space layout.

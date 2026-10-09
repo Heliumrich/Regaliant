@@ -72,6 +72,34 @@ pub struct MemState {
 /// memory are revalidated against it).
 pub static MAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Guest ranges whose host pages were committed or decommitted since the
+/// GPU executor last looked: its imports of guest memory pin the pages they
+/// were made with, so an import over a range that was remapped (even with
+/// identical bounds, as the title's sceKernelBatchMap streaming does) is stale.
+static REPAGED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+static REPAGED_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn repaged(addr: u64, size: u64) {
+    let mut r = REPAGED.lock();
+    if r.len() >= 1024 {
+        // Nobody collected them (no GPU work in between): one covering range.
+        let (lo, hi) = r.iter().fold((addr, addr + size), |(a, b), &(s, e)| (a.min(s), b.max(e)));
+        r.clear();
+        r.push((lo, hi));
+    } else {
+        r.push((addr, addr + size));
+    }
+    REPAGED_PENDING.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Takes the ranges whose pages changed since the last call ([start, end)).
+pub fn take_repaged() -> Vec<(u64, u64)> {
+    if !REPAGED_PENDING.swap(false, std::sync::atomic::Ordering::Acquire) {
+        return Vec::new();
+    }
+    std::mem::take(&mut *REPAGED.lock())
+}
+
 /// Whether guest [a, a+len) is covered by accessible mappings (from the
 /// mapping table: VirtualQuery walks page tables and is very slow on the
 /// title's multi-GiB mappings).
@@ -155,12 +183,14 @@ pub fn reserve_guest_range() -> Result<(), String> {
 
 fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     crate::gpu::track::remapped(addr, size);
+    repaged(addr, size);
     let p = unsafe { VirtualAlloc(addr as _, size as usize, MEM_COMMIT, win_prot(prot)) };
     if p.is_null() { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
 }
 
 fn host_decommit(addr: u64, size: u64) {
     crate::gpu::track::remapped(addr, size);
+    repaged(addr, size);
     unsafe {
         VirtualFree(addr as _, size as usize, MEM_DECOMMIT);
     }

@@ -587,6 +587,7 @@ impl Exec {
             used.extend(image_keys(p));
         }
         self.resolve_fast_clears(&used);
+        self.resolve_overwrites(&used);
         self.sync_block_textures(&used);
         // Resources.
         let mut stages: Vec<&mut Prepared> = vec![&mut vs];
@@ -721,6 +722,9 @@ impl Exec {
         for b in bounds {
             for &(base, n) in &b.writes {
                 crate::gpu::track::gpu_write(base, n);
+            }
+            if !b.sized_writes.is_empty() {
+                crate::gpu::images::with(|im| im.note_overwrites(&b.sized_writes));
             }
             self.pending_writes.extend(b.writes);
         }

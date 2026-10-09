@@ -398,6 +398,13 @@ pub struct Image {
     /// Block-compressed textures: generation of the block view last copied
     /// in (see `take_block_copies`).
     block_gen: u64,
+    /// Guest bytes of its layout and the T# that described it exactly (0 /
+    /// None: not seen through a T#): GPU buffer writes over GPU-owned images.
+    span: u64,
+    layout: Option<Tsharp>,
+    /// GPU buffer writes or CP DMA covered all of its guest bytes since its
+    /// last use: guest memory holds its contents (`reload_overwritten`).
+    overwritten: bool,
 }
 
 /// Pages of a texture are checked for CPU writes in SLICES interleaved
@@ -482,6 +489,17 @@ pub struct Images {
     pub upload_ns: u64,
     /// Counts storage-image bindings (write generations).
     write_seq: u64,
+    /// GPU-owned images with a known guest span, by address (see
+    /// `note_overwrites`), the largest span, and how many are marked.
+    owned: std::collections::BTreeMap<u64, Vec<ImageKey>>,
+    max_span: u64,
+    pending_overwrites: usize,
+    /// GPU-owned images reloaded from guest memory after buffer writes
+    /// covered them: cleared (all zero) / uploaded.
+    pub overwrite_clears: u64,
+    pub overwrite_uploads: u64,
+    /// Images reported for buffer writes covering only part of them.
+    partial_seen: std::collections::HashSet<u64>,
 }
 
 unsafe impl Send for Images {}
@@ -500,7 +518,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
                 .expect("image pool");
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
-            *g = Some(Images { map: HashMap::new(), gpu_bases: Default::default(), stencil_of: HashMap::new(), meta_of: HashMap::new(), pending_clears: HashMap::new(), samplers: HashMap::new(), pool, cmd, fence, reported: HashMap::new(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0 });
+            *g = Some(Images { map: HashMap::new(), gpu_bases: Default::default(), stencil_of: HashMap::new(), meta_of: HashMap::new(), pending_clears: HashMap::new(), samplers: HashMap::new(), pool, cmd, fence, reported: HashMap::new(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default() });
         }
     }
     f(g.as_mut().unwrap())
@@ -859,6 +877,9 @@ impl Images {
             if how == "exact" && !self.map[&k].gpu_written {
                 self.refresh(key, t, frame)?;
             }
+            if how == "exact" {
+                self.note_layout(k, t);
+            }
             return Ok(k);
         }
         let image = self.create(key)?;
@@ -877,8 +898,139 @@ impl Images {
             self.report(format!("texture {:#x} is not write-tracked (read-only or unmapped pages): later CPU updates are not seen", t.base));
         }
         let hashes = source.map(|(b, n)| all_hashes(b, n)).unwrap_or([0; SLICES]);
-        self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: false, source: region, hashes, checked_frame: frame, write_gen: 0, block_gen: 0 });
+        self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: false, source: region, hashes, checked_frame: frame, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false });
+        self.note_layout(key, t);
         Ok(key)
+    }
+
+    /// Remembers the guest layout of an image from a T# that describes it
+    /// exactly (its span and a T# to upload it with again).
+    fn note_layout(&mut self, k: ImageKey, t: &Tsharp) {
+        let Some(img) = self.map.get_mut(&k) else { return };
+        if img.layout.is_some() || k.ty3d {
+            return;
+        }
+        let Some(el) = elem_log2(t.format) else { return };
+        if let Some(lay) = tiling::layout(t.sw_mode, el, k.width, k.height, k.levels, is_block(t.format)) {
+            img.span = lay.size(k.layers);
+            img.layout = Some(*t);
+            self.index_owned(k);
+        }
+    }
+
+    /// Indexes a GPU-owned image with a known span (`note_overwrites`).
+    fn index_owned(&mut self, k: ImageKey) {
+        let Some(img) = self.map.get(&k) else { return };
+        if !img.gpu_written || img.span == 0 {
+            return;
+        }
+        let span = img.span;
+        let v = self.owned.entry(k.base).or_default();
+        if !v.contains(&k) {
+            v.push(k);
+            self.max_span = self.max_span.max(span);
+        }
+    }
+
+    /// Notes GPU buffer writes and CP DMA writes (sized ranges, not unbounded
+    /// pointers) over GPU-owned images. The title clears some of its render
+    /// targets and volumes through a buffer view of their memory (the
+    /// volumetric fog's density volume is filled with zeros by a compute
+    /// shader every frame, then fog volumes are drawn into its slices);
+    /// images here do not share memory with buffers, so an image whose guest
+    /// bytes a write covers entirely takes its contents from guest memory at
+    /// its next use (`reload_overwritten`). Writes over part of an image are
+    /// reported, not applied: the rest of its guest bytes are stale.
+    pub fn note_overwrites(&mut self, writes: &[(u64, u64)]) {
+        if writes.is_empty() || self.owned.is_empty() {
+            return;
+        }
+        let mut partial = Vec::new();
+        for &(b, n) in writes {
+            let end = b.saturating_add(n);
+            let keys: Vec<ImageKey> = self.owned.range(b.saturating_sub(self.max_span)..end).flat_map(|(_, v)| v.iter().copied()).collect();
+            for k in keys {
+                let Some(img) = self.map.get_mut(&k) else { continue };
+                let span = img.span;
+                if k.base + span <= b || !img.gpu_written {
+                    continue;
+                }
+                // Covering it, and not a much larger range that happens to
+                // contain it (a pool or heap binding).
+                if b <= k.base && k.base + span <= end && n <= 2 * span + (64 << 10) {
+                    if !img.overwritten {
+                        img.overwritten = true;
+                        self.pending_overwrites += 1;
+                    }
+                } else if self.partial_seen.len() < 64 && self.partial_seen.insert(k.base) {
+                    partial.push(format!(
+                        "GPU buffer write {b:#x}+{n:#x} covers part of GPU-owned image {:#x}+{span:#x} ({}x{}x{} {:?}): not applied",
+                        k.base, k.width, k.height, k.layers, k.format
+                    ));
+                }
+            }
+        }
+        for m in partial {
+            crate::info!("images: {m}");
+        }
+    }
+
+    /// Whether any of `keys` was overwritten through a buffer.
+    pub fn overwrites_pending(&self, keys: &[ImageKey]) -> bool {
+        self.pending_overwrites > 0 && keys.iter().any(|k| self.map.get(k).is_some_and(|i| i.overwritten))
+    }
+
+    /// Gives the images among `keys` that `note_overwrites` marked their
+    /// guest contents (the writers have completed): all-zero bytes clear the
+    /// image, other contents are uploaded with the layout of its T#.
+    pub fn reload_overwritten(&mut self, keys: &[ImageKey]) {
+        for k in keys {
+            let Some(img) = self.map.get_mut(k) else { continue };
+            if !img.overwritten {
+                continue;
+            }
+            img.overwritten = false;
+            self.pending_overwrites = self.pending_overwrites.saturating_sub(1);
+            let (image, span, layout) = (img.image, img.span, img.layout);
+            if !super::cp::guest_readable(k.base, span) {
+                self.report(format!("image {:#x} overwritten through a buffer: guest memory not readable", k.base));
+                continue;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(k.base as *const u8, span as usize) };
+            let zero = bytes.chunks(4096).all(|c| c.iter().fold(0u8, |a, &x| a | x) == 0);
+            let how = if zero {
+                let format = k.format;
+                self.one_shot(|cmd| unsafe {
+                    let d = &ctx().device;
+                    let range = vk::ImageSubresourceRange { aspect_mask: aspects(format), base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS };
+                    let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+                    d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+                    if is_depth(format) {
+                        d.cmd_clear_depth_stencil_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearDepthStencilValue { depth: 0.0, stencil: 0 }, &[range]);
+                    } else {
+                        d.cmd_clear_color_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearColorValue::default(), &[range]);
+                    }
+                    let a = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+                    d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[a], &[], &[]);
+                });
+                self.overwrite_clears += 1;
+                "cleared (zeros)"
+            } else if let (Some(t), false) = (layout, is_depth(k.format)) {
+                if let Err(e) = self.upload(image, *k, &t) {
+                    self.report(format!("image {:#x} overwritten through a buffer: upload failed: {e}", k.base));
+                    continue;
+                }
+                self.overwrite_uploads += 1;
+                "uploaded"
+            } else {
+                self.report(format!("image {:#x} ({:?}) overwritten through a buffer with non-zero data: not applied", k.base, k.format));
+                continue;
+            };
+            static SEEN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+            if SEEN.lock().get_or_insert_with(Default::default).insert(k.base) {
+                crate::info!("images: {:#x} {}x{}x{} {:?} overwritten through a buffer view of its memory: {how}", k.base, k.width, k.height, k.layers, k.format);
+            }
+        }
     }
 
     /// Re-uploads a CPU-sourced texture whose guest bytes were written
@@ -969,7 +1121,7 @@ impl Images {
         } else {
             let image = self.create(key)?;
             self.to_general(image, key.format);
-            self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: 0, block_gen: 0 });
+            self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false });
             self.gpu_bases.insert(key.base);
             crate::info!("images: new render target {:#x} {}x{} {:?} at flip {}", key.base, key.width, key.height, key.format, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
             // DS_CAPTURE_NEW_RT=<hex base>: capture the frame after a render
@@ -997,6 +1149,7 @@ impl Images {
             self.meta_of.insert(s.meta, (k, s.clear));
         }
         img.source = None;
+        self.index_owned(k);
         Ok(k)
     }
 
@@ -1319,6 +1472,7 @@ impl Images {
             img.gpu_written = true;
             img.source = None;
             self.gpu_bases.insert(key.base);
+            self.index_owned(key);
         }
         let img = self.map.get_mut(&key).unwrap();
         if let Some(&v) = img.views.get(&vkey) {
@@ -1416,6 +1570,15 @@ impl Images {
 
     /// One status line (hang reports).
     pub fn status(&self) -> String {
-        format!("    images: {} cached, {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying)\n", self.map.len(), self.uploads, self.reuploads, self.upload_bytes >> 20, self.upload_ns / 1_000_000)
+        format!(
+            "    images: {} cached, {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying); GPU-owned images overwritten through buffers: {} cleared, {} uploaded\n",
+            self.map.len(),
+            self.uploads,
+            self.reuploads,
+            self.upload_bytes >> 20,
+            self.upload_ns / 1_000_000,
+            self.overwrite_clears,
+            self.overwrite_uploads
+        )
     }
 }
