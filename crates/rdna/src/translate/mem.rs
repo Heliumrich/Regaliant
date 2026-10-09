@@ -35,6 +35,20 @@ pub fn stage_inputs(tr: &mut T) -> R<()> {
             tr.frag_coord = Some(fc);
             let ff = tr.input(tr.t.bool_, Some(BuiltIn::FrontFacing), None);
             let fcv = e(tr.b.load(tr.t.v4f, None, fc, None, []))?;
+            // Barycentrics (perspective-correct and linear): vertex 0's
+            // weight is 1 - i - j, as in the hardware's (i, j) VGPRs.
+            let bary = if tr.spec.barycentric {
+                tr.b.capability(rspirv::spirv::Capability::FragmentBarycentricKHR);
+                tr.b.extension("SPV_KHR_fragment_shader_barycentric");
+                let p = tr.input(tr.t.v3f, Some(BuiltIn::BaryCoordKHR), None);
+                let l = tr.input(tr.t.v3f, Some(BuiltIn::BaryCoordNoPerspKHR), None);
+                let pv = e(tr.b.load(tr.t.v3f, None, p, None, []))?;
+                let lv = e(tr.b.load(tr.t.v3f, None, l, None, []))?;
+                tr.bary = Some((pv, lv));
+                Some((pv, lv))
+            } else {
+                None
+            };
             let mut vg = 0u32;
             let addr = if tr.spec.ps_input_addr == 0 { 0x2 } else { tr.spec.ps_input_addr };
             for bit in 0..16 {
@@ -44,6 +58,14 @@ pub fn stage_inputs(tr: &mut T) -> R<()> {
                 let n = PS_INPUT_VGPRS[bit];
                 for k in 0..n {
                     let val = match bit {
+                        // PERSP_SAMPLE/CENTER/CENTROID and LINEAR_* (i, j):
+                        // single-sampled rendering, all at the center.
+                        0..=2 | 4..=6 if bary.is_some() => {
+                            let (pv, lv) = bary.unwrap();
+                            let src = if bit < 3 { pv } else { lv };
+                            let c = e(tr.b.composite_extract(tr.t.f32, None, src, [k + 1]))?;
+                            tr.to_u(c)?
+                        }
                         8..=11 => {
                             let c = e(tr.b.composite_extract(tr.t.f32, None, fcv, [(bit - 8) as u32]))?;
                             tr.to_u(c)?
@@ -383,6 +405,9 @@ fn attr_input(tr: &mut T, attr: u32) -> R<Option<Word>> {
 pub fn interp(tr: &mut T, ins: &Inst) -> R<()> {
     let attr = ins.intrp_attr();
     let chan = ins.intrp_chan();
+    if tr.per_vertex_attrs.contains(&attr) {
+        return interp_per_vertex(tr, ins, attr, chan);
+    }
     let val = match attr_input(tr, attr)? {
         Some(var) => {
             let v = e(tr.b.load(tr.t.v4f, None, var, None, []))?;
@@ -393,6 +418,67 @@ pub fn interp(tr: &mut T, ins: &Inst) -> R<()> {
             let c = [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0]][d as usize & 3][chan as usize];
             tr.f(c)
         }
+    };
+    let u = tr.to_u(val)?;
+    tr.set_vreg(ins.vdst() as u32, u)
+}
+
+/// Interpolation of an attribute read per vertex (see `per_vertex_attrs`):
+/// v_interp_mov returns P0 = vertex 0's value and P10/P20 = vertex 1's / 2's
+/// (flat-shaded inputs keep raw values) or their differences from P0
+/// (interpolated inputs); v_interp_p1/p2 give the interpolated value.
+fn interp_per_vertex(tr: &mut T, ins: &Inst, attr: u32, chan: u32) -> R<()> {
+    let f = tr.t.f32;
+    let pi = tr.spec.ps_inputs.get(attr as usize).copied();
+    if let Some(d) = pi.and_then(|p| p.default) {
+        let c = [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0]][d as usize & 3][chan as usize];
+        let v = tr.f(c);
+        let u = tr.to_u(v)?;
+        return tr.set_vreg(ins.vdst() as u32, u);
+    }
+    let flat = pi.is_some_and(|p| p.flat);
+    let var = match tr.per_vertex_in.get(&attr) {
+        Some(&v) => v,
+        None => {
+            let loc = pi.map(|p| p.param as u32).unwrap_or(attr);
+            let k3 = tr.u(3);
+            let arr = tr.b.type_array(tr.t.v4f, k3);
+            let v = tr.input(arr, None, Some(loc));
+            tr.b.decorate(v, Decoration::PerVertexKHR, []);
+            tr.per_vertex_in.insert(attr, v);
+            tr.params = tr.params.max(attr + 1);
+            v
+        }
+    };
+    let pf = tr.b.type_pointer(None, StorageClass::Input, f);
+    let mut vert = |tr: &mut T, k: u32| -> R<Word> {
+        let kk = tr.u(k);
+        let kc = tr.u(chan);
+        let p = e(tr.b.access_chain(pf, None, var, [kk, kc]))?;
+        e(tr.b.load(f, None, p, None, []))
+    };
+    let val = if ins.base_name() == Some("v_interp_mov_f32") {
+        match ins.intrp_vsrc() & 3 {
+            2 => vert(tr, 0)?,
+            sel => {
+                let x = vert(tr, sel as u32 + 1)?;
+                if flat {
+                    x
+                } else {
+                    let p0 = vert(tr, 0)?;
+                    e(tr.b.f_sub(f, None, x, p0))?
+                }
+            }
+        }
+    } else {
+        let (pv, _) = tr.bary.ok_or("per-vertex attribute without barycentrics")?;
+        let mut acc = tr.f(0.0);
+        for k in 0..3 {
+            let w = e(tr.b.composite_extract(f, None, pv, [k]))?;
+            let x = vert(tr, k)?;
+            acc = tr.glsl3(f, GLOp::Fma, w, x, acc)?;
+        }
+        acc
     };
     let u = tr.to_u(val)?;
     tr.set_vreg(ins.vdst() as u32, u)

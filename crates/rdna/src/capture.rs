@@ -124,6 +124,7 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         code_base: addr,
         wave64,
         ps_input_addr: u.ps_input_addr,
+        barycentric: false,
         ps_inputs: Vec::new(),
         mrt,
         cs_local_size: u.threads,

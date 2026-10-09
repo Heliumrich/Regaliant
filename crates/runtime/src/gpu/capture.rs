@@ -302,6 +302,13 @@ fn vs_dump_report(cp: &Cp, event: u64) -> Option<String> {
     Some(format!("vs {addr:#x}: {n} vertices dumped (exp pos0 at {:#x})", exp.pc))
 }
 
+/// Pixel whose cb0 value per-draw reports follow (`capture ... pixel=x,y`).
+static WATCH_PIXEL: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+
+pub fn set_watch_pixel(p: Option<(u32, u32)>) {
+    *WATCH_PIXEL.lock() = p;
+}
+
 /// Previous contents of dumped images (changed-pixel counts).
 static LAST_DUMP: Mutex<Option<std::collections::HashMap<(u64, bool), Vec<u8>>>> = Mutex::new(None);
 
@@ -330,7 +337,19 @@ fn dump_draw_target(cp: &Cp, event: u64) -> Option<String> {
         match r {
             Ok((raw, w, h, format)) => {
                 let texel = (raw.len() / (w as usize * h as usize).max(1)).max(1);
+                // The watched pixel before and after this draw.
+                let watch = (*WATCH_PIXEL.lock()).filter(|&(x, y)| x < w && y < h).map(|(x, y)| {
+                    let o = (y as usize * w as usize + x as usize) * texel;
+                    let before = LAST_DUMP.lock().as_ref().and_then(|m| m.get(&(s.base, false)).and_then(|p| p.get(o..o + texel).map(|b| b.to_vec())));
+                    (x, y, before, raw[o..o + texel].to_vec())
+                });
                 let ch = changed((s.base, false), &raw, texel).map(|n| format!("{n} px changed")).unwrap_or_else(|| "first dump".into());
+                let hex = |b: &[u8]| b.iter().rev().map(|x| format!("{x:02x}")).collect::<String>();
+                let ch = match watch {
+                    Some((x, y, Some(b), a)) if b != a => format!("{ch}; px({x},{y}) {} -> {}", hex(&b), hex(&a)),
+                    Some((x, y, None, a)) => format!("{ch}; px({x},{y}) {}", hex(&a)),
+                    _ => ch,
+                };
                 let name = format!("{event:04}_{:010x}.png", s.base);
                 // PNGs only on request (DS_CAPTURE_DRAWS_PNG=1): a range of
                 // full-size targets is gigabytes.
@@ -354,7 +373,19 @@ fn dump_draw_target(cp: &Cp, event: u64) -> Option<String> {
         match r {
             Ok(raw) => {
                 let texel = (raw.len() / (d.width as usize * d.height as usize).max(1)).max(1);
+                // The watched pixel's depth before and after this draw.
+                let watch = (*WATCH_PIXEL.lock()).filter(|&(x, y)| x < d.width && y < d.height && texel == 4).map(|(x, y)| {
+                    let o = (y as usize * d.width as usize + x as usize) * 4;
+                    let f = |b: &[u8]| f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    let before = LAST_DUMP.lock().as_ref().and_then(|m| m.get(&(d.base, false)).and_then(|p| p.get(o..o + 4).map(f)));
+                    (x, y, before, f(&raw[o..o + 4]))
+                });
                 let ch = changed((d.base, false), &raw, texel).map(|n| format!("{n} changed")).unwrap_or_else(|| "first dump".into());
+                let ch = match watch {
+                    Some((x, y, Some(b), a)) if b != a => format!("{ch}; z({x},{y}) {b} -> {a}"),
+                    Some((x, y, None, a)) => format!("{ch}; z({x},{y}) {a}"),
+                    _ => ch,
+                };
                 out.push(format!("depth {ch}"));
             }
             Err(e) => out.push(format!("depth dump failed: {e}")),
@@ -527,7 +558,7 @@ pub fn draw(cp: &Cp, what: &str) {
     let blends: Vec<String> = (0..8u32).filter(|i| (mask >> (4 * i)) & 0xF != 0).map(|i| format!("{i}:{:#x}", ctx(0x28780 + 4 * i))).collect();
     let _ = writeln!(
         s,
-        "    state vte {:#x} clip {:#x} su_sc_mode {:#x} sc_mode0 {:#x} aa {:#x} win_off {:#x} | screen_sc {:#x}..{:#x} generic_sc {:#x}..{:#x} vport_sc {:#x}..{:#x} zrange {}..{} | db_render {:#x} db_shader {:#x} depth_ctl {:#x} stencil_ctl {:#x} ref {:#x}/{:#x} z_read {:#x} s_info {:#x} | target_mask {mask:#x} blend [{}] blend_color ({}, {}, {}, {}) | index_type {:#x} instances {} reset_en {:#x} gb_clip {}/{}",
+        "    state vte {:#x} clip {:#x} su_sc_mode {:#x} sc_mode0 {:#x} aa {:#x} win_off {:#x} | screen_sc {:#x}..{:#x} generic_sc {:#x}..{:#x} vport_sc {:#x}..{:#x} zrange {}..{} | db_render {:#x} db_shader {:#x} alpha_to_mask {:#x} depth_ctl {:#x} stencil_ctl {:#x} ref {:#x}/{:#x} z_read {:#x} s_info {:#x} | target_mask {mask:#x} blend [{}] blend_color ({}, {}, {}, {}) | index_type {:#x} instances {} reset_en {:#x} gb_clip {}/{}",
         ctx(0x28818),
         ctx(0x28810),
         ctx(0x28814),
@@ -544,6 +575,7 @@ pub fn draw(cp: &Cp, what: &str) {
         f(ctx(0x282D4)),
         ctx(0x28000),
         ctx(0x2880C),
+        ctx(0x28B70),
         ctx(0x28800),
         ctx(0x2842C),
         ctx(0x28430),

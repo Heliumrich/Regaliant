@@ -122,6 +122,10 @@ pub struct Spec {
     pub wave64: bool,
     pub ps_input_addr: u32,
     pub ps_inputs: Vec<PsInput>,
+    /// Fragment barycentrics and per-vertex inputs are available
+    /// (VK_KHR_fragment_shader_barycentric): the barycentric VGPRs hold the
+    /// real (i, j) and v_interp_mov reads each vertex's value.
+    pub barycentric: bool,
     pub mrt: [MrtSpec; 8],
     pub cs_local_size: [u32; 3],
     /// COMPUTE_PGM_RSRC2 (TGID enables, TG size, TIDIG count, LDS size).
@@ -301,6 +305,12 @@ pub(crate) struct T<'a> {
     pub out_mrt: HashMap<u32, (Word, Word)>,
     pub out_depth: Option<Word>,
     pub in_attrs: HashMap<u32, Word>,
+    /// Attributes read per vertex (v_interp_mov of P10/P20, with
+    /// `Spec::barycentric`), and their per-vertex input arrays.
+    pub per_vertex_attrs: BTreeSet<u32>,
+    pub per_vertex_in: HashMap<u32, Word>,
+    /// BaryCoordKHR / BaryCoordNoPerspKHR inputs (loaded at entry).
+    pub bary: Option<(Word, Word)>,
     pub frag_coord: Option<Word>,
     pub lds: Option<Word>,
     /// GDS storage buffer (when the program uses GDS instructions).
@@ -1137,6 +1147,14 @@ fn lane0_elections(code: &[Inst], spec: &Spec) -> HashMap<u32, usize> {
     out
 }
 
+/// Attributes that v_interp_mov_f32 reads as P10 or P20: the title
+/// interpolates packed 16-bit attributes itself (flat-shaded inputs whose
+/// parameter cache holds each vertex's value, combined with the barycentric
+/// VGPRs through v_fma_mix_f32), e.g. the UVs of alpha-tested foliage.
+fn per_vertex_attrs(code: &[Inst]) -> BTreeSet<u32> {
+    code.iter().filter(|i| i.enc == Enc::Vintrp && i.base_name() == Some("v_interp_mov_f32") && i.intrp_vsrc() & 3 != 2).map(|i| i.intrp_attr()).collect()
+}
+
 /// Whether `p` may write VGPR `v`: Some(true) for an atomic returning the
 /// previous value into it, Some(false) for any other (possible) write.
 fn vgpr_def(p: &Inst, v: u16) -> Option<bool> {
@@ -1264,6 +1282,9 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         out_mrt: HashMap::new(),
         out_depth: None,
         in_attrs: HashMap::new(),
+        per_vertex_attrs: if spec.barycentric && spec.stage == Stage::Fragment { per_vertex_attrs(code) } else { BTreeSet::new() },
+        per_vertex_in: HashMap::new(),
+        bary: None,
         frag_coord: None,
         lds: None,
         gds: None,
@@ -1807,6 +1828,7 @@ mod tests {
             wave64: true,
             ps_input_addr: 0,
             ps_inputs: Vec::new(),
+            barycentric: false,
             mrt: [MrtSpec::default(); 8],
             cs_local_size: local,
             cs_rsrc2: 0,
@@ -1829,6 +1851,17 @@ mod tests {
         assert_eq!(e.into_iter().collect::<Vec<_>>(), vec![(0x9c, 1)]);
         // Not for groups of several waves.
         assert!(lane0_elections(&code, &cs_spec([16, 8, 1])).is_empty());
+    }
+
+    /// v_interp_mov_f32 of P10 / P20 (cs 0x100cc3d100's foliage alpha test:
+    /// P10, P0, P20 of attribute 0): that attribute is read per vertex; a
+    /// lone P0 read (a flat value) is not.
+    #[test]
+    fn per_vertex_attributes() {
+        let code = crate::decode_program(&[0xc80e0000, 0xc80a0002, 0xc8120001, 0xbf810000]).unwrap();
+        assert_eq!(per_vertex_attrs(&code).into_iter().collect::<Vec<_>>(), vec![0]);
+        let code = crate::decode_program(&[0xc80a0002, 0xbf810000]).unwrap();
+        assert!(per_vertex_attrs(&code).is_empty());
     }
 
     /// The counting kernel (cs 0x10088aa500) sums the class masks with DPP

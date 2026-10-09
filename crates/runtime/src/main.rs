@@ -294,6 +294,10 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 for arg in parts.by_ref() {
                     if arg == "dispatches" {
                         gpu::capture::set_dispatch_dumps(true);
+                    } else if let Some(p) = arg.strip_prefix("pixel=") {
+                        // ... reporting the cb0 value of that pixel per draw.
+                        let xy: Vec<u32> = p.split(',').filter_map(|v| v.parse().ok()).collect();
+                        gpu::capture::set_watch_pixel((xy.len() == 2).then(|| (xy[0], xy[1])));
                     } else if let Some(cs) = arg.strip_prefix("buffers=") {
                         // ... and the buffers that compute shader binds.
                         gpu::capture::set_dispatch_dumps(true);

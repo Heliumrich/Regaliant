@@ -28,6 +28,8 @@ pub struct Ctx {
     pub checkpoints: Option<ash::nv::device_diagnostic_checkpoints::Device>,
     pub device_name: String,
     pub validation: bool,
+    /// VK_KHR_fragment_shader_barycentric enabled.
+    pub barycentric: bool,
 }
 
 static CTX: OnceLock<Ctx> = OnceLock::new();
@@ -147,6 +149,23 @@ pub fn init() -> Result<(), String> {
         if has_robust2 {
             dexts.push(ash::ext::robustness2::NAME.as_ptr());
         }
+        // Fragment barycentrics: the title interpolates some attributes itself
+        // from each vertex's value (v_interp_mov of P10/P20).
+        let has_bary_ext = instance
+            .enumerate_device_extension_properties(pdev)
+            .unwrap_or_default()
+            .iter()
+            .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::fragment_shader_barycentric::NAME);
+        let mut bary_supported = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default();
+        if has_bary_ext {
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut bary_supported);
+            instance.get_physical_device_features2(pdev, &mut f2);
+        }
+        let barycentric = has_bary_ext && bary_supported.fragment_shader_barycentric != 0;
+        let mut bary = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default().fragment_shader_barycentric(true);
+        if barycentric {
+            dexts.push(ash::khr::fragment_shader_barycentric::NAME.as_ptr());
+        }
         let features = vk::PhysicalDeviceFeatures::default()
             .robust_buffer_access(true)
             .geometry_shader(true)
@@ -183,6 +202,9 @@ pub fn init() -> Result<(), String> {
         if has_robust2 {
             dci = dci.push_next(&mut r2);
         }
+        if barycentric {
+            dci = dci.push_next(&mut bary);
+        }
         let device = instance.create_device(pdev, &dci, None).map_err(|e| format!("vkCreateDevice: {e}"))?;
         crate::info!(
             "Vulkan robustness: robustBufferAccess, robustness2 {} (buffer {}, image {}, null descriptors {})",
@@ -210,6 +232,7 @@ pub fn init() -> Result<(), String> {
             limits: props.limits,
             device_name,
             validation,
+            barycentric,
         };
         crate::info!("Vulkan device: {} (queue family {qf}, validation {})", ctx.device_name, validation);
         {
