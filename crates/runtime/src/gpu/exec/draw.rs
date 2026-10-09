@@ -132,6 +132,7 @@ pub(crate) fn color_surface(cp: &Cp, n: u32) -> Result<Option<Surface>, String> 
         ty3d: (a3 >> 24) & 3 == 2,
         mip: (view >> 26) & 0xF,
         slice: view & 0x1FFF,
+        stencil_base: 0,
     }))
 }
 
@@ -146,11 +147,9 @@ fn depth_surface(cp: &Cp) -> Option<Surface> {
         (_, 1) => vk::Format::D32_SFLOAT_S8_UINT,
         _ => return None,
     };
-    let base = if zinfo & 3 != 0 {
-        ((ctx_reg(cp, 0x28048) as u64) << 8) | ((ctx_reg(cp, 0x28068) as u64 & 0xFF) << 40)
-    } else {
-        ((ctx_reg(cp, 0x2804C) as u64) << 8) | ((ctx_reg(cp, 0x2806C) as u64 & 0xFF) << 40)
-    };
+    // DB_STENCIL_READ_BASE: the stencil plane lives at its own address.
+    let stencil_base = ((ctx_reg(cp, 0x2804C) as u64) << 8) | ((ctx_reg(cp, 0x2806C) as u64 & 0xFF) << 40);
+    let base = if zinfo & 3 != 0 { ((ctx_reg(cp, 0x28048) as u64) << 8) | ((ctx_reg(cp, 0x28068) as u64 & 0xFF) << 40) } else { stencil_base };
     let size = ctx_reg(cp, 0x2801C);
     let view = ctx_reg(cp, 0x28008);
     let slice = (view & 0x7FF) | (((view >> 11) & 3) << 11);
@@ -165,6 +164,7 @@ fn depth_surface(cp: &Cp) -> Option<Surface> {
         ty3d: false,
         mip: (view >> 26) & 0xF,
         slice,
+        stencil_base: if sinfo & 1 != 0 { stencil_base } else { 0 },
     })
 }
 

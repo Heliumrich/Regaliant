@@ -436,9 +436,9 @@ pub fn dispatch(cp: &Cp, what: &str) {
                     let name = format!("{}_{:04}_{:010x}_{:010x}.png", c.flip, c.events, p.addr, t.base);
                     let r = super::images::with(|im| im.snapshot(t));
                     match r {
-                        Ok((rgba, w, h)) => {
+                        Ok((rgba, w, h, stats)) => {
                             let _ = std::fs::write(dir.join(&name), super::png::encode(w, h, &rgba));
-                            let _ = writeln!(s, "      image after dispatch: {name}");
+                            let _ = writeln!(s, "      image after dispatch: {name}{}", stats.map(|x| format!(" ({x})")).unwrap_or_default());
                         }
                         Err(e) => {
                             let _ = writeln!(s, "      image after dispatch: {name} failed: {e}");

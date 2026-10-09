@@ -256,6 +256,48 @@ pub fn to_rgba8(format: vk::Format, raw: &[u8]) -> Option<Vec<u8>> {
     })
 }
 
+/// Per-channel statistics of a float image (finite min / max / mean, NaN
+/// and infinity counts): HDR targets clamp to white or black as PNG.
+pub fn float_stats(format: vk::Format, raw: &[u8]) -> Option<String> {
+    use vk::Format as F;
+    let (channels, half) = match format {
+        F::R16G16B16A16_SFLOAT => (4, true),
+        F::R16G16_SFLOAT => (2, true),
+        F::R16_SFLOAT => (1, true),
+        F::R32G32B32A32_SFLOAT => (4, false),
+        F::R32G32_SFLOAT => (2, false),
+        F::R32_SFLOAT => (1, false),
+        _ => return None,
+    };
+    let size = if half { 2 } else { 4 };
+    let mut st = vec![(f32::INFINITY, f32::NEG_INFINITY, 0f64, 0u64, 0u64, 0u64); channels];
+    for texel in raw.chunks_exact(size * channels) {
+        for (c, s) in st.iter_mut().enumerate() {
+            let p = &texel[c * size..];
+            let v = if half { half_to_f32(u16::from_le_bytes([p[0], p[1]])) } else { f32::from_le_bytes([p[0], p[1], p[2], p[3]]) };
+            if v.is_nan() {
+                s.4 += 1;
+            } else if v.is_infinite() {
+                s.5 += 1;
+            } else {
+                s.0 = s.0.min(v);
+                s.1 = s.1.max(v);
+                s.2 += v as f64;
+                s.3 += 1;
+            }
+        }
+    }
+    let parts: Vec<String> = st
+        .iter()
+        .zip("rgba".chars())
+        .map(|(s, n)| {
+            let mean = if s.3 > 0 { s.2 / s.3 as f64 } else { 0.0 };
+            format!("{n} [{:.4}, {:.4}] mean {mean:.4} nan {} inf {}", s.0, s.1, s.4, s.5)
+        })
+        .collect();
+    Some(parts.join("; "))
+}
+
 /// A render target or depth/stencil attachment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -282,6 +324,8 @@ pub struct Surface {
     pub ty3d: bool,
     pub mip: u32,
     pub slice: u32,
+    /// Address of the stencil plane (depth/stencil surfaces with stencil).
+    pub stencil_base: u64,
 }
 
 /// UNORM equivalent of sRGB formats (storage views cannot be sRGB).
@@ -370,6 +414,11 @@ fn all_hashes(base: u64, size: u64) -> [u64; SLICES] {
 
 pub struct Images {
     map: HashMap<ImageKey, Image>,
+    /// Addresses with a GPU-written image (render targets, storage images,
+    /// stencil planes).
+    gpu_bases: std::collections::HashSet<u64>,
+    /// Depth/stencil image of each rendered stencil plane address.
+    stencil_of: HashMap<u64, ImageKey>,
     samplers: HashMap<([u32; 4], bool), vk::Sampler>,
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
@@ -397,7 +446,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
                 .expect("image pool");
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
-            *g = Some(Images { map: HashMap::new(), samplers: HashMap::new(), pool, cmd, fence, reported: HashMap::new(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0 });
+            *g = Some(Images { map: HashMap::new(), gpu_bases: Default::default(), stencil_of: HashMap::new(), samplers: HashMap::new(), pool, cmd, fence, reported: HashMap::new(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0 });
         }
     }
     f(g.as_mut().unwrap())
@@ -601,16 +650,61 @@ impl Images {
         Some(ImageKey { base: t.base, format, width: t.width, height: t.height, layers, levels, ty3d, cube })
     }
 
+    /// A rendered depth surface a texture of `key` reads (sampling only):
+    /// same address and size, R32 float over D32, R16 unorm over D16, R8 uint
+    /// over the stencil plane. Render targets are not written back, so guest
+    /// memory under them is stale (a reversed-Z depth of 0 is the far plane,
+    /// stencil 0 no material: the lighting saw only sky).
+    fn depth_alias(&self, key: &ImageKey) -> Option<ImageKey> {
+        use vk::Format as F;
+        if key.format == F::R8_UINT {
+            return self.stencil_of.get(&key.base).filter(|k| k.width == key.width && k.height == key.height && k.layers >= key.layers && self.map.contains_key(k)).copied();
+        }
+        let depths: &[vk::Format] = match key.format {
+            F::R32_SFLOAT => &[F::D32_SFLOAT, F::D32_SFLOAT_S8_UINT],
+            F::R16_UNORM => &[F::D16_UNORM, F::D16_UNORM_S8_UINT],
+            _ => return None,
+        };
+        self.map
+            .iter()
+            .filter(|(k, i)| {
+                i.gpu_written && k.base == key.base && k.width == key.width && k.height == key.height && k.layers >= key.layers && !k.ty3d && !key.ty3d && depths.contains(&k.format)
+            })
+            .map(|(k, _)| *k)
+            .max_by_key(|k| k.layers)
+    }
+
+    /// The cached image a texture of `key` uses, and how it was found. A
+    /// GPU-written image of the same address and size (other format,
+    /// rendered depth or stencil) holds newer data than guest memory: render
+    /// targets are not written back, so an upload made before the surface
+    /// was first rendered (e.g. the depth buffer read at boot) is stale.
+    fn lookup(&self, key: &ImageKey, storage: bool) -> Option<(ImageKey, &'static str)> {
+        let exact = self.map.get(key).map(|i| i.gpu_written);
+        if exact == Some(true) {
+            return Some((*key, "exact"));
+        }
+        if self.gpu_bases.contains(&key.base) {
+            if let Some(k) = self.alias(key, true) {
+                return Some((k, "alias"));
+            }
+            if !storage {
+                if let Some(k) = self.depth_alias(key) {
+                    return Some((k, if key.format == vk::Format::R8_UINT { "stencil of" } else { "depth of" }));
+                }
+            }
+        }
+        exact.map(|_| (*key, "exact"))
+    }
+
     /// Image for a T#: an existing GPU image at that address with a
     /// compatible size, or a texture uploaded from guest memory.
-    fn image_for(&mut self, t: &Tsharp, frame: u64) -> Result<ImageKey, String> {
+    fn image_for(&mut self, t: &Tsharp, frame: u64, storage: bool) -> Result<ImageKey, String> {
         let key = Self::key_of(t).ok_or_else(|| format!("image format {} unsupported", t.format))?;
-        if self.map.contains_key(&key) {
-            self.refresh(key, t, frame)?;
-            return Ok(key);
-        }
-        // A GPU-written image of the same address and size (other format).
-        if let Some(k) = self.alias(&key, true) {
+        if let Some((k, how)) = self.lookup(&key, storage) {
+            if how == "exact" && !self.map[&k].gpu_written {
+                self.refresh(key, t, frame)?;
+            }
             return Ok(k);
         }
         let image = self.create(key)?;
@@ -722,6 +816,7 @@ impl Images {
             let image = self.create(key)?;
             self.to_general(image, key.format);
             self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0 });
+            self.gpu_bases.insert(key.base);
             crate::info!("images: new render target {:#x} {}x{} {:?} at flip {}", key.base, key.width, key.height, key.format, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
             // DS_CAPTURE_NEW_RT=<hex base>: capture the frame after a render
             // target at or above that address is created.
@@ -739,6 +834,11 @@ impl Images {
         }
         // GPU-owned from now on: guest memory is no longer its source.
         img.gpu_written = true;
+        self.gpu_bases.insert(k.base);
+        if s.stencil_base != 0 && has_stencil(k.format) {
+            self.stencil_of.insert(s.stencil_base, k);
+            self.gpu_bases.insert(s.stencil_base);
+        }
         img.source = None;
         Ok(k)
     }
@@ -813,15 +913,20 @@ impl Images {
         keys.sort_by_key(|k| (k.base, k.format.as_raw()));
         let _ = std::fs::create_dir_all(dir);
         let mut n = 0;
+        let mut stats = String::new();
         for k in keys.into_iter().take(256) {
             let image = self.map[&k].image;
             let Ok(raw) = self.read_back(image, k.format, k.width, k.height) else { continue };
+            let name = format!("{:010x}_{}x{}_{:?}", k.base, k.width, k.height, k.format);
+            if let Some(s) = float_stats(k.format, &raw) {
+                stats.push_str(&format!("{name}: {s}\n"));
+            }
             let Some(rgba) = to_rgba8(k.format, &raw) else { continue };
-            let name = format!("{:010x}_{}x{}_{:?}.png", k.base, k.width, k.height, k.format);
-            if std::fs::write(dir.join(name), super::png::encode(k.width, k.height, &rgba)).is_ok() {
+            if std::fs::write(dir.join(format!("{name}.png")), super::png::encode(k.width, k.height, &rgba)).is_ok() {
                 n += 1;
             }
         }
+        let _ = std::fs::write(dir.join("stats.txt"), stats);
         n
     }
 
@@ -845,13 +950,14 @@ impl Images {
         Ok((raw, key.width, key.height, texel_bytes(key.format)))
     }
 
-    /// The cached image a T# resolves to (mip 0, layer 0) as RGBA8 (captures).
-    pub fn snapshot(&mut self, t: &Tsharp) -> Result<(Vec<u8>, u32, u32), String> {
+    /// The cached image a T# resolves to (mip 0, layer 0) as RGBA8, and the
+    /// statistics of float formats (captures).
+    pub fn snapshot(&mut self, t: &Tsharp) -> Result<(Vec<u8>, u32, u32, Option<String>), String> {
         let key = Self::key_of(t).ok_or("unsupported format")?;
         let key = if self.map.contains_key(&key) { key } else { self.alias(&key, false).ok_or("not cached")? };
         let image = self.map[&key].image;
         let raw = self.read_back(image, key.format, key.width, key.height)?;
-        Ok((to_rgba8(key.format, &raw).ok_or("format")?, key.width, key.height))
+        Ok((to_rgba8(key.format, &raw).ok_or("format")?, key.width, key.height, float_stats(key.format, &raw)))
     }
 
     /// Which cached image a T# resolves to now (frame captures).
@@ -863,18 +969,26 @@ impl Images {
             .filter(|i| i.key.base == t.base)
             .map(|i| format!("{}x{}x{} {:?} l{} m{}{}{}", i.key.width, i.key.height, i.key.layers, i.key.format, i.key.layers, i.key.levels, if i.gpu_written { " gpu" } else { "" }, if i.key == key { " =key" } else { "" }))
             .collect();
-        let pick = if self.map.contains_key(&key) { "exact".to_string() } else if let Some(k) = self.alias(&key, true) { format!("alias {:?} l{} m{}", k.format, k.layers, k.levels) } else { "new upload".into() };
+        let pick = match self.lookup(&key, false) {
+            Some((k, "exact")) => format!("exact{}", if self.map[&k].gpu_written { "" } else { " (uploaded)" }),
+            Some((k, how)) => format!("{how} {:#x} {:?} l{} m{}", k.base, k.format, k.layers, k.levels),
+            None => "new upload".into(),
+        };
         format!("{pick}; images at base: [{}]", all.join(", "))
     }
 
     /// View of a T# (format, type, levels/layers, swizzle) for sampling or storage.
     pub fn view(&mut self, t: &Tsharp, storage: bool, frame: u64) -> Result<(vk::ImageView, vk::Image), String> {
-        let key = self.image_for(t, frame)?;
+        let key = self.image_for(t, frame, storage)?;
         let req = vk_format(t.format).unwrap();
-        if is_depth(key.format) {
-            return Err(format!("texture {:#x} aliases a depth surface (not supported yet)", t.base));
+        let depth = is_depth(key.format);
+        let stencil = depth && req == vk::Format::R8_UINT;
+        if depth && storage {
+            return Err(format!("texture {:#x} aliases a depth surface (storage access not supported)", t.base));
         }
-        let fmt = if storage { storage_format(req) } else { req };
+        // Rendered depth is sampled through a view of its depth aspect (the
+        // value arrives in R, like the 32-bit float texture the title reads).
+        let fmt = if depth { key.format } else if storage { storage_format(req) } else { req };
         let levels = (t.last_level + 1).max(1);
         let _ = levels;
         let (vt, base_layer, layer_count) = if key.ty3d {
@@ -890,7 +1004,7 @@ impl Images {
         };
         let sel = |s: u16| -> u8 { (s & 7) as u8 };
         let swz = if storage { [4, 5, 6, 7] } else { [sel(t.dst_sel), sel(t.dst_sel >> 3), sel(t.dst_sel >> 6), sel(t.dst_sel >> 9)] };
-        let vkey = (fmt, vt, t.base_level, levels.saturating_sub(t.base_level).max(1), base_layer, layer_count, swz, storage as u8);
+        let vkey = (fmt, vt, t.base_level, levels.saturating_sub(t.base_level).max(1), base_layer, layer_count, swz, storage as u8 | (stencil as u8) << 1);
         let img = self.map.get_mut(&key).unwrap();
         if storage {
             if !img.gpu_written {
@@ -898,7 +1012,9 @@ impl Images {
             }
             img.gpu_written = true;
             img.source = None;
+            self.gpu_bases.insert(key.base);
         }
+        let img = self.map.get_mut(&key).unwrap();
         if let Some(&v) = img.views.get(&vkey) {
             return Ok((v, img.image));
         }
@@ -918,7 +1034,7 @@ impl Images {
             .format(fmt)
             .components(vk::ComponentMapping { r: comp(swz[0]), g: comp(swz[1]), b: comp(swz[2]), a: comp(swz[3]) })
             .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
+                aspect_mask: if stencil { vk::ImageAspectFlags::STENCIL } else if depth { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR },
                 base_mip_level: base_level,
                 level_count: if storage { 1 } else { (levels.saturating_sub(base_level)).clamp(1, levels_avail - base_level) },
                 base_array_layer: base_layer,

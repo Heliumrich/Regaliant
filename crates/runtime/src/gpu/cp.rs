@@ -680,6 +680,7 @@ impl Cp {
             }
             op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT => {
                 DISPATCHES.fetch_add(1, Ordering::Relaxed);
+                let mut indirect_groups = None;
                 if opcode == op::DISPATCH_DIRECT {
                     // DS_DELAY_CS=<shader>:<ms>: wait before that shader's
                     // dispatches (diagnosis of CPU/GPU data races).
@@ -714,6 +715,7 @@ impl Cp {
                     let a = self.dispatch_indirect_base + p(0) as u64;
                     if valid(a, 12) {
                         let g = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8)] };
+                        indirect_groups = Some(g);
                         self.dispatch(g, p(1));
                     }
                 }
@@ -727,7 +729,8 @@ impl Cp {
                     let what = if opcode == op::DISPATCH_DIRECT {
                         format!("DISPATCH_DIRECT {}x{}x{} initiator {:#x}", p(0), p(1), p(2), p(3))
                     } else {
-                        format!("DISPATCH_INDIRECT {:#x} base {:#x}", p(0), self.dispatch_indirect_base)
+                        let g = indirect_groups.map(|g| format!(" groups {}x{}x{}", g[0], g[1], g[2])).unwrap_or_default();
+                        format!("DISPATCH_INDIRECT {:#x} base {:#x}{g}", p(0), self.dispatch_indirect_base)
                     };
                     super::capture::dispatch(self, &what);
                     // DS_REPEAT_CS=<shader>: run that captured direct dispatch
