@@ -247,24 +247,16 @@ pub fn prepare_ps(cp: &Cp) -> Result<Prepared, String> {
 }
 
 /// `DS_PROBE=<shader address>:<pc>:<vgpr>` (hex address and pc, decimal
-/// VGPR): that pixel shader exports the VGPR's value after the instruction
-/// at pc as its color, or that compute shader stores it as the data of its
-/// image stores (debugging). An optional fourth field `:<n>` starts probing
-/// in the n-th frame (0-based) that uses the shader, e.g. to keep a
-/// reference frame intact.
+/// VGPR) or the `probe` control command: that pixel shader exports the
+/// VGPR's value after the instruction at pc as its color (float targets) or
+/// its raw bits (integer targets), or that compute shader stores it as the
+/// data of its image stores (debugging). An optional fourth field `:<n>`
+/// starts probing in the n-th frame (0-based) that uses the shader, e.g. to
+/// keep a reference frame intact.
 pub(crate) fn probe_for(addr: u64) -> Option<(u32, u32)> {
-    static P: std::sync::OnceLock<Option<(u64, u32, u32, u32)>> = std::sync::OnceLock::new();
     static USES: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((u64::MAX, 0));
-    let p = P.get_or_init(|| {
-        let v = std::env::var("DS_PROBE").ok()?;
-        let mut it = v.split(':');
-        let a = u64::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
-        let pc = u32::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
-        let vg = it.next()?.parse().ok()?;
-        let from = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-        Some((a, pc, vg, from))
-    });
-    let (a, pc, vg, from) = (*p)?;
+    let p = *PROBE.lock().get_or_insert_with(|| std::env::var("DS_PROBE").ok().and_then(|v| parse_probe(&v)));
+    let (a, pc, vg, from) = p?;
     if a != addr {
         return None;
     }
@@ -274,6 +266,25 @@ pub(crate) fn probe_for(addr: u64) -> Option<(u32, u32)> {
         *u = (flip, u.1 + 1);
     }
     (u.1 > from).then_some((pc, vg))
+}
+
+/// Probe setting (see `probe_for`): None until read from `DS_PROBE`.
+static PROBE: parking_lot::Mutex<Option<Option<(u64, u32, u32, u32)>>> = parking_lot::Mutex::new(None);
+
+fn parse_probe(v: &str) -> Option<(u64, u32, u32, u32)> {
+    let mut it = v.split(':');
+    let a = u64::from_str_radix(it.next()?.trim().trim_start_matches("0x"), 16).ok()?;
+    let pc = u32::from_str_radix(it.next()?.trim().trim_start_matches("0x"), 16).ok()?;
+    let vg = it.next()?.trim().parse().ok()?;
+    let from = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+    Some((a, pc, vg, from))
+}
+
+/// `probe <shader>:<pc>:<vgpr>[:<n>]` / `probe off` (control command).
+pub fn set_probe(v: &str) -> Result<(), String> {
+    let p = if v.trim() == "off" { None } else { Some(parse_probe(v).ok_or("usage: probe <hex shader>:<hex pc>:<vgpr>[:<frames>] | off")?) };
+    *PROBE.lock() = Some(p);
+    Ok(())
 }
 
 /// `DS_DUMP=<shader>:<pc>:<x>,<y>,<z>` (hex shader address and pc, decimal

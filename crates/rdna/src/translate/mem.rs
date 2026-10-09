@@ -1481,11 +1481,17 @@ pub fn export(tr: &mut T, ins: &Inst) -> R<()> {
                 cs.push(if ty == tr.t.v4f { tr.f(0.0) } else if ty == tr.t.v4i { tr.i(0) } else { tr.u(0) });
             }
             let mut v = e(tr.b.composite_construct(ty, None, cs))?;
-            if let (Some(pv), true) = (tr.probe_var, ty == tr.t.v4f) {
+            if let Some(pv) = tr.probe_var {
                 let pu = e(tr.b.load(tr.t.u32, None, pv, None, []))?;
-                let pf = tr.to_f(pu)?;
-                let one = tr.f(1.0);
-                v = e(tr.b.composite_construct(ty, None, [pf, pf, pf, one]))?;
+                v = if ty == tr.t.v4f {
+                    let pf = tr.to_f(pu)?;
+                    let one = tr.f(1.0);
+                    e(tr.b.composite_construct(ty, None, [pf, pf, pf, one]))?
+                } else {
+                    // Integer targets: the raw bits in every channel.
+                    let pc = if ty == tr.t.v4i { tr.to_i(pu)? } else { pu };
+                    e(tr.b.composite_construct(ty, None, [pc, pc, pc, pc]))?
+                };
             }
             tr.guarded(act, &mut |tr| ok(tr.b.store(var, v, None, [])))?;
         }

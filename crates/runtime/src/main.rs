@@ -260,6 +260,11 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 gpu::exec::set_equal_bias(v);
                 Ok(())
             }
+            "probe" => {
+                // Diagnosis: `probe <shader>:<pc>:<vgpr>[:<frames>]` / `probe off`.
+                let rest = line.trim_start().strip_prefix("probe").unwrap_or("").trim();
+                gpu::shaders::set_probe(rest)
+            }
             "skipvs" => {
                 // Diagnosis: `skipvs <hex vertex shader address>` toggles
                 // skipping the draws that use it.

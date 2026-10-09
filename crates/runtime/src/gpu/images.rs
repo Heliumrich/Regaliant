@@ -266,7 +266,8 @@ pub fn float_stats(format: vk::Format, raw: &[u8]) -> Option<String> {
         F::R16_SFLOAT => (1, true),
         F::R32G32B32A32_SFLOAT => (4, false),
         F::R32G32_SFLOAT => (2, false),
-        F::R32_SFLOAT => (1, false),
+        // Integer targets also as f32 bits (probed values, packed data).
+        F::R32_SFLOAT | F::R32_UINT | F::R32_SINT => (1, false),
         _ => return None,
     };
     let size = if half { 2 } else { 4 };
@@ -340,6 +341,20 @@ pub struct FastClear {
     pub clear: [u32; 2],
 }
 
+/// Blocks of a block-compressed texture that GPU work stored through an
+/// uncompressed view of its memory (one texel per block), to be copied in.
+pub struct BlockCopy {
+    pub key: ImageKey,
+    pub src: vk::Image,
+    pub dst: vk::Image,
+    /// Block grid of mip 0.
+    pub width: u32,
+    pub height: u32,
+    pub levels: u32,
+    pub layers: u32,
+    seq: u64,
+}
+
 /// UNORM equivalent of sRGB formats (storage views cannot be sRGB).
 fn storage_format(f: vk::Format) -> vk::Format {
     match f {
@@ -378,6 +393,11 @@ pub struct Image {
     hashes: [u64; SLICES],
     /// Frame of the last slice check.
     checked_frame: u64,
+    /// Generation of its last binding as a storage image (see `Images::write_seq`).
+    write_gen: u64,
+    /// Block-compressed textures: generation of the block view last copied
+    /// in (see `take_block_copies`).
+    block_gen: u64,
 }
 
 /// Pages of a texture are checked for CPU writes in SLICES interleaved
@@ -405,19 +425,35 @@ fn hash_bytes(a: u64, n: usize) -> u64 {
 }
 
 /// Sampled hash of one slice of a guest range: the first 256 bytes of every
-/// SLICES-th 4 KiB page starting at page `slice`.
+/// SLICES-th 4 KiB page starting at page `slice`. Unmapped pages count as
+/// a marker (partially resident textures map only some of their mips).
 fn slice_hash(base: u64, size: u64, slice: usize) -> u64 {
-    if !super::cp::guest_readable(base, size) {
-        return 0;
-    }
     let mut h = 0u64;
     let mut a = base + 4096 * slice as u64;
     while a < base + size {
         let n = 256.min(base + size - a) as usize;
-        h = h.rotate_left(5) ^ hash_bytes(a, n);
+        let v = if super::cp::guest_readable(a, n as u64) { hash_bytes(a, n) } else { 0x5555_5555_5555_5555 };
+        h = h.rotate_left(5) ^ v;
         a += 4096 * SLICES as u64;
     }
     h
+}
+
+/// Length of the mapped prefix of [base, base+size) (page granularity).
+fn readable_prefix(base: u64, size: u64) -> u64 {
+    if super::cp::guest_readable(base, size) {
+        return size;
+    }
+    let page = 4096u64;
+    let mut n = 0u64;
+    // Whole 64 KiB steps, then pages.
+    while n + (64 << 10) <= size && super::cp::guest_readable(base + n, 64 << 10) {
+        n += 64 << 10;
+    }
+    while n + page <= size && super::cp::guest_readable(base + n, page) {
+        n += page;
+    }
+    n
 }
 
 fn all_hashes(base: u64, size: u64) -> [u64; SLICES] {
@@ -444,6 +480,8 @@ pub struct Images {
     pub reuploads: u64,
     pub upload_bytes: u64,
     pub upload_ns: u64,
+    /// Counts storage-image bindings (write generations).
+    write_seq: u64,
 }
 
 unsafe impl Send for Images {}
@@ -462,7 +500,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
                 .expect("image pool");
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
-            *g = Some(Images { map: HashMap::new(), gpu_bases: Default::default(), stencil_of: HashMap::new(), meta_of: HashMap::new(), pending_clears: HashMap::new(), samplers: HashMap::new(), pool, cmd, fence, reported: HashMap::new(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0 });
+            *g = Some(Images { map: HashMap::new(), gpu_bases: Default::default(), stencil_of: HashMap::new(), meta_of: HashMap::new(), pending_clears: HashMap::new(), samplers: HashMap::new(), pool, cmd, fence, reported: HashMap::new(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0 });
         }
     }
     f(g.as_mut().unwrap())
@@ -599,16 +637,32 @@ impl Images {
             self.report(format!("texture with XOR swizzle mode {} uploaded with an assumed pipe count (2^{})", t.sw_mode, tiling::pipes_log2()));
         }
         let size = lay.size(layers);
-        if !super::cp::guest_readable(t.base, size) {
+        // Streamed textures are partially resident: only the mip tail and
+        // the smaller mips (at the start of the chain) may be mapped. Mips
+        // outside the mapped prefix stay empty (the T#'s base level excludes
+        // them); later mappings or writes re-upload (write tracking).
+        let readable = readable_prefix(t.base, size);
+        if readable == 0 {
             return Err(format!("texture {:#x}+{size:#x} not mapped", t.base));
         }
-        let src = unsafe { std::slice::from_raw_parts(t.base as *const u8, size as usize) };
+        let src = unsafe { std::slice::from_raw_parts(t.base as *const u8, readable as usize) };
+        let elem = 1u64 << el;
+        let mip_end = |mip: usize, layer: u32| -> u64 {
+            let m = &lay.mips[mip];
+            let start = layer as u64 * lay.slice_size + if m.tail.is_some() { 0 } else { m.offset };
+            start + if m.tail.is_some() { 1u64 << lay.block_log2 } else { m.pitch as u64 * m.padded_height as u64 * elem }
+        };
+        let mut skipped = 0;
         // Detile every (mip, layer) into one staging buffer.
         let mut staging: Vec<u8> = Vec::new();
         let mut regions = Vec::new();
         let mut tmp = Vec::new();
         for mip in 0..key.levels as usize {
             for layer in 0..layers {
+                if mip_end(mip, layer) > readable {
+                    skipped += 1;
+                    continue;
+                }
                 lay.detile(src, mip, layer, &mut tmp);
                 let off = staging.len() as u64;
                 staging.extend_from_slice(&tmp);
@@ -623,6 +677,12 @@ impl Images {
                         .image_extent(vk::Extent3D { width: w, height: h, depth: 1 }),
                 );
             }
+        }
+        if regions.is_empty() {
+            return Err(format!("texture {:#x}+{size:#x}: no mip mapped ({readable:#x} bytes mapped)", t.base));
+        }
+        if skipped > 0 {
+            self.report(format!("partially resident texture: {skipped} (mip, layer) not mapped, left empty"));
         }
         let c = ctx();
         let (buf, mem, ptr) = c.host_buffer(staging.len().max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
@@ -713,6 +773,45 @@ impl Images {
         exact.map(|_| (*key, "exact"))
     }
 
+    /// Block copies pending for the block-compressed textures among `keys`:
+    /// the title transcodes streamed textures with compute shaders that store
+    /// each 16- or 8-byte block as one R32G32B32A32 / R32G32 texel of a view
+    /// whose size is the block grid. Images here do not share memory, so the
+    /// blocks are copied into the texture (size-compatible formats) once per
+    /// write generation. Mips with partial blocks are left out.
+    pub fn take_block_copies(&mut self, keys: &[ImageKey]) -> Vec<BlockCopy> {
+        let mut out: Vec<BlockCopy> = Vec::new();
+        for k in keys {
+            if !is_compressed(k.format) || k.ty3d || out.iter().any(|c| c.key == *k) {
+                continue;
+            }
+            let Some(dst) = self.map.get(k) else { continue };
+            let (bw, bh) = (k.width.div_ceil(4), k.height.div_ceil(4));
+            let bytes = texel_bytes(k.format);
+            let src = self
+                .map
+                .values()
+                .filter(|i| i.gpu_written && i.key.base == k.base && !is_compressed(i.key.format) && !i.key.ty3d)
+                .filter(|i| texel_bytes(i.key.format) == bytes && i.key.width == bw && i.key.height == bh && i.write_gen > dst.block_gen)
+                .max_by_key(|i| i.write_gen);
+            let Some(src) = src else { continue };
+            let mut levels = 0;
+            while levels < src.key.levels.min(k.levels) && (k.width >> levels) % 4 == 0 && (k.height >> levels) % 4 == 0 && (k.width >> levels) > 0 && (k.height >> levels) > 0 {
+                levels += 1;
+            }
+            if levels == 0 {
+                continue;
+            }
+            out.push(BlockCopy { key: *k, src: src.image, dst: dst.image, width: bw, height: bh, levels, layers: src.key.layers.min(k.layers).max(1), seq: src.write_gen });
+        }
+        for c in &out {
+            if let Some(i) = self.map.get_mut(&c.key) {
+                i.block_gen = c.seq;
+            }
+        }
+        out
+    }
+
     /// Notes writes (GPU buffer writes, CP DMA) that cover the metadata of a
     /// rendered surface: fast clears, resolved at the surface's next use.
     pub fn note_meta_writes(&mut self, writes: &[(u64, u64)]) {
@@ -778,7 +877,7 @@ impl Images {
             self.report(format!("texture {:#x} is not write-tracked (read-only or unmapped pages): later CPU updates are not seen", t.base));
         }
         let hashes = source.map(|(b, n)| all_hashes(b, n)).unwrap_or([0; SLICES]);
-        self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: false, source: region, hashes, checked_frame: frame });
+        self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: false, source: region, hashes, checked_frame: frame, write_gen: 0, block_gen: 0 });
         Ok(key)
     }
 
@@ -870,7 +969,7 @@ impl Images {
         } else {
             let image = self.create(key)?;
             self.to_general(image, key.format);
-            self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0 });
+            self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: 0, block_gen: 0 });
             self.gpu_bases.insert(key.base);
             crate::info!("images: new render target {:#x} {}x{} {:?} at flip {}", key.base, key.width, key.height, key.format, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
             // DS_CAPTURE_NEW_RT=<hex base>: capture the frame after a render
@@ -974,6 +1073,44 @@ impl Images {
             c.device.free_memory(mem, None);
         }
         Ok(out)
+    }
+
+    /// Share of zero bytes in the cached image a T# resolves to, at the T#'s
+    /// base mip (layer 0), as the GPU holds it (frame captures; compare with
+    /// the guest data).
+    pub fn gpu_zero_stats(&mut self, t: &Tsharp) -> Option<String> {
+        let (k, _) = self.lookup(&Self::key_of(t)?, false)?;
+        if k.ty3d || is_depth(k.format) {
+            return None;
+        }
+        let image = self.map.get(&k)?.image;
+        let mip = t.base_level.min(k.levels.saturating_sub(1));
+        let (w, h) = ((k.width >> mip).max(1), (k.height >> mip).max(1));
+        let bytes = texel_bytes(k.format) as u64;
+        let size = if is_compressed(k.format) { w.div_ceil(4) as u64 * h.div_ceil(4) as u64 * bytes } else { w as u64 * h as u64 * bytes };
+        if size == 0 || size > 64 << 20 {
+            return None;
+        }
+        let c = ctx();
+        let (buf, mem, ptr) = c.host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST).ok()?;
+        self.one_shot(|cmd| unsafe {
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: mip, base_array_layer: 0, layer_count: 1 })
+                .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
+            c.device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::GENERAL, buf, &[region]);
+            let hb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[hb], &[], &[]);
+        });
+        let data = unsafe { std::slice::from_raw_parts(ptr, size as usize) };
+        let z = data.iter().filter(|&&b| b == 0).count() * 100 / data.len();
+        unsafe {
+            c.device.destroy_buffer(buf, None);
+            c.device.unmap_memory(mem);
+            c.device.free_memory(mem, None);
+        }
+        Some(format!("gpu image mip {mip}: {z}% zero"))
     }
 
     /// Writes the GPU-written color images (mip 0, layer 0) to `dir` as PNG
@@ -1092,7 +1229,53 @@ impl Images {
             Some((k, how)) => format!("{how} {:#x} {:?} l{} m{}", k.base, k.format, k.layers, k.levels),
             None => "new upload".into(),
         };
-        format!("{pick}; images at base: [{}]", all.join(", "))
+        // Share of zero bytes in the first 64 KiB of the guest data (texture
+        // data not loaded yet reads as zeros).
+        let n = 64u64 << 10;
+        let zeros = if super::cp::guest_readable(t.base, n) {
+            let s = unsafe { std::slice::from_raw_parts(t.base as *const u8, n as usize) };
+            format!("; guest data {}% zero", s.iter().filter(|&&b| b == 0).count() * 100 / s.len())
+        } else {
+            "; guest data unreadable".into()
+        };
+        // Per mip in the sampled range (upload layout): share of zero bytes
+        // where each mip's elements are read from.
+        let mut per_mip = String::new();
+        if let (Some(el), false) = (elem_log2(t.format), key.ty3d) {
+            if let Some(lay) = tiling::layout(t.sw_mode, el, key.width, key.height, key.levels, is_block(t.format)) {
+                let e = 1u64 << el;
+                for m in (t.base_level as usize)..lay.mips.len().min(t.base_level as usize + 4) {
+                    let ml = &lay.mips[m];
+                    let (mut z, mut n) = (0u64, 0u64);
+                    for y in (0..ml.height).step_by((ml.height as usize / 16).max(1)) {
+                        for x in (0..ml.width).step_by((ml.width as usize / 16).max(1)) {
+                            let a = t.base + lay.offset(m, 0, x, y);
+                            if super::cp::guest_readable(a, e) {
+                                let s = unsafe { std::slice::from_raw_parts(a as *const u8, e as usize) };
+                                z += s.iter().filter(|&&b| b == 0).count() as u64;
+                                n += e;
+                            }
+                        }
+                    }
+                    if n > 0 {
+                        per_mip.push_str(&format!(" m{m}:{}%", z * 100 / n));
+                    }
+                }
+            }
+        }
+        if !per_mip.is_empty() {
+            per_mip = format!("; zero bytes per mip{per_mip}");
+        }
+        // Uploaded textures: whether the sampled hashes of the source bytes
+        // changed since the last upload (what the CPU-write check compares).
+        if let Some(img) = self.map.get(&key).filter(|i| !i.gpu_written) {
+            if let Some((b, n)) = img.source.and_then(super::track::range) {
+                let now = all_hashes(b, n);
+                let changed = (0..SLICES).filter(|&s| now[s] != img.hashes[s]).count();
+                per_mip.push_str(&format!("; hashed slices changed since upload {changed}/{SLICES} (checked frame {})", img.checked_frame));
+            }
+        }
+        format!("{pick}; images at base: [{}]{zeros}{per_mip}", all.join(", "))
     }
 
     /// View of a T# (format, type, levels/layers, swizzle) for sampling or storage.
@@ -1123,8 +1306,13 @@ impl Images {
         let sel = |s: u16| -> u8 { (s & 7) as u8 };
         let swz = if storage { [4, 5, 6, 7] } else { [sel(t.dst_sel), sel(t.dst_sel >> 3), sel(t.dst_sel >> 6), sel(t.dst_sel >> 9)] };
         let vkey = (fmt, vt, t.base_level, levels.saturating_sub(t.base_level).max(1), base_layer, layer_count, swz, storage as u8 | (stencil as u8) << 1);
+        if storage {
+            self.write_seq += 1;
+        }
+        let seq = self.write_seq;
         let img = self.map.get_mut(&key).unwrap();
         if storage {
+            img.write_gen = seq;
             if !img.gpu_written {
                 crate::info!("images: {:#x} {}x{} {:?} becomes a storage image (was uploaded: {})", key.base, key.width, key.height, key.format, img.source.is_some());
             }

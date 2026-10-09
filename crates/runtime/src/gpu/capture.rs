@@ -437,7 +437,13 @@ pub fn draw(cp: &Cp, what: &str) {
                 if super::exec::enabled() {
                     for r in &p.resources {
                         if let super::shaders::Resolved::Image(t) = r {
-                            let d = super::images::with(|im| im.describe(t));
+                            let d = super::images::with(|im| {
+                                let d = im.describe(t);
+                                match im.gpu_zero_stats(t) {
+                                    Some(z) => format!("{d}; {z}"),
+                                    None => d,
+                                }
+                            });
                             let _ = writeln!(s, "      {name} image {:#x}: {d}", t.base);
                         }
                     }

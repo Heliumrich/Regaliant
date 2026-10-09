@@ -47,6 +47,8 @@ static WATCHDOG_PTR: std::sync::atomic::AtomicPtr<u32> = std::sync::atomic::Atom
 pub static WATCHDOG_STOPS: AtomicU64 = AtomicU64::new(0);
 /// Fast clears performed (metadata writes, see `Exec::resolve_fast_clears`).
 pub static FAST_CLEARS: AtomicU64 = AtomicU64::new(0);
+/// Block-compressed textures refreshed from GPU-written block views.
+pub static BLOCK_COPIES: AtomicU64 = AtomicU64::new(0);
 
 /// GPU execution enabled (`DS_GPU=1`) and Vulkan available.
 pub fn enabled() -> bool {
@@ -1033,6 +1035,40 @@ impl Exec {
         }
     }
 
+    /// Copies blocks that GPU work stored through an uncompressed view into
+    /// the block-compressed textures among `keys` (Images::take_block_copies),
+    /// before the work that samples them.
+    pub(crate) fn sync_block_textures(&mut self, keys: &[super::images::ImageKey]) {
+        if keys.is_empty() {
+            return;
+        }
+        let copies = super::images::with(|im| im.take_block_copies(keys));
+        if copies.is_empty() {
+            return;
+        }
+        self.end_rendering();
+        self.begin();
+        let c = ctx();
+        let cmd = self.cmd();
+        global_barrier(cmd);
+        for b in &copies {
+            let regions: Vec<vk::ImageCopy> = (0..b.levels)
+                .map(|l| {
+                    let sub = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: l, base_array_layer: 0, layer_count: b.layers };
+                    // Extent in texels of the (uncompressed) source.
+                    vk::ImageCopy { src_subresource: sub, src_offset: vk::Offset3D::default(), dst_subresource: sub, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: (b.width >> l).max(1), height: (b.height >> l).max(1), depth: 1 } }
+                })
+                .collect();
+            unsafe { c.device.cmd_copy_image(cmd, b.src, vk::ImageLayout::GENERAL, b.dst, vk::ImageLayout::GENERAL, &regions) };
+            BLOCK_COPIES.fetch_add(1, Ordering::Relaxed);
+            static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+            if SEEN.lock().get_or_insert_with(HashSet::new).insert(b.key.base) {
+                crate::info!("images: {:#x} {}x{} {:?}: {} mip(s) of blocks copied in from its GPU-written {}x{} view", b.key.base, b.key.width, b.key.height, b.key.format, b.levels, b.width, b.height);
+            }
+        }
+        global_barrier(cmd);
+    }
+
     /// Submits recorded work and waits for all of this queue's GPU work and
     /// deferred effects.
     pub fn flush(&mut self) {
@@ -1331,7 +1367,9 @@ impl Exec {
         }
         let t_prep = t0.elapsed();
         trace_loads(&self.name, &p, groups);
-        self.resolve_fast_clears(&image_keys(&p));
+        let keys = image_keys(&p);
+        self.resolve_fast_clears(&keys);
+        self.sync_block_textures(&keys);
         let (pipeline, layout, set_layout) = shared().pipeline(&p)?;
         let t_pipe = t0.elapsed();
         self.reserve(&[&p]);

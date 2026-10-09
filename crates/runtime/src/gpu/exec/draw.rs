@@ -587,6 +587,7 @@ impl Exec {
             used.extend(image_keys(p));
         }
         self.resolve_fast_clears(&used);
+        self.sync_block_textures(&used);
         // Resources.
         let mut stages: Vec<&mut Prepared> = vec![&mut vs];
         if let Some(p) = ps.as_mut() {
