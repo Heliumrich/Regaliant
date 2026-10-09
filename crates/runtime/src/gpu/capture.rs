@@ -216,11 +216,18 @@ pub fn draw_dumps() -> bool {
     next.is_some_and(|e| e >= lo && e <= hi)
 }
 
-/// `DS_CAPTURE_DISPATCHES=1`: also dump the images each captured dispatch
-/// writes, after it (dispatches/<flip>_<event>_<shader>_<image>.png).
+/// `DS_CAPTURE_DISPATCHES=1` or `capture dispatches` (control command, from
+/// then on): also dump the images each captured dispatch writes, after it
+/// (dispatches/<flip>_<event>_<shader>_<image>.png, with statistics).
 pub fn dispatch_dumps() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_CAPTURE_DISPATCHES").ok().as_deref() == Some("1")) && capturing()
+    (*ON.get_or_init(|| std::env::var("DS_CAPTURE_DISPATCHES").ok().as_deref() == Some("1")) || DISPATCH_DUMPS.load(Ordering::Relaxed)) && capturing()
+}
+
+static DISPATCH_DUMPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_dispatch_dumps(on: bool) {
+    DISPATCH_DUMPS.store(on, Ordering::Relaxed);
 }
 
 /// Per-draw report range set by the `capture <from>-<to>` control command
@@ -572,7 +579,7 @@ pub fn dispatch(cp: &Cp, what: &str) {
         cp.reg(Space::Sh, 0x209) & 0xFFFF
     );
     stage(cp, &mut s, &mut c.shaders, "cs", 0x20C, 0x212, 0x240);
-    let dumps = std::env::var("DS_CAPTURE_DISPATCHES").ok().as_deref() == Some("1");
+    let dumps = DISPATCH_DUMPS.load(Ordering::Relaxed) || std::env::var("DS_CAPTURE_DISPATCHES").ok().as_deref() == Some("1");
     match super::shaders::prepare_compute(cp, true) {
         Ok(p) => {
             for l in super::shaders::describe_resources(&p) {

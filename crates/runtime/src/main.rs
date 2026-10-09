@@ -286,12 +286,17 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 Ok(())
             }
             "capture" => {
-                // `capture [<from>-<to>]`: the next frame, optionally with
-                // per-draw reports for that range of its events.
-                if let Some((a, b)) = parts.next().and_then(|r| r.split_once('-')) {
-                    match (a.parse(), b.parse()) {
-                        (Ok(a), Ok(b)) => gpu::capture::set_draw_range((a, b)),
-                        _ => warn!("control: bad draw range '{a}-{b}'"),
+                // `capture [<from>-<to>] [dispatches]`: the next frame,
+                // optionally with per-draw reports for that range of its
+                // events and dumps of the images its dispatches write.
+                for arg in parts.by_ref() {
+                    if arg == "dispatches" {
+                        gpu::capture::set_dispatch_dumps(true);
+                    } else if let Some((a, b)) = arg.split_once('-') {
+                        match (a.parse(), b.parse()) {
+                            (Ok(a), Ok(b)) => gpu::capture::set_draw_range((a, b)),
+                            _ => warn!("control: bad draw range '{a}-{b}'"),
+                        }
                     }
                 }
                 gpu::capture::arm_next();
