@@ -260,6 +260,18 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 gpu::exec::set_equal_bias(v);
                 Ok(())
             }
+            "skipvs" => {
+                // Diagnosis: `skipvs <hex vertex shader address>` toggles
+                // skipping the draws that use it.
+                match parts.next().and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()) {
+                    Some(a) => {
+                        let on = gpu::exec::toggle_skip_vs(a);
+                        info!("control: draws with vertex shader {a:#x} {}", if on { "skipped" } else { "drawn again" });
+                        Ok(())
+                    }
+                    None => Err("usage: skipvs <hex address>".into()),
+                }
+            }
             "textreset" => {
                 exception::text_reset();
                 Ok(())

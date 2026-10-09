@@ -33,6 +33,8 @@ pub struct DrawArgs {
     pub index: Option<(u64, u32)>,
     /// First vertex (non-indexed) or vertex offset (indexed); None: VGT_INDX_OFFSET.
     pub base_vertex: Option<i32>,
+    /// Added to the instance id VGPR (indirect draws whose packet names no
+    /// start-instance SGPR; see the CP).
     pub first_instance: u32,
 }
 
@@ -116,6 +118,22 @@ pub static EQUAL_BIAS: AtomicU32 = AtomicU32::new(0x7FC0_0000);
 
 pub fn set_equal_bias(v: Option<f32>) {
     EQUAL_BIAS.store(v.unwrap_or(f32::NAN).to_bits(), Ordering::Relaxed);
+}
+
+/// Draws whose vertex shader is on this list are skipped (`skipvs` control
+/// command; diagnosis).
+static SKIP_VS: parking_lot::Mutex<Option<std::collections::HashSet<u64>>> = parking_lot::Mutex::new(None);
+
+/// Adds or removes a vertex shader address; returns whether it is listed now.
+pub fn toggle_skip_vs(addr: u64) -> bool {
+    let mut g = SKIP_VS.lock();
+    let s = g.get_or_insert_with(Default::default);
+    if s.remove(&addr) {
+        false
+    } else {
+        s.insert(addr);
+        true
+    }
 }
 
 fn equal_bias() -> Option<f32> {
@@ -428,6 +446,9 @@ impl Exec {
         if clip & (1 << 22) != 0 {
             return Ok(false); // DX_RASTERIZATION_KILL
         }
+        if SKIP_VS.lock().as_ref().is_some_and(|s| s.contains(&super::super::shaders::ngg_addr(cp))) {
+            return Err("vertex shader on the skip list (diagnosis)".into());
+        }
         let prim = cp.reg(Space::Uc, 0x242) & 0x3F;
         let (topology, class, rect) = match prim {
             1 => (vk::PrimitiveTopology::POINT_LIST, 0u8, false),
@@ -691,11 +712,9 @@ impl Exec {
                     };
                     let ty = if size == 4 { vk::IndexType::UINT32 } else { vk::IndexType::UINT16 };
                     c.device.cmd_bind_index_buffer(cmd, buffer, addr - start, ty);
-                    // Instance ids start at 0 as on the hardware (shaders add
-                    // the start instance from a user SGPR, see the CP).
-                    c.device.cmd_draw_indexed(cmd, a.count, a.instances, 0, base_vertex, 0);
+                    c.device.cmd_draw_indexed(cmd, a.count, a.instances, 0, base_vertex, a.first_instance);
                 }
-                None => c.device.cmd_draw(cmd, a.count, a.instances, base_vertex as u32, 0),
+                None => c.device.cmd_draw(cmd, a.count, a.instances, base_vertex as u32, a.first_instance),
             }
         }
         for b in bounds {

@@ -134,6 +134,11 @@ fn split_reg(r: u64) -> (u32, u32) {
 /// Draw initiator from an Agc draw modifier (bit 8 -> USE_OPAQUE; bit 32
 /// selects a variant without it). Source select is added by each draw.
 fn draw_initiator(modifier: u64, source_select: u32) -> u32 {
+    // Each distinct modifier once (its layout is not fully known).
+    static SEEN: parking_lot::Mutex<Option<std::collections::HashSet<(u64, u32)>>> = parking_lot::Mutex::new(None);
+    if SEEN.lock().get_or_insert_with(Default::default).insert((modifier, source_select)) {
+        crate::info!("agc: draw modifier {modifier:#018x} (source select {source_select})");
+    }
     let extra = if modifier & (1 << 32) != 0 { 0 } else { ((modifier as u32) >> 3) & 0x20 };
     source_select | extra
 }
@@ -520,6 +525,10 @@ sysv! {
         emit(cb, &[hdr(op::SET_BASE, 3, compute), if compute { 2 } else { 1 }, lo(addr), hi(addr)])
     }
     fn sceAgcDcbDrawIndexIndirect(cb: u64, offset: u32, modifier: u64) -> u64 {
+        static SEEN: parking_lot::Mutex<Option<std::collections::HashSet<u64>>> = parking_lot::Mutex::new(None);
+        if SEEN.lock().get_or_insert_with(Default::default).insert(modifier) {
+            crate::info!("agc: DrawIndexIndirect modifier {modifier:#018x}");
+        }
         emit(cb, &[hdr(op::DRAW_INDEX_INDIRECT, 4, DCB), offset, 0, 0, draw_initiator(modifier, 0)])
     }
     fn sceAgcDcbDrawIndexIndirectGetSize() -> u64 { 20 }

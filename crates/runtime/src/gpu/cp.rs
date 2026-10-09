@@ -88,6 +88,18 @@ pub struct Cp {
     /// A partial flush / acquire was requested: the next CP memory write
     /// must wait for the GPU work before it.
     fence_pending: bool,
+    /// SET_PREDICATION state for packets with the predicate bit.
+    pred: Option<Pred>,
+}
+
+/// SET_PREDICATION (as Agc encodes it: control = operation << 16 |
+/// wait << 12 | condition << 8, address, dwords covered).
+#[derive(Clone, Copy, Debug)]
+struct Pred {
+    op: u32,
+    cond: u32,
+    addr: u64,
+    count: u32,
 }
 
 unsafe fn rd32(a: u64) -> u32 {
@@ -326,6 +338,7 @@ impl Cp {
             exec: None,
             exec_failed: false,
             fence_pending: false,
+            pred: None,
         }
     }
 
@@ -440,23 +453,24 @@ impl Cp {
     }
 
     /// DRAW_INDIRECT_MULTI / DRAW_INDEX_INDIRECT_MULTI: draws described by
-    /// consecutive argument records (as Mesa radeonsi emits the packet: data
-    /// offset; BASE_VTX_LOC | START_INST_LOC << 16; DRAW_INDEX_LOC | bit 30
-    /// count from memory | bit 31 draw index enable; count; count address;
-    /// stride). Each draw gets its base vertex, start instance and draw index
-    /// in the user SGPRs the packet names. Returns the outcome summary.
+    /// consecutive argument records. gfx9+ layout (Mesa radeonsi and the Agc
+    /// builders emit it): data offset; BASE_VTX_LOC; START_INST_LOC;
+    /// DRAW_INDEX_LOC [15:0] | bit 30 count from memory | bit 31 draw index
+    /// enable; count; count address lo/hi; stride; initiator. Each draw gets
+    /// its base vertex, start instance and draw index in the user SGPRs the
+    /// packet names. Returns the outcome summary.
     fn draw_indirect_multi(&mut self, indexed: bool, p: &dyn Fn(u64) -> u32) -> String {
         // Arguments and counts may have been written by earlier GPU work.
         self.sync();
-        let (vtx_loc, inst_loc, id_loc) = (p(1) & 0xFFFF, p(1) >> 16, p(2) & 0xFFFF);
-        let id_enable = p(2) & (1 << 31) != 0;
-        let mut count = p(3);
-        if p(2) & (1 << 30) != 0 {
-            let ca = addr64(p(4), p(5));
+        let (vtx_loc, inst_loc, id_loc) = (p(1) & 0xFFFF, p(2) & 0xFFFF, p(3) & 0xFFFF);
+        let id_enable = p(3) & (1 << 31) != 0;
+        let mut count = p(4);
+        if p(3) & (1 << 30) != 0 {
+            let ca = addr64(p(5), p(6));
             count = if valid(ca, 4) { count.min(unsafe { rd32(ca) }) } else { 0 };
         }
         let rec = if indexed { 20 } else { 16 };
-        let stride = if p(6) != 0 { p(6) as u64 } else { rec };
+        let stride = if p(7) != 0 { p(7) as u64 } else { rec };
         let size = if indexed { self.index_size() } else { Some(0) };
         let Some(sz) = size else {
             self.note("draws with 8-bit indices are not rendered yet");
@@ -477,8 +491,10 @@ impl Cp {
             if vtx_loc != 0 {
                 self.set_reg(Space::Sh, vtx_loc, bv);
             }
+            let mut args = args;
             if inst_loc != 0 {
                 self.set_reg(Space::Sh, inst_loc, si);
+                args.first_instance = 0;
             }
             if id_enable && id_loc != 0 {
                 self.set_reg(Space::Sh, id_loc, i);
@@ -511,6 +527,40 @@ impl Cp {
         }
         let head: Vec<String> = (0..n.min(6)).map(|i| get(i).to_string()).collect();
         format!(" indices {lo}..{hi} [{}]", head.join(" "))
+    }
+
+    /// Whether a packet with the predicate bit executes under the current
+    /// SET_PREDICATION state, and what the predicate read (None: no
+    /// predication). ZPASS / PRIMCOUNT: begin/end counter pairs (16 bytes per
+    /// render backend, bit 63 valid); BOOL64 / BOOL32: a value in memory.
+    fn pred_value(&self) -> Option<(bool, String)> {
+        let pr = self.pred?;
+        let (visible, what) = match pr.op {
+            1 | 2 => {
+                if !guest_readable(pr.addr, 16 * 16) {
+                    return Some((true, format!("zpass {:#x} unreadable", pr.addr)));
+                }
+                let (mut sum, mut valid) = (0u64, 0);
+                for rb in 0..16u64 {
+                    let (b, e) = unsafe { (rd64(pr.addr + 16 * rb), rd64(pr.addr + 16 * rb + 8)) };
+                    if b >> 63 != 0 && e >> 63 != 0 {
+                        valid += 1;
+                        sum += (e & !(1 << 63)).wrapping_sub(b & !(1 << 63));
+                    }
+                }
+                (sum > 0, format!("zpass {sum} ({valid} valid pairs)"))
+            }
+            3 => {
+                let v = if guest_readable(pr.addr, 8) { unsafe { rd64(pr.addr) } } else { 0 };
+                (v != 0, format!("bool64 {v:#x}"))
+            }
+            4 => {
+                let v = if guest_readable(pr.addr, 4) { unsafe { rd32(pr.addr) } } else { 0 };
+                (v != 0, format!("bool32 {v:#x}"))
+            }
+            o => return Some((true, format!("op {o}"))),
+        };
+        Some((if pr.cond == 1 { visible } else { !visible }, what))
     }
 
     /// Index size in bytes (VGT_INDEX_TYPE), None for 8-bit indices.
@@ -692,7 +742,17 @@ impl Cp {
                 let base = addr64(p(1), p(2));
                 if p(0) == 2 { self.dispatch_indirect_base = base } else { self.draw_indirect_base = base }
             }
-            op::SET_PREDICATION => self.note("SET_PREDICATION recorded but not applied"),
+            op::SET_PREDICATION => {
+                let ctl = p(0);
+                let pop = (ctl >> 16) & 7;
+                let addr = addr64(p(1), p(2));
+                self.pred = (pop != 0).then_some(Pred { op: pop, cond: (ctl >> 8) & 1, addr, count: if n >= 4 { p(3) } else { 0 } });
+                self.note("SET_PREDICATION recorded but not applied");
+                if super::capture::capturing() {
+                    let what = self.pred_value().map(|(d, w)| format!("{w} -> {}", if d { "draw" } else { "skip" })).unwrap_or_else(|| "clear".into());
+                    super::capture::packet(self, &format!("SET_PREDICATION op {pop} cond {} wait {} addr {addr:#x} count {}: {what}", (ctl >> 8) & 1, (ctl >> 12) & 1, if n >= 4 { p(3) } else { 0 }));
+                }
+            }
             op::DRAW_INDEX_2 | op::DRAW_INDEX_AUTO | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT
             | op::DRAW_INDIRECT_MULTI | op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDEX_MULTI_AUTO => {
                 DRAWS.fetch_add(1, Ordering::Relaxed);
@@ -710,8 +770,13 @@ impl Cp {
                         // The CP hands the base vertex and start instance to the
                         // shader through the user SGPRs the packet names
                         // (BASE_VTX_LOC [15:0], START_INST_LOC [31:16]: SH
-                        // register offsets; as Mesa radeonsi emits them): the
-                        // instance id VGPR itself starts at 0.
+                        // register offsets; as Mesa radeonsi emits them), and
+                        // the instance id VGPR then starts at 0. Agc packets
+                        // name no locations (the title's indirect draws index
+                        // their instance data with a user SGPR that is 0 plus
+                        // the instance id): the start instance is then part
+                        // of the instance id, like the base vertex of the
+                        // vertex id.
                         let (vtx_loc, inst_loc) = (p(1) & 0xFFFF, p(1) >> 16);
                         let args = if opcode == op::DRAW_INDIRECT && valid(a, 16) {
                             let w = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12)] };
@@ -737,7 +802,12 @@ impl Cp {
                                 self.set_reg(Space::Sh, inst_loc, si);
                             }
                         }
-                        args.map(|(a, _, _)| a)
+                        args.map(|(mut a, _, _)| {
+                            if inst_loc != 0 {
+                                a.first_instance = 0;
+                            }
+                            a
+                        })
                     }
                     op::DRAW_INDIRECT_MULTI | op::DRAW_INDEX_INDIRECT_MULTI => {
                         multi = Some(self.draw_indirect_multi(opcode == op::DRAW_INDEX_INDIRECT_MULTI, p));
@@ -776,6 +846,11 @@ impl Cp {
                         op::DRAW_INDEX_AUTO => format!("DRAW_INDEX_AUTO count {} instances {}", p(0), self.num_instances),
                         op::DRAW_INDEX_OFFSET_2 => format!("DRAW_INDEX_OFFSET_2 count {} offset {} base {:#x}", p(2), p(1), self.index_base),
                         _ => format!("indirect draw opcode {opcode:#x} offset {:#x} base {:#x}{}", p(0), self.draw_indirect_base, indirect.take().map(|s| format!(" {s}")).unwrap_or_default()),
+                    };
+                    let what = match (h & 1 != 0).then(|| self.pred_value()) {
+                        Some(Some((d, w))) => format!("{what} predicated ({w}: {})", if d { "draw" } else { "skip" }),
+                        Some(None) => format!("{what} predicated (no predication set)"),
+                        None => what,
                     };
                     super::capture::draw(self, &what);
                 }
