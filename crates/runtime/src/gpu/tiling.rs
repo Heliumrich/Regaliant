@@ -4,8 +4,9 @@
 //! Follows Mesa addrlib (`src/amd/addrlib`, MIT; see docs/PROVENANCE.md):
 //! `Gfx10Lib::ComputeSurfaceInfoMacroTiled`, `GetSwizzlePatternInfo`
 //! (non-RB+ tables, as on gfx10.1 parts), `Lib::ComputeThinBlockDimension`,
-//! `Lib::ComputeOffsetFromSwizzlePattern`. Thin (2D, array, cube) surfaces
-//! only; 3D (thick) layouts are not implemented yet.
+//! `Lib::ComputeOffsetFromSwizzlePattern`. Thin (2D, array, cube) surfaces,
+//! and thick 3D surfaces with standard swizzles and one mip
+//! (`Lib::ComputeThickBlockDimension`, `ComputeSurfaceAddrFromCoordMacroTiled`).
 
 use super::swizzle_tables as t;
 
@@ -76,6 +77,117 @@ fn field_offset(p: &[u64; 20], bits: u32, field: u32, v: u32) -> u32 {
         }
     }
     off
+}
+
+/// Pattern info table of a 3D surface with a standard (thick) swizzle
+/// (`Gfx10Lib::GetSwizzlePatternInfo`, non-RB+).
+fn pattern_table_3d(sw: u32) -> Option<&'static [[u16; 5]]> {
+    Some(match sw {
+        5 => t::GFX10_SW_4K_S3_PATINFO,
+        9 => t::GFX10_SW_64K_S3_PATINFO,
+        17 => t::GFX10_SW_64K_S3_T_PATINFO,
+        21 => t::GFX10_SW_4K_S3_X_PATINFO,
+        25 => t::GFX10_SW_64K_S3_X_PATINFO,
+        _ => return None,
+    })
+}
+
+/// Whether a 3D surface with swizzle mode `sw` is thick (Z and standard
+/// swizzles; display and render-target swizzles keep 2D slices).
+pub fn is_thick_3d(sw: u32) -> bool {
+    matches!(sw, 4 | 5 | 8 | 9 | 16 | 17 | 20 | 21 | 24 | 25)
+}
+
+/// Thick 3D layout of one mip: blocks of bw x bh x bd elements; the surface
+/// is a stack of slabs of bd slices.
+#[derive(Clone, Debug)]
+pub struct Layout3d {
+    pub elem_log2: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub block_w: u32,
+    pub block_h: u32,
+    pub block_d: u32,
+    pub block_log2: u32,
+    pub pitch: u32,
+    pub padded_height: u32,
+    pub padded_depth: u32,
+    p: [u64; 20],
+}
+
+/// Single-mip thick 3D layout (standard swizzles), or None.
+pub fn layout_3d(sw: u32, elem_log2: u32, width: u32, height: u32, depth: u32) -> Option<Layout3d> {
+    let block_log2 = block_log2(sw)?;
+    let table = pattern_table_3d(sw)?;
+    let index = if is_xor(sw) { pipes_log2() * 5 + elem_log2 } else { elem_log2 } as usize;
+    let info = table.get(index)?;
+    let mut p = [0u64; 20];
+    p[..8].copy_from_slice(t::GFX10_SW_PATTERN_NIBBLE01.get(info[1] as usize)?);
+    p[8..12].copy_from_slice(t::GFX10_SW_PATTERN_NIBBLE2.get(info[2] as usize)?);
+    p[12..16].copy_from_slice(t::GFX10_SW_PATTERN_NIBBLE3.get(info[3] as usize)?);
+    p[16..20].copy_from_slice(t::GFX10_SW_PATTERN_NIBBLE4.get(info[4] as usize)?);
+    // Lib::ComputeThickBlockDimension: 1 KiB blocks per element size, grown
+    // evenly over the three dimensions (depth first, then height).
+    const BLOCK_1K_3D: [(u32, u32, u32); 5] = [(16, 8, 8), (8, 8, 8), (8, 8, 4), (8, 4, 4), (4, 4, 4)];
+    let (w0, h0, d0) = *BLOCK_1K_3D.get(elem_log2 as usize)?;
+    let in_1k = block_log2.checked_sub(10)?;
+    let (avg, rest) = (in_1k / 3, in_1k % 3);
+    let (bw, bh, bd) = (w0 << avg, h0 << (avg + rest / 2), d0 << (avg + u32::from(rest != 0)));
+    let (width, height, depth) = (width.max(1), height.max(1), depth.max(1));
+    Some(Layout3d {
+        elem_log2,
+        width,
+        height,
+        depth,
+        block_w: bw,
+        block_h: bh,
+        block_d: bd,
+        block_log2,
+        pitch: width.next_multiple_of(bw),
+        padded_height: height.next_multiple_of(bh),
+        padded_depth: depth.next_multiple_of(bd),
+        p,
+    })
+}
+
+impl Layout3d {
+    /// Bytes of one slab of block_d slices.
+    fn slab_size(&self) -> u64 {
+        self.pitch as u64 * self.padded_height as u64 * self.block_d as u64 * (1u64 << self.elem_log2)
+    }
+
+    /// Total bytes.
+    pub fn size(&self) -> u64 {
+        self.slab_size() * (self.padded_depth / self.block_d) as u64
+    }
+
+    /// Byte offset of element (x, y, z).
+    pub fn offset(&self, x: u32, y: u32, z: u32) -> u64 {
+        let pb = (self.pitch / self.block_w) as u64;
+        let blk = (y / self.block_h) as u64 * pb + (x / self.block_w) as u64;
+        let inner = field_offset(&self.p, self.block_log2, 0, x) ^ field_offset(&self.p, self.block_log2, 1, y) ^ field_offset(&self.p, self.block_log2, 2, z);
+        (z / self.block_d) as u64 * self.slab_size() + (blk << self.block_log2) + inner as u64
+    }
+
+    /// The whole volume as tightly packed rows and slices.
+    pub fn detile(&self, src: &[u8], dst: &mut Vec<u8>) {
+        let e = 1usize << self.elem_log2;
+        dst.clear();
+        dst.resize(self.width as usize * self.height as usize * self.depth as usize * e, 0);
+        let mut d = 0;
+        for z in 0..self.depth {
+            for y in 0..self.height {
+                for x in 0..self.width {
+                    let o = self.offset(x, y, z) as usize;
+                    if o + e <= src.len() {
+                        dst[d..d + e].copy_from_slice(&src[o..o + e]);
+                    }
+                    d += e;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -256,6 +368,31 @@ mod tests {
                 seen[o / 4] = true;
             }
         }
+    }
+
+    #[test]
+    fn thick_64k_standard() {
+        // RGBA8 in 64 KiB thick blocks: 32 x 32 x 16 (addrlib Block1K_3d
+        // (8, 8, 4) times 4 in each dimension); a bijection within a block.
+        let l = layout_3d(9, 2, 128, 128, 128).unwrap();
+        assert_eq!((l.block_w, l.block_h, l.block_d), (32, 32, 16));
+        assert_eq!(l.size(), 128 * 128 * 128 * 4);
+        let mut seen = vec![false; 32 * 32 * 16];
+        for z in 0..16 {
+            for y in 0..32 {
+                for x in 0..32 {
+                    let o = l.offset(x, y, z) as usize;
+                    assert_eq!(o % 4, 0);
+                    assert!(o < 65536 && !seen[o / 4]);
+                    seen[o / 4] = true;
+                }
+            }
+        }
+        // RGBA16F: 32 x 16 x 16; 4 KiB blocks of RGBA8: 8 x 16 x 8.
+        let l = layout_3d(9, 3, 214, 120, 72).unwrap();
+        assert_eq!((l.block_w, l.block_h, l.block_d), (32, 16, 16));
+        let l = layout_3d(5, 2, 64, 64, 64).unwrap();
+        assert_eq!((l.block_w, l.block_h, l.block_d), (8, 16, 8));
     }
 
     #[test]

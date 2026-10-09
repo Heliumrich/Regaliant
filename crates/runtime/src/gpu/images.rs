@@ -645,7 +645,7 @@ impl Images {
     fn upload_inner(&mut self, image: vk::Image, key: ImageKey, t: &Tsharp) -> Result<(u64, u64), String> {
         let first = !self.map.contains_key(&key);
         if key.ty3d {
-            return Err("3D (thick) texture layouts are not implemented".into());
+            return self.upload_3d(image, key, t, first);
         }
         let el = elem_log2(t.format).ok_or("unknown element size")?;
         let block = is_block(t.format);
@@ -719,6 +719,50 @@ impl Images {
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[b]);
             c.device.cmd_copy_buffer_to_image(cmd, buf, image, vk::ImageLayout::GENERAL, &regions);
+            let a = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[a], &[], &[]);
+        });
+        unsafe {
+            c.device.destroy_buffer(buf, None);
+            c.device.unmap_memory(mem);
+            c.device.free_memory(mem, None);
+        }
+        self.uploads += 1;
+        Ok((t.base, size))
+    }
+
+    /// Uploads a 3D texture (one mip, thick standard swizzle).
+    fn upload_3d(&mut self, image: vk::Image, key: ImageKey, t: &Tsharp, first: bool) -> Result<(u64, u64), String> {
+        if !tiling::is_thick_3d(t.sw_mode) || key.levels > 1 || is_block(t.format) {
+            return Err(format!("3D texture layout not implemented (swizzle mode {}, {} mips)", t.sw_mode, key.levels));
+        }
+        let el = elem_log2(t.format).ok_or("unknown element size")?;
+        let lay = tiling::layout_3d(t.sw_mode, el, key.width, key.height, key.layers).ok_or_else(|| format!("3D swizzle mode {} not supported", t.sw_mode))?;
+        let size = lay.size();
+        if !super::cp::guest_readable(t.base, size) {
+            return Err(format!("3D texture {:#x}+{size:#x} not mapped", t.base));
+        }
+        let src = unsafe { std::slice::from_raw_parts(t.base as *const u8, size as usize) };
+        let mut staging = Vec::new();
+        lay.detile(src, &mut staging);
+        let c = ctx();
+        let (buf, mem, ptr) = c.host_buffer(staging.len().max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
+        unsafe { std::ptr::copy_nonoverlapping(staging.as_ptr(), ptr, staging.len()) };
+        let region = vk::BufferImageCopy::default()
+            .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 })
+            .image_extent(vk::Extent3D { width: key.width, height: key.height, depth: key.layers });
+        let base = t.base;
+        self.one_shot(|cmd| unsafe {
+            super::vk::checkpoint(cmd, super::vk::mark::UPLOAD, base);
+            let b = vk::ImageMemoryBarrier::default()
+                .old_layout(if first { vk::ImageLayout::UNDEFINED } else { vk::ImageLayout::GENERAL })
+                .new_layout(vk::ImageLayout::GENERAL)
+                .image(image)
+                .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS })
+                .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[b]);
+            c.device.cmd_copy_buffer_to_image(cmd, buf, image, vk::ImageLayout::GENERAL, &[region]);
             let a = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[a], &[], &[]);
         });
