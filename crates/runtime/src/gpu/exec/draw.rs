@@ -122,6 +122,8 @@ pub(crate) fn color_surface(cp: &Cp, n: u32) -> Result<Option<Surface>, String> 
     let a2 = ctx_reg(cp, 0x28EC0 + 4 * n);
     let a3 = ctx_reg(cp, 0x28EE0 + 4 * n);
     let view = r(0xC);
+    // DCC (INFO.DCC_ENABLE): fast clears write only its metadata.
+    let meta = if info & (1 << 28) != 0 { ((r(0x34) as u64) << 8) | ((ctx_reg(cp, 0x28EA0 + 4 * n) as u64 & 0xFF) << 40) } else { 0 };
     Ok(Some(Surface {
         base,
         format,
@@ -133,6 +135,8 @@ pub(crate) fn color_surface(cp: &Cp, n: u32) -> Result<Option<Surface>, String> 
         mip: (view >> 26) & 0xF,
         slice: view & 0x1FFF,
         stencil_base: 0,
+        meta,
+        clear: [r(0x2C), r(0x30)],
     }))
 }
 
@@ -165,6 +169,9 @@ fn depth_surface(cp: &Cp) -> Option<Surface> {
         mip: (view >> 26) & 0xF,
         slice,
         stencil_base: if sinfo & 1 != 0 { stencil_base } else { 0 },
+        // HTILE (Z_INFO.TILE_SURFACE_ENABLE); DB_DEPTH_CLEAR, DB_STENCIL_CLEAR.
+        meta: if zinfo & (1 << 29) != 0 { ((ctx_reg(cp, 0x28014) as u64) << 8) | ((ctx_reg(cp, 0x28078) as u64 & 0xFF) << 40) } else { 0 },
+        clear: [ctx_reg(cp, 0x2802C), ctx_reg(cp, 0x28028)],
     })
 }
 
@@ -533,6 +540,13 @@ impl Exec {
                 r
             }
         };
+        // Fast clears (metadata writes) of the attachments and textures.
+        let mut used: Vec<images::ImageKey> = colors.iter().flatten().chain(depth.iter()).map(|t| t.key).collect();
+        used.extend(image_keys(&vs));
+        if let Some(p) = &ps {
+            used.extend(image_keys(p));
+        }
+        self.resolve_fast_clears(&used);
         // Resources.
         let mut stages: Vec<&mut Prepared> = vec![&mut vs];
         if let Some(p) = ps.as_mut() {
@@ -609,7 +623,16 @@ impl Exec {
             c.device.cmd_set_rasterizer_discard_enable(cmd, false);
             c.device.cmd_set_depth_test_enable(cmd, z_test);
             c.device.cmd_set_depth_write_enable(cmd, z_write);
-            c.device.cmd_set_depth_compare_op(cmd, compare_op(dctl >> 4));
+            // DS_DEPTH_EQUAL_BIAS=<units> (diagnosis): EQUAL tests without
+            // depth writes pass a little in front of the stored depth instead
+            // (reversed Z when the depth clear value is 0).
+            static EQ_BIAS: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+            let eq_bias = (*EQ_BIAS.get_or_init(|| std::env::var("DS_DEPTH_EQUAL_BIAS").ok().and_then(|v| v.parse().ok()))).filter(|_| z_test && !z_write && (dctl >> 4) & 7 == 2);
+            let reversed = f32r(reg(0x2802C)) == 0.0;
+            match eq_bias {
+                Some(_) => c.device.cmd_set_depth_compare_op(cmd, if reversed { vk::CompareOp::GREATER_OR_EQUAL } else { vk::CompareOp::LESS_OR_EQUAL }),
+                None => c.device.cmd_set_depth_compare_op(cmd, compare_op(dctl >> 4)),
+            }
             c.device.cmd_set_depth_bounds_test_enable(cmd, false);
             c.device.cmd_set_stencil_test_enable(cmd, s_test);
             let back = dctl & (1 << 7) != 0;
@@ -628,8 +651,10 @@ impl Exec {
             // PA_SU_SC_MODE_CNTL.POLY_OFFSET_FRONT/BACK_ENABLE with
             // PA_SU_POLY_OFFSET_* (scale in 1/16 units).
             let poly_offset = mode & (3 << 11) != 0;
-            c.device.cmd_set_depth_bias_enable(cmd, poly_offset);
-            if poly_offset {
+            c.device.cmd_set_depth_bias_enable(cmd, poly_offset || eq_bias.is_some());
+            if let (Some(units), false) = (eq_bias, poly_offset) {
+                c.device.cmd_set_depth_bias(cmd, if reversed { units } else { -units }, 0.0, 0.0);
+            } else if poly_offset {
                 let (sr, or) = if mode & (1 << 11) != 0 { (0x28B80, 0x28B84) } else { (0x28B88, 0x28B8C) };
                 c.device.cmd_set_depth_bias(cmd, f32r(reg(or)), f32r(reg(0x28B7C)), f32r(reg(sr)) / 16.0);
             }
@@ -645,9 +670,11 @@ impl Exec {
                     };
                     let ty = if size == 4 { vk::IndexType::UINT32 } else { vk::IndexType::UINT16 };
                     c.device.cmd_bind_index_buffer(cmd, buffer, addr - start, ty);
-                    c.device.cmd_draw_indexed(cmd, a.count, a.instances, 0, base_vertex, a.first_instance);
+                    // Instance ids start at 0 as on the hardware (shaders add
+                    // the start instance from a user SGPR, see the CP).
+                    c.device.cmd_draw_indexed(cmd, a.count, a.instances, 0, base_vertex, 0);
                 }
-                None => c.device.cmd_draw(cmd, a.count, a.instances, base_vertex as u32, a.first_instance),
+                None => c.device.cmd_draw(cmd, a.count, a.instances, base_vertex as u32, 0),
             }
         }
         for b in bounds {

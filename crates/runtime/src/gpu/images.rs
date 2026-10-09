@@ -194,7 +194,7 @@ pub fn cb_format(fmt: u32, ntype: u32, swap: u32) -> Option<vk::Format> {
     })
 }
 
-fn half_to_f32(h: u16) -> f32 {
+pub fn half_to_f32(h: u16) -> f32 {
     let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let e = ((h >> 10) & 0x1F) as i32;
     let m = (h & 0x3FF) as f32;
@@ -326,6 +326,18 @@ pub struct Surface {
     pub slice: u32,
     /// Address of the stencil plane (depth/stencil surfaces with stencil).
     pub stencil_base: u64,
+    /// Metadata a fast clear writes (DCC of color, HTILE of depth; 0: none).
+    pub meta: u64,
+    /// Clear values: CB_COLOR_CLEAR_WORD0/1, or DB_DEPTH_CLEAR and DB_STENCIL_CLEAR.
+    pub clear: [u32; 2],
+}
+
+/// A fast clear found pending for an image: its metadata and clear values.
+pub struct FastClear {
+    pub key: ImageKey,
+    pub image: vk::Image,
+    pub meta: u64,
+    pub clear: [u32; 2],
 }
 
 /// UNORM equivalent of sRGB formats (storage views cannot be sRGB).
@@ -419,6 +431,10 @@ pub struct Images {
     gpu_bases: std::collections::HashSet<u64>,
     /// Depth/stencil image of each rendered stencil plane address.
     stencil_of: HashMap<u64, ImageKey>,
+    /// Surface of each metadata address (DCC, HTILE) and its clear values.
+    meta_of: HashMap<u64, (ImageKey, [u32; 2])>,
+    /// Images whose metadata a GPU or CP write covered since (fast clears).
+    pending_clears: HashMap<ImageKey, u64>,
     samplers: HashMap<([u32; 4], bool), vk::Sampler>,
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
@@ -446,7 +462,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
                 .expect("image pool");
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
-            *g = Some(Images { map: HashMap::new(), gpu_bases: Default::default(), stencil_of: HashMap::new(), samplers: HashMap::new(), pool, cmd, fence, reported: HashMap::new(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0 });
+            *g = Some(Images { map: HashMap::new(), gpu_bases: Default::default(), stencil_of: HashMap::new(), meta_of: HashMap::new(), pending_clears: HashMap::new(), samplers: HashMap::new(), pool, cmd, fence, reported: HashMap::new(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0 });
         }
     }
     f(g.as_mut().unwrap())
@@ -697,6 +713,45 @@ impl Images {
         exact.map(|_| (*key, "exact"))
     }
 
+    /// Notes writes (GPU buffer writes, CP DMA) that cover the metadata of a
+    /// rendered surface: fast clears, resolved at the surface's next use.
+    pub fn note_meta_writes(&mut self, writes: &[(u64, u64)]) {
+        if self.meta_of.is_empty() {
+            return;
+        }
+        for &(b, n) in writes {
+            for (&meta, &(key, _)) in &self.meta_of {
+                if meta >= b && meta < b.saturating_add(n) {
+                    self.pending_clears.insert(key, meta);
+                }
+            }
+        }
+    }
+
+    /// Whether any of `keys` has a fast clear pending.
+    pub fn clears_pending(&self, keys: &[ImageKey]) -> bool {
+        !self.pending_clears.is_empty() && keys.iter().any(|k| self.pending_clears.contains_key(k))
+    }
+
+    /// Takes the pending fast clears of `keys`.
+    pub fn take_clears(&mut self, keys: &[ImageKey]) -> Vec<FastClear> {
+        let mut out = Vec::new();
+        for k in keys {
+            let Some(meta) = self.pending_clears.remove(k) else { continue };
+            let (Some(img), Some(&(_, clear))) = (self.map.get(k), self.meta_of.get(&meta)) else { continue };
+            if out.iter().any(|c: &FastClear| c.key == *k) {
+                continue;
+            }
+            out.push(FastClear { key: *k, image: img.image, meta, clear });
+        }
+        out
+    }
+
+    /// The cached image a T# would use now (fast-clear checks; no side effects).
+    pub fn resolved_key(&self, t: &Tsharp, storage: bool) -> Option<ImageKey> {
+        self.lookup(&Self::key_of(t)?, storage).map(|(k, _)| k)
+    }
+
     /// Image for a T#: an existing GPU image at that address with a
     /// compatible size, or a texture uploaded from guest memory.
     fn image_for(&mut self, t: &Tsharp, frame: u64, storage: bool) -> Result<ImageKey, String> {
@@ -839,6 +894,9 @@ impl Images {
             self.stencil_of.insert(s.stencil_base, k);
             self.gpu_bases.insert(s.stencil_base);
         }
+        if s.meta != 0 {
+            self.meta_of.insert(s.meta, (k, s.clear));
+        }
         img.source = None;
         Ok(k)
     }
@@ -880,10 +938,22 @@ impl Images {
 
     /// Reads mip 0 / layer 0 of a color image back (tightly packed texels).
     pub fn read_back(&mut self, image: vk::Image, format: vk::Format, width: u32, height: u32) -> Result<Vec<u8>, String> {
-        let bpp = texel_bytes(format) as u64;
-        if bpp == 0 || is_compressed(format) || is_depth(format) {
+        if texel_bytes(format) == 0 || is_compressed(format) || is_depth(format) {
             return Err(format!("read back of {format:?} unsupported"));
         }
+        self.read_back_aspect(image, format, vk::ImageAspectFlags::COLOR, width, height)
+    }
+
+    /// Reads mip 0 / layer 0 of one aspect back: color texels, depth as 32-bit
+    /// float (D32 formats) or 16-bit unorm (D16), stencil as bytes.
+    pub fn read_back_aspect(&mut self, image: vk::Image, format: vk::Format, aspect: vk::ImageAspectFlags, width: u32, height: u32) -> Result<Vec<u8>, String> {
+        let bpp = if aspect == vk::ImageAspectFlags::STENCIL {
+            1
+        } else if aspect == vk::ImageAspectFlags::DEPTH {
+            if matches!(format, vk::Format::D16_UNORM | vk::Format::D16_UNORM_S8_UINT) { 2 } else { 4 }
+        } else {
+            texel_bytes(format) as u64
+        };
         let size = bpp * width as u64 * height as u64;
         let c = ctx();
         let (buf, mem, ptr) = c.host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST)?;
@@ -891,7 +961,7 @@ impl Images {
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
             let region = vk::BufferImageCopy::default()
-                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 })
+                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: 1 })
                 .image_extent(vk::Extent3D { width, height, depth: 1 });
             c.device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::GENERAL, buf, &[region]);
             let hb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
@@ -926,6 +996,44 @@ impl Images {
                 n += 1;
             }
         }
+        // Depth surfaces: depth statistics and the stencil values present.
+        let mut dkeys: Vec<ImageKey> = self.map.values().filter(|i| i.gpu_written && is_depth(i.key.format)).map(|i| i.key).collect();
+        dkeys.sort_by_key(|k| k.base);
+        for k in dkeys.into_iter().take(64) {
+            let image = self.map[&k].image;
+            let name = format!("{:010x}_{}x{}_{:?}", k.base, k.width, k.height, k.format);
+            if aspects(k.format).contains(vk::ImageAspectFlags::DEPTH) {
+                if let Ok(raw) = self.read_back_aspect(image, k.format, vk::ImageAspectFlags::DEPTH, k.width, k.height) {
+                    if raw.len() as u64 == 4 * k.width as u64 * k.height as u64 {
+                        if let Some(s) = float_stats(vk::Format::R32_SFLOAT, &raw) {
+                            stats.push_str(&format!("{name} depth: {s}\n"));
+                        }
+                        // Depth as gray, scaled to the largest value.
+                        let d: Vec<f32> = raw.chunks_exact(4).map(|p| f32::from_le_bytes([p[0], p[1], p[2], p[3]])).collect();
+                        let max = d.iter().copied().filter(|v| v.is_finite()).fold(0f32, f32::max).max(f32::MIN_POSITIVE);
+                        let gray: Vec<u8> = d.iter().flat_map(|&v| {
+                            let g = ((v / max).clamp(0.0, 1.0) * 255.0) as u8;
+                            [g, g, g, 255]
+                        }).collect();
+                        let _ = std::fs::write(dir.join(format!("{name}_depth.png")), super::png::encode(k.width, k.height, &gray));
+                    }
+                }
+            }
+            if has_stencil(k.format) {
+                if let Ok(raw) = self.read_back_aspect(image, k.format, vk::ImageAspectFlags::STENCIL, k.width, k.height) {
+                    let mut hist = [0u64; 256];
+                    for &v in &raw {
+                        hist[v as usize] += 1;
+                    }
+                    let mut top: Vec<(u64, usize)> = hist.iter().enumerate().filter(|&(_, &c)| c > 0).map(|(v, &c)| (c, v)).collect();
+                    top.sort_unstable_by(|a, b| b.cmp(a));
+                    let list: Vec<String> = top.iter().take(12).map(|(c, v)| format!("{v:#04x}: {c}")).collect();
+                    stats.push_str(&format!("{name} stencil: {}\n", list.join(", ")));
+                    let gray: Vec<u8> = raw.iter().flat_map(|&v| [v, v, v, 255]).collect();
+                    let _ = std::fs::write(dir.join(format!("{name}_stencil.png")), super::png::encode(k.width, k.height, &gray));
+                }
+            }
+        }
         let _ = std::fs::write(dir.join("stats.txt"), stats);
         n
     }
@@ -943,9 +1051,19 @@ impl Images {
     /// The cached image a T# resolves to (mip 0, layer 0): raw texels in its
     /// Vulkan format, width, height and bytes per texel (diagnostics).
     pub fn snapshot_raw(&mut self, t: &Tsharp) -> Result<(Vec<u8>, u32, u32, u32), String> {
-        let key = Self::key_of(t).ok_or("unsupported format")?;
-        let key = if self.map.contains_key(&key) { key } else { self.alias(&key, false).ok_or("not cached")? };
+        let want = Self::key_of(t).ok_or("unsupported format")?;
+        let key = match self.lookup(&want, false) {
+            Some((k, _)) => k,
+            None => self.alias(&want, false).ok_or("not cached")?,
+        };
         let image = self.map[&key].image;
+        if is_depth(key.format) {
+            // Rendered depth or stencil read as a texture (R32F / R16 / R8 uint).
+            let aspect = if want.format == vk::Format::R8_UINT { vk::ImageAspectFlags::STENCIL } else { vk::ImageAspectFlags::DEPTH };
+            let raw = self.read_back_aspect(image, key.format, aspect, key.width, key.height)?;
+            let texel = (raw.len() as u64 / (key.width as u64 * key.height as u64).max(1)) as u32;
+            return Ok((raw, key.width, key.height, texel));
+        }
         let raw = self.read_back(image, key.format, key.width, key.height)?;
         Ok((raw, key.width, key.height, texel_bytes(key.format)))
     }

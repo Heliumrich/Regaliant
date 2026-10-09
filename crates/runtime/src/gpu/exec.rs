@@ -45,6 +45,8 @@ pub static ACTION_NS: AtomicU64 = AtomicU64::new(0);
 static WATCHDOG_PTR: std::sync::atomic::AtomicPtr<u32> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 /// Invocations stopped by the loop watchdog (`rdna::translate::LOOP_LIMIT`).
 pub static WATCHDOG_STOPS: AtomicU64 = AtomicU64::new(0);
+/// Fast clears performed (metadata writes, see `Exec::resolve_fast_clears`).
+pub static FAST_CLEARS: AtomicU64 = AtomicU64::new(0);
 
 /// GPU execution enabled (`DS_GPU=1`) and Vulkan available.
 pub fn enabled() -> bool {
@@ -631,6 +633,49 @@ fn completion_thread() {
     }
 }
 
+/// Image cache keys of the images a prepared stage binds (fast-clear checks).
+pub(crate) fn image_keys(p: &Prepared) -> Vec<super::images::ImageKey> {
+    let mut v = Vec::new();
+    for (i, r) in p.resources.iter().enumerate() {
+        if let Resolved::Image(t) = r {
+            let storage = p.tr.plan.resources.get(i).is_some_and(|x| x.written);
+            if let Some(k) = super::images::with(|im| im.resolved_key(t, storage)) {
+                v.push(k);
+            }
+        }
+    }
+    v
+}
+
+/// Clear color of a DCC fast-clear code (gfx10: 00 -> 0000, 40 -> 0001,
+/// 80 -> 1110, C0 -> 1111, RGBA; 20 -> the CLEAR_WORD registers; FF:
+/// uncompressed, nothing to clear). Codes from Mesa radeonsi si_clear.c.
+fn dcc_clear_color(code: u32, format: vk::Format, words: [u32; 2]) -> Result<Option<vk::ClearColorValue>, String> {
+    let f = |v: [f32; 4]| Some(vk::ClearColorValue { float32: v });
+    match code {
+        0x00 => Ok(f([0.0, 0.0, 0.0, 0.0])),
+        0x40 => Ok(f([0.0, 0.0, 0.0, 1.0])),
+        0x80 => Ok(f([1.0, 1.0, 1.0, 0.0])),
+        0xC0 => Ok(f([1.0, 1.0, 1.0, 1.0])),
+        0xFF => Ok(None),
+        // 0x10 (seen on the 64-bit lit-scene target with CLEAR_WORD 0): taken
+        // as a clear to the registers like 0x20 (assumption, not verified).
+        0x10 | 0x20 => {
+            let h = |x: u32| super::images::half_to_f32(x as u16);
+            match format {
+                vk::Format::R16G16B16A16_SFLOAT => Ok(f([h(words[0]), h(words[0] >> 16), h(words[1]), h(words[1] >> 16)])),
+                vk::Format::R32_SFLOAT => Ok(f([f32::from_bits(words[0]), 0.0, 0.0, 0.0])),
+                vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB => {
+                    let u = |s: u32| ((words[0] >> s) & 0xFF) as f32 / 255.0;
+                    Ok(f([u(0), u(8), u(16), u(24)]))
+                }
+                _ => Err(format!("DCC clear-register code for {format:?} not supported")),
+            }
+        }
+        c => Err(format!("DCC code {c:#x} not supported")),
+    }
+}
+
 /// Reports invocations the loop watchdog stopped (after each completed
 /// batch): once per program, which is saved for analysis.
 fn check_watchdog(queue: &str, shaders: &[u64]) {
@@ -932,6 +977,62 @@ impl Exec {
         self.ring_used = 0;
     }
 
+    /// Performs the fast clears pending for `keys` before they are used: the
+    /// title clears DCC and HTILE surfaces by writing only their metadata
+    /// (e.g. zero-filling a HUD layer's DCC each frame); images here are
+    /// never compressed, so the metadata is read back and the image cleared.
+    /// Runs before a draw or dispatch reserves its slot (it flushes).
+    pub(crate) fn resolve_fast_clears(&mut self, keys: &[super::images::ImageKey]) {
+        if keys.is_empty() || !super::images::with(|im| im.clears_pending(keys)) {
+            return;
+        }
+        // The metadata write may still be in flight.
+        self.end_rendering();
+        self.flush();
+        let clears = super::images::with(|im| im.take_clears(keys));
+        for c in clears {
+            if !super::cp::guest_readable(c.meta, 4) {
+                continue;
+            }
+            let v = unsafe { std::ptr::read_volatile(c.meta as *const u32) };
+            let k = c.key;
+            let full = vk::ImageSubresourceRange { aspect_mask: super::images::aspects(k.format), base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS };
+            let what = if super::images::is_depth(k.format) {
+                // HTILE: 0 = depth and stencil cleared; all ones = expanded.
+                if v == u32::MAX {
+                    continue;
+                }
+                if v != 0 {
+                    self.report(format!("images: HTILE value {v:#x} of {:#x} not interpreted (no clear)", k.base));
+                    continue;
+                }
+                let value = vk::ClearDepthStencilValue { depth: f32::from_bits(c.clear[0]), stencil: c.clear[1] & 0xFF };
+                self.begin();
+                unsafe { ctx().device.cmd_clear_depth_stencil_image(self.cmd(), c.image, vk::ImageLayout::GENERAL, &value, &[full]) };
+                format!("depth {} stencil {}", value.depth, value.stencil)
+            } else {
+                match dcc_clear_color(v & 0xFF, k.format, c.clear) {
+                    Ok(Some(color)) => {
+                        self.begin();
+                        unsafe { ctx().device.cmd_clear_color_image(self.cmd(), c.image, vk::ImageLayout::GENERAL, &color, &[full]) };
+                        format!("DCC code {:#x}", v & 0xFF)
+                    }
+                    Ok(None) => continue,
+                    Err(e) => {
+                        self.report(format!("images: fast clear of {:#x}: {e}", k.base));
+                        continue;
+                    }
+                }
+            };
+            global_barrier(self.cmd());
+            FAST_CLEARS.fetch_add(1, Ordering::Relaxed);
+            static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+            if SEEN.lock().get_or_insert_with(HashSet::new).insert(k.base) {
+                crate::info!("images: fast clear of {:#x} {}x{} {:?} ({what}; metadata {:#x})", k.base, k.width, k.height, k.format, c.meta);
+            }
+        }
+    }
+
     /// Submits recorded work and waits for all of this queue's GPU work and
     /// deferred effects.
     pub fn flush(&mut self) {
@@ -1230,6 +1331,7 @@ impl Exec {
         }
         let t_prep = t0.elapsed();
         trace_loads(&self.name, &p, groups);
+        self.resolve_fast_clears(&image_keys(&p));
         let (pipeline, layout, set_layout) = shared().pipeline(&p)?;
         let t_pipe = t0.elapsed();
         self.reserve(&[&p]);
@@ -1246,6 +1348,7 @@ impl Exec {
             }
         }
         let writes_here = std::mem::take(&mut bound.writes);
+        super::images::with(|im| im.note_meta_writes(&writes_here));
         self.write_set(set, std::slice::from_ref(&bound));
         self.end_rendering();
         let c = ctx();
@@ -1383,7 +1486,7 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} buffers shadowed in VRAM, {} not for lack of space), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} buffers shadowed in VRAM, {} not for lack of space), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         SHADOWED.load(Ordering::Relaxed),
         SHADOW_FULL.load(Ordering::Relaxed),
@@ -1392,6 +1495,7 @@ pub fn status() -> String {
         draw::DRAW_NOOP.load(Ordering::Relaxed),
         draw::DRAW_SKIPPED.load(Ordering::Relaxed),
         WATCHDOG_STOPS.load(Ordering::Relaxed),
+        FAST_CLEARS.load(Ordering::Relaxed),
         FLUSHES.load(Ordering::Relaxed),
         verify::status(),
         super::cp::sync_summary()

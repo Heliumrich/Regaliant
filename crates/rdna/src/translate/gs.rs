@@ -24,6 +24,7 @@ pub fn rect_list_gs(param_mask: u32) -> Vec<u32> {
     let per_vertex = b.type_struct([v4]);
     b.decorate(per_vertex, Decoration::Block, []);
     b.member_decorate(per_vertex, 0, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::Position)]);
+    b.member_decorate(per_vertex, 0, Decoration::Invariant, []);
     let arr_pv = b.type_array(per_vertex, three);
     let p_in_pv = b.type_pointer(None, StorageClass::Input, arr_pv);
     let gl_in = global(&mut b, p_in_pv, StorageClass::Input);

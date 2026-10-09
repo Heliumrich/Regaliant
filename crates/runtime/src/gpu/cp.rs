@@ -439,6 +439,60 @@ impl Cp {
         self.exec = Some(e);
     }
 
+    /// DRAW_INDIRECT_MULTI / DRAW_INDEX_INDIRECT_MULTI: draws described by
+    /// consecutive argument records (as Mesa radeonsi emits the packet: data
+    /// offset; BASE_VTX_LOC | START_INST_LOC << 16; DRAW_INDEX_LOC | bit 30
+    /// count from memory | bit 31 draw index enable; count; count address;
+    /// stride). Each draw gets its base vertex, start instance and draw index
+    /// in the user SGPRs the packet names. Returns the outcome summary.
+    fn draw_indirect_multi(&mut self, indexed: bool, p: &dyn Fn(u64) -> u32) -> String {
+        // Arguments and counts may have been written by earlier GPU work.
+        self.sync();
+        let (vtx_loc, inst_loc, id_loc) = (p(1) & 0xFFFF, p(1) >> 16, p(2) & 0xFFFF);
+        let id_enable = p(2) & (1 << 31) != 0;
+        let mut count = p(3);
+        if p(2) & (1 << 30) != 0 {
+            let ca = addr64(p(4), p(5));
+            count = if valid(ca, 4) { count.min(unsafe { rd32(ca) }) } else { 0 };
+        }
+        let rec = if indexed { 20 } else { 16 };
+        let stride = if p(6) != 0 { p(6) as u64 } else { rec };
+        let size = if indexed { self.index_size() } else { Some(0) };
+        let Some(sz) = size else {
+            self.note("draws with 8-bit indices are not rendered yet");
+            return "not executed (8-bit indices)".into();
+        };
+        let (mut drawn, mut outcome) = (0u32, String::new());
+        for i in 0..count.min(1 << 16) {
+            let a = self.draw_indirect_base + p(0) as u64 + i as u64 * stride;
+            if !valid(a, rec) {
+                break;
+            }
+            let w = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), if indexed { rd32(a + 16) } else { 0 }] };
+            let (args, bv, si) = if indexed {
+                (super::exec::DrawArgs { count: w[0], instances: w[1], index: Some((self.index_base + w[2] as u64 * sz as u64, sz)), base_vertex: Some(w[3] as i32), first_instance: w[4] }, w[3], w[4])
+            } else {
+                (super::exec::DrawArgs { count: w[0], instances: w[1], index: None, base_vertex: Some(w[2] as i32), first_instance: w[3] }, w[2], w[3])
+            };
+            if vtx_loc != 0 {
+                self.set_reg(Space::Sh, vtx_loc, bv);
+            }
+            if inst_loc != 0 {
+                self.set_reg(Space::Sh, inst_loc, si);
+            }
+            if id_enable && id_loc != 0 {
+                self.set_reg(Space::Sh, id_loc, i);
+            }
+            if args.count == 0 || args.instances == 0 {
+                continue;
+            }
+            self.draw(args);
+            drawn += 1;
+            outcome = std::mem::take(&mut self.last_draw);
+        }
+        format!("{drawn} of {count} draws ({})", if drawn > 0 { outcome } else { "none".into() })
+    }
+
     /// Index size in bytes (VGT_INDEX_TYPE), None for 8-bit indices.
     fn index_size(&self) -> Option<u32> {
         match self.reg(Space::Uc, crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE) & 3 {
@@ -623,6 +677,7 @@ impl Cp {
             | op::DRAW_INDIRECT_MULTI | op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDEX_MULTI_AUTO => {
                 DRAWS.fetch_add(1, Ordering::Relaxed);
                 let instances = self.num_instances;
+                let mut multi: Option<String> = None;
                 let args = match opcode {
                     op::DRAW_INDEX_AUTO => Some(super::exec::DrawArgs { count: p(0), instances, index: None, base_vertex: None, first_instance: 0 }),
                     op::DRAW_INDEX_2 => self.index_size().map(|sz| super::exec::DrawArgs { count: p(3), instances, index: Some((addr64(p(1), p(2)), sz)), base_vertex: None, first_instance: 0 }),
@@ -631,22 +686,41 @@ impl Cp {
                         // Arguments may have been written by earlier GPU work.
                         self.sync();
                         let a = self.draw_indirect_base + p(0) as u64;
-                        if opcode == op::DRAW_INDIRECT && valid(a, 16) {
+                        // The CP hands the base vertex and start instance to the
+                        // shader through the user SGPRs the packet names
+                        // (BASE_VTX_LOC [15:0], START_INST_LOC [31:16]: SH
+                        // register offsets; as Mesa radeonsi emits them): the
+                        // instance id VGPR itself starts at 0.
+                        let (vtx_loc, inst_loc) = (p(1) & 0xFFFF, p(1) >> 16);
+                        let args = if opcode == op::DRAW_INDIRECT && valid(a, 16) {
                             let w = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12)] };
-                            Some(super::exec::DrawArgs { count: w[0], instances: w[1], index: None, base_vertex: Some(w[2] as i32), first_instance: w[3] })
+                            Some((super::exec::DrawArgs { count: w[0], instances: w[1], index: None, base_vertex: Some(w[2] as i32), first_instance: w[3] }, w[2], w[3]))
                         } else if opcode == op::DRAW_INDEX_INDIRECT && valid(a, 20) {
                             let w = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), rd32(a + 16)] };
-                            self.index_size().map(|sz| super::exec::DrawArgs { count: w[0], instances: w[1], index: Some((self.index_base + w[2] as u64 * sz as u64, sz)), base_vertex: Some(w[3] as i32), first_instance: w[4] })
+                            self.index_size().map(|sz| (super::exec::DrawArgs { count: w[0], instances: w[1], index: Some((self.index_base + w[2] as u64 * sz as u64, sz)), base_vertex: Some(w[3] as i32), first_instance: w[4] }, w[3], w[4]))
                         } else {
                             None
+                        };
+                        if let Some((_, bv, si)) = args {
+                            if vtx_loc != 0 {
+                                self.set_reg(Space::Sh, vtx_loc, bv);
+                            }
+                            if inst_loc != 0 {
+                                self.set_reg(Space::Sh, inst_loc, si);
+                            }
                         }
+                        args.map(|(a, _, _)| a)
+                    }
+                    op::DRAW_INDIRECT_MULTI | op::DRAW_INDEX_INDIRECT_MULTI => {
+                        multi = Some(self.draw_indirect_multi(opcode == op::DRAW_INDEX_INDIRECT_MULTI, p));
+                        None
                     }
                     _ => {
                         self.note("multi-draw packets are not rendered yet");
                         None
                     }
                 };
-                self.last_draw = "not executed".into();
+                self.last_draw = multi.take().unwrap_or_else(|| "not executed".into());
                 match args {
                     Some(a) => {
                         self.draw(a);
@@ -955,6 +1029,9 @@ impl Cp {
         }
         let (name, at) = (self.name.clone(), self.cur_packet);
         let range = Some((dst, if daic { 4 } else { bytes }));
+        if super::exec::enabled() {
+            super::images::with(|im| im.note_meta_writes(&[(dst, if daic { 4 } else { bytes as u64 })]));
+        }
         match src_sel {
             2 => {
                 // Fill with the immediate dword.

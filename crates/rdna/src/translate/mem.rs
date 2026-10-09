@@ -1511,6 +1511,9 @@ pub fn export(tr: &mut T, ins: &Inst) -> R<()> {
                 Some(v) => v,
                 None => {
                     let v = tr.output(tr.t.v4f, Some(BuiltIn::Position), None);
+                    // Passes that test depth EQUAL against a prepass need
+                    // bit-identical positions from separately built pipelines.
+                    tr.b.decorate(v, spirv::Decoration::Invariant, []);
                     tr.out_pos = Some(v);
                     v
                 }

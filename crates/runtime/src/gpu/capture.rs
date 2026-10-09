@@ -280,16 +280,22 @@ pub fn draw(cp: &Cp, what: &str) {
         let base = ((ctx(0x28C60 + 0x3C * i) as u64) << 8) | ((ctx(0x28E40 + 4 * i) as u64 & 0xFF) << 40);
         let a2 = ctx(0x28EC0 + 4 * i);
         let a3 = ctx(0x28EE0 + 4 * i);
+        // Metadata: DCC (INFO bit 28) and CMASK surfaces, fast-clear color.
+        let dcc = ((ctx(0x28C94 + 0x3C * i) as u64) << 8) | ((ctx(0x28EA0 + 4 * i) as u64 & 0xFF) << 40);
+        let cmask = ((ctx(0x28C7C + 0x3C * i) as u64) << 8) | ((ctx(0x28E60 + 4 * i) as u64 & 0xFF) << 40);
         let _ = writeln!(
             s,
-            "    cb{i} {base:#x} info {info:#010x} view {:#x} attrib {:#x} {}x{} sw_mode {} type {} mask {:x}",
+            "    cb{i} {base:#x} info {info:#010x} view {:#x} attrib {:#x} {}x{} sw_mode {} type {} mask {:x} dcc {dcc:#x} ctl {:#x} cmask {cmask:#x} clear {:#x} {:#x}",
             ctx(0x28C6C + 0x3C * i),
             ctx(0x28C74 + 0x3C * i),
             ((a2 >> 14) & 0x3FFF) + 1,
             (a2 & 0x3FFF) + 1,
             (a3 >> 14) & 0x1F,
             (a3 >> 24) & 3,
-            (mask >> (4 * i)) & 0xF
+            (mask >> (4 * i)) & 0xF,
+            ctx(0x28C78 + 0x3C * i),
+            ctx(0x28C8C + 0x3C * i),
+            ctx(0x28C90 + 0x3C * i)
         );
     }
     for (name, r) in [("es", super::shaders::prepare_ngg(cp)), ("ps", super::shaders::prepare_ps(cp))] {
@@ -332,7 +338,19 @@ pub fn draw(cp: &Cp, what: &str) {
     }
     let zinfo = ctx(0x28040);
     if zinfo & 3 != 0 {
-        let _ = writeln!(s, "    depth {:#x} z_info {zinfo:#010x} size {:#x} control {:#x}", (ctx(0x28048) as u64) << 8, ctx(0x2801C), ctx(0x28800));
+        // HTILE (Z_INFO bit 29), fast-clear values.
+        let htile = ((ctx(0x28014) as u64) << 8) | ((ctx(0x28078) as u64 & 0xFF) << 40);
+        let _ = writeln!(
+            s,
+            "    depth {:#x} z_info {zinfo:#010x} stencil {:#x} s_info {:#x} size {:#x} control {:#x} htile {htile:#x} clear z {} s {:#x}",
+            (ctx(0x28048) as u64) << 8,
+            ((ctx(0x2804C) as u64) << 8) | ((ctx(0x2806C) as u64 & 0xFF) << 40),
+            ctx(0x28044),
+            ctx(0x2801C),
+            ctx(0x28800),
+            f32::from_bits(ctx(0x2802C)),
+            ctx(0x28028)
+        );
     }
     let _ = writeln!(
         s,
