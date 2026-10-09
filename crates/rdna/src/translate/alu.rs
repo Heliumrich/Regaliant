@@ -1500,9 +1500,15 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
             uout(tr, &v, r)?;
         }
         "v_readfirstlane_b32" => {
-            // This lane's value (values are uniform where used).
+            // Where all lanes run the block together, the first active lane's
+            // value, as hardware: loops that take a bit of the first lane's
+            // mask and clear it in every lane end only then (a lane reading
+            // its own empty mask toggles bit 31 forever while a lockstep vote
+            // keeps the loop going). In divergent code each lane emulates its
+            // own wave, so it reads its own value.
             let a = usrc(tr, ins, &v, 0)?;
-            tr.set_sreg(v.dst as u32, a)?;
+            let r = if tr.uniformity.is_uniform(ins.pc) { tr.wave_read_first(ins, a)? } else { a };
+            tr.set_sreg(v.dst as u32, r)?;
         }
         "v_readlane_b32" => {
             // A lane written by v_writelane (SGPR spill) reads its slot;

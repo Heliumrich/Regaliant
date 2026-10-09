@@ -78,19 +78,7 @@ fn finish(c: Capture, dumps: bool) {
     let Some(dir) = crate::run_dir() else { return };
     let path = dir.join(format!("capture-{}.txt", c.flip));
     let _ = std::fs::write(&path, &c.text);
-    let sdir = dir.join("shaders");
-    let _ = std::fs::create_dir_all(&sdir);
-    let mut dumped = 0;
-    for &a in &c.shaders {
-        let size = crate::hle::libs::agc::shader_code_size(a).unwrap_or_else(|| scan_to_endpgm(a));
-        if size == 0 || !crate::gpu::cp::guest_readable(a, size as u64) {
-            continue;
-        }
-        let bytes = unsafe { std::slice::from_raw_parts(a as *const u8, size) };
-        if std::fs::write(sdir.join(format!("{a:012x}.bin")), bytes).is_ok() {
-            dumped += 1;
-        }
-    }
+    let dumped = c.shaders.iter().filter(|&&a| save_program(a).is_some()).count();
     let tex = if dumps { dump_textures(&dir, &c.textures) } else { 0 };
     // Render targets as rendered (GPU execution): the graphics queue's work
     // of the frame completed before its flip.
@@ -138,6 +126,19 @@ fn dump_textures(dir: &std::path::Path, textures: &std::collections::BTreeMap<u6
 }
 
 /// Fallback size: up to the first s_endpgm (gfx10 0xBF810000), at most 64 KiB.
+/// Writes the shader program at `a` to `<run dir>/shaders/<address>.bin`.
+pub fn save_program(a: u64) -> Option<std::path::PathBuf> {
+    let sdir = crate::run_dir()?.join("shaders");
+    let size = crate::hle::libs::agc::shader_code_size(a).unwrap_or_else(|| scan_to_endpgm(a));
+    if size == 0 || !crate::gpu::cp::guest_readable(a, size as u64) {
+        return None;
+    }
+    let _ = std::fs::create_dir_all(&sdir);
+    let bytes = unsafe { std::slice::from_raw_parts(a as *const u8, size) };
+    let path = sdir.join(format!("{a:012x}.bin"));
+    std::fs::write(&path, bytes).ok().map(|_| path)
+}
+
 fn scan_to_endpgm(a: u64) -> usize {
     for i in 0..0x4000u64 {
         if !crate::gpu::cp::guest_readable(a + 4 * i, 4) {

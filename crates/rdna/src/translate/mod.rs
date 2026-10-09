@@ -159,10 +159,22 @@ pub enum BindingKind {
     Gds,
     /// u32 array of DUMP_DWORDS: register dumps (`Spec::dump`).
     Debug,
+    /// u32 array of WATCHDOG_DWORDS: the loop watchdog's record (see [`LOOP_LIMIT`]).
+    Watchdog,
 }
 
 /// Size of the global data share.
 pub const GDS_BYTES: u32 = 64 << 10;
+
+/// Loop watchdog: an invocation of a program with backward branches leaves
+/// after this many blocks. A lane that never leaves a loop would otherwise
+/// run until the driver declares the device lost (seen in Outpost Passage),
+/// which also stalls other applications' GPU work. A stopped invocation adds
+/// 1 to dword 0 of the watchdog binding and stores its program address
+/// (`Spec::code_base`) in dwords 1 (low) and 2 (high).
+pub const LOOP_LIMIT: u32 = 1 << 20;
+/// Size of the watchdog binding in dwords.
+pub const WATCHDOG_DWORDS: u32 = 4;
 
 #[derive(Clone, Debug)]
 pub struct Binding {
@@ -290,6 +302,8 @@ pub(crate) struct T<'a> {
     pub local_index: Option<Word>,
     /// Workgroup array for wave64 lane exchanges (created on first use).
     pub xchg: Option<Word>,
+    /// Workgroup array for wave64 first-lane reads: values, then flags.
+    pub xchg_first: Option<Word>,
     /// Blocks every invocation of the workgroup executes alike (barriers allowed).
     pub uniformity: crate::uniform::Uniformity,
     /// Lockstep mode (see the module documentation).
@@ -312,6 +326,10 @@ pub(crate) struct T<'a> {
     pub pc_var: Word,
     /// Probe value (see `Spec::probe`).
     pub probe_var: Option<Word>,
+    /// Loop watchdog binding and this invocation's block counter (programs
+    /// with backward branches; see [`LOOP_LIMIT`]).
+    pub watchdog: Option<Word>,
+    pub loop_ctr: Option<Word>,
     /// Debug binding (see `Spec::dump`) and WorkgroupId (compute).
     pub dump_buf: Option<Word>,
     pub wg_id: Option<Word>,
@@ -656,6 +674,89 @@ impl<'a> T<'a> {
         e(self.b.load(u, None, src, None, []))
     }
 
+    /// v_readfirstlane: the value of `v` in the first active lane of this
+    /// invocation's wave (lane 0 when EXEC is empty), the same in every lane.
+    /// Exact within a subgroup; wave64 compute code in uniform blocks
+    /// combines the two 32-lane halves through workgroup memory; elsewhere a
+    /// wave64 read stays within the 32-lane subgroup (reported).
+    pub fn wave_read_first(&mut self, ins: &Inst, v: Word) -> R<Word> {
+        let u = self.t.u32;
+        let bt = self.t.bool_;
+        self.b.capability(Capability::GroupNonUniformBallot);
+        let sg = self.u(spirv::Scope::Subgroup as u32);
+        let ex = self.sreg(crate::OP_EXEC_LO as u32)?;
+        let one = self.u(1);
+        let z = self.u(0);
+        let exb = e(self.b.bitwise_and(u, None, ex, one))?;
+        let act = e(self.b.i_not_equal(bt, None, exb, z))?;
+        let ballot = e(self.b.group_non_uniform_ballot(self.t.v4u, None, sg, act))?;
+        let bits = e(self.b.composite_extract(u, None, ballot, [0]))?;
+        let any = e(self.b.i_not_equal(bt, None, bits, z))?;
+        let lsb = self.glsl1(self.t.i32, spirv::GlslStd450Op::FindILsb, bits)?;
+        let lsb = self.to_u(lsb)?;
+        let first = e(self.b.select(u, None, any, lsb, z))?;
+        let (val, _) = self.lane_fetch(v, first)?;
+        let threads: u32 = self.spec.cs_local_size.iter().map(|&x| x.max(1)).product();
+        let compute = self.spec.stage == Stage::Compute;
+        if !self.spec.wave64 || (compute && threads <= 32) {
+            return Ok(val);
+        }
+        if !(compute && self.uniformity.is_uniform(ins.pc) && self.local_index.is_some()) {
+            self.warn(format!("{:#x}: wave64 first-lane read within the 32-lane subgroup", ins.pc));
+            return Ok(val);
+        }
+        // Each lane publishes its half's candidate and whether that half has
+        // an active lane; the wave takes the lower half's unless it has none.
+        self.lds_state = 0;
+        let li = self.local_index.unwrap();
+        let n = threads.next_multiple_of(64);
+        let xf = match self.xchg_first {
+            Some(x) => x,
+            None => {
+                let len = self.u(2 * n);
+                let arr = self.b.type_array(u, len);
+                let pt = self.b.type_pointer(None, StorageClass::Workgroup, arr);
+                let x = self.global_var(pt, StorageClass::Workgroup);
+                self.xchg_first = Some(x);
+                x
+            }
+        };
+        let p_wg = self.b.type_pointer(None, StorageClass::Workgroup, u);
+        let wg = self.u(spirv::Scope::Workgroup as u32);
+        let sem = self.u((spirv::MemorySemantics::ACQUIRE_RELEASE | spirv::MemorySemantics::WORKGROUP_MEMORY).bits());
+        let kn = self.u(n);
+        ok(self.b.control_barrier(wg, wg, sem))?;
+        let p = e(self.b.access_chain(p_wg, None, xf, [li]))?;
+        ok(self.b.store(p, val, None, []))?;
+        let anyu = e(self.b.select(u, None, any, one, z))?;
+        let i = e(self.b.i_add(u, None, kn, li))?;
+        let p = e(self.b.access_chain(p_wg, None, xf, [i]))?;
+        ok(self.b.store(p, anyu, None, []))?;
+        ok(self.b.control_barrier(wg, wg, sem))?;
+        let m = self.u(!63);
+        let base = e(self.b.bitwise_and(u, None, li, m))?;
+        let k32 = self.u(32);
+        let upper = e(self.b.i_add(u, None, base, k32))?;
+        let mut load = |tr: &mut Self, idx: Word| -> R<Word> {
+            let p = e(tr.b.access_chain(p_wg, None, xf, [idx]))?;
+            e(tr.b.load(u, None, p, None, []))
+        };
+        let lower_val = load(self, base)?;
+        let upper_val = load(self, upper)?;
+        let i = e(self.b.i_add(u, None, kn, base))?;
+        let lower_any = load(self, i)?;
+        let i = e(self.b.i_add(u, None, kn, upper))?;
+        let upper_any = load(self, i)?;
+        // Lanes past the end of a partial last wave do not exist.
+        let kt = self.u(threads);
+        let exists = e(self.b.u_less_than(bt, None, upper, kt))?;
+        let lower_none = e(self.b.i_equal(bt, None, lower_any, z))?;
+        let upper_some = e(self.b.i_not_equal(bt, None, upper_any, z))?;
+        let use_upper = e(self.b.logical_and(bt, None, lower_none, upper_some))?;
+        let use_upper = e(self.b.logical_and(bt, None, use_upper, exists))?;
+        e(self.b.select(u, None, use_upper, upper_val, lower_val))
+    }
+
     fn input(&mut self, ty: Word, builtin: Option<BuiltIn>, location: Option<u32>) -> Word {
         let pt = self.b.type_pointer(None, StorageClass::Input, ty);
         let v = self.global_var(pt, StorageClass::Input);
@@ -930,6 +1031,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         lane_id: None,
         local_index: None,
         xchg: None,
+        xchg_first: None,
         uniformity: crate::uniform::analyze(code),
         lockstep: false,
         vote: None,
@@ -942,6 +1044,8 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         mrt_mask: 0,
         pc_var: 0,
         probe_var: None,
+        watchdog: None,
+        loop_ctr: None,
         dump_buf: None,
         wg_id: None,
         sb_struct: None,
@@ -959,6 +1063,12 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         let bnd = tr.alloc_binding(BindingKind::Gds);
         tr.decorate_binding(v, bnd);
         tr.gds = Some(v);
+    }
+    if code.iter().any(|i| i.branch_target().is_some_and(|t| t <= i.pc)) {
+        let v = tr.sb_var();
+        let bnd = tr.alloc_binding(BindingKind::Watchdog);
+        tr.decorate_binding(v, bnd);
+        tr.watchdog = Some(v);
     }
     if spec.dump.is_some() && spec.stage == Stage::Compute {
         let v = tr.sb_var();
@@ -1032,6 +1142,10 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     tr.vgpr = tr.b.variable(p_arr_v, None, StorageClass::Function, None);
     tr.scc = tr.b.variable(tr.t.fn_bool, None, StorageClass::Function, None);
     tr.pc_var = tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, None);
+    if tr.watchdog.is_some() {
+        let z = tr.u(0);
+        tr.loop_ctr = Some(tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, Some(z)));
+    }
     if tr.spec.probe.is_some() {
         let z = tr.u(0);
         tr.probe_var = Some(tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, Some(z)));
@@ -1287,9 +1401,42 @@ fn emit_dispatch_loop(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>) -> R<()
     e(tr.b.begin_block(Some(cont)))?;
     let pc2 = e(tr.b.load(tr.t.u32, None, tr.pc_var, None, []))?;
     let ex = tr.u(PC_EXIT);
-    let done = e(tr.b.i_equal(tr.t.bool_, None, pc2, ex))?;
+    let mut done = e(tr.b.i_equal(tr.t.bool_, None, pc2, ex))?;
+    if let Some(ctr) = tr.loop_ctr {
+        let n = e(tr.b.load(tr.t.u32, None, ctr, None, []))?;
+        let one = tr.u(1);
+        let n = e(tr.b.i_add(tr.t.u32, None, n, one))?;
+        ok(tr.b.store(ctr, n, None, []))?;
+        let lim = tr.u(LOOP_LIMIT);
+        let over = e(tr.b.u_greater_than_equal(tr.t.bool_, None, n, lim))?;
+        done = e(tr.b.logical_or(tr.t.bool_, None, done, over))?;
+    }
     ok(tr.b.branch_conditional(done, exit, header, []))?;
     e(tr.b.begin_block(Some(exit)))?;
+    if let Some(wd) = tr.watchdog {
+        // Left with a block still to run: stopped by the watchdog.
+        let pc3 = e(tr.b.load(tr.t.u32, None, tr.pc_var, None, []))?;
+        let stopped = e(tr.b.i_not_equal(tr.t.bool_, None, pc3, ex))?;
+        let rec = tr.b.id();
+        let end = tr.b.id();
+        ok(tr.b.selection_merge(end, spirv::SelectionControl::NONE))?;
+        ok(tr.b.branch_conditional(stopped, rec, end, []))?;
+        e(tr.b.begin_block(Some(rec)))?;
+        let z = tr.u(0);
+        let p = e(tr.b.access_chain(tr.t.sb_u32, None, wd, [z, z]))?;
+        let scope = tr.u(spirv::Scope::Device as u32);
+        let one = tr.u(1);
+        e(tr.b.atomic_i_add(tr.t.u32, None, p, scope, z, one))?;
+        let base = tr.spec.code_base;
+        for (k, v) in [(1, base as u32), (2, (base >> 32) as u32)] {
+            let i = tr.u(k);
+            let p = e(tr.b.access_chain(tr.t.sb_u32, None, wd, [z, i]))?;
+            let c = tr.u(v);
+            ok(tr.b.store(p, c, None, []))?;
+        }
+        ok(tr.b.branch(end))?;
+        e(tr.b.begin_block(Some(end)))?;
+    }
     ok(tr.b.ret())?;
     Ok(())
 }

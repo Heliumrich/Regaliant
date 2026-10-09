@@ -41,6 +41,10 @@ pub static FLUSHES: AtomicU64 = AtomicU64::new(0);
 /// Time the completion thread spent waiting for fences / running actions (ns).
 pub static FENCE_NS: AtomicU64 = AtomicU64::new(0);
 pub static ACTION_NS: AtomicU64 = AtomicU64::new(0);
+/// Watchdog record of `Shared` (host visible; null before GPU execution starts).
+static WATCHDOG_PTR: std::sync::atomic::AtomicPtr<u32> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+/// Invocations stopped by the loop watchdog (`rdna::translate::LOOP_LIMIT`).
+pub static WATCHDOG_STOPS: AtomicU64 = AtomicU64::new(0);
 
 /// GPU execution enabled (`DS_GPU=1`) and Vulkan available.
 pub fn enabled() -> bool {
@@ -87,6 +91,9 @@ struct Shared {
     /// Register dumps (`DS_DUMP`), host visible.
     debug: vk::Buffer,
     debug_ptr: *mut u8,
+    /// Loop watchdog record (`rdna::translate::LOOP_LIMIT`), host visible
+    /// (mapped at WATCHDOG_PTR).
+    watchdog: vk::Buffer,
     /// Zero-filled buffer bound for empty or unmapped resources.
     dummy: vk::Buffer,
     import_align: u64,
@@ -123,6 +130,9 @@ fn shared() -> parking_lot::MappedMutexGuard<'static, Shared> {
         let (gds, _) = c.device_buffer(rdna::translate::GDS_BYTES as u64, usage).expect("GDS buffer");
         let (dummy, _) = c.device_buffer(DUMMY_BYTES, usage).expect("dummy buffer");
         let (debug, _, debug_ptr) = c.host_buffer(rdna::translate::DUMP_DWORDS as u64 * 4, usage).expect("debug buffer");
+        let (watchdog, _, watchdog_ptr) = c.host_buffer(rdna::translate::WATCHDOG_DWORDS as u64 * 4, usage).expect("watchdog buffer");
+        unsafe { std::ptr::write_bytes(watchdog_ptr, 0, rdna::translate::WATCHDOG_DWORDS as usize * 4) };
+        WATCHDOG_PTR.store(watchdog_ptr as *mut u32, Ordering::SeqCst);
         let mut host = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
         let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
         unsafe { c.instance.get_physical_device_properties2(c.pdev, &mut p2) };
@@ -149,6 +159,7 @@ fn shared() -> parking_lot::MappedMutexGuard<'static, Shared> {
             gds,
             debug,
             debug_ptr,
+            watchdog,
             dummy,
             import_align: host.min_imported_host_pointer_alignment.max(4096),
         });
@@ -379,7 +390,7 @@ pub fn pipeline_test(capture: &str) -> i32 {
 
 fn descriptor_type(k: BindingKind) -> vk::DescriptorType {
     match k {
-        BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Gds | BindingKind::Debug => vk::DescriptorType::STORAGE_BUFFER,
+        BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Gds | BindingKind::Debug | BindingKind::Watchdog => vk::DescriptorType::STORAGE_BUFFER,
         BindingKind::Image(_) => vk::DescriptorType::SAMPLED_IMAGE,
         BindingKind::StorageImage(_) => vk::DescriptorType::STORAGE_IMAGE,
         BindingKind::Sampler(_) => vk::DescriptorType::SAMPLER,
@@ -600,6 +611,7 @@ fn completion_thread() {
             }
             FLUSHES.fetch_add(1, Ordering::Relaxed);
             collect_timestamps(b.queries, &b.shaders);
+            check_watchdog(&b.name, &b.shaders);
             let ms = b.submitted.elapsed().as_millis();
             if ms >= 250 {
                 let list: Vec<String> = b.shaders.iter().map(|a| format!("{a:#x}")).collect();
@@ -617,6 +629,33 @@ fn completion_thread() {
         *DONE.lock() = b.seq;
         DONE_CV.notify_all();
     }
+}
+
+/// Reports invocations the loop watchdog stopped (after each completed
+/// batch): once per program, which is saved for analysis.
+fn check_watchdog(queue: &str, shaders: &[u64]) {
+    let p = WATCHDOG_PTR.load(Ordering::Acquire);
+    if p.is_null() {
+        return;
+    }
+    // Shaders add to dword 0 with atomics while other batches may run.
+    let n = unsafe { &*(p as *const std::sync::atomic::AtomicU32) }.swap(0, Ordering::AcqRel);
+    if n == 0 {
+        return;
+    }
+    let addr = unsafe { std::ptr::read_volatile(p.add(1)) as u64 | (std::ptr::read_volatile(p.add(2)) as u64) << 32 };
+    WATCHDOG_STOPS.fetch_add(n as u64, Ordering::Relaxed);
+    static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+    if !SEEN.lock().get_or_insert_with(HashSet::new).insert(addr) {
+        return;
+    }
+    let list: Vec<String> = shaders.iter().map(|a| format!("{a:#x}")).collect();
+    let saved = super::capture::save_program(addr).map(|f| format!("; program saved to {}", f.display())).unwrap_or_default();
+    crate::warn!(
+        "gpu[{queue}]: loop watchdog stopped {n} invocation(s) of shader {addr:#x} after {} blocks; its results are wrong (batch shaders {}){saved}",
+        rdna::translate::LOOP_LIMIT,
+        list.join(" ")
+    );
 }
 
 struct Slot {
@@ -1090,6 +1129,7 @@ impl Exec {
                     }
                     BindingKind::Gds => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: sh.gds, offset: 0, range: rdna::translate::GDS_BYTES as u64 })),
                     BindingKind::Debug => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: sh.debug, offset: 0, range: rdna::translate::DUMP_DWORDS as u64 * 4 })),
+                    BindingKind::Watchdog => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: sh.watchdog, offset: 0, range: rdna::translate::WATCHDOG_DWORDS as u64 * 4 })),
                     _ => {}
                 }
             }
@@ -1343,7 +1383,7 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} buffers shadowed in VRAM, {} not for lack of space), {} skipped; {} draws executed, {} without effect, {} skipped; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} buffers shadowed in VRAM, {} not for lack of space), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         SHADOWED.load(Ordering::Relaxed),
         SHADOW_FULL.load(Ordering::Relaxed),
@@ -1351,6 +1391,7 @@ pub fn status() -> String {
         draw::DRAWN.load(Ordering::Relaxed),
         draw::DRAW_NOOP.load(Ordering::Relaxed),
         draw::DRAW_SKIPPED.load(Ordering::Relaxed),
+        WATCHDOG_STOPS.load(Ordering::Relaxed),
         FLUSHES.load(Ordering::Relaxed),
         verify::status(),
         super::cp::sync_summary()
