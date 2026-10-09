@@ -493,6 +493,26 @@ impl Cp {
         format!("{drawn} of {count} draws ({})", if drawn > 0 { outcome } else { "none".into() })
     }
 
+    /// Smallest and largest index of `count` indices from `start` of the
+    /// bound index buffer, and the first ones (frame captures).
+    fn index_range(&self, start: u32, count: u32) -> String {
+        let Some(sz) = self.index_size() else { return String::new() };
+        let a = self.index_base + start as u64 * sz as u64;
+        let n = count.min(1 << 20) as u64;
+        if n == 0 || !guest_readable(a, n * sz as u64) {
+            return " indices unreadable".into();
+        }
+        let get = |i: u64| unsafe { if sz == 2 { (rd32((a + 2 * i) & !3) >> (((a + 2 * i) & 2) * 8)) & 0xFFFF } else { rd32(a + 4 * i) } };
+        let (mut lo, mut hi) = (u32::MAX, 0);
+        for i in 0..n {
+            let v = get(i);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        let head: Vec<String> = (0..n.min(6)).map(|i| get(i).to_string()).collect();
+        format!(" indices {lo}..{hi} [{}]", head.join(" "))
+    }
+
     /// Index size in bytes (VGT_INDEX_TYPE), None for 8-bit indices.
     fn index_size(&self) -> Option<u32> {
         match self.reg(Space::Uc, crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE) & 3 {
@@ -678,6 +698,7 @@ impl Cp {
                 DRAWS.fetch_add(1, Ordering::Relaxed);
                 let instances = self.num_instances;
                 let mut multi: Option<String> = None;
+                let mut indirect: Option<String> = None;
                 let args = match opcode {
                     op::DRAW_INDEX_AUTO => Some(super::exec::DrawArgs { count: p(0), instances, index: None, base_vertex: None, first_instance: 0 }),
                     op::DRAW_INDEX_2 => self.index_size().map(|sz| super::exec::DrawArgs { count: p(3), instances, index: Some((addr64(p(1), p(2)), sz)), base_vertex: None, first_instance: 0 }),
@@ -694,9 +715,16 @@ impl Cp {
                         let (vtx_loc, inst_loc) = (p(1) & 0xFFFF, p(1) >> 16);
                         let args = if opcode == op::DRAW_INDIRECT && valid(a, 16) {
                             let w = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12)] };
+                            if super::capture::capturing() {
+                                indirect = Some(format!("args {w:?} locs {vtx_loc:#x}/{inst_loc:#x}"));
+                            }
                             Some((super::exec::DrawArgs { count: w[0], instances: w[1], index: None, base_vertex: Some(w[2] as i32), first_instance: w[3] }, w[2], w[3]))
                         } else if opcode == op::DRAW_INDEX_INDIRECT && valid(a, 20) {
                             let w = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), rd32(a + 16)] };
+                            if super::capture::capturing() {
+                                let ty = self.reg(Space::Uc, crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE) & 3;
+                                indirect = Some(format!("args {w:?} locs {vtx_loc:#x}/{inst_loc:#x} index {:#x} type {ty} size {}{}", self.index_base, self.index_count, self.index_range(w[2], w[0])));
+                            }
                             self.index_size().map(|sz| (super::exec::DrawArgs { count: w[0], instances: w[1], index: Some((self.index_base + w[2] as u64 * sz as u64, sz)), base_vertex: Some(w[3] as i32), first_instance: w[4] }, w[3], w[4]))
                         } else {
                             None
@@ -747,7 +775,7 @@ impl Cp {
                         ),
                         op::DRAW_INDEX_AUTO => format!("DRAW_INDEX_AUTO count {} instances {}", p(0), self.num_instances),
                         op::DRAW_INDEX_OFFSET_2 => format!("DRAW_INDEX_OFFSET_2 count {} offset {} base {:#x}", p(2), p(1), self.index_base),
-                        _ => format!("indirect draw opcode {opcode:#x} offset {:#x} base {:#x}", p(0), self.draw_indirect_base),
+                        _ => format!("indirect draw opcode {opcode:#x} offset {:#x} base {:#x}{}", p(0), self.draw_indirect_base, indirect.take().map(|s| format!(" {s}")).unwrap_or_default()),
                     };
                     super::capture::draw(self, &what);
                 }

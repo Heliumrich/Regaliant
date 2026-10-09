@@ -135,7 +135,9 @@ pub struct Spec {
     pub probe: Option<(u32, u32)>,
     /// Debugging (compute): (pc, workgroup id): after each execution of the
     /// instruction at pc, the invocations of that workgroup write their
-    /// registers to the debug binding (see [`DUMP_STRIDE`]).
+    /// registers to the debug binding (see [`DUMP_STRIDE`]). Vertex stage:
+    /// (pc, [first vertex index, instance index, 0]): the invocations of that
+    /// instance with vertex indices from the first one (1024 slots) do.
     pub dump: Option<(u32, [u32; 3])>,
 }
 
@@ -320,6 +322,9 @@ pub(crate) struct T<'a> {
     /// (vgpr, lane) slots written by v_writelane with constant lanes (SGPR
     /// spills): per-invocation copies of those lanes' values.
     pub lane_slots: HashMap<(u32, u32), Word>,
+    /// Lane reads that take the invocation's own value (see
+    /// [`atomic_result_reads`]).
+    pub own_lane_reads: BTreeSet<u32>,
     pub warnings: Vec<String>,
     pub params: u32,
     pub mrt_mask: u32,
@@ -333,6 +338,8 @@ pub(crate) struct T<'a> {
     /// Debug binding (see `Spec::dump`) and WorkgroupId (compute).
     pub dump_buf: Option<Word>,
     pub wg_id: Option<Word>,
+    /// VertexIndex and InstanceIndex (vertex stage; register dumps).
+    pub vertex_ids: Option<(Word, Word)>,
     pub sb_struct: Option<Word>,
     /// Binding of each raw buffer variable, and its uvec2/uvec4 views
     /// (aliases of the same binding for aligned 8/16-byte accesses).
@@ -924,6 +931,65 @@ impl<'a> T<'a> {
     }
 }
 
+/// Lane reads (v_readlane / v_readfirstlane) of a value an atomic has just
+/// returned: the wave-aggregated atomic (a ballot counts the lanes, one lane
+/// adds the count, every lane takes the old value from that lane and adds
+/// its v_mbcnt prefix). Each invocation is a wave of one here (its ballot
+/// holds only its own bit, its prefix is 0), so it ran the atomic for itself
+/// and the result to take is its own; another lane's would make all lanes
+/// share one slot.
+fn atomic_result_reads(code: &[Inst]) -> BTreeSet<u32> {
+    let mut out = BTreeSet::new();
+    for (i, ins) in code.iter().enumerate() {
+        if !matches!(ins.base_name(), Some("v_readlane_b32" | "v_readfirstlane_b32")) {
+            continue;
+        }
+        let s = ins.src(0);
+        if s < crate::OP_VGPR0 {
+            continue;
+        }
+        let v = s - crate::OP_VGPR0;
+        for p in code[..i].iter().rev().take(32) {
+            match vgpr_def(p, v) {
+                Some(atomic) => {
+                    if atomic {
+                        out.insert(ins.pc);
+                    }
+                    break;
+                }
+                None => {}
+            }
+        }
+    }
+    out
+}
+
+/// Whether `p` may write VGPR `v`: Some(true) for an atomic returning the
+/// previous value into it, Some(false) for any other (possible) write.
+fn vgpr_def(p: &Inst, v: u16) -> Option<bool> {
+    let name = p.base_name().unwrap_or("");
+    let d = p.vdst();
+    match p.enc {
+        Enc::Mubuf | Enc::Mtbuf | Enc::Mimg | Enc::Global | Enc::Flat | Enc::Scratch | Enc::Ds => {
+            let atomic = name.contains("atomic") && (p.enc == Enc::Ds || p.glc()) || name.contains("_rtn");
+            let returns = atomic && (p.enc != Enc::Ds || name.contains("_rtn"));
+            let store = name.contains("store") || name.contains("write") || name.contains("atomic") && !returns;
+            if store || !(d..d + 4).contains(&v) {
+                return None;
+            }
+            Some(returns && d == v)
+        }
+        Enc::Vop1 | Enc::Vop2 | Enc::Vop3 | Enc::Vop3p | Enc::Vintrp => {
+            // Compares and lane reads write SGPRs.
+            if name.starts_with("v_cmp") || matches!(name, "v_readlane_b32" | "v_readfirstlane_b32") {
+                return None;
+            }
+            (d == v || d + 1 == v).then_some(false)
+        }
+        _ => None,
+    }
+}
+
 /// Splits the program into basic blocks: returns block start pcs.
 fn block_starts(code: &[Inst]) -> BTreeSet<u32> {
     let mut s = BTreeSet::new();
@@ -1039,6 +1105,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         lds_state: 0,
         sg_lane_var: None,
         lane_slots: HashMap::new(),
+        own_lane_reads: atomic_result_reads(code),
         warnings: Vec::new(),
         params: 0,
         mrt_mask: 0,
@@ -1048,6 +1115,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         loop_ctr: None,
         dump_buf: None,
         wg_id: None,
+        vertex_ids: None,
         sb_struct: None,
         buffer_binding: HashMap::new(),
         buffer_views: HashMap::new(),
@@ -1070,7 +1138,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         tr.decorate_binding(v, bnd);
         tr.watchdog = Some(v);
     }
-    if spec.dump.is_some() && spec.stage == Stage::Compute {
+    if spec.dump.is_some() && matches!(spec.stage, Stage::Compute | Stage::Vertex) {
         let v = tr.sb_var();
         let bnd = tr.alloc_binding(BindingKind::Debug);
         tr.decorate_binding(v, bnd);
@@ -1457,18 +1525,34 @@ fn translate_inst(tr: &mut T, ins: &Inst) -> R<()> {
     Ok(())
 }
 
-/// Register dump of the invocations of workgroup `g` (see `Spec::dump`).
+/// Register dump of the invocations of workgroup `g`, or of a range of
+/// vertices (see `Spec::dump`).
 fn emit_dump(tr: &mut T, g: [u32; 3]) -> R<()> {
-    let (Some(buf), Some(wg), Some(li)) = (tr.dump_buf, tr.wg_id, tr.local_index) else { return Ok(()) };
     let u = tr.t.u32;
     let bt = tr.t.bool_;
-    let mut cond = tr.bool_c(true);
-    for (k, gk) in g.iter().enumerate() {
-        let c = e(tr.b.composite_extract(u, None, wg, [k as u32]))?;
-        let kk = tr.u(*gk);
-        let eq = e(tr.b.i_equal(bt, None, c, kk))?;
-        cond = e(tr.b.logical_and(bt, None, cond, eq))?;
-    }
+    let (buf, li, cond) = match (tr.dump_buf, tr.wg_id, tr.local_index, tr.vertex_ids) {
+        (Some(buf), Some(wg), Some(li), _) => {
+            let mut cond = tr.bool_c(true);
+            for (k, gk) in g.iter().enumerate() {
+                let c = e(tr.b.composite_extract(u, None, wg, [k as u32]))?;
+                let kk = tr.u(*gk);
+                let eq = e(tr.b.i_equal(bt, None, c, kk))?;
+                cond = e(tr.b.logical_and(bt, None, cond, eq))?;
+            }
+            (buf, li, cond)
+        }
+        (Some(buf), _, _, Some((vi, ii))) => {
+            let first = tr.u(g[0]);
+            let slot = e(tr.b.i_sub(u, None, vi, first))?;
+            let n = tr.u(DUMP_DWORDS / DUMP_STRIDE);
+            let inside = e(tr.b.u_less_than(bt, None, slot, n))?;
+            let inst = tr.u(g[1]);
+            let same = e(tr.b.i_equal(bt, None, ii, inst))?;
+            let cond = e(tr.b.logical_and(bt, None, inside, same))?;
+            (buf, slot, cond)
+        }
+        _ => return Ok(()),
+    };
     tr.guarded(cond, &mut |tr| {
         let stride = tr.u(DUMP_STRIDE);
         let base = e(tr.b.i_mul(u, None, li, stride))?;

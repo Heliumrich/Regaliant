@@ -1506,8 +1506,10 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
             // its own empty mask toggles bit 31 forever while a lockstep vote
             // keeps the loop going). In divergent code each lane emulates its
             // own wave, so it reads its own value.
+            // An atomic's result is the invocation's own (see
+            // `atomic_result_reads`).
             let a = usrc(tr, ins, &v, 0)?;
-            let r = if tr.uniformity.is_uniform(ins.pc) { tr.wave_read_first(ins, a)? } else { a };
+            let r = if tr.uniformity.is_uniform(ins.pc) && !tr.own_lane_reads.contains(&ins.pc) { tr.wave_read_first(ins, a)? } else { a };
             tr.set_sreg(v.dst as u32, r)?;
         }
         "v_readlane_b32" => {
@@ -1516,6 +1518,9 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
             let slot = ins.const_lane_op().and_then(|(_, g, l)| tr.lane_slots.get(&(g as u32, l)).copied());
             let a = match slot {
                 Some(var) => e(tr.b.load(u, None, var, None, []))?,
+                // An atomic's result: the invocation's own (see
+                // `atomic_result_reads`).
+                None if tr.own_lane_reads.contains(&ins.pc) => tr.operand(ins, v.src[0])?,
                 None => {
                     let x = tr.operand(ins, v.src[0])?;
                     let l = tr.operand(ins, v.src[1])?;

@@ -8,6 +8,7 @@
 use super::*;
 use crate::gpu::images::{self, Surface, Target};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::AtomicU32;
 
 pub static DRAWN: AtomicU64 = AtomicU64::new(0);
 /// Draws without visible effect here (metadata passes, all writes disabled).
@@ -109,6 +110,24 @@ fn stencil_op(op: u32) -> vk::StencilOp {
     }
 }
 
+/// EQUAL depth test diagnosis (`DS_DEPTH_EQUAL_BIAS` or the `eqbias`
+/// control command): f32 bits, NaN = off, infinity = always pass.
+pub static EQUAL_BIAS: AtomicU32 = AtomicU32::new(0x7FC0_0000);
+
+pub fn set_equal_bias(v: Option<f32>) {
+    EQUAL_BIAS.store(v.unwrap_or(f32::NAN).to_bits(), Ordering::Relaxed);
+}
+
+fn equal_bias() -> Option<f32> {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        if let Ok(v) = std::env::var("DS_DEPTH_EQUAL_BIAS") {
+            set_equal_bias(if v == "always" { Some(f32::INFINITY) } else { v.parse().ok() });
+        }
+    });
+    Some(f32::from_bits(EQUAL_BIAS.load(Ordering::Relaxed))).filter(|v| !v.is_nan())
+}
+
 /// Color target n from CB_COLORn_* (None: no target bound).
 pub(crate) fn color_surface(cp: &Cp, n: u32) -> Result<Option<Surface>, String> {
     let r = |o: u32| ctx_reg(cp, 0x28C60 + 0x3C * n + o);
@@ -141,7 +160,7 @@ pub(crate) fn color_surface(cp: &Cp, n: u32) -> Result<Option<Surface>, String> 
 }
 
 /// Depth/stencil surface from DB_* (None: none bound).
-fn depth_surface(cp: &Cp) -> Option<Surface> {
+pub(crate) fn depth_surface(cp: &Cp) -> Option<Surface> {
     let zinfo = ctx_reg(cp, 0x28040);
     let sinfo = ctx_reg(cp, 0x28044);
     let format = match (zinfo & 3, sinfo & 1) {
@@ -625,14 +644,16 @@ impl Exec {
             c.device.cmd_set_depth_write_enable(cmd, z_write);
             // DS_DEPTH_EQUAL_BIAS=<units> (diagnosis): EQUAL tests without
             // depth writes pass a little in front of the stored depth instead
-            // (reversed Z when the depth clear value is 0).
-            static EQ_BIAS: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
-            let eq_bias = (*EQ_BIAS.get_or_init(|| std::env::var("DS_DEPTH_EQUAL_BIAS").ok().and_then(|v| v.parse().ok()))).filter(|_| z_test && !z_write && (dctl >> 4) & 7 == 2);
+            // (reversed Z when the depth clear value is 0); `always`: they
+            // always pass (do the draw's fragments exist at all?).
+            let eq_bias = equal_bias().filter(|_| z_test && !z_write && (dctl >> 4) & 7 == 2);
             let reversed = f32r(reg(0x2802C)) == 0.0;
             match eq_bias {
+                Some(b) if b.is_infinite() => c.device.cmd_set_depth_compare_op(cmd, vk::CompareOp::ALWAYS),
                 Some(_) => c.device.cmd_set_depth_compare_op(cmd, if reversed { vk::CompareOp::GREATER_OR_EQUAL } else { vk::CompareOp::LESS_OR_EQUAL }),
                 None => c.device.cmd_set_depth_compare_op(cmd, compare_op(dctl >> 4)),
             }
+            let eq_bias = eq_bias.filter(|b| b.is_finite());
             c.device.cmd_set_depth_bounds_test_enable(cmd, false);
             c.device.cmd_set_stencil_test_enable(cmd, s_test);
             let back = dctl & (1 << 7) != 0;

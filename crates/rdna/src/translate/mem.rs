@@ -28,6 +28,7 @@ pub fn stage_inputs(tr: &mut T) -> R<()> {
             let i = e(tr.b.load(tr.t.i32, None, iid, None, []))?;
             let i = tr.to_u(i)?;
             tr.set_vreg_raw(8, i)?;
+            tr.vertex_ids = Some((v, i));
         }
         Stage::Fragment => {
             let fc = tr.input(tr.t.v4f, Some(BuiltIn::FragCoord), None);

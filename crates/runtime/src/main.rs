@@ -250,6 +250,16 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 *hle::libs::ime_dialog::CONTROL_TEXT.lock() = Some(text);
                 Ok(())
             }
+            "eqbias" => {
+                // Diagnosis of EQUAL depth tests: `eqbias <units>|always|off`.
+                let v = match parts.next().unwrap_or("off") {
+                    "off" => None,
+                    "always" => Some(f32::INFINITY),
+                    x => x.parse().ok(),
+                };
+                gpu::exec::set_equal_bias(v);
+                Ok(())
+            }
             "textreset" => {
                 exception::text_reset();
                 Ok(())
@@ -259,6 +269,14 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 Ok(())
             }
             "capture" => {
+                // `capture [<from>-<to>]`: the next frame, optionally with
+                // per-draw reports for that range of its events.
+                if let Some((a, b)) = parts.next().and_then(|r| r.split_once('-')) {
+                    match (a.parse(), b.parse()) {
+                        (Ok(a), Ok(b)) => gpu::capture::set_draw_range((a, b)),
+                        _ => warn!("control: bad draw range '{a}-{b}'"),
+                    }
+                }
                 gpu::capture::arm_next();
                 Ok(())
             }

@@ -465,8 +465,9 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
         Enc::Vop1 if name == "v_readfirstlane_b32" => st.set(ins.vdst(), Prov::Unknown),
         Enc::Vop3 => {
             if crate::vop3_kind(ins.op) == crate::Vop3Kind::FromVopc {
-                // Compare result: SGPR pair in the VDST field.
-                let d = ins.vdst();
+                // Compare result: SGPR pair in the VDST field (gfx10 v_cmpx:
+                // EXEC only).
+                let d = if name.starts_with("v_cmpx_") { crate::OP_EXEC_LO } else { ins.vdst() };
                 st.set(d, Prov::Unknown);
                 st.set(d + 1, Prov::Unknown);
             } else if ins.is_vop3b() {
@@ -478,7 +479,9 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
             }
         }
         Enc::Vopc => {
-            let d = ins.sdwa_sdst().unwrap_or(crate::OP_VCC_LO);
+            // gfx10 v_cmpx writes EXEC only (VCC keeps e.g. a descriptor
+            // table pointer across it).
+            let d = if name.starts_with("v_cmpx_") { crate::OP_EXEC_LO } else { ins.sdwa_sdst().unwrap_or(crate::OP_VCC_LO) };
             st.set(d, Prov::Unknown);
             st.set(d + 1, Prov::Unknown);
         }

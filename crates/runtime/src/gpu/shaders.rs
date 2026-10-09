@@ -325,9 +325,20 @@ pub fn prepare_ngg(cp: &Cp) -> Result<Prepared, String> {
         resources: Vec::new(),
         binding_base: 0,
         probe: None,
-        dump: None,
+        dump: super::capture::vs_dump().and_then(|(first, inst)| pos_export(&insts).map(|i| (i.pc, [first, inst, 0]))),
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
+}
+
+/// Program address of the NGG (vertex) shader bound on `cp`.
+pub fn ngg_addr(cp: &Cp) -> u64 {
+    let sh = |i: u32| cp.reg(Space::Sh, i);
+    ((sh(ES_PGM_LO) as u64) | ((sh(ES_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8
+}
+
+/// The first position export (`exp pos0`) of a vertex program.
+pub fn pos_export(insts: &[rdna::Inst]) -> Option<&rdna::Inst> {
+    insts.iter().find(|i| i.enc == rdna::Enc::Exp && i.exp_target() == 12)
 }
 
 /// One line per resolved resource (frame captures).

@@ -206,10 +206,14 @@ fn f(v: u32) -> f32 {
     f32::from_bits(v)
 }
 
-/// `DS_CAPTURE_DRAWS=1`: also dump each captured draw's first color target
-/// after the draw (draws/<event>_<address>.png).
+/// `DS_CAPTURE_DRAWS=1` (every draw) or `=<from>-<to>` (capture events):
+/// after each such draw, the pixels of its first color target and of its
+/// stencil that changed (and the nonzero stencil count) are reported, and
+/// the color target is written to draws/<event>_<address>.png.
 pub fn draw_dumps() -> bool {
-    dumps_env() && capturing()
+    let Some((lo, hi)) = dumps_env() else { return false };
+    let next = ACTIVE.try_lock().and_then(|g| g.as_ref().map(|c| c.events + 1));
+    next.is_some_and(|e| e >= lo && e <= hi)
 }
 
 /// `DS_CAPTURE_DISPATCHES=1`: also dump the images each captured dispatch
@@ -219,28 +223,149 @@ pub fn dispatch_dumps() -> bool {
     *ON.get_or_init(|| std::env::var("DS_CAPTURE_DISPATCHES").ok().as_deref() == Some("1")) && capturing()
 }
 
-fn dumps_env() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_CAPTURE_DRAWS").ok().as_deref() == Some("1"))
+/// Per-draw report range set by the `capture <from>-<to>` control command
+/// (overrides `DS_CAPTURE_DRAWS`).
+static DRAW_RANGE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+pub fn set_draw_range(r: (u64, u64)) {
+    *DRAW_RANGE.lock() = Some(r);
+}
+
+fn dumps_env() -> Option<(u64, u64)> {
+    if let Some(r) = *DRAW_RANGE.lock() {
+        return Some(r);
+    }
+    static ON: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let v = std::env::var("DS_CAPTURE_DRAWS").ok()?;
+        if v == "1" {
+            return Some((0, u64::MAX));
+        }
+        let (a, b) = v.split_once('-')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    })
+}
+
+/// `DS_VS_DUMP=<first vertex index>[:<instance>]` with per-draw reports
+/// (`DS_CAPTURE_DRAWS=<from>-<to>`): the vertex shaders of those draws store
+/// their registers at their position export for 1024 vertex indices from
+/// the first one (instance 0 unless given); the report writes each dumped
+/// vertex's exported position to draws/<event>_vs.txt.
+pub fn vs_dump() -> Option<(u32, u32)> {
+    static V: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+    let v = (*V.get_or_init(|| {
+        let s = std::env::var("DS_VS_DUMP").ok()?;
+        let mut it = s.split(':');
+        let first = it.next()?.trim().parse().ok()?;
+        let inst = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+        Some((first, inst))
+    }))?;
+    draw_dumps().then_some(v)
+}
+
+fn vs_dump_report(cp: &Cp, event: u64) -> Option<String> {
+    static V: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let first = (*V.get_or_init(|| std::env::var("DS_VS_DUMP").ok()?.split(':').next()?.trim().parse().ok()))?;
+    let addr = super::shaders::ngg_addr(cp);
+    let (insts, _) = super::shaders::program(addr).ok()?;
+    let exp = super::shaders::pos_export(&insts)?;
+    let regs = super::exec::debug_dump(true);
+    let stride = rdna::translate::DUMP_STRIDE as usize;
+    let mut out = String::new();
+    let mut n = 0;
+    for (slot, r) in regs.chunks_exact(stride).enumerate() {
+        if r[385] == 0 {
+            continue;
+        }
+        n += 1;
+        let pos: Vec<String> = (0..4).map(|k| format!("{}", f32::from_bits(r[exp.exp_src(k) as usize]))).collect();
+        let _ = writeln!(out, "{} {}", first as usize + slot, pos.join(" "));
+    }
+    let dir = crate::run_dir()?.join("draws");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join(format!("{event:04}_vs.txt")), out);
+    Some(format!("vs {addr:#x}: {n} vertices dumped (exp pos0 at {:#x})", exp.pc))
+}
+
+/// Previous contents of dumped images (changed-pixel counts).
+static LAST_DUMP: Mutex<Option<std::collections::HashMap<(u64, bool), Vec<u8>>>> = Mutex::new(None);
+
+fn changed(key: (u64, bool), raw: &[u8], texel: usize) -> Option<usize> {
+    let mut g = LAST_DUMP.lock();
+    let m = g.get_or_insert_with(Default::default);
+    let n = m.get(&key).filter(|p| p.len() == raw.len()).map(|p| p.chunks_exact(texel).zip(raw.chunks_exact(texel)).filter(|(a, b)| a != b).count());
+    m.insert(key, raw.to_vec());
+    n
 }
 
 fn dump_draw_target(cp: &Cp, event: u64) -> Option<String> {
-    let s = super::exec::color_surface(cp, 0).ok().flatten()?;
-    let dir = crate::run_dir()?.join("draws");
-    let _ = std::fs::create_dir_all(&dir);
-    let r = super::images::with(|im| -> Result<(Vec<u8>, u32, u32), String> {
-        let t = im.target(&s)?;
-        let raw = im.read_back(t.image, t.key.format, t.key.width, t.key.height)?;
-        Ok((super::images::to_rgba8(t.key.format, &raw).ok_or("format")?, t.key.width, t.key.height))
-    });
-    match r {
-        Ok((rgba, w, h)) => {
-            let name = format!("{event:04}_{:010x}.png", s.base);
-            std::fs::write(dir.join(&name), super::png::encode(w, h, &rgba)).ok()?;
-            Some(name)
-        }
-        Err(e) => Some(format!("(dump failed: {e})")),
+    let (lo, hi) = dumps_env()?;
+    if event < lo || event > hi {
+        return None;
     }
+    let mut out = Vec::new();
+    if let Some(s) = super::exec::color_surface(cp, 0).ok().flatten() {
+        let dir = crate::run_dir()?.join("draws");
+        let _ = std::fs::create_dir_all(&dir);
+        let r = super::images::with(|im| -> Result<(Vec<u8>, u32, u32, ash::vk::Format), String> {
+            let t = im.target(&s)?;
+            let raw = im.read_back(t.image, t.key.format, t.key.width, t.key.height)?;
+            Ok((raw, t.key.width, t.key.height, t.key.format))
+        });
+        match r {
+            Ok((raw, w, h, format)) => {
+                let texel = (raw.len() / (w as usize * h as usize).max(1)).max(1);
+                let ch = changed((s.base, false), &raw, texel).map(|n| format!("{n} px changed")).unwrap_or_else(|| "first dump".into());
+                let name = format!("{event:04}_{:010x}.png", s.base);
+                // PNGs only on request (DS_CAPTURE_DRAWS_PNG=1): a range of
+                // full-size targets is gigabytes.
+                static PNG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let png = *PNG.get_or_init(|| std::env::var("DS_CAPTURE_DRAWS_PNG").ok().as_deref() == Some("1")) || lo == 0;
+                if png {
+                    if let Some(rgba) = super::images::to_rgba8(format, &raw) {
+                        let _ = std::fs::write(dir.join(&name), super::png::encode(w, h, &rgba));
+                    }
+                }
+                out.push(format!("cb0 {name} ({ch})"));
+            }
+            Err(e) => out.push(format!("cb0 dump failed: {e}")),
+        }
+    }
+    if let Some(d) = super::exec::depth_surface(cp).filter(|d| super::images::aspects(d.format).contains(ash::vk::ImageAspectFlags::DEPTH)) {
+        let r = super::images::with(|im| -> Result<Vec<u8>, String> {
+            let t = im.target(&d)?;
+            im.read_back_aspect(t.image, t.key.format, ash::vk::ImageAspectFlags::DEPTH, t.key.width, t.key.height)
+        });
+        match r {
+            Ok(raw) => {
+                let texel = (raw.len() / (d.width as usize * d.height as usize).max(1)).max(1);
+                let ch = changed((d.base, false), &raw, texel).map(|n| format!("{n} changed")).unwrap_or_else(|| "first dump".into());
+                out.push(format!("depth {ch}"));
+            }
+            Err(e) => out.push(format!("depth dump failed: {e}")),
+        }
+    }
+    if let Some(d) = super::exec::depth_surface(cp).filter(|d| super::images::has_stencil(d.format)) {
+        let r = super::images::with(|im| -> Result<Vec<u8>, String> {
+            let t = im.target(&d)?;
+            im.read_back_aspect(t.image, t.key.format, ash::vk::ImageAspectFlags::STENCIL, t.key.width, t.key.height)
+        });
+        match r {
+            Ok(raw) => {
+                let nz = raw.iter().filter(|&&v| v != 0).count();
+                let ch = changed((d.base, true), &raw, 1).map(|n| format!(", {n} changed")).unwrap_or_default();
+                out.push(format!("stencil {nz} nonzero{ch}"));
+                if std::env::var("DS_CAPTURE_DRAWS_PNG").ok().as_deref() == Some("1") {
+                    if let Some(dir) = crate::run_dir().map(|r| r.join("draws")) {
+                        let gray: Vec<u8> = raw.iter().flat_map(|&v| [v, v, v, 255]).collect();
+                        let _ = std::fs::write(dir.join(format!("{event:04}_{:010x}_stencil.png", d.base)), super::png::encode(d.width, d.height, &gray));
+                    }
+                }
+            }
+            Err(e) => out.push(format!("stencil dump failed: {e}")),
+        }
+    }
+    (!out.is_empty()).then(|| out.join("; "))
 }
 
 /// Records one draw (`what` names the packet and its arguments).
@@ -260,9 +385,14 @@ pub fn draw(cp: &Cp, what: &str) {
         cp.reg(Space::Uc, 0x25B),
         cp.last_draw
     );
-    if dumps_env() {
+    if dumps_env().is_some() {
         if let Some(n) = dump_draw_target(cp, c.events) {
             let _ = writeln!(s, "    target after draw: {n}");
+        }
+        if std::env::var("DS_VS_DUMP").is_ok() {
+            if let Some(n) = vs_dump_report(cp, c.events) {
+                let _ = writeln!(s, "    {n}");
+            }
         }
     }
     // NGG primitive shaders: program in the ES registers, resources and user

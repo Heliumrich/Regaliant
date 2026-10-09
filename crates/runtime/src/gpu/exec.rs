@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod draw;
-pub(crate) use draw::color_surface;
+pub(crate) use draw::{color_surface, depth_surface, set_equal_bias};
 pub use draw::DrawArgs;
 
 pub static EXECUTED: AtomicU64 = AtomicU64::new(0);
