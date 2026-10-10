@@ -277,7 +277,13 @@ fn draw_trace(what: &str, count: u32) {
     static LEFT: AtomicU32 = AtomicU32::new(16);
     let Some(want) = *WANT.get_or_init(|| std::env::var("DS_DRAW_TRACE").ok().and_then(|v| v.trim().parse().ok())) else { return };
     if count == want && LEFT.load(Ordering::Relaxed) > 0 && LEFT.fetch_sub(1, Ordering::Relaxed) > 0 {
-        crate::info!("agc: {what} count {count}: {}", crate::exception::current_guest_frames(16).join(" <- "));
+        // On a fiber, also the guest stack above the call: the callers'
+        // saved registers (the render item, geometry, ...).
+        let stack = match crate::hle::libs::fiber::guest_stack_words(96) {
+            Some(w) => format!("; guest stack: {}", w.iter().map(|v| format!("{v:x}")).collect::<Vec<_>>().join(" ")),
+            None => String::new(),
+        };
+        crate::info!("agc: {what} count {count}: {}{stack}", crate::exception::current_guest_frames(16).join(" <- "));
     }
 }
 

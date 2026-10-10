@@ -181,7 +181,7 @@ pub fn enter(t: &'static GuestThread) {
     crate::tls::set_current_tp(t.tp.load(Ordering::SeqCst));
     crate::log::set_thread_name(&t.name());
     t.host_tid.store(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } as u64, Ordering::SeqCst);
-    crate::exception::arm_watch_current_thread();
+    crate::exception::arm_watch_current_thread(true);
 }
 
 /// Runs guest code `entry(a0, a1)` on the current (already entered) thread.

@@ -213,6 +213,23 @@ pub unsafe fn on_host_stack<R, F: FnOnce() -> R>(fiber: u64, f: F) -> R {
     }
 }
 
+/// The guest stack words above the current HLE call (`n` qwords from the
+/// fiber-stack pointer recorded when it moved to the host stack), when the
+/// call came from a fiber (diagnostics: saved registers of guest frames).
+pub fn guest_stack_words(n: usize) -> Option<Vec<u64>> {
+    let fiber = CURRENT.with(|c| c.get());
+    if fiber == 0 {
+        return None;
+    }
+    let g = unsafe { *field(fiber, OBJ_GUEST_RSP) };
+    if g == 0 || !in_fiber_stack(g) {
+        return None;
+    }
+    let hi = STACK_HI.with(|c| c.get());
+    let n = n.min(((hi - g) / 8) as usize);
+    Some((0..n).map(|i| unsafe { *((g + 8 * i as u64) as *const u64) }).collect())
+}
+
 /// Runs a guest function called by HLE code. On a fiber's host stack it
 /// runs on the fiber's own stack instead, below the frames of the HLE call
 /// (the title's code expects its own stacks), and HLE calls it makes move to

@@ -383,7 +383,7 @@ fn queue(id: u32) -> &'static Queue {
 fn worker(q: &'static Queue, name: &str) {
     crate::log::set_thread_name(name);
     q.tid.store(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }, Ordering::Relaxed);
-    crate::exception::arm_watch_current_thread();
+    crate::exception::arm_watch_current_thread(false);
     let mut cp = cp::Cp::new(name, q.id != GFX);
     cp.wait_flag = Some(&q.cp_waiting);
     loop {

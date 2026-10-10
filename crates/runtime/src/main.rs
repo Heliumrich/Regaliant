@@ -13,6 +13,7 @@ mod loader;
 mod mem;
 mod patch;
 mod thread;
+mod titlefix;
 mod tls;
 
 use std::path::{Path, PathBuf};
@@ -182,7 +183,11 @@ fn prune_runs(runs: &Path, keep: usize) {
 ///   textreset                log text-hook strings again (`DS_TEXT_HOOK`)
 ///   mem <addr> <len>         write guest memory (hex) to mem-<addr>.bin in the run directory
 ///   emucheck <cs,..>[:<n>]   interpreter check of the next dispatches of those shaders (`off`)
-///   find <hex u64>           guest addresses (8-byte aligned) holding that value (first 64)
+///   find <hex u64>|<lo>-<hi> guest addresses (8-byte aligned) holding that value (or a value
+///                            in [lo, hi), listed) (first 64)
+///   watch <slot> <addr>|off [w|rw] [len] [all|guest]  hardware watchpoint (DR0-3) at run time
+///   findstr <text>           guest addresses holding that ASCII text (first 64)
+///   poke <addr> <u64> [<mask>]  write guest memory (experiments; logged)
 ///   quit                     orderly shutdown
 fn poll_control(path: &Path, offset: &mut u64) {
     use std::io::{Read, Seek, SeekFrom};
@@ -264,26 +269,110 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 Ok(())
             }
             "find" => {
-                // Debug: `find <hex u64>`: readable guest memory holding the
-                // value at an 8-byte aligned address (first 64 hits).
-                match parts.next().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
-                    Some(v) => {
+                // Debug: `find <hex u64>` or `find <hex lo>-<hex hi>`: readable
+                // guest memory holding the value (or a value in [lo, hi)) at an
+                // 8-byte aligned address (first 64 hits; ranges list the values).
+                let hex = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+                let arg = parts.next().unwrap_or("");
+                let range = match arg.split_once('-') {
+                    Some((lo, hi)) => hex(lo).zip(hex(hi)),
+                    None => hex(arg).map(|v| (v, v + 1)),
+                };
+                match range {
+                    Some((vlo, vhi)) => {
                         let spans: Vec<(u64, u64, String)> = mem::MEM.lock().vmas.values().filter(|m| m.kind != mem::VmaKind::Reserved && m.prot & 1 != 0).map(|m| (m.start, m.end(), m.name.clone())).collect();
                         let mut hits = Vec::new();
                         let t0 = Instant::now();
                         for (lo, hi, name) in &spans {
                             let mut a = (*lo + 7) & !7;
                             while a + 8 <= *hi && hits.len() < 64 {
-                                if unsafe { *(a as *const u64) } == v {
-                                    hits.push(format!("{a:#x} ({name})"));
+                                let v = unsafe { *(a as *const u64) };
+                                if (vlo..vhi).contains(&v) {
+                                    hits.push(if vhi - vlo > 1 { format!("{a:#x} ({name}) = {v:#x}") } else { format!("{a:#x} ({name})") });
                                 }
                                 a += 8;
                             }
                         }
-                        info!("find {v:#x}: {} hit(s) in {} mappings ({} ms): {}", hits.len(), spans.len(), t0.elapsed().as_millis(), hits.join(", "));
+                        info!("find {arg}: {} hit(s) in {} mappings ({} ms): {}", hits.len(), spans.len(), t0.elapsed().as_millis(), hits.join(", "));
                         Ok(())
                     }
-                    None => Err("usage: find <hex u64>".into()),
+                    None => Err("usage: find <hex u64> | <hex lo>-<hex hi>".into()),
+                }
+            }
+            "poke" => {
+                // Experiment: `poke <hex address> <hex u64> [<hex mask>]`: writes
+                // (old & !mask) | (value & mask) to the 8-byte aligned guest
+                // address (mask: all bits by default); logs old and new values.
+                let hex = |s: Option<&str>| s.and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok());
+                match (hex(parts.next()), hex(parts.next())) {
+                    (Some(a), Some(v)) if a % 8 == 0 && gpu::cp::guest_readable(a, 8) => {
+                        let mask = hex(parts.next()).unwrap_or(u64::MAX);
+                        let p = a as *mut u64;
+                        let old = unsafe { p.read_volatile() };
+                        let new = (old & !mask) | (v & mask);
+                        unsafe { p.write_volatile(new) };
+                        info!("control: poke {a:#x}: {old:#018x} -> {new:#018x}");
+                        Ok(())
+                    }
+                    _ => Err("usage: poke <hex 8-byte aligned address> <hex u64> [<hex mask>]".into()),
+                }
+            }
+            "findstr" => {
+                // Debug: `findstr <text>`: readable guest memory holding the
+                // ASCII text (first 64 hits; the rest of the line is the text).
+                let text = line.trim_start().strip_prefix("findstr").unwrap_or("").trim();
+                if text.is_empty() {
+                    Err("usage: findstr <text>".into())
+                } else {
+                    let needle = text.as_bytes();
+                    let spans: Vec<(u64, u64, String)> = mem::MEM.lock().vmas.values().filter(|m| m.kind != mem::VmaKind::Reserved && m.prot & 1 != 0).map(|m| (m.start, m.end(), m.name.clone())).collect();
+                    let mut hits = Vec::new();
+                    let t0 = Instant::now();
+                    for (lo, hi, name) in &spans {
+                        if hits.len() >= 64 || hi - lo < needle.len() as u64 {
+                            continue;
+                        }
+                        let hay = unsafe { std::slice::from_raw_parts(*lo as *const u8, (hi - lo) as usize) };
+                        let mut i = 0;
+                        while let Some(k) = hay[i..].windows(needle.len()).position(|w| w == needle) {
+                            hits.push(format!("{:#x} ({name})", lo + (i + k) as u64));
+                            i += k + 1;
+                            if hits.len() >= 64 {
+                                break;
+                            }
+                        }
+                    }
+                    info!("findstr {text}: {} hit(s) in {} mappings ({} ms): {}", hits.len(), spans.len(), t0.elapsed().as_millis(), hits.join(", "));
+                    Ok(())
+                }
+            }
+            "watch" => {
+                // Debug: `watch <slot 0-3> <hex address> [w|rw] [1|2|4|8] [all|guest]`
+                // or `watch <slot> off`: hardware watchpoint on every
+                // registered thread (writes: all threads by default; rw:
+                // guest threads by default). Hits are logged (`watch N ...`).
+                let slot = parts.next().and_then(|v| v.parse::<usize>().ok()).filter(|&s| s < 4);
+                let arg = parts.next().unwrap_or("");
+                let addr = if arg == "off" { Some(0) } else { u64::from_str_radix(arg.trim_start_matches("0x"), 16).ok() };
+                let (mut rw, mut len, mut guest) = (1u32, 8u32, None::<bool>);
+                for o in parts.by_ref() {
+                    match o {
+                        "w" => rw = 1,
+                        "rw" => rw = 3,
+                        "1" | "2" | "4" | "8" => len = o.parse().unwrap(),
+                        "all" => guest = Some(false),
+                        "guest" => guest = Some(true),
+                        _ => {}
+                    }
+                }
+                match (slot, addr) {
+                    (Some(s), Some(a)) => {
+                        let guest_only = guest.unwrap_or(rw == 3);
+                        let n = exception::set_watch(s, a, rw, len, guest_only);
+                        info!("control: watch {s} {a:#x} {} len {len}{}: {n} thread(s) armed", if rw == 3 { "rw" } else { "w" }, if guest_only { " (guest threads)" } else { "" });
+                        Ok(())
+                    }
+                    _ => Err("usage: watch <slot 0-3> <hex address>|off [w|rw] [1|2|4|8] [all|guest]".into()),
                 }
             }
             "emucheck" => {

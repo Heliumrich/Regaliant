@@ -685,27 +685,63 @@ unsafe fn handle_breakpoint(ctx: &mut CONTEXT) -> bool {
     }
 }
 
-/// Single-step after a non-`push rbp` breakpoint: re-arms it.
-/// `DS_WATCH=<hex address>`: a hardware write watchpoint (DR0, 8 bytes) armed
-/// on every guest thread and runtime worker thread; each hit is logged with
-/// the written value and the writer's frames (first `DS_WATCH_MAX`, default
-/// 64, hits).
-static WATCH: OnceLock<u64> = OnceLock::new();
-static WATCH_HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Hardware watchpoints in the four debug-address registers (DR0-DR3), on
+/// every guest thread and runtime worker thread that registered itself
+/// (`arm_watch_current_thread`). Slot 0 can come from `DS_WATCH=<hex address>`
+/// (8 bytes; writes, or reads and writes with `DS_WATCH_RW=1`) and any slot
+/// from the `watch` control command at run time (`set_watch`). Each hit is
+/// logged with the value at the address, the accessing thread and its frames
+/// (first `DS_WATCH_MAX`, default 64, hits per slot).
+static SLOT_ADDR: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// RW bits (1 writes, 3 reads and writes) | LEN bits << 4 (0 = 1 byte,
+/// 1 = 2, 3 = 4, 2 = 8) | guest threads only << 8.
+static SLOT_MODE: [std::sync::atomic::AtomicU32; 4] = [const { std::sync::atomic::AtomicU32::new(0) }; 4];
+static SLOT_HITS: [std::sync::atomic::AtomicU32; 4] = [const { std::sync::atomic::AtomicU32::new(0) }; 4];
+/// Registered threads: (host thread id, runs guest code).
+static WATCH_TIDS: parking_lot::Mutex<Vec<(u32, bool)>> = parking_lot::Mutex::new(Vec::new());
+const CONTEXT_DEBUG_REGISTERS_AMD64: u32 = 0x0010_0010;
 
-fn watch_addr() -> u64 {
-    *WATCH.get_or_init(|| {
-        std::env::var("DS_WATCH").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0) & !7
-    })
+fn watch_env_init() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let a = std::env::var("DS_WATCH").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0) & !7;
+        if a != 0 {
+            let rw = if std::env::var("DS_WATCH_RW").ok().as_deref() == Some("1") { 3 } else { 1 };
+            SLOT_MODE[0].store(rw | (2 << 4), Ordering::SeqCst);
+            SLOT_ADDR[0].store(a, Ordering::SeqCst);
+        }
+    });
 }
 
-/// Arms the `DS_WATCH` watchpoint on the calling thread (no-op without it).
-pub fn arm_watch_current_thread() {
+/// Sets the debug registers of a context from the slots.
+fn apply_slots(c: &mut CONTEXT, guest: bool) {
+    let mut dr7 = c.Dr7 & !0xFFFF_00FF;
+    for i in 0..4 {
+        let a = SLOT_ADDR[i].load(Ordering::SeqCst);
+        let m = SLOT_MODE[i].load(Ordering::SeqCst);
+        let on = a != 0 && (guest || m & 0x100 == 0);
+        let a = if on { a } else { 0 };
+        match i {
+            0 => c.Dr0 = a,
+            1 => c.Dr1 = a,
+            2 => c.Dr2 = a,
+            _ => c.Dr3 = a,
+        }
+        if on {
+            dr7 |= (1 << (2 * i)) | (((m & 3) as u64) << (16 + 4 * i)) | ((((m >> 4) & 3) as u64) << (18 + 4 * i));
+        }
+    }
+    c.Dr7 = dr7;
+}
+
+/// Registers the calling thread for watchpoints and arms the active slots
+/// on it (`guest`: the thread runs guest code; guest-only slots skip others).
+pub fn arm_watch_current_thread(guest: bool) {
     use windows_sys::Win32::System::Diagnostics::Debug::{GetThreadContext, SetThreadContext};
-    use windows_sys::Win32::System::Threading::GetCurrentThread;
-    const CONTEXT_DEBUG_REGISTERS_AMD64: u32 = 0x0010_0010;
-    let a = watch_addr();
-    if a == 0 {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId};
+    watch_env_init();
+    WATCH_TIDS.lock().push((unsafe { GetCurrentThreadId() }, guest));
+    if SLOT_ADDR.iter().all(|a| a.load(Ordering::SeqCst) == 0) {
         return;
     }
     unsafe {
@@ -714,43 +750,107 @@ pub fn arm_watch_current_thread() {
         if GetThreadContext(GetCurrentThread(), &mut c.0) == 0 {
             return;
         }
-        c.0.Dr0 = a;
-        // L0 enable, RW0 = 01 (data writes; 11 = reads and writes with
-        // DS_WATCH_RW=1), LEN0 = 10 (8 bytes).
-        let rw = if std::env::var("DS_WATCH_RW").ok().as_deref() == Some("1") { 3 } else { 1 };
-        c.0.Dr7 = (c.0.Dr7 & !0x000F_0003) | 1 | (rw << 16) | (2 << 18);
+        apply_slots(&mut c.0, guest);
         if SetThreadContext(GetCurrentThread(), &c.0) == 0 {
-            crate::warn!("DS_WATCH: SetThreadContext failed on this thread");
+            crate::warn!("watch: SetThreadContext failed on this thread");
         }
     }
 }
 
-unsafe fn handle_watch_hit(ctx: &mut CONTEXT) -> bool {
-    if ctx.Dr6 & 1 == 0 || watch_addr() == 0 {
-        return false;
-    }
-    ctx.Dr6 = 0;
-    static MAX: OnceLock<u32> = OnceLock::new();
-    let n = WATCH_HITS.fetch_add(1, Ordering::Relaxed);
-    if n < *MAX.get_or_init(|| std::env::var("DS_WATCH_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(64)) {
-        let a = watch_addr();
-        let v = unsafe { *(a as *const u64) };
-        let frames = unsafe { frames_line(ctx) };
-        crate::log::write(
-            crate::log::Level::Info,
-            format_args!("watch hit #{n}: [{a:#x}] = {v:#018x} by [{}] at {}; {frames}", crate::log::thread_name(), describe(ctx.Rip)),
-        );
-    }
-    true
+/// Sets watch slot `slot` (address 0: off) and re-arms every registered
+/// thread (suspended while its debug registers change). Returns how many
+/// threads were updated.
+pub fn set_watch(slot: usize, addr: u64, rw: u32, len: u32, guest_only: bool) -> usize {
+    use windows_sys::Win32::System::Diagnostics::Debug::{GetThreadContext, SetThreadContext};
+    use windows_sys::Win32::System::Threading::{GetCurrentThreadId, OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME};
+    watch_env_init();
+    let lenbits = match len {
+        1 => 0,
+        2 => 1,
+        4 => 3,
+        _ => 2,
+    };
+    SLOT_MODE[slot].store(rw | (lenbits << 4) | if guest_only { 0x100 } else { 0 }, Ordering::SeqCst);
+    SLOT_ADDR[slot].store(addr & !(len.max(1) as u64 - 1), Ordering::SeqCst);
+    SLOT_HITS[slot].store(0, Ordering::SeqCst);
+    let me = unsafe { GetCurrentThreadId() };
+    let mut tids = WATCH_TIDS.lock();
+    let mut done = 0;
+    tids.retain(|&(tid, guest)| {
+        if tid == me {
+            return true;
+        }
+        unsafe {
+            let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, 0, tid);
+            if h.is_null() {
+                return false; // exited
+            }
+            if SuspendThread(h) != u32::MAX {
+                let mut c: AlignedContext = std::mem::zeroed();
+                c.0.ContextFlags = CONTEXT_DEBUG_REGISTERS_AMD64;
+                if GetThreadContext(h, &mut c.0) != 0 {
+                    apply_slots(&mut c.0, guest);
+                    if SetThreadContext(h, &c.0) != 0 {
+                        done += 1;
+                    }
+                }
+                ResumeThread(h);
+            }
+            windows_sys::Win32::Foundation::CloseHandle(h);
+        }
+        true
+    });
+    done
 }
 
-unsafe fn handle_single_step(ctx: &mut CONTEXT) -> bool {
-    if unsafe { handle_watch_hit(ctx) } {
-        return true;
+unsafe fn handle_watch_hit(ctx: &mut CONTEXT) -> bool {
+    let hit = (ctx.Dr6 & 0xF) as usize;
+    if hit == 0 {
+        return false;
     }
+    let mut ours = false;
+    for i in 0..4 {
+        let a = SLOT_ADDR[i].load(Ordering::Relaxed);
+        if hit & (1 << i) == 0 || a == 0 {
+            continue;
+        }
+        ours = true;
+        static MAX: OnceLock<u32> = OnceLock::new();
+        let n = SLOT_HITS[i].fetch_add(1, Ordering::Relaxed);
+        if n < *MAX.get_or_init(|| std::env::var("DS_WATCH_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(64)) {
+            // Read through the kernel: a plain read of a read-watched address
+            // would hit the watchpoint again inside this handler.
+            let mut v = 0u64;
+            unsafe {
+                windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    (a & !7) as *const _,
+                    &mut v as *mut u64 as *mut _,
+                    8,
+                    std::ptr::null_mut(),
+                );
+            }
+            let kind = if SLOT_MODE[i].load(Ordering::Relaxed) & 3 == 3 { "access" } else { "write" };
+            let frames = unsafe { frames_line(ctx) };
+            crate::log::write(
+                crate::log::Level::Info,
+                format_args!("watch {i} {kind} #{n}: [{a:#x}] = {v:#018x} by [{}] at {}; {frames}", crate::log::thread_name(), describe(ctx.Rip)),
+            );
+        }
+    }
+    if ours {
+        ctx.Dr6 = 0;
+    }
+    ours
+}
+
+/// Single-step exception: watchpoint hits and/or the step after a
+/// non-`push rbp` breakpoint (which re-arms it).
+unsafe fn handle_single_step(ctx: &mut CONTEXT) -> bool {
+    let watched = unsafe { handle_watch_hit(ctx) };
     let bp = REARM.with(|r| r.replace(0));
     if bp == 0 {
-        return false;
+        return watched;
     }
     unsafe { patch_code_byte(bp, 0xCC) };
     ctx.EFlags &= !0x100;

@@ -367,7 +367,7 @@ fn submit(cb: u64, prio: u32, result: u64) -> Result<u32, i32> {
 
 fn worker(n: usize, q: &'static Queue) {
     crate::log::set_thread_name(&format!("apr{n}"));
-    crate::exception::arm_watch_current_thread();
+    crate::exception::arm_watch_current_thread(false);
     loop {
         let s = {
             let mut g = q.pending.lock();
