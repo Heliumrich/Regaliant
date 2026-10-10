@@ -77,6 +77,20 @@ static IMPORTS_MULTI: AtomicU64 = AtomicU64::new(0);
 static IMPORTS_STALE: AtomicU64 = AtomicU64::new(0);
 
 /// GPU execution enabled (`DS_GPU=1`) and Vulkan available.
+/// `DS_TRACE_WRITES=<hex bytes>`: logs once each shader (and CP DMA) that
+/// writes a guest range at least that large (who fills a large buffer).
+pub fn trace_writes(what: &str, base: u64, size: u64) {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let min = *MIN.get_or_init(|| std::env::var("DS_TRACE_WRITES").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0));
+    if min == 0 || size < min {
+        return;
+    }
+    static SEEN: Mutex<Option<HashSet<(String, u64, u64)>>> = Mutex::new(None);
+    if SEEN.lock().get_or_insert_with(HashSet::new).insert((what.to_string(), base, size)) {
+        crate::info!("writes: {what} writes {base:#x}+{size:#x} (flip {})", super::FRAMES.load(Ordering::Relaxed));
+    }
+}
+
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -1395,6 +1409,7 @@ impl Exec {
                                     info = vk::DescriptorBufferInfo { buffer, offset: off, range };
                                     bound_size = size;
                                     if p.tr.plan.resources[i].written {
+                                        trace_writes(&format!("{:?} shader {:#x}", p.stage, p.addr), base, size);
                                         bound.writes.push((base, size));
                                         if matches!(p.resources[i], Resolved::Buffer(_)) {
                                             bound.sized_writes.push((base, size));
