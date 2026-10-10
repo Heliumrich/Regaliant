@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 15] = [
+    static ALL: [Tunable; 16] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -42,6 +42,7 @@ pub mod tune {
         Tunable { name: "lazy_wait_submit", env: "DS_LAZY_WAIT_SUBMIT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "gpu_cp_writes", env: "DS_GPU_CP_WRITES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "slots", env: "DS_GPU_SLOTS", default: 4, value: AtomicU64::new(UNSET) },
+        Tunable { name: "lod_stats", env: "DS_LOD_STATS", default: 2, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -141,6 +142,14 @@ pub mod tune {
         get(14)
     }
 
+    /// GetLodStats (hardware LOD statistics, the title's texture streaming
+    /// feedback; `lodstats`): 0 leaves the buffer as the title wrote it (no
+    /// streaming of high mips), 1 reports every counter bank as sampled at
+    /// mip 0, 2 the banks of textures bound since the last report.
+    pub fn lod_stats() -> u64 {
+        get(15)
+    }
+
     /// Sets a switch by name; false if unknown.
     pub fn set(name: &str, v: u64) -> bool {
         match ALL.iter().find(|t| t.name == name) {
@@ -155,6 +164,7 @@ pub mod tune {
 
 pub mod exec;
 pub mod pcache;
+pub mod lodstats;
 pub mod pstats;
 pub mod mirror;
 pub mod images;

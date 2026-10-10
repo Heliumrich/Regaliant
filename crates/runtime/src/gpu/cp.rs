@@ -1601,7 +1601,29 @@ impl Cp {
                     return self.poll_until(at, &what, || !crate::hle::libs::videoout::buffer_busy(handle, index));
                 }
             }
-            pop::WORKLOADS_ACTIVE | pop::WORKLOAD_COMPLETE | pop::LOD_STATS => {}
+            pop::LOD_STATS => {
+                // Hardware LOD statistics (texture streaming feedback): the
+                // title reads, per counter bank (T# word 6), the 8-byte entry
+                // at 0x40 + 8 * bank: bits 56..59 the finest mip sampled (15:
+                // none), bits 32..55 a count (eboot+0xac90b0).
+                let (buf, size, flags) = (addr64(a(0), a(1)), a(2) as u64, a(3));
+                let mode = super::tune::lod_stats();
+                if buf != 0 {
+                    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    let n = SEEN.fetch_add(1, Ordering::Relaxed);
+                    let writable = size >= super::lodstats::BUFFER_BYTES && guest_readable(buf, super::lodstats::BUFFER_BYTES);
+                    if mode != 0 && writable {
+                        // Before the label write behind it (a deferred effect).
+                        let sampled = unsafe { super::lodstats::report(buf, mode, (flags >> 19) & 1 != 0) };
+                        if n < 2 || n.is_power_of_two() {
+                            crate::info!("gpu[{}]: GetLodStats #{n} (buffer {buf:#x}, flags {flags:#x}): {sampled} of 256 counter banks reported as sampled at mip 0 (mode {mode}; stand-in for the hardware counters)", self.name);
+                        }
+                    } else if n < 2 || n.is_power_of_two() {
+                        crate::warn!("gpu[{}]: GetLodStats #{n} (buffer {buf:#x} size {size:#x}, flags {flags:#x}) not written (mode {mode}): the title streams no high mips", self.name);
+                    }
+                }
+            }
+            pop::WORKLOADS_ACTIVE | pop::WORKLOAD_COMPLETE => {}
             pop::CONTEXT_STATE => match a(0) {
                 0 => self.clear_context(),
                 1 => self.ctx_stack.push(self.regs.ctx.clone()),

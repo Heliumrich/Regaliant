@@ -523,6 +523,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
             ResKind::Image => {
                 let t = Tsharp::decode(&w);
                 let dim = ImageDim::from_type(t.ty, t.depth).ok_or_else(|| format!("{:?} shader {addr:#x}: image resource {i} has type {}", spec.stage, t.ty))?;
+                super::lodstats::note(&t.raw);
                 spec.resources.push(ResSpec::Image { dim, class: num_class(t.format) });
                 resources.push(Resolved::Image(t));
             }
@@ -547,6 +548,9 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
                         }
                     }
                     let t = Tsharp::decode(&d);
+                    if ok {
+                        super::lodstats::note(&t.raw);
+                    }
                     let dim = ImageDim::from_type(t.ty, t.depth);
                     let usable = ok && t.base != 0 && super::images::vk_format(t.format).is_some() && dim.is_some() && first.is_none_or(|(fd, _)| Some(fd) == dim);
                     if usable && first.is_none() {

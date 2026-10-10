@@ -255,7 +255,11 @@ pub fn vfs_open(path: &str, flags: i32, _mode: u32) -> i32 {
             return sce(EEXIST);
         }
     } else if flags & O_DIRECTORY != 0 || flags & O_CREAT == 0 {
-        crate::debug!("open '{path}': not found");
+        if crate::hle::iostat::note("kernel", path, crate::hle::iostat::What::Fail, 0) {
+            crate::info!("open '{path}': not found");
+        } else {
+            crate::debug!("open '{path}': not found");
+        }
         return sce(ENOENT);
     }
     let host = existing.unwrap_or_else(|| r.candidates[0].clone());
@@ -274,7 +278,11 @@ pub fn vfs_open(path: &str, flags: i32, _mode: u32) -> i32 {
         Ok(f) => {
             let pos = if flags & O_APPEND != 0 { f.metadata().map(|m| m.len()).unwrap_or(0) } else { 0 };
             let fd = alloc_fd(Fd { kind: Kind::File { file: f, writable: wants_write }, pos: Mutex::new(pos), path: path.to_string() });
-            crate::debug!("open '{path}' flags={flags:#x} -> fd {fd}");
+            if crate::hle::iostat::note("kernel", path, crate::hle::iostat::What::Open, 0) {
+                crate::info!("open '{path}' flags={flags:#x} -> fd {fd}");
+            } else {
+                crate::debug!("open '{path}' flags={flags:#x} -> fd {fd}");
+            }
             fd
         }
         Err(e) => {
@@ -316,6 +324,9 @@ pub fn pread_fd(fd: i32, buf: &mut [u8], off: u64) -> Result<usize, i32> {
                     Ok(n) => done += n,
                     Err(e) => return Err(io_errno(&e)),
                 }
+            }
+            if crate::hle::iostat::note("kernel", &f.path, crate::hle::iostat::What::Read, done as u64) {
+                crate::info!("read '{}' [{off:#x}+{:#x}] -> {done:#x} bytes", f.path, buf.len());
             }
             Ok(done)
         }

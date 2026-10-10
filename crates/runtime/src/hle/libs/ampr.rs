@@ -265,6 +265,9 @@ unsafe fn resolve_list(prefix: Option<&str>, paths: *const u64, count: u32, ids:
             };
             match resolve_path(&full) {
                 Ok((id, size)) => {
+                    if crate::hle::iostat::note("apr", &full, crate::hle::iostat::What::Open, 0) {
+                        crate::info!("apr: resolved '{full}' -> id {id} ({size:#x} bytes)");
+                    }
                     *ids.add(i) = id;
                     if !sizes.is_null() {
                         *sizes.add(i) = size;
@@ -274,7 +277,11 @@ unsafe fn resolve_list(prefix: Option<&str>, paths: *const u64, count: u32, ids:
                     }
                 }
                 Err(e) => {
-                    crate::debug!("apr: resolve '{full}' failed ({e})");
+                    if crate::hle::iostat::note("apr", &full, crate::hle::iostat::What::Fail, 0) {
+                        crate::info!("apr: resolve '{full}' failed ({e})");
+                    } else {
+                        crate::debug!("apr: resolve '{full}' failed ({e})");
+                    }
                     *ids.add(i) = 0;
                     if !sizes.is_null() {
                         *sizes.add(i) = 0;
@@ -400,11 +407,8 @@ fn read_into(file_id: u32, dest: u64, size: u64, offset: u64) -> Result<(), i32>
         return Err(EINVAL);
     }
     let h = open_handle(&f)?;
-    if f.path.contains("/sound/") {
-        static LOGGED: AtomicU32 = AtomicU32::new(0);
-        if LOGGED.fetch_add(1, Ordering::Relaxed) < 24 {
-            crate::info!("apr: read {} [{offset:#x}+{size:#x}] -> {dest:#x}", f.path);
-        }
+    if crate::hle::iostat::note("apr", &f.path, crate::hle::iostat::What::Read, size) {
+        crate::info!("apr: read {} [{offset:#x}+{size:#x}] -> {dest:#x}", f.path);
     }
     // The kernel writes the buffer: write-tracked pages cannot fault.
     let _w = crate::gpu::track::host_write(dest, size);

@@ -313,6 +313,10 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 info!("guest thread stacks:\n{}", thread_summary_ex(true));
                 Ok(())
             }
+            "iostat" => {
+                info!("file traffic at flip {flip}:\n{}", hle::iostat::status());
+                Ok(())
+            }
             "capture" => {
                 // `capture [<from>-<to>] [dispatches] [buffers=<shader>]`:
                 // the next frame, optionally with per-draw reports for that
@@ -484,6 +488,7 @@ fn thread_summary_ex(with_stacks: bool) -> String {
     s.push_str(&gpu::status_ex(with_stacks));
     s.push_str(&audio::status());
     s.push_str(&hle::libs::ajm::status());
+    s.push_str(&hle::iostat::status());
     s
 }
 

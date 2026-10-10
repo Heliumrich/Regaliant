@@ -5,6 +5,7 @@
 //! nothing get a trap stub that reports the call; by default that is fatal so
 //! missing behavior is never hidden.
 
+pub mod iostat;
 pub mod kernel;
 pub mod libs;
 
