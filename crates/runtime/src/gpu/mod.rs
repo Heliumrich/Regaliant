@@ -101,10 +101,11 @@ pub mod tune {
         get(9) != 0
     }
 
-    /// Loop-free shaders are translated without the dispatcher loop (the
-    /// translator's block chain); switching translates shaders anew.
-    pub fn block_chain() -> bool {
-        get(10) != 0
+    /// Structured control flow instead of the translator's dispatcher: 1 for
+    /// every shader, 2 for loop-free ones only, 0 never; switching
+    /// translates shaders anew.
+    pub fn block_chain() -> u64 {
+        get(10)
     }
 
     /// Sets a switch by name; false if unknown.

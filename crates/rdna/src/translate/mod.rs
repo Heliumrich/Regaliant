@@ -176,9 +176,10 @@ pub struct Spec {
     /// (pc, [first vertex index, instance index, 0]): the invocations of that
     /// instance with vertex indices from the first one (1024 slots) do.
     pub dump: Option<(u32, [u32; 3])>,
-    /// Loop-free programs also use the loop-and-switch dispatcher instead
-    /// of the block chain (A/B comparisons).
+    /// The loop-and-switch dispatcher instead of structured control flow:
+    /// for every program, or for programs with loops only (A/B comparisons).
     pub force_dispatcher: bool,
+    pub dispatcher_for_loops: bool,
 }
 
 /// Entries of an image table bound as one array of sampled images
@@ -1659,7 +1660,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         ok(tr.b.ret())?;
     } else {
         match loop_ranges(code, &starts) {
-            Some(loops) if !spec.force_dispatcher => emit_structured(&mut tr, code, &starts, &loops)?,
+            Some(loops) if !spec.force_dispatcher && (loops.is_empty() || !spec.dispatcher_for_loops) => emit_structured(&mut tr, code, &starts, &loops)?,
             _ => emit_dispatch_loop(&mut tr, code, &starts)?,
         }
     }
@@ -2248,6 +2249,7 @@ mod tests {
             probe: None,
             dump: None,
             force_dispatcher: false,
+            dispatcher_for_loops: false,
         }
     }
 
