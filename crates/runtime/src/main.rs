@@ -266,6 +266,18 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 let rest = line.trim_start().strip_prefix("probe").unwrap_or("").trim();
                 gpu::shaders::set_probe(rest)
             }
+            "skipcs" => {
+                // Diagnosis: `skipcs <hex compute shader address>` toggles
+                // skipping its dispatches.
+                match parts.next().and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()) {
+                    Some(a) => {
+                        let on = gpu::exec::toggle_skip_cs(a);
+                        info!("control: dispatches of compute shader {a:#x} {}", if on { "skipped" } else { "run again" });
+                        Ok(())
+                    }
+                    None => Err("usage: skipcs <hex address>".into()),
+                }
+            }
             "skipvs" => {
                 // Diagnosis: `skipvs <hex vertex shader address>` toggles
                 // skipping the draws that use it.
@@ -298,6 +310,9 @@ fn poll_control(path: &Path, offset: &mut u64) {
                         // ... reporting the cb0 value of that pixel per draw.
                         let xy: Vec<u32> = p.split(',').filter_map(|v| v.parse().ok()).collect();
                         gpu::capture::set_watch_pixel((xy.len() == 2).then(|| (xy[0], xy[1])));
+                    } else if let Some(list) = arg.strip_prefix("ps=") {
+                        // ... reports of the targets of draws with these pixel shaders.
+                        gpu::capture::set_draw_ps(list.split(',').filter_map(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()).collect());
                     } else if let Some(cs) = arg.strip_prefix("buffers=") {
                         // ... and the buffers that compute shader binds.
                         gpu::capture::set_dispatch_dumps(true);

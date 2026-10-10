@@ -185,7 +185,18 @@ pub fn init() -> Result<(), String> {
             .fragment_stores_and_atomics(true)
             .multi_draw_indirect(true)
             .sample_rate_shading(true);
+        // Image tables are indexed per invocation (non-uniform indexing).
+        let mut f12_supported = vk::PhysicalDeviceVulkan12Features::default();
+        {
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut f12_supported);
+            instance.get_physical_device_features2(pdev, &mut f2);
+        }
+        let nonuniform = f12_supported.shader_sampled_image_array_non_uniform_indexing != 0;
+        if !nonuniform {
+            crate::warn!("Vulkan: shaderSampledImageArrayNonUniformIndexing unsupported (image tables index uniformly)");
+        }
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
+            .shader_sampled_image_array_non_uniform_indexing(nonuniform)
             .timeline_semaphore(true)
             .scalar_block_layout(true)
             .shader_float16(true)

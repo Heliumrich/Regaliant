@@ -113,7 +113,7 @@ impl Reader {
             }
             Prov::PtrLo(ptr, b) => Some((self.ptr(ptr, user)? + *b as u64) as u32),
             Prov::PtrHi(ptr, b) => Some(((self.ptr(ptr, user)? + *b as u64) >> 32) as u32),
-            Prov::Unknown => None,
+            Prov::Unknown | Prov::Table(..) => None,
         }
     }
 }
@@ -123,6 +123,9 @@ pub enum Resolved {
     Buffer(Vsharp),
     Global(u64),
     Image(Tsharp),
+    /// The entries of an image table (None: unusable entry, bound as a
+    /// dummy image).
+    ImageTable(Vec<Option<Tsharp>>),
     Sampler([u32; 4]),
 }
 
@@ -364,6 +367,12 @@ pub fn prepare_ngg(cp: &Cp) -> Result<Prepared, String> {
     prepare(addr, insts, code_hash, &user, &mut spec)
 }
 
+/// Program address of the pixel shader bound on `cp`.
+pub fn ps_addr(cp: &Cp) -> u64 {
+    let sh = |i: u32| cp.reg(Space::Sh, i);
+    ((sh(PS_PGM_LO) as u64) | ((sh(PS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8
+}
+
 /// Program address of the NGG (vertex) shader bound on `cp`.
 pub fn ngg_addr(cp: &Cp) -> u64 {
     let sh = |i: u32| cp.reg(Space::Sh, i);
@@ -390,6 +399,10 @@ pub fn describe_resources(p: &Prepared) -> Vec<String> {
             match r {
                 Resolved::Buffer(v) => format!("{i}: V# {:#x} stride {} records {} format {} dst_sel {:#x} oob {} {rw}", v.base, v.stride, v.num_records, v.format, v.dst_sel, v.oob_select),
                 Resolved::Global(a) => format!("{i}: global {a:#x} {rw}"),
+                Resolved::ImageTable(e) => {
+                    let list: Vec<String> = e.iter().enumerate().filter_map(|(k, t)| t.map(|t| format!("{k}:{:#x} {}x{}x{} f{}", t.base, t.width, t.height, t.depth, t.format))).collect();
+                    format!("{i}: image table of {} entries {rw} [{}]", e.len(), list.join(", "))
+                }
                 Resolved::Image(t) => format!(
                     "{i}: T# {:#x} format {} {}x{}x{} type {} sw_mode {} levels {}..{} base_array {} dst_sel {:#x} {rw} [{}]",
                     t.base,
@@ -486,6 +499,34 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
             ResKind::Sampler => {
                 spec.resources.push(ResSpec::Sampler);
                 resources.push(Resolved::Sampler([w[0], w[1], w[2], w[3]]));
+            }
+            ResKind::ImageTable => {
+                // The table's V#: entries of 32 bytes (T#s) from its base.
+                let v = Vsharp::decode(&w);
+                let n = (v.byte_size().unwrap_or(0) / 32).min(rdna::translate::IMAGE_TABLE_LEN as u64);
+                let mut entries = Vec::with_capacity(n as usize);
+                let mut first: Option<(ImageDim, u16)> = None;
+                for k in 0..n {
+                    let a = v.base + 32 * k;
+                    let mut d = [0u32; 8];
+                    let mut ok = true;
+                    for (j, dw) in d.iter_mut().enumerate() {
+                        match rd.u32(a + 4 * j as u64) {
+                            Some(x) => *dw = x,
+                            None => ok = false,
+                        }
+                    }
+                    let t = Tsharp::decode(&d);
+                    let dim = ImageDim::from_type(t.ty, t.depth);
+                    let usable = ok && t.base != 0 && super::images::vk_format(t.format).is_some() && dim.is_some() && first.is_none_or(|(fd, _)| Some(fd) == dim);
+                    if usable && first.is_none() {
+                        first = Some((dim.unwrap(), t.format));
+                    }
+                    entries.push(usable.then_some(t));
+                }
+                let (dim, format) = first.ok_or_else(|| format!("{:?} shader {addr:#x}: image table {i} ({:#x}, {n} entries) has no usable T#", spec.stage, v.base))?;
+                spec.resources.push(ResSpec::Image { dim, class: num_class(format) });
+                resources.push(Resolved::ImageTable(entries));
             }
         }
     }

@@ -1191,22 +1191,21 @@ fn fout(tr: &mut T, v: &V, x: Word) -> R<()> {
     uout(tr, v, u)
 }
 
-/// Writes a per-lane boolean to an SGPR pair (VCC or an explicit destination).
-fn write_mask(tr: &mut T, sdst: u16, c: Word) -> R<()> {
-    let act = tr.active()?;
-    let c = e(tr.b.logical_and(tr.t.bool_, None, c, act))?;
-    let v = tr.bool_to_u(c)?;
-    let z = tr.u(0);
-    tr.set_sreg(sdst as u32, v)?;
-    tr.set_sreg(sdst as u32 + 1, z)
+/// Writes a per-lane boolean as a lane mask (see `T::lane_mask`) to an SGPR
+/// pair (VCC or an explicit destination; one SGPR in wave32).
+fn write_mask(tr: &mut T, ins: &Inst, sdst: u16, c: Word) -> R<()> {
+    let (lo, hi) = tr.lane_mask(ins.pc, c)?;
+    tr.set_sreg(sdst as u32, lo)?;
+    if tr.spec.wave64 {
+        tr.set_sreg(sdst as u32 + 1, hi)?;
+    }
+    Ok(())
 }
 
 /// Lane bit of a mask operand (VCC or an SGPR pair).
 fn read_mask(tr: &mut T, ins: &Inst, op: u16) -> R<Word> {
-    let lo = tr.operand(ins, op)?;
-    let one = tr.u(1);
-    let b = e(tr.b.bitwise_and(tr.t.u32, None, lo, one))?;
-    nonzero(tr, b)
+    let (lo, hi) = if tr.spec.wave64 { s64(tr, ins, op)? } else { (tr.operand(ins, op)?, tr.u(0)) };
+    tr.mask_bit(lo, hi)
 }
 
 fn fcmp(tr: &mut T, a: Word, b: Word, c: &str) -> R<Option<Word>> {
@@ -1438,14 +1437,11 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
         };
         if is_x {
             // gfx10: v_cmpx writes EXEC only.
-            let act = tr.active()?;
-            let c2 = e(tr.b.logical_and(bt, None, c, act))?;
-            let nv = tr.bool_to_u(c2)?;
-            let z = tr.u(0);
-            tr.set_sreg(OP_EXEC_LO as u32, nv)?;
-            tr.set_sreg(OP_EXEC_HI as u32, z)?;
+            let (lo, hi) = tr.lane_mask(ins.pc, c)?;
+            tr.set_sreg(OP_EXEC_LO as u32, lo)?;
+            tr.set_sreg(OP_EXEC_HI as u32, hi)?;
         } else {
-            write_mask(tr, v.sdst, c)?;
+            write_mask(tr, ins, v.sdst, c)?;
         }
         return Ok(());
     }
@@ -1754,7 +1750,7 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
             let a = fsrc(tr, ins, &v, 0)?;
             fout(tr, &v, a)?;
             let fl = tr.bool_c(false);
-            write_mask(tr, v.sdst, fl)?;
+            write_mask(tr, ins, v.sdst, fl)?;
         }
         "v_div_fixup_f32" => {
             // src0 already holds the quotient computed by the preceding sequence.
@@ -2016,7 +2012,7 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
                 }
             };
             uout(tr, &v, r)?;
-            write_mask(tr, carry_out, co)?;
+            write_mask(tr, ins, carry_out, co)?;
         }
         "v_add3_u32" | "v_xad_u32" | "v_lshl_add_u32" | "v_add_lshl_u32" | "v_lshl_or_b32" | "v_and_or_b32" | "v_or3_b32" | "v_xor3_b32" => {
             let a = usrc(tr, ins, &v, 0)?;
@@ -2117,7 +2113,7 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
                 tr.set_vreg_raw(v.dst as u32 + k, nv)?;
             }
             let fl = tr.bool_c(false);
-            write_mask(tr, v.sdst, fl)?;
+            write_mask(tr, ins, v.sdst, fl)?;
         }
         "v_min_i32" | "v_max_i32" | "v_min_u32" | "v_max_u32" => {
             let a = usrc(tr, ins, &v, 0)?;
@@ -2195,13 +2191,18 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
             // popcount(mask & lanes_below) + src1. Lane masks (EXEC/VCC and
             // compare results) hold only this lane's bit: in a wave of one no
             // active lane is below, so they count 0. Other masks (-1 for the
-            // lane id) use the hardware lane index.
+            // lane id) use the hardware lane index. Wave-mask mode has the
+            // wave's masks.
             let m = usrc(tr, ins, &v, 0)?;
             let b = usrc(tr, ins, &v, 1)?;
-            let one = tr.u(1);
-            let lane_mask = e(tr.b.u_less_than_equal(bt, None, m, one))?;
-            let zero = tr.u(0);
-            let m = e(tr.b.select(u, None, lane_mask, zero, m))?;
+            let m = if tr.wave_masks {
+                m
+            } else {
+                let one = tr.u(1);
+                let lane_mask = e(tr.b.u_less_than_equal(bt, None, m, one))?;
+                let zero = tr.u(0);
+                e(tr.b.select(u, None, lane_mask, zero, m))?
+            };
             let (lo, hi) = lane_masks(tr)?;
             let lm = if name == "v_mbcnt_lo_u32_b32" { lo } else { hi };
             let x = e(tr.b.bitwise_and(u, None, m, lm))?;

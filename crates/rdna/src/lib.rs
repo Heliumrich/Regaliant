@@ -11,6 +11,7 @@ pub mod kernels;
 pub mod translate;
 pub mod tables;
 pub mod uniform;
+pub mod wavemask;
 
 use std::fmt::Write;
 

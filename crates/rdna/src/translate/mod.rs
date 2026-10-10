@@ -21,6 +21,15 @@
 //! decides them for each wave), so every block is uniform and all LDS
 //! accesses are ordered. With several waves a wave whose lanes are all
 //! inactive runs a region with EXEC empty instead of skipping it.
+//!
+//! Single-wave lockstep programs run in *wave-mask mode*: lane masks (EXEC,
+//! VCC, compare results) have the hardware layout, bit i for lane i, so
+//! masks used as values (ballots kept in LDS, counted, scanned with s_ff1)
+//! and the scalar state derived from them agree across invocations, and
+//! branches need no votes. A compare computes its own lane's bit; a ballot
+//! through workgroup memory completes the mask wherever it may be read as a
+//! whole (see [`crate::wavemask`]); elsewhere an invocation keeps a partial
+//! mask whose own bit is right.
 
 mod alu;
 pub mod gs;
@@ -147,6 +156,10 @@ pub struct Spec {
     pub dump: Option<(u32, [u32; 3])>,
 }
 
+/// Entries of an image table bound as one array of sampled images
+/// (`ResKind::ImageTable`); later entries are not reachable.
+pub const IMAGE_TABLE_LEN: u32 = 64;
+
 /// Probe register flags (see `Spec::probe`).
 pub const PROBE_SGPR: u32 = 1 << 12;
 pub const PROBE_UINT: u32 = 1 << 13;
@@ -167,6 +180,8 @@ pub enum BindingKind {
     Buffer(usize),
     Image(usize),
     StorageImage(usize),
+    /// IMAGE_TABLE_LEN sampled images: the entries of an image table.
+    ImageArray(usize),
     Sampler(usize),
     /// u32 array: the global data share (GDS_BYTES), shared by all shaders.
     Gds,
@@ -199,7 +214,7 @@ impl Binding {
     /// Plan resource index of a resource binding.
     pub fn kind_resource(&self) -> Option<usize> {
         match self.kind {
-            BindingKind::Buffer(i) | BindingKind::Image(i) | BindingKind::StorageImage(i) | BindingKind::Sampler(i) => Some(i),
+            BindingKind::Buffer(i) | BindingKind::Image(i) | BindingKind::StorageImage(i) | BindingKind::ImageArray(i) | BindingKind::Sampler(i) => Some(i),
             _ => None,
         }
     }
@@ -292,6 +307,10 @@ pub(crate) struct T<'a> {
     pub res_info: u32,
     pub buffers: HashMap<usize, Word>,
     pub images: HashMap<usize, ImageRes>,
+    /// Image tables: resource -> pc of the load that reads its T#, and the
+    /// byte offset each such load used (Function variables).
+    pub image_tables: HashMap<usize, u32>,
+    pub table_offsets: HashMap<u32, Word>,
     pub samplers: HashMap<usize, Word>,
     pub sampler_ty: Word,
     pub bindings: Vec<Binding>,
@@ -345,6 +364,13 @@ pub(crate) struct T<'a> {
     /// Lane-0 elections: compare pc -> source operand (0/1) holding the lane
     /// index, compared as lane 0 (see [`lane0_elections`]).
     pub elections: HashMap<u32, usize>,
+    /// Wave-mask mode (see the module documentation).
+    pub wave_masks: bool,
+    /// Wave-mask mode: pcs of the mask writes that produce complete masks.
+    pub complete: std::collections::HashSet<u32>,
+    /// Wave-mask mode: whether this lane's bit lies in the high dword of a
+    /// mask, and its position in that dword.
+    pub own_bit: Option<(Word, Word)>,
     pub warnings: Vec<String>,
     pub params: u32,
     pub mrt_mask: u32,
@@ -435,11 +461,52 @@ impl<'a> T<'a> {
         self.set_vreg_raw(idx, nv)
     }
     pub fn active(&mut self) -> R<Word> {
-        let ex = self.sreg(crate::OP_EXEC_LO as u32)?;
+        let lo = self.sreg(crate::OP_EXEC_LO as u32)?;
+        let hi = if self.own_bit.is_some() { self.sreg(crate::OP_EXEC_HI as u32)? } else { self.u(0) };
+        self.mask_bit(lo, hi)
+    }
+
+    /// This lane's bit of a lane mask (lo, hi): bit 0, or in wave-mask mode
+    /// the bit of the lane's index.
+    pub fn mask_bit(&mut self, lo: Word, hi: Word) -> R<Word> {
+        let u = self.t.u32;
+        let w = match self.own_bit {
+            Some((in_hi, sh)) => {
+                let w = e(self.b.select(u, None, in_hi, hi, lo))?;
+                e(self.b.shift_right_logical(u, None, w, sh))?
+            }
+            None => lo,
+        };
         let one = self.u(1);
         let zero = self.u(0);
-        let b = e(self.b.bitwise_and(self.t.u32, None, ex, one))?;
+        let b = e(self.b.bitwise_and(u, None, w, one))?;
         e(self.b.i_not_equal(self.t.bool_, None, b, zero))
+    }
+
+    /// Lane mask (lo, hi) of a per-lane condition written at `pc` (lanes
+    /// outside EXEC 0): this lane's bit alone (bit 0; in wave-mask mode the
+    /// bit of its index), or in wave-mask mode the complete mask where the
+    /// value may be read as a whole (a ballot).
+    pub fn lane_mask(&mut self, pc: u32, c: Word) -> R<(Word, Word)> {
+        let u = self.t.u32;
+        let z = self.u(0);
+        if c == self.bool_c(false) {
+            return Ok((z, z));
+        }
+        let act = self.active()?;
+        let c = e(self.b.logical_and(self.t.bool_, None, c, act))?;
+        match self.own_bit {
+            Some(_) if self.complete.contains(&pc) => self.wave_ballot(c),
+            Some((in_hi, sh)) => {
+                let one = self.u(1);
+                let bit = e(self.b.shift_left_logical(u, None, one, sh))?;
+                let m = e(self.b.select(u, None, c, bit, z))?;
+                let lo = e(self.b.select(u, None, in_hi, z, m))?;
+                let hi = e(self.b.select(u, None, in_hi, m, z))?;
+                Ok((lo, hi))
+            }
+            None => Ok((self.bool_to_u(c)?, z)),
+        }
     }
     pub fn get_scc(&mut self) -> R<Word> {
         e(self.b.load(self.t.bool_, None, self.scc, None, []))
@@ -466,7 +533,7 @@ impl<'a> T<'a> {
             crate::OP_VCCZ | crate::OP_EXECZ => {
                 let r = if op == crate::OP_VCCZ { crate::OP_VCC_LO } else { crate::OP_EXEC_LO } as u32;
                 let lo = self.sreg(r)?;
-                let hi = self.sreg(r + 1)?;
+                let hi = if self.spec.wave64 { self.sreg(r + 1)? } else { self.u(0) };
                 let o = e(self.b.bitwise_or(self.t.u32, None, lo, hi))?;
                 let z = self.u(0);
                 let c = e(self.b.i_equal(self.t.bool_, None, o, z))?;
@@ -642,11 +709,11 @@ impl<'a> T<'a> {
     pub fn lane_fetch_active(&mut self, v: Word, src: Word) -> R<(Word, Word)> {
         let u = self.t.u32;
         let (x, live) = self.lane_fetch(v, src)?;
-        let ex = self.sreg(crate::OP_EXEC_LO as u32)?;
+        let act = self.active()?;
         let one = self.u(1);
-        let exb = e(self.b.bitwise_and(u, None, ex, one))?;
-        let (sex, _) = self.lane_fetch(exb, src)?;
         let z = self.u(0);
+        let exb = e(self.b.select(u, None, act, one, z))?;
+        let (sex, _) = self.lane_fetch(exb, src)?;
         let act = e(self.b.i_not_equal(self.t.bool_, None, sex, z))?;
         let ok_ = e(self.b.logical_and(self.t.bool_, None, live, act))?;
         let x = e(self.b.select(u, None, ok_, x, z))?;
@@ -711,11 +778,9 @@ impl<'a> T<'a> {
         let bt = self.t.bool_;
         self.b.capability(Capability::GroupNonUniformBallot);
         let sg = self.u(spirv::Scope::Subgroup as u32);
-        let ex = self.sreg(crate::OP_EXEC_LO as u32)?;
         let one = self.u(1);
         let z = self.u(0);
-        let exb = e(self.b.bitwise_and(u, None, ex, one))?;
-        let act = e(self.b.i_not_equal(bt, None, exb, z))?;
+        let act = self.active()?;
         let ballot = e(self.b.group_non_uniform_ballot(self.t.v4u, None, sg, act))?;
         let bits = e(self.b.composite_extract(u, None, ballot, [0]))?;
         let any = e(self.b.i_not_equal(bt, None, bits, z))?;
@@ -847,10 +912,12 @@ impl<'a> T<'a> {
     }
 
     /// Ballot of a per-lane condition over the workgroup (lockstep mode: the
-    /// workgroup is one wave): (lo, hi) lane masks. Three rotating slots of
-    /// workgroup memory need one barrier per ballot: a slot is cleared (by
-    /// lane 0) after the barrier of the ballot following its use, when every
-    /// lane has read it, and reused after the next barrier.
+    /// workgroup is one wave): (lo, hi) lane masks. Each subgroup ORs its
+    /// lanes' bits of either half and one of its invocations adds them to a
+    /// slot. Three rotating slots of workgroup memory need one barrier per
+    /// ballot: a slot is cleared (by lane 0) after the barrier of the ballot
+    /// following its use, when every lane has read it, and reused after the
+    /// next barrier.
     pub fn wave_ballot(&mut self, c: Word) -> R<(Word, Word)> {
         let (Some(vote), Some(ctr), Some(li)) = (self.vote, self.vote_ctr, self.local_index) else {
             return Err("wave ballot outside lockstep mode".into());
@@ -864,18 +931,30 @@ impl<'a> T<'a> {
         let kn = e(self.b.u_mod(u, None, kn, three))?;
         ok(self.b.store(ctr, kn, None, []))?;
         let base = e(self.b.i_mul(u, None, k, two))?;
-        let k5 = self.u(5);
-        let half = e(self.b.shift_right_logical(u, None, li, k5))?;
-        let idx = e(self.b.i_add(u, None, base, half))?;
         let k31 = self.u(31);
         let pos = e(self.b.bitwise_and(u, None, li, k31))?;
         let bit = e(self.b.shift_left_logical(u, None, one, pos))?;
+        let z = self.u(0);
+        let mine = e(self.b.select(u, None, c, bit, z))?;
+        let k32 = self.u(32);
+        let lower = e(self.b.u_less_than(self.t.bool_, None, li, k32))?;
+        let lo_part = e(self.b.select(u, None, lower, mine, z))?;
+        let hi_part = e(self.b.select(u, None, lower, z, mine))?;
+        self.b.capability(Capability::GroupNonUniform);
+        self.b.capability(Capability::GroupNonUniformArithmetic);
+        let sg = self.u(spirv::Scope::Subgroup as u32);
+        let lo_sum = e(self.b.group_non_uniform_bitwise_or(u, None, sg, spirv::GroupOperation::Reduce, lo_part, None))?;
+        let hi_sum = e(self.b.group_non_uniform_bitwise_or(u, None, sg, spirv::GroupOperation::Reduce, hi_part, None))?;
+        let elected = e(self.b.group_non_uniform_elect(self.t.bool_, None, sg))?;
         let p_wg = self.b.type_pointer(None, StorageClass::Workgroup, u);
-        self.guarded(c, &mut |tr| {
-            let p = e(tr.b.access_chain(p_wg, None, vote, [idx]))?;
+        self.guarded(elected, &mut |tr| {
             let scope = tr.u(spirv::Scope::Workgroup as u32);
             let sem = tr.u(0);
-            e(tr.b.atomic_or(u, None, p, scope, sem, bit))?;
+            let p = e(tr.b.access_chain(p_wg, None, vote, [base]))?;
+            e(tr.b.atomic_or(u, None, p, scope, sem, lo_sum))?;
+            let base1 = e(tr.b.i_add(u, None, base, one))?;
+            let p = e(tr.b.access_chain(p_wg, None, vote, [base1]))?;
+            e(tr.b.atomic_or(u, None, p, scope, sem, hi_sum))?;
             Ok(())
         })?;
         self.workgroup_barrier()?;
@@ -887,7 +966,6 @@ impl<'a> T<'a> {
         let old = e(self.b.i_add(u, None, k, two))?;
         let old = e(self.b.u_mod(u, None, old, three))?;
         let old = e(self.b.i_mul(u, None, old, two))?;
-        let z = self.u(0);
         let first = e(self.b.i_equal(self.t.bool_, None, li, z))?;
         self.guarded(first, &mut |tr| {
             let p = e(tr.b.access_chain(p_wg, None, vote, [old]))?;
@@ -1255,6 +1333,8 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         sb_u32: b.type_pointer(None, StorageClass::StorageBuffer, u32t),
     };
     let sampler_ty = b.type_sampler();
+    let (lockstep, one_wave) = lockstep_mode(spec, code);
+    let wave_masks = lockstep && one_wave && wave_masks_wanted(spec.code_base);
     let mut tr = T {
         b,
         t,
@@ -1299,8 +1379,14 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         lds_state: 0,
         sg_lane_var: None,
         lane_slots: HashMap::new(),
-        own_lane_reads: atomic_result_reads(code),
-        elections: lane0_elections(code, spec),
+        image_tables: HashMap::new(),
+        table_offsets: HashMap::new(),
+        // In wave-mask mode lane reads and elections are exact.
+        own_lane_reads: if wave_masks { BTreeSet::new() } else { atomic_result_reads(code) },
+        elections: if wave_masks { HashMap::new() } else { lane0_elections(code, spec) },
+        wave_masks,
+        complete: if wave_masks { crate::wavemask::complete_masks(code, spec.wave64) } else { Default::default() },
+        own_bit: None,
         warnings: Vec::new(),
         params: 0,
         mrt_mask: 0,
@@ -1389,7 +1475,37 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
                 tr.decorate_binding(v, bnd);
                 tr.samplers.insert(i, v);
             }
-            (ResKind::Image, _) => return Err(format!("image resource {i} has no specialization")),
+            (ResKind::ImageTable, Some(ResSpec::Image { dim, class })) => {
+                if r.written {
+                    return Err(format!("image table {i} is written (storage tables unsupported)"));
+                }
+                let (dim, class) = (*dim, *class);
+                let sampled_ty = match class {
+                    NumClass::Float => tr.t.f32,
+                    NumClass::Sint => tr.t.i32,
+                    NumClass::Uint => tr.t.u32,
+                };
+                let (sd, arrayed) = match dim {
+                    ImageDim::D1 | ImageDim::D2 | ImageDim::D2Msaa => (spirv::Dim::Dim2D, 0),
+                    ImageDim::D3 => (spirv::Dim::Dim3D, 0),
+                    ImageDim::Cube => (spirv::Dim::DimCube, 0),
+                    ImageDim::CubeArray => (spirv::Dim::DimCube, 1),
+                    ImageDim::D1Array | ImageDim::D2Array | ImageDim::D2MsaaArray => (spirv::Dim::Dim2D, 1),
+                };
+                tr.b.extension("SPV_EXT_descriptor_indexing");
+                tr.b.capability(Capability::ShaderNonUniform);
+                tr.b.capability(Capability::SampledImageArrayNonUniformIndexing);
+                let img_ty = tr.b.type_image(sampled_ty, sd, 0, arrayed, 0, 1, spirv::ImageFormat::Unknown, None);
+                let n = tr.u(IMAGE_TABLE_LEN);
+                let arr = tr.b.type_array(img_ty, n);
+                let pt = tr.b.type_pointer(None, StorageClass::UniformConstant, arr);
+                let v = tr.global_var(pt, StorageClass::UniformConstant);
+                let bnd = tr.alloc_binding(BindingKind::ImageArray(i));
+                tr.decorate_binding(v, bnd);
+                tr.images.insert(i, ImageRes { var: v, img_ty, dim, class, storage: false });
+                tr.image_tables.insert(i, r.table.ok_or("image table without its load")?);
+            }
+            (ResKind::Image | ResKind::ImageTable, _) => return Err(format!("image resource {i} has no specialization")),
         }
     }
     // Function.
@@ -1418,12 +1534,16 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         let z = tr.u(0);
         tr.probe_var = Some(tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, Some(z)));
     }
+    let mut table_pcs: Vec<u32> = tr.image_tables.values().copied().collect();
+    table_pcs.sort();
+    table_pcs.dedup();
+    for pc in table_pcs {
+        let z = tr.u(0);
+        let v = tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, Some(z));
+        tr.table_offsets.insert(pc, v);
+    }
     // Lockstep mode (see the module documentation).
-    let threads: u32 = spec.cs_local_size.iter().map(|&x| x.max(1)).product();
-    let uses_lds = code.iter().any(|i| i.enc == Enc::Ds && !i.ds_gds() && !matches!(i.name(), Some("ds_swizzle_b32" | "ds_bpermute_b32" | "ds_permute_b32")));
-    let one_wave = threads <= if spec.wave64 { 64 } else { 32 };
-    let wave_scalars = spec.cs_rsrc2 & (1 << 10) != 0 || code.iter().any(|i| matches!(i.base_name(), Some("v_readlane_b32" | "v_readfirstlane_b32")));
-    tr.lockstep = spec.stage == Stage::Compute && uses_lds && (one_wave || !wave_scalars) && std::env::var("DS_LOCKSTEP").ok().as_deref() != Some("0");
+    tr.lockstep = lockstep;
     if tr.lockstep {
         let z = tr.u(0);
         tr.vote_ctr = Some(tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, Some(z)));
@@ -1449,15 +1569,31 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     ok(tr.b.store(tr.sgpr, zs, None, []))?;
     let zv = tr.b.constant_null(arr_v);
     ok(tr.b.store(tr.vgpr, zv, None, []))?;
-    // EXEC holds this lane's bit (bit 0) only.
-    let one = tr.u(1);
-    tr.set_sreg(crate::OP_EXEC_LO as u32, one)?;
-    tr.set_sreg(crate::OP_EXEC_HI as u32, zero)?;
+    // EXEC holds this lane's bit (bit 0) only; in wave-mask mode the lanes
+    // of the wave.
+    let (exec_lo, exec_hi) = if tr.wave_masks {
+        let threads: u32 = spec.cs_local_size.iter().map(|&x| x.max(1)).product();
+        let lo = if threads >= 32 { u32::MAX } else { (1u32 << threads) - 1 };
+        let hi = if !spec.wave64 || threads <= 32 { 0 } else if threads >= 64 { u32::MAX } else { (1u32 << (threads - 32)) - 1 };
+        (tr.u(lo), tr.u(hi))
+    } else {
+        (tr.u(1), zero)
+    };
+    tr.set_sreg(crate::OP_EXEC_LO as u32, exec_lo)?;
+    tr.set_sreg(crate::OP_EXEC_HI as u32, exec_hi)?;
     for i in 0..spec.user_sgprs.min(SGPR_DATA_USER as u16) as u32 {
         let v = tr.sgpr_data(i)?;
         tr.set_sreg(spec.user_base as u32 + i, v)?;
     }
     mem::stage_inputs(&mut tr)?;
+    if tr.wave_masks {
+        let lane = tr.lane()?;
+        let k32 = tr.u(32);
+        let k31 = tr.u(31);
+        let in_hi = e(tr.b.u_greater_than_equal(tr.t.bool_, None, lane, k32))?;
+        let sh = e(tr.b.bitwise_and(tr.t.u32, None, lane, k31))?;
+        tr.own_bit = Some((in_hi, sh));
+    }
     if let (Some(vote), Some(li)) = (tr.vote, tr.local_index) {
         // Ballot slots start cleared.
         let z = tr.u(0);
@@ -1532,6 +1668,27 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, compare_samplers, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings })
 }
 
+/// Wave-mask mode for the shader at `addr` (diagnosis: `DS_WAVEMASK=0`
+/// disables it, `DS_WAVEMASK=<hex address>[,...]` keeps it for those
+/// shaders only).
+fn wave_masks_wanted(addr: u64) -> bool {
+    match std::env::var("DS_WAVEMASK") {
+        Err(_) => true,
+        Ok(v) => v.split(',').any(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).is_ok_and(|x| x == addr && x != 0)),
+    }
+}
+
+/// Lockstep mode, and whether the workgroup is a single wave (see the
+/// module documentation).
+fn lockstep_mode(spec: &Spec, code: &[Inst]) -> (bool, bool) {
+    let threads: u32 = spec.cs_local_size.iter().map(|&x| x.max(1)).product();
+    let uses_lds = code.iter().any(|i| i.enc == Enc::Ds && !i.ds_gds() && !matches!(i.name(), Some("ds_swizzle_b32" | "ds_bpermute_b32" | "ds_permute_b32")));
+    let one_wave = threads <= if spec.wave64 { 64 } else { 32 };
+    let wave_scalars = spec.cs_rsrc2 & (1 << 10) != 0 || code.iter().any(|i| matches!(i.base_name(), Some("v_readlane_b32" | "v_readfirstlane_b32")));
+    let lockstep = spec.stage == Stage::Compute && uses_lds && (one_wave || !wave_scalars) && std::env::var("DS_LOCKSTEP").ok().as_deref() != Some("0");
+    (lockstep, one_wave)
+}
+
 const PC_EXIT: u32 = 0xFFFF_FFFF;
 
 /// Branch condition of a conditional SOPP branch (None = always taken).
@@ -1539,7 +1696,7 @@ const PC_EXIT: u32 = 0xFFFF_FFFF;
 fn branch_cond(tr: &mut T, ins: &Inst, before: &[Inst]) -> R<Option<Word>> {
     let name = ins.name().unwrap_or("");
     let bt = tr.t.bool_;
-    if tr.lockstep && tr.uniformity.divergent_branches.contains(&ins.pc) {
+    if tr.lockstep && !tr.wave_masks && tr.uniformity.divergent_branches.contains(&ins.pc) {
         // The wave's decision: EXEC/VCC zero when no lane has its bit; SCC
         // from lane masks is the OR of the lanes' SCC (results != 0), or the
         // AND for equality compares.
@@ -1862,6 +2019,36 @@ mod tests {
         assert_eq!(per_vertex_attrs(&code).into_iter().collect::<Vec<_>>(), vec![0]);
         let code = crate::decode_program(&[0xc80a0002, 0xbf810000]).unwrap();
         assert!(per_vertex_attrs(&code).is_empty());
+    }
+
+    /// Wave-mask mode (one wave, LDS): the compare whose mask is counted
+    /// gets a ballot (two subgroup ORs), the one only selected from does
+    /// not; the module parses.
+    #[test]
+    fn wave_mask_ballots_only_whole_reads() {
+        use crate::tables::*;
+        let op = |t: Table, n: &str| t.iter().find(|(_, x)| x.split('/').next() == Some(n)).unwrap().0 as u32;
+        let vopc = |o: u32, s0: u32, v1: u32| (0x3E << 25) | (o << 17) | (v1 << 9) | s0;
+        let words = [
+            vopc(op(VOPC, "v_cmp_gt_u32"), 0xA0, 0),                              // vcc = 32 > v0
+            (0x17D << 23) | (4 << 16) | (op(SOP1, "s_bcnt1_i32_b64") << 8) | 106, // s4 = popcount(vcc)
+            vopc(op(VOPC, "v_cmp_lt_f32"), 256, 1),                               // vcc = v0 < v1
+            (op(VOP2, "v_cndmask_b32") << 25) | (2 << 17) | (1 << 9) | 256,       // v2 = vcc ? v1 : v0
+            (0x3F << 25) | (3 << 17) | (op(VOP1, "v_mov_b32") << 9) | 4,          // v3 = s4
+            (0x36 << 26) | (op(DS, "ds_write_b32") << 18),                        // ds_write_b32 v0, v3
+            3 << 8,
+            0xBF81_0000, // s_endpgm
+        ];
+        let code = crate::decode_program(&words).unwrap();
+        assert_eq!(crate::wavemask::complete_masks(&code, true).into_iter().collect::<Vec<_>>(), vec![code[0].pc]);
+        let plan = crate::analysis::analyze(&code, 2, 0, 0);
+        let mut spec = cs_spec([64, 1, 1]);
+        spec.cs_rsrc2 = 1 << 15;
+        let out = translate(&code, &plan, &spec).unwrap();
+        let mut loader = rspirv::dr::Loader::new();
+        rspirv::binary::parse_words(&out.spirv, &mut loader).unwrap();
+        let ors = loader.module().functions.iter().flat_map(|f| f.blocks.iter()).flat_map(|b| b.instructions.iter()).filter(|i| i.class.opcode == spirv::Op::GroupNonUniformBitwiseOr).count();
+        assert_eq!(ors, 2);
     }
 
     /// The counting kernel (cs 0x10088aa500) sums the class masks with DPP

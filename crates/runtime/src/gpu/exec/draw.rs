@@ -248,7 +248,7 @@ fn set_layout_bindings(stages: &[(&Prepared, vk::ShaderStageFlags)]) -> Vec<vk::
     let mut v = Vec::new();
     for (p, flags) in stages {
         for b in &p.tr.out.bindings {
-            v.push(vk::DescriptorSetLayoutBinding::default().binding(b.binding).descriptor_type(descriptor_type(b.kind)).descriptor_count(1).stage_flags(*flags));
+            v.push(vk::DescriptorSetLayoutBinding::default().binding(b.binding).descriptor_type(descriptor_type(b.kind)).descriptor_count(super::binding_count(b.kind)).stage_flags(*flags));
         }
     }
     v

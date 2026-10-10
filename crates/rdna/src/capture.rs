@@ -101,7 +101,7 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
             ResKind::Buffer => ResSpec::Buffer { format: 77, dst_sel: 0xFAC },
             ResKind::Global => ResSpec::Global,
             ResKind::Sampler => ResSpec::Sampler,
-            ResKind::Image => {
+            ResKind::Image | ResKind::ImageTable => {
                 let dim = insts
                     .iter()
                     .find(|i| i.enc == crate::Enc::Mimg && plan.inst_res.get(&i.pc).is_some_and(|x| x.0 == r))

@@ -75,7 +75,7 @@ pub fn writes_scc(ins: &Inst) -> bool {
 }
 
 /// Scalar ops that do not write SCC.
-fn keeps_scc(name: &str) -> bool {
+pub(crate) fn keeps_scc(name: &str) -> bool {
     name.starts_with("s_mov")
         || name.starts_with("s_cmov")
         || name.starts_with("s_cselect")
@@ -201,61 +201,93 @@ fn branch_divergent(st: &Dep, ins: &Inst) -> bool {
     }
 }
 
-pub fn analyze(code: &[Inst]) -> Uniformity {
-    let n = code.len();
-    let mut block_of = HashMap::new();
-    let mut divergent_branches = HashSet::new();
-    if n == 0 {
-        return Uniformity { block_of, uniform: Vec::new(), divergent_branches };
-    }
-    let index: HashMap<u32, usize> = code.iter().enumerate().map(|(i, ins)| (ins.pc, i)).collect();
-    let mut starts = std::collections::BTreeSet::new();
-    starts.insert(0usize);
-    for (i, ins) in code.iter().enumerate() {
-        if let Some(t) = ins.branch_target() {
-            if let Some(&j) = index.get(&t) {
-                starts.insert(j);
+/// Basic blocks of a program and their successors (block `exit()` is the
+/// virtual exit).
+pub(crate) struct Cfg {
+    /// Index of each block's first instruction.
+    pub starts: Vec<usize>,
+    pub succ: Vec<Vec<usize>>,
+    n: usize,
+}
+
+impl Cfg {
+    pub fn new(code: &[Inst]) -> Cfg {
+        let n = code.len();
+        if n == 0 {
+            return Cfg { starts: Vec::new(), succ: Vec::new(), n };
+        }
+        let index: HashMap<u32, usize> = code.iter().enumerate().map(|(i, ins)| (ins.pc, i)).collect();
+        let mut starts = std::collections::BTreeSet::new();
+        starts.insert(0usize);
+        for (i, ins) in code.iter().enumerate() {
+            if let Some(t) = ins.branch_target() {
+                if let Some(&j) = index.get(&t) {
+                    starts.insert(j);
+                }
+                if i + 1 < n {
+                    starts.insert(i + 1);
+                }
             }
-            if i + 1 < n {
+            if ins.is_endpgm() && i + 1 < n {
                 starts.insert(i + 1);
             }
         }
-        if ins.is_endpgm() && i + 1 < n {
-            starts.insert(i + 1);
-        }
+        let starts: Vec<usize> = starts.into_iter().collect();
+        let nb = starts.len();
+        let at: HashMap<usize, usize> = starts.iter().enumerate().map(|(b, &s)| (s, b)).collect();
+        let end = |b: usize| starts.get(b + 1).copied().unwrap_or(n);
+        let exit = nb;
+        let succ: Vec<Vec<usize>> = (0..nb)
+            .map(|b| {
+                let e = end(b);
+                let last = &code[e - 1];
+                if last.is_endpgm() {
+                    return vec![exit];
+                }
+                let mut v = Vec::new();
+                match last.branch_target() {
+                    Some(t) => {
+                        v.push(index.get(&t).map(|j| at[j]).unwrap_or(exit));
+                        if last.name() != Some("s_branch") {
+                            v.push(if e < n { at[&e] } else { exit });
+                        }
+                    }
+                    None => v.push(if e < n { b + 1 } else { exit }),
+                }
+                v.dedup();
+                v
+            })
+            .collect();
+        Cfg { starts, succ, n }
     }
-    let starts: Vec<usize> = starts.into_iter().collect();
+
+    /// One past the last instruction of block `b`.
+    pub fn end(&self, b: usize) -> usize {
+        self.starts.get(b + 1).copied().unwrap_or(self.n)
+    }
+
+    pub fn exit(&self) -> usize {
+        self.starts.len()
+    }
+}
+
+pub fn analyze(code: &[Inst]) -> Uniformity {
+    let mut block_of = HashMap::new();
+    let mut divergent_branches = HashSet::new();
+    if code.is_empty() {
+        return Uniformity { block_of, uniform: Vec::new(), divergent_branches };
+    }
+    let cfg = Cfg::new(code);
+    let starts = &cfg.starts;
     let nb = starts.len();
-    let at: HashMap<usize, usize> = starts.iter().enumerate().map(|(b, &s)| (s, b)).collect();
-    let end = |b: usize| starts.get(b + 1).copied().unwrap_or(n);
+    let end = |b: usize| cfg.end(b);
     for b in 0..nb {
         for ins in &code[starts[b]..end(b)] {
             block_of.insert(ins.pc, b);
         }
     }
-    // Successors (nb = virtual exit).
-    let exit = nb;
-    let succ: Vec<Vec<usize>> = (0..nb)
-        .map(|b| {
-            let e = end(b);
-            let last = &code[e - 1];
-            if last.is_endpgm() {
-                return vec![exit];
-            }
-            let mut v = Vec::new();
-            match last.branch_target() {
-                Some(t) => {
-                    v.push(index.get(&t).map(|j| at[j]).unwrap_or(exit));
-                    if last.name() != Some("s_branch") {
-                        v.push(if e < n { at[&e] } else { exit });
-                    }
-                }
-                None => v.push(if e < n { b + 1 } else { exit }),
-            }
-            v.dedup();
-            v
-        })
-        .collect();
+    let exit = cfg.exit();
+    let succ = &cfg.succ;
     // Lane dependence at block ends (forward, union at joins).
     let mut entry: Vec<Option<Dep>> = vec![None; nb];
     entry[0] = Some([false; 129]);

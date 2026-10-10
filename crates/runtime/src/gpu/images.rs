@@ -500,6 +500,8 @@ pub struct Images {
     pub overwrite_uploads: u64,
     /// Images reported for buffer writes covering only part of them.
     partial_seen: std::collections::HashSet<u64>,
+    /// Zero images for unused image table entries, by view type.
+    dummies: HashMap<vk::ImageViewType, vk::ImageView>,
 }
 
 unsafe impl Send for Images {}
@@ -518,7 +520,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
                 .expect("image pool");
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
-            *g = Some(Images { map: HashMap::new(), gpu_bases: Default::default(), stencil_of: HashMap::new(), meta_of: HashMap::new(), pending_clears: HashMap::new(), samplers: HashMap::new(), pool, cmd, fence, reported: HashMap::new(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default() });
+            *g = Some(Images { map: HashMap::new(), gpu_bases: Default::default(), stencil_of: HashMap::new(), meta_of: HashMap::new(), pending_clears: HashMap::new(), samplers: HashMap::new(), pool, cmd, fence, reported: HashMap::new(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::new() });
         }
     }
     f(g.as_mut().unwrap())
@@ -773,6 +775,32 @@ impl Images {
         }
         self.uploads += 1;
         Ok((t.base, size))
+    }
+
+    /// A 1x1 zero image view of a dimension (unused image table entries).
+    pub fn dummy_view(&mut self, dim: rdna::translate::ImageDim) -> Result<vk::ImageView, String> {
+        use rdna::translate::ImageDim as D;
+        let (vt, layers, ty3d) = match dim {
+            D::D1 | D::D2 | D::D2Msaa => (vk::ImageViewType::TYPE_2D, 1, false),
+            D::D1Array | D::D2Array | D::D2MsaaArray => (vk::ImageViewType::TYPE_2D_ARRAY, 1, false),
+            D::Cube => (vk::ImageViewType::CUBE, 6, false),
+            D::CubeArray => (vk::ImageViewType::CUBE_ARRAY, 6, false),
+            D::D3 => (vk::ImageViewType::TYPE_3D, 1, true),
+        };
+        if let Some(&v) = self.dummies.get(&vt) {
+            return Ok(v);
+        }
+        let key = ImageKey { base: 0, format: vk::Format::R8G8B8A8_UNORM, width: 1, height: 1, layers, levels: 1, ty3d, cube: layers == 6 };
+        let image = self.create(key)?;
+        self.to_general(image, key.format);
+        let ci = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vt)
+            .format(key.format)
+            .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: if ty3d { 1 } else { layers } });
+        let v = unsafe { ctx().device.create_image_view(&ci, None) }.map_err(|e| format!("dummy view {vt:?}: {e}"))?;
+        self.dummies.insert(vt, v);
+        Ok(v)
     }
 
     /// Key of the image a T# describes.

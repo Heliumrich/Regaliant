@@ -24,6 +24,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 mod draw;
 pub(crate) use draw::{color_surface, depth_surface, set_equal_bias, toggle_skip_vs};
+
+/// Dispatches of compute shaders on this list are skipped (`skipcs` control
+/// command; diagnosis).
+static SKIP_CS: parking_lot::Mutex<Option<std::collections::HashSet<u64>>> = parking_lot::Mutex::new(None);
+
+/// Adds or removes a compute shader address; returns whether it is listed now.
+pub fn toggle_skip_cs(addr: u64) -> bool {
+    let mut g = SKIP_CS.lock();
+    let s = g.get_or_insert_with(Default::default);
+    if s.remove(&addr) {
+        false
+    } else {
+        s.insert(addr);
+        true
+    }
+}
+
+fn cs_addr(cp: &Cp) -> u64 {
+    ((cp.reg(Space::Sh, 0x20C) as u64) | ((cp.reg(Space::Sh, 0x20D) as u64 & 0xFF) << 32)) << 8
+}
 pub use draw::DrawArgs;
 
 pub static EXECUTED: AtomicU64 = AtomicU64::new(0);
@@ -332,7 +352,7 @@ fn compute_pipeline(out: &rdna::translate::Output) -> Result<Pipe, String> {
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(b.binding)
                         .descriptor_type(descriptor_type(b.kind))
-                        .descriptor_count(1)
+                        .descriptor_count(binding_count(b.kind))
                         .stage_flags(vk::ShaderStageFlags::COMPUTE)
                 })
                 .collect();
@@ -460,10 +480,15 @@ pub fn pipeline_test(capture: &str) -> i32 {
 fn descriptor_type(k: BindingKind) -> vk::DescriptorType {
     match k {
         BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Gds | BindingKind::Debug | BindingKind::Watchdog => vk::DescriptorType::STORAGE_BUFFER,
-        BindingKind::Image(_) => vk::DescriptorType::SAMPLED_IMAGE,
+        BindingKind::Image(_) | BindingKind::ImageArray(_) => vk::DescriptorType::SAMPLED_IMAGE,
         BindingKind::StorageImage(_) => vk::DescriptorType::STORAGE_IMAGE,
         BindingKind::Sampler(_) => vk::DescriptorType::SAMPLER,
     }
+}
+
+/// Descriptors in a binding (image tables are arrays).
+fn binding_count(k: BindingKind) -> u32 {
+    if matches!(k, BindingKind::ImageArray(_)) { rdna::translate::IMAGE_TABLE_LEN } else { 1 }
 }
 
 fn global_barrier(cmd: vk::CommandBuffer) {
@@ -498,6 +523,8 @@ fn trace_loads(queue: &str, p: &Prepared, groups: [u32; 3]) {
 struct Bound {
     bufs: Vec<(u32, vk::DescriptorBufferInfo)>,
     imgs: Vec<(u32, vk::DescriptorType, vk::DescriptorImageInfo)>,
+    /// Sampled image arrays (image tables).
+    img_arrays: Vec<(u32, Vec<vk::DescriptorImageInfo>)>,
     /// Guest ranges the stage writes.
     writes: Vec<(u64, u64)>,
     /// Those described by buffer descriptors (not unbounded pointers).
@@ -593,9 +620,11 @@ fn texture_ranges(p: &Prepared) -> Vec<(u64, u64)> {
     p.resources
         .iter()
         .filter_map(|r| match r {
-            Resolved::Image(t) => Some((t.base, (t.width as u64 * t.height as u64 * t.depth.max(1) as u64 * 16).min(1 << 30))),
+            Resolved::Image(t) => Some(vec![(t.base, (t.width as u64 * t.height as u64 * t.depth.max(1) as u64 * 16).min(1 << 30))]),
+            Resolved::ImageTable(e) => Some(e.iter().flatten().map(|t| (t.base, (t.width as u64 * t.height as u64 * t.depth.max(1) as u64 * 16).min(1 << 30))).collect()),
             _ => None,
         })
+        .flatten()
         .collect()
 }
 /// Batches in flight per queue: one recording while the other executes.
@@ -710,6 +739,13 @@ pub(crate) fn image_keys(p: &Prepared) -> Vec<super::images::ImageKey> {
             let storage = p.tr.plan.resources.get(i).is_some_and(|x| x.written);
             if let Some(k) = super::images::with(|im| im.resolved_key(t, storage)) {
                 v.push(k);
+            }
+        }
+        if let Resolved::ImageTable(e) = r {
+            for t in e.iter().flatten() {
+                if let Some(k) = super::images::with(|im| im.resolved_key(t, false)) {
+                    v.push(k);
+                }
             }
         }
     }
@@ -1232,7 +1268,7 @@ impl Exec {
             for b in &p.tr.out.bindings {
                 let ty = descriptor_type(b.kind);
                 if let Some(k) = POOL_TYPES.iter().position(|&t| t == ty) {
-                    need[1 + k] += 1;
+                    need[1 + k] += binding_count(b.kind);
                 }
             }
         }
@@ -1274,7 +1310,7 @@ impl Exec {
     /// info blocks of its SGPR data.
     fn bind_stage(&mut self, p: &mut Prepared, allow_shadow: bool) -> Result<Bound, String> {
         let res_info = rdna::translate::res_info_offset(&p.tr.plan) as usize;
-        let mut bound = Bound { bufs: Vec::new(), imgs: Vec::new(), writes: Vec::new(), sized_writes: Vec::new(), images: Vec::new(), shadows: Vec::new() };
+        let mut bound = Bound { bufs: Vec::new(), imgs: Vec::new(), img_arrays: Vec::new(), writes: Vec::new(), sized_writes: Vec::new(), images: Vec::new(), shadows: Vec::new() };
         let seg = SHADOW_BYTES;
         let shadow_base = seg * self.cur as u64;
         {
@@ -1370,7 +1406,32 @@ impl Exec {
                     let smp = super::images::with(|im| im.sampler(*sm, compare))?;
                     bound.imgs.push((b.binding, vk::DescriptorType::SAMPLER, vk::DescriptorImageInfo { sampler: smp, image_view: vk::ImageView::null(), image_layout: vk::ImageLayout::UNDEFINED }));
                 }
-                (BindingKind::Image(_) | BindingKind::StorageImage(_) | BindingKind::Sampler(_), _) => return Err("binding/resource mismatch".into()),
+                (BindingKind::ImageArray(_), Some(Resolved::ImageTable(entries))) => {
+                    let dim = entries.iter().flatten().find_map(|t| rdna::translate::ImageDim::from_type(t.ty, t.depth)).ok_or("image table without entries")?;
+                    let mut infos = Vec::with_capacity(rdna::translate::IMAGE_TABLE_LEN as usize);
+                    for k in 0..rdna::translate::IMAGE_TABLE_LEN as usize {
+                        let view = match entries.get(k).copied().flatten() {
+                            Some(t) => match super::images::with(|im| im.view(&t, false, frame)) {
+                                Ok((view, image)) => {
+                                    bound.images.push(image);
+                                    Some(view)
+                                }
+                                Err(e) => {
+                                    self.report(format!("image table entry {:#x}: {e}", t.base));
+                                    None
+                                }
+                            },
+                            None => None,
+                        };
+                        let view = match view {
+                            Some(v) => v,
+                            None => super::images::with(|im| im.dummy_view(dim))?,
+                        };
+                        infos.push(vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL });
+                    }
+                    bound.img_arrays.push((b.binding, infos));
+                }
+                (BindingKind::Image(_) | BindingKind::StorageImage(_) | BindingKind::ImageArray(_) | BindingKind::Sampler(_), _) => return Err("binding/resource mismatch".into()),
                 _ => {}
             }
         }
@@ -1405,6 +1466,9 @@ impl Exec {
             for (binding, ty, info) in &b.imgs {
                 writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(*ty).image_info(std::slice::from_ref(info)));
             }
+            for (binding, infos) in &b.img_arrays {
+                writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(vk::DescriptorType::SAMPLED_IMAGE).image_info(infos));
+            }
         }
         unsafe { ctx().device.update_descriptor_sets(&writes, &[]) };
     }
@@ -1412,6 +1476,10 @@ impl Exec {
     /// Executes a dispatch of `groups` thread groups with the compute state of `cp`.
     pub fn dispatch(&mut self, cp: &Cp, groups: [u32; 3], initiator: u32) {
         if DEVICE_LOST.load(Ordering::Relaxed) {
+            SKIPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if SKIP_CS.lock().as_ref().is_some_and(|s| s.contains(&cs_addr(cp))) {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }

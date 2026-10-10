@@ -199,6 +199,11 @@ fn note_textures(map: &mut std::collections::BTreeMap<u64, super::desc::Tsharp>,
         if let super::shaders::Resolved::Image(t) = r {
             map.entry(t.base).or_insert(*t);
         }
+        if let super::shaders::Resolved::ImageTable(e) = r {
+            for t in e.iter().flatten() {
+                map.entry(t.base).or_insert(*t);
+            }
+        }
     }
 }
 
@@ -244,6 +249,18 @@ static DRAW_RANGE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
 
 pub fn set_draw_range(r: (u64, u64)) {
     *DRAW_RANGE.lock() = Some(r);
+}
+
+/// Pixel shaders whose draws get target reports in every captured frame
+/// (`capture ps=<hex>[,<hex>...]`), wherever they fall in the frame.
+static DRAW_PS: Mutex<Option<Vec<u64>>> = Mutex::new(None);
+
+pub fn set_draw_ps(list: Vec<u64>) {
+    *DRAW_PS.lock() = Some(list);
+}
+
+fn ps_listed(cp: &Cp) -> bool {
+    DRAW_PS.lock().as_ref().is_some_and(|l| l.contains(&super::shaders::ps_addr(cp)))
 }
 
 fn dumps_env() -> Option<(u64, u64)> {
@@ -309,6 +326,9 @@ pub fn set_watch_pixel(p: Option<(u32, u32)>) {
     *WATCH_PIXEL.lock() = p;
 }
 
+/// Last watched-pixel value per image written by dispatches.
+static LAST_PIXEL: Mutex<Option<std::collections::HashMap<u64, Vec<u8>>>> = Mutex::new(None);
+
 /// Previous contents of dumped images (changed-pixel counts).
 static LAST_DUMP: Mutex<Option<std::collections::HashMap<(u64, bool), Vec<u8>>>> = Mutex::new(None);
 
@@ -321,8 +341,13 @@ fn changed(key: (u64, bool), raw: &[u8], texel: usize) -> Option<usize> {
 }
 
 fn dump_draw_target(cp: &Cp, event: u64) -> Option<String> {
-    let (lo, hi) = dumps_env()?;
-    if event < lo || event > hi {
+    let listed = ps_listed(cp);
+    let (lo, hi) = match dumps_env() {
+        Some(r) => r,
+        None if listed => (u64::MAX, u64::MAX),
+        None => return None,
+    };
+    if !listed && (event < lo || event > hi) {
         return None;
     }
     let mut out = Vec::new();
@@ -348,6 +373,10 @@ fn dump_draw_target(cp: &Cp, event: u64) -> Option<String> {
                 let ch = match watch {
                     Some((x, y, Some(b), a)) if b != a => format!("{ch}; px({x},{y}) {} -> {}", hex(&b), hex(&a)),
                     Some((x, y, None, a)) => format!("{ch}; px({x},{y}) {}", hex(&a)),
+                    _ => ch,
+                };
+                let ch = match (listed, super::images::float_stats(format, &raw)) {
+                    (true, Some(st)) => format!("{ch}; {st}"),
                     _ => ch,
                 };
                 let name = format!("{event:04}_{:010x}.png", s.base);
@@ -431,7 +460,7 @@ pub fn draw(cp: &Cp, what: &str) {
         cp.reg(Space::Uc, 0x25B),
         cp.last_draw
     );
-    if dumps_env().is_some() {
+    if dumps_env().is_some() || ps_listed(cp) {
         if let Some(n) = dump_draw_target(cp, c.events) {
             let _ = writeln!(s, "    target after draw: {n}");
         }
@@ -658,11 +687,28 @@ pub fn dispatch(cp: &Cp, what: &str) {
                             let _ = std::fs::write(dir.join(name.replace(".png", &format!("_{w}x{h}x{texel}.raw"))), raw);
                         }
                     }
+                    // The watched pixel (scaled to images smaller than 2560x1440).
+                    let watch = match *WATCH_PIXEL.lock() {
+                        Some((x, y)) => super::images::with(|im| im.snapshot_raw(t)).ok().and_then(|(raw, w, h, texel)| {
+                            let (sx, sy) = if w < 2560 || h < 1440 { (x * w / 2560, y * h / 1440) } else { (x, y) };
+                            let o = (sy as usize * w as usize + sx as usize) * texel as usize;
+                            let now = raw.get(o..o + texel as usize)?.to_vec();
+                            let hex = |b: &[u8]| b.iter().rev().map(|x| format!("{x:02x}")).collect::<String>();
+                            let mut g = LAST_PIXEL.lock();
+                            let before = g.get_or_insert_with(Default::default).insert(t.base, now.clone());
+                            Some(match before {
+                                Some(b) if b != now => format!(" px({sx},{sy}) {} -> {}", hex(&b), hex(&now)),
+                                Some(_) => format!(" px({sx},{sy}) unchanged {}", hex(&now)),
+                                None => format!(" px({sx},{sy}) {}", hex(&now)),
+                            })
+                        }),
+                        None => None,
+                    };
                     let r = super::images::with(|im| im.snapshot(t));
                     match r {
                         Ok((rgba, w, h, stats)) => {
                             let _ = std::fs::write(dir.join(&name), super::png::encode(w, h, &rgba));
-                            let _ = writeln!(s, "      image after dispatch: {name}{}", stats.map(|x| format!(" ({x})")).unwrap_or_default());
+                            let _ = writeln!(s, "      image after dispatch: {name}{}{}", stats.map(|x| format!(" ({x})")).unwrap_or_default(), watch.unwrap_or_default());
                         }
                         Err(e) => {
                             let _ = writeln!(s, "      image after dispatch: {name} failed: {e}");

@@ -339,6 +339,10 @@ pub fn smem(tr: &mut T, ins: &Inst) -> R<()> {
             let so = tr.operand(ins, ins.smem_soffset())?;
             off = e(tr.b.i_add(u, None, off, so))?;
         }
+        if let Some(&v) = tr.table_offsets.get(&ins.pc) {
+            // The table entry this load reads (an image table's index).
+            ok(tr.b.store(v, off, None, []))?;
+        }
         let km = tr.u(!3);
         let off = e(tr.b.bitwise_and(u, None, off, km))?;
         let bias = tr.res_info(r, 0)?;
@@ -1101,7 +1105,27 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
         NumClass::Sint => tr.t.i32,
         NumClass::Uint => u,
     };
-    let image = e(tr.b.load(img_ty, None, var, None, []))?;
+    let table = tr.image_tables.get(&ri).copied();
+    let image = match table {
+        Some(pc) => {
+            // The T# came from a table at a run-time offset: index the array
+            // of its entries (32 bytes each), per invocation.
+            let ov = *tr.table_offsets.get(&pc).ok_or_else(|| format!("{:#x}: image table load {pc:#x} not translated", ins.pc))?;
+            let off = e(tr.b.load(u, None, ov, None, []))?;
+            let k5 = tr.u(5);
+            let idx = e(tr.b.shift_right_logical(u, None, off, k5))?;
+            let max = tr.u(super::IMAGE_TABLE_LEN - 1);
+            let idx = tr.glsl2(u, GLOp::UMin, idx, max)?;
+            tr.b.decorate(idx, Decoration::NonUniform, []);
+            let pt = tr.b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+            let p = e(tr.b.access_chain(pt, None, var, [idx]))?;
+            tr.b.decorate(p, Decoration::NonUniform, []);
+            let img = e(tr.b.load(img_ty, None, p, None, []))?;
+            tr.b.decorate(img, Decoration::NonUniform, []);
+            img
+        }
+        None => e(tr.b.load(img_ty, None, var, None, []))?,
+    };
     // Writes dmask-selected components of a vec4 result to consecutive VGPRs.
     // Gathers return four texels (four VGPRs) of the component dmask selects.
     let out_mask = if name.starts_with("image_gather4") { 0xF } else { dmask };
@@ -1245,6 +1269,9 @@ fn sample(tr: &mut T, ins: &Inst, name: &str, image: Word, img_ty: Word, si: Opt
     let sampler = e(tr.b.load(tr.sampler_ty, None, svar, None, []))?;
     let si_ty = tr.b.type_sampled_image(img_ty);
     let simg = e(tr.b.sampled_image(si_ty, None, image, sampler))?;
+    if tr.plan.inst_res.get(&ins.pc).is_some_and(|&(r, _)| tr.image_tables.contains_key(&r)) {
+        tr.b.decorate(simg, Decoration::NonUniform, []);
+    }
     let mut ad = Addr { ins, next: 0 };
     let offset = if has_o { Some(ad.take(tr)?) } else { None };
     let bias = if has_b { Some(ad.take(tr)?) } else { None };

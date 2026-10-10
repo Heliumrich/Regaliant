@@ -33,6 +33,9 @@ pub enum Prov {
     /// Low/high half of `ptr + bias` (pointer arithmetic).
     PtrLo(Ptr, u32),
     PtrHi(Ptr, u32),
+    /// Dword `.1` of what the s_buffer_load at pc `.0` read: an entry of a
+    /// table read at a run-time offset (e.g. a T# picked per light probe).
+    Table(u32, u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -45,6 +48,10 @@ pub enum ResKind {
     Sampler,
     /// 64-bit base address (SGPR pair `saddr`) of GLOBAL instructions.
     Global,
+    /// T#s read from a buffer at a run-time offset (a descriptor table):
+    /// `dwords` is the table's V#, `Resource::table` the pc of the
+    /// s_buffer_load_dwordx8 that reads the T#.
+    ImageTable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -59,6 +66,8 @@ pub struct Resource {
     pub read: bool,
     /// Buffer is read with format conversion (buffer_load_format/tbuffer).
     pub formatted: bool,
+    /// Image tables: pc of the load that reads the T# from the table.
+    pub table: Option<u32>,
 }
 
 /// A scalar memory load whose dwords are resolved on the CPU at draw time.
@@ -79,11 +88,13 @@ pub struct Plan {
     pub inst_load: HashMap<u32, usize>,
     /// Problems found (unresolvable descriptors etc.).
     pub errors: Vec<String>,
+    /// s_buffer_load pc -> provenance of the V# it reads through.
+    pub table_loads: HashMap<u32, Vec<Prov>>,
 }
 
 impl Plan {
     fn resource(&mut self, r: Resource) -> usize {
-        if let Some(i) = self.resources.iter().position(|x| x.kind == r.kind && x.dwords == r.dwords) {
+        if let Some(i) = self.resources.iter().position(|x| x.kind == r.kind && x.dwords == r.dwords && x.table == r.table) {
             let x = &mut self.resources[i];
             x.written |= r.written;
             x.read |= r.read;
@@ -246,7 +257,7 @@ pub fn analyze(code: &[Inst], user_sgprs: u16, user_base: u16, code_base: u64) -
         }
     }
     for (i, r) in plan.resources.iter().enumerate() {
-        if r.dwords.iter().any(|p| matches!(p, Prov::Unknown)) {
+        if r.dwords.iter().any(|p| matches!(p, Prov::Unknown | Prov::Table(..))) {
             plan.errors.push(format!("resource {i} ({:?}) has unresolvable descriptor dwords {:?}", r.kind, r.dwords));
         }
     }
@@ -419,7 +430,7 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
                         // Known base, dynamic offset (e.g. a loop over a constant
                         // table): the base is bound as a buffer and read at run time.
                         let dwords = vec![Prov::PtrLo(p.clone(), bias), Prov::PtrHi(p, bias)];
-                        let r = plan.resource(Resource { kind: ResKind::Global, dwords, written: false, read: true, formatted: false });
+                        let r = plan.resource(Resource { kind: ResKind::Global, dwords, written: false, read: true, formatted: false, table: None });
                         plan.inst_res.insert(ins.pc, (r, None));
                         for k in 0..n {
                             st.set(d + k as u16, Prov::Unknown);
@@ -433,12 +444,14 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
                     }
                 }
             } else if name.starts_with("s_buffer_load") {
-                // V# in s[sbase:sbase+3].
-                let dwords = (0..4).map(|k| st.get(ins.smem_sbase() + k)).collect();
-                let r = plan.resource(Resource { kind: ResKind::Buffer, dwords, written: false, read: true, formatted: false });
+                // V# in s[sbase:sbase+3]. What it reads is known only at run
+                // time: a T# loaded this way is a table entry (ImageTable).
+                let dwords: Vec<Prov> = (0..4).map(|k| st.get(ins.smem_sbase() + k)).collect();
+                plan.table_loads.insert(ins.pc, dwords.clone());
+                let r = plan.resource(Resource { kind: ResKind::Buffer, dwords, written: false, read: true, formatted: false, table: None });
                 plan.inst_res.insert(ins.pc, (r, None));
                 for k in 0..n {
-                    st.set(d + k as u16, Prov::Unknown);
+                    st.set(d + k as u16, Prov::Table(ins.pc, k as u8));
                 }
             } else {
                 for k in 0..n {
@@ -452,18 +465,26 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
             let store = name.contains("_store") || name.contains("_atomic");
             let atomic = name.contains("_atomic");
             let formatted = name.contains("_format") || ins.enc == Enc::Mtbuf;
-            let r = plan.resource(Resource { kind: ResKind::Buffer, dwords, written: store, read: !store || atomic, formatted });
+            let r = plan.resource(Resource { kind: ResKind::Buffer, dwords, written: store, read: !store || atomic, formatted, table: None });
             plan.inst_res.insert(ins.pc, (r, None));
         }
         Enc::Mimg => {
             let base = ins.mem_srsrc();
-            let dwords = (0..8).map(|k| st.get(base + k)).collect();
+            let dwords: Vec<Prov> = (0..8).map(|k| st.get(base + k)).collect();
             let store = name.starts_with("image_store") || name.starts_with("image_atomic");
-            let img = plan.resource(Resource { kind: ResKind::Image, dwords, written: store, read: !store, formatted: false });
+            // A whole T# from one table load: an image table.
+            let table = match dwords.first() {
+                Some(&Prov::Table(pc, 0)) if dwords.iter().enumerate().all(|(k, p)| *p == Prov::Table(pc, k as u8)) => plan.table_loads.get(&pc).cloned().map(|v| (pc, v)),
+                _ => None,
+            };
+            let img = match table {
+                Some((pc, v)) => plan.resource(Resource { kind: ResKind::ImageTable, dwords: v, written: store, read: !store, formatted: false, table: Some(pc) }),
+                None => plan.resource(Resource { kind: ResKind::Image, dwords, written: store, read: !store, formatted: false, table: None }),
+            };
             let samp = if name.starts_with("image_sample") || name.starts_with("image_gather4") || name == "image_get_lod" {
                 let sb = ins.mimg_ssamp();
                 let sd = (0..4).map(|k| st.get(sb + k)).collect();
-                Some(plan.resource(Resource { kind: ResKind::Sampler, dwords: sd, written: false, read: false, formatted: false }))
+                Some(plan.resource(Resource { kind: ResKind::Sampler, dwords: sd, written: false, read: false, formatted: false, table: None }))
             } else {
                 None
             };
@@ -497,7 +518,7 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
             let dwords = vec![st.get(sa), st.get(sa + 1)];
             let store = name.starts_with("global_store") || name.starts_with("global_atomic");
             let atomic = name.starts_with("global_atomic");
-            let r = plan.resource(Resource { kind: ResKind::Global, dwords, written: store, read: !store || atomic, formatted: false });
+            let r = plan.resource(Resource { kind: ResKind::Global, dwords, written: store, read: !store || atomic, formatted: false, table: None });
             plan.inst_res.insert(ins.pc, (r, None));
         }
         _ => {}
