@@ -811,6 +811,16 @@ fn race_fault(addr: u64, ctx: &CONTEXT) -> bool {
 }
 
 unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
+    // On a fiber's own stack (sized by the title), the kernel's exception
+    // frame is already there; the handler itself runs on the fiber's host stack.
+    crate::hle::stack_check("exception handler");
+    match crate::hle::libs::fiber::on_fiber_stack() {
+        Some(fiber) => unsafe { crate::hle::libs::fiber::on_host_stack(fiber, || veh_body(info)) },
+        None => unsafe { veh_body(info) },
+    }
+}
+
+unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
     unsafe {
         let rec = &*(*info).ExceptionRecord;
         let code = rec.ExceptionCode as u32;
@@ -950,6 +960,19 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
                     let q: Vec<String> = (0..8).map(|i| format!("{:016x}", *((a + i * 8) as *const u64))).collect();
                     let _ = writeln!(r, "  [{name}] {a:#x}: {}", q.join(" "));
                 }
+            }
+            // The stack (the frame and its caller's links) and, on a fiber
+            // stack, the fiber's context.
+            if let Some(d) = crate::hle::libs::fiber::describe_stack(ctx.Rsp) {
+                let _ = writeln!(r, "  stack: {d}");
+            }
+            for k in 0..4u64 {
+                let a = (ctx.Rsp & !7) + k * 64;
+                if !readable(a) {
+                    break;
+                }
+                let q: Vec<String> = (0..8).map(|i| format!("{:016x}", *((a + i * 8) as *const u64))).collect();
+                let _ = writeln!(r, "  [rsp+{:#x}] {a:#x}: {}", k * 64, q.join(" "));
             }
             // DS_CRASH_PEEK: comma-separated `base(+hex|*)*[:count]` expressions,
             // e.g. `rbx+b4c8*:8` (load the pointer at rbx+0xb4c8, dump 8 qwords).

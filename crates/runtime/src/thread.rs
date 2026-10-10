@@ -194,6 +194,7 @@ pub fn run_entry(t: &'static GuestThread, entry: u64, a0: u64, a1: u64) -> u64 {
 pub fn exit_current(value: u64) -> ! {
     let t = current().expect("pthread_exit on a non-guest thread");
     run_key_destructors(t);
+    crate::hle::libs::fiber::leave_fibers();
     let rsp = t.saved_rsp.load(Ordering::SeqCst);
     unsafe { ds_guest_thread_exit(rsp, value) }
 }

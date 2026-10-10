@@ -5,13 +5,32 @@
 //! callee-saved registers, MXCSR and the x87 control word on the outgoing
 //! stack and swap stack pointers.
 //!
+//! A fiber may be resumed on another thread as soon as it is marked
+//! suspended, so the outgoing fiber's stack pointer is stored before its
+//! busy word (in the SceFiber object) is cleared, and a resumer waits for
+//! that word (`acquire`).
+//!
+//! The title sizes fiber stacks for its own code (16 KiB for most job
+//! fibers), so HLE functions and the exception handler do not run on them:
+//! called on a fiber's own stack they move to a host stack owned by that
+//! fiber (`on_host_stack`, 1 MiB, allocated on first use), and guest
+//! callbacks made from there return to the fiber's stack below the caller's
+//! frames (`guest_callback`). Both stacks belong to the fiber, so a fiber
+//! that switches away inside a callback can resume on any thread. The
+//! thread's stack bounds in the TEB (used by `__chkstk` probes) follow every
+//! stack change: fiber switches save and restore them with the registers.
+//!
+//! The lowest 256 bytes of every context hold a pattern: a switch away from
+//! a fiber whose pattern changed reports how close its stack came to (or
+//! past) the end of its context.
+//!
 //! Signatures confirmed at the title's call sites: `_sceFiberInitializeImpl(
 //! fiber, name, entry, argOnInitialize, addrContext, sizeContext, optParam,
 //! sdkVersion)`, `sceFiberSwitch(fiber, argOnRunTo, &argOnRun)`,
 //! `sceFiberReturnToThread(argOnReturn, &argOnRun)`; `SceFiber` is 0x100 bytes.
 
 use crate::hle::{Registry, cstr};
-use crate::{reg, sysv};
+use crate::{reg, sysv_on_guest_stack as sysv};
 use parking_lot::Mutex;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -25,7 +44,11 @@ const ERR_PERMISSION: i32 = 0x8059_0005u32 as i32;
 const ERR_STATE: i32 = 0x8059_0006u32 as i32;
 
 std::arch::global_asm!(
-    // void ds_fiber_switch(u64* save_rsp [rdi], u64 new_rsp [rsi])  [sysv64]
+    // void ds_fiber_switch(u64* save_rsp [rdi], u64 new_rsp [rsi],
+    //                      u64* busy [rdx] (0: none))  [sysv64]
+    // The busy word is cleared after the outgoing stack pointer is stored:
+    // from then on another thread may resume the outgoing context (this
+    // thread no longer touches that stack).
     ".globl ds_fiber_switch",
     "ds_fiber_switch:",
     "push rbp",
@@ -34,14 +57,22 @@ std::arch::global_asm!(
     "push r13",
     "push r14",
     "push r15",
+    "push qword ptr gs:[8]", // TEB StackBase
+    "push qword ptr gs:[0x10]", // TEB StackLimit
     "sub rsp, 8",
     "stmxcsr [rsp]",
     "fnstcw [rsp+4]",
     "mov [rdi], rsp",
+    "test rdx, rdx",
+    "jz 2f",
+    "mov qword ptr [rdx], 0",
+    "2:",
     "mov rsp, rsi",
     "ldmxcsr [rsp]",
     "fldcw [rsp+4]",
     "add rsp, 8",
+    "pop qword ptr gs:[0x10]",
+    "pop qword ptr gs:[8]",
     "pop r15",
     "pop r14",
     "pop r13",
@@ -57,12 +88,68 @@ std::arch::global_asm!(
     "call r12",
     "call {returned}",
     "ud2",
+    // void ds_call_on_stack(u64 top [rcx], void (*f)(void*) [rdx], void* arg [r8],
+    //                       u64 limit [r9])  [win64]
+    // Calls f(arg) with rsp just below `top` and the TEB stack bounds set to
+    // [limit, top), then restores both. The frame is described by unwind
+    // data (rbp frame), so host unwinding continues past the stack switch.
+    ".globl ds_call_on_stack",
+    ".seh_proc ds_call_on_stack",
+    "ds_call_on_stack:",
+    "push rbp",
+    ".seh_pushreg rbp",
+    "mov rbp, rsp",
+    ".seh_setframe rbp, 0",
+    ".seh_endprologue",
+    "push qword ptr gs:[8]",
+    "push qword ptr gs:[0x10]",
+    "mov qword ptr gs:[8], rcx",
+    "mov qword ptr gs:[0x10], r9",
+    "mov rsp, rcx",
+    "and rsp, -16",
+    "sub rsp, 32",
+    "mov rcx, r8",
+    "call rdx",
+    "mov rcx, [rbp-8]",
+    "mov qword ptr gs:[8], rcx",
+    "mov rcx, [rbp-16]",
+    "mov qword ptr gs:[0x10], rcx",
+    "mov rsp, rbp",
+    "pop rbp",
+    "ret",
+    ".seh_endproc",
     returned = sym fiber_entry_returned,
 );
 
 unsafe extern "sysv64" {
-    fn ds_fiber_switch(save_rsp: *mut u64, new_rsp: u64);
+    fn ds_fiber_switch(save_rsp: *mut u64, new_rsp: u64, busy: *mut u64);
     fn ds_fiber_start();
+}
+
+unsafe extern "C" {
+    fn ds_call_on_stack(top: u64, f: unsafe extern "C" fn(*mut u8), arg: *mut u8, limit: u64);
+}
+
+#[inline(always)]
+fn current_rsp() -> u64 {
+    let rsp: u64;
+    unsafe { std::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) };
+    rsp
+}
+
+/// Runs `f` on the stack ending at `top` (TEB bounds [limit, top)).
+unsafe fn call_on_stack<R, F: FnOnce() -> R>(top: u64, limit: u64, f: F) -> R {
+    struct Call<F, R> {
+        f: Option<F>,
+        r: Option<R>,
+    }
+    unsafe extern "C" fn tramp<R, F: FnOnce() -> R>(p: *mut u8) {
+        let c = unsafe { &mut *(p as *mut Call<F, R>) };
+        c.r = Some((c.f.take().unwrap())());
+    }
+    let mut c = Call { f: Some(f), r: None };
+    unsafe { ds_call_on_stack(top, tramp::<R, F>, &mut c as *mut Call<F, R> as *mut u8, limit) };
+    c.r.unwrap()
 }
 
 extern "sysv64" fn fiber_entry_returned() -> ! {
@@ -74,6 +161,137 @@ extern "sysv64" fn fiber_entry_returned() -> ! {
 /// Saved stack pointer of a suspended fiber, kept in the title's SceFiber
 /// object (stable address even while other threads create fibers).
 const OBJ_RSP: u64 = 0x08;
+/// Busy word in the SceFiber object: 1 from the moment a thread takes the
+/// fiber to run it until its context is saved again by a switch away.
+const OBJ_BUSY: u64 = 0x10;
+
+/// The fiber's host stack (lowest address; 0 until first used).
+const OBJ_ALT_BASE: u64 = 0x18;
+/// Where the next move to the host stack starts (below the frames of an HLE
+/// call whose guest callback is running).
+const OBJ_ALT_TOP: u64 = 0x20;
+/// The fiber-stack pointer of the HLE call running on the host stack (0:
+/// none), below which its guest callbacks run.
+const OBJ_GUEST_RSP: u64 = 0x28;
+const ALT_SIZE: u64 = 1 << 20;
+/// Room left between a frame and the stack its callee moves to.
+const CALL_GAP: u64 = 0x400;
+
+fn field(fiber: u64, off: u64) -> *mut u64 {
+    (fiber + off) as *mut u64
+}
+
+/// When the fiber running on this thread is on its own stack: that fiber.
+#[inline]
+pub fn on_fiber_stack() -> Option<u64> {
+    let fiber = CURRENT.with(|c| c.get());
+    if fiber == 0 {
+        return None;
+    }
+    in_fiber_stack(current_rsp()).then_some(fiber)
+}
+
+/// Runs `f` (an HLE function or the exception handler, entered on the
+/// fiber's own stack) on the fiber's host stack.
+pub unsafe fn on_host_stack<R, F: FnOnce() -> R>(fiber: u64, f: F) -> R {
+    unsafe {
+        let mut base = *field(fiber, OBJ_ALT_BASE);
+        if base == 0 {
+            use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+            base = VirtualAlloc(std::ptr::null(), ALT_SIZE as usize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as u64;
+            if base == 0 {
+                crate::fatal_exit(0xD521, "fiber host stack allocation failed");
+            }
+            *field(fiber, OBJ_ALT_BASE) = base;
+            *field(fiber, OBJ_ALT_TOP) = base + ALT_SIZE;
+        }
+        let prev = *field(fiber, OBJ_GUEST_RSP);
+        *field(fiber, OBJ_GUEST_RSP) = current_rsp();
+        let r = call_on_stack(*field(fiber, OBJ_ALT_TOP), base, f);
+        *field(fiber, OBJ_GUEST_RSP) = prev;
+        r
+    }
+}
+
+/// Runs a guest function called by HLE code. On a fiber's host stack it
+/// runs on the fiber's own stack instead, below the frames of the HLE call
+/// (the title's code expects its own stacks), and HLE calls it makes move to
+/// the host stack below the frames already there.
+pub unsafe fn guest_callback<R, F: FnOnce() -> R>(f: F) -> R {
+    unsafe {
+        let fiber = CURRENT.with(|c| c.get());
+        if fiber != 0 {
+            let base = *field(fiber, OBJ_ALT_BASE);
+            let guest = *field(fiber, OBJ_GUEST_RSP);
+            let rsp = current_rsp();
+            if base != 0 && guest != 0 && (base..base + ALT_SIZE).contains(&rsp) {
+                let top = *field(fiber, OBJ_ALT_TOP);
+                *field(fiber, OBJ_ALT_TOP) = (rsp - CALL_GAP) & !15;
+                *field(fiber, OBJ_GUEST_RSP) = 0;
+                let r = call_on_stack((guest - CALL_GAP) & !15, STACK_LO.with(|c| c.get()), f);
+                *field(fiber, OBJ_GUEST_RSP) = guest;
+                *field(fiber, OBJ_ALT_TOP) = top;
+                return r;
+            }
+        }
+        f()
+    }
+}
+
+fn busy(fiber: u64) -> &'static std::sync::atomic::AtomicU64 {
+    unsafe { &*((fiber + OBJ_BUSY) as *const std::sync::atomic::AtomicU64) }
+}
+
+/// Claims a fiber the bookkeeping just marked running: waits until its last
+/// switch away has stored its stack pointer, then returns that pointer.
+fn claim(fiber: u64) -> u64 {
+    use std::sync::atomic::Ordering;
+    let b = busy(fiber);
+    let mut spins = 0u64;
+    while b.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        std::hint::spin_loop();
+        spins += 1;
+        if spins % (1 << 24) == 0 {
+            crate::warn!("fiber {fiber:#x}: still waiting for its context ({spins} spins)");
+        }
+    }
+    unsafe { *((fiber + OBJ_RSP) as *const u64) }
+}
+
+/// Pattern in the lowest bytes of each context (contexts of at least
+/// GUARD_MIN_CONTEXT bytes).
+const GUARD_WORD: u64 = 0x4453_4755_4152_4421; // "!DRAUGSD"
+const GUARD_WORDS: u64 = 32;
+const GUARD_MIN_CONTEXT: u64 = 0x2000;
+
+/// Damage to a context's guard pattern: the highest changed word's offset
+/// from the context start and the number of changed words, if any.
+fn guard_damage(f: &Fiber) -> Option<(u64, u64)> {
+    if f.ctx_size < GUARD_MIN_CONTEXT {
+        return None;
+    }
+    let words = (0..GUARD_WORDS).filter(|i| unsafe { *((f.ctx + i * 8) as *const u64) } != GUARD_WORD);
+    let (mut hi, mut n) = (0, 0);
+    for i in words {
+        hi = i * 8 + 8;
+        n += 1;
+    }
+    (n > 0).then_some((hi, n))
+}
+
+/// Checks the guard of a fiber being switched away from (bookkeeping lock
+/// held); returns the report to log once per fiber.
+fn guard_report(fiber: u64, f: &mut Fiber) -> Option<String> {
+    if f.guard_reported {
+        return None;
+    }
+    let (hi, n) = guard_damage(f)?;
+    f.guard_reported = true;
+    Some(format!(
+        "fiber {fiber:#x} '{}' (context {:#x}+{:#x}): its stack reached the lowest {hi} bytes of the context ({n} of {GUARD_WORDS} guard words changed{})",
+        f.name, f.ctx, f.ctx_size, if n == GUARD_WORDS { "; it may have run past the context" } else { "" }
+    ))
+}
 
 #[derive(Clone)]
 struct Fiber {
@@ -86,6 +304,7 @@ struct Fiber {
     running: bool,
     /// Where the value passed by the next Run/Switch to this fiber goes.
     arg_on_run_ptr: u64,
+    guard_reported: bool,
 }
 
 static FIBERS: Mutex<Option<HashMap<u64, Fiber>>> = Mutex::new(None);
@@ -97,6 +316,64 @@ thread_local! {
     static RUN_RSP: Cell<u64> = const { Cell::new(0) };
     /// sceFiberRun's argOnReturn pointer.
     static RUN_RESULT_PTR: Cell<u64> = const { Cell::new(0) };
+    /// Bounds of the running fiber's own stack (0: the thread's stack).
+    static STACK_LO: Cell<u64> = const { Cell::new(0) };
+    static STACK_HI: Cell<u64> = const { Cell::new(0) };
+}
+
+fn set_stack(lo: u64, hi: u64) {
+    STACK_LO.with(|c| c.set(lo));
+    STACK_HI.with(|c| c.set(hi));
+}
+
+thread_local! {
+    /// The thread's own TEB stack bounds (StackBase, StackLimit), recorded by
+    /// sceFiberRun.
+    static THREAD_BOUNDS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+}
+
+fn teb_bounds() -> (u64, u64) {
+    let (base, limit): (u64, u64);
+    unsafe {
+        std::arch::asm!("mov {}, qword ptr gs:[8]", "mov {}, qword ptr gs:[0x10]", out(reg) base, out(reg) limit, options(nostack, preserves_flags));
+    }
+    (base, limit)
+}
+
+/// A guest thread leaves whatever fiber it runs (pthread_exit on a fiber):
+/// its own TEB stack bounds come back before it returns to its own stack.
+pub fn leave_fibers() {
+    if CURRENT.with(|c| c.get()) != 0 {
+        let (base, limit) = THREAD_BOUNDS.with(|c| c.get());
+        if base != 0 {
+            unsafe {
+                std::arch::asm!("mov qword ptr gs:[8], {}", "mov qword ptr gs:[0x10], {}", in(reg) base, in(reg) limit, options(nostack, preserves_flags));
+            }
+        }
+        CURRENT.with(|c| c.set(0));
+        set_stack(0, 0);
+    }
+}
+
+/// Lowest address of the stack of the fiber running on this thread, 0 when
+/// the thread runs on its own stack.
+#[inline]
+pub fn stack_lo() -> u64 {
+    STACK_LO.with(|c| c.get())
+}
+
+/// True when `rsp` is on the stack of the fiber running on this thread.
+#[inline]
+pub fn in_fiber_stack(rsp: u64) -> bool {
+    STACK_LO.with(|c| c.get()) <= rsp && rsp < STACK_HI.with(|c| c.get())
+}
+
+/// The fiber whose context contains `addr` (for fault reports; does not wait
+/// for the bookkeeping lock).
+pub fn describe_stack(addr: u64) -> Option<String> {
+    let g = FIBERS.try_lock()?;
+    let (fiber, f) = g.as_ref()?.iter().find(|(_, f)| (f.ctx..f.ctx + f.ctx_size).contains(&addr))?;
+    Some(format!("fiber {fiber:#x} '{}' context {:#x}+{:#x} (at +{:#x})", f.name, f.ctx, f.ctx_size, addr - f.ctx))
 }
 
 fn with<R>(f: impl FnOnce(&mut HashMap<u64, Fiber>) -> R) -> R {
@@ -108,8 +385,9 @@ fn valid(fiber: u64) -> bool {
 }
 
 /// Prepares the initial stack of a fiber: ds_fiber_switch "returns" into
-/// ds_fiber_start with the entry and its first argument in callee-saved regs.
-/// Returns the initial saved stack pointer.
+/// ds_fiber_start with the entry and its first argument in callee-saved regs
+/// and the TEB stack bounds set to the context. Returns the initial saved
+/// stack pointer.
 unsafe fn prepare_stack(f: &Fiber) -> u64 {
     let top = (f.ctx + f.ctx_size) & !15;
     let x = top - 8; // return slot; rsp == top (16-aligned) after `ret`
@@ -122,9 +400,11 @@ unsafe fn prepare_stack(f: &Fiber) -> u64 {
         w(x - 32, f.arg_init); // r13
         w(x - 40, 0); // r14 = argOnRun (filled on first activation)
         w(x - 48, 0); // r15
-        w(x - 56, 0x1F80 | (0x037F << 32)); // MXCSR | x87 control word
+        w(x - 56, f.ctx + f.ctx_size); // TEB StackBase
+        w(x - 64, f.ctx); // TEB StackLimit
+        w(x - 72, 0x1F80 | (0x037F << 32)); // MXCSR | x87 control word
     }
-    x - 56
+    x - 72
 }
 
 /// Delivers `arg` to a fiber about to run: as its entry argument the first time,
@@ -133,7 +413,7 @@ unsafe fn deliver(fiber: u64, f: &mut Fiber, arg: u64) {
     unsafe {
         if !f.started {
             let rsp = *((fiber + OBJ_RSP) as *const u64);
-            std::ptr::write((rsp + 16) as *mut u64, arg); // r14 slot (x - 40 == rsp + 16)
+            std::ptr::write((rsp + 32) as *mut u64, arg); // r14 slot (x - 40 == rsp + 32)
             f.started = true;
         } else if f.arg_on_run_ptr != 0 {
             std::ptr::write(f.arg_on_run_ptr as *mut u64, arg);
@@ -153,13 +433,18 @@ sysv! {
         if ctx == 0 || ctx_size < 512 { return ERR_RANGE; }
         let f = Fiber {
             name: cstr(name).chars().take(31).collect(),
-            entry, arg_init, ctx, ctx_size, started: false, running: false, arg_on_run_ptr: 0,
+            entry, arg_init, ctx, ctx_size, started: false, running: false, arg_on_run_ptr: 0, guard_reported: false,
         };
         let rsp = prepare_stack(&f);
+        if ctx_size >= GUARD_MIN_CONTEXT {
+            for i in 0..GUARD_WORDS {
+                *((ctx + i * 8) as *mut u64) = GUARD_WORD;
+            }
+        }
         std::ptr::write_bytes(fiber as *mut u8, 0, 0x100);
         *(fiber as *mut u64) = FIBER_MAGIC;
         *((fiber + OBJ_RSP) as *mut u64) = rsp;
-        crate::debug!("fiber {fiber:#x} '{}' entry {} ctx {ctx:#x}+{ctx_size:#x}", f.name, crate::loader::describe_addr(entry));
+        crate::info!("fiber {fiber:#x} '{}' entry {} ctx {ctx:#x}+{ctx_size:#x}", f.name, crate::loader::describe_addr(entry));
         with(|m| m.insert(fiber, f));
         0
     }
@@ -168,6 +453,12 @@ sysv! {
         if !valid(fiber) { return ERR_INVALID; }
         if with(|m| m.get(&fiber).is_some_and(|f| f.running)) { return ERR_STATE; }
         with(|m| m.remove(&fiber));
+        let alt = *field(fiber, OBJ_ALT_BASE);
+        if alt != 0 {
+            use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+            VirtualFree(alt as *mut _, 0, MEM_RELEASE);
+            *field(fiber, OBJ_ALT_BASE) = 0;
+        }
         *(fiber as *mut u64) = 0;
         0
     }
@@ -177,15 +468,18 @@ sysv! {
         if CURRENT.with(|c| c.get()) != 0 { return ERR_PERMISSION; }
         let ok = with(|m| {
             let f = m.get_mut(&fiber).unwrap();
-            if f.running { return false; }
+            if f.running { return None; }
             f.running = true;
             unsafe { deliver(fiber, f, arg) };
-            true
+            Some((f.ctx, f.ctx + f.ctx_size))
         });
-        if !ok { return ERR_STATE; }
+        let Some((lo, hi)) = ok else { return ERR_STATE };
+        THREAD_BOUNDS.with(|c| c.set(teb_bounds()));
         CURRENT.with(|c| c.set(fiber));
+        set_stack(lo, hi);
         RUN_RESULT_PTR.with(|c| c.set(ret_out as u64));
-        ds_fiber_switch(RUN_RSP.with(|c| c.as_ptr()), *((fiber + OBJ_RSP) as *const u64));
+        let rsp = claim(fiber);
+        ds_fiber_switch(RUN_RSP.with(|c| c.as_ptr()), rsp, std::ptr::null_mut());
         // Back on the thread: a fiber called sceFiberReturnToThread.
         0
     }
@@ -195,18 +489,22 @@ sysv! {
         let cur = CURRENT.with(|c| c.get());
         if cur == 0 { return ERR_PERMISSION; }
         let ok = with(|m| {
-            if m.get(&fiber).is_none_or(|f| f.running) { return false; }
+            if m.get(&fiber).is_none_or(|f| f.running) { return None; }
             let f = m.get_mut(&fiber).unwrap();
             f.running = true;
             unsafe { deliver(fiber, f, arg) };
+            let (lo, hi) = (f.ctx, f.ctx + f.ctx_size);
             let c = m.get_mut(&cur).unwrap();
             c.running = false;
             c.arg_on_run_ptr = arg_on_run as u64;
-            true
+            Some((lo, hi, guard_report(cur, c)))
         });
-        if !ok { return ERR_STATE; }
+        let Some((lo, hi, report)) = ok else { return ERR_STATE };
+        if let Some(r) = report { crate::error!("{r}"); }
         CURRENT.with(|c| c.set(fiber));
-        ds_fiber_switch((cur + OBJ_RSP) as *mut u64, *((fiber + OBJ_RSP) as *const u64));
+        set_stack(lo, hi);
+        let rsp = claim(fiber);
+        ds_fiber_switch((cur + OBJ_RSP) as *mut u64, rsp, (cur + OBJ_BUSY) as *mut u64);
         0
     }
     fn sceFiberReturnToThread(ret: u64, arg_on_run: *mut u64) -> i32 {
@@ -214,13 +512,16 @@ sysv! {
         if cur == 0 { return ERR_PERMISSION; }
         let p = RUN_RESULT_PTR.with(|c| c.get());
         if p != 0 { *(p as *mut u64) = ret; }
-        with(|m| {
+        let report = with(|m| {
             let c = m.get_mut(&cur).unwrap();
             c.running = false;
             c.arg_on_run_ptr = arg_on_run as u64;
+            guard_report(cur, c)
         });
+        if let Some(r) = report { crate::error!("{r}"); }
         CURRENT.with(|c| c.set(0));
-        ds_fiber_switch((cur + OBJ_RSP) as *mut u64, RUN_RSP.with(|c| c.get()));
+        set_stack(0, 0);
+        ds_fiber_switch((cur + OBJ_RSP) as *mut u64, RUN_RSP.with(|c| c.get()), (cur + OBJ_BUSY) as *mut u64);
         0
     }
     fn sceFiberGetSelf(out: *mut u64) -> i32 {
