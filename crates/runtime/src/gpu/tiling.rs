@@ -325,18 +325,59 @@ impl Layout {
         base + block + inner as u64
     }
 
-    /// Copies `mip` of `slice` from tiled `src` into tightly packed rows.
+    /// Copies `mip` of `slice` from tiled `src` into tightly packed rows
+    /// (row ranges on several threads for mips of 1 MiB and more).
     pub fn detile(&self, src: &[u8], mip: usize, slice: u32, dst: &mut Vec<u8>) {
         let m = &self.mips[mip];
         let e = 1usize << self.elem_log2;
+        let (w, h) = (m.width as usize, m.height as usize);
         dst.clear();
-        dst.resize(m.width as usize * m.height as usize * e, 0);
-        for y in 0..m.height {
-            for x in 0..m.width {
-                let o = self.offset(mip, slice, x, y) as usize;
-                let d = (y as usize * m.width as usize + x as usize) * e;
-                if o + e <= src.len() {
-                    dst[d..d + e].copy_from_slice(&src[o..o + e]);
+        dst.resize(w * h * e, 0);
+        if w == 0 || h == 0 {
+            return;
+        }
+        let threads = if dst.len() >= 1 << 20 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8) } else { 1 };
+        if threads <= 1 {
+            self.detile_rows(src, m, slice, 0, dst);
+            return;
+        }
+        let rows = h.div_ceil(threads);
+        std::thread::scope(|s| {
+            for (k, chunk) in dst.chunks_mut(rows * w * e).enumerate() {
+                s.spawn(move || self.detile_rows(src, m, slice, k * rows, chunk));
+            }
+        });
+    }
+
+    /// Detiles whole rows starting at row `y0` into `out`.
+    fn detile_rows(&self, src: &[u8], m: &MipLayout, slice: u32, y0: usize, out: &mut [u8]) {
+        match self.elem_log2 {
+            0 => self.rows_n::<1>(src, m, slice, y0, out),
+            1 => self.rows_n::<2>(src, m, slice, y0, out),
+            2 => self.rows_n::<4>(src, m, slice, y0, out),
+            3 => self.rows_n::<8>(src, m, slice, y0, out),
+            _ => self.rows_n::<16>(src, m, slice, y0, out),
+        }
+    }
+
+    /// `offset` per element without divisions (block sizes are powers of
+    /// two) and fixed-size element copies.
+    fn rows_n<const N: usize>(&self, src: &[u8], m: &MipLayout, slice: u32, y0: usize, out: &mut [u8]) {
+        let w = m.width as usize;
+        let base = slice as u64 * self.slice_size + m.offset;
+        let (tx, ty) = m.tail.map(|(a, b)| (a as usize, b as usize)).unwrap_or((0, 0));
+        let (lw, lh) = (self.block_w.trailing_zeros(), self.block_h.trailing_zeros());
+        let (mw, mh) = (self.block_w as usize - 1, self.block_h as usize - 1);
+        let pitch_blocks = (m.pitch / self.block_w).max(1) as u64;
+        for (r, orow) in out.chunks_exact_mut(w * N).enumerate() {
+            let gy = y0 + r + ty;
+            let ysv = self.ys[gy & mh];
+            let rb = base + (((gy >> lh) as u64 * pitch_blocks) << self.block_log2);
+            for x in 0..w {
+                let gx = x + tx;
+                let o = (rb + (((gx >> lw) as u64) << self.block_log2) + (self.xs[gx & mw] ^ ysv) as u64) as usize;
+                if o + N <= src.len() {
+                    orow[x * N..x * N + N].copy_from_slice(&src[o..o + N]);
                 }
             }
         }
@@ -351,6 +392,40 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_detile_matches_offsets() {
+        // Every swizzle mode, element size and mip (tails included), and an
+        // array slice: the row detiler against the per-element offsets.
+        for sw in [1u32, 5, 9, 24, 25, 27] {
+            for el in 0..5u32 {
+                for (tw, th, levels) in [(300u32, 200u32, 9u32), (1024, 512, 11), (64, 64, 7), (2048, 1024, 1)] {
+                    let Some(l) = layout(sw, el, tw, th, levels, false) else { continue };
+                    let size = l.size(2) as usize;
+                    let src: Vec<u8> = (0..size).map(|i| (i * 2654435761usize >> 7) as u8).collect();
+                    for mip in 0..l.mips.len() {
+                        for slice in 0..2 {
+                            let m = &l.mips[mip];
+                            let e = 1usize << el;
+                            let mut want = vec![0u8; m.width as usize * m.height as usize * e];
+                            for y in 0..m.height {
+                                for x in 0..m.width {
+                                    let o = l.offset(mip, slice, x, y) as usize;
+                                    let d = (y as usize * m.width as usize + x as usize) * e;
+                                    if o + e <= src.len() {
+                                        want[d..d + e].copy_from_slice(&src[o..o + e]);
+                                    }
+                                }
+                            }
+                            let mut got = Vec::new();
+                            l.detile(&src, mip, slice, &mut got);
+                            assert!(got == want, "sw {sw} elem {el} {tw}x{th} mip {mip} slice {slice}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn standard_64k_block() {
