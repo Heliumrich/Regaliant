@@ -973,9 +973,15 @@ impl Cp {
                         super::emucheck::compare(c);
                     }
                 } else {
+                    // Graphics ring: [offset from the SET_BASE base, initiator];
+                    // compute queues: [address lo, address hi, initiator] (the
+                    // form sceAgcAcbDispatchIndirect emits).
+                    let (a, initiator) = if n >= 3 { (addr64(p(0), p(1)), p(2)) } else { (self.dispatch_indirect_base + p(0) as u64, p(1)) };
                     // Arguments may have been written by earlier GPU work.
-                    let a = self.dispatch_indirect_base + p(0) as u64;
                     self.sync_reads(&[(a, 12)]);
+                    if !valid(a, 12) {
+                        crate::warn!("gpu[{}]: DISPATCH_INDIRECT arguments at {a:#x} outside guest memory (dispatch skipped)", self.name);
+                    }
                     if valid(a, 12) {
                         let g = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8)] };
                         indirect_groups = Some(g);
@@ -983,11 +989,11 @@ impl Cp {
                         // (after the earlier work has completed).
                         let check = if super::exec::enabled() && super::emucheck::wanted(self) {
                             self.sync();
-                            super::emucheck::prepare(self, g, p(1))
+                            super::emucheck::prepare(self, g, initiator)
                         } else {
                             None
                         };
-                        self.dispatch(g, p(1));
+                        self.dispatch(g, initiator);
                         if let Some(c) = check {
                             self.sync();
                             super::emucheck::compare(c);
@@ -1004,8 +1010,12 @@ impl Cp {
                     let what = if opcode == op::DISPATCH_DIRECT {
                         format!("DISPATCH_DIRECT {}x{}x{} initiator {:#x}", p(0), p(1), p(2), p(3))
                     } else {
-                        let g = indirect_groups.map(|g| format!(" groups {}x{}x{}", g[0], g[1], g[2])).unwrap_or_default();
-                        format!("DISPATCH_INDIRECT {:#x} base {:#x}{g}", p(0), self.dispatch_indirect_base)
+                        let g = indirect_groups.map(|g| format!(" groups {}x{}x{}", g[0], g[1], g[2])).unwrap_or_else(|| " (skipped)".into());
+                        if n >= 3 {
+                            format!("DISPATCH_INDIRECT args {:#x}{g}", addr64(p(0), p(1)))
+                        } else {
+                            format!("DISPATCH_INDIRECT {:#x} base {:#x}{g}", p(0), self.dispatch_indirect_base)
+                        }
                     };
                     super::capture::dispatch(self, &what);
                     // DS_REPEAT_CS=<shader>: run that captured direct dispatch
