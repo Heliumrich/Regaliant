@@ -22,6 +22,17 @@
 //! accesses are ordered. With several waves a wave whose lanes are all
 //! inactive runs a region with EXEC empty instead of skipping it.
 //!
+//! Outside lockstep mode invocations that took different paths reach a
+//! uniform block after different numbers of dispatcher steps, so the
+//! workgroup barriers placed there (LDS ordering, wave64 lane exchanges,
+//! s_barrier) would be different dynamic instances: invalid in Vulkan, and on
+//! NVIDIA a warp whose threads arrive at different steps passes the barrier
+//! early (a 64-lane luminance reduction raced and the exposure came out
+//! wrong, depending on timing). Such blocks are *sync blocks*: the dispatcher
+//! runs in rounds, and an invocation that reaches a sync block after other
+//! blocks of its round ends the round there; every invocation then starts
+//! the next round at that block together (see `emit_dispatch_loop`).
+//!
 //! Single-wave lockstep programs run in *wave-mask mode*: lane masks (EXEC,
 //! VCC, compare results) have the hardware layout, bit i for lane i, so
 //! masks used as values (ballots kept in LDS, counted, scanned with s_ff1)
@@ -352,6 +363,10 @@ pub(crate) struct T<'a> {
     /// and this invocation's ballot counter (mod 3).
     pub vote: Option<Word>,
     pub vote_ctr: Option<Word>,
+    /// Sync blocks (see the module documentation) and the dispatcher steps
+    /// of the current round.
+    pub sync_starts: Vec<u32>,
+    pub sync_steps: Option<Word>,
     /// LDS accesses since the last workgroup barrier: bit 0 reads, bit 1
     /// writes (3 at block entry: unknown).
     pub lds_state: u8,
@@ -1378,6 +1393,8 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         lockstep: false,
         vote: None,
         vote_ctr: None,
+        sync_starts: Vec::new(),
+        sync_steps: None,
         lds_state: 0,
         sg_lane_var: None,
         lane_slots: HashMap::default(),
@@ -1562,6 +1579,11 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
                 tr.lane_slots.insert((vgpr as u32, lane), v);
             }
         }
+    }
+    tr.sync_starts = sync_starts(&tr, code);
+    if !tr.sync_starts.is_empty() {
+        let z = tr.u(0);
+        tr.sync_steps = Some(tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, Some(z)));
     }
     // Initial state: all registers defined (zero), this lane active.
     let f = tr.bool_c(false);
@@ -1761,10 +1783,55 @@ fn branch_cond(tr: &mut T, ins: &Inst, before: &[Inst]) -> R<Option<Word>> {
     })
 }
 
+/// Starts of the sync blocks of a compute program outside lockstep mode:
+/// uniform blocks with an instruction that may place a workgroup barrier
+/// (s_barrier, an LDS access, a wave64 v_readlane / v_readfirstlane).
+fn sync_starts(tr: &T, code: &[Inst]) -> Vec<u32> {
+    if tr.spec.stage != Stage::Compute || tr.lockstep {
+        return Vec::new();
+    }
+    let starts: Vec<u32> = block_starts(code).into_iter().collect();
+    if starts.len() <= 1 {
+        return Vec::new();
+    }
+    let barrier = |i: &Inst| match i.base_name() {
+        Some("s_barrier") => true,
+        Some("v_readlane_b32" | "v_readfirstlane_b32") => tr.spec.wave64,
+        _ => i.enc == Enc::Ds && !i.ds_gds() && !matches!(i.name(), Some("ds_swizzle_b32" | "ds_bpermute_b32" | "ds_permute_b32")),
+    };
+    let mut out = Vec::new();
+    for (bi, &s) in starts.iter().enumerate() {
+        let end = starts.get(bi + 1).copied().unwrap_or(u32::MAX);
+        if code.iter().any(|i| i.pc >= s && i.pc < end && tr.uniformity.is_uniform(i.pc) && barrier(i)) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// The dispatcher: a loop over a switch on the next block's address. With
+/// sync blocks it runs in rounds (an outer loop): an invocation reaching a
+/// sync block after other blocks of the round leaves the inner loop, whose
+/// merge reconverges each subgroup, and the next round starts at that block
+/// for every invocation, so its barriers are the same dynamic instances.
 fn emit_dispatch_loop(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>) -> R<()> {
     let first = code[0].pc;
     let s0 = tr.u(first);
     ok(tr.b.store(tr.pc_var, s0, None, []))?;
+    let rounds = match tr.sync_steps {
+        Some(steps) if !tr.sync_starts.is_empty() => {
+            let (oh, ob, oc, ox) = (tr.b.id(), tr.b.id(), tr.b.id(), tr.b.id());
+            ok(tr.b.branch(oh))?;
+            e(tr.b.begin_block(Some(oh)))?;
+            ok(tr.b.loop_merge(ox, oc, spirv::LoopControl::NONE, []))?;
+            ok(tr.b.branch(ob))?;
+            e(tr.b.begin_block(Some(ob)))?;
+            let z = tr.u(0);
+            ok(tr.b.store(steps, z, None, []))?;
+            Some((steps, oh, oc, ox))
+        }
+        _ => None,
+    };
     let header = tr.b.id();
     let dispatch = tr.b.id();
     let sw_merge = tr.b.id();
@@ -1776,6 +1843,28 @@ fn emit_dispatch_loop(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>) -> R<()
     ok(tr.b.branch(dispatch))?;
     e(tr.b.begin_block(Some(dispatch)))?;
     let pc = e(tr.b.load(tr.t.u32, None, tr.pc_var, None, []))?;
+    if let Some((steps, ..)) = rounds {
+        let bt = tr.t.bool_;
+        let n = e(tr.b.load(tr.t.u32, None, steps, None, []))?;
+        let mut at_sync = tr.bool_c(false);
+        for s in tr.sync_starts.clone() {
+            let k = tr.u(s);
+            let eq = e(tr.b.i_equal(bt, None, pc, k))?;
+            at_sync = e(tr.b.logical_or(bt, None, at_sync, eq))?;
+        }
+        let z = tr.u(0);
+        let started = e(tr.b.i_not_equal(bt, None, n, z))?;
+        let leave = e(tr.b.logical_and(bt, None, at_sync, started))?;
+        let (brk, go) = (tr.b.id(), tr.b.id());
+        ok(tr.b.selection_merge(go, spirv::SelectionControl::NONE))?;
+        ok(tr.b.branch_conditional(leave, brk, go, []))?;
+        e(tr.b.begin_block(Some(brk)))?;
+        ok(tr.b.branch(exit))?;
+        e(tr.b.begin_block(Some(go)))?;
+        let one = tr.u(1);
+        let n1 = e(tr.b.i_add(tr.t.u32, None, n, one))?;
+        ok(tr.b.store(steps, n1, None, []))?;
+    }
     let block_ids: Vec<(u32, Word)> = starts.iter().map(|&s| (s, tr.b.id())).collect();
     ok(tr.b.selection_merge(sw_merge, spirv::SelectionControl::NONE))?;
     let targets: Vec<(Operand, Word)> = block_ids.iter().map(|&(s, id)| (Operand::LiteralBit32(s), id)).collect();
@@ -1840,6 +1929,21 @@ fn emit_dispatch_loop(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>) -> R<()
     }
     ok(tr.b.branch_conditional(done, exit, header, []))?;
     e(tr.b.begin_block(Some(exit)))?;
+    if let Some((_, oh, oc, ox)) = rounds {
+        // Next round unless finished (or stopped by the watchdog).
+        ok(tr.b.branch(oc))?;
+        e(tr.b.begin_block(Some(oc)))?;
+        let pc3 = e(tr.b.load(tr.t.u32, None, tr.pc_var, None, []))?;
+        let mut fin = e(tr.b.i_equal(tr.t.bool_, None, pc3, ex))?;
+        if let Some(ctr) = tr.loop_ctr {
+            let n = e(tr.b.load(tr.t.u32, None, ctr, None, []))?;
+            let lim = tr.u(LOOP_LIMIT);
+            let over = e(tr.b.u_greater_than_equal(tr.t.bool_, None, n, lim))?;
+            fin = e(tr.b.logical_or(tr.t.bool_, None, fin, over))?;
+        }
+        ok(tr.b.branch_conditional(fin, ox, oh, []))?;
+        e(tr.b.begin_block(Some(ox)))?;
+    }
     if let Some(wd) = tr.watchdog {
         // Left with a block still to run: stopped by the watchdog.
         let pc3 = e(tr.b.load(tr.t.u32, None, tr.pc_var, None, []))?;
