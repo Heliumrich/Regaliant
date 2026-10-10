@@ -593,12 +593,17 @@ impl Cp {
         let (vtx_loc, inst_loc, id_loc) = (p(1) & 0xFFFF, p(2) & 0xFFFF, p(3) & 0xFFFF);
         let id_enable = p(3) & (1 << 31) != 0;
         let mut count = p(4);
+        let mut count_src = format!("max {count}");
         if p(3) & (1 << 30) != 0 {
             // The count may have been written by earlier GPU work.
             let ca = addr64(p(5), p(6));
             self.sync_reads(&[(ca, 4)]);
-            count = if valid(ca, 4) { count.min(unsafe { rd32(ca) }) } else { 0 };
+            let mem = if valid(ca, 4) { Some(unsafe { rd32(ca) }) } else { None };
+            count_src = format!("max {count}, memory {ca:#x} = {mem:?}");
+            count = mem.map_or(0, |m| count.min(m));
         }
+        let capturing = super::capture::capturing();
+        let mut subs: Vec<String> = Vec::new();
         let rec = if indexed { 20 } else { 16 };
         let stride = if p(7) != 0 { p(7) as u64 } else { rec };
         // So may the arguments.
@@ -618,6 +623,9 @@ impl Cp {
                 break;
             }
             let w = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), if indexed { rd32(a + 16) } else { 0 }] };
+            if capturing && subs.len() < 8 {
+                subs.push(format!("{:?}", &w[..rec as usize / 4]));
+            }
             let (args, bv, si) = if indexed {
                 (super::exec::DrawArgs { count: w[0], instances: w[1], index: Some((self.index_base + w[2] as u64 * sz as u64, sz)), base_vertex: Some(w[3] as i32), first_instance: w[4] }, w[3], w[4])
             } else {
@@ -641,7 +649,8 @@ impl Cp {
             drawn += 1;
             outcome = std::mem::take(&mut self.last_draw);
         }
-        format!("{drawn} of {count} draws ({})", if drawn > 0 { outcome } else { "none".into() })
+        let detail = if capturing { format!(" [count {count_src}, stride {stride}, args {}]", subs.join(" ")) } else { String::new() };
+        format!("{drawn} of {count} draws ({}){detail}", if drawn > 0 { outcome } else { "none".into() })
     }
 
     /// Smallest and largest index of `count` indices from `start` of the
@@ -1006,6 +1015,8 @@ impl Cp {
             op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT => {
                 DISPATCHES.fetch_add(1, Ordering::Relaxed);
                 let mut indirect_groups = None;
+                let mut indirect_extra: Option<[u32; 2]> = None;
+                let mut gpu_read = false;
                 if opcode == op::DISPATCH_DIRECT {
                     // DS_DELAY_CS=<shader>:<ms>: wait before that shader's
                     // dispatches (diagnosis of CPU/GPU data races).
@@ -1042,6 +1053,7 @@ impl Cp {
                     // Arguments that GPU work still writes: the GPU reads them
                     // (captures and interpreter checks need the group counts).
                     let gpu = valid(a, 12) && !super::capture::capturing() && !(super::exec::enabled() && super::emucheck::wanted(self)) && self.dispatch_gpu_indirect(a, initiator);
+                    gpu_read = gpu;
                     if !gpu {
                         // Arguments may have been written by earlier GPU work.
                         self.sync_reads(&[(a, 12)]);
@@ -1051,6 +1063,11 @@ impl Cp {
                         if valid(a, 12) {
                             let g = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8)] };
                             indirect_groups = Some(g);
+                            // Captures: the two dwords after the group counts
+                            // (titles keep item counts there).
+                            if super::capture::capturing() && valid(a + 12, 8) {
+                                indirect_extra = Some(unsafe { [rd32(a + 12), rd32(a + 16)] });
+                            }
                             // DS_EMU_CHECK: interpret a sample of the groups first
                             // (after the earlier work has completed).
                             let check = if super::exec::enabled() && super::emucheck::wanted(self) {
@@ -1077,7 +1094,11 @@ impl Cp {
                     let what = if opcode == op::DISPATCH_DIRECT {
                         format!("DISPATCH_DIRECT {}x{}x{} initiator {:#x}", p(0), p(1), p(2), p(3))
                     } else {
-                        let g = indirect_groups.map(|g| format!(" groups {}x{}x{}", g[0], g[1], g[2])).unwrap_or_else(|| " (skipped)".into());
+                        let g = indirect_groups.map(|g| format!(" groups {}x{}x{}", g[0], g[1], g[2])).unwrap_or_else(|| if gpu_read { " (groups read by the GPU)".into() } else { " (skipped)".into() });
+                        let g = match indirect_extra {
+                            Some(x) => format!("{g} (then {:#x} {:#x})", x[0], x[1]),
+                            None => g,
+                        };
                         if n >= 3 {
                             format!("DISPATCH_INDIRECT args {:#x}{g}", addr64(p(0), p(1)))
                         } else {
