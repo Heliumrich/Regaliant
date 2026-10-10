@@ -530,19 +530,24 @@ const RING_SEG: u64 = 4 << 20;
 const POOL_LIMITS: [u32; 5] = [4096, 32768, 8192, 2048, 8192];
 const POOL_TYPES: [vk::DescriptorType; 4] = [vk::DescriptorType::STORAGE_BUFFER, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorType::STORAGE_IMAGE, vk::DescriptorType::SAMPLER];
 
-/// `DS_TRACE_CS=<hex address>`: logs that compute shader's scalar-load
-/// values whenever they change (diagnosing data-dependent hangs).
+/// `DS_TRACE_CS=<hex address>[,...]`: logs those compute shaders' scalar-load
+/// values and resources whenever the loads change (diagnosing data-dependent
+/// hangs, inputs of passes that frame captures miss).
 fn trace_loads(queue: &str, p: &Prepared, groups: [u32; 3]) {
-    static ADDR: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let a = *ADDR.get_or_init(|| std::env::var("DS_TRACE_CS").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()));
-    if a != Some(p.addr) {
+    static ADDRS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let addrs = ADDRS.get_or_init(|| {
+        std::env::var("DS_TRACE_CS").unwrap_or_default().split(',').filter_map(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).collect()
+    });
+    if !addrs.contains(&p.addr) {
         return;
     }
-    static LAST: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-    let mut last = LAST.lock();
+    static LAST: Mutex<Option<HashMap<u64, Vec<u32>>>> = Mutex::new(None);
+    let mut g = LAST.lock();
+    let last = g.get_or_insert_with(HashMap::new).entry(p.addr).or_default();
     if *last != p.sgpr_data {
         *last = p.sgpr_data.clone();
         crate::info!("trace cs {:#x} [{queue}] {}x{}x{}: {}", p.addr, groups[0], groups[1], groups[2], shaders::describe_loads(p).join(" | "));
+        crate::info!("trace cs {:#x} resources: {}", p.addr, shaders::describe_resources(p).join(" | "));
     }
 }
 
@@ -1978,6 +1983,7 @@ impl Exec {
     /// Buffer, image and sampler bindings of a stage; fills the resource
     /// info blocks of its SGPR data.
     fn bind_stage(&mut self, p: &mut Prepared, allow_shadow: bool) -> Result<Bound, String> {
+        super::images::BINDING_SHADER.with(|s| s.set(p.addr));
         let res_info = rdna::translate::res_info_offset(&p.tr.plan) as usize;
         let mut bound = Bound { bufs: Vec::new(), imgs: Vec::new(), img_arrays: Vec::new(), writes: Vec::new(), sized_writes: Vec::new(), images: Vec::new(), shadows: Vec::new(), write_src: Vec::new() };
         let seg = SHADOW_BYTES;

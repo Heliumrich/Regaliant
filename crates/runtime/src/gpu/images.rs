@@ -497,6 +497,12 @@ unsafe impl Send for Images {}
 
 pub static IMAGES: Mutex<Option<Images>> = Mutex::new(None);
 
+thread_local! {
+    /// The shader whose bindings are being resolved on this thread
+    /// (diagnostics: which pass first writes an uploaded image).
+    pub static BINDING_SHADER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Runs `f` with the image cache.
 pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
     let mut g = IMAGES.lock();
@@ -612,7 +618,9 @@ impl Images {
             let half = matches!(k.format, vk::Format::R16G16B16A16_SFLOAT | vk::Format::R16G16_SFLOAT | vk::Format::R16_SFLOAT);
             let full = matches!(k.format, vk::Format::R32G32B32A32_SFLOAT | vk::Format::R32G32_SFLOAT | vk::Format::R32_SFLOAT);
             let bc1 = matches!(k.format, vk::Format::BC1_RGBA_SRGB_BLOCK | vk::Format::BC1_RGBA_UNORM_BLOCK);
-            if bpp == 0 || !(half || full || bc1) {
+            let unorm8 = matches!(k.format, vk::Format::R8_UNORM | vk::Format::R8G8_UNORM | vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM);
+            let unorm16 = matches!(k.format, vk::Format::R16_UNORM | vk::Format::R16G16_UNORM | vk::Format::R16G16B16A16_UNORM);
+            if bpp == 0 || !(half || full || bc1 || unorm8 || unorm16) {
                 out.push(format!("{base:#x} {}x{}x{} {:?}: not a float format", k.width, k.height, k.layers, k.format));
                 continue;
             }
@@ -662,6 +670,33 @@ impl Images {
                     })
                     .collect();
                 out.push(format!("{base:#x} {}x{}x{} {:?}: mean endpoint rgb per layer: {}", k.width, k.height, k.layers, k.format, per.join(" ")));
+                continue;
+            }
+            if unorm8 || unorm16 {
+                // Per channel mean and share of zero texels, per layer.
+                let w = if unorm16 { 2 } else { 1 };
+                let max = if unorm16 { 65535.0 } else { 255.0 };
+                let per: Vec<String> = raw
+                    .chunks(slice as usize)
+                    .enumerate()
+                    .map(|(l, s)| {
+                        let n = s.len() / bpp as usize;
+                        let ch = bpp as usize / w;
+                        let mut sum = [0u64; 4];
+                        let mut zero = 0usize;
+                        for t in s.chunks_exact(bpp as usize) {
+                            if t.iter().all(|&x| x == 0) {
+                                zero += 1;
+                            }
+                            for (i, c) in t.chunks_exact(w).enumerate() {
+                                sum[i] += if w == 2 { u16::from_le_bytes([c[0], c[1]]) as u64 } else { c[0] as u64 };
+                            }
+                        }
+                        let means: Vec<String> = (0..ch).map(|i| format!("{:.3}", sum[i] as f64 / max / n.max(1) as f64)).collect();
+                        format!("{l}:{}{}", means.join("/"), if zero > 0 { format!(" z{:.0}%", 100.0 * zero as f64 / n.max(1) as f64) } else { String::new() })
+                    })
+                    .collect();
+                out.push(format!("{base:#x} {}x{}x{} {:?}: channel means per layer: {}", k.width, k.height, k.layers, k.format, per.join(" ")));
                 continue;
             }
             let st = float_stats(k.format, &raw).unwrap_or_default();
@@ -1725,6 +1760,28 @@ impl Images {
 
     /// View of a T# (format, type, levels/layers, swizzle) for sampling or storage.
     pub fn view(&mut self, t: &Tsharp, storage: bool, frame: u64) -> Result<(vk::ImageView, vk::Image), String> {
+        if storage {
+            // DS_TRACE_IMAGE_WRITERS=<hex base> or <w>x<h>x<depth>: each
+            // shader that binds such an image for writing, once.
+            static WATCH: std::sync::OnceLock<Option<(u64, [u32; 3])>> = std::sync::OnceLock::new();
+            let w = *WATCH.get_or_init(|| {
+                let v = std::env::var("DS_TRACE_IMAGE_WRITERS").ok()?;
+                let d: Vec<u32> = v.split('x').filter_map(|x| x.parse().ok()).collect();
+                if d.len() == 3 {
+                    Some((0, [d[0], d[1], d[2]]))
+                } else {
+                    u64::from_str_radix(v.trim_start_matches("0x"), 16).ok().map(|b| (b, [0; 3]))
+                }
+            });
+            if let Some((base, dims)) = w {
+                static SEEN: Mutex<Option<std::collections::HashSet<(u64, u64)>>> = Mutex::new(None);
+                let sh = BINDING_SHADER.with(|s| s.get());
+                let hit = if base != 0 { t.base == base } else { [t.width, t.height, t.depth] == dims };
+                if hit && SEEN.lock().get_or_insert_with(Default::default).insert((sh, t.base)) {
+                    crate::info!("images: shader {sh:#x} writes {:#x} ({}x{}x{} format {}, frame {frame})", t.base, t.width, t.height, t.depth, t.format);
+                }
+            }
+        }
         let key = self.image_for(t, frame, storage)?;
         let req = vk_format(t.format).unwrap();
         let depth = is_depth(key.format);
@@ -1759,7 +1816,7 @@ impl Images {
         if storage {
             img.write_gen = seq;
             if !img.gpu_written {
-                crate::info!("images: {:#x} {}x{} {:?} becomes a storage image (was uploaded: {})", key.base, key.width, key.height, key.format, img.source.is_some());
+                crate::info!("images: {:#x} {}x{} {:?} becomes a storage image (was uploaded: {}; shader {:#x})", key.base, key.width, key.height, key.format, img.source.is_some(), BINDING_SHADER.with(|s| s.get()));
             }
             img.gpu_written = true;
             img.source = None;

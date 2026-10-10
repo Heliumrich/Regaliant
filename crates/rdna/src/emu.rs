@@ -523,6 +523,7 @@ impl<'a, E: Env> Group<'a, E> {
             Enc::Sopk => self.sopk(w, &ins, name)?,
             Enc::Smem => self.smem(w, &ins, name)?,
             Enc::Vop1 | Enc::Vop2 | Enc::Vopc | Enc::Vop3 => self.valu(w, &ins, name)?,
+            Enc::Vop3p => self.vop3p(w, &ins, name)?,
             Enc::Ds => self.ds(w, &ins, name)?,
             Enc::Mubuf | Enc::Mtbuf => self.buffer(w, &ins, name)?,
             Enc::Global => self.global(w, &ins, name)?,
@@ -995,6 +996,85 @@ impl<'a, E: Env> Group<'a, E> {
     // -----------------------------------------------------------------------
     // Vector ALU
 
+    /// VOP3P: the mixed-precision FMAs (f32 sources, or f16 halves picked by
+    /// op_sel when op_sel_hi is set; neg_hi is abs, as in the translator).
+    fn vop3p(&mut self, w: usize, ins: &Inst, name: &str) -> R<()> {
+        if !matches!(name, "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16") {
+            return Err(format!("{:#x}: {name} (Vop3p) not emulated", ins.pc));
+        }
+        let v = Vop { dst: ins.vdst(), src: [ins.src(0), ins.src(1), ins.src(2)], abs: 0, neg: 0, clamp: false, omod: 0, opsel: 0, sdst: VCC as u16, vop3: true, sdwa: None, dpp16: None, dpp8: None };
+        let neg = bits(ins.w1, 29, 3);
+        let neg_hi = bits(ins.w0, 8, 3);
+        let opsel = bits(ins.w0, 11, 3);
+        let opsel_hi = bits(ins.w1, 27, 2) | (bits(ins.w0, 14, 1) << 2);
+        let clamp = bits(ins.w0, 15, 1) != 0;
+        for l in 0..self.lanes {
+            if !self.lane_writes(w, &v, l) {
+                continue;
+            }
+            let mut s = [0f32; 3];
+            for (k, sk) in s.iter_mut().enumerate() {
+                let raw = self.vsrc(w, ins, &v, k, l)?;
+                let mut x = if opsel_hi >> k & 1 != 0 { half_to_f32(if opsel >> k & 1 != 0 { (raw >> 16) as u16 } else { raw as u16 }) } else { f32::from_bits(raw) };
+                if neg_hi >> k & 1 != 0 {
+                    x = x.abs();
+                }
+                if neg >> k & 1 != 0 {
+                    x = -x;
+                }
+                *sk = x;
+            }
+            let mut r = s[0].mul_add(s[1], s[2]);
+            if clamp {
+                r = if r.is_nan() { 0.0 } else { r.clamp(0.0, 1.0) };
+            }
+            let d = (v.dst & 255) as usize;
+            let old = self.waves[w].v[d][l];
+            self.waves[w].v[d][l] = match name {
+                "v_fma_mix_f32" => r.to_bits(),
+                "v_fma_mixlo_f16" => (old & 0xFFFF_0000) | f32_to_half(r) as u32,
+                _ => (old & 0xFFFF) | ((f32_to_half(r) as u32) << 16),
+            };
+        }
+        Ok(())
+    }
+
+    /// v_permlane16_b32 / v_permlanex16_b32: lane i of each row of 16 reads
+    /// lane sel[i] (4 bits from src1 for i < 8, src2 above) of the same row
+    /// or (x16) of the other row of its 32-lane half; op_sel[0] fetches from
+    /// inactive lanes, op_sel[1] (bound control) writes the fetched value
+    /// even when the source lane is invalid, which otherwise keeps the
+    /// destination.
+    fn permlane(&mut self, w: usize, ins: &Inst, v: &Vop, name: &str) -> R<()> {
+        let s1 = self.sop(w, ins, v.src[1])?;
+        let s2 = self.sop(w, ins, v.src[2])?;
+        let (fi, bc) = (v.opsel & 1 != 0, v.opsel & 2 != 0);
+        let exec = self.waves[w].exec();
+        let x = (v.src[0].saturating_sub(256) & 255) as usize;
+        let before: Vec<u32> = self.waves[w].v[x].to_vec();
+        let d = (v.dst & 255) as usize;
+        for l in 0..self.lanes {
+            if exec >> l & 1 == 0 {
+                continue;
+            }
+            let i = l & 15;
+            let selw = if i >= 8 { s2 } else { s1 };
+            let sel = ((selw >> (4 * (i & 7))) & 15) as usize;
+            let mut row = l & !15;
+            if name == "v_permlanex16_b32" {
+                row ^= 16;
+            }
+            let src = row | sel;
+            let valid = fi || exec >> src & 1 != 0;
+            if valid {
+                self.waves[w].v[d][l] = before[src];
+            } else if bc {
+                self.waves[w].v[d][l] = 0;
+            }
+        }
+        Ok(())
+    }
+
     fn vop(&self, ins: &Inst) -> Vop {
         let mut v = Vop { dst: ins.vdst(), src: [ins.src(0), ins.src(1), 0], abs: 0, neg: 0, clamp: false, omod: 0, opsel: 0, sdst: VCC as u16, vop3: false, sdwa: None, dpp16: None, dpp8: None };
         match ins.enc {
@@ -1240,6 +1320,7 @@ impl<'a, E: Env> Group<'a, E> {
                 return Ok(());
             }
             "v_nop" | "v_pipeflush" | "v_clrexcp" => return Ok(()),
+            "v_permlane16_b32" | "v_permlanex16_b32" => return self.permlane(w, ins, &v, name),
             _ => {}
         }
         // Carry-out / carry-in arithmetic (VOP2 writes VCC, VOP3B an SGPR pair).
