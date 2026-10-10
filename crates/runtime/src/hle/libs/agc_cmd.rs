@@ -269,6 +269,18 @@ fn jump(cb: u64, compute: bool, chain: u32, cache_policy: u32, target: u64, size
     emit(cb, &[hdr(op::INDIRECT_BUFFER, 3, compute), lo(target) & !3, hi(target), control])
 }
 
+/// `DS_DRAW_TRACE=<index count>` (diagnosis): the guest call chains of the
+/// first 16 draw-builder calls with that index count.
+fn draw_trace(what: &str, count: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static WANT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    static LEFT: AtomicU32 = AtomicU32::new(16);
+    let Some(want) = *WANT.get_or_init(|| std::env::var("DS_DRAW_TRACE").ok().and_then(|v| v.trim().parse().ok())) else { return };
+    if count == want && LEFT.load(Ordering::Relaxed) > 0 && LEFT.fetch_sub(1, Ordering::Relaxed) > 0 {
+        crate::info!("agc: {what} count {count}: {}", crate::exception::current_guest_frames(16).join(" <- "));
+    }
+}
+
 // ---- EVENT_WRITE: dw1 = event_type | event_index<<8. Event types 0x38/0x39
 // (with an address, per the Agc size rule) carry addr lo/hi.
 fn event_index(t: u32) -> u32 {
@@ -503,6 +515,7 @@ sysv! {
     fn sceAgcDcbSetNumInstances(cb: u64, n: u32) -> u64 { emit(cb, &[hdr(op::NUM_INSTANCES, 1, DCB), n]) }
     fn sceAgcDcbSetNumInstancesGetSize() -> u64 { 8 }
     fn sceAgcDcbDrawIndex(cb: u64, count: u32, addr: u64, modifier: u64) -> u64 {
+        draw_trace("DrawIndex", count);
         emit(cb, &[hdr(op::DRAW_INDEX_2, 5, DCB), count.max(1), lo(addr), hi(addr), count, draw_initiator(modifier, 0)])
     }
     fn sceAgcDcbDrawIndexGetSize() -> u64 { 24 }
@@ -511,6 +524,7 @@ sysv! {
     }
     fn sceAgcDcbDrawIndexAutoGetSize() -> u64 { 12 }
     fn sceAgcDcbDrawIndexOffset(cb: u64, offset: u32, count: u32, modifier: u64) -> u64 {
+        draw_trace("DrawIndexOffset", count);
         emit(cb, &[hdr(op::DRAW_INDEX_OFFSET_2, 4, DCB), offset.wrapping_add(count), offset, count, draw_initiator(modifier, 0)])
     }
     fn sceAgcDcbDrawIndexOffsetGetSize() -> u64 { 20 }

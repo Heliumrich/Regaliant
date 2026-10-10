@@ -182,6 +182,7 @@ fn prune_runs(runs: &Path, keep: usize) {
 ///   textreset                log text-hook strings again (`DS_TEXT_HOOK`)
 ///   mem <addr> <len>         write guest memory (hex) to mem-<addr>.bin in the run directory
 ///   emucheck <cs,..>[:<n>]   interpreter check of the next dispatches of those shaders (`off`)
+///   find <hex u64>           guest addresses (8-byte aligned) holding that value (first 64)
 ///   quit                     orderly shutdown
 fn poll_control(path: &Path, offset: &mut u64) {
     use std::io::{Read, Seek, SeekFrom};
@@ -261,6 +262,29 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 };
                 gpu::exec::set_equal_bias(v);
                 Ok(())
+            }
+            "find" => {
+                // Debug: `find <hex u64>`: readable guest memory holding the
+                // value at an 8-byte aligned address (first 64 hits).
+                match parts.next().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
+                    Some(v) => {
+                        let spans: Vec<(u64, u64, String)> = mem::MEM.lock().vmas.values().filter(|m| m.kind != mem::VmaKind::Reserved && m.prot & 1 != 0).map(|m| (m.start, m.end(), m.name.clone())).collect();
+                        let mut hits = Vec::new();
+                        let t0 = Instant::now();
+                        for (lo, hi, name) in &spans {
+                            let mut a = (*lo + 7) & !7;
+                            while a + 8 <= *hi && hits.len() < 64 {
+                                if unsafe { *(a as *const u64) } == v {
+                                    hits.push(format!("{a:#x} ({name})"));
+                                }
+                                a += 8;
+                            }
+                        }
+                        info!("find {v:#x}: {} hit(s) in {} mappings ({} ms): {}", hits.len(), spans.len(), t0.elapsed().as_millis(), hits.join(", "));
+                        Ok(())
+                    }
+                    None => Err("usage: find <hex u64>".into()),
+                }
             }
             "emucheck" => {
                 // Diagnosis: `emucheck <hex shader>[,...][:<groups>]` / `emucheck off`.

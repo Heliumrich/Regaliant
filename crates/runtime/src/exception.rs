@@ -611,6 +611,15 @@ unsafe fn handle_breakpoint(ctx: &mut CONTEXT) -> bool {
                     bp_ = *(bp_ as *const u64);
                 }
             }
+            // DS_BREAK_XMM=<n>: the low float of xmm0..xmm(n-1) (float
+            // arguments of the System V ABI).
+            if let Some(n) = std::env::var("DS_BREAK_XMM").ok().and_then(|v| v.parse::<usize>().ok()) {
+                let x = &ctx.Anonymous.Anonymous;
+                let regs = [x.Xmm0, x.Xmm1, x.Xmm2, x.Xmm3, x.Xmm4, x.Xmm5, x.Xmm6, x.Xmm7];
+                for (k, r) in regs.iter().enumerate().take(n.min(8)) {
+                    extra.push_str(&format!(" xmm{k}={}", f32::from_bits(r.Low as u32)));
+                }
+            }
             if let Ok(spec) = std::env::var("DS_BREAK_PEEK") {
                 let regs = [
                     ("rdi", ctx.Rdi),
@@ -706,8 +715,10 @@ pub fn arm_watch_current_thread() {
             return;
         }
         c.0.Dr0 = a;
-        // L0 enable, RW0 = 01 (data writes), LEN0 = 10 (8 bytes).
-        c.0.Dr7 = (c.0.Dr7 & !0x000F_0003) | 1 | (1 << 16) | (2 << 18);
+        // L0 enable, RW0 = 01 (data writes; 11 = reads and writes with
+        // DS_WATCH_RW=1), LEN0 = 10 (8 bytes).
+        let rw = if std::env::var("DS_WATCH_RW").ok().as_deref() == Some("1") { 3 } else { 1 };
+        c.0.Dr7 = (c.0.Dr7 & !0x000F_0003) | 1 | (rw << 16) | (2 << 18);
         if SetThreadContext(GetCurrentThread(), &c.0) == 0 {
             crate::warn!("DS_WATCH: SetThreadContext failed on this thread");
         }
