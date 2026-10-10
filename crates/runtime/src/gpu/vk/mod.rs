@@ -274,6 +274,19 @@ fn init_inner() -> Result<(), String> {
             r2_supported.null_descriptor != 0
         );
         let queue = device.get_device_queue(qf, 0);
+        // Formats the title samples with depth comparison: which support it
+        // (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT).
+        {
+            let mut have = Vec::new();
+            for f in [vk::Format::R16_UNORM, vk::Format::R32_SFLOAT, vk::Format::R16_SFLOAT, vk::Format::D16_UNORM, vk::Format::D32_SFLOAT] {
+                let mut p3 = vk::FormatProperties3::default();
+                let mut p2 = vk::FormatProperties2::default().push_next(&mut p3);
+                instance.get_physical_device_format_properties2(pdev, f, &mut p2);
+                let opt = p3.optimal_tiling_features.contains(vk::FormatFeatureFlags2::SAMPLED_IMAGE_DEPTH_COMPARISON);
+                have.push(format!("{f:?} {opt}"));
+            }
+            crate::info!("Vulkan depth-comparison sampling support: {}", have.join(", "));
+        }
         let mem_props = instance.get_physical_device_memory_properties(pdev);
         let ctx = Ctx {
             surface_i: ash::khr::surface::Instance::new(&entry, &instance),

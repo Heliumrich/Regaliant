@@ -1027,6 +1027,55 @@ impl Addr<'_> {
         self.next += 1;
         tr.vreg(r)
     }
+
+    /// The next integer address component of an A16 instruction: 16-bit
+    /// values packed two per address VGPR (low half first), zero-extended.
+    fn take_u16(&mut self, tr: &mut T) -> R<Word> {
+        let u = tr.t.u32;
+        let r = addr_vgpr(self.ins, self.next / 2);
+        let hi = self.next % 2 == 1;
+        self.next += 1;
+        let v = tr.vreg(r)?;
+        if hi {
+            let k16 = tr.u(16);
+            e(tr.b.shift_right_logical(u, None, v, k16))
+        } else {
+            let m = tr.u(0xFFFF);
+            e(tr.b.bitwise_and(u, None, v, m))
+        }
+    }
+
+    /// The next integer address component (A16 or 32-bit).
+    fn take_int(&mut self, tr: &mut T, a16: bool) -> R<Word> {
+        if a16 { self.take_u16(tr) } else { self.take(tr) }
+    }
+}
+
+/// D16 store data: component `k` (of the enabled ones) is the 16-bit half
+/// `k % 2` of data VGPR `vd + k / 2`, converted for the image class (f16 to
+/// f32, zero- or sign-extended integers).
+fn d16_component(tr: &mut T, vd: u32, k: u32, class: NumClass) -> R<Word> {
+    let u = tr.t.u32;
+    let raw = tr.store_vreg(vd + k / 2)?;
+    let hi = k % 2 == 1;
+    Ok(match class {
+        NumClass::Float => super::alu::half_to_f(tr, raw, hi)?,
+        NumClass::Uint => {
+            if hi {
+                let k16 = tr.u(16);
+                e(tr.b.shift_right_logical(u, None, raw, k16))?
+            } else {
+                let m = tr.u(0xFFFF);
+                e(tr.b.bitwise_and(u, None, raw, m))?
+            }
+        }
+        NumClass::Sint => {
+            let i = tr.to_i(raw)?;
+            let off = tr.u(if hi { 16 } else { 0 });
+            let w16 = tr.u(16);
+            e(tr.b.bit_field_s_extract(tr.t.i32, None, i, off, w16))?
+        }
+    })
 }
 
 /// Integer coordinates (instruction layout) adapted to the host image type:
@@ -1099,11 +1148,14 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
     let u = tr.t.u32;
     let f = tr.t.f32;
     let Some(&(ri, si)) = tr.plan.inst_res.get(&ins.pc) else { return Err(format!("{:#x}: image op without resource", ins.pc)) };
-    let (var, img_ty, rdim, class, storage) = {
+    let (var, img_ty, rdim, class, storage, depth) = {
         let ir = &tr.images[&ri];
-        (ir.var, ir.img_ty, ir.dim, ir.class, ir.storage)
+        (ir.var, ir.img_ty, ir.dim, ir.class, ir.storage, ir.depth)
     };
-    if ins.mimg_a16() || ins.mimg_d16() {
+    // 16-bit addresses (A16) and data (D16): image_load / image_store only.
+    let (a16, d16) = (ins.mimg_a16(), ins.mimg_d16());
+    let packed_ok = matches!(name, "image_load" | "image_load_mip" | "image_store" | "image_store_mip");
+    if (a16 || d16) && !packed_ok {
         tr.warn(format!("{:#x}: {name} with a16/d16 unsupported", ins.pc));
         return Ok(());
     }
@@ -1161,7 +1213,7 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
         "image_load" | "image_load_mip" => {
             let mut cs = Vec::new();
             for _ in 0..coord_count(idim) {
-                let v = ad.take(tr)?;
+                let v = ad.take_int(tr, a16)?;
                 cs.push(tr.to_i(v)?);
             }
             let coord = int_coord(tr, idim, rdim, cs)?;
@@ -1172,13 +1224,43 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
                 e(tr.b.image_fetch(res_ty, None, image, coord, Some(ImageOperands::SAMPLE), [Operand::IdRef(s)]))?
             } else {
                 let lod = if name == "image_load_mip" {
-                    let v = ad.take(tr)?;
+                    let v = ad.take_int(tr, a16)?;
                     tr.to_i(v)?
                 } else {
                     tr.i(0)
                 };
                 e(tr.b.image_fetch(res_ty, None, image, coord, Some(ImageOperands::LOD), [Operand::IdRef(lod)]))?
             };
+            if d16 {
+                // Enabled components packed as 16-bit halves, two per VGPR.
+                let mut halves = Vec::new();
+                for c in 0..4 {
+                    if dmask & (1 << c) == 0 {
+                        continue;
+                    }
+                    let x = e(tr.b.composite_extract(comp_ty, None, res, [c]))?;
+                    let h = match class {
+                        NumClass::Float => super::alu::f_to_half(tr, x)?,
+                        _ => {
+                            let xu = tr.to_u(x)?;
+                            let m = tr.u(0xFFFF);
+                            e(tr.b.bitwise_and(u, None, xu, m))?
+                        }
+                    };
+                    halves.push(h);
+                }
+                for (k, pair) in halves.chunks(2).enumerate() {
+                    let v = if pair.len() == 2 {
+                        let k16 = tr.u(16);
+                        let hi = e(tr.b.shift_left_logical(u, None, pair[1], k16))?;
+                        e(tr.b.bitwise_or(u, None, pair[0], hi))?
+                    } else {
+                        pair[0]
+                    };
+                    tr.set_vreg(vd + k as u32, v)?;
+                }
+                return Ok(());
+            }
             write_result(tr, res)
         }
         "image_store" | "image_store_mip" => {
@@ -1187,11 +1269,11 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
             }
             let mut cs = Vec::new();
             for _ in 0..coord_count(idim) {
-                let v = ad.take(tr)?;
+                let v = ad.take_int(tr, a16)?;
                 cs.push(tr.to_i(v)?);
             }
             if name == "image_store_mip" {
-                let lod = ad.take(tr)?;
+                let lod = ad.take_int(tr, a16)?;
                 let _ = lod;
                 tr.warn(format!("{:#x}: image_store_mip writes the bound mip level", ins.pc));
             }
@@ -1199,6 +1281,21 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
             let mut comps = Vec::new();
             let mut k = 0;
             for c in 0..4 {
+                if d16 {
+                    let v = if dmask & (1 << c) != 0 {
+                        let x = d16_component(tr, vd, k, class)?;
+                        k += 1;
+                        x
+                    } else {
+                        match class {
+                            NumClass::Float => tr.f(0.0),
+                            NumClass::Sint => tr.i(0),
+                            NumClass::Uint => tr.u(0),
+                        }
+                    };
+                    comps.push(v);
+                    continue;
+                }
                 let v = if dmask & (1 << c) != 0 {
                     let x = tr.store_vreg(vd + k)?;
                     k += 1;
@@ -1250,7 +1347,7 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
             }
             Ok(())
         }
-        n if n.starts_with("image_sample") || n.starts_with("image_gather4") || n == "image_get_lod" => sample(tr, ins, name, image, img_ty, si, idim, rdim, res_ty, &write_result),
+        n if n.starts_with("image_sample") || n.starts_with("image_gather4") || n == "image_get_lod" => sample(tr, ins, name, image, img_ty, si, idim, rdim, depth, res_ty, &write_result),
         _ => {
             tr.warn(format!("{:#x}: unsupported {name}", ins.pc));
             Ok(())
@@ -1259,7 +1356,7 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sample(tr: &mut T, ins: &Inst, name: &str, image: Word, img_ty: Word, si: Option<usize>, idim: ImageDim, rdim: ImageDim, res_ty: Word, write_result: &dyn Fn(&mut T, Word) -> R<()>) -> R<()> {
+fn sample(tr: &mut T, ins: &Inst, name: &str, image: Word, img_ty: Word, si: Option<usize>, idim: ImageDim, rdim: ImageDim, depth: bool, res_ty: Word, write_result: &dyn Fn(&mut T, Word) -> R<()>) -> R<()> {
     let f = tr.t.f32;
     let gather = name.starts_with("image_gather4");
     let get_lod = name == "image_get_lod";
@@ -1273,8 +1370,15 @@ fn sample(tr: &mut T, ins: &Inst, name: &str, image: Word, img_ty: Word, si: Opt
     let has_cl = has("cl");
     let has_lz = has("lz");
     let Some(sidx) = si else { return Err(format!("{:#x}: sample without sampler", ins.pc)) };
+    // Vulkan compares only on depth formats (on the RTX 4090 not R16_UNORM,
+    // R16/R32_SFLOAT): comparisons on color views are emulated with a plain
+    // sampler (`compare_texels`).
+    let manual_cmp = has_c && !depth && !get_lod && matches!(rdim, ImageDim::D1 | ImageDim::D1Array | ImageDim::D2 | ImageDim::D2Array);
+    if has_c && !depth && !manual_cmp && !get_lod {
+        tr.warn(format!("{:#x}: depth comparison on a color {rdim:?} image (not emulated)", ins.pc));
+    }
     if !get_lod {
-        let (mine, other) = if has_c { (&mut tr.compare_samplers, &tr.plain_samplers) } else { (&mut tr.plain_samplers, &tr.compare_samplers) };
+        let (mine, other) = if has_c && !manual_cmp { (&mut tr.compare_samplers, &tr.plain_samplers) } else { (&mut tr.plain_samplers, &tr.compare_samplers) };
         mine.insert(sidx);
         if other.contains(&sidx) {
             tr.warn(format!("{:#x}: sampler {sidx} used with and without depth comparison", ins.pc));
@@ -1487,7 +1591,13 @@ fn sample(tr: &mut T, ins: &Inst, name: &str, image: Word, img_ty: Word, si: Opt
         tr.warn(format!("{:#x}: min-lod clamp ignored", ins.pc));
     }
     let m = if mask == ImageOperands::NONE { None } else { Some(mask) };
-    let res = if gather {
+    let res = if let (true, Some(zc)) = (manual_cmp, zcmp) {
+        let zf = tr.to_f(zc)?;
+        // A gather's offset operand (samples had theirs folded into coord).
+        let goff = if gather && mask.contains(ImageOperands::OFFSET) { operands.last().cloned() } else { None };
+        let arrayed = matches!(rdim, ImageDim::D1Array | ImageDim::D2Array);
+        compare_texels(tr, ins, image, simg, coord, zf, arrayed, gather, goff)?
+    } else if gather {
         let comp = tr.u(match ins.mimg_dmask() {
             2 => 1,
             4 => 2,
@@ -1519,6 +1629,90 @@ fn sample(tr: &mut T, ins: &Inst, name: &str, image: Word, img_ty: Word, si: Opt
         e(tr.b.image_sample_implicit_lod(res_ty, None, simg, coord, m, operands))?
     };
     write_result(tr, res)
+}
+
+/// Depth-comparison sampling of a color image (emulated: Vulkan defines
+/// comparison only for depth formats): gathers the 2x2 footprint with a plain
+/// sampler, compares each texel with the reference by the S# DEPTH_COMPARE_FUNC
+/// (word0[14:12], `ref func texel` as the hardware and Vulkan define it) and,
+/// for samples, filters the four results bilinearly (LINEAR mag filter,
+/// word2[20]; PCF as the hardware does) or takes the nearest one. Gathers
+/// return the four comparisons. The result is (r, 0, 0, 1) for samples.
+#[allow(clippy::too_many_arguments)]
+fn compare_texels(tr: &mut T, ins: &Inst, image: Word, simg: Word, coord: Word, zref: Word, arrayed: bool, gather: bool, goff: Option<Operand>) -> R<Word> {
+    let f = tr.t.f32;
+    let u = tr.t.u32;
+    let bt = tr.t.bool_;
+    let comp0 = tr.u(0);
+    let (gm, gops) = match goff {
+        Some(o) => (Some(ImageOperands::OFFSET), vec![o]),
+        None => (None, vec![]),
+    };
+    let g = e(tr.b.image_gather(tr.t.v4f, None, simg, coord, comp0, gm, gops))?;
+    let sb = ins.mimg_ssamp() as u32;
+    let w0 = tr.sreg(sb)?;
+    let w2 = tr.sreg(sb + 2)?;
+    let k12 = tr.u(12);
+    let k7 = tr.u(7);
+    let func = e(tr.b.shift_right_logical(u, None, w0, k12))?;
+    let func = e(tr.b.bitwise_and(u, None, func, k7))?;
+    let one = tr.f(1.0);
+    let zero = tr.f(0.0);
+    let t_true = tr.b.constant_true(bt);
+    let t_false = tr.b.constant_false(bt);
+    let mut c = [0; 4];
+    for (k, ck) in c.iter_mut().enumerate() {
+        let t = e(tr.b.composite_extract(f, None, g, [k as u32]))?;
+        let lt = e(tr.b.f_ord_less_than(bt, None, zref, t))?;
+        let eq = e(tr.b.f_ord_equal(bt, None, zref, t))?;
+        let gt = e(tr.b.f_ord_greater_than(bt, None, zref, t))?;
+        let le = e(tr.b.logical_or(bt, None, lt, eq))?;
+        let ge = e(tr.b.logical_or(bt, None, gt, eq))?;
+        let ne = e(tr.b.f_unord_not_equal(bt, None, zref, t))?;
+        let mut r = t_false;
+        for (v, cond) in [(1u32, lt), (2, eq), (3, le), (4, gt), (5, ne), (6, ge), (7, t_true)] {
+            let kv = tr.u(v);
+            let is = e(tr.b.i_equal(bt, None, func, kv))?;
+            r = e(tr.b.select(bt, None, is, cond, r))?;
+        }
+        *ck = e(tr.b.select(f, None, r, one, zero))?;
+    }
+    if gather {
+        return Ok(e(tr.b.composite_construct(tr.t.v4f, None, c))?);
+    }
+    // Weights of the footprint: gather order x = (i0,j1), y = (i1,j1),
+    // z = (i1,j0), w = (i0,j0).
+    let lod0 = tr.i(0);
+    let szty = if arrayed { tr.t.v3i } else { tr.t.v2i };
+    let size = e(tr.b.image_query_size_lod(szty, None, image, lod0))?;
+    let half = tr.f(0.5);
+    let mut fr = [0; 2];
+    for (k, fk) in fr.iter_mut().enumerate() {
+        let n = e(tr.b.composite_extract(tr.t.i32, None, size, [k as u32]))?;
+        let nf = e(tr.b.convert_s_to_f(f, None, n))?;
+        let x = e(tr.b.composite_extract(f, None, coord, [k as u32]))?;
+        let tx = e(tr.b.f_mul(f, None, x, nf))?;
+        let tx = e(tr.b.f_sub(f, None, tx, half))?;
+        *fk = tr.glsl1(f, GLOp::Fract, tx)?;
+    }
+    let bottom = tr.glsl3(f, GLOp::FMix, c[3], c[2], fr[0])?;
+    let top = tr.glsl3(f, GLOp::FMix, c[0], c[1], fr[0])?;
+    let bil = tr.glsl3(f, GLOp::FMix, bottom, top, fr[1])?;
+    let ihi = e(tr.b.f_ord_greater_than_equal(bt, None, fr[0], half))?;
+    let jhi = e(tr.b.f_ord_greater_than_equal(bt, None, fr[1], half))?;
+    let nb = e(tr.b.select(f, None, ihi, c[2], c[3]))?;
+    let nt = e(tr.b.select(f, None, ihi, c[1], c[0]))?;
+    let near = e(tr.b.select(f, None, jhi, nt, nb))?;
+    let k20 = tr.u(20);
+    let k1 = tr.u(1);
+    let mag = e(tr.b.shift_right_logical(u, None, w2, k20))?;
+    let mag = e(tr.b.bitwise_and(u, None, mag, k1))?;
+    let k0 = tr.u(0);
+    let lin = e(tr.b.i_not_equal(bt, None, mag, k0))?;
+    let r = e(tr.b.select(f, None, lin, bil, near))?;
+    let z = tr.f(0.0);
+    let one = tr.f(1.0);
+    Ok(e(tr.b.composite_construct(tr.t.v4f, None, [r, z, z, one]))?)
 }
 
 // ---------------------------------------------------------------------------

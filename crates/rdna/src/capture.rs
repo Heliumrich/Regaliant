@@ -107,7 +107,7 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
                     .find(|i| i.enc == crate::Enc::Mimg && plan.inst_res.get(&i.pc).is_some_and(|x| x.0 == r))
                     .map(|i| image_dim(i.mimg_dim()))
                     .unwrap_or(ImageDim::D2);
-                ResSpec::Image { dim, class: NumClass::Float }
+                ResSpec::Image { dim, class: NumClass::Float, depth: false }
             }
         })
         .collect();

@@ -1374,13 +1374,13 @@ fn cube_op(tr: &mut T, which: &str, x: Word, y: Word, z: Word) -> R<Word> {
 }
 
 /// f16 half (0 low, 1 high) of a 32-bit value as f32.
-fn half_to_f(tr: &mut T, raw: Word, hi: bool) -> R<Word> {
+pub(crate) fn half_to_f(tr: &mut T, raw: Word, hi: bool) -> R<Word> {
     let v = tr.glsl1(tr.t.v2f, GLOp::UnpackHalf2x16, raw)?;
     e(tr.b.composite_extract(tr.t.f32, None, v, [hi as u32]))
 }
 
 /// f32 -> f16 bits in the low 16 bits (high bits zero).
-fn f_to_half(tr: &mut T, x: Word) -> R<Word> {
+pub(crate) fn f_to_half(tr: &mut T, x: Word) -> R<Word> {
     let z = tr.f(0.0);
     let vv = e(tr.b.composite_construct(tr.t.v2f, None, [x, z]))?;
     tr.glsl1(tr.t.u32, GLOp::PackHalf2x16, vv)

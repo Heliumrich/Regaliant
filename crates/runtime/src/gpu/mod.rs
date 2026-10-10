@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 16] = [
+    static ALL: [Tunable; 17] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -43,6 +43,7 @@ pub mod tune {
         Tunable { name: "gpu_cp_writes", env: "DS_GPU_CP_WRITES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "slots", env: "DS_GPU_SLOTS", default: 4, value: AtomicU64::new(UNSET) },
         Tunable { name: "lod_stats", env: "DS_LOD_STATS", default: 2, value: AtomicU64::new(UNSET) },
+        Tunable { name: "cmp_emulate", env: "DS_CMP_EMULATE", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -148,6 +149,13 @@ pub mod tune {
     /// mip 0, 2 the banks of textures bound since the last report.
     pub fn lod_stats() -> u64 {
         get(15)
+    }
+
+    /// Depth-comparison sampling of color images is emulated in the
+    /// translation (Vulkan compares only on depth formats); 0 compares in
+    /// hardware everywhere (undefined on color formats; A/B).
+    pub fn cmp_emulate() -> bool {
+        get(16) != 0
     }
 
     /// Sets a switch by name; false if unknown.

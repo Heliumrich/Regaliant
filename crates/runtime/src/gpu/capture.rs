@@ -716,7 +716,20 @@ pub fn dispatch(cp: &Cp, what: &str) {
                             let (sx, sy) = if w < 2560 || h < 1440 { (x * w / 2560, y * h / 1440) } else { (x, y) };
                             let o = (sy as usize * w as usize + sx as usize) * texel as usize;
                             let now = raw.get(o..o + texel as usize)?.to_vec();
-                            let hex = |b: &[u8]| b.iter().rev().map(|x| format!("{x:02x}")).collect::<String>();
+                            // Hex, with the channels of 8-byte (four f16) and
+                            // 16-byte (four f32) texels decoded.
+                            let hex = |b: &[u8]| {
+                                let h = b.iter().rev().map(|x| format!("{x:02x}")).collect::<String>();
+                                let dec: Option<Vec<f32>> = match b.len() {
+                                    8 => Some(b.chunks_exact(2).map(|c| super::images::half_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect()),
+                                    16 => Some(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
+                                    _ => None,
+                                };
+                                match dec {
+                                    Some(v) => format!("{h} ({})", v.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(", ")),
+                                    None => h,
+                                }
+                            };
                             let mut g = LAST_PIXEL.lock();
                             let before = g.get_or_insert_with(Default::default).insert(t.base, now.clone());
                             Some(match before {

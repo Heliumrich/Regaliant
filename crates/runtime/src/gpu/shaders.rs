@@ -524,7 +524,8 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
                 let t = Tsharp::decode(&w);
                 let dim = ImageDim::from_type(t.ty, t.depth).ok_or_else(|| format!("{:?} shader {addr:#x}: image resource {i} has type {}", spec.stage, t.ty))?;
                 super::lodstats::note(&t.raw);
-                spec.resources.push(ResSpec::Image { dim, class: num_class(t.format) });
+                let depth = !super::tune::cmp_emulate() || super::images::with(|im| im.depth_view(&t));
+                spec.resources.push(ResSpec::Image { dim, class: num_class(t.format), depth });
                 resources.push(Resolved::Image(t));
             }
             ResKind::Sampler => {
@@ -559,7 +560,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
                     entries.push(usable.then_some(t));
                 }
                 let (dim, format) = first.ok_or_else(|| format!("{:?} shader {addr:#x}: image table {i} ({:#x}, {n} entries) has no usable T#", spec.stage, v.base))?;
-                spec.resources.push(ResSpec::Image { dim, class: num_class(format) });
+                spec.resources.push(ResSpec::Image { dim, class: num_class(format), depth: false });
                 resources.push(Resolved::ImageTable(entries));
             }
         }

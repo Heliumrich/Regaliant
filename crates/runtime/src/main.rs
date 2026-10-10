@@ -364,6 +364,21 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     _ => Err("usage: mem <hex address> <hex length up to 0x10000000>".into()),
                 }
             }
+            "fillimg" => {
+                // Experiment: `fillimg <hex address> <value>` fills the cached
+                // images at that guest address with one value (all channels,
+                // layers and mips).
+                let a = parts.next().and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok());
+                let v = parts.next().and_then(|v| v.parse::<f32>().ok());
+                match (a, v) {
+                    (Some(a), Some(v)) => {
+                        let n = gpu::images::with(|im| im.fill_at(a, v));
+                        info!("control: fillimg {a:#x} {v}: {n} image(s) filled");
+                        Ok(())
+                    }
+                    _ => Err("usage: fillimg <hex address> <value>".into()),
+                }
+            }
             "imgstat" => {
                 // Diagnosis: `imgstat <hex address>` logs value statistics of
                 // the cached images at that guest address.

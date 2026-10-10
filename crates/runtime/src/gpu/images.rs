@@ -715,6 +715,30 @@ impl Images {
         out
     }
 
+    /// Fills every cached image at guest address `base` (all layers and
+    /// mips) with one color value (diagnosis: `fillimg`; experiments with
+    /// GPU-written inputs). Returns how many images.
+    pub fn fill_at(&mut self, base: u64, value: f32) -> usize {
+        let imgs: Vec<(vk::Image, ImageKey)> = self.map.values().filter(|i| i.key.base == base).map(|i| (i.image, i.key)).collect();
+        let c = ctx();
+        for (image, k) in &imgs {
+            if is_depth(k.format) {
+                continue;
+            }
+            let layers = if k.ty3d { 1 } else { k.layers };
+            let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: k.levels.max(1), base_array_layer: 0, layer_count: layers };
+            let color = vk::ClearColorValue { float32: [value; 4] };
+            self.one_shot(|cmd| unsafe {
+                let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+                c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+                c.device.cmd_clear_color_image(cmd, *image, vk::ImageLayout::GENERAL, &color, &[range]);
+                let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+                c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            });
+        }
+        imgs.len()
+    }
+
     /// Uploads the CPU-sourced textures at guest address `base` (all of
     /// them without one) again at their next use (diagnosis: `reupload`);
     /// returns how many.
@@ -1191,6 +1215,13 @@ impl Images {
     }
 
     /// The cached image a T# would use now (fast-clear checks; no side effects).
+    /// Whether a T# binds as a depth/stencil view (a rendered depth surface):
+    /// the translation compares in hardware there and emulates comparisons
+    /// on color views.
+    pub fn depth_view(&self, t: &Tsharp) -> bool {
+        self.resolved_key(t, false).is_some_and(|k| is_depth(k.format))
+    }
+
     pub fn resolved_key(&self, t: &Tsharp, storage: bool) -> Option<ImageKey> {
         self.lookup(&Self::key_of(t)?, storage).map(|(k, _)| k)
     }

@@ -135,7 +135,9 @@ pub struct PsInput {
 pub enum ResSpec {
     /// V#: unified FORMAT (word3[18:12]) and DST_SEL_XYZW (word3[11:0]).
     Buffer { format: u8, dst_sel: u16 },
-    Image { dim: ImageDim, class: NumClass },
+    /// `depth`: bound as a depth/stencil view (depth-comparison sampling
+    /// works; on color views it is emulated, see `mem::compare_texels`).
+    Image { dim: ImageDim, class: NumClass, depth: bool },
     Sampler,
     /// Base address of GLOBAL instructions (bound like a raw buffer).
     Global,
@@ -316,6 +318,8 @@ pub(crate) struct ImageRes {
     pub dim: ImageDim,
     pub class: NumClass,
     pub storage: bool,
+    /// Bound as a depth/stencil view (`ResSpec::Image::depth`).
+    pub depth: bool,
 }
 
 pub(crate) struct T<'a> {
@@ -1475,8 +1479,8 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
                 tr.buffer_binding.insert(v, bnd);
                 tr.buffers.insert(i, v);
             }
-            (ResKind::Image, Some(ResSpec::Image { dim, class })) => {
-                let (dim, class) = (*dim, *class);
+            (ResKind::Image, Some(ResSpec::Image { dim, class, depth })) => {
+                let (dim, class, depth) = (*dim, *class, *depth);
                 let sampled_ty = match class {
                     NumClass::Float => tr.t.f32,
                     NumClass::Sint => tr.t.i32,
@@ -1499,7 +1503,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
                 let v = tr.global_var(pt, StorageClass::UniformConstant);
                 let bnd = tr.alloc_binding(if storage { BindingKind::StorageImage(i) } else { BindingKind::Image(i) });
                 tr.decorate_binding(v, bnd);
-                tr.images.insert(i, ImageRes { var: v, img_ty, dim, class, storage });
+                tr.images.insert(i, ImageRes { var: v, img_ty, dim, class, storage, depth });
             }
             (ResKind::Sampler, _) => {
                 let pt = tr.b.type_pointer(None, StorageClass::UniformConstant, tr.sampler_ty);
@@ -1508,7 +1512,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
                 tr.decorate_binding(v, bnd);
                 tr.samplers.insert(i, v);
             }
-            (ResKind::ImageTable, Some(ResSpec::Image { dim, class })) => {
+            (ResKind::ImageTable, Some(ResSpec::Image { dim, class, .. })) => {
                 if r.written {
                     return Err(format!("image table {i} is written (storage tables unsupported)"));
                 }
@@ -1535,7 +1539,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
                 let v = tr.global_var(pt, StorageClass::UniformConstant);
                 let bnd = tr.alloc_binding(BindingKind::ImageArray(i));
                 tr.decorate_binding(v, bnd);
-                tr.images.insert(i, ImageRes { var: v, img_ty, dim, class, storage: false });
+                tr.images.insert(i, ImageRes { var: v, img_ty, dim, class, storage: false, depth: false });
                 tr.image_tables.insert(i, r.table.ok_or("image table without its load")?);
             }
             (ResKind::Image | ResKind::ImageTable, _) => return Err(format!("image resource {i} has no specialization")),
