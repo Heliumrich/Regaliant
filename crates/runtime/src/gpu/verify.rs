@@ -5,6 +5,12 @@
 //! - fill: `dst[i] = (s4, s5, s6, s7)` for i = group * 64 + thread, V# in s[0:3];
 //! - copy: `dst[i] = src[i % n]` for i < count, src V# s[0:3], dst V# s[4:7],
 //!   {count, n} read from the constant buffer V# s[8:11].
+//!
+//! A copy's expected values are the source as the command processor found
+//! it (`snapshot_source`), when no GPU work or deferred CP write still wrote
+//! it: read at completion, sources the title updates every frame (animation
+//! data) made the check fail spuriously. Others are unverifiable, and so
+//! are checks whose destination later work of the same batch writes again.
 
 use super::desc::Vsharp;
 use super::shaders::Prepared;
@@ -31,6 +37,14 @@ pub struct Check {
     addr: u64,
     threads: u64,
     user: Vec<u32>,
+    /// Copy: (count, modulus, sampled destination indices with the source
+    /// values expected there), taken when the dispatch was recorded.
+    expected: Option<(u64, u64, Vec<(u64, u32)>)>,
+    /// Number of the batch's guest writes recorded up to and including this
+    /// dispatch (later ones may overwrite the destination).
+    pub writes_mark: usize,
+    /// The destination was written again later in the batch.
+    pub overwritten: bool,
 }
 
 const FILL: &[&str] = &["v_lshl_add_u32", "v_mov_b32", "v_mov_b32", "v_mov_b32", "v_mov_b32", "buffer_store_format_xyzw", "s_endpgm"];
@@ -90,7 +104,59 @@ pub fn check_for(p: &Prepared, groups: [u32; 3], local: [u32; 3]) -> Option<Chec
         return None;
     };
     let threads = groups.iter().map(|&g| g as u64).product::<u64>() * local.iter().map(|&l| l.max(1) as u64).product::<u64>();
-    Some(Check { kind, addr: p.addr, threads, user: p.user.clone() })
+    Some(Check { kind, addr: p.addr, threads, user: p.user.clone(), expected: None, writes_mark: 0, overwritten: false })
+}
+
+/// The guest range a check compares (the kernel's destination).
+pub fn dest_range(c: &Check) -> (u64, u64) {
+    let v = match c.kind {
+        Kind::Fill => Vsharp::decode(&c.user[0..4]),
+        Kind::Copy => Vsharp::decode(&c.user[4..8]),
+    };
+    (v.base, v.num_records as u64 * v.stride.max(1) as u64)
+}
+
+/// Guest ranges a check's expected values come from (copy: source and
+/// constant buffer).
+pub fn source_ranges(c: &Check) -> Vec<(u64, u64)> {
+    match c.kind {
+        Kind::Fill => Vec::new(),
+        Kind::Copy => {
+            let src = Vsharp::decode(&c.user[0..4]);
+            let cb = Vsharp::decode(&c.user[8..12]);
+            vec![(src.base, src.num_records as u64 * src.stride.max(1) as u64), (cb.base, 8)]
+        }
+    }
+}
+
+/// Records a copy's expected values now (see the module documentation).
+pub fn snapshot_source(c: &mut Check) {
+    if !matches!(c.kind, Kind::Copy) {
+        return;
+    }
+    let src = Vsharp::decode(&c.user[0..4]);
+    let dst = Vsharp::decode(&c.user[4..8]);
+    let cb = Vsharp::decode(&c.user[8..12]);
+    let (Some(count), Some(modn)) = (rd(cb.base), rd(cb.base + 4)) else { return };
+    let (count, modn) = (count as u64, modn as u64);
+    if modn == 0 || src.stride == 0 {
+        return;
+    }
+    let n = count.min(c.threads).min(dst.num_records as u64);
+    let mut want = Vec::new();
+    for i in samples(n) {
+        let s = i % modn;
+        let v = if s < src.num_records as u64 {
+            match rd(src.base + s * src.stride as u64) {
+                Some(v) => v,
+                None => return,
+            }
+        } else {
+            0
+        };
+        want.push((i, v));
+    }
+    c.expected = Some((count, modn, want));
 }
 
 fn rd(a: u64) -> Option<u32> {
@@ -138,6 +204,10 @@ fn outcome(name: &str, c: &Check, r: Result<String, String>) {
 
 /// Runs a check after the dispatch completed.
 pub fn run(name: &str, c: &Check) {
+    if c.overwritten {
+        outcome(name, c, Err("unverifiable: destination written again later in the batch".into()));
+        return;
+    }
     let r = match c.kind {
         Kind::Fill => fill(c),
         Kind::Copy => copy(c),
@@ -175,33 +245,28 @@ fn fill(c: &Check) -> Result<String, String> {
 fn copy(c: &Check) -> Result<String, String> {
     let src = Vsharp::decode(&c.user[0..4]);
     let dst = Vsharp::decode(&c.user[4..8]);
-    let cb = Vsharp::decode(&c.user[8..12]);
-    let count = rd(cb.base).ok_or("unverifiable: constant buffer unmapped")? as u64;
-    let modn = rd(cb.base + 4).ok_or("unverifiable: constant buffer unmapped")? as u64;
-    if modn == 0 {
-        return Err("unverifiable: modulus 0".into());
-    }
+    let Some((count, modn, want)) = &c.expected else {
+        return Err("unverifiable: source still written by GPU work when the copy was recorded".into());
+    };
+    let (count, modn) = (*count, *modn);
     if dword_components(src.format) != Some(1) || src.format != dst.format || src.stride == 0 || dst.stride == 0 || src.dst_sel & 7 != 4 || dst.dst_sel & 7 != 4 {
         return Err(format!("unverifiable: formats {}/{} strides {}/{}", src.format, dst.format, src.stride, dst.stride));
     }
     let n = count.min(c.threads).min(dst.num_records as u64);
     let mut bad = 0u64;
-    let idx = samples(n);
-    for &i in &idx {
-        let s = i % modn;
-        let want = if s < src.num_records as u64 { rd(src.base + s * src.stride as u64).ok_or("unverifiable: source unmapped")? } else { 0 };
+    for &(i, want) in want {
         let got = rd(dst.base + i * dst.stride as u64).ok_or("unverifiable: destination unmapped")?;
         if got != want {
             if bad == 0 {
-                crate::warn!("verify: copy element {i} is {got:#x}, expected {want:#x} (source element {s})");
+                crate::warn!("verify: copy element {i} is {got:#x}, expected {want:#x} (source element {} when recorded)", i % modn);
             }
             bad += 1;
         }
     }
     if bad > 0 {
-        return Err(format!("{bad} of {} sampled elements differ (count {count}, modulus {modn})", idx.len()));
+        return Err(format!("{bad} of {} sampled elements differ (count {count}, modulus {modn})", want.len()));
     }
-    Ok(format!("{} of {n} elements checked, dst[i] == src[i % {modn}] (count {count}, format {})", idx.len(), src.format))
+    Ok(format!("{} of {n} elements checked, dst[i] == src[i % {modn}] as recorded (count {count}, format {})", want.len(), src.format))
 }
 
 pub fn status() -> String {

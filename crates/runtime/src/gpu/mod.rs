@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 9] = [
+    static ALL: [Tunable; 10] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -36,6 +36,7 @@ pub mod tune {
         Tunable { name: "snap_index", env: "DS_SNAP_INDEX", default: 4 << 20, value: AtomicU64::new(UNSET) },
         Tunable { name: "ring_lo", env: "DS_RING_LO", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ring_hi", env: "DS_RING_HI", default: u64::MAX >> 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "shadow_keep", env: "DS_SHADOW_KEEP", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -91,6 +92,12 @@ pub mod tune {
     /// recorded (0: off).
     pub fn snap_index() -> u64 {
         get(6)
+    }
+
+    /// VRAM shadows stay resident for the rest of their batch (merged back
+    /// once) instead of being merged after each dispatch.
+    pub fn shadow_keep() -> bool {
+        get(9) != 0
     }
 
     /// Sets a switch by name; false if unknown.

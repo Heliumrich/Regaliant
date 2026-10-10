@@ -576,8 +576,21 @@ struct Bound {
 /// the decoder's own CPU state; copying the whole range back reverted the
 /// title's slot index and command-buffer cursor (decodes appended to stale
 /// command buffers until one overflowed) and its data pointers.
+///
+/// A shadow stays resident for the rest of its batch: later dispatches that
+/// shadow the same window use its working copy (no copy in), read-only
+/// bindings inside it read the working copy, and it is merged back once,
+/// before anything else uses the guest range in place and when the batch is
+/// submitted (`Exec::flush_resident`). The title's culling pass binds one
+/// 300 KB counter buffer (atomics) in ~170 dispatches per frame; each copied
+/// it in and merged it back.
+#[derive(Clone, Copy)]
 struct Shadow {
     host: vk::Buffer,
+    /// Guest address of the bound window (`host_off`).
+    guest: u64,
+    /// Bound through a resident shadow of the same window (no copy in).
+    reused: bool,
     /// Bound range within `host` (aligned start) and its offset in the shadow ring.
     host_off: u64,
     range: u64,
@@ -595,6 +608,12 @@ const SHADOW_BYTES: u64 = 32 << 20;
 const SHADOW_MAX: u64 = 4 << 20;
 
 static SHADOWED: AtomicU64 = AtomicU64::new(0);
+/// Resident shadows: bindings that reused one, read-only bindings served
+/// from one, merges, and merges forced before an in-place use.
+static SHADOWS_REUSED: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_READS: AtomicU64 = AtomicU64::new(0);
+static MERGES: AtomicU64 = AtomicU64::new(0);
+static EARLY_MERGES: AtomicU64 = AtomicU64::new(0);
 /// Shadow candidates bound in host memory because the slot's shadow ring was full.
 static SHADOW_FULL: AtomicU64 = AtomicU64::new(0);
 /// Read-only buffer snapshots (`Exec::snapshot`): taken, reused within a
@@ -1093,6 +1112,9 @@ pub struct Exec {
     /// Device-local shadow ring (SHADOW_BYTES per slot) and its use in the recording slot.
     shadow: vk::Buffer,
     shadow_used: u64,
+    /// Shadows of this batch whose working copies hold newer data than
+    /// guest memory (see Shadow).
+    resident: Vec<Shadow>,
 }
 
 unsafe impl Send for Exec {}
@@ -1154,6 +1176,7 @@ impl Exec {
                 pool_use: [0; 5],
                 shadow,
                 shadow_used: 0,
+                resident: Vec::new(),
             })
         }
     }
@@ -1203,6 +1226,7 @@ impl Exec {
         self.recording = true;
         self.pool_use = [0; 5];
         self.shadow_used = 0;
+        self.resident.clear();
     }
 
     /// Submits the recorded batch without waiting for it (its actions run
@@ -1210,6 +1234,9 @@ impl Exec {
     pub fn submit(&mut self) {
         if !self.recording {
             return;
+        }
+        if let Err(e) = self.flush_resident(None) {
+            self.report(format!("shadow write-back: {e}"));
         }
         if self.submit_after > done_seq() {
             // Deferred CP writes that this work may read come first.
@@ -1231,7 +1258,12 @@ impl Exec {
         let actions = std::mem::take(&mut self.actions);
         let has_actions = !actions.is_empty();
         let name = self.name.clone();
-        let seq = push_batch(fence, self.slots[i].queries, actions, std::mem::take(&mut self.checks), std::mem::take(&mut self.batch_shaders), &self.name, || {
+        let mut checks = std::mem::take(&mut self.checks);
+        for ch in checks.iter_mut() {
+            let (a, n) = verify::dest_range(ch);
+            ch.overwritten = self.pending_writes.get(ch.writes_mark..).unwrap_or(&[]).iter().any(|&(w, m)| w < a + n && a < w + m);
+        }
+        let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, || {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return;
             }
@@ -1505,6 +1537,79 @@ impl Exec {
         reads.iter().any(|r| self.pending_writes.iter().any(|w| ov(r, w)) || self.inflight.iter().any(|(_, w)| ov(r, w)))
     }
 
+    /// A read-only binding of guest [base, base+size) inside a resident shadow
+    /// reads its working copy: (buffer, offset of `base`, bytes from `base`
+    /// to the copy's end). A binding that overlaps one only partly gets it
+    /// merged back first and None.
+    fn resident_read(&mut self, base: u64, size: u64) -> Result<Option<(vk::Buffer, u64, u64)>, String> {
+        if let Some(r) = self.resident.iter().find(|r| r.guest <= base && base + size <= r.guest + r.range).copied() {
+            RESIDENT_READS.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some((self.shadow, r.shadow_off + (base - r.guest), r.guest + r.range - base)));
+        }
+        if self.resident.iter().any(|r| r.guest < base + size && base < r.guest + r.range) {
+            EARLY_MERGES.fetch_add(1, Ordering::Relaxed);
+            self.flush_resident(Some(&[(base, size)]))?;
+        }
+        Ok(None)
+    }
+
+    /// Writes the resident shadows overlapping `only` (all: None) back to
+    /// guest memory: the dwords their dispatches changed within the
+    /// resources' own bytes (see Shadow), between barriers.
+    pub(super) fn flush_resident(&mut self, only: Option<&[(u64, u64)]>) -> Result<(), String> {
+        let hit = |r: &Shadow| only.is_none_or(|rs| rs.iter().any(|&(a, n)| a < r.guest + r.range && r.guest < a + n));
+        if !self.resident.iter().any(hit) {
+            return Ok(());
+        }
+        let (flush, keep): (Vec<Shadow>, Vec<Shadow>) = std::mem::take(&mut self.resident).into_iter().partition(hit);
+        self.resident = keep;
+        self.end_rendering();
+        let c = ctx();
+        super::vk::checkpoint(self.cmd(), super::vk::mark::SHADOW_OUT, 0);
+        // The dispatches' writes to the working copies come first.
+        global_barrier(self.cmd());
+        let merge = if shadow_merge() { Some(merge_pipe()?) } else { None };
+        for sh in &flush {
+            let own = sh.size.min(sh.range - sh.bias);
+            match merge {
+                Some(m) => {
+                    let set = self.alloc_set(m.set_layout)?;
+                    let infos = [
+                        vk::DescriptorBufferInfo { buffer: self.shadow, offset: sh.shadow_off, range: sh.range },
+                        vk::DescriptorBufferInfo { buffer: self.shadow, offset: sh.pristine_off, range: sh.range },
+                        vk::DescriptorBufferInfo { buffer: sh.host, offset: sh.host_off, range: sh.range },
+                    ];
+                    let writes: Vec<vk::WriteDescriptorSet> = infos
+                        .iter()
+                        .enumerate()
+                        .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
+                        .collect();
+                    let first = (sh.bias / 4) as u32;
+                    let end = ((sh.bias + own).div_ceil(4)).min(sh.range / 4) as u32;
+                    let pc: Vec<u8> = [first, end].iter().flat_map(|x| x.to_le_bytes()).collect();
+                    unsafe {
+                        let cmd = self.cmd();
+                        c.device.update_descriptor_sets(&writes, &[]);
+                        c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, m.pipeline);
+                        c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, m.layout, 0, &[set], &[]);
+                        c.device.cmd_push_constants(cmd, m.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
+                        c.device.cmd_dispatch(cmd, end.saturating_sub(first).div_ceil(rdna::kernels::MERGE_LOCAL_SIZE).max(1), 1, 1);
+                    }
+                }
+                None => unsafe {
+                    let r = vk::BufferCopy { src_offset: sh.shadow_off + sh.bias, dst_offset: sh.host_off + sh.bias, size: own };
+                    c.device.cmd_copy_buffer(self.cmd(), self.shadow, sh.host, &[r]);
+                },
+            }
+        }
+        // Later work reads guest memory after the write-back.
+        global_barrier(self.cmd());
+        self.barrier_wanted = false;
+        self.dispatched = false;
+        MERGES.fetch_add(flush.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// A copy of guest [base, base+size) in video memory, taken now (when the
     /// command processor reaches the work that reads it): (buffer, offset of
     /// the copy's 16-byte aligned start, bias of `base` in it). Bound instead
@@ -1640,10 +1745,12 @@ impl Exec {
                         let mut bias = 0u64;
                         let mut bound_size = 0u64;
                         let read_only = size > 0 && !p.tr.plan.resources[i].written && matches!(p.resources[i], Resolved::Buffer(_));
+                        // Inside a resident shadow: its working copy is newer.
+                        let resident = if read_only { self.resident_read(base, size)? } else { None };
                         // Small read-only buffers: a snapshot in video memory.
-                        let snap = if read_only { self.snapshot(base, size, super::tune::snap_max()) } else { None };
+                        let snap = if read_only && resident.is_none() { self.snapshot(base, size, super::tune::snap_max()) } else { None };
                         // Read-only bindings of buffers GPU work wrote: VRAM mirrors.
-                        let mirrored = if read_only && snap.is_none() { super::mirror::lookup(base, size) } else { None };
+                        let mirrored = if read_only && snap.is_none() { resident.or_else(|| super::mirror::lookup(base, size)) } else { None };
                         let mut span = if size > 0 && mirrored.is_none() && snap.is_none() { sh.span(base, size) } else { None };
                         if span.is_none() && size > 0 && mirrored.is_none() && snap.is_none() {
                             // A descriptor reaching past the end of its mappings
@@ -1698,10 +1805,26 @@ impl Exec {
                                     let span = range.next_multiple_of(256);
                                     let res = &p.tr.plan.resources[i];
                                     let want = allow_shadow && shadow_writes() && res.written && range <= SHADOW_MAX && (res.atomic || range >= shadow_min());
-                                    if want && s_off + 2 * span > seg {
+                                    let window = (base - bias, range);
+                                    let reuse = if want { self.resident.iter().position(|r| r.host == buffer && r.host_off == off && r.range == range) } else { None };
+                                    if reuse.is_none() && self.resident.iter().any(|r| r.guest < window.0 + window.1 && window.0 < r.guest + r.range) {
+                                        // Guest memory gets the resident shadows' data first.
+                                        EARLY_MERGES.fetch_add(1, Ordering::Relaxed);
+                                        self.flush_resident(Some(&[window]))?;
+                                    }
+                                    if want && reuse.is_none() && s_off + 2 * span > seg {
                                         SHADOW_FULL.fetch_add(1, Ordering::Relaxed);
                                     }
-                                    if want && s_off + 2 * span <= seg {
+                                    if let Some(k) = reuse {
+                                        // Its write-back covers this resource's bytes too.
+                                        let r = &mut self.resident[k];
+                                        let (lo, hi) = (r.bias.min(bias), (r.bias + r.size).max(bias + size));
+                                        (r.bias, r.size) = (lo, hi - lo);
+                                        let r = *r;
+                                        bound.shadows.push(Shadow { reused: true, ..r });
+                                        info = vk::DescriptorBufferInfo { buffer: self.shadow, offset: r.shadow_off, range };
+                                        SHADOWS_REUSED.fetch_add(1, Ordering::Relaxed);
+                                    } else if want && s_off + 2 * span <= seg {
                                         // DS_TRACE_SHADOW=1: each shadowed range once per shader.
                                         static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                                         if *TRACE.get_or_init(|| std::env::var("DS_TRACE_SHADOW").ok().as_deref() == Some("1")) {
@@ -1712,7 +1835,7 @@ impl Exec {
                                             }
                                         }
                                         self.shadow_used = s_off + 2 * span;
-                                        bound.shadows.push(Shadow { host: buffer, host_off: off, range, shadow_off: shadow_base + s_off, pristine_off: shadow_base + s_off + span, bias, size });
+                                        bound.shadows.push(Shadow { host: buffer, guest: base - bias, reused: false, host_off: off, range, shadow_off: shadow_base + s_off, pristine_off: shadow_base + s_off + span, bias, size });
                                         info = vk::DescriptorBufferInfo { buffer: self.shadow, offset: shadow_base + s_off, range };
                                         SHADOWED.fetch_add(1, Ordering::Relaxed);
                                     }
@@ -1898,14 +2021,6 @@ impl Exec {
         self.bind_sgpr(&p, &mut bound)?;
         let t_bind = t0.elapsed();
         let set = self.alloc_set(set_layout)?;
-        // Shadow write-back kernel and its descriptor sets (see Shadow).
-        let merge = if !bound.shadows.is_empty() && shadow_merge() { Some(merge_pipe()?) } else { None };
-        let mut merge_sets = Vec::new();
-        if let Some(m) = merge {
-            for _ in &bound.shadows {
-                merge_sets.push(self.alloc_set(m.set_layout)?);
-            }
-        }
         let writes_here = std::mem::take(&mut bound.writes);
         let sized_here = std::mem::take(&mut bound.sized_writes);
         super::images::with(|im| {
@@ -1929,7 +2044,8 @@ impl Exec {
             self.dispatched = false;
         }
         stamp(0);
-        if !bound.shadows.is_empty() {
+        let fresh: Vec<Shadow> = bound.shadows.iter().filter(|s| !s.reused).copied().collect();
+        if !fresh.is_empty() {
             super::vk::checkpoint(self.cmd(), super::vk::mark::SHADOW_IN, p.addr);
             // Shadows get the guest data first (earlier writes are ordered by
             // the title's synchronization, or the barrier after every
@@ -1939,18 +2055,18 @@ impl Exec {
                     // One read of guest memory (the pristine copy), then the
                     // working copy from it: two reads could see different CPU
                     // writes, and the merge would store the older value.
-                    for sh in &bound.shadows {
+                    for sh in &fresh {
                         let r = vk::BufferCopy { src_offset: sh.host_off, dst_offset: sh.pristine_off, size: sh.range };
                         c.device.cmd_copy_buffer(self.cmd(), sh.host, self.shadow, &[r]);
                     }
                     let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
                     c.device.cmd_pipeline_barrier(self.cmd(), vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
-                    for sh in &bound.shadows {
+                    for sh in &fresh {
                         let r = vk::BufferCopy { src_offset: sh.pristine_off, dst_offset: sh.shadow_off, size: sh.range };
                         c.device.cmd_copy_buffer(self.cmd(), self.shadow, self.shadow, &[r]);
                     }
                 } else {
-                    for sh in &bound.shadows {
+                    for sh in &fresh {
                         let r = vk::BufferCopy { src_offset: sh.host_off, dst_offset: sh.shadow_off, size: sh.range };
                         c.device.cmd_copy_buffer(self.cmd(), sh.host, self.shadow, &[r]);
                     }
@@ -1976,46 +2092,17 @@ impl Exec {
         if !lazy_barriers() || !bound.shadows.is_empty() {
             global_barrier(self.cmd());
         }
-        if !bound.shadows.is_empty() {
-            super::vk::checkpoint(self.cmd(), super::vk::mark::SHADOW_OUT, p.addr);
-            // Results back to guest memory: the dwords the dispatch changed
-            // within the resource's own bytes (see Shadow).
-            for (k, sh) in bound.shadows.iter().enumerate() {
-                let own = sh.size.min(sh.range - sh.bias);
-                match merge {
-                    Some(m) => {
-                        let set = merge_sets[k];
-                        let infos = [
-                            vk::DescriptorBufferInfo { buffer: self.shadow, offset: sh.shadow_off, range: sh.range },
-                            vk::DescriptorBufferInfo { buffer: self.shadow, offset: sh.pristine_off, range: sh.range },
-                            vk::DescriptorBufferInfo { buffer: sh.host, offset: sh.host_off, range: sh.range },
-                        ];
-                        let writes: Vec<vk::WriteDescriptorSet> = infos
-                            .iter()
-                            .enumerate()
-                            .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
-                            .collect();
-                        let first = (sh.bias / 4) as u32;
-                        let end = ((sh.bias + own).div_ceil(4)).min(sh.range / 4) as u32;
-                        let pc: Vec<u8> = [first, end].iter().flat_map(|x| x.to_le_bytes()).collect();
-                        unsafe {
-                            let cmd = self.cmd();
-                            c.device.update_descriptor_sets(&writes, &[]);
-                            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, m.pipeline);
-                            c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, m.layout, 0, &[set], &[]);
-                            c.device.cmd_push_constants(cmd, m.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
-                            c.device.cmd_dispatch(cmd, end.saturating_sub(first).div_ceil(rdna::kernels::MERGE_LOCAL_SIZE).max(1), 1, 1);
-                        }
-                    }
-                    None => unsafe {
-                        let r = vk::BufferCopy { src_offset: sh.shadow_off + sh.bias, dst_offset: sh.host_off + sh.bias, size: own };
-                        c.device.cmd_copy_buffer(self.cmd(), self.shadow, sh.host, &[r]);
-                    },
-                }
+        // Written shadows stay resident for the rest of the batch (see Shadow);
+        // a reused one merged back while this dispatch's bindings were made
+        // joins again. Overlapping windows (aliased bindings) are merged now.
+        for sh in &bound.shadows {
+            if !self.resident.iter().any(|r| r.shadow_off == sh.shadow_off) {
+                self.resident.push(Shadow { reused: false, ..*sh });
             }
-            if !lazy_barriers() {
-                global_barrier(self.cmd());
-            }
+        }
+        let aliased = self.resident.iter().enumerate().any(|(i, a)| self.resident[..i].iter().any(|b| a.guest < b.guest + b.range && b.guest < a.guest + a.range));
+        if aliased || !super::tune::shadow_keep() {
+            self.flush_resident(None)?;
         }
         if lazy_barriers() {
             self.dispatched = true;
@@ -2066,7 +2153,13 @@ impl Exec {
                 (t_bind - t_pipe).as_millis()
             );
         }
-        if let Some(ch) = verify::check_for(&p, groups, local) {
+        if let Some(mut ch) = verify::check_for(&p, groups, local) {
+            // Expected values as recorded, when no GPU work still writes them.
+            let src = verify::source_ranges(&ch);
+            if !src.is_empty() && !self.overlaps_pending(&src) && INFLIGHT.latest(&src).is_none() && CP_WRITES.latest(&src).is_none() {
+                verify::snapshot_source(&mut ch);
+            }
+            ch.writes_mark = self.pending_writes.len();
             self.checks.push(ch);
         }
         Ok(())
@@ -2090,10 +2183,14 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} buffers shadowed in VRAM, {} not for lack of space), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         SHADOWED.load(Ordering::Relaxed),
         SHADOW_FULL.load(Ordering::Relaxed),
+        SHADOWS_REUSED.load(Ordering::Relaxed),
+        RESIDENT_READS.load(Ordering::Relaxed),
+        MERGES.load(Ordering::Relaxed),
+        EARLY_MERGES.load(Ordering::Relaxed),
         SKIPPED.load(Ordering::Relaxed),
         draw::DRAWN.load(Ordering::Relaxed),
         draw::DRAW_NOOP.load(Ordering::Relaxed),

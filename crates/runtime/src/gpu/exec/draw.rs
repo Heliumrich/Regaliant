@@ -615,6 +615,10 @@ impl Exec {
             stages.push(p);
         }
         self.reserve(&stages.iter().map(|p| &**p).collect::<Vec<_>>());
+        // Indices in guest memory that a resident shadow holds newer data for.
+        if let Some((addr, size)) = a.index {
+            self.flush_resident(Some(&[(addr, a.count as u64 * size as u64)]))?;
+        }
         let mut bounds = Vec::new();
         for p in stages.iter_mut() {
             let mut b = self.bind_stage(p, false)?;
