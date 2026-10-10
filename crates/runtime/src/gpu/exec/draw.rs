@@ -473,8 +473,7 @@ impl Exec {
         if let Some(p) = &ps {
             reads.extend_from_slice(&p.reads);
         }
-        if self.overlaps_pending(&reads) {
-            self.flush();
+        if self.sync_for_reads(&reads) {
             vs = shaders::prepare_ngg(cp)?;
             ps = if ps_addr != 0 { Some(shaders::prepare_ps(cp)?) } else { None };
         }
@@ -485,9 +484,7 @@ impl Exec {
         if let Some((addr, size)) = a.index {
             ranges.push((addr, a.count as u64 * size as u64));
         }
-        if self.overlaps_pending(&ranges) {
-            self.flush();
-        }
+        self.sync_for_reads(&ranges);
         // Color targets: enabled in CB_TARGET_MASK and CB_SHADER_MASK,
         // exported by the pixel shader with a non-zero export format.
         let mrt_mask = ps.as_ref().map(|p| p.tr.out.mrt_mask).unwrap_or(0);
@@ -728,6 +725,9 @@ impl Exec {
                         return Err(format!("index buffer {addr:#x}+{bytes:#x} is not mapped GPU memory (draw skipped)"));
                     };
                     let ty = if size == 4 { vk::IndexType::UINT32 } else { vk::IndexType::UINT16 };
+                    if let Some(s) = super::CP_WRITES.latest(&[(addr, bytes)]) {
+                        self.submit_after = self.submit_after.max(s);
+                    }
                     c.device.cmd_bind_index_buffer(cmd, buffer, addr - start, ty);
                     c.device.cmd_draw_indexed(cmd, a.count, a.instances, 0, base_vertex, a.first_instance);
                 }

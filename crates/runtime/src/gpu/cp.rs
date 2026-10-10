@@ -250,6 +250,46 @@ struct LabelEvent {
 
 static LABEL_LOG: parking_lot::Mutex<std::collections::VecDeque<LabelEvent>> = parking_lot::Mutex::new(std::collections::VecDeque::new());
 static WAITED: parking_lot::Mutex<Option<HashSet<u64>>> = parking_lot::Mutex::new(None);
+
+/// Label values deferred CP writes will store: address -> (batch sequence,
+/// value, bytes). A WAIT_REG_MEM that a promised value satisfies passes at
+/// once and orders its queue after that batch (`Exec::depend_on`): its later
+/// GPU work follows the batch on the device queue, its CP writes wait for
+/// it, its CP reads wait for unfinished writers (`Exec::sync_for_reads`), so
+/// the command processors record ahead of the GPU instead of idling until
+/// each batch completes. `DS_PROMISES=0` turns this off.
+static PROMISES: parking_lot::Mutex<Option<HashMap<u64, (u64, u64, u8)>>> = parking_lot::Mutex::new(None);
+/// Waits passed on a promise (diagnostics).
+pub static PROMISED: AtomicU64 = AtomicU64::new(0);
+
+fn promises_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_PROMISES").ok().as_deref() != Some("0"))
+}
+
+fn promise(seq: u64, addr: u64, value: u64, bytes: u8) {
+    if !promises_on() {
+        return;
+    }
+    let mut g = PROMISES.lock();
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() > 1 << 14 {
+        let done = super::exec::completed_seq();
+        m.retain(|_, p| p.0 > done);
+    }
+    m.insert(addr, (seq, value, bytes));
+}
+
+/// The batch whose promised write to `addr` satisfies the comparison.
+fn promised(addr: u64, wide: bool, func: u32, mask: u64, reference: u64) -> Option<u64> {
+    let g = PROMISES.lock();
+    let &(seq, value, bytes) = g.as_ref()?.get(&addr)?;
+    if seq <= super::exec::completed_seq() || (wide && bytes < 8) {
+        return None;
+    }
+    let v = if wide { value } else { value & 0xFFFF_FFFF };
+    compare(func, v & mask, reference & mask).then_some(seq)
+}
 const LABEL_LOG_CAP: usize = 1 << 15;
 
 fn label_event(queue: &str, kind: u8, addr: u64, value: u64, reference: u64, packet: u64) {
@@ -278,6 +318,7 @@ fn label_history(addr: u64, max: usize) -> String {
             b'I' => format!("wait ref {:#x}: satisfied at once (value {:#x})", e.reference, e.value),
             b'S' => format!("wait ref {:#x}: blocks (value {:#x})", e.reference, e.value),
             b'L' => format!("wait ref {:#x}: satisfied by a CP write it latched (value now {:#x})", e.reference, e.value),
+            b'P' => format!("wait ref {:#x}: passed on a promised write (value now {:#x})", e.reference, e.value),
             _ => format!("wait ref {:#x}: satisfied (value {:#x})", e.reference, e.value),
         };
         out.push_str(&format!("\n    {:>10.3} ms {} {what} (packet {:#x})", e.us as f64 / 1000.0, e.queue, e.packet));
@@ -381,18 +422,20 @@ impl Cp {
     /// always follow the GPU work; other CP writes follow it only after a
     /// partial flush or acquire (otherwise the CP does not wait for shaders),
     /// and later GPU work then waits for them (it may read what they write).
-    fn effect(&mut self, end_of_pipe: bool, write: Option<(u64, u64)>, f: Box<dyn FnOnce() + Send>) {
+    /// Returns the batch sequence a deferred effect runs after.
+    fn effect(&mut self, end_of_pipe: bool, write: Option<(u64, u64)>, f: Box<dyn FnOnce() + Send>) -> Option<u64> {
         let needs_prior = end_of_pipe || self.fence_pending;
         match self.exec.as_mut() {
             Some(e) if e.busy() && (needs_prior || e.deferred_pending()) => {
                 self.fence_pending = false;
-                e.after_gpu(f, write, !end_of_pipe);
+                e.after_gpu(f, write, !end_of_pipe)
             }
             _ => {
                 if needs_prior {
                     self.fence_pending = false;
                 }
-                f()
+                f();
+                None
             }
         }
     }
@@ -994,6 +1037,9 @@ impl Cp {
             op::COND_EXEC => {
                 self.sync();
                 let a = addr64(p(0), p(1));
+                // Another queue's unfinished batch may write it (queues run
+                // ahead on promises).
+                self.sync_reads(&[(a, 4)]);
                 let skip = p(3) & 0x3FFF;
                 if valid(a, 4) && unsafe { rd32(a) } == 0 {
                     return Flow::Skip(skip);
@@ -1063,7 +1109,12 @@ impl Cp {
                 let vals: Vec<u32> = (0..count).map(|i| p(3 + i)).collect();
                 let (name, at) = (self.name.clone(), self.cur_packet);
                 let len = if no_incr { 4 } else { 4 * count };
-                self.effect(
+                let label = match (count, no_incr) {
+                    (1, _) => Some((vals[0] as u64, 4u8)),
+                    (2, false) => Some((vals[0] as u64 | (vals[1] as u64) << 32, 8u8)),
+                    _ => None,
+                };
+                let seq = self.effect(
                     false,
                     Some((a, len)),
                     Box::new(move || {
@@ -1076,6 +1127,9 @@ impl Cp {
                         }
                     }),
                 );
+                if let (Some(s), Some((v, bytes))) = (seq, label) {
+                    promise(s, a, v, bytes);
+                }
             }
             0 => {
                 for i in 0..count {
@@ -1136,7 +1190,7 @@ impl Cp {
                     return;
                 }
                 let (name, at) = (self.name.clone(), self.cur_packet);
-                self.effect(
+                let seq = self.effect(
                     false,
                     Some((dst_a, if wide { 8 } else { 4 })),
                     Box::new(move || {
@@ -1145,6 +1199,9 @@ impl Cp {
                         note_write(&name, dst_a, value, at);
                     }),
                 );
+                if let (Some(s), true) = (seq, matches!(src, 1 | 2)) {
+                    super::exec::note_cp_source(s, (src_v, if wide { 8 } else { 4 }));
+                }
             }
             0 => {
                 // A register needs the value now: memory sources must be current.
@@ -1215,7 +1272,7 @@ impl Cp {
                     crate::error!("gpu[{}]: DMA_DATA from {src:#x}+{bytes:#x} outside guest memory", self.name);
                     return;
                 }
-                self.effect(
+                let seq = self.effect(
                     false,
                     range,
                     Box::new(move || {
@@ -1231,6 +1288,9 @@ impl Cp {
                         note_block(&name, dst, if daic { 4 } else { bytes }, at);
                     }),
                 );
+                if let Some(s) = seq {
+                    super::exec::note_cp_source(s, (src, if saic { 4 } else { bytes }));
+                }
             }
             _ => {
                 // Register or GDS source: register values / counters.
@@ -1259,7 +1319,7 @@ impl Cp {
             return;
         }
         let (name, at) = (self.name.clone(), self.cur_packet);
-        self.effect(
+        let seq = self.effect(
             true,
             write.then_some((a, 8)),
             Box::new(move || {
@@ -1277,6 +1337,13 @@ impl Cp {
                 }
             }),
         );
+        if let Some(s) = seq {
+            match data_sel {
+                1 => promise(s, a, data & 0xFFFF_FFFF, 4),
+                2 => promise(s, a, data, 8),
+                _ => {}
+            }
+        }
     }
 
     /// Polls `addr` until the comparison holds (WAIT_REG_MEM).
@@ -1301,6 +1368,14 @@ impl Cp {
             label_event(&self.name, b'I', a, v0, reference, at);
             return Flow::Next;
         }
+        if let Some(seq) = promised(a, wide, func, mask, reference) {
+            if let Some(e) = self.exec.as_mut() {
+                e.depend_on(seq);
+                PROMISED.fetch_add(1, Ordering::Relaxed);
+                label_event(&self.name, b'P', a, v0, reference, at);
+                return Flow::Next;
+            }
+        }
         label_event(&self.name, b'S', a, v0, reference, at);
         let what = format!("WAIT_REG_MEM at {at:#x}: [{a:#x}] & {mask:#x} func {func} ref {reference:#x}");
         self.waiting_on = a;
@@ -1313,7 +1388,10 @@ impl Cp {
         let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         ACTIVE_WAITS.lock().push(ActiveWait { addr: a, wide, func, mask, reference, hit: hit.clone() });
         let t0 = Instant::now();
-        let r = self.poll_until(at, &what, || hit.load(Ordering::SeqCst) || compare(func, read() & mask, reference & mask));
+        let use_promise = self.exec.is_some();
+        let r = self.poll_until(at, &what, || {
+            hit.load(Ordering::SeqCst) || compare(func, read() & mask, reference & mask) || (use_promise && promised(a, wide, func, mask, reference).is_some())
+        });
         {
             let by = last_write(a).map(|w| w.0).unwrap_or_else(|| "cpu".into());
             let mut g = WAIT_STATS.lock();
@@ -1325,11 +1403,21 @@ impl Cp {
         if let Some(f) = self.wait_flag {
             f.store(false, Ordering::SeqCst);
         }
-        let latched = hit.load(Ordering::SeqCst) && !compare(func, read() & mask, reference & mask);
+        let in_memory = compare(func, read() & mask, reference & mask);
+        let latched = hit.load(Ordering::SeqCst) && !in_memory;
         if latched {
             LATCHED.fetch_add(1, Ordering::Relaxed);
         }
-        label_event(&self.name, if latched { b'L' } else { b'E' }, a, read(), reference, at);
+        // Passed on a promise (its batch may have completed meanwhile).
+        let mut kind = if latched { b'L' } else { b'E' };
+        if !in_memory && !latched {
+            if let (Some(seq), Some(e)) = (promised(a, wide, func, mask, reference), self.exec.as_mut()) {
+                e.depend_on(seq);
+                PROMISED.fetch_add(1, Ordering::Relaxed);
+                kind = b'P';
+            }
+        }
+        label_event(&self.name, kind, a, read(), reference, at);
         match r {
             Flow::Stop => Flow::Stop,
             _ => Flow::Next,
@@ -1446,6 +1534,7 @@ impl Cp {
                 self.sync();
                 let ctl = a(0);
                 let cmp = addr64(a(1), a(2));
+                self.sync_reads(&[(cmp, 8)]);
                 let mask = addr64(a(3), a(4));
                 let reference = addr64(a(5), a(6));
                 let pass = valid(cmp, 8) && compare((ctl >> 8) & 7, unsafe { rd64(cmp) } & mask, reference & mask);

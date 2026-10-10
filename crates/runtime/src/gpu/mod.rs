@@ -445,14 +445,16 @@ pub fn status_ex(with_stacks: bool) -> String {
         }
     }
     s.push_str(&format!(
-        "    gpu totals: {} submits, {} packets, {} draws, {} dispatches, {} EOP interrupts, {} flips, {} label waits latched\n",
+        "    gpu totals: {} submits, {} packets, {} draws, {} dispatches, {} EOP interrupts, {} flips, {} label waits latched, {} passed on promises, {} CP reads waited for another queue\n",
         SUBMITS.load(Ordering::Relaxed),
         cp::PACKETS.load(Ordering::Relaxed),
         cp::DRAWS.load(Ordering::Relaxed),
         cp::DISPATCHES.load(Ordering::Relaxed),
         cp::EOP_INTERRUPTS.load(Ordering::Relaxed),
         FRAMES.load(Ordering::Relaxed),
-        cp::LATCHED.load(Ordering::Relaxed)
+        cp::LATCHED.load(Ordering::Relaxed),
+        cp::PROMISED.load(Ordering::Relaxed),
+        exec::FOREIGN_WAITS.load(Ordering::Relaxed)
     ));
     s.push_str(&format!("    {}
 ", throttle_status()));

@@ -674,6 +674,88 @@ fn done_seq() -> u64 {
     *DONE.lock()
 }
 
+/// Highest completed batch sequence (all earlier ones completed too).
+pub fn completed_seq() -> u64 {
+    done_seq()
+}
+
+/// Guest ranges written by unfinished batches (sequence, start, end),
+/// bucketed by 1 MiB.
+struct RangeLog(Mutex<Option<HashMap<u64, Vec<(u64, u64, u64)>>>>);
+
+const RANGE_BUCKET: u32 = 20;
+
+impl RangeLog {
+    const fn new() -> RangeLog {
+        RangeLog(Mutex::new(None))
+    }
+
+    fn note(&self, seq: u64, (a, n): (u64, u64)) {
+        if n == 0 {
+            return;
+        }
+        let done = done_seq();
+        let mut g = self.0.lock();
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.len() > 4096 {
+            m.retain(|_, v| {
+                v.retain(|e| e.0 > done);
+                !v.is_empty()
+            });
+        }
+        let end = a.saturating_add(n);
+        for b in (a >> RANGE_BUCKET)..=((end - 1) >> RANGE_BUCKET) {
+            let v = m.entry(b).or_default();
+            v.retain(|e| e.0 > done);
+            v.push((seq, a, end));
+        }
+    }
+
+    /// The latest unfinished batch that writes into `reads`.
+    fn latest(&self, reads: &[(u64, u64)]) -> Option<u64> {
+        let done = done_seq();
+        let mut g = self.0.lock();
+        let m = g.as_mut()?;
+        let mut best: Option<u64> = None;
+        for &(r, n) in reads {
+            if n == 0 {
+                continue;
+            }
+            let end = r.saturating_add(n);
+            for b in (r >> RANGE_BUCKET)..=((end - 1) >> RANGE_BUCKET) {
+                if let Some(v) = m.get_mut(&b) {
+                    v.retain(|e| e.0 > done);
+                    for &(s, wa, we) in v.iter() {
+                        if wa < end && r < we {
+                            best = best.max(Some(s));
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
+}
+
+/// What submitted, unfinished batches of every queue write (shader buffer
+/// writes and deferred CP writes): a queue that passed a label wait on a
+/// promise (`Cp::wait`) runs ahead of the batch writing the label and must
+/// not read on the CPU what such batches write.
+static INFLIGHT: RangeLog = RangeLog::new();
+/// Deferred CP writes that later GPU work may read (performed by the
+/// completion thread once their batch finished): a batch binding such a
+/// range is submitted only after that.
+static CP_WRITES: RangeLog = RangeLog::new();
+/// CP reads that waited for another queue's batch (diagnostics).
+pub static FOREIGN_WAITS: AtomicU64 = AtomicU64::new(0);
+
+/// A deferred CP copy (performed with its batch's actions) reads `src`:
+/// later GPU work binding it (it may overwrite it) is submitted after the
+/// copy ran.
+pub fn note_cp_source(seq: u64, src: (u64, u64)) {
+    CP_WRITES.note(seq, src);
+}
+
 /// Blocks until batch `seq` and all earlier ones completed (with their actions).
 pub fn wait_done(seq: u64) {
     let mut d = DONE.lock();
@@ -1094,6 +1176,7 @@ impl Exec {
         });
         self.slots[i].seq = seq;
         for w in std::mem::take(&mut self.pending_writes) {
+            INFLIGHT.note(seq, w);
             self.inflight.push((seq, w));
         }
         self.last_seq = seq;
@@ -1242,11 +1325,7 @@ impl Exec {
     /// writes into `reads` (memory the CP reads now: indirect arguments,
     /// draw counts); returns whether it waited.
     pub fn flush_if_writes(&mut self, reads: &[(u64, u64)]) -> bool {
-        if !self.overlaps_pending(reads) {
-            return false;
-        }
-        self.flush();
-        true
+        self.sync_for_reads(reads)
     }
 
     /// Whether GPU work is recorded or not yet completed.
@@ -1262,31 +1341,66 @@ impl Exec {
 
     /// Performs `f` after this queue's GPU work recorded so far and its
     /// earlier deferred effects, or now when nothing is outstanding. `write`
-    /// is the guest range it writes; `ordered` makes later GPU work wait for
-    /// it (CP writes that following dispatches may read).
-    pub fn after_gpu(&mut self, f: Action, write: Option<(u64, u64)>, ordered: bool) {
+    /// is the guest range it writes; `ordered`: later GPU work binding that
+    /// range is submitted after it (CP writes that following dispatches may
+    /// read; `CP_WRITES`). Returns the batch
+    /// sequence it runs after (None: performed now).
+    pub fn after_gpu(&mut self, f: Action, write: Option<(u64, u64)>, ordered: bool) -> Option<u64> {
         if self.recording {
             self.actions.push(f);
             self.submit();
             if let Some(w) = write {
+                INFLIGHT.note(self.last_seq, w);
+                if ordered {
+                    CP_WRITES.note(self.last_seq, w);
+                }
                 self.inflight.push((self.last_seq, w));
             }
-            if ordered {
-                self.submit_after = self.last_seq;
-            }
+            Some(self.last_seq)
         } else if self.last_seq > done_seq() {
             let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, || {});
             self.last_seq = seq;
             self.last_action_seq = seq;
             if let Some(w) = write {
+                INFLIGHT.note(seq, w);
+                if ordered {
+                    CP_WRITES.note(seq, w);
+                }
                 self.inflight.push((seq, w));
             }
-            if ordered {
-                self.submit_after = seq;
-            }
+            Some(seq)
         } else {
             f();
+            None
         }
+    }
+
+    /// Orders everything this queue does from now on after batch `seq` (a
+    /// label wait passed on a value that batch will write): later batches
+    /// follow it on the device queue, CP writes are deferred behind it.
+    pub fn depend_on(&mut self, seq: u64) {
+        self.last_seq = self.last_seq.max(seq);
+        self.last_action_seq = self.last_action_seq.max(seq);
+    }
+
+    /// Before the CP reads guest memory (shader inputs, uploads, indirect
+    /// arguments): completes this queue's work writing into `reads` and
+    /// waits for any queue's unfinished batch that does. Returns whether
+    /// it waited (memory may have changed).
+    pub fn sync_for_reads(&mut self, reads: &[(u64, u64)]) -> bool {
+        let mut waited = false;
+        if self.overlaps_pending(reads) {
+            self.flush();
+            waited = true;
+        }
+        if let Some(s) = INFLIGHT.latest(reads) {
+            if s > done_seq() {
+                FOREIGN_WAITS.fetch_add(1, Ordering::Relaxed);
+                wait_done(s);
+                waited = true;
+            }
+        }
+        waited
     }
 
     /// Whether this queue's outstanding GPU work or deferred CP effects will
@@ -1408,6 +1522,11 @@ impl Exec {
                                     let range = (bias + size).next_multiple_of(4).min(end - start - off);
                                     info = vk::DescriptorBufferInfo { buffer, offset: off, range };
                                     bound_size = size;
+                                    // A pending CP write into this buffer is
+                                    // performed before the batch is submitted.
+                                    if let Some(s) = CP_WRITES.latest(&[(base, size)]) {
+                                        self.submit_after = self.submit_after.max(s);
+                                    }
                                     if p.tr.plan.resources[i].written {
                                         trace_writes(&format!("{:?} shader {:#x}", p.stage, p.addr), base, size);
                                         bound.writes.push((base, size));
@@ -1569,14 +1688,11 @@ impl Exec {
         let t0 = std::time::Instant::now();
         let wave64 = initiator & (1 << 15) == 0;
         let mut p = shaders::prepare_compute(cp, wave64)?;
-        if self.overlaps_pending(&p.reads) {
-            self.flush();
+        if self.sync_for_reads(&p.reads) {
             p = shaders::prepare_compute(cp, wave64)?;
         }
         // Textures are uploaded from guest memory: earlier GPU writes first.
-        if self.overlaps_pending(&texture_ranges(&p)) {
-            self.flush();
-        }
+        self.sync_for_reads(&texture_ranges(&p));
         let local = [cp.reg(Space::Sh, 0x207) & 0xFFFF, cp.reg(Space::Sh, 0x208) & 0xFFFF, cp.reg(Space::Sh, 0x209) & 0xFFFF];
         if initiator & (1 << 5) != 0 {
             // USE_THREAD_DIMENSIONS: sizes are in threads.
