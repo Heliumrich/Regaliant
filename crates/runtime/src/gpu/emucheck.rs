@@ -5,27 +5,64 @@
 //! their workgroups (default 32, spread over the grid) is interpreted on the
 //! CPU from the same inputs; after the GPU dispatch, the texels and bytes the
 //! interpreter wrote are compared with what the GPU wrote. The result goes
-//! to the log. Diagnostic only (slow).
+//! to the log. Diagnostic only (slow). The `emucheck` control command sets
+//! the list at run time (shaders that load at different addresses per run).
 
 use super::cp::{Cp, Space};
 use super::desc::Tsharp;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 
+#[derive(Clone)]
 struct Cfg {
     addrs: Vec<u64>,
     groups: u32,
 }
 
-fn cfg() -> Option<&'static Cfg> {
-    static C: std::sync::OnceLock<Option<Cfg>> = std::sync::OnceLock::new();
-    C.get_or_init(|| {
-        let v = std::env::var("DS_EMU_CHECK").ok()?;
-        let mut it = v.split(':');
-        let addrs = it.next()?.split(',').filter_map(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()).collect();
-        let groups = it.next().and_then(|x| x.parse().ok()).unwrap_or(32);
-        Some(Cfg { addrs, groups })
-    })
-    .as_ref()
+/// `<shader>[,<shader>...][:<groups>]`.
+fn parse(v: &str) -> Option<Cfg> {
+    let mut it = v.split(':');
+    let addrs: Vec<u64> = it.next()?.split(',').filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()).collect();
+    let groups = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(32);
+    (!addrs.is_empty()).then_some(Cfg { addrs, groups })
+}
+
+/// The active list: `DS_EMU_CHECK` until `arm` replaces it.
+static CFG: parking_lot::RwLock<Option<Cfg>> = parking_lot::RwLock::new(None);
+static CFG_INIT: std::sync::Once = std::sync::Once::new();
+/// Whether any list is active (fast path of `wanted`).
+static ARMED: AtomicBool = AtomicBool::new(false);
+
+fn cfg() -> Option<Cfg> {
+    CFG_INIT.call_once(|| {
+        if let Some(c) = std::env::var("DS_EMU_CHECK").ok().and_then(|v| parse(&v)) {
+            *CFG.write() = Some(c);
+            ARMED.store(true, Ordering::Relaxed);
+        }
+    });
+    if !ARMED.load(Ordering::Relaxed) {
+        return None;
+    }
+    CFG.read().clone()
+}
+
+/// `emucheck <shader>[,<shader>...][:<groups>]` / `emucheck off` (control
+/// command): replaces the list; the next 3 dispatches of each listed shader
+/// are checked.
+pub fn arm(v: &str) -> Result<(), String> {
+    cfg();
+    let c = if v.trim() == "off" { None } else { Some(parse(v).ok_or("usage: emucheck <hex shader>[,<hex shader>...][:<groups>] | off")?) };
+    if let Some(c) = &c {
+        let mut done = DONE.lock().unwrap();
+        let d = done.get_or_insert_with(HashMap::new);
+        for a in &c.addrs {
+            d.remove(a);
+        }
+        crate::info!("emu check: armed for {} shader(s), {} group(s) each", c.addrs.len(), c.groups);
+    }
+    ARMED.store(c.is_some(), Ordering::Relaxed);
+    *CFG.write() = c;
+    Ok(())
 }
 
 /// Checks done so far per shader (the first 3 dispatches are checked).
@@ -37,8 +74,9 @@ fn cs_addr(cp: &Cp) -> u64 {
 
 /// Whether this dispatch is to be checked.
 pub fn wanted(cp: &Cp) -> bool {
+    let Some(c) = cfg() else { return false };
     let a = cs_addr(cp);
-    cfg().is_some_and(|c| c.addrs.contains(&a)) && DONE.lock().unwrap().get_or_insert_with(HashMap::new).get(&a).copied().unwrap_or(0) < 3
+    c.addrs.contains(&a) && DONE.lock().unwrap().get_or_insert_with(HashMap::new).get(&a).copied().unwrap_or(0) < 3
 }
 
 /// A CPU copy of an image (mip 0, layer 0) in its Vulkan format.
@@ -301,6 +339,38 @@ pub fn compare(p: Pending) {
         if bad == 0 {
             crate::info!("{msg}");
         } else {
+            // Both versions of the written ranges, for offline comparison
+            // (e.g. appended records in another order): segments of
+            // [u64 address, u64 length, bytes], interpreter then GPU.
+            if let Some(dir) = crate::run_dir() {
+                static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let k = SEQ.fetch_add(1, Ordering::Relaxed);
+                let (mut cpu, mut gpu) = (Vec::new(), Vec::new());
+                let mut it = p.env.writes.iter().peekable();
+                while let Some((&a0, _)) = it.peek().map(|(a, b)| (*a, *b)) {
+                    let mut seg = Vec::new();
+                    let mut a = a0;
+                    while let Some((&x, &b)) = it.peek().map(|(x, b)| (*x, *b)) {
+                        if x != a {
+                            break;
+                        }
+                        seg.push(b);
+                        a += 1;
+                        it.next();
+                    }
+                    if !super::cp::guest_readable(a0, seg.len() as u64) {
+                        continue;
+                    }
+                    let g = unsafe { std::slice::from_raw_parts(a0 as *const u8, seg.len()) };
+                    for (out, bytes) in [(&mut cpu, &seg[..]), (&mut gpu, g)] {
+                        out.extend_from_slice(&a0.to_le_bytes());
+                        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                        out.extend_from_slice(bytes);
+                    }
+                }
+                let _ = std::fs::write(dir.join(format!("emucheck_{addr:x}_{k}_cpu.bin")), &cpu);
+                let _ = std::fs::write(dir.join(format!("emucheck_{addr:x}_{k}_gpu.bin")), &gpu);
+            }
             crate::warn!("{msg}; resources:
       {}", p.resources.join("
       "));

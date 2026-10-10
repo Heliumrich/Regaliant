@@ -973,9 +973,12 @@ impl<'a, E: Env> Group<'a, E> {
             }
         } else if name.starts_with("s_buffer_load_dword") {
             let v = vsharp(&self.waves[w].s[sb..sb + 4]);
+            // Bytes the descriptor covers (records x stride when strided;
+            // OOB_SELECT 2 checks nothing), as the runtime binds it.
+            let limit = if v.oob == 2 { u64::MAX } else if v.stride == 0 { v.num_records as u64 } else { v.num_records as u64 * v.stride as u64 };
             for k in 0..n {
                 let o = (off as u64 & !3) + 4 * k as u64;
-                let x = if o + 4 <= v.num_records as u64 {
+                let x = if o + 4 <= limit {
                     let mut b = [0u8; 4];
                     self.env.read(v.base + o, &mut b);
                     u32::from_le_bytes(b)
@@ -1361,7 +1364,8 @@ impl<'a, E: Env> Group<'a, E> {
             let us = |k: usize| self.vsrc(w, ins, &v, k, l);
             let fs = |k: usize| self.fsrc(w, ins, &v, k, l);
             let r: u32 = match name {
-                "v_mov_b32" => us(0)?,
+                // Source modifiers act on the sign bit (as translated).
+                "v_mov_b32" => self.bsrc(w, ins, &v, 0, l)?,
                 "v_cndmask_b32" => {
                     let m = if v.vop3 { self.waves[w].s64(v.src[2] as usize) } else { self.waves[w].s64(VCC) };
                     let a = self.bsrc(w, ins, &v, 0, l)?;

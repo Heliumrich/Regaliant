@@ -181,6 +181,7 @@ fn prune_runs(runs: &Path, keep: usize) {
 ///   loglevel trace|debug|info  change logging at run time (trace = every HLE call)
 ///   textreset                log text-hook strings again (`DS_TEXT_HOOK`)
 ///   mem <addr> <len>         write guest memory (hex) to mem-<addr>.bin in the run directory
+///   emucheck <cs,..>[:<n>]   interpreter check of the next dispatches of those shaders (`off`)
 ///   quit                     orderly shutdown
 fn poll_control(path: &Path, offset: &mut u64) {
     use std::io::{Read, Seek, SeekFrom};
@@ -260,6 +261,11 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 };
                 gpu::exec::set_equal_bias(v);
                 Ok(())
+            }
+            "emucheck" => {
+                // Diagnosis: `emucheck <hex shader>[,...][:<groups>]` / `emucheck off`.
+                let rest = line.trim_start().strip_prefix("emucheck").unwrap_or("").trim();
+                gpu::emucheck::arm(rest)
             }
             "probe" => {
                 // Diagnosis: `probe <shader>:<pc>:<v<k>|s<k>>[u|i][:<frames>]` / `probe off`.
