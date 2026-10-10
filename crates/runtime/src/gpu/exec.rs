@@ -931,7 +931,10 @@ struct Slot {
     queries: vk::QueryPool,
 }
 
-const MAX_TIMED: u32 = 1024;
+const MAX_TIMED: u32 = 4096;
+/// Timed draws are keyed by their pixel shader (vertex shader without one)
+/// with this bit set.
+const DRAW_KEY: u64 = 1 << 63;
 
 fn profiling() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1002,19 +1005,25 @@ pub fn shader_profile() -> String {
     let Some(m) = g.as_ref() else { return String::new() };
     let mut v: Vec<(&u64, &[u64; 4])> = m.iter().collect();
     v.sort_by(|a, b| (b.1[1] + b.1[2] + b.1[3]).cmp(&(a.1[1] + a.1[2] + a.1[3])));
-    let tot = |k: usize| m.values().map(|x| x[k]).sum::<u64>() / 1_000_000;
+    let tot = |k: usize, draws: bool| m.iter().filter(|(a, _)| (**a & DRAW_KEY != 0) == draws).map(|(_, x)| x[k]).sum::<u64>() / 1_000_000;
     let mut s = format!(
-        "    gpu time: batches {} ms; dispatches {} ms, shadow copies in {} ms / out {} ms, between timed dispatches {} ms\n",
+        "    gpu time: batches {} ms; dispatches {} ms, draws {} ms, shadow copies in {} ms / out {} ms, between timed commands {} ms\n",
         BATCH_NS.load(Ordering::Relaxed) / 1_000_000,
-        tot(1),
-        tot(2),
-        tot(3),
+        tot(1, false),
+        tot(1, true),
+        tot(2, false),
+        tot(3, false),
         GAP_NS.load(Ordering::Relaxed) / 1_000_000
     );
     let top = std::env::var("DS_PROFILE_TOP").ok().and_then(|x| x.parse().ok()).unwrap_or(15);
     for (a, x) in v.iter().take(top) {
         let n = x[0].max(1);
-        s.push_str(&format!("      cs {a:#x}: {} dispatches, {} us each (+ copies {} / {} us)\n", x[0], x[1] / 1000 / n, x[2] / 1000 / n, x[3] / 1000 / n));
+        if **a & DRAW_KEY != 0 {
+            s.push_str(&format!("      draws with shader {:#x}: {} draws, {} us each
+", **a & !DRAW_KEY, x[0], x[1] / 1000 / n));
+        } else {
+            s.push_str(&format!("      cs {a:#x}: {} dispatches, {} us each (+ copies {} / {} us)\n", x[0], x[1] / 1000 / n, x[2] / 1000 / n, x[3] / 1000 / n));
+        }
     }
     s
 }

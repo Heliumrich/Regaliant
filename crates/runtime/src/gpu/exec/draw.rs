@@ -721,6 +721,15 @@ impl Exec {
             c.device.cmd_set_line_width(cmd, 1.0);
             c.device.cmd_set_blend_constants(cmd, &[f32r(reg(0x28414)), f32r(reg(0x28418)), f32r(reg(0x2841C)), f32r(reg(0x28420))]);
             let base_vertex = a.base_vertex.unwrap_or(reg(0x28408) as i32);
+            // DS_PROFILE_GPU: timestamps around the draw, keyed by its shader.
+            let qp = self.slots[self.cur].queries;
+            let ti = self.batch_shaders.len() as u32;
+            let timed = qp != vk::QueryPool::null() && ti < super::MAX_TIMED;
+            if timed {
+                for k in 0..2 {
+                    c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, super::STAMPS * ti + k);
+                }
+            }
             match a.index {
                 Some((addr, size)) => {
                     let bytes = a.count as u64 * size as u64;
@@ -736,6 +745,12 @@ impl Exec {
                     c.device.cmd_draw_indexed(cmd, a.count, a.instances, 0, base_vertex, a.first_instance);
                 }
                 None => c.device.cmd_draw(cmd, a.count, a.instances, base_vertex as u32, a.first_instance),
+            }
+            if timed {
+                for k in 2..4 {
+                    c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, super::STAMPS * ti + k);
+                }
+                self.batch_shaders.push(super::DRAW_KEY | if ps_addr != 0 { ps_addr } else { vs.addr });
             }
         }
         for b in bounds {
