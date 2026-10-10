@@ -136,6 +136,9 @@ pub struct Pending {
     steps: u64,
     addr: u64,
     dump: Option<(u32, [u32; 3], Dump, usize)>,
+    /// The dispatch's resources as the translation binds them (reported
+    /// with differences).
+    resources: Vec<String>,
 }
 
 /// Interprets a sample of the dispatch's workgroups (call before the GPU
@@ -165,6 +168,7 @@ pub fn prepare(cp: &Cp, groups: [u32; 3], initiator: u32) -> Option<Pending> {
             let _ = std::fs::write(sdir.join(format!("{addr:012x}.bin")), bytes);
         }
     }
+    let resources = super::shaders::prepare_compute(cp, initiator & (1 << 15) == 0).map(|p| super::shaders::describe_resources(&p)).unwrap_or_default();
     let sh = |i: u32| cp.reg(Space::Sh, i);
     let rsrc2 = sh(0x213);
     let local = [sh(0x207) & 0xFFFF, sh(0x208) & 0xFFFF, sh(0x209) & 0xFFFF];
@@ -223,7 +227,7 @@ pub fn prepare(cp: &Cp, groups: [u32; 3], initiator: u32) -> Option<Pending> {
         steps += grp.steps;
     }
     crate::info!("emu check: cs {addr:#x}: interpreted {n} of {total} groups ({steps} instructions, {} ms)", t0.elapsed().as_millis());
-    Some(Pending { env, groups: n as usize, errors, steps, addr, dump })
+    Some(Pending { env, groups: n as usize, errors, steps, addr, dump, resources })
 }
 
 /// Compares the interpreter's writes with the GPU's (after the dispatch completed).
@@ -297,7 +301,9 @@ pub fn compare(p: Pending) {
         if bad == 0 {
             crate::info!("{msg}");
         } else {
-            crate::warn!("{msg}");
+            crate::warn!("{msg}; resources:
+      {}", p.resources.join("
+      "));
         }
     }
     if let Some((pc, g, regs, lanes)) = &p.dump {
