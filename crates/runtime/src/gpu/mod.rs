@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 10] = [
+    static ALL: [Tunable; 11] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -37,6 +37,7 @@ pub mod tune {
         Tunable { name: "ring_lo", env: "DS_RING_LO", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ring_hi", env: "DS_RING_HI", default: u64::MAX >> 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_keep", env: "DS_SHADOW_KEEP", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "block_chain", env: "DS_BLOCK_CHAIN", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -98,6 +99,12 @@ pub mod tune {
     /// once) instead of being merged after each dispatch.
     pub fn shadow_keep() -> bool {
         get(9) != 0
+    }
+
+    /// Loop-free shaders are translated without the dispatcher loop (the
+    /// translator's block chain); switching translates shaders anew.
+    pub fn block_chain() -> bool {
+        get(10) != 0
     }
 
     /// Sets a switch by name; false if unknown.

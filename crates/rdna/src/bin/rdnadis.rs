@@ -150,6 +150,9 @@ fn translate_capture(capture: &str, out_dir: &str) -> i32 {
                     *warn_kinds.entry(k).or_default() += 1;
                 }
                 println!("{:#x} {:?}: {} words, {} binding(s), {} warning(s)", it.addr, it.stage, out.spirv.len(), out.bindings.len(), out.warnings.len());
+                for w in &out.warnings {
+                    println!("    {w}");
+                }
             }
             Err(e) => {
                 failed += 1;

@@ -14,7 +14,13 @@
 //! lanes exchange data through LDS without barriers. Invocations do not run
 //! in lockstep, so LDS accesses get workgroup barriers wherever another
 //! lane's earlier access could conflict (in blocks every invocation executes
-//! alike). Compute programs that use LDS run in *lockstep mode* when their
+//! alike).
+//!
+//! Programs without backward branches (most pixel, vertex and simple compute
+//! shaders) need no dispatcher: their blocks are emitted in address order,
+//! each run when the next address is its start (an invocation's path visits
+//! blocks in increasing order). Without the loop the driver sees a DAG and
+//! keeps the emulated registers in SSA form across blocks. Compute programs that use LDS run in *lockstep mode* when their
 //! workgroup is a single wave, or when no scalar value can differ between
 //! its waves (no v_readlane / v_readfirstlane, no wave id): lane-dependent
 //! branches are decided for the whole workgroup by a vote (as the hardware
@@ -166,6 +172,9 @@ pub struct Spec {
     /// (pc, [first vertex index, instance index, 0]): the invocations of that
     /// instance with vertex indices from the first one (1024 slots) do.
     pub dump: Option<(u32, [u32; 3])>,
+    /// Loop-free programs also use the loop-and-switch dispatcher instead
+    /// of the block chain (A/B comparisons).
+    pub force_dispatcher: bool,
 }
 
 /// Entries of an image table bound as one array of sampled images
@@ -1644,8 +1653,10 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
             translate_inst(&mut tr, ins)?;
         }
         ok(tr.b.ret())?;
-    } else {
+    } else if spec.force_dispatcher || code.iter().any(|i| i.branch_target().is_some_and(|t| t <= i.pc)) {
         emit_dispatch_loop(&mut tr, code, &starts)?;
+    } else {
+        emit_block_chain(&mut tr, code, &starts)?;
     }
     ok(tr.b.end_function())?;
 
@@ -1809,6 +1820,73 @@ fn sync_starts(tr: &T, code: &[Inst]) -> Vec<u32> {
     out
 }
 
+/// Translates block [start, end) and stores the address of the block to
+/// run next (PC_EXIT after s_endpgm) in `pc_var`.
+fn emit_block_body(tr: &mut T, code: &[Inst], start: u32, end: u32) -> R<()> {
+    // LDS accesses of other blocks are unknown here.
+    tr.lds_state = 3;
+    let mut next_pc = PC_EXIT;
+    let mut terminated = false;
+    let mut first = None;
+    for (k, ins) in code.iter().enumerate() {
+        if ins.pc < start || ins.pc >= end {
+            continue;
+        }
+        let first = *first.get_or_insert(k);
+        next_pc = code.get(k + 1).map(|n| n.pc).unwrap_or(PC_EXIT);
+        if ins.is_endpgm() {
+            let x = tr.u(PC_EXIT);
+            ok(tr.b.store(tr.pc_var, x, None, []))?;
+            terminated = true;
+            break;
+        }
+        if let Some(target) = ins.branch_target() {
+            let cond = branch_cond(tr, ins, &code[first..k])?;
+            let tv = tr.u(target);
+            let val = match cond {
+                None => tv,
+                Some(c) => {
+                    let fv = tr.u(next_pc);
+                    e(tr.b.select(tr.t.u32, None, c, tv, fv))?
+                }
+            };
+            ok(tr.b.store(tr.pc_var, val, None, []))?;
+            terminated = true;
+            break;
+        }
+        translate_inst(tr, ins)?;
+    }
+    if !terminated {
+        let x = tr.u(if end == u32::MAX { PC_EXIT } else { next_pc });
+        ok(tr.b.store(tr.pc_var, x, None, []))?;
+    }
+    Ok(())
+}
+
+/// Loop-free programs: the blocks in address order, each run when the next
+/// address is its start (see the module documentation).
+fn emit_block_chain(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>) -> R<()> {
+    let first = code[0].pc;
+    let s0 = tr.u(first);
+    ok(tr.b.store(tr.pc_var, s0, None, []))?;
+    let starts_vec: Vec<u32> = starts.iter().copied().collect();
+    for (bi, &start) in starts_vec.iter().enumerate() {
+        let end = starts_vec.get(bi + 1).copied().unwrap_or(u32::MAX);
+        let pc = e(tr.b.load(tr.t.u32, None, tr.pc_var, None, []))?;
+        let k = tr.u(start);
+        let here = e(tr.b.i_equal(tr.t.bool_, None, pc, k))?;
+        let (body, merge) = (tr.b.id(), tr.b.id());
+        ok(tr.b.selection_merge(merge, spirv::SelectionControl::NONE))?;
+        ok(tr.b.branch_conditional(here, body, merge, []))?;
+        e(tr.b.begin_block(Some(body)))?;
+        emit_block_body(tr, code, start, end)?;
+        ok(tr.b.branch(merge))?;
+        e(tr.b.begin_block(Some(merge)))?;
+    }
+    ok(tr.b.ret())?;
+    Ok(())
+}
+
 /// The dispatcher: a loop over a switch on the next block's address. With
 /// sync blocks it runs in rounds (an outer loop): an invocation reaching a
 /// sync block after other blocks of the round leaves the inner loop, whose
@@ -1872,44 +1950,8 @@ fn emit_dispatch_loop(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>) -> R<()
     let starts_vec: Vec<u32> = starts.iter().copied().collect();
     for (bi, &(start, id)) in block_ids.iter().enumerate() {
         e(tr.b.begin_block(Some(id)))?;
-        // LDS accesses of other blocks are unknown here.
-        tr.lds_state = 3;
         let end = starts_vec.get(bi + 1).copied().unwrap_or(u32::MAX);
-        let mut next_pc = PC_EXIT;
-        let mut terminated = false;
-        let mut first = None;
-        for (k, ins) in code.iter().enumerate() {
-            if ins.pc < start || ins.pc >= end {
-                continue;
-            }
-            let first = *first.get_or_insert(k);
-            next_pc = code.get(k + 1).map(|n| n.pc).unwrap_or(PC_EXIT);
-            if ins.is_endpgm() {
-                let x = tr.u(PC_EXIT);
-                ok(tr.b.store(tr.pc_var, x, None, []))?;
-                terminated = true;
-                break;
-            }
-            if let Some(target) = ins.branch_target() {
-                let cond = branch_cond(tr, ins, &code[first..k])?;
-                let tv = tr.u(target);
-                let val = match cond {
-                    None => tv,
-                    Some(c) => {
-                        let fv = tr.u(next_pc);
-                        e(tr.b.select(tr.t.u32, None, c, tv, fv))?
-                    }
-                };
-                ok(tr.b.store(tr.pc_var, val, None, []))?;
-                terminated = true;
-                break;
-            }
-            translate_inst(tr, ins)?;
-        }
-        if !terminated {
-            let x = tr.u(if end == u32::MAX { PC_EXIT } else { next_pc });
-            ok(tr.b.store(tr.pc_var, x, None, []))?;
-        }
+        emit_block_body(tr, code, start, end)?;
         ok(tr.b.branch(sw_merge))?;
     }
     e(tr.b.begin_block(Some(sw_merge)))?;
@@ -2099,6 +2141,7 @@ mod tests {
             binding_base: 0,
             probe: None,
             dump: None,
+            force_dispatcher: false,
         }
     }
 

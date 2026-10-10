@@ -209,6 +209,7 @@ pub fn prepare_compute(cp: &Cp, wave64: bool) -> Result<Prepared, String> {
         binding_base: 0,
         probe: probe_for(addr),
         dump: dump_for(addr),
+        force_dispatcher: !super::tune::block_chain(),
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
 }
@@ -271,6 +272,7 @@ pub fn prepare_ps(cp: &Cp) -> Result<Prepared, String> {
         binding_base: PS_BINDING_BASE,
         probe: probe_for(addr),
         dump: None,
+        force_dispatcher: !super::tune::block_chain(),
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
 }
@@ -387,6 +389,7 @@ pub fn prepare_ngg(cp: &Cp) -> Result<Prepared, String> {
         binding_base: 0,
         probe: None,
         dump: super::capture::vs_dump().and_then(|(first, inst)| pos_export(&insts).map(|i| (i.pc, [first, inst, 0]))),
+        force_dispatcher: !super::tune::block_chain(),
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
 }
