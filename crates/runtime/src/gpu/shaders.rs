@@ -84,11 +84,14 @@ pub struct Reader {
     pub reads: Vec<(u64, u64)>,
     /// The mapping of the last read (no memory-map lookup inside it).
     span: (u64, u64),
+    /// Pointers loaded from memory so far (each resource dword names its
+    /// pointer chain again).
+    ptrs: Vec<(Ptr, u64)>,
 }
 
 impl Reader {
     pub fn new() -> Reader {
-        Reader { reads: Vec::new(), span: (0, 0) }
+        Reader { reads: Vec::new(), span: (0, 0), ptrs: Vec::new() }
     }
 
     fn u32(&mut self, addr: u64) -> Option<u32> {
@@ -112,8 +115,13 @@ impl Reader {
         match p {
             Ptr::User(i) => Some((*user.get(*i as usize)? as u64) | ((*user.get(*i as usize + 1)? as u64) << 32)),
             Ptr::Mem(inner, off) => {
+                if let Some(&(_, v)) = self.ptrs.iter().find(|(q, _)| q == p) {
+                    return Some(v);
+                }
                 let base = self.ptr(inner, user)? + *off as u64;
-                Some((self.u32(base)? as u64) | ((self.u32(base + 4)? as u64) << 32))
+                let v = (self.u32(base)? as u64) | ((self.u32(base + 4)? as u64) << 32);
+                self.ptrs.push((p.clone(), v));
+                Some(v)
             }
             Ptr::Abs(a) => Some(*a),
         }
@@ -519,7 +527,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
             ResKind::ImageTable => {
                 // The table's V#: entries of 32 bytes (T#s) from its base.
                 let v = Vsharp::decode(&w);
-                let n = (v.byte_size().unwrap_or(0) / 32).min(rdna::translate::IMAGE_TABLE_LEN as u64);
+                let n = (v.extent() / 32).min(rdna::translate::IMAGE_TABLE_LEN as u64);
                 let mut entries = Vec::with_capacity(n as usize);
                 let mut first: Option<(ImageDim, u16)> = None;
                 for k in 0..n {
@@ -588,5 +596,11 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
         }
     }
     sgpr_data.resize(translate::sgpr_data_dwords(&tr.plan) as usize, 0);
+    // Resource info blocks are filled when binding; until then no index
+    // range check applies.
+    let ri = translate::res_info_offset(&tr.plan) as usize;
+    for k in 0..tr.plan.resources.len() {
+        sgpr_data[ri + translate::RES_INFO_DWORDS as usize * k + 3] = u32::MAX;
+    }
     Ok(Prepared { stage: spec.stage, addr, insts, tr, resources, res_addrs, sgpr_data, user: user.to_vec(), reads: rd.reads })
 }

@@ -748,12 +748,19 @@ fn buffer_addr(tr: &mut T, ins: &Inst, r: usize) -> R<Word> {
     let u = tr.t.u32;
     let mut addr = tr.u(ins.buf_offset());
     let mut vreg = ins.buf_vaddr() as u32;
+    let mut in_range = None;
     if ins.buf_idxen() {
         let idx = tr.vreg(vreg)?;
         vreg += 1;
         let st = tr.res_info(r, 1)?;
         let m = e(tr.b.i_mul(u, None, idx, st))?;
         addr = e(tr.b.i_add(u, None, addr, m))?;
+        // Structured buffers check the index before scaling it (an index at
+        // or beyond NUM_RECORDS reads 0): titles store flags in the high
+        // bits of indices, and the 32-bit product could wrap back into the
+        // bound range.
+        let limit = tr.res_info(r, 3)?;
+        in_range = Some(e(tr.b.u_less_than(tr.t.bool_, None, idx, limit))?);
     }
     if ins.buf_offen() {
         let off = tr.vreg(vreg)?;
@@ -762,7 +769,15 @@ fn buffer_addr(tr: &mut T, ins: &Inst, r: usize) -> R<Word> {
     let so = tr.operand(ins, ins.buf_soffset())?;
     addr = e(tr.b.i_add(u, None, addr, so))?;
     let bias = tr.res_info(r, 0)?;
-    e(tr.b.i_add(u, None, addr, bias))
+    let addr = e(tr.b.i_add(u, None, addr, bias))?;
+    match in_range {
+        // Beyond every bound range: robust access reads 0, drops writes.
+        Some(ok) => {
+            let out = tr.u(0xFFFF_FFF0);
+            e(tr.b.select(u, None, ok, addr, out))
+        }
+        None => Ok(addr),
+    }
 }
 
 pub fn buffer(tr: &mut T, ins: &Inst) -> R<()> {

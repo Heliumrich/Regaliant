@@ -447,23 +447,6 @@ fn slice_hash(base: u64, size: u64, slice: usize) -> u64 {
     h
 }
 
-/// Length of the mapped prefix of [base, base+size) (page granularity).
-fn readable_prefix(base: u64, size: u64) -> u64 {
-    if super::cp::guest_readable(base, size) {
-        return size;
-    }
-    let page = 4096u64;
-    let mut n = 0u64;
-    // Whole 64 KiB steps, then pages.
-    while n + (64 << 10) <= size && super::cp::guest_readable(base + n, 64 << 10) {
-        n += 64 << 10;
-    }
-    while n + page <= size && super::cp::guest_readable(base + n, page) {
-        n += page;
-    }
-    n
-}
-
 fn all_hashes(base: u64, size: u64) -> [u64; SLICES] {
     std::array::from_fn(|s| slice_hash(base, size, s))
 }
@@ -619,7 +602,8 @@ impl Images {
 
     /// Value statistics of every cached image at guest address `base` (mip
     /// 0, all layers or slices; float formats), with the largest magnitude
-    /// of the first channel per layer/slice (diagnosis: `imgstat`).
+    /// of the first channel per layer/slice; BC1 textures: each layer's mean
+    /// endpoint color and share of all-zero blocks (diagnosis: `imgstat`).
     pub fn stats_at(&mut self, base: u64) -> Vec<String> {
         let imgs: Vec<(vk::Image, ImageKey)> = self.map.values().filter(|i| i.key.base == base).map(|i| (i.image, i.key)).collect();
         let mut out = Vec::new();
@@ -627,12 +611,13 @@ impl Images {
             let bpp = texel_bytes(k.format) as u64;
             let half = matches!(k.format, vk::Format::R16G16B16A16_SFLOAT | vk::Format::R16G16_SFLOAT | vk::Format::R16_SFLOAT);
             let full = matches!(k.format, vk::Format::R32G32B32A32_SFLOAT | vk::Format::R32G32_SFLOAT | vk::Format::R32_SFLOAT);
-            if bpp == 0 || !(half || full) {
+            let bc1 = matches!(k.format, vk::Format::BC1_RGBA_SRGB_BLOCK | vk::Format::BC1_RGBA_UNORM_BLOCK);
+            if bpp == 0 || !(half || full || bc1) {
                 out.push(format!("{base:#x} {}x{}x{} {:?}: not a float format", k.width, k.height, k.layers, k.format));
                 continue;
             }
             let (layers, depth) = if k.ty3d { (1, k.layers) } else { (k.layers, 1) };
-            let slice = bpp * k.width as u64 * k.height as u64;
+            let slice = if bc1 { bpp * k.width.div_ceil(4) as u64 * k.height.div_ceil(4) as u64 } else { bpp * k.width as u64 * k.height as u64 };
             let size = slice * (layers * depth) as u64;
             let c = ctx();
             let Ok((buf, mem, ptr)) = c.host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST) else {
@@ -655,6 +640,30 @@ impl Images {
                 c.device.unmap_memory(mem);
                 c.device.free_memory(mem, None);
             }
+            if bc1 {
+                let rgb = |c: u16| [((c >> 11) & 31) as f32 / 31.0, ((c >> 5) & 63) as f32 / 63.0, (c & 31) as f32 / 31.0];
+                let per: Vec<String> = raw
+                    .chunks(slice as usize)
+                    .enumerate()
+                    .map(|(l, s)| {
+                        let (mut sum, mut zero, mut n) = ([0f64; 3], 0usize, 0usize);
+                        for b in s.chunks_exact(8) {
+                            n += 1;
+                            if b.iter().all(|&x| x == 0) {
+                                zero += 1;
+                            }
+                            let (c0, c1) = (rgb(u16::from_le_bytes([b[0], b[1]])), rgb(u16::from_le_bytes([b[2], b[3]])));
+                            for i in 0..3 {
+                                sum[i] += (c0[i] + c1[i]) as f64 / 2.0;
+                            }
+                        }
+                        let n = n.max(1) as f64;
+                        format!("{l}:{:.2}/{:.2}/{:.2}{}", sum[0] / n, sum[1] / n, sum[2] / n, if zero > 0 { format!(" z{:.0}%", 100.0 * zero as f64 / n) } else { String::new() })
+                    })
+                    .collect();
+                out.push(format!("{base:#x} {}x{}x{} {:?}: mean endpoint rgb per layer: {}", k.width, k.height, k.layers, k.format, per.join(" ")));
+                continue;
+            }
             let st = float_stats(k.format, &raw).unwrap_or_default();
             let maxima: Vec<String> = raw
                 .chunks(slice as usize)
@@ -669,6 +678,23 @@ impl Images {
             out.push(format!("{base:#x} {}x{}x{} {:?}: {st}; first-channel max per {}: {}", k.width, k.height, k.layers, k.format, if k.ty3d { "slice" } else { "layer" }, maxima.join(" ")));
         }
         out
+    }
+
+    /// Uploads the CPU-sourced textures at guest address `base` (all of
+    /// them without one) again at their next use (diagnosis: `reupload`);
+    /// returns how many.
+    pub fn force_reupload(&mut self, base: Option<u64>) -> usize {
+        let mut n = 0;
+        for img in self.map.values() {
+            if img.gpu_written || base.is_some_and(|b| b != img.key.base) {
+                continue;
+            }
+            if let Some(region) = img.source {
+                super::track::force_dirty(region);
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Zero-fills every cached image at guest address `base` (diagnosis:
@@ -739,30 +765,54 @@ impl Images {
             self.report(format!("texture with XOR swizzle mode {} uploaded with an assumed pipe count (2^{})", t.sw_mode, tiling::pipes_log2()));
         }
         let size = lay.size(layers);
-        // Streamed textures are partially resident: only the mip tail and
-        // the smaller mips (at the start of the chain) may be mapped. Mips
-        // outside the mapped prefix stay empty (the T#'s base level excludes
-        // them); later mappings or writes re-upload (write tracking).
-        let readable = readable_prefix(t.base, size);
-        if readable == 0 {
-            return Err(format!("texture {:#x}+{size:#x} not mapped", t.base));
-        }
-        let src = unsafe { std::slice::from_raw_parts(t.base as *const u8, readable as usize) };
+        // Streamed textures are partially resident: the title maps single
+        // layers of texture arrays (light cookies), and within a layer the
+        // mip tail and the smaller mips (at the start of the chain). Every
+        // mapped (mip, layer) is uploaded; on the first upload the others
+        // are zero-filled, never left as undefined image memory (which holds
+        // whatever the device memory held before). Later mappings or writes
+        // re-upload (write tracking).
         let elem = 1u64 << el;
-        let mip_end = |mip: usize, layer: u32| -> u64 {
+        let range = |mip: usize, layer: u32| -> (u64, u64) {
             let m = &lay.mips[mip];
             let start = layer as u64 * lay.slice_size + if m.tail.is_some() { 0 } else { m.offset };
-            start + if m.tail.is_some() { 1u64 << lay.block_log2 } else { m.pitch as u64 * m.padded_height as u64 * elem }
+            (start, if m.tail.is_some() { 1u64 << lay.block_log2 } else { m.pitch as u64 * m.padded_height as u64 * elem })
         };
+        let whole = super::cp::guest_readable(t.base, size);
+        let mapped = |mip: usize, layer: u32| -> bool {
+            let (s, n) = range(mip, layer);
+            whole || super::cp::guest_readable(t.base + s, n)
+        };
+        let mut end = 0u64;
+        for mip in 0..key.levels as usize {
+            for layer in 0..layers {
+                if mapped(mip, layer) {
+                    let (s, n) = range(mip, layer);
+                    end = end.max(s + n);
+                }
+            }
+        }
+        if end == 0 && !first {
+            return Err(format!("texture {:#x}+{size:#x} not mapped", t.base));
+        }
+        // Detiling reads only mapped regions (holes between them are not read).
+        let src = unsafe { std::slice::from_raw_parts(t.base as *const u8, end as usize) };
         let mut skipped = 0;
-        // Detile every (mip, layer) into one staging buffer.
+        // Detile every (mip, layer) into one staging buffer; unmapped ones
+        // of a first upload copy from one shared zero area at the end.
         let mut staging: Vec<u8> = Vec::new();
         let mut regions = Vec::new();
+        let mut zeroed: Vec<(usize, u32, usize)> = Vec::new();
         let mut tmp = Vec::new();
         for mip in 0..key.levels as usize {
             for layer in 0..layers {
-                if mip_end(mip, layer) > readable {
+                if !mapped(mip, layer) {
                     skipped += 1;
+                    if first {
+                        let m = &lay.mips[mip];
+                        let bytes = m.width as usize * m.height as usize * elem as usize;
+                        zeroed.push((mip, layer, bytes));
+                    }
                     continue;
                 }
                 lay.detile(src, mip, layer, &mut tmp);
@@ -780,11 +830,29 @@ impl Images {
                 );
             }
         }
-        if regions.is_empty() {
-            return Err(format!("texture {:#x}+{size:#x}: no mip mapped ({readable:#x} bytes mapped)", t.base));
+        if regions.is_empty() && zeroed.is_empty() {
+            return Err(format!("texture {:#x}+{size:#x}: no mip mapped", t.base));
+        }
+        if let Some(zero_len) = zeroed.iter().map(|z| z.2).max() {
+            let off = staging.len() as u64;
+            staging.resize(staging.len() + zero_len, 0);
+            for &(mip, layer, _) in &zeroed {
+                let m = &lay.mips[mip];
+                regions.push(
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(off)
+                        .buffer_row_length(if block { m.width * 4 } else { m.width })
+                        .buffer_image_height(if block { m.height * 4 } else { m.height })
+                        .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: mip as u32, base_array_layer: layer, layer_count: 1 })
+                        .image_extent(vk::Extent3D { width: m.texel_w, height: m.texel_h, depth: 1 }),
+                );
+            }
         }
         if skipped > 0 {
-            self.report(format!("partially resident texture: {skipped} (mip, layer) not mapped, left empty"));
+            self.report(format!(
+                "partially resident texture: {skipped} (mip, layer) not mapped, {}",
+                if first { "zero-filled" } else { "left as they were" }
+            ));
         }
         let c = ctx();
         let (buf, mem, ptr) = c.host_buffer(staging.len().max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
@@ -1304,6 +1372,7 @@ impl Images {
                 super::track::Why::GpuWrite(..) => "GPU write",
                 super::track::Why::Remap(..) => "mapping change",
                 super::track::Why::Unmapped => "unmapped",
+                super::track::Why::Forced => "requested",
                 super::track::Why::None => "?",
             });
             self.report(msg);

@@ -41,6 +41,8 @@ pub enum Why {
     GpuWrite(u64, u64),
     Remap(u64, u64),
     Unmapped,
+    /// Requested (diagnosis: `reupload`).
+    Forced,
 }
 
 #[derive(Default)]
@@ -185,6 +187,15 @@ pub fn take_dirty(id: u32) -> Option<Why> {
             Some(r.why)
         }
         _ => None,
+    }
+}
+
+/// Marks a region dirty (its texture is uploaded again at its next use).
+pub fn force_dirty(id: u32) {
+    let mut g = TRACK.lock();
+    if let Some(r) = g.as_mut().and_then(|t| t.regions.get_mut(id as usize)).and_then(|r| r.as_mut()) {
+        r.dirty = true;
+        r.why = Why::Forced;
     }
 }
 

@@ -372,6 +372,15 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     None => Err("usage: imgstat <hex address>".into()),
                 }
             }
+            "reupload" => {
+                // Diagnosis: `reupload [<hex address>]` uploads the textures
+                // sourced from guest memory (at that address) again at their
+                // next use.
+                let base = parts.next().and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok());
+                let n = gpu::images::with(|im| im.force_reupload(base));
+                info!("control: {n} texture(s) marked for upload");
+                Ok(())
+            }
             "clearimg" => {
                 // Diagnosis: `clearimg <hex address>` zero-fills the cached
                 // images at that guest address.

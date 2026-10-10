@@ -239,7 +239,8 @@ pub struct Output {
 /// Dwords of user data at the start of the SGPR data buffer.
 pub const SGPR_DATA_USER: u32 = 32;
 /// Dwords per resource info block: [byte bias of the resource base within
-/// the bound range, stride, num_records, 0].
+/// the bound range, stride, bound bytes, records an index may address
+/// (structured range check; u32::MAX: none)].
 pub const RES_INFO_DWORDS: u32 = 4;
 
 /// Offsets (in dwords) of each scalar load in the SGPR data buffer.

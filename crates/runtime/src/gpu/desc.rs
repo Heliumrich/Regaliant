@@ -16,7 +16,11 @@ pub struct Vsharp {
     pub dst_sel: u16,
     pub format: u8,
     pub add_tid: bool,
-    /// 0 structured with offset, 1 structured, 2 raw, 3 no bounds check.
+    /// Range check: 0 structured (index and offset), 1 structured (index),
+    /// 2 none, 3 raw (byte offset). Values from LLVM's MLIR AMDGPU lowering
+    /// (makeBufferRsrc: "0 = structured, 1 = check index, 2 = none, 3 =
+    /// either swizzles or testing against offset field"); the title's raw
+    /// buffers use 3.
     pub oob_select: u8,
     pub raw: [u32; 4],
 }
@@ -37,10 +41,21 @@ impl Vsharp {
 
     /// Bytes addressable through the descriptor (None: no bounds check).
     pub fn byte_size(&self) -> Option<u64> {
-        if self.oob_select == 3 {
+        if self.oob_select == 2 {
             return None;
         }
-        Some(if self.stride == 0 { self.num_records as u64 } else { self.num_records as u64 * self.stride as u64 })
+        Some(self.extent())
+    }
+
+    /// Bytes the descriptor describes (whatever its range check).
+    pub fn extent(&self) -> u64 {
+        if self.stride == 0 { self.num_records as u64 } else { self.num_records as u64 * self.stride as u64 }
+    }
+
+    /// Records an index may address (structured range checks: an index at
+    /// or beyond reads 0 and drops writes); u32::MAX when not checked.
+    pub fn index_limit(&self) -> u32 {
+        if self.oob_select <= 1 && self.stride != 0 { self.num_records } else { u32::MAX }
     }
 }
 

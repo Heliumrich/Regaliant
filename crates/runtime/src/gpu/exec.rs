@@ -1360,20 +1360,32 @@ impl Exec {
             for b in &p.tr.out.bindings {
                 match b.kind {
                     BindingKind::Buffer(i) => {
-                        let (base, size, stride) = match &p.resources[i] {
-                            Resolved::Buffer(v) => (v.base, v.byte_size(), v.stride),
-                            Resolved::Global(a) => (*a, None, 0),
+                        let (base, size, stride, limit) = match &p.resources[i] {
+                            Resolved::Buffer(v) => (v.base, v.byte_size(), v.stride, v.index_limit()),
+                            Resolved::Global(a) => (*a, None, 0, u32::MAX),
                             _ => return Err("binding/resource mismatch".into()),
                         };
-                        let size = match size {
+                        let mut size = match size {
                             Some(n) => n,
                             None => Shared::mapping(base).map(|(_, e)| (e - base).min(UNBOUNDED_MAX)).unwrap_or(0),
                         };
                         let mut info = vk::DescriptorBufferInfo { buffer: sh.dummy, offset: 0, range: DUMMY_BYTES };
                         let mut bias = 0u64;
                         let mut bound_size = 0u64;
+                        let mut span = if size > 0 { sh.span(base, size) } else { None };
+                        if span.is_none() && size > 0 {
+                            // A descriptor reaching past the end of its mappings
+                            // (generic sizes on ring allocations): the mapped part
+                            // is bound, the rest reads 0.
+                            if let Some((_, end, _)) = Shared::run(base, base & !(WINDOW - 1), (base + size).next_multiple_of(WINDOW)) {
+                                if end > base && end < base + size {
+                                    size = end - base;
+                                    span = sh.span(base, size);
+                                }
+                            }
+                        }
                         if size > 0 {
-                            match sh.span(base, size) {
+                            match span {
                                 Some((buffer, start, end)) => {
                                     let rel = base - start;
                                     let align = ctx().limits.min_storage_buffer_offset_alignment.max(4);
@@ -1424,6 +1436,7 @@ impl Exec {
                         p.sgpr_data[ri] = bias as u32;
                         p.sgpr_data[ri + 1] = stride;
                         p.sgpr_data[ri + 2] = bound_size.min(u32::MAX as u64) as u32;
+                        p.sgpr_data[ri + 3] = limit;
                         bound.bufs.push((b.binding, info));
                     }
                     BindingKind::Gds => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: sh.gds, offset: 0, range: rdna::translate::GDS_BYTES as u64 })),
