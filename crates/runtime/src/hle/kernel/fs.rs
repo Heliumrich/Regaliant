@@ -307,6 +307,14 @@ fn console_write(fd: i32, data: &[u8]) {
     let s = String::from_utf8_lossy(data);
     for line in s.trim_end_matches('\n').split('\n') {
         crate::info!("[guest fd{fd}] {line}");
+        // Developer automation (tools/tour.py) asks for a screenshot by
+        // printing `dsport-shot: <name>` (taken at the next flip).
+        if let Some(rest) = line.split("dsport-shot:").nth(1) {
+            let name: String = rest.trim().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
+            if !name.is_empty() {
+                *crate::hle::libs::videoout::SHOT_REQUEST.lock() = Some(name);
+            }
+        }
     }
 }
 

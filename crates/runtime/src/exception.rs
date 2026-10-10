@@ -919,6 +919,31 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
             };
             let addr = rec.ExceptionInformation[1] as u64;
             let _ = writeln!(r, "  {kind} of {:#x} ({})", addr, describe(addr));
+            // The page as the host sees it and as the guest mapped it.
+            {
+                use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+                let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                if VirtualQuery(addr as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) != 0 {
+                    let _ = writeln!(
+                        r,
+                        "  host page: region {:#x}+{:#x} state {:#x} protect {:#x}",
+                        mbi.BaseAddress as u64, mbi.RegionSize as u64, mbi.State, mbi.Protect
+                    );
+                }
+                match crate::mem::MEM.try_lock() {
+                    Some(m) => match m.find(addr) {
+                        Some(v) => {
+                            let _ = writeln!(r, "  guest mapping: {:#x}+{:#x} {:?} prot {:#x} phys {:#x} '{}'", v.start, v.size, v.kind, v.prot, v.phys, v.name);
+                        }
+                        None => {
+                            let _ = writeln!(r, "  guest mapping: none");
+                        }
+                    },
+                    None => {
+                        let _ = writeln!(r, "  guest mapping: (map lock held)");
+                    }
+                }
+            }
         }
         let _ = writeln!(
             r,

@@ -238,6 +238,23 @@ pub fn host_protect(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     if ok == 0 { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
 }
 
+/// `DS_TRACE_MAP=<hex lo>-<hex hi>`: logs every map, unmap and protection
+/// change that touches [lo, hi), with the calling thread's guest frames.
+fn trace_map(op: &str, start: u64, end: u64, detail: std::fmt::Arguments) {
+    static RANGE: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    let r = RANGE.get_or_init(|| {
+        let v = std::env::var("DS_TRACE_MAP").ok()?;
+        let (lo, hi) = v.split_once('-')?;
+        let h = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+        Some((h(lo)?, h(hi)?))
+    });
+    if let Some((lo, hi)) = *r {
+        if start < hi && lo < end {
+            crate::info!("mem trace: {op} {start:#x}..{end:#x} {detail} [{}]: {}", crate::log::thread_name(), crate::exception::current_guest_frames(8).join(" <- "));
+        }
+    }
+}
+
 impl MemState {
     /// Finds a free, aligned range of `size` bytes at or above `hint`.
     pub fn find_free(&self, hint: u64, size: u64, align: u64, limit: u64) -> Option<u64> {
@@ -292,6 +309,7 @@ impl MemState {
     /// Removes mappings in [start, end), decommitting host pages. Reserved ranges
     /// are left reserved only if `keep_reserved`.
     pub fn unmap_range(&mut self, start: u64, end: u64) {
+        trace_map("unmap", start, end, format_args!(""));
         MAP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.split_at(start);
         self.split_at(end);
@@ -388,6 +406,7 @@ impl MemState {
         }
         self.vmas.insert(addr, Vma { start: addr, size, kind, prot, phys, mtype, name: name.to_string() });
         MAP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        trace_map("map", addr, addr + size, format_args!("{kind:?} prot {prot:#x} phys {phys:#x} '{name}'"));
         Ok(addr)
     }
 
@@ -407,6 +426,7 @@ impl MemState {
     }
 
     pub fn protect(&mut self, start: u64, end: u64, prot: u32) -> Result<(), MemError> {
+        trace_map("protect", start, end, format_args!("prot {prot:#x}"));
         self.split_at(start);
         self.split_at(end);
         let keys: Vec<u64> = self.vmas.range(start..end).map(|(k, _)| *k).collect();
