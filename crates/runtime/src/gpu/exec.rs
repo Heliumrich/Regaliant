@@ -839,7 +839,7 @@ fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, ch
 fn completion_thread() {
     crate::log::set_thread_name("gpu-complete");
     loop {
-        let b = {
+        let mut b = {
             let mut q = BATCHES.lock();
             loop {
                 if let Some(b) = q.pop_front() {
@@ -872,7 +872,11 @@ fn completion_thread() {
             a();
         }
         ACTION_NS.fetch_add(ta.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        for ch in &b.checks {
+        for ch in b.checks.iter_mut() {
+            // A later batch (possibly already run) writes the destination again.
+            if INFLIGHT.latest(&[verify::dest_range(ch)]).is_some_and(|s| s > b.seq) {
+                ch.overwritten = true;
+            }
             verify::run(&b.name, ch);
         }
         *DONE.lock() = b.seq;

@@ -10,7 +10,9 @@
 //! it (`snapshot_source`), when no GPU work or deferred CP write still wrote
 //! it: read at completion, sources the title updates every frame (animation
 //! data) made the check fail spuriously. Others are unverifiable, and so
-//! are checks whose destination later work of the same batch writes again.
+//! are checks whose destination later work writes again (later in the
+//! batch, or a later batch: the title copies into one staging range from
+//! many sources).
 
 use super::desc::Vsharp;
 use super::shaders::Prepared;
@@ -205,7 +207,7 @@ fn outcome(name: &str, c: &Check, r: Result<String, String>) {
 /// Runs a check after the dispatch completed.
 pub fn run(name: &str, c: &Check) {
     if c.overwritten {
-        outcome(name, c, Err("unverifiable: destination written again later in the batch".into()));
+        outcome(name, c, Err("unverifiable: destination written again by later work".into()));
         return;
     }
     let r = match c.kind {
@@ -258,7 +260,12 @@ fn copy(c: &Check) -> Result<String, String> {
         let got = rd(dst.base + i * dst.stride as u64).ok_or("unverifiable: destination unmapped")?;
         if got != want {
             if bad == 0 {
-                crate::warn!("verify: copy element {i} is {got:#x}, expected {want:#x} (source element {} when recorded)", i % modn);
+                let s = i % modn;
+                let now = if s < src.num_records as u64 { rd(src.base + s * src.stride as u64) } else { Some(0) };
+                crate::warn!(
+                    "verify: copy element {i} is {got:#x}, expected {want:#x} (source element {s} when recorded, {now:#x?} now; source {:#x} stride {}, destination {:#x} stride {})",
+                    src.base, src.stride, dst.base, dst.stride
+                );
             }
             bad += 1;
         }
