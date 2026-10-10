@@ -26,11 +26,16 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 4] = [
+    static ALL: [Tunable; 9] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
         Tunable { name: "mirrors", env: "DS_MIRRORS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "ring_vram", env: "DS_RING_VRAM", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "snap_max", env: "DS_SNAP_MAX", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "snap_index", env: "DS_SNAP_INDEX", default: 4 << 20, value: AtomicU64::new(UNSET) },
+        Tunable { name: "ring_lo", env: "DS_RING_LO", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "ring_hi", env: "DS_RING_HI", default: u64::MAX >> 1, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -64,6 +69,30 @@ pub mod tune {
         get(3) != 0
     }
 
+    /// Which stages read their SGPR data from video memory instead of system
+    /// memory (diagnostic: it changes timing, not results): 0 none, 1 all,
+    /// 2 the graphics queue's, 3 the compute queues', 4 shaders at addresses
+    /// in [`ring_lo`, `ring_hi`).
+    pub fn ring_vram() -> u64 {
+        get(4)
+    }
+
+    pub fn ring_range() -> std::ops::Range<u64> {
+        get(7)..get(8)
+    }
+
+    /// Read-only buffer bindings up to this size are snapshotted into video
+    /// memory when recorded (0: off).
+    pub fn snap_max() -> u64 {
+        get(5)
+    }
+
+    /// Index buffers up to this size are snapshotted into video memory when
+    /// recorded (0: off).
+    pub fn snap_index() -> u64 {
+        get(6)
+    }
+
     /// Sets a switch by name; false if unknown.
     pub fn set(name: &str, v: u64) -> bool {
         match ALL.iter().find(|t| t.name == name) {
@@ -78,6 +107,7 @@ pub mod tune {
 
 pub mod exec;
 pub mod pcache;
+pub mod pstats;
 pub mod mirror;
 pub mod images;
 pub mod png;

@@ -373,14 +373,14 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 }
             }
             "tune" => {
-                // Measurements: `tune <promises|lazy|shadow_min> <value>`
+                // Measurements: `tune <switch> <value>` (`gpu::tune`)
                 // changes a GPU switch for the rest of the run.
                 match (parts.next(), parts.next().and_then(|v| v.parse::<u64>().ok())) {
                     (Some(name), Some(v)) if gpu::tune::set(name, v) => {
                         info!("control: tune {name} = {v} at flip {}", gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
                         Ok(())
                     }
-                    _ => Err("usage: tune <promises|lazy|shadow_min> <value>".into()),
+                    _ => Err("usage: tune <switch> <value> (see gpu::tune)".into()),
                 }
             }
             "tiny" => {

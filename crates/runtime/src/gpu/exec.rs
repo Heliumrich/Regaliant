@@ -346,6 +346,7 @@ impl Shared {
         }
         let t0 = std::time::Instant::now();
         let pipe = compute_pipeline(&p.tr.out)?;
+        super::pstats::report(pipe.pipeline, &format!("cs {:#x}", p.addr));
         let ms = t0.elapsed().as_millis();
         if ms >= 200 {
             crate::info!("gpu: compute pipeline for cs {:#x} ({} SPIR-V words) took {ms} ms", p.addr, p.tr.out.spirv.len());
@@ -377,7 +378,7 @@ fn compute_pipeline(out: &rdna::translate::Output) -> Result<Pipe, String> {
             let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None).map_err(|e| format!("pipeline layout: {e}"))?;
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&out.spirv), None).map_err(|e| format!("shader module: {e}"))?;
             let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
-            let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout).flags(vk::PipelineCreateFlags::DISPATCH_BASE);
+            let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout).flags(vk::PipelineCreateFlags::DISPATCH_BASE | super::pstats::flags());
             let pipeline = c.device.create_compute_pipelines(super::pcache::get(), &[ci], None).map_err(|(_, e)| format!("compute pipeline: {e}"));
             c.device.destroy_shader_module(module, None);
             super::pcache::created();
@@ -596,6 +597,17 @@ const SHADOW_MAX: u64 = 4 << 20;
 static SHADOWED: AtomicU64 = AtomicU64::new(0);
 /// Shadow candidates bound in host memory because the slot's shadow ring was full.
 static SHADOW_FULL: AtomicU64 = AtomicU64::new(0);
+/// Read-only buffer snapshots (`Exec::snapshot`): taken, reused within a
+/// batch, not taken for lack of space, bytes copied.
+static SNAPS: AtomicU64 = AtomicU64::new(0);
+static SNAPS_REUSED: AtomicU64 = AtomicU64::new(0);
+static SNAPS_FULL: AtomicU64 = AtomicU64::new(0);
+static SNAP_COPIED: AtomicU64 = AtomicU64::new(0);
+/// Index buffers drawn from snapshots (draws, bytes; reuses included).
+pub(super) static INDEX_SNAPS: AtomicU64 = AtomicU64::new(0);
+pub(super) static INDEX_SNAP_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Video memory for snapshots per queue (half per slot).
+const SNAP_BYTES: u64 = 32 << 20;
 
 /// `DS_GPU_SHADOW=0` binds written buffers in host memory directly (A/B
 /// comparisons of the shadow path).
@@ -1037,10 +1049,19 @@ pub struct Exec {
     pool: vk::CommandPool,
     slots: Vec<Slot>,
     cur: usize,
-    ring: vk::Buffer,
-    ring_ptr: *mut u8,
-    /// Offset within the current slot's ring segment.
-    ring_used: u64,
+    /// The SGPR data rings: system memory and video memory (allocated when
+    /// `tune ring_vram` first chooses it for a stage; failed: never).
+    rings: [Option<(vk::Buffer, *mut u8)>; 2],
+    vram_ring_failed: bool,
+    /// Offsets within the current slot's segment of each ring.
+    ring_used: [u64; 2],
+    /// Read-only buffer snapshots in video memory (allocated on first use;
+    /// a segment per slot), space used in the current segment, failure to
+    /// allocate, and the snapshots of the batch being recorded by range.
+    snap: Option<(vk::Buffer, *mut u8)>,
+    snap_used: u64,
+    snap_failed: bool,
+    snaps: HashMap<(u64, u64), u64>,
     ring_align: u64,
     recording: bool,
     /// Guest ranges written by the batch being recorded.
@@ -1100,15 +1121,21 @@ impl Exec {
                     },
                 });
             }
+            // SGPR data in system memory: a copy in video memory, read by
+            // every invocation, made no measurable difference (`tune ring_vram`).
             let (ring, _mem, ring_ptr) = c.host_buffer(RING_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER)?;
             let (shadow, _smem) = c.device_buffer(SHADOW_BYTES * SLOTS as u64, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)?;
             Ok(Exec {
                 pool,
                 slots,
                 cur: 0,
-                ring,
-                ring_ptr,
-                ring_used: 0,
+                rings: [Some((ring, ring_ptr)), None],
+                vram_ring_failed: false,
+                ring_used: [0; 2],
+                snap: None,
+                snap_used: 0,
+                snap_failed: false,
+                snaps: HashMap::new(),
                 ring_align: c.limits.min_storage_buffer_offset_alignment.max(16),
                 recording: false,
                 pending_writes: Vec::new(),
@@ -1225,7 +1252,9 @@ impl Exec {
         }
         self.recording = false;
         self.cur = (self.cur + 1) % SLOTS;
-        self.ring_used = 0;
+        self.ring_used = [0; 2];
+        self.snap_used = 0;
+        self.snaps.clear();
     }
 
     /// Performs the fast clears pending for `keys` before they are used: the
@@ -1476,14 +1505,64 @@ impl Exec {
         reads.iter().any(|r| self.pending_writes.iter().any(|w| ov(r, w)) || self.inflight.iter().any(|(_, w)| ov(r, w)))
     }
 
+    /// A copy of guest [base, base+size) in video memory, taken now (when the
+    /// command processor reaches the work that reads it): (buffer, offset of
+    /// the copy's 16-byte aligned start, bias of `base` in it). Bound instead
+    /// of the imported system memory, which every invocation would read across
+    /// PCIe. None: the range is larger than `limit` (0: off), GPU work not yet
+    /// complete (or a deferred CP write) writes it, or no space.
+    pub(super) fn snapshot(&mut self, base: u64, size: u64, limit: u64) -> Option<(vk::Buffer, u64, u64)> {
+        if size == 0 || size > limit || self.snap_failed {
+            return None;
+        }
+        let r = [(base, size)];
+        if CP_WRITES.latest(&r).is_some() || INFLIGHT.latest(&r).is_some() || self.overlaps_pending(&r) {
+            return None;
+        }
+        let al = base & !15;
+        let bias = base - al;
+        if let (Some(&at), Some((buf, _))) = (self.snaps.get(&(base, size)), self.snap) {
+            SNAPS_REUSED.fetch_add(1, Ordering::Relaxed);
+            return Some((buf, at, bias));
+        }
+        if self.snap.is_none() {
+            match ctx().bar_buffer(SNAP_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER) {
+                Ok((b, _m, p)) => self.snap = Some((b, p)),
+                Err(e) => {
+                    crate::warn!("gpu[{}]: no video memory for buffer snapshots ({e})", self.name);
+                    self.snap_failed = true;
+                    return None;
+                }
+            }
+        }
+        let (buf, ptr) = self.snap?;
+        let seg = SNAP_BYTES / SLOTS as u64;
+        let n = (bias + size).next_multiple_of(4);
+        let off = self.snap_used.next_multiple_of(self.ring_align);
+        if off + n > seg {
+            SNAPS_FULL.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if !super::cp::guest_readable(al, n) {
+            return None;
+        }
+        self.snap_used = off + n;
+        let at = seg * self.cur as u64 + off;
+        unsafe { std::ptr::copy_nonoverlapping(al as *const u8, ptr.add(at as usize), n as usize) };
+        SNAPS.fetch_add(1, Ordering::Relaxed);
+        SNAP_COPIED.fetch_add(n, Ordering::Relaxed);
+        self.snaps.insert((base, size), at);
+        Some((buf, at, bias))
+    }
+
     /// Allocates SGPR data space in the current slot's ring segment.
-    fn ring_alloc(&mut self, bytes: u64) -> Option<u64> {
+    fn ring_alloc(&mut self, which: usize, bytes: u64) -> Option<u64> {
         let seg = RING_BYTES / SLOTS as u64;
-        let off = self.ring_used.next_multiple_of(self.ring_align);
+        let off = self.ring_used[which].next_multiple_of(self.ring_align);
         if off + bytes > seg {
             return None;
         }
-        self.ring_used = off + bytes;
+        self.ring_used[which] = off + bytes;
         Some(seg * self.cur as u64 + off)
     }
 
@@ -1524,7 +1603,7 @@ impl Exec {
             }
         }
         let seg = RING_BYTES / SLOTS as u64;
-        let fits = self.ring_used.next_multiple_of(self.ring_align) + ring <= seg
+        let fits = self.ring_used.iter().all(|u| u.next_multiple_of(self.ring_align) + ring <= seg)
             && (0..5).all(|k| self.pool_use[k] + need[k] <= POOL_LIMITS[k])
             && (shadow == 0 || self.shadow_used + shadow <= SHADOW_BYTES);
         if !fits {
@@ -1560,10 +1639,13 @@ impl Exec {
                         let mut info = vk::DescriptorBufferInfo { buffer: sh.dummy, offset: 0, range: DUMMY_BYTES };
                         let mut bias = 0u64;
                         let mut bound_size = 0u64;
+                        let read_only = size > 0 && !p.tr.plan.resources[i].written && matches!(p.resources[i], Resolved::Buffer(_));
+                        // Small read-only buffers: a snapshot in video memory.
+                        let snap = if read_only { self.snapshot(base, size, super::tune::snap_max()) } else { None };
                         // Read-only bindings of buffers GPU work wrote: VRAM mirrors.
-                        let mirrored = if size > 0 && !p.tr.plan.resources[i].written && matches!(p.resources[i], Resolved::Buffer(_)) { super::mirror::lookup(base, size) } else { None };
-                        let mut span = if size > 0 && mirrored.is_none() { sh.span(base, size) } else { None };
-                        if span.is_none() && size > 0 && mirrored.is_none() {
+                        let mirrored = if read_only && snap.is_none() { super::mirror::lookup(base, size) } else { None };
+                        let mut span = if size > 0 && mirrored.is_none() && snap.is_none() { sh.span(base, size) } else { None };
+                        if span.is_none() && size > 0 && mirrored.is_none() && snap.is_none() {
                             // A descriptor reaching past the end of its mappings
                             // (generic sizes on ring allocations): the mapped part
                             // is bound, the rest reads 0.
@@ -1574,7 +1656,11 @@ impl Exec {
                                 }
                             }
                         }
-                        if let Some((mbuf, moff, avail)) = mirrored {
+                        if let Some((sbuf, soff, sbias)) = snap {
+                            bias = sbias;
+                            info = vk::DescriptorBufferInfo { buffer: sbuf, offset: soff, range: (sbias + size).next_multiple_of(4) };
+                            bound_size = size;
+                        } else if let Some((mbuf, moff, avail)) = mirrored {
                             let align = ctx().limits.min_storage_buffer_offset_alignment.max(4);
                             let off = moff & !(align - 1);
                             bias = moff - off;
@@ -1707,11 +1793,29 @@ impl Exec {
     /// Copies a stage's SGPR data into the ring (space reserved) and binds it.
     fn bind_sgpr(&mut self, p: &Prepared, bound: &mut Bound) -> Result<(), String> {
         let bytes: Vec<u8> = p.sgpr_data.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let off = self.ring_alloc(bytes.len() as u64).ok_or("SGPR data ring exhausted")?;
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ring_ptr.add(off as usize), bytes.len()) };
+        let vram = match super::tune::ring_vram() {
+            1 => true,
+            2 => self.name == "gfx",
+            3 => self.name != "gfx",
+            4 => super::tune::ring_range().contains(&p.addr),
+            _ => false,
+        };
+        if vram && self.rings[1].is_none() && !self.vram_ring_failed {
+            match ctx().bar_buffer(RING_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER) {
+                Ok((b, _m, p)) => self.rings[1] = Some((b, p)),
+                Err(e) => {
+                    crate::warn!("gpu[{}]: no SGPR data ring in video memory ({e})", self.name);
+                    self.vram_ring_failed = true;
+                }
+            }
+        }
+        let which = if vram && self.rings[1].is_some() { 1 } else { 0 };
+        let Some((ring, ring_ptr)) = self.rings[which] else { return Err("no SGPR data ring".into()) };
+        let off = self.ring_alloc(which, bytes.len() as u64).ok_or("SGPR data ring exhausted")?;
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ring_ptr.add(off as usize), bytes.len()) };
         for b in &p.tr.out.bindings {
             if b.kind == BindingKind::SgprData {
-                bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: self.ring, offset: off, range: bytes.len() as u64 }));
+                bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: ring, offset: off, range: bytes.len() as u64 }));
             }
         }
         Ok(())
@@ -2003,6 +2107,15 @@ pub fn status() -> String {
         + &super::track::status()
         + &crate::mem::remap_status()
         + &super::mirror::status()
+        + &format!(
+            "    buffer snapshots in VRAM: {} ({} MiB), {} reused, {} not for lack of space; draws with snapshotted indices {} ({} MiB)\n",
+            SNAPS.load(Ordering::Relaxed),
+            SNAP_COPIED.load(Ordering::Relaxed) >> 20,
+            SNAPS_REUSED.load(Ordering::Relaxed),
+            SNAPS_FULL.load(Ordering::Relaxed),
+            INDEX_SNAPS.load(Ordering::Relaxed),
+            INDEX_SNAP_BYTES.load(Ordering::Relaxed) >> 20
+        )
         + &format!(
             "    guest memory imports: {} ({} MiB), {} over several mappings, {} dropped after remapping
 ",

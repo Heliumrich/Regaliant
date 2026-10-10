@@ -26,6 +26,8 @@ pub struct Ctx {
     /// VK_NV_device_diagnostic_checkpoints (DS_GPU_CHECKPOINTS=1): markers
     /// read back after a device loss.
     pub checkpoints: Option<ash::nv::device_diagnostic_checkpoints::Device>,
+    /// VK_KHR_pipeline_executable_properties (DS_PIPELINE_STATS=1, `gpu::pstats`).
+    pub exec_props: Option<ash::khr::pipeline_executable_properties::Device>,
     pub device_name: String,
     pub validation: bool,
     /// VK_KHR_fragment_shader_barycentric enabled.
@@ -129,6 +131,19 @@ pub fn init() -> Result<(), String> {
         } else if want_ckpt {
             crate::warn!("DS_GPU_CHECKPOINTS=1 but VK_NV_device_diagnostic_checkpoints is unavailable");
         }
+        let want_stats = std::env::var("DS_PIPELINE_STATS").ok().as_deref() == Some("1");
+        let has_stats = want_stats
+            && instance
+                .enumerate_device_extension_properties(pdev)
+                .unwrap_or_default()
+                .iter()
+                .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::pipeline_executable_properties::NAME);
+        if has_stats {
+            dexts.push(ash::khr::pipeline_executable_properties::NAME.as_ptr());
+        } else if want_stats {
+            crate::warn!("DS_PIPELINE_STATS=1 but VK_KHR_pipeline_executable_properties is unavailable");
+        }
+        let mut stats_f = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default().pipeline_executable_info(true);
         // Out-of-range buffer/image accesses must not fault: GCN bounds-checks
         // buffer accesses against the descriptor (loads return 0, stores are
         // dropped), and titles rely on it. robustness2 gives exactly that.
@@ -216,6 +231,9 @@ pub fn init() -> Result<(), String> {
         if barycentric {
             dci = dci.push_next(&mut bary);
         }
+        if has_stats {
+            dci = dci.push_next(&mut stats_f);
+        }
         let device = instance.create_device(pdev, &dci, None).map_err(|e| format!("vkCreateDevice: {e}"))?;
         crate::info!(
             "Vulkan robustness: robustBufferAccess, robustness2 {} (buffer {}, image {}, null descriptors {})",
@@ -233,6 +251,7 @@ pub fn init() -> Result<(), String> {
             push_desc: ash::khr::push_descriptor::Device::new(&instance, &device),
             ext_host: host_import.then(|| ash::ext::external_memory_host::Device::new(&instance, &device)),
             checkpoints: has_ckpt.then(|| ash::nv::device_diagnostic_checkpoints::Device::new(&instance, &device)),
+            exec_props: has_stats.then(|| ash::khr::pipeline_executable_properties::Device::new(&instance, &device)),
             entry,
             instance,
             pdev,
@@ -378,6 +397,28 @@ impl Ctx {
                 return Err(format!("bind imported buffer: {e}"));
             }
             Ok((buf, mem))
+        }
+    }
+
+    /// Device-local buffer the CPU writes through its mapping (the PCIe BAR
+    /// window; writes are write-combined, reads by the CPU are very slow).
+    /// GPU reads stay in video memory, unlike `host_buffer`.
+    pub fn bar_buffer(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), String> {
+        unsafe {
+            let bi = vk::BufferCreateInfo::default().size(size).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buf = self.device.create_buffer(&bi, None).map_err(|e| format!("vkCreateBuffer: {e}"))?;
+            let req = self.device.get_buffer_memory_requirements(buf);
+            let want = vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+            let mem = match self.alloc(req, want) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.device.destroy_buffer(buf, None);
+                    return Err(e);
+                }
+            };
+            self.device.bind_buffer_memory(buf, mem, 0).map_err(|e| format!("bind buffer: {e}"))?;
+            let ptr = self.device.map_memory(mem, 0, size, vk::MemoryMapFlags::empty()).map_err(|e| format!("map: {e}"))? as *mut u8;
+            Ok((buf, mem, ptr))
         }
     }
 

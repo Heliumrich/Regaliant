@@ -346,6 +346,7 @@ fn graphics_pipeline(key: &GfxKey, vs: &Prepared, ps: Option<&Prepared>) -> Resu
             .color_blend_state(&cb)
             .dynamic_state(&dy)
             .layout(layout)
+            .flags(crate::gpu::pstats::flags())
             .push_next(&mut rinfo);
         let r = c.device.create_graphics_pipelines(crate::gpu::pcache::get(), &[gpci], None);
         crate::gpu::pcache::created();
@@ -353,6 +354,7 @@ fn graphics_pipeline(key: &GfxKey, vs: &Prepared, ps: Option<&Prepared>) -> Resu
             c.device.destroy_shader_module(m, None);
         }
         let pipeline = r.map_err(|(_, e)| format!("graphics pipeline: {e}"))?[0];
+        crate::gpu::pstats::report(pipeline, &format!("vs {:#x} ps {:#x}", vs.addr, ps.map_or(0, |p| p.addr)));
         Ok(Pipe { pipeline, layout, set_layout })
     }
 }
@@ -738,7 +740,20 @@ impl Exec {
                     c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, super::STAMPS * ti + k);
                 }
             }
+            // Index buffers: a snapshot in video memory (the input assembler
+            // fetches indices again for every instance; from system memory
+            // across PCIe an instanced foliage draw took 4-8 ms, 0.2-0.3 ms
+            // from video memory).
+            let snap = a.index.and_then(|(addr, size)| self.snapshot(addr, a.count as u64 * size as u64, crate::gpu::tune::snap_index()));
             match a.index {
+                Some((_, size)) if snap.is_some() => {
+                    let (sbuf, soff, sbias) = snap.unwrap();
+                    super::INDEX_SNAPS.fetch_add(1, Ordering::Relaxed);
+                    super::INDEX_SNAP_BYTES.fetch_add(a.count as u64 * size as u64, Ordering::Relaxed);
+                    let ty = if size == 4 { vk::IndexType::UINT32 } else { vk::IndexType::UINT16 };
+                    c.device.cmd_bind_index_buffer(cmd, sbuf, soff + sbias, ty);
+                    c.device.cmd_draw_indexed(cmd, a.count, a.instances, 0, base_vertex, a.first_instance);
+                }
                 Some((addr, size)) => {
                     let bytes = a.count as u64 * size as u64;
                     let span = shared().span(addr, bytes);
