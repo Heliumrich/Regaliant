@@ -30,12 +30,27 @@ pub static PACKETS: AtomicU64 = AtomicU64::new(0);
 pub static EOP_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 /// GPU completions waited for, by the PM4 opcode that required them.
 pub static SYNC_BY_OPCODE: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+/// CP effects deferred until earlier GPU work completed, by opcode and why:
+/// [end of pipe, after a sync event, behind an earlier deferred effect].
+pub static DEFERRED_BY_OPCODE: [[AtomicU64; 3]; 256] = [const { [const { AtomicU64::new(0) }; 3] }; 256];
 
 /// Most frequent synchronizing opcodes (diagnostics).
 pub fn sync_summary() -> String {
     let mut v: Vec<(u64, usize)> = SYNC_BY_OPCODE.iter().enumerate().map(|(i, c)| (c.load(Ordering::Relaxed), i)).filter(|x| x.0 > 0).collect();
     v.sort_by(|a, b| b.cmp(a));
-    v.iter().take(6).map(|(n, op)| format!("{op:#x}: {n}")).collect::<Vec<_>>().join(", ")
+    let waits = v.iter().take(6).map(|(n, op)| format!("{op:#x}: {n}")).collect::<Vec<_>>().join(", ");
+    let mut d: Vec<(u64, usize, [u64; 3])> = DEFERRED_BY_OPCODE
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let x = [c[0].load(Ordering::Relaxed), c[1].load(Ordering::Relaxed), c[2].load(Ordering::Relaxed)];
+            (x.iter().sum(), i, x)
+        })
+        .filter(|x| x.0 > 0)
+        .collect();
+    d.sort_by(|a, b| b.cmp(a));
+    let deferred = d.iter().take(6).map(|(_, op, x)| format!("{op:#x}: {} end of pipe / {} after sync / {} behind deferred", x[0], x[1], x[2])).collect::<Vec<_>>().join(", ");
+    format!("{waits}; deferred CP effects {deferred}")
 }
 
 /// Register file of one queue.
@@ -266,7 +281,7 @@ fn promises_on() -> bool {
     super::tune::promises()
 }
 
-fn promise(seq: u64, addr: u64, value: u64, bytes: u8) {
+pub(super) fn promise(seq: u64, addr: u64, value: u64, bytes: u8) {
     if !promises_on() {
         return;
     }
@@ -422,10 +437,37 @@ impl Cp {
     /// partial flush or acquire (otherwise the CP does not wait for shaders),
     /// and later GPU work then waits for them (it may read what they write).
     /// Returns the batch sequence a deferred effect runs after.
+    /// A memory write that would be deferred behind earlier GPU work, done by
+    /// the GPU in order with it (`Exec::gpu_cp_write`); false: take the CPU
+    /// path (switch off, nothing outstanding, or earlier CPU-side effects
+    /// still pending, which it must not overtake).
+    fn gpu_cp_write(&mut self, a: u64, data: &[u32], label: Option<(u64, u8)>, end_of_pipe: bool) -> bool {
+        if !super::tune::gpu_cp_writes() {
+            return false;
+        }
+        let needs_prior = end_of_pipe || self.fence_pending;
+        let Some(e) = self.exec.as_mut() else { return false };
+        if !(e.busy() && needs_prior) || e.deferred_pending() || !e.gpu_cp_write(a, data, label) {
+            return false;
+        }
+        self.fence_pending = false;
+        // Diagnostics (no latching: the value is not in memory yet).
+        let mut g = LAST_WRITE.lock();
+        let m = g.get_or_insert_with(Default::default);
+        if m.len() > 1 << 16 {
+            m.clear();
+        }
+        m.insert(a & !7, (self.name.clone(), label.map(|l| l.0).unwrap_or(data[0] as u64), self.cur_packet));
+        true
+    }
+
     fn effect(&mut self, end_of_pipe: bool, write: Option<(u64, u64)>, f: Box<dyn FnOnce() + Send>) -> Option<u64> {
         let needs_prior = end_of_pipe || self.fence_pending;
         match self.exec.as_mut() {
             Some(e) if e.busy() && (needs_prior || e.deferred_pending()) => {
+                let k = (self.cur_opcode as usize).min(255);
+                let why = if end_of_pipe { 0 } else if self.fence_pending { 1 } else { 2 };
+                DEFERRED_BY_OPCODE[k][why].fetch_add(1, Ordering::Relaxed);
                 self.fence_pending = false;
                 e.after_gpu(f, write, !end_of_pipe)
             }
@@ -458,13 +500,25 @@ impl Cp {
     }
 
     /// Hands recorded GPU work to the device without waiting.
-    fn submit_gpu(&mut self) {
+    fn submit_gpu(&mut self, why: &'static str) {
         if let Some(e) = self.exec.as_mut() {
-            e.submit();
+            e.submit_for(why);
         }
     }
 
     /// Executes a dispatch (when GPU execution is enabled).
+    /// An indirect dispatch with the GPU reading its arguments (see
+    /// `Exec::dispatch_gpu_indirect`); false: not taken.
+    fn dispatch_gpu_indirect(&mut self, args: u64, initiator: u32) -> bool {
+        if !super::exec::enabled() || self.exec_failed {
+            return false;
+        }
+        let Some(mut e) = self.exec.take() else { return false };
+        let taken = e.dispatch_gpu_indirect(self, args, initiator);
+        self.exec = Some(e);
+        taken
+    }
+
     fn dispatch(&mut self, groups: [u32; 3], initiator: u32) {
         if !super::exec::enabled() || self.exec_failed {
             self.note("dispatches are decoded but not executed (set DS_GPU=1 to run them)");
@@ -710,6 +764,11 @@ impl Cp {
         let mut end = addr + 4 * size as u64;
         let mut f = Fetched::new(addr, size);
         while cur < end {
+            if super::shutting_down() {
+                // Process shutdown releases label waits: the work behind
+                // them would run without its inputs. Nothing more runs.
+                break;
+            }
             if !valid(cur, 4) {
                 crate::error!("gpu[{}]: command pointer {cur:#x} outside guest memory", self.name);
                 break;
@@ -773,6 +832,9 @@ impl Cp {
                 }
             }
             let flow = self.packet(opcode, h, cur, n, &p);
+            if self.exec.as_ref().is_some_and(|e| e.submit_requested()) {
+                self.submit_gpu("label");
+            }
             if opcode == op::REWIND {
                 // The CPU streams packets behind a REWIND: read them live.
                 f = Fetched::new(next, 0);
@@ -790,7 +852,7 @@ impl Cp {
         }
         self.depth -= 1;
         if self.depth == 0 {
-            self.submit_gpu();
+            self.submit_gpu("cmdbuf");
         }
     }
 
@@ -977,26 +1039,31 @@ impl Cp {
                     // compute queues: [address lo, address hi, initiator] (the
                     // form sceAgcAcbDispatchIndirect emits).
                     let (a, initiator) = if n >= 3 { (addr64(p(0), p(1)), p(2)) } else { (self.dispatch_indirect_base + p(0) as u64, p(1)) };
-                    // Arguments may have been written by earlier GPU work.
-                    self.sync_reads(&[(a, 12)]);
-                    if !valid(a, 12) {
-                        crate::warn!("gpu[{}]: DISPATCH_INDIRECT arguments at {a:#x} outside guest memory (dispatch skipped)", self.name);
-                    }
-                    if valid(a, 12) {
-                        let g = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8)] };
-                        indirect_groups = Some(g);
-                        // DS_EMU_CHECK: interpret a sample of the groups first
-                        // (after the earlier work has completed).
-                        let check = if super::exec::enabled() && super::emucheck::wanted(self) {
-                            self.sync();
-                            super::emucheck::prepare(self, g, initiator)
-                        } else {
-                            None
-                        };
-                        self.dispatch(g, initiator);
-                        if let Some(c) = check {
-                            self.sync();
-                            super::emucheck::compare(c);
+                    // Arguments that GPU work still writes: the GPU reads them
+                    // (captures and interpreter checks need the group counts).
+                    let gpu = valid(a, 12) && !super::capture::capturing() && !(super::exec::enabled() && super::emucheck::wanted(self)) && self.dispatch_gpu_indirect(a, initiator);
+                    if !gpu {
+                        // Arguments may have been written by earlier GPU work.
+                        self.sync_reads(&[(a, 12)]);
+                        if !valid(a, 12) {
+                            crate::warn!("gpu[{}]: DISPATCH_INDIRECT arguments at {a:#x} outside guest memory (dispatch skipped)", self.name);
+                        }
+                        if valid(a, 12) {
+                            let g = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8)] };
+                            indirect_groups = Some(g);
+                            // DS_EMU_CHECK: interpret a sample of the groups first
+                            // (after the earlier work has completed).
+                            let check = if super::exec::enabled() && super::emucheck::wanted(self) {
+                                self.sync();
+                                super::emucheck::prepare(self, g, initiator)
+                            } else {
+                                None
+                            };
+                            self.dispatch(g, initiator);
+                            if let Some(c) = check {
+                                self.sync();
+                                super::emucheck::compare(c);
+                            }
                         }
                     }
                 }
@@ -1038,13 +1105,16 @@ impl Cp {
             op::DMA_DATA => self.dma_data(p),
             op::RELEASE_MEM => self.release_mem(p),
             op::WAIT_REG_MEM => {
-                // Let recorded work and deferred effects progress while polling.
-                self.submit_gpu();
+                if !super::tune::lazy_wait_submit() {
+                    self.submit_gpu("wait");
+                }
                 let c = p(0);
                 return self.wait(c, addr64(p(1), p(2)), false, p(3) as u64, p(4) as u64, at);
             }
             op::WAIT_REG_MEM64 => {
-                self.submit_gpu();
+                if !super::tune::lazy_wait_submit() {
+                    self.submit_gpu("wait");
+                }
                 let c = p(0);
                 return self.wait(c, addr64(p(1), p(2)), true, addr64(p(3), p(4)), addr64(p(5), p(6)), at);
             }
@@ -1129,6 +1199,11 @@ impl Cp {
                     (2, false) => Some((vals[0] as u64 | (vals[1] as u64) << 32, 8u8)),
                     _ => None,
                 };
+                // Without address increment only the last value stays.
+                let gpu_vals = if no_incr { vec![*vals.last().unwrap()] } else { vals.clone() };
+                if self.gpu_cp_write(a, &gpu_vals, label, false) {
+                    return;
+                }
                 let seq = self.effect(
                     false,
                     Some((a, len)),
@@ -1339,6 +1414,12 @@ impl Cp {
             return;
         }
         let (name, at) = (self.name.clone(), self.cur_packet);
+        if matches!(data_sel, 1 | 2) && (int_sel == 0 || int_sel == 3) {
+            let (vals, label) = if data_sel == 1 { (vec![data as u32], (data & 0xFFFF_FFFF, 4u8)) } else { (vec![data as u32, (data >> 32) as u32], (data, 8u8)) };
+            if self.gpu_cp_write(a, &vals, Some(label), true) {
+                return;
+            }
+        }
         let seq = self.effect(
             true,
             write.then_some((a, 8)),
@@ -1397,6 +1478,10 @@ impl Cp {
             }
         }
         label_event(&self.name, b'S', a, v0, reference, at);
+        // Let recorded work and deferred effects progress while polling; a
+        // queue holding this label in an unsubmitted batch submits it.
+        self.submit_gpu("wait");
+        super::exec::request_label_submit(a);
         let what = format!("WAIT_REG_MEM at {at:#x}: [{a:#x}] & {mask:#x} func {func} ref {reference:#x}");
         self.waiting_on = a;
         // Submitters stop waiting for this queue only when the label is not

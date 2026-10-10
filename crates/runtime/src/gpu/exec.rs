@@ -312,7 +312,7 @@ impl Shared {
         if start < vs || end <= start {
             return None;
         }
-        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER;
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER;
         // The driver pins the pages for writing: write-tracked (read-only)
         // pages must be writable while importing (their regions turn dirty
         // and are re-armed on their next use).
@@ -524,7 +524,8 @@ fn global_barrier(cmd: vk::CommandBuffer) {
     unsafe { ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]) };
 }
 
-const RING_BYTES: u64 = 8 << 20;
+/// SGPR data ring space per slot.
+const RING_SEG: u64 = 4 << 20;
 /// Descriptor pool of a slot: sets, then descriptors of each POOL_TYPES type.
 const POOL_LIMITS: [u32; 5] = [4096, 32768, 8192, 2048, 8192];
 const POOL_TYPES: [vk::DescriptorType; 4] = [vk::DescriptorType::STORAGE_BUFFER, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorType::STORAGE_IMAGE, vk::DescriptorType::SAMPLER];
@@ -608,6 +609,25 @@ const SHADOW_BYTES: u64 = 32 << 20;
 const SHADOW_MAX: u64 = 4 << 20;
 
 static SHADOWED: AtomicU64 = AtomicU64::new(0);
+/// Indirect dispatches whose arguments the GPU read (`Exec::dispatch_gpu_indirect`).
+static GPU_INDIRECT: AtomicU64 = AtomicU64::new(0);
+/// CP memory writes performed by the GPU (`Exec::gpu_cp_write`).
+static GPU_CP_WRITES: AtomicU64 = AtomicU64::new(0);
+/// Labels written GPU-side in batches not yet submitted (address & !7 ->
+/// the owning queue's submit request): a command processor about to block on
+/// one asks the owner to submit, which registers its promise.
+static UNSUBMITTED_LABELS: Mutex<Option<HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>>> = Mutex::new(None);
+/// A batch holding unsubmitted labels is submitted after recording this long
+/// (CPU threads of the title may poll them).
+const LABEL_LATENCY: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Asks the queue whose unsubmitted batch writes the label at `a` to submit
+/// it (`Cp::wait`, before polling).
+pub fn request_label_submit(a: u64) {
+    if let Some(f) = UNSUBMITTED_LABELS.lock().as_ref().and_then(|m| m.get(&(a & !7))) {
+        f.store(true, Ordering::SeqCst);
+    }
+}
 /// Resident shadows: bindings that reused one, read-only bindings served
 /// from one, merges, and merges forced before an in-place use.
 static SHADOWS_REUSED: AtomicU64 = AtomicU64::new(0);
@@ -625,8 +645,8 @@ static SNAP_COPIED: AtomicU64 = AtomicU64::new(0);
 /// Index buffers drawn from snapshots (draws, bytes; reuses included).
 pub(super) static INDEX_SNAPS: AtomicU64 = AtomicU64::new(0);
 pub(super) static INDEX_SNAP_BYTES: AtomicU64 = AtomicU64::new(0);
-/// Video memory for snapshots per queue (half per slot).
-const SNAP_BYTES: u64 = 32 << 20;
+/// Video memory for snapshots per slot.
+const SNAP_SEG: u64 = 16 << 20;
 
 /// `DS_GPU_SHADOW=0` binds written buffers in host memory directly (A/B
 /// comparisons of the shadow path).
@@ -694,8 +714,11 @@ fn texture_ranges(p: &Prepared) -> Vec<(u64, u64)> {
         .flatten()
         .collect()
 }
-/// Batches in flight per queue: one recording while the other executes.
-const SLOTS: usize = 2;
+/// Most batch slots per queue (`tune slots`, default 4): one batch recording
+/// while the batches of the others execute. A queue reuses a slot only after
+/// its batch completed, so more slots let a command processor run further
+/// ahead of the GPU. Slots are created when first used.
+pub const MAX_SLOTS: usize = 8;
 
 /// Command-processor effect performed after GPU work completes.
 pub type Action = Box<dyn FnOnce() + Send>;
@@ -721,6 +744,14 @@ static BATCHES_CV: parking_lot::Condvar = parking_lot::Condvar::new();
 static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
 /// Highest completed sequence number (all earlier ones completed too).
 static DONE: Mutex<u64> = Mutex::new(0);
+/// When the completion thread finished the last batch (profiling: GPU
+/// starvation, see `STARVED`).
+static LAST_DONE_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+/// Batches submitted per (queue, reason) while profiling.
+static SUBMIT_WHY: Mutex<Option<HashMap<(String, &'static str), u64>>> = Mutex::new(None);
+/// Submissions that found every earlier batch complete (the GPU idle), per
+/// queue: [submissions, idle ns before them, ns spent recording them].
+static STARVED: Mutex<Option<HashMap<String, [u64; 3]>>> = Mutex::new(None);
 static DONE_CV: parking_lot::Condvar = parking_lot::Condvar::new();
 
 fn done_seq() -> u64 {
@@ -732,55 +763,110 @@ pub fn completed_seq() -> u64 {
     done_seq()
 }
 
-/// Guest ranges written by unfinished batches (sequence, start, end),
-/// bucketed by 1 MiB.
-struct RangeLog(Mutex<Option<HashMap<u64, Vec<(u64, u64, u64)>>>>);
+/// Guest ranges written by unfinished batches (sequence, start, end):
+/// ranges up to `RANGE_LARGE` buckets bucketed by 1 MiB, larger ones in a
+/// list. Entries of completed batches are skipped by lookups and dropped
+/// now and then by `note`; `latest_seq` lets lookups return at once when
+/// every noted batch has completed (a command processor checks many
+/// bindings per draw: the per-lookup clean-up and the hundred buckets of the
+/// title's 112 MB culling output took ~13% of its time).
+struct RangeLog {
+    log: Mutex<Option<RangeLogInner>>,
+    latest_seq: AtomicU64,
+}
+
+#[derive(Default)]
+struct RangeLogInner {
+    buckets: HashMap<u64, Vec<(u64, u64, u64)>>,
+    large: Vec<(u64, u64, u64)>,
+    notes: u64,
+}
 
 const RANGE_BUCKET: u32 = 20;
+/// Ranges spanning more buckets than this go to the large list.
+const RANGE_LARGE: u64 = 16;
 
 impl RangeLog {
     const fn new() -> RangeLog {
-        RangeLog(Mutex::new(None))
+        RangeLog { log: Mutex::new(None), latest_seq: AtomicU64::new(0) }
     }
 
-    fn note(&self, seq: u64, (a, n): (u64, u64)) {
-        if n == 0 {
+    fn note(&self, seq: u64, w: (u64, u64)) {
+        self.note_all(seq, std::slice::from_ref(&w));
+    }
+
+    /// Notes several ranges written by batch `seq` (one lock).
+    fn note_all(&self, seq: u64, writes: &[(u64, u64)]) {
+        if writes.iter().all(|w| w.1 == 0) {
             return;
         }
+        self.latest_seq.fetch_max(seq, Ordering::SeqCst);
         let done = done_seq();
-        let mut g = self.0.lock();
-        let m = g.get_or_insert_with(HashMap::new);
-        if m.len() > 4096 {
-            m.retain(|_, v| {
+        let mut g = self.log.lock();
+        let m = g.get_or_insert_with(RangeLogInner::default);
+        m.notes += 1;
+        if m.notes % 1024 == 0 {
+            m.buckets.retain(|_, v| {
                 v.retain(|e| e.0 > done);
                 !v.is_empty()
             });
+            m.large.retain(|e| e.0 > done);
         }
-        let end = a.saturating_add(n);
-        for b in (a >> RANGE_BUCKET)..=((end - 1) >> RANGE_BUCKET) {
-            let v = m.entry(b).or_default();
-            v.retain(|e| e.0 > done);
-            v.push((seq, a, end));
+        for &(a, n) in writes {
+            if n == 0 {
+                continue;
+            }
+            let end = a.saturating_add(n);
+            let (b0, b1) = (a >> RANGE_BUCKET, (end - 1) >> RANGE_BUCKET);
+            if b1 - b0 >= RANGE_LARGE {
+                m.large.push((seq, a, end));
+                continue;
+            }
+            for b in b0..=b1 {
+                let v = m.buckets.entry(b).or_default();
+                if v.len() >= 32 {
+                    v.retain(|e| e.0 > done);
+                }
+                v.push((seq, a, end));
+            }
         }
     }
 
     /// The latest unfinished batch that writes into `reads`.
     fn latest(&self, reads: &[(u64, u64)]) -> Option<u64> {
         let done = done_seq();
-        let mut g = self.0.lock();
-        let m = g.as_mut()?;
+        if self.latest_seq.load(Ordering::SeqCst) <= done {
+            return None;
+        }
+        let g = self.log.lock();
+        let m = g.as_ref()?;
         let mut best: Option<u64> = None;
+        let mut consider = |&(s, wa, we): &(u64, u64, u64), r: u64, end: u64| {
+            if s > done && wa < end && r < we {
+                best = best.max(Some(s));
+            }
+        };
         for &(r, n) in reads {
             if n == 0 {
                 continue;
             }
             let end = r.saturating_add(n);
-            for b in (r >> RANGE_BUCKET)..=((end - 1) >> RANGE_BUCKET) {
-                if let Some(v) = m.get_mut(&b) {
-                    v.retain(|e| e.0 > done);
-                    for &(s, wa, we) in v.iter() {
-                        if wa < end && r < we {
-                            best = best.max(Some(s));
+            for e in &m.large {
+                consider(e, r, end);
+            }
+            let (b0, b1) = (r >> RANGE_BUCKET, (end - 1) >> RANGE_BUCKET);
+            if b1 - b0 >= RANGE_LARGE {
+                // A large read: every bucket once (fewer than its buckets).
+                for v in m.buckets.values() {
+                    for e in v {
+                        consider(e, r, end);
+                    }
+                }
+            } else {
+                for b in b0..=b1 {
+                    if let Some(v) = m.buckets.get(&b) {
+                        for e in v {
+                            consider(e, r, end);
                         }
                     }
                 }
@@ -859,7 +945,7 @@ fn completion_thread() {
                 }
             }
             FLUSHES.fetch_add(1, Ordering::Relaxed);
-            collect_timestamps(b.queries, &b.shaders);
+            collect_timestamps(b.queries, &b.shaders, &b.name);
             check_watchdog(&b.name, &b.shaders);
             let ms = b.submitted.elapsed().as_millis();
             if ms >= 250 {
@@ -880,6 +966,7 @@ fn completion_thread() {
             verify::run(&b.name, ch);
         }
         *DONE.lock() = b.seq;
+        *LAST_DONE_AT.lock() = Some(std::time::Instant::now());
         DONE_CV.notify_all();
     }
 }
@@ -969,6 +1056,42 @@ struct Slot {
     seq: u64,
     /// Timestamp queries around each dispatch (DS_PROFILE_GPU=1).
     queries: vk::QueryPool,
+    /// The SGPR data rings (RING_SEG each): system memory and video memory
+    /// (allocated when `tune ring_vram` first chooses it).
+    rings: [Option<(vk::Buffer, *mut u8)>; 2],
+    /// Read-only buffer snapshots in video memory (SNAP_SEG, allocated on
+    /// first use).
+    snap: Option<(vk::Buffer, *mut u8)>,
+    /// Device-local shadow space (SHADOW_BYTES: working and pristine copies).
+    shadow: vk::Buffer,
+}
+
+impl Slot {
+    fn new(pool: vk::CommandPool) -> Result<Slot, String> {
+        let c = ctx();
+        let sizes: Vec<vk::DescriptorPoolSize> = POOL_TYPES.iter().zip(&POOL_LIMITS[1..]).map(|(&ty, &n)| vk::DescriptorPoolSize { ty, descriptor_count: n }).collect();
+        unsafe {
+            let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).map_err(|e| e.to_string())?[0];
+            // SGPR data in system memory: a copy in video memory, read by
+            // every invocation, made no measurable difference (`tune ring_vram`).
+            let (ring, _mem, ring_ptr) = c.host_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let (shadow, _smem) = c.device_buffer(SHADOW_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)?;
+            Ok(Slot {
+                cmd,
+                fence: c.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| e.to_string())?,
+                desc_pool: c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(POOL_LIMITS[0]).pool_sizes(&sizes), None).map_err(|e| e.to_string())?,
+                seq: 0,
+                queries: if profiling() {
+                    c.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(STAMPS * MAX_TIMED + 2), None).map_err(|e| e.to_string())?
+                } else {
+                    vk::QueryPool::null()
+                },
+                rings: [Some((ring, ring_ptr)), None],
+                snap: None,
+                shadow,
+            })
+        }
+    }
 }
 
 const MAX_TIMED: u32 = 4096;
@@ -993,16 +1116,33 @@ static GAP_NS: AtomicU64 = AtomicU64::new(0);
 
 /// GPU time inside batches (first to last command), ns.
 static BATCH_NS: AtomicU64 = AtomicU64::new(0);
+/// GPU idle time between consecutive batches (one Vulkan queue runs them in
+/// submission order): (end timestamp of the last batch, per queue of the
+/// batch that ended the gap: [ns, gaps, gaps over 1 ms]).
+static IDLE: Mutex<(u64, Option<HashMap<String, [u64; 3]>>)> = Mutex::new((0, None));
 
 /// Reads a completed batch's dispatch timestamps into SHADER_TIME.
-fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64]) {
+fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str) {
     if pool == vk::QueryPool::null() {
         return;
     }
     let c = ctx();
     let mut be = [0u64; 2];
     if unsafe { c.device.get_query_pool_results(pool, STAMPS * MAX_TIMED, &mut be, vk::QueryResultFlags::TYPE_64) }.is_ok() {
-        BATCH_NS.fetch_add((be[1].saturating_sub(be[0]) as f64 * c.limits.timestamp_period as f64) as u64, Ordering::Relaxed);
+        let period = c.limits.timestamp_period as f64;
+        BATCH_NS.fetch_add((be[1].saturating_sub(be[0]) as f64 * period) as u64, Ordering::Relaxed);
+        let mut g = IDLE.lock();
+        if g.0 != 0 && be[0] > g.0 {
+            let ns = ((be[0] - g.0) as f64 * period) as u64;
+            // Gaps over 1 s: the profile was idle (menus, loading), not counted.
+            if ns < 1_000_000_000 {
+                let e = g.1.get_or_insert_with(HashMap::new).entry(queue.to_string()).or_insert([0; 3]);
+                e[0] += ns;
+                e[1] += 1;
+                e[2] += (ns >= 1_000_000) as u64;
+            }
+        }
+        g.0 = g.0.max(be[1]);
     }
     let n = (shaders.len() as u32).min(MAX_TIMED);
     if n == 0 {
@@ -1037,6 +1177,9 @@ pub fn reset_shader_profile() {
     }
     GAP_NS.store(0, Ordering::Relaxed);
     BATCH_NS.store(0, Ordering::Relaxed);
+    IDLE.lock().1 = None;
+    *STARVED.lock() = None;
+    *SUBMIT_WHY.lock() = None;
 }
 
 /// Shaders by total GPU time.
@@ -1055,6 +1198,25 @@ pub fn shader_profile() -> String {
         tot(3, false),
         GAP_NS.load(Ordering::Relaxed) / 1_000_000
     );
+    if let Some(idle) = IDLE.lock().1.as_ref() {
+        let mut v: Vec<(&String, &[u64; 3])> = idle.iter().collect();
+        v.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
+        let total: u64 = v.iter().map(|x| x.1[0]).sum();
+        let list: Vec<String> = v.iter().map(|(q, x)| format!("{q} {} ms ({} gaps, {} over 1 ms)", x[0] / 1_000_000, x[1], x[2])).collect();
+        s.push_str(&format!("    gpu idle between batches {} ms, before batches of: {}\n", total / 1_000_000, list.join(", ")));
+    }
+    if let Some(w) = SUBMIT_WHY.lock().as_ref() {
+        let mut v: Vec<(&(String, &'static str), &u64)> = w.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        let list: Vec<String> = v.iter().map(|((q, why), n)| format!("{q} {why} {n}")).collect();
+        s.push_str(&format!("    batches by what ended them: {}\n", list.join(", ")));
+    }
+    if let Some(st) = STARVED.lock().as_ref() {
+        let mut v: Vec<(&String, &[u64; 3])> = st.iter().collect();
+        v.sort_by(|a, b| b.1[1].cmp(&a.1[1]));
+        let list: Vec<String> = v.iter().map(|(q, x)| format!("{q} {} submissions, idle {} ms, recorded in {} ms", x[0], x[1] / 1_000_000, x[2] / 1_000_000)).collect();
+        s.push_str(&format!("    submissions to an idle GPU: {}\n", list.join(", ")));
+    }
     let top = std::env::var("DS_PROFILE_TOP").ok().and_then(|x| x.parse().ok()).unwrap_or(15);
     for (a, x) in v.iter().take(top) {
         let n = x[0].max(1);
@@ -1072,21 +1234,27 @@ pub struct Exec {
     pool: vk::CommandPool,
     slots: Vec<Slot>,
     cur: usize,
-    /// The SGPR data rings: system memory and video memory (allocated when
-    /// `tune ring_vram` first chooses it for a stage; failed: never).
-    rings: [Option<(vk::Buffer, *mut u8)>; 2],
+    /// Slots that could be created (a failed creation caps them).
+    slot_limit: usize,
+    /// The SGPR data ring in video memory could not be allocated.
     vram_ring_failed: bool,
     /// Offsets within the current slot's segment of each ring.
     ring_used: [u64; 2],
-    /// Read-only buffer snapshots in video memory (allocated on first use;
-    /// a segment per slot), space used in the current segment, failure to
-    /// allocate, and the snapshots of the batch being recorded by range.
-    snap: Option<(vk::Buffer, *mut u8)>,
+    /// Read-only buffer snapshots: space used in the current slot's buffer,
+    /// failure to allocate, and the snapshots of the batch being recorded by
+    /// range.
     snap_used: u64,
     snap_failed: bool,
     snaps: HashMap<(u64, u64), u64>,
     ring_align: u64,
     recording: bool,
+    /// When the batch being recorded was begun.
+    begun_at: std::time::Instant,
+    /// Label values the recording batch writes GPU-side (address, value,
+    /// bytes): promised when it is submitted.
+    pending_promises: Vec<(u64, u64, u8)>,
+    /// Set by a command processor waiting for one of those labels.
+    submit_request: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Guest ranges written by the batch being recorded.
     pending_writes: Vec<(u64, u64)>,
     /// Actions of the batch being recorded.
@@ -1113,8 +1281,7 @@ pub struct Exec {
     rendering: Option<draw::Rendering>,
     /// Descriptor pool usage of the recording slot (see POOL_LIMITS).
     pool_use: [u32; 5],
-    /// Device-local shadow ring (SHADOW_BYTES per slot) and its use in the recording slot.
-    shadow: vk::Buffer,
+    /// Shadow space used in the recording slot.
     shadow_used: u64,
     /// Shadows of this batch whose working copies hold newer data than
     /// guest memory (see Shadow).
@@ -1131,39 +1298,22 @@ impl Exec {
                 .device
                 .create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(c.queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
                 .map_err(|e| e.to_string())?;
-            let cmds = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(SLOTS as u32)).map_err(|e| e.to_string())?;
-            let sizes: Vec<vk::DescriptorPoolSize> = POOL_TYPES.iter().zip(&POOL_LIMITS[1..]).map(|(&ty, &n)| vk::DescriptorPoolSize { ty, descriptor_count: n }).collect();
-            let mut slots = Vec::new();
-            for cmd in cmds {
-                slots.push(Slot {
-                    cmd,
-                    fence: c.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| e.to_string())?,
-                    desc_pool: c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(POOL_LIMITS[0]).pool_sizes(&sizes), None).map_err(|e| e.to_string())?,
-                    seq: 0,
-                    queries: if profiling() {
-                        c.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(STAMPS * MAX_TIMED + 2), None).map_err(|e| e.to_string())?
-                    } else {
-                        vk::QueryPool::null()
-                    },
-                });
-            }
-            // SGPR data in system memory: a copy in video memory, read by
-            // every invocation, made no measurable difference (`tune ring_vram`).
-            let (ring, _mem, ring_ptr) = c.host_buffer(RING_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER)?;
-            let (shadow, _smem) = c.device_buffer(SHADOW_BYTES * SLOTS as u64, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)?;
+            let slots = vec![Slot::new(pool)?, Slot::new(pool)?];
             Ok(Exec {
                 pool,
                 slots,
                 cur: 0,
-                rings: [Some((ring, ring_ptr)), None],
+                slot_limit: MAX_SLOTS,
                 vram_ring_failed: false,
                 ring_used: [0; 2],
-                snap: None,
                 snap_used: 0,
                 snap_failed: false,
                 snaps: HashMap::new(),
                 ring_align: c.limits.min_storage_buffer_offset_alignment.max(16),
                 recording: false,
+                begun_at: std::time::Instant::now(),
+                pending_promises: Vec::new(),
+                submit_request: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 pending_writes: Vec::new(),
                 actions: Vec::new(),
                 checks: Vec::new(),
@@ -1178,7 +1328,6 @@ impl Exec {
                 batch_shaders: Vec::new(),
                 rendering: None,
                 pool_use: [0; 5],
-                shadow,
                 shadow_used: 0,
                 resident: Vec::new(),
             })
@@ -1197,15 +1346,35 @@ impl Exec {
         self.slots[self.cur].cmd
     }
 
+    /// The recording slot's shadow buffer.
+    fn shadow(&self) -> vk::Buffer {
+        self.slots[self.cur].shadow
+    }
+
     fn begin(&mut self) {
         if self.recording {
             return;
+        }
+        if self.cur == self.slots.len() {
+            match Slot::new(self.pool) {
+                Ok(slot) => self.slots.push(slot),
+                Err(e) => {
+                    crate::warn!("gpu[{}]: no batch slot {} ({e}); using {}", self.name, self.cur + 1, self.cur);
+                    self.slot_limit = self.cur;
+                    self.cur = 0;
+                }
+            }
         }
         // The slot's previous batch must have completed before reuse.
         let slot = &self.slots[self.cur];
         if slot.seq != 0 {
             wait_done(slot.seq);
             let c = ctx();
+            if done_seq() < slot.seq {
+                // Shutdown released the wait: the command buffer may still
+                // execute (resetting it would lose the device).
+                unsafe { c.device.wait_for_fences(&[slot.fence], true, 2_000_000_000).ok() };
+            }
             unsafe {
                 c.device.reset_fences(&[slot.fence]).ok();
                 c.device.reset_command_buffer(slot.cmd, vk::CommandBufferResetFlags::empty()).ok();
@@ -1228,6 +1397,7 @@ impl Exec {
             unsafe { ctx().device.cmd_write_timestamp(self.cmd(), vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED) };
         }
         self.recording = true;
+        self.begun_at = std::time::Instant::now();
         self.pool_use = [0; 5];
         self.shadow_used = 0;
         self.resident.clear();
@@ -1235,9 +1405,17 @@ impl Exec {
 
     /// Submits the recorded batch without waiting for it (its actions run
     /// when it completes).
-    pub fn submit(&mut self) {
+    /// Submits the recorded batch; `why` (profiling): what ended it.
+    pub fn submit_for(&mut self, why: &'static str) {
         if !self.recording {
             return;
+        }
+        if super::shutting_down() {
+            self.discard();
+            return;
+        }
+        if profiling() {
+            *SUBMIT_WHY.lock().get_or_insert_with(HashMap::new).entry((self.name.clone(), why)).or_default() += 1;
         }
         if let Err(e) = self.flush_resident(None) {
             self.report(format!("shadow write-back: {e}"));
@@ -1262,6 +1440,18 @@ impl Exec {
         let actions = std::mem::take(&mut self.actions);
         let has_actions = !actions.is_empty();
         let name = self.name.clone();
+        if profiling() {
+            // The GPU ran out of work before this batch: how long, and how
+            // long the batch took to record.
+            let idle = (done_seq() + 1 == NEXT_SEQ.load(Ordering::SeqCst)).then(|| LAST_DONE_AT.lock().map(|t| t.elapsed())).flatten();
+            if let Some(idle) = idle {
+                let mut g = STARVED.lock();
+                let e = g.get_or_insert_with(HashMap::new).entry(self.name.clone()).or_insert([0; 3]);
+                e[0] += 1;
+                e[1] += idle.as_nanos() as u64;
+                e[2] += self.begun_at.elapsed().as_nanos() as u64;
+            }
+        }
         let mut checks = std::mem::take(&mut self.checks);
         for ch in checks.iter_mut() {
             let (a, n) = verify::dest_range(ch);
@@ -1278,16 +1468,40 @@ impl Exec {
             }
         });
         self.slots[i].seq = seq;
-        for w in std::mem::take(&mut self.pending_writes) {
-            INFLIGHT.note(seq, w);
-            self.inflight.push((seq, w));
+        for (a, v, n) in std::mem::take(&mut self.pending_promises) {
+            super::cp::promise(seq, a, v, n);
         }
+        if let Some(m) = UNSUBMITTED_LABELS.lock().as_mut() {
+            m.retain(|_, f| !std::sync::Arc::ptr_eq(f, &self.submit_request));
+        }
+        self.submit_request.store(false, Ordering::SeqCst);
+        let writes = std::mem::take(&mut self.pending_writes);
+        INFLIGHT.note_all(seq, &writes);
+        self.inflight.extend(writes.into_iter().map(|w| (seq, w)));
         self.last_seq = seq;
         if has_actions {
             self.last_action_seq = seq;
         }
         self.recording = false;
-        self.cur = (self.cur + 1) % SLOTS;
+        let n = (super::tune::slots() as usize).clamp(2, MAX_SLOTS).min(self.slot_limit);
+        self.cur = (self.cur + 1) % n;
+        self.ring_used = [0; 2];
+        self.snap_used = 0;
+        self.snaps.clear();
+    }
+
+    /// Drops the recorded batch (process shutdown: label waits were released,
+    /// so the work may lack its inputs). The slot stays free.
+    fn discard(&mut self) {
+        self.end_rendering();
+        unsafe { ctx().device.end_command_buffer(self.cmd()).ok() };
+        self.actions.clear();
+        self.checks.clear();
+        self.pending_writes.clear();
+        self.pending_promises.clear();
+        self.batch_shaders.clear();
+        self.resident.clear();
+        self.recording = false;
         self.ring_used = [0; 2];
         self.snap_used = 0;
         self.snaps.clear();
@@ -1421,7 +1635,7 @@ impl Exec {
     /// Submits recorded work and waits for all of this queue's GPU work and
     /// deferred effects.
     pub fn flush(&mut self) {
-        self.submit();
+        self.submit_for("sync");
         wait_done(self.last_seq);
         self.inflight.clear();
     }
@@ -1453,7 +1667,7 @@ impl Exec {
     pub fn after_gpu(&mut self, f: Action, write: Option<(u64, u64)>, ordered: bool) -> Option<u64> {
         if self.recording {
             self.actions.push(f);
-            self.submit();
+            self.submit_for("effect");
             if let Some(w) = write {
                 INFLIGHT.note(self.last_seq, w);
                 if ordered {
@@ -1541,6 +1755,43 @@ impl Exec {
         reads.iter().any(|r| self.pending_writes.iter().any(|w| ov(r, w)) || self.inflight.iter().any(|(_, w)| ov(r, w)))
     }
 
+    /// A CP memory write that follows earlier GPU work, performed by the GPU
+    /// in order with it (vkCmdUpdateBuffer between barriers) instead of by
+    /// the CPU once the batch completed: the batch need not end there, and
+    /// later work reading the value need not wait for that completion (the
+    /// title issues ~170 such label and data writes per frame on the graphics
+    /// queue). `label`: a value other queues may wait for (promised when the
+    /// batch is submitted). False: not possible here.
+    pub fn gpu_cp_write(&mut self, a: u64, data: &[u32], label: Option<(u64, u8)>) -> bool {
+        let bytes = 4 * data.len() as u64;
+        if bytes == 0 || bytes > 65536 || a % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) {
+            return false;
+        }
+        let Some((buffer, start, _)) = shared().span(a, bytes) else { return false };
+        self.begin();
+        self.end_rendering();
+        let cmd = self.cmd();
+        let raw: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
+        global_barrier(cmd);
+        unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
+        global_barrier(cmd);
+        self.barrier_wanted = false;
+        self.dispatched = false;
+        self.pending_writes.push((a, bytes));
+        if let Some((v, n)) = label {
+            self.pending_promises.push((a, v, n));
+            UNSUBMITTED_LABELS.lock().get_or_insert_with(HashMap::new).insert(a & !7, self.submit_request.clone());
+        }
+        GPU_CP_WRITES.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Whether the recording batch should be submitted now: another queue
+    /// waits for one of its labels, or they have waited `LABEL_LATENCY`.
+    pub fn submit_requested(&self) -> bool {
+        self.recording && !self.pending_promises.is_empty() && (self.submit_request.load(Ordering::Relaxed) || self.begun_at.elapsed() > LABEL_LATENCY)
+    }
+
     /// A read-only binding of guest [base, base+size) inside a resident shadow
     /// reads its working copy: (buffer, offset of `base`, bytes from `base`
     /// to the copy's end). A binding that overlaps one only partly gets it
@@ -1548,7 +1799,7 @@ impl Exec {
     fn resident_read(&mut self, base: u64, size: u64) -> Result<Option<(vk::Buffer, u64, u64)>, String> {
         if let Some(r) = self.resident.iter().find(|r| r.guest <= base && base + size <= r.guest + r.range).copied() {
             RESIDENT_READS.fetch_add(1, Ordering::Relaxed);
-            return Ok(Some((self.shadow, r.shadow_off + (base - r.guest), r.guest + r.range - base)));
+            return Ok(Some((self.shadow(), r.shadow_off + (base - r.guest), r.guest + r.range - base)));
         }
         if self.resident.iter().any(|r| r.guest < base + size && base < r.guest + r.range) {
             EARLY_MERGES.fetch_add(1, Ordering::Relaxed);
@@ -1579,8 +1830,8 @@ impl Exec {
                 Some(m) => {
                     let set = self.alloc_set(m.set_layout)?;
                     let infos = [
-                        vk::DescriptorBufferInfo { buffer: self.shadow, offset: sh.shadow_off, range: sh.range },
-                        vk::DescriptorBufferInfo { buffer: self.shadow, offset: sh.pristine_off, range: sh.range },
+                        vk::DescriptorBufferInfo { buffer: self.shadow(), offset: sh.shadow_off, range: sh.range },
+                        vk::DescriptorBufferInfo { buffer: self.shadow(), offset: sh.pristine_off, range: sh.range },
                         vk::DescriptorBufferInfo { buffer: sh.host, offset: sh.host_off, range: sh.range },
                     ];
                     let writes: Vec<vk::WriteDescriptorSet> = infos
@@ -1602,7 +1853,7 @@ impl Exec {
                 }
                 None => unsafe {
                     let r = vk::BufferCopy { src_offset: sh.shadow_off + sh.bias, dst_offset: sh.host_off + sh.bias, size: own };
-                    c.device.cmd_copy_buffer(self.cmd(), self.shadow, sh.host, &[r]);
+                    c.device.cmd_copy_buffer(self.cmd(), self.shadow(), sh.host, &[r]);
                 },
             }
         }
@@ -1630,13 +1881,13 @@ impl Exec {
         }
         let al = base & !15;
         let bias = base - al;
-        if let (Some(&at), Some((buf, _))) = (self.snaps.get(&(base, size)), self.snap) {
+        if let (Some(&at), Some((buf, _))) = (self.snaps.get(&(base, size)), self.slots[self.cur].snap) {
             SNAPS_REUSED.fetch_add(1, Ordering::Relaxed);
             return Some((buf, at, bias));
         }
-        if self.snap.is_none() {
-            match ctx().bar_buffer(SNAP_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER) {
-                Ok((b, _m, p)) => self.snap = Some((b, p)),
+        if self.slots[self.cur].snap.is_none() {
+            match ctx().bar_buffer(SNAP_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER) {
+                Ok((b, _m, p)) => self.slots[self.cur].snap = Some((b, p)),
                 Err(e) => {
                     crate::warn!("gpu[{}]: no video memory for buffer snapshots ({e})", self.name);
                     self.snap_failed = true;
@@ -1644,8 +1895,8 @@ impl Exec {
                 }
             }
         }
-        let (buf, ptr) = self.snap?;
-        let seg = SNAP_BYTES / SLOTS as u64;
+        let (buf, ptr) = self.slots[self.cur].snap?;
+        let seg = SNAP_SEG;
         let n = (bias + size).next_multiple_of(4);
         let off = self.snap_used.next_multiple_of(self.ring_align);
         if off + n > seg {
@@ -1656,7 +1907,7 @@ impl Exec {
             return None;
         }
         self.snap_used = off + n;
-        let at = seg * self.cur as u64 + off;
+        let at = off;
         unsafe { std::ptr::copy_nonoverlapping(al as *const u8, ptr.add(at as usize), n as usize) };
         SNAPS.fetch_add(1, Ordering::Relaxed);
         SNAP_COPIED.fetch_add(n, Ordering::Relaxed);
@@ -1666,13 +1917,13 @@ impl Exec {
 
     /// Allocates SGPR data space in the current slot's ring segment.
     fn ring_alloc(&mut self, which: usize, bytes: u64) -> Option<u64> {
-        let seg = RING_BYTES / SLOTS as u64;
+        let seg = RING_SEG;
         let off = self.ring_used[which].next_multiple_of(self.ring_align);
         if off + bytes > seg {
             return None;
         }
         self.ring_used[which] = off + bytes;
-        Some(seg * self.cur as u64 + off)
+        Some(off)
     }
 
     /// Makes room in the recording slot for the SGPR data and descriptors of
@@ -1711,12 +1962,12 @@ impl Exec {
                 }
             }
         }
-        let seg = RING_BYTES / SLOTS as u64;
+        let seg = RING_SEG;
         let fits = self.ring_used.iter().all(|u| u.next_multiple_of(self.ring_align) + ring <= seg)
             && (0..5).all(|k| self.pool_use[k] + need[k] <= POOL_LIMITS[k])
             && (shadow == 0 || self.shadow_used + shadow <= SHADOW_BYTES);
         if !fits {
-            self.submit();
+            self.submit_for("full");
             self.begin();
         }
         for k in 0..5 {
@@ -1730,7 +1981,6 @@ impl Exec {
         let res_info = rdna::translate::res_info_offset(&p.tr.plan) as usize;
         let mut bound = Bound { bufs: Vec::new(), imgs: Vec::new(), img_arrays: Vec::new(), writes: Vec::new(), sized_writes: Vec::new(), images: Vec::new(), shadows: Vec::new(), write_src: Vec::new() };
         let seg = SHADOW_BYTES;
-        let shadow_base = seg * self.cur as u64;
         {
             let mut sh = shared();
             for b in &p.tr.out.bindings {
@@ -1826,7 +2076,7 @@ impl Exec {
                                         (r.bias, r.size) = (lo, hi - lo);
                                         let r = *r;
                                         bound.shadows.push(Shadow { reused: true, ..r });
-                                        info = vk::DescriptorBufferInfo { buffer: self.shadow, offset: r.shadow_off, range };
+                                        info = vk::DescriptorBufferInfo { buffer: self.shadow(), offset: r.shadow_off, range };
                                         SHADOWS_REUSED.fetch_add(1, Ordering::Relaxed);
                                     } else if want && s_off + 2 * span <= seg {
                                         // DS_TRACE_SHADOW=1: each shadowed range once per shader.
@@ -1839,8 +2089,8 @@ impl Exec {
                                             }
                                         }
                                         self.shadow_used = s_off + 2 * span;
-                                        bound.shadows.push(Shadow { host: buffer, guest: base - bias, reused: false, host_off: off, range, shadow_off: shadow_base + s_off, pristine_off: shadow_base + s_off + span, bias, size });
-                                        info = vk::DescriptorBufferInfo { buffer: self.shadow, offset: shadow_base + s_off, range };
+                                        bound.shadows.push(Shadow { host: buffer, guest: base - bias, reused: false, host_off: off, range, shadow_off: s_off, pristine_off: s_off + span, bias, size });
+                                        info = vk::DescriptorBufferInfo { buffer: self.shadow(), offset: s_off, range };
                                         SHADOWED.fetch_add(1, Ordering::Relaxed);
                                     }
                                     if res.written && matches!(p.resources[i], Resolved::Buffer(_)) {
@@ -1927,17 +2177,17 @@ impl Exec {
             4 => super::tune::ring_range().contains(&p.addr),
             _ => false,
         };
-        if vram && self.rings[1].is_none() && !self.vram_ring_failed {
-            match ctx().bar_buffer(RING_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER) {
-                Ok((b, _m, p)) => self.rings[1] = Some((b, p)),
+        if vram && self.slots[self.cur].rings[1].is_none() && !self.vram_ring_failed {
+            match ctx().bar_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER) {
+                Ok((b, _m, p)) => self.slots[self.cur].rings[1] = Some((b, p)),
                 Err(e) => {
                     crate::warn!("gpu[{}]: no SGPR data ring in video memory ({e})", self.name);
                     self.vram_ring_failed = true;
                 }
             }
         }
-        let which = if vram && self.rings[1].is_some() { 1 } else { 0 };
-        let Some((ring, ring_ptr)) = self.rings[which] else { return Err("no SGPR data ring".into()) };
+        let which = if vram && self.slots[self.cur].rings[1].is_some() { 1 } else { 0 };
+        let Some((ring, ring_ptr)) = self.slots[self.cur].rings[which] else { return Err("no SGPR data ring".into()) };
         let off = self.ring_alloc(which, bytes.len() as u64).ok_or("SGPR data ring exhausted")?;
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ring_ptr.add(off as usize), bytes.len()) };
         for b in &p.tr.out.bindings {
@@ -1980,7 +2230,7 @@ impl Exec {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if let Err(e) = self.dispatch_inner(cp, groups, initiator) {
+        if let Err(e) = self.dispatch_inner(cp, groups, initiator, None) {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             self.report(e);
         } else if sync_mode() {
@@ -1992,8 +2242,45 @@ impl Exec {
         }
     }
 
-    fn dispatch_inner(&mut self, cp: &Cp, mut groups: [u32; 3], initiator: u32) -> Result<(), String> {
+    /// An indirect dispatch whose arguments (12 bytes at `args`) GPU work
+    /// still writes, with the GPU reading them (vkCmdDispatchIndirect): the
+    /// command processor would otherwise submit, wait for that work and read
+    /// them itself while the GPU ran dry (~10 times per frame in the passage).
+    /// False: not taken (switch off, thread-dimension sizes, a dispatch base,
+    /// self-checks, or arguments readable now); the caller reads them.
+    pub fn dispatch_gpu_indirect(&mut self, cp: &Cp, args: u64, initiator: u32) -> bool {
+        if DEVICE_LOST.load(Ordering::Relaxed) || !super::tune::gpu_indirect() || initiator & (1 << 5) != 0 || verify::enabled() {
+            return false;
+        }
+        if [0x204, 0x205, 0x206].iter().any(|&r| cp.reg(Space::Sh, r) != 0) {
+            return false;
+        }
+        let r = [(args, 12)];
+        if !(self.overlaps_pending(&r) || INFLIGHT.latest(&r).is_some() || CP_WRITES.latest(&r).is_some()) {
+            return false;
+        }
+        if SKIP_CS.lock().as_ref().is_some_and(|s| s.contains(&cs_addr(cp))) {
+            SKIPPED.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        GPU_INDIRECT.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = self.dispatch_inner(cp, [1, 1, 1], initiator, Some(args)) {
+            SKIPPED.fetch_add(1, Ordering::Relaxed);
+            self.report(e);
+        } else if sync_mode() {
+            self.flush();
+        }
+        true
+    }
+
+    /// `indirect`: the arguments' guest address (the GPU reads the group
+    /// counts; `groups` is unused).
+    fn dispatch_inner(&mut self, cp: &Cp, mut groups: [u32; 3], initiator: u32, indirect: Option<u64>) -> Result<(), String> {
         let t0 = std::time::Instant::now();
+        if let Some(a) = indirect {
+            // A resident shadow holding newer arguments is merged back first.
+            self.flush_resident(Some(&[(a, 12)]))?;
+        }
         let wave64 = initiator & (1 << 15) == 0;
         let mut p = shaders::prepare_compute(cp, wave64)?;
         if self.sync_for_reads(&p.reads) {
@@ -2061,18 +2348,18 @@ impl Exec {
                     // writes, and the merge would store the older value.
                     for sh in &fresh {
                         let r = vk::BufferCopy { src_offset: sh.host_off, dst_offset: sh.pristine_off, size: sh.range };
-                        c.device.cmd_copy_buffer(self.cmd(), sh.host, self.shadow, &[r]);
+                        c.device.cmd_copy_buffer(self.cmd(), sh.host, self.shadow(), &[r]);
                     }
                     let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
                     c.device.cmd_pipeline_barrier(self.cmd(), vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
                     for sh in &fresh {
                         let r = vk::BufferCopy { src_offset: sh.pristine_off, dst_offset: sh.shadow_off, size: sh.range };
-                        c.device.cmd_copy_buffer(self.cmd(), self.shadow, self.shadow, &[r]);
+                        c.device.cmd_copy_buffer(self.cmd(), self.shadow(), self.shadow(), &[r]);
                     }
                 } else {
                     for sh in &fresh {
                         let r = vk::BufferCopy { src_offset: sh.host_off, dst_offset: sh.shadow_off, size: sh.range };
-                        c.device.cmd_copy_buffer(self.cmd(), sh.host, self.shadow, &[r]);
+                        c.device.cmd_copy_buffer(self.cmd(), sh.host, self.shadow(), &[r]);
                     }
                 }
                 let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
@@ -2082,11 +2369,25 @@ impl Exec {
         stamp(1);
         super::vk::checkpoint(self.cmd(), super::vk::mark::DISPATCH, p.addr);
         let start = [cp.reg(Space::Sh, 0x204), cp.reg(Space::Sh, 0x205), cp.reg(Space::Sh, 0x206)];
+        let args = match indirect {
+            Some(a) => {
+                let (buffer, base, _) = shared().span(a, 12).ok_or_else(|| format!("cs {:#x}: indirect arguments {a:#x} are not mapped GPU memory (dispatch skipped)", p.addr))?;
+                if let Some(s) = CP_WRITES.latest(&[(a, 12)]) {
+                    self.submit_after = self.submit_after.max(s);
+                }
+                Some((buffer, a - base))
+            }
+            None => None,
+        };
         unsafe {
             let cmd = self.cmd();
             c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
-            if start != [0, 0, 0] {
+            if let Some((buffer, offset)) = args {
+                // Earlier work of this batch wrote the arguments.
+                global_barrier(cmd);
+                c.device.cmd_dispatch_indirect(cmd, buffer, offset);
+            } else if start != [0, 0, 0] {
                 c.device.cmd_dispatch_base(cmd, start[0], start[1], start[2], groups[0].saturating_sub(start[0]), groups[1].saturating_sub(start[1]), groups[2].saturating_sub(start[2]));
             } else {
                 c.device.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
@@ -2157,7 +2458,7 @@ impl Exec {
                 (t_bind - t_pipe).as_millis()
             );
         }
-        if let Some(mut ch) = verify::check_for(&p, groups, local) {
+        if let Some(mut ch) = verify::check_for(&p, groups, local).filter(|_| indirect.is_none()) {
             // Expected values as recorded, when no GPU work still writes them.
             let src = verify::source_ranges(&ch);
             if !src.is_empty() && !self.overlaps_pending(&src) && INFLIGHT.latest(&src).is_none() && CP_WRITES.latest(&src).is_none() {
@@ -2187,8 +2488,10 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU; {} CP writes by the GPU; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
+        GPU_INDIRECT.load(Ordering::Relaxed),
+        GPU_CP_WRITES.load(Ordering::Relaxed),
         SHADOWED.load(Ordering::Relaxed),
         SHADOW_FULL.load(Ordering::Relaxed),
         SHADOWS_REUSED.load(Ordering::Relaxed),

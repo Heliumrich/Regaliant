@@ -860,7 +860,7 @@ impl<'a> T<'a> {
         let base = e(self.b.bitwise_and(u, None, li, m))?;
         let k32 = self.u(32);
         let upper = e(self.b.i_add(u, None, base, k32))?;
-        let mut load = |tr: &mut Self, idx: Word| -> R<Word> {
+        let load = |tr: &mut Self, idx: Word| -> R<Word> {
             let p = e(tr.b.access_chain(p_wg, None, xf, [idx]))?;
             e(tr.b.load(u, None, p, None, []))
         };
@@ -2182,7 +2182,7 @@ fn emit_dump(tr: &mut T, g: [u32; 3]) -> R<()> {
         let stride = tr.u(DUMP_STRIDE);
         let base = e(tr.b.i_mul(u, None, li, stride))?;
         let z = tr.u(0);
-        let mut put = |tr: &mut T, k: u32, v: Word| -> R<()> {
+        let put = |tr: &mut T, k: u32, v: Word| -> R<()> {
             let kk = tr.u(k);
             let i = e(tr.b.i_add(u, None, base, kk))?;
             let p = e(tr.b.access_chain(tr.t.sb_u32, None, buf, [z, i]))?;

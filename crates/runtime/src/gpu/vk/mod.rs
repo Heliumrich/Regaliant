@@ -59,12 +59,40 @@ unsafe extern "system" fn debug_cb(
     vk::FALSE
 }
 
+/// Vulkan initialization step reached (an init watchdog names it: two boots
+/// hung before initialization logged anything, the queues waiting for it).
+static INIT_STAGE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+const INIT_STAGES: [&str; 6] = ["loading the Vulkan loader", "creating the instance", "enumerating devices", "creating the device", "finishing", "done"];
+
+fn init_stage(k: u8) {
+    INIT_STAGE.store(k, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub fn init() -> Result<(), String> {
     if CTX.get().is_some() {
         return Ok(());
     }
+    // Reports a driver call that does not return (every queue waits for init).
+    let _ = std::thread::Builder::new().name("vk-init-watchdog".into()).spawn(|| {
+        for s in 1..=12 {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            let k = INIT_STAGE.load(std::sync::atomic::Ordering::SeqCst) as usize;
+            if k >= INIT_STAGES.len() - 1 {
+                return;
+            }
+            crate::warn!("Vulkan initialization still {} after {} s", INIT_STAGES[k], 10 * s);
+        }
+    });
+    let r = init_inner();
+    init_stage(INIT_STAGES.len() as u8 - 1);
+    r
+}
+
+fn init_inner() -> Result<(), String> {
     unsafe {
+        init_stage(0);
         let entry = ash::Entry::load().map_err(|e| format!("loading Vulkan: {e}"))?;
+        init_stage(1);
         let app_name = c"dsport";
         let app = vk::ApplicationInfo::default()
             .application_name(app_name)
@@ -85,6 +113,7 @@ pub fn init() -> Result<(), String> {
         }
         let ici = vk::InstanceCreateInfo::default().application_info(&app).enabled_layer_names(&layers).enabled_extension_names(&exts);
         let instance = entry.create_instance(&ici, None).map_err(|e| format!("vkCreateInstance: {e}"))?;
+        init_stage(2);
         if validation {
             let du = ash::ext::debug_utils::Instance::new(&entry, &instance);
             let mci = vk::DebugUtilsMessengerCreateInfoEXT::default()
@@ -234,7 +263,9 @@ pub fn init() -> Result<(), String> {
         if has_stats {
             dci = dci.push_next(&mut stats_f);
         }
+        init_stage(3);
         let device = instance.create_device(pdev, &dci, None).map_err(|e| format!("vkCreateDevice: {e}"))?;
+        init_stage(4);
         crate::info!(
             "Vulkan robustness: robustBufferAccess, robustness2 {} (buffer {}, image {}, null descriptors {})",
             has_robust2,

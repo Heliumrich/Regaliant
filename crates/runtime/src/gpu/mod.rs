@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 11] = [
+    static ALL: [Tunable; 15] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -38,6 +38,10 @@ pub mod tune {
         Tunable { name: "ring_hi", env: "DS_RING_HI", default: u64::MAX >> 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_keep", env: "DS_SHADOW_KEEP", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "block_chain", env: "DS_BLOCK_CHAIN", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "gpu_indirect", env: "DS_GPU_INDIRECT", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "lazy_wait_submit", env: "DS_LAZY_WAIT_SUBMIT", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "gpu_cp_writes", env: "DS_GPU_CP_WRITES", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "slots", env: "DS_GPU_SLOTS", default: 4, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -106,6 +110,35 @@ pub mod tune {
     /// translates shaders anew.
     pub fn block_chain() -> u64 {
         get(10)
+    }
+
+    /// Indirect dispatches whose arguments GPU work still writes read them on
+    /// the GPU (else the command processor waits for that work first).
+    pub fn gpu_indirect() -> bool {
+        get(11) != 0
+    }
+
+    /// A label wait submits the recorded work only when it has to poll (a wait
+    /// that passes at once does not end the batch).
+    pub fn lazy_wait_submit() -> bool {
+        get(12) != 0
+    }
+
+    /// Experimental (off): CP memory writes that follow earlier GPU work
+    /// (WRITE_DATA after a sync event, RELEASE_MEM values) are performed by the
+    /// GPU in order with it instead of by the CPU after the batch completed
+    /// (`Exec::gpu_cp_write`). Their promises are registered only when the
+    /// batch is submitted, so waits pass later (and on the latest value only):
+    /// in the passage it left ~80% of the batch splits (writes behind earlier
+    /// CPU-side effects take the CPU path) and caused more waits over 3 s.
+    pub fn gpu_cp_writes() -> bool {
+        get(13) != 0
+    }
+
+    /// Batch slots a queue cycles through (`exec::MAX_SLOTS` at most): it
+    /// records one batch while the batches of the others execute.
+    pub fn slots() -> u64 {
+        get(14)
     }
 
     /// Sets a switch by name; false if unknown.
@@ -447,12 +480,17 @@ static PROFILE: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::n
 /// kind ("gfx" / "acb"): the share of time a function was on the stack.
 static PROFILE_FN: Mutex<Option<(std::collections::HashMap<(&'static str, String), u64>, std::collections::HashMap<&'static str, u64>)>> = Mutex::new(None);
 
+/// Samples of a queue kind not waiting or sleeping, by the innermost function
+/// of ours on the stack: where command processing spends its CPU time.
+static PROFILE_BUSY: Mutex<Option<std::collections::HashMap<(&'static str, String), u64>>> = Mutex::new(None);
+
 pub fn start_profiler() {
     if std::env::var("DS_PROFILE_GPU").ok().as_deref() != Some("1") {
         return;
     }
     *PROFILE.lock() = Some(std::collections::HashMap::new());
     *PROFILE_FN.lock() = Some(Default::default());
+    *PROFILE_BUSY.lock() = Some(Default::default());
     let _ = crate::thread::spawn_host(
         "gpu-profiler",
         1 << 20,
@@ -472,6 +510,13 @@ pub fn start_profiler() {
                     }
                     let kind = if q.id == GFX { "gfx" } else { "acb" };
                     let mut fns: Vec<&str> = host.split(" <- ").map(|f| f.split("+0x").next().unwrap_or(f)).collect();
+                    let waiting = fns.iter().any(|f| f.contains("Wait") || f.contains("Sleep") || f.contains("DelayExecution") || f.contains("SetTimer") || f.contains("CreateWaitableTimer"));
+                    if !waiting {
+                        let ours = fns.iter().find(|f| f.starts_with("dsport::") || f.starts_with("rdna::")).copied().unwrap_or("(none)");
+                        if let Some(m) = PROFILE_BUSY.lock().as_mut() {
+                            *m.entry((kind, ours.to_string())).or_default() += 1;
+                        }
+                    }
                     fns.sort_unstable();
                     fns.dedup();
                     if let Some((m, n)) = PROFILE_FN.lock().as_mut() {
@@ -494,6 +539,9 @@ pub fn reset_profile() {
     if let Some((m, n)) = PROFILE_FN.lock().as_mut() {
         m.clear();
         n.clear();
+    }
+    if let Some(m) = PROFILE_BUSY.lock().as_mut() {
+        m.clear();
     }
     exec::reset_shader_profile();
     cp::reset_wait_stats();
@@ -527,6 +575,17 @@ fn profile_summary() -> String {
             s.push_str(&format!("    gpu profile {kind}: {total} samples, inclusive share per function:\n"));
             for (f, n) in v.iter().take(top) {
                 s.push_str(&format!("      {:5.1}%  {f}\n", **n as f64 * 100.0 / total as f64));
+            }
+        }
+    }
+    if let Some(m) = PROFILE_BUSY.lock().as_ref() {
+        for kind in ["gfx", "acb"] {
+            let mut v: Vec<(&String, &u64)> = m.iter().filter(|((k, _), _)| *k == kind).map(|((_, f), n)| (f, n)).collect();
+            let busy: u64 = v.iter().map(|x| *x.1).sum();
+            v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            s.push_str(&format!("    gpu profile {kind} busy (not waiting): {busy} samples, by innermost function of ours:\n"));
+            for (f, n) in v.iter().take(30) {
+                s.push_str(&format!("      {:5.1}%  {f}\n", **n as f64 * 100.0 / busy.max(1) as f64));
             }
         }
     }

@@ -23,7 +23,7 @@ static FAILED: AtomicU64 = AtomicU64::new(0);
 static UNCHECKED: AtomicU64 = AtomicU64::new(0);
 static LOGGED: AtomicU64 = AtomicU64::new(0);
 
-fn enabled() -> bool {
+pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("DS_GPU_VERIFY").ok().as_deref() == Some("1"))
 }

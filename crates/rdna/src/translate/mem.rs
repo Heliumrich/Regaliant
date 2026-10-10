@@ -455,7 +455,7 @@ fn interp_per_vertex(tr: &mut T, ins: &Inst, attr: u32, chan: u32) -> R<()> {
         }
     };
     let pf = tr.b.type_pointer(None, StorageClass::Input, f);
-    let mut vert = |tr: &mut T, k: u32| -> R<Word> {
+    let vert = |tr: &mut T, k: u32| -> R<Word> {
         let kk = tr.u(k);
         let kc = tr.u(chan);
         let p = e(tr.b.access_chain(pf, None, var, [kk, kc]))?;
