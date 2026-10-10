@@ -78,17 +78,33 @@ pub(crate) fn program(addr: u64) -> Result<(Arc<Vec<rdna::Inst>>, u64), String> 
     Ok((insts, hash))
 }
 
-/// Guest memory reader that records what it read (hazard checks).
+/// Guest memory reader that records what it read (hazard checks; adjacent
+/// reads merged).
 pub struct Reader {
     pub reads: Vec<(u64, u64)>,
+    /// The mapping of the last read (no memory-map lookup inside it).
+    span: (u64, u64),
 }
 
 impl Reader {
+    pub fn new() -> Reader {
+        Reader { reads: Vec::new(), span: (0, 0) }
+    }
+
     fn u32(&mut self, addr: u64) -> Option<u32> {
-        if addr % 4 != 0 || !super::cp::guest_readable(addr, 4) {
+        if addr % 4 != 0 {
             return None;
         }
-        self.reads.push((addr, 4));
+        if !(addr >= self.span.0 && addr + 4 <= self.span.1) {
+            if !super::cp::guest_readable(addr, 4) {
+                return None;
+            }
+            self.span = crate::mem::mapped_span(addr).unwrap_or((addr, addr + 4));
+        }
+        match self.reads.last_mut() {
+            Some(r) if r.0 + r.1 == addr => r.1 += 4,
+            _ => self.reads.push((addr, 4)),
+        }
         Some(unsafe { std::ptr::read_volatile(addr as *const u32) })
     }
 
@@ -466,7 +482,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
     if !plan.errors.is_empty() {
         return Err(format!("{:?} shader {addr:#x}: {}", spec.stage, plan.errors.join("; ")));
     }
-    let mut rd = Reader { reads: Vec::new() };
+    let mut rd = Reader::new();
     let mut resources = Vec::with_capacity(plan.resources.len());
     let mut res_addrs = Vec::with_capacity(plan.resources.len());
     spec.resources.clear();

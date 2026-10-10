@@ -116,6 +116,12 @@ pub fn mapped(a: u64, len: u64) -> bool {
     true
 }
 
+/// The mapped, readable mapping containing `a` as [start, end), if any.
+pub fn mapped_span(a: u64) -> Option<(u64, u64)> {
+    let st = MEM.lock();
+    st.find(a).filter(|v| v.kind != VmaKind::Reserved && v.prot != 0).map(|v| (v.start, v.end()))
+}
+
 pub static MEM: Mutex<MemState> = Mutex::new(MemState {
     vmas: BTreeMap::new(),
     dmem: BTreeMap::new(),

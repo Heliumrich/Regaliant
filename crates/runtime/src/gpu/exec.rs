@@ -874,6 +874,15 @@ fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64]) {
     }
 }
 
+/// Clears the dispatch timings (`profile reset` control command).
+pub fn reset_shader_profile() {
+    if let Some(m) = SHADER_TIME.lock().as_mut() {
+        m.clear();
+    }
+    GAP_NS.store(0, Ordering::Relaxed);
+    BATCH_NS.store(0, Ordering::Relaxed);
+}
+
 /// Shaders by total GPU time.
 pub fn shader_profile() -> String {
     let g = SHADER_TIME.lock();
@@ -1138,6 +1147,28 @@ impl Exec {
         }
     }
 
+    /// Grows depth images that the textures of `stages` sample with more
+    /// layers than they have (shadow arrays rendered slice by slice; see
+    /// `Images::depth_to_grow`), after the work that used them.
+    pub(crate) fn grow_sampled_depth(&mut self, stages: &[&Prepared]) {
+        for p in stages {
+            for r in &p.resources {
+                let Resolved::Image(t) = r else { continue };
+                let Some(k) = super::images::Images::key_of(t) else { continue };
+                let fam = super::images::Images::depth_family(k.format);
+                if fam.is_empty() || k.layers <= 1 || k.ty3d {
+                    continue;
+                }
+                let Some(old) = super::images::with(|im| im.depth_to_grow(k.base, k.width, k.height, fam, k.layers)) else { continue };
+                self.end_rendering();
+                self.flush();
+                if let Err(e) = super::images::with(|im| im.grow_depth(old, k.layers)) {
+                    self.report(format!("images: growing depth image {:#x}: {e}", k.base));
+                }
+            }
+        }
+    }
+
     /// Reloads images among `keys` whose guest bytes GPU buffer writes or CP
     /// DMA covered since their last use (`Images::note_overwrites`), once the
     /// writers have completed. Runs before a draw or dispatch reserves its
@@ -1191,6 +1222,17 @@ impl Exec {
         self.submit();
         wait_done(self.last_seq);
         self.inflight.clear();
+    }
+
+    /// Completes this queue's recorded and in-flight work when any of it
+    /// writes into `reads` (memory the CP reads now: indirect arguments,
+    /// draw counts); returns whether it waited.
+    pub fn flush_if_writes(&mut self, reads: &[(u64, u64)]) -> bool {
+        if !self.overlaps_pending(reads) {
+            return false;
+        }
+        self.flush();
+        true
     }
 
     /// Whether GPU work is recorded or not yet completed.
@@ -1519,6 +1561,7 @@ impl Exec {
         }
         let t_prep = t0.elapsed();
         trace_loads(&self.name, &p, groups);
+        self.grow_sampled_depth(&[&p]);
         let keys = image_keys(&p);
         self.resolve_fast_clears(&keys);
         self.resolve_overwrites(&keys);

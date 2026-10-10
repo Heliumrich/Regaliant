@@ -13,7 +13,7 @@
 //! decoded and counted but not rendered yet.
 
 use crate::hle::libs::agc_cmd::{DS_MAGIC, op, pop};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -299,6 +299,27 @@ fn note_block(queue: &str, addr: u64, bytes: u64, at: u64) {
     }
 }
 
+/// Blocking label waits per (waiting queue, queue that last wrote the
+/// label): count and nanoseconds (`profile report`).
+static WAIT_STATS: parking_lot::Mutex<Option<HashMap<(String, String), (u64, u64)>>> = parking_lot::Mutex::new(None);
+
+pub fn reset_wait_stats() {
+    *WAIT_STATS.lock() = None;
+}
+
+/// Blocking label waits by waiter and writer, longest total first.
+pub fn wait_stats() -> String {
+    let g = WAIT_STATS.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(&(String, String), &(u64, u64))> = m.iter().collect();
+    v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    let mut s = String::from("    label waits (waiter <- last writer: count, total ms, mean us):\n");
+    for ((w, by), (n, ns)) in v.iter().take(24) {
+        s.push_str(&format!("      {w} <- {by}: {n}, {} ms, {} us\n", ns / 1_000_000, ns / 1000 / (*n).max(1)));
+    }
+    s
+}
+
 fn last_write(addr: u64) -> Option<(String, u64, u64)> {
     LAST_WRITE.lock().as_ref()?.get(&(addr & !7)).cloned()
 }
@@ -372,6 +393,19 @@ impl Cp {
                     self.fence_pending = false;
                 }
                 f()
+            }
+        }
+    }
+
+    /// Makes memory the CP reads now current: completes this queue's GPU
+    /// work (and deferred CP writes) that writes into `reads`. Indirect
+    /// arguments are typically written by a culling dispatch shortly before;
+    /// the draws after the first then find nothing pending.
+    fn sync_reads(&mut self, reads: &[(u64, u64)]) {
+        if let Some(e) = self.exec.as_mut() {
+            if e.flush_if_writes(reads) {
+                let k = (self.cur_opcode as usize).min(255);
+                SYNC_BY_OPCODE[k].fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -460,17 +494,22 @@ impl Cp {
     /// its base vertex, start instance and draw index in the user SGPRs the
     /// packet names. Returns the outcome summary.
     fn draw_indirect_multi(&mut self, indexed: bool, p: &dyn Fn(u64) -> u32) -> String {
-        // Arguments and counts may have been written by earlier GPU work.
-        self.sync();
         let (vtx_loc, inst_loc, id_loc) = (p(1) & 0xFFFF, p(2) & 0xFFFF, p(3) & 0xFFFF);
         let id_enable = p(3) & (1 << 31) != 0;
         let mut count = p(4);
         if p(3) & (1 << 30) != 0 {
+            // The count may have been written by earlier GPU work.
             let ca = addr64(p(5), p(6));
+            self.sync_reads(&[(ca, 4)]);
             count = if valid(ca, 4) { count.min(unsafe { rd32(ca) }) } else { 0 };
         }
         let rec = if indexed { 20 } else { 16 };
         let stride = if p(7) != 0 { p(7) as u64 } else { rec };
+        // So may the arguments.
+        if count > 0 {
+            let first = self.draw_indirect_base + p(0) as u64;
+            self.sync_reads(&[(first, (count.min(1 << 16) as u64 - 1) * stride + rec)]);
+        }
         let size = if indexed { self.index_size() } else { Some(0) };
         let Some(sz) = size else {
             self.note("draws with 8-bit indices are not rendered yet");
@@ -765,8 +804,8 @@ impl Cp {
                     op::DRAW_INDEX_OFFSET_2 => self.index_size().map(|sz| super::exec::DrawArgs { count: p(2), instances, index: Some((self.index_base + p(1) as u64 * sz as u64, sz)), base_vertex: None, first_instance: 0 }),
                     op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT => {
                         // Arguments may have been written by earlier GPU work.
-                        self.sync();
                         let a = self.draw_indirect_base + p(0) as u64;
+                        self.sync_reads(&[(a, if opcode == op::DRAW_INDEX_INDIRECT { 20 } else { 16 })]);
                         // The CP hands the base vertex and start instance to the
                         // shader through the user SGPRs the packet names
                         // (BASE_VTX_LOC [15:0], START_INST_LOC [31:16]: SH
@@ -888,13 +927,19 @@ impl Cp {
                     }
                 } else {
                     // Arguments may have been written by earlier GPU work.
-                    self.sync();
                     let a = self.dispatch_indirect_base + p(0) as u64;
+                    self.sync_reads(&[(a, 12)]);
                     if valid(a, 12) {
                         let g = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8)] };
                         indirect_groups = Some(g);
-                        // DS_EMU_CHECK (earlier work has completed).
-                        let check = if super::exec::enabled() && super::emucheck::wanted(self) { super::emucheck::prepare(self, g, p(1)) } else { None };
+                        // DS_EMU_CHECK: interpret a sample of the groups first
+                        // (after the earlier work has completed).
+                        let check = if super::exec::enabled() && super::emucheck::wanted(self) {
+                            self.sync();
+                            super::emucheck::prepare(self, g, p(1))
+                        } else {
+                            None
+                        };
                         self.dispatch(g, p(1));
                         if let Some(c) = check {
                             self.sync();
@@ -1266,7 +1311,15 @@ impl Cp {
         }
         let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         ACTIVE_WAITS.lock().push(ActiveWait { addr: a, wide, func, mask, reference, hit: hit.clone() });
+        let t0 = Instant::now();
         let r = self.poll_until(at, &what, || hit.load(Ordering::SeqCst) || compare(func, read() & mask, reference & mask));
+        {
+            let by = last_write(a).map(|w| w.0).unwrap_or_else(|| "cpu".into());
+            let mut g = WAIT_STATS.lock();
+            let e = g.get_or_insert_with(HashMap::new).entry((self.name.clone(), by)).or_default();
+            e.0 += 1;
+            e.1 += t0.elapsed().as_nanos() as u64;
+        }
         ACTIVE_WAITS.lock().retain(|w| !std::sync::Arc::ptr_eq(&w.hit, &hit));
         if let Some(f) = self.wait_flag {
             f.store(false, Ordering::SeqCst);

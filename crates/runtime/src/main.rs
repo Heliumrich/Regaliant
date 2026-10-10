@@ -294,6 +294,21 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 exception::text_reset();
                 Ok(())
             }
+            "profile" => {
+                // `profile reset` restarts the DS_PROFILE_GPU sampling and
+                // dispatch timings; `profile report` logs them.
+                match parts.next() {
+                    Some("reset") => {
+                        gpu::reset_profile();
+                        Ok(())
+                    }
+                    Some("report") => {
+                        info!("profile at flip {flip}:\n{}", gpu::profile_report());
+                        Ok(())
+                    }
+                    _ => Err("usage: profile reset|report".into()),
+                }
+            }
             "stacks" => {
                 info!("guest thread stacks:\n{}", thread_summary_ex(true));
                 Ok(())
@@ -343,6 +358,30 @@ fn poll_control(path: &Path, offset: &mut u64) {
                         }
                     }
                     _ => Err("usage: mem <hex address> <hex length up to 0x10000000>".into()),
+                }
+            }
+            "imgstat" => {
+                // Diagnosis: `imgstat <hex address>` logs value statistics of
+                // the cached images at that guest address.
+                match parts.next().and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()) {
+                    Some(a) => {
+                        let lines = gpu::images::with(|im| im.stats_at(a));
+                        info!("control: imgstat {a:#x}: {} image(s)\n    {}", lines.len(), lines.join("\n    "));
+                        Ok(())
+                    }
+                    None => Err("usage: imgstat <hex address>".into()),
+                }
+            }
+            "clearimg" => {
+                // Diagnosis: `clearimg <hex address>` zero-fills the cached
+                // images at that guest address.
+                match parts.next().and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()) {
+                    Some(a) => {
+                        let n = gpu::images::with(|im| im.clear_at(a));
+                        info!("control: cleared {n} image(s) at {a:#x}");
+                        Ok(())
+                    }
+                    None => Err("usage: clearimg <hex address>".into()),
                 }
             }
             "vmas" => {

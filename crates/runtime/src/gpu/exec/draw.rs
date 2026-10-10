@@ -530,6 +530,16 @@ impl Exec {
         let s_write = s_test && (refm | refm_bf) & 0x00FF_0000 != 0 && sctl & 0xFF_FFFF != 0;
         let clear_z = has_z && db_render & 1 != 0;
         let clear_s = has_s && db_render & 2 != 0;
+        if z_test || s_test || clear_z || clear_s {
+            // A view of a later slice than the depth image has: grow it
+            // (after the work that used it) instead of a separate image.
+            let s = dsurf.as_ref().unwrap();
+            if let Some(old) = images::with(|im| im.depth_to_grow(s.base, s.width, s.height, images::Images::depth_family(s.format), s.layers)) {
+                self.end_rendering();
+                self.flush();
+                images::with(|im| im.grow_depth(old, s.layers))?;
+            }
+        }
         let depth = if z_test || s_test || clear_z || clear_s { Some(images::with(|im| im.target(dsurf.as_ref().unwrap()))?) } else { None };
         let mem_writes = vs.tr.plan.resources.iter().any(|r| r.written) || ps.as_ref().is_some_and(|p| p.tr.plan.resources.iter().any(|r| r.written));
         if colors.iter().all(Option::is_none) && !z_write && !s_write && !clear_z && !clear_s && !mem_writes {
@@ -580,6 +590,11 @@ impl Exec {
                 r
             }
         };
+        // Depth arrays sampled with more layers than rendered so far.
+        match &ps {
+            Some(p) => self.grow_sampled_depth(&[&vs, p]),
+            None => self.grow_sampled_depth(&[&vs]),
+        }
         // Fast clears (metadata writes) of the attachments and textures.
         let mut used: Vec<images::ImageKey> = colors.iter().flatten().chain(depth.iter()).map(|t| t.key).collect();
         used.extend(image_keys(&vs));

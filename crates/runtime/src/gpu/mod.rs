@@ -331,11 +331,16 @@ pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
 /// frequent host stacks (top 3 frames) are listed in hang reports.
 static PROFILE: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(None);
 
+/// Inclusive samples per (queue kind, host function) and samples per queue
+/// kind ("gfx" / "acb"): the share of time a function was on the stack.
+static PROFILE_FN: Mutex<Option<(std::collections::HashMap<(&'static str, String), u64>, std::collections::HashMap<&'static str, u64>)>> = Mutex::new(None);
+
 pub fn start_profiler() {
     if std::env::var("DS_PROFILE_GPU").ok().as_deref() != Some("1") {
         return;
     }
     *PROFILE.lock() = Some(std::collections::HashMap::new());
+    *PROFILE_FN.lock() = Some(Default::default());
     let _ = crate::thread::spawn_host(
         "gpu-profiler",
         1 << 20,
@@ -353,10 +358,41 @@ pub fn start_profiler() {
                     if let Some(m) = PROFILE.lock().as_mut() {
                         *m.entry(k).or_default() += 1;
                     }
+                    let kind = if q.id == GFX { "gfx" } else { "acb" };
+                    let mut fns: Vec<&str> = host.split(" <- ").map(|f| f.split("+0x").next().unwrap_or(f)).collect();
+                    fns.sort_unstable();
+                    fns.dedup();
+                    if let Some((m, n)) = PROFILE_FN.lock().as_mut() {
+                        *n.entry(kind).or_default() += 1;
+                        for f in fns {
+                            *m.entry((kind, f.to_string())).or_default() += 1;
+                        }
+                    }
                 }
             }
         }),
     );
+}
+
+/// Clears the samples and dispatch timings (`profile reset` control command).
+pub fn reset_profile() {
+    if let Some(m) = PROFILE.lock().as_mut() {
+        m.clear();
+    }
+    if let Some((m, n)) = PROFILE_FN.lock().as_mut() {
+        m.clear();
+        n.clear();
+    }
+    exec::reset_shader_profile();
+    cp::reset_wait_stats();
+}
+
+/// The profile so far (`profile report` control command).
+pub fn profile_report() -> String {
+    let mut s = profile_summary();
+    s.push_str(&exec::shader_profile());
+    s.push_str(&cp::wait_stats());
+    s
 }
 
 fn profile_summary() -> String {
@@ -367,6 +403,20 @@ fn profile_summary() -> String {
     let mut s = String::from("    gpu profile (10 ms samples):\n");
     for (k, n) in v.iter().take(20) {
         s.push_str(&format!("      {n:6}  {k}\n"));
+    }
+    drop(g);
+    // Inclusive time per function of our crate (and the waits), per queue kind.
+    if let Some((m, totals)) = PROFILE_FN.lock().as_ref() {
+        let top = std::env::var("DS_PROFILE_FN_TOP").ok().and_then(|x| x.parse().ok()).unwrap_or(40);
+        for kind in ["gfx", "acb"] {
+            let total = totals.get(kind).copied().unwrap_or(0).max(1);
+            let mut v: Vec<(&String, &u64)> = m.iter().filter(|((k, f), _)| *k == kind && (f.starts_with("dsport::") || f.contains("Wait") || f.contains("Sleep") || f.contains("Submit"))).map(|((_, f), n)| (f, n)).collect();
+            v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            s.push_str(&format!("    gpu profile {kind}: {total} samples, inclusive share per function:\n"));
+            for (f, n) in v.iter().take(top) {
+                s.push_str(&format!("      {:5.1}%  {f}\n", **n as f64 * 100.0 / total as f64));
+            }
+        }
     }
     s
 }

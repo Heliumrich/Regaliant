@@ -200,7 +200,8 @@ pub fn half_to_f32(h: u16) -> f32 {
     let m = (h & 0x3FF) as f32;
     s * match e {
         0 => m * 2f32.powi(-24),
-        31 => f32::INFINITY,
+        31 if m == 0.0 => f32::INFINITY,
+        31 => f32::NAN,
         _ => (1.0 + m / 1024.0) * 2f32.powi(e - 15),
     }
 }
@@ -502,6 +503,11 @@ pub struct Images {
     partial_seen: std::collections::HashSet<u64>,
     /// Zero images for unused image table entries, by view type.
     dummies: HashMap<vk::ImageViewType, vk::ImageView>,
+    /// Images replaced by larger ones (`grow_depth`); kept alive, since
+    /// descriptor sets of earlier batches may still name them.
+    retired: Vec<vk::Image>,
+    /// Depth images grown (status line).
+    pub depth_grows: u64,
 }
 
 unsafe impl Send for Images {}
@@ -520,7 +526,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
                 .expect("image pool");
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
-            *g = Some(Images { map: HashMap::new(), gpu_bases: Default::default(), stencil_of: HashMap::new(), meta_of: HashMap::new(), pending_clears: HashMap::new(), samplers: HashMap::new(), pool, cmd, fence, reported: HashMap::new(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::new() });
+            *g = Some(Images { map: HashMap::new(), gpu_bases: Default::default(), stencil_of: HashMap::new(), meta_of: HashMap::new(), pending_clears: HashMap::new(), samplers: HashMap::new(), pool, cmd, fence, reported: HashMap::new(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::new(), retired: Vec::new(), depth_grows: 0 });
         }
     }
     f(g.as_mut().unwrap())
@@ -609,6 +615,82 @@ impl Images {
             c.device.reset_fences(&[self.fence]).ok();
             c.device.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty()).ok();
         }
+    }
+
+    /// Value statistics of every cached image at guest address `base` (mip
+    /// 0, all layers or slices; float formats), with the largest magnitude
+    /// of the first channel per layer/slice (diagnosis: `imgstat`).
+    pub fn stats_at(&mut self, base: u64) -> Vec<String> {
+        let imgs: Vec<(vk::Image, ImageKey)> = self.map.values().filter(|i| i.key.base == base).map(|i| (i.image, i.key)).collect();
+        let mut out = Vec::new();
+        for (image, k) in imgs {
+            let bpp = texel_bytes(k.format) as u64;
+            let half = matches!(k.format, vk::Format::R16G16B16A16_SFLOAT | vk::Format::R16G16_SFLOAT | vk::Format::R16_SFLOAT);
+            let full = matches!(k.format, vk::Format::R32G32B32A32_SFLOAT | vk::Format::R32G32_SFLOAT | vk::Format::R32_SFLOAT);
+            if bpp == 0 || !(half || full) {
+                out.push(format!("{base:#x} {}x{}x{} {:?}: not a float format", k.width, k.height, k.layers, k.format));
+                continue;
+            }
+            let (layers, depth) = if k.ty3d { (1, k.layers) } else { (k.layers, 1) };
+            let slice = bpp * k.width as u64 * k.height as u64;
+            let size = slice * (layers * depth) as u64;
+            let c = ctx();
+            let Ok((buf, mem, ptr)) = c.host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST) else {
+                out.push(format!("{base:#x}: no staging buffer"));
+                continue;
+            };
+            self.one_shot(|cmd| unsafe {
+                let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: layers })
+                    .image_extent(vk::Extent3D { width: k.width, height: k.height, depth });
+                c.device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::GENERAL, buf, &[region]);
+                let hb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+                c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[hb], &[], &[]);
+            });
+            let raw = unsafe { std::slice::from_raw_parts(ptr, size as usize).to_vec() };
+            unsafe {
+                c.device.destroy_buffer(buf, None);
+                c.device.unmap_memory(mem);
+                c.device.free_memory(mem, None);
+            }
+            let st = float_stats(k.format, &raw).unwrap_or_default();
+            let maxima: Vec<String> = raw
+                .chunks(slice as usize)
+                .map(|s| {
+                    let m = s
+                        .chunks_exact(bpp as usize)
+                        .map(|t| if half { half_to_f32(u16::from_le_bytes([t[0], t[1]])) } else { f32::from_le_bytes([t[0], t[1], t[2], t[3]]) })
+                        .fold(0f32, |m, v| if v.is_nan() { f32::NAN } else { m.max(v.abs()) });
+                    format!("{m:.3}")
+                })
+                .collect();
+            out.push(format!("{base:#x} {}x{}x{} {:?}: {st}; first-channel max per {}: {}", k.width, k.height, k.layers, k.format, if k.ty3d { "slice" } else { "layer" }, maxima.join(" ")));
+        }
+        out
+    }
+
+    /// Zero-fills every cached image at guest address `base` (diagnosis:
+    /// `clearimg` control command); returns how many.
+    pub fn clear_at(&mut self, base: u64) -> usize {
+        let images: Vec<(vk::Image, vk::Format)> = self.map.values().filter(|i| i.key.base == base).map(|i| (i.image, i.key.format)).collect();
+        for &(image, format) in &images {
+            self.one_shot(|cmd| unsafe {
+                let range = vk::ImageSubresourceRange { aspect_mask: aspects(format), base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS };
+                let d = &ctx().device;
+                let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+                d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+                if is_depth(format) {
+                    d.cmd_clear_depth_stencil_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearDepthStencilValue { depth: 0.0, stencil: 0 }, &[range]);
+                } else if !is_compressed(format) {
+                    d.cmd_clear_color_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearColorValue::default(), &[range]);
+                }
+                let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+                d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            });
+        }
+        images.len()
     }
 
     /// Moves a new image to GENERAL and zero-fills it (depth: 0, stencil: 0).
@@ -814,6 +896,75 @@ impl Images {
             _ => 1,
         };
         Some(ImageKey { base: t.base, format, width: t.width, height: t.height, layers, levels, ty3d, cube })
+    }
+
+    /// The depth image at `base` (size, format family, mips) with the most
+    /// layers, when it has fewer than `layers` and none has enough. Depth
+    /// views name only their slice range (DB_DEPTH_VIEW), so a shadow array
+    /// rendered slice by slice, or sampled whole, makes its image grow
+    /// (`grow_depth`) instead of splitting into one image per view.
+    pub fn depth_to_grow(&self, base: u64, width: u32, height: u32, depths: &[vk::Format], layers: u32) -> Option<ImageKey> {
+        let same = |k: &ImageKey| k.base == base && k.width == width && k.height == height && !k.ty3d && depths.contains(&k.format);
+        if self.map.keys().any(|k| same(k) && k.layers >= layers) {
+            return None;
+        }
+        self.map.iter().filter(|(k, i)| i.gpu_written && same(k) && k.layers < layers).map(|(k, _)| *k).max_by_key(|k| k.layers)
+    }
+
+    /// Depth formats a sampled texture of `format` can read (R32 float over
+    /// D32, R16 unorm over D16), or a depth surface's own format.
+    pub fn depth_family(format: vk::Format) -> &'static [vk::Format] {
+        use vk::Format as F;
+        match format {
+            F::R32_SFLOAT | F::D32_SFLOAT | F::D32_SFLOAT_S8_UINT => &[F::D32_SFLOAT, F::D32_SFLOAT_S8_UINT],
+            F::R16_UNORM | F::D16_UNORM | F::D16_UNORM_S8_UINT => &[F::D16_UNORM, F::D16_UNORM_S8_UINT],
+            _ => &[],
+        }
+    }
+
+    /// Replaces depth image `old` by one with `layers` layers that holds its
+    /// contents (layers above stay cleared). The caller has completed the
+    /// work that used `old`.
+    pub fn grow_depth(&mut self, old: ImageKey, layers: u32) -> Result<ImageKey, String> {
+        let new_key = ImageKey { layers, ..old };
+        let image = self.create(new_key)?;
+        self.to_general(image, new_key.format);
+        let Some(prev) = self.map.remove(&old) else { return Err("grow_depth: image gone".into()) };
+        let aspect = aspects(old.format);
+        self.one_shot(|cmd| unsafe {
+            let d = &ctx().device;
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            let regions: Vec<vk::ImageCopy> = (0..old.levels)
+                .map(|m| {
+                    let sub = vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: m, base_array_layer: 0, layer_count: old.layers };
+                    vk::ImageCopy { src_subresource: sub, src_offset: vk::Offset3D::default(), dst_subresource: sub, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: (old.width >> m).max(1), height: (old.height >> m).max(1), depth: 1 } }
+                })
+                .collect();
+            d.cmd_copy_image(cmd, prev.image, vk::ImageLayout::GENERAL, image, vk::ImageLayout::GENERAL, &regions);
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        });
+        self.map.insert(new_key, Image { image, key: new_key, views: HashMap::new(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: prev.write_gen, block_gen: 0, span: 0, layout: None, overwritten: false });
+        for v in self.stencil_of.values_mut() {
+            if *v == old {
+                *v = new_key;
+            }
+        }
+        for v in self.meta_of.values_mut() {
+            if v.0 == old {
+                v.0 = new_key;
+            }
+        }
+        if let Some(n) = self.pending_clears.remove(&old) {
+            self.pending_clears.insert(new_key, n);
+        }
+        self.retired.push(prev.image);
+        self.depth_grows += 1;
+        if self.depth_grows <= 16 {
+            crate::info!("images: depth image {:#x} {}x{} {:?} grown from {} to {} layers", old.base, old.width, old.height, old.format, old.layers, layers);
+        }
+        Ok(new_key)
     }
 
     /// A rendered depth surface a texture of `key` reads (sampling only):
