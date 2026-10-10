@@ -503,6 +503,29 @@ pub fn draw(cp: &Cp, what: &str) {
             ctx(0x28C90 + 0x3C * i)
         );
     }
+    // Depth state: DB_DEPTH_CONTROL (stencil, z test, z write, zfunc), the
+    // depth clear value, PA_SU_SC_MODE_CNTL polygon offset enables and the
+    // PA_SU_POLY_OFFSET registers (DB_FMT_CNTL, clamp, front/back scale and
+    // offset).
+    let f = |a: u32| f32::from_bits(ctx(a));
+    let dctl = ctx(0x28800);
+    let _ = writeln!(
+        s,
+        "    depth control {dctl:#x} (z test {} write {} func {}, stencil {}), clear {}, poly offset {}{} fmt {:#x} clamp {} front {} x16 + {} back {} x16 + {}",
+        (dctl >> 1) & 1,
+        (dctl >> 2) & 1,
+        (dctl >> 4) & 7,
+        dctl & 1,
+        f(0x2802C),
+        if ctx(0x28814) & (1 << 11) != 0 { "front" } else { "" },
+        if ctx(0x28814) & (1 << 12) != 0 { " back" } else { "" },
+        ctx(0x28B78),
+        f(0x28B7C),
+        f(0x28B80),
+        f(0x28B84),
+        f(0x28B88),
+        f(0x28B8C)
+    );
     for (name, r) in [("es", super::shaders::prepare_ngg(cp)), ("ps", super::shaders::prepare_ps(cp))] {
         match r {
             Ok(p) => {
