@@ -235,12 +235,18 @@ pub fn set_dispatch_dumps(on: bool) {
     DISPATCH_DUMPS.store(on, Ordering::Relaxed);
 }
 
-/// Compute shader whose bound buffers a capture with dispatch dumps writes
-/// to dispatches/ after each of its dispatches (`capture buffers=<shader>`).
-static BUFFER_DUMPS: Mutex<Option<u64>> = Mutex::new(None);
+/// Compute shaders whose bound buffers a capture with dispatch dumps writes
+/// to dispatches/ after each of their dispatches (`capture buffers=<shader>[,..]`;
+/// buffers up to 64 MiB for one shader, 4 MiB each for several).
+static BUFFER_DUMPS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
-pub fn set_buffer_dumps(cs: Option<u64>) {
+pub fn set_buffer_dumps(cs: Vec<u64>) {
     *BUFFER_DUMPS.lock() = cs;
+}
+
+fn buffer_dump_limit(cs: u64) -> Option<u64> {
+    let g = BUFFER_DUMPS.lock();
+    g.contains(&cs).then(|| if g.len() > 1 { 4 << 20 } else { 64 << 20 })
 }
 
 /// Per-draw report range set by the `capture <from>-<to>` control command
@@ -678,12 +684,12 @@ pub fn dispatch(cp: &Cp, what: &str) {
                 let _ = writeln!(s, "      {l}");
             }
             note_textures(&mut c.textures, &p);
-            if dumps && *BUFFER_DUMPS.lock() == Some(p.addr) {
+            if let Some(limit) = buffer_dump_limit(p.addr).filter(|_| dumps) {
                 // The buffers as the completed dispatch left them.
                 let dir = crate::run_dir().map(|d| d.join("dispatches"));
                 for (i, r) in p.resources.iter().enumerate() {
                     let (super::shaders::Resolved::Buffer(v), Some(dir)) = (r, &dir) else { continue };
-                    let Some(n) = v.byte_size().filter(|&n| n > 0 && n <= 64 << 20) else { continue };
+                    let Some(n) = v.byte_size().filter(|&n| n > 0 && n <= limit) else { continue };
                     if !super::cp::guest_readable(v.base, n) {
                         continue;
                     }
@@ -704,7 +710,7 @@ pub fn dispatch(cp: &Cp, what: &str) {
                     let Some(dir) = crate::run_dir().map(|d| d.join("dispatches")) else { continue };
                     let _ = std::fs::create_dir_all(&dir);
                     let name = format!("{}_{:04}_{:010x}_{:010x}.png", c.flip, c.events, p.addr, t.base);
-                    if *BUFFER_DUMPS.lock() == Some(p.addr) {
+                    if buffer_dump_limit(p.addr).is_some() {
                         // Raw texels as well (mip 0, layer 0; e.g. probed values).
                         if let Ok((raw, w, h, texel)) = super::images::with(|im| im.snapshot_raw(t)) {
                             let _ = std::fs::write(dir.join(name.replace(".png", &format!("_{w}x{h}x{texel}.raw"))), raw);
