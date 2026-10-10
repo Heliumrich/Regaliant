@@ -9,7 +9,8 @@
 //! register clobbered on one branch does not affect the others.
 
 use crate::{Enc, Inst};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
+use crate::HashMap;
 
 /// Source of a 64-bit pointer used by scalar loads.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

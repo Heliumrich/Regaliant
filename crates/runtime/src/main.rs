@@ -487,6 +487,7 @@ pub fn fatal_exit(code: u32, reason: &str) -> ! {
 
 pub fn shutdown(code: i32) -> ! {
     gpu::shutdown();
+    gpu::pcache::save();
     info!("shutdown with status {code}\n{}", thread_summary());
     crate::log::flush();
     unsafe {
@@ -588,6 +589,7 @@ fn main() {
     hle::kernel::fs::ensure_dir(&rt.join("devlog").join("logs"));
     hle::kernel::fs::mount("/devlog/app", vec![rt.join("devlog")], true);
     hle::libs::savedata::init(cfg.root.join("local-data").join("saves"));
+    gpu::pcache::set_path(cfg.root.join("local-data").join("pipeline-cache.bin"));
 
     // Modules: the decrypted executable and the title's own libraries.
     let t0 = Instant::now();

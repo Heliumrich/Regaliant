@@ -16,7 +16,7 @@
 
 use crate::uniform::Cfg;
 use crate::{bits, Enc, Ext, Inst, OP_EXECZ, OP_EXEC_LO, OP_NULL, OP_SCC, OP_VCCZ, OP_VCC_LO, OP_VGPR0};
-use std::collections::HashSet;
+use crate::HashSet;
 
 /// SGPRs 0..127 and SCC.
 const SCC: usize = 128;
@@ -330,7 +330,7 @@ fn step(l: &mut Live, fx: &Fx) {
 /// Pcs of the VALU mask writes (compares, v_cmpx, carry-outs) whose result
 /// must be the complete wave mask.
 pub fn complete_masks(code: &[Inst], wave64: bool) -> HashSet<u32> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     if code.is_empty() {
         return out;
     }

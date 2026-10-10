@@ -40,7 +40,8 @@ use crate::{Enc, Inst};
 use rspirv::binary::Assemble;
 use rspirv::dr::{Builder, Operand};
 use rspirv::spirv::{self, BuiltIn, Capability, Decoration, ExecutionMode, ExecutionModel, StorageClass, Word};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use crate::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Stage {
@@ -368,7 +369,7 @@ pub(crate) struct T<'a> {
     /// Wave-mask mode (see the module documentation).
     pub wave_masks: bool,
     /// Wave-mask mode: pcs of the mask writes that produce complete masks.
-    pub complete: std::collections::HashSet<u32>,
+    pub complete: crate::HashSet<u32>,
     /// Wave-mask mode: whether this lane's bit lies in the high dword of a
     /// mask, and its position in that dword.
     pub own_bit: Option<(Word, Word)>,
@@ -1085,7 +1086,7 @@ fn atomic_result_reads(code: &[Inst]) -> BTreeSet<u32> {
 /// Returns compare pc -> index of the source operand holding vL.
 fn lane0_elections(code: &[Inst], spec: &Spec) -> HashMap<u32, usize> {
     use crate::{OP_EXEC_LO, OP_VCC_LO, OP_VGPR0};
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     let wave = if spec.wave64 { 64 } else { 32 };
     let [sx, sy, sz] = spec.cs_local_size.map(|x| x.max(1));
     if spec.stage != Stage::Compute || sx * sy * sz != wave {
@@ -1345,26 +1346,26 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         sgpr: 0,
         vgpr: 0,
         scc: 0,
-        consts: HashMap::new(),
+        consts: HashMap::default(),
         interface: Vec::new(),
         sgpr_data: 0,
         load_offsets: load_offsets(plan),
         res_info: res_info_offset(plan),
-        buffers: HashMap::new(),
-        images: HashMap::new(),
-        samplers: HashMap::new(),
+        buffers: HashMap::default(),
+        images: HashMap::default(),
+        samplers: HashMap::default(),
         sampler_ty,
         bindings: Vec::new(),
         next_binding: 0,
         out_pos: None,
-        out_params: HashMap::new(),
+        out_params: HashMap::default(),
         compare_samplers: BTreeSet::new(),
         plain_samplers: BTreeSet::new(),
-        out_mrt: HashMap::new(),
+        out_mrt: HashMap::default(),
         out_depth: None,
-        in_attrs: HashMap::new(),
+        in_attrs: HashMap::default(),
         per_vertex_attrs: if spec.barycentric && spec.stage == Stage::Fragment { per_vertex_attrs(code) } else { BTreeSet::new() },
-        per_vertex_in: HashMap::new(),
+        per_vertex_in: HashMap::default(),
         bary: None,
         frag_coord: None,
         lds: None,
@@ -1379,12 +1380,12 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         vote_ctr: None,
         lds_state: 0,
         sg_lane_var: None,
-        lane_slots: HashMap::new(),
-        image_tables: HashMap::new(),
-        table_offsets: HashMap::new(),
+        lane_slots: HashMap::default(),
+        image_tables: HashMap::default(),
+        table_offsets: HashMap::default(),
         // In wave-mask mode lane reads and elections are exact.
         own_lane_reads: if wave_masks { BTreeSet::new() } else { atomic_result_reads(code) },
-        elections: if wave_masks { HashMap::new() } else { lane0_elections(code, spec) },
+        elections: if wave_masks { HashMap::default() } else { lane0_elections(code, spec) },
         wave_masks,
         complete: if wave_masks { crate::wavemask::complete_masks(code, spec.wave64) } else { Default::default() },
         own_bit: None,
@@ -1399,9 +1400,9 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         wg_id: None,
         vertex_ids: None,
         sb_struct: None,
-        buffer_binding: HashMap::new(),
-        buffer_views: HashMap::new(),
-        view_structs: HashMap::new(),
+        buffer_binding: HashMap::default(),
+        buffer_views: HashMap::default(),
+        view_structs: HashMap::default(),
     };
     let mut elected: Vec<u32> = tr.elections.keys().copied().collect();
     elected.sort();

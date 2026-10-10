@@ -15,7 +15,7 @@
 
 use crate::format::{self, Num};
 use crate::{bits, Enc, Ext, Inst};
-use std::collections::HashMap;
+use crate::HashMap;
 
 /// Memory, image and logging services for an emulated workgroup.
 pub trait Env {

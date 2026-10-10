@@ -13,7 +13,7 @@
 //! hardware, and the translator makes v_readlane exact in uniform blocks).
 
 use crate::{Enc, Inst};
-use std::collections::{HashMap, HashSet};
+use crate::{HashMap, HashSet};
 
 /// Basic blocks of a program: per instruction its block, and per block
 /// whether it is uniform.
@@ -272,8 +272,8 @@ impl Cfg {
 }
 
 pub fn analyze(code: &[Inst]) -> Uniformity {
-    let mut block_of = HashMap::new();
-    let mut divergent_branches = HashSet::new();
+    let mut block_of = HashMap::default();
+    let mut divergent_branches = HashSet::default();
     if code.is_empty() {
         return Uniformity { block_of, uniform: Vec::new(), divergent_branches };
     }

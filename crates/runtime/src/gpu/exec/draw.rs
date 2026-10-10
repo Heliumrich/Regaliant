@@ -347,7 +347,8 @@ fn graphics_pipeline(key: &GfxKey, vs: &Prepared, ps: Option<&Prepared>) -> Resu
             .dynamic_state(&dy)
             .layout(layout)
             .push_next(&mut rinfo);
-        let r = c.device.create_graphics_pipelines(vk::PipelineCache::null(), &[gpci], None);
+        let r = c.device.create_graphics_pipelines(crate::gpu::pcache::get(), &[gpci], None);
+        crate::gpu::pcache::created();
         for (_, m) in modules {
             c.device.destroy_shader_module(m, None);
         }

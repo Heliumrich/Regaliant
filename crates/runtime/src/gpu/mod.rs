@@ -71,6 +71,7 @@ pub mod tune {
 }
 
 pub mod exec;
+pub mod pcache;
 pub mod images;
 pub mod png;
 pub mod track;

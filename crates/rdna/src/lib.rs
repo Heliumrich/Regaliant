@@ -3,6 +3,12 @@
 //! Encodings follow AMD's RDNA ISA; opcode names and numbers come from the
 //! generated `tables` (Mesa ACO's opcode table, gfx10 column).
 
+/// Hash containers with a fixed hasher (SipHash with fixed keys): iteration
+/// order, and with it the emitted SPIR-V, is the same in every run, so the
+/// driver's shader cache (keyed on the SPIR-V bytes) hits across runs.
+pub type HashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>>;
+pub type HashSet<T> = std::collections::HashSet<T, std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>>;
+
 pub mod analysis;
 pub mod capture;
 pub mod emu;

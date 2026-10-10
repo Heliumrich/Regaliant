@@ -376,8 +376,9 @@ fn compute_pipeline(out: &rdna::translate::Output) -> Result<Pipe, String> {
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&out.spirv), None).map_err(|e| format!("shader module: {e}"))?;
             let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
             let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout).flags(vk::PipelineCreateFlags::DISPATCH_BASE);
-            let pipeline = c.device.create_compute_pipelines(vk::PipelineCache::null(), &[ci], None).map_err(|(_, e)| format!("compute pipeline: {e}"));
+            let pipeline = c.device.create_compute_pipelines(super::pcache::get(), &[ci], None).map_err(|(_, e)| format!("compute pipeline: {e}"));
             c.device.destroy_shader_module(module, None);
+            super::pcache::created();
             Ok(Pipe { pipeline: pipeline?[0], layout, set_layout })
         }
     }
@@ -636,7 +637,7 @@ fn merge_pipe() -> Result<&'static MergePipe, String> {
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("merge module: {e}"))?;
             let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
             let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
-            let pipeline = c.device.create_compute_pipelines(vk::PipelineCache::null(), &[ci], None).map_err(|(_, e)| format!("merge pipeline: {e}"));
+            let pipeline = c.device.create_compute_pipelines(super::pcache::get(), &[ci], None).map_err(|(_, e)| format!("merge pipeline: {e}"));
             c.device.destroy_shader_module(module, None);
             Ok(MergePipe { pipeline: pipeline?[0], layout, set_layout })
         }
