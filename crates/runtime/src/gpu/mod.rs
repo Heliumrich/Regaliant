@@ -26,10 +26,11 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 3] = [
+    static ALL: [Tunable; 4] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
+        Tunable { name: "mirrors", env: "DS_MIRRORS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -58,6 +59,11 @@ pub mod tune {
         get(2)
     }
 
+    /// VRAM mirrors of GPU-written buffers (`gpu::mirror`).
+    pub fn mirrors() -> bool {
+        get(3) != 0
+    }
+
     /// Sets a switch by name; false if unknown.
     pub fn set(name: &str, v: u64) -> bool {
         match ALL.iter().find(|t| t.name == name) {
@@ -72,6 +78,7 @@ pub mod tune {
 
 pub mod exec;
 pub mod pcache;
+pub mod mirror;
 pub mod images;
 pub mod png;
 pub mod track;

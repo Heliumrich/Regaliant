@@ -357,6 +357,9 @@ fn graphics_pipeline(key: &GfxKey, vs: &Prepared, ps: Option<&Prepared>) -> Resu
     }
 }
 
+/// Pixel shaders whose draws are limited to one pixel (control `tiny`).
+pub static TINY_SCISSOR: parking_lot::Mutex<Vec<u64>> = parking_lot::Mutex::new(Vec::new());
+
 impl Exec {
     /// Executes a draw with the graphics state of `cp`; returns what
     /// happened (frame captures).
@@ -645,7 +648,12 @@ impl Exec {
                 vk::Viewport { x: 0.0, y: 0.0, width: area.0 as f32, height: area.1 as f32, min_depth: 0.0, max_depth: 1.0 }
             };
             c.device.cmd_set_viewport(cmd, 0, &[vp]);
-            let sc = vk::Rect2D { offset: vk::Offset2D { x: x0, y: y0 }, extent: vk::Extent2D { width: (x1 - x0) as u32, height: (y1 - y0) as u32 } };
+            let mut sc = vk::Rect2D { offset: vk::Offset2D { x: x0, y: y0 }, extent: vk::Extent2D { width: (x1 - x0) as u32, height: (y1 - y0) as u32 } };
+            // Diagnosis (control `tiny <ps>`): those draws cover one pixel
+            // (their vertex work stays, pixel work goes).
+            if TINY_SCISSOR.lock().contains(&ps_addr) {
+                sc.extent = vk::Extent2D { width: 1, height: 1 };
+            }
             c.device.cmd_set_scissor(cmd, 0, &[sc]);
             // Depth/stencil clears requested through DB_RENDER_CONTROL.
             if clear_z || clear_s {
@@ -754,6 +762,9 @@ impl Exec {
             }
         }
         for b in bounds {
+            if !b.writes.is_empty() {
+                crate::gpu::mirror::invalidate(&b.writes);
+            }
             for &(base, n) in &b.writes {
                 crate::gpu::track::gpu_write(base, n);
             }

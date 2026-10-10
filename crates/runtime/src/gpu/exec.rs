@@ -22,7 +22,7 @@ use rdna::translate::{BindingKind, RES_INFO_DWORDS};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-mod draw;
+pub mod draw;
 pub(crate) use draw::{color_surface, depth_surface, set_equal_bias, toggle_skip_vs};
 
 /// Dispatches of compute shaders on this list are skipped (`skipcs` control
@@ -276,6 +276,8 @@ impl Shared {
         if changed.is_empty() {
             return;
         }
+        let ranges: Vec<(u64, u64)> = changed.iter().map(|&(a, b)| (a, b - a)).collect();
+        super::mirror::invalidate(&ranges);
         for s in self.spans.iter_mut().filter(|s| s.valid) {
             if changed.iter().any(|&(a, b)| a < s.end && s.start < b) {
                 // Kept alive: recorded work may still reference it.
@@ -556,6 +558,9 @@ struct Bound {
     images: Vec<vk::Image>,
     /// Buffers bound through a VRAM shadow (copied in before, out after).
     shadows: Vec<Shadow>,
+    /// Written buffer resources and where their result is after the stage:
+    /// (guest base, size, buffer, offset of the base) - mirror refreshes.
+    write_src: Vec<(u64, u64, vk::Buffer, u64)>,
 }
 
 /// A guest buffer range shadowed in device memory for one dispatch: GPU
@@ -1535,7 +1540,7 @@ impl Exec {
     /// info blocks of its SGPR data.
     fn bind_stage(&mut self, p: &mut Prepared, allow_shadow: bool) -> Result<Bound, String> {
         let res_info = rdna::translate::res_info_offset(&p.tr.plan) as usize;
-        let mut bound = Bound { bufs: Vec::new(), imgs: Vec::new(), img_arrays: Vec::new(), writes: Vec::new(), sized_writes: Vec::new(), images: Vec::new(), shadows: Vec::new() };
+        let mut bound = Bound { bufs: Vec::new(), imgs: Vec::new(), img_arrays: Vec::new(), writes: Vec::new(), sized_writes: Vec::new(), images: Vec::new(), shadows: Vec::new(), write_src: Vec::new() };
         let seg = SHADOW_BYTES;
         let shadow_base = seg * self.cur as u64;
         {
@@ -1555,8 +1560,10 @@ impl Exec {
                         let mut info = vk::DescriptorBufferInfo { buffer: sh.dummy, offset: 0, range: DUMMY_BYTES };
                         let mut bias = 0u64;
                         let mut bound_size = 0u64;
-                        let mut span = if size > 0 { sh.span(base, size) } else { None };
-                        if span.is_none() && size > 0 {
+                        // Read-only bindings of buffers GPU work wrote: VRAM mirrors.
+                        let mirrored = if size > 0 && !p.tr.plan.resources[i].written && matches!(p.resources[i], Resolved::Buffer(_)) { super::mirror::lookup(base, size) } else { None };
+                        let mut span = if size > 0 && mirrored.is_none() { sh.span(base, size) } else { None };
+                        if span.is_none() && size > 0 && mirrored.is_none() {
                             // A descriptor reaching past the end of its mappings
                             // (generic sizes on ring allocations): the mapped part
                             // is bound, the rest reads 0.
@@ -1567,7 +1574,17 @@ impl Exec {
                                 }
                             }
                         }
-                        if size > 0 {
+                        if let Some((mbuf, moff, avail)) = mirrored {
+                            let align = ctx().limits.min_storage_buffer_offset_alignment.max(4);
+                            let off = moff & !(align - 1);
+                            bias = moff - off;
+                            let range = (bias + size).next_multiple_of(4).min(bias + avail);
+                            info = vk::DescriptorBufferInfo { buffer: mbuf, offset: off, range };
+                            bound_size = size;
+                            if let Some(s) = CP_WRITES.latest(&[(base, size)]) {
+                                self.submit_after = self.submit_after.max(s);
+                            }
+                        } else if size > 0 {
                             match span {
                                 Some((buffer, start, end)) => {
                                     let rel = base - start;
@@ -1612,6 +1629,10 @@ impl Exec {
                                         bound.shadows.push(Shadow { host: buffer, host_off: off, range, shadow_off: shadow_base + s_off, pristine_off: shadow_base + s_off + span, bias, size });
                                         info = vk::DescriptorBufferInfo { buffer: self.shadow, offset: shadow_base + s_off, range };
                                         SHADOWED.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    if res.written && matches!(p.resources[i], Resolved::Buffer(_)) {
+                                        // Within the bound range (clamped to the mapping).
+                                        bound.write_src.push((base, size.min(range - bias), info.buffer, info.offset + bias));
                                     }
                                 }
                                 None => {
@@ -1896,6 +1917,33 @@ impl Exec {
             self.dispatched = true;
         }
         stamp(3);
+        // VRAM mirrors of what this dispatch wrote (later read bindings use them).
+        let mut mirrored: Vec<(u64, u64)> = Vec::new();
+        let mut copies: Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)> = Vec::new();
+        for &(base, size, src, src_off) in &bound.write_src {
+            if let Some((mbuf, moff)) = super::mirror::for_write(base, size) {
+                copies.push((src, mbuf, vk::BufferCopy { src_offset: src_off, dst_offset: moff, size }));
+                mirrored.push((base, size));
+            }
+        }
+        let unmirrored: Vec<(u64, u64)> = writes_here.iter().copied().filter(|w| !mirrored.contains(w)).collect();
+        if !unmirrored.is_empty() {
+            super::mirror::invalidate(&unmirrored);
+        }
+        if !copies.is_empty() {
+            unsafe {
+                let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+                c.device.cmd_pipeline_barrier(self.cmd(), vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+                for (src, dst, r) in &copies {
+                    c.device.cmd_copy_buffer(self.cmd(), *src, *dst, &[*r]);
+                }
+            }
+            // Readers later in this batch wait for the copies.
+            self.barrier_wanted = true;
+            for &(b, n) in &mirrored {
+                super::mirror::refreshed(b, n);
+            }
+        }
         for &(b, n) in &writes_here {
             super::track::gpu_write(b, n);
         }
@@ -1954,6 +2002,7 @@ pub fn status() -> String {
     ) + &super::images::IMAGES.try_lock().and_then(|g| g.as_ref().map(|i| i.status())).unwrap_or_default()
         + &super::track::status()
         + &crate::mem::remap_status()
+        + &super::mirror::status()
         + &format!(
             "    guest memory imports: {} ({} MiB), {} over several mappings, {} dropped after remapping
 ",

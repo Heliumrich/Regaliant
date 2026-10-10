@@ -383,6 +383,19 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     _ => Err("usage: tune <promises|lazy|shadow_min> <value>".into()),
                 }
             }
+            "tiny" => {
+                // Diagnosis: `tiny <hex ps>` toggles limiting that pixel
+                // shader's draws to one pixel (vertex cost vs pixel cost).
+                match parts.next().and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()) {
+                    Some(a) => {
+                        let mut g = gpu::exec::draw::TINY_SCISSOR.lock();
+                        let on = if let Some(i) = g.iter().position(|&x| x == a) { g.remove(i); false } else { g.push(a); true };
+                        info!("control: draws with ps {a:#x} {}", if on { "limited to one pixel" } else { "full again" });
+                        Ok(())
+                    }
+                    None => Err("usage: tiny <hex ps address>".into()),
+                }
+            }
             "reupload" => {
                 // Diagnosis: `reupload [<hex address>]` uploads the textures
                 // sourced from guest memory (at that address) again at their
