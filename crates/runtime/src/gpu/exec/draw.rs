@@ -397,6 +397,8 @@ impl Exec {
         if self.rendering.take().is_some() {
             unsafe { ctx().device.cmd_end_rendering(self.cmd()) };
             global_barrier(self.cmd());
+            self.barrier_wanted = false;
+            self.dispatched = false;
         }
     }
 
@@ -622,6 +624,7 @@ impl Exec {
         let same = self.rendering.as_ref().is_some_and(|r| r.colors == colors && r.depth == depth);
         if !same || feedback {
             self.end_rendering();
+            self.barrier_if_wanted(true);
             self.begin_rendering(colors, depth, area);
         }
         let c = ctx();

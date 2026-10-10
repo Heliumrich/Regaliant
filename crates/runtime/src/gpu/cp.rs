@@ -263,8 +263,7 @@ static PROMISES: parking_lot::Mutex<Option<HashMap<u64, (u64, u64, u8)>>> = park
 pub static PROMISED: AtomicU64 = AtomicU64::new(0);
 
 fn promises_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_PROMISES").ok().as_deref() != Some("0"))
+    super::tune::promises()
 }
 
 fn promise(seq: u64, addr: u64, value: u64, bytes: u8) {
@@ -815,7 +814,12 @@ impl Cp {
             // Partial flushes, cache actions and acquires order later work
             // after earlier work: GPU work is already ordered by barriers, so
             // only a following CP memory write has to wait (see `fence`).
-            op::EVENT_WRITE | op::ACQUIRE_MEM => self.fence_pending = true,
+            op::EVENT_WRITE | op::ACQUIRE_MEM => {
+                self.fence_pending = true;
+                if let Some(e) = self.exec.as_mut() {
+                    e.note_sync();
+                }
+            }
             op::INDEX_TYPE => self.set_reg(Space::Uc, crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE, p(0)),
             op::INDEX_BASE => self.index_base = addr64(p(0), p(1)),
             op::INDEX_BUFFER_SIZE => self.index_count = p(0),
@@ -1304,6 +1308,9 @@ impl Cp {
     }
 
     fn release_mem(&mut self, p: &dyn Fn(u64) -> u32) {
+        if let Some(e) = self.exec.as_mut() {
+            e.note_sync();
+        }
         let data_cntl = p(1);
         let int_sel = (data_cntl >> 24) & 7;
         let data_sel = (data_cntl >> 29) & 7;

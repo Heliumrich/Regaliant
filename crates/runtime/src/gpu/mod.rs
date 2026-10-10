@@ -11,6 +11,65 @@ pub mod capture;
 pub mod cp;
 pub mod desc;
 pub mod emucheck;
+/// Run-time switches for A/B measurements within one run (`tune <name>
+/// <value>`; slowly varying load from other GPU users cancels out), each
+/// seeded from its environment variable.
+pub mod tune {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Tunable {
+        name: &'static str,
+        env: &'static str,
+        default: u64,
+        value: AtomicU64,
+    }
+
+    const UNSET: u64 = u64::MAX;
+
+    static ALL: [Tunable; 3] = [
+        Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
+    ];
+
+    fn get(i: usize) -> u64 {
+        let t = &ALL[i];
+        let v = t.value.load(Ordering::Relaxed);
+        if v != UNSET {
+            return v;
+        }
+        let v = std::env::var(t.env).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(t.default);
+        t.value.store(v, Ordering::Relaxed);
+        v
+    }
+
+    /// Label promises (`Cp::wait`).
+    pub fn promises() -> bool {
+        get(0) != 0
+    }
+
+    /// Dispatches ordered by the title's synchronization only.
+    pub fn lazy_barriers() -> bool {
+        get(1) != 0
+    }
+
+    /// Written buffers below this size skip VRAM shadows (unless atomic).
+    pub fn shadow_min() -> u64 {
+        get(2)
+    }
+
+    /// Sets a switch by name; false if unknown.
+    pub fn set(name: &str, v: u64) -> bool {
+        match ALL.iter().find(|t| t.name == name) {
+            Some(t) => {
+                t.value.store(v, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 pub mod exec;
 pub mod images;
 pub mod png;

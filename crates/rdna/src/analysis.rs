@@ -66,6 +66,8 @@ pub struct Resource {
     pub read: bool,
     /// Buffer is read with format conversion (buffer_load_format/tbuffer).
     pub formatted: bool,
+    /// Buffer is accessed with atomics.
+    pub atomic: bool,
     /// Image tables: pc of the load that reads the T# from the table.
     pub table: Option<u32>,
 }
@@ -99,6 +101,7 @@ impl Plan {
             x.written |= r.written;
             x.read |= r.read;
             x.formatted |= r.formatted;
+            x.atomic |= r.atomic;
             return i;
         }
         self.resources.push(r);
@@ -430,7 +433,7 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
                         // Known base, dynamic offset (e.g. a loop over a constant
                         // table): the base is bound as a buffer and read at run time.
                         let dwords = vec![Prov::PtrLo(p.clone(), bias), Prov::PtrHi(p, bias)];
-                        let r = plan.resource(Resource { kind: ResKind::Global, dwords, written: false, read: true, formatted: false, table: None });
+                        let r = plan.resource(Resource { kind: ResKind::Global, dwords, written: false, read: true, formatted: false, atomic: false, table: None });
                         plan.inst_res.insert(ins.pc, (r, None));
                         for k in 0..n {
                             st.set(d + k as u16, Prov::Unknown);
@@ -448,7 +451,7 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
                 // time: a T# loaded this way is a table entry (ImageTable).
                 let dwords: Vec<Prov> = (0..4).map(|k| st.get(ins.smem_sbase() + k)).collect();
                 plan.table_loads.insert(ins.pc, dwords.clone());
-                let r = plan.resource(Resource { kind: ResKind::Buffer, dwords, written: false, read: true, formatted: false, table: None });
+                let r = plan.resource(Resource { kind: ResKind::Buffer, dwords, written: false, read: true, formatted: false, atomic: false, table: None });
                 plan.inst_res.insert(ins.pc, (r, None));
                 for k in 0..n {
                     st.set(d + k as u16, Prov::Table(ins.pc, k as u8));
@@ -465,7 +468,7 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
             let store = name.contains("_store") || name.contains("_atomic");
             let atomic = name.contains("_atomic");
             let formatted = name.contains("_format") || ins.enc == Enc::Mtbuf;
-            let r = plan.resource(Resource { kind: ResKind::Buffer, dwords, written: store, read: !store || atomic, formatted, table: None });
+            let r = plan.resource(Resource { kind: ResKind::Buffer, dwords, written: store, read: !store || atomic, formatted, atomic, table: None });
             plan.inst_res.insert(ins.pc, (r, None));
         }
         Enc::Mimg => {
@@ -478,13 +481,13 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
                 _ => None,
             };
             let img = match table {
-                Some((pc, v)) => plan.resource(Resource { kind: ResKind::ImageTable, dwords: v, written: store, read: !store, formatted: false, table: Some(pc) }),
-                None => plan.resource(Resource { kind: ResKind::Image, dwords, written: store, read: !store, formatted: false, table: None }),
+                Some((pc, v)) => plan.resource(Resource { kind: ResKind::ImageTable, dwords: v, written: store, read: !store, formatted: false, atomic: false, table: Some(pc) }),
+                None => plan.resource(Resource { kind: ResKind::Image, dwords, written: store, read: !store, formatted: false, atomic: false, table: None }),
             };
             let samp = if name.starts_with("image_sample") || name.starts_with("image_gather4") || name == "image_get_lod" {
                 let sb = ins.mimg_ssamp();
                 let sd = (0..4).map(|k| st.get(sb + k)).collect();
-                Some(plan.resource(Resource { kind: ResKind::Sampler, dwords: sd, written: false, read: false, formatted: false, table: None }))
+                Some(plan.resource(Resource { kind: ResKind::Sampler, dwords: sd, written: false, read: false, formatted: false, atomic: false, table: None }))
             } else {
                 None
             };
@@ -518,7 +521,7 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
             let dwords = vec![st.get(sa), st.get(sa + 1)];
             let store = name.starts_with("global_store") || name.starts_with("global_atomic");
             let atomic = name.starts_with("global_atomic");
-            let r = plan.resource(Resource { kind: ResKind::Global, dwords, written: store, read: !store || atomic, formatted: false, table: None });
+            let r = plan.resource(Resource { kind: ResKind::Global, dwords, written: store, read: !store || atomic, formatted: false, atomic, table: None });
             plan.inst_res.insert(ins.pc, (r, None));
         }
         _ => {}

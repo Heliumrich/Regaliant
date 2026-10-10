@@ -372,6 +372,17 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     None => Err("usage: imgstat <hex address>".into()),
                 }
             }
+            "tune" => {
+                // Measurements: `tune <promises|lazy|shadow_min> <value>`
+                // changes a GPU switch for the rest of the run.
+                match (parts.next(), parts.next().and_then(|v| v.parse::<u64>().ok())) {
+                    (Some(name), Some(v)) if gpu::tune::set(name, v) => {
+                        info!("control: tune {name} = {v} at flip {}", gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
+                        Ok(())
+                    }
+                    _ => Err("usage: tune <promises|lazy|shadow_min> <value>".into()),
+                }
+            }
             "reupload" => {
                 // Diagnosis: `reupload [<hex address>]` uploads the textures
                 // sourced from guest memory (at that address) again at their

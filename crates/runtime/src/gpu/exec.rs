@@ -505,6 +505,14 @@ fn binding_count(k: BindingKind) -> u32 {
     if matches!(k, BindingKind::ImageArray(_)) { rdna::translate::IMAGE_TABLE_LEN } else { 1 }
 }
 
+/// Dispatches are ordered by the title's own synchronization (partial
+/// flushes, cache actions, end-of-pipe events) instead of a full barrier
+/// after every dispatch: consecutive independent dispatches overlap on the
+/// GPU as on the console (`DS_LAZY_BARRIERS=0`: a barrier after each).
+fn lazy_barriers() -> bool {
+    super::tune::lazy_barriers()
+}
+
 fn global_barrier(cmd: vk::CommandBuffer) {
     let mb = vk::MemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
@@ -588,6 +596,14 @@ static SHADOW_FULL: AtomicU64 = AtomicU64::new(0);
 fn shadow_writes() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("DS_GPU_SHADOW").ok().as_deref() != Some("0"))
+}
+
+/// Written buffers below this size are written in host memory directly
+/// unless the shader uses atomics on them: their shadow copies and merge
+/// (two DMA copies, a merge dispatch, barriers: ~25 us) cost more than the
+/// few stores they receive (`DS_GPU_SHADOW_MIN=<bytes>`, default 64 KiB).
+fn shadow_min() -> u64 {
+    super::tune::shadow_min()
 }
 
 /// `DS_GPU_SHADOW_MERGE=0` copies whole shadows back (the earlier behaviour,
@@ -1025,6 +1041,11 @@ pub struct Exec {
     /// The next submission waits for this sequence (deferred CP writes that
     /// later GPU work may read).
     submit_after: u64,
+    /// The title synchronized (flush, cache action, end-of-pipe event)
+    /// since the last full barrier: the next dispatch or draw waits.
+    barrier_wanted: bool,
+    /// A dispatch ran since the last full barrier (draws wait for it).
+    dispatched: bool,
     reported: HashMap<String, u64>,
     name: String,
     /// Shaders recorded in the current batch (slow-batch reports).
@@ -1082,6 +1103,8 @@ impl Exec {
                 last_seq: 0,
                 last_action_seq: 0,
                 submit_after: 0,
+                barrier_wanted: false,
+                dispatched: false,
                 reported: HashMap::new(),
                 name: name.to_string(),
                 batch_shaders: Vec::new(),
@@ -1129,6 +1152,8 @@ impl Exec {
             }
         }
         global_barrier(self.cmd());
+        self.barrier_wanted = false;
+        self.dispatched = false;
         let qp = self.slots[self.cur].queries;
         if qp != vk::QueryPool::null() {
             unsafe { ctx().device.cmd_write_timestamp(self.cmd(), vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED) };
@@ -1375,6 +1400,26 @@ impl Exec {
         }
     }
 
+    /// The title synchronized its GPU work (CS/PS partial flush, cache
+    /// action, end-of-pipe event): the next dispatch or draw waits for
+    /// earlier work.
+    pub fn note_sync(&mut self) {
+        self.barrier_wanted = true;
+    }
+
+    /// A full barrier when the title asked for one or (draws) after
+    /// dispatches since the last.
+    pub(super) fn barrier_if_wanted(&mut self, for_draw: bool) {
+        if !self.recording {
+            return;
+        }
+        if self.barrier_wanted || (for_draw && self.dispatched) {
+            global_barrier(self.cmd());
+            self.barrier_wanted = false;
+            self.dispatched = false;
+        }
+    }
+
     /// Orders everything this queue does from now on after batch `seq` (a
     /// label wait passed on a value that batch will write): later batches
     /// follow it on the device queue, CP writes are deferred behind it.
@@ -1538,7 +1583,8 @@ impl Exec {
                                     // (GPU atomics and stores to host memory are slow).
                                     let s_off = self.shadow_used.next_multiple_of(256);
                                     let span = range.next_multiple_of(256);
-                                    let want = allow_shadow && shadow_writes() && p.tr.plan.resources[i].written && range <= SHADOW_MAX;
+                                    let res = &p.tr.plan.resources[i];
+                                    let want = allow_shadow && shadow_writes() && res.written && range <= SHADOW_MAX && (res.atomic || range >= shadow_min());
                                     if want && s_off + 2 * span > seg {
                                         SHADOW_FULL.fetch_add(1, Ordering::Relaxed);
                                     }
@@ -1736,16 +1782,23 @@ impl Exec {
         let c = ctx();
         let qp = self.slots[self.cur].queries;
         let ti = self.batch_shaders.len() as u32;
+        let stamp_cmd = self.cmd();
         let stamp = |k: u32| {
             if qp != vk::QueryPool::null() && ti < MAX_TIMED {
-                unsafe { ctx().device.cmd_write_timestamp(self.cmd(), vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * ti + k) };
+                unsafe { ctx().device.cmd_write_timestamp(stamp_cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * ti + k) };
             }
         };
+        if lazy_barriers() && self.barrier_wanted {
+            global_barrier(self.cmd());
+            self.barrier_wanted = false;
+            self.dispatched = false;
+        }
         stamp(0);
         if !bound.shadows.is_empty() {
             super::vk::checkpoint(self.cmd(), super::vk::mark::SHADOW_IN, p.addr);
             // Shadows get the guest data first (earlier writes are ordered by
-            // the barrier after every dispatch).
+            // the title's synchronization, or the barrier after every
+            // dispatch without lazy barriers).
             unsafe {
                 if shadow_merge() {
                     // One read of guest memory (the pristine copy), then the
@@ -1785,7 +1838,9 @@ impl Exec {
             }
         }
         stamp(2);
-        global_barrier(self.cmd());
+        if !lazy_barriers() || !bound.shadows.is_empty() {
+            global_barrier(self.cmd());
+        }
         if !bound.shadows.is_empty() {
             super::vk::checkpoint(self.cmd(), super::vk::mark::SHADOW_OUT, p.addr);
             // Results back to guest memory: the dwords the dispatch changed
@@ -1823,7 +1878,12 @@ impl Exec {
                     },
                 }
             }
-            global_barrier(self.cmd());
+            if !lazy_barriers() {
+                global_barrier(self.cmd());
+            }
+        }
+        if lazy_barriers() {
+            self.dispatched = true;
         }
         stamp(3);
         for &(b, n) in &writes_here {
@@ -1883,6 +1943,7 @@ pub fn status() -> String {
         super::cp::sync_summary()
     ) + &super::images::IMAGES.try_lock().and_then(|g| g.as_ref().map(|i| i.status())).unwrap_or_default()
         + &super::track::status()
+        + &crate::mem::remap_status()
         + &format!(
             "    guest memory imports: {} ({} MiB), {} over several mappings, {} dropped after remapping
 ",

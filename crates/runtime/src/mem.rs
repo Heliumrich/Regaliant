@@ -68,6 +68,35 @@ pub struct MemState {
     internal_cursor: u64,
 }
 
+/// Direct-memory mappings whose contents live with the physical pages on the
+/// console but with the virtual pages here (diagnostics): `in_place` maps the
+/// same physical pages again over their own mapping (we zero them), `moved`
+/// maps physical pages last mapped at another address (their data stays
+/// there). `released`: physical start -> (address, size) of unmapped ranges.
+struct RemapStats {
+    in_place: u64,
+    in_place_bytes: u64,
+    moved: u64,
+    moved_bytes: u64,
+    logged: u32,
+    released: BTreeMap<u64, (u64, u64)>,
+}
+
+static REMAP: Mutex<RemapStats> = Mutex::new(RemapStats { in_place: 0, in_place_bytes: 0, moved: 0, moved_bytes: 0, logged: 0, released: BTreeMap::new() });
+
+/// One status line (diagnostics).
+pub fn remap_status() -> String {
+    let r = REMAP.lock();
+    format!(
+        "    direct memory remaps: {} in place ({} MiB, zeroed here), {} of pages last mapped elsewhere ({} MiB, contents not carried)
+",
+        r.in_place,
+        r.in_place_bytes >> 20,
+        r.moved,
+        r.moved_bytes >> 20
+    )
+}
+
 /// Incremented whenever guest mappings change (GPU zero-copy imports of guest
 /// memory are revalidated against it).
 pub static MAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -269,6 +298,13 @@ impl MemState {
         let keys: Vec<u64> = self.vmas.range(start..end).map(|(k, _)| *k).collect();
         for k in keys {
             let v = self.vmas.remove(&k).unwrap();
+            if v.kind == VmaKind::Direct {
+                let mut r = REMAP.lock();
+                if r.released.len() > 1 << 16 {
+                    r.released.clear();
+                }
+                r.released.insert(v.phys, (v.start, v.size));
+            }
             if v.kind != VmaKind::Reserved {
                 host_decommit(v.start, v.size);
             }
@@ -294,6 +330,39 @@ impl MemState {
             return Err(MemError::Invalid);
         }
         let existing = self.overlapping(addr, addr + size);
+        if kind == VmaKind::Direct {
+            // Diagnostics: contents the console would keep.
+            let same = existing
+                .iter()
+                .filter(|v| v.kind == VmaKind::Direct && v.phys.wrapping_sub(phys) == v.start.wrapping_sub(addr))
+                .map(|v| v.end().min(addr + size) - v.start.max(addr))
+                .sum::<u64>();
+            let mut r = REMAP.lock();
+            if same > 0 {
+                r.in_place += 1;
+                r.in_place_bytes += same;
+                if r.logged < 24 {
+                    r.logged += 1;
+                    crate::info!("mem: direct {addr:#x}+{size:#x} (phys {phys:#x}) mapped again over its own pages ({same:#x} bytes zeroed here) '{name}'");
+                }
+            }
+            let prior: Vec<(u64, u64, u64)> = r
+                .released
+                .range(phys.saturating_sub(1 << 30)..phys + size)
+                .filter(|(p, (_, n))| **p < phys + size && phys < **p + *n)
+                .map(|(p, (va, n))| (*p, *va, *n))
+                .collect();
+            for (p, va, n) in prior {
+                if va.wrapping_sub(p) != addr.wrapping_sub(phys) {
+                    r.moved += 1;
+                    r.moved_bytes += n.min(size);
+                    if r.logged < 24 {
+                        r.logged += 1;
+                        crate::info!("mem: direct phys {p:#x}+{n:#x}, last mapped at {va:#x}, now mapped at {:#x} '{name}' (contents not carried over)", addr + p.saturating_sub(phys));
+                    }
+                }
+            }
+        }
         if !existing.is_empty() {
             self.unmap_range(addr, addr + size);
         }
