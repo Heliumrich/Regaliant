@@ -16,11 +16,15 @@
 //! lane's earlier access could conflict (in blocks every invocation executes
 //! alike).
 //!
-//! Programs without backward branches (most pixel, vertex and simple compute
-//! shaders) need no dispatcher: their blocks are emitted in address order,
-//! each run when the next address is its start (an invocation's path visits
-//! blocks in increasing order). Without the loop the driver sees a DAG and
-//! keeps the emulated registers in SSA form across blocks. Compute programs that use LDS run in *lockstep mode* when their
+//! Programs whose loops nest (each loop a contiguous address range from its
+//! header to its last back edge, entered only at the header) need no
+//! dispatcher: their blocks are emitted in address order, each run when the
+//! next address is its start, and each loop range as a structured loop that
+//! repeats while the next address is its header (an invocation's path visits
+//! the blocks of one iteration in increasing order; exits, early ends and
+//! jumps to an outer header fall through the remaining guards). The driver
+//! then sees structured control flow instead of one loop over a switch.
+//! Others (overlapping or irreducible loops) keep the dispatcher. Compute programs that use LDS run in *lockstep mode* when their
 //! workgroup is a single wave, or when no scalar value can differ between
 //! its waves (no v_readlane / v_readfirstlane, no wave id): lane-dependent
 //! branches are decided for the whole workgroup by a vote (as the hardware
@@ -1653,10 +1657,11 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
             translate_inst(&mut tr, ins)?;
         }
         ok(tr.b.ret())?;
-    } else if spec.force_dispatcher || code.iter().any(|i| i.branch_target().is_some_and(|t| t <= i.pc)) {
-        emit_dispatch_loop(&mut tr, code, &starts)?;
     } else {
-        emit_block_chain(&mut tr, code, &starts)?;
+        match loop_ranges(code, &starts) {
+            Some(loops) if !spec.force_dispatcher => emit_structured(&mut tr, code, &starts, &loops)?,
+            _ => emit_dispatch_loop(&mut tr, code, &starts)?,
+        }
     }
     ok(tr.b.end_function())?;
 
@@ -1863,27 +1868,151 @@ fn emit_block_body(tr: &mut T, code: &[Inst], start: u32, end: u32) -> R<()> {
     Ok(())
 }
 
-/// Loop-free programs: the blocks in address order, each run when the next
-/// address is its start (see the module documentation).
-fn emit_block_chain(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>) -> R<()> {
+/// Next-address value after the loop watchdog stopped an invocation (no
+/// block starts there).
+const PC_STOPPED: u32 = 0xFFFF_FFFE;
+
+/// The loops of a program as address ranges [header, end) (end: the end of
+/// the block of its last back edge), outermost first for equal headers; None
+/// when two ranges overlap without nesting or a branch enters a range
+/// elsewhere than at its header (the dispatcher handles those).
+fn loop_ranges(code: &[Inst], starts: &BTreeSet<u32>) -> Option<Vec<(u32, u32)>> {
+    let block_end = |pc: u32| starts.range(pc + 1..).next().copied().unwrap_or(u32::MAX);
+    let mut loops: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+    for ins in code {
+        if let Some(t) = ins.branch_target() {
+            if t <= ins.pc {
+                let e = block_end(ins.pc);
+                let x = loops.entry(t).or_insert(e);
+                *x = (*x).max(e);
+            }
+        }
+    }
+    let list: Vec<(u32, u32)> = loops.into_iter().collect();
+    for (i, &(_, e1)) in list.iter().enumerate() {
+        for &(h2, e2) in &list[i + 1..] {
+            // h1 < h2: nested (e2 <= e1) or disjoint (h2 >= e1).
+            if h2 < e1 && e2 > e1 {
+                return None;
+            }
+        }
+    }
+    for ins in code {
+        if let Some(t) = ins.branch_target() {
+            for &(h, e) in &list {
+                let inside = |a: u32| a >= h && a < e;
+                if inside(t) && t != h && !inside(ins.pc) {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(list)
+}
+
+/// Structured control flow (see the module documentation): the blocks of
+/// [lo, hi) in address order, loops as structured loops.
+fn emit_structured(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>, loops: &[(u32, u32)]) -> R<()> {
     let first = code[0].pc;
     let s0 = tr.u(first);
     ok(tr.b.store(tr.pc_var, s0, None, []))?;
     let starts_vec: Vec<u32> = starts.iter().copied().collect();
-    for (bi, &start) in starts_vec.iter().enumerate() {
-        let end = starts_vec.get(bi + 1).copied().unwrap_or(u32::MAX);
+    emit_range(tr, code, &starts_vec, loops, 0, starts_vec.len(), None)?;
+    emit_watchdog_record(tr)?;
+    ok(tr.b.ret())?;
+    Ok(())
+}
+
+/// Blocks `lo..hi` of `starts`; `inside`: the header of the loop being
+/// emitted (its own range is not a nested loop).
+fn emit_range(tr: &mut T, code: &[Inst], starts: &[u32], loops: &[(u32, u32)], lo: usize, hi: usize, inside: Option<u32>) -> R<()> {
+    let mut i = lo;
+    while i < hi {
+        let s = starts[i];
+        if let Some(&(h, end)) = loops.iter().find(|&&(h, _)| h == s && Some(h) != inside) {
+            let j = starts.iter().position(|&x| x >= end).unwrap_or(starts.len()).min(hi);
+            emit_loop(tr, code, starts, loops, i, j, h)?;
+            i = j;
+            continue;
+        }
+        let end = starts.get(i + 1).copied().unwrap_or(u32::MAX);
         let pc = e(tr.b.load(tr.t.u32, None, tr.pc_var, None, []))?;
-        let k = tr.u(start);
+        let k = tr.u(s);
         let here = e(tr.b.i_equal(tr.t.bool_, None, pc, k))?;
         let (body, merge) = (tr.b.id(), tr.b.id());
         ok(tr.b.selection_merge(merge, spirv::SelectionControl::NONE))?;
         ok(tr.b.branch_conditional(here, body, merge, []))?;
         e(tr.b.begin_block(Some(body)))?;
-        emit_block_body(tr, code, start, end)?;
+        emit_block_body(tr, code, s, end)?;
         ok(tr.b.branch(merge))?;
         e(tr.b.begin_block(Some(merge)))?;
+        i += 1;
     }
-    ok(tr.b.ret())?;
+    Ok(())
+}
+
+/// The loop with header `h` over blocks `lo..hi`: repeats while the next
+/// address is `h` (counted by the loop watchdog).
+fn emit_loop(tr: &mut T, code: &[Inst], starts: &[u32], loops: &[(u32, u32)], lo: usize, hi: usize, h: u32) -> R<()> {
+    let (head, body, cont, merge) = (tr.b.id(), tr.b.id(), tr.b.id(), tr.b.id());
+    ok(tr.b.branch(head))?;
+    e(tr.b.begin_block(Some(head)))?;
+    ok(tr.b.loop_merge(merge, cont, spirv::LoopControl::NONE, []))?;
+    ok(tr.b.branch(body))?;
+    e(tr.b.begin_block(Some(body)))?;
+    emit_range(tr, code, starts, loops, lo, hi, Some(h))?;
+    ok(tr.b.branch(cont))?;
+    e(tr.b.begin_block(Some(cont)))?;
+    let bt = tr.t.bool_;
+    let pc = e(tr.b.load(tr.t.u32, None, tr.pc_var, None, []))?;
+    let kh = tr.u(h);
+    let mut again = e(tr.b.i_equal(bt, None, pc, kh))?;
+    if let Some(ctr) = tr.loop_ctr {
+        let n = e(tr.b.load(tr.t.u32, None, ctr, None, []))?;
+        let one = tr.u(1);
+        let n = e(tr.b.i_add(tr.t.u32, None, n, one))?;
+        ok(tr.b.store(ctr, n, None, []))?;
+        let lim = tr.u(LOOP_LIMIT);
+        let over = e(tr.b.u_greater_than_equal(bt, None, n, lim))?;
+        // Stopped: no block runs any more (the record follows at the end).
+        let stop = e(tr.b.logical_and(bt, None, again, over))?;
+        let ks = tr.u(PC_STOPPED);
+        let npc = e(tr.b.select(tr.t.u32, None, stop, ks, pc))?;
+        ok(tr.b.store(tr.pc_var, npc, None, []))?;
+        let go = e(tr.b.logical_not(bt, None, over))?;
+        again = e(tr.b.logical_and(bt, None, again, go))?;
+    }
+    ok(tr.b.branch_conditional(again, head, merge, []))?;
+    e(tr.b.begin_block(Some(merge)))?;
+    Ok(())
+}
+
+/// After the program: an invocation left with a block still to run was
+/// stopped by the loop watchdog; it records that and the program address.
+fn emit_watchdog_record(tr: &mut T) -> R<()> {
+    let Some(wd) = tr.watchdog else { return Ok(()) };
+    let ex = tr.u(PC_EXIT);
+    let pc3 = e(tr.b.load(tr.t.u32, None, tr.pc_var, None, []))?;
+    let stopped = e(tr.b.i_not_equal(tr.t.bool_, None, pc3, ex))?;
+    let rec = tr.b.id();
+    let end = tr.b.id();
+    ok(tr.b.selection_merge(end, spirv::SelectionControl::NONE))?;
+    ok(tr.b.branch_conditional(stopped, rec, end, []))?;
+    e(tr.b.begin_block(Some(rec)))?;
+    let z = tr.u(0);
+    let p = e(tr.b.access_chain(tr.t.sb_u32, None, wd, [z, z]))?;
+    let scope = tr.u(spirv::Scope::Device as u32);
+    let one = tr.u(1);
+    e(tr.b.atomic_i_add(tr.t.u32, None, p, scope, z, one))?;
+    let base = tr.spec.code_base;
+    for (k, v) in [(1, base as u32), (2, (base >> 32) as u32)] {
+        let i = tr.u(k);
+        let p = e(tr.b.access_chain(tr.t.sb_u32, None, wd, [z, i]))?;
+        let c = tr.u(v);
+        ok(tr.b.store(p, c, None, []))?;
+    }
+    ok(tr.b.branch(end))?;
+    e(tr.b.begin_block(Some(end)))?;
     Ok(())
 }
 
@@ -1986,30 +2115,7 @@ fn emit_dispatch_loop(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>) -> R<()
         ok(tr.b.branch_conditional(fin, ox, oh, []))?;
         e(tr.b.begin_block(Some(ox)))?;
     }
-    if let Some(wd) = tr.watchdog {
-        // Left with a block still to run: stopped by the watchdog.
-        let pc3 = e(tr.b.load(tr.t.u32, None, tr.pc_var, None, []))?;
-        let stopped = e(tr.b.i_not_equal(tr.t.bool_, None, pc3, ex))?;
-        let rec = tr.b.id();
-        let end = tr.b.id();
-        ok(tr.b.selection_merge(end, spirv::SelectionControl::NONE))?;
-        ok(tr.b.branch_conditional(stopped, rec, end, []))?;
-        e(tr.b.begin_block(Some(rec)))?;
-        let z = tr.u(0);
-        let p = e(tr.b.access_chain(tr.t.sb_u32, None, wd, [z, z]))?;
-        let scope = tr.u(spirv::Scope::Device as u32);
-        let one = tr.u(1);
-        e(tr.b.atomic_i_add(tr.t.u32, None, p, scope, z, one))?;
-        let base = tr.spec.code_base;
-        for (k, v) in [(1, base as u32), (2, (base >> 32) as u32)] {
-            let i = tr.u(k);
-            let p = e(tr.b.access_chain(tr.t.sb_u32, None, wd, [z, i]))?;
-            let c = tr.u(v);
-            ok(tr.b.store(p, c, None, []))?;
-        }
-        ok(tr.b.branch(end))?;
-        e(tr.b.begin_block(Some(end)))?;
-    }
+    emit_watchdog_record(tr)?;
     ok(tr.b.ret())?;
     Ok(())
 }
