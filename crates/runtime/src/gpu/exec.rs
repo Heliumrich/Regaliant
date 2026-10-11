@@ -1313,6 +1313,11 @@ const MAX_TIMED: u32 = 4096;
 /// with this bit set.
 const DRAW_KEY: u64 = 1 << 63;
 
+/// Whether DS_PROFILE_GPU is on (other modules' profile statistics).
+pub fn profiling_on() -> bool {
+    profiling()
+}
+
 fn profiling() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("DS_PROFILE_GPU").ok().as_deref() == Some("1"))
@@ -1422,6 +1427,7 @@ pub fn reset_shader_profile() {
         m.clear();
     }
     *SHADER_PLACEMENTS.lock() = None;
+    shaders::reset_repeats();
     for c in CS_PHASES.iter().chain(DRAW_PHASES.iter()) {
         c.store(0, Ordering::Relaxed);
     }
@@ -1461,6 +1467,7 @@ pub fn shader_profile() -> String {
         s.push_str(&format!("    gpu idle between batches {} ms, before batches of: {}\n", total / 1_000_000, list.join(", ")));
     }
     s.push_str(&phases_line("draw", &DRAW_PHASES, ["prepare and shader-read waits", "textures, targets, pipeline", "bindings"]));
+    s.push_str(&shaders::repeats_line());
     s.push_str(&phases_line("dispatch", &CS_PHASES, ["prepare and waits", "textures, pipeline", "bindings"]));
     {
         let n: Vec<u64> = SYNC_WHY.iter().zip(SYNC_WHY_AT_RESET.iter()).map(|(c, r)| c.load(Ordering::Relaxed).saturating_sub(r.load(Ordering::Relaxed))).collect();

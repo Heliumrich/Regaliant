@@ -14,6 +14,11 @@ use ash::vk;
 use parking_lot::Mutex;
 use super::fx::Map as HashMap;
 
+/// Changes whenever what `Images::lookup` finds for a key may change (images
+/// added or removed, an image turning GPU-written, stencil links): cached
+/// shader preparations that decided depth views from it are revalidated.
+pub static LOOKUP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Vulkan format of a gfx10 image FORMAT.
 pub fn vk_format(fmt: u16) -> Option<vk::Format> {
     use vk::Format as F;
@@ -1488,10 +1493,12 @@ impl Images {
         if self.map.insert(key, img).is_none() {
             self.by_base.entry(key.base).or_default().push(key);
         }
+        LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     fn map_remove(&mut self, key: &ImageKey) -> Option<Image> {
         let img = self.map.remove(key)?;
+        LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         if let Some(v) = self.by_base.get_mut(&key.base) {
             v.retain(|k| k != key);
             if v.is_empty() {
@@ -1550,10 +1557,14 @@ impl Images {
             crate::info!("images: {:#x} {}x{} {:?} becomes a render target", k.base, k.width, k.height, k.format);
         }
         // GPU-owned from now on: guest memory is no longer its source.
+        if !img.gpu_written {
+            LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         img.gpu_written = true;
         self.gpu_bases.insert(k.base);
         if s.stencil_base != 0 && has_stencil(k.format) {
             self.stencil_of.insert(s.stencil_base, k);
+            LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
             self.gpu_bases.insert(s.stencil_base);
         }
         if s.meta != 0 {
@@ -1901,6 +1912,9 @@ impl Images {
             img.write_gen = seq;
             if !img.gpu_written {
                 crate::info!("images: {:#x} {}x{} {:?} becomes a storage image (was uploaded: {}; shader {:#x})", key.base, key.width, key.height, key.format, img.source.is_some(), BINDING_SHADER.with(|s| s.get()));
+            }
+            if !img.gpu_written {
+                LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
             }
             img.gpu_written = true;
             img.source = None;

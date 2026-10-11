@@ -219,6 +219,7 @@ pub enum Resolved {
 }
 
 /// Everything needed to bind one shader stage for a draw/dispatch.
+#[derive(Clone)]
 pub struct Prepared {
     pub stage: Stage,
     pub addr: u64,
@@ -563,7 +564,194 @@ pub fn describe_loads(p: &Prepared) -> Vec<String> {
         .collect()
 }
 
+/// How often a stage's preparation repeats the previous one on its thread
+/// (profile): [calls, same program / user data / register state, and the
+/// same bytes read] per stage (vertex, pixel, compute).
+pub static REPEATS: [[std::sync::atomic::AtomicU64; 3]; 3] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 3];
+/// The same with only the user-data dwords that descriptors and scalar
+/// loads depend on in the key: [same deps, also same bytes] per stage.
+pub static REPEATS_DEPS: [[std::sync::atomic::AtomicU64; 2]; 3] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 3];
+
+thread_local! {
+    static LAST_PREP: std::cell::RefCell<[(u64, u64); 3]> = const { std::cell::RefCell::new([(0, 0); 3]) };
+    static LAST_DEPS: std::cell::RefCell<[(u64, u64); 3]> = const { std::cell::RefCell::new([(0, 0); 3]) };
+}
+
+/// User-data dwords that a plan's descriptors and scalar loads depend on.
+fn user_deps(plan: &rdna::analysis::Plan) -> u32 {
+    fn walk_ptr(p: &Ptr, m: &mut u32) {
+        match p {
+            Ptr::User(i) => *m |= 3 << (*i).min(30),
+            Ptr::Mem(inner, _) => walk_ptr(inner, m),
+            Ptr::Pc(_) => {}
+        }
+    }
+    fn walk(p: &Prov, m: &mut u32) {
+        match p {
+            Prov::User(i) => *m |= 1 << (*i).min(31),
+            Prov::Mem(ptr, _) | Prov::PtrLo(ptr, _) | Prov::PtrHi(ptr, _) => walk_ptr(ptr, m),
+            _ => {}
+        }
+    }
+    let mut m = 0u32;
+    for r in &plan.resources {
+        for d in &r.dwords {
+            walk(d, &mut m);
+        }
+    }
+    for l in &plan.loads {
+        walk_ptr(&l.ptr, &mut m);
+    }
+    m
+}
+
+fn note_repeat_deps(stage: Stage, key: u64, bytes: u64) {
+    use std::sync::atomic::Ordering;
+    let s = match stage {
+        Stage::Vertex => 0,
+        Stage::Fragment => 1,
+        _ => 2,
+    };
+    LAST_DEPS.with(|c| {
+        let mut c = c.borrow_mut();
+        if c[s].0 == key {
+            REPEATS_DEPS[s][0].fetch_add(1, Ordering::Relaxed);
+            if c[s].1 == bytes {
+                REPEATS_DEPS[s][1].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        c[s] = (key, bytes);
+    });
+}
+
+fn note_repeat(stage: Stage, key: u64, reads: &[(u64, u64)]) -> u64 {
+    use std::sync::atomic::Ordering;
+    let s = match stage {
+        Stage::Vertex => 0,
+        Stage::Fragment => 1,
+        _ => 2,
+    };
+    let mut h = super::fx::FxHasher::default();
+    for &(a, n) in reads {
+        h.write_u64(a);
+        let mut k = 0;
+        while k + 4 <= n {
+            if super::cp::guest_readable(a + k, 4) {
+                h.write_u32(unsafe { std::ptr::read_volatile((a + k) as *const u32) });
+            }
+            k += 4;
+        }
+    }
+    let bytes = h.finish();
+    REPEATS[s][0].fetch_add(1, Ordering::Relaxed);
+    LAST_PREP.with(|c| {
+        let mut c = c.borrow_mut();
+        if c[s].0 == key {
+            REPEATS[s][1].fetch_add(1, Ordering::Relaxed);
+            if c[s].1 == bytes {
+                REPEATS[s][2].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        c[s] = (key, bytes);
+    });
+    bytes
+}
+
+/// One line on how often preparations repeat (profile report).
+pub fn repeats_line() -> String {
+    use std::sync::atomic::Ordering;
+    let names = ["vertex", "pixel", "compute"];
+    let parts: Vec<String> = (0..3)
+        .map(|s| {
+            let r = &REPEATS[s];
+            let n = r[0].load(Ordering::Relaxed).max(1);
+            let d = &REPEATS_DEPS[s];
+            format!(
+                "{} {} ({}% same inputs, {}% also same bytes; with only the user data descriptors depend on {}%, {}%)",
+                names[s],
+                r[0].load(Ordering::Relaxed),
+                r[1].load(Ordering::Relaxed) * 100 / n,
+                r[2].load(Ordering::Relaxed) * 100 / n,
+                d[0].load(Ordering::Relaxed) * 100 / n,
+                d[1].load(Ordering::Relaxed) * 100 / n
+            )
+        })
+        .collect();
+    let (h, m) = (PREP_HITS.load(Ordering::Relaxed), PREP_MISSES.load(Ordering::Relaxed));
+    format!("    preparations repeating the previous one: {}; served from the cache {h} of {}\n", parts.join(", "), h + m)
+}
+
+pub fn reset_repeats() {
+    for r in REPEATS.iter() {
+        for c in r.iter() {
+            c.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    for r in REPEATS_DEPS.iter() {
+        for c in r.iter() {
+            c.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    PREP_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+    PREP_MISSES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A stage's last preparation on this thread: reused for the next one with
+/// the same program, register state and the user-data dwords its descriptors
+/// and loads depend on, when the guest words it read are unchanged. More than
+/// half of the draws' vertex and pixel preparations repeat that way (run
+/// 20261011-091944); dispatches do not.
+struct PrepEntry {
+    key: u64,
+    /// The words read (`Prepared::reads`, in order).
+    words: Vec<u32>,
+    prepared: Prepared,
+}
+
+thread_local! {
+    static PREP_CACHE: std::cell::RefCell<[Option<PrepEntry>; 3]> = const { std::cell::RefCell::new([None, None, None]) };
+    static LOCAL_DEPS: std::cell::RefCell<super::fx::Map<u64, u32>> = std::cell::RefCell::new(super::fx::Map::default());
+}
+/// Preparations served from / missing PREP_CACHE (diagnostics).
+pub static PREP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PREP_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn stage_slot(s: Stage) -> usize {
+    match s {
+        Stage::Vertex => 0,
+        Stage::Fragment => 1,
+        _ => 2,
+    }
+}
+
+/// The words in `reads` (in order); None if any is not readable now.
+fn read_words(reads: &[(u64, u64)], out: &mut Vec<u32>) -> bool {
+    out.clear();
+    for &(a, n) in reads {
+        if !super::cp::guest_readable(a, n) {
+            return false;
+        }
+        let mut k = 0;
+        while k + 4 <= n {
+            out.push(unsafe { std::ptr::read_volatile((a + k) as *const u32) });
+            k += 4;
+        }
+    }
+    true
+}
+
 fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32], spec: &mut Spec) -> Result<Prepared, String> {
+    // Diagnostics: the inputs that would key a cached preparation.
+    let repeat_key = super::exec::profiling_on().then(|| {
+        let mut h = super::fx::FxHasher::default();
+        h.write_u64(addr);
+        h.write_u64(code_hash);
+        for &w in &user[..(spec.user_sgprs as usize).min(user.len())] {
+            h.write_u32(w);
+        }
+        spec.hash(&mut h);
+        h.finish()
+    });
     // The plan depends only on the program, the user-data layout and where
     // data loads are read.
     let gpu_loads = super::tune::gpu_loads();
@@ -589,6 +777,63 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
     };
     if !plan.errors.is_empty() {
         return Err(format!("{:?} shader {addr:#x}: {}", spec.stage, plan.errors.join("; ")));
+    }
+    // The cached preparation of this stage, if its inputs and the words it
+    // read are the same.
+    let slot = stage_slot(spec.stage);
+    let deps = LOCAL_DEPS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| user_deps(&plan)));
+    let prep_key = {
+        let mut h = super::fx::FxHasher::default();
+        h.write_u64(addr);
+        h.write_u64(plan_key);
+        for (i, &w) in user.iter().enumerate().take(32) {
+            if deps & (1 << i) != 0 {
+                h.write_u32(w);
+            }
+        }
+        spec.hash(&mut h);
+        h.write_u8(super::tune::cmp_emulate() as u8);
+        h.write_u64(super::images::LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire));
+        h.finish()
+    };
+    // Compute preparations do not repeat (the per-item culls differ in the
+    // user data their descriptors depend on).
+    let cacheable = slot != 2 && super::tune::prep_cache();
+    let hit = PREP_CACHE.with(|c| {
+        if !cacheable {
+            return None;
+        }
+        let c = c.borrow();
+        let e = c[slot].as_ref().filter(|e| e.key == prep_key)?;
+        let mut now = Vec::with_capacity(e.words.len());
+        if !read_words(&e.prepared.reads, &mut now) || now != e.words {
+            return None;
+        }
+        let mut p = e.prepared.clone();
+        for (i, w) in p.sgpr_data.iter_mut().enumerate().take(translate::SGPR_DATA_USER as usize) {
+            *w = user.get(i).copied().unwrap_or(0);
+        }
+        p.user = user.to_vec();
+        Some(p)
+    });
+    if let Some(p) = hit {
+        PREP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Texture-streaming statistics as a full preparation notes them.
+        for r in &p.resources {
+            match r {
+                Resolved::Image(t) => super::lodstats::note(&t.raw),
+                Resolved::ImageTable(e) => {
+                    for t in e.iter().flatten() {
+                        super::lodstats::note(&t.raw);
+                    }
+                }
+                _ => {}
+            }
+        }
+        return Ok(p);
+    }
+    if cacheable {
+        PREP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let mut rd = Reader::new(addr);
     let mut resources = Vec::with_capacity(plan.resources.len());
@@ -744,5 +989,26 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
     for k in 0..tr.plan.resources.len() {
         sgpr_data[ri + translate::RES_INFO_DWORDS as usize * k + 3] = u32::MAX;
     }
-    Ok(Prepared { stage: spec.stage, addr, insts, tr, resources, res_addrs, sgpr_data, user: user.to_vec(), reads: rd.reads })
+    let prepared = Prepared { stage: spec.stage, addr, insts, tr, resources, res_addrs, sgpr_data, user: user.to_vec(), reads: rd.reads };
+    let mut words = Vec::new();
+    if cacheable && read_words(&prepared.reads, &mut words) {
+        let e = PrepEntry { key: prep_key, words, prepared: prepared.clone() };
+        PREP_CACHE.with(|c| c.borrow_mut()[slot] = Some(e));
+    }
+    if let Some(k) = repeat_key {
+        let tr = &prepared.tr;
+        let bytes = note_repeat(spec.stage, k, &prepared.reads);
+        let deps = user_deps(&tr.plan);
+        let mut h = super::fx::FxHasher::default();
+        h.write_u64(addr);
+        h.write_u64(code_hash);
+        for (i, &w) in user.iter().enumerate().take(32) {
+            if deps & (1 << i) != 0 {
+                h.write_u32(w);
+            }
+        }
+        spec.hash(&mut h);
+        note_repeat_deps(spec.stage, h.finish(), bytes);
+    }
+    Ok(prepared)
 }
