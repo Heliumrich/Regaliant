@@ -21,6 +21,18 @@ static PROGRAMS: Mutex<Option<HashMap<u64, Program>>> = Mutex::new(None);
 static PLANS: Mutex<Option<HashMap<u64, Arc<Plan>>>> = Mutex::new(None);
 static TRANSLATIONS: Mutex<Option<HashMap<(u64, u64), Arc<Translated>>>> = Mutex::new(None);
 
+thread_local! {
+    /// This thread's view of the shared caches (entries never change once
+    /// made), so that every command does not take their locks: programs by
+    /// address with the shader registrations count at which they were last
+    /// confirmed and the address's registration number (validating them by
+    /// hashing their code took a few microseconds per command), plans, and
+    /// translations.
+    static LOCAL_PROGRAMS: std::cell::RefCell<HashMap<u64, (u64, u64, Arc<Vec<rdna::Inst>>, u64)>> = std::cell::RefCell::new(HashMap::new());
+    static LOCAL_PLANS: std::cell::RefCell<HashMap<u64, Arc<Plan>>> = std::cell::RefCell::new(HashMap::new());
+    static LOCAL_TRANSLATIONS: std::cell::RefCell<HashMap<(u64, u64), Arc<Translated>>> = std::cell::RefCell::new(HashMap::new());
+}
+
 pub struct Translated {
     pub out: Output,
     pub plan: Arc<Plan>,
@@ -61,6 +73,34 @@ fn code_slice(addr: u64) -> Option<&'static [u32]> {
 
 /// Decodes (and caches) the program at `addr`; returns it and its hash.
 pub(crate) fn program(addr: u64) -> Result<(Arc<Vec<rdna::Inst>>, u64), String> {
+    use crate::hle::libs::agc;
+    // A program from a shader object stays as decoded until a shader object
+    // is created again at its address (or anywhere: then it is checked).
+    let regs = agc::shader_registrations();
+    let hit = LOCAL_PROGRAMS.with(|c| {
+        let mut c = c.borrow_mut();
+        let e = c.get_mut(&addr)?;
+        if e.0 != regs {
+            if agc::shader_registration(addr) != Some(e.1) {
+                return None;
+            }
+            e.0 = regs;
+        }
+        Some((e.2.clone(), e.3))
+    });
+    if let Some(h) = hit {
+        return Ok(h);
+    }
+    let reg = agc::shader_registration(addr);
+    let (insts, hash) = program_checked(addr)?;
+    if let Some(r) = reg {
+        LOCAL_PROGRAMS.with(|c| c.borrow_mut().insert(addr, (regs, r, insts.clone(), hash)));
+    }
+    Ok((insts, hash))
+}
+
+/// The program at `addr`, decoded (cached and checked by hashing its code).
+fn program_checked(addr: u64) -> Result<(Arc<Vec<rdna::Inst>>, u64), String> {
     let code = code_slice(addr).ok_or_else(|| format!("shader {addr:#x} not mapped"))?;
     let mut g = PROGRAMS.lock();
     let map = g.get_or_insert_with(HashMap::new);
@@ -479,7 +519,11 @@ pub fn describe_loads(p: &Prepared) -> Vec<String> {
 fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32], spec: &mut Spec) -> Result<Prepared, String> {
     // The plan depends only on the program and the user-data layout.
     let plan_key = code_hash ^ (spec.user_sgprs as u64) << 48 ^ (spec.user_base as u64) << 56;
-    let cached = PLANS.lock().as_ref().and_then(|m| m.get(&plan_key).cloned());
+    let cached = LOCAL_PLANS.with(|c| c.borrow().get(&plan_key).cloned()).or_else(|| {
+        let p = PLANS.lock().as_ref().and_then(|m| m.get(&plan_key).cloned())?;
+        LOCAL_PLANS.with(|c| c.borrow_mut().insert(plan_key, p.clone()));
+        Some(p)
+    });
     let plan = match cached {
         Some(p) => p,
         None => {
@@ -490,6 +534,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
                 crate::info!("{:?} shader {addr:#x}: analysis took {ms} ms ({} instructions)", spec.stage, insts.len());
             }
             PLANS.lock().get_or_insert_with(HashMap::new).insert(plan_key, p.clone());
+            LOCAL_PLANS.with(|c| c.borrow_mut().insert(plan_key, p.clone()));
             p
         }
     };
@@ -524,8 +569,8 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
                 let t = Tsharp::decode(&w);
                 let dim = ImageDim::from_type(t.ty, t.depth).ok_or_else(|| format!("{:?} shader {addr:#x}: image resource {i} has type {}", spec.stage, t.ty))?;
                 super::lodstats::note(&t.raw);
-                let depth = !super::tune::cmp_emulate() || super::images::with(|im| im.depth_view(&t));
-                spec.resources.push(ResSpec::Image { dim, class: num_class(t.format), depth });
+                // `depth` is decided below for all images at once.
+                spec.resources.push(ResSpec::Image { dim, class: num_class(t.format), depth: true });
                 resources.push(Resolved::Image(t));
             }
             ResKind::Sampler => {
@@ -565,13 +610,26 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
             }
         }
     }
+    if super::tune::cmp_emulate() && resources.iter().any(|r| matches!(r, Resolved::Image(_))) {
+        super::images::with(|im| {
+            for (r, s) in resources.iter().zip(spec.resources.iter_mut()) {
+                if let (Resolved::Image(t), ResSpec::Image { depth, .. }) = (r, s) {
+                    *depth = im.depth_view(t);
+                }
+            }
+        });
+    }
     let spec_hash = {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         spec.hash(&mut h);
         h.finish()
     };
     let tr = {
-        let cached = TRANSLATIONS.lock().as_ref().and_then(|m| m.get(&(plan_key, spec_hash)).cloned());
+        let cached = LOCAL_TRANSLATIONS.with(|c| c.borrow().get(&(plan_key, spec_hash)).cloned()).or_else(|| {
+            let t = TRANSLATIONS.lock().as_ref().and_then(|m| m.get(&(plan_key, spec_hash)).cloned())?;
+            LOCAL_TRANSLATIONS.with(|c| c.borrow_mut().insert((plan_key, spec_hash), t.clone()));
+            Some(t)
+        });
         match cached {
             Some(t) => t,
             None => {
@@ -593,6 +651,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
                 atomic_res.dedup();
                 let t = Arc::new(Translated { out, plan: plan.clone(), key: plan_key ^ spec_hash.rotate_left(1), atomic_res });
                 TRANSLATIONS.lock().get_or_insert_with(HashMap::new).insert((plan_key, spec_hash), t.clone());
+                LOCAL_TRANSLATIONS.with(|c| c.borrow_mut().insert((plan_key, spec_hash), t.clone()));
                 t
             }
         }

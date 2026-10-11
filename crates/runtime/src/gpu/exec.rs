@@ -2241,49 +2241,58 @@ impl Exec {
             }
         }
         let frame = super::FRAMES.load(Ordering::Relaxed);
-        for b in &p.tr.out.bindings {
-            match (b.kind, b.kind_resource().and_then(|i| p.resources.get(i))) {
-                (BindingKind::Image(_) | BindingKind::StorageImage(_), Some(Resolved::Image(t))) => {
-                    let storage = matches!(b.kind, BindingKind::StorageImage(_));
-                    let (view, image) = super::images::with(|im| im.view(t, storage, frame))?;
-                    let ty = if storage { vk::DescriptorType::STORAGE_IMAGE } else { vk::DescriptorType::SAMPLED_IMAGE };
-                    bound.imgs.push((b.binding, ty, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }));
-                    bound.images.push(image);
-                }
-                (BindingKind::Sampler(i), Some(Resolved::Sampler(sm))) => {
-                    let compare = p.tr.out.compare_samplers.contains(&i);
-                    let smp = super::images::with(|im| im.sampler(*sm, compare))?;
-                    bound.imgs.push((b.binding, vk::DescriptorType::SAMPLER, vk::DescriptorImageInfo { sampler: smp, image_view: vk::ImageView::null(), image_layout: vk::ImageLayout::UNDEFINED }));
-                }
-                (BindingKind::ImageArray(_), Some(Resolved::ImageTable(entries))) => {
-                    let dim = entries.iter().flatten().find_map(|t| rdna::translate::ImageDim::from_type(t.ty, t.depth)).ok_or("image table without entries")?;
-                    let mut infos = Vec::with_capacity(rdna::translate::IMAGE_TABLE_LEN as usize);
-                    for k in 0..rdna::translate::IMAGE_TABLE_LEN as usize {
-                        let view = match entries.get(k).copied().flatten() {
-                            Some(t) => match super::images::with(|im| im.view(&t, false, frame)) {
-                                Ok((view, image)) => {
-                                    bound.images.push(image);
-                                    Some(view)
-                                }
-                                Err(e) => {
-                                    self.report(format!("image table entry {:#x}: {e}", t.base));
-                                    None
-                                }
-                            },
-                            None => None,
-                        };
-                        let view = match view {
-                            Some(v) => v,
-                            None => super::images::with(|im| im.dummy_view(dim))?,
-                        };
-                        infos.push(vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL });
+        // One image-cache lock for all the stage's images and samplers.
+        let mut failed: Vec<String> = Vec::new();
+        let r: Result<(), String> = super::images::with(|im| {
+            for b in &p.tr.out.bindings {
+                match (b.kind, b.kind_resource().and_then(|i| p.resources.get(i))) {
+                    (BindingKind::Image(_) | BindingKind::StorageImage(_), Some(Resolved::Image(t))) => {
+                        let storage = matches!(b.kind, BindingKind::StorageImage(_));
+                        let (view, image) = im.view(t, storage, frame)?;
+                        let ty = if storage { vk::DescriptorType::STORAGE_IMAGE } else { vk::DescriptorType::SAMPLED_IMAGE };
+                        bound.imgs.push((b.binding, ty, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }));
+                        bound.images.push(image);
                     }
-                    bound.img_arrays.push((b.binding, infos));
+                    (BindingKind::Sampler(i), Some(Resolved::Sampler(sm))) => {
+                        let compare = p.tr.out.compare_samplers.contains(&i);
+                        let smp = im.sampler(*sm, compare)?;
+                        bound.imgs.push((b.binding, vk::DescriptorType::SAMPLER, vk::DescriptorImageInfo { sampler: smp, image_view: vk::ImageView::null(), image_layout: vk::ImageLayout::UNDEFINED }));
+                    }
+                    (BindingKind::ImageArray(_), Some(Resolved::ImageTable(entries))) => {
+                        let dim = entries.iter().flatten().find_map(|t| rdna::translate::ImageDim::from_type(t.ty, t.depth)).ok_or("image table without entries")?;
+                        let mut infos = Vec::with_capacity(rdna::translate::IMAGE_TABLE_LEN as usize);
+                        for k in 0..rdna::translate::IMAGE_TABLE_LEN as usize {
+                            let view = match entries.get(k).copied().flatten() {
+                                Some(t) => match im.view(&t, false, frame) {
+                                    Ok((view, image)) => {
+                                        bound.images.push(image);
+                                        Some(view)
+                                    }
+                                    Err(e) => {
+                                        failed.push(format!("image table entry {:#x}: {e}", t.base));
+                                        None
+                                    }
+                                },
+                                None => None,
+                            };
+                            let view = match view {
+                                Some(v) => v,
+                                None => im.dummy_view(dim)?,
+                            };
+                            infos.push(vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL });
+                        }
+                        bound.img_arrays.push((b.binding, infos));
+                    }
+                    (BindingKind::Image(_) | BindingKind::StorageImage(_) | BindingKind::ImageArray(_) | BindingKind::Sampler(_), _) => return Err("binding/resource mismatch".into()),
+                    _ => {}
                 }
-                (BindingKind::Image(_) | BindingKind::StorageImage(_) | BindingKind::ImageArray(_) | BindingKind::Sampler(_), _) => return Err("binding/resource mismatch".into()),
-                _ => {}
             }
+            Ok(())
+        });
+        for f in failed {
+            self.report(f);
         }
+        r?;
         Ok(bound)
     }
 

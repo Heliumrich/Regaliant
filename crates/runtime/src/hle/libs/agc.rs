@@ -144,18 +144,32 @@ static DEFAULTS_PTR: Mutex<(u64, u64)> = Mutex::new((0, 0));
 // Pointers are stored self-relative until sceAgcCreateShader relocates them.
 
 /// Shader programs created by the title: program address -> (stage, code
-/// bytes, instance-offset user-data slot).
-static SHADERS: Mutex<std::collections::BTreeMap<u64, (u8, usize, Option<u8>)>> = Mutex::new(std::collections::BTreeMap::new());
+/// bytes, instance-offset user-data slot, registration number).
+static SHADERS: Mutex<std::collections::BTreeMap<u64, (u8, usize, Option<u8>, u64)>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Shader objects created so far (`sceAgcCreateShader`): caches of decoded
+/// programs stay valid while it is unchanged.
+static REGISTRATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Code size of the program at `addr` (from its shader object), if known.
 pub fn shader_code_size(addr: u64) -> Option<usize> {
-    SHADERS.lock().get(&addr).map(|&(_, n, _)| n).filter(|&n| n > 0 && n < 1 << 20)
+    SHADERS.lock().get(&addr).map(|&(_, n, _, _)| n).filter(|&n| n > 0 && n < 1 << 20)
 }
 
 /// User-data slot (counted from the stage's first user SGPR) in which the
 /// program at `addr` expects a draw's start instance, if it has one.
 pub fn instance_offset_slot(addr: u64) -> Option<u32> {
-    SHADERS.lock().get(&addr).and_then(|&(_, _, s)| s).map(u32::from)
+    SHADERS.lock().get(&addr).and_then(|&(_, _, s, _)| s).map(u32::from)
+}
+
+/// How many shader objects have been created (changes with every creation).
+pub fn shader_registrations() -> u64 {
+    REGISTRATIONS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The registration number of the shader object whose program is at `addr`.
+pub fn shader_registration(addr: u64) -> Option<u64> {
+    SHADERS.lock().get(&addr).map(|&(_, _, _, r)| r)
 }
 
 /// Draw-modifier bit of primitive shaders that take an instance offset in
@@ -428,7 +442,8 @@ sysv! {
                 if rd32(e) == lo_reg {
                     let addr = ((rd32(e + 4) as u64) << 8) | (((rd32(e + 12) & 0xFF) as u64) << 40);
                     let size = (code + rd32(h + SHADER_SIZE) as u64).saturating_sub(addr);
-                    SHADERS.lock().insert(addr, (stage, size as usize, instance_offset_slot_of(h, stage)));
+                    let r = REGISTRATIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+                    SHADERS.lock().insert(addr, (stage, size as usize, instance_offset_slot_of(h, stage), r));
                     break;
                 }
             }
