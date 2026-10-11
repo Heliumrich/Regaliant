@@ -353,6 +353,12 @@ static WAITED: parking_lot::Mutex<Option<HashSet<u64>>> = parking_lot::Mutex::ne
 static PROMISES: parking_lot::Mutex<Option<HashMap<u64, (u64, u64, u8)>>> = parking_lot::Mutex::new(None);
 /// Waits passed on a promise (diagnostics).
 pub static PROMISED: AtomicU64 = AtomicU64::new(0);
+/// Multi-draw packets (DRAW_INDIRECT_MULTI / DRAW_INDEX_INDIRECT_MULTI), the
+/// draws they expanded to, and those packets whose count GPU work wrote
+/// (diagnostics: how much of the per-draw work they cause).
+pub static MDI_PACKETS: AtomicU64 = AtomicU64::new(0);
+pub static MDI_DRAWS: AtomicU64 = AtomicU64::new(0);
+pub static MDI_COUNT_FROM_MEMORY: AtomicU64 = AtomicU64::new(0);
 
 fn promises_on() -> bool {
     super::tune::promises()
@@ -690,7 +696,9 @@ impl Cp {
         let id_enable = p(3) & (1 << 31) != 0;
         let mut count = p(4);
         let mut count_src = format!("max {count}");
+        MDI_PACKETS.fetch_add(1, Ordering::Relaxed);
         if p(3) & (1 << 30) != 0 {
+            MDI_COUNT_FROM_MEMORY.fetch_add(1, Ordering::Relaxed);
             // The count may have been written by earlier GPU work.
             let ca = addr64(p(5), p(6));
             self.sync_reads(&[(ca, 4)]);
@@ -743,6 +751,7 @@ impl Cp {
             }
             self.draw(args);
             drawn += 1;
+            MDI_DRAWS.fetch_add(1, Ordering::Relaxed);
             outcome = std::mem::take(&mut self.last_draw);
         }
         let detail = if capturing { format!(" [count {count_src}, stride {stride}, args {}]", subs.join(" ")) } else { String::new() };
