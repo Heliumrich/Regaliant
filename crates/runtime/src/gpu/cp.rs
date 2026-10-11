@@ -105,6 +105,8 @@ pub struct Cp {
     fence_pending: bool,
     /// SET_PREDICATION state for packets with the predicate bit.
     pred: Option<Pred>,
+    /// When the title submitted the command buffer being executed.
+    pub submitted_at: Option<Instant>,
 }
 
 /// SET_PREDICATION (as Agc encodes it: control = operation << 16 |
@@ -198,7 +200,34 @@ fn compare(func: u32, value: u64, reference: u64) -> bool {
 /// for wait diagnostics.
 static LAST_WRITE: parking_lot::Mutex<Option<std::collections::HashMap<u64, (String, u64, u64)>>> = parking_lot::Mutex::new(None);
 
+/// Recent CP writes to each polled label (time, value), newest last: a
+/// queue that reaches a WAIT_REG_MEM late still sees the writes made after
+/// its command buffer was submitted (`missed_write`).
+static LABEL_WRITES: parking_lot::Mutex<Option<HashMap<u64, std::collections::VecDeque<(Instant, u64)>>>> = parking_lot::Mutex::new(None);
+const LABEL_WRITES_KEEP: usize = 64;
+/// Waits passed on a write made after their submission (diagnostics).
+pub static MISSED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a CP write to `addr` made at or after `since` satisfies the
+/// comparison.
+fn missed_write(addr: u64, wide: bool, func: u32, mask: u64, reference: u64, since: Instant) -> bool {
+    let g = LABEL_WRITES.lock();
+    let Some(h) = g.as_ref().and_then(|m| m.get(&addr)) else { return false };
+    h.iter().rev().take_while(|(t, _)| *t >= since).any(|&(_, v)| {
+        let v = if wide { v } else { v & 0xFFFF_FFFF };
+        compare(func, v & mask, reference & mask)
+    })
+}
+
 fn note_write(queue: &str, addr: u64, value: u64, at: u64) {
+    if WAITED.lock().as_ref().is_some_and(|w| w.contains(&(addr & !7))) {
+        let mut g = LABEL_WRITES.lock();
+        let h = g.get_or_insert_with(HashMap::new).entry(addr).or_default();
+        if h.len() >= LABEL_WRITES_KEEP {
+            h.pop_front();
+        }
+        h.push_back((Instant::now(), value));
+    }
     {
         let mut g = LAST_WRITE.lock();
         let m = g.get_or_insert_with(Default::default);
@@ -333,6 +362,7 @@ fn label_history(addr: u64, max: usize) -> String {
             b'S' => format!("wait ref {:#x}: blocks (value {:#x})", e.reference, e.value),
             b'L' => format!("wait ref {:#x}: satisfied by a CP write it latched (value now {:#x})", e.reference, e.value),
             b'P' => format!("wait ref {:#x}: passed on a promised write (value now {:#x})", e.reference, e.value),
+            b'M' => format!("wait ref {:#x}: passed on a write made after its submission (value now {:#x})", e.reference, e.value),
             _ => format!("wait ref {:#x}: satisfied (value {:#x})", e.reference, e.value),
         };
         out.push_str(&format!("\n    {:>10.3} ms {} {what} (packet {:#x})", e.us as f64 / 1000.0, e.queue, e.packet));
@@ -415,6 +445,7 @@ impl Cp {
             exec_failed: false,
             fence_pending: false,
             pred: None,
+            submitted_at: None,
         }
     }
 
@@ -1506,6 +1537,17 @@ impl Cp {
                 label_event(&self.name, b'P', a, v0, reference, at);
                 return Flow::Next;
             }
+        }
+        // A matching write made after this command buffer was submitted:
+        // hardware queues reach their waits at once and would have seen it.
+        // Ours fall behind at times (pipeline compilation) and then waited
+        // for a value already gone, e.g. a frame counter compared for
+        // equality (run 20261011-062446: acb0x48 waited for 0x7d8 at 0x7dc,
+        // and every queue stopped).
+        if self.submitted_at.is_some_and(|since| missed_write(a, wide, func, mask, reference, since)) {
+            MISSED.fetch_add(1, Ordering::Relaxed);
+            label_event(&self.name, b'M', a, v0, reference, at);
+            return Flow::Next;
         }
         label_event(&self.name, b'S', a, v0, reference, at);
         // Let recorded work and deferred effects progress while polling; a

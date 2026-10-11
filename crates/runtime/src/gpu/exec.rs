@@ -673,6 +673,86 @@ struct Bound {
     /// Written buffer resources and where their result is after the stage:
     /// (guest base, size, buffer, offset of the base) - mirror refreshes.
     write_src: Vec<(u64, u64, vk::Buffer, u64)>,
+    /// Where each buffer binding was placed (DS_PROFILE_GPU): (Placement,
+    /// bound bytes, written).
+    placements: Vec<(Placement, u64, bool)>,
+}
+
+/// Where a buffer binding's data is read and written (profile).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Placement {
+    /// Imported guest memory, across PCIe.
+    Host,
+    /// Read-only snapshot in video memory.
+    Snapshot,
+    /// Read-only copy made at the start of the batch (`Exec::pre_copy`).
+    PreCopy,
+    /// A resident shadow's working copy (read-only binding).
+    Resident,
+    /// A VRAM mirror of GPU-written data (read-only binding).
+    Mirror,
+    /// A VRAM shadow made for this dispatch.
+    Shadow,
+    /// A resident shadow reused.
+    ShadowReused,
+    /// Not mapped / empty (zeros).
+    None,
+}
+
+const PLACEMENTS: [Placement; 8] = [Placement::Host, Placement::Snapshot, Placement::PreCopy, Placement::Resident, Placement::Mirror, Placement::Shadow, Placement::ShadowReused, Placement::None];
+
+/// Buffer placements and workgroups per compute shader (DS_PROFILE_GPU=1).
+#[derive(Default)]
+struct ShaderPlacements {
+    dispatches: u64,
+    groups: u64,
+    indirect: u64,
+    /// Per binding: [count per Placement], total bytes, written count.
+    bindings: Vec<([u64; 8], u64, u64)>,
+}
+
+static SHADER_PLACEMENTS: Mutex<Option<HashMap<u64, ShaderPlacements>>> = Mutex::new(None);
+
+fn note_placements(addr: u64, groups: [u32; 3], indirect: bool, placements: &[(Placement, u64, bool)]) {
+    let mut g = SHADER_PLACEMENTS.lock();
+    let e = g.get_or_insert_with(HashMap::new).entry(addr).or_default();
+    e.dispatches += 1;
+    if indirect {
+        e.indirect += 1;
+    } else {
+        e.groups += groups.iter().map(|&x| x as u64).product::<u64>();
+    }
+    if e.bindings.len() < placements.len() {
+        e.bindings.resize(placements.len(), ([0; 8], 0, 0));
+    }
+    for (b, &(k, n, w)) in e.bindings.iter_mut().zip(placements) {
+        b.0[PLACEMENTS.iter().position(|&x| x == k).unwrap_or(7)] += 1;
+        b.1 += n;
+        b.2 += w as u64;
+    }
+}
+
+/// One line on a compute shader's workgroups and buffer placements.
+fn placement_line(addr: u64) -> Option<String> {
+    let g = SHADER_PLACEMENTS.lock();
+    let e = g.as_ref()?.get(&addr)?;
+    let direct = e.dispatches - e.indirect;
+    let mut s = format!("        groups per dispatch {}", if direct > 0 { format!("{:.1}", e.groups as f64 / direct as f64) } else { "-".into() });
+    if e.indirect > 0 {
+        s.push_str(&format!(" ({} indirect)", e.indirect));
+    }
+    s.push_str("; buffers:");
+    for (i, (counts, bytes, written)) in e.bindings.iter().enumerate() {
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            continue;
+        }
+        let kinds: Vec<String> = PLACEMENTS.iter().zip(counts.iter().copied()).filter(|&(_, c)| c > 0).map(|(k, c)| if c == total { format!("{k:?}") } else { format!("{k:?} {}%", c * 100 / total) }).collect();
+        let avg = *bytes as f64 / total as f64;
+        let size = if avg >= (1 << 20) as f64 { format!("{:.1} MB", avg / (1 << 20) as f64) } else if avg >= 1024.0 { format!("{:.1} KB", avg / 1024.0) } else { format!("{avg:.0} B") };
+        s.push_str(&format!(" #{i} {} {size}{}", kinds.join("/"), if *written > 0 { " written" } else { "" }));
+    }
+    Some(s)
 }
 
 /// A guest buffer range shadowed in device memory for one dispatch: GPU
@@ -757,6 +837,15 @@ pub(super) static INDEX_SNAPS: AtomicU64 = AtomicU64::new(0);
 pub(super) static INDEX_SNAP_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Video memory for snapshots per slot.
 const SNAP_SEG: u64 = 16 << 20;
+/// Device-local space per batch slot for copies made at the start of the
+/// batch (`Exec::pre_copy`).
+const PRE_SEG: u64 = 64 << 20;
+static PRE_COPIES: AtomicU64 = AtomicU64::new(0);
+static PRE_BYTES: AtomicU64 = AtomicU64::new(0);
+static PRE_REUSED: AtomicU64 = AtomicU64::new(0);
+static PRE_FULL: AtomicU64 = AtomicU64::new(0);
+/// GPU time of the batches' copy prologues (DS_PROFILE_GPU), ns.
+static PRE_NS: AtomicU64 = AtomicU64::new(0);
 
 /// `DS_GPU_SHADOW=0` binds written buffers in host memory directly (A/B
 /// comparisons of the shadow path).
@@ -812,7 +901,6 @@ fn merge_pipe() -> Result<&'static MergePipe, String> {
     .map_err(|e| e.clone())
 }
 
-/// Guest ranges of a stage's textures (uploads read them).
 /// The textures a stage samples, with a coarse bound of their guest bytes
 /// (16 per texel).
 fn texture_ranges(p: &Prepared) -> Vec<((u64, u64), super::desc::Tsharp)> {
@@ -1111,6 +1199,10 @@ struct Slot {
     snap: Option<(vk::Buffer, *mut u8)>,
     /// Device-local shadow space (SHADOW_BYTES: working and pristine copies).
     shadow: vk::Buffer,
+    /// The batch's prologue: copies of read-only buffers into `pre_buf`
+    /// (PRE_SEG, allocated on first use), submitted before `cmd`.
+    pre: vk::CommandBuffer,
+    pre_buf: Option<vk::Buffer>,
 }
 
 impl Slot {
@@ -1118,7 +1210,8 @@ impl Slot {
         let c = ctx();
         let sizes: Vec<vk::DescriptorPoolSize> = POOL_TYPES.iter().zip(&POOL_LIMITS[1..]).map(|(&ty, &n)| vk::DescriptorPoolSize { ty, descriptor_count: n }).collect();
         unsafe {
-            let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).map_err(|e| e.to_string())?[0];
+            let cmds = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(2)).map_err(|e| e.to_string())?;
+            let (cmd, pre) = (cmds[0], cmds[1]);
             // SGPR data in system memory: a copy in video memory, read by
             // every invocation, made no measurable difference (`tune ring_vram`).
             let (ring, _mem, ring_ptr) = c.host_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER)?;
@@ -1129,13 +1222,15 @@ impl Slot {
                 desc_pool: c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(POOL_LIMITS[0]).pool_sizes(&sizes), None).map_err(|e| e.to_string())?,
                 seq: 0,
                 queries: if profiling() {
-                    c.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(STAMPS * MAX_TIMED + 2), None).map_err(|e| e.to_string())?
+                    c.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(STAMPS * MAX_TIMED + 4), None).map_err(|e| e.to_string())?
                 } else {
                     vk::QueryPool::null()
                 },
                 rings: [Some((ring, ring_ptr)), None],
                 snap: None,
                 shadow,
+                pre,
+                pre_buf: None,
             })
         }
     }
@@ -1191,6 +1286,10 @@ fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str) {
         }
         g.0 = g.0.max(be[1]);
     }
+    let mut pre = [0u64; 2];
+    if unsafe { c.device.get_query_pool_results(pool, STAMPS * MAX_TIMED + 2, &mut pre, vk::QueryResultFlags::TYPE_64) }.is_ok() {
+        PRE_NS.fetch_add((pre[1].saturating_sub(pre[0]) as f64 * c.limits.timestamp_period as f64) as u64, Ordering::Relaxed);
+    }
     let n = (shaders.len() as u32).min(MAX_TIMED);
     if n == 0 {
         return;
@@ -1222,7 +1321,9 @@ pub fn reset_shader_profile() {
     if let Some(m) = SHADER_TIME.lock().as_mut() {
         m.clear();
     }
+    *SHADER_PLACEMENTS.lock() = None;
     GAP_NS.store(0, Ordering::Relaxed);
+    PRE_NS.store(0, Ordering::Relaxed);
     BATCH_NS.store(0, Ordering::Relaxed);
     IDLE.lock().1 = None;
     *STARVED.lock() = None;
@@ -1237,13 +1338,14 @@ pub fn shader_profile() -> String {
     v.sort_by(|a, b| (b.1[1] + b.1[2] + b.1[3]).cmp(&(a.1[1] + a.1[2] + a.1[3])));
     let tot = |k: usize, draws: bool| m.iter().filter(|(a, _)| (**a & DRAW_KEY != 0) == draws).map(|(_, x)| x[k]).sum::<u64>() / 1_000_000;
     let mut s = format!(
-        "    gpu time: batches {} ms; dispatches {} ms, draws {} ms, shadow copies in {} ms / out {} ms, between timed commands {} ms\n",
+        "    gpu time: batches {} ms; dispatches {} ms, draws {} ms, shadow copies in {} ms / out {} ms, between timed commands {} ms; batch-start copies {} ms\n",
         BATCH_NS.load(Ordering::Relaxed) / 1_000_000,
         tot(1, false),
         tot(1, true),
         tot(2, false),
         tot(3, false),
-        GAP_NS.load(Ordering::Relaxed) / 1_000_000
+        GAP_NS.load(Ordering::Relaxed) / 1_000_000,
+        PRE_NS.load(Ordering::Relaxed) / 1_000_000
     );
     if let Some(idle) = IDLE.lock().1.as_ref() {
         let mut v: Vec<(&String, &[u64; 3])> = idle.iter().collect();
@@ -1272,6 +1374,10 @@ pub fn shader_profile() -> String {
 ", **a & !DRAW_KEY, x[0], x[1] / 1000 / n));
         } else {
             s.push_str(&format!("      cs {a:#x}: {} dispatches, {} us each (+ copies {} / {} us)\n", x[0], x[1] / 1000 / n, x[2] / 1000 / n, x[3] / 1000 / n));
+            if let Some(l) = placement_line(**a) {
+                s.push_str(&l);
+                s.push('\n');
+            }
         }
     }
     s
@@ -1293,6 +1399,13 @@ pub struct Exec {
     snap_used: u64,
     snap_failed: bool,
     snaps: HashMap<(u64, u64), u64>,
+    /// Batch-start copies (`pre_copy`): space used in the current slot's
+    /// buffer, whether the slot's prologue is being recorded, allocation
+    /// failure, and the copies of the batch by guest range.
+    pre_used: u64,
+    pre_open: bool,
+    pre_failed: bool,
+    pres: HashMap<(u64, u64), u64>,
     ring_align: u64,
     recording: bool,
     /// When the batch being recorded was begun.
@@ -1358,6 +1471,10 @@ impl Exec {
                 snap_used: 0,
                 snap_failed: false,
                 snaps: HashMap::new(),
+                pre_used: 0,
+                pre_open: false,
+                pre_failed: false,
+                pres: HashMap::new(),
                 ring_align: c.limits.min_storage_buffer_offset_alignment.max(16),
                 recording: false,
                 begun_at: std::time::Instant::now(),
@@ -1428,6 +1545,7 @@ impl Exec {
             unsafe {
                 c.device.reset_fences(&[slot.fence]).ok();
                 c.device.reset_command_buffer(slot.cmd, vk::CommandBufferResetFlags::empty()).ok();
+                c.device.reset_command_buffer(slot.pre, vk::CommandBufferResetFlags::empty()).ok();
                 c.device.reset_descriptor_pool(slot.desc_pool, vk::DescriptorPoolResetFlags::empty()).ok();
             }
             self.slots[self.cur].seq = 0;
@@ -1481,6 +1599,11 @@ impl Exec {
         if self.slots[i].queries != vk::QueryPool::null() {
             unsafe { c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.slots[i].queries, STAMPS * MAX_TIMED + 1) };
         }
+        let pre = self.end_pre();
+        if pre.is_none() && self.slots[i].queries != vk::QueryPool::null() {
+            // No prologue: its timestamps read as unavailable.
+            unsafe { c.device.cmd_reset_query_pool(cmd, self.slots[i].queries, STAMPS * MAX_TIMED + 2, 2) };
+        }
         unsafe {
             // Make shader writes to imported memory visible to the host.
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
@@ -1511,7 +1634,11 @@ impl Exec {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return;
             }
-            if let Err(e) = c.submit(cmd, &[], &[], fence) {
+            let r = match pre {
+                Some(p) => c.submit_cmds(&[p, cmd], &[], &[], fence),
+                None => c.submit(cmd, &[], &[], fence),
+            };
+            if let Err(e) = r {
                 if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
                     crate::error!("gpu[{name}]: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
                 }
@@ -1539,6 +1666,8 @@ impl Exec {
         self.ring_used = [0; 2];
         self.snap_used = 0;
         self.snaps.clear();
+        self.pre_used = 0;
+        self.pres.clear();
     }
 
     /// Drops the recorded batch (process shutdown: label waits were released,
@@ -1557,6 +1686,91 @@ impl Exec {
         self.ring_used = [0; 2];
         self.snap_used = 0;
         self.snaps.clear();
+        let _ = self.end_pre();
+        self.pre_used = 0;
+        self.pres.clear();
+    }
+
+    /// Ends the batch's copy prologue, if it was begun: the copies complete
+    /// before the batch's work (which begins with a full barrier).
+    fn end_pre(&mut self) -> Option<vk::CommandBuffer> {
+        if !std::mem::take(&mut self.pre_open) {
+            return None;
+        }
+        let (pre, qp) = (self.slots[self.cur].pre, self.slots[self.cur].queries);
+        unsafe {
+            global_barrier(pre);
+            if qp != vk::QueryPool::null() {
+                ctx().device.cmd_write_timestamp(pre, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED + 3);
+            }
+            ctx().device.end_command_buffer(pre).ok();
+        }
+        Some(pre)
+    }
+
+    /// A copy of guest [base, base+size) in video memory made by the GPU at
+    /// the start of the batch, in its prologue (Slot::pre): (buffer, offset
+    /// of the copy's 16-byte aligned start, bias of `base` in it). Bound
+    /// instead of the imported system memory, which each invocation would
+    /// read across PCIe. The prologue runs after all earlier submitted work
+    /// and before this batch's, so the copy holds what an in-place read would
+    /// see unless work recorded earlier in this batch, or a deferred CP
+    /// write, writes the range (then None). None also: off or larger than
+    /// `tune pre_max`, not one mapping, no space.
+    pub(super) fn pre_copy(&mut self, base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
+        if size == 0 || size > super::tune::pre_max() || self.pre_failed {
+            return None;
+        }
+        let r = [(base, size)];
+        if self.overlaps_pending(&r) || CP_WRITES.latest(&r).is_some() {
+            return None;
+        }
+        let al = base & !15;
+        let bias = base - al;
+        if let (Some(&at), Some(buf)) = (self.pres.get(&(base, size)), self.slots[self.cur].pre_buf) {
+            PRE_REUSED.fetch_add(1, Ordering::Relaxed);
+            return Some((buf, at, bias));
+        }
+        let n = (bias + size).next_multiple_of(4);
+        let off = self.pre_used.next_multiple_of(self.ring_align);
+        if off + n > PRE_SEG {
+            PRE_FULL.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let (src, start, _) = span(al, n)?;
+        if self.slots[self.cur].pre_buf.is_none() {
+            match ctx().device_buffer(PRE_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER) {
+                Ok((b, _m)) => self.slots[self.cur].pre_buf = Some(b),
+                Err(e) => {
+                    crate::warn!("gpu[{}]: no video memory for batch-start copies ({e})", self.name);
+                    self.pre_failed = true;
+                    return None;
+                }
+            }
+        }
+        let buf = self.slots[self.cur].pre_buf?;
+        let c = ctx();
+        let (pre, qp) = (self.slots[self.cur].pre, self.slots[self.cur].queries);
+        if !self.pre_open {
+            unsafe {
+                c.device.begin_command_buffer(pre, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
+                if qp != vk::QueryPool::null() {
+                    c.device.cmd_reset_query_pool(pre, qp, STAMPS * MAX_TIMED + 2, 2);
+                }
+            }
+            // After all earlier submitted work.
+            global_barrier(pre);
+            if qp != vk::QueryPool::null() {
+                unsafe { c.device.cmd_write_timestamp(pre, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED + 2) };
+            }
+            self.pre_open = true;
+        }
+        unsafe { c.device.cmd_copy_buffer(pre, src, buf, &[vk::BufferCopy { src_offset: al - start, dst_offset: off, size: n }]) };
+        self.pre_used = off + n;
+        self.pres.insert((base, size), off);
+        PRE_COPIES.fetch_add(1, Ordering::Relaxed);
+        PRE_BYTES.fetch_add(n, Ordering::Relaxed);
+        Some((buf, off, bias))
     }
 
     /// Performs the fast clears pending for `keys` before they are used: the
@@ -2101,7 +2315,7 @@ impl Exec {
     fn bind_stage(&mut self, p: &mut Prepared, allow_shadow: bool) -> Result<Bound, String> {
         super::images::BINDING_SHADER.with(|s| s.set(p.addr));
         let res_info = rdna::translate::res_info_offset(&p.tr.plan) as usize;
-        let mut bound = Bound { bufs: Vec::new(), imgs: Vec::new(), img_arrays: Vec::new(), writes: Vec::new(), sized_writes: Vec::new(), images: Vec::new(), shadows: Vec::new(), write_src: Vec::new() };
+        let mut bound = Bound { bufs: Vec::new(), imgs: Vec::new(), img_arrays: Vec::new(), writes: Vec::new(), sized_writes: Vec::new(), images: Vec::new(), shadows: Vec::new(), write_src: Vec::new(), placements: Vec::new() };
         let seg = SHADOW_BYTES;
         let fx = fixed();
         {
@@ -2120,6 +2334,7 @@ impl Exec {
                         let mut info = vk::DescriptorBufferInfo { buffer: fx.dummy, offset: 0, range: DUMMY_BYTES };
                         let mut bias = 0u64;
                         let mut bound_size = 0u64;
+                        let mut placement = Placement::None;
                         let read_only = size > 0 && !p.tr.plan.resources[i].written && matches!(p.resources[i], Resolved::Buffer(_));
                         // Inside a resident shadow: its working copy is newer.
                         let resident = if read_only { self.resident_read(base, size)? } else { None };
@@ -2127,6 +2342,12 @@ impl Exec {
                         let snap = if read_only && resident.is_none() { self.snapshot(base, size, super::tune::snap_max()) } else { None };
                         // Read-only bindings of buffers GPU work wrote: VRAM mirrors.
                         let mirrored = if read_only && snap.is_none() { resident.or_else(|| super::mirror::lookup(base, size)) } else { None };
+                        // Other read-only buffers: a copy made at the batch's start.
+                        let pre = if read_only && snap.is_none() && mirrored.is_none() { self.pre_copy(base, size) } else { None };
+                        if pre.is_some() {
+                            placement = Placement::PreCopy;
+                        }
+                        let snap = snap.or(pre);
                         let mut span = if size > 0 && mirrored.is_none() && snap.is_none() { span(base, size) } else { None };
                         if span.is_none() && size > 0 && mirrored.is_none() && snap.is_none() {
                             // A descriptor reaching past the end of its mappings
@@ -2140,10 +2361,14 @@ impl Exec {
                             }
                         }
                         if let Some((sbuf, soff, sbias)) = snap {
+                            if placement != Placement::PreCopy {
+                                placement = Placement::Snapshot;
+                            }
                             bias = sbias;
                             info = vk::DescriptorBufferInfo { buffer: sbuf, offset: soff, range: (sbias + size).next_multiple_of(4) };
                             bound_size = size;
                         } else if let Some((mbuf, moff, avail)) = mirrored {
+                            placement = if resident.is_some() { Placement::Resident } else { Placement::Mirror };
                             let align = ctx().limits.min_storage_buffer_offset_alignment.max(4);
                             let off = moff & !(align - 1);
                             bias = moff - off;
@@ -2156,6 +2381,7 @@ impl Exec {
                         } else if size > 0 {
                             match span {
                                 Some((buffer, start, end)) => {
+                                    placement = Placement::Host;
                                     let rel = base - start;
                                     let align = ctx().limits.min_storage_buffer_offset_alignment.max(4);
                                     let off = rel & !(align - 1);
@@ -2198,6 +2424,7 @@ impl Exec {
                                         (r.bias, r.size) = (lo, hi - lo);
                                         let r = *r;
                                         bound.shadows.push(Shadow { reused: true, ..r });
+                                        placement = Placement::ShadowReused;
                                         info = vk::DescriptorBufferInfo { buffer: self.shadow(), offset: r.shadow_off, range };
                                         SHADOWS_REUSED.fetch_add(1, Ordering::Relaxed);
                                     } else if want && s_off + 2 * span <= seg {
@@ -2212,6 +2439,7 @@ impl Exec {
                                         }
                                         self.shadow_used = s_off + 2 * span;
                                         bound.shadows.push(Shadow { host: buffer, guest: base - bias, reused: false, host_off: off, range, shadow_off: s_off, pristine_off: s_off + span, bias, size });
+                                        placement = Placement::Shadow;
                                         info = vk::DescriptorBufferInfo { buffer: self.shadow(), offset: s_off, range };
                                         SHADOWED.fetch_add(1, Ordering::Relaxed);
                                     }
@@ -2226,6 +2454,7 @@ impl Exec {
                                 }
                             }
                         }
+                        bound.placements.push((placement, bound_size, p.tr.plan.resources[i].written));
                         let ri = res_info + RES_INFO_DWORDS as usize * i;
                         p.sgpr_data[ri] = bias as u32;
                         p.sgpr_data[ri + 1] = stride;
@@ -2439,6 +2668,9 @@ impl Exec {
         self.reserve(&[&p]);
         let mut bound = self.bind_stage(&mut p, true)?;
         self.bind_sgpr(&p, &mut bound)?;
+        if profiling() {
+            note_placements(p.addr, groups, indirect.is_some(), &bound.placements);
+        }
         let t_bind = t0.elapsed();
         let set = self.alloc_set(set_layout)?;
         let writes_here = std::mem::take(&mut bound.writes);
@@ -2523,7 +2755,7 @@ impl Exec {
             }
         }
         stamp(2);
-        if !lazy_barriers() || !bound.shadows.is_empty() {
+        if !lazy_barriers() || (!bound.shadows.is_empty() && super::tune::shadow_barrier()) {
             global_barrier(self.cmd());
         }
         // Written shadows stay resident for the rest of the batch (see Shadow);
@@ -2644,13 +2876,17 @@ pub fn status() -> String {
         + &super::mirror::status()
         + &sync_why_status()
         + &format!(
-            "    buffer snapshots in VRAM: {} ({} MiB), {} reused, {} not for lack of space; draws with snapshotted indices {} ({} MiB)\n",
+            "    buffer snapshots in VRAM: {} ({} MiB), {} reused, {} not for lack of space; draws with snapshotted indices {} ({} MiB); batch-start copies {} ({} MiB), {} reused, {} not for lack of space\n",
             SNAPS.load(Ordering::Relaxed),
             SNAP_COPIED.load(Ordering::Relaxed) >> 20,
             SNAPS_REUSED.load(Ordering::Relaxed),
             SNAPS_FULL.load(Ordering::Relaxed),
             INDEX_SNAPS.load(Ordering::Relaxed),
-            INDEX_SNAP_BYTES.load(Ordering::Relaxed) >> 20
+            INDEX_SNAP_BYTES.load(Ordering::Relaxed) >> 20,
+            PRE_COPIES.load(Ordering::Relaxed),
+            PRE_BYTES.load(Ordering::Relaxed) >> 20,
+            PRE_REUSED.load(Ordering::Relaxed),
+            PRE_FULL.load(Ordering::Relaxed)
         )
         + &format!(
             "    guest memory imports: {} ({} MiB), {} over several mappings, {} dropped after remapping

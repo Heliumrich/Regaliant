@@ -550,10 +550,15 @@ fn sop1(tr: &mut T, ins: &Inst, name: &str) -> R<()> {
             set_s64(tr, d, l, h)?;
         }
         "s_getpc_b64" => {
-            // Address of the next instruction.
-            let pc = tr.spec.code_base + ins.pc as u64 + 4;
-            let lo = tr.u(pc as u32);
-            let hi = tr.u((pc >> 32) as u32);
+            // Address of the next instruction: the program's address (from
+            // the SGPR data) plus its offset.
+            let (bl, bh) = tr.code_base()?;
+            let base = to64(tr, bl, bh)?;
+            let off_lo = tr.u(ins.pc as u32 + 4);
+            let off_hi = tr.u(0);
+            let off = to64(tr, off_lo, off_hi)?;
+            let pc = e(tr.b.i_add(tr.t.u64, None, base, off))?;
+            let (lo, hi) = from64(tr, pc)?;
             set_s64(tr, d, lo, hi)?;
         }
         "s_abs_i32" => {

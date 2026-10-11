@@ -19,8 +19,10 @@ pub enum Ptr {
     User(u16),
     /// Pointer loaded from memory: dword pair at `offset` from another pointer.
     Mem(Box<Ptr>, u32),
-    /// Absolute address (e.g. from s_getpc_b64).
-    Abs(u64),
+    /// Program-relative address (s_getpc_b64): byte offset from the
+    /// program's first instruction, resolved with the address of the copy
+    /// that runs (the title loads the same program at several addresses).
+    Pc(u64),
 }
 
 /// Provenance of one SGPR dword.
@@ -170,7 +172,7 @@ fn writes_pair(name: &str) -> bool {
 
 /// Runs the analysis. User-data dword `i` (of `user_sgprs`) is loaded into
 /// SGPR `user_base + i` (8 for merged/NGG shaders, 0 otherwise).
-pub fn analyze(code: &[Inst], user_sgprs: u16, user_base: u16, code_base: u64) -> Plan {
+pub fn analyze(code: &[Inst], user_sgprs: u16, user_base: u16) -> Plan {
     let mut init = State { s: vec![Prov::Unknown; 128], lanes: Vec::new() };
     for i in 0..user_sgprs.min(32) {
         if let Some(s) = init.s.get_mut((user_base + i) as usize) {
@@ -235,7 +237,7 @@ pub fn analyze(code: &[Inst], user_sgprs: u16, user_base: u16, code_base: u64) -
         queued[b] = false;
         let mut st = entry[b].clone().unwrap();
         for ins in &code[starts[b]..end(b)] {
-            step(&mut st, ins, code_base, &mut scratch);
+            step(&mut st, ins, &mut scratch);
         }
         scratch = Plan::default();
         for &sb in &succ[b] {
@@ -257,7 +259,7 @@ pub fn analyze(code: &[Inst], user_sgprs: u16, user_base: u16, code_base: u64) -
     for b in 0..starts.len() {
         let Some(mut st) = entry[b].clone() else { continue };
         for ins in &code[starts[b]..end(b)] {
-            step(&mut st, ins, code_base, &mut plan);
+            step(&mut st, ins, &mut plan);
         }
     }
     for (i, r) in plan.resources.iter().enumerate() {
@@ -269,7 +271,7 @@ pub fn analyze(code: &[Inst], user_sgprs: u16, user_base: u16, code_base: u64) -
 }
 
 /// Transfer function of one instruction (records resources/loads in `plan`).
-fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
+fn step(st: &mut State, ins: &Inst, plan: &mut Plan) {
     // SGPR spills through VGPR lanes.
     if let Some((write, vgpr, lane)) = ins.const_lane_op() {
         if write {
@@ -289,9 +291,9 @@ fn step(st: &mut State, ins: &Inst, code_base: u64, plan: &mut Plan) {
             let s = ins.ssrc0();
             match name {
                 "s_getpc_b64" => {
-                    let pc = code_base + ins.pc as u64 + 4;
-                    st.set(d, Prov::PtrLo(Ptr::Abs(pc), 0));
-                    st.set(d + 1, Prov::PtrHi(Ptr::Abs(pc), 0));
+                    let pc = ins.pc as u64 + 4;
+                    st.set(d, Prov::PtrLo(Ptr::Pc(pc), 0));
+                    st.set(d + 1, Prov::PtrHi(Ptr::Pc(pc), 0));
                 }
                 "s_mov_b32" => st.set(d, src_operand(st, ins, s)),
                 "s_not_b32" => {
@@ -540,12 +542,12 @@ mod tests {
     fn getpc_descriptor_with_constant_first() {
         let words = [0u32; 13];
         let code = crate::decode_program(&words).unwrap();
-        let plan = analyze(&code, 0, 0, 0x1000);
+        let plan = analyze(&code, 0, 0);
         assert!(plan.errors.is_empty(), "{:?}", plan.errors);
         let r = &plan.resources[0];
         assert_eq!(r.kind, ResKind::Buffer);
-        // s_getpc_b64 is at pc 0xc: the next instruction's address.
-        let pc = Ptr::Abs(0x1000 + 0xc + 4);
+        // s_getpc_b64 is at pc 0xc: the next instruction's offset.
+        let pc = Ptr::Pc(0xc + 4);
         assert_eq!(r.dwords, vec![Prov::PtrLo(pc.clone(), 0x474), Prov::PtrHi(pc, 0x474), Prov::Const(16), Prov::Const(0x1000_5004)]);
     }
 }

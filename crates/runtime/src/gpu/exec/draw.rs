@@ -743,11 +743,15 @@ impl Exec {
                     c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, super::STAMPS * ti + k);
                 }
             }
-            // Index buffers: a snapshot in video memory (the input assembler
+            // Index buffers: a copy in video memory (the input assembler
             // fetches indices again for every instance; from system memory
             // across PCIe an instanced foliage draw took 4-8 ms, 0.2-0.3 ms
-            // from video memory).
-            let snap = a.index.and_then(|(addr, size)| self.snapshot(addr, a.count as u64 * size as u64, crate::gpu::tune::snap_index()));
+            // from video memory), made by the GPU at the batch's start, else
+            // by the CPU now.
+            let snap = a.index.and_then(|(addr, size)| {
+                let bytes = a.count as u64 * size as u64;
+                self.pre_copy(addr, bytes).or_else(|| self.snapshot(addr, bytes, crate::gpu::tune::snap_index()))
+            });
             match a.index {
                 Some((_, size)) if snap.is_some() => {
                     let (sbuf, soff, sbias) = snap.unwrap();

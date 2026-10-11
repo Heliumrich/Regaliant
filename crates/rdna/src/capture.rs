@@ -91,7 +91,7 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
     let insts = crate::decode_program(&code).map_err(|e| format!("decode error {}", e.0))?;
     let user_base = if u.stage == Stage::Vertex { 8 } else { 0 };
     let users = if u.stage == Stage::Vertex && u.users == 0 { 24 } else { u.users };
-    let plan = crate::analysis::analyze(&insts, users, user_base, addr);
+    let plan = crate::analysis::analyze(&insts, users, user_base);
     let wave64 = !insts.iter().any(|i| i.name().is_some_and(|n| n.ends_with("_saveexec_b32") || n.ends_with("_wrexec_b32")));
     let resources: Vec<ResSpec> = plan
         .resources

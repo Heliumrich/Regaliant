@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 18] = [
+    static ALL: [Tunable; 20] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -45,6 +45,8 @@ pub mod tune {
         Tunable { name: "lod_stats", env: "DS_LOD_STATS", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "cmp_emulate", env: "DS_CMP_EMULATE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "tex_waits", env: "DS_TEX_WAITS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "shadow_barrier", env: "DS_SHADOW_BARRIER", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_max", env: "DS_PRE_MAX", default: 4 << 20, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -113,6 +115,24 @@ pub mod tune {
     /// translates shaders anew.
     pub fn block_chain() -> u64 {
         get(10)
+    }
+
+    /// Read-only buffer bindings and index buffers up to this size are read
+    /// from a copy in video memory that the GPU makes at the start of their
+    /// batch (`Exec::pre_copy`; 0: off) instead of across PCIe (vertex data,
+    /// the per-item culls' meshes): draws took ~45% less GPU time and the
+    /// courtyard ran ~10% faster (in-run A/B, run 20261011-063258).
+    pub fn pre_max() -> u64 {
+        get(19)
+    }
+
+    /// A full barrier after every dispatch that binds a VRAM shadow (1, as
+    /// when shadows were merged back after each dispatch), or only the
+    /// barriers the title's synchronization asks for (0; with lazy barriers;
+    /// merges have their own). Consecutive per-item culls share the shadow
+    /// of one atomic argument buffer: with 1 they cannot overlap.
+    pub fn shadow_barrier() -> bool {
+        get(18) != 0
     }
 
     /// Which textures a draw or dispatch waits for GPU writes to (their guest
@@ -406,6 +426,7 @@ fn worker(q: &'static Queue, name: &str) {
                 q.cv.wait(&mut g);
             }
         };
+        cp.submitted_at = Some(batch.at);
         for (i, &(addr, size)) in batch.bufs.iter().enumerate() {
             if trace_submit() && size == 277 {
                 // Bink decode command buffers: their counter (dword 272) and
@@ -668,7 +689,7 @@ pub fn status_ex(with_stacks: bool) -> String {
         }
     }
     s.push_str(&format!(
-        "    gpu totals: {} submits, {} packets, {} draws, {} dispatches, {} EOP interrupts, {} flips, {} label waits latched, {} passed on promises, {} CP reads waited for another queue\n",
+        "    gpu totals: {} submits, {} packets, {} draws, {} dispatches, {} EOP interrupts, {} flips, {} label waits latched, {} passed on writes made after their submission, {} passed on promises, {} CP reads waited for another queue\n",
         SUBMITS.load(Ordering::Relaxed),
         cp::PACKETS.load(Ordering::Relaxed),
         cp::DRAWS.load(Ordering::Relaxed),
@@ -676,6 +697,7 @@ pub fn status_ex(with_stacks: bool) -> String {
         cp::EOP_INTERRUPTS.load(Ordering::Relaxed),
         FRAMES.load(Ordering::Relaxed),
         cp::LATCHED.load(Ordering::Relaxed),
+        cp::MISSED.load(Ordering::Relaxed),
         cp::PROMISED.load(Ordering::Relaxed),
         exec::FOREIGN_WAITS.load(Ordering::Relaxed)
     ));

@@ -153,6 +153,9 @@ pub struct Spec {
     pub user_sgprs: u16,
     /// First SGPR receiving user data (8 for NGG shaders, 0 otherwise).
     pub user_base: u16,
+    /// The program's address. Translations do not depend on it (the
+    /// shader reads it from the SGPR data, `code_base_offset`), except for
+    /// the DS_WAVEMASK diagnosis filter.
     pub code_base: u64,
     /// Wave64 (else wave32): lane numbering for cross-lane operations.
     pub wave64: bool,
@@ -230,7 +233,7 @@ pub const GDS_BYTES: u32 = 64 << 10;
 /// run until the driver declares the device lost (seen in Outpost Passage),
 /// which also stalls other applications' GPU work. A stopped invocation adds
 /// 1 to dword 0 of the watchdog binding and stores its program address
-/// (`Spec::code_base`) in dwords 1 (low) and 2 (high).
+/// (from the SGPR data, `code_base_offset`) in dwords 1 (low) and 2 (high).
 pub const LOOP_LIMIT: u32 = 1 << 20;
 /// Size of the watchdog binding in dwords.
 pub const WATCHDOG_DWORDS: u32 = 4;
@@ -290,9 +293,18 @@ pub fn res_info_offset(plan: &Plan) -> u32 {
     SGPR_DATA_USER + plan.loads.iter().map(|l| l.dwords).sum::<u32>()
 }
 
+/// Dword offset of the program's address (low, high dword) in the SGPR
+/// data buffer, after the resource info blocks: s_getpc_b64 and the loop
+/// watchdog read it, so one translation serves every copy of a program
+/// (the title loads the same code at several addresses, and streamed
+/// shaders land at different addresses in every run).
+pub fn code_base_offset(plan: &Plan) -> u32 {
+    res_info_offset(plan) + RES_INFO_DWORDS * plan.resources.len() as u32
+}
+
 /// Total dwords of the SGPR data buffer.
 pub fn sgpr_data_dwords(plan: &Plan) -> u32 {
-    res_info_offset(plan) + RES_INFO_DWORDS * plan.resources.len() as u32
+    code_base_offset(plan) + 2
 }
 
 pub(crate) struct Types {
@@ -339,6 +351,8 @@ pub(crate) struct T<'a> {
     pub sgpr_data: Word,
     pub load_offsets: Vec<u32>,
     pub res_info: u32,
+    /// Offset of the program's address in the SGPR data.
+    pub code_base_at: u32,
     pub buffers: HashMap<usize, Word>,
     pub images: HashMap<usize, ImageRes>,
     /// Image tables: resource -> pc of the load that reads its T#, and the
@@ -625,6 +639,12 @@ impl<'a> T<'a> {
         let i = self.u(idx);
         let p = e(self.b.access_chain(self.t.sb_u32, None, self.sgpr_data, [z, i]))?;
         e(self.b.load(self.t.u32, None, p, None, []))
+    }
+
+    /// The program's address (low, high dword) from the SGPR data.
+    pub fn code_base(&mut self) -> R<(Word, Word)> {
+        let i = self.code_base_at;
+        Ok((self.sgpr_data(i)?, self.sgpr_data(i + 1)?))
     }
 
     /// Dword `k` of resource `r`'s info block (0 bias, 1 stride, 2 num_records).
@@ -1387,6 +1407,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         sgpr_data: 0,
         load_offsets: load_offsets(plan),
         res_info: res_info_offset(plan),
+        code_base_at: code_base_offset(plan),
         buffers: HashMap::default(),
         images: HashMap::default(),
         samplers: HashMap::default(),
@@ -2021,11 +2042,10 @@ fn emit_watchdog_record(tr: &mut T) -> R<()> {
     let scope = tr.u(spirv::Scope::Device as u32);
     let one = tr.u(1);
     e(tr.b.atomic_i_add(tr.t.u32, None, p, scope, z, one))?;
-    let base = tr.spec.code_base;
-    for (k, v) in [(1, base as u32), (2, (base >> 32) as u32)] {
+    let (bl, bh) = tr.code_base()?;
+    for (k, c) in [(1, bl), (2, bh)] {
         let i = tr.u(k);
         let p = e(tr.b.access_chain(tr.t.sb_u32, None, wd, [z, i]))?;
-        let c = tr.u(v);
         ok(tr.b.store(p, c, None, []))?;
     }
     ok(tr.b.branch(end))?;
@@ -2283,6 +2303,23 @@ mod tests {
         assert!(lane0_elections(&code, &cs_spec([16, 8, 1])).is_empty());
     }
 
+    /// A program's translation does not depend on its address (s_getpc_b64,
+    /// the loop watchdog's record): copies at other addresses share it.
+    #[test]
+    fn translation_is_position_independent() {
+        // s_mov_b32 s0, 0; s_getpc_b64 s[4:5]; loop: s_add_u32 s0, s0, 1;
+        // s_cmp_lt_u32 s0, 10; s_cbranch_scc1 loop; s_endpgm
+        let words = [0xbe800380, 0xbe841f00, 0x80008100, 0xbf0a8a00, 0xbf85fffd, 0xbf810000];
+        let code = crate::decode_program(&words).unwrap();
+        assert_eq!(code[1].name(), Some("s_getpc_b64"));
+        let plan = crate::analysis::analyze(&code, 2, 0);
+        let a = cs_spec([64, 1, 1]);
+        let mut b = cs_spec([64, 1, 1]);
+        b.code_base = 0x7_1234_5000;
+        let (ta, tb) = (translate(&code, &plan, &a).unwrap(), translate(&code, &plan, &b).unwrap());
+        assert_eq!(ta.spirv, tb.spirv);
+    }
+
     /// v_interp_mov_f32 of P10 / P20 (cs 0x100cc3d100's foliage alpha test:
     /// P10, P0, P20 of attribute 0): that attribute is read per vertex; a
     /// lone P0 read (a flat value) is not.
@@ -2314,7 +2351,7 @@ mod tests {
         ];
         let code = crate::decode_program(&words).unwrap();
         assert_eq!(crate::wavemask::complete_masks(&code, true).into_iter().collect::<Vec<_>>(), vec![code[0].pc]);
-        let plan = crate::analysis::analyze(&code, 2, 0, 0);
+        let plan = crate::analysis::analyze(&code, 2, 0);
         let mut spec = cs_spec([64, 1, 1]);
         spec.cs_rsrc2 = 1 << 15;
         let out = translate(&code, &plan, &spec).unwrap();

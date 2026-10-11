@@ -127,11 +127,13 @@ pub struct Reader {
     /// Pointers loaded from memory so far (each resource dword names its
     /// pointer chain again).
     ptrs: Vec<(Ptr, u64)>,
+    /// Address of the program (program-relative pointers).
+    code_base: u64,
 }
 
 impl Reader {
-    pub fn new() -> Reader {
-        Reader { reads: Vec::new(), span: (0, 0), ptrs: Vec::new() }
+    pub fn new(code_base: u64) -> Reader {
+        Reader { reads: Vec::new(), span: (0, 0), ptrs: Vec::new(), code_base }
     }
 
     fn u32(&mut self, addr: u64) -> Option<u32> {
@@ -163,7 +165,7 @@ impl Reader {
                 self.ptrs.push((p.clone(), v));
                 Some(v)
             }
-            Ptr::Abs(a) => Some(*a),
+            Ptr::Pc(o) => Some(self.code_base + *o),
         }
     }
 
@@ -528,7 +530,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
         Some(p) => p,
         None => {
             let t0 = std::time::Instant::now();
-            let p = Arc::new(rdna::analysis::analyze(&insts, spec.user_sgprs, spec.user_base, addr));
+            let p = Arc::new(rdna::analysis::analyze(&insts, spec.user_sgprs, spec.user_base));
             let ms = t0.elapsed().as_millis();
             if ms >= 100 {
                 crate::info!("{:?} shader {addr:#x}: analysis took {ms} ms ({} instructions)", spec.stage, insts.len());
@@ -541,7 +543,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
     if !plan.errors.is_empty() {
         return Err(format!("{:?} shader {addr:#x}: {}", spec.stage, plan.errors.join("; ")));
     }
-    let mut rd = Reader::new();
+    let mut rd = Reader::new(addr);
     let mut resources = Vec::with_capacity(plan.resources.len());
     let mut res_addrs = Vec::with_capacity(plan.resources.len());
     spec.resources.clear();
@@ -619,9 +621,19 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
             }
         });
     }
+    // Translations do not depend on the program's address (see
+    // translate::code_base_offset): copies of a program share one, and its
+    // pipeline (the Vulkan pipeline cache finds it again in the next run).
     let spec_hash = {
+        static BY_ADDRESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let by_address = *BY_ADDRESS.get_or_init(|| std::env::var_os("DS_WAVEMASK").is_some());
+        let base = spec.code_base;
+        if !by_address {
+            spec.code_base = 0;
+        }
         let mut h = std::collections::hash_map::DefaultHasher::new();
         spec.hash(&mut h);
+        spec.code_base = base;
         h.finish()
     };
     let tr = {
@@ -666,6 +678,9 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
         }
     }
     sgpr_data.resize(translate::sgpr_data_dwords(&tr.plan) as usize, 0);
+    let cb = translate::code_base_offset(&tr.plan) as usize;
+    sgpr_data[cb] = addr as u32;
+    sgpr_data[cb + 1] = (addr >> 32) as u32;
     // Resource info blocks are filled when binding; until then no index
     // range check applies.
     let ri = translate::res_info_offset(&tr.plan) as usize;
