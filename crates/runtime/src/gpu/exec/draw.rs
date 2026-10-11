@@ -508,9 +508,22 @@ impl Exec {
         }
         // Shader stages.
         let ps_addr = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
-        let mut vs = shaders::prepare_ngg(cp)?;
+        // Stages prepared ahead by the workers (`gpu::ahead`) when they still
+        // hold, else here.
+        let [pre_vs, pre_ps] = cp.take_ahead();
+        let mut vs = match pre_vs.and_then(|s| crate::gpu::ahead::take(&s, cp, true)) {
+            Some(p) => p,
+            None => shaders::prepare_ngg(cp)?,
+        };
         lap.mark(0);
-        let mut ps = if ps_addr != 0 { Some(shaders::prepare_ps(cp)?) } else { None };
+        let mut ps = if ps_addr != 0 {
+            match pre_ps.and_then(|s| crate::gpu::ahead::take(&s, cp, true)) {
+                Some(p) => Some(p),
+                None => Some(shaders::prepare_ps(cp)?),
+            }
+        } else {
+            None
+        };
         lap.mark(1);
         self.sync_readers = [vs.addr, ps.as_ref().map_or(0, |p| p.addr)];
         // Each stage's reads in place (no combined copy per draw).

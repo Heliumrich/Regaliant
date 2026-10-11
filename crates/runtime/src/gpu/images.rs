@@ -18,6 +18,15 @@ use super::fx::Map as HashMap;
 /// added or removed, an image turning GPU-written, stencil links): cached
 /// shader preparations that decided depth views from it are revalidated.
 pub static LOOKUP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Changes when the GPU-written images (render targets, storage images,
+/// their aliases at the same addresses) change: what `Images::depth_view`
+/// answers for a texture depends only on them (texture keys have color
+/// formats; uploads, which stream all the time, do not move it).
+pub static GPU_IMAGES_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn gpu_images_changed() {
+    GPU_IMAGES_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
 
 /// Vulkan format of a gfx10 image FORMAT.
 pub fn vk_format(fmt: u16) -> Option<vk::Format> {
@@ -1496,6 +1505,9 @@ impl Images {
 
     /// Adds an image (keeps the by-address index).
     fn map_insert(&mut self, key: ImageKey, img: Image) {
+        if img.gpu_written || self.gpu_bases.contains(&key.base) {
+            gpu_images_changed();
+        }
         if self.map.insert(key, img).is_none() {
             self.by_base.entry(key.base).or_default().push(key);
         }
@@ -1505,6 +1517,9 @@ impl Images {
     fn map_remove(&mut self, key: &ImageKey) -> Option<Image> {
         let img = self.map.remove(key)?;
         LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+        if img.gpu_written || self.gpu_bases.contains(&key.base) {
+            gpu_images_changed();
+        }
         if let Some(v) = self.by_base.get_mut(&key.base) {
             v.retain(|k| k != key);
             if v.is_empty() {
@@ -1565,12 +1580,14 @@ impl Images {
         // GPU-owned from now on: guest memory is no longer its source.
         if !img.gpu_written {
             LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+            gpu_images_changed();
         }
         img.gpu_written = true;
         self.gpu_bases.insert(k.base);
         if s.stencil_base != 0 && has_stencil(k.format) {
             self.stencil_of.insert(s.stencil_base, k);
             LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+            gpu_images_changed();
             self.gpu_bases.insert(s.stencil_base);
         }
         if s.meta != 0 {
@@ -1921,6 +1938,7 @@ impl Images {
             }
             if !img.gpu_written {
                 LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+                gpu_images_changed();
             }
             img.gpu_written = true;
             img.source = None;

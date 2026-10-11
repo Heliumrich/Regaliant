@@ -3220,7 +3220,12 @@ impl Exec {
             self.flush_resident(Some(&[(a, 12)]))?;
         }
         let wave64 = initiator & (1 << 15) == 0;
-        let mut p = shaders::prepare_compute(cp, wave64)?;
+        // Prepared ahead by the workers (`gpu::ahead`) when it still holds.
+        let [pre, _] = cp.take_ahead();
+        let mut p = match pre.and_then(|s| super::ahead::take(&s, cp, wave64)) {
+            Some(p) => p,
+            None => shaders::prepare_compute(cp, wave64)?,
+        };
         self.sync_readers = [p.addr, 0];
         if self.sync_for(&p.reads, SYNC_CS_READS) {
             if let Some(c) = self.sync_culprit.take() {
@@ -3462,6 +3467,7 @@ pub fn status() -> String {
         + &crate::mem::remap_status()
         + &crate::titlemem::status()
         + &super::lodstats::status()
+        + &super::ahead::status()
         + &super::mirror::status()
         + &super::homes::status()
         + &sync_why_status()

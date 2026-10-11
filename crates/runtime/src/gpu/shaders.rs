@@ -130,6 +130,9 @@ fn program_checked(addr: u64) -> Result<(Arc<Vec<rdna::Inst>>, u64), String> {
 /// reads merged).
 pub struct Reader {
     pub reads: Vec<(u64, u64)>,
+    /// The words read, in the order of `reads` (a preparation made ahead of
+    /// execution is checked against them, see `words_unchanged`).
+    pub words: Vec<u32>,
     /// The mapping of the last read (no memory-map lookup inside it).
     span: (u64, u64),
     /// Pointers loaded from memory so far (each resource dword names its
@@ -141,7 +144,7 @@ pub struct Reader {
 
 impl Reader {
     pub fn new(code_base: u64) -> Reader {
-        Reader { reads: Vec::new(), span: (0, 0), ptrs: Vec::new(), code_base }
+        Reader { reads: Vec::new(), words: Vec::new(), span: (0, 0), ptrs: Vec::new(), code_base }
     }
 
     fn u32(&mut self, addr: u64) -> Option<u32> {
@@ -158,7 +161,9 @@ impl Reader {
             Some(r) if r.0 + r.1 == addr => r.1 += 4,
             _ => self.reads.push((addr, 4)),
         }
-        Some(unsafe { std::ptr::read_volatile(addr as *const u32) })
+        let w = unsafe { std::ptr::read_volatile(addr as *const u32) };
+        self.words.push(w);
+        Some(w)
     }
 
     /// Reads `out.len()` consecutive dwords at `addr` with one readability
@@ -181,6 +186,7 @@ impl Reader {
         for (k, o) in out.iter_mut().enumerate() {
             *o = unsafe { std::ptr::read_volatile((addr + 4 * k as u64) as *const u32) };
         }
+        self.words.extend_from_slice(out);
         true
     }
 
@@ -241,6 +247,174 @@ pub struct Prepared {
     pub user: Vec<u32>,
     /// Guest memory read while resolving (for write hazards).
     pub reads: Vec<(u64, u64)>,
+    /// The words read, in the order of `reads`.
+    pub words: Vec<u32>,
+    /// `mem::MAP_GEN` and `images::GPU_IMAGES_GEN` when it was made (a
+    /// preparation made ahead of execution is checked against them).
+    pub map_gen: u64,
+    pub images_gen: u64,
+    /// Image resources that depth-comparison instructions sample (bit per
+    /// resource index) and whether each was a depth view (the only part of a
+    /// preparation that depends on the image cache).
+    pub cmp_images: u64,
+    pub cmp_depth: u64,
+}
+
+/// Image resources (bit per index) that depth-comparison sampling
+/// instructions (`image_sample_c*`, `image_gather4_c*`) use: only for them
+/// does the translation depend on whether the image is a depth view.
+fn compare_images(plan_key: u64, insts: &[rdna::Inst], plan: &Plan) -> u64 {
+    thread_local! {
+        static MASKS: std::cell::RefCell<super::fx::Map<u64, u64>> = std::cell::RefCell::new(super::fx::Map::default());
+    }
+    MASKS.with(|m| {
+        *m.borrow_mut().entry(plan_key).or_insert_with(|| {
+            let mut mask = 0u64;
+            for i in insts {
+                let Some(name) = i.name() else { continue };
+                if name == "image_get_lod" || !(name.starts_with("image_sample") || name.starts_with("image_gather4")) {
+                    continue;
+                }
+                let has_c = name.trim_start_matches("image_sample").trim_start_matches("image_gather4").split('_').any(|m| m == "c");
+                if let (true, Some(&(ri, _))) = (has_c, plan.inst_res.get(&i.pc)) {
+                    if ri < 64 {
+                        mask |= 1 << ri;
+                    }
+                }
+            }
+            mask
+        })
+    })
+}
+
+/// Whether the depth-view decisions a preparation made for its compared
+/// images still hold (`images::Images::depth_view`).
+pub fn depth_views_hold(p: &Prepared) -> bool {
+    if p.cmp_images == 0 || p.images_gen == super::images::GPU_IMAGES_GEN.load(std::sync::atomic::Ordering::Acquire) {
+        return true;
+    }
+    super::images::with(|im| {
+        p.resources.iter().enumerate().all(|(i, r)| match r {
+            Resolved::Image(t) if i < 64 && p.cmp_images & (1 << i) != 0 => im.depth_view(t) == (p.cmp_depth & (1 << i) != 0),
+            _ => true,
+        })
+    })
+}
+
+/// The registers a stage preparation reads: the live command processor, or
+/// a snapshot taken ahead of execution (`StageRegs`).
+pub trait RegRead {
+    fn sh(&self, i: u32) -> u32;
+    /// Context register by byte address (0x28000..).
+    fn ctx(&self, a: u32) -> u32;
+}
+
+impl RegRead for Cp {
+    fn sh(&self, i: u32) -> u32 {
+        self.reg(Space::Sh, i)
+    }
+    fn ctx(&self, a: u32) -> u32 {
+        self.reg(Space::Ctx, (a - 0x28000) / 4)
+    }
+}
+
+/// The kind of stage a preparation is for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StageKind {
+    Vertex,
+    Pixel,
+    Compute,
+}
+
+/// SH registers (dword indices) and context registers (byte addresses) the
+/// preparation of a stage kind reads (`prepare_ngg`, `prepare_ps`,
+/// `prepare_compute`; keep in step with them).
+fn reg_lists(kind: StageKind) -> (&'static [u32], &'static [u32]) {
+    static LISTS: std::sync::OnceLock<[(Vec<u32>, Vec<u32>); 3]> = std::sync::OnceLock::new();
+    let l = LISTS.get_or_init(|| {
+        let vs_sh: Vec<u32> = [ES_PGM_LO, ES_PGM_LO + 1, GS_RSRC2].into_iter().chain(GS_USER_DATA..GS_USER_DATA + 32).collect();
+        let ps_sh: Vec<u32> = [PS_PGM_LO, PS_PGM_LO + 1, PS_RSRC2].into_iter().chain(PS_USER_DATA..PS_USER_DATA + 32).collect();
+        let mut ps_ctx: Vec<u32> = vec![SPI_PS_IN_CONTROL, SPI_PS_INPUT_ADDR, SPI_SHADER_COL_FORMAT];
+        ps_ctx.extend((0..32).map(|n| SPI_PS_INPUT_CNTL_0 + 4 * n));
+        ps_ctx.extend((0..8).map(|m| CB_COLOR0_INFO + 0x3C * m));
+        let cs_sh: Vec<u32> = [CS_PGM_LO, CS_PGM_LO + 1, CS_RSRC2, CS_NUM_THREAD, CS_NUM_THREAD + 1, CS_NUM_THREAD + 2].into_iter().chain(CS_USER_DATA..CS_USER_DATA + 16).collect();
+        let mut v = [(vs_sh, vec![VGT_SHADER_STAGES_EN]), (ps_sh, ps_ctx), (cs_sh, Vec::new())];
+        for (sh, ctx) in v.iter_mut() {
+            sh.sort_unstable();
+            ctx.sort_unstable();
+        }
+        v
+    });
+    let e = &l[kind as usize];
+    (&e.0, &e.1)
+}
+
+/// The registers a stage preparation reads, captured ahead of execution
+/// (values in the order of `reg_lists`).
+#[derive(Debug)]
+pub struct StageRegs {
+    pub kind: StageKind,
+    pub sh: Vec<u32>,
+    pub ctx: Vec<u32>,
+    /// A register outside the lists was read (the preparation is not used).
+    pub missed: std::sync::atomic::AtomicBool,
+}
+
+impl StageRegs {
+    pub fn capture<R: RegRead + ?Sized>(kind: StageKind, r: &R) -> StageRegs {
+        let (sh, ctx) = reg_lists(kind);
+        StageRegs { kind, sh: sh.iter().map(|&i| r.sh(i)).collect(), ctx: ctx.iter().map(|&a| r.ctx(a)).collect(), missed: std::sync::atomic::AtomicBool::new(false) }
+    }
+
+    /// Whether `r` holds the same values.
+    pub fn matches<R: RegRead + ?Sized>(&self, r: &R) -> bool {
+        let (sh, ctx) = reg_lists(self.kind);
+        sh.iter().zip(&self.sh).all(|(&i, &v)| r.sh(i) == v) && ctx.iter().zip(&self.ctx).all(|(&a, &v)| r.ctx(a) == v)
+    }
+}
+
+impl RegRead for StageRegs {
+    fn sh(&self, i: u32) -> u32 {
+        let (sh, _) = reg_lists(self.kind);
+        match sh.binary_search(&i) {
+            Ok(k) => self.sh[k],
+            Err(_) => {
+                self.missed.store(true, std::sync::atomic::Ordering::Relaxed);
+                0
+            }
+        }
+    }
+    fn ctx(&self, a: u32) -> u32 {
+        let (_, ctx) = reg_lists(self.kind);
+        match ctx.binary_search(&a) {
+            Ok(k) => self.ctx[k],
+            Err(_) => {
+                self.missed.store(true, std::sync::atomic::Ordering::Relaxed);
+                0
+            }
+        }
+    }
+}
+
+/// Whether the guest words a preparation read are still in memory (a
+/// preparation made ahead of execution is used only then).
+pub fn words_unchanged(p: &Prepared) -> bool {
+    let checked = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::Acquire) != p.map_gen;
+    let mut k = 0usize;
+    for &(a, n) in &p.reads {
+        let m = (n / 4) as usize;
+        if checked && !super::cp::guest_readable(a, n) {
+            return false;
+        }
+        let Some(want) = p.words.get(k..k + m) else { return false };
+        for (j, &w) in want.iter().enumerate() {
+            if unsafe { std::ptr::read_volatile((a + 4 * j as u64) as *const u32) } != w {
+                return false;
+            }
+        }
+        k += m;
+    }
+    k == p.words.len()
 }
 
 fn num_class(format: u16) -> NumClass {
@@ -259,8 +433,8 @@ const CS_USER_DATA: u32 = 0x240;
 
 /// Resolves and translates the compute shader bound on `cp`. `wave64` comes
 /// from the dispatch initiator (CS_W32_EN clear).
-pub fn prepare_compute(cp: &Cp, wave64: bool) -> Result<Prepared, String> {
-    let sh = |i: u32| cp.reg(Space::Sh, i);
+pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prepared, String> {
+    let sh = |i: u32| cp.sh(i);
     let addr = ((sh(CS_PGM_LO) as u64) | ((sh(CS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
     let rsrc2 = sh(CS_RSRC2);
     let user_sgprs = ((rsrc2 >> 1) & 0x1F).min(16) as u16;
@@ -307,9 +481,9 @@ const SPI_SHADER_COL_FORMAT: u32 = 0x28714;
 const CB_COLOR0_INFO: u32 = 0x28C70;
 
 /// Resolves and translates the pixel shader bound on `cp`.
-pub fn prepare_ps(cp: &Cp) -> Result<Prepared, String> {
-    let sh = |i: u32| cp.reg(Space::Sh, i);
-    let ctx = |a: u32| cp.reg(Space::Ctx, (a - 0x28000) / 4);
+pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
+    let sh = |i: u32| cp.sh(i);
+    let ctx = |a: u32| cp.ctx(a);
     let addr = ((sh(PS_PGM_LO) as u64) | ((sh(PS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
     let rsrc2 = sh(PS_RSRC2);
     let user_sgprs = user_count(rsrc2);
@@ -445,9 +619,9 @@ const GS_USER_DATA: u32 = 0x8C;
 const VGT_SHADER_STAGES_EN: u32 = 0x28B54;
 
 /// Resolves and translates the NGG (vertex) shader bound on `cp`.
-pub fn prepare_ngg(cp: &Cp) -> Result<Prepared, String> {
-    let sh = |i: u32| cp.reg(Space::Sh, i);
-    let stages = cp.reg(Space::Ctx, (VGT_SHADER_STAGES_EN - 0x28000) / 4);
+pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
+    let sh = |i: u32| cp.sh(i);
+    let stages = cp.ctx(VGT_SHADER_STAGES_EN);
     let addr = ((sh(ES_PGM_LO) as u64) | ((sh(ES_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
     let rsrc2 = sh(GS_RSRC2);
     let user_sgprs = user_count(rsrc2);
@@ -475,6 +649,16 @@ pub fn prepare_ngg(cp: &Cp) -> Result<Prepared, String> {
         lod_stats: super::tune::lod_stats() == 3,
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
+}
+
+/// Program address of the pixel shader in a register view.
+pub fn ps_addr_of<R: RegRead + ?Sized>(r: &R) -> u64 {
+    ((r.sh(PS_PGM_LO) as u64) | ((r.sh(PS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8
+}
+
+/// Program address of the NGG (vertex) shader in a register view.
+pub fn ngg_addr_of<R: RegRead + ?Sized>(r: &R) -> u64 {
+    ((r.sh(ES_PGM_LO) as u64) | ((r.sh(ES_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8
 }
 
 /// Program address of the pixel shader bound on `cp`.
@@ -906,6 +1090,8 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
     if cacheable {
         PREP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    let map_gen = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
+    let images_gen = super::images::GPU_IMAGES_GEN.load(std::sync::atomic::Ordering::Acquire);
     let mut rd = Reader::new(addr);
     let mut resources = Vec::with_capacity(plan.resources.len());
     let mut res_addrs = Vec::with_capacity(plan.resources.len());
@@ -980,14 +1166,32 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
             }
         }
     }
+    // Depth views keep the hardware comparison, color views emulate it: the
+    // image cache decides, for the images comparison instructions sample
+    // (the others' translation does not depend on it).
+    let mut cmp_images = 0u64;
+    let mut cmp_depth = 0u64;
     if super::tune::cmp_emulate() && resources.iter().any(|r| matches!(r, Resolved::Image(_))) {
-        super::images::with(|im| {
-            for (r, s) in resources.iter().zip(spec.resources.iter_mut()) {
-                if let (Resolved::Image(t), ResSpec::Image { depth, .. }) = (r, s) {
-                    *depth = im.depth_view(t);
-                }
+        cmp_images = compare_images(plan_key, &insts, &plan);
+        for (r, s) in resources.iter().zip(spec.resources.iter_mut()) {
+            if let (Resolved::Image(_), ResSpec::Image { depth, .. }) = (r, s) {
+                *depth = false;
             }
-        });
+        }
+        if cmp_images != 0 {
+            super::images::with(|im| {
+                for (i, (r, s)) in resources.iter().zip(spec.resources.iter_mut()).enumerate() {
+                    if let (Resolved::Image(t), ResSpec::Image { depth, .. }) = (r, s) {
+                        if i < 64 && cmp_images & (1 << i) != 0 {
+                            *depth = im.depth_view(t);
+                            if *depth {
+                                cmp_depth |= 1 << i;
+                            }
+                        }
+                    }
+                }
+            });
+        }
     }
     // Translations do not depend on the program's address (see
     // translate::code_base_offset): copies of a program share one, and its
@@ -1089,7 +1293,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
             _ => {}
         }
     }
-    let prepared = Prepared { stage: spec.stage, addr, insts, tr, resources, res_addrs, sgpr_data, user: user.to_vec(), reads: rd.reads };
+    let prepared = Prepared { stage: spec.stage, addr, insts, tr, resources, res_addrs, sgpr_data, user: user.to_vec(), reads: rd.reads, words: rd.words, map_gen, images_gen, cmp_images, cmp_depth };
     let mut words = Vec::new();
     if cacheable && read_words(&prepared.reads, &mut words) {
         let e = PrepEntry { key: prep_key, words, prepared: prepared.clone() };
