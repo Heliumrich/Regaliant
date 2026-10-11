@@ -81,6 +81,17 @@ pub fn vk_format(fmt: u16) -> Option<vk::Format> {
 }
 
 /// Bytes per element: texel, or 4x4 block of compressed formats (log2).
+/// Bytes of guest memory a T#'s resource spans (all mips and layers), if
+/// its format and swizzle mode are known.
+pub fn guest_size(t: &Tsharp) -> Option<u64> {
+    let key = Images::key_of(t)?;
+    let el = elem_log2(t.format)?;
+    if key.ty3d {
+        return tiling::layout_3d(t.sw_mode, el, key.width, key.height, key.layers).map(|l| l.size());
+    }
+    tiling::layout(t.sw_mode, el, key.width, key.height, key.levels, is_block(t.format)).map(|l| l.size(key.layers))
+}
+
 pub fn elem_log2(fmt: u16) -> Option<u32> {
     let f = rdna::format::gfx10(fmt)?;
     Some(f.bytes().trailing_zeros())
@@ -453,6 +464,8 @@ fn all_hashes(base: u64, size: u64) -> [u64; SLICES] {
 
 pub struct Images {
     map: HashMap<ImageKey, Image>,
+    /// The keys of `map` by base address (`alias` lookups).
+    by_base: HashMap<u64, Vec<ImageKey>>,
     /// Addresses with a GPU-written image (render targets, storage images,
     /// stencil planes).
     gpu_bases: std::collections::HashSet<u64>,
@@ -515,7 +528,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
                 .expect("image pool");
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
-            *g = Some(Images { map: HashMap::new(), gpu_bases: Default::default(), stencil_of: HashMap::new(), meta_of: HashMap::new(), pending_clears: HashMap::new(), samplers: HashMap::new(), pool, cmd, fence, reported: HashMap::new(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::new(), retired: Vec::new(), depth_grows: 0 });
+            *g = Some(Images { map: HashMap::new(), by_base: HashMap::new(), gpu_bases: Default::default(), stencil_of: HashMap::new(), meta_of: HashMap::new(), pending_clears: HashMap::new(), samplers: HashMap::new(), pool, cmd, fence, reported: HashMap::new(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::new(), retired: Vec::new(), depth_grows: 0 });
         }
     }
     f(g.as_mut().unwrap())
@@ -1031,11 +1044,12 @@ impl Images {
     /// rendered slice by slice, or sampled whole, makes its image grow
     /// (`grow_depth`) instead of splitting into one image per view.
     pub fn depth_to_grow(&self, base: u64, width: u32, height: u32, depths: &[vk::Format], layers: u32) -> Option<ImageKey> {
-        let same = |k: &ImageKey| k.base == base && k.width == width && k.height == height && !k.ty3d && depths.contains(&k.format);
-        if self.map.keys().any(|k| same(k) && k.layers >= layers) {
+        let same = |k: &ImageKey| k.width == width && k.height == height && !k.ty3d && depths.contains(&k.format);
+        let at = self.by_base.get(&base)?;
+        if at.iter().any(|k| same(k) && k.layers >= layers) {
             return None;
         }
-        self.map.iter().filter(|(k, i)| i.gpu_written && same(k) && k.layers < layers).map(|(k, _)| *k).max_by_key(|k| k.layers)
+        at.iter().filter(|k| same(k) && k.layers < layers && self.map.get(k).is_some_and(|i| i.gpu_written)).copied().max_by_key(|k| k.layers)
     }
 
     /// Depth formats a sampled texture of `format` can read (R32 float over
@@ -1056,7 +1070,7 @@ impl Images {
         let new_key = ImageKey { layers, ..old };
         let image = self.create(new_key)?;
         self.to_general(image, new_key.format);
-        let Some(prev) = self.map.remove(&old) else { return Err("grow_depth: image gone".into()) };
+        let Some(prev) = self.map_remove(&old) else { return Err("grow_depth: image gone".into()) };
         let aspect = aspects(old.format);
         self.one_shot(|cmd| unsafe {
             let d = &ctx().device;
@@ -1072,7 +1086,7 @@ impl Images {
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
         });
-        self.map.insert(new_key, Image { image, key: new_key, views: HashMap::new(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: prev.write_gen, block_gen: 0, span: 0, layout: None, overwritten: false });
+        self.map_insert(new_key, Image { image, key: new_key, views: HashMap::new(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: prev.write_gen, block_gen: 0, span: 0, layout: None, overwritten: false });
         for v in self.stencil_of.values_mut() {
             if *v == old {
                 *v = new_key;
@@ -1123,6 +1137,19 @@ impl Images {
     /// rendered depth or stencil) holds newer data than guest memory: render
     /// targets are not written back, so an upload made before the surface
     /// was first rendered (e.g. the depth buffer read at boot) is stale.
+    /// Whether binding `t` may read its guest memory now: a texture not cached
+    /// yet or one uploaded from guest memory (refreshed when written there).
+    /// Images the GPU owns are read from their Vulkan image; buffer writes
+    /// over them are reloaded separately (`reload_overwritten`, which waits
+    /// for the writers itself).
+    pub fn reads_guest(&self, t: &Tsharp) -> bool {
+        let Some(key) = Self::key_of(t) else { return true };
+        match self.lookup(&key, false) {
+            Some((k, _)) => !self.map.get(&k).is_some_and(|i| i.gpu_written),
+            None => true,
+        }
+    }
+
     fn lookup(&self, key: &ImageKey, storage: bool) -> Option<(ImageKey, &'static str)> {
         let exact = self.map.get(key).map(|i| i.gpu_written);
         if exact == Some(true) {
@@ -1153,13 +1180,19 @@ impl Images {
             if !is_compressed(k.format) || k.ty3d || out.iter().any(|c| c.key == *k) {
                 continue;
             }
+            if !self.gpu_bases.contains(&k.base) {
+                continue;
+            }
             let Some(dst) = self.map.get(k) else { continue };
             let (bw, bh) = (k.width.div_ceil(4), k.height.div_ceil(4));
             let bytes = texel_bytes(k.format);
             let src = self
-                .map
-                .values()
-                .filter(|i| i.gpu_written && i.key.base == k.base && !is_compressed(i.key.format) && !i.key.ty3d)
+                .by_base
+                .get(&k.base)
+                .into_iter()
+                .flatten()
+                .filter_map(|kk| self.map.get(kk))
+                .filter(|i| i.gpu_written && !is_compressed(i.key.format) && !i.key.ty3d)
                 .filter(|i| texel_bytes(i.key.format) == bytes && i.key.width == bw && i.key.height == bh && i.write_gen > dst.block_gen)
                 .max_by_key(|i| i.write_gen);
             let Some(src) = src else { continue };
@@ -1255,7 +1288,7 @@ impl Images {
             self.report(format!("texture {:#x} is not write-tracked (read-only or unmapped pages): later CPU updates are not seen", t.base));
         }
         let hashes = source.map(|(b, n)| all_hashes(b, n)).unwrap_or([0; SLICES]);
-        self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: false, source: region, hashes, checked_frame: frame, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false });
+        self.map_insert(key, Image { image, key, views: HashMap::new(), gpu_written: false, source: region, hashes, checked_frame: frame, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false });
         self.note_layout(key, t);
         Ok(key)
     }
@@ -1448,14 +1481,32 @@ impl Images {
         Ok(())
     }
 
+    /// Adds an image (keeps the by-address index).
+    fn map_insert(&mut self, key: ImageKey, img: Image) {
+        if self.map.insert(key, img).is_none() {
+            self.by_base.entry(key.base).or_default().push(key);
+        }
+    }
+
+    fn map_remove(&mut self, key: &ImageKey) -> Option<Image> {
+        let img = self.map.remove(key)?;
+        if let Some(v) = self.by_base.get_mut(&key.base) {
+            v.retain(|k| k != key);
+            if v.is_empty() {
+                self.by_base.remove(&key.base);
+            }
+        }
+        Some(img)
+    }
+
     /// An existing image at `key`'s address with the same size that can be
     /// viewed in `key`'s format (optionally only GPU-written ones).
     fn alias(&self, key: &ImageKey, gpu_written_only: bool) -> Option<ImageKey> {
-        self.map
+        self.by_base
+            .get(&key.base)?
             .iter()
-            .filter(|(k, i)| {
-                (!gpu_written_only || i.gpu_written)
-                    && k.base == key.base
+            .filter(|k| {
+                self.map.get(k).is_some_and(|i| !gpu_written_only || i.gpu_written)
                     && k.width == key.width
                     && k.height == key.height
                     && k.layers >= key.layers
@@ -1463,7 +1514,7 @@ impl Images {
                     && k.ty3d == key.ty3d
                     && view_compatible(k.format, key.format)
             })
-            .map(|(k, _)| *k)
+            .copied()
             .max_by_key(|k| (k.format == key.format, k.levels, k.layers))
     }
 
@@ -1479,7 +1530,7 @@ impl Images {
         } else {
             let image = self.create(key)?;
             self.to_general(image, key.format);
-            self.map.insert(key, Image { image, key, views: HashMap::new(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false });
+            self.map_insert(key, Image { image, key, views: HashMap::new(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false });
             self.gpu_bases.insert(key.base);
             crate::info!("images: new render target {:#x} {}x{} {:?} at flip {}", key.base, key.width, key.height, key.format, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
             // DS_CAPTURE_NEW_RT=<hex base>: capture the frame after a render

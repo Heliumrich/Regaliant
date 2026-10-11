@@ -485,11 +485,11 @@ impl Exec {
             vs = shaders::prepare_ngg(cp)?;
             ps = if ps_addr != 0 { Some(shaders::prepare_ps(cp)?) } else { None };
         }
-        let mut ranges = texture_ranges(&vs);
+        let mut textures = texture_ranges(&vs);
         if let Some(p) = &ps {
-            ranges.extend(texture_ranges(p));
+            textures.extend(texture_ranges(p));
         }
-        self.sync_for(&ranges, SYNC_DRAW_TEXTURES);
+        self.sync_textures(&textures, SYNC_DRAW_TEXTURES);
         if let Some((addr, size)) = a.index {
             self.sync_for(&[(addr, a.count as u64 * size as u64)], SYNC_DRAW_INDICES);
         }
@@ -580,19 +580,18 @@ impl Exec {
             key.hash(&mut h);
             h.finish()
         };
-        let cached = shared().gfx.get(&hkey).map(|p| (p.pipeline, p.layout, p.set_layout));
+        let cached = gfx_pipe(hkey);
         let (pipeline, layout, set_layout) = match cached {
             Some(x) => x,
             None => {
                 let t0 = std::time::Instant::now();
                 let p = graphics_pipeline(&key, &vs, ps.as_ref())?;
+                super::PIPES_CREATED[1].fetch_add(1, Ordering::Relaxed);
                 let ms = t0.elapsed().as_millis();
                 if ms >= 200 {
                     crate::info!("gpu: graphics pipeline for vs {:#x} ps {ps_addr:#x} took {ms} ms", vs.addr);
                 }
-                let r = (p.pipeline, p.layout, p.set_layout);
-                shared().gfx.insert(hkey, p);
-                r
+                keep_gfx_pipe(hkey, p)
             }
         };
         // Depth arrays sampled with more layers than rendered so far.
@@ -760,7 +759,7 @@ impl Exec {
                 }
                 Some((addr, size)) => {
                     let bytes = a.count as u64 * size as u64;
-                    let span = shared().span(addr, bytes);
+                    let span = super::span(addr, bytes);
                     let Some((buffer, start, _)) = span else {
                         return Err(format!("index buffer {addr:#x}+{bytes:#x} is not mapped GPU memory (draw skipped)"));
                     };
@@ -790,7 +789,9 @@ impl Exec {
             if !b.sized_writes.is_empty() {
                 crate::gpu::images::with(|im| im.note_overwrites(&b.sized_writes));
             }
-            self.pending_writes.extend(b.writes);
+            for &(w, n) in &b.writes {
+                self.note_write(w, n);
+            }
         }
         Ok(true)
     }

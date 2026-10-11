@@ -97,9 +97,74 @@ pub fn remap_status() -> String {
     )
 }
 
-/// Incremented whenever guest mappings change (GPU zero-copy imports of guest
-/// memory are revalidated against it).
+/// Incremented whenever guest mappings or their protections change (inside
+/// the MEM lock): per-thread caches of readable ranges are valid for one
+/// value (`readable_span`).
 pub static MAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// This thread's recently confirmed runs of readable mappings, valid for
+    /// one MAP_GEN value, most recent first.
+    static READABLE: std::cell::RefCell<(u64, Vec<(u64, u64)>)> = const { std::cell::RefCell::new((u64::MAX, Vec::new())) };
+}
+
+/// The run of adjacent accessible mappings containing `a` as [start, end)
+/// (at most 64 mappings either side), from a per-thread cache when the
+/// mappings have not changed since (the GPU command processors check every
+/// descriptor and buffer they read; the mapping table lock is shared with
+/// the title's threads).
+pub fn readable_span(a: u64) -> Option<(u64, u64)> {
+    let generation = MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
+    let hit = READABLE.with(|c| {
+        let c = c.borrow();
+        if c.0 != generation {
+            return None;
+        }
+        c.1.iter().copied().find(|&(s, e)| s <= a && a < e)
+    });
+    if hit.is_some() {
+        return hit;
+    }
+    let run = {
+        let st = MEM.lock();
+        let usable = |v: &Vma| v.kind != VmaKind::Reserved && v.prot != 0;
+        let v = st.find(a).filter(|v| usable(v))?;
+        let (mut start, mut end) = (v.start, v.end());
+        for _ in 0..64 {
+            match st.vmas.range(..start).next_back().map(|(_, p)| p).filter(|p| p.end() == start && usable(p)) {
+                Some(p) => start = p.start,
+                None => break,
+            }
+        }
+        for _ in 0..64 {
+            match st.vmas.get(&end).filter(|p| usable(p)) {
+                Some(p) => end = p.end(),
+                None => break,
+            }
+        }
+        (start, end)
+    };
+    READABLE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0 != generation {
+            c.0 = generation;
+            c.1.clear();
+        }
+        c.1.insert(0, run);
+        c.1.truncate(16);
+    });
+    Some(run)
+}
+
+/// Whether guest [a, a+len) is accessible (`readable_span`, else `mapped`).
+pub fn readable(a: u64, len: u64) -> bool {
+    let end = a.saturating_add(len.max(1));
+    match readable_span(a) {
+        Some((_, e)) if end <= e => true,
+        Some(_) => mapped(a, len),
+        None => false,
+    }
+}
 
 /// Guest ranges whose host pages were committed or decommitted since the
 /// GPU executor last looked: its imports of guest memory pin the pages they
@@ -438,6 +503,7 @@ impl MemState {
             v.prot = prot;
             host_protect(v.start, v.size, prot)?;
         }
+        MAP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 

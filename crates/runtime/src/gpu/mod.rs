@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 17] = [
+    static ALL: [Tunable; 18] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -44,6 +44,7 @@ pub mod tune {
         Tunable { name: "slots", env: "DS_GPU_SLOTS", default: 4, value: AtomicU64::new(UNSET) },
         Tunable { name: "lod_stats", env: "DS_LOD_STATS", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "cmp_emulate", env: "DS_CMP_EMULATE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "tex_waits", env: "DS_TEX_WAITS", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -114,6 +115,14 @@ pub mod tune {
         get(10)
     }
 
+    /// Which textures a draw or dispatch waits for GPU writes to (their guest
+    /// memory): 1 those a coarse bound finds written, then only the ones read
+    /// from guest memory now, with their exact span (`Exec::sync_textures`);
+    /// 0 every texture with the coarse bound of 16 bytes per texel (A/B).
+    pub fn tex_waits() -> u64 {
+        get(17)
+    }
+
     /// Indirect dispatches whose arguments GPU work still writes read them on
     /// the GPU (else the command processor waits for that work first).
     pub fn gpu_indirect() -> bool {
@@ -175,6 +184,7 @@ pub mod pcache;
 pub mod lodstats;
 pub mod pstats;
 pub mod mirror;
+pub mod ranges;
 pub mod images;
 pub mod png;
 pub mod track;
@@ -502,6 +512,11 @@ static PROFILE_FN: Mutex<Option<(std::collections::HashMap<(&'static str, String
 /// of ours on the stack: where command processing spends its CPU time.
 static PROFILE_BUSY: Mutex<Option<std::collections::HashMap<(&'static str, String), u64>>> = Mutex::new(None);
 
+/// Samples of a queue kind blocked on a mutex (parking_lot `lock_slow` or an
+/// SRW lock), by the innermost function of ours on the stack: who waits for
+/// which lock.
+static PROFILE_LOCKS: Mutex<Option<std::collections::HashMap<(&'static str, String), u64>>> = Mutex::new(None);
+
 pub fn start_profiler() {
     if std::env::var("DS_PROFILE_GPU").ok().as_deref() != Some("1") {
         return;
@@ -509,6 +524,7 @@ pub fn start_profiler() {
     *PROFILE.lock() = Some(std::collections::HashMap::new());
     *PROFILE_FN.lock() = Some(Default::default());
     *PROFILE_BUSY.lock() = Some(Default::default());
+    *PROFILE_LOCKS.lock() = Some(Default::default());
     let _ = crate::thread::spawn_host(
         "gpu-profiler",
         1 << 20,
@@ -529,9 +545,13 @@ pub fn start_profiler() {
                     let kind = if q.id == GFX { "gfx" } else { "acb" };
                     let mut fns: Vec<&str> = host.split(" <- ").map(|f| f.split("+0x").next().unwrap_or(f)).collect();
                     let waiting = fns.iter().any(|f| f.contains("Wait") || f.contains("Sleep") || f.contains("DelayExecution") || f.contains("SetTimer") || f.contains("CreateWaitableTimer"));
+                    let ours = fns.iter().find(|f| (f.starts_with("dsport::") || f.starts_with("rdna::")) && !f.contains("parking_lot")).copied().unwrap_or("(none)");
                     if !waiting {
-                        let ours = fns.iter().find(|f| f.starts_with("dsport::") || f.starts_with("rdna::")).copied().unwrap_or("(none)");
                         if let Some(m) = PROFILE_BUSY.lock().as_mut() {
+                            *m.entry((kind, ours.to_string())).or_default() += 1;
+                        }
+                    } else if fns.iter().any(|f| f.contains("lock_slow") || f.contains("AcquireSRWLock")) {
+                        if let Some(m) = PROFILE_LOCKS.lock().as_mut() {
                             *m.entry((kind, ours.to_string())).or_default() += 1;
                         }
                     }
@@ -559,6 +579,9 @@ pub fn reset_profile() {
         n.clear();
     }
     if let Some(m) = PROFILE_BUSY.lock().as_mut() {
+        m.clear();
+    }
+    if let Some(m) = PROFILE_LOCKS.lock().as_mut() {
         m.clear();
     }
     exec::reset_shader_profile();
@@ -604,6 +627,17 @@ fn profile_summary() -> String {
             s.push_str(&format!("    gpu profile {kind} busy (not waiting): {busy} samples, by innermost function of ours:\n"));
             for (f, n) in v.iter().take(30) {
                 s.push_str(&format!("      {:5.1}%  {f}\n", **n as f64 * 100.0 / busy.max(1) as f64));
+            }
+        }
+    }
+    if let Some(m) = PROFILE_LOCKS.lock().as_ref() {
+        for kind in ["gfx", "acb"] {
+            let mut v: Vec<(&String, &u64)> = m.iter().filter(|((k, _), _)| *k == kind).map(|((_, f), n)| (f, n)).collect();
+            let total: u64 = v.iter().map(|x| *x.1).sum();
+            v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            s.push_str(&format!("    gpu profile {kind} lock waits: {total} samples, by innermost function of ours:\n"));
+            for (f, n) in v.iter().take(15) {
+                s.push_str(&format!("      {n:6}  {f}\n"));
             }
         }
     }

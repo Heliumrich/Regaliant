@@ -70,19 +70,28 @@ pub const SYNC_DRAW_READS: usize = 3;
 pub const SYNC_DRAW_TEXTURES: usize = 4;
 pub const SYNC_DRAW_INDICES: usize = 5;
 
+/// Pipelines created (compute, graphics): new translations or states.
+pub static PIPES_CREATED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 fn sync_why_status() -> String {
     let n: Vec<u64> = SYNC_WHY.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    CP read waits: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices
-",
-        n[0], n[1], n[2], n[3], n[4], n[5]
+        "    CP read waits: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices; pipelines created: {} compute, {} graphics\n",
+        n[0],
+        n[1],
+        n[2],
+        n[3],
+        n[4],
+        n[5],
+        PIPES_CREATED[0].load(Ordering::Relaxed),
+        PIPES_CREATED[1].load(Ordering::Relaxed)
     )
 }
 
 /// Time the completion thread spent waiting for fences / running actions (ns).
 pub static FENCE_NS: AtomicU64 = AtomicU64::new(0);
 pub static ACTION_NS: AtomicU64 = AtomicU64::new(0);
-/// Watchdog record of `Shared` (host visible; null before GPU execution starts).
+/// Watchdog record of `Fixed` (host visible; null before GPU execution starts).
 static WATCHDOG_PTR: std::sync::atomic::AtomicPtr<u32> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 /// Invocations stopped by the loop watchdog (`rdna::translate::LOOP_LIMIT`).
 pub static WATCHDOG_STOPS: AtomicU64 = AtomicU64::new(0);
@@ -147,11 +156,8 @@ struct Pipe {
     set_layout: vk::DescriptorSetLayout,
 }
 
-struct Shared {
-    spans: Vec<Span>,
-    pipes: HashMap<u64, Pipe>,
-    /// Graphics pipelines by state hash.
-    gfx: HashMap<u64, Pipe>,
+/// Buffers every queue binds, created once.
+struct Fixed {
     gds: vk::Buffer,
     /// Register dumps (`DS_DUMP`), host visible.
     debug: vk::Buffer,
@@ -164,16 +170,37 @@ struct Shared {
     import_align: u64,
 }
 
-unsafe impl Send for Shared {}
+unsafe impl Send for Fixed {}
+unsafe impl Sync for Fixed {}
 
-static SHARED: Mutex<Option<Shared>> = Mutex::new(None);
+static FIXED: std::sync::OnceLock<Fixed> = std::sync::OnceLock::new();
+
+/// Imported guest-memory windows. Every buffer binding of every queue looks
+/// one up, imports and remap invalidations are rare: a read-mostly lock, and
+/// `SPAN_GEN` changes with every change so that threads can keep their
+/// recent hits (`SPAN_CACHE`). (One mutex used to guard these, the pipeline
+/// maps and the fixed buffers, held across whole binding loops and pipeline
+/// compiles: the queue threads spent as much time waiting for it as working.)
+static SPANS: parking_lot::RwLock<Vec<Span>> = parking_lot::RwLock::new(Vec::new());
+static SPAN_GEN: AtomicU64 = AtomicU64::new(1);
+const SPAN_CACHE_LEN: usize = 16;
+
+thread_local! {
+    /// Recently used imports of this thread (start, end, buffer), valid for
+    /// one `SPAN_GEN`, most recent first.
+    static SPAN_CACHE: std::cell::RefCell<(u64, Vec<(u64, u64, vk::Buffer)>)> = const { std::cell::RefCell::new((0, Vec::new())) };
+}
+
+/// Compute pipelines by translation key; graphics pipelines by state hash.
+/// Pipelines are created outside these locks.
+static PIPES: Mutex<Option<HashMap<u64, Pipe>>> = Mutex::new(None);
+static GFX_PIPES: Mutex<Option<HashMap<u64, Pipe>>> = Mutex::new(None);
 
 /// Contents of the register-dump buffer (`DS_DUMP`); `clear` zeroes it
 /// (call with no GPU work using it in flight).
 pub fn debug_dump(clear: bool) -> Vec<u32> {
-    let sh = shared();
     let n = rdna::translate::DUMP_DWORDS as usize;
-    let p = sh.debug_ptr as *mut u32;
+    let p = fixed().debug_ptr as *mut u32;
     let v = unsafe { std::slice::from_raw_parts(p, n).to_vec() };
     if clear {
         unsafe { std::ptr::write_bytes(p, 0, n) };
@@ -187,9 +214,8 @@ const WINDOW: u64 = 64 << 20;
 const UNBOUNDED_MAX: u64 = 256 << 20;
 const DUMMY_BYTES: u64 = 64 << 10;
 
-fn shared() -> parking_lot::MappedMutexGuard<'static, Shared> {
-    let mut g = SHARED.lock();
-    if g.is_none() {
+fn fixed() -> &'static Fixed {
+    FIXED.get_or_init(|| {
         let c = ctx();
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC;
         let (gds, _) = c.device_buffer(rdna::translate::GDS_BYTES as u64, usage).expect("GDS buffer");
@@ -216,166 +242,224 @@ fn shared() -> parking_lot::MappedMutexGuard<'static, Shared> {
             c.device.destroy_fence(fence, None);
             c.device.destroy_command_pool(pool, None);
         }
-        *g = Some(Shared {
-            spans: Vec::new(),
-            pipes: HashMap::new(),
-            gfx: HashMap::new(),
-            gds,
-            debug,
-            debug_ptr,
-            watchdog,
-            dummy,
-            import_align: host.min_imported_host_pointer_alignment.max(4096),
-        });
-    }
-    parking_lot::MutexGuard::map(g, |s| s.as_mut().unwrap())
+        Fixed { gds, debug, debug_ptr, watchdog, dummy, import_align: host.min_imported_host_pointer_alignment.max(4096) }
+    })
 }
 
-impl Shared {
-    /// Guest mapping containing `addr`: [start, end) of its VMA.
-    fn mapping(addr: u64) -> Option<(u64, u64)> {
+/// Guest mapping containing `addr`: [start, end) of its VMA.
+fn mapping(addr: u64) -> Option<(u64, u64)> {
+    let st = crate::mem::MEM.lock();
+    let v = st.find(addr)?;
+    if v.kind == crate::mem::VmaKind::Reserved {
+        return None;
+    }
+    Some((v.start, v.end()))
+}
+
+/// Adjacent guest mappings around `addr` that one import may cover,
+/// clipped to [lo, hi): the title maps buffers in pieces (e.g.
+/// sceKernelBatchMap in 64 KiB steps), and a buffer may span several.
+/// Returns [start, end) and the number of mappings.
+fn mapping_run(addr: u64, lo: u64, hi: u64) -> Option<(u64, u64, usize)> {
+    use crate::mem::VmaKind;
+    let st = crate::mem::MEM.lock();
+    let v = st.find(addr)?;
+    if v.kind == VmaKind::Reserved {
+        return None;
+    }
+    let usable = |p: &crate::mem::Vma| p.kind != VmaKind::Reserved && p.prot != 0;
+    let (mut start, mut end, mut n) = (v.start, v.end(), 1);
+    while start > lo {
+        match st.vmas.range(..start).next_back().map(|(_, p)| p).filter(|p| p.end() == start && usable(p)) {
+            Some(p) => {
+                start = p.start;
+                n += 1;
+            }
+            None => break,
+        }
+    }
+    while end < hi {
+        match st.vmas.get(&end).filter(|p| usable(p)) {
+            Some(p) => {
+                end = p.end();
+                n += 1;
+            }
+            None => break,
+        }
+    }
+    Some((start.max(lo), end.min(hi), n))
+}
+
+/// Why guest [base, base+size) cannot be imported (diagnostics).
+fn unmapped_reason(base: u64, size: u64) -> String {
+    let st = crate::mem::MEM.lock();
+    let mut p = base;
+    while p < base + size {
+        match st.find(p) {
+            None => return format!("nothing mapped at {p:#x}"),
+            Some(v) if v.kind == crate::mem::VmaKind::Reserved => return format!("{p:#x} is only reserved ({:#x}+{:#x})", v.start, v.size),
+            Some(v) if v.prot == 0 && p != base => return format!("{p:#x} is not accessible ({:?} {:#x}+{:#x})", v.kind, v.start, v.size),
+            Some(v) => p = v.end(),
+        }
+    }
+    "mapped: the import failed".into()
+}
+
+/// Drops imports whose guest pages were committed or decommitted since.
+fn revalidate_spans() {
+    let changed = crate::mem::take_repaged();
+    if changed.is_empty() {
+        return;
+    }
+    let ranges: Vec<(u64, u64)> = changed.iter().map(|&(a, b)| (a, b - a)).collect();
+    super::mirror::invalidate(&ranges);
+    let mut g = SPANS.write();
+    for s in g.iter_mut().filter(|s| s.valid) {
+        if changed.iter().any(|&(a, b)| a < s.end && s.start < b) {
+            // Kept alive: recorded work may still reference it.
+            s.valid = false;
+            if IMPORTS_STALE.fetch_add(1, Ordering::Relaxed) < 20 {
+                crate::info!("gpu: guest range {:#x}..{:#x} imported for the GPU was remapped (imported again on its next use)", s.start, s.end);
+            }
+        }
+    }
+    SPAN_GEN.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Imported buffer covering guest [base, base+size): (buffer, window start, window end).
+fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
+    revalidate_spans();
+    let generation = SPAN_GEN.load(Ordering::Acquire);
+    let end = base.saturating_add(size);
+    let hit = SPAN_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0 != generation {
+            c.0 = generation;
+            c.1.clear();
+            return None;
+        }
+        let i = c.1.iter().position(|&(s, e, _)| s <= base && end <= e)?;
+        let x = c.1.remove(i);
+        c.1.insert(0, x);
+        Some((x.2, x.0, x.1))
+    });
+    if hit.is_some() {
+        return hit;
+    }
+    let found = SPANS.read().iter().find(|s| s.valid && s.start <= base && end <= s.end).map(|s| (s.buffer, s.start, s.end));
+    let r = found.or_else(|| import_span(base, size));
+    if let Some((b, st, e)) = r {
+        SPAN_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            if SPAN_GEN.load(Ordering::Acquire) == generation {
+                if c.0 != generation {
+                    c.0 = generation;
+                    c.1.clear();
+                }
+                c.1.insert(0, (st, e, b));
+                c.1.truncate(SPAN_CACHE_LEN);
+            }
+        });
+    }
+    r
+}
+
+/// Imports the guest window around [base, base+size) (another queue may
+/// have done so meanwhile).
+fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
+    let mut g = SPANS.write();
+    if let Some(s) = g.iter().find(|s| s.valid && s.start <= base && base + size <= s.end) {
+        return Some((s.buffer, s.start, s.end));
+    }
+    let (vs, ve, pieces) = mapping_run(base, base & !(WINDOW - 1), (base + size).next_multiple_of(WINDOW))?;
+    if base + size > ve {
+        return None;
+    }
+    {
+        // Diagnostics: how the title mapped memory the GPU uses.
         let st = crate::mem::MEM.lock();
-        let v = st.find(addr)?;
-        if v.kind == crate::mem::VmaKind::Reserved {
-            return None;
+        if let Some(v) = st.find(base) {
+            crate::debug!("gpu: importing for {base:#x}+{size:#x}: mapping {:#x}+{:#x} {:?} prot {:#x} '{}'", v.start, v.size, v.kind, v.prot, v.name);
         }
-        Some((v.start, v.end()))
     }
+    let a = fixed().import_align;
+    let start = vs & !(a - 1);
+    let end = ve.next_multiple_of(a).min(ve);
+    if start < vs || end <= start {
+        return None;
+    }
+    let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER;
+    // The driver pins the pages for writing: write-tracked (read-only)
+    // pages must be writable while importing (their regions turn dirty
+    // and are re-armed on their next use).
+    let _w = super::track::protected().then(|| super::track::host_write(start, end - start));
+    let t0 = std::time::Instant::now();
+    match ctx().import_host(start, end - start, usage) {
+        Ok((buffer, _mem)) => {
+            let ms = t0.elapsed().as_millis();
+            if ms >= 50 {
+                crate::info!("gpu: importing guest {start:#x}..{end:#x} ({} MiB) took {ms} ms", (end - start) >> 20);
+            }
+            g.push(Span { start, end, buffer, valid: true });
+            SPAN_GEN.fetch_add(1, Ordering::AcqRel);
+            IMPORTS.fetch_add(1, Ordering::Relaxed);
+            IMPORT_BYTES.fetch_add(end - start, Ordering::Relaxed);
+            if pieces > 1 {
+                IMPORTS_MULTI.fetch_add(1, Ordering::Relaxed);
+            }
+            Some((buffer, start, end))
+        }
+        Err(e) => {
+            crate::warn!("gpu: importing guest {start:#x}..{end:#x} failed: {e}");
+            None
+        }
+    }
+}
 
-    /// Adjacent guest mappings around `addr` that one import may cover,
-    /// clipped to [lo, hi): the title maps buffers in pieces (e.g.
-    /// sceKernelBatchMap in 64 KiB steps), and a buffer may span several.
-    /// Returns [start, end) and the number of mappings.
-    fn run(addr: u64, lo: u64, hi: u64) -> Option<(u64, u64, usize)> {
-        use crate::mem::VmaKind;
-        let st = crate::mem::MEM.lock();
-        let v = st.find(addr)?;
-        if v.kind == VmaKind::Reserved {
-            return None;
-        }
-        let usable = |p: &crate::mem::Vma| p.kind != VmaKind::Reserved && p.prot != 0;
-        let (mut start, mut end, mut n) = (v.start, v.end(), 1);
-        while start > lo {
-            match st.vmas.range(..start).next_back().map(|(_, p)| p).filter(|p| p.end() == start && usable(p)) {
-                Some(p) => {
-                    start = p.start;
-                    n += 1;
-                }
-                None => break,
-            }
-        }
-        while end < hi {
-            match st.vmas.get(&end).filter(|p| usable(p)) {
-                Some(p) => {
-                    end = p.end();
-                    n += 1;
-                }
-                None => break,
-            }
-        }
-        Some((start.max(lo), end.min(hi), n))
+/// The compute pipeline of a prepared shader (created on first use, outside
+/// the map's lock; a pipeline another queue created meanwhile wins).
+fn compute_pipe(p: &Prepared) -> Result<(vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout), String> {
+    let key = p.tr.key;
+    if let Some(x) = PIPES.lock().as_ref().and_then(|m| m.get(&key)) {
+        return Ok((x.pipeline, x.layout, x.set_layout));
     }
+    let t0 = std::time::Instant::now();
+    let pipe = compute_pipeline(&p.tr.out)?;
+    PIPES_CREATED[0].fetch_add(1, Ordering::Relaxed);
+    super::pstats::report(pipe.pipeline, &format!("cs {:#x}", p.addr));
+    let ms = t0.elapsed().as_millis();
+    if ms >= 200 {
+        crate::info!("gpu: compute pipeline for cs {:#x} ({} SPIR-V words) took {ms} ms", p.addr, p.tr.out.spirv.len());
+    }
+    Ok(keep_pipe(&PIPES, key, pipe))
+}
 
-    /// Why guest [base, base+size) cannot be imported (diagnostics).
-    fn unmapped_reason(base: u64, size: u64) -> String {
-        let st = crate::mem::MEM.lock();
-        let mut p = base;
-        while p < base + size {
-            match st.find(p) {
-                None => return format!("nothing mapped at {p:#x}"),
-                Some(v) if v.kind == crate::mem::VmaKind::Reserved => return format!("{p:#x} is only reserved ({:#x}+{:#x})", v.start, v.size),
-                Some(v) if v.prot == 0 && p != base => return format!("{p:#x} is not accessible ({:?} {:#x}+{:#x})", v.kind, v.start, v.size),
-                Some(v) => p = v.end(),
-            }
-        }
-        "mapped: the import failed".into()
-    }
+/// Graphics pipeline cached under a state hash, if any.
+fn gfx_pipe(hkey: u64) -> Option<(vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout)> {
+    GFX_PIPES.lock().as_ref().and_then(|m| m.get(&hkey)).map(|x| (x.pipeline, x.layout, x.set_layout))
+}
 
-    /// Drops imports whose guest pages were committed or decommitted since.
-    fn revalidate(&mut self) {
-        let changed = crate::mem::take_repaged();
-        if changed.is_empty() {
-            return;
-        }
-        let ranges: Vec<(u64, u64)> = changed.iter().map(|&(a, b)| (a, b - a)).collect();
-        super::mirror::invalidate(&ranges);
-        for s in self.spans.iter_mut().filter(|s| s.valid) {
-            if changed.iter().any(|&(a, b)| a < s.end && s.start < b) {
-                // Kept alive: recorded work may still reference it.
-                s.valid = false;
-                if IMPORTS_STALE.fetch_add(1, Ordering::Relaxed) < 20 {
-                    crate::info!("gpu: guest range {:#x}..{:#x} imported for the GPU was remapped (imported again on its next use)", s.start, s.end);
-                }
-            }
-        }
-    }
+fn keep_gfx_pipe(hkey: u64, pipe: Pipe) -> (vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout) {
+    keep_pipe(&GFX_PIPES, hkey, pipe)
+}
 
-    /// Imported buffer covering guest [base, base+size): (buffer, window start, window end).
-    fn span(&mut self, base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
-        self.revalidate();
-        if let Some(s) = self.spans.iter().find(|s| s.valid && s.start <= base && base + size <= s.end) {
-            return Some((s.buffer, s.start, s.end));
+/// Stores a newly created pipeline unless another queue stored one under
+/// the same key meanwhile (then the new one is destroyed unused).
+fn keep_pipe(map: &Mutex<Option<HashMap<u64, Pipe>>>, key: u64, pipe: Pipe) -> (vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout) {
+    let mut g = map.lock();
+    let m = g.get_or_insert_with(HashMap::new);
+    if let Some(x) = m.get(&key) {
+        unsafe {
+            let d = &ctx().device;
+            d.destroy_pipeline(pipe.pipeline, None);
+            d.destroy_pipeline_layout(pipe.layout, None);
+            d.destroy_descriptor_set_layout(pipe.set_layout, None);
         }
-        let (vs, ve, pieces) = Self::run(base, base & !(WINDOW - 1), (base + size).next_multiple_of(WINDOW))?;
-        if base + size > ve {
-            return None;
-        }
-        {
-            // Diagnostics: how the title mapped memory the GPU uses.
-            let st = crate::mem::MEM.lock();
-            if let Some(v) = st.find(base) {
-                crate::debug!("gpu: importing for {base:#x}+{size:#x}: mapping {:#x}+{:#x} {:?} prot {:#x} '{}'", v.start, v.size, v.kind, v.prot, v.name);
-            }
-        }
-        let a = self.import_align;
-        let start = vs & !(a - 1);
-        let end = ve.next_multiple_of(a).min(ve);
-        if start < vs || end <= start {
-            return None;
-        }
-        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER;
-        // The driver pins the pages for writing: write-tracked (read-only)
-        // pages must be writable while importing (their regions turn dirty
-        // and are re-armed on their next use).
-        let _w = super::track::protected().then(|| super::track::host_write(start, end - start));
-        let t0 = std::time::Instant::now();
-        match ctx().import_host(start, end - start, usage) {
-            Ok((buffer, _mem)) => {
-                let ms = t0.elapsed().as_millis();
-                if ms >= 50 {
-                    crate::info!("gpu: importing guest {start:#x}..{end:#x} ({} MiB) took {ms} ms", (end - start) >> 20);
-                }
-                self.spans.push(Span { start, end, buffer, valid: true });
-                IMPORTS.fetch_add(1, Ordering::Relaxed);
-                IMPORT_BYTES.fetch_add(end - start, Ordering::Relaxed);
-                if pieces > 1 {
-                    IMPORTS_MULTI.fetch_add(1, Ordering::Relaxed);
-                }
-                Some((buffer, start, end))
-            }
-            Err(e) => {
-                crate::warn!("gpu: importing guest {start:#x}..{end:#x} failed: {e}");
-                None
-            }
-        }
+        return (x.pipeline, x.layout, x.set_layout);
     }
-
-    fn pipeline(&mut self, p: &Prepared) -> Result<(vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout), String> {
-        let key = p.tr.key;
-        if let Some(x) = self.pipes.get(&key) {
-            return Ok((x.pipeline, x.layout, x.set_layout));
-        }
-        let t0 = std::time::Instant::now();
-        let pipe = compute_pipeline(&p.tr.out)?;
-        super::pstats::report(pipe.pipeline, &format!("cs {:#x}", p.addr));
-        let ms = t0.elapsed().as_millis();
-        if ms >= 200 {
-            crate::info!("gpu: compute pipeline for cs {:#x} ({} SPIR-V words) took {ms} ms", p.addr, p.tr.out.spirv.len());
-        }
-        let r = (pipe.pipeline, pipe.layout, pipe.set_layout);
-        self.pipes.insert(key, pipe);
-        Ok(r)
-    }
+    let r = (pipe.pipeline, pipe.layout, pipe.set_layout);
+    m.insert(key, pipe);
+    r
 }
 
 /// Creates a compute pipeline (and its layouts) for a translated shader.
@@ -426,7 +510,7 @@ pub fn pipeline_test(capture: &str) -> i32 {
         }
     };
     let c = ctx();
-    let dummy = shared().dummy;
+    let dummy = fixed().dummy;
     let (pool, cmd, fence, dpool) = unsafe {
         let pool = c.device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(c.queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
         let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).unwrap()[0];
@@ -729,15 +813,17 @@ fn merge_pipe() -> Result<&'static MergePipe, String> {
 }
 
 /// Guest ranges of a stage's textures (uploads read them).
-fn texture_ranges(p: &Prepared) -> Vec<(u64, u64)> {
+/// The textures a stage samples, with a coarse bound of their guest bytes
+/// (16 per texel).
+fn texture_ranges(p: &Prepared) -> Vec<((u64, u64), super::desc::Tsharp)> {
+    let coarse = |t: &super::desc::Tsharp| ((t.base, (t.width as u64 * t.height as u64 * t.depth.max(1) as u64 * 16).min(1 << 30)), *t);
     p.resources
         .iter()
-        .filter_map(|r| match r {
-            Resolved::Image(t) => Some(vec![(t.base, (t.width as u64 * t.height as u64 * t.depth.max(1) as u64 * 16).min(1 << 30))]),
-            Resolved::ImageTable(e) => Some(e.iter().flatten().map(|t| (t.base, (t.width as u64 * t.height as u64 * t.depth.max(1) as u64 * 16).min(1 << 30))).collect()),
-            _ => None,
+        .flat_map(|r| match r {
+            Resolved::Image(t) => vec![coarse(t)],
+            Resolved::ImageTable(e) => e.iter().flatten().map(coarse).collect(),
+            _ => Vec::new(),
         })
-        .flatten()
         .collect()
 }
 /// Most batch slots per queue (`tune slots`, default 4): one batch recording
@@ -789,73 +875,42 @@ pub fn completed_seq() -> u64 {
     done_seq()
 }
 
-/// Guest ranges written by unfinished batches (sequence, start, end):
-/// ranges up to `RANGE_LARGE` buckets bucketed by 1 MiB, larger ones in a
-/// list. Entries of completed batches are skipped by lookups and dropped
-/// now and then by `note`; `latest_seq` lets lookups return at once when
-/// every noted batch has completed (a command processor checks many
-/// bindings per draw: the per-lookup clean-up and the hundred buckets of the
-/// title's 112 MB culling output took ~13% of its time).
+/// Guest ranges written by unfinished batches, by sequence number
+/// (`ranges::SeqRanges`: per batch a coalesced union, so the title's
+/// thousands of writes per batch to the same buffers stay a few entries and a
+/// lookup costs one ordered search per unfinished batch); `latest_seq` lets
+/// lookups return at once when every noted batch has completed.
 struct RangeLog {
-    log: Mutex<Option<RangeLogInner>>,
+    log: Mutex<super::ranges::SeqRanges>,
     latest_seq: AtomicU64,
 }
 
-#[derive(Default)]
-struct RangeLogInner {
-    buckets: HashMap<u64, Vec<(u64, u64, u64)>>,
-    large: Vec<(u64, u64, u64)>,
-    notes: u64,
-}
-
-const RANGE_BUCKET: u32 = 20;
-/// Ranges spanning more buckets than this go to the large list.
-const RANGE_LARGE: u64 = 16;
-
 impl RangeLog {
     const fn new() -> RangeLog {
-        RangeLog { log: Mutex::new(None), latest_seq: AtomicU64::new(0) }
+        RangeLog { log: Mutex::new(super::ranges::SeqRanges::new()), latest_seq: AtomicU64::new(0) }
     }
 
     fn note(&self, seq: u64, w: (u64, u64)) {
-        self.note_all(seq, std::slice::from_ref(&w));
-    }
-
-    /// Notes several ranges written by batch `seq` (one lock).
-    fn note_all(&self, seq: u64, writes: &[(u64, u64)]) {
-        if writes.iter().all(|w| w.1 == 0) {
+        if w.1 == 0 {
             return;
         }
         self.latest_seq.fetch_max(seq, Ordering::SeqCst);
         let done = done_seq();
         let mut g = self.log.lock();
-        let m = g.get_or_insert_with(RangeLogInner::default);
-        m.notes += 1;
-        if m.notes % 1024 == 0 {
-            m.buckets.retain(|_, v| {
-                v.retain(|e| e.0 > done);
-                !v.is_empty()
-            });
-            m.large.retain(|e| e.0 > done);
+        g.prune(done);
+        g.insert(seq, w.0, w.1);
+    }
+
+    /// Notes the ranges written by batch `seq` (one lock).
+    fn note_ranges(&self, seq: u64, writes: &super::ranges::Ranges) {
+        if writes.is_empty() {
+            return;
         }
-        for &(a, n) in writes {
-            if n == 0 {
-                continue;
-            }
-            let end = a.saturating_add(n);
-            let (b0, b1) = (a >> RANGE_BUCKET, (end - 1) >> RANGE_BUCKET);
-            if b1 - b0 >= RANGE_LARGE {
-                m.large.push((seq, a, end));
-                continue;
-            }
-            for b in b0..=b1 {
-                let v = m.buckets.entry(b).or_default();
-                if v.len() >= 32 {
-                    v.retain(|e| e.0 > done);
-                }
-                v.push((seq, a, end));
-            }
-        }
+        self.latest_seq.fetch_max(seq, Ordering::SeqCst);
+        let done = done_seq();
+        let mut g = self.log.lock();
+        g.prune(done);
+        g.insert_all(seq, writes);
     }
 
     /// The latest unfinished batch that writes into `reads`.
@@ -864,41 +919,7 @@ impl RangeLog {
         if self.latest_seq.load(Ordering::SeqCst) <= done {
             return None;
         }
-        let g = self.log.lock();
-        let m = g.as_ref()?;
-        let mut best: Option<u64> = None;
-        let mut consider = |&(s, wa, we): &(u64, u64, u64), r: u64, end: u64| {
-            if s > done && wa < end && r < we {
-                best = best.max(Some(s));
-            }
-        };
-        for &(r, n) in reads {
-            if n == 0 {
-                continue;
-            }
-            let end = r.saturating_add(n);
-            for e in &m.large {
-                consider(e, r, end);
-            }
-            let (b0, b1) = (r >> RANGE_BUCKET, (end - 1) >> RANGE_BUCKET);
-            if b1 - b0 >= RANGE_LARGE {
-                // A large read: every bucket once (fewer than its buckets).
-                for v in m.buckets.values() {
-                    for e in v {
-                        consider(e, r, end);
-                    }
-                }
-            } else {
-                for b in b0..=b1 {
-                    if let Some(v) = m.buckets.get(&b) {
-                        for e in v {
-                            consider(e, r, end);
-                        }
-                    }
-                }
-            }
-        }
-        best
+        self.log.lock().latest(reads, done)
     }
 }
 
@@ -1281,13 +1302,15 @@ pub struct Exec {
     pending_promises: Vec<(u64, u64, u8)>,
     /// Set by a command processor waiting for one of those labels.
     submit_request: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Guest ranges written by the batch being recorded.
-    pending_writes: Vec<(u64, u64)>,
+    /// Guest ranges written by the batch being recorded, and in write order
+    /// for the self-checks (`verify`, only when enabled).
+    pending: super::ranges::Ranges,
+    pending_log: Vec<(u64, u64)>,
     /// Actions of the batch being recorded.
     actions: Vec<Action>,
     checks: Vec<verify::Check>,
     /// Guest ranges written by submitted batches or deferred CP writes, by sequence.
-    inflight: Vec<(u64, (u64, u64))>,
+    inflight: super::ranges::SeqRanges,
     /// Last sequence number this queue queued, and the last carrying actions.
     last_seq: u64,
     last_action_seq: u64,
@@ -1340,10 +1363,11 @@ impl Exec {
                 begun_at: std::time::Instant::now(),
                 pending_promises: Vec::new(),
                 submit_request: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                pending_writes: Vec::new(),
+                pending: Default::default(),
+                pending_log: Vec::new(),
                 actions: Vec::new(),
                 checks: Vec::new(),
-                inflight: Vec::new(),
+                inflight: Default::default(),
                 last_seq: 0,
                 last_action_seq: 0,
                 submit_after: 0,
@@ -1481,7 +1505,7 @@ impl Exec {
         let mut checks = std::mem::take(&mut self.checks);
         for ch in checks.iter_mut() {
             let (a, n) = verify::dest_range(ch);
-            ch.overwritten = self.pending_writes.get(ch.writes_mark..).unwrap_or(&[]).iter().any(|&(w, m)| w < a + n && a < w + m);
+            ch.overwritten = self.pending_log.get(ch.writes_mark..).unwrap_or(&[]).iter().any(|&(w, m)| w < a + n && a < w + m);
         }
         let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, || {
             if DEVICE_LOST.load(Ordering::Relaxed) {
@@ -1501,9 +1525,10 @@ impl Exec {
             m.retain(|_, f| !std::sync::Arc::ptr_eq(f, &self.submit_request));
         }
         self.submit_request.store(false, Ordering::SeqCst);
-        let writes = std::mem::take(&mut self.pending_writes);
-        INFLIGHT.note_all(seq, &writes);
-        self.inflight.extend(writes.into_iter().map(|w| (seq, w)));
+        let writes = std::mem::take(&mut self.pending);
+        self.pending_log.clear();
+        INFLIGHT.note_ranges(seq, &writes);
+        self.inflight.insert_all(seq, &writes);
         self.last_seq = seq;
         if has_actions {
             self.last_action_seq = seq;
@@ -1523,7 +1548,8 @@ impl Exec {
         unsafe { ctx().device.end_command_buffer(self.cmd()).ok() };
         self.actions.clear();
         self.checks.clear();
-        self.pending_writes.clear();
+        self.pending.clear();
+        self.pending_log.clear();
         self.pending_promises.clear();
         self.batch_shaders.clear();
         self.resident.clear();
@@ -1699,7 +1725,7 @@ impl Exec {
                 if ordered {
                     CP_WRITES.note(self.last_seq, w);
                 }
-                self.inflight.push((self.last_seq, w));
+                self.inflight.insert(self.last_seq, w.0, w.1);
             }
             Some(self.last_seq)
         } else if self.last_seq > done_seq() {
@@ -1711,7 +1737,7 @@ impl Exec {
                 if ordered {
                     CP_WRITES.note(seq, w);
                 }
-                self.inflight.push((seq, w));
+                self.inflight.insert(seq, w.0, w.1);
             }
             Some(seq)
         } else {
@@ -1752,11 +1778,64 @@ impl Exec {
     /// arguments): completes this queue's work writing into `reads` and
     /// waits for any queue's unfinished batch that does. Returns whether
     /// it waited (memory may have changed).
+    /// Waits for GPU writes into the guest memory of textures a stage samples
+    /// (they may be uploaded from it now). A coarse bound is checked first;
+    /// only textures it finds written are looked at closely: images the GPU
+    /// owns (render targets sampled by later passes) are read from their
+    /// Vulkan image, and the others count with the exact span of their mips
+    /// and layers (coarse bounds and render targets overlapped buffers GPU
+    /// work was writing, e.g. the ranges of unbounded global-pointer
+    /// bindings: ~2 needless waits of 5-7 ms per frame in the courtyard).
+    pub fn sync_textures(&mut self, textures: &[((u64, u64), super::desc::Tsharp)], why: usize) -> bool {
+        if textures.is_empty() {
+            return false;
+        }
+        let coarse: Vec<(u64, u64)> = textures.iter().map(|x| x.0).collect();
+        if super::tune::tex_waits() == 0 {
+            return self.sync_for(&coarse, why);
+        }
+        let done = done_seq();
+        self.inflight.prune(done);
+        let written = |s: &Self, r: (u64, u64)| s.pending.overlaps(r.0, r.1) || s.inflight.latest(&[r], done).is_some() || INFLIGHT.latest(&[r]).is_some();
+        let hit: Vec<&super::desc::Tsharp> = textures.iter().filter(|(r, _)| written(self, *r)).map(|(_, t)| t).collect();
+        if hit.is_empty() {
+            return false;
+        }
+        let fine: Vec<(u64, u64)> = super::images::with(|im| hit.into_iter().filter(|t| im.reads_guest(t)).map(|t| (t.base, super::images::guest_size(t).unwrap_or((t.width as u64 * t.height as u64 * t.depth.max(1) as u64 * 16).min(1 << 30)))).collect());
+        self.sync_for(&fine, why)
+    }
+
     /// `sync_for_reads`, counted by the reason (`SYNC_WHY`) when it waited.
     pub fn sync_for(&mut self, reads: &[(u64, u64)], why: usize) -> bool {
+        // DS_TRACE_SYNC=1: the first 400 waits, with the read that collided
+        // and the batch writing it.
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static TRACED: AtomicU64 = AtomicU64::new(0);
+        let trace = *TRACE.get_or_init(|| std::env::var("DS_TRACE_SYNC").ok().as_deref() == Some("1")) && TRACED.load(Ordering::Relaxed) < 400;
+        let culprit = if trace {
+            let done = done_seq();
+            reads.iter().find_map(|&r| {
+                if self.pending.overlaps(r.0, r.1) {
+                    Some((r, "this batch".to_string()))
+                } else if let Some(s) = self.inflight.latest(&[r], done) {
+                    Some((r, format!("own batch {s}")))
+                } else {
+                    INFLIGHT.latest(&[r]).map(|s| (r, format!("batch {s} (another queue)")))
+                }
+            })
+        } else {
+            None
+        };
+        let t0 = std::time::Instant::now();
         let w = self.sync_for_reads(reads);
         if w {
             SYNC_WHY[why.min(SYNC_WHY.len() - 1)].fetch_add(1, Ordering::Relaxed);
+            if let Some(((a, n), src)) = culprit {
+                if TRACED.fetch_add(1, Ordering::Relaxed) < 400 {
+                    const WHY: [&str; 6] = ["CP read", "dispatch shader read", "dispatch texture", "draw shader read", "draw texture", "draw indices"];
+                    crate::info!("gpu[{}]: waited {} us for {} {a:#x}+{n:#x} written by {src} (shader {:#x})", self.name, t0.elapsed().as_micros(), WHY[why.min(5)], self.batch_shaders.last().copied().unwrap_or(0));
+                }
+            }
         }
         w
     }
@@ -1783,11 +1862,18 @@ impl Exec {
         self.overlaps_pending(&[(a, n)])
     }
 
+    /// A guest range the batch being recorded writes.
+    pub(super) fn note_write(&mut self, a: u64, n: u64) {
+        self.pending.insert(a, n);
+        if verify::enabled() {
+            self.pending_log.push((a, n));
+        }
+    }
+
     fn overlaps_pending(&mut self, reads: &[(u64, u64)]) -> bool {
         let done = done_seq();
-        self.inflight.retain(|(seq, _)| *seq > done);
-        let ov = |&(a, n): &(u64, u64), &(w, m): &(u64, u64)| w < a + n && a < w + m;
-        reads.iter().any(|r| self.pending_writes.iter().any(|w| ov(r, w)) || self.inflight.iter().any(|(_, w)| ov(r, w)))
+        self.inflight.prune(done);
+        self.pending.overlaps_any(reads) || self.inflight.latest(reads, done).is_some()
     }
 
     /// A CP memory write that follows earlier GPU work, performed by the GPU
@@ -1802,7 +1888,7 @@ impl Exec {
         if bytes == 0 || bytes > 65536 || a % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) {
             return false;
         }
-        let Some((buffer, start, _)) = shared().span(a, bytes) else { return false };
+        let Some((buffer, start, _)) = span(a, bytes) else { return false };
         self.begin();
         self.end_rendering();
         let cmd = self.cmd();
@@ -1812,7 +1898,7 @@ impl Exec {
         global_barrier(cmd);
         self.barrier_wanted = false;
         self.dispatched = false;
-        self.pending_writes.push((a, bytes));
+        self.note_write(a, bytes);
         if let Some((v, n)) = label {
             self.pending_promises.push((a, v, n));
             UNSUBMITTED_LABELS.lock().get_or_insert_with(HashMap::new).insert(a & !7, self.submit_request.clone());
@@ -2017,8 +2103,8 @@ impl Exec {
         let res_info = rdna::translate::res_info_offset(&p.tr.plan) as usize;
         let mut bound = Bound { bufs: Vec::new(), imgs: Vec::new(), img_arrays: Vec::new(), writes: Vec::new(), sized_writes: Vec::new(), images: Vec::new(), shadows: Vec::new(), write_src: Vec::new() };
         let seg = SHADOW_BYTES;
+        let fx = fixed();
         {
-            let mut sh = shared();
             for b in &p.tr.out.bindings {
                 match b.kind {
                     BindingKind::Buffer(i) => {
@@ -2029,9 +2115,9 @@ impl Exec {
                         };
                         let mut size = match size {
                             Some(n) => n,
-                            None => Shared::mapping(base).map(|(_, e)| (e - base).min(UNBOUNDED_MAX)).unwrap_or(0),
+                            None => mapping(base).map(|(_, e)| (e - base).min(UNBOUNDED_MAX)).unwrap_or(0),
                         };
-                        let mut info = vk::DescriptorBufferInfo { buffer: sh.dummy, offset: 0, range: DUMMY_BYTES };
+                        let mut info = vk::DescriptorBufferInfo { buffer: fx.dummy, offset: 0, range: DUMMY_BYTES };
                         let mut bias = 0u64;
                         let mut bound_size = 0u64;
                         let read_only = size > 0 && !p.tr.plan.resources[i].written && matches!(p.resources[i], Resolved::Buffer(_));
@@ -2041,15 +2127,15 @@ impl Exec {
                         let snap = if read_only && resident.is_none() { self.snapshot(base, size, super::tune::snap_max()) } else { None };
                         // Read-only bindings of buffers GPU work wrote: VRAM mirrors.
                         let mirrored = if read_only && snap.is_none() { resident.or_else(|| super::mirror::lookup(base, size)) } else { None };
-                        let mut span = if size > 0 && mirrored.is_none() && snap.is_none() { sh.span(base, size) } else { None };
+                        let mut span = if size > 0 && mirrored.is_none() && snap.is_none() { span(base, size) } else { None };
                         if span.is_none() && size > 0 && mirrored.is_none() && snap.is_none() {
                             // A descriptor reaching past the end of its mappings
                             // (generic sizes on ring allocations): the mapped part
                             // is bound, the rest reads 0.
-                            if let Some((_, end, _)) = Shared::run(base, base & !(WINDOW - 1), (base + size).next_multiple_of(WINDOW)) {
+                            if let Some((_, end, _)) = mapping_run(base, base & !(WINDOW - 1), (base + size).next_multiple_of(WINDOW)) {
                                 if end > base && end < base + size {
                                     size = end - base;
-                                    span = sh.span(base, size);
+                                    span = self::span(base, size);
                                 }
                             }
                         }
@@ -2135,10 +2221,8 @@ impl Exec {
                                     }
                                 }
                                 None => {
-                                    drop(sh);
-                                    let why = Shared::unmapped_reason(base, size);
+                                    let why = unmapped_reason(base, size);
                                     self.report(format!("{:?} shader {:#x}: buffer {base:#x}+{size:#x} is not mapped GPU memory (bound as zeros): {why}", p.stage, p.addr));
-                                    sh = shared();
                                 }
                             }
                         }
@@ -2149,9 +2233,9 @@ impl Exec {
                         p.sgpr_data[ri + 3] = limit;
                         bound.bufs.push((b.binding, info));
                     }
-                    BindingKind::Gds => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: sh.gds, offset: 0, range: rdna::translate::GDS_BYTES as u64 })),
-                    BindingKind::Debug => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: sh.debug, offset: 0, range: rdna::translate::DUMP_DWORDS as u64 * 4 })),
-                    BindingKind::Watchdog => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: sh.watchdog, offset: 0, range: rdna::translate::WATCHDOG_DWORDS as u64 * 4 })),
+                    BindingKind::Gds => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.gds, offset: 0, range: rdna::translate::GDS_BYTES as u64 })),
+                    BindingKind::Debug => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.debug, offset: 0, range: rdna::translate::DUMP_DWORDS as u64 * 4 })),
+                    BindingKind::Watchdog => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.watchdog, offset: 0, range: rdna::translate::WATCHDOG_DWORDS as u64 * 4 })),
                     _ => {}
                 }
             }
@@ -2323,7 +2407,7 @@ impl Exec {
             p = shaders::prepare_compute(cp, wave64)?;
         }
         // Textures are uploaded from guest memory: earlier GPU writes first.
-        self.sync_for(&texture_ranges(&p), SYNC_CS_TEXTURES);
+        self.sync_textures(&texture_ranges(&p), SYNC_CS_TEXTURES);
         let local = [cp.reg(Space::Sh, 0x207) & 0xFFFF, cp.reg(Space::Sh, 0x208) & 0xFFFF, cp.reg(Space::Sh, 0x209) & 0xFFFF];
         if initiator & (1 << 5) != 0 {
             // USE_THREAD_DIMENSIONS: sizes are in threads.
@@ -2341,7 +2425,7 @@ impl Exec {
         self.resolve_fast_clears(&keys);
         self.resolve_overwrites(&keys);
         self.sync_block_textures(&keys);
-        let (pipeline, layout, set_layout) = shared().pipeline(&p)?;
+        let (pipeline, layout, set_layout) = compute_pipe(&p)?;
         let t_pipe = t0.elapsed();
         self.reserve(&[&p]);
         let mut bound = self.bind_stage(&mut p, true)?;
@@ -2407,7 +2491,7 @@ impl Exec {
         let start = [cp.reg(Space::Sh, 0x204), cp.reg(Space::Sh, 0x205), cp.reg(Space::Sh, 0x206)];
         let args = match indirect {
             Some(a) => {
-                let (buffer, base, _) = shared().span(a, 12).ok_or_else(|| format!("cs {:#x}: indirect arguments {a:#x} are not mapped GPU memory (dispatch skipped)", p.addr))?;
+                let (buffer, base, _) = span(a, 12).ok_or_else(|| format!("cs {:#x}: indirect arguments {a:#x} are not mapped GPU memory (dispatch skipped)", p.addr))?;
                 if let Some(s) = CP_WRITES.latest(&[(a, 12)]) {
                     self.submit_after = self.submit_after.max(s);
                 }
@@ -2479,7 +2563,9 @@ impl Exec {
         for &(b, n) in &writes_here {
             super::track::gpu_write(b, n);
         }
-        self.pending_writes.extend(writes_here);
+        for &(b, n) in &writes_here {
+            self.note_write(b, n);
+        }
         EXECUTED.fetch_add(1, Ordering::Relaxed);
         self.batch_shaders.push(p.addr);
         let total = t0.elapsed();
@@ -2500,7 +2586,7 @@ impl Exec {
             if !src.is_empty() && !self.overlaps_pending(&src) && INFLIGHT.latest(&src).is_none() && CP_WRITES.latest(&src).is_none() {
                 verify::snapshot_source(&mut ch);
             }
-            ch.writes_mark = self.pending_writes.len();
+            ch.writes_mark = self.pending_log.len();
             self.checks.push(ch);
         }
         Ok(())

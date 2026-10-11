@@ -141,7 +141,7 @@ fn valid(a: u64, len: u64) -> bool {
 
 /// Whether guest memory [a, a+len) is mapped and readable.
 pub fn guest_readable(a: u64, len: u64) -> bool {
-    valid(a, len) && crate::mem::mapped(a, len)
+    valid(a, len) && crate::mem::readable(a, len)
 }
 
 /// GPU timestamp (100 MHz, like the console's GPU clock counter).

@@ -102,7 +102,7 @@ impl Reader {
             if !super::cp::guest_readable(addr, 4) {
                 return None;
             }
-            self.span = crate::mem::mapped_span(addr).unwrap_or((addr, addr + 4));
+            self.span = crate::mem::readable_span(addr).unwrap_or((addr, addr + 4));
         }
         match self.reads.last_mut() {
             Some(r) if r.0 + r.1 == addr => r.1 += 4,
