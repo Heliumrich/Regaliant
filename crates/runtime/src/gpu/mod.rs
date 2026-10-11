@@ -42,7 +42,7 @@ pub mod tune {
         Tunable { name: "lazy_wait_submit", env: "DS_LAZY_WAIT_SUBMIT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "gpu_cp_writes", env: "DS_GPU_CP_WRITES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "slots", env: "DS_GPU_SLOTS", default: 4, value: AtomicU64::new(UNSET) },
-        Tunable { name: "lod_stats", env: "DS_LOD_STATS", default: 2, value: AtomicU64::new(UNSET) },
+        Tunable { name: "lod_stats", env: "DS_LOD_STATS", default: 3, value: AtomicU64::new(UNSET) },
         Tunable { name: "cmp_emulate", env: "DS_CMP_EMULATE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "tex_waits", env: "DS_TEX_WAITS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_barrier", env: "DS_SHADOW_BARRIER", default: 0, value: AtomicU64::new(UNSET) },
@@ -189,7 +189,9 @@ pub mod tune {
     /// GetLodStats (hardware LOD statistics, the title's texture streaming
     /// feedback; `lodstats`): 0 leaves the buffer as the title wrote it (no
     /// streaming of high mips), 1 reports every counter bank as sampled at
-    /// mip 0, 2 the banks of textures bound since the last report.
+    /// mip 0, 2 the banks of textures bound since the last report (at mip
+    /// 0), 3 what the sampling instructions measured on the GPU (finest mip
+    /// and lane count per bank; translations change with it).
     pub fn lod_stats() -> u64 {
         get(15)
     }

@@ -286,6 +286,7 @@ pub fn prepare_compute(cp: &Cp, wave64: bool) -> Result<Prepared, String> {
         force_dispatcher: super::tune::block_chain() == 0,
         dispatcher_for_loops: super::tune::block_chain() == 2,
         reg_vars: super::tune::reg_vars(),
+        lod_stats: super::tune::lod_stats() == 3,
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
 }
@@ -351,6 +352,7 @@ pub fn prepare_ps(cp: &Cp) -> Result<Prepared, String> {
         force_dispatcher: super::tune::block_chain() == 0,
         dispatcher_for_loops: super::tune::block_chain() == 2,
         reg_vars: super::tune::reg_vars(),
+        lod_stats: super::tune::lod_stats() == 3,
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
 }
@@ -470,6 +472,7 @@ pub fn prepare_ngg(cp: &Cp) -> Result<Prepared, String> {
         force_dispatcher: super::tune::block_chain() == 0,
         dispatcher_for_loops: super::tune::block_chain() == 2,
         reg_vars: super::tune::reg_vars(),
+        lod_stats: super::tune::lod_stats() == 3,
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
 }
@@ -1014,6 +1017,19 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
     let ri = translate::res_info_offset(&tr.plan) as usize;
     for k in 0..tr.plan.resources.len() {
         sgpr_data[ri + translate::RES_INFO_DWORDS as usize * k + 3] = u32::MAX;
+    }
+    // LOD information of the sampled images (hardware LOD statistics).
+    for (k, r) in resources.iter().enumerate() {
+        match r {
+            Resolved::Image(t) => sgpr_data[ri + translate::RES_INFO_DWORDS as usize * k] = super::lodstats::info(t),
+            Resolved::ImageTable(entries) => {
+                let at = (translate::lod_info_offset(&tr.plan) + translate::IMAGE_TABLE_LEN * translate::table_slot(&tr.plan, k)) as usize;
+                for (j, t) in entries.iter().enumerate().take(translate::IMAGE_TABLE_LEN as usize) {
+                    sgpr_data[at + j] = t.as_ref().map(super::lodstats::info).unwrap_or(0);
+                }
+            }
+            _ => {}
+        }
     }
     let prepared = Prepared { stage: spec.stage, addr, insts, tr, resources, res_addrs, sgpr_data, user: user.to_vec(), reads: rd.reads };
     let mut words = Vec::new();

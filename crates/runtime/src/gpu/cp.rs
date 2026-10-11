@@ -220,9 +220,14 @@ fn missed_write(addr: u64, wide: bool, func: u32, mask: u64, reference: u64, sin
 }
 
 /// Whether an equality wait for `reference` waits on a counter that has
-/// moved past it: the recorded writes include `reference`, every write since
-/// kept the value or added 1, and it rose by 2 or more (a frame counter; a
-/// flag set from 0 to 1 is not one).
+/// moved past it: every recorded write from `reference`'s last one on (or,
+/// when the counter passed it before the recorded window, every recorded
+/// write; at least three, starting a whole number of steps and less than 64
+/// steps above it) kept the value or added one step (1..4, the same
+/// throughout; the title's frame counters count by 1 and by 2), and it rose
+/// by two steps or more (a frame counter; a flag set from 0 to 1 is not
+/// one). Run 20261011-103835: acb0x48 waited for 0x801 at 0x805 after cold
+/// pipeline compiles and every queue stopped.
 fn counter_passed(addr: u64, wide: bool, func: u32, mask: u64, reference: u64) -> bool {
     if func & 7 != 3 {
         return false;
@@ -231,9 +236,25 @@ fn counter_passed(addr: u64, wide: bool, func: u32, mask: u64, reference: u64) -
     let Some(h) = g.as_ref().and_then(|m| m.get(&addr)) else { return false };
     let val = |v: u64| (if wide { v } else { v & 0xFFFF_FFFF }) & mask;
     let r = reference & mask;
-    let Some(i) = h.iter().rposition(|&(_, v)| val(v) == r) else { return false };
-    let later: Vec<u64> = h.iter().skip(i).map(|&(_, v)| val(v)).collect();
-    later.windows(2).all(|w| w[1] == w[0] || w[1] == w[0].wrapping_add(1)) && later.last().is_some_and(|&l| l >= r.wrapping_add(2))
+    let vals: Vec<u64> = h.iter().map(|&(_, v)| val(v)).collect();
+    let Some(step) = vals.windows(2).map(|w| w[1].wrapping_sub(w[0])).find(|&d| d != 0) else { return false };
+    if !(1..=4).contains(&step) {
+        return false;
+    }
+    let later = match vals.iter().rposition(|&v| v == r) {
+        Some(i) => &vals[i..],
+        None if vals.len() >= 3 && vals[0] > r && (vals[0] - r) % step == 0 && vals[0] - r < 64 * step => &vals[..],
+        None => return false,
+    };
+    later.windows(2).all(|w| w[1] == w[0] || w[1] == w[0].wrapping_add(step)) && later.last().is_some_and(|&l| l >= r.wrapping_add(2 * step))
+}
+
+/// The recorded writes of a waited-on label (wait reports).
+fn label_writes(addr: u64) -> String {
+    let g = LABEL_WRITES.lock();
+    let Some(h) = g.as_ref().and_then(|m| m.get(&addr)) else { return "none".into() };
+    let v: Vec<String> = h.iter().rev().take(12).rev().map(|&(_, v)| format!("{v:#x}")).collect();
+    v.join(" ")
 }
 /// Equality waits passed because their counter had moved on (diagnostics).
 pub static COUNTER_PASSED: AtomicU64 = AtomicU64::new(0);
@@ -243,10 +264,17 @@ fn note_write(queue: &str, addr: u64, value: u64, at: u64) {
     if WAITED.lock().as_ref().is_some_and(|w| w.contains(&(addr & !7))) {
         let mut g = LABEL_WRITES.lock();
         let h = g.get_or_insert_with(HashMap::new).entry(addr).or_default();
-        if h.len() >= LABEL_WRITES_KEEP {
-            h.pop_front();
+        // A repeated value refreshes its time: counters several queues
+        // write each frame keep their recent frames in the window.
+        match h.back_mut() {
+            Some(last) if last.1 == value => last.0 = Instant::now(),
+            _ => {
+                if h.len() >= LABEL_WRITES_KEEP {
+                    h.pop_front();
+                }
+                h.push_back((Instant::now(), value));
+            }
         }
-        h.push_back((Instant::now(), value));
     }
     {
         let mut g = LAST_WRITE.lock();
@@ -1668,7 +1696,7 @@ impl Cp {
                 } else {
                     String::new()
                 };
-                let history = if a != 0 { format!("; label history:{}", label_history(a, 16)) } else { String::new() };
+                let history = if a != 0 { format!("; recorded writes {}; label history:{}", label_writes(a), label_history(a, 16)) } else { String::new() };
                 crate::warn!("gpu[{}]: waiting > 3 s: {what}{}{detail}{history}", self.name, if marker.is_empty() { String::new() } else { format!(" (marker '{marker}')") });
             }
         }
@@ -1720,7 +1748,25 @@ impl Cp {
                     static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     let n = SEEN.fetch_add(1, Ordering::Relaxed);
                     let writable = size >= super::lodstats::BUFFER_BYTES && guest_readable(buf, super::lodstats::BUFFER_BYTES);
-                    if mode != 0 && writable {
+                    if mode == 3 && writable && self.exec.is_some() {
+                        // Copied after the work recorded so far, written to the
+                        // title's buffer once that completed (before the label
+                        // writes behind it).
+                        let e = self.exec.as_mut().unwrap();
+                        let slot = super::lodstats::take_slot();
+                        e.lod_stats_copy(slot, (flags >> 19) & 1 != 0);
+                        let name = self.name.clone();
+                        let log = n < 2 || n.is_power_of_two() || n % 1000 == 0;
+                        let f: Box<dyn FnOnce() + Send> = Box::new(move || {
+                            let words = super::exec::lod_stats_words(slot);
+                            let (sampled, by_mip) = unsafe { super::lodstats::write_measured(buf, &words, slot) };
+                            if log {
+                                let mips: Vec<String> = by_mip.iter().enumerate().filter(|&(_, &c)| c > 0).map(|(m, c)| format!("{m}:{c}")).collect();
+                                crate::info!("gpu[{name}]: GetLodStats #{n} (buffer {buf:#x}, flags {flags:#x}): {sampled} of 256 counter banks sampled (finest mip:banks {}; measured on the GPU)", mips.join(" "));
+                            }
+                        });
+                        e.after_gpu(f, Some((buf, super::lodstats::BUFFER_BYTES)), false);
+                    } else if mode != 0 && writable {
                         // Before the label write behind it (a deferred effect).
                         let sampled = unsafe { super::lodstats::report(buf, mode, (flags >> 19) & 1 != 0) };
                         if n < 2 || n.is_power_of_two() {
@@ -1797,4 +1843,42 @@ enum Flow {
     Skip(u32),
     Chain(u64, u32),
     Stop,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn history(addr: u64, values: &[u64]) {
+        let mut g = LABEL_WRITES.lock();
+        let h = g.get_or_insert_with(HashMap::new).entry(addr).or_default();
+        h.clear();
+        h.extend(values.iter().map(|&v| (Instant::now(), v)));
+    }
+
+    /// Equality waits on frame counters that moved on pass; waits on flags,
+    /// on values not yet reached and on counters that jump do not.
+    #[test]
+    fn counter_passed_rule() {
+        let m = 0xFFFF_FFFF;
+        history(0x1000, &[0x7fe, 0x7ff, 0x800, 0x801, 0x802, 0x803, 0x804, 0x805]);
+        assert!(counter_passed(0x1000, false, 3, m, 0x801));
+        assert!(!counter_passed(0x1000, false, 3, m, 0x804), "one step behind may still come");
+        assert!(!counter_passed(0x1000, false, 3, m, 0x806), "not reached yet");
+        assert!(!counter_passed(0x1000, false, 2, m, 0x801), "only equality waits");
+        // Counting by 2 (run 20261011-105452: 0x82c 0x82e 0x830 0x832).
+        history(0x1008, &[0x82c, 0x82e, 0x830, 0x832, 0x834]);
+        assert!(counter_passed(0x1008, false, 3, m, 0x82e));
+        assert!(!counter_passed(0x1008, false, 3, m, 0x832));
+        // The waited value before the recorded window.
+        history(0x1010, &[0x802, 0x803, 0x803, 0x804, 0x805]);
+        assert!(counter_passed(0x1010, false, 3, m, 0x801));
+        assert!(!counter_passed(0x1010, false, 3, m, 0x700), "too far behind the window");
+        // A flag (0 -> 1 -> 0) is not a counter.
+        history(0x1018, &[0, 1, 0, 1]);
+        assert!(!counter_passed(0x1018, false, 3, m, 0));
+        // A counter that was reset is not trusted.
+        history(0x1020, &[0x10, 0x11, 0x0, 0x1, 0x2, 0x3]);
+        assert!(!counter_passed(0x1020, false, 3, m, 0x11));
+    }
 }

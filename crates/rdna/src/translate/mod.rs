@@ -191,11 +191,27 @@ pub struct Spec {
     /// One variable per register (programs without relative addressing),
     /// else the register files as arrays (the earlier form, for A/B).
     pub reg_vars: bool,
+    /// Hardware LOD statistics (`sceAgcDcbGetLodStats`, the title's texture
+    /// streaming feedback): sampling instructions on textures whose T#
+    /// enables counting record the finest mip they sample and a count in
+    /// the T#'s counter bank (`BindingKind::LodStats`, [`LOD_INFO_ENABLED`]).
+    pub lod_stats: bool,
 }
 
 /// Entries of an image table bound as one array of sampled images
 /// (`ResKind::ImageTable`); later entries are not reachable.
 pub const IMAGE_TABLE_LEN: u32 = 64;
+
+/// The LOD-statistics binding (`Spec::lod_stats`): per counter bank the
+/// finest mip sampled (dwords 0..256; 15: none) and a count of sampling
+/// lanes (dwords 256..512).
+pub const LOD_STATS_DWORDS: u32 = 512;
+/// LOD information of a sampled image, filled from its T# when binding
+/// (resource info dword 0 of an image; one dword per entry of an image
+/// table from [`lod_info_offset`]): counting enabled (T# word 5 bit 25,
+/// LOD_HDW_CNT_EN) in bit 31, the T#'s base level in bits 8..11, the
+/// counter bank (word 6 bits 0..7) in bits 0..7.
+pub const LOD_INFO_ENABLED: u32 = 1 << 31;
 
 /// Probe register flags (see `Spec::probe`).
 pub const PROBE_SGPR: u32 = 1 << 12;
@@ -226,6 +242,8 @@ pub enum BindingKind {
     Debug,
     /// u32 array of WATCHDOG_DWORDS: the loop watchdog's record (see [`LOOP_LIMIT`]).
     Watchdog,
+    /// u32 array of LOD_STATS_DWORDS: the LOD statistics (`Spec::lod_stats`).
+    LodStats,
 }
 
 /// Size of the global data share.
@@ -305,9 +323,21 @@ pub fn code_base_offset(plan: &Plan) -> u32 {
     res_info_offset(plan) + RES_INFO_DWORDS * plan.resources.len() as u32
 }
 
+/// Dword offset of the image tables' LOD information (IMAGE_TABLE_LEN
+/// dwords per image table resource, in plan order; [`LOD_INFO_ENABLED`]),
+/// after the program's address.
+pub fn lod_info_offset(plan: &Plan) -> u32 {
+    code_base_offset(plan) + 2
+}
+
+/// Position of image table resource `r` among the plan's image tables.
+pub fn table_slot(plan: &Plan, r: usize) -> u32 {
+    plan.resources[..r].iter().filter(|x| x.kind == ResKind::ImageTable).count() as u32
+}
+
 /// Total dwords of the SGPR data buffer.
 pub fn sgpr_data_dwords(plan: &Plan) -> u32 {
-    code_base_offset(plan) + 2
+    lod_info_offset(plan) + IMAGE_TABLE_LEN * plan.resources.iter().filter(|x| x.kind == ResKind::ImageTable).count() as u32
 }
 
 pub(crate) struct Types {
@@ -447,6 +477,10 @@ pub(crate) struct T<'a> {
     pub loop_ctr: Option<Word>,
     /// Debug binding (see `Spec::dump`) and WorkgroupId (compute).
     pub dump_buf: Option<Word>,
+    /// The LOD-statistics binding (`Spec::lod_stats`).
+    pub lod_stats_var: Option<Word>,
+    /// gl_HelperInvocation (fragment LOD statistics skip helper lanes).
+    pub helper_var: Option<Word>,
     pub wg_id: Option<Word>,
     /// VertexIndex and InstanceIndex (vertex stage; register dumps).
     pub vertex_ids: Option<(Word, Word)>,
@@ -1501,6 +1535,8 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         watchdog: None,
         loop_ctr: None,
         dump_buf: None,
+        lod_stats_var: None,
+        helper_var: None,
         wg_id: None,
         vertex_ids: None,
         sb_struct: None,
@@ -1535,6 +1571,12 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         let bnd = tr.alloc_binding(BindingKind::Debug);
         tr.decorate_binding(v, bnd);
         tr.dump_buf = Some(v);
+    }
+    if spec.lod_stats && code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_sample"))) {
+        let v = tr.sb_var();
+        let bnd = tr.alloc_binding(BindingKind::LodStats);
+        tr.decorate_binding(v, bnd);
+        tr.lod_stats_var = Some(v);
     }
     // Resource bindings in plan order.
     for (i, r) in plan.resources.iter().enumerate() {
@@ -2343,6 +2385,7 @@ mod tests {
             force_dispatcher: false,
             dispatcher_for_loops: false,
             reg_vars: true,
+            lod_stats: false,
         }
     }
 

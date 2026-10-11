@@ -173,6 +173,13 @@ struct Fixed {
     watchdog: vk::Buffer,
     /// Zero-filled buffer bound for empty or unmapped resources.
     dummy: vk::Buffer,
+    /// Hardware LOD statistics measured by the sampling instructions
+    /// (`BindingKind::LodStats`; `lodstats`).
+    lodstats: vk::Buffer,
+    /// Copies of them made by GetLodStats packets (lodstats::RING slots),
+    /// host visible.
+    lod_readback: vk::Buffer,
+    lod_readback_ptr: *mut u8,
     import_align: u64,
 }
 
@@ -202,6 +209,14 @@ thread_local! {
 static PIPES: Mutex<Option<HashMap<u64, Pipe>>> = Mutex::new(None);
 static GFX_PIPES: Mutex<Option<HashMap<u64, Pipe>>> = Mutex::new(None);
 
+/// The LOD statistics copied into readback slot `slot` (call once the batch
+/// with its `Exec::lod_stats_copy` completed).
+pub fn lod_stats_words(slot: usize) -> Vec<u32> {
+    let n = (super::lodstats::SLOT_BYTES / 4) as usize;
+    let p = unsafe { fixed().lod_readback_ptr.add(slot * n * 4) } as *const u32;
+    unsafe { std::slice::from_raw_parts(p, n).to_vec() }
+}
+
 /// Contents of the register-dump buffer (`DS_DUMP`); `clear` zeroes it
 /// (call with no GPU work using it in flight).
 pub fn debug_dump(clear: bool) -> Vec<u32> {
@@ -227,6 +242,8 @@ fn fixed() -> &'static Fixed {
         let (gds, _) = c.device_buffer(rdna::translate::GDS_BYTES as u64, usage).expect("GDS buffer");
         let (dummy, _) = c.device_buffer(DUMMY_BYTES, usage).expect("dummy buffer");
         let (debug, _, debug_ptr) = c.host_buffer(rdna::translate::DUMP_DWORDS as u64 * 4, usage).expect("debug buffer");
+        let (lodstats, _) = c.device_buffer(super::lodstats::SLOT_BYTES, usage).expect("LOD statistics buffer");
+        let (lod_readback, _, lod_readback_ptr) = c.host_buffer(super::lodstats::SLOT_BYTES * super::lodstats::RING as u64, usage).expect("LOD statistics readback");
         let (watchdog, _, watchdog_ptr) = c.host_buffer(rdna::translate::WATCHDOG_DWORDS as u64 * 4, usage).expect("watchdog buffer");
         unsafe { std::ptr::write_bytes(watchdog_ptr, 0, rdna::translate::WATCHDOG_DWORDS as usize * 4) };
         WATCHDOG_PTR.store(watchdog_ptr as *mut u32, Ordering::SeqCst);
@@ -241,6 +258,9 @@ fn fixed() -> &'static Fixed {
             c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
             c.device.cmd_fill_buffer(cmd, gds, 0, vk::WHOLE_SIZE, 0);
             c.device.cmd_fill_buffer(cmd, dummy, 0, vk::WHOLE_SIZE, 0);
+            // Every bank: no mip sampled (15), count 0.
+            c.device.cmd_fill_buffer(cmd, lodstats, 0, super::lodstats::SLOT_BYTES / 2, 15);
+            c.device.cmd_fill_buffer(cmd, lodstats, super::lodstats::SLOT_BYTES / 2, super::lodstats::SLOT_BYTES / 2, 0);
             c.device.end_command_buffer(cmd).ok();
             if c.submit(cmd, &[], &[], fence).is_ok() {
                 c.device.wait_for_fences(&[fence], true, u64::MAX).ok();
@@ -248,7 +268,7 @@ fn fixed() -> &'static Fixed {
             c.device.destroy_fence(fence, None);
             c.device.destroy_command_pool(pool, None);
         }
-        Fixed { gds, debug, debug_ptr, watchdog, dummy, import_align: host.min_imported_host_pointer_alignment.max(4096) }
+        Fixed { gds, debug, debug_ptr, watchdog, dummy, lodstats, lod_readback, lod_readback_ptr, import_align: host.min_imported_host_pointer_alignment.max(4096) }
     })
 }
 
@@ -628,7 +648,7 @@ pub fn pipeline_test(capture: &str) -> i32 {
 
 fn descriptor_type(k: BindingKind) -> vk::DescriptorType {
     match k {
-        BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Gds | BindingKind::Debug | BindingKind::Watchdog => vk::DescriptorType::STORAGE_BUFFER,
+        BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Gds | BindingKind::Debug | BindingKind::Watchdog | BindingKind::LodStats => vk::DescriptorType::STORAGE_BUFFER,
         BindingKind::Image(_) | BindingKind::ImageArray(_) => vk::DescriptorType::SAMPLED_IMAGE,
         BindingKind::StorageImage(_) => vk::DescriptorType::STORAGE_IMAGE,
         BindingKind::Sampler(_) => vk::DescriptorType::SAMPLER,
@@ -2174,6 +2194,30 @@ impl Exec {
         self.recording || self.last_seq > done_seq()
     }
 
+    /// GetLodStats with statistics measured by the GPU (`tune lod_stats 3`):
+    /// after the work recorded so far, copies the counters into readback
+    /// slot `slot` and, with `reset`, starts them again (no bank sampled).
+    /// The caller reads the slot (`lod_stats_words`) in an action after it.
+    pub fn lod_stats_copy(&mut self, slot: usize, reset: bool) {
+        self.begin();
+        self.end_rendering();
+        let fx = fixed();
+        let cmd = self.cmd();
+        let d = &ctx().device;
+        let bytes = super::lodstats::SLOT_BYTES;
+        global_barrier(cmd);
+        unsafe {
+            d.cmd_copy_buffer(cmd, fx.lodstats, fx.lod_readback, &[vk::BufferCopy { src_offset: 0, dst_offset: slot as u64 * bytes, size: bytes }]);
+            if reset {
+                d.cmd_fill_buffer(cmd, fx.lodstats, 0, bytes / 2, 15);
+                d.cmd_fill_buffer(cmd, fx.lodstats, bytes / 2, bytes / 2, 0);
+            }
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        }
+        global_barrier(cmd);
+    }
+
     /// Whether deferred CP effects are still pending (later CP memory writes
     /// must queue behind them).
     pub fn deferred_pending(&self) -> bool {
@@ -2773,6 +2817,7 @@ impl Exec {
                     BindingKind::Gds => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.gds, offset: 0, range: rdna::translate::GDS_BYTES as u64 })),
                     BindingKind::Debug => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.debug, offset: 0, range: rdna::translate::DUMP_DWORDS as u64 * 4 })),
                     BindingKind::Watchdog => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.watchdog, offset: 0, range: rdna::translate::WATCHDOG_DWORDS as u64 * 4 })),
+                    BindingKind::LodStats => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.lodstats, offset: 0, range: super::lodstats::SLOT_BYTES })),
                     _ => {}
                 }
             }
@@ -3188,6 +3233,8 @@ pub fn status() -> String {
     ) + &super::images::IMAGES.try_lock().and_then(|g| g.as_ref().map(|i| i.status())).unwrap_or_default()
         + &super::track::status()
         + &crate::mem::remap_status()
+        + &crate::titlemem::status()
+        + &super::lodstats::status()
         + &super::mirror::status()
         + &super::homes::status()
         + &sync_why_status()

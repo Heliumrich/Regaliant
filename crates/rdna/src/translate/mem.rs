@@ -1177,13 +1177,7 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
         Some(pc) => {
             // The T# came from a table at a run-time offset: index the array
             // of its entries (32 bytes each), per invocation.
-            let ov = *tr.table_offsets.get(&pc).ok_or_else(|| format!("{:#x}: image table load {pc:#x} not translated", ins.pc))?;
-            let off = e(tr.b.load(u, None, ov, None, []))?;
-            let k5 = tr.u(5);
-            let idx = e(tr.b.shift_right_logical(u, None, off, k5))?;
-            let max = tr.u(super::IMAGE_TABLE_LEN - 1);
-            let idx = tr.glsl2(u, GLOp::UMin, idx, max)?;
-            tr.b.decorate(idx, Decoration::NonUniform, []);
+            let idx = table_index(tr, ins, pc)?;
             let pt = tr.b.type_pointer(None, StorageClass::UniformConstant, img_ty);
             let p = e(tr.b.access_chain(pt, None, var, [idx]))?;
             tr.b.decorate(p, Decoration::NonUniform, []);
@@ -1353,6 +1347,186 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
             Ok(())
         }
     }
+}
+
+/// Index of the image table entry the T# of table load `pc` selects (per
+/// invocation; clamped to the bound entries).
+fn table_index(tr: &mut T, ins: &Inst, pc: u32) -> R<Word> {
+    let u = tr.t.u32;
+    let ov = *tr.table_offsets.get(&pc).ok_or_else(|| format!("{:#x}: image table load {pc:#x} not translated", ins.pc))?;
+    let off = e(tr.b.load(u, None, ov, None, []))?;
+    let k5 = tr.u(5);
+    let idx = e(tr.b.shift_right_logical(u, None, off, k5))?;
+    let max = tr.u(super::IMAGE_TABLE_LEN - 1);
+    let idx = tr.glsl2(u, GLOp::UMin, idx, max)?;
+    tr.b.decorate(idx, Decoration::NonUniform, []);
+    Ok(idx)
+}
+
+/// How a sampling instruction selects its level of detail (LOD statistics).
+enum LodHow {
+    /// From the implicit derivatives (fragment), plus the bias operand.
+    Implicit(Option<Word>),
+    /// The LOD operand.
+    Explicit(Word),
+    /// From the gradient operands (x and y per dimension).
+    Grad(Vec<Word>, Vec<Word>),
+    /// The view's first mip (LOD zero).
+    Base,
+}
+
+/// The coordinate of a level-of-detail query: without the array layer.
+fn lod_coord(tr: &mut T, coord: Word, rdim: ImageDim) -> R<Word> {
+    let f = tr.t.f32;
+    let n = match rdim {
+        ImageDim::D1Array | ImageDim::D2Array => 2,
+        ImageDim::CubeArray => 3,
+        _ => return Ok(coord),
+    };
+    let mut c = Vec::new();
+    for k in 0..n {
+        c.push(e(tr.b.composite_extract(f, None, coord, [k]))?);
+    }
+    e(tr.b.composite_construct(if n == 2 { tr.t.v2f } else { tr.t.v3f }, None, c))
+}
+
+/// Level of detail from explicit gradients, relative to the view's first
+/// mip: log2 of the longer footprint axis in texels.
+fn grad_lod(tr: &mut T, image: Word, rdim: ImageDim, dx: &[Word], dy: &[Word]) -> R<Word> {
+    let f = tr.t.f32;
+    let sty = match rdim {
+        ImageDim::D1Array | ImageDim::D2Array | ImageDim::D3 | ImageDim::CubeArray => tr.t.v3i,
+        _ => tr.t.v2i,
+    };
+    let z = tr.i(0);
+    let size = e(tr.b.image_query_size_lod(sty, None, image, z))?;
+    let mut sx = tr.f(0.0);
+    let mut sy = tr.f(0.0);
+    for (j, (&gx, &gy)) in dx.iter().zip(dy.iter()).enumerate() {
+        let s = e(tr.b.composite_extract(tr.t.i32, None, size, [j as u32]))?;
+        let s = e(tr.b.convert_s_to_f(f, None, s))?;
+        let a = e(tr.b.f_mul(f, None, gx, s))?;
+        let a2 = e(tr.b.f_mul(f, None, a, a))?;
+        sx = e(tr.b.f_add(f, None, sx, a2))?;
+        let b = e(tr.b.f_mul(f, None, gy, s))?;
+        let b2 = e(tr.b.f_mul(f, None, b, b))?;
+        sy = e(tr.b.f_add(f, None, sy, b2))?;
+    }
+    let m = tr.glsl2(f, GLOp::FMax, sx, sy)?;
+    let l = tr.glsl1(f, GLOp::Log2, m)?;
+    let half = tr.f(0.5);
+    e(tr.b.f_mul(f, None, l, half))
+}
+
+/// Hardware LOD statistics (`Spec::lod_stats`): when the sampled T# enables
+/// counting ([`super::LOD_INFO_ENABLED`]), adds the active, non-helper lanes
+/// to its counter bank: the finest mip they sample (the level of detail
+/// relative to the texture's mip 0, floored, 0..14) and their number. The
+/// lanes of a subgroup sampling one bank add one atomic pair.
+#[allow(clippy::too_many_arguments)]
+fn record_lod(tr: &mut T, ins: &Inst, image: Word, simg: Word, coord: Word, rdim: ImageDim, how: LodHow) -> R<()> {
+    let Some(stats) = tr.lod_stats_var else { return Ok(()) };
+    let Some(&(r, _)) = tr.plan.inst_res.get(&ins.pc) else { return Ok(()) };
+    let u = tr.t.u32;
+    let f = tr.t.f32;
+    let bt = tr.t.bool_;
+    let info = match tr.image_tables.get(&r).copied() {
+        Some(pc) => {
+            let idx = table_index(tr, ins, pc)?;
+            let base = tr.u(super::lod_info_offset(&tr.plan) + super::IMAGE_TABLE_LEN * super::table_slot(&tr.plan, r));
+            let i = e(tr.b.i_add(u, None, base, idx))?;
+            let z = tr.u(0);
+            let p = e(tr.b.access_chain(tr.t.sb_u32, None, tr.sgpr_data, [z, i]))?;
+            e(tr.b.load(u, None, p, None, []))?
+        }
+        None => tr.res_info(r, 0)?,
+    };
+    // In uniform control flow (implicit derivatives).
+    let rel = match how {
+        LodHow::Implicit(bias) => {
+            let c = lod_coord(tr, coord, rdim)?;
+            let q = e(tr.b.image_query_lod(tr.t.v2f, None, simg, c))?;
+            let y = e(tr.b.composite_extract(f, None, q, [1]))?;
+            match bias {
+                Some(b) => {
+                    let bf = tr.to_f(b)?;
+                    e(tr.b.f_add(f, None, y, bf))?
+                }
+                None => y,
+            }
+        }
+        LodHow::Explicit(l) => tr.to_f(l)?,
+        LodHow::Grad(dx, dy) => grad_lod(tr, image, rdim, &dx, &dy)?,
+        LodHow::Base => tr.f(0.0),
+    };
+    let k8 = tr.u(8);
+    let k15 = tr.u(15);
+    let sh = e(tr.b.shift_right_logical(u, None, info, k8))?;
+    let base = e(tr.b.bitwise_and(u, None, sh, k15))?;
+    let basef = e(tr.b.convert_u_to_f(f, None, base))?;
+    let abs = e(tr.b.f_add(f, None, rel, basef))?;
+    let z = tr.f(0.0);
+    let hi = tr.f(14.0);
+    let lo = tr.glsl2(f, GLOp::NMax, abs, z)?;
+    let cl = tr.glsl2(f, GLOp::NMin, lo, hi)?;
+    let fl = tr.glsl1(f, GLOp::Floor, cl)?;
+    let mip = e(tr.b.convert_f_to_u(u, None, fl))?;
+    let kff = tr.u(0xFF);
+    let bank = e(tr.b.bitwise_and(u, None, info, kff))?;
+    let ken = tr.u(super::LOD_INFO_ENABLED);
+    let enabled = e(tr.b.u_greater_than_equal(bt, None, info, ken))?;
+    let act = tr.active()?;
+    let mut cond = e(tr.b.logical_and(bt, None, enabled, act))?;
+    if tr.spec.stage == Stage::Fragment {
+        let hv = match tr.helper_var {
+            Some(v) => v,
+            None => {
+                let v = tr.input(bt, Some(BuiltIn::HelperInvocation), None);
+                tr.helper_var = Some(v);
+                v
+            }
+        };
+        let h = e(tr.b.load(bt, None, hv, None, []))?;
+        let nh = e(tr.b.logical_not(bt, None, h))?;
+        cond = e(tr.b.logical_and(bt, None, cond, nh))?;
+    }
+    tr.guarded(cond, &mut |tr| {
+        tr.b.capability(spirv::Capability::GroupNonUniform);
+        tr.b.capability(spirv::Capability::GroupNonUniformBallot);
+        tr.b.capability(spirv::Capability::GroupNonUniformArithmetic);
+        let sg = tr.u(spirv::Scope::Subgroup as u32);
+        let scope = tr.u(spirv::Scope::Device as u32);
+        let sem = tr.u(0);
+        let zero = tr.u(0);
+        let k256 = tr.u(256);
+        let first = e(tr.b.group_non_uniform_broadcast_first(u, None, sg, bank))?;
+        let same = e(tr.b.i_equal(bt, None, bank, first))?;
+        let count_at = e(tr.b.i_add(u, None, bank, k256))?;
+        // Lanes sampling the subgroup's first bank (usually all): one lane
+        // adds for them.
+        tr.guarded(same, &mut |tr| {
+            let one = tr.u(1);
+            let mm = e(tr.b.group_non_uniform_u_min(u, None, sg, spirv::GroupOperation::Reduce, mip, None))?;
+            let n = e(tr.b.group_non_uniform_i_add(u, None, sg, spirv::GroupOperation::Reduce, one, None))?;
+            let el = e(tr.b.group_non_uniform_elect(bt, None, sg))?;
+            tr.guarded(el, &mut |tr| {
+                let p = e(tr.b.access_chain(tr.t.sb_u32, None, stats, [zero, bank]))?;
+                e(tr.b.atomic_u_min(u, None, p, scope, sem, mm))?;
+                let p = e(tr.b.access_chain(tr.t.sb_u32, None, stats, [zero, count_at]))?;
+                e(tr.b.atomic_i_add(u, None, p, scope, sem, n))?;
+                Ok(())
+            })
+        })?;
+        let other = e(tr.b.logical_not(bt, None, same))?;
+        tr.guarded(other, &mut |tr| {
+            let one = tr.u(1);
+            let p = e(tr.b.access_chain(tr.t.sb_u32, None, stats, [zero, bank]))?;
+            e(tr.b.atomic_u_min(u, None, p, scope, sem, mip))?;
+            let p = e(tr.b.access_chain(tr.t.sb_u32, None, stats, [zero, count_at]))?;
+            e(tr.b.atomic_i_add(u, None, p, scope, sem, one))?;
+            Ok(())
+        })
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1628,6 +1802,17 @@ fn sample(tr: &mut T, ins: &Inst, name: &str, image: Word, img_ty: Word, si: Opt
     } else {
         e(tr.b.image_sample_implicit_lod(res_ty, None, simg, coord, m, operands))?
     };
+    // After the sample (its sampled image is consumed in this block; the
+    // statistics open blocks of their own).
+    if tr.lod_stats_var.is_some() && !gather && !has_c {
+        let how = match (&derivs, cube) {
+            (Some((dx, dy)), false) => LodHow::Grad(dx.clone(), dy.clone()),
+            _ if has_l => LodHow::Explicit(lod_or_clamp.unwrap()),
+            _ if explicit => LodHow::Base,
+            _ => LodHow::Implicit(bias),
+        };
+        record_lod(tr, ins, image, simg, coord, rdim, how)?;
+    }
     write_result(tr, res)
 }
 
