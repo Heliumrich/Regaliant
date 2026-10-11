@@ -1382,6 +1382,8 @@ struct Slot {
     pre_buf: Option<vk::Buffer>,
     /// Video-memory homes the slot's batch binds (kept until it completes).
     homes: Vec<std::sync::Arc<super::homes::HomeBuf>>,
+    /// Shared copy chunks the slot's batch binds (kept until it completes).
+    keep: Vec<std::sync::Arc<super::precache::Chunk>>,
 }
 
 impl Slot {
@@ -1411,6 +1413,7 @@ impl Slot {
                 pre,
                 pre_buf: None,
                 homes: Vec::new(),
+                keep: Vec::new(),
             })
         }
     }
@@ -1805,7 +1808,7 @@ pub struct Exec {
     pre_used: u64,
     pre_open: bool,
     pre_failed: bool,
-    pres: super::fx::Map<(u64, u64), u64>,
+    pres: super::fx::Map<(u64, u64), (vk::Buffer, u64)>,
     ring_align: u64,
     recording: bool,
     /// When the batch being recorded was begun.
@@ -1866,6 +1869,12 @@ pub struct Exec {
     pub(crate) stop_why: &'static str,
     flush_why: &'static str,
     closed: Vec<Closed>,
+    /// The graphics queue's family (command processor and parallel
+    /// workers): batch-start copies are shared (`gpu::precache`).
+    shares_pre: bool,
+    /// Shared copies this batch's prologue makes (usable by later batches
+    /// once it is submitted).
+    shared_pending: Vec<(u64, u64)>,
 }
 
 unsafe impl Send for Exec {}
@@ -1874,6 +1883,7 @@ unsafe impl Send for Exec {}
 struct Closed {
     slot: usize,
     pre: Option<vk::CommandBuffer>,
+    shared: Vec<(u64, u64)>,
     writes: super::ranges::Ranges,
     checks: Vec<verify::Check>,
     shaders: Vec<u64>,
@@ -1940,6 +1950,8 @@ impl Exec {
                 stop_why: "",
                 flush_why: "",
                 closed: Vec::new(),
+                shares_pre: name.starts_with("gpu-gfx"),
+                shared_pending: Vec::new(),
             })
         }
     }
@@ -2015,6 +2027,7 @@ impl Exec {
             }
             self.slots[self.cur].seq = 0;
             self.slots[self.cur].homes.clear();
+            self.slots[self.cur].keep.clear();
         }
         unsafe {
             ctx().device.begin_command_buffer(self.cmd(), &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
@@ -2117,7 +2130,7 @@ impl Exec {
             if has_actions || !self.pending_promises.is_empty() {
                 crate::error!("gpu[{}]: CP effects in a parallel run (dropped)", self.name);
             }
-            self.closed.push(Closed { slot: i, pre, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders) });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders) });
             self.slots[i].seq = PENDING;
             self.pending_promises.clear();
             self.pending_log.clear();
@@ -2145,6 +2158,7 @@ impl Exec {
             }
         });
         self.slots[i].seq = seq;
+        super::precache::submitted(&std::mem::take(&mut self.shared_pending), seq);
         for (a, v, n) in std::mem::take(&mut self.pending_promises) {
             super::cp::promise(seq, a, v, n);
         }
@@ -2180,6 +2194,7 @@ impl Exec {
         self.pending.clear();
         self.pending_log.clear();
         self.pending_promises.clear();
+        self.shared_pending.clear();
         self.batch_shaders.clear();
         self.resident.clear();
         self.recording = false;
@@ -2367,18 +2382,30 @@ impl Exec {
         }
         let al = base & !15;
         let bias = base - al;
-        if let (Some(&at), Some(buf)) = (self.pres.get(&(base, size)), self.slots[self.cur].pre_buf) {
+        if let Some(&(buf, at)) = self.pres.get(&(base, size)) {
             PRE_REUSED.fetch_add(1, Ordering::Relaxed);
             return Some((buf, at, bias));
         }
         let n = (bias + size).next_multiple_of(4);
+        let share = self.shares_pre && super::precache::enabled();
+        if share {
+            // Copied by an earlier submitted batch (`gpu::precache`).
+            if let Some((chunk, at)) = super::precache::lookup(base, size) {
+                PRE_REUSED.fetch_add(1, Ordering::Relaxed);
+                let buf = chunk.buf;
+                self.slots[self.cur].keep.push(chunk);
+                self.pres.insert((base, size), (buf, at));
+                return Some((buf, at, bias));
+            }
+        }
         let off = self.pre_used.next_multiple_of(self.ring_align);
         if off + n > PRE_SEG {
             PRE_FULL.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         let (src, start, _) = span(al, n)?;
-        if self.slots[self.cur].pre_buf.is_none() {
+        let shared = if share { super::precache::insert(base, size, n) } else { None };
+        if shared.is_none() && self.slots[self.cur].pre_buf.is_none() {
             match ctx().device_buffer(PRE_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER) {
                 Ok((b, _m)) => self.slots[self.cur].pre_buf = Some(b),
                 Err(e) => {
@@ -2388,7 +2415,10 @@ impl Exec {
                 }
             }
         }
-        let buf = self.slots[self.cur].pre_buf?;
+        let (buf, off) = match &shared {
+            Some((chunk, at)) => (chunk.buf, *at),
+            None => (self.slots[self.cur].pre_buf?, off),
+        };
         let c = ctx();
         let (pre, qp) = (self.slots[self.cur].pre, self.slots[self.cur].queries);
         if !self.pre_open {
@@ -2406,8 +2436,14 @@ impl Exec {
             self.pre_open = true;
         }
         unsafe { c.device.cmd_copy_buffer(pre, src, buf, &[vk::BufferCopy { src_offset: al - start, dst_offset: off, size: n }]) };
-        self.pre_used = off + n;
-        self.pres.insert((base, size), off);
+        match shared {
+            Some((chunk, _)) => {
+                self.slots[self.cur].keep.push(chunk);
+                self.shared_pending.push((base, size));
+            }
+            None => self.pre_used = off + n,
+        }
+        self.pres.insert((base, size), (buf, off));
         PRE_COPIES.fetch_add(1, Ordering::Relaxed);
         PRE_BYTES.fetch_add(n, Ordering::Relaxed);
         if profiling() {
@@ -2827,6 +2863,7 @@ impl Exec {
 
     /// A guest range the batch being recorded writes.
     pub(super) fn note_write(&mut self, a: u64, n: u64) {
+        super::precache::invalidate(a, n);
         self.pending.insert(a, n);
         if verify::enabled() {
             self.pending_log.push((a, n));
@@ -3116,6 +3153,7 @@ impl Exec {
                 }
             });
             self.slots[b.slot].seq = seq;
+            super::precache::submitted(&b.shared, seq);
             INFLIGHT.note_ranges(seq, &b.writes);
             self.inflight.insert_all(seq, &b.writes);
             self.last_seq = seq;
@@ -3142,6 +3180,7 @@ impl Exec {
                 c.device.reset_descriptor_pool(s.desc_pool, vk::DescriptorPoolResetFlags::empty()).ok();
             }
             s.homes.clear();
+            s.keep.clear();
             s.seq = 0;
         }
     }
@@ -3783,6 +3822,7 @@ pub fn status() -> String {
         + &super::lodstats::status()
         + &super::ahead::status()
         + &super::par::status()
+        + &super::precache::status()
         + &super::mirror::status()
         + &super::homes::status()
         + &sync_why_status()

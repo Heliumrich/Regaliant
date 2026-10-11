@@ -330,6 +330,7 @@ impl Drop for HostWrite {
 /// pages in the range become writable, their regions dirty, and they stay
 /// writable while the returned guard lives.
 pub fn host_write(base: u64, len: u64) -> HostWrite {
+    super::precache::invalidate(base, len);
     if len == 0 {
         return HostWrite(None, base, 0);
     }
@@ -384,6 +385,7 @@ pub fn gpu_write(base: u64, len: u64) {
 /// base+len): its page states are forgotten (re-registered on re-arming)
 /// and overlapping regions are dirty.
 pub fn remapped(base: u64, len: u64) {
+    super::precache::invalidate(base, len);
     super::homes::remapped(base, len);
     let mut g = TRACK.lock();
     let Some(t) = g.as_mut() else { return };

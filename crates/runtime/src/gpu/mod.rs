@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 30] = [
+    static ALL: [Tunable; 31] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -57,6 +57,7 @@ pub mod tune {
         Tunable { name: "ahead", env: "DS_AHEAD", default: 4, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_cs", env: "DS_PRE_CS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "par", env: "DS_PAR", default: 3, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_share", env: "DS_PRE_SHARE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -267,6 +268,12 @@ pub mod tune {
         get(29)
     }
 
+    /// Batch-start copies of the graphics queue shared across its batches
+    /// (`gpu::precache`); 0: each batch copies what it binds.
+    pub fn pre_share() -> bool {
+        get(30) != 0
+    }
+
     /// Command-processor waits for GPU work still to be traced (`tune
     /// trace_sync <n>`: the next n are logged with the read that collided,
     /// its writer and the shader).
@@ -293,6 +300,7 @@ pub mod tune {
 
 pub mod ahead;
 pub mod par;
+pub mod precache;
 pub mod exec;
 pub mod pcache;
 pub mod lodstats;

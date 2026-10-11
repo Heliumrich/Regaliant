@@ -225,9 +225,11 @@ unsafe fn rd64(a: u64) -> u64 {
     unsafe { std::ptr::read_volatile(a as *const u64) }
 }
 unsafe fn wr32(a: u64, v: u32) {
+    super::precache::invalidate(a, 4);
     unsafe { std::ptr::write_volatile(a as *mut u32, v) }
 }
 unsafe fn wr64(a: u64, v: u64) {
+    super::precache::invalidate(a, 8);
     unsafe { std::ptr::write_volatile(a as *mut u64, v) }
 }
 
@@ -734,6 +736,21 @@ impl Cp {
     /// Why this worker's chunk stopped.
     pub fn worker_stop_why(&self) -> &'static str {
         self.exec.as_ref().map_or("", |e| e.stop_why)
+    }
+
+    /// After a label wait of the graphics queue: the CPU may have written
+    /// data before releasing it, so shared batch-start copies are dropped
+    /// (`gpu::precache`), unless the label holds what a GPU queue's CP wrote
+    /// last (the queues synchronize this way ~250 times per frame).
+    fn end_copy_scope_after_wait(&self, a: u64, wide: bool) {
+        if self.compute || !valid(a, if wide { 8 } else { 4 }) {
+            return;
+        }
+        let now = unsafe { if wide { rd64(a) } else { rd32(a) as u64 } };
+        let by_gpu = last_write(a).is_some_and(|(q, v, _)| q.starts_with("gpu-") && if wide { v == now } else { v as u32 == now as u32 });
+        if !by_gpu {
+            super::precache::end_scope();
+        }
     }
 
     /// Submits the batches this worker closed (the main command processor,
@@ -1621,6 +1638,10 @@ impl Cp {
             crate::error!("gpu[{}]: indirect buffer nesting too deep at {addr:#x}", self.name);
             return;
         }
+        if self.depth == 0 && !self.compute {
+            // CPU writes come between submissions.
+            super::precache::end_scope();
+        }
         self.depth += 1;
         let mut cur = addr;
         let mut end = addr + 4 * size as u64;
@@ -2049,14 +2070,20 @@ impl Cp {
                     self.submit_gpu("wait");
                 }
                 let c = p(0);
-                return self.wait(c, addr64(p(1), p(2)), false, p(3) as u64, p(4) as u64, at);
+                let a = addr64(p(1), p(2));
+                let flow = self.wait(c, a, false, p(3) as u64, p(4) as u64, at);
+                self.end_copy_scope_after_wait(a, false);
+                return flow;
             }
             op::WAIT_REG_MEM64 => {
                 if !super::tune::lazy_wait_submit() {
                     self.submit_gpu("wait");
                 }
                 let c = p(0);
-                return self.wait(c, addr64(p(1), p(2)), true, addr64(p(3), p(4)), addr64(p(5), p(6)), at);
+                let a = addr64(p(1), p(2));
+                let flow = self.wait(c, a, true, addr64(p(3), p(4)), addr64(p(5), p(6)), at);
+                self.end_copy_scope_after_wait(a, true);
+                return flow;
             }
             op::COND_EXEC => {
                 self.sync();
@@ -2079,6 +2106,9 @@ impl Cp {
                 self.run(a, size);
             }
             op::REWIND => {
+                if !self.compute {
+                    super::precache::end_scope();
+                }
                 // The parser stalls until the CPU marks the packet valid.
                 if p(0) & (1 << 31) == 0 {
                     return self.poll_until(at, &format!("REWIND at {at:#x} (waiting for the valid bit)"), || unsafe { rd32(at + 4) } & (1 << 31) != 0);
