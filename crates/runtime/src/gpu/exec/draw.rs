@@ -481,7 +481,7 @@ impl Exec {
         if let Some(p) = &ps {
             reads.extend_from_slice(&p.reads);
         }
-        if self.sync_for_reads(&reads) {
+        if self.sync_for(&reads, SYNC_DRAW_READS) {
             vs = shaders::prepare_ngg(cp)?;
             ps = if ps_addr != 0 { Some(shaders::prepare_ps(cp)?) } else { None };
         }
@@ -489,10 +489,10 @@ impl Exec {
         if let Some(p) = &ps {
             ranges.extend(texture_ranges(p));
         }
+        self.sync_for(&ranges, SYNC_DRAW_TEXTURES);
         if let Some((addr, size)) = a.index {
-            ranges.push((addr, a.count as u64 * size as u64));
+            self.sync_for(&[(addr, a.count as u64 * size as u64)], SYNC_DRAW_INDICES);
         }
-        self.sync_for_reads(&ranges);
         // Color targets: enabled in CB_TARGET_MASK and CB_SHADER_MASK,
         // exported by the pixel shader with a non-zero export format.
         let mrt_mask = ps.as_ref().map(|p| p.tr.out.mrt_mask).unwrap_or(0);

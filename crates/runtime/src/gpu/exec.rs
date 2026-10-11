@@ -58,6 +58,27 @@ fn sync_mode() -> bool {
 }
 pub static SKIPPED: AtomicU64 = AtomicU64::new(0);
 pub static FLUSHES: AtomicU64 = AtomicU64::new(0);
+/// Completions waited for so the CP could read memory, by reason: CP reads
+/// (indirect arguments, labels, ...), dispatch shader reads (descriptors and
+/// scalar loads), dispatch textures, draw shader reads, draw textures, draw
+/// indices (`gpu exec` status line).
+pub static SYNC_WHY: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+pub const SYNC_CP: usize = 0;
+pub const SYNC_CS_READS: usize = 1;
+pub const SYNC_CS_TEXTURES: usize = 2;
+pub const SYNC_DRAW_READS: usize = 3;
+pub const SYNC_DRAW_TEXTURES: usize = 4;
+pub const SYNC_DRAW_INDICES: usize = 5;
+
+fn sync_why_status() -> String {
+    let n: Vec<u64> = SYNC_WHY.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    format!(
+        "    CP read waits: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices
+",
+        n[0], n[1], n[2], n[3], n[4], n[5]
+    )
+}
+
 /// Time the completion thread spent waiting for fences / running actions (ns).
 pub static FENCE_NS: AtomicU64 = AtomicU64::new(0);
 pub static ACTION_NS: AtomicU64 = AtomicU64::new(0);
@@ -1649,7 +1670,7 @@ impl Exec {
     /// writes into `reads` (memory the CP reads now: indirect arguments,
     /// draw counts); returns whether it waited.
     pub fn flush_if_writes(&mut self, reads: &[(u64, u64)]) -> bool {
-        self.sync_for_reads(reads)
+        self.sync_for(reads, SYNC_CP)
     }
 
     /// Whether GPU work is recorded or not yet completed.
@@ -1731,6 +1752,15 @@ impl Exec {
     /// arguments): completes this queue's work writing into `reads` and
     /// waits for any queue's unfinished batch that does. Returns whether
     /// it waited (memory may have changed).
+    /// `sync_for_reads`, counted by the reason (`SYNC_WHY`) when it waited.
+    pub fn sync_for(&mut self, reads: &[(u64, u64)], why: usize) -> bool {
+        let w = self.sync_for_reads(reads);
+        if w {
+            SYNC_WHY[why.min(SYNC_WHY.len() - 1)].fetch_add(1, Ordering::Relaxed);
+        }
+        w
+    }
+
     pub fn sync_for_reads(&mut self, reads: &[(u64, u64)]) -> bool {
         let mut waited = false;
         if self.overlaps_pending(reads) {
@@ -2289,11 +2319,11 @@ impl Exec {
         }
         let wave64 = initiator & (1 << 15) == 0;
         let mut p = shaders::prepare_compute(cp, wave64)?;
-        if self.sync_for_reads(&p.reads) {
+        if self.sync_for(&p.reads, SYNC_CS_READS) {
             p = shaders::prepare_compute(cp, wave64)?;
         }
         // Textures are uploaded from guest memory: earlier GPU writes first.
-        self.sync_for_reads(&texture_ranges(&p));
+        self.sync_for(&texture_ranges(&p), SYNC_CS_TEXTURES);
         let local = [cp.reg(Space::Sh, 0x207) & 0xFFFF, cp.reg(Space::Sh, 0x208) & 0xFFFF, cp.reg(Space::Sh, 0x209) & 0xFFFF];
         if initiator & (1 << 5) != 0 {
             // USE_THREAD_DIMENSIONS: sizes are in threads.
@@ -2517,6 +2547,7 @@ pub fn status() -> String {
         + &super::track::status()
         + &crate::mem::remap_status()
         + &super::mirror::status()
+        + &sync_why_status()
         + &format!(
             "    buffer snapshots in VRAM: {} ({} MiB), {} reused, {} not for lack of space; draws with snapshotted indices {} ({} MiB)\n",
             SNAPS.load(Ordering::Relaxed),
