@@ -1285,6 +1285,11 @@ impl Images {
         }
     }
 
+    /// The images with a fast clear pending.
+    pub fn pending_clear_keys(&self) -> Vec<ImageKey> {
+        self.pending_clears.keys().copied().collect()
+    }
+
     /// Whether any of `keys` has a fast clear pending.
     pub fn clears_pending(&self, keys: &[ImageKey]) -> bool {
         !self.pending_clears.is_empty() && keys.iter().any(|k| self.pending_clears.contains_key(k))

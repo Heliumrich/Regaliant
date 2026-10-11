@@ -50,6 +50,16 @@ pub static STOPS: AtomicU64 = AtomicU64::new(0);
 pub static COMMANDS: AtomicU64 = AtomicU64::new(0);
 pub static WAIT_NS: AtomicU64 = AtomicU64::new(0);
 pub static CANCELLED: AtomicU64 = AtomicU64::new(0);
+static STOP_WHY: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+/// A chunk stopped early for `why`.
+pub fn note_stop(why: &'static str) {
+    let mut g = STOP_WHY.lock();
+    match g.iter_mut().find(|e| e.0 == why) {
+        Some(e) => e.1 += 1,
+        None => g.push((why, 1)),
+    }
+}
 
 /// The workers of a queue's command processor (created on first use).
 pub struct Pool {
@@ -161,11 +171,15 @@ pub fn status() -> String {
     if runs == 0 {
         return String::new();
     }
+    let mut why = STOP_WHY.lock().clone();
+    why.sort_by(|a, b| b.1.cmp(&a.1));
+    let why: Vec<String> = why.iter().map(|(w, n)| format!("{w} {n}")).collect();
     format!(
-        "    parallel runs: {runs} runs, {} chunks to workers ({} commands), {} stopped early, {} cancelled; main waited {} ms for workers\n",
+        "    parallel runs: {runs} runs, {} chunks to workers ({} commands), {} stopped early ({}), {} cancelled; main waited {} ms for workers\n",
         CHUNKS.load(Ordering::Relaxed),
         COMMANDS.load(Ordering::Relaxed),
         STOPS.load(Ordering::Relaxed),
+        why.join(", "),
         CANCELLED.load(Ordering::Relaxed),
         WAIT_NS.load(Ordering::Relaxed) / 1_000_000
     )

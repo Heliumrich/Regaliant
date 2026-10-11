@@ -622,7 +622,7 @@ impl Exec {
             let s = dsurf.as_ref().unwrap();
             if let Some(old) = images::with(|im| im.depth_to_grow(s.base, s.width, s.height, images::Images::depth_family(s.format), s.layers)) {
                 self.end_rendering();
-                self.flush();
+                self.flush_for("depth growth");
                 if self.stopped {
                     return Err(super::STOPPED.into());
                 }

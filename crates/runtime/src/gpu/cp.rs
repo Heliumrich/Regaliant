@@ -645,6 +645,7 @@ impl Cp {
     pub fn chunk_start(&mut self) {
         if let Some(e) = self.exec.as_mut() {
             e.stopped = false;
+            e.stop_why = "";
         }
     }
 
@@ -690,19 +691,45 @@ impl Cp {
             self.cur_packet = cur;
             self.cur_opcode = opcode;
             let p = |i: u64| f.rd(cur + 4 * (1 + i));
+            // Stages prepared ahead within the chunk, as in `run`.
+            let command = is_command(opcode);
+            if command && !self.ahead.is_empty() {
+                if self.ahead.front().is_some_and(|c| c.at == cur) {
+                    let c = self.ahead.pop_front().unwrap();
+                    *self.cur_ahead.borrow_mut() = c.stages;
+                } else {
+                    self.drop_ahead();
+                }
+            }
             let flow = self.packet(opcode, h, cur, n, &p);
+            if command {
+                for s in self.take_ahead().iter().flatten() {
+                    s.cancel();
+                }
+            }
             if self.exec.as_ref().is_some_and(|e| e.stopped) {
                 super::par::COMMANDS.fetch_add(commands, Ordering::Relaxed);
+                self.drop_ahead();
                 return Some(cur);
             }
             if !matches!(flow, Flow::Next) {
+                self.drop_ahead();
                 return Some(next);
             }
-            commands += is_command(opcode) as u64;
+            commands += command as u64;
+            if command && self.ahead.is_empty() && super::ahead::enabled() {
+                self.scan_ahead(&f, next, to);
+            }
             cur = next;
         }
         super::par::COMMANDS.fetch_add(commands, Ordering::Relaxed);
+        self.drop_ahead();
         None
+    }
+
+    /// Why this worker's chunk stopped.
+    pub fn worker_stop_why(&self) -> &'static str {
+        self.exec.as_ref().map_or("", |e| e.stop_why)
     }
 
     /// Submits the batches this worker closed (the main command processor,
@@ -865,6 +892,16 @@ impl Cp {
         if n < PAR_MIN || chunks < 2 {
             return;
         }
+        // Pending fast clears are applied now (a worker cannot apply one at
+        // the image's first use in program order, so each stopped its chunk:
+        // ~4 times per frame in the courtyard). The run's start is a
+        // synchronization point; the clear lands before every use in it.
+        let clears = super::images::with(|im| im.pending_clear_keys());
+        if !clears.is_empty() {
+            if let Some(e) = self.exec.as_mut() {
+                e.resolve_fast_clears(&clears);
+            }
+        }
         // Indirect arguments are read when the chunks run: GPU work still
         // writing them completes first.
         if !args.is_empty() {
@@ -939,6 +976,9 @@ impl Cp {
         let (st, last) = {
             let mut wcp = w.cp.lock();
             let last = wcp.worker_submit();
+            if stopped.is_some() {
+                super::par::note_stop(wcp.worker_stop_why());
+            }
             (wcp.chunk_state(), last)
         };
         // This queue's later work and CP effects follow the chunk's batches

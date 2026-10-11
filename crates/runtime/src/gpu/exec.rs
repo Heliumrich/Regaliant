@@ -1813,6 +1813,9 @@ pub struct Exec {
     /// records its own work.
     deferred: bool,
     pub(crate) stopped: bool,
+    /// Why (statistics), and the reason a caller gives a flush that follows.
+    pub(crate) stop_why: &'static str,
+    flush_why: &'static str,
     closed: Vec<Closed>,
 }
 
@@ -1885,6 +1888,8 @@ impl Exec {
                 sync_culprit: None,
                 deferred: false,
                 stopped: false,
+                stop_why: "",
+                flush_why: "",
                 closed: Vec::new(),
             })
         }
@@ -1924,12 +1929,12 @@ impl Exec {
                             self.cur = n;
                         }
                         Err(_) => {
-                            self.stopped = true;
+                            self.stop("no batch slot");
                             return;
                         }
                     },
                     None => {
-                        self.stopped = true;
+                        self.stop("no batch slot");
                         return;
                     }
                 }
@@ -2150,7 +2155,7 @@ impl Exec {
             return None;
         }
         if self.deferred && super::homes::copy_in_pending(base, size) {
-            self.stopped = true;
+            self.stop("home copy-in");
             return None;
         }
         let mut b = super::homes::bind(base, size, written);
@@ -2207,7 +2212,7 @@ impl Exec {
     /// (`tune homes 0` while they exist).
     fn homes_evict_all(&mut self) {
         if self.deferred {
-            self.stopped = true;
+            self.stop("homes evicted");
             return;
         }
         let parts = super::homes::take_all();
@@ -2243,7 +2248,7 @@ impl Exec {
             return;
         }
         if self.deferred {
-            self.stopped = true;
+            self.stop("home write-back");
             return;
         }
         self.begin();
@@ -2362,7 +2367,7 @@ impl Exec {
         }
         // The metadata write may still be in flight.
         self.end_rendering();
-        self.flush();
+        self.flush_for("fast clear");
         if self.stopped {
             return;
         }
@@ -2430,7 +2435,7 @@ impl Exec {
                 }
                 let Some(old) = super::images::with(|im| im.depth_to_grow(k.base, k.width, k.height, fam, k.layers)) else { continue };
                 self.end_rendering();
-                self.flush();
+                self.flush_for("depth growth");
                 if self.stopped {
                     return;
                 }
@@ -2450,7 +2455,7 @@ impl Exec {
             return;
         }
         self.end_rendering();
-        self.flush();
+        self.flush_for("overwritten image");
         if self.stopped {
             return;
         }
@@ -2467,7 +2472,7 @@ impl Exec {
         if self.deferred {
             // The copies must precede every use in program order.
             if super::images::with(|im| !im.block_copies(keys).is_empty()) {
-                self.stopped = true;
+                self.stop("block copy");
             }
             return;
         }
@@ -2502,7 +2507,8 @@ impl Exec {
     /// deferred effects.
     pub fn flush(&mut self) {
         if self.deferred {
-            self.stopped = true;
+            let why = if self.flush_why.is_empty() { "flush" } else { self.flush_why };
+            self.stop(why);
             return;
         }
         self.submit_for("sync");
@@ -2561,7 +2567,7 @@ impl Exec {
     pub fn after_gpu(&mut self, f: Action, write: Option<(u64, u64)>, ordered: bool) -> Option<u64> {
         if self.deferred {
             crate::error!("gpu[{}]: a CP effect in a parallel run (performed now)", self.name);
-            self.stopped = true;
+            self.stop("CP effect");
             f();
             return None;
         }
@@ -2738,7 +2744,7 @@ impl Exec {
         }
         lap(0, &mut t);
         if self.overlaps_pending(reads) {
-            self.flush();
+            self.flush_for("reads own writes");
             waited = true;
         }
         lap(1, &mut t);
@@ -3002,6 +3008,21 @@ impl Exec {
     /// Makes this a deferred executor (`gpu::par` workers).
     pub fn set_deferred(&mut self) {
         self.deferred = true;
+    }
+
+    /// Stops a deferred executor's chunk (see `deferred`).
+    fn stop(&mut self, why: &'static str) {
+        if !self.stopped {
+            self.stopped = true;
+            self.stop_why = why;
+        }
+    }
+
+    /// The reason the next flush has (a deferred executor's stop statistics).
+    fn flush_for(&mut self, why: &'static str) {
+        self.flush_why = why;
+        self.flush();
+        self.flush_why = "";
     }
 
     /// Submits the batches this deferred executor closed, in order (the

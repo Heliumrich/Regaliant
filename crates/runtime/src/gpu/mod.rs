@@ -56,7 +56,7 @@ pub mod tune {
         Tunable { name: "map_ranges", env: "DS_MAP_RANGES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ahead", env: "DS_AHEAD", default: 4, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_cs", env: "DS_PRE_CS", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "par", env: "DS_PAR", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par", env: "DS_PAR", default: 3, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
