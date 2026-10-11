@@ -1940,16 +1940,7 @@ impl Exec {
                 }
             }
         }
-        if self.cur == self.slots.len() {
-            match Slot::new(self.pool) {
-                Ok(slot) => self.slots.push(slot),
-                Err(e) => {
-                    crate::warn!("gpu[{}]: no batch slot {} ({e}); using {}", self.name, self.cur + 1, self.cur);
-                    self.slot_limit = self.cur;
-                    self.cur = 0;
-                }
-            }
-        }
+        self.ensure_slot();
         // The slot's previous batch must have completed before reuse.
         let slot = &self.slots[self.cur];
         if slot.seq != 0 {
@@ -1996,6 +1987,22 @@ impl Exec {
         self.pool_use = [0; 5];
         self.shadow_used = 0;
         self.resident.clear();
+    }
+
+    /// Creates the current slot when the rotation reached one not made yet
+    /// (`tune slots` raised): it is used before the batch begins (homes of
+    /// index buffers are kept by the slot their draw records into).
+    fn ensure_slot(&mut self) {
+        if self.cur == self.slots.len() {
+            match Slot::new(self.pool) {
+                Ok(slot) => self.slots.push(slot),
+                Err(e) => {
+                    crate::warn!("gpu[{}]: no batch slot {} ({e}); using {}", self.name, self.cur + 1, self.cur);
+                    self.slot_limit = self.cur;
+                    self.cur = 0;
+                }
+            }
+        }
     }
 
     /// Submits the recorded batch without waiting for it (its actions run
@@ -2204,6 +2211,7 @@ impl Exec {
             self.dispatched = false;
         }
         let r = (b.buf.buf, b.offset, b.avail, b.buf.clone());
+        self.ensure_slot();
         self.slots[self.cur].homes.push(b.buf);
         Some(r)
     }

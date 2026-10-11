@@ -700,6 +700,13 @@ fn main() {
     RUN_DIR.set(cfg.run_dir.clone()).ok();
     log::init(&cfg.run_dir.join("dsport.log")).expect("open log");
     log::set_thread_name("host");
+    // Panics (host threads abort the process) are logged with the thread
+    // that panicked: the run log is what post-mortems read.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        crate::error!("panic: {info}");
+        default_hook(info);
+    }));
     if cfg.debug || cfg.trace {
         log::LEVEL.store(log::Level::Debug as u8, std::sync::atomic::Ordering::Relaxed);
     }
