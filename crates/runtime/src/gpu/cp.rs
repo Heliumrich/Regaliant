@@ -749,7 +749,16 @@ impl Cp {
         let now = unsafe { if wide { rd64(a) } else { rd32(a) as u64 } };
         let by_gpu = last_write(a).is_some_and(|(q, v, _)| q.starts_with("gpu-") && if wide { v == now } else { v as u32 == now as u32 });
         if !by_gpu {
-            super::precache::end_scope();
+            super::precache::end_scope(1);
+        }
+    }
+
+    /// A title submission starts (its command buffers follow): CPU writes
+    /// come between submissions, so shared batch-start copies of the
+    /// graphics queue are dropped (`gpu::precache`).
+    pub fn new_submission(&mut self) {
+        if !self.compute {
+            super::precache::end_scope(0);
         }
     }
 
@@ -1638,10 +1647,6 @@ impl Cp {
             crate::error!("gpu[{}]: indirect buffer nesting too deep at {addr:#x}", self.name);
             return;
         }
-        if self.depth == 0 && !self.compute {
-            // CPU writes come between submissions.
-            super::precache::end_scope();
-        }
         self.depth += 1;
         let mut cur = addr;
         let mut end = addr + 4 * size as u64;
@@ -2107,7 +2112,7 @@ impl Cp {
             }
             op::REWIND => {
                 if !self.compute {
-                    super::precache::end_scope();
+                    super::precache::end_scope(2);
                 }
                 // The parser stalls until the CPU marks the packet valid.
                 if p(0) & (1 << 31) == 0 {

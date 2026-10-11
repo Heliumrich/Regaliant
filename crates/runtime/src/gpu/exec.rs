@@ -1289,7 +1289,11 @@ pub(crate) fn image_hazards(stages: &[&Prepared], extra: &[super::images::ImageK
         }
     }
     if !missed {
-        let pending = (super::images::any_pending() && super::images::with(|im| im.clears_pending(&v) || im.overwrites_pending(&v))) || super::images::block_copies_possible(&v);
+        let pending = if super::tune::pending_set() {
+            super::images::pending_hit(&v)
+        } else {
+            super::images::any_pending() && super::images::with(|im| im.clears_pending(&v) || im.overwrites_pending(&v))
+        } || super::images::block_copies_possible(&v);
         return (v, pending);
     }
     super::images::with(|im| {
@@ -3897,6 +3901,7 @@ pub fn status() -> String {
         + &super::ahead::status()
         + &super::par::status()
         + &super::precache::status()
+        + &super::images::scrub_status()
         + &super::mirror::status()
         + &super::homes::status()
         + &sync_why_status()

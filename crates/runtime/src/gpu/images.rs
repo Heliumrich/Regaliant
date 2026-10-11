@@ -37,6 +37,31 @@ pub fn any_pending() -> bool {
     PENDING.load(std::sync::atomic::Ordering::Acquire) != 0
 }
 
+/// The images with a fast clear or an overwrite reload pending (published
+/// by `with`), and its generation.
+static PENDING_SET: Mutex<Option<std::sync::Arc<super::fx::Set<ImageKey>>>> = Mutex::new(None);
+static PENDING_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static PENDING_TLS: std::cell::RefCell<(u64, std::sync::Arc<super::fx::Set<ImageKey>>)> = std::cell::RefCell::new((u64::MAX, std::sync::Arc::new(Default::default())));
+}
+
+/// Whether any of `keys` has a fast clear or an overwrite reload pending
+/// (`clears_pending || overwrites_pending` without the cache's lock).
+pub fn pending_hit(keys: &[ImageKey]) -> bool {
+    if !any_pending() {
+        return false;
+    }
+    let g = PENDING_GEN.load(std::sync::atomic::Ordering::Acquire);
+    PENDING_TLS.with(|t| {
+        let mut t = t.borrow_mut();
+        if t.0 != g {
+            *t = (g, PENDING_SET.lock().clone().unwrap_or_default());
+        }
+        keys.iter().any(|k| t.1.contains(k))
+    })
+}
+
 type SurfaceKey = (u64, i32, u32, u32, u32, u32, bool, u32, u32, u64, u64, [u32; 2]);
 
 fn surface_key(s: &Surface) -> SurfaceKey {
@@ -85,7 +110,8 @@ fn tls<R>(f: impl FnOnce(&mut Tls) -> R) -> R {
 pub fn view_hit(t: &Tsharp, frame: u64) -> Option<(vk::ImageView, vk::Image)> {
     let track = super::track::GEN.load(std::sync::atomic::Ordering::Acquire);
     let lookup = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
-    tls(|m| m.views.get(&t.raw).filter(|e| e.0 == frame && e.1 == lookup && e.2 == track).map(|e| (e.3, e.4)))
+    let any_frame = scrubbing();
+    tls(|m| m.views.get(&t.raw).filter(|e| (any_frame || e.0 == frame) && e.1 == lookup && e.2 == track).map(|e| (e.3, e.4)))
 }
 
 /// `Images::sampler` from this thread's memo.
@@ -655,6 +681,17 @@ pub struct Images {
     owned: std::collections::BTreeMap<u64, Vec<ImageKey>>,
     max_span: u64,
     pending_overwrites: usize,
+    /// Images marked overwritten (with `pending_clears`' keys: the set
+    /// `pending_hit` reads), and a count of changes to both (published at
+    /// the end of `with` when it moved).
+    overwritten_keys: super::fx::Set<ImageKey>,
+    pending_change: u64,
+    pending_published: u64,
+    /// Textures the scrubber visits in turn (`scrub_batch`), rebuilt when
+    /// LOOKUP_GEN moves, and its position.
+    scrub_keys: Vec<ImageKey>,
+    scrub_gen: u64,
+    scrub_at: usize,
     /// GPU-owned images reloaded from guest memory after buffer writes
     /// covered them: cleared (all zero) / uploaded.
     pub overwrite_clears: u64,
@@ -681,7 +718,50 @@ thread_local! {
 }
 
 /// Runs `f` with the image cache.
+/// Texture scrubbing (`tune tex_scrub`): a background thread samples the
+/// guest bytes of uploaded textures for CPU writes (`scrub_batch`) instead
+/// of the first draw that binds each in a frame (`refresh`); texture views
+/// then stay valid across frames (`view_hit`).
+pub fn scrubbing() -> bool {
+    super::tune::tex_scrub()
+}
+
+static SCRUB_CHECKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SCRUB_DIRTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn scrubber() {
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        if !scrubbing() || super::shutting_down() {
+            continue;
+        }
+        let work = with(|im| im.scrub_batch(32));
+        for (region, b, n, s, stored) in work {
+            SCRUB_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if slice_hash(b, n, s) != stored {
+                SCRUB_DIRTY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                super::track::force_dirty(region);
+            }
+        }
+    }
+}
+
+/// One status line ("" before the scrubber checked anything).
+pub fn scrub_status() -> String {
+    let n = SCRUB_CHECKS.load(std::sync::atomic::Ordering::Relaxed);
+    if n == 0 {
+        return String::new();
+    }
+    format!("    texture scrubbing: {n} slices checked, {} changed (re-uploaded at their next use)\n", SCRUB_DIRTY.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
+    static SCRUBBER: std::sync::Once = std::sync::Once::new();
+    SCRUBBER.call_once(|| {
+        if let Err(e) = crate::thread::spawn_host("gpu-texscrub", 1 << 20, Box::new(scrubber)) {
+            crate::warn!("images: no texture scrubber thread ({e})");
+        }
+    });
     let mut g = IMAGES.lock();
     if g.is_none() {
         let c = ctx();
@@ -692,12 +772,18 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
                 .expect("image pool");
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
-            *g = Some(Images { map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), retired: Vec::new(), depth_grows: 0 });
+            *g = Some(Images { map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), retired: Vec::new(), depth_grows: 0 });
         }
     }
     let im = g.as_mut().unwrap();
     let r = f(&mut *im);
     PENDING.store((im.pending_clears.len() + im.pending_overwrites) as u64, std::sync::atomic::Ordering::Release);
+    if im.pending_change != im.pending_published {
+        im.pending_published = im.pending_change;
+        let set: super::fx::Set<ImageKey> = im.pending_clears.keys().copied().chain(im.overwritten_keys.iter().copied()).collect();
+        *PENDING_SET.lock() = Some(std::sync::Arc::new(set));
+        PENDING_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
     r
 }
 
@@ -1266,6 +1352,7 @@ impl Images {
         }
         if let Some(n) = self.pending_clears.remove(&old) {
             self.pending_clears.insert(new_key, n);
+            self.pending_change += 1;
         }
         self.note_gen += 1;
         self.retired.push(prev.image);
@@ -1418,6 +1505,7 @@ impl Images {
         for &(b, n) in writes {
             for (&meta, &(key, _)) in self.meta_of.range(b..b.saturating_add(n)) {
                 self.pending_clears.insert(key, meta);
+                self.pending_change += 1;
             }
         }
     }
@@ -1437,6 +1525,7 @@ impl Images {
         let mut out = Vec::new();
         for k in keys {
             let Some(meta) = self.pending_clears.remove(k) else { continue };
+            self.pending_change += 1;
             self.note_gen += 1;
             let (Some(img), Some(&(_, clear))) = (self.map.get(k), self.meta_of.get(&meta)) else { continue };
             if out.iter().any(|c: &FastClear| c.key == *k) {
@@ -1567,6 +1656,8 @@ impl Images {
                 if b <= k.base && k.base + span <= end && n <= 2 * span + (64 << 10) {
                     if !img.overwritten {
                         img.overwritten = true;
+                        self.overwritten_keys.insert(k);
+                        self.pending_change += 1;
                         self.pending_overwrites += 1;
                     }
                 } else if self.partial_seen.len() < 64 && self.partial_seen.insert(k.base) {
@@ -1597,6 +1688,8 @@ impl Images {
                 continue;
             }
             img.overwritten = false;
+            self.overwritten_keys.remove(k);
+            self.pending_change += 1;
             self.pending_overwrites = self.pending_overwrites.saturating_sub(1);
             self.note_gen += 1;
             let (image, span, layout) = (img.image, img.span, img.layout);
@@ -1661,7 +1754,7 @@ impl Images {
                 self.map.get_mut(&key).unwrap().hashes = h;
             }
         }
-        if !super::track::protected() && self.map[&key].checked_frame != frame {
+        if !super::track::protected() && !scrubbing() && self.map[&key].checked_frame != frame {
             // CPU writes: one slice of the sampled hash per frame.
             let img = self.map.get_mut(&key).unwrap();
             img.checked_frame = frame;
@@ -1697,6 +1790,37 @@ impl Images {
             self.map.get_mut(&key).unwrap().hashes = all_hashes(b, n);
         }
         Ok(())
+    }
+
+    /// The next `max` uploaded textures to sample: (tracking region, guest
+    /// range, slice, the slice's hash at upload); each visit samples the
+    /// texture's next slice (`checked_frame` counts them while scrubbing).
+    fn scrub_batch(&mut self, max: usize) -> Vec<(u32, u64, u64, usize, u64)> {
+        let g = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
+        if self.scrub_gen != g || self.scrub_keys.is_empty() {
+            self.scrub_keys = self.map.iter().filter(|(_, i)| !i.gpu_written && i.source.is_some()).map(|(k, _)| *k).collect();
+            self.scrub_gen = g;
+        }
+        let n = self.scrub_keys.len();
+        let mut out = Vec::new();
+        for _ in 0..max.min(n) {
+            self.scrub_at = (self.scrub_at + 1) % n;
+            let k = self.scrub_keys[self.scrub_at];
+            let Some(img) = self.map.get_mut(&k) else { continue };
+            let (false, Some(region)) = (img.gpu_written, img.source) else { continue };
+            let s = (img.checked_frame % SLICES as u64) as usize;
+            img.checked_frame += 1;
+            let stored = img.hashes[s];
+            // Already marked: re-uploaded at its next use (textures whose
+            // memory streaming reused are often never used again).
+            if super::track::is_dirty(region) {
+                continue;
+            }
+            if let Some((b, len)) = super::track::range(region) {
+                out.push((region, b, len, s, stored));
+            }
+        }
+        out
     }
 
     /// Adds an image (keeps the by-address index).
@@ -2082,7 +2206,7 @@ impl Images {
         // (a new image) makes the entry stale at its next use.
         let (lookup, track) = (LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire), super::track::GEN.load(std::sync::atomic::Ordering::Acquire));
         if let Some(&(f, g, tg, v, i)) = self.view_memo.get(&t.raw) {
-            if f == frame && g == lookup && tg == track {
+            if (f == frame || scrubbing()) && g == lookup && tg == track {
                 return Ok((v, i));
             }
         }

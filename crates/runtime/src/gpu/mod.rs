@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 31] = [
+    static ALL: [Tunable; 33] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -58,6 +58,8 @@ pub mod tune {
         Tunable { name: "pre_cs", env: "DS_PRE_CS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "par", env: "DS_PAR", default: 3, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_share", env: "DS_PRE_SHARE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pending_set", env: "DS_PENDING_SET", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "tex_scrub", env: "DS_TEX_SCRUB", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -272,6 +274,18 @@ pub mod tune {
     /// (`gpu::precache`); 0: each batch copies what it binds.
     pub fn pre_share() -> bool {
         get(30) != 0
+    }
+
+    /// Draws check pending fast clears and overwrites of their images in a
+    /// published set (no image-cache lock); 0: under the lock (A/B).
+    pub fn pending_set() -> bool {
+        get(31) != 0
+    }
+
+    /// Uploaded textures sampled for CPU writes by a background thread
+    /// (`images::scrubbing`); 0: by the first draw binding each per frame.
+    pub fn tex_scrub() -> bool {
+        get(32) != 0
     }
 
     /// Command-processor waits for GPU work still to be traced (`tune
@@ -581,6 +595,7 @@ fn worker(q: &'static Queue, name: &str) {
             }
         };
         cp.submitted_at = Some(batch.at);
+        cp.new_submission();
         for (i, &(addr, size)) in batch.bufs.iter().enumerate() {
             if trace_submit() && size == 277 {
                 // Bink decode command buffers: their counter (dword 272) and

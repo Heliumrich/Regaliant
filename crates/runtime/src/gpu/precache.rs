@@ -61,6 +61,8 @@ static LO: AtomicU64 = AtomicU64::new(u64::MAX);
 static HI: AtomicU64 = AtomicU64::new(0);
 /// Statistics: [hits, copies, invalidated, scope ends, no space].
 static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Scope ends by reason: [title submission, CPU-released wait, REWIND].
+static ENDS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Shared copies on (`tune pre_share`).
 pub fn enabled() -> bool {
@@ -195,7 +197,8 @@ pub fn invalidate(base: u64, len: u64) {
 
 /// The queue family's scope ends (a title submission, a label wait): all
 /// entries go (their chunks are reused once no batch binds them).
-pub fn end_scope() {
+pub fn end_scope(why: usize) {
+    ENDS[why.min(2)].fetch_add(1, Ordering::Relaxed);
     let mut g = CACHE.lock();
     let Some(c) = g.as_mut() else { return };
     if c.entries.is_empty() {
@@ -217,11 +220,14 @@ pub fn status() -> String {
     }
     let chunks = CACHE.lock().as_ref().map_or(0, |c| c.chunks.len());
     format!(
-        "    shared batch-start copies: {} copies, {} reused by later batches, {} dropped by writes, {} scope ends, {} without space; {} chunks of {} MiB\n",
+        "    shared batch-start copies: {} copies, {} reused by later batches, {} dropped by writes, {} scope ends ({} submissions, {} waits the CPU released, {} REWIND), {} without space; {} chunks of {} MiB\n",
         s[1],
         s[0],
         s[2],
         s[3],
+        ENDS[0].load(Ordering::Relaxed),
+        ENDS[1].load(Ordering::Relaxed),
+        ENDS[2].load(Ordering::Relaxed),
         s[4],
         chunks,
         CHUNK >> 20

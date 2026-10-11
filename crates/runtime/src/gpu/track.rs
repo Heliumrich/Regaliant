@@ -229,10 +229,18 @@ pub fn take_dirty(id: u32) -> Option<Why> {
 pub fn force_dirty(id: u32) {
     let mut g = TRACK.lock();
     if let Some(r) = g.as_mut().and_then(|t| t.regions.get_mut(id as usize)).and_then(|r| r.as_mut()) {
+        if !r.dirty {
+            changed();
+        }
         r.dirty = true;
         r.why = Why::Forced;
-        changed();
     }
+}
+
+/// Whether the region is marked dirty (not yet taken).
+pub fn is_dirty(id: u32) -> bool {
+    let g = TRACK.lock();
+    g.as_ref().and_then(|t| t.regions.get(id as usize)).and_then(|r| r.as_ref()).is_some_and(|r| r.dirty)
 }
 
 /// A region's guest range.
