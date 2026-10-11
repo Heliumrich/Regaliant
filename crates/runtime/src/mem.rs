@@ -332,8 +332,23 @@ fn last_error() -> u32 {
     unsafe { windows_sys::Win32::Foundation::GetLastError() }
 }
 
-/// Reserves the whole guest range. Must run before anything else allocates widely.
+static RESERVED_EARLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Reserves the whole guest range at the process's first heap allocation
+/// (`heap`; allocates nothing). `reserve_guest_range` reports a failure.
+pub fn reserve_guest_range_early() {
+    let p = unsafe { VirtualAlloc(GUEST_BASE as _, (GUEST_END - GUEST_BASE) as usize, MEM_RESERVE, PAGE_NOACCESS) };
+    if !p.is_null() {
+        RESERVED_EARLY.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Reserves the whole guest range (done by the first heap allocation, see
+/// `reserve_guest_range_early`). Must run before anything else allocates widely.
 pub fn reserve_guest_range() -> Result<(), String> {
+    if RESERVED_EARLY.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(());
+    }
     let p = unsafe { VirtualAlloc(GUEST_BASE as _, (GUEST_END - GUEST_BASE) as usize, MEM_RESERVE, PAGE_NOACCESS) };
     if p.is_null() {
         let err = last_error();

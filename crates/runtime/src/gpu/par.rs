@@ -121,6 +121,7 @@ impl Pool {
                 Box::new(move || {
                     crate::log::set_thread_name(&tname);
                     crate::exception::arm_watch_current_thread(false);
+                    super::profile_this_thread("par");
                     run_worker(&w2);
                 }),
             );

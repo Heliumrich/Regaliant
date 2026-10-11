@@ -7,6 +7,7 @@ mod ehframe;
 mod audio;
 mod exception;
 mod gpu;
+mod heap;
 mod hle;
 mod input;
 mod loader;
@@ -46,9 +47,9 @@ pub fn run_dir() -> Option<&'static Path> {
     RUN_DIR.get().map(|p| p.as_path())
 }
 
-/// System allocator that reports implausibly large requests (almost always a
-/// guest value misread as a size) with the requesting host frames, before the
-/// request fails and aborts the process.
+/// The host heap (`heap`: mimalloc or the Windows heap) reporting implausibly
+/// large requests (almost always a guest value misread as a size) with the
+/// requesting host frames, before the request fails and aborts the process.
 struct GuardedAlloc;
 
 const HUGE_ALLOC: usize = 4 << 30;
@@ -70,22 +71,22 @@ unsafe impl std::alloc::GlobalAlloc for GuardedAlloc {
         if l.size() > HUGE_ALLOC {
             report_huge_alloc(l.size());
         }
-        unsafe { std::alloc::System.alloc(l) }
+        unsafe { heap::HostAlloc.alloc(l) }
     }
     unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
         if l.size() > HUGE_ALLOC {
             report_huge_alloc(l.size());
         }
-        unsafe { std::alloc::System.alloc_zeroed(l) }
+        unsafe { heap::HostAlloc.alloc_zeroed(l) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
-        unsafe { std::alloc::System.dealloc(p, l) }
+        unsafe { heap::HostAlloc.dealloc(p, l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new_size: usize) -> *mut u8 {
         if new_size > HUGE_ALLOC {
             report_huge_alloc(new_size);
         }
-        unsafe { std::alloc::System.realloc(p, l, new_size) }
+        unsafe { heap::HostAlloc.realloc(p, l, new_size) }
     }
 }
 
@@ -681,7 +682,8 @@ fn read_proc_param(m: &loader::LoadedModule) -> (u64, String, i32) {
 }
 
 fn main() {
-    // The guest address range must be reserved before the process grows.
+    // The guest address range must be reserved before the process grows
+    // (the first heap allocation reserved it already, see `heap`).
     if let Err(e) = mem::reserve_guest_range() {
         eprintln!("{e}");
         std::process::exit(2);
@@ -712,7 +714,7 @@ fn main() {
     }
     log::TRACE_HLE.store(cfg.trace, std::sync::atomic::Ordering::Relaxed);
     hle::LENIENT_IMPORTS.store(cfg.lenient, std::sync::atomic::Ordering::Relaxed);
-    info!("dsport {} | run dir {} | TLS slot {}", env!("CARGO_PKG_VERSION"), cfg.run_dir.display(), slot);
+    info!("dsport {} | run dir {} | TLS slot {} | host heap: {}", env!("CARGO_PKG_VERSION"), cfg.run_dir.display(), slot, heap::name());
     exception::install();
     if let Some(c) = &cfg.pipeline_test {
         let code = gpu::exec::pipeline_test(c);

@@ -56,7 +56,7 @@ pub mod tune {
         Tunable { name: "map_ranges", env: "DS_MAP_RANGES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ahead", env: "DS_AHEAD", default: 4, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_cs", env: "DS_PRE_CS", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "par", env: "DS_PAR", default: 3, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par", env: "DS_PAR", default: 5, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_share", env: "DS_PRE_SHARE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "pending_set", env: "DS_PENDING_SET", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "tex_scrub", env: "DS_TEX_SCRUB", default: 1, value: AtomicU64::new(UNSET) },
@@ -707,6 +707,25 @@ static PROFILE_BUSY: Mutex<Option<std::collections::HashMap<(&'static str, Strin
 /// which lock.
 static PROFILE_LOCKS: Mutex<Option<std::collections::HashMap<(&'static str, String), u64>>> = Mutex::new(None);
 
+/// Busy samples by the function our innermost function was calling (another
+/// crate's, the runtime library's, the driver's: "module!name") and by the
+/// innermost frame of all: where per-command time goes below our code.
+static PROFILE_CALLS: Mutex<Option<std::collections::HashMap<(&'static str, String), u64>>> = Mutex::new(None);
+static PROFILE_LEAF: Mutex<Option<std::collections::HashMap<(&'static str, String), u64>>> = Mutex::new(None);
+
+/// Threads sampled besides the queues' command processors: (kind, host tid)
+/// ("par": parallel recording workers, "prep": stage preparation workers).
+static PROFILE_THREADS: Mutex<Vec<(&'static str, u32)>> = Mutex::new(Vec::new());
+
+/// Samples the calling thread as `kind` while profiling (`DS_PROFILE_GPU`).
+pub fn profile_this_thread(kind: &'static str) {
+    let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    PROFILE_THREADS.lock().push((kind, tid));
+}
+
+/// Kinds of sampled threads, in report order.
+const PROFILE_KINDS: [&str; 4] = ["gfx", "acb", "par", "prep"];
+
 pub fn start_profiler() {
     if std::env::var("DS_PROFILE_GPU").ok().as_deref() != Some("1") {
         return;
@@ -715,6 +734,8 @@ pub fn start_profiler() {
     *PROFILE_FN.lock() = Some(Default::default());
     *PROFILE_BUSY.lock() = Some(Default::default());
     *PROFILE_LOCKS.lock() = Some(Default::default());
+    *PROFILE_CALLS.lock() = Some(Default::default());
+    *PROFILE_LEAF.lock() = Some(Default::default());
     let _ = crate::thread::spawn_host(
         "gpu-profiler",
         1 << 20,
@@ -722,23 +743,41 @@ pub fn start_profiler() {
             crate::log::set_thread_name("gpu-profiler");
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(10));
-                let qs: Vec<&'static Queue> = QUEUES.lock().clone();
-                for q in qs {
-                    let Some(st) = crate::exception::sample_thread(q.tid.load(Ordering::Relaxed), 0) else { continue };
-                    let host = st.lines().next().unwrap_or("").trim().trim_start_matches("host: ").to_string();
-                    let key: Vec<&str> = host.split(" <- ").take(4).collect();
-                    let name = if q.id == GFX { "gfx".to_string() } else { format!("acb{:#x}", q.id) };
+                let mut targets: Vec<(&'static str, String, u32)> = QUEUES
+                    .lock()
+                    .iter()
+                    .map(|q| if q.id == GFX { ("gfx", "gfx".to_string(), q.tid.load(Ordering::Relaxed)) } else { ("acb", format!("acb{:#x}", q.id), q.tid.load(Ordering::Relaxed)) })
+                    .collect();
+                targets.extend(PROFILE_THREADS.lock().iter().map(|&(kind, tid)| (kind, kind.to_string(), tid)));
+                for (kind, name, tid) in targets {
+                    let Some((frames, _)) = crate::exception::sample_frames(tid, 0) else { continue };
+                    let key: Vec<String> = frames.iter().take(4).map(|&a| crate::exception::host_symbol(a)).collect();
                     let k = format!("{name}: {}", key.join(" <- "));
                     if let Some(m) = PROFILE.lock().as_mut() {
                         *m.entry(k).or_default() += 1;
                     }
-                    let kind = if q.id == GFX { "gfx" } else { "acb" };
-                    let mut fns: Vec<&str> = host.split(" <- ").map(|f| f.split("+0x").next().unwrap_or(f)).collect();
+                    let labels: Vec<String> = frames.iter().map(|&a| crate::exception::frame_label(a)).collect();
+                    let mut fns: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
                     let waiting = fns.iter().any(|f| f.contains("Wait") || f.contains("Sleep") || f.contains("DelayExecution") || f.contains("SetTimer") || f.contains("CreateWaitableTimer"));
-                    let ours = fns.iter().find(|f| (f.starts_with("dsport::") || f.starts_with("rdna::")) && !f.contains("parking_lot")).copied().unwrap_or("(none)");
+                    let is_ours = |f: &str| (f.starts_with("dsport::") || f.starts_with("rdna::")) && !f.contains("parking_lot");
+                    let at = fns.iter().position(|f| is_ours(f));
+                    let ours = at.map_or("(none)", |i| fns[i]);
                     if !waiting {
                         if let Some(m) = PROFILE_BUSY.lock().as_mut() {
                             *m.entry((kind, ours.to_string())).or_default() += 1;
+                        }
+                        // What our innermost function was calling (itself when
+                        // it was running its own code).
+                        let callee = match at {
+                            Some(i) if i > 0 => fns[i - 1],
+                            Some(i) => fns[i],
+                            None => fns.last().copied().unwrap_or("(none)"),
+                        };
+                        if let Some(m) = PROFILE_CALLS.lock().as_mut() {
+                            *m.entry((kind, format!("{callee} <- {ours}"))).or_default() += 1;
+                        }
+                        if let Some(m) = PROFILE_LEAF.lock().as_mut() {
+                            *m.entry((kind, fns.first().copied().unwrap_or("(none)").to_string())).or_default() += 1;
                         }
                     } else if fns.iter().any(|f| f.contains("lock_slow") || f.contains("AcquireSRWLock")) {
                         if let Some(m) = PROFILE_LOCKS.lock().as_mut() {
@@ -774,6 +813,11 @@ pub fn reset_profile() {
     if let Some(m) = PROFILE_LOCKS.lock().as_mut() {
         m.clear();
     }
+    for p in [&PROFILE_CALLS, &PROFILE_LEAF] {
+        if let Some(m) = p.lock().as_mut() {
+            m.clear();
+        }
+    }
     exec::reset_shader_profile();
     cp::reset_wait_stats();
 }
@@ -799,7 +843,7 @@ fn profile_summary() -> String {
     // Inclusive time per function of our crate (and the waits), per queue kind.
     if let Some((m, totals)) = PROFILE_FN.lock().as_ref() {
         let top = std::env::var("DS_PROFILE_FN_TOP").ok().and_then(|x| x.parse().ok()).unwrap_or(40);
-        for kind in ["gfx", "acb"] {
+        for kind in PROFILE_KINDS {
             let total = totals.get(kind).copied().unwrap_or(0).max(1);
             let mut v: Vec<(&String, &u64)> = m.iter().filter(|((k, f), _)| *k == kind && (f.starts_with("dsport::") || f.contains("Wait") || f.contains("Sleep") || f.contains("Submit"))).map(|((_, f), n)| (f, n)).collect();
             v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
@@ -810,7 +854,7 @@ fn profile_summary() -> String {
         }
     }
     if let Some(m) = PROFILE_BUSY.lock().as_ref() {
-        for kind in ["gfx", "acb"] {
+        for kind in PROFILE_KINDS {
             let mut v: Vec<(&String, &u64)> = m.iter().filter(|((k, _), _)| *k == kind).map(|((_, f), n)| (f, n)).collect();
             let busy: u64 = v.iter().map(|x| *x.1).sum();
             v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
@@ -820,8 +864,24 @@ fn profile_summary() -> String {
             }
         }
     }
+    for (table, what, n) in [(&PROFILE_CALLS, "by callee of our innermost function", 40), (&PROFILE_LEAF, "by innermost frame", 25)] {
+        if let Some(m) = table.lock().as_ref() {
+            for kind in PROFILE_KINDS {
+                let mut v: Vec<(&String, &u64)> = m.iter().filter(|((k, _), _)| *k == kind).map(|((_, f), n)| (f, n)).collect();
+                let busy: u64 = v.iter().map(|x| *x.1).sum();
+                if busy == 0 {
+                    continue;
+                }
+                v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                s.push_str(&format!("    gpu profile {kind} busy (not waiting): {busy} samples, {what}:\n"));
+                for (f, c) in v.iter().take(n) {
+                    s.push_str(&format!("      {:5.1}%  {f}\n", **c as f64 * 100.0 / busy as f64));
+                }
+            }
+        }
+    }
     if let Some(m) = PROFILE_LOCKS.lock().as_ref() {
-        for kind in ["gfx", "acb"] {
+        for kind in PROFILE_KINDS {
             let mut v: Vec<(&String, &u64)> = m.iter().filter(|((k, _), _)| *k == kind).map(|((_, f), n)| (f, n)).collect();
             let total: u64 = v.iter().map(|x| *x.1).sum();
             v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));

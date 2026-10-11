@@ -471,7 +471,9 @@ impl Exec {
         if a.count == 0 || a.instances == 0 {
             return Ok(false);
         }
-        let t0 = std::time::Instant::now();
+        // Phase times (DS_PROFILE_GPU only: a clock read costs ~20 ns).
+        let t0 = super::profiling().then(std::time::Instant::now);
+        let since = |t0: Option<std::time::Instant>| t0.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         let mut lap = super::Laps::new();
         let reg = |r: u32| ctx_reg(cp, r);
         // CB_COLOR_CONTROL.MODE: 0 color disabled, 1 normal; others are
@@ -544,7 +546,7 @@ impl Exec {
             ps = if ps_addr != 0 { Some(shaders::prepare_ps(cp)?) } else { None };
         }
         lap.mark(2);
-        let t_prep = t0.elapsed();
+        let t_prep = since(t0);
         let mut textures = texture_ranges(&vs);
         if let Some(p) = &ps {
             textures.extend(texture_ranges(p));
@@ -680,7 +682,7 @@ impl Exec {
                 keep_gfx_pipe(hkey, p)
             }
         };
-        let t_pipe = t0.elapsed();
+        let t_pipe = since(t0);
         lap.mark(7);
         // Depth arrays sampled with more layers than rendered so far.
         match &ps {
@@ -738,7 +740,7 @@ impl Exec {
         lap.mark(12);
         self.write_set(set, &bounds);
         lap.mark(13);
-        let t_bind = t0.elapsed();
+        let t_bind = since(t0);
         // Rendering instance: reuse it while the attachments stay the same
         // and the draw does not sample one of them.
         let sampled: Vec<vk::Image> = bounds.iter().flat_map(|b| b.images.iter().copied()).collect();
@@ -1002,7 +1004,7 @@ impl Exec {
         }
         lap.mark(17);
         if super::profiling() {
-            super::note_phases(&super::DRAW_PHASES, [t_prep, t_pipe, t_bind, t0.elapsed()]);
+            super::note_phases(&super::DRAW_PHASES, [t_prep, t_pipe, t_bind, since(t0)]);
         }
         Ok(true)
     }

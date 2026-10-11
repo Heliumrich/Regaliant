@@ -324,7 +324,7 @@ pub fn pread_fd(fd: i32, buf: &mut [u8], off: u64) -> Result<usize, i32> {
         Kind::File { file, .. } => {
             // The kernel writes the buffer: write-tracked pages cannot fault.
             let _w = crate::gpu::track::host_write(buf.as_ptr() as u64, buf.len() as u64);
-            crate::gpu::exec::trace_writes(&format!("file read (fd {fd}) [{off:#x}]"), buf.as_ptr() as u64, buf.len() as u64);
+            crate::gpu::exec::trace_writes(|| format!("file read (fd {fd}) [{off:#x}]"), buf.as_ptr() as u64, buf.len() as u64);
             let mut done = 0;
             while done < buf.len() {
                 match file.seek_read(&mut buf[done..], off + done as u64) {

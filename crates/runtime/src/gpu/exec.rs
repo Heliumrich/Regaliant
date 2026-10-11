@@ -115,14 +115,15 @@ static IMPORTS_STALE: AtomicU64 = AtomicU64::new(0);
 /// GPU execution enabled (`DS_GPU=1`) and Vulkan available.
 /// `DS_TRACE_WRITES=<hex bytes>`: logs once each shader (and CP DMA) that
 /// writes a guest range at least that large (who fills a large buffer).
-pub fn trace_writes(what: &str, base: u64, size: u64) {
+pub fn trace_writes(what: impl FnOnce() -> String, base: u64, size: u64) {
     static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let min = *MIN.get_or_init(|| std::env::var("DS_TRACE_WRITES").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0));
     if min == 0 || size < min {
         return;
     }
+    let what = what();
     static SEEN: Mutex<Option<HashSet<(String, u64, u64)>>> = Mutex::new(None);
-    if SEEN.lock().get_or_insert_with(HashSet::new).insert((what.to_string(), base, size)) {
+    if SEEN.lock().get_or_insert_with(HashSet::new).insert((what.clone(), base, size)) {
         crate::info!("writes: {what} writes {base:#x}+{size:#x} (flip {})", super::FRAMES.load(Ordering::Relaxed));
     }
 }
@@ -1497,6 +1498,32 @@ static GAP_NS: AtomicU64 = AtomicU64::new(0);
 /// repeated; by size [<4 KiB, <64 KiB, <1 MiB, more] x [copies, bytes].
 static PRE_REPEAT: Mutex<(u64, Option<HashSet<(u64, u64)>>, [u64; 4], [[u64; 2]; 4])> = Mutex::new((u64::MAX, None, [0; 4], [[0; 2]; 4]));
 
+/// Batch-start copies across frames (DS_PROFILE_GPU): per range, the frame
+/// of its last first-in-frame copy and a sampled hash of its bytes then
+/// (`images::sampled_hash`); bytes of first-in-frame copies [of ranges not
+/// copied in the two frames before, unchanged since, changed].
+static PRE_STABLE: Mutex<(Option<HashMap<(u64, u64), (u64, u64)>>, [u64; 3])> = Mutex::new((None, [0; 3]));
+
+fn note_pre_stable(base: u64, size: u64, n: u64, frame: u64) {
+    let h = super::images::sampled_hash(base, size);
+    let mut g = PRE_STABLE.lock();
+    let m = g.0.get_or_insert_with(HashMap::new);
+    if m.len() > 1 << 20 {
+        m.clear();
+    }
+    let k = match m.insert((base, size), (frame, h)) {
+        Some((f, old)) if f + 2 >= frame => {
+            if old == h {
+                1
+            } else {
+                2
+            }
+        }
+        _ => 0,
+    };
+    g.1[k] += n;
+}
+
 fn note_pre_repeat(base: u64, size: u64, n: u64) {
     let frame = super::FRAMES.load(Ordering::Relaxed);
     let mut g = PRE_REPEAT.lock();
@@ -1507,6 +1534,11 @@ fn note_pre_repeat(base: u64, size: u64, n: u64) {
         }
     }
     let first = g.1.get_or_insert_with(HashSet::new).insert((base, size));
+    if first {
+        drop(g);
+        note_pre_stable(base, size, n, frame);
+        g = PRE_REPEAT.lock();
+    }
     let k = if first { 0 } else { 2 };
     g.2[k] += 1;
     g.2[k + 1] += n;
@@ -1521,8 +1553,16 @@ fn note_pre_repeat(base: u64, size: u64, n: u64) {
 }
 
 fn pre_repeat_line() -> String {
+    let st = PRE_STABLE.lock().1;
     let g = PRE_REPEAT.lock();
     let mb = |b: u64| b as f64 / (1u64 << 20) as f64;
+    let stable = format!(
+        "    batch-start copies across frames (first in a frame): ranges not copied in the two frames before {:.0} MiB, unchanged since {:.0} MiB, changed {:.0} MiB (sampled hashes)
+",
+        mb(st[0]),
+        mb(st[1]),
+        mb(st[2])
+    );
     let sizes: Vec<String> = ["<4K", "<64K", "<1M", ">=1M"].iter().zip(g.3.iter()).map(|(n, x)| format!("{n} {} ({:.0} MiB)", x[0], mb(x[1]))).collect();
     format!(
         "    batch-start copies within a frame: first {} ({:.0} MiB), repeated {} ({:.0} MiB); by size {}
@@ -1532,7 +1572,7 @@ fn pre_repeat_line() -> String {
         g.2[2],
         mb(g.2[3]),
         sizes.join(", ")
-    )
+    ) + &stable
 }
 
 /// Command-processor time per recorded command by phase (DS_PROFILE_GPU),
@@ -1736,6 +1776,7 @@ pub fn reset_shader_profile() {
         g.2 = [0; 4];
         g.3 = [[0; 2]; 4];
     }
+    PRE_STABLE.lock().1 = [0; 3];
     for c in DRAW_STEPS.iter().chain(CS_STEPS.iter()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
@@ -2823,9 +2864,9 @@ impl Exec {
         } else {
             None
         };
-        let t0 = std::time::Instant::now();
-        let w = self.sync_for_reads(reads);
-        if w {
+        let waited = self.sync_for_reads(reads);
+        let w = waited.is_some();
+        if let Some(t0) = waited {
             WAIT_NS[0].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             WAIT_NS[1].fetch_add(1, Ordering::Relaxed);
             note_queue_wait(&self.name, 0, t0.elapsed());
@@ -2855,8 +2896,11 @@ impl Exec {
         self.overlaps_pending(reads) || INFLIGHT.latest(reads).is_some_and(|s| s > done_seq())
     }
 
-    pub fn sync_for_reads(&mut self, reads: &[(u64, u64)]) -> bool {
-        let mut waited = false;
+    /// Waits until GPU work writing `reads` completed (homes copied back,
+    /// this queue's batch submitted, other queues' batches done): when it
+    /// waited, since when.
+    pub fn sync_for_reads(&mut self, reads: &[(u64, u64)]) -> Option<std::time::Instant> {
+        let mut waited: Option<std::time::Instant> = None;
         let prof = profiling();
         let t0 = prof.then(std::time::Instant::now);
         if prof {
@@ -2874,21 +2918,21 @@ impl Exec {
         if super::homes::any_stale(reads) {
             // GPU work wrote these parts in video memory: copied back (after
             // all earlier submitted work) before the CPU reads them.
+            waited.get_or_insert_with(std::time::Instant::now);
             self.home_write_back(reads);
             self.flush();
-            waited = true;
         }
         lap(0, &mut t);
         if self.overlaps_pending(reads) {
+            waited.get_or_insert_with(std::time::Instant::now);
             self.flush_for("reads own writes");
-            waited = true;
         }
         lap(1, &mut t);
         if let Some(s) = INFLIGHT.latest(reads) {
             if s > done_seq() {
+                waited.get_or_insert_with(std::time::Instant::now);
                 FOREIGN_WAITS.fetch_add(1, Ordering::Relaxed);
                 wait_done(s);
-                waited = true;
             }
         }
         lap(2, &mut t);
@@ -3288,7 +3332,7 @@ impl Exec {
                             info = vk::DescriptorBufferInfo { buffer: hbuf, offset: off, range: (bias + size).next_multiple_of(4).min(bias + avail) };
                             bound_size = size;
                             if p.tr.plan.resources[i].written {
-                                trace_writes(&format!("{:?} shader {:#x}", p.stage, p.addr), base, size);
+                                trace_writes(|| format!("{:?} shader {:#x}", p.stage, p.addr), base, size);
                                 bound.writes.push((base, size));
                                 if matches!(p.resources[i], Resolved::Buffer(_)) {
                                     bound.sized_writes.push((base, size));
@@ -3329,7 +3373,7 @@ impl Exec {
                                         self.submit_after = self.submit_after.max(s);
                                     }
                                     if p.tr.plan.resources[i].written {
-                                        trace_writes(&format!("{:?} shader {:#x}", p.stage, p.addr), base, size);
+                                        trace_writes(|| format!("{:?} shader {:#x}", p.stage, p.addr), base, size);
                                         bound.writes.push((base, size));
                                         if matches!(p.resources[i], Resolved::Buffer(_)) {
                                             bound.sized_writes.push((base, size));
@@ -3505,7 +3549,8 @@ impl Exec {
 
     /// Copies a stage's SGPR data into the ring (space reserved) and binds it.
     fn bind_sgpr(&mut self, p: &Prepared, bound: &mut Bound) -> Result<(), String> {
-        let bytes: Vec<u8> = p.sgpr_data.iter().flat_map(|w| w.to_le_bytes()).collect();
+        // Little-endian dwords, as the shader reads them.
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(p.sgpr_data.as_ptr() as *const u8, 4 * p.sgpr_data.len()) };
         let vram = match super::tune::ring_vram() {
             1 => true,
             2 => self.name == "gfx",
@@ -3616,7 +3661,11 @@ impl Exec {
     /// `indirect`: the arguments' guest address (the GPU reads the group
     /// counts; `groups` is unused).
     fn dispatch_inner(&mut self, cp: &Cp, mut groups: [u32; 3], initiator: u32, indirect: Option<u64>) -> Result<(), String> {
-        let t0 = std::time::Instant::now();
+        // Phase times only when profiling (a clock read costs ~20 ns); the
+        // total always (slow dispatches are reported).
+        let t_start = std::time::Instant::now();
+        let t0 = profiling().then_some(t_start);
+        let since = |t0: Option<std::time::Instant>| t0.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         let mut lap = Laps::for_dispatch();
         if let Some(a) = indirect {
             // A resident shadow holding newer arguments is merged back first.
@@ -3657,7 +3706,7 @@ impl Exec {
         if groups.contains(&0) {
             return Ok(());
         }
-        let t_prep = t0.elapsed();
+        let t_prep = since(t0);
         trace_loads(&self.name, &p, groups);
         self.grow_sampled_depth(&[&p]);
         let keys = image_keys(&p);
@@ -3669,7 +3718,7 @@ impl Exec {
         }
         lap.mark(3);
         let (pipeline, layout, set_layout) = compute_pipe(&p)?;
-        let t_pipe = t0.elapsed();
+        let t_pipe = since(t0);
         lap.mark(4);
         self.reserve(&[&p]);
         if self.stopped {
@@ -3686,7 +3735,7 @@ impl Exec {
             note_placements(p.addr, groups, indirect.is_some(), &bound.placements);
         }
         lap.mark(7);
-        let t_bind = t0.elapsed();
+        let t_bind = since(t0);
         let set = self.alloc_set(set_layout)?;
         lap.mark(8);
         let writes_here = std::mem::take(&mut bound.writes);
@@ -3829,20 +3878,13 @@ impl Exec {
         lap.mark(15);
         EXECUTED.fetch_add(1, Ordering::Relaxed);
         self.batch_shaders.push(p.addr);
-        let total = t0.elapsed();
+        let total = t_start.elapsed();
         if profiling() {
             note_phases(&CS_PHASES, [t_prep, t_pipe, t_bind, total]);
         }
         if total.as_millis() >= 200 {
-            crate::info!(
-                "gpu[{}]: dispatch of cs {:#x} took {} ms (prepare {} ms, pipeline {} ms, bindings {} ms)",
-                self.name,
-                p.addr,
-                total.as_millis(),
-                t_prep.as_millis(),
-                (t_pipe - t_prep).as_millis(),
-                (t_bind - t_pipe).as_millis()
-            );
+            let phases = if profiling() { format!(" (prepare {} ms, pipeline {} ms, bindings {} ms)", t_prep.as_millis(), (t_pipe - t_prep).as_millis(), (t_bind - t_pipe).as_millis()) } else { String::new() };
+            crate::info!("gpu[{}]: dispatch of cs {:#x} took {} ms{phases}", self.name, p.addr, total.as_millis());
         }
         if let Some(mut ch) = verify::check_for(&p, groups, local).filter(|_| indirect.is_none()) {
             // Expected values as recorded, when no GPU work still writes them.

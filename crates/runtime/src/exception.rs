@@ -19,6 +19,20 @@ static REPORTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::ne
 /// allocated while the thread is suspended (it may hold the heap lock).
 /// Used for hang diagnosis (time limit, control command `stacks`).
 pub fn sample_thread(host_tid: u32, depth: usize) -> Option<String> {
+    let (host, guest) = sample_frames(host_tid, depth)?;
+    let mut s = String::new();
+    if !host.is_empty() {
+        let names: Vec<String> = host.iter().map(|&a| host_symbol(a)).collect();
+        s.push_str(&format!("host: {}\n        ", names.join(" <- ")));
+    }
+    let g: Vec<String> = guest.iter().map(|&a| describe(a)).collect();
+    s.push_str(&format!("guest: {}", if g.is_empty() { "(no guest frames)".to_string() } else { g.join(" <- ") }));
+    Some(s)
+}
+
+/// The host return addresses (innermost first, at most 24) and the first
+/// `depth` guest frames of a running thread (`sample_thread`).
+pub fn sample_frames(host_tid: u32, depth: usize) -> Option<(Vec<u64>, Vec<u64>)> {
     use windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext;
     use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME};
     const CONTEXT_FULL_AMD64: u32 = 0x0010_000B;
@@ -48,14 +62,47 @@ pub fn sample_thread(host_tid: u32, depth: usize) -> Option<String> {
     if !ok {
         return None;
     }
-    let mut s = String::new();
-    if nh > 0 {
-        let names: Vec<String> = host[..nh].iter().map(|&a| host_symbol(a)).collect();
-        s.push_str(&format!("host: {}\n        ", names.join(" <- ")));
+    Some((host[..nh].to_vec(), guest[..ng].to_vec()))
+}
+
+/// A host code address as its function: "name" in our image, "module!name"
+/// in other modules ("module" alone where no symbol is near); no offsets.
+/// Cached per address (profiling).
+pub fn frame_label(addr: u64) -> String {
+    static CACHE: parking_lot::Mutex<Option<std::collections::HashMap<u64, String>>> = parking_lot::Mutex::new(None);
+    if let Some(s) = CACHE.lock().as_ref().and_then(|m| m.get(&addr)) {
+        return s.clone();
     }
-    let g: Vec<String> = guest[..ng].iter().map(|&a| describe(a)).collect();
-    s.push_str(&format!("guest: {}", if g.is_empty() { "(no guest frames)".to_string() } else { g.join(" <- ") }));
-    Some(s)
+    let sym = host_symbol(addr);
+    let (b, e) = host_image();
+    let label = if addr >= b && addr < e {
+        sym.split("+0x").next().unwrap_or(&sym).to_string()
+    } else {
+        let module = host_module(addr);
+        // Symbols of stripped modules are their nearest export, often far away.
+        let near = sym.rsplit_once("+0x").and_then(|(_, d)| u64::from_str_radix(d, 16).ok()).is_some_and(|d| d < 0x4000);
+        match (near, sym.starts_with("0x")) {
+            (true, false) => format!("{module}!{}", sym.split("+0x").next().unwrap_or(&sym)),
+            _ => module,
+        }
+    };
+    CACHE.lock().get_or_insert_with(Default::default).insert(addr, label.clone());
+    label
+}
+
+/// The file name of the module containing `addr` ("?" if none).
+fn host_module(addr: u64) -> String {
+    use windows_sys::Win32::System::LibraryLoader::{GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW, GetModuleHandleExW};
+    unsafe {
+        let mut m = std::ptr::null_mut();
+        if GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, addr as *const u16, &mut m) == 0 {
+            return "?".into();
+        }
+        let mut buf = [0u16; 260];
+        let n = GetModuleFileNameW(m, buf.as_mut_ptr(), buf.len() as u32) as usize;
+        let path = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
+        path.rsplit('\\').next().unwrap_or(&path).trim_end_matches(".dll").trim_end_matches(".DLL").to_string()
+    }
 }
 
 #[repr(C, align(16))]

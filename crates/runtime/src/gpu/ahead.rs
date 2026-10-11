@@ -109,6 +109,7 @@ fn ensure_workers() {
             Box::new(move || {
                 crate::log::set_thread_name(&name);
                 crate::exception::arm_watch_current_thread(false);
+                super::profile_this_thread("prep");
                 worker();
             }),
         );

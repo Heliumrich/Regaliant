@@ -632,6 +632,20 @@ fn slice_hash(base: u64, size: u64, slice: usize) -> u64 {
     h
 }
 
+/// Sampled hash of a guest range (diagnostics): all of it up to 4 KiB, else
+/// 256 bytes at 16 evenly spaced points and its last 256 bytes.
+pub(crate) fn sampled_hash(base: u64, size: u64) -> u64 {
+    let piece = |a: u64, n: u64| if super::cp::guest_readable(a, n) { hash_bytes(a, n as usize) } else { 0x5555_5555_5555_5555 };
+    if size <= 4096 {
+        return piece(base, size);
+    }
+    let mut h = 0u64;
+    for k in 0..16 {
+        h = h.rotate_left(5) ^ piece(base + (size - 256) * k / 16, 256);
+    }
+    h.rotate_left(5) ^ piece(base + size - 256, 256)
+}
+
 fn all_hashes(base: u64, size: u64) -> [u64; SLICES] {
     std::array::from_fn(|s| slice_hash(base, size, s))
 }
