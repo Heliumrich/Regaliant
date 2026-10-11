@@ -1214,6 +1214,17 @@ impl Images {
     }
 
     pub fn take_block_copies(&mut self, keys: &[ImageKey]) -> Vec<BlockCopy> {
+        let out = self.block_copies(keys);
+        for c in &out {
+            if let Some(i) = self.map.get_mut(&c.key) {
+                i.block_gen = c.seq;
+            }
+        }
+        out
+    }
+
+    /// The block copies `take_block_copies` would take (nothing marked).
+    pub fn block_copies(&self, keys: &[ImageKey]) -> Vec<BlockCopy> {
         let mut out: Vec<BlockCopy> = Vec::new();
         for k in keys {
             if !is_compressed(k.format) || k.ty3d || out.iter().any(|c| c.key == *k) {
@@ -1243,11 +1254,6 @@ impl Images {
                 continue;
             }
             out.push(BlockCopy { key: *k, src: src.image, dst: dst.image, width: bw, height: bh, levels, layers: src.key.layers.min(k.layers).max(1), seq: src.write_gen });
-        }
-        for c in &out {
-            if let Some(i) = self.map.get_mut(&c.key) {
-                i.block_gen = c.seq;
-            }
         }
         out
     }

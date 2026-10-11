@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 29] = [
+    static ALL: [Tunable; 30] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -56,6 +56,7 @@ pub mod tune {
         Tunable { name: "map_ranges", env: "DS_MAP_RANGES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ahead", env: "DS_AHEAD", default: 4, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_cs", env: "DS_PRE_CS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par", env: "DS_PAR", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -260,6 +261,12 @@ pub mod tune {
         get(28) != 0
     }
 
+    /// Worker command processors that record chunks of long
+    /// synchronization-free runs in parallel (`gpu::par`); 0: off.
+    pub fn par() -> u64 {
+        get(29)
+    }
+
     /// Command-processor waits for GPU work still to be traced (`tune
     /// trace_sync <n>`: the next n are logged with the read that collided,
     /// its writer and the shader).
@@ -285,6 +292,7 @@ pub mod tune {
 }
 
 pub mod ahead;
+pub mod par;
 pub mod exec;
 pub mod pcache;
 pub mod lodstats;

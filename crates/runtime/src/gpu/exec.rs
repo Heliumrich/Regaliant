@@ -1806,9 +1806,34 @@ pub struct Exec {
     sync_readers: [u64; 2],
     /// The read a traced wait collided with (the caller explains it).
     pub(super) sync_culprit: Option<(u64, u64)>,
+    /// Worker executor of a parallel run (`gpu::par`): batches are closed
+    /// for the main command processor to submit in program order
+    /// (`submit_closed`), never submitted or waited for here; anything that
+    /// would need that stops the chunk (`stopped`) before the command
+    /// records its own work.
+    deferred: bool,
+    pub(crate) stopped: bool,
+    closed: Vec<Closed>,
 }
 
 unsafe impl Send for Exec {}
+
+/// A batch a deferred executor closed (see `Exec::deferred`).
+struct Closed {
+    slot: usize,
+    pre: Option<vk::CommandBuffer>,
+    writes: super::ranges::Ranges,
+    checks: Vec<verify::Check>,
+    shaders: Vec<u64>,
+}
+
+/// Slot sequence of a batch closed but not yet submitted.
+const PENDING: u64 = u64::MAX;
+/// Batch slots a deferred executor may create.
+const DEFERRED_SLOTS: usize = 6;
+
+/// Error of a command a deferred executor stopped at (see `Exec::stopped`).
+pub(crate) const STOPPED: &str = "stopped (parallel run)";
 
 impl Exec {
     pub fn new(name: &str) -> Result<Exec, String> {
@@ -1858,6 +1883,9 @@ impl Exec {
                 resident: Vec::new(),
                 sync_readers: [0; 2],
                 sync_culprit: None,
+                deferred: false,
+                stopped: false,
+                closed: Vec::new(),
             })
         }
     }
@@ -1882,6 +1910,30 @@ impl Exec {
     fn begin(&mut self) {
         if self.recording {
             return;
+        }
+        if self.deferred {
+            // A slot whose batch is closed but not submitted cannot be reused:
+            // another one, or a new one, else the chunk stops.
+            let n = self.slots.len();
+            if self.slots[self.cur].seq == PENDING {
+                match (0..n).map(|k| (self.cur + k) % n).find(|&k| self.slots[k].seq != PENDING) {
+                    Some(k) => self.cur = k,
+                    None if n < DEFERRED_SLOTS => match Slot::new(self.pool) {
+                        Ok(s) => {
+                            self.slots.push(s);
+                            self.cur = n;
+                        }
+                        Err(_) => {
+                            self.stopped = true;
+                            return;
+                        }
+                    },
+                    None => {
+                        self.stopped = true;
+                        return;
+                    }
+                }
+            }
         }
         if self.cur == self.slots.len() {
             match Slot::new(self.pool) {
@@ -2000,6 +2052,23 @@ impl Exec {
             let (a, n) = verify::dest_range(ch);
             ch.overwritten = self.pending_log.get(ch.writes_mark..).unwrap_or(&[]).iter().any(|&(w, m)| w < a + n && a < w + m);
         }
+        if self.deferred {
+            if has_actions || !self.pending_promises.is_empty() {
+                crate::error!("gpu[{}]: CP effects in a parallel run (dropped)", self.name);
+            }
+            self.closed.push(Closed { slot: i, pre, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders) });
+            self.slots[i].seq = PENDING;
+            self.pending_promises.clear();
+            self.pending_log.clear();
+            self.recording = false;
+            self.cur = (self.cur + 1) % self.slots.len();
+            self.ring_used = [0; 2];
+            self.snap_used = 0;
+            self.snaps.clear();
+            self.pre_used = 0;
+            self.pres.clear();
+            return;
+        }
         let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, || {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return;
@@ -2080,6 +2149,10 @@ impl Exec {
         if !super::homes::any() && !(kind == HomeUse::Index && super::tune::homes()) {
             return None;
         }
+        if self.deferred && super::homes::copy_in_pending(base, size) {
+            self.stopped = true;
+            return None;
+        }
         let mut b = super::homes::bind(base, size, written);
         if b.is_none() && kind == HomeUse::Index && super::tune::homes() && super::homes::index_use(base, size) {
             b = super::homes::bind(base, size, written);
@@ -2133,6 +2206,10 @@ impl Exec {
     /// Writes every home's GPU-written parts back and drops the homes
     /// (`tune homes 0` while they exist).
     fn homes_evict_all(&mut self) {
+        if self.deferred {
+            self.stopped = true;
+            return;
+        }
         let parts = super::homes::take_all();
         if parts.is_empty() {
             return;
@@ -2163,6 +2240,10 @@ impl Exec {
             parts.extend(super::homes::stale_parts(a, n, true));
         }
         if parts.is_empty() {
+            return;
+        }
+        if self.deferred {
+            self.stopped = true;
             return;
         }
         self.begin();
@@ -2282,6 +2363,9 @@ impl Exec {
         // The metadata write may still be in flight.
         self.end_rendering();
         self.flush();
+        if self.stopped {
+            return;
+        }
         let clears = super::images::with(|im| im.take_clears(keys));
         for c in clears {
             if !super::cp::guest_readable(c.meta, 4) {
@@ -2301,12 +2385,18 @@ impl Exec {
                 }
                 let value = vk::ClearDepthStencilValue { depth: f32::from_bits(c.clear[0]), stencil: c.clear[1] & 0xFF };
                 self.begin();
+                if !self.recording {
+                    return;
+                }
                 unsafe { ctx().device.cmd_clear_depth_stencil_image(self.cmd(), c.image, vk::ImageLayout::GENERAL, &value, &[full]) };
                 format!("depth {} stencil {}", value.depth, value.stencil)
             } else {
                 match dcc_clear_color(v & 0xFF, k.format, c.clear) {
                     Ok(Some(color)) => {
                         self.begin();
+                        if !self.recording {
+                            return;
+                        }
                         unsafe { ctx().device.cmd_clear_color_image(self.cmd(), c.image, vk::ImageLayout::GENERAL, &color, &[full]) };
                         format!("DCC code {:#x}", v & 0xFF)
                     }
@@ -2341,6 +2431,9 @@ impl Exec {
                 let Some(old) = super::images::with(|im| im.depth_to_grow(k.base, k.width, k.height, fam, k.layers)) else { continue };
                 self.end_rendering();
                 self.flush();
+                if self.stopped {
+                    return;
+                }
                 if let Err(e) = super::images::with(|im| im.grow_depth(old, k.layers)) {
                     self.report(format!("images: growing depth image {:#x}: {e}", k.base));
                 }
@@ -2358,6 +2451,9 @@ impl Exec {
         }
         self.end_rendering();
         self.flush();
+        if self.stopped {
+            return;
+        }
         super::images::with(|im| im.reload_overwritten(keys));
     }
 
@@ -2366,6 +2462,13 @@ impl Exec {
     /// before the work that samples them.
     pub(crate) fn sync_block_textures(&mut self, keys: &[super::images::ImageKey]) {
         if keys.is_empty() {
+            return;
+        }
+        if self.deferred {
+            // The copies must precede every use in program order.
+            if super::images::with(|im| !im.block_copies(keys).is_empty()) {
+                self.stopped = true;
+            }
             return;
         }
         let copies = super::images::with(|im| im.take_block_copies(keys));
@@ -2398,6 +2501,10 @@ impl Exec {
     /// Submits recorded work and waits for all of this queue's GPU work and
     /// deferred effects.
     pub fn flush(&mut self) {
+        if self.deferred {
+            self.stopped = true;
+            return;
+        }
         self.submit_for("sync");
         wait_done(self.last_seq);
         self.inflight.clear();
@@ -2452,6 +2559,12 @@ impl Exec {
     /// read; `CP_WRITES`). Returns the batch
     /// sequence it runs after (None: performed now).
     pub fn after_gpu(&mut self, f: Action, write: Option<(u64, u64)>, ordered: bool) -> Option<u64> {
+        if self.deferred {
+            crate::error!("gpu[{}]: a CP effect in a parallel run (performed now)", self.name);
+            self.stopped = true;
+            f();
+            return None;
+        }
         if self.recording {
             self.actions.push(f);
             self.submit_for("effect");
@@ -2835,6 +2948,9 @@ impl Exec {
     /// `stages` (submits the batch and starts the next one otherwise).
     fn reserve(&mut self, stages: &[&Prepared]) {
         self.begin();
+        if !self.recording {
+            return;
+        }
         let mut need = [stages.len() as u32, 0, 0, 0, 0];
         let mut ring = 0u64;
         for p in stages {
@@ -2874,9 +2990,78 @@ impl Exec {
         if !fits {
             self.submit_for("full");
             self.begin();
+            if !self.recording {
+                return;
+            }
         }
         for k in 0..5 {
             self.pool_use[k] += need[k];
+        }
+    }
+
+    /// Makes this a deferred executor (`gpu::par` workers).
+    pub fn set_deferred(&mut self) {
+        self.deferred = true;
+    }
+
+    /// Submits the batches this deferred executor closed, in order (the
+    /// main command processor, after the work before them); returns the
+    /// last one's sequence. At shutdown they are dropped.
+    pub fn submit_closed(&mut self) -> Option<u64> {
+        let c = ctx();
+        let mut last = None;
+        for b in std::mem::take(&mut self.closed) {
+            if super::shutting_down() {
+                // Never submitted: free for reuse (begin resets a command
+                // buffer it records again).
+                self.slots[b.slot].seq = 0;
+                continue;
+            }
+            let (cmd, fence, queries) = (self.slots[b.slot].cmd, self.slots[b.slot].fence, self.slots[b.slot].queries);
+            let name = self.name.clone();
+            let pre = b.pre;
+            let seq = push_batch(fence, queries, Vec::new(), b.checks, b.shaders, &self.name, || {
+                if DEVICE_LOST.load(Ordering::Relaxed) {
+                    return;
+                }
+                let r = match pre {
+                    Some(p) => c.submit_cmds(&[p, cmd], &[], &[], fence),
+                    None => c.submit(cmd, &[], &[], fence),
+                };
+                if let Err(e) = r {
+                    if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
+                        crate::error!("gpu[{name}]: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
+                    }
+                }
+            });
+            self.slots[b.slot].seq = seq;
+            INFLIGHT.note_ranges(seq, &b.writes);
+            self.inflight.insert_all(seq, &b.writes);
+            self.last_seq = seq;
+            last = Some(seq);
+        }
+        last
+    }
+
+    /// Closes the batch being recorded (a deferred executor at the end of
+    /// its chunk).
+    pub fn close(&mut self) {
+        self.submit_for("chunk");
+    }
+
+    /// Drops the batches this deferred executor closed (never submitted):
+    /// their slots are reset for reuse.
+    pub fn discard_closed(&mut self) {
+        let c = ctx();
+        for b in std::mem::take(&mut self.closed) {
+            let s = &mut self.slots[b.slot];
+            unsafe {
+                c.device.reset_command_buffer(s.cmd, vk::CommandBufferResetFlags::empty()).ok();
+                c.device.reset_command_buffer(s.pre, vk::CommandBufferResetFlags::empty()).ok();
+                c.device.reset_descriptor_pool(s.desc_pool, vk::DescriptorPoolResetFlags::empty()).ok();
+            }
+            s.homes.clear();
+            s.seq = 0;
         }
     }
 
@@ -3184,8 +3369,10 @@ impl Exec {
             return;
         }
         if let Err(e) = self.dispatch_inner(cp, groups, initiator, None) {
-            SKIPPED.fetch_add(1, Ordering::Relaxed);
-            self.report(e);
+            if e != STOPPED {
+                SKIPPED.fetch_add(1, Ordering::Relaxed);
+                self.report(e);
+            }
         } else if sync_mode() {
             self.flush();
             if DEVICE_LOST.load(Ordering::Relaxed) {
@@ -3218,8 +3405,10 @@ impl Exec {
         }
         GPU_INDIRECT.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = self.dispatch_inner(cp, [1, 1, 1], initiator, Some(args)) {
-            SKIPPED.fetch_add(1, Ordering::Relaxed);
-            self.report(e);
+            if e != STOPPED {
+                SKIPPED.fetch_add(1, Ordering::Relaxed);
+                self.report(e);
+            }
         } else if sync_mode() {
             self.flush();
         }
@@ -3245,6 +3434,9 @@ impl Exec {
         lap.mark(0);
         self.sync_readers = [p.addr, 0];
         if self.sync_for(&p.reads, SYNC_CS_READS) {
+            if self.stopped {
+                return Err(STOPPED.into());
+            }
             if let Some(c) = self.sync_culprit.take() {
                 explain_wait(&self.name, c, &[&p]);
             }
@@ -3253,6 +3445,9 @@ impl Exec {
         lap.mark(1);
         // Textures are uploaded from guest memory: earlier GPU writes first.
         self.sync_textures(&texture_ranges(&p), SYNC_CS_TEXTURES);
+        if self.stopped {
+            return Err(STOPPED.into());
+        }
         lap.mark(2);
         let local = [cp.reg(Space::Sh, 0x207) & 0xFFFF, cp.reg(Space::Sh, 0x208) & 0xFFFF, cp.reg(Space::Sh, 0x209) & 0xFFFF];
         if initiator & (1 << 5) != 0 {
@@ -3271,13 +3466,22 @@ impl Exec {
         self.resolve_fast_clears(&keys);
         self.resolve_overwrites(&keys);
         self.sync_block_textures(&keys);
+        if self.stopped {
+            return Err(STOPPED.into());
+        }
         lap.mark(3);
         let (pipeline, layout, set_layout) = compute_pipe(&p)?;
         let t_pipe = t0.elapsed();
         lap.mark(4);
         self.reserve(&[&p]);
+        if self.stopped {
+            return Err(STOPPED.into());
+        }
         lap.mark(5);
         let mut bound = self.bind_stage(&mut p, true)?;
+        if self.stopped {
+            return Err(STOPPED.into());
+        }
         lap.mark(6);
         self.bind_sgpr(&p, &mut bound)?;
         if profiling() {
@@ -3497,6 +3701,7 @@ pub fn status() -> String {
         + &crate::titlemem::status()
         + &super::lodstats::status()
         + &super::ahead::status()
+        + &super::par::status()
         + &super::mirror::status()
         + &super::homes::status()
         + &sync_why_status()

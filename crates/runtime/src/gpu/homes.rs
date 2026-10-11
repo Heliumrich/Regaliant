@@ -140,6 +140,17 @@ pub fn bind(base: u64, size: u64, written: bool) -> Option<Bound> {
     Some(Bound { buf: h.buf.clone(), offset: base - h.base, avail: h.base + h.size - base, copy_in })
 }
 
+/// Whether binding [base, base+size) would copy guest data into its home
+/// first (`bind`: parts the CPU wrote since; a parallel chunk stops there:
+/// the copy must precede every earlier use in program order).
+pub fn copy_in_pending(base: u64, size: u64) -> bool {
+    if !any() {
+        return false;
+    }
+    let g = HOMES.lock();
+    g.iter().find(|h| h.base <= base && base + size <= h.base + h.size).is_some_and(|h| !h.dirty.is_empty())
+}
+
 /// The homes overlapping [base, base+size) (diagnostics).
 pub fn describe(base: u64, size: u64) -> String {
     let g = HOMES.lock();

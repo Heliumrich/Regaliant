@@ -410,6 +410,7 @@ impl Exec {
                 DRAW_NOOP.fetch_add(1, Ordering::Relaxed);
                 "no effect".to_string()
             }
+            Err(e) if e == super::STOPPED => "stopped (parallel run)".to_string(),
             Err(e) => {
                 DRAW_SKIPPED.fetch_add(1, Ordering::Relaxed);
                 let s = format!("skipped: {e}");
@@ -528,6 +529,9 @@ impl Exec {
         self.sync_readers = [vs.addr, ps.as_ref().map_or(0, |p| p.addr)];
         // Each stage's reads in place (no combined copy per draw).
         let waited = self.sync_for(&vs.reads, SYNC_DRAW_READS) | ps.as_ref().is_some_and(|p| self.sync_for(&p.reads, SYNC_DRAW_READS));
+        if self.stopped {
+            return Err(super::STOPPED.into());
+        }
         if waited {
             if let Some(c) = self.sync_culprit.take() {
                 let mut st: Vec<&Prepared> = vec![&vs];
@@ -546,6 +550,9 @@ impl Exec {
             textures.extend(texture_ranges(p));
         }
         self.sync_textures(&textures, SYNC_DRAW_TEXTURES);
+        if self.stopped {
+            return Err(super::STOPPED.into());
+        }
         lap.mark(3);
         // Indices in a video-memory home (`homes`; one is made for indices
         // that GPU work wrote through a large binding) are bound from it and
@@ -557,6 +564,9 @@ impl Exec {
                 let h = self.home_bind(addr, bytes, false, super::HomeUse::Index);
                 if h.is_none() {
                     self.sync_for(&[(addr, bytes)], SYNC_DRAW_INDICES);
+                }
+                if self.stopped {
+                    return Err(super::STOPPED.into());
                 }
                 h
             }
@@ -613,6 +623,9 @@ impl Exec {
             if let Some(old) = images::with(|im| im.depth_to_grow(s.base, s.width, s.height, images::Images::depth_family(s.format), s.layers)) {
                 self.end_rendering();
                 self.flush();
+                if self.stopped {
+                    return Err(super::STOPPED.into());
+                }
                 images::with(|im| im.grow_depth(old, s.layers))?;
             }
         }
@@ -681,10 +694,16 @@ impl Exec {
             Some(p) => super::image_hazards(&[&vs, p], &attached),
             None => super::image_hazards(&[&vs], &attached),
         };
+        if self.stopped {
+            return Err(super::STOPPED.into());
+        }
         if pending {
             self.resolve_fast_clears(&used);
             self.resolve_overwrites(&used);
             self.sync_block_textures(&used);
+            if self.stopped {
+                return Err(super::STOPPED.into());
+            }
         }
         lap.mark(8);
         // Resources.
@@ -693,6 +712,9 @@ impl Exec {
             stages.push(p);
         }
         self.reserve(&stages.iter().map(|p| &**p).collect::<Vec<_>>());
+        if self.stopped {
+            return Err(super::STOPPED.into());
+        }
         if let Some(h) = &index_home {
             // Kept until the batch that draws completes.
             self.slots[self.cur].homes.push(h.3.clone());
@@ -705,6 +727,9 @@ impl Exec {
         let mut bounds = Vec::new();
         for (k, p) in stages.iter_mut().enumerate() {
             let mut b = self.bind_stage(p, false)?;
+            if self.stopped {
+                return Err(super::STOPPED.into());
+            }
             self.bind_sgpr(p, &mut b)?;
             bounds.push(b);
             lap.mark(10 + k.min(1));

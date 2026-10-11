@@ -55,6 +55,7 @@ pub fn sync_summary() -> String {
 }
 
 /// Register file of one queue.
+#[derive(Clone)]
 pub struct Regs {
     pub ctx: Vec<u32>,
     pub sh: Vec<u32>,
@@ -117,6 +118,64 @@ pub struct Cp {
     /// The scan's copies of the SH and context register files (kept to
     /// avoid allocations).
     scan_regs: (Vec<u32>, Vec<u32>),
+    /// A parallel run in progress (`gpu::par`).
+    par: Option<ParRun>,
+    /// This command processor's chunk workers.
+    par_pool: super::par::Pool,
+}
+
+/// The command-processor state a chunk of a parallel run starts from and
+/// ends with (`gpu::par`).
+#[derive(Clone)]
+pub struct ChunkState {
+    regs: Regs,
+    index_base: u64,
+    index_count: u32,
+    num_instances: u32,
+    draw_indirect_base: u64,
+    dispatch_indirect_base: u64,
+}
+
+/// A parallel run in progress: chunk i + 1 starts at `starts[i]` and was
+/// handed to `workers[i]`; it ends where the next starts (the last at
+/// `end`). `next`: the chunk to collect next.
+struct ParRun {
+    starts: Vec<u64>,
+    end: u64,
+    next: usize,
+    workers: Vec<Arc<super::par::Worker>>,
+}
+
+/// Commands a run needs to be split, per chunk at least, and at most per
+/// parallel run.
+const PAR_MIN: usize = 192;
+const PAR_CHUNK_MIN: usize = 64;
+const PAR_MAX: usize = 8192;
+
+fn is_command(op: u32) -> bool {
+    matches!(op, op::DRAW_INDEX_2 | op::DRAW_INDEX_AUTO | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT | op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT)
+}
+
+/// Packets that leave a run open (state only; see `Cp::scan_ahead`).
+fn is_state(op: u32) -> bool {
+    matches!(
+        op,
+        op::SET_CONTEXT_REG
+            | op::SET_CONTEXT_REG_INDEX
+            | op::SET_SH_REG
+            | op::SET_SH_REG_INDEX
+            | op::SET_UCONFIG_REG
+            | op::SET_UCONFIG_REG_INDEX
+            | op::LOAD_CONTEXT_REG_INDEX
+            | op::LOAD_SH_REG_INDEX
+            | op::LOAD_UCONFIG_REG
+            | op::INDEX_TYPE
+            | op::INDEX_BASE
+            | op::INDEX_BUFFER_SIZE
+            | op::NUM_INSTANCES
+            | op::CONTEXT_CONTROL
+            | op::SET_BASE
+    )
 }
 
 /// A command the scan ahead saw: its packet address and the preparations
@@ -548,7 +607,364 @@ impl Cp {
             ahead: std::collections::VecDeque::new(),
             cur_ahead: std::cell::RefCell::new([None, None]),
             scan_regs: (Vec::new(), Vec::new()),
+            par: None,
+            par_pool: super::par::Pool::new(),
         }
+    }
+
+    pub fn chunk_state(&self) -> ChunkState {
+        ChunkState {
+            regs: self.regs.clone(),
+            index_base: self.index_base,
+            index_count: self.index_count,
+            num_instances: self.num_instances,
+            draw_indirect_base: self.draw_indirect_base,
+            dispatch_indirect_base: self.dispatch_indirect_base,
+        }
+    }
+
+    pub fn set_chunk_state(&mut self, s: &ChunkState) {
+        self.regs.ctx.copy_from_slice(&s.regs.ctx);
+        self.regs.sh.copy_from_slice(&s.regs.sh);
+        self.regs.uc.copy_from_slice(&s.regs.uc);
+        self.index_base = s.index_base;
+        self.index_count = s.index_count;
+        self.num_instances = s.num_instances;
+        self.draw_indirect_base = s.draw_indirect_base;
+        self.dispatch_indirect_base = s.dispatch_indirect_base;
+    }
+
+    /// Gives this (worker) command processor a deferred executor.
+    pub fn make_worker_exec(&mut self) -> Result<(), String> {
+        let mut e = super::exec::Exec::new(&self.name)?;
+        e.set_deferred();
+        self.exec = Some(e);
+        Ok(())
+    }
+
+    pub fn chunk_start(&mut self) {
+        if let Some(e) = self.exec.as_mut() {
+            e.stopped = false;
+        }
+    }
+
+    /// Closes the batch a chunk recorded into.
+    pub fn chunk_finish(&mut self) {
+        if let Some(e) = self.exec.as_mut() {
+            e.close();
+        }
+    }
+
+    /// Executes the packets in [from, to) of a run (a parallel worker):
+    /// returns the address of the packet where the executor stopped (it
+    /// and the rest are left to the main command processor), or None.
+    pub fn run_chunk(&mut self, from: u64, to: u64) -> Option<u64> {
+        let f = Fetched::new(from, 0);
+        let mut cur = from;
+        let mut commands = 0u64;
+        while cur < to {
+            if super::shutting_down() || !valid(cur, 4) {
+                return Some(cur);
+            }
+            let h = f.rd(cur);
+            match h >> 30 {
+                3 => {}
+                2 => {
+                    cur += 4;
+                    continue;
+                }
+                _ => return Some(cur),
+            }
+            let count = (h >> 16) & 0x3FFF;
+            let opcode = (h >> 8) & 0xFF;
+            if count == 0x3FFF {
+                cur += 4;
+                continue;
+            }
+            let n = count as u64 + 1;
+            let next = cur + 4 * (n + 1);
+            if next > to || !valid(cur, 4 * (n + 1)) || !(is_command(opcode) || is_state(opcode) || opcode == op::NOP) {
+                return Some(cur);
+            }
+            PACKETS.fetch_add(1, Ordering::Relaxed);
+            self.cur_packet = cur;
+            self.cur_opcode = opcode;
+            let p = |i: u64| f.rd(cur + 4 * (1 + i));
+            let flow = self.packet(opcode, h, cur, n, &p);
+            if self.exec.as_ref().is_some_and(|e| e.stopped) {
+                super::par::COMMANDS.fetch_add(commands, Ordering::Relaxed);
+                return Some(cur);
+            }
+            if !matches!(flow, Flow::Next) {
+                return Some(next);
+            }
+            commands += is_command(opcode) as u64;
+            cur = next;
+        }
+        super::par::COMMANDS.fetch_add(commands, Ordering::Relaxed);
+        None
+    }
+
+    /// Submits the batches this worker closed (the main command processor,
+    /// in program order); the last one's sequence.
+    pub fn worker_submit(&mut self) -> Option<u64> {
+        self.exec.as_mut().and_then(|e| e.submit_closed())
+    }
+
+    /// Drops the batches this worker closed (a cancelled parallel run).
+    pub fn worker_discard(&mut self) {
+        if let Some(e) = self.exec.as_mut() {
+            e.discard_closed();
+        }
+    }
+
+    /// Applies a state packet of a run to `st` as `packet` would.
+    fn apply_state(st: &mut ChunkState, opcode: u32, n: u64, p: &dyn Fn(u64) -> u32) {
+        let set = |v: &mut Vec<u32>, first: u32| {
+            for i in 1..n {
+                if let Some(r) = v.get_mut((first + (i - 1) as u32) as usize) {
+                    *r = p(i);
+                }
+            }
+        };
+        let load = |v: &mut Vec<u32>, a: u64, count: u32| {
+            if count == 0 || !valid(a, 8 * count as u64) {
+                return;
+            }
+            for i in 0..count as u64 {
+                let (o, val) = unsafe { (rd32(a + 8 * i), rd32(a + 8 * i + 4)) };
+                if let Some(r) = v.get_mut((o & 0xFFFF) as usize) {
+                    *r = val;
+                }
+            }
+        };
+        match opcode {
+            op::SET_CONTEXT_REG | op::SET_CONTEXT_REG_INDEX => set(&mut st.regs.ctx, p(0) & 0xFFFF),
+            op::SET_SH_REG | op::SET_SH_REG_INDEX => set(&mut st.regs.sh, p(0) & 0xFFFF),
+            op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX => set(&mut st.regs.uc, p(0) & 0xFFFF),
+            op::LOAD_CONTEXT_REG_INDEX => load(&mut st.regs.ctx, addr64(p(0), p(1)), p(2)),
+            op::LOAD_SH_REG_INDEX => load(&mut st.regs.sh, addr64(p(0), p(1)), p(2)),
+            op::LOAD_UCONFIG_REG => load(&mut st.regs.uc, addr64(p(0), p(1)), p(2)),
+            op::INDEX_TYPE => {
+                if let Some(r) = st.regs.uc.get_mut(crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE as usize) {
+                    *r = p(0);
+                }
+            }
+            op::INDEX_BASE => st.index_base = addr64(p(0), p(1)),
+            op::INDEX_BUFFER_SIZE => st.index_count = p(0),
+            op::NUM_INSTANCES => st.num_instances = p(0).max(1),
+            op::SET_BASE => {
+                let base = addr64(p(1), p(2));
+                if p(0) == 2 {
+                    st.dispatch_indirect_base = base
+                } else {
+                    st.draw_indirect_base = base
+                }
+            }
+            op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT => {
+                // The base vertex and start instance the packet hands to user SGPRs.
+                let a = st.draw_indirect_base + p(0) as u64;
+                let (bytes, k) = if opcode == op::DRAW_INDEX_INDIRECT { (20, 3) } else { (16, 2) };
+                if !valid(a, bytes) {
+                    return;
+                }
+                let index_ok = opcode == op::DRAW_INDIRECT || matches!(st.regs.uc.get(crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE as usize).map(|t| t & 3), Some(0 | 1));
+                if !index_ok {
+                    return;
+                }
+                let (bv, si) = unsafe { (rd32(a + 4 * k), rd32(a + 4 * (k + 1))) };
+                let (vtx_loc, inst_loc) = (p(1) & 0xFFFF, p(1) >> 16);
+                let inst_loc = if inst_loc != 0 {
+                    inst_loc
+                } else {
+                    let r = ScanRegs { sh: &st.regs.sh, ctx: &st.regs.ctx };
+                    crate::hle::libs::agc::instance_offset_slot(super::shaders::ngg_addr_of(&r)).map_or(0, |s| 0x8C + s)
+                };
+                if vtx_loc != 0 {
+                    if let Some(r) = st.regs.sh.get_mut(vtx_loc as usize) {
+                        *r = bv;
+                    }
+                }
+                if inst_loc != 0 {
+                    if let Some(r) = st.regs.sh.get_mut(inst_loc as usize) {
+                        *r = si;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Splits the synchronization-free run that starts with the command at
+    /// `from` into chunks when it is long enough: the first stays here, the
+    /// others start on the workers now (`gpu::par`).
+    fn par_plan(&mut self, f: &Fetched, from: u64, end: u64) {
+        let k = super::par::workers();
+        // The run's commands, its end and the indirect arguments read in it.
+        let mut ends: Vec<u64> = Vec::new();
+        let mut args: Vec<(u64, u64)> = Vec::new();
+        let (mut draw_base, mut disp_base) = (self.draw_indirect_base, self.dispatch_indirect_base);
+        let mut c = from;
+        let run_end = loop {
+            if c >= end || !valid(c, 4) {
+                break c;
+            }
+            let h = f.rd(c);
+            match h >> 30 {
+                3 => {}
+                2 => {
+                    c += 4;
+                    continue;
+                }
+                _ => break c,
+            }
+            let count = (h >> 16) & 0x3FFF;
+            if count == 0x3FFF {
+                c += 4;
+                continue;
+            }
+            if h & 1 != 0 {
+                break c;
+            }
+            let opc = (h >> 8) & 0xFF;
+            let n = count as u64 + 1;
+            let next = c + 4 * (n + 1);
+            if next > end || !valid(c, 4 * (n + 1)) {
+                break c;
+            }
+            let at = c;
+            let p = |i: u64| f.rd(at + 4 * (1 + i));
+            if is_command(opc) {
+                ends.push(next);
+                match opc {
+                    op::DRAW_INDIRECT => args.push((draw_base + p(0) as u64, 16)),
+                    op::DRAW_INDEX_INDIRECT => args.push((draw_base + p(0) as u64, 20)),
+                    op::DISPATCH_INDIRECT => args.push((if n >= 3 { addr64(p(0), p(1)) } else { disp_base + p(0) as u64 }, 12)),
+                    _ => {}
+                }
+                if ends.len() >= PAR_MAX {
+                    break next;
+                }
+            } else if opc == op::NOP {
+                if n >= 2 && p(0) == DS_MAGIC && !matches!(p(1), pop::PUSH_MARKER | pop::SET_MARKER | pop::POP_MARKER) {
+                    break c;
+                }
+            } else if opc == op::SET_BASE {
+                if p(0) == 2 {
+                    disp_base = addr64(p(1), p(2));
+                } else {
+                    draw_base = addr64(p(1), p(2));
+                }
+            } else if !is_state(opc) {
+                break c;
+            }
+            c = next;
+        };
+        let n = ends.len();
+        let chunks = (k + 1).min(n / PAR_CHUNK_MIN);
+        if n < PAR_MIN || chunks < 2 {
+            return;
+        }
+        // Indirect arguments are read when the chunks run: GPU work still
+        // writing them completes first.
+        if !args.is_empty() {
+            args.sort_unstable();
+            let mut merged: Vec<(u64, u64)> = Vec::new();
+            for (a, n) in args {
+                match merged.last_mut() {
+                    Some(m) if a <= m.0 + m.1 + 4096 => m.1 = m.1.max(a + n - m.0),
+                    _ => merged.push((a, n)),
+                }
+            }
+            self.sync_reads(&merged);
+        }
+        let per = n / chunks;
+        let starts: Vec<u64> = (1..chunks).map(|i| ends[i * per - 1]).collect();
+        // The state at each chunk's start.
+        let mut st = self.chunk_state();
+        let mut states: Vec<Box<ChunkState>> = Vec::new();
+        let mut c = from;
+        for &s in &starts {
+            while c < s {
+                let h = f.rd(c);
+                if h >> 30 == 2 {
+                    c += 4;
+                    continue;
+                }
+                let count = (h >> 16) & 0x3FFF;
+                if count == 0x3FFF {
+                    c += 4;
+                    continue;
+                }
+                let n = count as u64 + 1;
+                let at = c;
+                Self::apply_state(&mut st, (h >> 8) & 0xFF, n, &|i: u64| f.rd(at + 4 * (1 + i)));
+                c += 4 * (n + 1);
+            }
+            states.push(Box::new(st.clone()));
+        }
+        let mut workers = Vec::new();
+        for i in 0..starts.len() {
+            match self.par_pool.worker(i, &self.name, self.compute) {
+                Some(w) => workers.push(w),
+                None => return,
+            }
+        }
+        self.drop_ahead();
+        for (i, (w, state)) in workers.iter().zip(states).enumerate() {
+            let to = if i + 1 < starts.len() { starts[i + 1] } else { run_end };
+            w.start(state, starts[i], to);
+        }
+        super::par::RUNS.fetch_add(1, Ordering::Relaxed);
+        super::par::CHUNKS.fetch_add(starts.len() as u64, Ordering::Relaxed);
+        self.par = Some(ParRun { starts, end: run_end, next: 0, workers });
+    }
+
+    /// The main command processor reached the next chunk of the parallel
+    /// run: its own work so far goes to the GPU, then the chunk's batches;
+    /// execution continues with the chunk's end state from its end, or from
+    /// the packet where the worker stopped. Returns where to continue.
+    fn par_collect(&mut self) -> u64 {
+        let (w, to) = {
+            let pr = self.par.as_mut().unwrap();
+            let i = pr.next;
+            pr.next += 1;
+            (pr.workers[i].clone(), if i + 1 < pr.starts.len() { pr.starts[i + 1] } else { pr.end })
+        };
+        if self.par.as_ref().is_some_and(|p| p.next == p.starts.len()) {
+            self.par = None;
+        }
+        self.submit_gpu("par");
+        let stopped = w.wait();
+        let (st, last) = {
+            let mut wcp = w.cp.lock();
+            let last = wcp.worker_submit();
+            (wcp.chunk_state(), last)
+        };
+        // This queue's later work and CP effects follow the chunk's batches
+        // (a label written after the run must wait for them).
+        if let (Some(seq), Some(e)) = (last, self.exec.as_mut()) {
+            e.depend_on(seq);
+        }
+        self.set_chunk_state(&st);
+        match stopped {
+            Some(s) => {
+                super::par::STOPS.fetch_add(1, Ordering::Relaxed);
+                s
+            }
+            None => to,
+        }
+    }
+
+    /// Abandons the parallel run in progress (execution left it): the
+    /// workers' batches are dropped, their chunks are executed here.
+    fn par_cancel(&mut self) {
+        let Some(pr) = self.par.take() else { return };
+        for w in &pr.workers[pr.next..] {
+            w.wait();
+            w.cp.lock().worker_discard();
+        }
+        super::par::CANCELLED.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The executing command's stage preparations made ahead ([vertex,
@@ -1158,6 +1574,17 @@ impl Cp {
         let mut end = addr + 4 * size as u64;
         let mut f = Fetched::new(addr, size);
         while cur < end {
+            // The next chunk of a parallel run: collected here.
+            if let Some(pr) = &self.par {
+                if pr.starts[pr.next] == cur {
+                    cur = self.par_collect();
+                    continue;
+                }
+                if cur > pr.starts[pr.next] {
+                    // Execution left the run's packets.
+                    self.par_cancel();
+                }
+            }
             if super::shutting_down() {
                 // Process shutdown releases label waits: the work behind
                 // them would run without its inputs. Nothing more runs.
@@ -1197,6 +1624,9 @@ impl Cp {
             if next > end + 4 * 0x4000 || !valid(cur, 4 * (n + 1)) {
                 crate::error!("gpu[{}]: packet {opcode:#x} at {cur:#x} overruns its buffer", self.name);
                 break;
+            }
+            if self.par.is_none() && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && !self.compute && self.exec.is_some() && super::par::workers() > 0 && !super::capture::capturing() {
+                self.par_plan(&f, cur, end);
             }
             PACKETS.fetch_add(1, Ordering::Relaxed);
             self.cur_packet = cur;
@@ -1269,7 +1699,9 @@ impl Cp {
                     s.cancel();
                 }
                 if self.ahead.is_empty() && matches!(flow, Flow::Next) && !f.live && self.exec.is_some() && super::ahead::enabled() {
-                    self.scan_ahead(&f, next, end);
+                    // Within a parallel run's first chunk, only to its end.
+                    let until = self.par.as_ref().map_or(end, |p| p.starts[p.next].min(end));
+                    self.scan_ahead(&f, next, until);
                 }
             }
             if self.exec.as_ref().is_some_and(|e| e.submit_requested()) {
@@ -1290,6 +1722,10 @@ impl Cp {
                 }
                 Flow::Stop => break,
             }
+        }
+        // A parallel run planned in this buffer ends in it.
+        if self.par.is_some() {
+            self.par_cancel();
         }
         self.depth -= 1;
         if self.depth == 0 {
