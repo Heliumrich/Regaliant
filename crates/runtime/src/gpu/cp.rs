@@ -120,6 +120,9 @@ pub struct Cp {
     scan_regs: (Vec<u32>, Vec<u32>),
     /// A parallel run in progress (`gpu::par`).
     par: Option<ParRun>,
+    /// The end of the last run the planner found too short (no new plan
+    /// until execution passes it: each command would scan the rest again).
+    par_skip: (u64, u64),
     /// This command processor's chunk workers.
     par_pool: super::par::Pool,
 }
@@ -608,6 +611,7 @@ impl Cp {
             cur_ahead: std::cell::RefCell::new([None, None]),
             scan_regs: (Vec::new(), Vec::new()),
             par: None,
+            par_skip: (0, 0),
             par_pool: super::par::Pool::new(),
         }
     }
@@ -832,6 +836,7 @@ impl Cp {
         let mut args: Vec<(u64, u64)> = Vec::new();
         let (mut draw_base, mut disp_base) = (self.draw_indirect_base, self.dispatch_indirect_base);
         let mut c = from;
+        let mut why = 0x130usize;
         let run_end = loop {
             if c >= end || !valid(c, 4) {
                 break c;
@@ -851,6 +856,7 @@ impl Cp {
                 continue;
             }
             if h & 1 != 0 {
+                why = 0x133;
                 break c;
             }
             let opc = (h >> 8) & 0xFF;
@@ -870,10 +876,12 @@ impl Cp {
                     _ => {}
                 }
                 if ends.len() >= PAR_MAX {
+                    why = 0x131;
                     break next;
                 }
             } else if opc == op::NOP {
                 if n >= 2 && p(0) == DS_MAGIC && !matches!(p(1), pop::PUSH_MARKER | pop::SET_MARKER | pop::POP_MARKER) {
+                    why = 0x100 + (p(1) as usize).min(0x2F);
                     break c;
                 }
             } else if opc == op::SET_BASE {
@@ -883,13 +891,17 @@ impl Cp {
                     draw_base = addr64(p(1), p(2));
                 }
             } else if !is_state(opc) {
+                why = opc as usize;
                 break c;
             }
             c = next;
         };
         let n = ends.len();
+        super::par::note_run(n, why);
         let chunks = (k + 1).min(n / PAR_CHUNK_MIN);
         if n < PAR_MIN || chunks < 2 {
+            // Not again before execution passes this run's end.
+            self.par_skip = (end, run_end);
             return;
         }
         // Pending fast clears are applied now (a worker cannot apply one at
@@ -1665,7 +1677,8 @@ impl Cp {
                 crate::error!("gpu[{}]: packet {opcode:#x} at {cur:#x} overruns its buffer", self.name);
                 break;
             }
-            if self.par.is_none() && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && !self.compute && self.exec.is_some() && super::par::workers() > 0 && !super::capture::capturing() {
+            let skip = self.par_skip.0 == end && cur < self.par_skip.1;
+            if self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && !self.compute && self.exec.is_some() && super::par::workers() > 0 && !super::capture::capturing() {
                 self.par_plan(&f, cur, end);
             }
             PACKETS.fetch_add(1, Ordering::Relaxed);

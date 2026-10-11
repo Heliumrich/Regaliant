@@ -1449,6 +1449,49 @@ static SHADER_TIME: Mutex<Option<HashMap<u64, [u64; 4]>>> = Mutex::new(None);
 /// GPU time between timed dispatches (draws, CP copies, barriers), ns.
 static GAP_NS: AtomicU64 = AtomicU64::new(0);
 
+/// Batch-start copies of a range already copied by another batch in the
+/// same frame (DS_PROFILE_GPU): [copies, bytes] first in the frame, then
+/// repeated; by size [<4 KiB, <64 KiB, <1 MiB, more] x [copies, bytes].
+static PRE_REPEAT: Mutex<(u64, Option<HashSet<(u64, u64)>>, [u64; 4], [[u64; 2]; 4])> = Mutex::new((u64::MAX, None, [0; 4], [[0; 2]; 4]));
+
+fn note_pre_repeat(base: u64, size: u64, n: u64) {
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    let mut g = PRE_REPEAT.lock();
+    if g.0 != frame {
+        g.0 = frame;
+        if let Some(s) = g.1.as_mut() {
+            s.clear();
+        }
+    }
+    let first = g.1.get_or_insert_with(HashSet::new).insert((base, size));
+    let k = if first { 0 } else { 2 };
+    g.2[k] += 1;
+    g.2[k + 1] += n;
+    let b = match n {
+        0..4096 => 0,
+        4096..65536 => 1,
+        65536..1048576 => 2,
+        _ => 3,
+    };
+    g.3[b][0] += 1;
+    g.3[b][1] += n;
+}
+
+fn pre_repeat_line() -> String {
+    let g = PRE_REPEAT.lock();
+    let mb = |b: u64| b as f64 / (1u64 << 20) as f64;
+    let sizes: Vec<String> = ["<4K", "<64K", "<1M", ">=1M"].iter().zip(g.3.iter()).map(|(n, x)| format!("{n} {} ({:.0} MiB)", x[0], mb(x[1]))).collect();
+    format!(
+        "    batch-start copies within a frame: first {} ({:.0} MiB), repeated {} ({:.0} MiB); by size {}
+",
+        g.2[0],
+        mb(g.2[1]),
+        g.2[2],
+        mb(g.2[3]),
+        sizes.join(", ")
+    )
+}
+
 /// Command-processor time per recorded command by phase (DS_PROFILE_GPU),
 /// ns: dispatches [prepare, waits + textures + pipeline, bindings, total,
 /// count], draws [prepare + shader-read waits, textures + targets +
@@ -1645,6 +1688,11 @@ pub fn reset_shader_profile() {
     *SHADER_PLACEMENTS.lock() = None;
     shaders::reset_repeats();
     *QUEUE_WAITS.lock() = None;
+    {
+        let mut g = PRE_REPEAT.lock();
+        g.2 = [0; 4];
+        g.3 = [[0; 2]; 4];
+    }
     for c in DRAW_STEPS.iter().chain(CS_STEPS.iter()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
@@ -1695,6 +1743,7 @@ pub fn shader_profile() -> String {
     }
     s.push_str(&phases_line("draw", &DRAW_PHASES, ["prepare and shader-read waits", "textures, targets, pipeline", "bindings"]));
     s.push_str(&draw_steps_line());
+    s.push_str(&pre_repeat_line());
     s.push_str(&sync_steps_line());
     s.push_str(&shaders::repeats_line());
     s.push_str(&phases_line("dispatch", &CS_PHASES, ["prepare and waits", "textures, pipeline", "bindings"]));
@@ -2361,6 +2410,9 @@ impl Exec {
         self.pres.insert((base, size), off);
         PRE_COPIES.fetch_add(1, Ordering::Relaxed);
         PRE_BYTES.fetch_add(n, Ordering::Relaxed);
+        if profiling() {
+            note_pre_repeat(base, size, n);
+        }
         Some((buf, off, bias))
     }
 

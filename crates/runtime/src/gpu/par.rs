@@ -52,6 +52,36 @@ pub static WAIT_NS: AtomicU64 = AtomicU64::new(0);
 pub static CANCELLED: AtomicU64 = AtomicU64::new(0);
 static STOP_WHY: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
 
+/// Runs the planner saw, by length (commands): [<32, <64, <192, <512,
+/// <2048, more] x [runs, commands]; and by what ended them (PM4 opcode,
+/// 0x100 + private operation, 0x130 buffer end, 0x131 limit, 0x133
+/// predicated) x [runs, commands].
+static LENGTHS: Mutex<[[u64; 2]; 6]> = Mutex::new([[0; 2]; 6]);
+static ENDS: Mutex<Vec<(usize, u64, u64)>> = Mutex::new(Vec::new());
+
+/// A run of `n` commands ended by `why` (planner statistics).
+pub fn note_run(n: usize, why: usize) {
+    let b = match n {
+        0..32 => 0,
+        32..64 => 1,
+        64..192 => 2,
+        192..512 => 3,
+        512..2048 => 4,
+        _ => 5,
+    };
+    let mut g = LENGTHS.lock();
+    g[b][0] += 1;
+    g[b][1] += n as u64;
+    let mut e = ENDS.lock();
+    match e.iter_mut().find(|x| x.0 == why) {
+        Some(x) => {
+            x.1 += 1;
+            x.2 += n as u64;
+        }
+        None => e.push((why, 1, n as u64)),
+    }
+}
+
 /// A chunk stopped early for `why`.
 pub fn note_stop(why: &'static str) {
     let mut g = STOP_WHY.lock();
@@ -168,19 +198,34 @@ impl Worker {
 /// One status line ("" before any parallel run).
 pub fn status() -> String {
     let runs = RUNS.load(Ordering::Relaxed);
-    if runs == 0 {
+    if runs == 0 && ENDS.lock().is_empty() {
         return String::new();
     }
+    let lengths = *LENGTHS.lock();
+    let names = ["<32", "<64", "<192", "<512", "<2048", ">=2048"];
+    let lens: Vec<String> = names.iter().zip(lengths.iter()).map(|(n, x)| format!("{n} {}/{}", x[0], x[1])).collect();
+    let mut ends = ENDS.lock().clone();
+    ends.sort_by(|a, b| b.2.cmp(&a.2));
+    let end_name = |w: usize| match w {
+        0x130 => "buffer end".to_string(),
+        0x131 => "limit".to_string(),
+        0x133 => "predicated".to_string(),
+        w if w >= 0x100 => format!("private {:#x}", w - 0x100),
+        w => format!("{w:#x}"),
+    };
+    let ends: Vec<String> = ends.iter().take(10).map(|(w, r, c)| format!("{} {r}/{c}", end_name(*w))).collect();
     let mut why = STOP_WHY.lock().clone();
     why.sort_by(|a, b| b.1.cmp(&a.1));
     let why: Vec<String> = why.iter().map(|(w, n)| format!("{w} {n}")).collect();
     format!(
-        "    parallel runs: {runs} runs, {} chunks to workers ({} commands), {} stopped early ({}), {} cancelled; main waited {} ms for workers\n",
+        "    parallel runs: {runs} runs, {} chunks to workers ({} commands), {} stopped early ({}), {} cancelled; main waited {} ms for workers; runs seen by length (runs/commands) {}; by end {}\n",
         CHUNKS.load(Ordering::Relaxed),
         COMMANDS.load(Ordering::Relaxed),
         STOPS.load(Ordering::Relaxed),
         why.join(", "),
         CANCELLED.load(Ordering::Relaxed),
-        WAIT_NS.load(Ordering::Relaxed) / 1_000_000
+        WAIT_NS.load(Ordering::Relaxed) / 1_000_000,
+        lens.join(", "),
+        ends.join(", ")
     )
 }
