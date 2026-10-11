@@ -1256,6 +1256,42 @@ fn completion_thread() {
 /// copy pending, under one image-cache lock (a lock per texture and per
 /// query took ~0.9 us per draw, run 20261011-135122).
 pub(crate) fn image_hazards(stages: &[&Prepared], extra: &[super::images::ImageKey]) -> (Vec<super::images::ImageKey>, bool) {
+    // This thread's memos first (no lock); the cache's lock only on a miss
+    // or when a fast clear or overwrite is pending somewhere.
+    let mut v: Vec<super::images::ImageKey> = extra.to_vec();
+    let mut missed = false;
+    'stages: for p in stages {
+        for (i, r) in p.resources.iter().enumerate() {
+            match r {
+                Resolved::Image(t) => {
+                    let storage = p.tr.plan.resources.get(i).is_some_and(|x| x.written);
+                    match super::images::key_hit(t, storage) {
+                        Some(k) => v.extend(k),
+                        None => {
+                            missed = true;
+                            break 'stages;
+                        }
+                    }
+                }
+                Resolved::ImageTable(e) => {
+                    for t in e.iter().flatten() {
+                        match super::images::key_hit(t, false) {
+                            Some(k) => v.extend(k),
+                            None => {
+                                missed = true;
+                                break 'stages;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if !missed {
+        let pending = (super::images::any_pending() && super::images::with(|im| im.clears_pending(&v) || im.overwrites_pending(&v))) || super::images::block_copies_possible(&v);
+        return (v, pending);
+    }
     super::images::with(|im| {
         let mut v: Vec<super::images::ImageKey> = extra.to_vec();
         for p in stages {
@@ -3370,6 +3406,44 @@ impl Exec {
             }
         }
         let frame = super::FRAMES.load(Ordering::Relaxed);
+        // Sampled images and samplers from this thread's memos when every
+        // one of them is there (no lock); else one image-cache lock for all.
+        let memo = {
+            let (mut imgs, mut images) = (Vec::new(), Vec::new());
+            let mut all = true;
+            for b in &p.tr.out.bindings {
+                match (b.kind, b.kind_resource().and_then(|i| p.resources.get(i))) {
+                    (BindingKind::Image(_), Some(Resolved::Image(t))) => match super::images::view_hit(t, frame) {
+                        Some((view, image)) => {
+                            imgs.push((b.binding, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }));
+                            images.push(image);
+                        }
+                        None => {
+                            all = false;
+                            break;
+                        }
+                    },
+                    (BindingKind::Sampler(i), Some(Resolved::Sampler(sm))) => match super::images::sampler_hit(*sm, p.tr.out.compare_samplers.contains(&i)) {
+                        Some(smp) => imgs.push((b.binding, vk::DescriptorType::SAMPLER, vk::DescriptorImageInfo { sampler: smp, image_view: vk::ImageView::null(), image_layout: vk::ImageLayout::UNDEFINED })),
+                        None => {
+                            all = false;
+                            break;
+                        }
+                    },
+                    (BindingKind::StorageImage(_) | BindingKind::ImageArray(_), _) => {
+                        all = false;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            all.then_some((imgs, images))
+        };
+        if let Some((imgs, images)) = memo {
+            bound.imgs = imgs;
+            bound.images = images;
+            return Ok(bound);
+        }
         // One image-cache lock for all the stage's images and samplers.
         let mut failed: Vec<String> = Vec::new();
         let r: Result<(), String> = super::images::with(|im| {

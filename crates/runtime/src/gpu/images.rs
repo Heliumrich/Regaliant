@@ -28,6 +28,140 @@ fn gpu_images_changed() {
     GPU_IMAGES_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// Fast clears and overwritten images pending (published at the end of
+/// every `with`): draws check them without the lock while both are 0.
+static PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether any fast clear or overwrite reload is pending.
+pub fn any_pending() -> bool {
+    PENDING.load(std::sync::atomic::Ordering::Acquire) != 0
+}
+
+type SurfaceKey = (u64, i32, u32, u32, u32, u32, bool, u32, u32, u64, u64, [u32; 2]);
+
+fn surface_key(s: &Surface) -> SurfaceKey {
+    (s.base, s.format.as_raw(), s.width, s.height, s.layers, s.levels, s.ty3d, s.mip, s.slice, s.stencil_base, s.meta, s.clear)
+}
+
+/// Per-thread memos of the lookups every draw repeats (the recording
+/// threads of a parallel run all wanted the cache's one lock, which made
+/// every draw step 1.5-2x slower with three workers). Keys, targets, depth
+/// growth and GPU-written bases hold while LOOKUP_GEN does (`gen`); views
+/// also need the frame and the tracker's generation (`view`'s refresh);
+/// samplers are never dropped.
+#[derive(Default)]
+struct Tls {
+    lookup_gen: u64,
+    keys: HashMap<([u32; 8], bool), Option<ImageKey>>,
+    targets: HashMap<SurfaceKey, Target>,
+    grows: HashMap<(u64, u32, u32, i32, u32), Option<ImageKey>>,
+    gpu_base: HashMap<u64, bool>,
+    views: HashMap<[u32; 8], (u64, u64, u64, vk::ImageView, vk::Image)>,
+    samplers: HashMap<([u32; 4], bool), vk::Sampler>,
+}
+
+thread_local! {
+    static TLS: std::cell::RefCell<Tls> = std::cell::RefCell::new(Tls::default());
+}
+
+/// `f` on this thread's memos, those valid for one LOOKUP_GEN emptied if
+/// it moved.
+fn tls<R>(f: impl FnOnce(&mut Tls) -> R) -> R {
+    TLS.with(|t| {
+        let mut t = t.borrow_mut();
+        let g = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
+        if t.lookup_gen != g {
+            t.lookup_gen = g;
+            t.keys.clear();
+            t.targets.clear();
+            t.grows.clear();
+            t.gpu_base.clear();
+        }
+        f(&mut t)
+    })
+}
+
+/// `Images::view` from this thread's memo (sampled views only).
+pub fn view_hit(t: &Tsharp, frame: u64) -> Option<(vk::ImageView, vk::Image)> {
+    let track = super::track::GEN.load(std::sync::atomic::Ordering::Acquire);
+    let lookup = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
+    tls(|m| m.views.get(&t.raw).filter(|e| e.0 == frame && e.1 == lookup && e.2 == track).map(|e| (e.3, e.4)))
+}
+
+/// `Images::sampler` from this thread's memo.
+pub fn sampler_hit(s: [u32; 4], compare: bool) -> Option<vk::Sampler> {
+    tls(|m| m.samplers.get(&(s, compare)).copied())
+}
+
+/// `Images::resolved_key` from this thread's memo (None: not memoized).
+pub fn key_hit(t: &Tsharp, storage: bool) -> Option<Option<ImageKey>> {
+    tls(|m| m.keys.get(&(t.raw, storage)).copied())
+}
+
+/// `Images::target`, from this thread's memo when it holds.
+pub fn target(s: &Surface) -> Result<Target, String> {
+    let k = surface_key(s);
+    if let Some(t) = tls(|m| m.targets.get(&k).copied()) {
+        return Ok(t);
+    }
+    let g = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
+    let t = with(|im| im.target(s))?;
+    tls(|m| {
+        if m.lookup_gen == g {
+            m.targets.insert(k, t);
+        }
+    });
+    Ok(t)
+}
+
+/// `Images::depth_to_grow`, from this thread's memo when it holds.
+pub fn depth_to_grow(base: u64, width: u32, height: u32, format: vk::Format, layers: u32) -> Option<ImageKey> {
+    let k = (base, width, height, format.as_raw(), layers);
+    if let Some(r) = tls(|m| m.grows.get(&k).copied()) {
+        return r;
+    }
+    let g = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
+    let r = with(|im| im.depth_to_grow(base, width, height, Images::depth_family(format), layers));
+    tls(|m| {
+        if m.lookup_gen == g {
+            m.grows.insert(k, r);
+        }
+    });
+    r
+}
+
+/// Whether block copies may be pending for `keys` (`block_copies_possible`
+/// from this thread's memo of GPU-written bases).
+pub fn block_copies_possible(keys: &[ImageKey]) -> bool {
+    let cands: Vec<u64> = keys.iter().filter(|k| is_compressed(k.format) && !k.ty3d).map(|k| k.base).collect();
+    if cands.is_empty() {
+        return false;
+    }
+    let known: Option<bool> = tls(|m| {
+        let mut any = false;
+        for b in &cands {
+            match m.gpu_base.get(b) {
+                Some(&x) => any |= x,
+                None => return None,
+            }
+        }
+        Some(any)
+    });
+    if let Some(x) = known {
+        return x;
+    }
+    let g = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
+    let flags: Vec<bool> = with(|im| cands.iter().map(|b| im.gpu_bases.contains(b)).collect());
+    tls(|m| {
+        if m.lookup_gen == g {
+            for (b, f) in cands.iter().zip(&flags) {
+                m.gpu_base.insert(*b, *f);
+            }
+        }
+    });
+    flags.iter().any(|&f| f)
+}
+
 /// Vulkan format of a gfx10 image FORMAT.
 pub fn vk_format(fmt: u16) -> Option<vk::Format> {
     use vk::Format as F;
@@ -561,7 +695,10 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
             *g = Some(Images { map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), retired: Vec::new(), depth_grows: 0 });
         }
     }
-    f(g.as_mut().unwrap())
+    let im = g.as_mut().unwrap();
+    let r = f(&mut *im);
+    PENDING.store((im.pending_clears.len() + im.pending_overwrites) as u64, std::sync::atomic::Ordering::Release);
+    r
 }
 
 impl Images {
@@ -1330,6 +1467,11 @@ impl Images {
             self.key_memo.clear();
         }
         self.key_memo.insert((t.raw, storage), (lookup, k));
+        tls(|m| {
+            if m.lookup_gen == lookup {
+                m.keys.insert((t.raw, storage), k);
+            }
+        });
         k
     }
 
@@ -1949,6 +2091,12 @@ impl Images {
             self.view_memo.clear();
         }
         self.view_memo.insert(t.raw, (frame, lookup, track, r.0, r.1));
+        tls(|m| {
+            if m.views.len() >= 1 << 16 {
+                m.views.clear();
+            }
+            m.views.insert(t.raw, (frame, lookup, track, r.0, r.1));
+        });
         Ok(r)
     }
 
@@ -2057,6 +2205,9 @@ impl Images {
     /// S# compare function applies only to those).
     pub fn sampler(&mut self, s: [u32; 4], compare_use: bool) -> Result<vk::Sampler, String> {
         if let Some(&v) = self.samplers.get(&(s, compare_use)) {
+            tls(|m| {
+                m.samplers.insert((s, compare_use), v);
+            });
             return Ok(v);
         }
         let b = |v: u32, lo: u32, n: u32| (v >> lo) & ((1 << n) - 1);
@@ -2107,6 +2258,9 @@ impl Images {
             .unnormalized_coordinates(false);
         let v = unsafe { ctx().device.create_sampler(&ci, None) }.map_err(|e| format!("sampler: {e}"))?;
         self.samplers.insert((s, compare_use), v);
+        tls(|m| {
+            m.samplers.insert((s, compare_use), v);
+        });
         Ok(v)
     }
 

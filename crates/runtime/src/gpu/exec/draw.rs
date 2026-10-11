@@ -588,7 +588,7 @@ impl Exec {
                     continue;
                 }
                 let Some(s) = color_surface(cp, i)? else { continue };
-                let t = images::with(|im| im.target(&s))?;
+                let t = images::target(&s)?;
                 if colors.iter().flatten().any(|c| c.view == t.view) {
                     self.report(format!("color target {:#x} bound to two MRT slots (second ignored)", s.base));
                     continue;
@@ -620,7 +620,7 @@ impl Exec {
             // A view of a later slice than the depth image has: grow it
             // (after the work that used it) instead of a separate image.
             let s = dsurf.as_ref().unwrap();
-            if let Some(old) = images::with(|im| im.depth_to_grow(s.base, s.width, s.height, images::Images::depth_family(s.format), s.layers)) {
+            if let Some(old) = images::depth_to_grow(s.base, s.width, s.height, s.format, s.layers) {
                 self.end_rendering();
                 self.flush_for("depth growth");
                 if self.stopped {
@@ -629,7 +629,7 @@ impl Exec {
                 images::with(|im| im.grow_depth(old, s.layers))?;
             }
         }
-        let depth = if z_test || s_test || clear_z || clear_s { Some(images::with(|im| im.target(dsurf.as_ref().unwrap()))?) } else { None };
+        let depth = if z_test || s_test || clear_z || clear_s { Some(images::target(dsurf.as_ref().unwrap())?) } else { None };
         lap.mark(6);
         let mem_writes = vs.tr.plan.resources.iter().any(|r| r.written) || ps.as_ref().is_some_and(|p| p.tr.plan.resources.iter().any(|r| r.written));
         if colors.iter().all(Option::is_none) && !z_write && !s_write && !clear_z && !clear_s && !mem_writes {
