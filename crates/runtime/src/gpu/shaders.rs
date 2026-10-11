@@ -806,8 +806,12 @@ fn read_words(reads: &[(u64, u64)], out: &mut Vec<u32>) -> bool {
 }
 
 fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32], spec: &mut Spec) -> Result<Prepared, String> {
-    // Diagnostics: the inputs that would key a cached preparation.
-    let repeat_key = super::exec::profiling_on().then(|| {
+    // Diagnostics (DS_PROFILE_GPU with DS_PROFILE_REPEATS=1: hashing every
+    // word read and a global set per preparation inflate the prepare times
+    // the profile reports): the inputs that would key a cached preparation.
+    static REPEAT_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let repeat_stats = *REPEAT_STATS.get_or_init(|| std::env::var("DS_PROFILE_REPEATS").ok().as_deref() == Some("1"));
+    let repeat_key = (repeat_stats && super::exec::profiling_on()).then(|| {
         let mut h = super::fx::FxHasher::default();
         h.write_u64(addr);
         h.write_u64(code_hash);

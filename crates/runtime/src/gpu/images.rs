@@ -1181,6 +1181,12 @@ impl Images {
     /// whose size is the block grid. Images here do not share memory, so the
     /// blocks are copied into the texture (size-compatible formats) once per
     /// write generation. Mips with partial blocks are left out.
+    /// Whether `take_block_copies` may find something for `keys`
+    /// (block-compressed images whose guest base GPU work wrote).
+    pub fn block_copies_possible(&self, keys: &[ImageKey]) -> bool {
+        !self.gpu_bases.is_empty() && keys.iter().any(|k| is_compressed(k.format) && !k.ty3d && self.gpu_bases.contains(&k.base))
+    }
+
     pub fn take_block_copies(&mut self, keys: &[ImageKey]) -> Vec<BlockCopy> {
         let mut out: Vec<BlockCopy> = Vec::new();
         for k in keys {

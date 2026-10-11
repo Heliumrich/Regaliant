@@ -7,14 +7,57 @@
 use std::collections::BTreeMap;
 
 /// Union of half-open ranges [start, end), kept disjoint and coalesced.
+///
+/// A filter of the 64 KiB pages it covers (1024 bits, hashed; ranges over
+/// FILTER_BIG_PAGES pages counted apart) answers most overlap tests without
+/// the ordered lookup: the command processors test ~15-40 descriptor and
+/// constant reads per draw against the writes of the batch being recorded
+/// (~0.5 us per test with lookups, run 20261011-135920). Removals leave
+/// their bits (a stale bit only costs a lookup).
 #[derive(Default, Clone, Debug)]
 pub struct Ranges {
     by_start: BTreeMap<u64, u64>,
+    filter: [u64; 16],
+    big: u32,
+}
+
+const FILTER_SHIFT: u32 = 16;
+const FILTER_BIG_PAGES: u64 = 64;
+
+fn filter_bit(page: u64) -> usize {
+    (page.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - 10)) as usize
 }
 
 impl Ranges {
     pub const fn new() -> Ranges {
-        Ranges { by_start: BTreeMap::new() }
+        Ranges { by_start: BTreeMap::new(), filter: [0; 16], big: 0 }
+    }
+
+    fn filter_add(&mut self, a: u64, n: u64) {
+        let (first, last) = (a >> FILTER_SHIFT, (a.saturating_add(n) - 1) >> FILTER_SHIFT);
+        if last - first >= FILTER_BIG_PAGES {
+            self.big += 1;
+            return;
+        }
+        for page in first..=last {
+            let b = filter_bit(page);
+            self.filter[b / 64] |= 1 << (b % 64);
+        }
+    }
+
+    /// False when [a, a + n) certainly does not overlap.
+    fn filter_may(&self, a: u64, n: u64) -> bool {
+        if self.big > 0 {
+            return true;
+        }
+        let (first, last) = (a >> FILTER_SHIFT, (a.saturating_add(n) - 1) >> FILTER_SHIFT);
+        if last - first >= FILTER_BIG_PAGES {
+            return true;
+        }
+        (first..=last).any(|page| {
+            let b = filter_bit(page);
+            self.filter[b / 64] & (1 << (b % 64)) != 0
+        })
     }
 
     /// Adds [a, a + n).
@@ -22,6 +65,7 @@ impl Ranges {
         if n == 0 {
             return;
         }
+        self.filter_add(a, n);
         let mut start = a;
         let mut end = a.saturating_add(n);
         // A predecessor that overlaps or touches absorbs the new range.
@@ -44,7 +88,7 @@ impl Ranges {
 
     /// Whether [a, a + n) overlaps the union.
     pub fn overlaps(&self, a: u64, n: u64) -> bool {
-        if n == 0 {
+        if n == 0 || self.by_start.is_empty() || !self.filter_may(a, n) {
             return false;
         }
         let end = a.saturating_add(n);
@@ -62,6 +106,8 @@ impl Ranges {
 
     pub fn clear(&mut self) {
         self.by_start.clear();
+        self.filter = [0; 16];
+        self.big = 0;
     }
 
     /// Number of disjoint ranges.
@@ -110,27 +156,90 @@ impl Ranges {
     }
 }
 
+/// Pages of the summary (64 KiB) and its buckets (hashed pages).
+const SUMMARY_SHIFT: u32 = 16;
+const SUMMARY_BUCKETS: usize = 1 << 14;
+/// Ranges over this many pages are kept exactly instead (`big`): the
+/// unbounded pointer windows (up to 256 MiB) would mark a quarter of the
+/// buckets.
+const BIG_PAGES: u64 = 64;
+
+fn summary_bucket(page: u64) -> usize {
+    (page.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - 14)) as usize
+}
+
 /// Written ranges by batch sequence number: the latest batch that writes
 /// into a range, for batches that have not completed.
+///
+/// A summary answers most lookups without the per-batch search (a draw's
+/// ~20-40 descriptor and constant reads against every unfinished batch of
+/// its queue: ~0.7 us per check, run 20261011-135122): per bucket of pages
+/// the latest batch that writes into one of them, and the large ranges
+/// exactly. Neither is lowered when batches complete: a value at or below
+/// `done` simply no longer counts.
 #[derive(Default, Debug)]
 pub struct SeqRanges {
     by_seq: BTreeMap<u64, Ranges>,
+    summary: Vec<u64>,
+    big: Vec<(u64, u64, u64)>,
 }
 
 impl SeqRanges {
     pub const fn new() -> SeqRanges {
-        SeqRanges { by_seq: BTreeMap::new() }
+        SeqRanges { by_seq: BTreeMap::new(), summary: Vec::new(), big: Vec::new() }
+    }
+
+    fn summarize(&mut self, seq: u64, a: u64, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let end = a.saturating_add(n);
+        let (first, last) = (a >> SUMMARY_SHIFT, (end - 1) >> SUMMARY_SHIFT);
+        if last - first >= BIG_PAGES {
+            self.big.push((a, end, seq));
+            return;
+        }
+        if self.summary.is_empty() {
+            self.summary = vec![0; SUMMARY_BUCKETS];
+        }
+        for page in first..=last {
+            let b = &mut self.summary[summary_bucket(page)];
+            *b = (*b).max(seq);
+        }
+    }
+
+    /// Whether some batch after `done` may write into one of `reads`
+    /// (false: certainly none).
+    pub fn may_overlap(&self, reads: &[(u64, u64)], done: u64) -> bool {
+        reads.iter().any(|&(a, n)| {
+            if n == 0 {
+                return false;
+            }
+            let end = a.saturating_add(n);
+            if self.big.iter().any(|&(s, e, q)| q > done && s < end && a < e) {
+                return true;
+            }
+            let (first, last) = (a >> SUMMARY_SHIFT, (end - 1) >> SUMMARY_SHIFT);
+            if last - first >= BIG_PAGES {
+                return true;
+            }
+            !self.summary.is_empty() && (first..=last).any(|page| self.summary[summary_bucket(page)] > done)
+        })
     }
 
     pub fn insert(&mut self, seq: u64, a: u64, n: u64) {
         if n != 0 {
             self.by_seq.entry(seq).or_default().insert(a, n);
+            self.summarize(seq, a, n);
         }
     }
 
     pub fn insert_all(&mut self, seq: u64, r: &Ranges) {
         if !r.is_empty() {
             self.by_seq.entry(seq).or_default().extend(r);
+            for (a, n) in r.iter() {
+                self.summarize(seq, a, n);
+            }
         }
     }
 
@@ -142,10 +251,16 @@ impl SeqRanges {
             }
             self.by_seq.pop_first();
         }
+        if self.big.iter().any(|&(_, _, q)| q <= done) {
+            self.big.retain(|&(_, _, q)| q > done);
+        }
     }
 
     /// The latest batch after `done` that writes into any of `reads`.
     pub fn latest(&self, reads: &[(u64, u64)], done: u64) -> Option<u64> {
+        if !self.may_overlap(reads, done) {
+            return None;
+        }
         for (&s, r) in self.by_seq.iter().rev() {
             if s <= done {
                 break;
@@ -159,11 +274,36 @@ impl SeqRanges {
 
     pub fn clear(&mut self) {
         self.by_seq.clear();
+        self.summary.clear();
+        self.big.clear();
     }
 
     /// Total disjoint ranges over all batches (diagnostics).
     pub fn ranges(&self) -> usize {
         self.by_seq.values().map(Ranges::len).sum()
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    /// The summary never hides a write of an unfinished batch.
+    #[test]
+    fn summary_keeps_every_unfinished_write() {
+        let mut s = SeqRanges::new();
+        s.insert(5, 0x1_0000_0000, 0x100);
+        s.insert(6, 0x2_0000_0000, 0x1000_0000); // big: 256 MiB
+        assert_eq!(s.latest(&[(0x1_0000_0080, 4)], 0), Some(5));
+        assert_eq!(s.latest(&[(0x2_0800_0000, 4)], 0), Some(6));
+        assert_eq!(s.latest(&[(0x3_0000_0000, 4)], 0), None);
+        // Completed batches no longer count.
+        s.prune(5);
+        assert_eq!(s.latest(&[(0x1_0000_0080, 4)], 5), None);
+        assert_eq!(s.latest(&[(0x2_0800_0000, 4)], 5), Some(6));
+        s.prune(6);
+        assert_eq!(s.latest(&[(0x2_0800_0000, 4)], 6), None);
+        assert!(s.big.is_empty());
     }
 }
 

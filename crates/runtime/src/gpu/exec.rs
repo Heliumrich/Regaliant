@@ -1033,6 +1033,8 @@ static BATCHES_CV: parking_lot::Condvar = parking_lot::Condvar::new();
 static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
 /// Highest completed sequence number (all earlier ones completed too).
 static DONE: Mutex<u64> = Mutex::new(0);
+/// DONE without its lock (every CP read check asks for it).
+static DONE_ATOMIC: AtomicU64 = AtomicU64::new(0);
 /// When the completion thread finished the last batch (profiling: GPU
 /// starvation, see `STARVED`).
 static LAST_DONE_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -1044,7 +1046,7 @@ static STARVED: Mutex<Option<HashMap<String, [u64; 3]>>> = Mutex::new(None);
 static DONE_CV: parking_lot::Condvar = parking_lot::Condvar::new();
 
 fn done_seq() -> u64 {
-    *DONE.lock()
+    DONE_ATOMIC.load(Ordering::Acquire)
 }
 
 /// Highest completed batch sequence (all earlier ones completed too).
@@ -1060,17 +1062,64 @@ pub fn completed_seq() -> u64 {
 struct RangeLog {
     log: Mutex<super::ranges::SeqRanges>,
     latest_seq: AtomicU64,
+    /// Per bucket of 64 KiB guest pages (hashed), the latest batch that
+    /// writes into one of them: a lookup whose pages' buckets all hold
+    /// completed batches is answered without the log's lock (the command
+    /// processors check every draw's descriptor reads; ~1.75 us per draw
+    /// with the lock, run 20261011-133502). Never lowered: completion
+    /// clears a bucket implicitly (its batch <= done).
+    pages: [AtomicU64; PAGE_BUCKETS],
+}
+
+const PAGE_BUCKETS: usize = 1 << 16;
+const PAGE_SHIFT: u32 = 16;
+
+fn page_bucket(page: u64) -> usize {
+    (page.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - 16)) as usize
 }
 
 impl RangeLog {
     const fn new() -> RangeLog {
-        RangeLog { log: Mutex::new(super::ranges::SeqRanges::new()), latest_seq: AtomicU64::new(0) }
+        RangeLog { log: Mutex::new(super::ranges::SeqRanges::new()), latest_seq: AtomicU64::new(0), pages: [const { AtomicU64::new(0) }; PAGE_BUCKETS] }
+    }
+
+    /// Marks the page buckets of [a, a+n) as written by batch `seq`.
+    fn mark_pages(&self, seq: u64, a: u64, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let (first, last) = (a >> PAGE_SHIFT, (a + n - 1) >> PAGE_SHIFT);
+        if last - first >= PAGE_BUCKETS as u64 {
+            for b in self.pages.iter() {
+                b.fetch_max(seq, Ordering::SeqCst);
+            }
+            return;
+        }
+        for p in first..=last {
+            self.pages[page_bucket(p)].fetch_max(seq, Ordering::SeqCst);
+        }
+    }
+
+    /// Whether some unfinished batch may write into one of `reads` (false:
+    /// certainly none).
+    fn may_overlap(&self, reads: &[(u64, u64)], done: u64) -> bool {
+        reads.iter().any(|&(a, n)| {
+            if n == 0 {
+                return false;
+            }
+            let (first, last) = (a >> PAGE_SHIFT, (a + n - 1) >> PAGE_SHIFT);
+            if last - first >= 64 {
+                return true;
+            }
+            (first..=last).any(|p| self.pages[page_bucket(p)].load(Ordering::SeqCst) > done)
+        })
     }
 
     fn note(&self, seq: u64, w: (u64, u64)) {
         if w.1 == 0 {
             return;
         }
+        self.mark_pages(seq, w.0, w.1);
         self.latest_seq.fetch_max(seq, Ordering::SeqCst);
         let done = done_seq();
         let mut g = self.log.lock();
@@ -1083,6 +1132,9 @@ impl RangeLog {
         if writes.is_empty() {
             return;
         }
+        for (a, n) in writes.iter() {
+            self.mark_pages(seq, a, n);
+        }
         self.latest_seq.fetch_max(seq, Ordering::SeqCst);
         let done = done_seq();
         let mut g = self.log.lock();
@@ -1093,7 +1145,7 @@ impl RangeLog {
     /// The latest unfinished batch that writes into `reads`.
     fn latest(&self, reads: &[(u64, u64)]) -> Option<u64> {
         let done = done_seq();
-        if self.latest_seq.load(Ordering::SeqCst) <= done {
+        if self.latest_seq.load(Ordering::SeqCst) <= done || !self.may_overlap(reads, done) {
             return None;
         }
         self.log.lock().latest(reads, done)
@@ -1189,10 +1241,46 @@ fn completion_thread() {
             }
             verify::run(&b.name, ch);
         }
-        *DONE.lock() = b.seq;
+        {
+            let mut d = DONE.lock();
+            *d = b.seq;
+            DONE_ATOMIC.store(b.seq, Ordering::Release);
+        }
         *LAST_DONE_AT.lock() = Some(std::time::Instant::now());
         DONE_CV.notify_all();
     }
+}
+
+/// A draw's image keys (`extra`: its attachments, then every texture of
+/// `stages`) and whether one of them may have a fast clear, reload or block
+/// copy pending, under one image-cache lock (a lock per texture and per
+/// query took ~0.9 us per draw, run 20261011-135122).
+pub(crate) fn image_hazards(stages: &[&Prepared], extra: &[super::images::ImageKey]) -> (Vec<super::images::ImageKey>, bool) {
+    super::images::with(|im| {
+        let mut v: Vec<super::images::ImageKey> = extra.to_vec();
+        for p in stages {
+            for (i, r) in p.resources.iter().enumerate() {
+                match r {
+                    Resolved::Image(t) => {
+                        let storage = p.tr.plan.resources.get(i).is_some_and(|x| x.written);
+                        if let Some(k) = im.resolved_key(t, storage) {
+                            v.push(k);
+                        }
+                    }
+                    Resolved::ImageTable(e) => {
+                        for t in e.iter().flatten() {
+                            if let Some(k) = im.resolved_key(t, false) {
+                                v.push(k);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let pending = im.clears_pending(&v) || im.overwrites_pending(&v) || im.block_copies_possible(&v);
+        (v, pending)
+    })
 }
 
 /// Image cache keys of the images a prepared stage binds (fast-clear checks).
@@ -1343,6 +1431,14 @@ fn profiling() -> bool {
     *ON.get_or_init(|| std::env::var("DS_PROFILE_GPU").ok().as_deref() == Some("1"))
 }
 
+/// Per-command GPU timestamps (DS_PROFILE_GPU=1; `DS_PROFILE_GPU_STAMPS=0`
+/// keeps only the batch ones): BOTTOM_OF_PIPE stamps around every draw and
+/// dispatch serialize the GPU, which inflates the time of small commands.
+pub(super) fn command_stamps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_PROFILE_GPU_STAMPS").ok().as_deref() != Some("0"))
+}
+
 /// Timestamps per timed dispatch (all BOTTOM_OF_PIPE): before the shadow
 /// copies in, before the dispatch, after it, after the copies out.
 const STAMPS: u32 = 4;
@@ -1381,6 +1477,92 @@ fn phases_line(what: &str, table: &[AtomicU64; 5], names: [&str; 3]) -> String {
     )
 }
 
+/// Finer command-processor time per draw (DS_PROFILE_GPU), ns per step of
+/// `DRAW_STEP_NAMES`; the count is DRAW_PHASES[4].
+pub(super) static DRAW_STEPS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+pub(super) const DRAW_STEP_NAMES: [&str; 18] = [
+    "vs prepare", "ps prepare", "shader-read sync", "texture sync", "indices", "color targets", "depth target", "pipeline",
+    "image hazards", "reserve", "bind vs", "bind ps", "set alloc", "set write", "rendering instance", "dynamic state",
+    "index and draw", "write tracking",
+];
+
+/// Lap timer of a draw's steps (profiling only).
+pub(super) struct Laps {
+    last: Option<std::time::Instant>,
+}
+
+impl Laps {
+    pub(super) fn new() -> Laps {
+        Laps { last: profiling().then(std::time::Instant::now) }
+    }
+    /// Adds the time since the last mark to step `k`.
+    pub(super) fn mark(&mut self, k: usize) {
+        if let Some(t) = self.last {
+            let now = std::time::Instant::now();
+            DRAW_STEPS[k].fetch_add((now - t).as_nanos() as u64, Ordering::Relaxed);
+            self.last = Some(now);
+        }
+    }
+}
+
+/// Command-processor waits for GPU work (all queues): [ns, count] of read
+/// checks that waited (CP reads of GPU-written memory), then of batch-slot
+/// reuse (the slot's previous batch still running).
+pub(super) static WAIT_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// The same per queue: name -> [read-check ns, count, slot ns, count].
+static QUEUE_WAITS: Mutex<Option<HashMap<String, [u64; 4]>>> = Mutex::new(None);
+
+fn note_queue_wait(queue: &str, kind: usize, d: std::time::Duration) {
+    let mut g = QUEUE_WAITS.lock();
+    let e = g.get_or_insert_with(HashMap::new).entry(queue.to_string()).or_insert([0; 4]);
+    e[2 * kind] += d.as_nanos() as u64;
+    e[2 * kind + 1] += 1;
+}
+
+/// CP read checks (`sync_for_reads`, DS_PROFILE_GPU): ns in [home staleness,
+/// this queue's writes, other queues' writes], then [_, checks, ranges].
+pub(super) static SYNC_STEPS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+fn sync_steps_line() -> String {
+    let w: Vec<u64> = WAIT_NS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let waits = format!(
+        "    command-processor waits: {} read checks waited {} ms ({:.2} ms each), {} batch-slot reuses waited {} ms ({:.2} ms each)\n",
+        w[1],
+        w[0] / 1_000_000,
+        w[0] as f64 / w[1].max(1) as f64 / 1e6,
+        w[3],
+        w[2] / 1_000_000,
+        w[2] as f64 / w[3].max(1) as f64 / 1e6
+    );
+    let per_queue = {
+        let g = QUEUE_WAITS.lock();
+        let mut v: Vec<(String, [u64; 4])> = g.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect()).unwrap_or_default();
+        v.sort_by(|a, b| (b.1[0] + b.1[2]).cmp(&(a.1[0] + a.1[2])));
+        let parts: Vec<String> = v.iter().map(|(q, w)| format!("{q} reads {} ms ({}), slots {} ms ({})", w[0] / 1_000_000, w[1], w[2] / 1_000_000, w[3])).collect();
+        format!("    command-processor waits by queue: {}\n", parts.join("; "))
+    };
+    waits + &per_queue + &sync_steps_line_inner()
+}
+
+fn sync_steps_line_inner() -> String {
+    let n = SYNC_STEPS[4].load(Ordering::Relaxed).max(1);
+    let us = |k: usize| SYNC_STEPS[k].load(Ordering::Relaxed) as f64 / n as f64 / 1000.0;
+    format!(
+        "    CP read checks: {} ({:.1} ranges each; us each: homes {:.2}, this queue's writes {:.2}, other queues' writes {:.2})\n",
+        SYNC_STEPS[4].load(Ordering::Relaxed),
+        SYNC_STEPS[5].load(Ordering::Relaxed) as f64 / n as f64,
+        us(0),
+        us(1),
+        us(2)
+    )
+}
+
+fn draw_steps_line() -> String {
+    let n = DRAW_PHASES[4].load(Ordering::Relaxed).max(1);
+    let parts: Vec<String> = DRAW_STEP_NAMES.iter().zip(DRAW_STEPS.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
+    format!("    command processor per draw by step (us): {}\n", parts.join(", "))
+}
+
 /// GPU time inside batches (first to last command), ns.
 static BATCH_NS: AtomicU64 = AtomicU64::new(0);
 /// GPU idle time between consecutive batches (one Vulkan queue runs them in
@@ -1416,7 +1598,7 @@ fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str) {
         PRE_NS.fetch_add((pre[1].saturating_sub(pre[0]) as f64 * c.limits.timestamp_period as f64) as u64, Ordering::Relaxed);
     }
     let n = (shaders.len() as u32).min(MAX_TIMED);
-    if n == 0 {
+    if n == 0 || !command_stamps() {
         return;
     }
     let mut data = vec![0u64; (STAMPS * n) as usize];
@@ -1448,6 +1630,10 @@ pub fn reset_shader_profile() {
     }
     *SHADER_PLACEMENTS.lock() = None;
     shaders::reset_repeats();
+    *QUEUE_WAITS.lock() = None;
+    for c in DRAW_STEPS.iter().chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()) {
+        c.store(0, Ordering::Relaxed);
+    }
     for c in CS_PHASES.iter().chain(DRAW_PHASES.iter()) {
         c.store(0, Ordering::Relaxed);
     }
@@ -1465,7 +1651,14 @@ pub fn reset_shader_profile() {
 /// Shaders by total GPU time.
 pub fn shader_profile() -> String {
     let g = SHADER_TIME.lock();
-    let Some(m) = g.as_ref() else { return String::new() };
+    // Without per-command stamps (`command_stamps`) the map stays empty;
+    // the batch times, idle gaps and CP statistics are still reported.
+    let empty = HashMap::new();
+    let m = match g.as_ref() {
+        Some(m) => m,
+        None if profiling() => &empty,
+        None => return String::new(),
+    };
     let mut v: Vec<(&u64, &[u64; 4])> = m.iter().collect();
     v.sort_by(|a, b| (b.1[1] + b.1[2] + b.1[3]).cmp(&(a.1[1] + a.1[2] + a.1[3])));
     let tot = |k: usize, draws: bool| m.iter().filter(|(a, _)| (**a & DRAW_KEY != 0) == draws).map(|(_, x)| x[k]).sum::<u64>() / 1_000_000;
@@ -1487,6 +1680,8 @@ pub fn shader_profile() -> String {
         s.push_str(&format!("    gpu idle between batches {} ms, before batches of: {}\n", total / 1_000_000, list.join(", ")));
     }
     s.push_str(&phases_line("draw", &DRAW_PHASES, ["prepare and shader-read waits", "textures, targets, pipeline", "bindings"]));
+    s.push_str(&draw_steps_line());
+    s.push_str(&sync_steps_line());
     s.push_str(&shaders::repeats_line());
     s.push_str(&phases_line("dispatch", &CS_PHASES, ["prepare and waits", "textures, pipeline", "bindings"]));
     {
@@ -1583,6 +1778,9 @@ pub struct Exec {
     batch_shaders: Vec<u64>,
     /// Active dynamic-rendering instance (draws).
     rendering: Option<draw::Rendering>,
+    /// Graphics state recorded in the current command buffer (draws skip
+    /// the calls that would set the same values again).
+    dyncache: draw::DynCache,
     /// Descriptor pool usage of the recording slot (see POOL_LIMITS).
     pool_use: [u32; 5],
     /// Shadow space used in the recording slot.
@@ -1640,6 +1838,7 @@ impl Exec {
                 name: name.to_string(),
                 batch_shaders: Vec::new(),
                 rendering: None,
+                dyncache: Default::default(),
                 pool_use: [0; 5],
                 shadow_used: 0,
                 resident: Vec::new(),
@@ -1683,6 +1882,13 @@ impl Exec {
         // The slot's previous batch must have completed before reuse.
         let slot = &self.slots[self.cur];
         if slot.seq != 0 {
+            if slot.seq > done_seq() {
+                let t = std::time::Instant::now();
+                wait_done(slot.seq);
+                WAIT_NS[2].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                WAIT_NS[3].fetch_add(1, Ordering::Relaxed);
+                note_queue_wait(&self.name, 1, t.elapsed());
+            }
             wait_done(slot.seq);
             let c = ctx();
             if done_seq() < slot.seq {
@@ -1714,6 +1920,7 @@ impl Exec {
             unsafe { ctx().device.cmd_write_timestamp(self.cmd(), vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED) };
         }
         self.recording = true;
+        self.dyncache = Default::default();
         self.begun_at = std::time::Instant::now();
         self.pool_use = [0; 5];
         self.shadow_used = 0;
@@ -2350,6 +2557,9 @@ impl Exec {
         let t0 = std::time::Instant::now();
         let w = self.sync_for_reads(reads);
         if w {
+            WAIT_NS[0].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            WAIT_NS[1].fetch_add(1, Ordering::Relaxed);
+            note_queue_wait(&self.name, 0, t0.elapsed());
             SYNC_WHY[why.min(SYNC_WHY.len() - 1)].fetch_add(1, Ordering::Relaxed);
             if let Some(((a, n), src)) = culprit {
                 self.sync_culprit = Some((a, n));
@@ -2378,6 +2588,20 @@ impl Exec {
 
     pub fn sync_for_reads(&mut self, reads: &[(u64, u64)]) -> bool {
         let mut waited = false;
+        let prof = profiling();
+        let t0 = prof.then(std::time::Instant::now);
+        if prof {
+            SYNC_STEPS[4].fetch_add(1, Ordering::Relaxed);
+            SYNC_STEPS[5].fetch_add(reads.len() as u64, Ordering::Relaxed);
+        }
+        let lap = |k: usize, t: &mut Option<std::time::Instant>| {
+            if let Some(t0) = t {
+                let now = std::time::Instant::now();
+                SYNC_STEPS[k].fetch_add((now - *t0).as_nanos() as u64, Ordering::Relaxed);
+                *t = Some(now);
+            }
+        };
+        let mut t = t0;
         if super::homes::any_stale(reads) {
             // GPU work wrote these parts in video memory: copied back (after
             // all earlier submitted work) before the CPU reads them.
@@ -2385,10 +2609,12 @@ impl Exec {
             self.flush();
             waited = true;
         }
+        lap(0, &mut t);
         if self.overlaps_pending(reads) {
             self.flush();
             waited = true;
         }
+        lap(1, &mut t);
         if let Some(s) = INFLIGHT.latest(reads) {
             if s > done_seq() {
                 FOREIGN_WAITS.fetch_add(1, Ordering::Relaxed);
@@ -2396,6 +2622,7 @@ impl Exec {
                 waited = true;
             }
         }
+        lap(2, &mut t);
         waited
     }
 
@@ -3043,7 +3270,7 @@ impl Exec {
         let ti = self.batch_shaders.len() as u32;
         let stamp_cmd = self.cmd();
         let stamp = |k: u32| {
-            if qp != vk::QueryPool::null() && ti < MAX_TIMED {
+            if qp != vk::QueryPool::null() && ti < MAX_TIMED && command_stamps() {
                 unsafe { ctx().device.cmd_write_timestamp(stamp_cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * ti + k) };
             }
         };

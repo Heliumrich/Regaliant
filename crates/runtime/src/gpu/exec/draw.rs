@@ -18,6 +18,37 @@ pub static DRAW_SKIPPED: AtomicU64 = AtomicU64::new(0);
 const MAX_RT: usize = 8;
 
 /// Active dynamic-rendering instance of an executor.
+/// Dynamic graphics state recorded in the current command buffer: per
+/// state its value plus one (0: not recorded yet), the bound pipeline, the
+/// viewport, scissor, depth bias and blend constants (all of them as bits).
+/// A new command buffer starts with nothing recorded; only draws record
+/// graphics state, and every graphics pipeline makes the same states
+/// dynamic. Re-setting unchanged state cost ~1.2 us per draw (~25 calls, run
+/// 20261011-133502).
+#[derive(Default)]
+pub(crate) struct DynCache {
+    words: [u64; DYN_SLOTS],
+    pipeline: vk::Pipeline,
+    viewport: Option<[u32; 6]>,
+    scissor: Option<[i32; 4]>,
+    bias: Option<[u32; 3]>,
+    blend: Option<[u32; 4]>,
+}
+
+const DYN_SLOTS: usize = 22;
+
+impl DynCache {
+    /// Whether state `slot` must be recorded with value `v` (and notes it).
+    fn set(&mut self, slot: usize, v: u64) -> bool {
+        let w = v.wrapping_add(1);
+        if self.words[slot] == w {
+            return false;
+        }
+        self.words[slot] = w;
+        true
+    }
+}
+
 pub(super) struct Rendering {
     pub colors: [Option<Target>; MAX_RT],
     pub depth: Option<Target>,
@@ -440,6 +471,7 @@ impl Exec {
             return Ok(false);
         }
         let t0 = std::time::Instant::now();
+        let mut lap = super::Laps::new();
         let reg = |r: u32| ctx_reg(cp, r);
         // CB_COLOR_CONTROL.MODE: 0 color disabled, 1 normal; others are
         // metadata passes (fast-clear eliminate, FMASK/DCC decompress, resolve)
@@ -477,13 +509,13 @@ impl Exec {
         // Shader stages.
         let ps_addr = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
         let mut vs = shaders::prepare_ngg(cp)?;
+        lap.mark(0);
         let mut ps = if ps_addr != 0 { Some(shaders::prepare_ps(cp)?) } else { None };
-        let mut reads: Vec<(u64, u64)> = vs.reads.clone();
-        if let Some(p) = &ps {
-            reads.extend_from_slice(&p.reads);
-        }
+        lap.mark(1);
         self.sync_readers = [vs.addr, ps.as_ref().map_or(0, |p| p.addr)];
-        if self.sync_for(&reads, SYNC_DRAW_READS) {
+        // Each stage's reads in place (no combined copy per draw).
+        let waited = self.sync_for(&vs.reads, SYNC_DRAW_READS) | ps.as_ref().is_some_and(|p| self.sync_for(&p.reads, SYNC_DRAW_READS));
+        if waited {
             if let Some(c) = self.sync_culprit.take() {
                 let mut st: Vec<&Prepared> = vec![&vs];
                 if let Some(p) = &ps {
@@ -494,12 +526,14 @@ impl Exec {
             vs = shaders::prepare_ngg(cp)?;
             ps = if ps_addr != 0 { Some(shaders::prepare_ps(cp)?) } else { None };
         }
+        lap.mark(2);
         let t_prep = t0.elapsed();
         let mut textures = texture_ranges(&vs);
         if let Some(p) = &ps {
             textures.extend(texture_ranges(p));
         }
         self.sync_textures(&textures, SYNC_DRAW_TEXTURES);
+        lap.mark(3);
         // Indices in a video-memory home (`homes`; one is made for indices
         // that GPU work wrote through a large binding) are bound from it and
         // read in order on the GPU; others are waited for if GPU work writes
@@ -515,6 +549,7 @@ impl Exec {
             }
             None => None,
         };
+        lap.mark(4);
         // Color targets: enabled in CB_TARGET_MASK and CB_SHADER_MASK,
         // exported by the pixel shader with a non-zero export format.
         let mrt_mask = ps.as_ref().map(|p| p.tr.out.mrt_mask).unwrap_or(0);
@@ -540,6 +575,7 @@ impl Exec {
                 masks[i as usize] = m as u8;
             }
         }
+        lap.mark(5);
         // Depth/stencil.
         let dctl = reg(0x28800);
         let db_render = reg(0x28000);
@@ -568,6 +604,7 @@ impl Exec {
             }
         }
         let depth = if z_test || s_test || clear_z || clear_s { Some(images::with(|im| im.target(dsurf.as_ref().unwrap()))?) } else { None };
+        lap.mark(6);
         let mem_writes = vs.tr.plan.resources.iter().any(|r| r.written) || ps.as_ref().is_some_and(|p| p.tr.plan.resources.iter().any(|r| r.written));
         if colors.iter().all(Option::is_none) && !z_write && !s_write && !clear_z && !clear_s && !mem_writes {
             return Ok(false);
@@ -618,20 +655,25 @@ impl Exec {
             }
         };
         let t_pipe = t0.elapsed();
+        lap.mark(7);
         // Depth arrays sampled with more layers than rendered so far.
         match &ps {
             Some(p) => self.grow_sampled_depth(&[&vs, p]),
             None => self.grow_sampled_depth(&[&vs]),
         }
-        // Fast clears (metadata writes) of the attachments and textures.
-        let mut used: Vec<images::ImageKey> = colors.iter().flatten().chain(depth.iter()).map(|t| t.key).collect();
-        used.extend(image_keys(&vs));
-        if let Some(p) = &ps {
-            used.extend(image_keys(p));
+        // Fast clears (metadata writes), reloads and block copies of the
+        // attachments and textures.
+        let attached: Vec<images::ImageKey> = colors.iter().flatten().chain(depth.iter()).map(|t| t.key).collect();
+        let (used, pending) = match &ps {
+            Some(p) => super::image_hazards(&[&vs, p], &attached),
+            None => super::image_hazards(&[&vs], &attached),
+        };
+        if pending {
+            self.resolve_fast_clears(&used);
+            self.resolve_overwrites(&used);
+            self.sync_block_textures(&used);
         }
-        self.resolve_fast_clears(&used);
-        self.resolve_overwrites(&used);
-        self.sync_block_textures(&used);
+        lap.mark(8);
         // Resources.
         let mut stages: Vec<&mut Prepared> = vec![&mut vs];
         if let Some(p) = ps.as_mut() {
@@ -646,14 +688,18 @@ impl Exec {
         if let Some((addr, size)) = a.index {
             self.flush_resident(Some(&[(addr, a.count as u64 * size as u64)]))?;
         }
+        lap.mark(9);
         let mut bounds = Vec::new();
-        for p in stages.iter_mut() {
+        for (k, p) in stages.iter_mut().enumerate() {
             let mut b = self.bind_stage(p, false)?;
             self.bind_sgpr(p, &mut b)?;
             bounds.push(b);
+            lap.mark(10 + k.min(1));
         }
         let set = self.alloc_set(set_layout)?;
+        lap.mark(12);
         self.write_set(set, &bounds);
+        lap.mark(13);
         let t_bind = t0.elapsed();
         // Rendering instance: reuse it while the attachments stay the same
         // and the draw does not sample one of them.
@@ -665,30 +711,43 @@ impl Exec {
             self.barrier_if_wanted(true);
             self.begin_rendering(colors, depth, area);
         }
+        lap.mark(14);
         let c = ctx();
         let cmd = self.cmd();
         crate::gpu::vk::checkpoint(cmd, crate::gpu::vk::mark::DRAW, ps_addr);
+        // Viewport 0 (PA_CL_VPORT_*): the hardware window transform maps
+        // directly onto a Vulkan viewport (negative height for a flipped Y).
+        let vte = reg(0x28818);
+        let (xs, xo, ys, yo, zs, zo) = (f32r(reg(0x2843C)), f32r(reg(0x28440)), f32r(reg(0x28444)), f32r(reg(0x28448)), f32r(reg(0x2844C)), f32r(reg(0x28450)));
+        let vp = if vte & 0x3F == 0x3F && xs != 0.0 && ys != 0.0 {
+            vk::Viewport { x: xo - xs, y: yo - ys, width: 2.0 * xs, height: 2.0 * ys, min_depth: zo.clamp(0.0, 1.0), max_depth: (zo + zs).clamp(0.0, 1.0) }
+        } else {
+            self.report(format!("PA_CL_VTE_CNTL {vte:#x} (viewport transform disabled) approximated"));
+            vk::Viewport { x: 0.0, y: 0.0, width: area.0 as f32, height: area.1 as f32, min_depth: 0.0, max_depth: 1.0 }
+        };
+        let dc = &mut self.dyncache;
         unsafe {
-            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            if dc.pipeline != pipeline {
+                c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                dc.pipeline = pipeline;
+            }
             c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, layout, 0, &[set], &[]);
-            // Viewport 0 (PA_CL_VPORT_*): the hardware window transform maps
-            // directly onto a Vulkan viewport (negative height for a flipped Y).
-            let vte = reg(0x28818);
-            let (xs, xo, ys, yo, zs, zo) = (f32r(reg(0x2843C)), f32r(reg(0x28440)), f32r(reg(0x28444)), f32r(reg(0x28448)), f32r(reg(0x2844C)), f32r(reg(0x28450)));
-            let vp = if vte & 0x3F == 0x3F && xs != 0.0 && ys != 0.0 {
-                vk::Viewport { x: xo - xs, y: yo - ys, width: 2.0 * xs, height: 2.0 * ys, min_depth: zo.clamp(0.0, 1.0), max_depth: (zo + zs).clamp(0.0, 1.0) }
-            } else {
-                self.report(format!("PA_CL_VTE_CNTL {vte:#x} (viewport transform disabled) approximated"));
-                vk::Viewport { x: 0.0, y: 0.0, width: area.0 as f32, height: area.1 as f32, min_depth: 0.0, max_depth: 1.0 }
-            };
-            c.device.cmd_set_viewport(cmd, 0, &[vp]);
+            let vpw = [vp.x.to_bits(), vp.y.to_bits(), vp.width.to_bits(), vp.height.to_bits(), vp.min_depth.to_bits(), vp.max_depth.to_bits()];
+            if dc.viewport != Some(vpw) {
+                c.device.cmd_set_viewport(cmd, 0, &[vp]);
+                dc.viewport = Some(vpw);
+            }
             let mut sc = vk::Rect2D { offset: vk::Offset2D { x: x0, y: y0 }, extent: vk::Extent2D { width: (x1 - x0) as u32, height: (y1 - y0) as u32 } };
             // Diagnosis (control `tiny <ps>`): those draws cover one pixel
             // (their vertex work stays, pixel work goes).
             if TINY_SCISSOR.lock().contains(&ps_addr) {
                 sc.extent = vk::Extent2D { width: 1, height: 1 };
             }
-            c.device.cmd_set_scissor(cmd, 0, &[sc]);
+            let scw = [sc.offset.x, sc.offset.y, sc.extent.width as i32, sc.extent.height as i32];
+            if dc.scissor != Some(scw) {
+                c.device.cmd_set_scissor(cmd, 0, &[sc]);
+                dc.scissor = Some(scw);
+            }
             // Depth/stencil clears requested through DB_RENDER_CONTROL.
             if clear_z || clear_s {
                 let mut aspect = vk::ImageAspectFlags::empty();
@@ -716,57 +775,131 @@ impl Exec {
             if mode & 2 != 0 && !rect {
                 cull |= vk::CullModeFlags::BACK;
             }
-            c.device.cmd_set_cull_mode(cmd, cull);
-            c.device.cmd_set_front_face(cmd, if mode & 4 != 0 { vk::FrontFace::CLOCKWISE } else { vk::FrontFace::COUNTER_CLOCKWISE });
-            c.device.cmd_set_primitive_topology(cmd, topology);
-            c.device.cmd_set_primitive_restart_enable(cmd, reg(0x28A94) & 1 != 0 && matches!(prim, 3 | 5 | 6) && a.index.is_some());
-            c.device.cmd_set_rasterizer_discard_enable(cmd, false);
-            c.device.cmd_set_depth_test_enable(cmd, z_test);
-            c.device.cmd_set_depth_write_enable(cmd, z_write);
+            if dc.set(0, cull.as_raw() as u64) {
+                c.device.cmd_set_cull_mode(cmd, cull);
+            }
+            let front = if mode & 4 != 0 { vk::FrontFace::CLOCKWISE } else { vk::FrontFace::COUNTER_CLOCKWISE };
+            if dc.set(1, front.as_raw() as u64) {
+                c.device.cmd_set_front_face(cmd, front);
+            }
+            if dc.set(2, topology.as_raw() as u64) {
+                c.device.cmd_set_primitive_topology(cmd, topology);
+            }
+            let restart = reg(0x28A94) & 1 != 0 && matches!(prim, 3 | 5 | 6) && a.index.is_some();
+            if dc.set(3, restart as u64) {
+                c.device.cmd_set_primitive_restart_enable(cmd, restart);
+            }
+            if dc.set(4, 0) {
+                c.device.cmd_set_rasterizer_discard_enable(cmd, false);
+            }
+            if dc.set(5, z_test as u64) {
+                c.device.cmd_set_depth_test_enable(cmd, z_test);
+            }
+            if dc.set(6, z_write as u64) {
+                c.device.cmd_set_depth_write_enable(cmd, z_write);
+            }
             // DS_DEPTH_EQUAL_BIAS=<units> (diagnosis): EQUAL tests without
             // depth writes pass a little in front of the stored depth instead
             // (reversed Z when the depth clear value is 0); `always`: they
             // always pass (do the draw's fragments exist at all?).
             let eq_bias = equal_bias().filter(|_| z_test && !z_write && (dctl >> 4) & 7 == 2);
             let reversed = f32r(reg(0x2802C)) == 0.0;
-            match eq_bias {
-                Some(b) if b.is_infinite() => c.device.cmd_set_depth_compare_op(cmd, vk::CompareOp::ALWAYS),
-                Some(_) => c.device.cmd_set_depth_compare_op(cmd, if reversed { vk::CompareOp::GREATER_OR_EQUAL } else { vk::CompareOp::LESS_OR_EQUAL }),
-                None => c.device.cmd_set_depth_compare_op(cmd, compare_op(dctl >> 4)),
+            let zop = match eq_bias {
+                Some(b) if b.is_infinite() => vk::CompareOp::ALWAYS,
+                Some(_) => {
+                    if reversed {
+                        vk::CompareOp::GREATER_OR_EQUAL
+                    } else {
+                        vk::CompareOp::LESS_OR_EQUAL
+                    }
+                }
+                None => compare_op(dctl >> 4),
+            };
+            if dc.set(7, zop.as_raw() as u64) {
+                c.device.cmd_set_depth_compare_op(cmd, zop);
             }
             let eq_bias = eq_bias.filter(|b| b.is_finite());
-            c.device.cmd_set_depth_bounds_test_enable(cmd, false);
-            c.device.cmd_set_stencil_test_enable(cmd, s_test);
+            if dc.set(8, 0) {
+                c.device.cmd_set_depth_bounds_test_enable(cmd, false);
+            }
+            if dc.set(9, s_test as u64) {
+                c.device.cmd_set_stencil_test_enable(cmd, s_test);
+            }
             let back = dctl & (1 << 7) != 0;
             let ffunc = compare_op(dctl >> 8);
             let bfunc = if back { compare_op(dctl >> 20) } else { ffunc };
-            c.device.cmd_set_stencil_op(cmd, vk::StencilFaceFlags::FRONT, stencil_op(sctl), stencil_op(sctl >> 4), stencil_op(sctl >> 8), ffunc);
+            let sop = |w: u32, f: vk::CompareOp| (stencil_op(w), stencil_op(w >> 4), stencil_op(w >> 8), f);
+            let pack = |o: (vk::StencilOp, vk::StencilOp, vk::StencilOp, vk::CompareOp)| (o.0.as_raw() as u64) | (o.1.as_raw() as u64) << 16 | (o.2.as_raw() as u64) << 32 | (o.3.as_raw() as u64) << 48;
+            let fo = sop(sctl, ffunc);
+            if dc.set(10, pack(fo)) {
+                c.device.cmd_set_stencil_op(cmd, vk::StencilFaceFlags::FRONT, fo.0, fo.1, fo.2, fo.3);
+            }
             let bs = if back { sctl >> 12 } else { sctl };
-            c.device.cmd_set_stencil_op(cmd, vk::StencilFaceFlags::BACK, stencil_op(bs), stencil_op(bs >> 4), stencil_op(bs >> 8), bfunc);
+            let bo = sop(bs, bfunc);
+            if dc.set(11, pack(bo)) {
+                c.device.cmd_set_stencil_op(cmd, vk::StencilFaceFlags::BACK, bo.0, bo.1, bo.2, bo.3);
+            }
             let rb = if back { refm_bf } else { refm };
-            c.device.cmd_set_stencil_reference(cmd, vk::StencilFaceFlags::FRONT, refm & 0xFF);
-            c.device.cmd_set_stencil_reference(cmd, vk::StencilFaceFlags::BACK, rb & 0xFF);
-            c.device.cmd_set_stencil_compare_mask(cmd, vk::StencilFaceFlags::FRONT, (refm >> 8) & 0xFF);
-            c.device.cmd_set_stencil_compare_mask(cmd, vk::StencilFaceFlags::BACK, (rb >> 8) & 0xFF);
-            c.device.cmd_set_stencil_write_mask(cmd, vk::StencilFaceFlags::FRONT, (refm >> 16) & 0xFF);
-            c.device.cmd_set_stencil_write_mask(cmd, vk::StencilFaceFlags::BACK, (rb >> 16) & 0xFF);
+            for (slot, face, v) in [
+                (12, vk::StencilFaceFlags::FRONT, refm & 0xFF),
+                (13, vk::StencilFaceFlags::BACK, rb & 0xFF),
+            ] {
+                if dc.set(slot, v as u64) {
+                    c.device.cmd_set_stencil_reference(cmd, face, v);
+                }
+            }
+            for (slot, face, v) in [
+                (14, vk::StencilFaceFlags::FRONT, (refm >> 8) & 0xFF),
+                (15, vk::StencilFaceFlags::BACK, (rb >> 8) & 0xFF),
+            ] {
+                if dc.set(slot, v as u64) {
+                    c.device.cmd_set_stencil_compare_mask(cmd, face, v);
+                }
+            }
+            for (slot, face, v) in [
+                (16, vk::StencilFaceFlags::FRONT, (refm >> 16) & 0xFF),
+                (17, vk::StencilFaceFlags::BACK, (rb >> 16) & 0xFF),
+            ] {
+                if dc.set(slot, v as u64) {
+                    c.device.cmd_set_stencil_write_mask(cmd, face, v);
+                }
+            }
             // PA_SU_SC_MODE_CNTL.POLY_OFFSET_FRONT/BACK_ENABLE with
             // PA_SU_POLY_OFFSET_* (scale in 1/16 units).
             let poly_offset = mode & (3 << 11) != 0;
-            c.device.cmd_set_depth_bias_enable(cmd, poly_offset || eq_bias.is_some());
-            if let (Some(units), false) = (eq_bias, poly_offset) {
-                c.device.cmd_set_depth_bias(cmd, if reversed { units } else { -units }, 0.0, 0.0);
+            let bias_on = poly_offset || eq_bias.is_some();
+            if dc.set(18, bias_on as u64) {
+                c.device.cmd_set_depth_bias_enable(cmd, bias_on);
+            }
+            let bias = if let (Some(units), false) = (eq_bias, poly_offset) {
+                Some((if reversed { units } else { -units }, 0.0, 0.0))
             } else if poly_offset {
                 let (sr, or) = if mode & (1 << 11) != 0 { (0x28B80, 0x28B84) } else { (0x28B88, 0x28B8C) };
-                c.device.cmd_set_depth_bias(cmd, f32r(reg(or)), f32r(reg(0x28B7C)), f32r(reg(sr)) / 16.0);
+                Some((f32r(reg(or)), f32r(reg(0x28B7C)), f32r(reg(sr)) / 16.0))
+            } else {
+                None
+            };
+            if let Some((k, clamp, slope)) = bias {
+                let bw = [k.to_bits(), clamp.to_bits(), slope.to_bits()];
+                if dc.bias != Some(bw) {
+                    c.device.cmd_set_depth_bias(cmd, k, clamp, slope);
+                    dc.bias = Some(bw);
+                }
             }
-            c.device.cmd_set_line_width(cmd, 1.0);
-            c.device.cmd_set_blend_constants(cmd, &[f32r(reg(0x28414)), f32r(reg(0x28418)), f32r(reg(0x2841C)), f32r(reg(0x28420))]);
+            if dc.set(20, 1) {
+                c.device.cmd_set_line_width(cmd, 1.0);
+            }
+            let bc = [reg(0x28414), reg(0x28418), reg(0x2841C), reg(0x28420)];
+            if dc.blend != Some(bc) {
+                c.device.cmd_set_blend_constants(cmd, &[f32r(bc[0]), f32r(bc[1]), f32r(bc[2]), f32r(bc[3])]);
+                dc.blend = Some(bc);
+            }
             let base_vertex = a.base_vertex.unwrap_or(reg(0x28408) as i32);
+            lap.mark(15);
             // DS_PROFILE_GPU: timestamps around the draw, keyed by its shader.
             let qp = self.slots[self.cur].queries;
             let ti = self.batch_shaders.len() as u32;
-            let timed = qp != vk::QueryPool::null() && ti < super::MAX_TIMED;
+            let timed = qp != vk::QueryPool::null() && ti < super::MAX_TIMED && super::command_stamps();
             if timed {
                 for k in 0..2 {
                     c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, super::STAMPS * ti + k);
@@ -814,6 +947,7 @@ impl Exec {
                 self.batch_shaders.push(super::DRAW_KEY | if ps_addr != 0 { ps_addr } else { vs.addr });
             }
         }
+        lap.mark(16);
         for b in bounds {
             if !b.writes.is_empty() {
                 crate::gpu::mirror::invalidate(&b.writes);
@@ -828,6 +962,7 @@ impl Exec {
                 self.note_write(w, n);
             }
         }
+        lap.mark(17);
         if super::profiling() {
             super::note_phases(&super::DRAW_PHASES, [t_prep, t_pipe, t_bind, t0.elapsed()]);
         }
