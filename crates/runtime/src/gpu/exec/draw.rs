@@ -542,6 +542,8 @@ impl Exec {
                 }
                 super::explain_wait(&self.name, c, &st);
             }
+            let same = shaders::words_unchanged(&vs) && ps.as_ref().is_none_or(shaders::words_unchanged);
+            super::READ_WAIT_WORDS[if same { 0 } else { 1 }].fetch_add(1, Ordering::Relaxed);
             vs = shaders::prepare_ngg(cp)?;
             ps = if ps_addr != 0 { Some(shaders::prepare_ps(cp)?) } else { None };
         }

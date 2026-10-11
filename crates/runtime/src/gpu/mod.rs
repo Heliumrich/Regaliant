@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 35] = [
+    static ALL: [Tunable; 36] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -60,8 +60,9 @@ pub mod tune {
         Tunable { name: "pre_share", env: "DS_PRE_SHARE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "pending_set", env: "DS_PENDING_SET", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "tex_scrub", env: "DS_TEX_SCRUB", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "pre_share_min", env: "DS_PRE_SHARE_MIN", default: 65536, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_share_min", env: "DS_PRE_SHARE_MIN", default: 16384, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_share_mib", env: "DS_PRE_SHARE_MIB", default: 1024, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_share_volatile", env: "DS_PRE_SHARE_VOLATILE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -299,6 +300,12 @@ pub mod tune {
     /// Video memory for shared batch-start copies, MiB.
     pub fn pre_share_mib() -> u64 {
         get(34)
+    }
+
+    /// Frames a range GPU work wrote is not kept in the shared chunks
+    /// (copied per batch instead); 0: always kept.
+    pub fn pre_share_volatile() -> u64 {
+        get(35)
     }
 
     /// Command-processor waits for GPU work still to be traced (`tune

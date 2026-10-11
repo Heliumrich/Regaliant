@@ -77,9 +77,22 @@ pub const SYNC_DRAW_INDICES: usize = 5;
 pub static PIPES_CREATED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 pub static PIPES_NS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Waits for a stage's shader reads (GPU work was writing what the
+/// preparation read): [draws whose words were the same after the wait,
+/// changed; dispatches same, changed]. Same: preparing with the earlier
+/// values instead of waiting would have been right.
+pub(super) static READ_WAIT_WORDS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 fn sync_why_status() -> String {
     let n: Vec<u64> = SYNC_WHY.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let w: Vec<u64> = READ_WAIT_WORDS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
+        "    shader-read waits whose words were unchanged after the wait: draws {} of {}, dispatches {} of {}\n",
+        w[0],
+        w[0] + w[1],
+        w[2],
+        w[2] + w[3]
+    ) + &format!(
         "    CP read waits: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices; pipelines created: {} compute ({} ms), {} graphics ({} ms)\n",
         n[0],
         n[1],
@@ -1856,6 +1869,9 @@ pub fn reset_shader_profile() {
         g.3 = [[0; 2]; 4];
     }
     PRE_STABLE.lock().1 = [0; 5];
+    for c in READ_WAIT_WORDS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
     for c in crate::mem::WRITE_WATCH_STATS.iter() {
         c.store(0, Ordering::Relaxed);
     }
@@ -1919,6 +1935,8 @@ pub fn shader_profile() -> String {
             "    command-processor waits for GPU work: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices\n",
             n[0], n[1], n[2], n[3], n[4], n[5]
         ));
+        let w: Vec<u64> = READ_WAIT_WORDS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        s.push_str(&format!("    shader-read waits whose words were unchanged after the wait: draws {} of {}, dispatches {} of {}\n", w[0], w[0] + w[1], w[2], w[2] + w[3]));
     }
     if let Some(w) = SUBMIT_WHY.lock().as_ref() {
         let mut v: Vec<(&(String, &'static str), &u64)> = w.iter().collect();
@@ -3048,7 +3066,7 @@ impl Exec {
 
     /// A guest range the batch being recorded writes.
     pub(super) fn note_write(&mut self, a: u64, n: u64) {
-        super::precache::invalidate(a, n);
+        super::precache::invalidate_gpu(a, n);
         self.pending.insert(a, n);
         if verify::enabled() {
             self.pending_log.push((a, n));
@@ -3811,6 +3829,7 @@ impl Exec {
             if let Some(c) = self.sync_culprit.take() {
                 explain_wait(&self.name, c, &[&p]);
             }
+            READ_WAIT_WORDS[if shaders::words_unchanged(&p) { 2 } else { 3 }].fetch_add(1, Ordering::Relaxed);
             p = shaders::prepare_compute(cp, wave64)?;
         }
         lap.mark(1);

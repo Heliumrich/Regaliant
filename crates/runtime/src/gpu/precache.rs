@@ -69,6 +69,10 @@ struct Cache {
     lo: u64,
     hi: u64,
     chunks: Vec<Slot>,
+    /// Ranges GPU work wrote while they had an entry, and the frame: copied
+    /// per batch for `tune pre_share_volatile` frames (their copies die
+    /// within a frame and would fill the chunks).
+    volatile: Map<(u64, u64), u64>,
     /// The chunk being filled and its use.
     current: Option<(usize, u64)>,
     fills: u64,
@@ -85,8 +89,8 @@ static EPOCH: AtomicU64 = AtomicU64::new(1);
 
 /// Statistics: [hits, copies, checks (epoch changed), dropped by CPU writes,
 /// dropped by GPU/CP/host writes and mapping changes, dropped by eviction,
-/// no space, failed checks].
-static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// no space, failed checks, not kept (GPU-written lately)].
+static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 /// Epochs by reason: [title submission, CPU-released wait, REWIND].
 static ENDS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
@@ -115,8 +119,9 @@ impl Cache {
         true
     }
 
-    /// Drops the entries overlapping [base, end); how many.
-    fn drop_range(&mut self, base: u64, end: u64) -> u64 {
+    /// Drops the entries overlapping [base, end); how many. `gpu`: GPU work
+    /// writes the range (the entries' keys turn volatile).
+    fn drop_range(&mut self, base: u64, end: u64, gpu: bool) -> u64 {
         if self.entries.is_empty() || end <= self.lo || self.hi <= base {
             return 0;
         }
@@ -128,8 +133,16 @@ impl Cache {
                 }
             }
         }
+        let frame = super::FRAMES.load(Ordering::Relaxed);
         for &k in &hit {
             self.remove(k);
+            if gpu {
+                self.volatile.insert(k, frame);
+            }
+        }
+        if self.volatile.len() > 1 << 16 {
+            let keep = super::tune::pre_share_volatile();
+            self.volatile.retain(|_, f| f.saturating_add(keep) >= frame);
         }
         hit.len() as u64
     }
@@ -146,7 +159,7 @@ impl Cache {
                 end += 4096;
                 i += 1;
             }
-            n += self.drop_range(start, end);
+            n += self.drop_range(start, end, false);
         }
         n
     }
@@ -256,6 +269,11 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64)> {
 pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64)> {
     let mut g = CACHE.lock();
     let c = g.get_or_insert_with(Cache::default);
+    let keep = super::tune::pre_share_volatile();
+    if keep > 0 && c.volatile.get(&(base, size)).is_some_and(|&f| f.saturating_add(keep) >= super::FRAMES.load(Ordering::Relaxed)) {
+        STATS[8].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     // The range's write marks so far: the copy sees those writes (it runs
     // later), other entries on those pages are stale.
     let mut pages = Vec::new();
@@ -303,14 +321,25 @@ pub fn submitted(keys: &[(u64, u64)], seq: u64) {
     }
 }
 
-/// Guest [base, base+len) may have changed: copies overlapping it go.
+/// Guest [base, base+len) may have changed (CP, host and mapping changes):
+/// copies overlapping it go.
 pub fn invalidate(base: u64, len: u64) {
+    drop_overlapping(base, len, false);
+}
+
+/// GPU work writes guest [base, base+len): copies overlapping it go, and
+/// their ranges are not kept for a while (`tune pre_share_volatile`).
+pub fn invalidate_gpu(base: u64, len: u64) {
+    drop_overlapping(base, len, true);
+}
+
+fn drop_overlapping(base: u64, len: u64, gpu: bool) {
     if len == 0 || base.saturating_add(len) <= LO.load(Ordering::Acquire) || HI.load(Ordering::Acquire) <= base {
         return;
     }
     let mut g = CACHE.lock();
     let Some(c) = g.as_mut() else { return };
-    let n = c.drop_range(base, base.saturating_add(len));
+    let n = c.drop_range(base, base.saturating_add(len), gpu);
     if n > 0 {
         STATS[4].fetch_add(n, Ordering::Relaxed);
         c.bounds_changed();
@@ -320,7 +349,7 @@ pub fn invalidate(base: u64, len: u64) {
 /// The ranges a batch writes, at its submission (see the module notes).
 pub fn invalidate_ranges(writes: &super::ranges::Ranges) {
     for (a, n) in writes.iter() {
-        invalidate(a, n);
+        invalidate_gpu(a, n);
     }
 }
 
@@ -340,9 +369,10 @@ pub fn status() -> String {
     }
     let (chunks, entries) = CACHE.lock().as_ref().map_or((0, 0), |c| (c.chunks.len(), c.entries.len()));
     format!(
-        "    shared batch-start copies: {} copies, {} reused; {} checks for CPU writes ({} failed), entries dropped by CPU writes {}, by GPU/CP/host writes and mapping changes {}, by eviction {}; {} without space; {} entries in {} chunks of {} MiB; epochs: {} submissions, {} waits the CPU released, {} REWIND\n",
+        "    shared batch-start copies: {} copies, {} reused, {} not kept (GPU-written lately); {} checks for CPU writes ({} failed), entries dropped by CPU writes {}, by GPU/CP/host writes and mapping changes {}, by eviction {}; {} without space; {} entries in {} chunks of {} MiB; epochs: {} submissions, {} waits the CPU released, {} REWIND\n",
         s[1],
         s[0],
+        s[8],
         s[2],
         s[7],
         s[3],
