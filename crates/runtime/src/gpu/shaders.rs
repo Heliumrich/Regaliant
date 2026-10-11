@@ -31,6 +31,10 @@ thread_local! {
     static LOCAL_PROGRAMS: std::cell::RefCell<HashMap<u64, (u64, u64, Arc<Vec<rdna::Inst>>, u64)>> = std::cell::RefCell::new(HashMap::new());
     static LOCAL_PLANS: std::cell::RefCell<HashMap<u64, Arc<Plan>>> = std::cell::RefCell::new(HashMap::new());
     static LOCAL_TRANSLATIONS: std::cell::RefCell<HashMap<(u64, u64), Arc<Translated>>> = std::cell::RefCell::new(HashMap::new());
+    /// Translations by (plan key, fast hash of the specialization), checked
+    /// by comparing the specialization: SipHashing the whole Spec for every
+    /// command took about a microsecond per stage.
+    static FAST_TRANSLATIONS: std::cell::RefCell<super::fx::Map<(u64, u64), Arc<Translated>>> = std::cell::RefCell::new(super::fx::Map::default());
 }
 
 pub struct Translated {
@@ -40,6 +44,10 @@ pub struct Translated {
     pub key: u64,
     /// Buffer resources targeted by atomic instructions.
     pub atomic_res: Vec<usize>,
+    /// The specialization it was made for (program address zero unless
+    /// DS_WAVEMASK keys translations by it): the per-thread lookup by a fast
+    /// hash compares it.
+    pub spec: Spec,
 }
 
 fn hash_words(w: &[u32]) -> u64 {
@@ -781,8 +789,13 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
     // The cached preparation of this stage, if its inputs and the words it
     // read are the same.
     let slot = stage_slot(spec.stage);
-    let deps = LOCAL_DEPS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| user_deps(&plan)));
-    let prep_key = {
+    // Compute preparations do not repeat (the per-item culls differ in the
+    // user data their descriptors depend on).
+    let cacheable = slot != 2 && super::tune::prep_cache();
+    let prep_key = if !cacheable {
+        0
+    } else {
+        let deps = LOCAL_DEPS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| user_deps(&plan)));
         let mut h = super::fx::FxHasher::default();
         h.write_u64(addr);
         h.write_u64(plan_key);
@@ -796,9 +809,6 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
         h.write_u64(super::images::LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire));
         h.finish()
     };
-    // Compute preparations do not repeat (the per-item culls differ in the
-    // user data their descriptors depend on).
-    let cacheable = slot != 2 && super::tune::prep_cache();
     let hit = PREP_CACHE.with(|c| {
         if !cacheable {
             return None;
@@ -921,25 +931,37 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
     // Translations do not depend on the program's address (see
     // translate::code_base_offset): copies of a program share one, and its
     // pipeline (the Vulkan pipeline cache finds it again in the next run).
-    let spec_hash = {
-        static BY_ADDRESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let by_address = *BY_ADDRESS.get_or_init(|| std::env::var_os("DS_WAVEMASK").is_some());
-        let base = spec.code_base;
-        if !by_address {
-            spec.code_base = 0;
-        }
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+    static BY_ADDRESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let by_address = *BY_ADDRESS.get_or_init(|| std::env::var_os("DS_WAVEMASK").is_some());
+    let base = spec.code_base;
+    if !by_address {
+        spec.code_base = 0;
+    }
+    let fast = {
+        let mut h = super::fx::FxHasher::default();
         spec.hash(&mut h);
-        spec.code_base = base;
         h.finish()
     };
-    let tr = {
+    let fast_hit = FAST_TRANSLATIONS.with(|c| c.borrow().get(&(plan_key, fast)).filter(|t| t.spec == *spec).cloned());
+    let key_spec = if fast_hit.is_none() { Some(spec.clone()) } else { None };
+    let spec_hash = match &key_spec {
+        Some(ks) => {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            ks.hash(&mut h);
+            h.finish()
+        }
+        None => 0,
+    };
+    spec.code_base = base;
+    let tr = if let Some(t) = fast_hit {
+        t
+    } else {
         let cached = LOCAL_TRANSLATIONS.with(|c| c.borrow().get(&(plan_key, spec_hash)).cloned()).or_else(|| {
             let t = TRANSLATIONS.lock().as_ref().and_then(|m| m.get(&(plan_key, spec_hash)).cloned())?;
             LOCAL_TRANSLATIONS.with(|c| c.borrow_mut().insert((plan_key, spec_hash), t.clone()));
             Some(t)
         });
-        match cached {
+        let t = match cached {
             Some(t) => t,
             None => {
                 let t0 = std::time::Instant::now();
@@ -958,12 +980,16 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
                     .collect();
                 atomic_res.sort_unstable();
                 atomic_res.dedup();
-                let t = Arc::new(Translated { out, plan: plan.clone(), key: plan_key ^ spec_hash.rotate_left(1), atomic_res });
+                let t = Arc::new(Translated { out, plan: plan.clone(), key: plan_key ^ spec_hash.rotate_left(1), atomic_res, spec: key_spec.clone().unwrap_or_else(|| spec.clone()) });
                 TRANSLATIONS.lock().get_or_insert_with(HashMap::new).insert((plan_key, spec_hash), t.clone());
                 LOCAL_TRANSLATIONS.with(|c| c.borrow_mut().insert((plan_key, spec_hash), t.clone()));
                 t
             }
+        };
+        if key_spec.as_ref().is_some_and(|ks| *ks == t.spec) {
+            FAST_TRANSLATIONS.with(|c| c.borrow_mut().insert((plan_key, fast), t.clone()));
         }
+        t
     };
     // Scalar-load data, resolved now.
     let mut sgpr_data = user.to_vec();
