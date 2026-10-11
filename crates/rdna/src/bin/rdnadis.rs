@@ -51,6 +51,25 @@ fn main() {
         }
         return;
     }
+    // --masks <file.bin>...: per program, whether it uses LDS and whether a
+    // compare mask is read as a value (wave64 / wave32), i.e. whether a
+    // single-wave compute dispatch of it runs in wave-mask mode.
+    if files.first().is_some_and(|f| f == "--masks") {
+        for f in &files[1..] {
+            let bytes = std::fs::read(f).expect("read shader");
+            let code: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let Ok(insts) = rdna::decode_program(&code) else {
+                println!("{f}: decode failed");
+                continue;
+            };
+            let lds = insts.iter().any(|i| i.enc == rdna::Enc::Ds && !i.ds_gds());
+            let mut pcs: Vec<u32> = rdna::wavemask::mask_value_writes(&insts, true).into_iter().collect();
+            pcs.sort();
+            let pcs: Vec<String> = pcs.iter().map(|p| format!("{p:#x}")).collect();
+            println!("{f}: lds {lds} mask values {} / {} [{}]", rdna::wavemask::reads_mask_values(&insts, true), rdna::wavemask::reads_mask_values(&insts, false), pcs.join(" "));
+        }
+        return;
+    }
     // --analyze: descriptor/scalar-load provenance per file (32 user SGPRs assumed).
     let analyze = files.first().is_some_and(|f| f == "--analyze");
     if analyze {

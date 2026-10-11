@@ -582,6 +582,16 @@ impl Cp {
         self.exec = Some(e);
     }
 
+    /// START_INST_LOC for an indirect draw packet that names none (our Agc
+    /// builders): the SH register of the bound primitive shader's
+    /// instance-offset user SGPR (its shader object declares it, see
+    /// `agc::instance_offset_slot`), else 0 (none: the start instance then
+    /// stays part of the instance id, as in Vulkan).
+    fn instance_offset_loc(&self) -> u32 {
+        const GS_USER_DATA: u32 = 0x8C;
+        crate::hle::libs::agc::instance_offset_slot(super::shaders::ngg_addr(self)).map_or(0, |s| GS_USER_DATA + s)
+    }
+
     /// DRAW_INDIRECT_MULTI / DRAW_INDEX_INDIRECT_MULTI: draws described by
     /// consecutive argument records. gfx9+ layout (Mesa radeonsi and the Agc
     /// builders emit it): data offset; BASE_VTX_LOC; START_INST_LOC;
@@ -591,6 +601,7 @@ impl Cp {
     /// packet names. Returns the outcome summary.
     fn draw_indirect_multi(&mut self, indexed: bool, p: &dyn Fn(u64) -> u32) -> String {
         let (vtx_loc, inst_loc, id_loc) = (p(1) & 0xFFFF, p(2) & 0xFFFF, p(3) & 0xFFFF);
+        let inst_loc = if inst_loc != 0 { inst_loc } else { self.instance_offset_loc() };
         let id_enable = p(3) & (1 << 31) != 0;
         let mut count = p(4);
         let mut count_src = format!("max {count}");
@@ -928,13 +939,11 @@ impl Cp {
                         // shader through the user SGPRs the packet names
                         // (BASE_VTX_LOC [15:0], START_INST_LOC [31:16]: SH
                         // register offsets; as Mesa radeonsi emits them), and
-                        // the instance id VGPR then starts at 0. Agc packets
-                        // name no locations (the title's indirect draws index
-                        // their instance data with a user SGPR that is 0 plus
-                        // the instance id): the start instance is then part
-                        // of the instance id, like the base vertex of the
-                        // vertex id.
+                        // the instance id VGPR then starts at 0. Our Agc
+                        // packets name no locations: the start instance goes
+                        // to the bound shader's instance-offset slot.
                         let (vtx_loc, inst_loc) = (p(1) & 0xFFFF, p(1) >> 16);
+                        let inst_loc = if inst_loc != 0 { inst_loc } else { self.instance_offset_loc() };
                         let args = if opcode == op::DRAW_INDIRECT && valid(a, 16) {
                             let w = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12)] };
                             if super::capture::capturing() {

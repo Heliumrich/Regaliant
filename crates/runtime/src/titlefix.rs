@@ -13,21 +13,11 @@ struct Fix {
     why: &'static str,
 }
 
-const FIXES: &[Fix] = &[Fix {
-    // eboot+0xa21e10 hands a render item to the GPU-driven batches (sets bit 0
-    // of the item's byte +0x30, which removes it from the CPU draw lists) when
-    // its shader program qualifies ([prog+0x3d8] == 4, no [prog+0x60], no flags
-    // in [prog+0x3e4] / bit 4 of [prog+0x3f0]). Here the GPU-driven path draws
-    // nothing for such items (the courtyard castle, most architecture), while
-    // the CPU path draws them correctly (run 20261010-222845: the bit cleared
-    // at run time brings the castle back). `jne` -> `nop; jmp` (same target):
-    // every item takes the not-eligible path and stays on the CPU path.
-    name: "static meshes on the CPU draw path",
-    offset: 0xa21e77,
-    from: &[0x0f, 0x85, 0x2b, 0x04, 0x00, 0x00],
-    to: &[0x90, 0xe9, 0x2b, 0x04, 0x00, 0x00],
-    why: "the GPU-driven batches draw nothing for these items here (STATUS: architecture)",
-}];
+/// None at present. The one used until 2026-10-11 kept static meshes off the
+/// GPU-driven batches (eboot+0xa21e77 `jne` -> `nop; jmp`), which drew
+/// nothing here: the title's batch culling stores compare ballots, which the
+/// shader translation now builds completely (STATUS: architecture).
+const FIXES: &[Fix] = &[];
 
 /// Applies the fixes to the main executable's image (module-relative view).
 pub fn apply(image: &mut [u8]) {

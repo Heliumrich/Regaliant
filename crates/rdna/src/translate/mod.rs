@@ -31,6 +31,9 @@
 //! decides them for each wave), so every block is uniform and all LDS
 //! accesses are ordered. With several waves a wave whose lanes are all
 //! inactive runs a region with EXEC empty instead of skipping it.
+//! Single-wave compute programs that read compare masks as values (ballots
+//! they store or count: [`crate::wavemask::reads_mask_values`]) run in
+//! lockstep mode as well, with or without LDS.
 //!
 //! Outside lockstep mode invocations that took different paths reach a
 //! uniform block after different numbers of dispatcher steps, so the
@@ -1730,7 +1733,16 @@ fn lockstep_mode(spec: &Spec, code: &[Inst]) -> (bool, bool) {
     let uses_lds = code.iter().any(|i| i.enc == Enc::Ds && !i.ds_gds() && !matches!(i.name(), Some("ds_swizzle_b32" | "ds_bpermute_b32" | "ds_permute_b32")));
     let one_wave = threads <= if spec.wave64 { 64 } else { 32 };
     let wave_scalars = spec.cs_rsrc2 & (1 << 10) != 0 || code.iter().any(|i| matches!(i.base_name(), Some("v_readlane_b32" | "v_readfirstlane_b32")));
-    let lockstep = spec.stage == Stage::Compute && uses_lds && (one_wave || !wave_scalars) && std::env::var("DS_LOCKSTEP").ok().as_deref() != Some("0");
+    // A single wave that reads lane masks as values (ballots it stores or
+    // counts) needs wave-mask mode, which runs in lockstep, with or without
+    // LDS (the title's batch culling stores one compare ballot per 32 items).
+    // (`DS_MASK_VALUES=0`: not for such programs, diagnosis.)
+    let mask_values = spec.stage == Stage::Compute
+        && one_wave
+        && !uses_lds
+        && std::env::var("DS_MASK_VALUES").ok().as_deref() != Some("0")
+        && crate::wavemask::reads_mask_values(code, spec.wave64);
+    let lockstep = spec.stage == Stage::Compute && (uses_lds || mask_values) && (one_wave || !wave_scalars) && std::env::var("DS_LOCKSTEP").ok().as_deref() != Some("0");
     (lockstep, one_wave)
 }
 

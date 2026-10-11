@@ -143,12 +143,47 @@ static DEFAULTS_PTR: Mutex<(u64, u64)> = Mutex::new((0, 0));
 // u16 special_sizes, u8 type, u8 num_cx_registers, u8 num_sh_registers}.
 // Pointers are stored self-relative until sceAgcCreateShader relocates them.
 
-/// Shader programs created by the title: program address -> (stage, code bytes).
-static SHADERS: Mutex<std::collections::BTreeMap<u64, (u8, usize)>> = Mutex::new(std::collections::BTreeMap::new());
+/// Shader programs created by the title: program address -> (stage, code
+/// bytes, instance-offset user-data slot).
+static SHADERS: Mutex<std::collections::BTreeMap<u64, (u8, usize, Option<u8>)>> = Mutex::new(std::collections::BTreeMap::new());
 
 /// Code size of the program at `addr` (from its shader object), if known.
 pub fn shader_code_size(addr: u64) -> Option<usize> {
-    SHADERS.lock().get(&addr).map(|&(_, n)| n).filter(|&n| n > 0 && n < 1 << 20)
+    SHADERS.lock().get(&addr).map(|&(_, n, _)| n).filter(|&n| n > 0 && n < 1 << 20)
+}
+
+/// User-data slot (counted from the stage's first user SGPR) in which the
+/// program at `addr` expects a draw's start instance, if it has one.
+pub fn instance_offset_slot(addr: u64) -> Option<u32> {
+    SHADERS.lock().get(&addr).and_then(|&(_, _, s)| s).map(u32::from)
+}
+
+/// Draw-modifier bit of primitive shaders that take an instance offset in
+/// a user SGPR (the modifier's layout is otherwise unknown; in this title
+/// it comes with bit 2 set as well: 0x40100004 against 0x40000000).
+const DRAW_MODIFIER_INSTANCE_OFFSET: u64 = 1 << 20;
+
+/// The instance-offset slot of a primitive shader object: the last dword of
+/// its user-data range. In PPSA01341 every shader with the flag has a range
+/// one dword longer than its declared resources (ShaderUserData +0x2A), and
+/// its code adds the low half of that SGPR to the instance id (s10 in the
+/// GPU-driven static meshes' vertex shaders). On hardware an indirect draw
+/// has the command processor write its start instance there
+/// (START_INST_LOC), and the instance id VGPR counts from 0.
+unsafe fn instance_offset_slot_of(h: u64, stage: u8) -> Option<u8> {
+    use shader::*;
+    let sp = unsafe { rd64(h + SPECIALS) };
+    if stage != 2 || sp == 0 {
+        return None;
+    }
+    let modifier = unsafe { rd64(sp + specials::DRAW_MODIFIER) };
+    let end = unsafe { *((sp + specials::USER_DATA_RANGE + 2) as *const u16) };
+    let slot = (modifier & DRAW_MODIFIER_INSTANCE_OFFSET != 0 && (1..=32).contains(&end)).then(|| (end - 1) as u8);
+    static SEEN: Mutex<Option<std::collections::HashSet<(u64, Option<u8>)>>> = Mutex::new(None);
+    if SEEN.lock().get_or_insert_with(Default::default).insert((modifier, slot)) {
+        crate::info!("agc: primitive shaders with draw modifier {modifier:#x}: start instance in user-data slot {slot:?} (shader {h:#x})");
+    }
+    slot
 }
 
 pub mod shader {
@@ -193,6 +228,42 @@ unsafe fn relocate(field: u64) {
 }
 
 const ERR_INVALID_SHADER_PROGRAM: i32 = 0x8A6C_0005u32 as i32;
+
+/// `DS_SHADER_INFO=1`: logs each created shader object's header, special
+/// registers, user-data layout and SH registers (interface research).
+unsafe fn log_shader_info(h: u64) {
+    use shader::*;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("DS_SHADER_INFO").is_some()) {
+        return;
+    }
+    let readable = |a: u64, n: u64| a != 0 && crate::gpu::cp::guest_readable(a, n);
+    let words = |a: u64, n: u64| (0..n).map(|i| format!("{:08x}", unsafe { rd32(a + 4 * i) })).collect::<Vec<_>>().join(" ");
+    unsafe {
+        let stage = *((h + TYPE) as *const u8);
+        let mut s = format!("agc: shader info {h:#x} stage {stage} header [{}]", words(h, 0x60 / 4));
+        let sp = rd64(h + SPECIALS);
+        if readable(sp, 0x30) {
+            s += &format!(" specials [{}]", words(sp, 0x30 / 4));
+        }
+        let ud = rd64(h + USER_DATA);
+        if readable(ud, 0x40) {
+            s += &format!(" userdata [{}]", words(ud, 0x40 / 4));
+            let d = rd64(ud + UD_DIRECT);
+            if readable(d, 0x40) {
+                let v: Vec<String> = (0..32).map(|i| format!("{:04x}", *((d + 2 * i) as *const u16))).collect();
+                s += &format!(" direct [{}]", v.join(" "));
+            }
+        }
+        let regs = rd64(h + SH_REGS);
+        let n = *((h + NUM_SH) as *const u8) as u64;
+        if readable(regs, 8 * n) {
+            let v: Vec<String> = (0..n).map(|i| format!("{:x}={:08x}", rd32(regs + 8 * i), rd32(regs + 8 * i + 4))).collect();
+            s += &format!(" sh [{}]", v.join(" "));
+        }
+        crate::info!("{s}");
+    }
+}
 
 /// ShaderSpecialRegs (0x30 bytes): {ge_cntl, vgt_shader_stages_en: ShaderRegister,
 /// u32 dispatch_modifier, u16 user_data start/end, u64 draw_modifier,
@@ -347,6 +418,7 @@ sysv! {
             }
         }
         crate::debug!("agc: shader {h:#x} stage {stage} code {code:#x} size {:#x}", rd32(h + SHADER_SIZE));
+        log_shader_info(h);
         if let Some(lo_reg) = program_register(stage) {
             // Program address as programmed (code may hold data before it).
             let regs = rd64(h + SH_REGS);
@@ -356,7 +428,7 @@ sysv! {
                 if rd32(e) == lo_reg {
                     let addr = ((rd32(e + 4) as u64) << 8) | (((rd32(e + 12) & 0xFF) as u64) << 40);
                     let size = (code + rd32(h + SHADER_SIZE) as u64).saturating_sub(addr);
-                    SHADERS.lock().insert(addr, (stage, size as usize));
+                    SHADERS.lock().insert(addr, (stage, size as usize, instance_offset_slot_of(h, stage)));
                     break;
                 }
             }

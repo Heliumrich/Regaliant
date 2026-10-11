@@ -287,6 +287,35 @@ fn draw_trace(what: &str, count: u32) {
     }
 }
 
+/// `DS_INDIRECT_TRACE=1`: each distinct guest call chain of the indirect
+/// draw builders, once (up to 32), with the guest stack above the call;
+/// only the first 20000 calls are unwound (the unwinding is slow).
+fn indirect_trace(what: &str, offset: u32) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static SEEN: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+    static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if !*ON.get_or_init(|| std::env::var_os("DS_INDIRECT_TRACE").is_some())
+        || CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 20_000
+        || SEEN.lock().len() >= 32
+    {
+        return;
+    }
+    let frames = crate::exception::current_guest_frames(12);
+    let key = frames.iter().take(6).cloned().collect::<Vec<_>>().join(" <- ");
+    {
+        let mut g = SEEN.lock();
+        if g.len() >= 32 || g.contains(&key) {
+            return;
+        }
+        g.push(key);
+    }
+    let stack = match crate::hle::libs::fiber::guest_stack_words(64) {
+        Some(w) => format!("; guest stack: {}", w.iter().map(|v| format!("{v:x}")).collect::<Vec<_>>().join(" ")),
+        None => String::new(),
+    };
+    crate::info!("agc: {what} offset {offset:#x}: {}{stack}", frames.join(" <- "));
+}
+
 // ---- EVENT_WRITE: dw1 = event_type | event_index<<8. Event types 0x38/0x39
 // (with an address, per the Agc size rule) carry addr lo/hi.
 fn event_index(t: u32) -> u32 {
@@ -549,6 +578,7 @@ sysv! {
         if SEEN.lock().get_or_insert_with(Default::default).insert(modifier) {
             crate::info!("agc: DrawIndexIndirect modifier {modifier:#018x}");
         }
+        indirect_trace("DrawIndexIndirect", offset);
         emit(cb, &[hdr(op::DRAW_INDEX_INDIRECT, 4, DCB), offset, 0, 0, draw_initiator(modifier, 0)])
     }
     fn sceAgcDcbDrawIndexIndirectGetSize() -> u64 { 20 }
@@ -563,6 +593,7 @@ sysv! {
     }
     fn sceAgcDcbDrawIndirectMultiGetSize() -> u64 { 40 }
     fn sceAgcDcbDrawIndexIndirectMulti(cb: u64, offset: u32, count_indirect: u32, max_count: u32, count_addr: u64, stride: u32, modifier: u64) -> u64 {
+        indirect_trace("DrawIndexIndirectMulti", offset);
         emit(cb, &[hdr(op::DRAW_INDEX_INDIRECT_MULTI, 9, DCB), offset, 0, 0, (count_indirect & 1) << 30, max_count, lo(count_addr), hi(count_addr), stride, draw_initiator(modifier, 0)])
     }
     fn sceAgcDcbDrawIndexIndirectMultiGetSize() -> u64 { 40 }

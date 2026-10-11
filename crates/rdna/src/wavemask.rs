@@ -310,7 +310,22 @@ fn effects(ins: &Inst, wave64: bool) -> Fx {
     fx
 }
 
-fn step(l: &mut Live, fx: &Fx) {
+/// The effects as far as reads of mask *values* go: branches, EXEC updates
+/// (saveexec) and SCC tests of masks are left out (lane-by-lane emulation
+/// keeps them right: each invocation follows its own lane).
+fn value_effects(ins: &Inst, wave64: bool) -> Fx {
+    let mut fx = effects(ins, wave64);
+    let name = ins.base_name().unwrap_or("");
+    let exec_update = ins.enc == Enc::Sop1 && (name.contains("saveexec") || name.contains("wrexec"));
+    if matches!(ins.enc, Enc::Sopp | Enc::Sopc) || exec_update {
+        fx.whole.clear();
+    }
+    fx.whole.retain(|&r| r != SCC);
+    fx.prop.retain(|&(_, d)| d != SCC);
+    fx
+}
+
+fn step(l: &mut Live, fx: &Fx, exec_live: bool) {
     let after = *l;
     for &d in &fx.defs {
         l[d] = false;
@@ -323,19 +338,40 @@ fn step(l: &mut Live, fx: &Fx) {
     for &r in &fx.whole {
         l[r] = true;
     }
-    l[EXEC] = true;
-    l[EXEC + 1] = true;
+    if exec_live {
+        l[EXEC] = true;
+        l[EXEC + 1] = true;
+    }
 }
 
 /// Pcs of the VALU mask writes (compares, v_cmpx, carry-outs) whose result
 /// must be the complete wave mask.
 pub fn complete_masks(code: &[Inst], wave64: bool) -> HashSet<u32> {
+    analyze(code, wave64, false)
+}
+
+/// Whether a VALU mask write may be read as a value: copied into a VGPR or
+/// memory, counted or searched (s_bcnt, s_ff), used in scalar arithmetic.
+/// Outside wave-mask mode such reads come out wrong (a ballot that one lane
+/// stores holds that lane's bit alone), unlike branches, EXEC updates and
+/// SCC tests of masks.
+pub fn reads_mask_values(code: &[Inst], wave64: bool) -> bool {
+    !mask_value_writes(code, wave64).is_empty()
+}
+
+/// Pcs of the VALU mask writes whose value may be read (see
+/// [`reads_mask_values`]).
+pub fn mask_value_writes(code: &[Inst], wave64: bool) -> HashSet<u32> {
+    analyze(code, wave64, true)
+}
+
+fn analyze(code: &[Inst], wave64: bool, values_only: bool) -> HashSet<u32> {
     let mut out = HashSet::default();
     if code.is_empty() {
         return out;
     }
     let cfg = Cfg::new(code);
-    let fx: Vec<Fx> = code.iter().map(|i| effects(i, wave64)).collect();
+    let fx: Vec<Fx> = code.iter().map(|i| if values_only { value_effects(i, wave64) } else { effects(i, wave64) }).collect();
     let nb = cfg.starts.len();
     let exit = cfg.exit();
     let mut live_in: Vec<Live> = vec![[false; N]; nb];
@@ -355,7 +391,7 @@ pub fn complete_masks(code: &[Inst], wave64: bool) -> HashSet<u32> {
         for b in (0..nb).rev() {
             let mut l = live_out(&live_in, b);
             for i in (cfg.starts[b]..cfg.end(b)).rev() {
-                step(&mut l, &fx[i]);
+                step(&mut l, &fx[i], !values_only);
             }
             for k in 0..N {
                 if l[k] && !live_in[b][k] {
@@ -374,7 +410,7 @@ pub fn complete_masks(code: &[Inst], wave64: bool) -> HashSet<u32> {
             if fx[i].mask && fx[i].defs.iter().any(|&d| l[d]) {
                 out.insert(code[i].pc);
             }
-            step(&mut l, &fx[i]);
+            step(&mut l, &fx[i], !values_only);
         }
     }
     out
@@ -389,6 +425,9 @@ mod tests {
     }
     fn enc_vop2(op: u32, vdst: u32, src0: u32, vsrc1: u32) -> u32 {
         (op << 25) | (vdst << 17) | (vsrc1 << 9) | src0
+    }
+    fn enc_vop1(op: u32, vdst: u32, src0: u32) -> u32 {
+        (0x3F << 25) | (vdst << 17) | (op << 9) | src0
     }
     fn enc_sop1(op: u32, sdst: u32, ssrc0: u32) -> u32 {
         (0x17D << 23) | (sdst << 16) | (op << 8) | ssrc0
@@ -447,6 +486,32 @@ mod tests {
         // Without the SCC branch the and result is only selected from: partial.
         let code = program(&[enc_vopc(cmp, 256, 1), enc_sop2(and64, 106, 106, 126), enc_vop2(cnd, 2, 256, 1), enc_sopp(endpgm, 0)]);
         assert!(!complete_masks(&code, true).contains(&code[0].pc));
+    }
+
+    #[test]
+    fn mask_values_need_wave_masks() {
+        use crate::tables::*;
+        let cmp = opcode(VOPC, "v_cmp_lt_f32");
+        let mov = opcode(VOP1, "v_mov_b32");
+        let and64 = opcode(SOP2, "s_and_b64");
+        let and_sx = opcode(SOP1, "s_and_saveexec_b64");
+        let bcnt = opcode(SOP1, "s_bcnt1_i32_b64");
+        let cbr_scc = opcode(SOPP, "s_cbranch_scc1");
+        let cbr_exec = opcode(SOPP, "s_cbranch_execz");
+        let endpgm = 1;
+        // A ballot copied into a VGPR (to be stored): v_cmp vcc ; v_mov_b32 v0, vcc_lo
+        let code = program(&[enc_vopc(cmp, 256, 1), enc_vop1(mov, 0, 106), enc_sopp(endpgm, 0)]);
+        assert!(reads_mask_values(&code, true));
+        // Counted: v_cmp vcc ; s_and_b64 s[2:3], vcc, exec ; s_bcnt1 s6, s[2:3]
+        let code = program(&[enc_vopc(cmp, 256, 1), enc_sop2(and64, 2, 106, 126), enc_sop1(bcnt, 6, 2), enc_sopp(endpgm, 0)]);
+        assert!(reads_mask_values(&code, true));
+        // Branches only: v_cmp vcc ; s_and_saveexec_b64 s[4:5], vcc ; s_cbranch_execz
+        let code = program(&[enc_vopc(cmp, 256, 1), enc_sop1(and_sx, 4, 106), enc_sopp(cbr_exec, 0), enc_sopp(endpgm, 0)]);
+        assert!(!reads_mask_values(&code, true));
+        assert!(complete_masks(&code, true).contains(&code[0].pc));
+        // An SCC test: v_cmp vcc ; s_and_b64 vcc, vcc, exec ; s_cbranch_scc1
+        let code = program(&[enc_vopc(cmp, 256, 1), enc_sop2(and64, 106, 106, 126), enc_sopp(cbr_scc, 0), enc_sopp(endpgm, 0)]);
+        assert!(!reads_mask_values(&code, true));
     }
 
     #[test]
