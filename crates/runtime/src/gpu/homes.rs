@@ -65,6 +65,26 @@ struct Home {
 }
 
 static HOMES: Mutex<Vec<Home>> = Mutex::new(Vec::new());
+/// Bumped whenever homes are created or dropped: threads keep a copy of the
+/// home ranges (`ranges`) and check most bindings without the lock.
+static GEN: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static RANGES: std::cell::RefCell<(u64, Vec<(u64, u64)>)> = const { std::cell::RefCell::new((0, Vec::new())) };
+}
+
+/// Runs `f` on this thread's copy of the home ranges (base, size).
+fn with_ranges<R>(f: impl FnOnce(&[(u64, u64)]) -> R) -> R {
+    let g = GEN.load(Ordering::Acquire);
+    RANGES.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0 != g {
+            c.1 = HOMES.lock().iter().map(|h| (h.base, h.size)).collect();
+            c.0 = g;
+        }
+        f(&c.1)
+    })
+}
 /// Guest ranges GPU work wrote through bindings too large for a shadow
 /// (home candidates).
 static LARGE_WRITES: Mutex<Ranges> = Mutex::new(Ranges::new());
@@ -99,7 +119,7 @@ pub struct Bound {
 /// needs first (taken: the caller records them before the use). `written`:
 /// the use writes the range (guest memory goes stale there).
 pub fn bind(base: u64, size: u64, written: bool) -> Option<Bound> {
-    if !any() || size == 0 {
+    if !any() || size == 0 || !with_ranges(|r| r.iter().any(|&(b, n)| b <= base && base + size <= b + n)) {
         return None;
     }
     let mut g = HOMES.lock();
@@ -145,12 +165,12 @@ pub fn index_use(base: u64, size: u64) -> bool {
 
 /// Whether a home holds all of [base, base+size).
 pub fn contains(base: u64, size: u64) -> bool {
-    any() && HOMES.lock().iter().any(|h| h.base <= base && base + size <= h.base + h.size)
+    any() && with_ranges(|r| r.iter().any(|&(b, n)| b <= base && base + size <= b + n))
 }
 
 /// Whether [base, base+size) overlaps a home.
 pub fn overlaps(base: u64, size: u64) -> bool {
-    any() && HOMES.lock().iter().any(|h| h.base < base + size && base < h.base + h.size)
+    any() && with_ranges(|r| r.iter().any(|&(b, n)| b < base + size && base < b + n))
 }
 
 /// Creates a home for the pages of [base, base+size) unless one overlaps
@@ -179,6 +199,7 @@ pub fn create(base: u64, size: u64) -> bool {
     dirty.insert(b, n);
     g.push(Home { base: b, size: n, buf: Arc::new(HomeBuf { buf, mem, size: n }), dirty, stale: Ranges::default() });
     ANY.store(true, Ordering::Relaxed);
+    GEN.fetch_add(1, Ordering::AcqRel);
     CREATED.fetch_add(1, Ordering::Relaxed);
     crate::info!("gpu: video-memory home for {b:#x}+{n:#x} ({} MiB)", n >> 20);
     true
@@ -209,7 +230,9 @@ pub fn stale_parts(base: u64, size: u64, taken: bool) -> Vec<(u64, u64, Arc<Home
 
 /// Whether any of `reads` overlaps stale parts of a home.
 pub fn any_stale(reads: &[(u64, u64)]) -> bool {
-    any() && HOMES.lock().iter().any(|h| reads.iter().any(|&(a, n)| h.stale.overlaps(a, n)))
+    any()
+        && with_ranges(|r| reads.iter().any(|&(a, n)| r.iter().any(|&(b, m)| b < a + n && a < b + m)))
+        && HOMES.lock().iter().any(|h| reads.iter().any(|&(a, n)| h.stale.overlaps(a, n)))
 }
 
 /// A write from the CPU side (CP write, file read) into guest memory: the
@@ -247,6 +270,7 @@ pub fn remapped(base: u64, size: u64) {
     });
     DROPPED.fetch_add((before - g.len()) as u64, Ordering::Relaxed);
     ANY.store(!g.is_empty(), Ordering::Relaxed);
+    GEN.fetch_add(1, Ordering::AcqRel);
 }
 
 /// All homes with their GPU-written parts (taken), then dropped (`tune
@@ -264,6 +288,7 @@ pub fn take_all() -> Vec<(u64, u64, Arc<HomeBuf>, u64)> {
     DROPPED.fetch_add(g.len() as u64, Ordering::Relaxed);
     g.clear();
     ANY.store(false, Ordering::Relaxed);
+    GEN.fetch_add(1, Ordering::AcqRel);
     v
 }
 

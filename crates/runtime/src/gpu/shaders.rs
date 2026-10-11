@@ -153,6 +153,29 @@ impl Reader {
         Some(unsafe { std::ptr::read_volatile(addr as *const u32) })
     }
 
+    /// Reads `out.len()` consecutive dwords at `addr` with one readability
+    /// check; false (nothing read) if any of them is not readable.
+    fn read_into(&mut self, addr: u64, out: &mut [u32]) -> bool {
+        let n = 4 * out.len() as u64;
+        if addr % 4 != 0 || n == 0 {
+            return false;
+        }
+        if !(addr >= self.span.0 && addr + n <= self.span.1) {
+            if !super::cp::guest_readable(addr, n) {
+                return false;
+            }
+            self.span = crate::mem::readable_span(addr).unwrap_or((addr, addr + n));
+        }
+        match self.reads.last_mut() {
+            Some(r) if r.0 + r.1 == addr => r.1 += n,
+            _ => self.reads.push((addr, n)),
+        }
+        for (k, o) in out.iter_mut().enumerate() {
+            *o = unsafe { std::ptr::read_volatile((addr + 4 * k as u64) as *const u32) };
+        }
+        true
+    }
+
     fn ptr(&mut self, p: &Ptr, user: &[u32]) -> Option<u64> {
         match p {
             Ptr::User(i) => Some((*user.get(*i as usize)? as u64) | ((*user.get(*i as usize + 1)? as u64) << 32)),
@@ -578,8 +601,13 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
             _ => None,
         };
         res_addrs.push(src);
-        for (k, p) in res.dwords.iter().enumerate() {
-            w[k] = rd.eval(p, user).ok_or_else(|| format!("{:?} shader {addr:#x}: resource {i} dword {k} unresolvable ({p:?})", spec.stage))?;
+        // A descriptor in consecutive words: one block read.
+        let n = res.dwords.len().min(8);
+        let block = plan.blocks.get(i).copied().unwrap_or(false) && src.is_some_and(|b| rd.read_into(b, &mut w[..n]));
+        if !block {
+            for (k, p) in res.dwords.iter().enumerate() {
+                w[k] = rd.eval(p, user).ok_or_else(|| format!("{:?} shader {addr:#x}: resource {i} dword {k} unresolvable ({p:?})", spec.stage))?;
+            }
         }
         match res.kind {
             ResKind::Buffer => {
@@ -697,8 +725,13 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
     sgpr_data.resize(translate::SGPR_DATA_USER as usize, 0);
     for l in &tr.plan.loads {
         let base = rd.ptr(&l.ptr, user);
-        for k in 0..l.dwords {
-            sgpr_data.push(base.and_then(|b| rd.u32(b + l.offset as u64 + 4 * k as u64)).unwrap_or(0));
+        let start = sgpr_data.len();
+        sgpr_data.resize(start + l.dwords as usize, 0);
+        let Some(b) = base else { continue };
+        if !rd.read_into(b + l.offset as u64, &mut sgpr_data[start..]) {
+            for k in 0..l.dwords as usize {
+                sgpr_data[start + k] = rd.u32(b + l.offset as u64 + 4 * k as u64).unwrap_or(0);
+            }
         }
     }
     sgpr_data.resize(translate::sgpr_data_dwords(&tr.plan) as usize, 0);

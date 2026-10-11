@@ -439,6 +439,7 @@ impl Exec {
         if a.count == 0 || a.instances == 0 {
             return Ok(false);
         }
+        let t0 = std::time::Instant::now();
         let reg = |r: u32| ctx_reg(cp, r);
         // CB_COLOR_CONTROL.MODE: 0 color disabled, 1 normal; others are
         // metadata passes (fast-clear eliminate, FMASK/DCC decompress, resolve)
@@ -493,6 +494,7 @@ impl Exec {
             vs = shaders::prepare_ngg(cp)?;
             ps = if ps_addr != 0 { Some(shaders::prepare_ps(cp)?) } else { None };
         }
+        let t_prep = t0.elapsed();
         let mut textures = texture_ranges(&vs);
         if let Some(p) = &ps {
             textures.extend(texture_ranges(p));
@@ -615,6 +617,7 @@ impl Exec {
                 keep_gfx_pipe(hkey, p)
             }
         };
+        let t_pipe = t0.elapsed();
         // Depth arrays sampled with more layers than rendered so far.
         match &ps {
             Some(p) => self.grow_sampled_depth(&[&vs, p]),
@@ -651,6 +654,7 @@ impl Exec {
         }
         let set = self.alloc_set(set_layout)?;
         self.write_set(set, &bounds);
+        let t_bind = t0.elapsed();
         // Rendering instance: reuse it while the attachments stay the same
         // and the draw does not sample one of them.
         let sampled: Vec<vk::Image> = bounds.iter().flat_map(|b| b.images.iter().copied()).collect();
@@ -823,6 +827,9 @@ impl Exec {
             for &(w, n) in &b.writes {
                 self.note_write(w, n);
             }
+        }
+        if super::profiling() {
+            super::note_phases(&super::DRAW_PHASES, [t_prep, t_pipe, t_bind, t0.elapsed()]);
         }
         Ok(true)
     }

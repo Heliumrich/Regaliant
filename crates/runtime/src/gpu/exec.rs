@@ -1328,6 +1328,34 @@ static SHADER_TIME: Mutex<Option<HashMap<u64, [u64; 4]>>> = Mutex::new(None);
 /// GPU time between timed dispatches (draws, CP copies, barriers), ns.
 static GAP_NS: AtomicU64 = AtomicU64::new(0);
 
+/// Command-processor time per recorded command by phase (DS_PROFILE_GPU),
+/// ns: dispatches [prepare, waits + textures + pipeline, bindings, total,
+/// count], draws [prepare + shader-read waits, textures + targets +
+/// pipeline, bindings, total, count].
+pub(super) static CS_PHASES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+pub(super) static DRAW_PHASES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+pub(super) fn note_phases(table: &[AtomicU64; 5], t: [std::time::Duration; 4]) {
+    for (k, d) in t.iter().enumerate() {
+        table[k].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+    }
+    table[4].fetch_add(1, Ordering::Relaxed);
+}
+
+fn phases_line(what: &str, table: &[AtomicU64; 5], names: [&str; 3]) -> String {
+    let n = table[4].load(Ordering::Relaxed).max(1);
+    let us = |k: usize| table[k].load(Ordering::Relaxed) as f64 / n as f64 / 1000.0;
+    let (a, b, c, t) = (us(0), us(1) - us(0), us(2) - us(1), us(3));
+    format!(
+        "    command processor per {what}: {} recorded, {t:.1} us each ({} {a:.1}, {} {b:.1}, {} {c:.1}, recording {:.1})\n",
+        table[4].load(Ordering::Relaxed),
+        names[0],
+        names[1],
+        names[2],
+        t - us(2)
+    )
+}
+
 /// GPU time inside batches (first to last command), ns.
 static BATCH_NS: AtomicU64 = AtomicU64::new(0);
 /// GPU idle time between consecutive batches (one Vulkan queue runs them in
@@ -1394,6 +1422,9 @@ pub fn reset_shader_profile() {
         m.clear();
     }
     *SHADER_PLACEMENTS.lock() = None;
+    for c in CS_PHASES.iter().chain(DRAW_PHASES.iter()) {
+        c.store(0, Ordering::Relaxed);
+    }
     for (r, c) in SYNC_WHY_AT_RESET.iter().zip(SYNC_WHY.iter()) {
         r.store(c.load(Ordering::Relaxed), Ordering::Relaxed);
     }
@@ -1429,6 +1460,8 @@ pub fn shader_profile() -> String {
         let list: Vec<String> = v.iter().map(|(q, x)| format!("{q} {} ms ({} gaps, {} over 1 ms)", x[0] / 1_000_000, x[1], x[2])).collect();
         s.push_str(&format!("    gpu idle between batches {} ms, before batches of: {}\n", total / 1_000_000, list.join(", ")));
     }
+    s.push_str(&phases_line("draw", &DRAW_PHASES, ["prepare and shader-read waits", "textures, targets, pipeline", "bindings"]));
+    s.push_str(&phases_line("dispatch", &CS_PHASES, ["prepare and waits", "textures, pipeline", "bindings"]));
     {
         let n: Vec<u64> = SYNC_WHY.iter().zip(SYNC_WHY_AT_RESET.iter()).map(|(c, r)| c.load(Ordering::Relaxed).saturating_sub(r.load(Ordering::Relaxed))).collect();
         s.push_str(&format!(
@@ -1480,14 +1513,14 @@ pub struct Exec {
     /// range.
     snap_used: u64,
     snap_failed: bool,
-    snaps: HashMap<(u64, u64), u64>,
+    snaps: super::fx::Map<(u64, u64), u64>,
     /// Batch-start copies (`pre_copy`): space used in the current slot's
     /// buffer, whether the slot's prologue is being recorded, allocation
     /// failure, and the copies of the batch by guest range.
     pre_used: u64,
     pre_open: bool,
     pre_failed: bool,
-    pres: HashMap<(u64, u64), u64>,
+    pres: super::fx::Map<(u64, u64), u64>,
     ring_align: u64,
     recording: bool,
     /// When the batch being recorded was begun.
@@ -1556,11 +1589,11 @@ impl Exec {
                 ring_used: [0; 2],
                 snap_used: 0,
                 snap_failed: false,
-                snaps: HashMap::new(),
+                snaps: Default::default(),
                 pre_used: 0,
                 pre_open: false,
                 pre_failed: false,
-                pres: HashMap::new(),
+                pres: Default::default(),
                 ring_align: c.limits.min_storage_buffer_offset_alignment.max(16),
                 recording: false,
                 begun_at: std::time::Instant::now(),
@@ -3082,6 +3115,9 @@ impl Exec {
         EXECUTED.fetch_add(1, Ordering::Relaxed);
         self.batch_shaders.push(p.addr);
         let total = t0.elapsed();
+        if profiling() {
+            note_phases(&CS_PHASES, [t_prep, t_pipe, t_bind, total]);
+        }
         if total.as_millis() >= 200 {
             crate::info!(
                 "gpu[{}]: dispatch of cs {:#x} took {} ms (prepare {} ms, pipeline {} ms, bindings {} ms)",

@@ -95,6 +95,9 @@ pub struct Plan {
     pub errors: Vec<String>,
     /// s_buffer_load pc -> provenance of the V# it reads through.
     pub table_loads: HashMap<u32, Vec<Prov>>,
+    /// Per resource: its descriptor dwords are consecutive words behind one
+    /// pointer (read as one block).
+    pub blocks: Vec<bool>,
 }
 
 impl Plan {
@@ -330,6 +333,14 @@ fn run(code: &[Inst], user_sgprs: u16, user_base: u16, force: &HashSet<u32>) -> 
             step(&mut st, ins, &mut plan, force);
         }
     }
+    plan.blocks = plan
+        .resources
+        .iter()
+        .map(|r| match r.dwords.first() {
+            Some(Prov::Mem(p0, o0)) => r.dwords.iter().enumerate().all(|(k, d)| matches!(d, Prov::Mem(p, o) if p == p0 && *o == o0 + 4 * k as u32)),
+            _ => false,
+        })
+        .collect();
     for (i, r) in plan.resources.iter().enumerate() {
         if r.dwords.iter().any(|p| matches!(p, Prov::Unknown | Prov::Table(..))) {
             plan.errors.push(format!("resource {i} ({:?}) has unresolvable descriptor dwords {:?}", r.kind, r.dwords));
