@@ -12,7 +12,7 @@ use super::tiling;
 use super::vk::ctx;
 use ash::vk;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use super::fx::Map as HashMap;
 
 /// Vulkan format of a gfx10 image FORMAT.
 pub fn vk_format(fmt: u16) -> Option<vk::Format> {
@@ -468,7 +468,7 @@ pub struct Images {
     by_base: HashMap<u64, Vec<ImageKey>>,
     /// Addresses with a GPU-written image (render targets, storage images,
     /// stencil planes).
-    gpu_bases: std::collections::HashSet<u64>,
+    gpu_bases: super::fx::Set<u64>,
     /// Depth/stencil image of each rendered stencil plane address.
     stencil_of: HashMap<u64, ImageKey>,
     /// Surface of each metadata address (DCC, HTILE) and its clear values.
@@ -496,7 +496,7 @@ pub struct Images {
     pub overwrite_clears: u64,
     pub overwrite_uploads: u64,
     /// Images reported for buffer writes covering only part of them.
-    partial_seen: std::collections::HashSet<u64>,
+    partial_seen: super::fx::Set<u64>,
     /// Zero images for unused image table entries, by view type.
     dummies: HashMap<vk::ImageViewType, vk::ImageView>,
     /// Images replaced by larger ones (`grow_depth`); kept alive, since
@@ -528,7 +528,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
                 .expect("image pool");
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
-            *g = Some(Images { map: HashMap::new(), by_base: HashMap::new(), gpu_bases: Default::default(), stencil_of: HashMap::new(), meta_of: HashMap::new(), pending_clears: HashMap::new(), samplers: HashMap::new(), pool, cmd, fence, reported: HashMap::new(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::new(), retired: Vec::new(), depth_grows: 0 });
+            *g = Some(Images { map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), retired: Vec::new(), depth_grows: 0 });
         }
     }
     f(g.as_mut().unwrap())
@@ -1086,7 +1086,7 @@ impl Images {
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
         });
-        self.map_insert(new_key, Image { image, key: new_key, views: HashMap::new(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: prev.write_gen, block_gen: 0, span: 0, layout: None, overwritten: false });
+        self.map_insert(new_key, Image { image, key: new_key, views: HashMap::default(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: prev.write_gen, block_gen: 0, span: 0, layout: None, overwritten: false });
         for v in self.stencil_of.values_mut() {
             if *v == old {
                 *v = new_key;
@@ -1123,12 +1123,14 @@ impl Images {
             F::R16_UNORM => &[F::D16_UNORM, F::D16_UNORM_S8_UINT],
             _ => return None,
         };
-        self.map
+        // The images at this address (it scanned the whole cache per lookup).
+        self.by_base
+            .get(&key.base)?
             .iter()
-            .filter(|(k, i)| {
-                i.gpu_written && k.base == key.base && k.width == key.width && k.height == key.height && k.layers >= key.layers && !k.ty3d && !key.ty3d && depths.contains(&k.format)
+            .filter(|k| {
+                self.map.get(k).is_some_and(|i| i.gpu_written) && k.width == key.width && k.height == key.height && k.layers >= key.layers && !k.ty3d && !key.ty3d && depths.contains(&k.format)
             })
-            .map(|(k, _)| *k)
+            .copied()
             .max_by_key(|k| k.layers)
     }
 
@@ -1288,7 +1290,7 @@ impl Images {
             self.report(format!("texture {:#x} is not write-tracked (read-only or unmapped pages): later CPU updates are not seen", t.base));
         }
         let hashes = source.map(|(b, n)| all_hashes(b, n)).unwrap_or([0; SLICES]);
-        self.map_insert(key, Image { image, key, views: HashMap::new(), gpu_written: false, source: region, hashes, checked_frame: frame, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false });
+        self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: false, source: region, hashes, checked_frame: frame, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false });
         self.note_layout(key, t);
         Ok(key)
     }
@@ -1530,7 +1532,7 @@ impl Images {
         } else {
             let image = self.create(key)?;
             self.to_general(image, key.format);
-            self.map_insert(key, Image { image, key, views: HashMap::new(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false });
+            self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false });
             self.gpu_bases.insert(key.base);
             crate::info!("images: new render target {:#x} {}x{} {:?} at flip {}", key.base, key.width, key.height, key.format, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
             // DS_CAPTURE_NEW_RT=<hex base>: capture the frame after a render
