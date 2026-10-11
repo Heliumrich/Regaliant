@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 33] = [
+    static ALL: [Tunable; 35] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -57,9 +57,11 @@ pub mod tune {
         Tunable { name: "ahead", env: "DS_AHEAD", default: 4, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_cs", env: "DS_PRE_CS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "par", env: "DS_PAR", default: 5, value: AtomicU64::new(UNSET) },
-        Tunable { name: "pre_share", env: "DS_PRE_SHARE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_share", env: "DS_PRE_SHARE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "pending_set", env: "DS_PENDING_SET", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "tex_scrub", env: "DS_TEX_SCRUB", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_share_min", env: "DS_PRE_SHARE_MIN", default: 65536, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_share_mib", env: "DS_PRE_SHARE_MIB", default: 1024, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -286,6 +288,17 @@ pub mod tune {
     /// (`images::scrubbing`); 0: by the first draw binding each per frame.
     pub fn tex_scrub() -> bool {
         get(32) != 0
+    }
+
+    /// Smallest batch-start copy kept in the shared video-memory chunks
+    /// (`gpu::precache`), bytes.
+    pub fn pre_share_min() -> u64 {
+        get(33)
+    }
+
+    /// Video memory for shared batch-start copies, MiB.
+    pub fn pre_share_mib() -> u64 {
+        get(34)
     }
 
     /// Command-processor waits for GPU work still to be traced (`tune

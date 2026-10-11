@@ -152,9 +152,62 @@ struct Span {
     start: u64,
     end: u64,
     buffer: vk::Buffer,
+    mem: vk::DeviceMemory,
     /// Still backed by the pages it was imported with (cleared when guest
     /// pages in its range are committed or decommitted).
     valid: bool,
+}
+
+/// Imports whose guest pages were remapped (`revalidate_spans`), freed once
+/// no batch can still use them (`reap_spans`): with SPAN_GEN after their
+/// invalidation and, once no unsubmitted batch began before that, the last
+/// batch sequence submitted then. They pin the pages they were imported
+/// with: kept forever, they pinned more host memory at every level change
+/// until imports failed (run 20261011-224123).
+struct Dead {
+    span: Span,
+    generation: u64,
+    seq: Option<u64>,
+}
+
+static GRAVEYARD: Mutex<Vec<Dead>> = Mutex::new(Vec::new());
+static GRAVEYARD_LEN: AtomicU64 = AtomicU64::new(0);
+/// Imports freed after remapping: [count, bytes].
+static SPANS_FREED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Per executor, SPAN_GEN when its oldest batch not yet submitted began
+/// (u64::MAX: none). Imports are looked up only while a batch records, so a
+/// batch that began after an import was dropped cannot use it.
+static EXEC_GENS: Mutex<Vec<std::sync::Arc<AtomicU64>>> = Mutex::new(Vec::new());
+
+/// Frees dropped imports no batch can use any more (completion thread).
+fn reap_spans() {
+    if GRAVEYARD_LEN.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let oldest_open = EXEC_GENS.lock().iter().map(|g| g.load(Ordering::SeqCst)).min().unwrap_or(u64::MAX);
+    let next = NEXT_SEQ.load(Ordering::SeqCst);
+    let done = done_seq();
+    let mut g = GRAVEYARD.lock();
+    g.retain_mut(|d| {
+        if d.seq.is_none() && oldest_open >= d.generation {
+            // Every batch that may use it was submitted by now.
+            d.seq = Some(next - 1);
+        }
+        match d.seq {
+            Some(s) if done >= s && !DEVICE_LOST.load(Ordering::Relaxed) => {
+                unsafe {
+                    ctx().device.destroy_buffer(d.span.buffer, None);
+                    ctx().device.free_memory(d.span.mem, None);
+                }
+                SPANS_FREED[0].fetch_add(1, Ordering::Relaxed);
+                SPANS_FREED[1].fetch_add(d.span.end - d.span.start, Ordering::Relaxed);
+                false
+            }
+            _ => true,
+        }
+    });
+    GRAVEYARD_LEN.store(g.len() as u64, Ordering::Release);
 }
 
 struct Pipe {
@@ -341,16 +394,30 @@ fn revalidate_spans() {
     let ranges: Vec<(u64, u64)> = changed.iter().map(|&(a, b)| (a, b - a)).collect();
     super::mirror::invalidate(&ranges);
     let mut g = SPANS.write();
-    for s in g.iter_mut().filter(|s| s.valid) {
-        if changed.iter().any(|&(a, b)| a < s.end && s.start < b) {
-            // Kept alive: recorded work may still reference it.
-            s.valid = false;
+    let mut dead = Vec::new();
+    let mut i = 0;
+    while i < g.len() {
+        let s = &g[i];
+        if s.valid && changed.iter().any(|&(a, b)| a < s.end && s.start < b) {
             if IMPORTS_STALE.fetch_add(1, Ordering::Relaxed) < 20 {
                 crate::info!("gpu: guest range {:#x}..{:#x} imported for the GPU was remapped (imported again on its next use)", s.start, s.end);
             }
+            // Freed once no batch can use it (recorded work may).
+            dead.push(g.swap_remove(i));
+        } else {
+            i += 1;
         }
     }
-    SPAN_GEN.fetch_add(1, Ordering::AcqRel);
+    let generation = SPAN_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+    drop(g);
+    if !dead.is_empty() {
+        let mut gy = GRAVEYARD.lock();
+        gy.extend(dead.into_iter().map(|mut span| {
+            span.valid = false;
+            Dead { span, generation, seq: None }
+        }));
+        GRAVEYARD_LEN.store(gy.len() as u64, Ordering::Release);
+    }
 }
 
 /// Imported buffer covering guest [base, base+size): (buffer, window start, window end).
@@ -441,12 +508,12 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     let _w = super::track::protected().then(|| super::track::host_write(start, end - start));
     let t0 = std::time::Instant::now();
     match ctx().import_host(start, end - start, usage) {
-        Ok((buffer, _mem)) => {
+        Ok((buffer, mem)) => {
             let ms = t0.elapsed().as_millis();
             if ms >= 50 {
                 crate::info!("gpu: importing guest {start:#x}..{end:#x} ({} MiB) took {ms} ms", (end - start) >> 20);
             }
-            g.push(Span { start, end, buffer, valid: true });
+            g.push(Span { start, end, buffer, mem, valid: true });
             SPAN_GEN.fetch_add(1, Ordering::AcqRel);
             IMPORTS.fetch_add(1, Ordering::Relaxed);
             IMPORT_BYTES.fetch_add(end - start, Ordering::Relaxed);
@@ -456,7 +523,9 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
             Some((buffer, start, end))
         }
         Err(e) => {
-            crate::warn!("gpu: importing guest {start:#x}..{end:#x} failed: {e}");
+            static REPORTED: AtomicU64 = AtomicU64::new(0);
+            let heaps = if REPORTED.fetch_add(1, Ordering::Relaxed) < 4 { format!(" (memory: {}; {} imports dropped after remapping not freed yet)", super::vk::ctx_heaps(), GRAVEYARD_LEN.load(Ordering::Relaxed)) } else { String::new() };
+            crate::warn!("gpu: importing guest {start:#x}..{end:#x} failed: {e}{heaps}");
             None
         }
     }
@@ -1010,6 +1079,12 @@ fn texture_ranges(p: &Prepared) -> Vec<((u64, u64), super::desc::Tsharp)> {
 /// ahead of the GPU. Slots are created when first used.
 pub const MAX_SLOTS: usize = 8;
 
+/// Largest read-only binding of memory the driver cannot import that is
+/// copied by the CPU (`Exec::snapshot`) instead of bound as zeros.
+const UNIMPORTABLE_SNAP_MAX: u64 = 64 << 10;
+/// Bindings served that way.
+static UNIMPORTABLE_SNAPS: AtomicU64 = AtomicU64::new(0);
+
 /// Command-processor effect performed after GPU work completes.
 pub type Action = Box<dyn FnOnce() + Send>;
 
@@ -1249,6 +1324,7 @@ fn completion_thread() {
         }
         *LAST_DONE_AT.lock() = Some(std::time::Instant::now());
         DONE_CV.notify_all();
+        reap_spans();
     }
 }
 
@@ -1502,7 +1578,7 @@ static PRE_REPEAT: Mutex<(u64, Option<HashSet<(u64, u64)>>, [u64; 4], [[u64; 2];
 /// of its last first-in-frame copy and a sampled hash of its bytes then
 /// (`images::sampled_hash`); bytes of first-in-frame copies [of ranges not
 /// copied in the two frames before, unchanged since, changed].
-static PRE_STABLE: Mutex<(Option<HashMap<(u64, u64), (u64, u64)>>, [u64; 3])> = Mutex::new((None, [0; 3]));
+static PRE_STABLE: Mutex<(Option<HashMap<(u64, u64), (u64, u64)>>, [u64; 5])> = Mutex::new((None, [0; 5]));
 
 fn note_pre_stable(base: u64, size: u64, n: u64, frame: u64) {
     let h = super::images::sampled_hash(base, size);
@@ -1557,11 +1633,14 @@ fn pre_repeat_line() -> String {
     let g = PRE_REPEAT.lock();
     let mb = |b: u64| b as f64 / (1u64 << 20) as f64;
     let stable = format!(
-        "    batch-start copies across frames (first in a frame): ranges not copied in the two frames before {:.0} MiB, unchanged since {:.0} MiB, changed {:.0} MiB (sampled hashes)
+        "    batch-start copies across frames (first in a frame): ranges not copied in the two frames before {:.0} MiB, unchanged since {:.0} MiB, changed {:.0} MiB (sampled hashes); write-watch queries {} ({:.1} us each, {} pages)
 ",
         mb(st[0]),
         mb(st[1]),
-        mb(st[2])
+        mb(st[2]),
+        crate::mem::WRITE_WATCH_STATS[0].load(Ordering::Relaxed),
+        crate::mem::WRITE_WATCH_STATS[1].load(Ordering::Relaxed) as f64 / crate::mem::WRITE_WATCH_STATS[0].load(Ordering::Relaxed).max(1) as f64 / 1000.0,
+        crate::mem::WRITE_WATCH_STATS[2].load(Ordering::Relaxed)
     );
     let sizes: Vec<String> = ["<4K", "<64K", "<1M", ">=1M"].iter().zip(g.3.iter()).map(|(n, x)| format!("{n} {} ({:.0} MiB)", x[0], mb(x[1]))).collect();
     format!(
@@ -1776,7 +1855,10 @@ pub fn reset_shader_profile() {
         g.2 = [0; 4];
         g.3 = [[0; 2]; 4];
     }
-    PRE_STABLE.lock().1 = [0; 3];
+    PRE_STABLE.lock().1 = [0; 5];
+    for c in crate::mem::WRITE_WATCH_STATS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
     for c in DRAW_STEPS.iter().chain(CS_STEPS.iter()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
@@ -1950,6 +2032,9 @@ pub struct Exec {
     pub(crate) stop_why: &'static str,
     flush_why: &'static str,
     closed: Vec<Closed>,
+    /// SPAN_GEN when its oldest batch not yet submitted began (u64::MAX:
+    /// none), registered in EXEC_GENS (`reap_spans`).
+    open_gen: std::sync::Arc<AtomicU64>,
     /// The graphics queue's family (command processor and parallel
     /// workers): batch-start copies are shared (`gpu::precache`).
     shares_pre: bool,
@@ -2031,7 +2116,12 @@ impl Exec {
                 stop_why: "",
                 flush_why: "",
                 closed: Vec::new(),
-                shares_pre: name.starts_with("gpu-gfx"),
+                open_gen: {
+                    let g = std::sync::Arc::new(AtomicU64::new(u64::MAX));
+                    EXEC_GENS.lock().push(g.clone());
+                    g
+                },
+                shares_pre: true,
                 shared_pending: Vec::new(),
             })
         }
@@ -2057,6 +2147,10 @@ impl Exec {
     fn begin(&mut self) {
         if self.recording {
             return;
+        }
+        // Imports looked up from now on belong to this batch (`reap_spans`).
+        if self.open_gen.load(Ordering::Relaxed) == u64::MAX {
+            self.open_gen.store(SPAN_GEN.load(Ordering::SeqCst), Ordering::SeqCst);
         }
         if self.deferred {
             // A slot whose batch is closed but not submitted cannot be reused:
@@ -2239,6 +2333,7 @@ impl Exec {
             }
         });
         self.slots[i].seq = seq;
+        self.open_gen.store(u64::MAX, Ordering::SeqCst);
         super::precache::submitted(&std::mem::take(&mut self.shared_pending), seq);
         for (a, v, n) in std::mem::take(&mut self.pending_promises) {
             super::cp::promise(seq, a, v, n);
@@ -2250,6 +2345,9 @@ impl Exec {
         let writes = std::mem::take(&mut self.pending);
         self.pending_log.clear();
         INFLIGHT.note_ranges(seq, &writes);
+        // Shared copies made by batches submitted before this one precede
+        // its writes on the GPU (see `precache`).
+        super::precache::invalidate_ranges(&writes);
         self.inflight.insert_all(seq, &writes);
         self.last_seq = seq;
         if has_actions {
@@ -2268,6 +2366,9 @@ impl Exec {
     /// Drops the recorded batch (process shutdown: label waits were released,
     /// so the work may lack its inputs). The slot stays free.
     fn discard(&mut self) {
+        if self.closed.is_empty() {
+            self.open_gen.store(u64::MAX, Ordering::SeqCst);
+        }
         self.end_rendering();
         unsafe { ctx().device.end_command_buffer(self.cmd()).ok() };
         self.actions.clear();
@@ -2468,7 +2569,7 @@ impl Exec {
             return Some((buf, at, bias));
         }
         let n = (bias + size).next_multiple_of(4);
-        let share = self.shares_pre && super::precache::enabled();
+        let share = self.shares_pre && super::precache::enabled() && super::precache::worth(size);
         if share {
             // Copied by an earlier submitted batch (`gpu::precache`).
             if let Some((chunk, at)) = super::precache::lookup(base, size) {
@@ -2972,8 +3073,8 @@ impl Exec {
         if bytes == 0 || bytes > 65536 || a % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(a, bytes) {
             return false;
         }
-        let Some((buffer, start, _)) = span(a, bytes) else { return false };
         self.begin();
+        let Some((buffer, start, _)) = span(a, bytes) else { return false };
         self.end_rendering();
         let cmd = self.cmd();
         let raw: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -3239,9 +3340,13 @@ impl Exec {
             self.slots[b.slot].seq = seq;
             super::precache::submitted(&b.shared, seq);
             INFLIGHT.note_ranges(seq, &b.writes);
+            super::precache::invalidate_ranges(&b.writes);
             self.inflight.insert_all(seq, &b.writes);
             self.last_seq = seq;
             last = Some(seq);
+        }
+        if !self.recording {
+            self.open_gen.store(u64::MAX, Ordering::SeqCst);
         }
         last
     }
@@ -3266,6 +3371,9 @@ impl Exec {
             s.homes.clear();
             s.keep.clear();
             s.seq = 0;
+        }
+        if !self.recording {
+            self.open_gen.store(u64::MAX, Ordering::SeqCst);
         }
     }
 
@@ -3432,8 +3540,24 @@ impl Exec {
                                     }
                                 }
                                 None => {
-                                    let why = unmapped_reason(base, size);
-                                    self.report(format!("{:?} shader {:#x}: buffer {base:#x}+{size:#x} is not mapped GPU memory (bound as zeros): {why}", p.stage, p.addr));
+                                    // Memory the driver cannot import (e.g. the
+                                    // executable's read-only pages, which hold some
+                                    // shaders' constants): small read-only ranges
+                                    // are copied by the CPU instead of read as zeros.
+                                    let snap = if read_only { self.snapshot(base, size, UNIMPORTABLE_SNAP_MAX) } else { None };
+                                    match snap {
+                                        Some((sbuf, soff, sbias)) => {
+                                            placement = Placement::Snapshot;
+                                            bias = sbias;
+                                            info = vk::DescriptorBufferInfo { buffer: sbuf, offset: soff, range: (sbias + size).next_multiple_of(4) };
+                                            bound_size = size;
+                                            UNIMPORTABLE_SNAPS.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        None => {
+                                            let why = unmapped_reason(base, size);
+                                            self.report(format!("{:?} shader {:#x}: buffer {base:#x}+{size:#x} is not mapped GPU memory (bound as zeros): {why}", p.stage, p.addr));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -3948,11 +4072,12 @@ pub fn status() -> String {
         + &super::homes::status()
         + &sync_why_status()
         + &format!(
-            "    buffer snapshots in VRAM: {} ({} MiB), {} reused, {} not for lack of space; draws with snapshotted indices {} ({} MiB); batch-start copies {} ({} MiB), {} reused, {} not for lack of space\n",
+            "    buffer snapshots in VRAM: {} ({} MiB), {} reused, {} not for lack of space, {} for memory that cannot be imported; draws with snapshotted indices {} ({} MiB); batch-start copies {} ({} MiB), {} reused, {} not for lack of space\n",
             SNAPS.load(Ordering::Relaxed),
             SNAP_COPIED.load(Ordering::Relaxed) >> 20,
             SNAPS_REUSED.load(Ordering::Relaxed),
             SNAPS_FULL.load(Ordering::Relaxed),
+            UNIMPORTABLE_SNAPS.load(Ordering::Relaxed),
             INDEX_SNAPS.load(Ordering::Relaxed),
             INDEX_SNAP_BYTES.load(Ordering::Relaxed) >> 20,
             PRE_COPIES.load(Ordering::Relaxed),
@@ -3961,12 +4086,16 @@ pub fn status() -> String {
             PRE_FULL.load(Ordering::Relaxed)
         )
         + &format!(
-            "    guest memory imports: {} ({} MiB), {} over several mappings, {} dropped after remapping
+            "    guest memory imports: {} ({} MiB), {} over several mappings, {} dropped after remapping ({} freed, {} MiB; {} waiting); memory: {}
 ",
             IMPORTS.load(Ordering::Relaxed),
             IMPORT_BYTES.load(Ordering::Relaxed) >> 20,
             IMPORTS_MULTI.load(Ordering::Relaxed),
-            IMPORTS_STALE.load(Ordering::Relaxed)
+            IMPORTS_STALE.load(Ordering::Relaxed),
+            SPANS_FREED[0].load(Ordering::Relaxed),
+            SPANS_FREED[1].load(Ordering::Relaxed) >> 20,
+            GRAVEYARD_LEN.load(Ordering::Relaxed),
+            super::vk::ctx_heaps()
         )
         + &format!("    gpu completion: {} ms waiting for fences, {} ms in actions
 ", FENCE_NS.load(Ordering::Relaxed) / 1_000_000, ACTION_NS.load(Ordering::Relaxed) / 1_000_000)

@@ -333,24 +333,111 @@ fn last_error() -> u32 {
 }
 
 static RESERVED_EARLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The guest range was reserved with write watching (`take_written`).
+static WRITE_WATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Why a requested write-watched reservation failed (Win32 error; 0: none).
+static WRITE_WATCH_ERROR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Reserves the whole guest range at the process's first heap allocation
-/// (`heap`; allocates nothing). `reserve_guest_range` reports a failure.
+/// Whether environment variable `name` (ASCII) equals `value`, read without
+/// allocating (the heap may not be set up yet).
+pub fn env_is(name: &str, value: &str) -> bool {
+    use windows_sys::Win32::System::Environment::GetEnvironmentVariableW;
+    let mut n = [0u16; 64];
+    if name.len() >= n.len() {
+        return false;
+    }
+    for (d, c) in n.iter_mut().zip(name.bytes()) {
+        *d = c as u16;
+    }
+    let mut buf = [0u16; 64];
+    let len = unsafe { GetEnvironmentVariableW(n.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    len == value.len() && buf[..len].iter().zip(value.bytes()).all(|(&a, b)| a == b as u16)
+}
+
+/// Reserves the whole guest range once, allocating nothing: called by
+/// `reserve_guest_range` at the start of `main` and by the first heap
+/// allocation should one come earlier (`heap`). With write watching (the
+/// system notes which pages the CPU writes; `take_written`) unless
+/// `DS_WRITE_WATCH=0`.
 pub fn reserve_guest_range_early() {
-    let p = unsafe { VirtualAlloc(GUEST_BASE as _, (GUEST_END - GUEST_BASE) as usize, MEM_RESERVE, PAGE_NOACCESS) };
+    if RESERVED_EARLY.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let size = (GUEST_END - GUEST_BASE) as usize;
+    if !env_is("DS_WRITE_WATCH", "0") {
+        let p = unsafe { VirtualAlloc(GUEST_BASE as _, size, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS) };
+        if !p.is_null() {
+            WRITE_WATCH.store(true, std::sync::atomic::Ordering::Release);
+            RESERVED_EARLY.store(true, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        WRITE_WATCH_ERROR.store(last_error(), std::sync::atomic::Ordering::Release);
+    }
+    let p = unsafe { VirtualAlloc(GUEST_BASE as _, size, MEM_RESERVE, PAGE_NOACCESS) };
     if !p.is_null() {
         RESERVED_EARLY.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
-/// Reserves the whole guest range (done by the first heap allocation, see
-/// `reserve_guest_range_early`). Must run before anything else allocates widely.
-pub fn reserve_guest_range() -> Result<(), String> {
-    if RESERVED_EARLY.load(std::sync::atomic::Ordering::Acquire) {
-        return Ok(());
+/// VirtualAlloc's MEM_WRITE_WATCH and GetWriteWatch's WRITE_WATCH_FLAG_RESET
+/// (not named by windows-sys).
+const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+const WRITE_WATCH_FLAG_RESET: u32 = 1;
+
+/// Whether the guest range is write-watched.
+pub fn write_watched() -> bool {
+    WRITE_WATCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Write watching of the guest range, for the start-up log.
+pub fn write_watch_state() -> String {
+    match (write_watched(), WRITE_WATCH_ERROR.load(std::sync::atomic::Ordering::Acquire)) {
+        (true, _) => "on".into(),
+        (false, 0) => "off".into(),
+        (false, e) => format!("off (reserving with write watch failed: error {e})"),
     }
-    let p = unsafe { VirtualAlloc(GUEST_BASE as _, (GUEST_END - GUEST_BASE) as usize, MEM_RESERVE, PAGE_NOACCESS) };
-    if p.is_null() {
+}
+
+/// Statistics of `take_written`: [calls, ns, pages reported].
+pub static WRITE_WATCH_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The 4 KiB pages of guest [base, base+size) the CPU wrote since they were
+/// last taken (their write marks are reset), into `out` (page addresses);
+/// None without write watching or when the query fails (treat as written).
+pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !write_watched() || size == 0 {
+        return None;
+    }
+    let (lo, hi) = (base & !4095, (base + size).next_multiple_of(4096));
+    let t = std::time::Instant::now();
+    let mut addrs = [std::ptr::null_mut::<std::ffi::c_void>(); 256];
+    let mut at = lo;
+    while at < hi {
+        let mut count: usize = addrs.len();
+        let mut gran = 0u32;
+        let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, at as _, (hi - at) as usize, addrs.as_mut_ptr(), &mut count, &mut gran) };
+        if r != 0 {
+            return None;
+        }
+        out.extend(addrs[..count].iter().map(|&a| a as u64));
+        if count < addrs.len() {
+            break;
+        }
+        // More than fit: continue after the last page reported.
+        at = addrs[count - 1] as u64 + 4096;
+    }
+    WRITE_WATCH_STATS[0].fetch_add(1, Relaxed);
+    WRITE_WATCH_STATS[1].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+    WRITE_WATCH_STATS[2].fetch_add(out.len() as u64, Relaxed);
+    Some(())
+}
+
+/// Reserves the whole guest range (`reserve_guest_range_early`). Must run
+/// before anything else allocates widely.
+pub fn reserve_guest_range() -> Result<(), String> {
+    reserve_guest_range_early();
+    if !RESERVED_EARLY.load(std::sync::atomic::Ordering::Acquire) {
         let err = last_error();
         // Find what occupies the range for a useful diagnostic.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };

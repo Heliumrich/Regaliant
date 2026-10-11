@@ -9,8 +9,9 @@
 //!
 //! mimalloc places its segments at hint addresses between 2 and 6 TiB on
 //! 64-bit Windows, inside the guest address range (`mem::GUEST_BASE` ..
-//! `GUEST_END`), which must be reserved in one piece: the first allocation
-//! therefore reserves the guest range before anything else is allocated.
+//! `GUEST_END`), which must be reserved in one piece. `main` reserves it
+//! before it allocates anything (nothing is allocated before `main`); should
+//! an allocation ever come first, it reserves the range itself.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -52,11 +53,7 @@ fn decide() -> u8 {
 
 /// `DS_ALLOC=system` (read without allocating).
 fn env_is_system() -> bool {
-    use windows_sys::Win32::System::Environment::GetEnvironmentVariableW;
-    let name: [u16; 9] = [b'D' as u16, b'S' as u16, b'_' as u16, b'A' as u16, b'L' as u16, b'L' as u16, b'O' as u16, b'C' as u16, 0];
-    let mut buf = [0u16; 16];
-    let n = unsafe { GetEnvironmentVariableW(name.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
-    n == 6 && buf[..6].iter().zip("system".bytes()).all(|(&a, b)| a == b as u16)
+    crate::mem::env_is("DS_ALLOC", "system")
 }
 
 /// Which heap is in use (status line).

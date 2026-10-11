@@ -714,7 +714,7 @@ fn main() {
     }
     log::TRACE_HLE.store(cfg.trace, std::sync::atomic::Ordering::Relaxed);
     hle::LENIENT_IMPORTS.store(cfg.lenient, std::sync::atomic::Ordering::Relaxed);
-    info!("dsport {} | run dir {} | TLS slot {} | host heap: {}", env!("CARGO_PKG_VERSION"), cfg.run_dir.display(), slot, heap::name());
+    info!("dsport {} | run dir {} | TLS slot {} | host heap: {} | guest write watch: {}", env!("CARGO_PKG_VERSION"), cfg.run_dir.display(), slot, heap::name(), mem::write_watch_state());
     exception::install();
     if let Some(c) = &cfg.pipeline_test {
         let code = gpu::exec::pipeline_test(c);

@@ -743,7 +743,7 @@ impl Cp {
     /// (`gpu::precache`), unless the label holds what a GPU queue's CP wrote
     /// last (the queues synchronize this way ~250 times per frame).
     fn end_copy_scope_after_wait(&self, a: u64, wide: bool) {
-        if self.compute || !valid(a, if wide { 8 } else { 4 }) {
+        if !valid(a, if wide { 8 } else { 4 }) {
             return;
         }
         let now = unsafe { if wide { rd64(a) } else { rd32(a) as u64 } };
@@ -757,9 +757,7 @@ impl Cp {
     /// come between submissions, so shared batch-start copies of the
     /// graphics queue are dropped (`gpu::precache`).
     pub fn new_submission(&mut self) {
-        if !self.compute {
-            super::precache::end_scope(0);
-        }
+        super::precache::end_scope(0);
     }
 
     /// Submits the batches this worker closed (the main command processor,
@@ -2307,6 +2305,7 @@ impl Cp {
         let (name, at) = (self.name.clone(), self.cur_packet);
         let range = Some((dst, if daic { 4 } else { bytes }));
         super::mirror::invalidate(&[(dst, if daic { 4 } else { bytes })]);
+        super::precache::invalidate(dst, if daic { 4 } else { bytes });
         super::exec::trace_writes(|| format!("{} DMA_DATA (src_sel {src_sel}, from {src:#x})", self.name), dst, bytes);
         if super::exec::enabled() {
             super::images::with(|im| {
@@ -2351,6 +2350,8 @@ impl Cp {
                             }
                         } else {
                             unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, bytes as usize) };
+                            // Shared copies checked in this epoch are stale now.
+                            super::precache::invalidate(dst, bytes);
                         }
                         note_block(&name, dst, if daic { 4 } else { bytes }, at);
                     }),

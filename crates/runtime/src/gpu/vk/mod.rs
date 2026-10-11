@@ -32,6 +32,8 @@ pub struct Ctx {
     pub validation: bool,
     /// VK_KHR_fragment_shader_barycentric enabled.
     pub barycentric: bool,
+    /// VK_EXT_memory_budget enabled (`heap_report`).
+    pub memory_budget: bool,
 }
 
 static CTX: OnceLock<Ctx> = OnceLock::new();
@@ -147,6 +149,14 @@ fn init_inner() -> Result<(), String> {
         let mut dexts = vec![ash::khr::swapchain::NAME.as_ptr(), ash::khr::push_descriptor::NAME.as_ptr()];
         if host_import {
             dexts.push(ash::ext::external_memory_host::NAME.as_ptr());
+        }
+        let memory_budget = instance
+            .enumerate_device_extension_properties(pdev)
+            .unwrap_or_default()
+            .iter()
+            .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::memory_budget::NAME);
+        if memory_budget {
+            dexts.push(ash::ext::memory_budget::NAME.as_ptr());
         }
         let want_ckpt = std::env::var("DS_GPU_CHECKPOINTS").ok().as_deref() == Some("1");
         let has_ckpt = want_ckpt
@@ -307,6 +317,7 @@ fn init_inner() -> Result<(), String> {
             device_name,
             validation,
             barycentric,
+            memory_budget,
         };
         crate::info!("Vulkan device: {} (queue family {qf}, validation {})", ctx.device_name, validation);
         {
@@ -325,8 +336,40 @@ fn init_inner() -> Result<(), String> {
             );
         }
         CTX.set(ctx).ok();
+        crate::info!("Vulkan memory heaps: {}", ctx_heaps());
         Ok(())
     }
+}
+
+impl Ctx {
+    /// Each memory heap: size, flags and (VK_EXT_memory_budget) this
+    /// process's usage against its budget, MiB.
+    pub fn heap_report(&self) -> String {
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut p2 = vk::PhysicalDeviceMemoryProperties2::default();
+        if self.memory_budget {
+            p2 = p2.push_next(&mut budget);
+        }
+        unsafe { self.instance.get_physical_device_memory_properties2(self.pdev, &mut p2) };
+        let props = p2.memory_properties;
+        (0..props.memory_heap_count as usize)
+            .map(|i| {
+                let h = props.memory_heaps[i];
+                let local = if h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) { "device-local" } else { "host" };
+                if self.memory_budget {
+                    format!("heap {i} ({local}) {} MiB: used {} of budget {}", h.size >> 20, budget.heap_usage[i] >> 20, budget.heap_budget[i] >> 20)
+                } else {
+                    format!("heap {i} ({local}) {} MiB", h.size >> 20)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+/// `Ctx::heap_report` of the initialized context ("" before).
+pub fn ctx_heaps() -> String {
+    CTX.get().map(|c| c.heap_report()).unwrap_or_default()
 }
 
 /// Checkpoint marker kinds (high byte of the marker value).
