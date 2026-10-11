@@ -273,10 +273,12 @@ pub fn on_write_fault(addr: u64) -> bool {
 }
 
 /// A write that cannot fault is in progress (see `host_write`).
-pub struct HostWrite(Option<u64>);
+/// (busy-range id, written range: homes copy it in when the write is done).
+pub struct HostWrite(Option<u64>, u64, u64);
 
 impl Drop for HostWrite {
     fn drop(&mut self) {
+        super::homes::cpu_written(self.1, self.2);
         if let Some(id) = self.0 {
             if let Some(t) = TRACK.lock().as_mut() {
                 t.busy.retain(|b| b.0 != id);
@@ -291,12 +293,12 @@ impl Drop for HostWrite {
 /// writable while the returned guard lives.
 pub fn host_write(base: u64, len: u64) -> HostWrite {
     if len == 0 {
-        return HostWrite(None);
+        return HostWrite(None, base, 0);
     }
     let mut g = TRACK.lock();
-    let Some(t) = g.as_mut() else { return HostWrite(None) };
+    let Some(t) = g.as_mut() else { return HostWrite(None, base, len) };
     if t.regions.is_empty() {
-        return HostWrite(None);
+        return HostWrite(None, base, len);
     }
     let (first, end) = (base & !(PAGE - 1), base + len);
     if (end - first) / PAGE > t.pages.len() as u64 {
@@ -322,7 +324,7 @@ pub fn host_write(base: u64, len: u64) -> HostWrite {
     t.next_busy += 1;
     let id = t.next_busy;
     t.busy.push((id, base, len));
-    HostWrite(Some(id))
+    HostWrite(Some(id), base, len)
 }
 
 /// Announces a GPU write to [base, base+len): overlapping regions are dirty
@@ -342,6 +344,7 @@ pub fn gpu_write(base: u64, len: u64) {
 /// base+len): its page states are forgotten (re-registered on re-arming)
 /// and overlapping regions are dirty.
 pub fn remapped(base: u64, len: u64) {
+    super::homes::remapped(base, len);
     let mut g = TRACK.lock();
     let Some(t) = g.as_mut() else { return };
     if t.regions.is_empty() {

@@ -481,6 +481,7 @@ impl Exec {
         if let Some(p) = &ps {
             reads.extend_from_slice(&p.reads);
         }
+        self.sync_readers = [vs.addr, ps.as_ref().map_or(0, |p| p.addr)];
         if self.sync_for(&reads, SYNC_DRAW_READS) {
             vs = shaders::prepare_ngg(cp)?;
             ps = if ps_addr != 0 { Some(shaders::prepare_ps(cp)?) } else { None };
@@ -490,9 +491,21 @@ impl Exec {
             textures.extend(texture_ranges(p));
         }
         self.sync_textures(&textures, SYNC_DRAW_TEXTURES);
-        if let Some((addr, size)) = a.index {
-            self.sync_for(&[(addr, a.count as u64 * size as u64)], SYNC_DRAW_INDICES);
-        }
+        // Indices in a video-memory home (`homes`; one is made for indices
+        // that GPU work wrote through a large binding) are bound from it and
+        // read in order on the GPU; others are waited for if GPU work writes
+        // them.
+        let index_home = match a.index {
+            Some((addr, size)) => {
+                let bytes = a.count as u64 * size as u64;
+                let h = self.home_bind(addr, bytes, false, super::HomeUse::Index);
+                if h.is_none() {
+                    self.sync_for(&[(addr, bytes)], SYNC_DRAW_INDICES);
+                }
+                h
+            }
+            None => None,
+        };
         // Color targets: enabled in CB_TARGET_MASK and CB_SHADER_MASK,
         // exported by the pixel shader with a non-zero export format.
         let mrt_mask = ps.as_ref().map(|p| p.tr.out.mrt_mask).unwrap_or(0);
@@ -614,6 +627,10 @@ impl Exec {
             stages.push(p);
         }
         self.reserve(&stages.iter().map(|p| &**p).collect::<Vec<_>>());
+        if let Some(h) = &index_home {
+            // Kept until the batch that draws completes.
+            self.slots[self.cur].homes.push(h.3.clone());
+        }
         // Indices in guest memory that a resident shadow holds newer data for.
         if let Some((addr, size)) = a.index {
             self.flush_resident(Some(&[(addr, a.count as u64 * size as u64)]))?;
@@ -748,9 +765,11 @@ impl Exec {
             // across PCIe an instanced foliage draw took 4-8 ms, 0.2-0.3 ms
             // from video memory), made by the GPU at the batch's start, else
             // by the CPU now.
-            let snap = a.index.and_then(|(addr, size)| {
-                let bytes = a.count as u64 * size as u64;
-                self.pre_copy(addr, bytes).or_else(|| self.snapshot(addr, bytes, crate::gpu::tune::snap_index()))
+            let snap = index_home.as_ref().map(|h| (h.0, h.1, 0)).or_else(|| {
+                a.index.and_then(|(addr, size)| {
+                    let bytes = a.count as u64 * size as u64;
+                    self.pre_copy(addr, bytes).or_else(|| self.snapshot(addr, bytes, crate::gpu::tune::snap_index()))
+                })
             });
             match a.index {
                 Some((_, size)) if snap.is_some() => {

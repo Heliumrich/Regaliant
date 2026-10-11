@@ -13,6 +13,10 @@ pub struct Ranges {
 }
 
 impl Ranges {
+    pub const fn new() -> Ranges {
+        Ranges { by_start: BTreeMap::new() }
+    }
+
     /// Adds [a, a + n).
     pub fn insert(&mut self, a: u64, n: u64) {
         if n == 0 {
@@ -74,6 +78,35 @@ impl Ranges {
         for (a, n) in other.iter() {
             self.insert(a, n);
         }
+    }
+
+    /// Removes [a, a + n) from the union.
+    pub fn remove(&mut self, a: u64, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let end = a.saturating_add(n);
+        let hit: Vec<(u64, u64)> = self.by_start.range(..end).rev().take_while(|&(_, &e)| e > a).map(|(&s, &e)| (s, e)).collect();
+        for (s, e) in hit {
+            self.by_start.remove(&s);
+            if s < a {
+                self.by_start.insert(s, a);
+            }
+            if e > end {
+                self.by_start.insert(end, e);
+            }
+        }
+    }
+
+    /// The parts of the union inside [a, a + n), as (start, length).
+    pub fn intersect(&self, a: u64, n: u64) -> Vec<(u64, u64)> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let end = a.saturating_add(n);
+        let mut v: Vec<(u64, u64)> = self.by_start.range(..end).rev().take_while(|&(_, &e)| e > a).map(|(&s, &e)| (s.max(a), e.min(end))).map(|(s, e)| (s, e - s)).collect();
+        v.reverse();
+        v
     }
 }
 
@@ -180,6 +213,25 @@ mod tests {
         // A huge range at the top of the address space.
         r.insert(u64::MAX - 10, 100);
         assert!(r.overlaps(u64::MAX - 1, 1));
+    }
+
+    #[test]
+    fn remove_and_intersect() {
+        let mut r = Ranges::default();
+        r.insert(100, 100); // [100,200)
+        r.insert(300, 50); // [300,350)
+        assert_eq!(r.intersect(150, 200), vec![(150, 50), (300, 50)]);
+        assert_eq!(r.intersect(0, 100), vec![]);
+        assert_eq!(r.intersect(320, 10), vec![(320, 10)]);
+        r.remove(120, 10); // splits the first
+        assert_eq!(collect(&r), vec![(100, 20), (130, 70), (300, 50)]);
+        r.remove(190, 120); // trims the second, cuts the third's start
+        assert_eq!(collect(&r), vec![(100, 20), (130, 60), (310, 40)]);
+        r.remove(0, 1000);
+        assert!(r.is_empty());
+        r.insert(10, 10);
+        r.remove(10, 0); // empty: no change
+        assert_eq!(collect(&r), vec![(10, 10)]);
     }
 
     #[test]

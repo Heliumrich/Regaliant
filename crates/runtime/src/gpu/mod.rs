@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 20] = [
+    static ALL: [Tunable; 23] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -47,6 +47,9 @@ pub mod tune {
         Tunable { name: "tex_waits", env: "DS_TEX_WAITS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_barrier", env: "DS_SHADOW_BARRIER", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_max", env: "DS_PRE_MAX", default: 4 << 20, value: AtomicU64::new(UNSET) },
+        Tunable { name: "scratch_writes", env: "DS_SCRATCH_WRITES", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "trace_sync", env: "DS_TRACE_SYNC_N", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "homes", env: "DS_HOMES", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -126,6 +129,14 @@ pub mod tune {
         get(19)
     }
 
+    /// Diagnosis only (1; breaks rendering): written buffer bindings too large
+    /// for a VRAM shadow store into a video-memory scratch buffer and their
+    /// results are lost. Measures what GPU stores to imported host memory
+    /// cost (the per-item culls' index output).
+    pub fn scratch_writes() -> bool {
+        get(20) != 0
+    }
+
     /// A full barrier after every dispatch that binds a VRAM shadow (1, as
     /// when shadows were merged back after each dispatch), or only the
     /// barriers the title's synchronization asks for (0; with lazy barriers;
@@ -187,6 +198,27 @@ pub mod tune {
         get(16) != 0
     }
 
+    /// Index buffers that GPU work wrote through a binding too large for a
+    /// VRAM shadow get a home in video memory that later GPU uses of the
+    /// range bind (`gpu::homes`): 3.29 against 2.26 flips/s in the
+    /// courtyard (in-run A/B, run 20261011-072603). 0 writes the homes back
+    /// and drops them.
+    pub fn homes() -> bool {
+        get(22) != 0
+    }
+
+    /// Command-processor waits for GPU work still to be traced (`tune
+    /// trace_sync <n>`: the next n are logged with the read that collided,
+    /// its writer and the shader).
+    pub fn get_trace_sync() -> bool {
+        get(21) > 0
+    }
+
+    /// Takes one of the waits still to be traced.
+    pub fn take_trace_sync() -> bool {
+        get(21) > 0 && ALL[21].value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| if v != UNSET && v > 0 { Some(v - 1) } else { None }).is_ok()
+    }
+
     /// Sets a switch by name; false if unknown.
     pub fn set(name: &str, v: u64) -> bool {
         match ALL.iter().find(|t| t.name == name) {
@@ -205,6 +237,7 @@ pub mod lodstats;
 pub mod pstats;
 pub mod mirror;
 pub mod ranges;
+pub mod homes;
 pub mod images;
 pub mod png;
 pub mod track;

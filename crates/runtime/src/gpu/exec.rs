@@ -63,6 +63,8 @@ pub static FLUSHES: AtomicU64 = AtomicU64::new(0);
 /// scalar loads), dispatch textures, draw shader reads, draw textures, draw
 /// indices (`gpu exec` status line).
 pub static SYNC_WHY: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// SYNC_WHY at the last `profile reset` (per-window counts).
+static SYNC_WHY_AT_RESET: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 pub const SYNC_CP: usize = 0;
 pub const SYNC_CS_READS: usize = 1;
 pub const SYNC_CS_TEXTURES: usize = 2;
@@ -362,6 +364,25 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
         });
     }
     r
+}
+
+/// Guest [a, a+n) as pieces of imported buffers: (buffer, offset in it,
+/// guest address, bytes); unmapped parts are left out.
+fn guest_pieces(a: u64, n: u64) -> Vec<(vk::Buffer, u64, u64, u64)> {
+    if let Some((buf, start, _)) = span(a, n) {
+        return vec![(buf, a - start, a, n)];
+    }
+    let mut v = Vec::new();
+    let end = a + n;
+    let mut c = a;
+    while c < end {
+        let e = ((c & !(WINDOW - 1)) + WINDOW).min(end);
+        if let Some((buf, start, _)) = span(c, e - c) {
+            v.push((buf, c - start, c, e - c));
+        }
+        c = e;
+    }
+    v
 }
 
 /// Imports the guest window around [base, base+size) (another queue may
@@ -678,6 +699,18 @@ struct Bound {
     placements: Vec<(Placement, u64, bool)>,
 }
 
+/// How a binding uses guest memory that a video-memory home may hold.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum HomeUse {
+    /// A buffer descriptor's range.
+    Sized,
+    /// An unbounded pointer (`Resolved::Global`): the window up to the
+    /// mapping's end or UNBOUNDED_MAX.
+    Unbounded,
+    /// A draw's index buffer (may create the home).
+    Index,
+}
+
 /// Where a buffer binding's data is read and written (profile).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Placement {
@@ -697,9 +730,22 @@ enum Placement {
     ShadowReused,
     /// Not mapped / empty (zeros).
     None,
+    /// A video-memory scratch buffer, results lost (`tune scratch_writes`).
+    Scratch,
+    /// A video-memory home (`homes`).
+    Home,
 }
 
-const PLACEMENTS: [Placement; 8] = [Placement::Host, Placement::Snapshot, Placement::PreCopy, Placement::Resident, Placement::Mirror, Placement::Shadow, Placement::ShadowReused, Placement::None];
+const PLACEMENTS: [Placement; 10] = [Placement::Host, Placement::Snapshot, Placement::PreCopy, Placement::Resident, Placement::Mirror, Placement::Shadow, Placement::ShadowReused, Placement::None, Placement::Scratch, Placement::Home];
+
+/// Video memory written instead of large unshadowed buffers (diagnosis,
+/// `tune scratch_writes`).
+const SCRATCH_BYTES: u64 = 256 << 20;
+static SCRATCH: std::sync::OnceLock<Option<vk::Buffer>> = std::sync::OnceLock::new();
+
+fn scratch_buffer() -> Option<vk::Buffer> {
+    *SCRATCH.get_or_init(|| ctx().device_buffer(SCRATCH_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER).ok().map(|(b, _)| b))
+}
 
 /// Buffer placements and workgroups per compute shader (DS_PROFILE_GPU=1).
 #[derive(Default)]
@@ -708,7 +754,7 @@ struct ShaderPlacements {
     groups: u64,
     indirect: u64,
     /// Per binding: [count per Placement], total bytes, written count.
-    bindings: Vec<([u64; 8], u64, u64)>,
+    bindings: Vec<([u64; 10], u64, u64)>,
 }
 
 static SHADER_PLACEMENTS: Mutex<Option<HashMap<u64, ShaderPlacements>>> = Mutex::new(None);
@@ -723,7 +769,7 @@ fn note_placements(addr: u64, groups: [u32; 3], indirect: bool, placements: &[(P
         e.groups += groups.iter().map(|&x| x as u64).product::<u64>();
     }
     if e.bindings.len() < placements.len() {
-        e.bindings.resize(placements.len(), ([0; 8], 0, 0));
+        e.bindings.resize(placements.len(), ([0; 10], 0, 0));
     }
     for (b, &(k, n, w)) in e.bindings.iter_mut().zip(placements) {
         b.0[PLACEMENTS.iter().position(|&x| x == k).unwrap_or(7)] += 1;
@@ -1203,6 +1249,8 @@ struct Slot {
     /// (PRE_SEG, allocated on first use), submitted before `cmd`.
     pre: vk::CommandBuffer,
     pre_buf: Option<vk::Buffer>,
+    /// Video-memory homes the slot's batch binds (kept until it completes).
+    homes: Vec<std::sync::Arc<super::homes::HomeBuf>>,
 }
 
 impl Slot {
@@ -1231,6 +1279,7 @@ impl Slot {
                 shadow,
                 pre,
                 pre_buf: None,
+                homes: Vec::new(),
             })
         }
     }
@@ -1322,6 +1371,9 @@ pub fn reset_shader_profile() {
         m.clear();
     }
     *SHADER_PLACEMENTS.lock() = None;
+    for (r, c) in SYNC_WHY_AT_RESET.iter().zip(SYNC_WHY.iter()) {
+        r.store(c.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
     GAP_NS.store(0, Ordering::Relaxed);
     PRE_NS.store(0, Ordering::Relaxed);
     BATCH_NS.store(0, Ordering::Relaxed);
@@ -1353,6 +1405,13 @@ pub fn shader_profile() -> String {
         let total: u64 = v.iter().map(|x| x.1[0]).sum();
         let list: Vec<String> = v.iter().map(|(q, x)| format!("{q} {} ms ({} gaps, {} over 1 ms)", x[0] / 1_000_000, x[1], x[2])).collect();
         s.push_str(&format!("    gpu idle between batches {} ms, before batches of: {}\n", total / 1_000_000, list.join(", ")));
+    }
+    {
+        let n: Vec<u64> = SYNC_WHY.iter().zip(SYNC_WHY_AT_RESET.iter()).map(|(c, r)| c.load(Ordering::Relaxed).saturating_sub(r.load(Ordering::Relaxed))).collect();
+        s.push_str(&format!(
+            "    command-processor waits for GPU work: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices\n",
+            n[0], n[1], n[2], n[3], n[4], n[5]
+        ));
     }
     if let Some(w) = SUBMIT_WHY.lock().as_ref() {
         let mut v: Vec<(&(String, &'static str), &u64)> = w.iter().collect();
@@ -1448,6 +1507,8 @@ pub struct Exec {
     /// Shadows of this batch whose working copies hold newer data than
     /// guest memory (see Shadow).
     resident: Vec<Shadow>,
+    /// The shaders whose reads the next `sync_for` checks (wait traces).
+    sync_readers: [u64; 2],
 }
 
 unsafe impl Send for Exec {}
@@ -1497,6 +1558,7 @@ impl Exec {
                 pool_use: [0; 5],
                 shadow_used: 0,
                 resident: Vec::new(),
+                sync_readers: [0; 2],
             })
         }
     }
@@ -1549,6 +1611,7 @@ impl Exec {
                 c.device.reset_descriptor_pool(slot.desc_pool, vk::DescriptorPoolResetFlags::empty()).ok();
             }
             self.slots[self.cur].seq = 0;
+            self.slots[self.cur].homes.clear();
         }
         unsafe {
             ctx().device.begin_command_buffer(self.cmd(), &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
@@ -1691,6 +1754,133 @@ impl Exec {
         self.pres.clear();
     }
 
+    /// The home of guest [base, base+size) for a binding (see `homes`):
+    /// (buffer, offset of `base`, bytes from `base` to the home's end). The
+    /// copies in the home needs are recorded first. A written binding too
+    /// large for a VRAM shadow gets a home (`tune homes`; `create`: a sized
+    /// buffer binding). A binding that only partly overlaps a home uses guest
+    /// memory: the overlap's GPU-written parts are written back first.
+    pub(super) fn home_bind(&mut self, base: u64, size: u64, written: bool, kind: HomeUse) -> Option<(vk::Buffer, u64, u64, std::sync::Arc<super::homes::HomeBuf>)> {
+        if size == 0 {
+            return None;
+        }
+        if !super::tune::homes() && super::homes::any() {
+            self.homes_evict_all();
+        }
+        if kind == HomeUse::Sized && written && size > SHADOW_MAX && size <= super::homes::MAX && super::tune::homes() {
+            super::homes::note_large_write(base, size);
+        }
+        if !super::homes::any() && !(kind == HomeUse::Index && super::tune::homes()) {
+            return None;
+        }
+        let mut b = super::homes::bind(base, size, written);
+        if b.is_none() && kind == HomeUse::Index && super::tune::homes() && super::homes::index_use(base, size) {
+            b = super::homes::bind(base, size, written);
+        }
+        let Some(b) = b else {
+            if kind == HomeUse::Unbounded && !written {
+                // An unbounded pointer's window (up to UNBOUNDED_MAX) that
+                // passes over a home: assumed not to read it (writing the
+                // home's GPU-written parts back for every such binding cost
+                // more than the home saved).
+                if super::homes::overlaps(base, size) {
+                    super::homes::UNBOUNDED_OVERLAPS.fetch_add(1, Ordering::Relaxed);
+                }
+                return None;
+            }
+            if super::homes::overlaps(base, size) {
+                if super::homes::PARTIAL.fetch_add(1, Ordering::Relaxed) < 40 {
+                    crate::info!(
+                        "gpu[{}]: binding {base:#x}+{size:#x} ({}) of shader {:#x} only partly overlaps a home: {}",
+                        self.name,
+                        if written { "written" } else { "read" },
+                        super::images::BINDING_SHADER.with(|s| s.get()),
+                        super::homes::describe(base, size)
+                    );
+                }
+                self.home_write_back(&[(base, size)]);
+            }
+            return None;
+        };
+        if !b.copy_in.is_empty() {
+            self.begin();
+            self.end_rendering();
+            let c = ctx();
+            let cmd = self.cmd();
+            global_barrier(cmd);
+            for &(a, n, off) in &b.copy_in {
+                for (src, src_off, ga, len) in guest_pieces(a, n) {
+                    unsafe { c.device.cmd_copy_buffer(cmd, src, b.buf.buf, &[vk::BufferCopy { src_offset: src_off, dst_offset: off + (ga - a), size: len }]) };
+                    super::homes::COPIED_IN.fetch_add(len, Ordering::Relaxed);
+                }
+            }
+            global_barrier(cmd);
+            self.barrier_wanted = false;
+            self.dispatched = false;
+        }
+        let r = (b.buf.buf, b.offset, b.avail, b.buf.clone());
+        self.slots[self.cur].homes.push(b.buf);
+        Some(r)
+    }
+
+    /// Writes every home's GPU-written parts back and drops the homes
+    /// (`tune homes 0` while they exist).
+    fn homes_evict_all(&mut self) {
+        let parts = super::homes::take_all();
+        if parts.is_empty() {
+            return;
+        }
+        self.begin();
+        self.end_rendering();
+        let c = ctx();
+        let cmd = self.cmd();
+        global_barrier(cmd);
+        for (a, n, hb, off) in parts {
+            for (dst, dst_off, ga, len) in guest_pieces(a, n) {
+                unsafe { c.device.cmd_copy_buffer(cmd, hb.buf, dst, &[vk::BufferCopy { src_offset: off + (ga - a), dst_offset: dst_off, size: len }]) };
+                super::homes::WRITE_BACK_BYTES.fetch_add(len, Ordering::Relaxed);
+            }
+            self.slots[self.cur].homes.push(hb);
+        }
+        global_barrier(cmd);
+        self.barrier_wanted = false;
+        self.dispatched = false;
+        crate::info!("gpu[{}]: homes written back and dropped (tune homes 0)", self.name);
+    }
+
+    /// Records copies of the GPU-written parts of the homes overlapping
+    /// `ranges` back to guest memory, in order after all earlier work.
+    fn home_write_back(&mut self, ranges: &[(u64, u64)]) {
+        let mut parts = Vec::new();
+        for &(a, n) in ranges {
+            parts.extend(super::homes::stale_parts(a, n, true));
+        }
+        if parts.is_empty() {
+            return;
+        }
+        self.begin();
+        self.end_rendering();
+        let c = ctx();
+        let cmd = self.cmd();
+        global_barrier(cmd);
+        let total: u64 = parts.iter().map(|p| p.1).sum();
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        if total >= 1 << 20 && LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
+            crate::info!("gpu[{}]: writing back {} KiB of homes for {:x?} (shader {:#x})", self.name, total >> 10, ranges, super::images::BINDING_SHADER.with(|s| s.get()));
+        }
+        for (a, n, hb, off) in parts {
+            for (dst, dst_off, ga, len) in guest_pieces(a, n) {
+                unsafe { c.device.cmd_copy_buffer(cmd, hb.buf, dst, &[vk::BufferCopy { src_offset: off + (ga - a), dst_offset: dst_off, size: len }]) };
+                super::homes::WRITE_BACK_BYTES.fetch_add(len, Ordering::Relaxed);
+            }
+            self.slots[self.cur].homes.push(hb);
+        }
+        global_barrier(cmd);
+        super::homes::WRITE_BACKS.fetch_add(1, Ordering::Relaxed);
+        self.barrier_wanted = false;
+        self.dispatched = false;
+    }
+
     /// Ends the batch's copy prologue, if it was begun: the copies complete
     /// before the batch's work (which begins with a full barrier).
     fn end_pre(&mut self) -> Option<vk::CommandBuffer> {
@@ -1718,7 +1908,7 @@ impl Exec {
     /// write, writes the range (then None). None also: off or larger than
     /// `tune pre_max`, not one mapping, no space.
     pub(super) fn pre_copy(&mut self, base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
-        if size == 0 || size > super::tune::pre_max() || self.pre_failed {
+        if size == 0 || size > super::tune::pre_max() || self.pre_failed || super::homes::overlaps(base, size) {
             return None;
         }
         let r = [(base, size)];
@@ -2025,7 +2215,8 @@ impl Exec {
         // and the batch writing it.
         static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         static TRACED: AtomicU64 = AtomicU64::new(0);
-        let trace = *TRACE.get_or_init(|| std::env::var("DS_TRACE_SYNC").ok().as_deref() == Some("1")) && TRACED.load(Ordering::Relaxed) < 400;
+        let trace = (*TRACE.get_or_init(|| std::env::var("DS_TRACE_SYNC").ok().as_deref() == Some("1")) && TRACED.load(Ordering::Relaxed) < 400)
+            || (super::tune::get_trace_sync() && self.would_wait(reads) && super::tune::take_trace_sync());
         let culprit = if trace {
             let done = done_seq();
             reads.iter().find_map(|&r| {
@@ -2045,17 +2236,38 @@ impl Exec {
         if w {
             SYNC_WHY[why.min(SYNC_WHY.len() - 1)].fetch_add(1, Ordering::Relaxed);
             if let Some(((a, n), src)) = culprit {
-                if TRACED.fetch_add(1, Ordering::Relaxed) < 400 {
+                {
+                    TRACED.fetch_add(1, Ordering::Relaxed);
                     const WHY: [&str; 6] = ["CP read", "dispatch shader read", "dispatch texture", "draw shader read", "draw texture", "draw indices"];
-                    crate::info!("gpu[{}]: waited {} us for {} {a:#x}+{n:#x} written by {src} (shader {:#x})", self.name, t0.elapsed().as_micros(), WHY[why.min(5)], self.batch_shaders.last().copied().unwrap_or(0));
+                    crate::info!(
+                        "gpu[{}]: waited {} us for {} {a:#x}+{n:#x} written by {src} (reading shaders {:#x} {:#x}; last recorded {:#x})",
+                        self.name,
+                        t0.elapsed().as_micros(),
+                        WHY[why.min(5)],
+                        self.sync_readers[0],
+                        self.sync_readers[1],
+                        self.batch_shaders.last().copied().unwrap_or(0)
+                    );
                 }
             }
         }
         w
     }
 
+    /// Whether `sync_for_reads` would wait.
+    fn would_wait(&mut self, reads: &[(u64, u64)]) -> bool {
+        self.overlaps_pending(reads) || INFLIGHT.latest(reads).is_some_and(|s| s > done_seq())
+    }
+
     pub fn sync_for_reads(&mut self, reads: &[(u64, u64)]) -> bool {
         let mut waited = false;
+        if super::homes::any_stale(reads) {
+            // GPU work wrote these parts in video memory: copied back (after
+            // all earlier submitted work) before the CPU reads them.
+            self.home_write_back(reads);
+            self.flush();
+            waited = true;
+        }
         if self.overlaps_pending(reads) {
             self.flush();
             waited = true;
@@ -2099,7 +2311,7 @@ impl Exec {
     /// batch is submitted). False: not possible here.
     pub fn gpu_cp_write(&mut self, a: u64, data: &[u32], label: Option<(u64, u8)>) -> bool {
         let bytes = 4 * data.len() as u64;
-        if bytes == 0 || bytes > 65536 || a % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) {
+        if bytes == 0 || bytes > 65536 || a % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(a, bytes) {
             return false;
         }
         let Some((buffer, start, _)) = span(a, bytes) else { return false };
@@ -2207,7 +2419,7 @@ impl Exec {
     /// PCIe. None: the range is larger than `limit` (0: off), GPU work not yet
     /// complete (or a deferred CP write) writes it, or no space.
     pub(super) fn snapshot(&mut self, base: u64, size: u64, limit: u64) -> Option<(vk::Buffer, u64, u64)> {
-        if size == 0 || size > limit || self.snap_failed {
+        if size == 0 || size > limit || self.snap_failed || super::homes::overlaps(base, size) {
             return None;
         }
         let r = [(base, size)];
@@ -2336,20 +2548,24 @@ impl Exec {
                         let mut bound_size = 0u64;
                         let mut placement = Placement::None;
                         let read_only = size > 0 && !p.tr.plan.resources[i].written && matches!(p.resources[i], Resolved::Buffer(_));
+                        // A video-memory home holding the range (see `homes`).
+                        let home = self
+                            .home_bind(base, size, p.tr.plan.resources[i].written, if matches!(p.resources[i], Resolved::Buffer(_)) { HomeUse::Sized } else { HomeUse::Unbounded })
+                            .map(|h| (h.0, h.1, h.2));
                         // Inside a resident shadow: its working copy is newer.
-                        let resident = if read_only { self.resident_read(base, size)? } else { None };
+                        let resident = if read_only && home.is_none() { self.resident_read(base, size)? } else { None };
                         // Small read-only buffers: a snapshot in video memory.
-                        let snap = if read_only && resident.is_none() { self.snapshot(base, size, super::tune::snap_max()) } else { None };
+                        let snap = if read_only && resident.is_none() && home.is_none() { self.snapshot(base, size, super::tune::snap_max()) } else { None };
                         // Read-only bindings of buffers GPU work wrote: VRAM mirrors.
-                        let mirrored = if read_only && snap.is_none() { resident.or_else(|| super::mirror::lookup(base, size)) } else { None };
+                        let mirrored = if read_only && snap.is_none() && home.is_none() { resident.or_else(|| super::mirror::lookup(base, size)) } else { None };
                         // Other read-only buffers: a copy made at the batch's start.
-                        let pre = if read_only && snap.is_none() && mirrored.is_none() { self.pre_copy(base, size) } else { None };
+                        let pre = if read_only && snap.is_none() && mirrored.is_none() && home.is_none() { self.pre_copy(base, size) } else { None };
                         if pre.is_some() {
                             placement = Placement::PreCopy;
                         }
                         let snap = snap.or(pre);
-                        let mut span = if size > 0 && mirrored.is_none() && snap.is_none() { span(base, size) } else { None };
-                        if span.is_none() && size > 0 && mirrored.is_none() && snap.is_none() {
+                        let mut span = if size > 0 && mirrored.is_none() && snap.is_none() && home.is_none() { span(base, size) } else { None };
+                        if span.is_none() && size > 0 && mirrored.is_none() && snap.is_none() && home.is_none() {
                             // A descriptor reaching past the end of its mappings
                             // (generic sizes on ring allocations): the mapped part
                             // is bound, the rest reads 0.
@@ -2360,7 +2576,21 @@ impl Exec {
                                 }
                             }
                         }
-                        if let Some((sbuf, soff, sbias)) = snap {
+                        if let Some((hbuf, hoff, avail)) = home {
+                            placement = Placement::Home;
+                            let align = ctx().limits.min_storage_buffer_offset_alignment.max(4);
+                            let off = hoff & !(align - 1);
+                            bias = hoff - off;
+                            info = vk::DescriptorBufferInfo { buffer: hbuf, offset: off, range: (bias + size).next_multiple_of(4).min(bias + avail) };
+                            bound_size = size;
+                            if p.tr.plan.resources[i].written {
+                                trace_writes(&format!("{:?} shader {:#x}", p.stage, p.addr), base, size);
+                                bound.writes.push((base, size));
+                                if matches!(p.resources[i], Resolved::Buffer(_)) {
+                                    bound.sized_writes.push((base, size));
+                                }
+                            }
+                        } else if let Some((sbuf, soff, sbias)) = snap {
                             if placement != Placement::PreCopy {
                                 placement = Placement::Snapshot;
                             }
@@ -2442,6 +2672,11 @@ impl Exec {
                                         placement = Placement::Shadow;
                                         info = vk::DescriptorBufferInfo { buffer: self.shadow(), offset: s_off, range };
                                         SHADOWED.fetch_add(1, Ordering::Relaxed);
+                                    } else if res.written && range > SHADOW_MAX && range <= SCRATCH_BYTES && super::tune::scratch_writes() {
+                                        if let Some(sb) = scratch_buffer() {
+                                            placement = Placement::Scratch;
+                                            info = vk::DescriptorBufferInfo { buffer: sb, offset: 0, range };
+                                        }
                                     }
                                     if res.written && matches!(p.resources[i], Resolved::Buffer(_)) {
                                         // Within the bound range (clamped to the mapping).
@@ -2641,6 +2876,7 @@ impl Exec {
         }
         let wave64 = initiator & (1 << 15) == 0;
         let mut p = shaders::prepare_compute(cp, wave64)?;
+        self.sync_readers = [p.addr, 0];
         if self.sync_for(&p.reads, SYNC_CS_READS) {
             p = shaders::prepare_compute(cp, wave64)?;
         }
@@ -2874,6 +3110,7 @@ pub fn status() -> String {
         + &super::track::status()
         + &crate::mem::remap_status()
         + &super::mirror::status()
+        + &super::homes::status()
         + &sync_why_status()
         + &format!(
             "    buffer snapshots in VRAM: {} ({} MiB), {} reused, {} not for lack of space; draws with snapshotted indices {} ({} MiB); batch-start copies {} ({} MiB), {} reused, {} not for lack of space\n",

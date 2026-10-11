@@ -220,6 +220,7 @@ fn missed_write(addr: u64, wide: bool, func: u32, mask: u64, reference: u64, sin
 }
 
 fn note_write(queue: &str, addr: u64, value: u64, at: u64) {
+    super::homes::cpu_written(addr, 8);
     if WAITED.lock().as_ref().is_some_and(|w| w.contains(&(addr & !7))) {
         let mut g = LABEL_WRITES.lock();
         let h = g.get_or_insert_with(HashMap::new).entry(addr).or_default();
@@ -373,6 +374,7 @@ fn label_history(addr: u64, max: usize) -> String {
 /// Records the label-sized words of a block the CP wrote (DMA fills and
 /// copies up to 16 KiB; larger blocks are data, not labels).
 fn note_block(queue: &str, addr: u64, bytes: u64, at: u64) {
+    super::homes::cpu_written(addr, bytes);
     if bytes > 16 << 10 {
         return;
     }
