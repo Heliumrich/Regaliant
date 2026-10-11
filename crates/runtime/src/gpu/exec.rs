@@ -1486,20 +1486,32 @@ pub(super) const DRAW_STEP_NAMES: [&str; 18] = [
     "index and draw", "write tracking",
 ];
 
-/// Lap timer of a draw's steps (profiling only).
+/// The same per dispatch (all queues), steps of `CS_STEP_NAMES`; the count
+/// is CS_PHASES[4].
+pub(super) static CS_STEPS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+pub(super) const CS_STEP_NAMES: [&str; 16] = [
+    "prepare", "shader-read sync", "texture sync", "image hazards", "pipeline", "reserve", "bind", "sgpr data", "set alloc",
+    "image notes", "set write", "shadow copies", "dispatch", "shadows after", "mirrors", "write tracking",
+];
+
+/// Lap timer of a command's steps (profiling only).
 pub(super) struct Laps {
     last: Option<std::time::Instant>,
+    steps: &'static [AtomicU64],
 }
 
 impl Laps {
     pub(super) fn new() -> Laps {
-        Laps { last: profiling().then(std::time::Instant::now) }
+        Laps { last: profiling().then(std::time::Instant::now), steps: &DRAW_STEPS }
+    }
+    fn for_dispatch() -> Laps {
+        Laps { last: profiling().then(std::time::Instant::now), steps: &CS_STEPS }
     }
     /// Adds the time since the last mark to step `k`.
     pub(super) fn mark(&mut self, k: usize) {
         if let Some(t) = self.last {
             let now = std::time::Instant::now();
-            DRAW_STEPS[k].fetch_add((now - t).as_nanos() as u64, Ordering::Relaxed);
+            self.steps[k].fetch_add((now - t).as_nanos() as u64, Ordering::Relaxed);
             self.last = Some(now);
         }
     }
@@ -1560,7 +1572,9 @@ fn sync_steps_line_inner() -> String {
 fn draw_steps_line() -> String {
     let n = DRAW_PHASES[4].load(Ordering::Relaxed).max(1);
     let parts: Vec<String> = DRAW_STEP_NAMES.iter().zip(DRAW_STEPS.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
-    format!("    command processor per draw by step (us): {}\n", parts.join(", "))
+    let n = CS_PHASES[4].load(Ordering::Relaxed).max(1);
+    let cs: Vec<String> = CS_STEP_NAMES.iter().zip(CS_STEPS.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
+    format!("    command processor per draw by step (us): {}\n    command processor per dispatch by step (us): {}\n", parts.join(", "), cs.join(", "))
 }
 
 /// GPU time inside batches (first to last command), ns.
@@ -1631,7 +1645,7 @@ pub fn reset_shader_profile() {
     *SHADER_PLACEMENTS.lock() = None;
     shaders::reset_repeats();
     *QUEUE_WAITS.lock() = None;
-    for c in DRAW_STEPS.iter().chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()) {
+    for c in DRAW_STEPS.iter().chain(CS_STEPS.iter()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     for c in CS_PHASES.iter().chain(DRAW_PHASES.iter()) {
@@ -2902,8 +2916,9 @@ impl Exec {
                         let snap = if read_only && resident.is_none() && home.is_none() { self.snapshot(base, size, super::tune::snap_max()) } else { None };
                         // Read-only bindings of buffers GPU work wrote: VRAM mirrors.
                         let mirrored = if read_only && snap.is_none() && home.is_none() { resident.or_else(|| super::mirror::lookup(base, size)) } else { None };
-                        // Other read-only buffers: a copy made at the batch's start.
-                        let pre = if read_only && snap.is_none() && mirrored.is_none() && home.is_none() { self.pre_copy(base, size) } else { None };
+                        // Other read-only buffers: a copy made at the batch's start
+                        // (dispatches only with `tune pre_cs`).
+                        let pre = if read_only && snap.is_none() && mirrored.is_none() && home.is_none() && (!allow_shadow || super::tune::pre_cs()) { self.pre_copy(base, size) } else { None };
                         if pre.is_some() {
                             placement = Placement::PreCopy;
                         }
@@ -3215,6 +3230,7 @@ impl Exec {
     /// counts; `groups` is unused).
     fn dispatch_inner(&mut self, cp: &Cp, mut groups: [u32; 3], initiator: u32, indirect: Option<u64>) -> Result<(), String> {
         let t0 = std::time::Instant::now();
+        let mut lap = Laps::for_dispatch();
         if let Some(a) = indirect {
             // A resident shadow holding newer arguments is merged back first.
             self.flush_resident(Some(&[(a, 12)]))?;
@@ -3226,6 +3242,7 @@ impl Exec {
             Some(p) => p,
             None => shaders::prepare_compute(cp, wave64)?,
         };
+        lap.mark(0);
         self.sync_readers = [p.addr, 0];
         if self.sync_for(&p.reads, SYNC_CS_READS) {
             if let Some(c) = self.sync_culprit.take() {
@@ -3233,8 +3250,10 @@ impl Exec {
             }
             p = shaders::prepare_compute(cp, wave64)?;
         }
+        lap.mark(1);
         // Textures are uploaded from guest memory: earlier GPU writes first.
         self.sync_textures(&texture_ranges(&p), SYNC_CS_TEXTURES);
+        lap.mark(2);
         let local = [cp.reg(Space::Sh, 0x207) & 0xFFFF, cp.reg(Space::Sh, 0x208) & 0xFFFF, cp.reg(Space::Sh, 0x209) & 0xFFFF];
         if initiator & (1 << 5) != 0 {
             // USE_THREAD_DIMENSIONS: sizes are in threads.
@@ -3252,23 +3271,28 @@ impl Exec {
         self.resolve_fast_clears(&keys);
         self.resolve_overwrites(&keys);
         self.sync_block_textures(&keys);
+        lap.mark(3);
         let (pipeline, layout, set_layout) = compute_pipe(&p)?;
         let t_pipe = t0.elapsed();
+        lap.mark(4);
         self.reserve(&[&p]);
+        lap.mark(5);
         let mut bound = self.bind_stage(&mut p, true)?;
+        lap.mark(6);
         self.bind_sgpr(&p, &mut bound)?;
         if profiling() {
             note_placements(p.addr, groups, indirect.is_some(), &bound.placements);
         }
+        lap.mark(7);
         let t_bind = t0.elapsed();
         let set = self.alloc_set(set_layout)?;
+        lap.mark(8);
         let writes_here = std::mem::take(&mut bound.writes);
         let sized_here = std::mem::take(&mut bound.sized_writes);
-        super::images::with(|im| {
-            im.note_meta_writes(&writes_here);
-            im.note_overwrites(&sized_here);
-        });
+        super::images::with(|im| im.note_writes(&writes_here, &sized_here));
+        lap.mark(9);
         self.write_set(set, std::slice::from_ref(&bound));
+        lap.mark(10);
         self.end_rendering();
         let c = ctx();
         let qp = self.slots[self.cur].queries;
@@ -3317,6 +3341,7 @@ impl Exec {
             }
         }
         stamp(1);
+        lap.mark(11);
         super::vk::checkpoint(self.cmd(), super::vk::mark::DISPATCH, p.addr);
         let start = [cp.reg(Space::Sh, 0x204), cp.reg(Space::Sh, 0x205), cp.reg(Space::Sh, 0x206)];
         let args = match indirect {
@@ -3344,6 +3369,7 @@ impl Exec {
             }
         }
         stamp(2);
+        lap.mark(12);
         if !lazy_barriers() || (!bound.shadows.is_empty() && super::tune::shadow_barrier()) {
             global_barrier(self.cmd());
         }
@@ -3363,6 +3389,7 @@ impl Exec {
             self.dispatched = true;
         }
         stamp(3);
+        lap.mark(13);
         // VRAM mirrors of what this dispatch wrote (later read bindings use them).
         let mut mirrored: Vec<(u64, u64)> = Vec::new();
         let mut copies: Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)> = Vec::new();
@@ -3390,12 +3417,14 @@ impl Exec {
                 super::mirror::refreshed(b, n);
             }
         }
+        lap.mark(14);
         for &(b, n) in &writes_here {
             super::track::gpu_write(b, n);
         }
         for &(b, n) in &writes_here {
             self.note_write(b, n);
         }
+        lap.mark(15);
         EXECUTED.fetch_add(1, Ordering::Relaxed);
         self.batch_shaders.push(p.addr);
         let total = t0.elapsed();

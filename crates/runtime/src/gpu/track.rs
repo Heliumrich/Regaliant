@@ -16,7 +16,7 @@
 //! read the memory (writes after re-arming fault again).
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READONLY, PAGE_READWRITE};
 
@@ -48,6 +48,12 @@ pub enum Why {
 #[derive(Default)]
 struct Tracker {
     regions: Vec<Option<Region>>,
+    /// Region ids by base address (regions are never removed) and the
+    /// largest region size: overlap queries look at the bases in (start -
+    /// max_size, end) only. Scanning every region took ~0.8 us per GPU
+    /// write, two per dispatch (the per-item culls, ~4,300 per frame).
+    by_base: BTreeMap<u64, Vec<u32>>,
+    max_size: u64,
     /// Watched page -> (regions on it, protection to restore, protected now).
     pages: HashMap<u64, (Vec<u32>, u32, bool)>,
     /// Ranges being written by code that cannot fault (kernel reads, driver
@@ -58,12 +64,44 @@ struct Tracker {
 
 static TRACK: Mutex<Option<Tracker>> = Mutex::new(None);
 pub static FAULTS: AtomicU64 = AtomicU64::new(0);
+/// Changes whenever a region becomes dirty or GPU-written: consumers may
+/// keep results that checked the regions while it stays the same.
+pub static GEN: AtomicU64 = AtomicU64::new(0);
+
+fn changed() {
+    GEN.fetch_add(1, Ordering::Release);
+}
 
 fn read_only(prot: u32) -> u32 {
     match prot {
         PAGE_READWRITE => PAGE_READONLY,
         PAGE_EXECUTE_READWRITE => PAGE_EXECUTE_READ,
         p => p,
+    }
+}
+
+impl Tracker {
+    fn add(&mut self, base: u64, size: u64) -> u32 {
+        let id = self.regions.len() as u32;
+        self.regions.push(Some(Region { base, size, dirty: false, gpu: false, why: Why::None }));
+        self.by_base.entry(base).or_default().push(id);
+        self.max_size = self.max_size.max(size);
+        id
+    }
+
+    /// Calls `f` for every region overlapping [base, base+len).
+    fn each_overlapping(&mut self, base: u64, len: u64, mut f: impl FnMut(&mut Region)) {
+        let end = base.saturating_add(len);
+        let Tracker { regions, by_base, max_size, .. } = self;
+        for (_, ids) in by_base.range(base.saturating_sub(*max_size)..end) {
+            for &id in ids {
+                if let Some(Some(r)) = regions.get_mut(id as usize) {
+                    if r.base < end && base < r.base + r.size {
+                        f(r);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -108,15 +146,12 @@ pub fn watch(base: u64, size: u64) -> Option<u32> {
     if !protected() {
         let mut g = TRACK.lock();
         let t = g.get_or_insert_with(Tracker::default);
-        let id = t.regions.len() as u32;
-        t.regions.push(Some(Region { base, size, dirty: false, gpu: false, why: Why::None }));
-        return Some(id);
+        return Some(t.add(base, size));
     }
     let sp = spans(base, size)?;
     let mut g = TRACK.lock();
     let t = g.get_or_insert_with(Tracker::default);
-    let id = t.regions.len() as u32;
-    t.regions.push(Some(Region { base, size, dirty: false, gpu: false, why: Why::None }));
+    let id = t.add(base, size);
     arm_locked(t, id, &sp);
     Some(id)
 }
@@ -196,6 +231,7 @@ pub fn force_dirty(id: u32) {
     if let Some(r) = g.as_mut().and_then(|t| t.regions.get_mut(id as usize)).and_then(|r| r.as_mut()) {
         r.dirty = true;
         r.why = Why::Forced;
+        changed();
     }
 }
 
@@ -236,6 +272,7 @@ pub fn rearm(id: u32) {
             if let Some(Some(r)) = t.regions.get_mut(id as usize) {
                 r.dirty = true;
                 r.why = Why::Unmapped;
+                changed();
             }
         }
     }
@@ -255,6 +292,7 @@ fn unprotect_page(t: &mut Tracker, page: u64, why: Why) -> bool {
         if let Some(Some(r)) = t.regions.get_mut(id as usize) {
             r.dirty = true;
             r.why = why;
+            changed();
         }
     }
     true
@@ -315,12 +353,13 @@ pub fn host_write(base: u64, len: u64) -> HostWrite {
     }
     // Regions without watched pages (no page protection) learn of the
     // write here.
-    for r in t.regions.iter_mut().flatten() {
-        if r.base < base + len && base < r.base + r.size {
-            r.dirty = true;
-            r.why = Why::HostWrite(base);
+    t.each_overlapping(base, len, |r| {
+        if !r.dirty {
+            changed();
         }
-    }
+        r.dirty = true;
+        r.why = Why::HostWrite(base);
+    });
     t.next_busy += 1;
     let id = t.next_busy;
     t.busy.push((id, base, len));
@@ -332,12 +371,13 @@ pub fn host_write(base: u64, len: u64) -> HostWrite {
 pub fn gpu_write(base: u64, len: u64) {
     let mut g = TRACK.lock();
     let Some(t) = g.as_mut() else { return };
-    for r in t.regions.iter_mut().flatten() {
-        if r.base < base + len && base < r.base + r.size {
-            r.gpu = true;
-            r.why = Why::GpuWrite(base, len);
+    t.each_overlapping(base, len, |r| {
+        if !r.gpu {
+            changed();
         }
-    }
+        r.gpu = true;
+        r.why = Why::GpuWrite(base, len);
+    });
 }
 
 /// The memory manager changed the mapping or protection of [base,
@@ -360,12 +400,13 @@ pub fn remapped(base: u64, len: u64) {
             p += PAGE;
         }
     }
-    for r in t.regions.iter_mut().flatten() {
-        if r.base < base + len && base < r.base + r.size {
-            r.dirty = true;
-            r.why = Why::Remap(base, len);
+    t.each_overlapping(base, len, |r| {
+        if !r.dirty {
+            changed();
         }
-    }
+        r.dirty = true;
+        r.why = Why::Remap(base, len);
+    });
 }
 
 /// One status line.
@@ -373,4 +414,32 @@ pub fn status() -> String {
     let g = TRACK.lock();
     let (regions, pages) = g.as_ref().map(|t| (t.regions.iter().flatten().count(), t.pages.len())).unwrap_or((0, 0));
     format!("    write tracking: {regions} regions, {pages} pages, {} write faults\n", FAULTS.load(Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hits(t: &mut Tracker, base: u64, len: u64) -> Vec<u64> {
+        let mut v = Vec::new();
+        t.each_overlapping(base, len, |r| v.push(r.base));
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn overlap_index_finds_every_overlapping_region() {
+        let mut t = Tracker::default();
+        t.add(0x1000, 0x1000);
+        t.add(0x8000, 0x10_0000);
+        t.add(0x20_0000, 0x10);
+        t.add(0x8000, 0x10);
+        assert_eq!(hits(&mut t, 0x1800, 4), vec![0x1000]);
+        // A large region starting well before the write.
+        assert_eq!(hits(&mut t, 0x10_0000, 4), vec![0x8000]);
+        assert_eq!(hits(&mut t, 0x8008, 4), vec![0x8000, 0x8000]);
+        assert_eq!(hits(&mut t, 0x2000, 0x6000), Vec::<u64>::new());
+        assert_eq!(hits(&mut t, 0, u64::MAX), vec![0x1000, 0x8000, 0x8000, 0x20_0000]);
+        assert_eq!(hits(&mut t, 0x20_0010, 0x100), Vec::<u64>::new());
+    }
 }

@@ -486,7 +486,23 @@ pub struct Images {
     /// Depth/stencil image of each rendered stencil plane address.
     stencil_of: HashMap<u64, ImageKey>,
     /// Surface of each metadata address (DCC, HTILE) and its clear values.
-    meta_of: HashMap<u64, (ImageKey, [u32; 2])>,
+    /// Fast-clear metadata address -> (image, clear value); ordered for the
+    /// range lookups of `note_meta_writes`.
+    meta_of: std::collections::BTreeMap<u64, (ImageKey, [u32; 2])>,
+    /// The writes `note_writes` last applied, with LOOKUP_GEN and note_gen
+    /// then: the per-item culls report the same two ranges thousands of
+    /// times per frame, and noting them again changes nothing until a
+    /// pending clear or overwrite is taken or the images change.
+    last_note: Option<(Vec<(u64, u64)>, Vec<(u64, u64)>, u64, u64)>,
+    note_gen: u64,
+    /// Sampled views by T#: (frame, LOOKUP_GEN, track::GEN, view, image).
+    /// Within a frame, while no image was created, removed or re-aliased and
+    /// no tracked texture source was written, `view` would do nothing but
+    /// return the same view (draws bind the same textures thousands of times
+    /// per frame; each full lookup took the tracker's lock three times).
+    view_memo: HashMap<[u32; 8], (u64, u64, u64, vk::ImageView, vk::Image)>,
+    /// `resolved_key` by (T#, storage): (LOOKUP_GEN, key).
+    key_memo: HashMap<([u32; 8], bool), (u64, Option<ImageKey>)>,
     /// Images whose metadata a GPU or CP write covered since (fast clears).
     pending_clears: HashMap<ImageKey, u64>,
     samplers: HashMap<([u32; 4], bool), vk::Sampler>,
@@ -542,7 +558,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
                 .expect("image pool");
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
-            *g = Some(Images { map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), retired: Vec::new(), depth_grows: 0 });
+            *g = Some(Images { map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), retired: Vec::new(), depth_grows: 0 });
         }
     }
     f(g.as_mut().unwrap())
@@ -1114,6 +1130,7 @@ impl Images {
         if let Some(n) = self.pending_clears.remove(&old) {
             self.pending_clears.insert(new_key, n);
         }
+        self.note_gen += 1;
         self.retired.push(prev.image);
         self.depth_grows += 1;
         if self.depth_grows <= 16 {
@@ -1237,15 +1254,27 @@ impl Images {
 
     /// Notes writes (GPU buffer writes, CP DMA) that cover the metadata of a
     /// rendered surface: fast clears, resolved at the surface's next use.
+    /// GPU buffer writes: fast-clear metadata (`note_meta_writes`) and
+    /// GPU-owned images overwritten (`note_overwrites`, the sized writes).
+    pub fn note_writes(&mut self, writes: &[(u64, u64)], sized: &[(u64, u64)]) {
+        let lookup = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
+        if let Some((w, s, g, n)) = &self.last_note {
+            if *g == lookup && *n == self.note_gen && w == writes && s == sized {
+                return;
+            }
+        }
+        self.note_meta_writes(writes);
+        self.note_overwrites(sized);
+        self.last_note = Some((writes.to_vec(), sized.to_vec(), lookup, self.note_gen));
+    }
+
     pub fn note_meta_writes(&mut self, writes: &[(u64, u64)]) {
         if self.meta_of.is_empty() {
             return;
         }
         for &(b, n) in writes {
-            for (&meta, &(key, _)) in &self.meta_of {
-                if meta >= b && meta < b.saturating_add(n) {
-                    self.pending_clears.insert(key, meta);
-                }
+            for (&meta, &(key, _)) in self.meta_of.range(b..b.saturating_add(n)) {
+                self.pending_clears.insert(key, meta);
             }
         }
     }
@@ -1260,6 +1289,7 @@ impl Images {
         let mut out = Vec::new();
         for k in keys {
             let Some(meta) = self.pending_clears.remove(k) else { continue };
+            self.note_gen += 1;
             let (Some(img), Some(&(_, clear))) = (self.map.get(k), self.meta_of.get(&meta)) else { continue };
             if out.iter().any(|c: &FastClear| c.key == *k) {
                 continue;
@@ -1273,12 +1303,23 @@ impl Images {
     /// Whether a T# binds as a depth/stencil view (a rendered depth surface):
     /// the translation compares in hardware there and emulates comparisons
     /// on color views.
-    pub fn depth_view(&self, t: &Tsharp) -> bool {
+    pub fn depth_view(&mut self, t: &Tsharp) -> bool {
         self.resolved_key(t, false).is_some_and(|k| is_depth(k.format))
     }
 
-    pub fn resolved_key(&self, t: &Tsharp, storage: bool) -> Option<ImageKey> {
-        self.lookup(&Self::key_of(t)?, storage).map(|(k, _)| k)
+    pub fn resolved_key(&mut self, t: &Tsharp, storage: bool) -> Option<ImageKey> {
+        let lookup = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
+        if let Some(&(g, k)) = self.key_memo.get(&(t.raw, storage)) {
+            if g == lookup {
+                return k;
+            }
+        }
+        let k = self.lookup(&Self::key_of(t)?, storage).map(|(k, _)| k);
+        if self.key_memo.len() >= 1 << 16 {
+            self.key_memo.clear();
+        }
+        self.key_memo.insert((t.raw, storage), (lookup, k));
+        k
     }
 
     /// Image for a T#: an existing GPU image at that address with a
@@ -1341,6 +1382,7 @@ impl Images {
         if !v.contains(&k) {
             v.push(k);
             self.max_span = self.max_span.max(span);
+            self.note_gen += 1;
         }
     }
 
@@ -1403,6 +1445,7 @@ impl Images {
             }
             img.overwritten = false;
             self.pending_overwrites = self.pending_overwrites.saturating_sub(1);
+            self.note_gen += 1;
             let (image, span, layout) = (img.image, img.span, img.layout);
             if !super::cp::guest_readable(k.base, span) {
                 self.report(format!("image {:#x} overwritten through a buffer: guest memory not readable", k.base));
@@ -1584,14 +1627,15 @@ impl Images {
         }
         img.gpu_written = true;
         self.gpu_bases.insert(k.base);
-        if s.stencil_base != 0 && has_stencil(k.format) {
-            self.stencil_of.insert(s.stencil_base, k);
+        // Generations move only on a change (every draw with a depth/stencil
+        // target came here: lookups cached by generation never hit).
+        if s.stencil_base != 0 && has_stencil(k.format) && self.stencil_of.insert(s.stencil_base, k) != Some(k) {
             LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
             gpu_images_changed();
             self.gpu_bases.insert(s.stencil_base);
         }
-        if s.meta != 0 {
-            self.meta_of.insert(s.meta, (k, s.clear));
+        if s.meta != 0 && self.meta_of.insert(s.meta, (k, s.clear)) != Some((k, s.clear)) {
+            self.note_gen += 1;
         }
         img.source = None;
         self.index_owned(k);
@@ -1878,6 +1922,26 @@ impl Images {
 
     /// View of a T# (format, type, levels/layers, swizzle) for sampling or storage.
     pub fn view(&mut self, t: &Tsharp, storage: bool, frame: u64) -> Result<(vk::ImageView, vk::Image), String> {
+        if storage {
+            return self.view_full(t, storage, frame);
+        }
+        // Generations read first: a change made by the full lookup itself
+        // (a new image) makes the entry stale at its next use.
+        let (lookup, track) = (LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire), super::track::GEN.load(std::sync::atomic::Ordering::Acquire));
+        if let Some(&(f, g, tg, v, i)) = self.view_memo.get(&t.raw) {
+            if f == frame && g == lookup && tg == track {
+                return Ok((v, i));
+            }
+        }
+        let r = self.view_full(t, storage, frame)?;
+        if self.view_memo.len() >= 1 << 16 {
+            self.view_memo.clear();
+        }
+        self.view_memo.insert(t.raw, (frame, lookup, track, r.0, r.1));
+        Ok(r)
+    }
+
+    fn view_full(&mut self, t: &Tsharp, storage: bool, frame: u64) -> Result<(vk::ImageView, vk::Image), String> {
         if storage {
             // DS_TRACE_IMAGE_WRITERS=<hex base> or <w>x<h>x<depth>: each
             // shader that binds such an image for writing, once.

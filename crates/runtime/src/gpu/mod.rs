@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 28] = [
+    static ALL: [Tunable; 29] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -55,6 +55,7 @@ pub mod tune {
         Tunable { name: "prep_cache", env: "DS_PREP_CACHE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "map_ranges", env: "DS_MAP_RANGES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ahead", env: "DS_AHEAD", default: 4, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_cs", env: "DS_PRE_CS", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -250,6 +251,13 @@ pub mod tune {
     /// command processor (the earlier behavior, for A/B).
     pub fn ahead() -> u64 {
         get(27)
+    }
+
+    /// Read-only buffer bindings of dispatches copied into video memory at
+    /// the batch's start like those of draws (`Exec::pre_copy`); 0: compute
+    /// shaders read them from guest memory in place.
+    pub fn pre_cs() -> bool {
+        get(28) != 0
     }
 
     /// Command-processor waits for GPU work still to be traced (`tune
