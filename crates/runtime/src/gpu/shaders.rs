@@ -616,6 +616,32 @@ fn user_deps(plan: &rdna::analysis::Plan) -> u32 {
     m
 }
 
+/// Preparations whose inputs and bytes read match one of the previous frame
+/// (profile; how much a cache across frames could serve): per stage
+/// [calls, same full inputs, same inputs counting only the user data the
+/// descriptors depend on].
+pub static CROSS_FRAME: [[std::sync::atomic::AtomicU64; 3]; 3] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 3];
+
+/// (frame, this frame's (kind, stage, key, bytes) set, the previous frame's).
+type FrameSets = (u64, super::fx::Set<(u8, u8, u64, u64)>, super::fx::Set<(u8, u8, u64, u64)>);
+static FRAME_SETS: parking_lot::Mutex<Option<FrameSets>> = parking_lot::Mutex::new(None);
+
+/// Notes a preparation's (kind, key, bytes) for the cross-frame statistic;
+/// true when the previous frame had the same.
+fn seen_last_frame(kind: u8, stage: usize, key: u64, bytes: u64) -> bool {
+    let frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+    let mut g = FRAME_SETS.lock();
+    let st = g.get_or_insert_with(|| (frame, Default::default(), Default::default()));
+    if st.0 != frame {
+        st.2 = std::mem::take(&mut st.1);
+        st.0 = frame;
+    }
+    let k = (kind, stage as u8, key, bytes);
+    let hit = st.2.contains(&k);
+    st.1.insert(k);
+    hit
+}
+
 fn note_repeat_deps(stage: Stage, key: u64, bytes: u64) {
     use std::sync::atomic::Ordering;
     let s = match stage {
@@ -623,6 +649,9 @@ fn note_repeat_deps(stage: Stage, key: u64, bytes: u64) {
         Stage::Fragment => 1,
         _ => 2,
     };
+    if seen_last_frame(1, s, key, bytes) {
+        CROSS_FRAME[s][2].fetch_add(1, Ordering::Relaxed);
+    }
     LAST_DEPS.with(|c| {
         let mut c = c.borrow_mut();
         if c[s].0 == key {
@@ -659,6 +688,10 @@ fn note_repeat(stage: Stage, key: u64, reads: &[(u64, u64)]) -> u64 {
     }
     let bytes = h.finish();
     REPEATS[s][0].fetch_add(1, Ordering::Relaxed);
+    CROSS_FRAME[s][0].fetch_add(1, Ordering::Relaxed);
+    if seen_last_frame(0, s, key, bytes) {
+        CROSS_FRAME[s][1].fetch_add(1, Ordering::Relaxed);
+    }
     LAST_PREP.with(|c| {
         let mut c = c.borrow_mut();
         if c[s].0 == key {
@@ -693,10 +726,27 @@ pub fn repeats_line() -> String {
         })
         .collect();
     let (h, m) = (PREP_HITS.load(Ordering::Relaxed), PREP_MISSES.load(Ordering::Relaxed));
-    format!("    preparations repeating the previous one: {}; served from the cache {h} of {}\n", parts.join(", "), h + m)
+    let cross: Vec<String> = (0..3)
+        .map(|s| {
+            let c = &CROSS_FRAME[s];
+            let n = c[0].load(Ordering::Relaxed).max(1);
+            format!("{} {}% ({}% with only the user data descriptors depend on)", names[s], c[1].load(Ordering::Relaxed) * 100 / n, c[2].load(Ordering::Relaxed) * 100 / n)
+        })
+        .collect();
+    format!(
+        "    preparations repeating the previous one: {}; served from the cache {h} of {}\n    preparations identical to one of the previous frame (inputs and bytes read): {}\n",
+        parts.join(", "),
+        h + m,
+        cross.join(", ")
+    )
 }
 
 pub fn reset_repeats() {
+    for r in CROSS_FRAME.iter() {
+        for c in r.iter() {
+            c.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     for r in REPEATS.iter() {
         for c in r.iter() {
             c.store(0, std::sync::atomic::Ordering::Relaxed);
