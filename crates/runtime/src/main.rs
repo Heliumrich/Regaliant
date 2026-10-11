@@ -14,6 +14,7 @@ mod mem;
 mod patch;
 mod thread;
 mod titlefix;
+mod titlemem;
 mod tls;
 
 use std::path::{Path, PathBuf};
@@ -841,6 +842,9 @@ fn main() {
         ticks += 1;
         if ticks % 8 == 0 && exception::break_stats_enabled() {
             exception::dump_break_stats();
+        }
+        if ticks % 4 == 0 {
+            titlemem::tick(start.elapsed().as_secs());
         }
         crate::log::try_flush();
         if let Some((path, offset)) = control.as_mut() {
