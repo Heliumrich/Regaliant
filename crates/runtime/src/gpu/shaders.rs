@@ -253,6 +253,7 @@ pub fn prepare_compute(cp: &Cp, wave64: bool) -> Result<Prepared, String> {
         dump: dump_for(addr),
         force_dispatcher: super::tune::block_chain() == 0,
         dispatcher_for_loops: super::tune::block_chain() == 2,
+        reg_vars: super::tune::reg_vars(),
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
 }
@@ -317,6 +318,7 @@ pub fn prepare_ps(cp: &Cp) -> Result<Prepared, String> {
         dump: None,
         force_dispatcher: super::tune::block_chain() == 0,
         dispatcher_for_loops: super::tune::block_chain() == 2,
+        reg_vars: super::tune::reg_vars(),
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
 }
@@ -435,6 +437,7 @@ pub fn prepare_ngg(cp: &Cp) -> Result<Prepared, String> {
         dump: super::capture::vs_dump().and_then(|(first, inst)| pos_export(&insts).map(|i| (i.pc, [first, inst, 0]))),
         force_dispatcher: super::tune::block_chain() == 0,
         dispatcher_for_loops: super::tune::block_chain() == 2,
+        reg_vars: super::tune::reg_vars(),
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
 }
@@ -457,6 +460,25 @@ pub fn pos_export(insts: &[rdna::Inst]) -> Option<&rdna::Inst> {
 }
 
 /// One line per resolved resource (frame captures).
+/// Where a prepared stage's CPU-side reads come from (wait traces): each
+/// scalar load and each descriptor read from memory, with its guest range.
+pub fn read_sources(p: &Prepared) -> Vec<(String, u64, u64)> {
+    let mut rd = Reader::new(p.addr);
+    let mut v = Vec::new();
+    for (k, l) in p.tr.plan.loads.iter().enumerate() {
+        if let Some(b) = rd.ptr(&l.ptr, &p.user) {
+            v.push((format!("load {k} {:?}+{:#x} x{}", l.ptr, l.offset, l.dwords), b + l.offset as u64, 4 * l.dwords as u64));
+        }
+    }
+    for (i, a) in p.res_addrs.iter().enumerate() {
+        if let Some(a) = a {
+            let res = &p.tr.plan.resources[i];
+            v.push((format!("resource {i} {:?} {:?}", res.kind, res.dwords.first()), *a, 4 * res.dwords.len() as u64));
+        }
+    }
+    v
+}
+
 pub fn describe_resources(p: &Prepared) -> Vec<String> {
     p.resources
         .iter()
@@ -519,8 +541,10 @@ pub fn describe_loads(p: &Prepared) -> Vec<String> {
 }
 
 fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32], spec: &mut Spec) -> Result<Prepared, String> {
-    // The plan depends only on the program and the user-data layout.
-    let plan_key = code_hash ^ (spec.user_sgprs as u64) << 48 ^ (spec.user_base as u64) << 56;
+    // The plan depends only on the program, the user-data layout and where
+    // data loads are read.
+    let gpu_loads = super::tune::gpu_loads();
+    let plan_key = code_hash ^ (spec.user_sgprs as u64) << 48 ^ (spec.user_base as u64) << 56 ^ (gpu_loads as u64) << 40;
     let cached = LOCAL_PLANS.with(|c| c.borrow().get(&plan_key).cloned()).or_else(|| {
         let p = PLANS.lock().as_ref().and_then(|m| m.get(&plan_key).cloned())?;
         LOCAL_PLANS.with(|c| c.borrow_mut().insert(plan_key, p.clone()));
@@ -530,7 +554,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
         Some(p) => p,
         None => {
             let t0 = std::time::Instant::now();
-            let p = Arc::new(rdna::analysis::analyze(&insts, spec.user_sgprs, spec.user_base));
+            let p = Arc::new(rdna::analysis::analyze_opts(&insts, spec.user_sgprs, spec.user_base, gpu_loads));
             let ms = t0.elapsed().as_millis();
             if ms >= 100 {
                 crate::info!("{:?} shader {addr:#x}: analysis took {ms} ms ({} instructions)", spec.stage, insts.len());

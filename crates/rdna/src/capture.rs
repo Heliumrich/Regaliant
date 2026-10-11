@@ -120,6 +120,7 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         dump: None,
         force_dispatcher: false,
         dispatcher_for_loops: false,
+        reg_vars: true,
         stage: u.stage,
         user_sgprs: users,
         user_base,

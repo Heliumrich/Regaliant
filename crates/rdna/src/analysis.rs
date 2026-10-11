@@ -9,7 +9,7 @@
 //! register clobbered on one branch does not affect the others.
 
 use crate::{Enc, Inst};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use crate::HashMap;
 
 /// Source of a 64-bit pointer used by scalar loads.
@@ -173,6 +173,74 @@ fn writes_pair(name: &str) -> bool {
 /// Runs the analysis. User-data dword `i` (of `user_sgprs`) is loaded into
 /// SGPR `user_base + i` (8 for merged/NGG shaders, 0 otherwise).
 pub fn analyze(code: &[Inst], user_sgprs: u16, user_base: u16) -> Plan {
+    analyze_opts(code, user_sgprs, user_base, false)
+}
+
+/// `gpu_data_loads`: scalar loads whose results feed no descriptor and no
+/// pointer (data only, e.g. a matrix in a constant block) are read by the
+/// shader at run time through a binding of their base, as loads at a
+/// dynamic offset are, instead of being resolved on the CPU when the
+/// command is recorded. GPU work that writes such data shortly before (the
+/// title computes per-view constants on the GPU) then costs the command
+/// processor no wait for that work to complete.
+pub fn analyze_opts(code: &[Inst], user_sgprs: u16, user_base: u16, gpu_data_loads: bool) -> Plan {
+    let plan = run(code, user_sgprs, user_base, &HashSet::new());
+    if !gpu_data_loads || plan.loads.is_empty() {
+        return plan;
+    }
+    let data = data_only_loads(&plan);
+    let force: HashSet<u32> = plan.inst_load.iter().filter(|&(_, &k)| data[k]).map(|(&pc, _)| pc).collect();
+    if force.is_empty() {
+        return plan;
+    }
+    let p2 = run(code, user_sgprs, user_base, &force);
+    if p2.errors.len() > plan.errors.len() {
+        return plan;
+    }
+    p2
+}
+
+/// Which scalar loads only produce data: no dword they read is a descriptor
+/// dword (of a resource or an s_buffer_load table) or a pointer that a load
+/// or descriptor goes through.
+fn data_only_loads(plan: &Plan) -> Vec<bool> {
+    fn walk_ptr(p: &Ptr, refs: &mut Vec<(Ptr, u32)>) {
+        if let Ptr::Mem(inner, off) = p {
+            refs.push(((**inner).clone(), *off));
+            refs.push(((**inner).clone(), off + 4));
+            walk_ptr(inner, refs);
+        }
+    }
+    fn walk_prov(p: &Prov, refs: &mut Vec<(Ptr, u32)>) {
+        match p {
+            Prov::Mem(ptr, off) => {
+                refs.push((ptr.clone(), *off));
+                walk_ptr(ptr, refs);
+            }
+            Prov::PtrLo(ptr, _) | Prov::PtrHi(ptr, _) => walk_ptr(ptr, refs),
+            _ => {}
+        }
+    }
+    let mut refs = Vec::new();
+    for r in &plan.resources {
+        for d in &r.dwords {
+            walk_prov(d, &mut refs);
+        }
+    }
+    for l in &plan.loads {
+        walk_ptr(&l.ptr, &mut refs);
+    }
+    for v in plan.table_loads.values() {
+        for d in v {
+            walk_prov(d, &mut refs);
+        }
+    }
+    plan.loads.iter().map(|l| !refs.iter().any(|(p, o)| *p == l.ptr && *o >= l.offset && *o < l.offset + 4 * l.dwords)).collect()
+}
+
+/// The analysis proper; s_load instructions at the pcs in `force` are read
+/// at run time through a binding of their base (see `analyze_opts`).
+fn run(code: &[Inst], user_sgprs: u16, user_base: u16, force: &HashSet<u32>) -> Plan {
     let mut init = State { s: vec![Prov::Unknown; 128], lanes: Vec::new() };
     for i in 0..user_sgprs.min(32) {
         if let Some(s) = init.s.get_mut((user_base + i) as usize) {
@@ -237,7 +305,7 @@ pub fn analyze(code: &[Inst], user_sgprs: u16, user_base: u16) -> Plan {
         queued[b] = false;
         let mut st = entry[b].clone().unwrap();
         for ins in &code[starts[b]..end(b)] {
-            step(&mut st, ins, &mut scratch);
+            step(&mut st, ins, &mut scratch, force);
         }
         scratch = Plan::default();
         for &sb in &succ[b] {
@@ -259,7 +327,7 @@ pub fn analyze(code: &[Inst], user_sgprs: u16, user_base: u16) -> Plan {
     for b in 0..starts.len() {
         let Some(mut st) = entry[b].clone() else { continue };
         for ins in &code[starts[b]..end(b)] {
-            step(&mut st, ins, &mut plan);
+            step(&mut st, ins, &mut plan, force);
         }
     }
     for (i, r) in plan.resources.iter().enumerate() {
@@ -271,7 +339,7 @@ pub fn analyze(code: &[Inst], user_sgprs: u16, user_base: u16) -> Plan {
 }
 
 /// Transfer function of one instruction (records resources/loads in `plan`).
-fn step(st: &mut State, ins: &Inst, plan: &mut Plan) {
+fn step(st: &mut State, ins: &Inst, plan: &mut Plan, force: &HashSet<u32>) {
     // SGPR spills through VGPR lanes.
     if let Some((write, vgpr, lane)) = ins.const_lane_op() {
         if write {
@@ -421,7 +489,7 @@ fn step(st: &mut State, ins: &Inst, plan: &mut Plan) {
             };
             if name.starts_with("s_load") {
                 match (st.ptr(ins.smem_sbase()), off) {
-                    (Some((p, bias)), Some(o)) => {
+                    (Some((p, bias)), Some(o)) if !force.contains(&ins.pc) => {
                         let o = o.wrapping_add(bias);
                         let idx = plan.loads.iter().position(|l| l.ptr == p && l.offset == o && l.dwords == n).unwrap_or_else(|| {
                             plan.loads.push(ScalarLoad { ptr: p.clone(), offset: o, dwords: n });
@@ -432,9 +500,10 @@ fn step(st: &mut State, ins: &Inst, plan: &mut Plan) {
                             st.set(d + k as u16, Prov::Mem(p.clone(), o + 4 * k));
                         }
                     }
-                    (Some((p, bias)), None) => {
+                    (Some((p, bias)), _) => {
                         // Known base, dynamic offset (e.g. a loop over a constant
-                        // table): the base is bound as a buffer and read at run time.
+                        // table), or data read on the GPU (`analyze_opts`): the
+                        // base is bound as a buffer and read at run time.
                         let dwords = vec![Prov::PtrLo(p.clone(), bias), Prov::PtrHi(p, bias)];
                         let r = plan.resource(Resource { kind: ResKind::Global, dwords, written: false, read: true, formatted: false, atomic: false, table: None });
                         plan.inst_res.insert(ins.pc, (r, None));
@@ -549,5 +618,29 @@ mod tests {
         // s_getpc_b64 is at pc 0xc: the next instruction's offset.
         let pc = Ptr::Pc(0xc + 4);
         assert_eq!(r.dwords, vec![Prov::PtrLo(pc.clone(), 0x474), Prov::PtrHi(pc, 0x474), Prov::Const(16), Prov::Const(0x1000_5004)]);
+    }
+
+    /// A V# and a data dword loaded through the same user pointer: with
+    /// `gpu_data_loads` only the data load moves to the GPU (a binding of the
+    /// base), the descriptor stays resolved on the CPU.
+    #[test]
+    fn data_loads_move_to_the_gpu() {
+        // s_load_dwordx4 s[4:7], s[0:1], 0x0; s_load_dword s8, s[0:1], 0x10;
+        // s_waitcnt lgkmcnt(0); buffer_load_dword v1, v0, s[4:7], 0 offen;
+        // v_mov_b32 v2, s8; s_endpgm
+        let words = [0xf4080100, 0xfa000000, 0xf4000200, 0xfa000010, 0xbf8cc07f, 0xe0301000, 0x80010100, 0x7e040208, 0xbf810000];
+        let code = crate::decode_program(&words).unwrap();
+        assert_eq!(code[1].name(), Some("s_load_dword"));
+        let cpu = analyze_opts(&code, 2, 0, false);
+        assert!(cpu.errors.is_empty(), "{:?}", cpu.errors);
+        assert_eq!(cpu.loads.len(), 2);
+        let gpu = analyze_opts(&code, 2, 0, true);
+        assert!(gpu.errors.is_empty(), "{:?}", gpu.errors);
+        assert_eq!(gpu.loads.len(), 1);
+        assert_eq!(gpu.loads[0].dwords, 4);
+        let (r, _) = gpu.inst_res[&code[1].pc];
+        assert_eq!(gpu.resources[r].kind, ResKind::Global);
+        assert_eq!(gpu.resources[r].dwords, vec![Prov::PtrLo(Ptr::User(0), 0), Prov::PtrHi(Ptr::User(0), 0)]);
+        assert!(!gpu.inst_load.contains_key(&code[1].pc));
     }
 }

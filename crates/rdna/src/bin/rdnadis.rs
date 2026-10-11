@@ -24,14 +24,16 @@ fn main() {
         println!("{}", loader.module().disassemble());
         return;
     }
-    // --plan <file> [user sgprs] [user base]: resources and scalar loads with provenance.
-    if files.first().is_some_and(|f| f == "--plan") && files.len() >= 2 {
+    // --plan <file> [user sgprs] [user base]: resources and scalar loads with provenance
+    // (--plan-gpu: with data-only loads read on the GPU, see analysis::analyze_opts).
+    if files.first().is_some_and(|f| f == "--plan" || f == "--plan-gpu") && files.len() >= 2 {
+        let gpu = files[0] == "--plan-gpu";
         let bytes = std::fs::read(&files[1]).expect("read shader");
         let code: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         let insts = rdna::decode_program(&code).expect("decode");
         let users: u16 = files.get(2).and_then(|x| x.parse().ok()).unwrap_or(32);
         let base: u16 = files.get(3).and_then(|x| x.parse().ok()).unwrap_or(0);
-        let plan = rdna::analysis::analyze(&insts, users, base);
+        let plan = rdna::analysis::analyze_opts(&insts, users, base, gpu);
         for (i, r) in plan.resources.iter().enumerate() {
             println!("resource {i}: {:?} read {} written {}", r.kind, r.read, r.written);
             for (k, d) in r.dwords.iter().enumerate() {

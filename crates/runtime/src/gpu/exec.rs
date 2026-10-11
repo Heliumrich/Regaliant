@@ -72,13 +72,15 @@ pub const SYNC_DRAW_READS: usize = 3;
 pub const SYNC_DRAW_TEXTURES: usize = 4;
 pub const SYNC_DRAW_INDICES: usize = 5;
 
-/// Pipelines created (compute, graphics): new translations or states.
+/// Pipelines created (compute, graphics): new translations or states, and
+/// the time their creation took (ns; cache hits are quick).
 pub static PIPES_CREATED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+pub static PIPES_NS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 fn sync_why_status() -> String {
     let n: Vec<u64> = SYNC_WHY.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    CP read waits: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices; pipelines created: {} compute, {} graphics\n",
+        "    CP read waits: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices; pipelines created: {} compute ({} ms), {} graphics ({} ms)\n",
         n[0],
         n[1],
         n[2],
@@ -86,7 +88,9 @@ fn sync_why_status() -> String {
         n[4],
         n[5],
         PIPES_CREATED[0].load(Ordering::Relaxed),
-        PIPES_CREATED[1].load(Ordering::Relaxed)
+        PIPES_NS[0].load(Ordering::Relaxed) / 1_000_000,
+        PIPES_CREATED[1].load(Ordering::Relaxed),
+        PIPES_NS[1].load(Ordering::Relaxed) / 1_000_000
     )
 }
 
@@ -447,6 +451,7 @@ fn compute_pipe(p: &Prepared) -> Result<(vk::Pipeline, vk::PipelineLayout, vk::D
     let t0 = std::time::Instant::now();
     let pipe = compute_pipeline(&p.tr.out)?;
     PIPES_CREATED[0].fetch_add(1, Ordering::Relaxed);
+    PIPES_NS[0].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     super::pstats::report(pipe.pipeline, &format!("cs {:#x}", p.addr));
     let ms = t0.elapsed().as_millis();
     if ms >= 200 {
@@ -659,6 +664,24 @@ const POOL_TYPES: [vk::DescriptorType; 4] = [vk::DescriptorType::STORAGE_BUFFER,
 /// `DS_TRACE_CS=<hex address>[,...]`: logs those compute shaders' scalar-load
 /// values and resources whenever the loads change (diagnosing data-dependent
 /// hangs, inputs of passes that frame captures miss).
+/// A traced wait for a read of `c`: which loads or descriptors of `stages`
+/// read it (their programs are saved to the run directory once).
+pub(super) fn explain_wait(queue: &str, c: (u64, u64), stages: &[&Prepared]) {
+    static SAVED: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+    for p in stages {
+        let hits: Vec<String> = shaders::read_sources(p).into_iter().filter(|(_, a, n)| *a < c.0 + c.1 && c.0 < a + n).map(|(d, a, n)| format!("{d} @{a:#x}+{n:#x}")).collect();
+        if hits.is_empty() {
+            continue;
+        }
+        if SAVED.lock().get_or_insert_with(HashSet::new).insert(p.addr) {
+            super::capture::save_program(p.addr);
+        }
+        // The colliding bytes as they are now (the wait completed the writer).
+        let words: Vec<String> = (0..(c.1 / 4).min(16)).map(|k| c.0 + 4 * k).filter(|&a| super::cp::guest_readable(a, 4)).map(|a| format!("{:08x}", unsafe { std::ptr::read_volatile(a as *const u32) })).collect();
+        crate::info!("gpu[{queue}]:   read by {:?} shader {:#x}: {} = [{}]", p.stage, p.addr, hits.join("; "), words.join(" "));
+    }
+}
+
 fn trace_loads(queue: &str, p: &Prepared, groups: [u32; 3]) {
     static ADDRS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let addrs = ADDRS.get_or_init(|| {
@@ -1509,6 +1532,8 @@ pub struct Exec {
     resident: Vec<Shadow>,
     /// The shaders whose reads the next `sync_for` checks (wait traces).
     sync_readers: [u64; 2],
+    /// The read a traced wait collided with (the caller explains it).
+    pub(super) sync_culprit: Option<(u64, u64)>,
 }
 
 unsafe impl Send for Exec {}
@@ -1559,6 +1584,7 @@ impl Exec {
                 shadow_used: 0,
                 resident: Vec::new(),
                 sync_readers: [0; 2],
+                sync_culprit: None,
             })
         }
     }
@@ -2220,13 +2246,19 @@ impl Exec {
         let culprit = if trace {
             let done = done_seq();
             reads.iter().find_map(|&r| {
-                if self.pending.overlaps(r.0, r.1) {
-                    Some((r, "this batch".to_string()))
+                let who = if self.pending.overlaps(r.0, r.1) {
+                    Some("this batch".to_string())
                 } else if let Some(s) = self.inflight.latest(&[r], done) {
-                    Some((r, format!("own batch {s}")))
+                    Some(format!("own batch {s}"))
                 } else {
-                    INFLIGHT.latest(&[r]).map(|s| (r, format!("batch {s} (another queue)")))
-                }
+                    INFLIGHT.latest(&[r]).map(|s| format!("batch {s} (another queue)"))
+                }?;
+                let cp = match CP_WRITES.latest(&[r]) {
+                    Some(s) => format!(", a deferred CP write after batch {s}"),
+                    None => ", GPU work".to_string(),
+                };
+                let last = super::cp::last_write_info(r.0).map(|w| format!(" [last CP write there: {w}]")).unwrap_or_default();
+                Some((r, format!("{who}{cp}{last}")))
             })
         } else {
             None
@@ -2236,6 +2268,7 @@ impl Exec {
         if w {
             SYNC_WHY[why.min(SYNC_WHY.len() - 1)].fetch_add(1, Ordering::Relaxed);
             if let Some(((a, n), src)) = culprit {
+                self.sync_culprit = Some((a, n));
                 {
                     TRACED.fetch_add(1, Ordering::Relaxed);
                     const WHY: [&str; 6] = ["CP read", "dispatch shader read", "dispatch texture", "draw shader read", "draw texture", "draw indices"];
@@ -2878,6 +2911,9 @@ impl Exec {
         let mut p = shaders::prepare_compute(cp, wave64)?;
         self.sync_readers = [p.addr, 0];
         if self.sync_for(&p.reads, SYNC_CS_READS) {
+            if let Some(c) = self.sync_culprit.take() {
+                explain_wait(&self.name, c, &[&p]);
+            }
             p = shaders::prepare_compute(cp, wave64)?;
         }
         // Textures are uploaded from guest memory: earlier GPU writes first.

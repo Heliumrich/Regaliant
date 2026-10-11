@@ -188,6 +188,9 @@ pub struct Spec {
     /// for every program, or for programs with loops only (A/B comparisons).
     pub force_dispatcher: bool,
     pub dispatcher_for_loops: bool,
+    /// One variable per register (programs without relative addressing),
+    /// else the register files as arrays (the earlier form, for A/B).
+    pub reg_vars: bool,
 }
 
 /// Entries of an image table bound as one array of sampled images
@@ -343,8 +346,17 @@ pub(crate) struct T<'a> {
     pub glsl: Word,
     pub spec: &'a Spec,
     pub plan: &'a Plan,
+    /// Register files as arrays (programs with relative addressing,
+    /// s_movrel* / v_movrel*), else 0 ...
     pub sgpr: Word,
     pub vgpr: Word,
+    /// ... and one variable per register instead (no access chain per use:
+    /// the arrays made about a third of the translated modules' words).
+    pub sregs: Vec<Word>,
+    pub vregs: Vec<Word>,
+    /// This lane's EXEC bit as computed in a block (function, block): reused
+    /// there until EXEC is written (it was recomputed for every VGPR write).
+    active_cache: Option<((usize, usize), Word)>,
     pub scc: Word,
     pub consts: HashMap<(Word, u32), Word>,
     pub interface: Vec<Word>,
@@ -481,28 +493,44 @@ impl<'a> T<'a> {
         e(self.b.access_chain(pt, None, file, [i]))
     }
 
+    fn sreg_ptr(&mut self, idx: u32) -> R<Word> {
+        match self.sregs.get(idx as usize) {
+            Some(&v) => Ok(v),
+            None => self.reg_ptr(self.sgpr, idx),
+        }
+    }
+    fn vreg_ptr(&mut self, idx: u32) -> R<Word> {
+        match self.vregs.get(idx as usize) {
+            Some(&v) => Ok(v),
+            None => self.reg_ptr(self.vgpr, idx),
+        }
+    }
+
     /// Raw 32-bit value of a scalar register slot (0..127; NULL reads 0).
     pub fn sreg(&mut self, idx: u32) -> R<Word> {
         if idx == crate::OP_NULL as u32 || idx >= 128 {
             return Ok(self.u(0));
         }
-        let p = self.reg_ptr(self.sgpr, idx)?;
+        let p = self.sreg_ptr(idx)?;
         e(self.b.load(self.t.u32, None, p, None, []))
     }
     pub fn set_sreg(&mut self, idx: u32, v: Word) -> R<()> {
         if idx >= 128 || idx == crate::OP_NULL as u32 {
             return Ok(()); // writes to constants / null are ignored
         }
-        let p = self.reg_ptr(self.sgpr, idx)?;
+        if idx == crate::OP_EXEC_LO as u32 || idx == crate::OP_EXEC_HI as u32 {
+            self.active_cache = None;
+        }
+        let p = self.sreg_ptr(idx)?;
         ok(self.b.store(p, v, None, []))
     }
     pub fn vreg(&mut self, idx: u32) -> R<Word> {
-        let p = self.reg_ptr(self.vgpr, idx & 255)?;
+        let p = self.vreg_ptr(idx & 255)?;
         e(self.b.load(self.t.u32, None, p, None, []))
     }
     /// Unconditional VGPR write (initialization, lane-exact writes).
     pub fn set_vreg_raw(&mut self, idx: u32, v: Word) -> R<()> {
-        let p = self.reg_ptr(self.vgpr, idx & 255)?;
+        let p = self.vreg_ptr(idx & 255)?;
         ok(self.b.store(p, v, None, []))
     }
     /// VGPR write predicated on this lane being active.
@@ -513,9 +541,23 @@ impl<'a> T<'a> {
         self.set_vreg_raw(idx, nv)
     }
     pub fn active(&mut self) -> R<Word> {
+        let here = self.b.selected_function().zip(self.b.selected_block());
+        if let (Some((at, v)), Some(h)) = (self.active_cache, here) {
+            if at == h {
+                return Ok(v);
+            }
+        }
         let lo = self.sreg(crate::OP_EXEC_LO as u32)?;
         let hi = if self.own_bit.is_some() { self.sreg(crate::OP_EXEC_HI as u32)? } else { self.u(0) };
-        self.mask_bit(lo, hi)
+        let v = self.mask_bit(lo, hi)?;
+        // Not with relative addressing: a v/s_movreld could write EXEC
+        // through the array.
+        if self.sregs.is_empty() {
+            self.active_cache = None;
+        } else if let Some(h) = here {
+            self.active_cache = Some((h, v));
+        }
+        Ok(v)
     }
 
     /// This lane's bit of a lane mask (lo, hi): bit 0, or in wave-mask mode
@@ -1401,6 +1443,9 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         plan,
         sgpr: 0,
         vgpr: 0,
+        sregs: Vec::new(),
+        vregs: Vec::new(),
+        active_cache: None,
         scc: 0,
         consts: HashMap::default(),
         interface: Vec::new(),
@@ -1583,8 +1628,17 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     };
     let p_arr_s = tr.b.type_pointer(None, StorageClass::Function, arr_s);
     let p_arr_v = tr.b.type_pointer(None, StorageClass::Function, arr_v);
-    tr.sgpr = tr.b.variable(p_arr_s, None, StorageClass::Function, None);
-    tr.vgpr = tr.b.variable(p_arr_v, None, StorageClass::Function, None);
+    // Relative register addressing needs the files as arrays; otherwise
+    // one variable per register (zero).
+    let relative = code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("s_movrel") || n.starts_with("v_movrel")));
+    if relative || !spec.reg_vars {
+        tr.sgpr = tr.b.variable(p_arr_s, None, StorageClass::Function, None);
+        tr.vgpr = tr.b.variable(p_arr_v, None, StorageClass::Function, None);
+    } else {
+        let z = tr.u(0);
+        tr.sregs = (0..128).map(|_| tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, Some(z))).collect();
+        tr.vregs = (0..256).map(|_| tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, Some(z))).collect();
+    }
     tr.scc = tr.b.variable(tr.t.fn_bool, None, StorageClass::Function, None);
     tr.pc_var = tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, None);
     if tr.watchdog.is_some() {
@@ -1631,10 +1685,12 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     let f = tr.bool_c(false);
     tr.set_scc(f)?;
     let zero = tr.u(0);
-    let zs = tr.b.constant_null(arr_s);
-    ok(tr.b.store(tr.sgpr, zs, None, []))?;
-    let zv = tr.b.constant_null(arr_v);
-    ok(tr.b.store(tr.vgpr, zv, None, []))?;
+    if tr.sregs.is_empty() {
+        let zs = tr.b.constant_null(arr_s);
+        ok(tr.b.store(tr.sgpr, zs, None, []))?;
+        let zv = tr.b.constant_null(arr_v);
+        ok(tr.b.store(tr.vgpr, zv, None, []))?;
+    }
     // EXEC holds this lane's bit (bit 0) only; in wave-mask mode the lanes
     // of the wave.
     let (exec_lo, exec_hi) = if tr.wave_masks {
@@ -2286,6 +2342,7 @@ mod tests {
             dump: None,
             force_dispatcher: false,
             dispatcher_for_loops: false,
+            reg_vars: true,
         }
     }
 

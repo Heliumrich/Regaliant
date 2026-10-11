@@ -219,6 +219,25 @@ fn missed_write(addr: u64, wide: bool, func: u32, mask: u64, reference: u64, sin
     })
 }
 
+/// Whether an equality wait for `reference` waits on a counter that has
+/// moved past it: the recorded writes include `reference`, every write since
+/// kept the value or added 1, and it rose by 2 or more (a frame counter; a
+/// flag set from 0 to 1 is not one).
+fn counter_passed(addr: u64, wide: bool, func: u32, mask: u64, reference: u64) -> bool {
+    if func & 7 != 3 {
+        return false;
+    }
+    let g = LABEL_WRITES.lock();
+    let Some(h) = g.as_ref().and_then(|m| m.get(&addr)) else { return false };
+    let val = |v: u64| (if wide { v } else { v & 0xFFFF_FFFF }) & mask;
+    let r = reference & mask;
+    let Some(i) = h.iter().rposition(|&(_, v)| val(v) == r) else { return false };
+    let later: Vec<u64> = h.iter().skip(i).map(|&(_, v)| val(v)).collect();
+    later.windows(2).all(|w| w[1] == w[0] || w[1] == w[0].wrapping_add(1)) && later.last().is_some_and(|&l| l >= r.wrapping_add(2))
+}
+/// Equality waits passed because their counter had moved on (diagnostics).
+pub static COUNTER_PASSED: AtomicU64 = AtomicU64::new(0);
+
 fn note_write(queue: &str, addr: u64, value: u64, at: u64) {
     super::homes::cpu_written(addr, 8);
     if WAITED.lock().as_ref().is_some_and(|w| w.contains(&(addr & !7))) {
@@ -405,6 +424,11 @@ pub fn wait_stats() -> String {
         s.push_str(&format!("      {w} <- {by}: {n}, {} ms, {} us\n", ns / 1_000_000, ns / 1000 / (*n).max(1)));
     }
     s
+}
+
+/// The last CP write to the label-sized word at `addr` (wait traces).
+pub fn last_write_info(addr: u64) -> Option<String> {
+    last_write(addr).map(|(q, v, pk)| format!("{q} wrote {v:#x} (packet {pk:#x})"))
 }
 
 fn last_write(addr: u64) -> Option<(String, u64, u64)> {
@@ -1548,6 +1572,16 @@ impl Cp {
         // and every queue stopped).
         if self.submitted_at.is_some_and(|since| missed_write(a, wide, func, mask, reference, since)) {
             MISSED.fetch_add(1, Ordering::Relaxed);
+            label_event(&self.name, b'M', a, v0, reference, at);
+            return Flow::Next;
+        }
+        // An equality wait on a counter that has moved past the value (its
+        // command buffer came after the write: run 20261011-082829, acb0x48
+        // waited for 0x706 at 0x70a while pipelines compiled).
+        if counter_passed(a, wide, func, mask, reference) {
+            if COUNTER_PASSED.fetch_add(1, Ordering::Relaxed) < 20 {
+                crate::info!("gpu[{}]: WAIT_REG_MEM at {at:#x} for [{a:#x}] == {reference:#x} passed: the counter is at {v0:#x}", self.name);
+            }
             label_event(&self.name, b'M', a, v0, reference, at);
             return Flow::Next;
         }

@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 23] = [
+    static ALL: [Tunable; 25] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -50,6 +50,8 @@ pub mod tune {
         Tunable { name: "scratch_writes", env: "DS_SCRATCH_WRITES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "trace_sync", env: "DS_TRACE_SYNC_N", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "homes", env: "DS_HOMES", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "gpu_loads", env: "DS_GPU_LOADS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "reg_vars", env: "DS_REG_VARS", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -205,6 +207,21 @@ pub mod tune {
     /// and drops them.
     pub fn homes() -> bool {
         get(22) != 0
+    }
+
+    /// Scalar loads that only produce data are read by the shader at run
+    /// time (`rdna::analysis::analyze_opts`) instead of being resolved on the
+    /// CPU when the command is recorded: GPU work that writes them shortly
+    /// before then costs no wait. Switching translates programs anew.
+    pub fn gpu_loads() -> bool {
+        get(23) != 0
+    }
+
+    /// Translations keep each register in its own variable (1) or the
+    /// register files in arrays (0, the earlier form): see
+    /// `rdna::translate::Spec::reg_vars`. Switching translates programs anew.
+    pub fn reg_vars() -> bool {
+        get(24) != 0
     }
 
     /// Command-processor waits for GPU work still to be traced (`tune
@@ -722,7 +739,7 @@ pub fn status_ex(with_stacks: bool) -> String {
         }
     }
     s.push_str(&format!(
-        "    gpu totals: {} submits, {} packets, {} draws, {} dispatches, {} EOP interrupts, {} flips, {} label waits latched, {} passed on writes made after their submission, {} passed on promises, {} CP reads waited for another queue\n",
+        "    gpu totals: {} submits, {} packets, {} draws, {} dispatches, {} EOP interrupts, {} flips, {} label waits latched, {} passed on writes made after their submission, {} on counters past their value, {} passed on promises, {} CP reads waited for another queue\n",
         SUBMITS.load(Ordering::Relaxed),
         cp::PACKETS.load(Ordering::Relaxed),
         cp::DRAWS.load(Ordering::Relaxed),
@@ -731,6 +748,7 @@ pub fn status_ex(with_stacks: bool) -> String {
         FRAMES.load(Ordering::Relaxed),
         cp::LATCHED.load(Ordering::Relaxed),
         cp::MISSED.load(Ordering::Relaxed),
+        cp::COUNTER_PASSED.load(Ordering::Relaxed),
         cp::PROMISED.load(Ordering::Relaxed),
         exec::FOREIGN_WAITS.load(Ordering::Relaxed)
     ));

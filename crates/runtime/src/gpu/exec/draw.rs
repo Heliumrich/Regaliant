@@ -483,6 +483,13 @@ impl Exec {
         }
         self.sync_readers = [vs.addr, ps.as_ref().map_or(0, |p| p.addr)];
         if self.sync_for(&reads, SYNC_DRAW_READS) {
+            if let Some(c) = self.sync_culprit.take() {
+                let mut st: Vec<&Prepared> = vec![&vs];
+                if let Some(p) = &ps {
+                    st.push(p);
+                }
+                super::explain_wait(&self.name, c, &st);
+            }
             vs = shaders::prepare_ngg(cp)?;
             ps = if ps_addr != 0 { Some(shaders::prepare_ps(cp)?) } else { None };
         }
@@ -600,6 +607,7 @@ impl Exec {
                 let t0 = std::time::Instant::now();
                 let p = graphics_pipeline(&key, &vs, ps.as_ref())?;
                 super::PIPES_CREATED[1].fetch_add(1, Ordering::Relaxed);
+                super::PIPES_NS[1].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 let ms = t0.elapsed().as_millis();
                 if ms >= 200 {
                     crate::info!("gpu: graphics pipeline for vs {:#x} ps {ps_addr:#x} took {ms} ms", vs.addr);
