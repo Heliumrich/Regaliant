@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 26] = [
+    static ALL: [Tunable; 27] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -53,6 +53,7 @@ pub mod tune {
         Tunable { name: "gpu_loads", env: "DS_GPU_LOADS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "reg_vars", env: "DS_REG_VARS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "prep_cache", env: "DS_PREP_CACHE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "map_ranges", env: "DS_MAP_RANGES", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -234,6 +235,13 @@ pub mod tune {
     /// 20261011-092437); a form that shares the unchanging parts may pay.
     pub fn prep_cache() -> bool {
         get(25) != 0
+    }
+
+    /// The per-thread caches of readable guest ranges (`mem::readable_span`)
+    /// keep the runs a mapping change did not touch; 0 empties them at every
+    /// change (the earlier behavior, for A/B).
+    pub fn map_ranges() -> bool {
+        get(26) != 0
     }
 
     /// Command-processor waits for GPU work still to be traced (`tune

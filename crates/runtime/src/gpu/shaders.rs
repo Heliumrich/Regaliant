@@ -645,11 +645,15 @@ fn note_repeat(stage: Stage, key: u64, reads: &[(u64, u64)]) -> u64 {
     let mut h = super::fx::FxHasher::default();
     for &(a, n) in reads {
         h.write_u64(a);
+        // One check per range: per-word checks made this profile-only
+        // statistic most of the readable-range checks (~7.6 million per
+        // second, run 20261011-115142) and inflated their profile share.
+        if !super::cp::guest_readable(a, n) {
+            continue;
+        }
         let mut k = 0;
         while k + 4 <= n {
-            if super::cp::guest_readable(a + k, 4) {
-                h.write_u32(unsafe { std::ptr::read_volatile((a + k) as *const u32) });
-            }
+            h.write_u32(unsafe { std::ptr::read_volatile((a + k) as *const u32) });
             k += 4;
         }
     }

@@ -84,16 +84,24 @@ struct RemapStats {
 
 static REMAP: Mutex<RemapStats> = Mutex::new(RemapStats { in_place: 0, in_place_bytes: 0, moved: 0, moved_bytes: 0, logged: 0, released: BTreeMap::new() });
 
+/// `readable_span` calls and cache misses (diagnostics).
+static SPAN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SPAN_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// One status line (diagnostics).
 pub fn remap_status() -> String {
     let r = REMAP.lock();
+    let o = std::sync::atomic::Ordering::Relaxed;
     format!(
-        "    direct memory remaps: {} in place ({} MiB, zeroed here), {} of pages last mapped elsewhere ({} MiB, contents not carried)
+        "    direct memory remaps: {} in place ({} MiB, zeroed here), {} of pages last mapped elsewhere ({} MiB, contents not carried); mapping changes {}; readable-range checks {} ({} cache misses)
 ",
         r.in_place,
         r.in_place_bytes >> 20,
         r.moved,
-        r.moved_bytes >> 20
+        r.moved_bytes >> 20,
+        MAP_GEN.load(o),
+        SPAN_CALLS.load(o),
+        SPAN_MISSES.load(o)
     )
 }
 
@@ -102,47 +110,109 @@ pub fn remap_status() -> String {
 /// value (`readable_span`).
 pub static MAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The latest mapping changes: (generation it made, start, end), oldest
+/// first. A thread's cached readable runs that no change since its
+/// generation touched stay valid: the title's texture streaming remaps
+/// 64 KiB pieces many times per second, and every change used to empty
+/// every command processor's cache (`readable_span` was ~12% of the
+/// graphics thread's busy samples, run 20261011-111123).
+static CHANGES: Mutex<std::collections::VecDeque<(u64, u64, u64)>> = Mutex::new(std::collections::VecDeque::new());
+const CHANGES_KEEP: usize = 256;
+
+/// Notes a mapping change of [start, end) (inside the MEM lock).
+fn bump_gen(start: u64, end: u64) {
+    let mut c = CHANGES.lock();
+    let generation = MAP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    if c.len() >= CHANGES_KEEP {
+        c.pop_front();
+    }
+    c.push_back((generation, start, end));
+}
+
+/// Brings a thread's cached runs from generation `from` to `to`: drops the
+/// runs a change in between touched; false when the changes are not all
+/// known any more (the caller empties the cache).
+fn revalidate(runs: &mut Vec<(u64, u64, bool)>, from: u64, to: u64) -> bool {
+    if from == u64::MAX {
+        return false;
+    }
+    let c = CHANGES.lock();
+    if c.front().is_none_or(|&(g, _, _)| g > from + 1) {
+        return false;
+    }
+    for &(g, s, e) in c.iter() {
+        if g > from && g <= to {
+            runs.retain(|&(rs, re, _)| e <= rs || re <= s);
+        }
+    }
+    true
+}
+
+/// Cached runs per thread.
+const READABLE_RUNS: usize = 64;
+
 thread_local! {
-    /// This thread's recently confirmed runs of readable mappings, valid for
-    /// one MAP_GEN value, most recent first.
-    static READABLE: std::cell::RefCell<(u64, Vec<(u64, u64)>)> = const { std::cell::RefCell::new((u64::MAX, Vec::new())) };
+    /// This thread's recently confirmed runs: [start, end) and whether they
+    /// are readable (unmapped gaps are kept too: descriptors of unbound
+    /// resources point there again and again), sorted by start and
+    /// disjoint; valid for one MAP_GEN value (`revalidate` carries them
+    /// over changes elsewhere).
+    static READABLE: std::cell::RefCell<(u64, Vec<(u64, u64, bool)>)> = const { std::cell::RefCell::new((u64::MAX, Vec::new())) };
 }
 
 /// The run of adjacent accessible mappings containing `a` as [start, end)
 /// (at most 64 mappings either side), from a per-thread cache when the
 /// mappings have not changed since (the GPU command processors check every
-/// descriptor and buffer they read; the mapping table lock is shared with
-/// the title's threads).
+/// descriptor and buffer they read, ~2.3 million times per second in the
+/// courtyard; the mapping table lock is shared with the title's threads).
 pub fn readable_span(a: u64) -> Option<(u64, u64)> {
+    SPAN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let generation = MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
     let hit = READABLE.with(|c| {
-        let c = c.borrow();
+        let mut c = c.borrow_mut();
         if c.0 != generation {
-            return None;
+            let from = c.0;
+            if !crate::gpu::tune::map_ranges() || !revalidate(&mut c.1, from, generation) {
+                c.1.clear();
+            }
+            c.0 = generation;
         }
-        c.1.iter().copied().find(|&(s, e)| s <= a && a < e)
+        let i = c.1.partition_point(|r| r.0 <= a);
+        i.checked_sub(1).map(|i| c.1[i]).filter(|r| a < r.1)
     });
-    if hit.is_some() {
-        return hit;
+    if let Some((s, e, ok)) = hit {
+        return ok.then_some((s, e));
     }
-    let run = {
+    SPAN_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (start, end, ok) = {
         let st = MEM.lock();
         let usable = |v: &Vma| v.kind != VmaKind::Reserved && v.prot != 0;
-        let v = st.find(a).filter(|v| usable(v))?;
-        let (mut start, mut end) = (v.start, v.end());
-        for _ in 0..64 {
-            match st.vmas.range(..start).next_back().map(|(_, p)| p).filter(|p| p.end() == start && usable(p)) {
-                Some(p) => start = p.start,
-                None => break,
+        match st.find(a) {
+            Some(v) if usable(v) => {
+                let (mut start, mut end) = (v.start, v.end());
+                for _ in 0..64 {
+                    match st.vmas.range(..start).next_back().map(|(_, p)| p).filter(|p| p.end() == start && usable(p)) {
+                        Some(p) => start = p.start,
+                        None => break,
+                    }
+                }
+                for _ in 0..64 {
+                    match st.vmas.get(&end).filter(|p| usable(p)) {
+                        Some(p) => end = p.end(),
+                        None => break,
+                    }
+                }
+                (start, end, true)
+            }
+            // Reserved or inaccessible: that mapping.
+            Some(v) => (v.start, v.end(), false),
+            // Between mappings: the gap.
+            None => {
+                let lo = st.vmas.range(..=a).next_back().map(|(_, p)| p.end()).filter(|&e| e <= a).unwrap_or(a);
+                let hi = st.vmas.range(a..).next().map(|(&k, _)| k).filter(|&k| k > a).unwrap_or(a + 1);
+                (lo, hi, false)
             }
         }
-        for _ in 0..64 {
-            match st.vmas.get(&end).filter(|p| usable(p)) {
-                Some(p) => end = p.end(),
-                None => break,
-            }
-        }
-        (start, end)
     };
     READABLE.with(|c| {
         let mut c = c.borrow_mut();
@@ -150,10 +220,15 @@ pub fn readable_span(a: u64) -> Option<(u64, u64)> {
             c.0 = generation;
             c.1.clear();
         }
-        c.1.insert(0, run);
-        c.1.truncate(16);
+        // Newer runs replace the ones they overlap.
+        c.1.retain(|r| r.1 <= start || end <= r.0);
+        if c.1.len() >= READABLE_RUNS {
+            c.1.clear();
+        }
+        let i = c.1.partition_point(|r| r.0 < start);
+        c.1.insert(i, (start, end, ok));
     });
-    Some(run)
+    ok.then_some((start, end))
 }
 
 /// Whether guest [a, a+len) is accessible (`readable_span`, else `mapped`).
@@ -375,7 +450,7 @@ impl MemState {
     /// are left reserved only if `keep_reserved`.
     pub fn unmap_range(&mut self, start: u64, end: u64) {
         trace_map("unmap", start, end, format_args!(""));
-        MAP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        bump_gen(start, end);
         self.split_at(start);
         self.split_at(end);
         let keys: Vec<u64> = self.vmas.range(start..end).map(|(k, _)| *k).collect();
@@ -470,7 +545,7 @@ impl MemState {
             self.flexible_used += size;
         }
         self.vmas.insert(addr, Vma { start: addr, size, kind, prot, phys, mtype, name: name.to_string() });
-        MAP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        bump_gen(addr, addr + size);
         trace_map("map", addr, addr + size, format_args!("{kind:?} prot {prot:#x} phys {phys:#x} '{name}'"));
         Ok(addr)
     }
@@ -503,7 +578,7 @@ impl MemState {
             v.prot = prot;
             host_protect(v.start, v.size, prot)?;
         }
-        MAP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        bump_gen(start, end);
         Ok(())
     }
 
@@ -628,4 +703,27 @@ pub fn arena_cstr(s: &str) -> u64 {
         *((p + s.len() as u64) as *mut u8) = 0;
     }
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cached readable runs survive mapping changes that do not touch them.
+    #[test]
+    fn readable_runs_survive_unrelated_changes() {
+        let g0 = MAP_GEN.load(std::sync::atomic::Ordering::SeqCst);
+        let mut runs = vec![(0x1_0000, 0x2_0000, true), (0x5_0000, 0x6_0000, false)];
+        bump_gen(0x2_0000, 0x3_0000); // adjacent to the first run
+        bump_gen(0x5_8000, 0x5_9000); // inside the second
+        let g1 = MAP_GEN.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(revalidate(&mut runs, g0, g1));
+        assert_eq!(runs, vec![(0x1_0000, 0x2_0000, true)]);
+        assert!(!revalidate(&mut runs, u64::MAX, g1), "a cache never filled");
+        for _ in 0..CHANGES_KEEP + 1 {
+            bump_gen(0x9_0000, 0x9_1000);
+        }
+        let g2 = MAP_GEN.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(!revalidate(&mut runs, g1, g2), "changes no longer all known");
+    }
 }
