@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 38] = [
+    static ALL: [Tunable; 39] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -65,6 +65,7 @@ pub mod tune {
         Tunable { name: "pre_share_volatile", env: "DS_PRE_SHARE_VOLATILE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "spec_reads", env: "DS_SPEC_READS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "submit_thread", env: "DS_SUBMIT_THREAD", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par_balance", env: "DS_PAR_BALANCE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -320,6 +321,12 @@ pub mod tune {
     /// (`exec::push_batch`) instead of by the command processors.
     pub fn submit_thread() -> bool {
         get(37) != 0
+    }
+
+    /// The main command processor's share of a split run follows whether it
+    /// waited for the workers (`par::main_weight`); 0: equal chunks.
+    pub fn par_balance() -> bool {
+        get(38) != 0
     }
 
     /// Command-processor waits for GPU work still to be traced (`tune

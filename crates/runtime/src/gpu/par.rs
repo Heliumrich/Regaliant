@@ -25,6 +25,34 @@ pub fn workers() -> usize {
     (super::tune::par() as usize).min(8)
 }
 
+/// The main command processor's chunk relative to a worker's, in 1/1000
+/// (`tune par_balance`): raised after a split run in which it waited for
+/// the workers when collecting their batches, lowered after one in which it
+/// did not (the workers start after the planning and with cold per-thread
+/// caches; it waited ~6.6% of its time with equal chunks, profile run
+/// 20261012-001629).
+static MAIN_WEIGHT: AtomicU64 = AtomicU64::new(1000);
+
+/// The main command processor's chunk relative to a worker's.
+pub fn main_weight() -> f64 {
+    if super::tune::par_balance() {
+        MAIN_WEIGHT.load(Ordering::Relaxed) as f64 / 1000.0
+    } else {
+        1.0
+    }
+}
+
+/// A split run was collected; the main command processor waited `ns` for
+/// its workers in all.
+pub fn note_main_wait(ns: u64) {
+    if !super::tune::par_balance() {
+        return;
+    }
+    let w = MAIN_WEIGHT.load(Ordering::Relaxed);
+    let next = if ns > 20_000 { (w + 25).min(4000) } else { w.saturating_sub(25).max(500) };
+    MAIN_WEIGHT.store(next, Ordering::Relaxed);
+}
+
 struct Job {
     state: Box<ChunkState>,
     from: u64,
@@ -173,8 +201,9 @@ impl Worker {
         self.cv.notify_all();
     }
 
-    /// Waits for the chunk: where it stopped (None: it ran to its end).
-    pub fn wait(&self) -> Option<u64> {
+    /// Waits for the chunk: where it stopped (None: it ran to its end), and
+    /// how long it waited (ns).
+    pub fn wait(&self) -> (Option<u64>, u64) {
         let t = std::time::Instant::now();
         let mut g = self.done.lock();
         // A chunk usually ends within microseconds of the main command
@@ -191,8 +220,9 @@ impl Worker {
         while g.is_none() {
             self.done_cv.wait(&mut g);
         }
-        WAIT_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        g.take().unwrap()
+        let ns = t.elapsed().as_nanos() as u64;
+        WAIT_NS.fetch_add(ns, Ordering::Relaxed);
+        (g.take().unwrap(), ns)
     }
 }
 
@@ -219,13 +249,14 @@ pub fn status() -> String {
     why.sort_by(|a, b| b.1.cmp(&a.1));
     let why: Vec<String> = why.iter().map(|(w, n)| format!("{w} {n}")).collect();
     format!(
-        "    parallel runs: {runs} runs, {} chunks to workers ({} commands), {} stopped early ({}), {} cancelled; main waited {} ms for workers; runs seen by length (runs/commands) {}; by end {}\n",
+        "    parallel runs: {runs} runs, {} chunks to workers ({} commands), {} stopped early ({}), {} cancelled; main waited {} ms for workers (its chunk {:.2}x a worker's); runs seen by length (runs/commands) {}; by end {}\n",
         CHUNKS.load(Ordering::Relaxed),
         COMMANDS.load(Ordering::Relaxed),
         STOPS.load(Ordering::Relaxed),
         why.join(", "),
         CANCELLED.load(Ordering::Relaxed),
         WAIT_NS.load(Ordering::Relaxed) / 1_000_000,
+        main_weight(),
         lens.join(", "),
         ends.join(", ")
     )

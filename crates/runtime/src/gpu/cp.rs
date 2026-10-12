@@ -147,6 +147,8 @@ struct ParRun {
     end: u64,
     next: usize,
     workers: Vec<Arc<super::par::Worker>>,
+    /// How long the main command processor waited for the workers so far.
+    waited_ns: u64,
 }
 
 /// Commands a run needs to be split, per chunk at least, and at most per
@@ -951,8 +953,13 @@ impl Cp {
             }
             self.sync_reads(&merged);
         }
-        let per = n / chunks;
-        let starts: Vec<u64> = (1..chunks).map(|i| ends[i * per - 1]).collect();
+        // The main command processor's chunk first (`par::main_weight`
+        // times a worker's), then equal ones.
+        let k = chunks - 1;
+        let w = super::par::main_weight();
+        let main_n = ((n as f64 * w / (w + k as f64)).round() as usize).clamp(PAR_CHUNK_MIN, n - k * PAR_CHUNK_MIN);
+        let per = (n - main_n) / k;
+        let starts: Vec<u64> = (0..k).map(|i| ends[main_n + i * per - 1]).collect();
         // The state at each chunk's start.
         let mut st = self.chunk_state();
         let mut states: Vec<Box<ChunkState>> = Vec::new();
@@ -990,7 +997,7 @@ impl Cp {
         }
         super::par::RUNS.fetch_add(1, Ordering::Relaxed);
         super::par::CHUNKS.fetch_add(starts.len() as u64, Ordering::Relaxed);
-        self.par = Some(ParRun { starts, end: run_end, next: 0, workers });
+        self.par = Some(ParRun { starts, end: run_end, next: 0, workers, waited_ns: 0 });
     }
 
     /// The main command processor reached the next chunk of the parallel
@@ -1004,11 +1011,17 @@ impl Cp {
             pr.next += 1;
             (pr.workers[i].clone(), if i + 1 < pr.starts.len() { pr.starts[i + 1] } else { pr.end })
         };
-        if self.par.as_ref().is_some_and(|p| p.next == p.starts.len()) {
-            self.par = None;
-        }
+        let last = self.par.as_ref().is_some_and(|p| p.next == p.starts.len());
         self.submit_gpu("par");
-        let stopped = w.wait();
+        let (stopped, waited) = w.wait();
+        match self.par.as_mut() {
+            Some(pr) if last => {
+                super::par::note_main_wait(pr.waited_ns + waited);
+                self.par = None;
+            }
+            Some(pr) => pr.waited_ns += waited,
+            None => {}
+        }
         let (st, last) = {
             let mut wcp = w.cp.lock();
             let last = wcp.worker_submit();
@@ -1037,7 +1050,7 @@ impl Cp {
     fn par_cancel(&mut self) {
         let Some(pr) = self.par.take() else { return };
         for w in &pr.workers[pr.next..] {
-            w.wait();
+            let _ = w.wait();
             w.cp.lock().worker_discard();
         }
         super::par::CANCELLED.fetch_add(1, Ordering::Relaxed);

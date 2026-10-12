@@ -1539,27 +1539,6 @@ pub(crate) fn image_hazards(stages: &[&Prepared], extra: &[super::images::ImageK
     })
 }
 
-/// Image cache keys of the images a prepared stage binds (fast-clear checks).
-pub(crate) fn image_keys(p: &Prepared) -> Vec<super::images::ImageKey> {
-    let mut v = Vec::new();
-    for (i, r) in p.resources.iter().enumerate() {
-        if let Resolved::Image(t) = r {
-            let storage = p.tr.plan.resources.get(i).is_some_and(|x| x.written);
-            if let Some(k) = super::images::with(|im| im.resolved_key(t, storage)) {
-                v.push(k);
-            }
-        }
-        if let Resolved::ImageTable(e) = r {
-            for t in e.iter().flatten() {
-                if let Some(k) = super::images::with(|im| im.resolved_key(t, false)) {
-                    v.push(k);
-                }
-            }
-        }
-    }
-    v
-}
-
 /// Clear color of a DCC fast-clear code (gfx10: 00 -> 0000, 40 -> 0001,
 /// 80 -> 1110, C0 -> 1111, RGBA; 20 -> the CLEAR_WORD registers; FF:
 /// uncompressed, nothing to clear). Codes from Mesa radeonsi si_clear.c.
@@ -4028,10 +4007,15 @@ impl Exec {
         let t_prep = since(t0);
         trace_loads(&self.name, &p, groups);
         self.grow_sampled_depth(&[&p]);
-        let keys = image_keys(&p);
-        self.resolve_fast_clears(&keys);
-        self.resolve_overwrites(&keys);
-        self.sync_block_textures(&keys);
+        // Fast clears, overwrite reloads and block copies of the images, as
+        // for draws: the keys from this thread's memos, the cache's lock only
+        // when one may be pending.
+        let (keys, pending) = image_hazards(&[&p], &[]);
+        if pending {
+            self.resolve_fast_clears(&keys);
+            self.resolve_overwrites(&keys);
+            self.sync_block_textures(&keys);
+        }
         if self.stopped {
             return Err(STOPPED.into());
         }
