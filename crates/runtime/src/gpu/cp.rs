@@ -2143,8 +2143,9 @@ impl Cp {
                         }
                     }
                 }
-                if super::capture::dispatch_dumps() {
-                    // Per-dispatch image dumps: complete the dispatch first.
+                if super::capture::dispatch_dumps() || super::capture::watching() {
+                    // Per-dispatch image dumps and pixel watches: complete
+                    // the dispatch first.
                     if let Some(e) = self.exec.as_mut() {
                         e.flush();
                     }

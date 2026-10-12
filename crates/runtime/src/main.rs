@@ -447,7 +447,8 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 Ok(())
             }
             "capture" => {
-                // `capture [<from>-<to>] [dispatches] [buffers=<shader>[,..]]`:
+                // `capture [<from>-<to>] [dispatches] [images=<base>[,..]]
+                // [buffers=<shader>[,..]] [pixel=<x>,<y>]`:
                 // the next frame, optionally with per-draw reports for that
                 // range of its events, dumps of the images its dispatches
                 // write and of the buffers those compute shaders bind.
@@ -461,6 +462,11 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     } else if let Some(list) = arg.strip_prefix("ps=") {
                         // ... reports of the targets of draws with these pixel shaders.
                         gpu::capture::set_draw_ps(list.split(',').filter_map(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()).collect());
+                    } else if let Some(list) = arg.strip_prefix("images=") {
+                        // ... only these images (PNG and raw texels) after
+                        // each dispatch that writes them.
+                        gpu::capture::set_dispatch_dumps(true);
+                        gpu::capture::set_image_dumps(list.split(',').filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()).collect());
                     } else if let Some(cs) = arg.strip_prefix("buffers=") {
                         // ... and the buffers that compute shader binds.
                         gpu::capture::set_dispatch_dumps(true);

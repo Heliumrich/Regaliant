@@ -2266,6 +2266,27 @@ impl Images {
         Ok((raw, key.width, key.height, texel_bytes(key.format)))
     }
 
+    /// One texel of the cached image a T# resolves to (mip 0, layer 0; depth
+    /// images: the aspect the T# reads), with the image's size and format
+    /// (pixel watches of captures).
+    pub fn texel_of(&mut self, t: &Tsharp, x: u32, y: u32) -> Result<(Vec<u8>, u32, u32, vk::Format), String> {
+        let want = Self::key_of(t).ok_or("unsupported format")?;
+        let key = match self.lookup(&want, false) {
+            Some((k, _)) => k,
+            None => self.alias(&want, false).ok_or("not cached")?,
+        };
+        let image = self.map[&key].image;
+        let (x, y) = (x.min(key.width.saturating_sub(1)), y.min(key.height.saturating_sub(1)));
+        let aspect = if !is_depth(key.format) {
+            vk::ImageAspectFlags::COLOR
+        } else if want.format == vk::Format::R8_UINT {
+            vk::ImageAspectFlags::STENCIL
+        } else {
+            vk::ImageAspectFlags::DEPTH
+        };
+        Ok((self.read_back_texel(image, key.format, aspect, x, y)?, key.width, key.height, key.format))
+    }
+
     /// The cached image a T# resolves to (mip 0, layer 0) as RGBA8, and the
     /// statistics of float formats (captures).
     pub fn snapshot(&mut self, t: &Tsharp) -> Result<(Vec<u8>, u32, u32, Option<String>), String> {

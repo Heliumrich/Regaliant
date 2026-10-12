@@ -121,7 +121,10 @@ fn vblank_thread() {
             crate::gpu::timeline::flipped(n as u64);
         }
         if let Some(b) = show {
-            let n = PORT.lock().as_ref().map(|p| p.count).unwrap_or(0);
+            let (n, attr) = PORT.lock().as_ref().map(|p| (p.count, p.sets.get(b.set as usize).copied().flatten())).unwrap_or((0, None));
+            if let Some(a) = attr {
+                crate::gpu::capture::note_display_size(a.width, a.height);
+            }
             maybe_screenshot(&b, n);
             present_buffer(&b);
         }

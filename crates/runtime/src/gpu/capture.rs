@@ -255,6 +255,15 @@ fn buffer_dump_limit(cs: u64) -> Option<u64> {
     g.contains(&cs).then(|| if g.len() > 1 { 4 << 20 } else { 64 << 20 })
 }
 
+/// Images whose contents a capture with dispatch dumps writes (PNG and raw
+/// texels) after each dispatch that writes them (`capture images=<hex
+/// base>[,..]`); empty: every image dispatches write (PNG only).
+static IMAGE_DUMPS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+pub fn set_image_dumps(bases: Vec<u64>) {
+    *IMAGE_DUMPS.lock() = bases;
+}
+
 /// Per-draw report range set by the `capture <from>-<to>` control command
 /// (overrides `DS_CAPTURE_DRAWS`).
 static DRAW_RANGE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
@@ -331,8 +340,58 @@ fn vs_dump_report(cp: &Cp, event: u64) -> Option<String> {
     Some(format!("vs {addr:#x}: {n} vertices dumped (exp pos0 at {:#x})", exp.pc))
 }
 
-/// Pixel whose cb0 value per-draw reports follow (`capture ... pixel=x,y`).
+/// Pixel whose cb0 value per-draw reports follow (`capture ... pixel=x,y`),
+/// in the presented image's coordinates (`DISPLAY`).
 static WATCH_PIXEL: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+
+/// Size of the presented image (width << 32 | height), noted at each flip:
+/// a watched pixel is scaled to images of other sizes.
+static DISPLAY: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_display_size(w: u32, h: u32) {
+    DISPLAY.store((w as u64) << 32 | h as u64, Ordering::Relaxed);
+}
+
+/// The watched pixel's position in a `w` x `h` image.
+fn scaled(x: u32, y: u32, w: u32, h: u32) -> (u32, u32) {
+    let d = DISPLAY.load(Ordering::Relaxed);
+    let (dw, dh) = ((d >> 32) as u32, d as u32);
+    if dw == 0 || dh == 0 || (w == dw && h == dh) {
+        return (x, y);
+    }
+    ((x as u64 * w as u64 / dw as u64) as u32, (y as u64 * h as u64 / dh as u64) as u32)
+}
+
+/// Hex of a texel, with the channels of 8-byte (four f16) and 16-byte (four
+/// f32) texels decoded.
+fn texel_hex(b: &[u8]) -> String {
+    let h = b.iter().rev().map(|x| format!("{x:02x}")).collect::<String>();
+    let dec: Option<Vec<f32>> = match b.len() {
+        8 => Some(b.chunks_exact(2).map(|c| super::images::half_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect()),
+        16 => Some(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
+        _ => None,
+    };
+    match dec {
+        Some(v) => format!("{h} ({})", v.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(", ")),
+        None => h,
+    }
+}
+
+/// The watched pixel of an image a dispatch wrote, against its value after
+/// the previous dispatch that wrote it: " px(x,y) before -> after" (None
+/// when unchanged and `only_changes`).
+fn watch_image(t: &super::desc::Tsharp, x: u32, y: u32, only_changes: bool) -> Option<String> {
+    let (sx, sy) = scaled(x, y, t.width, t.height);
+    let (now, w, h, fmt) = super::images::with(|im| im.texel_of(t, sx, sy)).ok()?;
+    let mut g = LAST_PIXEL.lock();
+    let before = g.get_or_insert_with(Default::default).insert(t.base, now.clone());
+    match before {
+        Some(b) if b != now => Some(format!(" px({sx},{sy}) of {w}x{h} {fmt:?} {} -> {}", texel_hex(&b), texel_hex(&now))),
+        Some(_) if only_changes => None,
+        Some(_) => Some(format!(" px({sx},{sy}) unchanged {}", texel_hex(&now))),
+        None => Some(format!(" px({sx},{sy}) of {w}x{h} {fmt:?} {}", texel_hex(&now))),
+    }
+}
 
 pub fn set_watch_pixel(p: Option<(u32, u32)>) {
     *WATCH_PIXEL.lock() = p;
@@ -375,16 +434,18 @@ fn watch_texels(cp: &Cp, x: u32, y: u32) -> Option<String> {
         }
     };
     if let Some(s) = super::exec::color_surface(cp, 0).ok().flatten() {
+        let (x, y) = scaled(x, y, s.width, s.height);
         if x < s.width && y < s.height {
             if let Ok((raw, fmt)) = super::images::with(|im| -> Result<(Vec<u8>, ash::vk::Format), String> {
                 let t = im.target(&s)?;
                 Ok((im.read_back_texel(t.image, t.key.format, ash::vk::ImageAspectFlags::COLOR, x, y)?, t.key.format))
             }) {
-                note((s.base, false), raw, format!("cb0 {:#x} {fmt:?} px({x},{y})", s.base));
+                note((s.base, false), raw, format!("cb0 {:#x} {}x{} {fmt:?} px({x},{y})", s.base, s.width, s.height));
             }
         }
     }
     if let Some(d) = super::exec::depth_surface(cp).filter(|d| super::images::aspects(d.format).contains(ash::vk::ImageAspectFlags::DEPTH)) {
+        let (x, y) = scaled(x, y, d.width, d.height);
         if x < d.width && y < d.height {
             if let Ok(raw) = super::images::with(|im| -> Result<Vec<u8>, String> {
                 let t = im.target(&d)?;
@@ -609,6 +670,30 @@ pub fn draw(cp: &Cp, what: &str) {
                         }
                     }
                 }
+                // Pixel watch: images the stage writes through image stores
+                // (e.g. decals updating the G-buffer), where they changed.
+                if let (Some((x, y)), true) = (*WATCH_PIXEL.lock(), super::exec::enabled()) {
+                    for (i, r) in p.resources.iter().enumerate() {
+                        let super::shaders::Resolved::Image(t) = r else { continue };
+                        if !p.tr.plan.resources.get(i).is_some_and(|x| x.written) {
+                            continue;
+                        }
+                        if let Some(w) = watch_image(t, x, y, true) {
+                            let _ = writeln!(s, "      {name} image after draw: {:#x}{w}", t.base);
+                        }
+                    }
+                }
+                // Small constant buffers (per-draw data such as a decal's
+                // transform), as floats.
+                for (i, r) in p.resources.iter().enumerate() {
+                    let super::shaders::Resolved::Buffer(v) = r else { continue };
+                    let Some(n) = v.byte_size().filter(|&n| n > 0 && n <= 256) else { continue };
+                    if !crate::gpu::cp::guest_readable(v.base, n) {
+                        continue;
+                    }
+                    let words: Vec<String> = (0..n / 4).map(|k| f32::from_bits(unsafe { std::ptr::read_volatile((v.base + 4 * k) as *const u32) })).map(|x| format!("{x}")).collect();
+                    let _ = writeln!(s, "      {name} {i} constants @{:#x}: {}", v.base, words.join(" "));
+                }
                 if name == "es" {
                     vertex_data(&mut s, &p);
                 }
@@ -758,51 +843,45 @@ pub fn dispatch(cp: &Cp, what: &str) {
                     let _ = writeln!(s, "      buffer after dispatch: {name} ({n} bytes, {nz} non-zero)");
                 }
             }
+            let watched = *WATCH_PIXEL.lock();
+            if !dumps && super::exec::enabled() {
+                // Watch-only capture: the watched pixel of each image the
+                // dispatch writes or reads, where it changed since the last
+                // dispatch that bound the image (one texel read back).
+                if let Some((x, y)) = watched {
+                    for (i, r) in p.resources.iter().enumerate() {
+                        let super::shaders::Resolved::Image(t) = r else { continue };
+                        let written = p.tr.plan.resources[i].written;
+                        if let Some(w) = watch_image(t, x, y, true) {
+                            let _ = writeln!(s, "      image {} dispatch: {:#x}{w}", if written { "after" } else { "read by" }, t.base);
+                        }
+                    }
+                }
+            }
             if dumps && super::exec::enabled() {
+                let only = IMAGE_DUMPS.lock().clone();
                 for (i, r) in p.resources.iter().enumerate() {
                     let super::shaders::Resolved::Image(t) = r else { continue };
                     if !p.tr.plan.resources[i].written {
                         continue;
                     }
+                    if !only.is_empty() && !only.contains(&t.base) {
+                        if let Some(w) = watched.and_then(|(x, y)| watch_image(t, x, y, true)) {
+                            let _ = writeln!(s, "      image after dispatch: {:#x}{w}", t.base);
+                        }
+                        continue;
+                    }
                     let Some(dir) = crate::run_dir().map(|d| d.join("dispatches")) else { continue };
                     let _ = std::fs::create_dir_all(&dir);
                     let name = format!("{}_{:04}_{:010x}_{:010x}.png", c.flip, c.events, p.addr, t.base);
-                    if buffer_dump_limit(p.addr).is_some() {
+                    if buffer_dump_limit(p.addr).is_some() || !only.is_empty() {
                         // Raw texels as well (mip 0, layer 0; e.g. probed values).
                         if let Ok((raw, w, h, texel)) = super::images::with(|im| im.snapshot_raw(t)) {
                             let _ = std::fs::write(dir.join(name.replace(".png", &format!("_{w}x{h}x{texel}.raw"))), raw);
                         }
                     }
-                    // The watched pixel (scaled to images smaller than 2560x1440).
-                    let watch = match *WATCH_PIXEL.lock() {
-                        Some((x, y)) => super::images::with(|im| im.snapshot_raw(t)).ok().and_then(|(raw, w, h, texel)| {
-                            let (sx, sy) = if w < 2560 || h < 1440 { (x * w / 2560, y * h / 1440) } else { (x, y) };
-                            let o = (sy as usize * w as usize + sx as usize) * texel as usize;
-                            let now = raw.get(o..o + texel as usize)?.to_vec();
-                            // Hex, with the channels of 8-byte (four f16) and
-                            // 16-byte (four f32) texels decoded.
-                            let hex = |b: &[u8]| {
-                                let h = b.iter().rev().map(|x| format!("{x:02x}")).collect::<String>();
-                                let dec: Option<Vec<f32>> = match b.len() {
-                                    8 => Some(b.chunks_exact(2).map(|c| super::images::half_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect()),
-                                    16 => Some(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
-                                    _ => None,
-                                };
-                                match dec {
-                                    Some(v) => format!("{h} ({})", v.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(", ")),
-                                    None => h,
-                                }
-                            };
-                            let mut g = LAST_PIXEL.lock();
-                            let before = g.get_or_insert_with(Default::default).insert(t.base, now.clone());
-                            Some(match before {
-                                Some(b) if b != now => format!(" px({sx},{sy}) {} -> {}", hex(&b), hex(&now)),
-                                Some(_) => format!(" px({sx},{sy}) unchanged {}", hex(&now)),
-                                None => format!(" px({sx},{sy}) {}", hex(&now)),
-                            })
-                        }),
-                        None => None,
-                    };
+                    // The watched pixel (scaled from the presented image's size).
+                    let watch = watched.and_then(|(x, y)| watch_image(t, x, y, false));
                     let r = super::images::with(|im| im.snapshot(t));
                     match r {
                         Ok((rgba, w, h, stats)) => {
