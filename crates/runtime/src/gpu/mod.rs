@@ -54,7 +54,7 @@ pub mod tune {
         Tunable { name: "reg_vars", env: "DS_REG_VARS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "prep_cache", env: "DS_PREP_CACHE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "map_ranges", env: "DS_MAP_RANGES", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "ahead", env: "DS_AHEAD", default: 4, value: AtomicU64::new(UNSET) },
+        Tunable { name: "ahead", env: "DS_AHEAD", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_cs", env: "DS_PRE_CS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "par", env: "DS_PAR", default: 5, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_share", env: "DS_PRE_SHARE", default: 1, value: AtomicU64::new(UNSET) },
@@ -268,8 +268,10 @@ pub mod tune {
     }
 
     /// Worker threads that prepare the stages of synchronization-free runs
-    /// ahead of execution (`gpu::ahead`); 0 prepares every stage on the
-    /// command processor (the earlier behavior, for A/B).
+    /// ahead of execution (`gpu::ahead`); 0 (default since 2026-10-12)
+    /// prepares every stage on the command processor that records it: with
+    /// parallel recording, 4 workers cost ~100 ms of CPU per courtyard frame
+    /// and saved no frame time (FINDINGS: stage preparation ahead off).
     pub fn ahead() -> u64 {
         get(27)
     }

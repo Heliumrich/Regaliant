@@ -73,6 +73,16 @@ const WAITS: usize = 11;
 const SCAN_NS: usize = 12;
 static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
+/// Failed preparations by stage kind and reason (the error's words, numbers
+/// and addresses left out).
+static FAILED_WHY: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(None);
+
+fn note_failure(kind: StageKind, e: &str) {
+    let words: Vec<&str> = e.split_whitespace().map(|w| if w.chars().any(|c| c.is_ascii_digit()) { "#" } else { w }).take(10).collect();
+    let k = format!("{kind:?}: {}", words.join(" "));
+    *FAILED_WHY.lock().get_or_insert_with(Default::default).entry(k).or_default() += 1;
+}
+
 /// Why scans ended: by PM4 opcode (0..0xFF), private operation (0x100 +
 /// op), or END_* below.
 static STOPS: [AtomicU64; 0x140] = [const { AtomicU64::new(0) }; 0x140];
@@ -143,7 +153,18 @@ fn worker() {
             StageKind::Compute => shaders::prepare_compute(&slot.regs, slot.wave64),
         }))
         .unwrap_or_else(|_| Err("preparation panicked".to_string()));
-        let r = if slot.regs.missed.load(Ordering::Relaxed) { Err("a register outside the snapshot was read".to_string()) } else { r };
+        let r = if slot.regs.missed.load(Ordering::Relaxed) {
+            // Every such preparation is redone on the command processor:
+            // `shaders::reg_lists` must list what the stage's preparation reads.
+            let reg = slot.regs.missed_reg.load(Ordering::Relaxed);
+            static WARNED: AtomicU32 = AtomicU32::new(0);
+            if WARNED.fetch_or(1 << slot.regs.kind as u32, Ordering::Relaxed) & (1 << slot.regs.kind as u32) == 0 {
+                crate::warn!("gpu: a {:?} stage preparation read register {reg:#x} outside its snapshot (shaders::reg_lists): such preparations made ahead are not used", slot.regs.kind);
+            }
+            Err("a register outside the snapshot was read".to_string())
+        } else {
+            r
+        };
         *slot.result.lock() = Some(r);
         slot.state.store(DONE, Ordering::Release);
         slot.cv.notify_all();
@@ -197,8 +218,9 @@ pub fn take<R: RegRead + ?Sized>(slot: &Slot, live: &R, wave64: bool) -> Option<
     };
     let p = match r {
         Ok(p) => p,
-        Err(_) => {
+        Err(e) => {
             STATS[ERRORS].fetch_add(1, Ordering::Relaxed);
+            note_failure(slot.regs.kind, &e);
             return None;
         }
     };
@@ -239,8 +261,11 @@ pub fn status() -> String {
         i => format!("{i:#x}"),
     };
     let stops: Vec<String> = stops.iter().take(8).map(|(n, i)| format!("{} {n}", name(*i))).collect();
+    let mut why: Vec<(String, u64)> = FAILED_WHY.lock().as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect()).unwrap_or_default();
+    why.sort_by(|a, b| b.1.cmp(&a.1));
+    let why: Vec<String> = why.iter().take(6).map(|(k, n)| format!("{n} {k}")).collect();
     format!(
-        "    preparations ahead: {} scans ({} ms; ended by {}), {} stages handed to {} workers, {} used, {} prepared here instead (not started), stale: {} registers, {} program, {} GPU images, {} words; {} failed, {} dropped; {} waits for a worker ({} ms)\n",
+        "    preparations ahead: {} scans ({} ms; ended by {}), {} stages handed to {} workers, {} used, {} prepared here instead (not started), stale: {} registers, {} program, {} GPU images, {} words; {} failed ({}), {} dropped; {} waits for a worker ({} ms)\n",
         s[SCANS],
         s[SCAN_NS] / 1_000_000,
         stops.join(", "),
@@ -253,6 +278,7 @@ pub fn status() -> String {
         s[STALE_IMAGES],
         s[STALE_WORDS],
         s[ERRORS],
+        why.join("; "),
         s[DROPPED],
         s[WAITS],
         s[WAITED_NS] / 1_000_000

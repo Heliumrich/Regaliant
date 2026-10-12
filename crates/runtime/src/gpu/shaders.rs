@@ -349,7 +349,7 @@ fn reg_lists(kind: StageKind) -> (&'static [u32], &'static [u32]) {
     let l = LISTS.get_or_init(|| {
         let vs_sh: Vec<u32> = [ES_PGM_LO, ES_PGM_LO + 1, GS_RSRC2].into_iter().chain(GS_USER_DATA..GS_USER_DATA + 32).collect();
         let ps_sh: Vec<u32> = [PS_PGM_LO, PS_PGM_LO + 1, PS_RSRC2].into_iter().chain(PS_USER_DATA..PS_USER_DATA + 32).collect();
-        let mut ps_ctx: Vec<u32> = vec![SPI_PS_IN_CONTROL, SPI_PS_INPUT_ADDR, SPI_SHADER_COL_FORMAT];
+        let mut ps_ctx: Vec<u32> = vec![SPI_PS_IN_CONTROL, SPI_PS_INPUT_ADDR, SPI_SHADER_COL_FORMAT, DB_SHADER_CONTROL];
         ps_ctx.extend((0..32).map(|n| SPI_PS_INPUT_CNTL_0 + 4 * n));
         ps_ctx.extend((0..8).map(|m| CB_COLOR0_INFO + 0x3C * m));
         let cs_sh: Vec<u32> = [CS_PGM_LO, CS_PGM_LO + 1, CS_RSRC2, CS_NUM_THREAD, CS_NUM_THREAD + 1, CS_NUM_THREAD + 2].into_iter().chain(CS_USER_DATA..CS_USER_DATA + 16).collect();
@@ -373,12 +373,20 @@ pub struct StageRegs {
     pub ctx: Vec<u32>,
     /// A register outside the lists was read (the preparation is not used).
     pub missed: std::sync::atomic::AtomicBool,
+    /// The first such register (SH: dword index; context: byte address).
+    pub missed_reg: std::sync::atomic::AtomicU32,
 }
 
 impl StageRegs {
     pub fn capture<R: RegRead + ?Sized>(kind: StageKind, r: &R) -> StageRegs {
         let (sh, ctx) = reg_lists(kind);
-        StageRegs { kind, sh: sh.iter().map(|&i| r.sh(i)).collect(), ctx: ctx.iter().map(|&a| r.ctx(a)).collect(), missed: std::sync::atomic::AtomicBool::new(false) }
+        StageRegs {
+            kind,
+            sh: sh.iter().map(|&i| r.sh(i)).collect(),
+            ctx: ctx.iter().map(|&a| r.ctx(a)).collect(),
+            missed: std::sync::atomic::AtomicBool::new(false),
+            missed_reg: std::sync::atomic::AtomicU32::new(0),
+        }
     }
 
     /// Whether `r` holds the same values.
@@ -394,7 +402,9 @@ impl RegRead for StageRegs {
         match sh.binary_search(&i) {
             Ok(k) => self.sh[k],
             Err(_) => {
-                self.missed.store(true, std::sync::atomic::Ordering::Relaxed);
+                if !self.missed.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    self.missed_reg.store(i, std::sync::atomic::Ordering::Relaxed);
+                }
                 0
             }
         }
@@ -404,7 +414,9 @@ impl RegRead for StageRegs {
         match ctx.binary_search(&a) {
             Ok(k) => self.ctx[k],
             Err(_) => {
-                self.missed.store(true, std::sync::atomic::Ordering::Relaxed);
+                if !self.missed.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    self.missed_reg.store(a, std::sync::atomic::Ordering::Relaxed);
+                }
                 0
             }
         }
