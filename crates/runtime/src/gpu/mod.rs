@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 39] = [
+    static ALL: [Tunable; 40] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -66,6 +66,7 @@ pub mod tune {
         Tunable { name: "spec_reads", env: "DS_SPEC_READS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "submit_thread", env: "DS_SUBMIT_THREAD", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_balance", env: "DS_PAR_BALANCE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_inflight", env: "DS_PRE_INFLIGHT", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -327,6 +328,12 @@ pub mod tune {
     /// waited for the workers (`par::main_weight`); 0: equal chunks.
     pub fn par_balance() -> bool {
         get(38) != 0
+    }
+
+    /// Batch-start copies of ranges that submitted batches of the same queue
+    /// still write (the prologue runs after them); 0: bound in place.
+    pub fn pre_inflight() -> bool {
+        get(39) != 0
     }
 
     /// Command-processor waits for GPU work still to be traced (`tune

@@ -995,6 +995,9 @@ impl Exec {
                     c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, super::STAMPS * ti + k);
                 }
                 self.batch_shaders.push(super::DRAW_KEY | if ps_addr != 0 { ps_addr } else { vs.addr });
+            } else if super::profiling() {
+                // Batch GPU time by command (`note_batch_by`).
+                self.batch_shaders.push(super::DRAW_KEY | if ps_addr != 0 { ps_addr } else { vs.addr });
             }
         }
         lap.mark(16);

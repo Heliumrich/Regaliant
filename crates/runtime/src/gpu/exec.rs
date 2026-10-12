@@ -2745,7 +2745,11 @@ impl Exec {
             return None;
         }
         let r = [(base, size)];
-        if self.overlaps_pending(&r) || CP_WRITES.latest(&r).is_some() {
+        // Writes of this batch come after the prologue; those of submitted
+        // batches (this queue's too) before it (`tune pre_inflight`; 0: also
+        // refused while this queue's submitted batches still run).
+        let pending = if super::tune::pre_inflight() { self.pending.overlaps_any(&r) } else { self.overlaps_pending(&r) };
+        if pending || CP_WRITES.latest(&r).is_some() {
             return None;
         }
         let al = base & !15;
