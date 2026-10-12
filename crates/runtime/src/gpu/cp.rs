@@ -2747,7 +2747,11 @@ impl Cp {
                     set_state(&self.name, "running".into());
                 }
                 if r != 0 {
-                    crate::warn!("gpu[{}]: flip of buffer {index} failed ({r:#x})", self.name);
+                    // The packet as executed and as it is in memory now (a
+                    // command buffer reused before execution shows here).
+                    let words: Vec<String> = (0..n.min(9)).map(|k| format!("{:08x}", a(k))).collect();
+                    let now: Vec<String> = (0..n.min(9) + 3).map(|k| at + 4 * k).filter(|&w| guest_readable(w, 4)).map(|w| format!("{:08x}", unsafe { rd32(w) })).collect();
+                    crate::warn!("gpu[{}]: flip of buffer {index} (handle {handle:#x}) failed ({r:#x}); packet at {at:#x}: args {} (memory now: {}), submitted {} ms ago", self.name, words.join(" "), now.join(" "), self.submitted_at.map_or(0, |t| t.elapsed().as_millis()));
                 }
                 let n = crate::gpu::FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
                 super::capture::on_flip(n);
