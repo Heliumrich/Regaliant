@@ -982,6 +982,20 @@ static GPU_INDIRECT: AtomicU64 = AtomicU64::new(0);
 /// CP memory writes performed by the GPU (`Exec::gpu_cp_write`).
 static GPU_CP_WRITES: AtomicU64 = AtomicU64::new(0);
 static GPU_TIMESTAMPS: AtomicU64 = AtomicU64::new(0);
+/// Batch begins (DS_PROFILE_GPU): [count, ns including slot waits, of them
+/// draws' resident-shadow checks of their indices: count, ns].
+static BEGIN_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn begin_stats_line() -> String {
+    let s: Vec<u64> = BEGIN_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    format!(
+        "    batch begins: {} ({:.1} us each, slot waits included); draws' index checks against resident shadows: {} ({:.2} us each)\n",
+        s[0],
+        s[1] as f64 / s[0].max(1) as f64 / 1000.0,
+        s[2],
+        s[3] as f64 / s[2].max(1) as f64 / 1000.0
+    )
+}
 /// The first GPU timestamp writes (batch, guest address), compared with the
 /// title's clock once their batch completed (logged; a check of the clock
 /// conversion).
@@ -2124,6 +2138,9 @@ pub fn reset_shader_profile() {
         g.3 = [[0; 2]; 4];
     }
     PRE_STABLE.lock().1 = [0; 5];
+    for c in &BEGIN_STATS {
+        c.store(0, Ordering::Relaxed);
+    }
     *BATCH_BY.lock() = None;
     for c in READ_WAIT_WORDS.iter() {
         c.store(0, Ordering::Relaxed);
@@ -2173,6 +2190,7 @@ pub fn shader_profile() -> String {
         PRE_NS.load(Ordering::Relaxed) / 1_000_000
     );
     s.push_str(&batch_by_lines());
+    s.push_str(&begin_stats_line());
     if let Some(idle) = IDLE.lock().1.as_ref() {
         let mut v: Vec<(&String, &[u64; 3])> = idle.iter().collect();
         v.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
@@ -2456,6 +2474,15 @@ impl Exec {
         if self.recording {
             return;
         }
+        let t0 = profiling().then(std::time::Instant::now);
+        self.begin_batch();
+        if let Some(t) = t0 {
+            BEGIN_STATS[0].fetch_add(1, Ordering::Relaxed);
+            BEGIN_STATS[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn begin_batch(&mut self) {
         // Imports looked up from now on belong to this batch (`reap_spans`).
         if self.open_gen.load(Ordering::Relaxed) == u64::MAX {
             self.open_gen.store(SPAN_GEN.load(Ordering::SeqCst), Ordering::SeqCst);

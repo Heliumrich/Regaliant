@@ -246,7 +246,7 @@ fn addr64(lo: u32, hi: u32) -> u64 {
 }
 
 /// Guest addresses the command processor may touch.
-fn valid(a: u64, len: u64) -> bool {
+pub(crate) fn valid(a: u64, len: u64) -> bool {
     a >= crate::mem::GUEST_BASE && a.checked_add(len).is_some_and(|e| e <= crate::mem::GUEST_END)
 }
 

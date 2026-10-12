@@ -1173,10 +1173,13 @@ impl Images {
             let start = layer as u64 * lay.slice_size + if m.tail.is_some() { 0 } else { m.offset };
             (start, if m.tail.is_some() { 1u64 << lay.block_log2 } else { m.pitch as u64 * m.padded_height as u64 * elem })
         };
-        let whole = super::cp::guest_readable(t.base, size);
+        // Pages checked and read under the guest-reader lock: the title may
+        // unmap layers of a streamed array meanwhile (`mem::GUEST_READERS`).
+        let readers = crate::mem::GUEST_READERS.read();
+        let whole = super::cp::valid(t.base, size) && crate::mem::os_readable(t.base, size);
         let mapped = |mip: usize, layer: u32| -> bool {
             let (s, n) = range(mip, layer);
-            whole || super::cp::guest_readable(t.base + s, n)
+            whole || (super::cp::valid(t.base + s, n) && crate::mem::os_readable(t.base + s, n))
         };
         let mut end = 0u64;
         for mip in 0..key.levels as usize {
@@ -1225,6 +1228,8 @@ impl Images {
                 );
             }
         }
+        // Guest memory is no longer read.
+        drop(readers);
         if regions.is_empty() && zeroed.is_empty() {
             return Err(format!("texture {:#x}+{size:#x}: no mip mapped", t.base));
         }
@@ -1286,12 +1291,14 @@ impl Images {
         let el = elem_log2(t.format).ok_or("unknown element size")?;
         let lay = tiling::layout_3d(t.sw_mode, el, key.width, key.height, key.layers).ok_or_else(|| format!("3D swizzle mode {} not supported", t.sw_mode))?;
         let size = lay.size();
-        if !super::cp::guest_readable(t.base, size) {
+        let readers = crate::mem::GUEST_READERS.read();
+        if !(super::cp::valid(t.base, size) && crate::mem::os_readable(t.base, size)) {
             return Err(format!("3D texture {:#x}+{size:#x} not mapped", t.base));
         }
         let src = unsafe { std::slice::from_raw_parts(t.base as *const u8, size as usize) };
         let mut staging = Vec::new();
         lay.detile(src, &mut staging);
+        drop(readers);
         let c = ctx();
         let (buf, mem, ptr) = c.host_buffer(staging.len().max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
         unsafe { std::ptr::copy_nonoverlapping(staging.as_ptr(), ptr, staging.len()) };

@@ -465,9 +465,42 @@ fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     if p.is_null() { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
 }
 
+/// Bulk readers of guest memory on our threads (texture uploads) hold this
+/// shared while they check that pages are mapped and read them; decommits and
+/// protection changes take it exclusively. A title thread unmapped a layer of
+/// a streamed texture array during a level load while a queue thread
+/// detiled it (fatal access violation, run 20261012-082109). Holders must not
+/// take `MEM` (decommits hold it while they wait here): they check pages with
+/// `os_readable`.
+pub static GUEST_READERS: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
+
+/// Whether every page of [a, a+len) is committed and readable now (operating
+/// system query; takes none of our locks).
+pub fn os_readable(a: u64, len: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
+    let end = a.saturating_add(len.max(1));
+    let mut p = a;
+    while p < end {
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(p as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+            return false;
+        }
+        if mbi.State != MEM_COMMIT || mbi.Protect == 0 || mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0 {
+            return false;
+        }
+        let next = mbi.BaseAddress as u64 + mbi.RegionSize as u64;
+        if next <= p {
+            return false;
+        }
+        p = next;
+    }
+    true
+}
+
 fn host_decommit(addr: u64, size: u64) {
     crate::gpu::track::remapped(addr, size);
     repaged(addr, size);
+    let _readers_out = GUEST_READERS.write();
     unsafe {
         VirtualFree(addr as _, size as usize, MEM_DECOMMIT);
     }
@@ -476,6 +509,7 @@ fn host_decommit(addr: u64, size: u64) {
 pub fn host_protect(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     crate::gpu::track::remapped(addr, size);
     let mut old = 0u32;
+    let _readers_out = GUEST_READERS.write();
     let ok = unsafe { VirtualProtect(addr as _, size as usize, win_prot(prot), &mut old) };
     if ok == 0 { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
 }

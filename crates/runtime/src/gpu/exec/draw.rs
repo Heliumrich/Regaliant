@@ -731,7 +731,12 @@ impl Exec {
         }
         // Indices in guest memory that a resident shadow holds newer data for.
         if let Some((addr, size)) = a.index {
+            let t = profiling().then(std::time::Instant::now);
             self.flush_resident(Some(&[(addr, a.count as u64 * size as u64)]))?;
+            if let Some(t) = t {
+                super::BEGIN_STATS[2].fetch_add(1, Ordering::Relaxed);
+                super::BEGIN_STATS[3].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
         }
         lap.mark(9);
         let mut bounds = Vec::new();
