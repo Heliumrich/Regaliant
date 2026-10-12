@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 46] = [
+    static ALL: [Tunable; 47] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -73,8 +73,10 @@ pub mod tune {
         Tunable { name: "lean_regs", env: "DS_LEAN_REGS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "span_cache", env: "DS_SPAN_CACHE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fill_dma", env: "DS_FILL_DMA", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "lean_cmd", env: "DS_LEAN_CMD", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
+    #[inline]
     fn get(i: usize) -> u64 {
         let t = &ALL[i];
         let v = t.value.load(Ordering::Relaxed);
@@ -87,21 +89,25 @@ pub mod tune {
     }
 
     /// Label promises (`Cp::wait`).
+    #[inline]
     pub fn promises() -> bool {
         get(0) != 0
     }
 
     /// Dispatches ordered by the title's synchronization only.
+    #[inline]
     pub fn lazy_barriers() -> bool {
         get(1) != 0
     }
 
     /// Written buffers below this size skip VRAM shadows (unless atomic).
+    #[inline]
     pub fn shadow_min() -> u64 {
         get(2)
     }
 
     /// VRAM mirrors of GPU-written buffers (`gpu::mirror`).
+    #[inline]
     pub fn mirrors() -> bool {
         get(3) != 0
     }
@@ -110,28 +116,33 @@ pub mod tune {
     /// memory (diagnostic: it changes timing, not results): 0 none, 1 all,
     /// 2 the graphics queue's, 3 the compute queues', 4 shaders at addresses
     /// in [`ring_lo`, `ring_hi`).
+    #[inline]
     pub fn ring_vram() -> u64 {
         get(4)
     }
 
+    #[inline]
     pub fn ring_range() -> std::ops::Range<u64> {
         get(7)..get(8)
     }
 
     /// Read-only buffer bindings up to this size are snapshotted into video
     /// memory when recorded (0: off).
+    #[inline]
     pub fn snap_max() -> u64 {
         get(5)
     }
 
     /// Index buffers up to this size are snapshotted into video memory when
     /// recorded (0: off).
+    #[inline]
     pub fn snap_index() -> u64 {
         get(6)
     }
 
     /// VRAM shadows stay resident for the rest of their batch (merged back
     /// once) instead of being merged after each dispatch.
+    #[inline]
     pub fn shadow_keep() -> bool {
         get(9) != 0
     }
@@ -139,6 +150,7 @@ pub mod tune {
     /// Structured control flow instead of the translator's dispatcher: 1 for
     /// every shader, 2 for loop-free ones only, 0 never; switching
     /// translates shaders anew.
+    #[inline]
     pub fn block_chain() -> u64 {
         get(10)
     }
@@ -152,6 +164,7 @@ pub mod tune {
     /// place (~9 ms of draw time per courtyard frame); GPU time per frame
     /// ~11% lower in each of three A/B cycles, rate median +3.9% (run
     /// 20261012-132127; 16 MiB was worse earlier).
+    #[inline]
     pub fn pre_max() -> u64 {
         get(19)
     }
@@ -160,6 +173,7 @@ pub mod tune {
     /// for a VRAM shadow store into a video-memory scratch buffer and their
     /// results are lost. Measures what GPU stores to imported host memory
     /// cost (the per-item culls' index output).
+    #[inline]
     pub fn scratch_writes() -> bool {
         get(20) != 0
     }
@@ -169,6 +183,7 @@ pub mod tune {
     /// barriers the title's synchronization asks for (0; with lazy barriers;
     /// merges have their own). Consecutive per-item culls share the shadow
     /// of one atomic argument buffer: with 1 they cannot overlap.
+    #[inline]
     pub fn shadow_barrier() -> bool {
         get(18) != 0
     }
@@ -177,18 +192,21 @@ pub mod tune {
     /// memory): 1 those a coarse bound finds written, then only the ones read
     /// from guest memory now, with their exact span (`Exec::sync_textures`);
     /// 0 every texture with the coarse bound of 16 bytes per texel (A/B).
+    #[inline]
     pub fn tex_waits() -> u64 {
         get(17)
     }
 
     /// Indirect dispatches whose arguments GPU work still writes read them on
     /// the GPU (else the command processor waits for that work first).
+    #[inline]
     pub fn gpu_indirect() -> bool {
         get(11) != 0
     }
 
     /// A label wait submits the recorded work only when it has to poll (a wait
     /// that passes at once does not end the batch).
+    #[inline]
     pub fn lazy_wait_submit() -> bool {
         get(12) != 0
     }
@@ -203,12 +221,14 @@ pub mod tune {
     /// submitted only once the CPU performed the queue's earlier deferred
     /// writes (they keep their order); until 2026-10-12 writes behind those
     /// took the CPU path, ~90% of them in the courtyard (run 20261012-040642).
+    #[inline]
     pub fn gpu_cp_writes() -> bool {
         get(13) != 0
     }
 
     /// Batch slots a queue cycles through (`exec::MAX_SLOTS` at most): it
     /// records one batch while the batches of the others execute.
+    #[inline]
     pub fn slots() -> u64 {
         get(14)
     }
@@ -219,6 +239,7 @@ pub mod tune {
     /// mip 0, 2 the banks of textures bound since the last report (at mip
     /// 0), 3 what the sampling instructions measured on the GPU (finest mip
     /// and lane count per bank; translations change with it).
+    #[inline]
     pub fn lod_stats() -> u64 {
         get(15)
     }
@@ -226,6 +247,7 @@ pub mod tune {
     /// Depth-comparison sampling of color images is emulated in the
     /// translation (Vulkan compares only on depth formats); 0 compares in
     /// hardware everywhere (undefined on color formats; A/B).
+    #[inline]
     pub fn cmp_emulate() -> bool {
         get(16) != 0
     }
@@ -235,6 +257,7 @@ pub mod tune {
     /// range bind (`gpu::homes`): 3.29 against 2.26 flips/s in the
     /// courtyard (in-run A/B, run 20261011-072603). 0 writes the homes back
     /// and drops them.
+    #[inline]
     pub fn homes() -> bool {
         get(22) != 0
     }
@@ -243,6 +266,7 @@ pub mod tune {
     /// time (`rdna::analysis::analyze_opts`) instead of being resolved on the
     /// CPU when the command is recorded: GPU work that writes them shortly
     /// before then costs no wait. Switching translates programs anew.
+    #[inline]
     pub fn gpu_loads() -> bool {
         get(23) != 0
     }
@@ -250,6 +274,7 @@ pub mod tune {
     /// Translations keep each register in its own variable (1) or the
     /// register files in arrays (0, the earlier form): see
     /// `rdna::translate::Spec::reg_vars`. Switching translates programs anew.
+    #[inline]
     pub fn reg_vars() -> bool {
         get(24) != 0
     }
@@ -259,6 +284,7 @@ pub mod tune {
     /// cloning whole preparations into and out of the cache cost more than
     /// the resolution it saved (17-20 against 16.5-17 us per draw, run
     /// 20261011-092437); a form that shares the unchanging parts may pay.
+    #[inline]
     pub fn prep_cache() -> bool {
         get(25) != 0
     }
@@ -266,6 +292,7 @@ pub mod tune {
     /// The per-thread caches of readable guest ranges (`mem::readable_span`)
     /// keep the runs a mapping change did not touch; 0 empties them at every
     /// change (the earlier behavior, for A/B).
+    #[inline]
     pub fn map_ranges() -> bool {
         get(26) != 0
     }
@@ -275,6 +302,7 @@ pub mod tune {
     /// prepares every stage on the command processor that records it: with
     /// parallel recording, 4 workers cost ~100 ms of CPU per courtyard frame
     /// and saved no frame time (FINDINGS: stage preparation ahead off).
+    #[inline]
     pub fn ahead() -> u64 {
         get(27)
     }
@@ -282,65 +310,76 @@ pub mod tune {
     /// Read-only buffer bindings of dispatches copied into video memory at
     /// the batch's start like those of draws (`Exec::pre_copy`); 0: compute
     /// shaders read them from guest memory in place.
+    #[inline]
     pub fn pre_cs() -> bool {
         get(28) != 0
     }
 
     /// Worker command processors that record chunks of long
     /// synchronization-free runs in parallel (`gpu::par`); 0: off.
+    #[inline]
     pub fn par() -> u64 {
         get(29)
     }
 
     /// Batch-start copies of the graphics queue shared across its batches
     /// (`gpu::precache`); 0: each batch copies what it binds.
+    #[inline]
     pub fn pre_share() -> bool {
         get(30) != 0
     }
 
     /// Draws check pending fast clears and overwrites of their images in a
     /// published set (no image-cache lock); 0: under the lock (A/B).
+    #[inline]
     pub fn pending_set() -> bool {
         get(31) != 0
     }
 
     /// Uploaded textures sampled for CPU writes by a background thread
     /// (`images::scrubbing`); 0: by the first draw binding each per frame.
+    #[inline]
     pub fn tex_scrub() -> bool {
         get(32) != 0
     }
 
     /// Smallest batch-start copy kept in the shared video-memory chunks
     /// (`gpu::precache`), bytes.
+    #[inline]
     pub fn pre_share_min() -> u64 {
         get(33)
     }
 
     /// Video memory for shared batch-start copies, MiB.
+    #[inline]
     pub fn pre_share_mib() -> u64 {
         get(34)
     }
 
     /// Frames a range GPU work wrote is not kept in the shared chunks
     /// (copied per batch instead); 0: always kept.
+    #[inline]
     pub fn pre_share_volatile() -> u64 {
         get(35)
     }
 
     /// Stages whose preparation read what submitted GPU work still writes
     /// are used as prepared and checked afterwards (`exec::speculate`).
+    #[inline]
     pub fn spec_reads() -> bool {
         get(36) != 0
     }
 
     /// Batches are submitted to Vulkan by a thread of their own
     /// (`exec::push_batch`) instead of by the command processors.
+    #[inline]
     pub fn submit_thread() -> bool {
         get(37) != 0
     }
 
     /// The main command processor's share of a split run follows whether it
     /// waited for the workers (`par::main_weight`); 0: equal chunks.
+    #[inline]
     pub fn par_balance() -> bool {
         get(38) != 0
     }
@@ -350,18 +389,21 @@ pub mod tune {
     /// regions (0: one call per copy as it is made). ~5.6x fewer calls in
     /// the courtyard; the rate effect was within the noise of a loaded run
     /// (20261012-163645), so it stays off until measured on a quiet machine.
+    #[inline]
     pub fn pre_merge() -> bool {
         get(42) != 0
     }
 
     /// Batch-start copies of ranges that submitted batches of the same queue
     /// still write (the prologue runs after them); 0: bound in place.
+    #[inline]
     pub fn pre_inflight() -> bool {
         get(39) != 0
     }
 
     /// A command processor's batch is submitted once it has been recording
     /// this many microseconds while the GPU has no work left (0: off).
+    #[inline]
     pub fn idle_split() -> u64 {
         get(40)
     }
@@ -371,6 +413,7 @@ pub mod tune {
     /// maxPushDescriptors, instead of a descriptor set allocated, written
     /// and bound per command; pipelines are cached per setting (an in-run
     /// A/B compiles both).
+    #[inline]
     pub fn push_desc() -> bool {
         get(41) != 0
     }
@@ -378,11 +421,13 @@ pub mod tune {
     /// Command-processor waits for GPU work still to be traced (`tune
     /// trace_sync <n>`: the next n are logged with the read that collided,
     /// its writer and the shader).
+    #[inline]
     pub fn get_trace_sync() -> bool {
         get(21) > 0
     }
 
     /// Takes one of the waits still to be traced.
+    #[inline]
     pub fn take_trace_sync() -> bool {
         get(21) > 0 && ALL[21].value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| if v != UNSET && v > 0 { Some(v - 1) } else { None }).is_ok()
     }
@@ -390,6 +435,7 @@ pub mod tune {
     /// Register-state snapshots of parallel chunks (and replays) hold only
     /// the registers written so far (`cp::HIGH`); 0 copies whole register
     /// files (100 KiB each), for A/B.
+    #[inline]
     pub fn lean_regs() -> bool {
         get(43) != 0
     }
@@ -397,6 +443,7 @@ pub mod tune {
     /// The shader-input reader keeps the mappings of its last four reads and
     /// looks a miss up once; 0: the last read's mapping, two lookups per miss
     /// (the earlier behavior, for A/B).
+    #[inline]
     pub fn span_cache() -> bool {
         get(44) != 0
     }
@@ -404,8 +451,17 @@ pub mod tune {
     /// Dispatches of the title's fill kernel over a whole range are buffer
     /// fills of guest memory in place (`verify::full_fill`), without the
     /// kernel and its VRAM shadow; 0: the kernel runs (for A/B).
+    #[inline]
     pub fn fill_dma() -> bool {
         get(45) != 0
+    }
+
+    /// Per-command steps without needless work: the main command processor
+    /// spins on a flag for its workers, and a compute pipeline already bound
+    /// in the command buffer is not bound again; 0: as before (for A/B).
+    #[inline]
+    pub fn lean_cmd() -> bool {
+        get(46) != 0
     }
 
     /// A switch's value by name; None if unknown.
@@ -922,6 +978,10 @@ static PROFILE_LOCKS: Mutex<Option<std::collections::HashMap<(&'static str, Stri
 /// crate's, the runtime library's, the driver's: "module!name") and by the
 /// innermost frame of all: where per-command time goes below our code.
 static PROFILE_CALLS: Mutex<Option<std::collections::HashMap<(&'static str, String), u64>>> = Mutex::new(None);
+/// Busy samples by the source line our innermost function was at (its own
+/// work or the call it was making): where per-command time goes within a
+/// function.
+static PROFILE_LINES: Mutex<Option<std::collections::HashMap<(&'static str, String), u64>>> = Mutex::new(None);
 static PROFILE_LEAF: Mutex<Option<std::collections::HashMap<(&'static str, String), u64>>> = Mutex::new(None);
 
 /// Threads sampled besides the queues' command processors: (kind, host tid)
@@ -950,6 +1010,7 @@ pub fn start_profiler() {
     *PROFILE_BUSY.lock() = Some(Default::default());
     *PROFILE_LOCKS.lock() = Some(Default::default());
     *PROFILE_CALLS.lock() = Some(Default::default());
+    *PROFILE_LINES.lock() = Some(Default::default());
     *PROFILE_LEAF.lock() = Some(Default::default());
     let _ = crate::thread::spawn_host(
         "gpu-profiler",
@@ -991,6 +1052,15 @@ pub fn start_profiler() {
                         if let Some(m) = PROFILE_CALLS.lock().as_mut() {
                             *m.entry((kind, format!("{callee} <- {ours}"))).or_default() += 1;
                         }
+                        // The line our innermost function was at (a return
+                        // address less one: the call's line).
+                        if let Some(i) = at {
+                            if let Some(line) = crate::exception::host_line(frames[i].saturating_sub((i > 0) as u64)) {
+                                if let Some(m) = PROFILE_LINES.lock().as_mut() {
+                                    *m.entry((kind, format!("{line} {}", ours.rsplit("::").next().unwrap_or(ours)))).or_default() += 1;
+                                }
+                            }
+                        }
                         if let Some(m) = PROFILE_LEAF.lock().as_mut() {
                             *m.entry((kind, fns.first().copied().unwrap_or("(none)").to_string())).or_default() += 1;
                         }
@@ -1028,7 +1098,7 @@ pub fn reset_profile() {
     if let Some(m) = PROFILE_LOCKS.lock().as_mut() {
         m.clear();
     }
-    for p in [&PROFILE_CALLS, &PROFILE_LEAF] {
+    for p in [&PROFILE_CALLS, &PROFILE_LEAF, &PROFILE_LINES] {
         if let Some(m) = p.lock().as_mut() {
             m.clear();
         }
@@ -1087,7 +1157,7 @@ fn profile_summary() -> String {
             }
         }
     }
-    for (table, what, n) in [(&PROFILE_CALLS, "by callee of our innermost function", 40), (&PROFILE_LEAF, "by innermost frame", 25)] {
+    for (table, what, n) in [(&PROFILE_CALLS, "by callee of our innermost function", 40), (&PROFILE_LEAF, "by innermost frame", 25), (&PROFILE_LINES, "by source line of our innermost function", 50)] {
         if let Some(m) = table.lock().as_ref() {
             for kind in PROFILE_KINDS {
                 let mut v: Vec<(&String, &u64)> = m.iter().filter(|((k, _), _)| *k == kind).map(|((_, f), n)| (f, n)).collect();

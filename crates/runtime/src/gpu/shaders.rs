@@ -1314,7 +1314,8 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
         t
     };
     // Scalar-load data, resolved now.
-    let mut sgpr_data = user.to_vec();
+    let mut sgpr_data = Vec::with_capacity((translate::sgpr_data_dwords(&tr.plan) as usize).max(translate::SGPR_DATA_USER as usize));
+    sgpr_data.extend_from_slice(user);
     sgpr_data.resize(translate::SGPR_DATA_USER as usize, 0);
     let mut data_loads = Vec::new();
     for (j, l) in tr.plan.loads.iter().enumerate() {

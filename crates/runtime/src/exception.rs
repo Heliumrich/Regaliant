@@ -324,15 +324,16 @@ unsafe fn frames_line(ctx: &CONTEXT) -> String {
     format!("frames: {}", v.join(" <- "))
 }
 
-/// Name of a host code address: dbghelp symbol (our PDB, or a DLL's
-/// exports) + offset. The symbol search path is our executable's directory
-/// only, so no symbol server is ever contacted.
-pub fn host_symbol(addr: u64) -> String {
-    use windows_sys::Win32::System::Diagnostics::Debug::{SYMBOL_INFOW, SYMOPT_DEFERRED_LOADS, SYMOPT_UNDNAME, SymFromAddrW, SymInitializeW, SymSetOptions};
+/// dbghelp's state (it is not thread safe): None before initialization,
+/// then whether it succeeded.
+static SYM: parking_lot::Mutex<Option<bool>> = parking_lot::Mutex::new(None);
+
+/// Initializes dbghelp once (under the SYM lock): the symbol search path is
+/// our executable's directory only, so no symbol server is ever contacted.
+fn sym_ready(g: &mut Option<bool>) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::{SYMOPT_DEFERRED_LOADS, SYMOPT_LOAD_LINES, SYMOPT_UNDNAME, SymInitializeW, SymSetOptions};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    static SYM: parking_lot::Mutex<Option<bool>> = parking_lot::Mutex::new(None);
-    let mut g = SYM.lock();
-    let ready = *g.get_or_insert_with(|| unsafe {
+    *g.get_or_insert_with(|| unsafe {
         let dir: Vec<u16> = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -341,9 +342,54 @@ pub fn host_symbol(addr: u64) -> String {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
         SymInitializeW(GetCurrentProcess(), dir.as_ptr(), 1) != 0
-    });
+    })
+}
+
+/// Source file name and line of a host code address in our executable
+/// (profiles: which line of a function its samples fall on), cached.
+pub fn host_line(addr: u64) -> Option<String> {
+    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGEHLP_LINEW64, SymGetLineFromAddrW64};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    static LINES: parking_lot::Mutex<Option<std::collections::HashMap<u64, Option<String>>>> = parking_lot::Mutex::new(None);
+    if let Some(l) = LINES.lock().as_ref().and_then(|m| m.get(&addr)) {
+        return l.clone();
+    }
+    let line = {
+        let mut g = SYM.lock();
+        if !sym_ready(&mut g) {
+            return None;
+        }
+        unsafe {
+            let mut l: IMAGEHLP_LINEW64 = std::mem::zeroed();
+            l.SizeOfStruct = std::mem::size_of::<IMAGEHLP_LINEW64>() as u32;
+            let mut disp = 0u32;
+            if SymGetLineFromAddrW64(GetCurrentProcess(), addr, &mut disp, &mut l) != 0 && !l.FileName.is_null() {
+                let mut n = 0;
+                while *l.FileName.add(n) != 0 && n < 1024 {
+                    n += 1;
+                }
+                let path = String::from_utf16_lossy(std::slice::from_raw_parts(l.FileName, n));
+                let file = path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string();
+                Some(format!("{file}:{}", l.LineNumber))
+            } else {
+                None
+            }
+        }
+    };
+    LINES.lock().get_or_insert_with(Default::default).insert(addr, line.clone());
+    line
+}
+
+/// Name of a host code address: dbghelp symbol (our PDB, or a DLL's
+/// exports) + offset. The symbol search path is our executable's directory
+/// only, so no symbol server is ever contacted.
+pub fn host_symbol(addr: u64) -> String {
+    use windows_sys::Win32::System::Diagnostics::Debug::{SYMBOL_INFOW, SymFromAddrW};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut g = SYM.lock();
+    let ready = sym_ready(&mut g);
     let (b, e) = host_image();
     let fallback = if addr >= b && addr < e { format!("dsport+{:#x}", addr - b) } else { format!("{addr:#x}") };
     if !ready {

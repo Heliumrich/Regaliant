@@ -16,7 +16,7 @@
 
 use super::cp::{ChunkState, Cp};
 use parking_lot::{Condvar, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Chunk workers wanted (`tune par`; 0: runs are recorded by the command
@@ -67,6 +67,8 @@ pub struct Worker {
     cv: Condvar,
     /// The finished chunk: where it stopped (None: it ran to its end).
     done: Mutex<Option<Option<u64>>>,
+    /// Set once `done` holds the finished chunk (spun on without the lock).
+    finished: AtomicBool,
     done_cv: Condvar,
 }
 
@@ -140,7 +142,7 @@ impl Pool {
                 crate::warn!("gpu[{wname}]: no executor for a parallel worker ({e})");
                 return None;
             }
-            let w = Arc::new(Worker { cp: Mutex::new(cp), job: Mutex::new(None), cv: Condvar::new(), done: Mutex::new(None), done_cv: Condvar::new() });
+            let w = Arc::new(Worker { cp: Mutex::new(cp), job: Mutex::new(None), cv: Condvar::new(), done: Mutex::new(None), finished: AtomicBool::new(false), done_cv: Condvar::new() });
             let w2 = w.clone();
             let tname = wname.clone();
             let r = crate::thread::spawn_host(
@@ -189,6 +191,7 @@ fn run_worker(w: &Worker) {
             r
         };
         *w.done.lock() = Some(stopped);
+        w.finished.store(true, Ordering::Release);
         w.done_cv.notify_all();
     }
 }
@@ -197,6 +200,7 @@ impl Worker {
     /// Starts the chunk [from, to) from `state`.
     pub fn start(&self, state: Box<ChunkState>, from: u64, to: u64) {
         *self.done.lock() = None;
+        self.finished.store(false, Ordering::Release);
         *self.job.lock() = Some(Job { state, from, to });
         self.cv.notify_all();
     }
@@ -211,9 +215,19 @@ impl Worker {
         if g.is_none() {
             drop(g);
             let mut spins = 0;
-            while spins < 4096 && self.done.lock().is_none() {
-                std::hint::spin_loop();
-                spins += 1;
+            if super::tune::lean_cmd() {
+                // The flag, not the lock the worker takes to post its result
+                // (2.6% of the main command processor's busy samples went to
+                // this loop's locking, run 20261012-213847).
+                while spins < 4096 && !self.finished.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                    spins += 1;
+                }
+            } else {
+                while spins < 4096 && self.done.lock().is_none() {
+                    std::hint::spin_loop();
+                    spins += 1;
+                }
             }
             g = self.done.lock();
         }

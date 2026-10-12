@@ -29,6 +29,8 @@ const MAX_RT: usize = 8;
 pub(crate) struct DynCache {
     words: [u64; DYN_SLOTS],
     pipeline: vk::Pipeline,
+    /// The compute pipeline bound last in this command buffer.
+    pub(crate) cs_pipeline: vk::Pipeline,
     viewport: Option<[u32; 6]>,
     scissor: Option<[i32; 4]>,
     bias: Option<[u32; 3]>,
@@ -751,7 +753,9 @@ impl Exec {
             }
         }
         lap.mark(9);
-        let mut bounds = Vec::new();
+        // The vector is kept for the next draw (empty: it drains at the end).
+        let mut bounds = std::mem::take(&mut self.draw_bounds);
+        bounds.clear();
         for (k, p) in stages.iter_mut().enumerate() {
             let mut b = self.bind_stage(p, false)?;
             if self.stopped {
@@ -779,8 +783,7 @@ impl Exec {
         let t_bind = since(t0);
         // Rendering instance: reuse it while the attachments stay the same
         // and the draw does not sample one of them.
-        let sampled: Vec<vk::Image> = bounds.iter().flat_map(|b| b.images.iter().copied()).collect();
-        let feedback = self.rendering.as_ref().is_some_and(|r| r.colors.iter().flatten().chain(r.depth.iter()).any(|t| sampled.contains(&t.image)));
+        let feedback = self.rendering.as_ref().is_some_and(|r| r.colors.iter().flatten().chain(r.depth.iter()).any(|t| bounds.iter().any(|b| b.images.contains(&t.image))));
         let same = self.rendering.as_ref().is_some_and(|r| r.colors == colors && r.depth == depth);
         if !same || feedback {
             self.end_rendering();
@@ -1027,7 +1030,7 @@ impl Exec {
             }
         }
         lap.mark(16);
-        for b in bounds {
+        for b in bounds.drain(..) {
             if !b.writes.is_empty() {
                 crate::gpu::mirror::invalidate(&b.writes);
             }
@@ -1040,7 +1043,9 @@ impl Exec {
             for &(w, n) in &b.writes {
                 self.note_write(w, n);
             }
+            self.recycle(b);
         }
+        self.draw_bounds = bounds;
         lap.mark(17);
         if super::profiling() {
             super::note_phases(&super::DRAW_PHASES, [t_prep, t_pipe, t_bind, since(t0)]);

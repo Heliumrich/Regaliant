@@ -901,6 +901,7 @@ fn trace_loads(queue: &str, p: &Prepared, groups: [u32; 3]) {
 }
 
 /// Descriptor writes of one shader stage.
+#[derive(Default)]
 struct Bound {
     bufs: Vec<(u32, vk::DescriptorBufferInfo)>,
     imgs: Vec<(u32, vk::DescriptorType, vk::DescriptorImageInfo)>,
@@ -2485,6 +2486,10 @@ pub struct Exec {
     /// Graphics state recorded in the current command buffer (draws skip
     /// the calls that would set the same values again).
     dyncache: draw::DynCache,
+    /// Cleared bindings for the next commands (`bind_stage`, `recycle`).
+    bound_pool: Vec<Bound>,
+    /// A draw's stage bindings (the vector reused).
+    draw_bounds: Vec<Bound>,
     /// Descriptor pool usage of the recording slot (see POOL_LIMITS).
     pool_use: [u32; 5],
     /// Shadow space used in the recording slot.
@@ -2591,6 +2596,8 @@ impl Exec {
                 batch_shaders: Vec::new(),
                 rendering: None,
                 dyncache: Default::default(),
+                bound_pool: Vec::new(),
+                draw_bounds: Vec::new(),
                 pool_use: [0; 5],
                 shadow_used: 0,
                 resident: Vec::new(),
@@ -3159,6 +3166,23 @@ impl Exec {
             note_pre_repeat(base, size, n);
         }
         Some((buf, off, bias))
+    }
+
+    /// Returns a command's binding for reuse, cleared.
+    fn recycle(&mut self, mut b: Bound) {
+        if self.bound_pool.len() >= 8 {
+            return;
+        }
+        b.bufs.clear();
+        b.imgs.clear();
+        b.img_arrays.clear();
+        b.writes.clear();
+        b.sized_writes.clear();
+        b.images.clear();
+        b.shadows.clear();
+        b.write_src.clear();
+        b.placements.clear();
+        self.bound_pool.push(b);
     }
 
     /// Fills guest [base, base+len) with the word `v` in place (vkCmdFillBuffer
@@ -3885,6 +3909,7 @@ impl Exec {
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
             c.device.update_descriptor_sets(&writes, &[]);
             c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, tp.pipeline);
+            self.dyncache.cs_pipeline = tp.pipeline;
             c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, tp.layout, 0, &[set], &[]);
             c.device.cmd_push_constants(cmd, tp.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
             c.device.cmd_dispatch(cmd, 1, 1, 1);
@@ -3975,6 +4000,9 @@ impl Exec {
                     c.device.cmd_copy_buffer(self.cmd(), self.shadow(), sh.host, &[r]);
                 },
             }
+        }
+        if let Some(m) = merge {
+            self.dyncache.cs_pipeline = m.pipeline;
         }
         // Later work reads guest memory after the write-back.
         global_barrier(self.cmd());
@@ -4200,7 +4228,11 @@ impl Exec {
         super::images::BINDING_SHADER.with(|s| s.set(p.addr));
         let res_info = rdna::translate::res_info_offset(&p.tr.plan) as usize;
         let nb = p.tr.out.bindings.len();
-        let mut bound = Bound { bufs: Vec::with_capacity(nb), imgs: Vec::with_capacity(nb), img_arrays: Vec::new(), writes: Vec::new(), sized_writes: Vec::new(), images: Vec::with_capacity(nb), shadows: Vec::new(), write_src: Vec::new(), placements: Vec::new() };
+        // A recycled binding's vectors keep their capacity (`recycle`).
+        let mut bound = self.bound_pool.pop().unwrap_or_default();
+        bound.bufs.reserve(nb);
+        bound.imgs.reserve(nb);
+        bound.images.reserve(nb);
         let seg = SHADOW_BYTES;
         let fx = fixed();
         {
@@ -4802,7 +4834,10 @@ impl Exec {
         };
         unsafe {
             let cmd = self.cmd();
-            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            if !super::tune::lean_cmd() || self.dyncache.cs_pipeline != pipeline {
+                c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                self.dyncache.cs_pipeline = pipeline;
+            }
             bind_descriptors(cmd, vk::PipelineBindPoint::COMPUTE, layout, set, std::slice::from_ref(&bound));
             if let Some((buffer, offset)) = args {
                 // Earlier work of this batch wrote the arguments.
@@ -4881,6 +4916,7 @@ impl Exec {
             let phases = if profiling() { format!(" (prepare {} ms, pipeline {} ms, bindings {} ms)", t_prep.as_millis(), (t_pipe - t_prep).as_millis(), (t_bind - t_pipe).as_millis()) } else { String::new() };
             crate::info!("gpu[{}]: dispatch of cs {:#x} took {} ms{phases}", self.name, p.addr, total.as_millis());
         }
+        self.recycle(bound);
         if let Some(mut ch) = verify::check_for(&p, groups, local).filter(|_| indirect.is_none()) {
             // Expected values as recorded, when no GPU work still writes them.
             let src = verify::source_ranges(&ch);
