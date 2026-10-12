@@ -435,6 +435,55 @@ fn latch_waits(addr: u64, bytes: u64) {
     }
 }
 
+/// A label write the GPU performed in order within a batch
+/// (`Exec::gpu_cp_write`), seen once the batch completed: recorded like a
+/// CPU-performed CP write (the history late waiters pass on, `missed_write`)
+/// and latched for the active waits its value satisfies (by the value: the
+/// title may have reset the label since). Without this, a queue reaching its
+/// wait after the batch completed and the label was reset blocked forever:
+/// run 20261012-141114 stopped at flip 737 with graphics and acb0x50 waiting
+/// for 1 at 0x11d37ff7e0, which acb0x20's GPU-side write had set ("recorded
+/// writes none").
+pub(super) fn gpu_label_written(queue: &str, addr: u64, value: u64, bytes: u8) {
+    if WAITED.lock().as_ref().is_some_and(|w| w.contains(&(addr & !7))) {
+        let mut g = LABEL_WRITES.lock();
+        let h = g.get_or_insert_with(HashMap::new).entry(addr).or_default();
+        match h.back_mut() {
+            Some(last) if last.1 == value => last.0 = Instant::now(),
+            _ => {
+                if h.len() >= LABEL_WRITES_KEEP {
+                    h.pop_front();
+                }
+                h.push_back((Instant::now(), value));
+            }
+        }
+    }
+    {
+        let g = ACTIVE_WAITS.lock();
+        for w in g.iter() {
+            // The waited word within the written bytes.
+            let v = if w.addr == addr {
+                if w.wide {
+                    if bytes < 8 {
+                        continue;
+                    }
+                    value
+                } else {
+                    value & 0xFFFF_FFFF
+                }
+            } else if !w.wide && bytes >= 8 && w.addr == addr + 4 {
+                value >> 32
+            } else {
+                continue;
+            };
+            if compare(w.func, v & w.mask, w.reference & w.mask) {
+                w.hit.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+    label_event(queue, b'W', addr, value, 0, 0);
+}
+
 /// Label activity of all queues (CP writes, waits) on addresses some
 /// WAIT_REG_MEM polls: a flight recorder dumped for the label when a wait
 /// stalls. A value that changes between CP events was written by the CPU

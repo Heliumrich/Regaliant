@@ -581,6 +581,9 @@ pub struct FastClear {
     pub image: vk::Image,
     pub meta: u64,
     pub clear: [u32; 2],
+    /// The metadata's first word, known from the fill that wrote it (no read
+    /// back after the GPU work).
+    pub known: Option<u32>,
 }
 
 /// Blocks of a block-compressed texture that GPU work stored through an
@@ -734,7 +737,9 @@ pub struct Images {
     /// `resolved_key` by (T#, storage): (LOOKUP_GEN, key).
     key_memo: HashMap<([u32; 8], bool), (u64, Option<ImageKey>)>,
     /// Images whose metadata a GPU or CP write covered since (fast clears).
-    pending_clears: HashMap<ImageKey, u64>,
+    /// Images whose fast-clear metadata was written: (metadata address, its
+    /// first word when the writer's value is known: `note_meta_fill`).
+    pending_clears: HashMap<ImageKey, (u64, Option<u32>)>,
     samplers: HashMap<([u32; 4], bool), vk::Sampler>,
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
@@ -1581,10 +1586,30 @@ impl Images {
         }
         for &(b, n) in writes {
             for (&meta, &(key, _)) in self.meta_of.range(b..b.saturating_add(n)) {
-                self.pending_clears.insert(key, meta);
+                self.pending_clears.insert(key, (meta, None));
                 self.pending_change += 1;
             }
         }
+    }
+
+    /// The fill kernel stored `v` in every word of [base, base+len): the fast
+    /// clears pending on metadata inside it read `v` (after `note_writes`
+    /// for the same dispatch, which marked them unknown).
+    pub fn note_meta_fill(&mut self, base: u64, len: u64, v: u32) {
+        if self.meta_of.is_empty() {
+            return;
+        }
+        let end = base.saturating_add(len);
+        for (&meta, &(key, _)) in self.meta_of.range(base..end) {
+            if meta + 4 <= end {
+                self.pending_clears.insert(key, (meta, Some(v)));
+            }
+        }
+    }
+
+    /// Whether every pending fast clear among `keys` has a known value.
+    pub fn clears_known(&self, keys: &[ImageKey]) -> bool {
+        keys.iter().all(|k| self.pending_clears.get(k).is_none_or(|&(_, v)| v.is_some()))
     }
 
     /// The images with a fast clear pending.
@@ -1601,14 +1626,14 @@ impl Images {
     pub fn take_clears(&mut self, keys: &[ImageKey]) -> Vec<FastClear> {
         let mut out = Vec::new();
         for k in keys {
-            let Some(meta) = self.pending_clears.remove(k) else { continue };
+            let Some((meta, known)) = self.pending_clears.remove(k) else { continue };
             self.pending_change += 1;
             self.note_gen += 1;
             let (Some(img), Some(&(_, clear))) = (self.map.get(k), self.meta_of.get(&meta)) else { continue };
             if out.iter().any(|c: &FastClear| c.key == *k) {
                 continue;
             }
-            out.push(FastClear { key: *k, image: img.image, meta, clear });
+            out.push(FastClear { key: *k, image: img.image, meta, clear, known });
         }
         out
     }

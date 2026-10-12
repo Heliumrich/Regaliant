@@ -87,18 +87,40 @@ fn matches(insts: &[rdna::Inst], want: &[&str]) -> bool {
     insts.len() == want.len() && insts.iter().zip(want).all(|(i, w)| i.name() == Some(*w))
 }
 
+/// Whether a program is the fill kernel: v_mov_b32 v0..v3 from s4..s7, then
+/// store v0..v3 at index v4 through the V# in s[0:3].
+fn is_fill(p: &Prepared) -> bool {
+    if !matches(&p.insts, FILL) {
+        return false;
+    }
+    let movs_ok = (0..4).all(|k| p.insts[1 + k].src(0) == 4 + k as u16 && p.insts[1 + k].vdst() == k as u16);
+    let st = &p.insts[5];
+    movs_ok && st.buf_srsrc() == 0 && st.vdst() == 0 && st.buf_vaddr() == 4 && st.buf_idxen()
+}
+
+/// A dispatch of the fill kernel storing one value in every component
+/// (s4..s7 equal, 0 or all ones: the same 32-bit words in any format): its
+/// destination range and that word. The title clears DCC and HTILE metadata
+/// this way (cs 0x80271be00 in the executable), so the value a fast clear
+/// reads back is known when the dispatch is recorded.
+pub fn fill_value(p: &Prepared) -> Option<((u64, u64), u32)> {
+    if p.user.len() < 8 || !is_fill(p) {
+        return None;
+    }
+    let v = p.user[4];
+    if !(v == 0 || v == u32::MAX) || p.user[5..8].iter().any(|&w| w != v) {
+        return None;
+    }
+    let d = Vsharp::decode(&p.user[0..4]);
+    Some(((d.base, d.num_records as u64 * d.stride.max(1) as u64), v))
+}
+
 /// A check for a dispatch of a recognized kernel.
 pub fn check_for(p: &Prepared, groups: [u32; 3], local: [u32; 3]) -> Option<Check> {
     if !enabled() {
         return None;
     }
-    let kind = if matches(&p.insts, FILL) {
-        // v_mov_b32 v0..v3 from s4..s7; store v0 at index v4 through s[0:3].
-        let movs_ok = (0..4).all(|k| p.insts[1 + k].src(0) == 4 + k as u16 && p.insts[1 + k].vdst() == k as u16);
-        let st = &p.insts[5];
-        if !(movs_ok && st.buf_srsrc() == 0 && st.vdst() == 0 && st.buf_vaddr() == 4 && st.buf_idxen()) {
-            return None;
-        }
+    let kind = if is_fill(p) {
         Kind::Fill
     } else if matches(&p.insts, COPY) {
         Kind::Copy

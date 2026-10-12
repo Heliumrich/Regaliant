@@ -122,6 +122,9 @@ static WATCHDOG_PTR: std::sync::atomic::AtomicPtr<u32> = std::sync::atomic::Atom
 pub static WATCHDOG_STOPS: AtomicU64 = AtomicU64::new(0);
 /// Fast clears performed (metadata writes, see `Exec::resolve_fast_clears`).
 pub static FAST_CLEARS: AtomicU64 = AtomicU64::new(0);
+/// Fast clears resolved without waiting for the GPU (metadata value known
+/// from the fill that wrote it).
+pub static FAST_CLEARS_KNOWN: AtomicU64 = AtomicU64::new(0);
 /// Block-compressed textures refreshed from GPU-written block views.
 pub static BLOCK_COPIES: AtomicU64 = AtomicU64::new(0);
 /// Guest-memory imports: count, bytes, how many spanned several mappings,
@@ -1166,6 +1169,9 @@ struct Batch {
     shaders: Vec<u64>,
     submitted: std::time::Instant,
     name: String,
+    /// Label writes the GPU performs within it: (address, value, bytes),
+    /// made known to waits when it completes (`cp::gpu_label_written`).
+    gpu_labels: Vec<(u64, u64, u8)>,
 }
 
 unsafe impl Send for Batch {}
@@ -1398,7 +1404,7 @@ pub fn wait_done(seq: u64) {
 
 /// Queues a batch: `submit` runs (the vkQueueSubmit) under the queue lock so
 /// sequence order is submission order.
-fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, submit: impl FnOnce() + Send + 'static) -> u64 {
+fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, gpu_labels: Vec<(u64, u64, u8)>, submit: impl FnOnce() + Send + 'static) -> u64 {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         crate::thread::spawn_host("gpu-complete", 1 << 20, Box::new(completion_thread)).expect("gpu completion thread");
@@ -1418,7 +1424,7 @@ fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, ch
         submit();
         note_submitted(seq);
     }
-    q.push_back(Batch { queries, seq, fence, actions, checks, shaders, submitted: std::time::Instant::now(), name: name.to_string() });
+    q.push_back(Batch { queries, seq, fence, actions, checks, shaders, submitted: std::time::Instant::now(), name: name.to_string(), gpu_labels });
     BATCHES_CV.notify_one();
     seq
 }
@@ -1506,6 +1512,11 @@ fn completion_thread() {
                 let list: Vec<String> = b.shaders.iter().map(|a| format!("{a:#x}")).collect();
                 crate::info!("gpu[{}]: batch of {} dispatch(es) took {ms} ms (shaders {})", b.name, b.shaders.len(), list.join(" "));
             }
+        }
+        // Label writes the GPU performed within the batch (before its CP
+        // effects, which come after its work).
+        for &(a, v, n) in &b.gpu_labels {
+            super::cp::gpu_label_written(&b.name, a, v, n);
         }
         let ta = std::time::Instant::now();
         let tl = if b.actions.is_empty() { None } else { super::timeline::mark() };
@@ -2674,7 +2685,8 @@ impl Exec {
             return;
         }
         let commands = self.batch_shaders.len();
-        let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, move || {
+        let gpu_labels = self.pending_promises.clone();
+        let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, move || {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return;
             }
@@ -2998,18 +3010,39 @@ impl Exec {
         if keys.is_empty() || !super::images::with(|im| im.clears_pending(keys)) {
             return;
         }
-        // The metadata write may still be in flight.
         self.end_rendering();
-        self.flush_for("fast clear");
-        if self.stopped {
-            return;
+        // The metadata write may still be in flight: read it back after the
+        // GPU work, unless the fill that wrote it gave its value (then the
+        // clear needs no wait; ~8 per courtyard frame drained the GPU).
+        // DS_GPU_VERIFY=1: known values are compared with the read-back one.
+        let check = verify::enabled();
+        if check || !super::images::with(|im| im.clears_known(keys)) {
+            self.flush_for("fast clear");
+            if self.stopped {
+                return;
+            }
         }
         let clears = super::images::with(|im| im.take_clears(keys));
         for c in clears {
-            if !super::cp::guest_readable(c.meta, 4) {
-                continue;
-            }
-            let v = unsafe { std::ptr::read_volatile(c.meta as *const u32) };
+            let v = match c.known {
+                Some(v) => {
+                    FAST_CLEARS_KNOWN.fetch_add(1, Ordering::Relaxed);
+                    if check && super::cp::guest_readable(c.meta, 4) {
+                        let read = unsafe { std::ptr::read_volatile(c.meta as *const u32) };
+                        static MISMATCH: AtomicU64 = AtomicU64::new(0);
+                        if read != v && MISMATCH.fetch_add(1, Ordering::Relaxed) < 20 {
+                            crate::warn!("images: fast clear of {:#x}: metadata {:#x} reads {read:#x}, the fill wrote {v:#x}", c.key.base, c.meta);
+                        }
+                    }
+                    v
+                }
+                None => {
+                    if !super::cp::guest_readable(c.meta, 4) {
+                        continue;
+                    }
+                    unsafe { std::ptr::read_volatile(c.meta as *const u32) }
+                }
+            };
             let k = c.key;
             let full = vk::ImageSubresourceRange { aspect_mask: super::images::aspects(k.format), base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS };
             let what = if super::images::is_depth(k.format) {
@@ -3218,7 +3251,7 @@ impl Exec {
             }
             Some(self.last_seq)
         } else if self.last_seq > done_seq() {
-            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, || {});
+            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), || {});
             self.last_seq = seq;
             self.last_action_seq = seq;
             self.cpu_action_seq = seq;
@@ -3913,7 +3946,7 @@ impl Exec {
             let (cmd, fence, queries) = (self.slots[b.slot].cmd, self.slots[b.slot].fence, self.slots[b.slot].queries);
             let name = self.name.clone();
             let pre = b.pre;
-            let seq = push_batch(fence, queries, Vec::new(), b.checks, b.shaders, &self.name, move || {
+            let seq = push_batch(fence, queries, Vec::new(), b.checks, b.shaders, &self.name, Vec::new(), move || {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
                     return;
                 }
@@ -4476,7 +4509,13 @@ impl Exec {
         lap.mark(8);
         let writes_here = std::mem::take(&mut bound.writes);
         let sized_here = std::mem::take(&mut bound.sized_writes);
-        super::images::with(|im| im.note_writes(&writes_here, &sized_here));
+        let fill = verify::fill_value(&p);
+        super::images::with(|im| {
+            im.note_writes(&writes_here, &sized_here);
+            if let Some(((base, len), v)) = fill {
+                im.note_meta_fill(base, len, v);
+            }
+        });
         lap.mark(9);
         self.write_set(set, std::slice::from_ref(&bound));
         lap.mark(10);
@@ -4652,7 +4691,7 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU; {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU; {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait); {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         GPU_CP_WRITES.load(Ordering::Relaxed),
@@ -4670,6 +4709,7 @@ pub fn status() -> String {
         draw::DRAW_SKIPPED.load(Ordering::Relaxed),
         WATCHDOG_STOPS.load(Ordering::Relaxed),
         FAST_CLEARS.load(Ordering::Relaxed),
+        FAST_CLEARS_KNOWN.load(Ordering::Relaxed),
         FLUSHES.load(Ordering::Relaxed),
         verify::status(),
         super::cp::sync_summary()
