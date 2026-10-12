@@ -99,6 +99,16 @@ fn bucket(page: u64) -> usize {
     (page.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize
 }
 
+/// The same per 4 MiB (writes over 64 small buckets: the culls' 112 MB
+/// index buffer, written by every one of their dispatches, took the cache's
+/// lock each time).
+const COARSE_BUCKETS: usize = 1 << 12;
+static COVER_COARSE: [std::sync::atomic::AtomicU32; COARSE_BUCKETS] = [const { std::sync::atomic::AtomicU32::new(0) }; COARSE_BUCKETS];
+
+fn coarse_bucket(page: u64) -> usize {
+    (page.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 52) as usize
+}
+
 /// Counts an entry's pages in (or out of) the buckets.
 fn cover(base: u64, size: u64, add: bool) {
     if size == 0 {
@@ -112,13 +122,25 @@ fn cover(base: u64, size: u64, add: bool) {
             c.fetch_sub(1, Ordering::AcqRel);
         }
     }
+    for page in (base >> 22)..=((base + size - 1) >> 22) {
+        let c = &COVER_COARSE[coarse_bucket(page)];
+        if add {
+            c.fetch_add(1, Ordering::AcqRel);
+        } else {
+            c.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 /// Whether an entry may overlap [base, base+len) (false: certainly none).
 fn may_cover(base: u64, len: u64) -> bool {
     let (first, last) = (base >> 16, (base + len - 1) >> 16);
     if last - first >= 64 {
-        return true;
+        let (first, last) = (base >> 22, (base + len - 1) >> 22);
+        if last - first >= 64 {
+            return true;
+        }
+        return (first..=last).any(|page| COVER_COARSE[coarse_bucket(page)].load(Ordering::Acquire) != 0);
     }
     (first..=last).any(|page| COVER[bucket(page)].load(Ordering::Acquire) != 0)
 }

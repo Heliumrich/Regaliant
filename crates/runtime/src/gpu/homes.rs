@@ -53,10 +53,23 @@ impl Drop for HomeBuf {
     }
 }
 
+/// A home's state readable without the lock (`bind`'s fast path).
+pub struct Shared {
+    /// Unique per home (stale notes name it).
+    id: u64,
+    /// Parts written from the CPU side wait to be copied in.
+    dirty: AtomicBool,
+    /// Bumped when stale parts are removed (written back, overwritten from
+    /// the CPU side): a thread's note that it marked a range stale holds
+    /// while it stays the same.
+    stale_gen: AtomicU64,
+}
+
 struct Home {
     base: u64,
     size: u64,
     buf: Arc<HomeBuf>,
+    shared: Arc<Shared>,
     /// Guest ranges written from the CPU side since they were last copied
     /// in (all of it at creation).
     dirty: Ranges,
@@ -69,21 +82,35 @@ static HOMES: Mutex<Vec<Home>> = Mutex::new(Vec::new());
 /// home ranges (`ranges`) and check most bindings without the lock.
 static GEN: AtomicU64 = AtomicU64::new(1);
 
+type Snap = (u64, Vec<(u64, u64)>, Vec<(Arc<HomeBuf>, Arc<Shared>)>);
+
 thread_local! {
-    static RANGES: std::cell::RefCell<(u64, Vec<(u64, u64)>)> = const { std::cell::RefCell::new((0, Vec::new())) };
+    static RANGES: std::cell::RefCell<Snap> = const { std::cell::RefCell::new((0, Vec::new(), Vec::new())) };
+    /// Ranges this thread marked stale: (base, size, home, its stale_gen).
+    static STALE_NOTES: std::cell::RefCell<Vec<(u64, u64, u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The large written range this thread noted last (`note_large_write`).
+    static LAST_LARGE: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
-/// Runs `f` on this thread's copy of the home ranges (base, size).
-fn with_ranges<R>(f: impl FnOnce(&[(u64, u64)]) -> R) -> R {
+/// Runs `f` on this thread's copy of the homes: ranges (base, size) and
+/// their buffers and shared state, refreshed when homes come or go.
+fn with_snap<R>(f: impl FnOnce(&[(u64, u64)], &[(Arc<HomeBuf>, Arc<Shared>)]) -> R) -> R {
     let g = GEN.load(Ordering::Acquire);
     RANGES.with(|c| {
         let mut c = c.borrow_mut();
         if c.0 != g {
-            c.1 = HOMES.lock().iter().map(|h| (h.base, h.size)).collect();
+            let homes = HOMES.lock();
+            c.1 = homes.iter().map(|h| (h.base, h.size)).collect();
+            c.2 = homes.iter().map(|h| (h.buf.clone(), h.shared.clone())).collect();
             c.0 = g;
         }
-        f(&c.1)
+        f(&c.1, &c.2)
     })
+}
+
+/// Runs `f` on this thread's copy of the home ranges (base, size).
+fn with_ranges<R>(f: impl FnOnce(&[(u64, u64)]) -> R) -> R {
+    with_snap(|r, _| f(r))
 }
 /// Guest ranges GPU work wrote through bindings too large for a shadow
 /// (home candidates).
@@ -119,8 +146,22 @@ pub struct Bound {
 /// needs first (taken: the caller records them before the use). `written`:
 /// the use writes the range (guest memory goes stale there).
 pub fn bind(base: u64, size: u64, written: bool) -> Option<Bound> {
-    if !any() || size == 0 || !with_ranges(|r| r.iter().any(|&(b, n)| b <= base && base + size <= b + n)) {
+    if !any() || size == 0 {
         return None;
+    }
+    let found = with_snap(|r, s| r.iter().position(|&(b, n)| b <= base && base + size <= b + n).map(|i| (r[i], s[i].0.clone(), s[i].1.clone())));
+    let ((hb, hn), buf, shared) = found?;
+    // Without the lock when nothing waits to be copied in and a written
+    // range is already marked stale by this thread (the culls and the draws
+    // reading their indices bind the 112 MB home ~17k times per frame; the
+    // lock was a main point of contention between the recording threads).
+    if !shared.dirty.load(Ordering::Acquire) {
+        let sgen = shared.stale_gen.load(Ordering::Acquire);
+        let id = shared.id;
+        if !written || STALE_NOTES.with(|n| n.borrow().iter().any(|&(b, m, h, sg)| h == id && sg == sgen && b <= base && base + size <= b + m)) {
+            BINDINGS.fetch_add(1, Ordering::Relaxed);
+            return Some(Bound { buf, offset: base - hb, avail: hb + hn - base, copy_in: Vec::new() });
+        }
     }
     let mut g = HOMES.lock();
     let h = g.iter_mut().find(|h| h.base <= base && base + size <= h.base + h.size)?;
@@ -131,10 +172,19 @@ pub fn bind(base: u64, size: u64, written: bool) -> Option<Bound> {
         // copies are recorded before this use only.
         let v: Vec<(u64, u64, u64)> = h.dirty.iter().map(|(a, n)| (a, n, a - h.base)).collect();
         h.dirty.clear();
+        h.shared.dirty.store(false, Ordering::Release);
         v
     };
     if written {
         h.stale.insert(base, size);
+        let note = (base, size, h.shared.id, h.shared.stale_gen.load(Ordering::Acquire));
+        STALE_NOTES.with(|n| {
+            let mut n = n.borrow_mut();
+            if n.len() >= 16 {
+                n.remove(0);
+            }
+            n.push(note);
+        });
     }
     BINDINGS.fetch_add(1, Ordering::Relaxed);
     Some(Bound { buf: h.buf.clone(), offset: base - h.base, avail: h.base + h.size - base, copy_in })
@@ -147,8 +197,7 @@ pub fn copy_in_pending(base: u64, size: u64) -> bool {
     if !any() {
         return false;
     }
-    let g = HOMES.lock();
-    g.iter().find(|h| h.base <= base && base + size <= h.base + h.size).is_some_and(|h| !h.dirty.is_empty())
+    with_snap(|r, s| r.iter().position(|&(b, n)| b <= base && base + size <= b + n).is_some_and(|i| s[i].1.dirty.load(Ordering::Acquire)))
 }
 
 /// The homes overlapping [base, base+size) (diagnostics).
@@ -161,7 +210,12 @@ pub fn describe(base: u64, size: u64) -> String {
 /// GPU work wrote [base, base+size) through a binding too large for a
 /// VRAM shadow.
 pub fn note_large_write(base: u64, size: u64) {
+    // The culls note the same range for every dispatch.
+    if LAST_LARGE.with(|c| c.get()) == (base, size) {
+        return;
+    }
     LARGE_WRITES.lock().insert(base, size);
+    LAST_LARGE.with(|c| c.set((base, size)));
 }
 
 /// An index buffer [base, base+size) inside a range noted by
@@ -208,7 +262,9 @@ pub fn create(base: u64, size: u64) -> bool {
     USED.fetch_add(n, Ordering::Relaxed);
     let mut dirty = Ranges::default();
     dirty.insert(b, n);
-    g.push(Home { base: b, size: n, buf: Arc::new(HomeBuf { buf, mem, size: n }), dirty, stale: Ranges::default() });
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    let shared = Arc::new(Shared { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), dirty: AtomicBool::new(true), stale_gen: AtomicU64::new(0) });
+    g.push(Home { base: b, size: n, buf: Arc::new(HomeBuf { buf, mem, size: n }), shared, dirty, stale: Ranges::default() });
     ANY.store(true, Ordering::Relaxed);
     GEN.fetch_add(1, Ordering::AcqRel);
     CREATED.fetch_add(1, Ordering::Relaxed);
@@ -234,6 +290,7 @@ pub fn stale_parts(base: u64, size: u64, taken: bool) -> Vec<(u64, u64, Arc<Home
         }
         if taken {
             h.stale.remove(base, size);
+            h.shared.stale_gen.fetch_add(1, Ordering::AcqRel);
         }
     }
     v
@@ -257,8 +314,10 @@ pub fn cpu_written(base: u64, size: u64) {
         let (a, e) = (base.max(h.base), (base + size).min(h.base + h.size));
         if a < e {
             h.dirty.insert(a, e - a);
+            h.shared.dirty.store(true, Ordering::Release);
             // The CPU-side write is newer than what GPU work left there.
             h.stale.remove(a, e - a);
+            h.shared.stale_gen.fetch_add(1, Ordering::AcqRel);
         }
     }
 }

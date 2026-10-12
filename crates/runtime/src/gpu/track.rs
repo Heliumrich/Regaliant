@@ -68,8 +68,13 @@ pub static FAULTS: AtomicU64 = AtomicU64::new(0);
 /// keep results that checked the regions while it stays the same.
 pub static GEN: AtomicU64 = AtomicU64::new(0);
 
-fn changed() {
+/// GEN changes by cause: [forced dirty, page not writable, CPU write fault,
+/// host write, GPU write, remap] (profile line `image memos`).
+pub static GEN_WHY: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+fn changed(why: usize) {
     GEN.fetch_add(1, Ordering::Release);
+    GEN_WHY[why].fetch_add(1, Ordering::Relaxed);
 }
 
 fn read_only(prot: u32) -> u32 {
@@ -80,8 +85,42 @@ fn read_only(prot: u32) -> u32 {
     }
 }
 
+/// Regions per 64 KiB and per 4 MiB of guest memory (hashed; regions are
+/// never removed): GPU writes where no region lies skip the lock
+/// (`gpu_write` ran for every written binding of every command and its lock
+/// was contended between the recording threads).
+const FILTER: usize = 1 << 16;
+static REGION_PAGES: [AtomicU64; FILTER] = [const { AtomicU64::new(0) }; FILTER];
+static REGION_COARSE: [AtomicU64; 1 << 12] = [const { AtomicU64::new(0) }; 1 << 12];
+
+fn filter_bucket(page: u64, bits: u32) -> usize {
+    (page.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize
+}
+
+fn note_region(base: u64, size: u64) {
+    let size = size.max(1);
+    for page in (base >> 16)..=((base + size - 1) >> 16) {
+        REGION_PAGES[filter_bucket(page, 16)].fetch_add(1, Ordering::AcqRel);
+    }
+    for page in (base >> 22)..=((base + size - 1) >> 22) {
+        REGION_COARSE[filter_bucket(page, 12)].fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Whether a region may overlap [base, base+len) (false: certainly none).
+fn may_have_region(base: u64, len: u64) -> bool {
+    let len = len.max(1);
+    let (first, last) = (base >> 16, (base + len - 1) >> 16);
+    if last - first < 64 {
+        return (first..=last).any(|p| REGION_PAGES[filter_bucket(p, 16)].load(Ordering::Acquire) != 0);
+    }
+    let (first, last) = (base >> 22, (base + len - 1) >> 22);
+    last - first >= 64 || (first..=last).any(|p| REGION_COARSE[filter_bucket(p, 12)].load(Ordering::Acquire) != 0)
+}
+
 impl Tracker {
     fn add(&mut self, base: u64, size: u64) -> u32 {
+        note_region(base, size);
         let id = self.regions.len() as u32;
         self.regions.push(Some(Region { base, size, dirty: false, gpu: false, why: Why::None }));
         self.by_base.entry(base).or_default().push(id);
@@ -230,7 +269,7 @@ pub fn force_dirty(id: u32) {
     let mut g = TRACK.lock();
     if let Some(r) = g.as_mut().and_then(|t| t.regions.get_mut(id as usize)).and_then(|r| r.as_mut()) {
         if !r.dirty {
-            changed();
+            changed(0);
         }
         r.dirty = true;
         r.why = Why::Forced;
@@ -280,7 +319,7 @@ pub fn rearm(id: u32) {
             if let Some(Some(r)) = t.regions.get_mut(id as usize) {
                 r.dirty = true;
                 r.why = Why::Unmapped;
-                changed();
+                changed(1);
             }
         }
     }
@@ -300,7 +339,7 @@ fn unprotect_page(t: &mut Tracker, page: u64, why: Why) -> bool {
         if let Some(Some(r)) = t.regions.get_mut(id as usize) {
             r.dirty = true;
             r.why = why;
-            changed();
+            changed(2);
         }
     }
     true
@@ -364,7 +403,7 @@ pub fn host_write(base: u64, len: u64) -> HostWrite {
     // write here.
     t.each_overlapping(base, len, |r| {
         if !r.dirty {
-            changed();
+            changed(3);
         }
         r.dirty = true;
         r.why = Why::HostWrite(base);
@@ -378,11 +417,14 @@ pub fn host_write(base: u64, len: u64) -> HostWrite {
 /// Announces a GPU write to [base, base+len): overlapping regions are dirty
 /// (their pages need no change).
 pub fn gpu_write(base: u64, len: u64) {
+    if !may_have_region(base, len) {
+        return;
+    }
     let mut g = TRACK.lock();
     let Some(t) = g.as_mut() else { return };
     t.each_overlapping(base, len, |r| {
         if !r.gpu {
-            changed();
+            changed(4);
         }
         r.gpu = true;
         r.why = Why::GpuWrite(base, len);
@@ -412,7 +454,7 @@ pub fn remapped(base: u64, len: u64) {
     }
     t.each_overlapping(base, len, |r| {
         if !r.dirty {
-            changed();
+            changed(5);
         }
         r.dirty = true;
         r.why = Why::Remap(base, len);

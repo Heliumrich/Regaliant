@@ -106,12 +106,66 @@ fn tls<R>(f: impl FnOnce(&mut Tls) -> R) -> R {
     })
 }
 
+/// Memo statistics (DS_PROFILE_GPU; `profile report`): view lookups [hit,
+/// not memoized, other frame, image-cache generation moved, write-tracking
+/// generation moved], key lookups [hit, miss], and the generations at the
+/// last `profile reset` [lookup, tracking].
+static MEMO_STATS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+static MEMO_GENS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static TRACK_WHY_AT_RESET: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+fn memo_note(k: usize) {
+    if super::exec::profiling_on() {
+        MEMO_STATS[k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Clears the memo statistics (`profile reset`).
+pub fn reset_memo_stats() {
+    for c in &MEMO_STATS {
+        c.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+    MEMO_GENS[0].store(LOOKUP_GEN.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+    MEMO_GENS[1].store(super::track::GEN.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+    for (r, c) in TRACK_WHY_AT_RESET.iter().zip(super::track::GEN_WHY.iter()) {
+        r.store(c.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// One profile line on the per-thread memos.
+pub fn memo_stats_line() -> String {
+    let s: Vec<u64> = MEMO_STATS.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
+    format!(
+        "    image memos: views hit {}, missed {} (not memoized {}, other frame {}, image cache changed {}, write tracking changed {}); keys hit {}, missed {}; generations since reset: image cache {}, write tracking {} (forced dirty, page not writable, CPU write fault, host write, GPU write, remap: {:?})\n",
+        s[0],
+        s[1] + s[2] + s[3] + s[4],
+        s[1],
+        s[2],
+        s[3],
+        s[4],
+        s[5],
+        s[6],
+        LOOKUP_GEN.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(MEMO_GENS[0].load(std::sync::atomic::Ordering::Relaxed)),
+        super::track::GEN.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(MEMO_GENS[1].load(std::sync::atomic::Ordering::Relaxed)),
+        super::track::GEN_WHY.iter().zip(TRACK_WHY_AT_RESET.iter()).map(|(c, r)| c.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(r.load(std::sync::atomic::Ordering::Relaxed))).collect::<Vec<u64>>()
+    )
+}
+
 /// `Images::view` from this thread's memo (sampled views only).
 pub fn view_hit(t: &Tsharp, frame: u64) -> Option<(vk::ImageView, vk::Image)> {
     let track = super::track::GEN.load(std::sync::atomic::Ordering::Acquire);
     let lookup = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
     let any_frame = scrubbing();
-    tls(|m| m.views.get(&t.raw).filter(|e| (any_frame || e.0 == frame) && e.1 == lookup && e.2 == track).map(|e| (e.3, e.4)))
+    let e = tls(|m| m.views.get(&t.raw).copied());
+    let k = match e {
+        None => 1,
+        Some(e) if !(any_frame || e.0 == frame) => 2,
+        Some(e) if e.1 != lookup => 3,
+        Some(e) if e.2 != track => 4,
+        Some(_) => 0,
+    };
+    memo_note(k);
+    if k == 0 { e.map(|e| (e.3, e.4)) } else { None }
 }
 
 /// `Images::sampler` from this thread's memo.
@@ -121,7 +175,9 @@ pub fn sampler_hit(s: [u32; 4], compare: bool) -> Option<vk::Sampler> {
 
 /// `Images::resolved_key` from this thread's memo (None: not memoized).
 pub fn key_hit(t: &Tsharp, storage: bool) -> Option<Option<ImageKey>> {
-    tls(|m| m.keys.get(&(t.raw, storage)).copied())
+    let r = tls(|m| m.keys.get(&(t.raw, storage)).copied());
+    memo_note(if r.is_some() { 5 } else { 6 });
+    r
 }
 
 /// `Images::target`, from this thread's memo when it holds.
@@ -1562,6 +1618,11 @@ impl Images {
         let lookup = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
         if let Some(&(g, k)) = self.key_memo.get(&(t.raw, storage)) {
             if g == lookup {
+                tls(|m| {
+                    if m.lookup_gen == lookup {
+                        m.keys.insert((t.raw, storage), k);
+                    }
+                });
                 return k;
             }
         }
@@ -2221,6 +2282,15 @@ impl Images {
         let (lookup, track) = (LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire), super::track::GEN.load(std::sync::atomic::Ordering::Acquire));
         if let Some(&(f, g, tg, v, i)) = self.view_memo.get(&t.raw) {
             if (f == frame || scrubbing()) && g == lookup && tg == track {
+                // This thread's memo too: without it every thread but the one
+                // that made the entry took this lock for each lookup (64% of
+                // view lookups missed their memo, run 20261012-073715).
+                tls(|m| {
+                    if m.views.len() >= 1 << 16 {
+                        m.views.clear();
+                    }
+                    m.views.insert(t.raw, (frame, lookup, track, v, i));
+                });
                 return Ok((v, i));
             }
         }

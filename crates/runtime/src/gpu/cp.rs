@@ -958,7 +958,9 @@ impl Cp {
                     draw_base = addr64(p(1), p(2));
                 }
             } else if !is_state(opc) {
-                why = opc as usize;
+                // EVENT_WRITE by event type (statistics: partial flushes
+                // and cache events order only GPU work).
+                why = if opc == op::EVENT_WRITE { 0x200 + (p(0) & 0x3F) as usize } else { opc as usize };
                 break c;
             }
             c = next;

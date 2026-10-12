@@ -226,6 +226,17 @@ impl Worker {
     }
 }
 
+/// Clears the statistics (`profile reset`: the status line and the profile
+/// report then cover the window).
+pub fn reset_stats() {
+    for c in [&RUNS, &CHUNKS, &STOPS, &COMMANDS, &WAIT_NS, &CANCELLED] {
+        c.store(0, Ordering::Relaxed);
+    }
+    STOP_WHY.lock().clear();
+    *LENGTHS.lock() = [[0; 2]; 6];
+    ENDS.lock().clear();
+}
+
 /// One status line ("" before any parallel run).
 pub fn status() -> String {
     let runs = RUNS.load(Ordering::Relaxed);
@@ -241,6 +252,7 @@ pub fn status() -> String {
         0x130 => "buffer end".to_string(),
         0x131 => "limit".to_string(),
         0x133 => "predicated".to_string(),
+        w if w >= 0x200 => format!("event {:#x}", w - 0x200),
         w if w >= 0x100 => format!("private {:#x}", w - 0x100),
         w => format!("{w:#x}"),
     };

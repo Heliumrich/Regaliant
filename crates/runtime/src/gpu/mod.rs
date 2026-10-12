@@ -883,6 +883,8 @@ pub fn reset_profile() {
     }
     exec::reset_shader_profile();
     cp::reset_wait_stats();
+    par::reset_stats();
+    images::reset_memo_stats();
 }
 
 /// The profile so far (`profile report` control command).
@@ -890,6 +892,8 @@ pub fn profile_report() -> String {
     let mut s = profile_summary();
     s.push_str(&exec::shader_profile());
     s.push_str(&cp::wait_stats());
+    s.push_str(&par::status());
+    s.push_str(&images::memo_stats_line());
     s
 }
 
