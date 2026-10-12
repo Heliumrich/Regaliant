@@ -3564,7 +3564,7 @@ impl Exec {
                     BindingKind::Buffer(i) => {
                         let (base, size, stride, limit) = match &p.resources[i] {
                             Resolved::Buffer(v) => (v.base, v.byte_size(), v.stride, v.index_limit()),
-                            Resolved::Global(a) => (*a, None, 0, u32::MAX),
+                            Resolved::Global(a, n) => (*a, *n, 0, u32::MAX),
                             _ => return Err("binding/resource mismatch".into()),
                         };
                         let mut size = match size {
@@ -3575,10 +3575,13 @@ impl Exec {
                         let mut bias = 0u64;
                         let mut bound_size = 0u64;
                         let mut placement = Placement::None;
-                        let read_only = size > 0 && !p.tr.plan.resources[i].written && matches!(p.resources[i], Resolved::Buffer(_));
+                        // Sized: buffers, and bases whose loads all read known
+                        // bytes (data loads read by the shader).
+                        let sized = matches!(p.resources[i], Resolved::Buffer(_) | Resolved::Global(_, Some(_)));
+                        let read_only = size > 0 && !p.tr.plan.resources[i].written && sized;
                         // A video-memory home holding the range (see `homes`).
                         let home = self
-                            .home_bind(base, size, p.tr.plan.resources[i].written, if matches!(p.resources[i], Resolved::Buffer(_)) { HomeUse::Sized } else { HomeUse::Unbounded })
+                            .home_bind(base, size, p.tr.plan.resources[i].written, if sized { HomeUse::Sized } else { HomeUse::Unbounded })
                             .map(|h| (h.0, h.1, h.2));
                         // Inside a resident shadow: its working copy is newer.
                         let resident = if read_only && home.is_none() { self.resident_read(base, size)? } else { None };
@@ -3692,7 +3695,7 @@ impl Exec {
                                         if *TRACE.get_or_init(|| std::env::var("DS_TRACE_SHADOW").ok().as_deref() == Some("1")) {
                                             static SEEN: std::sync::Mutex<Option<HashSet<(u64, u64)>>> = std::sync::Mutex::new(None);
                                             if SEEN.lock().unwrap().get_or_insert_with(HashSet::new).insert((p.addr, base)) {
-                                                let global = matches!(p.resources[i], Resolved::Global(_));
+                                                let global = matches!(p.resources[i], Resolved::Global(..));
                                                 crate::info!("shadow: {:?} shader {:#x} writes {base:#x}+{size:#x} (bound {range:#x}{})", p.stage, p.addr, if global { ", global pointer" } else { "" });
                                             }
                                         }

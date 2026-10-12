@@ -224,7 +224,9 @@ impl Reader {
 #[derive(Clone, Debug)]
 pub enum Resolved {
     Buffer(Vsharp),
-    Global(u64),
+    /// A base address and, for data loads at constant offsets, the bytes they
+    /// read from it.
+    Global(u64, Option<u64>),
     Image(Tsharp),
     /// The entries of an image table (None: unusable entry, bound as a
     /// dummy image).
@@ -711,7 +713,7 @@ pub fn describe_resources(p: &Prepared) -> Vec<String> {
             let rw = format!("{}{}{from}", if used.read { "r" } else { "" }, if used.written { "w" } else { "" });
             match r {
                 Resolved::Buffer(v) => format!("{i}: V# {:#x} stride {} records {} format {} dst_sel {:#x} oob {} {rw}", v.base, v.stride, v.num_records, v.format, v.dst_sel, v.oob_select),
-                Resolved::Global(a) => format!("{i}: global {a:#x} {rw}"),
+                Resolved::Global(a, n) => format!("{i}: global {a:#x}{} {rw}", n.map(|n| format!("+{n:#x}")).unwrap_or_default()),
                 Resolved::ImageTable(e) => {
                     let list: Vec<String> = e.iter().enumerate().filter_map(|(k, t)| t.map(|t| format!("{k}:{:#x} {}x{}x{} f{}", t.base, t.width, t.height, t.depth, t.format))).collect();
                     format!("{i}: image table of {} entries {rw} [{}]", e.len(), list.join(", "))
@@ -1119,7 +1121,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
             }
             ResKind::Global => {
                 spec.resources.push(ResSpec::Global);
-                resources.push(Resolved::Global(w[0] as u64 | ((w[1] as u64) << 32)));
+                resources.push(Resolved::Global(w[0] as u64 | ((w[1] as u64) << 32), res.extent.map(|e| e as u64)));
             }
             ResKind::Image => {
                 let t = Tsharp::decode(&w);
