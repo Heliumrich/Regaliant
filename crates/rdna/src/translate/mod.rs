@@ -235,7 +235,12 @@ pub enum BindingKind {
     StorageImage(usize),
     /// IMAGE_TABLE_LEN sampled images: the entries of an image table.
     ImageArray(usize),
+    /// A sampler resource's S# for its instructions without depth comparison.
     Sampler(usize),
+    /// The same S# with depth comparison enabled, for its depth-compare
+    /// instructions (Vulkan samplers compare only for Dref instructions and
+    /// must not be used otherwise; the title uses some samplers both ways).
+    CompareSampler(usize),
     /// u32 array: the global data share (GDS_BYTES), shared by all shaders.
     Gds,
     /// u32 array of DUMP_DWORDS: register dumps (`Spec::dump`).
@@ -269,7 +274,7 @@ impl Binding {
     /// Plan resource index of a resource binding.
     pub fn kind_resource(&self) -> Option<usize> {
         match self.kind {
-            BindingKind::Buffer(i) | BindingKind::Image(i) | BindingKind::StorageImage(i) | BindingKind::ImageArray(i) | BindingKind::Sampler(i) => Some(i),
+            BindingKind::Buffer(i) | BindingKind::Image(i) | BindingKind::StorageImage(i) | BindingKind::ImageArray(i) | BindingKind::Sampler(i) | BindingKind::CompareSampler(i) => Some(i),
             _ => None,
         }
     }
@@ -284,9 +289,6 @@ pub struct Output {
     pub mrt_mask: u32,
     /// Bit mask of parameter locations exported (vertex).
     pub param_mask: u32,
-    /// Sampler resources used by depth-compare instructions (their Vulkan
-    /// samplers need compareEnable; others must not have it).
-    pub compare_samplers: Vec<usize>,
     pub writes_depth: bool,
     pub warnings: Vec<String>,
 }
@@ -401,16 +403,17 @@ pub(crate) struct T<'a> {
     /// byte offset each such load used (Function variables).
     pub image_tables: HashMap<usize, u32>,
     pub table_offsets: HashMap<u32, Word>,
+    /// Sampler resources, and their variables (declared at first use) for
+    /// plain and for depth-compare instructions.
+    pub sampler_res: BTreeSet<usize>,
     pub samplers: HashMap<usize, Word>,
+    pub compare_sampler_vars: HashMap<usize, Word>,
     pub sampler_ty: Word,
     pub bindings: Vec<Binding>,
     pub next_binding: u32,
     // stage interface
     pub out_pos: Option<Word>,
     pub out_params: HashMap<u32, Word>,
-    /// Sampler resources used with / without depth comparison.
-    pub compare_samplers: BTreeSet<usize>,
-    pub plain_samplers: BTreeSet<usize>,
     pub out_mrt: HashMap<u32, (Word, Word)>,
     pub out_depth: Option<Word>,
     /// Fragment inputs by location (vertex parameter): one variable per
@@ -737,6 +740,28 @@ impl<'a> T<'a> {
         let inst = rspirv::dr::Instruction::new(spirv::Op::Variable, Some(ptr_ty), Some(id), vec![Operand::StorageClass(sc)]);
         self.b.module_mut().types_global_values.push(inst);
         id
+    }
+
+    /// The variable of sampler resource `i` for instructions with (`compare`)
+    /// or without depth comparison, declared and bound at its first use.
+    pub fn sampler_var(&mut self, i: usize, compare: bool) -> R<Word> {
+        let known = if compare { self.compare_sampler_vars.get(&i) } else { self.samplers.get(&i) };
+        if let Some(&v) = known {
+            return Ok(v);
+        }
+        if !self.sampler_res.contains(&i) {
+            return Err(format!("resource {i} is not a sampler"));
+        }
+        let pt = self.b.type_pointer(None, StorageClass::UniformConstant, self.sampler_ty);
+        let v = self.global_var(pt, StorageClass::UniformConstant);
+        let bnd = self.alloc_binding(if compare { BindingKind::CompareSampler(i) } else { BindingKind::Sampler(i) });
+        self.decorate_binding(v, bnd);
+        if compare {
+            self.compare_sampler_vars.insert(i, v);
+        } else {
+            self.samplers.insert(i, v);
+        }
+        Ok(v)
     }
 
     fn alloc_binding(&mut self, kind: BindingKind) -> u32 {
@@ -1528,14 +1553,14 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         code_base_at: code_base_offset(plan),
         buffers: HashMap::default(),
         images: HashMap::default(),
+        sampler_res: BTreeSet::new(),
         samplers: HashMap::default(),
+        compare_sampler_vars: HashMap::default(),
         sampler_ty,
         bindings: Vec::new(),
         next_binding: 0,
         out_pos: None,
         out_params: HashMap::default(),
-        compare_samplers: BTreeSet::new(),
-        plain_samplers: BTreeSet::new(),
         out_mrt: HashMap::default(),
         out_depth: None,
         in_attrs: HashMap::default(),
@@ -1656,11 +1681,8 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
                 tr.images.insert(i, ImageRes { var: v, img_ty, dim, class, storage, depth });
             }
             (ResKind::Sampler, _) => {
-                let pt = tr.b.type_pointer(None, StorageClass::UniformConstant, tr.sampler_ty);
-                let v = tr.global_var(pt, StorageClass::UniformConstant);
-                let bnd = tr.alloc_binding(BindingKind::Sampler(i));
-                tr.decorate_binding(v, bnd);
-                tr.samplers.insert(i, v);
+                // Bound at first use (`sampler_var`), plain or comparing.
+                tr.sampler_res.insert(i);
             }
             (ResKind::ImageTable, Some(ResSpec::Image { dim, class, .. })) => {
                 if r.written {
@@ -1870,8 +1892,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     }
     let spirv = tr.b.module().assemble();
     let param_mask = tr.out_params.keys().filter(|&&p| p < 32).fold(0u32, |m, &p| m | 1 << p);
-    let compare_samplers = tr.compare_samplers.iter().copied().collect();
-    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, compare_samplers, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings })
+    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings })
 }
 
 /// Wave-mask mode for the shader at `addr` (diagnosis: `DS_WAVEMASK=0`

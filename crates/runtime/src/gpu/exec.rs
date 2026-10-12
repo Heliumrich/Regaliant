@@ -740,7 +740,7 @@ fn descriptor_type(k: BindingKind) -> vk::DescriptorType {
         BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Gds | BindingKind::Debug | BindingKind::Watchdog | BindingKind::LodStats => vk::DescriptorType::STORAGE_BUFFER,
         BindingKind::Image(_) | BindingKind::ImageArray(_) => vk::DescriptorType::SAMPLED_IMAGE,
         BindingKind::StorageImage(_) => vk::DescriptorType::STORAGE_IMAGE,
-        BindingKind::Sampler(_) => vk::DescriptorType::SAMPLER,
+        BindingKind::Sampler(_) | BindingKind::CompareSampler(_) => vk::DescriptorType::SAMPLER,
     }
 }
 
@@ -4175,7 +4175,7 @@ impl Exec {
                             break;
                         }
                     },
-                    (BindingKind::Sampler(i), Some(Resolved::Sampler(sm))) => match super::images::sampler_hit(*sm, p.tr.out.compare_samplers.contains(&i)) {
+                    (BindingKind::Sampler(_) | BindingKind::CompareSampler(_), Some(Resolved::Sampler(sm))) => match super::images::sampler_hit(*sm, matches!(b.kind, BindingKind::CompareSampler(_))) {
                         Some(smp) => imgs.push((b.binding, vk::DescriptorType::SAMPLER, vk::DescriptorImageInfo { sampler: smp, image_view: vk::ImageView::null(), image_layout: vk::ImageLayout::UNDEFINED })),
                         None => {
                             all = false;
@@ -4208,8 +4208,8 @@ impl Exec {
                         bound.imgs.push((b.binding, ty, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }));
                         bound.images.push(image);
                     }
-                    (BindingKind::Sampler(i), Some(Resolved::Sampler(sm))) => {
-                        let compare = p.tr.out.compare_samplers.contains(&i);
+                    (BindingKind::Sampler(_) | BindingKind::CompareSampler(_), Some(Resolved::Sampler(sm))) => {
+                        let compare = matches!(b.kind, BindingKind::CompareSampler(_));
                         let smp = im.sampler(*sm, compare)?;
                         bound.imgs.push((b.binding, vk::DescriptorType::SAMPLER, vk::DescriptorImageInfo { sampler: smp, image_view: vk::ImageView::null(), image_layout: vk::ImageLayout::UNDEFINED }));
                     }
@@ -4238,7 +4238,7 @@ impl Exec {
                         }
                         bound.img_arrays.push((b.binding, infos));
                     }
-                    (BindingKind::Image(_) | BindingKind::StorageImage(_) | BindingKind::ImageArray(_) | BindingKind::Sampler(_), _) => return Err("binding/resource mismatch".into()),
+                    (BindingKind::Image(_) | BindingKind::StorageImage(_) | BindingKind::ImageArray(_) | BindingKind::Sampler(_) | BindingKind::CompareSampler(_), _) => return Err("binding/resource mismatch".into()),
                     _ => {}
                 }
             }

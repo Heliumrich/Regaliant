@@ -1545,14 +1545,7 @@ fn sample(tr: &mut T, ins: &Inst, name: &str, image: Word, img_ty: Word, si: Opt
     if has_c && !depth && !manual_cmp && !get_lod {
         tr.warn(format!("{:#x}: depth comparison on a color {rdim:?} image (not emulated)", ins.pc));
     }
-    if !get_lod {
-        let (mine, other) = if has_c && !manual_cmp { (&mut tr.compare_samplers, &tr.plain_samplers) } else { (&mut tr.plain_samplers, &tr.compare_samplers) };
-        mine.insert(sidx);
-        if other.contains(&sidx) {
-            tr.warn(format!("{:#x}: sampler {sidx} used with and without depth comparison", ins.pc));
-        }
-    }
-    let svar = tr.samplers[&sidx];
+    let svar = tr.sampler_var(sidx, has_c && !manual_cmp && !get_lod)?;
     let sampler = e(tr.b.load(tr.sampler_ty, None, svar, None, []))?;
     let si_ty = tr.b.type_sampled_image(img_ty);
     let simg = e(tr.b.sampled_image(si_ty, None, image, sampler))?;
