@@ -476,6 +476,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         dispatcher_for_loops: super::tune::block_chain() == 2,
         reg_vars: super::tune::reg_vars(),
         lod_stats: super::tune::lod_stats() == 3,
+        early_tests: false,
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
 }
@@ -492,6 +493,8 @@ const PS_USER_DATA: u32 = 0x0C;
 const SPI_PS_INPUT_CNTL_0: u32 = 0x28644;
 const SPI_PS_INPUT_ADDR: u32 = 0x286D0;
 const SPI_PS_IN_CONTROL: u32 = 0x286D8;
+/// DB_SHADER_CONTROL (bit 12 DEPTH_BEFORE_SHADER: `Spec::early_tests`).
+const DB_SHADER_CONTROL: u32 = 0x2880C;
 const SPI_SHADER_COL_FORMAT: u32 = 0x28714;
 const CB_COLOR0_INFO: u32 = 0x28C70;
 
@@ -542,6 +545,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         dispatcher_for_loops: super::tune::block_chain() == 2,
         reg_vars: super::tune::reg_vars(),
         lod_stats: super::tune::lod_stats() == 3,
+        early_tests: ctx(DB_SHADER_CONTROL) & (1 << 12) != 0,
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
 }
@@ -662,6 +666,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         dispatcher_for_loops: super::tune::block_chain() == 2,
         reg_vars: super::tune::reg_vars(),
         lod_stats: super::tune::lod_stats() == 3,
+        early_tests: false,
     };
     prepare(addr, insts, code_hash, &user, &mut spec)
 }

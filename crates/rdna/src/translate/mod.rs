@@ -196,6 +196,15 @@ pub struct Spec {
     /// enables counting record the finest mip they sample and a count in
     /// the T#'s counter bank (`BindingKind::LodStats`, [`LOD_INFO_ENABLED`]).
     pub lod_stats: bool,
+    /// Pixel stage: the depth and stencil tests run before the shader
+    /// (DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER, D3D's [earlydepthstencil]), so
+    /// fragments that fail them do not run it and its image and buffer stores
+    /// do not happen (`EarlyFragmentTests`; not with a depth export). Without
+    /// it a Vulkan fragment shader with stores runs for every rasterized
+    /// fragment: the courtyard's decal volumes (stencil-marked boxes whose
+    /// shader rewrites the G-buffer through image stores) darkened the whole
+    /// screen rectangle of a box instead of the ground inside it.
+    pub early_tests: bool,
 }
 
 /// Entries of an image table bound as one array of sampled images
@@ -1882,6 +1891,8 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
             tr.b.execution_mode(func, ExecutionMode::OriginUpperLeft, []);
             if tr.out_depth.is_some() {
                 tr.b.execution_mode(func, ExecutionMode::DepthReplacing, []);
+            } else if spec.early_tests {
+                tr.b.execution_mode(func, ExecutionMode::EarlyFragmentTests, []);
             }
         }
         Stage::Compute => {
@@ -2446,6 +2457,7 @@ mod tests {
             dispatcher_for_loops: false,
             reg_vars: true,
             lod_stats: false,
+            early_tests: false,
         }
     }
 
@@ -2537,6 +2549,39 @@ mod tests {
         let out = translate(&code, &plan, &spec).unwrap();
         assert!(out.warnings.is_empty(), "{:?}", out.warnings);
         assert_eq!(input_locations(&out.spirv), vec![(0, false, false), (1, true, false), (2, true, false)]);
+    }
+
+    /// Execution modes (OpExecutionMode operands after the entry point) of a
+    /// SPIR-V module.
+    fn execution_modes(spirv: &[u32]) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut i = 5;
+        while i < spirv.len() {
+            let (n, op) = ((spirv[i] >> 16) as usize, spirv[i] & 0xFFFF);
+            if op == 16 && n >= 3 {
+                out.push(spirv[i + 2]);
+            }
+            i += n.max(1);
+        }
+        out
+    }
+
+    /// DEPTH_BEFORE_SHADER (`Spec::early_tests`) makes the fragment shader
+    /// declare EarlyFragmentTests (mode 9), only when asked.
+    #[test]
+    fn early_fragment_tests() {
+        // The pixel shader of shared_parameter_has_one_input (mrt0 export).
+        let words = [
+            0xc8160702, 0xc8220700, 0xc82e0701, 0xc85a0802, 0xc8280200, 0xc8290201, 0xc8260c02, 0xc8320c00, 0xf800180f, 0x160b0805, 0xbf810000,
+        ];
+        let code = crate::decode_program(&words).unwrap();
+        let plan = crate::analysis::analyze(&code, 0, 0);
+        let mut spec = ps_spec(&[(0, false), (1, true), (1, true), (2, true)]);
+        let late = translate(&code, &plan, &spec).unwrap();
+        assert!(!execution_modes(&late.spirv).contains(&9));
+        spec.early_tests = true;
+        let early = translate(&code, &plan, &spec).unwrap();
+        assert!(execution_modes(&early.spirv).contains(&9));
     }
 
     /// 16-bit instructions of the title's compute shaders (cs 0x100898d500's

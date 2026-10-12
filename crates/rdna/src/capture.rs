@@ -123,6 +123,7 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         reg_vars: true,
         // RDNA_LOD_STATS=1: with the LOD-statistics instrumentation (validation).
         lod_stats: std::env::var_os("RDNA_LOD_STATS").is_some(),
+        early_tests: false,
         stage: u.stage,
         user_sgprs: users,
         user_base,
