@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 41] = [
+    static ALL: [Tunable; 42] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -68,6 +68,7 @@ pub mod tune {
         Tunable { name: "par_balance", env: "DS_PAR_BALANCE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_inflight", env: "DS_PRE_INFLIGHT", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "idle_split", env: "DS_IDLE_SPLIT", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "push_desc", env: "DS_PUSH_DESC", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -348,6 +349,15 @@ pub mod tune {
     /// this many microseconds while the GPU has no work left (0: off).
     pub fn idle_split() -> u64 {
         get(40)
+    }
+
+    /// Pipelines created from now on take their descriptors pushed into the
+    /// command buffer (VK_KHR_push_descriptor) when their set layout fits
+    /// maxPushDescriptors, instead of a descriptor set allocated, written
+    /// and bound per command; pipelines are cached per setting (an in-run
+    /// A/B compiles both).
+    pub fn push_desc() -> bool {
+        get(41) != 0
     }
 
     /// Command-processor waits for GPU work still to be traced (`tune

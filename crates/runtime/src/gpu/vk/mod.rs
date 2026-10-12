@@ -21,6 +21,8 @@ pub struct Ctx {
     pub win32_i: ash::khr::win32_surface::Instance,
     pub swapchain_d: ash::khr::swapchain::Device,
     pub push_desc: ash::khr::push_descriptor::Device,
+    /// VkPhysicalDevicePushDescriptorPropertiesKHR::maxPushDescriptors.
+    pub max_push: u32,
     /// VK_EXT_external_memory_host (zero-copy access to guest memory).
     pub ext_host: Option<ash::ext::external_memory_host::Device>,
     /// VK_NV_device_diagnostic_checkpoints (DS_GPU_CHECKPOINTS=1): markers
@@ -339,11 +341,18 @@ fn init_inner() -> Result<(), String> {
             crate::info!("Vulkan depth-comparison sampling support: {}", have.join(", "));
         }
         let mem_props = instance.get_physical_device_memory_properties(pdev);
+        let max_push = {
+            let mut pd = vk::PhysicalDevicePushDescriptorPropertiesKHR::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut pd);
+            instance.get_physical_device_properties2(pdev, &mut p2);
+            pd.max_push_descriptors
+        };
         let ctx = Ctx {
             surface_i: ash::khr::surface::Instance::new(&entry, &instance),
             win32_i: ash::khr::win32_surface::Instance::new(&entry, &instance),
             swapchain_d: ash::khr::swapchain::Device::new(&instance, &device),
             push_desc: ash::khr::push_descriptor::Device::new(&instance, &device),
+            max_push,
             ext_host: host_import.then(|| ash::ext::external_memory_host::Device::new(&instance, &device)),
             checkpoints: has_ckpt.then(|| ash::nv::device_diagnostic_checkpoints::Device::new(&instance, &device)),
             exec_props: has_stats.then(|| ash::khr::pipeline_executable_properties::Device::new(&instance, &device)),
@@ -371,12 +380,13 @@ fn init_inner() -> Result<(), String> {
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
             ctx.instance.get_physical_device_properties2(pdev, &mut p2);
             crate::info!(
-                "Vulkan limits: maxStorageBufferRange {:#x}, minStorageBufferOffsetAlignment {}, external_memory_host {} (import alignment {:#x}), buffer_device_address {}",
+                "Vulkan limits: maxStorageBufferRange {:#x}, minStorageBufferOffsetAlignment {}, external_memory_host {} (import alignment {:#x}), buffer_device_address {}, maxPushDescriptors {}",
                 ctx.limits.max_storage_buffer_range,
                 ctx.limits.min_storage_buffer_offset_alignment,
                 has(ash::ext::external_memory_host::NAME),
                 host.min_imported_host_pointer_alignment,
-                has(ash::khr::buffer_device_address::NAME)
+                has(ash::khr::buffer_device_address::NAME),
+                ctx.max_push
             );
         }
         CTX.set(ctx).ok();

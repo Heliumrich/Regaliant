@@ -76,6 +76,10 @@ pub const SYNC_DRAW_INDICES: usize = 5;
 /// the time their creation took (ns; cache hits are quick).
 pub static PIPES_CREATED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 pub static PIPES_NS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Of those, pipelines whose descriptors are pushed (`tune::push_desc`).
+pub static PIPES_PUSH: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Commands recorded with pushed descriptors, with a descriptor set.
+pub static PUSHED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Waits for a stage's shader reads (GPU work was writing what the
 /// preparation read): [draws whose words were the same after the wait,
@@ -99,7 +103,7 @@ fn sync_why_status() -> String {
         SPEC_STATS[2].load(Ordering::Relaxed),
         NO_SPEC.lock().as_ref().map_or(0, |n| n.len())
     ) + &format!(
-        "    CP read waits: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices; pipelines created: {} compute ({} ms), {} graphics ({} ms)\n",
+        "    CP read waits: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices; pipelines created: {} compute ({} ms, {} with pushed descriptors), {} graphics ({} ms, {} pushed); commands with pushed descriptors {}, with sets {}\n",
         n[0],
         n[1],
         n[2],
@@ -108,8 +112,12 @@ fn sync_why_status() -> String {
         n[5],
         PIPES_CREATED[0].load(Ordering::Relaxed),
         PIPES_NS[0].load(Ordering::Relaxed) / 1_000_000,
+        PIPES_PUSH[0].load(Ordering::Relaxed),
         PIPES_CREATED[1].load(Ordering::Relaxed),
-        PIPES_NS[1].load(Ordering::Relaxed) / 1_000_000
+        PIPES_NS[1].load(Ordering::Relaxed) / 1_000_000,
+        PIPES_PUSH[1].load(Ordering::Relaxed),
+        PUSHED[0].load(Ordering::Relaxed),
+        PUSHED[1].load(Ordering::Relaxed)
     )
 }
 
@@ -233,10 +241,39 @@ fn reap_spans() {
     GRAVEYARD_LEN.store(g.len() as u64, Ordering::Release);
 }
 
+#[derive(Clone, Copy)]
 struct Pipe {
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
     set_layout: vk::DescriptorSetLayout,
+    /// The set layout is a push descriptor layout (`push_layout`): commands
+    /// push their descriptors instead of allocating, writing and binding a
+    /// set.
+    push: bool,
+}
+
+/// Whether a set layout with these bindings is made a push descriptor
+/// layout (`tune::push_desc`, all its descriptors within the device's
+/// maxPushDescriptors; image tables alone are 64), and its create flags.
+fn push_layout(bindings: &[vk::DescriptorSetLayoutBinding], push_mode: bool) -> (bool, vk::DescriptorSetLayoutCreateFlags) {
+    let n: u32 = bindings.iter().map(|b| b.descriptor_count).sum();
+    if push_mode && n <= ctx().max_push {
+        (true, vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
+    } else {
+        (false, vk::DescriptorSetLayoutCreateFlags::empty())
+    }
+}
+
+/// Whether a pipeline of these stages gets a push descriptor layout: the
+/// switch on and all their descriptors within maxPushDescriptors.
+fn push_fits(stages: &[&Prepared]) -> bool {
+    super::tune::push_desc() && stages.iter().flat_map(|p| p.tr.out.bindings.iter()).map(|b| binding_count(b.kind)).sum::<u32>() <= ctx().max_push
+}
+
+/// Pipelines with push descriptor layouts are cached under keys of their
+/// own (others are the same pipeline in either setting).
+fn push_key(key: u64, push: bool) -> u64 {
+    if push { key ^ 0x9E37_79B9_7F4A_7C15 } else { key }
 }
 
 /// Buffers every queue binds, created once.
@@ -558,15 +595,19 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
 
 /// The compute pipeline of a prepared shader (created on first use, outside
 /// the map's lock; a pipeline another queue created meanwhile wins).
-fn compute_pipe(p: &Prepared) -> Result<(vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout), String> {
-    let key = p.tr.key;
+fn compute_pipe(p: &Prepared) -> Result<Pipe, String> {
+    let push_mode = push_fits(&[p]);
+    let key = push_key(p.tr.key, push_mode);
     if let Some(x) = PIPES.lock().as_ref().and_then(|m| m.get(&key)) {
-        return Ok((x.pipeline, x.layout, x.set_layout));
+        return Ok(*x);
     }
     let t0 = std::time::Instant::now();
-    let pipe = compute_pipeline(&p.tr.out)?;
+    let pipe = compute_pipeline(&p.tr.out, push_mode)?;
     PIPES_CREATED[0].fetch_add(1, Ordering::Relaxed);
     PIPES_NS[0].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if pipe.push {
+        PIPES_PUSH[0].fetch_add(1, Ordering::Relaxed);
+    }
     super::pstats::report(pipe.pipeline, &format!("cs {:#x}", p.addr));
     let ms = t0.elapsed().as_millis();
     if ms >= 200 {
@@ -576,17 +617,17 @@ fn compute_pipe(p: &Prepared) -> Result<(vk::Pipeline, vk::PipelineLayout, vk::D
 }
 
 /// Graphics pipeline cached under a state hash, if any.
-fn gfx_pipe(hkey: u64) -> Option<(vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout)> {
-    GFX_PIPES.lock().as_ref().and_then(|m| m.get(&hkey)).map(|x| (x.pipeline, x.layout, x.set_layout))
+fn gfx_pipe(hkey: u64) -> Option<Pipe> {
+    GFX_PIPES.lock().as_ref().and_then(|m| m.get(&hkey)).copied()
 }
 
-fn keep_gfx_pipe(hkey: u64, pipe: Pipe) -> (vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout) {
+fn keep_gfx_pipe(hkey: u64, pipe: Pipe) -> Pipe {
     keep_pipe(&GFX_PIPES, hkey, pipe)
 }
 
 /// Stores a newly created pipeline unless another queue stored one under
 /// the same key meanwhile (then the new one is destroyed unused).
-fn keep_pipe(map: &Mutex<Option<HashMap<u64, Pipe>>>, key: u64, pipe: Pipe) -> (vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout) {
+fn keep_pipe(map: &Mutex<Option<HashMap<u64, Pipe>>>, key: u64, pipe: Pipe) -> Pipe {
     let mut g = map.lock();
     let m = g.get_or_insert_with(HashMap::new);
     if let Some(x) = m.get(&key) {
@@ -596,15 +637,15 @@ fn keep_pipe(map: &Mutex<Option<HashMap<u64, Pipe>>>, key: u64, pipe: Pipe) -> (
             d.destroy_pipeline_layout(pipe.layout, None);
             d.destroy_descriptor_set_layout(pipe.set_layout, None);
         }
-        return (x.pipeline, x.layout, x.set_layout);
+        return *x;
     }
-    let r = (pipe.pipeline, pipe.layout, pipe.set_layout);
     m.insert(key, pipe);
-    r
+    pipe
 }
 
-/// Creates a compute pipeline (and its layouts) for a translated shader.
-fn compute_pipeline(out: &rdna::translate::Output) -> Result<Pipe, String> {
+/// Creates a compute pipeline (and its layouts) for a translated shader
+/// (`push_mode`: a push descriptor layout if it fits, `push_layout`).
+fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool) -> Result<Pipe, String> {
     let c = ctx();
     {
         unsafe {
@@ -619,7 +660,8 @@ fn compute_pipeline(out: &rdna::translate::Output) -> Result<Pipe, String> {
                         .stage_flags(vk::ShaderStageFlags::COMPUTE)
                 })
                 .collect();
-            let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("set layout: {e}"))?;
+            let (push, flags) = push_layout(&bindings, push_mode);
+            let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().flags(flags).bindings(&bindings), None).map_err(|e| format!("set layout: {e}"))?;
             let layouts = [set_layout];
             let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None).map_err(|e| format!("pipeline layout: {e}"))?;
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&out.spirv), None).map_err(|e| format!("shader module: {e}"))?;
@@ -628,7 +670,7 @@ fn compute_pipeline(out: &rdna::translate::Output) -> Result<Pipe, String> {
             let pipeline = c.device.create_compute_pipelines(super::pcache::get(), &[ci], None).map_err(|(_, e)| format!("compute pipeline: {e}"));
             c.device.destroy_shader_module(module, None);
             super::pcache::created();
-            Ok(Pipe { pipeline: pipeline?[0], layout, set_layout })
+            Ok(Pipe { pipeline: pipeline?[0], layout, set_layout, push })
         }
     }
 }
@@ -676,7 +718,8 @@ pub fn pipeline_test(capture: &str) -> i32 {
             }
         };
         let t0 = std::time::Instant::now();
-        let p = match compute_pipeline(out) {
+        // Sets of its own pool (no pushed descriptors).
+        let p = match compute_pipeline(out, false) {
             Ok(p) => p,
             Err(e) => {
                 failed += 1;
@@ -753,6 +796,42 @@ fn descriptor_type(k: BindingKind) -> vk::DescriptorType {
 /// Descriptors in a binding (image tables are arrays).
 fn binding_count(k: BindingKind) -> u32 {
     if matches!(k, BindingKind::ImageArray(_)) { rdna::translate::IMAGE_TABLE_LEN } else { 1 }
+}
+
+/// The descriptor writes of a command's stages (`set`: ignored when pushed).
+fn descriptor_writes(set: vk::DescriptorSet, bounds: &[Bound]) -> Vec<vk::WriteDescriptorSet<'_>> {
+    let mut writes: Vec<vk::WriteDescriptorSet> = Vec::with_capacity(bounds.iter().map(|b| b.bufs.len() + b.imgs.len() + b.img_arrays.len()).sum());
+    for b in bounds {
+        for (binding, info) in &b.bufs {
+            writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)));
+        }
+        for (binding, ty, info) in &b.imgs {
+            writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(*ty).image_info(std::slice::from_ref(info)));
+        }
+        for (binding, infos) in &b.img_arrays {
+            writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(vk::DescriptorType::SAMPLED_IMAGE).image_info(infos));
+        }
+    }
+    writes
+}
+
+/// Records a command's descriptors: pushed into the command buffer (push
+/// descriptor layouts, `set` None) or its written set bound.
+fn bind_descriptors(cmd: vk::CommandBuffer, at: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: Option<vk::DescriptorSet>, bounds: &[Bound]) {
+    let c = ctx();
+    match set {
+        Some(set) => {
+            PUSHED[1].fetch_add(1, Ordering::Relaxed);
+            unsafe { c.device.cmd_bind_descriptor_sets(cmd, at, layout, 0, &[set], &[]) };
+        }
+        None => {
+            PUSHED[0].fetch_add(1, Ordering::Relaxed);
+            let writes = descriptor_writes(vk::DescriptorSet::null(), bounds);
+            if !writes.is_empty() {
+                unsafe { c.push_desc.cmd_push_descriptor_set(cmd, at, layout, 0, &writes) };
+            }
+        }
+    }
 }
 
 /// Dispatches are ordered by the title's own synchronization (partial
@@ -3857,15 +3936,19 @@ impl Exec {
 
     /// Makes room in the recording slot for the SGPR data and descriptors of
     /// `stages` (submits the batch and starts the next one otherwise).
-    fn reserve(&mut self, stages: &[&Prepared]) {
+    /// `push`: the command pushes its descriptors (no set from the pool).
+    fn reserve(&mut self, stages: &[&Prepared], push: bool) {
         self.begin();
         if !self.recording {
             return;
         }
-        let mut need = [stages.len() as u32, 0, 0, 0, 0];
+        let mut need = [if push { 0 } else { stages.len() as u32 }, 0, 0, 0, 0];
         let mut ring = 0u64;
         for p in stages {
             ring += 4 * p.sgpr_data.len() as u64 + self.ring_align;
+            if push {
+                continue;
+            }
             for b in &p.tr.out.bindings {
                 let ty = descriptor_type(b.kind);
                 if let Some(k) = POOL_TYPES.iter().position(|&t| t == ty) {
@@ -4340,18 +4423,7 @@ impl Exec {
     }
 
     fn write_set(&self, set: vk::DescriptorSet, bounds: &[Bound]) {
-        let mut writes: Vec<vk::WriteDescriptorSet> = Vec::with_capacity(bounds.iter().map(|b| b.bufs.len() + b.imgs.len() + b.img_arrays.len()).sum());
-        for b in bounds {
-            for (binding, info) in &b.bufs {
-                writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)));
-            }
-            for (binding, ty, info) in &b.imgs {
-                writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(*ty).image_info(std::slice::from_ref(info)));
-            }
-            for (binding, infos) in &b.img_arrays {
-                writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(vk::DescriptorType::SAMPLED_IMAGE).image_info(infos));
-            }
-        }
+        let writes = descriptor_writes(set, bounds);
         unsafe { ctx().device.update_descriptor_sets(&writes, &[]) };
     }
 
@@ -4483,10 +4555,10 @@ impl Exec {
             return Err(STOPPED.into());
         }
         lap.mark(3);
-        let (pipeline, layout, set_layout) = compute_pipe(&p)?;
+        let Pipe { pipeline, layout, set_layout, push } = compute_pipe(&p)?;
         let t_pipe = since(t0);
         lap.mark(4);
-        self.reserve(&[&p]);
+        self.reserve(&[&p], push);
         if self.stopped {
             return Err(STOPPED.into());
         }
@@ -4505,7 +4577,7 @@ impl Exec {
         }
         lap.mark(7);
         let t_bind = since(t0);
-        let set = self.alloc_set(set_layout)?;
+        let set = if push { None } else { Some(self.alloc_set(set_layout)?) };
         lap.mark(8);
         let writes_here = std::mem::take(&mut bound.writes);
         let sized_here = std::mem::take(&mut bound.sized_writes);
@@ -4517,7 +4589,9 @@ impl Exec {
             }
         });
         lap.mark(9);
-        self.write_set(set, std::slice::from_ref(&bound));
+        if let Some(set) = set {
+            self.write_set(set, std::slice::from_ref(&bound));
+        }
         lap.mark(10);
         self.end_rendering();
         let c = ctx();
@@ -4583,7 +4657,7 @@ impl Exec {
         unsafe {
             let cmd = self.cmd();
             c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-            c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            bind_descriptors(cmd, vk::PipelineBindPoint::COMPUTE, layout, set, std::slice::from_ref(&bound));
             if let Some((buffer, offset)) = args {
                 // Earlier work of this batch wrote the arguments.
                 global_barrier(cmd);

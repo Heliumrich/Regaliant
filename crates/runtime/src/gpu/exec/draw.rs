@@ -285,8 +285,9 @@ fn set_layout_bindings(stages: &[(&Prepared, vk::ShaderStageFlags)]) -> Vec<vk::
     v
 }
 
-/// Creates a graphics pipeline for dynamic rendering.
-fn graphics_pipeline(key: &GfxKey, vs: &Prepared, ps: Option<&Prepared>) -> Result<Pipe, String> {
+/// Creates a graphics pipeline for dynamic rendering (`push_mode`: a push
+/// descriptor layout if it fits, `push_layout`).
+fn graphics_pipeline(key: &GfxKey, vs: &Prepared, ps: Option<&Prepared>, push_mode: bool) -> Result<Pipe, String> {
     let c = ctx();
     unsafe {
         let mut stages_p = vec![(vs, vk::ShaderStageFlags::VERTEX)];
@@ -294,7 +295,8 @@ fn graphics_pipeline(key: &GfxKey, vs: &Prepared, ps: Option<&Prepared>) -> Resu
             stages_p.push((p, vk::ShaderStageFlags::FRAGMENT));
         }
         let bindings = set_layout_bindings(&stages_p);
-        let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("set layout: {e}"))?;
+        let (push, flags) = super::push_layout(&bindings, push_mode);
+        let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().flags(flags).bindings(&bindings), None).map_err(|e| format!("set layout: {e}"))?;
         let layouts = [set_layout];
         let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None).map_err(|e| format!("pipeline layout: {e}"))?;
         let module = |code: &[u32]| c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None).map_err(|e| format!("shader module: {e}"));
@@ -386,7 +388,7 @@ fn graphics_pipeline(key: &GfxKey, vs: &Prepared, ps: Option<&Prepared>) -> Resu
         }
         let pipeline = r.map_err(|(_, e)| format!("graphics pipeline: {e}"))?[0];
         crate::gpu::pstats::report(pipeline, &format!("vs {:#x} ps {:#x}", vs.addr, ps.map_or(0, |p| p.addr)));
-        Ok(Pipe { pipeline, layout, set_layout })
+        Ok(Pipe { pipeline, layout, set_layout, push })
     }
 }
 
@@ -673,19 +675,26 @@ impl Exec {
             topology_class: class,
             depth_clamp,
         };
+        let push_mode = match &ps {
+            Some(p) => super::push_fits(&[&vs, p]),
+            None => super::push_fits(&[&vs]),
+        };
         let hkey = {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             key.hash(&mut h);
-            h.finish()
+            super::push_key(h.finish(), push_mode)
         };
         let cached = gfx_pipe(hkey);
-        let (pipeline, layout, set_layout) = match cached {
+        let Pipe { pipeline, layout, set_layout, push } = match cached {
             Some(x) => x,
             None => {
                 let t0 = std::time::Instant::now();
-                let p = graphics_pipeline(&key, &vs, ps.as_ref())?;
+                let p = graphics_pipeline(&key, &vs, ps.as_ref(), push_mode)?;
                 super::PIPES_CREATED[1].fetch_add(1, Ordering::Relaxed);
                 super::PIPES_NS[1].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                if p.push {
+                    super::PIPES_PUSH[1].fetch_add(1, Ordering::Relaxed);
+                }
                 let ms = t0.elapsed().as_millis();
                 if ms >= 200 {
                     crate::info!("gpu: graphics pipeline for vs {:#x} ps {ps_addr:#x} took {ms} ms", vs.addr);
@@ -724,7 +733,7 @@ impl Exec {
         if let Some(p) = ps.as_mut() {
             stages.push(p);
         }
-        self.reserve(&stages.iter().map(|p| &**p).collect::<Vec<_>>());
+        self.reserve(&stages.iter().map(|p| &**p).collect::<Vec<_>>(), push);
         if self.stopped {
             return Err(super::STOPPED.into());
         }
@@ -761,9 +770,11 @@ impl Exec {
             let all: Vec<_> = bounds.iter().flat_map(|b| b.placements.iter().copied()).collect();
             super::note_placements(super::DRAW_KEY | if ps_addr != 0 { ps_addr } else { stages[0].addr }, [0; 3], false, &all);
         }
-        let set = self.alloc_set(set_layout)?;
+        let set = if push { None } else { Some(self.alloc_set(set_layout)?) };
         lap.mark(12);
-        self.write_set(set, &bounds);
+        if let Some(set) = set {
+            self.write_set(set, &bounds);
+        }
         lap.mark(13);
         let t_bind = since(t0);
         // Rendering instance: reuse it while the attachments stay the same
@@ -796,7 +807,7 @@ impl Exec {
                 c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 dc.pipeline = pipeline;
             }
-            c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, layout, 0, &[set], &[]);
+            super::bind_descriptors(cmd, vk::PipelineBindPoint::GRAPHICS, layout, set, &bounds);
             let vpw = [vp.x.to_bits(), vp.y.to_bits(), vp.width.to_bits(), vp.height.to_bits(), vp.min_depth.to_bits(), vp.max_depth.to_bits()];
             if dc.viewport != Some(vpw) {
                 c.device.cmd_set_viewport(cmd, 0, &[vp]);
