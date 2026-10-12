@@ -40,7 +40,7 @@ pub mod tune {
         Tunable { name: "block_chain", env: "DS_BLOCK_CHAIN", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "gpu_indirect", env: "DS_GPU_INDIRECT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy_wait_submit", env: "DS_LAZY_WAIT_SUBMIT", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "gpu_cp_writes", env: "DS_GPU_CP_WRITES", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "gpu_cp_writes", env: "DS_GPU_CP_WRITES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "slots", env: "DS_GPU_SLOTS", default: 4, value: AtomicU64::new(UNSET) },
         Tunable { name: "lod_stats", env: "DS_LOD_STATS", default: 3, value: AtomicU64::new(UNSET) },
         Tunable { name: "cmp_emulate", env: "DS_CMP_EMULATE", default: 1, value: AtomicU64::new(UNSET) },
@@ -184,13 +184,16 @@ pub mod tune {
         get(12) != 0
     }
 
-    /// Experimental (off): CP memory writes that follow earlier GPU work
-    /// (WRITE_DATA after a sync event, RELEASE_MEM values) are performed by the
-    /// GPU in order with it instead of by the CPU after the batch completed
-    /// (`Exec::gpu_cp_write`). Their promises are registered only when the
-    /// batch is submitted, so waits pass later (and on the latest value only):
-    /// in the passage it left ~80% of the batch splits (writes behind earlier
-    /// CPU-side effects take the CPU path) and caused more waits over 3 s.
+    /// On by default since 2026-10-12: CP memory writes that follow earlier GPU work or
+    /// earlier deferred CP writes (WRITE_DATA after a sync event, RELEASE_MEM
+    /// values, end-of-pipe timestamps) are performed by the GPU in order with
+    /// it instead of by the CPU after the batch completed
+    /// (`Exec::gpu_cp_write`, `Exec::gpu_timestamp`). Their promises
+    /// are registered only when the batch is submitted, so waits pass later
+    /// (and on the latest value only). A batch holding such writes is
+    /// submitted only once the CPU performed the queue's earlier deferred
+    /// writes (they keep their order); until 2026-10-12 writes behind those
+    /// took the CPU path, ~90% of them in the courtyard (run 20261012-040642).
     pub fn gpu_cp_writes() -> bool {
         get(13) != 0
     }

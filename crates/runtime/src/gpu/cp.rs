@@ -34,6 +34,11 @@ pub static SYNC_BY_OPCODE: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256]
 /// CP effects deferred until earlier GPU work completed, by opcode and why:
 /// [end of pipe, after a sync event, behind an earlier deferred effect].
 pub static DEFERRED_BY_OPCODE: [[AtomicU64; 3]; 256] = [const { [const { AtomicU64::new(0) }; 3] }; 256];
+/// RELEASE_MEM packets by DATA_SEL and INT_SEL (8 x 8).
+pub static RELEASE_KINDS: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+/// Waits passed on a value the waiting queue's own recording batch writes
+/// on the GPU (`tune gpu_cp_writes`).
+pub static OPEN_PROMISED: AtomicU64 = AtomicU64::new(0);
 
 /// Most frequent synchronizing opcodes (diagnostics).
 pub fn sync_summary() -> String {
@@ -51,7 +56,8 @@ pub fn sync_summary() -> String {
         .collect();
     d.sort_by(|a, b| b.cmp(a));
     let deferred = d.iter().take(6).map(|(_, op, x)| format!("{op:#x}: {} end of pipe / {} after sync / {} behind deferred", x[0], x[1], x[2])).collect::<Vec<_>>().join(", ");
-    format!("{waits}; deferred CP effects {deferred}")
+    let kinds: Vec<String> = RELEASE_KINDS.iter().enumerate().filter(|(_, c)| c.load(Ordering::Relaxed) > 0).map(|(i, c)| format!("data {} int {}: {}", i / 8, i % 8, c.load(Ordering::Relaxed))).collect();
+    format!("{waits}; deferred CP effects {deferred}; RELEASE_MEM by kind {}; waits passed on the own batch's GPU writes {}", kinds.join(", "), OPEN_PROMISED.load(Ordering::Relaxed))
 }
 
 /// Register file of one queue.
@@ -449,13 +455,14 @@ static LABEL_LOG: parking_lot::Mutex<std::collections::VecDeque<LabelEvent>> = p
 static WAITED: parking_lot::Mutex<Option<HashSet<u64>>> = parking_lot::Mutex::new(None);
 
 /// Label values deferred CP writes will store: address -> (batch sequence,
-/// value, bytes). A WAIT_REG_MEM that a promised value satisfies passes at
+/// value, bytes, whether the CPU stores it after the batch completed rather
+/// than the GPU within it). A WAIT_REG_MEM that a promised value satisfies passes at
 /// once and orders its queue after that batch (`Exec::depend_on`): its later
 /// GPU work follows the batch on the device queue, its CP writes wait for
 /// it, its CP reads wait for unfinished writers (`Exec::sync_for_reads`), so
 /// the command processors record ahead of the GPU instead of idling until
 /// each batch completes. `DS_PROMISES=0` turns this off.
-static PROMISES: parking_lot::Mutex<Option<HashMap<u64, (u64, u64, u8)>>> = parking_lot::Mutex::new(None);
+static PROMISES: parking_lot::Mutex<Option<HashMap<u64, (u64, u64, u8, bool)>>> = parking_lot::Mutex::new(None);
 /// Waits passed on a promise (diagnostics).
 pub static PROMISED: AtomicU64 = AtomicU64::new(0);
 /// Multi-draw packets (DRAW_INDIRECT_MULTI / DRAW_INDEX_INDIRECT_MULTI), the
@@ -469,7 +476,7 @@ fn promises_on() -> bool {
     super::tune::promises()
 }
 
-pub(super) fn promise(seq: u64, addr: u64, value: u64, bytes: u8) {
+pub(super) fn promise(seq: u64, addr: u64, value: u64, bytes: u8, by_cpu: bool) {
     if !promises_on() {
         return;
     }
@@ -479,18 +486,19 @@ pub(super) fn promise(seq: u64, addr: u64, value: u64, bytes: u8) {
         let done = super::exec::completed_seq();
         m.retain(|_, p| p.0 > done);
     }
-    m.insert(addr, (seq, value, bytes));
+    m.insert(addr, (seq, value, bytes, by_cpu));
 }
 
-/// The batch whose promised write to `addr` satisfies the comparison.
-fn promised(addr: u64, wide: bool, func: u32, mask: u64, reference: u64) -> Option<u64> {
+/// The batch whose promised write to `addr` satisfies the comparison, and
+/// whether the CPU performs that write.
+fn promised(addr: u64, wide: bool, func: u32, mask: u64, reference: u64) -> Option<(u64, bool)> {
     let g = PROMISES.lock();
-    let &(seq, value, bytes) = g.as_ref()?.get(&addr)?;
+    let &(seq, value, bytes, by_cpu) = g.as_ref()?.get(&addr)?;
     if seq <= super::exec::completed_seq() || (wide && bytes < 8) {
         return None;
     }
     let v = if wide { value } else { value & 0xFFFF_FFFF };
-    compare(func, v & mask, reference & mask).then_some(seq)
+    compare(func, v & mask, reference & mask).then_some((seq, by_cpu))
 }
 const LABEL_LOG_CAP: usize = 1 << 15;
 
@@ -1068,7 +1076,7 @@ impl Cp {
         // This queue's later work and CP effects follow the chunk's batches
         // (a label written after the run must wait for them).
         if let (Some(seq), Some(e)) = (last, self.exec.as_mut()) {
-            e.depend_on(seq);
+            e.depend_on(seq, false);
         }
         self.set_chunk_state(&st);
         match stopped {
@@ -1358,7 +1366,16 @@ impl Cp {
         }
         let needs_prior = end_of_pipe || self.fence_pending;
         let Some(e) = self.exec.as_mut() else { return false };
-        if !(e.busy() && needs_prior) || e.deferred_pending() || !e.gpu_cp_write(a, data, label) {
+        // Nothing outstanding to follow: the CPU performs the write now.
+        let refused = if !(e.busy() && (needs_prior || e.deferred_pending())) {
+            Some(0)
+        } else if !e.gpu_cp_write(a, data, label) {
+            Some(2)
+        } else {
+            None
+        };
+        if let Some(k) = refused {
+            super::exec::GPU_CP_REFUSED[k].fetch_add(1, Ordering::Relaxed);
             return false;
         }
         self.fence_pending = false;
@@ -2239,7 +2256,7 @@ impl Cp {
                     }),
                 );
                 if let (Some(s), Some((v, bytes))) = (seq, label) {
-                    promise(s, a, v, bytes);
+                    promise(s, a, v, bytes, true);
                 }
             }
             0 => {
@@ -2426,6 +2443,7 @@ impl Cp {
         let data_cntl = p(1);
         let int_sel = (data_cntl >> 24) & 7;
         let data_sel = (data_cntl >> 29) & 7;
+        RELEASE_KINDS[(data_sel * 8 + int_sel) as usize].fetch_add(1, Ordering::Relaxed);
         let a = addr64(p(2) & !3, p(3));
         let data = addr64(p(4), p(5));
         let ctx = p(6);
@@ -2442,6 +2460,19 @@ impl Cp {
             let (vals, label) = if data_sel == 1 { (vec![data as u32], (data & 0xFFFF_FFFF, 4u8)) } else { (vec![data as u32, (data >> 32) as u32], (data, 8u8)) };
             if self.gpu_cp_write(a, &vals, Some(label), true) {
                 return;
+            }
+        }
+        // Neither a write nor an interrupt: nothing the CPU would do after the
+        // GPU work (deferring it ended the batch for an empty action).
+        if !write && (int_sel == 0 || int_sel == 3) {
+            return;
+        }
+        if matches!(data_sel, 3 | 4) && (int_sel == 0 || int_sel == 3) && super::tune::gpu_cp_writes() {
+            if let Some(e) = self.exec.as_mut() {
+                if e.busy() && e.gpu_timestamp(a) {
+                    self.fence_pending = false;
+                    return;
+                }
             }
         }
         let seq = self.effect(
@@ -2464,8 +2495,8 @@ impl Cp {
         );
         if let Some(s) = seq {
             match data_sel {
-                1 => promise(s, a, data & 0xFFFF_FFFF, 4),
-                2 => promise(s, a, data, 8),
+                1 => promise(s, a, data & 0xFFFF_FFFF, 4, true),
+                2 => promise(s, a, data, 8, true),
                 _ => {}
             }
         }
@@ -2493,9 +2524,9 @@ impl Cp {
             label_event(&self.name, b'I', a, v0, reference, at);
             return Flow::Next;
         }
-        if let Some(seq) = promised(a, wide, func, mask, reference) {
+        if let Some((seq, by_cpu)) = promised(a, wide, func, mask, reference) {
             if let Some(e) = self.exec.as_mut() {
-                e.depend_on(seq);
+                e.depend_on(seq, by_cpu);
                 PROMISED.fetch_add(1, Ordering::Relaxed);
                 label_event(&self.name, b'P', a, v0, reference, at);
                 return Flow::Next;
@@ -2511,6 +2542,16 @@ impl Cp {
             MISSED.fetch_add(1, Ordering::Relaxed);
             label_event(&self.name, b'M', a, v0, reference, at);
             return Flow::Next;
+        }
+        // A value this queue's recording batch writes on the GPU: its later
+        // work follows that write in the batch (`tune gpu_cp_writes`).
+        if let Some((v, bytes)) = self.exec.as_ref().and_then(|e| e.open_promise(a)) {
+            let v = if wide { v } else { v & 0xFFFF_FFFF };
+            if !(wide && bytes < 8) && compare(func, v & mask, reference & mask) {
+                OPEN_PROMISED.fetch_add(1, Ordering::Relaxed);
+                label_event(&self.name, b'P', a, v0, reference, at);
+                return Flow::Next;
+            }
         }
         // An equality wait on a counter that has moved past the value (its
         // command buffer came after the write: run 20261011-082829, acb0x48
@@ -2563,8 +2604,8 @@ impl Cp {
         // Passed on a promise (its batch may have completed meanwhile).
         let mut kind = if latched { b'L' } else { b'E' };
         if !in_memory && !latched {
-            if let (Some(seq), Some(e)) = (promised(a, wide, func, mask, reference), self.exec.as_mut()) {
-                e.depend_on(seq);
+            if let (Some((seq, by_cpu)), Some(e)) = (promised(a, wide, func, mask, reference), self.exec.as_mut()) {
+                e.depend_on(seq, by_cpu);
                 PROMISED.fetch_add(1, Ordering::Relaxed);
                 kind = b'P';
             }

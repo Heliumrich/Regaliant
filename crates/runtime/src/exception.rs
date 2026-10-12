@@ -5,7 +5,7 @@
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS};
+use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, IMAGE_RUNTIME_FUNCTION_ENTRY};
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 
@@ -43,6 +43,9 @@ pub fn sample_frames(host_tid: u32, depth: usize) -> Option<(Vec<u64>, Vec<u64>)
     let mut guest = [0u64; 32];
     let (mut nh, mut ng) = (0usize, 0usize);
     let mut ok = false;
+    if UNWIND_MISSED.load(std::sync::atomic::Ordering::Relaxed) {
+        refresh_unwind_tables();
+    }
     unsafe {
         let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, host_tid);
         if h.is_null() {
@@ -52,7 +55,7 @@ pub fn sample_frames(host_tid: u32, depth: usize) -> Option<(Vec<u64>, Vec<u64>)
             let mut c: AlignedContext = std::mem::zeroed();
             c.0.ContextFlags = CONTEXT_FULL_AMD64;
             if GetThreadContext(h, &mut c.0) != 0 {
-                (nh, ng) = unwind(&mut c, &mut host, &mut guest[..depth.min(32)]);
+                (nh, ng) = unwind_with(&mut c, &mut host, &mut guest[..depth.min(32)], snapshot_function);
                 ok = true;
             }
             ResumeThread(h);
@@ -108,6 +111,92 @@ fn host_module(addr: u64) -> String {
 #[repr(C, align(16))]
 struct AlignedContext(CONTEXT);
 
+/// A loaded module's unwind table: image [base, end) and its
+/// RUNTIME_FUNCTION array (exception directory).
+#[derive(Clone, Copy)]
+struct UnwindTable {
+    base: u64,
+    end: u64,
+    table: u64,
+    count: u32,
+}
+
+/// The loaded modules' unwind tables, taken while no thread is suspended
+/// (`refresh_unwind_tables`). Sampling a suspended thread cannot use
+/// RtlLookupFunctionEntry: the loader holds its function-table lock while it
+/// maps a module, so a thread sampled inside LoadLibrary left the sampler
+/// blocked and the thread suspended (Vulkan initialization stuck "loading
+/// the Vulkan loader" / "creating the instance" in profiled runs
+/// 20261012-043754 and -051931).
+static UNWIND_TABLES: parking_lot::RwLock<Vec<UnwindTable>> = parking_lot::RwLock::new(Vec::new());
+/// A lookup found no module (one loaded since): refresh before the next
+/// suspension.
+static UNWIND_MISSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+fn refresh_unwind_tables() {
+    use windows_sys::Win32::System::ProcessStatus::EnumProcessModules;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut mods = vec![std::ptr::null_mut(); 2048];
+    let mut needed = 0u32;
+    let mut v = Vec::new();
+    unsafe {
+        if EnumProcessModules(GetCurrentProcess(), mods.as_mut_ptr(), (mods.len() * 8) as u32, &mut needed) == 0 {
+            return;
+        }
+        for &m in &mods[..(needed as usize / 8).min(mods.len())] {
+            let base = m as u64;
+            if !readable(base) {
+                continue;
+            }
+            // PE32+ headers: the NT headers at e_lfanew; SizeOfImage at +56
+            // of the optional header, the exception directory (data
+            // directory 3) at +112 + 3 * 8.
+            let nt = base + *((base + 0x3c) as *const u32) as u64;
+            if !readable(nt) || *(nt as *const u32) != 0x4550 || *((nt + 24) as *const u16) != 0x20b {
+                continue;
+            }
+            let opt = nt + 24;
+            let dir = opt + 112 + 3 * 8;
+            let (va, size) = (*(dir as *const u32) as u64, *((dir + 4) as *const u32));
+            if va != 0 && size >= 12 {
+                v.push(UnwindTable { base, end: base + *((opt + 56) as *const u32) as u64, table: base + va, count: size / 12 });
+            }
+        }
+    }
+    v.sort_by_key(|t| t.base);
+    *UNWIND_TABLES.write() = v;
+    UNWIND_MISSED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// RtlLookupFunctionEntry from the snapshot, without the loader's locks:
+/// the entry for `pc` (null: no module or no entry, a leaf function).
+unsafe fn snapshot_function(pc: u64, base: &mut u64) -> *const IMAGE_RUNTIME_FUNCTION_ENTRY {
+    let Some(g) = UNWIND_TABLES.try_read() else { return std::ptr::null() };
+    let i = g.partition_point(|t| t.base <= pc);
+    let Some(t) = i.checked_sub(1).map(|i| g[i]).filter(|t| pc < t.end) else {
+        UNWIND_MISSED.store(true, std::sync::atomic::Ordering::Relaxed);
+        return std::ptr::null();
+    };
+    if !readable(t.table) {
+        return std::ptr::null();
+    }
+    let rva = (pc - t.base) as u32;
+    let entries = unsafe { std::slice::from_raw_parts(t.table as *const [u32; 3], t.count as usize) };
+    let k = entries.partition_point(|e| e[1] <= rva);
+    match entries.get(k) {
+        Some(e) if e[0] <= rva => {
+            *base = t.base;
+            // An odd unwind-data address points at another entry.
+            if e[2] & 1 != 0 { (t.base + (e[2] & !1) as u64) as *const IMAGE_RUNTIME_FUNCTION_ENTRY } else { e as *const [u32; 3] as *const IMAGE_RUNTIME_FUNCTION_ENTRY }
+        }
+        _ => std::ptr::null(),
+    }
+}
+
+unsafe fn system_function(pc: u64, base: &mut u64) -> *const IMAGE_RUNTIME_FUNCTION_ENTRY {
+    unsafe { windows_sys::Win32::System::Diagnostics::Debug::RtlLookupFunctionEntry(pc, base, std::ptr::null_mut()) }
+}
+
 /// Guest frames of the calling thread (for diagnostics in HLE functions):
 /// the first is the guest call site of the HLE function.
 pub fn current_guest_frames(depth: usize) -> Vec<String> {
@@ -140,7 +229,13 @@ pub fn readable(a: u64) -> bool {
 /// later ones follow the guest frame-pointer chain. Fills the arrays without
 /// allocating; returns (host frames, guest frames).
 unsafe fn unwind(c: &mut AlignedContext, host: &mut [u64], guest: &mut [u64]) -> (usize, usize) {
-    use windows_sys::Win32::System::Diagnostics::Debug::{RtlLookupFunctionEntry, RtlVirtualUnwind};
+    unsafe { unwind_with(c, host, guest, system_function) }
+}
+
+/// `unwind` with the function-entry lookup given (`snapshot_function` for
+/// suspended threads).
+unsafe fn unwind_with(c: &mut AlignedContext, host: &mut [u64], guest: &mut [u64], lookup: unsafe fn(u64, &mut u64) -> *const IMAGE_RUNTIME_FUNCTION_ENTRY) -> (usize, usize) {
+    use windows_sys::Win32::System::Diagnostics::Debug::RtlVirtualUnwind;
     let (mut nh, mut ng) = (0usize, 0usize);
     for _ in 0..64 {
         let pc = c.0.Rip;
@@ -152,7 +247,7 @@ unsafe fn unwind(c: &mut AlignedContext, host: &mut [u64], guest: &mut [u64]) ->
             nh += 1;
         }
         let mut base = 0u64;
-        let fe = unsafe { RtlLookupFunctionEntry(pc, &mut base, std::ptr::null_mut()) };
+        let fe = unsafe { lookup(pc, &mut base) };
         if fe.is_null() {
             // Leaf function or code without unwind data: return address at [rsp].
             if !readable(c.0.Rsp) {
