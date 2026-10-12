@@ -215,6 +215,7 @@ fn reap_spans() {
         }
         match d.seq {
             Some(s) if done >= s && !DEVICE_LOST.load(Ordering::Relaxed) => {
+                super::vk::note_gpu_freed(d.span.buffer);
                 unsafe {
                     ctx().device.destroy_buffer(d.span.buffer, None);
                     ctx().device.free_memory(d.span.mem, None);
@@ -433,6 +434,7 @@ fn revalidate_spans() {
         let mut gy = GRAVEYARD.lock();
         gy.extend(dead.into_iter().map(|mut span| {
             span.valid = false;
+            super::vk::note_gpu_dropped(span.buffer);
             Dead { span, generation, seq: None }
         }));
         GRAVEYARD_LEN.store(gy.len() as u64, Ordering::Release);
@@ -527,7 +529,8 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     let _w = super::track::protected().then(|| super::track::host_write(start, end - start));
     let t0 = std::time::Instant::now();
     match ctx().import_host(start, end - start, usage) {
-        Ok((buffer, mem)) => {
+        Ok((buffer, mem, va)) => {
+            super::vk::note_gpu_range(buffer, va, end - start, || format!("guest import {start:#x}..{end:#x}"));
             let ms = t0.elapsed().as_millis();
             if ms >= 50 {
                 crate::info!("gpu: importing guest {start:#x}..{end:#x} ({} MiB) took {ms} ms", (end - start) >> 20);

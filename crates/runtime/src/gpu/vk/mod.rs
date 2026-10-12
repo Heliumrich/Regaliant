@@ -37,6 +37,11 @@ pub struct Ctx {
     /// VK_EXT_calibrated_timestamps with the device and performance-counter
     /// time domains (`gpu::timeline`: GPU timestamps on the CPU clock).
     pub calibrated: Option<ash::ext::calibrated_timestamps::Device>,
+    /// VK_EXT_device_fault: the device's own account of a loss (`fault_report`).
+    pub fault: Option<ash::ext::device_fault::Device>,
+    /// bufferDeviceAddress enabled: guest imports and video-memory homes get
+    /// GPU addresses that fault reports name (`note_gpu_range`).
+    pub device_addresses: bool,
 }
 
 static CTX: OnceLock<Ctx> = OnceLock::new();
@@ -172,6 +177,23 @@ fn init_inner() -> Result<(), String> {
         if calibrated {
             dexts.push(ash::ext::calibrated_timestamps::NAME.as_ptr());
         }
+        // Device faults: the faulting addresses and the driver's description
+        // after a device loss.
+        let has_fault_ext = instance
+            .enumerate_device_extension_properties(pdev)
+            .unwrap_or_default()
+            .iter()
+            .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::device_fault::NAME);
+        let mut fault_supported = vk::PhysicalDeviceFaultFeaturesEXT::default();
+        if has_fault_ext {
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut fault_supported);
+            instance.get_physical_device_features2(pdev, &mut f2);
+        }
+        let has_fault = has_fault_ext && fault_supported.device_fault != 0;
+        let mut fault_f = vk::PhysicalDeviceFaultFeaturesEXT::default().device_fault(true).device_fault_vendor_binary(fault_supported.device_fault_vendor_binary != 0);
+        if has_fault {
+            dexts.push(ash::ext::device_fault::NAME.as_ptr());
+        }
         let want_ckpt = std::env::var("DS_GPU_CHECKPOINTS").ok().as_deref() == Some("1");
         let has_ckpt = want_ckpt
             && instance
@@ -263,7 +285,9 @@ fn init_inner() -> Result<(), String> {
         if !nonuniform {
             crate::warn!("Vulkan: shaderSampledImageArrayNonUniformIndexing unsupported (image tables index uniformly)");
         }
+        let device_addresses = f12_supported.buffer_device_address != 0;
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
+            .buffer_device_address(device_addresses)
             .shader_sampled_image_array_non_uniform_indexing(nonuniform)
             .timeline_semaphore(true)
             .scalar_block_layout(true)
@@ -283,6 +307,9 @@ fn init_inner() -> Result<(), String> {
         }
         if barycentric {
             dci = dci.push_next(&mut bary);
+        }
+        if has_fault {
+            dci = dci.push_next(&mut fault_f);
         }
         if has_stats {
             dci = dci.push_next(&mut stats_f);
@@ -321,6 +348,8 @@ fn init_inner() -> Result<(), String> {
             checkpoints: has_ckpt.then(|| ash::nv::device_diagnostic_checkpoints::Device::new(&instance, &device)),
             exec_props: has_stats.then(|| ash::khr::pipeline_executable_properties::Device::new(&instance, &device)),
             calibrated: calibrated.then(|| ash::ext::calibrated_timestamps::Device::new(&instance, &device)),
+            fault: has_fault.then(|| ash::ext::device_fault::Device::new(&instance, &device)),
+            device_addresses,
             entry,
             instance,
             pdev,
@@ -407,10 +436,150 @@ pub fn checkpoint(cmd: vk::CommandBuffer, kind: u64, value: u64) {
     }
 }
 
-/// The queue's last checkpoints per pipeline stage, after a device loss.
+/// GPU address ranges of guest imports and video-memory homes, for device
+/// fault reports: live ones, dropped ones (no new work uses them) and the
+/// last freed ones.
+struct GpuRange {
+    buf: u64,
+    va: u64,
+    size: u64,
+    what: String,
+    dropped_ms: Option<f64>,
+    freed_ms: Option<f64>,
+}
+
+static GPU_RANGES: Mutex<Vec<GpuRange>> = Mutex::new(Vec::new());
+
+/// Remembers buffer `buf`'s GPU address range (`va` 0: none) as `what`.
+pub fn note_gpu_range(buf: vk::Buffer, va: u64, size: u64, what: impl FnOnce() -> String) {
+    use ash::vk::Handle;
+    if va == 0 {
+        return;
+    }
+    GPU_RANGES.lock().push(GpuRange { buf: buf.as_raw(), va, size, what: what(), dropped_ms: None, freed_ms: None });
+}
+
+/// Buffer `buf` is no longer used for new work (freed once its batches end).
+pub fn note_gpu_dropped(buf: vk::Buffer) {
+    use ash::vk::Handle;
+    let t = crate::log::elapsed_ms();
+    if let Some(r) = GPU_RANGES.lock().iter_mut().rev().find(|r| r.buf == buf.as_raw() && r.freed_ms.is_none()) {
+        r.dropped_ms.get_or_insert(t);
+    }
+}
+
+/// Buffer `buf` was destroyed (its range is kept among the last freed).
+pub fn note_gpu_freed(buf: vk::Buffer) {
+    use ash::vk::Handle;
+    let t = crate::log::elapsed_ms();
+    let mut g = GPU_RANGES.lock();
+    if let Some(r) = g.iter_mut().rev().find(|r| r.buf == buf.as_raw() && r.freed_ms.is_none()) {
+        r.freed_ms = Some(t);
+    }
+    let freed = g.iter().filter(|r| r.freed_ms.is_some()).count();
+    if freed > 4096 {
+        let mut drop_n = freed - 4096;
+        g.retain(|r| {
+            if drop_n > 0 && r.freed_ms.is_some() {
+                drop_n -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
+/// The GPU address of a buffer created with SHADER_DEVICE_ADDRESS (0 without
+/// bufferDeviceAddress).
+pub fn buffer_address(buf: vk::Buffer) -> u64 {
+    let c = ctx();
+    if !c.device_addresses {
+        return 0;
+    }
+    unsafe { c.device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buf)) }
+}
+
+/// Where a GPU address lies among the noted ranges.
+fn describe_address(a: u64) -> String {
+    let g = GPU_RANGES.lock();
+    let now = crate::log::elapsed_ms();
+    let mut hits: Vec<String> = g
+        .iter()
+        .filter(|r| r.va <= a && a < r.va + r.size)
+        .map(|r| {
+            let state = match (r.dropped_ms, r.freed_ms) {
+                (_, Some(f)) => format!("FREED {:.0} ms before the report", now - f),
+                (Some(d), None) => format!("dropped {:.0} ms before the report, not freed", now - d),
+                (None, None) => "live".into(),
+            };
+            format!("{} +{:#x} ({state})", r.what, a - r.va)
+        })
+        .collect();
+    if hits.is_empty() {
+        // The nearest noted ranges below and above.
+        let below = g.iter().filter(|r| r.va + r.size <= a).max_by_key(|r| r.va + r.size).map(|r| format!("{:#x} past the end of {}", a - (r.va + r.size), r.what));
+        let above = g.iter().filter(|r| r.va > a).min_by_key(|r| r.va).map(|r| format!("{:#x} before {}", r.va - a, r.what));
+        hits.push(format!("in no noted range ({} ranges noted; {})", g.len(), [below, above].into_iter().flatten().collect::<Vec<_>>().join("; ")));
+    }
+    hits.join(" | ")
+}
+
+/// The device's account of a loss (VK_EXT_device_fault): description,
+/// faulting addresses with the noted ranges they fall in, vendor codes; the
+/// vendor binary goes to `gpu-fault.bin` in the run directory. Computed once.
+pub fn fault_report() -> String {
+    static REPORT: OnceLock<String> = OnceLock::new();
+    REPORT
+        .get_or_init(|| {
+            let Some(c) = try_ctx() else { return String::new() };
+            let Some(f) = &c.fault else { return "(no VK_EXT_device_fault)".into() };
+            unsafe {
+                let mut counts = vk::DeviceFaultCountsEXT::default();
+                let r = (f.fp().get_device_fault_info_ext)(c.device.handle(), &mut counts, std::ptr::null_mut());
+                if r != vk::Result::SUCCESS && r != vk::Result::INCOMPLETE {
+                    return format!("vkGetDeviceFaultInfoEXT: {r}");
+                }
+                let mut addrs = vec![vk::DeviceFaultAddressInfoEXT::default(); counts.address_info_count as usize];
+                let mut vendors = vec![vk::DeviceFaultVendorInfoEXT::default(); counts.vendor_info_count as usize];
+                let mut bin = vec![0u8; counts.vendor_binary_size as usize];
+                let mut info = vk::DeviceFaultInfoEXT::default();
+                info.p_address_infos = if addrs.is_empty() { std::ptr::null_mut() } else { addrs.as_mut_ptr() };
+                info.p_vendor_infos = if vendors.is_empty() { std::ptr::null_mut() } else { vendors.as_mut_ptr() };
+                info.p_vendor_binary_data = if bin.is_empty() { std::ptr::null_mut() } else { bin.as_mut_ptr().cast() };
+                let r = (f.fp().get_device_fault_info_ext)(c.device.handle(), &mut counts, &mut info);
+                if r != vk::Result::SUCCESS && r != vk::Result::INCOMPLETE {
+                    return format!("vkGetDeviceFaultInfoEXT: {r}");
+                }
+                let desc = CStr::from_ptr(info.description.as_ptr()).to_string_lossy().into_owned();
+                let mut out = vec![format!("device fault: '{desc}'")];
+                for a in addrs.iter().take(counts.address_info_count as usize) {
+                    out.push(format!("{:?} at {:#x} (precision {:#x}): {}", a.address_type, a.reported_address, a.address_precision, describe_address(a.reported_address)));
+                }
+                for v in vendors.iter().take(counts.vendor_info_count as usize) {
+                    let d = CStr::from_ptr(v.description.as_ptr()).to_string_lossy().into_owned();
+                    out.push(format!("vendor '{d}' code {:#x} data {:#x}", v.vendor_fault_code, v.vendor_fault_data));
+                }
+                if !bin.is_empty() {
+                    if let Some(dir) = crate::run_dir() {
+                        let p = dir.join("gpu-fault.bin");
+                        if std::fs::write(&p, &bin).is_ok() {
+                            out.push(format!("vendor binary ({} bytes): {}", bin.len(), p.display()));
+                        }
+                    }
+                }
+                out.join("; ")
+            }
+        })
+        .clone()
+}
+
+/// The queue's last checkpoints per pipeline stage, after a device loss
+/// (and the device's fault report).
 pub fn checkpoint_report() -> String {
+    let fault = fault_report();
     let Some(c) = try_ctx() else { return String::new() };
-    let Some(cp) = &c.checkpoints else { return "(DS_GPU_CHECKPOINTS=1 names the failing command)".into() };
+    let Some(cp) = &c.checkpoints else { return format!("(DS_GPU_CHECKPOINTS=1 names the failing command); {fault}") };
     let q = c.queue.lock();
     unsafe {
         let n = cp.get_queue_checkpoint_data_len(*q);
@@ -430,6 +599,7 @@ pub fn checkpoint_report() -> String {
                 };
                 format!("{:?}: {kind} {:#x}", d.stage, m & ((1 << 56) - 1))
             })
+            .chain(std::iter::once(fault))
             .collect::<Vec<_>>()
             .join("; ")
     }
@@ -447,6 +617,40 @@ impl Ctx {
         unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory({}): {e}", req.size))
     }
 
+    /// Device-local buffer with a GPU address (0 without bufferDeviceAddress):
+    /// video-memory homes, named in device fault reports.
+    pub fn device_buffer_addressed(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, u64), String> {
+        if !self.device_addresses {
+            let (b, m) = self.device_buffer(size, usage)?;
+            return Ok((b, m, 0));
+        }
+        unsafe {
+            let bi = vk::BufferCreateInfo::default().size(size).usage(usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS).sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buf = self.device.create_buffer(&bi, None).map_err(|e| format!("vkCreateBuffer: {e}"))?;
+            let req = self.device.get_buffer_memory_requirements(buf);
+            let Some(ty) = self.memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL) else {
+                self.device.destroy_buffer(buf, None);
+                return Err("no suitable memory type".into());
+            };
+            let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+            let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty).push_next(&mut fl);
+            let mem = match self.device.allocate_memory(&ai, None) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.device.destroy_buffer(buf, None);
+                    return Err(format!("vkAllocateMemory({}): {e}", req.size));
+                }
+            };
+            if let Err(e) = self.device.bind_buffer_memory(buf, mem, 0) {
+                self.device.destroy_buffer(buf, None);
+                self.device.free_memory(mem, None);
+                return Err(format!("bind buffer: {e}"));
+            }
+            let va = self.device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buf));
+            Ok((buf, mem, va))
+        }
+    }
+
     /// Device-local buffer (not host-visible).
     pub fn device_buffer(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory), String> {
         unsafe {
@@ -461,7 +665,9 @@ impl Ctx {
 
     /// Imports existing host memory [ptr, ptr+size) (page aligned) as a GPU
     /// buffer (VK_EXT_external_memory_host): the GPU reads and writes it in place.
-    pub fn import_host(&self, ptr: u64, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory), String> {
+    /// The third value is the buffer's GPU address (0 without bufferDeviceAddress).
+    pub fn import_host(&self, ptr: u64, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, u64), String> {
+        let usage = if self.device_addresses { usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS } else { usage };
         let ext = self.ext_host.as_ref().ok_or("VK_EXT_external_memory_host not available")?;
         let ht = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
         unsafe {
@@ -485,7 +691,9 @@ impl Ctx {
                 return Err(format!("no memory type for imported host memory (bits {bits:#x})"));
             };
             let mut imp = vk::ImportMemoryHostPointerInfoEXT::default().handle_type(ht).host_pointer(ptr as *mut std::ffi::c_void);
+            let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
             let ai = vk::MemoryAllocateInfo::default().allocation_size(size).memory_type_index(ty).push_next(&mut imp);
+            let ai = if self.device_addresses { ai.push_next(&mut fl) } else { ai };
             let mem = match self.device.allocate_memory(&ai, None) {
                 Ok(m) => m,
                 Err(e) => {
@@ -498,7 +706,8 @@ impl Ctx {
                 self.device.free_memory(mem, None);
                 return Err(format!("bind imported buffer: {e}"));
             }
-            Ok((buf, mem))
+            let va = if self.device_addresses { self.device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buf)) } else { 0 };
+            Ok((buf, mem, va))
         }
     }
 

@@ -45,6 +45,7 @@ pub struct HomeBuf {
 
 impl Drop for HomeBuf {
     fn drop(&mut self) {
+        super::vk::note_gpu_freed(self.buf);
         unsafe {
             ctx().device.destroy_buffer(self.buf, None);
             ctx().device.free_memory(self.mem, None);
@@ -252,8 +253,11 @@ pub fn create(base: u64, size: u64) -> bool {
         return false;
     }
     let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
-    let (buf, mem) = match ctx().device_buffer(n, usage) {
-        Ok(x) => x,
+    let (buf, mem) = match ctx().device_buffer_addressed(n, usage) {
+        Ok((buf, mem, va)) => {
+            super::vk::note_gpu_range(buf, va, n, || format!("home {b:#x}+{n:#x}"));
+            (buf, mem)
+        }
         Err(e) => {
             crate::warn!("gpu: no video memory for a home of {b:#x}+{n:#x} ({e})");
             return false;

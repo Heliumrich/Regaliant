@@ -1112,6 +1112,13 @@ fn bsrc(tr: &mut T, ins: &Inst, v: &V, k: usize) -> R<Word> {
     Ok(x)
 }
 
+/// 16-bit compares and integer arithmetic are translated (`DS_TR_OPS16=0`:
+/// left untranslated as before 2026-10-12, for A/B runs).
+fn ops16() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_TR_OPS16").ok().as_deref() != Some("0"))
+}
+
 /// 16-bit source `k` in the low bits (zero-extended): the low half, or the
 /// high half with VOP3 op_sel (SDWA selections are applied by `usrc`);
 /// inline float constants are their f16 encodings.
@@ -1503,12 +1510,12 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
                 int_cmp(tr, a, b, cmp, ty == "i64")?
             }
             // 16-bit compares (f16 halves widen exactly to f32).
-            (_, "f16") if cmp != "class" => {
+            (_, "f16") if cmp != "class" && ops16() => {
                 let a = fsrc16(tr, ins, &v, 0)?;
                 let b = fsrc16(tr, ins, &v, 1)?;
                 fcmp(tr, a, b, cmp)?
             }
-            (_, "i16" | "u16") => {
+            (_, "i16" | "u16") if ops16() => {
                 let a = isrc16(tr, ins, &v, 0, ty == "i16")?;
                 let b = isrc16(tr, ins, &v, 1, ty == "i16")?;
                 int_cmp(tr, a, b, cmp, ty == "i16")?
@@ -2037,7 +2044,7 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
             }
         }
         // ---- 16-bit integer arithmetic (VOP3 on gfx10: v_add_nc_u16 ...)
-        "v_add_u16" | "v_sub_u16" | "v_add_i16" | "v_sub_i16" | "v_mul_lo_u16" | "v_max_u16" | "v_max_i16" | "v_min_u16" | "v_min_i16" | "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" | "v_mad_u16" | "v_mad_i16" => {
+        "v_add_u16" | "v_sub_u16" | "v_add_i16" | "v_sub_i16" | "v_mul_lo_u16" | "v_max_u16" | "v_max_i16" | "v_min_u16" | "v_min_i16" | "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" | "v_mad_u16" | "v_mad_i16" if ops16() => {
             let signed = name.ends_with("i16");
             let a = isrc16(tr, ins, &v, 0, signed)?;
             let b = isrc16(tr, ins, &v, 1, signed || name == "v_ashrrev_i16")?;
