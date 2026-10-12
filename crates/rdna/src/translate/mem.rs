@@ -382,25 +382,16 @@ pub fn smem(tr: &mut T, ins: &Inst) -> R<()> {
 // Attribute interpolation
 
 fn attr_input(tr: &mut T, attr: u32) -> R<Option<Word>> {
-    let spec_in = tr.spec.ps_inputs.get(attr as usize).copied();
-    if let Some(pi) = spec_in {
-        if pi.default.is_some() {
-            return Ok(None);
-        }
-    }
-    if let Some(&v) = tr.in_attrs.get(&attr) {
+    let Some((loc, flat)) = super::attr_location(tr.spec, attr) else { return Ok(None) };
+    tr.params = tr.params.max(attr + 1);
+    if let Some(&v) = tr.in_attrs.get(&loc) {
         return Ok(Some(v));
     }
-    let (loc, flat) = match spec_in {
-        Some(pi) => (pi.param as u32, pi.flat),
-        None => (attr, false),
-    };
     let v = tr.input(tr.t.v4f, None, Some(loc));
     if flat {
         tr.b.decorate(v, Decoration::Flat, []);
     }
-    tr.in_attrs.insert(attr, v);
-    tr.params = tr.params.max(attr + 1);
+    tr.in_attrs.insert(loc, v);
     Ok(Some(v))
 }
 
@@ -409,7 +400,7 @@ fn attr_input(tr: &mut T, attr: u32) -> R<Option<Word>> {
 pub fn interp(tr: &mut T, ins: &Inst) -> R<()> {
     let attr = ins.intrp_attr();
     let chan = ins.intrp_chan();
-    if tr.per_vertex_attrs.contains(&attr) {
+    if super::attr_location(tr.spec, attr).is_some_and(|(loc, _)| tr.per_vertex_locs.contains(&loc)) {
         return interp_per_vertex(tr, ins, attr, chan);
     }
     let val = match attr_input(tr, attr)? {
@@ -427,10 +418,11 @@ pub fn interp(tr: &mut T, ins: &Inst) -> R<()> {
     tr.set_vreg(ins.vdst() as u32, u)
 }
 
-/// Interpolation of an attribute read per vertex (see `per_vertex_attrs`):
-/// v_interp_mov returns P0 = vertex 0's value and P10/P20 = vertex 1's / 2's
-/// (flat-shaded inputs keep raw values) or their differences from P0
-/// (interpolated inputs); v_interp_p1/p2 give the interpolated value.
+/// Interpolation of an attribute whose location is read per vertex (see
+/// `per_vertex_locations`): v_interp_mov returns P0 = vertex 0's value and
+/// P10/P20 = vertex 1's / 2's (flat-shaded inputs keep raw values) or their
+/// differences from P0 (interpolated inputs); v_interp_p1/p2 give the
+/// interpolated value (the provoking vertex's of a flat-shaded input).
 fn interp_per_vertex(tr: &mut T, ins: &Inst, attr: u32, chan: u32) -> R<()> {
     let f = tr.t.f32;
     let pi = tr.spec.ps_inputs.get(attr as usize).copied();
@@ -441,16 +433,16 @@ fn interp_per_vertex(tr: &mut T, ins: &Inst, attr: u32, chan: u32) -> R<()> {
         return tr.set_vreg(ins.vdst() as u32, u);
     }
     let flat = pi.is_some_and(|p| p.flat);
-    let var = match tr.per_vertex_in.get(&attr) {
+    let loc = pi.map(|p| p.param as u32).unwrap_or(attr);
+    tr.params = tr.params.max(attr + 1);
+    let var = match tr.per_vertex_in.get(&loc) {
         Some(&v) => v,
         None => {
-            let loc = pi.map(|p| p.param as u32).unwrap_or(attr);
             let k3 = tr.u(3);
             let arr = tr.b.type_array(tr.t.v4f, k3);
             let v = tr.input(arr, None, Some(loc));
             tr.b.decorate(v, Decoration::PerVertexKHR, []);
-            tr.per_vertex_in.insert(attr, v);
-            tr.params = tr.params.max(attr + 1);
+            tr.per_vertex_in.insert(loc, v);
             v
         }
     };
@@ -474,6 +466,8 @@ fn interp_per_vertex(tr: &mut T, ins: &Inst, attr: u32, chan: u32) -> R<()> {
                 }
             }
         }
+    } else if flat {
+        vert(tr, 0)?
     } else {
         let (pv, _) = tr.bary.ok_or("per-vertex attribute without barycentrics")?;
         let mut acc = tr.f(0.0);

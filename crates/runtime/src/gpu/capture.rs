@@ -221,6 +221,12 @@ pub fn draw_dumps() -> bool {
     next.is_some_and(|e| e >= lo && e <= hi)
 }
 
+/// A frame capture with a watched pixel (`capture pixel=x,y`): each draw
+/// completes before its texel is read back.
+pub fn watching() -> bool {
+    WATCH_PIXEL.lock().is_some() && capturing()
+}
+
 /// `DS_CAPTURE_DISPATCHES=1` or `capture dispatches` (control command, from
 /// then on): also dump the images each captured dispatch writes, after it
 /// (dispatches/<flip>_<event>_<shader>_<image>.png, with statistics).
@@ -330,6 +336,7 @@ static WATCH_PIXEL: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 
 pub fn set_watch_pixel(p: Option<(u32, u32)>) {
     *WATCH_PIXEL.lock() = p;
+    *WATCH_TEXELS.lock() = None;
 }
 
 /// Last watched-pixel value per image written by dispatches.
@@ -346,8 +353,58 @@ fn changed(key: (u64, bool), raw: &[u8], texel: usize) -> Option<usize> {
     n
 }
 
+/// The watched pixel's color-target-0 texel and depth after the previous
+/// draws that wrote them (watch-only captures).
+static WATCH_TEXELS: Mutex<Option<std::collections::HashMap<(u64, bool), Vec<u8>>>> = Mutex::new(None);
+
+/// `capture pixel=<x>,<y>` without a draw range: the draws that change the
+/// watched pixel of their color target 0 or depth, with the values, from a
+/// one-texel read back after each draw (whole-target dumps of a frame's
+/// thousands of draws take far too long).
+fn watch_texels(cp: &Cp, x: u32, y: u32) -> Option<String> {
+    let hex = |b: &[u8]| b.iter().rev().map(|v| format!("{v:02x}")).collect::<String>();
+    let mut out = Vec::new();
+    let mut note = |key: (u64, bool), now: Vec<u8>, what: String| {
+        let mut g = WATCH_TEXELS.lock();
+        let before = g.get_or_insert_with(Default::default).insert(key, now.clone());
+        if before.as_ref() != Some(&now) {
+            out.push(match before {
+                Some(b) => format!("{what} {} -> {}", hex(&b), hex(&now)),
+                None => format!("{what} {}", hex(&now)),
+            });
+        }
+    };
+    if let Some(s) = super::exec::color_surface(cp, 0).ok().flatten() {
+        if x < s.width && y < s.height {
+            if let Ok((raw, fmt)) = super::images::with(|im| -> Result<(Vec<u8>, ash::vk::Format), String> {
+                let t = im.target(&s)?;
+                Ok((im.read_back_texel(t.image, t.key.format, ash::vk::ImageAspectFlags::COLOR, x, y)?, t.key.format))
+            }) {
+                note((s.base, false), raw, format!("cb0 {:#x} {fmt:?} px({x},{y})", s.base));
+            }
+        }
+    }
+    if let Some(d) = super::exec::depth_surface(cp).filter(|d| super::images::aspects(d.format).contains(ash::vk::ImageAspectFlags::DEPTH)) {
+        if x < d.width && y < d.height {
+            if let Ok(raw) = super::images::with(|im| -> Result<Vec<u8>, String> {
+                let t = im.target(&d)?;
+                im.read_back_texel(t.image, t.key.format, ash::vk::ImageAspectFlags::DEPTH, x, y)
+            }) {
+                let z = (raw.len() == 4).then(|| f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
+                note((d.base, true), raw, format!("depth {:#x} z({x},{y}){}", d.base, z.map(|z| format!(" = {z}")).unwrap_or_default()));
+            }
+        }
+    }
+    (!out.is_empty()).then(|| out.join("; "))
+}
+
 fn dump_draw_target(cp: &Cp, event: u64) -> Option<String> {
     let listed = ps_listed(cp);
+    if dumps_env().is_none() && !listed {
+        if let Some((x, y)) = *WATCH_PIXEL.lock() {
+            return watch_texels(cp, x, y);
+        }
+    }
     let (lo, hi) = match dumps_env() {
         Some(r) => r,
         None if listed => (u64::MAX, u64::MAX),
@@ -466,7 +523,7 @@ pub fn draw(cp: &Cp, what: &str) {
         cp.reg(Space::Uc, 0x25B),
         cp.last_draw
     );
-    if dumps_env().is_some() || ps_listed(cp) {
+    if dumps_env().is_some() || ps_listed(cp) || WATCH_PIXEL.lock().is_some() {
         if let Some(n) = dump_draw_target(cp, c.events) {
             let _ = writeln!(s, "    target after draw: {n}");
         }

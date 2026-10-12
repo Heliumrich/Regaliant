@@ -2044,6 +2044,41 @@ impl Images {
         self.read_back_aspect(image, format, vk::ImageAspectFlags::COLOR, width, height)
     }
 
+    /// One texel at (x, y) of mip 0 / layer 0 of one aspect, in the layout
+    /// of `read_back_aspect` (pixel watches of frame captures).
+    pub fn read_back_texel(&mut self, image: vk::Image, format: vk::Format, aspect: vk::ImageAspectFlags, x: u32, y: u32) -> Result<Vec<u8>, String> {
+        let bpp = if aspect == vk::ImageAspectFlags::STENCIL {
+            1
+        } else if aspect == vk::ImageAspectFlags::DEPTH {
+            if matches!(format, vk::Format::D16_UNORM | vk::Format::D16_UNORM_S8_UINT) { 2 } else { 4 }
+        } else {
+            texel_bytes(format) as u64
+        };
+        if bpp == 0 || is_compressed(format) {
+            return Err(format!("texel read back of {format:?} unsupported"));
+        }
+        let c = ctx();
+        let (buf, mem, ptr) = c.host_buffer(bpp.max(4), vk::BufferUsageFlags::TRANSFER_DST)?;
+        self.one_shot(|cmd| unsafe {
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: 1 })
+                .image_offset(vk::Offset3D { x: x as i32, y: y as i32, z: 0 })
+                .image_extent(vk::Extent3D { width: 1, height: 1, depth: 1 });
+            c.device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::GENERAL, buf, &[region]);
+            let hb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[hb], &[], &[]);
+        });
+        let out = unsafe { std::slice::from_raw_parts(ptr, bpp as usize).to_vec() };
+        unsafe {
+            c.device.destroy_buffer(buf, None);
+            c.device.unmap_memory(mem);
+            c.device.free_memory(mem, None);
+        }
+        Ok(out)
+    }
+
     /// Reads mip 0 / layer 0 of one aspect back: color texels, depth as 32-bit
     /// float (D32 formats) or 16-bit unorm (D16), stencil as bytes.
     pub fn read_back_aspect(&mut self, image: vk::Image, format: vk::Format, aspect: vk::ImageAspectFlags, width: u32, height: u32) -> Result<Vec<u8>, String> {

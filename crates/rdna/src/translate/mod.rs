@@ -413,10 +413,12 @@ pub(crate) struct T<'a> {
     pub plain_samplers: BTreeSet<usize>,
     pub out_mrt: HashMap<u32, (Word, Word)>,
     pub out_depth: Option<Word>,
+    /// Fragment inputs by location (vertex parameter): one variable per
+    /// location, shared by the attributes that read it.
     pub in_attrs: HashMap<u32, Word>,
-    /// Attributes read per vertex (v_interp_mov of P10/P20, with
+    /// Locations read per vertex (`per_vertex_locations`, with
     /// `Spec::barycentric`), and their per-vertex input arrays.
-    pub per_vertex_attrs: BTreeSet<u32>,
+    pub per_vertex_locs: BTreeSet<u32>,
     pub per_vertex_in: HashMap<u32, Word>,
     /// BaryCoordKHR / BaryCoordNoPerspKHR inputs (loaded at entry).
     pub bary: Option<(Word, Word)>,
@@ -1367,6 +1369,43 @@ fn per_vertex_attrs(code: &[Inst]) -> BTreeSet<u32> {
     code.iter().filter(|i| i.enc == Enc::Vintrp && i.base_name() == Some("v_interp_mov_f32") && i.intrp_vsrc() & 3 != 2).map(|i| i.intrp_attr()).collect()
 }
 
+/// Vertex parameter (location) of attribute `attr` and whether it is
+/// flat-shaded; None for an attribute with a constant default.
+pub(crate) fn attr_location(spec: &Spec, attr: u32) -> Option<(u32, bool)> {
+    match spec.ps_inputs.get(attr as usize) {
+        Some(pi) if pi.default.is_some() => None,
+        Some(pi) => Some((pi.param as u32, pi.flat)),
+        None => Some((attr, false)),
+    }
+}
+
+/// Locations a fragment shader reads through per-vertex input arrays: those
+/// of attributes read per vertex (`per_vertex_attrs`), of interpolated
+/// attributes read as P0 (vertex 0's value), and locations that attributes
+/// read both flat and interpolated. Each location is a single input
+/// variable: Vulkan has no aliasing of a location's flat, interpolated and
+/// per-vertex inputs (the title maps two attributes to one parameter, one
+/// read per vertex, one flat: the G-buffer shaders of World 4-1's cliffs,
+/// whose UVs became constant per triangle).
+fn per_vertex_locations(code: &[Inst], spec: &Spec) -> BTreeSet<u32> {
+    let mut out: BTreeSet<u32> = per_vertex_attrs(code).into_iter().filter_map(|a| attr_location(spec, a).map(|(loc, _)| loc)).collect();
+    let mut kinds: HashMap<u32, (bool, bool)> = HashMap::default();
+    for i in code.iter().filter(|i| i.enc == Enc::Vintrp) {
+        let Some((loc, flat)) = attr_location(spec, i.intrp_attr()) else { continue };
+        if !flat && i.base_name() == Some("v_interp_mov_f32") {
+            out.insert(loc);
+        }
+        let k = kinds.entry(loc).or_default();
+        if flat {
+            k.0 = true;
+        } else {
+            k.1 = true;
+        }
+    }
+    out.extend(kinds.into_iter().filter(|(_, (f, s))| *f && *s).map(|(l, _)| l));
+    out
+}
+
 /// Whether `p` may write VGPR `v`: Some(true) for an atomic returning the
 /// previous value into it, Some(false) for any other (possible) write.
 fn vgpr_def(p: &Inst, v: u16) -> Option<bool> {
@@ -1500,7 +1539,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         out_mrt: HashMap::default(),
         out_depth: None,
         in_attrs: HashMap::default(),
-        per_vertex_attrs: if spec.barycentric && spec.stage == Stage::Fragment { per_vertex_attrs(code) } else { BTreeSet::new() },
+        per_vertex_locs: if spec.barycentric && spec.stage == Stage::Fragment { per_vertex_locations(code, spec) } else { BTreeSet::new() },
         per_vertex_in: HashMap::default(),
         bary: None,
         frag_coord: None,
@@ -2418,6 +2457,82 @@ mod tests {
         b.code_base = 0x7_1234_5000;
         let (ta, tb) = (translate(&code, &plan, &a).unwrap(), translate(&code, &plan, &b).unwrap());
         assert_eq!(ta.spirv, tb.spirv);
+    }
+
+    fn ps_spec(inputs: &[(u8, bool)]) -> Spec {
+        let mut s = cs_spec([1, 1, 1]);
+        s.stage = Stage::Fragment;
+        s.barycentric = true;
+        s.ps_input_addr = 0x2;
+        s.ps_inputs = inputs.iter().map(|&(param, flat)| PsInput { param, flat, default: None }).collect();
+        s
+    }
+
+    /// Input variables (Location, PerVertexKHR, Flat) of a SPIR-V module.
+    fn input_locations(spirv: &[u32]) -> Vec<(u32, bool, bool)> {
+        let mut decs: HashMap<u32, (Option<u32>, bool, bool)> = HashMap::default();
+        let mut inputs = Vec::new();
+        let mut i = 5;
+        while i < spirv.len() {
+            let (op, n) = (spirv[i] & 0xFFFF, (spirv[i] >> 16) as usize);
+            let a = &spirv[i + 1..i + n];
+            match op {
+                71 => {
+                    let d = decs.entry(a[0]).or_default();
+                    match a[1] {
+                        30 => d.0 = Some(a[2]),
+                        14 => d.2 = true,
+                        5285 => d.1 = true,
+                        _ => {}
+                    }
+                }
+                59 if a[2] == 1 => inputs.push(a[1]),
+                _ => {}
+            }
+            i += n.max(1);
+        }
+        let mut out: Vec<_> = inputs.iter().filter_map(|v| decs.get(v).and_then(|d| d.0.map(|l| (l, d.1, d.2)))).collect();
+        out.sort();
+        out
+    }
+
+    /// Two attributes on one parameter, one read per vertex and one flat (ps
+    /// 0x139d9a6500, World 4-1's cliffs: input_cntl [0x0 0x401 0x401
+    /// 0x402]): one per-vertex input at that location, none flat.
+    #[test]
+    fn shared_parameter_has_one_input() {
+        // v_interp_mov_f32 v5, p0, attr1.w; v_interp_mov_f32 v8, p10, attr1.w;
+        // v_interp_mov_f32 v11, p20, attr1.w; v_interp_mov_f32 v22, p0, attr2.x;
+        // v_interp_p1_f32 v10, v0, attr0.z; v_interp_p2_f32 v10, v1, attr0.z;
+        // v_interp_mov_f32 v9, p0, attr3.x; v_interp_mov_f32 v12, p10, attr3.x;
+        // exp mrt0 v5, v8, v11, v22 done vm; s_endpgm
+        let words = [
+            0xc8160702, 0xc8220700, 0xc82e0701, 0xc85a0802, 0xc8280200, 0xc8290201, 0xc8260c02, 0xc8320c00, 0xf800180f, 0x160b0805, 0xbf810000,
+        ];
+        let code = crate::decode_program(&words).unwrap();
+        let spec = ps_spec(&[(0, false), (1, true), (1, true), (2, true)]);
+        assert_eq!(per_vertex_locations(&code, &spec).into_iter().collect::<Vec<_>>(), vec![1, 2]);
+        let plan = crate::analysis::analyze(&code, 0, 0);
+        let out = translate(&code, &plan, &spec).unwrap();
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert_eq!(input_locations(&out.spirv), vec![(0, false, false), (1, true, false), (2, true, false)]);
+    }
+
+    /// 16-bit instructions of the title's compute shaders (cs 0x100898d500's
+    /// `v_add_u16_e64 v5, 0xffff, v7`, cs 0x10089e3a00's v_cmpx_gt_f16)
+    /// translate without warnings.
+    #[test]
+    fn sixteen_bit_ops_translate() {
+        // v_add_u16_e64 v5, 0xffff, v7; v_cmpx_gt_f16 1.0, v1;
+        // v_max_i16 v2, v3, v4 op_sel:[0,0,0,1]; s_endpgm
+        let words = [0xd7030005, 0x00020eff, 0x0000ffff, 0x7db802f2, 0xd70a4002, 0x00020903, 0xbf810000];
+        let code = crate::decode_program(&words).unwrap();
+        assert_eq!(code[0].base_name(), Some("v_add_u16"));
+        assert_eq!(code[1].name(), Some("v_cmpx_gt_f16"));
+        assert_eq!(code[2].base_name(), Some("v_max_i16"));
+        let plan = crate::analysis::analyze(&code, 2, 0);
+        let out = translate(&code, &plan, &cs_spec([64, 1, 1])).unwrap();
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
     }
 
     /// v_interp_mov_f32 of P10 / P20 (cs 0x100cc3d100's foliage alpha test:

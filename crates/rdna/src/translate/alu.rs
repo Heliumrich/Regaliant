@@ -1112,6 +1112,74 @@ fn bsrc(tr: &mut T, ins: &Inst, v: &V, k: usize) -> R<Word> {
     Ok(x)
 }
 
+/// 16-bit source `k` in the low bits (zero-extended): the low half, or the
+/// high half with VOP3 op_sel (SDWA selections are applied by `usrc`);
+/// inline float constants are their f16 encodings.
+fn src16(tr: &mut T, ins: &Inst, v: &V, k: usize) -> R<Word> {
+    const HALF_CONSTS: [u32; 9] = [0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118];
+    let u = tr.t.u32;
+    let op = v.src[k];
+    let raw = match op {
+        240..=248 if !(k == 0 && v.dpp.is_some()) => tr.u(HALF_CONSTS[(op - 240) as usize]),
+        _ => usrc(tr, ins, v, k)?,
+    };
+    let raw = if v.vop3 && v.opsel >> k & 1 != 0 {
+        let k16 = tr.u(16);
+        e(tr.b.shift_right_logical(u, None, raw, k16))?
+    } else {
+        raw
+    };
+    let m = tr.u(0xFFFF);
+    e(tr.b.bitwise_and(u, None, raw, m))
+}
+
+/// 16-bit integer source `k` as a 32-bit value (sign-extended for i16).
+fn isrc16(tr: &mut T, ins: &Inst, v: &V, k: usize, signed: bool) -> R<Word> {
+    let x = src16(tr, ins, v, k)?;
+    if !signed {
+        return Ok(x);
+    }
+    let z = tr.u(0);
+    let w = tr.u(16);
+    e(tr.b.bit_field_s_extract(tr.t.u32, None, x, z, w))
+}
+
+/// f16 source `k` as f32 with abs/neg modifiers.
+fn fsrc16(tr: &mut T, ins: &Inst, v: &V, k: usize) -> R<Word> {
+    let h = src16(tr, ins, v, k)?;
+    let mut x = half_to_f(tr, h, false)?;
+    if v.abs >> k & 1 != 0 {
+        x = tr.glsl1(tr.t.f32, GLOp::FAbs, x)?;
+    }
+    if v.neg >> k & 1 != 0 {
+        x = e(tr.b.f_negate(tr.t.f32, None, x))?;
+    }
+    Ok(x)
+}
+
+/// Writes a 16-bit result: the low half of the destination, or the high half
+/// with VOP3 op_sel[3]; gfx10 16-bit instructions keep the other half.
+fn out16(tr: &mut T, v: &V, x: Word) -> R<()> {
+    let u = tr.t.u32;
+    let m = tr.u(0xFFFF);
+    let x = e(tr.b.bitwise_and(u, None, x, m))?;
+    if v.sdwa.is_some() {
+        return uout(tr, v, x);
+    }
+    let old = tr.vreg(v.dst as u32)?;
+    let r = if v.opsel & 8 != 0 {
+        let k16 = tr.u(16);
+        let hi = e(tr.b.shift_left_logical(u, None, x, k16))?;
+        let lo = e(tr.b.bitwise_and(u, None, old, m))?;
+        e(tr.b.bitwise_or(u, None, lo, hi))?
+    } else {
+        let mh = tr.u(0xFFFF_0000);
+        let hi = e(tr.b.bitwise_and(u, None, old, mh))?;
+        e(tr.b.bitwise_or(u, None, hi, x))?
+    };
+    uout(tr, v, r)
+}
+
 /// 64-bit vector source (VGPR pair, SGPR pair or constant).
 fn vsrc64(tr: &mut T, ins: &Inst, op: u16) -> R<(Word, Word)> {
     if op >= 256 {
@@ -1433,6 +1501,17 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
                 let a = to64(tr, alo, ahi)?;
                 let b = to64(tr, blo, bhi)?;
                 int_cmp(tr, a, b, cmp, ty == "i64")?
+            }
+            // 16-bit compares (f16 halves widen exactly to f32).
+            (_, "f16") if cmp != "class" => {
+                let a = fsrc16(tr, ins, &v, 0)?;
+                let b = fsrc16(tr, ins, &v, 1)?;
+                fcmp(tr, a, b, cmp)?
+            }
+            (_, "i16" | "u16") => {
+                let a = isrc16(tr, ins, &v, 0, ty == "i16")?;
+                let b = isrc16(tr, ins, &v, 1, ty == "i16")?;
+                int_cmp(tr, a, b, cmp, ty == "i16")?
             }
             _ => None,
         };
@@ -1956,6 +2035,63 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
                 };
                 uout(tr, &v, res)?;
             }
+        }
+        // ---- 16-bit integer arithmetic (VOP3 on gfx10: v_add_nc_u16 ...)
+        "v_add_u16" | "v_sub_u16" | "v_add_i16" | "v_sub_i16" | "v_mul_lo_u16" | "v_max_u16" | "v_max_i16" | "v_min_u16" | "v_min_i16" | "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" | "v_mad_u16" | "v_mad_i16" => {
+            let signed = name.ends_with("i16");
+            let a = isrc16(tr, ins, &v, 0, signed)?;
+            let b = isrc16(tr, ins, &v, 1, signed || name == "v_ashrrev_i16")?;
+            let k15 = tr.u(15);
+            let r = match name {
+                "v_add_u16" | "v_sub_u16" | "v_add_i16" | "v_sub_i16" => {
+                    let r = if name.starts_with("v_add") { e(tr.b.i_add(u, None, a, b))? } else { e(tr.b.i_sub(u, None, a, b))? };
+                    if v.clamp {
+                        // Saturating forms (the exact result fits in 32 bits).
+                        let (lo, hi) = if signed { (tr.i(-32768), tr.i(32767)) } else { (tr.i(0), tr.i(65535)) };
+                        let ri = tr.to_i(r)?;
+                        let c = tr.glsl3(i, GLOp::SClamp, ri, lo, hi)?;
+                        tr.to_u(c)?
+                    } else {
+                        r
+                    }
+                }
+                "v_mul_lo_u16" => e(tr.b.i_mul(u, None, a, b))?,
+                "v_max_u16" => tr.glsl2(u, GLOp::UMax, a, b)?,
+                "v_min_u16" => tr.glsl2(u, GLOp::UMin, a, b)?,
+                "v_max_i16" | "v_min_i16" => {
+                    let (ai, bi) = (tr.to_i(a)?, tr.to_i(b)?);
+                    let r = tr.glsl2(i, if name == "v_max_i16" { GLOp::SMax } else { GLOp::SMin }, ai, bi)?;
+                    tr.to_u(r)?
+                }
+                "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
+                    let sh = e(tr.b.bitwise_and(u, None, a, k15))?;
+                    match name {
+                        "v_lshlrev_b16" => e(tr.b.shift_left_logical(u, None, b, sh))?,
+                        "v_lshrrev_b16" => e(tr.b.shift_right_logical(u, None, b, sh))?,
+                        _ => e(tr.b.shift_right_arithmetic(u, None, b, sh))?,
+                    }
+                }
+                _ => {
+                    // v_mad_u16 / v_mad_i16: a * b + c.
+                    let c = isrc16(tr, ins, &v, 2, signed)?;
+                    let p = e(tr.b.i_mul(u, None, a, b))?;
+                    let r = e(tr.b.i_add(u, None, p, c))?;
+                    if v.clamp {
+                        if signed {
+                            let (lo, hi) = (tr.i(-32768), tr.i(32767));
+                            let ri = tr.to_i(r)?;
+                            let c = tr.glsl3(i, GLOp::SClamp, ri, lo, hi)?;
+                            tr.to_u(c)?
+                        } else {
+                            let m = tr.u(0xFFFF);
+                            tr.glsl2(u, GLOp::UMin, r, m)?
+                        }
+                    } else {
+                        r
+                    }
+                }
+            };
+            out16(tr, &v, r)?;
         }
         // ---- integer arithmetic
         "v_add_u32" | "v_sub_u32" | "v_subrev_u32" | "v_add_i32" | "v_sub_i32" => {

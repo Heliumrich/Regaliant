@@ -1212,6 +1212,31 @@ impl<'a, E: Env> Group<'a, E> {
         true
     }
 
+    /// 16-bit source `k` of lane `l` in the low bits: the low half, or the
+    /// high half with VOP3 op_sel; inline float constants are f16 encodings.
+    fn src16(&self, w: usize, ins: &Inst, v: &Vop, k: usize, l: usize) -> R<u32> {
+        const HALF_CONSTS: [u32; 9] = [0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118];
+        let op = v.src[k];
+        let raw = match op {
+            240..=248 if !(k == 0 && (v.dpp16.is_some() || v.dpp8.is_some())) => HALF_CONSTS[(op - 240) as usize],
+            _ => self.vsrc(w, ins, v, k, l)?,
+        };
+        let raw = if v.vop3 && v.opsel >> k & 1 != 0 { raw >> 16 } else { raw };
+        Ok(raw & 0xFFFF)
+    }
+
+    /// f16 source `k` of lane `l` with abs/neg.
+    fn fsrc16(&self, w: usize, ins: &Inst, v: &Vop, k: usize, l: usize) -> R<f32> {
+        let mut x = half_to_f32(self.src16(w, ins, v, k, l)? as u16);
+        if v.abs >> k & 1 != 0 {
+            x = x.abs();
+        }
+        if v.neg >> k & 1 != 0 {
+            x = -x;
+        }
+        Ok(x)
+    }
+
     fn fsrc(&self, w: usize, ins: &Inst, v: &Vop, k: usize, l: usize) -> R<f32> {
         let mut x = f(self.vsrc(w, ins, v, k, l)?);
         if v.abs >> k & 1 != 0 {
@@ -1283,10 +1308,15 @@ impl<'a, E: Env> Group<'a, E> {
                         int_cmp(cmp, a, b, ty == "i32").ok_or_else(|| format!("{:#x}: {name} not emulated", ins.pc))?
                     }
                     "i16" | "u16" => {
-                        let a = self.vsrc(w, ins, &v, 0, l)? & 0xFFFF;
-                        let b = self.vsrc(w, ins, &v, 1, l)? & 0xFFFF;
+                        let a = self.src16(w, ins, &v, 0, l)?;
+                        let b = self.src16(w, ins, &v, 1, l)?;
                         let (a, b) = if ty == "i16" { (sext(a, 16), sext(b, 16)) } else { (a, b) };
                         int_cmp(cmp, a, b, ty == "i16").ok_or_else(|| format!("{:#x}: {name} not emulated", ins.pc))?
+                    }
+                    "f16" if cmp != "class" => {
+                        let a = self.fsrc16(w, ins, &v, 0, l)?;
+                        let b = self.fsrc16(w, ins, &v, 1, l)?;
+                        fcmp(cmp, a, b).ok_or_else(|| format!("{:#x}: {name} not emulated", ins.pc))?
                     }
                     _ => return Err(format!("{:#x}: {name} not emulated", ins.pc)),
                 };
@@ -1606,6 +1636,56 @@ impl<'a, E: Env> Group<'a, E> {
                 "v_cubeid_f32" | "v_cubesc_f32" | "v_cubetc_f32" | "v_cubema_f32" => {
                     let (x, y, z) = (fs(0)?, fs(1)?, fs(2)?);
                     u(cube(name, x, y, z))
+                }
+                // 16-bit integer arithmetic (VOP3 on gfx10): the result goes to
+                // the low half (the high half with op_sel[3]); the other half
+                // is kept.
+                "v_add_u16" | "v_sub_u16" | "v_add_i16" | "v_sub_i16" | "v_mul_lo_u16" | "v_max_u16" | "v_max_i16" | "v_min_u16" | "v_min_i16" | "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" | "v_mad_u16" | "v_mad_i16" => {
+                    let signed = name.ends_with("i16");
+                    let s16 = |k: usize| -> R<u32> {
+                        let x = self.src16(w, ins, &v, k, l)?;
+                        Ok(if signed { sext(x, 16) } else { x })
+                    };
+                    let (a, b) = (s16(0)?, s16(1)?);
+                    let (ai, bi) = (a as i32, b as i32);
+                    let r = match name {
+                        "v_add_u16" => {
+                            let r = a + b;
+                            if v.clamp { r.min(0xFFFF) } else { r }
+                        }
+                        "v_sub_u16" => {
+                            if v.clamp && b > a { 0 } else { a.wrapping_sub(b) }
+                        }
+                        "v_add_i16" | "v_sub_i16" => {
+                            let r = if name == "v_add_i16" { ai + bi } else { ai - bi };
+                            (if v.clamp { r.clamp(-32768, 32767) } else { r }) as u32
+                        }
+                        "v_mul_lo_u16" => a.wrapping_mul(b),
+                        "v_max_u16" => a.max(b),
+                        "v_min_u16" => a.min(b),
+                        "v_max_i16" => ai.max(bi) as u32,
+                        "v_min_i16" => ai.min(bi) as u32,
+                        "v_lshlrev_b16" => b << (a & 15),
+                        "v_lshrrev_b16" => b >> (a & 15),
+                        "v_ashrrev_i16" => (sext(b, 16) as i32 >> (a & 15)) as u32,
+                        _ => {
+                            let c = s16(2)?;
+                            let r = a.wrapping_mul(b).wrapping_add(c);
+                            match (v.clamp, signed) {
+                                (false, _) => r,
+                                (true, true) => (r as i32).clamp(-32768, 32767) as u32,
+                                (true, false) => r.min(0xFFFF),
+                            }
+                        }
+                    } & 0xFFFF;
+                    let old = self.waves[w].v[(v.dst & 255) as usize][l];
+                    if v.sdwa.is_some() {
+                        r
+                    } else if v.opsel & 8 != 0 {
+                        (old & 0xFFFF) | (r << 16)
+                    } else {
+                        (old & 0xFFFF_0000) | r
+                    }
                 }
                 _ => return Err(format!("{:#x}: {name} not emulated", ins.pc)),
             };
