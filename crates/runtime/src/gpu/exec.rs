@@ -87,11 +87,13 @@ fn sync_why_status() -> String {
     let n: Vec<u64> = SYNC_WHY.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let w: Vec<u64> = READ_WAIT_WORDS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    shader-read waits whose words were unchanged after the wait: draws {} of {}, dispatches {} of {}; stages used as prepared instead of waiting {} (checks held {}, failed {}, {} shaders wait again)\n",
+        "    shader-read waits whose words were unchanged after the wait: draws {} of {}, dispatches {} of {}; commands that did not wait {} ({} data loads copied by batch prologues), stages used as prepared {} (checks held {}, failed {}, {} shaders wait again)\n",
         w[0],
         w[0] + w[1],
         w[2],
         w[2] + w[3],
+        SPEC_STATS[3].load(Ordering::Relaxed),
+        SPEC_STATS[4].load(Ordering::Relaxed),
         SPEC_STATS[0].load(Ordering::Relaxed),
         SPEC_STATS[1].load(Ordering::Relaxed),
         SPEC_STATS[2].load(Ordering::Relaxed),
@@ -1278,8 +1280,20 @@ static SPEC_CHECKS: Mutex<Vec<SpecCheck>> = Mutex::new(Vec::new());
 static SPEC_PENDING: AtomicU64 = AtomicU64::new(0);
 /// Shaders whose speculation was wrong once: they wait again.
 static NO_SPEC: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
-/// [stages used as prepared, checks that held, checks that failed].
-static SPEC_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// [stages used as prepared (checked), checks that held, checks that
+/// failed, commands that did not wait, data loads copied by the prologue].
+static SPEC_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// A data-only load the batch prologue copies from guest memory into a
+/// stage's SGPR data (`Exec::speculate`): stage index, dword index in the
+/// SGPR data, the imported guest buffer and offset, bytes.
+pub(super) struct SgprPatch {
+    stage: usize,
+    sgpr: u32,
+    src: vk::Buffer,
+    src_off: u64,
+    bytes: u64,
+}
 
 /// Checks the speculations whose batch completed (completion thread).
 fn check_speculations(done: u64) {
@@ -1630,7 +1644,7 @@ impl Slot {
             let (cmd, pre) = (cmds[0], cmds[1]);
             // SGPR data in system memory: a copy in video memory, read by
             // every invocation, made no measurable difference (`tune ring_vram`).
-            let (ring, _mem, ring_ptr) = c.host_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let (ring, _mem, ring_ptr) = c.host_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)?;
             let (shadow, _smem) = c.device_buffer(SHADOW_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)?;
             Ok(Slot {
                 cmd,
@@ -1907,6 +1921,38 @@ static BATCH_NS: AtomicU64 = AtomicU64::new(0);
 /// batch that ended the gap: [ns, gaps, gaps over 1 ms]).
 static IDLE: Mutex<(u64, Option<HashMap<String, [u64; 3]>>)> = Mutex::new((0, None));
 
+/// Batch GPU time by the batch's most frequent command (DS_PROFILE_GPU with
+/// batch stamps only, which do not serialize the GPU): (queue, shader key)
+/// -> [batches, ns, commands].
+static BATCH_BY: Mutex<Option<HashMap<(String, u64), [u64; 3]>>> = Mutex::new(None);
+
+fn note_batch_by(queue: &str, shaders: &[u64], ns: u64) {
+    let mut counts: HashMap<u64, u32> = HashMap::new();
+    for &a in shaders {
+        *counts.entry(a).or_default() += 1;
+    }
+    let key = counts.iter().max_by_key(|(a, n)| (**n, std::cmp::Reverse(**a))).map_or(0, |(a, _)| *a);
+    let mut g = BATCH_BY.lock();
+    let e = g.get_or_insert_with(HashMap::new).entry((queue.to_string(), key)).or_insert([0; 3]);
+    e[0] += 1;
+    e[1] += ns;
+    e[2] += shaders.len() as u64;
+}
+
+fn batch_by_lines() -> String {
+    let g = BATCH_BY.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(&(String, u64), &[u64; 3])> = m.iter().collect();
+    v.sort_by(|a, b| b.1[1].cmp(&a.1[1]));
+    let total: u64 = v.iter().map(|x| x.1[1]).sum();
+    let mut s = format!("    batch GPU time by the batch's most frequent command ({} ms in all):\n", total / 1_000_000);
+    for ((q, a), x) in v.iter().take(25) {
+        let what = if *a & DRAW_KEY != 0 { format!("draws {:#x}", a & !DRAW_KEY) } else if *a == 0 { "(no commands)".to_string() } else { format!("cs {a:#x}") };
+        s.push_str(&format!("      {q} {what}: {} batches, {} ms, {:.1} commands and {:.0} us each\n", x[0], x[1] / 1_000_000, x[2] as f64 / x[0].max(1) as f64, x[1] as f64 / x[0].max(1) as f64 / 1000.0));
+    }
+    s
+}
+
 /// Reads a completed batch's dispatch timestamps into SHADER_TIME.
 fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str) {
     if pool == vk::QueryPool::null() {
@@ -1916,7 +1962,11 @@ fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str) {
     let mut be = [0u64; 2];
     if unsafe { c.device.get_query_pool_results(pool, STAMPS * MAX_TIMED, &mut be, vk::QueryResultFlags::TYPE_64) }.is_ok() {
         let period = c.limits.timestamp_period as f64;
-        BATCH_NS.fetch_add((be[1].saturating_sub(be[0]) as f64 * period) as u64, Ordering::Relaxed);
+        let batch_ns = (be[1].saturating_sub(be[0]) as f64 * period) as u64;
+        BATCH_NS.fetch_add(batch_ns, Ordering::Relaxed);
+        if !command_stamps() {
+            note_batch_by(queue, shaders, batch_ns);
+        }
         let mut g = IDLE.lock();
         if g.0 != 0 && be[0] > g.0 {
             let ns = ((be[0] - g.0) as f64 * period) as u64;
@@ -1974,6 +2024,7 @@ pub fn reset_shader_profile() {
         g.3 = [[0; 2]; 4];
     }
     PRE_STABLE.lock().1 = [0; 5];
+    *BATCH_BY.lock() = None;
     for c in READ_WAIT_WORDS.iter() {
         c.store(0, Ordering::Relaxed);
     }
@@ -2021,6 +2072,7 @@ pub fn shader_profile() -> String {
         GAP_NS.load(Ordering::Relaxed) / 1_000_000,
         PRE_NS.load(Ordering::Relaxed) / 1_000_000
     );
+    s.push_str(&batch_by_lines());
     if let Some(idle) = IDLE.lock().1.as_ref() {
         let mut v: Vec<(&String, &[u64; 3])> = idle.iter().collect();
         v.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
@@ -2042,11 +2094,13 @@ pub fn shader_profile() -> String {
         ));
         let w: Vec<u64> = READ_WAIT_WORDS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         s.push_str(&format!(
-            "    shader-read waits whose words were unchanged after the wait: draws {} of {}, dispatches {} of {}; stages used as prepared instead of waiting {} (checks held {}, failed {})\n",
+            "    shader-read waits whose words were unchanged after the wait: draws {} of {}, dispatches {} of {}; commands that did not wait {} ({} data loads copied by batch prologues), stages used as prepared {} (checks held {}, failed {})\n",
             w[0],
             w[0] + w[1],
             w[2],
             w[2] + w[3],
+            SPEC_STATS[3].load(Ordering::Relaxed),
+            SPEC_STATS[4].load(Ordering::Relaxed),
             SPEC_STATS[0].load(Ordering::Relaxed),
             SPEC_STATS[1].load(Ordering::Relaxed),
             SPEC_STATS[2].load(Ordering::Relaxed)
@@ -2734,21 +2788,7 @@ impl Exec {
             None => (self.slots[self.cur].pre_buf?, off),
         };
         let c = ctx();
-        let (pre, qp) = (self.slots[self.cur].pre, self.slots[self.cur].queries);
-        if !self.pre_open {
-            unsafe {
-                c.device.begin_command_buffer(pre, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
-                if qp != vk::QueryPool::null() {
-                    c.device.cmd_reset_query_pool(pre, qp, STAMPS * MAX_TIMED + 2, 2);
-                }
-            }
-            // After all earlier submitted work.
-            global_barrier(pre);
-            if qp != vk::QueryPool::null() {
-                unsafe { c.device.cmd_write_timestamp(pre, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED + 2) };
-            }
-            self.pre_open = true;
-        }
+        let pre = self.open_pre();
         unsafe { c.device.cmd_copy_buffer(pre, src, buf, &[vk::BufferCopy { src_offset: al - start, dst_offset: off, size: n }]) };
         match shared {
             Some((chunk, _, id)) => {
@@ -3125,44 +3165,119 @@ impl Exec {
     }
 
     /// Instead of waiting for GPU work that writes what the stages'
-    /// preparations read (`tune spec_reads`): when that work is all
-    /// submitted (not this batch's), no home holds newer data and no stage's
-    /// shader was mispredicted before, the stages are used as prepared (with
-    /// the values before those writes) and their words are checked once the
-    /// work completed (`check_speculations`). True: speculated (no wait).
-    pub(super) fn speculate(&mut self, stages: &[&Prepared]) -> bool {
+    /// preparations read (`tune spec_reads`), when that work is all
+    /// submitted (not this batch's) and no home holds newer data: the
+    /// data-only loads it writes (`Prepared::data_loads`) are copied from
+    /// guest memory into the stages' SGPR data by the batch prologue, on the
+    /// GPU after that work (`SgprPatch`); the other words it writes
+    /// (descriptors, pointers) are used as read and checked once the work
+    /// completed (`check_speculations`; a shader that mispredicted waits
+    /// from then on). Some: no wait, with the copies to make once the
+    /// stages' SGPR data is placed; None: wait.
+    pub(super) fn speculate(&mut self, stages: &[&Prepared]) -> Option<Vec<SgprPatch>> {
         if !super::tune::spec_reads() {
-            return false;
+            return None;
         }
         let done = done_seq();
         self.inflight.prune(done);
-        let mut writers: Vec<(usize, u64)> = Vec::new();
+        let writer = |s: &Self, r: &[(u64, u64)]| s.inflight.latest(r, done).max(INFLIGHT.latest(r)).filter(|&x| x > done);
+        let mut patches = Vec::new();
+        let mut checks: Vec<SpecCheck> = Vec::new();
+        let mut any = false;
         for (k, p) in stages.iter().enumerate() {
             if p.reads.is_empty() {
                 continue;
             }
             if self.pending.overlaps_any(&p.reads) || super::homes::any_stale(&p.reads) {
-                return false;
+                return None;
             }
-            let s = self.inflight.latest(&p.reads, done).max(INFLIGHT.latest(&p.reads));
-            if let Some(s) = s.filter(|&s| s > done) {
-                writers.push((k, s));
+            if writer(self, &p.reads).is_none() {
+                continue;
+            }
+            any = true;
+            let mut data = vec![false; p.words.len()];
+            for d in &p.data_loads {
+                let bytes = 4 * d.dwords as u64;
+                if writer(self, &[(d.addr, bytes)]).is_some() {
+                    let (src, start, _) = span(d.addr, bytes)?;
+                    patches.push(SgprPatch { stage: k, sgpr: d.sgpr, src, src_off: d.addr - start, bytes });
+                }
+                for w in d.word as usize..(d.word + d.dwords) as usize {
+                    if let Some(x) = data.get_mut(w) {
+                        *x = true;
+                    }
+                }
+            }
+            // The other words, where that work writes: used as read, checked.
+            let (mut reads, mut words): (Vec<(u64, u64)>, Vec<u32>) = (Vec::new(), Vec::new());
+            let mut i = 0usize;
+            for &(a, n) in &p.reads {
+                for j in 0..n / 4 {
+                    if !data.get(i).copied().unwrap_or(true) {
+                        let at = a + 4 * j;
+                        match reads.last_mut() {
+                            Some(r) if r.0 + r.1 == at => r.1 += 4,
+                            _ => reads.push((at, 4)),
+                        }
+                        words.push(p.words[i]);
+                    }
+                    i += 1;
+                }
+            }
+            if let Some(s) = writer(self, &reads) {
+                if NO_SPEC.lock().as_ref().is_some_and(|n| n.contains(&p.addr)) {
+                    return None;
+                }
+                checks.push(SpecCheck { seq: s, shader: p.addr, reads, words });
             }
         }
-        if writers.is_empty() {
-            return false;
+        if !any {
+            return None;
         }
-        if NO_SPEC.lock().as_ref().is_some_and(|n| writers.iter().any(|&(k, _)| n.contains(&stages[k].addr))) {
-            return false;
+        SPEC_STATS[0].fetch_add(checks.len() as u64, Ordering::Relaxed);
+        SPEC_STATS[3].fetch_add(1, Ordering::Relaxed);
+        SPEC_STATS[4].fetch_add(patches.len() as u64, Ordering::Relaxed);
+        if !checks.is_empty() {
+            let mut g = SPEC_CHECKS.lock();
+            g.extend(checks);
+            SPEC_PENDING.store(g.len() as u64, Ordering::Release);
         }
-        let mut g = SPEC_CHECKS.lock();
-        for &(k, s) in &writers {
-            let p = stages[k];
-            g.push(SpecCheck { seq: s, shader: p.addr, reads: p.reads.clone(), words: p.words.clone() });
-            SPEC_STATS[0].fetch_add(1, Ordering::Relaxed);
+        Some(patches)
+    }
+
+    /// Records the prologue copies of `patches` for stage `stage`, whose SGPR
+    /// data is at `ring` + `at` (`speculate`).
+    pub(super) fn patch_sgpr(&mut self, patches: &[SgprPatch], stage: usize, ring: vk::Buffer, at: u64) {
+        let mine: Vec<&SgprPatch> = patches.iter().filter(|p| p.stage == stage).collect();
+        if mine.is_empty() {
+            return;
         }
-        SPEC_PENDING.store(g.len() as u64, Ordering::Release);
-        true
+        let pre = self.open_pre();
+        for p in mine {
+            unsafe { ctx().device.cmd_copy_buffer(pre, p.src, ring, &[vk::BufferCopy { src_offset: p.src_off, dst_offset: at + 4 * p.sgpr as u64, size: p.bytes }]) };
+        }
+    }
+
+    /// The batch prologue (`Slot::pre`), begun if it was not yet: it runs
+    /// after all earlier submitted work and before this batch's.
+    fn open_pre(&mut self) -> vk::CommandBuffer {
+        let c = ctx();
+        let (pre, qp) = (self.slots[self.cur].pre, self.slots[self.cur].queries);
+        if !self.pre_open {
+            unsafe {
+                c.device.begin_command_buffer(pre, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
+                if qp != vk::QueryPool::null() {
+                    c.device.cmd_reset_query_pool(pre, qp, STAMPS * MAX_TIMED + 2, 2);
+                }
+            }
+            // After all earlier submitted work.
+            global_barrier(pre);
+            if qp != vk::QueryPool::null() {
+                unsafe { c.device.cmd_write_timestamp(pre, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED + 2) };
+            }
+            self.pre_open = true;
+        }
+        pre
     }
 
     /// Whether `sync_for_reads` would wait.
@@ -3847,8 +3962,9 @@ impl Exec {
         Ok(bound)
     }
 
-    /// Copies a stage's SGPR data into the ring (space reserved) and binds it.
-    fn bind_sgpr(&mut self, p: &Prepared, bound: &mut Bound) -> Result<(), String> {
+    /// Copies a stage's SGPR data into the ring (space reserved) and binds it;
+    /// where it went (ring buffer, offset).
+    fn bind_sgpr(&mut self, p: &Prepared, bound: &mut Bound) -> Result<(vk::Buffer, u64), String> {
         // Little-endian dwords, as the shader reads them.
         let bytes: &[u8] = unsafe { std::slice::from_raw_parts(p.sgpr_data.as_ptr() as *const u8, 4 * p.sgpr_data.len()) };
         let vram = match super::tune::ring_vram() {
@@ -3859,7 +3975,7 @@ impl Exec {
             _ => false,
         };
         if vram && self.slots[self.cur].rings[1].is_none() && !self.vram_ring_failed {
-            match ctx().bar_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER) {
+            match ctx().bar_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST) {
                 Ok((b, _m, p)) => self.slots[self.cur].rings[1] = Some((b, p)),
                 Err(e) => {
                     crate::warn!("gpu[{}]: no SGPR data ring in video memory ({e})", self.name);
@@ -3876,7 +3992,7 @@ impl Exec {
                 bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: ring, offset: off, range: bytes.len() as u64 }));
             }
         }
-        Ok(())
+        Ok((ring, off))
     }
 
     fn alloc_set(&mut self, layout: vk::DescriptorSetLayout) -> Result<vk::DescriptorSet, String> {
@@ -3980,7 +4096,8 @@ impl Exec {
         };
         lap.mark(0);
         self.sync_readers = [p.addr, 0];
-        if !self.speculate(&[&p]) && self.sync_for(&p.reads, SYNC_CS_READS) {
+        let patches = self.speculate(&[&p]);
+        if patches.is_none() && self.sync_for(&p.reads, SYNC_CS_READS) {
             if self.stopped {
                 return Err(STOPPED.into());
             }
@@ -4036,7 +4153,10 @@ impl Exec {
             return Err(STOPPED.into());
         }
         lap.mark(6);
-        self.bind_sgpr(&p, &mut bound)?;
+        let (ring, at) = self.bind_sgpr(&p, &mut bound)?;
+        if let Some(pt) = &patches {
+            self.patch_sgpr(pt, 0, ring, at);
+        }
         if profiling() {
             note_placements(p.addr, groups, indirect.is_some(), &bound.placements);
         }

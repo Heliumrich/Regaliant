@@ -102,6 +102,11 @@ pub struct Plan {
     /// Per resource: its descriptor dwords are consecutive words behind one
     /// pointer (read as one block).
     pub blocks: Vec<bool>,
+    /// Per entry of `loads`: data only (no dword it reads is a descriptor
+    /// dword or a pointer; see `data_only_loads`). Such words may reach the
+    /// shader by another route than the CPU reading them (the runtime copies
+    /// them on the GPU when GPU work is still writing them).
+    pub load_data: Vec<bool>,
 }
 
 impl Plan {
@@ -195,20 +200,24 @@ pub fn analyze(code: &[Inst], user_sgprs: u16, user_base: u16) -> Plan {
 /// title computes per-view constants on the GPU) then costs the command
 /// processor no wait for that work to complete.
 pub fn analyze_opts(code: &[Inst], user_sgprs: u16, user_base: u16, gpu_data_loads: bool) -> Plan {
+    let with_data = |mut p: Plan| {
+        p.load_data = data_only_loads(&p);
+        p
+    };
     let plan = run(code, user_sgprs, user_base, &HashSet::new());
     if !gpu_data_loads || plan.loads.is_empty() {
-        return plan;
+        return with_data(plan);
     }
     let data = data_only_loads(&plan);
     let force: HashSet<u32> = plan.inst_load.iter().filter(|&(_, &k)| data[k]).map(|(&pc, _)| pc).collect();
     if force.is_empty() {
-        return plan;
+        return with_data(plan);
     }
     let p2 = run(code, user_sgprs, user_base, &force);
     if p2.errors.len() > plan.errors.len() {
-        return plan;
+        return with_data(plan);
     }
-    p2
+    with_data(p2)
 }
 
 /// Which scalar loads only produce data: no dword they read is a descriptor
@@ -654,6 +663,10 @@ mod tests {
         let cpu = analyze_opts(&code, 2, 0, false);
         assert!(cpu.errors.is_empty(), "{:?}", cpu.errors);
         assert_eq!(cpu.loads.len(), 2);
+        // The V# load feeds a descriptor, the dword load is data only.
+        let v = cpu.loads.iter().position(|l| l.dwords == 4).unwrap();
+        let d = cpu.loads.iter().position(|l| l.dwords == 1).unwrap();
+        assert!(!cpu.load_data[v] && cpu.load_data[d]);
         let gpu = analyze_opts(&code, 2, 0, true);
         assert!(gpu.errors.is_empty(), "{:?}", gpu.errors);
         assert_eq!(gpu.loads.len(), 1);

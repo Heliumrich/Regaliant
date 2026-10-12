@@ -260,6 +260,19 @@ pub struct Prepared {
     /// preparation that depends on the image cache).
     pub cmp_images: u64,
     pub cmp_depth: u64,
+    /// The data-only scalar loads (`Plan::load_data`) as read: where their
+    /// dwords sit in `sgpr_data`, the guest address, and where their words
+    /// start in `words`.
+    pub data_loads: Vec<DataLoad>,
+}
+
+/// A data-only scalar load of a prepared stage (`Prepared::data_loads`).
+#[derive(Clone, Copy, Debug)]
+pub struct DataLoad {
+    pub sgpr: u32,
+    pub addr: u64,
+    pub dwords: u32,
+    pub word: u32,
 }
 
 /// Image resources (bit per index) that depth-comparison sampling
@@ -1261,15 +1274,20 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
     // Scalar-load data, resolved now.
     let mut sgpr_data = user.to_vec();
     sgpr_data.resize(translate::SGPR_DATA_USER as usize, 0);
-    for l in &tr.plan.loads {
+    let mut data_loads = Vec::new();
+    for (j, l) in tr.plan.loads.iter().enumerate() {
         let base = rd.ptr(&l.ptr, user);
         let start = sgpr_data.len();
         sgpr_data.resize(start + l.dwords as usize, 0);
         let Some(b) = base else { continue };
+        let word = rd.words.len();
         if !rd.read_into(b + l.offset as u64, &mut sgpr_data[start..]) {
             for k in 0..l.dwords as usize {
                 sgpr_data[start + k] = rd.u32(b + l.offset as u64 + 4 * k as u64).unwrap_or(0);
             }
+        }
+        if tr.plan.load_data.get(j).copied().unwrap_or(false) && rd.words.len() == word + l.dwords as usize {
+            data_loads.push(DataLoad { sgpr: start as u32, addr: b + l.offset as u64, dwords: l.dwords, word: word as u32 });
         }
     }
     sgpr_data.resize(translate::sgpr_data_dwords(&tr.plan) as usize, 0);
@@ -1295,7 +1313,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
             _ => {}
         }
     }
-    let prepared = Prepared { stage: spec.stage, addr, insts, tr, resources, res_addrs, sgpr_data, user: user.to_vec(), reads: rd.reads, words: rd.words, map_gen, images_gen, cmp_images, cmp_depth };
+    let prepared = Prepared { stage: spec.stage, addr, insts, tr, resources, res_addrs, sgpr_data, user: user.to_vec(), reads: rd.reads, words: rd.words, map_gen, images_gen, cmp_images, cmp_depth, data_loads };
     let mut words = Vec::new();
     if cacheable && read_words(&prepared.reads, &mut words) {
         let e = PrepEntry { key: prep_key, words, prepared: prepared.clone() };

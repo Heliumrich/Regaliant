@@ -531,11 +531,11 @@ impl Exec {
         self.sync_readers = [vs.addr, ps.as_ref().map_or(0, |p| p.addr)];
         // Each stage's reads in place (no combined copy per draw), unless the
         // stages are used as prepared (`speculate`).
-        let speculated = match &ps {
+        let patches = match &ps {
             Some(p) => self.speculate(&[&vs, p]),
             None => self.speculate(&[&vs]),
         };
-        let waited = !speculated && (self.sync_for(&vs.reads, SYNC_DRAW_READS) | ps.as_ref().is_some_and(|p| self.sync_for(&p.reads, SYNC_DRAW_READS)));
+        let waited = patches.is_none() && (self.sync_for(&vs.reads, SYNC_DRAW_READS) | ps.as_ref().is_some_and(|p| self.sync_for(&p.reads, SYNC_DRAW_READS)));
         if self.stopped {
             return Err(super::STOPPED.into());
         }
@@ -739,7 +739,10 @@ impl Exec {
             if self.stopped {
                 return Err(super::STOPPED.into());
             }
-            self.bind_sgpr(p, &mut b)?;
+            let (ring, at) = self.bind_sgpr(p, &mut b)?;
+            if let Some(pt) = &patches {
+                self.patch_sgpr(pt, k, ring, at);
+            }
             bounds.push(b);
             lap.mark(10 + k.min(1));
         }
