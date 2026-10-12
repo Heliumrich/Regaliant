@@ -2027,6 +2027,43 @@ fn pre_repeat_line() -> String {
 pub(super) static CS_PHASES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 pub(super) static DRAW_PHASES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
+/// Command-processor time per compute shader while profiling: [dispatches,
+/// then ns until prepared, until textures and pipeline, until bound, in all].
+static CS_CPU: Mutex<Option<HashMap<u64, [u64; 5]>>> = Mutex::new(None);
+
+fn note_cs_cpu(addr: u64, t: [std::time::Duration; 4]) {
+    let mut g = CS_CPU.lock();
+    let e = g.get_or_insert_with(HashMap::new).entry(addr).or_insert([0; 5]);
+    e[0] += 1;
+    for k in 0..4 {
+        e[k + 1] += t[k].as_nanos() as u64;
+    }
+}
+
+/// The compute shaders taking the most command-processor time (profile).
+fn cs_cpu_lines() -> String {
+    let g = CS_CPU.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(&u64, &[u64; 5])> = m.iter().collect();
+    v.sort_by(|a, b| b.1[4].cmp(&a.1[4]));
+    let all: u64 = v.iter().map(|x| x.1[4]).sum();
+    let mut s = format!("    command-processor time by compute shader ({} ms in all):\n", all / 1_000_000);
+    for (a, x) in v.iter().take(12) {
+        let n = x[0].max(1) as f64;
+        let us = |k: usize| x[k] as f64 / n / 1000.0;
+        s.push_str(&format!(
+            "      cs {a:#x}: {} dispatches, {} ms, us each: prepare and waits {:.1}, textures and pipeline {:.1}, bindings {:.1}, recording {:.1}\n",
+            x[0],
+            x[4] / 1_000_000,
+            us(1),
+            us(2) - us(1),
+            us(3) - us(2),
+            us(4) - us(3)
+        ));
+    }
+    s
+}
+
 pub(super) fn note_phases(table: &[AtomicU64; 5], t: [std::time::Duration; 4]) {
     for (k, d) in t.iter().enumerate() {
         table[k].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
@@ -2277,6 +2314,7 @@ pub fn reset_shader_profile() {
     if let Some(m) = SHADER_TIME.lock().as_mut() {
         m.clear();
     }
+    *CS_CPU.lock() = None;
     *SHADER_PLACEMENTS.lock() = None;
     shaders::reset_repeats();
     *QUEUE_WAITS.lock() = None;
@@ -2352,6 +2390,7 @@ pub fn shader_profile() -> String {
     s.push_str(&sync_steps_line());
     s.push_str(&shaders::repeats_line());
     s.push_str(&phases_line("dispatch", &CS_PHASES, ["prepare and waits", "textures, pipeline", "bindings"]));
+    s.push_str(&cs_cpu_lines());
     {
         let n: Vec<u64> = SYNC_WHY.iter().zip(SYNC_WHY_AT_RESET.iter()).map(|(c, r)| c.load(Ordering::Relaxed).saturating_sub(r.load(Ordering::Relaxed))).collect();
         s.push_str(&format!(
@@ -4911,6 +4950,7 @@ impl Exec {
         let total = t_start.elapsed();
         if profiling() {
             note_phases(&CS_PHASES, [t_prep, t_pipe, t_bind, total]);
+            note_cs_cpu(p.addr, [t_prep, t_pipe, t_bind, total]);
         }
         if total.as_millis() >= 200 {
             let phases = if profiling() { format!(" (prepare {} ms, pipeline {} ms, bindings {} ms)", t_prep.as_millis(), (t_pipe - t_prep).as_millis(), (t_bind - t_pipe).as_millis()) } else { String::new() };
