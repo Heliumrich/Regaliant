@@ -160,6 +160,22 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// dropped by GPU/CP/host writes and mapping changes, dropped by eviction,
 /// no space, failed checks, not kept (GPU-written lately)].
 static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// STATS at the last `profile reset` (`window_line`).
+static SNAP: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+/// Starts a profile window (`profile reset`).
+pub fn reset_window() {
+    for (s, v) in SNAP.iter().zip(STATS.iter()) {
+        s.store(v.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+}
+
+/// The shared copies since the last `profile reset`.
+pub fn window_line() -> String {
+    let d: Vec<u64> = STATS.iter().zip(SNAP.iter()).map(|(v, s)| v.load(Ordering::Relaxed).saturating_sub(s.load(Ordering::Relaxed))).collect();
+    format!("shared: {} copies, {} reused, {} without space, entries dropped by eviction {}", d[1], d[0], d[6], d[5])
+}
+
 /// Epochs by reason: [title submission, CPU-released wait, REWIND].
 static ENDS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 

@@ -903,6 +903,7 @@ pub fn reset_profile() {
     cp::reset_wait_stats();
     par::reset_stats();
     images::reset_memo_stats();
+    exec::reset_pre_window();
 }
 
 /// The profile so far (`profile report` control command).
@@ -912,6 +913,7 @@ pub fn profile_report() -> String {
     s.push_str(&cp::wait_stats());
     s.push_str(&par::status());
     s.push_str(&images::memo_stats_line());
+    s.push_str(&exec::pre_window_line());
     s
 }
 

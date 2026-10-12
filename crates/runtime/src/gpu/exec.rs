@@ -1149,6 +1149,22 @@ const SNAP_SEG: u64 = 16 << 20;
 const PRE_SEG: u64 = 64 << 20;
 static PRE_COPIES: AtomicU64 = AtomicU64::new(0);
 static PRE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// PRE_COPIES and PRE_BYTES at the last `profile reset`.
+static PRE_SNAP: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Starts a profile window of the batch-start copies (`profile reset`).
+pub(super) fn reset_pre_window() {
+    PRE_SNAP[0].store(PRE_COPIES.load(Ordering::Relaxed), Ordering::Relaxed);
+    PRE_SNAP[1].store(PRE_BYTES.load(Ordering::Relaxed), Ordering::Relaxed);
+    super::precache::reset_window();
+}
+
+/// The batch-start copies since the last `profile reset` (`profile report`).
+pub(super) fn pre_window_line() -> String {
+    let n = PRE_COPIES.load(Ordering::Relaxed).saturating_sub(PRE_SNAP[0].load(Ordering::Relaxed));
+    let b = PRE_BYTES.load(Ordering::Relaxed).saturating_sub(PRE_SNAP[1].load(Ordering::Relaxed));
+    format!("    batch-start copies in the window: {n} ({} MiB); {}\n", b >> 20, super::precache::window_line())
+}
 static PRE_REUSED: AtomicU64 = AtomicU64::new(0);
 static PRE_FULL: AtomicU64 = AtomicU64::new(0);
 /// GPU time of the batches' copy prologues (DS_PROFILE_GPU), ns.
