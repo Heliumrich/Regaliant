@@ -286,8 +286,9 @@ fn set_layout_bindings(stages: &[(&Prepared, vk::ShaderStageFlags)]) -> Vec<vk::
 }
 
 /// Creates a graphics pipeline for dynamic rendering (`push_mode`: a push
-/// descriptor layout if it fits, `push_layout`).
-fn graphics_pipeline(key: &GfxKey, vs: &Prepared, ps: Option<&Prepared>, push_mode: bool) -> Result<Pipe, String> {
+/// descriptor layout if it fits, `push_layout`), through the pipeline cache
+/// file of `hkey`.
+fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared>, push_mode: bool) -> Result<Pipe, String> {
     let c = ctx();
     unsafe {
         let mut stages_p = vec![(vs, vk::ShaderStageFlags::VERTEX)];
@@ -381,8 +382,7 @@ fn graphics_pipeline(key: &GfxKey, vs: &Prepared, ps: Option<&Prepared>, push_mo
             .layout(layout)
             .flags(crate::gpu::pstats::flags())
             .push_next(&mut rinfo);
-        let r = c.device.create_graphics_pipelines(crate::gpu::pcache::get(), &[gpci], None);
-        crate::gpu::pcache::created();
+        let r = crate::gpu::pcache::with_cache('g', hkey, |cache| c.device.create_graphics_pipelines(cache, &[gpci], None));
         for (_, m) in modules {
             c.device.destroy_shader_module(m, None);
         }
@@ -689,7 +689,7 @@ impl Exec {
             Some(x) => x,
             None => {
                 let t0 = std::time::Instant::now();
-                let p = graphics_pipeline(&key, &vs, ps.as_ref(), push_mode)?;
+                let p = graphics_pipeline(&key, hkey, &vs, ps.as_ref(), push_mode)?;
                 super::PIPES_CREATED[1].fetch_add(1, Ordering::Relaxed);
                 super::PIPES_NS[1].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 if p.push {

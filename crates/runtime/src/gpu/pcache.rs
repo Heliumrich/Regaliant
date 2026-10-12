@@ -1,113 +1,377 @@
-//! Persistent Vulkan pipeline cache (`local-data/pipeline-cache.bin`).
+//! Persistent Vulkan pipeline caches, one per pipeline
+//! (`local-data/pipelines/<kind><key>.bin`).
 //!
-//! Creating the title's ~150 pipelines takes ~150 s per run (62 s of it during
-//! the first area load, on the graphics command processor). The translated
-//! SPIR-V is deterministic, so a cache kept across runs lets the driver skip
-//! compilation. The file is loaded once, the cache is shared by all pipeline
-//! creations (Vulkan pipeline caches are internally synchronized), and it is
-//! saved in the background after `SAVE_EVERY` pipeline creations at most every
-//! `SAVE_INTERVAL`, and at shutdown (written to a temporary file, then
-//! renamed). Incompatible data (another driver or GPU) is rejected by the
-//! driver's header check.
+//! Creating the title's pipelines from scratch takes minutes per run (~700 in
+//! 122 s at the 2026-10-11 courtyard), so compiled pipelines are kept across
+//! runs. One cache file for all of them grew without bound (Vulkan caches
+//! never drop entries: 1.5 GB by 2026-10-11, entries of earlier translations
+//! and variants included, copied out of the driver and rewritten 26 times in
+//! one run), and over its 1 GiB load limit it was dropped whole, so the next
+//! run recompiled everything. Now each pipeline is created with a small cache
+//! of its own, loaded from the file named by the pipeline's key (translation
+//! and state: `exec::compute_pipe`, the graphics state hash); the file is
+//! written when creation added data (a miss, or another translation under
+//! the same key) and touched when it was used as is. At startup the files used
+//! longest ago go beyond `BUDGET` bytes. Data of another driver or GPU is
+//! rejected by the driver's header check and replaced.
 //!
-//! Vulkan caches never drop entries: pipelines of earlier translations stay in
-//! the file. By 2026-10-11 it had grown to 1.5 GB, was copied out of the driver
-//! and rewritten 26 times in one run, and pipeline creations waited for those
-//! copies. Saved data over `MAX_LOAD` is therefore not loaded (the cache starts
-//! empty and the file is replaced by the next save).
+//! The data of every one-pipeline cache on the RTX 4090 driver (610.88)
+//! carries the same ~2 MB block (2,097,212 bytes, at varying offsets) besides
+//! the pipeline's own entries (tens of KB), so files store the pipeline's
+//! bytes and a reference to the block, which is kept once (`<hash>.blk`;
+//! found by comparing two pipelines' data, `discover`). Files written whole
+//! are converted when read.
 
 use super::vk::ctx;
 use ash::vk;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use parking_lot::Mutex;
 
-static PATH: OnceLock<PathBuf> = OnceLock::new();
-static CACHE: OnceLock<vk::PipelineCache> = OnceLock::new();
-static NEW: AtomicU64 = AtomicU64::new(0);
-static SAVING: AtomicBool = AtomicBool::new(false);
-/// Size of the data last loaded or saved (unchanged data is not rewritten).
-static SAVED_LEN: AtomicU64 = AtomicU64::new(0);
-/// When the last save started (ms since `START`).
-static LAST_SAVE_MS: AtomicU64 = AtomicU64::new(0);
-static START: OnceLock<std::time::Instant> = OnceLock::new();
-const SAVE_EVERY: u64 = 32;
-const SAVE_INTERVAL_MS: u64 = 180_000;
-const MAX_LOAD: usize = 1 << 30;
+static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Where the cache lives (set once at startup; no file, no persistence).
-pub fn set_path(p: PathBuf) {
-    let _ = PATH.set(p);
+/// File header of data stored without its shared block: the magic, the
+/// block's offset and length (u32 each) and its hash (u64), then the data
+/// before and after it.
+const MAGIC: &[u8; 8] = b"DSPCDDP1";
+const HEADER: usize = 8 + 4 + 4 + 8;
+/// Shortest block stored apart.
+const MIN_BLOCK: usize = 1 << 20;
+/// Known shared blocks by hash (loaded from `<hash>.blk` when first needed).
+static BLOCKS: Mutex<Vec<(u64, Arc<Vec<u8>>)>> = Mutex::new(Vec::new());
+/// The last data written whole: a shared block is found by comparing two.
+static LAST_WHOLE: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+fn hash64(b: &[u8]) -> u64 {
+    // FNV-1a.
+    b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x100_0000_01b3))
 }
 
-/// The shared pipeline cache (created, from the saved data, on first use).
-pub fn get() -> vk::PipelineCache {
-    *CACHE.get_or_init(|| {
-        let d = &ctx().device;
-        START.get_or_init(std::time::Instant::now);
-        let mut data = PATH.get().and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
-        if data.len() > MAX_LOAD {
-            crate::warn!("pipeline cache: {} MiB of saved data (entries of earlier translations accumulate) is over {} MiB: starting empty", data.len() >> 20, MAX_LOAD >> 20);
-            data = Vec::new();
+/// First position of `needle` in `hay`.
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    find_from(hay, needle, 0)
+}
+
+/// First position of `needle` in `hay` from `start`.
+fn find_from(hay: &[u8], needle: &[u8], start: usize) -> Option<usize> {
+    let n = needle.len();
+    if n == 0 || n > hay.len() {
+        return None;
+    }
+    let sig = &needle[..n.min(64)];
+    let last = hay.len() - n;
+    let mut i = start;
+    while i <= last {
+        let p = hay[i..=last].iter().position(|&b| b == sig[0])?;
+        let j = i + p;
+        if &hay[j..j + sig.len()] == sig && &hay[j..j + n] == needle {
+            return Some(j);
         }
-        if !data.is_empty() {
-            let ci = vk::PipelineCacheCreateInfo::default().initial_data(&data);
-            match unsafe { d.create_pipeline_cache(&ci, None) } {
-                Ok(c) => {
-                    crate::info!("pipeline cache: {} KiB loaded", data.len() >> 10);
-                    SAVED_LEN.store(data.len() as u64, Ordering::Relaxed);
-                    return c;
-                }
-                Err(e) => crate::warn!("pipeline cache: saved data rejected ({e}); starting empty"),
+        i = j + 1;
+    }
+    None
+}
+
+/// A run of `b` of at least MIN_BLOCK bytes that `a` also contains, grown
+/// from 64-byte windows near the middle of `b` (each occurrence in `a` is
+/// tried: the data may repeat short patterns).
+fn discover(a: &[u8], b: &[u8]) -> Option<Vec<u8>> {
+    if b.len() < MIN_BLOCK || a.len() < MIN_BLOCK {
+        return None;
+    }
+    for k in 0..8 {
+        let mid = (b.len() / 2 + k * 4099).min(b.len() - 64);
+        let w = &b[mid..mid + 64];
+        let mut from = 0;
+        for _ in 0..256 {
+            let Some(t) = find_from(a, w, from) else { break };
+            let (mut s, mut u) = (mid, t);
+            while s > 0 && u > 0 && b[s - 1] == a[u - 1] {
+                s -= 1;
+                u -= 1;
+            }
+            let (mut e, mut v) = (mid + 64, t + 64);
+            while e < b.len() && v < a.len() && b[e] == a[v] {
+                e += 1;
+                v += 1;
+            }
+            if e - s >= MIN_BLOCK {
+                return Some(b[s..e].to_vec());
+            }
+            from = t + 1;
+        }
+    }
+    None
+}
+
+fn block_path(dir: &Path, h: u64) -> PathBuf {
+    dir.join(format!("{h:016x}.blk"))
+}
+
+/// The shared block with hash `h` (from its file when first needed).
+fn block(h: u64) -> Option<Arc<Vec<u8>>> {
+    if let Some((_, b)) = BLOCKS.lock().iter().find(|(k, _)| *k == h) {
+        return Some(b.clone());
+    }
+    let data = std::fs::read(block_path(DIR.get()?, h)).ok()?;
+    if hash64(&data) != h {
+        return None;
+    }
+    let b = Arc::new(data);
+    BLOCKS.lock().push((h, b.clone()));
+    Some(b)
+}
+
+/// The blocks stored so far (their files: `<hash>.blk`).
+fn load_blocks(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if let Some(h) = name.strip_suffix(".blk").and_then(|x| u64::from_str_radix(x, 16).ok()) {
+            let _ = block(h);
+        }
+    }
+}
+
+/// Pipeline cache data as stored: without a known shared block when it
+/// contains one (a new block is found by comparing with the last data
+/// written whole, and stored).
+fn encode(data: &[u8]) -> Vec<u8> {
+    let known: Vec<(u64, Arc<Vec<u8>>)> = BLOCKS.lock().clone();
+    for (h, b) in &known {
+        if let Some(o) = find(data, b) {
+            let mut out = Vec::with_capacity(HEADER + data.len() - b.len());
+            out.extend_from_slice(MAGIC);
+            out.extend_from_slice(&(o as u32).to_le_bytes());
+            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            out.extend_from_slice(&h.to_le_bytes());
+            out.extend_from_slice(&data[..o]);
+            out.extend_from_slice(&data[o + b.len()..]);
+            return out;
+        }
+    }
+    let prev = LAST_WHOLE.lock().replace(data.to_vec());
+    if let (Some(prev), Some(dir)) = (prev, DIR.get()) {
+        if let Some(b) = discover(&prev, data) {
+            let h = hash64(&b);
+            if std::fs::write(block_path(dir, h), &b).is_ok() {
+                crate::info!("pipeline cache: a {} KiB block shared by the pipelines' data is stored once ({h:016x}.blk)", b.len() >> 10);
+                BLOCKS.lock().push((h, Arc::new(b)));
+                *LAST_WHOLE.lock() = None;
+                return encode(data);
             }
         }
-        unsafe { d.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) }.unwrap_or_else(|e| {
-            crate::warn!("pipeline cache: creation failed ({e}); pipelines are not cached");
-            vk::PipelineCache::null()
+    }
+    data.to_vec()
+}
+
+/// The pipeline cache data of a file (None: a block it names is missing).
+fn decode(file: &[u8]) -> Option<Vec<u8>> {
+    if file.len() < HEADER || &file[..8] != MAGIC {
+        return Some(file.to_vec());
+    }
+    let o = u32::from_le_bytes(file[8..12].try_into().ok()?) as usize;
+    let n = u32::from_le_bytes(file[12..16].try_into().ok()?) as usize;
+    let h = u64::from_le_bytes(file[16..24].try_into().ok()?);
+    let rest = &file[HEADER..];
+    let b = block(h)?;
+    if b.len() != n || o > rest.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(rest.len() + n);
+    out.extend_from_slice(&rest[..o]);
+    out.extend_from_slice(&b);
+    out.extend_from_slice(&rest[o..]);
+    Some(out)
+}
+
+/// Writes a pipeline file (temporary name first: two threads may make the
+/// same pipeline).
+fn write_file(p: &Path, bytes: &[u8]) -> bool {
+    let tmp = p.with_extension(format!("{:x}.tmp", std::thread::current().id().as_u64_compat()));
+    if std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, p)).is_ok() {
+        return true;
+    }
+    let _ = std::fs::remove_file(&tmp);
+    false
+}
+
+/// Stores the pipeline files written whole without their shared block
+/// (before pruning, which goes by size).
+fn convert(dir: &Path) {
+    load_blocks(dir);
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut n = 0;
+    for e in rd.flatten() {
+        let path = e.path();
+        if path.extension().is_none_or(|x| x != "bin") {
+            continue;
+        }
+        let Ok(file) = std::fs::read(&path) else { continue };
+        if file.starts_with(MAGIC) {
+            continue;
+        }
+        let enc = encode(&file);
+        if enc.len() < file.len() && write_file(&path, &enc) {
+            n += 1;
+        }
+    }
+    if n > 0 {
+        crate::info!("pipeline cache: {n} pipeline files stored without their shared block");
+    }
+}
+
+/// Bytes of pipeline files kept (the least recently used beyond it go at
+/// startup, down to three quarters of it).
+const BUDGET: u64 = 2 << 30;
+
+/// [pipelines created from their file unchanged, files written (misses),
+/// bytes written, files pruned].
+pub static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Where the pipeline files live (set once at startup; none: no persistence).
+/// Prunes the directory in the background.
+pub fn set_dir(dir: PathBuf) {
+    if std::fs::create_dir_all(&dir).is_err() || DIR.set(dir.clone()).is_err() {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("pcache-prune".into()).spawn(move || {
+        convert(&dir);
+        prune(&dir);
+    });
+}
+
+/// Removes the files used longest ago while the directory is over `BUDGET`.
+fn prune(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = rd
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            Some((m.modified().ok()?, m.len(), e.path()))
         })
-    })
-}
-
-/// Notes a pipeline creation; saves in the background now and then.
-pub fn created() {
-    let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
-    let last = LAST_SAVE_MS.load(Ordering::Relaxed);
-    if NEW.fetch_add(1, Ordering::Relaxed) + 1 >= SAVE_EVERY && now >= last + SAVE_INTERVAL_MS && !SAVING.swap(true, Ordering::AcqRel) {
-        NEW.store(0, Ordering::Relaxed);
-        LAST_SAVE_MS.store(now, Ordering::Relaxed);
-        let spawned = std::thread::Builder::new().name("pcache-save".into()).spawn(|| {
-            save();
-            SAVING.store(false, Ordering::Release);
-        });
-        if spawned.is_err() {
-            SAVING.store(false, Ordering::Release);
+        .collect();
+    let mut total: u64 = files.iter().map(|f| f.1).sum();
+    crate::info!("pipeline cache: {} pipeline files, {} MiB", files.len(), total >> 20);
+    if total <= BUDGET {
+        return;
+    }
+    files.sort_by_key(|f| f.0);
+    let mut removed = 0u64;
+    for (_, len, path) in files {
+        if total <= BUDGET / 4 * 3 {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total -= len;
+            removed += 1;
         }
     }
+    STATS[3].fetch_add(removed, Ordering::Relaxed);
+    crate::info!("pipeline cache: {removed} pipeline files used longest ago removed ({} MiB left)", total >> 20);
 }
 
-/// Writes the cache to its file (temporary file, then rename).
-pub fn save() {
-    let (Some(path), Some(&cache)) = (PATH.get(), CACHE.get()) else { return };
+/// Creates a pipeline through the cache file of `key` (`kind`: 'c' compute,
+/// 'g' graphics, 'i' the runtime's own): `create` gets the pipeline cache to
+/// pass to vkCreate*Pipelines.
+pub fn with_cache<T>(kind: char, key: u64, create: impl FnOnce(vk::PipelineCache) -> T) -> T {
+    let d = &ctx().device;
+    let path = DIR.get().map(|dir| dir.join(format!("{kind}{key:016x}.bin")));
+    let file = path.as_ref().and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
+    let whole = !file.starts_with(MAGIC);
+    let data = decode(&file).unwrap_or_default();
+    let cache = unsafe { d.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&data), None) }
+        .or_else(|_| unsafe { d.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) })
+        .unwrap_or(vk::PipelineCache::null());
+    let r = create(cache);
     if cache == vk::PipelineCache::null() {
-        return;
+        return r;
     }
-    let data = match unsafe { ctx().device.get_pipeline_cache_data(cache) } {
-        Ok(d) => d,
-        Err(e) => {
-            crate::warn!("pipeline cache: reading the data failed ({e})");
-            return;
+    if let Some(p) = &path {
+        match unsafe { d.get_pipeline_cache_data(cache) } {
+            Ok(new) if new.len() != data.len() => {
+                let enc = encode(&new);
+                if write_file(p, &enc) {
+                    STATS[1].fetch_add(1, Ordering::Relaxed);
+                    STATS[2].fetch_add(enc.len() as u64, Ordering::Relaxed);
+                }
+            }
+            Ok(new) if whole && !file.is_empty() => {
+                // A file written whole: store it without its shared block.
+                STATS[0].fetch_add(1, Ordering::Relaxed);
+                let enc = encode(&new);
+                if enc.len() < file.len() {
+                    write_file(p, &enc);
+                }
+            }
+            Ok(_) => {
+                STATS[0].fetch_add(1, Ordering::Relaxed);
+                // Last use, for pruning.
+                if let Ok(f) = std::fs::File::options().write(true).open(p) {
+                    let _ = f.set_modified(std::time::SystemTime::now());
+                }
+            }
+            Err(e) => crate::warn!("pipeline cache: reading the data of {kind}{key:016x} failed ({e})"),
         }
-    };
-    if data.len() as u64 == SAVED_LEN.load(Ordering::Relaxed) {
-        return;
     }
-    let tmp = path.with_extension("tmp");
-    let r = std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, path));
-    match r {
-        Ok(()) => {
-            SAVED_LEN.store(data.len() as u64, Ordering::Relaxed);
-            crate::info!("pipeline cache: {} KiB saved", data.len() >> 10)
+    unsafe { d.destroy_pipeline_cache(cache, None) };
+    r
+}
+
+/// One status line.
+pub fn status() -> String {
+    let s: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    format!("    pipeline cache files: {} pipelines from their file, {} written ({} MiB), {} pruned\n", s[0], s[1], s[2] >> 20, s[3])
+}
+
+/// `ThreadId::as_u64` is unstable: a stable number per thread from its debug
+/// form.
+trait ThreadIdNumber {
+    fn as_u64_compat(&self) -> u64;
+}
+
+impl ThreadIdNumber for std::thread::ThreadId {
+    fn as_u64_compat(&self) -> u64 {
+        format!("{self:?}").bytes().filter(u8::is_ascii_digit).fold(0u64, |a, b| a.wrapping_mul(10).wrapping_add((b - b'0') as u64))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two pipelines' data sharing a 1.5 MiB block at different offsets:
+    /// `discover` finds it, and stored without it the data comes back whole.
+    #[test]
+    fn shared_block_round_trip() {
+        // xorshift64 bytes, with a short repeated pattern at the window the
+        // search starts from (as the driver's data may hold).
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut block: Vec<u8> = (0..(3 << 19))
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let pat: Vec<u8> = block[700_000..700_200].to_vec();
+        block[100..300].copy_from_slice(&pat);
+        let a: Vec<u8> = [&b"header-a"[..], &block, &[7u8; 300]].concat();
+        let b: Vec<u8> = [&[9u8; 5000][..], &block, &b"tail-b"[..]].concat();
+        let found = discover(&a, &b).expect("block");
+        assert_eq!(found, block);
+        let h = hash64(&found);
+        BLOCKS.lock().push((h, Arc::new(found)));
+        for data in [&a, &b] {
+            let enc = encode(data);
+            assert!(enc.starts_with(MAGIC) && enc.len() < data.len() / 100);
+            assert_eq!(decode(&enc).as_deref(), Some(&data[..]));
         }
-        Err(e) => crate::warn!("pipeline cache: saving to {} failed ({e})", path.display()),
+        // Data without the block is stored whole.
+        let c = b"short pipeline data".to_vec();
+        assert_eq!(decode(&encode(&c)).as_deref(), Some(&c[..]));
     }
 }

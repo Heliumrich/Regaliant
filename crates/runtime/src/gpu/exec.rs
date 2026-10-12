@@ -602,7 +602,7 @@ fn compute_pipe(p: &Prepared) -> Result<Pipe, String> {
         return Ok(*x);
     }
     let t0 = std::time::Instant::now();
-    let pipe = compute_pipeline(&p.tr.out, push_mode)?;
+    let pipe = compute_pipeline(&p.tr.out, push_mode, Some(key))?;
     PIPES_CREATED[0].fetch_add(1, Ordering::Relaxed);
     PIPES_NS[0].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     if pipe.push {
@@ -644,8 +644,9 @@ fn keep_pipe(map: &Mutex<Option<HashMap<u64, Pipe>>>, key: u64, pipe: Pipe) -> P
 }
 
 /// Creates a compute pipeline (and its layouts) for a translated shader
-/// (`push_mode`: a push descriptor layout if it fits, `push_layout`).
-fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool) -> Result<Pipe, String> {
+/// (`push_mode`: a push descriptor layout if it fits, `push_layout`; with
+/// `cache_key`, through that key's pipeline cache file).
+fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: Option<u64>) -> Result<Pipe, String> {
     let c = ctx();
     {
         unsafe {
@@ -667,9 +668,12 @@ fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool) -> Result<Pi
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&out.spirv), None).map_err(|e| format!("shader module: {e}"))?;
             let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
             let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout).flags(vk::PipelineCreateFlags::DISPATCH_BASE | super::pstats::flags());
-            let pipeline = c.device.create_compute_pipelines(super::pcache::get(), &[ci], None).map_err(|(_, e)| format!("compute pipeline: {e}"));
+            let create = |cache| c.device.create_compute_pipelines(cache, &[ci], None).map_err(|(_, e)| format!("compute pipeline: {e}"));
+            let pipeline = match cache_key {
+                Some(k) => super::pcache::with_cache('c', k, create),
+                None => create(vk::PipelineCache::null()),
+            };
             c.device.destroy_shader_module(module, None);
-            super::pcache::created();
             Ok(Pipe { pipeline: pipeline?[0], layout, set_layout, push })
         }
     }
@@ -719,7 +723,7 @@ pub fn pipeline_test(capture: &str) -> i32 {
         };
         let t0 = std::time::Instant::now();
         // Sets of its own pool (no pushed descriptors).
-        let p = match compute_pipeline(out, false) {
+        let p = match compute_pipeline(out, false, None) {
             Ok(p) => p,
             Err(e) => {
                 failed += 1;
@@ -1219,7 +1223,7 @@ fn merge_pipe() -> Result<&'static MergePipe, String> {
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("merge module: {e}"))?;
             let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
             let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
-            let pipeline = c.device.create_compute_pipelines(super::pcache::get(), &[ci], None).map_err(|(_, e)| format!("merge pipeline: {e}"));
+            let pipeline = super::pcache::with_cache('i', 1, |cache| c.device.create_compute_pipelines(cache, &[ci], None)).map_err(|(_, e)| format!("merge pipeline: {e}"));
             c.device.destroy_shader_module(module, None);
             Ok(MergePipe { pipeline: pipeline?[0], layout, set_layout })
         }
@@ -1862,7 +1866,7 @@ fn ts_pipe() -> Result<&'static TsPipe, String> {
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("timestamp module: {e}"))?;
             let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
             let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
-            let pipeline = c.device.create_compute_pipelines(super::pcache::get(), &[ci], None).map_err(|(_, e)| format!("timestamp pipeline: {e}"));
+            let pipeline = super::pcache::with_cache('i', 2, |cache| c.device.create_compute_pipelines(cache, &[ci], None)).map_err(|(_, e)| format!("timestamp pipeline: {e}"));
             c.device.destroy_shader_module(module, None);
             Ok(TsPipe { pipeline: pipeline?[0], layout, set_layout })
         }
@@ -4843,6 +4847,7 @@ pub fn status() -> String {
         + &super::ahead::status()
         + &super::par::status()
         + &super::precache::status()
+        + &super::pcache::status()
         + &super::images::scrub_status()
         + &super::mirror::status()
         + &super::homes::status()
