@@ -1149,13 +1149,16 @@ const SNAP_SEG: u64 = 16 << 20;
 const PRE_SEG: u64 = 64 << 20;
 static PRE_COPIES: AtomicU64 = AtomicU64::new(0);
 static PRE_BYTES: AtomicU64 = AtomicU64::new(0);
-/// PRE_COPIES and PRE_BYTES at the last `profile reset`.
-static PRE_SNAP: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// vkCmdCopyBuffer calls recording batch-start copies (`tune pre_merge`).
+static PRE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// PRE_COPIES, PRE_BYTES and PRE_CALLS at the last `profile reset`.
+static PRE_SNAP: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Starts a profile window of the batch-start copies (`profile reset`).
 pub(super) fn reset_pre_window() {
     PRE_SNAP[0].store(PRE_COPIES.load(Ordering::Relaxed), Ordering::Relaxed);
     PRE_SNAP[1].store(PRE_BYTES.load(Ordering::Relaxed), Ordering::Relaxed);
+    PRE_SNAP[2].store(PRE_CALLS.load(Ordering::Relaxed), Ordering::Relaxed);
     super::precache::reset_window();
 }
 
@@ -1163,7 +1166,8 @@ pub(super) fn reset_pre_window() {
 pub(super) fn pre_window_line() -> String {
     let n = PRE_COPIES.load(Ordering::Relaxed).saturating_sub(PRE_SNAP[0].load(Ordering::Relaxed));
     let b = PRE_BYTES.load(Ordering::Relaxed).saturating_sub(PRE_SNAP[1].load(Ordering::Relaxed));
-    format!("    batch-start copies in the window: {n} ({} MiB); {}\n", b >> 20, super::precache::window_line())
+    let k = PRE_CALLS.load(Ordering::Relaxed).saturating_sub(PRE_SNAP[2].load(Ordering::Relaxed));
+    format!("    batch-start copies in the window: {n} ({} MiB, {k} copy calls); {}\n", b >> 20, super::precache::window_line())
 }
 static PRE_REUSED: AtomicU64 = AtomicU64::new(0);
 static PRE_FULL: AtomicU64 = AtomicU64::new(0);
@@ -2392,6 +2396,9 @@ pub struct Exec {
     pre_open: bool,
     pre_failed: bool,
     pres: super::fx::Map<(u64, u64), (vk::Buffer, u64)>,
+    /// Prologue copies not recorded yet (`tune pre_merge`): (source,
+    /// destination, region), recorded grouped by buffers by `end_pre`.
+    pre_copies: Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>,
     ring_align: u64,
     recording: bool,
     /// When the batch being recorded was begun.
@@ -2523,6 +2530,7 @@ impl Exec {
                 pre_open: false,
                 pre_failed: false,
                 pres: Default::default(),
+                pre_copies: Vec::new(),
                 ring_align: c.limits.min_storage_buffer_offset_alignment.max(16),
                 recording: false,
                 begun_at: std::time::Instant::now(),
@@ -3004,9 +3012,28 @@ impl Exec {
     /// before the batch's work (which begins with a full barrier).
     fn end_pre(&mut self) -> Option<vk::CommandBuffer> {
         if !std::mem::take(&mut self.pre_open) {
+            self.pre_copies.clear();
             return None;
         }
         let (pre, qp) = (self.slots[self.cur].pre, self.slots[self.cur].queries);
+        if !self.pre_copies.is_empty() {
+            // The copies' destinations are distinct ranges of video memory
+            // and their sources guest memory: any order is the same.
+            self.pre_copies.sort_unstable_by_key(|&(s, d, r)| (s, d, r.src_offset));
+            let mut regions: Vec<vk::BufferCopy> = Vec::with_capacity(self.pre_copies.len());
+            let mut i = 0;
+            while i < self.pre_copies.len() {
+                let (src, dst, _) = self.pre_copies[i];
+                regions.clear();
+                while i < self.pre_copies.len() && self.pre_copies[i].0 == src && self.pre_copies[i].1 == dst {
+                    regions.push(self.pre_copies[i].2);
+                    i += 1;
+                }
+                PRE_CALLS.fetch_add(1, Ordering::Relaxed);
+                unsafe { ctx().device.cmd_copy_buffer(pre, src, dst, &regions) };
+            }
+            self.pre_copies.clear();
+        }
         unsafe {
             global_barrier(pre);
             if qp != vk::QueryPool::null() {
@@ -3077,9 +3104,14 @@ impl Exec {
             Some((chunk, at, _)) => (chunk.buf, *at),
             None => (self.slots[self.cur].pre_buf?, off),
         };
-        let c = ctx();
         let pre = self.open_pre();
-        unsafe { c.device.cmd_copy_buffer(pre, src, buf, &[vk::BufferCopy { src_offset: al - start, dst_offset: off, size: n }]) };
+        let region = vk::BufferCopy { src_offset: al - start, dst_offset: off, size: n };
+        if super::tune::pre_merge() {
+            self.pre_copies.push((src, buf, region));
+        } else {
+            PRE_CALLS.fetch_add(1, Ordering::Relaxed);
+            unsafe { ctx().device.cmd_copy_buffer(pre, src, buf, &[region]) };
+        }
         match shared {
             Some((chunk, _, id)) => {
                 self.slots[self.cur].keep.push(chunk);

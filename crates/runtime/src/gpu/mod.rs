@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 42] = [
+    static ALL: [Tunable; 43] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -69,6 +69,7 @@ pub mod tune {
         Tunable { name: "pre_inflight", env: "DS_PRE_INFLIGHT", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "idle_split", env: "DS_IDLE_SPLIT", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "push_desc", env: "DS_PUSH_DESC", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_merge", env: "DS_PRE_MERGE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -337,6 +338,15 @@ pub mod tune {
     /// waited for the workers (`par::main_weight`); 0: equal chunks.
     pub fn par_balance() -> bool {
         get(38) != 0
+    }
+
+    /// A batch's prologue copies are recorded when the prologue ends, one
+    /// vkCmdCopyBuffer per source and destination buffer with all their
+    /// regions (0: one call per copy as it is made). ~5.6x fewer calls in
+    /// the courtyard; the rate effect was within the noise of a loaded run
+    /// (20261012-163645), so it stays off until measured on a quiet machine.
+    pub fn pre_merge() -> bool {
+        get(42) != 0
     }
 
     /// Batch-start copies of ranges that submitted batches of the same queue
