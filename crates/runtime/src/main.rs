@@ -431,12 +431,17 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 }
             }
             "replay" => {
-                // `replay <iterations> [<switch> <a> <b>]`: one frame of the
-                // title replayed through the GPU front end with the title
-                // held, optionally alternating a `tune` switch
-                // (`gpu::replay`).
+                // `replay <iterations> [<switch> <a> <b>] [timeline=<k>]`: one
+                // frame of the title replayed through the GPU front end with
+                // the title held, optionally alternating a `tune` switch, and
+                // the timeline of the last k iterations (`gpu::replay`).
                 let n = parts.next().and_then(|v| v.parse::<u32>().ok()).filter(|n| (1..=200).contains(n));
-                let rest: Vec<&str> = parts.by_ref().collect();
+                let mut rest: Vec<&str> = parts.by_ref().collect();
+                let mut timeline = 0u32;
+                if let Some(k) = rest.last().and_then(|t| t.strip_prefix("timeline=")).and_then(|k| k.parse().ok()) {
+                    timeline = k;
+                    rest.pop();
+                }
                 let ab = match rest.as_slice() {
                     [] => Ok(None),
                     [name, a, b] => match (a.parse::<u64>(), b.parse::<u64>()) {
@@ -446,8 +451,8 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     _ => Err(()),
                 };
                 match (n, ab) {
-                    (Some(n), Ok(ab)) => gpu::replay::start(n, ab),
-                    _ => Err("usage: replay <iterations 1-200> [<switch> <a> <b>]".into()),
+                    (Some(n), Ok(ab)) => gpu::replay::start(n, ab, timeline),
+                    _ => Err("usage: replay <iterations 1-200> [<switch> <a> <b>] [timeline=<k>]".into()),
                 }
             }
             "timeline" => {

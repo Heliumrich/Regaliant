@@ -30,7 +30,10 @@
 //! Each iteration reports its wall time from queueing to completion, the
 //! CPU time of the front end's threads by kind (`threadcpu`), its commands,
 //! and the GPU time inside batches when batch stamps are on
-//! (`DS_PROFILE_GPU=1`). With `<switch> <a> <b>` the switch alternates per
+//! (`DS_PROFILE_GPU=1`). `timeline=<k>` records the `timeline` of the last k
+//! iterations, each iteration's end standing in for a flip (GPU spans with
+//! `DS_PROFILE_GPU=1`, best `DS_PROFILE_GPU_STAMPS=0`; `tools/timeline.py`).
+//! With `<switch> <a> <b>` the switch alternates per
 //! iteration (a first); the summary compares medians without each value's
 //! first iteration (pipelines of a new setting compile there). The frame's
 //! command buffers (top levels) get their contents at submission back
@@ -338,7 +341,7 @@ impl Run {
 }
 
 /// Arms a replay of `iterations` iterations (see the module documentation).
-pub fn start(iterations: u32, ab: Option<(String, u64, u64)>) -> Result<(), String> {
+pub fn start(iterations: u32, ab: Option<(String, u64, u64)>, timeline: u32) -> Result<(), String> {
     if !super::exec::enabled() {
         return Err("GPU execution is off".into());
     }
@@ -361,7 +364,7 @@ pub fn start(iterations: u32, ab: Option<(String, u64, u64)>) -> Result<(), Stri
         1 << 20,
         Box::new(move || {
             crate::log::set_thread_name("gpu-replay");
-            drive(iterations, ab);
+            drive(iterations, ab, timeline.min(iterations));
             RECORDING.store(false, Ordering::SeqCst);
             REPLAYING.store(false, Ordering::SeqCst);
             set_phase(Phase::Off);
@@ -415,7 +418,7 @@ fn record() -> bool {
     false
 }
 
-fn drive(iterations: u32, ab: Option<(String, u64, u64)>) {
+fn drive(iterations: u32, ab: Option<(String, u64, u64)>, timeline: u32) {
     crate::info!("replay: armed for {iterations} iteration(s){}", ab.as_ref().map(|(n, a, b)| format!(", {n} alternating {a} / {b}")).unwrap_or_default());
     if !record() {
         return;
@@ -465,12 +468,19 @@ fn drive(iterations: u32, ab: Option<(String, u64, u64)>) {
         write_back(&bufs_rec);
         write_back(&before);
         to_queues(Ctl::Restore(0));
+        if timeline > 0 && i == iterations - timeline {
+            if let Err(e) = super::timeline::start(timeline) {
+                crate::warn!("replay: no timeline ({e})");
+            }
+        }
         let s0 = sample();
         for (q, bufs, _) in &frame {
             super::enqueue(*q, bufs.clone(), None);
         }
         let done = quiesce(Duration::from_secs(60));
         let s1 = sample();
+        // An iteration's end is a flip to the timeline (it ends after the last).
+        super::timeline::flipped(i as u64 + 1);
         if !done {
             crate::warn!("replay: iteration {} did not complete within 60 s: stopped", i + 1);
             // Waits still pass after WAIT_LIMIT while the queues drain.
