@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 43] = [
+    static ALL: [Tunable; 45] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -70,6 +70,8 @@ pub mod tune {
         Tunable { name: "idle_split", env: "DS_IDLE_SPLIT", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "push_desc", env: "DS_PUSH_DESC", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_merge", env: "DS_PRE_MERGE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "lean_regs", env: "DS_LEAN_REGS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "span_cache", env: "DS_SPAN_CACHE", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -382,6 +384,20 @@ pub mod tune {
     /// Takes one of the waits still to be traced.
     pub fn take_trace_sync() -> bool {
         get(21) > 0 && ALL[21].value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| if v != UNSET && v > 0 { Some(v - 1) } else { None }).is_ok()
+    }
+
+    /// Register-state snapshots of parallel chunks (and replays) hold only
+    /// the registers written so far (`cp::HIGH`); 0 copies whole register
+    /// files (100 KiB each), for A/B.
+    pub fn lean_regs() -> bool {
+        get(43) != 0
+    }
+
+    /// The shader-input reader keeps the mappings of its last four reads and
+    /// looks a miss up once; 0: the last read's mapping, two lookups per miss
+    /// (the earlier behavior, for A/B).
+    pub fn span_cache() -> bool {
+        get(44) != 0
     }
 
     /// A switch's value by name; None if unknown.

@@ -74,6 +74,47 @@ impl Regs {
     }
 }
 
+/// The highest register index written so far plus one, per space (context,
+/// SH, UCONFIG), over all command processors and chunk states: every register
+/// at or above it is zero everywhere, so state snapshots (`ChunkState`) hold
+/// only what lies below (the UCONFIG file alone is 64 KiB; a parallel run
+/// copied ~20 whole register files).
+static HIGH: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
+
+fn note_high(space: Space, index: usize) {
+    let h = &HIGH[space as usize];
+    if index >= h.load(Ordering::Relaxed) {
+        h.fetch_max(index + 1, Ordering::AcqRel);
+    }
+}
+
+fn high(space: Space, cap: usize) -> usize {
+    HIGH[space as usize].load(Ordering::Acquire).min(cap)
+}
+
+/// Copies a snapshot's registers into `dst` and zeroes the rest up to `hi`
+/// (registers the snapshot does not hold were zero when it was taken).
+fn copy_prefix(dst: &mut [u32], src: &[u32], hi: usize) {
+    let n = src.len().min(dst.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    let end = hi.min(dst.len());
+    if end > n {
+        dst[n..end].fill(0);
+    }
+}
+
+/// Writes register `i` of a snapshot (growing it), notes the index.
+fn put_reg(v: &mut Vec<u32>, space: Space, cap: usize, i: usize, val: u32) {
+    if i >= cap {
+        return;
+    }
+    if i >= v.len() {
+        v.resize(i + 1, 0);
+    }
+    v[i] = val;
+    note_high(space, i);
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Space {
     Ctx,
@@ -702,8 +743,9 @@ impl Cp {
     }
 
     pub fn chunk_state(&self) -> ChunkState {
+        let (c, s, u) = if super::tune::lean_regs() { (high(Space::Ctx, CTX_DWORDS), high(Space::Sh, SH_DWORDS), high(Space::Uc, UC_DWORDS)) } else { (CTX_DWORDS, SH_DWORDS, UC_DWORDS) };
         ChunkState {
-            regs: self.regs.clone(),
+            regs: Regs { ctx: self.regs.ctx[..c].to_vec(), sh: self.regs.sh[..s].to_vec(), uc: self.regs.uc[..u].to_vec() },
             index_base: self.index_base,
             index_count: self.index_count,
             num_instances: self.num_instances,
@@ -713,9 +755,9 @@ impl Cp {
     }
 
     pub fn set_chunk_state(&mut self, s: &ChunkState) {
-        self.regs.ctx.copy_from_slice(&s.regs.ctx);
-        self.regs.sh.copy_from_slice(&s.regs.sh);
-        self.regs.uc.copy_from_slice(&s.regs.uc);
+        copy_prefix(&mut self.regs.ctx, &s.regs.ctx, high(Space::Ctx, CTX_DWORDS));
+        copy_prefix(&mut self.regs.sh, &s.regs.sh, high(Space::Sh, SH_DWORDS));
+        copy_prefix(&mut self.regs.uc, &s.regs.uc, high(Space::Uc, UC_DWORDS));
         self.index_base = s.index_base;
         self.index_count = s.index_count;
         self.num_instances = s.num_instances;
@@ -867,36 +909,28 @@ impl Cp {
 
     /// Applies a state packet of a run to `st` as `packet` would.
     fn apply_state(st: &mut ChunkState, opcode: u32, n: u64, p: &dyn Fn(u64) -> u32) {
-        let set = |v: &mut Vec<u32>, first: u32| {
+        let set = |v: &mut Vec<u32>, space: Space, cap: usize, first: u32| {
             for i in 1..n {
-                if let Some(r) = v.get_mut((first + (i - 1) as u32) as usize) {
-                    *r = p(i);
-                }
+                put_reg(v, space, cap, (first + (i - 1) as u32) as usize, p(i));
             }
         };
-        let load = |v: &mut Vec<u32>, a: u64, count: u32| {
+        let load = |v: &mut Vec<u32>, space: Space, cap: usize, a: u64, count: u32| {
             if count == 0 || !valid(a, 8 * count as u64) {
                 return;
             }
             for i in 0..count as u64 {
                 let (o, val) = unsafe { (rd32(a + 8 * i), rd32(a + 8 * i + 4)) };
-                if let Some(r) = v.get_mut((o & 0xFFFF) as usize) {
-                    *r = val;
-                }
+                put_reg(v, space, cap, (o & 0xFFFF) as usize, val);
             }
         };
         match opcode {
-            op::SET_CONTEXT_REG | op::SET_CONTEXT_REG_INDEX => set(&mut st.regs.ctx, p(0) & 0xFFFF),
-            op::SET_SH_REG | op::SET_SH_REG_INDEX => set(&mut st.regs.sh, p(0) & 0xFFFF),
-            op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX => set(&mut st.regs.uc, p(0) & 0xFFFF),
-            op::LOAD_CONTEXT_REG_INDEX => load(&mut st.regs.ctx, addr64(p(0), p(1)), p(2)),
-            op::LOAD_SH_REG_INDEX => load(&mut st.regs.sh, addr64(p(0), p(1)), p(2)),
-            op::LOAD_UCONFIG_REG => load(&mut st.regs.uc, addr64(p(0), p(1)), p(2)),
-            op::INDEX_TYPE => {
-                if let Some(r) = st.regs.uc.get_mut(crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE as usize) {
-                    *r = p(0);
-                }
-            }
+            op::SET_CONTEXT_REG | op::SET_CONTEXT_REG_INDEX => set(&mut st.regs.ctx, Space::Ctx, CTX_DWORDS, p(0) & 0xFFFF),
+            op::SET_SH_REG | op::SET_SH_REG_INDEX => set(&mut st.regs.sh, Space::Sh, SH_DWORDS, p(0) & 0xFFFF),
+            op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX => set(&mut st.regs.uc, Space::Uc, UC_DWORDS, p(0) & 0xFFFF),
+            op::LOAD_CONTEXT_REG_INDEX => load(&mut st.regs.ctx, Space::Ctx, CTX_DWORDS, addr64(p(0), p(1)), p(2)),
+            op::LOAD_SH_REG_INDEX => load(&mut st.regs.sh, Space::Sh, SH_DWORDS, addr64(p(0), p(1)), p(2)),
+            op::LOAD_UCONFIG_REG => load(&mut st.regs.uc, Space::Uc, UC_DWORDS, addr64(p(0), p(1)), p(2)),
+            op::INDEX_TYPE => put_reg(&mut st.regs.uc, Space::Uc, UC_DWORDS, crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE as usize, p(0)),
             op::INDEX_BASE => st.index_base = addr64(p(0), p(1)),
             op::INDEX_BUFFER_SIZE => st.index_count = p(0),
             op::NUM_INSTANCES => st.num_instances = p(0).max(1),
@@ -928,14 +962,10 @@ impl Cp {
                     crate::hle::libs::agc::instance_offset_slot(super::shaders::ngg_addr_of(&r)).map_or(0, |s| 0x8C + s)
                 };
                 if vtx_loc != 0 {
-                    if let Some(r) = st.regs.sh.get_mut(vtx_loc as usize) {
-                        *r = bv;
-                    }
+                    put_reg(&mut st.regs.sh, Space::Sh, SH_DWORDS, vtx_loc as usize, bv);
                 }
                 if inst_loc != 0 {
-                    if let Some(r) = st.regs.sh.get_mut(inst_loc as usize) {
-                        *r = si;
-                    }
+                    put_reg(&mut st.regs.sh, Space::Sh, SH_DWORDS, inst_loc as usize, si);
                 }
             }
             _ => {}
@@ -1727,6 +1757,7 @@ impl Cp {
         };
         if (index as usize) < n {
             v[index as usize] = value;
+            note_high(space, index as usize);
         }
     }
 
@@ -2906,5 +2937,22 @@ mod tests {
         // A counter that was reset is not trusted.
         history(0x1020, &[0x10, 0x11, 0x0, 0x1, 0x2, 0x3]);
         assert!(!counter_passed(0x1020, false, 3, m, 0x11));
+    }
+
+    #[test]
+    fn register_snapshots_hold_the_written_part() {
+        // A snapshot's registers, then zeros up to the current high mark
+        // (written after the snapshot), the rest untouched (never written).
+        let mut dst = vec![7u32; 8];
+        copy_prefix(&mut dst, &[1, 2, 3], 6);
+        assert_eq!(dst, [1, 2, 3, 0, 0, 0, 7, 7]);
+        // Writes to a snapshot grow it and raise the mark; beyond the file
+        // they are ignored.
+        let mut v = vec![1u32, 2];
+        put_reg(&mut v, Space::Sh, 4, 3, 9);
+        assert_eq!(v, [1, 2, 0, 9]);
+        assert!(high(Space::Sh, SH_DWORDS) >= 4);
+        put_reg(&mut v, Space::Sh, 4, 4, 5);
+        assert_eq!(v.len(), 4);
     }
 }

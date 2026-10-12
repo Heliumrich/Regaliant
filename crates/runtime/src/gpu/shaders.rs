@@ -127,35 +127,70 @@ fn program_checked(addr: u64) -> Result<(Arc<Vec<rdna::Inst>>, u64), String> {
 }
 
 /// Guest memory reader that records what it read (hazard checks; adjacent
-/// reads merged).
-pub struct Reader {
+/// reads merged). It lives within one preparation of a stage whose plan
+/// (`'a`) holds the pointer chains it resolves.
+pub struct Reader<'a> {
     pub reads: Vec<(u64, u64)>,
     /// The words read, in the order of `reads` (a preparation made ahead of
     /// execution is checked against them, see `words_unchanged`).
     pub words: Vec<u32>,
-    /// The mapping of the last read (no memory-map lookup inside it).
-    span: (u64, u64),
-    /// Pointers loaded from memory so far (each resource dword names its
-    /// pointer chain again).
-    ptrs: Vec<(Ptr, u64)>,
+    /// The mappings of recent reads (no memory-map lookup inside them; a
+    /// stage reads its user data, descriptor tables and constants from a few
+    /// mappings in turn), replaced round robin.
+    spans: [(u64, u64); 4],
+    next_span: usize,
+    /// Pointers loaded from memory so far, by the plan's chain (each resource
+    /// dword names its pointer chain again; kept by reference, not cloned:
+    /// the clones' allocations and deep comparisons were ~6% of the graphics
+    /// command processor's time, run 20261012-202512).
+    ptrs: Vec<(&'a Ptr, u64)>,
     /// Address of the program (program-relative pointers).
     code_base: u64,
 }
 
-impl Reader {
-    pub fn new(code_base: u64) -> Reader {
-        Reader { reads: Vec::new(), words: Vec::new(), span: (0, 0), ptrs: Vec::new(), code_base }
+impl<'a> Reader<'a> {
+    pub fn new(code_base: u64) -> Reader<'a> {
+        Reader { reads: Vec::new(), words: Vec::new(), spans: [(0, 0); 4], next_span: 0, ptrs: Vec::new(), code_base }
+    }
+
+    /// Whether guest memory [addr, addr + n) is readable: within a recent
+    /// read's mapping, else one memory-map lookup (`readable_span` was ~7% of
+    /// the recording threads' time, about 50 lookups per command, mostly
+    /// from here: run 20261012-202512).
+    fn readable(&mut self, addr: u64, n: u64) -> bool {
+        let end = addr.saturating_add(n);
+        if !super::tune::span_cache() {
+            // The earlier behavior: the last read's mapping, two lookups.
+            if addr >= self.spans[0].0 && end <= self.spans[0].1 {
+                return true;
+            }
+            if !super::cp::guest_readable(addr, n) {
+                return false;
+            }
+            self.spans[0] = crate::mem::readable_span(addr).unwrap_or((addr, end));
+            return true;
+        }
+        if self.spans.iter().any(|&(s, e)| addr >= s && end <= e) {
+            return true;
+        }
+        if !super::cp::valid(addr, n) {
+            return false;
+        }
+        match crate::mem::readable_span(addr) {
+            Some((s, e)) if end <= e => {
+                self.spans[self.next_span] = (s, e);
+                self.next_span = (self.next_span + 1) % self.spans.len();
+                true
+            }
+            // Across mappings with different protections: the slow check.
+            Some(_) => crate::mem::readable(addr, n),
+            None => false,
+        }
     }
 
     fn u32(&mut self, addr: u64) -> Option<u32> {
-        if addr % 4 != 0 {
+        if addr % 4 != 0 || !self.readable(addr, 4) {
             return None;
-        }
-        if !(addr >= self.span.0 && addr + 4 <= self.span.1) {
-            if !super::cp::guest_readable(addr, 4) {
-                return None;
-            }
-            self.span = crate::mem::readable_span(addr).unwrap_or((addr, addr + 4));
         }
         match self.reads.last_mut() {
             Some(r) if r.0 + r.1 == addr => r.1 += 4,
@@ -170,14 +205,8 @@ impl Reader {
     /// check; false (nothing read) if any of them is not readable.
     fn read_into(&mut self, addr: u64, out: &mut [u32]) -> bool {
         let n = 4 * out.len() as u64;
-        if addr % 4 != 0 || n == 0 {
+        if addr % 4 != 0 || n == 0 || !self.readable(addr, n) {
             return false;
-        }
-        if !(addr >= self.span.0 && addr + n <= self.span.1) {
-            if !super::cp::guest_readable(addr, n) {
-                return false;
-            }
-            self.span = crate::mem::readable_span(addr).unwrap_or((addr, addr + n));
         }
         match self.reads.last_mut() {
             Some(r) if r.0 + r.1 == addr => r.1 += n,
@@ -190,23 +219,25 @@ impl Reader {
         true
     }
 
-    fn ptr(&mut self, p: &Ptr, user: &[u32]) -> Option<u64> {
+    fn ptr(&mut self, p: &'a Ptr, user: &[u32]) -> Option<u64> {
         match p {
             Ptr::User(i) => Some((*user.get(*i as usize)? as u64) | ((*user.get(*i as usize + 1)? as u64) << 32)),
             Ptr::Mem(inner, off) => {
-                if let Some(&(_, v)) = self.ptrs.iter().find(|(q, _)| q == p) {
+                // The same chain object first, then an equal one elsewhere in
+                // the plan.
+                if let Some(&(_, v)) = self.ptrs.iter().find(|e| std::ptr::eq(e.0, p)).or_else(|| self.ptrs.iter().find(|e| e.0 == p)) {
                     return Some(v);
                 }
                 let base = self.ptr(inner, user)? + *off as u64;
                 let v = (self.u32(base)? as u64) | ((self.u32(base + 4)? as u64) << 32);
-                self.ptrs.push((p.clone(), v));
+                self.ptrs.push((p, v));
                 Some(v)
             }
             Ptr::Pc(o) => Some(self.code_base + *o),
         }
     }
 
-    fn eval(&mut self, p: &Prov, user: &[u32]) -> Option<u32> {
+    fn eval(&mut self, p: &'a Prov, user: &[u32]) -> Option<u32> {
         match p {
             Prov::User(i) => user.get(*i as usize).copied(),
             Prov::Const(c) => Some(*c),
@@ -1174,13 +1205,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
                 for k in 0..n {
                     let a = v.base + 32 * k;
                     let mut d = [0u32; 8];
-                    let mut ok = true;
-                    for (j, dw) in d.iter_mut().enumerate() {
-                        match rd.u32(a + 4 * j as u64) {
-                            Some(x) => *dw = x,
-                            None => ok = false,
-                        }
-                    }
+                    let ok = rd.read_into(a, &mut d);
                     let t = Tsharp::decode(&d);
                     if ok {
                         super::lodstats::note(&t.raw);
@@ -1330,7 +1355,9 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
             _ => {}
         }
     }
-    let prepared = Prepared { stage: spec.stage, addr, insts, tr, resources, res_addrs, sgpr_data, user: user.to_vec(), reads: rd.reads, words: rd.words, map_gen, images_gen, cmp_images, cmp_depth, data_loads };
+    // The reader's references into the translation's plan end here.
+    let Reader { reads, words, .. } = rd;
+    let prepared = Prepared { stage: spec.stage, addr, insts, tr, resources, res_addrs, sgpr_data, user: user.to_vec(), reads, words, map_gen, images_gen, cmp_images, cmp_depth, data_loads };
     let mut words = Vec::new();
     if cacheable && read_words(&prepared.reads, &mut words) {
         let e = PrepEntry { key: prep_key, words, prepared: prepared.clone() };
