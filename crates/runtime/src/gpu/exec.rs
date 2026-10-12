@@ -894,7 +894,7 @@ struct ShaderPlacements {
 
 static SHADER_PLACEMENTS: Mutex<Option<HashMap<u64, ShaderPlacements>>> = Mutex::new(None);
 
-fn note_placements(addr: u64, groups: [u32; 3], indirect: bool, placements: &[(Placement, u64, bool)]) {
+pub(crate) fn note_placements(addr: u64, groups: [u32; 3], indirect: bool, placements: &[(Placement, u64, bool)]) {
     let mut g = SHADER_PLACEMENTS.lock();
     let e = g.get_or_insert_with(HashMap::new).entry(addr).or_default();
     e.dispatches += 1;
@@ -2245,6 +2245,12 @@ pub fn shader_profile() -> String {
         if **a & DRAW_KEY != 0 {
             s.push_str(&format!("      draws with shader {:#x}: {} draws, {} us each
 ", **a & !DRAW_KEY, x[0], x[1] / 1000 / n));
+            if let Some(l) = placement_line(**a) {
+                // Buffers of the vertex stage, then of the pixel stage.
+                let rest = l.split_once("; buffers:").map(|(_, r)| r).unwrap_or("");
+                s.push_str(&format!("        buffers (vertex stage first):{rest}"));
+                s.push('\n');
+            }
         } else {
             s.push_str(&format!("      cs {a:#x}: {} dispatches, {} us each (+ copies {} / {} us)\n", x[0], x[1] / 1000 / n, x[2] / 1000 / n, x[3] / 1000 / n));
             if let Some(l) = placement_line(**a) {

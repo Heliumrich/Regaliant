@@ -46,7 +46,7 @@ pub mod tune {
         Tunable { name: "cmp_emulate", env: "DS_CMP_EMULATE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "tex_waits", env: "DS_TEX_WAITS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_barrier", env: "DS_SHADOW_BARRIER", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "pre_max", env: "DS_PRE_MAX", default: 4 << 20, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_max", env: "DS_PRE_MAX", default: 8 << 20, value: AtomicU64::new(UNSET) },
         Tunable { name: "scratch_writes", env: "DS_SCRATCH_WRITES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "trace_sync", env: "DS_TRACE_SYNC_N", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "homes", env: "DS_HOMES", default: 1, value: AtomicU64::new(UNSET) },
@@ -142,7 +142,11 @@ pub mod tune {
     /// from a copy in video memory that the GPU makes at the start of their
     /// batch (`Exec::pre_copy`; 0: off) instead of across PCIe (vertex data,
     /// the per-item culls' meshes): draws took ~45% less GPU time and the
-    /// courtyard ran ~10% faster (in-run A/B, run 20261011-063258).
+    /// courtyard ran ~10% faster (in-run A/B, run 20261011-063258). 8 MiB
+    /// since 2026-10-12: the foliage draws' 6.8 MB instance buffer was read in
+    /// place (~9 ms of draw time per courtyard frame); GPU time per frame
+    /// ~11% lower in each of three A/B cycles, rate median +3.9% (run
+    /// 20261012-132127; 16 MiB was worse earlier).
     pub fn pre_max() -> u64 {
         get(19)
     }

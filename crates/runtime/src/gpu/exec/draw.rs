@@ -752,6 +752,12 @@ impl Exec {
             bounds.push(b);
             lap.mark(10 + k.min(1));
         }
+        if profiling() {
+            // Buffer placements of the draw's stages (vertex stage first), under
+            // the draw's profile key.
+            let all: Vec<_> = bounds.iter().flat_map(|b| b.placements.iter().copied()).collect();
+            super::note_placements(super::DRAW_KEY | if ps_addr != 0 { ps_addr } else { stages[0].addr }, [0; 3], false, &all);
+        }
         let set = self.alloc_set(set_layout)?;
         lap.mark(12);
         self.write_set(set, &bounds);
