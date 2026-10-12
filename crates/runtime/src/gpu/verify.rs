@@ -115,6 +115,72 @@ pub fn fill_value(p: &Prepared) -> Option<((u64, u64), u32)> {
     Some(((d.base, d.num_records as u64 * d.stride.max(1) as u64), v))
 }
 
+/// A dispatch of the fill kernel that stores one 32-bit word over all of
+/// [base, base + len): `fill_value`'s word in every component of a 32-bit
+/// format whose components fill the stride (identity swizzle, no thread-id
+/// addressing or swizzling, indices checked against the records), the
+/// element index the flattened thread id (`v_lshl_add_u32 v4, s[tgid_x],
+/// log2(local x), v0`; a one-dimensional dispatch, no store offsets): a
+/// buffer fill of n = min(`threads_x`, records) elements
+/// (`Exec::fill_in_place`). The caller checks the dispatch has no base and
+/// no partial groups.
+pub fn full_fill(p: &Prepared, groups: [u32; 3], local: [u32; 3], threads_x: u64) -> Option<(u64, u64, u32)> {
+    let (_, v) = fill_value(p)?;
+    match full_fill_range(p, groups, local, threads_x, v) {
+        Ok(r) => Some(r),
+        Err(why) => {
+            // Once per reason: a fill that stays a kernel dispatch.
+            static SEEN: parking_lot::Mutex<Vec<&'static str>> = parking_lot::Mutex::new(Vec::new());
+            let mut g = SEEN.lock();
+            if !g.contains(&why) {
+                g.push(why);
+                crate::info!("verify: fill kernel cs {:#x} stays a dispatch: {why} (V# {:08x?}, groups {groups:?}, local {local:?}, rsrc2 {:#x})", p.addr, &p.user[0..4], p.tr.spec.cs_rsrc2);
+            }
+            None
+        }
+    }
+}
+
+fn full_fill_range(p: &Prepared, groups: [u32; 3], local: [u32; 3], threads_x: u64, v: u32) -> Result<(u64, u64, u32), &'static str> {
+    let d = Vsharp::decode(&p.user[0..4]);
+    let comps = dword_components(d.format).ok_or("format not of 32-bit components")?;
+    if d.dst_sel != 0xFAC {
+        return Err("swizzled components");
+    }
+    if d.add_tid || d.raw[1] >> 30 != 0 {
+        return Err("thread-id or swizzled addressing");
+    }
+    if d.oob_select > 1 {
+        return Err("indices not checked against the records");
+    }
+    if d.stride != 4 * comps {
+        return Err("components do not fill the stride");
+    }
+    let lx = local[0].max(1);
+    if groups[1] > 1 || groups[2] > 1 || local[1] > 1 || local[2] > 1 || !lx.is_power_of_two() {
+        return Err("not a one-dimensional dispatch of a power-of-two group size");
+    }
+    // The workgroup id X follows the user SGPRs (COMPUTE_PGM_RSRC2.TGID_X_EN).
+    let rsrc2 = p.tr.spec.cs_rsrc2;
+    if rsrc2 & (1 << 7) == 0 {
+        return Err("no workgroup id X");
+    }
+    let tgid_x = ((rsrc2 >> 1) & 0x1F) as u16;
+    let ix = &p.insts[0];
+    if ix.vdst() != 4 || ix.src(0) != tgid_x || ix.src(1) != 128 + lx.trailing_zeros() as u16 || ix.src(2) != rdna::OP_VGPR0 {
+        return Err("index not (workgroup id X << log2(group size)) + thread id X");
+    }
+    if ix.vop3_abs() != 0 || ix.vop3_neg() != 0 || ix.vop3_clamp() || ix.vop3_omod() != 0 || ix.vop3_opsel() != 0 {
+        return Err("index instruction modifiers");
+    }
+    let st = &p.insts[5];
+    if st.buf_offset() != 0 || st.buf_offen() || !matches!(st.buf_soffset(), 128 | rdna::OP_NULL) {
+        return Err("store offsets");
+    }
+    let n = threads_x.min(d.num_records as u64);
+    Ok((d.base, n * d.stride as u64, v))
+}
+
 /// A check for a dispatch of a recognized kernel.
 pub fn check_for(p: &Prepared, groups: [u32; 3], local: [u32; 3]) -> Option<Check> {
     if !enabled() {

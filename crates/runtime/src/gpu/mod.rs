@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 45] = [
+    static ALL: [Tunable; 46] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -72,6 +72,7 @@ pub mod tune {
         Tunable { name: "pre_merge", env: "DS_PRE_MERGE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "lean_regs", env: "DS_LEAN_REGS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "span_cache", env: "DS_SPAN_CACHE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fill_dma", env: "DS_FILL_DMA", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -398,6 +399,13 @@ pub mod tune {
     /// (the earlier behavior, for A/B).
     pub fn span_cache() -> bool {
         get(44) != 0
+    }
+
+    /// Dispatches of the title's fill kernel over a whole range are buffer
+    /// fills of guest memory in place (`verify::full_fill`), without the
+    /// kernel and its VRAM shadow; 0: the kernel runs (for A/B).
+    pub fn fill_dma() -> bool {
+        get(45) != 0
     }
 
     /// A switch's value by name; None if unknown.

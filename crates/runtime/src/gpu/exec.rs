@@ -130,6 +130,8 @@ static WATCHDOG_PTR: std::sync::atomic::AtomicPtr<u32> = std::sync::atomic::Atom
 pub static WATCHDOG_STOPS: AtomicU64 = AtomicU64::new(0);
 /// Fast clears performed (metadata writes, see `Exec::resolve_fast_clears`).
 pub static FAST_CLEARS: AtomicU64 = AtomicU64::new(0);
+/// Fill-kernel dispatches recorded as buffer fills (`Exec::fill_in_place`).
+pub static FILLS_IN_PLACE: AtomicU64 = AtomicU64::new(0);
 /// Fast clears resolved without waiting for the GPU (metadata value known
 /// from the fill that wrote it).
 pub static FAST_CLEARS_KNOWN: AtomicU64 = AtomicU64::new(0);
@@ -2189,6 +2191,25 @@ fn batch_by_lines() -> String {
     s
 }
 
+/// A batch's commands for the timeline: its most frequent shaders (draws
+/// by pixel shader, "d"), with counts.
+fn batch_contents(shaders: &[u64]) -> String {
+    let mut counts: Vec<(u64, u32)> = Vec::new();
+    for &a in shaders {
+        match counts.iter_mut().find(|c| c.0 == a) {
+            Some(c) => c.1 += 1,
+            None => counts.push((a, 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let parts: Vec<String> = counts.iter().take(4).map(|&(a, n)| if a & DRAW_KEY != 0 { format!("d{:x}x{n}", a & !DRAW_KEY) } else { format!("{a:x}x{n}") }).collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(": {}{}", parts.join(" "), if counts.len() > 4 { " .." } else { "" })
+    }
+}
+
 /// Reads a completed batch's dispatch timestamps into SHADER_TIME.
 fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str, seq: u64) {
     if pool == vk::QueryPool::null() {
@@ -2199,7 +2220,9 @@ fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str, seq: u6
     if unsafe { c.device.get_query_pool_results(pool, STAMPS * MAX_TIMED, &mut be, vk::QueryResultFlags::TYPE_64) }.is_ok() {
         let period = c.limits.timestamp_period as f64;
         let batch_ns = (be[1].saturating_sub(be[0]) as f64 * period) as u64;
-        super::timeline::gpu(queue, seq, be[0], be[1], &format!(", {} commands", shaders.len()));
+        if super::timeline::on() {
+            super::timeline::gpu(queue, seq, be[0], be[1], &format!(", {} commands{}", shaders.len(), batch_contents(shaders)));
+        }
         BATCH_NS.fetch_add(batch_ns, Ordering::Relaxed);
         if !command_stamps() {
             note_batch_by(queue, shaders, batch_ns);
@@ -3136,6 +3159,36 @@ impl Exec {
             note_pre_repeat(base, size, n);
         }
         Some((buf, off, bias))
+    }
+
+    /// Fills guest [base, base+len) with the word `v` in place (vkCmdFillBuffer
+    /// on the guest range's buffer), ordered like a dispatch (lazy barriers).
+    /// False: a video-memory home covers part of it or it is not one mapping
+    /// (the kernel runs instead).
+    fn fill_in_place(&mut self, base: u64, len: u64, v: u32) -> Result<bool, String> {
+        if len == 0 || base % 4 != 0 || len % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(base, len) {
+            return Ok(false);
+        }
+        let Some((buffer, start, _)) = span(base, len) else { return Ok(false) };
+        // Resident shadows holding newer data of the range go back first:
+        // their merge would undo the fill.
+        self.flush_resident(Some(&[(base, len)]))?;
+        self.begin();
+        if !self.recording {
+            return Ok(false);
+        }
+        self.end_rendering();
+        let cmd = self.cmd();
+        if !lazy_barriers() || self.barrier_wanted {
+            global_barrier(cmd);
+            self.barrier_wanted = false;
+            self.dispatched = false;
+        }
+        unsafe { ctx().device.cmd_fill_buffer(cmd, buffer, base - start, len, v) };
+        if !lazy_barriers() {
+            global_barrier(cmd);
+        }
+        Ok(true)
     }
 
     /// Performs the fast clears pending for `keys` before they are used: the
@@ -4588,6 +4641,8 @@ impl Exec {
         }
         lap.mark(2);
         let local = [cp.reg(Space::Sh, 0x207) & 0xFFFF, cp.reg(Space::Sh, 0x208) & 0xFFFF, cp.reg(Space::Sh, 0x209) & 0xFFFF];
+        // Threads along X (USE_THREAD_DIMENSIONS gives threads, not groups).
+        let threads_x = if initiator & (1 << 5) != 0 { groups[0] as u64 } else { groups[0] as u64 * local[0].max(1) as u64 };
         if initiator & (1 << 5) != 0 {
             // USE_THREAD_DIMENSIONS: sizes are in threads.
             for k in 0..3 {
@@ -4611,6 +4666,39 @@ impl Exec {
         }
         if self.stopped {
             return Err(STOPPED.into());
+        }
+        // The fill kernel over a whole range (`verify::full_fill`): one buffer
+        // fill of guest memory in place, without the kernel's VRAM shadow
+        // (a copy in, then a merge kernel storing every dword back across
+        // PCIe: 1.3-2.3 ms per ~1 MiB HTILE clear, run 20261012-205403).
+        let plain = indirect.is_none() && cp.reg(Space::Sh, 0x207) >> 16 == 0 && (0x204..0x207).all(|r| cp.reg(Space::Sh, r) == 0);
+        if !plain && super::tune::fill_dma() && verify::fill_value(&p).is_some() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::info!("gpu[{}]: fill kernel cs {:#x} stays a dispatch: indirect {}, COMPUTE_NUM_THREAD_X {:#x}, start {:?}", self.name, p.addr, indirect.is_some(), cp.reg(Space::Sh, 0x207), [cp.reg(Space::Sh, 0x204), cp.reg(Space::Sh, 0x205), cp.reg(Space::Sh, 0x206)]));
+        }
+        if plain && super::tune::fill_dma() {
+            if let Some((base, len, v)) = verify::full_fill(&p, groups, local, threads_x) {
+                if self.fill_in_place(base, len, v)? {
+                    super::images::with(|im| {
+                        im.note_writes(&[(base, len)], &[(base, len)]);
+                        im.note_meta_fill(base, len, v);
+                    });
+                    super::mirror::invalidate(&[(base, len)]);
+                    super::track::gpu_write(base, len);
+                    self.note_write(base, len);
+                    if lazy_barriers() {
+                        self.dispatched = true;
+                    }
+                    EXECUTED.fetch_add(1, Ordering::Relaxed);
+                    FILLS_IN_PLACE.fetch_add(1, Ordering::Relaxed);
+                    // `DS_GPU_VERIFY=1` compares the result as for the kernel.
+                    if let Some(mut ch) = verify::check_for(&p, groups, local) {
+                        ch.writes_mark = self.pending_log.len();
+                        self.checks.push(ch);
+                    }
+                    return Ok(());
+                }
+            }
         }
         lap.mark(3);
         let Pipe { pipeline, layout, set_layout, push } = compute_pipe(&p)?;
@@ -4823,7 +4911,7 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU; {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait); {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU; {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         GPU_CP_WRITES.load(Ordering::Relaxed),
@@ -4842,6 +4930,7 @@ pub fn status() -> String {
         WATCHDOG_STOPS.load(Ordering::Relaxed),
         FAST_CLEARS.load(Ordering::Relaxed),
         FAST_CLEARS_KNOWN.load(Ordering::Relaxed),
+        FILLS_IN_PLACE.load(Ordering::Relaxed),
         FLUSHES.load(Ordering::Relaxed),
         verify::status(),
         super::cp::sync_summary()
