@@ -382,6 +382,11 @@ pub mod tune {
         get(21) > 0 && ALL[21].value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| if v != UNSET && v > 0 { Some(v - 1) } else { None }).is_ok()
     }
 
+    /// A switch's value by name; None if unknown.
+    pub fn value(name: &str) -> Option<u64> {
+        ALL.iter().position(|t| t.name == name).map(get)
+    }
+
     /// Sets a switch by name; false if unknown.
     pub fn set(name: &str, v: u64) -> bool {
         match ALL.iter().find(|t| t.name == name) {
@@ -405,6 +410,8 @@ pub mod mirror;
 pub mod ranges;
 pub mod homes;
 pub mod timeline;
+pub mod replay;
+pub mod threadcpu;
 
 /// Fast non-cryptographic hashing for maps on the command processors' hot
 /// paths (the image cache). Lookups compare keys, so a collision costs time
@@ -497,6 +504,75 @@ struct Submission {
     /// Copies of the buffers at submission (DS_CHECK_SUBMIT).
     copies: Vec<Vec<u32>>,
     at: std::time::Instant,
+    /// Work other than command buffers (frame replay).
+    ctl: Option<Ctl>,
+}
+
+/// Work for a queue's command processor besides command buffers (frame
+/// replay, `gpu::replay`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Ctl {
+    /// Completes the GPU work recorded so far and its deferred effects.
+    Finish,
+    /// Keeps the command processor's register state in slot 0 or 1.
+    Save(usize),
+    /// Restores the register state kept in that slot.
+    Restore(usize),
+}
+
+/// Queues work for a queue's command processor outside the title's
+/// submission path (no throttling, no replay hold).
+pub(crate) fn enqueue(queue_id: u32, bufs: Vec<(u64, u32)>, ctl: Option<Ctl>) {
+    let q = queue(queue_id);
+    let mut g = q.pending.lock();
+    q.submitted.fetch_add(1, Ordering::SeqCst);
+    g.push_back(Submission { bufs, hashes: Vec::new(), copies: Vec::new(), at: std::time::Instant::now(), ctl });
+    drop(g);
+    q.cv.notify_one();
+}
+
+/// The queues created so far.
+pub(crate) fn queue_ids() -> Vec<u32> {
+    QUEUES.lock().iter().map(|q| q.id).collect()
+}
+
+/// Whether every queue has completed all the work queued to it.
+pub(crate) fn queues_idle() -> bool {
+    QUEUES.lock().iter().all(|q| q.done.load(Ordering::SeqCst) >= q.submitted.load(Ordering::SeqCst))
+}
+
+/// The GPU front end's threads by kind ("gfx", "acb", "par", "prep",
+/// "submit", "complete", "scrub") and host thread id.
+pub(crate) fn cpu_threads() -> Vec<(&'static str, u32)> {
+    let mut v: Vec<(&'static str, u32)> = QUEUES.lock().iter().map(|q| (if q.id == GFX { "gfx" } else { "acb" }, q.tid.load(Ordering::Relaxed))).filter(|x| x.1 != 0).collect();
+    v.extend(PROFILE_THREADS.lock().iter().copied());
+    v
+}
+
+/// Whether one of the command buffers (address, dwords) holds a flip (the
+/// private FLIP packet) in its top level.
+pub(crate) fn has_flip(bufs: &[(u64, u32)]) -> bool {
+    use crate::hle::libs::agc_cmd::{pop, DS_MAGIC};
+    bufs.iter().any(|&(addr, size)| {
+        let mut i = 0u64;
+        while i < size as u64 {
+            let a = addr + 4 * i;
+            if !cp::guest_readable(a, 12) {
+                return false;
+            }
+            let h = unsafe { *(a as *const u32) };
+            if h >> 30 != 3 {
+                i += 1;
+                continue;
+            }
+            let n = ((h >> 16) & 0x3FFF) as u64 + 1;
+            if (h >> 8) & 0xFF == 0x10 && n >= 2 && unsafe { *((a + 4) as *const u32) } == DS_MAGIC && unsafe { *((a + 8) as *const u32) } == pop::FLIP {
+                return true;
+            }
+            i += n + 1;
+        }
+        false
+    })
 }
 
 fn buffer_copy(addr: u64, size: u32) -> Vec<u32> {
@@ -667,6 +743,8 @@ fn worker(q: &'static Queue, name: &str) {
     crate::exception::arm_watch_current_thread(false);
     let mut cp = cp::Cp::new(name, q.id != GFX);
     cp.wait_flag = Some(&q.cp_waiting);
+    // Register states kept for a frame replay (`Ctl::Save`).
+    let mut saved: [Option<cp::ChunkState>; 2] = [None, None];
     loop {
         let batch = {
             let mut g = q.pending.lock();
@@ -681,6 +759,21 @@ fn worker(q: &'static Queue, name: &str) {
             timeline::end(name, idle, || "idle: no title submission".into());
             b
         };
+        if let Some(c) = batch.ctl {
+            match c {
+                Ctl::Finish => cp.finish(),
+                Ctl::Save(k) => saved[k] = Some(cp.chunk_state()),
+                Ctl::Restore(k) => {
+                    if let Some(s) = &saved[k] {
+                        cp.set_chunk_state(s);
+                    }
+                }
+            }
+            let _g = q.pending.lock();
+            q.done.fetch_add(1, Ordering::SeqCst);
+            q.done_cv.notify_all();
+            continue;
+        }
         cp.submitted_at = Some(batch.at);
         cp.new_submission();
         for (i, &(addr, size)) in batch.bufs.iter().enumerate() {
@@ -725,6 +818,9 @@ pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
     if buffers.is_empty() {
         return;
     }
+    // A frame replay holds the title at the start and end of the frame it
+    // records.
+    replay::hold();
     SUBMITS.fetch_add(1, Ordering::Relaxed);
     let q = queue(queue_id);
     let hashes = if check_submit() { buffers.iter().map(|&(a, n)| buffer_hash(a, n)).collect() } else { Vec::new() };
@@ -761,7 +857,9 @@ pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
             }
         }
     }
-    g.push_back(Submission { bufs: buffers, hashes, copies, at: std::time::Instant::now() });
+    // In queue order (under the queue's lock): the replay keeps each queue's.
+    replay::note_submitted(queue_id, &buffers);
+    g.push_back(Submission { bufs: buffers, hashes, copies, at: std::time::Instant::now(), ctl: None });
     q.cv.notify_one();
     // DS_SUBMIT_SYNC=small (up to SMALL_SUBMIT dwords) or =1 (all),
     // diagnostic: the submit returns once its work completed (no CPU/GPU
@@ -914,6 +1012,7 @@ pub fn reset_profile() {
     par::reset_stats();
     images::reset_memo_stats();
     exec::reset_pre_window();
+    threadcpu::reset_window();
 }
 
 /// The profile so far (`profile report` control command).
@@ -924,6 +1023,7 @@ pub fn profile_report() -> String {
     s.push_str(&par::status());
     s.push_str(&images::memo_stats_line());
     s.push_str(&exec::pre_window_line());
+    s.push_str(&threadcpu::window_line());
     s
 }
 

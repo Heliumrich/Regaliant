@@ -1586,6 +1586,7 @@ fn wait_submitted(seq: u64) {
 /// Waits for submitted batches in order, then performs their actions.
 fn completion_thread() {
     crate::log::set_thread_name("gpu-complete");
+    super::profile_this_thread("complete");
     loop {
         let mut b = {
             let mut q = BATCHES.lock();
@@ -2146,6 +2147,11 @@ fn draw_steps_line() -> String {
 
 /// GPU time inside batches (first to last command), ns.
 static BATCH_NS: AtomicU64 = AtomicU64::new(0);
+
+/// GPU time inside batches so far, ns (batch stamps: `DS_PROFILE_GPU=1`).
+pub fn batch_ns() -> u64 {
+    BATCH_NS.load(Ordering::Relaxed)
+}
 /// GPU idle time between consecutive batches (one Vulkan queue runs them in
 /// submission order): (end timestamp of the last batch, per queue of the
 /// batch that ended the gap: [ns, gaps, gaps over 1 ms]).

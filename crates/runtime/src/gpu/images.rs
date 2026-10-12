@@ -805,6 +805,7 @@ static SCRUB_CHECKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 static SCRUB_DIRTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn scrubber() {
+    super::profile_this_thread("scrub");
     loop {
         std::thread::sleep(std::time::Duration::from_millis(2));
         if !scrubbing() || super::shutting_down() {

@@ -430,6 +430,26 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     _ => Err("usage: profile reset|report".into()),
                 }
             }
+            "replay" => {
+                // `replay <iterations> [<switch> <a> <b>]`: one frame of the
+                // title replayed through the GPU front end with the title
+                // held, optionally alternating a `tune` switch
+                // (`gpu::replay`).
+                let n = parts.next().and_then(|v| v.parse::<u32>().ok()).filter(|n| (1..=200).contains(n));
+                let rest: Vec<&str> = parts.by_ref().collect();
+                let ab = match rest.as_slice() {
+                    [] => Ok(None),
+                    [name, a, b] => match (a.parse::<u64>(), b.parse::<u64>()) {
+                        (Ok(a), Ok(b)) => Ok(Some((name.to_string(), a, b))),
+                        _ => Err(()),
+                    },
+                    _ => Err(()),
+                };
+                match (n, ab) {
+                    (Some(n), Ok(ab)) => gpu::replay::start(n, ab),
+                    _ => Err("usage: replay <iterations 1-200> [<switch> <a> <b>]".into()),
+                }
+            }
             "timeline" => {
                 // `timeline <flips>`: spans of command processing and GPU
                 // batches over the next flips (`gpu::timeline`).

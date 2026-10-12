@@ -1415,6 +1415,7 @@ impl Cp {
         if !super::tune::gpu_cp_writes() {
             return false;
         }
+        super::replay::note_cp_write(a, 4 * data.len() as u64);
         let needs_prior = end_of_pipe || self.fence_pending;
         let Some(e) = self.exec.as_mut() else { return false };
         // Nothing outstanding to follow: the CPU performs the write now.
@@ -1441,6 +1442,9 @@ impl Cp {
     }
 
     fn effect(&mut self, end_of_pipe: bool, write: Option<(u64, u64)>, f: Box<dyn FnOnce() + Send>) -> Option<u64> {
+        if let Some((a, n)) = write {
+            super::replay::note_cp_write(a, n);
+        }
         let needs_prior = end_of_pipe || self.fence_pending;
         match self.exec.as_mut() {
             Some(e) if e.busy() && (needs_prior || e.deferred_pending()) => {
@@ -2481,6 +2485,7 @@ impl Cp {
                 // Register or GDS source: register values / counters.
                 let v = if sas { self.reg_by_addr(src as u32) } else { 0 };
                 self.note("DMA_DATA from registers/GDS: register value or 0");
+                super::replay::note_cp_write(dst, if daic { 4 } else { bytes });
                 for i in 0..(bytes / 4).max(1) {
                     unsafe { wr32(if daic { dst } else { dst + 4 * i }, v) };
                 }
@@ -2539,7 +2544,8 @@ impl Cp {
                     }
                     note_write(&name, a, data, at);
                 }
-                if int_sel != 0 && int_sel != 3 {
+                // Not for a replayed frame (`gpu::replay`): the title is held.
+                if int_sel != 0 && int_sel != 3 && !super::replay::replaying() {
                     EOP_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
                     crate::hle::libs::agcdriver::raise_eop(ctx);
                 }
@@ -2615,6 +2621,12 @@ impl Cp {
             label_event(&self.name, b'M', a, v0, reference, at);
             return Flow::Next;
         }
+        // In a replayed frame, a wait the title's CPU released when the frame
+        // ran passes (`gpu::replay`).
+        if super::replay::pass_wait(at, a) {
+            label_event(&self.name, b'M', a, v0, reference, at);
+            return Flow::Next;
+        }
         label_event(&self.name, b'S', a, v0, reference, at);
         // Let recorded work and deferred effects progress while polling; a
         // queue holding this label in an unsubmitted batch submits it.
@@ -2679,6 +2691,9 @@ impl Cp {
             if crate::gpu::shutting_down() {
                 return Flow::Stop;
             }
+            if super::replay::force_wait(at, start, what) {
+                break;
+            }
             spins += 1;
             if spins < 200 {
                 std::hint::spin_loop();
@@ -2712,6 +2727,9 @@ impl Cp {
 
     fn private(&mut self, operation: u32, at: u64, n: u64, a: &dyn Fn(u64) -> u32) -> Flow {
         match operation {
+            // A replayed frame (`gpu::replay`) is not presented (its work
+            // completes here as for a flip).
+            pop::FLIP if super::replay::replaying() => self.sync(),
             pop::FLIP => {
                 self.sync();
                 let handle = a(0) as i32;
@@ -2736,7 +2754,7 @@ impl Cp {
             }
             pop::WAIT_SAFE_FOR_RENDERING => {
                 let (handle, index) = (a(0) as i32, a(1) as i32);
-                if crate::hle::libs::videoout::buffer_busy(handle, index) {
+                if crate::hle::libs::videoout::buffer_busy(handle, index) && !super::replay::replaying() {
                     let what = format!("WaitUntilSafeForRendering: display buffer {index} is displayed or queued");
                     return self.poll_until(at, &what, || !crate::hle::libs::videoout::buffer_busy(handle, index));
                 }

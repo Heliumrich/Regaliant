@@ -42,6 +42,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Environment",
     "Win32_System_Time",
+    "Win32_System_WindowsProgramming",
     "Win32_Storage_FileSystem",
     "Win32_Security",
     "Win32_UI_Input_XboxController",
