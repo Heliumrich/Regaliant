@@ -550,10 +550,34 @@ static WAIT_STATS: parking_lot::Mutex<Option<HashMap<(String, String), (u64, u64
 
 pub fn reset_wait_stats() {
     *WAIT_STATS.lock() = None;
+    *EPOCH_WAITS.lock() = None;
+}
+
+/// Waits the CPU released (new copy-cache epochs, DS_PROFILE_GPU): (queue,
+/// label, last CP write there) -> count.
+static EPOCH_WAITS: parking_lot::Mutex<Option<HashMap<(String, u64, String), u64>>> = parking_lot::Mutex::new(None);
+
+fn epoch_wait_lines() -> String {
+    let g = EPOCH_WAITS.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(&(String, u64, String), &u64)> = m.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1));
+    let total: u64 = v.iter().map(|x| *x.1).sum();
+    let mut s = format!("    waits the CPU released (copy-cache epochs), {total} in all:\n");
+    for ((q, a, by), n) in v.iter().take(12) {
+        s.push_str(&format!("      {q} label {a:#x} ({by}): {n}\n"));
+    }
+    s
+}
+
+pub fn wait_stats() -> String {
+    let mut s = epoch_wait_lines();
+    s.push_str(&wait_stats_inner());
+    s
 }
 
 /// Blocking label waits by waiter and writer, longest total first.
-pub fn wait_stats() -> String {
+fn wait_stats_inner() -> String {
     let g = WAIT_STATS.lock();
     let Some(m) = g.as_ref() else { return String::new() };
     let mut v: Vec<(&(String, String), &(u64, u64))> = m.iter().collect();
@@ -749,9 +773,18 @@ impl Cp {
             return;
         }
         let now = unsafe { if wide { rd64(a) } else { rd32(a) as u64 } };
-        let by_gpu = last_write(a).is_some_and(|(q, v, _)| q.starts_with("gpu-") && if wide { v == now } else { v as u32 == now as u32 });
+        let last = last_write(a);
+        let by_gpu = last.as_ref().is_some_and(|(q, v, _)| q.starts_with("gpu-") && if wide { *v == now } else { *v as u32 == now as u32 });
         if !by_gpu {
             super::precache::end_scope(1);
+            if super::exec::profiling_on() {
+                let by = match last {
+                    Some((q, v, _)) if (if wide { v == now } else { v as u32 == now as u32 }) => format!("written by {q}"),
+                    Some((q, _, _)) => format!("{q} wrote another value"),
+                    None => "no CP write recorded".into(),
+                };
+                *EPOCH_WAITS.lock().get_or_insert_with(HashMap::new).entry((self.name.clone(), a, by)).or_default() += 1;
+            }
         }
     }
 
@@ -1013,7 +1046,9 @@ impl Cp {
         };
         let last = self.par.as_ref().is_some_and(|p| p.next == p.starts.len());
         self.submit_gpu("par");
+        let tl = super::timeline::mark();
         let (stopped, waited) = w.wait();
+        super::timeline::end(&self.name, tl, || "wait: parallel chunk".into());
         match self.par.as_mut() {
             Some(pr) if last => {
                 super::par::note_main_wait(pr.waited_ns + waited);
@@ -2503,12 +2538,14 @@ impl Cp {
         let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         ACTIVE_WAITS.lock().push(ActiveWait { addr: a, wide, func, mask, reference, hit: hit.clone() });
         let t0 = Instant::now();
+        let tl = super::timeline::mark();
         let use_promise = self.exec.is_some();
         let r = self.poll_until(at, &what, || {
             hit.load(Ordering::SeqCst) || compare(func, read() & mask, reference & mask) || (use_promise && promised(a, wide, func, mask, reference).is_some())
         });
         {
             let by = last_write(a).map(|w| w.0).unwrap_or_else(|| "cpu".into());
+            super::timeline::end(&self.name, tl, || format!("wait: label {a:#x} (written by {by})"));
             let mut g = WAIT_STATS.lock();
             let e = g.get_or_insert_with(HashMap::new).entry((self.name.clone(), by)).or_default();
             e.0 += 1;

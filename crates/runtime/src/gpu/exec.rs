@@ -1408,7 +1408,9 @@ fn submitter_thread() {
                 SUBMIT_CV.wait(&mut q);
             }
         };
+        let tl = super::timeline::mark();
         job();
+        super::timeline::end("vk submit", tl, || format!("#{seq}"));
         note_submitted(seq);
     }
 }
@@ -1449,7 +1451,7 @@ fn completion_thread() {
                 }
             }
             FLUSHES.fetch_add(1, Ordering::Relaxed);
-            collect_timestamps(b.queries, &b.shaders, &b.name);
+            collect_timestamps(b.queries, &b.shaders, &b.name, b.seq);
             check_watchdog(&b.name, &b.shaders);
             let ms = b.submitted.elapsed().as_millis();
             if ms >= 250 {
@@ -1458,9 +1460,12 @@ fn completion_thread() {
             }
         }
         let ta = std::time::Instant::now();
+        let tl = if b.actions.is_empty() { None } else { super::timeline::mark() };
+        let n = b.actions.len();
         for a in b.actions {
             a();
         }
+        super::timeline::end("gpu-complete", tl, || format!("{} CP effect(s) of {} #{}", n, b.name, b.seq));
         ACTION_NS.fetch_add(ta.elapsed().as_nanos() as u64, Ordering::Relaxed);
         for ch in b.checks.iter_mut() {
             // A later batch (possibly already run) writes the destination again.
@@ -1954,7 +1959,7 @@ fn batch_by_lines() -> String {
 }
 
 /// Reads a completed batch's dispatch timestamps into SHADER_TIME.
-fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str) {
+fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str, seq: u64) {
     if pool == vk::QueryPool::null() {
         return;
     }
@@ -1963,6 +1968,7 @@ fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str) {
     if unsafe { c.device.get_query_pool_results(pool, STAMPS * MAX_TIMED, &mut be, vk::QueryResultFlags::TYPE_64) }.is_ok() {
         let period = c.limits.timestamp_period as f64;
         let batch_ns = (be[1].saturating_sub(be[0]) as f64 * period) as u64;
+        super::timeline::gpu(queue, seq, be[0], be[1], &format!(", {} commands", shaders.len()));
         BATCH_NS.fetch_add(batch_ns, Ordering::Relaxed);
         if !command_stamps() {
             note_batch_by(queue, shaders, batch_ns);
@@ -1983,6 +1989,7 @@ fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str) {
     let mut pre = [0u64; 2];
     if unsafe { c.device.get_query_pool_results(pool, STAMPS * MAX_TIMED + 2, &mut pre, vk::QueryResultFlags::TYPE_64) }.is_ok() {
         PRE_NS.fetch_add((pre[1].saturating_sub(pre[0]) as f64 * c.limits.timestamp_period as f64) as u64, Ordering::Relaxed);
+        super::timeline::gpu(queue, seq, pre[0], pre[1], " prologue");
     }
     let n = (shaders.len() as u32).min(MAX_TIMED);
     if n == 0 || !command_stamps() {
@@ -2162,6 +2169,8 @@ pub struct Exec {
     recording: bool,
     /// When the batch being recorded was begun.
     begun_at: std::time::Instant,
+    /// Its start on the timeline (`timeline::mark`).
+    begun_mark: Option<i64>,
     /// Label values the recording batch writes GPU-side (address, value,
     /// bytes): promised when it is submitted.
     pending_promises: Vec<(u64, u64, u8)>,
@@ -2275,6 +2284,7 @@ impl Exec {
                 ring_align: c.limits.min_storage_buffer_offset_alignment.max(16),
                 recording: false,
                 begun_at: std::time::Instant::now(),
+                begun_mark: None,
                 pending_promises: Vec::new(),
                 submit_request: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 pending: Default::default(),
@@ -2368,7 +2378,9 @@ impl Exec {
         if slot.seq != 0 {
             if slot.seq > done_seq() {
                 let t = std::time::Instant::now();
+                let tl = super::timeline::mark();
                 wait_done(slot.seq);
+                super::timeline::end(&self.name, tl, || format!("wait: batch slot (#{})", slot.seq));
                 WAIT_NS[2].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 WAIT_NS[3].fetch_add(1, Ordering::Relaxed);
                 note_queue_wait(&self.name, 1, t.elapsed());
@@ -2407,6 +2419,7 @@ impl Exec {
         self.recording = true;
         self.dyncache = Default::default();
         self.begun_at = std::time::Instant::now();
+        self.begun_mark = super::timeline::mark();
         self.pool_use = [0; 5];
         self.shadow_used = 0;
         self.resident.clear();
@@ -2447,7 +2460,9 @@ impl Exec {
         }
         if self.submit_after > done_seq() {
             // Deferred CP writes that this work may read come first.
+            let tl = super::timeline::mark();
             wait_done(self.submit_after);
+            super::timeline::end(&self.name, tl, || format!("wait: deferred CP writes (#{})", self.submit_after));
         }
         self.end_rendering();
         let c = ctx();
@@ -2491,6 +2506,7 @@ impl Exec {
             if has_actions || !self.pending_promises.is_empty() {
                 crate::error!("gpu[{}]: CP effects in a parallel run (dropped)", self.name);
             }
+            super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
             self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders) });
             self.slots[i].seq = PENDING;
             self.pending_promises.clear();
@@ -2504,6 +2520,7 @@ impl Exec {
             self.pres.clear();
             return;
         }
+        let commands = self.batch_shaders.len();
         let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, move || {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return;
@@ -2518,6 +2535,7 @@ impl Exec {
                 }
             }
         });
+        super::timeline::end(&self.name, self.begun_mark.take(), || format!("batch #{seq}, {commands} commands ({why})"));
         self.slots[i].seq = seq;
         self.open_gen.store(u64::MAX, Ordering::SeqCst);
         super::precache::submitted(&std::mem::take(&mut self.shared_pending), seq);
@@ -2966,7 +2984,9 @@ impl Exec {
             return;
         }
         self.submit_for("sync");
+        let tl = super::timeline::mark();
         wait_done(self.last_seq);
+        super::timeline::end(&self.name, tl, || format!("wait: own batches (#{})", self.last_seq));
         self.inflight.clear();
     }
 
@@ -3052,6 +3072,22 @@ impl Exec {
             f();
             None
         }
+    }
+
+    /// Submits the batch being recorded when the GPU has run out of work
+    /// (every batch of every queue completed) and the batch has been
+    /// recording for `tune idle_split` us: the main command processor's own
+    /// chunk of a parallel run (~670-820 commands) took 7-12 ms to record
+    /// while the GPU sat idle (timeline run 20261012-032934).
+    pub(super) fn split_if_gpu_idle(&mut self) {
+        if !self.recording || self.deferred {
+            return;
+        }
+        let us = super::tune::idle_split();
+        if us == 0 || done_seq() + 1 < NEXT_SEQ.load(Ordering::Relaxed) || self.begun_at.elapsed() < std::time::Duration::from_micros(us) {
+            return;
+        }
+        self.submit_for("idle");
     }
 
     /// The title synchronized its GPU work (CS/PS partial flush, cache
@@ -3325,7 +3361,9 @@ impl Exec {
             if s > done_seq() {
                 waited.get_or_insert_with(std::time::Instant::now);
                 FOREIGN_WAITS.fetch_add(1, Ordering::Relaxed);
+                let tl = super::timeline::mark();
                 wait_done(s);
+                super::timeline::end(&self.name, tl, || format!("wait: batch #{s} writing inputs"));
             }
         }
         lap(2, &mut t);
@@ -4043,6 +4081,7 @@ impl Exec {
                 crate::error!("gpu[{}]: device lost by the dispatch of cs {cs:#x} ({}x{}x{} groups)", self.name, groups[0], groups[1], groups[2]);
             }
         }
+        self.split_if_gpu_idle();
     }
 
     /// An indirect dispatch whose arguments (12 bytes at `args`) GPU work

@@ -88,6 +88,7 @@ fn vblank_thread() {
         }
         next += period;
         let mut show: Option<DisplayBuffer> = None;
+        let mut flipped = None;
         {
             let mut g = PORT.lock();
             let Some(p) = g.as_mut() else { continue };
@@ -111,9 +112,13 @@ fn vblank_thread() {
                     show = p.buffers[f.index as usize];
                 }
                 crate::gpu::FRAMES.store(p.count, std::sync::atomic::Ordering::Relaxed);
+                flipped = Some(p.count);
                 FLIP_CV.notify_all();
             }
             VBLANK_CV.notify_all();
+        }
+        if let Some(n) = flipped {
+            crate::gpu::timeline::flipped(n as u64);
         }
         if let Some(b) = show {
             let n = PORT.lock().as_ref().map(|p| p.count).unwrap_or(0);

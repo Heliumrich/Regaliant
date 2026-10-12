@@ -430,6 +430,14 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     _ => Err("usage: profile reset|report".into()),
                 }
             }
+            "timeline" => {
+                // `timeline <flips>`: spans of command processing and GPU
+                // batches over the next flips (`gpu::timeline`).
+                match parts.next().and_then(|n| n.parse::<u32>().ok()) {
+                    Some(n) if n > 0 => gpu::timeline::start(n),
+                    _ => Err("usage: timeline <flips>".into()),
+                }
+            }
             "stacks" => {
                 info!("guest thread stacks:\n{}", thread_summary_ex(true));
                 Ok(())

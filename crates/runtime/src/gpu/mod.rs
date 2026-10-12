@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 40] = [
+    static ALL: [Tunable; 41] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -67,6 +67,7 @@ pub mod tune {
         Tunable { name: "submit_thread", env: "DS_SUBMIT_THREAD", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_balance", env: "DS_PAR_BALANCE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_inflight", env: "DS_PRE_INFLIGHT", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "idle_split", env: "DS_IDLE_SPLIT", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -336,6 +337,12 @@ pub mod tune {
         get(39) != 0
     }
 
+    /// A command processor's batch is submitted once it has been recording
+    /// this many microseconds while the GPU has no work left (0: off).
+    pub fn idle_split() -> u64 {
+        get(40)
+    }
+
     /// Command-processor waits for GPU work still to be traced (`tune
     /// trace_sync <n>`: the next n are logged with the read that collided,
     /// its writer and the shader).
@@ -370,6 +377,7 @@ pub mod pstats;
 pub mod mirror;
 pub mod ranges;
 pub mod homes;
+pub mod timeline;
 
 /// Fast non-cryptographic hashing for maps on the command processors' hot
 /// paths (the image cache). Lookups compare keys, so a collision costs time
@@ -635,12 +643,16 @@ fn worker(q: &'static Queue, name: &str) {
     loop {
         let batch = {
             let mut g = q.pending.lock();
-            loop {
+            let mut idle = None;
+            let b = loop {
                 if let Some(b) = g.pop_front() {
                     break b;
                 }
+                idle = idle.or_else(timeline::mark);
                 q.cv.wait(&mut g);
-            }
+            };
+            timeline::end(name, idle, || "idle: no title submission".into());
+            b
         };
         cp.submitted_at = Some(batch.at);
         cp.new_submission();

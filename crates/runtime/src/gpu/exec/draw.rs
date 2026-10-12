@@ -426,6 +426,7 @@ impl Exec {
                 crate::error!("gpu[{}]: device lost by a draw (vs {vs:#x}, ps {ps:#x})", self.name);
             }
         }
+        self.split_if_gpu_idle();
         outcome
     }
 

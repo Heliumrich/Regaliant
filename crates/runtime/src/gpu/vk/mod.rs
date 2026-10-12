@@ -34,6 +34,9 @@ pub struct Ctx {
     pub barycentric: bool,
     /// VK_EXT_memory_budget enabled (`heap_report`).
     pub memory_budget: bool,
+    /// VK_EXT_calibrated_timestamps with the device and performance-counter
+    /// time domains (`gpu::timeline`: GPU timestamps on the CPU clock).
+    pub calibrated: Option<ash::ext::calibrated_timestamps::Device>,
 }
 
 static CTX: OnceLock<Ctx> = OnceLock::new();
@@ -157,6 +160,17 @@ fn init_inner() -> Result<(), String> {
             .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::memory_budget::NAME);
         if memory_budget {
             dexts.push(ash::ext::memory_budget::NAME.as_ptr());
+        }
+        let calibrated = instance
+            .enumerate_device_extension_properties(pdev)
+            .unwrap_or_default()
+            .iter()
+            .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::calibrated_timestamps::NAME)
+            && ash::ext::calibrated_timestamps::Instance::new(&entry, &instance)
+                .get_physical_device_calibrateable_time_domains(pdev)
+                .is_ok_and(|d| d.contains(&vk::TimeDomainEXT::DEVICE) && d.contains(&vk::TimeDomainEXT::QUERY_PERFORMANCE_COUNTER));
+        if calibrated {
+            dexts.push(ash::ext::calibrated_timestamps::NAME.as_ptr());
         }
         let want_ckpt = std::env::var("DS_GPU_CHECKPOINTS").ok().as_deref() == Some("1");
         let has_ckpt = want_ckpt
@@ -306,6 +320,7 @@ fn init_inner() -> Result<(), String> {
             ext_host: host_import.then(|| ash::ext::external_memory_host::Device::new(&instance, &device)),
             checkpoints: has_ckpt.then(|| ash::nv::device_diagnostic_checkpoints::Device::new(&instance, &device)),
             exec_props: has_stats.then(|| ash::khr::pipeline_executable_properties::Device::new(&instance, &device)),
+            calibrated: calibrated.then(|| ash::ext::calibrated_timestamps::Device::new(&instance, &device)),
             entry,
             instance,
             pdev,
@@ -523,6 +538,15 @@ impl Ctx {
             let ptr = self.device.map_memory(mem, 0, size, vk::MemoryMapFlags::empty()).map_err(|e| format!("map: {e}"))? as *mut u8;
             Ok((buf, mem, ptr))
         }
+    }
+
+    /// A GPU timestamp and the performance counter read together (None
+    /// without VK_EXT_calibrated_timestamps).
+    pub fn calibrate(&self) -> Option<(u64, i64)> {
+        let cal = self.calibrated.as_ref()?;
+        let info = [vk::CalibratedTimestampInfoEXT::default().time_domain(vk::TimeDomainEXT::DEVICE), vk::CalibratedTimestampInfoEXT::default().time_domain(vk::TimeDomainEXT::QUERY_PERFORMANCE_COUNTER)];
+        let (t, _) = unsafe { cal.get_calibrated_timestamps(&info) }.ok()?;
+        Some((t[0], t[1] as i64))
     }
 
     pub fn submit(&self, cmd: vk::CommandBuffer, wait: &[(vk::Semaphore, vk::PipelineStageFlags)], signal: &[vk::Semaphore], fence: vk::Fence) -> Result<(), String> {
