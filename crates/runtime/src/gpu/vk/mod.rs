@@ -490,16 +490,6 @@ pub fn note_gpu_freed(buf: vk::Buffer) {
     }
 }
 
-/// The GPU address of a buffer created with SHADER_DEVICE_ADDRESS (0 without
-/// bufferDeviceAddress).
-pub fn buffer_address(buf: vk::Buffer) -> u64 {
-    let c = ctx();
-    if !c.device_addresses {
-        return 0;
-    }
-    unsafe { c.device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buf)) }
-}
-
 /// Where a GPU address lies among the noted ranges.
 fn describe_address(a: u64) -> String {
     let g = GPU_RANGES.lock();

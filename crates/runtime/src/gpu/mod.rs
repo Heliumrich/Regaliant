@@ -793,8 +793,12 @@ pub fn profile_this_thread(kind: &'static str) {
 /// Kinds of sampled threads, in report order.
 const PROFILE_KINDS: [&str; 5] = ["gfx", "acb", "par", "prep", "submit"];
 
+/// Starts the 10 ms thread sampler: `DS_PROFILE_GPU=1` (with the per-command
+/// timers and statistics) or `DS_PROFILE_GPU=2` (the sampler alone: function
+/// profiles of an otherwise unprofiled run, whose timers and statistics
+/// would show up in them).
 pub fn start_profiler() {
-    if std::env::var("DS_PROFILE_GPU").ok().as_deref() != Some("1") {
+    if !matches!(std::env::var("DS_PROFILE_GPU").ok().as_deref(), Some("1" | "2")) {
         return;
     }
     *PROFILE.lock() = Some(std::collections::HashMap::new());

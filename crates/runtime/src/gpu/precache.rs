@@ -62,6 +62,9 @@ struct Slot {
     chunk: Arc<Chunk>,
     /// When it was last started (`Cache::fills`): eviction order.
     filled: u64,
+    /// Keys of the entries made in it since (some may be gone or replaced):
+    /// an eviction removes its entries without scanning all of them.
+    keys: Vec<(u64, u64)>,
 }
 
 #[derive(Default)]
@@ -244,7 +247,7 @@ impl Cache {
     /// Space for `n` bytes (256-byte aligned) in the chunk being filled, a
     /// free one, a new one, or (all in use) the chunk filled longest ago once
     /// nothing binds it (its entries go now).
-    fn alloc(&mut self, n: u64) -> Option<(Arc<Chunk>, u64)> {
+    fn alloc(&mut self, n: u64) -> Option<(usize, Arc<Chunk>, u64)> {
         let n = n.next_multiple_of(256);
         if n > CHUNK {
             return None;
@@ -253,7 +256,7 @@ impl Cache {
             if *used + n <= CHUNK {
                 let off = *used;
                 *used += n;
-                return Some((self.chunks[*k].chunk.clone(), off));
+                return Some((*k, self.chunks[*k].chunk.clone(), off));
             }
         }
         let max = (super::tune::pre_share_mib() as u64 * (1 << 20) / CHUNK).max(2) as usize;
@@ -262,7 +265,7 @@ impl Cache {
             Some(k) => k,
             None if self.chunks.len() < max && !self.failed => match ctx().device_buffer(CHUNK, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER) {
                 Ok((buf, mem)) => {
-                    self.chunks.push(Slot { chunk: Arc::new(Chunk { buf, _mem: mem }), filled: 0 });
+                    self.chunks.push(Slot { chunk: Arc::new(Chunk { buf, _mem: mem }), filled: 0, keys: Vec::new() });
                     self.chunks.len() - 1
                 }
                 Err(e) => {
@@ -277,10 +280,11 @@ impl Cache {
                 let cur = self.current.map(|c| c.0);
                 let old = (0..self.chunks.len()).filter(|&k| Some(k) != cur).min_by_key(|&k| self.chunks[k].filled)?;
                 let victim = self.chunks[old].chunk.clone();
-                let keys: Vec<(u64, u64)> = self.entries.iter().filter(|(_, e)| Arc::ptr_eq(&e.chunk, &victim)).map(|(k, _)| *k).collect();
-                STATS[5].fetch_add(keys.len() as u64, Ordering::Relaxed);
-                for k in keys {
-                    self.remove(k);
+                for k in std::mem::take(&mut self.chunks[old].keys) {
+                    if self.entries.get(&k).is_some_and(|e| Arc::ptr_eq(&e.chunk, &victim)) {
+                        self.remove(k);
+                        STATS[5].fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 drop(victim);
                 if !idle(&self.chunks[old]) {
@@ -291,8 +295,10 @@ impl Cache {
         };
         self.fills += 1;
         self.chunks[k].filled = self.fills;
+        // An idle chunk has no entries left (each holds its chunk).
+        self.chunks[k].keys.clear();
         self.current = Some((k, n));
-        Some((self.chunks[k].chunk.clone(), 0))
+        Some((k, self.chunks[k].chunk.clone(), 0))
     }
 }
 
@@ -353,11 +359,12 @@ pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
         let n = c.drop_pages(&pages);
         STATS[3].fetch_add(n, Ordering::Relaxed);
     }
-    let Some((chunk, offset)) = c.alloc(n) else {
+    let Some((slot, chunk, offset)) = c.alloc(n) else {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         c.bounds_changed();
         return None;
     };
+    c.chunks[slot].keys.push((base, size));
     STATS[1].fetch_add(1, Ordering::Relaxed);
     c.remove((base, size));
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);

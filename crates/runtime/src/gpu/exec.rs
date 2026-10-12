@@ -1128,16 +1128,17 @@ fn merge_pipe() -> Result<&'static MergePipe, String> {
 
 /// The textures a stage samples, with a coarse bound of their guest bytes
 /// (16 per texel).
-fn texture_ranges(p: &Prepared) -> Vec<((u64, u64), super::desc::Tsharp)> {
+/// Appended to `out` (a reused vector: no allocation per command once it
+/// has grown).
+fn texture_ranges_into(p: &Prepared, out: &mut Vec<((u64, u64), super::desc::Tsharp)>) {
     let coarse = |t: &super::desc::Tsharp| ((t.base, (t.width as u64 * t.height as u64 * t.depth.max(1) as u64 * 16).min(1 << 30)), *t);
-    p.resources
-        .iter()
-        .flat_map(|r| match r {
-            Resolved::Image(t) => vec![coarse(t)],
-            Resolved::ImageTable(e) => e.iter().flatten().map(coarse).collect(),
-            _ => Vec::new(),
-        })
-        .collect()
+    for r in &p.resources {
+        match r {
+            Resolved::Image(t) => out.push(coarse(t)),
+            Resolved::ImageTable(e) => out.extend(e.iter().flatten().map(coarse)),
+            _ => {}
+        }
+    }
 }
 /// Most batch slots per queue (`tune slots`, default 4): one batch recording
 /// while the batches of the others execute. A queue reuses a slot only after
@@ -2369,6 +2370,8 @@ pub struct Exec {
     /// Shared copies this batch's prologue makes (usable by later batches
     /// once it is submitted).
     shared_pending: Vec<(u64, u64, u64)>,
+    /// A draw's texture ranges (`texture_ranges_into`), reused per draw.
+    tex_scratch: Vec<((u64, u64), super::desc::Tsharp)>,
 }
 
 unsafe impl Send for Exec {}
@@ -2458,6 +2461,7 @@ impl Exec {
                 },
                 shares_pre: true,
                 shared_pending: Vec::new(),
+                tex_scratch: Vec::new(),
             })
         }
     }
@@ -3968,7 +3972,8 @@ impl Exec {
     fn bind_stage(&mut self, p: &mut Prepared, allow_shadow: bool) -> Result<Bound, String> {
         super::images::BINDING_SHADER.with(|s| s.set(p.addr));
         let res_info = rdna::translate::res_info_offset(&p.tr.plan) as usize;
-        let mut bound = Bound { bufs: Vec::new(), imgs: Vec::new(), img_arrays: Vec::new(), writes: Vec::new(), sized_writes: Vec::new(), images: Vec::new(), shadows: Vec::new(), write_src: Vec::new(), placements: Vec::new() };
+        let nb = p.tr.out.bindings.len();
+        let mut bound = Bound { bufs: Vec::with_capacity(nb), imgs: Vec::with_capacity(nb), img_arrays: Vec::new(), writes: Vec::new(), sized_writes: Vec::new(), images: Vec::with_capacity(nb), shadows: Vec::new(), write_src: Vec::new(), placements: Vec::new() };
         let seg = SHADOW_BYTES;
         let fx = fixed();
         {
@@ -4150,7 +4155,9 @@ impl Exec {
                                 }
                             }
                         }
-                        bound.placements.push((placement, bound_size, p.tr.plan.resources[i].written));
+                        if profiling() {
+                            bound.placements.push((placement, bound_size, p.tr.plan.resources[i].written));
+                        }
                         let ri = res_info + RES_INFO_DWORDS as usize * i;
                         p.sgpr_data[ri] = bias as u32;
                         p.sgpr_data[ri + 1] = stride;
@@ -4300,7 +4307,7 @@ impl Exec {
     }
 
     fn write_set(&self, set: vk::DescriptorSet, bounds: &[Bound]) {
-        let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
+        let mut writes: Vec<vk::WriteDescriptorSet> = Vec::with_capacity(bounds.iter().map(|b| b.bufs.len() + b.imgs.len() + b.img_arrays.len()).sum());
         for b in bounds {
             for (binding, info) in &b.bufs {
                 writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)));
@@ -4408,7 +4415,11 @@ impl Exec {
         }
         lap.mark(1);
         // Textures are uploaded from guest memory: earlier GPU writes first.
-        self.sync_textures(&texture_ranges(&p), SYNC_CS_TEXTURES);
+        let mut textures = std::mem::take(&mut self.tex_scratch);
+        textures.clear();
+        texture_ranges_into(&p, &mut textures);
+        self.sync_textures(&textures, SYNC_CS_TEXTURES);
+        self.tex_scratch = textures;
         if self.stopped {
             return Err(STOPPED.into());
         }

@@ -555,11 +555,14 @@ impl Exec {
         }
         lap.mark(2);
         let t_prep = since(t0);
-        let mut textures = texture_ranges(&vs);
+        let mut textures = std::mem::take(&mut self.tex_scratch);
+        textures.clear();
+        super::texture_ranges_into(&vs, &mut textures);
         if let Some(p) = &ps {
-            textures.extend(texture_ranges(p));
+            super::texture_ranges_into(p, &mut textures);
         }
         self.sync_textures(&textures, SYNC_DRAW_TEXTURES);
+        self.tex_scratch = textures;
         if self.stopped {
             return Err(super::STOPPED.into());
         }
