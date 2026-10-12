@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 36] = [
+    static ALL: [Tunable; 37] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -63,6 +63,7 @@ pub mod tune {
         Tunable { name: "pre_share_min", env: "DS_PRE_SHARE_MIN", default: 16384, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_share_mib", env: "DS_PRE_SHARE_MIB", default: 1024, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_share_volatile", env: "DS_PRE_SHARE_VOLATILE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "spec_reads", env: "DS_SPEC_READS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -306,6 +307,12 @@ pub mod tune {
     /// (copied per batch instead); 0: always kept.
     pub fn pre_share_volatile() -> u64 {
         get(35)
+    }
+
+    /// Stages whose preparation read what submitted GPU work still writes
+    /// are used as prepared and checked afterwards (`exec::speculate`).
+    pub fn spec_reads() -> bool {
+        get(36) != 0
     }
 
     /// Command-processor waits for GPU work still to be traced (`tune

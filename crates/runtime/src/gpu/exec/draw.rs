@@ -529,8 +529,13 @@ impl Exec {
         };
         lap.mark(1);
         self.sync_readers = [vs.addr, ps.as_ref().map_or(0, |p| p.addr)];
-        // Each stage's reads in place (no combined copy per draw).
-        let waited = self.sync_for(&vs.reads, SYNC_DRAW_READS) | ps.as_ref().is_some_and(|p| self.sync_for(&p.reads, SYNC_DRAW_READS));
+        // Each stage's reads in place (no combined copy per draw), unless the
+        // stages are used as prepared (`speculate`).
+        let speculated = match &ps {
+            Some(p) => self.speculate(&[&vs, p]),
+            None => self.speculate(&[&vs]),
+        };
+        let waited = !speculated && (self.sync_for(&vs.reads, SYNC_DRAW_READS) | ps.as_ref().is_some_and(|p| self.sync_for(&p.reads, SYNC_DRAW_READS)));
         if self.stopped {
             return Err(super::STOPPED.into());
         }

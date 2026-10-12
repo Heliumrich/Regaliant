@@ -87,11 +87,15 @@ fn sync_why_status() -> String {
     let n: Vec<u64> = SYNC_WHY.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let w: Vec<u64> = READ_WAIT_WORDS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    shader-read waits whose words were unchanged after the wait: draws {} of {}, dispatches {} of {}\n",
+        "    shader-read waits whose words were unchanged after the wait: draws {} of {}, dispatches {} of {}; stages used as prepared instead of waiting {} (checks held {}, failed {}, {} shaders wait again)\n",
         w[0],
         w[0] + w[1],
         w[2],
-        w[2] + w[3]
+        w[2] + w[3],
+        SPEC_STATS[0].load(Ordering::Relaxed),
+        SPEC_STATS[1].load(Ordering::Relaxed),
+        SPEC_STATS[2].load(Ordering::Relaxed),
+        NO_SPEC.lock().as_ref().map_or(0, |n| n.len())
     ) + &format!(
         "    CP read waits: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices; pipelines created: {} compute ({} ms), {} graphics ({} ms)\n",
         n[0],
@@ -1260,6 +1264,65 @@ pub fn note_cp_source(seq: u64, src: (u64, u64)) {
     CP_WRITES.note(seq, src);
 }
 
+/// A stage used as prepared although submitted GPU work (batch `seq`) was
+/// still writing what its preparation read (`Exec::speculate`): the words
+/// it read are compared with memory once that batch completed.
+struct SpecCheck {
+    seq: u64,
+    shader: u64,
+    reads: Vec<(u64, u64)>,
+    words: Vec<u32>,
+}
+
+static SPEC_CHECKS: Mutex<Vec<SpecCheck>> = Mutex::new(Vec::new());
+static SPEC_PENDING: AtomicU64 = AtomicU64::new(0);
+/// Shaders whose speculation was wrong once: they wait again.
+static NO_SPEC: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+/// [stages used as prepared, checks that held, checks that failed].
+static SPEC_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Checks the speculations whose batch completed (completion thread).
+fn check_speculations(done: u64) {
+    if SPEC_PENDING.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let due: Vec<SpecCheck> = {
+        let mut g = SPEC_CHECKS.lock();
+        let (due, keep): (Vec<SpecCheck>, Vec<SpecCheck>) = std::mem::take(&mut *g).into_iter().partition(|c| c.seq <= done);
+        *g = keep;
+        SPEC_PENDING.store(g.len() as u64, Ordering::Release);
+        due
+    };
+    for c in due {
+        let mut k = 0usize;
+        let mut held = true;
+        'reads: for &(a, n) in &c.reads {
+            let m = (n / 4) as usize;
+            if !super::cp::guest_readable(a, n) {
+                held = false;
+                break;
+            }
+            for j in 0..m {
+                let now = unsafe { std::ptr::read_volatile((a + 4 * j as u64) as *const u32) };
+                if c.words.get(k + j) != Some(&now) {
+                    held = false;
+                    break 'reads;
+                }
+            }
+            k += m;
+        }
+        if held {
+            SPEC_STATS[1].fetch_add(1, Ordering::Relaxed);
+        } else {
+            let n = SPEC_STATS[2].fetch_add(1, Ordering::Relaxed);
+            NO_SPEC.lock().get_or_insert_with(HashSet::new).insert(c.shader);
+            if n < 20 {
+                crate::info!("gpu: a stage used as prepared read words GPU work then changed (shader {:#x}, reads {:x?}); it waits from now on", c.shader, c.reads);
+            }
+        }
+    }
+}
+
 /// Blocks until batch `seq` and all earlier ones completed (with their actions).
 pub fn wait_done(seq: u64) {
     let mut d = DONE.lock();
@@ -1338,6 +1401,7 @@ fn completion_thread() {
         *LAST_DONE_AT.lock() = Some(std::time::Instant::now());
         DONE_CV.notify_all();
         reap_spans();
+        check_speculations(b.seq);
     }
 }
 
@@ -1936,7 +2000,16 @@ pub fn shader_profile() -> String {
             n[0], n[1], n[2], n[3], n[4], n[5]
         ));
         let w: Vec<u64> = READ_WAIT_WORDS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-        s.push_str(&format!("    shader-read waits whose words were unchanged after the wait: draws {} of {}, dispatches {} of {}\n", w[0], w[0] + w[1], w[2], w[2] + w[3]));
+        s.push_str(&format!(
+            "    shader-read waits whose words were unchanged after the wait: draws {} of {}, dispatches {} of {}; stages used as prepared instead of waiting {} (checks held {}, failed {})\n",
+            w[0],
+            w[0] + w[1],
+            w[2],
+            w[2] + w[3],
+            SPEC_STATS[0].load(Ordering::Relaxed),
+            SPEC_STATS[1].load(Ordering::Relaxed),
+            SPEC_STATS[2].load(Ordering::Relaxed)
+        ));
     }
     if let Some(w) = SUBMIT_WHY.lock().as_ref() {
         let mut v: Vec<(&(String, &'static str), &u64)> = w.iter().collect();
@@ -3010,6 +3083,47 @@ impl Exec {
         w
     }
 
+    /// Instead of waiting for GPU work that writes what the stages'
+    /// preparations read (`tune spec_reads`): when that work is all
+    /// submitted (not this batch's), no home holds newer data and no stage's
+    /// shader was mispredicted before, the stages are used as prepared (with
+    /// the values before those writes) and their words are checked once the
+    /// work completed (`check_speculations`). True: speculated (no wait).
+    pub(super) fn speculate(&mut self, stages: &[&Prepared]) -> bool {
+        if !super::tune::spec_reads() {
+            return false;
+        }
+        let done = done_seq();
+        self.inflight.prune(done);
+        let mut writers: Vec<(usize, u64)> = Vec::new();
+        for (k, p) in stages.iter().enumerate() {
+            if p.reads.is_empty() {
+                continue;
+            }
+            if self.pending.overlaps_any(&p.reads) || super::homes::any_stale(&p.reads) {
+                return false;
+            }
+            let s = self.inflight.latest(&p.reads, done).max(INFLIGHT.latest(&p.reads));
+            if let Some(s) = s.filter(|&s| s > done) {
+                writers.push((k, s));
+            }
+        }
+        if writers.is_empty() {
+            return false;
+        }
+        if NO_SPEC.lock().as_ref().is_some_and(|n| writers.iter().any(|&(k, _)| n.contains(&stages[k].addr))) {
+            return false;
+        }
+        let mut g = SPEC_CHECKS.lock();
+        for &(k, s) in &writers {
+            let p = stages[k];
+            g.push(SpecCheck { seq: s, shader: p.addr, reads: p.reads.clone(), words: p.words.clone() });
+            SPEC_STATS[0].fetch_add(1, Ordering::Relaxed);
+        }
+        SPEC_PENDING.store(g.len() as u64, Ordering::Release);
+        true
+    }
+
     /// Whether `sync_for_reads` would wait.
     fn would_wait(&mut self, reads: &[(u64, u64)]) -> bool {
         self.overlaps_pending(reads) || INFLIGHT.latest(reads).is_some_and(|s| s > done_seq())
@@ -3822,7 +3936,7 @@ impl Exec {
         };
         lap.mark(0);
         self.sync_readers = [p.addr, 0];
-        if self.sync_for(&p.reads, SYNC_CS_READS) {
+        if !self.speculate(&[&p]) && self.sync_for(&p.reads, SYNC_CS_READS) {
             if self.stopped {
                 return Err(STOPPED.into());
             }
