@@ -47,6 +47,11 @@ struct Entry {
     chunk: Arc<Chunk>,
     /// Offset of the copy (its 16-byte aligned start) in the chunk.
     offset: u64,
+    /// Unique per insertion: two batches may both copy a range they missed
+    /// at the same time, the second entry replacing the first; only the
+    /// batch that made an entry may mark it submitted (`submitted`), or a
+    /// third batch could bind a copy whose batch is not submitted yet.
+    id: u64,
     /// Sequence of the batch whose prologue copies it (0: not submitted).
     seq: u64,
     /// The synchronization epoch it was last checked for CPU writes in.
@@ -80,12 +85,51 @@ struct Cache {
 }
 
 static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+
+/// Per bucket of 64 KiB guest pages (hashed), how many entries cover one of
+/// its pages: writes whose buckets are all empty need not take the lock (GPU
+/// and CP writes check every written range; with entries all over guest
+/// memory the LO/HI bounds rarely exclude them: write tracking per dispatch
+/// went from 0.57 to 1.59 us, profile run 20261012-001629). A write racing an
+/// insert is caught again when its batch is submitted (`invalidate_ranges`).
+const BUCKETS: usize = 1 << 16;
+static COVER: [std::sync::atomic::AtomicU32; BUCKETS] = [const { std::sync::atomic::AtomicU32::new(0) }; BUCKETS];
+
+fn bucket(page: u64) -> usize {
+    (page.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize
+}
+
+/// Counts an entry's pages in (or out of) the buckets.
+fn cover(base: u64, size: u64, add: bool) {
+    if size == 0 {
+        return;
+    }
+    for page in (base >> 16)..=((base + size - 1) >> 16) {
+        let c = &COVER[bucket(page)];
+        if add {
+            c.fetch_add(1, Ordering::AcqRel);
+        } else {
+            c.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Whether an entry may overlap [base, base+len) (false: certainly none).
+fn may_cover(base: u64, len: u64) -> bool {
+    let (first, last) = (base >> 16, (base + len - 1) >> 16);
+    if last - first >= 64 {
+        return true;
+    }
+    (first..=last).any(|page| COVER[bucket(page)].load(Ordering::Acquire) != 0)
+}
 /// Bounds of all entries, readable without the lock (`invalidate` skips
 /// writes outside them; LO > HI: no entries).
 static LO: AtomicU64 = AtomicU64::new(u64::MAX);
 static HI: AtomicU64 = AtomicU64::new(0);
 /// The synchronization epoch (`end_scope`).
 static EPOCH: AtomicU64 = AtomicU64::new(1);
+/// Entry ids (`Entry::id`).
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Statistics: [hits, copies, checks (epoch changed), dropped by CPU writes,
 /// dropped by GPU/CP/host writes and mapping changes, dropped by eviction,
@@ -110,6 +154,7 @@ impl Cache {
         if self.entries.remove(&key).is_none() {
             return false;
         }
+        cover(key.0, key.1, false);
         if let Some(v) = self.by_base.get_mut(&key.0) {
             v.retain(|&s| s != key.1);
             if v.is_empty() {
@@ -265,8 +310,9 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64)> {
 }
 
 /// Space for a new copy of [base, base+size) (`n` bytes from its aligned
-/// start); the entry is usable by other batches once `submitted` names it.
-pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64)> {
+/// start) and the new entry's id; the entry is usable by other batches once
+/// `submitted` names it.
+pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     let mut g = CACHE.lock();
     let c = g.get_or_insert_with(Cache::default);
     let keep = super::tune::pre_share_volatile();
@@ -292,7 +338,9 @@ pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64)> {
     };
     STATS[1].fetch_add(1, Ordering::Relaxed);
     c.remove((base, size));
-    c.entries.insert((base, size), Entry { chunk: chunk.clone(), offset, seq: 0, checked: EPOCH.load(Ordering::Acquire) });
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    c.entries.insert((base, size), Entry { chunk: chunk.clone(), offset, id, seq: 0, checked: EPOCH.load(Ordering::Acquire) });
+    cover(base, size, true);
     c.by_base.entry(base).or_default().push(size);
     c.max_size = c.max_size.max(size);
     if c.entries.len() == 1 {
@@ -302,19 +350,20 @@ pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64)> {
         c.hi = c.hi.max(base + size);
     }
     c.bounds_changed();
-    Some((chunk, offset))
+    Some((chunk, offset, id))
 }
 
-/// The batch `seq` whose prologue makes the copies of `keys` was submitted.
-pub fn submitted(keys: &[(u64, u64)], seq: u64) {
-    if keys.is_empty() {
+/// The batch `seq` whose prologue makes the copies of `made` ((base, size,
+/// entry id)) was submitted: those entries, if still there, are usable.
+pub fn submitted(made: &[(u64, u64, u64)], seq: u64) {
+    if made.is_empty() {
         return;
     }
     let mut g = CACHE.lock();
     let Some(c) = g.as_mut() else { return };
-    for k in keys {
-        if let Some(e) = c.entries.get_mut(k) {
-            if e.seq == 0 {
+    for &(base, size, id) in made {
+        if let Some(e) = c.entries.get_mut(&(base, size)) {
+            if e.id == id && e.seq == 0 {
                 e.seq = seq;
             }
         }
@@ -334,7 +383,7 @@ pub fn invalidate_gpu(base: u64, len: u64) {
 }
 
 fn drop_overlapping(base: u64, len: u64, gpu: bool) {
-    if len == 0 || base.saturating_add(len) <= LO.load(Ordering::Acquire) || HI.load(Ordering::Acquire) <= base {
+    if len == 0 || base.saturating_add(len) <= LO.load(Ordering::Acquire) || HI.load(Ordering::Acquire) <= base || !may_cover(base, len) {
         return;
     }
     let mut g = CACHE.lock();

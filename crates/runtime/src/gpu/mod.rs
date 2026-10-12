@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 37] = [
+    static ALL: [Tunable; 38] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -64,6 +64,7 @@ pub mod tune {
         Tunable { name: "pre_share_mib", env: "DS_PRE_SHARE_MIB", default: 1024, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_share_volatile", env: "DS_PRE_SHARE_VOLATILE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "spec_reads", env: "DS_SPEC_READS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "submit_thread", env: "DS_SUBMIT_THREAD", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     fn get(i: usize) -> u64 {
@@ -313,6 +314,12 @@ pub mod tune {
     /// are used as prepared and checked afterwards (`exec::speculate`).
     pub fn spec_reads() -> bool {
         get(36) != 0
+    }
+
+    /// Batches are submitted to Vulkan by a thread of their own
+    /// (`exec::push_batch`) instead of by the command processors.
+    pub fn submit_thread() -> bool {
+        get(37) != 0
     }
 
     /// Command-processor waits for GPU work still to be traced (`tune
@@ -751,7 +758,7 @@ pub fn profile_this_thread(kind: &'static str) {
 }
 
 /// Kinds of sampled threads, in report order.
-const PROFILE_KINDS: [&str; 4] = ["gfx", "acb", "par", "prep"];
+const PROFILE_KINDS: [&str; 5] = ["gfx", "acb", "par", "prep", "submit"];
 
 pub fn start_profiler() {
     if std::env::var("DS_PROFILE_GPU").ok().as_deref() != Some("1") {

@@ -1336,17 +1336,78 @@ pub fn wait_done(seq: u64) {
 
 /// Queues a batch: `submit` runs (the vkQueueSubmit) under the queue lock so
 /// sequence order is submission order.
-fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, submit: impl FnOnce()) -> u64 {
+fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, submit: impl FnOnce() + Send + 'static) -> u64 {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         crate::thread::spawn_host("gpu-complete", 1 << 20, Box::new(completion_thread)).expect("gpu completion thread");
+        crate::thread::spawn_host("gpu-submit", 1 << 20, Box::new(submitter_thread)).expect("gpu submission thread");
     });
     let mut q = BATCHES.lock();
-    submit();
     let seq = NEXT_SEQ.fetch_add(1, Ordering::SeqCst);
+    // The submission thread submits in sequence order; inline only while
+    // nothing is queued for it (the order holds when the switch changes).
+    let mut sq = SUBMIT_Q.lock();
+    if super::tune::submit_thread() || !sq.is_empty() {
+        sq.push_back((seq, Box::new(submit)));
+        drop(sq);
+        SUBMIT_CV.notify_one();
+    } else {
+        drop(sq);
+        submit();
+        note_submitted(seq);
+    }
     q.push_back(Batch { queries, seq, fence, actions, checks, shaders, submitted: std::time::Instant::now(), name: name.to_string() });
     BATCHES_CV.notify_one();
     seq
+}
+
+/// Submissions for the submission thread (`tune submit_thread`): the
+/// vkQueueSubmit of each batch in sequence order, off the command
+/// processors (~7% of the graphics command processor's busy samples, ~220
+/// batches per courtyard frame; profile run 20261012-001629).
+type SubmitJob = Box<dyn FnOnce() + Send>;
+static SUBMIT_Q: Mutex<std::collections::VecDeque<(u64, SubmitJob)>> = Mutex::new(std::collections::VecDeque::new());
+static SUBMIT_CV: parking_lot::Condvar = parking_lot::Condvar::new();
+/// Highest batch sequence submitted to Vulkan (the completion thread waits
+/// for a fence only once its batch was submitted).
+static SUBMITTED: Mutex<u64> = Mutex::new(0);
+static SUBMITTED_CV: parking_lot::Condvar = parking_lot::Condvar::new();
+
+fn note_submitted(seq: u64) {
+    let mut g = SUBMITTED.lock();
+    if *g < seq {
+        *g = seq;
+    }
+    SUBMITTED_CV.notify_all();
+}
+
+fn submitter_thread() {
+    crate::log::set_thread_name("gpu-submit");
+    super::profile_this_thread("submit");
+    loop {
+        let (seq, job) = {
+            let mut q = SUBMIT_Q.lock();
+            loop {
+                if let Some(j) = q.pop_front() {
+                    break j;
+                }
+                SUBMIT_CV.wait(&mut q);
+            }
+        };
+        job();
+        note_submitted(seq);
+    }
+}
+
+/// Blocks until batch `seq` was submitted to Vulkan.
+fn wait_submitted(seq: u64) {
+    let mut g = SUBMITTED.lock();
+    while *g < seq {
+        if super::shutting_down() && DEVICE_LOST.load(Ordering::Relaxed) {
+            return;
+        }
+        SUBMITTED_CV.wait_for(&mut g, std::time::Duration::from_millis(100));
+    }
 }
 
 /// Waits for submitted batches in order, then performs their actions.
@@ -1363,6 +1424,7 @@ fn completion_thread() {
             }
         };
         if b.fence != vk::Fence::null() && !DEVICE_LOST.load(Ordering::Relaxed) {
+            wait_submitted(b.seq);
             let tf = std::time::Instant::now();
             let r = unsafe { ctx().device.wait_for_fences(&[b.fence], true, 10_000_000_000) };
             FENCE_NS.fetch_add(tf.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -2131,7 +2193,7 @@ pub struct Exec {
     shares_pre: bool,
     /// Shared copies this batch's prologue makes (usable by later batches
     /// once it is submitted).
-    shared_pending: Vec<(u64, u64)>,
+    shared_pending: Vec<(u64, u64, u64)>,
 }
 
 unsafe impl Send for Exec {}
@@ -2140,7 +2202,7 @@ unsafe impl Send for Exec {}
 struct Closed {
     slot: usize,
     pre: Option<vk::CommandBuffer>,
-    shared: Vec<(u64, u64)>,
+    shared: Vec<(u64, u64, u64)>,
     writes: super::ranges::Ranges,
     checks: Vec<verify::Check>,
     shaders: Vec<u64>,
@@ -2409,7 +2471,7 @@ impl Exec {
             self.pres.clear();
             return;
         }
-        let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, || {
+        let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, move || {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return;
             }
@@ -2689,7 +2751,7 @@ impl Exec {
             }
         }
         let (buf, off) = match &shared {
-            Some((chunk, at)) => (chunk.buf, *at),
+            Some((chunk, at, _)) => (chunk.buf, *at),
             None => (self.slots[self.cur].pre_buf?, off),
         };
         let c = ctx();
@@ -2710,9 +2772,9 @@ impl Exec {
         }
         unsafe { c.device.cmd_copy_buffer(pre, src, buf, &[vk::BufferCopy { src_offset: al - start, dst_offset: off, size: n }]) };
         match shared {
-            Some((chunk, _)) => {
+            Some((chunk, _, id)) => {
                 self.slots[self.cur].keep.push(chunk);
-                self.shared_pending.push((base, size));
+                self.shared_pending.push((base, size, id));
             }
             None => self.pre_used = off + n,
         }
@@ -3455,7 +3517,7 @@ impl Exec {
             let (cmd, fence, queries) = (self.slots[b.slot].cmd, self.slots[b.slot].fence, self.slots[b.slot].queries);
             let name = self.name.clone();
             let pre = b.pre;
-            let seq = push_batch(fence, queries, Vec::new(), b.checks, b.shaders, &self.name, || {
+            let seq = push_batch(fence, queries, Vec::new(), b.checks, b.shaders, &self.name, move || {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
                     return;
                 }
