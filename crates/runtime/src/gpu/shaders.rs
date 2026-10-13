@@ -172,6 +172,7 @@ fn program_checked(addr: u64) -> Result<(Arc<Vec<rdna::Inst>>, u64), String> {
     let last = insts.last().ok_or("empty program")?;
     let words = (last.pc / 4 + last.len as u32) as usize;
     let hash = hash_words(&code[..words.min(code.len())]);
+    note_per_lane(addr, &code[..words.min(code.len())], hash);
     let insts = Arc::new(insts);
     map.insert(addr, Program { words, hash, insts: insts.clone() });
     Ok((insts, hash))
@@ -674,10 +675,67 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         reg_vars: super::tune::reg_vars(),
         lod_stats: super::tune::lod_stats() == 3,
         early_tests: false,
+        per_lane: super::tune::per_lane() && per_lane_program(code_hash),
     };
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
     r
+}
+
+/// Compute programs translated per lane (`Spec::per_lane`), by FNV-1a of
+/// their words up to the first s_endpgm, each checked by reading its code:
+/// its cross-lane operations only scalarize per-lane work (FINDINGS.md
+/// 2026-10-13: their translations then take 128 registers instead of 168
+/// and run 35-40% faster).
+const PER_LANE_PROGRAMS: &[(u64, &str)] = &[
+    // Tiled lighting passes (~40k workgroups of one wave64): per-cluster
+    // light masks OR-reduced across the wave (DPP, v_permlanex16,
+    // v_readlane of lanes 31 and 63) and walked with s_ff1; light data read
+    // with scalar loads, per-lane tests inside.
+    (0xb65e_e39a_31c6_fa92, "tiled pass cs 0x10088ab600"),
+    (0xbf04_60d4_7979_f8d3, "tiled pass cs 0x10088b8200"),
+    // Not the froxel fog cs 0x100892b200 (FNV 0xcb83739fea041817; the same
+    // light-mask walks, two waterfall loops, LDS slots per lane): per lane
+    // it ran in half the time but drew a haze band along the right screen
+    // edge, where its froxel grid leaves partial workgroups (lanes outside
+    // the grid leave early, while the wave-wide reductions of lockstep mode
+    // keep them in with their contribution masked off).
+];
+
+/// Program hashes (`hash_words`) found in PER_LANE_PROGRAMS (read without a
+/// lock by every compute preparation).
+static PER_LANE_HASHES: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+fn per_lane_program(code_hash: u64) -> bool {
+    code_hash != 0 && PER_LANE_HASHES.iter().any(|h| h.load(std::sync::atomic::Ordering::Relaxed) == code_hash)
+}
+
+/// FNV-1a of a program's bytes up to and including its first s_endpgm.
+fn program_id(words: &[u32]) -> u64 {
+    let n = words.iter().position(|&w| w == 0xBF81_0000).map_or(words.len(), |i| i + 1);
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &w in &words[..n] {
+        for b in w.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Notes a decoded program found in PER_LANE_PROGRAMS (by its hash).
+fn note_per_lane(addr: u64, words: &[u32], hash: u64) {
+    let id = program_id(words);
+    let Some(&(_, what)) = PER_LANE_PROGRAMS.iter().find(|p| p.0 == id) else { return };
+    if per_lane_program(hash) {
+        return;
+    }
+    for slot in &PER_LANE_HASHES {
+        if slot.compare_exchange(0, hash, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).is_ok() {
+            crate::info!("shader {addr:#x}: translated per lane ({what})");
+            return;
+        }
+    }
 }
 
 /// User-data dword count of a graphics stage: RSRC2 USER_SGPR[5:1] and USER_SGPR_MSB[27].
@@ -745,6 +803,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         reg_vars: super::tune::reg_vars(),
         lod_stats: super::tune::lod_stats() == 3,
         early_tests: ctx(DB_SHADER_CONTROL) & (1 << 12) != 0,
+        per_lane: false,
     };
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
@@ -886,6 +945,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         reg_vars: super::tune::reg_vars(),
         lod_stats: super::tune::lod_stats() == 3,
         early_tests: false,
+        per_lane: false,
     };
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
@@ -1544,7 +1604,7 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     // translate::code_base_offset): copies of a program share one, and its
     // pipeline (the Vulkan pipeline cache finds it again in the next run).
     static BY_ADDRESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let by_address = *BY_ADDRESS.get_or_init(|| std::env::var_os("DS_WAVEMASK").is_some());
+    let by_address = *BY_ADDRESS.get_or_init(|| std::env::var_os("DS_WAVEMASK").is_some() || std::env::var_os("DS_LOCKSTEP_OFF").is_some());
     let base = spec.code_base;
     if !by_address {
         spec.code_base = 0;

@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 64] = [
+    static ALL: [Tunable; 65] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -91,6 +91,7 @@ pub mod tune {
         Tunable { name: "guest_cpus", env: "DS_GUEST_CPUS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy_passes", env: "DS_LAZY_PASSES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "push_partial", env: "DS_PUSH_PARTIAL", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "per_lane", env: "DS_PER_LANE", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -670,6 +671,14 @@ pub mod tune {
     #[inline]
     pub fn push_partial() -> bool {
         get(63) != 0
+    }
+
+    /// The listed compute programs are translated per lane
+    /// (`shaders::PER_LANE_PROGRAMS`, `Spec::per_lane`); switching translates
+    /// them anew.
+    #[inline]
+    pub fn per_lane() -> bool {
+        get(64) != 0
     }
 
     /// A switch's value by name; None if unknown.

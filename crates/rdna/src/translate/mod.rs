@@ -205,6 +205,15 @@ pub struct Spec {
     /// shader rewrites the G-buffer through image stores) darkened the whole
     /// screen rectangle of a box instead of the ground inside it.
     pub early_tests: bool,
+    /// Compute: translate per lane, each invocation a wave of one, even when
+    /// the program would run in lockstep or wave-mask mode: for programs
+    /// whose cross-lane operations only scalarize per-lane work (their
+    /// lane masks OR-reduced across the wave and walked with s_ff1, values
+    /// broadcast with v_readlane / v_readfirstlane in waterfall loops, LDS
+    /// slots addressed by lane): walking only this lane's part gives each
+    /// lane the same result. The runtime decides per program (its list of
+    /// verified programs).
+    pub per_lane: bool,
 }
 
 /// Entries of an image table bound as one array of sampled images
@@ -1947,8 +1956,23 @@ fn lockstep_mode(spec: &Spec, code: &[Inst]) -> (bool, bool) {
         && !uses_lds
         && std::env::var("DS_MASK_VALUES").ok().as_deref() != Some("0")
         && crate::wavemask::reads_mask_values(code, spec.wave64);
-    let lockstep = spec.stage == Stage::Compute && (uses_lds || mask_values) && (one_wave || !wave_scalars) && std::env::var("DS_LOCKSTEP").ok().as_deref() != Some("0");
+    let lockstep = spec.stage == Stage::Compute
+        && (uses_lds || mask_values)
+        && (one_wave || !wave_scalars)
+        && std::env::var("DS_LOCKSTEP").ok().as_deref() != Some("0")
+        && !spec.per_lane
+        && !lockstep_off(spec.code_base);
     (lockstep, one_wave)
+}
+
+/// Diagnosis: `DS_LOCKSTEP_OFF=<hex address>[,...]` translates those
+/// shaders without lockstep (and wave-mask) mode, each invocation a wave
+/// of one (translations are then keyed by address, as with DS_WAVEMASK).
+fn lockstep_off(addr: u64) -> bool {
+    match std::env::var("DS_LOCKSTEP_OFF") {
+        Err(_) => false,
+        Ok(v) => v.split(',').any(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).is_ok_and(|x| x == addr && x != 0)),
+    }
 }
 
 const PC_EXIT: u32 = 0xFFFF_FFFF;
@@ -2473,6 +2497,7 @@ mod tests {
             reg_vars: true,
             lod_stats: false,
             early_tests: false,
+            per_lane: false,
         }
     }
 
