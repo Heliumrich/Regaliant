@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 53] = [
+    static ALL: [Tunable; 54] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -80,6 +80,7 @@ pub mod tune {
         Tunable { name: "pre_big_max", env: "DS_PRE_BIG_MAX", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_big_mib", env: "DS_PRE_BIG_MIB", default: 1024, value: AtomicU64::new(UNSET) },
         Tunable { name: "home_reads", env: "DS_HOME_READS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "shadow_share", env: "DS_SHADOW_SHARE", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     #[inline]
@@ -523,6 +524,15 @@ pub mod tune {
     #[inline]
     pub fn home_reads() -> bool {
         get(52) != 0
+    }
+
+    /// A written-buffer shadow's working copy becomes a shared copy of its
+    /// window after its merge (`precache`), and the next shadow of the window
+    /// is copied in from it instead of from guest memory across PCIe; 0: from
+    /// guest memory (for A/B).
+    #[inline]
+    pub fn shadow_share() -> bool {
+        get(53) != 0
     }
 
     /// A switch's value by name; None if unknown.

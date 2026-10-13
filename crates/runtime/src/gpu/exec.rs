@@ -1084,6 +1084,13 @@ struct Shadow {
     /// The resource's own bytes within the range (copied back).
     bias: u64,
     size: u64,
+    /// When its copy in was recorded, as `precache::watch` dates it (None:
+    /// not followed; its working copy is not shared after the merge).
+    since: Option<u64>,
+    /// Guest memory in its window was written in place meanwhile (a CP write,
+    /// an aliased binding): its working copy is not what the merge leaves
+    /// there, so it is not shared (`tune shadow_share`).
+    tainted: bool,
 }
 
 /// Device-local shadow space per slot (working and pristine copies).
@@ -1158,6 +1165,12 @@ pub fn request_label_submit(a: u64) {
 /// Resident shadows: bindings that reused one, read-only bindings served
 /// from one, merges, and merges forced before an in-place use.
 static SHADOWS_REUSED: AtomicU64 = AtomicU64::new(0);
+/// Written-buffer shadows and the shared copies (`tune shadow_share`):
+/// [working copies shared after the merge, copies in from a shared copy, not
+/// shared: written in place meanwhile, CPU-written meanwhile, no entry].
+static SHADOWS_SHARED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Copies in from shared copies counted for DS_SHADOW_SHARE_CHECK sampling.
+static SHARE_CHECKED: AtomicU64 = AtomicU64::new(0);
 static RESIDENT_READS: AtomicU64 = AtomicU64::new(0);
 static MERGES: AtomicU64 = AtomicU64::new(0);
 static EARLY_MERGES: AtomicU64 = AtomicU64::new(0);
@@ -2587,6 +2600,9 @@ pub struct Exec {
     /// Shared copies this batch's prologue makes (usable by later batches
     /// once it is submitted).
     shared_pending: Vec<(u64, u64, u64)>,
+    /// Ids of the shared copies this batch made of its shadows after writing
+    /// them (`share_shadows`): its submission-time invalidation spares them.
+    shared_kept: Vec<u64>,
     /// A draw's texture ranges (`texture_ranges_into`), reused per draw.
     tex_scratch: Vec<((u64, u64), super::desc::Tsharp)>,
 }
@@ -2598,6 +2614,8 @@ struct Closed {
     slot: usize,
     pre: Option<vk::CommandBuffer>,
     shared: Vec<(u64, u64, u64)>,
+    /// `Exec::shared_kept` of the batch.
+    kept: Vec<u64>,
     writes: super::ranges::Ranges,
     checks: Vec<verify::Check>,
     shaders: Vec<u64>,
@@ -2682,6 +2700,7 @@ impl Exec {
                 },
                 shares_pre: true,
                 shared_pending: Vec::new(),
+                shared_kept: Vec::new(),
                 tex_scratch: Vec::new(),
             })
         }
@@ -2881,7 +2900,7 @@ impl Exec {
                 crate::error!("gpu[{}]: CP effects in a parallel run (dropped)", self.name);
             }
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders) });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), kept: std::mem::take(&mut self.shared_kept), writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders) });
             self.slots[i].seq = PENDING;
             self.pending_promises.clear();
             self.pending_log.clear();
@@ -2932,7 +2951,7 @@ impl Exec {
         INFLIGHT.note_ranges(seq, &writes);
         // Shared copies made by batches submitted before this one precede
         // its writes on the GPU (see `precache`).
-        super::precache::invalidate_ranges(&writes);
+        super::precache::invalidate_ranges_except(&writes, &std::mem::take(&mut self.shared_kept));
         self.inflight.insert_all(seq, &writes);
         self.last_seq = seq;
         if has_actions {
@@ -2964,6 +2983,7 @@ impl Exec {
         self.pending_log.clear();
         self.pending_promises.clear();
         self.shared_pending.clear();
+        self.shared_kept.clear();
         self.batch_shaders.clear();
         self.resident.clear();
         self.recording = false;
@@ -3928,6 +3948,7 @@ impl Exec {
         self.end_rendering();
         let cmd = self.cmd();
         let raw: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
+        self.taint_resident(a, bytes);
         global_barrier(cmd);
         unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
         global_barrier(cmd);
@@ -4013,6 +4034,7 @@ impl Exec {
         global_barrier(cmd);
         self.barrier_wanted = false;
         self.dispatched = false;
+        self.taint_resident(a, 8);
         self.note_write(a, 8);
         if GPU_TIMESTAMPS.fetch_add(1, Ordering::Relaxed) < 8 {
             self.ts_check.push(a);
@@ -4100,12 +4122,56 @@ impl Exec {
         if let Some(m) = merge {
             self.dyncache.cs_pipeline = m.pipeline;
         }
+        if merge.is_some() && super::tune::shadow_share() && super::precache::enabled() {
+            self.share_shadows(&flush);
+        }
         // Later work reads guest memory after the write-back.
         global_barrier(self.cmd());
         self.barrier_wanted = false;
         self.dispatched = false;
         MERGES.fetch_add(flush.len() as u64, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// After the merge of `flush` (recorded): the working copies of the
+    /// shadows nothing else wrote meanwhile become shared copies of their
+    /// windows (`precache`; `tune shadow_share`), spared by this batch's own
+    /// submission-time invalidation.
+    fn share_shadows(&mut self, flush: &[Shadow]) {
+        let c = ctx();
+        for sh in flush {
+            let Some(since) = sh.since else { continue };
+            if sh.tainted {
+                SHADOWS_SHARED[2].fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if !super::precache::unwritten_since(sh.guest, sh.range, since) {
+                SHADOWS_SHARED[3].fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let Some((chunk, at, id)) = super::precache::insert(sh.guest, sh.range, sh.range) else {
+                SHADOWS_SHARED[4].fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            // Reads the working copy, as the merge does (no hazard between them).
+            let r = vk::BufferCopy { src_offset: sh.shadow_off, dst_offset: at, size: sh.range };
+            unsafe { c.device.cmd_copy_buffer(self.cmd(), self.shadow(), chunk.buf, &[r]) };
+            self.slots[self.cur].keep.push(chunk);
+            self.shared_pending.push((sh.guest, sh.range, id));
+            self.shared_kept.push(id);
+            SHADOWS_SHARED[0].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A write into guest memory in place (not through a shadow) on this
+    /// executor: resident shadows overlapping it no longer hold what their
+    /// merge leaves there.
+    fn taint_resident(&mut self, a: u64, n: u64) {
+        for r in self.resident.iter_mut() {
+            if r.guest < a.saturating_add(n) && a < r.guest + r.range {
+                r.tainted = true;
+            }
+        }
     }
 
     /// A copy of guest [base, base+size) in video memory, taken now (when the
@@ -4281,7 +4347,7 @@ impl Exec {
             self.slots[b.slot].seq = seq;
             super::precache::submitted(&b.shared, seq);
             INFLIGHT.note_ranges(seq, &b.writes);
-            super::precache::invalidate_ranges(&b.writes);
+            super::precache::invalidate_ranges_except(&b.writes, &b.kept);
             self.inflight.insert_all(seq, &b.writes);
             self.last_seq = seq;
             last = Some(seq);
@@ -4473,7 +4539,7 @@ impl Exec {
                                             }
                                         }
                                         self.shadow_used = s_off + 2 * span;
-                                        bound.shadows.push(Shadow { host: buffer, guest: base - bias, reused: false, host_off: off, range, shadow_off: s_off, pristine_off: s_off + span, bias, size });
+                                        bound.shadows.push(Shadow { host: buffer, guest: base - bias, reused: false, host_off: off, range, shadow_off: s_off, pristine_off: s_off + span, bias, size, since: None, tainted: false });
                                         placement = Placement::Shadow;
                                         info = vk::DescriptorBufferInfo { buffer: self.shadow(), offset: s_off, range };
                                         SHADOWED.fetch_add(1, Ordering::Relaxed);
@@ -4897,14 +4963,58 @@ impl Exec {
             // Shadows get the guest data first (earlier writes are ordered by
             // the title's synchronization, or the barrier after every
             // dispatch without lazy barriers).
+            // A window an earlier batch's merge left in the shared copies
+            // (`tune shadow_share`): copied in from video memory. Its CPU
+            // writes are followed from now on (its marks so far: the copy
+            // runs after them).
+            let share = shadow_merge() && super::tune::shadow_share() && super::precache::enabled();
+            let mut kept: Vec<Option<(vk::Buffer, u64)>> = Vec::with_capacity(fresh.len());
+            for sh in &fresh {
+                if !share || !super::precache::worth(sh.range) {
+                    kept.push(None);
+                    continue;
+                }
+                let since = super::precache::watch(sh.guest, sh.range);
+                if let Some(s) = bound.shadows.iter_mut().find(|s| s.shadow_off == sh.shadow_off) {
+                    s.since = Some(since);
+                }
+                match super::precache::lookup(sh.guest, sh.range) {
+                    Some((chunk, at)) => {
+                        kept.push(Some((chunk.buf, at)));
+                        self.slots[self.cur].keep.push(chunk);
+                        SHADOWS_SHARED[1].fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => kept.push(None),
+                }
+            }
             unsafe {
                 if shadow_merge() {
                     // One read of guest memory (the pristine copy), then the
                     // working copy from it: two reads could see different CPU
                     // writes, and the merge would store the older value.
-                    for sh in &fresh {
-                        let r = vk::BufferCopy { src_offset: sh.host_off, dst_offset: sh.pristine_off, size: sh.range };
-                        c.device.cmd_copy_buffer(self.cmd(), sh.host, self.shadow(), &[r]);
+                    for (sh, k) in fresh.iter().zip(&kept) {
+                        match *k {
+                            Some((buf, at)) => {
+                                let r = vk::BufferCopy { src_offset: at, dst_offset: sh.pristine_off, size: sh.range };
+                                c.device.cmd_copy_buffer(self.cmd(), buf, self.shadow(), &[r]);
+                                // DS_SHADOW_SHARE_CHECK: guest memory and the
+                                // shared copy, both as of this point.
+                                let every = verify::share_check_every();
+                                if every > 0 && SHARE_CHECKED.fetch_add(1, Ordering::Relaxed) % every == 0 {
+                                    if let Some((check, rb)) = verify::shared_check((sh.guest, sh.range), sh.range) {
+                                        c.device.cmd_copy_buffer(self.cmd(), sh.host, rb, &[vk::BufferCopy { src_offset: sh.host_off, dst_offset: 0, size: sh.range }]);
+                                        c.device.cmd_copy_buffer(self.cmd(), buf, rb, &[vk::BufferCopy { src_offset: at, dst_offset: sh.range, size: sh.range }]);
+                                        let hb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+                                        c.device.cmd_pipeline_barrier(self.cmd(), vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[hb], &[], &[]);
+                                        self.checks.push(check);
+                                    }
+                                }
+                            }
+                            None => {
+                                let r = vk::BufferCopy { src_offset: sh.host_off, dst_offset: sh.pristine_off, size: sh.range };
+                                c.device.cmd_copy_buffer(self.cmd(), sh.host, self.shadow(), &[r]);
+                            }
+                        }
                     }
                     let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
                     c.device.cmd_pipeline_barrier(self.cmd(), vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
@@ -4964,6 +5074,15 @@ impl Exec {
         for sh in &bound.shadows {
             if !self.resident.iter().any(|r| r.shadow_off == sh.shadow_off) {
                 self.resident.push(Shadow { reused: false, ..*sh });
+            }
+        }
+        // Writes of this dispatch in place (not through one of its shadows)
+        // into a resident window.
+        if !self.resident.is_empty() {
+            for &(b, n) in &writes_here {
+                if !bound.shadows.iter().any(|s| s.guest <= b && b + n <= s.guest + s.range) {
+                    self.taint_resident(b, n);
+                }
             }
         }
         let aliased = self.resident.iter().enumerate().any(|(i, a)| self.resident[..i].iter().any(|b| a.guest < b.guest + b.range && b.guest < a.guest + a.range));
@@ -5103,6 +5222,14 @@ pub fn status() -> String {
         + &super::lodstats::status()
         + &super::ahead::status()
         + &super::par::status()
+        + &format!(
+            "    shadows shared after their merge: {}, copies in from them {}; not shared: {} written in place meanwhile, {} CPU-written, {} no entry\n",
+            SHADOWS_SHARED[0].load(Ordering::Relaxed),
+            SHADOWS_SHARED[1].load(Ordering::Relaxed),
+            SHADOWS_SHARED[2].load(Ordering::Relaxed),
+            SHADOWS_SHARED[3].load(Ordering::Relaxed),
+            SHADOWS_SHARED[4].load(Ordering::Relaxed)
+        )
         + &super::precache::status()
         + &super::pcache::status()
         + &super::images::scrub_status()

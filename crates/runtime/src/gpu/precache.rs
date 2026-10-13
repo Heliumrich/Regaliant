@@ -25,6 +25,19 @@
 //! chunks are in use, the entries of the chunk filled longest ago are
 //! dropped, and the chunk is reused once no batch binds it any more.
 //!
+//! Written-buffer shadows (`Exec`: a dispatch's written binding in video
+//! memory, merged back into guest memory when its batch ends) leave their
+//! working copy here after the merge (`tune shadow_share`): the next batch
+//! that shadows the same window copies it in from video memory instead of
+//! across PCIe (~14 GB/s; ~4 ms of the courtyard frame's GPU time, mostly
+//! 1-4 MB buffers GPU work rewrites every frame). Such a copy holds what the
+//! merge left in guest memory only if nothing else wrote the window meanwhile:
+//! CPU writes since its copy-in are dated by the write marks taken for the
+//! window (`watch`, `unwritten_since`; every take dates the watched windows,
+//! whichever entry it was for), CP writes into it in the same batch taint
+//! the shadow (`Exec`), and the batch's own submission-time invalidation
+//! spares the copies it made after its writes (`invalidate_ranges_except`).
+//!
 //! Copies over a chunk (read-only bindings of up to `tune pre_big_max`
 //! bytes; off by default, no measured gain) get a video-memory slot of their
 //! own within `tune pre_big_mib`. A big range that CPU or GPU writes changed
@@ -120,7 +133,24 @@ struct Cache {
     big_changed: Map<(u64, u64), u64>,
     /// A big slot could not be allocated (warned once).
     big_failed: bool,
+    /// Takes of write marks that reported pages, counted (`Watched`).
+    marks: u64,
+    /// Shadow windows whose CPU writes are followed (`watch`), oldest first.
+    watched: Vec<Watched>,
+    /// Entry ids `drop_range` leaves (`invalidate_ranges_except`).
+    spare: Vec<u64>,
 }
+
+/// A written-buffer shadow's window [lo, hi): the count of mark takes
+/// (`Cache::marks`) when one last reported a page in it.
+struct Watched {
+    lo: u64,
+    hi: u64,
+    written: u64,
+}
+
+/// Windows followed at most (the oldest go: unknown then, not kept).
+const WATCHED_MAX: usize = 512;
 
 static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
 
@@ -258,7 +288,7 @@ impl Cache {
         let mut hit: Vec<(u64, u64)> = Vec::new();
         for (&b, sizes) in self.by_base.range(base.saturating_sub(self.max_size)..end) {
             for &s in sizes {
-                if b < end && base < b + s {
+                if b < end && base < b + s && (self.spare.is_empty() || self.entries.get(&(b, s)).is_none_or(|e| !self.spare.contains(&e.id))) {
                     hit.push((b, s));
                 }
             }
@@ -308,6 +338,60 @@ impl Cache {
         } else {
             LO.store(self.lo, Ordering::Release);
             HI.store(self.hi, Ordering::Release);
+        }
+    }
+
+    /// `mem::take_written` for the cache: the pages reported also date the
+    /// watched windows they fall in (a failed query dates those overlapping
+    /// the range).
+    fn take_marks(&mut self, base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
+        let first = out.len();
+        let r = crate::mem::take_written(base, size, out);
+        if self.watched.is_empty() {
+            return r;
+        }
+        match r {
+            Some(()) if out.len() > first => {
+                self.marks += 1;
+                let g = self.marks;
+                for &p in &out[first..] {
+                    for w in self.watched.iter_mut() {
+                        if w.lo <= p && p < w.hi {
+                            w.written = g;
+                        }
+                    }
+                }
+            }
+            Some(()) => {}
+            None => {
+                self.marks += 1;
+                let (g, end) = (self.marks, base.saturating_add(size));
+                for w in self.watched.iter_mut() {
+                    if w.lo < end && base < w.hi {
+                        w.written = g;
+                    }
+                }
+            }
+        }
+        r
+    }
+
+    /// Takes the range's write marks: entries on written pages go (as in
+    /// `lookup`), watched windows are dated.
+    fn take_and_drop(&mut self, base: u64, size: u64) {
+        let mut pages = Vec::new();
+        match self.take_marks(base, size, &mut pages) {
+            None => {
+                STATS[7].fetch_add(1, Ordering::Relaxed);
+                self.drop_range(base, base.saturating_add(size), false);
+                self.bounds_changed();
+            }
+            Some(()) if !pages.is_empty() => {
+                let n = self.drop_pages(&pages);
+                STATS[3].fetch_add(n, Ordering::Relaxed);
+                self.bounds_changed();
+            }
+            Some(()) => {}
         }
     }
 
@@ -470,7 +554,7 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64)> {
     if e.checked != epoch {
         STATS[2].fetch_add(1, Ordering::Relaxed);
         let mut pages = Vec::new();
-        match crate::mem::take_written(base, size, &mut pages) {
+        match c.take_marks(base, size, &mut pages) {
             None => {
                 STATS[7].fetch_add(1, Ordering::Relaxed);
                 c.remove((base, size));
@@ -516,7 +600,7 @@ pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     // The range's write marks so far: the copy sees those writes (it runs
     // later), other entries on those pages are stale.
     let mut pages = Vec::new();
-    if crate::mem::take_written(base, size, &mut pages).is_none() {
+    if c.take_marks(base, size, &mut pages).is_none() {
         STATS[7].fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -593,9 +677,54 @@ fn drop_overlapping(base: u64, len: u64, gpu: bool) {
 
 /// The ranges a batch writes, at its submission (see the module notes).
 pub fn invalidate_ranges(writes: &super::ranges::Ranges) {
-    for (a, n) in writes.iter() {
-        invalidate_gpu(a, n);
+    invalidate_ranges_except(writes, &[]);
+}
+
+/// `invalidate_ranges`, sparing the entries `keep` (ids: the copies of
+/// written-buffer shadows the batch made after its writes).
+pub fn invalidate_ranges_except(writes: &super::ranges::Ranges, keep: &[u64]) {
+    if keep.is_empty() {
+        for (a, n) in writes.iter() {
+            invalidate_gpu(a, n);
+        }
+        return;
     }
+    let mut g = CACHE.lock();
+    let Some(c) = g.as_mut() else { return };
+    c.spare = keep.to_vec();
+    for (a, n) in writes.iter() {
+        c.drop_range(a, a.saturating_add(n), true);
+    }
+    c.spare.clear();
+    c.bounds_changed();
+}
+
+/// Starts following CPU writes of a shadow's window [base, base+size) whose
+/// copy in is recorded now: its marks so far are taken (the copy runs after
+/// those writes) and the moment returned (`unwritten_since`).
+pub fn watch(base: u64, size: u64) -> u64 {
+    let mut g = CACHE.lock();
+    let c = g.get_or_insert_with(Cache::default);
+    c.take_and_drop(base, size);
+    let (lo, hi) = (base & !4095, base.saturating_add(size).next_multiple_of(4096));
+    if !c.watched.iter().any(|w| w.lo == lo && w.hi == hi) {
+        if c.watched.len() >= WATCHED_MAX {
+            c.watched.remove(0);
+        }
+        c.watched.push(Watched { lo, hi, written: 0 });
+    }
+    c.marks
+}
+
+/// Whether the CPU wrote no page of the window [base, base+size) since the
+/// moment `since` (`watch`); false when unknown (the window's watch was
+/// dropped).
+pub fn unwritten_since(base: u64, size: u64, since: u64) -> bool {
+    let mut g = CACHE.lock();
+    let Some(c) = g.as_mut() else { return false };
+    c.take_and_drop(base, size);
+    let (lo, hi) = (base & !4095, base.saturating_add(size).next_multiple_of(4096));
+    c.watched.iter().find(|w| w.lo == lo && w.hi == hi).is_some_and(|w| w.written <= since)
 }
 
 /// A synchronization epoch ends (a title submission starts, a wait the CPU

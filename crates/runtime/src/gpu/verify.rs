@@ -6,6 +6,11 @@
 //! - copy: `dst[i] = src[i % n]` for i < count, src V# s[0:3], dst V# s[4:7],
 //!   {count, n} read from the constant buffer V# s[8:11].
 //!
+//! Also (`DS_SHADOW_SHARE_CHECK=<n>`): every n-th copy in of a written-buffer
+//! shadow from a shared copy (`tune shadow_share`) is compared with guest
+//! memory at that point of the GPU's work (both copied to a readback buffer
+//! there; any difference is a stale shared copy, or a CPU write racing it).
+//!
 //! A copy's expected values are the source as the command processor found
 //! it (`snapshot_source`), when no GPU work or deferred CP write still wrote
 //! it: read at completion, sources the title updates every frame (animation
@@ -32,6 +37,43 @@ pub fn enabled() -> bool {
 enum Kind {
     Fill,
     Copy,
+    Shared,
+}
+
+/// A readback buffer holding guest memory and the shared copy of a window
+/// (`Kind::Shared`), each `len` bytes; freed with the check.
+pub struct Staging {
+    buf: ash::vk::Buffer,
+    mem: ash::vk::DeviceMemory,
+    ptr: usize,
+    len: u64,
+    window: (u64, u64),
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let c = super::vk::ctx();
+        unsafe {
+            c.device.destroy_buffer(self.buf, None);
+            c.device.free_memory(self.mem, None);
+        }
+    }
+}
+
+/// `DS_SHADOW_SHARE_CHECK=<n>`: check every n-th copy in from a shared copy
+/// (0: none).
+pub fn share_check_every() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("DS_SHADOW_SHARE_CHECK").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// A check of a shared copy of `window` (`len` bytes): the caller records
+/// copies of guest memory to `buf` [0, len) and of the shared copy to [len,
+/// 2 len), then a barrier for the host's reads. None: no readback memory.
+pub fn shared_check(window: (u64, u64), len: u64) -> Option<(Check, ash::vk::Buffer)> {
+    let (buf, mem, ptr) = super::vk::ctx().host_buffer(2 * len, ash::vk::BufferUsageFlags::TRANSFER_DST).ok()?;
+    let staging = Staging { buf, mem, ptr: ptr as usize, len, window };
+    Some((Check { kind: Kind::Shared, addr: window.0, threads: 0, user: Vec::new(), expected: None, writes_mark: 0, overwritten: false, staging: Some(staging) }, buf))
 }
 
 pub struct Check {
@@ -47,6 +89,8 @@ pub struct Check {
     pub writes_mark: usize,
     /// The destination was written again later in the batch.
     pub overwritten: bool,
+    /// `Kind::Shared`: the readback buffer.
+    staging: Option<Staging>,
 }
 
 const FILL: &[&str] = &["v_lshl_add_u32", "v_mov_b32", "v_mov_b32", "v_mov_b32", "v_mov_b32", "buffer_store_format_xyzw", "s_endpgm"];
@@ -194,7 +238,7 @@ pub fn check_for(p: &Prepared, groups: [u32; 3], local: [u32; 3]) -> Option<Chec
         return None;
     };
     let threads = groups.iter().map(|&g| g as u64).product::<u64>() * local.iter().map(|&l| l.max(1) as u64).product::<u64>();
-    Some(Check { kind, addr: p.addr, threads, user: p.user.clone(), expected: None, writes_mark: 0, overwritten: false })
+    Some(Check { kind, addr: p.addr, threads, user: p.user.clone(), expected: None, writes_mark: 0, overwritten: false, staging: None })
 }
 
 /// The guest range a check compares (the kernel's destination).
@@ -202,6 +246,8 @@ pub fn dest_range(c: &Check) -> (u64, u64) {
     let v = match c.kind {
         Kind::Fill => Vsharp::decode(&c.user[0..4]),
         Kind::Copy => Vsharp::decode(&c.user[4..8]),
+        // Compared where the GPU copied both: later writes do not matter.
+        Kind::Shared => return (0, 0),
     };
     (v.base, v.num_records as u64 * v.stride.max(1) as u64)
 }
@@ -210,7 +256,7 @@ pub fn dest_range(c: &Check) -> (u64, u64) {
 /// constant buffer).
 pub fn source_ranges(c: &Check) -> Vec<(u64, u64)> {
     match c.kind {
-        Kind::Fill => Vec::new(),
+        Kind::Fill | Kind::Shared => Vec::new(),
         Kind::Copy => {
             let src = Vsharp::decode(&c.user[0..4]);
             let cb = Vsharp::decode(&c.user[8..12]);
@@ -301,8 +347,29 @@ pub fn run(name: &str, c: &Check) {
     let r = match c.kind {
         Kind::Fill => fill(c),
         Kind::Copy => copy(c),
+        Kind::Shared => shared(c),
     };
     outcome(name, c, r);
+}
+
+fn shared(c: &Check) -> Result<String, String> {
+    let s = c.staging.as_ref().ok_or("unverifiable: no readback buffer")?;
+    let n = (s.len / 4) as usize;
+    let (guest, kept) = unsafe { (std::slice::from_raw_parts(s.ptr as *const u32, n), std::slice::from_raw_parts((s.ptr + s.len as usize) as *const u32, n)) };
+    let diff: Vec<usize> = (0..n).filter(|&i| guest[i] != kept[i]).collect();
+    if diff.is_empty() {
+        return Ok(format!("shared copy of {:#x}+{:#x} equals guest memory", s.window.0, s.window.1));
+    }
+    let i = diff[0];
+    Err(format!(
+        "shared copy of {:#x}+{:#x} differs from guest memory in {} of {n} dwords (first at +{:#x}: guest {:#x}, copy {:#x})",
+        s.window.0,
+        s.window.1,
+        diff.len(),
+        4 * i,
+        guest[i],
+        kept[i]
+    ))
 }
 
 fn fill(c: &Check) -> Result<String, String> {
