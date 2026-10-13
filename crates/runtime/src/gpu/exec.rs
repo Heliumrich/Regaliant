@@ -1169,6 +1169,9 @@ static SHADOWS_REUSED: AtomicU64 = AtomicU64::new(0);
 /// [working copies shared after the merge, copies in from a shared copy, not
 /// shared: written in place meanwhile, CPU-written meanwhile, no entry].
 static SHADOWS_SHARED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// End-of-pipe writes without a full barrier (`tune eop_light`): [labels,
+/// timestamps, waits that ordered the work after them].
+static EOP_LIGHT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Copies in from shared copies counted for DS_SHADOW_SHARE_CHECK sampling.
 static SHARE_CHECKED: AtomicU64 = AtomicU64::new(0);
 static RESIDENT_READS: AtomicU64 = AtomicU64::new(0);
@@ -2544,6 +2547,13 @@ pub struct Exec {
     submit_after: u64,
     /// CP timestamp writes the GPU performs in the recording batch.
     ts_used: u32,
+    /// End-of-pipe timestamps of the batch whose readback and store wait for
+    /// its end (`tune eop_light`): (descriptor set, push constants).
+    ts_deferred: Vec<(vk::DescriptorSet, Vec<u8>)>,
+    /// An end-of-pipe label write in the batch that later work is not
+    /// ordered after (`tune eop_light`): a wait passing on it orders it
+    /// (`order_after_open_writes`).
+    eop_unordered: bool,
     /// Of them, those to compare with the clock once the batch completed.
     ts_check: Vec<u64>,
     /// The recording batch holds CP writes performed by the GPU
@@ -2688,6 +2698,8 @@ impl Exec {
                 last_action_seq: 0,
                 submit_after: 0,
                 ts_used: 0,
+                ts_deferred: Vec::new(),
+                eop_unordered: false,
                 ts_check: Vec::new(),
                 gpu_writes_open: false,
                 last_gpu_write_seq: 0,
@@ -2838,6 +2850,8 @@ impl Exec {
         self.begun_mark = super::timeline::mark();
         self.pool_use = [0; 5];
         self.ts_used = 0;
+        self.ts_deferred.clear();
+        self.eop_unordered = false;
         self.shadow_used = 0;
         self.resident.clear();
     }
@@ -2882,6 +2896,7 @@ impl Exec {
             super::timeline::end(&self.name, tl, || format!("wait: deferred CP writes (#{})", self.submit_after));
         }
         self.end_rendering();
+        self.resolve_timestamps();
         let c = ctx();
         let i = self.cur;
         let (cmd, fence) = (self.slots[i].cmd, self.slots[i].fence);
@@ -4000,7 +4015,7 @@ impl Exec {
     /// title issues ~170 such label and data writes per frame on the graphics
     /// queue). `label`: a value other queues may wait for (promised when the
     /// batch is submitted). False: not possible here.
-    pub fn gpu_cp_write(&mut self, a: u64, data: &[u32], label: Option<(u64, u8)>) -> bool {
+    pub fn gpu_cp_write(&mut self, a: u64, data: &[u32], label: Option<(u64, u8)>, end_of_pipe: bool) -> bool {
         let bytes = 4 * data.len() as u64;
         if bytes == 0 || bytes > 65536 || a % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(a, bytes) {
             return false;
@@ -4022,11 +4037,25 @@ impl Exec {
         let cmd = self.cmd();
         let raw: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
         self.taint_resident(a, bytes);
-        global_barrier(cmd);
-        unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
-        global_barrier(cmd);
-        self.barrier_wanted = false;
-        self.dispatched = false;
+        if end_of_pipe && super::tune::eop_light() {
+            // An end-of-pipe write (RELEASE_MEM): after the work before it,
+            // which it does not hold later work back for (as on the console);
+            // later transfers wait for it. A wait on it in this batch orders
+            // the work after it (`order_after_open_writes`).
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            unsafe {
+                ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+                ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw);
+            }
+            self.eop_unordered = true;
+            EOP_LIGHT[0].fetch_add(1, Ordering::Relaxed);
+        } else {
+            global_barrier(cmd);
+            unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
+            global_barrier(cmd);
+            self.barrier_wanted = false;
+            self.dispatched = false;
+        }
         self.note_write(a, bytes);
         if let Some((v, n)) = label {
             self.pending_promises.push((a, v, n));
@@ -4091,6 +4120,25 @@ impl Exec {
             .collect();
         let pc: Vec<u8> = [q, ((off - base) / 4) as u32, k as u32, (k >> 32) as u32].iter().flat_map(|x| x.to_le_bytes()).collect();
         let cmd = self.cmd();
+        if super::tune::eop_light() {
+            // Taken when the work before it completed, without holding later
+            // work back; read and stored to guest memory at the batch's end
+            // (`resolve_timestamps`; the CPU reads it after completion, and a
+            // command-processor read of it waits for the batch).
+            unsafe {
+                c.device.cmd_reset_query_pool(cmd, pool, q, 1);
+                c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, q);
+                c.device.update_descriptor_sets(&writes, &[]);
+            }
+            self.ts_deferred.push((set, pc));
+            EOP_LIGHT[1].fetch_add(1, Ordering::Relaxed);
+            self.taint_resident(a, 8);
+            self.note_write(a, 8);
+            if GPU_TIMESTAMPS.fetch_add(1, Ordering::Relaxed) < 8 {
+                self.ts_check.push(a);
+            }
+            return true;
+        }
         unsafe {
             c.device.cmd_reset_query_pool(cmd, pool, q, 1);
             c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, q);
@@ -4113,6 +4161,44 @@ impl Exec {
             self.ts_check.push(a);
         }
         true
+    }
+
+    /// The batch's deferred end-of-pipe timestamps (`tune eop_light`): their
+    /// queries read at once and each stored to guest memory, at the batch's
+    /// end (each query holds when the work before it completed).
+    fn resolve_timestamps(&mut self) {
+        if self.ts_deferred.is_empty() {
+            return;
+        }
+        let deferred = std::mem::take(&mut self.ts_deferred);
+        let (Some((pool, tbuf)), Ok(tp)) = (self.slots[self.cur].ts, ts_pipe()) else { return };
+        let c = ctx();
+        let cmd = self.cmd();
+        unsafe {
+            c.device.cmd_copy_query_pool_results(cmd, pool, 0, self.ts_used, tbuf, 0, 8, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT);
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, tp.pipeline);
+            for (set, pc) in &deferred {
+                c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, tp.layout, 0, &[*set], &[]);
+                c.device.cmd_push_constants(cmd, tp.layout, vk::ShaderStageFlags::COMPUTE, 0, pc);
+                c.device.cmd_dispatch(cmd, 1, 1, 1);
+            }
+        }
+        self.dyncache.cs_pipeline = tp.pipeline;
+    }
+
+    /// A wait passed on a value this batch writes at its end of pipe
+    /// (`open_promise`): the work recorded from now on follows that write
+    /// (and everything before it), as the wait makes it on the console.
+    pub fn order_after_open_writes(&mut self) {
+        if std::mem::take(&mut self.eop_unordered) {
+            self.end_rendering();
+            global_barrier(self.cmd());
+            self.barrier_wanted = false;
+            self.dispatched = false;
+            EOP_LIGHT[2].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// The value the recording batch writes last to label `a` on the GPU
@@ -5297,6 +5383,12 @@ pub fn status() -> String {
         + &super::lodstats::status()
         + &super::ahead::status()
         + &super::par::status()
+        + &format!(
+            "    end-of-pipe writes without a full barrier: {} labels, {} timestamps; {} waits ordered the work after them\n",
+            EOP_LIGHT[0].load(Ordering::Relaxed),
+            EOP_LIGHT[1].load(Ordering::Relaxed),
+            EOP_LIGHT[2].load(Ordering::Relaxed)
+        )
         + &format!(
             "    shadows shared after their merge: {}, copies in from them {}; not shared: {} written in place meanwhile, {} CPU-written, {} no entry\n",
             SHADOWS_SHARED[0].load(Ordering::Relaxed),

@@ -1451,7 +1451,7 @@ impl Cp {
         // Nothing outstanding to follow: the CPU performs the write now.
         let refused = if !(e.busy() && (needs_prior || e.deferred_pending())) {
             Some(0)
-        } else if !e.gpu_cp_write(a, data, label) {
+        } else if !e.gpu_cp_write(a, data, label, end_of_pipe) {
             Some(2)
         } else {
             None
@@ -2638,6 +2638,11 @@ impl Cp {
             let v = if wide { v } else { v & 0xFFFF_FFFF };
             if !(wide && bytes < 8) && compare(func, v & mask, reference & mask) {
                 OPEN_PROMISED.fetch_add(1, Ordering::Relaxed);
+                // Later work follows that write (end-of-pipe writes do not
+                // order it by themselves: `tune eop_light`).
+                if let Some(e) = self.exec.as_mut() {
+                    e.order_after_open_writes();
+                }
                 label_event(&self.name, b'P', a, v0, reference, at);
                 return Flow::Next;
             }

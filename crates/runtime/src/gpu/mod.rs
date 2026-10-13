@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 55] = [
+    static ALL: [Tunable; 56] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -82,6 +82,7 @@ pub mod tune {
         Tunable { name: "home_reads", env: "DS_HOME_READS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_share", env: "DS_SHADOW_SHARE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "clean_pages", env: "DS_CLEAN_PAGES", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "eop_light", env: "DS_EOP_LIGHT", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     #[inline]
@@ -543,6 +544,17 @@ pub mod tune {
     #[inline]
     pub fn clean_pages() -> bool {
         get(54) != 0
+    }
+
+    /// End-of-pipe writes performed by the GPU (RELEASE_MEM labels and
+    /// timestamps) follow the work before them without holding later work
+    /// back: labels behind a barrier into transfers only, timestamps as
+    /// queries stored at the batch's end; a wait passing on such a label in
+    /// the same batch orders the work after it. 0: full barriers around each
+    /// (for A/B).
+    #[inline]
+    pub fn eop_light() -> bool {
+        get(55) != 0
     }
 
     /// A switch's value by name; None if unknown.
