@@ -28,8 +28,12 @@ thread_local! {
     /// confirmed and the address's registration number (validating them by
     /// hashing their code took a few microseconds per command), plans, and
     /// translations.
-    static LOCAL_PROGRAMS: std::cell::RefCell<super::fx::Map<u64, (u64, u64, Arc<Vec<rdna::Inst>>, u64)>> = std::cell::RefCell::new(super::fx::Map::default());
-    static LOCAL_PLANS: std::cell::RefCell<super::fx::Map<u64, Arc<Plan>>> = std::cell::RefCell::new(super::fx::Map::default());
+    /// Per-thread handles (`Rc`) on the shared programs and plans: a
+    /// preparation clones the handle, not the shared reference count the
+    /// recording threads all touch (only a new preparation keeps a shared
+    /// clone).
+    static LOCAL_PROGRAMS: std::cell::RefCell<super::fx::Map<u64, (u64, u64, std::rc::Rc<Arc<Vec<rdna::Inst>>>, u64)>> = std::cell::RefCell::new(super::fx::Map::default());
+    static LOCAL_PLANS: std::cell::RefCell<super::fx::Map<u64, std::rc::Rc<Arc<Plan>>>> = std::cell::RefCell::new(super::fx::Map::default());
     /// The reader's sizes in the last full preparation of each plan (ranges
     /// read, words read, pointers loaded): its vectors start at that
     /// capacity instead of doubling from empty (their growth was ~4% of the
@@ -86,6 +90,11 @@ fn code_slice(addr: u64) -> Option<&'static [u32]> {
 
 /// Decodes (and caches) the program at `addr`; returns it and its hash.
 pub(crate) fn program(addr: u64) -> Result<(Arc<Vec<rdna::Inst>>, u64), String> {
+    program_local(addr).map(|(p, h)| (Arc::clone(&p), h))
+}
+
+/// `program` as this thread's handle on it.
+fn program_local(addr: u64) -> Result<(std::rc::Rc<Arc<Vec<rdna::Inst>>>, u64), String> {
     use crate::hle::libs::agc;
     // A program from a shader object stays as decoded until a shader object
     // is created again at its address (or anywhere: then it is checked).
@@ -106,6 +115,7 @@ pub(crate) fn program(addr: u64) -> Result<(Arc<Vec<rdna::Inst>>, u64), String> 
     }
     let reg = agc::shader_registration(addr);
     let (insts, hash) = program_checked(addr)?;
+    let insts = std::rc::Rc::new(insts);
     if let Some(r) = reg {
         LOCAL_PROGRAMS.with(|c| c.borrow_mut().insert(addr, (regs, r, insts.clone(), hash)));
     }
@@ -314,7 +324,13 @@ pub enum Resolved {
 /// What preparing a stage found in guest memory, shared by the
 /// preparation's copies (one allocation; a repeated preparation from the
 /// cache, `prep_cache`, costs no deep copy). `Prepared` derefs to it.
+/// The program and its translation are held here too: the recording
+/// threads share their reference counts, so a copy of a preparation
+/// touches only this block's (contended clones cost up to ~100 ns each on
+/// the development machine's Ryzen 9 5900X).
 pub struct Found {
+    pub insts: Arc<Vec<rdna::Inst>>,
+    pub tr: Arc<Translated>,
     pub resources: Vec<Resolved>,
     /// Guest address of each descriptor's first dword when read from memory.
     pub res_addrs: Vec<Option<u64>>,
@@ -337,8 +353,6 @@ pub struct Found {
 pub struct Prepared {
     pub stage: Stage,
     pub addr: u64,
-    pub insts: Arc<Vec<rdna::Inst>>,
-    pub tr: Arc<Translated>,
     pub found: Arc<Found>,
     /// SGPR data buffer contents (resource info blocks filled at binding).
     pub sgpr_data: Vec<u32>,
@@ -569,7 +583,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
     let user_sgprs = ((rsrc2 >> 1) & 0x1F).min(16) as u16;
     let user: Vec<u32> = (0..16).map(|i| sh(CS_USER_DATA + i)).collect();
     let local = [sh(CS_NUM_THREAD) & 0xFFFF, sh(CS_NUM_THREAD + 1) & 0xFFFF, sh(CS_NUM_THREAD + 2) & 0xFFFF];
-    let (insts, code_hash) = program(addr)?;
+    let (insts, code_hash) = program_local(addr)?;
     let mut spec = Spec {
         stage: Stage::Compute,
         user_sgprs,
@@ -620,7 +634,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
     let rsrc2 = sh(PS_RSRC2);
     let user_sgprs = user_count(rsrc2);
     let user: Vec<u32> = (0..32).map(|i| sh(PS_USER_DATA + i)).collect();
-    let (insts, code_hash) = program(addr)?;
+    let (insts, code_hash) = program_local(addr)?;
     let in_control = ctx(SPI_PS_IN_CONTROL);
     let mut ps_inputs = Vec::new();
     for n in 0..(in_control & 0x3F).min(32) {
@@ -759,7 +773,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
     let rsrc2 = sh(GS_RSRC2);
     let user_sgprs = user_count(rsrc2);
     let user: Vec<u32> = (0..32).map(|i| sh(GS_USER_DATA + i)).collect();
-    let (insts, code_hash) = program(addr)?;
+    let (insts, code_hash) = program_local(addr)?;
     let mut spec = Spec {
         stage: Stage::Vertex,
         user_sgprs,
@@ -1231,7 +1245,7 @@ fn stage_slot(s: Stage) -> usize {
     }
 }
 
-fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32], spec: &mut Spec) -> Result<Prepared, String> {
+fn prepare(addr: u64, insts: std::rc::Rc<Arc<Vec<rdna::Inst>>>, code_hash: u64, user: &[u32], spec: &mut Spec) -> Result<Prepared, String> {
     // Diagnostics (DS_PROFILE_GPU with DS_PROFILE_REPEATS=1: hashing every
     // word read and a global set per preparation inflate the prepare times
     // the profile reports): the inputs that would key a cached preparation.
@@ -1252,7 +1266,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
     let gpu_loads = super::tune::gpu_loads();
     let plan_key = code_hash ^ (spec.user_sgprs as u64) << 48 ^ (spec.user_base as u64) << 56 ^ (gpu_loads as u64) << 40;
     let cached = LOCAL_PLANS.with(|c| c.borrow().get(&plan_key).cloned()).or_else(|| {
-        let p = PLANS.lock().as_ref().and_then(|m| m.get(&plan_key).cloned())?;
+        let p = std::rc::Rc::new(PLANS.lock().as_ref().and_then(|m| m.get(&plan_key).cloned())?);
         LOCAL_PLANS.with(|c| c.borrow_mut().insert(plan_key, p.clone()));
         Some(p)
     });
@@ -1266,6 +1280,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
                 crate::info!("{:?} shader {addr:#x}: analysis took {ms} ms ({} instructions)", spec.stage, insts.len());
             }
             PLANS.lock().get_or_insert_with(HashMap::new).insert(plan_key, p.clone());
+            let p = std::rc::Rc::new(p);
             LOCAL_PLANS.with(|c| c.borrow_mut().insert(plan_key, p.clone()));
             p
         }
@@ -1483,7 +1498,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
                     .collect();
                 atomic_res.sort_unstable();
                 atomic_res.dedup();
-                let t = Arc::new(Translated { out, plan: plan.clone(), key: plan_key ^ spec_hash.rotate_left(1), atomic_res, spec: key_spec.clone().unwrap_or_else(|| spec.clone()) });
+                let t = Arc::new(Translated { out, plan: Arc::clone(&plan), key: plan_key ^ spec_hash.rotate_left(1), atomic_res, spec: key_spec.clone().unwrap_or_else(|| spec.clone()) });
                 TRANSLATIONS.lock().get_or_insert_with(HashMap::new).insert((plan_key, spec_hash), t.clone());
                 LOCAL_TRANSLATIONS.with(|c| c.borrow_mut().insert((plan_key, spec_hash), t.clone()));
                 t
@@ -1546,9 +1561,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
     let prepared = Prepared {
         stage: spec.stage,
         addr,
-        insts,
-        tr,
-        found: Arc::new(Found { resources, res_addrs, reads, words, unread, data_loads }),
+        found: Arc::new(Found { insts: Arc::clone(&insts), tr, resources, res_addrs, reads, words, unread, data_loads }),
         sgpr_data,
         user: user.to_vec(),
         map_gen,

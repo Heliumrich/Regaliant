@@ -4824,9 +4824,12 @@ impl Exec {
     /// Buffer, image and sampler bindings of a stage; fills the resource
     /// info blocks of its SGPR data.
     fn bind_stage(&mut self, p: &mut Prepared, allow_shadow: bool) -> Result<Bound, String> {
+        // What the preparation found (its own block, shared with its cache
+        // entry), apart from the SGPR data written below.
+        let found = p.found.clone();
         super::images::BINDING_SHADER.with(|s| s.set(p.addr));
-        let res_info = rdna::translate::res_info_offset(&p.tr.plan) as usize;
-        let nb = p.tr.out.bindings.len();
+        let res_info = rdna::translate::res_info_offset(&found.tr.plan) as usize;
+        let nb = found.tr.out.bindings.len();
         // A recycled binding's vectors keep their capacity (`recycle`).
         let mut bound = self.bound_pool.pop().unwrap_or_default();
         bound.bufs.reserve(nb);
@@ -4835,10 +4838,10 @@ impl Exec {
         let seg = SHADOW_BYTES;
         let fx = fixed();
         {
-            for b in &p.tr.out.bindings {
+            for b in &found.tr.out.bindings {
                 match b.kind {
                     BindingKind::Buffer(i) => {
-                        let (base, size, stride, limit) = match &p.resources[i] {
+                        let (base, size, stride, limit) = match &found.resources[i] {
                             Resolved::Buffer(v) => (v.base, v.byte_size(), v.stride, v.index_limit()),
                             Resolved::Global(a, n) => (*a, *n, 0, u32::MAX),
                             _ => return Err("binding/resource mismatch".into()),
@@ -4853,11 +4856,11 @@ impl Exec {
                         let mut placement = Placement::None;
                         // Sized: buffers, and bases whose loads all read known
                         // bytes (data loads read by the shader).
-                        let sized = matches!(p.resources[i], Resolved::Buffer(_) | Resolved::Global(_, Some(_)));
-                        let read_only = size > 0 && !p.tr.plan.resources[i].written && sized;
+                        let sized = matches!(found.resources[i], Resolved::Buffer(_) | Resolved::Global(_, Some(_)));
+                        let read_only = size > 0 && !found.tr.plan.resources[i].written && sized;
                         // A video-memory home holding the range (see `homes`).
                         let home = self
-                            .home_bind(base, size, p.tr.plan.resources[i].written, if sized { HomeUse::Sized } else { HomeUse::Unbounded })
+                            .home_bind(base, size, found.tr.plan.resources[i].written, if sized { HomeUse::Sized } else { HomeUse::Unbounded })
                             .map(|h| (h.0, h.1, h.2));
                         // Inside a resident shadow: its working copy is newer.
                         let resident = if read_only && home.is_none() { self.resident_read(base, size)? } else { None };
@@ -4891,10 +4894,10 @@ impl Exec {
                             bias = hoff - off;
                             info = vk::DescriptorBufferInfo { buffer: hbuf, offset: off, range: (bias + size).next_multiple_of(4).min(bias + avail) };
                             bound_size = size;
-                            if p.tr.plan.resources[i].written {
+                            if found.tr.plan.resources[i].written {
                                 trace_writes(|| format!("{:?} shader {:#x}", p.stage, p.addr), base, size);
                                 bound.writes.push((base, size));
-                                if matches!(p.resources[i], Resolved::Buffer(_)) {
+                                if matches!(found.resources[i], Resolved::Buffer(_)) {
                                     bound.sized_writes.push((base, size));
                                 }
                             }
@@ -4932,10 +4935,10 @@ impl Exec {
                                     if let Some(s) = CP_WRITES.latest(&[(base, size)]) {
                                         self.submit_after = self.submit_after.max(s);
                                     }
-                                    if p.tr.plan.resources[i].written {
+                                    if found.tr.plan.resources[i].written {
                                         trace_writes(|| format!("{:?} shader {:#x}", p.stage, p.addr), base, size);
                                         bound.writes.push((base, size));
-                                        if matches!(p.resources[i], Resolved::Buffer(_)) {
+                                        if matches!(found.resources[i], Resolved::Buffer(_)) {
                                             bound.sized_writes.push((base, size));
                                         }
                                     }
@@ -4943,7 +4946,7 @@ impl Exec {
                                     // (GPU atomics and stores to host memory are slow).
                                     let s_off = self.shadow_used.next_multiple_of(256);
                                     let span = range.next_multiple_of(256);
-                                    let res = &p.tr.plan.resources[i];
+                                    let res = &found.tr.plan.resources[i];
                                     let want = allow_shadow && shadow_writes() && res.written && range <= SHADOW_MAX && (res.atomic || range >= shadow_min());
                                     let window = (base - bias, range);
                                     let reuse = if want { self.resident.iter().position(|r| r.host == buffer && r.host_off == off && r.range == range) } else { None };
@@ -4971,7 +4974,7 @@ impl Exec {
                                         if *TRACE.get_or_init(|| std::env::var("DS_TRACE_SHADOW").ok().as_deref() == Some("1")) {
                                             static SEEN: std::sync::Mutex<Option<HashSet<(u64, u64)>>> = std::sync::Mutex::new(None);
                                             if SEEN.lock().unwrap().get_or_insert_with(HashSet::new).insert((p.addr, base)) {
-                                                let global = matches!(p.resources[i], Resolved::Global(..));
+                                                let global = matches!(found.resources[i], Resolved::Global(..));
                                                 crate::info!("shadow: {:?} shader {:#x} writes {base:#x}+{size:#x} (bound {range:#x}{})", p.stage, p.addr, if global { ", global pointer" } else { "" });
                                             }
                                         }
@@ -4986,7 +4989,7 @@ impl Exec {
                                             info = vk::DescriptorBufferInfo { buffer: sb, offset: 0, range };
                                         }
                                     }
-                                    if res.written && matches!(p.resources[i], Resolved::Buffer(_)) {
+                                    if res.written && matches!(found.resources[i], Resolved::Buffer(_)) {
                                         // Within the bound range (clamped to the mapping).
                                         bound.write_src.push((base, size.min(range - bias), info.buffer, info.offset + bias));
                                     }
@@ -5014,7 +5017,7 @@ impl Exec {
                             }
                         }
                         if profiling() {
-                            bound.placements.push((placement, bound_size, p.tr.plan.resources[i].written));
+                            bound.placements.push((placement, bound_size, found.tr.plan.resources[i].written));
                         }
                         let ri = res_info + RES_INFO_DWORDS as usize * i;
                         p.sgpr_data[ri] = bias as u32;
@@ -5037,8 +5040,8 @@ impl Exec {
         let memo = {
             let (mut imgs, mut images) = (Vec::new(), Vec::new());
             let mut all = true;
-            for b in &p.tr.out.bindings {
-                match (b.kind, b.kind_resource().and_then(|i| p.resources.get(i))) {
+            for b in &found.tr.out.bindings {
+                match (b.kind, b.kind_resource().and_then(|i| found.resources.get(i))) {
                     (BindingKind::Image(_), Some(Resolved::Image(t))) => match super::images::view_hit(t, frame) {
                         Some((view, image)) => {
                             imgs.push((b.binding, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }));
@@ -5073,8 +5076,8 @@ impl Exec {
         // One image-cache lock for all the stage's images and samplers.
         let mut failed: Vec<String> = Vec::new();
         let r: Result<(), String> = super::images::with(|im| {
-            for b in &p.tr.out.bindings {
-                match (b.kind, b.kind_resource().and_then(|i| p.resources.get(i))) {
+            for b in &found.tr.out.bindings {
+                match (b.kind, b.kind_resource().and_then(|i| found.resources.get(i))) {
                     (BindingKind::Image(_) | BindingKind::StorageImage(_), Some(Resolved::Image(t))) => {
                         let storage = matches!(b.kind, BindingKind::StorageImage(_));
                         let (view, image) = im.view(t, storage, frame)?;
