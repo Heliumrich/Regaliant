@@ -451,6 +451,19 @@ impl Exec {
         }
     }
 
+    /// Ends the active rendering instance for a dispatch or for draws to
+    /// other attachments: with `tune lazy_passes` without a barrier of its
+    /// own (the title flushes and waits before work that uses what the
+    /// instance drew, which arms the lazy barrier; draws after dispatches
+    /// wait for them), else as `end_rendering`.
+    pub(super) fn end_rendering_lazy(&mut self) {
+        if !super::super::tune::lazy_passes() {
+            self.end_rendering();
+        } else if self.rendering.take().is_some() {
+            unsafe { ctx().device.cmd_end_rendering(self.cmd()) };
+        }
+    }
+
     fn begin_rendering(&mut self, colors: [Option<Target>; MAX_RT], depth: Option<Target>, area: (u32, u32)) {
         let n = colors.iter().rposition(Option::is_some).map(|i| i + 1).unwrap_or(0);
         let color_infos: Vec<vk::RenderingAttachmentInfo> = colors[..n]
@@ -473,6 +486,7 @@ impl Exec {
                 ri = ri.stencil_attachment(d);
             }
         }
+        super::note_vk(super::VK_RENDER_PASSES);
         unsafe { ctx().device.cmd_begin_rendering(self.cmd(), &ri) };
         self.rendering = Some(Rendering { colors, depth, area });
     }
@@ -792,7 +806,11 @@ impl Exec {
         let feedback = self.rendering.as_ref().is_some_and(|r| r.colors.iter().flatten().chain(r.depth.iter()).any(|t| bounds.iter().any(|b| b.images.contains(&t.image))));
         let same = self.rendering.as_ref().is_some_and(|r| r.colors == colors && r.depth == depth);
         if !same || feedback {
-            self.end_rendering();
+            if feedback {
+                self.end_rendering();
+            } else {
+                self.end_rendering_lazy();
+            }
             self.barrier_if_wanted(true);
             self.begin_rendering(colors, depth, area);
         }
@@ -813,6 +831,7 @@ impl Exec {
         let dc = &mut self.dyncache;
         unsafe {
             if dc.pipeline != pipeline {
+                super::note_vk(super::VK_GFX_PIPELINES);
                 c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 dc.pipeline = pipeline;
             }
@@ -984,7 +1003,10 @@ impl Exec {
             // DS_PROFILE_GPU: timestamps around the draw, keyed by its shader.
             let qp = self.slots[self.cur].queries;
             let ti = self.batch_shaders.len() as u32;
-            let timed = qp != vk::QueryPool::null() && ti < super::MAX_TIMED && super::stamp_worth(Some(a.count as u64 * a.instances as u64), 16384);
+            // Full-screen passes (a triangle or quad, one instance) count as
+            // large: their cost is the pixels they shade.
+            let work = if a.count <= 4 && a.instances == 1 { u64::MAX } else { a.count as u64 * a.instances as u64 };
+            let timed = qp != vk::QueryPool::null() && ti < super::MAX_TIMED && super::stamp_worth(Some(work), 16384);
             if timed {
                 for k in 0..2 {
                     c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, super::STAMPS * ti + k);

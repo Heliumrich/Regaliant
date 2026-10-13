@@ -126,6 +126,15 @@ fn program_checked(addr: u64) -> Result<(Arc<Vec<rdna::Inst>>, u64), String> {
     Ok((insts, hash))
 }
 
+/// A pointer chain's structural hash (`Reader::ptrs`).
+fn ptr_hash(p: &Ptr) -> u64 {
+    match p {
+        Ptr::User(i) => 0x9E37_79B9_7F4A_7C15 ^ *i as u64,
+        Ptr::Mem(inner, off) => ptr_hash(inner).rotate_left(17) ^ (*off as u64 + 1).wrapping_mul(0xBF58_476D_1CE4_E5B9),
+        Ptr::Pc(o) => (*o ^ 0x94D0_49BB_1331_11EB).wrapping_mul(0x2545_F491_4F6C_DD1D),
+    }
+}
+
 /// Guest memory reader that records what it read (hazard checks; adjacent
 /// reads merged). It lives within one preparation of a stage whose plan
 /// (`'a`) holds the pointer chains it resolves.
@@ -145,8 +154,11 @@ pub struct Reader<'a> {
     /// Pointers loaded from memory so far, by the plan's chain (each resource
     /// dword names its pointer chain again; kept by reference, not cloned:
     /// the clones' allocations and deep comparisons were ~6% of the graphics
-    /// command processor's time, run 20261012-202512).
-    ptrs: Vec<(&'a Ptr, u64)>,
+    /// command processor's time, run 20261012-202512), with the chain's
+    /// structural hash (equal chains elsewhere in the plan are found by it
+    /// before one deep comparison: comparing every entry deeply was up to 7%
+    /// of the compute queues' busy samples, run 20261013-115322).
+    ptrs: Vec<(&'a Ptr, u64, u64)>,
     /// Address of the program (program-relative pointers).
     code_base: u64,
 }
@@ -236,12 +248,16 @@ impl<'a> Reader<'a> {
             Ptr::Mem(inner, off) => {
                 // The same chain object first, then an equal one elsewhere in
                 // the plan.
-                if let Some(&(_, v)) = self.ptrs.iter().find(|e| std::ptr::eq(e.0, p)).or_else(|| self.ptrs.iter().find(|e| e.0 == p)) {
+                if let Some(&(_, _, v)) = self.ptrs.iter().find(|e| std::ptr::eq(e.0, p)) {
+                    return Some(v);
+                }
+                let h = ptr_hash(p);
+                if let Some(&(_, _, v)) = self.ptrs.iter().find(|e| e.1 == h && e.0 == p) {
                     return Some(v);
                 }
                 let base = self.ptr(inner, user)? + *off as u64;
                 let v = (self.u32(base)? as u64) | ((self.u32(base + 4)? as u64) << 32);
-                self.ptrs.push((p, v));
+                self.ptrs.push((p, h, v));
                 Some(v)
             }
             Ptr::Pc(o) => Some(self.code_base + *o),

@@ -29,6 +29,7 @@ pub enum Ptr {
 /// is loaded from: unequal chains (most comparisons when a preparation
 /// looks up the pointers it loaded) differ without following the boxes.
 impl PartialEq for Ptr {
+    #[inline]
     fn eq(&self, other: &Ptr) -> bool {
         match (self, other) {
             (Ptr::User(a), Ptr::User(b)) => a == b,

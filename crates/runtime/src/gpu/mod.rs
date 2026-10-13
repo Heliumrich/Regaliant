@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 62] = [
+    static ALL: [Tunable; 63] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -89,6 +89,7 @@ pub mod tune {
         Tunable { name: "cp_priority", env: "DS_CP_PRIORITY", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "cp_cpus", env: "DS_CP_CPUS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "guest_cpus", env: "DS_GUEST_CPUS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "lazy_passes", env: "DS_LAZY_PASSES", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -651,6 +652,15 @@ pub mod tune {
     #[inline]
     pub fn guest_cpus() -> u64 {
         get(61)
+    }
+
+    /// A rendering instance ends without a full barrier: later commands that
+    /// use its attachments' contents follow the title's own synchronization
+    /// (flushes and partial flushes arm the lazy barrier, as for dispatches),
+    /// and draws after dispatches wait for them as before.
+    #[inline]
+    pub fn lazy_passes() -> bool {
+        get(62) != 0
     }
 
     /// A switch's value by name; None if unknown.

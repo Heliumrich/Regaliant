@@ -81,6 +81,43 @@ pub static PIPES_PUSH: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Commands recorded with pushed descriptors, with a descriptor set.
 pub static PUSHED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+thread_local! {
+    /// This thread's PUSHED counts not yet added (every 256: one shared
+    /// counter bumped by every draw and dispatch of every recording thread).
+    static PUSHED_LOCAL: std::cell::Cell<[u32; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+fn note_pushed(k: usize) {
+    PUSHED_LOCAL.with(|c| {
+        let mut v = c.get();
+        v[k] += 1;
+        if v[k] == 256 {
+            PUSHED[k].fetch_add(256, Ordering::Relaxed);
+            v[k] = 0;
+        }
+        c.set(v);
+    });
+}
+
+/// The Vulkan commands that shape the GPU's work, counted while profiling
+/// (`profile report`): global barriers, render pass begins, graphics and
+/// compute pipeline binds, descriptor pushes or set binds.
+pub(super) static VK_OPS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Global barriers by the source line that asked for them (profiling).
+static BARRIER_SITES: Mutex<Option<HashMap<(&'static str, u32), u64>>> = Mutex::new(None);
+pub(super) const VK_BARRIERS: usize = 0;
+pub(super) const VK_RENDER_PASSES: usize = 1;
+pub(super) const VK_GFX_PIPELINES: usize = 2;
+pub(super) const VK_CS_PIPELINES: usize = 3;
+pub(super) const VK_DESCRIPTORS: usize = 4;
+
+#[inline]
+pub(super) fn note_vk(k: usize) {
+    if profiling() {
+        VK_OPS[k].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Waits for a stage's shader reads (GPU work was writing what the
 /// preparation read): [draws whose words were the same after the wait,
 /// changed; dispatches same, changed]. Same: preparing with the earlier
@@ -922,11 +959,13 @@ fn bind_descriptors(cmd: vk::CommandBuffer, at: vk::PipelineBindPoint, layout: v
     let c = ctx();
     match set {
         Some(set) => {
-            PUSHED[1].fetch_add(1, Ordering::Relaxed);
+            note_pushed(1);
+            note_vk(VK_DESCRIPTORS);
             unsafe { c.device.cmd_bind_descriptor_sets(cmd, at, layout, 0, &[set], &[]) };
         }
         None => {
-            PUSHED[0].fetch_add(1, Ordering::Relaxed);
+            note_pushed(0);
+            note_vk(VK_DESCRIPTORS);
             let writes = descriptor_writes(vk::DescriptorSet::null(), bounds);
             if !writes.is_empty() {
                 unsafe { c.push_desc.cmd_push_descriptor_set(cmd, at, layout, 0, &writes) };
@@ -943,7 +982,13 @@ fn lazy_barriers() -> bool {
     super::tune::lazy_barriers()
 }
 
+#[track_caller]
 fn global_barrier(cmd: vk::CommandBuffer) {
+    note_vk(VK_BARRIERS);
+    if profiling() {
+        let l = std::panic::Location::caller();
+        *BARRIER_SITES.lock().get_or_insert_with(HashMap::new).entry((l.file(), l.line())).or_default() += 1;
+    }
     let mb = vk::MemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
         .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
@@ -1912,6 +1957,19 @@ pub(crate) fn image_hazards(stages: &[&Prepared], extra: &[super::images::ImageK
     })
 }
 
+/// Whether a fast clear or an overwrite reload may be pending for one of
+/// `keys`, without the image cache's lock (its published pending set): a
+/// command whose images only may need block copies took the lock twice for
+/// nothing (`resolve_overwrites` was 3% of the graphics command
+/// processor's busy samples, run 20261013-115322).
+fn pending_for(keys: &[super::images::ImageKey]) -> bool {
+    if super::tune::pending_set() {
+        super::images::pending_hit(keys)
+    } else {
+        super::images::any_pending()
+    }
+}
+
 /// Clear color of a DCC fast-clear code (gfx10: 00 -> 0000, 40 -> 0001,
 /// 80 -> 1110, C0 -> 1111, RGBA; 20 -> the CLEAR_WORD registers; FF:
 /// uncompressed, nothing to clear). Codes from Mesa radeonsi si_clear.c.
@@ -2544,6 +2602,10 @@ pub fn reset_shader_profile() {
     if let Some(m) = SHADER_TIME.lock().as_mut() {
         m.clear();
     }
+    for c in &VK_OPS {
+        c.store(0, Ordering::Relaxed);
+    }
+    *BARRIER_SITES.lock() = None;
     *CS_CPU.lock() = None;
     *SHADER_PLACEMENTS.lock() = None;
     shaders::reset_repeats();
@@ -2607,6 +2669,19 @@ pub fn shader_profile() -> String {
     );
     s.push_str(&batch_by_lines());
     s.push_str(&begin_stats_line());
+    {
+        let v: Vec<u64> = VK_OPS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        s.push_str(&format!(
+            "    vulkan commands recorded: {} global barriers, {} render pass begins, {} graphics and {} compute pipeline binds, {} descriptor pushes or set binds\n",
+            v[VK_BARRIERS], v[VK_RENDER_PASSES], v[VK_GFX_PIPELINES], v[VK_CS_PIPELINES], v[VK_DESCRIPTORS]
+        ));
+        if let Some(m) = BARRIER_SITES.lock().as_ref() {
+            let mut sites: Vec<(&(&str, u32), &u64)> = m.iter().collect();
+            sites.sort_by(|a, b| b.1.cmp(a.1));
+            let list: Vec<String> = sites.iter().take(12).map(|((f, l), n)| format!("{}:{l} {n}", f.rsplit(['/', '\\']).next().unwrap_or(f))).collect();
+            s.push_str(&format!("    global barriers by site: {}\n", list.join(", ")));
+        }
+    }
     if let Some(idle) = IDLE.lock().1.as_ref() {
         let mut v: Vec<(&String, &[u64; 3])> = idle.iter().collect();
         v.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
@@ -3570,7 +3645,7 @@ impl Exec {
     /// never compressed, so the metadata is read back and the image cleared.
     /// Runs before a draw or dispatch reserves its slot (it flushes).
     pub(crate) fn resolve_fast_clears(&mut self, keys: &[super::images::ImageKey]) {
-        if keys.is_empty() || !super::images::with(|im| im.clears_pending(keys)) {
+        if keys.is_empty() || !pending_for(keys) || !super::images::with(|im| im.clears_pending(keys)) {
             return;
         }
         self.end_rendering();
@@ -3681,7 +3756,7 @@ impl Exec {
     /// writers have completed. Runs before a draw or dispatch reserves its
     /// slot (it flushes).
     pub(crate) fn resolve_overwrites(&mut self, keys: &[super::images::ImageKey]) {
-        if keys.is_empty() || !super::images::with(|im| im.overwrites_pending(keys)) {
+        if keys.is_empty() || !pending_for(keys) || !super::images::with(|im| im.overwrites_pending(keys)) {
             return;
         }
         self.end_rendering();
@@ -5303,7 +5378,7 @@ impl Exec {
             self.write_set(set, std::slice::from_ref(&bound));
         }
         lap.mark(10);
-        self.end_rendering();
+        self.end_rendering_lazy();
         let c = ctx();
         let qp = self.slots[self.cur].queries;
         let ti = self.batch_shaders.len() as u32;
@@ -5421,6 +5496,7 @@ impl Exec {
         unsafe {
             let cmd = self.cmd();
             if !super::tune::lean_cmd() || self.dyncache.cs_pipeline != pipeline {
+                note_vk(VK_CS_PIPELINES);
                 c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
                 self.dyncache.cs_pipeline = pipeline;
             }
