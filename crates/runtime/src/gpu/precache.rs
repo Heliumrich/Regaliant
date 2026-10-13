@@ -155,6 +155,9 @@ static HI: AtomicU64 = AtomicU64::new(0);
 static EPOCH: AtomicU64 = AtomicU64::new(1);
 /// Entry ids (`Entry::id`).
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// Changes whenever an entry is inserted: while it stays the same, dropping
+/// a range dropped before changes nothing (`Exec`'s write-note memo).
+pub static INSERT_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// Statistics: [hits, copies, checks (epoch changed), dropped by CPU writes,
 /// dropped by GPU/CP/host writes and mapping changes, dropped by eviction,
@@ -385,6 +388,7 @@ pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     c.remove((base, size));
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     c.entries.insert((base, size), Entry { chunk: chunk.clone(), offset, id, seq: 0, checked: EPOCH.load(Ordering::Acquire) });
+    INSERT_GEN.fetch_add(1, Ordering::Release);
     cover(base, size, true);
     c.by_base.entry(base).or_default().push(size);
     c.max_size = c.max_size.max(size);

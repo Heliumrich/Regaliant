@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 48] = [
+    static ALL: [Tunable; 49] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -75,6 +75,7 @@ pub mod tune {
         Tunable { name: "fill_dma", env: "DS_FILL_DMA", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lean_cmd", env: "DS_LEAN_CMD", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "exact_big", env: "DS_EXACT_BIG", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "lean_notes", env: "DS_LEAN_NOTES", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     #[inline]
@@ -471,6 +472,15 @@ pub mod tune {
     #[inline]
     pub fn exact_big() -> bool {
         get(47) != 0
+    }
+
+    /// A dispatch writing the same ranges as its executor's previous command
+    /// skips the global write notes (image cache, write tracker, copy cache)
+    /// while their generations are unchanged (`Exec::last_notes`); 0: every
+    /// dispatch notes them (for A/B).
+    #[inline]
+    pub fn lean_notes() -> bool {
+        get(48) != 0
     }
 
     /// A switch's value by name; None if unknown.

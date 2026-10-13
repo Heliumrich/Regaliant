@@ -72,6 +72,11 @@ pub static GEN: AtomicU64 = AtomicU64::new(0);
 /// host write, GPU write, remap] (profile line `image memos`).
 pub static GEN_WHY: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
+/// Changes whenever a region is added, its GPU-written flag is reset, or a
+/// mapping change hits regions: while it stays the same, a `gpu_write` of a
+/// range noted before changes nothing (`Exec`'s write-note memo).
+pub static RESET_GEN: AtomicU64 = AtomicU64::new(0);
+
 fn changed(why: usize) {
     GEN.fetch_add(1, Ordering::Release);
     GEN_WHY[why].fetch_add(1, Ordering::Relaxed);
@@ -121,6 +126,7 @@ fn may_have_region(base: u64, len: u64) -> bool {
 impl Tracker {
     fn add(&mut self, base: u64, size: u64) -> u32 {
         note_region(base, size);
+        RESET_GEN.fetch_add(1, Ordering::Release);
         let id = self.regions.len() as u32;
         self.regions.push(Some(Region { base, size, dirty: false, gpu: false, why: Why::None }));
         self.by_base.entry(base).or_default().push(id);
@@ -258,6 +264,7 @@ pub fn take_dirty(id: u32) -> Option<Why> {
         Some(r) if r.dirty => {
             r.dirty = false;
             r.gpu = false;
+            RESET_GEN.fetch_add(1, Ordering::Release);
             Some(r.why)
         }
         _ => None,
@@ -293,7 +300,13 @@ pub fn take_gpu_written(id: u32) -> bool {
     let mut g = TRACK.lock();
     let Some(t) = g.as_mut() else { return false };
     match t.regions.get_mut(id as usize).and_then(|r| r.as_mut()) {
-        Some(r) => std::mem::replace(&mut r.gpu, false),
+        Some(r) => {
+            let was = std::mem::replace(&mut r.gpu, false);
+            if was {
+                RESET_GEN.fetch_add(1, Ordering::Release);
+            }
+            was
+        }
         None => false,
     }
 }
@@ -437,6 +450,7 @@ pub fn gpu_write(base: u64, len: u64) {
 pub fn remapped(base: u64, len: u64) {
     super::precache::invalidate(base, len);
     super::homes::remapped(base, len);
+    RESET_GEN.fetch_add(1, Ordering::Release);
     let mut g = TRACK.lock();
     let Some(t) = g.as_mut() else { return };
     if t.regions.is_empty() {

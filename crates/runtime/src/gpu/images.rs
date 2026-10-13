@@ -831,6 +831,10 @@ pub fn scrub_status() -> String {
     format!("    texture scrubbing: {n} slices checked, {} changed (re-uploaded at their next use)\n", SCRUB_DIRTY.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// Follows `Images::note_gen` (read without the lock: `Exec`'s write-note
+/// memo).
+pub static NOTE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
     static SCRUBBER: std::sync::Once = std::sync::Once::new();
     SCRUBBER.call_once(|| {
@@ -1438,6 +1442,7 @@ impl Images {
             self.pending_change += 1;
         }
         self.note_gen += 1;
+        NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         self.retired.push(prev.image);
         self.depth_grows += 1;
         if self.depth_grows <= 16 {
@@ -1604,6 +1609,10 @@ impl Images {
         for (&meta, &(key, _)) in self.meta_of.range(base..end) {
             if meta + 4 <= end {
                 self.pending_clears.insert(key, (meta, Some(v)));
+                // A write noted again over it makes it unknown again: not a
+                // repeat for the memos of `note_writes` and `Exec::last_notes`.
+                self.note_gen += 1;
+                NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
             }
         }
     }
@@ -1630,6 +1639,7 @@ impl Images {
             let Some((meta, known)) = self.pending_clears.remove(k) else { continue };
             self.pending_change += 1;
             self.note_gen += 1;
+            NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
             let (Some(img), Some(&(_, clear))) = (self.map.get(k), self.meta_of.get(&meta)) else { continue };
             if out.iter().any(|c: &FastClear| c.key == *k) {
                 continue;
@@ -1733,6 +1743,7 @@ impl Images {
             v.push(k);
             self.max_span = self.max_span.max(span);
             self.note_gen += 1;
+            NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -1800,6 +1811,7 @@ impl Images {
             self.pending_change += 1;
             self.pending_overwrites = self.pending_overwrites.saturating_sub(1);
             self.note_gen += 1;
+            NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
             let (image, span, layout) = (img.image, img.span, img.layout);
             if !super::cp::guest_readable(k.base, span) {
                 self.report(format!("image {:#x} overwritten through a buffer: guest memory not readable", k.base));
@@ -2021,6 +2033,7 @@ impl Images {
         }
         if s.meta != 0 && self.meta_of.insert(s.meta, (k, s.clear)) != Some((k, s.clear)) {
             self.note_gen += 1;
+            NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         img.source = None;
         self.index_owned(k);

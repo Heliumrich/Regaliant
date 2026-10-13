@@ -132,6 +132,18 @@ pub static WATCHDOG_STOPS: AtomicU64 = AtomicU64::new(0);
 pub static FAST_CLEARS: AtomicU64 = AtomicU64::new(0);
 /// Fill-kernel dispatches recorded as buffer fills (`Exec::fill_in_place`).
 pub static FILLS_IN_PLACE: AtomicU64 = AtomicU64::new(0);
+/// Dispatches whose global write notes were skipped (`Exec::last_notes`).
+pub static NOTES_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// The generations the global write notes depend on (`Exec::last_notes`).
+fn note_gens() -> [u64; 4] {
+    [
+        super::images::LOOKUP_GEN.load(Ordering::Acquire),
+        super::images::NOTE_GEN.load(Ordering::Acquire),
+        super::track::RESET_GEN.load(Ordering::Acquire),
+        super::precache::INSERT_GEN.load(Ordering::Acquire),
+    ]
+}
 /// Fast clears resolved without waiting for the GPU (metadata value known
 /// from the fill that wrote it).
 pub static FAST_CLEARS_KNOWN: AtomicU64 = AtomicU64::new(0);
@@ -2527,6 +2539,13 @@ pub struct Exec {
     dyncache: draw::DynCache,
     /// Cleared bindings for the next commands (`bind_stage`, `recycle`).
     bound_pool: Vec<Bound>,
+    /// The written ranges (all, sized) this executor's last dispatch noted in
+    /// the image cache, the write tracker and the copy cache, with their
+    /// generations after it (`note_gens`): a dispatch writing the same ranges
+    /// skips those notes while the generations stay the same. The title's
+    /// culls write the same two buffers ~2,700 times per frame and each note
+    /// took a global lock (5.3 us per dispatch profiled, run 20261013-021047).
+    last_notes: (Vec<(u64, u64)>, Vec<(u64, u64)>, [u64; 4]),
     /// A draw's stage bindings (the vector reused).
     draw_bounds: Vec<Bound>,
     /// Descriptor pool usage of the recording slot (see POOL_LIMITS).
@@ -2636,6 +2655,7 @@ impl Exec {
                 rendering: None,
                 dyncache: Default::default(),
                 bound_pool: Vec::new(),
+                last_notes: (Vec::new(), Vec::new(), [u64::MAX; 4]),
                 draw_bounds: Vec::new(),
                 pool_use: [0; 5],
                 shadow_used: 0,
@@ -4799,12 +4819,20 @@ impl Exec {
         let writes_here = std::mem::take(&mut bound.writes);
         let sized_here = std::mem::take(&mut bound.sized_writes);
         let fill = verify::fill_value(&p);
-        super::images::with(|im| {
-            im.note_writes(&writes_here, &sized_here);
-            if let Some(((base, len), v)) = fill {
-                im.note_meta_fill(base, len, v);
-            }
-        });
+        // The same writes as this executor's last dispatch, with nothing
+        // changed since in the structures they were noted in. The notes
+        // themselves move none of these generations: read before them, a
+        // change by another thread while they run makes the next one note.
+        let gens = note_gens();
+        let repeat = super::tune::lean_notes() && fill.is_none() && !writes_here.is_empty() && self.last_notes.2 == gens && self.last_notes.0 == writes_here && self.last_notes.1 == sized_here;
+        if !repeat {
+            super::images::with(|im| {
+                im.note_writes(&writes_here, &sized_here);
+                if let Some(((base, len), v)) = fill {
+                    im.note_meta_fill(base, len, v);
+                }
+            });
+        }
         lap.mark(9);
         if let Some(set) = set {
             self.write_set(set, std::slice::from_ref(&bound));
@@ -4938,11 +4966,31 @@ impl Exec {
             }
         }
         lap.mark(14);
-        for &(b, n) in &writes_here {
-            super::track::gpu_write(b, n);
-        }
-        for &(b, n) in &writes_here {
-            self.note_write(b, n);
+        if repeat {
+            // This batch's own record of them still: it may have begun since.
+            for &(b, n) in &writes_here {
+                self.pending.insert(b, n);
+                if verify::enabled() {
+                    self.pending_log.push((b, n));
+                }
+            }
+            NOTES_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            for &(b, n) in &writes_here {
+                super::track::gpu_write(b, n);
+            }
+            for &(b, n) in &writes_here {
+                self.note_write(b, n);
+            }
+            if fill.is_some() {
+                // Known values noted: the next write of the range is not a
+                // repeat of this one.
+                self.last_notes.2 = [u64::MAX; 4];
+            } else if !writes_here.is_empty() {
+                self.last_notes.0.clone_from(&writes_here);
+                self.last_notes.1.clone_from(&sized_here);
+                self.last_notes.2 = gens;
+            }
         }
         lap.mark(15);
         EXECUTED.fetch_add(1, Ordering::Relaxed);
@@ -4987,7 +5035,7 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU; {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU; {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills, {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         GPU_CP_WRITES.load(Ordering::Relaxed),
@@ -5007,6 +5055,7 @@ pub fn status() -> String {
         FAST_CLEARS.load(Ordering::Relaxed),
         FAST_CLEARS_KNOWN.load(Ordering::Relaxed),
         FILLS_IN_PLACE.load(Ordering::Relaxed),
+        NOTES_SKIPPED.load(Ordering::Relaxed),
         FLUSHES.load(Ordering::Relaxed),
         verify::status(),
         super::cp::sync_summary()
