@@ -329,6 +329,8 @@ struct Run {
     /// Thread CPU ms by kind (`threadcpu::KINDS`).
     cpu: [f64; threadcpu::KINDS.len()],
     commands: u64,
+    /// GPU time in batches (profiled runs; 0 otherwise).
+    gpu_ms: f64,
 }
 
 impl Run {
@@ -493,9 +495,9 @@ fn drive(iterations: u32, ab: Option<(String, u64, u64)>, timeline: u32) {
         }
         let draws = s1.draws - s0.draws;
         let dispatches = s1.dispatches - s0.dispatches;
-        let r = Run { value, wall_ms: (s1.at - s0.at).as_secs_f64() * 1000.0, cpu, commands: draws + dispatches };
-        let kinds: Vec<String> = threadcpu::KINDS.iter().zip(&r.cpu).map(|(k, c)| format!("{k} {c:.1}")).collect();
         let gpu = s1.batch_ns - s0.batch_ns;
+        let r = Run { value, wall_ms: (s1.at - s0.at).as_secs_f64() * 1000.0, cpu, commands: draws + dispatches, gpu_ms: gpu as f64 / 1e6 };
+        let kinds: Vec<String> = threadcpu::KINDS.iter().zip(&r.cpu).map(|(k, c)| format!("{k} {c:.1}")).collect();
         crate::info!(
             "replay {}/{iterations}{}: {:.1} ms; thread CPU ms {} (all {:.1}; {:.2} us per command); {draws} draws, {dispatches} dispatches, {} packets{}{}",
             i + 1,
@@ -547,34 +549,37 @@ fn summary(runs: &[Run], name: Option<&str>) {
             values.push(r.value);
         }
     }
-    let mut medians: Vec<(Option<u64>, f64, f64)> = Vec::new();
+    let mut medians: Vec<(Option<u64>, f64, f64, f64)> = Vec::new();
     for v in &values {
         let all: Vec<&Run> = runs.iter().filter(|r| r.value == *v).collect();
         let used: Vec<&Run> = if all.len() > 1 { all[1..].to_vec() } else { all.clone() };
         let wall = median(used.iter().map(|r| r.wall_ms).collect());
         let cpu: Vec<String> = threadcpu::KINDS.iter().enumerate().map(|(k, kind)| format!("{kind} {:.1}", median(used.iter().map(|r| r.cpu[k]).collect()))).collect();
         let us = median(used.iter().map(|r| r.us_per_command()).collect());
+        let gpu = median(used.iter().map(|r| r.gpu_ms).collect());
         let label = match (name, v) {
             (Some(n), Some(x)) => format!("{n}={x}"),
             _ => "frame".to_string(),
         };
         crate::info!(
-            "replay summary {label}: median of {} iteration(s): {wall:.1} ms (min {:.1}, max {:.1}); thread CPU ms {} (all {:.1}); {us:.2} us per command",
+            "replay summary {label}: median of {} iteration(s): {wall:.1} ms (min {:.1}, max {:.1}); thread CPU ms {} (all {:.1}); {us:.2} us per command{}",
             used.len(),
             used.iter().map(|r| r.wall_ms).fold(f64::MAX, f64::min),
             used.iter().map(|r| r.wall_ms).fold(0.0, f64::max),
             cpu.join(", "),
-            median(used.iter().map(|r| r.cpu_all()).collect())
+            median(used.iter().map(|r| r.cpu_all()).collect()),
+            if gpu > 0.0 { format!("; GPU in batches {gpu:.1} ms") } else { String::new() }
         );
-        medians.push((*v, wall, us));
+        medians.push((*v, wall, us, gpu));
     }
     if let (Some(n), [a, b]) = (name, medians.as_slice()) {
         crate::info!(
-            "replay summary {n}: {}/{}: wall {:.3}, CPU per command {:.3}",
+            "replay summary {n}: {}/{}: wall {:.3}, CPU per command {:.3}{}",
             b.0.unwrap_or(0),
             a.0.unwrap_or(0),
             b.1 / a.1.max(1e-9),
-            b.2 / a.2.max(1e-9)
+            b.2 / a.2.max(1e-9),
+            if a.3 > 0.0 { format!(", GPU in batches {:.3}", b.3 / a.3) } else { String::new() }
         );
     }
 }

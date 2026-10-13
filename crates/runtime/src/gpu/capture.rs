@@ -60,8 +60,7 @@ pub fn on_flip(flip: u64) {
         finish(c, last);
         if !last {
             MORE.store(more - 1, Ordering::SeqCst);
-            *g = Some(Capture { flip, text: format!("# frame after flip {flip}
-"), shaders: BTreeSet::new(), events: 0, textures: Default::default() });
+            *g = Some(Capture { flip, text: format!("# frame after flip {flip}\n"), shaders: BTreeSet::new(), events: 0, textures: Default::default() });
         }
         return;
     }

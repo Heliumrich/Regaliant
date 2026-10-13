@@ -10,7 +10,9 @@
 //! draw then uses as its index buffer gets a home: a device-local copy of
 //! its guest range that every later GPU use inside the range binds
 //! (dispatch and draw buffers, index buffers), across batches and queues
-//! (one Vulkan queue runs all batches in submission order). (Homes for every
+//! (one Vulkan queue runs all batches in submission order). With `tune
+//! home_reads` (off by default: no measured gain) a large read-only buffer
+//! binding inside such a range creates one too (`read_use`). (Homes for every
 //! large written binding also caught buffers that draws sample as textures
 //! and pools that unbounded pointers of other shaders span: their
 //! write-backs made the courtyard slower, 1.94 against 2.27 flips/s.)
@@ -222,6 +224,16 @@ pub fn note_large_write(base: u64, size: u64) {
 /// An index buffer [base, base+size) inside a range noted by
 /// `note_large_write`: that range gets a home (`create`).
 pub fn index_use(base: u64, size: u64) -> bool {
+    use_inside(base, size)
+}
+
+/// A large read-only buffer binding [base, base+size) inside a range noted
+/// by `note_large_write`: that range gets a home (`tune home_reads`).
+pub fn read_use(base: u64, size: u64) -> bool {
+    use_inside(base, size)
+}
+
+fn use_inside(base: u64, size: u64) -> bool {
     let found = LARGE_WRITES.lock().iter().find(|&(a, n)| a <= base && base + size <= a + n);
     match found {
         Some((a, n)) => create(a, n),

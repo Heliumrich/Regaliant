@@ -132,6 +132,17 @@ pub static WATCHDOG_STOPS: AtomicU64 = AtomicU64::new(0);
 pub static FAST_CLEARS: AtomicU64 = AtomicU64::new(0);
 /// Fill-kernel dispatches recorded as buffer fills (`Exec::fill_in_place`).
 pub static FILLS_IN_PLACE: AtomicU64 = AtomicU64::new(0);
+/// Logs why a big read-only binding stays in place, once per range and
+/// reason (the first 48).
+fn note_big_refusal(base: u64, size: u64, why: &'static str) {
+    static SEEN: Mutex<Option<std::collections::HashSet<(u64, u64, &'static str)>>> = Mutex::new(None);
+    let mut g = SEEN.lock();
+    let seen = g.get_or_insert_with(Default::default);
+    if seen.len() < 48 && seen.insert((base, size, why)) {
+        crate::info!("gpu: read-only binding {base:#x}+{size:#x} ({} MiB) read in place: {why}", size >> 20);
+    }
+}
+
 /// Dispatches whose global write notes were skipped (`Exec::last_notes`).
 pub static NOTES_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
@@ -2011,8 +2022,7 @@ fn pre_repeat_line() -> String {
     let g = PRE_REPEAT.lock();
     let mb = |b: u64| b as f64 / (1u64 << 20) as f64;
     let stable = format!(
-        "    batch-start copies across frames (first in a frame): ranges not copied in the two frames before {:.0} MiB, unchanged since {:.0} MiB, changed {:.0} MiB (sampled hashes); write-watch queries {} ({:.1} us each, {} pages)
-",
+        "    batch-start copies across frames (first in a frame): ranges not copied in the two frames before {:.0} MiB, unchanged since {:.0} MiB, changed {:.0} MiB (sampled hashes); write-watch queries {} ({:.1} us each, {} pages)\n",
         mb(st[0]),
         mb(st[1]),
         mb(st[2]),
@@ -2022,8 +2032,7 @@ fn pre_repeat_line() -> String {
     );
     let sizes: Vec<String> = ["<4K", "<64K", "<1M", ">=1M"].iter().zip(g.3.iter()).map(|(n, x)| format!("{n} {} ({:.0} MiB)", x[0], mb(x[1]))).collect();
     format!(
-        "    batch-start copies within a frame: first {} ({:.0} MiB), repeated {} ({:.0} MiB); by size {}
-",
+        "    batch-start copies within a frame: first {} ({:.0} MiB), repeated {} ({:.0} MiB); by size {}\n",
         g.2[0],
         mb(g.2[1]),
         g.2[2],
@@ -2439,8 +2448,7 @@ pub fn shader_profile() -> String {
     for (a, x) in v.iter().take(top) {
         let n = x[0].max(1);
         if **a & DRAW_KEY != 0 {
-            s.push_str(&format!("      draws with shader {:#x}: {} draws, {} us each
-", **a & !DRAW_KEY, x[0], x[1] / 1000 / n));
+            s.push_str(&format!("      draws with shader {:#x}: {} draws, {} us each\n", **a & !DRAW_KEY, x[0], x[1] / 1000 / n));
             if let Some(l) = placement_line(**a) {
                 // Buffers of the vertex stage, then of the pixel stage.
                 let rest = l.split_once("; buffers:").map(|(_, r)| r).unwrap_or("");
@@ -2983,7 +2991,11 @@ impl Exec {
         if kind == HomeUse::Sized && written && size > SHADOW_MAX && size <= super::homes::MAX && super::tune::homes() {
             super::homes::note_large_write(base, size);
         }
-        if !super::homes::any() && !(kind == HomeUse::Index && super::tune::homes()) {
+        // A large read that may create a home (`tune home_reads`; only when
+        // recording in order: a parallel chunk's later neighbours may have
+        // bound the range in place already).
+        let read_use = kind == HomeUse::Sized && !written && size > super::tune::pre_max() && !self.deferred && super::tune::homes() && super::tune::home_reads();
+        if !super::homes::any() && !(kind == HomeUse::Index && super::tune::homes()) && !read_use {
             return None;
         }
         if self.deferred && super::homes::copy_in_pending(base, size) {
@@ -2992,6 +3004,9 @@ impl Exec {
         }
         let mut b = super::homes::bind(base, size, written);
         if b.is_none() && kind == HomeUse::Index && super::tune::homes() && super::homes::index_use(base, size) {
+            b = super::homes::bind(base, size, written);
+        }
+        if b.is_none() && read_use && super::homes::read_use(base, size) {
             b = super::homes::bind(base, size, written);
         }
         let Some(b) = b else {
@@ -3153,7 +3168,15 @@ impl Exec {
     /// write, writes the range (then None). None also: off or larger than
     /// `tune pre_max`, not one mapping, no space.
     pub(super) fn pre_copy(&mut self, base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
-        if size == 0 || size > super::tune::pre_max() || self.pre_failed || super::homes::overlaps(base, size) {
+        // Over `pre_max`: only as a shared copy (`tune pre_big_max`).
+        let big = size > super::tune::pre_max();
+        if size == 0 || (big && !(size <= super::tune::pre_big_max() && self.shares_pre && super::precache::enabled())) || self.pre_failed {
+            return None;
+        }
+        if super::homes::overlaps(base, size) {
+            if big {
+                note_big_refusal(base, size, "a video-memory home overlaps it");
+            }
             return None;
         }
         let r = [(base, size)];
@@ -3162,6 +3185,9 @@ impl Exec {
         // refused while this queue's submitted batches still run).
         let pending = if super::tune::pre_inflight() { self.pending.overlaps_any(&r) } else { self.overlaps_pending(&r) };
         if pending || CP_WRITES.latest(&r).is_some() {
+            if big {
+                note_big_refusal(base, size, if pending { "GPU work of this queue writes it" } else { "a deferred CP write" });
+            }
             return None;
         }
         let al = base & !15;
@@ -3183,12 +3209,23 @@ impl Exec {
             }
         }
         let off = self.pre_used.next_multiple_of(self.ring_align);
-        if off + n > PRE_SEG {
+        let Some((src, start, _)) = span(al, n) else {
+            if big {
+                note_big_refusal(base, size, "not one mapping");
+            }
+            return None;
+        };
+        let shared = if share { super::precache::insert(base, size, n) } else { None };
+        // The batch's own segment for copies not shared (big ones are read
+        // in place then).
+        if shared.is_none() && big {
+            note_big_refusal(base, size, "the shared copies declined it");
+            return None;
+        }
+        if shared.is_none() && off + n > PRE_SEG {
             PRE_FULL.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let (src, start, _) = span(al, n)?;
-        let shared = if share { super::precache::insert(base, size, n) } else { None };
         if shared.is_none() && self.slots[self.cur].pre_buf.is_none() {
             match ctx().device_buffer(PRE_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER) {
                 Ok((b, _m)) => self.slots[self.cur].pre_buf = Some(b),
@@ -5087,8 +5124,7 @@ pub fn status() -> String {
             PRE_FULL.load(Ordering::Relaxed)
         )
         + &format!(
-            "    guest memory imports: {} ({} MiB), {} over several mappings, {} dropped after remapping ({} freed, {} MiB; {} waiting); memory: {}
-",
+            "    guest memory imports: {} ({} MiB), {} over several mappings, {} dropped after remapping ({} freed, {} MiB; {} waiting); memory: {}\n",
             IMPORTS.load(Ordering::Relaxed),
             IMPORT_BYTES.load(Ordering::Relaxed) >> 20,
             IMPORTS_MULTI.load(Ordering::Relaxed),
@@ -5098,6 +5134,5 @@ pub fn status() -> String {
             GRAVEYARD_LEN.load(Ordering::Relaxed),
             super::vk::ctx_heaps()
         )
-        + &format!("    gpu completion: {} ms waiting for fences, {} ms in actions
-", FENCE_NS.load(Ordering::Relaxed) / 1_000_000, ACTION_NS.load(Ordering::Relaxed) / 1_000_000)
+        + &format!("    gpu completion: {} ms waiting for fences, {} ms in actions\n", FENCE_NS.load(Ordering::Relaxed) / 1_000_000, ACTION_NS.load(Ordering::Relaxed) / 1_000_000)
 }

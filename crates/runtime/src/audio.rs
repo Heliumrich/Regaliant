@@ -83,14 +83,12 @@ pub fn status() -> String {
     let Some(m) = MIXER.get() else { return String::new() };
     let Some(s) = m.streams.try_lock() else { return String::new() };
     let mut out = format!(
-        "    audio: {:.1} s played, {:.2} s underrun
-",
+        "    audio: {:.1} s played, {:.2} s underrun\n",
         PLAYED_FRAMES.load(Ordering::Relaxed) as f64 / RATE as f64,
         UNDERRUN_FRAMES.load(Ordering::Relaxed) as f64 / RATE as f64
     );
     for (i, st) in s.iter().enumerate() {
-        out.push_str(&format!("    audio stream {i}: {:.1} s pushed, {} grain(s) queued, peak {:.3}
-", st.pushed as f64 / RATE as f64, st.grains.len(), st.peak));
+        out.push_str(&format!("    audio stream {i}: {:.1} s pushed, {} grain(s) queued, peak {:.3}\n", st.pushed as f64 / RATE as f64, st.grains.len(), st.peak));
     }
     out
 }

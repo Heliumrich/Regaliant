@@ -51,8 +51,7 @@ pub fn status() -> String {
         return String::new();
     }
     let mips: Vec<String> = (0..16).filter(|&m| t[3 + m] > 0).map(|m| format!("{m}:{}", t[3 + m])).collect();
-    format!("    LOD statistics measured on the GPU: {} reports, {} with sampled banks, {} banks sampled (finest mip:banks {})
-", t[0], t[1], t[2], mips.join(" "))
+    format!("    LOD statistics measured on the GPU: {} reports, {} with sampled banks, {} banks sampled (finest mip:banks {})\n", t[0], t[1], t[2], mips.join(" "))
 }
 
 /// A readback slot for one GetLodStats copy (waits while all are in use).

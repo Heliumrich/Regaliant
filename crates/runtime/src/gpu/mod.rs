@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 49] = [
+    static ALL: [Tunable; 53] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -76,6 +76,10 @@ pub mod tune {
         Tunable { name: "lean_cmd", env: "DS_LEAN_CMD", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "exact_big", env: "DS_EXACT_BIG", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lean_notes", env: "DS_LEAN_NOTES", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_keep", env: "DS_PRE_KEEP", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_big_max", env: "DS_PRE_BIG_MAX", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_big_mib", env: "DS_PRE_BIG_MIB", default: 1024, value: AtomicU64::new(UNSET) },
+        Tunable { name: "home_reads", env: "DS_HOME_READS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     #[inline]
@@ -481,6 +485,44 @@ pub mod tune {
     #[inline]
     pub fn lean_notes() -> bool {
         get(48) != 0
+    }
+
+    /// The shared batch-start copies evict the oldest chunk no batch binds
+    /// (not the oldest, often bound by every frame's batches), and a range
+    /// another batch's unsubmitted prologue copies is copied privately
+    /// instead of replacing that entry; 0: as before (for A/B).
+    #[inline]
+    pub fn pre_keep() -> bool {
+        get(49) != 0
+    }
+
+    /// Read-only buffer bindings over `pre_max` and up to this many bytes are
+    /// copied into a shared video-memory slot of their own (`precache`,
+    /// within `pre_big_mib`) instead of being read in place across PCIe.
+    /// Default 0 (off): in the courtyard such ranges are GPU-written every
+    /// frame (their copies were dropped) and the replay A/B showed no gain
+    /// (GPU time 1.002 and 1.014, run 20261013-025441).
+    #[inline]
+    pub fn pre_big_max() -> u64 {
+        get(50)
+    }
+
+    /// Video memory for those copies (MiB).
+    #[inline]
+    pub fn pre_big_mib() -> u64 {
+        get(51)
+    }
+
+    /// A read-only buffer binding over `pre_max` inside a range GPU work
+    /// writes through large bindings gives that range a video-memory home
+    /// (`homes::read_use`), like an index buffer there does. Default 0 (only
+    /// index buffers do): in the courtyard it made five more homes (427 MiB,
+    /// no write-backs) and left their passes' GPU times unchanged (stamped
+    /// replays 20261013-023246 / -030557: the readers read those buffers
+    /// sparsely).
+    #[inline]
+    pub fn home_reads() -> bool {
+        get(52) != 0
     }
 
     /// A switch's value by name; None if unknown.
@@ -1246,8 +1288,7 @@ pub fn status_ex(with_stacks: bool) -> String {
         cp::PROMISED.load(Ordering::Relaxed),
         exec::FOREIGN_WAITS.load(Ordering::Relaxed)
     ));
-    s.push_str(&format!("    {}
-", throttle_status()));
+    s.push_str(&format!("    {}\n", throttle_status()));
     s.push_str(&exec::status());
     s.push_str(&profile_summary());
     s.push_str(&exec::shader_profile());
