@@ -302,6 +302,13 @@ pub mod tune {
         get(25) != 0
     }
 
+    /// `prep_cache`'s mode: 1 the latest preparation per stage, 2 a frame's
+    /// (faster in replayed frames, slower live: FINDINGS.md 2026-10-13).
+    #[inline]
+    pub fn prep_cache_mode() -> u64 {
+        get(25)
+    }
+
     /// The per-thread caches of readable guest ranges (`mem::readable_span`)
     /// keep the runs a mapping change did not touch; 0 empties them at every
     /// change (the earlier behavior, for A/B).
@@ -1271,6 +1278,9 @@ pub fn profile_report() -> String {
     s.push_str(&par::status());
     s.push_str(&images::memo_stats_line());
     s.push_str(&exec::pre_window_line());
+    if !exec::profiling_on() {
+        s.push_str(&shaders::prep_cache_line());
+    }
     s.push_str(&threadcpu::window_line());
     s
 }

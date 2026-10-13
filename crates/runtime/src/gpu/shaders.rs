@@ -1024,6 +1024,14 @@ pub fn repeats_line() -> String {
     )
 }
 
+/// Stage preparations served from the cache since `profile reset` (the
+/// sampler-only report, which has no `repeats_line`).
+pub fn prep_cache_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (h, m) = (PREP_HITS.load(Relaxed), PREP_MISSES.load(Relaxed));
+    format!("    stage preparations: served from the cache {h} of {} (prep_cache {})\n", h + m, super::tune::prep_cache_mode())
+}
+
 pub fn reset_repeats() {
     for r in CROSS_FRAME.iter() {
         for c in r.iter() {
@@ -1050,13 +1058,28 @@ pub fn reset_repeats() {
 /// half of the draws' vertex and pixel preparations repeat that way (run
 /// 20261011-091944); dispatches do not.
 struct PrepEntry {
-    key: u64,
+    /// Its program and plan, besides the key (a hash).
+    addr: u64,
+    plan_key: u64,
     /// Validated by the words it read (`words_unchanged`).
     prepared: Prepared,
 }
 
+/// Entries kept per stage and thread with `tune prep_cache 2` (cleared when
+/// full): a frame's distinct preparations on one recording thread.
+const PREP_CACHE_MAX: usize = 2048;
+
 thread_local! {
-    static PREP_CACHE: std::cell::RefCell<[Option<PrepEntry>; 3]> = const { std::cell::RefCell::new([None, None, None]) };
+    /// Vertex and pixel preparations by key (`prepare`): the latest only
+    /// (`tune prep_cache 1`) or up to PREP_CACHE_MAX (2): most preparations
+    /// that miss the latest repeat one of the previous frame (pixel 57%,
+    /// vertex 24%; run 20261013-104455). Live, 2 serves 59% instead of 43%
+    /// yet costs ~6% more CPU per command (inserts, re-validations after
+    /// mapping changes, a colder working set; run 20261013-115322).
+    static PREP_CACHE: std::cell::RefCell<[super::fx::Map<u64, PrepEntry>; 2]> = std::cell::RefCell::new([super::fx::Map::default(), super::fx::Map::default()]);
+    /// The latest preparation per stage (`tune prep_cache 1`; kept apart so
+    /// that alternating the modes in a replay A/B leaves the map as it was).
+    static PREP_LATEST: std::cell::RefCell<[Option<(u64, PrepEntry)>; 2]> = const { std::cell::RefCell::new([None, None]) };
     static LOCAL_DEPS: std::cell::RefCell<super::fx::Map<u64, u32>> = std::cell::RefCell::new(super::fx::Map::default());
 }
 /// Preparations served from / missing PREP_CACHE (diagnostics).
@@ -1145,6 +1168,26 @@ fn prep_compare(hit: &Prepared, full: &Prepared) {
     }
 }
 
+/// A cached preparation for a call with user data `user`, if the guest words
+/// it read and its depth-view decisions (part of its translation) still hold.
+fn reuse(e: &mut PrepEntry, user: &[u32]) -> Option<Prepared> {
+    let map_gen = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
+    let images_gen = super::images::GPU_IMAGES_GEN.load(std::sync::atomic::Ordering::Acquire);
+    if !words_unchanged(&e.prepared) || !depth_views_hold(&e.prepared) {
+        return None;
+    }
+    // Readable at this mapping, the same depth views at these images: later
+    // reuses skip those checks.
+    e.prepared.map_gen = map_gen;
+    e.prepared.images_gen = images_gen;
+    let mut p = e.prepared.clone();
+    for (i, w) in p.sgpr_data.iter_mut().enumerate().take(translate::SGPR_DATA_USER as usize) {
+        *w = user.get(i).copied().unwrap_or(0);
+    }
+    p.user = user.to_vec();
+    Some(p)
+}
+
 fn stage_slot(s: Stage) -> usize {
     match s {
         Stage::Vertex => 0,
@@ -1214,33 +1257,20 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
             }
         }
         spec.hash(&mut h);
+        // The depth-view decisions, the one image-cache input, are checked
+        // on reuse (`depth_views_hold`): entries outlive image lookups
+        // changing as textures stream.
         h.write_u8(super::tune::cmp_emulate() as u8);
-        h.write_u64(super::images::LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire));
         h.finish()
     };
-    let hit = PREP_CACHE.with(|c| {
-        if !cacheable {
-            return None;
-        }
-        let mut c = c.borrow_mut();
-        let e = c[slot].as_mut().filter(|e| e.key == prep_key)?;
-        // The depth-view decisions are part of its translation.
-        let map_gen = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
-        let images_gen = super::images::GPU_IMAGES_GEN.load(std::sync::atomic::Ordering::Acquire);
-        if !words_unchanged(&e.prepared) || !depth_views_hold(&e.prepared) {
-            return None;
-        }
-        // Readable at this mapping, the same depth views at these images:
-        // later hits skip those checks.
-        e.prepared.map_gen = map_gen;
-        e.prepared.images_gen = images_gen;
-        let mut p = e.prepared.clone();
-        for (i, w) in p.sgpr_data.iter_mut().enumerate().take(translate::SGPR_DATA_USER as usize) {
-            *w = user.get(i).copied().unwrap_or(0);
-        }
-        p.user = user.to_vec();
-        Some(p)
-    });
+    let same = |e: &PrepEntry| e.addr == addr && e.plan_key == plan_key;
+    let hit = if !cacheable {
+        None
+    } else if super::tune::prep_cache_mode() >= 2 {
+        PREP_CACHE.with(|c| c.borrow_mut()[slot].get_mut(&prep_key).filter(|e| same(e)).and_then(|e| reuse(e, user)))
+    } else {
+        PREP_LATEST.with(|l| l.borrow_mut()[slot].as_mut().filter(|(k, e)| *k == prep_key && same(e)).and_then(|(_, e)| reuse(e, user)))
+    };
     let mut checked_hit = None;
     let hit = hit.and_then(|p| {
         PREP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1491,8 +1521,18 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
     }
     if cacheable {
         // The words it read are the cache's check (no second read).
-        let e = PrepEntry { key: prep_key, prepared: prepared.clone() };
-        PREP_CACHE.with(|c| c.borrow_mut()[slot] = Some(e));
+        let e = PrepEntry { addr, plan_key, prepared: prepared.clone() };
+        if super::tune::prep_cache_mode() >= 2 {
+            PREP_CACHE.with(|c| {
+                let m = &mut c.borrow_mut()[slot];
+                if m.len() >= PREP_CACHE_MAX {
+                    m.clear();
+                }
+                m.insert(prep_key, e);
+            });
+        } else {
+            PREP_LATEST.with(|l| l.borrow_mut()[slot] = Some((prep_key, e)));
+        }
     }
     if let Some(k) = repeat_key {
         let tr = &prepared.tr;

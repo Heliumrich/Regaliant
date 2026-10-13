@@ -15,8 +15,8 @@ use parking_lot::Mutex;
 use super::fx::Map as HashMap;
 
 /// Changes whenever what `Images::lookup` finds for a key may change (images
-/// added or removed, an image turning GPU-written, stencil links): cached
-/// shader preparations that decided depth views from it are revalidated.
+/// added or removed, an image turning GPU-written, stencil links): the
+/// per-thread lookup memos (`tls`) and the global write notes depend on it.
 pub static LOOKUP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 /// Changes when the GPU-written images (render targets, storage images,
 /// their aliases at the same addresses) change: what `Images::depth_view`
