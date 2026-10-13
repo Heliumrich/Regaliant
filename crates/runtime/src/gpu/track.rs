@@ -607,6 +607,7 @@ pub const REMAP_PROTECT: u8 = 2;
 /// on re-arming) and overlapping regions are dirty.
 pub fn remapped(base: u64, len: u64, op: u8) {
     note_event(["commit", "decommit", "protection"][(op as usize).min(2)], base, len);
+    super::exec::note_remap_over_imports(base, len, op);
     super::precache::invalidate(base, len);
     super::homes::remapped(base, len);
     RESET_GEN.fetch_add(1, Ordering::Release);

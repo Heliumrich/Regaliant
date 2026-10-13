@@ -235,8 +235,29 @@ static SPANS_FREED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// batch that began after an import was dropped cannot use it.
 static EXEC_GENS: Mutex<Vec<std::sync::Arc<AtomicU64>>> = Mutex::new(Vec::new());
 
-/// Frees dropped imports no batch can use any more (completion thread).
+/// Whether an import, in use or dropped and not freed yet, may cover guest
+/// [base, base+len): true also while the lists are busy (callers inside the
+/// memory manager's lock only try them: `import_span` holds them while it
+/// takes that lock).
+pub(crate) fn imports_may_cover(base: u64, len: u64) -> bool {
+    let end = base.saturating_add(len);
+    let Some(g) = SPANS.try_read() else { return true };
+    if g.iter().any(|s| s.start < end && base < s.end) {
+        return true;
+    }
+    drop(g);
+    let Some(gy) = GRAVEYARD.try_lock() else { return true };
+    gy.iter().any(|d| d.span.start < end && base < d.span.end)
+}
+
+/// Frees dropped imports no batch can use any more (completion thread), then
+/// decommits the guest ranges that waited for them (`mem::retry_deferred`).
 fn reap_spans() {
+    reap_dead_spans();
+    crate::mem::retry_deferred();
+}
+
+fn reap_dead_spans() {
     if GRAVEYARD_LEN.load(Ordering::Acquire) == 0 {
         return;
     }
@@ -468,6 +489,57 @@ fn unmapped_reason(base: u64, size: u64) -> String {
         }
     }
     "mapped: the import failed".into()
+}
+
+/// Mapping changes of guest memory inside a live import (diagnostics of
+/// device losses at level loads): counts by kind (`track::REMAP_*`), and the
+/// latest ones ((when, kind, base, len, import start, import end); no more
+/// are kept once the device is lost, so they show what preceded it).
+static REMAPS_OVER_IMPORTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static REMAP_RING: Mutex<Option<std::collections::VecDeque<(std::time::Instant, u8, u64, u64, u64, u64)>>> = Mutex::new(None);
+
+/// A commit, decommit or protection change of guest [base, base+len)
+/// (`track::remapped`, inside the memory manager's lock: the import list is
+/// only tried, never waited for).
+pub(super) fn note_remap_over_imports(base: u64, len: u64, op: u8) {
+    if DEVICE_LOST.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(g) = SPANS.try_read() else { return };
+    let end = base.saturating_add(len);
+    let hit = g.iter().find(|s| s.valid && s.start < end && base < s.end).map(|s| (s.start, s.end));
+    drop(g);
+    let Some((s, e)) = hit else { return };
+    REMAPS_OVER_IMPORTS[(op as usize).min(2)].fetch_add(1, Ordering::Relaxed);
+    let mut r = REMAP_RING.lock();
+    let r = r.get_or_insert_with(Default::default);
+    if r.len() >= 64 {
+        r.pop_front();
+    }
+    r.push_back((std::time::Instant::now(), op, base, len, s, e));
+}
+
+/// One status line: mapping changes inside live imports, and the latest.
+fn remaps_over_imports_line() -> String {
+    let n: Vec<u64> = REMAPS_OVER_IMPORTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let last: Vec<String> = REMAP_RING
+        .lock()
+        .as_ref()
+        .map(|r| {
+            r.iter()
+                .rev()
+                .take(8)
+                .map(|x| format!("{} {:#x}+{:#x} in {:#x}..{:#x} {:.1} s ago", ["commit", "decommit", "protection"][(x.1 as usize).min(2)], x.2, x.3, x.4, x.5, x.0.elapsed().as_secs_f64()))
+                .collect()
+        })
+        .unwrap_or_default();
+    format!(
+        "    mapping changes inside live imports: commits {}, decommits {}, protection changes {}; latest (before a device loss, if any): {}\n",
+        n[0],
+        n[1],
+        n[2],
+        if last.is_empty() { "none".to_string() } else { last.join("; ") }
+    )
 }
 
 /// Drops imports whose guest pages were committed or decommitted since.
@@ -5524,5 +5596,6 @@ pub fn status() -> String {
             GRAVEYARD_LEN.load(Ordering::Relaxed),
             super::vk::ctx_heaps()
         )
+        + &remaps_over_imports_line()
         + &format!("    gpu completion: {} ms waiting for fences, {} ms in actions\n", FENCE_NS.load(Ordering::Relaxed) / 1_000_000, ACTION_NS.load(Ordering::Relaxed) / 1_000_000)
 }

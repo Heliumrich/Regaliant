@@ -93,7 +93,7 @@ pub fn remap_status() -> String {
     let r = REMAP.lock();
     let o = std::sync::atomic::Ordering::Relaxed;
     format!(
-        "    direct memory remaps: {} in place ({} MiB, zeroed here), {} of pages last mapped elsewhere ({} MiB, contents not carried); mapping changes {}; readable-range checks {} ({} cache misses)
+        "    direct memory remaps: {} in place ({} MiB, zeroed here), {} of pages last mapped elsewhere ({} MiB, contents not carried); mapping changes {}; readable-range checks {} ({} cache misses); decommits deferred under GPU imports {} ({} MiB; {} done later, {} mapped again first, {} waiting)
 ",
         r.in_place,
         r.in_place_bytes >> 20,
@@ -101,7 +101,12 @@ pub fn remap_status() -> String {
         r.moved_bytes >> 20,
         MAP_GEN.load(o),
         SPAN_CALLS.load(o),
-        SPAN_MISSES.load(o)
+        SPAN_MISSES.load(o),
+        DEFERRED_STATS[0].load(o),
+        DEFERRED_STATS[3].load(o) >> 20,
+        DEFERRED_STATS[1].load(o),
+        DEFERRED_STATS[2].load(o),
+        DEFERRED_LEN.load(o)
     )
 }
 
@@ -461,8 +466,93 @@ pub fn reserve_guest_range() -> Result<(), String> {
 fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_COMMIT);
     repaged(addr, size);
+    // Parts whose decommit was deferred are still committed with their old
+    // contents: a new mapping starts zeroed, as after a decommit.
+    let stale = cancel_deferred(addr, addr + size);
+    if !stale.is_empty() {
+        let _readers_out = GUEST_READERS.write();
+        for &(a, e) in &stale {
+            let p = unsafe { VirtualAlloc(a as _, (e - a) as usize, MEM_COMMIT, PAGE_READWRITE) };
+            if !p.is_null() {
+                unsafe { std::ptr::write_bytes(a as *mut u8, 0, (e - a) as usize) };
+            }
+        }
+    }
     let p = unsafe { VirtualAlloc(addr as _, size as usize, MEM_COMMIT, win_prot(prot)) };
     if p.is_null() { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
+}
+
+/// Guest ranges [start, end) unmapped while a GPU import covered them: their
+/// host pages stay committed until no import does (`retry_deferred`). A
+/// decommit under an import that batches in flight still used lost the
+/// device at level loads (the title unmaps memory it is done with inside
+/// the 64 MiB windows the GPU imports; FINDINGS.md 2026-10-13).
+static DEFERRED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+static DEFERRED_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// [deferred, decommitted later, mapped again first, bytes deferred].
+pub static DEFERRED_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Decommits under GPU imports wait for them (`DS_DEFER_DECOMMIT=0`: at
+/// once, as before; for A/B).
+fn defer_decommits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_DEFER_DECOMMIT").ok().as_deref() != Some("0"))
+}
+
+/// Removes [start, end) from the deferred decommits; the parts that were
+/// deferred (still committed).
+fn cancel_deferred(start: u64, end: u64) -> Vec<(u64, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if DEFERRED_LEN.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
+    let mut d = DEFERRED.lock();
+    let mut hit = Vec::new();
+    let mut keep = Vec::with_capacity(d.len());
+    for &(a, e) in d.iter() {
+        if e <= start || end <= a {
+            keep.push((a, e));
+            continue;
+        }
+        hit.push((a.max(start), e.min(end)));
+        if a < start {
+            keep.push((a, start));
+        }
+        if end < e {
+            keep.push((end, e));
+        }
+    }
+    if !hit.is_empty() {
+        DEFERRED_STATS[2].fetch_add(hit.len() as u64, Relaxed);
+    }
+    *d = keep;
+    DEFERRED_LEN.store(d.len(), std::sync::atomic::Ordering::Release);
+    hit
+}
+
+/// Decommits the deferred ranges no import covers any more (the GPU
+/// completion thread, after freeing dropped imports).
+pub fn retry_deferred() {
+    if DEFERRED_LEN.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    // The memory manager's lock: no mapping changes meanwhile.
+    let _st = MEM.lock();
+    let mut d = DEFERRED.lock();
+    let mut keep = Vec::new();
+    for &(a, e) in d.iter() {
+        if crate::gpu::imports_may_cover(a, e - a) {
+            keep.push((a, e));
+            continue;
+        }
+        let _readers_out = GUEST_READERS.write();
+        unsafe {
+            VirtualFree(a as _, (e - a) as usize, MEM_DECOMMIT);
+        }
+        DEFERRED_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    *d = keep;
+    DEFERRED_LEN.store(d.len(), std::sync::atomic::Ordering::Release);
 }
 
 /// Bulk readers of guest memory on our threads (texture uploads) hold this
@@ -500,6 +590,14 @@ pub fn os_readable(a: u64, len: u64) -> bool {
 fn host_decommit(addr: u64, size: u64) {
     crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_DECOMMIT);
     repaged(addr, size);
+    if defer_decommits() && crate::gpu::imports_may_cover(addr, size) {
+        let mut d = DEFERRED.lock();
+        d.push((addr, addr + size));
+        DEFERRED_LEN.store(d.len(), std::sync::atomic::Ordering::Release);
+        DEFERRED_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        DEFERRED_STATS[3].fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     let _readers_out = GUEST_READERS.write();
     unsafe {
         VirtualFree(addr as _, size as usize, MEM_DECOMMIT);

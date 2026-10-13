@@ -632,6 +632,11 @@ pub mod ahead;
 pub mod par;
 pub mod precache;
 pub mod exec;
+
+/// Whether a GPU import may cover guest [base, base+len) (`exec`).
+pub(crate) fn imports_may_cover(base: u64, len: u64) -> bool {
+    exec::imports_may_cover(base, len)
+}
 pub mod pcache;
 pub mod lodstats;
 pub mod pstats;
