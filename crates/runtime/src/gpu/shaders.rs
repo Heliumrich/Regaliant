@@ -1355,6 +1355,7 @@ fn prepare(addr: u64, insts: std::rc::Rc<Arc<Vec<rdna::Inst>>>, code_hash: u64, 
     let mut resources = Vec::with_capacity(plan.resources.len());
     let mut res_addrs = Vec::with_capacity(plan.resources.len());
     spec.resources.clear();
+    spec.resources.reserve(plan.resources.len());
     for (i, res) in plan.resources.iter().enumerate() {
         let mut w = [0u32; 8];
         let src = match res.dwords.first() {
