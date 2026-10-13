@@ -1709,6 +1709,11 @@ static PRE_FULL: AtomicU64 = AtomicU64::new(0);
 /// batches with such copies, batches that waited only for such copies
 /// earlier batches made], and their values at the last `profile reset`.
 static XCOPY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Why `speculate` left a command to wait (diagnostics, since boot): stale
+/// home, a data load this batch writes or not one mapping, a parallel
+/// chunk's own writes, a stage that writes memory or images, a shader that
+/// mispredicted.
+static SPEC_REFUSED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static XCOPY_SNAP: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// GPU time of the batches' copy prologues (DS_PROFILE_GPU), ns.
 static PRE_NS: AtomicU64 = AtomicU64::new(0);
@@ -2070,21 +2075,73 @@ struct SpecCheck {
 
 static SPEC_CHECKS: Mutex<Vec<SpecCheck>> = Mutex::new(Vec::new());
 static SPEC_PENDING: AtomicU64 = AtomicU64::new(0);
-/// Shaders whose speculation was wrong once: they wait again.
-static NO_SPEC: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+/// Shaders whose speculation was wrong, and the frame: they wait again for
+/// NO_SPEC_FRAMES frames (mispredictions came at level loads, when the
+/// words change; the same shaders' words held in every wait since).
+static NO_SPEC: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
+const NO_SPEC_FRAMES: u64 = 600;
+
+/// Whether shader `addr` mispredicted lately (`NO_SPEC`).
+fn no_spec(addr: u64) -> bool {
+    let mut g = NO_SPEC.lock();
+    let Some(m) = g.as_mut() else { return false };
+    match m.get(&addr) {
+        Some(&f) if f + NO_SPEC_FRAMES > super::FRAMES.load(Ordering::Relaxed) => true,
+        Some(_) => {
+            m.remove(&addr);
+            false
+        }
+        None => false,
+    }
+}
 /// [stages used as prepared (checked), checks that held, checks that
 /// failed, commands that did not wait, data loads copied by the prologue].
 static SPEC_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// A data-only load the batch prologue copies from guest memory into a
-/// stage's SGPR data (`Exec::speculate`): stage index, dword index in the
-/// SGPR data, the imported guest buffer and offset, bytes.
+/// stage's SGPR data, after the submitted work writing it (`Exec::
+/// speculate`): stage index, dword index in the SGPR data, the imported
+/// guest buffer and offset, bytes.
 pub(super) struct SgprPatch {
     stage: usize,
     sgpr: u32,
     src: vk::Buffer,
     src_off: u64,
     bytes: u64,
+}
+
+/// Speculations on words the batch being recorded writes (`Exec::
+/// speculate`; checked once it completed).
+static SPEC_OWN: AtomicU64 = AtomicU64::new(0);
+
+/// Whether every dword of `reads` lies in the descriptor (read from memory)
+/// of a resource stage `p` only reads: a wrong one of those reads wrong data
+/// at worst; pointer words and the descriptors of what it writes are not.
+fn read_only_descriptors(p: &Prepared, reads: &[(u64, u64)]) -> bool {
+    use rdna::analysis::ResKind;
+    let res = &p.tr.plan.resources;
+    let mut ro: Vec<(u64, u64)> = Vec::new();
+    for (r, a) in res.iter().zip(p.res_addrs.iter()) {
+        let Some(a) = *a else { continue };
+        let n = 4 * r.dwords.len() as u64;
+        if r.written || matches!(r.kind, ResKind::ImageTable | ResKind::Global) {
+            if reads.iter().any(|&(b, m)| b < a + n && a < b + m) {
+                return false;
+            }
+        } else {
+            ro.push((a, n));
+        }
+    }
+    reads.iter().all(|&(b, m)| {
+        let mut d = b;
+        while d < b + m {
+            if !ro.iter().any(|&(a, n)| d >= a && d + 4 <= a + n) {
+                return false;
+            }
+            d += 4;
+        }
+        true
+    })
 }
 
 /// Checks the speculations whose batch completed (completion thread).
@@ -2121,9 +2178,9 @@ fn check_speculations(done: u64) {
             SPEC_STATS[1].fetch_add(1, Ordering::Relaxed);
         } else {
             let n = SPEC_STATS[2].fetch_add(1, Ordering::Relaxed);
-            NO_SPEC.lock().get_or_insert_with(HashSet::new).insert(c.shader);
+            NO_SPEC.lock().get_or_insert_with(HashMap::new).insert(c.shader, super::FRAMES.load(Ordering::Relaxed));
             if n < 20 {
-                crate::info!("gpu: a stage used as prepared read words GPU work then changed (shader {:#x}, reads {:x?}); it waits from now on", c.shader, c.reads);
+                crate::info!("gpu: a stage used as prepared read words GPU work then changed (shader {:#x}, reads {:x?}); it waits for {NO_SPEC_FRAMES} frames", c.shader, c.reads);
             }
         }
     }
@@ -3120,8 +3177,19 @@ pub fn shader_profile() -> String {
     {
         let n: Vec<u64> = SYNC_WHY.iter().zip(SYNC_WHY_AT_RESET.iter()).map(|(c, r)| c.load(Ordering::Relaxed).saturating_sub(r.load(Ordering::Relaxed))).collect();
         s.push_str(&format!(
-            "    command-processor waits for GPU work: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices\n",
-            n[0], n[1], n[2], n[3], n[4], n[5]
+            "    command-processor waits for GPU work: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices; speculation (since boot): on words the recording batch writes {}; refused: stale home {}, data this batch writes or not one mapping {}, a parallel chunk's own writes {}, a stage writing memory or images {}, mispredicting shader {}\n",
+            n[0],
+            n[1],
+            n[2],
+            n[3],
+            n[4],
+            n[5],
+            SPEC_OWN.load(Ordering::Relaxed),
+            SPEC_REFUSED[0].load(Ordering::Relaxed),
+            SPEC_REFUSED[1].load(Ordering::Relaxed),
+            SPEC_REFUSED[2].load(Ordering::Relaxed),
+            SPEC_REFUSED[3].load(Ordering::Relaxed),
+            SPEC_REFUSED[4].load(Ordering::Relaxed)
         ));
         let w: Vec<u64> = READ_WAIT_WORDS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         s.push_str(&format!(
@@ -3324,6 +3392,9 @@ pub struct Exec {
     shared_kept: Vec<u64>,
     /// A draw's texture ranges (`texture_ranges_into`), reused per draw.
     tex_scratch: Vec<((u64, u64), super::desc::Tsharp)>,
+    /// Speculations on words this batch writes (`speculate`): checked once
+    /// it completed, its sequence set at submission.
+    own_checks: Vec<SpecCheck>,
 }
 
 unsafe impl Send for Exec {}
@@ -3443,6 +3514,7 @@ impl Exec {
                 shared_pending: Vec::new(),
                 shared_kept: Vec::new(),
                 tex_scratch: Vec::new(),
+                own_checks: Vec::new(),
             })
         }
     }
@@ -3697,6 +3769,11 @@ impl Exec {
         self.slots[i].seq = seq;
         self.open_gen.store(u64::MAX, Ordering::SeqCst);
         super::precache::submitted(&std::mem::take(&mut self.shared_pending), seq);
+        if !self.own_checks.is_empty() {
+            let mut g = SPEC_CHECKS.lock();
+            g.extend(self.own_checks.drain(..).map(|c| SpecCheck { seq, ..c }));
+            SPEC_PENDING.store(g.len() as u64, Ordering::Release);
+        }
         st.mark(6);
         // The batch's writes are noted before its labels are promised: a
         // queue that passes a wait on one sees them (its copies of those
@@ -3762,6 +3839,7 @@ impl Exec {
         self.snap_used = 0;
         self.snaps.clear();
         let _ = self.end_pre();
+        self.own_checks.clear();
         self.xcopies.clear();
         self.copy_wait = 0;
         self.pre_used = 0;
@@ -4519,6 +4597,15 @@ impl Exec {
     }
 
     /// `sync_for_reads`, counted by the reason (`SYNC_WHY`) when it waited.
+    /// `sync_for` of a stage's reads (`tune skip_read_waits`: none, a timing
+    /// diagnosis with wrong results).
+    pub(super) fn sync_for_stage(&mut self, reads: &[(u64, u64)], why: usize) -> bool {
+        if super::tune::skip_read_waits() {
+            return false;
+        }
+        self.sync_for(reads, why)
+    }
+
     pub fn sync_for(&mut self, reads: &[(u64, u64)], why: usize) -> bool {
         // DS_TRACE_SYNC=1: the first 400 waits, with the read that collided
         // and the batch writing it.
@@ -4587,28 +4674,46 @@ impl Exec {
         if !super::tune::spec_reads() {
             return None;
         }
+        if stages.iter().any(|p| super::homes::any_stale(&p.reads)) {
+            SPEC_REFUSED[0].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         let done = done_seq();
         self.inflight.prune(done);
         let writer = |s: &Self, r: &[(u64, u64)]| s.inflight.latest(r, done).max(INFLIGHT.latest(r)).filter(|&x| x > done);
         let mut patches = Vec::new();
         let mut checks: Vec<SpecCheck> = Vec::new();
+        let mut own: Vec<SpecCheck> = Vec::new();
         let mut any = false;
         for (k, p) in stages.iter().enumerate() {
             if p.reads.is_empty() {
                 continue;
             }
-            if self.pending.overlaps_any(&p.reads) || super::homes::any_stale(&p.reads) {
-                return None;
-            }
-            if writer(self, &p.reads).is_none() {
+            let pending = self.pending.overlaps_any(&p.reads);
+            if !pending && writer(self, &p.reads).is_none() {
                 continue;
+            }
+            // A parallel chunk's batch gets its sequence later (its main
+            // command processor submits it): such reads wait there.
+            if pending && self.deferred {
+                SPEC_REFUSED[2].fetch_add(1, Ordering::Relaxed);
+                return None;
             }
             any = true;
             let mut data = vec![false; p.words.len()];
             for d in p.data_loads.iter() {
                 let bytes = 4 * d.dwords as u64;
+                if self.pending.overlaps(d.addr, bytes) {
+                    // Data this batch writes: no copy point before the stage
+                    // outside rendering (`tune gpu_loads` reads it on the GPU).
+                    SPEC_REFUSED[1].fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
                 if writer(self, &[(d.addr, bytes)]).is_some() {
-                    let (src, start, _) = span(d.addr, bytes)?;
+                    let Some((src, start, _)) = span(d.addr, bytes) else {
+                        SPEC_REFUSED[1].fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    };
                     patches.push(SgprPatch { stage: k, sgpr: d.sgpr, src, src_off: d.addr - start, bytes });
                 }
                 for w in d.word as usize..(d.word + d.dwords) as usize {
@@ -4617,7 +4722,9 @@ impl Exec {
                     }
                 }
             }
-            // The other words, where that work writes: used as read, checked.
+            // The other words, where that work writes: used as read, checked
+            // once it completed; not for a stage that writes memory or images
+            // (a wrong descriptor there would corrupt them).
             let (mut reads, mut words): (Vec<(u64, u64)>, Vec<u32>) = (Vec::new(), Vec::new());
             let mut i = 0usize;
             for &(a, n) in p.reads.iter() {
@@ -4633,19 +4740,35 @@ impl Exec {
                     i += 1;
                 }
             }
-            if let Some(s) = writer(self, &reads) {
-                if NO_SPEC.lock().as_ref().is_some_and(|n| n.contains(&p.addr)) {
+            let own_writes = self.pending.overlaps_any(&reads);
+            let submitted = writer(self, &reads);
+            if own_writes || submitted.is_some() {
+                if p.tr.plan.resources.iter().any(|r| r.written) && !read_only_descriptors(p, &reads) {
+                    SPEC_REFUSED[3].fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
-                checks.push(SpecCheck { seq: s, shader: p.addr, reads, words });
+                if no_spec(p.addr) {
+                    SPEC_REFUSED[4].fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                match submitted.filter(|_| !own_writes) {
+                    Some(s) => checks.push(SpecCheck { seq: s, shader: p.addr, reads, words }),
+                    // This batch writes them: checked once it completed (its
+                    // sequence comes with its submission).
+                    None => own.push(SpecCheck { seq: 0, shader: p.addr, reads, words }),
+                }
             }
         }
         if !any {
             return None;
         }
-        SPEC_STATS[0].fetch_add(checks.len() as u64, Ordering::Relaxed);
+        SPEC_STATS[0].fetch_add((checks.len() + own.len()) as u64, Ordering::Relaxed);
         SPEC_STATS[3].fetch_add(1, Ordering::Relaxed);
         SPEC_STATS[4].fetch_add(patches.len() as u64, Ordering::Relaxed);
+        if !own.is_empty() {
+            SPEC_OWN.fetch_add(own.len() as u64, Ordering::Relaxed);
+            self.own_checks.extend(own);
+        }
         if !checks.is_empty() {
             let mut g = SPEC_CHECKS.lock();
             g.extend(checks);
@@ -4791,7 +4914,19 @@ impl Exec {
     }
 
     /// A guest range the batch being recorded writes.
+    #[track_caller]
     pub(super) fn note_write(&mut self, a: u64, n: u64) {
+        // DS_TRACE_NOTE=<hex address>: the first 40 notes covering it
+        // (diagnosis: who writes a word stage preparations wait for).
+        static AT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let at = *AT.get_or_init(|| std::env::var("DS_TRACE_NOTE").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0));
+        if at != 0 && a <= at && at < a.saturating_add(n) {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 40 {
+                let l = std::panic::Location::caller();
+                crate::info!("gpu[{}]: note_write {a:#x}+{n:#x} covers {at:#x} at {}:{} (last shader {:#x}, {} commands in the batch)", self.name, l.file(), l.line(), self.batch_shaders.last().copied().unwrap_or(0), self.batch_shaders.len());
+            }
+        }
         super::precache::invalidate_gpu(a, n);
         self.pending.insert(a, n);
         self.own_gen += 1;
@@ -5779,7 +5914,7 @@ impl Exec {
         lap.mark(0);
         self.sync_readers = [p.addr, 0];
         let patches = self.speculate(&[&p]);
-        if patches.is_none() && self.sync_for(&p.reads, SYNC_CS_READS) {
+        if patches.is_none() && self.sync_for_stage(&p.reads, SYNC_CS_READS) {
             if self.stopped {
                 return Err(STOPPED.into());
             }

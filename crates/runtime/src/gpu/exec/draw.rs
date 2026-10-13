@@ -563,7 +563,7 @@ impl Exec {
             Some(p) => self.speculate(&[&vs, p]),
             None => self.speculate(&[&vs]),
         };
-        let waited = patches.is_none() && (self.sync_for(&vs.reads, SYNC_DRAW_READS) | ps.as_ref().is_some_and(|p| self.sync_for(&p.reads, SYNC_DRAW_READS)));
+        let waited = patches.is_none() && (self.sync_for_stage(&vs.reads, SYNC_DRAW_READS) | ps.as_ref().is_some_and(|p| self.sync_for_stage(&p.reads, SYNC_DRAW_READS)));
         if self.stopped {
             return Err(super::STOPPED.into());
         }

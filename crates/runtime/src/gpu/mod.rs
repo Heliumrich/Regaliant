@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 66] = [
+    static ALL: [Tunable; 67] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -93,6 +93,7 @@ pub mod tune {
         Tunable { name: "push_partial", env: "DS_PUSH_PARTIAL", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "per_lane", env: "DS_PER_LANE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "copy_queue", env: "DS_COPY_QUEUE_USE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "skip_read_waits", env: "DS_SKIP_READ_WAITS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -690,6 +691,14 @@ pub mod tune {
     pub fn copy_queue() -> bool {
         get(65) != 0
     }
+
+    /// Diagnosis (timing only, wrong results): stage preparations do not
+    /// wait for GPU work writing what they read (they use memory as it is).
+    #[inline]
+    pub fn skip_read_waits() -> bool {
+        get(66) != 0
+    }
+
 
     /// A switch's value by name; None if unknown.
     pub fn value(name: &str) -> Option<u64> {
