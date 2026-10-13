@@ -9,7 +9,8 @@
 //! `tune pre_share_min` bytes now go to shared video-memory chunks and stay
 //! there: a later batch of any queue binds the copy instead of copying again,
 //! once the batch whose prologue makes it is submitted (so the copy precedes
-//! it on the one Vulkan queue) and while the range is unchanged:
+//! it on the main Vulkan queue, or the binding batch waits for it on the copy
+//! queue's timeline: `lookup`) and while the range is unchanged:
 //!
 //! - CPU writes: the guest range is write-watched (`mem::take_written`). An
 //!   entry is checked once per synchronization epoch (`end_scope`: a title
@@ -88,6 +89,9 @@ struct Entry {
     id: u64,
     /// Sequence of the batch whose prologue copies it (0: not submitted).
     seq: u64,
+    /// Copied on the copy queue (batches binding it wait for its batch's
+    /// copies there: `lookup`).
+    on_copy: bool,
     /// The synchronization epoch it was last checked for CPU writes in.
     checked: u64,
     /// Its chunk's slot (`Slot::live`).
@@ -572,8 +576,10 @@ impl Cache {
 }
 
 /// A submitted copy of guest [base, base+size) that is still current:
-/// (chunk, offset). Checks it for CPU writes once per epoch.
-pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64)> {
+/// (chunk, offset, the copy queue's timeline value a batch binding it waits
+/// for: the sequence of the batch that copied it there, else 0). Checks it
+/// for CPU writes once per epoch.
+pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     let mut g = CACHE.lock();
     let c = g.as_mut()?;
     let e = c.entries.get(&(base, size))?;
@@ -605,7 +611,7 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64)> {
     }
     let e = c.entries.get(&(base, size))?;
     STATS[0].fetch_add(1, Ordering::Relaxed);
-    Some((e.chunk.clone(), e.offset))
+    Some((e.chunk.clone(), e.offset, if e.on_copy { e.seq } else { 0 }))
 }
 
 /// Why the range has no usable copy (`GONE_NAMES` index; diagnostics).
@@ -663,7 +669,7 @@ pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     c.remove((base, size));
     c.chunks[slot].live += 1;
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    c.entries.insert((base, size), Entry { chunk: chunk.clone(), offset, id, seq: 0, checked: EPOCH.load(Ordering::Acquire), slot, made: std::time::Instant::now() });
+    c.entries.insert((base, size), Entry { chunk: chunk.clone(), offset, id, seq: 0, on_copy: false, checked: EPOCH.load(Ordering::Acquire), slot, made: std::time::Instant::now() });
     INSERT_GEN.fetch_add(1, Ordering::Release);
     cover(base, size, true);
     c.by_base.entry(base).or_default().push(size);
@@ -679,17 +685,19 @@ pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
 }
 
 /// The batch `seq` whose prologue makes the copies of `made` ((base, size,
-/// entry id)) was submitted: those entries, if still there, are usable.
-pub fn submitted(made: &[(u64, u64, u64)], seq: u64) {
+/// entry id, made on the copy queue)) was submitted: those entries, if still
+/// there, are usable.
+pub fn submitted(made: &[(u64, u64, u64, bool)], seq: u64) {
     if made.is_empty() {
         return;
     }
     let mut g = CACHE.lock();
     let Some(c) = g.as_mut() else { return };
-    for &(base, size, id) in made {
+    for &(base, size, id, on_copy) in made {
         if let Some(e) = c.entries.get_mut(&(base, size)) {
             if e.id == id && e.seq == 0 {
                 e.seq = seq;
+                e.on_copy = on_copy;
             }
         }
     }

@@ -44,6 +44,21 @@ pub struct Ctx {
     /// bufferDeviceAddress enabled: guest imports and video-memory homes get
     /// GPU addresses that fault reports name (`note_gpu_range`).
     pub device_addresses: bool,
+    /// The copy queue (a transfer-only queue family; `DS_COPY_QUEUE=0`:
+    /// none): batch-start copies run on it beside the main queue (`exec`).
+    pub copy: Option<CopyQueue>,
+    /// The queue families buffers are used by: the main queue's and the copy
+    /// queue's (the same twice without one).
+    pub families: [u32; 2],
+}
+
+/// A transfer-only queue for batch-start copies, and its timeline.
+pub struct CopyQueue {
+    pub family: u32,
+    pub queue: Mutex<vk::Queue>,
+    /// Timeline semaphore: reaches a batch's sequence once the copies it
+    /// made on this queue are done (signalled in sequence order).
+    pub copied: vk::Semaphore,
 }
 
 static CTX: OnceLock<Ctx> = OnceLock::new();
@@ -154,7 +169,21 @@ fn init_inner() -> Result<(), String> {
         let (pdev, qf, props) = chosen.ok_or("no Vulkan device with graphics+compute")?;
         let device_name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy().into_owned();
         let prio = [1.0f32];
-        let qci = [vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio)];
+        // A transfer-only family for the copy queue (`DS_COPY_QUEUE=0`: none).
+        let copy_family = if std::env::var("DS_COPY_QUEUE").ok().as_deref() != Some("0") {
+            instance
+                .get_physical_device_queue_family_properties(pdev)
+                .iter()
+                .position(|q| q.queue_count > 0 && q.queue_flags.contains(vk::QueueFlags::TRANSFER) && !q.queue_flags.intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE))
+                .map(|f| f as u32)
+        } else {
+            None
+        };
+        let qci_all = [
+            vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio),
+            vk::DeviceQueueCreateInfo::default().queue_family_index(copy_family.unwrap_or(qf)).queue_priorities(&prio),
+        ];
+        let qci = if copy_family.is_some() { &qci_all[..] } else { &qci_all[..1] };
         let host_import = instance
             .enumerate_device_extension_properties(pdev)
             .unwrap_or_default()
@@ -303,7 +332,7 @@ fn init_inner() -> Result<(), String> {
             .shader_int8(true);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true).maintenance4(true);
         let mut dci = vk::DeviceCreateInfo::default()
-            .queue_create_infos(&qci)
+            .queue_create_infos(qci)
             .enabled_extension_names(&dexts)
             .enabled_features(&features)
             .push_next(&mut f12)
@@ -331,6 +360,14 @@ fn init_inner() -> Result<(), String> {
             r2_supported.null_descriptor != 0
         );
         let queue = device.get_device_queue(qf, 0);
+        let copy = copy_family.and_then(|f| {
+            let mut tci = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
+            let copied = device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tci), None).ok()?;
+            Some(CopyQueue { family: f, queue: Mutex::new(device.get_device_queue(f, 0)), copied })
+        });
+        if let Some(c) = &copy {
+            crate::info!("Vulkan: copy queue in family {} (batch-start copies beside the main queue)", c.family);
+        }
         // Formats the title samples with depth comparison: which support it
         // (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT).
         {
@@ -363,6 +400,8 @@ fn init_inner() -> Result<(), String> {
             calibrated: calibrated.then(|| ash::ext::calibrated_timestamps::Device::new(&instance, &device)),
             fault: has_fault.then(|| ash::ext::device_fault::Device::new(&instance, &device)),
             device_addresses,
+            families: [qf, copy.as_ref().map_or(qf, |c| c.family)],
+            copy,
             entry,
             instance,
             pdev,
@@ -629,7 +668,7 @@ impl Ctx {
             return Ok((b, m, 0));
         }
         unsafe {
-            let bi = vk::BufferCreateInfo::default().size(size).usage(usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS).sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let bi = self.shared(vk::BufferCreateInfo::default().size(size).usage(usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS));
             let buf = self.device.create_buffer(&bi, None).map_err(|e| format!("vkCreateBuffer: {e}"))?;
             let req = self.device.get_buffer_memory_requirements(buf);
             let Some(ty) = self.memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL) else {
@@ -655,10 +694,20 @@ impl Ctx {
         }
     }
 
+    /// `bi` with the buffer shared by the main and copy queues' families
+    /// (concurrent; exclusive without a copy queue).
+    fn shared<'a>(&'a self, bi: vk::BufferCreateInfo<'a>) -> vk::BufferCreateInfo<'a> {
+        if self.copy.is_some() {
+            bi.sharing_mode(vk::SharingMode::CONCURRENT).queue_family_indices(&self.families)
+        } else {
+            bi.sharing_mode(vk::SharingMode::EXCLUSIVE)
+        }
+    }
+
     /// Device-local buffer (not host-visible).
     pub fn device_buffer(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory), String> {
         unsafe {
-            let bi = vk::BufferCreateInfo::default().size(size).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let bi = self.shared(vk::BufferCreateInfo::default().size(size).usage(usage));
             let buf = self.device.create_buffer(&bi, None).map_err(|e| format!("vkCreateBuffer: {e}"))?;
             let req = self.device.get_buffer_memory_requirements(buf);
             let mem = self.alloc(req, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
@@ -681,7 +730,7 @@ impl Ctx {
                 return Err(format!("vkGetMemoryHostPointerPropertiesEXT: {r}"));
             }
             let mut ebi = vk::ExternalMemoryBufferCreateInfo::default().handle_types(ht);
-            let bi = vk::BufferCreateInfo::default().size(size).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE).push_next(&mut ebi);
+            let bi = self.shared(vk::BufferCreateInfo::default().size(size).usage(usage)).push_next(&mut ebi);
             let buf = self.device.create_buffer(&bi, None).map_err(|e| format!("vkCreateBuffer: {e}"))?;
             let req = self.device.get_buffer_memory_requirements(buf);
             let bits = req.memory_type_bits & props.memory_type_bits;
@@ -720,7 +769,7 @@ impl Ctx {
     /// GPU reads stay in video memory, unlike `host_buffer`.
     pub fn bar_buffer(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), String> {
         unsafe {
-            let bi = vk::BufferCreateInfo::default().size(size).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let bi = self.shared(vk::BufferCreateInfo::default().size(size).usage(usage));
             let buf = self.device.create_buffer(&bi, None).map_err(|e| format!("vkCreateBuffer: {e}"))?;
             let req = self.device.get_buffer_memory_requirements(buf);
             let want = vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
@@ -740,7 +789,7 @@ impl Ctx {
     /// Host-visible, coherent buffer (staging / per-draw data).
     pub fn host_buffer(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), String> {
         unsafe {
-            let bi = vk::BufferCreateInfo::default().size(size).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let bi = self.shared(vk::BufferCreateInfo::default().size(size).usage(usage));
             let buf = self.device.create_buffer(&bi, None).map_err(|e| format!("vkCreateBuffer: {e}"))?;
             let req = self.device.get_buffer_memory_requirements(buf);
             // Prefer cached host memory: results are read back by the CPU
@@ -764,6 +813,18 @@ impl Ctx {
 
     pub fn submit(&self, cmd: vk::CommandBuffer, wait: &[(vk::Semaphore, vk::PipelineStageFlags)], signal: &[vk::Semaphore], fence: vk::Fence) -> Result<(), String> {
         self.submit_cmds(&[cmd], wait, signal, fence)
+    }
+
+    /// Submits command buffers to the main queue, or the copy queue, with
+    /// timeline semaphore waits (semaphore, value, stages that wait) and
+    /// signals (semaphore, value).
+    pub fn submit_timeline(&self, on_copy: bool, cmds: &[vk::CommandBuffer], waits: &[(vk::Semaphore, u64, vk::PipelineStageFlags2)], signals: &[(vk::Semaphore, u64)], fence: vk::Fence) -> Result<(), String> {
+        let cbs: Vec<vk::CommandBufferSubmitInfo> = cmds.iter().map(|&c| vk::CommandBufferSubmitInfo::default().command_buffer(c)).collect();
+        let ws: Vec<vk::SemaphoreSubmitInfo> = waits.iter().map(|&(s, v, st)| vk::SemaphoreSubmitInfo::default().semaphore(s).value(v).stage_mask(st)).collect();
+        let ss: Vec<vk::SemaphoreSubmitInfo> = signals.iter().map(|&(s, v)| vk::SemaphoreSubmitInfo::default().semaphore(s).value(v).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)).collect();
+        let si = vk::SubmitInfo2::default().command_buffer_infos(&cbs).wait_semaphore_infos(&ws).signal_semaphore_infos(&ss);
+        let q = if on_copy { self.copy.as_ref().ok_or("no copy queue")?.queue.lock() } else { self.queue.lock() };
+        unsafe { self.device.queue_submit2(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit2: {e}"))
     }
 
     /// Submits command buffers that execute in order.

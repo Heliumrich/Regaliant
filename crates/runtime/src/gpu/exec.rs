@@ -1235,6 +1235,65 @@ fn lazy_barriers() -> bool {
 }
 
 #[track_caller]
+/// Records prologue copies grouped by (source, destination) buffer.
+fn record_copies(cmd: vk::CommandBuffer, copies: &mut Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>) {
+    if copies.is_empty() {
+        return;
+    }
+    // The copies' destinations are distinct ranges of video memory and their
+    // sources guest memory: any order is the same.
+    copies.sort_unstable_by_key(|&(s, d, r)| (s, d, r.src_offset));
+    let mut regions: Vec<vk::BufferCopy> = Vec::with_capacity(copies.len());
+    let mut i = 0;
+    while i < copies.len() {
+        let (src, dst, _) = copies[i];
+        regions.clear();
+        while i < copies.len() && copies[i].0 == src && copies[i].1 == dst {
+            regions.push(copies[i].2);
+            i += 1;
+        }
+        PRE_CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe { ctx().device.cmd_copy_buffer(cmd, src, dst, &regions) };
+    }
+    copies.clear();
+}
+
+/// Counts a batch's copy-queue use (`XCOPY`).
+fn note_copy_waits(own: bool, wait: u64) {
+    if own {
+        XCOPY[2].fetch_add(1, Ordering::Relaxed);
+    } else if wait > 0 {
+        XCOPY[3].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Submits batch `seq`: its copies on the copy queue (`xpre`; they signal
+/// the copy timeline with `seq`), then its prologue and commands on the main
+/// queue once its own copies there and those it binds that earlier batches
+/// made there (`wait`) are done. Called in sequence order (`push_batch`):
+/// the timeline's signals increase.
+fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, fence: vk::Fence) -> Result<(), String> {
+    let c = ctx();
+    let mut wait = wait;
+    if let Some(x) = xpre {
+        let q = c.copy.as_ref().ok_or("no copy queue")?;
+        c.submit_timeline(true, &[x], &[], &[(q.copied, seq)], vk::Fence::null())?;
+        wait = seq;
+    }
+    let both;
+    let cmds: &[vk::CommandBuffer] = match pre {
+        Some(p) => {
+            both = [p, cmd];
+            &both
+        }
+        None => std::slice::from_ref(&cmd),
+    };
+    match (&c.copy, wait) {
+        (Some(q), w) if w > 0 => c.submit_timeline(false, cmds, &[(q.copied, w, vk::PipelineStageFlags2::ALL_COMMANDS)], &[], fence),
+        _ => c.submit_cmds(cmds, &[], &[], fence),
+    }
+}
+
 fn global_barrier(cmd: vk::CommandBuffer) {
     note_vk(VK_BARRIERS);
     if profiling() {
@@ -1619,6 +1678,9 @@ pub(super) fn reset_pre_window() {
     PRE_SNAP[0].store(PRE_COPIES.load(Ordering::Relaxed), Ordering::Relaxed);
     PRE_SNAP[1].store(PRE_BYTES.load(Ordering::Relaxed), Ordering::Relaxed);
     PRE_SNAP[2].store(PRE_CALLS.load(Ordering::Relaxed), Ordering::Relaxed);
+    for (s, v) in XCOPY_SNAP.iter().zip(&XCOPY) {
+        s.store(v.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
     super::precache::reset_window();
 }
 
@@ -1627,10 +1689,27 @@ pub(super) fn pre_window_line() -> String {
     let n = PRE_COPIES.load(Ordering::Relaxed).saturating_sub(PRE_SNAP[0].load(Ordering::Relaxed));
     let b = PRE_BYTES.load(Ordering::Relaxed).saturating_sub(PRE_SNAP[1].load(Ordering::Relaxed));
     let k = PRE_CALLS.load(Ordering::Relaxed).saturating_sub(PRE_SNAP[2].load(Ordering::Relaxed));
-    format!("    batch-start copies in the window: {n} ({} MiB, {k} copy calls); {}\n", b >> 20, super::precache::window_line())
+    let x: Vec<u64> = XCOPY.iter().zip(&XCOPY_SNAP).map(|(v, s)| v.load(Ordering::Relaxed).saturating_sub(s.load(Ordering::Relaxed))).collect();
+    let xq = if ctx().copy.is_some() {
+        format!(
+            "    on the copy queue: {} copies ({} MiB) in {} batches; {} batches waited only for shared copies made there\n",
+            x[0],
+            x[1] >> 20,
+            x[2],
+            x[3]
+        )
+    } else {
+        String::new()
+    };
+    format!("    batch-start copies in the window: {n} ({} MiB, {k} copy calls); {}\n", b >> 20, super::precache::window_line()) + &xq
 }
 static PRE_REUSED: AtomicU64 = AtomicU64::new(0);
 static PRE_FULL: AtomicU64 = AtomicU64::new(0);
+/// Batch-start copies on the copy queue (`DS_COPY_QUEUE`): [copies, bytes,
+/// batches with such copies, batches that waited only for such copies
+/// earlier batches made], and their values at the last `profile reset`.
+static XCOPY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static XCOPY_SNAP: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// GPU time of the batches' copy prologues (DS_PROFILE_GPU), ns.
 static PRE_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -2063,7 +2142,7 @@ pub fn wait_done(seq: u64) {
 
 /// Queues a batch: `submit` runs (the vkQueueSubmit) under the queue lock so
 /// sequence order is submission order.
-fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, gpu_labels: Vec<(u64, u64, u8)>, ops: [u64; OPS], submit: impl FnOnce() + Send + 'static) -> u64 {
+fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, gpu_labels: Vec<(u64, u64, u8)>, ops: [u64; OPS], submit: impl FnOnce(u64) + Send + 'static) -> u64 {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         crate::thread::spawn_host("gpu-complete", 1 << 20, Box::new(completion_thread)).expect("gpu completion thread");
@@ -2080,7 +2159,7 @@ fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, ch
         SUBMIT_CV.notify_one();
     } else {
         drop(sq);
-        submit();
+        submit(seq);
         note_submitted(seq);
     }
     q.push_back(Batch { queries, seq, fence, actions, checks, shaders, submitted: std::time::Instant::now(), name: name.to_string(), gpu_labels, ops });
@@ -2092,7 +2171,7 @@ fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, ch
 /// vkQueueSubmit of each batch in sequence order, off the command
 /// processors (~7% of the graphics command processor's busy samples, ~220
 /// batches per courtyard frame; profile run 20261012-001629).
-type SubmitJob = Box<dyn FnOnce() + Send>;
+type SubmitJob = Box<dyn FnOnce(u64) + Send>;
 static SUBMIT_Q: Mutex<std::collections::VecDeque<(u64, SubmitJob)>> = Mutex::new(std::collections::VecDeque::new());
 static SUBMIT_CV: parking_lot::Condvar = parking_lot::Condvar::new();
 /// Highest batch sequence submitted to Vulkan (the completion thread waits
@@ -2123,7 +2202,7 @@ fn submitter_thread() {
             }
         };
         let tl = super::timeline::mark();
-        job();
+        job(seq);
         super::timeline::end("vk submit", tl, || format!("#{seq}"));
         note_submitted(seq);
     }
@@ -2369,6 +2448,9 @@ struct Slot {
     /// (PRE_SEG, allocated on first use), submitted before `cmd`.
     pre: vk::CommandBuffer,
     pre_buf: Option<vk::Buffer>,
+    /// The prologue's copies on the copy queue (`DS_COPY_QUEUE`; null
+    /// without one): copies of ranges no submitted batch writes.
+    xpre: vk::CommandBuffer,
     /// Video-memory homes the slot's batch binds (kept until it completes).
     homes: Vec<std::sync::Arc<super::homes::HomeBuf>>,
     /// Shared copy chunks the slot's batch binds (kept until it completes).
@@ -2379,12 +2461,17 @@ struct Slot {
 }
 
 impl Slot {
-    fn new(pool: vk::CommandPool) -> Result<Slot, String> {
+    fn new(pool: vk::CommandPool, xpool: vk::CommandPool) -> Result<Slot, String> {
         let c = ctx();
         let sizes: Vec<vk::DescriptorPoolSize> = POOL_TYPES.iter().zip(&POOL_LIMITS[1..]).map(|(&ty, &n)| vk::DescriptorPoolSize { ty, descriptor_count: n }).collect();
         unsafe {
             let cmds = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(2)).map_err(|e| e.to_string())?;
             let (cmd, pre) = (cmds[0], cmds[1]);
+            let xpre = if xpool == vk::CommandPool::null() {
+                vk::CommandBuffer::null()
+            } else {
+                c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(xpool).command_buffer_count(1)).map_err(|e| e.to_string())?[0]
+            };
             // SGPR data in system memory: a copy in video memory, read by
             // every invocation, made no measurable difference (`tune ring_vram`).
             let (ring, _mem, ring_ptr) = c.host_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)?;
@@ -2404,6 +2491,7 @@ impl Slot {
                 shadow,
                 pre,
                 pre_buf: None,
+                xpre,
                 homes: Vec::new(),
                 keep: Vec::new(),
                 ts: None,
@@ -3085,6 +3173,8 @@ pub fn shader_profile() -> String {
 
 pub struct Exec {
     pool: vk::CommandPool,
+    /// The copy queue's command pool (null without one).
+    xpool: vk::CommandPool,
     slots: Vec<Slot>,
     cur: usize,
     /// Slots that could be created (a failed creation caps them).
@@ -3109,6 +3199,11 @@ pub struct Exec {
     /// Prologue copies not recorded yet (`tune pre_merge`): (source,
     /// destination, region), recorded grouped by buffers by `end_pre`.
     pre_copies: Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>,
+    /// The batch's copies for the copy queue (`Slot::xpre`, recorded by
+    /// `end_xpre`), and the copy queue's timeline value the batch waits for
+    /// besides its own (shared copies earlier batches made there).
+    xcopies: Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>,
+    copy_wait: u64,
     ring_align: u64,
     recording: bool,
     /// When the batch being recorded was begun.
@@ -3223,7 +3318,7 @@ pub struct Exec {
     shares_pre: bool,
     /// Shared copies this batch's prologue makes (usable by later batches
     /// once it is submitted).
-    shared_pending: Vec<(u64, u64, u64)>,
+    shared_pending: Vec<(u64, u64, u64, bool)>,
     /// Ids of the shared copies this batch made of its shadows after writing
     /// them (`share_shadows`): its submission-time invalidation spares them.
     shared_kept: Vec<u64>,
@@ -3237,7 +3332,9 @@ unsafe impl Send for Exec {}
 struct Closed {
     slot: usize,
     pre: Option<vk::CommandBuffer>,
-    shared: Vec<(u64, u64, u64)>,
+    shared: Vec<(u64, u64, u64, bool)>,
+    /// `Exec::copy_wait` of the batch.
+    copy_wait: u64,
     /// `Exec::shared_kept` of the batch.
     kept: Vec<u64>,
     /// `ops_line` of the batch.
@@ -3263,9 +3360,17 @@ impl Exec {
                 .device
                 .create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(c.queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
                 .map_err(|e| e.to_string())?;
-            let slots = vec![Slot::new(pool)?, Slot::new(pool)?];
+            let xpool = match &c.copy {
+                Some(q) => c
+                    .device
+                    .create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(q.family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
+                    .map_err(|e| e.to_string())?,
+                None => vk::CommandPool::null(),
+            };
+            let slots = vec![Slot::new(pool, xpool)?, Slot::new(pool, xpool)?];
             Ok(Exec {
                 pool,
+                xpool,
                 slots,
                 cur: 0,
                 slot_limit: MAX_SLOTS,
@@ -3279,6 +3384,8 @@ impl Exec {
                 pre_failed: false,
                 pres: Default::default(),
                 pre_copies: Vec::new(),
+                xcopies: Vec::new(),
+                copy_wait: 0,
                 ring_align: c.limits.min_storage_buffer_offset_alignment.max(16),
                 recording: false,
                 begun_at: std::time::Instant::now(),
@@ -3381,7 +3488,7 @@ impl Exec {
             if self.slots[self.cur].seq == PENDING {
                 match (0..n).map(|k| (self.cur + k) % n).find(|&k| self.slots[k].seq != PENDING) {
                     Some(k) => self.cur = k,
-                    None if n < DEFERRED_SLOTS => match Slot::new(self.pool) {
+                    None if n < DEFERRED_SLOTS => match Slot::new(self.pool, self.xpool) {
                         Ok(s) => {
                             self.slots.push(s);
                             self.cur = n;
@@ -3460,7 +3567,7 @@ impl Exec {
     /// index buffers are kept by the slot their draw records into).
     fn ensure_slot(&mut self) {
         if self.cur == self.slots.len() {
-            match Slot::new(self.pool) {
+            match Slot::new(self.pool, self.xpool) {
                 Ok(slot) => self.slots.push(slot),
                 Err(e) => {
                     crate::warn!("gpu[{}]: no batch slot {} ({e}); using {}", self.name, self.cur + 1, self.cur);
@@ -3513,6 +3620,8 @@ impl Exec {
             unsafe { c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.slots[i].queries, STAMPS * MAX_TIMED + 1) };
         }
         let pre = self.end_pre();
+        let xpre = self.end_xpre();
+        let copy_wait = std::mem::take(&mut self.copy_wait);
         if pre.is_none() && self.slots[i].queries != vk::QueryPool::null() {
             // No prologue: its timestamps read as unavailable.
             unsafe { c.device.cmd_reset_query_pool(cmd, self.slots[i].queries, STAMPS * MAX_TIMED + 2, 2) };
@@ -3550,7 +3659,7 @@ impl Exec {
                 crate::error!("gpu[{}]: CP effects in a parallel run (dropped)", self.name);
             }
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders) });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders) });
             self.slots[i].seq = PENDING;
             self.pending_promises.clear();
             self.pending_log.clear();
@@ -3565,14 +3674,12 @@ impl Exec {
         }
         let commands = self.batch_shaders.len();
         let gpu_labels = self.pending_promises.clone();
-        let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, move || {
+        note_copy_waits(xpre.is_some(), copy_wait);
+        let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, move |seq| {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return;
             }
-            let r = match pre {
-                Some(p) => c.submit_cmds(&[p, cmd], &[], &[], fence),
-                None => c.submit(cmd, &[], &[], fence),
-            };
+            let r = submit_batch(seq, xpre, pre, cmd, copy_wait, fence);
             if let Err(e) = r {
                 if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
                     crate::error!("gpu[{name}]: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
@@ -3591,6 +3698,13 @@ impl Exec {
         self.open_gen.store(u64::MAX, Ordering::SeqCst);
         super::precache::submitted(&std::mem::take(&mut self.shared_pending), seq);
         st.mark(6);
+        // The batch's writes are noted before its labels are promised: a
+        // queue that passes a wait on one sees them (its copies of those
+        // ranges stay on the main queue, after this batch).
+        let writes = std::mem::take(&mut self.pending);
+        self.pending_log.clear();
+        INFLIGHT.note_ranges(seq, &writes);
+        st.mark(8);
         for (a, v, n) in std::mem::take(&mut self.pending_promises) {
             super::cp::promise(seq, a, v, n, false);
         }
@@ -3599,10 +3713,6 @@ impl Exec {
         }
         self.submit_request.store(false, Ordering::SeqCst);
         st.mark(7);
-        let writes = std::mem::take(&mut self.pending);
-        self.pending_log.clear();
-        INFLIGHT.note_ranges(seq, &writes);
-        st.mark(8);
         // Shared copies made by batches submitted before this one precede
         // its writes on the GPU (see `precache`).
         super::precache::invalidate_ranges_except(&writes, &std::mem::take(&mut self.shared_kept));
@@ -3652,6 +3762,8 @@ impl Exec {
         self.snap_used = 0;
         self.snaps.clear();
         let _ = self.end_pre();
+        self.xcopies.clear();
+        self.copy_wait = 0;
         self.pre_used = 0;
         self.pres.clear();
     }
@@ -3853,24 +3965,7 @@ impl Exec {
             return None;
         }
         let (pre, qp) = (self.slots[self.cur].pre, self.slots[self.cur].queries);
-        if !self.pre_copies.is_empty() {
-            // The copies' destinations are distinct ranges of video memory
-            // and their sources guest memory: any order is the same.
-            self.pre_copies.sort_unstable_by_key(|&(s, d, r)| (s, d, r.src_offset));
-            let mut regions: Vec<vk::BufferCopy> = Vec::with_capacity(self.pre_copies.len());
-            let mut i = 0;
-            while i < self.pre_copies.len() {
-                let (src, dst, _) = self.pre_copies[i];
-                regions.clear();
-                while i < self.pre_copies.len() && self.pre_copies[i].0 == src && self.pre_copies[i].1 == dst {
-                    regions.push(self.pre_copies[i].2);
-                    i += 1;
-                }
-                PRE_CALLS.fetch_add(1, Ordering::Relaxed);
-                unsafe { ctx().device.cmd_copy_buffer(pre, src, dst, &regions) };
-            }
-            self.pre_copies.clear();
-        }
+        record_copies(pre, &mut self.pre_copies);
         unsafe {
             global_barrier(pre);
             if qp != vk::QueryPool::null() {
@@ -3879,6 +3974,20 @@ impl Exec {
             ctx().device.end_command_buffer(pre).ok();
         }
         Some(pre)
+    }
+
+    /// Records the batch's copies for the copy queue (`Slot::xpre`), if any.
+    fn end_xpre(&mut self) -> Option<vk::CommandBuffer> {
+        if self.xcopies.is_empty() {
+            return None;
+        }
+        let x = self.slots[self.cur].xpre;
+        unsafe {
+            ctx().device.begin_command_buffer(x, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
+            record_copies(x, &mut self.xcopies);
+            ctx().device.end_command_buffer(x).ok();
+        }
+        Some(x)
     }
 
     /// A copy of guest [base, base+size) in video memory made by the GPU at
@@ -3923,8 +4032,9 @@ impl Exec {
         let share = self.shares_pre && super::precache::enabled() && super::precache::worth(size);
         if share {
             // Copied by an earlier submitted batch (`gpu::precache`).
-            if let Some((chunk, at)) = super::precache::lookup(base, size) {
+            if let Some((chunk, at, made)) = super::precache::lookup(base, size) {
                 PRE_REUSED.fetch_add(1, Ordering::Relaxed);
+                self.copy_wait = self.copy_wait.max(made);
                 let buf = chunk.buf;
                 self.slots[self.cur].keep.push(chunk);
                 self.pres.insert((base, size), (buf, at));
@@ -3971,18 +4081,30 @@ impl Exec {
             Some((chunk, at, _)) => (chunk.buf, *at),
             None => (self.slots[self.cur].pre_buf?, off),
         };
-        let pre = self.open_pre();
         let region = vk::BufferCopy { src_offset: al - start, dst_offset: off, size: n };
-        if super::tune::pre_merge() {
-            self.pre_copies.push((src, buf, region));
+        // On the copy queue when no submitted batch writes the range: it
+        // waits for none, and the batch waits for it (`submit_batch`). Else
+        // in the prologue on the main queue, after all earlier work. (Not in
+        // a parallel chunk: earlier chunks of its run, not submitted yet, may
+        // write the range.)
+        let on_copy = self.slots[self.cur].xpre != vk::CommandBuffer::null() && !self.deferred && super::tune::copy_queue() && INFLIGHT.latest(&r).is_none();
+        if on_copy {
+            self.xcopies.push((src, buf, region));
+            XCOPY[0].fetch_add(1, Ordering::Relaxed);
+            XCOPY[1].fetch_add(n, Ordering::Relaxed);
         } else {
-            PRE_CALLS.fetch_add(1, Ordering::Relaxed);
-            unsafe { ctx().device.cmd_copy_buffer(pre, src, buf, &[region]) };
+            let pre = self.open_pre();
+            if super::tune::pre_merge() {
+                self.pre_copies.push((src, buf, region));
+            } else {
+                PRE_CALLS.fetch_add(1, Ordering::Relaxed);
+                unsafe { ctx().device.cmd_copy_buffer(pre, src, buf, &[region]) };
+            }
         }
         match shared {
             Some((chunk, _, id)) => {
                 self.slots[self.cur].keep.push(chunk);
-                self.shared_pending.push((base, size, id));
+                self.shared_pending.push((base, size, id, on_copy));
             }
             None => self.pre_used = off + n,
         }
@@ -4298,7 +4420,7 @@ impl Exec {
             }
             Some(self.last_seq)
         } else if self.last_seq > done_seq() {
-            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), [0; OPS], || {});
+            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), [0; OPS], |_| {});
             self.last_seq = seq;
             self.last_action_seq = seq;
             self.cpu_action_seq = seq;
@@ -5000,7 +5122,7 @@ impl Exec {
             let r = vk::BufferCopy { src_offset: sh.shadow_off, dst_offset: at, size: sh.range };
             unsafe { c.device.cmd_copy_buffer(self.cmd(), self.shadow(), chunk.buf, &[r]) };
             self.slots[self.cur].keep.push(chunk);
-            self.shared_pending.push((sh.guest, sh.range, id));
+            self.shared_pending.push((sh.guest, sh.range, id, false));
             self.shared_kept.push(id);
             SHADOWS_SHARED[0].fetch_add(1, Ordering::Relaxed);
         }
@@ -5161,7 +5283,6 @@ impl Exec {
     /// main command processor, after the work before them); returns the
     /// last one's sequence. At shutdown they are dropped.
     pub fn submit_closed(&mut self) -> Option<u64> {
-        let c = ctx();
         let mut last = None;
         for b in std::mem::take(&mut self.closed) {
             if super::shutting_down() {
@@ -5172,15 +5293,13 @@ impl Exec {
             }
             let (cmd, fence, queries) = (self.slots[b.slot].cmd, self.slots[b.slot].fence, self.slots[b.slot].queries);
             let name = self.name.clone();
-            let pre = b.pre;
-            let seq = push_batch(fence, queries, Vec::new(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, move || {
+            let (pre, copy_wait) = (b.pre, b.copy_wait);
+            note_copy_waits(false, copy_wait);
+            let seq = push_batch(fence, queries, Vec::new(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, move |seq| {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
                     return;
                 }
-                let r = match pre {
-                    Some(p) => c.submit_cmds(&[p, cmd], &[], &[], fence),
-                    None => c.submit(cmd, &[], &[], fence),
-                };
+                let r = submit_batch(seq, None, pre, cmd, copy_wait, fence);
                 if let Err(e) = r {
                     if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
                         crate::error!("gpu[{name}]: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
@@ -5838,7 +5957,8 @@ impl Exec {
                 // at a World 5-1 load, runs 20261013-035334 .. -041906).
                 let shared = if self.deferred { None } else { super::precache::lookup(sh.guest, sh.range) };
                 match shared {
-                    Some((chunk, at)) => {
+                    Some((chunk, at, made)) => {
+                        self.copy_wait = self.copy_wait.max(made);
                         kept.push(Some((chunk.buf, at)));
                         self.slots[self.cur].keep.push(chunk);
                         SHADOWS_SHARED[1].fetch_add(1, Ordering::Relaxed);
@@ -6114,7 +6234,7 @@ pub fn status() -> String {
         + &super::homes::status()
         + &sync_why_status()
         + &format!(
-            "    buffer snapshots in VRAM: {} ({} MiB), {} reused, {} not for lack of space, {} for memory that cannot be imported; draws with snapshotted indices {} ({} MiB); batch-start copies {} ({} MiB), {} reused, {} not for lack of space\n",
+            "    buffer snapshots in VRAM: {} ({} MiB), {} reused, {} not for lack of space, {} for memory that cannot be imported; draws with snapshotted indices {} ({} MiB); batch-start copies {} ({} MiB), {} reused, {} not for lack of space; on the copy queue {} ({} MiB)\n",
             SNAPS.load(Ordering::Relaxed),
             SNAP_COPIED.load(Ordering::Relaxed) >> 20,
             SNAPS_REUSED.load(Ordering::Relaxed),
@@ -6125,7 +6245,9 @@ pub fn status() -> String {
             PRE_COPIES.load(Ordering::Relaxed),
             PRE_BYTES.load(Ordering::Relaxed) >> 20,
             PRE_REUSED.load(Ordering::Relaxed),
-            PRE_FULL.load(Ordering::Relaxed)
+            PRE_FULL.load(Ordering::Relaxed),
+            XCOPY[0].load(Ordering::Relaxed),
+            XCOPY[1].load(Ordering::Relaxed) >> 20
         )
         + &format!(
             "    guest memory imports: {} ({} MiB), {} over several mappings, {} dropped after remapping ({} freed, {} MiB; {} waiting); memory: {}\n",

@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 65] = [
+    static ALL: [Tunable; 66] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -92,6 +92,7 @@ pub mod tune {
         Tunable { name: "lazy_passes", env: "DS_LAZY_PASSES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "push_partial", env: "DS_PUSH_PARTIAL", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "per_lane", env: "DS_PER_LANE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "copy_queue", env: "DS_COPY_QUEUE_USE", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -679,6 +680,14 @@ pub mod tune {
     #[inline]
     pub fn per_lane() -> bool {
         get(64) != 0
+    }
+
+    /// Batch-start copies of ranges no submitted batch writes run on the
+    /// copy queue when there is one (`DS_COPY_QUEUE=0` at boot: none; 0
+    /// here: all in the prologues on the main queue).
+    #[inline]
+    pub fn copy_queue() -> bool {
+        get(65) != 0
     }
 
     /// A switch's value by name; None if unknown.
