@@ -1353,6 +1353,9 @@ pub fn completed_seq() -> u64 {
 struct RangeLog {
     log: Mutex<super::ranges::SeqRanges>,
     latest_seq: AtomicU64,
+    /// Bumped after every note (`Exec`'s cache of clean pages holds while it
+    /// stays the same; a reader takes it before looking).
+    notes: AtomicU64,
     /// Per bucket of 64 KiB guest pages (hashed), the latest batch that
     /// writes into one of them: a lookup whose pages' buckets all hold
     /// completed batches is answered without the log's lock (the command
@@ -1371,7 +1374,7 @@ fn page_bucket(page: u64) -> usize {
 
 impl RangeLog {
     const fn new() -> RangeLog {
-        RangeLog { log: Mutex::new(super::ranges::SeqRanges::new()), latest_seq: AtomicU64::new(0), pages: [const { AtomicU64::new(0) }; PAGE_BUCKETS] }
+        RangeLog { log: Mutex::new(super::ranges::SeqRanges::new()), latest_seq: AtomicU64::new(0), notes: AtomicU64::new(0), pages: [const { AtomicU64::new(0) }; PAGE_BUCKETS] }
     }
 
     /// Marks the page buckets of [a, a+n) as written by batch `seq`.
@@ -1416,6 +1419,8 @@ impl RangeLog {
         let mut g = self.log.lock();
         g.prune(done);
         g.insert(seq, w.0, w.1);
+        drop(g);
+        self.notes.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Notes the ranges written by batch `seq` (one lock).
@@ -1431,6 +1436,8 @@ impl RangeLog {
         let mut g = self.log.lock();
         g.prune(done);
         g.insert_all(seq, writes);
+        drop(g);
+        self.notes.fetch_add(1, Ordering::AcqRel);
     }
 
     /// The latest unfinished batch that writes into `reads`.
@@ -2175,7 +2182,10 @@ fn note_queue_wait(queue: &str, kind: usize, d: std::time::Duration) {
 
 /// CP read checks (`sync_for_reads`, DS_PROFILE_GPU): ns in [home staleness,
 /// this queue's writes, other queues' writes], then [_, checks, ranges].
-pub(super) static SYNC_STEPS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+pub(super) static SYNC_STEPS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// Pages of the clean-page cache (`Exec::clean_pages`): 64 KiB, 512 slots.
+const CLEAN_SHIFT: u32 = 16;
+const CLEAN_SLOTS: usize = 512;
 
 fn sync_steps_line() -> String {
     let w: Vec<u64> = WAIT_NS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
@@ -2202,9 +2212,10 @@ fn sync_steps_line_inner() -> String {
     let n = SYNC_STEPS[4].load(Ordering::Relaxed).max(1);
     let us = |k: usize| SYNC_STEPS[k].load(Ordering::Relaxed) as f64 / n as f64 / 1000.0;
     format!(
-        "    CP read checks: {} ({:.1} ranges each; us each: homes {:.2}, this queue's writes {:.2}, other queues' writes {:.2})\n",
+        "    CP read checks: {} ({:.1} ranges each, {:.1} in pages known clean; us each: homes {:.2}, this queue's writes {:.2}, other queues' writes {:.2})\n",
         SYNC_STEPS[4].load(Ordering::Relaxed),
         SYNC_STEPS[5].load(Ordering::Relaxed) as f64 / n as f64,
+        SYNC_STEPS[6].load(Ordering::Relaxed) as f64 / n as f64,
         us(0),
         us(1),
         us(2)
@@ -2560,6 +2571,15 @@ pub struct Exec {
     dyncache: draw::DynCache,
     /// Cleared bindings for the next commands (`bind_stage`, `recycle`).
     bound_pool: Vec<Bound>,
+    /// Bumped whenever this executor's pending or in-flight writes grow.
+    own_gen: u64,
+    /// 64 KiB pages that no pending or in-flight write and no stale home part
+    /// overlapped when last checked (direct-mapped by page), valid while the
+    /// write generations are `clean_tag` (`sync_for_reads`).
+    clean_pages: Vec<u64>,
+    clean_tag: [u64; 3],
+    /// The reads `sync_for_reads` still checks (the vector reused).
+    dirty_reads: Vec<(u64, u64)>,
     /// The written ranges (all, sized) this executor's last dispatch noted in
     /// the image cache, the write tracker and the copy cache, with their
     /// generations after it (`note_gens`): a dispatch writing the same ranges
@@ -2681,6 +2701,10 @@ impl Exec {
                 rendering: None,
                 dyncache: Default::default(),
                 bound_pool: Vec::new(),
+                own_gen: 0,
+                clean_pages: vec![u64::MAX; CLEAN_SLOTS],
+                clean_tag: [u64::MAX; 3],
+                dirty_reads: Vec::new(),
                 last_notes: (Vec::new(), Vec::new(), [u64::MAX; 4]),
                 draw_bounds: Vec::new(),
                 pool_use: [0; 5],
@@ -2953,6 +2977,7 @@ impl Exec {
         // its writes on the GPU (see `precache`).
         super::precache::invalidate_ranges_except(&writes, &std::mem::take(&mut self.shared_kept));
         self.inflight.insert_all(seq, &writes);
+        self.own_gen += 1;
         self.last_seq = seq;
         if has_actions {
             self.last_action_seq = seq;
@@ -3578,6 +3603,7 @@ impl Exec {
                     CP_WRITES.note(self.last_seq, w);
                 }
                 self.inflight.insert(self.last_seq, w.0, w.1);
+                self.own_gen += 1;
             }
             Some(self.last_seq)
         } else if self.last_seq > done_seq() {
@@ -3591,6 +3617,7 @@ impl Exec {
                     CP_WRITES.note(seq, w);
                 }
                 self.inflight.insert(seq, w.0, w.1);
+                self.own_gen += 1;
             }
             Some(seq)
         } else {
@@ -3873,6 +3900,50 @@ impl Exec {
             }
         };
         let mut t = t0;
+        // Reads in pages known clean since the write generations last changed
+        // skip the checks; the others are checked as before.
+        let mut dirty = std::mem::take(&mut self.dirty_reads);
+        dirty.clear();
+        let reads: &[(u64, u64)] = if super::tune::clean_pages() {
+            let tag = [self.own_gen, INFLIGHT.notes.load(Ordering::Acquire), super::homes::STALE_ADDED.load(Ordering::Acquire)];
+            if tag != self.clean_tag {
+                self.clean_pages.fill(u64::MAX);
+                self.clean_tag = tag;
+            }
+            for &(a, n) in reads {
+                if n == 0 {
+                    continue;
+                }
+                let (first, last) = (a >> CLEAN_SHIFT, (a + n - 1) >> CLEAN_SHIFT);
+                let mut clean = true;
+                for page in first..=last {
+                    let slot = (page as usize) & (CLEAN_SLOTS - 1);
+                    if self.clean_pages[slot] == page {
+                        continue;
+                    }
+                    let whole = [(page << CLEAN_SHIFT, 1u64 << CLEAN_SHIFT)];
+                    if super::homes::any_stale(&whole) || self.overlaps_pending(&whole) || INFLIGHT.latest(&whole).is_some() {
+                        clean = false;
+                        break;
+                    }
+                    self.clean_pages[slot] = page;
+                }
+                if !clean {
+                    dirty.push((a, n));
+                }
+            }
+            if prof {
+                SYNC_STEPS[6].fetch_add((reads.len() - dirty.len()) as u64, Ordering::Relaxed);
+            }
+            &dirty
+        } else {
+            reads
+        };
+        if reads.is_empty() {
+            lap(0, &mut t);
+            self.dirty_reads = dirty;
+            return None;
+        }
         if super::homes::any_stale(reads) {
             // GPU work wrote these parts in video memory: copied back (after
             // all earlier submitted work) before the CPU reads them.
@@ -3896,6 +3967,7 @@ impl Exec {
             }
         }
         lap(2, &mut t);
+        self.dirty_reads = dirty;
         waited
     }
 
@@ -3909,6 +3981,7 @@ impl Exec {
     pub(super) fn note_write(&mut self, a: u64, n: u64) {
         super::precache::invalidate_gpu(a, n);
         self.pending.insert(a, n);
+        self.own_gen += 1;
         if verify::enabled() {
             self.pending_log.push((a, n));
         }
@@ -4349,6 +4422,7 @@ impl Exec {
             INFLIGHT.note_ranges(seq, &b.writes);
             super::precache::invalidate_ranges_except(&b.writes, &b.kept);
             self.inflight.insert_all(seq, &b.writes);
+            self.own_gen += 1;
             self.last_seq = seq;
             last = Some(seq);
         }
@@ -5124,6 +5198,7 @@ impl Exec {
         lap.mark(14);
         if repeat {
             // This batch's own record of them still: it may have begun since.
+            self.own_gen += 1;
             for &(b, n) in &writes_here {
                 self.pending.insert(b, n);
                 if verify::enabled() {

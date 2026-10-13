@@ -569,6 +569,7 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     Some(a) => {
                         let mut g = gpu::exec::draw::TINY_SCISSOR.lock();
                         let on = if let Some(i) = g.iter().position(|&x| x == a) { g.remove(i); false } else { g.push(a); true };
+                        gpu::exec::draw::TINY_ANY.store(!g.is_empty(), std::sync::atomic::Ordering::Relaxed);
                         info!("control: draws with ps {a:#x} {}", if on { "limited to one pixel" } else { "full again" });
                         Ok(())
                     }

@@ -156,17 +156,21 @@ pub fn set_equal_bias(v: Option<f32>) {
 /// Draws whose vertex shader is on this list are skipped (`skipvs` control
 /// command; diagnosis).
 static SKIP_VS: parking_lot::Mutex<Option<std::collections::HashSet<u64>>> = parking_lot::Mutex::new(None);
+/// Whether the list has entries (read by every draw without the lock).
+static SKIP_VS_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Adds or removes a vertex shader address; returns whether it is listed now.
 pub fn toggle_skip_vs(addr: u64) -> bool {
     let mut g = SKIP_VS.lock();
     let s = g.get_or_insert_with(Default::default);
-    if s.remove(&addr) {
+    let listed = if s.remove(&addr) {
         false
     } else {
         s.insert(addr);
         true
-    }
+    };
+    SKIP_VS_ANY.store(!s.is_empty(), Ordering::Relaxed);
+    listed
 }
 
 fn equal_bias() -> Option<f32> {
@@ -394,8 +398,10 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepare
     }
 }
 
-/// Pixel shaders whose draws are limited to one pixel (control `tiny`).
+/// Pixel shaders whose draws are limited to one pixel (control `tiny`), and
+/// whether there are any (read by every draw without the lock).
 pub static TINY_SCISSOR: parking_lot::Mutex<Vec<u64>> = parking_lot::Mutex::new(Vec::new());
+pub static TINY_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl Exec {
     /// Executes a draw with the graphics state of `cp`; returns what
@@ -495,7 +501,7 @@ impl Exec {
         if clip & (1 << 22) != 0 {
             return Ok(false); // DX_RASTERIZATION_KILL
         }
-        if SKIP_VS.lock().as_ref().is_some_and(|s| s.contains(&super::super::shaders::ngg_addr(cp))) {
+        if SKIP_VS_ANY.load(Ordering::Relaxed) && SKIP_VS.lock().as_ref().is_some_and(|s| s.contains(&super::super::shaders::ngg_addr(cp))) {
             return Err("vertex shader on the skip list (diagnosis)".into());
         }
         let prim = cp.reg(Space::Uc, 0x242) & 0x3F;
@@ -819,7 +825,7 @@ impl Exec {
             let mut sc = vk::Rect2D { offset: vk::Offset2D { x: x0, y: y0 }, extent: vk::Extent2D { width: (x1 - x0) as u32, height: (y1 - y0) as u32 } };
             // Diagnosis (control `tiny <ps>`): those draws cover one pixel
             // (their vertex work stays, pixel work goes).
-            if TINY_SCISSOR.lock().contains(&ps_addr) {
+            if TINY_ANY.load(Ordering::Relaxed) && TINY_SCISSOR.lock().contains(&ps_addr) {
                 sc.extent = vk::Extent2D { width: 1, height: 1 };
             }
             let scw = [sc.offset.x, sc.offset.y, sc.extent.width as i32, sc.extent.height as i32];

@@ -128,6 +128,9 @@ pub static COPIED_IN: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_BACKS: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_BACK_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static PARTIAL: AtomicU64 = AtomicU64::new(0);
+/// Bumped after stale parts are added (GPU work bound a home for writing):
+/// `Exec`'s cache of clean pages holds while it stays the same.
+pub static STALE_ADDED: AtomicU64 = AtomicU64::new(0);
 
 /// Whether any home exists (fast path for every binding).
 pub fn any() -> bool {
@@ -180,6 +183,7 @@ pub fn bind(base: u64, size: u64, written: bool) -> Option<Bound> {
     };
     if written {
         h.stale.insert(base, size);
+        STALE_ADDED.fetch_add(1, Ordering::AcqRel);
         let note = (base, size, h.shared.id, h.shared.stale_gen.load(Ordering::Acquire));
         STALE_NOTES.with(|n| {
             let mut n = n.borrow_mut();
