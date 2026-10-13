@@ -675,11 +675,12 @@ pub mod tune {
     }
 
     /// The listed compute programs are translated per lane
-    /// (`shaders::PER_LANE_PROGRAMS`, `Spec::per_lane`); switching translates
-    /// them anew.
+    /// (`shaders::PER_LANE_PROGRAMS`, `Spec::per_lane`): 1 all, 2 those
+    /// without subgroup-decided EXEC branches (`Spec::lane_votes`), 0 none;
+    /// switching translates them anew.
     #[inline]
-    pub fn per_lane() -> bool {
-        get(64) != 0
+    pub fn per_lane() -> u64 {
+        get(64)
     }
 
     /// Batch-start copies of ranges no submitted batch writes run on the

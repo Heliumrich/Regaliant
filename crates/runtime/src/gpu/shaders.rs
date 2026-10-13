@@ -675,8 +675,14 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         reg_vars: super::tune::reg_vars(),
         lod_stats: super::tune::lod_stats() == 3,
         early_tests: false,
-        per_lane: super::tune::per_lane() && per_lane_program(code_hash),
+        per_lane: false,
+        lane_votes: false,
     };
+    if super::tune::per_lane() != 0 && per_lane_program(code_hash) {
+        let votes = lane_votes_program(code_hash);
+        spec.per_lane = super::tune::per_lane() == 1 || !votes;
+        spec.lane_votes = spec.per_lane && votes;
+    }
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
     r
@@ -686,20 +692,24 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
 /// their words up to the first s_endpgm, each checked by reading its code:
 /// its cross-lane operations only scalarize per-lane work (FINDINGS.md
 /// 2026-10-13: their translations then take 128 registers instead of 168
-/// and run 35-40% faster).
-const PER_LANE_PROGRAMS: &[(u64, &str)] = &[
+/// and run 35-40% faster); and whether its EXEC branches are decided per
+/// subgroup (`Spec::lane_votes`).
+const PER_LANE_PROGRAMS: &[(u64, &str, bool)] = &[
     // Tiled lighting passes (~40k workgroups of one wave64): per-cluster
     // light masks OR-reduced across the wave (DPP, v_permlanex16,
     // v_readlane of lanes 31 and 63) and walked with s_ff1; light data read
     // with scalar loads, per-lane tests inside.
-    (0xb65e_e39a_31c6_fa92, "tiled pass cs 0x10088ab600"),
-    (0xbf04_60d4_7979_f8d3, "tiled pass cs 0x10088b8200"),
-    // Not the froxel fog cs 0x100892b200 (FNV 0xcb83739fea041817; the same
-    // light-mask walks, two waterfall loops, LDS slots per lane): per lane
-    // it ran in half the time but drew a haze band along the right screen
-    // edge, where its froxel grid leaves partial workgroups (lanes outside
-    // the grid leave early, while the wave-wide reductions of lockstep mode
-    // keep them in with their contribution masked off).
+    (0xb65e_e39a_31c6_fa92, "tiled pass cs 0x10088ab600", false),
+    (0xbf04_60d4_7979_f8d3, "tiled pass cs 0x10088b8200", false),
+    // The froxel fog (the same light-mask walks, two waterfall loops, LDS
+    // slots per lane): per lane in half the time. Its light-mask unions
+    // enable all lanes and read the ones EXEC had masked off as zero; with
+    // EXEC branches decided per invocation such lanes had left the region
+    // and the reads found no value: a haze band along the right screen edge
+    // (the volume is 214 froxels wide in 27 groups of 8; lanes past it read
+    // no depth). Its EXEC branches are decided per 32-lane subgroup
+    // (`Spec::lane_votes`; the tiled passes' would cost them ~20%).
+    (0xcb83_739f_ea04_1817, "froxel fog cs 0x100892b200", true),
 ];
 
 /// Program hashes (`hash_words`) found in PER_LANE_PROGRAMS (read without a
@@ -708,6 +718,14 @@ static PER_LANE_HASHES: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::
 
 fn per_lane_program(code_hash: u64) -> bool {
     code_hash != 0 && PER_LANE_HASHES.iter().any(|h| h.load(std::sync::atomic::Ordering::Relaxed) == code_hash)
+}
+
+/// Program hashes of PER_LANE_PROGRAMS entries with subgroup-decided EXEC
+/// branches.
+static LANE_VOTE_HASHES: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+fn lane_votes_program(code_hash: u64) -> bool {
+    code_hash != 0 && LANE_VOTE_HASHES.iter().any(|h| h.load(std::sync::atomic::Ordering::Relaxed) == code_hash)
 }
 
 /// FNV-1a of a program's bytes up to and including its first s_endpgm.
@@ -726,13 +744,22 @@ fn program_id(words: &[u32]) -> u64 {
 /// Notes a decoded program found in PER_LANE_PROGRAMS (by its hash).
 fn note_per_lane(addr: u64, words: &[u32], hash: u64) {
     let id = program_id(words);
-    let Some(&(_, what)) = PER_LANE_PROGRAMS.iter().find(|p| p.0 == id) else { return };
+    let Some(&(_, what, votes)) = PER_LANE_PROGRAMS.iter().find(|p| p.0 == id) else { return };
     if per_lane_program(hash) {
         return;
     }
+    // (The vote list first: a preparation that finds the program per lane
+    // finds its votes too.)
+    if votes {
+        for slot in &LANE_VOTE_HASHES {
+            if slot.compare_exchange(0, hash, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).is_ok() {
+                break;
+            }
+        }
+    }
     for slot in &PER_LANE_HASHES {
         if slot.compare_exchange(0, hash, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).is_ok() {
-            crate::info!("shader {addr:#x}: translated per lane ({what})");
+            crate::info!("shader {addr:#x}: translated per lane ({what}{})", if votes { "; EXEC branches per subgroup" } else { "" });
             return;
         }
     }
@@ -804,6 +831,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         lod_stats: super::tune::lod_stats() == 3,
         early_tests: ctx(DB_SHADER_CONTROL) & (1 << 12) != 0,
         per_lane: false,
+        lane_votes: false,
     };
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
@@ -946,6 +974,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         lod_stats: super::tune::lod_stats() == 3,
         early_tests: false,
         per_lane: false,
+        lane_votes: false,
     };
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);

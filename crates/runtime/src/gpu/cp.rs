@@ -307,6 +307,9 @@ pub fn gpu_clock() -> u64 {
 
 /// Command buffers up to this size are copied when execution starts.
 const FETCH_DWORDS: u32 = 512;
+/// Payload dwords of each packet of a larger buffer copied when execution
+/// reaches the packet (`Cp::run`).
+const PACKET_FETCH: usize = 32;
 
 /// A command buffer as the CP fetched it (see `Cp::run`): small buffers are
 /// copied, larger ones read from guest memory.
@@ -1868,7 +1871,20 @@ impl Cp {
             PACKETS.fetch_add(1, Ordering::Relaxed);
             self.cur_packet = cur;
             self.cur_opcode = opcode;
-            let p = |i: u64| f.rd(cur + 4 * (1 + i));
+            // The packet as the CP fetches it on reaching it, before it
+            // executes: handlers that wait (for GPU work, a label, a display
+            // buffer) read their arguments as fetched. Read after the wait,
+            // they came from what the title had written into the buffer
+            // meanwhile: a FLIP (which waits for the work before it) took its
+            // arguments from the rewritten buffer while its first dwords had
+            // been read before, the flip failed, and the next frame waited for
+            // its display buffer forever (runs 20261012-195508, -191738).
+            let mut pk = [0u32; PACKET_FETCH];
+            let fetched = if f.words.is_empty() { (n as usize).min(PACKET_FETCH) } else { 0 };
+            for (i, w) in pk.iter_mut().enumerate().take(fetched) {
+                *w = f.rd(cur + 4 * (1 + i as u64));
+            }
+            let p = |i: u64| if (i as usize) < fetched { pk[i as usize] } else { f.rd(cur + 4 * (1 + i)) };
             let command = matches!(
                 opcode,
                 op::DRAW_INDEX_2 | op::DRAW_INDEX_AUTO | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT | op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT

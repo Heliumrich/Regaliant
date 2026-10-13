@@ -1234,7 +1234,6 @@ fn lazy_barriers() -> bool {
     super::tune::lazy_barriers()
 }
 
-#[track_caller]
 /// Records prologue copies grouped by (source, destination) buffer.
 fn record_copies(cmd: vk::CommandBuffer, copies: &mut Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>) {
     if copies.is_empty() {
@@ -1294,6 +1293,7 @@ fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::Comma
     }
 }
 
+#[track_caller]
 fn global_barrier(cmd: vk::CommandBuffer) {
     note_vk(VK_BARRIERS);
     if profiling() {

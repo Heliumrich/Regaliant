@@ -125,6 +125,7 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         lod_stats: std::env::var_os("RDNA_LOD_STATS").is_some(),
         early_tests: false,
         per_lane: false,
+        lane_votes: false,
         stage: u.stage,
         user_sgprs: users,
         user_base,

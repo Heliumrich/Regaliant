@@ -214,6 +214,11 @@ pub struct Spec {
     /// lane the same result. The runtime decides per program (its list of
     /// verified programs).
     pub per_lane: bool,
+    /// Per lane: EXEC and VCC branches are decided for the 32-lane subgroup
+    /// (`branch_cond`), for programs whose cross-lane reads (after saving
+    /// EXEC and enabling all lanes) must find lanes EXEC masked off earlier.
+    /// It costs time where lanes would have skipped a region alone.
+    pub lane_votes: bool,
 }
 
 /// Entries of an image table bound as one array of sampled images
@@ -1209,6 +1214,13 @@ impl<'a> T<'a> {
         e(self.b.i_not_equal(self.t.bool_, None, x, z))
     }
 
+    /// Whether `c` holds in every active invocation of the subgroup.
+    pub fn subgroup_all(&mut self, c: Word) -> R<Word> {
+        self.b.capability(Capability::GroupNonUniformVote);
+        let sg = self.u(spirv::Scope::Subgroup as u32);
+        e(self.b.group_non_uniform_all(self.t.bool_, None, sg, c))
+    }
+
     /// Emits `f` in a block executed only when `cond` holds.
     pub fn guarded(&mut self, cond: Word, f: &mut dyn FnMut(&mut T) -> R<()>) -> R<()> {
         let merge = self.b.id();
@@ -2036,6 +2048,16 @@ fn branch_cond(tr: &mut T, ins: &Inst, before: &[Inst]) -> R<Option<Word>> {
             let o = e(tr.b.bitwise_or(tr.t.u32, None, lo, hi))?;
             let z = tr.u(0);
             let zero = e(tr.b.i_equal(bt, None, o, z))?;
+            // `Spec::lane_votes` (per lane): decided for the 32-lane subgroup
+            // as the hardware decides for the wave, so a lane whose EXEC (or
+            // VCC: compares leave inactive lanes' bits clear) is empty stays
+            // with its subgroup through the region, writing nothing, where
+            // cross-lane operations (DPP, permlanes, lane reads after an
+            // EXEC-all-lanes save) read it as hardware reads a lane EXEC
+            // masked off. Decided per invocation, it left the region and the
+            // reads found no value (the froxel fog's light-mask unions took
+            // garbage at the volume's right edge, whose lanes skip the work).
+            let zero = if tr.spec.lane_votes { tr.subgroup_all(zero)? } else { zero };
             Some(if name.ends_with('z') && !name.ends_with("nz") { zero } else { e(tr.b.logical_not(bt, None, zero))? })
         }
         _ => {
@@ -2498,6 +2520,7 @@ mod tests {
             lod_stats: false,
             early_tests: false,
             per_lane: false,
+            lane_votes: false,
         }
     }
 
