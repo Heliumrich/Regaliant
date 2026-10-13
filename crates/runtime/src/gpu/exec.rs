@@ -2108,8 +2108,29 @@ fn profiling() -> bool {
 /// keeps only the batch ones): BOTTOM_OF_PIPE stamps around every draw and
 /// dispatch serialize the GPU, which inflates the time of small commands.
 pub(super) fn command_stamps() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_PROFILE_GPU_STAMPS").ok().as_deref() != Some("0"))
+    stamp_mode() != 0
+}
+
+/// 0: batch stamps only, 1: every command, 2 (`DS_PROFILE_GPU_STAMPS=big`):
+/// only commands large enough that the serialization does not distort
+/// them (`stamp_worth`).
+fn stamp_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("DS_PROFILE_GPU_STAMPS").ok().as_deref() {
+        Some("0") => 0,
+        Some("big") => 2,
+        _ => 1,
+    })
+}
+
+/// Whether a command of `work` items (a dispatch's workgroups, a draw's
+/// vertices times instances; None: indirect, unknown) gets stamps.
+pub(super) fn stamp_worth(work: Option<u64>, big: u64) -> bool {
+    match stamp_mode() {
+        0 => false,
+        1 => true,
+        _ => work.is_none_or(|w| w >= big),
+    }
 }
 
 /// Timestamps per timed dispatch (all BOTTOM_OF_PIPE): before the shadow
@@ -2476,24 +2497,44 @@ fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str, seq: u6
     if n == 0 || !command_stamps() {
         return;
     }
-    let mut data = vec![0u64; (STAMPS * n) as usize];
-    let r = unsafe { c.device.get_query_pool_results(pool, 0, &mut data, vk::QueryResultFlags::TYPE_64) };
-    if r.is_err() {
+    // Only some commands are stamped (`DS_PROFILE_GPU_STAMPS=big`): each
+    // result with its availability (ash takes the query count from the
+    // slice and the stride from its element: one [value, available] pair
+    // per query), the commands without stamps skipped.
+    let some = stamp_mode() == 2;
+    let mut data = vec![[0u64; 2]; (STAMPS * n) as usize];
+    let r = if some {
+        unsafe { c.device.get_query_pool_results(pool, 0, &mut data, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY) }
+    } else {
+        let mut plain = vec![0u64; (STAMPS * n) as usize];
+        let r = unsafe { c.device.get_query_pool_results(pool, 0, &mut plain, vk::QueryResultFlags::TYPE_64) };
+        for (d, v) in data.iter_mut().zip(plain) {
+            *d = [v, 1];
+        }
+        r
+    };
+    if r.is_err() && !(some && r == Err(vk::Result::NOT_READY)) {
         return;
     }
     let period = c.limits.timestamp_period as f64;
     let ns = |a: u64, b: u64| (b.saturating_sub(a) as f64 * period) as u64;
+    let stamp = |i: usize, k: usize| -> Option<u64> {
+        let [v, available] = data[STAMPS as usize * i + k];
+        (available != 0).then_some(v)
+    };
     let mut g = SHADER_TIME.lock();
     let m = g.get_or_insert_with(HashMap::new);
     for (i, &a) in shaders.iter().take(n as usize).enumerate() {
-        let q = &data[STAMPS as usize * i..STAMPS as usize * (i + 1)];
+        let (Some(q0), Some(q1), Some(q2), Some(q3)) = (stamp(i, 0), stamp(i, 1), stamp(i, 2), stamp(i, 3)) else { continue };
         let e = m.entry(a).or_insert([0; 4]);
         e[0] += 1;
-        e[1] += ns(q[1], q[2]);
-        e[2] += ns(q[0], q[1]);
-        e[3] += ns(q[2], q[3]);
+        e[1] += ns(q1, q2);
+        e[2] += ns(q0, q1);
+        e[3] += ns(q2, q3);
         if i > 0 {
-            GAP_NS.fetch_add(ns(data[STAMPS as usize * i - 1], q[0]), Ordering::Relaxed);
+            if let Some(prev) = stamp(i - 1, STAMPS as usize - 1) {
+                GAP_NS.fetch_add(ns(prev, q0), Ordering::Relaxed);
+            }
         }
     }
 }
@@ -5267,8 +5308,9 @@ impl Exec {
         let qp = self.slots[self.cur].queries;
         let ti = self.batch_shaders.len() as u32;
         let stamp_cmd = self.cmd();
+        let stamped = stamp_worth(indirect.map_or(Some(groups[0] as u64 * groups[1] as u64 * groups[2] as u64), |_| None), 256);
         let stamp = |k: u32| {
-            if qp != vk::QueryPool::null() && ti < MAX_TIMED && command_stamps() {
+            if qp != vk::QueryPool::null() && ti < MAX_TIMED && stamped {
                 unsafe { ctx().device.cmd_write_timestamp(stamp_cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * ti + k) };
             }
         };

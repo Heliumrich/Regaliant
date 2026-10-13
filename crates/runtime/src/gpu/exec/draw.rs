@@ -984,7 +984,7 @@ impl Exec {
             // DS_PROFILE_GPU: timestamps around the draw, keyed by its shader.
             let qp = self.slots[self.cur].queries;
             let ti = self.batch_shaders.len() as u32;
-            let timed = qp != vk::QueryPool::null() && ti < super::MAX_TIMED && super::command_stamps();
+            let timed = qp != vk::QueryPool::null() && ti < super::MAX_TIMED && super::stamp_worth(Some(a.count as u64 * a.instances as u64), 16384);
             if timed {
                 for k in 0..2 {
                     c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, super::STAMPS * ti + k);
