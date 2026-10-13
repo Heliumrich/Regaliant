@@ -7,6 +7,7 @@ mod ehframe;
 mod audio;
 mod exception;
 mod gpu;
+mod guestprof;
 mod heap;
 mod hle;
 mod input;
@@ -557,6 +558,9 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 match (parts.next(), parts.next().and_then(|v| v.parse::<u64>().ok())) {
                     (Some(name), Some(v)) if gpu::tune::set(name, v) => {
                         info!("control: tune {name} = {v} at flip {}", gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
+                        if name == "guest_cpus" {
+                            thread::apply_guest_cpus(v);
+                        }
                         Ok(())
                     }
                     _ => Err("usage: tune <switch> <value> (see gpu::tune)".into()),
@@ -762,6 +766,7 @@ fn main() {
     }
     gpu::capture::init_from_env();
     gpu::start_profiler();
+    guestprof::start();
     if std::env::var_os("DS_TEST_FAULT").is_some() {
         info!("DS_TEST_FAULT: writing to an invalid address from host code");
         unsafe { std::ptr::write_volatile(0x32c3be8 as *mut u64, 1) };

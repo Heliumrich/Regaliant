@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 60] = [
+    static ALL: [Tunable; 62] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -87,6 +87,8 @@ pub mod tune {
         Tunable { name: "upload_parts", env: "DS_UPLOAD_PARTS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "upload_async", env: "DS_UPLOAD_ASYNC", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "cp_priority", env: "DS_CP_PRIORITY", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "cp_cpus", env: "DS_CP_CPUS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "guest_cpus", env: "DS_GUEST_CPUS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -635,6 +637,20 @@ pub mod tune {
     #[inline]
     pub fn cp_priority() -> u64 {
         get(59)
+    }
+
+    /// Logical CPUs the GPU front end's threads may run on (`prio`; a
+    /// decimal mask, 0 = all of the process's).
+    #[inline]
+    pub fn cp_cpus() -> u64 {
+        get(60)
+    }
+
+    /// Logical CPUs the title's threads may run on (`thread::apply_guest_cpus`;
+    /// a decimal mask, 0 = all of the process's).
+    #[inline]
+    pub fn guest_cpus() -> u64 {
+        get(61)
     }
 
     /// A switch's value by name; None if unknown.
@@ -1290,6 +1306,7 @@ pub fn reset_profile() {
     exec::reset_pre_window();
     threadcpu::reset_window();
     crate::audio::reset_window();
+    crate::guestprof::reset();
 }
 
 /// The profile so far (`profile report` control command).
@@ -1304,6 +1321,7 @@ pub fn profile_report() -> String {
         s.push_str(&shaders::prep_cache_line());
     }
     s.push_str(&crate::audio::window_line());
+    s.push_str(&crate::guestprof::report());
     s.push_str(&threadcpu::window_line());
     s
 }

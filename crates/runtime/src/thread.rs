@@ -182,6 +182,43 @@ pub fn enter(t: &'static GuestThread) {
     crate::log::set_thread_name(&t.name());
     t.host_tid.store(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } as u64, Ordering::SeqCst);
     crate::exception::arm_watch_current_thread(true);
+    let cpus = crate::gpu::tune::guest_cpus();
+    if cpus != 0 {
+        set_cpus(unsafe { windows_sys::Win32::System::Threading::GetCurrentThread() }, cpus);
+    }
+}
+
+/// Restricts a host thread to the logical CPUs of `mask` (0: all of the
+/// process's).
+fn set_cpus(h: windows_sys::Win32::Foundation::HANDLE, mask: u64) {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessAffinityMask, SetThreadAffinityMask};
+    let mut m = mask as usize;
+    if m == 0 {
+        let (mut process, mut system) = (0usize, 0usize);
+        if unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut process, &mut system) } == 0 {
+            return;
+        }
+        m = process;
+    }
+    if unsafe { SetThreadAffinityMask(h, m) } == 0 {
+        crate::warn!("thread affinity {m:#x} not set ({})", std::io::Error::last_os_error());
+    }
+}
+
+/// `tune guest_cpus <mask>`: the title's threads, running and later ones,
+/// on the logical CPUs of `mask` (0: all of the process's).
+pub fn apply_guest_cpus(mask: u64) {
+    use windows_sys::Win32::System::Threading::{OpenThread, THREAD_QUERY_INFORMATION, THREAD_SET_INFORMATION};
+    let tids: Vec<u32> = THREADS.lock().iter().filter(|t| t.exited.try_lock().is_some_and(|e| e.is_none())).map(|t| t.host_tid.load(Ordering::Relaxed) as u32).filter(|&tid| tid != 0).collect();
+    for tid in &tids {
+        let h = unsafe { OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, 0, *tid) };
+        if h.is_null() {
+            continue;
+        }
+        set_cpus(h, mask);
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+    }
+    crate::info!("guest threads ({}) restricted to CPU mask {mask:#x} (0: all)", tids.len());
 }
 
 /// Runs guest code `entry(a0, a1)` on the current (already entered) thread.
