@@ -1317,9 +1317,76 @@ struct Batch {
     /// Label writes the GPU performs within it: (address, value, bytes),
     /// made known to waits when it completes (`cp::gpu_label_written`).
     gpu_labels: Vec<(u64, u64, u8)>,
+    /// Its other GPU operations (`ops_line`), named with a slow or lost batch.
+    ops: String,
 }
 
 unsafe impl Send for Batch {}
+
+/// Copies `n` timestamp queries from `first` into `buf` at `off` (8 bytes
+/// each), once the work before them completed: by a full barrier (`tune
+/// ts_nowait`; a copy that waits for availability is the only operation of
+/// a batch that can stall the GPU indefinitely) or by the copy's own wait.
+unsafe fn copy_timestamps(cmd: vk::CommandBuffer, pool: vk::QueryPool, first: u32, n: u32, buf: vk::Buffer, off: u64) {
+    let c = ctx();
+    unsafe {
+        if super::tune::ts_nowait() {
+            global_barrier(cmd);
+            c.device.cmd_copy_query_pool_results(cmd, pool, first, n, buf, off, 8, vk::QueryResultFlags::TYPE_64);
+        } else {
+            c.device.cmd_copy_query_pool_results(cmd, pool, first, n, buf, off, 8, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT);
+        }
+    }
+}
+
+/// A batch's GPU operations besides its draws and dispatches, counted while
+/// it is recorded (`Exec::ops`).
+const OP_FILLS: usize = 0;
+const OP_FILL_BYTES: usize = 1;
+const OP_CP_WRITES: usize = 2;
+const OP_TIMESTAMPS: usize = 3;
+const OP_MERGES: usize = 4;
+const OP_SHADOWS_IN: usize = 5;
+const OP_SHADOW_BYTES: usize = 6;
+const OP_PRE: usize = 7;
+const OP_PRE_BYTES: usize = 8;
+const OP_WRITE_BACK_BYTES: usize = 9;
+const OP_FAST_CLEARS: usize = 10;
+const OPS: usize = 11;
+
+fn ops_line(ops: &[u64; OPS]) -> String {
+    let kib = |b: u64| b.div_ceil(1024);
+    let mut parts = Vec::new();
+    if ops[OP_FILLS] > 0 {
+        parts.push(format!("{} fills ({} KiB)", ops[OP_FILLS], kib(ops[OP_FILL_BYTES])));
+    }
+    if ops[OP_CP_WRITES] > 0 {
+        parts.push(format!("{} CP writes", ops[OP_CP_WRITES]));
+    }
+    if ops[OP_TIMESTAMPS] > 0 {
+        parts.push(format!("{} timestamps", ops[OP_TIMESTAMPS]));
+    }
+    if ops[OP_MERGES] > 0 {
+        parts.push(format!("{} shadow merges", ops[OP_MERGES]));
+    }
+    if ops[OP_SHADOWS_IN] > 0 {
+        parts.push(format!("{} shadow copies in ({} KiB)", ops[OP_SHADOWS_IN], kib(ops[OP_SHADOW_BYTES])));
+    }
+    if ops[OP_PRE] > 0 {
+        parts.push(format!("{} batch-start copies ({} KiB)", ops[OP_PRE], kib(ops[OP_PRE_BYTES])));
+    }
+    if ops[OP_WRITE_BACK_BYTES] > 0 {
+        parts.push(format!("home write-backs {} KiB", kib(ops[OP_WRITE_BACK_BYTES])));
+    }
+    if ops[OP_FAST_CLEARS] > 0 {
+        parts.push(format!("{} fast clears", ops[OP_FAST_CLEARS]));
+    }
+    if parts.is_empty() {
+        "no other operations".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
 
 /// Batches in submission order (sequence numbers increase).
 static BATCHES: Mutex<std::collections::VecDeque<Batch>> = Mutex::new(std::collections::VecDeque::new());
@@ -1556,7 +1623,7 @@ pub fn wait_done(seq: u64) {
 
 /// Queues a batch: `submit` runs (the vkQueueSubmit) under the queue lock so
 /// sequence order is submission order.
-fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, gpu_labels: Vec<(u64, u64, u8)>, submit: impl FnOnce() + Send + 'static) -> u64 {
+fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, gpu_labels: Vec<(u64, u64, u8)>, ops: String, submit: impl FnOnce() + Send + 'static) -> u64 {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         crate::thread::spawn_host("gpu-complete", 1 << 20, Box::new(completion_thread)).expect("gpu completion thread");
@@ -1576,7 +1643,7 @@ fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, ch
         submit();
         note_submitted(seq);
     }
-    q.push_back(Batch { queries, seq, fence, actions, checks, shaders, submitted: std::time::Instant::now(), name: name.to_string(), gpu_labels });
+    q.push_back(Batch { queries, seq, fence, actions, checks, shaders, submitted: std::time::Instant::now(), name: name.to_string(), gpu_labels, ops });
     BATCHES_CV.notify_one();
     seq
 }
@@ -1654,7 +1721,7 @@ fn completion_thread() {
             if let Err(e) = r {
                 if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
                     let list: Vec<String> = b.shaders.iter().map(|a| format!("{a:#x}")).collect();
-                    crate::error!("gpu[{}]: waiting for GPU work: {e}; GPU execution stops (batch shaders: {}); checkpoints: {}", b.name, list.join(" "), super::vk::checkpoint_report());
+                    crate::error!("gpu[{}]: waiting for GPU work: {e}; GPU execution stops (batch #{}: shaders {}; {}); checkpoints: {}", b.name, b.seq, list.join(" "), b.ops, super::vk::checkpoint_report());
                 }
             }
             FLUSHES.fetch_add(1, Ordering::Relaxed);
@@ -1663,7 +1730,7 @@ fn completion_thread() {
             let ms = b.submitted.elapsed().as_millis();
             if ms >= 250 {
                 let list: Vec<String> = b.shaders.iter().map(|a| format!("{a:#x}")).collect();
-                crate::info!("gpu[{}]: batch of {} dispatch(es) took {ms} ms (shaders {})", b.name, b.shaders.len(), list.join(" "));
+                crate::info!("gpu[{}]: batch #{} of {} command(s) took {ms} ms (shaders {}; {})", b.name, b.seq, b.shaders.len(), list.join(" "), b.ops);
             }
         }
         // Label writes the GPU performed within the batch (before its CP
@@ -2583,6 +2650,8 @@ pub struct Exec {
     bound_pool: Vec<Bound>,
     /// Bumped whenever this executor's pending or in-flight writes grow.
     own_gen: u64,
+    /// The recording batch's other GPU operations (`ops_line`).
+    ops: [u64; OPS],
     /// 64 KiB pages that no pending or in-flight write and no stale home part
     /// overlapped when last checked (direct-mapped by page), valid while the
     /// write generations are `clean_tag` (`sync_for_reads`).
@@ -2646,6 +2715,8 @@ struct Closed {
     shared: Vec<(u64, u64, u64)>,
     /// `Exec::shared_kept` of the batch.
     kept: Vec<u64>,
+    /// `ops_line` of the batch.
+    ops: String,
     writes: super::ranges::Ranges,
     checks: Vec<verify::Check>,
     shaders: Vec<u64>,
@@ -2714,6 +2785,7 @@ impl Exec {
                 dyncache: Default::default(),
                 bound_pool: Vec::new(),
                 own_gen: 0,
+                ops: [0; OPS],
                 clean_pages: vec![u64::MAX; CLEAN_SLOTS],
                 clean_tag: [u64::MAX; 3],
                 dirty_reads: Vec::new(),
@@ -2850,6 +2922,7 @@ impl Exec {
         self.begun_mark = super::timeline::mark();
         self.pool_use = [0; 5];
         self.ts_used = 0;
+        self.ops = [0; OPS];
         self.ts_deferred.clear();
         self.eop_unordered = false;
         self.shadow_used = 0;
@@ -2939,7 +3012,7 @@ impl Exec {
                 crate::error!("gpu[{}]: CP effects in a parallel run (dropped)", self.name);
             }
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), kept: std::mem::take(&mut self.shared_kept), writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders) });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), kept: std::mem::take(&mut self.shared_kept), ops: ops_line(&self.ops), writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders) });
             self.slots[i].seq = PENDING;
             self.pending_promises.clear();
             self.pending_log.clear();
@@ -2954,7 +3027,7 @@ impl Exec {
         }
         let commands = self.batch_shaders.len();
         let gpu_labels = self.pending_promises.clone();
-        let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, move || {
+        let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, ops_line(&self.ops), move || {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return;
             }
@@ -3165,6 +3238,7 @@ impl Exec {
         let cmd = self.cmd();
         global_barrier(cmd);
         let total: u64 = parts.iter().map(|p| p.1).sum();
+        self.ops[OP_WRITE_BACK_BYTES] += total;
         static LOGGED: AtomicU64 = AtomicU64::new(0);
         if total >= 1 << 20 && LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
             crate::info!("gpu[{}]: writing back {} KiB of homes for {:x?} (shader {:#x})", self.name, total >> 10, ranges, super::images::BINDING_SHADER.with(|s| s.get()));
@@ -3318,6 +3392,8 @@ impl Exec {
         self.pres.insert((base, size), (buf, off));
         PRE_COPIES.fetch_add(1, Ordering::Relaxed);
         PRE_BYTES.fetch_add(n, Ordering::Relaxed);
+        self.ops[OP_PRE] += 1;
+        self.ops[OP_PRE_BYTES] += n;
         if profiling() {
             note_pre_repeat(base, size, n);
         }
@@ -3365,6 +3441,8 @@ impl Exec {
             self.dispatched = false;
         }
         unsafe { ctx().device.cmd_fill_buffer(cmd, buffer, base - start, len, v) };
+        self.ops[OP_FILLS] += 1;
+        self.ops[OP_FILL_BYTES] += len;
         if !lazy_barriers() {
             global_barrier(cmd);
         }
@@ -3450,6 +3528,7 @@ impl Exec {
             };
             global_barrier(self.cmd());
             FAST_CLEARS.fetch_add(1, Ordering::Relaxed);
+            self.ops[OP_FAST_CLEARS] += 1;
             static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
             if SEEN.lock().get_or_insert_with(HashSet::new).insert(k.base) {
                 crate::info!("images: fast clear of {:#x} {}x{} {:?} ({what}; metadata {:#x})", k.base, k.width, k.height, k.format, c.meta);
@@ -3622,7 +3701,7 @@ impl Exec {
             }
             Some(self.last_seq)
         } else if self.last_seq > done_seq() {
-            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), || {});
+            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), String::new(), || {});
             self.last_seq = seq;
             self.last_action_seq = seq;
             self.cpu_action_seq = seq;
@@ -4065,6 +4144,7 @@ impl Exec {
             UNSUBMITTED_LABELS.lock().get_or_insert_with(HashMap::new).insert(a & !7, self.submit_request.clone());
         }
         GPU_CP_WRITES.fetch_add(1, Ordering::Relaxed);
+        self.ops[OP_CP_WRITES] += 1;
         true
     }
 
@@ -4137,6 +4217,7 @@ impl Exec {
             EOP_LIGHT[1].fetch_add(1, Ordering::Relaxed);
             self.taint_resident(a, 8);
             self.note_write(a, 8);
+            self.ops[OP_TIMESTAMPS] += 1;
             if GPU_TIMESTAMPS.fetch_add(1, Ordering::Relaxed) < 8 {
                 self.ts_check.push(a);
             }
@@ -4145,7 +4226,7 @@ impl Exec {
         unsafe {
             c.device.cmd_reset_query_pool(cmd, pool, q, 1);
             c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, q);
-            c.device.cmd_copy_query_pool_results(cmd, pool, q, 1, tbuf, q as u64 * 8, 8, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT);
+            copy_timestamps(cmd, pool, q, 1, tbuf, q as u64 * 8);
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
             c.device.update_descriptor_sets(&writes, &[]);
@@ -4160,6 +4241,7 @@ impl Exec {
         self.dispatched = false;
         self.taint_resident(a, 8);
         self.note_write(a, 8);
+        self.ops[OP_TIMESTAMPS] += 1;
         if GPU_TIMESTAMPS.fetch_add(1, Ordering::Relaxed) < 8 {
             self.ts_check.push(a);
         }
@@ -4179,7 +4261,7 @@ impl Exec {
         let c = ctx();
         let cmd = self.cmd();
         unsafe {
-            c.device.cmd_copy_query_pool_results(cmd, pool, 0, self.ts_used, tbuf, 0, 8, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT);
+            copy_timestamps(cmd, pool, 0, self.ts_used, tbuf, 0);
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
             c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, tp.pipeline);
@@ -4293,6 +4375,7 @@ impl Exec {
         self.barrier_wanted = false;
         self.dispatched = false;
         MERGES.fetch_add(flush.len() as u64, Ordering::Relaxed);
+        self.ops[OP_MERGES] += flush.len() as u64;
         Ok(())
     }
 
@@ -4493,7 +4576,7 @@ impl Exec {
             let (cmd, fence, queries) = (self.slots[b.slot].cmd, self.slots[b.slot].fence, self.slots[b.slot].queries);
             let name = self.name.clone();
             let pre = b.pre;
-            let seq = push_batch(fence, queries, Vec::new(), b.checks, b.shaders, &self.name, Vec::new(), move || {
+            let seq = push_batch(fence, queries, Vec::new(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, move || {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
                     return;
                 }
@@ -5122,6 +5205,8 @@ impl Exec {
         }
         stamp(0);
         let fresh: Vec<Shadow> = bound.shadows.iter().filter(|s| !s.reused).copied().collect();
+        self.ops[OP_SHADOWS_IN] += fresh.len() as u64;
+        self.ops[OP_SHADOW_BYTES] += fresh.iter().map(|s| s.range).sum::<u64>();
         if !fresh.is_empty() {
             super::vk::checkpoint(self.cmd(), super::vk::mark::SHADOW_IN, p.addr);
             // Shadows get the guest data first (earlier writes are ordered by

@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 56] = [
+    static ALL: [Tunable; 57] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -83,6 +83,7 @@ pub mod tune {
         Tunable { name: "shadow_share", env: "DS_SHADOW_SHARE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "clean_pages", env: "DS_CLEAN_PAGES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "eop_light", env: "DS_EOP_LIGHT", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "ts_nowait", env: "DS_TS_NOWAIT", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     #[inline]
@@ -560,6 +561,16 @@ pub mod tune {
     #[inline]
     pub fn eop_light() -> bool {
         get(55) != 0
+    }
+
+    /// Timestamp queries are copied after a full barrier instead of by a copy
+    /// that waits for their availability: the waiting copy stalled the GPU at
+    /// level loads (device losses in 4 of 4 tours of the configurations that
+    /// showed them, none with this; FINDINGS.md 2026-10-13). 0: the waiting
+    /// copy (for A/B).
+    #[inline]
+    pub fn ts_nowait() -> bool {
+        get(56) != 0
     }
 
     /// A switch's value by name; None if unknown.
