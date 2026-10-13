@@ -652,6 +652,29 @@ pub struct Image {
     overwritten: bool,
 }
 
+/// A host-visible buffer texture data is uploaded from (`Images::staging`).
+struct Staging {
+    buf: vk::Buffer,
+    mem: vk::DeviceMemory,
+    ptr: *mut u8,
+    cap: u64,
+}
+
+/// Staging buffers kept for reuse: up to this many bytes, each of at most
+/// STAGING_POOLED bytes (larger ones are made for their upload alone).
+const STAGING_KEEP: u64 = 128 << 20;
+const STAGING_POOLED: u64 = 32 << 20;
+/// Uploads in flight, and their staging bytes, before the next one waits
+/// for the oldest. Unbounded bytes (up to 32 uploads of ~85 MB arrays, freed
+/// only at a later upload) made guest-memory imports fail by the ten
+/// thousand and preceded device losses (runs 20261013-083710, -084645).
+const MAX_INFLIGHT: usize = 32;
+const MAX_INFLIGHT_BYTES: u64 = 128 << 20;
+/// Uploads that waited for an earlier one (`MAX_INFLIGHT`), and staging
+/// buffers made.
+static UPLOAD_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STAGING_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Pages of a texture are checked for CPU writes in SLICES interleaved
 /// slices, one slice per frame (a change is seen within SLICES frames).
 const SLICES: usize = 8;
@@ -675,7 +698,13 @@ fn upload_check() -> bool {
     *ON.get_or_init(|| std::env::var("DS_UPLOAD_CHECK").ok().as_deref() == Some("1"))
 }
 static SUB_HASHES: Mutex<Option<HashMap<ImageKey, (std::time::Instant, Vec<u64>)>>> = Mutex::new(None);
-static SUB_CHECKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Hashes of each (mip, layer)'s guest bytes at its last upload, by texture
+/// (`tune upload_parts`; SUB_UNMAPPED: not mapped then, SUB_NONE: unknown).
+static SUB_SUMS: Mutex<Option<HashMap<ImageKey, Vec<u64>>>> = Mutex::new(None);
+const SUB_NONE: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+/// Partial re-uploads' candidates left out as unchanged (their hash).
+static SUB_SAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUB_CHECKS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 const SUB_UNMAPPED: u64 = 0x5555_5555_5555_5555;
 
 /// 2D uploads' time (diagnostics), ns: detiling, the staging buffer (made,
@@ -771,6 +800,12 @@ pub struct Images {
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
+    /// Staging buffers not in use (`staging`), uploads submitted without
+    /// waiting (command buffer, fence, the staging buffer it reads; oldest
+    /// first) and the command buffers and fences of completed ones.
+    staging_free: Vec<Staging>,
+    inflight: std::collections::VecDeque<(vk::CommandBuffer, vk::Fence, Staging)>,
+    spare_cmds: Vec<(vk::CommandBuffer, vk::Fence)>,
     reported: HashMap<String, u64>,
     pub uploads: u64,
     pub reuploads: u64,
@@ -829,13 +864,46 @@ pub fn scrubbing() -> bool {
 }
 
 static SCRUB_CHECKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Write-watch scrubbing (`tex_scrub` 2): takes and the pages they covered.
+static SCRUB_TAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SCRUB_TAKE_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SCRUB_EDGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SCRUB_DIRTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn scrubber() {
     super::profile_this_thread("scrub");
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        let marks = super::tune::tex_scrub_mode() == 2;
+        std::thread::sleep(std::time::Duration::from_millis(if marks { 10 } else { 2 }));
         if !scrubbing() || super::shutting_down() {
+            continue;
+        }
+        if marks {
+            // Write-watch marks of the next textures' pages: taking them
+            // tells the write tracker which pages the CPU wrote (the
+            // texture's own region included: re-uploaded at its next use).
+            // In pieces of at most 16 MiB (the copy cache's lock is held
+            // during a take).
+            let work = with(|im| im.scrub_regions(64));
+            let mut pages = Vec::new();
+            for (b, n) in work {
+                let mut a = b;
+                while a < b + n {
+                    let len = (b + n - a).min(16 << 20);
+                    pages.clear();
+                    SCRUB_TAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    SCRUB_TAKE_PAGES.fetch_add(len / 4096, std::sync::atomic::Ordering::Relaxed);
+                    let _ = super::precache::take_written_for(a, len, &mut pages, None);
+                    SCRUB_DIRTY.fetch_add((!pages.is_empty()) as u64, std::sync::atomic::Ordering::Relaxed);
+                    // Written pages only where the texture shares a page with
+                    // other data (its first and last page).
+                    let (first, last) = (b & !4095, (b + n - 1) & !4095);
+                    if !pages.is_empty() && pages.iter().all(|&p| p == first || p == last) {
+                        SCRUB_EDGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    a += len;
+                }
+            }
             continue;
         }
         let work = with(|im| im.scrub_batch(32));
@@ -851,6 +919,15 @@ fn scrubber() {
 
 /// One status line ("" before the scrubber checked anything).
 pub fn scrub_status() -> String {
+    let takes = SCRUB_TAKES.load(std::sync::atomic::Ordering::Relaxed);
+    if takes > 0 {
+        return format!(
+            "    texture scrubbing by write-watch marks: {takes} takes over {} pages, {} found CPU writes ({} only on a first or last page)\n",
+            SCRUB_TAKE_PAGES.load(std::sync::atomic::Ordering::Relaxed),
+            SCRUB_DIRTY.load(std::sync::atomic::Ordering::Relaxed),
+            SCRUB_EDGE.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
     let n = SCRUB_CHECKS.load(std::sync::atomic::Ordering::Relaxed);
     if n == 0 {
         return String::new();
@@ -879,7 +956,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
                 .expect("image pool");
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
-            *g = Some(Images { map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), retired: Vec::new(), depth_grows: 0 });
+            *g = Some(Images { map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), inflight: Default::default(), spare_cmds: Vec::new(), reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), retired: Vec::new(), depth_grows: 0 });
         }
     }
     let im = g.as_mut().unwrap();
@@ -954,6 +1031,95 @@ impl Images {
     }
 
     /// Records commands into the cache's command buffer and waits for them.
+    /// A staging buffer of at least `n` bytes: the smallest free one that
+    /// fits, else a new one (rounded up to a power of two from 1 MiB, so
+    /// they are reused, up to STAGING_POOLED).
+    fn staging(&mut self, n: u64) -> Result<Staging, String> {
+        if let Some(i) = self.staging_free.iter().enumerate().filter(|(_, s)| s.cap >= n).min_by_key(|(_, s)| s.cap).map(|(i, _)| i) {
+            return Ok(self.staging_free.swap_remove(i));
+        }
+        let cap = if n > STAGING_POOLED { n } else { n.max(1 << 20).next_power_of_two() };
+        let (buf, mem, ptr) = ctx().host_buffer(cap, vk::BufferUsageFlags::TRANSFER_SRC)?;
+        STAGING_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Staging { buf, mem, ptr, cap })
+    }
+
+    /// A staging buffer the GPU is done with: kept for reuse or freed.
+    fn release_staging(&mut self, s: Staging) {
+        let kept: u64 = self.staging_free.iter().map(|s| s.cap).sum();
+        if s.cap <= STAGING_POOLED && kept + s.cap <= STAGING_KEEP {
+            self.staging_free.push(s);
+            return;
+        }
+        let d = &ctx().device;
+        unsafe {
+            d.destroy_buffer(s.buf, None);
+            d.unmap_memory(s.mem);
+            d.free_memory(s.mem, None);
+        }
+    }
+
+    /// Recycles the uploads the GPU completed (in submission order); with
+    /// more than `max` in flight or more than `max_bytes` of their staging
+    /// buffers, waits for the oldest.
+    fn reap(&mut self, max: usize, max_bytes: u64) {
+        let c = ctx();
+        while let Some(&(_, fence, _)) = self.inflight.front() {
+            let done = unsafe { c.device.get_fence_status(fence) }.unwrap_or(true);
+            if !done {
+                let bytes: u64 = self.inflight.iter().map(|x| x.2.cap).sum();
+                if self.inflight.len() <= max && bytes <= max_bytes {
+                    break;
+                }
+                UPLOAD_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Err(e) = unsafe { c.device.wait_for_fences(&[fence], true, 10_000_000_000) } {
+                    if !super::exec::DEVICE_LOST.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        crate::error!("images: upload failed: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
+                    }
+                }
+            }
+            let (cmd, fence, s) = self.inflight.pop_front().unwrap();
+            unsafe {
+                c.device.reset_fences(&[fence]).ok();
+                c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
+            }
+            self.spare_cmds.push((cmd, fence));
+            self.release_staging(s);
+        }
+    }
+
+    /// Records and submits a transfer reading staging buffer `s` without
+    /// waiting for it: on the one queue it runs after the work submitted
+    /// before it and before batches submitted later, and its barriers order
+    /// it against the image's other uses; `reap` recycles it.
+    fn submit_upload(&mut self, s: Staging, f: impl FnOnce(vk::CommandBuffer)) {
+        self.reap(MAX_INFLIGHT - 1, MAX_INFLIGHT_BYTES.saturating_sub(s.cap));
+        let c = ctx();
+        let (cmd, fence) = match self.spare_cmds.pop() {
+            Some(x) => x,
+            None => unsafe {
+                let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(self.pool).command_buffer_count(1)).expect("upload cmd")[0];
+                (cmd, c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("upload fence"))
+            },
+        };
+        unsafe {
+            c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
+            f(cmd);
+            c.device.end_command_buffer(cmd).ok();
+            match c.submit(cmd, &[], &[], fence) {
+                Ok(()) => self.inflight.push_back((cmd, fence, s)),
+                Err(e) => {
+                    if !super::exec::DEVICE_LOST.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        crate::error!("images: submit failed: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
+                    }
+                    c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
+                    self.spare_cmds.push((cmd, fence));
+                    self.release_staging(s);
+                }
+            }
+        }
+    }
+
     fn one_shot(&mut self, f: impl FnOnce(vk::CommandBuffer)) {
         let c = ctx();
         unsafe {
@@ -1249,7 +1415,7 @@ impl Images {
             let (s, n) = range(mip, layer);
             whole || (super::cp::valid(t.base + s, n) && crate::mem::os_readable(t.base + s, n))
         };
-        let wanted = |mip: usize, layer: u32| -> bool {
+        let candidate = |mip: usize, layer: u32| -> bool {
             if !precise {
                 return true;
             }
@@ -1259,6 +1425,52 @@ impl Images {
             let i = written.partition_point(|&(pb, pl)| pb + pl <= a);
             written.get(i).is_some_and(|&(pb, _)| pb < e) || only.is_some_and(|parts| parts.iter().any(|&(pb, pl)| pb < e && a < pb.saturating_add(pl)))
         };
+        // Of the candidates, those whose bytes changed since their last
+        // upload (hashes kept per (mip, layer)): the title rewrites texture
+        // memory with the same data (16,143 of 16,146 parts re-uploaded after
+        // CPU writes were unchanged, run 20261013-082344). Mapping is checked
+        // for candidates only (one memory query each; a streamed array has
+        // thousands of (mip, layer)s, most of them not candidates).
+        let sums_on = super::tune::upload_parts();
+        let n_sub = key.levels as usize * layers as usize;
+        let mut sums: Vec<u64> = if sums_on {
+            SUB_SUMS.lock().as_ref().and_then(|m| m.get(&key).cloned()).filter(|v| v.len() == n_sub).unwrap_or_else(|| vec![SUB_NONE; n_sub])
+        } else {
+            Vec::new()
+        };
+        let t_query = std::time::Instant::now();
+        let mut want = vec![false; n_sub];
+        let mut use_mapped = vec![false; n_sub];
+        let mut end = 0u64;
+        for mip in 0..key.levels as usize {
+            for layer in 0..layers {
+                let i = mip * layers as usize + layer as usize;
+                if !candidate(mip, layer) {
+                    continue;
+                }
+                if !mapped(mip, layer) {
+                    want[i] = true;
+                    if sums_on {
+                        sums[i] = SUB_UNMAPPED;
+                    }
+                    continue;
+                }
+                let (s, n) = range(mip, layer);
+                if sums_on {
+                    let h = hash_bytes(t.base + s, n as usize);
+                    if precise && sums[i] == h {
+                        SUB_SAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                    sums[i] = h;
+                }
+                want[i] = true;
+                use_mapped[i] = true;
+                end = end.max(s + n);
+            }
+        }
+        UPLOAD_SPLIT[3].fetch_add(t_query.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let wanted = |mip: usize, layer: u32| want[mip * layers as usize + layer as usize];
         if upload_check() {
             let now: Vec<u64> = (0..key.levels as usize)
                 .flat_map(|mip| (0..layers).map(move |layer| (mip, layer)))
@@ -1272,6 +1484,13 @@ impl Images {
             if let (true, Some((at, prev))) = (precise, map.get(&key)) {
                 for (i, (&a, &b)) in prev.iter().zip(&now).enumerate() {
                     let (mip, layer) = (i / layers as usize, (i % layers as usize) as u32);
+                    if wanted(mip, layer) && a != SUB_UNMAPPED && b != SUB_UNMAPPED {
+                        // Uploaded again: did its bytes change?
+                        SUB_CHECKS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if a == b {
+                            SUB_CHECKS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                     if wanted(mip, layer) || b == SUB_UNMAPPED {
                         continue;
                     }
@@ -1293,23 +1512,11 @@ impl Images {
             }
             map.insert(key, (std::time::Instant::now(), now));
         }
-        // Which wanted (mip, layer)s are mapped (one memory query each; a
-        // streamed array has thousands, most of them not wanted).
-        let t_query = std::time::Instant::now();
-        let mut use_mapped = vec![false; key.levels as usize * layers as usize];
-        let mut end = 0u64;
-        for mip in 0..key.levels as usize {
-            for layer in 0..layers {
-                if wanted(mip, layer) && mapped(mip, layer) {
-                    use_mapped[mip * layers as usize + layer as usize] = true;
-                    let (s, n) = range(mip, layer);
-                    end = end.max(s + n);
-                }
-            }
-        }
-        UPLOAD_SPLIT[3].fetch_add(t_query.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         if end == 0 && precise {
             // Nothing mapped changed.
+            if sums_on {
+                SUB_SUMS.lock().get_or_insert_with(HashMap::default).insert(key, sums);
+            }
             PART_UPLOADS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             PART_UPLOADS[2].fetch_add(key.levels as u64 * layers as u64, std::sync::atomic::Ordering::Relaxed);
             return Ok((t.base, size));
@@ -1362,6 +1569,9 @@ impl Images {
         drop(readers);
         UPLOAD_SPLIT[0].fetch_add(t_detile.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         DETILED.fetch_add(staging.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if sums_on {
+            SUB_SUMS.lock().get_or_insert_with(HashMap::default).insert(key, sums);
+        }
         if precise {
             use std::sync::atomic::Ordering::Relaxed;
             PART_UPLOADS[0].fetch_add(1, Relaxed);
@@ -1395,12 +1605,19 @@ impl Images {
         }
         let c = ctx();
         let t_stage = std::time::Instant::now();
-        let (buf, mem, ptr) = c.host_buffer(staging.len().max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
-        unsafe { std::ptr::copy_nonoverlapping(staging.as_ptr(), ptr, staging.len()) };
+        let asynchronous = super::tune::upload_async();
+        let st = if asynchronous {
+            self.staging(staging.len().max(4) as u64)?
+        } else {
+            let (buf, mem, ptr) = c.host_buffer(staging.len().max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
+            Staging { buf, mem, ptr, cap: staging.len().max(4) as u64 }
+        };
+        let (buf, mem) = (st.buf, st.mem);
+        unsafe { std::ptr::copy_nonoverlapping(staging.as_ptr(), st.ptr, staging.len()) };
         let base = t.base;
         let t_copy = std::time::Instant::now();
         UPLOAD_SPLIT[1].fetch_add((t_copy - t_stage).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        self.one_shot(|cmd| unsafe {
+        let record = |cmd: vk::CommandBuffer| unsafe {
             super::vk::checkpoint(cmd, super::vk::mark::UPLOAD, base);
             // A first upload starts from UNDEFINED; a re-upload keeps the
             // layout and waits for earlier work using the image.
@@ -1415,7 +1632,14 @@ impl Images {
             c.device.cmd_copy_buffer_to_image(cmd, buf, image, vk::ImageLayout::GENERAL, &regions);
             let a = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[a], &[], &[]);
-        });
+        };
+        if asynchronous {
+            self.submit_upload(st, record);
+            UPLOAD_SPLIT[2].fetch_add(t_copy.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.uploads += 1;
+            return Ok((t.base, size));
+        }
+        self.one_shot(record);
         let t_free = std::time::Instant::now();
         UPLOAD_SPLIT[2].fetch_add((t_free - t_copy).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         unsafe {
@@ -1992,6 +2216,11 @@ impl Images {
     /// Re-uploads a CPU-sourced texture whose guest bytes were written
     /// since its upload (write tracking: CPU faults, file reads, GPU writes).
     fn refresh(&mut self, key: ImageKey, t: &Tsharp, frame: u64) -> Result<(), String> {
+        // Staging buffers of completed uploads go back at once (not only at
+        // the next upload).
+        if !self.inflight.is_empty() {
+            self.reap(usize::MAX, u64::MAX);
+        }
         let img = &self.map[&key];
         if img.gpu_written {
             return Ok(());
@@ -2061,6 +2290,30 @@ impl Images {
             self.map.get_mut(&key).unwrap().hashes = h;
         }
         Ok(())
+    }
+
+    /// The guest ranges of the next `max` uploaded textures not marked
+    /// written yet (write-watch scrubbing).
+    fn scrub_regions(&mut self, max: usize) -> Vec<(u64, u64)> {
+        let g = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
+        if self.scrub_gen != g || self.scrub_keys.is_empty() {
+            self.scrub_keys = self.map.iter().filter(|(_, i)| !i.gpu_written && i.source.is_some()).map(|(k, _)| *k).collect();
+            self.scrub_gen = g;
+        }
+        let n = self.scrub_keys.len();
+        let mut out = Vec::new();
+        for _ in 0..max.min(n) {
+            self.scrub_at = (self.scrub_at + 1) % n;
+            let Some(img) = self.map.get(&self.scrub_keys[self.scrub_at]) else { continue };
+            let (false, Some(region)) = (img.gpu_written, img.source) else { continue };
+            if super::track::is_dirty(region) {
+                continue;
+            }
+            if let Some(r) = super::track::range(region) {
+                out.push(r);
+            }
+        }
+        out
     }
 
     /// The next `max` uploaded textures to sample: (tracking region, guest
@@ -2739,9 +2992,19 @@ impl Images {
             .collect();
         let p = &PART_UPLOADS;
         let ww = &crate::mem::WRITE_WATCH_STATS;
-        let check = if upload_check() { format!(" (checked: {} left out, {} changed)", SUB_CHECKS[0].load(Relaxed), SUB_CHECKS[1].load(Relaxed)) } else { String::new() };
+        let check = if upload_check() {
+            format!(
+                " (checked: {} left out, {} changed; {} uploaded again, {} of them unchanged)",
+                SUB_CHECKS[0].load(Relaxed),
+                SUB_CHECKS[1].load(Relaxed),
+                SUB_CHECKS[2].load(Relaxed),
+                SUB_CHECKS[3].load(Relaxed)
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "    images: {} cached, {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms mapping queries), {} ms staging, {} ms transfers); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages); GPU-owned images overwritten through buffers: {} cleared, {} uploaded; re-uploads after mapping changes: {}\n",
+            "    images: {} cached, {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; staging buffers made {}, waits for uploads in flight {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages); GPU-owned images overwritten through buffers: {} cleared, {} uploaded; re-uploads after mapping changes: {}\n",
             self.map.len(),
             self.uploads,
             self.reuploads,
@@ -2752,9 +3015,12 @@ impl Images {
             UPLOAD_SPLIT[3].load(Relaxed) / 1_000_000,
             UPLOAD_SPLIT[1].load(Relaxed) / 1_000_000,
             UPLOAD_SPLIT[2].load(Relaxed) / 1_000_000,
+            STAGING_MADE.load(Relaxed),
+            UPLOAD_WAITS.load(Relaxed),
             p[0].load(Relaxed),
             p[1].load(Relaxed),
             p[2].load(Relaxed),
+            SUB_SAME.load(Relaxed),
             p[3].load(Relaxed) >> 20,
             ww[0].load(Relaxed),
             ww[1].load(Relaxed) as f64 / ww[0].load(Relaxed).max(1) as f64 / 1000.0,

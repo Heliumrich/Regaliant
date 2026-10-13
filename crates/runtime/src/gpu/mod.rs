@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 58] = [
+    static ALL: [Tunable; 59] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -59,7 +59,7 @@ pub mod tune {
         Tunable { name: "par", env: "DS_PAR", default: 5, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_share", env: "DS_PRE_SHARE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "pending_set", env: "DS_PENDING_SET", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "tex_scrub", env: "DS_TEX_SCRUB", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "tex_scrub", env: "DS_TEX_SCRUB", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_share_min", env: "DS_PRE_SHARE_MIN", default: 16384, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_share_mib", env: "DS_PRE_SHARE_MIB", default: 1024, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_share_volatile", env: "DS_PRE_SHARE_VOLATILE", default: 0, value: AtomicU64::new(UNSET) },
@@ -85,6 +85,7 @@ pub mod tune {
         Tunable { name: "eop_light", env: "DS_EOP_LIGHT", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ts_nowait", env: "DS_TS_NOWAIT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "upload_parts", env: "DS_UPLOAD_PARTS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "upload_async", env: "DS_UPLOAD_ASYNC", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     #[inline]
@@ -348,11 +349,22 @@ pub mod tune {
         get(31) != 0
     }
 
-    /// Uploaded textures sampled for CPU writes by a background thread
-    /// (`images::scrubbing`); 0: by the first draw binding each per frame.
+    /// Uploaded textures checked for CPU writes by a background thread
+    /// (`images::scrubbing`): 2 by their write-watch marks (exact; the pages
+    /// go to the write tracker, and re-uploads leave out parts whose bytes
+    /// are unchanged: the title rewrites texture memory with the same data),
+    /// 1 by sampled hashes (the thread's CPU 5.7-6.4 against 2.3-2.5 ms per
+    /// frame, CPU per command +0.4 to +4.4%, run 20261013-083150); 0: by the
+    /// first draw binding each per frame (sampled).
     #[inline]
     pub fn tex_scrub() -> bool {
         get(32) != 0
+    }
+
+    /// `tex_scrub`'s mode.
+    #[inline]
+    pub fn tex_scrub_mode() -> u64 {
+        get(32)
     }
 
     /// Smallest batch-start copy kept in the shared video-memory chunks
@@ -586,6 +598,17 @@ pub mod tune {
     #[inline]
     pub fn upload_parts() -> bool {
         get(57) != 0
+    }
+
+    /// Texture uploads are submitted without waiting for them (1; their
+    /// staging buffers pooled and reused once the GPU is done with them):
+    /// -2.3 s of upload time per gate run. Off: with it, guest-memory
+    /// imports failed by the ten thousand (48 per run without) and two tours
+    /// lost the device early (runs 20261013-083710, -084645; FINDINGS.md
+    /// 2026-10-13); the cause is not known yet.
+    #[inline]
+    pub fn upload_async() -> bool {
+        get(58) != 0
     }
 
     /// A switch's value by name; None if unknown.
