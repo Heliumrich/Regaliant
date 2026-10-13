@@ -28,8 +28,13 @@ thread_local! {
     /// confirmed and the address's registration number (validating them by
     /// hashing their code took a few microseconds per command), plans, and
     /// translations.
-    static LOCAL_PROGRAMS: std::cell::RefCell<HashMap<u64, (u64, u64, Arc<Vec<rdna::Inst>>, u64)>> = std::cell::RefCell::new(HashMap::new());
-    static LOCAL_PLANS: std::cell::RefCell<HashMap<u64, Arc<Plan>>> = std::cell::RefCell::new(HashMap::new());
+    static LOCAL_PROGRAMS: std::cell::RefCell<super::fx::Map<u64, (u64, u64, Arc<Vec<rdna::Inst>>, u64)>> = std::cell::RefCell::new(super::fx::Map::default());
+    static LOCAL_PLANS: std::cell::RefCell<super::fx::Map<u64, Arc<Plan>>> = std::cell::RefCell::new(super::fx::Map::default());
+    /// The reader's sizes in the last full preparation of each plan (ranges
+    /// read, words read, pointers loaded): its vectors start at that
+    /// capacity instead of doubling from empty (their growth was ~4% of the
+    /// graphics command processor's busy samples, run 20261013-143720).
+    static READ_HINTS: std::cell::RefCell<super::fx::Map<u64, [u32; 3]>> = std::cell::RefCell::new(super::fx::Map::default());
     static LOCAL_TRANSLATIONS: std::cell::RefCell<HashMap<(u64, u64), Arc<Translated>>> = std::cell::RefCell::new(HashMap::new());
     /// Translations by (plan key, fast hash of the specialization), checked
     /// by comparing the specialization: SipHashing the whole Spec for every
@@ -165,7 +170,21 @@ pub struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     pub fn new(code_base: u64) -> Reader<'a> {
-        Reader { reads: Vec::new(), words: Vec::new(), unread: Vec::new(), spans: [(0, 0); 4], next_span: 0, ptrs: Vec::new(), code_base }
+        Self::with_sizes(code_base, [0; 3])
+    }
+
+    /// A reader whose vectors start with room for `sizes` (ranges read,
+    /// words read, pointers loaded).
+    fn with_sizes(code_base: u64, sizes: [u32; 3]) -> Reader<'a> {
+        Reader {
+            reads: Vec::with_capacity(sizes[0] as usize),
+            words: Vec::with_capacity(sizes[1] as usize),
+            unread: Vec::new(),
+            spans: [(0, 0); 4],
+            next_span: 0,
+            ptrs: Vec::with_capacity(sizes[2] as usize),
+            code_base,
+        }
     }
 
     /// Whether guest memory [addr, addr + n) is readable: within a recent
@@ -1316,7 +1335,8 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
     }
     let map_gen = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
     let images_gen = super::images::GPU_IMAGES_GEN.load(std::sync::atomic::Ordering::Acquire);
-    let mut rd = Reader::new(addr);
+    let sizes = READ_HINTS.with(|h| h.borrow().get(&plan_key).copied().unwrap_or([0; 3]));
+    let mut rd = Reader::with_sizes(addr, sizes);
     let mut resources = Vec::with_capacity(plan.resources.len());
     let mut res_addrs = Vec::with_capacity(plan.resources.len());
     spec.resources.clear();
@@ -1518,6 +1538,10 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
         }
     }
     // The reader's references into the translation's plan end here.
+    let used = [rd.reads.len() as u32, rd.words.len() as u32, rd.ptrs.len() as u32];
+    if used != sizes {
+        READ_HINTS.with(|h| h.borrow_mut().insert(plan_key, used));
+    }
     let Reader { reads, words, unread, .. } = rd;
     let prepared = Prepared {
         stage: spec.stage,
