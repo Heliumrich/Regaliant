@@ -977,6 +977,7 @@ pub fn record_bench(capture: &str, shader: Option<u64>) -> i32 {
     // The pushed values change every dispatch (ranges vary), as a command's do.
     let info = |i: u32| vk::DescriptorBufferInfo { buffer: dummy, offset: 0, range: DUMMY_BYTES - 16 * (i % 8) as u64 };
     let mut lines = Vec::new();
+    let mut ends: Vec<(f64, f64)> = Vec::new();
     for variant in ["all pushed", "a third pushed", "none pushed", "set bound"] {
         let mut per = Vec::new();
         for _rep in 0..5 {
@@ -1012,12 +1013,25 @@ pub fn record_bench(capture: &str, shader: Option<u64>) -> i32 {
                     c.device.cmd_dispatch(cmd, 1, 1, 1);
                 }
                 per.push(t0.elapsed().as_nanos() as f64 / N as f64);
+                let t1 = std::time::Instant::now();
+                c.device.end_command_buffer(cmd).ok();
+                let t2 = std::time::Instant::now();
+                c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
+                let t3 = std::time::Instant::now();
+                c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
                 c.device.end_command_buffer(cmd).ok();
                 c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
+                ends.push(((t2 - t1).as_nanos() as f64 / 1000.0, (t3 - t2).as_nanos() as f64 / 1000.0));
             }
         }
         per.sort_by(|a, b| a.partial_cmp(b).unwrap());
         lines.push(format!("{variant}: {:.0} ns per dispatch (median of 5; min {:.0}, max {:.0})", per[2], per[0], per[4]));
+    }
+    // End and reset of a command buffer holding N dispatches (the batch
+    // overheads each command processor pays per batch).
+    ends.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    if let Some(&(e, r)) = ends.get(ends.len() / 2) {
+        lines.push(format!("end of a command buffer of {N} dispatches {e:.0} us, its reset {r:.0} us (median)"));
     }
     for l in &lines {
         crate::info!("record bench: cs {addr:#x} ({n} bindings), {N} dispatches recorded: {l}");
@@ -1462,16 +1476,61 @@ static GPU_TIMESTAMPS: AtomicU64 = AtomicU64::new(0);
 /// Batch begins (DS_PROFILE_GPU): [count, ns including slot waits, of them
 /// draws' resident-shadow checks of their indices: count, ns].
 static BEGIN_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Batch submissions (DS_PROFILE_GPU): [count, ns in `submit_for` without
+/// its wait for deferred CP writes].
+static SUBMIT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// `submit_for`'s steps (DS_PROFILE_GPU): ns per step (`SUBMIT_STEP_NAMES`).
+static SUBMIT_STEPS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+const SUBMIT_STEP_NAMES: [&str; 11] = [
+    "shadow write-back",
+    "end rendering",
+    "timestamps",
+    "prologue",
+    "end",
+    "hand-off",
+    "copies submitted",
+    "promises and labels",
+    "in-flight write log",
+    "copy invalidation",
+    "own write log",
+];
+
+/// Times the steps of `submit_for` (profiling).
+struct StepTimer(Option<std::time::Instant>);
+
+impl StepTimer {
+    fn mark(&mut self, k: usize) {
+        if let Some(t) = self.0 {
+            let now = std::time::Instant::now();
+            SUBMIT_STEPS[k].fetch_add((now - t).as_nanos() as u64, Ordering::Relaxed);
+            self.0 = Some(now);
+        }
+    }
+
+    fn restart(&mut self) {
+        if self.0.is_some() {
+            self.0 = Some(std::time::Instant::now());
+        }
+    }
+}
 
 fn begin_stats_line() -> String {
     let s: Vec<u64> = BEGIN_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let slot_wait = WAIT_NS[2].load(Ordering::Relaxed);
+    let sub: Vec<u64> = SUBMIT_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    batch begins: {} ({:.1} us each, slot waits included); draws' index checks against resident shadows: {} ({:.2} us each)\n",
+        "    batch begins: {} ({:.1} us each, slot waits included; {:.1} us without them); submissions {} ({:.1} us each); draws' index checks against resident shadows: {} ({:.2} us each)\n",
         s[0],
         s[1] as f64 / s[0].max(1) as f64 / 1000.0,
+        s[1].saturating_sub(slot_wait) as f64 / s[0].max(1) as f64 / 1000.0,
+        sub[0],
+        sub[1] as f64 / sub[0].max(1) as f64 / 1000.0,
         s[2],
         s[3] as f64 / s[2].max(1) as f64 / 1000.0
-    )
+    ) + &{
+        let steps: Vec<String> = SUBMIT_STEP_NAMES.iter().zip(SUBMIT_STEPS.iter()).map(|(n, v)| format!("{n} {:.1}", v.load(Ordering::Relaxed) as f64 / sub[0].max(1) as f64 / 1000.0)).collect();
+        format!("    submission steps (us each): {}\n", steps.join(", "))
+    }
 }
 /// The first GPU timestamp writes (batch, guest address), compared with the
 /// title's clock once their batch completed (logged; a check of the clock
@@ -1673,7 +1732,7 @@ struct Batch {
     /// made known to waits when it completes (`cp::gpu_label_written`).
     gpu_labels: Vec<(u64, u64, u8)>,
     /// Its other GPU operations (`ops_line`), named with a slow or lost batch.
-    ops: String,
+    ops: [u64; OPS],
 }
 
 unsafe impl Send for Batch {}
@@ -1788,18 +1847,36 @@ struct RangeLog {
     /// with the lock, run 20261011-133502). Never lowered: completion
     /// clears a bucket implicitly (its batch <= done).
     pages: [AtomicU64; PAGE_BUCKETS],
+    /// The same per 4 MiB, for ranges of COARSE_FROM pages or more (marked
+    /// here instead of page by page: the culls' 112 MB home took ~1,800
+    /// atomic updates per batch that wrote it).
+    coarse: [AtomicU64; COARSE_BUCKETS],
 }
 
 const PAGE_BUCKETS: usize = 1 << 16;
 const PAGE_SHIFT: u32 = 16;
+const COARSE_BUCKETS: usize = 1 << 12;
+const COARSE_SHIFT: u32 = 22;
+/// Ranges of this many 64 KiB pages or more are marked per 4 MiB.
+const COARSE_FROM: u64 = 64;
 
 fn page_bucket(page: u64) -> usize {
     (page.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - 16)) as usize
 }
 
+fn coarse_bucket(page: u64) -> usize {
+    (page.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - 12)) as usize
+}
+
 impl RangeLog {
     const fn new() -> RangeLog {
-        RangeLog { log: Mutex::new(super::ranges::SeqRanges::new()), latest_seq: AtomicU64::new(0), notes: AtomicU64::new(0), pages: [const { AtomicU64::new(0) }; PAGE_BUCKETS] }
+        RangeLog {
+            log: Mutex::new(super::ranges::SeqRanges::new()),
+            latest_seq: AtomicU64::new(0),
+            notes: AtomicU64::new(0),
+            pages: [const { AtomicU64::new(0) }; PAGE_BUCKETS],
+            coarse: [const { AtomicU64::new(0) }; COARSE_BUCKETS],
+        }
     }
 
     /// Marks the page buckets of [a, a+n) as written by batch `seq`.
@@ -1808,9 +1885,16 @@ impl RangeLog {
             return;
         }
         let (first, last) = (a >> PAGE_SHIFT, (a + n - 1) >> PAGE_SHIFT);
-        if last - first >= PAGE_BUCKETS as u64 {
-            for b in self.pages.iter() {
-                b.fetch_max(seq, Ordering::SeqCst);
+        if last - first >= COARSE_FROM {
+            let (first, last) = (a >> COARSE_SHIFT, (a + n - 1) >> COARSE_SHIFT);
+            if last - first >= COARSE_BUCKETS as u64 {
+                for b in self.coarse.iter() {
+                    b.fetch_max(seq, Ordering::SeqCst);
+                }
+                return;
+            }
+            for p in first..=last {
+                self.coarse[coarse_bucket(p)].fetch_max(seq, Ordering::SeqCst);
             }
             return;
         }
@@ -1831,6 +1915,7 @@ impl RangeLog {
                 return true;
             }
             (first..=last).any(|p| self.pages[page_bucket(p)].load(Ordering::SeqCst) > done)
+                || ((a >> COARSE_SHIFT)..=((a + n - 1) >> COARSE_SHIFT)).any(|p| self.coarse[coarse_bucket(p)].load(Ordering::SeqCst) > done)
         })
     }
 
@@ -1978,7 +2063,7 @@ pub fn wait_done(seq: u64) {
 
 /// Queues a batch: `submit` runs (the vkQueueSubmit) under the queue lock so
 /// sequence order is submission order.
-fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, gpu_labels: Vec<(u64, u64, u8)>, ops: String, submit: impl FnOnce() + Send + 'static) -> u64 {
+fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, gpu_labels: Vec<(u64, u64, u8)>, ops: [u64; OPS], submit: impl FnOnce() + Send + 'static) -> u64 {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         crate::thread::spawn_host("gpu-complete", 1 << 20, Box::new(completion_thread)).expect("gpu completion thread");
@@ -2078,7 +2163,7 @@ fn completion_thread() {
             if let Err(e) = r {
                 if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
                     let list: Vec<String> = b.shaders.iter().map(|a| format!("{a:#x}")).collect();
-                    crate::error!("gpu[{}]: waiting for GPU work: {e}; GPU execution stops (batch #{}: shaders {}; {}); checkpoints: {}", b.name, b.seq, list.join(" "), b.ops, super::vk::checkpoint_report());
+                    crate::error!("gpu[{}]: waiting for GPU work: {e}; GPU execution stops (batch #{}: shaders {}; {}); checkpoints: {}", b.name, b.seq, list.join(" "), ops_line(&b.ops), super::vk::checkpoint_report());
                 }
             }
             FLUSHES.fetch_add(1, Ordering::Relaxed);
@@ -2087,7 +2172,7 @@ fn completion_thread() {
             let ms = b.submitted.elapsed().as_millis();
             if ms >= 250 {
                 let list: Vec<String> = b.shaders.iter().map(|a| format!("{a:#x}")).collect();
-                crate::info!("gpu[{}]: batch #{} of {} command(s) took {ms} ms (shaders {}; {})", b.name, b.seq, b.shaders.len(), list.join(" "), b.ops);
+                crate::info!("gpu[{}]: batch #{} of {} command(s) took {ms} ms (shaders {}; {})", b.name, b.seq, b.shaders.len(), list.join(" "), ops_line(&b.ops));
             }
         }
         // Label writes the GPU performed within the batch (before its CP
@@ -2449,8 +2534,12 @@ static PRE_REPEAT: Mutex<(u64, Option<HashSet<(u64, u64)>>, [u64; 4], [[u64; 2];
 /// (`images::sampled_hash`); bytes of first-in-frame copies [of ranges not
 /// copied in the two frames before, unchanged since, changed].
 static PRE_STABLE: Mutex<(Option<HashMap<(u64, u64), (u64, u64)>>, [u64; 5])> = Mutex::new((None, [0; 5]));
+/// Bytes of first-in-frame copies of ranges unchanged since an earlier
+/// frame, by why the shared copies did not serve them
+/// (`precache::GONE_NAMES`).
+static PRE_UNCHANGED_WHY: Mutex<[u64; 10]> = Mutex::new([0; 10]);
 
-fn note_pre_stable(base: u64, size: u64, n: u64, frame: u64) {
+fn note_pre_stable(base: u64, size: u64, n: u64, frame: u64, why: u8) {
     let h = super::images::sampled_hash(base, size);
     let mut g = PRE_STABLE.lock();
     let m = g.0.get_or_insert_with(HashMap::new);
@@ -2468,9 +2557,12 @@ fn note_pre_stable(base: u64, size: u64, n: u64, frame: u64) {
         _ => 0,
     };
     g.1[k] += n;
+    if k == 1 {
+        PRE_UNCHANGED_WHY.lock()[(why as usize).min(9)] += n;
+    }
 }
 
-fn note_pre_repeat(base: u64, size: u64, n: u64) {
+fn note_pre_repeat(base: u64, size: u64, n: u64, why: u8) {
     let frame = super::FRAMES.load(Ordering::Relaxed);
     let mut g = PRE_REPEAT.lock();
     if g.0 != frame {
@@ -2482,7 +2574,7 @@ fn note_pre_repeat(base: u64, size: u64, n: u64) {
     let first = g.1.get_or_insert_with(HashSet::new).insert((base, size));
     if first {
         drop(g);
-        note_pre_stable(base, size, n, frame);
+        note_pre_stable(base, size, n, frame, why);
         g = PRE_REPEAT.lock();
     }
     let k = if first { 0 } else { 2 };
@@ -2512,6 +2604,8 @@ fn pre_repeat_line() -> String {
         crate::mem::WRITE_WATCH_STATS[2].load(Ordering::Relaxed)
     );
     let sizes: Vec<String> = ["<4K", "<64K", "<1M", ">=1M"].iter().zip(g.3.iter()).map(|(n, x)| format!("{n} {} ({:.0} MiB)", x[0], mb(x[1]))).collect();
+    let why = *PRE_UNCHANGED_WHY.lock();
+    let whys: Vec<String> = super::precache::GONE_NAMES.iter().zip(why).filter(|&(_, b)| b > 0).map(|(n, b)| format!("{n} {:.0} MiB", mb(b))).collect();
     format!(
         "    batch-start copies within a frame: first {} ({:.0} MiB), repeated {} ({:.0} MiB); by size {}\n",
         g.2[0],
@@ -2520,6 +2614,7 @@ fn pre_repeat_line() -> String {
         mb(g.2[3]),
         sizes.join(", ")
     ) + &stable
+        + &format!("    first-in-frame copies of unchanged ranges, by why no shared copy served them: {}\n", whys.join(", "))
 }
 
 /// Command-processor time per recorded command by phase (DS_PROFILE_GPU),
@@ -3146,7 +3241,7 @@ struct Closed {
     /// `Exec::shared_kept` of the batch.
     kept: Vec<u64>,
     /// `ops_line` of the batch.
-    ops: String,
+    ops: [u64; OPS],
     writes: super::ranges::Ranges,
     checks: Vec<verify::Check>,
     shaders: Vec<u64>,
@@ -3387,20 +3482,30 @@ impl Exec {
             self.discard();
             return;
         }
+        let t_submit = profiling().then(std::time::Instant::now);
+        // (Chunk batches of parallel workers close here without a submission.)
+        let mut st = StepTimer(t_submit.filter(|_| !self.deferred));
+        let mut waited = std::time::Duration::ZERO;
         if profiling() {
             *SUBMIT_WHY.lock().get_or_insert_with(HashMap::new).entry((self.name.clone(), why)).or_default() += 1;
         }
         if let Err(e) = self.flush_resident(None) {
             self.report(format!("shadow write-back: {e}"));
         }
+        st.mark(0);
         if self.submit_after > done_seq() {
             // Deferred CP writes that this work may read come first.
             let tl = super::timeline::mark();
+            let tw = std::time::Instant::now();
             wait_done(self.submit_after);
+            waited = tw.elapsed();
             super::timeline::end(&self.name, tl, || format!("wait: deferred CP writes (#{})", self.submit_after));
+            st.restart();
         }
         self.end_rendering();
+        st.mark(1);
         self.resolve_timestamps();
+        st.mark(2);
         let c = ctx();
         let i = self.cur;
         let (cmd, fence) = (self.slots[i].cmd, self.slots[i].fence);
@@ -3412,12 +3517,14 @@ impl Exec {
             // No prologue: its timestamps read as unavailable.
             unsafe { c.device.cmd_reset_query_pool(cmd, self.slots[i].queries, STAMPS * MAX_TIMED + 2, 2) };
         }
+        st.mark(3);
         unsafe {
             // Make shader writes to imported memory visible to the host.
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[mb], &[], &[]);
             c.device.end_command_buffer(cmd).ok();
         }
+        st.mark(4);
         let actions = std::mem::take(&mut self.actions);
         let has_actions = !actions.is_empty();
         let name = self.name.clone();
@@ -3443,7 +3550,7 @@ impl Exec {
                 crate::error!("gpu[{}]: CP effects in a parallel run (dropped)", self.name);
             }
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), kept: std::mem::take(&mut self.shared_kept), ops: ops_line(&self.ops), writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders) });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders) });
             self.slots[i].seq = PENDING;
             self.pending_promises.clear();
             self.pending_log.clear();
@@ -3458,7 +3565,7 @@ impl Exec {
         }
         let commands = self.batch_shaders.len();
         let gpu_labels = self.pending_promises.clone();
-        let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, ops_line(&self.ops), move || {
+        let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, move || {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return;
             }
@@ -3473,6 +3580,7 @@ impl Exec {
             }
         });
         super::timeline::end(&self.name, self.begun_mark.take(), || format!("batch #{seq}, {commands} commands ({why})"));
+        st.mark(5);
         if std::mem::take(&mut self.gpu_writes_open) {
             self.last_gpu_write_seq = seq;
         }
@@ -3482,6 +3590,7 @@ impl Exec {
         self.slots[i].seq = seq;
         self.open_gen.store(u64::MAX, Ordering::SeqCst);
         super::precache::submitted(&std::mem::take(&mut self.shared_pending), seq);
+        st.mark(6);
         for (a, v, n) in std::mem::take(&mut self.pending_promises) {
             super::cp::promise(seq, a, v, n, false);
         }
@@ -3489,13 +3598,17 @@ impl Exec {
             m.retain(|_, f| !std::sync::Arc::ptr_eq(f, &self.submit_request));
         }
         self.submit_request.store(false, Ordering::SeqCst);
+        st.mark(7);
         let writes = std::mem::take(&mut self.pending);
         self.pending_log.clear();
         INFLIGHT.note_ranges(seq, &writes);
+        st.mark(8);
         // Shared copies made by batches submitted before this one precede
         // its writes on the GPU (see `precache`).
         super::precache::invalidate_ranges_except(&writes, &std::mem::take(&mut self.shared_kept));
+        st.mark(9);
         self.inflight.insert_all(seq, &writes);
+        st.mark(10);
         self.own_gen += 1;
         self.last_seq = seq;
         if has_actions {
@@ -3510,6 +3623,10 @@ impl Exec {
         self.snaps.clear();
         self.pre_used = 0;
         self.pres.clear();
+        if let Some(t) = t_submit {
+            SUBMIT_STATS[0].fetch_add(1, Ordering::Relaxed);
+            SUBMIT_STATS[1].fetch_add(t.elapsed().saturating_sub(waited).as_nanos() as u64, Ordering::Relaxed);
+        }
     }
 
     /// Drops the recorded batch (process shutdown: label waits were released,
@@ -3821,6 +3938,14 @@ impl Exec {
             }
             return None;
         };
+        // (Profiling: why no shared copy served it.)
+        let why = if !profiling() {
+            0
+        } else if share {
+            super::precache::miss_reason(base, size)
+        } else {
+            9
+        };
         let shared = if share { super::precache::insert(base, size, n) } else { None };
         // The batch's own segment for copies not shared (big ones are read
         // in place then).
@@ -3867,7 +3992,7 @@ impl Exec {
         self.ops[OP_PRE] += 1;
         self.ops[OP_PRE_BYTES] += n;
         if profiling() {
-            note_pre_repeat(base, size, n);
+            note_pre_repeat(base, size, n, why);
         }
         Some((buf, off, bias))
     }
@@ -4173,7 +4298,7 @@ impl Exec {
             }
             Some(self.last_seq)
         } else if self.last_seq > done_seq() {
-            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), String::new(), || {});
+            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), [0; OPS], || {});
             self.last_seq = seq;
             self.last_action_seq = seq;
             self.cpu_action_seq = seq;

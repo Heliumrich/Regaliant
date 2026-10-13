@@ -139,7 +139,18 @@ struct Cache {
     watched: Vec<Watched>,
     /// Entry ids `drop_range` leaves (`invalidate_ranges_except`).
     spare: Vec<u64>,
+    /// Why the entries being removed now go (`GONE_*`; diagnostics), and
+    /// per key the reason its entry last went and the frame (DS_PROFILE_GPU:
+    /// `miss_reason`).
+    why: u8,
+    gone: Map<(u64, u64), (u8, u64)>,
 }
+
+/// Why an entry went (`miss_reason`): unknown, CPU writes on its pages, a
+/// failed write-mark query, GPU writes, CP or host writes or a mapping
+/// change, eviction, replaced by a new copy; and the misses with an entry:
+/// its batch not submitted yet, present; and never kept / too small.
+pub const GONE_NAMES: [&str; 10] = ["never kept", "CPU writes", "failed write query", "GPU writes", "CP/host writes or remaps", "eviction", "replaced", "copy not submitted yet", "present", "too small to share"];
 
 /// A written-buffer shadow's window [lo, hi): the count of mark takes
 /// (`Cache::marks`) when one last reported a page in it.
@@ -270,6 +281,12 @@ pub fn worth(size: u64) -> bool {
 impl Cache {
     fn remove(&mut self, key: (u64, u64)) -> bool {
         let Some(e) = self.entries.remove(&key) else { return false };
+        if super::exec::profiling_on() {
+            if self.gone.len() > 1 << 16 {
+                self.gone.clear();
+            }
+            self.gone.insert(key, (self.why, super::FRAMES.load(Ordering::Relaxed)));
+        }
         if let Some(s) = self.chunks.get_mut(e.slot) {
             s.live = s.live.saturating_sub(1);
         }
@@ -393,10 +410,12 @@ impl Cache {
         match self.take_marks(base, size, &mut pages, None) {
             None => {
                 STATS[7].fetch_add(1, Ordering::Relaxed);
+                self.why = 2;
                 self.drop_range(base, base.saturating_add(size), false);
                 self.bounds_changed();
             }
             Some(()) if !pages.is_empty() => {
+                self.why = 1;
                 let n = self.drop_pages(&pages);
                 STATS[3].fetch_add(n, Ordering::Relaxed);
                 self.bounds_changed();
@@ -416,6 +435,7 @@ impl Cache {
     /// idle then.
     fn evict(&mut self, k: usize) -> bool {
         let victim = self.chunks[k].chunk.clone();
+        self.why = 5;
         for key in std::mem::take(&mut self.chunks[k].keys) {
             if self.entries.get(&key).is_some_and(|e| Arc::ptr_eq(&e.chunk, &victim)) {
                 self.remove(key);
@@ -567,11 +587,13 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64)> {
         match c.take_marks(base, size, &mut pages, None) {
             None => {
                 STATS[7].fetch_add(1, Ordering::Relaxed);
+                c.why = 2;
                 c.remove((base, size));
                 c.bounds_changed();
                 return None;
             }
             Some(()) if !pages.is_empty() => {
+                c.why = 1;
                 let n = c.drop_pages(&pages);
                 STATS[3].fetch_add(n, Ordering::Relaxed);
                 c.bounds_changed();
@@ -584,6 +606,17 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64)> {
     let e = c.entries.get(&(base, size))?;
     STATS[0].fetch_add(1, Ordering::Relaxed);
     Some((e.chunk.clone(), e.offset))
+}
+
+/// Why the range has no usable copy (`GONE_NAMES` index; diagnostics).
+pub fn miss_reason(base: u64, size: u64) -> u8 {
+    let g = CACHE.lock();
+    let Some(c) = g.as_ref() else { return 0 };
+    match c.entries.get(&(base, size)) {
+        Some(e) if e.seq == 0 => 7,
+        Some(_) => 8,
+        None => c.gone.get(&(base, size)).map_or(0, |g| g.0),
+    }
 }
 
 /// Space for a new copy of [base, base+size) (`n` bytes from its aligned
@@ -615,6 +648,7 @@ pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
         return None;
     }
     if !pages.is_empty() {
+        c.why = 1;
         let n = c.drop_pages(&pages);
         STATS[3].fetch_add(n, Ordering::Relaxed);
     }
@@ -625,6 +659,7 @@ pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     };
     c.chunks[slot].keys.push((base, size));
     STATS[1].fetch_add(1, Ordering::Relaxed);
+    c.why = 6;
     c.remove((base, size));
     c.chunks[slot].live += 1;
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -673,10 +708,12 @@ pub fn take_written_for(base: u64, size: u64, out: &mut Vec<u64>, except: Option
     match r {
         None => {
             STATS[7].fetch_add(1, Ordering::Relaxed);
+            c.why = 2;
             c.drop_range(base, base.saturating_add(size), false);
             c.bounds_changed();
         }
         Some(()) if out.len() > first => {
+            c.why = 1;
             let n = c.drop_pages(&out[first..]);
             STATS[3].fetch_add(n, Ordering::Relaxed);
             c.bounds_changed();
@@ -718,6 +755,7 @@ fn drop_overlapping(base: u64, len: u64, gpu: bool) {
     }
     let mut g = CACHE.lock();
     let Some(c) = g.as_mut() else { return };
+    c.why = if gpu { 3 } else { 4 };
     let n = c.drop_range(base, base.saturating_add(len), gpu);
     if n > 0 {
         STATS[4].fetch_add(n, Ordering::Relaxed);
@@ -742,6 +780,7 @@ pub fn invalidate_ranges_except(writes: &super::ranges::Ranges, keep: &[u64]) {
     let mut g = CACHE.lock();
     let Some(c) = g.as_mut() else { return };
     c.spare = keep.to_vec();
+    c.why = 3;
     for (a, n) in writes.iter() {
         c.drop_range(a, a.saturating_add(n), true);
     }
