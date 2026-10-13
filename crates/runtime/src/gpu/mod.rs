@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 59] = [
+    static ALL: [Tunable; 60] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -86,15 +86,25 @@ pub mod tune {
         Tunable { name: "ts_nowait", env: "DS_TS_NOWAIT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "upload_parts", env: "DS_UPLOAD_PARTS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "upload_async", env: "DS_UPLOAD_ASYNC", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "cp_priority", env: "DS_CP_PRIORITY", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
-    #[inline]
+    /// A switch's value: one relaxed load once set (inlined into every
+    /// caller; the per-command paths read dozens of switches).
+    #[inline(always)]
     fn get(i: usize) -> u64 {
-        let t = &ALL[i];
-        let v = t.value.load(Ordering::Relaxed);
+        let v = ALL[i].value.load(Ordering::Relaxed);
         if v != UNSET {
             return v;
         }
+        first_get(i)
+    }
+
+    /// The first read of a switch: its environment variable or default.
+    #[cold]
+    #[inline(never)]
+    fn first_get(i: usize) -> u64 {
+        let t = &ALL[i];
         let v = std::env::var(t.env).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(t.default);
         t.value.store(v, Ordering::Relaxed);
         v
@@ -618,6 +628,15 @@ pub mod tune {
         get(58) != 0
     }
 
+    /// Host priority of the GPU front end's threads (`prio`): 0 normal,
+    /// 1 above normal (default since 2026-10-13: on 12 of the 5900X's 24
+    /// logical CPUs 11.3-11.5 flips/s instead of 2.3, the same at 24; run
+    /// 20261013-124535), 2 highest.
+    #[inline]
+    pub fn cp_priority() -> u64 {
+        get(59)
+    }
+
     /// A switch's value by name; None if unknown.
     pub fn value(name: &str) -> Option<u64> {
         ALL.iter().position(|t| t.name == name).map(get)
@@ -637,6 +656,7 @@ pub mod tune {
 
 pub mod ahead;
 pub mod par;
+pub mod prio;
 pub mod precache;
 pub mod exec;
 
@@ -987,6 +1007,7 @@ fn worker(q: &'static Queue, name: &str) {
     // Register states kept for a frame replay (`Ctl::Save`).
     let mut saved: [Option<cp::ChunkState>; 2] = [None, None];
     loop {
+        prio::apply();
         let batch = {
             let mut g = q.pending.lock();
             let mut idle = None;
@@ -1268,6 +1289,7 @@ pub fn reset_profile() {
     images::reset_memo_stats();
     exec::reset_pre_window();
     threadcpu::reset_window();
+    crate::audio::reset_window();
 }
 
 /// The profile so far (`profile report` control command).
@@ -1281,6 +1303,7 @@ pub fn profile_report() -> String {
     if !exec::profiling_on() {
         s.push_str(&shaders::prep_cache_line());
     }
+    s.push_str(&crate::audio::window_line());
     s.push_str(&threadcpu::window_line());
     s
 }

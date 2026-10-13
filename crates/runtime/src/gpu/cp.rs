@@ -553,6 +553,11 @@ static WAITED: parking_lot::Mutex<Option<HashSet<u64>>> = parking_lot::Mutex::ne
 /// the command processors record ahead of the GPU instead of idling until
 /// each batch completes. `DS_PROMISES=0` turns this off.
 static PROMISES: parking_lot::Mutex<Option<HashMap<u64, (u64, u64, u8, bool)>>> = parking_lot::Mutex::new(None);
+/// Moves with every promise made: a polling wait looks at the promises
+/// again only then (one that did not satisfy it cannot start to; it can
+/// only go stale). Every poll took PROMISES' lock before: ~6% of the
+/// compute queues' busy samples, run 20261013-115322.
+static PROMISE_GEN: AtomicU64 = AtomicU64::new(0);
 /// Waits passed on a promise (diagnostics).
 pub static PROMISED: AtomicU64 = AtomicU64::new(0);
 /// Multi-draw packets (DRAW_INDIRECT_MULTI / DRAW_INDEX_INDIRECT_MULTI), the
@@ -577,6 +582,8 @@ pub(super) fn promise(seq: u64, addr: u64, value: u64, bytes: u8, by_cpu: bool) 
         m.retain(|_, p| p.0 > done);
     }
     m.insert(addr, (seq, value, bytes, by_cpu));
+    drop(g);
+    PROMISE_GEN.fetch_add(1, Ordering::Release);
 }
 
 /// The batch whose promised write to `addr` satisfies the comparison, and
@@ -2681,8 +2688,13 @@ impl Cp {
         let t0 = Instant::now();
         let tl = super::timeline::mark();
         let use_promise = self.exec.is_some();
+        let promises_seen = std::cell::Cell::new(u64::MAX);
+        let promises_moved = || {
+            let g = PROMISE_GEN.load(Ordering::Acquire);
+            promises_seen.replace(g) != g
+        };
         let r = self.poll_until(at, &what, || {
-            hit.load(Ordering::SeqCst) || compare(func, read() & mask, reference & mask) || (use_promise && promised(a, wide, func, mask, reference).is_some())
+            hit.load(Ordering::SeqCst) || compare(func, read() & mask, reference & mask) || (use_promise && promises_moved() && promised(a, wide, func, mask, reference).is_some())
         });
         {
             let by = last_write(a).map(|w| w.0).unwrap_or_else(|| "cpu".into());

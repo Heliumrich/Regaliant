@@ -31,6 +31,21 @@ struct Mixer {
 static MIXER: OnceLock<Mixer> = OnceLock::new();
 pub static UNDERRUN_FRAMES: AtomicU64 = AtomicU64::new(0);
 pub static PLAYED_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// UNDERRUN_FRAMES and PLAYED_FRAMES at the last `profile reset`.
+static AT_RESET: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Starts a profile window (`profile reset`).
+pub fn reset_window() {
+    AT_RESET[0].store(UNDERRUN_FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
+    AT_RESET[1].store(PLAYED_FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+/// Played and underrun seconds since `profile reset` (profile report).
+pub fn window_line() -> String {
+    let u = UNDERRUN_FRAMES.load(Ordering::Relaxed).saturating_sub(AT_RESET[0].load(Ordering::Relaxed));
+    let p = PLAYED_FRAMES.load(Ordering::Relaxed).saturating_sub(AT_RESET[1].load(Ordering::Relaxed));
+    format!("    audio in the window: {:.1} s played, {:.2} s underrun\n", p as f64 / RATE as f64, u as f64 / RATE as f64)
+}
 
 /// Stream 0 belongs to AudioOut2 (one context mixes everything it pushes).
 pub const STREAM_AUDIOOUT2: usize = 0;
@@ -63,6 +78,9 @@ fn ensure(streams: &mut Vec<Stream>, id: usize) {
 /// Queues one stereo interleaved grain on stream `id`, blocking while the
 /// stream already holds `depth` grains.
 pub fn push_stream(id: usize, grain: Vec<f32>, depth: usize) {
+    // (The title mixes in its job system: any of its 13 job workers pushes
+    // here, so raising producers raised the spinning workers to the GPU
+    // front end's level and undid `gpu::prio`, run 20261013-123910.)
     let m = mixer();
     let mut s = m.streams.lock();
     ensure(&mut s, id);
@@ -144,6 +162,12 @@ fn mix_into(out: &mut [f32], frames: usize) {
 
 fn output_thread() {
     crate::log::set_thread_name("audio-out");
+    // Little work per wake-up, but late work is heard: above the title's
+    // threads and the GPU front end's (`gpu::prio`).
+    unsafe {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST};
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    }
     match wasapi::run() {
         Ok(()) => {}
         Err(e) => {

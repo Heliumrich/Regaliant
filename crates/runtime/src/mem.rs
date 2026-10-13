@@ -84,8 +84,12 @@ struct RemapStats {
 
 static REMAP: Mutex<RemapStats> = Mutex::new(RemapStats { in_place: 0, in_place_bytes: 0, moved: 0, moved_bytes: 0, logged: 0, released: BTreeMap::new() });
 
-/// `readable_span` calls and cache misses (diagnostics).
+/// `readable_span` calls and cache misses (diagnostics). Calls are counted
+/// per thread and added here every SPAN_CALLS_BATCH (one shared counter
+/// bumped by every recording thread ~2.3 million times per second was
+/// 0.5-1% of their busy samples, run 20261013-115322).
 static SPAN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const SPAN_CALLS_BATCH: u32 = 1024;
 static SPAN_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One status line (diagnostics).
@@ -163,6 +167,8 @@ thread_local! {
     /// disjoint; valid for one MAP_GEN value (`revalidate` carries them
     /// over changes elsewhere).
     static READABLE: std::cell::RefCell<(u64, Vec<(u64, u64, bool)>)> = const { std::cell::RefCell::new((u64::MAX, Vec::new())) };
+    /// This thread's `readable_span` calls not yet added to SPAN_CALLS.
+    static SPAN_CALLS_LOCAL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// The run of adjacent accessible mappings containing `a` as [start, end)
@@ -171,7 +177,15 @@ thread_local! {
 /// descriptor and buffer they read, ~2.3 million times per second in the
 /// courtyard; the mapping table lock is shared with the title's threads).
 pub fn readable_span(a: u64) -> Option<(u64, u64)> {
-    SPAN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SPAN_CALLS_LOCAL.with(|n| {
+        let k = n.get() + 1;
+        if k == SPAN_CALLS_BATCH {
+            SPAN_CALLS.fetch_add(k as u64, std::sync::atomic::Ordering::Relaxed);
+            n.set(0);
+        } else {
+            n.set(k);
+        }
+    });
     let generation = MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
     let hit = READABLE.with(|c| {
         let mut c = c.borrow_mut();

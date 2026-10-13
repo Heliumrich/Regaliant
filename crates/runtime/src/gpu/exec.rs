@@ -1744,6 +1744,7 @@ fn submitter_thread() {
     crate::log::set_thread_name("gpu-submit");
     super::profile_this_thread("submit");
     loop {
+        super::prio::apply();
         let (seq, job) = {
             let mut q = SUBMIT_Q.lock();
             loop {
@@ -1776,6 +1777,7 @@ fn completion_thread() {
     crate::log::set_thread_name("gpu-complete");
     super::profile_this_thread("complete");
     loop {
+        super::prio::apply();
         let mut b = {
             let mut q = BATCHES.lock();
             loop {

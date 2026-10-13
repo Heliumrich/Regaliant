@@ -173,6 +173,7 @@ impl Default for Pool {
 
 fn run_worker(w: &Worker) {
     loop {
+        super::prio::apply();
         let job = {
             let mut g = w.job.lock();
             loop {

@@ -13,7 +13,7 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 use crate::HashMap;
 
 /// Source of a 64-bit pointer used by scalar loads.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Eq, Hash)]
 pub enum Ptr {
     /// User-data SGPR pair (lo index).
     User(u16),
@@ -23,6 +23,20 @@ pub enum Ptr {
     /// program's first instruction, resolved with the address of the copy
     /// that runs (the title loads the same program at several addresses).
     Pc(u64),
+}
+
+/// Structural equality with a chain's offset compared before the chain it
+/// is loaded from: unequal chains (most comparisons when a preparation
+/// looks up the pointers it loaded) differ without following the boxes.
+impl PartialEq for Ptr {
+    fn eq(&self, other: &Ptr) -> bool {
+        match (self, other) {
+            (Ptr::User(a), Ptr::User(b)) => a == b,
+            (Ptr::Mem(pa, oa), Ptr::Mem(pb, ob)) => oa == ob && pa == pb,
+            (Ptr::Pc(a), Ptr::Pc(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// Provenance of one SGPR dword.
