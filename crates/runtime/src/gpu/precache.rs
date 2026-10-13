@@ -347,10 +347,16 @@ impl Cache {
 
     /// `mem::take_written` for the cache: the pages reported also date the
     /// watched windows they fall in (a failed query dates those overlapping
-    /// the range).
-    fn take_marks(&mut self, base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
+    /// the range), and texture regions on them other than `except` are told
+    /// (`track::cpu_pages`: taking the marks resets them).
+    fn take_marks(&mut self, base: u64, size: u64, out: &mut Vec<u64>, except: Option<u32>) -> Option<()> {
         let first = out.len();
         let r = crate::mem::take_written(base, size, out);
+        match r {
+            Some(()) if out.len() > first => super::track::cpu_pages(&out[first..], except),
+            Some(()) => {}
+            None => super::track::cpu_range(base, size, except),
+        }
         if self.watched.is_empty() {
             return r;
         }
@@ -384,7 +390,7 @@ impl Cache {
     /// `lookup`), watched windows are dated.
     fn take_and_drop(&mut self, base: u64, size: u64) {
         let mut pages = Vec::new();
-        match self.take_marks(base, size, &mut pages) {
+        match self.take_marks(base, size, &mut pages, None) {
             None => {
                 STATS[7].fetch_add(1, Ordering::Relaxed);
                 self.drop_range(base, base.saturating_add(size), false);
@@ -558,7 +564,7 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64)> {
     if e.checked != epoch {
         STATS[2].fetch_add(1, Ordering::Relaxed);
         let mut pages = Vec::new();
-        match c.take_marks(base, size, &mut pages) {
+        match c.take_marks(base, size, &mut pages, None) {
             None => {
                 STATS[7].fetch_add(1, Ordering::Relaxed);
                 c.remove((base, size));
@@ -604,7 +610,7 @@ pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     // The range's write marks so far: the copy sees those writes (it runs
     // later), other entries on those pages are stale.
     let mut pages = Vec::new();
-    if c.take_marks(base, size, &mut pages).is_none() {
+    if c.take_marks(base, size, &mut pages, None).is_none() {
         STATS[7].fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -652,6 +658,32 @@ pub fn submitted(made: &[(u64, u64, u64)], seq: u64) {
             }
         }
     }
+}
+
+/// The pages of guest [base, base+size) the CPU wrote since their write
+/// marks were last taken, into `out` (texture re-uploads; None: unknown,
+/// treat it all as written). The marks are taken under the cache's lock like
+/// its own takes: entries on those pages go, watched windows are dated, and
+/// texture regions on them other than `except` (the caller's) are told.
+pub fn take_written_for(base: u64, size: u64, out: &mut Vec<u64>, except: Option<u32>) -> Option<()> {
+    let mut g = CACHE.lock();
+    let c = g.get_or_insert_with(Cache::default);
+    let first = out.len();
+    let r = c.take_marks(base, size, out, except);
+    match r {
+        None => {
+            STATS[7].fetch_add(1, Ordering::Relaxed);
+            c.drop_range(base, base.saturating_add(size), false);
+            c.bounds_changed();
+        }
+        Some(()) if out.len() > first => {
+            let n = c.drop_pages(&out[first..]);
+            STATS[3].fetch_add(n, Ordering::Relaxed);
+            c.bounds_changed();
+        }
+        Some(()) => {}
+    }
+    r
 }
 
 /// Guest [base, base+len) may have changed (CP, host and mapping changes):

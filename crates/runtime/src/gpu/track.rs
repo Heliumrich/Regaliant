@@ -71,6 +71,8 @@ pub enum Why {
     Forced,
     /// Sampled bytes changed (texture scrubbing: CPU writes).
     Sampled,
+    /// CPU writes reported by write-watch marks (`cpu_pages`).
+    Written(u64),
 }
 
 #[derive(Default)]
@@ -164,13 +166,18 @@ impl Tracker {
 
     /// Calls `f` for every region overlapping [base, base+len).
     fn each_overlapping(&mut self, base: u64, len: u64, mut f: impl FnMut(&mut Region)) {
+        self.each_overlapping_id(base, len, |_, r| f(r));
+    }
+
+    /// `each_overlapping` with the region ids.
+    fn each_overlapping_id(&mut self, base: u64, len: u64, mut f: impl FnMut(u32, &mut Region)) {
         let end = base.saturating_add(len);
         let Tracker { regions, by_base, max_size, .. } = self;
         for (_, ids) in by_base.range(base.saturating_sub(*max_size)..end) {
             for &id in ids {
                 if let Some(Some(r)) = regions.get_mut(id as usize) {
                     if r.base < end && base < r.base + r.size {
-                        f(r);
+                        f(id, r);
                     }
                 }
             }
@@ -297,22 +304,80 @@ pub fn take_dirty(id: u32) -> Option<(Why, Option<Vec<(u64, u64)>>)> {
             RESET_GEN.fetch_add(1, Ordering::Release);
             let whole = std::mem::replace(&mut r.whole, false);
             let parts = std::mem::take(&mut r.parts);
+            if events_on() {
+                let mut h = TAKES.lock();
+                if h.len() >= 1 << 14 {
+                    h.pop_front();
+                }
+                h.push_back((std::time::Instant::now(), id, whole, parts.clone()));
+            }
             Some((r.why, (!whole).then_some(parts)))
         }
         _ => None,
     }
 }
 
-/// Marks a region dirty, written somewhere (sampled hashes changed: texture
-/// scrubbing).
+/// Marks a region dirty, written by the CPU somewhere (sampled hashes
+/// changed: texture scrubbing). The written ranges known so far stay: its
+/// consumer finds CPU-written pages by their write-watch marks.
 pub fn sampled_dirty(id: u32) {
     let mut g = TRACK.lock();
     if let Some(r) = g.as_mut().and_then(|t| t.regions.get_mut(id as usize)).and_then(|r| r.as_mut()) {
         if !r.dirty {
             changed(0);
         }
-        r.mark(None, Why::Sampled);
+        r.mark(Some((0, 0)), Why::Sampled);
     }
+}
+
+/// The CPU wrote `pages` (ascending 4 KiB page addresses: write-watch marks,
+/// which their taker reset): regions on them other than `except` are dirty
+/// with those parts.
+pub fn cpu_pages(pages: &[u64], except: Option<u32>) {
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for &p in pages {
+        match runs.last_mut() {
+            Some(r) if r.0 + r.1 == p => r.1 += PAGE,
+            _ => runs.push((p, PAGE)),
+        }
+    }
+    runs.retain(|&(b, n)| may_have_region(b, n));
+    for &(b, n) in &runs {
+        note_event("CPU write (write watch)", b, n);
+    }
+    if runs.is_empty() {
+        return;
+    }
+    let mut g = TRACK.lock();
+    let Some(t) = g.as_mut() else { return };
+    for (b, n) in runs {
+        t.each_overlapping_id(b, n, |id, r| {
+            if Some(id) != except {
+                if !r.dirty {
+                    changed(2);
+                }
+                r.mark(Some((b, n)), Why::Written(b));
+            }
+        });
+    }
+}
+
+/// Write marks of [base, base+len) could not be taken: regions on it other
+/// than `except` count it as written.
+pub fn cpu_range(base: u64, len: u64, except: Option<u32>) {
+    if !may_have_region(base, len) {
+        return;
+    }
+    let mut g = TRACK.lock();
+    let Some(t) = g.as_mut() else { return };
+    t.each_overlapping_id(base, len, |id, r| {
+        if Some(id) != except {
+            if !r.dirty {
+                changed(2);
+            }
+            r.mark(Some((base, len)), Why::Written(base));
+        }
+    });
 }
 
 /// Marks a region dirty (its texture is uploaded again at its next use).
@@ -324,6 +389,14 @@ pub fn force_dirty(id: u32) {
         }
         r.mark(None, Why::Forced);
     }
+}
+
+/// Whether the region holds written parts not taken yet that overlap
+/// [base, base+len) (or is written all over).
+pub fn pending_overlaps(id: u32, base: u64, len: u64) -> bool {
+    let g = TRACK.lock();
+    let Some(r) = g.as_ref().and_then(|t| t.regions.get(id as usize)).and_then(|r| r.as_ref()) else { return false };
+    r.dirty && (r.whole || r.parts.iter().any(|&(b, n)| b < base + len && base < b.saturating_add(n)))
 }
 
 /// Whether the region is marked dirty (not yet taken).
@@ -431,6 +504,7 @@ impl Drop for HostWrite {
 /// pages in the range become writable, their regions dirty, and they stay
 /// writable while the returned guard lives.
 pub fn host_write(base: u64, len: u64) -> HostWrite {
+    note_event("host write", base, len);
     super::precache::invalidate(base, len);
     if len == 0 {
         return HostWrite(None, base, 0);
@@ -473,6 +547,7 @@ pub fn gpu_write(base: u64, len: u64) {
     if !may_have_region(base, len) {
         return;
     }
+    note_event("GPU write (recorded)", base, len);
     let mut g = TRACK.lock();
     let Some(t) = g.as_mut() else { return };
     t.each_overlapping(base, len, |r| {
@@ -484,6 +559,44 @@ pub fn gpu_write(base: u64, len: u64) {
     });
 }
 
+/// DS_UPLOAD_CHECK=1: the writes announced over tracked regions, newest
+/// last ((when, what, base, len); diagnostics of changed texture parts).
+static EVENTS: parking_lot::Mutex<std::collections::VecDeque<(std::time::Instant, &'static str, u64, u64)>> = parking_lot::Mutex::new(std::collections::VecDeque::new());
+
+fn events_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_UPLOAD_CHECK").ok().as_deref() == Some("1"))
+}
+
+fn note_event(what: &'static str, base: u64, len: u64) {
+    if !events_on() || !may_have_region(base, len) {
+        return;
+    }
+    let mut e = EVENTS.lock();
+    if e.len() >= 1 << 16 {
+        e.pop_front();
+    }
+    e.push_back((std::time::Instant::now(), what, base, len));
+}
+
+/// DS_UPLOAD_CHECK=1: `take_dirty` results ((when, region, whole, parts)).
+static TAKES: parking_lot::Mutex<std::collections::VecDeque<(std::time::Instant, u32, bool, Vec<(u64, u64)>)>> = parking_lot::Mutex::new(std::collections::VecDeque::new());
+
+/// The region's `take_dirty` results since `since` (diagnostics).
+pub fn takes_since(id: u32, since: std::time::Instant) -> Vec<String> {
+    let h = TAKES.lock();
+    h.iter().filter(|x| x.1 == id && x.0 >= since).map(|x| format!("{} ms after: {}", (x.0 - since).as_millis(), if x.2 { "whole".to_string() } else { format!("{:x?}", x.3) })).collect()
+}
+
+/// The noted writes overlapping [base, base+len) since `since` (diagnostics).
+pub fn events_since(base: u64, len: u64, since: std::time::Instant) -> Vec<String> {
+    let e = EVENTS.lock();
+    e.iter()
+        .filter(|x| x.0 >= since && x.2 < base + len && base < x.2.saturating_add(x.3))
+        .map(|x| format!("{} {:#x}+{:#x} {} ms after", x.1, x.2, x.3, (x.0 - since).as_millis()))
+        .collect()
+}
+
 /// Kinds of mapping change (`Why::Remap`).
 pub const REMAP_COMMIT: u8 = 0;
 pub const REMAP_DECOMMIT: u8 = 1;
@@ -493,6 +606,7 @@ pub const REMAP_PROTECT: u8 = 2;
 /// base+len) (`op`: `REMAP_*`): its page states are forgotten (re-registered
 /// on re-arming) and overlapping regions are dirty.
 pub fn remapped(base: u64, len: u64, op: u8) {
+    note_event(["commit", "decommit", "protection"][(op as usize).min(2)], base, len);
     super::precache::invalidate(base, len);
     super::homes::remapped(base, len);
     RESET_GEN.fetch_add(1, Ordering::Release);

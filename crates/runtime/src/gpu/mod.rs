@@ -84,7 +84,7 @@ pub mod tune {
         Tunable { name: "clean_pages", env: "DS_CLEAN_PAGES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "eop_light", env: "DS_EOP_LIGHT", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ts_nowait", env: "DS_TS_NOWAIT", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "upload_parts", env: "DS_UPLOAD_PARTS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "upload_parts", env: "DS_UPLOAD_PARTS", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     #[inline]
@@ -575,14 +575,14 @@ pub mod tune {
         get(56) != 0
     }
 
-    /// Re-uploads after file reads and mapping changes upload only the
-    /// (mip, layer)s the written ranges overlap (1): the title streams
-    /// texture arrays a layer at a time (1024x1024x64 BC7, 1024x1024x80), and
-    /// every layer it mapped re-uploads the whole array (FINDINGS.md
-    /// 2026-10-13). Off: the title fills mapped layers and small mips with
-    /// CPU writes later, which only the whole re-uploads picked up
-    /// (DS_UPLOAD_CHECK=1 found 29 of 23,807 left-out (mip, layer)s changed,
-    /// run 20261013-065447).
+    /// Texture re-uploads upload only the (mip, layer)s that the written
+    /// ranges (mappings, file reads) or the CPU's writes since the last
+    /// upload (write-watch marks, taken through the copy cache) overlap: the
+    /// title streams texture arrays a layer at a time (1024x1024x64 BC7,
+    /// 1024x1024x256), and every layer it mapped re-uploaded the whole array.
+    /// Upload time -32% and the level load to the gate 18.2 -> 13.5 s (runs
+    /// 20261013-073959 / -073718); DS_UPLOAD_CHECK=1 found no changed part
+    /// left out (run -072814). 0: whole re-uploads (for A/B).
     #[inline]
     pub fn upload_parts() -> bool {
         get(57) != 0
