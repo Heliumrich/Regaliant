@@ -270,6 +270,21 @@ pub const GDS_BYTES: u32 = 64 << 10;
 /// 1 to dword 0 of the watchdog binding and stores its program address
 /// (from the SGPR data, `code_base_offset`) in dwords 1 (low) and 2 (high).
 pub const LOOP_LIMIT: u32 = 1 << 20;
+/// The limit translations use: LOOP_LIMIT unless set (`set_loop_limit`;
+/// diagnosis of device losses, `DS_LOOP_LIMIT`: a lower limit names a
+/// shader whose every invocation loops long instead of losing the device).
+static LOOP_LIMIT_SET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_loop_limit(n: u32) {
+    LOOP_LIMIT_SET.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn loop_limit() -> u32 {
+    match LOOP_LIMIT_SET.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => LOOP_LIMIT,
+        n => n,
+    }
+}
 /// Size of the watchdog binding in dwords.
 pub const WATCHDOG_DWORDS: u32 = 4;
 
@@ -2179,7 +2194,7 @@ fn emit_loop(tr: &mut T, code: &[Inst], starts: &[u32], loops: &[(u32, u32)], lo
         let one = tr.u(1);
         let n = e(tr.b.i_add(tr.t.u32, None, n, one))?;
         ok(tr.b.store(ctr, n, None, []))?;
-        let lim = tr.u(LOOP_LIMIT);
+        let lim = tr.u(loop_limit());
         let over = e(tr.b.u_greater_than_equal(bt, None, n, lim))?;
         // Stopped: no block runs any more (the record follows at the end).
         let stop = e(tr.b.logical_and(bt, None, again, over))?;
@@ -2300,7 +2315,7 @@ fn emit_dispatch_loop(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>) -> R<()
         let one = tr.u(1);
         let n = e(tr.b.i_add(tr.t.u32, None, n, one))?;
         ok(tr.b.store(ctr, n, None, []))?;
-        let lim = tr.u(LOOP_LIMIT);
+        let lim = tr.u(loop_limit());
         let over = e(tr.b.u_greater_than_equal(tr.t.bool_, None, n, lim))?;
         done = e(tr.b.logical_or(tr.t.bool_, None, done, over))?;
     }
@@ -2314,7 +2329,7 @@ fn emit_dispatch_loop(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>) -> R<()
         let mut fin = e(tr.b.i_equal(tr.t.bool_, None, pc3, ex))?;
         if let Some(ctr) = tr.loop_ctr {
             let n = e(tr.b.load(tr.t.u32, None, ctr, None, []))?;
-            let lim = tr.u(LOOP_LIMIT);
+            let lim = tr.u(loop_limit());
             let over = e(tr.b.u_greater_than_equal(tr.t.bool_, None, n, lim))?;
             fin = e(tr.b.logical_or(tr.t.bool_, None, fin, over))?;
         }

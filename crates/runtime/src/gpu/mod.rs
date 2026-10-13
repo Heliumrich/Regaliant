@@ -80,9 +80,9 @@ pub mod tune {
         Tunable { name: "pre_big_max", env: "DS_PRE_BIG_MAX", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_big_mib", env: "DS_PRE_BIG_MIB", default: 1024, value: AtomicU64::new(UNSET) },
         Tunable { name: "home_reads", env: "DS_HOME_READS", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "shadow_share", env: "DS_SHADOW_SHARE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "shadow_share", env: "DS_SHADOW_SHARE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "clean_pages", env: "DS_CLEAN_PAGES", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "eop_light", env: "DS_EOP_LIGHT", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "eop_light", env: "DS_EOP_LIGHT", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     #[inline]
@@ -530,8 +530,11 @@ pub mod tune {
 
     /// A written-buffer shadow's working copy becomes a shared copy of its
     /// window after its merge (`precache`), and the next shadow of the window
-    /// is copied in from it instead of from guest memory across PCIe; 0: from
-    /// guest memory (for A/B).
+    /// is copied in from it instead of from guest memory across PCIe. Off by
+    /// default: with it (or `eop_light`) the GPU was lost at a World 5-1
+    /// load after 4-2 and 4-3 in every tour (FINDINGS.md 2026-10-13), and a
+    /// write recorded by another queue after the lookup but executed before
+    /// the copy in is not seen by it.
     #[inline]
     pub fn shadow_share() -> bool {
         get(53) != 0
@@ -549,9 +552,11 @@ pub mod tune {
     /// End-of-pipe writes performed by the GPU (RELEASE_MEM labels and
     /// timestamps) follow the work before them without holding later work
     /// back: labels behind a barrier into transfers only, timestamps as
-    /// queries stored at the batch's end; a wait passing on such a label in
-    /// the same batch orders the work after it. 0: full barriers around each
-    /// (for A/B).
+    /// queries stored at the batch's end or before a later CP write; a wait
+    /// passing on such a label in the same batch orders the work after it.
+    /// Off by default: with it (or `shadow_share`) the GPU was lost at a
+    /// World 5-1 load in every tour (FINDINGS.md 2026-10-13); the drains it
+    /// removes may hide a missing barrier elsewhere.
     #[inline]
     pub fn eop_light() -> bool {
         get(55) != 0

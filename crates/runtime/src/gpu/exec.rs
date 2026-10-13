@@ -1822,7 +1822,7 @@ fn check_watchdog(queue: &str, shaders: &[u64]) {
     let saved = super::capture::save_program(addr).map(|f| format!("; program saved to {}", f.display())).unwrap_or_default();
     crate::warn!(
         "gpu[{queue}]: loop watchdog stopped {n} invocation(s) of shader {addr:#x} after {} blocks; its results are wrong (batch shaders {}){saved}",
-        rdna::translate::LOOP_LIMIT,
+        rdna::translate::loop_limit(),
         list.join(" ")
     );
 }
@@ -4034,6 +4034,9 @@ impl Exec {
         self.begin();
         self.gpu_writes_open = true;
         self.end_rendering();
+        // End-of-pipe events are written in order on the console: a title
+        // that sees this value may read the timestamps taken before it.
+        self.resolve_timestamps();
         let cmd = self.cmd();
         let raw: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
         self.taint_resident(a, bytes);
@@ -4165,7 +4168,8 @@ impl Exec {
 
     /// The batch's deferred end-of-pipe timestamps (`tune eop_light`): their
     /// queries read at once and each stored to guest memory, at the batch's
-    /// end (each query holds when the work before it completed).
+    /// end or before a later CP write of the batch (each query holds when the
+    /// work before it completed).
     fn resolve_timestamps(&mut self) {
         if self.ts_deferred.is_empty() {
             return;
@@ -5138,7 +5142,14 @@ impl Exec {
                 if let Some(s) = bound.shadows.iter_mut().find(|s| s.shadow_off == sh.shadow_off) {
                     s.since = Some(since);
                 }
-                match super::precache::lookup(sh.guest, sh.range) {
+                // Not in a parallel chunk: earlier chunks of the run, recorded
+                // at the same time, may write the window (the culls' counters
+                // accumulate across chunks), and their writes invalidate the
+                // shared copy only when recorded; this chunk's copy in runs
+                // after theirs and must see them (stale counters hung the GPU
+                // at a World 5-1 load, runs 20261013-035334 .. -041906).
+                let shared = if self.deferred { None } else { super::precache::lookup(sh.guest, sh.range) };
+                match shared {
                     Some((chunk, at)) => {
                         kept.push(Some((chunk.buf, at)));
                         self.slots[self.cur].keep.push(chunk);

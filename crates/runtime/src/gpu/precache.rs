@@ -151,6 +151,10 @@ struct Watched {
 
 /// Windows followed at most (the oldest go: unknown then, not kept).
 const WATCHED_MAX: usize = 512;
+/// Bounds of the watched windows, readable without the lock (`invalidate`
+/// dates the windows a CPU-side write overlaps; LO > HI: none).
+static WATCH_LO: AtomicU64 = AtomicU64::new(u64::MAX);
+static WATCH_HI: AtomicU64 = AtomicU64::new(0);
 
 static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
 
@@ -651,8 +655,22 @@ pub fn submitted(made: &[(u64, u64, u64)], seq: u64) {
 }
 
 /// Guest [base, base+len) may have changed (CP, host and mapping changes):
-/// copies overlapping it go.
+/// copies overlapping it go, and watched shadow windows it overlaps are dated
+/// (file reads by DMA leave no write marks).
 pub fn invalidate(base: u64, len: u64) {
+    let end = base.saturating_add(len);
+    if len != 0 && base < WATCH_HI.load(Ordering::Acquire) && WATCH_LO.load(Ordering::Acquire) < end {
+        let mut g = CACHE.lock();
+        if let Some(c) = g.as_mut() {
+            if c.watched.iter().any(|w| w.lo < end && base < w.hi) {
+                c.marks += 1;
+                let m = c.marks;
+                for w in c.watched.iter_mut().filter(|w| w.lo < end && base < w.hi) {
+                    w.written = m;
+                }
+            }
+        }
+    }
     drop_overlapping(base, len, false);
 }
 
@@ -712,6 +730,9 @@ pub fn watch(base: u64, size: u64) -> u64 {
             c.watched.remove(0);
         }
         c.watched.push(Watched { lo, hi, written: 0 });
+        // Bounds only grow (a dropped window only costs a lookup).
+        WATCH_LO.fetch_min(lo, Ordering::AcqRel);
+        WATCH_HI.fetch_max(hi, Ordering::AcqRel);
     }
     c.marks
 }

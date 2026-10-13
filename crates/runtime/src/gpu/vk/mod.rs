@@ -81,6 +81,10 @@ fn init_stage(k: u8) {
 }
 
 pub fn init() -> Result<(), String> {
+    if let Some(n) = std::env::var("DS_LOOP_LIMIT").ok().and_then(|v| v.parse::<u32>().ok()).filter(|&n| n > 0) {
+        rdna::translate::set_loop_limit(n);
+        crate::info!("gpu: loop watchdog limit {n} blocks per invocation (DS_LOOP_LIMIT)");
+    }
     if CTX.get().is_some() {
         return Ok(());
     }
