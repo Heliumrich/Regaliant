@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 63] = [
+    static ALL: [Tunable; 64] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -90,6 +90,7 @@ pub mod tune {
         Tunable { name: "cp_cpus", env: "DS_CP_CPUS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "guest_cpus", env: "DS_GUEST_CPUS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy_passes", env: "DS_LAZY_PASSES", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "push_partial", env: "DS_PUSH_PARTIAL", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -661,6 +662,14 @@ pub mod tune {
     #[inline]
     pub fn lazy_passes() -> bool {
         get(62) != 0
+    }
+
+    /// A command with the same pipeline layout as the previous push and no
+    /// pipeline bound since pushes only the descriptors that changed
+    /// (`exec::bind_descriptors`).
+    #[inline]
+    pub fn push_partial() -> bool {
+        get(63) != 0
     }
 
     /// A switch's value by name; None if unknown.
@@ -1330,6 +1339,7 @@ pub fn profile_report() -> String {
     if !exec::profiling_on() {
         s.push_str(&shaders::prep_cache_line());
     }
+    s.push_str(&exec::push_line());
     s.push_str(&crate::audio::window_line());
     s.push_str(&crate::guestprof::report());
     s.push_str(&threadcpu::window_line());

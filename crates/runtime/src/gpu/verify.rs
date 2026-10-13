@@ -238,7 +238,7 @@ pub fn check_for(p: &Prepared, groups: [u32; 3], local: [u32; 3]) -> Option<Chec
         return None;
     };
     let threads = groups.iter().map(|&g| g as u64).product::<u64>() * local.iter().map(|&l| l.max(1) as u64).product::<u64>();
-    Some(Check { kind, addr: p.addr, threads, user: p.user.clone(), expected: None, writes_mark: 0, overwritten: false, staging: None })
+    Some(Check { kind, addr: p.addr, threads, user: p.user.to_vec(), expected: None, writes_mark: 0, overwritten: false, staging: None })
 }
 
 /// The guest range a check compares (the kernel's destination).

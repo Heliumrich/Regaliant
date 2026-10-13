@@ -32,7 +32,7 @@ thread_local! {
     /// preparation clones the handle, not the shared reference count the
     /// recording threads all touch (only a new preparation keeps a shared
     /// clone).
-    static LOCAL_PROGRAMS: std::cell::RefCell<super::fx::Map<u64, (u64, u64, std::rc::Rc<Arc<Vec<rdna::Inst>>>, u64)>> = std::cell::RefCell::new(super::fx::Map::default());
+    static LOCAL_PROGRAMS: std::cell::RefCell<super::fx::Map<u64, (u64, u64, Arc<Local<Vec<rdna::Inst>>>, u64)>> = std::cell::RefCell::new(super::fx::Map::default());
     static LOCAL_PLANS: std::cell::RefCell<super::fx::Map<u64, std::rc::Rc<Arc<Plan>>>> = std::cell::RefCell::new(super::fx::Map::default());
     /// The reader's sizes in the last full preparation of each plan (ranges
     /// read, words read, pointers loaded): its vectors start at that
@@ -43,7 +43,43 @@ thread_local! {
     /// Translations by (plan key, fast hash of the specialization), checked
     /// by comparing the specialization: SipHashing the whole Spec for every
     /// command took about a microsecond per stage.
-    static FAST_TRANSLATIONS: std::cell::RefCell<super::fx::Map<(u64, u64), Arc<Translated>>> = std::cell::RefCell::new(super::fx::Map::default());
+    static FAST_TRANSLATIONS: std::cell::RefCell<super::fx::Map<(u64, u64), Arc<Local<Translated>>>> = std::cell::RefCell::new(super::fx::Map::default());
+    /// Each plan's latest translation on this thread: a preparation whose
+    /// specialization equals it skips hashing the specialization (runs of
+    /// commands repeat their shaders' specializations).
+    static LAST_TRANSLATIONS: std::cell::RefCell<super::fx::Map<u64, Arc<Local<Translated>>>> = std::cell::RefCell::new(super::fx::Map::default());
+    /// The vectors of the specializations being built (`spec_vecs`), kept
+    /// for the next preparation.
+    static SPEC_VECS: std::cell::RefCell<(Vec<PsInput>, Vec<ResSpec>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Empty vectors for a specialization's pixel inputs and resources, with
+/// the capacity of earlier ones (`spec_vecs_back`).
+fn spec_vecs() -> (Vec<PsInput>, Vec<ResSpec>) {
+    SPEC_VECS.with(|v| {
+        let (mut a, mut b) = std::mem::take(&mut *v.borrow_mut());
+        a.clear();
+        b.clear();
+        (a, b)
+    })
+}
+
+fn spec_vecs_back(spec: Spec) {
+    SPEC_VECS.with(|v| *v.borrow_mut() = (spec.ps_inputs, spec.resources));
+}
+
+/// A recording thread's own handle on a shared program or translation:
+/// preparations and their copies clone the handle, whose reference count
+/// only its thread touches. (The shared counts are contended: a clone and
+/// drop took up to ~100 ns on the development machine's Ryzen 9 5900X with
+/// several recording threads, 3 ns uncontended.)
+pub struct Local<T>(pub Arc<T>);
+
+impl<T> std::ops::Deref for Local<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
 }
 
 pub struct Translated {
@@ -90,11 +126,11 @@ fn code_slice(addr: u64) -> Option<&'static [u32]> {
 
 /// Decodes (and caches) the program at `addr`; returns it and its hash.
 pub(crate) fn program(addr: u64) -> Result<(Arc<Vec<rdna::Inst>>, u64), String> {
-    program_local(addr).map(|(p, h)| (Arc::clone(&p), h))
+    program_local(addr).map(|(p, h)| (Arc::clone(&p.0), h))
 }
 
 /// `program` as this thread's handle on it.
-fn program_local(addr: u64) -> Result<(std::rc::Rc<Arc<Vec<rdna::Inst>>>, u64), String> {
+fn program_local(addr: u64) -> Result<(Arc<Local<Vec<rdna::Inst>>>, u64), String> {
     use crate::hle::libs::agc;
     // A program from a shader object stays as decoded until a shader object
     // is created again at its address (or anywhere: then it is checked).
@@ -115,7 +151,7 @@ fn program_local(addr: u64) -> Result<(std::rc::Rc<Arc<Vec<rdna::Inst>>>, u64), 
     }
     let reg = agc::shader_registration(addr);
     let (insts, hash) = program_checked(addr)?;
-    let insts = std::rc::Rc::new(insts);
+    let insts = Arc::new(Local(insts));
     if let Some(r) = reg {
         LOCAL_PROGRAMS.with(|c| c.borrow_mut().insert(addr, (regs, r, insts.clone(), hash)));
     }
@@ -264,10 +300,12 @@ impl<'a> Reader<'a> {
             Some(r) if r.0 + r.1 == addr => r.1 += n,
             _ => self.reads.push((addr, n)),
         }
+        self.words.reserve(out.len());
         for (k, o) in out.iter_mut().enumerate() {
-            *o = unsafe { std::ptr::read_volatile((addr + 4 * k as u64) as *const u32) };
+            let w = unsafe { std::ptr::read_volatile((addr + 4 * k as u64) as *const u32) };
+            *o = w;
+            self.words.push(w);
         }
-        self.words.extend_from_slice(out);
         true
     }
 
@@ -329,8 +367,8 @@ pub enum Resolved {
 /// touches only this block's (contended clones cost up to ~100 ns each on
 /// the development machine's Ryzen 9 5900X).
 pub struct Found {
-    pub insts: Arc<Vec<rdna::Inst>>,
-    pub tr: Arc<Translated>,
+    pub insts: Arc<Local<Vec<rdna::Inst>>>,
+    pub tr: Arc<Local<Translated>>,
     pub resources: Vec<Resolved>,
     /// Guest address of each descriptor's first dword when read from memory.
     pub res_addrs: Vec<Option<u64>>,
@@ -356,7 +394,7 @@ pub struct Prepared {
     pub found: Arc<Found>,
     /// SGPR data buffer contents (resource info blocks filled at binding).
     pub sgpr_data: Vec<u32>,
-    pub user: Vec<u32>,
+    pub user: UserData,
     /// `mem::MAP_GEN` and `images::GPU_IMAGES_GEN` when it was made (a
     /// preparation made ahead of execution is checked against them).
     pub map_gen: u64,
@@ -366,6 +404,36 @@ pub struct Prepared {
     /// preparation that depends on the image cache).
     pub cmp_images: u64,
     pub cmp_depth: u64,
+}
+
+/// A stage's user-data dwords (at most 32), held inline: a preparation
+/// and each copy of one would otherwise allocate them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct UserData {
+    n: u8,
+    w: [u32; 32],
+}
+
+impl UserData {
+    pub fn new(s: &[u32]) -> UserData {
+        let n = s.len().min(32);
+        let mut w = [0u32; 32];
+        w[..n].copy_from_slice(&s[..n]);
+        UserData { n: n as u8, w }
+    }
+}
+
+impl std::ops::Deref for UserData {
+    type Target = [u32];
+    fn deref(&self) -> &[u32] {
+        &self.w[..self.n as usize]
+    }
+}
+
+impl std::fmt::Debug for UserData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
 }
 
 impl std::ops::Deref for Prepared {
@@ -581,9 +649,10 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
     let addr = ((sh(CS_PGM_LO) as u64) | ((sh(CS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
     let rsrc2 = sh(CS_RSRC2);
     let user_sgprs = ((rsrc2 >> 1) & 0x1F).min(16) as u16;
-    let user: Vec<u32> = (0..16).map(|i| sh(CS_USER_DATA + i)).collect();
+    let user: [u32; 16] = std::array::from_fn(|i| sh(CS_USER_DATA + i as u32));
     let local = [sh(CS_NUM_THREAD) & 0xFFFF, sh(CS_NUM_THREAD + 1) & 0xFFFF, sh(CS_NUM_THREAD + 2) & 0xFFFF];
     let (insts, code_hash) = program_local(addr)?;
+    let (ps_inputs, resources) = spec_vecs();
     let mut spec = Spec {
         stage: Stage::Compute,
         user_sgprs,
@@ -591,12 +660,12 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         code_base: addr,
         wave64,
         ps_input_addr: 0,
-        ps_inputs: Vec::new(),
+        ps_inputs,
         barycentric: false,
         mrt: [MrtSpec::default(); 8],
         cs_local_size: local,
         cs_rsrc2: rsrc2,
-        resources: Vec::new(),
+        resources,
         binding_base: 0,
         probe: probe_for(addr),
         dump: dump_for(addr),
@@ -606,7 +675,9 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         lod_stats: super::tune::lod_stats() == 3,
         early_tests: false,
     };
-    prepare(addr, insts, code_hash, &user, &mut spec)
+    let r = prepare(addr, insts, code_hash, &user, &mut spec);
+    spec_vecs_back(spec);
+    r
 }
 
 /// User-data dword count of a graphics stage: RSRC2 USER_SGPR[5:1] and USER_SGPR_MSB[27].
@@ -633,10 +704,10 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
     let addr = ((sh(PS_PGM_LO) as u64) | ((sh(PS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
     let rsrc2 = sh(PS_RSRC2);
     let user_sgprs = user_count(rsrc2);
-    let user: Vec<u32> = (0..32).map(|i| sh(PS_USER_DATA + i)).collect();
+    let user: [u32; 32] = std::array::from_fn(|i| sh(PS_USER_DATA + i as u32));
     let (insts, code_hash) = program_local(addr)?;
     let in_control = ctx(SPI_PS_IN_CONTROL);
-    let mut ps_inputs = Vec::new();
+    let (mut ps_inputs, resources) = spec_vecs();
     for n in 0..(in_control & 0x3F).min(32) {
         let c = ctx(SPI_PS_INPUT_CNTL_0 + 4 * n);
         let off = c & 0x3F;
@@ -665,7 +736,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         mrt,
         cs_local_size: [1, 1, 1],
         cs_rsrc2: 0,
-        resources: Vec::new(),
+        resources,
         binding_base: PS_BINDING_BASE,
         probe: probe_for(addr),
         dump: None,
@@ -675,7 +746,9 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         lod_stats: super::tune::lod_stats() == 3,
         early_tests: ctx(DB_SHADER_CONTROL) & (1 << 12) != 0,
     };
-    prepare(addr, insts, code_hash, &user, &mut spec)
+    let r = prepare(addr, insts, code_hash, &user, &mut spec);
+    spec_vecs_back(spec);
+    r
 }
 
 /// `DS_PROBE=<shader address>:<pc>:<vgpr>` (hex address and pc, decimal
@@ -687,6 +760,16 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
 /// keep a reference frame intact.
 pub(crate) fn probe_for(addr: u64) -> Option<(u32, u32)> {
     static USES: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((u64::MAX, 0));
+    // Every stage preparation asks: the shared lock only while a probe is
+    // set (it was ~1% of the recording threads' busy samples).
+    PROBE_FROM_ENV.call_once(|| {
+        let mut g = PROBE.lock();
+        let p = *g.get_or_insert_with(|| std::env::var("DS_PROBE").ok().and_then(|v| parse_probe(&v)));
+        PROBE_ON.store(p.is_some(), std::sync::atomic::Ordering::Relaxed);
+    });
+    if !PROBE_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     let p = *PROBE.lock().get_or_insert_with(|| std::env::var("DS_PROBE").ok().and_then(|v| parse_probe(&v)));
     let (a, pc, vg, from) = p?;
     if a != addr {
@@ -702,6 +785,9 @@ pub(crate) fn probe_for(addr: u64) -> Option<(u32, u32)> {
 
 /// Probe setting (see `probe_for`): None until read from `DS_PROBE`.
 static PROBE: parking_lot::Mutex<Option<Option<(u64, u32, u32, u32)>>> = parking_lot::Mutex::new(None);
+/// A probe is set (PROBE holds one); `DS_PROBE` read once.
+static PROBE_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PROBE_FROM_ENV: std::sync::Once = std::sync::Once::new();
 
 /// `<shader>:<pc>:<register>[:<n>]`; the register is `v<k>` (or `<k>`) or
 /// `s<k>`, with a suffix `u` / `i` to show an unsigned / signed integer as
@@ -735,7 +821,11 @@ fn parse_probe(v: &str) -> Option<(u64, u32, u32, u32)> {
 /// `probe <shader>:<pc>:<vgpr>[:<n>]` / `probe off` (control command).
 pub fn set_probe(v: &str) -> Result<(), String> {
     let p = if v.trim() == "off" { None } else { Some(parse_probe(v).ok_or("usage: probe <hex shader>:<hex pc>:<v<k>|s<k>>[u|i][:<frames>] | off")?) };
+    // The environment's setting is replaced (read first so that it cannot
+    // come back).
+    PROBE_FROM_ENV.call_once(|| {});
     *PROBE.lock() = Some(p);
+    PROBE_ON.store(p.is_some(), std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -772,8 +862,9 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
     let addr = ((sh(ES_PGM_LO) as u64) | ((sh(ES_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
     let rsrc2 = sh(GS_RSRC2);
     let user_sgprs = user_count(rsrc2);
-    let user: Vec<u32> = (0..32).map(|i| sh(GS_USER_DATA + i)).collect();
+    let user: [u32; 32] = std::array::from_fn(|i| sh(GS_USER_DATA + i as u32));
     let (insts, code_hash) = program_local(addr)?;
+    let (ps_inputs, resources) = spec_vecs();
     let mut spec = Spec {
         stage: Stage::Vertex,
         user_sgprs,
@@ -781,12 +872,12 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         code_base: addr,
         wave64: (stages >> 22) & 1 == 0,
         ps_input_addr: 0,
-        ps_inputs: Vec::new(),
+        ps_inputs,
         barycentric: false,
         mrt: [MrtSpec::default(); 8],
         cs_local_size: [1, 1, 1],
         cs_rsrc2: 0,
-        resources: Vec::new(),
+        resources,
         binding_base: 0,
         probe: None,
         dump: super::capture::vs_dump().and_then(|(first, inst)| pos_export(&insts).map(|i| (i.pc, [first, inst, 0]))),
@@ -796,7 +887,9 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         lod_stats: super::tune::lod_stats() == 3,
         early_tests: false,
     };
-    prepare(addr, insts, code_hash, &user, &mut spec)
+    let r = prepare(addr, insts, code_hash, &user, &mut spec);
+    spec_vecs_back(spec);
+    r
 }
 
 /// Program address of the pixel shader in a register view.
@@ -1156,7 +1249,7 @@ fn prep_compare(hit: &Prepared, full: &Prepared) {
     if hit.addr != full.addr {
         diff.push("address");
     }
-    if !Arc::ptr_eq(&hit.tr, &full.tr) && hit.tr.spec != full.tr.spec {
+    if !Arc::ptr_eq(&hit.tr.0, &full.tr.0) && hit.tr.spec != full.tr.spec {
         diff.push("translation");
     }
     if hit.resources != full.resources {
@@ -1233,7 +1326,7 @@ fn reuse(e: &mut PrepEntry, user: &[u32]) -> Option<Prepared> {
     for (i, w) in p.sgpr_data.iter_mut().enumerate().take(translate::SGPR_DATA_USER as usize) {
         *w = user.get(i).copied().unwrap_or(0);
     }
-    p.user = user.to_vec();
+    p.user = UserData::new(user);
     Some(p)
 }
 
@@ -1245,7 +1338,7 @@ fn stage_slot(s: Stage) -> usize {
     }
 }
 
-fn prepare(addr: u64, insts: std::rc::Rc<Arc<Vec<rdna::Inst>>>, code_hash: u64, user: &[u32], spec: &mut Spec) -> Result<Prepared, String> {
+fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: &[u32], spec: &mut Spec) -> Result<Prepared, String> {
     // Diagnostics (DS_PROFILE_GPU with DS_PROFILE_REPEATS=1: hashing every
     // word read and a global set per preparation inflate the prepare times
     // the profile reports): the inputs that would key a cached preparation.
@@ -1456,12 +1549,19 @@ fn prepare(addr: u64, insts: std::rc::Rc<Arc<Vec<rdna::Inst>>>, code_hash: u64, 
     if !by_address {
         spec.code_base = 0;
     }
-    let fast = {
-        let mut h = super::fx::FxHasher::default();
-        spec.hash(&mut h);
-        h.finish()
+    let last_hit = LAST_TRANSLATIONS.with(|c| c.borrow().get(&plan_key).filter(|t| t.spec == *spec).cloned());
+    let from_last = last_hit.is_some();
+    let (fast, fast_hit) = match last_hit {
+        Some(t) => (0, Some(t)),
+        None => {
+            let fast = {
+                let mut h = super::fx::FxHasher::default();
+                spec.hash(&mut h);
+                h.finish()
+            };
+            (fast, FAST_TRANSLATIONS.with(|c| c.borrow().get(&(plan_key, fast)).filter(|t| t.spec == *spec).cloned()))
+        }
     };
-    let fast_hit = FAST_TRANSLATIONS.with(|c| c.borrow().get(&(plan_key, fast)).filter(|t| t.spec == *spec).cloned());
     let key_spec = if fast_hit.is_none() { Some(spec.clone()) } else { None };
     let spec_hash = match &key_spec {
         Some(ks) => {
@@ -1505,16 +1605,21 @@ fn prepare(addr: u64, insts: std::rc::Rc<Arc<Vec<rdna::Inst>>>, code_hash: u64, 
                 t
             }
         };
+        // This thread's handle on it.
+        let t = Arc::new(Local(t));
         if key_spec.as_ref().is_some_and(|ks| *ks == t.spec) {
             FAST_TRANSLATIONS.with(|c| c.borrow_mut().insert((plan_key, fast), t.clone()));
         }
         t
     };
+    if !from_last {
+        LAST_TRANSLATIONS.with(|c| c.borrow_mut().insert(plan_key, tr.clone()));
+    }
     // Scalar-load data, resolved now.
     let mut sgpr_data = Vec::with_capacity((translate::sgpr_data_dwords(&tr.plan) as usize).max(translate::SGPR_DATA_USER as usize));
     sgpr_data.extend_from_slice(user);
     sgpr_data.resize(translate::SGPR_DATA_USER as usize, 0);
-    let mut data_loads = Vec::new();
+    let mut data_loads = Vec::with_capacity(tr.plan.load_data.iter().filter(|&&d| d).count());
     for (j, l) in tr.plan.loads.iter().enumerate() {
         let base = rd.ptr(&l.ptr, user);
         let start = sgpr_data.len();
@@ -1562,9 +1667,9 @@ fn prepare(addr: u64, insts: std::rc::Rc<Arc<Vec<rdna::Inst>>>, code_hash: u64, 
     let prepared = Prepared {
         stage: spec.stage,
         addr,
-        found: Arc::new(Found { insts: Arc::clone(&insts), tr, resources, res_addrs, reads, words, unread, data_loads }),
+        found: Arc::new(Found { insts, tr, resources, res_addrs, reads, words, unread, data_loads }),
         sgpr_data,
-        user: user.to_vec(),
+        user: UserData::new(user),
         map_gen,
         images_gen,
         cmp_images,

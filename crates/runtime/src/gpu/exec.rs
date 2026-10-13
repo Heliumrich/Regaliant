@@ -922,6 +922,118 @@ pub fn pipeline_test(capture: &str) -> i32 {
     if failed > 0 { 1 } else { 0 }
 }
 
+/// `--record-bench <capture> [<cs address>]`: the CPU cost of recording a
+/// captured compute shader's dispatches on this driver, per dispatch: with
+/// all its descriptors pushed, a third of them pushed, none (pushed once
+/// before), and one descriptor set bound; the dispatches are recorded, not
+/// executed. The shader: the given one, else the buffers-only compute
+/// shader with the most bindings.
+pub fn record_bench(capture: &str, shader: Option<u64>) -> i32 {
+    if let Err(e) = super::vk::init() {
+        crate::error!("record bench: Vulkan: {e}");
+        return 2;
+    }
+    let items = match rdna::capture::translate_all(capture) {
+        Ok(i) => i,
+        Err(e) => {
+            crate::error!("record bench: {e}");
+            return 2;
+        }
+    };
+    let buffers_only = |o: &rdna::translate::Output| o.bindings.iter().all(|b| descriptor_type(b.kind) == vk::DescriptorType::STORAGE_BUFFER);
+    let pick = items
+        .iter()
+        .filter(|it| it.stage == rdna::translate::Stage::Compute)
+        .filter_map(|it| it.out.as_ref().ok().map(|o| (it.addr, o)))
+        .filter(|(a, o)| buffers_only(o) && shader.is_none_or(|s| s == *a))
+        .max_by_key(|(_, o)| o.bindings.len());
+    let Some((addr, out)) = pick else {
+        crate::error!("record bench: no buffers-only compute shader{} in {capture}", shader.map(|s| format!(" at {s:#x}")).unwrap_or_default());
+        return 2;
+    };
+    let c = ctx();
+    let dummy = fixed().dummy;
+    let n = out.bindings.len();
+    let (push, set_pipe) = match (compute_pipeline(out, true, None), compute_pipeline(out, false, None)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            crate::error!("record bench: cs {addr:#x}: {e}");
+            return 2;
+        }
+    };
+    const N: u32 = 20_000;
+    let (pool, cmd, dpool, set) = unsafe {
+        let pool = c.device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(c.queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+        let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).unwrap()[0];
+        let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 256 }];
+        let dpool = c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(4).pool_sizes(&sizes), None).unwrap();
+        let layouts = [set_pipe.set_layout];
+        let set = c.device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(dpool).set_layouts(&layouts)).unwrap()[0];
+        let infos: Vec<vk::DescriptorBufferInfo> = out.bindings.iter().map(|_| vk::DescriptorBufferInfo { buffer: dummy, offset: 0, range: DUMMY_BYTES }).collect();
+        let writes: Vec<vk::WriteDescriptorSet> = out.bindings.iter().zip(&infos).map(|(b, i)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(b.binding).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(i))).collect();
+        c.device.update_descriptor_sets(&writes, &[]);
+        (pool, cmd, dpool, set)
+    };
+    // The pushed values change every dispatch (ranges vary), as a command's do.
+    let info = |i: u32| vk::DescriptorBufferInfo { buffer: dummy, offset: 0, range: DUMMY_BYTES - 16 * (i % 8) as u64 };
+    let mut lines = Vec::new();
+    for variant in ["all pushed", "a third pushed", "none pushed", "set bound"] {
+        let mut per = Vec::new();
+        for _rep in 0..5 {
+            unsafe {
+                c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
+                let p = if variant == "set bound" { &set_pipe } else { &push };
+                c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.pipeline);
+                let all: Vec<vk::DescriptorBufferInfo> = (0..n as u32).map(info).collect();
+                if variant != "set bound" {
+                    let w: Vec<vk::WriteDescriptorSet> = out.bindings.iter().zip(&all).map(|(b, i)| vk::WriteDescriptorSet::default().dst_binding(b.binding).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(i))).collect();
+                    c.push_desc.cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::COMPUTE, p.layout, 0, &w);
+                }
+                let k = match variant {
+                    "all pushed" => n,
+                    "a third pushed" => n.div_ceil(3),
+                    _ => 0,
+                };
+                let t0 = std::time::Instant::now();
+                for i in 0..N {
+                    match variant {
+                        "set bound" => c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, p.layout, 0, &[set], &[]),
+                        _ if k > 0 => {
+                            let mut buf = [const { std::mem::MaybeUninit::<vk::WriteDescriptorSet>::uninit() }; 32];
+                            let vals: [vk::DescriptorBufferInfo; 32] = std::array::from_fn(|j| info(i + j as u32));
+                            for (j, b) in out.bindings.iter().take(k.min(32)).enumerate() {
+                                buf[j].write(vk::WriteDescriptorSet::default().dst_binding(b.binding).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(&vals[j])));
+                            }
+                            let w = std::slice::from_raw_parts(buf.as_ptr() as *const vk::WriteDescriptorSet, k.min(32));
+                            c.push_desc.cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::COMPUTE, p.layout, 0, w);
+                        }
+                        _ => {}
+                    }
+                    c.device.cmd_dispatch(cmd, 1, 1, 1);
+                }
+                per.push(t0.elapsed().as_nanos() as f64 / N as f64);
+                c.device.end_command_buffer(cmd).ok();
+                c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
+            }
+        }
+        per.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        lines.push(format!("{variant}: {:.0} ns per dispatch (median of 5; min {:.0}, max {:.0})", per[2], per[0], per[4]));
+    }
+    for l in &lines {
+        crate::info!("record bench: cs {addr:#x} ({n} bindings), {N} dispatches recorded: {l}");
+    }
+    unsafe {
+        c.device.destroy_descriptor_pool(dpool, None);
+        c.device.destroy_command_pool(pool, None);
+        for p in [&push, &set_pipe] {
+            c.device.destroy_pipeline(p.pipeline, None);
+            c.device.destroy_pipeline_layout(p.layout, None);
+            c.device.destroy_descriptor_set_layout(p.set_layout, None);
+        }
+    }
+    0
+}
+
 fn descriptor_type(k: BindingKind) -> vk::DescriptorType {
     match k {
         BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Gds | BindingKind::Debug | BindingKind::Watchdog | BindingKind::LodStats => vk::DescriptorType::STORAGE_BUFFER,
@@ -953,23 +1065,149 @@ fn descriptor_writes(set: vk::DescriptorSet, bounds: &[Bound]) -> Vec<vk::WriteD
     writes
 }
 
+/// A pushed descriptor's value (`PushedSet`).
+#[derive(Clone, Copy)]
+enum PushedDesc {
+    Buffer(vk::Buffer, u64, u64),
+    Image(vk::DescriptorType, vk::Sampler, vk::ImageView, vk::ImageLayout),
+    /// Image arrays are pushed again every time.
+    Array,
+}
+
+impl PushedDesc {
+    fn same(&self, o: &PushedDesc) -> bool {
+        match (self, o) {
+            (PushedDesc::Buffer(a, b, c), PushedDesc::Buffer(x, y, z)) => a == x && b == y && c == z,
+            (PushedDesc::Image(a, b, c, d), PushedDesc::Image(w, x, y, z)) => a == w && b == x && c == y && d == z,
+            _ => false,
+        }
+    }
+}
+
+/// The push descriptors of one bind point in a command buffer: the layout
+/// they were pushed with and each binding's value in push order. A push
+/// with the same layout and no pipeline bound since writes only the
+/// bindings that changed (Vulkan keeps the others): consecutive commands
+/// of a shader mostly change only their SGPR data (the per-item culls also
+/// two of their eight resources), and the driver's work per push and
+/// draw or dispatch grows with the descriptors pushed.
+#[derive(Default)]
+pub(crate) struct PushedSet {
+    cmd: vk::CommandBuffer,
+    layout: vk::PipelineLayout,
+    descs: Vec<(u32, PushedDesc)>,
+}
+
+/// Pushes or partial pushes (commands) and descriptors pushed and left out
+/// (diagnostics, `push_line`).
+pub(super) static PUSH_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+thread_local! {
+    /// This thread's PUSH_STATS not yet added.
+    static PUSH_LOCAL: std::cell::Cell<[u32; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+
+fn note_push(partial: bool, pushed: usize, left: usize) {
+    PUSH_LOCAL.with(|c| {
+        let mut v = c.get();
+        v[partial as usize] += 1;
+        v[2] += pushed as u32;
+        v[3] += left as u32;
+        if v[0] + v[1] >= 256 {
+            for (k, x) in v.iter().enumerate() {
+                PUSH_STATS[k].fetch_add(*x as u64, Ordering::Relaxed);
+            }
+            v = [0; 4];
+        }
+        c.set(v);
+    });
+}
+
+/// Status line: push descriptor writes left out as unchanged.
+pub(super) fn push_line() -> String {
+    let v: Vec<u64> = PUSH_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    format!("    descriptor pushes: {} full, {} partial; {} descriptors pushed, {} left out as unchanged\n", v[0], v[1], v[2], v[3])
+}
+
 /// Records a command's descriptors: pushed into the command buffer (push
-/// descriptor layouts, `set` None) or its written set bound.
-fn bind_descriptors(cmd: vk::CommandBuffer, at: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: Option<vk::DescriptorSet>, bounds: &[Bound]) {
+/// descriptor layouts, `set` None) or its written set bound. `state`: what
+/// this bind point holds; `rebound`: a pipeline was bound for this command
+/// (the push then writes every binding).
+fn bind_descriptors(cmd: vk::CommandBuffer, at: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: Option<vk::DescriptorSet>, bounds: &[Bound], state: &mut PushedSet, rebound: bool) {
     let c = ctx();
     match set {
         Some(set) => {
             note_pushed(1);
             note_vk(VK_DESCRIPTORS);
+            state.layout = vk::PipelineLayout::null();
+            state.descs.clear();
             unsafe { c.device.cmd_bind_descriptor_sets(cmd, at, layout, 0, &[set], &[]) };
         }
         None => {
             note_pushed(0);
             note_vk(VK_DESCRIPTORS);
-            let writes = descriptor_writes(vk::DescriptorSet::null(), bounds);
-            if !writes.is_empty() {
-                unsafe { c.push_desc.cmd_push_descriptor_set(cmd, at, layout, 0, &writes) };
+            // Up to 32 writes from the stack (every command pushes; a vector
+            // was one allocation per command).
+            const STACK_WRITES: usize = 32;
+            let n: usize = bounds.iter().map(|b| b.bufs.len() + b.imgs.len() + b.img_arrays.len()).sum();
+            if n == 0 {
+                return;
             }
+            let partial = super::tune::push_partial() && !rebound && state.cmd == cmd && state.layout == layout && state.descs.len() == n;
+            if !partial {
+                state.cmd = cmd;
+                state.layout = layout;
+                state.descs.clear();
+            }
+            if n > STACK_WRITES {
+                let writes = descriptor_writes(vk::DescriptorSet::null(), bounds);
+                unsafe { c.push_desc.cmd_push_descriptor_set(cmd, at, layout, 0, &writes) };
+                state.layout = vk::PipelineLayout::null();
+                state.descs.clear();
+                note_push(false, n, 0);
+                return;
+            }
+            let mut buf = [const { std::mem::MaybeUninit::<vk::WriteDescriptorSet>::uninit() }; STACK_WRITES];
+            let mut k = 0;
+            let mut j = 0;
+            // The binding at push position j: kept from the last push when
+            // it holds the same value, else written (and recorded).
+            let mut keep = |binding: u32, d: PushedDesc| -> bool {
+                let same = partial && state.descs[j].0 == binding && state.descs[j].1.same(&d);
+                if partial {
+                    state.descs[j] = (binding, d);
+                } else {
+                    state.descs.push((binding, d));
+                }
+                j += 1;
+                same
+            };
+            for b in bounds {
+                for (binding, info) in &b.bufs {
+                    if !keep(*binding, PushedDesc::Buffer(info.buffer, info.offset, info.range)) {
+                        buf[k].write(vk::WriteDescriptorSet::default().dst_binding(*binding).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)));
+                        k += 1;
+                    }
+                }
+                for (binding, ty, info) in &b.imgs {
+                    if !keep(*binding, PushedDesc::Image(*ty, info.sampler, info.image_view, info.image_layout)) {
+                        buf[k].write(vk::WriteDescriptorSet::default().dst_binding(*binding).descriptor_type(*ty).image_info(std::slice::from_ref(info)));
+                        k += 1;
+                    }
+                }
+                for (binding, infos) in &b.img_arrays {
+                    keep(*binding, PushedDesc::Array);
+                    buf[k].write(vk::WriteDescriptorSet::default().dst_binding(*binding).descriptor_type(vk::DescriptorType::SAMPLED_IMAGE).image_info(infos));
+                    k += 1;
+                }
+            }
+            note_push(partial, k, n - k);
+            if k == 0 {
+                return;
+            }
+            // The first k entries are initialized.
+            let writes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const vk::WriteDescriptorSet, k) };
+            unsafe { c.push_desc.cmd_push_descriptor_set(cmd, at, layout, 0, writes) };
         }
     }
 }
@@ -1889,10 +2127,11 @@ fn completion_thread() {
 /// `stages`) and whether one of them may have a fast clear, reload or block
 /// copy pending, under one image-cache lock (a lock per texture and per
 /// query took ~0.9 us per draw, run 20261011-135122).
-pub(crate) fn image_hazards(stages: &[&Prepared], extra: &[super::images::ImageKey]) -> (Vec<super::images::ImageKey>, bool) {
+pub(crate) fn image_hazards(stages: &[&Prepared], v: &mut Vec<super::images::ImageKey>) -> bool {
     // This thread's memos first (no lock); the cache's lock only on a miss
-    // or when a fast clear or overwrite is pending somewhere.
-    let mut v: Vec<super::images::ImageKey> = extra.to_vec();
+    // or when a fast clear or overwrite is pending somewhere. `v` holds the
+    // attachments' keys (kept); the stages' images are added.
+    let extra = v.len();
     let mut missed = false;
     'stages: for p in stages {
         for (i, r) in p.resources.iter().enumerate() {
@@ -1927,11 +2166,11 @@ pub(crate) fn image_hazards(stages: &[&Prepared], extra: &[super::images::ImageK
             super::images::pending_hit(&v)
         } else {
             super::images::any_pending() && super::images::with(|im| im.clears_pending(&v) || im.overwrites_pending(&v))
-        } || super::images::block_copies_possible(&v);
-        return (v, pending);
+        } || super::images::block_copies_possible(v);
+        return pending;
     }
+    v.truncate(extra);
     super::images::with(|im| {
-        let mut v: Vec<super::images::ImageKey> = extra.to_vec();
         for p in stages {
             for (i, r) in p.resources.iter().enumerate() {
                 match r {
@@ -1952,8 +2191,7 @@ pub(crate) fn image_hazards(stages: &[&Prepared], extra: &[super::images::ImageK
                 }
             }
         }
-        let pending = im.clears_pending(&v) || im.overwrites_pending(&v) || im.block_copies_possible(&v);
-        (v, pending)
+        im.clears_pending(v) || im.overwrites_pending(v) || im.block_copies_possible(v)
     })
 }
 
@@ -2838,6 +3076,8 @@ pub struct Exec {
     dyncache: draw::DynCache,
     /// Cleared bindings for the next commands (`bind_stage`, `recycle`).
     bound_pool: Vec<Bound>,
+    /// Image keys of the command being recorded (`image_hazards`; reused).
+    keys_scratch: Vec<super::images::ImageKey>,
     /// Bumped whenever this executor's pending or in-flight writes grow.
     own_gen: u64,
     /// The recording batch's other GPU operations (`ops_line`).
@@ -2974,6 +3214,7 @@ impl Exec {
                 rendering: None,
                 dyncache: Default::default(),
                 bound_pool: Vec::new(),
+                keys_scratch: Vec::new(),
                 own_gen: 0,
                 ops: [0; OPS],
                 clean_pages: vec![u64::MAX; CLEAN_SLOTS],
@@ -3304,7 +3545,10 @@ impl Exec {
     /// large for a VRAM shadow gets a home (`tune homes`; `create`: a sized
     /// buffer binding). A binding that only partly overlaps a home uses guest
     /// memory: the overlap's GPU-written parts are written back first.
-    pub(super) fn home_bind(&mut self, base: u64, size: u64, written: bool, kind: HomeUse) -> Option<(vk::Buffer, u64, u64, std::sync::Arc<super::homes::HomeBuf>)> {
+    /// (buffer, offset of `base`, bytes available, the home when the caller
+    /// must keep it for its work: returned only while no batch is being
+    /// recorded, else the batch keeps it).
+    pub(super) fn home_bind(&mut self, base: u64, size: u64, written: bool, kind: HomeUse) -> Option<(vk::Buffer, u64, u64, Option<std::sync::Arc<super::homes::HomeBuf>>)> {
         if size == 0 {
             return None;
         }
@@ -3325,13 +3569,27 @@ impl Exec {
             self.stop("home copy-in");
             return None;
         }
-        let mut b = super::homes::bind(base, size, written);
-        if b.is_none() && kind == HomeUse::Index && super::tune::homes() && super::homes::index_use(base, size) {
-            b = super::homes::bind(base, size, written);
-        }
-        if b.is_none() && read_use && super::homes::read_use(base, size) {
-            b = super::homes::bind(base, size, written);
-        }
+        // The batch being recorded keeps each home once (its batch slot's
+        // list): the home's shared reference count is touched for the first
+        // binding only.
+        let recording = self.recording;
+        let mut taken: Option<std::sync::Arc<super::homes::HomeBuf>> = None;
+        let b = {
+            let held = self.slots.get(self.cur).map(|s| &s.homes);
+            let mut keep = |h: &std::sync::Arc<super::homes::HomeBuf>| {
+                if !(recording && held.is_some_and(|l| l.iter().any(|k| std::sync::Arc::ptr_eq(k, h)))) {
+                    taken = Some(h.clone());
+                }
+            };
+            let mut b = super::homes::bind(base, size, written, &mut keep);
+            if b.is_none() && kind == HomeUse::Index && super::tune::homes() && super::homes::index_use(base, size) {
+                b = super::homes::bind(base, size, written, &mut keep);
+            }
+            if b.is_none() && read_use && super::homes::read_use(base, size) {
+                b = super::homes::bind(base, size, written, &mut keep);
+            }
+            b
+        };
         let Some(b) = b else {
             if kind == HomeUse::Unbounded && !written {
                 // An unbounded pointer's window (up to UNBOUNDED_MAX) that
@@ -3365,7 +3623,7 @@ impl Exec {
             global_barrier(cmd);
             for &(a, n, off) in &b.copy_in {
                 for (src, src_off, ga, len) in guest_pieces(a, n) {
-                    unsafe { c.device.cmd_copy_buffer(cmd, src, b.buf.buf, &[vk::BufferCopy { src_offset: src_off, dst_offset: off + (ga - a), size: len }]) };
+                    unsafe { c.device.cmd_copy_buffer(cmd, src, b.buf, &[vk::BufferCopy { src_offset: src_off, dst_offset: off + (ga - a), size: len }]) };
                     super::homes::COPIED_IN.fetch_add(len, Ordering::Relaxed);
                 }
             }
@@ -3373,10 +3631,34 @@ impl Exec {
             self.barrier_wanted = false;
             self.dispatched = false;
         }
-        let r = (b.buf.buf, b.offset, b.avail, b.buf.clone());
         self.ensure_slot();
-        self.slots[self.cur].homes.push(b.buf);
-        Some(r)
+        if let Some(h) = &taken {
+            let l = &mut self.slots[self.cur].homes;
+            if !l.iter().any(|k| std::sync::Arc::ptr_eq(k, h)) {
+                l.push(h.clone());
+            }
+        }
+        // While recording the batch keeps it; else the caller keeps it for
+        // the batch it then records into.
+        Some((b.buf, b.offset, b.avail, if self.recording { None } else { taken }))
+    }
+
+    /// Keeps the home whose buffer is `buf` for the batch being recorded
+    /// (once per batch; `held`: the home, if the caller has it); false if
+    /// it no longer exists.
+    pub(super) fn keep_home(&mut self, buf: vk::Buffer, held: Option<&std::sync::Arc<super::homes::HomeBuf>>) -> bool {
+        self.ensure_slot();
+        let l = &mut self.slots[self.cur].homes;
+        if l.iter().any(|k| k.buf == buf) {
+            return true;
+        }
+        match held.cloned().or_else(|| super::homes::handle(buf)) {
+            Some(h) => {
+                l.push(h);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Writes every home's GPU-written parts back and drops the homes
@@ -3974,8 +4256,8 @@ impl Exec {
         if textures.is_empty() {
             return false;
         }
-        let coarse: Vec<(u64, u64)> = textures.iter().map(|x| x.0).collect();
         if super::tune::tex_waits() == 0 {
+            let coarse: Vec<(u64, u64)> = textures.iter().map(|x| x.0).collect();
             return self.sync_for(&coarse, why);
         }
         let done = done_seq();
@@ -5037,15 +5319,15 @@ impl Exec {
         let frame = super::FRAMES.load(Ordering::Relaxed);
         // Sampled images and samplers from this thread's memos when every
         // one of them is there (no lock); else one image-cache lock for all.
+        // Into the recycled vectors (only images and samplers fill them).
         let memo = {
-            let (mut imgs, mut images) = (Vec::new(), Vec::new());
             let mut all = true;
             for b in &found.tr.out.bindings {
                 match (b.kind, b.kind_resource().and_then(|i| found.resources.get(i))) {
                     (BindingKind::Image(_), Some(Resolved::Image(t))) => match super::images::view_hit(t, frame) {
                         Some((view, image)) => {
-                            imgs.push((b.binding, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }));
-                            images.push(image);
+                            bound.imgs.push((b.binding, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }));
+                            bound.images.push(image);
                         }
                         None => {
                             all = false;
@@ -5053,7 +5335,7 @@ impl Exec {
                         }
                     },
                     (BindingKind::Sampler(_) | BindingKind::CompareSampler(_), Some(Resolved::Sampler(sm))) => match super::images::sampler_hit(*sm, matches!(b.kind, BindingKind::CompareSampler(_))) {
-                        Some(smp) => imgs.push((b.binding, vk::DescriptorType::SAMPLER, vk::DescriptorImageInfo { sampler: smp, image_view: vk::ImageView::null(), image_layout: vk::ImageLayout::UNDEFINED })),
+                        Some(smp) => bound.imgs.push((b.binding, vk::DescriptorType::SAMPLER, vk::DescriptorImageInfo { sampler: smp, image_view: vk::ImageView::null(), image_layout: vk::ImageLayout::UNDEFINED })),
                         None => {
                             all = false;
                             break;
@@ -5066,13 +5348,13 @@ impl Exec {
                     _ => {}
                 }
             }
-            all.then_some((imgs, images))
+            all
         };
-        if let Some((imgs, images)) = memo {
-            bound.imgs = imgs;
-            bound.images = images;
+        if memo {
             return Ok(bound);
         }
+        bound.imgs.clear();
+        bound.images.clear();
         // One image-cache lock for all the stage's images and samplers.
         let mut failed: Vec<String> = Vec::new();
         let r: Result<(), String> = super::images::with(|im| {
@@ -5292,12 +5574,14 @@ impl Exec {
         // Fast clears, overwrite reloads and block copies of the images, as
         // for draws: the keys from this thread's memos, the cache's lock only
         // when one may be pending.
-        let (keys, pending) = image_hazards(&[&p], &[]);
-        if pending {
+        let mut keys = std::mem::take(&mut self.keys_scratch);
+        keys.clear();
+        if image_hazards(&[&p], &mut keys) {
             self.resolve_fast_clears(&keys);
             self.resolve_overwrites(&keys);
             self.sync_block_textures(&keys);
         }
+        self.keys_scratch = keys;
         if self.stopped {
             return Err(STOPPED.into());
         }
@@ -5498,12 +5782,13 @@ impl Exec {
         };
         unsafe {
             let cmd = self.cmd();
-            if !super::tune::lean_cmd() || self.dyncache.cs_pipeline != pipeline {
+            let rebound = !super::tune::lean_cmd() || self.dyncache.cs_pipeline != pipeline;
+            if rebound {
                 note_vk(VK_CS_PIPELINES);
                 c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
                 self.dyncache.cs_pipeline = pipeline;
             }
-            bind_descriptors(cmd, vk::PipelineBindPoint::COMPUTE, layout, set, std::slice::from_ref(&bound));
+            bind_descriptors(cmd, vk::PipelineBindPoint::COMPUTE, layout, set, std::slice::from_ref(&bound), &mut self.dyncache.pushed[1], rebound);
             if let Some((buffer, offset)) = args {
                 // Earlier work of this batch wrote the arguments.
                 global_barrier(cmd);
@@ -5554,9 +5839,15 @@ impl Exec {
                 mirrored.push((base, size));
             }
         }
-        let unmirrored: Vec<(u64, u64)> = writes_here.iter().copied().filter(|w| !mirrored.contains(w)).collect();
-        if !unmirrored.is_empty() {
-            super::mirror::invalidate(&unmirrored);
+        if mirrored.is_empty() {
+            if !writes_here.is_empty() {
+                super::mirror::invalidate(&writes_here);
+            }
+        } else {
+            let unmirrored: Vec<(u64, u64)> = writes_here.iter().copied().filter(|w| !mirrored.contains(w)).collect();
+            if !unmirrored.is_empty() {
+                super::mirror::invalidate(&unmirrored);
+            }
         }
         if !copies.is_empty() {
             unsafe {
@@ -5612,6 +5903,9 @@ impl Exec {
             let phases = if profiling() { format!(" (prepare {} ms, pipeline {} ms, bindings {} ms)", t_prep.as_millis(), (t_pipe - t_prep).as_millis(), (t_bind - t_pipe).as_millis()) } else { String::new() };
             crate::info!("gpu[{}]: dispatch of cs {:#x} took {} ms{phases}", self.name, p.addr, total.as_millis());
         }
+        // The write lists go back for the next binding (their capacity).
+        bound.writes = writes_here;
+        bound.sized_writes = sized_here;
         self.recycle(bound);
         if let Some(mut ch) = verify::check_for(&p, groups, local).filter(|_| indirect.is_none()) {
             // Expected values as recorded, when no GPU work still writes them.

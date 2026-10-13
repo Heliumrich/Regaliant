@@ -139,7 +139,8 @@ pub fn any() -> bool {
 
 /// A binding of guest [base, base+size) in a home.
 pub struct Bound {
-    pub buf: Arc<HomeBuf>,
+    /// The home's buffer (`bind` handed the home to its `keep`).
+    pub buf: vk::Buffer,
     /// Offset of `base` in the home's buffer.
     pub offset: u64,
     /// Bytes from `base` to the home's end.
@@ -150,24 +151,45 @@ pub struct Bound {
 
 /// The home holding all of [base, base+size), with the copies in its use
 /// needs first (taken: the caller records them before the use). `written`:
-/// the use writes the range (guest memory goes stale there).
-pub fn bind(base: u64, size: u64, written: bool) -> Option<Bound> {
+/// the use writes the range (guest memory goes stale there). `keep` gets
+/// the home while it is certainly alive: the caller keeps it for the work
+/// that uses it (and clones it only when it does not hold it yet).
+pub fn bind(base: u64, size: u64, written: bool, keep: &mut dyn FnMut(&Arc<HomeBuf>)) -> Option<Bound> {
     if !any() || size == 0 {
         return None;
     }
-    let found = with_snap(|r, s| r.iter().position(|&(b, n)| b <= base && base + size <= b + n).map(|i| (r[i], s[i].0.clone(), s[i].1.clone())));
-    let ((hb, hn), buf, shared) = found?;
     // Without the lock when nothing waits to be copied in and a written
     // range is already marked stale by this thread (the culls and the draws
     // reading their indices bind the 112 MB home ~17k times per frame; the
-    // lock was a main point of contention between the recording threads).
-    if !shared.dirty.load(Ordering::Acquire) {
-        let sgen = shared.stale_gen.load(Ordering::Acquire);
-        let id = shared.id;
-        if !written || STALE_NOTES.with(|n| n.borrow().iter().any(|&(b, m, h, sg)| h == id && sg == sgen && b <= base && base + size <= b + m)) {
-            BINDINGS.fetch_add(1, Ordering::Relaxed);
-            return Some(Bound { buf, offset: base - hb, avail: hb + hn - base, copy_in: Vec::new() });
+    // lock was a main point of contention between the recording threads),
+    // and by reference: the homes' reference counts are shared by all
+    // recording threads.
+    enum Fast {
+        Hit(vk::Buffer, u64, u64),
+        Slow,
+        Miss,
+    }
+    let f = with_snap(|r, s| {
+        let Some(i) = r.iter().position(|&(b, n)| b <= base && base + size <= b + n) else { return Fast::Miss };
+        let (hb, hn) = r[i];
+        let shared = &s[i].1;
+        if !shared.dirty.load(Ordering::Acquire) {
+            let sgen = shared.stale_gen.load(Ordering::Acquire);
+            let id = shared.id;
+            if !written || STALE_NOTES.with(|n| n.borrow().iter().any(|&(b, m, h, sg)| h == id && sg == sgen && b <= base && base + size <= b + m)) {
+                keep(&s[i].0);
+                return Fast::Hit(s[i].0.buf, base - hb, hb + hn - base);
+            }
         }
+        Fast::Slow
+    });
+    match f {
+        Fast::Miss => return None,
+        Fast::Hit(buf, offset, avail) => {
+            note_binding();
+            return Some(Bound { buf, offset, avail, copy_in: Vec::new() });
+        }
+        Fast::Slow => {}
     }
     let mut g = HOMES.lock();
     let h = g.iter_mut().find(|h| h.base <= base && base + size <= h.base + h.size)?;
@@ -193,8 +215,32 @@ pub fn bind(base: u64, size: u64, written: bool) -> Option<Bound> {
             n.push(note);
         });
     }
-    BINDINGS.fetch_add(1, Ordering::Relaxed);
-    Some(Bound { buf: h.buf.clone(), offset: base - h.base, avail: h.base + h.size - base, copy_in })
+    note_binding();
+    keep(&h.buf);
+    Some(Bound { buf: h.buf.buf, offset: base - h.base, avail: h.base + h.size - base, copy_in })
+}
+
+/// The home whose buffer is `buf` (to keep it for later work), if it
+/// still exists.
+pub fn handle(buf: vk::Buffer) -> Option<Arc<HomeBuf>> {
+    with_snap(|_, s| s.iter().find(|(h, _)| h.buf == buf).map(|(h, _)| h.clone())).or_else(|| HOMES.lock().iter().find(|h| h.buf.buf == buf).map(|h| h.buf.clone()))
+}
+
+/// Counts a binding (BINDINGS, in batches per thread: one shared counter
+/// bumped by every binding of every recording thread).
+fn note_binding() {
+    thread_local! {
+        static N: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    N.with(|c| {
+        let v = c.get() + 1;
+        if v == 256 {
+            BINDINGS.fetch_add(256, Ordering::Relaxed);
+            c.set(0);
+        } else {
+            c.set(v);
+        }
+    });
 }
 
 /// Whether binding [base, base+size) would copy guest data into its home

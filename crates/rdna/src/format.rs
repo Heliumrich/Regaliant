@@ -183,8 +183,19 @@ fn parse_num(s: &str) -> Option<Num> {
     })
 }
 
-/// Looks up a gfx10 FORMAT value.
+/// Looks up a gfx10 FORMAT value (from a table parsed once: stage
+/// preparations ask for every image and buffer format they bind).
 pub fn gfx10(id: u16) -> Option<Format> {
+    static TABLE: std::sync::OnceLock<Vec<Option<Format>>> = std::sync::OnceLock::new();
+    let t = TABLE.get_or_init(|| {
+        let n = NAMES.iter().map(|&(i, _)| i as usize + 1).max().unwrap_or(0);
+        (0..n).map(|i| parse(i as u16)).collect()
+    });
+    t.get(id as usize).copied().flatten()
+}
+
+/// Parses the name of FORMAT value `id`.
+fn parse(id: u16) -> Option<Format> {
     let name = NAMES.iter().find(|(i, _)| *i == id)?.1;
     let (layout, num) = name.rsplit_once('_')?;
     let num = parse_num(num)?;

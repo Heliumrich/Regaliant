@@ -124,8 +124,8 @@ pub enum Space {
 
 pub struct Cp {
     pub name: String,
-    /// Outcome of the last draw (frame captures).
-    pub last_draw: String,
+    /// Outcome of the last draw (frame captures; no allocation per draw).
+    pub last_draw: std::borrow::Cow<'static, str>,
     pub compute: bool,
     pub regs: Regs,
     index_base: u64,
@@ -147,7 +147,9 @@ pub struct Cp {
     notes_seen: HashSet<&'static str>,
     depth: u32,
     /// Vulkan executor (created on the first dispatch when enabled).
-    exec: Option<super::exec::Exec>,
+    /// Boxed: commands take it out of the processor and put it back (one
+    /// pointer moved per draw and dispatch, not the whole executor).
+    exec: Option<Box<super::exec::Exec>>,
     exec_failed: bool,
     /// A partial flush / acquire was requested: the next CP memory write
     /// must wait for the GPU work before it.
@@ -718,7 +720,7 @@ impl Cp {
     pub fn new(name: &str, compute: bool) -> Cp {
         Cp {
             name: name.to_string(),
-            last_draw: String::new(),
+            last_draw: std::borrow::Cow::Borrowed(""),
             compute,
             regs: Regs::new(),
             index_base: 0,
@@ -776,7 +778,7 @@ impl Cp {
     pub fn make_worker_exec(&mut self) -> Result<(), String> {
         let mut e = super::exec::Exec::new(&self.name)?;
         e.set_deferred();
-        self.exec = Some(e);
+        self.exec = Some(Box::new(e));
         Ok(())
     }
 
@@ -1546,7 +1548,7 @@ impl Cp {
         }
         if self.exec.is_none() {
             match super::exec::Exec::new(&self.name) {
-                Ok(e) => self.exec = Some(e),
+                Ok(e) => self.exec = Some(Box::new(e)),
                 Err(e) => {
                     crate::error!("gpu[{}]: no executor: {e}", self.name);
                     self.exec_failed = true;
@@ -1589,7 +1591,7 @@ impl Cp {
         }
         if self.exec.is_none() {
             match super::exec::Exec::new(&self.name) {
-                Ok(e) => self.exec = Some(e),
+                Ok(e) => self.exec = Some(Box::new(e)),
                 Err(e) => {
                     crate::error!("gpu[{}]: no executor: {e}", self.name);
                     self.exec_failed = true;
@@ -1681,7 +1683,7 @@ impl Cp {
             self.draw(args);
             drawn += 1;
             MDI_DRAWS.fetch_add(1, Ordering::Relaxed);
-            outcome = std::mem::take(&mut self.last_draw);
+            outcome = std::mem::take(&mut self.last_draw).into_owned();
         }
         let detail = if capturing { format!(" [count {count_src}, stride {stride}, args {}]", subs.join(" ")) } else { String::new() };
         format!("{drawn} of {count} draws ({}){detail}", if drawn > 0 { outcome } else { "none".into() })
@@ -2076,7 +2078,7 @@ impl Cp {
                         None
                     }
                 };
-                self.last_draw = multi.take().unwrap_or_else(|| "not executed".into());
+                self.last_draw = multi.take().map_or(std::borrow::Cow::Borrowed("not executed"), std::borrow::Cow::Owned);
                 match args {
                     Some(a) => {
                         self.draw(a);

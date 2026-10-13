@@ -15,7 +15,7 @@
 use super::vk::ctx;
 use ash::vk;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Device memory for mirrors (bump allocated; one mirror per written range).
 const POOL_BYTES: u64 = 768 << 20;
@@ -39,6 +39,9 @@ struct Pool {
 }
 
 static POOL: Mutex<Option<Pool>> = Mutex::new(None);
+/// A mirror was made (until then `invalidate`, called for every command's
+/// writes, has nothing to drop and takes no lock).
+static LIVE: AtomicBool = AtomicBool::new(false);
 /// Read bindings served from mirrors / refreshes (diagnostics).
 pub static HITS: AtomicU64 = AtomicU64::new(0);
 pub static REFRESHES: AtomicU64 = AtomicU64::new(0);
@@ -87,6 +90,7 @@ pub fn for_write(base: u64, size: u64) -> Option<(vk::Buffer, u64)> {
         }
         p.used = off + size;
         p.list.push(Mirror { base, size, off, frame: None });
+        LIVE.store(true, Ordering::Release);
         Some((p.buffer, off))
     })
     .flatten()
@@ -120,6 +124,9 @@ pub fn lookup(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
 /// Drops the mirrors overlapping any of `ranges` (writes that do not
 /// refresh them: CP writes, unmirrored GPU writes, remaps).
 pub fn invalidate(ranges: &[(u64, u64)]) {
+    if !LIVE.load(Ordering::Acquire) {
+        return;
+    }
     let mut g = POOL.lock();
     let Some(p) = g.as_mut() else { return };
     for m in p.list.iter_mut().filter(|m| m.frame.is_some()) {

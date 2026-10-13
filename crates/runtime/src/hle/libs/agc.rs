@@ -150,6 +150,9 @@ static SHADERS: Mutex<std::collections::BTreeMap<u64, (u8, usize, Option<u8>, u6
 /// Shader objects created so far (`sceAgcCreateShader`): caches of decoded
 /// programs stay valid while it is unchanged.
 static REGISTRATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bumped after each insert into SHADERS: the recording threads' copies of
+/// instance-offset slots (`instance_offset_slot`) hold while it is unchanged.
+static SHADERS_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Code size of the program at `addr` (from its shader object), if known.
 pub fn shader_code_size(addr: u64) -> Option<usize> {
@@ -159,7 +162,25 @@ pub fn shader_code_size(addr: u64) -> Option<usize> {
 /// User-data slot (counted from the stage's first user SGPR) in which the
 /// program at `addr` expects a draw's start instance, if it has one.
 pub fn instance_offset_slot(addr: u64) -> Option<u32> {
-    SHADERS.lock().get(&addr).and_then(|&(_, _, s, _)| s).map(u32::from)
+    // From this thread's copy: indirect draws ask for every draw, and the
+    // registry's lock is shared by all recording threads.
+    thread_local! {
+        static MEMO: std::cell::RefCell<(u64, std::collections::HashMap<u64, Option<u32>>)> = std::cell::RefCell::new((u64::MAX, std::collections::HashMap::new()));
+    }
+    let g = SHADERS_GEN.load(std::sync::atomic::Ordering::Acquire);
+    MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.0 != g {
+            m.0 = g;
+            m.1.clear();
+        }
+        if let Some(&v) = m.1.get(&addr) {
+            return v;
+        }
+        let v = SHADERS.lock().get(&addr).and_then(|&(_, _, s, _)| s).map(u32::from);
+        m.1.insert(addr, v);
+        v
+    })
 }
 
 /// How many shader objects have been created (changes with every creation).
@@ -444,6 +465,7 @@ sysv! {
                     let size = (code + rd32(h + SHADER_SIZE) as u64).saturating_sub(addr);
                     let r = REGISTRATIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
                     SHADERS.lock().insert(addr, (stage, size as usize, instance_offset_slot_of(h, stage), r));
+                    SHADERS_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     break;
                 }
             }

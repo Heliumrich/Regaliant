@@ -31,6 +31,9 @@ pub(crate) struct DynCache {
     pipeline: vk::Pipeline,
     /// The compute pipeline bound last in this command buffer.
     pub(crate) cs_pipeline: vk::Pipeline,
+    /// The push descriptors in this command buffer, per bind point
+    /// (graphics, compute; `bind_descriptors`).
+    pub(crate) pushed: [super::PushedSet; 2],
     viewport: Option<[u32; 6]>,
     scissor: Option<[i32; 4]>,
     bias: Option<[u32; 3]>,
@@ -406,7 +409,7 @@ pub static TINY_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 impl Exec {
     /// Executes a draw with the graphics state of `cp`; returns what
     /// happened (frame captures).
-    pub fn draw(&mut self, cp: &Cp, args: DrawArgs) -> String {
+    pub fn draw(&mut self, cp: &Cp, args: DrawArgs) -> std::borrow::Cow<'static, str> {
         if DEVICE_LOST.load(Ordering::Relaxed) {
             DRAW_SKIPPED.fetch_add(1, Ordering::Relaxed);
             return "skipped (device lost)".into();
@@ -414,18 +417,18 @@ impl Exec {
         let outcome = match self.draw_inner(cp, &args) {
             Ok(true) => {
                 DRAWN.fetch_add(1, Ordering::Relaxed);
-                "drawn".to_string()
+                "drawn".into()
             }
             Ok(false) => {
                 DRAW_NOOP.fetch_add(1, Ordering::Relaxed);
-                "no effect".to_string()
+                "no effect".into()
             }
-            Err(e) if e == super::STOPPED => "stopped (parallel run)".to_string(),
+            Err(e) if e == super::STOPPED => "stopped (parallel run)".into(),
             Err(e) => {
                 DRAW_SKIPPED.fetch_add(1, Ordering::Relaxed);
                 let s = format!("skipped: {e}");
                 self.report(e);
-                s
+                s.into()
             }
         };
         if sync_mode() {
@@ -733,10 +736,12 @@ impl Exec {
         }
         // Fast clears (metadata writes), reloads and block copies of the
         // attachments and textures.
-        let attached: Vec<images::ImageKey> = colors.iter().flatten().chain(depth.iter()).map(|t| t.key).collect();
-        let (used, pending) = match &ps {
-            Some(p) => super::image_hazards(&[&vs, p], &attached),
-            None => super::image_hazards(&[&vs], &attached),
+        let mut used = std::mem::take(&mut self.keys_scratch);
+        used.clear();
+        used.extend(colors.iter().flatten().chain(depth.iter()).map(|t| t.key));
+        let pending = match &ps {
+            Some(p) => super::image_hazards(&[&vs, p], &mut used),
+            None => super::image_hazards(&[&vs], &mut used),
         };
         if self.stopped {
             return Err(super::STOPPED.into());
@@ -749,19 +754,21 @@ impl Exec {
                 return Err(super::STOPPED.into());
             }
         }
+        self.keys_scratch = used;
         lap.mark(8);
         // Resources.
-        let mut stages: Vec<&mut Prepared> = vec![&mut vs];
-        if let Some(p) = ps.as_mut() {
-            stages.push(p);
+        match &ps {
+            Some(p) => self.reserve(&[&vs, p], push),
+            None => self.reserve(&[&vs], push),
         }
-        self.reserve(&stages.iter().map(|p| &**p).collect::<Vec<_>>(), push);
         if self.stopped {
             return Err(super::STOPPED.into());
         }
         if let Some(h) = &index_home {
-            // Kept until the batch that draws completes.
-            self.slots[self.cur].homes.push(h.3.clone());
+            // Kept until the batch that draws completes (once per batch).
+            if !self.keep_home(h.0, h.3.as_ref()) {
+                return Err("the index buffer's video-memory home was dropped during the draw (draw skipped)".into());
+            }
         }
         // Indices in guest memory that a resident shadow holds newer data for.
         if let Some((addr, size)) = a.index {
@@ -776,7 +783,14 @@ impl Exec {
         // The vector is kept for the next draw (empty: it drains at the end).
         let mut bounds = std::mem::take(&mut self.draw_bounds);
         bounds.clear();
-        for (k, p) in stages.iter_mut().enumerate() {
+        for k in 0..2 {
+            let p: &mut Prepared = match k {
+                0 => &mut vs,
+                _ => match ps.as_mut() {
+                    Some(p) => p,
+                    None => break,
+                },
+            };
             let mut b = self.bind_stage(p, false)?;
             if self.stopped {
                 return Err(super::STOPPED.into());
@@ -792,7 +806,7 @@ impl Exec {
             // Buffer placements of the draw's stages (vertex stage first), under
             // the draw's profile key.
             let all: Vec<_> = bounds.iter().flat_map(|b| b.placements.iter().copied()).collect();
-            super::note_placements(super::DRAW_KEY | if ps_addr != 0 { ps_addr } else { stages[0].addr }, [0; 3], false, &all);
+            super::note_placements(super::DRAW_KEY | if ps_addr != 0 { ps_addr } else { vs.addr }, [0; 3], false, &all);
         }
         let set = if push { None } else { Some(self.alloc_set(set_layout)?) };
         lap.mark(12);
@@ -830,12 +844,13 @@ impl Exec {
         };
         let dc = &mut self.dyncache;
         unsafe {
-            if dc.pipeline != pipeline {
+            let rebound = dc.pipeline != pipeline;
+            if rebound {
                 super::note_vk(super::VK_GFX_PIPELINES);
                 c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 dc.pipeline = pipeline;
             }
-            super::bind_descriptors(cmd, vk::PipelineBindPoint::GRAPHICS, layout, set, &bounds);
+            super::bind_descriptors(cmd, vk::PipelineBindPoint::GRAPHICS, layout, set, &bounds, &mut dc.pushed[0], rebound);
             let vpw = [vp.x.to_bits(), vp.y.to_bits(), vp.width.to_bits(), vp.height.to_bits(), vp.min_depth.to_bits(), vp.max_depth.to_bits()];
             if dc.viewport != Some(vpw) {
                 c.device.cmd_set_viewport(cmd, 0, &[vp]);

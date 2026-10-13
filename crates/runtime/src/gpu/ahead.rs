@@ -224,7 +224,7 @@ pub fn take<R: RegRead + ?Sized>(slot: &Slot, live: &R, wave64: bool) -> Option<
             return None;
         }
     };
-    if !shaders::program(p.addr).is_ok_and(|(insts, _)| Arc::ptr_eq(&insts, &p.insts)) {
+    if !shaders::program(p.addr).is_ok_and(|(insts, _)| Arc::ptr_eq(&insts, &p.insts.0)) {
         STATS[STALE_PROGRAM].fetch_add(1, Ordering::Relaxed);
         return None;
     }

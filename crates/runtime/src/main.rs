@@ -35,6 +35,8 @@ pub struct Config {
     pub control: Option<PathBuf>,
     /// `--pipeline-test <capture.txt>`: create pipelines for a captured frame and exit.
     pub pipeline_test: Option<String>,
+    /// `--record-bench <capture> [<cs address>]` (`gpu::exec::record_bench`).
+    pub record_bench: Option<(String, Option<u64>)>,
     pub trace: bool,
     pub lenient: bool,
     pub debug: bool,
@@ -124,6 +126,7 @@ fn parse_args() -> Config {
     let mut control = None;
     let mut app = None;
     let mut pipeline_test = None;
+    let mut record_bench = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -136,6 +139,11 @@ fn parse_args() -> Config {
             "--control" => control = Some(PathBuf::from(args.next().expect("--control needs a path"))),
             "--app" => app = Some(PathBuf::from(args.next().expect("--app needs a path"))),
             "--pipeline-test" => pipeline_test = Some(args.next().expect("--pipeline-test needs a capture file")),
+            "--record-bench" => {
+                let file = args.next().expect("--record-bench needs a capture file");
+                let cs = args.next().and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok());
+                record_bench = Some((file, cs));
+            }
             other => {
                 eprintln!("unknown argument {other}");
                 std::process::exit(2);
@@ -156,6 +164,7 @@ fn parse_args() -> Config {
         headless,
         control,
         pipeline_test,
+        record_bench,
     }
 }
 
@@ -761,6 +770,11 @@ fn main() {
     exception::install();
     if let Some(c) = &cfg.pipeline_test {
         let code = gpu::exec::pipeline_test(c);
+        log::flush();
+        std::process::exit(code);
+    }
+    if let Some((c, cs)) = &cfg.record_bench {
+        let code = gpu::exec::record_bench(c, *cs);
         log::flush();
         std::process::exit(code);
     }
