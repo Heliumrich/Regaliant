@@ -8,17 +8,20 @@ use std::collections::BTreeMap;
 
 /// Union of half-open ranges [start, end), kept disjoint and coalesced.
 ///
-/// A filter of the 64 KiB pages it covers (1024 bits, hashed; ranges over
-/// FILTER_BIG_PAGES pages counted apart) answers most overlap tests without
-/// the ordered lookup: the command processors test ~15-40 descriptor and
-/// constant reads per draw against the writes of the batch being recorded
-/// (~0.5 us per test with lookups, run 20261011-135920). Removals leave
-/// their bits (a stale bit only costs a lookup).
+/// A filter of the 64 KiB pages it covers (1024 bits, hashed) answers most
+/// overlap tests without the ordered lookup: the command processors test
+/// ~15-40 descriptor and constant reads per draw against the writes of the
+/// batch being recorded (~0.5 us per test with lookups, run
+/// 20261011-135920). Ranges over FILTER_BIG_PAGES pages are kept exactly
+/// beside it (`big`, coalesced, few): they used to switch the filter off, and
+/// the title's culls write their 112 MB output buffer in every dispatch, so
+/// every test of a batch holding one took the lookup. Removals leave their
+/// bits and big entries (stale ones only cost a lookup).
 #[derive(Default, Clone, Debug)]
 pub struct Ranges {
     by_start: BTreeMap<u64, u64>,
     filter: [u64; 16],
-    big: u32,
+    big: Vec<(u64, u64)>,
 }
 
 const FILTER_SHIFT: u32 = 16;
@@ -30,13 +33,24 @@ fn filter_bit(page: u64) -> usize {
 
 impl Ranges {
     pub const fn new() -> Ranges {
-        Ranges { by_start: BTreeMap::new(), filter: [0; 16], big: 0 }
+        Ranges { by_start: BTreeMap::new(), filter: [0; 16], big: Vec::new() }
     }
 
     fn filter_add(&mut self, a: u64, n: u64) {
         let (first, last) = (a >> FILTER_SHIFT, (a.saturating_add(n) - 1) >> FILTER_SHIFT);
         if last - first >= FILTER_BIG_PAGES {
-            self.big += 1;
+            // Exactly, merged with the big ranges it overlaps or touches.
+            let (mut s, mut e) = (a, a.saturating_add(n));
+            self.big.retain(|&(bs, be)| {
+                if bs <= e && s <= be {
+                    s = s.min(bs);
+                    e = e.max(be);
+                    false
+                } else {
+                    true
+                }
+            });
+            self.big.push((s, e));
             return;
         }
         for page in first..=last {
@@ -47,10 +61,16 @@ impl Ranges {
 
     /// False when [a, a + n) certainly does not overlap.
     fn filter_may(&self, a: u64, n: u64) -> bool {
-        if self.big > 0 {
+        let end = a.saturating_add(n);
+        // `tune exact_big 0`: any big range sends every test to the lookup
+        // (the earlier behavior, for A/B).
+        if !self.big.is_empty() && !super::tune::exact_big() {
             return true;
         }
-        let (first, last) = (a >> FILTER_SHIFT, (a.saturating_add(n) - 1) >> FILTER_SHIFT);
+        if self.big.iter().any(|&(s, e)| s < end && a < e) {
+            return true;
+        }
+        let (first, last) = (a >> FILTER_SHIFT, (end - 1) >> FILTER_SHIFT);
         if last - first >= FILTER_BIG_PAGES {
             return true;
         }
@@ -107,7 +127,7 @@ impl Ranges {
     pub fn clear(&mut self) {
         self.by_start.clear();
         self.filter = [0; 16];
-        self.big = 0;
+        self.big.clear();
     }
 
     /// Number of disjoint ranges.
@@ -353,6 +373,61 @@ mod tests {
         // A huge range at the top of the address space.
         r.insert(u64::MAX - 10, 100);
         assert!(r.overlaps(u64::MAX - 1, 1));
+    }
+
+    #[test]
+    fn overlap_tests_match_brute_force_with_big_ranges() {
+        // xorshift: deterministic pseudo-random ranges, small (bytes to a
+        // few pages) and big (over FILTER_BIG_PAGES pages of 64 KiB).
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for round in 0..20 {
+            let mut r = Ranges::new();
+            let mut set: Vec<(u64, u64)> = Vec::new();
+            for k in 0..200 {
+                let a = 0x10_0000_0000 + (next() % (1 << 34)) / 4 * 4;
+                let n = if next() % 16 == 0 { (64 + next() % 4096) << 16 } else { 4 + next() % (3 << 16) };
+                if k % 23 == 22 && !set.is_empty() {
+                    // Remove part of an inserted range.
+                    let (s, e) = set[(next() % set.len() as u64) as usize];
+                    let cut = (s + (e - s) / 3, (e - s) / 3 + 1);
+                    r.remove(cut.0, cut.1);
+                    let (cs, ce) = (cut.0, cut.0 + cut.1);
+                    let mut out = Vec::new();
+                    for &(s, e) in &set {
+                        if e <= cs || ce <= s {
+                            out.push((s, e));
+                        } else {
+                            if s < cs {
+                                out.push((s, cs));
+                            }
+                            if ce < e {
+                                out.push((ce, e));
+                            }
+                        }
+                    }
+                    set = out;
+                } else {
+                    r.insert(a, n);
+                    set.push((a, a + n));
+                }
+            }
+            for _ in 0..2000 {
+                let a = 0x10_0000_0000 + (next() % (1 << 34)) / 4 * 4;
+                let n = if next() % 8 == 0 { (1 + next() % 128) << 16 } else { 4 + next() % 256 };
+                let want = set.iter().any(|&(s, e)| s < a + n && a < e);
+                assert_eq!(r.overlaps(a, n), want, "round {round}: [{a:#x}, +{n:#x})");
+            }
+            // Queries inside the inserted ranges always overlap.
+            for &(s, e) in &set {
+                assert!(r.overlaps(s, 4.min(e - s)), "round {round}: inside [{s:#x}, {e:#x})");
+            }
+        }
     }
 
     #[test]

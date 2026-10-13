@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 47] = [
+    static ALL: [Tunable; 48] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -74,6 +74,7 @@ pub mod tune {
         Tunable { name: "span_cache", env: "DS_SPAN_CACHE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fill_dma", env: "DS_FILL_DMA", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lean_cmd", env: "DS_LEAN_CMD", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "exact_big", env: "DS_EXACT_BIG", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     #[inline]
@@ -462,6 +463,14 @@ pub mod tune {
     #[inline]
     pub fn lean_cmd() -> bool {
         get(46) != 0
+    }
+
+    /// Range unions keep ranges over 64 pages exactly beside their page
+    /// filter (`ranges::Ranges`); 0: any such range switches the filter off
+    /// (the earlier behavior, for A/B).
+    #[inline]
+    pub fn exact_big() -> bool {
+        get(47) != 0
     }
 
     /// A switch's value by name; None if unknown.
