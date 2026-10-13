@@ -134,6 +134,9 @@ pub struct Reader<'a> {
     /// The words read, in the order of `reads` (a preparation made ahead of
     /// execution is checked against them, see `words_unchanged`).
     pub words: Vec<u32>,
+    /// Ranges it could not read (not mapped or not readable): what was
+    /// resolved without them holds while they stay so.
+    pub unread: Vec<(u64, u64)>,
     /// The mappings of recent reads (no memory-map lookup inside them; a
     /// stage reads its user data, descriptor tables and constants from a few
     /// mappings in turn), replaced round robin.
@@ -150,7 +153,7 @@ pub struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     pub fn new(code_base: u64) -> Reader<'a> {
-        Reader { reads: Vec::new(), words: Vec::new(), spans: [(0, 0); 4], next_span: 0, ptrs: Vec::new(), code_base }
+        Reader { reads: Vec::new(), words: Vec::new(), unread: Vec::new(), spans: [(0, 0); 4], next_span: 0, ptrs: Vec::new(), code_base }
     }
 
     /// Whether guest memory [addr, addr + n) is readable: within a recent
@@ -189,7 +192,11 @@ impl<'a> Reader<'a> {
     }
 
     fn u32(&mut self, addr: u64) -> Option<u32> {
-        if addr % 4 != 0 || !self.readable(addr, 4) {
+        if addr % 4 != 0 {
+            return None;
+        }
+        if !self.readable(addr, 4) {
+            self.unread.push((addr, 4));
             return None;
         }
         match self.reads.last_mut() {
@@ -205,7 +212,11 @@ impl<'a> Reader<'a> {
     /// check; false (nothing read) if any of them is not readable.
     fn read_into(&mut self, addr: u64, out: &mut [u32]) -> bool {
         let n = 4 * out.len() as u64;
-        if addr % 4 != 0 || n == 0 || !self.readable(addr, n) {
+        if addr % 4 != 0 || n == 0 {
+            return false;
+        }
+        if !self.readable(addr, n) {
+            self.unread.push((addr, n));
             return false;
         }
         match self.reads.last_mut() {
@@ -252,7 +263,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Resolved {
     Buffer(Vsharp),
     /// A base address and, for data loads at constant offsets, the bytes they
@@ -265,23 +276,38 @@ pub enum Resolved {
     Sampler([u32; 4]),
 }
 
-/// Everything needed to bind one shader stage for a draw/dispatch.
+/// What preparing a stage found in guest memory, shared by the
+/// preparation's copies (one allocation; a repeated preparation from the
+/// cache, `prep_cache`, costs no deep copy). `Prepared` derefs to it.
+pub struct Found {
+    pub resources: Vec<Resolved>,
+    /// Guest address of each descriptor's first dword when read from memory.
+    pub res_addrs: Vec<Option<u64>>,
+    /// Guest memory read while resolving (for write hazards).
+    pub reads: Vec<(u64, u64)>,
+    /// The words read, in the order of `reads`.
+    pub words: Vec<u32>,
+    /// Guest ranges it could not read (`Reader::unread`).
+    pub unread: Vec<(u64, u64)>,
+    /// The data-only scalar loads (`Plan::load_data`) as read: where their
+    /// dwords sit in `sgpr_data`, the guest address, and where their words
+    /// start in `words`.
+    pub data_loads: Vec<DataLoad>,
+}
+
+/// Everything needed to bind one shader stage for a draw/dispatch: what was
+/// found (`Found`, shared by copies; fields reached through `Deref`), and
+/// the SGPR data and user data, a copy's own.
 #[derive(Clone)]
 pub struct Prepared {
     pub stage: Stage,
     pub addr: u64,
     pub insts: Arc<Vec<rdna::Inst>>,
     pub tr: Arc<Translated>,
-    pub resources: Vec<Resolved>,
-    /// Guest address of each descriptor's first dword when read from memory.
-    pub res_addrs: Vec<Option<u64>>,
+    pub found: Arc<Found>,
     /// SGPR data buffer contents (resource info blocks filled at binding).
     pub sgpr_data: Vec<u32>,
     pub user: Vec<u32>,
-    /// Guest memory read while resolving (for write hazards).
-    pub reads: Vec<(u64, u64)>,
-    /// The words read, in the order of `reads`.
-    pub words: Vec<u32>,
     /// `mem::MAP_GEN` and `images::GPU_IMAGES_GEN` when it was made (a
     /// preparation made ahead of execution is checked against them).
     pub map_gen: u64,
@@ -291,14 +317,17 @@ pub struct Prepared {
     /// preparation that depends on the image cache).
     pub cmp_images: u64,
     pub cmp_depth: u64,
-    /// The data-only scalar loads (`Plan::load_data`) as read: where their
-    /// dwords sit in `sgpr_data`, the guest address, and where their words
-    /// start in `words`.
-    pub data_loads: Vec<DataLoad>,
+}
+
+impl std::ops::Deref for Prepared {
+    type Target = Found;
+    fn deref(&self) -> &Found {
+        &self.found
+    }
 }
 
 /// A data-only scalar load of a prepared stage (`Prepared::data_loads`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DataLoad {
     pub sgpr: u32,
     pub addr: u64,
@@ -454,12 +483,19 @@ impl RegRead for StageRegs {
     }
 }
 
-/// Whether the guest words a preparation read are still in memory (a
-/// preparation made ahead of execution is used only then).
+/// Whether the guest words a preparation read are still in memory and what
+/// it could not read still cannot be read (a preparation made ahead of
+/// execution, or a reused one, is used only then): a data load from pages
+/// the title's streaming had not mapped yet resolved to zeros, and a cached
+/// preparation kept them after the pages were mapped (DS_PREP_CHECK, run
+/// 20261013-064118).
 pub fn words_unchanged(p: &Prepared) -> bool {
     let checked = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::Acquire) != p.map_gen;
+    if checked && p.unread.iter().any(|&(a, n)| super::cp::guest_readable(a, n)) {
+        return false;
+    }
     let mut k = 0usize;
-    for &(a, n) in &p.reads {
+    for &(a, n) in p.reads.iter() {
         let m = (n / 4) as usize;
         if checked && !super::cp::guest_readable(a, n) {
             return false;
@@ -1015,8 +1051,7 @@ pub fn reset_repeats() {
 /// 20261011-091944); dispatches do not.
 struct PrepEntry {
     key: u64,
-    /// The words read (`Prepared::reads`, in order).
-    words: Vec<u32>,
+    /// Validated by the words it read (`words_unchanged`).
     prepared: Prepared,
 }
 
@@ -1027,6 +1062,88 @@ thread_local! {
 /// Preparations served from / missing PREP_CACHE (diagnostics).
 pub static PREP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static PREP_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Cache hits compared with a full preparation (DS_PREP_CHECK=1) and those
+/// that differed.
+static PREP_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PREP_DIFFERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Differences explained by guest writes during the check.
+static PREP_RACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// DS_PREP_CHECK=1: every PREP_CACHE hit is prepared in full as well and
+/// the two are compared (a correctness check of the cache's key and
+/// validation; the full preparation is used).
+fn prep_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_PREP_CHECK").ok().as_deref() == Some("1"))
+}
+
+/// Compares a cache hit with the full preparation (`prep_check`).
+fn prep_compare(hit: &Prepared, full: &Prepared) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut diff = Vec::new();
+    if hit.addr != full.addr {
+        diff.push("address");
+    }
+    if !Arc::ptr_eq(&hit.tr, &full.tr) && hit.tr.spec != full.tr.spec {
+        diff.push("translation");
+    }
+    if hit.resources != full.resources {
+        diff.push("resources");
+    }
+    if hit.res_addrs != full.res_addrs {
+        diff.push("descriptor addresses");
+    }
+    if hit.sgpr_data != full.sgpr_data {
+        diff.push("SGPR data");
+    }
+    if hit.user != full.user {
+        diff.push("user data");
+    }
+    if hit.reads != full.reads || hit.words != full.words || hit.unread != full.unread {
+        diff.push("reads");
+    }
+    if hit.data_loads != full.data_loads {
+        diff.push("data loads");
+    }
+    if (hit.cmp_images, hit.cmp_depth) != (full.cmp_images, full.cmp_depth) {
+        diff.push("depth views");
+    }
+    let n = PREP_CHECKED.fetch_add(1, Relaxed) + 1;
+    if !diff.is_empty() {
+        if !words_unchanged(hit) {
+            // The title wrote memory the cached preparation read between the
+            // cache's check and the full preparation: a full preparation a
+            // moment earlier would have matched (not a cache error).
+            let r = PREP_RACED.fetch_add(1, Relaxed) + 1;
+            if r <= 5 {
+                crate::info!("prep check: {:?} shader {:#x}: memory it read changed during the check (differs in {}; not counted)", full.stage, full.addr, diff.join(", "));
+            }
+        } else {
+            let d = PREP_DIFFERED.fetch_add(1, Relaxed) + 1;
+            if d <= 20 {
+                let mut detail = Vec::new();
+                if let Some(i) = hit.reads.iter().zip(full.reads.iter()).position(|(a, b)| a != b) {
+                    detail.push(format!("read {i}: cached {:x?}, full {:x?}", hit.reads[i], full.reads[i]));
+                } else if hit.reads.len() != full.reads.len() {
+                    detail.push(format!("reads: cached {}, full {} ranges (full's next {:x?})", hit.reads.len(), full.reads.len(), full.reads.get(hit.reads.len())));
+                }
+                if let Some(i) = hit.words.iter().zip(full.words.iter()).position(|(a, b)| a != b) {
+                    detail.push(format!("word {i}: cached {:#x}, full {:#x}", hit.words[i], full.words[i]));
+                }
+                if hit.unread != full.unread {
+                    detail.push(format!("unread: cached {:x?}, full {:x?}", &hit.unread[..hit.unread.len().min(4)], &full.unread[..full.unread.len().min(4)]));
+                }
+                if let Some(i) = hit.sgpr_data.iter().zip(full.sgpr_data.iter()).position(|(a, b)| a != b) {
+                    detail.push(format!("SGPR data {i}: cached {:#x}, full {:#x}", hit.sgpr_data[i], full.sgpr_data[i]));
+                }
+                crate::warn!("prep check: {:?} shader {:#x}: the cached preparation differs from a full one in {} ({})", full.stage, full.addr, diff.join(", "), detail.join("; "));
+            }
+        }
+    }
+    if n.is_power_of_two() && n >= 1024 {
+        crate::info!("prep check: {n} cache hits compared with full preparations, {} differed, {} changed during the check", PREP_DIFFERED.load(Relaxed), PREP_RACED.load(Relaxed));
+    }
+}
 
 fn stage_slot(s: Stage) -> usize {
     match s {
@@ -1034,22 +1151,6 @@ fn stage_slot(s: Stage) -> usize {
         Stage::Fragment => 1,
         _ => 2,
     }
-}
-
-/// The words in `reads` (in order); None if any is not readable now.
-fn read_words(reads: &[(u64, u64)], out: &mut Vec<u32>) -> bool {
-    out.clear();
-    for &(a, n) in reads {
-        if !super::cp::guest_readable(a, n) {
-            return false;
-        }
-        let mut k = 0;
-        while k + 4 <= n {
-            out.push(unsafe { std::ptr::read_volatile((a + k) as *const u32) });
-            k += 4;
-        }
-    }
-    true
 }
 
 fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32], spec: &mut Spec) -> Result<Prepared, String> {
@@ -1121,12 +1222,18 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
         if !cacheable {
             return None;
         }
-        let c = c.borrow();
-        let e = c[slot].as_ref().filter(|e| e.key == prep_key)?;
-        let mut now = Vec::with_capacity(e.words.len());
-        if !read_words(&e.prepared.reads, &mut now) || now != e.words {
+        let mut c = c.borrow_mut();
+        let e = c[slot].as_mut().filter(|e| e.key == prep_key)?;
+        // The depth-view decisions are part of its translation.
+        let map_gen = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
+        let images_gen = super::images::GPU_IMAGES_GEN.load(std::sync::atomic::Ordering::Acquire);
+        if !words_unchanged(&e.prepared) || !depth_views_hold(&e.prepared) {
             return None;
         }
+        // Readable at this mapping, the same depth views at these images:
+        // later hits skip those checks.
+        e.prepared.map_gen = map_gen;
+        e.prepared.images_gen = images_gen;
         let mut p = e.prepared.clone();
         for (i, w) in p.sgpr_data.iter_mut().enumerate().take(translate::SGPR_DATA_USER as usize) {
             *w = user.get(i).copied().unwrap_or(0);
@@ -1134,10 +1241,18 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
         p.user = user.to_vec();
         Some(p)
     });
-    if let Some(p) = hit {
+    let mut checked_hit = None;
+    let hit = hit.and_then(|p| {
         PREP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if prep_check() {
+            checked_hit = Some(p);
+            return None;
+        }
+        Some(p)
+    });
+    if let Some(p) = hit {
         // Texture-streaming statistics as a full preparation notes them.
-        for r in &p.resources {
+        for r in p.resources.iter() {
             match r {
                 Resolved::Image(t) => super::lodstats::note(&t.raw),
                 Resolved::ImageTable(e) => {
@@ -1150,7 +1265,7 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
         }
         return Ok(p);
     }
-    if cacheable {
+    if cacheable && checked_hit.is_none() {
         PREP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let map_gen = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
@@ -1357,11 +1472,26 @@ fn prepare(addr: u64, insts: Arc<Vec<rdna::Inst>>, code_hash: u64, user: &[u32],
         }
     }
     // The reader's references into the translation's plan end here.
-    let Reader { reads, words, .. } = rd;
-    let prepared = Prepared { stage: spec.stage, addr, insts, tr, resources, res_addrs, sgpr_data, user: user.to_vec(), reads, words, map_gen, images_gen, cmp_images, cmp_depth, data_loads };
-    let mut words = Vec::new();
-    if cacheable && read_words(&prepared.reads, &mut words) {
-        let e = PrepEntry { key: prep_key, words, prepared: prepared.clone() };
+    let Reader { reads, words, unread, .. } = rd;
+    let prepared = Prepared {
+        stage: spec.stage,
+        addr,
+        insts,
+        tr,
+        found: Arc::new(Found { resources, res_addrs, reads, words, unread, data_loads }),
+        sgpr_data,
+        user: user.to_vec(),
+        map_gen,
+        images_gen,
+        cmp_images,
+        cmp_depth,
+    };
+    if let Some(h) = &checked_hit {
+        prep_compare(h, &prepared);
+    }
+    if cacheable {
+        // The words it read are the cache's check (no second read).
+        let e = PrepEntry { key: prep_key, prepared: prepared.clone() };
         PREP_CACHE.with(|c| c.borrow_mut()[slot] = Some(e));
     }
     if let Some(k) = repeat_key {

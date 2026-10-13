@@ -459,7 +459,7 @@ pub fn reserve_guest_range() -> Result<(), String> {
 }
 
 fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
-    crate::gpu::track::remapped(addr, size);
+    crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_COMMIT);
     repaged(addr, size);
     let p = unsafe { VirtualAlloc(addr as _, size as usize, MEM_COMMIT, win_prot(prot)) };
     if p.is_null() { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
@@ -498,7 +498,7 @@ pub fn os_readable(a: u64, len: u64) -> bool {
 }
 
 fn host_decommit(addr: u64, size: u64) {
-    crate::gpu::track::remapped(addr, size);
+    crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_DECOMMIT);
     repaged(addr, size);
     let _readers_out = GUEST_READERS.write();
     unsafe {
@@ -507,7 +507,7 @@ fn host_decommit(addr: u64, size: u64) {
 }
 
 pub fn host_protect(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
-    crate::gpu::track::remapped(addr, size);
+    crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_PROTECT);
     let mut old = 0u32;
     let _readers_out = GUEST_READERS.write();
     let ok = unsafe { VirtualProtect(addr as _, size as usize, win_prot(prot), &mut old) };

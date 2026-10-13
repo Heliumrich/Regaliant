@@ -1280,7 +1280,7 @@ fn merge_pipe() -> Result<&'static MergePipe, String> {
 /// has grown).
 fn texture_ranges_into(p: &Prepared, out: &mut Vec<((u64, u64), super::desc::Tsharp)>) {
     let coarse = |t: &super::desc::Tsharp| ((t.base, (t.width as u64 * t.height as u64 * t.depth.max(1) as u64 * 16).min(1 << 30)), *t);
-    for r in &p.resources {
+    for r in p.resources.iter() {
         match r {
             Resolved::Image(t) => out.push(coarse(t)),
             Resolved::ImageTable(e) => out.extend(e.iter().flatten().map(coarse)),
@@ -3541,7 +3541,7 @@ impl Exec {
     /// `Images::depth_to_grow`), after the work that used them.
     pub(crate) fn grow_sampled_depth(&mut self, stages: &[&Prepared]) {
         for p in stages {
-            for r in &p.resources {
+            for r in p.resources.iter() {
                 let Resolved::Image(t) = r else { continue };
                 let Some(k) = super::images::Images::key_of(t) else { continue };
                 let fam = super::images::Images::depth_family(k.format);
@@ -3886,7 +3886,7 @@ impl Exec {
             }
             any = true;
             let mut data = vec![false; p.words.len()];
-            for d in &p.data_loads {
+            for d in p.data_loads.iter() {
                 let bytes = 4 * d.dwords as u64;
                 if writer(self, &[(d.addr, bytes)]).is_some() {
                     let (src, start, _) = span(d.addr, bytes)?;
@@ -3901,7 +3901,7 @@ impl Exec {
             // The other words, where that work writes: used as read, checked.
             let (mut reads, mut words): (Vec<(u64, u64)>, Vec<u32>) = (Vec::new(), Vec::new());
             let mut i = 0usize;
-            for &(a, n) in &p.reads {
+            for &(a, n) in p.reads.iter() {
                 for j in 0..n / 4 {
                     if !data.get(i).copied().unwrap_or(true) {
                         let at = a + 4 * j;

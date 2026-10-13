@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 57] = [
+    static ALL: [Tunable; 58] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -52,7 +52,7 @@ pub mod tune {
         Tunable { name: "homes", env: "DS_HOMES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "gpu_loads", env: "DS_GPU_LOADS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "reg_vars", env: "DS_REG_VARS", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "prep_cache", env: "DS_PREP_CACHE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "prep_cache", env: "DS_PREP_CACHE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "map_ranges", env: "DS_MAP_RANGES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ahead", env: "DS_AHEAD", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_cs", env: "DS_PRE_CS", default: 1, value: AtomicU64::new(UNSET) },
@@ -84,6 +84,7 @@ pub mod tune {
         Tunable { name: "clean_pages", env: "DS_CLEAN_PAGES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "eop_light", env: "DS_EOP_LIGHT", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ts_nowait", env: "DS_TS_NOWAIT", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "upload_parts", env: "DS_UPLOAD_PARTS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     #[inline]
@@ -290,10 +291,11 @@ pub mod tune {
     }
 
     /// Vertex and pixel shader preparations reuse the previous one of their
-    /// stage when inputs and the guest words read are unchanged (1). Off:
-    /// cloning whole preparations into and out of the cache cost more than
-    /// the resolution it saved (17-20 against 16.5-17 us per draw, run
-    /// 20261011-092437); a form that shares the unchanging parts may pay.
+    /// stage when inputs and the guest words read are unchanged (1): the
+    /// copies share the unchanging parts, checked in place (3.5-3.7% less
+    /// CPU per command in replay A/Bs, run 20261013-063425; whole clones
+    /// cost more than they saved before, run 20261011-092437).
+    /// DS_PREP_CHECK=1 compares every reuse with a full preparation.
     #[inline]
     pub fn prep_cache() -> bool {
         get(25) != 0
@@ -571,6 +573,19 @@ pub mod tune {
     #[inline]
     pub fn ts_nowait() -> bool {
         get(56) != 0
+    }
+
+    /// Re-uploads after file reads and mapping changes upload only the
+    /// (mip, layer)s the written ranges overlap (1): the title streams
+    /// texture arrays a layer at a time (1024x1024x64 BC7, 1024x1024x80), and
+    /// every layer it mapped re-uploads the whole array (FINDINGS.md
+    /// 2026-10-13). Off: the title fills mapped layers and small mips with
+    /// CPU writes later, which only the whole re-uploads picked up
+    /// (DS_UPLOAD_CHECK=1 found 29 of 23,807 left-out (mip, layer)s changed,
+    /// run 20261013-065447).
+    #[inline]
+    pub fn upload_parts() -> bool {
+        get(57) != 0
     }
 
     /// A switch's value by name; None if unknown.

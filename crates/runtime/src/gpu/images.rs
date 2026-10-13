@@ -656,6 +656,58 @@ pub struct Image {
 /// slices, one slice per frame (a change is seen within SLICES frames).
 const SLICES: usize = 8;
 
+/// Re-uploads after mapping changes (diagnostics), by kind of change
+/// (`track::REMAP_*`): [count, with the sampled hashes unchanged, covering
+/// part of the texture only, upload ns].
+static REMAP_UPLOADS: [[std::sync::atomic::AtomicU64; 4]; 3] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 3];
+/// Sampled hash of the guest bytes [a, a+n) of one (mip, layer) of a
+/// texture at `base`: all of them up to 64 KiB, else the first 256 bytes of
+/// each of the texture's 4 KiB pages inside it (the bytes `slice_hash`
+/// samples: a change the CPU-write checks see is seen here too).
+fn sub_hash(base: u64, a: u64, n: u64) -> u64 {
+    if n <= 1 << 16 {
+        return hash_bytes(a, n as usize);
+    }
+    let end = a + n;
+    let mut p = base + (a - base) / 4096 * 4096;
+    let mut h = 0u64;
+    while p < end {
+        let (lo, hi) = (p.max(a), (p + 256).min(end));
+        if lo < hi {
+            h = h.rotate_left(5) ^ hash_bytes(lo, (hi - lo) as usize);
+        }
+        p += 4096;
+    }
+    h
+}
+
+/// The (mip, layer)s' `sub_hash`es at their last upload, by texture
+/// (`tune upload_parts`).
+static SUBS: Mutex<Option<HashMap<ImageKey, Vec<u64>>>> = Mutex::new(None);
+
+/// Partial re-uploads (`tune upload_parts`): [uploads, (mip, layer)s
+/// uploaded, (mip, layer)s left out, bytes detiled].
+static PART_UPLOADS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// Bytes detiled by 2D uploads (all of them).
+static DETILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// DS_UPLOAD_CHECK=1: every upload hashes all guest bytes of each mapped
+/// (mip, layer); a partial re-upload checks that the ones it leaves out are
+/// unchanged since the last upload ([checked, changed]): what the sampled
+/// hashes (`sub_hash`) miss.
+fn upload_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_UPLOAD_CHECK").ok().as_deref() == Some("1"))
+}
+static SUB_HASHES: Mutex<Option<HashMap<ImageKey, Vec<u64>>>> = Mutex::new(None);
+static SUB_CHECKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+const SUB_UNMAPPED: u64 = 0x5555_5555_5555_5555;
+
+/// 2D uploads' time (diagnostics), ns: detiling, the staging buffer (made,
+/// filled, freed), the transfer (submitted and waited for: the GPU's queue
+/// drains first).
+static UPLOAD_SPLIT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Hash of `n` bytes at `a` (four independent lanes over 64-bit words).
 fn hash_bytes(a: u64, n: usize) -> u64 {
     let mut h = [0x9E37_79B9_7F4A_7C15u64, 0xC2B2_AE3D_27D4_EB4F, 0x1656_67B1_9E37_79F9, 0x27D4_EB2F_1656_67C5];
@@ -816,7 +868,7 @@ fn scrubber() {
             SCRUB_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if slice_hash(b, n, s) != stored {
                 SCRUB_DIRTY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                super::track::force_dirty(region);
+                super::track::sampled_dirty(region);
             }
         }
     }
@@ -1148,8 +1200,16 @@ impl Images {
 
     /// Uploads all mips/layers of a guest texture (detiled) into `image`.
     fn upload(&mut self, image: vk::Image, key: ImageKey, t: &Tsharp) -> Result<(u64, u64), String> {
+        self.upload_parts(image, key, t, None, true)
+    }
+
+    /// Uploads the mapped (mip, layer)s of a guest texture: all of them with
+    /// `all` (and on a first upload, and for 3D textures); otherwise, with
+    /// `tune upload_parts`, those that overlap the written ranges `only` and
+    /// those whose sampled bytes changed since their last upload.
+    fn upload_parts(&mut self, image: vk::Image, key: ImageKey, t: &Tsharp, only: Option<&[(u64, u64)]>, all: bool) -> Result<(u64, u64), String> {
         let t0 = std::time::Instant::now();
-        let r = self.upload_inner(image, key, t);
+        let r = self.upload_inner(image, key, t, only, all);
         if let Ok((_, n)) = &r {
             self.upload_bytes += n;
         }
@@ -1157,8 +1217,10 @@ impl Images {
         r
     }
 
-    fn upload_inner(&mut self, image: vk::Image, key: ImageKey, t: &Tsharp) -> Result<(u64, u64), String> {
+    fn upload_inner(&mut self, image: vk::Image, key: ImageKey, t: &Tsharp, only: Option<&[(u64, u64)]>, all: bool) -> Result<(u64, u64), String> {
         let first = !self.map.contains_key(&key);
+        let subs_on = super::tune::upload_parts();
+        let precise = subs_on && !first && !all;
         if key.ty3d {
             return self.upload_3d(image, key, t, first);
         }
@@ -1185,20 +1247,85 @@ impl Images {
         };
         // Pages checked and read under the guest-reader lock: the title may
         // unmap layers of a streamed array meanwhile (`mem::GUEST_READERS`).
+        let t_detile = std::time::Instant::now();
         let readers = crate::mem::GUEST_READERS.read();
         let whole = super::cp::valid(t.base, size) && crate::mem::os_readable(t.base, size);
         let mapped = |mip: usize, layer: u32| -> bool {
             let (s, n) = range(mip, layer);
             whole || (super::cp::valid(t.base + s, n) && crate::mem::os_readable(t.base + s, n))
         };
+        // A partial re-upload (`precise`): the (mip, layer)s whose sampled
+        // bytes changed since their last upload, and those the written
+        // ranges overlap. The title maps a layer of a streamed array at a
+        // time and fills mapped layers and small mips with CPU writes later.
+        let index = |mip: usize, layer: u32| mip * layers as usize + layer as usize;
+        let subs: Vec<u64> = if subs_on {
+            (0..key.levels as usize)
+                .flat_map(|mip| (0..layers).map(move |layer| (mip, layer)))
+                .map(|(mip, layer)| {
+                    let (s, n) = range(mip, layer);
+                    if mapped(mip, layer) { sub_hash(t.base, t.base + s, n) } else { SUB_UNMAPPED }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let prev = if precise { SUBS.lock().as_ref().and_then(|m| m.get(&key).cloned()) } else { None };
+        let wanted = |mip: usize, layer: u32| -> bool {
+            if !precise {
+                return true;
+            }
+            let i = index(mip, layer);
+            let Some(prev) = &prev else { return true };
+            if prev.get(i) != subs.get(i) {
+                return true;
+            }
+            let Some(parts) = only else { return false };
+            let (s, n) = range(mip, layer);
+            let (a, e) = (t.base + s, t.base + s + n);
+            parts.iter().any(|&(pb, pl)| pb < e && a < pb.saturating_add(pl))
+        };
+        if upload_check() {
+            let now: Vec<u64> = (0..key.levels as usize)
+                .flat_map(|mip| (0..layers).map(move |layer| (mip, layer)))
+                .map(|(mip, layer)| {
+                    let (s, n) = range(mip, layer);
+                    if mapped(mip, layer) { hash_bytes(t.base + s, n as usize) } else { SUB_UNMAPPED }
+                })
+                .collect();
+            let mut g = SUB_HASHES.lock();
+            let map = g.get_or_insert_with(HashMap::default);
+            if let (true, Some(prev)) = (precise, map.get(&key)) {
+                for (i, (&a, &b)) in prev.iter().zip(&now).enumerate() {
+                    let (mip, layer) = (i / layers as usize, (i % layers as usize) as u32);
+                    if wanted(mip, layer) || b == SUB_UNMAPPED {
+                        continue;
+                    }
+                    SUB_CHECKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if a != b && SUB_CHECKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+                        crate::warn!("upload check: texture {:#x} {}x{}x{} mip {mip} layer {layer}: changed although no written range overlaps it (ranges {only:x?})", t.base, key.width, key.height, layers);
+                    }
+                }
+            }
+            map.insert(key, now);
+        }
         let mut end = 0u64;
         for mip in 0..key.levels as usize {
             for layer in 0..layers {
-                if mapped(mip, layer) {
+                if mapped(mip, layer) && wanted(mip, layer) {
                     let (s, n) = range(mip, layer);
                     end = end.max(s + n);
                 }
             }
+        }
+        if end == 0 && precise {
+            // Nothing mapped changed.
+            if subs_on {
+                SUBS.lock().get_or_insert_with(HashMap::default).insert(key, subs);
+            }
+            PART_UPLOADS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            PART_UPLOADS[2].fetch_add(key.levels as u64 * layers as u64, std::sync::atomic::Ordering::Relaxed);
+            return Ok((t.base, size));
         }
         if end == 0 && !first {
             return Err(format!("texture {:#x}+{size:#x} not mapped", t.base));
@@ -1212,8 +1339,14 @@ impl Images {
         let mut regions = Vec::new();
         let mut zeroed: Vec<(usize, u32, usize)> = Vec::new();
         let mut tmp = Vec::new();
+        let (mut parts_done, mut parts_left) = (0u64, 0u64);
         for mip in 0..key.levels as usize {
             for layer in 0..layers {
+                if !wanted(mip, layer) {
+                    parts_left += 1;
+                    continue;
+                }
+                parts_done += 1;
                 if !mapped(mip, layer) {
                     skipped += 1;
                     if first {
@@ -1240,6 +1373,18 @@ impl Images {
         }
         // Guest memory is no longer read.
         drop(readers);
+        UPLOAD_SPLIT[0].fetch_add(t_detile.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        DETILED.fetch_add(staging.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if subs_on {
+            SUBS.lock().get_or_insert_with(HashMap::default).insert(key, subs);
+        }
+        if precise {
+            use std::sync::atomic::Ordering::Relaxed;
+            PART_UPLOADS[0].fetch_add(1, Relaxed);
+            PART_UPLOADS[1].fetch_add(parts_done, Relaxed);
+            PART_UPLOADS[2].fetch_add(parts_left, Relaxed);
+            PART_UPLOADS[3].fetch_add(staging.len() as u64, Relaxed);
+        }
         if regions.is_empty() && zeroed.is_empty() {
             return Err(format!("texture {:#x}+{size:#x}: no mip mapped", t.base));
         }
@@ -1265,9 +1410,12 @@ impl Images {
             ));
         }
         let c = ctx();
+        let t_stage = std::time::Instant::now();
         let (buf, mem, ptr) = c.host_buffer(staging.len().max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
         unsafe { std::ptr::copy_nonoverlapping(staging.as_ptr(), ptr, staging.len()) };
         let base = t.base;
+        let t_copy = std::time::Instant::now();
+        UPLOAD_SPLIT[1].fetch_add((t_copy - t_stage).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         self.one_shot(|cmd| unsafe {
             super::vk::checkpoint(cmd, super::vk::mark::UPLOAD, base);
             // A first upload starts from UNDEFINED; a re-upload keeps the
@@ -1284,11 +1432,14 @@ impl Images {
             let a = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[a], &[], &[]);
         });
+        let t_free = std::time::Instant::now();
+        UPLOAD_SPLIT[2].fetch_add((t_free - t_copy).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         unsafe {
             c.device.destroy_buffer(buf, None);
             c.device.unmap_memory(mem);
             c.device.free_memory(mem, None);
         }
+        UPLOAD_SPLIT[1].fetch_add(t_free.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         self.uploads += 1;
         Ok((t.base, size))
     }
@@ -1870,7 +2021,7 @@ impl Images {
             if h != self.map[&key].hashes {
                 self.reuploads += 1;
                 self.report(format!("texture {:#x} {}x{} re-uploaded (GPU write)", t.base, t.width, t.height));
-                self.upload(image, key, t)?;
+                self.upload_parts(image, key, t, None, false)?;
                 self.map.get_mut(&key).unwrap().hashes = h;
             }
         }
@@ -1882,11 +2033,11 @@ impl Images {
             if slice_hash(b, n, s) != img.hashes[s] {
                 self.reuploads += 1;
                 self.report(format!("texture {:#x} {}x{} re-uploaded (CPU write)", t.base, t.width, t.height));
-                self.upload(image, key, t)?;
+                self.upload_parts(image, key, t, None, false)?;
                 self.map.get_mut(&key).unwrap().hashes = all_hashes(b, n);
             }
         }
-        if let Some(why) = super::track::take_dirty(region) {
+        if let Some((why, parts)) = super::track::take_dirty(region) {
             // Re-armed first: writes during the upload mark it dirty again.
             super::track::rearm(region);
             self.reuploads += 1;
@@ -1903,11 +2054,26 @@ impl Images {
                 super::track::Why::Remap(..) => "mapping change",
                 super::track::Why::Unmapped => "unmapped",
                 super::track::Why::Forced => "requested",
+                super::track::Why::Sampled => "CPU write, sampled",
                 super::track::Why::None => "?",
             });
             self.report(msg);
-            self.upload(image, key, t)?;
-            self.map.get_mut(&key).unwrap().hashes = all_hashes(b, n);
+            let t0 = std::time::Instant::now();
+            self.upload_parts(image, key, t, parts.as_deref(), matches!(why, super::track::Why::Forced))?;
+            let h = all_hashes(b, n);
+            if let super::track::Why::Remap(rb, rl, op) = why {
+                use std::sync::atomic::Ordering::Relaxed;
+                let s = &REMAP_UPLOADS[(op as usize).min(2)];
+                s[0].fetch_add(1, Relaxed);
+                if h == self.map[&key].hashes {
+                    s[1].fetch_add(1, Relaxed);
+                }
+                if rb > b || rb.saturating_add(rl) < b + n {
+                    s[2].fetch_add(1, Relaxed);
+                }
+                s[3].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+            }
+            self.map.get_mut(&key).unwrap().hashes = h;
         }
         Ok(())
     }
@@ -2580,15 +2746,32 @@ impl Images {
 
     /// One status line (hang reports).
     pub fn status(&self) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        let remaps: Vec<String> = ["commit", "decommit", "protection"]
+            .iter()
+            .zip(&REMAP_UPLOADS)
+            .map(|(what, s)| format!("{what} {} ({} unchanged, {} partial, {} ms)", s[0].load(Relaxed), s[1].load(Relaxed), s[2].load(Relaxed), s[3].load(Relaxed) / 1_000_000))
+            .collect();
+        let p = &PART_UPLOADS;
+        let check = if upload_check() { format!(" (checked: {} left out, {} changed)", SUB_CHECKS[0].load(Relaxed), SUB_CHECKS[1].load(Relaxed)) } else { String::new() };
         format!(
-            "    images: {} cached, {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying); GPU-owned images overwritten through buffers: {} cleared, {} uploaded\n",
+            "    images: {} cached, {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling, {} ms staging, {} ms transfers); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} MiB){check}; GPU-owned images overwritten through buffers: {} cleared, {} uploaded; re-uploads after mapping changes: {}\n",
             self.map.len(),
             self.uploads,
             self.reuploads,
             self.upload_bytes >> 20,
             self.upload_ns / 1_000_000,
+            DETILED.load(Relaxed) >> 20,
+            UPLOAD_SPLIT[0].load(Relaxed) / 1_000_000,
+            UPLOAD_SPLIT[1].load(Relaxed) / 1_000_000,
+            UPLOAD_SPLIT[2].load(Relaxed) / 1_000_000,
+            p[0].load(Relaxed),
+            p[1].load(Relaxed),
+            p[2].load(Relaxed),
+            p[3].load(Relaxed) >> 20,
             self.overwrite_clears,
-            self.overwrite_uploads
+            self.overwrite_uploads,
+            remaps.join(", ")
         )
     }
 }

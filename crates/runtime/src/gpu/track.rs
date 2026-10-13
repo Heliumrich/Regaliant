@@ -13,7 +13,9 @@
 //! sampled hashing instead (`protected()` tells which applies).
 //!
 //! Protocol for a consumer: `take_dirty(id)`; if dirty, `rearm(id)` and then
-//! read the memory (writes after re-arming fault again).
+//! read the memory (writes after re-arming fault again). `take_dirty` names
+//! the parts written when they are known (file reads, mapping changes, CPU
+//! write faults), so a consumer may read only those.
 
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
@@ -31,6 +33,28 @@ struct Region {
     gpu: bool,
     /// What made it dirty last (diagnostics).
     why: Why,
+    /// The ranges written since it was armed, unless `whole` (unknown parts,
+    /// or more than `MAX_PARTS`).
+    parts: Vec<(u64, u64)>,
+    whole: bool,
+}
+
+/// Written ranges kept per region before it counts as written all over.
+const MAX_PARTS: usize = 64;
+
+impl Region {
+    /// Marks the region dirty: `part` written (None: unknown parts).
+    fn mark(&mut self, part: Option<(u64, u64)>, why: Why) {
+        self.dirty = true;
+        self.why = why;
+        match part {
+            Some(p) if !self.whole && self.parts.len() < MAX_PARTS => self.parts.push(p),
+            _ => {
+                self.whole = true;
+                self.parts.clear();
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -39,10 +63,14 @@ pub enum Why {
     Fault(u64),
     HostWrite(u64),
     GpuWrite(u64, u64),
-    Remap(u64, u64),
+    /// A mapping change of [base, base+len): `REMAP_COMMIT`, `REMAP_DECOMMIT`
+    /// or `REMAP_PROTECT`.
+    Remap(u64, u64, u8),
     Unmapped,
     /// Requested (diagnosis: `reupload`).
     Forced,
+    /// Sampled bytes changed (texture scrubbing: CPU writes).
+    Sampled,
 }
 
 #[derive(Default)]
@@ -128,7 +156,7 @@ impl Tracker {
         note_region(base, size);
         RESET_GEN.fetch_add(1, Ordering::Release);
         let id = self.regions.len() as u32;
-        self.regions.push(Some(Region { base, size, dirty: false, gpu: false, why: Why::None }));
+        self.regions.push(Some(Region { base, size, dirty: false, gpu: false, why: Why::None, parts: Vec::new(), whole: false }));
         self.by_base.entry(base).or_default().push(id);
         self.max_size = self.max_size.max(size);
         id
@@ -232,7 +260,8 @@ fn arm_locked(t: &mut Tracker, id: u32, spans: &[(u64, u64, u32)]) {
                 // A non-faulting writer is active here: stay writable, and
                 // re-arm on the next check.
                 if let Some(Some(r)) = t.regions.get_mut(id as usize) {
-                    r.dirty = true;
+                    let why = r.why;
+                    r.mark(None, why);
                 }
                 p += PAGE;
                 continue;
@@ -256,8 +285,9 @@ fn arm_locked(t: &mut Tracker, id: u32, spans: &[(u64, u64, u32)]) {
 }
 
 /// Whether the region was written by the CPU since it was last armed (call
-/// `rearm` before reading the memory), and why.
-pub fn take_dirty(id: u32) -> Option<Why> {
+/// `rearm` before reading the memory): why (the last cause), and the ranges
+/// written when known (None: any part may have changed).
+pub fn take_dirty(id: u32) -> Option<(Why, Option<Vec<(u64, u64)>>)> {
     let mut g = TRACK.lock();
     let t = g.as_mut()?;
     match t.regions.get_mut(id as usize).and_then(|r| r.as_mut()) {
@@ -265,9 +295,23 @@ pub fn take_dirty(id: u32) -> Option<Why> {
             r.dirty = false;
             r.gpu = false;
             RESET_GEN.fetch_add(1, Ordering::Release);
-            Some(r.why)
+            let whole = std::mem::replace(&mut r.whole, false);
+            let parts = std::mem::take(&mut r.parts);
+            Some((r.why, (!whole).then_some(parts)))
         }
         _ => None,
+    }
+}
+
+/// Marks a region dirty, written somewhere (sampled hashes changed: texture
+/// scrubbing).
+pub fn sampled_dirty(id: u32) {
+    let mut g = TRACK.lock();
+    if let Some(r) = g.as_mut().and_then(|t| t.regions.get_mut(id as usize)).and_then(|r| r.as_mut()) {
+        if !r.dirty {
+            changed(0);
+        }
+        r.mark(None, Why::Sampled);
     }
 }
 
@@ -278,8 +322,7 @@ pub fn force_dirty(id: u32) {
         if !r.dirty {
             changed(0);
         }
-        r.dirty = true;
-        r.why = Why::Forced;
+        r.mark(None, Why::Forced);
     }
 }
 
@@ -330,8 +373,7 @@ pub fn rearm(id: u32) {
         // Unmapped or not writable now: report dirty on every check.
         None => {
             if let Some(Some(r)) = t.regions.get_mut(id as usize) {
-                r.dirty = true;
-                r.why = Why::Unmapped;
+                r.mark(None, Why::Unmapped);
                 changed(1);
             }
         }
@@ -350,8 +392,7 @@ fn unprotect_page(t: &mut Tracker, page: u64, why: Why) -> bool {
     let ids = e.0.clone();
     for id in ids {
         if let Some(Some(r)) = t.regions.get_mut(id as usize) {
-            r.dirty = true;
-            r.why = why;
+            r.mark(Some((page, PAGE)), why);
             changed(2);
         }
     }
@@ -418,8 +459,7 @@ pub fn host_write(base: u64, len: u64) -> HostWrite {
         if !r.dirty {
             changed(3);
         }
-        r.dirty = true;
-        r.why = Why::HostWrite(base);
+        r.mark(Some((base, len)), Why::HostWrite(base));
     });
     t.next_busy += 1;
     let id = t.next_busy;
@@ -444,10 +484,15 @@ pub fn gpu_write(base: u64, len: u64) {
     });
 }
 
+/// Kinds of mapping change (`Why::Remap`).
+pub const REMAP_COMMIT: u8 = 0;
+pub const REMAP_DECOMMIT: u8 = 1;
+pub const REMAP_PROTECT: u8 = 2;
+
 /// The memory manager changed the mapping or protection of [base,
-/// base+len): its page states are forgotten (re-registered on re-arming)
-/// and overlapping regions are dirty.
-pub fn remapped(base: u64, len: u64) {
+/// base+len) (`op`: `REMAP_*`): its page states are forgotten (re-registered
+/// on re-arming) and overlapping regions are dirty.
+pub fn remapped(base: u64, len: u64, op: u8) {
     super::precache::invalidate(base, len);
     super::homes::remapped(base, len);
     RESET_GEN.fetch_add(1, Ordering::Release);
@@ -470,8 +515,7 @@ pub fn remapped(base: u64, len: u64) {
         if !r.dirty {
             changed(5);
         }
-        r.dirty = true;
-        r.why = Why::Remap(base, len);
+        r.mark(Some((base, len)), Why::Remap(base, len, op));
     });
 }
 

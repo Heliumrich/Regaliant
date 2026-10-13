@@ -194,7 +194,7 @@ fn vertex_data(out: &mut String, p: &super::shaders::Prepared) {
 }
 
 fn note_textures(map: &mut std::collections::BTreeMap<u64, super::desc::Tsharp>, p: &super::shaders::Prepared) {
-    for r in &p.resources {
+    for r in p.resources.iter() {
         if let super::shaders::Resolved::Image(t) = r {
             map.entry(t.base).or_insert(*t);
         }
@@ -656,7 +656,7 @@ pub fn draw(cp: &Cp, what: &str) {
                     let _ = writeln!(s, "      {name} {l}");
                 }
                 if super::exec::enabled() {
-                    for r in &p.resources {
+                    for r in p.resources.iter() {
                         if let super::shaders::Resolved::Image(t) = r {
                             let d = super::images::with(|im| {
                                 let d = im.describe(t);
