@@ -680,6 +680,58 @@ fn epoch_wait_lines() -> String {
     s
 }
 
+/// The graphics command processor's time by packet class (`tune
+/// cp_classes`): [ns without waits, packets, ns of waits] for draws and
+/// dispatches of own chunks of parallel runs, draws and dispatches of serial
+/// runs, CP effects (other packets), state packets, NOPs and private
+/// operations, planning parallel runs, collecting their chunks, submissions
+/// at buffer ends.
+static CP_CLASSES: [[AtomicU64; 3]; 10] = [const { [const { AtomicU64::new(0) }; 3] }; 10];
+/// FRAMES when the classes were last cleared.
+static CP_CLASSES_FROM: AtomicU64 = AtomicU64::new(0);
+const CP_CLASS_NAMES: [&str; 10] = ["own parallel chunks: draws", "own parallel chunks: dispatches", "serial draws", "serial dispatches", "CP effects", "state", "NOPs and private operations", "planning", "collecting", "buffer-end submissions"];
+
+/// A packet class's start (`cp_classes`): the clock and the thread's waits.
+fn class_start(on: bool) -> Option<(Instant, u64)> {
+    on.then(|| (Instant::now(), super::timeline::waited_ns()))
+}
+
+fn class_end(k: usize, t: Option<(Instant, u64)>) {
+    let Some((t0, w0)) = t else { return };
+    let waited = super::timeline::waited_ns().saturating_sub(w0);
+    let ns = (t0.elapsed().as_nanos() as u64).saturating_sub(waited);
+    let c = &CP_CLASSES[k];
+    c[0].fetch_add(ns, Ordering::Relaxed);
+    c[1].fetch_add(1, Ordering::Relaxed);
+    c[2].fetch_add(waited, Ordering::Relaxed);
+}
+
+/// Clears the packet classes (`profile reset`).
+pub fn reset_classes() {
+    for c in CP_CLASSES.iter().flatten() {
+        c.store(0, Ordering::Relaxed);
+    }
+    CP_CLASSES_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+/// The packet classes per flip since they were cleared ("" when none).
+pub fn classes_line() -> String {
+    let flips = super::FRAMES.load(Ordering::Relaxed).saturating_sub(CP_CLASSES_FROM.load(Ordering::Relaxed)).max(1) as f64;
+    let total: u64 = CP_CLASSES.iter().map(|c| c[0].load(Ordering::Relaxed)).sum();
+    if total == 0 {
+        return String::new();
+    }
+    let parts: Vec<String> = CP_CLASSES
+        .iter()
+        .zip(CP_CLASS_NAMES)
+        .map(|(c, name)| {
+            let (ns, n, w) = (c[0].load(Ordering::Relaxed), c[1].load(Ordering::Relaxed), c[2].load(Ordering::Relaxed));
+            format!("{name} {:.2} ms ({:.0} packets, {:.1} us each; waits {:.2} ms)", ns as f64 / flips / 1e6, n as f64 / flips, ns as f64 / n.max(1) as f64 / 1e3, w as f64 / flips / 1e6)
+        })
+        .collect();
+    format!("    graphics command processor per flip by packet class (waits apart; {:.2} ms in all): {}\n", total as f64 / flips / 1e6, parts.join("; "))
+}
+
 pub fn wait_stats() -> String {
     let mut s = epoch_wait_lines();
     s.push_str(&wait_stats_inner());
@@ -1153,9 +1205,9 @@ impl Cp {
         };
         self.submit_gpu("par");
         run.grant(i);
-        let tl = super::timeline::mark();
+        let tw = super::timeline::wait_start();
         let (done, waited) = run.collect(i);
-        super::timeline::end(&self.name, tl, || "wait: parallel chunk".into());
+        tw.end(&self.name, || "wait: parallel chunk".into());
         match self.par.as_mut() {
             Some(pr) if last => {
                 super::par::note_main_wait(pr.waited_ns + waited);
@@ -1812,11 +1864,15 @@ impl Cp {
         let mut cur = addr;
         let mut end = addr + 4 * size as u64;
         let mut f = Fetched::new(addr, size);
+        // Time by packet class (the graphics queue; `tune cp_classes`).
+        let classes = !self.compute && super::tune::cp_classes();
         while cur < end {
             // The next chunk of a parallel run: collected here.
             if let Some(pr) = &self.par {
                 if pr.starts[pr.next] == cur {
+                    let t = class_start(classes);
                     cur = self.par_collect();
+                    class_end(8, t);
                     continue;
                 }
                 if cur > pr.starts[pr.next] {
@@ -1866,7 +1922,9 @@ impl Cp {
             }
             let skip = self.par_skip.0 == end && cur < self.par_skip.1;
             if self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && !self.compute && self.exec.is_some() && super::par::workers() > 0 && !super::capture::capturing() {
+                let t = class_start(classes);
                 self.par_plan(&f, cur, end);
+                class_end(7, t);
             }
             PACKETS.fetch_add(1, Ordering::Relaxed);
             self.cur_packet = cur;
@@ -1945,7 +2003,19 @@ impl Cp {
                     super::capture::packet(self, &format!("{name} {opcode:#x} @{cur:#x} [{}]", args.join(" ")));
                 }
             }
+            let dispatch = matches!(opcode, op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT);
+            let class = if command {
+                (if self.par.is_some() { 0 } else { 2 }) + dispatch as usize
+            } else if is_state(opcode) {
+                5
+            } else if opcode == op::NOP {
+                6
+            } else {
+                4
+            };
+            let t = class_start(classes && opcode != op::INDIRECT_BUFFER);
             let flow = self.packet(opcode, h, cur, n, &p);
+            class_end(class, t);
             if command {
                 // Preparations of this command that it did not take.
                 for s in self.take_ahead().iter().flatten() {
@@ -1982,7 +2052,9 @@ impl Cp {
         }
         self.depth -= 1;
         if self.depth == 0 {
+            let t = class_start(classes);
             self.submit_gpu("cmdbuf");
+            class_end(9, t);
         }
     }
 
@@ -2704,7 +2776,7 @@ impl Cp {
         let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         ACTIVE_WAITS.lock().push(ActiveWait { addr: a, wide, func, mask, reference, hit: hit.clone() });
         let t0 = Instant::now();
-        let tl = super::timeline::mark();
+        let tw = super::timeline::wait_start();
         let use_promise = self.exec.is_some();
         let promises_seen = std::cell::Cell::new(u64::MAX);
         let promises_moved = || {
@@ -2716,7 +2788,7 @@ impl Cp {
         });
         {
             let by = last_write(a).map(|w| w.0).unwrap_or_else(|| "cpu".into());
-            super::timeline::end(&self.name, tl, || format!("wait: label {a:#x} (written by {by})"));
+            tw.end(&self.name, || format!("wait: label {a:#x} (written by {by})"));
             let mut g = WAIT_STATS.lock();
             let e = g.get_or_insert_with(HashMap::new).entry((self.name.clone(), by)).or_default();
             e.0 += 1;

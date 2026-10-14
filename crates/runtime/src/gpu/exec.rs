@@ -3633,9 +3633,9 @@ impl Exec {
         if slot.seq != 0 {
             if slot.seq > done_seq() {
                 let t = std::time::Instant::now();
-                let tl = super::timeline::mark();
+                let tw = super::timeline::wait_start();
                 wait_done(slot.seq);
-                super::timeline::end(&self.name, tl, || format!("wait: batch slot (#{})", slot.seq));
+                tw.end(&self.name, || format!("wait: batch slot (#{})", slot.seq));
                 WAIT_NS[2].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 WAIT_NS[3].fetch_add(1, Ordering::Relaxed);
                 note_queue_wait(&self.name, 1, t.elapsed());
@@ -3727,11 +3727,9 @@ impl Exec {
         st.mark(0);
         if self.submit_after > done_seq() {
             // Deferred CP writes that this work may read come first.
-            let tl = super::timeline::mark();
-            let tw = std::time::Instant::now();
+            let tw = super::timeline::wait_start();
             wait_done(self.submit_after);
-            waited = tw.elapsed();
-            super::timeline::end(&self.name, tl, || format!("wait: deferred CP writes (#{})", self.submit_after));
+            waited = tw.end(&self.name, || format!("wait: deferred CP writes (#{})", self.submit_after));
             st.restart();
         }
         self.end_rendering();
@@ -4477,9 +4475,9 @@ impl Exec {
             return;
         }
         self.submit_for("sync");
-        let tl = super::timeline::mark();
+        let tw = super::timeline::wait_start();
         wait_done(self.last_seq);
-        super::timeline::end(&self.name, tl, || format!("wait: own batches (#{})", self.last_seq));
+        tw.end(&self.name, || format!("wait: own batches (#{})", self.last_seq));
         self.inflight.clear();
     }
 
@@ -4954,9 +4952,9 @@ impl Exec {
             if s > done_seq() {
                 waited.get_or_insert_with(std::time::Instant::now);
                 FOREIGN_WAITS.fetch_add(1, Ordering::Relaxed);
-                let tl = super::timeline::mark();
+                let tw = super::timeline::wait_start();
                 wait_done(s);
-                super::timeline::end(&self.name, tl, || format!("wait: batch #{s} writing inputs"));
+                tw.end(&self.name, || format!("wait: batch #{s} writing inputs"));
             }
         }
         lap(2, &mut t);

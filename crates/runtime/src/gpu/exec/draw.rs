@@ -903,7 +903,7 @@ impl Exec {
                     kinds[6] = true;
                 }
             }
-            if let Some(d) = r.depth.as_ref().filter(|d| sampled_now(d.image)) {
+            if r.depth.as_ref().is_some_and(|d| sampled_now(d.image)) {
                 kinds[if z_write { 2 } else if s_write { 3 } else if clear_z || clear_s { 4 } else { 5 }] = true;
             }
             for (k, &on) in kinds.iter().enumerate() {

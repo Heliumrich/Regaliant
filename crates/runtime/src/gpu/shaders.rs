@@ -24,6 +24,8 @@ static TRANSLATIONS: Mutex<Option<HashMap<(u64, u64), Arc<Translated>>>> = Mutex
 /// (`prepare`), once per program address.
 const BIG_SPIRV_WORDS: usize = 40_000;
 static BIG_SPIRV_SEEN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+/// Programs logged under a `gpu_loads_sel` selection (bisection).
+static GPU_LOADS_SELECTED: Mutex<Option<std::collections::HashSet<(u64, u64)>>> = Mutex::new(None);
 
 thread_local! {
     /// This thread's view of the shared caches (entries never change once
@@ -1449,7 +1451,16 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     });
     // The plan depends only on the program, the user-data layout and where
     // data loads are read.
-    let gpu_loads = super::tune::gpu_loads();
+    let sel = super::tune::gpu_loads_sel();
+    let selected = sel == 0 || code_hash & ((1u64 << (sel >> 32).min(63)) - 1) == sel & 0xFFFF_FFFF;
+    let gpu_loads = match super::tune::gpu_loads_mode() {
+        0 => false,
+        2 => !spec.per_lane && selected,
+        _ => selected,
+    };
+    if gpu_loads && sel >> 32 >= 8 && GPU_LOADS_SELECTED.lock().get_or_insert_with(std::collections::HashSet::new).insert((sel, addr)) {
+        crate::info!("gpu_loads selection {sel:#x}: {:?} shader {addr:#x} (code hash {code_hash:#018x})", spec.stage);
+    }
     let plan_key = code_hash ^ (spec.user_sgprs as u64) << 48 ^ (spec.user_base as u64) << 56 ^ (gpu_loads as u64) << 40;
     let cached = LOCAL_PLANS.with(|c| c.borrow().get(&plan_key).cloned()).or_else(|| {
         let p = std::rc::Rc::new(PLANS.lock().as_ref().and_then(|m| m.get(&plan_key).cloned())?);

@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 74] = [
+    static ALL: [Tunable; 76] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -56,7 +56,7 @@ pub mod tune {
         Tunable { name: "map_ranges", env: "DS_MAP_RANGES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ahead", env: "DS_AHEAD", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_cs", env: "DS_PRE_CS", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "par", env: "DS_PAR", default: 5, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par", env: "DS_PAR", default: 1000, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_share", env: "DS_PRE_SHARE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "pending_set", env: "DS_PENDING_SET", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "tex_scrub", env: "DS_TEX_SCRUB", default: 2, value: AtomicU64::new(UNSET) },
@@ -101,6 +101,8 @@ pub mod tune {
         Tunable { name: "exact_indirect", env: "DS_EXACT_INDIRECT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "merge_barriers", env: "DS_MERGE_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "feedback_exact", env: "DS_FEEDBACK_EXACT", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "cp_classes", env: "DS_CP_CLASSES", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "gpu_loads_sel", env: "DS_GPU_LOADS_SEL", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -307,6 +309,13 @@ pub mod tune {
         get(23) != 0
     }
 
+    /// `gpu_loads` mode: 1 every program, 2 all but programs translated per
+    /// lane (diagnosis).
+    #[inline]
+    pub fn gpu_loads_mode() -> u64 {
+        get(23)
+    }
+
     /// Translations keep each register in its own variable (1) or the
     /// register files in arrays (0, the earlier form): see
     /// `rdna::translate::Spec::reg_vars`. Switching translates programs anew.
@@ -360,7 +369,8 @@ pub mod tune {
     }
 
     /// Worker command processors that record chunks of long
-    /// synchronization-free runs in parallel (`gpu::par`); 0: off.
+    /// synchronization-free runs in parallel (`gpu::par`); 0: off; 1000 (the
+    /// default): a third of the logical CPUs, 2 to 8 (`par::workers`).
     #[inline]
     pub fn par() -> u64 {
         get(29)
@@ -762,6 +772,21 @@ pub mod tune {
     #[inline]
     pub fn feedback_exact() -> bool {
         get(73) != 0
+    }
+
+    /// The graphics command processor's time by packet class, waits apart
+    /// (profile report line; costs two clock reads per packet).
+    #[inline]
+    pub fn cp_classes() -> bool {
+        get(74) != 0
+    }
+
+    /// Diagnosis: `gpu_loads` only for programs whose code hash ends in a bit
+    /// pattern: (bits << 32) | pattern (0: every program). Bisects a program
+    /// that renders differently with GPU-side loads.
+    #[inline]
+    pub fn gpu_loads_sel() -> u64 {
+        get(75)
     }
 
     /// A switch's value by name; None if unknown.
@@ -1393,6 +1418,7 @@ pub fn start_profiler() {
 
 /// Clears the samples and dispatch timings (`profile reset` control command).
 pub fn reset_profile() {
+    cp::reset_classes();
     if let Some(m) = PROFILE.lock().as_mut() {
         m.clear();
     }
@@ -1426,6 +1452,7 @@ pub fn profile_report() -> String {
     let mut s = profile_summary();
     s.push_str(&exec::shader_profile());
     s.push_str(&cp::wait_stats());
+    s.push_str(&cp::classes_line());
     s.push_str(&par::status());
     s.push_str(&images::memo_stats_line());
     s.push_str(&exec::pre_window_line());

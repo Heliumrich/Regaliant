@@ -25,9 +25,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Chunk workers wanted (`tune par`; 0: runs are recorded by the command
-/// processor alone).
+/// processor alone). By default a third of the logical CPUs, 2 to 8: on 24
+/// logical CPUs 6, 7 and 8 workers recorded +2.0%, +2.2% and +2.4% against 5
+/// (FINDINGS.md 2026-10-14); fewer CPUs keep fewer threads busy beside the
+/// title's 13 job workers.
 pub fn workers() -> usize {
-    (super::tune::par() as usize).min(8)
+    match super::tune::par() {
+        1000 => {
+            static AUTO: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *AUTO.get_or_init(|| std::thread::available_parallelism().map_or(5, |n| (n.get() / 3).clamp(2, 8)))
+        }
+        v => (v as usize).min(8),
+    }
 }
 
 /// Chunks per recorder (the main command processor and each worker) a run
@@ -98,6 +107,8 @@ pub struct Run {
     active: AtomicUsize,
     lock: Mutex<()>,
     cv: Condvar,
+    /// When the run was planned (the workers' start latency).
+    born: std::time::Instant,
 }
 
 impl Run {
@@ -114,6 +125,7 @@ impl Run {
             active: AtomicUsize::new(0),
             lock: Mutex::new(()),
             cv: Condvar::new(),
+            born: std::time::Instant::now(),
         }
     }
 
@@ -192,6 +204,12 @@ pub static STOPS: AtomicU64 = AtomicU64::new(0);
 pub static COMMANDS: AtomicU64 = AtomicU64::new(0);
 pub static WAIT_NS: AtomicU64 = AtomicU64::new(0);
 pub static TURN_NS: AtomicU64 = AtomicU64::new(0);
+/// Workers' time per phase (ns): from the run's planning to their first
+/// chunk of it (per worker and run), setting a chunk's state up, recording
+/// it, closing its batch, submitting and posting it; and the count of first
+/// chunks.
+static PHASE_NS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static STARTS: AtomicU64 = AtomicU64::new(0);
 pub static CANCELLED: AtomicU64 = AtomicU64::new(0);
 static STOP_WHY: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
 
@@ -304,6 +322,12 @@ fn run_worker(w: &Worker, name: &str) {
 /// Records, submits and posts chunks of `run` until none is left or the run
 /// is cancelled.
 fn take_chunks(w: &Worker, run: &Run, name: &str) {
+    let mut first = true;
+    let lap = |k: usize, t: &mut std::time::Instant| {
+        let now = std::time::Instant::now();
+        PHASE_NS[k].fetch_add((now - *t).as_nanos() as u64, Ordering::Relaxed);
+        *t = now;
+    };
     loop {
         if run.cancelled.load(Ordering::Acquire) {
             return;
@@ -312,19 +336,28 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         let Some((state, from, to)) = run.chunks.get(i) else { return };
         let Some(state) = state.lock().take() else { return };
         let (from, to) = (*from, *to);
+        let mut t = std::time::Instant::now();
+        if std::mem::take(&mut first) {
+            PHASE_NS[0].fetch_add((t - run.born).as_nanos() as u64, Ordering::Relaxed);
+            STARTS.fetch_add(1, Ordering::Relaxed);
+        }
         let mut cp = w.cp.lock();
         cp.set_chunk_state(&state);
         cp.chunk_start();
+        lap(1, &mut t);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cp.run_chunk(from, to)));
         let failed = r.is_err();
         let stopped = r.unwrap_or(Some(from));
+        lap(2, &mut t);
         cp.chunk_finish();
+        lap(3, &mut t);
         let ready = || run.turn.load(Ordering::Acquire) > i || run.cancelled.load(Ordering::Acquire);
         if !ready() {
             let tl = super::timeline::mark();
             TURN_NS.fetch_add(run.wait_until(ready), Ordering::Relaxed);
             super::timeline::end(name, tl, || "wait: chunk turn".into());
         }
+        let mut t = std::time::Instant::now();
         let granted = run.turn.load(Ordering::Acquire) > i;
         if !granted || failed {
             // Cancelled before its turn, or failed (the main command
@@ -349,6 +382,7 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
             run.turn.fetch_max(i + 2, Ordering::AcqRel);
         }
         run.notify();
+        lap(4, &mut t);
     }
 }
 
@@ -364,7 +398,10 @@ impl Worker {
 /// Clears the statistics (`profile reset`: the status line and the profile
 /// report then cover the window).
 pub fn reset_stats() {
-    for c in [&RUNS, &CHUNKS, &STOPS, &COMMANDS, &WAIT_NS, &TURN_NS, &CANCELLED] {
+    for c in [&RUNS, &CHUNKS, &STOPS, &COMMANDS, &WAIT_NS, &TURN_NS, &CANCELLED, &STARTS] {
+        c.store(0, Ordering::Relaxed);
+    }
+    for c in &PHASE_NS {
         c.store(0, Ordering::Relaxed);
     }
     STOP_WHY.lock().clear();
@@ -396,7 +433,7 @@ pub fn status() -> String {
     why.sort_by(|a, b| b.1.cmp(&a.1));
     let why: Vec<String> = why.iter().map(|(w, n)| format!("{w} {n}")).collect();
     format!(
-        "    parallel runs: {runs} runs, {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled; main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added); runs seen by length (runs/commands) {}; by end {}\n",
+        "    parallel runs: {runs} runs, {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled; main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}\n",
         CHUNKS.load(Ordering::Relaxed),
         COMMANDS.load(Ordering::Relaxed),
         split(),
@@ -407,6 +444,12 @@ pub fn status() -> String {
         main_weight(),
         TURN_NS.load(Ordering::Relaxed) / 1_000_000,
         super::exec::WORKER_SLOTS.load(Ordering::Relaxed),
+        PHASE_NS[0].load(Ordering::Relaxed) as f64 / STARTS.load(Ordering::Relaxed).max(1) as f64 / 1e3,
+        PHASE_NS[1].load(Ordering::Relaxed) as f64 / CHUNKS.load(Ordering::Relaxed).max(1) as f64 / 1e3,
+        PHASE_NS[2].load(Ordering::Relaxed) as f64 / CHUNKS.load(Ordering::Relaxed).max(1) as f64 / 1e3,
+        COMMANDS.load(Ordering::Relaxed) as f64 / CHUNKS.load(Ordering::Relaxed).max(1) as f64,
+        PHASE_NS[3].load(Ordering::Relaxed) as f64 / CHUNKS.load(Ordering::Relaxed).max(1) as f64 / 1e3,
+        PHASE_NS[4].load(Ordering::Relaxed) as f64 / CHUNKS.load(Ordering::Relaxed).max(1) as f64 / 1e3,
         lens.join(", "),
         ends.join(", ")
     )

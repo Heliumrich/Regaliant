@@ -59,6 +59,37 @@ pub fn mark() -> Option<i64> {
     on().then(now)
 }
 
+thread_local! {
+    /// Nanoseconds the calling thread spent in waits (`Wait`).
+    static WAITED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Nanoseconds the calling thread has spent in waits so far.
+pub fn waited_ns() -> u64 {
+    WAITED.with(|w| w.get())
+}
+
+/// A wait of the calling thread: always timed (`waited_ns`), a span when the
+/// timeline records.
+pub struct Wait {
+    t0: std::time::Instant,
+    tl: Option<i64>,
+}
+
+pub fn wait_start() -> Wait {
+    Wait { t0: std::time::Instant::now(), tl: mark() }
+}
+
+impl Wait {
+    /// Ends the wait (a span named `name` on `track`); how long it took.
+    pub fn end(self, track: &str, name: impl FnOnce() -> String) -> std::time::Duration {
+        let d = self.t0.elapsed();
+        WAITED.with(|w| w.set(w.get() + d.as_nanos() as u64));
+        end(track, self.tl, name);
+        d
+    }
+}
+
 /// Ends a span begun with `mark` on `track`.
 pub fn end(track: &str, t0: Option<i64>, name: impl FnOnce() -> String) {
     let Some(t0) = t0 else { return };
