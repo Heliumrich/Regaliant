@@ -1537,6 +1537,7 @@ pub fn profile_report() -> String {
     s.push_str(&cp::classes_line());
     s.push_str(&exec::race_line());
     s.push_str(&forward::status_line());
+    s.push_str(&crate::hle::kernel::timeouts_line());
     s.push_str(&par::status());
     s.push_str(&images::memo_stats_line());
     s.push_str(&exec::pre_window_line());

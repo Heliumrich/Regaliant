@@ -100,6 +100,7 @@ impl GMutex {
             match deadline {
                 Some(d) => {
                     if self.cv.wait_until(&mut s, d).timed_out() && s.0 != 0 {
+                        super::note_timeout("mutex", self as *const _ as u64, &self.name, 0);
                         return ETIMEDOUT;
                     }
                 }
@@ -277,7 +278,12 @@ impl GCond {
         }
         drop(g);
         m.reacquire(count);
-        if timed_out { ETIMEDOUT } else { 0 }
+        if timed_out {
+            super::note_timeout("cond", self as *const _ as u64, "", 0);
+            ETIMEDOUT
+        } else {
+            0
+        }
     }
     fn signal(&self) {
         let mut g = self.seq.lock();
@@ -346,6 +352,7 @@ impl GRwLock {
             match deadline {
                 Some(d) => {
                     if self.cv.wait_until(&mut s, d).timed_out() && s.1 != 0 {
+                        super::note_timeout("rwlock (read)", self as *const _ as u64, "", 0);
                         return ETIMEDOUT;
                     }
                 }
@@ -372,6 +379,7 @@ impl GRwLock {
             match deadline {
                 Some(d) => {
                     if self.cv.wait_until(&mut s, d).timed_out() && (s.0 != 0 || s.1 != 0) {
+                        super::note_timeout("rwlock (write)", self as *const _ as u64, "", 0);
                         return ETIMEDOUT;
                     }
                 }
@@ -598,6 +606,7 @@ sysv! {
             match deadline {
                 Some(d) => {
                     if s.cv.wait_until(&mut c, d).timed_out() && *c < need {
+                        super::note_timeout("sema", h, &s.name, *timeout as u64);
                         *timeout = 0;
                         return sce(ETIMEDOUT);
                     }
@@ -672,6 +681,7 @@ sysv! {
             match deadline {
                 Some(d) => {
                     if e.cv.wait_until(&mut b, d).timed_out() && !ef_satisfied(*b, pat, mode) {
+                        super::note_timeout("event flag", h, &e.name, *timeout as u64);
                         if !result.is_null() { *result = *b; }
                         *timeout = 0;
                         return sce(ETIMEDOUT);

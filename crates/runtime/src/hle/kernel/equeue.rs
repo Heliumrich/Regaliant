@@ -153,7 +153,12 @@ sysv! {
         let buf = std::slice::from_raw_parts_mut(ev, num as usize);
         let n = q.wait(buf, deadline);
         if !out.is_null() { *out = n as i32; }
-        if n == 0 { sce(ETIMEDOUT) } else { 0 }
+        if n == 0 {
+            super::note_timeout("equeue", h, &q.name, if timeout.is_null() { 0 } else { *timeout as u64 });
+            sce(ETIMEDOUT)
+        } else {
+            0
+        }
     }
     fn sceKernelAddUserEvent(h: u64, id: i32) -> i32 {
         let Some(q) = from_handle(h) else { return sce(EBADF) };
