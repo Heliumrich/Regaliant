@@ -698,10 +698,26 @@ pub fn fatal_exit(code: u32, reason: &str) -> ! {
     }
 }
 
+/// A profile-instrumented build (`-Cprofile-generate` with `--cfg
+/// dsport_pgo_gen`) writes its counters here: TerminateProcess skips the
+/// profile runtime's exit hook.
+fn pgo_write() {
+    #[cfg(dsport_pgo_gen)]
+    unsafe {
+        unsafe extern "C" {
+            fn __llvm_profile_write_file() -> i32;
+        }
+        let r = __llvm_profile_write_file();
+        info!("profile counters written (status {r})");
+        crate::log::flush();
+    }
+}
+
 pub fn shutdown(code: i32) -> ! {
     gpu::shutdown();
     info!("shutdown with status {code}\n{}", thread_summary());
     crate::log::flush();
+    pgo_write();
     unsafe {
         windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code as u32);
     }

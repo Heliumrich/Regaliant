@@ -16,5 +16,21 @@ panic = "abort"
 debug = "line-tables-only"
 panic = "abort"
 
+# Whole-program optimization for measurement and release builds (slower to
+# build; `release` stays the daily build): `scripts/cargo.ps1 build --profile
+# release-lto`, run with DSPORT_PROFILE=release-lto (scripts/gpu-run.ps1).
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+# Profile-guided builds on top of release-lto (scripts/pgo.ps1): the
+# instrumented build that gathers counters, and the build that uses them.
+[profile.release-pgo-gen]
+inherits = "release-lto"
+
+[profile.release-pgo]
+inherits = "release-lto"
+
 [profile.dev.package."*"]
 opt-level = 2
