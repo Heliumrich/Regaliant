@@ -972,6 +972,14 @@ pub mod tune {
         get(93) != 0
     }
 
+    /// `copy_update 2`: the graphics queue's parallel workers record their
+    /// per-view copies as buffer updates too (checked once their batches
+    /// completed; not forwarded, as they record out of program order).
+    #[inline]
+    pub fn copy_update_workers() -> bool {
+        get(93) >= 2
+    }
+
     /// A parallel run's chunk batches drop their leading full barriers but
     /// the first's (its scope covers the later submissions): the chunks of a
     /// synchronization-free run no longer wait for each other on the GPU.

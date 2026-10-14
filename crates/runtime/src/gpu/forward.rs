@@ -82,6 +82,45 @@ pub static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 /// or unmapped memory at the destination)].
 pub static UPDATES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// A copy a parallel worker of the graphics queue recorded as a buffer
+/// update (`tune copy_update 2`): compared with memory once its batch
+/// completed. Never served to readers: the workers record their chunks out
+/// of program order.
+struct Check {
+    id: u64,
+    base: u64,
+    words: Vec<u32>,
+    /// The destination's words when the copy was recorded.
+    old: Vec<u32>,
+    /// Its batch (0 until submitted).
+    seq: u64,
+}
+
+static CHECKS: Mutex<Vec<Check>> = Mutex::new(Vec::new());
+static CHECK_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Live checks per 64 KiB page of their destinations, by a hash of the
+/// page: a write whose pages all count 0 ends none (no lock taken).
+static CHECK_PAGES: [std::sync::atomic::AtomicU32; 1024] = [const { std::sync::atomic::AtomicU32::new(0) }; 1024];
+
+fn check_pages(base: u64, n: u64) -> impl Iterator<Item = &'static std::sync::atomic::AtomicU32> {
+    let (first, last) = (base >> 16, (base + n.max(1) - 1) >> 16);
+    // At most every slot once (a range over 1024 pages counts them all).
+    let pages = (last - first + 1).min(1024);
+    (0..pages).map(move |k| &CHECK_PAGES[((first + k).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 54) as usize])
+}
+
+fn check_untrack(c: &Check) {
+    for slot in check_pages(c.base, 4 * c.words.len() as u64) {
+        slot.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+/// At most this many checks wait for their batches (the oldest goes first).
+const MAX_CHECKS: usize = 4096;
+/// The workers' buffer updates: [recorded, words, words equal after their
+/// batch completed, words still as before (it did not land), words other
+/// than both (rewritten since), checks ended by a later write].
+pub static CHECK_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
 /// Resource indices of a recognized copy kernel.
 #[derive(Clone, Copy)]
 struct Roles {
@@ -266,6 +305,19 @@ pub fn uncovered(reads: &[(u64, u64)]) -> Option<Vec<(u64, u64)>> {
 /// GPU work or a CP write recorded later in the stream writes [a, a + n):
 /// entries it overlaps end.
 pub fn written(a: u64, n: u64) {
+    if n != 0 && CHECK_COUNT.load(Ordering::Acquire) != 0 && (n > 1024 << 16 || check_pages(a, n).any(|slot| slot.load(Ordering::Acquire) != 0)) {
+        let mut g = CHECKS.lock();
+        let before = g.len();
+        g.retain(|c| {
+            let keep = !(c.base < a + n && a < c.base + 4 * c.words.len() as u64);
+            if !keep {
+                check_untrack(c);
+            }
+            keep
+        });
+        CHECK_STATS[5].fetch_add((before - g.len()) as u64, Ordering::Relaxed);
+        CHECK_COUNT.store(g.len(), Ordering::Release);
+    }
     if COUNT.load(Ordering::Acquire) == 0 || n == 0 {
         return;
     }
@@ -416,10 +468,54 @@ pub fn add(base: u64, words: Vec<u32>, program: u64, hash: u64, from: Inputs) ->
     id
 }
 
+/// Starts a check of a parallel worker's buffer update (`Check`); its id.
+pub fn add_check(base: u64, words: Vec<u32>) -> u64 {
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let n = words.len() as u64;
+    let old: Vec<u32> = if super::cp::guest_readable(base, 4 * n) { (0..n).map(|k| unsafe { std::ptr::read_volatile((base + 4 * k) as *const u32) }).collect() } else { Vec::new() };
+    CHECK_STATS[0].fetch_add(1, Ordering::Relaxed);
+    CHECK_STATS[1].fetch_add(n, Ordering::Relaxed);
+    let mut g = CHECKS.lock();
+    if g.len() >= MAX_CHECKS {
+        let c = g.remove(0);
+        check_untrack(&c);
+    }
+    for slot in check_pages(base, 4 * n) {
+        slot.fetch_add(1, Ordering::AcqRel);
+    }
+    g.push(Check { id, base, words, old, seq: 0 });
+    CHECK_COUNT.store(g.len(), Ordering::Release);
+    id
+}
+
+/// Drops the checks of batches that were never submitted.
+pub fn drop_checks(ids: &[u64]) {
+    if ids.is_empty() || CHECK_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut g = CHECKS.lock();
+    g.retain(|c| {
+        let keep = !ids.contains(&c.id);
+        if !keep {
+            check_untrack(c);
+        }
+        keep
+    });
+    CHECK_COUNT.store(g.len(), Ordering::Release);
+}
+
 /// The batch holding these entries' copies was submitted as `seq`.
 pub fn submitted(ids: &[u64], seq: u64) {
     if ids.is_empty() {
         return;
+    }
+    if CHECK_COUNT.load(Ordering::Acquire) != 0 {
+        let mut g = CHECKS.lock();
+        for c in g.iter_mut() {
+            if c.seq == 0 && ids.contains(&c.id) {
+                c.seq = seq;
+            }
+        }
     }
     let mut g = ENTRIES.write();
     for e in g.iter_mut() {
@@ -432,6 +528,9 @@ pub fn submitted(ids: &[u64], seq: u64) {
 /// Batches up to `done` completed: their entries' words are compared with
 /// memory (the GPU copied them by now) and the entries end.
 pub fn completed(done: u64) {
+    if CHECK_COUNT.load(Ordering::Acquire) != 0 {
+        complete_checks(done);
+    }
     if COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
@@ -506,6 +605,49 @@ pub fn completed(done: u64) {
     }
 }
 
+/// Batches up to `done` completed: their workers' buffer updates are
+/// compared with memory.
+fn complete_checks(done: u64) {
+    let due: Vec<Check> = {
+        let mut g = CHECKS.lock();
+        if !g.iter().any(|c| c.seq != 0 && c.seq <= done) {
+            return;
+        }
+        let (due, keep): (Vec<Check>, Vec<Check>) = std::mem::take(&mut *g).into_iter().partition(|c| c.seq != 0 && c.seq <= done);
+        *g = keep;
+        for c in &due {
+            check_untrack(c);
+        }
+        CHECK_COUNT.store(g.len(), Ordering::Release);
+        due
+    };
+    for c in due {
+        if !super::cp::guest_readable(c.base, 4 * c.words.len() as u64) {
+            continue;
+        }
+        let (mut equal, mut stale, mut other) = (0u64, 0u64, 0u64);
+        for (k, &w) in c.words.iter().enumerate() {
+            let now = unsafe { std::ptr::read_volatile((c.base + 4 * k as u64) as *const u32) };
+            if now == w {
+                equal += 1;
+            } else if c.old.get(k) == Some(&now) {
+                stale += 1;
+            } else {
+                other += 1;
+            }
+        }
+        CHECK_STATS[2].fetch_add(equal, Ordering::Relaxed);
+        CHECK_STATS[3].fetch_add(stale, Ordering::Relaxed);
+        CHECK_STATS[4].fetch_add(other, Ordering::Relaxed);
+        if stale > 0 {
+            static LOGGED: AtomicU64 = AtomicU64::new(0);
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 20 {
+                crate::warn!("gpu: a worker's buffer update to {:#x} (batch {}): {stale} of {} words still as before it after it ran", c.base, c.seq, c.words.len());
+            }
+        }
+    }
+}
+
 /// The status line ("" when nothing was forwarded).
 pub fn status_line() -> String {
     let s: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
@@ -513,8 +655,9 @@ pub fn status_line() -> String {
         return String::new();
     }
     let u: Vec<u64> = UPDATES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let k: Vec<u64> = CHECK_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    forwarded copies: {} made ({} not: inputs still written or odd shapes), {} ended by later writes, {} by the title's rewrites, {} retired after their batch; {} words served, {} stage reads with no wait for the copy; after the copies ran {} words equal, {} as before the copy (it did not land), {} rewritten since; recorded as buffer updates {} ({} words; {} as dispatches)\n",
-        s[0], s[7], s[1], s[8], s[2], s[3], s[4], s[5], s[6], s[9], u[0], u[1], u[2]
+        "    forwarded copies: {} made ({} not: inputs still written or odd shapes), {} ended by later writes, {} by the title's rewrites, {} retired after their batch; {} words served, {} stage reads with no wait for the copy; after the copies ran {} words equal, {} as before the copy (it did not land), {} rewritten since; recorded as buffer updates {} ({} words; {} as dispatches); by the workers {} ({} words; after their batches {} words equal, {} as before, {} rewritten; {} checks ended by later writes)\n",
+        s[0], s[7], s[1], s[8], s[2], s[3], s[4], s[5], s[6], s[9], u[0], u[1], u[2], k[0], k[1], k[2], k[3], k[4], k[5]
     )
 }

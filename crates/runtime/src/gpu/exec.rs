@@ -3780,6 +3780,8 @@ struct Closed {
     checks: Vec<verify::Check>,
     shaders: Vec<u64>,
     races: Vec<RaceCheck>,
+    /// Checks of the buffer updates recorded in it (`forward::add_check`).
+    forward_ids: Vec<u64>,
 }
 
 /// Slot sequence of a batch closed but not yet submitted.
@@ -4160,7 +4162,7 @@ impl Exec {
                 crate::error!("gpu[{}]: CP effects in a parallel run (dropped)", self.name);
             }
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending) });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids) });
             self.slots[i].seq = PENDING;
             self.pending_promises.clear();
             self.pending_log.clear();
@@ -5522,7 +5524,9 @@ impl Exec {
     /// Some: left to the dispatch (the computation given back) when the
     /// destination lies in a video-memory home, overlaps a resident shadow
     /// or the copy's inputs, or is not mapped for the GPU.
-    fn copy_as_update(&mut self, p: &Prepared, c: (u64, Vec<u32>, super::forward::Inputs)) -> Option<(u64, Vec<u32>, super::forward::Inputs)> {
+    /// `check_only`: a parallel worker's (its words checked after its batch
+    /// completed, not forwarded).
+    fn copy_as_update(&mut self, p: &Prepared, c: (u64, Vec<u32>, super::forward::Inputs), check_only: bool) -> Option<(u64, Vec<u32>, super::forward::Inputs)> {
         let (base, bytes) = (c.0, 4 * c.1.len() as u64);
         let refuse = |c| {
             super::forward::UPDATES[2].fetch_add(1, Ordering::Relaxed);
@@ -5574,9 +5578,13 @@ impl Exec {
         self.note_write(base, bytes);
         // The next dispatch notes its writes again (these changed the record).
         self.last_notes.2 = [u64::MAX; 4];
-        super::forward::UPDATES[0].fetch_add(1, Ordering::Relaxed);
-        super::forward::UPDATES[1].fetch_add(words.len() as u64, Ordering::Relaxed);
-        let id = super::forward::add(base, words, p.addr, p.code_hash, from);
+        let id = if check_only {
+            super::forward::add_check(base, words)
+        } else {
+            super::forward::UPDATES[0].fetch_add(1, Ordering::Relaxed);
+            super::forward::UPDATES[1].fetch_add(words.len() as u64, Ordering::Relaxed);
+            super::forward::add(base, words, p.addr, p.code_hash, from)
+        };
         self.forward_ids.push(id);
         EXECUTED.fetch_add(1, Ordering::Relaxed);
         self.batch_shaders.push(p.addr);
@@ -6179,6 +6187,7 @@ impl Exec {
                 }
             });
             self.slots[b.slot].seq = seq;
+            super::forward::submitted(&b.forward_ids, seq);
             if !b.races.is_empty() {
                 let cpw_submit = super::cp::CPW_SEQ.load(Ordering::Acquire);
                 RACE_CHECKS.lock().extend(b.races.into_iter().map(|c| RaceCheck { seq, cpw_submit, ..c }));
@@ -6215,6 +6224,7 @@ impl Exec {
             self.clear_open_writes(None);
         }
         for b in std::mem::take(&mut self.closed) {
+            super::forward::drop_checks(&b.forward_ids);
             let s = &mut self.slots[b.slot];
             unsafe {
                 c.device.reset_command_buffer(s.cmd, vk::CommandBufferResetFlags::empty()).ok();
@@ -6772,8 +6782,11 @@ impl Exec {
         // (`tune copy_update`); its computation is reused for forwarding when
         // it stays a dispatch (None: not tried, Some(None): refused).
         let forward_here = super::tune::forward_copies() && !self.deferred && indirect.is_none() && self.name == "gpu-gfx";
+        // The graphics queue's parallel workers (`copy_update 2`): updates
+        // checked once their batches completed, never forwarded.
+        let worker_here = super::tune::forward_copies() && self.deferred && indirect.is_none() && self.name.starts_with("gpu-gfx") && super::tune::copy_update_workers();
         let mut forwarded: Option<Option<(u64, Vec<u32>, super::forward::Inputs)>> = None;
-        if forward_here
+        if (forward_here || worker_here)
             && super::tune::copy_update()
             && patches.is_none()
             && initiator & (1 << 5) == 0
@@ -6782,9 +6795,13 @@ impl Exec {
             && !super::tune::race_checks()
             && !super::capture::capturing()
         {
-            let busy = |r: &[(u64, u64)]| self.overlaps_pending_ro(r) || INFLIGHT.latest(r).is_some() || CP_WRITES.latest(r).is_some();
+            // A worker also cannot see what the main command processor's batch,
+            // unsubmitted when the run was planned, writes.
+            let busy = |r: &[(u64, u64)]| {
+                self.overlaps_pending_ro(r) || INFLIGHT.latest(r).is_some() || CP_WRITES.latest(r).is_some() || self.main_writes.as_ref().is_some_and(|m| m.overlaps_any(r))
+            };
             match super::forward::compute(&p, groups, local, busy) {
-                Some(c) => match self.copy_as_update(&p, c) {
+                Some(c) => match self.copy_as_update(&p, c, worker_here) {
                     None => return Ok(()),
                     Some(c) => forwarded = Some(Some(c)),
                 },
