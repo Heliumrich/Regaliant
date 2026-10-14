@@ -95,7 +95,7 @@ pub mod tune {
         Tunable { name: "copy_queue", env: "DS_COPY_QUEUE_USE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "skip_read_waits", env: "DS_SKIP_READ_WAITS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_split", env: "DS_PAR_SPLIT", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "par_weight", env: "DS_PAR_WEIGHT", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par_weight", env: "DS_PAR_WEIGHT", default: 500, value: AtomicU64::new(UNSET) },
         Tunable { name: "alt_queue", env: "DS_ALT_QUEUE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "skip_barriers", env: "DS_SKIP_BARRIERS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "exact_indirect", env: "DS_EXACT_INDIRECT", default: 1, value: AtomicU64::new(UNSET) },
@@ -715,7 +715,9 @@ pub mod tune {
     }
 
     /// The main command processor's chunk of a parallel run relative to a
-    /// worker's, in 1/1000 (0: `par_balance` decides).
+    /// worker's, in 1/1000 (0: `par_balance` decides): half a worker's, as it
+    /// records the cull run slower per command than they do (+1.0-1.4%,
+    /// FINDINGS.md 2026-10-14).
     #[inline]
     pub fn par_weight() -> u64 {
         get(68)
