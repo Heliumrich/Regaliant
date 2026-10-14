@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 76] = [
+    static ALL: [Tunable; 78] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -103,6 +103,8 @@ pub mod tune {
         Tunable { name: "feedback_exact", env: "DS_FEEDBACK_EXACT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "cp_classes", env: "DS_CP_CLASSES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "gpu_loads_sel", env: "DS_GPU_LOADS_SEL", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "race_checks", env: "DS_RACE_CHECKS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "data_snapshots", env: "DS_DATA_SNAPSHOTS", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -310,7 +312,8 @@ pub mod tune {
     }
 
     /// `gpu_loads` mode: 1 every program, 2 all but programs translated per
-    /// lane (diagnosis).
+    /// lane (diagnosis), 3 only stages whose data-only loads GPU work still
+    /// writes (prepared again when the command processor would wait).
     #[inline]
     pub fn gpu_loads_mode() -> u64 {
         get(23)
@@ -787,6 +790,22 @@ pub mod tune {
     #[inline]
     pub fn gpu_loads_sel() -> u64 {
         get(75)
+    }
+
+    /// Diagnosis: read-only data the shaders read on the GPU (4 KiB or less
+    /// per binding) is compared, once its batch completed, with what guest
+    /// memory held when the command was recorded (`exec::check_races`).
+    #[inline]
+    pub fn race_checks() -> bool {
+        get(76) != 0
+    }
+
+    /// Data-only loads read on the GPU (`gpu_loads`) of data no GPU work
+    /// still writes are bound to a snapshot taken when the command is
+    /// recorded (0: guest memory as the batch executes).
+    #[inline]
+    pub fn data_snapshots() -> bool {
+        get(77) != 0
     }
 
     /// A switch's value by name; None if unknown.
@@ -1453,6 +1472,7 @@ pub fn profile_report() -> String {
     s.push_str(&exec::shader_profile());
     s.push_str(&cp::wait_stats());
     s.push_str(&cp::classes_line());
+    s.push_str(&exec::race_line());
     s.push_str(&par::status());
     s.push_str(&images::memo_stats_line());
     s.push_str(&exec::pre_window_line());

@@ -589,6 +589,21 @@ impl Exec {
             None
         };
         lap.mark(1);
+        // Data GPU work still writes (the title's per-draw transforms, written
+        // by a dispatch just before): read by the shaders themselves (`tune
+        // gpu_loads 3`; data the title writes stays captured when recorded).
+        if super::super::tune::gpu_loads_mode() == 3 {
+            if !vs.data_loads.is_empty() && self.would_wait(&shaders::data_load_ranges(&vs)) {
+                shaders::note_gpu_loads_program(vs.addr);
+                vs = shaders::with_gpu_loads(|| shaders::prepare_ngg(cp))?;
+                super::HYBRID_LOADS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if ps.as_ref().is_some_and(|p| !p.data_loads.is_empty() && self.would_wait(&shaders::data_load_ranges(p))) {
+                shaders::note_gpu_loads_program(ps.as_ref().map_or(0, |p| p.addr));
+                ps = Some(shaders::with_gpu_loads(|| shaders::prepare_ps(cp))?);
+                super::HYBRID_LOADS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         self.sync_readers = [vs.addr, ps.as_ref().map_or(0, |p| p.addr)];
         // Each stage's reads in place (no combined copy per draw), unless the
         // stages are used as prepared (`speculate`).

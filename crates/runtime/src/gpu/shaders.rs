@@ -24,6 +24,66 @@ static TRANSLATIONS: Mutex<Option<HashMap<(u64, u64), Arc<Translated>>>> = Mutex
 /// (`prepare`), once per program address.
 const BIG_SPIRV_WORDS: usize = 40_000;
 static BIG_SPIRV_SEEN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+thread_local! {
+    /// Preparations made inside `with_gpu_loads` read their data-only loads
+    /// on the GPU whatever `tune gpu_loads` says.
+    static FORCE_GPU_LOADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the stage preparations it makes reading their data-only
+/// scalar loads on the GPU (`tune gpu_loads 3`: for stages whose data the
+/// command processor would otherwise wait for).
+pub fn with_gpu_loads<T>(f: impl FnOnce() -> T) -> T {
+    FORCE_GPU_LOADS.with(|c| c.set(true));
+    let r = f();
+    FORCE_GPU_LOADS.with(|c| c.set(false));
+    r
+}
+
+/// Programs whose data-only loads GPU work was found writing when they were
+/// prepared (`tune gpu_loads 3`): prepared with GPU-side loads from then on
+/// (no second preparation per command); a generation for the threads'
+/// copies.
+static GPU_LOADS_PROGRAMS: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+static GPU_LOADS_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static LOCAL_GPU_LOADS: std::cell::RefCell<(u64, std::collections::HashSet<u64>)> = std::cell::RefCell::new((0, std::collections::HashSet::new()));
+}
+
+/// Program `addr` reads data GPU work writes: GPU-side loads from now on.
+pub fn note_gpu_loads_program(addr: u64) {
+    if GPU_LOADS_PROGRAMS.lock().get_or_insert_with(std::collections::HashSet::new).insert(addr) {
+        GPU_LOADS_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Whether program `addr` was noted (this thread's copy of the set).
+fn gpu_loads_program(addr: u64) -> bool {
+    let generation = GPU_LOADS_GEN.load(std::sync::atomic::Ordering::Acquire);
+    if generation == 0 {
+        return false;
+    }
+    LOCAL_GPU_LOADS.with(|l| {
+        let mut l = l.borrow_mut();
+        if l.0 != generation {
+            l.1 = GPU_LOADS_PROGRAMS.lock().clone().unwrap_or_default();
+            l.0 = generation;
+        }
+        l.1.contains(&addr)
+    })
+}
+
+/// Programs prepared with GPU-side loads because they were noted.
+pub fn gpu_loads_programs() -> usize {
+    GPU_LOADS_PROGRAMS.lock().as_ref().map_or(0, |s| s.len())
+}
+
+/// The data-only loads' ranges of a preparation made with CPU-resolved loads.
+pub fn data_load_ranges(p: &Prepared) -> Vec<(u64, u64)> {
+    p.data_loads.iter().map(|d| (d.addr, 4 * d.dwords as u64)).collect()
+}
+
 /// Programs logged under a `gpu_loads_sel` selection (bisection).
 static GPU_LOADS_SELECTED: Mutex<Option<std::collections::HashSet<(u64, u64)>>> = Mutex::new(None);
 
@@ -1453,11 +1513,13 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     // data loads are read.
     let sel = super::tune::gpu_loads_sel();
     let selected = sel == 0 || code_hash & ((1u64 << (sel >> 32).min(63)) - 1) == sel & 0xFFFF_FFFF;
-    let gpu_loads = match super::tune::gpu_loads_mode() {
-        0 => false,
-        2 => !spec.per_lane && selected,
-        _ => selected,
-    };
+    let gpu_loads = FORCE_GPU_LOADS.with(|c| c.get())
+        || match super::tune::gpu_loads_mode() {
+            0 => false,
+            2 => !spec.per_lane && selected,
+            3 => gpu_loads_program(addr),
+            _ => selected,
+        };
     if gpu_loads && sel >> 32 >= 8 && GPU_LOADS_SELECTED.lock().get_or_insert_with(std::collections::HashSet::new).insert((sel, addr)) {
         let saved = super::capture::save_program(addr).map(|f| format!("; program saved to {}", f.display())).unwrap_or_default();
         crate::info!("gpu_loads selection {sel:#x}: {:?} shader {addr:#x} (code hash {code_hash:#018x}){saved}", spec.stage);

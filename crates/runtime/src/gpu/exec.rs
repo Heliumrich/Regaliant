@@ -2152,6 +2152,67 @@ fn read_only_descriptors(p: &Prepared, reads: &[(u64, u64)]) -> bool {
 }
 
 /// Checks the speculations whose batch completed (completion thread).
+/// Read-only data a command's shaders read on the GPU, as guest memory held
+/// it when the command was recorded (`tune race_checks`): compared once the
+/// batch completed; a difference means the data changed while the batch was
+/// in flight (the GPU reads it when the batch executes).
+struct RaceCheck {
+    seq: u64,
+    shader: u64,
+    base: u64,
+    words: Vec<u32>,
+    flip: u64,
+}
+
+static RACE_CHECKS: Mutex<Vec<RaceCheck>> = Mutex::new(Vec::new());
+/// [ranges checked, ranges changed].
+static RACE_STATS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+fn check_races(done: u64) {
+    let due: Vec<RaceCheck> = {
+        let mut g = RACE_CHECKS.lock();
+        if g.is_empty() {
+            return;
+        }
+        let (due, keep): (Vec<RaceCheck>, Vec<RaceCheck>) = std::mem::take(&mut *g).into_iter().partition(|c| c.seq <= done);
+        *g = keep;
+        due
+    };
+    for c in due {
+        RACE_STATS[0].fetch_add(1, Ordering::Relaxed);
+        let n = 4 * c.words.len() as u64;
+        if !super::cp::guest_readable(c.base, n) {
+            continue;
+        }
+        let changed = (0..c.words.len()).find(|&j| unsafe { std::ptr::read_volatile((c.base + 4 * j as u64) as *const u32) } != c.words[j]);
+        if let Some(j) = changed {
+            let k = RACE_STATS[1].fetch_add(1, Ordering::Relaxed);
+            if k < 300 {
+                let now = unsafe { std::ptr::read_volatile((c.base + 4 * j as u64) as *const u32) };
+                let gpu = INFLIGHT.latest(&[(c.base, n)]).map_or("none in flight".to_string(), |s| format!("batch {s} writes it"));
+                crate::info!(
+                    "gpu: race check: shader {:#x} read {:#x}+{n:#x} on the GPU; dword {j} was {:#x} when recorded (flip {}), {now:#x} after batch {} completed (flip {}); GPU writers: {gpu}",
+                    c.shader,
+                    c.base,
+                    c.words[j],
+                    c.flip,
+                    c.seq,
+                    super::FRAMES.load(Ordering::Relaxed)
+                );
+            }
+        }
+    }
+}
+
+/// The race checks' status line ("" when off).
+pub fn race_line() -> String {
+    let s: Vec<u64> = RACE_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if s[0] == 0 {
+        return String::new();
+    }
+    format!("    race checks: {} read-only ranges read on the GPU checked after their batch, {} changed meanwhile\n", s[0], s[1])
+}
+
 fn check_speculations(done: u64) {
     if SPEC_PENDING.load(Ordering::Acquire) == 0 {
         return;
@@ -2347,6 +2408,7 @@ fn completion_thread() {
         DONE_CV.notify_all();
         reap_spans();
         check_speculations(b.seq);
+        check_races(b.seq);
         check_timestamps(b.seq);
     }
 }
@@ -3402,6 +3464,8 @@ pub struct Exec {
     /// Speculations on words this batch writes (`speculate`): checked once
     /// it completed, its sequence set at submission.
     own_checks: Vec<SpecCheck>,
+    /// Race checks of the batch being recorded (`tune race_checks`).
+    race_pending: Vec<RaceCheck>,
     /// The compute queue id in this executor's name (`gpu-acb<id>`; 0: none)
     /// and whether the batch being recorded goes to the main family's second
     /// Vulkan queue (`tune alt_queue`: a timing diagnosis, no ordering
@@ -3432,6 +3496,7 @@ struct Closed {
     writes: super::ranges::Ranges,
     checks: Vec<verify::Check>,
     shaders: Vec<u64>,
+    races: Vec<RaceCheck>,
 }
 
 /// Slot sequence of a batch closed but not yet submitted.
@@ -3451,6 +3516,11 @@ pub static FEEDBACK: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// draw path), and their pixel shaders (profiling).
 pub static FEEDBACK_KINDS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 pub static FEEDBACK_PS: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
+/// Stages prepared again with GPU-side data loads because GPU work still
+/// wrote their data (`tune gpu_loads 3`): [vertex, pixel, compute].
+pub static HYBRID_LOADS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Snapshots of data-only loads read on the GPU (`tune data_snapshots`).
+pub static DATA_SNAPS: AtomicU64 = AtomicU64::new(0);
 /// Render passes ended without a barrier of their own because a full one
 /// followed at once (`end_rendering_before_barrier`).
 pub static MERGED_PASS_BARRIERS: AtomicU64 = AtomicU64::new(0);
@@ -3552,6 +3622,7 @@ impl Exec {
                 shared_kept: Vec::new(),
                 tex_scratch: Vec::new(),
                 own_checks: Vec::new(),
+                race_pending: Vec::new(),
                 alt_id: name.strip_prefix("gpu-acb").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).unwrap_or(0),
                 batch_alt: false,
                 batch_alt_share: false,
@@ -3782,7 +3853,7 @@ impl Exec {
                 crate::error!("gpu[{}]: CP effects in a parallel run (dropped)", self.name);
             }
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders) });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending) });
             self.slots[i].seq = PENDING;
             self.pending_promises.clear();
             self.pending_log.clear();
@@ -3825,6 +3896,9 @@ impl Exec {
             let mut g = SPEC_CHECKS.lock();
             g.extend(self.own_checks.drain(..).map(|c| SpecCheck { seq, ..c }));
             SPEC_PENDING.store(g.len() as u64, Ordering::Release);
+        }
+        if !self.race_pending.is_empty() {
+            RACE_CHECKS.lock().extend(self.race_pending.drain(..).map(|c| RaceCheck { seq, ..c }));
         }
         st.mark(6);
         // The batch's writes are noted before its labels are promised: a
@@ -3879,6 +3953,7 @@ impl Exec {
         self.actions.clear();
         self.gpu_writes_open = false;
         self.checks.clear();
+        self.race_pending.clear();
         self.pending.clear();
         self.pending_log.clear();
         self.pending_promises.clear();
@@ -5346,6 +5421,17 @@ impl Exec {
     /// PCIe. None: the range is larger than `limit` (0: off), GPU work not yet
     /// complete (or a deferred CP write) writes it, or no space.
     pub(super) fn snapshot(&mut self, base: u64, size: u64, limit: u64) -> Option<(vk::Buffer, u64, u64)> {
+        self.snapshot_as(base, size, limit, true)
+    }
+
+    /// A snapshot of [base, base + size) as memory holds it now, never one
+    /// taken earlier in the batch (CP writes may have changed it since).
+    pub(super) fn snapshot_exact(&mut self, base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
+        DATA_SNAPS.fetch_add(1, Ordering::Relaxed);
+        self.snapshot_as(base, size, 65536, false)
+    }
+
+    fn snapshot_as(&mut self, base: u64, size: u64, limit: u64, reuse: bool) -> Option<(vk::Buffer, u64, u64)> {
         if size == 0 || size > limit || self.snap_failed || super::homes::overlaps(base, size) {
             return None;
         }
@@ -5355,7 +5441,7 @@ impl Exec {
         }
         let al = base & !15;
         let bias = base - al;
-        if let (Some(&at), Some((buf, _))) = (self.snaps.get(&(base, size)), self.slots[self.cur].snap) {
+        if let (true, Some(&at), Some((buf, _))) = (reuse, self.snaps.get(&(base, size)), self.slots[self.cur].snap) {
             SNAPS_REUSED.fetch_add(1, Ordering::Relaxed);
             return Some((buf, at, bias));
         }
@@ -5535,6 +5621,9 @@ impl Exec {
                 }
             });
             self.slots[b.slot].seq = seq;
+            if !b.races.is_empty() {
+                RACE_CHECKS.lock().extend(b.races.into_iter().map(|c| RaceCheck { seq, ..c }));
+            }
             super::precache::submitted(&b.shared, seq);
             INFLIGHT.note_ranges(seq, &b.writes);
             super::precache::invalidate_ranges_except(&b.writes, &b.kept);
@@ -5619,7 +5708,24 @@ impl Exec {
                         // Inside a resident shadow: its working copy is newer.
                         let resident = if read_only && home.is_none() { self.resident_read(base, size)? } else { None };
                         // Small read-only buffers: a snapshot in video memory.
-                        let snap = if read_only && resident.is_none() && home.is_none() { self.snapshot(base, size, super::tune::snap_max()) } else { None };
+                        // Data-only loads read on the GPU (`gpu_loads`) of data
+                        // no GPU work still writes: as memory holds it now, as
+                        // the CPU-resolved loads read it (the shader would read
+                        // it when the batch executes, after CP and title writes
+                        // that came later: `tune race_checks`, FINDINGS.md
+                        // 2026-10-14); data GPU work writes is read where it is.
+                        let data_load = read_only && matches!(found.resources[i], Resolved::Global(_, Some(_)));
+                        let snap = if !(read_only && resident.is_none() && home.is_none()) {
+                            None
+                        } else if data_load && super::tune::data_snapshots() {
+                            self.snapshot_exact(base, size)
+                        } else {
+                            self.snapshot(base, size, super::tune::snap_max())
+                        };
+                        if read_only && snap.is_none() && size <= 4096 && size % 4 == 0 && super::tune::race_checks() && !self.pending.overlaps(base, size) && super::cp::guest_readable(base, size) {
+                            let words: Vec<u32> = (0..size / 4).map(|j| unsafe { std::ptr::read_volatile((base + 4 * j) as *const u32) }).collect();
+                            self.race_pending.push(RaceCheck { seq: 0, shader: p.addr, base, words, flip: super::FRAMES.load(Ordering::Relaxed) });
+                        }
                         // Read-only bindings of buffers GPU work wrote: VRAM mirrors.
                         let mirrored = if read_only && snap.is_none() && home.is_none() { resident.or_else(|| super::mirror::lookup(base, size)) } else { None };
                         // Other read-only buffers: a copy made at the batch's start
@@ -6015,6 +6121,13 @@ impl Exec {
             None => shaders::prepare_compute(cp, wave64)?,
         };
         lap.mark(0);
+        // Data GPU work still writes: read by the shader itself (`tune
+        // gpu_loads 3`; data the title writes stays captured when recorded).
+        if super::tune::gpu_loads_mode() == 3 && !p.data_loads.is_empty() && self.would_wait(&shaders::data_load_ranges(&p)) {
+            shaders::note_gpu_loads_program(p.addr);
+            p = shaders::with_gpu_loads(|| shaders::prepare_compute(cp, wave64))?;
+            HYBRID_LOADS[2].fetch_add(1, Ordering::Relaxed);
+        }
         self.sync_readers = [p.addr, 0];
         let patches = self.speculate(&[&p]);
         if patches.is_none() && self.sync_for_stage(&p.reads, SYNC_CS_READS) {
@@ -6431,10 +6544,12 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them behind a barrier of their own; {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills, {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them behind a barrier of their own; stages prepared again with GPU-side data loads {:?} ({} programs since with them); {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills, {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         INDIRECT_BARRIERS[0].load(Ordering::Relaxed),
+        HYBRID_LOADS.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),
+        shaders::gpu_loads_programs(),
         MERGED_PASS_BARRIERS.load(Ordering::Relaxed),
         FEEDBACK[0].load(Ordering::Relaxed),
         FEEDBACK[1].load(Ordering::Relaxed),
