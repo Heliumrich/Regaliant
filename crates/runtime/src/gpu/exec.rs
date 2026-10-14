@@ -1271,7 +1271,7 @@ fn note_copy_waits(own: bool, wait: u64) {
 /// queue once its own copies there and those it binds that earlier batches
 /// made there (`wait`) are done. Called in sequence order (`push_batch`):
 /// the timeline's signals increase.
-fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, fence: vk::Fence) -> Result<(), String> {
+fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, fence: vk::Fence, alt: bool) -> Result<(), String> {
     let c = ctx();
     let mut wait = wait;
     if let Some(x) = xpre {
@@ -1288,7 +1288,8 @@ fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::Comma
         None => std::slice::from_ref(&cmd),
     };
     match (&c.copy, wait) {
-        (Some(q), w) if w > 0 => c.submit_timeline(false, cmds, &[(q.copied, w, vk::PipelineStageFlags2::ALL_COMMANDS)], &[], fence),
+        (Some(q), w) if w > 0 => c.submit_timeline_on(false, alt, cmds, &[(q.copied, w, vk::PipelineStageFlags2::ALL_COMMANDS)], &[], fence),
+        _ if alt => c.submit_timeline_on(false, true, cmds, &[], &[], fence),
         _ => c.submit_cmds(cmds, &[], &[], fence),
     }
 }
@@ -1829,7 +1830,9 @@ unsafe fn copy_timestamps(cmd: vk::CommandBuffer, pool: vk::QueryPool, first: u3
     let c = ctx();
     unsafe {
         if super::tune::ts_nowait() {
-            global_barrier(cmd);
+            if super::tune::skip_barriers() & 8 == 0 {
+                global_barrier(cmd);
+            }
             c.device.cmd_copy_query_pool_results(cmd, pool, first, n, buf, off, 8, vk::QueryResultFlags::TYPE_64);
         } else {
             c.device.cmd_copy_query_pool_results(cmd, pool, first, n, buf, off, 8, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT);
@@ -3395,6 +3398,18 @@ pub struct Exec {
     /// Speculations on words this batch writes (`speculate`): checked once
     /// it completed, its sequence set at submission.
     own_checks: Vec<SpecCheck>,
+    /// The compute queue id in this executor's name (`gpu-acb<id>`; 0: none)
+    /// and whether the batch being recorded goes to the main family's second
+    /// Vulkan queue (`tune alt_queue`: a timing diagnosis, no ordering
+    /// against the other queue; its batches share no batch-start copies
+    /// unless bit 16 of the switch is set).
+    alt_id: u64,
+    batch_alt: bool,
+    batch_alt_share: bool,
+    /// GPU writes this batch recorded since its last full barrier through
+    /// `barrier` (None: more than `SINCE_MAX`): an indirect dispatch whose
+    /// arguments none of them writes needs no barrier of its own.
+    since_barrier: Option<Vec<(u64, u64)>>,
 }
 
 unsafe impl Send for Exec {}
@@ -3419,6 +3434,14 @@ struct Closed {
 const PENDING: u64 = u64::MAX;
 /// Batch slots a deferred executor may create.
 const DEFERRED_SLOTS: usize = 6;
+/// Writes `Exec::since_barrier` lists (more: any range counts as written).
+const SINCE_MAX: usize = 128;
+/// Indirect dispatches with a barrier of their own, and without one (their
+/// arguments not written since the batch's last barrier; `tune
+/// exact_indirect`).
+pub static INDIRECT_BARRIERS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// Batch slots deferred executors made beyond their first two (statistics).
+pub static WORKER_SLOTS: AtomicU64 = AtomicU64::new(0);
 
 /// Error of a command a deferred executor stopped at (see `Exec::stopped`).
 pub(crate) const STOPPED: &str = "stopped (parallel run)";
@@ -3515,6 +3538,10 @@ impl Exec {
                 shared_kept: Vec::new(),
                 tex_scratch: Vec::new(),
                 own_checks: Vec::new(),
+                alt_id: name.strip_prefix("gpu-acb").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).unwrap_or(0),
+                batch_alt: false,
+                batch_alt_share: false,
+                since_barrier: Some(Vec::new()),
             })
         }
     }
@@ -3554,25 +3581,34 @@ impl Exec {
             self.open_gen.store(SPAN_GEN.load(Ordering::SeqCst), Ordering::SeqCst);
         }
         if self.deferred {
-            // A slot whose batch is closed but not submitted cannot be reused:
-            // another one, or a new one, else the chunk stops.
+            // A slot whose batch is closed but not submitted cannot be reused,
+            // and one whose batch the GPU still executes would make the chunk
+            // wait for it (a worker records several chunks of a run): a free
+            // one, or a new one, else one still executing, else the chunk
+            // stops.
             let n = self.slots.len();
-            if self.slots[self.cur].seq == PENDING {
-                match (0..n).map(|k| (self.cur + k) % n).find(|&k| self.slots[k].seq != PENDING) {
+            let done = done_seq();
+            let free = |s: &Slot| s.seq != PENDING && s.seq <= done;
+            if !free(&self.slots[self.cur]) {
+                let next = |ok: &dyn Fn(&Slot) -> bool| (0..n).map(|k| (self.cur + k) % n).find(|&k| ok(&self.slots[k]));
+                match next(&free) {
                     Some(k) => self.cur = k,
-                    None if n < DEFERRED_SLOTS => match Slot::new(self.pool, self.xpool) {
-                        Ok(s) => {
-                            self.slots.push(s);
-                            self.cur = n;
-                        }
-                        Err(_) => {
-                            self.stop("no batch slot");
-                            return;
-                        }
-                    },
                     None => {
-                        self.stop("no batch slot");
-                        return;
+                        let made = if n < DEFERRED_SLOTS { Slot::new(self.pool, self.xpool).ok() } else { None };
+                        match made {
+                            Some(s) => {
+                                self.slots.push(s);
+                                self.cur = n;
+                                WORKER_SLOTS.fetch_add(1, Ordering::Relaxed);
+                            }
+                            None => match next(&|s: &Slot| s.seq != PENDING) {
+                                Some(k) => self.cur = k,
+                                None => {
+                                    self.stop("no batch slot");
+                                    return;
+                                }
+                            },
+                        }
                     }
                 }
             }
@@ -3614,7 +3650,7 @@ impl Exec {
                 ctx().device.cmd_reset_query_pool(self.cmd(), qp, 0, STAMPS * MAX_TIMED + 2);
             }
         }
-        global_barrier(self.cmd());
+        self.barrier();
         self.barrier_wanted = false;
         self.dispatched = false;
         let qp = self.slots[self.cur].queries;
@@ -3622,6 +3658,9 @@ impl Exec {
             unsafe { ctx().device.cmd_write_timestamp(self.cmd(), vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED) };
         }
         self.recording = true;
+        let aq = super::tune::alt_queue();
+        self.batch_alt = self.alt_id != 0 && aq & 0xFFFF == self.alt_id && ctx().queue2.is_some();
+        self.batch_alt_share = aq & 0x10000 != 0;
         self.dyncache = Default::default();
         self.begun_at = std::time::Instant::now();
         self.begun_mark = super::timeline::mark();
@@ -3747,11 +3786,12 @@ impl Exec {
         let commands = self.batch_shaders.len();
         let gpu_labels = self.pending_promises.clone();
         note_copy_waits(xpre.is_some(), copy_wait);
+        let alt = self.batch_alt;
         let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, move |seq| {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return;
             }
-            let r = submit_batch(seq, xpre, pre, cmd, copy_wait, fence);
+            let r = submit_batch(seq, xpre, pre, cmd, copy_wait, fence, alt);
             if let Err(e) = r {
                 if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
                     crate::error!("gpu[{name}]: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
@@ -3927,14 +3967,14 @@ impl Exec {
             self.end_rendering();
             let c = ctx();
             let cmd = self.cmd();
-            global_barrier(cmd);
+            self.barrier();
             for &(a, n, off) in &b.copy_in {
                 for (src, src_off, ga, len) in guest_pieces(a, n) {
                     unsafe { c.device.cmd_copy_buffer(cmd, src, b.buf, &[vk::BufferCopy { src_offset: src_off, dst_offset: off + (ga - a), size: len }]) };
                     super::homes::COPIED_IN.fetch_add(len, Ordering::Relaxed);
                 }
             }
-            global_barrier(cmd);
+            self.barrier();
             self.barrier_wanted = false;
             self.dispatched = false;
         }
@@ -3983,7 +4023,7 @@ impl Exec {
         self.end_rendering();
         let c = ctx();
         let cmd = self.cmd();
-        global_barrier(cmd);
+        self.barrier();
         for (a, n, hb, off) in parts {
             for (dst, dst_off, ga, len) in guest_pieces(a, n) {
                 unsafe { c.device.cmd_copy_buffer(cmd, hb.buf, dst, &[vk::BufferCopy { src_offset: off + (ga - a), dst_offset: dst_off, size: len }]) };
@@ -3991,7 +4031,7 @@ impl Exec {
             }
             self.slots[self.cur].homes.push(hb);
         }
-        global_barrier(cmd);
+        self.barrier();
         self.barrier_wanted = false;
         self.dispatched = false;
         crate::info!("gpu[{}]: homes written back and dropped (tune homes 0)", self.name);
@@ -4015,7 +4055,7 @@ impl Exec {
         self.end_rendering();
         let c = ctx();
         let cmd = self.cmd();
-        global_barrier(cmd);
+        self.barrier();
         let total: u64 = parts.iter().map(|p| p.1).sum();
         self.ops[OP_WRITE_BACK_BYTES] += total;
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -4029,7 +4069,7 @@ impl Exec {
             }
             self.slots[self.cur].homes.push(hb);
         }
-        global_barrier(cmd);
+        self.barrier();
         super::homes::WRITE_BACKS.fetch_add(1, Ordering::Relaxed);
         self.barrier_wanted = false;
         self.dispatched = false;
@@ -4080,7 +4120,8 @@ impl Exec {
     pub(super) fn pre_copy(&mut self, base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
         // Over `pre_max`: only as a shared copy (`tune pre_big_max`).
         let big = size > super::tune::pre_max();
-        if size == 0 || (big && !(size <= super::tune::pre_big_max() && self.shares_pre && super::precache::enabled())) || self.pre_failed {
+        let shares = self.shares_pre && (!self.batch_alt || self.batch_alt_share);
+        if size == 0 || (big && !(size <= super::tune::pre_big_max() && shares && super::precache::enabled())) || self.pre_failed {
             return None;
         }
         if super::homes::overlaps(base, size) {
@@ -4107,7 +4148,7 @@ impl Exec {
             return Some((buf, at, bias));
         }
         let n = (bias + size).next_multiple_of(4);
-        let share = self.shares_pre && super::precache::enabled() && super::precache::worth(size);
+        let share = shares && super::precache::enabled() && super::precache::worth(size);
         if share {
             // Copied by an earlier submitted batch (`gpu::precache`).
             if let Some((chunk, at, made)) = super::precache::lookup(base, size) {
@@ -4233,7 +4274,7 @@ impl Exec {
         self.end_rendering();
         let cmd = self.cmd();
         if !lazy_barriers() || self.barrier_wanted {
-            global_barrier(cmd);
+            self.barrier();
             self.barrier_wanted = false;
             self.dispatched = false;
         }
@@ -4241,7 +4282,7 @@ impl Exec {
         self.ops[OP_FILLS] += 1;
         self.ops[OP_FILL_BYTES] += len;
         if !lazy_barriers() {
-            global_barrier(cmd);
+            self.barrier();
         }
         Ok(true)
     }
@@ -4323,7 +4364,7 @@ impl Exec {
                     }
                 }
             };
-            global_barrier(self.cmd());
+            self.barrier();
             FAST_CLEARS.fetch_add(1, Ordering::Relaxed);
             self.ops[OP_FAST_CLEARS] += 1;
             static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
@@ -4396,7 +4437,7 @@ impl Exec {
         self.begin();
         let c = ctx();
         let cmd = self.cmd();
-        global_barrier(cmd);
+        self.barrier();
         for b in &copies {
             let regions: Vec<vk::ImageCopy> = (0..b.levels)
                 .map(|l| {
@@ -4412,7 +4453,7 @@ impl Exec {
                 crate::info!("images: {:#x} {}x{} {:?}: {} mip(s) of blocks copied in from its GPU-written {}x{} view", b.key.base, b.key.width, b.key.height, b.key.format, b.levels, b.width, b.height);
             }
         }
-        global_barrier(cmd);
+        self.barrier();
     }
 
     /// Submits recorded work and waits for all of this queue's GPU work and
@@ -4453,7 +4494,7 @@ impl Exec {
         let cmd = self.cmd();
         let d = &ctx().device;
         let bytes = super::lodstats::SLOT_BYTES;
-        global_barrier(cmd);
+        self.barrier();
         unsafe {
             d.cmd_copy_buffer(cmd, fx.lodstats, fx.lod_readback, &[vk::BufferCopy { src_offset: 0, dst_offset: slot as u64 * bytes, size: bytes }]);
             if reset {
@@ -4463,7 +4504,7 @@ impl Exec {
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
             d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[mb], &[], &[]);
         }
-        global_barrier(cmd);
+        self.barrier();
     }
 
     /// Whether deferred CP effects are still pending (later CP memory writes
@@ -4547,7 +4588,7 @@ impl Exec {
             return;
         }
         if self.barrier_wanted || (for_draw && self.dispatched) {
-            global_barrier(self.cmd());
+            self.barrier();
             self.barrier_wanted = false;
             self.dispatched = false;
         }
@@ -4929,6 +4970,7 @@ impl Exec {
         }
         super::precache::invalidate_gpu(a, n);
         self.pending.insert(a, n);
+        self.note_since(a, n);
         self.own_gen += 1;
         if verify::enabled() {
             self.pending_log.push((a, n));
@@ -4985,10 +5027,12 @@ impl Exec {
             }
             self.eop_unordered = true;
             EOP_LIGHT[0].fetch_add(1, Ordering::Relaxed);
-        } else {
-            global_barrier(cmd);
+        } else if super::tune::skip_barriers() & 4 != 0 {
             unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
-            global_barrier(cmd);
+        } else {
+            self.barrier();
+            unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
+            self.barrier();
             self.barrier_wanted = false;
             self.dispatched = false;
         }
@@ -5090,7 +5134,9 @@ impl Exec {
             c.device.cmd_push_constants(cmd, tp.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
             c.device.cmd_dispatch(cmd, 1, 1, 1);
         }
-        global_barrier(cmd);
+        if super::tune::skip_barriers() & 8 == 0 {
+            self.barrier();
+        }
         self.barrier_wanted = false;
         self.dispatched = false;
         self.taint_resident(a, 8);
@@ -5134,7 +5180,7 @@ impl Exec {
     pub fn order_after_open_writes(&mut self) {
         if std::mem::take(&mut self.eop_unordered) {
             self.end_rendering();
-            global_barrier(self.cmd());
+            self.barrier();
             self.barrier_wanted = false;
             self.dispatched = false;
             EOP_LIGHT[2].fetch_add(1, Ordering::Relaxed);
@@ -5183,7 +5229,7 @@ impl Exec {
         let c = ctx();
         super::vk::checkpoint(self.cmd(), super::vk::mark::SHADOW_OUT, 0);
         // The dispatches' writes to the working copies come first.
-        global_barrier(self.cmd());
+        self.barrier();
         let merge = if shadow_merge() { Some(merge_pipe()?) } else { None };
         for sh in &flush {
             let own = sh.size.min(sh.range - sh.bias);
@@ -5225,7 +5271,7 @@ impl Exec {
             self.share_shadows(&flush);
         }
         // Later work reads guest memory after the write-back.
-        global_barrier(self.cmd());
+        self.barrier();
         self.barrier_wanted = false;
         self.dispatched = false;
         MERGES.fetch_add(flush.len() as u64, Ordering::Relaxed);
@@ -5394,6 +5440,32 @@ impl Exec {
         }
     }
 
+    /// A full barrier in the batch being recorded (see `global_barrier`).
+    #[track_caller]
+    fn barrier(&mut self) {
+        global_barrier(self.cmd());
+        match self.since_barrier.as_mut() {
+            Some(v) => v.clear(),
+            None => self.since_barrier = Some(Vec::new()),
+        }
+    }
+
+    /// A GPU write of [a, a + n) recorded in this batch (`since_barrier`).
+    fn note_since(&mut self, a: u64, n: u64) {
+        if let Some(v) = self.since_barrier.as_mut() {
+            if v.len() < SINCE_MAX {
+                v.push((a, n));
+            } else {
+                self.since_barrier = None;
+            }
+        }
+    }
+
+    /// Whether this batch wrote into [a, a + n) since its last full barrier.
+    fn written_since_barrier(&self, a: u64, n: u64) -> bool {
+        self.since_barrier.as_ref().is_none_or(|v| v.iter().any(|&(w, m)| w < a + n && a < w + m))
+    }
+
     /// Makes this a deferred executor (`gpu::par` workers).
     pub fn set_deferred(&mut self) {
         self.deferred = true;
@@ -5434,7 +5506,7 @@ impl Exec {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
                     return;
                 }
-                let r = submit_batch(seq, None, pre, cmd, copy_wait, fence);
+                let r = submit_batch(seq, None, pre, cmd, copy_wait, fence, false);
                 if let Err(e) = r {
                     if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
                         crate::error!("gpu[{name}]: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
@@ -6056,7 +6128,7 @@ impl Exec {
             }
         };
         if lazy_barriers() && self.barrier_wanted {
-            global_barrier(self.cmd());
+            self.barrier();
             self.barrier_wanted = false;
             self.dispatched = false;
         }
@@ -6090,7 +6162,7 @@ impl Exec {
                 // shared copy only when recorded; this chunk's copy in runs
                 // after theirs and must see them (stale counters hung the GPU
                 // at a World 5-1 load, runs 20261013-035334 .. -041906).
-                let shared = if self.deferred { None } else { super::precache::lookup(sh.guest, sh.range) };
+                let shared = if self.deferred || (self.batch_alt && !self.batch_alt_share) { None } else { super::precache::lookup(sh.guest, sh.range) };
                 match shared {
                     Some((chunk, at, made)) => {
                         self.copy_wait = self.copy_wait.max(made);
@@ -6170,8 +6242,16 @@ impl Exec {
             }
             bind_descriptors(cmd, vk::PipelineBindPoint::COMPUTE, layout, set, std::slice::from_ref(&bound), &mut self.dyncache.pushed[1], rebound);
             if let Some((buffer, offset)) = args {
-                // Earlier work of this batch wrote the arguments.
-                global_barrier(cmd);
+                // Work of this batch since its last barrier wrote the
+                // arguments (`tune exact_indirect`; earlier batches complete
+                // before this one starts).
+                let a = indirect.unwrap_or(0);
+                if super::tune::skip_barriers() & 2 == 0 && (!super::tune::exact_indirect() || self.written_since_barrier(a, 12)) {
+                    self.barrier();
+                    INDIRECT_BARRIERS[0].fetch_add(1, Ordering::Relaxed);
+                } else {
+                    INDIRECT_BARRIERS[1].fetch_add(1, Ordering::Relaxed);
+                }
                 c.device.cmd_dispatch_indirect(cmd, buffer, offset);
             } else if start != [0, 0, 0] {
                 c.device.cmd_dispatch_base(cmd, start[0], start[1], start[2], groups[0].saturating_sub(start[0]), groups[1].saturating_sub(start[1]), groups[2].saturating_sub(start[2]));
@@ -6182,7 +6262,7 @@ impl Exec {
         stamp(2);
         lap.mark(12);
         if !lazy_barriers() || (!bound.shadows.is_empty() && super::tune::shadow_barrier()) {
-            global_barrier(self.cmd());
+            self.barrier();
         }
         // Written shadows stay resident for the rest of the batch (see Shadow);
         // a reused one merged back while this dispatch's bindings were made
@@ -6249,6 +6329,7 @@ impl Exec {
             self.own_gen += 1;
             for &(b, n) in &writes_here {
                 self.pending.insert(b, n);
+                self.note_since(b, n);
                 if verify::enabled() {
                     self.pending_log.push((b, n));
                 }
@@ -6317,9 +6398,10 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU; {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills, {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them behind a barrier of their own; {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills, {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
+        INDIRECT_BARRIERS[0].load(Ordering::Relaxed),
         GPU_CP_WRITES.load(Ordering::Relaxed),
         GPU_TIMESTAMPS.load(Ordering::Relaxed),
         GPU_CP_REFUSED.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),

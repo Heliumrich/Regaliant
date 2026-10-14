@@ -188,14 +188,14 @@ pub struct ChunkState {
     dispatch_indirect_base: u64,
 }
 
-/// A parallel run in progress: chunk i + 1 starts at `starts[i]` and was
-/// handed to `workers[i]`; it ends where the next starts (the last at
-/// `end`). `next`: the chunk to collect next.
+/// A parallel run in progress: chunk i + 1 starts at `starts[i]` and is
+/// chunk i of `run` (the workers'); it ends where the next starts (the last
+/// at `end`). `next`: the chunk to collect next.
 struct ParRun {
     starts: Vec<u64>,
     end: u64,
     next: usize,
-    workers: Vec<Arc<super::par::Worker>>,
+    run: Arc<super::par::Run>,
     /// How long the main command processor waited for the workers so far.
     waited_ns: u64,
 }
@@ -986,7 +986,7 @@ impl Cp {
 
     /// Splits the synchronization-free run that starts with the command at
     /// `from` into chunks when it is long enough: the first stays here, the
-    /// others start on the workers now (`gpu::par`).
+    /// others go to the workers' queue now (`gpu::par`).
     fn par_plan(&mut self, f: &Fetched, from: u64, end: u64) {
         let k = super::par::workers();
         // The run's commands, its end and the indirect arguments read in it.
@@ -1058,7 +1058,7 @@ impl Cp {
         };
         let n = ends.len();
         super::par::note_run(n, why);
-        let chunks = (k + 1).min(n / PAR_CHUNK_MIN);
+        let chunks = ((k + 1) * super::par::split()).min(n / PAR_CHUNK_MIN);
         if n < PAR_MIN || chunks < 2 {
             // Not again before execution passes this run's end.
             self.par_skip = (end, run_end);
@@ -1088,12 +1088,12 @@ impl Cp {
             self.sync_reads(&merged);
         }
         // The main command processor's chunk first (`par::main_weight`
-        // times a worker's), then equal ones.
-        let k = chunks - 1;
+        // times a worker's), then equal ones for the workers' queue.
+        let m = chunks - 1;
         let w = super::par::main_weight();
-        let main_n = ((n as f64 * w / (w + k as f64)).round() as usize).clamp(PAR_CHUNK_MIN, n - k * PAR_CHUNK_MIN);
-        let per = (n - main_n) / k;
-        let starts: Vec<u64> = (0..k).map(|i| ends[main_n + i * per - 1]).collect();
+        let main_n = ((n as f64 * w / (w + m as f64)).round() as usize).clamp(PAR_CHUNK_MIN, n - m * PAR_CHUNK_MIN);
+        let per = (n - main_n) / m;
+        let starts: Vec<u64> = (0..m).map(|i| ends[main_n + i * per - 1]).collect();
         // The state at each chunk's start.
         let mut st = self.chunk_state();
         let mut states: Vec<Box<ChunkState>> = Vec::new();
@@ -1118,37 +1118,43 @@ impl Cp {
             states.push(Box::new(st.clone()));
         }
         let mut workers = Vec::new();
-        for i in 0..starts.len() {
+        for i in 0..k.min(m) {
             match self.par_pool.worker(i, &self.name, self.compute) {
                 Some(w) => workers.push(w),
-                None => return,
+                None => break,
             }
         }
+        if workers.is_empty() {
+            return;
+        }
         self.drop_ahead();
-        for (i, (w, state)) in workers.iter().zip(states).enumerate() {
-            let to = if i + 1 < starts.len() { starts[i + 1] } else { run_end };
-            w.start(state, starts[i], to);
+        let queue = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
+        let run = Arc::new(super::par::Run::new(queue));
+        for w in &workers {
+            w.start(run.clone());
         }
         super::par::RUNS.fetch_add(1, Ordering::Relaxed);
         super::par::CHUNKS.fetch_add(starts.len() as u64, Ordering::Relaxed);
-        self.par = Some(ParRun { starts, end: run_end, next: 0, workers, waited_ns: 0 });
+        self.par = Some(ParRun { starts, end: run_end, next: 0, run, waited_ns: 0 });
     }
 
     /// The main command processor reached the next chunk of the parallel
-    /// run: its own work so far goes to the GPU, then the chunk's batches;
-    /// execution continues with the chunk's end state from its end, or from
-    /// the packet where the worker stopped. Returns where to continue.
+    /// run: its own work so far goes to the GPU, then the chunk's batches
+    /// (its worker submits them once given the turn, or did when the chunk
+    /// before ran to its end); execution continues with the chunk's end
+    /// state from its end, or from the packet where the worker stopped.
+    /// Returns where to continue.
     fn par_collect(&mut self) -> u64 {
-        let (w, to) = {
+        let (run, i, to, last) = {
             let pr = self.par.as_mut().unwrap();
             let i = pr.next;
             pr.next += 1;
-            (pr.workers[i].clone(), if i + 1 < pr.starts.len() { pr.starts[i + 1] } else { pr.end })
+            (pr.run.clone(), i, if i + 1 < pr.starts.len() { pr.starts[i + 1] } else { pr.end }, pr.next == pr.starts.len())
         };
-        let last = self.par.as_ref().is_some_and(|p| p.next == p.starts.len());
         self.submit_gpu("par");
+        run.grant(i);
         let tl = super::timeline::mark();
-        let (stopped, waited) = w.wait();
+        let (done, waited) = run.collect(i);
         super::timeline::end(&self.name, tl, || "wait: parallel chunk".into());
         match self.par.as_mut() {
             Some(pr) if last => {
@@ -1158,21 +1164,16 @@ impl Cp {
             Some(pr) => pr.waited_ns += waited,
             None => {}
         }
-        let (st, last) = {
-            let mut wcp = w.cp.lock();
-            let last = wcp.worker_submit();
-            if stopped.is_some() {
-                super::par::note_stop(wcp.worker_stop_why());
-            }
-            (wcp.chunk_state(), last)
-        };
+        if done.stopped.is_some() {
+            super::par::note_stop(done.why);
+        }
         // This queue's later work and CP effects follow the chunk's batches
         // (a label written after the run must wait for them).
-        if let (Some(seq), Some(e)) = (last, self.exec.as_mut()) {
+        if let (Some(seq), Some(e)) = (done.last, self.exec.as_mut()) {
             e.depend_on(seq, false);
         }
-        self.set_chunk_state(&st);
-        match stopped {
+        self.set_chunk_state(&done.state);
+        match done.stopped {
             Some(s) => {
                 super::par::STOPS.fetch_add(1, Ordering::Relaxed);
                 s
@@ -1182,13 +1183,12 @@ impl Cp {
     }
 
     /// Abandons the parallel run in progress (execution left it): the
-    /// workers' batches are dropped, their chunks are executed here.
+    /// workers drop the batches of chunks whose turn did not come (none had:
+    /// execution leaves a run only from the main command processor's own
+    /// chunk or the rest of a stopped one); their chunks are executed here.
     fn par_cancel(&mut self) {
         let Some(pr) = self.par.take() else { return };
-        for w in &pr.workers[pr.next..] {
-            let _ = w.wait();
-            w.cp.lock().worker_discard();
-        }
+        pr.run.cancel();
         super::par::CANCELLED.fetch_add(1, Ordering::Relaxed);
     }
 

@@ -481,6 +481,12 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 info!("file traffic at flip {flip}:\n{}", hle::iostat::status());
                 Ok(())
             }
+            "frametimes" => {
+                // Intervals between presented flips since the last
+                // `frametimes` (`gpu::pacing`).
+                info!("frame times at flip {flip}: {}", gpu::pacing::report_and_reset());
+                Ok(())
+            }
             "capture" => {
                 // `capture [<from>-<to>] [dispatches] [images=<base>[,..]]
                 // [buffers=<shader>[,..]] [pixel=<x>,<y>]`:

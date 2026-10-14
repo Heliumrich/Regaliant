@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 67] = [
+    static ALL: [Tunable; 72] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -94,6 +94,11 @@ pub mod tune {
         Tunable { name: "per_lane", env: "DS_PER_LANE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "copy_queue", env: "DS_COPY_QUEUE_USE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "skip_read_waits", env: "DS_SKIP_READ_WAITS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par_split", env: "DS_PAR_SPLIT", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par_weight", env: "DS_PAR_WEIGHT", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "alt_queue", env: "DS_ALT_QUEUE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "skip_barriers", env: "DS_SKIP_BARRIERS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "exact_indirect", env: "DS_EXACT_INDIRECT", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -699,6 +704,43 @@ pub mod tune {
         get(66) != 0
     }
 
+    /// Chunks per recorder a parallel run is split into (`gpu::par`): the
+    /// workers take them in order and submit each when its turn comes; 1:
+    /// one each.
+    #[inline]
+    pub fn par_split() -> u64 {
+        get(67)
+    }
+
+    /// The main command processor's chunk of a parallel run relative to a
+    /// worker's, in 1/1000 (0: `par_balance` decides).
+    #[inline]
+    pub fn par_weight() -> u64 {
+        get(68)
+    }
+
+    /// Diagnosis (timing only, no ordering between the queues): the batches
+    /// of the compute queue with this id go to a second Vulkan queue of the
+    /// main family (0: none; bit 16: they still share batch-start copies).
+    #[inline]
+    pub fn alt_queue() -> u64 {
+        get(69)
+    }
+
+    /// Diagnosis (timing only, wrong results): full barriers left out, by
+    /// site: 1 after a render pass, 2 before an indirect dispatch, 4 around
+    /// a CP memory write the GPU performs, 8 around a GPU timestamp store.
+    #[inline]
+    pub fn skip_barriers() -> u64 {
+        get(70)
+    }
+
+    /// An indirect dispatch whose arguments the GPU reads waits behind a full
+    /// barrier only when its batch wrote them since its last one (0: always).
+    #[inline]
+    pub fn exact_indirect() -> bool {
+        get(71) != 0
+    }
 
     /// A switch's value by name; None if unknown.
     pub fn value(name: &str) -> Option<u64> {
@@ -718,6 +760,7 @@ pub mod tune {
 }
 
 pub mod ahead;
+pub mod pacing;
 pub mod par;
 pub mod prio;
 pub mod precache;

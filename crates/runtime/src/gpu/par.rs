@@ -3,26 +3,38 @@
 //!
 //! A long run of commands without synchronization packets between them is
 //! split at command boundaries into chunks. The main command processor
-//! executes the first chunk itself; each later chunk goes to a worker: a
-//! command processor of its own (`Cp`, started from a copy of the register
-//! state at the chunk's start) whose executor is deferred (`Exec::deferred`):
-//! it records the chunk's draws and dispatches with the same code into
-//! batches that it closes but does not submit. The main command processor
-//! then submits each chunk's batches in program order after its own work
-//! (`Cp::par_collect`) and continues with the state at the chunk's end. A
-//! command the worker cannot record without flushing or waiting for its own
-//! unsubmitted work stops the chunk there; the main command processor
-//! executes the rest of that chunk itself.
+//! executes the first chunk itself; the others form a queue (`Run`) that the
+//! workers take in program order: a worker is a command processor of its own
+//! (`Cp`, started from a copy of the register state at the chunk's start)
+//! whose executor is deferred (`Exec::deferred`): it records the chunk's
+//! draws and dispatches with the same code into batches that it closes, then
+//! waits for the chunk's turn, submits them, posts the state at the chunk's
+//! end and takes the next chunk not taken. The main command processor gives
+//! a chunk its turn once its own work before the chunk went to the GPU
+//! (`Cp::par_collect`) and continues with the state at the chunk's end; a
+//! chunk that ran to its end passes the turn to the next itself, so the GPU
+//! starts on a run while its later chunks are still being recorded (`tune
+//! par_split`: chunks per recorder). A command the worker cannot record
+//! without flushing or waiting for its own unsubmitted work stops the chunk
+//! there; the main command processor executes the rest of that chunk itself
+//! and then gives the next chunk its turn.
 
 use super::cp::{ChunkState, Cp};
 use parking_lot::{Condvar, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Chunk workers wanted (`tune par`; 0: runs are recorded by the command
 /// processor alone).
 pub fn workers() -> usize {
     (super::tune::par() as usize).min(8)
+}
+
+/// Chunks per recorder (the main command processor and each worker) a run
+/// is split into (`tune par_split`; 1: one each, all submitted when the
+/// main command processor's own chunk is done).
+pub fn split() -> usize {
+    (super::tune::par_split() as usize).clamp(1, 16)
 }
 
 /// The main command processor's chunk relative to a worker's, in 1/1000
@@ -35,7 +47,10 @@ static MAIN_WEIGHT: AtomicU64 = AtomicU64::new(1000);
 
 /// The main command processor's chunk relative to a worker's.
 pub fn main_weight() -> f64 {
-    if super::tune::par_balance() {
+    let fixed = super::tune::par_weight();
+    if fixed > 0 {
+        fixed.min(4000) as f64 / 1000.0
+    } else if super::tune::par_balance() {
         MAIN_WEIGHT.load(Ordering::Relaxed) as f64 / 1000.0
     } else {
         1.0
@@ -53,32 +68,130 @@ pub fn note_main_wait(ns: u64) {
     MAIN_WEIGHT.store(next, Ordering::Relaxed);
 }
 
-struct Job {
-    state: Box<ChunkState>,
-    from: u64,
-    to: u64,
+/// A chunk as its worker left it.
+pub struct Done {
+    /// Where it stopped (None: it ran to its end).
+    pub stopped: Option<u64>,
+    /// The command-processor state where it stopped or ended.
+    pub state: ChunkState,
+    /// The sequence of its last batch (None: it submitted none).
+    pub last: Option<u64>,
+    /// Why it stopped ("" when it ran to its end).
+    pub why: &'static str,
+}
+
+/// The chunks of a parallel run that the workers record (all but the main
+/// command processor's), in program order.
+pub struct Run {
+    /// Chunk i: its start state (taken by the worker that records it), its
+    /// first packet and the packet after it.
+    chunks: Vec<(Mutex<Option<Box<ChunkState>>>, u64, u64)>,
+    /// The next chunk not taken.
+    next: AtomicUsize,
+    /// Chunks whose turn came: chunk i submits once this exceeds i.
+    turn: AtomicUsize,
+    /// Chunks posted (in order: chunk i's once this exceeds i).
+    posted: AtomicUsize,
+    results: Mutex<Vec<Option<Done>>>,
+    cancelled: AtomicBool,
+    /// Workers started on the run that have not left it.
+    active: AtomicUsize,
+    lock: Mutex<()>,
+    cv: Condvar,
+}
+
+impl Run {
+    /// The run of `chunks` ([start state, first packet, end]).
+    pub fn new(chunks: Vec<(Box<ChunkState>, u64, u64)>) -> Run {
+        let n = chunks.len();
+        Run {
+            chunks: chunks.into_iter().map(|(s, a, b)| (Mutex::new(Some(s)), a, b)).collect(),
+            next: AtomicUsize::new(0),
+            turn: AtomicUsize::new(0),
+            posted: AtomicUsize::new(0),
+            results: Mutex::new((0..n).map(|_| None).collect()),
+            cancelled: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
+            lock: Mutex::new(()),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn notify(&self) {
+        let _g = self.lock.lock();
+        self.cv.notify_all();
+    }
+
+    /// Waits until `ready` holds (spinning briefly first: the chunks of a run
+    /// are handed over within microseconds of each other); how long (ns).
+    fn wait_until(&self, ready: impl Fn() -> bool) -> u64 {
+        if ready() {
+            return 0;
+        }
+        let t = std::time::Instant::now();
+        let mut spins = 0;
+        while spins < 4096 && !ready() {
+            std::hint::spin_loop();
+            spins += 1;
+        }
+        if !ready() {
+            let mut g = self.lock.lock();
+            while !ready() {
+                self.cv.wait(&mut g);
+            }
+        }
+        t.elapsed().as_nanos() as u64
+    }
+
+    /// Chunk `i` may submit (the main command processor's work before it went
+    /// to the GPU).
+    pub fn grant(&self, i: usize) {
+        if self.turn.fetch_max(i + 1, Ordering::AcqRel) <= i {
+            self.notify();
+        }
+    }
+
+    /// Waits for chunk `i` to be posted: it and how long the wait took (ns).
+    pub fn collect(&self, i: usize) -> (Done, u64) {
+        let ns = self.wait_until(|| self.posted.load(Ordering::Acquire) > i);
+        WAIT_NS.fetch_add(ns, Ordering::Relaxed);
+        let d = self.results.lock()[i].take().expect("parallel chunk posted twice");
+        (d, ns)
+    }
+
+    /// Abandons the run: chunks not yet submitted are dropped by their
+    /// workers; returns once every worker left it.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify();
+        self.wait_until(|| self.active.load(Ordering::Acquire) == 0);
+    }
+
+    fn leave(&self) {
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.notify();
+        }
+    }
 }
 
 pub struct Worker {
     /// The worker's command processor (locked by the worker while it runs a
-    /// chunk, by the main command processor while it takes the results).
-    pub cp: Mutex<Cp>,
-    job: Mutex<Option<Job>>,
+    /// chunk).
+    cp: Mutex<Cp>,
+    /// The run to take chunks of.
+    job: Mutex<Option<Arc<Run>>>,
     cv: Condvar,
-    /// The finished chunk: where it stopped (None: it ran to its end).
-    done: Mutex<Option<Option<u64>>>,
-    /// Set once `done` holds the finished chunk (spun on without the lock).
-    finished: AtomicBool,
-    done_cv: Condvar,
 }
 
 /// Statistics: runs split, chunks handed to workers, chunks that stopped,
-/// commands per chunk..., main command processor's waits for workers (ns).
+/// commands per chunk..., main command processor's waits for workers (ns),
+/// workers' waits for their chunks' turns (ns).
 pub static RUNS: AtomicU64 = AtomicU64::new(0);
 pub static CHUNKS: AtomicU64 = AtomicU64::new(0);
 pub static STOPS: AtomicU64 = AtomicU64::new(0);
 pub static COMMANDS: AtomicU64 = AtomicU64::new(0);
 pub static WAIT_NS: AtomicU64 = AtomicU64::new(0);
+pub static TURN_NS: AtomicU64 = AtomicU64::new(0);
 pub static CANCELLED: AtomicU64 = AtomicU64::new(0);
 static STOP_WHY: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
 
@@ -142,7 +255,7 @@ impl Pool {
                 crate::warn!("gpu[{wname}]: no executor for a parallel worker ({e})");
                 return None;
             }
-            let w = Arc::new(Worker { cp: Mutex::new(cp), job: Mutex::new(None), cv: Condvar::new(), done: Mutex::new(None), finished: AtomicBool::new(false), done_cv: Condvar::new() });
+            let w = Arc::new(Worker { cp: Mutex::new(cp), job: Mutex::new(None), cv: Condvar::new() });
             let w2 = w.clone();
             let tname = wname.clone();
             let r = crate::thread::spawn_host(
@@ -152,7 +265,7 @@ impl Pool {
                     crate::log::set_thread_name(&tname);
                     crate::exception::arm_watch_current_thread(false);
                     super::profile_this_thread("par");
-                    run_worker(&w2);
+                    run_worker(&w2, &tname);
                 }),
             );
             if let Err(e) = r {
@@ -171,80 +284,87 @@ impl Default for Pool {
     }
 }
 
-fn run_worker(w: &Worker) {
+fn run_worker(w: &Worker, name: &str) {
     loop {
         super::prio::apply();
-        let job = {
+        let run = {
             let mut g = w.job.lock();
             loop {
-                if let Some(j) = g.take() {
-                    break j;
+                if let Some(r) = g.take() {
+                    break r;
                 }
                 w.cv.wait(&mut g);
             }
         };
-        let stopped = {
-            let mut cp = w.cp.lock();
-            cp.set_chunk_state(&job.state);
-            cp.chunk_start();
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cp.run_chunk(job.from, job.to))).unwrap_or(Some(job.from));
-            cp.chunk_finish();
-            r
+        take_chunks(w, &run, name);
+        run.leave();
+    }
+}
+
+/// Records, submits and posts chunks of `run` until none is left or the run
+/// is cancelled.
+fn take_chunks(w: &Worker, run: &Run, name: &str) {
+    loop {
+        if run.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let i = run.next.fetch_add(1, Ordering::AcqRel);
+        let Some((state, from, to)) = run.chunks.get(i) else { return };
+        let Some(state) = state.lock().take() else { return };
+        let (from, to) = (*from, *to);
+        let mut cp = w.cp.lock();
+        cp.set_chunk_state(&state);
+        cp.chunk_start();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cp.run_chunk(from, to)));
+        let failed = r.is_err();
+        let stopped = r.unwrap_or(Some(from));
+        cp.chunk_finish();
+        let ready = || run.turn.load(Ordering::Acquire) > i || run.cancelled.load(Ordering::Acquire);
+        if !ready() {
+            let tl = super::timeline::mark();
+            TURN_NS.fetch_add(run.wait_until(ready), Ordering::Relaxed);
+            super::timeline::end(name, tl, || "wait: chunk turn".into());
+        }
+        let granted = run.turn.load(Ordering::Acquire) > i;
+        if !granted || failed {
+            // Cancelled before its turn, or failed (the main command
+            // processor executes it from its start): never submitted.
+            cp.worker_discard();
+        }
+        if !granted {
+            return;
+        }
+        let done = if failed {
+            Done { stopped, state: *state, last: None, why: "failed" }
+        } else {
+            let last = cp.worker_submit();
+            let why = if stopped.is_some() { cp.worker_stop_why() } else { "" };
+            Done { stopped, state: cp.chunk_state(), last, why }
         };
-        *w.done.lock() = Some(stopped);
-        w.finished.store(true, Ordering::Release);
-        w.done_cv.notify_all();
+        drop(cp);
+        run.results.lock()[i] = Some(done);
+        run.posted.store(i + 1, Ordering::Release);
+        if stopped.is_none() {
+            // The next chunk follows this one's end directly.
+            run.turn.fetch_max(i + 2, Ordering::AcqRel);
+        }
+        run.notify();
     }
 }
 
 impl Worker {
-    /// Starts the chunk [from, to) from `state`.
-    pub fn start(&self, state: Box<ChunkState>, from: u64, to: u64) {
-        *self.done.lock() = None;
-        self.finished.store(false, Ordering::Release);
-        *self.job.lock() = Some(Job { state, from, to });
+    /// Takes chunks of `run` (`Run::active` counts it).
+    pub fn start(&self, run: Arc<Run>) {
+        run.active.fetch_add(1, Ordering::AcqRel);
+        *self.job.lock() = Some(run);
         self.cv.notify_all();
-    }
-
-    /// Waits for the chunk: where it stopped (None: it ran to its end), and
-    /// how long it waited (ns).
-    pub fn wait(&self) -> (Option<u64>, u64) {
-        let t = std::time::Instant::now();
-        let mut g = self.done.lock();
-        // A chunk usually ends within microseconds of the main command
-        // processor's own; spin a little before blocking.
-        if g.is_none() {
-            drop(g);
-            let mut spins = 0;
-            if super::tune::lean_cmd() {
-                // The flag, not the lock the worker takes to post its result
-                // (2.6% of the main command processor's busy samples went to
-                // this loop's locking, run 20261012-213847).
-                while spins < 4096 && !self.finished.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
-                    spins += 1;
-                }
-            } else {
-                while spins < 4096 && self.done.lock().is_none() {
-                    std::hint::spin_loop();
-                    spins += 1;
-                }
-            }
-            g = self.done.lock();
-        }
-        while g.is_none() {
-            self.done_cv.wait(&mut g);
-        }
-        let ns = t.elapsed().as_nanos() as u64;
-        WAIT_NS.fetch_add(ns, Ordering::Relaxed);
-        (g.take().unwrap(), ns)
     }
 }
 
 /// Clears the statistics (`profile reset`: the status line and the profile
 /// report then cover the window).
 pub fn reset_stats() {
-    for c in [&RUNS, &CHUNKS, &STOPS, &COMMANDS, &WAIT_NS, &CANCELLED] {
+    for c in [&RUNS, &CHUNKS, &STOPS, &COMMANDS, &WAIT_NS, &TURN_NS, &CANCELLED] {
         c.store(0, Ordering::Relaxed);
     }
     STOP_WHY.lock().clear();
@@ -276,14 +396,17 @@ pub fn status() -> String {
     why.sort_by(|a, b| b.1.cmp(&a.1));
     let why: Vec<String> = why.iter().map(|(w, n)| format!("{w} {n}")).collect();
     format!(
-        "    parallel runs: {runs} runs, {} chunks to workers ({} commands), {} stopped early ({}), {} cancelled; main waited {} ms for workers (its chunk {:.2}x a worker's); runs seen by length (runs/commands) {}; by end {}\n",
+        "    parallel runs: {runs} runs, {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled; main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added); runs seen by length (runs/commands) {}; by end {}\n",
         CHUNKS.load(Ordering::Relaxed),
         COMMANDS.load(Ordering::Relaxed),
+        split(),
         STOPS.load(Ordering::Relaxed),
         why.join(", "),
         CANCELLED.load(Ordering::Relaxed),
         WAIT_NS.load(Ordering::Relaxed) / 1_000_000,
         main_weight(),
+        TURN_NS.load(Ordering::Relaxed) / 1_000_000,
+        super::exec::WORKER_SLOTS.load(Ordering::Relaxed),
         lens.join(", "),
         ends.join(", ")
     )

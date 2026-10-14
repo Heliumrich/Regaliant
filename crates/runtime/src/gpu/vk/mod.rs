@@ -14,6 +14,8 @@ pub struct Ctx {
     pub pdev: vk::PhysicalDevice,
     pub device: ash::Device,
     pub queue: Mutex<vk::Queue>,
+    /// A second queue of the main family (`tune alt_queue`), if it has one.
+    pub queue2: Option<Mutex<vk::Queue>>,
     pub queue_family: u32,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
     pub limits: vk::PhysicalDeviceLimits,
@@ -169,6 +171,9 @@ fn init_inner() -> Result<(), String> {
         let (pdev, qf, props) = chosen.ok_or("no Vulkan device with graphics+compute")?;
         let device_name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy().into_owned();
         let prio = [1.0f32];
+        // Two queues of the main family when it has them (`tune alt_queue`).
+        let prio2 = [1.0f32, 1.0];
+        let main_queues = if instance.get_physical_device_queue_family_properties(pdev)[qf as usize].queue_count >= 2 { 2 } else { 1 };
         // A transfer-only family for the copy queue (`DS_COPY_QUEUE=0`: none).
         let copy_family = if std::env::var("DS_COPY_QUEUE").ok().as_deref() != Some("0") {
             instance
@@ -180,7 +185,7 @@ fn init_inner() -> Result<(), String> {
             None
         };
         let qci_all = [
-            vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio),
+            vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio2[..main_queues]),
             vk::DeviceQueueCreateInfo::default().queue_family_index(copy_family.unwrap_or(qf)).queue_priorities(&prio),
         ];
         let qci = if copy_family.is_some() { &qci_all[..] } else { &qci_all[..1] };
@@ -360,6 +365,7 @@ fn init_inner() -> Result<(), String> {
             r2_supported.null_descriptor != 0
         );
         let queue = device.get_device_queue(qf, 0);
+        let queue2 = (main_queues == 2).then(|| Mutex::new(device.get_device_queue(qf, 1)));
         let copy = copy_family.and_then(|f| {
             let mut tci = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
             let copied = device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tci), None).ok()?;
@@ -407,6 +413,7 @@ fn init_inner() -> Result<(), String> {
             pdev,
             device,
             queue: Mutex::new(queue),
+            queue2,
             queue_family: qf,
             mem_props,
             limits: props.limits,
@@ -819,11 +826,21 @@ impl Ctx {
     /// timeline semaphore waits (semaphore, value, stages that wait) and
     /// signals (semaphore, value).
     pub fn submit_timeline(&self, on_copy: bool, cmds: &[vk::CommandBuffer], waits: &[(vk::Semaphore, u64, vk::PipelineStageFlags2)], signals: &[(vk::Semaphore, u64)], fence: vk::Fence) -> Result<(), String> {
+        self.submit_timeline_on(on_copy, false, cmds, waits, signals, fence)
+    }
+
+    /// `submit_timeline`, on the main family's second queue when `alt` and
+    /// there is one (`tune alt_queue`).
+    pub fn submit_timeline_on(&self, on_copy: bool, alt: bool, cmds: &[vk::CommandBuffer], waits: &[(vk::Semaphore, u64, vk::PipelineStageFlags2)], signals: &[(vk::Semaphore, u64)], fence: vk::Fence) -> Result<(), String> {
         let cbs: Vec<vk::CommandBufferSubmitInfo> = cmds.iter().map(|&c| vk::CommandBufferSubmitInfo::default().command_buffer(c)).collect();
         let ws: Vec<vk::SemaphoreSubmitInfo> = waits.iter().map(|&(s, v, st)| vk::SemaphoreSubmitInfo::default().semaphore(s).value(v).stage_mask(st)).collect();
         let ss: Vec<vk::SemaphoreSubmitInfo> = signals.iter().map(|&(s, v)| vk::SemaphoreSubmitInfo::default().semaphore(s).value(v).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)).collect();
         let si = vk::SubmitInfo2::default().command_buffer_infos(&cbs).wait_semaphore_infos(&ws).signal_semaphore_infos(&ss);
-        let q = if on_copy { self.copy.as_ref().ok_or("no copy queue")?.queue.lock() } else { self.queue.lock() };
+        let q = match (&self.queue2, on_copy) {
+            (_, true) => self.copy.as_ref().ok_or("no copy queue")?.queue.lock(),
+            (Some(q2), false) if alt => q2.lock(),
+            _ => self.queue.lock(),
+        };
         unsafe { self.device.queue_submit2(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit2: {e}"))
     }
 

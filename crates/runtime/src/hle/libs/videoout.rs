@@ -112,6 +112,7 @@ fn vblank_thread() {
                     show = p.buffers[f.index as usize];
                 }
                 crate::gpu::FRAMES.store(p.count, std::sync::atomic::Ordering::Relaxed);
+                crate::gpu::pacing::note_flip(p.count as u64, p.vblank_time);
                 flipped = Some(p.count);
                 FLIP_CV.notify_all();
             }

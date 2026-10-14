@@ -448,7 +448,9 @@ impl Exec {
     pub(super) fn end_rendering(&mut self) {
         if self.rendering.take().is_some() {
             unsafe { ctx().device.cmd_end_rendering(self.cmd()) };
-            global_barrier(self.cmd());
+            if super::super::tune::skip_barriers() & 1 == 0 {
+                self.barrier();
+            }
             self.barrier_wanted = false;
             self.dispatched = false;
         }
