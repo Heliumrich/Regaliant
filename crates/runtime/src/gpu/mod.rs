@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 87] = [
+    static ALL: [Tunable; 88] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -114,6 +114,7 @@ pub mod tune {
         Tunable { name: "label_early", env: "DS_LABEL_EARLY", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_events", env: "DS_PAR_EVENTS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_min_compute", env: "DS_PAR_MIN_COMPUTE", default: 192, value: AtomicU64::new(UNSET) },
+        Tunable { name: "chain_memo", env: "DS_CHAIN_MEMO", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -906,6 +907,13 @@ pub mod tune {
     #[inline]
     pub fn par_min_compute() -> u64 {
         get(86)
+    }
+
+    /// Stage preparations resolve each of their plan's distinct pointer
+    /// chains once (`Plan::chain_ids`; 0: looked up by hash per use).
+    #[inline]
+    pub fn chain_memo() -> bool {
+        get(87) != 0
     }
 
     /// A switch's value by name; None if unknown.

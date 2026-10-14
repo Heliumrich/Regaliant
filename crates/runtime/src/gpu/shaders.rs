@@ -279,6 +279,11 @@ pub struct Reader<'a> {
     ptrs: Vec<(&'a Ptr, u64, u64)>,
     /// Address of the program (program-relative pointers).
     code_base: u64,
+    /// Pointers resolved so far by the plan's chain number
+    /// (`Plan::chain_ids`): loads and resources naming equal chains find
+    /// them without hashing or comparing chains (`ptr_hash` was 7.8% of the
+    /// compute queues' busy samples, run 20261014-145828).
+    chain_vals: Vec<Option<u64>>,
 }
 
 impl<'a> Reader<'a> {
@@ -297,7 +302,25 @@ impl<'a> Reader<'a> {
             next_span: 0,
             ptrs: Vec::with_capacity(sizes[2] as usize),
             code_base,
+            chain_vals: Vec::new(),
         }
+    }
+
+    /// `ptr` of the chain numbered `id` in its plan (u32::MAX: unnumbered).
+    fn chain(&mut self, id: u32, p: &'a Ptr, user: &[u32]) -> Option<u64> {
+        if id == u32::MAX || !super::tune::chain_memo() {
+            return self.ptr(p, user);
+        }
+        let i = id as usize;
+        if let Some(Some(v)) = self.chain_vals.get(i) {
+            return Some(*v);
+        }
+        let v = self.ptr(p, user)?;
+        if self.chain_vals.len() <= i {
+            self.chain_vals.resize(i + 1, None);
+        }
+        self.chain_vals[i] = Some(v);
+        Some(v)
     }
 
     /// Whether guest memory [addr, addr + n) is readable: within a recent
@@ -1634,7 +1657,7 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     for (i, res) in plan.resources.iter().enumerate() {
         let mut w = [0u32; 8];
         let src = match res.dwords.first() {
-            Some(Prov::Mem(ptr, off)) => rd.ptr(ptr, user).map(|b| b + *off as u64),
+            Some(Prov::Mem(ptr, off)) => rd.chain(plan.chain_ids.get(plan.loads.len() + i).copied().unwrap_or(u32::MAX), ptr, user).map(|b| b + *off as u64),
             _ => None,
         };
         res_addrs.push(src);
@@ -1820,7 +1843,7 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     sgpr_data.resize(translate::SGPR_DATA_USER as usize, 0);
     let mut data_loads = Vec::with_capacity(tr.plan.load_data.iter().filter(|&&d| d).count());
     for (j, l) in tr.plan.loads.iter().enumerate() {
-        let base = rd.ptr(&l.ptr, user);
+        let base = rd.chain(tr.plan.chain_ids.get(j).copied().unwrap_or(u32::MAX), &l.ptr, user);
         let start = sgpr_data.len();
         sgpr_data.resize(start + l.dwords as usize, 0);
         let Some(b) = base else { continue };

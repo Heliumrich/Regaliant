@@ -122,9 +122,42 @@ pub struct Plan {
     /// shader by another route than the CPU reading them (the runtime copies
     /// them on the GPU when GPU work is still writing them).
     pub load_data: Vec<bool>,
+    /// Per entry of `loads`, then per entry of `resources` (the pointer of
+    /// its first dword when that is loaded from memory): the number of its
+    /// pointer chain among the plan's structurally distinct `Ptr::Mem`
+    /// chains (u32::MAX: none), so that a preparation resolves each distinct
+    /// chain once; `chain_count` of them. Empty for a plan not numbered.
+    pub chain_ids: Vec<u32>,
+    pub chain_count: u32,
 }
 
 impl Plan {
+    /// Numbers the pointer chains of the loads and resources (`chain_ids`).
+    fn number_chains(&mut self) {
+        let mut ids: HashMap<Ptr, u32> = HashMap::default();
+        let mut id_of = |p: &Ptr| -> u32 {
+            match p {
+                Ptr::Mem(..) => {
+                    let n = ids.len() as u32;
+                    *ids.entry(p.clone()).or_insert(n)
+                }
+                _ => u32::MAX,
+            }
+        };
+        let mut v = Vec::with_capacity(self.loads.len() + self.resources.len());
+        for l in &self.loads {
+            v.push(id_of(&l.ptr));
+        }
+        for r in &self.resources {
+            v.push(match r.dwords.first() {
+                Some(Prov::Mem(p, _)) => id_of(p),
+                _ => u32::MAX,
+            });
+        }
+        self.chain_count = ids.len() as u32;
+        self.chain_ids = v;
+    }
+
     fn resource(&mut self, r: Resource) -> usize {
         if let Some(i) = self.resources.iter().position(|x| x.kind == r.kind && x.dwords == r.dwords && x.table == r.table) {
             let x = &mut self.resources[i];
@@ -217,6 +250,7 @@ pub fn analyze(code: &[Inst], user_sgprs: u16, user_base: u16) -> Plan {
 pub fn analyze_opts(code: &[Inst], user_sgprs: u16, user_base: u16, gpu_data_loads: bool) -> Plan {
     let with_data = |mut p: Plan| {
         p.load_data = data_only_loads(&p);
+        p.number_chains();
         p
     };
     let plan = run(code, user_sgprs, user_base, &HashSet::new());
