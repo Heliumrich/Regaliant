@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 95] = [
+    static ALL: [Tunable; 94] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -121,7 +121,6 @@ pub mod tune {
         Tunable { name: "shadow_args", env: "DS_SHADOW_ARGS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ahead_queues", env: "DS_AHEAD_QUEUES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "copy_update", env: "DS_COPY_UPDATE", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "run_barrier", env: "DS_RUN_BARRIER", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -980,13 +979,6 @@ pub mod tune {
         get(93) >= 2
     }
 
-    /// A parallel run's chunk batches drop their leading full barriers but
-    /// the first's (its scope covers the later submissions): the chunks of a
-    /// synchronization-free run no longer wait for each other on the GPU.
-    #[inline]
-    pub fn run_barrier() -> bool {
-        get(94) != 0
-    }
 
     /// A switch's value by name; None if unknown.
     pub fn value(name: &str) -> Option<u64> {

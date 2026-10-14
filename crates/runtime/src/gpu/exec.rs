@@ -1865,6 +1865,8 @@ struct Batch {
     gpu_labels: Vec<(u64, u64, u8)>,
     /// Its other GPU operations (`ops_line`), named with a slow or lost batch.
     ops: [u64; OPS],
+    /// Its barrier segments' marks (`seg_stamps`).
+    segs: Vec<SegMark>,
 }
 
 unsafe impl Send for Batch {}
@@ -2500,7 +2502,7 @@ pub fn wait_done(seq: u64) {
 
 /// Queues a batch: `submit` runs (the vkQueueSubmit) under the queue lock so
 /// sequence order is submission order.
-fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, gpu_labels: Vec<(u64, u64, u8)>, ops: [u64; OPS], submit: impl FnOnce(u64) + Send + 'static) -> u64 {
+fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, gpu_labels: Vec<(u64, u64, u8)>, ops: [u64; OPS], segs: Vec<SegMark>, submit: impl FnOnce(u64) + Send + 'static) -> u64 {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         crate::thread::spawn_host("gpu-complete", 1 << 20, Box::new(completion_thread)).expect("gpu completion thread");
@@ -2520,7 +2522,7 @@ fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, ch
         submit(seq);
         note_submitted(seq);
     }
-    q.push_back(Batch { queries, seq, fence, actions, checks, shaders, submitted: std::time::Instant::now(), name: name.to_string(), gpu_labels, ops });
+    q.push_back(Batch { queries, seq, fence, actions, checks, shaders, submitted: std::time::Instant::now(), name: name.to_string(), gpu_labels, ops, segs });
     BATCHES_CV.notify_one();
     seq
 }
@@ -2604,7 +2606,7 @@ fn completion_thread() {
                 }
             }
             FLUSHES.fetch_add(1, Ordering::Relaxed);
-            collect_timestamps(b.queries, &b.shaders, &b.name, b.seq);
+            collect_timestamps(b.queries, &b.shaders, &b.name, b.seq, &b.segs, &b.ops);
             check_watchdog(&b.name, &b.shaders);
             let ms = b.submitted.elapsed().as_millis();
             if ms >= 250 {
@@ -2939,7 +2941,15 @@ fn profiling() -> bool {
 /// keeps only the batch ones): BOTTOM_OF_PIPE stamps around every draw and
 /// dispatch serialize the GPU, which inflates the time of small commands.
 pub(super) fn command_stamps() -> bool {
-    stamp_mode() != 0
+    matches!(stamp_mode(), 1 | 2)
+}
+
+/// `DS_PROFILE_GPU_STAMPS=seg`: no stamps around commands; a timestamp
+/// after every full barrier the executors record (the GPU drained there
+/// anyway), each segment's time split among the commands in it
+/// (`collect_segments`): GPU time by command without serializing them.
+pub(super) fn seg_stamps() -> bool {
+    profiling() && stamp_mode() == 3
 }
 
 /// 0: batch stamps only, 1: every command, 2 (`DS_PROFILE_GPU_STAMPS=big`):
@@ -2950,6 +2960,7 @@ fn stamp_mode() -> u8 {
     *MODE.get_or_init(|| match std::env::var("DS_PROFILE_GPU_STAMPS").ok().as_deref() {
         Some("0") => 0,
         Some("big") => 2,
+        Some("seg") => 3,
         _ => 1,
     })
 }
@@ -2958,10 +2969,134 @@ fn stamp_mode() -> u8 {
 /// vertices times instances; None: indirect, unknown) gets stamps.
 pub(super) fn stamp_worth(work: Option<u64>, big: u64) -> bool {
     match stamp_mode() {
-        0 => false,
         1 => true,
-        _ => work.is_none_or(|w| w >= big),
+        2 => work.is_none_or(|w| w >= big),
+        _ => false,
     }
+}
+
+/// A full barrier a batch recorded with a timestamp after it (`seg_stamps`):
+/// its query, and the batch's command count and operation counts then.
+#[derive(Clone, Copy)]
+struct SegMark {
+    query: u32,
+    cmds: u32,
+    ops: [u64; OPS],
+    /// Where the barrier was recorded.
+    site: &'static std::panic::Location<'static>,
+}
+
+/// GPU time by barrier segment (`seg_stamps`): per command key (a compute
+/// shader, or DRAW_KEY | pixel shader) [ns, commands]; segments without
+/// commands by what they recorded [ns, segments]; [ns in segments with
+/// commands, without, segments].
+static SEG_TIME: Mutex<Option<HashMap<u64, [u64; 2]>>> = Mutex::new(None);
+static SEG_EMPTY: Mutex<Option<HashMap<&'static str, [u64; 2]>>> = Mutex::new(None);
+static SEG_TOTAL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Segments between two barriers with nothing recorded between them, by the
+/// two barriers' sites (the batch's start counts as a site): [ns, segments].
+type SitePair = (&'static str, u32, &'static str, u32);
+static SEG_PAIRS: Mutex<Option<HashMap<SitePair, [u64; 2]>>> = Mutex::new(None);
+
+/// What a segment without commands recorded (its operation counts' change).
+fn seg_kind(a: &[u64; OPS], b: &[u64; OPS]) -> &'static str {
+    const KINDS: [(usize, &str); 7] = [
+        (OP_MERGES, "shadow merges"),
+        (OP_SHADOWS_IN, "shadow copies in"),
+        (OP_TIMESTAMPS, "timestamps"),
+        (OP_CP_WRITES, "CP writes"),
+        (OP_FILLS, "buffer fills"),
+        (OP_FAST_CLEARS, "fast clears"),
+        (OP_WRITE_BACK_BYTES, "home write-backs"),
+    ];
+    KINDS.iter().find(|&&(k, _)| b[k] > a[k]).map_or("barriers only", |&(_, n)| n)
+}
+
+/// Splits a completed batch's time among its barrier segments (`seg_stamps`).
+fn collect_segments(pool: vk::QueryPool, shaders: &[u64], segs: &[SegMark], ops_end: &[u64; OPS], be: [u64; 2]) {
+    let c = ctx();
+    let mut t = vec![0u64; segs.len()];
+    if !segs.is_empty() && unsafe { c.device.get_query_pool_results(pool, 0, &mut t, vk::QueryResultFlags::TYPE_64) }.is_err() {
+        return;
+    }
+    let period = c.limits.timestamp_period as f64;
+    // Boundaries in recording order: the batch's start, each mark, its end
+    // (kept monotonic: the start stamp follows the leading barrier's).
+    let start: (&'static str, u32) = ("batch start", 0);
+    let end: (&'static str, u32) = ("batch end", 0);
+    let mut bounds: Vec<(u64, usize, [u64; OPS], (&'static str, u32))> = Vec::with_capacity(segs.len() + 2);
+    bounds.push((be[0], 0, [0; OPS], start));
+    for (m, &v) in segs.iter().zip(&t) {
+        let last = bounds.last().map_or(0, |b| b.0);
+        let file = m.site.file().rsplit(['/', '\\']).next().unwrap_or("");
+        bounds.push((v.max(last), (m.cmds as usize).min(shaders.len()), m.ops, (file, m.site.line())));
+    }
+    let last = bounds.last().map_or(0, |b| b.0);
+    bounds.push((be[1].max(last), shaders.len(), *ops_end, end));
+    let mut gp = SEG_PAIRS.lock();
+    let mp = gp.get_or_insert_with(HashMap::new);
+    let mut g = SEG_TIME.lock();
+    let m = g.get_or_insert_with(HashMap::new);
+    let mut ge = SEG_EMPTY.lock();
+    let me = ge.get_or_insert_with(HashMap::new);
+    for w in bounds.windows(2) {
+        let d = ((w[1].0 - w[0].0) as f64 * period) as u64;
+        let (from, to) = (w[0].1, w[1].1.max(w[0].1));
+        let cmds = &shaders[from..to];
+        if cmds.is_empty() {
+            let kind = seg_kind(&w[0].2, &w[1].2);
+            let e = me.entry(kind).or_insert([0; 2]);
+            e[0] += d;
+            e[1] += 1;
+            if kind == "barriers only" {
+                let e = mp.entry((w[0].3 .0, w[0].3 .1, w[1].3 .0, w[1].3 .1)).or_insert([0; 2]);
+                e[0] += d;
+                e[1] += 1;
+            }
+            SEG_TOTAL[1].fetch_add(d, Ordering::Relaxed);
+        } else {
+            let each = d / cmds.len() as u64;
+            for &k in cmds {
+                let e = m.entry(k).or_insert([0; 2]);
+                e[0] += each;
+                e[1] += 1;
+            }
+            SEG_TOTAL[0].fetch_add(d, Ordering::Relaxed);
+        }
+        SEG_TOTAL[2].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The segment profile's lines (`seg_stamps`).
+fn seg_lines() -> String {
+    let t: Vec<u64> = SEG_TOTAL.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let mut s = format!(
+        "    gpu time by barrier segment (DS_PROFILE_GPU_STAMPS=seg): {} ms with commands, {} ms without, {} segments\n",
+        t[0] / 1_000_000,
+        t[1] / 1_000_000,
+        t[2]
+    );
+    if let Some(m) = SEG_TIME.lock().as_ref() {
+        let mut v: Vec<(&u64, &[u64; 2])> = m.iter().collect();
+        v.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
+        for (k, x) in v.iter().take(30) {
+            let what = if **k & DRAW_KEY != 0 { format!("draws {:#x}", **k & !DRAW_KEY) } else { format!("cs {:#x}", **k) };
+            s.push_str(&format!("      {what}: {} ms, {} commands, {:.1} us each\n", x[0] / 1_000_000, x[1], x[0] as f64 / x[1].max(1) as f64 / 1000.0));
+        }
+    }
+    if let Some(m) = SEG_EMPTY.lock().as_ref() {
+        let mut v: Vec<(&&str, &[u64; 2])> = m.iter().collect();
+        v.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
+        let parts: Vec<String> = v.iter().map(|(k, x)| format!("{k} {} ms ({} segments, {:.1} us each)", x[0] / 1_000_000, x[1], x[0] as f64 / x[1].max(1) as f64 / 1000.0)).collect();
+        s.push_str(&format!("      segments without commands: {}\n", parts.join(", ")));
+    }
+    if let Some(m) = SEG_PAIRS.lock().as_ref() {
+        let mut v: Vec<(&SitePair, &[u64; 2])> = m.iter().collect();
+        v.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
+        let parts: Vec<String> = v.iter().take(16).map(|((f0, l0, f1, l1), x)| format!("{f0}:{l0} -> {f1}:{l1} {} ms ({})", x[0] / 1_000_000, x[1])).collect();
+        s.push_str(&format!("      barrier-only segments by their barriers' sites: {}\n", parts.join(", ")));
+    }
+    s
 }
 
 /// Timestamps per timed dispatch (all BOTTOM_OF_PIPE): before the shadow
@@ -3334,7 +3469,7 @@ fn batch_contents(shaders: &[u64]) -> String {
 }
 
 /// Reads a completed batch's dispatch timestamps into SHADER_TIME.
-fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str, seq: u64) {
+fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str, seq: u64, segs: &[SegMark], ops: &[u64; OPS]) {
     if pool == vk::QueryPool::null() {
         return;
     }
@@ -3362,6 +3497,10 @@ fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str, seq: u6
             }
         }
         g.0 = g.0.max(be[1]);
+        drop(g);
+        if seg_stamps() {
+            collect_segments(pool, shaders, segs, ops, be);
+        }
     }
     let mut pre = [0u64; 2];
     if unsafe { c.device.get_query_pool_results(pool, STAMPS * MAX_TIMED + 2, &mut pre, vk::QueryResultFlags::TYPE_64) }.is_ok() {
@@ -3425,6 +3564,12 @@ pub fn reset_shader_profile() {
     *BARRIER_SITES.lock() = None;
     *CS_CPU.lock() = None;
     *SHADER_PLACEMENTS.lock() = None;
+    *SEG_TIME.lock() = None;
+    *SEG_EMPTY.lock() = None;
+    *SEG_PAIRS.lock() = None;
+    for c in &SEG_TOTAL {
+        c.store(0, Ordering::Relaxed);
+    }
     shaders::reset_repeats();
     *QUEUE_WAITS.lock() = None;
     {
@@ -3484,6 +3629,9 @@ pub fn shader_profile() -> String {
         GAP_NS.load(Ordering::Relaxed) / 1_000_000,
         PRE_NS.load(Ordering::Relaxed) / 1_000_000
     );
+    if seg_stamps() {
+        s.push_str(&seg_lines());
+    }
     s.push_str(&batch_by_lines());
     s.push_str(&begin_stats_line());
     {
@@ -3755,12 +3903,8 @@ pub struct Exec {
     /// `barrier` (None: more than `SINCE_MAX`): an indirect dispatch whose
     /// arguments none of them writes needs no barrier of its own.
     since_barrier: Option<Vec<(u64, u64)>>,
-    /// A deferred executor's next batch is the first a parallel run's
-    /// workers submit (`tune run_barrier`: it keeps the leading barriers that
-    /// order the run's chunks after the work before it), and whether the
-    /// batch being recorded is that one (its prologue keeps its barrier).
-    run_first: bool,
-    batch_run_first: bool,
+    /// The batch's barrier segments so far (`seg_stamps`).
+    segs: Vec<SegMark>,
 }
 
 unsafe impl Send for Exec {}
@@ -3782,6 +3926,8 @@ struct Closed {
     races: Vec<RaceCheck>,
     /// Checks of the buffer updates recorded in it (`forward::add_check`).
     forward_ids: Vec<u64>,
+    /// Its barrier segments' marks (`seg_stamps`).
+    segs: Vec<SegMark>,
 }
 
 /// Slot sequence of a batch closed but not yet submitted.
@@ -3919,8 +4065,7 @@ impl Exec {
                 batch_alt: false,
                 batch_alt_share: false,
                 since_barrier: Some(Vec::new()),
-                run_first: false,
-                batch_run_first: false,
+                segs: Vec::new(),
             })
         }
     }
@@ -4029,22 +4174,13 @@ impl Exec {
                 ctx().device.cmd_reset_query_pool(self.cmd(), qp, 0, STAMPS * MAX_TIMED + 2);
             }
         }
-        // A parallel run's chunks are ordered after the work before the run
-        // by the leading barriers of the first batch its workers submit (a
-        // barrier's second scope reaches every later submission to the
-        // queue), not after each other: the title left them unordered (`tune
-        // run_barrier`). A first chunk that stops or fails is executed by the
-        // main command processor in a batch of its own before the next
-        // chunk's turn.
-        self.batch_run_first = std::mem::take(&mut self.run_first);
-        if self.deferred && super::tune::run_barrier() && !self.batch_run_first {
-            match self.since_barrier.as_mut() {
-                Some(v) => v.clear(),
-                None => self.since_barrier = Some(Vec::new()),
-            }
-        } else {
-            self.barrier();
-        }
+        // Every batch follows all earlier ones: also a parallel run's chunks,
+        // which the title left unordered, as their shadows of a buffer they
+        // all write (the culls' appends) are copied in and merged back per
+        // batch (FINDINGS.md 2026-10-14 night).
+        self.ops = [0; OPS];
+        self.segs.clear();
+        self.barrier();
         self.barrier_wanted = false;
         self.dispatched = false;
         let qp = self.slots[self.cur].queries;
@@ -4162,7 +4298,7 @@ impl Exec {
                 crate::error!("gpu[{}]: CP effects in a parallel run (dropped)", self.name);
             }
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids) });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs) });
             self.slots[i].seq = PENDING;
             self.pending_promises.clear();
             self.pending_log.clear();
@@ -4179,7 +4315,7 @@ impl Exec {
         let gpu_labels = self.pending_promises.clone();
         note_copy_waits(xpre.is_some(), copy_wait);
         let alt = self.batch_alt;
-        let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, move |seq| {
+        let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, std::mem::take(&mut self.segs), move |seq| {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return;
             }
@@ -4944,7 +5080,7 @@ impl Exec {
             }
             Some(self.last_seq)
         } else if self.last_seq > done_seq() {
-            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), [0; OPS], |_| {});
+            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), [0; OPS], Vec::new(), |_| {});
             self.last_seq = seq;
             self.last_action_seq = seq;
             self.cpu_action_seq = seq;
@@ -5253,11 +5389,8 @@ impl Exec {
                     c.device.cmd_reset_query_pool(pre, qp, STAMPS * MAX_TIMED + 2, 2);
                 }
             }
-            // After all earlier submitted work (a parallel run's later chunks:
-            // after its first, see `begin_batch`).
-            if !(self.deferred && super::tune::run_barrier() && !self.batch_run_first) {
-                global_barrier(pre);
-            }
+            // After all earlier submitted work.
+            global_barrier(pre);
             if qp != vk::QueryPool::null() {
                 unsafe { c.device.cmd_write_timestamp(pre, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED + 2) };
             }
@@ -5475,6 +5608,8 @@ impl Exec {
         let cmd = self.cmd();
         let raw: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
         self.taint_resident(a, bytes);
+        // Counted before its barriers (`seg_stamps` names the segment by it).
+        self.ops[OP_CP_WRITES] += 1;
         if end_of_pipe && super::tune::eop_light() {
             // An end-of-pipe write (RELEASE_MEM): after the work before it,
             // which it does not hold later work back for (as on the console);
@@ -5511,7 +5646,6 @@ impl Exec {
             }
         }
         GPU_CP_WRITES.fetch_add(1, Ordering::Relaxed);
-        self.ops[OP_CP_WRITES] += 1;
         true
     }
 
@@ -5683,6 +5817,8 @@ impl Exec {
             c.device.cmd_push_constants(cmd, tp.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
             c.device.cmd_dispatch(cmd, 1, 1, 1);
         }
+        // Counted before its barrier (`seg_stamps` names the segment by it).
+        self.ops[OP_TIMESTAMPS] += 1;
         let ordered = super::tune::skip_barriers() & 8 == 0;
         if ordered {
             self.barrier();
@@ -5694,7 +5830,6 @@ impl Exec {
         if ordered {
             self.ordered_since(a, 8);
         }
-        self.ops[OP_TIMESTAMPS] += 1;
         if GPU_TIMESTAMPS.fetch_add(1, Ordering::Relaxed) < 8 {
             self.ts_check.push(a);
         }
@@ -5826,12 +5961,13 @@ impl Exec {
         if merge.is_some() && super::tune::shadow_share() && super::precache::enabled() {
             self.share_shadows(&flush);
         }
-        // Later work reads guest memory after the write-back.
+        // Later work reads guest memory after the write-back (counted
+        // before that barrier: `seg_stamps` names the segment by it).
+        self.ops[OP_MERGES] += flush.len() as u64;
         self.barrier();
         self.barrier_wanted = false;
         self.dispatched = false;
         MERGES.fetch_add(flush.len() as u64, Ordering::Relaxed);
-        self.ops[OP_MERGES] += flush.len() as u64;
         Ok(())
     }
 
@@ -6011,6 +6147,14 @@ impl Exec {
     #[track_caller]
     fn barrier(&mut self) {
         global_barrier(self.cmd());
+        if seg_stamps() {
+            let qp = self.slots[self.cur].queries;
+            let query = self.segs.len() as u32;
+            if qp != vk::QueryPool::null() && query < STAMPS * MAX_TIMED {
+                unsafe { ctx().device.cmd_write_timestamp(self.cmd(), vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, query) };
+                self.segs.push(SegMark { query, cmds: self.batch_shaders.len() as u32, ops: self.ops, site: std::panic::Location::caller() });
+            }
+        }
         self.barrier_wanted = false;
         self.dispatched = false;
         match self.since_barrier.as_mut() {
@@ -6133,11 +6277,6 @@ impl Exec {
         self.main_writes = w;
     }
 
-    /// The chunk this deferred executor records next is its run's first for
-    /// the workers (`run_first`).
-    pub fn set_run_first(&mut self, first: bool) {
-        self.run_first = first;
-    }
 
     /// Makes this a deferred executor (`gpu::par` workers).
     pub fn set_deferred(&mut self) {
@@ -6175,7 +6314,7 @@ impl Exec {
             let name = self.name.clone();
             let (pre, copy_wait) = (b.pre, b.copy_wait);
             note_copy_waits(false, copy_wait);
-            let seq = push_batch(fence, queries, Vec::new(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, move |seq| {
+            let seq = push_batch(fence, queries, Vec::new(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, move |seq| {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
                     return;
                 }
