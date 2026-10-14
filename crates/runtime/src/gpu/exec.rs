@@ -1377,7 +1377,23 @@ struct Bound {
     /// Where each buffer binding was placed (DS_PROFILE_GPU): (Placement,
     /// bound bytes, written).
     placements: Vec<(Placement, u64, bool)>,
+    /// Buffer bindings read where guest memory (or its video-memory home)
+    /// holds the data, with `tune race_checks`: (base, size, kind: 1
+    /// written, 2 data-only loads read on the GPU, 4 an unbounded pointer).
+    in_place: Vec<(u64, u64, u8)>,
 }
+
+/// Commands about to be recorded with an in-place buffer binding that GPU
+/// work of the same batch wrote since its last full barrier (`tune
+/// race_checks`): [read-only by draws, by dispatches, written by draws, by
+/// dispatches, draws in the same rendering instance after a title sync
+/// (its barrier waits for the next instance), commands after more writes
+/// than are tracked since a barrier, read-only data-only loads by
+/// dispatches, read-only unbounded pointers by dispatches].
+pub static UNORDERED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Unordered read-only bindings of dispatches by (shader, kind): count and
+/// an example (`tune race_checks`).
+static UNORDERED_BY: Mutex<Option<HashMap<(u64, u8), (u64, String)>>> = Mutex::new(None);
 
 /// How a binding uses guest memory that a video-memory home may hold.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2062,6 +2078,9 @@ static INFLIGHT: RangeLog = RangeLog::new();
 static CP_WRITES: RangeLog = RangeLog::new();
 /// CP reads that waited for another queue's batch (diagnostics).
 pub static FOREIGN_WAITS: AtomicU64 = AtomicU64::new(0);
+/// Reads by parallel workers of what the main command processor's batch,
+/// unsubmitted when the run was planned, writes (`tune par_main_writes`).
+pub static MAIN_WRITE_READS: AtomicU64 = AtomicU64::new(0);
 
 /// A deferred CP copy (performed with its batch's actions) reads `src`:
 /// later GPU work binding it (it may overwrite it) is submitted after the
@@ -2151,7 +2170,6 @@ fn read_only_descriptors(p: &Prepared, reads: &[(u64, u64)]) -> bool {
     })
 }
 
-/// Checks the speculations whose batch completed (completion thread).
 /// Read-only data a command's shaders read on the GPU, as guest memory held
 /// it when the command was recorded (`tune race_checks`): compared once the
 /// batch completed; a difference means the data changed while the batch was
@@ -2162,11 +2180,81 @@ struct RaceCheck {
     base: u64,
     words: Vec<u32>,
     flip: u64,
+    /// When recorded: 1 a deferred CP write pending (the batch is submitted
+    /// after it), 2 unfinished GPU work writing it, 4 a buffer binding (else
+    /// a data-only load); 16 << placement (0 in place, 1 VRAM mirror or
+    /// resident shadow, 2 batch-start copy, 3 video-memory home).
+    why: u8,
+    /// CPU-performed CP writes so far when recorded and when submitted
+    /// (`cp::CPW_SEQ`).
+    cpw: u64,
+    cpw_submit: u64,
 }
 
 static RACE_CHECKS: Mutex<Vec<RaceCheck>> = Mutex::new(Vec::new());
 /// [ranges checked, ranges changed].
 static RACE_STATS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// What changed a checked range (`check_races`); the first five are not
+/// explained by the order of the packet stream.
+const RACE_CAUSES: [&str; 9] = [
+    "a CP write the CPU performed after the command was recorded and before its batch was submitted",
+    "a CP write the CPU performed after the batch was submitted",
+    "a deferred CP write after an earlier batch, not pending when the command was recorded",
+    "GPU work of an earlier batch not in flight when the command was recorded",
+    "no CP or GPU write found (the title's CPU, or an untracked write)",
+    "a deferred CP write pending when recorded, or after this batch (expected)",
+    "GPU work of this or a later batch (expected)",
+    "GPU work in flight when recorded (expected)",
+    "unreadable",
+];
+static RACE_CAUSE_COUNTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// Per (cause, shader, why): count, an example range and change.
+static RACE_SUMMARY: Mutex<Option<HashMap<(usize, u64, u8), (u64, u64, u64, String)>>> = Mutex::new(None);
+
+/// GPU writes of submitted batches, by 4 KiB page (`tune race_checks`):
+/// (batch, start, bytes); ranges over 1 MiB in a list of their own.
+#[derive(Default)]
+struct GpuWriteLog {
+    pages: HashMap<u64, Vec<(u64, u64, u64)>>,
+    big: std::collections::VecDeque<(u64, u64, u64)>,
+}
+
+static RACE_GPU_WRITES: Mutex<Option<GpuWriteLog>> = Mutex::new(None);
+
+fn note_race_writes(seq: u64, writes: &super::ranges::Ranges) {
+    if writes.is_empty() {
+        return;
+    }
+    let mut g = RACE_GPU_WRITES.lock();
+    let l = g.get_or_insert_with(Default::default);
+    for (a, n) in writes.iter() {
+        if n > 1 << 20 {
+            if l.big.len() >= 4096 {
+                l.big.pop_front();
+            }
+            l.big.push_back((seq, a, n));
+            continue;
+        }
+        for p in a >> 12..=(a + n.max(1) - 1) >> 12 {
+            let v = l.pages.entry(p).or_default();
+            if v.len() >= 64 {
+                v.remove(0);
+            }
+            v.push((seq, a, n));
+        }
+    }
+}
+
+/// The latest batch whose GPU writes cover `addr`.
+fn race_gpu_writer(addr: u64) -> Option<u64> {
+    let g = RACE_GPU_WRITES.lock();
+    let l = g.as_ref()?;
+    let hit = |&&(_, a, n): &&(u64, u64, u64)| a <= addr && addr < a + n;
+    let p = l.pages.get(&(addr >> 12)).and_then(|v| v.iter().filter(hit).map(|e| e.0).max());
+    let b = l.big.iter().filter(hit).map(|e| e.0).max();
+    p.max(b)
+}
 
 fn check_races(done: u64) {
     let due: Vec<RaceCheck> = {
@@ -2185,21 +2273,40 @@ fn check_races(done: u64) {
             continue;
         }
         let changed = (0..c.words.len()).find(|&j| unsafe { std::ptr::read_volatile((c.base + 4 * j as u64) as *const u32) } != c.words[j]);
-        if let Some(j) = changed {
-            let k = RACE_STATS[1].fetch_add(1, Ordering::Relaxed);
-            if k < 300 {
-                let now = unsafe { std::ptr::read_volatile((c.base + 4 * j as u64) as *const u32) };
-                let gpu = INFLIGHT.latest(&[(c.base, n)]).map_or("none in flight".to_string(), |s| format!("batch {s} writes it"));
-                crate::info!(
-                    "gpu: race check: shader {:#x} read {:#x}+{n:#x} on the GPU; dword {j} was {:#x} when recorded (flip {}), {now:#x} after batch {} completed (flip {}); GPU writers: {gpu}",
-                    c.shader,
-                    c.base,
-                    c.words[j],
-                    c.flip,
-                    c.seq,
-                    super::FRAMES.load(Ordering::Relaxed)
-                );
-            }
+        let Some(j) = changed else { continue };
+        RACE_STATS[1].fetch_add(1, Ordering::Relaxed);
+        let w = c.base + 4 * j as u64;
+        let now = unsafe { std::ptr::read_volatile(w as *const u32) };
+        let cpw = super::cp::cpw_since(w, c.cpw);
+        let gpu = race_gpu_writer(w);
+        let (cause, by) = match (&cpw, gpu) {
+            (Some((s, 0, q, at, op)), _) => (if *s <= c.cpw_submit { 0 } else { 1 }, format!("{q} opcode {op:#x} packet {at:#x}")),
+            (Some((_, after, q, at, op)), _) => (if *after >= c.seq || c.why & 1 != 0 { 5 } else { 2 }, format!("{q} opcode {op:#x} packet {at:#x} after batch {after}")),
+            (None, Some(s)) if s >= c.seq => (6, format!("batch {s}")),
+            (None, Some(s)) if c.why & 2 != 0 => (7, format!("batch {s}")),
+            (None, Some(s)) => (3, format!("batch {s}")),
+            (None, None) => (4, String::new()),
+        };
+        RACE_CAUSE_COUNTS[cause].fetch_add(1, Ordering::Relaxed);
+        let first = {
+            let mut g = RACE_SUMMARY.lock();
+            let m = g.get_or_insert_with(HashMap::new);
+            let e = m.entry((cause, c.shader, c.why)).or_insert_with(|| (0, c.base, n, format!("dword {j} {:#x} -> {now:#x} by {by}", c.words[j])));
+            e.0 += 1;
+            e.0 == 1
+        };
+        if cause < 5 && first {
+            crate::info!(
+                "gpu: race check: shader {:#x} read {:#x}+{n:#x} on the GPU (why {:#x}); dword {j} was {:#x} when recorded (flip {}), {now:#x} after batch {} completed (flip {}): {} ({by})",
+                c.shader,
+                c.base,
+                c.why,
+                c.words[j],
+                c.flip,
+                c.seq,
+                super::FRAMES.load(Ordering::Relaxed),
+                RACE_CAUSES[cause]
+            );
         }
     }
 }
@@ -2210,9 +2317,39 @@ pub fn race_line() -> String {
     if s[0] == 0 {
         return String::new();
     }
-    format!("    race checks: {} read-only ranges read on the GPU checked after their batch, {} changed meanwhile\n", s[0], s[1])
+    let mut out = format!("    race checks: {} read-only ranges read on the GPU checked after their batch, {} changed meanwhile:", s[0], s[1]);
+    for (k, name) in RACE_CAUSES.iter().enumerate() {
+        let n = RACE_CAUSE_COUNTS[k].load(Ordering::Relaxed);
+        if n > 0 {
+            out.push_str(&format!(" {n} {name};"));
+        }
+    }
+    out.push('\n');
+    let g = RACE_SUMMARY.lock();
+    if let Some(m) = g.as_ref() {
+        let mut v: Vec<_> = m.iter().filter(|(k, _)| k.0 < 5).collect();
+        v.sort_by_key(|(_, e)| std::cmp::Reverse(e.0));
+        for ((cause, shader, why), (count, base, n, ex)) in v.into_iter().take(24) {
+            out.push_str(&format!("      {count} x shader {shader:#x} (why {why:#x}) {base:#x}+{n:#x}: {ex}; {}\n", RACE_CAUSES[*cause]));
+        }
+    }
+    let u: Vec<u64> = UNORDERED.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    out.push_str(&format!(
+        "    unordered in-place bindings (written by this batch since its last barrier): read-only {} by draws, {} by dispatches ({} data-only loads, {} unbounded pointers); read and written {} by draws, {} by dispatches; draws after a title sync in the same rendering instance {}; commands after untracked writes {}\n",
+        u[0], u[1], u[6], u[7], u[2], u[3], u[4], u[5]
+    ));
+    let g = UNORDERED_BY.lock();
+    if let Some(m) = g.as_ref() {
+        let mut v: Vec<_> = m.iter().collect();
+        v.sort_by_key(|(_, e)| std::cmp::Reverse(e.0));
+        for ((sh, kind), (count, ex)) in v.into_iter().take(16) {
+            out.push_str(&format!("      {count} x cs {sh:#x} ({}): {ex}\n", match kind { 2 => "data-only loads", 4 => "unbounded pointer", _ => "buffer" }));
+        }
+    }
+    out
 }
 
+/// Checks the speculations whose batch completed (completion thread).
 fn check_speculations(done: u64) {
     if SPEC_PENDING.load(Ordering::Acquire) == 0 {
         return;
@@ -2387,9 +2524,11 @@ fn completion_thread() {
         let ta = std::time::Instant::now();
         let tl = if b.actions.is_empty() { None } else { super::timeline::mark() };
         let n = b.actions.len();
+        super::cp::set_after_batch(b.seq);
         for a in b.actions {
             a();
         }
+        super::cp::set_after_batch(0);
         super::timeline::end("gpu-complete", tl, || format!("{} CP effect(s) of {} #{}", n, b.name, b.seq));
         ACTION_NS.fetch_add(ta.elapsed().as_nanos() as u64, Ordering::Relaxed);
         for ch in b.checks.iter_mut() {
@@ -3442,6 +3581,9 @@ pub struct Exec {
     /// would need that stops the chunk (`stopped`) before the command
     /// records its own work.
     deferred: bool,
+    /// A worker's: what the main command processor's batch, not yet
+    /// submitted when the run was planned, writes (`tune par_main_writes`).
+    main_writes: Option<std::sync::Arc<super::ranges::Ranges>>,
     pub(crate) stopped: bool,
     /// Why (statistics), and the reason a caller gives a flush that follows.
     pub(crate) stop_why: &'static str,
@@ -3608,6 +3750,7 @@ impl Exec {
                 sync_readers: [0; 2],
                 sync_culprit: None,
                 deferred: false,
+                main_writes: None,
                 stopped: false,
                 stop_why: "",
                 flush_why: "",
@@ -3898,7 +4041,8 @@ impl Exec {
             SPEC_PENDING.store(g.len() as u64, Ordering::Release);
         }
         if !self.race_pending.is_empty() {
-            RACE_CHECKS.lock().extend(self.race_pending.drain(..).map(|c| RaceCheck { seq, ..c }));
+            let cpw_submit = super::cp::CPW_SEQ.load(Ordering::Acquire);
+            RACE_CHECKS.lock().extend(self.race_pending.drain(..).map(|c| RaceCheck { seq, cpw_submit, ..c }));
         }
         st.mark(6);
         // The batch's writes are noted before its labels are promised: a
@@ -3907,6 +4051,9 @@ impl Exec {
         let writes = std::mem::take(&mut self.pending);
         self.pending_log.clear();
         INFLIGHT.note_ranges(seq, &writes);
+        if super::tune::race_checks() {
+            note_race_writes(seq, &writes);
+        }
         st.mark(8);
         for (a, v, n) in std::mem::take(&mut self.pending_promises) {
             super::cp::promise(seq, a, v, n, false);
@@ -4338,6 +4485,7 @@ impl Exec {
         b.shadows.clear();
         b.write_src.clear();
         b.placements.clear();
+        b.in_place.clear();
         self.bound_pool.push(b);
     }
 
@@ -4951,6 +5099,18 @@ impl Exec {
     /// this queue's batch submitted, other queues' batches done): when it
     /// waited, since when.
     pub fn sync_for_reads(&mut self, reads: &[(u64, u64)]) -> Option<std::time::Instant> {
+        if let Some(m) = &self.main_writes {
+            if !m.is_empty() && m.overlaps_any(reads) {
+                if MAIN_WRITE_READS.fetch_add(1, Ordering::Relaxed) % 20000 == 0 {
+                    let hits: Vec<String> = reads.iter().flat_map(|&(a, n)| m.intersect(a, n).into_iter().take(3).map(move |(b, k)| format!("read {a:#x}+{n:#x} / written {b:#x}+{k:#x}"))).take(4).collect();
+                    crate::info!("gpu[{}]: a worker reads the main command processor's unsubmitted writes ({} ranges): {} (shaders {:#x} {:#x})", self.name, m.len(), hits.join("; "), self.sync_readers[0], self.sync_readers[1]);
+                }
+                if super::tune::par_main_writes() == 1 {
+                    self.stop("reads the main command processor's unsubmitted writes");
+                    return Some(std::time::Instant::now());
+                }
+            }
+        }
         let mut waited: Option<std::time::Instant> = None;
         let prof = profiling();
         let t0 = prof.then(std::time::Instant::now);
@@ -5131,6 +5291,10 @@ impl Exec {
             self.dispatched = false;
         }
         self.note_write(a, bytes);
+        if full {
+            // The barrier after it orders it before later work.
+            self.ordered_since(a, bytes);
+        }
         if let Some((v, n)) = label {
             self.pending_promises.push((a, v, n));
             UNSUBMITTED_LABELS.lock().get_or_insert_with(HashMap::new).insert(a & !7, self.submit_request.clone());
@@ -5232,13 +5396,17 @@ impl Exec {
             c.device.cmd_push_constants(cmd, tp.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
             c.device.cmd_dispatch(cmd, 1, 1, 1);
         }
-        if super::tune::skip_barriers() & 8 == 0 {
+        let ordered = super::tune::skip_barriers() & 8 == 0;
+        if ordered {
             self.barrier();
         }
         self.barrier_wanted = false;
         self.dispatched = false;
         self.taint_resident(a, 8);
         self.note_write(a, 8);
+        if ordered {
+            self.ordered_since(a, 8);
+        }
         self.ops[OP_TIMESTAMPS] += 1;
         if GPU_TIMESTAMPS.fetch_add(1, Ordering::Relaxed) < 8 {
             self.ts_check.push(a);
@@ -5560,7 +5728,7 @@ impl Exec {
     /// A GPU write of [a, a + n) recorded in this batch (`since_barrier`).
     fn note_since(&mut self, a: u64, n: u64) {
         if let Some(v) = self.since_barrier.as_mut() {
-            if v.len() < SINCE_MAX {
+            if v.len() < if super::tune::race_checks() { 4096 } else { SINCE_MAX } {
                 v.push((a, n));
             } else {
                 self.since_barrier = None;
@@ -5568,9 +5736,64 @@ impl Exec {
         }
     }
 
+    /// The write of [a, a + n) just noted precedes a full barrier.
+    fn ordered_since(&mut self, a: u64, n: u64) {
+        if let Some(v) = self.since_barrier.as_mut() {
+            if v.last() == Some(&(a, n)) {
+                v.pop();
+            }
+        }
+    }
+
     /// Whether this batch wrote into [a, a + n) since its last full barrier.
     fn written_since_barrier(&self, a: u64, n: u64) -> bool {
         self.since_barrier.as_ref().is_none_or(|v| v.iter().any(|&(w, m)| w < a + n && a < w + m))
+    }
+
+    /// Diagnosis (`tune race_checks`): counts the in-place bindings of the
+    /// command about to be recorded that this batch's GPU work wrote since
+    /// its last full barrier (`UNORDERED`; the first 60 read-only ones are
+    /// logged).
+    fn note_unordered(&self, bounds: &[Bound], shaders: &[u64], draw: bool) {
+        if self.since_barrier.is_none() {
+            UNORDERED[5].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        for (b, &sh) in bounds.iter().zip(shaders) {
+            for &(a, n, kind) in &b.in_place {
+                if !self.written_since_barrier(a, n) {
+                    continue;
+                }
+                let written = kind & 1 != 0;
+                let k = if written { 2 } else { 0 } + if draw { 0 } else { 1 };
+                UNORDERED[k].fetch_add(1, Ordering::Relaxed);
+                if written || draw {
+                    continue;
+                }
+                if kind & 2 != 0 {
+                    UNORDERED[6].fetch_add(1, Ordering::Relaxed);
+                } else if kind & 4 != 0 {
+                    UNORDERED[7].fetch_add(1, Ordering::Relaxed);
+                }
+                let mut g = UNORDERED_BY.lock();
+                let e = g.get_or_insert_with(HashMap::new).entry((sh, kind)).or_insert_with(|| {
+                    let w: Vec<String> = self.since_barrier.iter().flatten().filter(|&&(w, m)| w < a + n && a < w + m).take(4).map(|(w, m)| format!("{w:#x}+{m:#x}")).collect();
+                    (0, format!("binds {a:#x}+{n:#x}, written {} (last shaders {:x?}, {})", w.join(" "), &self.batch_shaders[self.batch_shaders.len().saturating_sub(3)..], self.name))
+                });
+                e.0 += 1;
+            }
+        }
+    }
+
+    /// What the batch being recorded writes (a parallel run's planning).
+    pub fn unsubmitted_writes(&self) -> super::ranges::Ranges {
+        if self.recording { self.pending.clone() } else { Default::default() }
+    }
+
+    /// A worker's chunk follows a main command processor's batch that
+    /// writes `w` and was not yet submitted when the run was planned.
+    pub fn set_main_writes(&mut self, w: Option<std::sync::Arc<super::ranges::Ranges>>) {
+        self.main_writes = w;
     }
 
     /// Makes this a deferred executor (`gpu::par` workers).
@@ -5622,10 +5845,14 @@ impl Exec {
             });
             self.slots[b.slot].seq = seq;
             if !b.races.is_empty() {
-                RACE_CHECKS.lock().extend(b.races.into_iter().map(|c| RaceCheck { seq, ..c }));
+                let cpw_submit = super::cp::CPW_SEQ.load(Ordering::Acquire);
+                RACE_CHECKS.lock().extend(b.races.into_iter().map(|c| RaceCheck { seq, cpw_submit, ..c }));
             }
             super::precache::submitted(&b.shared, seq);
             INFLIGHT.note_ranges(seq, &b.writes);
+            if super::tune::race_checks() {
+                note_race_writes(seq, &b.writes);
+            }
             super::precache::invalidate_ranges_except(&b.writes, &b.kept);
             self.inflight.insert_all(seq, &b.writes);
             self.own_gen += 1;
@@ -5722,10 +5949,6 @@ impl Exec {
                         } else {
                             self.snapshot(base, size, super::tune::snap_max())
                         };
-                        if read_only && snap.is_none() && size <= 4096 && size % 4 == 0 && super::tune::race_checks() && !self.pending.overlaps(base, size) && super::cp::guest_readable(base, size) {
-                            let words: Vec<u32> = (0..size / 4).map(|j| unsafe { std::ptr::read_volatile((base + 4 * j) as *const u32) }).collect();
-                            self.race_pending.push(RaceCheck { seq: 0, shader: p.addr, base, words, flip: super::FRAMES.load(Ordering::Relaxed) });
-                        }
                         // Read-only bindings of buffers GPU work wrote: VRAM mirrors.
                         let mirrored = if read_only && snap.is_none() && home.is_none() { resident.or_else(|| super::mirror::lookup(base, size)) } else { None };
                         // Other read-only buffers: a copy made at the batch's start
@@ -5733,6 +5956,15 @@ impl Exec {
                         let pre = if read_only && snap.is_none() && mirrored.is_none() && home.is_none() && (!allow_shadow || super::tune::pre_cs()) { self.pre_copy(base, size) } else { None };
                         if pre.is_some() {
                             placement = Placement::PreCopy;
+                        }
+                        // Diagnosis: ranges read when the batch executes.
+                        if read_only && (snap.is_none() || pre.is_some()) && size <= 4096 && size % 4 == 0 && super::tune::race_checks() && !self.pending.overlaps(base, size) && super::cp::guest_readable(base, size) {
+                            let r = [(base, size)];
+                            let mut why = if CP_WRITES.latest(&r).is_some() { 1 } else { 0 } | if INFLIGHT.latest(&r).is_some() { 2 } else { 0 } | if data_load { 0 } else { 4 };
+                            why |= 16 << if home.is_some() { 3 } else if pre.is_some() { 2 } else if mirrored.is_some() { 1 } else { 0 };
+                            let words: Vec<u32> = (0..size / 4).map(|j| unsafe { std::ptr::read_volatile((base + 4 * j) as *const u32) }).collect();
+                            let cpw = super::cp::CPW_SEQ.load(Ordering::Acquire);
+                            self.race_pending.push(RaceCheck { seq: 0, shader: p.addr, base, words, flip: super::FRAMES.load(Ordering::Relaxed), why, cpw, cpw_submit: 0 });
                         }
                         let snap = snap.or(pre);
                         let mut span = if size > 0 && mirrored.is_none() && snap.is_none() && home.is_none() { span(base, size) } else { None };
@@ -5746,6 +5978,11 @@ impl Exec {
                                     span = self::span(base, size);
                                 }
                             }
+                        }
+                        if super::tune::race_checks() && size > 0 && snap.is_none() && mirrored.is_none() && (home.is_some() || span.is_some()) {
+                            let unbounded = matches!(found.resources[i], Resolved::Global(_, None));
+                            let kind = if found.tr.plan.resources[i].written { 1 } else { 0 } | if data_load { 2 } else { 0 } | if unbounded { 4 } else { 0 };
+                            bound.in_place.push((base, size, kind));
                         }
                         if let Some((hbuf, hoff, avail)) = home {
                             placement = Placement::Home;
@@ -6277,6 +6514,9 @@ impl Exec {
             }
             self.barrier_wanted = false;
             self.dispatched = false;
+        }
+        if super::tune::race_checks() {
+            self.note_unordered(std::slice::from_ref(&bound), &[p.addr], false);
         }
         stamp(0);
         let fresh: Vec<Shadow> = bound.shadows.iter().filter(|s| !s.reused).copied().collect();

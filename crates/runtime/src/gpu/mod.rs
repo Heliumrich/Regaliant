@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 78] = [
+    static ALL: [Tunable; 79] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -105,6 +105,7 @@ pub mod tune {
         Tunable { name: "gpu_loads_sel", env: "DS_GPU_LOADS_SEL", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "race_checks", env: "DS_RACE_CHECKS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "data_snapshots", env: "DS_DATA_SNAPSHOTS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par_main_writes", env: "DS_PAR_MAIN_WRITES", default: 2, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -806,6 +807,17 @@ pub mod tune {
     #[inline]
     pub fn data_snapshots() -> bool {
         get(77) != 0
+    }
+
+    /// Parallel workers reading guest memory that the main command
+    /// processor's batch, not yet submitted when the run was planned,
+    /// writes (they cannot see it and read the previous contents): 0
+    /// counted only, 1 the chunk stops there (the main command processor
+    /// records the rest), 2 (default) that batch is submitted before the
+    /// workers start (they wait for it like for any submitted work).
+    #[inline]
+    pub fn par_main_writes() -> u64 {
+        get(78)
     }
 
     /// A switch's value by name; None if unknown.

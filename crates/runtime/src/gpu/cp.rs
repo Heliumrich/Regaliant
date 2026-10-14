@@ -416,6 +416,52 @@ fn label_writes(addr: u64) -> String {
 /// Equality waits passed because their counter had moved on (diagnostics).
 pub static COUNTER_PASSED: AtomicU64 = AtomicU64::new(0);
 
+/// CP memory writes the CPU performed, for the race checks (`tune
+/// race_checks`): a global order number and, per 8-byte granule, the last
+/// such write's (number, batch it ran after (0: performed on the CP's
+/// thread when the CP reached it), queue, packet, opcode).
+pub static CPW_SEQ: AtomicU64 = AtomicU64::new(0);
+type CpwEntry = (u64, u64, Arc<str>, u64, u32);
+static CPW_LOG: parking_lot::Mutex<Option<HashMap<u64, CpwEntry>>> = parking_lot::Mutex::new(None);
+
+thread_local! {
+    /// The batch whose deferred CP effects this thread is performing (the
+    /// completion thread; 0 elsewhere).
+    static AFTER_BATCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The completion thread performs batch `seq`'s CP effects (0: done).
+pub fn set_after_batch(seq: u64) {
+    AFTER_BATCH.with(|c| c.set(seq));
+}
+
+fn cpw_note(queue: &str, a: u64, n: u64, at: u64, opcode: u32) {
+    if !super::tune::race_checks() {
+        return;
+    }
+    let s = CPW_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+    let after = AFTER_BATCH.with(|c| c.get());
+    let q: Arc<str> = queue.into();
+    let mut g = CPW_LOG.lock();
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() > 1 << 21 {
+        m.clear();
+    }
+    let mut g8 = a & !7;
+    while g8 < a + n.min(1 << 16) {
+        m.insert(g8, (s, after, q.clone(), at, opcode));
+        g8 += 8;
+    }
+}
+
+/// The last CPU-performed CP write to the granule of `addr` with an order
+/// number above `after`: (number, batch it ran after, queue, packet, opcode).
+pub fn cpw_since(addr: u64, after: u64) -> Option<(u64, u64, String, u64, u32)> {
+    let g = CPW_LOG.lock();
+    let e = g.as_ref()?.get(&(addr & !7))?;
+    (e.0 > after).then(|| (e.0, e.1, e.2.to_string(), e.3, e.4))
+}
+
 fn note_write(queue: &str, addr: u64, value: u64, at: u64) {
     super::homes::cpu_written(addr, 8);
     if WAITED.lock().as_ref().is_some_and(|w| w.contains(&(addr & !7))) {
@@ -837,10 +883,11 @@ impl Cp {
         Ok(())
     }
 
-    pub fn chunk_start(&mut self) {
+    pub fn chunk_start(&mut self, main_writes: &Arc<super::ranges::Ranges>) {
         if let Some(e) = self.exec.as_mut() {
             e.stopped = false;
             e.stop_why = "";
+            e.set_main_writes(Some(main_writes.clone()));
         }
     }
 
@@ -1180,8 +1227,15 @@ impl Cp {
             return;
         }
         self.drop_ahead();
+        // What this queue's batch being recorded writes: the workers cannot
+        // wait for it (`tune par_main_writes`).
+        let mut main_writes = self.exec.as_ref().map(|e| e.unsubmitted_writes()).unwrap_or_default();
+        if super::tune::par_main_writes() == 2 && !main_writes.is_empty() {
+            self.submit_gpu("parallel run");
+            main_writes = Default::default();
+        }
         let queue = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
-        let run = Arc::new(super::par::Run::new(queue));
+        let run = Arc::new(super::par::Run::new(queue, Arc::new(main_writes)));
         for w in &workers {
             w.start(run.clone());
         }
@@ -1546,6 +1600,16 @@ impl Cp {
                 let why = if end_of_pipe { 0 } else if self.fence_pending { 1 } else { 2 };
                 DEFERRED_BY_OPCODE[k][why].fetch_add(1, Ordering::Relaxed);
                 self.fence_pending = false;
+                let f = match write {
+                    Some((a, n)) if super::tune::race_checks() => {
+                        let (q, at, op) = (self.name.clone(), self.cur_packet, self.cur_opcode);
+                        Box::new(move || {
+                            f();
+                            cpw_note(&q, a, n, at, op);
+                        }) as Box<dyn FnOnce() + Send>
+                    }
+                    _ => f,
+                };
                 e.after_gpu(f, write, !end_of_pipe)
             }
             _ => {
@@ -1553,6 +1617,9 @@ impl Cp {
                     self.fence_pending = false;
                 }
                 f();
+                if let Some((a, n)) = write {
+                    cpw_note(&self.name, a, n, self.cur_packet, self.cur_opcode);
+                }
                 None
             }
         }
@@ -2617,6 +2684,7 @@ impl Cp {
                 for i in 0..(bytes / 4).max(1) {
                     unsafe { wr32(if daic { dst } else { dst + 4 * i }, v) };
                 }
+                cpw_note(&self.name, dst, if daic { 4 } else { bytes }, self.cur_packet, self.cur_opcode);
             }
         }
     }

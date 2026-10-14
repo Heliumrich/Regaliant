@@ -939,6 +939,11 @@ impl Exec {
             }
             self.barrier_if_wanted(true);
             self.begin_rendering(colors, depth, area);
+        } else if super::super::tune::race_checks() && self.barrier_wanted {
+            super::UNORDERED[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if super::super::tune::race_checks() {
+            self.note_unordered(&bounds, &[vs.addr, ps_addr], true);
         }
         if let Some(r) = self.rendering.as_mut() {
             for t in r.colors.iter().flatten() {

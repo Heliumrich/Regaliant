@@ -109,11 +109,14 @@ pub struct Run {
     cv: Condvar,
     /// When the run was planned (the workers' start latency).
     born: std::time::Instant,
+    /// What the main command processor's batch, not submitted when the run
+    /// was planned, writes (`tune par_main_writes`).
+    main_writes: Arc<super::ranges::Ranges>,
 }
 
 impl Run {
     /// The run of `chunks` ([start state, first packet, end]).
-    pub fn new(chunks: Vec<(Box<ChunkState>, u64, u64)>) -> Run {
+    pub fn new(chunks: Vec<(Box<ChunkState>, u64, u64)>, main_writes: Arc<super::ranges::Ranges>) -> Run {
         let n = chunks.len();
         Run {
             chunks: chunks.into_iter().map(|(s, a, b)| (Mutex::new(Some(s)), a, b)).collect(),
@@ -126,6 +129,7 @@ impl Run {
             lock: Mutex::new(()),
             cv: Condvar::new(),
             born: std::time::Instant::now(),
+            main_writes,
         }
     }
 
@@ -343,7 +347,7 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         }
         let mut cp = w.cp.lock();
         cp.set_chunk_state(&state);
-        cp.chunk_start();
+        cp.chunk_start(&run.main_writes);
         lap(1, &mut t);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cp.run_chunk(from, to)));
         let failed = r.is_err();
@@ -433,13 +437,14 @@ pub fn status() -> String {
     why.sort_by(|a, b| b.1.cmp(&a.1));
     let why: Vec<String> = why.iter().map(|(w, n)| format!("{w} {n}")).collect();
     format!(
-        "    parallel runs: {runs} runs, {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled; main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}\n",
+        "    parallel runs: {runs} runs, {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled, {} worker reads of the main command processor's unsubmitted writes; main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}\n",
         CHUNKS.load(Ordering::Relaxed),
         COMMANDS.load(Ordering::Relaxed),
         split(),
         STOPS.load(Ordering::Relaxed),
         why.join(", "),
         CANCELLED.load(Ordering::Relaxed),
+        super::exec::MAIN_WRITE_READS.load(Ordering::Relaxed),
         WAIT_NS.load(Ordering::Relaxed) / 1_000_000,
         main_weight(),
         TURN_NS.load(Ordering::Relaxed) / 1_000_000,
