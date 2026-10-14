@@ -1459,7 +1459,8 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         _ => selected,
     };
     if gpu_loads && sel >> 32 >= 8 && GPU_LOADS_SELECTED.lock().get_or_insert_with(std::collections::HashSet::new).insert((sel, addr)) {
-        crate::info!("gpu_loads selection {sel:#x}: {:?} shader {addr:#x} (code hash {code_hash:#018x})", spec.stage);
+        let saved = super::capture::save_program(addr).map(|f| format!("; program saved to {}", f.display())).unwrap_or_default();
+        crate::info!("gpu_loads selection {sel:#x}: {:?} shader {addr:#x} (code hash {code_hash:#018x}){saved}", spec.stage);
     }
     let plan_key = code_hash ^ (spec.user_sgprs as u64) << 48 ^ (spec.user_base as u64) << 56 ^ (gpu_loads as u64) << 40;
     let cached = LOCAL_PLANS.with(|c| c.borrow().get(&plan_key).cloned()).or_else(|| {
