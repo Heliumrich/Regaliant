@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 81] = [
+    static ALL: [Tunable; 82] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -108,6 +108,7 @@ pub mod tune {
         Tunable { name: "par_main_writes", env: "DS_PAR_MAIN_WRITES", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "forward_copies", env: "DS_FORWARD_COPIES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "label_merge", env: "DS_LABEL_MERGE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "sync_cs", env: "DS_SYNC_CS_ON", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -855,6 +856,14 @@ pub mod tune {
     #[inline]
     pub fn label_merge() -> bool {
         get(80) != 0
+    }
+
+    /// Dispatches of the listed compute shaders (`exec::sync_cs`; by default
+    /// two load-time kernels) are completed right after they are recorded
+    /// (0: not; switchable while running).
+    #[inline]
+    pub fn sync_cs() -> bool {
+        get(81) != 0
     }
 
     /// A switch's value by name; None if unknown.

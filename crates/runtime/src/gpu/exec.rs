@@ -56,6 +56,27 @@ fn sync_mode() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("DS_GPU_SYNC").ok().as_deref() == Some("1"))
 }
+
+/// Compute shaders whose dispatches are completed on the GPU right after
+/// they are recorded (`tune sync_cs`), as the console runs them shortly
+/// after its command processor reaches them: the title rewrites their
+/// inputs soon after issuing them. By default two one-group kernels of
+/// the level loads (in the base shader pack of 01.007.000) that turn
+/// 52-byte records into a 1.5 MB buffer: run later, with inputs the title
+/// had rewritten, they left World 8-3 in a different, dark state until the
+/// next boot (6 of 10 boots with `forward_copies`, 0 of 4 completed at
+/// once; FINDINGS.md 2026-10-14). `DS_SYNC_CS=<hex address>[,...]` replaces
+/// the list (empty: none); `tune race_checks` finds such inputs (changes
+/// with no CP or GPU writer).
+fn sync_cs(addr: u64) -> bool {
+    const DEFAULT: [u64; 2] = [0x10_089c_a600, 0x10_089d_0b00];
+    static SET: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let s = SET.get_or_init(|| match std::env::var("DS_SYNC_CS") {
+        Ok(v) => v.split(',').filter_map(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).collect(),
+        Err(_) => DEFAULT.to_vec(),
+    });
+    !s.is_empty() && super::tune::sync_cs() && s.contains(&addr)
+}
 pub static SKIPPED: AtomicU64 = AtomicU64::new(0);
 pub static FLUSHES: AtomicU64 = AtomicU64::new(0);
 /// Completions waited for so the CP could read memory, by reason: CP reads
@@ -6465,7 +6486,7 @@ impl Exec {
                 SKIPPED.fetch_add(1, Ordering::Relaxed);
                 self.report(e);
             }
-        } else if sync_mode() {
+        } else if sync_mode() || (!self.deferred && sync_cs(cs_addr(cp))) {
             self.flush();
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 let cs = ((cp.reg(Space::Sh, 0x20C) as u64) | ((cp.reg(Space::Sh, 0x20D) as u64 & 0xFF) << 32)) << 8;
