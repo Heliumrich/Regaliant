@@ -1260,6 +1260,11 @@ fn record_copies(cmd: vk::CommandBuffer, copies: &mut Vec<(vk::Buffer, vk::Buffe
     if copies.is_empty() {
         return;
     }
+    if super::tune::skip_copies() & 4 != 0 {
+        // Diagnosis: batch-start copies left out (timing only).
+        copies.clear();
+        return;
+    }
     // The copies' destinations are distinct ranges of video memory and their
     // sources guest memory: any order is the same.
     copies.sort_unstable_by_key(|&(s, d, r)| (s, d, r.src_offset));
@@ -5928,7 +5933,9 @@ impl Exec {
         self.end_rendering_then_barrier();
         super::vk::checkpoint(self.cmd(), super::vk::mark::SHADOW_OUT, 0);
         let merge = if shadow_merge() { Some(merge_pipe()?) } else { None };
-        for sh in &flush {
+        // Diagnosis (`tune skip_copies 2`): the merges left out (timing only).
+        let flushing: &[Shadow] = if super::tune::skip_copies() & 2 != 0 { &[] } else { &flush };
+        for sh in flushing {
             let own = sh.size.min(sh.range - sh.bias);
             match merge {
                 Some(m) => {
@@ -7073,7 +7080,7 @@ impl Exec {
         let fresh: Vec<Shadow> = bound.shadows.iter().filter(|s| !s.reused).copied().collect();
         self.ops[OP_SHADOWS_IN] += fresh.len() as u64;
         self.ops[OP_SHADOW_BYTES] += fresh.iter().map(|s| s.range).sum::<u64>();
-        if !fresh.is_empty() {
+        if !fresh.is_empty() && super::tune::skip_copies() & 1 == 0 {
             super::vk::checkpoint(self.cmd(), super::vk::mark::SHADOW_IN, p.addr);
             // Shadows get the guest data first (earlier writes are ordered by
             // the title's synchronization, or the barrier after every

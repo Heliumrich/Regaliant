@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 94] = [
+    static ALL: [Tunable; 95] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -120,7 +120,8 @@ pub mod tune {
         Tunable { name: "cp_classes_acb", env: "DS_CP_CLASSES_ACB", default: 0x50, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_args", env: "DS_SHADOW_ARGS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ahead_queues", env: "DS_AHEAD_QUEUES", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "copy_update", env: "DS_COPY_UPDATE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "copy_update", env: "DS_COPY_UPDATE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "skip_copies", env: "DS_SKIP_COPIES", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -968,6 +969,9 @@ pub mod tune {
     /// command processor as a buffer update of the words it computed for it
     /// instead of a dispatch (no stage binding, SGPR data, descriptors or
     /// shader; the same place in the stream and the same lazy barriers).
+    /// Off: during loads the words computed when recording sometimes differ
+    /// from what the kernel leaves, and writing them broke meshes (World 4-2
+    /// in 3 of 8 boots of the PGO build, FINDINGS.md 2026-10-15).
     #[inline]
     pub fn copy_update() -> bool {
         get(93) != 0
@@ -979,6 +983,16 @@ pub mod tune {
     #[inline]
     pub fn copy_update_workers() -> bool {
         get(93) >= 2
+    }
+
+    /// Diagnosis (timing only, wrong results): copies between guest memory
+    /// and video memory left out, as if the data lived in video memory: 1
+    /// the copies into new shadows (use only with 2: the merges would store
+    /// garbage), 2 the merges of shadows back to guest memory (guest memory
+    /// keeps older values), 4 the batch-start copies (read-only data).
+    #[inline]
+    pub fn skip_copies() -> u64 {
+        get(94)
     }
 
 
