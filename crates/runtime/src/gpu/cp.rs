@@ -1053,11 +1053,14 @@ impl Cp {
         Ok(())
     }
 
-    pub fn chunk_start(&mut self, main_writes: &Arc<super::ranges::Ranges>) {
+    /// `first`: the run's first chunk for the workers (its first batch is
+    /// the first of theirs submitted; `tune run_barrier`).
+    pub fn chunk_start(&mut self, main_writes: &Arc<super::ranges::Ranges>, first: bool) {
         if let Some(e) = self.exec.as_mut() {
             e.stopped = false;
             e.stop_why = "";
             e.set_main_writes(Some(main_writes.clone()));
+            e.set_run_first(first);
         }
     }
 

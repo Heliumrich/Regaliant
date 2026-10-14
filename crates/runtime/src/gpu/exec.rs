@@ -3755,6 +3755,12 @@ pub struct Exec {
     /// `barrier` (None: more than `SINCE_MAX`): an indirect dispatch whose
     /// arguments none of them writes needs no barrier of its own.
     since_barrier: Option<Vec<(u64, u64)>>,
+    /// A deferred executor's next batch is the first a parallel run's
+    /// workers submit (`tune run_barrier`: it keeps the leading barriers that
+    /// order the run's chunks after the work before it), and whether the
+    /// batch being recorded is that one (its prologue keeps its barrier).
+    run_first: bool,
+    batch_run_first: bool,
 }
 
 unsafe impl Send for Exec {}
@@ -3911,6 +3917,8 @@ impl Exec {
                 batch_alt: false,
                 batch_alt_share: false,
                 since_barrier: Some(Vec::new()),
+                run_first: false,
+                batch_run_first: false,
             })
         }
     }
@@ -4019,7 +4027,22 @@ impl Exec {
                 ctx().device.cmd_reset_query_pool(self.cmd(), qp, 0, STAMPS * MAX_TIMED + 2);
             }
         }
-        self.barrier();
+        // A parallel run's chunks are ordered after the work before the run
+        // by the leading barriers of the first batch its workers submit (a
+        // barrier's second scope reaches every later submission to the
+        // queue), not after each other: the title left them unordered (`tune
+        // run_barrier`). A first chunk that stops or fails is executed by the
+        // main command processor in a batch of its own before the next
+        // chunk's turn.
+        self.batch_run_first = std::mem::take(&mut self.run_first);
+        if self.deferred && super::tune::run_barrier() && !self.batch_run_first {
+            match self.since_barrier.as_mut() {
+                Some(v) => v.clear(),
+                None => self.since_barrier = Some(Vec::new()),
+            }
+        } else {
+            self.barrier();
+        }
         self.barrier_wanted = false;
         self.dispatched = false;
         let qp = self.slots[self.cur].queries;
@@ -5228,8 +5251,11 @@ impl Exec {
                     c.device.cmd_reset_query_pool(pre, qp, STAMPS * MAX_TIMED + 2, 2);
                 }
             }
-            // After all earlier submitted work.
-            global_barrier(pre);
+            // After all earlier submitted work (a parallel run's later chunks:
+            // after its first, see `begin_batch`).
+            if !(self.deferred && super::tune::run_barrier() && !self.batch_run_first) {
+                global_barrier(pre);
+            }
             if qp != vk::QueryPool::null() {
                 unsafe { c.device.cmd_write_timestamp(pre, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED + 2) };
             }
@@ -6097,6 +6123,12 @@ impl Exec {
     /// writes `w` and was not yet submitted when the run was planned.
     pub fn set_main_writes(&mut self, w: Option<std::sync::Arc<super::ranges::Ranges>>) {
         self.main_writes = w;
+    }
+
+    /// The chunk this deferred executor records next is its run's first for
+    /// the workers (`run_first`).
+    pub fn set_run_first(&mut self, first: bool) {
+        self.run_first = first;
     }
 
     /// Makes this a deferred executor (`gpu::par` workers).

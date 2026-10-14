@@ -363,7 +363,7 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         }
         let mut cp = w.cp.lock();
         cp.set_chunk_state(&state);
-        cp.chunk_start(&run.main_writes);
+        cp.chunk_start(&run.main_writes, i == 0);
         lap(1, &mut t);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cp.run_chunk(from, to)));
         let failed = r.is_err();
