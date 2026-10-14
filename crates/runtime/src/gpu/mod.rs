@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 88] = [
+    static ALL: [Tunable; 89] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -110,11 +110,12 @@ pub mod tune {
         Tunable { name: "label_merge", env: "DS_LABEL_MERGE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "sync_cs", env: "DS_SYNC_CS_ON", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_compute", env: "DS_PAR_COMPUTE", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "par_min", env: "DS_PAR_MIN", default: 192, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par_min", env: "DS_PAR_MIN", default: 128, value: AtomicU64::new(UNSET) },
         Tunable { name: "label_early", env: "DS_LABEL_EARLY", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_events", env: "DS_PAR_EVENTS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_min_compute", env: "DS_PAR_MIN_COMPUTE", default: 192, value: AtomicU64::new(UNSET) },
         Tunable { name: "chain_memo", env: "DS_CHAIN_MEMO", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "wait_yields", env: "DS_WAIT_YIELDS", default: 800, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -914,6 +915,14 @@ pub mod tune {
     #[inline]
     pub fn chain_memo() -> bool {
         get(87) != 0
+    }
+
+    /// A command processor's polling wait (labels, REWIND) yields its
+    /// time slice this many times after 200 spins before it sleeps 100 us
+    /// between checks.
+    #[inline]
+    pub fn wait_yields() -> u64 {
+        get(88)
     }
 
     /// A switch's value by name; None if unknown.

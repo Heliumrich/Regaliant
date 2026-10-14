@@ -208,8 +208,9 @@ struct ParRun {
     sync: bool,
 }
 
-/// Commands per chunk at least (fewer when `tune par_min`, the commands a
-/// run needs to be split, is below 192), and at most per parallel run.
+/// Commands per chunk at least (a third of `tune par_min`, the commands a
+/// run needs to be split, when that is below 192), and at most per
+/// parallel run.
 const PAR_CHUNK_MIN: usize = 64;
 const PAR_MAX: usize = 8192;
 
@@ -3020,6 +3021,7 @@ impl Cp {
         let mut reported = false;
         set_state(&self.name, what.to_string());
         let mut spins = 0u32;
+        let yields = 200 + super::tune::wait_yields().min(100_000) as u32;
         while !cond() {
             if crate::gpu::shutting_down() {
                 return Flow::Stop;
@@ -3030,7 +3032,7 @@ impl Cp {
             spins += 1;
             if spins < 200 {
                 std::hint::spin_loop();
-            } else if spins < 1000 {
+            } else if spins < yields {
                 std::thread::yield_now();
             } else {
                 std::thread::sleep(Duration::from_micros(100));
