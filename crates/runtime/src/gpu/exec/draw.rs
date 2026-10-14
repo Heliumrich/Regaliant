@@ -279,7 +279,7 @@ fn scissor(cp: &Cp, area: (u32, u32)) -> (i32, i32, i32, i32) {
 }
 
 /// Pipeline state that is baked into a graphics pipeline.
-#[derive(Hash)]
+#[derive(Hash, Clone, Copy, PartialEq, Eq)]
 struct GfxKey {
     vs: u64,
     ps: u64,
@@ -290,6 +290,11 @@ struct GfxKey {
     depth: i32,
     topology_class: u8,
     depth_clamp: bool,
+}
+
+thread_local! {
+    /// The last graphics pipeline key this thread hashed, and its hash.
+    static LAST_GFX_KEY: std::cell::Cell<Option<(GfxKey, u64)>> = const { std::cell::Cell::new(None) };
 }
 
 fn set_layout_bindings(stages: &[(&Prepared, vk::ShaderStageFlags)]) -> Vec<vk::DescriptorSetLayoutBinding<'static>> {
@@ -752,10 +757,19 @@ impl Exec {
             Some(p) => super::push_fits(&[&vs, p]),
             None => super::push_fits(&[&vs]),
         };
+        // Consecutive draws mostly share their pipeline state: the key's
+        // hash (also the persistent cache file's name, so its hasher stays)
+        // is computed again only when the key changed on this thread.
         let hkey = {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            key.hash(&mut h);
-            super::push_key(h.finish(), push_mode)
+            let last = LAST_GFX_KEY.with(|c| c.get()).filter(|(k, _)| *k == key).map(|(_, h)| h);
+            let h = last.unwrap_or_else(|| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                key.hash(&mut h);
+                let h = h.finish();
+                LAST_GFX_KEY.with(|c| c.set(Some((key, h))));
+                h
+            });
+            super::push_key(h, push_mode)
         };
         let cached = gfx_pipe(hkey);
         let Pipe { pipeline, layout, set_layout, push } = match cached {

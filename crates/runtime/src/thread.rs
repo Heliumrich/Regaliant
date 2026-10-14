@@ -271,6 +271,40 @@ pub fn run_key_destructors(t: &'static GuestThread) {
 /// Creates a host thread whose whole stack is committed up front. PS4 code does
 /// not probe the stack, so lazily grown (guard-page) Windows stacks would fault
 /// when a large frame is touched below the guard page.
+/// Sleeps about `d` on a high-resolution waitable timer the calling thread
+/// keeps (std's `thread::sleep` creates and closes one per call: in the
+/// command processors' 100 us polling sleeps that was ~4.5% of the compute
+/// queues' busy samples in `ZwClose` alone, run 20261014-161648). Falls back
+/// to `thread::sleep` when the timer cannot be made.
+pub fn short_sleep(d: std::time::Duration) {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Threading::{CreateWaitableTimerExW, SetWaitableTimer, WaitForSingleObject, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, TIMER_ALL_ACCESS};
+    struct Timer(HANDLE);
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+    thread_local! {
+        static TIMER: Timer = Timer(unsafe { CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS) });
+    }
+    // Zero: yield as std's sleep does (Sleep(0)).
+    if d.is_zero() || !crate::gpu::tune::timer_sleep() {
+        std::thread::sleep(d);
+        return;
+    }
+    // Relative due time in 100 ns units (negative), at least one unit.
+    let due = -((d.as_nanos() / 100).clamp(1, i64::MAX as u128) as i64);
+    let slept = TIMER
+        .try_with(|t| !t.0.is_null() && unsafe { SetWaitableTimer(t.0, &due, 0, None, std::ptr::null(), 0) } != 0 && unsafe { WaitForSingleObject(t.0, INFINITE) } == 0)
+        .unwrap_or(false);
+    if !slept {
+        std::thread::sleep(d);
+    }
+}
+
 pub fn spawn_host(name: &str, stack_size: usize, f: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
     use windows_sys::Win32::System::Threading::{CreateThread, SetThreadDescription};
     unsafe extern "system" fn proc_(param: *mut std::ffi::c_void) -> u32 {

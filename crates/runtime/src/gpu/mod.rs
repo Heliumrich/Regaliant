@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 89] = [
+    static ALL: [Tunable; 90] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -116,6 +116,7 @@ pub mod tune {
         Tunable { name: "par_min_compute", env: "DS_PAR_MIN_COMPUTE", default: 192, value: AtomicU64::new(UNSET) },
         Tunable { name: "chain_memo", env: "DS_CHAIN_MEMO", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "wait_yields", env: "DS_WAIT_YIELDS", default: 800, value: AtomicU64::new(UNSET) },
+        Tunable { name: "timer_sleep", env: "DS_TIMER_SLEEP", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -923,6 +924,14 @@ pub mod tune {
     #[inline]
     pub fn wait_yields() -> u64 {
         get(88)
+    }
+
+    /// Short sleeps (polling waits, the title's usleep and nanosleep) on a
+    /// waitable timer each thread keeps (`thread::short_sleep`; 0: std's
+    /// sleep, which makes and closes a timer per call).
+    #[inline]
+    pub fn timer_sleep() -> bool {
+        get(89) != 0
     }
 
     /// A switch's value by name; None if unknown.

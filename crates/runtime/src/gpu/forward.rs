@@ -86,8 +86,8 @@ thread_local! {
     /// This thread reads guest memory for the graphics queue.
     static HERE: Cell<bool> = const { Cell::new(false) };
     /// This thread's copy of the entries: (generation, [(base, bytes,
-    /// copied words, old words)]).
-    static LOCAL: RefCell<(u64, Vec<LocalEntry>)> = const { RefCell::new((0, Vec::new())) };
+    /// copied words, old words)], the span [lo, hi) they lie in).
+    static LOCAL: RefCell<(u64, Vec<LocalEntry>, (u64, u64))> = const { RefCell::new((0, Vec::new(), (0, 0))) };
 }
 
 /// The calling thread records for the graphics queue (its command processor
@@ -104,16 +104,20 @@ pub fn active() -> bool {
 
 type LocalEntry = (u64, u64, Arc<[u32]>, Arc<[u32]>);
 
-fn with_local<R>(f: impl FnOnce(&[LocalEntry]) -> R) -> R {
+/// This thread's copy of the entries with the span they lie in (a read
+/// outside it overlaps none: the entries are destinations within the
+/// per-view block).
+fn with_local_span<R>(f: impl FnOnce(&[LocalEntry], (u64, u64)) -> R) -> R {
     let generation = GEN.load(Ordering::Acquire);
     LOCAL.with(|l| {
         let mut l = l.borrow_mut();
         if l.0 != generation {
             let g = ENTRIES.read();
             l.1 = g.iter().map(|e| (e.base, 4 * e.words.len() as u64, e.words.clone(), e.old.clone())).collect();
+            l.2 = l.1.iter().fold((u64::MAX, 0), |(lo, hi), e| (lo.min(e.0), hi.max(e.0 + e.1)));
             l.0 = generation;
         }
-        f(&l.1)
+        f(&l.1, l.2)
     })
 }
 
@@ -138,7 +142,10 @@ pub fn word_or(addr: u64, mem: u32) -> u32 {
     if !active() {
         return mem;
     }
-    let hit = with_local(|v| {
+    let hit = with_local_span(|v, (lo, hi)| {
+        if addr < lo || hi <= addr {
+            return None;
+        }
         v.iter().find(|e| e.0 <= addr && addr < e.0 + e.1).map(|e| {
             let k = ((addr - e.0) / 4) as usize;
             (e.0, e.2[k], e.3.get(k).copied())
@@ -166,7 +173,10 @@ pub fn overlay(addr: u64, out: &mut [u32]) {
     }
     let end = addr + 4 * out.len() as u64;
     let mut stale = Vec::new();
-    let n = with_local(|v| {
+    let n = with_local_span(|v, (lo, hi)| {
+        if end <= lo || hi <= addr {
+            return 0;
+        }
         let mut n = 0u64;
         for (base, bytes, words, old) in v {
             let (lo, hi) = (addr.max(*base), end.min(base + bytes));
@@ -203,8 +213,8 @@ pub fn uncovered(reads: &[(u64, u64)]) -> Option<Vec<(u64, u64)>> {
     if !active() {
         return None;
     }
-    with_local(|v| {
-        if !reads.iter().any(|&(a, n)| v.iter().any(|e| e.0 < a + n && a < e.0 + e.1)) {
+    with_local_span(|v, (lo, hi)| {
+        if !reads.iter().any(|&(a, n)| a < hi && lo < a + n && v.iter().any(|e| e.0 < a + n && a < e.0 + e.1)) {
             return None;
         }
         let mut out = Vec::with_capacity(reads.len());

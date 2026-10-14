@@ -82,7 +82,7 @@ pub fn sleep_us(us: u64) {
     if us == 0 {
         std::thread::yield_now();
     } else {
-        std::thread::sleep(Duration::from_micros(us));
+        crate::thread::short_sleep(Duration::from_micros(us));
     }
 }
 
@@ -160,7 +160,7 @@ sysv! {
     fn sceKernelSleep(s: u32) -> i32 { std::thread::sleep(Duration::from_secs(s as u64)); 0 }
     fn sceKernelNanosleep(req: *const i64, rem: *mut i64) -> i32 {
         if req.is_null() { return sce(EINVAL); }
-        std::thread::sleep(Duration::new((*req).max(0) as u64, (*req.add(1)).clamp(0, 999_999_999) as u32));
+        crate::thread::short_sleep(Duration::new((*req).max(0) as u64, (*req.add(1)).clamp(0, 999_999_999) as u32));
         if !rem.is_null() { *rem = 0; *rem.add(1) = 0; }
         0
     }
@@ -202,7 +202,7 @@ sysv! {
     }
     fn nanosleep(req: *const i64, rem: *mut i64) -> i32 {
         if req.is_null() { super::set_errno(EINVAL); return -1; }
-        std::thread::sleep(Duration::new((*req).max(0) as u64, (*req.add(1)).clamp(0, 999_999_999) as u32));
+        crate::thread::short_sleep(Duration::new((*req).max(0) as u64, (*req.add(1)).clamp(0, 999_999_999) as u32));
         if !rem.is_null() { *rem = 0; *rem.add(1) = 0; }
         0
     }

@@ -3035,7 +3035,7 @@ impl Cp {
             } else if spins < yields {
                 std::thread::yield_now();
             } else {
-                std::thread::sleep(Duration::from_micros(100));
+                crate::thread::short_sleep(Duration::from_micros(100));
             }
             if !reported && start.elapsed() > Duration::from_secs(3) {
                 reported = true;
