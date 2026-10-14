@@ -106,7 +106,7 @@ pub mod tune {
         Tunable { name: "race_checks", env: "DS_RACE_CHECKS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "data_snapshots", env: "DS_DATA_SNAPSHOTS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_main_writes", env: "DS_PAR_MAIN_WRITES", default: 2, value: AtomicU64::new(UNSET) },
-        Tunable { name: "forward_copies", env: "DS_FORWARD_COPIES", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "forward_copies", env: "DS_FORWARD_COPIES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "label_merge", env: "DS_LABEL_MERGE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "sync_cs", env: "DS_SYNC_CS_ON", default: 0, value: AtomicU64::new(UNSET) },
     ];
@@ -1538,6 +1538,7 @@ pub fn profile_report() -> String {
     s.push_str(&exec::race_line());
     s.push_str(&forward::status_line());
     s.push_str(&crate::hle::kernel::timeouts_line());
+    s.push_str(&cp::long_waits_line());
     s.push_str(&par::status());
     s.push_str(&images::memo_stats_line());
     s.push_str(&exec::pre_window_line());

@@ -348,7 +348,7 @@ impl<'a> Reader<'a> {
             _ => self.reads.push((addr, 4)),
         }
         // A copy recorded earlier leaves other words there (`gpu::forward`).
-        let w = super::forward::word(addr).unwrap_or_else(|| unsafe { std::ptr::read_volatile(addr as *const u32) });
+        let w = super::forward::word_or(addr, unsafe { std::ptr::read_volatile(addr as *const u32) });
         self.words.push(w);
         Some(w)
     }

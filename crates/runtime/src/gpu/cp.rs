@@ -621,7 +621,7 @@ static WAITED: parking_lot::Mutex<Option<HashSet<u64>>> = parking_lot::Mutex::ne
 /// it, its CP reads wait for unfinished writers (`Exec::sync_for_reads`), so
 /// the command processors record ahead of the GPU instead of idling until
 /// each batch completes. `DS_PROMISES=0` turns this off.
-static PROMISES: parking_lot::Mutex<Option<HashMap<u64, (u64, u64, u8, bool)>>> = parking_lot::Mutex::new(None);
+static PROMISES: parking_lot::Mutex<Option<HashMap<u64, (u64, u64, u8, bool, Instant)>>> = parking_lot::Mutex::new(None);
 /// Moves with every promise made: a polling wait looks at the promises
 /// again only then (one that did not satisfy it cannot start to; it can
 /// only go stale). Every poll took PROMISES' lock before: ~6% of the
@@ -650,7 +650,7 @@ pub(super) fn promise(seq: u64, addr: u64, value: u64, bytes: u8, by_cpu: bool) 
         let done = super::exec::completed_seq();
         m.retain(|_, p| p.0 > done);
     }
-    m.insert(addr, (seq, value, bytes, by_cpu));
+    m.insert(addr, (seq, value, bytes, by_cpu, Instant::now()));
     drop(g);
     PROMISE_GEN.fetch_add(1, Ordering::Release);
 }
@@ -659,7 +659,7 @@ pub(super) fn promise(seq: u64, addr: u64, value: u64, bytes: u8, by_cpu: bool) 
 /// whether the CPU performs that write.
 fn promised(addr: u64, wide: bool, func: u32, mask: u64, reference: u64) -> Option<(u64, bool)> {
     let g = PROMISES.lock();
-    let &(seq, value, bytes, by_cpu) = g.as_ref()?.get(&addr)?;
+    let &(seq, value, bytes, by_cpu, _) = g.as_ref()?.get(&addr)?;
     if seq <= super::exec::completed_seq() || (wide && bytes < 8) {
         return None;
     }
@@ -725,6 +725,8 @@ static WAIT_STATS: parking_lot::Mutex<Option<HashMap<(String, String), (u64, u64
 pub fn reset_wait_stats() {
     *WAIT_STATS.lock() = None;
     *EPOCH_WAITS.lock() = None;
+    *LONG_WAITS.lock() = None;
+    LONG_WAITS_LOGGED.store(0, Ordering::Relaxed);
 }
 
 /// Waits the CPU released (new copy-cache epochs, DS_PROFILE_GPU): (queue,
@@ -813,6 +815,76 @@ fn wait_stats_inner() -> String {
         s.push_str(&format!("      {w} <- {by}: {n}, {} ms, {} us\n", ns / 1_000_000, ns / 1000 / (*n).max(1)));
     }
     s
+}
+
+/// Blocking label waits of 1 ms or more by (waiter, last writer, label):
+/// [count, ns, ended in memory with no promise for the label, ended in
+/// memory with a promise for it (of a value that did not satisfy the wait or
+/// made after the wait ended), passed on a promise, latched]; the first 40
+/// are logged in detail (`long_wait`).
+static LONG_WAITS: parking_lot::Mutex<Option<HashMap<(String, String, u64), [u64; 6]>>> = parking_lot::Mutex::new(None);
+static LONG_WAITS_LOGGED: AtomicU64 = AtomicU64::new(0);
+
+/// A blocking wait on `a` that lasted `ns` and ended as `kind` (b'E': the
+/// value in memory, b'P': a promise, b'L': latched).
+#[allow(clippy::too_many_arguments)]
+fn long_wait(waiter: &str, a: u64, wide: bool, func: u32, mask: u64, reference: u64, at: u64, t0: Instant, kind: u8) {
+    let ns = t0.elapsed().as_nanos() as u64;
+    if ns < 1_000_000 {
+        return;
+    }
+    let (by, wv, wpk) = last_write(a).unwrap_or_else(|| ("cpu".into(), 0, 0));
+    let p = PROMISES.lock().as_ref().and_then(|m| m.get(&a).copied());
+    let slot = match (kind, p) {
+        (b'P', _) => 4,
+        (b'L', _) => 5,
+        (_, None) => 2,
+        _ => 3,
+    };
+    {
+        let mut g = LONG_WAITS.lock();
+        let e = g.get_or_insert_with(HashMap::new).entry((waiter.to_string(), by.clone(), a)).or_default();
+        e[0] += 1;
+        e[1] += ns;
+        e[slot] += 1;
+    }
+    if LONG_WAITS_LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
+        let promise = match p {
+            None => "none".to_string(),
+            Some((seq, v, bytes, by_cpu, t)) => {
+                let since = t.checked_duration_since(t0).map(|d| format!("{:.2} ms into the wait", d.as_secs_f64() * 1e3)).unwrap_or_else(|| format!("{:.2} ms before the wait", t0.duration_since(t).as_secs_f64() * 1e3));
+                let vv = if wide { v } else { v & 0xFFFF_FFFF };
+                format!("batch {seq} ({}; completed through {}), value {v:#x} ({bytes} bytes{}), made {since}, satisfies: {}", if by_cpu { "CPU after it" } else { "GPU in it" }, super::exec::completed_seq(), "", !(wide && bytes < 8) && compare(func, vv & mask, reference & mask))
+            }
+        };
+        let header = if wpk != 0 && valid(wpk, 4) { unsafe { rd32(wpk) } } else { 0 };
+        let op = if header >> 30 == 3 { format!("{:#04x}", (header >> 8) & 0xFF) } else { "?".into() };
+        crate::info!(
+            "gpu[{waiter}]: label wait {:.2} ms at {at:#x} on [{a:#x}] func {func} ref {reference:#x} mask {mask:#x} ended {} (value now {:#x}); last write {wv:#x} by {by} (packet {wpk:#x}, opcode {op}); promise: {promise}; label history:{}",
+            ns as f64 / 1e6,
+            match kind {
+                b'P' => "on a promise",
+                b'L' => "latched",
+                _ => "in memory",
+            },
+            if wide { unsafe { rd64(a) } } else { (unsafe { rd32(a) }) as u64 },
+            label_history(a, 10)
+        );
+    }
+}
+
+/// Long label waits by waiter, writer and label (profile report).
+pub fn long_waits_line() -> String {
+    let g = LONG_WAITS.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<_> = m.iter().collect();
+    v.sort_by_key(|(_, e)| std::cmp::Reverse(e[1]));
+    let parts: Vec<String> = v
+        .iter()
+        .take(10)
+        .map(|((w, by, a), e)| format!("{w} <- {by} [{a:#x}]: {} waits {:.1} ms (in memory without a promise {}, with one {}, on a promise {}, latched {})", e[0], e[1] as f64 / 1e6, e[2], e[3], e[4], e[5]))
+        .collect();
+    format!("    label waits of 1 ms or more: {}\n", parts.join("; "))
 }
 
 /// The last CP write to the label-sized word at `addr` (wait traces).
@@ -2901,6 +2973,7 @@ impl Cp {
             }
         }
         label_event(&self.name, kind, a, read(), reference, at);
+        long_wait(&self.name, a, wide, func, mask, reference, at, t0, kind);
         match r {
             Flow::Stop => Flow::Stop,
             _ => Flow::Next,

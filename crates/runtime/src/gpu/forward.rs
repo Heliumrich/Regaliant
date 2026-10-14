@@ -12,9 +12,11 @@
 //! its parallel workers (stage preparations and their checks) take these
 //! words instead of waiting. The copy itself still runs on the GPU in order.
 //! An entry ends when other GPU work or a CP write touches its destination
-//! (later in the stream: the words would be stale), or once its batch
-//! completed: memory then holds the words, which are compared (`STATS`); a
-//! program whose words ever differ is not forwarded again.
+//! (later in the stream: the words would be stale), when a reader finds a
+//! word that is neither the destination's old word (the copy has not run)
+//! nor the copied one (it has): the title's CPU rewrote it, or once its
+//! batch completed: memory then holds the words, which are compared
+//! (`STATS`); a destination whose copy did not land is not forwarded again.
 
 use parking_lot::{Mutex, RwLock};
 use std::cell::{Cell, RefCell};
@@ -35,6 +37,8 @@ struct Entry {
     hash: u64,
     /// What it was computed from: the source's words and the control block.
     from: Inputs,
+    /// The destination's words when the copy was recorded.
+    old: Arc<[u32]>,
 }
 
 /// A copy's inputs as read when it was recorded.
@@ -57,9 +61,12 @@ const MAX_ENTRIES: usize = 64;
 
 /// [copies forwarded, entries ended by a later write, entries retired after
 /// their batch, words served, stage reads that needed no wait thanks to
-/// them, words compared equal after the copy ran, words that differed,
-/// copies not forwarded (inputs GPU work still writes, odd formats or sizes)].
-pub static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// them, words compared equal after the copy ran, words still as before the
+/// copy then (it did not land), copies not forwarded (inputs GPU work still
+/// writes, odd formats or sizes), entries ended because a reader found the
+/// title had rewritten the destination, words the title rewrote after the
+/// copy ran].
+pub static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// Resource indices of a recognized copy kernel.
 #[derive(Clone, Copy)]
@@ -78,8 +85,9 @@ static DISTRUSTED: Mutex<Option<HashSet<(u64, u64)>>> = Mutex::new(None);
 thread_local! {
     /// This thread reads guest memory for the graphics queue.
     static HERE: Cell<bool> = const { Cell::new(false) };
-    /// This thread's copy of the entries: (generation, [(base, bytes, words)]).
-    static LOCAL: RefCell<(u64, Vec<(u64, u64, Arc<[u32]>)>)> = const { RefCell::new((0, Vec::new())) };
+    /// This thread's copy of the entries: (generation, [(base, bytes,
+    /// copied words, old words)]).
+    static LOCAL: RefCell<(u64, Vec<LocalEntry>)> = const { RefCell::new((0, Vec::new())) };
 }
 
 /// The calling thread records for the graphics queue (its command processor
@@ -94,51 +102,95 @@ pub fn active() -> bool {
     COUNT.load(Ordering::Acquire) != 0 && HERE.with(|h| h.get())
 }
 
-fn with_local<R>(f: impl FnOnce(&[(u64, u64, Arc<[u32]>)]) -> R) -> R {
+type LocalEntry = (u64, u64, Arc<[u32]>, Arc<[u32]>);
+
+fn with_local<R>(f: impl FnOnce(&[LocalEntry]) -> R) -> R {
     let generation = GEN.load(Ordering::Acquire);
     LOCAL.with(|l| {
         let mut l = l.borrow_mut();
         if l.0 != generation {
             let g = ENTRIES.read();
-            l.1 = g.iter().map(|e| (e.base, 4 * e.words.len() as u64, e.words.clone())).collect();
+            l.1 = g.iter().map(|e| (e.base, 4 * e.words.len() as u64, e.words.clone(), e.old.clone())).collect();
             l.0 = generation;
         }
         f(&l.1)
     })
 }
 
-/// The forwarded word at `addr` (4-byte aligned), if an entry covers it.
-#[inline]
-pub fn word(addr: u64) -> Option<u32> {
-    if !active() {
-        return None;
+/// The entry at `base` is stale: a reader found a destination word that is
+/// neither the old nor the copied one (the title's CPU rewrote it).
+fn drop_stale(base: u64) {
+    let mut g = ENTRIES.write();
+    let before = g.len();
+    g.retain(|e| e.base != base);
+    if g.len() != before {
+        STATS[8].fetch_add(1, Ordering::Relaxed);
+        COUNT.store(g.len(), Ordering::Release);
+        GEN.fetch_add(1, Ordering::AcqRel);
     }
-    let w = with_local(|v| v.iter().find(|e| e.0 <= addr && addr < e.0 + e.1).map(|e| e.2[((addr - e.0) / 4) as usize]));
-    if w.is_some() {
-        STATS[3].fetch_add(1, Ordering::Relaxed);
-    }
-    w
 }
 
-/// Replaces the words of `out` (read at `addr`) that entries cover.
+/// The word a reader takes at `addr` (4-byte aligned) given `mem`, what
+/// guest memory holds there: the copied word while memory still holds the
+/// destination's old word (the copy has not run) or that word itself.
+#[inline]
+pub fn word_or(addr: u64, mem: u32) -> u32 {
+    if !active() {
+        return mem;
+    }
+    let hit = with_local(|v| {
+        v.iter().find(|e| e.0 <= addr && addr < e.0 + e.1).map(|e| {
+            let k = ((addr - e.0) / 4) as usize;
+            (e.0, e.2[k], e.3.get(k).copied())
+        })
+    });
+    match hit {
+        Some((_, w, old)) if mem == w || Some(mem) == old => {
+            STATS[3].fetch_add(1, Ordering::Relaxed);
+            w
+        }
+        Some((base, ..)) => {
+            drop_stale(base);
+            mem
+        }
+        None => mem,
+    }
+}
+
+/// Replaces the words of `out` (read at `addr` from guest memory) that
+/// entries cover, entry by entry: all of an entry's words in range, or none
+/// when one of them shows the title rewrote the destination (the entry ends).
 pub fn overlay(addr: u64, out: &mut [u32]) {
     if !active() {
         return;
     }
     let end = addr + 4 * out.len() as u64;
+    let mut stale = Vec::new();
     let n = with_local(|v| {
         let mut n = 0u64;
-        for (base, bytes, words) in v {
+        for (base, bytes, words, old) in v {
             let (lo, hi) = (addr.max(*base), end.min(base + bytes));
-            let mut a = lo;
-            while a < hi {
+            if lo >= hi {
+                continue;
+            }
+            let ok = (lo..hi).step_by(4).all(|a| {
+                let (i, k) = (((a - addr) / 4) as usize, ((a - base) / 4) as usize);
+                out[i] == words[k] || old.get(k) == Some(&out[i])
+            });
+            if !ok {
+                stale.push(*base);
+                continue;
+            }
+            for a in (lo..hi).step_by(4) {
                 out[((a - addr) / 4) as usize] = words[((a - base) / 4) as usize];
-                a += 4;
                 n += 1;
             }
         }
         n
     });
+    for base in stale {
+        drop_stale(base);
+    }
     if n > 0 {
         STATS[3].fetch_add(n, Ordering::Relaxed);
     }
@@ -160,7 +212,7 @@ pub fn uncovered(reads: &[(u64, u64)]) -> Option<Vec<(u64, u64)>> {
         for &(a, n) in reads {
             // Pieces of [a, a + n) outside every entry.
             let mut pieces = vec![(a, a + n)];
-            for (base, bytes, _) in v {
+            for (base, bytes, _, _) in v {
                 let (lo, hi) = (*base, base + bytes);
                 let mut next = Vec::with_capacity(pieces.len() + 1);
                 for (s, e) in pieces {
@@ -321,13 +373,19 @@ pub fn compute(p: &Prepared, groups: [u32; 3], local: [u32; 3], busy: impl Fn(&[
 /// just recorded, after its own writes were noted); returns the entry's id.
 pub fn add(base: u64, words: Vec<u32>, program: u64, hash: u64, from: Inputs) -> u64 {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let n = words.len() as u64;
+    let old: Arc<[u32]> = if super::cp::guest_readable(base, 4 * n) {
+        (0..n).map(|k| unsafe { std::ptr::read_volatile((base + 4 * k) as *const u32) }).collect()
+    } else {
+        Arc::from(Vec::new())
+    };
     let mut g = ENTRIES.write();
     let end = base + 4 * words.len() as u64;
     g.retain(|e| !(e.base < end && base < e.base + 4 * e.words.len() as u64));
     if g.len() >= MAX_ENTRIES {
         g.remove(0);
     }
-    g.push(Entry { id, base, words: words.into(), seq: 0, program, hash, from });
+    g.push(Entry { id, base, words: words.into(), seq: 0, program, hash, from, old });
     COUNT.store(g.len(), Ordering::Release);
     GEN.fetch_add(1, Ordering::AcqRel);
     STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -370,15 +428,22 @@ pub fn completed(done: u64) {
             continue;
         }
         let mut differ = 0u64;
+        let mut rewritten = 0u64;
         let mut first = None;
         for (k, &w) in e.words.iter().enumerate() {
             let now = unsafe { std::ptr::read_volatile((e.base + 4 * k as u64) as *const u32) };
-            if now != w {
+            if now == w {
+                continue;
+            }
+            if e.old.get(k) == Some(&now) && e.old[k] != w {
                 differ += 1;
                 first.get_or_insert((k, w, now));
+            } else {
+                rewritten += 1;
             }
         }
-        STATS[5].fetch_add(e.words.len() as u64 - differ, Ordering::Relaxed);
+        STATS[9].fetch_add(rewritten, Ordering::Relaxed);
+        STATS[5].fetch_add(e.words.len() as u64 - differ - rewritten, Ordering::Relaxed);
         if let Some((k, w, now)) = first {
             STATS[6].fetch_add(differ, Ordering::Relaxed);
             static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -395,7 +460,7 @@ pub fn completed(done: u64) {
                 let src_changed = src_now.iter().zip(&f.src_words).filter(|(a, b)| a != b).count();
                 let cb_now = if super::cp::guest_readable(f.cb, 8) { unsafe { [std::ptr::read_volatile(f.cb as *const u32), std::ptr::read_volatile((f.cb + 4) as *const u32)] } } else { [0, 0] };
                 crate::warn!(
-                    "gpu: forwarded copy to {:#x} (cs {:#x}, batch {}): {differ} of {} words differ from memory after the copy, first dword {k}: forwarded {w:#x}, memory {now:#x}; source {:#x} ({} words, stride {}): {src_changed} words changed since recorded{}; control block {:#x}: count {} modulus {} when recorded, {} {} now; last CP write to the source: {}; this destination is no longer forwarded",
+                    "gpu: forwarded copy to {:#x} (cs {:#x}, batch {}): {differ} of {} words still as before the copy after it ran, first dword {k}: forwarded {w:#x}, memory {now:#x}; source {:#x} ({} words, stride {}): {src_changed} words changed since recorded{}; control block {:#x}: count {} modulus {} when recorded, {} {} now; last CP write to the source: {}; this destination is no longer forwarded",
                     e.base,
                     e.program,
                     e.seq,
@@ -424,7 +489,7 @@ pub fn status_line() -> String {
         return String::new();
     }
     format!(
-        "    forwarded copies: {} made ({} not: inputs still written or odd shapes), {} ended by later writes, {} retired after their batch; {} words served, {} stage reads with no wait for the copy; after the copies ran {} words equal, {} differ\n",
-        s[0], s[7], s[1], s[2], s[3], s[4], s[5], s[6]
+        "    forwarded copies: {} made ({} not: inputs still written or odd shapes), {} ended by later writes, {} by the title's rewrites, {} retired after their batch; {} words served, {} stage reads with no wait for the copy; after the copies ran {} words equal, {} as before the copy (it did not land), {} rewritten since\n",
+        s[0], s[7], s[1], s[8], s[2], s[3], s[4], s[5], s[6], s[9]
     )
 }
