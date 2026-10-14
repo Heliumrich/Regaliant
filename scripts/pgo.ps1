@@ -44,7 +44,8 @@ switch ($Step) {
     }
     'use' {
         if (-not (Test-Path $merged)) { "no $merged (run merge first)"; exit 2 }
-        Set-Flags @("-Cprofile-use=$merged", '-Cllvm-args=-pgo-warn-mismatch=false')
+        # (The instrumented build differs only in `pgo_write`; LLVM 22 names the option this way.)
+        Set-Flags @("-Cprofile-use=$merged", '-Cllvm-args=-no-pgo-warn-mismatch')
         & $cargo build --profile release-pgo --target $target -p dsport
         if ($LASTEXITCODE -ne 0) { "build failed"; exit 1 }
         Copy-Build 'release-pgo'
