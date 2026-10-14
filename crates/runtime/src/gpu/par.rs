@@ -287,6 +287,9 @@ impl Pool {
                     crate::log::set_thread_name(&tname);
                     crate::exception::arm_watch_current_thread(false);
                     super::profile_this_thread("par");
+                    if !compute {
+                        super::forward::enable_here();
+                    }
                     run_worker(&w2, &tname);
                 }),
             );

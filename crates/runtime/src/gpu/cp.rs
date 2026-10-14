@@ -1592,6 +1592,7 @@ impl Cp {
     fn effect(&mut self, end_of_pipe: bool, write: Option<(u64, u64)>, f: Box<dyn FnOnce() + Send>) -> Option<u64> {
         if let Some((a, n)) = write {
             super::replay::note_cp_write(a, n);
+            super::forward::written(a, n);
         }
         let needs_prior = end_of_pipe || self.fence_pending;
         match self.exec.as_mut() {
@@ -2681,6 +2682,7 @@ impl Cp {
                 let v = if sas { self.reg_by_addr(src as u32) } else { 0 };
                 self.note("DMA_DATA from registers/GDS: register value or 0");
                 super::replay::note_cp_write(dst, if daic { 4 } else { bytes });
+                super::forward::written(dst, if daic { 4 } else { bytes });
                 for i in 0..(bytes / 4).max(1) {
                     unsafe { wr32(if daic { dst } else { dst + 4 * i }, v) };
                 }

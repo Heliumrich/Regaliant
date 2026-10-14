@@ -347,7 +347,8 @@ impl<'a> Reader<'a> {
             Some(r) if r.0 + r.1 == addr => r.1 += 4,
             _ => self.reads.push((addr, 4)),
         }
-        let w = unsafe { std::ptr::read_volatile(addr as *const u32) };
+        // A copy recorded earlier leaves other words there (`gpu::forward`).
+        let w = super::forward::word(addr).unwrap_or_else(|| unsafe { std::ptr::read_volatile(addr as *const u32) });
         self.words.push(w);
         Some(w)
     }
@@ -367,12 +368,11 @@ impl<'a> Reader<'a> {
             Some(r) if r.0 + r.1 == addr => r.1 += n,
             _ => self.reads.push((addr, n)),
         }
-        self.words.reserve(out.len());
         for (k, o) in out.iter_mut().enumerate() {
-            let w = unsafe { std::ptr::read_volatile((addr + 4 * k as u64) as *const u32) };
-            *o = w;
-            self.words.push(w);
+            *o = unsafe { std::ptr::read_volatile((addr + 4 * k as u64) as *const u32) };
         }
+        super::forward::overlay(addr, out);
+        self.words.extend_from_slice(out);
         true
     }
 
@@ -471,6 +471,8 @@ pub struct Prepared {
     /// preparation that depends on the image cache).
     pub cmp_images: u64,
     pub cmp_depth: u64,
+    /// The program code's hash (`program_checked`).
+    pub code_hash: u64,
 }
 
 /// A stage's user-data dwords (at most 32), held inline: a preparation
@@ -685,6 +687,19 @@ pub fn words_unchanged(p: &Prepared) -> bool {
             return false;
         }
         let Some(want) = p.words.get(k..k + m) else { return false };
+        if super::forward::active() {
+            // As the reader sees them now (`gpu::forward`).
+            let mut now = vec![0u32; m];
+            for (j, o) in now.iter_mut().enumerate() {
+                *o = unsafe { std::ptr::read_volatile((a + 4 * j as u64) as *const u32) };
+            }
+            super::forward::overlay(a, &mut now);
+            if now != want {
+                return false;
+            }
+            k += m;
+            continue;
+        }
         for (j, &w) in want.iter().enumerate() {
             if unsafe { std::ptr::read_volatile((a + 4 * j as u64) as *const u32) } != w {
                 return false;
@@ -1858,6 +1873,7 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         images_gen,
         cmp_images,
         cmp_depth,
+        code_hash,
     };
     if let Some(h) = &checked_hit {
         prep_compare(h, &prepared);

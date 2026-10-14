@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 79] = [
+    static ALL: [Tunable; 80] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -106,6 +106,7 @@ pub mod tune {
         Tunable { name: "race_checks", env: "DS_RACE_CHECKS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "data_snapshots", env: "DS_DATA_SNAPSHOTS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_main_writes", env: "DS_PAR_MAIN_WRITES", default: 2, value: AtomicU64::new(UNSET) },
+        Tunable { name: "forward_copies", env: "DS_FORWARD_COPIES", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -820,6 +821,14 @@ pub mod tune {
         get(78)
     }
 
+    /// The per-view copy kernel's result forwarded to the graphics queue's
+    /// later reads of its destination instead of waiting for the copy
+    /// (`gpu::forward`).
+    #[inline]
+    pub fn forward_copies() -> bool {
+        get(79) != 0
+    }
+
     /// A switch's value by name; None if unknown.
     pub fn value(name: &str) -> Option<u64> {
         ALL.iter().position(|t| t.name == name).map(get)
@@ -839,6 +848,7 @@ pub mod tune {
 
 pub mod ahead;
 pub mod pacing;
+pub mod forward;
 pub mod par;
 pub mod prio;
 pub mod precache;
@@ -1187,6 +1197,9 @@ fn worker(q: &'static Queue, name: &str) {
     q.tid.store(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }, Ordering::Relaxed);
     crate::exception::arm_watch_current_thread(false);
     let mut cp = cp::Cp::new(name, q.id != GFX);
+    if q.id == GFX {
+        forward::enable_here();
+    }
     cp.wait_flag = Some(&q.cp_waiting);
     // Register states kept for a frame replay (`Ctl::Save`).
     let mut saved: [Option<cp::ChunkState>; 2] = [None, None];
@@ -1485,6 +1498,7 @@ pub fn profile_report() -> String {
     s.push_str(&cp::wait_stats());
     s.push_str(&cp::classes_line());
     s.push_str(&exec::race_line());
+    s.push_str(&forward::status_line());
     s.push_str(&par::status());
     s.push_str(&images::memo_stats_line());
     s.push_str(&exec::pre_window_line());

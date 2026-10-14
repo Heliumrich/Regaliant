@@ -2548,6 +2548,7 @@ fn completion_thread() {
         reap_spans();
         check_speculations(b.seq);
         check_races(b.seq);
+        super::forward::completed(b.seq);
         check_timestamps(b.seq);
     }
 }
@@ -3608,6 +3609,8 @@ pub struct Exec {
     own_checks: Vec<SpecCheck>,
     /// Race checks of the batch being recorded (`tune race_checks`).
     race_pending: Vec<RaceCheck>,
+    /// Forwarded copies recorded into the batch being recorded (`gpu::forward`).
+    forward_ids: Vec<u64>,
     /// The compute queue id in this executor's name (`gpu-acb<id>`; 0: none)
     /// and whether the batch being recorded goes to the main family's second
     /// Vulkan queue (`tune alt_queue`: a timing diagnosis, no ordering
@@ -3766,6 +3769,7 @@ impl Exec {
                 tex_scratch: Vec::new(),
                 own_checks: Vec::new(),
                 race_pending: Vec::new(),
+                forward_ids: Vec::new(),
                 alt_id: name.strip_prefix("gpu-acb").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).unwrap_or(0),
                 batch_alt: false,
                 batch_alt_share: false,
@@ -4043,6 +4047,9 @@ impl Exec {
         if !self.race_pending.is_empty() {
             let cpw_submit = super::cp::CPW_SEQ.load(Ordering::Acquire);
             RACE_CHECKS.lock().extend(self.race_pending.drain(..).map(|c| RaceCheck { seq, cpw_submit, ..c }));
+        }
+        if !self.forward_ids.is_empty() {
+            super::forward::submitted(&std::mem::take(&mut self.forward_ids), seq);
         }
         st.mark(6);
         // The batch's writes are noted before its labels are promised: a
@@ -5099,6 +5106,13 @@ impl Exec {
     /// this queue's batch submitted, other queues' batches done): when it
     /// waited, since when.
     pub fn sync_for_reads(&mut self, reads: &[(u64, u64)]) -> Option<std::time::Instant> {
+        // Words a copy recorded earlier leaves there were read as forwarded
+        // (`gpu::forward`): the copy need not complete first.
+        let forwarded = super::forward::uncovered(reads);
+        let reads: &[(u64, u64)] = forwarded.as_deref().unwrap_or(reads);
+        if reads.is_empty() {
+            return None;
+        }
         if let Some(m) = &self.main_writes {
             if !m.is_empty() && m.overlaps_any(reads) {
                 if MAIN_WRITE_READS.fetch_add(1, Ordering::Relaxed) % 20000 == 0 {
@@ -5218,12 +5232,18 @@ impl Exec {
             }
         }
         super::precache::invalidate_gpu(a, n);
+        super::forward::written(a, n);
         self.pending.insert(a, n);
         self.note_since(a, n);
         self.own_gen += 1;
         if verify::enabled() {
             self.pending_log.push((a, n));
         }
+    }
+
+    /// `overlaps_pending` without pruning (a shared borrow).
+    fn overlaps_pending_ro(&self, reads: &[(u64, u64)]) -> bool {
+        self.pending.overlaps_any(reads) || self.inflight.latest(reads, done_seq()).is_some()
     }
 
     fn overlaps_pending(&mut self, reads: &[(u64, u64)]) -> bool {
@@ -6714,6 +6734,7 @@ impl Exec {
             // This batch's own record of them still: it may have begun since.
             self.own_gen += 1;
             for &(b, n) in &writes_here {
+                super::forward::written(b, n);
                 self.pending.insert(b, n);
                 self.note_since(b, n);
                 if verify::enabled() {
@@ -6739,6 +6760,13 @@ impl Exec {
             }
         }
         lap.mark(15);
+        if super::tune::forward_copies() && !self.deferred && indirect.is_none() && self.name == "gpu-gfx" {
+            let busy = |r: &[(u64, u64)]| self.overlaps_pending_ro(r) || INFLIGHT.latest(r).is_some() || CP_WRITES.latest(r).is_some();
+            if let Some((base, words, from)) = super::forward::compute(&p, groups, local, busy) {
+                let id = super::forward::add(base, words, p.addr, p.code_hash, from);
+                self.forward_ids.push(id);
+            }
+        }
         EXECUTED.fetch_add(1, Ordering::Relaxed);
         self.batch_shaders.push(p.addr);
         let total = t_start.elapsed();
