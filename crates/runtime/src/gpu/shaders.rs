@@ -20,6 +20,10 @@ struct Program {
 static PROGRAMS: Mutex<Option<HashMap<u64, Program>>> = Mutex::new(None);
 static PLANS: Mutex<Option<HashMap<u64, Arc<Plan>>>> = Mutex::new(None);
 static TRANSLATIONS: Mutex<Option<HashMap<(u64, u64), Arc<Translated>>>> = Mutex::new(None);
+/// Translations at least this large are logged with their program saved
+/// (`prepare`), once per program address.
+const BIG_SPIRV_WORDS: usize = 40_000;
+static BIG_SPIRV_SEEN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
 
 thread_local! {
     /// This thread's view of the shared caches (entries never change once
@@ -1677,6 +1681,23 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
                 let ms = t0.elapsed().as_millis();
                 if ms >= 100 {
                     crate::info!("{:?} shader {addr:#x}: translated in {ms} ms ({} instructions, {} SPIR-V words)", spec.stage, insts.len(), out.spirv.len());
+                }
+                // Large translations compile for seconds on first use (play
+                // stalled 0.5-3.4 s per effect shader, FINDINGS.md
+                // 2026-10-14): each logged once, its program saved.
+                if out.spirv.len() >= BIG_SPIRV_WORDS && BIG_SPIRV_SEEN.lock().get_or_insert_with(std::collections::HashSet::new).insert(addr) {
+                    let saved = super::capture::save_program(addr).map(|f| format!("; program saved to {}", f.display())).unwrap_or_default();
+                    crate::info!(
+                        "{:?} shader {addr:#x}: {} instructions -> {} SPIR-V words ({:.0} per instruction; wave64 {}, per lane {}, lane votes {}, local size {:?}){saved}",
+                        spec.stage,
+                        insts.len(),
+                        out.spirv.len(),
+                        out.spirv.len() as f64 / insts.len().max(1) as f64,
+                        spec.wave64,
+                        spec.per_lane,
+                        spec.lane_votes,
+                        spec.cs_local_size
+                    );
                 }
                 for w in &out.warnings {
                     crate::warn!("{:?} shader {addr:#x}: {w}", spec.stage);

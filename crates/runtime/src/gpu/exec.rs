@@ -1365,6 +1365,10 @@ struct Bound {
     sized_writes: Vec<(u64, u64)>,
     /// Images it samples or stores to.
     images: Vec<vk::Image>,
+    /// Those it stores to, and those it samples through an R8_UINT view
+    /// (the stencil aspect of a depth image; other views of one read depth).
+    stored: Vec<vk::Image>,
+    stencil_views: Vec<vk::Image>,
     /// Buffers bound through a VRAM shadow (copied in before, out after).
     shadows: Vec<Shadow>,
     /// Written buffer resources and where their result is after the stage:
@@ -3440,6 +3444,16 @@ const SINCE_MAX: usize = 128;
 /// arguments not written since the batch's last barrier; `tune
 /// exact_indirect`).
 pub static INDIRECT_BARRIERS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// Draws that sampled an attachment of the current rendering instance and
+/// kept it (neither written in it), and those that ended it.
+pub static FEEDBACK: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// Those draws by the attachment they sample and how they use it (see the
+/// draw path), and their pixel shaders (profiling).
+pub static FEEDBACK_KINDS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+pub static FEEDBACK_PS: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
+/// Render passes ended without a barrier of their own because a full one
+/// followed at once (`end_rendering_before_barrier`).
+pub static MERGED_PASS_BARRIERS: AtomicU64 = AtomicU64::new(0);
 /// Batch slots deferred executors made beyond their first two (statistics).
 pub static WORKER_SLOTS: AtomicU64 = AtomicU64::new(0);
 
@@ -3964,10 +3978,9 @@ impl Exec {
         };
         if !b.copy_in.is_empty() {
             self.begin();
-            self.end_rendering();
+            self.end_rendering_then_barrier();
             let c = ctx();
             let cmd = self.cmd();
-            self.barrier();
             for &(a, n, off) in &b.copy_in {
                 for (src, src_off, ga, len) in guest_pieces(a, n) {
                     unsafe { c.device.cmd_copy_buffer(cmd, src, b.buf, &[vk::BufferCopy { src_offset: src_off, dst_offset: off + (ga - a), size: len }]) };
@@ -4020,10 +4033,9 @@ impl Exec {
             return;
         }
         self.begin();
-        self.end_rendering();
+        self.end_rendering_then_barrier();
         let c = ctx();
         let cmd = self.cmd();
-        self.barrier();
         for (a, n, hb, off) in parts {
             for (dst, dst_off, ga, len) in guest_pieces(a, n) {
                 unsafe { c.device.cmd_copy_buffer(cmd, hb.buf, dst, &[vk::BufferCopy { src_offset: off + (ga - a), dst_offset: dst_off, size: len }]) };
@@ -4052,10 +4064,9 @@ impl Exec {
             return;
         }
         self.begin();
-        self.end_rendering();
+        self.end_rendering_then_barrier();
         let c = ctx();
         let cmd = self.cmd();
-        self.barrier();
         let total: u64 = parts.iter().map(|p| p.1).sum();
         self.ops[OP_WRITE_BACK_BYTES] += total;
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -4249,6 +4260,8 @@ impl Exec {
         b.writes.clear();
         b.sized_writes.clear();
         b.images.clear();
+        b.stored.clear();
+        b.stencil_views.clear();
         b.shadows.clear();
         b.write_src.clear();
         b.placements.clear();
@@ -4433,11 +4446,10 @@ impl Exec {
         if copies.is_empty() {
             return;
         }
-        self.end_rendering();
         self.begin();
+        self.end_rendering_then_barrier();
         let c = ctx();
         let cmd = self.cmd();
-        self.barrier();
         for b in &copies {
             let regions: Vec<vk::ImageCopy> = (0..b.levels)
                 .map(|l| {
@@ -4489,12 +4501,11 @@ impl Exec {
     /// The caller reads the slot (`lod_stats_words`) in an action after it.
     pub fn lod_stats_copy(&mut self, slot: usize, reset: bool) {
         self.begin();
-        self.end_rendering();
+        self.end_rendering_then_barrier();
         let fx = fixed();
         let cmd = self.cmd();
         let d = &ctx().device;
         let bytes = super::lodstats::SLOT_BYTES;
-        self.barrier();
         unsafe {
             d.cmd_copy_buffer(cmd, fx.lodstats, fx.lod_readback, &[vk::BufferCopy { src_offset: 0, dst_offset: slot as u64 * bytes, size: bytes }]);
             if reset {
@@ -4588,7 +4599,12 @@ impl Exec {
             return;
         }
         if self.barrier_wanted || (for_draw && self.dispatched) {
-            self.barrier();
+            // Diagnosis: 16 leaves out the title's barriers, 32 the ones
+            // between dispatches and the draws after them.
+            let skip = super::tune::skip_barriers();
+            if (self.barrier_wanted && skip & 16 == 0) || (!self.barrier_wanted && skip & 32 == 0) {
+                self.barrier();
+            }
             self.barrier_wanted = false;
             self.dispatched = false;
         }
@@ -5008,7 +5024,12 @@ impl Exec {
         }
         self.begin();
         self.gpu_writes_open = true;
-        self.end_rendering();
+        let full = !(end_of_pipe && super::tune::eop_light()) && super::tune::skip_barriers() & 4 == 0;
+        if full && self.ts_deferred.is_empty() {
+            self.end_rendering_before_barrier();
+        } else {
+            self.end_rendering();
+        }
         // End-of-pipe events are written in order on the console: a title
         // that sees this value may read the timestamps taken before it.
         self.resolve_timestamps();
@@ -5087,7 +5108,11 @@ impl Exec {
         self.pool_use[0] += 1;
         self.pool_use[1] += 2;
         self.gpu_writes_open = true;
-        self.end_rendering();
+        if !super::tune::eop_light() && super::tune::ts_nowait() && super::tune::skip_barriers() & 8 == 0 {
+            self.end_rendering_before_barrier();
+        } else {
+            self.end_rendering();
+        }
         let q = self.ts_used;
         self.ts_used += 1;
         let align = c.limits.min_storage_buffer_offset_alignment.max(4);
@@ -5179,10 +5204,7 @@ impl Exec {
     /// (and everything before it), as the wait makes it on the console.
     pub fn order_after_open_writes(&mut self) {
         if std::mem::take(&mut self.eop_unordered) {
-            self.end_rendering();
-            self.barrier();
-            self.barrier_wanted = false;
-            self.dispatched = false;
+            self.end_rendering_then_barrier();
             EOP_LIGHT[2].fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -5225,11 +5247,10 @@ impl Exec {
         }
         let (flush, keep): (Vec<Shadow>, Vec<Shadow>) = std::mem::take(&mut self.resident).into_iter().partition(hit);
         self.resident = keep;
-        self.end_rendering();
         let c = ctx();
-        super::vk::checkpoint(self.cmd(), super::vk::mark::SHADOW_OUT, 0);
         // The dispatches' writes to the working copies come first.
-        self.barrier();
+        self.end_rendering_then_barrier();
+        super::vk::checkpoint(self.cmd(), super::vk::mark::SHADOW_OUT, 0);
         let merge = if shadow_merge() { Some(merge_pipe()?) } else { None };
         for sh in &flush {
             let own = sh.size.min(sh.range - sh.bias);
@@ -5444,6 +5465,8 @@ impl Exec {
     #[track_caller]
     fn barrier(&mut self) {
         global_barrier(self.cmd());
+        self.barrier_wanted = false;
+        self.dispatched = false;
         match self.since_barrier.as_mut() {
             Some(v) => v.clear(),
             None => self.since_barrier = Some(Vec::new()),
@@ -5779,6 +5802,9 @@ impl Exec {
                         Some((view, image)) => {
                             bound.imgs.push((b.binding, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }));
                             bound.images.push(image);
+                            if super::images::vk_format(t.format) == Some(vk::Format::R8_UINT) {
+                                bound.stencil_views.push(image);
+                            }
                         }
                         None => {
                             all = false;
@@ -5806,6 +5832,8 @@ impl Exec {
         }
         bound.imgs.clear();
         bound.images.clear();
+        bound.stored.clear();
+        bound.stencil_views.clear();
         // One image-cache lock for all the stage's images and samplers.
         let mut failed: Vec<String> = Vec::new();
         let r: Result<(), String> = super::images::with(|im| {
@@ -5817,6 +5845,11 @@ impl Exec {
                         let ty = if storage { vk::DescriptorType::STORAGE_IMAGE } else { vk::DescriptorType::SAMPLED_IMAGE };
                         bound.imgs.push((b.binding, ty, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }));
                         bound.images.push(image);
+                        if storage {
+                            bound.stored.push(image);
+                        } else if super::images::vk_format(t.format) == Some(vk::Format::R8_UINT) {
+                            bound.stencil_views.push(image);
+                        }
                     }
                     (BindingKind::Sampler(_) | BindingKind::CompareSampler(_), Some(Resolved::Sampler(sm))) => {
                         let compare = matches!(b.kind, BindingKind::CompareSampler(_));
@@ -6128,7 +6161,9 @@ impl Exec {
             }
         };
         if lazy_barriers() && self.barrier_wanted {
-            self.barrier();
+            if super::tune::skip_barriers() & 16 == 0 {
+                self.barrier();
+            }
             self.barrier_wanted = false;
             self.dispatched = false;
         }
@@ -6398,10 +6433,19 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them behind a barrier of their own; {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills, {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them behind a barrier of their own; {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills, {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         INDIRECT_BARRIERS[0].load(Ordering::Relaxed),
+        MERGED_PASS_BARRIERS.load(Ordering::Relaxed),
+        FEEDBACK[0].load(Ordering::Relaxed),
+        FEEDBACK[1].load(Ordering::Relaxed),
+        FEEDBACK_KINDS.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),
+        {
+            let mut v: Vec<(u64, u64)> = FEEDBACK_PS.lock().as_ref().map(|m| m.iter().map(|(a, n)| (*a, *n)).collect()).unwrap_or_default();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            v.iter().take(6).map(|(a, n)| format!("{a:#x} {n}")).collect::<Vec<String>>().join(", ")
+        },
         GPU_CP_WRITES.load(Ordering::Relaxed),
         GPU_TIMESTAMPS.load(Ordering::Relaxed),
         GPU_CP_REFUSED.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),

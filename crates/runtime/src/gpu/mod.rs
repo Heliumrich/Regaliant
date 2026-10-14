@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 72] = [
+    static ALL: [Tunable; 74] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -99,6 +99,8 @@ pub mod tune {
         Tunable { name: "alt_queue", env: "DS_ALT_QUEUE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "skip_barriers", env: "DS_SKIP_BARRIERS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "exact_indirect", env: "DS_EXACT_INDIRECT", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "merge_barriers", env: "DS_MERGE_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "feedback_exact", env: "DS_FEEDBACK_EXACT", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -729,7 +731,10 @@ pub mod tune {
 
     /// Diagnosis (timing only, wrong results): full barriers left out, by
     /// site: 1 after a render pass, 2 before an indirect dispatch, 4 around
-    /// a CP memory write the GPU performs, 8 around a GPU timestamp store.
+    /// a CP memory write the GPU performs, 8 around a GPU timestamp store,
+    /// 16 the title's synchronization (partial flushes, cache actions,
+    /// end-of-pipe events) before the next command, 32 between dispatches
+    /// and the draws after them.
     #[inline]
     pub fn skip_barriers() -> u64 {
         get(70)
@@ -740,6 +745,21 @@ pub mod tune {
     #[inline]
     pub fn exact_indirect() -> bool {
         get(71) != 0
+    }
+
+    /// A render pass ended right before a full barrier takes none of its own
+    /// (0: one each).
+    #[inline]
+    pub fn merge_barriers() -> bool {
+        get(72) != 0
+    }
+
+    /// A draw that samples an attachment of the current rendering instance
+    /// ends it only when the instance writes that attachment (or the draw
+    /// does, or stores to it); 0: whenever it samples one.
+    #[inline]
+    pub fn feedback_exact() -> bool {
+        get(73) != 0
     }
 
     /// A switch's value by name; None if unknown.

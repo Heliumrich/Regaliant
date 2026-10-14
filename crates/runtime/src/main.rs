@@ -815,7 +815,10 @@ fn main() {
     hle::kernel::fs::ensure_dir(&rt.join("devlog").join("logs"));
     hle::kernel::fs::mount("/devlog/app", vec![rt.join("devlog")], true);
     hle::libs::savedata::init(cfg.root.join("local-data").join("saves"));
-    gpu::pcache::set_dir(cfg.root.join("local-data").join("pipelines"));
+    // DS_PIPELINE_DIR=<directory name under local-data>: another pipeline
+    // store (experiments that start without compiled pipelines).
+    let pipe_dir = std::env::var("DS_PIPELINE_DIR").ok().filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')).unwrap_or_else(|| "pipelines".into());
+    gpu::pcache::set_dir(cfg.root.join("local-data").join(pipe_dir));
 
     // Modules: the decrypted executable and the title's own libraries.
     let t0 = Instant::now();

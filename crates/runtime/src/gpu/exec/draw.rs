@@ -58,6 +58,14 @@ pub(super) struct Rendering {
     pub colors: [Option<Target>; MAX_RT],
     pub depth: Option<Target>,
     pub area: (u32, u32),
+    /// Color attachments its draws wrote, and those they sampled; the depth
+    /// attachment's depth and stencil aspects written and sampled (one
+    /// instance never does both to one aspect of an attachment: `tune
+    /// feedback_exact`).
+    pub written: Vec<vk::Image>,
+    pub sampled: Vec<vk::Image>,
+    pub ds_written: [bool; 2],
+    pub ds_sampled: [bool; 2],
 }
 
 /// Arguments of one draw packet.
@@ -445,6 +453,7 @@ impl Exec {
 
     /// Ends the active rendering instance; its attachment writes become
     /// visible to later commands.
+    #[track_caller]
     pub(super) fn end_rendering(&mut self) {
         if self.rendering.take().is_some() {
             unsafe { ctx().device.cmd_end_rendering(self.cmd()) };
@@ -456,11 +465,33 @@ impl Exec {
         }
     }
 
+    /// Ends the active rendering instance for a caller that records a full
+    /// barrier next, before anything else touches memory: that barrier
+    /// makes the attachment writes visible (`tune merge_barriers`; ending
+    /// with a barrier of its own drained the GPU twice in a row).
+    #[track_caller]
+    pub(super) fn end_rendering_before_barrier(&mut self) {
+        if !super::super::tune::merge_barriers() {
+            self.end_rendering();
+        } else if self.rendering.take().is_some() {
+            unsafe { ctx().device.cmd_end_rendering(self.cmd()) };
+            MERGED_PASS_BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// `end_rendering_before_barrier`, then that barrier.
+    #[track_caller]
+    pub(super) fn end_rendering_then_barrier(&mut self) {
+        self.end_rendering_before_barrier();
+        self.barrier();
+    }
+
     /// Ends the active rendering instance for a dispatch or for draws to
     /// other attachments: with `tune lazy_passes` without a barrier of its
     /// own (the title flushes and waits before work that uses what the
     /// instance drew, which arms the lazy barrier; draws after dispatches
     /// wait for them), else as `end_rendering`.
+    #[track_caller]
     pub(super) fn end_rendering_lazy(&mut self) {
         if !super::super::tune::lazy_passes() {
             self.end_rendering();
@@ -493,7 +524,7 @@ impl Exec {
         }
         super::note_vk(super::VK_RENDER_PASSES);
         unsafe { ctx().device.cmd_begin_rendering(self.cmd(), &ri) };
-        self.rendering = Some(Rendering { colors, depth, area });
+        self.rendering = Some(Rendering { colors, depth, area, written: Vec::new(), sampled: Vec::new(), ds_written: [false; 2], ds_sampled: [false; 2] });
     }
 
     /// Records the draw; Ok(false) when it has no effect here.
@@ -818,9 +849,73 @@ impl Exec {
         lap.mark(13);
         let t_bind = since(t0);
         // Rendering instance: reuse it while the attachments stay the same
-        // and the draw does not sample one of them.
-        let feedback = self.rendering.as_ref().is_some_and(|r| r.colors.iter().flatten().chain(r.depth.iter()).any(|t| bounds.iter().any(|b| b.images.contains(&t.image))));
+        // and no attachment is both written and sampled in it (Vulkan's
+        // rule for an image that is an attachment and a descriptor at once;
+        // `tune feedback_exact`, else any sampled attachment ends it: ~266
+        // instances per gate frame, each with a full barrier).
+        let writes_ds = z_write || s_write || clear_z || clear_s;
+        // This draw's writes of the depth attachment's [depth, stencil].
+        let ds_writes = [z_write || clear_z, s_write || clear_s];
+        let draw_writes = |img: vk::Image| colors.iter().flatten().any(|t| t.image == img) || (writes_ds && depth.as_ref().is_some_and(|d| d.image == img));
+        let sampled_now = |img: vk::Image| bounds.iter().any(|b| b.images.contains(&img));
+        let stored_now = |img: vk::Image| bounds.iter().any(|b| b.stored.contains(&img));
+        // Its sampling of the depth attachment's [depth, stencil] (any view
+        // that is not R8_UINT reads depth).
+        let ds_sampled_now = |img: vk::Image| [bounds.iter().any(|b| b.images.contains(&img) && !b.stencil_views.contains(&img)), bounds.iter().any(|b| b.stencil_views.contains(&img))];
+        let exact = super::super::tune::feedback_exact();
+        let mut samples_attachment = false;
+        let feedback = self.rendering.as_ref().is_some_and(|r| {
+            let color = r.colors.iter().flatten().any(|t| {
+                let a = t.image;
+                let sampled = sampled_now(a);
+                samples_attachment |= sampled;
+                if !exact {
+                    return sampled;
+                }
+                stored_now(a) || (sampled && (draw_writes(a) || r.written.contains(&a))) || (draw_writes(a) && r.sampled.contains(&a))
+            });
+            let ds = r.depth.as_ref().is_some_and(|t| {
+                let a = t.image;
+                let sampled = sampled_now(a);
+                samples_attachment |= sampled;
+                if !exact {
+                    return sampled;
+                }
+                let now = ds_sampled_now(a);
+                stored_now(a) || (0..2).any(|k| (now[k] && (ds_writes[k] || r.ds_written[k])) || (ds_writes[k] && r.ds_sampled[k]))
+            });
+            color || ds
+        });
         let same = self.rendering.as_ref().is_some_and(|r| r.colors == colors && r.depth == depth);
+        if samples_attachment && same {
+            super::FEEDBACK[feedback as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // What the sampled attachment is and how this draw uses it
+            // (statistics): [color written by the draw, color not written,
+            // depth with depth writes, with stencil writes only, with a
+            // clear only, depth not written, stored to].
+            let r = self.rendering.as_ref().unwrap();
+            let mut kinds = [false; 7];
+            for t in r.colors.iter().flatten() {
+                if sampled_now(t.image) {
+                    kinds[if draw_writes(t.image) { 0 } else { 1 }] = true;
+                }
+                if stored_now(t.image) {
+                    kinds[6] = true;
+                }
+            }
+            if let Some(d) = r.depth.as_ref().filter(|d| sampled_now(d.image)) {
+                kinds[if z_write { 2 } else if s_write { 3 } else if clear_z || clear_s { 4 } else { 5 }] = true;
+            }
+            for (k, &on) in kinds.iter().enumerate() {
+                if on {
+                    super::FEEDBACK_KINDS[k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            if super::profiling_on() {
+                let ps_addr = ps.as_ref().map_or(0, |p| p.addr);
+                *super::FEEDBACK_PS.lock().get_or_insert_with(std::collections::HashMap::new).entry(ps_addr).or_default() += 1;
+            }
+        }
         if !same || feedback {
             if feedback {
                 self.end_rendering();
@@ -829,6 +924,24 @@ impl Exec {
             }
             self.barrier_if_wanted(true);
             self.begin_rendering(colors, depth, area);
+        }
+        if let Some(r) = self.rendering.as_mut() {
+            for t in r.colors.iter().flatten() {
+                let a = t.image;
+                if draw_writes(a) && !r.written.contains(&a) {
+                    r.written.push(a);
+                }
+                if sampled_now(a) && !r.sampled.contains(&a) {
+                    r.sampled.push(a);
+                }
+            }
+            if let Some(a) = r.depth.as_ref().map(|t| t.image) {
+                let now = ds_sampled_now(a);
+                for k in 0..2 {
+                    r.ds_written[k] |= ds_writes[k];
+                    r.ds_sampled[k] |= now[k];
+                }
+            }
         }
         lap.mark(14);
         let c = ctx();
