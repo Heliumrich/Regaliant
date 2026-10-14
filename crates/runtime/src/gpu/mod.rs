@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 80] = [
+    static ALL: [Tunable; 81] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -107,6 +107,7 @@ pub mod tune {
         Tunable { name: "data_snapshots", env: "DS_DATA_SNAPSHOTS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_main_writes", env: "DS_PAR_MAIN_WRITES", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "forward_copies", env: "DS_FORWARD_COPIES", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "label_merge", env: "DS_LABEL_MERGE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -660,7 +661,10 @@ pub mod tune {
     /// Host priority of the GPU front end's threads (`prio`): 0 normal,
     /// 1 above normal (default since 2026-10-13: on 12 of the 5900X's 24
     /// logical CPUs 11.3-11.5 flips/s instead of 2.3, the same at 24; run
-    /// 20261013-124535), 2 highest.
+    /// 20261013-124535), 2 highest, 3 above normal for the graphics command
+    /// processor only (the others at normal: busy front-end threads above
+    /// the title's starve its jobs, and World 8-3 loads into a different
+    /// state; FINDINGS.md 2026-10-14).
     #[inline]
     pub fn cp_priority() -> u64 {
         get(59)
@@ -802,6 +806,18 @@ pub mod tune {
         get(76) != 0
     }
 
+    /// The largest range the race checks follow: `tune race_checks 1` 4 KiB
+    /// (words kept), a larger value that many bytes (ranges over 4 KiB are
+    /// compared by hash).
+    #[inline]
+    pub fn race_max() -> u64 {
+        match get(76) {
+            0 => 0,
+            1 => 4096,
+            v => v,
+        }
+    }
+
     /// Data-only loads read on the GPU (`gpu_loads`) of data no GPU work
     /// still writes are bound to a snapshot taken when the command is
     /// recorded (0: guest memory as the batch executes).
@@ -827,6 +843,18 @@ pub mod tune {
     #[inline]
     pub fn forward_copies() -> bool {
         get(79) != 0
+    }
+
+    /// A CP write the GPU performs in order (a label the title's CPU or
+    /// another queue may watch) first merges the batch's resident shadows
+    /// into guest memory: what earlier work wrote is there before the label.
+    /// Default 0 (merged when the batch is submitted): ~316k label writes per
+    /// gate run precede a merge, merging first cost ~2-3% and changed nothing
+    /// seen; the title's CPU reading such data after the label would need it
+    /// (FINDINGS.md 2026-10-14 evening).
+    #[inline]
+    pub fn label_merge() -> bool {
+        get(80) != 0
     }
 
     /// A switch's value by name; None if unknown.
@@ -1199,6 +1227,7 @@ fn worker(q: &'static Queue, name: &str) {
     let mut cp = cp::Cp::new(name, q.id != GFX);
     if q.id == GFX {
         forward::enable_here();
+        prio::set_main();
     }
     cp.wait_flag = Some(&q.cp_waiting);
     // Register states kept for a frame replay (`Ctl::Save`).

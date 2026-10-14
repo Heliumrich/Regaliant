@@ -454,6 +454,24 @@ fn cpw_note(queue: &str, a: u64, n: u64, at: u64, opcode: u32) {
     }
 }
 
+/// The latest CPU-performed CP write into [a, a + n) with an order number
+/// above `after` (as `cpw_since`).
+pub fn cpw_since_range(a: u64, n: u64, after: u64) -> Option<(u64, u64, String, u64, u32)> {
+    let g = CPW_LOG.lock();
+    let m = g.as_ref()?;
+    let mut best: Option<&CpwEntry> = None;
+    let mut g8 = a & !7;
+    while g8 < a + n {
+        if let Some(e) = m.get(&g8).filter(|e| e.0 > after) {
+            if best.is_none_or(|b| e.0 > b.0) {
+                best = Some(e);
+            }
+        }
+        g8 += 8;
+    }
+    best.map(|e| (e.0, e.1, e.2.to_string(), e.3, e.4))
+}
+
 /// The last CPU-performed CP write to the granule of `addr` with an order
 /// number above `after`: (number, batch it ran after, queue, packet, opcode).
 pub fn cpw_since(addr: u64, after: u64) -> Option<(u64, u64, String, u64, u32)> {

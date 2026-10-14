@@ -8,15 +8,28 @@
 use std::cell::Cell;
 
 thread_local! {
-    /// The `cp_priority` and `cp_cpus` values this thread last applied.
+    /// The priority level and `cp_cpus` value this thread last applied.
     static APPLIED: Cell<(u64, u64)> = const { Cell::new((u64::MAX, u64::MAX)) };
+    /// The graphics queue's command processor (`tune cp_priority 3`).
+    static MAIN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The calling thread is the graphics queue's command processor.
+pub fn set_main() {
+    MAIN.with(|m| m.set(true));
 }
 
 /// Applies `tune cp_priority` and `tune cp_cpus` to the calling thread if
 /// they changed since this thread last looked (two relaxed loads otherwise).
+/// `cp_priority 3`: above normal for the graphics command processor only
+/// (the critical path), normal for the other front-end threads.
 #[inline]
 pub fn apply() {
-    let want = (super::tune::cp_priority(), super::tune::cp_cpus());
+    let level = match super::tune::cp_priority() {
+        3 => MAIN.with(|m| m.get()) as u64,
+        p => p,
+    };
+    let want = (level, super::tune::cp_cpus());
     let had = APPLIED.with(|a| a.replace(want));
     if had != want {
         set(had, want);

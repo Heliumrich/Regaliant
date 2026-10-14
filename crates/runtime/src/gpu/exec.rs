@@ -2178,7 +2178,12 @@ struct RaceCheck {
     seq: u64,
     shader: u64,
     base: u64,
+    /// The words (ranges up to 4 KiB), else empty and `hash` of `len` bytes.
     words: Vec<u32>,
+    len: u64,
+    hash: u64,
+    /// The executor that recorded the command.
+    queue: std::sync::Arc<str>,
     flip: u64,
     /// When recorded: 1 a deferred CP write pending (the batch is submitted
     /// after it), 2 unfinished GPU work writing it, 4 a buffer binding (else
@@ -2209,8 +2214,40 @@ const RACE_CAUSES: [&str; 9] = [
     "unreadable",
 ];
 static RACE_CAUSE_COUNTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
-/// Per (cause, shader, why): count, an example range and change.
-static RACE_SUMMARY: Mutex<Option<HashMap<(usize, u64, u8), (u64, u64, u64, String)>>> = Mutex::new(None);
+/// Per (cause, shader, why, queue): count, an example range and change.
+static RACE_SUMMARY: Mutex<Option<HashMap<(usize, u64, u8, std::sync::Arc<str>), (u64, u64, u64, String)>>> = Mutex::new(None);
+
+/// A hash of guest [base, base + len) (race checks of ranges over 4 KiB).
+fn race_hash(base: u64, len: u64) -> u64 {
+    let mut h = super::fx::FxHasher::default();
+    let mut a = base;
+    while a + 8 <= base + len {
+        std::hash::Hasher::write_u64(&mut h, unsafe { std::ptr::read_unaligned(a as *const u64) });
+        a += 8;
+    }
+    while a < base + len {
+        std::hash::Hasher::write_u32(&mut h, unsafe { std::ptr::read_unaligned(a as *const u32) });
+        a += 4;
+    }
+    std::hash::Hasher::finish(&h)
+}
+
+/// Writes of batches not yet submitted, by executor (`tune race_checks`):
+/// all batches go to one device queue in submission order, so a binding
+/// that reads another queue's such writes runs before them.
+static OPEN_WRITES: Mutex<Option<HashMap<u64, (std::sync::Arc<str>, super::ranges::Ranges)>>> = Mutex::new(None);
+/// Bindings that read another queue's unsubmitted writes, by (reading queue,
+/// writing queue, shader): count and an example.
+static OPEN_READS: Mutex<Option<HashMap<(std::sync::Arc<str>, std::sync::Arc<str>, u64), (u64, String)>>> = Mutex::new(None);
+static OPEN_READ_COUNT: AtomicU64 = AtomicU64::new(0);
+static OPEN_READS_LOGGED: AtomicU64 = AtomicU64::new(0);
+static RACE_IDS: AtomicU64 = AtomicU64::new(1);
+
+/// A queue's name without a parallel worker's suffix (the graphics queue's
+/// workers record chunks of its runs).
+fn queue_family(name: &str) -> &str {
+    name.split("-par").next().unwrap_or(name)
+}
 
 /// GPU writes of submitted batches, by 4 KiB page (`tune race_checks`):
 /// (batch, start, bytes); ranges over 1 MiB in a list of their own.
@@ -2246,6 +2283,20 @@ fn note_race_writes(seq: u64, writes: &super::ranges::Ranges) {
     }
 }
 
+/// The latest batch whose GPU writes overlap [a, a + n).
+fn race_gpu_writer_range(a: u64, n: u64) -> Option<u64> {
+    let g = RACE_GPU_WRITES.lock();
+    let l = g.as_ref()?;
+    let hit = |&&(_, b, m): &&(u64, u64, u64)| b < a + n && a < b + m;
+    let mut best = l.big.iter().filter(hit).map(|e| e.0).max();
+    for page in a >> 12..=(a + n.max(1) - 1) >> 12 {
+        if let Some(s) = l.pages.get(&page).and_then(|v| v.iter().filter(hit).map(|e| e.0).max()) {
+            best = best.max(Some(s));
+        }
+    }
+    best
+}
+
 /// The latest batch whose GPU writes cover `addr`.
 fn race_gpu_writer(addr: u64) -> Option<u64> {
     let g = RACE_GPU_WRITES.lock();
@@ -2268,17 +2319,24 @@ fn check_races(done: u64) {
     };
     for c in due {
         RACE_STATS[0].fetch_add(1, Ordering::Relaxed);
-        let n = 4 * c.words.len() as u64;
+        let n = c.len;
         if !super::cp::guest_readable(c.base, n) {
             continue;
         }
-        let changed = (0..c.words.len()).find(|&j| unsafe { std::ptr::read_volatile((c.base + 4 * j as u64) as *const u32) } != c.words[j]);
-        let Some(j) = changed else { continue };
+        // Small ranges: the first word that changed; larger ones: by hash.
+        let (j, was, now, cpw, gpu) = if c.words.is_empty() {
+            if race_hash(c.base, n) == c.hash {
+                continue;
+            }
+            (usize::MAX, 0, 0, super::cp::cpw_since_range(c.base, n, c.cpw), race_gpu_writer_range(c.base, n))
+        } else {
+            let changed = (0..c.words.len()).find(|&j| unsafe { std::ptr::read_volatile((c.base + 4 * j as u64) as *const u32) } != c.words[j]);
+            let Some(j) = changed else { continue };
+            let w = c.base + 4 * j as u64;
+            (j, c.words[j], unsafe { std::ptr::read_volatile(w as *const u32) }, super::cp::cpw_since(w, c.cpw), race_gpu_writer(w))
+        };
         RACE_STATS[1].fetch_add(1, Ordering::Relaxed);
-        let w = c.base + 4 * j as u64;
-        let now = unsafe { std::ptr::read_volatile(w as *const u32) };
-        let cpw = super::cp::cpw_since(w, c.cpw);
-        let gpu = race_gpu_writer(w);
+        let what = if j == usize::MAX { "the hash".to_string() } else { format!("dword {j} {was:#x} -> {now:#x}") };
         let (cause, by) = match (&cpw, gpu) {
             (Some((s, 0, q, at, op)), _) => (if *s <= c.cpw_submit { 0 } else { 1 }, format!("{q} opcode {op:#x} packet {at:#x}")),
             (Some((_, after, q, at, op)), _) => (if *after >= c.seq || c.why & 1 != 0 { 5 } else { 2 }, format!("{q} opcode {op:#x} packet {at:#x} after batch {after}")),
@@ -2291,17 +2349,17 @@ fn check_races(done: u64) {
         let first = {
             let mut g = RACE_SUMMARY.lock();
             let m = g.get_or_insert_with(HashMap::new);
-            let e = m.entry((cause, c.shader, c.why)).or_insert_with(|| (0, c.base, n, format!("dword {j} {:#x} -> {now:#x} by {by}", c.words[j])));
+            let e = m.entry((cause, c.shader, c.why, c.queue.clone())).or_insert_with(|| (0, c.base, n, format!("{what} by {by}")));
             e.0 += 1;
             e.0 == 1
         };
         if cause < 5 && first {
             crate::info!(
-                "gpu: race check: shader {:#x} read {:#x}+{n:#x} on the GPU (why {:#x}); dword {j} was {:#x} when recorded (flip {}), {now:#x} after batch {} completed (flip {}): {} ({by})",
+                "gpu: race check: {} shader {:#x} read {:#x}+{n:#x} on the GPU (why {:#x}); {what} between recording (flip {}) and the end of batch {} (flip {}): {} ({by})",
+                c.queue,
                 c.shader,
                 c.base,
                 c.why,
-                c.words[j],
                 c.flip,
                 c.seq,
                 super::FRAMES.load(Ordering::Relaxed),
@@ -2329,8 +2387,19 @@ pub fn race_line() -> String {
     if let Some(m) = g.as_ref() {
         let mut v: Vec<_> = m.iter().filter(|(k, _)| k.0 < 5).collect();
         v.sort_by_key(|(_, e)| std::cmp::Reverse(e.0));
-        for ((cause, shader, why), (count, base, n, ex)) in v.into_iter().take(24) {
-            out.push_str(&format!("      {count} x shader {shader:#x} (why {why:#x}) {base:#x}+{n:#x}: {ex}; {}\n", RACE_CAUSES[*cause]));
+        for ((cause, shader, why, queue), (count, base, n, ex)) in v.into_iter().take(24) {
+            out.push_str(&format!("      {count} x {queue} shader {shader:#x} (why {why:#x}) {base:#x}+{n:#x}: {ex}; {}\n", RACE_CAUSES[*cause]));
+        }
+    }
+    drop(g);
+    let opened = OPEN_READ_COUNT.load(Ordering::Relaxed);
+    out.push_str(&format!("    bindings reading another queue's unsubmitted writes (run before them): {opened}\n"));
+    let g = OPEN_READS.lock();
+    if let Some(m) = g.as_ref() {
+        let mut v: Vec<_> = m.iter().collect();
+        v.sort_by_key(|(_, e)| std::cmp::Reverse(e.0));
+        for ((reader, writer, shader), (count, ex)) in v.into_iter().take(16) {
+            out.push_str(&format!("      {count} x {reader} shader {shader:#x} reads {writer}'s: {ex}\n"));
         }
     }
     let u: Vec<u64> = UNORDERED.iter().map(|c| c.load(Ordering::Relaxed)).collect();
@@ -3609,6 +3678,8 @@ pub struct Exec {
     own_checks: Vec<SpecCheck>,
     /// Race checks of the batch being recorded (`tune race_checks`).
     race_pending: Vec<RaceCheck>,
+    race_id: u64,
+    race_name: std::sync::Arc<str>,
     /// Forwarded copies recorded into the batch being recorded (`gpu::forward`).
     forward_ids: Vec<u64>,
     /// The compute queue id in this executor's name (`gpu-acb<id>`; 0: none)
@@ -3669,6 +3740,9 @@ pub static DATA_SNAPS: AtomicU64 = AtomicU64::new(0);
 /// Render passes ended without a barrier of their own because a full one
 /// followed at once (`end_rendering_before_barrier`).
 pub static MERGED_PASS_BARRIERS: AtomicU64 = AtomicU64::new(0);
+/// GPU-performed CP writes with resident shadows in the batch: [shadows
+/// merged first, written with shadows unmerged (`tune label_merge 0`)].
+pub static LABEL_MERGES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// Batch slots deferred executors made beyond their first two (statistics).
 pub static WORKER_SLOTS: AtomicU64 = AtomicU64::new(0);
 
@@ -3769,6 +3843,8 @@ impl Exec {
                 tex_scratch: Vec::new(),
                 own_checks: Vec::new(),
                 race_pending: Vec::new(),
+                race_id: RACE_IDS.fetch_add(1, Ordering::Relaxed),
+                race_name: name.into(),
                 forward_ids: Vec::new(),
                 alt_id: name.strip_prefix("gpu-acb").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).unwrap_or(0),
                 batch_alt: false,
@@ -4060,6 +4136,7 @@ impl Exec {
         INFLIGHT.note_ranges(seq, &writes);
         if super::tune::race_checks() {
             note_race_writes(seq, &writes);
+            self.clear_open_writes(None);
         }
         st.mark(8);
         for (a, v, n) in std::mem::take(&mut self.pending_promises) {
@@ -4108,6 +4185,9 @@ impl Exec {
         self.gpu_writes_open = false;
         self.checks.clear();
         self.race_pending.clear();
+        if super::tune::race_checks() {
+            self.clear_open_writes(None);
+        }
         self.pending.clear();
         self.pending_log.clear();
         self.pending_promises.clear();
@@ -5233,6 +5313,9 @@ impl Exec {
         }
         super::precache::invalidate_gpu(a, n);
         super::forward::written(a, n);
+        if super::tune::race_checks() {
+            self.note_open_write(a, n);
+        }
         self.pending.insert(a, n);
         self.note_since(a, n);
         self.own_gen += 1;
@@ -5276,6 +5359,20 @@ impl Exec {
             self.submit_after = self.submit_after.max(cpu);
         }
         self.begin();
+        // What earlier work of this batch wrote into resident shadows reaches
+        // guest memory before this write does: a title thread that sees the
+        // label reads it there (the shadows were merged only when the batch
+        // was submitted, after the label: `tune label_merge`).
+        if !self.resident.is_empty() {
+            if super::tune::label_merge() {
+                LABEL_MERGES[0].fetch_add(1, Ordering::Relaxed);
+                if self.flush_resident(None).is_err() {
+                    return false;
+                }
+            } else {
+                LABEL_MERGES[1].fetch_add(1, Ordering::Relaxed);
+            }
+        }
         self.gpu_writes_open = true;
         let full = !(end_of_pipe && super::tune::eop_light()) && super::tune::skip_barriers() & 4 == 0;
         if full && self.ts_deferred.is_empty() {
@@ -5756,6 +5853,49 @@ impl Exec {
         }
     }
 
+    /// Diagnosis (`tune race_checks`): this executor's batch being recorded
+    /// writes [a, a + n) (`OPEN_WRITES`).
+    fn note_open_write(&self, a: u64, n: u64) {
+        let mut g = OPEN_WRITES.lock();
+        g.get_or_insert_with(HashMap::new).entry(self.race_id).or_insert_with(|| (self.race_name.clone(), Default::default())).1.insert(a, n);
+    }
+
+    /// Diagnosis: a binding of `shader` reads [a, a + n); counted when another
+    /// queue's batch not yet submitted writes there (`OPEN_READS`).
+    fn note_open_read(&self, shader: u64, a: u64, n: u64) {
+        let g = OPEN_WRITES.lock();
+        let Some(m) = g.as_ref() else { return };
+        let mine = queue_family(&self.race_name);
+        for (id, (q, r)) in m {
+            if *id == self.race_id || queue_family(q) == mine || !r.overlaps(a, n) {
+                continue;
+            }
+            OPEN_READ_COUNT.fetch_add(1, Ordering::Relaxed);
+            let hit: Vec<String> = r.intersect(a, n).into_iter().take(3).map(|(b, k)| format!("{b:#x}+{k:#x}")).collect();
+            let mut o = OPEN_READS.lock();
+            let e = o.get_or_insert_with(HashMap::new).entry((self.race_name.clone(), q.clone(), shader)).or_insert_with(|| (0, format!("binds {a:#x}+{n:#x}, written {} (flip {})", hit.join(" "), super::FRAMES.load(Ordering::Relaxed))));
+            e.0 += 1;
+            if e.0 == 1 && OPEN_READS_LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
+                crate::info!("gpu: race check: {} shader {shader:#x} binds {a:#x}+{n:#x}, which {q}'s batch not yet submitted writes ({})", self.race_name, hit.join(" "));
+            }
+        }
+    }
+
+    /// Diagnosis: this executor's writes went to the device (or were dropped).
+    fn clear_open_writes(&self, which: Option<&super::ranges::Ranges>) {
+        let mut g = OPEN_WRITES.lock();
+        if let Some(e) = g.as_mut().and_then(|m| m.get_mut(&self.race_id)) {
+            match which {
+                Some(w) => {
+                    for (a, n) in w.iter() {
+                        e.1.remove(a, n);
+                    }
+                }
+                None => e.1.clear(),
+            }
+        }
+    }
+
     /// The write of [a, a + n) just noted precedes a full barrier.
     fn ordered_since(&mut self, a: u64, n: u64) {
         if let Some(v) = self.since_barrier.as_mut() {
@@ -5872,6 +6012,7 @@ impl Exec {
             INFLIGHT.note_ranges(seq, &b.writes);
             if super::tune::race_checks() {
                 note_race_writes(seq, &b.writes);
+                self.clear_open_writes(Some(&b.writes));
             }
             super::precache::invalidate_ranges_except(&b.writes, &b.kept);
             self.inflight.insert_all(seq, &b.writes);
@@ -5895,6 +6036,9 @@ impl Exec {
     /// their slots are reset for reuse.
     pub fn discard_closed(&mut self) {
         let c = ctx();
+        if super::tune::race_checks() {
+            self.clear_open_writes(None);
+        }
         for b in std::mem::take(&mut self.closed) {
             let s = &mut self.slots[b.slot];
             unsafe {
@@ -5978,13 +6122,20 @@ impl Exec {
                             placement = Placement::PreCopy;
                         }
                         // Diagnosis: ranges read when the batch executes.
-                        if read_only && (snap.is_none() || pre.is_some()) && size <= 4096 && size % 4 == 0 && super::tune::race_checks() && !self.pending.overlaps(base, size) && super::cp::guest_readable(base, size) {
+                        if read_only && super::tune::race_checks() && size <= 1 << 28 {
+                            self.note_open_read(p.addr, base, size);
+                        }
+                        if read_only && (snap.is_none() || pre.is_some()) && size <= super::tune::race_max() && size % 4 == 0 && super::tune::race_checks() && !self.pending.overlaps(base, size) && super::cp::guest_readable(base, size) {
                             let r = [(base, size)];
                             let mut why = if CP_WRITES.latest(&r).is_some() { 1 } else { 0 } | if INFLIGHT.latest(&r).is_some() { 2 } else { 0 } | if data_load { 0 } else { 4 };
                             why |= 16 << if home.is_some() { 3 } else if pre.is_some() { 2 } else if mirrored.is_some() { 1 } else { 0 };
-                            let words: Vec<u32> = (0..size / 4).map(|j| unsafe { std::ptr::read_volatile((base + 4 * j) as *const u32) }).collect();
+                            let (words, hash) = if size <= 4096 {
+                                ((0..size / 4).map(|j| unsafe { std::ptr::read_volatile((base + 4 * j) as *const u32) }).collect(), 0)
+                            } else {
+                                (Vec::new(), race_hash(base, size))
+                            };
                             let cpw = super::cp::CPW_SEQ.load(Ordering::Acquire);
-                            self.race_pending.push(RaceCheck { seq: 0, shader: p.addr, base, words, flip: super::FRAMES.load(Ordering::Relaxed), why, cpw, cpw_submit: 0 });
+                            self.race_pending.push(RaceCheck { seq: 0, shader: p.addr, base, words, len: size, hash, queue: self.race_name.clone(), flip: super::FRAMES.load(Ordering::Relaxed), why, cpw, cpw_submit: 0 });
                         }
                         let snap = snap.or(pre);
                         let mut span = if size > 0 && mirrored.is_none() && snap.is_none() && home.is_none() { span(base, size) } else { None };
@@ -6735,6 +6886,9 @@ impl Exec {
             self.own_gen += 1;
             for &(b, n) in &writes_here {
                 super::forward::written(b, n);
+                if super::tune::race_checks() {
+                    self.note_open_write(b, n);
+                }
                 self.pending.insert(b, n);
                 self.note_since(b, n);
                 if verify::enabled() {
@@ -6812,13 +6966,15 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them behind a barrier of their own; stages prepared again with GPU-side data loads {:?} ({} programs since with them); {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills, {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them behind a barrier of their own; stages prepared again with GPU-side data loads {:?} ({} programs since with them); {} render passes ended into the next full barrier; GPU-performed CP writes after merging resident shadows {} (written before the merge {}); draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills, {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         INDIRECT_BARRIERS[0].load(Ordering::Relaxed),
         HYBRID_LOADS.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),
         shaders::gpu_loads_programs(),
         MERGED_PASS_BARRIERS.load(Ordering::Relaxed),
+        LABEL_MERGES[0].load(Ordering::Relaxed),
+        LABEL_MERGES[1].load(Ordering::Relaxed),
         FEEDBACK[0].load(Ordering::Relaxed),
         FEEDBACK[1].load(Ordering::Relaxed),
         FEEDBACK_KINDS.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),
