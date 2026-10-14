@@ -3074,13 +3074,14 @@ fn pre_repeat_line() -> String {
 pub(super) static CS_PHASES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 pub(super) static DRAW_PHASES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
-/// Command-processor time per compute shader while profiling: [dispatches,
-/// then ns until prepared, until textures and pipeline, until bound, in all].
-static CS_CPU: Mutex<Option<HashMap<u64, [u64; 5]>>> = Mutex::new(None);
+/// Command-processor time per compute shader and dispatch kind (`CS_KINDS`)
+/// while profiling: [dispatches, then ns until prepared, until textures and
+/// pipeline, until bound, in all].
+static CS_CPU: Mutex<Option<HashMap<(u64, usize), [u64; 5]>>> = Mutex::new(None);
 
-fn note_cs_cpu(addr: u64, t: [std::time::Duration; 4]) {
+fn note_cs_cpu(addr: u64, kind: usize, t: [std::time::Duration; 4]) {
     let mut g = CS_CPU.lock();
-    let e = g.get_or_insert_with(HashMap::new).entry(addr).or_insert([0; 5]);
+    let e = g.get_or_insert_with(HashMap::new).entry((addr, kind)).or_insert([0; 5]);
     e[0] += 1;
     for k in 0..4 {
         e[k + 1] += t[k].as_nanos() as u64;
@@ -3091,15 +3092,28 @@ fn note_cs_cpu(addr: u64, t: [std::time::Duration; 4]) {
 fn cs_cpu_lines() -> String {
     let g = CS_CPU.lock();
     let Some(m) = g.as_ref() else { return String::new() };
-    let mut v: Vec<(&u64, &[u64; 5])> = m.iter().collect();
+    let mut v: Vec<(&(u64, usize), &[u64; 5])> = m.iter().collect();
     v.sort_by(|a, b| b.1[4].cmp(&a.1[4]));
     let all: u64 = v.iter().map(|x| x.1[4]).sum();
     let mut s = format!("    command-processor time by compute shader ({} ms in all):\n", all / 1_000_000);
-    for (a, x) in v.iter().take(12) {
+    // The 16 costliest, then the graphics command processor's own (its
+    // serial runs and its chunks of parallel ones) and the compute queues'
+    // costliest indirect ones, with their buffer placements.
+    let main: Vec<&(&(u64, usize), &[u64; 5])> = v.iter().filter(|x| x.0 .1 == 0).take(10).collect();
+    let n_main = main.len();
+    let indirect: Vec<&(&(u64, usize), &[u64; 5])> = v.iter().filter(|x| x.0 .1 == 3).take(10).collect();
+    for (i, ((a, kind), x)) in v.iter().take(16).chain(main.into_iter()).chain(indirect.into_iter()).enumerate() {
+        if i == 16 {
+            s.push_str("    the graphics command processor's own dispatches by its time:\n");
+        }
+        if i == 16 + n_main {
+            s.push_str("    compute queues' indirect dispatches by command-processor time:\n");
+        }
         let n = x[0].max(1) as f64;
         let us = |k: usize| x[k] as f64 / n / 1000.0;
         s.push_str(&format!(
-            "      cs {a:#x}: {} dispatches, {} ms, us each: prepare and waits {:.1}, textures and pipeline {:.1}, bindings {:.1}, recording {:.1}\n",
+            "      cs {a:#x} ({}): {} dispatches, {} ms, us each: prepare and waits {:.1}, textures and pipeline {:.1}, bindings {:.1}, recording {:.1}\n",
+            CS_KINDS[*kind],
             x[0],
             x[4] / 1_000_000,
             us(1),
@@ -3107,6 +3121,12 @@ fn cs_cpu_lines() -> String {
             us(3) - us(2),
             us(4) - us(3)
         ));
+        if i >= 16 {
+            if let Some(l) = placement_line(*a) {
+                s.push_str(&l);
+                s.push('\n');
+            }
+        }
     }
     s
 }
@@ -3141,13 +3161,19 @@ pub(super) const DRAW_STEP_NAMES: [&str; 18] = [
     "index and draw", "write tracking",
 ];
 
-/// The same per dispatch (all queues), steps of `CS_STEP_NAMES`; the count
-/// is CS_PHASES[4].
-pub(super) static CS_STEPS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
-pub(super) const CS_STEP_NAMES: [&str; 16] = [
+/// The same per dispatch by kind (`CS_KINDS`), steps of `CS_STEP_NAMES`
+/// and then the count of dispatches recorded to the end.
+pub(super) static CS_STEPS: [[AtomicU64; CS_STEP_COUNT + 1]; 6] = [const { [const { AtomicU64::new(0) }; CS_STEP_COUNT + 1] }; 6];
+const CS_STEP_COUNT: usize = 19;
+pub(super) const CS_STEP_NAMES: [&str; CS_STEP_COUNT] = [
     "prepare", "shader-read sync", "texture sync", "image hazards", "pipeline", "reserve", "bind", "sgpr data", "set alloc",
-    "image notes", "set write", "shadow copies", "dispatch", "shadows after", "mirrors", "write tracking",
+    "image notes", "set write", "shadow copies", "dispatch", "shadows after", "mirrors", "write tracking", "argument merge",
+    "indirect checks", "indirect barrier",
 ];
+/// Dispatch kinds of the profile: direct or indirect (arguments read by the
+/// GPU), by the graphics command processor, its parallel workers or a
+/// compute queue's command processor (`Exec::cs_kind`).
+const CS_KINDS: [&str; 6] = ["graphics direct", "graphics indirect", "compute direct", "compute indirect", "graphics workers direct", "graphics workers indirect"];
 
 /// Lap timer of a command's steps (profiling only).
 pub(super) struct Laps {
@@ -3159,8 +3185,8 @@ impl Laps {
     pub(super) fn new() -> Laps {
         Laps { last: profiling().then(std::time::Instant::now), steps: &DRAW_STEPS }
     }
-    fn for_dispatch() -> Laps {
-        Laps { last: profiling().then(std::time::Instant::now), steps: &CS_STEPS }
+    fn for_dispatch(kind: usize) -> Laps {
+        Laps { last: profiling().then(std::time::Instant::now), steps: &CS_STEPS[kind][..CS_STEP_COUNT] }
     }
     /// Adds the time since the last mark to step `k`.
     pub(super) fn mark(&mut self, k: usize) {
@@ -3231,9 +3257,17 @@ fn sync_steps_line_inner() -> String {
 fn draw_steps_line() -> String {
     let n = DRAW_PHASES[4].load(Ordering::Relaxed).max(1);
     let parts: Vec<String> = DRAW_STEP_NAMES.iter().zip(DRAW_STEPS.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
-    let n = CS_PHASES[4].load(Ordering::Relaxed).max(1);
-    let cs: Vec<String> = CS_STEP_NAMES.iter().zip(CS_STEPS.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
-    format!("    command processor per draw by step (us): {}\n    command processor per dispatch by step (us): {}\n", parts.join(", "), cs.join(", "))
+    let mut s = format!("    command processor per draw by step (us): {}\n", parts.join(", "));
+    for (kind, steps) in CS_KINDS.iter().zip(CS_STEPS.iter()) {
+        let n = steps[CS_STEP_COUNT].load(Ordering::Relaxed);
+        if n == 0 {
+            continue;
+        }
+        let total: u64 = steps[..CS_STEP_COUNT].iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        let cs: Vec<String> = CS_STEP_NAMES.iter().zip(steps.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
+        s.push_str(&format!("    command processor per dispatch by step ({kind}: {n}, {:.1} us each): {}\n", total as f64 / n as f64 / 1000.0, cs.join(", ")));
+    }
+    s
 }
 
 /// GPU time inside batches (first to last command), ns.
@@ -3409,7 +3443,7 @@ pub fn reset_shader_profile() {
     for c in crate::mem::WRITE_WATCH_STATS.iter() {
         c.store(0, Ordering::Relaxed);
     }
-    for c in DRAW_STEPS.iter().chain(CS_STEPS.iter()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()) {
+    for c in DRAW_STEPS.iter().chain(CS_STEPS.iter().flatten()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     for c in CS_PHASES.iter().chain(DRAW_PHASES.iter()) {
@@ -5453,6 +5487,76 @@ impl Exec {
         true
     }
 
+    /// The per-view copy kernel recorded as a buffer update of the words
+    /// `forward::compute` found for it (`tune copy_update`): at the
+    /// dispatch's place in the stream behind the same lazy barrier, later
+    /// draws and dispatches ordered after it as after a dispatch, only the
+    /// words it writes noted as written, and its forwarding entry started
+    /// (checked against memory once the batch completed). None: recorded.
+    /// Some: left to the dispatch (the computation given back) when the
+    /// destination lies in a video-memory home, overlaps a resident shadow
+    /// or the copy's inputs, or is not mapped for the GPU.
+    fn copy_as_update(&mut self, p: &Prepared, c: (u64, Vec<u32>, super::forward::Inputs)) -> Option<(u64, Vec<u32>, super::forward::Inputs)> {
+        let (base, bytes) = (c.0, 4 * c.1.len() as u64);
+        let refuse = |c| {
+            super::forward::UPDATES[2].fetch_add(1, Ordering::Relaxed);
+            Some(c)
+        };
+        if bytes == 0 || base % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(base, bytes) || c.2.overlaps(base, bytes) {
+            return refuse(c);
+        }
+        if self.resident.iter().any(|r| r.guest < base + bytes && base < r.guest + r.range) {
+            return refuse(c);
+        }
+        let Some((buffer, start, end)) = span(base, bytes) else { return refuse(c) };
+        if base + bytes > end {
+            return refuse(c);
+        }
+        self.begin();
+        if !self.recording {
+            return refuse(c);
+        }
+        // A CP write still pending into the destination is performed before
+        // this batch is submitted (as for a binding of it in place).
+        if let Some(s) = CP_WRITES.latest(&[(base, bytes)]) {
+            self.submit_after = self.submit_after.max(s);
+        }
+        self.end_rendering_lazy();
+        if lazy_barriers() && self.barrier_wanted {
+            if super::tune::skip_barriers() & 16 == 0 {
+                self.barrier();
+            }
+            self.barrier_wanted = false;
+            self.dispatched = false;
+        }
+        let (base, words, from) = c;
+        let raw: &[u8] = unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, bytes as usize) };
+        let cmd = self.cmd();
+        for (k, part) in raw.chunks(65536).enumerate() {
+            unsafe { ctx().device.cmd_update_buffer(cmd, buffer, base - start + 65536 * k as u64, part) };
+        }
+        if lazy_barriers() {
+            // Later draws and dispatches wait for it as for a dispatch.
+            self.dispatched = true;
+        } else {
+            self.barrier();
+        }
+        let w = [(base, bytes)];
+        super::images::with(|im| im.note_writes(&w, &w));
+        super::mirror::invalidate(&w);
+        super::track::gpu_write(base, bytes);
+        self.note_write(base, bytes);
+        // The next dispatch notes its writes again (these changed the record).
+        self.last_notes.2 = [u64::MAX; 4];
+        super::forward::UPDATES[0].fetch_add(1, Ordering::Relaxed);
+        super::forward::UPDATES[1].fetch_add(words.len() as u64, Ordering::Relaxed);
+        let id = super::forward::add(base, words, p.addr, p.code_hash, from);
+        self.forward_ids.push(id);
+        EXECUTED.fetch_add(1, Ordering::Relaxed);
+        self.batch_shaders.push(p.addr);
+        None
+    }
+
     /// An end-of-pipe timestamp write (RELEASE_MEM DATA_SEL 3/4) performed by
     /// the GPU in order with this queue's work: the GPU clock when the work
     /// before it completed (vkCmdWriteTimestamp at the bottom of the pipe),
@@ -6514,6 +6618,18 @@ impl Exec {
         self.split_if_gpu_idle();
     }
 
+    /// The profile's dispatch kind (`CS_KINDS`) of a dispatch recorded here.
+    fn cs_kind(&self, indirect: bool) -> usize {
+        indirect as usize
+            + if self.alt_id != 0 {
+                2
+            } else if self.deferred {
+                4
+            } else {
+                0
+            }
+    }
+
     /// An indirect dispatch whose arguments (12 bytes at `args`) GPU work
     /// still writes, with the GPU reading them (vkCmdDispatchIndirect): the
     /// command processor would otherwise submit, wait for that work and read
@@ -6527,6 +6643,7 @@ impl Exec {
         if [0x204, 0x205, 0x206].iter().any(|&r| cp.reg(Space::Sh, r) != 0) {
             return false;
         }
+        let mut lap = Laps::for_dispatch(self.cs_kind(true));
         let r = [(args, 12)];
         if !(self.overlaps_pending(&r) || INFLIGHT.latest(&r).is_some() || CP_WRITES.latest(&r).is_some()) {
             return false;
@@ -6535,6 +6652,7 @@ impl Exec {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             return true;
         }
+        lap.mark(17);
         GPU_INDIRECT.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = self.dispatch_inner(cp, [1, 1, 1], initiator, Some(args)) {
             if e != STOPPED {
@@ -6555,7 +6673,8 @@ impl Exec {
         let t_start = std::time::Instant::now();
         let t0 = profiling().then_some(t_start);
         let since = |t0: Option<std::time::Instant>| t0.map_or(std::time::Duration::ZERO, |t| t.elapsed());
-        let mut lap = Laps::for_dispatch();
+        let kind = self.cs_kind(indirect.is_some());
+        let mut lap = Laps::for_dispatch(kind);
         if let Some(a) = indirect {
             // A resident shadow holding newer arguments is merged back first,
             // unless the GPU reads them from its working copy (`tune
@@ -6563,6 +6682,7 @@ impl Exec {
             if !(super::tune::shadow_args() && self.resident_args(a).is_some()) {
                 self.flush_resident(Some(&[(a, 12)]))?;
             }
+            lap.mark(16);
         }
         let wave64 = initiator & (1 << 15) == 0;
         // Prepared ahead by the workers (`gpu::ahead`) when it still holds.
@@ -6616,6 +6736,29 @@ impl Exec {
         }
         let t_prep = since(t0);
         trace_loads(&self.name, &p, groups);
+        // The per-view copy kernel as a buffer update of the words it leaves
+        // (`tune copy_update`); its computation is reused for forwarding when
+        // it stays a dispatch (None: not tried, Some(None): refused).
+        let forward_here = super::tune::forward_copies() && !self.deferred && indirect.is_none() && self.name == "gpu-gfx";
+        let mut forwarded: Option<Option<(u64, Vec<u32>, super::forward::Inputs)>> = None;
+        if forward_here
+            && super::tune::copy_update()
+            && patches.is_none()
+            && initiator & (1 << 5) == 0
+            && (0x204..0x207).all(|r| cp.reg(Space::Sh, r) == 0)
+            && !verify::enabled()
+            && !super::tune::race_checks()
+            && !super::capture::capturing()
+        {
+            let busy = |r: &[(u64, u64)]| self.overlaps_pending_ro(r) || INFLIGHT.latest(r).is_some() || CP_WRITES.latest(r).is_some();
+            match super::forward::compute(&p, groups, local, busy) {
+                Some(c) => match self.copy_as_update(&p, c) {
+                    None => return Ok(()),
+                    Some(c) => forwarded = Some(Some(c)),
+                },
+                None => forwarded = Some(None),
+            }
+        }
         self.grow_sampled_depth(&[&p]);
         // Fast clears, overwrite reloads and block copies of the images, as
         // for draws: the keys from this thread's memos, the cache's lock only
@@ -6848,6 +6991,7 @@ impl Exec {
             }
             bind_descriptors(cmd, vk::PipelineBindPoint::COMPUTE, layout, set, std::slice::from_ref(&bound), &mut self.dyncache.pushed[1], rebound);
             if let Some((buffer, offset)) = args {
+                lap.mark(12);
                 // Work of this batch since its last barrier wrote the
                 // arguments (`tune exact_indirect`; earlier batches complete
                 // before this one starts).
@@ -6858,6 +7002,7 @@ impl Exec {
                 } else {
                     INDIRECT_BARRIERS[1].fetch_add(1, Ordering::Relaxed);
                 }
+                lap.mark(18);
                 c.device.cmd_dispatch_indirect(cmd, buffer, offset);
             } else if start != [0, 0, 0] {
                 c.device.cmd_dispatch_base(cmd, start[0], start[1], start[2], groups[0].saturating_sub(start[0]), groups[1].saturating_sub(start[1]), groups[2].saturating_sub(start[2]));
@@ -6963,9 +7108,13 @@ impl Exec {
             }
         }
         lap.mark(15);
-        if super::tune::forward_copies() && !self.deferred && indirect.is_none() && self.name == "gpu-gfx" {
+        if forward_here {
             let busy = |r: &[(u64, u64)]| self.overlaps_pending_ro(r) || INFLIGHT.latest(r).is_some() || CP_WRITES.latest(r).is_some();
-            if let Some((base, words, from)) = super::forward::compute(&p, groups, local, busy) {
+            let computed = match forwarded {
+                Some(c) => c,
+                None => super::forward::compute(&p, groups, local, busy),
+            };
+            if let Some((base, words, from)) = computed {
                 let id = super::forward::add(base, words, p.addr, p.code_hash, from);
                 self.forward_ids.push(id);
             }
@@ -6975,7 +7124,8 @@ impl Exec {
         let total = t_start.elapsed();
         if profiling() {
             note_phases(&CS_PHASES, [t_prep, t_pipe, t_bind, total]);
-            note_cs_cpu(p.addr, [t_prep, t_pipe, t_bind, total]);
+            note_cs_cpu(p.addr, kind, [t_prep, t_pipe, t_bind, total]);
+            CS_STEPS[kind][CS_STEP_COUNT].fetch_add(1, Ordering::Relaxed);
         }
         if total.as_millis() >= 200 {
             let phases = if profiling() { format!(" (prepare {} ms, pipeline {} ms, bindings {} ms)", t_prep.as_millis(), (t_pipe - t_prep).as_millis(), (t_bind - t_pipe).as_millis()) } else { String::new() };

@@ -104,6 +104,17 @@ pub fn enabled() -> bool {
     super::tune::ahead() > 0
 }
 
+/// Whether a command processor (a compute queue's: `compute`) hands its
+/// stages to the workers (`tune ahead_queues`).
+pub fn enabled_for(compute: bool) -> bool {
+    enabled()
+        && match super::tune::ahead_queues() {
+            1 => compute,
+            2 => !compute,
+            _ => true,
+        }
+}
+
 fn ensure_workers() {
     let want = super::tune::ahead().min(16) as usize;
     while WORKERS.load(Ordering::Acquire) < want {

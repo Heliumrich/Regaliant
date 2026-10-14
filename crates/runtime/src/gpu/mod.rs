@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 92] = [
+    static ALL: [Tunable; 94] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -119,6 +119,8 @@ pub mod tune {
         Tunable { name: "timer_sleep", env: "DS_TIMER_SLEEP", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "cp_classes_acb", env: "DS_CP_CLASSES_ACB", default: 0x50, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_args", env: "DS_SHADOW_ARGS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "ahead_queues", env: "DS_AHEAD_QUEUES", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "copy_update", env: "DS_COPY_UPDATE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -951,6 +953,24 @@ pub mod tune {
         get(91) != 0
     }
 
+    /// The command processors whose synchronization-free runs the `ahead`
+    /// workers prepare: 0 all, 1 the compute queues only (they record
+    /// serially; the graphics queue's runs mostly go to parallel workers),
+    /// 2 the graphics queue only.
+    #[inline]
+    pub fn ahead_queues() -> u64 {
+        get(92)
+    }
+
+    /// The per-view copy kernel (`gpu::forward`) is recorded by the graphics
+    /// command processor as a buffer update of the words it computed for it
+    /// instead of a dispatch (no stage binding, SGPR data, descriptors or
+    /// shader; the same place in the stream and the same lazy barriers).
+    #[inline]
+    pub fn copy_update() -> bool {
+        get(93) != 0
+    }
+
     /// A switch's value by name; None if unknown.
     pub fn value(name: &str) -> Option<u64> {
         ALL.iter().position(|t| t.name == name).map(get)
@@ -1323,6 +1343,7 @@ fn worker(q: &'static Queue, name: &str) {
         forward::enable_here();
         prio::set_main();
     }
+    shaders::set_compute_queue(q.id != GFX);
     cp.wait_flag = Some(&q.cp_waiting);
     // Register states kept for a frame replay (`Ctl::Save`).
     let mut saved: [Option<cp::ChunkState>; 2] = [None, None];

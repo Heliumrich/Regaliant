@@ -1129,7 +1129,7 @@ impl Cp {
                 return Some(next);
             }
             commands += command as u64;
-            if command && self.ahead.is_empty() && super::ahead::enabled() {
+            if command && self.ahead.is_empty() && super::ahead::enabled_for(self.compute) {
                 self.scan_ahead(&f, next, to);
             }
             cur = next;
@@ -2270,7 +2270,7 @@ impl Cp {
                 for s in self.take_ahead().iter().flatten() {
                     s.cancel();
                 }
-                if self.ahead.is_empty() && matches!(flow, Flow::Next) && !f.live && self.exec.is_some() && super::ahead::enabled() {
+                if self.ahead.is_empty() && matches!(flow, Flow::Next) && !f.live && self.exec.is_some() && super::ahead::enabled_for(self.compute) {
                     // Within a parallel run's first chunk, only to its end.
                     let until = self.par.as_ref().map_or(end, |p| p.starts[p.next].min(end));
                     self.scan_ahead(&f, next, until);

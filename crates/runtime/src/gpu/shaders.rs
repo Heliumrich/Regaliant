@@ -1196,14 +1196,16 @@ pub fn describe_loads(p: &Prepared) -> Vec<String> {
 /// How often a stage's preparation repeats the previous one on its thread
 /// (profile): [calls, same program / user data / register state, and the
 /// same bytes read] per stage (vertex, pixel, compute).
-pub static REPEATS: [[std::sync::atomic::AtomicU64; 3]; 3] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 3];
+pub static REPEATS: [[std::sync::atomic::AtomicU64; 3]; 4] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 4];
 /// The same with only the user-data dwords that descriptors and scalar
 /// loads depend on in the key: [same deps, also same bytes] per stage.
-pub static REPEATS_DEPS: [[std::sync::atomic::AtomicU64; 2]; 3] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 3];
+pub static REPEATS_DEPS: [[std::sync::atomic::AtomicU64; 2]; 4] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 4];
 
 thread_local! {
-    static LAST_PREP: std::cell::RefCell<[(u64, u64); 3]> = const { std::cell::RefCell::new([(0, 0); 3]) };
-    static LAST_DEPS: std::cell::RefCell<[(u64, u64); 3]> = const { std::cell::RefCell::new([(0, 0); 3]) };
+    static LAST_PREP: std::cell::RefCell<[(u64, u64); 4]> = const { std::cell::RefCell::new([(0, 0); 4]) };
+    static LAST_DEPS: std::cell::RefCell<[(u64, u64); 4]> = const { std::cell::RefCell::new([(0, 0); 4]) };
+    /// This thread is a compute queue's command processor (statistics).
+    static COMPUTE_QUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// User-data dwords that a plan's descriptors and scalar loads depend on.
@@ -1238,7 +1240,25 @@ fn user_deps(plan: &rdna::analysis::Plan) -> u32 {
 /// (profile; how much a cache across frames could serve): per stage
 /// [calls, same full inputs, same inputs counting only the user data the
 /// descriptors depend on].
-pub static CROSS_FRAME: [[std::sync::atomic::AtomicU64; 3]; 3] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 3];
+pub static CROSS_FRAME: [[std::sync::atomic::AtomicU64; 3]; 4] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 4];
+
+/// Marks the calling thread as a compute queue's command processor: its
+/// compute preparations are counted apart from the graphics queue's
+/// (`repeats_line`).
+pub fn set_compute_queue(on: bool) {
+    COMPUTE_QUEUE.with(|c| c.set(on));
+}
+
+/// The repeat statistics' class of a stage: vertex, pixel, compute on the
+/// graphics queue (and its workers), compute on a compute queue.
+fn stat_slot(stage: Stage) -> usize {
+    match stage {
+        Stage::Vertex => 0,
+        Stage::Fragment => 1,
+        _ if COMPUTE_QUEUE.with(|c| c.get()) => 3,
+        _ => 2,
+    }
+}
 
 /// (frame, this frame's (kind, stage, key, bytes) set, the previous frame's).
 type FrameSets = (u64, super::fx::Set<(u8, u8, u64, u64)>, super::fx::Set<(u8, u8, u64, u64)>);
@@ -1262,11 +1282,7 @@ fn seen_last_frame(kind: u8, stage: usize, key: u64, bytes: u64) -> bool {
 
 fn note_repeat_deps(stage: Stage, key: u64, bytes: u64) {
     use std::sync::atomic::Ordering;
-    let s = match stage {
-        Stage::Vertex => 0,
-        Stage::Fragment => 1,
-        _ => 2,
-    };
+    let s = stat_slot(stage);
     if seen_last_frame(1, s, key, bytes) {
         CROSS_FRAME[s][2].fetch_add(1, Ordering::Relaxed);
     }
@@ -1284,11 +1300,7 @@ fn note_repeat_deps(stage: Stage, key: u64, bytes: u64) {
 
 fn note_repeat(stage: Stage, key: u64, reads: &[(u64, u64)]) -> u64 {
     use std::sync::atomic::Ordering;
-    let s = match stage {
-        Stage::Vertex => 0,
-        Stage::Fragment => 1,
-        _ => 2,
-    };
+    let s = stat_slot(stage);
     let mut h = super::fx::FxHasher::default();
     for &(a, n) in reads {
         h.write_u64(a);
@@ -1326,8 +1338,8 @@ fn note_repeat(stage: Stage, key: u64, reads: &[(u64, u64)]) -> u64 {
 /// One line on how often preparations repeat (profile report).
 pub fn repeats_line() -> String {
     use std::sync::atomic::Ordering;
-    let names = ["vertex", "pixel", "compute"];
-    let parts: Vec<String> = (0..3)
+    let names = ["vertex", "pixel", "compute (graphics queue)", "compute (compute queues)"];
+    let parts: Vec<String> = (0..4)
         .map(|s| {
             let r = &REPEATS[s];
             let n = r[0].load(Ordering::Relaxed).max(1);
@@ -1344,7 +1356,7 @@ pub fn repeats_line() -> String {
         })
         .collect();
     let (h, m) = (PREP_HITS.load(Ordering::Relaxed), PREP_MISSES.load(Ordering::Relaxed));
-    let cross: Vec<String> = (0..3)
+    let cross: Vec<String> = (0..4)
         .map(|s| {
             let c = &CROSS_FRAME[s];
             let n = c[0].load(Ordering::Relaxed).max(1);

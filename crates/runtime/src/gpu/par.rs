@@ -226,6 +226,8 @@ static ENDS: Mutex<Vec<(usize, u64, u64)>> = Mutex::new(Vec::new());
 /// The same for the compute queues' runs (`tune par_compute`).
 static LENGTHS_C: Mutex<[[u64; 2]; 6]> = Mutex::new([[0; 2]; 6]);
 static ENDS_C: Mutex<Vec<(usize, u64, u64)>> = Mutex::new(Vec::new());
+/// The graphics queue's runs of fewer than 32 commands by what ended them.
+static ENDS_SHORT: Mutex<Vec<(usize, u64, u64)>> = Mutex::new(Vec::new());
 
 /// A run of `n` commands ended by `why` (planner statistics); `compute`: of
 /// a compute queue.
@@ -242,13 +244,19 @@ pub fn note_run(n: usize, why: usize, compute: bool) {
     let mut g = lengths.lock();
     g[b][0] += 1;
     g[b][1] += n as u64;
-    let mut e = ends.lock();
-    match e.iter_mut().find(|x| x.0 == why) {
-        Some(x) => {
-            x.1 += 1;
-            x.2 += n as u64;
+    let note = |ends: &Mutex<Vec<(usize, u64, u64)>>| {
+        let mut e = ends.lock();
+        match e.iter_mut().find(|x| x.0 == why) {
+            Some(x) => {
+                x.1 += 1;
+                x.2 += n as u64;
+            }
+            None => e.push((why, 1, n as u64)),
         }
-        None => e.push((why, 1, n as u64)),
+    };
+    note(ends);
+    if !compute && n < 32 {
+        note(&ENDS_SHORT);
     }
 }
 
@@ -421,6 +429,7 @@ pub fn reset_stats() {
     ENDS.lock().clear();
     *LENGTHS_C.lock() = [[0; 2]; 6];
     ENDS_C.lock().clear();
+    ENDS_SHORT.lock().clear();
 }
 
 /// One status line ("" before any parallel run).
@@ -437,6 +446,8 @@ pub fn status() -> String {
     ends.sort_by(|a, b| b.2.cmp(&a.2));
     let mut ends_c = ENDS_C.lock().clone();
     ends_c.sort_by(|a, b| b.2.cmp(&a.2));
+    let mut ends_s = ENDS_SHORT.lock().clone();
+    ends_s.sort_by(|a, b| b.2.cmp(&a.2));
     let end_name = |w: usize| match w {
         0x130 => "buffer end".to_string(),
         0x131 => "limit".to_string(),
@@ -447,11 +458,12 @@ pub fn status() -> String {
     };
     let ends: Vec<String> = ends.iter().take(10).map(|(w, r, c)| format!("{} {r}/{c}", end_name(*w))).collect();
     let ends_c: Vec<String> = ends_c.iter().take(10).map(|(w, r, c)| format!("{} {r}/{c}", end_name(*w))).collect();
+    let ends_s: Vec<String> = ends_s.iter().take(10).map(|(w, r, c)| format!("{} {r}/{c}", end_name(*w))).collect();
     let mut why = STOP_WHY.lock().clone();
     why.sort_by(|a, b| b.1.cmp(&a.1));
     let why: Vec<String> = why.iter().map(|(w, n)| format!("{w} {n}")).collect();
     format!(
-        "    parallel runs: {runs} runs, {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled, {} worker reads of the main command processor's unsubmitted writes; main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}; compute queues' runs by length {}; by end {}\n",
+        "    parallel runs: {runs} runs, {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled, {} worker reads of the main command processor's unsubmitted writes; main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}; runs under 32 commands by end {}; compute queues' runs by length {}; by end {}\n",
         CHUNKS.load(Ordering::Relaxed),
         COMMANDS.load(Ordering::Relaxed),
         split(),
@@ -471,6 +483,7 @@ pub fn status() -> String {
         PHASE_NS[4].load(Ordering::Relaxed) as f64 / CHUNKS.load(Ordering::Relaxed).max(1) as f64 / 1e3,
         lens.join(", "),
         ends.join(", "),
+        ends_s.join(", "),
         lens_c.join(", "),
         ends_c.join(", ")
     )

@@ -52,6 +52,14 @@ pub struct Inputs {
     modulus: u64,
 }
 
+impl Inputs {
+    /// Whether the copy's source or control block overlaps [a, a + n).
+    pub fn overlaps(&self, a: u64, n: u64) -> bool {
+        let src_end = self.src + (self.src_words.len() as u64).saturating_sub(1) * self.stride + 4;
+        (self.src < a + n && a < src_end) || (self.cb < a + n && a < self.cb + 8)
+    }
+}
+
 static ENTRIES: RwLock<Vec<Entry>> = RwLock::new(Vec::new());
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 static GEN: AtomicU64 = AtomicU64::new(1);
@@ -67,6 +75,12 @@ const MAX_ENTRIES: usize = 64;
 /// title had rewritten the destination, words the title rewrote after the
 /// copy ran].
 pub static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+/// Copies recorded as buffer updates of their computed words instead of
+/// dispatches (`tune copy_update`; `Exec::copy_as_update`): [recorded, words
+/// written, computed but recorded as dispatches (a home, a resident shadow
+/// or unmapped memory at the destination)].
+pub static UPDATES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Resource indices of a recognized copy kernel.
 #[derive(Clone, Copy)]
@@ -498,8 +512,9 @@ pub fn status_line() -> String {
     if s[0] == 0 && s[7] == 0 {
         return String::new();
     }
+    let u: Vec<u64> = UPDATES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    forwarded copies: {} made ({} not: inputs still written or odd shapes), {} ended by later writes, {} by the title's rewrites, {} retired after their batch; {} words served, {} stage reads with no wait for the copy; after the copies ran {} words equal, {} as before the copy (it did not land), {} rewritten since\n",
-        s[0], s[7], s[1], s[8], s[2], s[3], s[4], s[5], s[6], s[9]
+        "    forwarded copies: {} made ({} not: inputs still written or odd shapes), {} ended by later writes, {} by the title's rewrites, {} retired after their batch; {} words served, {} stage reads with no wait for the copy; after the copies ran {} words equal, {} as before the copy (it did not land), {} rewritten since; recorded as buffer updates {} ({} words; {} as dispatches)\n",
+        s[0], s[7], s[1], s[8], s[2], s[3], s[4], s[5], s[6], s[9], u[0], u[1], u[2]
     )
 }
