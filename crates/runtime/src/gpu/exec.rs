@@ -1902,7 +1902,9 @@ const OP_PRE: usize = 7;
 const OP_PRE_BYTES: usize = 8;
 const OP_WRITE_BACK_BYTES: usize = 9;
 const OP_FAST_CLEARS: usize = 10;
-const OPS: usize = 11;
+/// Rendering instances ended (`seg_stamps` names segments by it).
+pub(super) const OP_PASS_ENDS: usize = 11;
+const OPS: usize = 12;
 
 fn ops_line(ops: &[u64; OPS]) -> String {
     let kib = |b: u64| b.div_ceil(1024);
@@ -3000,7 +3002,7 @@ static SEG_PAIRS: Mutex<Option<HashMap<SitePair, [u64; 2]>>> = Mutex::new(None);
 
 /// What a segment without commands recorded (its operation counts' change).
 fn seg_kind(a: &[u64; OPS], b: &[u64; OPS]) -> &'static str {
-    const KINDS: [(usize, &str); 7] = [
+    const KINDS: [(usize, &str); 8] = [
         (OP_MERGES, "shadow merges"),
         (OP_SHADOWS_IN, "shadow copies in"),
         (OP_TIMESTAMPS, "timestamps"),
@@ -3008,6 +3010,7 @@ fn seg_kind(a: &[u64; OPS], b: &[u64; OPS]) -> &'static str {
         (OP_FILLS, "buffer fills"),
         (OP_FAST_CLEARS, "fast clears"),
         (OP_WRITE_BACK_BYTES, "home write-backs"),
+        (OP_PASS_ENDS, "rendering ends"),
     ];
     KINDS.iter().find(|&&(k, _)| b[k] > a[k]).map_or("barriers only", |&(_, n)| n)
 }
@@ -5608,9 +5611,8 @@ impl Exec {
         let cmd = self.cmd();
         let raw: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
         self.taint_resident(a, bytes);
-        // Counted before its barriers (`seg_stamps` names the segment by it).
-        self.ops[OP_CP_WRITES] += 1;
         if end_of_pipe && super::tune::eop_light() {
+            self.ops[OP_CP_WRITES] += 1;
             // An end-of-pipe write (RELEASE_MEM): after the work before it,
             // which it does not hold later work back for (as on the console);
             // later transfers wait for it. A wait on it in this batch orders
@@ -5623,9 +5625,13 @@ impl Exec {
             self.eop_unordered = true;
             EOP_LIGHT[0].fetch_add(1, Ordering::Relaxed);
         } else if super::tune::skip_barriers() & 4 != 0 {
+            self.ops[OP_CP_WRITES] += 1;
             unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
         } else {
             self.barrier();
+            // Counted between its barriers (`seg_stamps` names the segment
+            // by it).
+            self.ops[OP_CP_WRITES] += 1;
             unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
             self.barrier();
             self.barrier_wanted = false;

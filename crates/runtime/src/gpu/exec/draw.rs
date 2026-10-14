@@ -462,6 +462,7 @@ impl Exec {
     pub(super) fn end_rendering(&mut self) {
         if self.rendering.take().is_some() {
             unsafe { ctx().device.cmd_end_rendering(self.cmd()) };
+            self.ops[super::OP_PASS_ENDS] += 1;
             if super::super::tune::skip_barriers() & 1 == 0 {
                 self.barrier();
             }
@@ -480,6 +481,7 @@ impl Exec {
             self.end_rendering();
         } else if self.rendering.take().is_some() {
             unsafe { ctx().device.cmd_end_rendering(self.cmd()) };
+            self.ops[super::OP_PASS_ENDS] += 1;
             MERGED_PASS_BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -502,6 +504,7 @@ impl Exec {
             self.end_rendering();
         } else if self.rendering.take().is_some() {
             unsafe { ctx().device.cmd_end_rendering(self.cmd()) };
+            self.ops[super::OP_PASS_ENDS] += 1;
         }
     }
 

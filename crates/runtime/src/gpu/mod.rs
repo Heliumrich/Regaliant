@@ -82,7 +82,7 @@ pub mod tune {
         Tunable { name: "home_reads", env: "DS_HOME_READS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_share", env: "DS_SHADOW_SHARE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "clean_pages", env: "DS_CLEAN_PAGES", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "eop_light", env: "DS_EOP_LIGHT", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "eop_light", env: "DS_EOP_LIGHT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ts_nowait", env: "DS_TS_NOWAIT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "upload_parts", env: "DS_UPLOAD_PARTS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "upload_async", env: "DS_UPLOAD_ASYNC", default: 0, value: AtomicU64::new(UNSET) },
@@ -629,9 +629,11 @@ pub mod tune {
     /// back: labels behind a barrier into transfers only, timestamps as
     /// queries stored at the batch's end or before a later CP write; a wait
     /// passing on such a label in the same batch orders the work after it.
-    /// Off by default: with it (or `shadow_share`) the GPU was lost at a
-    /// World 5-1 load in every tour (FINDINGS.md 2026-10-13); the drains it
-    /// removes may hide a missing barrier elsewhere.
+    /// On by default since 2026-10-14 (+2.7% at the gate; the title's ~156
+    /// timestamps per flip took ~14 us of GPU time each between full
+    /// barriers). It had been off since World 5-1 device losses with it, which
+    /// the timestamp copy that waited in the command stream caused (`tune
+    /// ts_nowait`; FINDINGS.md 2026-10-13); tours pass with it since.
     #[inline]
     pub fn eop_light() -> bool {
         get(55) != 0
