@@ -57,7 +57,12 @@ pub fn sync_summary() -> String {
     d.sort_by(|a, b| b.cmp(a));
     let deferred = d.iter().take(6).map(|(_, op, x)| format!("{op:#x}: {} end of pipe / {} after sync / {} behind deferred", x[0], x[1], x[2])).collect::<Vec<_>>().join(", ");
     let kinds: Vec<String> = RELEASE_KINDS.iter().enumerate().filter(|(_, c)| c.load(Ordering::Relaxed) > 0).map(|(i, c)| format!("data {} int {}: {}", i / 8, i % 8, c.load(Ordering::Relaxed))).collect();
-    format!("{waits}; deferred CP effects {deferred}; RELEASE_MEM by kind {}; waits passed on the own batch's GPU writes {}", kinds.join(", "), OPEN_PROMISED.load(Ordering::Relaxed))
+    format!(
+        "{waits}; deferred CP effects {deferred}; RELEASE_MEM by kind {}; waits passed on the own batch's GPU writes {}; label writes recorded while another queue waited (submitted at once) {}",
+        kinds.join(", "),
+        OPEN_PROMISED.load(Ordering::Relaxed),
+        super::exec::LABEL_EARLY.load(Ordering::Relaxed)
+    )
 }
 
 /// Register file of one queue.
@@ -198,11 +203,13 @@ struct ParRun {
     run: Arc<super::par::Run>,
     /// How long the main command processor waited for the workers so far.
     waited_ns: u64,
+    /// The run holds flushes or cache actions (`tune par_events`): later CP
+    /// writes follow the GPU work before them.
+    sync: bool,
 }
 
-/// Commands a run needs to be split, per chunk at least, and at most per
-/// parallel run.
-const PAR_MIN: usize = 192;
+/// Commands per chunk at least (fewer when `tune par_min`, the commands a
+/// run needs to be split, is below 192), and at most per parallel run.
 const PAR_CHUNK_MIN: usize = 64;
 const PAR_MAX: usize = 8192;
 
@@ -211,6 +218,12 @@ fn is_command(op: u32) -> bool {
 }
 
 /// Packets that leave a run open (state only; see `Cp::scan_ahead`).
+/// Flushes and cache actions that parallel runs of this kind of queue keep
+/// inside them (`tune par_events`).
+fn par_event(op: u32, compute: bool) -> bool {
+    matches!(op, op::EVENT_WRITE | op::ACQUIRE_MEM) && super::tune::par_events() & if compute { 1 } else { 2 } != 0
+}
+
 fn is_state(op: u32) -> bool {
     matches!(
         op,
@@ -526,6 +539,17 @@ struct ActiveWait {
 }
 
 static ACTIVE_WAITS: parking_lot::Mutex<Vec<ActiveWait>> = parking_lot::Mutex::new(Vec::new());
+/// Blocking waits in progress (cheap check before taking the lock).
+static ACTIVE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a queue blocks on the label-sized word at `a` now.
+pub(super) fn waited_now(a: u64) -> bool {
+    if ACTIVE_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let a = a & !7;
+    ACTIVE_WAITS.lock().iter().any(|w| w.addr & !7 == a)
+}
 /// Waits satisfied by a latched CP write whose value was gone by the time
 /// the waiter looked again (diagnostics).
 pub static LATCHED: AtomicU64 = AtomicU64::new(0);
@@ -1016,7 +1040,7 @@ impl Cp {
             }
             let n = count as u64 + 1;
             let next = cur + 4 * (n + 1);
-            if next > to || !valid(cur, 4 * (n + 1)) || !(is_command(opcode) || is_state(opcode) || opcode == op::NOP) {
+            if next > to || !valid(cur, 4 * (n + 1)) || !(is_command(opcode) || is_state(opcode) || opcode == op::NOP || par_event(opcode, self.compute)) {
                 return Some(cur);
             }
             PACKETS.fetch_add(1, Ordering::Relaxed);
@@ -1177,13 +1201,14 @@ impl Cp {
     /// `from` into chunks when it is long enough: the first stays here, the
     /// others go to the workers' queue now (`gpu::par`).
     fn par_plan(&mut self, f: &Fetched, from: u64, end: u64) {
-        let k = super::par::workers();
+        let k = if self.compute { (super::tune::par_compute() as usize).min(8) } else { super::par::workers() };
         // The run's commands, its end and the indirect arguments read in it.
         let mut ends: Vec<u64> = Vec::new();
         let mut args: Vec<(u64, u64)> = Vec::new();
         let (mut draw_base, mut disp_base) = (self.draw_indirect_base, self.dispatch_indirect_base);
         let mut c = from;
         let mut why = 0x130usize;
+        let mut sync = false;
         let run_end = loop {
             if c >= end || !valid(c, 4) {
                 break c;
@@ -1237,6 +1262,8 @@ impl Cp {
                 } else {
                     draw_base = addr64(p(1), p(2));
                 }
+            } else if par_event(opc, self.compute) {
+                sync = true;
             } else if !is_state(opc) {
                 // EVENT_WRITE by event type (statistics: partial flushes
                 // and cache events order only GPU work).
@@ -1246,9 +1273,11 @@ impl Cp {
             c = next;
         };
         let n = ends.len();
-        super::par::note_run(n, why);
-        let chunks = ((k + 1) * super::par::split()).min(n / PAR_CHUNK_MIN);
-        if n < PAR_MIN || chunks < 2 {
+        super::par::note_run(n, why, self.compute);
+        let par_min = (if self.compute { super::tune::par_min_compute() } else { super::tune::par_min() } as usize).max(48);
+        let chunk_min = (par_min / 3).clamp(16, PAR_CHUNK_MIN);
+        let chunks = ((k + 1) * super::par::split()).min(n / chunk_min);
+        if n < par_min || chunks < 2 {
             // Not again before execution passes this run's end.
             self.par_skip = (end, run_end);
             return;
@@ -1280,7 +1309,7 @@ impl Cp {
         // times a worker's), then equal ones for the workers' queue.
         let m = chunks - 1;
         let w = super::par::main_weight();
-        let main_n = ((n as f64 * w / (w + m as f64)).round() as usize).clamp(PAR_CHUNK_MIN, n - m * PAR_CHUNK_MIN);
+        let main_n = ((n as f64 * w / (w + m as f64)).round() as usize).clamp(chunk_min, n - m * chunk_min);
         let per = (n - main_n) / m;
         let starts: Vec<u64> = (0..m).map(|i| ends[main_n + i * per - 1]).collect();
         // The state at each chunk's start.
@@ -1331,7 +1360,7 @@ impl Cp {
         }
         super::par::RUNS.fetch_add(1, Ordering::Relaxed);
         super::par::CHUNKS.fetch_add(starts.len() as u64, Ordering::Relaxed);
-        self.par = Some(ParRun { starts, end: run_end, next: 0, run, waited_ns: 0 });
+        self.par = Some(ParRun { starts, end: run_end, next: 0, run, waited_ns: 0, sync });
     }
 
     /// The main command processor reached the next chunk of the parallel
@@ -1345,6 +1374,9 @@ impl Cp {
             let pr = self.par.as_mut().unwrap();
             let i = pr.next;
             pr.next += 1;
+            if pr.sync {
+                self.fence_pending = true;
+            }
             (pr.run.clone(), i, if i + 1 < pr.starts.len() { pr.starts[i + 1] } else { pr.end }, pr.next == pr.starts.len())
         };
         self.submit_gpu("par");
@@ -2079,7 +2111,7 @@ impl Cp {
                 break;
             }
             let skip = self.par_skip.0 == end && cur < self.par_skip.1;
-            if self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && !self.compute && self.exec.is_some() && super::par::workers() > 0 && !super::capture::capturing() {
+            if self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && self.exec.is_some() && (if self.compute { super::tune::par_compute() > 0 } else { super::par::workers() > 0 }) && !super::capture::capturing() {
                 let t = class_start(classes);
                 self.par_plan(&f, cur, end);
                 class_end(7, t);
@@ -2935,6 +2967,7 @@ impl Cp {
         }
         let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         ACTIVE_WAITS.lock().push(ActiveWait { addr: a, wide, func, mask, reference, hit: hit.clone() });
+        ACTIVE_COUNT.fetch_add(1, Ordering::AcqRel);
         let t0 = Instant::now();
         let tw = super::timeline::wait_start();
         let use_promise = self.exec.is_some();
@@ -2955,6 +2988,7 @@ impl Cp {
             e.1 += t0.elapsed().as_nanos() as u64;
         }
         ACTIVE_WAITS.lock().retain(|w| !std::sync::Arc::ptr_eq(&w.hit, &hit));
+        ACTIVE_COUNT.fetch_sub(1, Ordering::AcqRel);
         if let Some(f) = self.wait_flag {
             f.store(false, Ordering::SeqCst);
         }

@@ -1666,6 +1666,9 @@ pub static GPU_CP_REFUSED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// the owning queue's submit request): a command processor about to block on
 /// one asks the owner to submit, which registers its promise.
 static UNSUBMITTED_LABELS: Mutex<Option<HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>>> = Mutex::new(None);
+/// GPU-side label writes recorded while another queue blocked on the label
+/// (`tune label_early`: their batches were submitted at the next packet).
+pub static LABEL_EARLY: AtomicU64 = AtomicU64::new(0);
 /// A batch holding unsubmitted labels is submitted after recording this long
 /// (CPU threads of the title may poll them).
 const LABEL_LATENCY: std::time::Duration = std::time::Duration::from_millis(2);
@@ -5436,6 +5439,11 @@ impl Exec {
         if let Some((v, n)) = label {
             self.pending_promises.push((a, v, n));
             UNSUBMITTED_LABELS.lock().get_or_insert_with(HashMap::new).insert(a & !7, self.submit_request.clone());
+            // Another queue already blocks on it: submit at the next packet.
+            if super::tune::label_early() && super::cp::waited_now(a) {
+                self.submit_request.store(true, Ordering::SeqCst);
+                LABEL_EARLY.fetch_add(1, Ordering::Relaxed);
+            }
         }
         GPU_CP_WRITES.fetch_add(1, Ordering::Relaxed);
         self.ops[OP_CP_WRITES] += 1;
