@@ -780,6 +780,45 @@ fn epoch_wait_lines() -> String {
 static CP_CLASSES: [[AtomicU64; 3]; 10] = [const { [const { AtomicU64::new(0) }; 3] }; 10];
 /// FRAMES when the classes were last cleared.
 static CP_CLASSES_FROM: AtomicU64 = AtomicU64::new(0);
+/// The same per PM4 opcode for the compute queue `tune cp_classes_acb`
+/// names: [ns without waits, packets, ns of waits].
+static ACB_OPS: [[AtomicU64; 3]; 256] = [const { [const { AtomicU64::new(0) }; 3] }; 256];
+
+fn acb_op_end(opcode: u32, t: Option<(Instant, u64)>) {
+    let Some((t0, w0)) = t else { return };
+    let waited = super::timeline::waited_ns().saturating_sub(w0);
+    let ns = (t0.elapsed().as_nanos() as u64).saturating_sub(waited);
+    let c = &ACB_OPS[(opcode & 0xFF) as usize];
+    c[0].fetch_add(ns, Ordering::Relaxed);
+    c[1].fetch_add(1, Ordering::Relaxed);
+    c[2].fetch_add(waited, Ordering::Relaxed);
+}
+
+fn op_name(opcode: u32) -> String {
+    let n = match opcode {
+        op::NOP => "NOP",
+        op::SET_BASE => "SET_BASE",
+        op::DISPATCH_DIRECT => "DISPATCH_DIRECT",
+        op::DISPATCH_INDIRECT => "DISPATCH_INDIRECT",
+        op::COND_EXEC => "COND_EXEC",
+        op::WRITE_DATA => "WRITE_DATA",
+        op::WAIT_REG_MEM => "WAIT_REG_MEM",
+        op::INDIRECT_BUFFER => "INDIRECT_BUFFER",
+        op::COPY_DATA => "COPY_DATA",
+        op::EVENT_WRITE => "EVENT_WRITE",
+        op::RELEASE_MEM => "RELEASE_MEM",
+        op::DMA_DATA => "DMA_DATA",
+        op::ACQUIRE_MEM => "ACQUIRE_MEM",
+        op::SET_SH_REG => "SET_SH_REG",
+        op::SET_SH_REG_INDEX => "SET_SH_REG_INDEX",
+        op::SET_UCONFIG_REG => "SET_UCONFIG_REG",
+        op::LOAD_SH_REG_INDEX => "LOAD_SH_REG_INDEX",
+        op::WAIT_REG_MEM64 => "WAIT_REG_MEM64",
+        1 => "label submissions after packets",
+        _ => return format!("op {opcode:#04x}"),
+    };
+    n.to_string()
+}
 const CP_CLASS_NAMES: [&str; 10] = ["own parallel chunks: draws", "own parallel chunks: dispatches", "serial draws", "serial dispatches", "CP effects", "state", "NOPs and private operations", "planning", "collecting", "buffer-end submissions"];
 
 /// A packet class's start (`cp_classes`): the clock and the thread's waits.
@@ -799,7 +838,7 @@ fn class_end(k: usize, t: Option<(Instant, u64)>) {
 
 /// Clears the packet classes (`profile reset`).
 pub fn reset_classes() {
-    for c in CP_CLASSES.iter().flatten() {
+    for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
     CP_CLASSES_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -820,7 +859,23 @@ pub fn classes_line() -> String {
             format!("{name} {:.2} ms ({:.0} packets, {:.1} us each; waits {:.2} ms)", ns as f64 / flips / 1e6, n as f64 / flips, ns as f64 / n.max(1) as f64 / 1e3, w as f64 / flips / 1e6)
         })
         .collect();
-    format!("    graphics command processor per flip by packet class (waits apart; {:.2} ms in all): {}\n", total as f64 / flips / 1e6, parts.join("; "))
+    let mut s = format!("    graphics command processor per flip by packet class (waits apart; {:.2} ms in all): {}\n", total as f64 / flips / 1e6, parts.join("; "));
+    let mut ops: Vec<(usize, u64, u64, u64)> = ACB_OPS
+        .iter()
+        .enumerate()
+        .map(|(k, c)| (k, c[0].load(Ordering::Relaxed), c[1].load(Ordering::Relaxed), c[2].load(Ordering::Relaxed)))
+        .filter(|&(_, ns, _, w)| ns + w > 0)
+        .collect();
+    if !ops.is_empty() {
+        let all: u64 = ops.iter().map(|o| o.1).sum();
+        ops.sort_by_key(|o| std::cmp::Reverse(o.1));
+        let parts: Vec<String> = ops
+            .iter()
+            .map(|&(k, ns, n, w)| format!("{} {:.2} ms ({:.0} packets, {:.1} us each; waits {:.2} ms)", op_name(k as u32), ns as f64 / flips / 1e6, n as f64 / flips, ns as f64 / n.max(1) as f64 / 1e3, w as f64 / flips / 1e6))
+            .collect();
+        s.push_str(&format!("    compute queue {:#x} per flip by packet (waits apart; {:.2} ms in all): {}\n", super::tune::cp_classes_acb(), all as f64 / flips / 1e6, parts.join("; ")));
+    }
+    s
 }
 
 pub fn wait_stats() -> String {
@@ -2057,6 +2112,7 @@ impl Cp {
         let mut f = Fetched::new(addr, size);
         // Time by packet class (the graphics queue; `tune cp_classes`).
         let classes = !self.compute && super::tune::cp_classes();
+        let acb_ops = self.compute && super::tune::cp_classes() && self.name.strip_prefix("gpu-acb").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()) == Some(super::tune::cp_classes_acb());
         while cur < end {
             // The next chunk of a parallel run: collected here.
             if let Some(pr) = &self.par {
@@ -2205,8 +2261,10 @@ impl Cp {
                 4
             };
             let t = class_start(classes && opcode != op::INDIRECT_BUFFER);
+            let ta = class_start(acb_ops && opcode != op::INDIRECT_BUFFER);
             let flow = self.packet(opcode, h, cur, n, &p);
             class_end(class, t);
+            acb_op_end(opcode, ta);
             if command {
                 // Preparations of this command that it did not take.
                 for s in self.take_ahead().iter().flatten() {
@@ -2219,7 +2277,9 @@ impl Cp {
                 }
             }
             if self.exec.as_ref().is_some_and(|e| e.submit_requested()) {
+                let ta = class_start(acb_ops);
                 self.submit_gpu("label");
+                acb_op_end(1, ta);
             }
             if opcode == op::REWIND {
                 // The CPU streams packets behind a REWIND: read them live.

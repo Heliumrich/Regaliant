@@ -1569,6 +1569,9 @@ const SHADOW_BYTES: u64 = 32 << 20;
 const SHADOW_MAX: u64 = 4 << 20;
 
 static SHADOWED: AtomicU64 = AtomicU64::new(0);
+/// Indirect dispatches that read their arguments from a resident shadow's
+/// working copy (`tune shadow_args`).
+static SHADOW_ARGS: AtomicU64 = AtomicU64::new(0);
 /// Indirect dispatches whose arguments the GPU read (`Exec::dispatch_gpu_indirect`).
 static GPU_INDIRECT: AtomicU64 = AtomicU64::new(0);
 /// CP memory writes performed by the GPU (`Exec::gpu_cp_write`).
@@ -2834,7 +2837,7 @@ impl Slot {
             // SGPR data in system memory: a copy in video memory, read by
             // every invocation, made no measurable difference (`tune ring_vram`).
             let (ring, _mem, ring_ptr) = c.host_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)?;
-            let (shadow, _smem) = c.device_buffer(SHADOW_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)?;
+            let (shadow, _smem) = c.device_buffer(SHADOW_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER)?;
             Ok(Slot {
                 cmd,
                 fence: c.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| e.to_string())?,
@@ -5608,6 +5611,13 @@ impl Exec {
         self.recording && !self.pending_promises.is_empty() && (self.submit_request.load(Ordering::Relaxed) || self.begun_at.elapsed() > LABEL_LATENCY)
     }
 
+    /// Indirect arguments at `a` (12 bytes) a resident shadow holds whole and
+    /// nothing wrote in place since its copy in (not tainted): its working
+    /// copy has the newest of every dword in its window (`tune shadow_args`).
+    fn resident_args(&self, a: u64) -> Option<(vk::Buffer, u64)> {
+        self.resident.iter().find(|r| !r.tainted && r.guest <= a && a + 12 <= r.guest + r.range).map(|r| (self.shadow(), r.shadow_off + (a - r.guest)))
+    }
+
     /// A read-only binding of guest [base, base+size) inside a resident shadow
     /// reads its working copy: (buffer, offset of `base`, bytes from `base`
     /// to the copy's end). A binding that overlaps one only partly gets it
@@ -6547,8 +6557,12 @@ impl Exec {
         let since = |t0: Option<std::time::Instant>| t0.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         let mut lap = Laps::for_dispatch();
         if let Some(a) = indirect {
-            // A resident shadow holding newer arguments is merged back first.
-            self.flush_resident(Some(&[(a, 12)]))?;
+            // A resident shadow holding newer arguments is merged back first,
+            // unless the GPU reads them from its working copy (`tune
+            // shadow_args`; checked again where they are bound).
+            if !(super::tune::shadow_args() && self.resident_args(a).is_some()) {
+                self.flush_resident(Some(&[(a, 12)]))?;
+            }
         }
         let wave64 = initiator & (1 << 15) == 0;
         // Prepared ahead by the workers (`gpu::ahead`) when it still holds.
@@ -6809,6 +6823,12 @@ impl Exec {
         super::vk::checkpoint(self.cmd(), super::vk::mark::DISPATCH, p.addr);
         let start = [cp.reg(Space::Sh, 0x204), cp.reg(Space::Sh, 0x205), cp.reg(Space::Sh, 0x206)];
         let args = match indirect {
+            // Still held by a resident shadow (binding and batch changes since
+            // the check above may have merged it): its working copy.
+            Some(a) if super::tune::shadow_args() && self.resident_args(a).is_some() => {
+                SHADOW_ARGS.fetch_add(1, Ordering::Relaxed);
+                self.resident_args(a)
+            }
             Some(a) => {
                 let (buffer, base, _) = span(a, 12).ok_or_else(|| format!("cs {:#x}: indirect arguments {a:#x} are not mapped GPU memory (dispatch skipped)", p.addr))?;
                 if let Some(s) = CP_WRITES.latest(&[(a, 12)]) {
@@ -6995,9 +7015,10 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them behind a barrier of their own; stages prepared again with GPU-side data loads {:?} ({} programs since with them); {} render passes ended into the next full barrier; GPU-performed CP writes after merging resident shadows {} (written before the merge {}); draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills, {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; stages prepared again with GPU-side data loads {:?} ({} programs since with them); {} render passes ended into the next full barrier; GPU-performed CP writes after merging resident shadows {} (written before the merge {}); draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills, {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
+        SHADOW_ARGS.load(Ordering::Relaxed),
         INDIRECT_BARRIERS[0].load(Ordering::Relaxed),
         HYBRID_LOADS.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),
         shaders::gpu_loads_programs(),

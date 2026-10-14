@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 90] = [
+    static ALL: [Tunable; 92] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -117,6 +117,8 @@ pub mod tune {
         Tunable { name: "chain_memo", env: "DS_CHAIN_MEMO", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "wait_yields", env: "DS_WAIT_YIELDS", default: 800, value: AtomicU64::new(UNSET) },
         Tunable { name: "timer_sleep", env: "DS_TIMER_SLEEP", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "cp_classes_acb", env: "DS_CP_CLASSES_ACB", default: 0x50, value: AtomicU64::new(UNSET) },
+        Tunable { name: "shadow_args", env: "DS_SHADOW_ARGS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -932,6 +934,21 @@ pub mod tune {
     #[inline]
     pub fn timer_sleep() -> bool {
         get(89) != 0
+    }
+
+    /// The compute queue (its id, e.g. 0x50) whose command processor's time
+    /// `cp_classes` also gives per packet opcode.
+    #[inline]
+    pub fn cp_classes_acb() -> u64 {
+        get(90)
+    }
+
+    /// An indirect dispatch whose arguments a resident shadow holds (an
+    /// earlier dispatch of the batch wrote them in its working copy) reads
+    /// them there instead of merging the shadow back first.
+    #[inline]
+    pub fn shadow_args() -> bool {
+        get(91) != 0
     }
 
     /// A switch's value by name; None if unknown.
