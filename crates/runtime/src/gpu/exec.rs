@@ -1748,6 +1748,10 @@ static SHADOWS_SHARED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// End-of-pipe writes without a full barrier (`tune eop_light`): [labels,
 /// timestamps, waits that ordered the work after them].
 static EOP_LIGHT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Dispatches storing deferred timestamps (`Exec::resolve_timestamps`), and
+/// deferred timestamps a later one of the same resolve overwrote.
+static TS_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+static TS_REPEATS: AtomicU64 = AtomicU64::new(0);
 /// Copies in from shared copies counted for DS_SHADOW_SHARE_CHECK sampling.
 static SHARE_CHECKED: AtomicU64 = AtomicU64::new(0);
 static RESIDENT_READS: AtomicU64 = AtomicU64::new(0);
@@ -2935,6 +2939,43 @@ struct TsPipe {
     set_layout: vk::DescriptorSetLayout,
 }
 
+/// A deferred end-of-pipe timestamp: its query, the guest memory buffer and
+/// byte offset it is stored at, the clock offset (`title_clock_k`).
+#[derive(Clone, Copy)]
+struct TsEntry {
+    q: u32,
+    buffer: vk::Buffer,
+    off: u64,
+    k: u64,
+}
+
+/// The pipeline storing up to `rdna::kernels::TS_MANY` timestamps per
+/// dispatch (`Exec::resolve_timestamps`).
+fn ts_many_pipe() -> Result<&'static TsPipe, String> {
+    static PIPE: std::sync::OnceLock<Result<TsPipe, String>> = std::sync::OnceLock::new();
+    PIPE.get_or_init(|| {
+        let c = ctx();
+        unsafe {
+            let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..2)
+                .map(|b| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
+                .collect();
+            let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("timestamp set layout: {e}"))?;
+            let layouts = [set_layout];
+            let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 4 * (4 + 2 * rdna::kernels::TS_MANY) }];
+            let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("timestamp layout: {e}"))?;
+            let code = rdna::kernels::timestamp_store_many();
+            let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("timestamp module: {e}"))?;
+            let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+            let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
+            let pipeline = super::pcache::with_cache('i', 3, |cache| c.device.create_compute_pipelines(cache, &[ci], None)).map_err(|(_, e)| format!("timestamp pipeline: {e}"));
+            c.device.destroy_shader_module(module, None);
+            Ok(TsPipe { pipeline: pipeline?[0], layout, set_layout })
+        }
+    })
+    .as_ref()
+    .map_err(|e| e.clone())
+}
+
 fn ts_pipe() -> Result<&'static TsPipe, String> {
     static PIPE: std::sync::OnceLock<Result<TsPipe, String>> = std::sync::OnceLock::new();
     PIPE.get_or_init(|| {
@@ -3884,8 +3925,8 @@ pub struct Exec {
     /// CP timestamp writes the GPU performs in the recording batch.
     ts_used: u32,
     /// End-of-pipe timestamps of the batch whose readback and store wait for
-    /// its end (`tune eop_light`): (descriptor set, push constants).
-    ts_deferred: Vec<(vk::DescriptorSet, Vec<u8>)>,
+    /// its end (`tune eop_light`).
+    ts_deferred: Vec<TsEntry>,
     /// An end-of-pipe label write in the batch that later work is not
     /// ordered after (`tune eop_light`): a wait passing on it orders it
     /// (`order_after_open_writes`).
@@ -5935,7 +5976,15 @@ impl Exec {
             }
         }
         let Some((pool, tbuf)) = self.slots[self.cur].ts else { return false };
-        let Ok(set) = self.alloc_set(tp.set_layout) else { return false };
+        // The deferred ones get their sets when resolved (`resolve_timestamps`;
+        // the space stays reserved here).
+        let eop = super::tune::eop_light();
+        let set = if eop {
+            vk::DescriptorSet::null()
+        } else {
+            let Ok(set) = self.alloc_set(tp.set_layout) else { return false };
+            set
+        };
         self.pool_use[0] += 1;
         self.pool_use[1] += 2;
         self.gpu_writes_open = true;
@@ -5949,15 +5998,8 @@ impl Exec {
         let align = c.limits.min_storage_buffer_offset_alignment.max(4);
         let off = a - start;
         let base = off / align * align;
-        let infos = [vk::DescriptorBufferInfo { buffer: tbuf, offset: 0, range: TS_PER_BATCH as u64 * 8 }, vk::DescriptorBufferInfo { buffer, offset: base, range: off - base + 8 }];
-        let writes: Vec<vk::WriteDescriptorSet> = infos
-            .iter()
-            .enumerate()
-            .map(|(i, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
-            .collect();
-        let pc: Vec<u8> = [q, ((off - base) / 4) as u32, k as u32, (k >> 32) as u32].iter().flat_map(|x| x.to_le_bytes()).collect();
         let cmd = self.cmd();
-        if super::tune::eop_light() {
+        if eop {
             // Taken when the work before it completed, without holding later
             // work back; read and stored to guest memory at the batch's end
             // (`resolve_timestamps`; the CPU reads it after completion, and a
@@ -5965,9 +6007,8 @@ impl Exec {
             unsafe {
                 c.device.cmd_reset_query_pool(cmd, pool, q, 1);
                 c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, q);
-                c.device.update_descriptor_sets(&writes, &[]);
             }
-            self.ts_deferred.push((set, pc));
+            self.ts_deferred.push(TsEntry { q, buffer, off, k });
             EOP_LIGHT[1].fetch_add(1, Ordering::Relaxed);
             self.taint_resident(a, 8);
             self.note_write(a, 8);
@@ -5977,6 +6018,13 @@ impl Exec {
             }
             return true;
         }
+        let infos = [vk::DescriptorBufferInfo { buffer: tbuf, offset: 0, range: TS_PER_BATCH as u64 * 8 }, vk::DescriptorBufferInfo { buffer, offset: base, range: off - base + 8 }];
+        let writes: Vec<vk::WriteDescriptorSet> = infos
+            .iter()
+            .enumerate()
+            .map(|(i, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
+            .collect();
+        let pc: Vec<u8> = [q, ((off - base) / 4) as u32, k as u32, (k >> 32) as u32].iter().flat_map(|x| x.to_le_bytes()).collect();
         unsafe {
             c.device.cmd_reset_query_pool(cmd, pool, q, 1);
             c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, q);
@@ -6017,8 +6065,22 @@ impl Exec {
         if self.ts_deferred.is_empty() {
             return;
         }
-        let deferred = std::mem::take(&mut self.ts_deferred);
-        let (Some((pool, tbuf)), Ok(tp)) = (self.slots[self.cur].ts, ts_pipe()) else { return };
+        let mut deferred = std::mem::take(&mut self.ts_deferred);
+        // A slot written twice in the batch keeps the later value (stored in
+        // order, one dispatch each, the later store won; stores of one
+        // dispatch run unordered).
+        let before = deferred.len();
+        let mut seen: Vec<(vk::Buffer, u64)> = Vec::with_capacity(before);
+        for i in (0..deferred.len()).rev() {
+            let key = (deferred[i].buffer, deferred[i].off);
+            if seen.contains(&key) {
+                deferred.remove(i);
+            } else {
+                seen.push(key);
+            }
+        }
+        TS_REPEATS.fetch_add((before - deferred.len()) as u64, Ordering::Relaxed);
+        let (Some((pool, tbuf)), Ok(tp)) = (self.slots[self.cur].ts, ts_many_pipe()) else { return };
         let c = ctx();
         let cmd = self.cmd();
         unsafe {
@@ -6026,13 +6088,45 @@ impl Exec {
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
             c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, tp.pipeline);
-            for (set, pc) in &deferred {
-                c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, tp.layout, 0, &[*set], &[]);
-                c.device.cmd_push_constants(cmd, tp.layout, vk::ShaderStageFlags::COMPUTE, 0, pc);
-                c.device.cmd_dispatch(cmd, 1, 1, 1);
-            }
         }
         self.dyncache.cs_pipeline = tp.pipeline;
+        // Up to TS_MANY per dispatch (`tune ts_batch`), those of one buffer
+        // and clock offset in order, the binding over the bytes they store.
+        let per = (super::tune::ts_batch() as usize).clamp(1, rdna::kernels::TS_MANY as usize);
+        let align = c.limits.min_storage_buffer_offset_alignment.max(4);
+        let mut i = 0;
+        while i < deferred.len() {
+            let first = deferred[i];
+            let mut j = i + 1;
+            while j < deferred.len() && j - i < per && deferred[j].buffer == first.buffer && deferred[j].k == first.k {
+                j += 1;
+            }
+            let group = &deferred[i..j];
+            let lo = group.iter().map(|e| e.off).min().unwrap_or(0) / align * align;
+            let hi = group.iter().map(|e| e.off + 8).max().unwrap_or(8);
+            let Ok(set) = self.alloc_set(tp.set_layout) else { return };
+            let infos = [vk::DescriptorBufferInfo { buffer: tbuf, offset: 0, range: TS_PER_BATCH as u64 * 8 }, vk::DescriptorBufferInfo { buffer: first.buffer, offset: lo, range: hi - lo }];
+            let writes: Vec<vk::WriteDescriptorSet> = infos
+                .iter()
+                .enumerate()
+                .map(|(b, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(b as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
+                .collect();
+            let mut pc: Vec<u32> = vec![first.k as u32, (first.k >> 32) as u32, group.len() as u32, 0];
+            for e in group {
+                pc.push(e.q);
+                pc.push(((e.off - lo) / 4) as u32);
+            }
+            pc.resize(4 + 2 * rdna::kernels::TS_MANY as usize, 0);
+            let bytes: Vec<u8> = pc.iter().flat_map(|x| x.to_le_bytes()).collect();
+            unsafe {
+                c.device.update_descriptor_sets(&writes, &[]);
+                c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, tp.layout, 0, &[set], &[]);
+                c.device.cmd_push_constants(cmd, tp.layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
+                c.device.cmd_dispatch(cmd, 1, 1, 1);
+            }
+            TS_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+            i = j;
+        }
     }
 
     /// A wait passed on a value this batch writes at its end of pipe
@@ -7623,9 +7717,11 @@ pub fn status() -> String {
         + &super::ahead::status()
         + &super::par::status()
         + &format!(
-            "    end-of-pipe writes without a full barrier: {} labels, {} timestamps; {} waits ordered the work after them\n",
+            "    end-of-pipe writes without a full barrier: {} labels, {} timestamps (stored by {} dispatches, {} overwritten in their batch); {} waits ordered the work after them\n",
             EOP_LIGHT[0].load(Ordering::Relaxed),
             EOP_LIGHT[1].load(Ordering::Relaxed),
+            TS_DISPATCHES.load(Ordering::Relaxed),
+            TS_REPEATS.load(Ordering::Relaxed),
             EOP_LIGHT[2].load(Ordering::Relaxed)
         )
         + &format!(

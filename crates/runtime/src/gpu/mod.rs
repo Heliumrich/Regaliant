@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 103] = [
+    static ALL: [Tunable; 104] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -130,6 +130,7 @@ pub mod tune {
         Tunable { name: "marks_unlocked", env: "DS_MARKS_UNLOCKED", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lock_relief", env: "DS_LOCK_RELIEF", default: 3, value: AtomicU64::new(UNSET) },
         Tunable { name: "prep_pool", env: "DS_PREP_POOL", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "ts_batch", env: "DS_TS_BATCH", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1085,6 +1086,16 @@ pub mod tune {
     #[inline]
     pub fn prep_pool() -> bool {
         get(102) != 0
+    }
+
+    /// End-of-pipe timestamps stored per dispatch when a batch resolves them
+    /// (`Exec::resolve_timestamps`, 1 to 14; 1: one dispatch each, as
+    /// before 2026-10-15; 14 saved ~0.4 ms of GPU time per frame, and the
+    /// first tour with it showed faults in 5-2 and 8-2 that did not recur:
+    /// 1 until understood, FINDINGS.md).
+    #[inline]
+    pub fn ts_batch() -> u64 {
+        get(103)
     }
 
 

@@ -182,8 +182,128 @@ fn build_timestamp() -> Result<Vec<u32>, rspirv::dr::Error> {
     Ok(b.module().assemble())
 }
 
+/// Timestamps `timestamp_store_many` stores per dispatch (its push
+/// constants: 128 bytes, the guaranteed minimum).
+pub const TS_MANY: u32 = 14;
+
+/// Up to `TS_MANY` GPU timestamps stored in the title's GPU clock by one
+/// dispatch (`timestamp_store` stores one): invocation i < count reads the
+/// 64-bit timestamp at index q_i of binding 0 and stores (t + k) / 10 as two
+/// dwords at dword d_i of binding 1 (push constants
+/// `{k_lo, k_hi, count, 0, q_0, d_0, ..., q_13, d_13}`).
+pub fn timestamp_store_many() -> Vec<u32> {
+    build_timestamp_many().expect("timestamp kernel (many)")
+}
+
+fn build_timestamp_many() -> Result<Vec<u32>, rspirv::dr::Error> {
+    let lit = Operand::LiteralBit32;
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.capability(Capability::Int64);
+    b.extension("SPV_KHR_storage_buffer_storage_class");
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+    let void = b.type_void();
+    let bool_ = b.type_bool();
+    let u32t = b.type_int(32, 0);
+    let u64t = b.type_int(64, 0);
+    let v3 = b.type_vector(u32t, 3);
+    let rta64 = b.type_runtime_array(u64t);
+    b.decorate(rta64, Decoration::ArrayStride, [lit(8)]);
+    let st64 = b.type_struct([rta64]);
+    b.decorate(st64, Decoration::Block, []);
+    b.member_decorate(st64, 0, Decoration::Offset, [lit(0)]);
+    let p_st64 = b.type_pointer(None, StorageClass::StorageBuffer, st64);
+    let p_u64 = b.type_pointer(None, StorageClass::StorageBuffer, u64t);
+    let rta = b.type_runtime_array(u32t);
+    b.decorate(rta, Decoration::ArrayStride, [lit(4)]);
+    let st = b.type_struct([rta]);
+    b.decorate(st, Decoration::Block, []);
+    b.member_decorate(st, 0, Decoration::Offset, [lit(0)]);
+    let p_st = b.type_pointer(None, StorageClass::StorageBuffer, st);
+    let p_u = b.type_pointer(None, StorageClass::StorageBuffer, u32t);
+    let n_words = b.constant_bit32(u32t, 4 + 2 * TS_MANY);
+    let arr = b.type_array(u32t, n_words);
+    b.decorate(arr, Decoration::ArrayStride, [lit(4)]);
+    let pc = b.type_struct([arr]);
+    b.decorate(pc, Decoration::Block, []);
+    b.member_decorate(pc, 0, Decoration::Offset, [lit(0)]);
+    let p_pc = b.type_pointer(None, StorageClass::PushConstant, pc);
+    let p_pcu = b.type_pointer(None, StorageClass::PushConstant, u32t);
+    let p_in = b.type_pointer(None, StorageClass::Input, v3);
+    let lid = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(lid, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::LocalInvocationId)]);
+    let src = global(&mut b, p_st64, StorageClass::StorageBuffer);
+    b.decorate(src, Decoration::DescriptorSet, [lit(0)]);
+    b.decorate(src, Decoration::Binding, [lit(0)]);
+    b.decorate(src, Decoration::NonWritable, []);
+    let dst = global(&mut b, p_st, StorageClass::StorageBuffer);
+    b.decorate(dst, Decoration::DescriptorSet, [lit(0)]);
+    b.decorate(dst, Decoration::Binding, [lit(1)]);
+    let pcv = global(&mut b, p_pc, StorageClass::PushConstant);
+    let c: Vec<Word> = (0..6).map(|i| b.constant_bit32(u32t, i)).collect();
+    let c32 = b.constant_bit64(u64t, 32);
+    let c10 = b.constant_bit64(u64t, 10);
+    let fty = b.type_function(void, []);
+    let f = b.begin_function(void, None, FunctionControl::NONE, fty)?;
+    b.begin_block(None)?;
+    let l = b.load(v3, None, lid, None, [])?;
+    let x = b.composite_extract(u32t, None, l, [0])?;
+    let pn = b.access_chain(p_pcu, None, pcv, [c[0], c[2]])?;
+    let count = b.load(u32t, None, pn, None, [])?;
+    let inside = b.u_less_than(bool_, None, x, count)?;
+    let (l_body, l_end) = (b.id(), b.id());
+    b.selection_merge(l_end, SelectionControl::NONE)?;
+    b.branch_conditional(inside, l_body, l_end, [])?;
+    b.begin_block(Some(l_body))?;
+    let x2 = b.i_mul(u32t, None, x, c[2])?;
+    let iq = b.i_add(u32t, None, x2, c[4])?;
+    let id_ = b.i_add(u32t, None, x2, c[5])?;
+    let pq = b.access_chain(p_pcu, None, pcv, [c[0], iq])?;
+    let q = b.load(u32t, None, pq, None, [])?;
+    let pd = b.access_chain(p_pcu, None, pcv, [c[0], id_])?;
+    let d = b.load(u32t, None, pd, None, [])?;
+    let pklo = b.access_chain(p_pcu, None, pcv, [c[0], c[0]])?;
+    let klo = b.load(u32t, None, pklo, None, [])?;
+    let pkhi = b.access_chain(p_pcu, None, pcv, [c[0], c[1]])?;
+    let khi = b.load(u32t, None, pkhi, None, [])?;
+    let klo = b.u_convert(u64t, None, klo)?;
+    let khi = b.u_convert(u64t, None, khi)?;
+    let khi = b.shift_left_logical(u64t, None, khi, c32)?;
+    let k = b.bitwise_or(u64t, None, khi, klo)?;
+    let pt = b.access_chain(p_u64, None, src, [c[0], q])?;
+    let t = b.load(u64t, None, pt, None, [])?;
+    let sum = b.i_add(u64t, None, t, k)?;
+    let v = b.u_div(u64t, None, sum, c10)?;
+    let lo = b.u_convert(u32t, None, v)?;
+    let vh = b.shift_right_logical(u64t, None, v, c32)?;
+    let hi = b.u_convert(u32t, None, vh)?;
+    let p0 = b.access_chain(p_u, None, dst, [c[0], d])?;
+    b.store(p0, lo, None, [])?;
+    let d1 = b.i_add(u32t, None, d, c[1])?;
+    let p1 = b.access_chain(p_u, None, dst, [c[0], d1])?;
+    b.store(p1, hi, None, [])?;
+    b.branch(l_end)?;
+    b.begin_block(Some(l_end))?;
+    b.ret()?;
+    b.end_function()?;
+    b.entry_point(ExecutionModel::GLCompute, f, "main", [lid]);
+    b.execution_mode(f, ExecutionMode::LocalSize, [16, 1, 1]);
+    Ok(b.module().assemble())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn timestamp_many_kernel_assembles() {
+        let w = super::timestamp_store_many();
+        assert_eq!(w[0], 0x0723_0203);
+        if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("timestamp_store_many.spv"), bytes).unwrap();
+        }
+    }
+
     #[test]
     fn timestamp_kernel_assembles() {
         let w = super::timestamp_store();
