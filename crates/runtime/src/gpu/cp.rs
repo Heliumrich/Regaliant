@@ -165,6 +165,11 @@ pub struct Cp {
     pred: Option<Pred>,
     /// When the title submitted the command buffer being executed.
     pub submitted_at: Option<Instant>,
+    /// Another command buffer follows this one at once (the title's
+    /// submission holds more, or its next submission is queued): its end
+    /// need not submit the batch (`tune cmdbuf_merge`).
+    pub more_follows: Option<Box<dyn Fn() -> bool + Send>>,
+    pub next_in_submission: bool,
     /// Stage preparations started ahead for the next commands of the
     /// current synchronization-free run (`scan_ahead`), in packet order.
     ahead: std::collections::VecDeque<AheadCmd>,
@@ -224,6 +229,9 @@ struct ParRun {
 /// parallel run.
 const PAR_CHUNK_MIN: usize = 64;
 const PAR_MAX: usize = 8192;
+
+/// Command-buffer ends that left the batch open (`tune cmdbuf_merge`).
+pub static CMDBUF_MERGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn is_command(op: u32) -> bool {
     matches!(op, op::DRAW_INDEX_2 | op::DRAW_INDEX_AUTO | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT | op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT)
@@ -1047,6 +1055,8 @@ impl Cp {
             fence_pending: false,
             pred: None,
             submitted_at: None,
+            more_follows: None,
+            next_in_submission: false,
             ahead: std::collections::VecDeque::new(),
             cur_ahead: std::cell::RefCell::new([None, None]),
             scan_regs: (Vec::new(), Vec::new()),
@@ -2645,9 +2655,16 @@ impl Cp {
         }
         self.depth -= 1;
         if self.depth == 0 {
-            let t = class_start(classes);
-            self.submit_gpu("cmdbuf");
-            class_end(9, t);
+            // The batch stays open into the next command buffer when that one
+            // is already here (`tune cmdbuf_merge`): a batch less to begin.
+            let merge = super::tune::cmdbuf_merge() && !self.compute && (self.next_in_submission || self.more_follows.as_ref().is_some_and(|f| f()));
+            if merge {
+                CMDBUF_MERGED.fetch_add(1, Ordering::Relaxed);
+            } else {
+                let t = class_start(classes);
+                self.submit_gpu("cmdbuf");
+                class_end(9, t);
+            }
         }
     }
 

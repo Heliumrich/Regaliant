@@ -569,7 +569,8 @@ impl Exec {
         let t0 = super::profiling().then(std::time::Instant::now);
         let since = |t0: Option<std::time::Instant>| t0.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         let kind = if self.deferred { 2 } else if cp.in_parallel_run() { 1 } else { 0 };
-        let mut lap = super::Laps::for_draw(kind);
+        let first = self.batch_shaders.is_empty();
+        let mut lap = super::Laps::for_draw(kind, first);
         let reg = |r: u32| ctx_reg(cp, r);
         // CB_COLOR_CONTROL.MODE: 0 color disabled, 1 normal; others are
         // metadata passes (fast-clear eliminate, FMASK/DCC decompress, resolve)
@@ -1331,7 +1332,12 @@ impl Exec {
         lap.mark(17);
         if super::profiling() {
             super::note_phases(&super::DRAW_PHASES, [t_prep, t_pipe, t_bind, since(t0)]);
-            super::DRAW_STEPS[kind][18].fetch_add(1, Ordering::Relaxed);
+            super::note_place(self.deferred, self.batch_shaders.len().saturating_sub(1), [t_prep, t_pipe, t_bind, since(t0)]);
+            if first {
+                super::DRAW_STEPS_FIRST[18].fetch_add(1, Ordering::Relaxed);
+            } else {
+                super::DRAW_STEPS[kind][18].fetch_add(1, Ordering::Relaxed);
+            }
         }
         Ok(true)
     }

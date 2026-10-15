@@ -3500,6 +3500,49 @@ fn cs_cpu_lines() -> String {
     s
 }
 
+/// Draws and dispatches by their place in their batch (DS_PROFILE_GPU):
+/// [main command processor, parallel workers][place: 1st, 2nd, 3rd-4th,
+/// 5th-8th, 9th-16th, 17th-32nd, 33rd-64th, 65th-128th, later] as
+/// `note_phases` tables: what a fresh batch's first commands cost (a
+/// parallel chunk is a batch of its own).
+pub(super) static PLACE_PHASES: [[[AtomicU64; 5]; 9]; 2] = [const { [const { [const { AtomicU64::new(0) }; 5] }; 9] }; 2];
+
+/// A command recorded as the `place`-th (from 0) of its batch.
+pub(super) fn note_place(worker: bool, place: usize, t: [std::time::Duration; 4]) {
+    let b = match place {
+        0 => 0,
+        1 => 1,
+        2..=3 => 2,
+        4..=7 => 3,
+        8..=15 => 4,
+        16..=31 => 5,
+        32..=63 => 6,
+        64..=127 => 7,
+        _ => 8,
+    };
+    note_phases(&PLACE_PHASES[worker as usize][b], t);
+}
+
+fn place_lines() -> String {
+    const NAMES: [&str; 9] = ["1st", "2nd", "3rd-4th", "5th-8th", "9th-16th", "17th-32nd", "33rd-64th", "65th-128th", "later"];
+    let mut s = String::new();
+    for (w, who) in ["main command processor", "parallel workers"].iter().enumerate() {
+        let parts: Vec<String> = PLACE_PHASES[w]
+            .iter()
+            .zip(NAMES)
+            .filter(|(t, _)| t[4].load(Ordering::Relaxed) > 0)
+            .map(|(t, name)| {
+                let n = t[4].load(Ordering::Relaxed) as f64;
+                let us = |k: usize| t[k].load(Ordering::Relaxed) as f64 / n / 1000.0;
+                format!("{name} {:.0}: {:.1} us ({:.1}/{:.1}/{:.1}/{:.1})", n, us(3), us(0), us(1) - us(0), us(2) - us(1), us(3) - us(2))
+            })
+            .collect();
+        s.push_str(&format!("    {who}: draws and dispatches by place in their batch (count: us each (prepare/textures and pipeline/bindings/recording)): {}
+", parts.join(", ")));
+    }
+    s
+}
+
 pub(super) fn note_phases(table: &[AtomicU64; 5], t: [std::time::Duration; 4]) {
     for (k, d) in t.iter().enumerate() {
         table[k].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
@@ -3541,6 +3584,10 @@ pub(super) const DRAW_STEP_NAMES: [&str; 18] = [
 /// The same per dispatch by kind (`CS_KINDS`), steps of `CS_STEP_NAMES`
 /// and then the count of dispatches recorded to the end.
 pub(super) static CS_STEPS: [[AtomicU64; CS_STEP_COUNT + 1]; 6] = [const { [const { AtomicU64::new(0) }; CS_STEP_COUNT + 1] }; 6];
+/// Steps of draws and dispatches that were their batch's first command
+/// (`place_lines`), the count last.
+pub(super) static DRAW_STEPS_FIRST: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
+pub(super) static CS_STEPS_FIRST: [AtomicU64; CS_STEP_COUNT + 1] = [const { AtomicU64::new(0) }; CS_STEP_COUNT + 1];
 const CS_STEP_COUNT: usize = 19;
 pub(super) const CS_STEP_NAMES: [&str; CS_STEP_COUNT] = [
     "prepare", "shader-read sync", "texture sync", "image hazards", "pipeline", "reserve", "bind", "sgpr data", "set alloc",
@@ -3556,11 +3603,16 @@ const CS_KINDS: [&str; 6] = ["graphics direct", "graphics indirect", "compute di
 /// per buffer binding `BIND_STEP_NAMES[..7]`, then per stage the images and
 /// samplers, then the counts of buffer bindings and of stages.
 pub(super) static BIND_STEPS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// The same for the first command of a batch (`place_lines`: a fresh
+/// batch's first command costs several times a later one's bindings).
+pub(super) static BIND_STEPS_FIRST: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 const BIND_STEP_NAMES: [&str; 8] = ["resource and home", "resident shadows", "snapshot", "mirror", "batch-start copy", "mapping span", "placement and rest", "images and samplers"];
 
 thread_local! {
     /// This thread's BIND_STEPS not yet added.
     static BIND_LOCAL: std::cell::Cell<[u64; 10]> = const { std::cell::Cell::new([0; 10]) };
+    /// Whether the stage being bound belongs to its batch's first command.
+    static BIND_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// TSC lap clock of the bind step's parts (profiling only; ~10 ns a mark).
@@ -3596,6 +3648,12 @@ impl Drop for BindClock {
         let now = unsafe { core::arch::x86_64::_rdtsc() };
         self.acc[7] += now.wrapping_sub(self.last);
         self.acc[9] += 1;
+        if BIND_FIRST.with(|f| f.get()) {
+            for (c, a) in BIND_STEPS_FIRST.iter().zip(self.acc.iter()) {
+                c.fetch_add(*a, Ordering::Relaxed);
+            }
+            return;
+        }
         BIND_LOCAL.with(|l| {
             let mut v = l.get();
             for (x, a) in v.iter_mut().zip(self.acc.iter()) {
@@ -3612,16 +3670,21 @@ impl Drop for BindClock {
     }
 }
 
-/// Profile line: the bind step by part (`BIND_STEPS`).
+/// Profile line: the bind step by part (`BIND_STEPS`), and for batches'
+/// first commands (`BIND_STEPS_FIRST`).
 fn bind_steps_line() -> String {
-    let v: Vec<u64> = BIND_STEPS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    bind_steps_of(&BIND_STEPS, "") + &bind_steps_of(&BIND_STEPS_FIRST, " (first command of a batch)")
+}
+
+fn bind_steps_of(steps: &[AtomicU64; 10], what: &str) -> String {
+    let v: Vec<u64> = steps.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     if v[9] == 0 {
         return String::new();
     }
     let ns = |cycles: u64, n: u64| cycles as f64 * 1e9 / super::threadcpu::tsc_hz() / n.max(1) as f64;
     let parts: Vec<String> = BIND_STEP_NAMES[..7].iter().enumerate().map(|(k, name)| format!("{name} {:.0}", ns(v[k], v[8]))).collect();
     format!(
-        "    bind step by part: {} stages, {} buffer bindings ({:.1} per stage); ns per buffer binding: {}; images and samplers {:.0} ns per stage\n",
+        "    bind step by part{what}: {} stages, {} buffer bindings ({:.1} per stage); ns per buffer binding: {}; images and samplers {:.0} ns per stage\n",
         v[9],
         v[8],
         v[8] as f64 / v[9] as f64,
@@ -3633,6 +3696,8 @@ fn bind_steps_line() -> String {
 /// `Exec::pre_copy` by outcome (DS_PROFILE_GPU): TSC cycles and calls per
 /// `PRE_STEP_NAMES`.
 static PRE_STEPS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+/// The same for the first command of a batch.
+static PRE_STEPS_FIRST: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 const PRE_STEP_NAMES: [&str; 6] = ["refused at once", "reused in the batch", "shared copy reused", "copied for the batch", "copied into the shared cache", "refused after looking"];
 
 thread_local! {
@@ -3661,6 +3726,11 @@ impl PreClock {
 impl Drop for PreClock {
     fn drop(&mut self) {
         let dt = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(self.t0);
+        if BIND_FIRST.with(|f| f.get()) {
+            PRE_STEPS_FIRST[2 * self.k].fetch_add(dt, Ordering::Relaxed);
+            PRE_STEPS_FIRST[2 * self.k + 1].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         PRE_LOCAL.with(|l| {
             let (mut v, mut n) = l.get();
             v[2 * self.k] += dt;
@@ -3677,9 +3747,14 @@ impl Drop for PreClock {
     }
 }
 
-/// Profile line: `pre_copy` by outcome (`PRE_STEPS`).
+/// Profile line: `pre_copy` by outcome (`PRE_STEPS`), and for batches'
+/// first commands (`PRE_STEPS_FIRST`).
 fn pre_steps_line() -> String {
-    let v: Vec<u64> = PRE_STEPS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    pre_steps_of(&PRE_STEPS, "") + &pre_steps_of(&PRE_STEPS_FIRST, " (first command of a batch)")
+}
+
+fn pre_steps_of(steps: &[AtomicU64; 12], what: &str) -> String {
+    let v: Vec<u64> = steps.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let calls: u64 = (0..6).map(|k| v[2 * k + 1]).sum();
     if calls == 0 {
         return String::new();
@@ -3690,7 +3765,7 @@ fn pre_steps_line() -> String {
         .enumerate()
         .map(|(k, name)| format!("{name} {} ({:.0} ns each, {:.0} ms)", v[2 * k + 1], v[2 * k] as f64 * 1e9 / hz / v[2 * k + 1].max(1) as f64, v[2 * k] as f64 * 1e3 / hz))
         .collect();
-    format!("    batch-start copy lookups by outcome: {calls} calls: {}\n", parts.join(", "))
+    format!("    batch-start copy lookups by outcome{what}: {calls} calls: {}\n", parts.join(", "))
 }
 
 /// Lap timer of a command's steps (profiling only).
@@ -3700,11 +3775,11 @@ pub(super) struct Laps {
 }
 
 impl Laps {
-    pub(super) fn for_draw(kind: usize) -> Laps {
-        Laps { last: profiling().then(std::time::Instant::now), steps: &DRAW_STEPS[kind][..18] }
+    pub(super) fn for_draw(kind: usize, first: bool) -> Laps {
+        Laps { last: profiling().then(std::time::Instant::now), steps: if first { &DRAW_STEPS_FIRST[..18] } else { &DRAW_STEPS[kind][..18] } }
     }
-    fn for_dispatch(kind: usize) -> Laps {
-        Laps { last: profiling().then(std::time::Instant::now), steps: &CS_STEPS[kind][..CS_STEP_COUNT] }
+    fn for_dispatch(kind: usize, first: bool) -> Laps {
+        Laps { last: profiling().then(std::time::Instant::now), steps: if first { &CS_STEPS_FIRST[..CS_STEP_COUNT] } else { &CS_STEPS[kind][..CS_STEP_COUNT] } }
     }
     /// Adds the time since the last mark to step `k`.
     pub(super) fn mark(&mut self, k: usize) {
@@ -3774,6 +3849,19 @@ fn sync_steps_line_inner() -> String {
 
 fn draw_steps_line() -> String {
     let mut s = String::new();
+    // Batches' first commands.
+    let n = DRAW_STEPS_FIRST[18].load(Ordering::Relaxed);
+    if n > 0 {
+        let total: u64 = DRAW_STEPS_FIRST[..18].iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        let parts: Vec<String> = DRAW_STEP_NAMES.iter().zip(DRAW_STEPS_FIRST.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
+        s.push_str(&format!("    command processor per draw by step, first command of a batch ({n} draws, {:.2} us each): {}\n", total as f64 / n as f64 / 1000.0, parts.join(", ")));
+    }
+    let n = CS_STEPS_FIRST[CS_STEP_COUNT].load(Ordering::Relaxed);
+    if n > 0 {
+        let parts: Vec<String> = CS_STEP_NAMES.iter().zip(CS_STEPS_FIRST.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
+        let total: u64 = CS_STEPS_FIRST[..CS_STEP_COUNT].iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        s.push_str(&format!("    command processor per dispatch by step, first command of a batch ({n} dispatches, {:.2} us each): {}\n", total as f64 / n as f64 / 1000.0, parts.join(", ")));
+    }
     for (kind, steps) in DRAW_KINDS.iter().zip(DRAW_STEPS.iter()) {
         let n = steps[18].load(Ordering::Relaxed);
         if n == 0 {
@@ -3995,10 +4083,10 @@ pub fn reset_shader_profile() {
     for c in crate::mem::WRITE_WATCH_STATS.iter() {
         c.store(0, Ordering::Relaxed);
     }
-    for c in DRAW_STEPS.iter().flatten().chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()).chain(BIND_STEPS.iter()).chain(PRE_STEPS.iter()) {
+    for c in DRAW_STEPS.iter().flatten().chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(DRAW_STEPS_FIRST.iter()).chain(CS_STEPS_FIRST.iter()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()).chain(BIND_STEPS.iter()).chain(BIND_STEPS_FIRST.iter()).chain(PRE_STEPS.iter()).chain(PRE_STEPS_FIRST.iter()) {
         c.store(0, Ordering::Relaxed);
     }
-    for c in CS_PHASES.iter().chain(DRAW_PHASES.iter()) {
+    for c in CS_PHASES.iter().chain(DRAW_PHASES.iter()).chain(PLACE_PHASES.iter().flatten().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
     for (r, c) in SYNC_WHY_AT_RESET.iter().zip(SYNC_WHY.iter()) {
@@ -4071,6 +4159,7 @@ pub fn shader_profile() -> String {
     s.push_str(&sync_steps_line());
     s.push_str(&shaders::repeats_line());
     s.push_str(&phases_line("dispatch", &CS_PHASES, ["prepare and waits", "textures, pipeline", "bindings"]));
+    s.push_str(&place_lines());
     s.push_str(&cs_cpu_lines());
     {
         let n: Vec<u64> = SYNC_WHY.iter().zip(SYNC_WHY_AT_RESET.iter()).map(|(c, r)| c.load(Ordering::Relaxed).saturating_sub(r.load(Ordering::Relaxed))).collect();
@@ -4107,7 +4196,7 @@ pub fn shader_profile() -> String {
         let mut v: Vec<(&(String, &'static str), &u64)> = w.iter().collect();
         v.sort_by(|a, b| b.1.cmp(a.1));
         let list: Vec<String> = v.iter().map(|((q, why), n)| format!("{q} {why} {n}")).collect();
-        s.push_str(&format!("    batches by what ended them: {}\n", list.join(", ")));
+        s.push_str(&format!("    batches by what ended them: {} (command-buffer ends left open: {})\n", list.join(", "), super::cp::CMDBUF_MERGED.load(Ordering::Relaxed)));
     }
     if let Some(st) = STARVED.lock().as_ref() {
         let mut v: Vec<(&String, &[u64; 3])> = st.iter().collect();
@@ -7118,6 +7207,7 @@ impl Exec {
         bound.images.reserve(nb);
         let seg = SHADOW_BYTES;
         let fx = fixed();
+        BIND_FIRST.with(|f| f.set(self.batch_shaders.is_empty()));
         let mut clk = BindClock::start();
         {
             for b in &found.tr.out.bindings {
@@ -7569,7 +7659,7 @@ impl Exec {
         if [0x204, 0x205, 0x206].iter().any(|&r| cp.reg(Space::Sh, r) != 0) {
             return false;
         }
-        let mut lap = Laps::for_dispatch(self.cs_kind(true));
+        let mut lap = Laps::for_dispatch(self.cs_kind(true), false);
         let r = [(args, 12)];
         if !(self.overlaps_pending(&r) || INFLIGHT.latest(&r).is_some() || CP_WRITES.latest(&r).is_some()) {
             return false;
@@ -7605,7 +7695,8 @@ impl Exec {
         let t0 = profiling().then_some(t_start);
         let since = |t0: Option<std::time::Instant>| t0.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         let kind = self.cs_kind(indirect.is_some());
-        let mut lap = Laps::for_dispatch(kind);
+        let first = self.batch_shaders.is_empty();
+        let mut lap = Laps::for_dispatch(kind, first);
         if let Some(a) = indirect {
             // A resident shadow holding newer arguments is merged back first,
             // unless the GPU reads them from its working copy (`tune
@@ -8080,8 +8171,13 @@ impl Exec {
         let total = t_start.elapsed();
         if profiling() {
             note_phases(&CS_PHASES, [t_prep, t_pipe, t_bind, total]);
+            note_place(self.deferred, self.batch_shaders.len().saturating_sub(1), [t_prep, t_pipe, t_bind, total]);
             note_cs_cpu(p.addr, kind, [t_prep, t_pipe, t_bind, total]);
-            CS_STEPS[kind][CS_STEP_COUNT].fetch_add(1, Ordering::Relaxed);
+            if first {
+                CS_STEPS_FIRST[CS_STEP_COUNT].fetch_add(1, Ordering::Relaxed);
+            } else {
+                CS_STEPS[kind][CS_STEP_COUNT].fetch_add(1, Ordering::Relaxed);
+            }
         }
         if total.as_millis() >= 200 {
             let phases = if profiling() { format!(" (prepare {} ms, pipeline {} ms, bindings {} ms)", t_prep.as_millis(), (t_pipe - t_prep).as_millis(), (t_bind - t_pipe).as_millis()) } else { String::new() };

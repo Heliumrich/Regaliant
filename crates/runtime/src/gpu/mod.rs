@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 105] = [
+    static ALL: [Tunable; 106] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -132,6 +132,7 @@ pub mod tune {
         Tunable { name: "prep_pool", env: "DS_PREP_POOL", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ts_batch", env: "DS_TS_BATCH", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ww_probe", env: "DS_WW_PROBE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "cmdbuf_merge", env: "DS_CMDBUF_MERGE", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1118,6 +1119,17 @@ pub mod tune {
         get(104) != 0
     }
 
+    /// The graphics command processor keeps its batch open at the end of a
+    /// title command buffer when another follows at once (more buffers in
+    /// the submission, or the next submission queued): ~22 of its ~75
+    /// batches per frame end there, each a batch begin (~60 us with slot
+    /// waits) and a costlier first command (~100 us) more. Live A/B
+    /// 2026-10-15 late night: +3.8% flips/s (1.023-1.050); default 1.
+    #[inline]
+    pub fn cmdbuf_merge() -> bool {
+        get(105) != 0
+    }
+
 
     /// A switch's value by name; None if unknown.
     pub fn value(name: &str) -> Option<u64> {
@@ -1495,6 +1507,7 @@ fn worker(q: &'static Queue, name: &str) {
     }
     shaders::set_compute_queue(q.id != GFX);
     cp.wait_flag = Some(&q.cp_waiting);
+    cp.more_follows = Some(Box::new(move || !q.pending.lock().is_empty()));
     // Register states kept for a frame replay (`Ctl::Save`).
     let mut saved: [Option<cp::ChunkState>; 2] = [None, None];
     loop {
@@ -1529,7 +1542,9 @@ fn worker(q: &'static Queue, name: &str) {
         }
         cp.submitted_at = Some(batch.at);
         cp.new_submission();
+        let nbufs = batch.bufs.len();
         for (i, &(addr, size)) in batch.bufs.iter().enumerate() {
+            cp.next_in_submission = i + 1 < nbufs;
             if trace_submit() && size == 277 {
                 // Bink decode command buffers: their counter (dword 272) and
                 // dword 159 at submission and now, and the label the first
