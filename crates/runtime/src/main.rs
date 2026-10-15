@@ -528,8 +528,10 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 let hex = |s: Option<&str>| s.and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok());
                 match (hex(parts.next()), hex(parts.next())) {
                     (Some(a), Some(n)) if n > 0 && n <= 256 << 20 => {
-                        if !gpu::cp::guest_readable(a, n) {
-                            Err(format!("{a:#x}+{n:#x} is not readable guest memory"))
+                        // Guest memory GPU work may read, or any readable process
+                        // memory (the title's heap objects live outside those ranges).
+                        if !gpu::cp::guest_readable(a, n) && !mem::os_readable(a, n) {
+                            Err(format!("{a:#x}+{n:#x} is not readable memory"))
                         } else if let Some(dir) = RUN_DIR.get() {
                             let bytes = unsafe { std::slice::from_raw_parts(a as *const u8, n as usize) };
                             std::fs::write(dir.join(format!("mem-{a:x}.bin")), bytes).map_err(|e| e.to_string())
