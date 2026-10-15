@@ -93,9 +93,113 @@ const SPAN_CALLS_BATCH: u32 = 1024;
 static SPAN_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One status line (diagnostics).
+/// Contents of unmapped direct memory kept with its physical pages
+/// (`DS_PHYS_CARRY=1`). On the console a physical page keeps its data while
+/// unmapped and shows it wherever it is mapped next; here a mapping's pages
+/// are private to its addresses, so the title's remaps of physical memory to
+/// new addresses (~27k per tour, 8 GB, mostly `sceKernelBatchMap`) arrived
+/// zeroed. Unmapping parks the non-zero 4 KiB pages by physical address
+/// (`park`), the next mapping of them copies them in (`unpark`), releasing
+/// the physical memory drops them (`drop_parked`).
+static PARKED: Mutex<BTreeMap<u64, Box<[u8]>>> = Mutex::new(BTreeMap::new());
+/// [pages parked, zero pages left out, pages copied into a new mapping,
+/// pages dropped by releases, bytes held, pages not parked (cap)].
+pub static PARK_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+/// Most bytes kept parked.
+const PARK_CAP: u64 = 4 << 30;
+const PARK_PAGE: u64 = 4096;
+
+/// `DS_PHYS_CARRY=1`: unmapped direct memory keeps its contents (`PARKED`).
+pub fn phys_carry() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| env_is("DS_PHYS_CARRY", "1"))
+}
+
+/// Parks the non-zero pages of the direct mapping [va, va+size) of physical
+/// `phys` (before its pages are decommitted).
+fn park(va: u64, phys: u64, size: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !os_readable(va, size) {
+        return;
+    }
+    let mut g = PARKED.lock();
+    let mut off = 0;
+    while off < size {
+        let page = unsafe { std::slice::from_raw_parts((va + off) as *const u64, (PARK_PAGE / 8) as usize) };
+        let key = phys + off;
+        if page.iter().all(|&w| w == 0) {
+            if g.remove(&key).is_some() {
+                PARK_STATS[4].fetch_sub(PARK_PAGE, Relaxed);
+            }
+            PARK_STATS[1].fetch_add(1, Relaxed);
+        } else if PARK_STATS[4].load(Relaxed) + PARK_PAGE > PARK_CAP && !g.contains_key(&key) {
+            PARK_STATS[5].fetch_add(1, Relaxed);
+        } else {
+            let bytes = unsafe { std::slice::from_raw_parts((va + off) as *const u8, PARK_PAGE as usize) };
+            if g.insert(key, bytes.into()).is_none() {
+                PARK_STATS[4].fetch_add(PARK_PAGE, Relaxed);
+            }
+            PARK_STATS[0].fetch_add(1, Relaxed);
+        }
+        off += PARK_PAGE;
+    }
+}
+
+/// Copies the parked pages of physical [phys, phys+size) into the new
+/// direct mapping at `va` (protection `prot`), and forgets them.
+fn unpark(va: u64, phys: u64, size: u64, prot: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut g = PARKED.lock();
+    let keys: Vec<u64> = g.range(phys..phys + size).map(|(k, _)| *k).collect();
+    if keys.is_empty() {
+        return;
+    }
+    let writable = matches!(win_prot(prot), PAGE_READWRITE | PAGE_EXECUTE_READWRITE);
+    let mut old = 0u32;
+    if !writable {
+        unsafe { VirtualProtect(va as _, size as usize, PAGE_READWRITE, &mut old) };
+    }
+    for k in keys {
+        if let Some(b) = g.remove(&k) {
+            unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), (va + (k - phys)) as *mut u8, PARK_PAGE as usize) };
+            PARK_STATS[4].fetch_sub(PARK_PAGE, Relaxed);
+            PARK_STATS[2].fetch_add(1, Relaxed);
+        }
+    }
+    if !writable {
+        unsafe { VirtualProtect(va as _, size as usize, win_prot(prot), &mut old) };
+    }
+}
+
+/// Forgets the parked pages of released physical [start, end).
+fn drop_parked(start: u64, end: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut g = PARKED.lock();
+    let keys: Vec<u64> = g.range(start..end).map(|(k, _)| *k).collect();
+    for k in keys {
+        g.remove(&k);
+        PARK_STATS[4].fetch_sub(PARK_PAGE, Relaxed);
+        PARK_STATS[3].fetch_add(1, Relaxed);
+    }
+}
+
 pub fn remap_status() -> String {
     let r = REMAP.lock();
     let o = std::sync::atomic::Ordering::Relaxed;
+    let carry = if phys_carry() {
+        let v: Vec<u64> = PARK_STATS.iter().map(|c| c.load(o)).collect();
+        format!(
+            "; contents carried (DS_PHYS_CARRY): {} pages parked ({} zero left out), {} copied into later mappings, {} dropped by releases, {} MiB held, {} not parked (cap)",
+            v[0],
+            v[1],
+            v[2],
+            v[3],
+            v[4] >> 20,
+            v[5]
+        )
+    } else {
+        String::new()
+    };
     format!(
         "    direct memory remaps: {} in place ({} MiB, zeroed here), {} of pages last mapped elsewhere ({} MiB, contents not carried); mapping changes {}; readable-range checks {} ({} cache misses); decommits deferred under GPU imports {} ({} MiB; {} done later, {} mapped again first, {} waiting)
 ",
@@ -112,6 +216,7 @@ pub fn remap_status() -> String {
         DEFERRED_STATS[2].load(o),
         DEFERRED_LEN.load(o)
     )
+    .replace(" waiting)\n", &format!(" waiting){carry}\n"))
 }
 
 /// Incremented whenever guest mappings or their protections change (inside
@@ -711,6 +816,9 @@ impl MemState {
                 }
                 r.released.insert(v.phys, (v.start, v.size));
             }
+            if v.kind == VmaKind::Direct && phys_carry() {
+                park(v.start, v.phys, v.size);
+            }
             if v.kind != VmaKind::Reserved {
                 host_decommit(v.start, v.size);
             }
@@ -774,6 +882,9 @@ impl MemState {
         }
         if kind != VmaKind::Reserved {
             host_commit(addr, size, prot)?;
+        }
+        if kind == VmaKind::Direct && phys_carry() {
+            unpark(addr, phys, size, prot);
         }
         if kind == VmaKind::Direct {
             for v in self.vmas.values() {
@@ -875,6 +986,9 @@ impl MemState {
             .collect();
         for (s, e) in vas {
             self.unmap_range(s, e);
+        }
+        if phys_carry() {
+            drop_parked(start, end);
         }
     }
 

@@ -637,6 +637,42 @@ fn revalidate_spans() {
     }
 }
 
+/// In-place bindings with residency on (they import their pages): by
+/// [written, unsized] and size bucket (<64K, <1M, <16M, more): [bindings,
+/// bytes]; and the shaders behind the most bytes.
+static IN_PLACE: Mutex<Option<(HashMap<(bool, bool, u8), [u64; 2]>, HashMap<u64, u64>)>> = Mutex::new(None);
+
+fn note_in_place(written: bool, pointer: bool, size: u64, shader: u64) {
+    let b = match size {
+        0..65536 => 0,
+        65536..1048576 => 1,
+        1048576..16777216 => 2,
+        _ => 3,
+    };
+    let mut g = IN_PLACE.lock();
+    let (m, s) = g.get_or_insert_with(Default::default);
+    let e = m.entry((written, pointer, b)).or_default();
+    e[0] += 1;
+    e[1] += size;
+    *s.entry(shader).or_default() += size;
+}
+
+/// Status part: in-place bindings with residency on.
+pub(super) fn in_place_line() -> String {
+    let g = IN_PLACE.lock();
+    let Some((m, s)) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(&(bool, bool, u8), &[u64; 2])> = m.iter().collect();
+    v.sort_by(|a, b| b.1[1].cmp(&a.1[1]));
+    let parts: Vec<String> = v
+        .iter()
+        .map(|((w, u, b), x)| format!("{}{} {} {} ({} GiB)", if *w { "written" } else { "read" }, if *u { " unsized" } else { "" }, ["<64K", "<1M", "<16M", ">=16M"][*b as usize], x[0], x[1] >> 30))
+        .collect();
+    let mut sh: Vec<(&u64, &u64)> = s.iter().collect();
+    sh.sort_by(|a, b| b.1.cmp(a.1));
+    let top: Vec<String> = sh.iter().take(6).map(|(a, n)| format!("{a:#x} {} GiB", *n >> 30)).collect();
+    format!("    in-place bindings with residency on: {}; by shader: {}\n", parts.join(", "), top.join(", "))
+}
+
 /// New imports by the code that asked for them (residency on: their pages
 /// turn host class), as (calls, bytes).
 static IMPORT_SITES: Mutex<Option<HashMap<(&'static str, u32), (u64, u64)>>> = Mutex::new(None);
@@ -7168,6 +7204,9 @@ impl Exec {
                             match span {
                                 Some((buffer, start, end)) => {
                                     placement = Placement::Host;
+                                    if super::resident::enabled() {
+                                        note_in_place(found.tr.plan.resources[i].written, matches!(found.resources[i], Resolved::Global(_, None)), size, p.addr);
+                                    }
                                     let rel = base - start;
                                     let align = ctx().limits.min_storage_buffer_offset_alignment.max(4);
                                     let off = rel & !(align - 1);
@@ -8103,6 +8142,7 @@ pub fn status() -> String {
         + &super::homes::status()
         + &super::resident::status()
         + &import_sites_line()
+        + &in_place_line()
         + &sync_why_status()
         + &format!(
             "    buffer snapshots in VRAM: {} ({} MiB), {} reused, {} not for lack of space, {} for memory that cannot be imported; draws with snapshotted indices {} ({} MiB); batch-start copies {} ({} MiB), {} reused, {} not for lack of space; on the copy queue {} ({} MiB)\n",
