@@ -938,7 +938,12 @@ fn long_wait(waiter: &str, a: u64, wide: bool, func: u32, mask: u64, reference: 
         e[1] += ns;
         e[slot] += 1;
     }
-    if LONG_WAITS_LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
+    // DS_TRACE_WAITS=<queue>: that queue's long waits (the first 200), with
+    // the same detail, whenever they happen.
+    static TRACE_Q: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    static TRACED_Q: AtomicU64 = AtomicU64::new(0);
+    let traced = TRACE_Q.get_or_init(|| std::env::var("DS_TRACE_WAITS").ok()).as_deref() == Some(waiter) && TRACED_Q.fetch_add(1, Ordering::Relaxed) < 200;
+    if traced || LONG_WAITS_LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
         let promise = match p {
             None => "none".to_string(),
             Some((seq, v, bytes, by_cpu, t)) => {
