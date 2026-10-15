@@ -14,6 +14,8 @@ pub static DRAWN: AtomicU64 = AtomicU64::new(0);
 /// Draws without visible effect here (metadata passes, all writes disabled).
 pub static DRAW_NOOP: AtomicU64 = AtomicU64::new(0);
 pub static DRAW_SKIPPED: AtomicU64 = AtomicU64::new(0);
+/// Indexed indirect draws recorded with the GPU reading their arguments.
+pub static GPU_ARG_DRAWS: AtomicU64 = AtomicU64::new(0);
 
 const MAX_RT: usize = 8;
 
@@ -80,7 +82,28 @@ pub struct DrawArgs {
     /// Added to the instance id VGPR (indirect draws whose packet names no
     /// start-instance SGPR; see the CP).
     pub first_instance: u32,
+    /// An indexed indirect draw whose arguments the GPU reads (`tune
+    /// draw_args_gpu`); `count`, `instances`, `base_vertex` and
+    /// `first_instance` are then unused and `index` is the index buffer's
+    /// start.
+    pub gpu_args: Option<GpuArgs>,
 }
+
+/// Arguments read by the GPU (`DrawArgs::gpu_args`).
+#[derive(Clone, Copy, Debug)]
+pub struct GpuArgs {
+    /// Guest address of the DrawIndexIndirect record (in a video-memory home).
+    pub addr: u64,
+    /// The vertex stage's user-data word that receives the start instance.
+    pub inst_slot: u16,
+    /// The index buffer's size in bytes (VGT_INDEX_BUFFER_SIZE), in a home.
+    pub index_bytes: u64,
+}
+
+/// `draw` outcome when the vertex stage needs the start instance on the CPU
+/// (`shaders::uses_user_word`): the command processor reads the arguments
+/// and draws again.
+pub const NEEDS_CPU_ARGS: &str = "indirect arguments needed on the CPU";
 
 fn ctx_reg(cp: &Cp, a: u32) -> u32 {
     cp.reg(Space::Ctx, (a - 0x28000) / 4)
@@ -437,6 +460,7 @@ impl Exec {
                 "no effect".into()
             }
             Err(e) if e == super::STOPPED => "stopped (parallel run)".into(),
+            Err(e) if e == NEEDS_CPU_ARGS => NEEDS_CPU_ARGS.into(),
             Err(e) => {
                 DRAW_SKIPPED.fetch_add(1, Ordering::Relaxed);
                 let s = format!("skipped: {e}");
@@ -537,7 +561,8 @@ impl Exec {
 
     /// Records the draw; Ok(false) when it has no effect here.
     fn draw_inner(&mut self, cp: &Cp, a: &DrawArgs) -> Result<bool, String> {
-        if a.count == 0 || a.instances == 0 {
+        let gpu = a.gpu_args;
+        if gpu.is_none() && (a.count == 0 || a.instances == 0) {
             return Ok(false);
         }
         // Phase times (DS_PROFILE_GPU only: a clock read costs ~20 ns).
@@ -581,12 +606,24 @@ impl Exec {
         // Shader stages.
         let ps_addr = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
         // Stages prepared ahead by the workers (`gpu::ahead`) when they still
-        // hold, else here.
+        // hold, else here. A draw whose arguments the GPU reads takes the
+        // start instance on the GPU (prepared here).
+        let prep_vs = |cp: &Cp| match gpu {
+            Some(g) => shaders::with_base_instance(g.inst_slot, || shaders::prepare_ngg(cp)),
+            None => shaders::prepare_ngg(cp),
+        };
         let [pre_vs, pre_ps] = cp.take_ahead();
+        let pre_vs = if gpu.is_some() { None } else { pre_vs };
         let mut vs = match pre_vs.and_then(|s| crate::gpu::ahead::take(&s, cp, true)) {
             Some(p) => p,
-            None => shaders::prepare_ngg(cp)?,
+            None => prep_vs(cp)?,
         };
+        if let Some(g) = gpu {
+            if shaders::uses_user_word(&vs, g.inst_slot) {
+                shaders::note_cpu_args_program(vs.addr);
+                return Err(NEEDS_CPU_ARGS.into());
+            }
+        }
         lap.mark(0);
         let mut ps = if ps_addr != 0 {
             match pre_ps.and_then(|s| crate::gpu::ahead::take(&s, cp, true)) {
@@ -603,7 +640,7 @@ impl Exec {
         if super::super::tune::gpu_loads_mode() == 3 {
             if !vs.data_loads.is_empty() && self.would_wait(&shaders::data_load_ranges(&vs)) {
                 shaders::note_gpu_loads_program(vs.addr);
-                vs = shaders::with_gpu_loads(|| shaders::prepare_ngg(cp))?;
+                vs = shaders::with_gpu_loads(|| prep_vs(cp))?;
                 super::HYBRID_LOADS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             if ps.as_ref().is_some_and(|p| !p.data_loads.is_empty() && self.would_wait(&shaders::data_load_ranges(p))) {
@@ -633,7 +670,7 @@ impl Exec {
             }
             let same = shaders::words_unchanged(&vs) && ps.as_ref().is_none_or(shaders::words_unchanged);
             super::READ_WAIT_WORDS[if same { 0 } else { 1 }].fetch_add(1, Ordering::Relaxed);
-            vs = shaders::prepare_ngg(cp)?;
+            vs = prep_vs(cp)?;
             ps = if ps_addr != 0 { Some(shaders::prepare_ps(cp)?) } else { None };
         }
         lap.mark(2);
@@ -654,17 +691,35 @@ impl Exec {
         // that GPU work wrote through a large binding) are bound from it and
         // read in order on the GPU; others are waited for if GPU work writes
         // them.
+        let index_bytes = |size: u32| gpu.map_or(a.count as u64 * size as u64, |g| g.index_bytes);
         let index_home = match a.index {
             Some((addr, size)) => {
-                let bytes = a.count as u64 * size as u64;
+                let bytes = index_bytes(size);
                 let h = self.home_bind(addr, bytes, false, super::HomeUse::Index);
                 if h.is_none() {
+                    if gpu.is_some() {
+                        return Err(format!("index buffer {addr:#x}+{bytes:#x} of a draw reading its arguments on the GPU is not in a video-memory home (draw skipped)"));
+                    }
                     self.sync_for(&[(addr, bytes)], SYNC_DRAW_INDICES);
                 }
                 if self.stopped {
                     return Err(super::STOPPED.into());
                 }
                 h
+            }
+            None => None,
+        };
+        // Arguments the GPU reads: from their video-memory home.
+        let args_home = match gpu {
+            Some(g) => {
+                let h = self.home_bind(g.addr, 20, false, super::HomeUse::Sized);
+                if self.stopped {
+                    return Err(super::STOPPED.into());
+                }
+                match h {
+                    Some(h) => Some(h),
+                    None => return Err(format!("indirect arguments {:#x} are no longer in a video-memory home (draw skipped)", g.addr)),
+                }
             }
             None => None,
         };
@@ -835,10 +890,15 @@ impl Exec {
                 return Err("the index buffer's video-memory home was dropped during the draw (draw skipped)".into());
             }
         }
+        if let Some(h) = &args_home {
+            if !self.keep_home(h.0, h.3.as_ref()) {
+                return Err("the indirect arguments' video-memory home was dropped during the draw (draw skipped)".into());
+            }
+        }
         // Indices in guest memory that a resident shadow holds newer data for.
         if let Some((addr, size)) = a.index {
             let t = profiling().then(std::time::Instant::now);
-            self.flush_resident(Some(&[(addr, a.count as u64 * size as u64)]))?;
+            self.flush_resident(Some(&[(addr, index_bytes(size))]))?;
             if let Some(t) = t {
                 super::BEGIN_STATS[2].fetch_add(1, Ordering::Relaxed);
                 super::BEGIN_STATS[3].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1172,7 +1232,13 @@ impl Exec {
             let ti = self.batch_shaders.len() as u32;
             // Full-screen passes (a triangle or quad, one instance) count as
             // large: their cost is the pixels they shade.
-            let work = if a.count <= 4 && a.instances == 1 { u64::MAX } else { a.count as u64 * a.instances as u64 };
+            let work = if gpu.is_some() {
+                0
+            } else if a.count <= 4 && a.instances == 1 {
+                u64::MAX
+            } else {
+                a.count as u64 * a.instances as u64
+            };
             let timed = qp != vk::QueryPool::null() && ti < super::MAX_TIMED && super::stamp_worth(Some(work), 16384);
             if timed {
                 for k in 0..2 {
@@ -1197,7 +1263,14 @@ impl Exec {
                     super::INDEX_SNAP_BYTES.fetch_add(a.count as u64 * size as u64, Ordering::Relaxed);
                     let ty = if size == 4 { vk::IndexType::UINT32 } else { vk::IndexType::UINT16 };
                     c.device.cmd_bind_index_buffer(cmd, sbuf, soff + sbias, ty);
-                    c.device.cmd_draw_indexed(cmd, a.count, a.instances, 0, base_vertex, a.first_instance);
+                    match &args_home {
+                        Some(h) => {
+                            GPU_ARG_DRAWS.fetch_add(1, Ordering::Relaxed);
+                            c.device.cmd_draw_indexed_indirect(cmd, h.0, h.1, 1, 20);
+                            self.args_read = true;
+                        }
+                        None => c.device.cmd_draw_indexed(cmd, a.count, a.instances, 0, base_vertex, a.first_instance),
+                    }
                 }
                 Some((addr, size)) => {
                     let bytes = a.count as u64 * size as u64;

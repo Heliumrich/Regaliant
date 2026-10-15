@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 95] = [
+    static ALL: [Tunable; 96] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -122,6 +122,7 @@ pub mod tune {
         Tunable { name: "ahead_queues", env: "DS_AHEAD_QUEUES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "copy_update", env: "DS_COPY_UPDATE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "skip_copies", env: "DS_SKIP_COPIES", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "draw_args_gpu", env: "DS_DRAW_ARGS_GPU", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -993,6 +994,16 @@ pub mod tune {
     #[inline]
     pub fn skip_copies() -> u64 {
         get(94)
+    }
+
+    /// Indexed indirect draws whose arguments GPU work wrote through a VRAM
+    /// shadow read them on the GPU from a video-memory home made for that
+    /// buffer (the culls' DrawIndexIndirect records): no merge of the
+    /// buffer back to guest memory after every batch, no copy in at the
+    /// next, no wait for the culls before the draws are recorded.
+    #[inline]
+    pub fn draw_args_gpu() -> bool {
+        get(95) != 0
     }
 
 

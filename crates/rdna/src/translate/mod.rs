@@ -146,7 +146,7 @@ pub enum ResSpec {
     Global,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Spec {
     pub stage: Stage,
     /// Number of user-data dwords.
@@ -219,6 +219,45 @@ pub struct Spec {
     /// EXEC and enabling all lanes) must find lanes EXEC masked off earlier.
     /// It costs time where lanes would have skipped a region alone.
     pub lane_votes: bool,
+    /// Vertex stage of a draw whose arguments the GPU reads (indexed
+    /// indirect draws, see the runtime's `DrawArgs::gpu_args`): this SGPR
+    /// receives the start instance (`gl_BaseInstance`), as the command
+    /// processor writes it into the user SGPR the packet names, and the
+    /// instance id VGPR counts from 0.
+    pub base_instance_sgpr: Option<u16>,
+}
+
+/// As derived, except that `base_instance_sgpr` is hashed only when set:
+/// translations and pipelines keyed by the hash of a spec without it keep
+/// their keys (pipeline cache files are named by them).
+impl std::hash::Hash for Spec {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.stage.hash(state);
+        self.user_sgprs.hash(state);
+        self.user_base.hash(state);
+        self.code_base.hash(state);
+        self.wave64.hash(state);
+        self.ps_input_addr.hash(state);
+        self.ps_inputs.hash(state);
+        self.barycentric.hash(state);
+        self.mrt.hash(state);
+        self.cs_local_size.hash(state);
+        self.cs_rsrc2.hash(state);
+        self.resources.hash(state);
+        self.binding_base.hash(state);
+        self.probe.hash(state);
+        self.dump.hash(state);
+        self.force_dispatcher.hash(state);
+        self.dispatcher_for_loops.hash(state);
+        self.reg_vars.hash(state);
+        self.lod_stats.hash(state);
+        self.early_tests.hash(state);
+        self.per_lane.hash(state);
+        self.lane_votes.hash(state);
+        if let Some(s) = self.base_instance_sgpr {
+            s.hash(state);
+        }
+    }
 }
 
 /// Entries of an image table bound as one array of sampled images
@@ -2521,6 +2560,7 @@ mod tests {
             early_tests: false,
             per_lane: false,
             lane_votes: false,
+            base_instance_sgpr: None,
         }
     }
 

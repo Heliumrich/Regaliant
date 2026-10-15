@@ -46,6 +46,10 @@ pub struct Ctx {
     /// bufferDeviceAddress enabled: guest imports and video-memory homes get
     /// GPU addresses that fault reports name (`note_gpu_range`).
     pub device_addresses: bool,
+    /// shaderDrawParameters and drawIndirectFirstInstance enabled: vertex
+    /// shaders of draws whose arguments the GPU reads take the start
+    /// instance from gl_BaseInstance (`tune draw_args_gpu`).
+    pub draw_parameters: bool,
     /// The copy queue (a transfer-only queue family; `DS_COPY_QUEUE=0`:
     /// none): batch-start copies run on it beside the main queue (`exec`).
     pub copy: Option<CopyQueue>,
@@ -296,7 +300,9 @@ fn init_inner() -> Result<(), String> {
         if barycentric {
             dexts.push(ash::khr::fragment_shader_barycentric::NAME.as_ptr());
         }
+        let first_instance = instance.get_physical_device_features(pdev).draw_indirect_first_instance != 0;
         let features = vk::PhysicalDeviceFeatures::default()
+            .draw_indirect_first_instance(first_instance)
             .robust_buffer_access(true)
             .geometry_shader(true)
             .independent_blend(true)
@@ -317,10 +323,13 @@ fn init_inner() -> Result<(), String> {
             .sample_rate_shading(true);
         // Image tables are indexed per invocation (non-uniform indexing).
         let mut f12_supported = vk::PhysicalDeviceVulkan12Features::default();
+        let mut f11_supported = vk::PhysicalDeviceVulkan11Features::default();
         {
-            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut f12_supported);
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut f12_supported).push_next(&mut f11_supported);
             instance.get_physical_device_features2(pdev, &mut f2);
         }
+        let draw_parameters = f11_supported.shader_draw_parameters != 0;
+        let mut f11 = vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(draw_parameters);
         let nonuniform = f12_supported.shader_sampled_image_array_non_uniform_indexing != 0;
         if !nonuniform {
             crate::warn!("Vulkan: shaderSampledImageArrayNonUniformIndexing unsupported (image tables index uniformly)");
@@ -340,6 +349,7 @@ fn init_inner() -> Result<(), String> {
             .queue_create_infos(qci)
             .enabled_extension_names(&dexts)
             .enabled_features(&features)
+            .push_next(&mut f11)
             .push_next(&mut f12)
             .push_next(&mut f13);
         if has_robust2 {
@@ -406,6 +416,7 @@ fn init_inner() -> Result<(), String> {
             calibrated: calibrated.then(|| ash::ext::calibrated_timestamps::Device::new(&instance, &device)),
             fault: has_fault.then(|| ash::ext::device_fault::Device::new(&instance, &device)),
             device_addresses,
+            draw_parameters: draw_parameters && first_instance,
             families: [qf, copy.as_ref().map_or(qf, |c| c.family)],
             copy,
             entry,

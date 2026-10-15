@@ -28,6 +28,42 @@ thread_local! {
     /// Preparations made inside `with_gpu_loads` read their data-only loads
     /// on the GPU whatever `tune gpu_loads` says.
     static FORCE_GPU_LOADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Vertex stages prepared inside `with_base_instance`: the user-data
+    /// word that receives the draw's start instance on the GPU.
+    static BASE_INSTANCE: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with the vertex stages it prepares taking user-data word `slot`
+/// from the draw's start instance on the GPU (`Spec::base_instance_sgpr`:
+/// indexed indirect draws whose arguments the GPU reads).
+pub fn with_base_instance<T>(slot: u16, f: impl FnOnce() -> T) -> T {
+    BASE_INSTANCE.with(|c| c.set(Some(slot)));
+    let r = f();
+    BASE_INSTANCE.with(|c| c.set(None));
+    r
+}
+
+/// Whether anything of the stage resolved on the CPU (descriptors, scalar
+/// loads and their pointers) depends on user-data word `slot`: then its
+/// value must be known when the draw is recorded.
+pub fn uses_user_word(p: &Prepared, slot: u16) -> bool {
+    user_deps(&p.tr.plan) & (1u32 << slot.min(31)) != 0
+}
+
+/// NGG programs whose CPU-resolved inputs depend on the start-instance
+/// word: their indirect draws read their arguments on the CPU.
+static CPU_ARGS_PROGRAMS: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+static CPU_ARGS_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn note_cpu_args_program(addr: u64) {
+    if CPU_ARGS_PROGRAMS.lock().get_or_insert_with(Default::default).insert(addr) {
+        crate::info!("gpu: vertex program {addr:#x} resolves inputs from its start-instance word on the CPU: its indirect draws read their arguments there");
+    }
+    CPU_ARGS_ANY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub fn cpu_args_program(addr: u64) -> bool {
+    CPU_ARGS_ANY.load(std::sync::atomic::Ordering::Acquire) && CPU_ARGS_PROGRAMS.lock().as_ref().is_some_and(|s| s.contains(&addr))
 }
 
 /// Runs `f` with the stage preparations it makes reading their data-only
@@ -781,6 +817,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         early_tests: false,
         per_lane: false,
         lane_votes: false,
+        base_instance_sgpr: None,
     };
     if super::tune::per_lane() != 0 && per_lane_program(code_hash) {
         let votes = lane_votes_program(code_hash);
@@ -936,6 +973,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         early_tests: ctx(DB_SHADER_CONTROL) & (1 << 12) != 0,
         per_lane: false,
         lane_votes: false,
+        base_instance_sgpr: None,
     };
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
@@ -1079,6 +1117,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         early_tests: false,
         per_lane: false,
         lane_votes: false,
+        base_instance_sgpr: BASE_INSTANCE.with(|c| c.get()).map(|k| 8 + k),
     };
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);

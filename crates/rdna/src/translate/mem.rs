@@ -26,7 +26,19 @@ pub fn stage_inputs(tr: &mut T) -> R<()> {
             let v = tr.to_u(v)?;
             tr.set_vreg_raw(5, v)?;
             let i = e(tr.b.load(tr.t.i32, None, iid, None, []))?;
-            let i = tr.to_u(i)?;
+            let mut i = tr.to_u(i)?;
+            if let Some(k) = tr.spec.base_instance_sgpr {
+                // A draw whose arguments the GPU reads: the start instance
+                // reaches the shader as the command processor hands it over
+                // (in a user SGPR), the instance id counts from 0
+                // (DrawParameters is core in SPIR-V 1.3).
+                tr.b.capability(rspirv::spirv::Capability::DrawParameters);
+                let bid = tr.input(tr.t.i32, Some(BuiltIn::BaseInstance), None);
+                let b = e(tr.b.load(tr.t.i32, None, bid, None, []))?;
+                let b = tr.to_u(b)?;
+                tr.set_sreg(k as u32, b)?;
+                i = e(tr.b.i_sub(tr.t.u32, None, i, b))?;
+            }
             tr.set_vreg_raw(8, i)?;
             tr.vertex_ids = Some((v, i));
         }

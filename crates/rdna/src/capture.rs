@@ -126,6 +126,7 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         early_tests: false,
         per_lane: false,
         lane_votes: false,
+        base_instance_sgpr: None,
         stage: u.stage,
         user_sgprs: users,
         user_base,

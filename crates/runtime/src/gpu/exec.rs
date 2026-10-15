@@ -44,7 +44,7 @@ pub fn toggle_skip_cs(addr: u64) -> bool {
 fn cs_addr(cp: &Cp) -> u64 {
     ((cp.reg(Space::Sh, 0x20C) as u64) | ((cp.reg(Space::Sh, 0x20D) as u64 & 0xFF) << 32)) << 8
 }
-pub use draw::DrawArgs;
+pub use draw::{DrawArgs, GpuArgs, NEEDS_CPU_ARGS};
 
 pub static EXECUTED: AtomicU64 = AtomicU64::new(0);
 /// The Vulkan device was lost: GPU execution stops (reported once).
@@ -1566,6 +1566,25 @@ struct Shadow {
     /// an aliased binding): its working copy is not what the merge leaves
     /// there, so it is not shared (`tune shadow_share`).
     tainted: bool,
+    /// The shader whose binding made it (profile: merges by window).
+    writer: u64,
+}
+
+/// Shadow merges by window (DS_PROFILE_GPU): (guest, range) -> [merges,
+/// bytes, the shader that made the last one merged].
+static MERGE_BY: Mutex<Option<HashMap<(u64, u64), [u64; 3]>>> = Mutex::new(None);
+/// The flip MERGE_BY started counting at.
+static MERGE_FROM: AtomicU64 = AtomicU64::new(0);
+
+fn merge_by_lines(flips: u64) -> String {
+    let g = MERGE_BY.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(&(u64, u64), &[u64; 3])> = m.iter().collect();
+    v.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
+    let total: u64 = v.iter().map(|x| x.1[0]).sum();
+    let per = |n: u64| n as f64 / flips.max(1) as f64;
+    let parts: Vec<String> = v.iter().take(16).map(|((g, r), x)| format!("{g:#x}+{r:#x} (cs {:#x}) {:.1}", x[2], per(x[0]))).collect();
+    format!("    shadow merges by window, per flip ({:.1} in all, {} windows): {}\n", per(total), v.len(), parts.join(", "))
 }
 
 /// Device-local shadow space per slot (working and pristine copies).
@@ -1579,6 +1598,9 @@ static SHADOWED: AtomicU64 = AtomicU64::new(0);
 static SHADOW_ARGS: AtomicU64 = AtomicU64::new(0);
 /// Indirect dispatches whose arguments the GPU read (`Exec::dispatch_gpu_indirect`).
 static GPU_INDIRECT: AtomicU64 = AtomicU64::new(0);
+/// Barriers between draws that read their arguments on the GPU and a later
+/// dispatch rewriting them (`Exec::args_read`).
+pub(super) static ARGS_WAR_BARRIERS: AtomicU64 = AtomicU64::new(0);
 /// CP memory writes performed by the GPU (`Exec::gpu_cp_write`).
 static GPU_CP_WRITES: AtomicU64 = AtomicU64::new(0);
 static GPU_TIMESTAMPS: AtomicU64 = AtomicU64::new(0);
@@ -3573,6 +3595,8 @@ pub fn reset_shader_profile() {
     *CS_CPU.lock() = None;
     *SHADER_PLACEMENTS.lock() = None;
     *SEG_TIME.lock() = None;
+    *MERGE_BY.lock() = None;
+    MERGE_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
     *SEG_EMPTY.lock() = None;
     *SEG_PAIRS.lock() = None;
     for c in &SEG_TOTAL {
@@ -3640,6 +3664,7 @@ pub fn shader_profile() -> String {
     if seg_stamps() {
         s.push_str(&seg_lines());
     }
+    s.push_str(&merge_by_lines(super::FRAMES.load(Ordering::Relaxed).saturating_sub(MERGE_FROM.load(Ordering::Relaxed))));
     s.push_str(&batch_by_lines());
     s.push_str(&begin_stats_line());
     {
@@ -3816,6 +3841,11 @@ pub struct Exec {
     /// The title synchronized (flush, cache action, end-of-pipe event)
     /// since the last full barrier: the next dispatch or draw waits.
     barrier_wanted: bool,
+    /// A draw read its arguments on the GPU since the last full barrier
+    /// (`tune draw_args_gpu`): a dispatch writing an argument home waits for
+    /// it (the console's command processor read them when it reached the
+    /// draw, so the title rewrites them without synchronizing).
+    args_read: bool,
     /// A dispatch ran since the last full barrier (draws wait for it).
     dispatched: bool,
     reported: HashMap<String, u64>,
@@ -4029,6 +4059,7 @@ impl Exec {
                 cpu_action_seq: 0,
                 cpu_dep_seq: 0,
                 barrier_wanted: false,
+                args_read: false,
                 dispatched: false,
                 reported: HashMap::new(),
                 name: name.to_string(),
@@ -4584,6 +4615,39 @@ impl Exec {
         self.barrier_wanted = false;
         self.dispatched = false;
         crate::info!("gpu[{}]: homes written back and dropped (tune homes 0)", self.name);
+    }
+
+    /// Writes the write-watched (argument) homes' GPU-written parts back and
+    /// drops the homes (`tune draw_args_gpu 0` while they exist; the main
+    /// command processor when it plans a parallel run: no worker records).
+    /// Later readers of those parts wait for this batch.
+    pub fn evict_watched_homes(&mut self) {
+        if self.deferred {
+            return;
+        }
+        let parts = super::homes::take_watched();
+        if parts.is_empty() {
+            return;
+        }
+        self.begin();
+        self.end_rendering_then_barrier();
+        let c = ctx();
+        let cmd = self.cmd();
+        let mut written = Vec::with_capacity(parts.len());
+        for (a, n, hb, off) in parts {
+            for (dst, dst_off, ga, len) in guest_pieces(a, n) {
+                unsafe { c.device.cmd_copy_buffer(cmd, hb.buf, dst, &[vk::BufferCopy { src_offset: off + (ga - a), dst_offset: dst_off, size: len }]) };
+                super::homes::WRITE_BACK_BYTES.fetch_add(len, Ordering::Relaxed);
+            }
+            self.slots[self.cur].homes.push(hb);
+            written.push((a, n));
+        }
+        self.barrier();
+        self.barrier_wanted = false;
+        self.dispatched = false;
+        for (a, n) in written {
+            self.note_write(a, n);
+        }
     }
 
     /// Records copies of the GPU-written parts of the homes overlapping
@@ -5974,6 +6038,16 @@ impl Exec {
         if merge.is_some() && super::tune::shadow_share() && super::precache::enabled() {
             self.share_shadows(&flush);
         }
+        if profiling() {
+            let mut g = MERGE_BY.lock();
+            let m = g.get_or_insert_with(HashMap::new);
+            for sh in &flush {
+                let e = m.entry((sh.guest, sh.range)).or_insert([0; 3]);
+                e[0] += 1;
+                e[1] += sh.range;
+                e[2] = sh.writer;
+            }
+        }
         // Later work reads guest memory after the write-back (counted
         // before that barrier: `seg_stamps` names the segment by it).
         self.ops[OP_MERGES] += flush.len() as u64;
@@ -6170,6 +6244,7 @@ impl Exec {
         }
         self.barrier_wanted = false;
         self.dispatched = false;
+        self.args_read = false;
         match self.since_barrier.as_mut() {
             Some(v) => v.clear(),
             None => self.since_barrier = Some(Vec::new()),
@@ -6294,6 +6369,11 @@ impl Exec {
     /// Makes this a deferred executor (`gpu::par` workers).
     pub fn set_deferred(&mut self) {
         self.deferred = true;
+    }
+
+    /// A deferred executor (`gpu::par` workers record with one).
+    pub fn is_deferred(&self) -> bool {
+        self.deferred
     }
 
     /// Stops a deferred executor's chunk (see `deferred`).
@@ -6421,6 +6501,12 @@ impl Exec {
                             Some(n) => n,
                             None => mapping(base).map(|(_, e)| (e - base).min(UNBOUNDED_MAX)).unwrap_or(0),
                         };
+                        // Written records of indirect draw arguments (16 or 20
+                        // bytes): where draws may read them on the GPU (`tune
+                        // draw_args_gpu`, `homes::vote_args`).
+                        if matches!(stride, 16 | 20) && size <= SHADOW_MAX && found.tr.plan.resources[i].written && super::tune::draw_args_gpu() {
+                            super::homes::note_shadow_write(base, size);
+                        }
                         let mut info = vk::DescriptorBufferInfo { buffer: fx.dummy, offset: 0, range: DUMMY_BYTES };
                         let mut bias = 0u64;
                         let mut bound_size = 0u64;
@@ -6584,7 +6670,7 @@ impl Exec {
                                             }
                                         }
                                         self.shadow_used = s_off + 2 * span;
-                                        bound.shadows.push(Shadow { host: buffer, guest: base - bias, reused: false, host_off: off, range, shadow_off: s_off, pristine_off: s_off + span, bias, size, since: None, tainted: false });
+                                        bound.shadows.push(Shadow { host: buffer, guest: base - bias, reused: false, host_off: off, range, shadow_off: s_off, pristine_off: s_off + span, bias, size, since: None, tainted: false, writer: p.addr });
                                         placement = Placement::Shadow;
                                         info = vk::DescriptorBufferInfo { buffer: self.shadow(), offset: s_off, range };
                                         SHADOWED.fetch_add(1, Ordering::Relaxed);
@@ -6842,6 +6928,11 @@ impl Exec {
         if !(self.overlaps_pending(&r) || INFLIGHT.latest(&r).is_some() || CP_WRITES.latest(&r).is_some()) {
             return false;
         }
+        // Arguments in a video-memory home: read by the CP after the home's
+        // GPU-written parts are written back.
+        if super::homes::overlaps(args, 12) {
+            return false;
+        }
         if SKIP_CS.lock().as_ref().is_some_and(|s| s.contains(&cs_addr(cp))) {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             return true;
@@ -7072,6 +7163,12 @@ impl Exec {
             }
             self.barrier_wanted = false;
             self.dispatched = false;
+        }
+        // Arguments draws read on the GPU since the last barrier, which this
+        // dispatch rewrites: the draws read them first.
+        if self.args_read && bound.writes.iter().any(|&(b, n)| super::homes::watched_overlaps(b, n)) {
+            ARGS_WAR_BARRIERS.fetch_add(1, Ordering::Relaxed);
+            self.barrier();
         }
         if super::tune::race_checks() {
             self.note_unordered(std::slice::from_ref(&bound), &[p.addr], false);
@@ -7366,7 +7463,7 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; stages prepared again with GPU-side data loads {:?} ({} programs since with them); {} render passes ended into the next full barrier; GPU-performed CP writes after merging resident shadows {} (written before the merge {}); draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed, {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills, {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; stages prepared again with GPU-side data loads {:?} ({} programs since with them); {} render passes ended into the next full barrier; GPU-performed CP writes after merging resident shadows {} (written before the merge {}); draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills, {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         SHADOW_ARGS.load(Ordering::Relaxed),
@@ -7395,6 +7492,8 @@ pub fn status() -> String {
         EARLY_MERGES.load(Ordering::Relaxed),
         SKIPPED.load(Ordering::Relaxed),
         draw::DRAWN.load(Ordering::Relaxed),
+        draw::GPU_ARG_DRAWS.load(Ordering::Relaxed),
+        ARGS_WAR_BARRIERS.load(Ordering::Relaxed),
         draw::DRAW_NOOP.load(Ordering::Relaxed),
         draw::DRAW_SKIPPED.load(Ordering::Relaxed),
         WATCHDOG_STOPS.load(Ordering::Relaxed),

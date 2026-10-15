@@ -79,7 +79,18 @@ static VBLANK_CV: Condvar = Condvar::new();
 
 fn vblank_thread() {
     crate::log::set_thread_name("vblank");
-    let period = Duration::from_nanos(16_683_333); // 59.94 Hz
+    // DS_VBLANK_HZ=<hz> (diagnosis, 30-1000): vblanks at another rate, so
+    // flips are not quantized to 16.7 ms steps and A/Bs see frame cost below
+    // a vblank (the title flips at every vblank, `sceVideoOutSetFlipRate(0)`;
+    // it may pace or time its frames by them: not for behavior checks).
+    let hz = std::env::var("DS_VBLANK_HZ").ok().and_then(|v| v.parse::<f64>().ok()).filter(|h| (30.0..=1000.0).contains(h));
+    let period = match hz {
+        Some(h) => {
+            crate::info!("vblank at {h} Hz (DS_VBLANK_HZ, diagnosis)");
+            Duration::from_nanos((1e9 / h) as u64)
+        }
+        None => Duration::from_nanos(16_683_333), // 59.94 Hz
+    };
     let mut next = Instant::now() + period;
     loop {
         let now = Instant::now();

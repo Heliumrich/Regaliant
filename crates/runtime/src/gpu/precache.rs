@@ -827,6 +827,12 @@ pub fn unwritten_since(base: u64, size: u64, since: u64) -> bool {
     c.watched.iter().find(|w| w.lo == lo && w.hi == hi).is_some_and(|w| w.written <= since)
 }
 
+/// The current synchronization epoch (write-watched homes check their pages
+/// once per epoch too).
+pub fn epoch() -> u64 {
+    EPOCH.load(Ordering::Acquire)
+}
+
 /// A synchronization epoch ends (a title submission starts, a wait the CPU
 /// released, REWIND; any queue): entries are checked for CPU writes again at
 /// their next use.
