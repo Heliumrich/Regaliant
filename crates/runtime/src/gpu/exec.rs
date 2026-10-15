@@ -637,7 +637,23 @@ fn revalidate_spans() {
     }
 }
 
+/// New imports by the code that asked for them (residency on: their pages
+/// turn host class), as (calls, bytes).
+static IMPORT_SITES: Mutex<Option<HashMap<(&'static str, u32), (u64, u64)>>> = Mutex::new(None);
+
+/// Status part: the sites that made imports (residency on).
+pub(super) fn import_sites_line() -> String {
+    let g = IMPORT_SITES.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(&(&str, u32), &(u64, u64))> = m.iter().collect();
+    v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    let list: Vec<String> = v.iter().take(10).map(|((f, l), (n, b))| format!("{}:{l} {n} ({} MiB)", f.rsplit(['/', '\\']).next().unwrap_or(f), b >> 20)).collect();
+    format!("    imports made with residency on, by site: {}
+", list.join(", "))
+}
+
 /// Imported buffer covering guest [base, base+size): (buffer, window start, window end).
+#[track_caller]
 fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     revalidate_spans();
     let generation = SPAN_GEN.load(Ordering::Acquire);
@@ -658,7 +674,17 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
         return hit;
     }
     let found = SPANS.read().iter().find(|s| s.valid && s.start <= base && end <= s.end).map(|s| (s.buffer, s.start, s.end));
-    let r = found.or_else(|| import_span(base, size));
+    let site = std::panic::Location::caller();
+    let r = found.or_else(|| {
+        let r = import_span(base, size);
+        if let (Some((_, st, e)), true) = (r, super::resident::enabled()) {
+            let mut g = IMPORT_SITES.lock();
+            let x = g.get_or_insert_with(HashMap::new).entry((site.file(), site.line())).or_default();
+            x.0 += 1;
+            x.1 += e - st;
+        }
+        r
+    });
     if let Some((b, st, e)) = r {
         SPAN_CACHE.with(|c| {
             let mut c = c.borrow_mut();
@@ -8076,6 +8102,7 @@ pub fn status() -> String {
         + &super::mirror::status()
         + &super::homes::status()
         + &super::resident::status()
+        + &import_sites_line()
         + &sync_why_status()
         + &format!(
             "    buffer snapshots in VRAM: {} ({} MiB), {} reused, {} not for lack of space, {} for memory that cannot be imported; draws with snapshotted indices {} ({} MiB); batch-start copies {} ({} MiB), {} reused, {} not for lack of space; on the copy queue {} ({} MiB)\n",
