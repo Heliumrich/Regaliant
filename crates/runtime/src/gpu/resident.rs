@@ -567,11 +567,10 @@ pub fn remap_guard() -> parking_lot::RwLockWriteGuard<'static, ()> {
 }
 
 /// A mapping or protection change of [base, base+len) is done (called under
-/// `remap_guard`): its page states are reset again. `remapped` runs before
-/// the change (with the other caches' invalidations); a take on another
-/// thread in between may have armed pages or marked them unwritable, which
-/// the change then overrode (a page marked armed and clean but writable
-/// would hide CPU writes from every later take).
+/// `remap_guard`): its page states are reset (`remapped`), now that the
+/// change set the pages' protection (a page marked armed and clean but
+/// writable would hide CPU writes from every later take; one reset before
+/// the change left armed pages read-only and unmarked until it landed).
 pub fn settled(base: u64, len: u64) {
     remapped(base, len);
 }
@@ -1384,12 +1383,12 @@ fn section_test() -> Result<String, String> {
 /// Status line.
 pub fn status() -> String {
     let v: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    if !wanted() {
-        if !crate::sections::on() {
-            return String::new();
-        }
+    // Section-backed memory's write tracking (with residency too), then
+    // residency's line.
+    let mut out = String::new();
+    if crate::sections::on() {
         let t: Vec<u64> = TAKE_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-        return format!(
+        out = format!(
             "    write tracking by protection (sections): {} takes visited {} pages ({} region queries), reported {} ({} of them unarmable: once per epoch), armed {} ({} left for other protections); {} write faults ({} races), {} turned volatile ({} armed again after their stay), {} host class; {} arming calls ({:.1} us each), {} disarming calls ({:.1} us each); {} host writes ({} pages); {} remaps; {}; {:.0} MiB zeroed for new mappings (direct {:.0}); {} imports without an alias slot ({} alias views bridged); kernel-mode accesses retried {} ({} retries, {} failed for good)\n",
             t[0],
             t[3],
@@ -1420,8 +1419,11 @@ pub fn status() -> String {
             crate::mem::KERNEL_IO[2].load(Ordering::Relaxed)
         );
     }
+    if !wanted() {
+        return out;
+    }
     let refused: Vec<String> = REFUSE_NAMES.iter().zip(REFUSED.iter()).map(|(n, c)| format!("{n} {}", c.load(Ordering::Relaxed))).collect();
-    format!(
+    out + &format!(
         "    residency ({}): {} bindings from the mirror ({} pages), {} pages uploaded, {} made stale by GPU writes; {} pages armed, {} write faults ({} races), {} volatile, {} host class; {} arming calls ({:.1} us each), {} disarming calls ({:.1} us each); {} host writes ({} pages); {} mirror pages backed, {} uploads, {} readbacks, {} remaps; refused: {}\n",
         if enabled() { "on" } else { "off" },
         v[S_BINDS],

@@ -612,7 +612,10 @@ pub fn remapped(base: u64, len: u64, op: u8) {
     super::exec::note_remap_over_imports(base, len, op);
     super::precache::invalidate(base, len);
     super::homes::remapped(base, len);
-    super::resident::remapped(base, len);
+    // Page states are reset by `resident::settled` after the change, under
+    // `resident::remap_guard`: reset here, before it, armed pages stayed
+    // read-only without being marked ours until the change landed, and a
+    // guest write meanwhile was fatal (gate window 20261015-172335).
     RESET_GEN.fetch_add(1, Ordering::Release);
     let mut g = TRACK.lock();
     let Some(t) = g.as_mut() else { return };

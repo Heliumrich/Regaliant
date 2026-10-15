@@ -7259,7 +7259,8 @@ impl Exec {
                                     let s_off = self.shadow_used.next_multiple_of(256);
                                     let span = range.next_multiple_of(256);
                                     let res = &found.tr.plan.resources[i];
-                                    let want = allow_shadow && shadow_writes() && res.written && range <= SHADOW_MAX && (res.atomic || range >= shadow_min());
+                                    let all_scratch = res.written && range <= SCRATCH_BYTES && super::tune::scratch_all();
+                                    let want = !all_scratch && allow_shadow && shadow_writes() && res.written && range <= SHADOW_MAX && (res.atomic || range >= shadow_min());
                                     let window = (base - bias, range);
                                     let reuse = if want { self.resident.iter().position(|r| r.host == buffer && r.host_off == off && r.range == range) } else { None };
                                     if reuse.is_none() && self.resident.iter().any(|r| r.guest < window.0 + window.1 && window.0 < r.guest + r.range) {
@@ -7295,7 +7296,7 @@ impl Exec {
                                         placement = Placement::Shadow;
                                         info = vk::DescriptorBufferInfo { buffer: self.shadow(), offset: s_off, range };
                                         SHADOWED.fetch_add(1, Ordering::Relaxed);
-                                    } else if res.written && range > SHADOW_MAX && range <= SCRATCH_BYTES && super::tune::scratch_writes() {
+                                    } else if all_scratch || (res.written && range > SHADOW_MAX && range <= SCRATCH_BYTES && super::tune::scratch_writes()) {
                                         if let Some(sb) = scratch_buffer() {
                                             placement = Placement::Scratch;
                                             info = vk::DescriptorBufferInfo { buffer: sb, offset: 0, range };

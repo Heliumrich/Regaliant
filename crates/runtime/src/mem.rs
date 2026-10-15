@@ -850,9 +850,10 @@ pub fn host_protect(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     let _readers_out = GUEST_READERS.write();
     let _arm = crate::gpu::resident::remap_guard();
     let ok = unsafe { VirtualProtect(addr as _, size as usize, win_prot(prot), &mut old) };
-    // Again after the change: a take in between may have armed pages the
-    // new protection then overrode (`resident::settled`).
-    crate::gpu::resident::settled(addr, size);
+    // After the change (a failed one left armed pages armed).
+    if ok != 0 {
+        crate::gpu::resident::settled(addr, size);
+    }
     if ok == 0 { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
 }
 

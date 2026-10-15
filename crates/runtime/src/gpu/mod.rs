@@ -244,6 +244,15 @@ pub mod tune {
         get(20) != 0
     }
 
+    /// Diagnosis only (2; breaks rendering): every written buffer binding
+    /// stores into the scratch buffer, none shadowed, merged or written in
+    /// guest memory: the upper bound of keeping GPU-written data in video
+    /// memory (residency design stage 3), its readers left as they are.
+    #[inline]
+    pub fn scratch_all() -> bool {
+        get(20) == 2
+    }
+
     /// A full barrier after every dispatch that binds a VRAM shadow (1, as
     /// when shadows were merged back after each dispatch), or only the
     /// barriers the title's synchronization asks for (0; with lazy barriers;
