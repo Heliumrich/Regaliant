@@ -1552,6 +1552,10 @@ const SCRATCH_BYTES: u64 = 256 << 20;
 /// Imports refused because no alias slot covered the range (`sections`).
 static ALIAS_MISSES: AtomicU64 = AtomicU64::new(0);
 
+pub fn alias_misses() -> u64 {
+    ALIAS_MISSES.load(Ordering::Relaxed)
+}
+
 /// Largest read-only binding served from the residency mirror, and a
 /// batch's staging for its uploads (`Exec::resident_bind`).
 const RES_MAX: u64 = 256 << 20;

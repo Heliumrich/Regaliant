@@ -364,8 +364,10 @@ pub fn pread_fd(fd: i32, buf: &mut [u8], off: u64) -> Result<usize, i32> {
             let _w = crate::gpu::track::host_write(buf.as_ptr() as u64, buf.len() as u64);
             crate::gpu::exec::trace_writes(|| format!("file read (fd {fd}) [{off:#x}]"), buf.as_ptr() as u64, buf.len() as u64);
             let mut done = 0;
+            let base = buf.as_ptr() as u64;
             while done < buf.len() {
-                match file.seek_read(&mut buf[done..], off + done as u64) {
+                let what = || format!("read of '{}' [{:#x}] into {:#x}", f.path, off + done as u64, base + done as u64);
+                match crate::mem::kernel_io(&what, base + done as u64, (buf.len() - done) as u64, true, || file.seek_read(&mut buf[done..], off + done as u64)) {
                     Ok(0) => break,
                     Ok(n) => done += n,
                     Err(e) => return Err(io_errno(&e)),
@@ -406,7 +408,8 @@ pub fn pwrite_fd(fd: i32, data: &[u8], off: Option<u64>) -> Result<usize, i32> {
             let at = off.unwrap_or(*pos);
             let mut done = 0;
             while done < data.len() {
-                match file.seek_write(&data[done..], at + done as u64) {
+                let what = || format!("write of '{}' [{:#x}] from {:#x}", f.path, at + done as u64, data.as_ptr() as u64 + done as u64);
+                match crate::mem::kernel_io(&what, data.as_ptr() as u64 + done as u64, (data.len() - done) as u64, false, || file.seek_write(&data[done..], at + done as u64)) {
                     Ok(n) => done += n,
                     Err(e) => return Err(io_errno(&e)),
                 }

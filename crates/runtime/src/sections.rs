@@ -17,7 +17,7 @@
 
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use windows_sys::Win32::Foundation::{GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile3, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
@@ -58,6 +58,68 @@ struct State {
     /// Alias views by (slot, guest start): (size, section, offset, guest
     /// bytes still mapped through it, imported or deferred: kept).
     aliases: BTreeMap<(u8, u64), Alias>,
+    /// Section ranges that may hold data, start -> end: direct memory mapped
+    /// since it was last zeroed, anonymous offsets freed after use.
+    dirty: [BTreeMap<u64, u64>; 2],
+    /// Direct memory allocated again over dirty ranges: zeroed when it is
+    /// next mapped (`map_new_view`).
+    zero_next: BTreeMap<u64, u64>,
+}
+
+/// Adds [a, e) to the range set `m` (start -> end), coalescing.
+fn rs_add(m: &mut BTreeMap<u64, u64>, mut a: u64, mut e: u64) {
+    if a >= e {
+        return;
+    }
+    if let Some((&s, &t)) = m.range(..=a).next_back() {
+        if t >= a {
+            m.remove(&s);
+            a = s;
+            e = e.max(t);
+        }
+    }
+    while let Some((&s, &t)) = m.range(a..=e).next() {
+        m.remove(&s);
+        e = e.max(t);
+    }
+    m.insert(a, e);
+}
+
+/// Removes [a, e) from the range set `m`; returns the pieces removed.
+fn rs_take(m: &mut BTreeMap<u64, u64>, a: u64, e: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let first = m.range(..a).next_back().filter(|(_, t)| **t > a).map(|(&s, _)| s).unwrap_or(a);
+    let keys: Vec<u64> = m.range(first..e).map(|(&s, _)| s).collect();
+    for s in keys {
+        let t = m.remove(&s).unwrap();
+        if s < a {
+            m.insert(s, a);
+        }
+        if t > e {
+            m.insert(e, t);
+        }
+        let (x, y) = (s.max(a), t.min(e));
+        if x < y {
+            out.push((x, y));
+        }
+    }
+    out
+}
+
+/// Bytes zeroed by `map_new_view` (reused anonymous offsets, direct memory
+/// allocated again).
+static ZEROED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Direct memory [start, start+len) was allocated: what of it was mapped
+/// before is zeroed at its next mapping, as private pages were before
+/// sections (a mapping over the same pages without a new allocation keeps
+/// their contents, as on the console).
+pub fn dmem_allocated(start: u64, len: u64) {
+    let mut g = STATE.lock();
+    let Some(st) = g.as_mut() else { return };
+    for (a, e) in rs_take(&mut st.dirty[0], start, start + len) {
+        rs_add(&mut st.zero_next, a, e);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -103,7 +165,16 @@ pub fn reserve(base: u64, size: u64, dmem_size: u64, anon_size: u64) -> Result<(
                 return Err(GetLastError());
             }
         }
-        *STATE.lock() = Some(State { dmem, anon, anon_size, anon_free: BTreeMap::new(), anon_init: false, aliases: BTreeMap::new() });
+        *STATE.lock() = Some(State {
+            dmem,
+            anon,
+            anon_size,
+            anon_free: BTreeMap::new(),
+            anon_init: false,
+            aliases: BTreeMap::new(),
+            dirty: [BTreeMap::new(), BTreeMap::new()],
+            zero_next: BTreeMap::new(),
+        });
     }
     ON.store(true, Ordering::Release);
     Ok(())
@@ -114,10 +185,52 @@ pub fn reserve(base: u64, size: u64, dmem_size: u64, anon_size: u64) -> Result<(
 static SPLIT_LO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SPLIT_HI: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A view over [lo, hi) is about to be unmapped and mapped again in parts.
-pub fn split_begin(lo: u64, hi: u64) {
+/// Splits made, and the last one's range and time (`log::elapsed_ms`):
+/// diagnostics of kernel-mode accesses that failed (`mem::kernel_io`).
+static SPLITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static LAST_SPLIT: Mutex<(u64, u64, f64)> = Mutex::new((0, 0, 0.0));
+/// Causes of splits (`split_begin`): a mapping made over part of a view, a
+/// part unmapped, a part's protection changed.
+pub const SPLIT_MAP_OVER: usize = 0;
+pub const SPLIT_UNMAP: usize = 1;
+pub const SPLIT_PROTECT: usize = 2;
+
+/// A view over [lo, hi) is about to be unmapped and mapped again in parts
+/// (`why`: SPLIT_*).
+pub fn split_begin(lo: u64, hi: u64, why: usize) {
+    SPLITS[why.min(2)].fetch_add(1, Ordering::Relaxed);
+    *LAST_SPLIT.lock() = (lo, hi, crate::log::elapsed_ms());
     SPLIT_LO.store(lo, Ordering::SeqCst);
     SPLIT_HI.store(hi, Ordering::SeqCst);
+}
+
+/// Waits while a split overlapping [lo, hi) is in progress (kernel-mode
+/// accesses cannot fault into `wait_split`); whether one was.
+pub fn wait_split_range(lo: u64, hi: u64) -> bool {
+    if !on() {
+        return false;
+    }
+    let mut waited = false;
+    loop {
+        let (a, b) = (SPLIT_LO.load(Ordering::SeqCst), SPLIT_HI.load(Ordering::SeqCst));
+        if b == 0 || hi <= a || b <= lo {
+            return waited;
+        }
+        waited = true;
+        std::thread::yield_now();
+    }
+}
+
+/// Bytes zeroed for new mappings (diagnostics): direct, anonymous.
+pub fn zeroed() -> (u64, u64) {
+    (ZEROED[0].load(Ordering::Relaxed), ZEROED[1].load(Ordering::Relaxed))
+}
+
+/// Splits so far and the last one (diagnostics).
+pub fn split_line() -> String {
+    let (lo, hi, at) = *LAST_SPLIT.lock();
+    let n: Vec<u64> = SPLITS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    format!("{} view splits (mappings over a part {}, parts unmapped {}, parts protected {}; last {lo:#x}..{hi:#x} at {at:.0} ms)", n.iter().sum::<u64>(), n[0], n[1], n[2])
 }
 
 /// The split is done.
@@ -158,10 +271,12 @@ pub fn anon_alloc(size: u64) -> Option<u64> {
     Some(off)
 }
 
-/// Returns [off, off+size) of the anonymous section (coalescing).
+/// Returns [off, off+size) of the anonymous section (coalescing); its pages
+/// are zeroed when the offsets are mapped again (`map_new_view`).
 pub fn anon_free(off: u64, size: u64) {
     let mut g = STATE.lock();
     let Some(st) = g.as_mut() else { return };
+    rs_add(&mut st.dirty[1], off, off + size);
     let (mut s, mut e) = (off, off + size);
     if let Some((&p, &n)) = st.anon_free.range(..s).next_back() {
         if p + n == s {
@@ -234,6 +349,17 @@ fn handle(sec: Sec) -> Option<HANDLE> {
 /// Maps a view of `sec` at [va, va+n) (offset `off`) into placeholders,
 /// commits its pages and gives it protection `prot`.
 pub fn map_view(va: u64, n: u64, sec: Sec, off: u64, prot: u32) -> Result<(), String> {
+    map_view_with(va, n, sec, off, prot, false)
+}
+
+/// `map_view` for a new guest mapping: its pages read as zeros where the
+/// section's pages are stale (anonymous offsets used before, direct memory
+/// allocated again: fresh flexible memory is zero-filled on the console).
+pub fn map_new_view(va: u64, n: u64, sec: Sec, off: u64, prot: u32) -> Result<(), String> {
+    map_view_with(va, n, sec, off, prot, true)
+}
+
+fn map_view_with(va: u64, n: u64, sec: Sec, off: u64, prot: u32, fresh: bool) -> Result<(), String> {
     let h = handle(sec).ok_or("sections not set up")?;
     isolate(va, n)?;
     unsafe {
@@ -245,6 +371,21 @@ pub fn map_view(va: u64, n: u64, sec: Sec, off: u64, prot: u32) -> Result<(), St
             let e = GetLastError();
             UnmapViewOfFile2(GetCurrentProcess(), v, MEM_PRESERVE_PLACEHOLDER);
             return Err(format!("committing {va:#x}+{n:#x}: error {e}"));
+        }
+        if fresh {
+            let stale = match STATE.lock().as_mut() {
+                Some(st) if sec == Sec::Dmem => {
+                    let z = rs_take(&mut st.zero_next, off, off + n);
+                    rs_add(&mut st.dirty[0], off, off + n);
+                    z
+                }
+                Some(st) => rs_take(&mut st.dirty[1], off, off + n),
+                None => Vec::new(),
+            };
+            for (a, e) in stale {
+                std::ptr::write_bytes((va + (a - off)) as *mut u8, 0, (e - a) as usize);
+                ZEROED[(sec == Sec::Anon) as usize].fetch_add(e - a, Ordering::Relaxed);
+            }
         }
         let mut old = 0u32;
         if prot != PAGE_EXECUTE_READWRITE && VirtualProtect(va as _, n as usize, prot, &mut old) == 0 {
@@ -265,9 +406,19 @@ pub fn unmap_view(va: u64) -> Result<(), String> {
 }
 
 /// Maps the alias of the guest mapping [va, va+n) (`sec` at `off`) in the
-/// first slot whose range is free. Returns the slot.
+/// first slot whose range is free, preferring a slot whose alias views
+/// adjoin it (one import may then span both: a binding over two mappings
+/// whose aliases lie in different slots cannot be imported). Returns the
+/// slot.
 pub fn map_alias(va: u64, n: u64, sec: Sec, off: u64) -> Result<u8, String> {
-    for slot in 0..ALIAS_SLOTS as u8 {
+    let adjoins = |slot: u8| {
+        STATE.lock().as_ref().is_some_and(|s| {
+            s.aliases.range(..(slot, va)).next_back().is_some_and(|(&(sl, st), a)| sl == slot && st + a.size == va) || s.aliases.contains_key(&(slot, va + n))
+        })
+    };
+    let (mut order, rest): (Vec<u8>, Vec<u8>) = (0..ALIAS_SLOTS as u8).partition(|&sl| adjoins(sl));
+    order.extend(rest);
+    for slot in order {
         let busy = STATE.lock().as_ref().is_some_and(|s| {
             s.aliases.range(..(slot, va + n)).next_back().is_some_and(|(&(sl, st), a)| sl == slot && st + a.size > va)
         });
@@ -390,5 +541,46 @@ mod tests {
         anon_free(a, k);
         anon_free(b, 2 * k);
         assert_eq!(anon_alloc(64 << 20), Some(0));
+        // A new view of anonymous offsets freed after use reads zeros.
+        let at = base + (2 << 20);
+        map_new_view(at, 4 * k, Sec::Anon, 0, PAGE_READWRITE).unwrap();
+        unsafe { std::ptr::write_volatile((at + k) as *mut u32, 5) };
+        unmap_view(at).unwrap();
+        anon_free(0, 64 << 20);
+        assert_eq!(anon_alloc(4 * k), Some(0));
+        map_new_view(at, 4 * k, Sec::Anon, 0, PAGE_READWRITE).unwrap();
+        assert_eq!(unsafe { std::ptr::read_volatile((at + k) as *const u32) }, 0);
+        unmap_view(at).unwrap();
+        // Direct memory keeps its contents across mappings until it is
+        // allocated again; then its next mapping reads zeros.
+        let at = base + (3 << 20);
+        map_new_view(at, 4 * k, Sec::Dmem, 8 * k, PAGE_READWRITE).unwrap();
+        unsafe { std::ptr::write_volatile(at as *mut u32, 9) };
+        unmap_view(at).unwrap();
+        map_new_view(at, 4 * k, Sec::Dmem, 8 * k, PAGE_READWRITE).unwrap();
+        assert_eq!(unsafe { std::ptr::read_volatile(at as *const u32) }, 9);
+        unmap_view(at).unwrap();
+        dmem_allocated(8 * k, 4 * k);
+        map_new_view(at, 4 * k, Sec::Dmem, 8 * k, PAGE_READWRITE).unwrap();
+        assert_eq!(unsafe { std::ptr::read_volatile(at as *const u32) }, 0);
+        unmap_view(at).unwrap();
+    }
+
+    #[test]
+    fn range_sets() {
+        let mut m = BTreeMap::new();
+        rs_add(&mut m, 10, 20);
+        rs_add(&mut m, 30, 40);
+        rs_add(&mut m, 20, 25);
+        assert_eq!(m.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>(), vec![(10, 25), (30, 40)]);
+        rs_add(&mut m, 5, 35);
+        assert_eq!(m.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>(), vec![(5, 40)]);
+        assert_eq!(rs_take(&mut m, 10, 20), vec![(10, 20)]);
+        assert_eq!(m.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>(), vec![(5, 10), (20, 40)]);
+        assert_eq!(rs_take(&mut m, 0, 30), vec![(5, 10), (20, 30)]);
+        assert_eq!(m.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>(), vec![(30, 40)]);
+        assert_eq!(rs_take(&mut m, 50, 60), vec![]);
+        assert_eq!(rs_take(&mut m, 35, 45), vec![(35, 40)]);
+        assert_eq!(m.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>(), vec![(30, 35)]);
     }
 }

@@ -369,7 +369,10 @@ sysv! {
         let f = match std::fs::File::open(memory_file(user)) { Ok(f) => f, Err(_) => return ERR_NOT_FOUND };
         let out = std::slice::from_raw_parts_mut(buf, size as usize);
         out.fill(0);
-        let _ = f.seek_read(out, offset as u64);
+        // The kernel writes the buffer: write-tracked pages cannot fault.
+        let _w = crate::gpu::track::host_write(buf as u64, size);
+        let what = || format!("save data memory read [{offset:#x}+{size:#x}] into {:#x}", buf as u64);
+        let _ = crate::mem::kernel_io(&what, buf as u64, size, true, || f.seek_read(&mut out[..], offset as u64));
         0
     }
     // ---- PS5: Mount3 {i32 user, pad, dir_name* @8, u64 blocks @16,
@@ -489,7 +492,8 @@ sysv! {
     fn sceSaveDataSetSaveDataMemory(user: i32, buf: *const u8, size: u64, offset: i64) -> i32 {
         use std::os::windows::fs::FileExt;
         let f = match std::fs::OpenOptions::new().write(true).open(memory_file(user)) { Ok(f) => f, Err(_) => return ERR_NOT_FOUND };
-        if f.seek_write(std::slice::from_raw_parts(buf, size as usize), offset as u64).is_err() { return ERR_INTERNAL; }
+        let what = || format!("save data memory write [{offset:#x}+{size:#x}] from {:#x}", buf as u64);
+        if crate::mem::kernel_io(&what, buf as u64, size, false, || f.seek_write(std::slice::from_raw_parts(buf, size as usize), offset as u64)).is_err() { return ERR_INTERNAL; }
         0
     }
 }

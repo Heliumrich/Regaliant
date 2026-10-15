@@ -416,7 +416,8 @@ fn read_into(file_id: u32, dest: u64, size: u64, offset: u64) -> Result<(), i32>
     let buf = unsafe { std::slice::from_raw_parts_mut(dest as *mut u8, size as usize) };
     let mut done = 0usize;
     while done < buf.len() {
-        match h.seek_read(&mut buf[done..], offset + done as u64) {
+        let what = || format!("apr: read {} [{:#x}] into {:#x}", f.path, offset + done as u64, dest + done as u64);
+        match crate::mem::kernel_io(&what, dest + done as u64, (buf.len() - done) as u64, true, || h.seek_read(&mut buf[done..], offset + done as u64)) {
             Ok(0) => return Err(EIO),
             Ok(n) => done += n,
             Err(e) => {

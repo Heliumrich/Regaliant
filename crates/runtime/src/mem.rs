@@ -640,6 +640,7 @@ fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
         }
     }
     let p = unsafe { VirtualAlloc(addr as _, size as usize, MEM_COMMIT, win_prot(prot)) };
+    crate::gpu::resident::settled(addr, size);
     if p.is_null() { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
 }
 
@@ -752,6 +753,79 @@ pub fn os_readable(a: u64, len: u64) -> bool {
     true
 }
 
+/// Kernel-mode accesses of guest memory that failed and were retried
+/// (`kernel_io`): [calls, retries, calls that failed for good].
+pub static KERNEL_IO: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Runs `op`, one kernel-mode access of guest [base, base+len) (a file read
+/// into it: `into_guest`, or a file write from it). Such accesses cannot
+/// fault into our exception handler: a page inaccessible for a moment (a
+/// section view being split, `sections::wait_split`; a page armed for write
+/// tracking) fails them with os error 998 or 1784 instead, and the title
+/// sees a failed read (the 8-1 load of tour 20261015-151613 never ended).
+/// They are run again after the split (pages disarmed again), a few times,
+/// with what the range looked like logged.
+pub fn kernel_io<T>(what: &dyn Fn() -> String, base: u64, len: u64, into_guest: bool, mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    use std::sync::atomic::Ordering::Relaxed;
+    const TRIES: u32 = 8;
+    let mut tries = 0;
+    loop {
+        let r = op();
+        match &r {
+            Err(e) if matches!(e.raw_os_error(), Some(998 | 1784)) && tries < TRIES => {
+                if tries == 0 && KERNEL_IO[0].fetch_add(1, Relaxed) < 32 {
+                    crate::warn!("{}: {e}; retrying ({})", what(), describe_host(base, len));
+                }
+                tries += 1;
+                KERNEL_IO[1].fetch_add(1, Relaxed);
+                crate::sections::wait_split_range(base, base.saturating_add(len));
+                if into_guest {
+                    crate::gpu::resident::disarm_for_host(base, len);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1 << tries.min(5)));
+                continue;
+            }
+            Err(e) if tries > 0 => {
+                KERNEL_IO[2].fetch_add(1, Relaxed);
+                crate::warn!("{}: still failing after {tries} retries: {e} ({})", what(), describe_host(base, len));
+            }
+            Ok(_) if tries > 0 && KERNEL_IO[0].load(Relaxed) <= 32 => crate::info!("{}: succeeded on retry {tries}", what()),
+            _ => {}
+        }
+        return r;
+    }
+}
+
+/// What guest [base, base+len) looks like now (diagnostics): its mappings,
+/// the operating system's regions, the write tracking's page states and the
+/// last view split.
+pub fn describe_host(base: u64, len: u64) -> String {
+    let end = base.saturating_add(len.max(1));
+    let mut out = format!("{base:#x}+{len:#x}:");
+    match MEM.try_lock_for(std::time::Duration::from_millis(20)) {
+        Some(st) => {
+            for v in st.overlapping(base, end).iter().take(4) {
+                out += &format!(" mapping {:#x}+{:#x} {:?} prot {:#x} '{}';", v.start, v.size, v.kind, v.prot, v.name);
+            }
+        }
+        None => out += " (mappings busy);",
+    }
+    let mut p = base;
+    let mut n = 0;
+    while p < end && n < 6 {
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(p as _, &mut m, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+            out += " (no region)";
+            break;
+        }
+        out += &format!(" region {:#x}+{:#x} state {:#x} protect {:#x} type {:#x};", m.BaseAddress as u64, m.RegionSize, m.State, m.Protect, m.Type);
+        p = m.BaseAddress as u64 + m.RegionSize as u64;
+        n += 1;
+    }
+    out += &format!(" {}; {}", crate::gpu::resident::describe(base, len), crate::sections::split_line());
+    out
+}
+
 fn host_decommit(addr: u64, size: u64) {
     crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_DECOMMIT);
     repaged(addr, size);
@@ -767,6 +841,7 @@ fn host_decommit(addr: u64, size: u64) {
     unsafe {
         VirtualFree(addr as _, size as usize, MEM_DECOMMIT);
     }
+    crate::gpu::resident::settled(addr, size);
 }
 
 pub fn host_protect(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
@@ -774,6 +849,9 @@ pub fn host_protect(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     let mut old = 0u32;
     let _readers_out = GUEST_READERS.write();
     let ok = unsafe { VirtualProtect(addr as _, size as usize, win_prot(prot), &mut old) };
+    // Again after the change: a take in between may have armed pages the
+    // new protection then overrode (`resident::settled`).
+    crate::gpu::resident::settled(addr, size);
     if ok == 0 { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
 }
 
@@ -801,7 +879,7 @@ fn section_commit(addr: u64, size: u64, kind: VmaKind, prot: u32, phys: u64) -> 
     crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_COMMIT);
     repaged(addr, size);
     let (which, off) = if kind == VmaKind::Direct { (Sec::Dmem, phys) } else { (Sec::Anon, sec::anon_alloc(size).ok_or(MemError::NoSpace)?) };
-    if let Err(e) = sec::map_view(addr, size, which, off, win_prot(prot)) {
+    if let Err(e) = sec::map_new_view(addr, size, which, off, win_prot(prot)) {
         crate::warn!("mem: {e}");
         if which == Sec::Anon {
             sec::anon_free(off, size);
@@ -815,6 +893,7 @@ fn section_commit(addr: u64, size: u64, kind: VmaKind, prot: u32, phys: u64) -> 
             NO_SLOT
         }
     };
+    crate::gpu::resident::settled(addr, size);
     Ok((slot, if which == Sec::Anon { off } else { 0 }))
 }
 
@@ -829,6 +908,7 @@ fn section_release(v: &Vma) {
             crate::warn!("mem: {e}");
         }
     }
+    crate::gpu::resident::settled(v.start, v.size);
     if v.slot != NO_SLOT {
         crate::sections::alias_unref(v.start, v.size, v.slot, crate::gpu::imports_may_cover);
     }
@@ -842,17 +922,18 @@ fn section_release(v: &Vma) {
 /// the same section pages (contents kept). Faults of other threads inside it
 /// meanwhile wait (`sections::wait_split`); the residency's protections of its
 /// pages are reset.
-fn section_split(v: &Vma, at: u64) {
+fn section_split(v: &Vma, at: u64, why: usize) {
     use crate::sections::{self as sec, Sec};
     let (which, off) = if v.kind == VmaKind::Direct { (Sec::Dmem, v.phys) } else { (Sec::Anon, v.off) };
     crate::gpu::track::remapped(v.start, v.size, crate::gpu::track::REMAP_PROTECT);
     let _readers_out = GUEST_READERS.write();
-    sec::split_begin(v.start, v.end());
+    sec::split_begin(v.start, v.end(), why);
     let lo = at - v.start;
     let r = sec::unmap_view(v.start)
         .and_then(|_| sec::map_view(v.start, lo, which, off, win_prot(v.prot)))
         .and_then(|_| sec::map_view(at, v.end() - at, which, off + lo, win_prot(v.prot)));
     sec::split_end();
+    crate::gpu::resident::settled(v.start, v.size);
     if let Err(e) = r {
         crate::error!("mem: splitting the view {:#x}+{:#x} at {at:#x}: {e}", v.start, v.size);
     }
@@ -880,11 +961,11 @@ impl MemState {
     }
 
     /// Ensures a VMA boundary exists at `addr`.
-    fn split_at(&mut self, addr: u64) {
+    fn split_at(&mut self, addr: u64, why: usize) {
         let Some(v) = self.vmas.range(..addr).next_back().map(|(_, v)| v.clone()) else { return };
         if addr > v.start && addr < v.end() {
             if crate::sections::on() && v.kind != VmaKind::Reserved {
-                section_split(&v, addr);
+                section_split(&v, addr, why);
             }
             let mut lo = v.clone();
             lo.size = addr - v.start;
@@ -917,10 +998,15 @@ impl MemState {
     /// Removes mappings in [start, end), decommitting host pages. Reserved ranges
     /// are left reserved only if `keep_reserved`.
     pub fn unmap_range(&mut self, start: u64, end: u64) {
+        self.unmap_range_for(start, end, crate::sections::SPLIT_UNMAP);
+    }
+
+    /// `unmap_range`; `why` names the cause of view splits (diagnostics).
+    fn unmap_range_for(&mut self, start: u64, end: u64, why: usize) {
         trace_map("unmap", start, end, format_args!(""));
         bump_gen(start, end);
-        self.split_at(start);
-        self.split_at(end);
+        self.split_at(start, why);
+        self.split_at(end, why);
         let keys: Vec<u64> = self.vmas.range(start..end).map(|(k, _)| *k).collect();
         for k in keys {
             let v = self.vmas.remove(&k).unwrap();
@@ -997,7 +1083,7 @@ impl MemState {
             }
         }
         if !existing.is_empty() {
-            self.unmap_range(addr, addr + size);
+            self.unmap_range_for(addr, addr + size, crate::sections::SPLIT_MAP_OVER);
         }
         let (mut slot, mut off) = (NO_SLOT, 0);
         if kind != VmaKind::Reserved {
@@ -1016,6 +1102,17 @@ impl MemState {
             let bits = if kind == VmaKind::Direct { addr | size | phys } else { addr | size };
             let k = if bits & 0xFFFF == 0 { 0 } else if bits & 0x3FFF == 0 { 1 } else { 2 };
             MAP_ALIGN[k + if kind == VmaKind::Direct { 0 } else { 3 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if kind == VmaKind::Direct {
+            // Diagnostics: physical memory mapped without an allocation
+            // (with sections it shows whatever those pages hold).
+            let covered: u64 = self.dmem.range(..phys + size).filter(|(s, b)| **s + b.size > phys).map(|(s, b)| (s + b.size).min(phys + size) - (*s).max(phys)).sum();
+            if covered < size {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                    crate::warn!("mem: direct {addr:#x}+{size:#x} maps phys {phys:#x} of which {:#x} bytes are not allocated '{name}'", size - covered);
+                }
+            }
         }
         if kind == VmaKind::Direct && !crate::sections::on() {
             for v in self.vmas.values() {
@@ -1057,8 +1154,8 @@ impl MemState {
 
     pub fn protect(&mut self, start: u64, end: u64, prot: u32) -> Result<(), MemError> {
         trace_map("protect", start, end, format_args!("prot {prot:#x}"));
-        self.split_at(start);
-        self.split_at(end);
+        self.split_at(start, crate::sections::SPLIT_PROTECT);
+        self.split_at(end, crate::sections::SPLIT_PROTECT);
         let keys: Vec<u64> = self.vmas.range(start..end).map(|(k, _)| *k).collect();
         for k in keys {
             let v = self.vmas.get_mut(&k).unwrap();
@@ -1089,6 +1186,9 @@ impl MemState {
             return None;
         }
         self.dmem.insert(cand, DmemBlock { size: len, mtype });
+        if crate::sections::on() {
+            crate::sections::dmem_allocated(cand, len);
+        }
         Some(cand)
     }
 
