@@ -4182,6 +4182,8 @@ pub struct Exec {
     /// against the other queue; its batches share no batch-start copies
     /// unless bit 16 of the switch is set).
     alt_id: u64,
+    /// Every batch goes to the compute-only family's queue (`vk::alt_compute_id`).
+    on_compute: bool,
     batch_alt: bool,
     batch_alt_share: bool,
     /// GPU writes this batch recorded since its last full barrier through
@@ -4252,10 +4254,15 @@ pub(crate) const STOPPED: &str = "stopped (parallel run)";
 impl Exec {
     pub fn new(name: &str) -> Result<Exec, String> {
         let c = ctx();
+        let alt_id = name.strip_prefix("gpu-acb").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
+        // This queue's batches all go to the compute-only family's queue
+        // (`vk::alt_compute_id`): its command buffers come from that family.
+        let on_compute = alt_id != 0 && super::vk::alt_compute_id() == Some(alt_id) && c.compute.is_some();
+        let family = if on_compute { c.compute.as_ref().map_or(c.queue_family, |q| q.family) } else { c.queue_family };
         unsafe {
             let pool = c
                 .device
-                .create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(c.queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
+                .create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
                 .map_err(|e| e.to_string())?;
             let xpool = match &c.copy {
                 Some(q) => c
@@ -4347,7 +4354,8 @@ impl Exec {
                 race_id: RACE_IDS.fetch_add(1, Ordering::Relaxed),
                 race_name: name.into(),
                 forward_ids: Vec::new(),
-                alt_id: name.strip_prefix("gpu-acb").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).unwrap_or(0),
+                alt_id,
+                on_compute,
                 batch_alt: false,
                 batch_alt_share: false,
                 since_barrier: Some(Vec::new()),
@@ -4475,7 +4483,7 @@ impl Exec {
         }
         self.recording = true;
         let aq = super::tune::alt_queue();
-        self.batch_alt = self.alt_id != 0 && aq & 0xFFFF == self.alt_id && ctx().queue2.is_some();
+        self.batch_alt = self.on_compute || (self.alt_id != 0 && aq & 0xFFFF == self.alt_id && ctx().queue2.is_some());
         self.batch_alt_share = aq & 0x10000 != 0;
         self.dyncache = Default::default();
         self.begun_at = std::time::Instant::now();

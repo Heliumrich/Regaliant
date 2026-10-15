@@ -53,9 +53,32 @@ pub struct Ctx {
     /// The copy queue (a transfer-only queue family; `DS_COPY_QUEUE=0`:
     /// none): batch-start copies run on it beside the main queue (`exec`).
     pub copy: Option<CopyQueue>,
-    /// The queue families buffers are used by: the main queue's and the copy
-    /// queue's (the same twice without one).
-    pub families: [u32; 2],
+    /// A queue of a compute-only family (diagnosis, `alt_compute_id`): one
+    /// compute queue's batches run on it beside the main queue.
+    pub compute: Option<ComputeQueue>,
+    /// The distinct queue families buffers are used by (the main queue's,
+    /// the copy queue's, the compute queue's).
+    pub families: Vec<u32>,
+}
+
+/// A queue of a compute-only family (`Ctx::compute`).
+pub struct ComputeQueue {
+    pub family: u32,
+    pub queue: Mutex<vk::Queue>,
+}
+
+/// The compute queue (its id, e.g. 0x50) whose batches go to a queue of a
+/// compute-only family: `DS_ALT_QUEUE` at boot with 0x20000 added (timing
+/// only, as `tune alt_queue`: no ordering between the queues; buffers are
+/// shared with that family, images are not).
+pub fn alt_compute_id() -> Option<u64> {
+    static ID: OnceLock<Option<u64>> = OnceLock::new();
+    *ID.get_or_init(|| {
+        let v = std::env::var("DS_ALT_QUEUE").ok()?;
+        let v = v.trim();
+        let n = if let Some(h) = v.strip_prefix("0x") { u64::from_str_radix(h, 16).ok()? } else { v.parse::<u64>().ok()? };
+        (n & 0x20000 != 0 && n & 0xFFFF != 0).then_some(n & 0xFFFF)
+    })
 }
 
 /// A transfer-only queue for batch-start copies, and its timeline.
@@ -188,11 +211,23 @@ fn init_inner() -> Result<(), String> {
         } else {
             None
         };
-        let qci_all = [
-            vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio2[..main_queues]),
-            vk::DeviceQueueCreateInfo::default().queue_family_index(copy_family.unwrap_or(qf)).queue_priorities(&prio),
-        ];
-        let qci = if copy_family.is_some() { &qci_all[..] } else { &qci_all[..1] };
+        // A compute-only family (diagnosis: `alt_compute_id`).
+        let compute_family = if alt_compute_id().is_some() {
+            instance
+                .get_physical_device_queue_family_properties(pdev)
+                .iter()
+                .position(|q| q.queue_count > 0 && q.queue_flags.contains(vk::QueueFlags::COMPUTE) && !q.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+                .map(|f| f as u32)
+        } else {
+            None
+        };
+        let mut qci = vec![vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio2[..main_queues])];
+        if let Some(f) = copy_family {
+            qci.push(vk::DeviceQueueCreateInfo::default().queue_family_index(f).queue_priorities(&prio));
+        }
+        if let Some(f) = compute_family {
+            qci.push(vk::DeviceQueueCreateInfo::default().queue_family_index(f).queue_priorities(&prio));
+        }
         let host_import = instance
             .enumerate_device_extension_properties(pdev)
             .unwrap_or_default()
@@ -346,7 +381,7 @@ fn init_inner() -> Result<(), String> {
             .shader_int8(true);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true).maintenance4(true);
         let mut dci = vk::DeviceCreateInfo::default()
-            .queue_create_infos(qci)
+            .queue_create_infos(&qci)
             .enabled_extension_names(&dexts)
             .enabled_features(&features)
             .push_next(&mut f11)
@@ -376,6 +411,16 @@ fn init_inner() -> Result<(), String> {
         );
         let queue = device.get_device_queue(qf, 0);
         let queue2 = (main_queues == 2).then(|| Mutex::new(device.get_device_queue(qf, 1)));
+        let compute = compute_family.map(|f| ComputeQueue { family: f, queue: Mutex::new(device.get_device_queue(f, 0)) });
+        if let Some(c) = &compute {
+            crate::info!("Vulkan: compute queue in family {} (queue {:#x}'s batches beside the main queue; diagnosis)", c.family, alt_compute_id().unwrap_or(0));
+        }
+        let mut families = vec![qf];
+        for f in [copy_family, compute_family].into_iter().flatten() {
+            if !families.contains(&f) {
+                families.push(f);
+            }
+        }
         let copy = copy_family.and_then(|f| {
             let mut tci = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
             let copied = device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tci), None).ok()?;
@@ -417,8 +462,9 @@ fn init_inner() -> Result<(), String> {
             fault: has_fault.then(|| ash::ext::device_fault::Device::new(&instance, &device)),
             device_addresses,
             draw_parameters: draw_parameters && first_instance,
-            families: [qf, copy.as_ref().map_or(qf, |c| c.family)],
+            families,
             copy,
+            compute,
             entry,
             instance,
             pdev,
@@ -712,10 +758,10 @@ impl Ctx {
         }
     }
 
-    /// `bi` with the buffer shared by the main and copy queues' families
-    /// (concurrent; exclusive without a copy queue).
+    /// `bi` with the buffer shared by the families of the main, copy and
+    /// compute queues (concurrent; exclusive with the main queue's alone).
     fn shared<'a>(&'a self, bi: vk::BufferCreateInfo<'a>) -> vk::BufferCreateInfo<'a> {
-        if self.copy.is_some() {
+        if self.families.len() > 1 {
             bi.sharing_mode(vk::SharingMode::CONCURRENT).queue_family_indices(&self.families)
         } else {
             bi.sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -849,6 +895,7 @@ impl Ctx {
         let si = vk::SubmitInfo2::default().command_buffer_infos(&cbs).wait_semaphore_infos(&ws).signal_semaphore_infos(&ss);
         let q = match (&self.queue2, on_copy) {
             (_, true) => self.copy.as_ref().ok_or("no copy queue")?.queue.lock(),
+            (_, false) if alt && self.compute.is_some() => self.compute.as_ref().map(|c| c.queue.lock()).ok_or("no compute queue")?,
             (Some(q2), false) if alt => q2.lock(),
             _ => self.queue.lock(),
         };
