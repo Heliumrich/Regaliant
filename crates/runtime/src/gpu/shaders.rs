@@ -331,14 +331,14 @@ impl<'a> Reader<'a> {
     /// words read, pointers loaded).
     fn with_sizes(code_base: u64, sizes: [u32; 3]) -> Reader<'a> {
         Reader {
-            reads: Vec::with_capacity(sizes[0] as usize),
-            words: Vec::with_capacity(sizes[1] as usize),
-            unread: Vec::new(),
+            reads: pool::pairs(sizes[0] as usize),
+            words: pool::words(sizes[1] as usize),
+            unread: pool::pairs(0),
             spans: [(0, 0); 4],
             next_span: 0,
             ptrs: Vec::with_capacity(sizes[2] as usize),
             code_base,
-            chain_vals: Vec::new(),
+            chain_vals: pool::addrs(0),
         }
     }
 
@@ -510,10 +510,86 @@ pub struct Found {
     pub data_loads: Vec<DataLoad>,
 }
 
+impl Drop for Found {
+    fn drop(&mut self) {
+        pool::put_resolved(std::mem::take(&mut self.resources));
+        pool::put_addrs(std::mem::take(&mut self.res_addrs));
+        pool::put_pairs(std::mem::take(&mut self.reads));
+        pool::put_words(std::mem::take(&mut self.words));
+        pool::put_pairs(std::mem::take(&mut self.unread));
+        pool::put_loads(std::mem::take(&mut self.data_loads));
+    }
+}
+
+/// The vectors of finished preparations, kept per thread for the next ones
+/// (`Found` and `Prepared` give theirs back when dropped): a preparation
+/// made ~10 allocations, ~5% of the recording workers' busy samples in
+/// `mi_malloc_aligned` (2026-10-15).
+mod pool {
+    use super::{DataLoad, Resolved};
+    use std::cell::RefCell;
+
+    /// Vectors kept per kind at most, and the largest capacity kept.
+    const MAX: usize = 64;
+    const CAP_MAX: usize = 1 << 16;
+
+    #[derive(Default)]
+    struct Pool {
+        pairs: Vec<Vec<(u64, u64)>>,
+        words: Vec<Vec<u32>>,
+        resolved: Vec<Vec<Resolved>>,
+        addrs: Vec<Vec<Option<u64>>>,
+        loads: Vec<Vec<DataLoad>>,
+    }
+
+    thread_local! {
+        static POOL: RefCell<Pool> = RefCell::new(Pool::default());
+    }
+
+    macro_rules! kind {
+        ($take:ident, $put:ident, $field:ident, $t:ty) => {
+            /// An empty vector with room for `cap` (from the pool if one is left).
+            pub fn $take(cap: usize) -> Vec<$t> {
+                if !crate::gpu::tune::prep_pool() {
+                    return Vec::with_capacity(cap);
+                }
+                let v = POOL.try_with(|p| p.try_borrow_mut().ok().and_then(|mut p| p.$field.pop())).ok().flatten();
+                match v {
+                    Some(mut v) => {
+                        v.reserve(cap);
+                        v
+                    }
+                    None => Vec::with_capacity(cap),
+                }
+            }
+
+            /// Gives `v` back (emptied) for a later preparation.
+            pub fn $put(mut v: Vec<$t>) {
+                if v.capacity() == 0 || v.capacity() > CAP_MAX || !crate::gpu::tune::prep_pool() {
+                    return;
+                }
+                v.clear();
+                let _ = POOL.try_with(|p| {
+                    if let Ok(mut p) = p.try_borrow_mut() {
+                        if p.$field.len() < MAX {
+                            p.$field.push(v);
+                        }
+                    }
+                });
+            }
+        };
+    }
+
+    kind!(pairs, put_pairs, pairs, (u64, u64));
+    kind!(words, put_words, words, u32);
+    kind!(resolved, put_resolved, resolved, Resolved);
+    kind!(addrs, put_addrs, addrs, Option<u64>);
+    kind!(loads, put_loads, loads, DataLoad);
+}
+
 /// Everything needed to bind one shader stage for a draw/dispatch: what was
 /// found (`Found`, shared by copies; fields reached through `Deref`), and
 /// the SGPR data and user data, a copy's own.
-#[derive(Clone)]
 pub struct Prepared {
     pub stage: Stage,
     pub addr: u64,
@@ -532,6 +608,31 @@ pub struct Prepared {
     pub cmp_depth: u64,
     /// The program code's hash (`program_checked`).
     pub code_hash: u64,
+}
+
+impl Clone for Prepared {
+    fn clone(&self) -> Prepared {
+        let mut sgpr_data = pool::words(self.sgpr_data.len());
+        sgpr_data.extend_from_slice(&self.sgpr_data);
+        Prepared {
+            stage: self.stage,
+            addr: self.addr,
+            found: self.found.clone(),
+            sgpr_data,
+            user: self.user,
+            map_gen: self.map_gen,
+            images_gen: self.images_gen,
+            cmp_images: self.cmp_images,
+            cmp_depth: self.cmp_depth,
+            code_hash: self.code_hash,
+        }
+    }
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        pool::put_words(std::mem::take(&mut self.sgpr_data));
+    }
 }
 
 /// A stage's user-data dwords (at most 32), held inline: a preparation
@@ -1701,8 +1802,8 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     let images_gen = super::images::GPU_IMAGES_GEN.load(std::sync::atomic::Ordering::Acquire);
     let sizes = READ_HINTS.with(|h| h.borrow().get(&plan_key).copied().unwrap_or([0; 3]));
     let mut rd = Reader::with_sizes(addr, sizes);
-    let mut resources = Vec::with_capacity(plan.resources.len());
-    let mut res_addrs = Vec::with_capacity(plan.resources.len());
+    let mut resources = pool::resolved(plan.resources.len());
+    let mut res_addrs = pool::addrs(plan.resources.len());
     spec.resources.clear();
     spec.resources.reserve(plan.resources.len());
     for (i, res) in plan.resources.iter().enumerate() {
@@ -1889,10 +1990,10 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         LAST_TRANSLATIONS.with(|c| c.borrow_mut().insert(plan_key, tr.clone()));
     }
     // Scalar-load data, resolved now.
-    let mut sgpr_data = Vec::with_capacity((translate::sgpr_data_dwords(&tr.plan) as usize).max(translate::SGPR_DATA_USER as usize));
+    let mut sgpr_data = pool::words((translate::sgpr_data_dwords(&tr.plan) as usize).max(translate::SGPR_DATA_USER as usize));
     sgpr_data.extend_from_slice(user);
     sgpr_data.resize(translate::SGPR_DATA_USER as usize, 0);
-    let mut data_loads = Vec::with_capacity(tr.plan.load_data.iter().filter(|&&d| d).count());
+    let mut data_loads = pool::loads(tr.plan.load_data.iter().filter(|&&d| d).count());
     for (j, l) in tr.plan.loads.iter().enumerate() {
         let base = rd.chain(tr.plan.chain_ids.get(j).copied().unwrap_or(u32::MAX), &l.ptr, user);
         let start = sgpr_data.len();
@@ -1936,7 +2037,8 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     if used != sizes {
         READ_HINTS.with(|h| h.borrow_mut().insert(plan_key, used));
     }
-    let Reader { reads, words, unread, .. } = rd;
+    let Reader { reads, words, unread, chain_vals, .. } = rd;
+    pool::put_addrs(chain_vals);
     let prepared = Prepared {
         stage: spec.stage,
         addr,

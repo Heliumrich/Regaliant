@@ -943,6 +943,51 @@ pub fn scrub_status() -> String {
 /// memo).
 pub static NOTE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Pages (64 KiB, hashed) holding a GPU-owned image's bytes or a fast-clear
+/// metadata address (`Images::owned`, `meta_of`), marked when indexed and
+/// never cleared (both only grow): buffer writes on no marked page have
+/// nothing for `note_writes` and skip the image cache's lock (`may_note`;
+/// every writing dispatch took it, the most waited-for lock after the copy
+/// cache's, 2026-10-15).
+const NOTE_BUCKETS: usize = 1 << 16;
+static NOTE_PAGES: [std::sync::atomic::AtomicBool; NOTE_BUCKETS] = [const { std::sync::atomic::AtomicBool::new(false) }; NOTE_BUCKETS];
+
+fn note_bucket(page: u64) -> usize {
+    (page.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize
+}
+
+fn mark_note_pages(base: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (base >> 16, (base + len - 1) >> 16);
+    if last - first >= NOTE_BUCKETS as u64 {
+        for b in NOTE_PAGES.iter() {
+            b.store(true, std::sync::atomic::Ordering::Release);
+        }
+        return;
+    }
+    for page in first..=last {
+        NOTE_PAGES[note_bucket(page)].store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Whether `note_writes` may have something to do for these writes (false:
+/// certainly not; when a mark races a write, that write was not ordered
+/// after the image's indexing under the lock either).
+pub fn may_note(writes: &[(u64, u64)]) -> bool {
+    if !super::tune::note_filter() {
+        return true;
+    }
+    writes.iter().any(|&(b, n)| {
+        if n == 0 {
+            return false;
+        }
+        let (first, last) = (b >> 16, (b + n - 1) >> 16);
+        last - first >= 1024 || (first..=last).any(|p| NOTE_PAGES[note_bucket(p)].load(std::sync::atomic::Ordering::Acquire))
+    })
+}
+
 pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
     static SCRUBBER: std::sync::Once = std::sync::Once::new();
     SCRUBBER.call_once(|| {
@@ -2103,6 +2148,7 @@ impl Images {
         let span = img.span;
         let v = self.owned.entry(k.base).or_default();
         if !v.contains(&k) {
+            mark_note_pages(k.base, span);
             v.push(k);
             self.max_span = self.max_span.max(span);
             self.note_gen += 1;
@@ -2473,6 +2519,9 @@ impl Images {
             LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
             gpu_images_changed();
             self.gpu_bases.insert(s.stencil_base);
+        }
+        if s.meta != 0 {
+            mark_note_pages(s.meta, 4);
         }
         if s.meta != 0 && self.meta_of.insert(s.meta, (k, s.clear)) != Some((k, s.clear)) {
             self.note_gen += 1;

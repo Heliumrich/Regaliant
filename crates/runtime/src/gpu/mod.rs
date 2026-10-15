@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 101] = [
+    static ALL: [Tunable; 103] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -128,6 +128,8 @@ pub mod tune {
         Tunable { name: "flip_async", env: "DS_FLIP_ASYNC", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "wait_ahead", env: "DS_WAIT_AHEAD", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "marks_unlocked", env: "DS_MARKS_UNLOCKED", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "lock_relief", env: "DS_LOCK_RELIEF", default: 3, value: AtomicU64::new(UNSET) },
+        Tunable { name: "prep_pool", env: "DS_PREP_POOL", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1062,6 +1064,27 @@ pub mod tune {
     #[inline]
     pub fn marks_unlocked() -> bool {
         get(100) != 0
+    }
+
+    /// Bit 0: writing dispatches skip the image cache's lock when no page
+    /// they write holds a GPU-owned image or fast-clear metadata
+    /// (`images::may_note`); bit 1: the write logs' lookups share their lock
+    /// (`exec::RangeLog`, a reader-writer lock; else taken exclusively).
+    #[inline]
+    pub fn note_filter() -> bool {
+        get(101) & 1 != 0
+    }
+
+    #[inline]
+    pub fn shared_log_reads() -> bool {
+        get(101) & 2 != 0
+    }
+
+    /// Stage preparations take their vectors from a per-thread pool that
+    /// finished preparations refill (`shaders::pool`; 0: allocate each).
+    #[inline]
+    pub fn prep_pool() -> bool {
+        get(102) != 0
     }
 
 

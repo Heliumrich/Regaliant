@@ -2028,7 +2028,7 @@ pub fn completed_seq() -> u64 {
 /// lookup costs one ordered search per unfinished batch); `latest_seq` lets
 /// lookups return at once when every noted batch has completed.
 struct RangeLog {
-    log: Mutex<super::ranges::SeqRanges>,
+    log: parking_lot::RwLock<super::ranges::SeqRanges>,
     latest_seq: AtomicU64,
     /// Bumped after every note (`Exec`'s cache of clean pages holds while it
     /// stays the same; a reader takes it before looking).
@@ -2064,7 +2064,7 @@ fn coarse_bucket(page: u64) -> usize {
 impl RangeLog {
     const fn new() -> RangeLog {
         RangeLog {
-            log: Mutex::new(super::ranges::SeqRanges::new()),
+            log: parking_lot::RwLock::new(super::ranges::SeqRanges::new()),
             latest_seq: AtomicU64::new(0),
             notes: AtomicU64::new(0),
             pages: [const { AtomicU64::new(0) }; PAGE_BUCKETS],
@@ -2119,7 +2119,7 @@ impl RangeLog {
         self.mark_pages(seq, w.0, w.1);
         self.latest_seq.fetch_max(seq, Ordering::SeqCst);
         let done = done_seq();
-        let mut g = self.log.lock();
+        let mut g = super::lockstat::WRITE_LOGS.write(&self.log);
         g.prune(done);
         g.insert(seq, w.0, w.1);
         drop(g);
@@ -2136,7 +2136,7 @@ impl RangeLog {
         }
         self.latest_seq.fetch_max(seq, Ordering::SeqCst);
         let done = done_seq();
-        let mut g = self.log.lock();
+        let mut g = super::lockstat::WRITE_LOGS.write(&self.log);
         g.prune(done);
         g.insert_all(seq, writes);
         drop(g);
@@ -2149,7 +2149,11 @@ impl RangeLog {
         if self.latest_seq.load(Ordering::SeqCst) <= done || !self.may_overlap(reads, done) {
             return None;
         }
-        self.log.lock().latest(reads, done)
+        if super::tune::shared_log_reads() {
+            super::lockstat::WRITE_LOGS.read(&self.log).latest(reads, done)
+        } else {
+            super::lockstat::WRITE_LOGS.write(&self.log).latest(reads, done)
+        }
     }
 }
 
@@ -5873,7 +5877,9 @@ impl Exec {
             self.barrier();
         }
         let w = [(base, bytes)];
-        super::images::with(|im| im.note_writes(&w, &w));
+        if super::images::may_note(&w) {
+            super::images::with(|im| im.note_writes(&w, &w));
+        }
         super::mirror::invalidate(&w);
         super::track::gpu_write(base, bytes);
         self.note_write(base, bytes);
@@ -7236,7 +7242,9 @@ impl Exec {
         // change by another thread while they run makes the next one note.
         let gens = note_gens();
         let repeat = super::tune::lean_notes() && fill.is_none() && !writes_here.is_empty() && self.last_notes.2 == gens && self.last_notes.0 == writes_here && self.last_notes.1 == sized_here;
-        if !repeat {
+        // Writes on no page of a GPU-owned image or fast-clear metadata have
+        // nothing to note there (`images::may_note`).
+        if !repeat && (fill.is_some() || super::images::may_note(&writes_here)) {
             super::images::with(|im| {
                 im.note_writes(&writes_here, &sized_here);
                 if let Some(((base, len), v)) = fill {

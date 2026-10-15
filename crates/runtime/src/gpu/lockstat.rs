@@ -3,7 +3,7 @@
 //! to wait is counted with the time it waited; one that does not costs a
 //! `try_lock`.
 
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct LockStat {
@@ -30,6 +30,32 @@ impl LockStat {
         g
     }
 
+    /// `m.read()`, counting the wait when a writer holds it.
+    #[inline]
+    pub fn read<'a, T>(&self, m: &'a RwLock<T>) -> RwLockReadGuard<'a, T> {
+        if let Some(g) = m.try_read() {
+            return g;
+        }
+        let t = std::time::Instant::now();
+        let g = m.read();
+        self.waits.fetch_add(1, Ordering::Relaxed);
+        self.ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        g
+    }
+
+    /// `m.write()`, counting the wait when others hold it.
+    #[inline]
+    pub fn write<'a, T>(&self, m: &'a RwLock<T>) -> RwLockWriteGuard<'a, T> {
+        if let Some(g) = m.try_write() {
+            return g;
+        }
+        let t = std::time::Instant::now();
+        let g = m.write();
+        self.waits.fetch_add(1, Ordering::Relaxed);
+        self.ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        g
+    }
+
     fn part(&self) -> String {
         format!("{} {} ({} ms)", self.name, self.waits.load(Ordering::Relaxed), self.ns.load(Ordering::Relaxed) / 1_000_000)
     }
@@ -46,8 +72,11 @@ pub static COPY_CACHE: LockStat = LockStat::new("copy cache");
 pub static MIRRORS: LockStat = LockStat::new("mirrors");
 /// Video-memory homes (`homes`).
 pub static HOMES: LockStat = LockStat::new("homes");
+/// The logs of unfinished batches' and deferred CP writes
+/// (`exec::RangeLog`: reads by every read check, writes by every note).
+pub static WRITE_LOGS: LockStat = LockStat::new("write logs");
 
-const ALL: [&LockStat; 3] = [&COPY_CACHE, &MIRRORS, &HOMES];
+const ALL: [&LockStat; 4] = [&COPY_CACHE, &MIRRORS, &HOMES, &WRITE_LOGS];
 
 /// Clears the counts (`profile reset`).
 pub fn reset_stats() {
