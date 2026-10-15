@@ -17,6 +17,12 @@
 //!   submission starts, a wait the CPU released, REWIND; any queue): writes
 //!   the title orders before later commands are made before such an event.
 //!   A written page drops every entry on it (taking its marks resets them).
+//!   Marks are taken without the cache's lock (`take_unlocked`: the query
+//!   is a system call, and under the lock it made the recording threads wait
+//!   ~10 ms per flip in all): a take is registered first and its pages are
+//!   applied after under the lock; a check that would find a range unchanged
+//!   first waits for the takes over it that began before it ended, since
+//!   those may have reset its pages (`wait_takes`).
 //! - GPU and CP writes, host writes (file reads), mapping changes:
 //!   `invalidate`, when the write is recorded and again when its batch is
 //!   submitted (a copy recorded later by another queue's batch submitted
@@ -143,6 +149,10 @@ struct Cache {
     watched: Vec<Watched>,
     /// Entry ids `drop_range` leaves (`invalidate_ranges_except`).
     spare: Vec<u64>,
+    /// Takes of write marks in flight (`take_unlocked`): their pages [lo, hi)
+    /// and number, the last number given.
+    takes: Vec<(u64, u64, u64)>,
+    take_seq: u64,
     /// Why the entries being removed now go (`GONE_*`; diagnostics), and
     /// per key the reason its entry last went and the frame (DS_PROFILE_GPU:
     /// `miss_reason`).
@@ -247,10 +257,11 @@ pub static INSERT_GEN: AtomicU64 = AtomicU64::new(0);
 /// dropped by GPU/CP/host writes and mapping changes, dropped by eviction,
 /// no space, failed checks, not kept (GPU-written lately), left to a batch
 /// not submitted yet (`tune pre_keep`), big copies, big entries dropped by
-/// writes, big copies declined (changed lately)].
-static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+/// writes, big copies declined (changed lately), checks that waited for
+/// another thread's take].
+static STATS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
 /// STATS at the last `profile reset` (`window_line`).
-static SNAP: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+static SNAP: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
 
 /// Starts a profile window (`profile reset`).
 pub fn reset_window() {
@@ -366,26 +377,25 @@ impl Cache {
         }
     }
 
-    /// `mem::take_written` for the cache: the pages reported also date the
-    /// watched windows they fall in (a failed query dates those overlapping
-    /// the range), and texture regions on them other than `except` are told
-    /// (`track::cpu_pages`: taking the marks resets them).
-    fn take_marks(&mut self, base: u64, size: u64, out: &mut Vec<u64>, except: Option<u32>) -> Option<()> {
-        let first = out.len();
-        let r = crate::mem::take_written(base, size, out);
+    /// What a take of [base, base+size)'s write marks found (`r`, the pages
+    /// `new`), applied: the pages date the watched windows they fall in (a
+    /// failed query dates those overlapping the range), and texture regions
+    /// on them other than `except` are told (`track::cpu_pages`: taking the
+    /// marks resets them).
+    fn apply_marks(&mut self, base: u64, size: u64, r: Option<()>, new: &[u64], except: Option<u32>) {
         match r {
-            Some(()) if out.len() > first => super::track::cpu_pages(&out[first..], except),
+            Some(()) if !new.is_empty() => super::track::cpu_pages(new, except),
             Some(()) => {}
             None => super::track::cpu_range(base, size, except),
         }
         if self.watched.is_empty() {
-            return r;
+            return;
         }
         match r {
-            Some(()) if out.len() > first => {
+            Some(()) if !new.is_empty() => {
                 self.marks += 1;
                 let g = self.marks;
-                for &p in &out[first..] {
+                for &p in new {
                     for w in self.watched.iter_mut() {
                         if w.lo <= p && p < w.hi {
                             w.written = g;
@@ -404,14 +414,27 @@ impl Cache {
                 }
             }
         }
-        r
     }
 
-    /// Takes the range's write marks: entries on written pages go (as in
-    /// `lookup`), watched windows are dated.
-    fn take_and_drop(&mut self, base: u64, size: u64) {
-        let mut pages = Vec::new();
-        match self.take_marks(base, size, &mut pages, None) {
+    /// Registers a take of [base, base+size)'s marks about to be made
+    /// without the lock; its number.
+    fn begin_take(&mut self, base: u64, size: u64) -> u64 {
+        self.take_seq += 1;
+        self.takes.push((base & !4095, base.saturating_add(size).next_multiple_of(4096), self.take_seq));
+        self.take_seq
+    }
+
+    /// Whether a take numbered up to `upto` is in flight over a page of
+    /// [base, base+size).
+    fn takes_over(&self, base: u64, size: u64, upto: u64) -> bool {
+        let (lo, hi) = (base & !4095, base.saturating_add(size).next_multiple_of(4096));
+        self.takes.iter().any(|&(a, b, t)| t <= upto && a < hi && lo < b)
+    }
+
+    /// Entries on the pages a take found written go (all of the range when
+    /// the query failed).
+    fn dropped_by_take(&mut self, base: u64, size: u64, r: Option<()>, pages: &[u64]) {
+        match r {
             None => {
                 STATS[7].fetch_add(1, Ordering::Relaxed);
                 self.why = 2;
@@ -420,7 +443,7 @@ impl Cache {
             }
             Some(()) if !pages.is_empty() => {
                 self.why = 1;
-                let n = self.drop_pages(&pages);
+                let n = self.drop_pages(pages);
                 STATS[3].fetch_add(n, Ordering::Relaxed);
                 self.bounds_changed();
             }
@@ -575,26 +598,91 @@ impl Cache {
     }
 }
 
+type Guard = parking_lot::MutexGuard<'static, Option<Cache>>;
+
+fn lock() -> Guard {
+    super::lockstat::COPY_CACHE.lock(&CACHE)
+}
+
+/// Takes [base, base+size)'s write marks into `out` without holding the
+/// cache's lock during the query: registered as in flight first, applied
+/// after (`Cache::apply_marks`, texture regions other than `except` told).
+/// Returns the lock, held, the query's result and the last take number
+/// given when it was applied (`wait_takes`).
+fn take_unlocked(base: u64, size: u64, out: &mut Vec<u64>, except: Option<u32>) -> (Guard, Option<()>, u64) {
+    if !super::tune::marks_unlocked() {
+        // Under the lock: no take is ever in flight.
+        let mut g = lock();
+        let c = g.get_or_insert_with(Cache::default);
+        let first = out.len();
+        let r = crate::mem::take_written(base, size, out);
+        c.apply_marks(base, size, r, &out[first..], except);
+        let upto = c.take_seq;
+        return (g, r, upto);
+    }
+    let token = lock().get_or_insert_with(Cache::default).begin_take(base, size);
+    let first = out.len();
+    let r = crate::mem::take_written(base, size, out);
+    let mut g = lock();
+    let c = g.get_or_insert_with(Cache::default);
+    c.takes.retain(|t| t.2 != token);
+    c.apply_marks(base, size, r, &out[first..], except);
+    let upto = c.take_seq;
+    (g, r, upto)
+}
+
+/// Waits, with the lock released, until no take numbered up to `upto` is
+/// in flight over [base, base+size): such a take may have reset marks of
+/// pages written before; its pages are applied once it ends.
+fn wait_takes(mut g: Guard, base: u64, size: u64, upto: u64) -> Guard {
+    let mut n = 0u32;
+    while g.as_ref().is_some_and(|c| c.takes_over(base, size, upto)) {
+        drop(g);
+        n += 1;
+        if n < 64 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+        g = lock();
+    }
+    if n > 0 {
+        STATS[13].fetch_add(1, Ordering::Relaxed);
+    }
+    g
+}
+
 /// A submitted copy of guest [base, base+size) that is still current:
 /// (chunk, offset, the copy queue's timeline value a batch binding it waits
 /// for: the sequence of the batch that copied it there, else 0). Checks it
 /// for CPU writes once per epoch.
 pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64, u64)> {
-    let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);
-    let c = g.as_mut()?;
-    let e = c.entries.get(&(base, size))?;
-    if e.seq == 0 {
-        return None;
-    }
     let epoch = EPOCH.load(Ordering::Acquire);
-    if e.checked != epoch {
-        STATS[2].fetch_add(1, Ordering::Relaxed);
-        let mut pages = Vec::new();
-        match c.take_marks(base, size, &mut pages, None) {
+    let id = {
+        let mut g = lock();
+        let c = g.as_mut()?;
+        let e = c.entries.get(&(base, size))?;
+        if e.seq == 0 {
+            return None;
+        }
+        if e.checked == epoch {
+            STATS[0].fetch_add(1, Ordering::Relaxed);
+            return Some((e.chunk.clone(), e.offset, if e.on_copy { e.seq } else { 0 }));
+        }
+        e.id
+    };
+    STATS[2].fetch_add(1, Ordering::Relaxed);
+    let mut pages = Vec::new();
+    let (mut g, r, upto) = take_unlocked(base, size, &mut pages, None);
+    {
+        let c = g.as_mut()?;
+        match r {
             None => {
                 STATS[7].fetch_add(1, Ordering::Relaxed);
                 c.why = 2;
-                c.remove((base, size));
+                if c.entries.get(&(base, size)).is_some_and(|e| e.id == id) {
+                    c.remove((base, size));
+                }
                 c.bounds_changed();
                 return None;
             }
@@ -607,9 +695,10 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64, u64)> {
             }
             Some(()) => {}
         }
-        c.entries.get_mut(&(base, size))?.checked = epoch;
     }
-    let e = c.entries.get(&(base, size))?;
+    let mut g = wait_takes(g, base, size, upto);
+    let e = g.as_mut()?.entries.get_mut(&(base, size)).filter(|e| e.id == id)?;
+    e.checked = epoch;
     STATS[0].fetch_add(1, Ordering::Relaxed);
     Some((e.chunk.clone(), e.offset, if e.on_copy { e.seq } else { 0 }))
 }
@@ -629,34 +718,45 @@ pub fn miss_reason(base: u64, size: u64) -> u8 {
 /// start) and the new entry's id; the entry is usable by other batches once
 /// `submitted` names it.
 pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
-    let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);
-    let c = g.get_or_insert_with(Cache::default);
-    if super::tune::pre_keep() && c.entries.get(&(base, size)).is_some_and(|e| e.seq == 0 && e.made.elapsed() < std::time::Duration::from_millis(500)) {
-        // A batch not submitted yet copies it: this one copies it for itself
-        // (replacing the entry wasted that copy and its space).
-        STATS[9].fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    if n > CHUNK && c.big_changed.get(&(base, size)).is_some_and(|&f| f.saturating_add(BIG_QUIET) >= super::FRAMES.load(Ordering::Relaxed)) {
-        STATS[12].fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    let keep = super::tune::pre_share_volatile();
-    if keep > 0 && c.volatile.get(&(base, size)).is_some_and(|&f| f.saturating_add(keep) >= super::FRAMES.load(Ordering::Relaxed)) {
-        STATS[8].fetch_add(1, Ordering::Relaxed);
-        return None;
+    // A batch not submitted yet copies it: this one copies it for itself
+    // (replacing the entry wasted that copy and its space).
+    let pending = |c: &Cache| super::tune::pre_keep() && c.entries.get(&(base, size)).is_some_and(|e| e.seq == 0 && e.made.elapsed() < std::time::Duration::from_millis(500));
+    {
+        let mut g = lock();
+        let c = g.get_or_insert_with(Cache::default);
+        if pending(c) {
+            STATS[9].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if n > CHUNK && c.big_changed.get(&(base, size)).is_some_and(|&f| f.saturating_add(BIG_QUIET) >= super::FRAMES.load(Ordering::Relaxed)) {
+            STATS[12].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let keep = super::tune::pre_share_volatile();
+        if keep > 0 && c.volatile.get(&(base, size)).is_some_and(|&f| f.saturating_add(keep) >= super::FRAMES.load(Ordering::Relaxed)) {
+            STATS[8].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
     }
     // The range's write marks so far: the copy sees those writes (it runs
-    // later), other entries on those pages are stale.
+    // later), other entries on those pages are stale. (A take in flight
+    // over it from another thread can only drop the new entry later.)
     let mut pages = Vec::new();
-    if c.take_marks(base, size, &mut pages, None).is_none() {
+    let (mut g, r, _) = take_unlocked(base, size, &mut pages, None);
+    let c = g.get_or_insert_with(Cache::default);
+    if r.is_none() {
         STATS[7].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     if !pages.is_empty() {
         c.why = 1;
-        let n = c.drop_pages(&pages);
-        STATS[3].fetch_add(n, Ordering::Relaxed);
+        let k = c.drop_pages(&pages);
+        STATS[3].fetch_add(k, Ordering::Relaxed);
+    }
+    if pending(c) {
+        STATS[9].fetch_add(1, Ordering::Relaxed);
+        c.bounds_changed();
+        return None;
     }
     let Some((slot, chunk, offset)) = c.alloc(n) else {
         STATS[6].fetch_add(1, Ordering::Relaxed);
@@ -709,25 +809,12 @@ pub fn submitted(made: &[(u64, u64, u64, bool)], seq: u64) {
 /// its own takes: entries on those pages go, watched windows are dated, and
 /// texture regions on them other than `except` (the caller's) are told.
 pub fn take_written_for(base: u64, size: u64, out: &mut Vec<u64>, except: Option<u32>) -> Option<()> {
-    let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);
-    let c = g.get_or_insert_with(Cache::default);
     let first = out.len();
-    let r = c.take_marks(base, size, out, except);
-    match r {
-        None => {
-            STATS[7].fetch_add(1, Ordering::Relaxed);
-            c.why = 2;
-            c.drop_range(base, base.saturating_add(size), false);
-            c.bounds_changed();
-        }
-        Some(()) if out.len() > first => {
-            c.why = 1;
-            let n = c.drop_pages(&out[first..]);
-            STATS[3].fetch_add(n, Ordering::Relaxed);
-            c.bounds_changed();
-        }
-        Some(()) => {}
-    }
+    let (mut g, r, upto) = take_unlocked(base, size, out, except);
+    g.get_or_insert_with(Cache::default).dropped_by_take(base, size, r, &out[first..]);
+    // Pages another take over the range reset are told to the texture
+    // regions on them once it ends (as when it came first under one lock).
+    drop(wait_takes(g, base, size, upto));
     r
 }
 
@@ -800,9 +887,10 @@ pub fn invalidate_ranges_except(writes: &super::ranges::Ranges, keep: &[u64]) {
 /// copy in is recorded now: its marks so far are taken (the copy runs after
 /// those writes) and the moment returned (`unwritten_since`).
 pub fn watch(base: u64, size: u64) -> u64 {
-    let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);
+    let mut pages = Vec::new();
+    let (mut g, r, _) = take_unlocked(base, size, &mut pages, None);
     let c = g.get_or_insert_with(Cache::default);
-    c.take_and_drop(base, size);
+    c.dropped_by_take(base, size, r, &pages);
     let (lo, hi) = (base & !4095, base.saturating_add(size).next_multiple_of(4096));
     if !c.watched.iter().any(|w| w.lo == lo && w.hi == hi) {
         if c.watched.len() >= WATCHED_MAX {
@@ -820,9 +908,14 @@ pub fn watch(base: u64, size: u64) -> u64 {
 /// moment `since` (`watch`); false when unknown (the window's watch was
 /// dropped).
 pub fn unwritten_since(base: u64, size: u64, since: u64) -> bool {
-    let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);
-    let Some(c) = g.as_mut() else { return false };
-    c.take_and_drop(base, size);
+    if lock().is_none() {
+        return false;
+    }
+    let mut pages = Vec::new();
+    let (mut g, r, upto) = take_unlocked(base, size, &mut pages, None);
+    g.get_or_insert_with(Cache::default).dropped_by_take(base, size, r, &pages);
+    let g = wait_takes(g, base, size, upto);
+    let Some(c) = g.as_ref() else { return false };
     let (lo, hi) = (base & !4095, base.saturating_add(size).next_multiple_of(4096));
     c.watched.iter().find(|w| w.lo == lo && w.hi == hi).is_some_and(|w| w.written <= since)
 }
@@ -852,12 +945,13 @@ pub fn status() -> String {
         (c.chunks.len() - big.len(), c.entries.len(), big.len(), big.iter().sum::<u64>() >> 20)
     });
     format!(
-        "    shared batch-start copies: {} copies, {} reused, {} not kept (GPU-written lately); {} checks for CPU writes ({} failed), entries dropped by CPU writes {}, by GPU/CP/host writes and mapping changes {}, by eviction {}; {} without space, {} left to a batch not submitted yet; {} entries in {} chunks of {} MiB and {} big slots ({} MiB; {} big copies, {} dropped by writes, {} declined as changed lately); epochs: {} submissions, {} waits the CPU released, {} REWIND ({} waits passed on GPU writes ended none)\n",
+        "    shared batch-start copies: {} copies, {} reused, {} not kept (GPU-written lately); {} checks for CPU writes ({} failed, {} waited for another thread's take), entries dropped by CPU writes {}, by GPU/CP/host writes and mapping changes {}, by eviction {}; {} without space, {} left to a batch not submitted yet; {} entries in {} chunks of {} MiB and {} big slots ({} MiB; {} big copies, {} dropped by writes, {} declined as changed lately); epochs: {} submissions, {} waits the CPU released, {} REWIND ({} waits passed on GPU writes ended none)\n",
         s[1],
         s[0],
         s[8],
         s[2],
         s[7],
+        s[13],
         s[3],
         s[4],
         s[5],

@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 100] = [
+    static ALL: [Tunable; 101] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -127,6 +127,7 @@ pub mod tune {
         Tunable { name: "epoch_gpu_waits", env: "DS_EPOCH_GPU_WAITS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "flip_async", env: "DS_FLIP_ASYNC", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "wait_ahead", env: "DS_WAIT_AHEAD", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "marks_unlocked", env: "DS_MARKS_UNLOCKED", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1053,6 +1054,14 @@ pub mod tune {
             1 => compute,
             _ => true,
         }
+    }
+
+    /// The batch-start copy cache takes write-watch marks without holding
+    /// its lock during the query (`precache::take_unlocked`; 0: under the
+    /// lock, as before 2026-10-15).
+    #[inline]
+    pub fn marks_unlocked() -> bool {
+        get(100) != 0
     }
 
 
