@@ -71,7 +71,14 @@ const DROPPED: usize = 9;
 const WAITED_NS: usize = 10;
 const WAITS: usize = 11;
 const SCAN_NS: usize = 12;
-static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+/// Stages a command processor prepared while it waited on a label
+/// (`prepare_here`, `tune wait_ahead`) and the time that took (ns); scans
+/// made at such waits and the commands they found.
+const HERE: usize = 13;
+const HERE_NS: usize = 14;
+const WAIT_SCANS: usize = 15;
+const WAIT_CMDS: usize = 16;
+static STATS: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
 
 /// Failed preparations by stage kind and reason (the error's words, numbers
 /// and addresses left out).
@@ -156,6 +163,35 @@ fn worker() {
         if slot.state.compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire).is_err() {
             continue;
         }
+        run_slot(&slot);
+    }
+}
+
+/// Prepares `slot` on this thread if nothing took it yet (a command
+/// processor while it waits on a label, `tune wait_ahead`); whether it did.
+pub fn prepare_here(slot: &Slot) -> bool {
+    if slot.state.compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return false;
+    }
+    let t = std::time::Instant::now();
+    run_slot(slot);
+    STATS[HERE_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    STATS[HERE].fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// A scan made at a label wait (`Cp::scan_through`) found `commands` and
+/// ended for `why` (as `note_scan`) after `ns`.
+pub fn note_wait_scan(commands: usize, why: usize, ns: u64) {
+    STOPS[why.min(STOPS.len() - 1)].fetch_add(1, Ordering::Relaxed);
+    STATS[SCAN_NS].fetch_add(ns, Ordering::Relaxed);
+    STATS[WAIT_SCANS].fetch_add(1, Ordering::Relaxed);
+    STATS[WAIT_CMDS].fetch_add(commands as u64, Ordering::Relaxed);
+}
+
+/// Runs a slot taken for preparation (state RUNNING) and posts its result.
+fn run_slot(slot: &Slot) {
+    {
         // A panic must not leave the slot running (the command processor
         // would wait for it forever).
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match slot.regs.kind {
@@ -256,7 +292,7 @@ pub fn take<R: RegRead + ?Sized>(slot: &Slot, live: &R, wave64: bool) -> Option<
 /// One status line ("" before any scan).
 pub fn status() -> String {
     let s: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    if s[SCANS] == 0 {
+    if s[SCANS] == 0 && s[WAIT_SCANS] == 0 {
         return String::new();
     }
     let mut stops: Vec<(u64, usize)> = STOPS.iter().enumerate().map(|(i, c)| (c.load(Ordering::Relaxed), i)).filter(|x| x.0 > 0).collect();
@@ -276,12 +312,16 @@ pub fn status() -> String {
     why.sort_by(|a, b| b.1.cmp(&a.1));
     let why: Vec<String> = why.iter().take(6).map(|(k, n)| format!("{n} {k}")).collect();
     format!(
-        "    preparations ahead: {} scans ({} ms; ended by {}), {} stages handed to {} workers, {} used, {} prepared here instead (not started), stale: {} registers, {} program, {} GPU images, {} words; {} failed ({}), {} dropped; {} waits for a worker ({} ms)\n",
+        "    preparations ahead: {} scans ({} ms; ended by {}), {} stages handed to {} workers, {} scans at label waits found {} commands, {} stages prepared while waiting ({} ms), {} used, {} prepared here instead (not started), stale: {} registers, {} program, {} GPU images, {} words; {} failed ({}), {} dropped; {} waits for a worker ({} ms)\n",
         s[SCANS],
         s[SCAN_NS] / 1_000_000,
         stops.join(", "),
         s[JOBS],
         WORKERS.load(Ordering::Relaxed),
+        s[WAIT_SCANS],
+        s[WAIT_CMDS],
+        s[HERE],
+        s[HERE_NS] / 1_000_000,
         s[USED],
         s[TAKEN_OVER],
         s[STALE_REGS],

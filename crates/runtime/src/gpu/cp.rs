@@ -174,6 +174,9 @@ pub struct Cp {
     /// The scan's copies of the SH and context register files (kept to
     /// avoid allocations).
     scan_regs: (Vec<u32>, Vec<u32>),
+    /// The buffer, the packet after it and the buffer's end of the label
+    /// wait about to execute (`tune wait_ahead`): scanned if it blocks.
+    wait_ctx: Option<(Fetched, u64, u64)>,
     /// A parallel run in progress (`gpu::par`).
     par: Option<ParRun>,
     /// The last WAIT_REG_MEM passed on a GPU queue's write (a promise, an
@@ -333,6 +336,7 @@ const PACKET_FETCH: usize = 32;
 
 /// A command buffer as the CP fetched it (see `Cp::run`): small buffers are
 /// copied, larger ones read from guest memory.
+#[derive(Clone)]
 struct Fetched {
     base: u64,
     words: Vec<u32>,
@@ -1038,6 +1042,7 @@ impl Cp {
             ahead: std::collections::VecDeque::new(),
             cur_ahead: std::cell::RefCell::new([None, None]),
             scan_regs: (Vec::new(), Vec::new()),
+            wait_ctx: None,
             par: None,
             par_skip: (0, 0),
             par_pool: super::par::Pool::new(),
@@ -1538,6 +1543,194 @@ impl Cp {
                 s.cancel();
             }
         }
+    }
+
+    /// The commands after a label wait that blocked (`tune wait_ahead`):
+    /// from `from` with this command processor's registers, through
+    /// register writes, flushes, cache actions, end-of-pipe events, CP
+    /// writes and further label waits (what a stage reads is checked again
+    /// when it is used, `ahead::take`), up to any other control packet, the
+    /// buffer's end or WAIT_SCAN_MAX commands. A synchronization-free run
+    /// long enough for the parallel workers ends it before its first
+    /// command (they prepare their own). The stages are prepared by this
+    /// command processor while it waits (`wait`), not handed to workers.
+    fn scan_through(&mut self, f: &Fetched, from: u64, end: u64) -> Vec<AheadCmd> {
+        use super::ahead::{END_ARGS, END_BUFFER, END_HEADER, END_INVALID, END_MAX, END_PREDICATED};
+        const WAIT_SCAN_MAX: usize = 1024;
+        let t0 = Instant::now();
+        // Runs this command processor would split among parallel workers.
+        let par_min = if f.words.is_empty() && !super::capture::capturing() && (if self.compute { super::tune::par_compute() > 0 } else { super::par::workers() > 0 }) {
+            (if self.compute { super::tune::par_min_compute() } else { super::tune::par_min() } as usize).max(48)
+        } else {
+            usize::MAX
+        };
+        let mut why = END_BUFFER;
+        let (mut sh, mut ctx) = std::mem::take(&mut self.scan_regs);
+        sh.clear();
+        sh.extend_from_slice(&self.regs.sh);
+        ctx.clear();
+        ctx.extend_from_slice(&self.regs.ctx);
+        let mut draw_base = self.draw_indirect_base;
+        let mut cmds: Vec<AheadCmd> = Vec::new();
+        // The synchronization-free run being scanned: its first command's
+        // index and its commands.
+        let (mut run_first, mut run_len) = (0usize, 0usize);
+        let mut cur = from;
+        while cur < end {
+            if cmds.len() >= WAIT_SCAN_MAX {
+                why = END_MAX;
+                break;
+            }
+            if !valid(cur, 4) {
+                why = END_INVALID;
+                break;
+            }
+            let h = f.rd(cur);
+            match h >> 30 {
+                3 => {}
+                2 => {
+                    cur += 4;
+                    continue;
+                }
+                _ => {
+                    why = END_HEADER;
+                    break;
+                }
+            }
+            let count = (h >> 16) & 0x3FFF;
+            if count == 0x3FFF {
+                cur += 4;
+                continue;
+            }
+            // Predicated packets may be skipped at execution.
+            if h & 1 != 0 {
+                why = END_PREDICATED;
+                break;
+            }
+            let opcode = (h >> 8) & 0xFF;
+            let n = count as u64 + 1;
+            let next = cur + 4 * (n + 1);
+            if next > end || !valid(cur, 4 * (n + 1)) {
+                why = END_BUFFER;
+                break;
+            }
+            let at = cur;
+            let p = |i: u64| f.rd(at + 4 * (1 + i));
+            let set = |v: &mut Vec<u32>, first: u32| {
+                for i in 1..n {
+                    if let Some(r) = v.get_mut((first + (i - 1) as u32) as usize) {
+                        *r = p(i);
+                    }
+                }
+            };
+            let mut command: Option<[Option<super::shaders::StageRegs>; 2]> = None;
+            let mut wave64 = true;
+            let mut sync = false;
+            match opcode {
+                op::NOP => {
+                    // Private packets (flips, branches, draws, state) end
+                    // the scan; debug markers do not.
+                    if n >= 2 && p(0) == DS_MAGIC && !matches!(p(1), pop::PUSH_MARKER | pop::SET_MARKER | pop::POP_MARKER) {
+                        why = 0x100 + (p(1) as usize).min(0x2F);
+                        break;
+                    }
+                }
+                // GPU-side synchronization, CP writes and label waits:
+                // passed (they end synchronization-free runs).
+                op::EVENT_WRITE | op::ACQUIRE_MEM | op::RELEASE_MEM | op::WRITE_DATA | op::WAIT_REG_MEM | op::WAIT_REG_MEM64 => sync = true,
+                op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX | op::LOAD_UCONFIG_REG | op::INDEX_TYPE | op::INDEX_BASE | op::INDEX_BUFFER_SIZE | op::NUM_INSTANCES | op::CONTEXT_CONTROL => {}
+                op::SET_CONTEXT_REG | op::SET_CONTEXT_REG_INDEX => set(&mut ctx, p(0) & 0xFFFF),
+                op::SET_SH_REG | op::SET_SH_REG_INDEX => set(&mut sh, p(0) & 0xFFFF),
+                op::LOAD_CONTEXT_REG_INDEX | op::LOAD_SH_REG_INDEX => {
+                    // As `load_pairs`: memory holds {offset, value} pairs.
+                    let (a, count) = (addr64(p(0), p(1)), p(2) as u64);
+                    if count > 0 && !valid(a, 8 * count) {
+                        why = END_ARGS;
+                        break;
+                    }
+                    let v = if opcode == op::LOAD_CONTEXT_REG_INDEX { &mut ctx } else { &mut sh };
+                    for i in 0..count {
+                        let (o, val) = unsafe { (rd32(a + 8 * i), rd32(a + 8 * i + 4)) };
+                        if let Some(r) = v.get_mut((o & 0xFFFF) as usize) {
+                            *r = val;
+                        }
+                    }
+                }
+                op::SET_BASE => {
+                    if p(0) != 2 {
+                        draw_base = addr64(p(1), p(2));
+                    }
+                }
+                op::DRAW_INDEX_2 | op::DRAW_INDEX_AUTO | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT => {
+                    if matches!(opcode, op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT) {
+                        // As `packet` does: the base vertex and start instance
+                        // go to the user SGPRs the packet names.
+                        let a = draw_base + p(0) as u64;
+                        let (bytes, k) = if opcode == op::DRAW_INDEX_INDIRECT { (20, 3) } else { (16, 2) };
+                        if !valid(a, bytes) {
+                            why = END_ARGS;
+                            break;
+                        }
+                        let (bv, si) = unsafe { (rd32(a + 4 * k), rd32(a + 4 * (k + 1))) };
+                        let (vtx_loc, inst_loc) = (p(1) & 0xFFFF, p(1) >> 16);
+                        let inst_loc = if inst_loc != 0 {
+                            inst_loc
+                        } else {
+                            let ngg = super::shaders::ngg_addr_of(&ScanRegs { sh: &sh, ctx: &ctx });
+                            crate::hle::libs::agc::instance_offset_slot(ngg).map_or(0, |s| 0x8C + s)
+                        };
+                        if vtx_loc != 0 {
+                            if let Some(r) = sh.get_mut(vtx_loc as usize) {
+                                *r = bv;
+                            }
+                        }
+                        if inst_loc != 0 {
+                            if let Some(r) = sh.get_mut(inst_loc as usize) {
+                                *r = si;
+                            }
+                        }
+                    }
+                    let view = ScanRegs { sh: &sh, ctx: &ctx };
+                    let ps = super::shaders::ps_addr_of(&view);
+                    command = Some([
+                        Some(super::shaders::StageRegs::capture(super::shaders::StageKind::Vertex, &view)),
+                        (ps != 0).then(|| super::shaders::StageRegs::capture(super::shaders::StageKind::Pixel, &view)),
+                    ]);
+                }
+                op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT => {
+                    let initiator = if opcode == op::DISPATCH_DIRECT { p(3) } else if n >= 3 { p(2) } else { p(1) };
+                    wave64 = initiator & (1 << 15) == 0;
+                    let view = ScanRegs { sh: &sh, ctx: &ctx };
+                    command = Some([Some(super::shaders::StageRegs::capture(super::shaders::StageKind::Compute, &view)), None]);
+                }
+                _ => {
+                    why = opcode as usize;
+                    break;
+                }
+            }
+            if sync {
+                if run_len >= par_min {
+                    break;
+                }
+                run_len = 0;
+            }
+            if let Some(stages) = command {
+                if run_len == 0 {
+                    run_first = cmds.len();
+                }
+                run_len += 1;
+                let stages = stages.map(|r| r.map(|r| super::ahead::Slot::new(r, wave64)));
+                cmds.push(AheadCmd { at, stages });
+            }
+            cur = next;
+        }
+        // A run the workers will record: its commands are theirs.
+        if run_len >= par_min {
+            cmds.truncate(run_first);
+        }
+        self.scan_regs = (sh, ctx);
+        super::ahead::note_wait_scan(cmds.len(), why, t0.elapsed().as_nanos() as u64);
+        cmds
     }
 
     /// Scans the packets from `from` to the end of the synchronization-free
@@ -2333,6 +2526,9 @@ impl Cp {
                         | op::CONTEXT_CONTROL
                         | op::SET_BASE
                 )
+                // Preparations made past GPU-side synchronization, CP writes
+                // and label waits (`scan_through`) are checked when used.
+                && !matches!(opcode, op::EVENT_WRITE | op::ACQUIRE_MEM | op::RELEASE_MEM | op::WRITE_DATA | op::WAIT_REG_MEM | op::WAIT_REG_MEM64)
             {
                 self.drop_ahead();
             }
@@ -2371,7 +2567,13 @@ impl Cp {
             };
             let t = class_start(classes && opcode != op::INDIRECT_BUFFER);
             let ta = class_start(acb_ops && opcode != op::INDIRECT_BUFFER);
+            // A label wait that blocks prepares the stages after it meanwhile
+            // (`tune wait_ahead`).
+            if matches!(opcode, op::WAIT_REG_MEM | op::WAIT_REG_MEM64) && !f.live && self.exec.is_some() && super::tune::wait_ahead_for(self.compute) {
+                self.wait_ctx = Some((f.clone(), next, end));
+            }
             let flow = self.packet(opcode, h, cur, n, &p);
+            self.wait_ctx = None;
             class_end(class, t);
             acb_op_end(opcode, ta);
             if command {
@@ -3156,9 +3358,33 @@ impl Cp {
             let g = PROMISE_GEN.load(Ordering::Acquire);
             promises_seen.replace(g) != g
         };
-        let r = self.poll_until(at, &what, || {
-            hit.load(Ordering::SeqCst) || compare(func, read() & mask, reference & mask) || (use_promise && promises_moved() && promised(a, wide, func, mask, reference).is_some())
-        });
+        // The stages of the commands after this wait are prepared meanwhile
+        // (`tune wait_ahead`; checked when used as any made ahead), those
+        // of an earlier wait's scan first.
+        let mut pending: Vec<Arc<super::ahead::Slot>> = Vec::new();
+        if let Some((f, from, end)) = self.wait_ctx.take() {
+            if self.ahead.is_empty() {
+                let cmds = self.scan_through(&f, from, end);
+                self.ahead.extend(cmds);
+            }
+            pending = self.ahead.iter().flat_map(|c| c.stages.iter().flatten().cloned()).collect();
+        }
+        let mut next_slot = 0usize;
+        let mut work = || {
+            while next_slot < pending.len() {
+                next_slot += 1;
+                if super::ahead::prepare_here(&pending[next_slot - 1]) {
+                    return true;
+                }
+            }
+            false
+        };
+        let r = self.poll_until_with(
+            at,
+            &what,
+            || hit.load(Ordering::SeqCst) || compare(func, read() & mask, reference & mask) || (use_promise && promises_moved() && promised(a, wide, func, mask, reference).is_some()),
+            &mut work,
+        );
         {
             let by = last_write(a).map(|w| w.0).unwrap_or_else(|| "cpu".into());
             tw.end(&self.name, || format!("wait: label {a:#x} (written by {by})"));
@@ -3197,6 +3423,12 @@ impl Cp {
 
     /// Spins (then sleeps) until `cond`; reports long waits once.
     fn poll_until(&mut self, at: u64, what: &str, cond: impl Fn() -> bool) -> Flow {
+        self.poll_until_with(at, what, cond, &mut || false)
+    }
+
+    /// `poll_until`, calling `work` between the checks while it finds
+    /// something to do (it returns whether it did).
+    fn poll_until_with(&mut self, at: u64, what: &str, cond: impl Fn() -> bool, work: &mut dyn FnMut() -> bool) -> Flow {
         let start = Instant::now();
         let mut reported = false;
         set_state(&self.name, what.to_string());
@@ -3208,6 +3440,9 @@ impl Cp {
             }
             if super::replay::force_wait(at, start, what) {
                 break;
+            }
+            if work() {
+                continue;
             }
             spins += 1;
             if spins < 200 {
