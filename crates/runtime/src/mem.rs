@@ -50,15 +50,13 @@ pub struct Vma {
     pub phys: u64,
     pub mtype: i32,
     pub name: String,
-    /// Section-backed memory (`sections`): the alias slot of its pages
-    /// (NO_SLOT: none) and, for memory other than direct, its offset in the
-    /// anonymous section.
-    pub slot: u8,
+    /// Section-backed memory (`sections`): the alias slots holding alias
+    /// views of its pages that it references (bit per slot: the slot its
+    /// mapping took, and slots `bridge_aliases` added) and, for memory other
+    /// than direct, its offset in the anonymous section.
+    pub slots: u8,
     pub off: u64,
 }
-
-/// `Vma::slot` without an alias.
-pub const NO_SLOT: u8 = u8::MAX;
 /// The anonymous section's size (`sections`): flexible memory, modules and
 /// runtime-owned guest memory.
 const ANON_SIZE: u64 = 4 << 30;
@@ -639,6 +637,7 @@ fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
             }
         }
     }
+    let _arm = crate::gpu::resident::remap_guard();
     let p = unsafe { VirtualAlloc(addr as _, size as usize, MEM_COMMIT, win_prot(prot)) };
     crate::gpu::resident::settled(addr, size);
     if p.is_null() { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
@@ -838,6 +837,7 @@ fn host_decommit(addr: u64, size: u64) {
         return;
     }
     let _readers_out = GUEST_READERS.write();
+    let _arm = crate::gpu::resident::remap_guard();
     unsafe {
         VirtualFree(addr as _, size as usize, MEM_DECOMMIT);
     }
@@ -848,6 +848,7 @@ pub fn host_protect(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_PROTECT);
     let mut old = 0u32;
     let _readers_out = GUEST_READERS.write();
+    let _arm = crate::gpu::resident::remap_guard();
     let ok = unsafe { VirtualProtect(addr as _, size as usize, win_prot(prot), &mut old) };
     // Again after the change: a take in between may have armed pages the
     // new protection then overrode (`resident::settled`).
@@ -873,12 +874,13 @@ fn trace_map(op: &str, start: u64, end: u64, detail: std::fmt::Arguments) {
 }
 
 /// Maps the views of a new mapping (`sections`): the guest view and its
-/// alias. Returns (alias slot, anonymous-section offset).
+/// alias. Returns (alias slots, as `Vma::slots`; anonymous-section offset).
 fn section_commit(addr: u64, size: u64, kind: VmaKind, prot: u32, phys: u64) -> Result<(u8, u64), MemError> {
     use crate::sections::{self as sec, Sec};
     crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_COMMIT);
     repaged(addr, size);
     let (which, off) = if kind == VmaKind::Direct { (Sec::Dmem, phys) } else { (Sec::Anon, sec::anon_alloc(size).ok_or(MemError::NoSpace)?) };
+    let _arm = crate::gpu::resident::remap_guard();
     if let Err(e) = sec::map_new_view(addr, size, which, off, win_prot(prot)) {
         crate::warn!("mem: {e}");
         if which == Sec::Anon {
@@ -886,15 +888,15 @@ fn section_commit(addr: u64, size: u64, kind: VmaKind, prot: u32, phys: u64) -> 
         }
         return Err(MemError::HostFailure(0));
     }
-    let slot = match sec::map_alias(addr, size, which, off) {
-        Ok(s) => s,
+    let slots = match sec::map_alias(addr, size, which, off) {
+        Ok(s) => 1u8 << s,
         Err(e) => {
             crate::warn!("mem: {e} (the GPU cannot import it)");
-            NO_SLOT
+            0
         }
     };
     crate::gpu::resident::settled(addr, size);
-    Ok((slot, if which == Sec::Anon { off } else { 0 }))
+    Ok((slots, if which == Sec::Anon { off } else { 0 }))
 }
 
 /// Unmaps the views of mapping `v` (`sections`): its guest view now, its
@@ -904,17 +906,63 @@ fn section_release(v: &Vma) {
     repaged(v.start, v.size);
     {
         let _readers_out = GUEST_READERS.write();
+        let _arm = crate::gpu::resident::remap_guard();
         if let Err(e) = crate::sections::unmap_view(v.start) {
             crate::warn!("mem: {e}");
         }
+        crate::gpu::resident::settled(v.start, v.size);
     }
-    crate::gpu::resident::settled(v.start, v.size);
-    if v.slot != NO_SLOT {
-        crate::sections::alias_unref(v.start, v.size, v.slot, crate::gpu::imports_may_cover);
+    for slot in 0..crate::sections::ALIAS_SLOTS as u8 {
+        if v.slots & (1 << slot) != 0 {
+            crate::sections::alias_unref(v.start, v.size, slot, crate::gpu::imports_may_cover);
+        }
     }
     if v.kind != VmaKind::Direct {
         crate::sections::anon_free(v.off, v.size);
     }
+}
+
+/// Alias views mapped by `bridge_aliases`.
+pub static BRIDGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Makes one alias slot cover guest [start, end) without a gap (`sections`;
+/// a GPU import is of one slot's alias views): a binding over mappings whose
+/// aliases lie in different slots (a mapping takes another slot while an
+/// older alias at its addresses is still referenced or imported) could not
+/// be imported (24,448 such bindings in tour 20261015-163640, bound as zeros
+/// or left out). Each mapping there without an alias in the first slot that
+/// is free or covered over all of them gets one, referenced like its first.
+/// Returns that slot.
+pub fn bridge_aliases(start: u64, end: u64) -> Option<u8> {
+    use crate::sections::{self as sec, Sec};
+    let mut st = MEM.lock();
+    let vmas = st.overlapping(start, end);
+    let mut p = start;
+    for v in &vmas {
+        if v.start > p || v.kind == VmaKind::Reserved {
+            return None;
+        }
+        p = v.end();
+    }
+    if p < end {
+        return None;
+    }
+    let slot = (0..sec::ALIAS_SLOTS as u8).find(|&slot| vmas.iter().all(|v| sec::alias_covers(v.start, v.size, slot) || sec::alias_free(v.start, v.size, slot)))?;
+    for v in &vmas {
+        if sec::alias_covers(v.start, v.size, slot) {
+            continue;
+        }
+        let (which, off) = if v.kind == VmaKind::Direct { (Sec::Dmem, v.phys) } else { (Sec::Anon, v.off) };
+        if let Err(e) = sec::map_alias_in(v.start, v.size, which, off, slot) {
+            crate::warn!("mem: bridging aliases for {start:#x}..{end:#x}: {e}");
+            return None;
+        }
+        if let Some(m) = st.vmas.get_mut(&v.start) {
+            m.slots |= 1 << slot;
+        }
+        BRIDGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    Some(slot)
 }
 
 /// Splits the guest view of mapping `v` at `at` (`sections`): views cannot
@@ -927,6 +975,7 @@ fn section_split(v: &Vma, at: u64, why: usize) {
     let (which, off) = if v.kind == VmaKind::Direct { (Sec::Dmem, v.phys) } else { (Sec::Anon, v.off) };
     crate::gpu::track::remapped(v.start, v.size, crate::gpu::track::REMAP_PROTECT);
     let _readers_out = GUEST_READERS.write();
+    let _arm = crate::gpu::resident::remap_guard();
     sec::split_begin(v.start, v.end(), why);
     let lo = at - v.start;
     let r = sec::unmap_view(v.start)
@@ -1085,10 +1134,10 @@ impl MemState {
         if !existing.is_empty() {
             self.unmap_range_for(addr, addr + size, crate::sections::SPLIT_MAP_OVER);
         }
-        let (mut slot, mut off) = (NO_SLOT, 0);
+        let (mut slots, mut off) = (0u8, 0);
         if kind != VmaKind::Reserved {
             if crate::sections::on() {
-                (slot, off) = section_commit(addr, size, kind, prot, phys)?;
+                (slots, off) = section_commit(addr, size, kind, prot, phys)?;
             } else {
                 host_commit(addr, size, prot)?;
             }
@@ -1131,7 +1180,7 @@ impl MemState {
         if kind == VmaKind::Flexible {
             self.flexible_used += size;
         }
-        self.vmas.insert(addr, Vma { start: addr, size, kind, prot, phys, mtype, name: name.to_string(), slot, off });
+        self.vmas.insert(addr, Vma { start: addr, size, kind, prot, phys, mtype, name: name.to_string(), slots, off });
         bump_gen(addr, addr + size);
         trace_map("map", addr, addr + size, format_args!("{kind:?} prot {prot:#x} phys {phys:#x} '{name}'"));
         Ok(addr)

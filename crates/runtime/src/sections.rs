@@ -419,22 +419,45 @@ pub fn map_alias(va: u64, n: u64, sec: Sec, off: u64) -> Result<u8, String> {
     let (mut order, rest): (Vec<u8>, Vec<u8>) = (0..ALIAS_SLOTS as u8).partition(|&sl| adjoins(sl));
     order.extend(rest);
     for slot in order {
-        let busy = STATE.lock().as_ref().is_some_and(|s| {
-            s.aliases.range(..(slot, va + n)).next_back().is_some_and(|(&(sl, st), a)| sl == slot && st + a.size > va)
-        });
-        if busy {
-            continue;
+        if map_alias_in(va, n, sec, off, slot).is_ok() {
+            return Ok(slot);
         }
-        let at = alias_of(va, slot);
-        if map_view(at, n, sec, off, PAGE_READWRITE).is_err() {
-            continue;
-        }
-        if let Some(s) = STATE.lock().as_mut() {
-            s.aliases.insert((slot, va), Alias { size: n, refs: n });
-        }
-        return Ok(slot);
     }
     Err(format!("no free alias slot for {va:#x}+{n:#x}"))
+}
+
+/// Maps the alias of guest [va, va+n) (`sec` at `off`) in `slot`, when no
+/// alias view there overlaps it.
+pub fn map_alias_in(va: u64, n: u64, sec: Sec, off: u64, slot: u8) -> Result<(), String> {
+    if !alias_free(va, n, slot) {
+        return Err(format!("alias slot {slot} is taken at {va:#x}+{n:#x}"));
+    }
+    map_view(alias_of(va, slot), n, sec, off, PAGE_READWRITE)?;
+    if let Some(s) = STATE.lock().as_mut() {
+        s.aliases.insert((slot, va), Alias { size: n, refs: n });
+    }
+    Ok(())
+}
+
+/// Whether no alias view in `slot` overlaps guest [a, a+n).
+pub fn alias_free(a: u64, n: u64, slot: u8) -> bool {
+    STATE.lock().as_ref().is_none_or(|s| !s.aliases.range(..(slot, a + n)).next_back().is_some_and(|(&(sl, st), al)| sl == slot && st + al.size > a))
+}
+
+/// Whether alias views in `slot` cover guest [a, a+n) without a gap.
+pub fn alias_covers(a: u64, n: u64, slot: u8) -> bool {
+    STATE.lock().as_ref().is_some_and(|s| covers(s, slot, a, n))
+}
+
+fn covers(s: &State, slot: u8, a: u64, n: u64) -> bool {
+    let mut p = a;
+    while p < a + n {
+        match s.aliases.range(..=(slot, p)).next_back() {
+            Some((&(sl, st), al)) if sl == slot && st <= p && p < st + al.size => p = st + al.size,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// The guest bytes [va, va+n) no longer map through their alias in `slot`:
@@ -484,16 +507,7 @@ pub fn retry_deferred(imported: impl Fn(u64, u64) -> bool) {
 pub fn alias_slot_for(a: u64, n: u64) -> Option<u8> {
     let g = STATE.lock();
     let s = g.as_ref()?;
-    (0..ALIAS_SLOTS as u8).find(|&slot| {
-        let mut p = a;
-        while p < a + n {
-            match s.aliases.range(..=(slot, p)).next_back() {
-                Some((&(sl, st), al)) if sl == slot && st <= p && p < st + al.size => p = st + al.size,
-                _ => return false,
-            }
-        }
-        true
-    })
+    (0..ALIAS_SLOTS as u8).find(|&slot| covers(s, slot, a, n))
 }
 
 #[cfg(test)]
@@ -530,6 +544,14 @@ mod tests {
         assert_eq!(alias_slot_for(base + (1 << 20), 4 * k), Some(slot));
         assert_eq!(alias_slot_for(base + (1 << 20), k), Some(slot.min(slot2)));
         assert_eq!(alias_slot_for(base + (1 << 20), 5 * k), None);
+        // Bridging: an alias of the next view in the first one's slot makes
+        // that slot cover both.
+        assert!(!alias_free(base + (1 << 20), k, slot));
+        assert!(alias_free(base + (1 << 20) + 4 * k, k, slot));
+        map_alias_in(base + (1 << 20) + 4 * k, k, Sec::Dmem, 4 * k, slot).unwrap();
+        assert!(alias_covers(base + (1 << 20) + 4 * k, k, slot));
+        assert!(map_alias_in(base + (1 << 20) + 4 * k, k, Sec::Dmem, 4 * k, slot).is_err(), "taken");
+        assert_eq!(alias_slot_for(base + (1 << 20), 5 * k), Some(slot));
         // Unmapped placeholders coalesce for a larger view.
         unmap_view(base + (1 << 20)).unwrap();
         unmap_view(base + (1 << 20) + k).unwrap();

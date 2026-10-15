@@ -793,7 +793,7 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     if crate::sections::on() {
         let slot = crate::sections::alias_slot_for(start, end - start).or_else(|| {
             (start, end) = ((base & !(a - 1)).max(vs), (base + size).next_multiple_of(a).min(ve));
-            crate::sections::alias_slot_for(start, end - start)
+            crate::sections::alias_slot_for(start, end - start).or_else(|| crate::mem::bridge_aliases(start, end))
         });
         let Some(slot) = slot else {
             ALIAS_MISSES.fetch_add(1, Ordering::Relaxed);
@@ -5174,6 +5174,10 @@ impl Exec {
                 }
                 Page::Refuse => {
                     why = Some(2);
+                    break;
+                }
+                Page::GpuWritten => {
+                    why = Some(8);
                     break;
                 }
                 Page::Upload => need.push(p),

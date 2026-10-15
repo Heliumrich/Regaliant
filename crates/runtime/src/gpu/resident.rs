@@ -71,6 +71,10 @@ const ST_BUSY: u8 = 4;
 pub const ST_HOST: u8 = 8;
 /// Written by the CPU in nearby frames again and again: never armed.
 pub const ST_VOLATILE: u8 = 16;
+/// GPU work wrote it in guest memory (`gpu_wrote`; cleared by remaps): read
+/// in place rather than uploaded again after every such write (a binding of
+/// it is refused; `DS_RES_GPU_PAGES=1` keeps such pages in the mirror).
+const ST_GPU_W: u8 = 32;
 /// Taken since its last write (`take_written`; cleared by write faults, file
 /// reads, remaps).
 const ST_CLEAN: u8 = 64;
@@ -160,7 +164,9 @@ static ON: AtomicBool = AtomicBool::new(false);
 /// protection calls and ns, mirror pages backed, uploads, readbacks, resets,
 /// fault races, pages claimed for upload, pages made volatile, pages made
 /// host class, bindings served from the mirror, and refusals by REFUSE_NAMES.
-static STATS: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
+static STATS: [AtomicU64; 21] = [const { AtomicU64::new(0) }; 21];
+/// Mirror pages made stale by GPU writes in guest memory (`gpu_wrote`).
+const S_GPU_INVAL: usize = 20;
 /// Volatile pages armed again after their stay (`take_written`).
 const S_VOL_REARMED: usize = 19;
 /// Pages left unarmed by `arm` for their protection (neither plain
@@ -179,12 +185,12 @@ const S_HOSTED: usize = 11;
 const S_BINDS: usize = 12;
 const S_BIND_PAGES: usize = 13;
 /// Why a read-only binding was not served from the mirror (`refused`).
-pub const REFUSE_NAMES: [&str; 8] = ["outside the mirror or too large", "GPU or CP writes pending", "host or volatile pages", "another batch's upload pending", "imported pages", "staging full", "arming failed", "mirror pages not bound"];
-static REFUSED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+pub const REFUSE_NAMES: [&str; 9] = ["outside the mirror or too large", "GPU or CP writes pending", "host or volatile pages", "another batch's upload pending", "imported pages", "staging full", "arming failed", "mirror pages not bound", "GPU-written pages"];
+static REFUSED: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 /// Counts a refusal (`REFUSE_NAMES` index).
 pub fn refused(why: usize) {
-    REFUSED[why.min(7)].fetch_add(1, Ordering::Relaxed);
+    REFUSED[why.min(8)].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Counts a binding served from the mirror and its pages.
@@ -383,6 +389,8 @@ pub fn arm(base: u64, len: u64) -> u64 {
 /// for write tracking).
 fn arm_with(base: u64, len: u64, extra: u8) -> u64 {
     use windows_sys::Win32::System::Memory::PAGE_READONLY;
+    // No mapping change meanwhile (`ARM_LOCK`).
+    let _arming = ARM_LOCK.read();
     let (lo, hi) = (base & !(PAGE - 1), (base + len).next_multiple_of(PAGE));
     let mut armed = 0;
     let mut p = lo;
@@ -530,7 +538,7 @@ pub fn remapped(base: u64, len: u64) {
                 std::hint::spin_loop();
                 continue;
             }
-            if cur & (ST_ARMED | ST_VALID | ST_CLEAN | ST_GUEST_RO) == 0 || s.compare_exchange(cur, cur & !(ST_ARMED | ST_VALID | ST_CLEAN | ST_GUEST_RO), Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if cur & (ST_ARMED | ST_VALID | ST_CLEAN | ST_GUEST_RO | ST_GPU_W) == 0 || s.compare_exchange(cur, cur & !(ST_ARMED | ST_VALID | ST_CLEAN | ST_GUEST_RO | ST_GPU_W), Ordering::AcqRel, Ordering::Acquire).is_ok() {
                 break;
             }
         }
@@ -542,12 +550,28 @@ pub fn remapped(base: u64, len: u64) {
     STATS[S_RESETS].fetch_add(1, Ordering::Relaxed);
 }
 
-/// A mapping or protection change of [base, base+len) is done: its page
-/// states are reset again. `remapped` runs before the change (with the other
-/// caches' invalidations); a take on another thread in between may have
-/// armed pages or marked them unwritable, which the change then overrode
-/// (a page marked armed and clean but writable would hide CPU writes from
-/// every later take).
+/// Arming and the memory manager's mapping changes exclude each other: a
+/// change holds it exclusively from just before the operating-system call
+/// until its pages' states are reset after it (`remap_guard`, `settled`);
+/// `arm_with` holds it shared. Without it a page armed between the change
+/// and the reset kept its read-only protection with its state reset, and
+/// the guest's next write to it was not ours to handle (fatal, gate window
+/// 20261015-163016).
+static ARM_LOCK: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
+
+/// Held by the memory manager across a mapping or protection change of
+/// guest memory and the `settled` after it (taken after `mem::GUEST_READERS`
+/// where both are; arming threads may hold that one shared).
+pub fn remap_guard() -> parking_lot::RwLockWriteGuard<'static, ()> {
+    ARM_LOCK.write()
+}
+
+/// A mapping or protection change of [base, base+len) is done (called under
+/// `remap_guard`): its page states are reset again. `remapped` runs before
+/// the change (with the other caches' invalidations); a take on another
+/// thread in between may have armed pages or marked them unwritable, which
+/// the change then overrode (a page marked armed and clean but writable
+/// would hide CPU writes from every later take).
 pub fn settled(base: u64, len: u64) {
     remapped(base, len);
 }
@@ -740,19 +764,23 @@ pub fn gpu_wrote(writes: &super::ranges::Ranges) {
     if !enabled() || writes.is_empty() {
         return;
     }
+    let mut stale = 0;
     for (a, n) in writes.iter() {
         let (lo, hi) = ((a & !(PAGE - 1)).max(MIRROR_BASE), a.saturating_add(n).next_multiple_of(PAGE).min(MIRROR_END));
         let mut p = lo;
         while p < hi {
             match chunk(p, false) {
                 Some(c) => {
-                    c.pages[idx(p)].fetch_and(!ST_VALID, Ordering::AcqRel);
+                    if c.pages[idx(p)].fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| Some((s & !ST_VALID) | ST_GPU_W)).is_ok_and(|s| s & ST_VALID != 0) {
+                        stale += 1;
+                    }
                     p += PAGE;
                 }
                 None => p = ((p >> CHUNK_SHIFT) + 1) << CHUNK_SHIFT,
             }
         }
     }
+    STATS[S_GPU_INVAL].fetch_add(stale, Ordering::Relaxed);
 }
 
 /// What a read-only binding may do with a page (`page`).
@@ -766,6 +794,15 @@ pub enum Page {
     Upload,
     /// Host class, volatile or busy: not from the mirror.
     Refuse,
+    /// GPU work writes it in guest memory (`ST_GPU_W`): not from the mirror.
+    GpuWritten,
+}
+
+/// `DS_RES_GPU_PAGES=1`: pages GPU work writes in guest memory stay in the
+/// mirror (uploaded again after each such write; A/B).
+fn gpu_pages_kept() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("DS_RES_GPU_PAGES").ok().as_deref() == Some("1"))
 }
 
 /// The page holding `addr` for a read-only binding.
@@ -775,6 +812,9 @@ pub fn page(addr: u64) -> Page {
     let s = c.pages[i].load(Ordering::Acquire);
     if s & (ST_HOST | ST_VOLATILE | ST_BUSY) != 0 || c.writing[i].load(Ordering::Acquire) != 0 {
         return Page::Refuse;
+    }
+    if s & ST_GPU_W != 0 && !gpu_pages_kept() {
+        return Page::GpuWritten;
     }
     let seq = c.seqs[i].load(Ordering::Acquire);
     if seq == PENDING {
@@ -844,7 +884,9 @@ pub fn host_write_begin(base: u64, len: u64) {
     if !tracking() || len == 0 {
         return;
     }
-    let (lo, hi) = if enabled() {
+    // Residency alone arms only the mirror's span; section-backed memory's
+    // write tracking arms all guest memory.
+    let (lo, hi) = if enabled() && !crate::sections::on() {
         ((base & !(PAGE - 1)).max(MIRROR_BASE), base.saturating_add(len).next_multiple_of(PAGE).min(MIRROR_END))
     } else {
         (base & !(PAGE - 1), base.saturating_add(len).next_multiple_of(PAGE))
@@ -919,7 +961,9 @@ pub fn host_write_end(base: u64, len: u64) {
     if !tracking() || len == 0 {
         return;
     }
-    let (lo, hi) = if enabled() {
+    // Residency alone arms only the mirror's span; section-backed memory's
+    // write tracking arms all guest memory.
+    let (lo, hi) = if enabled() && !crate::sections::on() {
         ((base & !(PAGE - 1)).max(MIRROR_BASE), base.saturating_add(len).next_multiple_of(PAGE).min(MIRROR_END))
     } else {
         (base & !(PAGE - 1), base.saturating_add(len).next_multiple_of(PAGE))
@@ -1346,7 +1390,7 @@ pub fn status() -> String {
         }
         let t: Vec<u64> = TAKE_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         return format!(
-            "    write tracking by protection (sections): {} takes visited {} pages ({} region queries), reported {} ({} of them unarmable: once per epoch), armed {} ({} left for other protections); {} write faults ({} races), {} turned volatile ({} armed again after their stay), {} host class; {} arming calls ({:.1} us each), {} disarming calls ({:.1} us each); {} host writes ({} pages); {} remaps; {}; {:.0} MiB zeroed for new mappings (direct {:.0}); {} imports without an alias slot; kernel-mode accesses retried {} ({} retries, {} failed for good)\n",
+            "    write tracking by protection (sections): {} takes visited {} pages ({} region queries), reported {} ({} of them unarmable: once per epoch), armed {} ({} left for other protections); {} write faults ({} races), {} turned volatile ({} armed again after their stay), {} host class; {} arming calls ({:.1} us each), {} disarming calls ({:.1} us each); {} host writes ({} pages); {} remaps; {}; {:.0} MiB zeroed for new mappings (direct {:.0}); {} imports without an alias slot ({} alias views bridged); kernel-mode accesses retried {} ({} retries, {} failed for good)\n",
             t[0],
             t[3],
             t[4],
@@ -1370,6 +1414,7 @@ pub fn status() -> String {
             (crate::sections::zeroed().0 + crate::sections::zeroed().1) as f64 / (1u64 << 20) as f64,
             crate::sections::zeroed().0 as f64 / (1u64 << 20) as f64,
             super::exec::alias_misses(),
+            crate::mem::BRIDGES.load(Ordering::Relaxed),
             crate::mem::KERNEL_IO[0].load(Ordering::Relaxed),
             crate::mem::KERNEL_IO[1].load(Ordering::Relaxed),
             crate::mem::KERNEL_IO[2].load(Ordering::Relaxed)
@@ -1377,11 +1422,12 @@ pub fn status() -> String {
     }
     let refused: Vec<String> = REFUSE_NAMES.iter().zip(REFUSED.iter()).map(|(n, c)| format!("{n} {}", c.load(Ordering::Relaxed))).collect();
     format!(
-        "    residency ({}): {} bindings from the mirror ({} pages), {} pages uploaded; {} pages armed, {} write faults ({} races), {} volatile, {} host class; {} arming calls ({:.1} us each), {} disarming calls ({:.1} us each); {} host writes ({} pages); {} mirror pages backed, {} uploads, {} readbacks, {} remaps; refused: {}\n",
+        "    residency ({}): {} bindings from the mirror ({} pages), {} pages uploaded, {} made stale by GPU writes; {} pages armed, {} write faults ({} races), {} volatile, {} host class; {} arming calls ({:.1} us each), {} disarming calls ({:.1} us each); {} host writes ({} pages); {} mirror pages backed, {} uploads, {} readbacks, {} remaps; refused: {}\n",
         if enabled() { "on" } else { "off" },
         v[S_BINDS],
         v[S_BIND_PAGES],
         v[S_CLAIMED],
+        v[S_GPU_INVAL],
         v[S_ARMED],
         v[S_FAULTS],
         v[S_RACES],
