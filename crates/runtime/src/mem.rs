@@ -107,6 +107,9 @@ static PARKED: Mutex<BTreeMap<u64, Box<[u8]>>> = Mutex::new(BTreeMap::new());
 pub static PARK_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 /// Most bytes kept parked.
 const PARK_CAP: u64 = 4 << 30;
+/// Direct mappings whose address, size and physical offset are all 64 KiB
+/// aligned, 16 KiB aligned, or neither.
+static MAP_ALIGN: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 const PARK_PAGE: u64 = 4096;
 
 /// `DS_PHYS_CARRY=1`: unmapped direct memory keeps its contents (`PARKED`).
@@ -216,7 +219,10 @@ pub fn remap_status() -> String {
         DEFERRED_STATS[2].load(o),
         DEFERRED_LEN.load(o)
     )
-    .replace(" waiting)\n", &format!(" waiting){carry}\n"))
+    .replace(
+        " waiting)\n",
+        &format!(" waiting){carry}; direct mappings aligned to 64 KiB {}, to 16 KiB {}, less {}\n", MAP_ALIGN[0].load(o), MAP_ALIGN[1].load(o), MAP_ALIGN[2].load(o)),
+    )
 }
 
 /// Incremented whenever guest mappings or their protections change (inside
@@ -885,6 +891,11 @@ impl MemState {
         }
         if kind == VmaKind::Direct && phys_carry() {
             unpark(addr, phys, size, prot);
+        }
+        if kind == VmaKind::Direct {
+            // Alignment of direct mappings (64 KiB: what section views need).
+            let k = if (addr | size | phys) & 0xFFFF == 0 { 0 } else if (addr | size | phys) & 0x3FFF == 0 { 1 } else { 2 };
+            MAP_ALIGN[k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if kind == VmaKind::Direct {
             for v in self.vmas.values() {

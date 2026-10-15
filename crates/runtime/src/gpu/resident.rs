@@ -770,6 +770,96 @@ fn self_test() -> Result<String, String> {
     Ok(format!("2 write faults on 8 armed pages; {} KiB through the mirror and back", m.page >> 10))
 }
 
+/// Feasibility of section-backed guest memory (`DS_SECTION_TEST=1`, at the
+/// first GPU use): a 64 MiB pagefile section mapped as two views in
+/// placeholders; the GPU imports one view and fills parts of it while the
+/// other view shows the same pages, then while the other view is
+/// read-only. If imports of section views work and protecting one view
+/// leaves the GPU's writes through the other intact, guest memory could be
+/// protected for residency while the GPU imports an alias of it.
+pub fn section_test_maybe() {
+    if std::env::var("DS_SECTION_TEST").ok().as_deref() != Some("1") {
+        return;
+    }
+    match section_test() {
+        Ok(s) => crate::info!("section test passed: {s}"),
+        Err(e) => crate::error!("section test failed: {e}"),
+    }
+}
+
+fn section_test() -> Result<String, String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, MapViewOfFile3, UnmapViewOfFile2, VirtualAlloc2, VirtualFree, VirtualProtect, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
+        MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let size: usize = 64 << 20;
+    let c = ctx();
+    unsafe {
+        let sec = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, size as u32, std::ptr::null());
+        if sec.is_null() {
+            return Err(format!("CreateFileMappingW: {}", GetLastError()));
+        }
+        let base = VirtualAlloc2(std::ptr::null_mut(), std::ptr::null(), 2 * size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0);
+        if base.is_null() {
+            CloseHandle(sec);
+            return Err(format!("VirtualAlloc2 placeholder: {}", GetLastError()));
+        }
+        if VirtualFree(base, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0 {
+            return Err(format!("splitting the placeholder: {}", GetLastError()));
+        }
+        let a = MapViewOfFile3(sec, GetCurrentProcess(), base, 0, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
+        let b = MapViewOfFile3(sec, GetCurrentProcess(), (base as usize + size) as _, 0, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
+        if a.Value.is_null() || b.Value.is_null() {
+            return Err(format!("MapViewOfFile3: {}", GetLastError()));
+        }
+        let (pa, pb) = (a.Value as *mut u32, b.Value as *mut u32);
+        let r = (|| -> Result<String, String> {
+            // The two views share their pages.
+            std::ptr::write_volatile(pa.add(7), 0x1234_5678);
+            if std::ptr::read_volatile(pb.add(7)) != 0x1234_5678 {
+                return Err("the views do not share pages".into());
+            }
+            // The GPU imports view b and fills parts of it.
+            let (buf, mem, _) = c.import_host(pb as u64, size as u64, vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let fill = |off: u64, v: u32| one_off(|cmd| c.device.cmd_fill_buffer(cmd, buf, off, 1 << 20, v));
+            let check = |off: u64, v: u32| (0..(1 << 18)).step_by(997).all(|i| std::ptr::read_volatile(pa.add(off as usize / 4 + i)) == v);
+            let mut out = Vec::new();
+            let r = (|| -> Result<(), String> {
+                fill(0, 0xA5A5_A5A5)?;
+                if !check(0, 0xA5A5_A5A5) {
+                    return Err("view a does not show the GPU's fill of view b".into());
+                }
+                out.push("GPU writes to an imported view show in the other");
+                // View a read-only: the GPU keeps writing through view b.
+                let mut old = 0u32;
+                if VirtualProtect(pa as _, size, PAGE_READONLY, &mut old) == 0 {
+                    return Err(format!("VirtualProtect view a: {}", GetLastError()));
+                }
+                for k in 0..16u64 {
+                    fill((k + 1) << 20, 0x5A00_0000 + k as u32)?;
+                }
+                if !(0..16u64).all(|k| check((k + 1) << 20, 0x5A00_0000 + k as u32)) {
+                    return Err("GPU fills through view b missing in read-only view a".into());
+                }
+                VirtualProtect(pa as _, size, PAGE_READWRITE, &mut old);
+                out.push("16 GPU fills through view b while view a was read-only, no device loss");
+                Ok(())
+            })();
+            c.device.destroy_buffer(buf, None);
+            c.device.free_memory(mem, None);
+            r.map(|_| out.join("; "))
+        })();
+        UnmapViewOfFile2(GetCurrentProcess(), a, MEM_PRESERVE_PLACEHOLDER);
+        UnmapViewOfFile2(GetCurrentProcess(), b, MEM_PRESERVE_PLACEHOLDER);
+        VirtualFree(base, 0, MEM_RELEASE);
+        VirtualFree((base as usize + size) as _, 0, MEM_RELEASE);
+        CloseHandle(sec);
+        r
+    }
+}
+
 /// Status line.
 pub fn status() -> String {
     if !wanted() {
