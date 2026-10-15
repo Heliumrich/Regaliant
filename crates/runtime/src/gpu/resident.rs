@@ -251,8 +251,11 @@ fn protect_regions(a: u64, e: u64, prot: u32, need_rw: bool) -> bool {
 enum RegionKind {
     /// Committed, plain read-write.
     Rw,
-    /// The guest cannot write it (uncommitted, read-only, no access).
+    /// Committed, and the guest cannot write it (read-only, no access).
     NotWritable,
+    /// Not committed (reserved, placeholders, unmapped tiles of partially
+    /// resident textures): nothing to track.
+    Uncommitted,
     /// Anything else (guard, executable read-write).
     Other,
 }
@@ -265,10 +268,8 @@ fn region_kind(p: u64, e: u64) -> (u64, RegionKind) {
         return (e, RegionKind::Other);
     }
     let end = (info.BaseAddress as u64 + info.RegionSize as u64).min(e).max(p + PAGE);
-    // Uncommitted pages (unmapped tiles of partially resident textures) cannot
-    // be written either (a remap committing them clears the mark).
     let kind = if info.State != MEM_COMMIT {
-        RegionKind::NotWritable
+        RegionKind::Uncommitted
     } else if info.Protect == PAGE_READWRITE {
         RegionKind::Rw
     } else if matches!(info.Protect, PAGE_READONLY | PAGE_EXECUTE_READ | PAGE_NOACCESS | PAGE_EXECUTE) {
@@ -322,7 +323,13 @@ fn arm_with(base: u64, len: u64, extra: u8) -> u64 {
             while p < e {
                 let (r_end, kind) = region_kind(p, e);
                 let ok = kind == RegionKind::Rw && protect(p, r_end - p, PAGE_READONLY);
-                let mark = if ok { ST_ARMED | extra } else if kind == RegionKind::NotWritable { ST_GUEST_RO } else { 0 };
+                let mark = if ok {
+                    ST_ARMED | extra
+                } else if matches!(kind, RegionKind::NotWritable | RegionKind::Uncommitted) {
+                    ST_GUEST_RO
+                } else {
+                    0
+                };
                 let mut q = p;
                 while q < r_end {
                     if let Some(c) = chunk(q, false) {
@@ -513,7 +520,22 @@ pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
     let mut arm_from = None;
     let mut armed = 0;
     let mut p = lo;
+    // Uncommitted regions are skipped whole (write watching never reported
+    // them; partially resident textures span ~1 TiB of them): no pages to
+    // report, no table chunks made.
+    let mut region_end = lo;
     while p < hi {
+        if p >= region_end {
+            let (e, kind) = region_kind(p, hi);
+            region_end = e;
+            if kind == RegionKind::Uncommitted {
+                if let Some(a) = arm_from.take() {
+                    armed += arm_with(a, p - a, 0);
+                }
+                p = e;
+                continue;
+            }
+        }
         let c = chunk(p, true)?;
         let i = idx(p);
         let s = c.pages[i].load(Ordering::Acquire);
@@ -552,6 +574,29 @@ pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
     TAKE_STATS[1].fetch_add((out.len() - first) as u64, Ordering::Relaxed);
     TAKE_STATS[2].fetch_add(armed, Ordering::Relaxed);
     Some(())
+}
+
+/// GPU work writes `writes` of guest memory where it lives (in place
+/// through an import, a shadow's merge, a fill, a CP write): the mirror's
+/// copies of those pages are stale (with section-backed memory such pages
+/// may be in the mirror; the writes bypass the guest view's protection).
+pub fn gpu_wrote(writes: &super::ranges::Ranges) {
+    if !enabled() || writes.is_empty() {
+        return;
+    }
+    for (a, n) in writes.iter() {
+        let (lo, hi) = ((a & !(PAGE - 1)).max(MIRROR_BASE), a.saturating_add(n).next_multiple_of(PAGE).min(MIRROR_END));
+        let mut p = lo;
+        while p < hi {
+            match chunk(p, false) {
+                Some(c) => {
+                    c.pages[idx(p)].fetch_and(!ST_VALID, Ordering::AcqRel);
+                    p += PAGE;
+                }
+                None => p = ((p >> CHUNK_SHIFT) + 1) << CHUNK_SHIFT,
+            }
+        }
+    }
 }
 
 /// What a read-only binding may do with a page (`page`).

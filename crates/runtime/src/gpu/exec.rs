@@ -4775,6 +4775,7 @@ impl Exec {
         let writes = std::mem::take(&mut self.pending);
         self.pending_log.clear();
         INFLIGHT.note_ranges(seq, &writes);
+        super::resident::gpu_wrote(&writes);
         if super::tune::race_checks() {
             note_race_writes(seq, &writes);
             self.clear_open_writes(None);
@@ -5193,7 +5194,7 @@ impl Exec {
     fn resident_upload(&mut self, lo: u64, hi: u64, mbuf: vk::Buffer, need: &mut Vec<u64>) -> Option<usize> {
         use super::resident as res;
         // Imported pages cannot be armed: host class from now on.
-        if let Some((a, e)) = imported_overlap(lo, hi) {
+        if let Some((a, e)) = imported_overlap(lo, hi).filter(|_| !crate::sections::on()) {
             res::mark_host(a, e - a);
             return Some(4);
         }
@@ -7023,6 +7024,7 @@ impl Exec {
             super::precache::submitted(&b.shared, seq);
             super::resident::submitted(&b.res_pages, seq);
             INFLIGHT.note_ranges(seq, &b.writes);
+            super::resident::gpu_wrote(&b.writes);
             if super::tune::race_checks() {
                 note_race_writes(seq, &b.writes);
                 self.clear_open_writes(Some(&b.writes));
