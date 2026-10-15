@@ -147,7 +147,7 @@ fn with_snap<R>(f: impl FnOnce(&[(u64, u64)], &[(Arc<HomeBuf>, Arc<Shared>)]) ->
     RANGES.with(|c| {
         let mut c = c.borrow_mut();
         if c.0 != g {
-            let homes = HOMES.lock();
+            let homes = super::lockstat::HOMES.lock(&HOMES);
             c.1 = homes.iter().map(|h| (h.base, h.size)).collect();
             c.2 = homes.iter().map(|h| (h.buf.clone(), h.shared.clone())).collect();
             c.0 = g;
@@ -262,7 +262,7 @@ pub fn bind(base: u64, size: u64, written: bool, keep: &mut dyn FnMut(&Arc<HomeB
         }
         Fast::Slow => {}
     }
-    let mut g = HOMES.lock();
+    let mut g = super::lockstat::HOMES.lock(&HOMES);
     let h = g.iter_mut().find(|h| h.base <= base && base + size <= h.base + h.size)?;
     if h.shared.watched {
         let epoch = super::precache::epoch();
@@ -301,7 +301,7 @@ pub fn bind(base: u64, size: u64, written: bool, keep: &mut dyn FnMut(&Arc<HomeB
 /// The home whose buffer is `buf` (to keep it for later work), if it
 /// still exists.
 pub fn handle(buf: vk::Buffer) -> Option<Arc<HomeBuf>> {
-    with_snap(|_, s| s.iter().find(|(h, _)| h.buf == buf).map(|(h, _)| h.clone())).or_else(|| HOMES.lock().iter().find(|h| h.buf.buf == buf).map(|h| h.buf.clone()))
+    with_snap(|_, s| s.iter().find(|(h, _)| h.buf == buf).map(|(h, _)| h.clone())).or_else(|| super::lockstat::HOMES.lock(&HOMES).iter().find(|h| h.buf.buf == buf).map(|h| h.buf.clone()))
 }
 
 /// Counts a binding (BINDINGS, in batches per thread: one shared counter
@@ -341,7 +341,7 @@ pub fn copy_in_pending(base: u64, size: u64) -> bool {
             // A write-watched home not checked in this epoch: checked now
             // (pages the CPU wrote become dirty and wait for the caller's
             // in-order copy in).
-            let mut g = HOMES.lock();
+            let mut g = super::lockstat::HOMES.lock(&HOMES);
             let Some(h) = g.iter_mut().find(|h| h.base <= base && base + size <= h.base + h.size) else { return false };
             if h.shared.checked.load(Ordering::Acquire) != epoch {
                 check_cpu_writes(h);
@@ -354,7 +354,7 @@ pub fn copy_in_pending(base: u64, size: u64) -> bool {
 
 /// The homes overlapping [base, base+size) (diagnostics).
 pub fn describe(base: u64, size: u64) -> String {
-    let g = HOMES.lock();
+    let g = super::lockstat::HOMES.lock(&HOMES);
     let v: Vec<String> = g.iter().filter(|h| h.base < base + size && base < h.base + h.size).map(|h| format!("{:#x}+{:#x}", h.base, h.size)).collect();
     v.join(", ")
 }
@@ -614,7 +614,7 @@ pub fn watched_overlaps(base: u64, size: u64) -> bool {
 /// writes those parts back first; no other thread may record work that
 /// binds them).
 pub fn take_watched() -> Vec<(u64, u64, Arc<HomeBuf>, u64)> {
-    let mut g = HOMES.lock();
+    let mut g = super::lockstat::HOMES.lock(&HOMES);
     let mut v = Vec::new();
     let mut known = KNOWN.lock();
     for h in g.iter().filter(|h| h.shared.watched) {
@@ -681,7 +681,7 @@ fn create_with(b: u64, n: u64, watched: bool, what: &str) -> bool {
     if n > MAX || USED.load(Ordering::Relaxed) + n > BUDGET {
         return false;
     }
-    let mut g = HOMES.lock();
+    let mut g = super::lockstat::HOMES.lock(&HOMES);
     if g.iter().any(|h| h.base < e && b < h.base + h.size) {
         return false;
     }
@@ -727,7 +727,7 @@ pub fn stale_parts(base: u64, size: u64, taken: bool) -> Vec<(u64, u64, Arc<Home
     if !any() {
         return Vec::new();
     }
-    let mut g = HOMES.lock();
+    let mut g = super::lockstat::HOMES.lock(&HOMES);
     let mut v = Vec::new();
     for h in g.iter_mut() {
         if !(h.base < base + size && base < h.base + h.size) {
@@ -751,7 +751,7 @@ pub fn stale_parts(base: u64, size: u64, taken: bool) -> Vec<(u64, u64, Arc<Home
 pub fn any_stale(reads: &[(u64, u64)]) -> bool {
     any()
         && with_ranges(|r| reads.iter().any(|&(a, n)| r.iter().any(|&(b, m)| b < a + n && a < b + m)))
-        && HOMES.lock().iter().any(|h| reads.iter().any(|&(a, n)| h.stale.overlaps(a, n)))
+        && super::lockstat::HOMES.lock(&HOMES).iter().any(|h| reads.iter().any(|&(a, n)| h.stale.overlaps(a, n)))
 }
 
 /// A write from the CPU side (CP write, file read) into guest memory: the
@@ -760,7 +760,7 @@ pub fn cpu_written(base: u64, size: u64) {
     if !any() || size == 0 {
         return;
     }
-    let mut g = HOMES.lock();
+    let mut g = super::lockstat::HOMES.lock(&HOMES);
     for h in g.iter_mut() {
         let (a, e) = (base.max(h.base), (base + size).min(h.base + h.size));
         if a < e {
@@ -783,7 +783,7 @@ pub fn remapped(base: u64, size: u64) {
     if !any() {
         return;
     }
-    let mut g = HOMES.lock();
+    let mut g = super::lockstat::HOMES.lock(&HOMES);
     let before = g.len();
     g.retain(|h| {
         let hit = h.base < base.saturating_add(size) && base < h.base + h.size;
@@ -802,7 +802,7 @@ pub fn remapped(base: u64, size: u64) {
 /// A queue still recording work that bound a home keeps writing it until
 /// that batch is submitted; those writes are lost (A/B use only).
 pub fn take_all() -> Vec<(u64, u64, Arc<HomeBuf>, u64)> {
-    let mut g = HOMES.lock();
+    let mut g = super::lockstat::HOMES.lock(&HOMES);
     let mut v = Vec::new();
     for h in g.iter_mut() {
         for (a, n) in h.stale.iter() {

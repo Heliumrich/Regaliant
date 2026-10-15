@@ -186,6 +186,8 @@ pub struct Cp {
     /// The end of the last run the planner found too short (no new plan
     /// until execution passes it: each command would scan the rest again).
     par_skip: (u64, u64),
+    /// Its commands (`tune cp_classes`: serial commands by run length).
+    par_skip_n: usize,
     /// This command processor's chunk workers.
     par_pool: super::par::Pool,
 }
@@ -799,6 +801,10 @@ fn epoch_wait_lines() -> String {
 /// operations, planning parallel runs, collecting their chunks, submissions
 /// at buffer ends.
 static CP_CLASSES: [[AtomicU64; 3]; 10] = [const { [const { AtomicU64::new(0) }; 3] }; 10];
+/// The graphics command processor's serial commands by why they were not in
+/// a parallel run (`tune cp_classes`): `SERIAL_WHY_NAMES`.
+static SERIAL_WHY: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+const SERIAL_WHY_NAMES: [&str; 9] = ["small fetched buffers", "streamed", "runs of 1", "runs of 2-7", "runs of 8-31", "runs of 32-127", "runs of 128 or more", "other", "small fetched buffers' count"];
 /// FRAMES when the classes were last cleared.
 static CP_CLASSES_FROM: AtomicU64 = AtomicU64::new(0);
 /// The same per PM4 opcode for the compute queue `tune cp_classes_acb`
@@ -859,7 +865,7 @@ fn class_end(k: usize, t: Option<(Instant, u64)>) {
 
 /// Clears the packet classes (`profile reset`).
 pub fn reset_classes() {
-    for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()) {
+    for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()).chain(SERIAL_WHY.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     CP_CLASSES_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -881,6 +887,8 @@ pub fn classes_line() -> String {
         })
         .collect();
     let mut s = format!("    graphics command processor per flip by packet class (waits apart; {:.2} ms in all): {}\n", total as f64 / flips / 1e6, parts.join("; "));
+    let why: Vec<String> = SERIAL_WHY.iter().zip(SERIAL_WHY_NAMES).map(|(c, name)| format!("{name} {:.1}", c.load(Ordering::Relaxed) as f64 / flips)).collect();
+    s.push_str(&format!("    its serial commands per flip by why they were not in a parallel run: {}\n", why.join(", ")));
     let mut ops: Vec<(usize, u64, u64, u64)> = ACB_OPS
         .iter()
         .enumerate()
@@ -1045,6 +1053,7 @@ impl Cp {
             wait_ctx: None,
             par: None,
             par_skip: (0, 0),
+            par_skip_n: 0,
             par_pool: super::par::Pool::new(),
             last_wait_gpu: false,
         }
@@ -1368,6 +1377,7 @@ impl Cp {
         if n < par_min || chunks < 2 {
             // Not again before execution passes this run's end.
             self.par_skip = (end, run_end);
+            self.par_skip_n = n;
             return;
         }
         // Pending fast clears are applied now (a worker cannot apply one at
@@ -2414,6 +2424,9 @@ impl Cp {
         let mut f = Fetched::new(addr, size);
         // Time by packet class (the graphics queue; `tune cp_classes`).
         let classes = !self.compute && super::tune::cp_classes();
+        if classes && !f.words.is_empty() {
+            SERIAL_WHY[8].fetch_add(1, Ordering::Relaxed);
+        }
         let acb_ops = self.compute && super::tune::cp_classes() && self.name.strip_prefix("gpu-acb").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()) == Some(super::tune::cp_classes_acb());
         while cur < end {
             // The next chunk of a parallel run: collected here.
@@ -2554,6 +2567,24 @@ impl Cp {
                     let args: Vec<String> = (0..n.min(8)).map(|i| format!("{:08x}", p(i))).collect();
                     super::capture::packet(self, &format!("{name} {opcode:#x} @{cur:#x} [{}]", args.join(" ")));
                 }
+            }
+            if classes && command && self.par.is_none() {
+                let k = if !f.words.is_empty() {
+                    0
+                } else if f.live {
+                    1
+                } else if self.par_skip.0 == end && cur < self.par_skip.1 {
+                    match self.par_skip_n {
+                        0 | 1 => 2,
+                        2..=7 => 3,
+                        8..=31 => 4,
+                        32..=127 => 5,
+                        _ => 6,
+                    }
+                } else {
+                    7
+                };
+                SERIAL_WHY[k].fetch_add(1, Ordering::Relaxed);
             }
             let dispatch = matches!(opcode, op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT);
             let class = if command {

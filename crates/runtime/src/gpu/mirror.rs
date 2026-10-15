@@ -51,7 +51,7 @@ fn frame() -> u64 {
 }
 
 fn with<R>(f: impl FnOnce(&mut Pool) -> R) -> Option<R> {
-    let mut g = POOL.lock();
+    let mut g = super::lockstat::MIRRORS.lock(&POOL);
     if g.is_none() {
         match ctx().device_buffer(POOL_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::INDEX_BUFFER) {
             Ok((buffer, _mem)) => *g = Some(Pool { buffer, used: 0, list: Vec::new(), full: false }),
@@ -114,7 +114,7 @@ pub fn lookup(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
         return None;
     }
     let f = frame();
-    let g = POOL.lock();
+    let g = super::lockstat::MIRRORS.lock(&POOL);
     let p = g.as_ref()?;
     let m = p.list.iter().find(|m| m.frame.is_some_and(|w| f <= w + 1) && m.base <= base && base + size <= m.base + m.size)?;
     HITS.fetch_add(1, Ordering::Relaxed);
@@ -127,7 +127,7 @@ pub fn invalidate(ranges: &[(u64, u64)]) {
     if !LIVE.load(Ordering::Acquire) {
         return;
     }
-    let mut g = POOL.lock();
+    let mut g = super::lockstat::MIRRORS.lock(&POOL);
     let Some(p) = g.as_mut() else { return };
     for m in p.list.iter_mut().filter(|m| m.frame.is_some()) {
         if ranges.iter().any(|&(a, n)| m.base < a + n && a < m.base + m.size) {
@@ -138,7 +138,7 @@ pub fn invalidate(ranges: &[(u64, u64)]) {
 
 /// One status line.
 pub fn status() -> String {
-    let g = POOL.lock();
+    let g = super::lockstat::MIRRORS.lock(&POOL);
     let (n, used) = g.as_ref().map(|p| (p.list.len(), p.used)).unwrap_or((0, 0));
     format!(
         "    buffer mirrors: {n} ({} MiB), {} refreshes, {} read bindings served\n",

@@ -580,7 +580,7 @@ impl Cache {
 /// for: the sequence of the batch that copied it there, else 0). Checks it
 /// for CPU writes once per epoch.
 pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64, u64)> {
-    let mut g = CACHE.lock();
+    let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);
     let c = g.as_mut()?;
     let e = c.entries.get(&(base, size))?;
     if e.seq == 0 {
@@ -616,7 +616,7 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64, u64)> {
 
 /// Why the range has no usable copy (`GONE_NAMES` index; diagnostics).
 pub fn miss_reason(base: u64, size: u64) -> u8 {
-    let g = CACHE.lock();
+    let g = super::lockstat::COPY_CACHE.lock(&CACHE);
     let Some(c) = g.as_ref() else { return 0 };
     match c.entries.get(&(base, size)) {
         Some(e) if e.seq == 0 => 7,
@@ -629,7 +629,7 @@ pub fn miss_reason(base: u64, size: u64) -> u8 {
 /// start) and the new entry's id; the entry is usable by other batches once
 /// `submitted` names it.
 pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
-    let mut g = CACHE.lock();
+    let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);
     let c = g.get_or_insert_with(Cache::default);
     if super::tune::pre_keep() && c.entries.get(&(base, size)).is_some_and(|e| e.seq == 0 && e.made.elapsed() < std::time::Duration::from_millis(500)) {
         // A batch not submitted yet copies it: this one copies it for itself
@@ -691,7 +691,7 @@ pub fn submitted(made: &[(u64, u64, u64, bool)], seq: u64) {
     if made.is_empty() {
         return;
     }
-    let mut g = CACHE.lock();
+    let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);
     let Some(c) = g.as_mut() else { return };
     for &(base, size, id, on_copy) in made {
         if let Some(e) = c.entries.get_mut(&(base, size)) {
@@ -709,7 +709,7 @@ pub fn submitted(made: &[(u64, u64, u64, bool)], seq: u64) {
 /// its own takes: entries on those pages go, watched windows are dated, and
 /// texture regions on them other than `except` (the caller's) are told.
 pub fn take_written_for(base: u64, size: u64, out: &mut Vec<u64>, except: Option<u32>) -> Option<()> {
-    let mut g = CACHE.lock();
+    let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);
     let c = g.get_or_insert_with(Cache::default);
     let first = out.len();
     let r = c.take_marks(base, size, out, except);
@@ -737,7 +737,7 @@ pub fn take_written_for(base: u64, size: u64, out: &mut Vec<u64>, except: Option
 pub fn invalidate(base: u64, len: u64) {
     let end = base.saturating_add(len);
     if len != 0 && base < WATCH_HI.load(Ordering::Acquire) && WATCH_LO.load(Ordering::Acquire) < end {
-        let mut g = CACHE.lock();
+        let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);
         if let Some(c) = g.as_mut() {
             if c.watched.iter().any(|w| w.lo < end && base < w.hi) {
                 c.marks += 1;
@@ -761,7 +761,7 @@ fn drop_overlapping(base: u64, len: u64, gpu: bool) {
     if len == 0 || base.saturating_add(len) <= LO.load(Ordering::Acquire) || HI.load(Ordering::Acquire) <= base || !may_cover(base, len) {
         return;
     }
-    let mut g = CACHE.lock();
+    let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);
     let Some(c) = g.as_mut() else { return };
     c.why = if gpu { 3 } else { 4 };
     let n = c.drop_range(base, base.saturating_add(len), gpu);
@@ -785,7 +785,7 @@ pub fn invalidate_ranges_except(writes: &super::ranges::Ranges, keep: &[u64]) {
         }
         return;
     }
-    let mut g = CACHE.lock();
+    let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);
     let Some(c) = g.as_mut() else { return };
     c.spare = keep.to_vec();
     c.why = 3;
@@ -800,7 +800,7 @@ pub fn invalidate_ranges_except(writes: &super::ranges::Ranges, keep: &[u64]) {
 /// copy in is recorded now: its marks so far are taken (the copy runs after
 /// those writes) and the moment returned (`unwritten_since`).
 pub fn watch(base: u64, size: u64) -> u64 {
-    let mut g = CACHE.lock();
+    let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);
     let c = g.get_or_insert_with(Cache::default);
     c.take_and_drop(base, size);
     let (lo, hi) = (base & !4095, base.saturating_add(size).next_multiple_of(4096));
@@ -820,7 +820,7 @@ pub fn watch(base: u64, size: u64) -> u64 {
 /// moment `since` (`watch`); false when unknown (the window's watch was
 /// dropped).
 pub fn unwritten_since(base: u64, size: u64, since: u64) -> bool {
-    let mut g = CACHE.lock();
+    let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);
     let Some(c) = g.as_mut() else { return false };
     c.take_and_drop(base, size);
     let (lo, hi) = (base & !4095, base.saturating_add(size).next_multiple_of(4096));
@@ -847,7 +847,7 @@ pub fn status() -> String {
     if s[1] == 0 {
         return String::new();
     }
-    let (chunks, entries, bigs, big_mib) = CACHE.lock().as_ref().map_or((0, 0, 0, 0), |c| {
+    let (chunks, entries, bigs, big_mib) = super::lockstat::COPY_CACHE.lock(&CACHE).as_ref().map_or((0, 0, 0, 0), |c| {
         let big: Vec<u64> = c.chunks.iter().filter(|s| s.cap > CHUNK).map(|s| s.cap).collect();
         (c.chunks.len() - big.len(), c.entries.len(), big.len(), big.iter().sum::<u64>() >> 20)
     });

@@ -7629,6 +7629,7 @@ pub fn status() -> String {
             SHADOWS_SHARED[4].load(Ordering::Relaxed)
         )
         + &super::precache::status()
+        + &super::lockstat::status()
         + &super::pcache::status()
         + &super::images::scrub_status()
         + &super::mirror::status()

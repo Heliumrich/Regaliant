@@ -1079,6 +1079,7 @@ pub mod forward;
 pub mod par;
 pub mod prio;
 pub mod precache;
+pub mod lockstat;
 pub mod exec;
 
 /// Whether a GPU import may cover guest [base, base+len) (`exec`).
@@ -1713,6 +1714,7 @@ pub fn reset_profile() {
     exec::reset_shader_profile();
     cp::reset_wait_stats();
     par::reset_stats();
+    lockstat::reset_stats();
     images::reset_memo_stats();
     exec::reset_pre_window();
     threadcpu::reset_window();

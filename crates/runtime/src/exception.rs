@@ -1022,7 +1022,18 @@ unsafe fn handle_watch_hit(ctx: &mut CONTEXT) -> bool {
             let frames = unsafe { frames_line(ctx) };
             crate::log::write(
                 crate::log::Level::Info,
-                format_args!("watch {i} {kind} #{n}: [{a:#x}] = {v:#018x} by [{}] at {}; {frames}", crate::log::thread_name(), describe(ctx.Rip)),
+                format_args!(
+                    "watch {i} {kind} #{n}: [{a:#x}] = {v:#018x} by [{}] at {} (rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} rbp {:#x}); {frames}",
+                    crate::log::thread_name(),
+                    describe(ctx.Rip),
+                    ctx.Rax,
+                    ctx.Rbx,
+                    ctx.Rcx,
+                    ctx.Rdx,
+                    ctx.Rsi,
+                    ctx.Rdi,
+                    ctx.Rbp
+                ),
             );
         }
     }

@@ -231,12 +231,50 @@ fn io_errno(e: &std::io::Error) -> i32 {
 }
 
 /// Opens a guest path. Returns fd or SCE error.
+/// The developer command line the title reads at boot after its own
+/// (/app0/misc/gamecommandlineargs.txt): `+convar=value` settings and
+/// commands. The runtime adds its title settings to it (`title_args`).
+const DEVLOG_ARGS: &str = "/devlog/app/commandlineargs.txt";
+
+/// Title settings the runtime passes on the developer command line unless
+/// `DS_GAME_ARGS` replaces them (`none`: nothing). Physics takes fixed
+/// 1/59.94 s steps, at most `physicsMaxUpdateStepsPerFrame` per frame
+/// (title default 1: below 60 fps physics ran at frame rate / 60, ~0.35x
+/// real time at 21 fps); 6 covers the title's 0.1 s frame-step cap
+/// (`gameMaxDeltaTime`) with the same step (FINDINGS.md 2026-10-15).
+const TITLE_ARGS: &str = "+physicsMaxUpdateStepsPerFrame=6";
+
+fn title_args() -> Option<String> {
+    let v = std::env::var("DS_GAME_ARGS").unwrap_or_else(|_| TITLE_ARGS.to_string());
+    let v = v.trim();
+    (!v.is_empty() && v != "none").then(|| v.to_string())
+}
+
+/// Opens the developer command line with the runtime's title settings
+/// added: the file's own content (if any) and then `extra`, served from a
+/// merged copy in the run directory (`title-commandline.txt`).
+fn open_merged_args(r: &Resolved, path: &str, extra: &str) -> Option<i32> {
+    let own = r.candidates.iter().find(|p| p.is_file()).and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    let own = own.trim_end();
+    let merged = if own.is_empty() { format!("{extra}\n") } else { format!("{own} {extra}\n") };
+    let host = crate::run_dir()?.join("title-commandline.txt");
+    std::fs::write(&host, merged.as_bytes()).ok()?;
+    let file = File::open(&host).ok()?;
+    crate::info!("title command line {path}: runtime settings '{extra}' added after {} byte(s) of its own (DS_GAME_ARGS; copy in {})", own.len(), host.display());
+    Some(alloc_fd(Fd { kind: Kind::File { file, writable: false }, pos: Mutex::new(0), path: path.to_string() }))
+}
+
 pub fn vfs_open(path: &str, flags: i32, _mode: u32) -> i32 {
     let Some(r) = resolve(path) else {
         crate::warn!("open '{path}': no mount");
         return sce(ENOENT);
     };
     let wants_write = flags & O_ACCMODE != 0 || flags & (O_CREAT | O_TRUNC | O_APPEND) != 0;
+    if path == DEVLOG_ARGS && !wants_write {
+        if let Some(fd) = title_args().and_then(|extra| open_merged_args(&r, path, &extra)) {
+            return fd;
+        }
+    }
     let existing = r.candidates.iter().find(|p| p.exists()).cloned();
     if wants_write && !r.writable {
         crate::warn!("open '{path}' for writing on read-only mount");
