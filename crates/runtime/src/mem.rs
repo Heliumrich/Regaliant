@@ -556,6 +556,8 @@ pub fn write_watch_state() -> String {
 
 /// Statistics of `take_written`: [calls, ns, pages reported].
 pub static WRITE_WATCH_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Takes that the probe query found clean (`tune ww_probe`).
+pub static PROBE_CLEAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The 4 KiB pages of guest [base, base+size) the CPU wrote since they were
 /// last taken (their write marks are reset), into `out` (page addresses);
@@ -577,6 +579,22 @@ pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
     let t = std::time::Instant::now();
     let mut addrs = [std::ptr::null_mut::<std::ffi::c_void>(); 256];
     let mut at = lo;
+    if crate::gpu::tune::ww_probe() {
+        // Clean ranges (most takes) end with one query that resets nothing;
+        // otherwise the resetting queries start at the first written page.
+        let mut count: usize = 1;
+        let mut gran = 0u32;
+        let r = unsafe { GetWriteWatch(0, lo as _, (hi - lo) as usize, addrs.as_mut_ptr(), &mut count, &mut gran) };
+        if r == 0 && count == 0 {
+            WRITE_WATCH_STATS[0].fetch_add(1, Relaxed);
+            WRITE_WATCH_STATS[1].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            PROBE_CLEAN.fetch_add(1, Relaxed);
+            return Some(());
+        }
+        if r == 0 && count == 1 {
+            at = (addrs[0] as u64).clamp(lo, hi);
+        }
+    }
     while at < hi {
         let mut count: usize = addrs.len();
         let mut gran = 0u32;

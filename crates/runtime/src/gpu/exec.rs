@@ -3413,13 +3413,14 @@ fn pre_repeat_line() -> String {
     let g = PRE_REPEAT.lock();
     let mb = |b: u64| b as f64 / (1u64 << 20) as f64;
     let stable = format!(
-        "    batch-start copies across frames (first in a frame): ranges not copied in the two frames before {:.0} MiB, unchanged since {:.0} MiB, changed {:.0} MiB (sampled hashes); write-watch queries {} ({:.1} us each, {} pages)\n",
+        "    batch-start copies across frames (first in a frame): ranges not copied in the two frames before {:.0} MiB, unchanged since {:.0} MiB, changed {:.0} MiB (sampled hashes); write-watch queries {} ({:.1} us each, {} pages; {} found clean by a probe)\n",
         mb(st[0]),
         mb(st[1]),
         mb(st[2]),
         crate::mem::WRITE_WATCH_STATS[0].load(Ordering::Relaxed),
         crate::mem::WRITE_WATCH_STATS[1].load(Ordering::Relaxed) as f64 / crate::mem::WRITE_WATCH_STATS[0].load(Ordering::Relaxed).max(1) as f64 / 1000.0,
-        crate::mem::WRITE_WATCH_STATS[2].load(Ordering::Relaxed)
+        crate::mem::WRITE_WATCH_STATS[2].load(Ordering::Relaxed),
+        crate::mem::PROBE_CLEAN.load(Ordering::Relaxed)
     );
     let sizes: Vec<String> = ["<4K", "<64K", "<1M", ">=1M"].iter().zip(g.3.iter()).map(|(n, x)| format!("{n} {} ({:.0} MiB)", x[0], mb(x[1]))).collect();
     let why = *PRE_UNCHANGED_WHY.lock();

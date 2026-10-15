@@ -3092,7 +3092,7 @@ impl Images {
             String::new()
         };
         format!(
-            "    images: {} cached, {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; staging buffers made {}, waits for uploads in flight {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}\n",
+            "    images: {} cached, {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; staging buffers made {}, waits for uploads in flight {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages, {} found clean by a probe); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}\n",
             self.map.len(),
             self.uploads,
             self.reuploads,
@@ -3113,6 +3113,7 @@ impl Images {
             ww[0].load(Relaxed),
             ww[1].load(Relaxed) as f64 / ww[0].load(Relaxed).max(1) as f64 / 1000.0,
             ww[2].load(Relaxed),
+            crate::mem::PROBE_CLEAN.load(Relaxed),
             self.overwrite_clears,
             ZERO_FILL_CLEARS.load(std::sync::atomic::Ordering::Relaxed),
             self.overwrite_uploads,

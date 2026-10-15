@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 104] = [
+    static ALL: [Tunable; 105] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -131,6 +131,7 @@ pub mod tune {
         Tunable { name: "lock_relief", env: "DS_LOCK_RELIEF", default: 3, value: AtomicU64::new(UNSET) },
         Tunable { name: "prep_pool", env: "DS_PREP_POOL", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ts_batch", env: "DS_TS_BATCH", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "ww_probe", env: "DS_WW_PROBE", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1105,6 +1106,16 @@ pub mod tune {
     #[inline]
     pub fn ts_batch() -> u64 {
         get(103)
+    }
+
+    /// Write-mark takes query first without resetting (one page at most):
+    /// a range found clean needs no resetting query (a query that resets
+    /// nothing costs 0.4-0.8 us, the game's takes average 3.8 us; resets
+    /// interrupt the process's other threads with TLB shootdowns). Live A/B
+    /// 2026-10-15 night: +1.5% flips/s, -1% CPU per command; default 1.
+    #[inline]
+    pub fn ww_probe() -> bool {
+        get(104) != 0
     }
 
 
