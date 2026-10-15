@@ -35,7 +35,7 @@ pub fn workers() -> usize {
             static AUTO: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
             *AUTO.get_or_init(|| std::thread::available_parallelism().map_or(5, |n| (n.get() / 3).clamp(2, 8)))
         }
-        v => (v as usize).min(8),
+        v => (v as usize).min(16),
     }
 }
 
