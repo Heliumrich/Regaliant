@@ -1368,3 +1368,108 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
         crate::fatal_exit(0xD501, "fatal exception");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, RemoveVectoredExceptionHandler, EXCEPTION_POINTERS};
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE};
+
+    static PAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    unsafe extern "system" fn unprotect(info: *mut EXCEPTION_POINTERS) -> i32 {
+        let rec = unsafe { &*(*info).ExceptionRecord };
+        let page = PAGE.load(std::sync::atomic::Ordering::Acquire);
+        if rec.ExceptionCode == 0xC000_0005u32 as i32 && rec.ExceptionInformation[1] as u64 & !0xFFF == page {
+            let mut old = 0;
+            unsafe { VirtualProtect(page as _, 4096, PAGE_READWRITE, &mut old) };
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
+        0
+    }
+
+    /// A handled fault keeps the AVX registers' full width (the title's
+    /// vector code faults on write-tracked pages mid-computation).
+    #[test]
+    fn handled_fault_keeps_ymm() {
+        let page = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY) } as u64;
+        assert_ne!(page, 0);
+        PAGE.store(page, std::sync::atomic::Ordering::Release);
+        let h = unsafe { AddVectoredExceptionHandler(1, Some(unprotect)) };
+        let src: [u64; 8] = [0x1111_2222_3333_4444, 0x5555_6666_7777_8888, 0x9999_aaaa_bbbb_cccc, 0xdddd_eeee_ffff_0001, 0x0102_0304_0506_0708, 0x1112_1314_1516_1718, 0x2122_2324_2526_2728, 0x3132_3334_3536_3738];
+        let mut out = [0u64; 8];
+        unsafe {
+            std::arch::asm!(
+                "vmovdqu ymm1, [{s}]",
+                "vmovdqu ymm14, [{s} + 32]",
+                "mov dword ptr [{p}], 1",
+                "vmovdqu [{o}], ymm1",
+                "vmovdqu [{o} + 32], ymm14",
+                "vzeroupper",
+                s = in(reg) src.as_ptr(),
+                p = in(reg) page,
+                o = in(reg) out.as_mut_ptr(),
+                out("ymm1") _, out("ymm14") _,
+            );
+        }
+        unsafe {
+            RemoveVectoredExceptionHandler(h);
+            VirtualFree(page as _, 0, MEM_RELEASE);
+        }
+        assert_eq!(out, src);
+    }
+
+    /// Which bytes below the stack pointer a handled fault's dispatch
+    /// overwrites (System V code, the title, keeps data in the 128-byte red
+    /// zone there without moving the stack pointer). Prints the offsets
+    /// whose marker changed.
+    #[test]
+    fn handled_fault_below_the_stack_pointer() {
+        let page = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY) } as u64;
+        assert_ne!(page, 0);
+        PAGE.store(page, std::sync::atomic::Ordering::Release);
+        let h = unsafe { AddVectoredExceptionHandler(1, Some(unprotect)) };
+        // Markers at rsp-8 .. rsp-4096 (stack memory already touched: a
+        // large local first), copied out after the fault.
+        let mut out = [0u64; 512];
+        let mut probe = [0u8; 16384];
+        std::hint::black_box(&mut probe);
+        unsafe {
+            std::arch::asm!(
+                "mov rcx, 1",
+                "2:",
+                "mov rax, rsp",
+                "shl rcx, 3",
+                "sub rax, rcx",
+                "shr rcx, 3",
+                "mov rdx, rcx",
+                "mov r8, 0x5a5a000000000000",
+                "or rdx, r8",
+                "mov [rax], rdx",
+                "inc rcx",
+                "cmp rcx, 513",
+                "jne 2b",
+                "mov dword ptr [{p}], 1",
+                "mov rcx, 1",
+                "3:",
+                "mov rax, rsp",
+                "shl rcx, 3",
+                "sub rax, rcx",
+                "shr rcx, 3",
+                "mov rdx, [rax]",
+                "mov [{o} + rcx * 8 - 8], rdx",
+                "inc rcx",
+                "cmp rcx, 513",
+                "jne 3b",
+                p = in(reg) page,
+                o = in(reg) out.as_mut_ptr(),
+                out("rax") _, out("rcx") _, out("rdx") _, out("r8") _,
+            );
+        }
+        unsafe {
+            RemoveVectoredExceptionHandler(h);
+            VirtualFree(page as _, 0, MEM_RELEASE);
+        }
+        let changed: Vec<usize> = (1..=512).filter(|&k| out[k - 1] != (0x5a5a_0000_0000_0000 | k as u64)).map(|k| k * 8).collect();
+        eprintln!("bytes below rsp overwritten by the fault (offsets): {} of 4096; first {:?}, last {:?}", changed.len() * 8, changed.first(), changed.last());
+    }
+}

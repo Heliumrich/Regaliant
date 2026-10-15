@@ -881,6 +881,7 @@ fn section_commit(addr: u64, size: u64, kind: VmaKind, prot: u32, phys: u64) -> 
     crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_COMMIT);
     repaged(addr, size);
     let (which, off) = if kind == VmaKind::Direct { (Sec::Dmem, phys) } else { (Sec::Anon, sec::anon_alloc(size).ok_or(MemError::NoSpace)?) };
+    mapped_over_gpu_writes(addr, size, which == Sec::Dmem, off);
     let _arm = crate::gpu::resident::remap_guard();
     if let Err(e) = sec::map_new_view(addr, size, which, off, win_prot(prot)) {
         crate::warn!("mem: {e}");
@@ -920,6 +921,78 @@ fn section_release(v: &Vma) {
     }
     if v.kind != VmaKind::Direct {
         crate::sections::anon_free(v.off, v.size);
+    }
+}
+
+/// Guest mappings unmapped while unfinished GPU work writes them: their
+/// physical pages (section offset) and the batch: with section-backed memory
+/// those writes land in the pages wherever they are mapped next
+/// (`section_commit` waits for the batch with `DS_PHYS_WAIT=1`). Counts:
+/// [unmapped with writes pending, of them direct, mapped again while
+/// pending, waits that ended in time].
+static PENDING_REUSE: Mutex<Vec<(bool, u64, u64, u64, u64)>> = Mutex::new(Vec::new());
+pub static PENDING_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn phys_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| env_is("DS_PHYS_WAIT", "1"))
+}
+
+fn unmapped_with_gpu_writes(v: &Vma) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(seq) = crate::gpu::exec::pending_writes(v.start, v.size) else { return };
+    let direct = v.kind == VmaKind::Direct;
+    let n = PENDING_STATS[0].fetch_add(1, Relaxed);
+    if direct {
+        PENDING_STATS[1].fetch_add(1, Relaxed);
+    }
+    if n < 16 {
+        crate::info!(
+            "mem: {:?} {:#x}+{:#x} '{}' unmapped while batch {seq} (completed up to {}) writes it",
+            v.kind,
+            v.start,
+            v.size,
+            v.name,
+            crate::gpu::exec::completed_seq()
+        );
+    }
+    if crate::sections::on() {
+        let off = if direct { v.phys } else { v.off };
+        let mut g = PENDING_REUSE.lock();
+        let done = crate::gpu::exec::completed_seq();
+        g.retain(|e| e.3 > done);
+        if g.len() < 4096 {
+            g.push((direct, off, v.size, seq, v.start));
+        }
+    }
+}
+
+/// A new mapping of section pages [off, off+size) (`direct`: direct memory,
+/// else anonymous): GPU work still writing them through an earlier mapping
+/// is counted, and waited for with `DS_PHYS_WAIT=1` (at most 250 ms).
+fn mapped_over_gpu_writes(addr: u64, size: u64, direct: bool, off: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let hit = {
+        let mut g = PENDING_REUSE.lock();
+        if g.is_empty() {
+            return;
+        }
+        let done = crate::gpu::exec::completed_seq();
+        g.retain(|e| e.3 > done);
+        g.iter().filter(|e| e.0 == direct && e.1 < off + size && off < e.1 + e.2).max_by_key(|e| e.3).copied()
+    };
+    let Some((_, o, n, seq, va)) = hit else { return };
+    let k = PENDING_STATS[2].fetch_add(1, Relaxed);
+    let waited = phys_wait() && crate::gpu::exec::wait_done_for(seq, std::time::Duration::from_millis(250));
+    if waited {
+        PENDING_STATS[3].fetch_add(1, Relaxed);
+    }
+    if k < 16 {
+        crate::info!(
+            "mem: {} {off:#x}+{size:#x} mapped at {addr:#x} while batch {seq} still writes {o:#x}+{n:#x} through its previous mapping at {va:#x}{}",
+            if direct { "direct memory" } else { "anonymous memory" },
+            if phys_wait() { if waited { " (waited for it)" } else { " (wait timed out)" } } else { "" }
+        );
     }
 }
 
@@ -1060,6 +1133,9 @@ impl MemState {
         let keys: Vec<u64> = self.vmas.range(start..end).map(|(k, _)| *k).collect();
         for k in keys {
             let v = self.vmas.remove(&k).unwrap();
+            if matches!(v.kind, VmaKind::Direct | VmaKind::Flexible) {
+                unmapped_with_gpu_writes(&v);
+            }
             if v.kind == VmaKind::Direct {
                 let mut r = REMAP.lock();
                 if r.released.len() > 1 << 16 {

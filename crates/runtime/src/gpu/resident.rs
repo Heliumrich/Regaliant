@@ -1389,7 +1389,7 @@ pub fn status() -> String {
     if crate::sections::on() {
         let t: Vec<u64> = TAKE_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         out = format!(
-            "    write tracking by protection (sections): {} takes visited {} pages ({} region queries), reported {} ({} of them unarmable: once per epoch), armed {} ({} left for other protections); {} write faults ({} races), {} turned volatile ({} armed again after their stay), {} host class; {} arming calls ({:.1} us each), {} disarming calls ({:.1} us each); {} host writes ({} pages); {} remaps; {}; {:.0} MiB zeroed for new mappings (direct {:.0}); {} imports without an alias slot ({} alias views bridged); kernel-mode accesses retried {} ({} retries, {} failed for good)\n",
+            "    write tracking by protection (sections): {} takes visited {} pages ({} region queries), reported {} ({} of them unarmable: once per epoch), armed {} ({} left for other protections); {} write faults ({} races), {} turned volatile ({} armed again after their stay), {} host class; {} arming calls ({:.1} us each), {} disarming calls ({:.1} us each); {} host writes ({} pages); {} remaps; {}; {:.0} MiB zeroed for new mappings (direct {:.0}); {} imports without an alias slot ({} alias views bridged); kernel-mode accesses retried {} ({} retries, {} failed for good); unmapped with GPU writes pending {} (direct {}), mapped again while pending {} ({} waited for)\n",
             t[0],
             t[3],
             t[4],
@@ -1416,7 +1416,11 @@ pub fn status() -> String {
             crate::mem::BRIDGES.load(Ordering::Relaxed),
             crate::mem::KERNEL_IO[0].load(Ordering::Relaxed),
             crate::mem::KERNEL_IO[1].load(Ordering::Relaxed),
-            crate::mem::KERNEL_IO[2].load(Ordering::Relaxed)
+            crate::mem::KERNEL_IO[2].load(Ordering::Relaxed),
+            crate::mem::PENDING_STATS[0].load(Ordering::Relaxed),
+            crate::mem::PENDING_STATS[1].load(Ordering::Relaxed),
+            crate::mem::PENDING_STATS[2].load(Ordering::Relaxed),
+            crate::mem::PENDING_STATS[3].load(Ordering::Relaxed)
         );
     }
     if !wanted() {

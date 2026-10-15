@@ -2659,6 +2659,27 @@ fn check_speculations(done: u64) {
     }
 }
 
+/// The latest unfinished batch that writes guest [base, base+size) (shader
+/// writes and deferred CP writes), if any.
+pub fn pending_writes(base: u64, size: u64) -> Option<u64> {
+    let r = [(base, size)];
+    INFLIGHT.latest(&r).max(CP_WRITES.latest(&r))
+}
+
+/// `wait_done` for at most `max`; whether batch `seq` completed.
+pub fn wait_done_for(seq: u64, max: std::time::Duration) -> bool {
+    let until = std::time::Instant::now() + max;
+    let mut d = DONE.lock();
+    while *d < seq {
+        let now = std::time::Instant::now();
+        if now >= until || super::shutting_down() {
+            return false;
+        }
+        DONE_CV.wait_for(&mut d, (until - now).min(std::time::Duration::from_millis(100)));
+    }
+    true
+}
+
 /// Blocks until batch `seq` and all earlier ones completed (with their actions).
 pub fn wait_done(seq: u64) {
     let mut d = DONE.lock();
