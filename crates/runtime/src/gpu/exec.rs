@@ -3421,6 +3421,147 @@ pub(super) const CS_STEP_NAMES: [&str; CS_STEP_COUNT] = [
 /// compute queue's command processor (`Exec::cs_kind`).
 const CS_KINDS: [&str; 6] = ["graphics direct", "graphics indirect", "compute direct", "compute indirect", "graphics workers direct", "graphics workers indirect"];
 
+/// The bind step (`Exec::bind_stage`) by part (DS_PROFILE_GPU; TSC cycles):
+/// per buffer binding `BIND_STEP_NAMES[..7]`, then per stage the images and
+/// samplers, then the counts of buffer bindings and of stages.
+pub(super) static BIND_STEPS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+const BIND_STEP_NAMES: [&str; 8] = ["resource and home", "resident shadows", "snapshot", "mirror", "batch-start copy", "mapping span", "placement and rest", "images and samplers"];
+
+thread_local! {
+    /// This thread's BIND_STEPS not yet added.
+    static BIND_LOCAL: std::cell::Cell<[u64; 10]> = const { std::cell::Cell::new([0; 10]) };
+}
+
+/// TSC lap clock of the bind step's parts (profiling only; ~10 ns a mark).
+/// Dropped at the end of the stage: the time since its last mark counts as
+/// images and samplers.
+struct BindClock {
+    last: u64,
+    acc: [u64; 10],
+}
+
+impl BindClock {
+    fn start() -> Option<BindClock> {
+        profiling().then(|| BindClock { last: unsafe { core::arch::x86_64::_rdtsc() }, acc: [0; 10] })
+    }
+
+    fn mark(c: &mut Option<BindClock>, k: usize) {
+        if let Some(c) = c {
+            let now = unsafe { core::arch::x86_64::_rdtsc() };
+            c.acc[k] += now.wrapping_sub(c.last);
+            c.last = now;
+        }
+    }
+
+    fn count_buffer(c: &mut Option<BindClock>) {
+        if let Some(c) = c {
+            c.acc[8] += 1;
+        }
+    }
+}
+
+impl Drop for BindClock {
+    fn drop(&mut self) {
+        let now = unsafe { core::arch::x86_64::_rdtsc() };
+        self.acc[7] += now.wrapping_sub(self.last);
+        self.acc[9] += 1;
+        BIND_LOCAL.with(|l| {
+            let mut v = l.get();
+            for (x, a) in v.iter_mut().zip(self.acc.iter()) {
+                *x += a;
+            }
+            if v[9] >= 256 {
+                for (c, x) in BIND_STEPS.iter().zip(v.iter()) {
+                    c.fetch_add(*x, Ordering::Relaxed);
+                }
+                v = [0; 10];
+            }
+            l.set(v);
+        });
+    }
+}
+
+/// Profile line: the bind step by part (`BIND_STEPS`).
+fn bind_steps_line() -> String {
+    let v: Vec<u64> = BIND_STEPS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if v[9] == 0 {
+        return String::new();
+    }
+    let ns = |cycles: u64, n: u64| cycles as f64 * 1e9 / super::threadcpu::tsc_hz() / n.max(1) as f64;
+    let parts: Vec<String> = BIND_STEP_NAMES[..7].iter().enumerate().map(|(k, name)| format!("{name} {:.0}", ns(v[k], v[8]))).collect();
+    format!(
+        "    bind step by part: {} stages, {} buffer bindings ({:.1} per stage); ns per buffer binding: {}; images and samplers {:.0} ns per stage\n",
+        v[9],
+        v[8],
+        v[8] as f64 / v[9] as f64,
+        parts.join(", "),
+        ns(v[7], v[9])
+    )
+}
+
+/// `Exec::pre_copy` by outcome (DS_PROFILE_GPU): TSC cycles and calls per
+/// `PRE_STEP_NAMES`.
+static PRE_STEPS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+const PRE_STEP_NAMES: [&str; 6] = ["refused at once", "reused in the batch", "shared copy reused", "copied for the batch", "copied into the shared cache", "refused after looking"];
+
+thread_local! {
+    /// This thread's PRE_STEPS not yet added, and its calls since.
+    static PRE_LOCAL: std::cell::Cell<([u64; 12], u32)> = const { std::cell::Cell::new(([0; 12], 0)) };
+}
+
+/// Times one `pre_copy` call; `k` is its outcome when it returns.
+struct PreClock {
+    t0: u64,
+    k: usize,
+}
+
+impl PreClock {
+    fn start() -> Option<PreClock> {
+        profiling().then(|| PreClock { t0: unsafe { core::arch::x86_64::_rdtsc() }, k: 0 })
+    }
+
+    fn set(c: &mut Option<PreClock>, k: usize) {
+        if let Some(c) = c {
+            c.k = k;
+        }
+    }
+}
+
+impl Drop for PreClock {
+    fn drop(&mut self) {
+        let dt = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(self.t0);
+        PRE_LOCAL.with(|l| {
+            let (mut v, mut n) = l.get();
+            v[2 * self.k] += dt;
+            v[2 * self.k + 1] += 1;
+            n += 1;
+            if n >= 1024 {
+                for (c, x) in PRE_STEPS.iter().zip(v.iter()) {
+                    c.fetch_add(*x, Ordering::Relaxed);
+                }
+                (v, n) = ([0; 12], 0);
+            }
+            l.set((v, n));
+        });
+    }
+}
+
+/// Profile line: `pre_copy` by outcome (`PRE_STEPS`).
+fn pre_steps_line() -> String {
+    let v: Vec<u64> = PRE_STEPS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let calls: u64 = (0..6).map(|k| v[2 * k + 1]).sum();
+    if calls == 0 {
+        return String::new();
+    }
+    let hz = super::threadcpu::tsc_hz();
+    let parts: Vec<String> = PRE_STEP_NAMES
+        .iter()
+        .enumerate()
+        .map(|(k, name)| format!("{name} {} ({:.0} ns each, {:.0} ms)", v[2 * k + 1], v[2 * k] as f64 * 1e9 / hz / v[2 * k + 1].max(1) as f64, v[2 * k] as f64 * 1e3 / hz))
+        .collect();
+    format!("    batch-start copy lookups by outcome: {calls} calls: {}\n", parts.join(", "))
+}
+
 /// Lap timer of a command's steps (profiling only).
 pub(super) struct Laps {
     last: Option<std::time::Instant>,
@@ -3723,7 +3864,7 @@ pub fn reset_shader_profile() {
     for c in crate::mem::WRITE_WATCH_STATS.iter() {
         c.store(0, Ordering::Relaxed);
     }
-    for c in DRAW_STEPS.iter().flatten().chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()) {
+    for c in DRAW_STEPS.iter().flatten().chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()).chain(BIND_STEPS.iter()).chain(PRE_STEPS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     for c in CS_PHASES.iter().chain(DRAW_PHASES.iter()) {
@@ -3793,6 +3934,8 @@ pub fn shader_profile() -> String {
     }
     s.push_str(&phases_line("draw", &DRAW_PHASES, ["prepare and shader-read waits", "textures, targets, pipeline", "bindings"]));
     s.push_str(&draw_steps_line());
+    s.push_str(&bind_steps_line());
+    s.push_str(&pre_steps_line());
     s.push_str(&pre_repeat_line());
     s.push_str(&sync_steps_line());
     s.push_str(&shaders::repeats_line());
@@ -4858,6 +5001,7 @@ impl Exec {
     /// write, writes the range (then None). None also: off or larger than
     /// `tune pre_max`, not one mapping, no space.
     pub(super) fn pre_copy(&mut self, base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
+        let mut clk = PreClock::start();
         // Over `pre_max`: only as a shared copy (`tune pre_big_max`).
         let big = size > super::tune::pre_max();
         let shares = self.shares_pre && (!self.batch_alt || self.batch_alt_share);
@@ -4885,6 +5029,7 @@ impl Exec {
         let bias = base - al;
         if let Some(&(buf, at)) = self.pres.get(&(base, size)) {
             PRE_REUSED.fetch_add(1, Ordering::Relaxed);
+            PreClock::set(&mut clk, 1);
             return Some((buf, at, bias));
         }
         let n = (bias + size).next_multiple_of(4);
@@ -4897,9 +5042,11 @@ impl Exec {
                 let buf = chunk.buf;
                 self.slots[self.cur].keep.push(chunk);
                 self.pres.insert((base, size), (buf, at));
+                PreClock::set(&mut clk, 2);
                 return Some((buf, at, bias));
             }
         }
+        PreClock::set(&mut clk, 5);
         let off = self.pre_used.next_multiple_of(self.ring_align);
         let Some((src, start, _)) = span(al, n) else {
             if big {
@@ -4907,7 +5054,8 @@ impl Exec {
             }
             return None;
         };
-        // (Profiling: why no shared copy served it.)
+        // (Profiling: why no shared copy served it; left out of the clock.)
+        let t_why = clk.as_ref().map(|_| unsafe { core::arch::x86_64::_rdtsc() });
         let why = if !profiling() {
             0
         } else if share {
@@ -4915,6 +5063,9 @@ impl Exec {
         } else {
             9
         };
+        if let (Some(c), Some(t)) = (clk.as_mut(), t_why) {
+            c.t0 = c.t0.wrapping_add(unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t));
+        }
         let shared = if share { super::precache::insert(base, size, n) } else { None };
         // The batch's own segment for copies not shared (big ones are read
         // in place then).
@@ -4964,14 +5115,19 @@ impl Exec {
             Some((chunk, _, id)) => {
                 self.slots[self.cur].keep.push(chunk);
                 self.shared_pending.push((base, size, id, on_copy));
+                PreClock::set(&mut clk, 4);
             }
-            None => self.pre_used = off + n,
+            None => {
+                self.pre_used = off + n;
+                PreClock::set(&mut clk, 3);
+            }
         }
         self.pres.insert((base, size), (buf, off));
         PRE_COPIES.fetch_add(1, Ordering::Relaxed);
         PRE_BYTES.fetch_add(n, Ordering::Relaxed);
         self.ops[OP_PRE] += 1;
         self.ops[OP_PRE_BYTES] += n;
+        drop(clk);
         if profiling() {
             note_pre_repeat(base, size, n, why);
         }
@@ -6681,6 +6837,7 @@ impl Exec {
         bound.images.reserve(nb);
         let seg = SHADOW_BYTES;
         let fx = fixed();
+        let mut clk = BindClock::start();
         {
             for b in &found.tr.out.bindings {
                 match b.kind {
@@ -6712,8 +6869,10 @@ impl Exec {
                         let home = self
                             .home_bind(base, size, found.tr.plan.resources[i].written, if sized { HomeUse::Sized } else { HomeUse::Unbounded })
                             .map(|h| (h.0, h.1, h.2));
+                        BindClock::mark(&mut clk, 0);
                         // Inside a resident shadow: its working copy is newer.
                         let resident = if read_only && home.is_none() { self.resident_read(base, size)? } else { None };
+                        BindClock::mark(&mut clk, 1);
                         // Small read-only buffers: a snapshot in video memory.
                         // Data-only loads read on the GPU (`gpu_loads`) of data
                         // no GPU work still writes: as memory holds it now, as
@@ -6729,14 +6888,17 @@ impl Exec {
                         } else {
                             self.snapshot(base, size, super::tune::snap_max())
                         };
+                        BindClock::mark(&mut clk, 2);
                         // Read-only bindings of buffers GPU work wrote: VRAM mirrors.
                         let mirrored = if read_only && snap.is_none() && home.is_none() { resident.or_else(|| super::mirror::lookup(base, size)) } else { None };
+                        BindClock::mark(&mut clk, 3);
                         // Other read-only buffers: a copy made at the batch's start
                         // (dispatches only with `tune pre_cs`).
                         let pre = if read_only && snap.is_none() && mirrored.is_none() && home.is_none() && (!allow_shadow || super::tune::pre_cs()) { self.pre_copy(base, size) } else { None };
                         if pre.is_some() {
                             placement = Placement::PreCopy;
                         }
+                        BindClock::mark(&mut clk, 4);
                         // Diagnosis: ranges read when the batch executes.
                         if read_only && super::tune::race_checks() && size <= 1 << 28 {
                             self.note_open_read(p.addr, base, size);
@@ -6766,6 +6928,7 @@ impl Exec {
                                 }
                             }
                         }
+                        BindClock::mark(&mut clk, 5);
                         if super::tune::race_checks() && size > 0 && snap.is_none() && mirrored.is_none() && (home.is_some() || span.is_some()) {
                             let unbounded = matches!(found.resources[i], Resolved::Global(_, None));
                             let kind = if found.tr.plan.resources[i].written { 1 } else { 0 } | if data_load { 2 } else { 0 } | if unbounded { 4 } else { 0 };
@@ -6909,6 +7072,8 @@ impl Exec {
                         p.sgpr_data[ri + 2] = bound_size.min(u32::MAX as u64) as u32;
                         p.sgpr_data[ri + 3] = limit;
                         bound.bufs.push((b.binding, info));
+                        BindClock::mark(&mut clk, 6);
+                        BindClock::count_buffer(&mut clk);
                     }
                     BindingKind::Gds => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.gds, offset: 0, range: rdna::translate::GDS_BYTES as u64 })),
                     BindingKind::Debug => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.debug, offset: 0, range: rdna::translate::DUMP_DWORDS as u64 * 4 })),
