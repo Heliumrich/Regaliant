@@ -568,7 +568,8 @@ impl Exec {
         // Phase times (DS_PROFILE_GPU only: a clock read costs ~20 ns).
         let t0 = super::profiling().then(std::time::Instant::now);
         let since = |t0: Option<std::time::Instant>| t0.map_or(std::time::Duration::ZERO, |t| t.elapsed());
-        let mut lap = super::Laps::new();
+        let kind = if self.deferred { 2 } else if cp.in_parallel_run() { 1 } else { 0 };
+        let mut lap = super::Laps::for_draw(kind);
         let reg = |r: u32| ctx_reg(cp, r);
         // CB_COLOR_CONTROL.MODE: 0 color disabled, 1 normal; others are
         // metadata passes (fast-clear eliminate, FMASK/DCC decompress, resolve)
@@ -849,11 +850,15 @@ impl Exec {
         };
         let t_pipe = since(t0);
         lap.mark(7);
+        // Profile: the step's parts by draw kind ([draws, grow ns, check
+        // ns, pending, resolve ns]).
+        let hz_t = profiling().then(std::time::Instant::now);
         // Depth arrays sampled with more layers than rendered so far.
         match &ps {
             Some(p) => self.grow_sampled_depth(&[&vs, p]),
             None => self.grow_sampled_depth(&[&vs]),
         }
+        let hz_t1 = hz_t.map(|_| std::time::Instant::now());
         // Fast clears (metadata writes), reloads and block copies of the
         // attachments and textures.
         let mut used = std::mem::take(&mut self.keys_scratch);
@@ -863,6 +868,7 @@ impl Exec {
             Some(p) => super::image_hazards(&[&vs, p], &mut used),
             None => super::image_hazards(&[&vs], &mut used),
         };
+        let hz_t2 = hz_t.map(|_| std::time::Instant::now());
         if self.stopped {
             return Err(super::STOPPED.into());
         }
@@ -873,6 +879,14 @@ impl Exec {
             if self.stopped {
                 return Err(super::STOPPED.into());
             }
+        }
+        if let (Some(t0), Some(t1), Some(t2)) = (hz_t, hz_t1, hz_t2) {
+            let h = &super::HAZARD_STEPS[kind];
+            h[0].fetch_add(1, Ordering::Relaxed);
+            h[1].fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
+            h[2].fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
+            h[3].fetch_add(pending as u64, Ordering::Relaxed);
+            h[4].fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         self.keys_scratch = used;
         lap.mark(8);
@@ -1317,6 +1331,7 @@ impl Exec {
         lap.mark(17);
         if super::profiling() {
             super::note_phases(&super::DRAW_PHASES, [t_prep, t_pipe, t_bind, since(t0)]);
+            super::DRAW_STEPS[kind][18].fetch_add(1, Ordering::Relaxed);
         }
         Ok(true)
     }

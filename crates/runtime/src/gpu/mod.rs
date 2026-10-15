@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 96] = [
+    static ALL: [Tunable; 97] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -123,6 +123,7 @@ pub mod tune {
         Tunable { name: "copy_update", env: "DS_COPY_UPDATE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "skip_copies", env: "DS_SKIP_COPIES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "draw_args_gpu", env: "DS_DRAW_ARGS_GPU", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "zero_fill_clears", env: "DS_ZERO_FILL_CLEARS", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1004,6 +1005,15 @@ pub mod tune {
     #[inline]
     pub fn draw_args_gpu() -> bool {
         get(95) != 0
+    }
+
+    /// GPU-owned images whose memory the fill kernel zeroes (recognized
+    /// when recorded, `verify::full_fill`) are cleared right after the fill
+    /// in its batch (`Images::zero_filled`), instead of their next user
+    /// waiting for the GPU and scanning their bytes.
+    #[inline]
+    pub fn zero_fill_clears() -> bool {
+        get(96) != 0
     }
 
 

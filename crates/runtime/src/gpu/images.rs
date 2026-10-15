@@ -347,6 +347,10 @@ pub fn texel_bytes(f: vk::Format) -> u32 {
     }
 }
 
+/// GPU-owned images cleared right after a zero fill of their memory
+/// (`Images::zero_filled`).
+pub static ZERO_FILL_CLEARS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn is_depth(f: vk::Format) -> bool {
     matches!(f, vk::Format::D16_UNORM | vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT | vk::Format::D16_UNORM_S8_UINT | vk::Format::D24_UNORM_S8_UINT | vk::Format::S8_UINT)
 }
@@ -2151,6 +2155,41 @@ impl Images {
         }
     }
 
+    /// The fill kernel stores zeros over [base, base+len) (`tune
+    /// zero_fill_clears`): the GPU-owned images it covers as
+    /// `note_overwrites` counts covering are cleared by the caller right after
+    /// the fill, in its batch (returned), instead of being marked overwritten
+    /// (which made their next user wait for the GPU, scan their guest bytes
+    /// for zeros and clear them: ~6,300 per gate run, ~0.4 ms each on the
+    /// graphics command processor). Compressed formats keep that path.
+    pub fn zero_filled(&mut self, base: u64, len: u64) -> Vec<(vk::Image, vk::Format)> {
+        let mut out = Vec::new();
+        if len == 0 || self.owned.is_empty() {
+            return out;
+        }
+        let end = base.saturating_add(len);
+        let keys: Vec<ImageKey> = self.owned.range(base.saturating_sub(self.max_span)..end).flat_map(|(_, v)| v.iter().copied()).collect();
+        for k in keys {
+            let Some(img) = self.map.get_mut(&k) else { continue };
+            let span = img.span;
+            if !img.gpu_written || is_compressed(k.format) || !(base <= k.base && k.base + span <= end && len <= 2 * span + (64 << 10)) {
+                continue;
+            }
+            if img.overwritten {
+                img.overwritten = false;
+                self.overwritten_keys.remove(&k);
+                self.pending_overwrites = self.pending_overwrites.saturating_sub(1);
+            }
+            self.pending_change += 1;
+            self.note_gen += 1;
+            NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+            self.overwrite_clears += 1;
+            ZERO_FILL_CLEARS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            out.push((img.image, k.format));
+        }
+        out
+    }
+
     /// Whether any of `keys` was overwritten through a buffer.
     pub fn overwrites_pending(&self, keys: &[ImageKey]) -> bool {
         self.pending_overwrites > 0 && keys.iter().any(|k| self.map.get(k).is_some_and(|i| i.overwritten))
@@ -3004,7 +3043,7 @@ impl Images {
             String::new()
         };
         format!(
-            "    images: {} cached, {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; staging buffers made {}, waits for uploads in flight {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages); GPU-owned images overwritten through buffers: {} cleared, {} uploaded; re-uploads after mapping changes: {}\n",
+            "    images: {} cached, {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; staging buffers made {}, waits for uploads in flight {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}\n",
             self.map.len(),
             self.uploads,
             self.reuploads,
@@ -3026,6 +3065,7 @@ impl Images {
             ww[1].load(Relaxed) as f64 / ww[0].load(Relaxed).max(1) as f64 / 1000.0,
             ww[2].load(Relaxed),
             self.overwrite_clears,
+            ZERO_FILL_CLEARS.load(std::sync::atomic::Ordering::Relaxed),
             self.overwrite_uploads,
             remaps.join(", ")
         )

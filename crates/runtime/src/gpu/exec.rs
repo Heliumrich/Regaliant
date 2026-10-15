@@ -3317,9 +3317,17 @@ fn phases_line(what: &str, table: &[AtomicU64; 5], names: [&str; 3]) -> String {
     )
 }
 
-/// Finer command-processor time per draw (DS_PROFILE_GPU), ns per step of
-/// `DRAW_STEP_NAMES`; the count is DRAW_PHASES[4].
-pub(super) static DRAW_STEPS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+/// Finer command-processor time per draw (DS_PROFILE_GPU) by kind
+/// (`DRAW_KINDS`), ns per step of `DRAW_STEP_NAMES`, then the count of draws
+/// recorded to the end.
+pub(super) static DRAW_STEPS: [[AtomicU64; 19]; 3] = [const { [const { AtomicU64::new(0) }; 19] }; 3];
+/// The draws' image-hazard step by kind (DS_PROFILE_GPU): [draws, ns
+/// growing sampled depth arrays, ns finding the images and pending work,
+/// draws with pending work, ns resolving it].
+pub(super) static HAZARD_STEPS: [[AtomicU64; 5]; 3] = [const { [const { AtomicU64::new(0) }; 5] }; 3];
+/// Draw kinds of the profile: recorded by the graphics command processor
+/// serially, in its own chunk of a parallel run, or by a parallel worker.
+pub(super) const DRAW_KINDS: [&str; 3] = ["graphics serial", "graphics own chunks", "graphics workers"];
 pub(super) const DRAW_STEP_NAMES: [&str; 18] = [
     "vs prepare", "ps prepare", "shader-read sync", "texture sync", "indices", "color targets", "depth target", "pipeline",
     "image hazards", "reserve", "bind vs", "bind ps", "set alloc", "set write", "rendering instance", "dynamic state",
@@ -3347,8 +3355,8 @@ pub(super) struct Laps {
 }
 
 impl Laps {
-    pub(super) fn new() -> Laps {
-        Laps { last: profiling().then(std::time::Instant::now), steps: &DRAW_STEPS }
+    pub(super) fn for_draw(kind: usize) -> Laps {
+        Laps { last: profiling().then(std::time::Instant::now), steps: &DRAW_STEPS[kind][..18] }
     }
     fn for_dispatch(kind: usize) -> Laps {
         Laps { last: profiling().then(std::time::Instant::now), steps: &CS_STEPS[kind][..CS_STEP_COUNT] }
@@ -3420,9 +3428,30 @@ fn sync_steps_line_inner() -> String {
 }
 
 fn draw_steps_line() -> String {
-    let n = DRAW_PHASES[4].load(Ordering::Relaxed).max(1);
-    let parts: Vec<String> = DRAW_STEP_NAMES.iter().zip(DRAW_STEPS.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
-    let mut s = format!("    command processor per draw by step (us): {}\n", parts.join(", "));
+    let mut s = String::new();
+    for (kind, steps) in DRAW_KINDS.iter().zip(DRAW_STEPS.iter()) {
+        let n = steps[18].load(Ordering::Relaxed);
+        if n == 0 {
+            continue;
+        }
+        let total: u64 = steps[..18].iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        let parts: Vec<String> = DRAW_STEP_NAMES.iter().zip(steps.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
+        s.push_str(&format!("    command processor per draw by step, {kind} ({n} draws, {:.2} us each): {}\n", total as f64 / n as f64 / 1000.0, parts.join(", ")));
+    }
+    for (kind, h) in DRAW_KINDS.iter().zip(HAZARD_STEPS.iter()) {
+        let v: Vec<u64> = h.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        if v[0] == 0 {
+            continue;
+        }
+        let us = |x: u64| x as f64 / v[0] as f64 / 1000.0;
+        s.push_str(&format!(
+            "    image-hazard step, {kind}: grow sampled depth {:.2} us, find images and pending work {:.2} us, pending at {:.1}% of draws, resolving {:.2} us (per draw)\n",
+            us(v[1]),
+            us(v[2]),
+            v[3] as f64 * 100.0 / v[0] as f64,
+            us(v[4])
+        ));
+    }
     for (kind, steps) in CS_KINDS.iter().zip(CS_STEPS.iter()) {
         let n = steps[CS_STEP_COUNT].load(Ordering::Relaxed);
         if n == 0 {
@@ -3620,7 +3649,7 @@ pub fn reset_shader_profile() {
     for c in crate::mem::WRITE_WATCH_STATS.iter() {
         c.store(0, Ordering::Relaxed);
     }
-    for c in DRAW_STEPS.iter().chain(CS_STEPS.iter().flatten()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()) {
+    for c in DRAW_STEPS.iter().flatten().chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     for c in CS_PHASES.iter().chain(DRAW_PHASES.iter()) {
@@ -4615,6 +4644,30 @@ impl Exec {
         self.barrier_wanted = false;
         self.dispatched = false;
         crate::info!("gpu[{}]: homes written back and dropped (tune homes 0)", self.name);
+    }
+
+    /// Clears images to zero in the batch being recorded (after the fill of
+    /// their memory recorded just before: `Images::zero_filled`), between
+    /// barriers.
+    fn clear_images_zero(&mut self, images: &[(vk::Image, vk::Format)]) {
+        self.begin();
+        self.end_rendering();
+        let d = &ctx().device;
+        let cmd = self.cmd();
+        unsafe {
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            for &(image, format) in images {
+                let range = vk::ImageSubresourceRange { aspect_mask: super::images::aspects(format), base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS };
+                if super::images::is_depth(format) {
+                    d.cmd_clear_depth_stencil_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearDepthStencilValue { depth: 0.0, stencil: 0 }, &[range]);
+                } else {
+                    d.cmd_clear_color_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearColorValue::default(), &[range]);
+                }
+            }
+            let a = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[a], &[], &[]);
+        }
     }
 
     /// Writes the write-watched (argument) homes' GPU-written parts back and
@@ -7078,10 +7131,20 @@ impl Exec {
         if plain && super::tune::fill_dma() {
             if let Some((base, len, v)) = verify::full_fill(&p, groups, local, threads_x) {
                 if self.fill_in_place(base, len, v)? {
-                    super::images::with(|im| {
-                        im.note_writes(&[(base, len)], &[(base, len)]);
+                    let zeroed = super::images::with(|im| {
+                        let z = if v == 0 && super::tune::zero_fill_clears() {
+                            im.note_meta_writes(&[(base, len)]);
+                            im.zero_filled(base, len)
+                        } else {
+                            im.note_writes(&[(base, len)], &[(base, len)]);
+                            Vec::new()
+                        };
                         im.note_meta_fill(base, len, v);
+                        z
                     });
+                    if !zeroed.is_empty() {
+                        self.clear_images_zero(&zeroed);
+                    }
                     super::mirror::invalidate(&[(base, len)]);
                     super::track::gpu_write(base, len);
                     self.note_write(base, len);

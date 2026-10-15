@@ -1991,6 +1991,12 @@ impl Cp {
         true
     }
 
+    /// Whether this (main) command processor is recording its own chunk of a
+    /// parallel run (profile: draw kinds).
+    pub(super) fn in_parallel_run(&self) -> bool {
+        self.par.is_some()
+    }
+
     /// START_INST_LOC for an indirect draw packet that names none (our Agc
     /// builders): the SH register of the bound primitive shader's
     /// instance-offset user SGPR (its shader object declares it, see
