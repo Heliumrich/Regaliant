@@ -610,6 +610,7 @@ pub fn remapped(base: u64, len: u64, op: u8) {
     super::exec::note_remap_over_imports(base, len, op);
     super::precache::invalidate(base, len);
     super::homes::remapped(base, len);
+    super::resident::remapped(base, len);
     RESET_GEN.fetch_add(1, Ordering::Release);
     let mut g = TRACK.lock();
     let Some(t) = g.as_mut() else { return };

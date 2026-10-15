@@ -46,6 +46,9 @@ pub struct Ctx {
     /// bufferDeviceAddress enabled: guest imports and video-memory homes get
     /// GPU addresses that fault reports name (`note_gpu_range`).
     pub device_addresses: bool,
+    /// sparseBinding and sparseResidencyBuffer enabled (`DS_RESIDENT=1`:
+    /// the residency mirror, `gpu::resident`).
+    pub sparse_buffers: bool,
     /// shaderDrawParameters and drawIndirectFirstInstance enabled: vertex
     /// shaders of draws whose arguments the GPU reads take the start
     /// instance from gl_BaseInstance (`tune draw_args_gpu`).
@@ -336,6 +339,16 @@ fn init_inner() -> Result<(), String> {
             dexts.push(ash::khr::fragment_shader_barycentric::NAME.as_ptr());
         }
         let first_instance = instance.get_physical_device_features(pdev).draw_indirect_first_instance != 0;
+        // Sparse buffers for the residency mirror (`DS_RESIDENT=1`): the
+        // device and the main queue's family must support them.
+        let sparse_buffers = super::resident::wanted() && {
+            let f = instance.get_physical_device_features(pdev);
+            let fam = instance.get_physical_device_queue_family_properties(pdev)[qf as usize].queue_flags;
+            f.sparse_binding != 0 && f.sparse_residency_buffer != 0 && fam.contains(vk::QueueFlags::SPARSE_BINDING)
+        };
+        if super::resident::wanted() && !sparse_buffers {
+            crate::warn!("DS_RESIDENT=1 but the device or the main queue family has no sparse buffers");
+        }
         let features = vk::PhysicalDeviceFeatures::default()
             .draw_indirect_first_instance(first_instance)
             .robust_buffer_access(true)
@@ -355,7 +368,9 @@ fn init_inner() -> Result<(), String> {
             .vertex_pipeline_stores_and_atomics(true)
             .fragment_stores_and_atomics(true)
             .multi_draw_indirect(true)
-            .sample_rate_shading(true);
+            .sample_rate_shading(true)
+            .sparse_binding(sparse_buffers)
+            .sparse_residency_buffer(sparse_buffers);
         // Image tables are indexed per invocation (non-uniform indexing).
         let mut f12_supported = vk::PhysicalDeviceVulkan12Features::default();
         let mut f11_supported = vk::PhysicalDeviceVulkan11Features::default();
@@ -461,6 +476,7 @@ fn init_inner() -> Result<(), String> {
             calibrated: calibrated.then(|| ash::ext::calibrated_timestamps::Device::new(&instance, &device)),
             fault: has_fault.then(|| ash::ext::device_fault::Device::new(&instance, &device)),
             device_addresses,
+            sparse_buffers,
             draw_parameters: draw_parameters && first_instance,
             families,
             copy,

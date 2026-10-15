@@ -250,6 +250,7 @@ pub fn enabled() -> bool {
         match super::vk::init() {
             Ok(()) => {
                 crate::info!("gpu: executing compute dispatches on Vulkan (DS_GPU=1)");
+                super::resident::init();
                 true
             }
             Err(e) => {
@@ -7911,6 +7912,7 @@ pub fn status() -> String {
         + &super::images::scrub_status()
         + &super::mirror::status()
         + &super::homes::status()
+        + &super::resident::status()
         + &sync_why_status()
         + &format!(
             "    buffer snapshots in VRAM: {} ({} MiB), {} reused, {} not for lack of space, {} for memory that cannot be imported; draws with snapshotted indices {} ({} MiB); batch-start copies {} ({} MiB), {} reused, {} not for lack of space; on the copy queue {} ({} MiB)\n",
