@@ -30,7 +30,13 @@
 //! VOLATILE_FRAMES of its last write fault is volatile: never armed again
 //! (each fault and re-arm costs microseconds), it keeps the old placements.
 //! Pages an import covers are host class (`mark_host`, called before every
-//! import): protecting imported pages lost the device. Writes that cannot
+//! import): protecting imported pages lost the device.
+//!
+//! CPU-write tracking for section-backed guest memory (`sections`, which has
+//! no write watching): `take_written` reports the pages not taken since they
+//! were last written (no `ST_CLEAN`), marks them clean and arms them; a write
+//! fault, a file read or a remap clears the bit. The table and fault path run
+//! whenever sections are on (`tracking`), the mirror only with `DS_RESIDENT`. Writes that cannot
 //! fault (file reads: the kernel fails them on a read-only page, "Invalid
 //! access to memory location") announce themselves (`host_write_begin` and
 //! `_end`, from `track::host_write`'s guard): their pages are disarmed and
@@ -63,6 +69,12 @@ const ST_BUSY: u8 = 4;
 pub const ST_HOST: u8 = 8;
 /// Written by the CPU in nearby frames again and again: never armed.
 pub const ST_VOLATILE: u8 = 16;
+/// Taken since its last write (`take_written`; cleared by write faults, file
+/// reads, remaps).
+const ST_CLEAN: u8 = 64;
+/// The guest cannot write it (read-only or no-access protection when it was
+/// to be armed): clean once taken, without arming (cleared by remaps).
+const ST_GUEST_RO: u8 = 128;
 /// A page's upload sequence while the batch copying it is not submitted.
 const PENDING: u64 = u64::MAX;
 /// A write fault this many frames after the page's last one makes it volatile.
@@ -76,6 +88,9 @@ struct Chunk {
     faulted: Box<[AtomicU32]>,
     /// Writes that cannot fault in progress over the page (`host_write_begin`).
     writing: Box<[AtomicU8]>,
+    /// The synchronization epoch (`precache::epoch`, low bits) a page that
+    /// cannot be armed was last reported written in (`take_written`).
+    stamp: Box<[AtomicU32]>,
 }
 
 /// Chunks by guest address >> CHUNK_SHIFT; never removed (16 KiB each).
@@ -133,6 +148,12 @@ pub fn enabled() -> bool {
     ON.load(Ordering::Acquire)
 }
 
+/// The page table, arming and write faults run: residency, or section-backed
+/// guest memory (its CPU-write tracking, `take_written`).
+pub fn tracking() -> bool {
+    ON.load(Ordering::Acquire) || crate::sections::on()
+}
+
 fn chunk(addr: u64, create: bool) -> Option<&'static Chunk> {
     let key = addr >> CHUNK_SHIFT;
     if let Some(c) = TABLE.read().as_ref().and_then(|t| t.get(&key).copied()) {
@@ -149,6 +170,7 @@ fn chunk(addr: u64, create: bool) -> Option<&'static Chunk> {
             seqs: (0..CHUNK_PAGES).map(|_| AtomicU64::new(0)).collect(),
             faulted: (0..CHUNK_PAGES).map(|_| AtomicU32::new(0)).collect(),
             writing: (0..CHUNK_PAGES).map(|_| AtomicU8::new(0)).collect(),
+            stamp: (0..CHUNK_PAGES).map(|_| AtomicU32::new(0)).collect(),
         }))
     }))
 }
@@ -177,6 +199,7 @@ pub fn mark_host(base: u64, len: u64) {
             if slot(c, p).fetch_or(ST_HOST, Ordering::AcqRel) & ST_HOST == 0 {
                 n += 1;
             }
+            slot(c, p).fetch_and(!ST_CLEAN, Ordering::AcqRel);
         }
         p += PAGE;
     }
@@ -192,6 +215,68 @@ fn protect(a: u64, n: u64, prot: u32) -> bool {
     STATS[S_PROTECTS + k].fetch_add(1, Ordering::Relaxed);
     STATS[S_PROTECT_NS + k].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     ok
+}
+
+/// Protects [a, e) with `prot`, one call per memory region (a call cannot
+/// span two section views). With `need_rw` only when every region is plain
+/// read-write now; false (nothing changed) otherwise.
+fn protect_regions(a: u64, e: u64, prot: u32, need_rw: bool) -> bool {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_READWRITE};
+    let mut regions = Vec::new();
+    let mut p = a;
+    while p < e {
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(p as _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+            return false;
+        }
+        if need_rw && (info.State != MEM_COMMIT || info.Protect != PAGE_READWRITE) {
+            return false;
+        }
+        let end = (info.BaseAddress as u64 + info.RegionSize as u64).min(e);
+        regions.push((p, end));
+        p = end;
+    }
+    for (k, &(s, t)) in regions.iter().enumerate() {
+        if !protect(s, t - s, prot) {
+            for &(s0, t0) in &regions[..k] {
+                protect(s0, t0 - s0, PAGE_READWRITE);
+            }
+            return false;
+        }
+    }
+    true
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegionKind {
+    /// Committed, plain read-write.
+    Rw,
+    /// The guest cannot write it (uncommitted, read-only, no access).
+    NotWritable,
+    /// Anything else (guard, executable read-write).
+    Other,
+}
+
+/// The memory region holding `p`, clipped to `e`: (end, kind).
+fn region_kind(p: u64, e: u64) -> (u64, RegionKind) {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE};
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { VirtualQuery(p as _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+        return (e, RegionKind::Other);
+    }
+    let end = (info.BaseAddress as u64 + info.RegionSize as u64).min(e).max(p + PAGE);
+    // Uncommitted pages (unmapped tiles of partially resident textures) cannot
+    // be written either (a remap committing them clears the mark).
+    let kind = if info.State != MEM_COMMIT {
+        RegionKind::NotWritable
+    } else if info.Protect == PAGE_READWRITE {
+        RegionKind::Rw
+    } else if matches!(info.Protect, PAGE_READONLY | PAGE_EXECUTE_READ | PAGE_NOACCESS | PAGE_EXECUTE) {
+        RegionKind::NotWritable
+    } else {
+        RegionKind::Other
+    };
+    (end, kind)
 }
 
 /// Whether [a, a+n) is committed plain read-write memory now.
@@ -216,29 +301,40 @@ fn plain_rw(a: u64, n: u64) -> bool {
 /// a run that is not plain read-write memory is not armed. Returns the
 /// pages armed.
 pub fn arm(base: u64, len: u64) -> u64 {
+    arm_with(base, len, ST_VALID)
+}
+
+/// `arm`, setting `extra` besides ST_ARMED (ST_VALID for the mirror; nothing
+/// for write tracking).
+fn arm_with(base: u64, len: u64, extra: u8) -> u64 {
     use windows_sys::Win32::System::Memory::PAGE_READONLY;
     let (lo, hi) = (base & !(PAGE - 1), (base + len).next_multiple_of(PAGE));
     let mut armed = 0;
     let mut p = lo;
     // Runs of pages taken busy, protected with one call each.
     let mut run: Option<(u64, u64)> = None;
+    // Region by region (a protection call cannot span two section views):
+    // plain read-write regions are armed, regions the guest cannot write are
+    // marked so (clean once taken), others are left.
     let flush = |run: &mut Option<(u64, u64)>, armed: &mut u64| {
         if let Some((a, e)) = run.take() {
-            let ok = plain_rw(a, e - a) && protect(a, e - a, PAGE_READONLY);
-            let mut q = a;
-            while q < e {
-                if let Some(c) = chunk(q, false) {
-                    let s = slot(c, q);
-                    if ok {
-                        s.store((s.load(Ordering::Acquire) | ST_ARMED | ST_VALID) & !ST_BUSY, Ordering::Release);
-                    } else {
-                        s.fetch_and(!ST_BUSY, Ordering::AcqRel);
+            let mut p = a;
+            while p < e {
+                let (r_end, kind) = region_kind(p, e);
+                let ok = kind == RegionKind::Rw && protect(p, r_end - p, PAGE_READONLY);
+                let mark = if ok { ST_ARMED | extra } else if kind == RegionKind::NotWritable { ST_GUEST_RO } else { 0 };
+                let mut q = p;
+                while q < r_end {
+                    if let Some(c) = chunk(q, false) {
+                        let s = slot(c, q);
+                        s.store((s.load(Ordering::Acquire) | mark) & !ST_BUSY, Ordering::Release);
                     }
+                    q += PAGE;
                 }
-                q += PAGE;
-            }
-            if ok {
-                *armed += (e - a) / PAGE;
+                if ok {
+                    *armed += (r_end - p) / PAGE;
+                }
+                p = r_end;
             }
         }
     };
@@ -272,11 +368,11 @@ pub fn arm(base: u64, len: u64) -> u64 {
 fn disarm_range(lo: u64, hi: u64) {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     let release = |a: u64, e: u64| {
-        protect(a, e - a, PAGE_READWRITE);
+        protect_regions(a, e, PAGE_READWRITE, false);
         let mut q = a;
         while q < e {
             if let Some(c) = chunk(q, false) {
-                slot(c, q).fetch_and(!(ST_ARMED | ST_VALID | ST_BUSY), Ordering::AcqRel);
+                slot(c, q).fetch_and(!(ST_ARMED | ST_VALID | ST_BUSY | ST_CLEAN), Ordering::AcqRel);
             }
             q += PAGE;
         }
@@ -329,7 +425,7 @@ fn disarm_range(lo: u64, hi: u64) {
 /// A guest commit, decommit or protection change of [base, base+len): its
 /// pages are no longer armed or valid (the new protection is the guest's).
 pub fn remapped(base: u64, len: u64) {
-    if !enabled() || len == 0 {
+    if !tracking() || len == 0 {
         return;
     }
     let (lo, hi) = (base & !(PAGE - 1), base.saturating_add(len).next_multiple_of(PAGE));
@@ -346,7 +442,7 @@ pub fn remapped(base: u64, len: u64) {
                 std::hint::spin_loop();
                 continue;
             }
-            if cur & (ST_ARMED | ST_VALID) == 0 || s.compare_exchange(cur, cur & !(ST_ARMED | ST_VALID), Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if cur & (ST_ARMED | ST_VALID | ST_CLEAN | ST_GUEST_RO) == 0 || s.compare_exchange(cur, cur & !(ST_ARMED | ST_VALID | ST_CLEAN | ST_GUEST_RO), Ordering::AcqRel, Ordering::Acquire).is_ok() {
                 break;
             }
         }
@@ -362,7 +458,7 @@ pub fn remapped(base: u64, len: u64) {
 /// (the table's read lock only).
 pub fn on_fault(addr: u64, write: bool) -> bool {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
-    if !write || !enabled() {
+    if !write || !tracking() {
         return false;
     }
     let page = addr & !(PAGE - 1);
@@ -389,7 +485,7 @@ pub fn on_fault(addr: u64, write: bool) -> bool {
             let frame = super::FRAMES.load(Ordering::Relaxed) as u32 + 1;
             let last = c.faulted[idx(page)].swap(frame, Ordering::AcqRel);
             let volatile = last != 0 && frame.wrapping_sub(last) <= VOLATILE_FRAMES;
-            s.store((cur & !(ST_ARMED | ST_VALID | ST_BUSY)) | if volatile { ST_VOLATILE } else { 0 }, Ordering::Release);
+            s.store((cur & !(ST_ARMED | ST_VALID | ST_BUSY | ST_CLEAN)) | if volatile { ST_VOLATILE } else { 0 }, Ordering::Release);
             STATS[S_FAULTS].fetch_add(1, Ordering::Relaxed);
             if volatile {
                 STATS[S_VOLATILE].fetch_add(1, Ordering::Relaxed);
@@ -397,6 +493,65 @@ pub fn on_fault(addr: u64, write: bool) -> bool {
             return true;
         }
     }
+}
+
+/// Statistics of `take_written`: [calls, pages reported, pages armed].
+pub static TAKE_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The 4 KiB pages of [base, base+size) the CPU may have written since they
+/// were last taken (section-backed memory: `mem::take_written`), into `out`.
+/// Reported pages are marked clean and armed (read-only), so their next
+/// write faults and clears the mark; volatile and host-class pages, and
+/// pages a file read is writing, stay unarmed and are always reported.
+pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
+    if size == 0 {
+        return Some(());
+    }
+    let (lo, hi) = (base & !(PAGE - 1), base.saturating_add(size).next_multiple_of(PAGE));
+    let first = out.len();
+    let epoch = super::precache::epoch() as u32;
+    let mut arm_from = None;
+    let mut armed = 0;
+    let mut p = lo;
+    while p < hi {
+        let c = chunk(p, true)?;
+        let i = idx(p);
+        let s = c.pages[i].load(Ordering::Acquire);
+        let clean = s & ST_CLEAN != 0 && s & (ST_ARMED | ST_GUEST_RO) != 0;
+        let unarmable = s & (ST_VOLATILE | ST_HOST) != 0 || c.writing[i].load(Ordering::Acquire) != 0;
+        if unarmable {
+            // Not tracked: written as far as anyone knows, reported once per
+            // synchronization epoch (the title orders its writes for our
+            // commands before an epoch ends; write watching reported a page
+            // once per write).
+            if c.stamp[i].swap(epoch, Ordering::AcqRel) != epoch {
+                out.push(p);
+            }
+        } else if !clean {
+            out.push(p);
+            // Clean before armed: a write in between needs no fault, as the
+            // caller reads the memory after this returns.
+            c.pages[i].fetch_or(ST_CLEAN, Ordering::AcqRel);
+        }
+        // Runs of pages to arm (clean, neither armed nor known unwritable).
+        let want = !unarmable && c.pages[i].load(Ordering::Acquire) & (ST_ARMED | ST_CLEAN | ST_GUEST_RO) == ST_CLEAN;
+        match (want, arm_from) {
+            (true, None) => arm_from = Some(p),
+            (false, Some(a)) => {
+                armed += arm_with(a, p - a, 0);
+                arm_from = None;
+            }
+            _ => {}
+        }
+        p += PAGE;
+    }
+    if let Some(a) = arm_from {
+        armed += arm_with(a, hi - a, 0);
+    }
+    TAKE_STATS[0].fetch_add(1, Ordering::Relaxed);
+    TAKE_STATS[1].fetch_add((out.len() - first) as u64, Ordering::Relaxed);
+    TAKE_STATS[2].fetch_add(armed, Ordering::Relaxed);
+    Some(())
 }
 
 /// What a read-only binding may do with a page (`page`).
@@ -485,10 +640,14 @@ pub fn claim_pages(pages: &[u64]) -> usize {
 /// [base, base+len): its pages in the mirror's span are disarmed and stay
 /// out of the mirror until `host_write_end`.
 pub fn host_write_begin(base: u64, len: u64) {
-    if !enabled() || len == 0 {
+    if !tracking() || len == 0 {
         return;
     }
-    let (lo, hi) = ((base & !(PAGE - 1)).max(MIRROR_BASE), base.saturating_add(len).next_multiple_of(PAGE).min(MIRROR_END));
+    let (lo, hi) = if enabled() {
+        ((base & !(PAGE - 1)).max(MIRROR_BASE), base.saturating_add(len).next_multiple_of(PAGE).min(MIRROR_END))
+    } else {
+        (base & !(PAGE - 1), base.saturating_add(len).next_multiple_of(PAGE))
+    };
     if lo >= hi {
         return;
     }
@@ -496,6 +655,7 @@ pub fn host_write_begin(base: u64, len: u64) {
     while p < hi {
         if let Some(c) = chunk(p, true) {
             c.writing[idx(p)].fetch_add(1, Ordering::AcqRel);
+            c.pages[idx(p)].fetch_and(!ST_CLEAN, Ordering::AcqRel);
         }
         p += PAGE;
     }
@@ -507,10 +667,14 @@ pub fn host_write_begin(base: u64, len: u64) {
 /// The write announced by `host_write_begin(base, len)` ended: its pages
 /// may be armed again (the mirror's copies of them are stale).
 pub fn host_write_end(base: u64, len: u64) {
-    if !enabled() || len == 0 {
+    if !tracking() || len == 0 {
         return;
     }
-    let (lo, hi) = ((base & !(PAGE - 1)).max(MIRROR_BASE), base.saturating_add(len).next_multiple_of(PAGE).min(MIRROR_END));
+    let (lo, hi) = if enabled() {
+        ((base & !(PAGE - 1)).max(MIRROR_BASE), base.saturating_add(len).next_multiple_of(PAGE).min(MIRROR_END))
+    } else {
+        (base & !(PAGE - 1), base.saturating_add(len).next_multiple_of(PAGE))
+    };
     let mut p = lo;
     while p < hi {
         if let Some(c) = chunk(p, false) {
@@ -853,19 +1017,103 @@ fn section_test() -> Result<String, String> {
         })();
         UnmapViewOfFile2(GetCurrentProcess(), a, MEM_PRESERVE_PLACEHOLDER);
         UnmapViewOfFile2(GetCurrentProcess(), b, MEM_PRESERVE_PLACEHOLDER);
+        // Granularity: a 16 KiB view at a 16 KiB (not 64 KiB) aligned address
+        // and section offset, split out of a placeholder.
+        let fine = (|| -> Result<&'static str, String> {
+            let at = base as usize + (1 << 20) + (16 << 10);
+            if VirtualFree(at as _, 16 << 10, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0 {
+                return Err(format!("splitting a placeholder at 16 KiB granularity: error {}", GetLastError()));
+            }
+            let v = MapViewOfFile3(sec, GetCurrentProcess(), at as _, 16 << 10, 16 << 10, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
+            if v.Value.is_null() {
+                return Err(format!("a 16 KiB view at 16 KiB alignment: error {}", GetLastError()));
+            }
+            UnmapViewOfFile2(GetCurrentProcess(), v, MEM_PRESERVE_PLACEHOLDER);
+            VirtualFree(at as _, 0, MEM_RELEASE);
+            VirtualFree((at + (16 << 10)) as _, 0, MEM_RELEASE);
+            Ok("16 KiB views at 16 KiB granularity work")
+        })();
+        // One import spanning four adjacent 64 KiB views of non-contiguous
+        // section offsets (the title maps buffers in batch-mapped pieces).
+        let multi = (|| -> Result<&'static str, String> {
+            let at = base as usize + size;
+            let piece = 64usize << 10;
+            let offs = [3usize, 1, 2, 0].map(|k| (8 << 20) + k * piece);
+            let mut views = Vec::new();
+            for (i, &off) in offs.iter().enumerate() {
+                let va = at + i * piece;
+                if VirtualFree(va as _, piece, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0 {
+                    return Err(format!("splitting placeholders: error {}", GetLastError()));
+                }
+                let v = MapViewOfFile3(sec, GetCurrentProcess(), va as _, off as u64, piece, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
+                if v.Value.is_null() {
+                    return Err(format!("mapping piece {i}: error {}", GetLastError()));
+                }
+                views.push(v);
+            }
+            let r = (|| -> Result<&'static str, String> {
+                let (buf, mem, _) = c.import_host(at as u64, 4 * piece as u64, vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER).map_err(|e| format!("importing across views: {e}"))?;
+                let r = one_off(|cmd| {
+                    for i in 0..4u64 {
+                        c.device.cmd_fill_buffer(cmd, buf, i * piece as u64, piece as u64, 0xC0DE_0000 + i as u32);
+                    }
+                });
+                c.device.destroy_buffer(buf, None);
+                c.device.free_memory(mem, None);
+                r?;
+                if !(0..4usize).all(|i| std::ptr::read_volatile(((at + i * piece) + 4092) as *const u32) == 0xC0DE_0000 + i as u32) {
+                    return Err("GPU fills across views landed wrong".into());
+                }
+                Ok("one import spans adjacent views of scattered section offsets")
+            })();
+            for (i, v) in views.into_iter().enumerate() {
+                UnmapViewOfFile2(GetCurrentProcess(), v, MEM_PRESERVE_PLACEHOLDER);
+                VirtualFree((at + i * piece) as _, 0, MEM_RELEASE);
+            }
+            VirtualFree((at + 4 * piece) as _, 0, MEM_RELEASE);
+            r
+        })();
         VirtualFree(base, 0, MEM_RELEASE);
         VirtualFree((base as usize + size) as _, 0, MEM_RELEASE);
         CloseHandle(sec);
-        r
+        let fine = match fine {
+            Ok(s) => s.to_string(),
+            Err(e) => format!("no fine views ({e})"),
+        };
+        let multi = match multi {
+            Ok(s) => s.to_string(),
+            Err(e) => format!("no imports across views ({e})"),
+        };
+        r.map(|s| format!("{s}; {fine}; {multi}"))
     }
 }
 
 /// Status line.
 pub fn status() -> String {
-    if !wanted() {
-        return String::new();
-    }
     let v: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if !wanted() {
+        if !crate::sections::on() {
+            return String::new();
+        }
+        let t: Vec<u64> = TAKE_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        return format!(
+            "    write tracking by protection (sections): {} takes reported {} pages, armed {}; {} write faults ({} races), {} volatile, {} host class; {} arming calls ({:.1} us each), {} disarming calls ({:.1} us each); {} host writes ({} pages); {} remaps\n",
+            t[0],
+            t[1],
+            t[2],
+            v[S_FAULTS],
+            v[S_RACES],
+            v[S_VOLATILE],
+            v[S_HOSTED],
+            v[S_PROTECTS],
+            v[S_PROTECT_NS] as f64 / v[S_PROTECTS].max(1) as f64 / 1000.0,
+            v[S_UNPROTECTS],
+            v[S_UNPROTECT_NS] as f64 / v[S_UNPROTECTS].max(1) as f64 / 1000.0,
+            v[S_HOST_WRITES],
+            v[S_HOST_WRITE_PAGES],
+            v[S_RESETS]
+        );
+    }
     let refused: Vec<String> = REFUSE_NAMES.iter().zip(REFUSED.iter()).map(|(n, c)| format!("{n} {}", c.load(Ordering::Relaxed))).collect();
     format!(
         "    residency ({}): {} bindings from the mirror ({} pages), {} pages uploaded; {} pages armed, {} write faults ({} races), {} volatile, {} host class; {} arming calls ({:.1} us each), {} disarming calls ({:.1} us each); {} host writes ({} pages); {} mirror pages backed, {} uploads, {} readbacks, {} remaps; refused: {}\n",

@@ -7,6 +7,9 @@
 //!
 //! Limitation (reported, never silent): mapping the same direct-memory range at
 //! two virtual addresses (aliasing) is not shared; it is detected and logged.
+//! With `DS_SECTIONS=1` guest memory is section-backed instead (`sections`):
+//! mappings are views, physical pages keep their contents across remaps and
+//! aliases share them, and the GPU imports alias views.
 
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
@@ -47,7 +50,18 @@ pub struct Vma {
     pub phys: u64,
     pub mtype: i32,
     pub name: String,
+    /// Section-backed memory (`sections`): the alias slot of its pages
+    /// (NO_SLOT: none) and, for memory other than direct, its offset in the
+    /// anonymous section.
+    pub slot: u8,
+    pub off: u64,
 }
+
+/// `Vma::slot` without an alias.
+pub const NO_SLOT: u8 = u8::MAX;
+/// The anonymous section's size (`sections`): flexible memory, modules and
+/// runtime-owned guest memory.
+const ANON_SIZE: u64 = 4 << 30;
 
 impl Vma {
     pub fn end(&self) -> u64 {
@@ -109,7 +123,7 @@ pub static PARK_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::a
 const PARK_CAP: u64 = 4 << 30;
 /// Direct mappings whose address, size and physical offset are all 64 KiB
 /// aligned, 16 KiB aligned, or neither.
-static MAP_ALIGN: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static MAP_ALIGN: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 const PARK_PAGE: u64 = 4096;
 
 /// `DS_PHYS_CARRY=1`: unmapped direct memory keeps its contents (`PARKED`).
@@ -221,7 +235,15 @@ pub fn remap_status() -> String {
     )
     .replace(
         " waiting)\n",
-        &format!(" waiting){carry}; direct mappings aligned to 64 KiB {}, to 16 KiB {}, less {}\n", MAP_ALIGN[0].load(o), MAP_ALIGN[1].load(o), MAP_ALIGN[2].load(o)),
+        &format!(
+            " waiting){carry}; direct mappings aligned to 64 KiB {}, to 16 KiB {}, less {}; other mappings {}, {}, {}\n",
+            MAP_ALIGN[0].load(o),
+            MAP_ALIGN[1].load(o),
+            MAP_ALIGN[2].load(o),
+            MAP_ALIGN[3].load(o),
+            MAP_ALIGN[4].load(o),
+            MAP_ALIGN[5].load(o)
+        ),
     )
 }
 
@@ -494,6 +516,11 @@ pub fn reserve_guest_range_early() {
         return;
     }
     let size = (GUEST_END - GUEST_BASE) as usize;
+    // Section-backed guest memory (no write watching: views have none).
+    if env_is("DS_SECTIONS", "1") && crate::sections::reserve(GUEST_BASE, size as u64, DMEM_SIZE, ANON_SIZE).is_ok() {
+        RESERVED_EARLY.store(true, std::sync::atomic::Ordering::Release);
+        return;
+    }
     if !env_is("DS_WRITE_WATCH", "0") {
         let p = unsafe { VirtualAlloc(GUEST_BASE as _, size, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS) };
         if !p.is_null() {
@@ -514,9 +541,10 @@ pub fn reserve_guest_range_early() {
 const MEM_WRITE_WATCH: u32 = 0x0020_0000;
 const WRITE_WATCH_FLAG_RESET: u32 = 1;
 
-/// Whether the guest range is write-watched.
+/// Whether CPU writes to the guest range are tracked (`take_written`):
+/// write watching, or page protection for section-backed memory.
 pub fn write_watched() -> bool {
-    WRITE_WATCH.load(std::sync::atomic::Ordering::Acquire)
+    WRITE_WATCH.load(std::sync::atomic::Ordering::Acquire) || crate::sections::on()
 }
 
 /// Write watching of the guest range, for the start-up log.
@@ -536,6 +564,14 @@ pub static WRITE_WATCH_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::
 /// None without write watching or when the query fails (treat as written).
 pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
     use std::sync::atomic::Ordering::Relaxed;
+    if crate::sections::on() {
+        let t = std::time::Instant::now();
+        let r = crate::gpu::resident::take_written(base, size, out);
+        WRITE_WATCH_STATS[0].fetch_add(1, Relaxed);
+        WRITE_WATCH_STATS[1].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        WRITE_WATCH_STATS[2].fetch_add(out.len() as u64, Relaxed);
+        return r;
+    }
     if !write_watched() || size == 0 {
         return None;
     }
@@ -658,6 +694,10 @@ fn cancel_deferred(start: u64, end: u64) -> Vec<(u64, u64)> {
 /// Decommits the deferred ranges no import covers any more (the GPU
 /// completion thread, after freeing dropped imports).
 pub fn retry_deferred() {
+    if crate::sections::on() {
+        crate::sections::retry_deferred(crate::gpu::imports_may_cover);
+        return;
+    }
     if DEFERRED_LEN.load(std::sync::atomic::Ordering::Acquire) == 0 {
         return;
     }
@@ -754,6 +794,70 @@ fn trace_map(op: &str, start: u64, end: u64, detail: std::fmt::Arguments) {
     }
 }
 
+/// Maps the views of a new mapping (`sections`): the guest view and its
+/// alias. Returns (alias slot, anonymous-section offset).
+fn section_commit(addr: u64, size: u64, kind: VmaKind, prot: u32, phys: u64) -> Result<(u8, u64), MemError> {
+    use crate::sections::{self as sec, Sec};
+    crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_COMMIT);
+    repaged(addr, size);
+    let (which, off) = if kind == VmaKind::Direct { (Sec::Dmem, phys) } else { (Sec::Anon, sec::anon_alloc(size).ok_or(MemError::NoSpace)?) };
+    if let Err(e) = sec::map_view(addr, size, which, off, win_prot(prot)) {
+        crate::warn!("mem: {e}");
+        if which == Sec::Anon {
+            sec::anon_free(off, size);
+        }
+        return Err(MemError::HostFailure(0));
+    }
+    let slot = match sec::map_alias(addr, size, which, off) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::warn!("mem: {e} (the GPU cannot import it)");
+            NO_SLOT
+        }
+    };
+    Ok((slot, if which == Sec::Anon { off } else { 0 }))
+}
+
+/// Unmaps the views of mapping `v` (`sections`): its guest view now, its
+/// alias once nothing maps through it and no GPU import may use it.
+fn section_release(v: &Vma) {
+    crate::gpu::track::remapped(v.start, v.size, crate::gpu::track::REMAP_DECOMMIT);
+    repaged(v.start, v.size);
+    {
+        let _readers_out = GUEST_READERS.write();
+        if let Err(e) = crate::sections::unmap_view(v.start) {
+            crate::warn!("mem: {e}");
+        }
+    }
+    if v.slot != NO_SLOT {
+        crate::sections::alias_unref(v.start, v.size, v.slot, crate::gpu::imports_may_cover);
+    }
+    if v.kind != VmaKind::Direct {
+        crate::sections::anon_free(v.off, v.size);
+    }
+}
+
+/// Splits the guest view of mapping `v` at `at` (`sections`): views cannot
+/// be unmapped in part, so it is unmapped and mapped again as two views of
+/// the same section pages (contents kept). Faults of other threads inside it
+/// meanwhile wait (`sections::wait_split`); the residency's protections of its
+/// pages are reset.
+fn section_split(v: &Vma, at: u64) {
+    use crate::sections::{self as sec, Sec};
+    let (which, off) = if v.kind == VmaKind::Direct { (Sec::Dmem, v.phys) } else { (Sec::Anon, v.off) };
+    crate::gpu::track::remapped(v.start, v.size, crate::gpu::track::REMAP_PROTECT);
+    let _readers_out = GUEST_READERS.write();
+    sec::split_begin(v.start, v.end());
+    let lo = at - v.start;
+    let r = sec::unmap_view(v.start)
+        .and_then(|_| sec::map_view(v.start, lo, which, off, win_prot(v.prot)))
+        .and_then(|_| sec::map_view(at, v.end() - at, which, off + lo, win_prot(v.prot)));
+    sec::split_end();
+    if let Err(e) = r {
+        crate::error!("mem: splitting the view {:#x}+{:#x} at {at:#x}: {e}", v.start, v.size);
+    }
+}
+
 impl MemState {
     /// Finds a free, aligned range of `size` bytes at or above `hint`.
     pub fn find_free(&self, hint: u64, size: u64, align: u64, limit: u64) -> Option<u64> {
@@ -779,12 +883,17 @@ impl MemState {
     fn split_at(&mut self, addr: u64) {
         let Some(v) = self.vmas.range(..addr).next_back().map(|(_, v)| v.clone()) else { return };
         if addr > v.start && addr < v.end() {
+            if crate::sections::on() && v.kind != VmaKind::Reserved {
+                section_split(&v, addr);
+            }
             let mut lo = v.clone();
             lo.size = addr - v.start;
             let mut hi = v;
             hi.size = hi.end() - addr;
             if hi.kind == VmaKind::Direct {
                 hi.phys += lo.size;
+            } else {
+                hi.off += lo.size;
             }
             hi.start = addr;
             self.vmas.insert(lo.start, lo);
@@ -822,11 +931,15 @@ impl MemState {
                 }
                 r.released.insert(v.phys, (v.start, v.size));
             }
-            if v.kind == VmaKind::Direct && phys_carry() {
+            if v.kind == VmaKind::Direct && phys_carry() && !crate::sections::on() {
                 park(v.start, v.phys, v.size);
             }
             if v.kind != VmaKind::Reserved {
-                host_decommit(v.start, v.size);
+                if crate::sections::on() {
+                    section_release(&v);
+                } else {
+                    host_decommit(v.start, v.size);
+                }
             }
             if v.kind == VmaKind::Flexible {
                 self.flexible_used = self.flexible_used.saturating_sub(v.size);
@@ -886,18 +999,25 @@ impl MemState {
         if !existing.is_empty() {
             self.unmap_range(addr, addr + size);
         }
+        let (mut slot, mut off) = (NO_SLOT, 0);
         if kind != VmaKind::Reserved {
-            host_commit(addr, size, prot)?;
+            if crate::sections::on() {
+                (slot, off) = section_commit(addr, size, kind, prot, phys)?;
+            } else {
+                host_commit(addr, size, prot)?;
+            }
         }
-        if kind == VmaKind::Direct && phys_carry() {
+        if kind == VmaKind::Direct && phys_carry() && !crate::sections::on() {
             unpark(addr, phys, size, prot);
         }
-        if kind == VmaKind::Direct {
-            // Alignment of direct mappings (64 KiB: what section views need).
-            let k = if (addr | size | phys) & 0xFFFF == 0 { 0 } else if (addr | size | phys) & 0x3FFF == 0 { 1 } else { 2 };
-            MAP_ALIGN[k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if kind != VmaKind::Reserved {
+            // Alignment of mappings (64 KiB: what section views may need);
+            // direct ones counted with their physical offset.
+            let bits = if kind == VmaKind::Direct { addr | size | phys } else { addr | size };
+            let k = if bits & 0xFFFF == 0 { 0 } else if bits & 0x3FFF == 0 { 1 } else { 2 };
+            MAP_ALIGN[k + if kind == VmaKind::Direct { 0 } else { 3 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        if kind == VmaKind::Direct {
+        if kind == VmaKind::Direct && !crate::sections::on() {
             for v in self.vmas.values() {
                 if v.kind == VmaKind::Direct && phys < v.phys + v.size && v.phys < phys + size {
                     crate::warn!(
@@ -914,7 +1034,7 @@ impl MemState {
         if kind == VmaKind::Flexible {
             self.flexible_used += size;
         }
-        self.vmas.insert(addr, Vma { start: addr, size, kind, prot, phys, mtype, name: name.to_string() });
+        self.vmas.insert(addr, Vma { start: addr, size, kind, prot, phys, mtype, name: name.to_string(), slot, off });
         bump_gen(addr, addr + size);
         trace_map("map", addr, addr + size, format_args!("{kind:?} prot {prot:#x} phys {phys:#x} '{name}'"));
         Ok(addr)

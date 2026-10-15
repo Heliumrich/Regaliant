@@ -13,6 +13,7 @@ mod hle;
 mod input;
 mod loader;
 mod mem;
+mod sections;
 mod patch;
 mod thread;
 mod titlefix;

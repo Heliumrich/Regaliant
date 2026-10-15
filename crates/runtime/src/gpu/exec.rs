@@ -770,8 +770,9 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     if base + size > ve {
         return None;
     }
-    // Imported pages must never be protected: host class from now on.
-    if super::resident::enabled() {
+    // Imported pages must never be protected: host class from now on
+    // (section-backed memory imports alias views instead).
+    if super::resident::enabled() && !crate::sections::on() {
         super::resident::mark_host(vs, ve - vs);
     }
     {
@@ -782,10 +783,23 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
         }
     }
     let a = fixed().import_align;
-    let start = vs & !(a - 1);
-    let end = ve.next_multiple_of(a).min(ve);
+    let (mut start, mut end) = (vs & !(a - 1), ve.next_multiple_of(a).min(ve));
     if start < vs || end <= start {
         return None;
+    }
+    // Section-backed memory: the import is of the alias views (contiguous in
+    // one slot), the window narrowed to the binding when the run is not.
+    let mut alias = 0u64;
+    if crate::sections::on() {
+        let slot = crate::sections::alias_slot_for(start, end - start).or_else(|| {
+            (start, end) = ((base & !(a - 1)).max(vs), (base + size).next_multiple_of(a).min(ve));
+            crate::sections::alias_slot_for(start, end - start)
+        });
+        let Some(slot) = slot else {
+            ALIAS_MISSES.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        alias = crate::sections::alias_of(0, slot);
     }
     let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER;
     // The driver pins the pages for writing: write-tracked (read-only)
@@ -793,7 +807,7 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     // and are re-armed on their next use).
     let _w = super::track::protected().then(|| super::track::host_write(start, end - start));
     let t0 = std::time::Instant::now();
-    match ctx().import_host(start, end - start, usage) {
+    match ctx().import_host(start + alias, end - start, usage) {
         Ok((buffer, mem, va)) => {
             super::vk::note_gpu_range(buffer, va, end - start, || format!("guest import {start:#x}..{end:#x}"));
             let ms = t0.elapsed().as_millis();
@@ -1535,6 +1549,9 @@ const PLACEMENTS: [Placement; 11] = [Placement::Host, Placement::Snapshot, Place
 /// Video memory written instead of large unshadowed buffers (diagnosis,
 /// `tune scratch_writes`).
 const SCRATCH_BYTES: u64 = 256 << 20;
+/// Imports refused because no alias slot covered the range (`sections`).
+static ALIAS_MISSES: AtomicU64 = AtomicU64::new(0);
+
 /// Largest read-only binding served from the residency mirror, and a
 /// batch's staging for its uploads (`Exec::resident_bind`).
 const RES_MAX: u64 = 256 << 20;
