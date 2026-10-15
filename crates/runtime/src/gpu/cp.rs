@@ -176,6 +176,10 @@ pub struct Cp {
     scan_regs: (Vec<u32>, Vec<u32>),
     /// A parallel run in progress (`gpu::par`).
     par: Option<ParRun>,
+    /// The last WAIT_REG_MEM passed on a GPU queue's write (a promise, an
+    /// open promise of this queue, a latched CP write): no CPU write
+    /// released it, so it ends no copy-cache epoch (`tune epoch_gpu_waits`).
+    last_wait_gpu: bool,
     /// The end of the last run the planner found too short (no new plan
     /// until execution passes it: each command would scan the rest again).
     par_skip: (u64, u64),
@@ -663,6 +667,9 @@ pub static MDI_PACKETS: AtomicU64 = AtomicU64::new(0);
 /// Indexed indirect draws tried with the GPU reading their arguments whose
 /// vertex program needed them on the CPU (`draw_gpu_args`).
 pub static CPU_ARG_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+/// Waits passed on a GPU queue's write that ended no copy-cache epoch
+/// (`Cp::last_wait_gpu`).
+pub static EPOCH_GPU_WAITS: AtomicU64 = AtomicU64::new(0);
 /// Indexed indirect draws with arguments in a video-memory home read on the
 /// CPU, by why: a base-vertex SGPR, no start-instance SGPR of the vertex
 /// stage, 8-bit indices, indices outside homes, a vertex program needing the
@@ -1034,6 +1041,7 @@ impl Cp {
             par: None,
             par_skip: (0, 0),
             par_pool: super::par::Pool::new(),
+            last_wait_gpu: false,
         }
     }
 
@@ -1165,6 +1173,10 @@ impl Cp {
     /// last (the queues synchronize this way ~250 times per frame).
     fn end_copy_scope_after_wait(&self, a: u64, wide: bool) {
         if !valid(a, if wide { 8 } else { 4 }) {
+            return;
+        }
+        if self.last_wait_gpu && super::tune::epoch_gpu_waits() {
+            EPOCH_GPU_WAITS.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let now = unsafe { if wide { rd64(a) } else { rd32(a) as u64 } };
@@ -3062,6 +3074,7 @@ impl Cp {
         }
         let read = move || if wide { unsafe { rd64(a) } } else { (unsafe { rd32(a) }) as u64 };
         WAITED.lock().get_or_insert_with(HashSet::new).insert(a & !7);
+        self.last_wait_gpu = false;
         let v0 = read();
         if compare(func, v0 & mask, reference & mask) {
             label_event(&self.name, b'I', a, v0, reference, at);
@@ -3072,6 +3085,7 @@ impl Cp {
                 e.depend_on(seq, by_cpu);
                 PROMISED.fetch_add(1, Ordering::Relaxed);
                 label_event(&self.name, b'P', a, v0, reference, at);
+                self.last_wait_gpu = true;
                 return Flow::Next;
             }
         }
@@ -3098,6 +3112,7 @@ impl Cp {
                     e.order_after_open_writes();
                 }
                 label_event(&self.name, b'P', a, v0, reference, at);
+                self.last_wait_gpu = true;
                 return Flow::Next;
             }
         }
@@ -3172,6 +3187,7 @@ impl Cp {
             }
         }
         label_event(&self.name, kind, a, read(), reference, at);
+        self.last_wait_gpu = kind == b'P' || kind == b'L';
         long_wait(&self.name, a, wide, func, mask, reference, at, t0, kind);
         match r {
             Flow::Stop => Flow::Stop,
@@ -3229,6 +3245,31 @@ impl Cp {
             // A replayed frame (`gpu::replay`) is not presented (its work
             // completes here as for a flip).
             pop::FLIP if super::replay::replaying() => self.sync(),
+            pop::FLIP if super::tune::flip_async() => {
+                // Queued now, shown once this queue's GPU work before it
+                // completed (as the hardware's CP queues it) instead of the
+                // command processor waiting for that work here.
+                let handle = a(0) as i32;
+                let index = a(1) as i32;
+                let arg = addr64(a(3), a(4)) as i64;
+                let mut r = crate::hle::libs::videoout::reserve_flip(handle, index, arg);
+                if r == Err(crate::hle::libs::videoout::ERR_FLIP_QUEUE_FULL) {
+                    set_state(&self.name, format!("flip of buffer {index}: waiting for a free flip slot"));
+                    while r == Err(crate::hle::libs::videoout::ERR_FLIP_QUEUE_FULL) && !crate::gpu::shutting_down() {
+                        std::thread::sleep(Duration::from_micros(500));
+                        r = crate::hle::libs::videoout::reserve_flip(handle, index, arg);
+                    }
+                    set_state(&self.name, "running".into());
+                }
+                match r {
+                    Ok(ticket) => {
+                        self.effect(true, None, Box::new(move || crate::hle::libs::videoout::commit_flip(ticket)));
+                    }
+                    Err(e) => crate::warn!("gpu[{}]: flip of buffer {index} (handle {handle:#x}) failed ({e:#x})", self.name),
+                }
+                let n = crate::gpu::FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+                super::capture::on_flip(n);
+            }
             pop::FLIP => {
                 self.sync();
                 let handle = a(0) as i32;

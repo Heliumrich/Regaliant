@@ -1570,6 +1570,34 @@ struct Shadow {
     writer: u64,
 }
 
+/// Command processors' waits for their own batches (`Exec::flush`,
+/// DS_PROFILE_GPU) by call site and whether the graphics command processor
+/// waited: [count, ns].
+static FLUSH_SITES: Mutex<Option<HashMap<(&'static str, u32, bool), [u64; 2]>>> = Mutex::new(None);
+
+fn flush_site_lines(flips: u64) -> String {
+    let g = FLUSH_SITES.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let per = |x: u64| x as f64 / flips.max(1) as f64;
+    let mut s = String::new();
+    for gfx in [true, false] {
+        let mut v: Vec<(&(&str, u32, bool), &[u64; 2])> = m.iter().filter(|(k, _)| k.2 == gfx).collect();
+        v.sort_by(|a, b| b.1[1].cmp(&a.1[1]));
+        let total: u64 = v.iter().map(|x| x.1[1]).sum();
+        let parts: Vec<String> = v
+            .iter()
+            .take(12)
+            .map(|((f, l, _), x)| {
+                let file = f.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(f);
+                format!("{file}:{l} {:.2} ms ({:.1}, {:.0} us each)", per(x[1]) / 1e6, per(x[0]), x[1] as f64 / x[0].max(1) as f64 / 1000.0)
+            })
+            .collect();
+        let who = if gfx { "graphics command processor" } else { "other command processors" };
+        s.push_str(&format!("    waits for own batches per flip, {who} ({:.2} ms in all): {}\n", per(total) / 1e6, parts.join(", ")));
+    }
+    s
+}
+
 /// Shadow merges by window (DS_PROFILE_GPU): (guest, range) -> [merges,
 /// bytes, the shader that made the last one merged].
 static MERGE_BY: Mutex<Option<HashMap<(u64, u64), [u64; 3]>>> = Mutex::new(None);
@@ -3625,6 +3653,7 @@ pub fn reset_shader_profile() {
     *SHADER_PLACEMENTS.lock() = None;
     *SEG_TIME.lock() = None;
     *MERGE_BY.lock() = None;
+    *FLUSH_SITES.lock() = None;
     MERGE_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
     *SEG_EMPTY.lock() = None;
     *SEG_PAIRS.lock() = None;
@@ -3694,6 +3723,7 @@ pub fn shader_profile() -> String {
         s.push_str(&seg_lines());
     }
     s.push_str(&merge_by_lines(super::FRAMES.load(Ordering::Relaxed).saturating_sub(MERGE_FROM.load(Ordering::Relaxed))));
+    s.push_str(&flush_site_lines(super::FRAMES.load(Ordering::Relaxed).saturating_sub(MERGE_FROM.load(Ordering::Relaxed))));
     s.push_str(&batch_by_lines());
     s.push_str(&begin_stats_line());
     {
@@ -5125,17 +5155,26 @@ impl Exec {
 
     /// Submits recorded work and waits for all of this queue's GPU work and
     /// deferred effects.
+    #[track_caller]
     pub fn flush(&mut self) {
         if self.deferred {
             let why = if self.flush_why.is_empty() { "flush" } else { self.flush_why };
             self.stop(why);
             return;
         }
+        let t0 = profiling().then(std::time::Instant::now);
         self.submit_for("sync");
         let tw = super::timeline::wait_start();
         wait_done(self.last_seq);
         tw.end(&self.name, || format!("wait: own batches (#{})", self.last_seq));
         self.inflight.clear();
+        if let Some(t0) = t0 {
+            let l = std::panic::Location::caller();
+            let mut g = FLUSH_SITES.lock();
+            let e = g.get_or_insert_with(HashMap::new).entry((l.file(), l.line(), self.name == "gpu-gfx")).or_insert([0; 2]);
+            e[0] += 1;
+            e[1] += t0.elapsed().as_nanos() as u64;
+        }
     }
 
     /// Completes this queue's recorded and in-flight work when any of it
@@ -6438,6 +6477,7 @@ impl Exec {
     }
 
     /// The reason the next flush has (a deferred executor's stop statistics).
+    #[track_caller]
     fn flush_for(&mut self, why: &'static str) {
         self.flush_why = why;
         self.flush();

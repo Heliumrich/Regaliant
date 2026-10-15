@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 97] = [
+    static ALL: [Tunable; 99] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -124,6 +124,8 @@ pub mod tune {
         Tunable { name: "skip_copies", env: "DS_SKIP_COPIES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "draw_args_gpu", env: "DS_DRAW_ARGS_GPU", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "zero_fill_clears", env: "DS_ZERO_FILL_CLEARS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "epoch_gpu_waits", env: "DS_EPOCH_GPU_WAITS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "flip_async", env: "DS_FLIP_ASYNC", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1014,6 +1016,26 @@ pub mod tune {
     #[inline]
     pub fn zero_fill_clears() -> bool {
         get(96) != 0
+    }
+
+    /// A label wait that passed on a GPU queue's write (a promise, a latched
+    /// CP write) ends no copy-cache epoch (`precache::end_scope`): no CPU
+    /// write released it. Waits on labels another queue's GPU work writes
+    /// were taken for CPU-released ones when the value was not in memory yet
+    /// (passed on its promise), ~300 epochs per frame, each making every
+    /// shared batch-start copy check its pages for CPU writes again.
+    #[inline]
+    pub fn epoch_gpu_waits() -> bool {
+        get(97) != 0
+    }
+
+    /// A GPU queue's FLIP packet is queued at once and shown after the GPU
+    /// work before it (a deferred effect: `videoout::reserve_flip`,
+    /// `commit_flip`) instead of the command processor waiting for that work
+    /// (~0.7 ms per flip on the graphics command processor).
+    #[inline]
+    pub fn flip_async() -> bool {
+        get(98) != 0
     }
 
 

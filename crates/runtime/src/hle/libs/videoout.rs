@@ -53,6 +53,11 @@ struct Flip {
     index: i32,
     arg: i64,
     submit_tsc: u64,
+    /// The GPU work before it completed (`reserve_flip` queues it before,
+    /// `commit_flip` marks it): only a ready flip at the front is shown.
+    ready: bool,
+    /// Unique per reserved flip (0: submitted ready).
+    ticket: u64,
 }
 
 pub struct Port {
@@ -107,7 +112,7 @@ fn vblank_thread() {
             p.vblank_time = crate::hle::kernel::time::process_time_us();
             p.vblank_tsc = unsafe { core::arch::x86_64::_rdtsc() };
             let interval = p.flip_rate as u64 + 1;
-            if !p.pending.is_empty() && p.vblanks - p.last_flip_vblank >= interval {
+            if p.pending.front().is_some_and(|f| f.ready) && p.vblanks - p.last_flip_vblank >= interval {
                 let f = p.pending.pop_front().unwrap();
                 p.current = f.index;
                 p.count += 1;
@@ -164,10 +169,40 @@ pub fn submit_flip(handle: i32, index: i32, arg: i64) -> i32 {
         if p.pending.len() >= 16 {
             return ERR_FLIP_QUEUE_FULL;
         }
-        p.pending.push_back(Flip { index, arg, submit_tsc: unsafe { core::arch::x86_64::_rdtsc() } });
+        p.pending.push_back(Flip { index, arg, submit_tsc: unsafe { core::arch::x86_64::_rdtsc() }, ready: true, ticket: 0 });
         0
     })
     .unwrap_or_else(|e| e)
+}
+
+/// A flip queued now and shown only once `commit_flip` marks it ready (a
+/// GPU queue's FLIP packet, `tune flip_async`: the GPU work before it is
+/// still running). It counts towards the queue's limit and keeps its buffer
+/// busy at once. Ok(ticket), or the error `submit_flip` would give.
+pub fn reserve_flip(handle: i32, index: i32, arg: i64) -> Result<u64, i32> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    port(handle, |p| {
+        if index >= 16 || (index >= 0 && p.buffers[index as usize].is_none()) {
+            return Err(ERR_INVALID_INDEX);
+        }
+        if p.pending.len() >= 16 {
+            return Err(ERR_FLIP_QUEUE_FULL);
+        }
+        let ticket = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        p.pending.push_back(Flip { index, arg, submit_tsc: unsafe { core::arch::x86_64::_rdtsc() }, ready: false, ticket });
+        Ok(ticket)
+    })
+    .unwrap_or_else(Err)
+}
+
+/// The GPU work before a reserved flip completed: it may be shown.
+pub fn commit_flip(ticket: u64) {
+    let mut g = PORT.lock();
+    if let Some(p) = g.as_mut() {
+        if let Some(f) = p.pending.iter_mut().find(|f| f.ticket == ticket) {
+            f.ready = true;
+        }
+    }
 }
 
 /// Whether display buffer `index` is scanned out or waiting in the flip

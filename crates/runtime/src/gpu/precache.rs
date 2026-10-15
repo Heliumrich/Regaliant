@@ -852,7 +852,7 @@ pub fn status() -> String {
         (c.chunks.len() - big.len(), c.entries.len(), big.len(), big.iter().sum::<u64>() >> 20)
     });
     format!(
-        "    shared batch-start copies: {} copies, {} reused, {} not kept (GPU-written lately); {} checks for CPU writes ({} failed), entries dropped by CPU writes {}, by GPU/CP/host writes and mapping changes {}, by eviction {}; {} without space, {} left to a batch not submitted yet; {} entries in {} chunks of {} MiB and {} big slots ({} MiB; {} big copies, {} dropped by writes, {} declined as changed lately); epochs: {} submissions, {} waits the CPU released, {} REWIND\n",
+        "    shared batch-start copies: {} copies, {} reused, {} not kept (GPU-written lately); {} checks for CPU writes ({} failed), entries dropped by CPU writes {}, by GPU/CP/host writes and mapping changes {}, by eviction {}; {} without space, {} left to a batch not submitted yet; {} entries in {} chunks of {} MiB and {} big slots ({} MiB; {} big copies, {} dropped by writes, {} declined as changed lately); epochs: {} submissions, {} waits the CPU released, {} REWIND ({} waits passed on GPU writes ended none)\n",
         s[1],
         s[0],
         s[8],
@@ -873,6 +873,7 @@ pub fn status() -> String {
         s[12],
         ENDS[0].load(Ordering::Relaxed),
         ENDS[1].load(Ordering::Relaxed),
-        ENDS[2].load(Ordering::Relaxed)
+        ENDS[2].load(Ordering::Relaxed),
+        super::cp::EPOCH_GPU_WAITS.load(Ordering::Relaxed)
     )
 }
