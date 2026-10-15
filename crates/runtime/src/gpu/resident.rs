@@ -17,14 +17,30 @@
 //!   64 KiB pages bound on first use (`back`) to device memory taken from
 //!   64 MiB blocks.
 //! - Staging copies into and out of the mirror (`upload_now`,
-//!   `readback_now`): synchronous here (the boot self-test); later stages
-//!   record them into batches.
+//!   `readback_now`): synchronous here (the boot self-test).
+//!
+//! Stage 2: read-only buffer bindings of pages the mirror holds bind it
+//! (`Exec::resident_bind`). A page is uploaded by the batch that first binds
+//! it: claimed (`claim_pages`: its upload pending), armed, copied (memcpy)
+//! into the slot's staging ring and from there into the mirror in the
+//! batch's prologue; once that batch is submitted (`submitted`) every later
+//! batch may bind it (each batch begins behind a full barrier). While an
+//! upload is pending no other batch uploads or binds the page (two pending
+//! copies could land in either order). A page written again within
+//! VOLATILE_FRAMES of its last write fault is volatile: never armed again
+//! (each fault and re-arm costs microseconds), it keeps the old placements.
+//! Pages an import covers are host class (`mark_host`, called before every
+//! import): protecting imported pages lost the device. Writes that cannot
+//! fault (file reads: the kernel fails them on a read-only page, "Invalid
+//! access to memory location") announce themselves (`host_write_begin` and
+//! `_end`, from `track::host_write`'s guard): their pages are disarmed and
+//! not armed again until the write ends.
 
 use super::vk::ctx;
 use ash::vk;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 pub const PAGE: u64 = 4096;
 /// Page states per chunk of the table: 64 MiB of guest memory.
@@ -45,9 +61,21 @@ pub const ST_ARMED: u8 = 2;
 const ST_BUSY: u8 = 4;
 /// Host class: imported or written by CP writes the GPU performs; never armed.
 pub const ST_HOST: u8 = 8;
+/// Written by the CPU in nearby frames again and again: never armed.
+pub const ST_VOLATILE: u8 = 16;
+/// A page's upload sequence while the batch copying it is not submitted.
+const PENDING: u64 = u64::MAX;
+/// A write fault this many frames after the page's last one makes it volatile.
+const VOLATILE_FRAMES: u32 = 8;
 
 struct Chunk {
     pages: Box<[AtomicU8]>,
+    /// The batch that uploaded the page (PENDING: not submitted yet; 0: none).
+    seqs: Box<[AtomicU64]>,
+    /// The frame of the page's last write fault, plus one (0: none).
+    faulted: Box<[AtomicU32]>,
+    /// Writes that cannot fault in progress over the page (`host_write_begin`).
+    writing: Box<[AtomicU8]>,
 }
 
 /// Chunks by guest address >> CHUNK_SHIFT; never removed (16 KiB each).
@@ -55,8 +83,35 @@ static TABLE: RwLock<Option<HashMap<u64, &'static Chunk>>> = RwLock::new(None);
 static ON: AtomicBool = AtomicBool::new(false);
 
 /// Counters (`status`): pages armed, write faults taken, arm calls, their
-/// protection calls and ns, mirror pages backed, uploads, readbacks, resets.
-static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// protection calls and ns, mirror pages backed, uploads, readbacks, resets,
+/// fault races, pages claimed for upload, pages made volatile, pages made
+/// host class, bindings served from the mirror, and refusals by REFUSE_NAMES.
+static STATS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+/// Protection calls and ns that disarmed (the others armed).
+const S_UNPROTECTS: usize = 14;
+const S_UNPROTECT_NS: usize = 15;
+/// Host writes announced, and pages disarmed by them.
+const S_HOST_WRITES: usize = 16;
+const S_HOST_WRITE_PAGES: usize = 17;
+const S_CLAIMED: usize = 9;
+const S_VOLATILE: usize = 10;
+const S_HOSTED: usize = 11;
+const S_BINDS: usize = 12;
+const S_BIND_PAGES: usize = 13;
+/// Why a read-only binding was not served from the mirror (`refused`).
+pub const REFUSE_NAMES: [&str; 8] = ["outside the mirror or too large", "GPU or CP writes pending", "host or volatile pages", "another batch's upload pending", "imported pages", "staging full", "arming failed", "mirror pages not bound"];
+static REFUSED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Counts a refusal (`REFUSE_NAMES` index).
+pub fn refused(why: usize) {
+    REFUSED[why.min(7)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Counts a binding served from the mirror and its pages.
+pub fn served(pages: u64) {
+    STATS[S_BINDS].fetch_add(1, Ordering::Relaxed);
+    STATS[S_BIND_PAGES].fetch_add(pages, Ordering::Relaxed);
+}
 const S_ARMED: usize = 0;
 const S_FAULTS: usize = 1;
 const S_PROTECTS: usize = 2;
@@ -88,11 +143,22 @@ fn chunk(addr: u64, create: bool) -> Option<&'static Chunk> {
     }
     let mut g = TABLE.write();
     let t = g.get_or_insert_with(HashMap::new);
-    Some(*t.entry(key).or_insert_with(|| Box::leak(Box::new(Chunk { pages: (0..CHUNK_PAGES).map(|_| AtomicU8::new(0)).collect() }))))
+    Some(*t.entry(key).or_insert_with(|| {
+        Box::leak(Box::new(Chunk {
+            pages: (0..CHUNK_PAGES).map(|_| AtomicU8::new(0)).collect(),
+            seqs: (0..CHUNK_PAGES).map(|_| AtomicU64::new(0)).collect(),
+            faulted: (0..CHUNK_PAGES).map(|_| AtomicU32::new(0)).collect(),
+            writing: (0..CHUNK_PAGES).map(|_| AtomicU8::new(0)).collect(),
+        }))
+    }))
+}
+
+fn idx(addr: u64) -> usize {
+    ((addr >> 12) as usize) & (CHUNK_PAGES - 1)
 }
 
 fn slot(c: &Chunk, addr: u64) -> &AtomicU8 {
-    &c.pages[((addr >> 12) as usize) & (CHUNK_PAGES - 1)]
+    &c.pages[idx(addr)]
 }
 
 /// The state of the page holding `addr` (0 when untracked).
@@ -105,21 +171,26 @@ pub fn mark_host(base: u64, len: u64) {
     let (lo, hi) = (base & !(PAGE - 1), (base + len).next_multiple_of(PAGE));
     disarm_range(lo, hi);
     let mut p = lo;
+    let mut n = 0;
     while p < hi {
         if let Some(c) = chunk(p, true) {
-            slot(c, p).fetch_or(ST_HOST, Ordering::AcqRel);
+            if slot(c, p).fetch_or(ST_HOST, Ordering::AcqRel) & ST_HOST == 0 {
+                n += 1;
+            }
         }
         p += PAGE;
     }
+    STATS[S_HOSTED].fetch_add(n, Ordering::Relaxed);
 }
 
 fn protect(a: u64, n: u64, prot: u32) -> bool {
-    use windows_sys::Win32::System::Memory::VirtualProtect;
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_READONLY};
     let t = std::time::Instant::now();
     let mut old = 0u32;
     let ok = unsafe { VirtualProtect(a as _, n as usize, prot, &mut old) } != 0;
-    STATS[S_PROTECTS].fetch_add(1, Ordering::Relaxed);
-    STATS[S_PROTECT_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let k = if prot == PAGE_READONLY { 0 } else { S_UNPROTECTS - S_PROTECTS };
+    STATS[S_PROTECTS + k].fetch_add(1, Ordering::Relaxed);
+    STATS[S_PROTECT_NS + k].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     ok
 }
 
@@ -175,7 +246,7 @@ pub fn arm(base: u64, len: u64) -> u64 {
         let c = chunk(p, true).expect("chunk");
         let s = slot(c, p);
         let cur = s.load(Ordering::Acquire);
-        let take = cur & (ST_HOST | ST_BUSY | ST_ARMED) == 0 && s.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok();
+        let take = cur & (ST_HOST | ST_BUSY | ST_ARMED) == 0 && c.writing[idx(p)].load(Ordering::Acquire) == 0 && s.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok();
         if take {
             run = Some(match run {
                 Some((a, e)) if e == p => (a, p + PAGE),
@@ -196,32 +267,62 @@ pub fn arm(base: u64, len: u64) -> u64 {
 }
 
 /// Disarms the armed pages of [lo, hi) (page-aligned): writable again and
-/// device-invalid.
+/// device-invalid. Runs of armed pages are taken busy and made writable with
+/// one call each (an import window covers up to 16,384 pages).
 fn disarm_range(lo: u64, hi: u64) {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+    let release = |a: u64, e: u64| {
+        protect(a, e - a, PAGE_READWRITE);
+        let mut q = a;
+        while q < e {
+            if let Some(c) = chunk(q, false) {
+                slot(c, q).fetch_and(!(ST_ARMED | ST_VALID | ST_BUSY), Ordering::AcqRel);
+            }
+            q += PAGE;
+        }
+    };
+    let mut run: Option<(u64, u64)> = None;
     let mut p = lo;
     while p < hi {
         let Some(c) = chunk(p, false) else {
+            if let Some((a, e)) = run.take() {
+                release(a, e);
+            }
             p = ((p >> CHUNK_SHIFT) + 1) << CHUNK_SHIFT;
             continue;
         };
         let s = slot(c, p);
-        loop {
+        let took = loop {
             let cur = s.load(Ordering::Acquire);
             if cur & ST_BUSY != 0 {
                 std::hint::spin_loop();
                 continue;
             }
             if cur & ST_ARMED == 0 {
-                break;
+                break false;
             }
             if s.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                protect(p, PAGE, PAGE_READWRITE);
-                s.store(cur & !(ST_ARMED | ST_VALID | ST_BUSY), Ordering::Release);
-                break;
+                break true;
             }
+        };
+        match (took, run) {
+            (true, Some((a, e))) if e == p => run = Some((a, p + PAGE)),
+            (true, r) => {
+                if let Some((a, e)) = r {
+                    release(a, e);
+                }
+                run = Some((p, p + PAGE));
+            }
+            (false, Some((a, e))) => {
+                release(a, e);
+                run = None;
+            }
+            (false, None) => {}
         }
         p += PAGE;
+    }
+    if let Some((a, e)) = run {
+        release(a, e);
     }
 }
 
@@ -284,11 +385,171 @@ pub fn on_fault(addr: u64, write: bool) -> bool {
         }
         if s.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
             protect(page, PAGE, PAGE_READWRITE);
-            s.store(cur & !(ST_ARMED | ST_VALID | ST_BUSY), Ordering::Release);
+            // Written again soon after the last write: volatile from now on.
+            let frame = super::FRAMES.load(Ordering::Relaxed) as u32 + 1;
+            let last = c.faulted[idx(page)].swap(frame, Ordering::AcqRel);
+            let volatile = last != 0 && frame.wrapping_sub(last) <= VOLATILE_FRAMES;
+            s.store((cur & !(ST_ARMED | ST_VALID | ST_BUSY)) | if volatile { ST_VOLATILE } else { 0 }, Ordering::Release);
             STATS[S_FAULTS].fetch_add(1, Ordering::Relaxed);
+            if volatile {
+                STATS[S_VOLATILE].fetch_add(1, Ordering::Relaxed);
+            }
             return true;
         }
     }
+}
+
+/// What a read-only binding may do with a page (`page`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Page {
+    /// The mirror holds it (uploaded by a submitted batch).
+    Ready,
+    /// A batch not submitted yet uploads it (usable by that batch only).
+    Pending,
+    /// It needs an upload (`claim_pages`).
+    Upload,
+    /// Host class, volatile or busy: not from the mirror.
+    Refuse,
+}
+
+/// The page holding `addr` for a read-only binding.
+pub fn page(addr: u64) -> Page {
+    let Some(c) = chunk(addr, false) else { return Page::Upload };
+    let i = idx(addr);
+    let s = c.pages[i].load(Ordering::Acquire);
+    if s & (ST_HOST | ST_VOLATILE | ST_BUSY) != 0 || c.writing[i].load(Ordering::Acquire) != 0 {
+        return Page::Refuse;
+    }
+    let seq = c.seqs[i].load(Ordering::Acquire);
+    if seq == PENDING {
+        Page::Pending
+    } else if s & (ST_VALID | ST_ARMED) == ST_VALID | ST_ARMED && seq != 0 {
+        Page::Ready
+    } else {
+        Page::Upload
+    }
+}
+
+/// Claims the uploads of `pages` (ascending, each `Page::Upload` when
+/// looked at): their uploads become pending and they are armed (read-only,
+/// device-valid), so the caller may copy them out. Returns how many were
+/// claimed, in order: the caller uploads those and gives up on the rest.
+pub fn claim_pages(pages: &[u64]) -> usize {
+    // Take the uploads (stop at the first another thread holds).
+    let mut taken = 0;
+    for &p in pages {
+        let c = chunk(p, true).expect("chunk");
+        let i = idx(p);
+        let cur = c.seqs[i].load(Ordering::Acquire);
+        if cur == PENDING || c.seqs[i].compare_exchange(cur, PENDING, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            break;
+        }
+        taken += 1;
+    }
+    // Arm them, contiguous runs with one call each (pages still armed are
+    // unchanged since: valid again).
+    let mut k = 0;
+    while k < taken {
+        let mut e = k + 1;
+        while e < taken && pages[e] == pages[e - 1] + PAGE {
+            e += 1;
+        }
+        arm(pages[k], pages[e - 1] + PAGE - pages[k]);
+        k = e;
+    }
+    // The claim holds up to the first page that could not be armed; the
+    // pages after it are given up (never back to an older upload: device
+    // memory may hold a copy older than what the host has now).
+    let mut n = 0;
+    for (j, &p) in pages[..taken].iter().enumerate() {
+        let c = chunk(p, false).expect("chunk");
+        let i = idx(p);
+        let s = c.pages[i].load(Ordering::Acquire);
+        let ok = j == n
+            && s & ST_ARMED != 0
+            && s & (ST_HOST | ST_VOLATILE) == 0
+            && c.writing[i].load(Ordering::Acquire) == 0;
+        if ok {
+            c.pages[i].fetch_or(ST_VALID, Ordering::AcqRel);
+            n += 1;
+        } else {
+            c.pages[i].fetch_and(!ST_VALID, Ordering::AcqRel);
+            c.seqs[i].store(0, Ordering::Release);
+        }
+    }
+    STATS[S_CLAIMED].fetch_add(n as u64, Ordering::Relaxed);
+    n
+}
+
+/// A write that cannot fault (a file read into guest memory) begins over
+/// [base, base+len): its pages in the mirror's span are disarmed and stay
+/// out of the mirror until `host_write_end`.
+pub fn host_write_begin(base: u64, len: u64) {
+    if !enabled() || len == 0 {
+        return;
+    }
+    let (lo, hi) = ((base & !(PAGE - 1)).max(MIRROR_BASE), base.saturating_add(len).next_multiple_of(PAGE).min(MIRROR_END));
+    if lo >= hi {
+        return;
+    }
+    let mut p = lo;
+    while p < hi {
+        if let Some(c) = chunk(p, true) {
+            c.writing[idx(p)].fetch_add(1, Ordering::AcqRel);
+        }
+        p += PAGE;
+    }
+    disarm_range(lo, hi);
+    STATS[S_HOST_WRITES].fetch_add(1, Ordering::Relaxed);
+    STATS[S_HOST_WRITE_PAGES].fetch_add((hi - lo) / PAGE, Ordering::Relaxed);
+}
+
+/// The write announced by `host_write_begin(base, len)` ended: its pages
+/// may be armed again (the mirror's copies of them are stale).
+pub fn host_write_end(base: u64, len: u64) {
+    if !enabled() || len == 0 {
+        return;
+    }
+    let (lo, hi) = ((base & !(PAGE - 1)).max(MIRROR_BASE), base.saturating_add(len).next_multiple_of(PAGE).min(MIRROR_END));
+    let mut p = lo;
+    while p < hi {
+        if let Some(c) = chunk(p, false) {
+            let i = idx(p);
+            c.pages[i].fetch_and(!ST_VALID, Ordering::AcqRel);
+            let _ = c.writing[i].fetch_update(Ordering::AcqRel, Ordering::Acquire, |w| w.checked_sub(1));
+        }
+        p += PAGE;
+    }
+}
+
+/// The batch that uploads `pages` was submitted as `seq`.
+pub fn submitted(pages: &[u64], seq: u64) {
+    for &p in pages {
+        if let Some(c) = chunk(p, false) {
+            let _ = c.seqs[idx(p)].compare_exchange(PENDING, seq, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+}
+
+/// The batch that would have uploaded `pages` was dropped: they need an
+/// upload again.
+pub fn dropped(pages: &[u64]) {
+    for &p in pages {
+        if let Some(c) = chunk(p, false) {
+            let i = idx(p);
+            if c.seqs[i].compare_exchange(PENDING, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                c.pages[i].fetch_and(!ST_VALID, Ordering::AcqRel);
+            }
+        }
+    }
+}
+
+/// The mirror buffer and its sparse page size.
+pub fn mirror() -> Option<(vk::Buffer, u64)> {
+    if !enabled() {
+        return None;
+    }
+    MIRROR.get().map(|m| (m.buf, m.page))
 }
 
 /// The mirror: a sparse buffer over [MIRROR_BASE, MIRROR_END).
@@ -515,18 +776,29 @@ pub fn status() -> String {
         return String::new();
     }
     let v: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let refused: Vec<String> = REFUSE_NAMES.iter().zip(REFUSED.iter()).map(|(n, c)| format!("{n} {}", c.load(Ordering::Relaxed))).collect();
     format!(
-        "    residency ({}): {} pages armed, {} write faults ({} races), {} protection calls ({:.1} us each), {} mirror pages backed, {} uploads, {} readbacks, {} remaps\n",
+        "    residency ({}): {} bindings from the mirror ({} pages), {} pages uploaded; {} pages armed, {} write faults ({} races), {} volatile, {} host class; {} arming calls ({:.1} us each), {} disarming calls ({:.1} us each); {} host writes ({} pages); {} mirror pages backed, {} uploads, {} readbacks, {} remaps; refused: {}\n",
         if enabled() { "on" } else { "off" },
+        v[S_BINDS],
+        v[S_BIND_PAGES],
+        v[S_CLAIMED],
         v[S_ARMED],
         v[S_FAULTS],
         v[S_RACES],
+        v[S_VOLATILE],
+        v[S_HOSTED],
         v[S_PROTECTS],
         v[S_PROTECT_NS] as f64 / v[S_PROTECTS].max(1) as f64 / 1000.0,
+        v[S_UNPROTECTS],
+        v[S_UNPROTECT_NS] as f64 / v[S_UNPROTECTS].max(1) as f64 / 1000.0,
+        v[S_HOST_WRITES],
+        v[S_HOST_WRITE_PAGES],
         v[S_BACKED],
         v[S_UPLOADS],
         v[S_READBACKS],
-        v[S_RESETS]
+        v[S_RESETS],
+        refused.join(", ")
     )
 }
 
@@ -562,6 +834,42 @@ mod tests {
         // A remap resets armed pages' state (the guest's protection applies).
         remapped(a + 2 * PAGE, PAGE);
         assert_eq!(state(a + 2 * PAGE), 0);
+        disarm_range(a, a + n);
+        unsafe { VirtualFree(a as _, 0, MEM_RELEASE) };
+    }
+
+    /// Claims, submission, and a write that cannot fault, on pages inside
+    /// the mirror's span (skipped when that address is taken).
+    #[test]
+    fn claim_submit_host_write() {
+        ON.store(true, Ordering::Release);
+        let want = MIRROR_END - (1 << 20);
+        let n = 8 * PAGE;
+        let a = unsafe { VirtualAlloc(want as _, n as usize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as u64;
+        if a != want {
+            return;
+        }
+        let pages: Vec<u64> = (0..4).map(|i| a + i * PAGE).collect();
+        assert_eq!(page(a), Page::Upload);
+        assert_eq!(claim_pages(&pages), 4);
+        assert_eq!(page(a), Page::Pending);
+        assert_eq!(state(a + PAGE), ST_ARMED | ST_VALID);
+        // Another claim of a pending page fails.
+        assert_eq!(claim_pages(&pages[..1]), 0);
+        submitted(&pages, 7);
+        assert_eq!(page(a + 2 * PAGE), Page::Ready);
+        // A file read over pages 1..2: disarmed and kept out until it ends.
+        host_write_begin(a + PAGE + 100, PAGE);
+        assert_eq!(page(a + PAGE), Page::Refuse);
+        assert!(plain_rw(a + PAGE, 2 * PAGE));
+        assert_eq!(claim_pages(&[a + PAGE]), 0);
+        host_write_end(a + PAGE + 100, PAGE);
+        assert_eq!(page(a + PAGE), Page::Upload);
+        assert_eq!(page(a + 3 * PAGE), Page::Ready);
+        // A dropped batch's pages need an upload again.
+        assert_eq!(claim_pages(&[a + PAGE]), 1);
+        dropped(&[a + PAGE]);
+        assert_eq!(page(a + PAGE), Page::Upload);
         disarm_range(a, a + n);
         unsafe { VirtualFree(a as _, 0, MEM_RELEASE) };
     }

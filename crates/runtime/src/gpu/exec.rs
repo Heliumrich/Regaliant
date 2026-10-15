@@ -701,9 +701,15 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     if let Some(s) = g.iter().find(|s| s.valid && s.start <= base && base + size <= s.end) {
         return Some((s.buffer, s.start, s.end));
     }
-    let (vs, ve, pieces) = mapping_run(base, base & !(WINDOW - 1), (base + size).next_multiple_of(WINDOW))?;
+    // Residency: smaller windows (their pages become host class).
+    let window = if super::resident::enabled() { RES_WINDOW } else { WINDOW };
+    let (vs, ve, pieces) = mapping_run(base, base & !(window - 1), (base + size).next_multiple_of(window))?;
     if base + size > ve {
         return None;
+    }
+    // Imported pages must never be protected: host class from now on.
+    if super::resident::enabled() {
+        super::resident::mark_host(vs, ve - vs);
     }
     {
         // Diagnostics: how the title mapped memory the GPU uses.
@@ -1457,13 +1463,27 @@ enum Placement {
     Scratch,
     /// A video-memory home (`homes`).
     Home,
+    /// The residency mirror (`gpu::resident`, read-only binding).
+    Mirrored,
 }
 
-const PLACEMENTS: [Placement; 10] = [Placement::Host, Placement::Snapshot, Placement::PreCopy, Placement::Resident, Placement::Mirror, Placement::Shadow, Placement::ShadowReused, Placement::None, Placement::Scratch, Placement::Home];
+const PLACEMENTS: [Placement; 11] = [Placement::Host, Placement::Snapshot, Placement::PreCopy, Placement::Resident, Placement::Mirror, Placement::Shadow, Placement::ShadowReused, Placement::None, Placement::Scratch, Placement::Home, Placement::Mirrored];
 
 /// Video memory written instead of large unshadowed buffers (diagnosis,
 /// `tune scratch_writes`).
 const SCRATCH_BYTES: u64 = 256 << 20;
+/// Largest read-only binding served from the residency mirror, and a
+/// batch's staging for its uploads (`Exec::resident_bind`).
+const RES_MAX: u64 = 256 << 20;
+/// Import windows with residency on (`WINDOW` otherwise).
+const RES_WINDOW: u64 = 4 << 20;
+const STAGE_SEG: u64 = 16 << 20;
+
+/// The part of guest [lo, hi) a live import covers, if any (residency:
+/// such pages are host class).
+fn imported_overlap(lo: u64, hi: u64) -> Option<(u64, u64)> {
+    SPANS.read().iter().find(|s| s.valid && s.start < hi && lo < s.end).map(|s| (s.start.max(lo), s.end.min(hi)))
+}
 static SCRATCH: std::sync::OnceLock<Option<vk::Buffer>> = std::sync::OnceLock::new();
 
 fn scratch_buffer() -> Option<vk::Buffer> {
@@ -1477,7 +1497,7 @@ struct ShaderPlacements {
     groups: u64,
     indirect: u64,
     /// Per binding: [count per Placement], total bytes, written count.
-    bindings: Vec<([u64; 10], u64, u64)>,
+    bindings: Vec<([u64; 11], u64, u64)>,
 }
 
 static SHADER_PLACEMENTS: Mutex<Option<HashMap<u64, ShaderPlacements>>> = Mutex::new(None);
@@ -1492,7 +1512,7 @@ pub(crate) fn note_placements(addr: u64, groups: [u32; 3], indirect: bool, place
         e.groups += groups.iter().map(|&x| x as u64).product::<u64>();
     }
     if e.bindings.len() < placements.len() {
-        e.bindings.resize(placements.len(), ([0; 10], 0, 0));
+        e.bindings.resize(placements.len(), ([0; 11], 0, 0));
     }
     for (b, &(k, n, w)) in e.bindings.iter_mut().zip(placements) {
         b.0[PLACEMENTS.iter().position(|&x| x == k).unwrap_or(7)] += 1;
@@ -2888,6 +2908,9 @@ struct Slot {
     /// Timestamp queries and their copied results for CP timestamp writes
     /// the GPU performs (`Exec::gpu_timestamp`; made on first use).
     ts: Option<(vk::QueryPool, vk::Buffer)>,
+    /// Staging for the batch's uploads into the residency mirror
+    /// (STAGE_SEG of host memory, made on first use).
+    stage: Option<(vk::Buffer, *mut u8)>,
 }
 
 impl Slot {
@@ -2921,6 +2944,7 @@ impl Slot {
                 shadow,
                 pre,
                 pre_buf: None,
+                stage: None,
                 xpre,
                 homes: Vec::new(),
                 keep: Vec::new(),
@@ -4032,6 +4056,13 @@ pub struct Exec {
     pre_open: bool,
     pre_failed: bool,
     pres: super::fx::Map<(u64, u64), (vk::Buffer, u64)>,
+    /// Pages this batch uploads into the residency mirror (`resident_bind`),
+    /// the same as a set, scratch for the pages a binding needs, and the
+    /// bytes of the slot's staging used.
+    res_pages: Vec<u64>,
+    res_mine: super::fx::Set<u64>,
+    res_need: Vec<u64>,
+    stage_used: u64,
     /// Prologue copies not recorded yet (`tune pre_merge`): (source,
     /// destination, region), recorded grouped by buffers by `end_pre`.
     pre_copies: Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>,
@@ -4216,6 +4247,8 @@ struct Closed {
     forward_ids: Vec<u64>,
     /// Its barrier segments' marks (`seg_stamps`).
     segs: Vec<SegMark>,
+    /// Pages it uploads into the residency mirror (`Exec::res_pages`).
+    res_pages: Vec<u64>,
 }
 
 /// Slot sequence of a batch closed but not yet submitted.
@@ -4288,6 +4321,10 @@ impl Exec {
                 pre_open: false,
                 pre_failed: false,
                 pres: Default::default(),
+                res_pages: Vec::new(),
+                res_mine: Default::default(),
+                res_need: Vec::new(),
+                stage_used: 0,
                 pre_copies: Vec::new(),
                 xcopies: Vec::new(),
                 copy_wait: 0,
@@ -4593,7 +4630,9 @@ impl Exec {
                 crate::error!("gpu[{}]: CP effects in a parallel run (dropped)", self.name);
             }
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs) });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages) });
+            self.res_mine.clear();
+            self.stage_used = 0;
             self.slots[i].seq = PENDING;
             self.pending_promises.clear();
             self.pending_log.clear();
@@ -4632,6 +4671,11 @@ impl Exec {
         self.slots[i].seq = seq;
         self.open_gen.store(u64::MAX, Ordering::SeqCst);
         super::precache::submitted(&std::mem::take(&mut self.shared_pending), seq);
+        if !self.res_pages.is_empty() {
+            super::resident::submitted(&std::mem::take(&mut self.res_pages), seq);
+            self.res_mine.clear();
+        }
+        self.stage_used = 0;
         if !self.own_checks.is_empty() {
             let mut g = SPEC_CHECKS.lock();
             g.extend(self.own_checks.drain(..).map(|c| SpecCheck { seq, ..c }));
@@ -4712,6 +4756,9 @@ impl Exec {
         self.shared_kept.clear();
         self.batch_shaders.clear();
         self.resident.clear();
+        super::resident::dropped(&std::mem::take(&mut self.res_pages));
+        self.res_mine.clear();
+        self.stage_used = 0;
         self.recording = false;
         self.ring_used = [0; 2];
         self.snap_used = 0;
@@ -5009,6 +5056,117 @@ impl Exec {
     /// see unless work recorded earlier in this batch, or a deferred CP
     /// write, writes the range (then None). None also: off or larger than
     /// `tune pre_max`, not one mapping, no space.
+    /// A read-only binding of guest [base, base+size) served from the
+    /// residency mirror (`gpu::resident`): (mirror buffer, offset of `base`
+    /// in it, bytes available from `base`). Pages the mirror does not hold
+    /// yet are uploaded by this batch (staged here, copied in its prologue),
+    /// as many as its staging takes; the binding is refused until all are.
+    fn resident_bind(&mut self, base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
+        use super::resident::{self as res, Page};
+        let (mbuf, _) = res::mirror()?;
+        let end = base.checked_add(size)?;
+        if base < res::MIRROR_BASE || end > res::MIRROR_END || size > RES_MAX {
+            res::refused(0);
+            return None;
+        }
+        let r = [(base, size)];
+        if super::homes::overlaps(base, size) || self.overlaps_pending(&r) || CP_WRITES.latest(&r).is_some() || INFLIGHT.latest(&r).is_some() || self.resident.iter().any(|s| s.guest < end && base < s.guest + s.range) {
+            res::refused(1);
+            return None;
+        }
+        let (lo, hi) = (base & !(res::PAGE - 1), end.next_multiple_of(res::PAGE));
+        let mut need = std::mem::take(&mut self.res_need);
+        need.clear();
+        let mut why = None;
+        let mut p = lo;
+        while p < hi {
+            match res::page(p) {
+                Page::Ready => {}
+                Page::Pending if self.res_mine.contains(&p) => {}
+                Page::Pending => {
+                    why = Some(3);
+                    break;
+                }
+                Page::Refuse => {
+                    why = Some(2);
+                    break;
+                }
+                Page::Upload => need.push(p),
+            }
+            p += res::PAGE;
+        }
+        if why.is_none() && !need.is_empty() {
+            why = self.resident_upload(lo, hi, mbuf, &mut need);
+        }
+        self.res_need = need;
+        if let Some(w) = why {
+            res::refused(w);
+            return None;
+        }
+        res::served((hi - lo) / res::PAGE);
+        Some((mbuf, base - res::MIRROR_BASE, hi - base))
+    }
+
+    /// Uploads `need` (pages of [lo, hi) the mirror lacks) as far as the
+    /// batch's staging takes. None when all were uploaded, else why not
+    /// (`resident::REFUSE_NAMES` index).
+    fn resident_upload(&mut self, lo: u64, hi: u64, mbuf: vk::Buffer, need: &mut Vec<u64>) -> Option<usize> {
+        use super::resident as res;
+        // Imported pages cannot be armed: host class from now on.
+        if let Some((a, e)) = imported_overlap(lo, hi) {
+            res::mark_host(a, e - a);
+            return Some(4);
+        }
+        let _readers = crate::mem::GUEST_READERS.read();
+        if !crate::mem::os_readable(lo, hi - lo) {
+            return Some(6);
+        }
+        let room = (STAGE_SEG - self.stage_used) / res::PAGE;
+        let partial = (need.len() as u64) > room;
+        need.truncate(room as usize);
+        if need.is_empty() {
+            return Some(5);
+        }
+        if res::back(need[0], need[need.len() - 1] + res::PAGE - need[0]).is_err() {
+            return Some(7);
+        }
+        let Some((sbuf, sptr)) = self.stage_buffer() else { return Some(5) };
+        let claimed = res::claim_pages(need);
+        if claimed > 0 {
+            let _ = self.open_pre();
+        }
+        for &pg in &need[..claimed] {
+            let at = self.stage_used;
+            unsafe { std::ptr::copy_nonoverlapping(pg as *const u8, sptr.add(at as usize), res::PAGE as usize) };
+            self.pre_copies.push((sbuf, mbuf, vk::BufferCopy { src_offset: at, dst_offset: pg - res::MIRROR_BASE, size: res::PAGE }));
+            self.stage_used += res::PAGE;
+            self.res_pages.push(pg);
+            self.res_mine.insert(pg);
+        }
+        if claimed < need.len() {
+            Some(6)
+        } else if partial {
+            Some(5)
+        } else {
+            None
+        }
+    }
+
+    /// The slot's staging ring for mirror uploads (made on first use).
+    fn stage_buffer(&mut self) -> Option<(vk::Buffer, *mut u8)> {
+        let s = &mut self.slots[self.cur];
+        if s.stage.is_none() {
+            match ctx().host_buffer(STAGE_SEG, vk::BufferUsageFlags::TRANSFER_SRC) {
+                Ok((b, _m, ptr)) => s.stage = Some((b, ptr)),
+                Err(e) => {
+                    crate::warn!("gpu[{}]: no staging for mirror uploads ({e})", self.name);
+                    return None;
+                }
+            }
+        }
+        s.stage
+    }
+
     pub(super) fn pre_copy(&mut self, base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
         let mut clk = PreClock::start();
         // Over `pre_max`: only as a shared copy (`tune pre_big_max`).
@@ -6783,6 +6941,7 @@ impl Exec {
                 RACE_CHECKS.lock().extend(b.races.into_iter().map(|c| RaceCheck { seq, cpw_submit, ..c }));
             }
             super::precache::submitted(&b.shared, seq);
+            super::resident::submitted(&b.res_pages, seq);
             INFLIGHT.note_ranges(seq, &b.writes);
             if super::tune::race_checks() {
                 note_race_writes(seq, &b.writes);
@@ -6815,6 +6974,7 @@ impl Exec {
         }
         for b in std::mem::take(&mut self.closed) {
             super::forward::drop_checks(&b.forward_ids);
+            super::resident::dropped(&b.res_pages);
             let s = &mut self.slots[b.slot];
             unsafe {
                 c.device.reset_command_buffer(s.cmd, vk::CommandBufferResetFlags::empty()).ok();
@@ -6874,10 +7034,13 @@ impl Exec {
                         // bytes (data loads read by the shader).
                         let sized = matches!(found.resources[i], Resolved::Buffer(_) | Resolved::Global(_, Some(_)));
                         let read_only = size > 0 && !found.tr.plan.resources[i].written && sized;
-                        // A video-memory home holding the range (see `homes`).
-                        let home = self
-                            .home_bind(base, size, found.tr.plan.resources[i].written, if sized { HomeUse::Sized } else { HomeUse::Unbounded })
-                            .map(|h| (h.0, h.1, h.2));
+                        // The residency mirror (read-only bindings, `gpu::resident`), or
+                        // a video-memory home holding the range (see `homes`).
+                        let from_mirror = if read_only && super::resident::enabled() { self.resident_bind(base, size) } else { None };
+                        let home = from_mirror.or_else(|| {
+                            self.home_bind(base, size, found.tr.plan.resources[i].written, if sized { HomeUse::Sized } else { HomeUse::Unbounded })
+                                .map(|h| (h.0, h.1, h.2))
+                        });
                         BindClock::mark(&mut clk, 0);
                         // Inside a resident shadow: its working copy is newer.
                         let resident = if read_only && home.is_none() { self.resident_read(base, size)? } else { None };
@@ -6944,7 +7107,7 @@ impl Exec {
                             bound.in_place.push((base, size, kind));
                         }
                         if let Some((hbuf, hoff, avail)) = home {
-                            placement = Placement::Home;
+                            placement = if from_mirror.is_some() { Placement::Mirrored } else { Placement::Home };
                             let align = ctx().limits.min_storage_buffer_offset_alignment.max(4);
                             let off = hoff & !(align - 1);
                             bias = hoff - off;

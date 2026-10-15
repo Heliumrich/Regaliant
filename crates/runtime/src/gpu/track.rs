@@ -491,6 +491,7 @@ pub struct HostWrite(Option<u64>, u64, u64);
 impl Drop for HostWrite {
     fn drop(&mut self) {
         super::homes::cpu_written(self.1, self.2);
+        super::resident::host_write_end(self.1, self.2);
         if let Some(id) = self.0 {
             if let Some(t) = TRACK.lock().as_mut() {
                 t.busy.retain(|b| b.0 != id);
@@ -506,6 +507,7 @@ impl Drop for HostWrite {
 pub fn host_write(base: u64, len: u64) -> HostWrite {
     note_event("host write", base, len);
     super::precache::invalidate(base, len);
+    super::resident::host_write_begin(base, len);
     if len == 0 {
         return HostWrite(None, base, 0);
     }
