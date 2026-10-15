@@ -2657,7 +2657,8 @@ impl Cp {
         if self.depth == 0 {
             // The batch stays open into the next command buffer when that one
             // is already here (`tune cmdbuf_merge`): a batch less to begin.
-            let merge = super::tune::cmdbuf_merge() && !self.compute && (self.next_in_submission || self.more_follows.as_ref().is_some_and(|f| f()));
+            let mode = super::tune::cmdbuf_merge();
+            let merge = (mode >= 2 || (mode == 1 && !self.compute)) && (self.next_in_submission || self.more_follows.as_ref().is_some_and(|f| f()));
             if merge {
                 CMDBUF_MERGED.fetch_add(1, Ordering::Relaxed);
             } else {

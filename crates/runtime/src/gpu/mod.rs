@@ -132,7 +132,7 @@ pub mod tune {
         Tunable { name: "prep_pool", env: "DS_PREP_POOL", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ts_batch", env: "DS_TS_BATCH", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ww_probe", env: "DS_WW_PROBE", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "cmdbuf_merge", env: "DS_CMDBUF_MERGE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "cmdbuf_merge", env: "DS_CMDBUF_MERGE", default: 2, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1125,9 +1125,11 @@ pub mod tune {
     /// batches per frame end there, each a batch begin (~60 us with slot
     /// waits) and a costlier first command (~100 us) more. Live A/B
     /// 2026-10-15 late night: +3.8% flips/s (1.023-1.050); default 1.
+    /// 2 (default): the compute queues too (+1.4% flips/s, -1.3% CPU per
+    /// command against 1 in a live A/B).
     #[inline]
-    pub fn cmdbuf_merge() -> bool {
-        get(105) != 0
+    pub fn cmdbuf_merge() -> u64 {
+        get(105)
     }
 
 
