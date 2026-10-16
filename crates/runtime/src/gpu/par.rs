@@ -87,6 +87,9 @@ pub struct Done {
     pub last: Option<u64>,
     /// Why it stopped ("" when it ran to its end).
     pub why: &'static str,
+    /// TSC cycles each command recorded took, in order (`tune par_cost`;
+    /// the first one with the chunk's setup).
+    pub costs: Vec<u32>,
 }
 
 /// The chunks of a parallel run that the workers record (all but the main
@@ -112,6 +115,8 @@ pub struct Run {
     /// What the main command processor's batch, not submitted when the run
     /// was planned, writes (`tune par_main_writes`).
     main_writes: Arc<super::ranges::Ranges>,
+    /// The workers time each command (`tune par_cost`).
+    pub timed: bool,
 }
 
 impl Run {
@@ -130,6 +135,7 @@ impl Run {
             cv: Condvar::new(),
             born: std::time::Instant::now(),
             main_writes,
+            timed: false,
         }
     }
 
@@ -365,6 +371,7 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         let mut cp = w.cp.lock();
         cp.set_chunk_state(&state);
         cp.chunk_start(&run.main_writes);
+        cp.chunk_costs = run.timed.then(|| Vec::with_capacity(512));
         lap(1, &mut t);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cp.run_chunk(from, to)));
         let failed = r.is_err();
@@ -389,11 +396,11 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
             return;
         }
         let done = if failed {
-            Done { stopped, state: *state, last: None, why: "failed" }
+            Done { stopped, state: *state, last: None, why: "failed", costs: Vec::new() }
         } else {
             let last = cp.worker_submit();
             let why = if stopped.is_some() { cp.worker_stop_why() } else { "" };
-            Done { stopped, state: cp.chunk_state(), last, why }
+            Done { stopped, state: cp.chunk_state(), last, why, costs: cp.chunk_costs.take().unwrap_or_default() }
         };
         drop(cp);
         run.results.lock()[i] = Some(done);
@@ -419,7 +426,7 @@ impl Worker {
 /// Clears the statistics (`profile reset`: the status line and the profile
 /// report then cover the window).
 pub fn reset_stats() {
-    for c in [&RUNS, &CHUNKS, &STOPS, &COMMANDS, &WAIT_NS, &TURN_NS, &CANCELLED, &STARTS] {
+    for c in [&RUNS, &CHUNKS, &STOPS, &COMMANDS, &WAIT_NS, &TURN_NS, &CANCELLED, &STARTS, &super::cp::PAR_COSTED] {
         c.store(0, Ordering::Relaxed);
     }
     for c in &PHASE_NS {
@@ -464,7 +471,8 @@ pub fn status() -> String {
     why.sort_by(|a, b| b.1.cmp(&a.1));
     let why: Vec<String> = why.iter().map(|(w, n)| format!("{w} {n}")).collect();
     format!(
-        "    parallel runs: {runs} runs, {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled, {} worker reads of the main command processor's unsubmitted writes; main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}; runs under 32 commands by end {}; compute queues' runs by length {}; by end {}\n",
+        "    parallel runs: {runs} runs ({} split at equal recording cost), {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled, {} worker reads of the main command processor's unsubmitted writes; main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}; runs under 32 commands by end {}; compute queues' runs by length {}; by end {}\n",
+        super::cp::PAR_COSTED.load(Ordering::Relaxed),
         CHUNKS.load(Ordering::Relaxed),
         COMMANDS.load(Ordering::Relaxed),
         split(),

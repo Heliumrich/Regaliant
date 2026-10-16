@@ -195,6 +195,53 @@ pub struct Cp {
     par_skip_n: usize,
     /// This command processor's chunk workers.
     par_pool: super::par::Pool,
+    /// A worker's per-command recording cost in its chunk (`tune par_cost`).
+    pub chunk_costs: Option<Vec<u32>>,
+    /// Per-command recording costs of the parallel runs seen, by run
+    /// signature (`tune par_cost`).
+    run_costs: HashMap<u64, RunCost>,
+}
+
+/// The recording cost of a parallel run's commands as its workers measured
+/// it (TSC cycles, smoothed over the times the run was seen; NaN: not
+/// measured yet), and the frame it was last planned in.
+struct RunCost {
+    costs: Vec<f32>,
+    seen: u64,
+}
+
+/// Splits commands [main_n, n) into `m` chunks of about equal summed cost
+/// (`costs` per command), each of at least `min` commands: the first command
+/// of each chunk. None without costs for all of them.
+fn cost_firsts(costs: &[f32], main_n: usize, n: usize, m: usize, min: usize) -> Option<Vec<usize>> {
+    let region = costs.get(main_n..n)?;
+    if m < 2 || region.iter().any(|c| !c.is_finite()) || n - main_n < m * min {
+        return None;
+    }
+    let total: f64 = region.iter().map(|&c| c as f64).sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let mut firsts = Vec::with_capacity(m);
+    firsts.push(main_n);
+    let mut acc = 0.0;
+    for (j, &c) in region.iter().enumerate() {
+        let k = firsts.len();
+        if k == m {
+            break;
+        }
+        acc += c as f64;
+        if acc >= total * k as f64 / m as f64 {
+            let lo = firsts[k - 1] + min;
+            let hi = n - (m - k) * min;
+            firsts.push((main_n + j + 1).clamp(lo, hi));
+        }
+    }
+    while firsts.len() < m {
+        let k = firsts.len();
+        firsts.push((firsts[k - 1] + min).min(n - (m - k) * min));
+    }
+    firsts.windows(2).all(|w| w[1] >= w[0] + min).then_some(firsts)
 }
 
 /// The command-processor state a chunk of a parallel run starts from and
@@ -222,6 +269,11 @@ struct ParRun {
     /// The run holds flushes or cache actions (`tune par_events`): later CP
     /// writes follow the GPU work before them.
     sync: bool,
+    /// Its signature and command count, and each worker chunk's first
+    /// command (`tune par_cost`; signature 0: not timed).
+    sig: u64,
+    n: usize,
+    firsts: Vec<usize>,
 }
 
 /// Commands per chunk at least (a third of `tune par_min`, the commands a
@@ -592,6 +644,8 @@ pub(super) fn waited_now(a: u64) -> bool {
 /// Waits satisfied by a latched CP write whose value was gone by the time
 /// the waiter looked again (diagnostics).
 pub static LATCHED: AtomicU64 = AtomicU64::new(0);
+/// Parallel runs split at equal recording cost (`tune par_cost`).
+pub static PAR_COSTED: AtomicU64 = AtomicU64::new(0);
 /// Batches the graphics queue ended for `tune split_every` (diagnostics).
 pub static SPLITS: AtomicU64 = AtomicU64::new(0);
 /// Sleeps of label waits on their label's address (diagnostics).
@@ -1099,6 +1153,8 @@ impl Cp {
             par_skip: (0, 0),
             par_skip_n: 0,
             par_pool: super::par::Pool::new(),
+            chunk_costs: None,
+            run_costs: HashMap::new(),
             last_wait_gpu: false,
         }
     }
@@ -1156,6 +1212,7 @@ impl Cp {
         let f = Fetched::new(from, 0);
         let mut cur = from;
         let mut commands = 0u64;
+        let mut last = unsafe { core::arch::x86_64::_rdtsc() };
         while cur < to {
             if super::shutting_down() || !valid(cur, 4) {
                 return Some(cur);
@@ -1210,6 +1267,13 @@ impl Cp {
                 return Some(next);
             }
             commands += command as u64;
+            if command {
+                if let Some(v) = self.chunk_costs.as_mut() {
+                    let now = unsafe { core::arch::x86_64::_rdtsc() };
+                    v.push(now.wrapping_sub(last).min(u32::MAX as u64) as u32);
+                    last = now;
+                }
+            }
             if command && self.ahead.is_empty() && super::ahead::enabled_for(self.compute) {
                 self.scan_ahead(&f, next, to);
             }
@@ -1350,11 +1414,15 @@ impl Cp {
         let mut c = from;
         let mut why = 0x130usize;
         let mut sync = false;
+        // The run's signature: its packet headers (opcode and size), the
+        // same when the title records the same pass again.
+        let mut sig = 0xcbf2_9ce4_8422_2325u64;
         let run_end = loop {
             if c >= end || !valid(c, 4) {
                 break c;
             }
             let h = f.rd(c);
+            sig = (sig ^ h as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
             match h >> 30 {
                 3 => {}
                 2 => {
@@ -1475,7 +1543,30 @@ impl Cp {
         let w = super::par::main_weight();
         let main_n = ((n as f64 * w / (w + m as f64)).round() as usize).clamp(chunk_min, n - m * chunk_min);
         let per = (n - main_n) / m;
-        let starts: Vec<u64> = (0..m).map(|i| ends[main_n + i * per - 1]).collect();
+        // At equal recording cost when the run was measured before (`tune
+        // par_cost`), else at equal command counts.
+        let timed = super::tune::par_cost();
+        let sig = if timed { (sig ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1 } else { 0 };
+        let frame = super::FRAMES.load(Ordering::Relaxed);
+        let costed = if timed {
+            if self.run_costs.len() > 512 {
+                self.run_costs.retain(|_, r| r.seen + 120 >= frame);
+            }
+            let rc = self.run_costs.entry(sig).or_insert_with(|| RunCost { costs: vec![f32::NAN; n], seen: frame });
+            rc.seen = frame;
+            if rc.costs.len() == n {
+                cost_firsts(&rc.costs, main_n, n, m, chunk_min)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if costed.is_some() {
+            PAR_COSTED.fetch_add(1, Ordering::Relaxed);
+        }
+        let firsts: Vec<usize> = costed.unwrap_or_else(|| (0..m).map(|i| main_n + i * per).collect());
+        let starts: Vec<u64> = firsts.iter().map(|&i| ends[i - 1]).collect();
         // The state at each chunk's start.
         let mut st = self.chunk_state();
         let mut states: Vec<Box<ChunkState>> = Vec::new();
@@ -1518,13 +1609,15 @@ impl Cp {
             main_writes = Default::default();
         }
         let queue = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
-        let run = Arc::new(super::par::Run::new(queue, Arc::new(main_writes)));
+        let mut run = super::par::Run::new(queue, Arc::new(main_writes));
+        run.timed = timed;
+        let run = Arc::new(run);
         for w in &workers {
             w.start(run.clone());
         }
         super::par::RUNS.fetch_add(1, Ordering::Relaxed);
         super::par::CHUNKS.fetch_add(starts.len() as u64, Ordering::Relaxed);
-        self.par = Some(ParRun { starts, end: run_end, next: 0, run, waited_ns: 0, sync });
+        self.par = Some(ParRun { starts, end: run_end, next: 0, run, waited_ns: 0, sync, sig, n, firsts });
     }
 
     /// The main command processor reached the next chunk of the parallel
@@ -1548,6 +1641,8 @@ impl Cp {
         let tw = super::timeline::wait_start();
         let (done, waited) = run.collect(i);
         tw.end(&self.name, || "wait: parallel chunk".into());
+        // (Before the run ends below.)
+        let cost_key = self.par.as_ref().filter(|p| p.sig != 0 && !done.costs.is_empty()).and_then(|p| Some((p.sig, p.n, *p.firsts.get(i)?)));
         match self.par.as_mut() {
             Some(pr) if last => {
                 super::par::note_main_wait(pr.waited_ns + waited);
@@ -1558,6 +1653,9 @@ impl Cp {
         }
         if done.stopped.is_some() {
             super::par::note_stop(done.why);
+        }
+        if let Some((sig, n, first)) = cost_key {
+            self.note_chunk_costs(sig, n, first, &done.costs);
         }
         // This queue's later work and CP effects follow the chunk's batches
         // (a label written after the run must wait for them).
@@ -1571,6 +1669,29 @@ impl Cp {
                 s
             }
             None => to,
+        }
+    }
+
+    /// Folds the per-command costs a chunk measured (its first command:
+    /// `first`) into its run's costs (`tune par_cost`): smoothed; a chunk's
+    /// first command (it carries the chunk's setup) only when unknown, as
+    /// the mean of the others.
+    fn note_chunk_costs(&mut self, sig: u64, n: usize, first: usize, costs: &[u32]) {
+        let Some(rc) = self.run_costs.get_mut(&sig) else { return };
+        if rc.costs.len() != n || costs.len() < 2 {
+            return;
+        }
+        let mut sum = 0.0f64;
+        for (j, &c) in costs.iter().enumerate().skip(1) {
+            let Some(slot) = rc.costs.get_mut(first + j) else { break };
+            let v = c as f32;
+            *slot = if slot.is_finite() { 0.5 * *slot + 0.5 * v } else { v };
+            sum += c as f64;
+        }
+        if let Some(slot) = rc.costs.get_mut(first) {
+            if !slot.is_finite() {
+                *slot = (sum / (costs.len() - 1) as f64) as f32;
+            }
         }
     }
 
@@ -3816,5 +3937,34 @@ mod tests {
         assert!(high(Space::Sh, SH_DWORDS) >= 4);
         put_reg(&mut v, Space::Sh, 4, 4, 5);
         assert_eq!(v.len(), 4);
+    }
+
+    #[test]
+    fn chunks_split_at_equal_cost() {
+        // Commands 0..4 are the main command processor's; 4..16 go to three
+        // workers. The last four cost three times the others.
+        let mut c = vec![1.0f32; 16];
+        for x in c.iter_mut().skip(12) {
+            *x = 3.0;
+        }
+        // Total 8 + 12 = 20 over three chunks: cuts where ~6.7 and ~13.3
+        // are reached.
+        assert_eq!(cost_firsts(&c, 4, 16, 3, 2), Some(vec![4, 11, 14]));
+        // Equal costs: equal counts.
+        assert_eq!(cost_firsts(&[1.0; 16], 4, 16, 3, 2), Some(vec![4, 8, 12]));
+        // Chunks keep their minimum size.
+        let mut d = vec![1.0f32; 16];
+        d[4] = 100.0;
+        assert_eq!(cost_firsts(&d, 4, 16, 3, 3), Some(vec![4, 7, 10]));
+        // Unmeasured commands: no split by cost.
+        let mut e = vec![1.0f32; 16];
+        e[9] = f32::NAN;
+        assert_eq!(cost_firsts(&e, 4, 16, 3, 2), None);
+        // Main's part may stay unmeasured.
+        let mut g = vec![f32::NAN; 16];
+        for x in g.iter_mut().skip(4) {
+            *x = 1.0;
+        }
+        assert_eq!(cost_firsts(&g, 4, 16, 3, 2), Some(vec![4, 8, 12]));
     }
 }

@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 112] = [
+    static ALL: [Tunable; 113] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -139,6 +139,7 @@ pub mod tune {
         Tunable { name: "slots_gfx", env: "DS_GPU_SLOTS_GFX", default: 4, value: AtomicU64::new(UNSET) },
         Tunable { name: "split_every", env: "DS_SPLIT_EVERY", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "xpre_dry", env: "DS_XPRE_DRY", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par_cost", env: "DS_PAR_COST", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1189,11 +1190,22 @@ pub mod tune {
     /// prologue on the main queue instead: nothing runs that they could
     /// overlap, and the wait across queues (graphics batches with their own
     /// copies there started 65 us after their submission, 27 us without;
-    /// FINDINGS.md 2026-10-16) is left out. Not measured on a quiet machine
-    /// yet (default 0).
+    /// FINDINGS.md 2026-10-16) is left out. Neutral on a quiet machine
+    /// (flips/s 1.016, 0.997, 0.999, 0.995): off.
     #[inline]
     pub fn xpre_dry() -> bool {
         get(111) != 0
+    }
+
+    /// A parallel run is split among the workers at equal recording cost
+    /// instead of equal command counts, by the per-command costs its workers
+    /// measured when the same run (same packet headers) was recorded before
+    /// (`cp::RunCost`): its slowest chunk ended 14% after the mean one
+    /// (median; FINDINGS.md 2026-10-16), partly the same chunks every frame.
+    /// Default since 2026-10-16: +1.5% flips/s, +0.4% CPU per command.
+    #[inline]
+    pub fn par_cost() -> bool {
+        get(112) != 0
     }
 
 
