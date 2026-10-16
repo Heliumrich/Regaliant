@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 111] = [
+    static ALL: [Tunable; 112] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -138,6 +138,7 @@ pub mod tune {
         Tunable { name: "par_spins", env: "DS_PAR_SPINS", default: 512, value: AtomicU64::new(UNSET) },
         Tunable { name: "slots_gfx", env: "DS_GPU_SLOTS_GFX", default: 4, value: AtomicU64::new(UNSET) },
         Tunable { name: "split_every", env: "DS_SPLIT_EVERY", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "xpre_dry", env: "DS_XPRE_DRY", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1181,6 +1182,18 @@ pub mod tune {
     #[inline]
     pub fn split_every() -> u64 {
         get(110)
+    }
+
+    /// A batch submitted while the GPU has run out of work (every batch
+    /// handed over completed) records its copies for the copy queue into its
+    /// prologue on the main queue instead: nothing runs that they could
+    /// overlap, and the wait across queues (graphics batches with their own
+    /// copies there started 65 us after their submission, 27 us without;
+    /// FINDINGS.md 2026-10-16) is left out. Not measured on a quiet machine
+    /// yet (default 0).
+    #[inline]
+    pub fn xpre_dry() -> bool {
+        get(111) != 0
     }
 
 

@@ -1908,6 +1908,7 @@ pub(super) fn reset_pre_window() {
     for (s, v) in XCOPY_SNAP.iter().zip(&XCOPY) {
         s.store(v.load(Ordering::Relaxed), Ordering::Relaxed);
     }
+    XDRY_SNAP.store(XDRY.load(Ordering::Relaxed), Ordering::Relaxed);
     super::precache::reset_window();
 }
 
@@ -1919,11 +1920,12 @@ pub(super) fn pre_window_line() -> String {
     let x: Vec<u64> = XCOPY.iter().zip(&XCOPY_SNAP).map(|(v, s)| v.load(Ordering::Relaxed).saturating_sub(s.load(Ordering::Relaxed))).collect();
     let xq = if ctx().copy.is_some() {
         format!(
-            "    on the copy queue: {} copies ({} MiB) in {} batches; {} batches waited only for shared copies made there\n",
+            "    on the copy queue: {} copies ({} MiB) in {} batches; {} batches waited only for shared copies made there; {} batches put theirs into the prologue as the GPU had run dry (`xpre_dry`)\n",
             x[0],
             x[1] >> 20,
             x[2],
-            x[3]
+            x[3],
+            XDRY.load(Ordering::Relaxed).saturating_sub(XDRY_SNAP.load(Ordering::Relaxed))
         )
     } else {
         String::new()
@@ -1936,6 +1938,10 @@ static PRE_FULL: AtomicU64 = AtomicU64::new(0);
 /// batches with such copies, batches that waited only for such copies
 /// earlier batches made], and their values at the last `profile reset`.
 static XCOPY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Batches whose copy-queue copies went into their prologue as the GPU had
+/// run dry (`tune xpre_dry`), and the count at the last `profile reset`.
+static XDRY: AtomicU64 = AtomicU64::new(0);
+static XDRY_SNAP: AtomicU64 = AtomicU64::new(0);
 /// Why `speculate` left a command to wait (diagnostics, since boot): stale
 /// home, a data load this batch writes or not one mapping, a parallel
 /// chunk's own writes, a stage that writes memory or images, a shader that
@@ -2138,6 +2144,12 @@ static SUBMIT_WHY: Mutex<Option<HashMap<(String, &'static str), u64>>> = Mutex::
 /// queue: [submissions, idle ns before them, ns spent recording them].
 static STARVED: Mutex<Option<HashMap<String, [u64; 3]>>> = Mutex::new(None);
 static DONE_CV: parking_lot::Condvar = parking_lot::Condvar::new();
+
+/// Whether every batch handed over so far completed: the GPU ran out of our
+/// work (`tune xpre_dry`).
+fn gpu_ran_dry() -> bool {
+    done_seq() + 1 >= NEXT_SEQ.load(Ordering::Acquire)
+}
 
 fn done_seq() -> u64 {
     DONE_ATOMIC.load(Ordering::Acquire)
@@ -4942,6 +4954,16 @@ impl Exec {
         st.mark(1);
         self.resolve_timestamps();
         st.mark(2);
+        if !self.deferred && !self.xcopies.is_empty() && super::tune::xpre_dry() && gpu_ran_dry() {
+            // The GPU waits for this batch: its copies go into its prologue
+            // (`tune xpre_dry`).
+            let pre = self.open_pre();
+            record_copies(pre, &mut self.xcopies);
+            for e in self.shared_pending.iter_mut() {
+                e.3 = false;
+            }
+            XDRY.fetch_add(1, Ordering::Relaxed);
+        }
         let c = ctx();
         let i = self.cur;
         let (cmd, fence) = (self.slots[i].cmd, self.slots[i].fence);
