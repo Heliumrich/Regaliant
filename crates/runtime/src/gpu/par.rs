@@ -221,7 +221,8 @@ pub struct Worker {
     cp: Mutex<Cp>,
     /// The run to take chunks of.
     job: Mutex<Option<Arc<Run>>>,
-    cv: Condvar,
+    /// Its pool's wake word (`Pool::wake`): an idle worker sleeps on it.
+    wake: Arc<AtomicU64>,
 }
 
 /// Statistics: runs split, chunks handed to workers, chunks that stopped,
@@ -297,11 +298,22 @@ pub fn note_stop(why: &'static str) {
 /// The workers of a queue's command processor (created on first use).
 pub struct Pool {
     workers: Vec<Arc<Worker>>,
+    /// Moves when runs were handed out (`Worker::give`, `wake`): the idle
+    /// workers sleep on it (`WaitOnAddress`), so one call wakes them all
+    /// (a condition variable each took ~21 us of the planner per run,
+    /// FINDINGS.md 2026-10-16).
+    wake: Arc<AtomicU64>,
 }
 
 impl Pool {
     pub fn new() -> Pool {
-        Pool { workers: Vec::new() }
+        Pool { workers: Vec::new(), wake: Arc::new(AtomicU64::new(0)) }
+    }
+
+    /// Wakes the idle workers to the runs given them (`Worker::give`).
+    pub fn wake(&self) {
+        self.wake.fetch_add(1, Ordering::AcqRel);
+        unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll(Arc::as_ptr(&self.wake) as *const core::ffi::c_void) };
     }
 
     /// Worker `i` of the command processor `name` (started on first use);
@@ -315,7 +327,7 @@ impl Pool {
                 crate::warn!("gpu[{wname}]: no executor for a parallel worker ({e})");
                 return None;
             }
-            let w = Arc::new(Worker { cp: Mutex::new(cp), job: Mutex::new(None), cv: Condvar::new() });
+            let w = Arc::new(Worker { cp: Mutex::new(cp), job: Mutex::new(None), wake: self.wake.clone() });
             let w2 = w.clone();
             let tname = wname.clone();
             let r = crate::thread::spawn_host(
@@ -350,14 +362,21 @@ impl Default for Pool {
 fn run_worker(w: &Worker, name: &str) {
     loop {
         super::prio::apply();
-        let run = {
-            let mut g = w.job.lock();
-            loop {
-                if let Some(r) = g.take() {
-                    break r;
-                }
-                w.cv.wait(&mut g);
+        let run = loop {
+            // The word before looking: a run given after this wakes the
+            // sleep below (or it does not start).
+            let seen = w.wake.load(Ordering::Acquire);
+            if let Some(r) = w.job.lock().take() {
+                break r;
             }
+            unsafe {
+                windows_sys::Win32::System::Threading::WaitOnAddress(
+                    Arc::as_ptr(&w.wake) as *const core::ffi::c_void,
+                    &seen as *const u64 as *const core::ffi::c_void,
+                    8,
+                    windows_sys::Win32::System::Threading::INFINITE,
+                )
+            };
         };
         take_chunks(w, &run, name);
         run.leave();
@@ -433,11 +452,11 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
 }
 
 impl Worker {
-    /// Takes chunks of `run` (`Run::active` counts it).
-    pub fn start(&self, run: Arc<Run>) {
+    /// Gives it `run` to take chunks of (`Run::active` counts it); it
+    /// starts once its pool wakes (`Pool::wake`).
+    pub fn give(&self, run: Arc<Run>) {
         run.active.fetch_add(1, Ordering::AcqRel);
         *self.job.lock() = Some(run);
-        self.cv.notify_all();
     }
 }
 

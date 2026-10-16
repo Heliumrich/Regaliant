@@ -1377,6 +1377,46 @@ fn record_copies(cmd: vk::CommandBuffer, copies: &mut Vec<(vk::Buffer, vk::Buffe
     copies.clear();
 }
 
+/// Records a prologue's remaining copies and ends it (`Exec::end_pre`; on
+/// the submission thread with `tune submit_finish`).
+fn finish_pre(pre: vk::CommandBuffer, copies: &mut Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>, qp: vk::QueryPool) {
+    record_copies(pre, copies);
+    unsafe {
+        global_barrier(pre);
+        if qp != vk::QueryPool::null() {
+            ctx().device.cmd_write_timestamp(pre, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED + 3);
+        }
+        ctx().device.end_command_buffer(pre).ok();
+    }
+}
+
+/// Records a batch's copies for the copy queue into its `xpre` (`Exec::end_xpre`).
+fn finish_xpre(x: vk::CommandBuffer, copies: &mut Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>) {
+    unsafe {
+        ctx().device.begin_command_buffer(x, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
+        record_copies(x, copies);
+        ctx().device.end_command_buffer(x).ok();
+    }
+}
+
+/// Ends a batch's command buffer: its end timestamp (profiling; the
+/// prologue's read as unavailable when it has none) and a barrier making
+/// shader writes to imported memory visible to the host.
+fn finish_main(cmd: vk::CommandBuffer, qp: vk::QueryPool, has_pre: bool) {
+    let c = ctx();
+    unsafe {
+        if qp != vk::QueryPool::null() {
+            c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED + 1);
+            if !has_pre {
+                c.device.cmd_reset_query_pool(cmd, qp, STAMPS * MAX_TIMED + 2, 2);
+            }
+        }
+        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        c.device.end_command_buffer(cmd).ok();
+    }
+}
+
 /// Counts a batch's copy-queue use (`XCOPY`).
 fn note_copy_waits(own: bool, wait: u64) {
     if own {
@@ -1759,6 +1799,9 @@ static OFFTHREAD_RESETS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static SUBMIT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// `submit_for`'s steps (DS_PROFILE_GPU): ns per step (`SUBMIT_STEP_NAMES`).
 static SUBMIT_STEPS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// The same for the submissions before a parallel run (`Cp::par_plan`), and
+/// their count last.
+static SUBMIT_STEPS_RUN: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 const SUBMIT_STEP_NAMES: [&str; 11] = [
     "shadow write-back",
     "end rendering",
@@ -1774,13 +1817,17 @@ const SUBMIT_STEP_NAMES: [&str; 11] = [
 ];
 
 /// Times the steps of `submit_for` (profiling).
-struct StepTimer(Option<std::time::Instant>);
+struct StepTimer(Option<std::time::Instant>, bool);
 
 impl StepTimer {
     fn mark(&mut self, k: usize) {
         if let Some(t) = self.0 {
             let now = std::time::Instant::now();
-            SUBMIT_STEPS[k].fetch_add((now - t).as_nanos() as u64, Ordering::Relaxed);
+            let ns = (now - t).as_nanos() as u64;
+            SUBMIT_STEPS[k].fetch_add(ns, Ordering::Relaxed);
+            if self.1 {
+                SUBMIT_STEPS_RUN[k].fetch_add(ns, Ordering::Relaxed);
+            }
             self.0 = Some(now);
         }
     }
@@ -1808,7 +1855,9 @@ fn begin_stats_line() -> String {
         s[3] as f64 / s[2].max(1) as f64 / 1000.0
     ) + &{
         let steps: Vec<String> = SUBMIT_STEP_NAMES.iter().zip(SUBMIT_STEPS.iter()).map(|(n, v)| format!("{n} {:.1}", v.load(Ordering::Relaxed) as f64 / sub[0].max(1) as f64 / 1000.0)).collect();
-        format!("    submission steps (us each): {}\n", steps.join(", "))
+        let runs = SUBMIT_STEPS_RUN[11].load(Ordering::Relaxed);
+        let before: Vec<String> = SUBMIT_STEP_NAMES.iter().zip(SUBMIT_STEPS_RUN.iter()).map(|(n, v)| format!("{n} {:.1}", v.load(Ordering::Relaxed) as f64 / runs.max(1) as f64 / 1000.0)).collect();
+        format!("    submission steps (us each): {}; of the {} before parallel runs: {}\n", steps.join(", "), runs, before.join(", "))
     }
 }
 /// The first GPU timestamp writes (batch, guest address), compared with the
@@ -4203,7 +4252,7 @@ pub fn reset_shader_profile() {
         g.3 = [[0; 2]; 4];
     }
     PRE_STABLE.lock().1 = [0; 5];
-    for c in BEGIN_STATS.iter().chain(OFFTHREAD_RESETS.iter()) {
+    for c in BEGIN_STATS.iter().chain(OFFTHREAD_RESETS.iter()).chain(SUBMIT_STATS.iter()).chain(SUBMIT_STEPS.iter()).chain(SUBMIT_STEPS_RUN.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     *BATCH_BY.lock() = None;
@@ -4942,7 +4991,10 @@ impl Exec {
         }
         let t_submit = profiling().then(std::time::Instant::now);
         // (Chunk batches of parallel workers close here without a submission.)
-        let mut st = StepTimer(t_submit.filter(|_| !self.deferred));
+        let mut st = StepTimer(t_submit.filter(|_| !self.deferred), why == "parallel run");
+        if st.0.is_some() && st.1 {
+            SUBMIT_STEPS_RUN[11].fetch_add(1, Ordering::Relaxed);
+        }
         let mut waited = std::time::Duration::ZERO;
         if profiling() {
             *SUBMIT_WHY.lock().get_or_insert_with(HashMap::new).entry((self.name.clone(), why)).or_default() += 1;
@@ -4972,26 +5024,25 @@ impl Exec {
             }
             XDRY.fetch_add(1, Ordering::Relaxed);
         }
-        let c = ctx();
         let i = self.cur;
         let (cmd, fence) = (self.slots[i].cmd, self.slots[i].fence);
-        if self.slots[i].queries != vk::QueryPool::null() {
-            unsafe { c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.slots[i].queries, STAMPS * MAX_TIMED + 1) };
-        }
-        let pre = self.end_pre();
-        let xpre = self.end_xpre();
+        let qp = self.slots[i].queries;
+        // Finished by the submission thread (`tune submit_finish`): the
+        // prologue left open with its copies, the copy-queue copies, the
+        // command buffer's end.
+        let finish = !self.deferred && super::tune::submit_finish() && super::tune::submit_thread();
+        let (pre, xpre, pre_job, xpre_job) = if finish {
+            let pre_job = self.take_pre();
+            let xpre_job = (!self.xcopies.is_empty()).then(|| (self.slots[i].xpre, std::mem::take(&mut self.xcopies)));
+            (None, None, pre_job, xpre_job)
+        } else {
+            let pre = self.end_pre();
+            let xpre = self.end_xpre();
+            finish_main(cmd, qp, pre.is_some());
+            (pre, xpre, None, None)
+        };
         let copy_wait = std::mem::take(&mut self.copy_wait);
-        if pre.is_none() && self.slots[i].queries != vk::QueryPool::null() {
-            // No prologue: its timestamps read as unavailable.
-            unsafe { c.device.cmd_reset_query_pool(cmd, self.slots[i].queries, STAMPS * MAX_TIMED + 2, 2) };
-        }
         st.mark(3);
-        unsafe {
-            // Make shader writes to imported memory visible to the host.
-            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
-            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[mb], &[], &[]);
-            c.device.end_command_buffer(cmd).ok();
-        }
         st.mark(4);
         let actions = std::mem::take(&mut self.actions);
         let has_actions = !actions.is_empty();
@@ -5035,12 +5086,24 @@ impl Exec {
         }
         let commands = self.batch_shaders.len();
         let gpu_labels = self.pending_promises.clone();
-        note_copy_waits(xpre.is_some(), copy_wait);
+        note_copy_waits(xpre.is_some() || xpre_job.is_some(), copy_wait);
         let alt = self.batch_alt;
         let reset = self.slot_reset(i);
         let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, std::mem::take(&mut self.segs), reset, move |seq| {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return;
+            }
+            let (mut pre, mut xpre) = (pre, xpre);
+            if finish {
+                pre = pre_job.map(|(p, mut copies)| {
+                    finish_pre(p, &mut copies, qp);
+                    p
+                });
+                xpre = xpre_job.map(|(x, mut copies)| {
+                    finish_xpre(x, &mut copies);
+                    x
+                });
+                finish_main(cmd, qp, pre.is_some());
             }
             let r = submit_batch(seq, xpre, pre, cmd, copy_wait, fence, alt);
             if let Err(e) = r {
@@ -5404,6 +5467,17 @@ impl Exec {
         super::homes::WRITE_BACKS.fetch_add(1, Ordering::Relaxed);
         self.barrier_wanted = false;
         self.dispatched = false;
+    }
+
+    /// The batch's copy prologue, if it was begun, left open with the copies
+    /// still to record into it (`tune submit_finish`: `finish_pre` on the
+    /// submission thread).
+    fn take_pre(&mut self) -> Option<(vk::CommandBuffer, Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>)> {
+        if !std::mem::take(&mut self.pre_open) {
+            self.pre_copies.clear();
+            return None;
+        }
+        Some((self.slots[self.cur].pre, std::mem::take(&mut self.pre_copies)))
     }
 
     /// Ends the batch's copy prologue, if it was begun: the copies complete

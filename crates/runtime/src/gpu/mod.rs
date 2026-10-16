@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 113] = [
+    static ALL: [Tunable; 115] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -140,6 +140,8 @@ pub mod tune {
         Tunable { name: "split_every", env: "DS_SPLIT_EVERY", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "xpre_dry", env: "DS_XPRE_DRY", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_cost", env: "DS_PAR_COST", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "submit_finish", env: "DS_SUBMIT_FINISH", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "plan_check", env: "DS_PLAN_CHECK", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1207,6 +1209,26 @@ pub mod tune {
     #[inline]
     pub fn par_cost() -> bool {
         get(112) != 0
+    }
+
+    /// A command processor's batch is finished by the submission thread
+    /// (`tune submit_thread`): its prologue's copies recorded and the
+    /// prologue, its copy-queue copies and its command buffer ended there,
+    /// not on the recording thread (~18 us of a ~50 us submission,
+    /// profiled; FINDINGS.md 2026-10-16). Parallel workers' chunk batches
+    /// keep finishing theirs.
+    #[inline]
+    pub fn submit_finish() -> bool {
+        get(113) != 0
+    }
+
+    /// Diagnostics: the parallel-run planner also computes each chunk's
+    /// start state a register at a time (`Cp::apply_state` for every packet)
+    /// and logs where it differs from the one-copy register ranges
+    /// (`put_regs`).
+    #[inline]
+    pub fn plan_check() -> bool {
+        get(114) != 0
     }
 
 

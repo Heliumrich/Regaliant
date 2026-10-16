@@ -110,6 +110,53 @@ fn copy_prefix(dst: &mut [u32], src: &[u32], hi: usize) {
     }
 }
 
+/// `tune plan_check`: logs the first registers where a chunk start state made
+/// with `put_regs` differs from the one made a register at a time.
+fn plan_check_states(a: &ChunkState, b: &ChunkState, at: u64) {
+    static CHECKED: AtomicU64 = AtomicU64::new(0);
+    static BAD: AtomicU64 = AtomicU64::new(0);
+    let n = CHECKED.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut diff = Vec::new();
+    for (name, x, y) in [("ctx", &a.regs.ctx, &b.regs.ctx), ("sh", &a.regs.sh, &b.regs.sh), ("uc", &a.regs.uc, &b.regs.uc)] {
+        for i in 0..x.len().max(y.len()) {
+            let (u, v) = (x.get(i).copied().unwrap_or(0), y.get(i).copied().unwrap_or(0));
+            if u != v && diff.len() < 6 {
+                diff.push(format!("{name}[{i:#x}] {u:#x} against {v:#x}"));
+            }
+        }
+    }
+    let other = (a.index_base, a.index_count, a.num_instances, a.draw_indirect_base, a.dispatch_indirect_base) != (b.index_base, b.index_count, b.num_instances, b.draw_indirect_base, b.dispatch_indirect_base);
+    if !diff.is_empty() || other {
+        if BAD.fetch_add(1, Ordering::Relaxed) < 20 {
+            crate::warn!("gpu: plan_check: chunk start at {at:#x}: {} (other fields differ: {other})", diff.join(", "));
+        }
+    } else if n % 10000 == 0 {
+        crate::info!("gpu: plan_check: {n} chunk start states checked, {} differed", BAD.load(Ordering::Relaxed));
+    }
+}
+
+/// Writes `count` registers of a snapshot from `first` (growing it) with the
+/// dwords at `a` (`put_reg` for each, in one copy).
+fn put_regs(v: &mut Vec<u32>, space: Space, cap: usize, first: usize, f: &Fetched, a: u64, count: usize) {
+    if count == 0 || first >= cap {
+        return;
+    }
+    let end = (first + count).min(cap);
+    if end > v.len() {
+        v.resize(end, 0);
+    }
+    let dst = &mut v[first..end];
+    match f.slice(a, dst.len()) {
+        Some(src) => dst.copy_from_slice(src),
+        None => {
+            for (j, d) in dst.iter_mut().enumerate() {
+                *d = f.rd(a + 4 * j as u64);
+            }
+        }
+    }
+    note_high(space, end - 1);
+}
+
 /// Writes register `i` of a snapshot (growing it), notes the index.
 fn put_reg(v: &mut Vec<u32>, space: Space, cap: usize, i: usize, val: u32) {
     if i >= cap {
@@ -413,6 +460,16 @@ impl Fetched {
         let n = size as usize;
         let words = if on && size > 0 && size <= FETCH_DWORDS && valid(base, 4 * n as u64) { unsafe { std::slice::from_raw_parts(base as *const u32, n) }.to_vec() } else { Vec::new() };
         Fetched { base, words, live: false }
+    }
+
+    /// The `len` dwords at `a` when they are all fetched, or all live (none
+    /// fetched); None when they straddle the fetched range.
+    fn slice(&self, a: u64, len: usize) -> Option<&[u32]> {
+        if self.words.is_empty() {
+            return valid(a, 4 * len as u64).then(|| unsafe { std::slice::from_raw_parts(a as *const u32, len) });
+        }
+        let i = (a.checked_sub(self.base)? / 4) as usize;
+        self.words.get(i..i + len)
     }
 
     /// The dword at `a`: fetched, or live memory past the fetched range.
@@ -942,6 +999,27 @@ fn op_name(opcode: u32) -> String {
     };
     n.to_string()
 }
+/// The planner's time (`tune cp_classes`; ns): [runs left serial, their
+/// count, then for runs split: the scan, setup (fast clears, homes,
+/// indirect-argument reads), the chunks' start states, the rest of starting
+/// the workers, their count; then of starting: getting the workers and the
+/// unsubmitted writes, submitting the batch before the run, making the run,
+/// waking the workers].
+static PLAN_PHASES: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+
+/// Lap clock of `par_plan` (`PLAN_PHASES`).
+struct PlanLaps(Option<Instant>);
+
+impl PlanLaps {
+    fn mark(&mut self, k: usize) {
+        if let Some(t) = self.0 {
+            let now = Instant::now();
+            PLAN_PHASES[k].fetch_add((now - t).as_nanos() as u64, Ordering::Relaxed);
+            self.0 = Some(now);
+        }
+    }
+}
+
 const CP_CLASS_NAMES: [&str; 10] = ["own parallel chunks: draws", "own parallel chunks: dispatches", "serial draws", "serial dispatches", "CP effects", "state", "NOPs and private operations", "planning", "collecting", "buffer-end submissions"];
 
 /// A packet class's start (`cp_classes`): the clock and the thread's waits.
@@ -961,7 +1039,7 @@ fn class_end(k: usize, t: Option<(Instant, u64)>) {
 
 /// Clears the packet classes (`profile reset`).
 pub fn reset_classes() {
-    for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()).chain(SERIAL_WHY.iter()) {
+    for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()).chain(SERIAL_WHY.iter()).chain(PLAN_PHASES.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     CP_CLASSES_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -985,6 +1063,24 @@ pub fn classes_line() -> String {
     let mut s = format!("    graphics command processor per flip by packet class (waits apart; {:.2} ms in all): {}\n", total as f64 / flips / 1e6, parts.join("; "));
     let why: Vec<String> = SERIAL_WHY.iter().zip(SERIAL_WHY_NAMES).map(|(c, name)| format!("{name} {:.1}", c.load(Ordering::Relaxed) as f64 / flips)).collect();
     s.push_str(&format!("    its serial commands per flip by why they were not in a parallel run: {}\n", why.join(", ")));
+    let ph: Vec<u64> = PLAN_PHASES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let us = |ns: u64, n: u64| ns as f64 / n.max(1) as f64 / 1e3;
+    s.push_str(&format!(
+        "    planning per flip: {:.1} runs left serial at {:.1} us each; {:.1} runs split at {:.1} us each (scan {:.1}, setup {:.1}, chunk start states {:.1}, starting workers {:.1}: getting them and the unsubmitted writes {:.1}, submitting the batch before the run {:.1}, making the run {:.1}, waking them {:.1}, the rest {:.1})\n",
+        ph[1] as f64 / flips,
+        us(ph[0], ph[1]),
+        ph[6] as f64 / flips,
+        us(ph[2] + ph[3] + ph[4] + ph[5] + ph[7] + ph[8] + ph[9] + ph[10], ph[6]),
+        us(ph[2], ph[6]),
+        us(ph[3], ph[6]),
+        us(ph[4], ph[6]),
+        us(ph[5] + ph[7] + ph[8] + ph[9] + ph[10], ph[6]),
+        us(ph[7], ph[6]),
+        us(ph[8], ph[6]),
+        us(ph[9], ph[6]),
+        us(ph[10], ph[6]),
+        us(ph[5], ph[6])
+    ));
     let mut ops: Vec<(usize, u64, u64, u64)> = ACB_OPS
         .iter()
         .enumerate()
@@ -1406,6 +1502,8 @@ impl Cp {
     /// `from` into chunks when it is long enough: the first stays here, the
     /// others go to the workers' queue now (`gpu::par`).
     fn par_plan(&mut self, f: &Fetched, from: u64, end: u64) {
+        // (Profile: `tune cp_classes`, `PLAN_PHASES`.)
+        let mut lap = PlanLaps(super::tune::cp_classes().then(Instant::now));
         let k = if self.compute { (super::tune::par_compute() as usize).min(8) } else { super::par::workers() };
         // The run's commands, its end and the indirect arguments read in it.
         let mut ends: Vec<u64> = Vec::new();
@@ -1490,8 +1588,11 @@ impl Cp {
             // Not again before execution passes this run's end.
             self.par_skip = (end, run_end);
             self.par_skip_n = n;
+            lap.mark(0);
+            PLAN_PHASES[1].fetch_add(1, Ordering::Relaxed);
             return;
         }
+        lap.mark(2);
         // Pending fast clears are applied now (a worker cannot apply one at
         // the image's first use in program order, so each stopped its chunk:
         // ~4 times per frame in the courtyard). The run's start is a
@@ -1537,6 +1638,7 @@ impl Cp {
             }
             self.sync_reads(&merged);
         }
+        lap.mark(3);
         // The main command processor's chunk first (`par::main_weight`
         // times a worker's), then equal ones for the workers' queue.
         let m = chunks - 1;
@@ -1571,6 +1673,8 @@ impl Cp {
         let mut st = self.chunk_state();
         let mut states: Vec<Box<ChunkState>> = Vec::new();
         let mut c = from;
+        // (`tune plan_check`: the same a register at a time.)
+        let mut check = super::tune::plan_check().then(|| self.chunk_state());
         for &s in &starts {
             while c < s {
                 let h = f.rd(c);
@@ -1585,11 +1689,36 @@ impl Cp {
                 }
                 let n = count as u64 + 1;
                 let at = c;
-                Self::apply_state(&mut st, (h >> 8) & 0xFF, n, &|i: u64| f.rd(at + 4 * (1 + i)));
+                let opc = (h >> 8) & 0xFF;
+                // Register ranges in one copy (most of a run's packets).
+                let regs = match opc {
+                    op::SET_CONTEXT_REG | op::SET_CONTEXT_REG_INDEX => Some((Space::Ctx, CTX_DWORDS)),
+                    op::SET_SH_REG | op::SET_SH_REG_INDEX => Some((Space::Sh, SH_DWORDS)),
+                    op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX => Some((Space::Uc, UC_DWORDS)),
+                    _ => None,
+                };
+                match regs {
+                    Some((space, cap)) if n >= 2 => {
+                        let v = match space {
+                            Space::Ctx => &mut st.regs.ctx,
+                            Space::Sh => &mut st.regs.sh,
+                            Space::Uc => &mut st.regs.uc,
+                        };
+                        put_regs(v, space, cap, (f.rd(at + 4) & 0xFFFF) as usize, f, at + 8, (n - 1) as usize);
+                    }
+                    _ => Self::apply_state(&mut st, opc, n, &|i: u64| f.rd(at + 4 * (1 + i))),
+                }
+                if let Some(st2) = check.as_mut() {
+                    Self::apply_state(st2, opc, n, &|i: u64| f.rd(at + 4 * (1 + i)));
+                }
                 c += 4 * (n + 1);
+            }
+            if let Some(st2) = check.as_ref() {
+                plan_check_states(&st, st2, s);
             }
             states.push(Box::new(st.clone()));
         }
+        lap.mark(4);
         let mut workers = Vec::new();
         for i in 0..k.min(m) {
             match self.par_pool.worker(i, &self.name, self.compute) {
@@ -1604,20 +1733,27 @@ impl Cp {
         // What this queue's batch being recorded writes: the workers cannot
         // wait for it (`tune par_main_writes`).
         let mut main_writes = self.exec.as_ref().map(|e| e.unsubmitted_writes()).unwrap_or_default();
+        lap.mark(7);
         if super::tune::par_main_writes() == 2 && !main_writes.is_empty() {
             self.submit_gpu("parallel run");
             main_writes = Default::default();
         }
+        lap.mark(8);
         let queue = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
         let mut run = super::par::Run::new(queue, Arc::new(main_writes));
         run.timed = timed;
         let run = Arc::new(run);
+        lap.mark(9);
         for w in &workers {
-            w.start(run.clone());
+            w.give(run.clone());
         }
+        self.par_pool.wake();
+        lap.mark(10);
         super::par::RUNS.fetch_add(1, Ordering::Relaxed);
         super::par::CHUNKS.fetch_add(starts.len() as u64, Ordering::Relaxed);
         self.par = Some(ParRun { starts, end: run_end, next: 0, run, waited_ns: 0, sync, sig, n, firsts });
+        lap.mark(5);
+        PLAN_PHASES[6].fetch_add(1, Ordering::Relaxed);
     }
 
     /// The main command processor reached the next chunk of the parallel
@@ -3937,6 +4073,26 @@ mod tests {
         assert!(high(Space::Sh, SH_DWORDS) >= 4);
         put_reg(&mut v, Space::Sh, 4, 4, 5);
         assert_eq!(v.len(), 4);
+    }
+
+    #[test]
+    fn register_ranges_copy_like_single_writes() {
+        // A SET_*_REG payload at 0x1000 (fetched): registers 3.. get 10, 11,
+        // 12; a range past the file's end stops at it.
+        let f = Fetched { base: 0x1000, words: vec![10, 11, 12, 13, 14], live: false };
+        let mut a = vec![7u32; 2];
+        put_regs(&mut a, Space::Ctx, 64, 3, &f, 0x1000, 3);
+        let mut b = vec![7u32; 2];
+        for j in 0..3 {
+            put_reg(&mut b, Space::Ctx, 64, 3 + j, 10 + j as u32);
+        }
+        assert_eq!(a, b);
+        assert_eq!(a, [7, 7, 0, 10, 11, 12]);
+        let mut c = Vec::new();
+        put_regs(&mut c, Space::Ctx, 5, 3, &f, 0x1004, 4);
+        assert_eq!(c, [0, 0, 0, 11, 12]);
+        assert_eq!(f.slice(0x1008, 3), Some(&[12u32, 13, 14][..]));
+        assert_eq!(f.slice(0x1010, 2), None, "straddles the fetched words");
     }
 
     #[test]
