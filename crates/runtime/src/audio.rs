@@ -154,11 +154,20 @@ fn mix_into(out: &mut [f32], frames: usize) {
     if starved {
         UNDERRUN_FRAMES.fetch_add(frames as u64, Ordering::Relaxed);
     }
+    // A soft knee above 0.8 instead of clipping at full scale (loud
+    // transients of the 3D mix reached ~1.2 in combat).
     for v in out[..2 * frames].iter_mut() {
-        *v = v.clamp(-1.0, 1.0);
+        let a = v.abs();
+        if a > SOFT_KNEE {
+            *v = v.signum() * (SOFT_KNEE + (1.0 - SOFT_KNEE) * ((a - SOFT_KNEE) / (1.0 - SOFT_KNEE)).tanh());
+        }
     }
     PLAYED_FRAMES.fetch_add(frames as u64, Ordering::Relaxed);
 }
+
+/// Output level from which samples are compressed smoothly toward full
+/// scale (`mix_into`).
+const SOFT_KNEE: f32 = 0.8;
 
 fn output_thread() {
     crate::log::set_thread_name("audio-out");
