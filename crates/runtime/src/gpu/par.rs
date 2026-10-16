@@ -39,6 +39,24 @@ pub fn workers() -> usize {
     }
 }
 
+/// The fewest commands a graphics run is split at (`tune par_min`; 0:
+/// automatic): 64 with eight workers or more, else 128. On 24 logical CPUs
+/// 64 against 128 gave +1.6% flips/s at +5.4% CPU per command (more, smaller
+/// chunks; FINDINGS.md 2026-10-16): worth it while CPUs are spare, a loss
+/// once they are not.
+pub fn min_run() -> usize {
+    match super::tune::par_min() {
+        0 => {
+            if workers() >= 8 {
+                64
+            } else {
+                128
+            }
+        }
+        v => v as usize,
+    }
+}
+
 /// Chunks per recorder (the main command processor and each worker) a run
 /// is split into (`tune par_split`; 1: one each, all submitted when the
 /// main command processor's own chunk is done).

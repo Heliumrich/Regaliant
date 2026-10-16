@@ -110,7 +110,7 @@ pub mod tune {
         Tunable { name: "label_merge", env: "DS_LABEL_MERGE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "sync_cs", env: "DS_SYNC_CS_ON", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_compute", env: "DS_PAR_COMPUTE", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "par_min", env: "DS_PAR_MIN", default: 128, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par_min", env: "DS_PAR_MIN", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "label_early", env: "DS_LABEL_EARLY", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_events", env: "DS_PAR_EVENTS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_min_compute", env: "DS_PAR_MIN_COMPUTE", default: 192, value: AtomicU64::new(UNSET) },
@@ -917,7 +917,8 @@ pub mod tune {
     }
 
     /// The fewest commands a run is split into parallel chunks at (chunks
-    /// at least a third of it, at least 16 commands).
+    /// at least a third of it, at least 16 commands); 0: automatic
+    /// (`par::min_run`).
     #[inline]
     pub fn par_min() -> u64 {
         get(83)

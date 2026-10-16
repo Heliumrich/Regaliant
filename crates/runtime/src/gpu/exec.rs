@@ -3711,23 +3711,27 @@ pub static ZERO_GROUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// samplers, then the counts of buffer bindings and of stages.
 /// Per place class (`PLACE_CLASSES`: a fresh batch's first commands cost
 /// several times a later one's bindings, `place_lines`).
-pub(super) static BIND_STEPS_BY: [[AtomicU64; 10]; 6] = [const { [const { AtomicU64::new(0) }; 10] }; 6];
+pub(super) static BIND_STEPS_BY: [[AtomicU64; 10]; 9] = [const { [const { AtomicU64::new(0) }; 10] }; 9];
 const BIND_STEP_NAMES: [&str; 8] = ["resource and home", "resident shadows", "snapshot", "mirror", "batch-start copy", "mapping span", "placement and rest", "images and samplers"];
 
 /// Place classes of the bind-step and batch-start copy tables (`place_class`).
-const PLACE_CLASSES: [&str; 6] = [
-    "main command processors, later commands",
-    "main command processors, first command of a batch",
-    "main command processors, 2nd-32nd commands",
+const PLACE_CLASSES: [&str; 9] = [
+    "graphics command processor, later commands",
+    "graphics command processor, first command of a batch",
+    "graphics command processor, 2nd-32nd commands",
+    "compute queues, later commands",
+    "compute queues, first command of a batch",
+    "compute queues, 2nd-32nd commands",
     "parallel workers, later commands",
     "parallel workers, first command of a batch",
     "parallel workers, 2nd-32nd commands",
 ];
 
 /// The place class of a command recorded as the `place`-th (from 0) of its
-/// batch by a parallel worker or not.
-fn place_class(worker: bool, place: usize) -> u8 {
-    3 * worker as u8
+/// batch by the graphics command processor (`kind` 0), a compute queue's
+/// (1) or a parallel worker (2).
+fn place_class(kind: u8, place: usize) -> u8 {
+    3 * kind
         + match place {
             0 => 1,
             1..=31 => 2,
@@ -3747,7 +3751,7 @@ fn flush_every(class: usize) -> u64 {
 
 thread_local! {
     /// This thread's BIND_STEPS_BY not yet added.
-    static BIND_LOCAL: std::cell::Cell<[[u64; 10]; 6]> = const { std::cell::Cell::new([[0; 10]; 6]) };
+    static BIND_LOCAL: std::cell::Cell<[[u64; 10]; 9]> = const { std::cell::Cell::new([[0; 10]; 9]) };
     /// The place class of the command being bound (`place_class`).
     static BIND_PLACE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
@@ -3826,12 +3830,12 @@ fn bind_steps_of(steps: &[AtomicU64; 10], what: &str) -> String {
 
 /// `Exec::pre_copy` by outcome (DS_PROFILE_GPU) per place class
 /// (`PLACE_CLASSES`): TSC cycles and calls per `PRE_STEP_NAMES`.
-static PRE_STEPS_BY: [[AtomicU64; 12]; 6] = [const { [const { AtomicU64::new(0) }; 12] }; 6];
+static PRE_STEPS_BY: [[AtomicU64; 12]; 9] = [const { [const { AtomicU64::new(0) }; 12] }; 9];
 const PRE_STEP_NAMES: [&str; 6] = ["refused at once", "reused in the batch", "shared copy reused", "copied for the batch", "copied into the shared cache", "refused after looking"];
 
 thread_local! {
     /// This thread's PRE_STEPS_BY not yet added.
-    static PRE_LOCAL: std::cell::Cell<[[u64; 12]; 6]> = const { std::cell::Cell::new([[0; 12]; 6]) };
+    static PRE_LOCAL: std::cell::Cell<[[u64; 12]; 9]> = const { std::cell::Cell::new([[0; 12]; 9]) };
 }
 
 /// Times one `pre_copy` call; `k` is its outcome when it returns.
@@ -4538,6 +4542,9 @@ pub struct Exec {
     alt_id: u64,
     /// Every batch goes to the compute-only family's queue (`vk::alt_compute_id`).
     on_compute: bool,
+    /// A compute queue's command processor records into it (profile
+    /// classes).
+    compute_cp: bool,
     batch_alt: bool,
     batch_alt_share: bool,
     /// GPU writes this batch recorded since its last full barrier through
@@ -4706,6 +4713,7 @@ impl Exec {
                 forward_ids: Vec::new(),
                 alt_id,
                 on_compute,
+                compute_cp: name.starts_with("gpu-acb"),
                 batch_alt: false,
                 batch_alt_share: false,
                 since_barrier: Some(Vec::new()),
@@ -7396,7 +7404,7 @@ impl Exec {
         bound.images.reserve(nb);
         let seg = SHADOW_BYTES;
         let fx = fixed();
-        BIND_PLACE.with(|f| f.set(place_class(self.deferred, self.batch_shaders.len())));
+        BIND_PLACE.with(|f| f.set(place_class(if self.deferred { 2 } else if self.compute_cp { 1 } else { 0 }, self.batch_shaders.len())));
         let mut clk = BindClock::start();
         {
             for b in &found.tr.out.bindings {

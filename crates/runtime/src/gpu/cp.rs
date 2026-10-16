@@ -1483,7 +1483,7 @@ impl Cp {
         };
         let n = ends.len();
         super::par::note_run(n, why, self.compute);
-        let par_min = (if self.compute { super::tune::par_min_compute() } else { super::tune::par_min() } as usize).max(48);
+        let par_min = (if self.compute { super::tune::par_min_compute() as usize } else { super::par::min_run() }).max(48);
         let chunk_min = (par_min / 3).clamp(16, PAR_CHUNK_MIN);
         let chunks = ((k + 1) * super::par::split()).min(n / chunk_min);
         if n < par_min || chunks < 2 {
@@ -1735,7 +1735,7 @@ impl Cp {
         let t0 = Instant::now();
         // Runs this command processor would split among parallel workers.
         let par_min = if f.words.is_empty() && !super::capture::capturing() && (if self.compute { super::tune::par_compute() > 0 } else { super::par::workers() > 0 }) {
-            (if self.compute { super::tune::par_min_compute() } else { super::tune::par_min() } as usize).max(48)
+            (if self.compute { super::tune::par_min_compute() as usize } else { super::par::min_run() }).max(48)
         } else {
             usize::MAX
         };
