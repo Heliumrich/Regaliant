@@ -77,13 +77,14 @@ struct Window {
     cycles: [u64; KINDS.len()],
     flips: u64,
     commands: u64,
+    splits: u64,
 }
 
 static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
 
 /// Starts a profile window (`profile reset`).
 pub fn reset_window() {
-    let w = Window { at: Instant::now(), cycles: snapshot(), flips: super::FRAMES.load(Ordering::Relaxed), commands: commands() };
+    let w = Window { at: Instant::now(), cycles: snapshot(), flips: super::FRAMES.load(Ordering::Relaxed), commands: commands(), splits: super::cp::SPLITS.load(Ordering::Relaxed) };
     *WINDOW.lock() = Some(w);
 }
 
@@ -97,8 +98,10 @@ pub fn window_line() -> String {
     let cmds = commands().saturating_sub(w.commands).max(1);
     let all: u64 = d.iter().sum();
     let parts: Vec<String> = KINDS.iter().zip(&d).map(|(k, &c)| format!("{k} {:.1}", ms(c) / flips as f64)).collect();
+    let splits = super::cp::SPLITS.load(Ordering::Relaxed).saturating_sub(w.splits);
+    let split = if splits > 0 { format!("; {:.1} batch splits per flip (`split_every`)", splits as f64 / flips as f64) } else { String::new() };
     format!(
-        "    thread CPU in the window, ms per flip: {} (all {:.1}); {:.2} us per command over all threads; {flips} flips, {cmds} commands in {:.1} s\n",
+        "    thread CPU in the window, ms per flip: {} (all {:.1}); {:.2} us per command over all threads; {flips} flips, {cmds} commands in {:.1} s{split}\n",
         parts.join(", "),
         ms(all) / flips as f64,
         ms(all) * 1000.0 / cmds as f64,

@@ -1393,6 +1393,7 @@ fn note_copy_waits(own: bool, wait: u64) {
 /// the timeline's signals increase.
 fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, fence: vk::Fence, alt: bool) -> Result<(), String> {
     let c = ctx();
+    SUBMIT_KIND.with(|k| k.set(if xpre.is_some() { 1 } else if wait > 0 { 2 } else { 0 }));
     let mut wait = wait;
     if let Some(x) = xpre {
         let q = c.copy.as_ref().ok_or("no copy queue")?;
@@ -2737,6 +2738,13 @@ fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, ch
     seq
 }
 
+thread_local! {
+    /// The batch just submitted (timeline names): 0 waits for no copy-queue
+    /// copies, 1 its own copies ran there, 2 it waits only for copies earlier
+    /// batches made there.
+    static SUBMIT_KIND: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
 /// Submissions for the submission thread (`tune submit_thread`): the
 /// vkQueueSubmit of each batch in sequence order, off the command
 /// processors (~7% of the graphics command processor's busy samples, ~220
@@ -2772,8 +2780,9 @@ fn submitter_thread() {
             }
         };
         let tl = super::timeline::mark();
+        SUBMIT_KIND.with(|k| k.set(0));
         job(seq);
-        super::timeline::end("vk submit", tl, || format!("#{seq}"));
+        super::timeline::end("vk submit", tl, || format!("#{seq}{}", ["", " own copies", " earlier copies"][SUBMIT_KIND.with(|k| k.get()) as usize]));
         note_submitted(seq);
     }
 }
@@ -3688,17 +3697,47 @@ pub static ZERO_GROUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// The bind step (`Exec::bind_stage`) by part (DS_PROFILE_GPU; TSC cycles):
 /// per buffer binding `BIND_STEP_NAMES[..7]`, then per stage the images and
 /// samplers, then the counts of buffer bindings and of stages.
-pub(super) static BIND_STEPS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
-/// The same for the first command of a batch (`place_lines`: a fresh
-/// batch's first command costs several times a later one's bindings).
-pub(super) static BIND_STEPS_FIRST: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// Per place class (`PLACE_CLASSES`: a fresh batch's first commands cost
+/// several times a later one's bindings, `place_lines`).
+pub(super) static BIND_STEPS_BY: [[AtomicU64; 10]; 6] = [const { [const { AtomicU64::new(0) }; 10] }; 6];
 const BIND_STEP_NAMES: [&str; 8] = ["resource and home", "resident shadows", "snapshot", "mirror", "batch-start copy", "mapping span", "placement and rest", "images and samplers"];
 
+/// Place classes of the bind-step and batch-start copy tables (`place_class`).
+const PLACE_CLASSES: [&str; 6] = [
+    "main command processors, later commands",
+    "main command processors, first command of a batch",
+    "main command processors, 2nd-32nd commands",
+    "parallel workers, later commands",
+    "parallel workers, first command of a batch",
+    "parallel workers, 2nd-32nd commands",
+];
+
+/// The place class of a command recorded as the `place`-th (from 0) of its
+/// batch by a parallel worker or not.
+fn place_class(worker: bool, place: usize) -> u8 {
+    3 * worker as u8
+        + match place {
+            0 => 1,
+            1..=31 => 2,
+            _ => 0,
+        }
+}
+
+/// Stages (calls) of a place class a thread adds to the shared tables at a
+/// time: the rarer classes at once.
+fn flush_every(class: usize) -> u64 {
+    match class % 3 {
+        1 => 1,
+        2 => 32,
+        _ => 256,
+    }
+}
+
 thread_local! {
-    /// This thread's BIND_STEPS not yet added.
-    static BIND_LOCAL: std::cell::Cell<[u64; 10]> = const { std::cell::Cell::new([0; 10]) };
-    /// Whether the stage being bound belongs to its batch's first command.
-    static BIND_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// This thread's BIND_STEPS_BY not yet added.
+    static BIND_LOCAL: std::cell::Cell<[[u64; 10]; 6]> = const { std::cell::Cell::new([[0; 10]; 6]) };
+    /// The place class of the command being bound (`place_class`).
+    static BIND_PLACE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
 /// TSC lap clock of the bind step's parts (profiling only; ~10 ns a mark).
@@ -3734,32 +3773,26 @@ impl Drop for BindClock {
         let now = unsafe { core::arch::x86_64::_rdtsc() };
         self.acc[7] += now.wrapping_sub(self.last);
         self.acc[9] += 1;
-        if BIND_FIRST.with(|f| f.get()) {
-            for (c, a) in BIND_STEPS_FIRST.iter().zip(self.acc.iter()) {
-                c.fetch_add(*a, Ordering::Relaxed);
-            }
-            return;
-        }
+        let k = BIND_PLACE.with(|f| f.get()) as usize;
         BIND_LOCAL.with(|l| {
             let mut v = l.get();
-            for (x, a) in v.iter_mut().zip(self.acc.iter()) {
+            for (x, a) in v[k].iter_mut().zip(self.acc.iter()) {
                 *x += a;
             }
-            if v[9] >= 256 {
-                for (c, x) in BIND_STEPS.iter().zip(v.iter()) {
+            if v[k][9] >= flush_every(k) {
+                for (c, x) in BIND_STEPS_BY[k].iter().zip(v[k].iter()) {
                     c.fetch_add(*x, Ordering::Relaxed);
                 }
-                v = [0; 10];
+                v[k] = [0; 10];
             }
             l.set(v);
         });
     }
 }
 
-/// Profile line: the bind step by part (`BIND_STEPS`), and for batches'
-/// first commands (`BIND_STEPS_FIRST`).
+/// Profile lines: the bind step by part per place class (`BIND_STEPS_BY`).
 fn bind_steps_line() -> String {
-    bind_steps_of(&BIND_STEPS, "") + &bind_steps_of(&BIND_STEPS_FIRST, " (first command of a batch)")
+    BIND_STEPS_BY.iter().zip(PLACE_CLASSES).map(|(t, what)| bind_steps_of(t, &format!(" ({what})"))).collect()
 }
 
 fn bind_steps_of(steps: &[AtomicU64; 10], what: &str) -> String {
@@ -3779,16 +3812,14 @@ fn bind_steps_of(steps: &[AtomicU64; 10], what: &str) -> String {
     )
 }
 
-/// `Exec::pre_copy` by outcome (DS_PROFILE_GPU): TSC cycles and calls per
-/// `PRE_STEP_NAMES`.
-static PRE_STEPS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
-/// The same for the first command of a batch.
-static PRE_STEPS_FIRST: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+/// `Exec::pre_copy` by outcome (DS_PROFILE_GPU) per place class
+/// (`PLACE_CLASSES`): TSC cycles and calls per `PRE_STEP_NAMES`.
+static PRE_STEPS_BY: [[AtomicU64; 12]; 6] = [const { [const { AtomicU64::new(0) }; 12] }; 6];
 const PRE_STEP_NAMES: [&str; 6] = ["refused at once", "reused in the batch", "shared copy reused", "copied for the batch", "copied into the shared cache", "refused after looking"];
 
 thread_local! {
-    /// This thread's PRE_STEPS not yet added, and its calls since.
-    static PRE_LOCAL: std::cell::Cell<([u64; 12], u32)> = const { std::cell::Cell::new(([0; 12], 0)) };
+    /// This thread's PRE_STEPS_BY not yet added.
+    static PRE_LOCAL: std::cell::Cell<[[u64; 12]; 6]> = const { std::cell::Cell::new([[0; 12]; 6]) };
 }
 
 /// Times one `pre_copy` call; `k` is its outcome when it returns.
@@ -3812,31 +3843,28 @@ impl PreClock {
 impl Drop for PreClock {
     fn drop(&mut self) {
         let dt = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(self.t0);
-        if BIND_FIRST.with(|f| f.get()) {
-            PRE_STEPS_FIRST[2 * self.k].fetch_add(dt, Ordering::Relaxed);
-            PRE_STEPS_FIRST[2 * self.k + 1].fetch_add(1, Ordering::Relaxed);
-            return;
-        }
+        // (A call outside a stage's binding counts in the class of the
+        // stage bound last.)
+        let c = BIND_PLACE.with(|f| f.get()) as usize;
         PRE_LOCAL.with(|l| {
-            let (mut v, mut n) = l.get();
-            v[2 * self.k] += dt;
-            v[2 * self.k + 1] += 1;
-            n += 1;
-            if n >= 1024 {
-                for (c, x) in PRE_STEPS.iter().zip(v.iter()) {
-                    c.fetch_add(*x, Ordering::Relaxed);
+            let mut v = l.get();
+            v[c][2 * self.k] += dt;
+            v[c][2 * self.k + 1] += 1;
+            let calls: u64 = (0..6).map(|j| v[c][2 * j + 1]).sum();
+            if calls >= 4 * flush_every(c) {
+                for (s, x) in PRE_STEPS_BY[c].iter().zip(v[c].iter()) {
+                    s.fetch_add(*x, Ordering::Relaxed);
                 }
-                (v, n) = ([0; 12], 0);
+                v[c] = [0; 12];
             }
-            l.set((v, n));
+            l.set(v);
         });
     }
 }
 
-/// Profile line: `pre_copy` by outcome (`PRE_STEPS`), and for batches'
-/// first commands (`PRE_STEPS_FIRST`).
+/// Profile lines: `pre_copy` by outcome per place class (`PRE_STEPS_BY`).
 fn pre_steps_line() -> String {
-    pre_steps_of(&PRE_STEPS, "") + &pre_steps_of(&PRE_STEPS_FIRST, " (first command of a batch)")
+    PRE_STEPS_BY.iter().zip(PLACE_CLASSES).map(|(t, what)| pre_steps_of(t, &format!(" ({what})"))).collect()
 }
 
 fn pre_steps_of(steps: &[AtomicU64; 12], what: &str) -> String {
@@ -4169,7 +4197,7 @@ pub fn reset_shader_profile() {
     for c in crate::mem::WRITE_WATCH_STATS.iter() {
         c.store(0, Ordering::Relaxed);
     }
-    for c in DRAW_STEPS.iter().flatten().chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(DRAW_STEPS_FIRST.iter()).chain(CS_STEPS_FIRST.iter()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()).chain(BIND_STEPS.iter()).chain(BIND_STEPS_FIRST.iter()).chain(PRE_STEPS.iter()).chain(PRE_STEPS_FIRST.iter()) {
+    for c in DRAW_STEPS.iter().flatten().chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(DRAW_STEPS_FIRST.iter()).chain(CS_STEPS_FIRST.iter()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()).chain(BIND_STEPS_BY.iter().flatten()).chain(PRE_STEPS_BY.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
     for c in CS_PHASES.iter().chain(DRAW_PHASES.iter()).chain(PLACE_PHASES.iter().flatten().flatten()) {
@@ -4843,6 +4871,16 @@ impl Exec {
         self.resident.clear();
     }
 
+    /// Commands in the batch being recorded by a command processor (not a
+    /// parallel worker's chunk); 0 when none is open.
+    pub fn serial_batch_len(&self) -> usize {
+        if self.recording && !self.deferred {
+            self.batch_shaders.len()
+        } else {
+            0
+        }
+    }
+
     /// Slot `i`'s batch is being submitted: the completion thread resets the
     /// slot once it completed (`tune offthread_reset`; `push_batch` notes
     /// the batch in `reset_state`).
@@ -5043,7 +5081,9 @@ impl Exec {
             self.cpu_action_seq = seq;
         }
         self.recording = false;
-        let n = (super::tune::slots() as usize).clamp(2, MAX_SLOTS).min(self.slot_limit);
+        // The graphics queue's batches wait for slots most (`tune slots_gfx`).
+        let want = if self.name == "gpu-gfx" { super::tune::slots_gfx() } else { super::tune::slots() };
+        let n = (want as usize).clamp(2, MAX_SLOTS).min(self.slot_limit);
         self.cur = (self.cur + 1) % n;
         self.ring_used = [0; 2];
         self.snap_used = 0;
@@ -7334,7 +7374,7 @@ impl Exec {
         bound.images.reserve(nb);
         let seg = SHADOW_BYTES;
         let fx = fixed();
-        BIND_FIRST.with(|f| f.set(self.batch_shaders.is_empty()));
+        BIND_PLACE.with(|f| f.set(place_class(self.deferred, self.batch_shaders.len())));
         let mut clk = BindClock::start();
         {
             for b in &found.tr.out.bindings {

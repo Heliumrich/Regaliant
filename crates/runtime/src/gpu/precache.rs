@@ -265,7 +265,7 @@ static SNAP: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
 
 /// Starts a profile window (`profile reset`).
 pub fn reset_window() {
-    for (s, v) in SNAP.iter().zip(STATS.iter()) {
+    for (s, v) in SNAP.iter().zip(STATS.iter()).chain(ENDS_SNAP.iter().zip(ENDS.iter())) {
         s.store(v.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 }
@@ -273,14 +273,17 @@ pub fn reset_window() {
 /// The shared copies since the last `profile reset`.
 pub fn window_line() -> String {
     let d: Vec<u64> = STATS.iter().zip(SNAP.iter()).map(|(v, s)| v.load(Ordering::Relaxed).saturating_sub(s.load(Ordering::Relaxed))).collect();
+    let e: Vec<u64> = ENDS.iter().zip(ENDS_SNAP.iter()).map(|(v, s)| v.load(Ordering::Relaxed).saturating_sub(s.load(Ordering::Relaxed))).collect();
     format!(
-        "shared: {} copies, {} reused, {} without space, {} left to a batch not submitted yet, entries dropped by eviction {}; big copies {}, dropped by writes {}, declined {}",
-        d[1], d[0], d[6], d[9], d[5], d[10], d[11], d[12]
+        "shared: {} copies, {} reused ({} checked for CPU writes in a new epoch, {} of them waited for another thread's take; entries dropped by CPU writes {}), {} without space, {} left to a batch not submitted yet, entries dropped by eviction {}; big copies {}, dropped by writes {}, declined {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND",
+        d[1], d[0], d[2], d[13], d[3], d[6], d[9], d[5], d[10], d[11], d[12], e[0], e[1], e[2]
     )
 }
 
 /// Epochs by reason: [title submission, CPU-released wait, REWIND].
 static ENDS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// ENDS at the last `profile reset` (`window_line`).
+static ENDS_SNAP: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Shared copies on (`tune pre_share`, and the guest range write-watched).
 pub fn enabled() -> bool {

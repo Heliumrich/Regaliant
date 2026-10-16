@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 109] = [
+    static ALL: [Tunable; 111] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -136,6 +136,8 @@ pub mod tune {
         Tunable { name: "offthread_reset", env: "DS_OFFTHREAD_RESET", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "label_wake", env: "DS_LABEL_WAKE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_spins", env: "DS_PAR_SPINS", default: 512, value: AtomicU64::new(UNSET) },
+        Tunable { name: "slots_gfx", env: "DS_GPU_SLOTS_GFX", default: 4, value: AtomicU64::new(UNSET) },
+        Tunable { name: "split_every", env: "DS_SPLIT_EVERY", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1162,6 +1164,23 @@ pub mod tune {
     #[inline]
     pub fn par_spins() -> u64 {
         get(108)
+    }
+
+    /// Batch slots of the graphics queue's command processor (`slots` for
+    /// the others): its batches wait for a slot when the GPU is behind. 8
+    /// against 4: +0.9% flips/s (noise level), more video memory in use
+    /// (FINDINGS.md 2026-10-16): 4.
+    #[inline]
+    pub fn slots_gfx() -> u64 {
+        get(109)
+    }
+
+    /// Diagnostics: the graphics queue's command processor ends its batch
+    /// after every N commands it records serially (0: off): the marginal
+    /// cost of a batch boundary (`cp::SPLITS`; the thread CPU window line).
+    #[inline]
+    pub fn split_every() -> u64 {
+        get(110)
     }
 
 

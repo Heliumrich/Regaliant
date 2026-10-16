@@ -592,6 +592,8 @@ pub(super) fn waited_now(a: u64) -> bool {
 /// Waits satisfied by a latched CP write whose value was gone by the time
 /// the waiter looked again (diagnostics).
 pub static LATCHED: AtomicU64 = AtomicU64::new(0);
+/// Batches the graphics queue ended for `tune split_every` (diagnostics).
+pub static SPLITS: AtomicU64 = AtomicU64::new(0);
 /// Sleeps of label waits on their label's address (diagnostics).
 pub static WAKE_SLEEPS: AtomicU64 = AtomicU64::new(0);
 
@@ -2154,6 +2156,7 @@ impl Cp {
         let mut e = self.exec.take().unwrap();
         e.dispatch(self, groups, initiator);
         self.exec = Some(e);
+        self.split_if_due();
     }
 
     /// Resets the context registers to their clear-state values: zero, except
@@ -2178,6 +2181,21 @@ impl Cp {
         }
     }
 
+    /// Diagnostics (`tune split_every`): ends the graphics queue's batch
+    /// after every N commands recorded serially.
+    fn split_if_due(&mut self) {
+        let n = super::tune::split_every();
+        if n == 0 || self.compute || self.par.is_some() {
+            return;
+        }
+        if let Some(e) = self.exec.as_mut() {
+            if e.serial_batch_len() as u64 >= n {
+                SPLITS.fetch_add(1, Ordering::Relaxed);
+                e.submit_for("split (diagnostics)");
+            }
+        }
+    }
+
     /// Executes a draw (when GPU execution is enabled).
     fn draw(&mut self, args: super::exec::DrawArgs) {
         if !super::exec::enabled() || self.exec_failed {
@@ -2197,6 +2215,7 @@ impl Cp {
         let mut e = self.exec.take().unwrap();
         self.last_draw = e.draw(self, args);
         self.exec = Some(e);
+        self.split_if_due();
     }
 
     /// An indexed indirect draw with the GPU reading its arguments (`tune
