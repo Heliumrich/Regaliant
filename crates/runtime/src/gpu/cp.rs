@@ -1006,6 +1006,10 @@ fn op_name(opcode: u32) -> String {
 /// unsubmitted writes, submitting the batch before the run, making the run,
 /// waking the workers].
 static PLAN_PHASES: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// Runs planned while the batch being recorded had writes (`tune
+/// cp_classes`): [such runs, runs whose writes the forwarded copies all
+/// cover, the written ranges, the ranges' pieces not covered].
+static PLAN_MAIN_WRITES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Lap clock of `par_plan` (`PLAN_PHASES`).
 struct PlanLaps(Option<Instant>);
@@ -1039,7 +1043,7 @@ fn class_end(k: usize, t: Option<(Instant, u64)>) {
 
 /// Clears the packet classes (`profile reset`).
 pub fn reset_classes() {
-    for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()).chain(SERIAL_WHY.iter()).chain(PLAN_PHASES.iter()) {
+    for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()).chain(SERIAL_WHY.iter()).chain(PLAN_PHASES.iter()).chain(PLAN_MAIN_WRITES.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     CP_CLASSES_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -1080,6 +1084,14 @@ pub fn classes_line() -> String {
         us(ph[9], ph[6]),
         us(ph[10], ph[6]),
         us(ph[5], ph[6])
+    ));
+    let mw: Vec<u64> = PLAN_MAIN_WRITES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    s.push_str(&format!(
+        "    runs planned with the batch's writes unsubmitted: {:.1} per flip, {:.1} of them all covered by forwarded copies ({} written ranges, {} pieces not covered)\n",
+        mw[0] as f64 / flips,
+        mw[1] as f64 / flips,
+        mw[2],
+        mw[3]
     ));
     let mut ops: Vec<(usize, u64, u64, u64)> = ACB_OPS
         .iter()
@@ -1733,6 +1745,15 @@ impl Cp {
         // What this queue's batch being recorded writes: the workers cannot
         // wait for it (`tune par_main_writes`).
         let mut main_writes = self.exec.as_ref().map(|e| e.unsubmitted_writes()).unwrap_or_default();
+        if lap.0.is_some() && !main_writes.is_empty() {
+            // (Profile: how much of them the forwarded copies cover.)
+            let ranges: Vec<(u64, u64)> = main_writes.iter().collect();
+            let left = super::forward::uncovered(&ranges);
+            PLAN_MAIN_WRITES[0].fetch_add(1, Ordering::Relaxed);
+            PLAN_MAIN_WRITES[1].fetch_add(left.as_ref().is_some_and(|v| v.is_empty()) as u64, Ordering::Relaxed);
+            PLAN_MAIN_WRITES[2].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+            PLAN_MAIN_WRITES[3].fetch_add(left.map_or(ranges.len(), |v| v.len()) as u64, Ordering::Relaxed);
+        }
         lap.mark(7);
         if super::tune::par_main_writes() == 2 && !main_writes.is_empty() {
             self.submit_gpu("parallel run");
