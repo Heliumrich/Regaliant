@@ -2917,7 +2917,9 @@ impl Cp {
                             } else {
                                 None
                             };
+                            super::exec::set_cpu_indirect(true);
                             self.dispatch(g, initiator);
+                            super::exec::set_cpu_indirect(false);
                             if let Some(c) = check {
                                 self.sync();
                                 super::emucheck::compare(c);

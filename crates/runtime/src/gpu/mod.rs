@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 108] = [
+    static ALL: [Tunable; 109] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -135,6 +135,7 @@ pub mod tune {
         Tunable { name: "cmdbuf_merge", env: "DS_CMDBUF_MERGE", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "offthread_reset", env: "DS_OFFTHREAD_RESET", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "label_wake", env: "DS_LABEL_WAKE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par_spins", env: "DS_PAR_SPINS", default: 512, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1152,6 +1153,15 @@ pub mod tune {
     #[inline]
     pub fn label_wake() -> bool {
         get(107) != 0
+    }
+
+    /// Spins (`pause`) of a parallel run's waits (a worker for its chunk's
+    /// turn, the main command processor for a chunk) before they block on
+    /// the run's condition variable (512 since 2026-10-16, 4,096 before:
+    /// -5% CPU per command with the front end on one CCD).
+    #[inline]
+    pub fn par_spins() -> u64 {
+        get(108)
     }
 
 

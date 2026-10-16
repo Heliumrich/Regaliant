@@ -146,7 +146,8 @@ impl Run {
         }
         let t = std::time::Instant::now();
         let mut spins = 0;
-        while spins < 4096 && !ready() {
+        let limit = super::tune::par_spins();
+        while spins < limit && !ready() {
             std::hint::spin_loop();
             spins += 1;
         }

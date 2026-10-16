@@ -28,17 +28,27 @@ pub(crate) use draw::{color_surface, depth_surface, set_equal_bias, toggle_skip_
 /// Dispatches of compute shaders on this list are skipped (`skipcs` control
 /// command; diagnosis).
 static SKIP_CS: parking_lot::Mutex<Option<std::collections::HashSet<u64>>> = parking_lot::Mutex::new(None);
+/// SKIP_CS holds an address (every dispatch of every recording thread took
+/// its lock to find it empty).
+static SKIP_CS_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Adds or removes a compute shader address; returns whether it is listed now.
 pub fn toggle_skip_cs(addr: u64) -> bool {
     let mut g = SKIP_CS.lock();
     let s = g.get_or_insert_with(Default::default);
-    if s.remove(&addr) {
+    let listed = if s.remove(&addr) {
         false
     } else {
         s.insert(addr);
         true
-    }
+    };
+    SKIP_CS_ANY.store(!s.is_empty(), Ordering::Release);
+    listed
+}
+
+/// Whether `cp`'s compute shader is on the skip list.
+fn skip_cs(cp: &Cp) -> bool {
+    SKIP_CS_ANY.load(Ordering::Acquire) && SKIP_CS.lock().as_ref().is_some_and(|s| s.contains(&cs_addr(cp)))
 }
 
 fn cs_addr(cp: &Cp) -> u64 {
@@ -3532,7 +3542,11 @@ fn cs_cpu_lines() -> String {
             s.push_str("    the graphics command processor's own dispatches by its time:\n");
         }
         if i == 16 + n_main {
-            s.push_str("    compute queues' indirect dispatches by command-processor time:\n");
+            s.push_str(&format!(
+                "    compute queues' indirect dispatches by command-processor time (also those whose arguments the CPU read; dispatches with no groups found after their preparation since boot: {} direct, {} indirect):\n",
+                ZERO_GROUPS[0].load(Ordering::Relaxed),
+                ZERO_GROUPS[1].load(Ordering::Relaxed)
+            ));
         }
         let n = x[0].max(1) as f64;
         let us = |k: usize| x[k] as f64 / n / 1000.0;
@@ -3654,6 +3668,22 @@ pub(super) const CS_STEP_NAMES: [&str; CS_STEP_COUNT] = [
 /// GPU), by the graphics command processor, its parallel workers or a
 /// compute queue's command processor (`Exec::cs_kind`).
 const CS_KINDS: [&str; 6] = ["graphics direct", "graphics indirect", "compute direct", "compute indirect", "graphics workers direct", "graphics workers indirect"];
+
+thread_local! {
+    /// The dispatch being executed is an indirect one whose arguments the
+    /// command processor read (`set_cpu_indirect`; profiling kinds).
+    static CPU_INDIRECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The command processor executes an indirect dispatch with the arguments it
+/// read (true) or is done with it (false).
+pub fn set_cpu_indirect(on: bool) {
+    CPU_INDIRECT.with(|c| c.set(on));
+}
+
+/// Dispatches with no groups, found after their preparation: [direct, indirect
+/// with the arguments read by the CPU].
+pub static ZERO_GROUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// The bind step (`Exec::bind_stage`) by part (DS_PROFILE_GPU; TSC cycles):
 /// per buffer binding `BIND_STEP_NAMES[..7]`, then per stage the images and
@@ -7712,7 +7742,7 @@ impl Exec {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if SKIP_CS.lock().as_ref().is_some_and(|s| s.contains(&cs_addr(cp))) {
+        if skip_cs(cp) {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -7733,6 +7763,8 @@ impl Exec {
 
     /// The profile's dispatch kind (`CS_KINDS`) of a dispatch recorded here.
     fn cs_kind(&self, indirect: bool) -> usize {
+        // Indirect dispatches whose arguments the CPU read profile as such.
+        let indirect = indirect || CPU_INDIRECT.with(|c| c.get());
         indirect as usize
             + if self.alt_id != 0 {
                 2
@@ -7766,7 +7798,7 @@ impl Exec {
         if super::homes::overlaps(args, 12) {
             return false;
         }
-        if SKIP_CS.lock().as_ref().is_some_and(|s| s.contains(&cs_addr(cp))) {
+        if skip_cs(cp) {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -7851,6 +7883,7 @@ impl Exec {
             }
         }
         if groups.contains(&0) {
+            ZERO_GROUPS[CPU_INDIRECT.with(|c| c.get()) as usize].fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         let t_prep = since(t0);
