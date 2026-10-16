@@ -5282,9 +5282,37 @@ impl Exec {
                 // An unbounded pointer's window (up to UNBOUNDED_MAX) that
                 // passes over a home: assumed not to read it (writing the
                 // home's GPU-written parts back for every such binding cost
-                // more than the home saved).
+                // more than the home saved), except within `tune
+                // unbounded_near` bytes of its base, where those parts are
+                // written back first (guest memory, which the pointer reads,
+                // is stale there).
                 if super::homes::overlaps(base, size) {
                     super::homes::UNBOUNDED_OVERLAPS.fetch_add(1, Ordering::Relaxed);
+                    let inside = super::homes::overlaps(base, 4);
+                    if inside {
+                        super::homes::UNBOUNDED_STALE[0].fetch_add(1, Ordering::Relaxed);
+                    }
+                    if super::homes::any_stale(&[(base, size.min(4096))]) {
+                        let n = super::homes::UNBOUNDED_STALE[1].fetch_add(1, Ordering::Relaxed);
+                        if n < 20 {
+                            crate::info!(
+                                "gpu[{}]: unbounded pointer {base:#x} ({}) of shader {:#x} reads guest memory where home {} holds GPU-written data not written back{}",
+                                self.name,
+                                if inside { "inside the home" } else { "before it" },
+                                super::images::BINDING_SHADER.with(|s| s.get()),
+                                super::homes::describe(base, 4096),
+                                if super::tune::unbounded_near() > 0 { " (written back first: `unbounded_near`)" } else { "" }
+                            );
+                        }
+                    }
+                    let near = super::tune::unbounded_near();
+                    if near > 0 {
+                        let w = [(base, size.min(near))];
+                        if super::homes::any_stale(&w) {
+                            super::homes::UNBOUNDED_STALE[2].fetch_add(1, Ordering::Relaxed);
+                            self.home_write_back(&w);
+                        }
+                    }
                 }
                 return None;
             }
@@ -5944,6 +5972,19 @@ impl Exec {
             return;
         }
         self.end_rendering();
+        // Writers that bound a video-memory home left their data there: it
+        // is written back before the flush the reload waits for (guest memory
+        // is what the reload reads).
+        if super::homes::any() && super::tune::image_homes() {
+            let spans = super::images::with(|im| im.overwritten_spans(keys));
+            if super::homes::any_stale(&spans) {
+                super::homes::IMAGE_STALE[1].fetch_add(1, Ordering::Relaxed);
+                self.home_write_back(&spans);
+                if self.stopped {
+                    return;
+                }
+            }
+        }
         self.flush_for("overwritten image");
         if self.stopped {
             return;
@@ -6724,7 +6765,7 @@ impl Exec {
         } else {
             super::forward::UPDATES[0].fetch_add(1, Ordering::Relaxed);
             super::forward::UPDATES[1].fetch_add(words.len() as u64, Ordering::Relaxed);
-            super::forward::add(base, words, p.addr, p.code_hash, from)
+            super::forward::add(base, words, p.addr, p.code_hash, from, "as a buffer update", &self.name)
         };
         self.forward_ids.push(id);
         EXECUTED.fetch_add(1, Ordering::Relaxed);
@@ -8436,7 +8477,14 @@ impl Exec {
                 None => super::forward::compute(&p, groups, local, busy),
             };
             if let Some((base, words, from)) = computed {
-                let id = super::forward::add(base, words, p.addr, p.code_hash, from);
+                // (Diagnostics: how this dispatch bound the destination.)
+                let how = match bound.shadows.iter().find(|s| s.guest <= base && base < s.guest + s.range) {
+                    Some(s) if s.reused => "through a resident shadow",
+                    Some(_) => "through a VRAM shadow",
+                    None if super::homes::overlaps(base, 4) => "in a home",
+                    None => "in place",
+                };
+                let id = super::forward::add(base, words, p.addr, p.code_hash, from, how, &self.name);
                 self.forward_ids.push(id);
             }
         }

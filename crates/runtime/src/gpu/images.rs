@@ -1423,6 +1423,23 @@ impl Images {
             self.report(format!("texture with XOR swizzle mode {} uploaded with an assumed pipe count (2^{})", t.sw_mode, tiling::pipes_log2()));
         }
         let size = lay.size(layers);
+        // Guest memory where a video-memory home holds newer GPU-written data
+        // (`homes`): this upload reads the older bytes (diagnostics).
+        if super::homes::any() && super::homes::any_stale(&[(t.base, size)]) {
+            let n = super::homes::IMAGE_STALE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 20 {
+                crate::warn!(
+                    "images: {} {:#x} {}x{}x{} {:?} uploaded from guest memory where home {} holds GPU-written data not written back",
+                    if first { "new image" } else { "image" },
+                    t.base,
+                    key.width,
+                    key.height,
+                    layers,
+                    t.format,
+                    super::homes::describe(t.base, size)
+                );
+            }
+        }
         // Streamed textures are partially resident: the title maps single
         // layers of texture arrays (light cookies), and within a layer the
         // mip tail and the smaller mips (at the start of the chain). Every
@@ -2234,6 +2251,12 @@ impl Images {
             out.push((img.image, k.format));
         }
         out
+    }
+
+    /// The guest bytes of the images among `keys` overwritten through a
+    /// buffer (`reload_overwritten` reads them).
+    pub fn overwritten_spans(&self, keys: &[ImageKey]) -> Vec<(u64, u64)> {
+        keys.iter().filter_map(|k| self.map.get(k).filter(|i| i.overwritten && i.span > 0).map(|i| (k.base, i.span))).collect()
     }
 
     /// Whether any of `keys` was overwritten through a buffer.

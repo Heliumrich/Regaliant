@@ -87,10 +87,13 @@ pub struct Shared {
     /// the CPU side): a thread's note that it marked a range stale holds
     /// while it stays the same.
     stale_gen: AtomicU64,
-    /// Write-watched (`create_args`): the synchronization epoch its pages
-    /// were last checked for CPU writes in (`precache::epoch`).
+    /// Write-watched (`create_args`; every home with `tune homes_watch`):
+    /// the synchronization epoch its pages were last checked for CPU writes
+    /// in (`precache::epoch`).
     watched: bool,
     checked: AtomicU64,
+    /// A home of indirect draw arguments (`create_args`).
+    args: bool,
 }
 
 struct Home {
@@ -190,6 +193,15 @@ static VOTE_GEN: AtomicU64 = AtomicU64::new(1);
 /// Whether any write-watched home exists.
 static WATCHED_ANY: AtomicBool = AtomicBool::new(false);
 pub static UNBOUNDED_OVERLAPS: AtomicU64 = AtomicU64::new(0);
+/// Of those: [based inside a home, with GPU-written parts of a home not yet
+/// in guest memory within 4 KiB of their base, written back first (`tune
+/// unbounded_near`)].
+pub static UNBOUNDED_STALE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Image uploads from guest memory (new textures, re-uploads, reloads of
+/// overwritten images) over GPU-written parts of a home not yet in guest
+/// memory: [uploads, of them reloads of overwritten images whose parts were
+/// written back first (`tune image_homes`)].
+pub static IMAGE_STALE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static ANY: AtomicBool = AtomicBool::new(false);
 static USED: AtomicU64 = AtomicU64::new(0);
 pub static CREATED: AtomicU64 = AtomicU64::new(0);
@@ -197,6 +209,9 @@ pub static DROPPED: AtomicU64 = AtomicU64::new(0);
 pub static BINDINGS: AtomicU64 = AtomicU64::new(0);
 pub static COPIED_IN: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_BACKS: AtomicU64 = AtomicU64::new(0);
+/// Bytes guest code changed in homes that are write-watched only because of
+/// `tune homes_watch` (unseen without it).
+pub static GUEST_CHANGED: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_BACK_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static PARTIAL: AtomicU64 = AtomicU64::new(0);
 /// Bumped after stale parts are added (GPU work bound a home for writing):
@@ -431,8 +446,11 @@ fn check_cpu_writes(h: &mut Home) {
     }
     let bytes: u64 = changed.iter().map(|r| r.1).sum();
     CPU_WRITTEN_PAGES.fetch_add(bytes, Ordering::Relaxed);
+    if !h.shared.args {
+        GUEST_CHANGED.fetch_add(bytes, Ordering::Relaxed);
+    }
     static LOGGED: AtomicU64 = AtomicU64::new(0);
-    if LOGGED.fetch_add(1, Ordering::Relaxed) < 20 {
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < if h.shared.args { 20 } else { 200 } {
         let lost: u64 = changed.iter().map(|&(a, n)| h.stale.intersect(a, n).iter().map(|r| r.1).sum::<u64>()).sum();
         crate::info!(
             "gpu: the CPU changed {bytes} bytes ({} runs, first {:#x}) of write-watched home {:#x}+{:#x}: copied in before its next GPU use ({lost} of them GPU-written and not written back)",
@@ -591,7 +609,7 @@ fn drop_cpu_side(b: u64, m: u64, interior: usize) {
 /// memory, which the home copies in at its first use) and no other thread
 /// records work that writes it.
 pub fn create_args(b: u64, n: u64) -> bool {
-    let made = create_with(b, n, true, "indirect draw arguments, write-watched");
+    let made = create_with(b, n, true, true, "indirect draw arguments, write-watched");
     if made {
         WATCHED_ANY.store(true, Ordering::Release);
         VOTE_GEN.fetch_add(1, Ordering::AcqRel);
@@ -606,7 +624,7 @@ pub fn any_watched() -> bool {
 
 /// Whether [base, base+size) overlaps a write-watched (argument) home.
 pub fn watched_overlaps(base: u64, size: u64) -> bool {
-    any_watched() && with_snap(|r, s| r.iter().zip(s).any(|(&(b, n), (_, sh))| sh.watched && b < base + size && base < b + n))
+    any_watched() && with_snap(|r, s| r.iter().zip(s).any(|(&(b, n), (_, sh))| sh.args && b < base + size && base < b + n))
 }
 
 /// The write-watched (argument) homes' GPU-written parts (taken), then the
@@ -617,7 +635,7 @@ pub fn take_watched() -> Vec<(u64, u64, Arc<HomeBuf>, u64)> {
     let mut g = super::lockstat::HOMES.lock(&HOMES);
     let mut v = Vec::new();
     let mut known = KNOWN.lock();
-    for h in g.iter().filter(|h| h.shared.watched) {
+    for h in g.iter().filter(|h| h.shared.args) {
         for (a, n) in h.stale.iter() {
             v.push((a, n, h.buf.clone(), a - h.base));
         }
@@ -627,7 +645,7 @@ pub fn take_watched() -> Vec<(u64, u64, Arc<HomeBuf>, u64)> {
         crate::info!("gpu: home {:#x}+{:#x} written back and dropped (tune draw_args_gpu 0)", h.base, h.size);
     }
     let before = g.len();
-    g.retain(|h| !h.shared.watched);
+    g.retain(|h| !h.shared.args);
     DROPPED.fetch_add((before - g.len()) as u64, Ordering::Relaxed);
     ANY.store(!g.is_empty(), Ordering::Relaxed);
     WATCHED_ANY.store(false, Ordering::Release);
@@ -671,12 +689,12 @@ pub fn overlaps(base: u64, size: u64) -> bool {
 /// copied in at its first use.
 pub fn create(base: u64, size: u64) -> bool {
     let (b, e) = (base & !0xFFF, (base + size).next_multiple_of(0x1000));
-    create_with(b, e - b, false, "")
+    create_with(b, e - b, super::tune::homes_watch(), false, "")
 }
 
 /// A home of exactly [b, b+n) (`watched`: checked for CPU writes, see
-/// `create_args`).
-fn create_with(b: u64, n: u64, watched: bool, what: &str) -> bool {
+/// `create_args`; `args`: of indirect draw arguments).
+fn create_with(b: u64, n: u64, watched: bool, args: bool, what: &str) -> bool {
     let e = b + n;
     if n > MAX || USED.load(Ordering::Relaxed) + n > BUDGET {
         return false;
@@ -702,7 +720,7 @@ fn create_with(b: u64, n: u64, watched: bool, what: &str) -> bool {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     // A watched home's first check takes the marks of writes made before it
     // existed: all of it is copied in at its first use anyway.
-    let shared = Arc::new(Shared { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), dirty: AtomicBool::new(true), stale_gen: AtomicU64::new(0), watched, checked: AtomicU64::new(0) });
+    let shared = Arc::new(Shared { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), dirty: AtomicBool::new(true), stale_gen: AtomicU64::new(0), watched, checked: AtomicU64::new(0), args });
     let snap = watched.then(|| {
         let mut v = vec![0u32; (n / 4) as usize];
         guest_words(b, v.len(), &mut v);
@@ -769,6 +787,11 @@ pub fn cpu_written(base: u64, size: u64) {
             // The CPU-side write is newer than what GPU work left there.
             h.stale.remove(a, e - a);
             h.shared.stale_gen.fetch_add(1, Ordering::AcqRel);
+            // A watched home's next check takes these words as they are (a
+            // write we saw, not one of the guest code's).
+            if h.shared.watched {
+                h.resnap.insert(a, e - a);
+            }
         }
     }
 }
@@ -818,7 +841,7 @@ pub fn take_all() -> Vec<(u64, u64, Arc<HomeBuf>, u64)> {
 
 pub fn status() -> String {
     format!(
-        "    video-memory homes: {} created, {} dropped, {} MiB; {} bindings, {} bytes copied in, {} write-backs ({} KiB), {} partial overlaps, {} unbounded pointer bindings over homes; write-watched: {} checks, {} bytes the CPU changed, {} written pages covered in part\n",
+        "    video-memory homes: {} created, {} dropped, {} MiB; {} bindings, {} bytes copied in, {} write-backs ({} KiB), {} partial overlaps, {} unbounded pointer bindings over homes ({} based inside one, {} with GPU-written parts not yet in guest memory within 4 KiB of their base, {} written back first), {} image uploads over GPU-written home data not in guest memory ({} reloads of overwritten images written back first); write-watched: {} checks, {} bytes the CPU changed ({} of them by guest code in homes watched for `homes_watch`), {} written pages covered in part\n",
         CREATED.load(Ordering::Relaxed),
         DROPPED.load(Ordering::Relaxed),
         USED.load(Ordering::Relaxed) >> 20,
@@ -828,8 +851,14 @@ pub fn status() -> String {
         WRITE_BACK_BYTES.load(Ordering::Relaxed) >> 10,
         PARTIAL.load(Ordering::Relaxed),
         UNBOUNDED_OVERLAPS.load(Ordering::Relaxed),
+        UNBOUNDED_STALE[0].load(Ordering::Relaxed),
+        UNBOUNDED_STALE[1].load(Ordering::Relaxed),
+        UNBOUNDED_STALE[2].load(Ordering::Relaxed),
+        IMAGE_STALE[0].load(Ordering::Relaxed),
+        IMAGE_STALE[1].load(Ordering::Relaxed),
         WATCH_CHECKS.load(Ordering::Relaxed),
         CPU_WRITTEN_PAGES.load(Ordering::Relaxed),
+        GUEST_CHANGED.load(Ordering::Relaxed),
         EDGE_PAGES.load(Ordering::Relaxed)
     )
 }

@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 115] = [
+    static ALL: [Tunable; 119] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -142,6 +142,10 @@ pub mod tune {
         Tunable { name: "par_cost", env: "DS_PAR_COST", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "submit_finish", env: "DS_SUBMIT_FINISH", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "plan_check", env: "DS_PLAN_CHECK", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "homes_watch", env: "DS_HOMES_WATCH", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "unbounded_near", env: "DS_UNBOUNDED_NEAR", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "image_homes", env: "DS_IMAGE_HOMES", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par_prewake", env: "DS_PAR_PREWAKE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1229,6 +1233,44 @@ pub mod tune {
     #[inline]
     pub fn plan_check() -> bool {
         get(114) != 0
+    }
+
+    /// Every video-memory home made from now on is write-watched like the
+    /// indirect-argument homes: once per synchronization epoch the pages the
+    /// CPU wrote are compared word by word with what the home last took in,
+    /// and the words guest code changed are copied in before its next GPU
+    /// use (logged). Without it a home sees only the CPU-side writes we make
+    /// (CP writes, file reads): guest code writing into its range is not
+    /// seen and GPU work keeps reading the home's older copy.
+    #[inline]
+    pub fn homes_watch() -> bool {
+        get(115) != 0
+    }
+
+    /// Bytes from an unbounded pointer's base (a read-only global pointer
+    /// of unknown extent, read in place) within which the GPU-written parts
+    /// of video-memory homes are written back to guest memory first (0:
+    /// none; the pointer is assumed not to read homes, as before).
+    #[inline]
+    pub fn unbounded_near() -> u64 {
+        get(116)
+    }
+
+    /// A GPU-owned image overwritten through a buffer is reloaded from guest
+    /// memory after the GPU-written parts of video-memory homes over it are
+    /// written back (0: as before, for A/B: the reload reads older bytes
+    /// where the writers bound a home).
+    #[inline]
+    pub fn image_homes() -> bool {
+        get(117) != 0
+    }
+
+    /// Microseconds the workers of a queue spin for a run when its planner
+    /// pre-wakes them, once its chunks are cut (`par::Pool::prewake`; 0: off,
+    /// the workers are woken when the run is handed over).
+    #[inline]
+    pub fn par_prewake() -> u64 {
+        get(118)
     }
 
 

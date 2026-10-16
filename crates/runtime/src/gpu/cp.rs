@@ -1681,6 +1681,12 @@ impl Cp {
         }
         let firsts: Vec<usize> = costed.unwrap_or_else(|| (0..m).map(|i| main_n + i * per).collect());
         let starts: Vec<u64> = firsts.iter().map(|&i| ends[i - 1]).collect();
+        // The workers are woken now to spin for the run (`tune
+        // par_prewake`): the chunk start states and the submission before
+        // the run take ~120-150 us more.
+        if super::tune::par_prewake() > 0 {
+            self.par_pool.prewake();
+        }
         // The state at each chunk's start.
         let mut st = self.chunk_state();
         let mut states: Vec<Box<ChunkState>> = Vec::new();

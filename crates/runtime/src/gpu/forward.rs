@@ -39,6 +39,11 @@ struct Entry {
     from: Inputs,
     /// The destination's words when the copy was recorded.
     old: Arc<[u32]>,
+    /// Diagnostics: how the dispatch bound its destination, the recording
+    /// queue, and the home write-backs so far when it was recorded.
+    how: &'static str,
+    queue: Arc<str>,
+    write_backs: u64,
 }
 
 /// A copy's inputs as read when it was recorded.
@@ -73,8 +78,9 @@ const MAX_ENTRIES: usize = 64;
 /// copy then (it did not land), copies not forwarded (inputs GPU work still
 /// writes, odd formats or sizes), entries ended because a reader found the
 /// title had rewritten the destination, words the title rewrote after the
-/// copy ran].
-pub static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// copy ran, entries not compared because their destination lies in a
+/// video-memory home].
+pub static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 /// Copies recorded as buffer updates of their computed words instead of
 /// dispatches (`tune copy_update`; `Exec::copy_as_update`): [recorded, words
@@ -447,7 +453,7 @@ pub fn compute(p: &Prepared, groups: [u32; 3], local: [u32; 3], busy: impl Fn(&[
 
 /// Starts forwarding `words` at `base` (written by the dispatch of `program`
 /// just recorded, after its own writes were noted); returns the entry's id.
-pub fn add(base: u64, words: Vec<u32>, program: u64, hash: u64, from: Inputs) -> u64 {
+pub fn add(base: u64, words: Vec<u32>, program: u64, hash: u64, from: Inputs, how: &'static str, queue: &str) -> u64 {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let n = words.len() as u64;
     let old: Arc<[u32]> = if super::cp::guest_readable(base, 4 * n) {
@@ -461,7 +467,7 @@ pub fn add(base: u64, words: Vec<u32>, program: u64, hash: u64, from: Inputs) ->
     if g.len() >= MAX_ENTRIES {
         g.remove(0);
     }
-    g.push(Entry { id, base, words: words.into(), seq: 0, program, hash, from, old });
+    g.push(Entry { id, base, words: words.into(), seq: 0, program, hash, from, old, how, queue: queue.into(), write_backs: super::homes::WRITE_BACKS.load(Ordering::Relaxed) });
     COUNT.store(g.len(), Ordering::Release);
     GEN.fetch_add(1, Ordering::AcqRel);
     STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -550,6 +556,15 @@ pub fn completed(done: u64) {
         if !super::cp::guest_readable(e.base, 4 * e.words.len() as u64) {
             continue;
         }
+        // A destination in a video-memory home: the copy wrote the home,
+        // and guest memory holds the old words until a reader on the CPU side
+        // has the home written back (`homes`): nothing to compare here (these
+        // were all the "did not land" reports of 5-2 loads, FINDINGS.md
+        // 2026-10-16).
+        if super::homes::overlaps(e.base, 4 * e.words.len() as u64) {
+            STATS[10].fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         let mut differ = 0u64;
         let mut rewritten = 0u64;
         let mut first = None;
@@ -583,7 +598,7 @@ pub fn completed(done: u64) {
                 let src_changed = src_now.iter().zip(&f.src_words).filter(|(a, b)| a != b).count();
                 let cb_now = if super::cp::guest_readable(f.cb, 8) { unsafe { [std::ptr::read_volatile(f.cb as *const u32), std::ptr::read_volatile((f.cb + 4) as *const u32)] } } else { [0, 0] };
                 crate::warn!(
-                    "gpu: forwarded copy to {:#x} (cs {:#x}, batch {}): {differ} of {} words still as before the copy after it ran, first dword {k}: forwarded {w:#x}, memory {now:#x}; source {:#x} ({} words, stride {}): {src_changed} words changed since recorded{}; control block {:#x}: count {} modulus {} when recorded, {} {} now; last CP write to the source: {}; this destination is no longer forwarded",
+                    "gpu: forwarded copy to {:#x} (cs {:#x}, batch {}): {differ} of {} words still as before the copy after it ran, first dword {k}: forwarded {w:#x}, memory {now:#x}; source {:#x} ({} words, stride {}): {src_changed} words changed since recorded{}; control block {:#x}: count {} modulus {} when recorded, {} {} now; last CP write to the source: {}; destination bound {} by {}, in a home now: {}, home write-backs since: {}; this destination is no longer forwarded",
                     e.base,
                     e.program,
                     e.seq,
@@ -597,7 +612,11 @@ pub fn completed(done: u64) {
                     f.modulus,
                     cb_now[0],
                     cb_now[1],
-                    super::cp::last_write_info(f.src).unwrap_or_else(|| "none".into())
+                    super::cp::last_write_info(f.src).unwrap_or_else(|| "none".into()),
+                    e.how,
+                    e.queue,
+                    super::homes::overlaps(e.base, 4 * e.words.len() as u64),
+                    super::homes::WRITE_BACKS.load(Ordering::Relaxed).saturating_sub(e.write_backs)
                 );
             }
             DISTRUSTED.lock().get_or_insert_with(HashSet::new).insert((e.hash, e.base));
@@ -657,7 +676,7 @@ pub fn status_line() -> String {
     let u: Vec<u64> = UPDATES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let k: Vec<u64> = CHECK_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    forwarded copies: {} made ({} not: inputs still written or odd shapes), {} ended by later writes, {} by the title's rewrites, {} retired after their batch; {} words served, {} stage reads with no wait for the copy; after the copies ran {} words equal, {} as before the copy (it did not land), {} rewritten since; recorded as buffer updates {} ({} words; {} as dispatches); by the workers {} ({} words; after their batches {} words equal, {} as before, {} rewritten; {} checks ended by later writes)\n",
-        s[0], s[7], s[1], s[8], s[2], s[3], s[4], s[5], s[6], s[9], u[0], u[1], u[2], k[0], k[1], k[2], k[3], k[4], k[5]
+        "    forwarded copies: {} made ({} not: inputs still written or odd shapes), {} ended by later writes, {} by the title's rewrites, {} retired after their batch ({} into a video-memory home, not compared); {} words served, {} stage reads with no wait for the copy; after the copies ran {} words equal, {} as before the copy (it did not land), {} rewritten since; recorded as buffer updates {} ({} words; {} as dispatches); by the workers {} ({} words; after their batches {} words equal, {} as before, {} rewritten; {} checks ended by later writes)\n",
+        s[0], s[7], s[1], s[8], s[2], s[10], s[3], s[4], s[5], s[6], s[9], u[0], u[1], u[2], k[0], k[1], k[2], k[3], k[4], k[5]
     )
 }
