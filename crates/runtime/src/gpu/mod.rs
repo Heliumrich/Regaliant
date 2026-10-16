@@ -87,7 +87,7 @@ pub mod tune {
         Tunable { name: "upload_parts", env: "DS_UPLOAD_PARTS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "upload_async", env: "DS_UPLOAD_ASYNC", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "cp_priority", env: "DS_CP_PRIORITY", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "cp_cpus", env: "DS_CP_CPUS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "cp_cpus", env: "DS_CP_CPUS", default: u64::MAX - 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "guest_cpus", env: "DS_GUEST_CPUS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy_passes", env: "DS_LAZY_PASSES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "push_partial", env: "DS_PUSH_PARTIAL", default: 1, value: AtomicU64::new(UNSET) },
@@ -708,7 +708,8 @@ pub mod tune {
     }
 
     /// Logical CPUs the GPU front end's threads may run on (`prio`; a
-    /// decimal mask, 0 = all of the process's).
+    /// decimal mask, 0 = all of the process's; default `prio::CPUS_AUTO`:
+    /// one last-level-cache group when there are several, `prio::auto_cpus`).
     #[inline]
     pub fn cp_cpus() -> u64 {
         get(60)
