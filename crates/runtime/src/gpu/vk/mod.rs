@@ -349,7 +349,11 @@ fn init_inner() -> Result<(), String> {
         if super::resident::wanted() && !sparse_buffers {
             crate::warn!("DS_RESIDENT=1 but the device or the main queue family has no sparse buffers");
         }
+        // Storage images bound one view per mip level are indexed per
+        // invocation (image_store_mip / image_load_mip).
+        let storage_dyn = instance.get_physical_device_features(pdev).shader_storage_image_array_dynamic_indexing != 0;
         let features = vk::PhysicalDeviceFeatures::default()
+            .shader_storage_image_array_dynamic_indexing(storage_dyn)
             .draw_indirect_first_instance(first_instance)
             .robust_buffer_access(true)
             .geometry_shader(true)
@@ -384,10 +388,15 @@ fn init_inner() -> Result<(), String> {
         if !nonuniform {
             crate::warn!("Vulkan: shaderSampledImageArrayNonUniformIndexing unsupported (image tables index uniformly)");
         }
+        let storage_nonuniform = f12_supported.shader_storage_image_array_non_uniform_indexing != 0;
+        if !storage_nonuniform || !storage_dyn {
+            crate::warn!("Vulkan: storage image arrays without non-uniform indexing (programs that select mip levels per lane may fail or write wrong levels)");
+        }
         let device_addresses = f12_supported.buffer_device_address != 0;
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(device_addresses)
             .shader_sampled_image_array_non_uniform_indexing(nonuniform)
+            .shader_storage_image_array_non_uniform_indexing(storage_nonuniform)
             .timeline_semaphore(true)
             .scalar_block_layout(true)
             .shader_float16(true)

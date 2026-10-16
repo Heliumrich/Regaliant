@@ -347,13 +347,22 @@ pub fn smem(tr: &mut T, ins: &Inst) -> R<()> {
         let Some(&(r, _)) = tr.plan.inst_res.get(&ins.pc) else { return Err(format!("{:#x}: s_buffer_load without resource", ins.pc)) };
         let var = tr.buffers[&r];
         let mut off = tr.u(ins.smem_offset() as u32);
+        let mut dynamic = None;
         if ins.smem_soffset() != crate::OP_NULL {
             let so = tr.operand(ins, ins.smem_soffset())?;
+            dynamic = Some(so);
             off = e(tr.b.i_add(u, None, off, so))?;
         }
         if let Some(&v) = tr.table_offsets.get(&ins.pc) {
-            // The table entry this load reads (an image table's index).
-            ok(tr.b.store(v, off, None, []))?;
+            // The table entry this load reads (an image table's index): the
+            // offset into a V#'s range, or for a T#-sized s_load the offset
+            // register alone (its table starts at the immediate offset).
+            let pointer_table = tr.plan.table_loads.get(&ins.pc).is_some_and(|d| d.len() == 2);
+            let x = match (pointer_table, dynamic) {
+                (true, Some(so)) => so,
+                _ => off,
+            };
+            ok(tr.b.store(v, x, None, []))?;
         }
         let km = tr.u(!3);
         let off = e(tr.b.bitwise_and(u, None, off, km))?;
@@ -1154,9 +1163,9 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
     let u = tr.t.u32;
     let f = tr.t.f32;
     let Some(&(ri, si)) = tr.plan.inst_res.get(&ins.pc) else { return Err(format!("{:#x}: image op without resource", ins.pc)) };
-    let (var, img_ty, rdim, class, storage, depth) = {
+    let (var, img_ty, rdim, class, storage, depth, mips) = {
         let ir = &tr.images[&ri];
-        (ir.var, ir.img_ty, ir.dim, ir.class, ir.storage, ir.depth)
+        (ir.var, ir.img_ty, ir.dim, ir.class, ir.storage, ir.depth, ir.mips)
     };
     // 16-bit addresses (A16) and data (D16): image_load / image_store only.
     let (a16, d16) = (ins.mimg_a16(), ins.mimg_d16());
@@ -1191,6 +1200,14 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
             tr.b.decorate(img, Decoration::NonUniform, []);
             img
         }
+        // A storage image bound per mip level: the first view (the T#'s
+        // base level); image_store_mip and image_load_mip select their own.
+        None if mips => {
+            let z = tr.u(0);
+            let pt = tr.b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+            let p = e(tr.b.access_chain(pt, None, var, [z]))?;
+            e(tr.b.load(img_ty, None, p, None, []))?
+        }
         None => e(tr.b.load(img_ty, None, var, None, []))?,
     };
     // Writes dmask-selected components of a vec4 result to consecutive VGPRs.
@@ -1218,7 +1235,14 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
             }
             let coord = int_coord(tr, idim, rdim, cs)?;
             let res = if storage {
-                e(tr.b.image_read(res_ty, None, image, coord, None, []))?
+                // image_load_mip reads the level its operand selects.
+                let img = if mips && name == "image_load_mip" {
+                    let lod = ad.take_int(tr, a16)?;
+                    mip_view(tr, var, img_ty, lod)?
+                } else {
+                    image
+                };
+                e(tr.b.image_read(res_ty, None, img, coord, None, []))?
             } else if matches!(rdim, ImageDim::D2Msaa | ImageDim::D2MsaaArray) {
                 let s = tr.i(0);
                 e(tr.b.image_fetch(res_ty, None, image, coord, Some(ImageOperands::SAMPLE), [Operand::IdRef(s)]))?
@@ -1272,10 +1296,19 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
                 let v = ad.take_int(tr, a16)?;
                 cs.push(tr.to_i(v)?);
             }
+            // image_store_mip writes the level its operand selects, counted
+            // from the T#'s base level; past its last level nothing is
+            // written.
+            let mut target = image;
+            let mut in_range = None;
             if name == "image_store_mip" {
                 let lod = ad.take_int(tr, a16)?;
-                let _ = lod;
-                tr.warn(format!("{:#x}: image_store_mip writes the bound mip level", ins.pc));
+                if mips {
+                    target = mip_view(tr, var, img_ty, lod)?;
+                    in_range = Some(mip_in_range(tr, ins, lod)?);
+                } else {
+                    tr.warn(format!("{:#x}: image_store_mip writes the bound mip level", ins.pc));
+                }
             }
             let coord = int_coord(tr, idim, rdim, cs)?;
             let mut comps = Vec::new();
@@ -1310,8 +1343,11 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
                 });
             }
             let texel = e(tr.b.composite_construct(res_ty, None, comps))?;
-            let act = tr.active()?;
-            tr.guarded(act, &mut |tr| ok(tr.b.image_write(image, coord, texel, None, [])))
+            let mut act = tr.active()?;
+            if let Some(k) = in_range {
+                act = e(tr.b.logical_and(tr.t.bool_, None, act, k))?;
+            }
+            tr.guarded(act, &mut |tr| ok(tr.b.image_write(target, coord, texel, None, [])))
         }
         "image_get_resinfo" => {
             // [width, height, depth or layers, levels]
@@ -1353,6 +1389,35 @@ pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
             Ok(())
         }
     }
+}
+
+/// View `lod` (clamped to the views bound) of a storage image bound as one
+/// view per mip level (`BindingKind::StorageImageMips`), per invocation.
+fn mip_view(tr: &mut T, var: Word, img_ty: Word, lod: Word) -> R<Word> {
+    let u = tr.t.u32;
+    let max = tr.u(super::MIP_VIEWS - 1);
+    let idx = tr.glsl2(u, GLOp::UMin, lod, max)?;
+    tr.b.decorate(idx, Decoration::NonUniform, []);
+    let pt = tr.b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+    let p = e(tr.b.access_chain(pt, None, var, [idx]))?;
+    tr.b.decorate(p, Decoration::NonUniform, []);
+    let img = e(tr.b.load(img_ty, None, p, None, []))?;
+    tr.b.decorate(img, Decoration::NonUniform, []);
+    Ok(img)
+}
+
+/// Whether mip `lod` (from BASE_LEVEL) of an image instruction's T# is at
+/// most its LAST_LEVEL (T# dword 3 bits 12..15 and 16..19).
+fn mip_in_range(tr: &mut T, ins: &Inst, lod: Word) -> R<Word> {
+    let u = tr.t.u32;
+    let w3 = tr.sreg(ins.mimg_srsrc() as u32 + 3)?;
+    let (k12, k16, k4) = (tr.u(12), tr.u(16), tr.u(4));
+    let base = e(tr.b.bit_field_u_extract(u, None, w3, k12, k4))?;
+    let last = e(tr.b.bit_field_u_extract(u, None, w3, k16, k4))?;
+    // Clamped first: base + lod must not wrap.
+    let l = tr.glsl2(u, GLOp::UMin, lod, k16)?;
+    let level = e(tr.b.i_add(u, None, base, l))?;
+    e(tr.b.u_less_than_equal(tr.t.bool_, None, level, last))
 }
 
 /// Index of the image table entry the T# of table load `pc` selects (per

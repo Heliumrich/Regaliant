@@ -228,6 +228,11 @@ fn note_gens() -> [u64; 4] {
 pub static FAST_CLEARS_KNOWN: AtomicU64 = AtomicU64::new(0);
 /// Block-compressed textures refreshed from GPU-written block views.
 pub static BLOCK_COPIES: AtomicU64 = AtomicU64::new(0);
+/// Of those, with the mip tail from a view of the tail block (`tune block_tails`).
+pub static BLOCK_TAIL_COPIES: AtomicU64 = AtomicU64::new(0);
+/// Storage images bound one view per mip level (image_store_mip /
+/// image_load_mip programs).
+pub static MIP_VIEW_BINDINGS: AtomicU64 = AtomicU64::new(0);
 /// Guest-memory imports: count, bytes, how many spanned several mappings,
 /// and how many were dropped because their pages were remapped.
 static IMPORTS: AtomicU64 = AtomicU64::new(0);
@@ -892,6 +897,10 @@ fn keep_pipe(map: &Mutex<Option<HashMap<u64, Pipe>>>, key: u64, pipe: Pipe) -> P
     pipe
 }
 
+/// Pipeline creation flags `compute_pipeline` adds (`--pipeline-test` with
+/// `DS_PT_NOOPT=1`: VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT).
+static EXTRA_PIPE_FLAGS: AtomicU64 = AtomicU64::new(0);
+
 /// Creates a compute pipeline (and its layouts) for a translated shader
 /// (`push_mode`: a push descriptor layout if it fits, `push_layout`; with
 /// `cache_key`, through that key's pipeline cache file).
@@ -916,7 +925,8 @@ fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: O
             let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None).map_err(|e| format!("pipeline layout: {e}"))?;
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&out.spirv), None).map_err(|e| format!("shader module: {e}"))?;
             let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
-            let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout).flags(vk::PipelineCreateFlags::DISPATCH_BASE | super::pstats::flags());
+            let extra = vk::PipelineCreateFlags::from_raw(EXTRA_PIPE_FLAGS.load(Ordering::Relaxed) as u32);
+            let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout).flags(vk::PipelineCreateFlags::DISPATCH_BASE | super::pstats::flags() | extra);
             let create = |cache| c.device.create_compute_pipelines(cache, &[ci], None).map_err(|(_, e)| format!("compute pipeline: {e}"));
             let pipeline = match cache_key {
                 Some(k) => super::pcache::with_cache('c', k, create),
@@ -932,8 +942,19 @@ fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: O
 /// frame capture, creates its Vulkan pipeline and runs one thread group with
 /// all buffers bound to zeros (images: skipped), reporting the time of each
 /// step: driver acceptance and compile cost of the translator's output (the
-/// driver may defer compilation to the first use).
+/// driver may defer compilation to the first use). Each module gets a SPIR-V
+/// generator word of its own (from the clock) so the driver's shader cache
+/// does not serve it (`DS_PT_NONCE=0`: as translated); `DS_PT_NOOPT=1`
+/// creates the pipelines with optimization disabled; `DS_PT_MIN_WORDS=<n>`
+/// tests only translations of at least n words.
 pub fn pipeline_test(capture: &str) -> i32 {
+    let env_num = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(d);
+    let nonce = env_num("DS_PT_NONCE", 1) != 0;
+    let min_words = env_num("DS_PT_MIN_WORDS", 0) as usize;
+    if env_num("DS_PT_NOOPT", 0) != 0 {
+        EXTRA_PIPE_FLAGS.store(vk::PipelineCreateFlags::DISABLE_OPTIMIZATION.as_raw() as u64, Ordering::Relaxed);
+    }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
     if let Err(e) = super::vk::init() {
         crate::error!("pipeline test: Vulkan: {e}");
         return 2;
@@ -969,6 +990,18 @@ pub fn pipeline_test(capture: &str) -> i32 {
                 crate::warn!("pipeline test: cs {:#x}: translation failed: {e}", it.addr);
                 continue;
             }
+        };
+        if out.spirv.len() < min_words {
+            continue;
+        }
+        let mut uniq;
+        let out = if nonce {
+            uniq = out.clone();
+            // SPIR-V header word 2: the generator (not interpreted).
+            uniq.spirv[2] = (stamp ^ it.addr ^ (ok as u64) << 48) as u32 | 1;
+            &uniq
+        } else {
+            out
         };
         let t0 = std::time::Instant::now();
         // Sets of its own pool (no pushed descriptors).
@@ -1033,7 +1066,12 @@ pub fn pipeline_test(capture: &str) -> i32 {
     for (total, run, addr, words) in times.iter().take(15) {
         crate::info!("pipeline test: cs {addr:#x}: {total} ms (first dispatch {run} ms; {words} SPIR-V words)");
     }
-    crate::info!("pipeline test: {ok} compute pipelines created ({create_ms} ms), {} dispatched ({run_ms} ms), {skipped} with images not dispatched, {failed} failed", ok - skipped);
+    crate::info!(
+        "pipeline test: {ok} compute pipelines created ({create_ms} ms{}{}), {} dispatched ({run_ms} ms), {skipped} with images not dispatched, {failed} failed",
+        if nonce { ", driver cache bypassed" } else { "" },
+        if EXTRA_PIPE_FLAGS.load(Ordering::Relaxed) != 0 { ", optimization disabled" } else { "" },
+        ok - skipped
+    );
     if failed > 0 { 1 } else { 0 }
 }
 
@@ -1167,14 +1205,19 @@ fn descriptor_type(k: BindingKind) -> vk::DescriptorType {
     match k {
         BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Gds | BindingKind::Debug | BindingKind::Watchdog | BindingKind::LodStats => vk::DescriptorType::STORAGE_BUFFER,
         BindingKind::Image(_) | BindingKind::ImageArray(_) => vk::DescriptorType::SAMPLED_IMAGE,
-        BindingKind::StorageImage(_) => vk::DescriptorType::STORAGE_IMAGE,
+        BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_) => vk::DescriptorType::STORAGE_IMAGE,
         BindingKind::Sampler(_) | BindingKind::CompareSampler(_) => vk::DescriptorType::SAMPLER,
     }
 }
 
-/// Descriptors in a binding (image tables are arrays).
+/// Descriptors in a binding (image tables and storage images bound per mip
+/// level are arrays).
 fn binding_count(k: BindingKind) -> u32 {
-    if matches!(k, BindingKind::ImageArray(_)) { rdna::translate::IMAGE_TABLE_LEN } else { 1 }
+    match k {
+        BindingKind::ImageArray(_) => rdna::translate::IMAGE_TABLE_LEN,
+        BindingKind::StorageImageMips(_) => rdna::translate::MIP_VIEWS,
+        _ => 1,
+    }
 }
 
 /// The descriptor writes of a command's stages (`set`: ignored when pushed).
@@ -1187,8 +1230,8 @@ fn descriptor_writes(set: vk::DescriptorSet, bounds: &[Bound]) -> Vec<vk::WriteD
         for (binding, ty, info) in &b.imgs {
             writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(*ty).image_info(std::slice::from_ref(info)));
         }
-        for (binding, infos) in &b.img_arrays {
-            writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(vk::DescriptorType::SAMPLED_IMAGE).image_info(infos));
+        for (binding, ty, infos) in &b.img_arrays {
+            writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(*ty).image_info(infos));
         }
     }
     writes
@@ -1324,9 +1367,9 @@ fn bind_descriptors(cmd: vk::CommandBuffer, at: vk::PipelineBindPoint, layout: v
                         k += 1;
                     }
                 }
-                for (binding, infos) in &b.img_arrays {
+                for (binding, ty, infos) in &b.img_arrays {
                     keep(*binding, PushedDesc::Array);
-                    buf[k].write(vk::WriteDescriptorSet::default().dst_binding(*binding).descriptor_type(vk::DescriptorType::SAMPLED_IMAGE).image_info(infos));
+                    buf[k].write(vk::WriteDescriptorSet::default().dst_binding(*binding).descriptor_type(*ty).image_info(infos));
                     k += 1;
                 }
             }
@@ -1518,8 +1561,9 @@ fn trace_loads(queue: &str, p: &Prepared, groups: [u32; 3]) {
 struct Bound {
     bufs: Vec<(u32, vk::DescriptorBufferInfo)>,
     imgs: Vec<(u32, vk::DescriptorType, vk::DescriptorImageInfo)>,
-    /// Sampled image arrays (image tables).
-    img_arrays: Vec<(u32, Vec<vk::DescriptorImageInfo>)>,
+    /// Image arrays: image tables (sampled), storage images bound per mip
+    /// level.
+    img_arrays: Vec<(u32, vk::DescriptorType, Vec<vk::DescriptorImageInfo>)>,
     /// Guest ranges the stage writes.
     writes: Vec<(u64, u64)>,
     /// Those described by buffer descriptors (not unbounded pointers).
@@ -6021,18 +6065,44 @@ impl Exec {
         let c = ctx();
         let cmd = self.cmd();
         for b in &copies {
-            let regions: Vec<vk::ImageCopy> = (0..b.levels)
-                .map(|l| {
-                    let sub = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: l, base_array_layer: 0, layer_count: b.layers };
-                    // Extent in texels of the (uncompressed) source.
-                    vk::ImageCopy { src_subresource: sub, src_offset: vk::Offset3D::default(), dst_subresource: sub, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: (b.width >> l).max(1), height: (b.height >> l).max(1), depth: 1 } }
-                })
-                .collect();
-            unsafe { c.device.cmd_copy_image(cmd, b.src, vk::ImageLayout::GENERAL, b.dst, vk::ImageLayout::GENERAL, &regions) };
+            if b.levels > 0 {
+                let regions: Vec<vk::ImageCopy> = (0..b.levels)
+                    .map(|l| {
+                        let sub = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: l, base_array_layer: 0, layer_count: b.layers };
+                        // Extent in texels of the (uncompressed) source.
+                        vk::ImageCopy { src_subresource: sub, src_offset: vk::Offset3D::default(), dst_subresource: sub, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: (b.width >> l).max(1), height: (b.height >> l).max(1), depth: 1 } }
+                    })
+                    .collect();
+                unsafe { c.device.cmd_copy_image(cmd, b.src, vk::ImageLayout::GENERAL, b.dst, vk::ImageLayout::GENERAL, &regions) };
+            }
+            // The mip tail from the view of the tail block: each tail mip
+            // from where it sits inside that block.
+            if let Some((tsrc, regs)) = &b.tail {
+                let regions: Vec<vk::ImageCopy> = regs
+                    .iter()
+                    .map(|&(mip, x, y, w, h)| {
+                        let src_sub = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
+                        let dst_sub = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: mip, base_array_layer: 0, layer_count: 1 };
+                        vk::ImageCopy { src_subresource: src_sub, src_offset: vk::Offset3D { x: x as i32, y: y as i32, z: 0 }, dst_subresource: dst_sub, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: w, height: h, depth: 1 } }
+                    })
+                    .collect();
+                unsafe { c.device.cmd_copy_image(cmd, *tsrc, vk::ImageLayout::GENERAL, b.dst, vk::ImageLayout::GENERAL, &regions) };
+                BLOCK_TAIL_COPIES.fetch_add(1, Ordering::Relaxed);
+            }
             BLOCK_COPIES.fetch_add(1, Ordering::Relaxed);
             static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
             if SEEN.lock().get_or_insert_with(HashSet::new).insert(b.key.base) {
-                crate::info!("images: {:#x} {}x{} {:?}: {} mip(s) of blocks copied in from its GPU-written {}x{} view", b.key.base, b.key.width, b.key.height, b.key.format, b.levels, b.width, b.height);
+                crate::info!(
+                    "images: {:#x} {}x{} {:?}: {} mip(s) of blocks copied in from its GPU-written {}x{} view{}",
+                    b.key.base,
+                    b.key.width,
+                    b.key.height,
+                    b.key.format,
+                    b.levels,
+                    b.width,
+                    b.height,
+                    b.tail.as_ref().map_or(String::new(), |(_, r)| format!(", mips {}..{} from its tail block's view", r.first().map_or(0, |x| x.0), r.last().map_or(0, |x| x.0)))
+                );
             }
         }
         self.barrier();
@@ -7837,7 +7907,7 @@ impl Exec {
                             break;
                         }
                     },
-                    (BindingKind::StorageImage(_) | BindingKind::ImageArray(_), _) => {
+                    (BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_) | BindingKind::ImageArray(_), _) => {
                         all = false;
                         break;
                     }
@@ -7898,9 +7968,38 @@ impl Exec {
                             };
                             infos.push(vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL });
                         }
-                        bound.img_arrays.push((b.binding, infos));
+                        bound.img_arrays.push((b.binding, vk::DescriptorType::SAMPLED_IMAGE, infos));
                     }
-                    (BindingKind::Image(_) | BindingKind::StorageImage(_) | BindingKind::ImageArray(_) | BindingKind::Sampler(_) | BindingKind::CompareSampler(_), _) => return Err("binding/resource mismatch".into()),
+                    (BindingKind::StorageImageMips(_), Some(Resolved::Image(t))) => {
+                        // One view per mip level from the T#'s base level;
+                        // those past its last level repeat the last.
+                        let n = (t.last_level.saturating_sub(t.base_level) + 1).min(rdna::translate::MIP_VIEWS);
+                        let mut infos = Vec::with_capacity(rdna::translate::MIP_VIEWS as usize);
+                        let mut image = vk::Image::null();
+                        for k in 0..n {
+                            let mut tk = *t;
+                            tk.base_level = t.base_level + k;
+                            tk.raw[3] = (tk.raw[3] & !(0xf << 12)) | (tk.base_level << 12);
+                            let (view, img) = im.view(&tk, true, frame)?;
+                            image = img;
+                            infos.push(vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL });
+                        }
+                        while infos.len() < rdna::translate::MIP_VIEWS as usize {
+                            infos.push(infos[infos.len() - 1]);
+                        }
+                        MIP_VIEW_BINDINGS.fetch_add(1, Ordering::Relaxed);
+                        // Each shader and image once: which programs write
+                        // several levels per dispatch.
+                        static SEEN: Mutex<Option<HashSet<(u64, u64)>>> = Mutex::new(None);
+                        let sh = super::images::BINDING_SHADER.with(|s| s.get());
+                        if SEEN.lock().get_or_insert_with(HashSet::new).insert((sh, t.base)) {
+                            crate::info!("images: shader {sh:#x} binds {:#x} ({}x{} format {}) one view per mip level, levels {}..{}", t.base, t.width, t.height, t.format, t.base_level, t.last_level);
+                        }
+                        bound.images.push(image);
+                        bound.stored.push(image);
+                        bound.img_arrays.push((b.binding, vk::DescriptorType::STORAGE_IMAGE, infos));
+                    }
+                    (BindingKind::Image(_) | BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_) | BindingKind::ImageArray(_) | BindingKind::Sampler(_) | BindingKind::CompareSampler(_), _) => return Err("binding/resource mismatch".into()),
                     _ => {}
                 }
             }
@@ -8649,6 +8748,14 @@ pub fn status() -> String {
             SHADOWS_SHARED[2].load(Ordering::Relaxed),
             SHADOWS_SHARED[3].load(Ordering::Relaxed),
             SHADOWS_SHARED[4].load(Ordering::Relaxed)
+        )
+        + &format!(
+            "    images: {} block-compressed refreshes from GPU-written views ({} with the mip tail from the tail block's view), {} storage bindings one view per mip level, {} draws without attachments
+",
+            BLOCK_COPIES.load(Ordering::Relaxed),
+            BLOCK_TAIL_COPIES.load(Ordering::Relaxed),
+            MIP_VIEW_BINDINGS.load(Ordering::Relaxed),
+            draw::ATTACHLESS.load(Ordering::Relaxed)
         )
         + &super::precache::status()
         + &super::lockstat::status()

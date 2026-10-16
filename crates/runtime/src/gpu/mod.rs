@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 119] = [
+    static ALL: [Tunable; 122] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -146,6 +146,9 @@ pub mod tune {
         Tunable { name: "unbounded_near", env: "DS_UNBOUNDED_NEAR", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "image_homes", env: "DS_IMAGE_HOMES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_prewake", env: "DS_PAR_PREWAKE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "attachless_draws", env: "DS_ATTACHLESS_DRAWS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "block_tails", env: "DS_BLOCK_TAILS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "mip_views", env: "DS_MIP_VIEWS", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1274,6 +1277,38 @@ pub mod tune {
     #[inline]
     pub fn par_prewake() -> u64 {
         get(118)
+    }
+
+    /// Draws with neither color nor depth attachments whose shaders write
+    /// memory (buffer or image stores) are recorded in a rendering instance
+    /// without attachments, its area limited by the draw's scissors (0:
+    /// skipped, as before 2026-10-16: one each per recording thread in every
+    /// session, `draw with only memory writes`).
+    #[inline]
+    pub fn attachless_draws() -> bool {
+        get(119) != 0
+    }
+
+    /// Block-compressed textures that GPU work transcodes: the mip tail the
+    /// title stores through a view of the tail block alone (a single-level
+    /// view one swizzle block in size at the surface's base) is copied into
+    /// the tail mips (0: only the view of the whole chain is copied, as
+    /// before 2026-10-16: the tail mips kept whatever that view held).
+    #[inline]
+    pub fn block_tails() -> bool {
+        get(120) != 0
+    }
+
+    /// Storage images whose programs select the mip level they store to or
+    /// load from (image_store_mip / image_load_mip: the title's mip-chain
+    /// generators, several levels per dispatch) are bound one view per
+    /// level (`rdna::translate::Spec::mip_views`; 0: one view of the T#'s
+    /// base level that receives every level, as before 2026-10-16: the
+    /// character creator's face, generated mips over the base level).
+    /// Switching translates programs anew.
+    #[inline]
+    pub fn mip_views() -> bool {
+        get(121) != 0
     }
 
 

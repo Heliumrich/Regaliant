@@ -51,8 +51,9 @@ pub enum Prov {
     /// Low/high half of `ptr + bias` (pointer arithmetic).
     PtrLo(Ptr, u32),
     PtrHi(Ptr, u32),
-    /// Dword `.1` of what the s_buffer_load at pc `.0` read: an entry of a
-    /// table read at a run-time offset (e.g. a T# picked per light probe).
+    /// Dword `.1` of what the s_buffer_load (or T#-sized s_load) at pc `.0`
+    /// read: an entry of a table read at a run-time offset (e.g. a T# picked
+    /// per light probe, or per material layer in a waterfall loop).
     Table(u32, u8),
 }
 
@@ -250,6 +251,7 @@ pub fn analyze(code: &[Inst], user_sgprs: u16, user_base: u16) -> Plan {
 pub fn analyze_opts(code: &[Inst], user_sgprs: u16, user_base: u16, gpu_data_loads: bool) -> Plan {
     let with_data = |mut p: Plan| {
         p.load_data = data_only_loads(&p);
+        table_extents(&mut p);
         p.number_chains();
         p
     };
@@ -267,6 +269,29 @@ pub fn analyze_opts(code: &[Inst], user_sgprs: u16, user_base: u16, gpu_data_loa
         return with_data(plan);
     }
     with_data(p2)
+}
+
+/// Image tables read by T#-sized s_loads at run-time offsets (a pointer,
+/// `table_loads` of two dwords): their length in bytes (`Resource::extent`)
+/// from the loads at constant offsets that read the same entries in order
+/// from the first (the title's shaders also unroll such a loop); left
+/// unknown without them.
+fn table_extents(plan: &mut Plan) {
+    for i in 0..plan.resources.len() {
+        let r = &plan.resources[i];
+        if !matches!(r.kind, ResKind::ImageTable) {
+            continue;
+        }
+        let Some(v) = r.table.and_then(|pc| plan.table_loads.get(&pc)) else { continue };
+        let [Prov::PtrLo(p, at), Prov::PtrHi(..)] = v.as_slice() else { continue };
+        let mut k = 0u32;
+        while k < 64 && plan.loads.iter().any(|l| l.ptr == *p && l.offset == at.wrapping_add(32 * k) && l.dwords == 8) {
+            k += 1;
+        }
+        if k > 0 {
+            plan.resources[i].extent = Some(32 * k);
+        }
+    }
 }
 
 /// Which scalar loads only produce data: no dword they read is a descriptor
@@ -581,12 +606,25 @@ fn step(st: &mut State, ins: &Inst, plan: &mut Plan, force: &HashSet<u32>) {
                         // Known base, dynamic offset (e.g. a loop over a constant
                         // table), or data read on the GPU (`analyze_opts`): the
                         // base is bound as a buffer and read at run time.
-                        let dwords = vec![Prov::PtrLo(p.clone(), bias), Prov::PtrHi(p, bias)];
+                        let dwords = vec![Prov::PtrLo(p.clone(), bias), Prov::PtrHi(p.clone(), bias)];
                         let extent = off.map(|o| o.saturating_add(4 * n));
                         let r = plan.resource(Resource { kind: ResKind::Global, dwords, written: false, read: true, formatted: false, atomic: false, table: None, extent });
                         plan.inst_res.insert(ins.pc, (r, None));
-                        for k in 0..n {
-                            st.set(d + k as u16, Prov::Unknown);
+                        if n == 8 && off.is_none() {
+                            // A T#-sized load at a run-time offset (the title's
+                            // waterfall loops over a material's textures): an
+                            // entry of a table from the base plus the immediate
+                            // offset, the offset register selecting it (32
+                            // bytes per entry; `table_extents`).
+                            let at = bias.wrapping_add(ins.smem_offset() as u32);
+                            plan.table_loads.insert(ins.pc, vec![Prov::PtrLo(p.clone(), at), Prov::PtrHi(p, at)]);
+                            for k in 0..n {
+                                st.set(d + k as u16, Prov::Table(ins.pc, k as u8));
+                            }
+                        } else {
+                            for k in 0..n {
+                                st.set(d + k as u16, Prov::Unknown);
+                            }
                         }
                     }
                     _ => {

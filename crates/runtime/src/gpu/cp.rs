@@ -430,6 +430,12 @@ pub fn guest_readable(a: u64, len: u64) -> bool {
     valid(a, len) && crate::mem::readable(a, len)
 }
 
+/// Compute shaders whose dispatches `DS_TRACE_CS` traces.
+fn trace_cs_list() -> &'static [u64] {
+    static L: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    L.get_or_init(|| std::env::var("DS_TRACE_CS").map(|v| v.split(',').filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default())
+}
+
 /// GPU timestamp (100 MHz, like the console's GPU clock counter).
 pub fn gpu_clock() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -3236,6 +3242,48 @@ impl Cp {
                                 self.sync();
                                 super::emucheck::compare(c);
                             }
+                        }
+                    }
+                }
+                // DS_TRACE_CS=<shader>[,<shader>..]: the first 8 dispatches of
+                // each of those compute shaders log their resources and what
+                // the image cache holds for each image (diagnostics).
+                if !trace_cs_list().is_empty() {
+                    let cs = ((self.reg(Space::Sh, 0x20C) as u64) | ((self.reg(Space::Sh, 0x20D) as u64 & 0xFF) << 32)) << 8;
+                    if trace_cs_list().contains(&cs) {
+                        static SEEN: parking_lot::Mutex<Vec<(u64, u32)>> = parking_lot::Mutex::new(Vec::new());
+                        let n = {
+                            let mut g = SEEN.lock();
+                            match g.iter_mut().find(|e| e.0 == cs) {
+                                Some(e) => {
+                                    e.1 += 1;
+                                    e.1
+                                }
+                                None => {
+                                    g.push((cs, 1));
+                                    1
+                                }
+                            }
+                        };
+                        if n <= 8 {
+                            let mut lines = Vec::new();
+                            if let Ok(p) = super::shaders::prepare_compute(self, true) {
+                                lines.extend(super::shaders::describe_resources(&p));
+                                for r in &p.resources {
+                                    if let super::shaders::Resolved::Image(t) = r {
+                                        lines.push(format!("image {:#x}: {}", t.base, super::images::with(|im| im.describe(t))));
+                                    }
+                                }
+                            }
+                            crate::info!(
+                                "gpu[{}]: trace cs {cs:#x} dispatch #{n} {}x{}x{} at flip {}:\n    {}",
+                                self.name,
+                                p(0),
+                                p(1),
+                                p(2),
+                                super::FRAMES.load(Ordering::Relaxed),
+                                lines.join("\n    ")
+                            );
                         }
                     }
                 }

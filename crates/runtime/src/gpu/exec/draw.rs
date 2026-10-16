@@ -333,6 +333,11 @@ fn set_layout_bindings(stages: &[(&Prepared, vk::ShaderStageFlags)]) -> Vec<vk::
 /// Creates a graphics pipeline for dynamic rendering (`push_mode`: a push
 /// descriptor layout if it fits, `push_layout`), through the pipeline cache
 /// file of `hkey`.
+/// Render area of instances without attachments (`tune attachless_draws`).
+const ATTACHLESS_AREA: u32 = 16384;
+/// Draws recorded without attachments (status).
+pub static ATTACHLESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared>, push_mode: bool) -> Result<Pipe, String> {
     let c = ctx();
     unsafe {
@@ -788,13 +793,20 @@ impl Exec {
         if colors.iter().all(Option::is_none) && !z_write && !s_write && !clear_z && !clear_s && !mem_writes {
             return Ok(false);
         }
-        if colors.iter().all(Option::is_none) && depth.is_none() {
-            // Memory side effects only: a render area is still needed.
+        let attachless = colors.iter().all(Option::is_none) && depth.is_none();
+        if attachless && !super::super::tune::attachless_draws() {
             return Err("draw with only memory writes (no attachments) not supported yet (skipped)".into());
         }
         let mut area = (u32::MAX, u32::MAX);
         for t in colors.iter().flatten().chain(depth.iter()) {
             area = (area.0.min(t.width), area.1.min(t.height));
+        }
+        if attachless {
+            // Memory side effects only: a rendering instance without
+            // attachments, shared by such draws; each draw's scissors (from
+            // its registers) limit what it rasterizes.
+            area = (ATTACHLESS_AREA, ATTACHLESS_AREA);
+            ATTACHLESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let (x0, y0, x1, y1) = scissor(cp, area);
         if x1 <= x0 || y1 <= y0 {

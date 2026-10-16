@@ -594,6 +594,8 @@ pub struct FastClear {
 /// uncompressed view of its memory (one texel per block), to be copied in.
 pub struct BlockCopy {
     pub key: ImageKey,
+    /// The view of the whole chain (null when only the tail was written):
+    /// its first `levels` mips.
     pub src: vk::Image,
     pub dst: vk::Image,
     /// Block grid of mip 0.
@@ -601,6 +603,12 @@ pub struct BlockCopy {
     pub height: u32,
     pub levels: u32,
     pub layers: u32,
+    /// The mip tail stored through a view of the tail block alone (one
+    /// swizzle block at the surface's base, a single level the size of the
+    /// block in elements: the title's transcoders write the small mips
+    /// there): the view and, per tail mip, (mip, x, y, width, height) in
+    /// blocks (where the mip sits inside the tail block).
+    pub tail: Option<(vk::Image, Vec<(u32, u32, u32, u32, u32)>)>,
     seq: u64,
 }
 
@@ -1960,6 +1968,35 @@ impl Images {
         out
     }
 
+    /// The mip tail of block-compressed texture `k` stored through a view
+    /// of the tail block (`BlockCopy::tail`), newer than its last copy: the
+    /// view, its write generation and the tail mips with whole blocks.
+    fn tail_blocks(&self, k: &ImageKey, dst: &Image, bytes: u32) -> Option<(vk::Image, u64, Vec<(u32, u32, u32, u32, u32)>)> {
+        let t = dst.layout.as_ref()?;
+        let el = elem_log2(t.format)?;
+        let lay = tiling::layout(t.sw_mode, el, k.width, k.height, k.levels, true)?;
+        let regions: Vec<(u32, u32, u32, u32, u32)> = lay
+            .mips
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.texel_w % 4 == 0 && m.texel_h % 4 == 0)
+            .filter_map(|(i, m)| m.tail.map(|(x, y)| (i as u32, x, y, m.width, m.height)))
+            .collect();
+        if regions.is_empty() {
+            return None;
+        }
+        let src = self
+            .by_base
+            .get(&k.base)
+            .into_iter()
+            .flatten()
+            .filter_map(|kk| self.map.get(kk))
+            .filter(|i| i.gpu_written && !is_compressed(i.key.format) && !i.key.ty3d && i.key.levels == 1)
+            .filter(|i| texel_bytes(i.key.format) == bytes && i.key.width == lay.block_w && i.key.height == lay.block_h && i.write_gen > dst.block_gen)
+            .max_by_key(|i| i.write_gen)?;
+        Some((src.image, src.write_gen, regions))
+    }
+
     /// The block copies `take_block_copies` would take (nothing marked).
     pub fn block_copies(&self, keys: &[ImageKey]) -> Vec<BlockCopy> {
         let mut out: Vec<BlockCopy> = Vec::new();
@@ -1982,15 +2019,34 @@ impl Images {
                 .filter(|i| i.gpu_written && !is_compressed(i.key.format) && !i.key.ty3d)
                 .filter(|i| texel_bytes(i.key.format) == bytes && i.key.width == bw && i.key.height == bh && i.write_gen > dst.block_gen)
                 .max_by_key(|i| i.write_gen);
-            let Some(src) = src else { continue };
-            let mut levels = 0;
-            while levels < src.key.levels.min(k.levels) && (k.width >> levels) % 4 == 0 && (k.height >> levels) % 4 == 0 && (k.width >> levels) > 0 && (k.height >> levels) > 0 {
-                levels += 1;
-            }
-            if levels == 0 {
+            let tail = if super::tune::block_tails() { self.tail_blocks(k, dst, bytes) } else { None };
+            if src.is_none() && tail.is_none() {
                 continue;
             }
-            out.push(BlockCopy { key: *k, src: src.image, dst: dst.image, width: bw, height: bh, levels, layers: src.key.layers.min(k.layers).max(1), seq: src.write_gen });
+            // Mips with whole blocks, before the tail when a tail view
+            // supplies the tail (the two copies must not overlap).
+            let first_tail = tail.as_ref().and_then(|(_, _, r)| r.first().map(|x| x.0)).unwrap_or(u32::MAX);
+            let mut levels = 0;
+            if let Some(src) = src {
+                while levels < src.key.levels.min(k.levels).min(first_tail) && (k.width >> levels) % 4 == 0 && (k.height >> levels) % 4 == 0 && (k.width >> levels) > 0 && (k.height >> levels) > 0 {
+                    levels += 1;
+                }
+            }
+            if levels == 0 && tail.is_none() {
+                continue;
+            }
+            let seq = src.map_or(0, |s| s.write_gen).max(tail.as_ref().map_or(0, |t| t.1));
+            out.push(BlockCopy {
+                key: *k,
+                src: if levels > 0 { src.map_or(vk::Image::null(), |s| s.image) } else { vk::Image::null() },
+                dst: dst.image,
+                width: bw,
+                height: bh,
+                levels,
+                layers: src.map_or(1, |s| s.key.layers.min(k.layers).max(1)),
+                tail: tail.map(|(img, _, r)| (img, r)),
+                seq,
+            });
         }
         out
     }

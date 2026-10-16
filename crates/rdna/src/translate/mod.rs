@@ -191,6 +191,11 @@ pub struct Spec {
     /// One variable per register (programs without relative addressing),
     /// else the register files as arrays (the earlier form, for A/B).
     pub reg_vars: bool,
+    /// Storage images whose instructions select mip levels (image_store_mip,
+    /// image_load_mip) are bound one view per level
+    /// (`BindingKind::StorageImageMips`); else as one view of the T#'s base
+    /// level that every level is written to (the earlier form, for A/B).
+    pub mip_views: bool,
     /// Hardware LOD statistics (`sceAgcDcbGetLodStats`, the title's texture
     /// streaming feedback): sampling instructions on textures whose T#
     /// enables counting record the finest mip they sample and a count in
@@ -250,6 +255,7 @@ impl std::hash::Hash for Spec {
         self.force_dispatcher.hash(state);
         self.dispatcher_for_loops.hash(state);
         self.reg_vars.hash(state);
+        self.mip_views.hash(state);
         self.lod_stats.hash(state);
         self.early_tests.hash(state);
         self.per_lane.hash(state);
@@ -263,6 +269,10 @@ impl std::hash::Hash for Spec {
 /// Entries of an image table bound as one array of sampled images
 /// (`ResKind::ImageTable`); later entries are not reachable.
 pub const IMAGE_TABLE_LEN: u32 = 64;
+
+/// Views bound for a storage image whose program selects mip levels
+/// (`BindingKind::StorageImageMips`).
+pub const MIP_VIEWS: u32 = 16;
 
 /// The LOD-statistics binding (`Spec::lod_stats`): per counter bank the
 /// finest mip sampled (dwords 0..256; 15: none) and a count of sampling
@@ -295,6 +305,11 @@ pub enum BindingKind {
     Buffer(usize),
     Image(usize),
     StorageImage(usize),
+    /// MIP_VIEWS storage images, one view per mip level from the T#'s base
+    /// level (views past its last level repeat the last): image_store_mip
+    /// and image_load_mip select one by their mip operand, the other
+    /// instructions use the first.
+    StorageImageMips(usize),
     /// IMAGE_TABLE_LEN sampled images: the entries of an image table.
     ImageArray(usize),
     /// A sampler resource's S# for its instructions without depth comparison.
@@ -351,12 +366,13 @@ impl Binding {
     /// Plan resource index of a resource binding.
     pub fn kind_resource(&self) -> Option<usize> {
         match self.kind {
-            BindingKind::Buffer(i) | BindingKind::Image(i) | BindingKind::StorageImage(i) | BindingKind::ImageArray(i) | BindingKind::Sampler(i) | BindingKind::CompareSampler(i) => Some(i),
+            BindingKind::Buffer(i) | BindingKind::Image(i) | BindingKind::StorageImage(i) | BindingKind::StorageImageMips(i) | BindingKind::ImageArray(i) | BindingKind::Sampler(i) | BindingKind::CompareSampler(i) => Some(i),
             _ => None,
         }
     }
 }
 
+#[derive(Clone)]
 pub struct Output {
     pub spirv: Vec<u32>,
     pub bindings: Vec<Binding>,
@@ -447,6 +463,8 @@ pub(crate) struct ImageRes {
     pub storage: bool,
     /// Bound as a depth/stencil view (`ResSpec::Image::depth`).
     pub depth: bool,
+    /// Bound as MIP_VIEWS views, one per mip level (`var` is their array).
+    pub mips: bool,
 }
 
 pub(crate) struct T<'a> {
@@ -1726,6 +1744,13 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         tr.decorate_binding(v, bnd);
         tr.lod_stats_var = Some(v);
     }
+    // Images whose instructions select a mip level (bound one view per level
+    // when they are storage images).
+    let mip_res: BTreeSet<usize> = code
+        .iter()
+        .filter(|i| matches!(i.name(), Some("image_store_mip" | "image_load_mip")))
+        .filter_map(|i| plan.inst_res.get(&i.pc).map(|&(ri, _)| ri))
+        .collect();
     // Resource bindings in plan order.
     for (i, r) in plan.resources.iter().enumerate() {
         match (r.kind, spec.resources.get(i)) {
@@ -1757,12 +1782,29 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
                     ImageDim::D2MsaaArray => (spirv::Dim::Dim2D, 1, 1),
                 };
                 let storage = r.written;
+                let mips = storage && spec.mip_views && mip_res.contains(&i);
                 let img_ty = tr.b.type_image(sampled_ty, sd, 0, arrayed, ms, if storage { 2 } else { 1 }, spirv::ImageFormat::Unknown, None);
-                let pt = tr.b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+                let var_ty = if mips {
+                    // Indexed by each lane's mip operand.
+                    tr.b.extension("SPV_EXT_descriptor_indexing");
+                    tr.b.capability(Capability::ShaderNonUniform);
+                    tr.b.capability(Capability::StorageImageArrayNonUniformIndexing);
+                    let n = tr.u(MIP_VIEWS);
+                    tr.b.type_array(img_ty, n)
+                } else {
+                    img_ty
+                };
+                let pt = tr.b.type_pointer(None, StorageClass::UniformConstant, var_ty);
                 let v = tr.global_var(pt, StorageClass::UniformConstant);
-                let bnd = tr.alloc_binding(if storage { BindingKind::StorageImage(i) } else { BindingKind::Image(i) });
+                let bnd = tr.alloc_binding(if mips {
+                    BindingKind::StorageImageMips(i)
+                } else if storage {
+                    BindingKind::StorageImage(i)
+                } else {
+                    BindingKind::Image(i)
+                });
                 tr.decorate_binding(v, bnd);
-                tr.images.insert(i, ImageRes { var: v, img_ty, dim, class, storage, depth });
+                tr.images.insert(i, ImageRes { var: v, img_ty, dim, class, storage, depth, mips });
             }
             (ResKind::Sampler, _) => {
                 // Bound at first use (`sampler_var`), plain or comparing.
@@ -1795,7 +1837,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
                 let v = tr.global_var(pt, StorageClass::UniformConstant);
                 let bnd = tr.alloc_binding(BindingKind::ImageArray(i));
                 tr.decorate_binding(v, bnd);
-                tr.images.insert(i, ImageRes { var: v, img_ty, dim, class, storage: false, depth: false });
+                tr.images.insert(i, ImageRes { var: v, img_ty, dim, class, storage: false, depth: false, mips: false });
                 tr.image_tables.insert(i, r.table.ok_or("image table without its load")?);
             }
             (ResKind::Image | ResKind::ImageTable, _) => return Err(format!("image resource {i} has no specialization")),
@@ -2556,6 +2598,7 @@ mod tests {
             force_dispatcher: false,
             dispatcher_for_loops: false,
             reg_vars: true,
+            mip_views: true,
             lod_stats: false,
             early_tests: false,
             per_lane: false,

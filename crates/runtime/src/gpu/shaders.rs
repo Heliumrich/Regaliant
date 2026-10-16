@@ -914,6 +914,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         force_dispatcher: super::tune::block_chain() == 0,
         dispatcher_for_loops: super::tune::block_chain() == 2,
         reg_vars: super::tune::reg_vars(),
+        mip_views: super::tune::mip_views(),
         lod_stats: super::tune::lod_stats() == 3,
         early_tests: false,
         per_lane: false,
@@ -1070,6 +1071,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         force_dispatcher: super::tune::block_chain() == 0,
         dispatcher_for_loops: super::tune::block_chain() == 2,
         reg_vars: super::tune::reg_vars(),
+        mip_views: super::tune::mip_views(),
         lod_stats: super::tune::lod_stats() == 3,
         early_tests: ctx(DB_SHADER_CONTROL) & (1 << 12) != 0,
         per_lane: false,
@@ -1214,6 +1216,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         force_dispatcher: super::tune::block_chain() == 0,
         dispatcher_for_loops: super::tune::block_chain() == 2,
         reg_vars: super::tune::reg_vars(),
+        mip_views: super::tune::mip_views(),
         lod_stats: super::tune::lod_stats() == 3,
         early_tests: false,
         per_lane: false,
@@ -1844,13 +1847,27 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
                 resources.push(Resolved::Sampler([w[0], w[1], w[2], w[3]]));
             }
             ResKind::ImageTable => {
-                // The table's V#: entries of 32 bytes (T#s) from its base.
-                let v = Vsharp::decode(&w);
-                let n = (v.extent() / 32).min(rdna::translate::IMAGE_TABLE_LEN as u64);
+                // Entries of 32 bytes (T#s) from the table's base: a V#'s
+                // range, or from a pointer (a T#-sized s_load at a run-time
+                // offset) as many as the analysis saw loaded at constant
+                // offsets, else up to the first entry that is no usable T#
+                // (at most 32: the title's waterfall loops select entries by
+                // a 32-bit mask).
+                let len = rdna::translate::IMAGE_TABLE_LEN as u64;
+                let (tbase, n, stop) = if res.dwords.len() == 2 {
+                    let b = w[0] as u64 | ((w[1] as u64) << 32);
+                    match res.extent {
+                        Some(e) => (b, (e as u64 / 32).min(len), false),
+                        None => (b, 32.min(len), true),
+                    }
+                } else {
+                    let v = Vsharp::decode(&w);
+                    (v.base, (v.extent() / 32).min(len), false)
+                };
                 let mut entries = Vec::with_capacity(n as usize);
                 let mut first: Option<(ImageDim, u16)> = None;
                 for k in 0..n {
-                    let a = v.base + 32 * k;
+                    let a = tbase + 32 * k;
                     let mut d = [0u32; 8];
                     let ok = rd.read_into(a, &mut d);
                     let t = Tsharp::decode(&d);
@@ -1859,12 +1876,15 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
                     }
                     let dim = ImageDim::from_type(t.ty, t.depth);
                     let usable = ok && t.base != 0 && super::images::vk_format(t.format).is_some() && dim.is_some() && first.is_none_or(|(fd, _)| Some(fd) == dim);
+                    if !usable && stop {
+                        break;
+                    }
                     if usable && first.is_none() {
                         first = Some((dim.unwrap(), t.format));
                     }
                     entries.push(usable.then_some(t));
                 }
-                let (dim, format) = first.ok_or_else(|| format!("{:?} shader {addr:#x}: image table {i} ({:#x}, {n} entries) has no usable T#", spec.stage, v.base))?;
+                let (dim, format) = first.ok_or_else(|| format!("{:?} shader {addr:#x}: image table {i} ({tbase:#x}, {n} entries) has no usable T#", spec.stage))?;
                 spec.resources.push(ResSpec::Image { dim, class: num_class(format), depth: false });
                 resources.push(Resolved::ImageTable(entries));
             }
