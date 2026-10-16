@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 106] = [
+    static ALL: [Tunable; 107] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -69,7 +69,7 @@ pub mod tune {
         Tunable { name: "pre_inflight", env: "DS_PRE_INFLIGHT", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "idle_split", env: "DS_IDLE_SPLIT", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "push_desc", env: "DS_PUSH_DESC", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "pre_merge", env: "DS_PRE_MERGE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_merge", env: "DS_PRE_MERGE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lean_regs", env: "DS_LEAN_REGS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "span_cache", env: "DS_SPAN_CACHE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fill_dma", env: "DS_FILL_DMA", default: 1, value: AtomicU64::new(UNSET) },
@@ -133,6 +133,7 @@ pub mod tune {
         Tunable { name: "ts_batch", env: "DS_TS_BATCH", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ww_probe", env: "DS_WW_PROBE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "cmdbuf_merge", env: "DS_CMDBUF_MERGE", default: 2, value: AtomicU64::new(UNSET) },
+        Tunable { name: "offthread_reset", env: "DS_OFFTHREAD_RESET", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -492,8 +493,8 @@ pub mod tune {
     /// A batch's prologue copies are recorded when the prologue ends, one
     /// vkCmdCopyBuffer per source and destination buffer with all their
     /// regions (0: one call per copy as it is made). ~5.6x fewer calls in
-    /// the courtyard; the rate effect was within the noise of a loaded run
-    /// (20261012-163645), so it stays off until measured on a quiet machine.
+    /// the courtyard; default since 2026-10-16: -1.2% CPU per command at the
+    /// gate (four cycles 0.974-0.995), flips/s 1.010 (FINDINGS.md).
     #[inline]
     pub fn pre_merge() -> bool {
         get(42) != 0
@@ -1130,6 +1131,15 @@ pub mod tune {
     #[inline]
     pub fn cmdbuf_merge() -> u64 {
         get(105)
+    }
+
+    /// A batch's slot (its command pools, descriptor pool and fence) is
+    /// reset by the completion thread once the batch completed, not by the
+    /// recording thread when it begins its next batch in that slot (default
+    /// 1 since 2026-10-16: -0.5% CPU per command; FINDINGS.md).
+    #[inline]
+    pub fn offthread_reset() -> bool {
+        get(106) != 0
     }
 
 

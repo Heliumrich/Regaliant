@@ -1740,6 +1740,9 @@ static GPU_TIMESTAMPS: AtomicU64 = AtomicU64::new(0);
 /// Batch begins (DS_PROFILE_GPU): [count, ns including slot waits, of them
 /// draws' resident-shadow checks of their indices: count, ns].
 static BEGIN_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Batch begins in a slot the completion thread was to reset (`tune
+/// offthread_reset`): [found reset, waited for the reset, taken back].
+static OFFTHREAD_RESETS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Batch submissions (DS_PROFILE_GPU): [count, ns in `submit_for` without
 /// its wait for deferred CP writes].
 static SUBMIT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -1783,10 +1786,11 @@ fn begin_stats_line() -> String {
     let slot_wait = WAIT_NS[2].load(Ordering::Relaxed);
     let sub: Vec<u64> = SUBMIT_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    batch begins: {} ({:.1} us each, slot waits included; {:.1} us without them); submissions {} ({:.1} us each); draws' index checks against resident shadows: {} ({:.2} us each)\n",
+        "    batch begins: {} ({:.1} us each, slot waits included; {:.1} us without them; slots reset by the completion thread {:?}: found reset, waited for, taken back); submissions {} ({:.1} us each); draws' index checks against resident shadows: {} ({:.2} us each)\n",
         s[0],
         s[1] as f64 / s[0].max(1) as f64 / 1000.0,
         s[1].saturating_sub(slot_wait) as f64 / s[0].max(1) as f64 / 1000.0,
+        OFFTHREAD_RESETS.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),
         sub[0],
         sub[1] as f64 / sub[0].max(1) as f64 / 1000.0,
         s[2],
@@ -2031,6 +2035,8 @@ struct Batch {
     ops: [u64; OPS],
     /// Its barrier segments' marks (`seg_stamps`).
     segs: Vec<SegMark>,
+    /// Its slot, reset here once it completed (`tune offthread_reset`).
+    reset: Option<SlotReset>,
 }
 
 unsafe impl Send for Batch {}
@@ -2693,7 +2699,7 @@ pub fn wait_done(seq: u64) {
 
 /// Queues a batch: `submit` runs (the vkQueueSubmit) under the queue lock so
 /// sequence order is submission order.
-fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, gpu_labels: Vec<(u64, u64, u8)>, ops: [u64; OPS], segs: Vec<SegMark>, submit: impl FnOnce(u64) + Send + 'static) -> u64 {
+fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, gpu_labels: Vec<(u64, u64, u8)>, ops: [u64; OPS], segs: Vec<SegMark>, reset: Option<SlotReset>, submit: impl FnOnce(u64) + Send + 'static) -> u64 {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         crate::thread::spawn_host("gpu-complete", 1 << 20, Box::new(completion_thread)).expect("gpu completion thread");
@@ -2701,6 +2707,9 @@ fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, ch
     });
     let mut q = BATCHES.lock();
     let seq = NEXT_SEQ.fetch_add(1, Ordering::SeqCst);
+    if let Some(r) = &reset {
+        r.state.store(seq, Ordering::Release);
+    }
     // The submission thread submits in sequence order; inline only while
     // nothing is queued for it (the order holds when the switch changes).
     let mut sq = SUBMIT_Q.lock();
@@ -2713,7 +2722,7 @@ fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, ch
         submit(seq);
         note_submitted(seq);
     }
-    q.push_back(Batch { queries, seq, fence, actions, checks, shaders, submitted: std::time::Instant::now(), name: name.to_string(), gpu_labels, ops, segs });
+    q.push_back(Batch { queries, seq, fence, actions, checks, shaders, submitted: std::time::Instant::now(), name: name.to_string(), gpu_labels, ops, segs, reset });
     BATCHES_CV.notify_one();
     seq
 }
@@ -2834,6 +2843,23 @@ fn completion_thread() {
         }
         *LAST_DONE_AT.lock() = Some(std::time::Instant::now());
         DONE_CV.notify_all();
+        // Its slot for the next batch there, unless the recording thread took
+        // the reset back (`Exec::begin_batch`).
+        if let Some(r) = b.reset.take() {
+            if !DEVICE_LOST.load(Ordering::Relaxed) && r.state.compare_exchange(b.seq, u64::MAX, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                let c = ctx();
+                unsafe {
+                    c.device.reset_fences(&[r.fence]).ok();
+                    for p in r.pools {
+                        if p != vk::CommandPool::null() {
+                            c.device.reset_command_pool(p, vk::CommandPoolResetFlags::empty()).ok();
+                        }
+                    }
+                    c.device.reset_descriptor_pool(r.desc_pool, vk::DescriptorPoolResetFlags::empty()).ok();
+                }
+                r.state.store(0, Ordering::Release);
+            }
+        }
         reap_spans();
         check_speculations(b.seq);
         check_races(b.seq);
@@ -3016,12 +3042,38 @@ struct Slot {
     /// Staging for the batch's uploads into the residency mirror
     /// (STAGE_SEG of host memory, made on first use).
     stage: Option<(vk::Buffer, *mut u8)>,
+    /// The slot's own command pools (its queue's family; the copy queue's,
+    /// null without one), so that a whole slot can be reset at once.
+    cpool: vk::CommandPool,
+    xcpool: vk::CommandPool,
+    /// The batch whose completion the completion thread resets the slot
+    /// after (`SlotReset`; 0: none or done, u64::MAX: resetting).
+    reset_state: std::sync::Arc<AtomicU64>,
+    /// The slot's last batch went to the completion thread for resetting.
+    reset_pending: bool,
+}
+
+/// What the completion thread resets once a batch completed (`tune
+/// offthread_reset`): its slot's command pools, descriptor pool and fence,
+/// then `state` goes to 0. Resetting them took ~18 us of each batch begin
+/// on the recording threads (profile, 2026-10-15 late night).
+struct SlotReset {
+    pools: [vk::CommandPool; 2],
+    desc_pool: vk::DescriptorPool,
+    fence: vk::Fence,
+    state: std::sync::Arc<AtomicU64>,
 }
 
 impl Slot {
-    fn new(pool: vk::CommandPool, xpool: vk::CommandPool) -> Result<Slot, String> {
+    fn new(family: u32, xfamily: Option<u32>) -> Result<Slot, String> {
         let c = ctx();
         let sizes: Vec<vk::DescriptorPoolSize> = POOL_TYPES.iter().zip(&POOL_LIMITS[1..]).map(|(&ty, &n)| vk::DescriptorPoolSize { ty, descriptor_count: n }).collect();
+        let make_pool = |f: u32| unsafe { c.device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(f).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).map_err(|e| e.to_string()) };
+        let pool = make_pool(family)?;
+        let xpool = match xfamily {
+            Some(f) => make_pool(f)?,
+            None => vk::CommandPool::null(),
+        };
         unsafe {
             let cmds = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(2)).map_err(|e| e.to_string())?;
             let (cmd, pre) = (cmds[0], cmds[1]);
@@ -3054,6 +3106,10 @@ impl Slot {
                 homes: Vec::new(),
                 keep: Vec::new(),
                 ts: None,
+                cpool: pool,
+                xcpool: xpool,
+                reset_state: std::sync::Arc::new(AtomicU64::new(0)),
+                reset_pending: false,
             })
         }
     }
@@ -4073,7 +4129,7 @@ pub fn reset_shader_profile() {
         g.3 = [[0; 2]; 4];
     }
     PRE_STABLE.lock().1 = [0; 5];
-    for c in &BEGIN_STATS {
+    for c in BEGIN_STATS.iter().chain(OFFTHREAD_RESETS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     *BATCH_BY.lock() = None;
@@ -4227,9 +4283,10 @@ pub fn shader_profile() -> String {
 }
 
 pub struct Exec {
-    pool: vk::CommandPool,
-    /// The copy queue's command pool (null without one).
-    xpool: vk::CommandPool,
+    /// The queue families of the slots' command pools (`Slot::new`): this
+    /// queue's, the copy queue's (none without one).
+    family: u32,
+    xfamily: Option<u32>,
     slots: Vec<Slot>,
     cur: usize,
     /// Slots that could be created (a failed creation caps them).
@@ -4488,22 +4545,12 @@ impl Exec {
         // (`vk::alt_compute_id`): its command buffers come from that family.
         let on_compute = alt_id != 0 && super::vk::alt_compute_id() == Some(alt_id) && c.compute.is_some();
         let family = if on_compute { c.compute.as_ref().map_or(c.queue_family, |q| q.family) } else { c.queue_family };
-        unsafe {
-            let pool = c
-                .device
-                .create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
-                .map_err(|e| e.to_string())?;
-            let xpool = match &c.copy {
-                Some(q) => c
-                    .device
-                    .create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(q.family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
-                    .map_err(|e| e.to_string())?,
-                None => vk::CommandPool::null(),
-            };
-            let slots = vec![Slot::new(pool, xpool)?, Slot::new(pool, xpool)?];
+        {
+            let xfamily = c.copy.as_ref().map(|q| q.family);
+            let slots = vec![Slot::new(family, xfamily)?, Slot::new(family, xfamily)?];
             Ok(Exec {
-                pool,
-                xpool,
+                family,
+                xfamily,
                 slots,
                 cur: 0,
                 slot_limit: MAX_SLOTS,
@@ -4645,7 +4692,7 @@ impl Exec {
                 match next(&free) {
                     Some(k) => self.cur = k,
                     None => {
-                        let made = if n < DEFERRED_SLOTS { Slot::new(self.pool, self.xpool).ok() } else { None };
+                        let made = if n < DEFERRED_SLOTS { Slot::new(self.family, self.xfamily).ok() } else { None };
                         match made {
                             Some(s) => {
                                 self.slots.push(s);
@@ -4679,17 +4726,53 @@ impl Exec {
             }
             wait_done(slot.seq);
             let c = ctx();
-            if done_seq() < slot.seq {
-                // Shutdown released the wait: the command buffer may still
-                // execute (resetting it would lose the device).
-                unsafe { c.device.wait_for_fences(&[slot.fence], true, 2_000_000_000).ok() };
+            // The completion thread resets the slot right after the batch
+            // completed (`tune offthread_reset`): waited for, or taken back
+            // when it cannot come (shutdown released the wait, device lost).
+            let mut reset_done = false;
+            if slot.reset_pending {
+                let mut spins = 0u32;
+                loop {
+                    let v = slot.reset_state.load(Ordering::Acquire);
+                    if v == 0 {
+                        reset_done = true;
+                        break;
+                    }
+                    if v != u64::MAX && (done_seq() < slot.seq || DEVICE_LOST.load(Ordering::Relaxed)) {
+                        if slot.reset_state.compare_exchange(v, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                            break;
+                        }
+                        continue;
+                    }
+                    spins += 1;
+                    if spins < 256 {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+                if !reset_done {
+                    OFFTHREAD_RESETS[2].fetch_add(1, Ordering::Relaxed);
+                } else if spins > 0 {
+                    OFFTHREAD_RESETS[1].fetch_add(1, Ordering::Relaxed);
+                } else {
+                    OFFTHREAD_RESETS[0].fetch_add(1, Ordering::Relaxed);
+                }
             }
-            unsafe {
-                c.device.reset_fences(&[slot.fence]).ok();
-                c.device.reset_command_buffer(slot.cmd, vk::CommandBufferResetFlags::empty()).ok();
-                c.device.reset_command_buffer(slot.pre, vk::CommandBufferResetFlags::empty()).ok();
-                c.device.reset_descriptor_pool(slot.desc_pool, vk::DescriptorPoolResetFlags::empty()).ok();
+            if !reset_done {
+                if done_seq() < slot.seq {
+                    // Shutdown released the wait: the command buffer may still
+                    // execute (resetting it would lose the device).
+                    unsafe { c.device.wait_for_fences(&[slot.fence], true, 2_000_000_000).ok() };
+                }
+                unsafe {
+                    c.device.reset_fences(&[slot.fence]).ok();
+                    c.device.reset_command_buffer(slot.cmd, vk::CommandBufferResetFlags::empty()).ok();
+                    c.device.reset_command_buffer(slot.pre, vk::CommandBufferResetFlags::empty()).ok();
+                    c.device.reset_descriptor_pool(slot.desc_pool, vk::DescriptorPoolResetFlags::empty()).ok();
+                }
             }
+            self.slots[self.cur].reset_pending = false;
             self.slots[self.cur].seq = 0;
             self.slots[self.cur].homes.clear();
             self.slots[self.cur].keep.clear();
@@ -4730,12 +4813,24 @@ impl Exec {
         self.resident.clear();
     }
 
+    /// Slot `i`'s batch is being submitted: the completion thread resets the
+    /// slot once it completed (`tune offthread_reset`; `push_batch` notes
+    /// the batch in `reset_state`).
+    fn slot_reset(&mut self, i: usize) -> Option<SlotReset> {
+        if !super::tune::offthread_reset() {
+            return None;
+        }
+        let s = &mut self.slots[i];
+        s.reset_pending = true;
+        Some(SlotReset { pools: [s.cpool, s.xcpool], desc_pool: s.desc_pool, fence: s.fence, state: s.reset_state.clone() })
+    }
+
     /// Creates the current slot when the rotation reached one not made yet
     /// (`tune slots` raised): it is used before the batch begins (homes of
     /// index buffers are kept by the slot their draw records into).
     fn ensure_slot(&mut self) {
         if self.cur == self.slots.len() {
-            match Slot::new(self.pool, self.xpool) {
+            match Slot::new(self.family, self.xfamily) {
                 Ok(slot) => self.slots.push(slot),
                 Err(e) => {
                     crate::warn!("gpu[{}]: no batch slot {} ({e}); using {}", self.name, self.cur + 1, self.cur);
@@ -4844,7 +4939,8 @@ impl Exec {
         let gpu_labels = self.pending_promises.clone();
         note_copy_waits(xpre.is_some(), copy_wait);
         let alt = self.batch_alt;
-        let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, std::mem::take(&mut self.segs), move |seq| {
+        let reset = self.slot_reset(i);
+        let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, std::mem::take(&mut self.segs), reset, move |seq| {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return;
             }
@@ -5812,7 +5908,7 @@ impl Exec {
             }
             Some(self.last_seq)
         } else if self.last_seq > done_seq() {
-            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), [0; OPS], Vec::new(), |_| {});
+            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), [0; OPS], Vec::new(), None, |_| {});
             self.last_seq = seq;
             self.last_action_seq = seq;
             self.cpu_action_seq = seq;
@@ -7123,7 +7219,8 @@ impl Exec {
             let name = self.name.clone();
             let (pre, copy_wait) = (b.pre, b.copy_wait);
             note_copy_waits(false, copy_wait);
-            let seq = push_batch(fence, queries, Vec::new(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, move |seq| {
+            let reset = self.slot_reset(b.slot);
+            let seq = push_batch(fence, queries, Vec::new(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, reset, move |seq| {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
                     return;
                 }
@@ -8206,10 +8303,21 @@ impl Drop for Exec {
         let c = ctx();
         unsafe {
             for s in &self.slots {
+                // The completion thread must not reset what is destroyed.
+                loop {
+                    let v = s.reset_state.load(Ordering::Acquire);
+                    if v == 0 || (v != u64::MAX && s.reset_state.compare_exchange(v, 0, Ordering::AcqRel, Ordering::Acquire).is_ok()) {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
                 c.device.destroy_fence(s.fence, None);
                 c.device.destroy_descriptor_pool(s.desc_pool, None);
+                c.device.destroy_command_pool(s.cpool, None);
+                if s.xcpool != vk::CommandPool::null() {
+                    c.device.destroy_command_pool(s.xcpool, None);
+                }
             }
-            c.device.destroy_command_pool(self.pool, None);
         }
     }
 }
