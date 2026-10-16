@@ -350,7 +350,7 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepare
         let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().flags(flags).bindings(&bindings), None).map_err(|e| format!("set layout: {e}"))?;
         let layouts = [set_layout];
         let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None).map_err(|e| format!("pipeline layout: {e}"))?;
-        let module = |code: &[u32]| c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None).map_err(|e| format!("shader module: {e}"));
+        let module = |code: &[u32]| c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&super::module_code(code)), None).map_err(|e| format!("shader module: {e}"));
         let mut modules = vec![(vk::ShaderStageFlags::VERTEX, module(&vs.tr.out.spirv)?)];
         if let Some(mask) = key.rect_gs {
             modules.push((vk::ShaderStageFlags::GEOMETRY, module(&rdna::translate::gs::rect_list_gs(mask))?));

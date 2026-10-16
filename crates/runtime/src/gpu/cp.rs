@@ -225,7 +225,11 @@ pub struct Cp {
     cur_ahead: std::cell::RefCell<[Option<Arc<super::ahead::Slot>>; 2]>,
     /// The scan's copies of the SH and context register files (kept to
     /// avoid allocations).
-    scan_regs: (Vec<u32>, Vec<u32>),
+    scan_regs: std::cell::RefCell<(Vec<u32>, Vec<u32>)>,
+    /// The fetched buffer's base, the packet after the dispatch about to
+    /// execute and the buffer's end (`tune compile_ahead`): scanned when
+    /// the dispatch's pipeline is missing (`prefetch_compiles`).
+    compile_ctx: std::cell::Cell<Option<(u64, u64, u64)>>,
     /// The buffer, the packet after it and the buffer's end of the label
     /// wait about to execute (`tune wait_ahead`): scanned if it blocks.
     wait_ctx: Option<(Fetched, u64, u64)>,
@@ -1261,7 +1265,8 @@ impl Cp {
             next_in_submission: false,
             ahead: std::collections::VecDeque::new(),
             cur_ahead: std::cell::RefCell::new([None, None]),
-            scan_regs: (Vec::new(), Vec::new()),
+            scan_regs: std::cell::RefCell::new((Vec::new(), Vec::new())),
+            compile_ctx: std::cell::Cell::new(None),
             wait_ctx: None,
             par: None,
             par_skip: (0, 0),
@@ -1908,17 +1913,38 @@ impl Cp {
     /// command (they prepare their own). The stages are prepared by this
     /// command processor while it waits (`wait`), not handed to workers.
     fn scan_through(&mut self, f: &Fetched, from: u64, end: u64) -> Vec<AheadCmd> {
+        let (cmds, why, ns) = self.scan_commands(f, from, end, false);
+        super::ahead::note_wait_scan(cmds.len(), why, ns);
+        cmds
+    }
+
+    /// A dispatch's pipeline is missing (its program's first use with this
+    /// state): the commands after it in its buffer are scanned as at a label
+    /// wait (`scan_commands`, through synchronization and long runs) and
+    /// their compute stages handed to the compile workers (`gpu::compile`).
+    pub fn prefetch_compiles(&self) {
+        let Some((base, from, end)) = self.compile_ctx.take() else { return };
+        // Read in place (the scan does not copy the buffer).
+        let f = Fetched { base, words: Vec::new(), live: false };
+        let (cmds, _, ns) = self.scan_commands(&f, from, end, true);
+        let slots: Vec<Arc<super::ahead::Slot>> = cmds.into_iter().filter_map(|c| c.stages.into_iter().next().flatten()).collect();
+        super::compile::submit(slots, ns);
+    }
+
+    /// The scan of `scan_through` (`whole`: also through runs the parallel
+    /// workers would record): the commands, why it ended, its nanoseconds.
+    fn scan_commands(&self, f: &Fetched, from: u64, end: u64, whole: bool) -> (Vec<AheadCmd>, usize, u64) {
         use super::ahead::{END_ARGS, END_BUFFER, END_HEADER, END_INVALID, END_MAX, END_PREDICATED};
         const WAIT_SCAN_MAX: usize = 1024;
         let t0 = Instant::now();
         // Runs this command processor would split among parallel workers.
-        let par_min = if f.words.is_empty() && !super::capture::capturing() && (if self.compute { super::tune::par_compute() > 0 } else { super::par::workers() > 0 }) {
+        let par_min = if !whole && f.words.is_empty() && !super::capture::capturing() && (if self.compute { super::tune::par_compute() > 0 } else { super::par::workers() > 0 }) {
             (if self.compute { super::tune::par_min_compute() as usize } else { super::par::min_run() }).max(48)
         } else {
             usize::MAX
         };
         let mut why = END_BUFFER;
-        let (mut sh, mut ctx) = std::mem::take(&mut self.scan_regs);
+        let (mut sh, mut ctx) = std::mem::take(&mut *self.scan_regs.borrow_mut());
         sh.clear();
         sh.extend_from_slice(&self.regs.sh);
         ctx.clear();
@@ -2081,9 +2107,8 @@ impl Cp {
         if run_len >= par_min {
             cmds.truncate(run_first);
         }
-        self.scan_regs = (sh, ctx);
-        super::ahead::note_wait_scan(cmds.len(), why, t0.elapsed().as_nanos() as u64);
-        cmds
+        *self.scan_regs.borrow_mut() = (sh, ctx);
+        (cmds, why, t0.elapsed().as_nanos() as u64)
     }
 
     /// Scans the packets from `from` to the end of the synchronization-free
@@ -2159,7 +2184,7 @@ impl Cp {
             }
         }
         let mut why = END_BUFFER;
-        let (mut sh, mut ctx) = std::mem::take(&mut self.scan_regs);
+        let (mut sh, mut ctx) = std::mem::take(&mut *self.scan_regs.borrow_mut());
         sh.clear();
         sh.extend_from_slice(&self.regs.sh);
         ctx.clear();
@@ -2304,7 +2329,7 @@ impl Cp {
             }
             cur = next;
         }
-        self.scan_regs = (sh, ctx);
+        *self.scan_regs.borrow_mut() = (sh, ctx);
         super::ahead::submit(&slots);
         super::ahead::note_scan(why, t0.elapsed().as_nanos() as u64);
     }
@@ -2963,8 +2988,14 @@ impl Cp {
             if matches!(opcode, op::WAIT_REG_MEM | op::WAIT_REG_MEM64) && !f.live && self.exec.is_some() && super::tune::wait_ahead_for(self.compute) {
                 self.wait_ctx = Some((f.clone(), next, end));
             }
+            // A dispatch whose pipeline turns out missing scans the commands
+            // after it for more first uses (`tune compile_ahead`).
+            if dispatch && !f.live && super::compile::at_first_uses() {
+                self.compile_ctx.set(Some((f.base, next, end)));
+            }
             let flow = self.packet(opcode, h, cur, n, &p);
             self.wait_ctx = None;
+            self.compile_ctx.set(None);
             class_end(class, t);
             acb_op_end(opcode, ta);
             if command {
@@ -3813,10 +3844,21 @@ impl Cp {
             pending = self.ahead.iter().flat_map(|c| c.stages.iter().flatten().cloned()).collect();
         }
         let mut next_slot = 0usize;
+        let compile_ahead = super::compile::at_waits();
         let mut work = || {
             while next_slot < pending.len() {
                 next_slot += 1;
-                if super::ahead::prepare_here(&pending[next_slot - 1]) {
+                let slot = &pending[next_slot - 1];
+                if super::ahead::prepare_here(slot) {
+                    // A compute stage whose pipeline is missing: its compile
+                    // starts now, on a compile worker (`tune compile_ahead`).
+                    if compile_ahead {
+                        if let Some(p) = super::ahead::prepared_compute(slot) {
+                            if !super::exec::compute_pipe_known(&p) {
+                                super::compile::submit_prepared(p);
+                            }
+                        }
+                    }
                     return true;
                 }
             }

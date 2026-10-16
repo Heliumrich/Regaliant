@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 122] = [
+    static ALL: [Tunable; 123] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -149,6 +149,7 @@ pub mod tune {
         Tunable { name: "attachless_draws", env: "DS_ATTACHLESS_DRAWS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "block_tails", env: "DS_BLOCK_TAILS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "mip_views", env: "DS_MIP_VIEWS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "compile_ahead", env: "DS_COMPILE_AHEAD", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1311,6 +1312,17 @@ pub mod tune {
         get(121) != 0
     }
 
+    /// Worker threads that compile the pipelines of the commands after a
+    /// first use while its command processor compiles its own
+    /// (`gpu::compile`; 4: a first session reached the courtyard after 81-89
+    /// s instead of 117-134; 0, the default: each when execution reaches it.
+    /// Off by default: its speculative preparations change how World 8-2
+    /// comes up after its load, FINDINGS.md 2026-10-16 night).
+    #[inline]
+    pub fn compile_ahead() -> u64 {
+        get(122)
+    }
+
 
     /// A switch's value by name; None if unknown.
     pub fn value(name: &str) -> Option<u64> {
@@ -1330,6 +1342,7 @@ pub mod tune {
 }
 
 pub mod ahead;
+pub mod compile;
 pub mod pacing;
 pub mod forward;
 pub mod par;

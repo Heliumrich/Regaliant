@@ -107,6 +107,9 @@ pub const SYNC_DRAW_INDICES: usize = 5;
 /// the time their creation took (ns; cache hits are quick).
 pub static PIPES_CREATED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 pub static PIPES_NS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Dispatches whose compute pipeline was missing and the nanoseconds their
+/// command processors spent creating it or waiting for it (first uses).
+pub static FIRST_USES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Of those, pipelines whose descriptors are pushed (`tune::push_desc`).
 pub static PIPES_PUSH: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Commands recorded with pushed descriptors, with a descriptor set.
@@ -186,6 +189,11 @@ fn sync_why_status() -> String {
         PIPES_PUSH[1].load(Ordering::Relaxed),
         PUSHED[0].load(Ordering::Relaxed),
         PUSHED[1].load(Ordering::Relaxed)
+    ) + &format!(
+        "    first uses on the command processors: {} compute pipelines missing at their dispatch ({} ms creating or waiting for them), graphics pipelines created there as above
+",
+        FIRST_USES[0].load(Ordering::Relaxed),
+        FIRST_USES[1].load(Ordering::Relaxed) / 1_000_000
     )
 }
 
@@ -847,14 +855,125 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     }
 }
 
+/// A compute pipeline being created (`compute_pipe`): its result once done.
+struct PipeFlight {
+    done: Mutex<Option<Result<Pipe, String>>>,
+    cv: parking_lot::Condvar,
+}
+
+/// Compute pipelines being created, by key: a thread that needs one waits
+/// for it instead of compiling it again (compiles ahead of use,
+/// `gpu::compile`, and several queues meeting a new program).
+static PIPE_FLIGHTS: Mutex<Option<HashMap<u64, std::sync::Arc<PipeFlight>>>> = Mutex::new(None);
+/// Waits for a pipeline in flight: count, nanoseconds; compiles avoided.
+static PIPE_FLIGHT_WAITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// (waits for a pipeline in flight, their nanoseconds, compiles avoided).
+pub fn inflight_stats() -> (u64, u64, u64) {
+    (PIPE_FLIGHT_WAITS[0].load(Ordering::Relaxed), PIPE_FLIGHT_WAITS[1].load(Ordering::Relaxed), PIPE_FLIGHT_WAITS[2].load(Ordering::Relaxed))
+}
+
+/// The compute pipeline of a prepared shader if it exists.
+fn cached_compute_pipe(p: &Prepared) -> Option<Pipe> {
+    let key = push_key(p.tr.key, push_fits(&[p]));
+    PIPES.lock().as_ref().and_then(|m| m.get(&key)).copied()
+}
+
+/// Whether the compute pipeline of a prepared shader exists or is being
+/// created (a miss is a first use: `Cp::prefetch_compiles`).
+pub(crate) fn compute_pipe_known(p: &Prepared) -> bool {
+    let key = push_key(p.tr.key, push_fits(&[p]));
+    PIPES.lock().as_ref().is_some_and(|m| m.contains_key(&key)) || PIPE_FLIGHTS.lock().as_ref().is_some_and(|m| m.contains_key(&key))
+}
+
+/// Creates the compute pipeline of a stage prepared ahead of its use
+/// (`gpu::compile` workers): Some(true) when it was created here,
+/// Some(false) when it existed or another thread had it in flight, None
+/// when creating it failed.
+pub fn precompile(p: &Prepared) -> Option<bool> {
+    if compute_pipe_known(p) {
+        return Some(false);
+    }
+    let created = std::cell::Cell::new(false);
+    let r = compute_pipe_with(p, &created);
+    if compile_trace() && created.get() {
+        let key = push_key(p.tr.key, push_fits(&[p]));
+        AHEAD_KEYS.lock().get_or_insert_with(HashSet::new).insert(key);
+        crate::info!("compile ahead: cs {:#x} key {:#x} created", p.addr, key);
+    }
+    r.ok().map(|_| created.get())
+}
+
+/// `DS_COMPILE_TRACE=1`: pipelines compiled ahead and first uses logged
+/// with their keys (which preparations made ahead matched execution).
+static AHEAD_KEYS: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+
+fn compile_trace() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("DS_COMPILE_TRACE").ok().as_deref() == Some("1"))
+}
+
 /// The compute pipeline of a prepared shader (created on first use, outside
-/// the map's lock; a pipeline another queue created meanwhile wins).
+/// the map's lock; a pipeline another queue created meanwhile wins; one in
+/// flight on another thread is waited for).
 fn compute_pipe(p: &Prepared) -> Result<Pipe, String> {
+    compute_pipe_with(p, &std::cell::Cell::new(false))
+}
+
+fn compute_pipe_with(p: &Prepared, created: &std::cell::Cell<bool>) -> Result<Pipe, String> {
     let push_mode = push_fits(&[p]);
     let key = push_key(p.tr.key, push_mode);
     if let Some(x) = PIPES.lock().as_ref().and_then(|m| m.get(&key)) {
         return Ok(*x);
     }
+    let (mine, flight) = {
+        let mut g = PIPE_FLIGHTS.lock();
+        let m = g.get_or_insert_with(HashMap::new);
+        match m.get(&key) {
+            Some(f) => (false, f.clone()),
+            None => {
+                let f = std::sync::Arc::new(PipeFlight { done: Mutex::new(None), cv: parking_lot::Condvar::new() });
+                m.insert(key, f.clone());
+                (true, f)
+            }
+        }
+    };
+    if !mine {
+        let t = std::time::Instant::now();
+        let r = {
+            let mut d = flight.done.lock();
+            while d.is_none() {
+                flight.cv.wait(&mut d);
+            }
+            d.clone().unwrap()
+        };
+        PIPE_FLIGHT_WAITS[0].fetch_add(1, Ordering::Relaxed);
+        PIPE_FLIGHT_WAITS[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if r.is_ok() {
+            PIPE_FLIGHT_WAITS[2].fetch_add(1, Ordering::Relaxed);
+            return r;
+        }
+        // The other attempt failed: this one reports its own error.
+        return compute_pipe_create(p, push_mode, key, created);
+    }
+    // Stored meanwhile by a thread that finished just before this one
+    // registered.
+    let stored = PIPES.lock().as_ref().and_then(|m| m.get(&key)).copied();
+    // A panic must not leave the threads waiting for it blocked.
+    let r = match stored {
+        Some(x) => Ok(x),
+        None => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compute_pipe_create(p, push_mode, key, created))).unwrap_or_else(|_| Err("pipeline creation panicked".to_string())),
+    };
+    *flight.done.lock() = Some(r.clone());
+    flight.cv.notify_all();
+    if let Some(m) = PIPE_FLIGHTS.lock().as_mut() {
+        m.remove(&key);
+    }
+    r
+}
+
+fn compute_pipe_create(p: &Prepared, push_mode: bool, key: u64, created: &std::cell::Cell<bool>) -> Result<Pipe, String> {
+    created.set(true);
     let t0 = std::time::Instant::now();
     let pipe = compute_pipeline(&p.tr.out, push_mode, Some(key))?;
     PIPES_CREATED[0].fetch_add(1, Ordering::Relaxed);
@@ -897,6 +1016,29 @@ fn keep_pipe(map: &Mutex<Option<HashMap<u64, Pipe>>>, key: u64, pipe: Pipe) -> P
     pipe
 }
 
+/// A translation's SPIR-V as handed to the driver: with `DS_SPIRV_NONCE=1`
+/// (tests of first-use compiles) the header's generator word is made unique
+/// to this session, so the driver's shader cache serves nothing it compiled
+/// in an earlier one.
+pub(super) fn module_code(spirv: &[u32]) -> std::borrow::Cow<'_, [u32]> {
+    static NONCE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let nonce = *NONCE.get_or_init(|| {
+        (std::env::var("DS_SPIRV_NONCE").ok().as_deref() == Some("1")).then(|| {
+            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
+            crate::warn!("gpu: DS_SPIRV_NONCE=1: shader modules carry a session nonce (the driver's shader cache misses)");
+            (t ^ (t >> 32)) as u32 | 1
+        })
+    });
+    match nonce {
+        Some(n) if spirv.len() > 2 => {
+            let mut v = spirv.to_vec();
+            v[2] = n;
+            std::borrow::Cow::Owned(v)
+        }
+        _ => std::borrow::Cow::Borrowed(spirv),
+    }
+}
+
 /// Pipeline creation flags `compute_pipeline` adds (`--pipeline-test` with
 /// `DS_PT_NOOPT=1`: VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT).
 static EXTRA_PIPE_FLAGS: AtomicU64 = AtomicU64::new(0);
@@ -923,7 +1065,8 @@ fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: O
             let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().flags(flags).bindings(&bindings), None).map_err(|e| format!("set layout: {e}"))?;
             let layouts = [set_layout];
             let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None).map_err(|e| format!("pipeline layout: {e}"))?;
-            let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&out.spirv), None).map_err(|e| format!("shader module: {e}"))?;
+            let code = module_code(&out.spirv);
+            let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("shader module: {e}"))?;
             let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
             let extra = vk::PipelineCreateFlags::from_raw(EXTRA_PIPE_FLAGS.load(Ordering::Relaxed) as u32);
             let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout).flags(vk::PipelineCreateFlags::DISPATCH_BASE | super::pstats::flags() | extra);
@@ -946,7 +1089,9 @@ fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: O
 /// generator word of its own (from the clock) so the driver's shader cache
 /// does not serve it (`DS_PT_NONCE=0`: as translated); `DS_PT_NOOPT=1`
 /// creates the pipelines with optimization disabled; `DS_PT_MIN_WORDS=<n>`
-/// tests only translations of at least n words.
+/// tests only translations of at least n words; `DS_PT_SPV_DIR=<dir>`
+/// replaces a translation by `<dir>/<12-digit hex address>.spv` when that
+/// exists (an optimizer's output of it: `spvval --opt`).
 pub fn pipeline_test(capture: &str) -> i32 {
     let env_num = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(d);
     let nonce = env_num("DS_PT_NONCE", 1) != 0;
@@ -994,6 +1139,17 @@ pub fn pipeline_test(capture: &str) -> i32 {
         if out.spirv.len() < min_words {
             continue;
         }
+        let external = std::env::var("DS_PT_SPV_DIR").ok().and_then(|d| std::fs::read(std::path::Path::new(&d).join(format!("{:012x}.spv", it.addr))).ok());
+        let replaced;
+        let out = match external {
+            Some(bytes) => {
+                let mut o = out.clone();
+                o.spirv = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                replaced = o;
+                &replaced
+            }
+            None => out,
+        };
         let mut uniq;
         let out = if nonce {
             uniq = out.clone();
@@ -8297,7 +8453,32 @@ impl Exec {
             }
         }
         lap.mark(3);
-        let Pipe { pipeline, layout, set_layout, push } = compute_pipe(&p)?;
+        let Pipe { pipeline, layout, set_layout, push } = match cached_compute_pipe(&p) {
+            Some(x) => {
+                if compile_trace() {
+                    let key = push_key(p.tr.key, push_fits(&[&p]));
+                    if AHEAD_KEYS.lock().get_or_insert_with(HashSet::new).remove(&key) {
+                        crate::info!("used ahead: cs {:#x} key {key:#x}", p.addr);
+                    }
+                }
+                x
+            }
+            None => {
+                // A first use: the programs of the commands after this one
+                // are compiled meanwhile (`gpu::compile`).
+                let t = std::time::Instant::now();
+                if super::compile::at_first_uses() && !compute_pipe_known(&p) {
+                    cp.prefetch_compiles();
+                }
+                let r = compute_pipe(&p);
+                if compile_trace() {
+                    crate::info!("first use: cs {:#x} key {:#x} after {} ms", p.addr, push_key(p.tr.key, push_fits(&[&p])), t.elapsed().as_millis());
+                }
+                FIRST_USES[0].fetch_add(1, Ordering::Relaxed);
+                FIRST_USES[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                r?
+            }
+        };
         let t_pipe = since(t0);
         lap.mark(4);
         self.reserve(&[&p], push);
@@ -8732,6 +8913,7 @@ pub fn status() -> String {
         + &crate::titlemem::status()
         + &super::lodstats::status()
         + &super::ahead::status()
+        + &super::compile::status()
         + &super::par::status()
         + &format!(
             "    end-of-pipe writes without a full barrier: {} labels, {} timestamps (stored by {} dispatches, {} overwritten in their batch); {} waits ordered the work after them\n",

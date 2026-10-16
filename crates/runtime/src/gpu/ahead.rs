@@ -41,6 +41,15 @@ impl Slot {
         Arc::new(Slot { regs, wave64, state: AtomicU32::new(QUEUED), result: Mutex::new(None), cv: Condvar::new() })
     }
 
+    /// The registers its preparation reads (`gpu::compile`).
+    pub fn regs(&self) -> &StageRegs {
+        &self.regs
+    }
+
+    pub fn wave64(&self) -> bool {
+        self.wave64
+    }
+
     /// Not needed any more (a worker skips it, or drops its result).
     pub fn cancel(&self) {
         if self.state.compare_exchange(QUEUED, CANCELLED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
@@ -165,6 +174,15 @@ fn worker() {
         }
         run_slot(&slot);
     }
+}
+
+/// The compute stage a finished slot prepared, if it succeeded (a copy;
+/// `gpu::compile` creates its pipeline ahead of use).
+pub fn prepared_compute(slot: &Slot) -> Option<Prepared> {
+    if slot.regs.kind != StageKind::Compute || slot.state.load(Ordering::Acquire) != DONE || slot.regs.missed.load(Ordering::Relaxed) {
+        return None;
+    }
+    slot.result.lock().as_ref().and_then(|r| r.as_ref().ok().cloned())
 }
 
 /// Prepares `slot` on this thread if nothing took it yet (a command
