@@ -2358,6 +2358,9 @@ pub static FOREIGN_WAITS: AtomicU64 = AtomicU64::new(0);
 /// Reads by parallel workers of what the main command processor's batch,
 /// unsubmitted when the run was planned, writes (`tune par_main_writes`).
 pub static MAIN_WRITE_READS: AtomicU64 = AtomicU64::new(0);
+/// Of those (`tune par_main_writes 3`): [reads that found the batch not yet
+/// submitted and waited for it, ns waited].
+pub static MAIN_SUBMIT_WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// A deferred CP copy (performed with its batch's actions) reads `src`:
 /// later GPU work binding it (it may overwrite it) is submitted after the
@@ -4553,8 +4556,10 @@ pub struct Exec {
     /// records its own work.
     deferred: bool,
     /// A worker's: what the main command processor's batch, not yet
-    /// submitted when the run was planned, writes (`tune par_main_writes`).
+    /// submitted when the run was planned, writes (`tune par_main_writes`),
+    /// and (mode 3) whether it has been submitted since.
     main_writes: Option<std::sync::Arc<super::ranges::Ranges>>,
+    main_submitted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) stopped: bool,
     /// Why (statistics), and the reason a caller gives a flush that follows.
     pub(crate) stop_why: &'static str,
@@ -4742,6 +4747,7 @@ impl Exec {
                 sync_culprit: None,
                 deferred: false,
                 main_writes: None,
+                main_submitted: None,
                 stopped: false,
                 stop_why: "",
                 flush_why: "",
@@ -5683,7 +5689,7 @@ impl Exec {
         // Writes of this batch come after the prologue; those of submitted
         // batches (this queue's too) before it (`tune pre_inflight`; 0: also
         // refused while this queue's submitted batches still run).
-        let pending = if super::tune::pre_inflight() { self.pending.overlaps_any(&r) } else { self.overlaps_pending(&r) };
+        let pending = if super::tune::pre_inflight() { self.pending.overlaps_any(&r) || self.main_pending(&r) } else { self.overlaps_pending(&r) };
         if pending || CP_WRITES.latest(&r).is_some() {
             if big {
                 note_big_refusal(base, size, if pending { "GPU work of this queue writes it" } else { "a deferred CP write" });
@@ -6468,6 +6474,27 @@ impl Exec {
                     self.stop("reads the main command processor's unsubmitted writes");
                     return Some(std::time::Instant::now());
                 }
+                // Mode 3: the main command processor submits that batch right
+                // after handing the run over; once it has, its writes are
+                // waited for like any submitted work (below).
+                if let Some(f) = self.main_submitted.clone() {
+                    if !f.load(Ordering::Acquire) {
+                        let t = std::time::Instant::now();
+                        let mut k = 0u32;
+                        while !f.load(Ordering::Acquire) {
+                            k += 1;
+                            if k < 4096 {
+                                std::hint::spin_loop();
+                            } else {
+                                std::thread::yield_now();
+                            }
+                        }
+                        MAIN_SUBMIT_WAITS[0].fetch_add(1, Ordering::Relaxed);
+                        MAIN_SUBMIT_WAITS[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    }
+                    self.main_writes = None;
+                    self.main_submitted = None;
+                }
             }
         }
         let mut waited: Option<std::time::Instant> = None;
@@ -6591,13 +6618,20 @@ impl Exec {
 
     /// `overlaps_pending` without pruning (a shared borrow).
     fn overlaps_pending_ro(&self, reads: &[(u64, u64)]) -> bool {
-        self.pending.overlaps_any(reads) || self.inflight.latest(reads, done_seq()).is_some()
+        self.pending.overlaps_any(reads) || self.inflight.latest(reads, done_seq()).is_some() || self.main_pending(reads)
     }
 
     fn overlaps_pending(&mut self, reads: &[(u64, u64)]) -> bool {
         let done = done_seq();
         self.inflight.prune(done);
-        self.pending.overlaps_any(reads) || self.inflight.latest(reads, done).is_some()
+        self.pending.overlaps_any(reads) || self.inflight.latest(reads, done).is_some() || self.main_pending(reads)
+    }
+
+    /// A worker's: whether `reads` overlap what the main command processor's
+    /// batch writes while it is not submitted yet (`tune par_main_writes 3`;
+    /// once it is, those writes are in-flight work like any other).
+    fn main_pending(&self, reads: &[(u64, u64)]) -> bool {
+        self.main_submitted.as_ref().is_some_and(|f| !f.load(Ordering::Acquire)) && self.main_writes.as_ref().is_some_and(|m| m.overlaps_any(reads))
     }
 
     /// A CP memory write that follows earlier GPU work, performed by the GPU
@@ -7386,9 +7420,11 @@ impl Exec {
     }
 
     /// A worker's chunk follows a main command processor's batch that
-    /// writes `w` and was not yet submitted when the run was planned.
-    pub fn set_main_writes(&mut self, w: Option<std::sync::Arc<super::ranges::Ranges>>) {
+    /// writes `w` and was not yet submitted when the run was planned
+    /// (`submitted`: set once it is, `tune par_main_writes 3`).
+    pub fn set_main_writes(&mut self, w: Option<std::sync::Arc<super::ranges::Ranges>>, submitted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
         self.main_writes = w;
+        self.main_submitted = submitted;
     }
 
 

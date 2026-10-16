@@ -1298,11 +1298,12 @@ impl Cp {
         Ok(())
     }
 
-    pub fn chunk_start(&mut self, main_writes: &Arc<super::ranges::Ranges>) {
+    pub fn chunk_start(&mut self, main_writes: &Arc<super::ranges::Ranges>, submitted: &Arc<std::sync::atomic::AtomicBool>) {
         if let Some(e) = self.exec.as_mut() {
             e.stopped = false;
             e.stop_why = "";
-            e.set_main_writes(Some(main_writes.clone()));
+            let pending = !main_writes.is_empty() && !submitted.load(Ordering::Acquire);
+            e.set_main_writes(Some(main_writes.clone()), pending.then(|| submitted.clone()));
         }
     }
 
@@ -1761,13 +1762,17 @@ impl Cp {
             PLAN_MAIN_WRITES[3].fetch_add(left.map_or(ranges.len(), |v| v.len()) as u64, Ordering::Relaxed);
         }
         lap.mark(7);
+        // Mode 3: the batch is submitted right after the hand-over (a
+        // worker that reads its writes waits for that submission).
+        let submit_after = super::tune::par_main_writes() == 3 && !main_writes.is_empty();
         if super::tune::par_main_writes() == 2 && !main_writes.is_empty() {
             self.submit_gpu("parallel run");
             main_writes = Default::default();
         }
         lap.mark(8);
         let queue = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
-        let mut run = super::par::Run::new(queue, Arc::new(main_writes));
+        let submitted = Arc::new(std::sync::atomic::AtomicBool::new(!submit_after));
+        let mut run = super::par::Run::new(queue, Arc::new(main_writes), submitted.clone());
         run.timed = timed;
         let run = Arc::new(run);
         lap.mark(9);
@@ -1775,6 +1780,10 @@ impl Cp {
             w.give(run.clone());
         }
         self.par_pool.wake();
+        if submit_after {
+            self.submit_gpu("parallel run");
+            submitted.store(true, Ordering::Release);
+        }
         lap.mark(10);
         super::par::RUNS.fetch_add(1, Ordering::Relaxed);
         super::par::CHUNKS.fetch_add(starts.len() as u64, Ordering::Relaxed);

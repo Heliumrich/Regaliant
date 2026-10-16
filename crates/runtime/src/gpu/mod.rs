@@ -881,7 +881,10 @@ pub mod tune {
     /// writes (they cannot see it and read the previous contents): 0
     /// counted only, 1 the chunk stops there (the main command processor
     /// records the rest), 2 (default) that batch is submitted before the
-    /// workers start (they wait for it like for any submitted work).
+    /// workers start (they wait for it like for any submitted work), 3 it is
+    /// submitted right after they were handed the run (a worker reading its
+    /// writes first waits for that submission: the workers start ~55-65 us
+    /// earlier per run).
     #[inline]
     pub fn par_main_writes() -> u64 {
         get(78)
