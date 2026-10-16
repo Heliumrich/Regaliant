@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 107] = [
+    static ALL: [Tunable; 108] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -134,6 +134,7 @@ pub mod tune {
         Tunable { name: "ww_probe", env: "DS_WW_PROBE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "cmdbuf_merge", env: "DS_CMDBUF_MERGE", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "offthread_reset", env: "DS_OFFTHREAD_RESET", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "label_wake", env: "DS_LABEL_WAKE", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1141,6 +1142,16 @@ pub mod tune {
     #[inline]
     pub fn offthread_reset() -> bool {
         get(106) != 0
+    }
+
+    /// A label wait whose label a GPU queue wrote last sleeps (`WaitOnAddress`,
+    /// at most 1 ms at a time) after its spins until a promise, a latched CP
+    /// write or a GPU-performed label write wakes it, instead of yielding and
+    /// sleeping 100 us between polls (`cp::wake_label`; default since
+    /// 2026-10-16: -4.1% CPU per command, the compute queues' CPU -17%).
+    #[inline]
+    pub fn label_wake() -> bool {
+        get(107) != 0
     }
 
 

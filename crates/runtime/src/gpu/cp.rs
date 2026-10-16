@@ -563,6 +563,24 @@ static ACTIVE_WAITS: parking_lot::Mutex<Vec<ActiveWait>> = parking_lot::Mutex::n
 /// Blocking waits in progress (cheap check before taking the lock).
 static ACTIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// A wait on a label a GPU queue writes sleeps on the label's own address
+/// (`WaitOnAddress`, `tune label_wake`) instead of polling: a promise for
+/// the label, a latched CP write or a GPU-performed write to it wakes the
+/// waits on that address (and a change of its value in memory before they
+/// sleep). The compute queues wait on the graphics queue's labels 12-23 ms
+/// at a time, ~4 times per frame each, and their polls (spins, yields,
+/// 100 us sleeps) took the front end's CPUs (FINDINGS.md 2026-10-16).
+fn wake_label(addr: u64, bytes: u8) {
+    if ACTIVE_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll(addr as *const core::ffi::c_void) };
+    if bytes >= 8 {
+        // A 32-bit wait on its upper half.
+        unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll((addr + 4) as *const core::ffi::c_void) };
+    }
+}
+
 /// Whether a queue blocks on the label-sized word at `a` now.
 pub(super) fn waited_now(a: u64) -> bool {
     if ACTIVE_COUNT.load(Ordering::Acquire) == 0 {
@@ -574,19 +592,27 @@ pub(super) fn waited_now(a: u64) -> bool {
 /// Waits satisfied by a latched CP write whose value was gone by the time
 /// the waiter looked again (diagnostics).
 pub static LATCHED: AtomicU64 = AtomicU64::new(0);
+/// Sleeps of label waits on their label's address (diagnostics).
+pub static WAKE_SLEEPS: AtomicU64 = AtomicU64::new(0);
 
 /// Latches the active waits overlapping [addr, addr+bytes) that the
 /// current memory contents satisfy (called right after a CP write).
 fn latch_waits(addr: u64, bytes: u64) {
     let g = ACTIVE_WAITS.lock();
+    let mut hits: Vec<u64> = Vec::new();
     for w in g.iter() {
         let n = if w.wide { 8 } else { 4 };
         if w.addr < addr + bytes && addr < w.addr + n {
             let v = if w.wide { unsafe { rd64(w.addr) } } else { (unsafe { rd32(w.addr) }) as u64 };
             if compare(w.func, v & w.mask, w.reference & w.mask) {
                 w.hit.store(true, Ordering::SeqCst);
+                hits.push(w.addr);
             }
         }
+    }
+    drop(g);
+    for a in hits {
+        wake_label(a, 4);
     }
 }
 
@@ -613,6 +639,7 @@ pub(super) fn gpu_label_written(queue: &str, addr: u64, value: u64, bytes: u8) {
             }
         }
     }
+    let mut woke: Vec<u64> = Vec::new();
     {
         let g = ACTIVE_WAITS.lock();
         for w in g.iter() {
@@ -633,8 +660,12 @@ pub(super) fn gpu_label_written(queue: &str, addr: u64, value: u64, bytes: u8) {
             };
             if compare(w.func, v & w.mask, w.reference & w.mask) {
                 w.hit.store(true, Ordering::SeqCst);
+                woke.push(w.addr);
             }
         }
+    }
+    for a in woke {
+        wake_label(a, 4);
     }
     label_event(queue, b'W', addr, value, 0, 0);
 }
@@ -709,6 +740,7 @@ pub(super) fn promise(seq: u64, addr: u64, value: u64, bytes: u8, by_cpu: bool) 
     m.insert(addr, (seq, value, bytes, by_cpu, Instant::now()));
     drop(g);
     PROMISE_GEN.fetch_add(1, Ordering::Release);
+    wake_label(addr, bytes);
 }
 
 /// The batch whose promised write to `addr` satisfies the comparison, and
@@ -927,7 +959,7 @@ fn wait_stats_inner() -> String {
     let Some(m) = g.as_ref() else { return String::new() };
     let mut v: Vec<(&(String, String), &(u64, u64))> = m.iter().collect();
     v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
-    let mut s = String::from("    label waits (waiter <- last writer: count, total ms, mean us):\n");
+    let mut s = format!("    label waits (waiter <- last writer: count, total ms, mean us; {} sleeps on wakes, `label_wake`):\n", WAKE_SLEEPS.load(Ordering::Relaxed));
     for ((w, by), (n, ns)) in v.iter().take(24) {
         s.push_str(&format!("      {w} <- {by}: {n}, {} ms, {} us\n", ns / 1_000_000, ns / 1000 / (*n).max(1)));
     }
@@ -3428,11 +3460,16 @@ impl Cp {
             }
             false
         };
-        let r = self.poll_until_with(
+        // A label a GPU queue wrote last: its next value comes with a
+        // promise, a latched CP write or a GPU-performed write seen
+        // (`wake_label`).
+        let gpu_label = last_write(a).is_some_and(|(q, _, _)| q.starts_with("gpu-"));
+        let r = self.poll_until_wake(
             at,
             &what,
             || hit.load(Ordering::SeqCst) || compare(func, read() & mask, reference & mask) || (use_promise && promises_moved() && promised(a, wide, func, mask, reference).is_some()),
             &mut work,
+            (gpu_label && super::tune::label_wake() && a % if wide { 8 } else { 4 } == 0).then_some((a, wide)),
         );
         {
             let by = last_write(a).map(|w| w.0).unwrap_or_else(|| "cpu".into());
@@ -3472,12 +3509,15 @@ impl Cp {
 
     /// Spins (then sleeps) until `cond`; reports long waits once.
     fn poll_until(&mut self, at: u64, what: &str, cond: impl Fn() -> bool) -> Flow {
-        self.poll_until_with(at, what, cond, &mut || false)
+        self.poll_until_wake(at, what, cond, &mut || false, None)
     }
 
     /// `poll_until`, calling `work` between the checks while it finds
     /// something to do (it returns whether it did).
-    fn poll_until_with(&mut self, at: u64, what: &str, cond: impl Fn() -> bool, work: &mut dyn FnMut() -> bool) -> Flow {
+    /// `wake` (a label's address and width): after its spins the wait sleeps
+    /// on the label's address (`wake_label`; at most 1 ms at a time) instead
+    /// of yielding and sleeping 100 us between checks.
+    fn poll_until_wake(&mut self, at: u64, what: &str, cond: impl Fn() -> bool, work: &mut dyn FnMut() -> bool, wake: Option<(u64, bool)>) -> Flow {
         let start = Instant::now();
         let mut reported = false;
         set_state(&self.name, what.to_string());
@@ -3496,6 +3536,14 @@ impl Cp {
             spins += 1;
             if spins < 200 {
                 std::hint::spin_loop();
+            } else if let Some((a, wide)) = wake {
+                // The value now: a write after this wakes the sleep too.
+                let seen: u64 = unsafe { if wide { rd64(a) } else { rd32(a) as u64 } };
+                if cond() {
+                    break;
+                }
+                WAKE_SLEEPS.fetch_add(1, Ordering::Relaxed);
+                unsafe { windows_sys::Win32::System::Threading::WaitOnAddress(a as *const core::ffi::c_void, &seen as *const u64 as *const core::ffi::c_void, if wide { 8 } else { 4 }, 1) };
             } else if spins < yields {
                 std::thread::yield_now();
             } else {
