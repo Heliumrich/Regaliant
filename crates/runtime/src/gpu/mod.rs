@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 123] = [
+    static ALL: [Tunable; 124] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -150,6 +150,7 @@ pub mod tune {
         Tunable { name: "block_tails", env: "DS_BLOCK_TAILS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "mip_views", env: "DS_MIP_VIEWS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "compile_ahead", env: "DS_COMPILE_AHEAD", default: 4, value: AtomicU64::new(UNSET) },
+        Tunable { name: "lane_guards", env: "DS_LANE_GUARDS", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1325,6 +1326,15 @@ pub mod tune {
     #[inline]
     pub fn compile_ahead() -> u64 {
         get(122)
+    }
+
+    /// Runs of lane-local vector instructions translated inside one lane
+    /// guard (`rdna::translate::Spec::lane_guards`; default 1 since
+    /// 2026-10-17: -22% SPIR-V words, -11% compile time; 0: a select per
+    /// register write). Switching translates programs anew.
+    #[inline]
+    pub fn lane_guards() -> bool {
+        get(123) != 0
     }
 
 

@@ -1243,6 +1243,10 @@ fn uout(tr: &mut T, v: &V, x: Word) -> R<()> {
             };
         }
     }
+    // Inside a lane guard the lane is active (and DPP never is).
+    if tr.lane_guard && v.dpp.is_none() {
+        return tr.set_vreg_raw(v.dst as u32, x);
+    }
     let en = write_enable(tr, v)?;
     let old = tr.vreg(v.dst as u32)?;
     let nv = e(tr.b.select(u, None, en, x, old))?;

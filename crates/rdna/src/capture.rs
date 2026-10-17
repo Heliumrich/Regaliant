@@ -121,6 +121,8 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         force_dispatcher: false,
         dispatcher_for_loops: false,
         reg_vars: true,
+        // RDNA_LANE_GUARDS=0: a select per register write (the earlier form).
+        lane_guards: std::env::var("RDNA_LANE_GUARDS").ok().as_deref() != Some("0"),
         mip_views: true,
         // RDNA_LOD_STATS=1: with the LOD-statistics instrumentation (validation).
         lod_stats: std::env::var_os("RDNA_LOD_STATS").is_some(),

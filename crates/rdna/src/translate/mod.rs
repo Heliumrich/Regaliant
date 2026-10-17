@@ -191,6 +191,12 @@ pub struct Spec {
     /// One variable per register (programs without relative addressing),
     /// else the register files as arrays (the earlier form, for A/B).
     pub reg_vars: bool,
+    /// Runs of vector instructions that only touch their own lane's
+    /// registers (`lane_local`) are translated inside one lane guard (`if`
+    /// this lane is active) with plain register writes, instead of a select
+    /// against the old value for every write (smaller programs: compile time
+    /// grows with their size).
+    pub lane_guards: bool,
     /// Storage images whose instructions select mip levels (image_store_mip,
     /// image_load_mip) are bound one view per level
     /// (`BindingKind::StorageImageMips`); else as one view of the T#'s base
@@ -255,6 +261,7 @@ impl std::hash::Hash for Spec {
         self.force_dispatcher.hash(state);
         self.dispatcher_for_loops.hash(state);
         self.reg_vars.hash(state);
+        self.lane_guards.hash(state);
         self.mip_views.hash(state);
         self.lod_stats.hash(state);
         self.early_tests.hash(state);
@@ -547,6 +554,16 @@ pub(crate) struct T<'a> {
     /// LDS accesses since the last workgroup barrier: bit 0 reads, bit 1
     /// writes (3 at block entry: unknown).
     pub lds_state: u8,
+    /// Inside a lane guard (`emit_block_body`): this lane is active, so
+    /// register writes need no select and `active` is true.
+    pub lane_guard: bool,
+    /// Inside a lane guard, for the current block only (values made in a
+    /// nested construct do not dominate the code after it): VGPR values
+    /// written or loaded there, and bitcast pairs (f32 <-> u32) made there,
+    /// reused instead of another load or a bitcast back.
+    vcache: HashMap<u32, Word>,
+    bitcasts: HashMap<Word, Word>,
+    vcache_block: Option<(usize, usize)>,
     /// SubgroupLocalInvocationId input (created on first use).
     pub sg_lane_var: Option<Word>,
     /// (vgpr, lane) slots written by v_writelane with constant lanes (SGPR
@@ -659,22 +676,59 @@ impl<'a> T<'a> {
         ok(self.b.store(p, v, None, []))
     }
     pub fn vreg(&mut self, idx: u32) -> R<Word> {
+        if self.lane_guard && self.vcache_here() {
+            if let Some(&v) = self.vcache.get(&(idx & 255)) {
+                return Ok(v);
+            }
+        }
         let p = self.vreg_ptr(idx & 255)?;
-        e(self.b.load(self.t.u32, None, p, None, []))
+        let v = e(self.b.load(self.t.u32, None, p, None, []))?;
+        if self.lane_guard {
+            self.vcache.insert(idx & 255, v);
+        }
+        Ok(v)
     }
     /// Unconditional VGPR write (initialization, lane-exact writes).
     pub fn set_vreg_raw(&mut self, idx: u32, v: Word) -> R<()> {
         let p = self.vreg_ptr(idx & 255)?;
-        ok(self.b.store(p, v, None, []))
+        ok(self.b.store(p, v, None, []))?;
+        if self.lane_guard && self.vcache_here() {
+            self.vcache.insert(idx & 255, v);
+        }
+        Ok(())
+    }
+    /// Whether the lane guard's caches hold for the block being emitted
+    /// (else they are emptied and tied to it).
+    fn vcache_here(&mut self) -> bool {
+        let here = self.b.selected_function().zip(self.b.selected_block());
+        if here.is_some() && here == self.vcache_block {
+            return true;
+        }
+        self.vcache.clear();
+        self.bitcasts.clear();
+        self.vcache_block = here;
+        false
+    }
+    /// Empties the lane guard's caches (a guard begins or ends).
+    pub fn reset_vcache(&mut self) {
+        self.vcache.clear();
+        self.bitcasts.clear();
+        self.vcache_block = None;
     }
     /// VGPR write predicated on this lane being active.
     pub fn set_vreg(&mut self, idx: u32, v: Word) -> R<()> {
+        if self.lane_guard {
+            return self.set_vreg_raw(idx, v);
+        }
         let act = self.active()?;
         let old = self.vreg(idx)?;
         let nv = e(self.b.select(self.t.u32, None, act, v, old))?;
         self.set_vreg_raw(idx, nv)
     }
     pub fn active(&mut self) -> R<Word> {
+        if self.lane_guard {
+            return Ok(self.bool_c(true));
+        }
         let here = self.b.selected_function().zip(self.b.selected_block());
         if let (Some((at, v)), Some(h)) = (self.active_cache, here) {
             if at == h {
@@ -781,10 +835,24 @@ impl<'a> T<'a> {
     }
 
     pub fn to_f(&mut self, v: Word) -> R<Word> {
-        e(self.b.bitcast(self.t.f32, None, v))
+        self.bitcast_cached(self.t.f32, v)
     }
     pub fn to_u(&mut self, v: Word) -> R<Word> {
-        e(self.b.bitcast(self.t.u32, None, v))
+        self.bitcast_cached(self.t.u32, v)
+    }
+    /// A bitcast between f32 and u32; inside a lane guard the value it was
+    /// made from when that is the other half of an earlier pair.
+    fn bitcast_cached(&mut self, ty: Word, v: Word) -> R<Word> {
+        if self.lane_guard && self.vcache_here() {
+            if let Some(&x) = self.bitcasts.get(&v) {
+                return Ok(x);
+            }
+            let x = e(self.b.bitcast(ty, None, v))?;
+            self.bitcasts.insert(v, x);
+            self.bitcasts.insert(x, v);
+            return Ok(x);
+        }
+        e(self.b.bitcast(ty, None, v))
     }
     pub fn to_i(&mut self, v: Word) -> R<Word> {
         e(self.b.bitcast(self.t.i32, None, v))
@@ -1683,6 +1751,10 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         sync_starts: Vec::new(),
         sync_steps: None,
         lds_state: 0,
+        lane_guard: false,
+        vcache: HashMap::default(),
+        bitcasts: HashMap::default(),
+        vcache_block: None,
         sg_lane_var: None,
         lane_slots: HashMap::default(),
         image_tables: HashMap::default(),
@@ -2176,17 +2248,70 @@ fn sync_starts(tr: &T, code: &[Inst]) -> Vec<u32> {
 
 /// Translates block [start, end) and stores the address of the block to
 /// run next (PC_EXIT after s_endpgm) in `pc_var`.
+/// A vector instruction that reads and writes only its own lane's registers
+/// (and reads SGPRs): no SGPR, VCC or EXEC write (compares, carries, VOP3b,
+/// lane reads), no other lane's register (DPP, permlane, writelane). Runs of
+/// them share one lane guard (`Spec::lane_guards`).
+fn lane_local(ins: &Inst) -> bool {
+    if !matches!(ins.enc, Enc::Vop1 | Enc::Vop2 | Enc::Vop3 | Enc::Vop3p) || !matches!(ins.ext, crate::Ext::None | crate::Ext::Sdwa(_)) {
+        return false;
+    }
+    if ins.enc == Enc::Vop3 && ins.is_vop3b() {
+        return false;
+    }
+    let Some(name) = ins.base_name() else { return false };
+    !(name.starts_with("v_cmp")
+        || name.starts_with("v_readlane")
+        || name.starts_with("v_readfirstlane")
+        || name.starts_with("v_writelane")
+        || name.starts_with("v_permlane")
+        || name.starts_with("v_movrel")
+        || name.starts_with("v_swap")
+        || name.contains("_co_")
+        || name.contains("_ci_"))
+}
+
+/// Shortest run of lane-local instructions given a lane guard of its own
+/// (the guard's branch and labels cost about one select's words).
+const LANE_GUARD_MIN: usize = 3;
+
 fn emit_block_body(tr: &mut T, code: &[Inst], start: u32, end: u32) -> R<()> {
     // LDS accesses of other blocks are unknown here.
     tr.lds_state = 3;
     let mut next_pc = PC_EXIT;
     let mut terminated = false;
     let mut first = None;
+    // The end (exclusive index) of the lane-guarded run being translated.
+    let mut guarded_until = 0usize;
     for (k, ins) in code.iter().enumerate() {
         if ins.pc < start || ins.pc >= end {
             continue;
         }
+        if k < guarded_until {
+            continue;
+        }
         let first = *first.get_or_insert(k);
+        if tr.spec.lane_guards && lane_local(ins) {
+            let mut j = k;
+            while j < code.len() && code[j].pc < end && lane_local(&code[j]) && !code[j].is_endpgm() && code[j].branch_target().is_none() {
+                j += 1;
+            }
+            if j - k >= LANE_GUARD_MIN {
+                let act = tr.active()?;
+                let run = &code[k..j];
+                tr.guarded(act, &mut |tr| {
+                    tr.reset_vcache();
+                    tr.lane_guard = true;
+                    let r = run.iter().try_for_each(|i| translate_inst(tr, i));
+                    tr.lane_guard = false;
+                    tr.reset_vcache();
+                    r
+                })?;
+                guarded_until = j;
+                next_pc = code.get(j).map(|n| n.pc).unwrap_or(PC_EXIT);
+                continue;
+            }
+        }
         next_pc = code.get(k + 1).map(|n| n.pc).unwrap_or(PC_EXIT);
         if ins.is_endpgm() {
             let x = tr.u(PC_EXIT);
@@ -2598,6 +2723,7 @@ mod tests {
             force_dispatcher: false,
             dispatcher_for_loops: false,
             reg_vars: true,
+            lane_guards: true,
             mip_views: true,
             lod_stats: false,
             early_tests: false,
