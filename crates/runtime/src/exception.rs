@@ -1023,7 +1023,7 @@ unsafe fn handle_watch_hit(ctx: &mut CONTEXT) -> bool {
             crate::log::write(
                 crate::log::Level::Info,
                 format_args!(
-                    "watch {i} {kind} #{n}: [{a:#x}] = {v:#018x} by [{}] at {} (rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} rbp {:#x}); {frames}",
+                    "watch {i} {kind} #{n}: [{a:#x}] = {v:#018x} by [{}] at {} (rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} rbp {:#x} r12 {:#x} r13 {:#x} r14 {:#x} r15 {:#x} rsp {:#x}, [rsp] {}); {frames}",
                     crate::log::thread_name(),
                     describe(ctx.Rip),
                     ctx.Rax,
@@ -1032,7 +1032,15 @@ unsafe fn handle_watch_hit(ctx: &mut CONTEXT) -> bool {
                     ctx.Rdx,
                     ctx.Rsi,
                     ctx.Rdi,
-                    ctx.Rbp
+                    ctx.Rbp,
+                    ctx.R12,
+                    ctx.R13,
+                    ctx.R14,
+                    ctx.R15,
+                    ctx.Rsp,
+                    // The return address of a leaf function (frames from the
+                    // frame-pointer chain skip it).
+                    if readable(ctx.Rsp) { describe(unsafe { *(ctx.Rsp as *const u64) }) } else { "?".to_string() }
                 ),
             );
         }

@@ -106,6 +106,26 @@ struct PadData {
     unique: [u8; 12],
 }
 
+/// Logs the title's pad buffers and their readers (the first eight buffer
+/// and call site pairs).
+fn note_pad_buffer(data: *mut PadData, how: &str) {
+    static SEEN: parking_lot::Mutex<Vec<(u64, String)>> = parking_lot::Mutex::new(Vec::new());
+    // Every read at first, then every 64th (the guest unwind costs ~20 us).
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if (n >= 256 && n % 64 != 0) || SEEN.lock().len() >= 8 {
+        return;
+    }
+    let frames = crate::exception::current_guest_frames(4);
+    let key = (data as u64, frames.first().cloned().unwrap_or_default());
+    let mut g = SEEN.lock();
+    if g.len() < 8 && !g.contains(&key) {
+        g.push(key);
+        drop(g);
+        crate::info!("pad: {how} into {:#x} [{}] from {}", data as u64, crate::log::thread_name(), frames.join(" <- "));
+    }
+}
+
 fn read_pad() -> PadData {
     let mut d: PadData = unsafe { std::mem::zeroed() };
     let st = crate::input::pad_state();
@@ -183,6 +203,7 @@ sysv! {
     }
     fn scePadReadState(h: i32, data: *mut PadData) -> i32 {
         if h != 1 || data.is_null() { return 0x80920003u32 as i32; }
+        note_pad_buffer(data, "scePadReadState");
         std::ptr::write_unaligned(data, read_pad());
         0
     }
@@ -190,6 +211,7 @@ sysv! {
     /// returned per call (ScePadData is 120 bytes, as the title's buffer confirms).
     fn scePadRead(h: i32, data: *mut PadData, num: i32) -> i32 {
         if h != 1 || data.is_null() || num < 1 { return 0x80920003u32 as i32; }
+        note_pad_buffer(data, "scePadRead");
         std::ptr::write_unaligned(data, read_pad());
         1
     }

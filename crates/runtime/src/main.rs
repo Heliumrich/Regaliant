@@ -189,6 +189,14 @@ fn prune_runs(runs: &Path, keep: usize) {
 /// appended to the file since the last poll.
 ///   press <buttons> [hold]   e.g. `press down`, `press cross 10`, `press ls_up+r1 30`; the hold
 ///                            is in flips (default 6), or wall-clock with a suffix: `4s`, `300ms`
+///   key <input> [ms]         hold a key or mouse button of the keyboard and mouse layout
+///                            (controls.txt names: `key W 1000`, `key Mouse1`; default 200 ms)
+///   mouse <dx> <dy>          mouse motion in counts; `wheel <n>` wheel notches (up positive)
+///   capture on|off           mouse input as if the window had captured the cursor (headless)
+///   stick l|r <x> <y> [ms]   hold a stick at a tilt (-128..127 from the centre; default 1000 ms)
+///   find32 <hex u32>|<lo>-<hi>  guest addresses (4-byte aligned) holding a 32-bit value (first 64)
+///   fscan start|changed|same|floats [+|-|=|*]  search the title's flexible memory for a value by
+///                            how it changes (pages, then f32 values; see `fscan`)
 ///   shot <name>              screenshot of the next presented flip -> shot_<name>.png
 ///   dump                     dump all GPU images at the next flip
 ///   trace                    log every draw/dispatch of an upcoming flip (FRAME lines)
@@ -312,6 +320,63 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     None => Err("usage: find <hex u64> | <hex lo>-<hex hi>".into()),
                 }
             }
+            "fscan" => {
+                // Debug (finding a value the title keeps, e.g. the camera's
+                // angles): `fscan start` hashes the pages of the title's
+                // flexible memory; `fscan changed` keeps the pages that changed
+                // since (intersected with earlier ones), `fscan same` drops the
+                // pages that changed and copies the rest once few remain;
+                // `fscan floats [+|-|=|*]` lists the copied pages' f32 values
+                // that rose, fell, stayed or changed since the copy (keeping
+                // those as the candidates, first 48 listed) and copies again.
+                fscan(parts.next().unwrap_or(""), parts.next().unwrap_or("*"))
+            }
+            "find32" => {
+                // Debug: `find32 <hex u32>` or `find32 <hex lo>-<hex hi>`: readable
+                // guest memory holding the 32-bit value (or one in [lo, hi)) at a
+                // 4-byte aligned address (first 64 hits, with the value as f32).
+                let hex = |s: &str| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+                let arg = parts.next().unwrap_or("");
+                let range = match arg.split_once('-') {
+                    Some((lo, hi)) => hex(lo).zip(hex(hi)),
+                    None => hex(arg).map(|v| (v, v.saturating_add(1))),
+                };
+                match range {
+                    Some((vlo, vhi)) => {
+                        let spans: Vec<(u64, u64, String)> = mem::MEM.lock().vmas.values().filter(|m| m.kind != mem::VmaKind::Reserved && m.prot & 1 != 0).map(|m| (m.start, m.end(), m.name.clone())).collect();
+                        let mut hits = Vec::new();
+                        let t0 = Instant::now();
+                        for (lo, hi, name) in &spans {
+                            let mut a = (*lo + 3) & !3;
+                            while a + 4 <= *hi && hits.len() < 64 {
+                                let v = unsafe { *(a as *const u32) };
+                                if (vlo..vhi).contains(&v) {
+                                    hits.push(format!("{a:#x} ({name}) = {v:#x} ({})", f32::from_bits(v)));
+                                }
+                                a += 4;
+                            }
+                        }
+                        info!("find32 {arg}: {} hit(s) in {} mappings ({} ms): {}", hits.len(), spans.len(), t0.elapsed().as_millis(), hits.join(", "));
+                        Ok(())
+                    }
+                    None => Err("usage: find32 <hex u32> | <hex lo>-<hex hi>".into()),
+                }
+            }
+            "stick" => {
+                // Diagnosis: `stick l|r <x> <y> [ms]`: holds a stick at a tilt
+                // (-128..127 from the centre, y down; default 1000 ms).
+                let side = parts.next();
+                let x = parts.next().and_then(|v| v.parse::<i32>().ok());
+                let y = parts.next().and_then(|v| v.parse::<i32>().ok());
+                let ms = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1000);
+                match (side, x, y) {
+                    (Some(sd @ ("l" | "r")), Some(x), Some(y)) => {
+                        input::hold_stick(sd == "r", x, y, Duration::from_millis(ms));
+                        Ok(())
+                    }
+                    _ => Err("usage: stick l|r <x> <y> [ms]".into()),
+                }
+            }
             "poke" => {
                 // Experiment: `poke <hex address> <hex u64> [<hex mask>]`: writes
                 // (old & !mask) | (value & mask) to the 8-byte aligned guest
@@ -357,6 +422,46 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     }
                     info!("findstr {text}: {} hit(s) in {} mappings ({} ms): {}", hits.len(), spans.len(), t0.elapsed().as_millis(), hits.join(", "));
                     Ok(())
+                }
+            }
+            "key" => {
+                // Diagnosis: `key <input> [ms]` holds a key or mouse button of
+                // the keyboard and mouse layout (default 200 ms).
+                let name = parts.next().unwrap_or("");
+                let ms = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(200);
+                input::inject_hold(name, Duration::from_millis(ms))
+            }
+            "mouse" => {
+                // Diagnosis: `mouse <dx> <dy>` mouse motion in counts.
+                let dx = parts.next().and_then(|v| v.parse::<i64>().ok());
+                let dy = parts.next().and_then(|v| v.parse::<i64>().ok());
+                match (dx, dy) {
+                    (Some(dx), Some(dy)) => {
+                        input::inject_motion(dx, dy, 0);
+                        Ok(())
+                    }
+                    _ => Err("usage: mouse <dx> <dy>".into()),
+                }
+            }
+            "wheel" => {
+                // Diagnosis: `wheel <notches>` (up positive).
+                match parts.next().and_then(|v| v.parse::<i32>().ok()) {
+                    Some(n) => {
+                        input::inject_motion(0, 0, n);
+                        Ok(())
+                    }
+                    None => Err("usage: wheel <notches>".into()),
+                }
+            }
+            "capture" => {
+                // Diagnosis: `capture on|off`: mouse input counts as if the
+                // window had captured the cursor (headless runs).
+                match parts.next() {
+                    Some(v @ ("on" | "off")) => {
+                        gpu::vk::window::CAPTURE_TEST.store(v == "on", std::sync::atomic::Ordering::Relaxed);
+                        Ok(())
+                    }
+                    _ => Err("usage: capture on|off".into()),
                 }
             }
             "watch" => {
@@ -643,6 +748,114 @@ fn poll_control(path: &Path, offset: &mut u64) {
     }
 }
 
+/// `fscan` state: page hashes, candidate pages, their copies, candidate
+/// float addresses.
+#[derive(Default)]
+struct FScan {
+    pages: Vec<(u64, u64)>,
+    cand: Option<Vec<u64>>,
+    copy: std::collections::BTreeMap<u64, Vec<u8>>,
+    floats: Option<Vec<u64>>,
+}
+
+static FSCAN: parking_lot::Mutex<Option<FScan>> = parking_lot::Mutex::new(None);
+/// Candidate pages copied for `fscan floats` (64 MiB) at most.
+const FSCAN_COPY_PAGES: usize = 16384;
+
+fn page_hash(a: u64) -> u64 {
+    let p = a as *const u64;
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for i in 0..512 {
+        h = (h ^ unsafe { p.add(i).read_volatile() }).wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+fn fscan(cmd: &str, arg: &str) -> Result<(), String> {
+    let t0 = Instant::now();
+    let mut g = FSCAN.lock();
+    if cmd == "start" {
+        let spans: Vec<(u64, u64)> = mem::MEM.lock().vmas.values().filter(|m| m.kind == mem::VmaKind::Flexible && m.prot & 3 == 3).map(|m| (m.start, m.end())).collect();
+        let mut st = FScan::default();
+        for (lo, hi) in spans {
+            let mut a = lo;
+            while a + 4096 <= hi {
+                st.pages.push((a, page_hash(a)));
+                a += 4096;
+            }
+        }
+        info!("fscan start: {} pages ({} ms)", st.pages.len(), t0.elapsed().as_millis());
+        *g = Some(st);
+        return Ok(());
+    }
+    let st = g.as_mut().ok_or("fscan start first")?;
+    match cmd {
+        "changed" | "same" => {
+            let mut changed = std::collections::HashSet::new();
+            for (a, h) in st.pages.iter_mut() {
+                let n = page_hash(*a);
+                if n != *h {
+                    changed.insert(*a);
+                    *h = n;
+                }
+            }
+            let prev = st.cand.take().unwrap_or_else(|| st.pages.iter().map(|p| p.0).collect());
+            let next: Vec<u64> = prev.into_iter().filter(|a| changed.contains(a) == (cmd == "changed")).collect();
+            if next.len() <= FSCAN_COPY_PAGES {
+                st.copy = next.iter().map(|&a| (a, unsafe { std::slice::from_raw_parts(a as *const u8, 4096) }.to_vec())).collect();
+            }
+            let listed = if next.len() <= 16 { format!(": {}", next.iter().map(|a| format!("{a:#x}")).collect::<Vec<_>>().join(" ")) } else { String::new() };
+            info!("fscan {cmd}: {} pages changed, {} candidate pages{} ({} ms){listed}", changed.len(), next.len(), if next.len() <= FSCAN_COPY_PAGES { " (copied)" } else { "" }, t0.elapsed().as_millis());
+            st.cand = Some(next);
+            Ok(())
+        }
+        "floats" => {
+            if st.copy.is_empty() {
+                return Err("no copied pages (fscan same first)".into());
+            }
+            let mut found: Vec<(u64, f32, f32)> = Vec::new();
+            for (&a, old) in st.copy.iter_mut() {
+                let now = unsafe { std::slice::from_raw_parts(a as *const u8, 4096) };
+                for i in (0..4096).step_by(4) {
+                    let (o, n) = (f32::from_le_bytes(old[i..i + 4].try_into().unwrap()), f32::from_le_bytes(now[i..i + 4].try_into().unwrap()));
+                    let addr = a + i as u64;
+                    if let Some(f) = &st.floats {
+                        if f.binary_search(&addr).is_err() {
+                            continue;
+                        }
+                    }
+                    // Not plausible values: non-finite, huge, or tiny (integers
+                    // and pointers read as floats).
+                    let odd = |v: f32| !v.is_finite() || v.abs() > 1e5 || (v != 0.0 && v.abs() < 1e-6);
+                    if odd(o) || odd(n) {
+                        continue;
+                    }
+                    let keep = match arg {
+                        "+" => n > o,
+                        "-" => n < o,
+                        "=" => n == o,
+                        _ => n != o,
+                    };
+                    if keep {
+                        found.push((addr, o, n));
+                    }
+                }
+                old.copy_from_slice(now);
+            }
+            let list: Vec<String> = found.iter().take(48).map(|(a, o, n)| format!("{a:#x} {o} -> {n}")).collect();
+            info!("fscan floats {arg}: {} candidates ({} ms): {}", found.len(), t0.elapsed().as_millis(), list.join(", "));
+            st.floats = Some(found.iter().map(|f| f.0).collect());
+            Ok(())
+        }
+        "reset" => {
+            st.floats = None;
+            info!("fscan reset: float candidates cleared");
+            Ok(())
+        }
+        _ => Err("usage: fscan start|changed|same|floats [+|-|=|*]|reset".into()),
+    }
+}
+
 pub fn fatal_report(text: &str) {
     crate::log::write(crate::log::Level::Error, format_args!("{text}"));
     if let Some(dir) = RUN_DIR.get() {
@@ -835,6 +1048,8 @@ fn main() {
     hle::kernel::fs::ensure_dir(&rt.join("devlog").join("logs"));
     hle::kernel::fs::mount("/devlog/app", vec![rt.join("devlog")], true);
     hle::libs::savedata::init(cfg.root.join("local-data").join("saves"));
+    // Keyboard and mouse layout (written with the defaults when missing).
+    input::init(&cfg.root.join("local-data").join("controls.txt"));
     // DS_PIPELINE_DIR=<directory name under local-data>: another pipeline
     // store (experiments that start without compiled pipelines).
     let pipe_dir = std::env::var("DS_PIPELINE_DIR").ok().filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')).unwrap_or_else(|| "pipelines".into());

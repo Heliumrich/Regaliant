@@ -1,8 +1,20 @@
 //! Output window (Win32) running its own message loop thread.
+//!
+//! Keyboard: key states by virtual-key code (`key_down`), with the left and
+//! right Shift, Ctrl and Alt keys apart as well as together.
+//!
+//! Mouse (`input`): device motion from WM_INPUT (Raw Input: the counts the
+//! mouse reports, no pointer acceleration), its buttons and wheel. A click
+//! into the client area captures the cursor: hidden and held at the client
+//! area's centre while the window is focused, so motion only turns the
+//! camera. Leaving the window (Alt+Tab) releases it until the window is
+//! focused again; F1 releases it or takes it back. Buttons and motion count
+//! only while it is captured (the capturing click is not an attack).
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -19,12 +31,133 @@ pub static CLIENT_H: AtomicU32 = AtomicU32::new(720);
 /// Virtual-key states (true = down).
 pub static KEYS: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
 
+/// Mouse motion not yet taken (`input`), in device counts.
+pub static MOUSE_DX: AtomicI64 = AtomicI64::new(0);
+pub static MOUSE_DY: AtomicI64 = AtomicI64::new(0);
+/// Wheel movement not yet taken, in WHEEL_DELTA (120) units per notch.
+pub static MOUSE_WHEEL: AtomicI32 = AtomicI32::new(0);
+/// Mouse buttons down: bit 0 left, 1 right, 2 middle, 3 and 4 the side
+/// buttons (X1, X2).
+pub static MOUSE_BUTTONS: AtomicU32 = AtomicU32::new(0);
+/// The cursor is captured (hidden and held in the client area).
+pub static CAPTURED: AtomicBool = AtomicBool::new(false);
+static FOCUSED: AtomicBool = AtomicBool::new(false);
+/// Whether a focused window captures the cursor: from the first click into
+/// the client area on (not at launch: the window appears while the title
+/// boots); F1 toggles.
+static CAPTURE_WANTED: AtomicBool = AtomicBool::new(false);
+/// Diagnosis (control channel `capture`): input as if captured without a
+/// focused window (headless runs, injected motion).
+pub static CAPTURE_TEST: AtomicBool = AtomicBool::new(false);
+/// The last absolute position of a mouse reporting absolute coordinates
+/// (remote sessions, tablets; i64::MIN: none yet).
+static ABS_X: AtomicI64 = AtomicI64::new(i64::MIN);
+static ABS_Y: AtomicI64 = AtomicI64::new(i64::MIN);
+
 pub fn get() -> Option<&'static Window> {
     WINDOW.get()
 }
 
 pub fn key_down(vk: u8) -> bool {
     KEYS[vk as usize].load(Ordering::Relaxed)
+}
+
+/// The left or right key of a Shift, Ctrl or Alt key message (VK_LSHIFT ..
+/// VK_RMENU): Shift by its scan code, Ctrl and Alt by the extended-key bit.
+fn sided(wp: WPARAM, lp: LPARAM) -> Option<u8> {
+    let extended = (lp >> 24) & 1 != 0;
+    match wp as u8 {
+        0x10 => Some(if (lp >> 16) & 0xFF == 0x36 { 0xA1 } else { 0xA0 }),
+        0x11 => Some(if extended { 0xA3 } else { 0xA2 }),
+        0x12 => Some(if extended { 0xA5 } else { 0xA4 }),
+        _ => None,
+    }
+}
+
+fn set_key(wp: WPARAM, lp: LPARAM, down: bool) {
+    KEYS[(wp & 0xFF) as usize].store(down, Ordering::Relaxed);
+    if let Some(k) = sided(wp, lp) {
+        KEYS[k as usize].store(down, Ordering::Relaxed);
+        // The common key is down while either side is.
+        let (l, r) = match wp as u8 {
+            0x10 => (0xA0, 0xA1),
+            0x11 => (0xA2, 0xA3),
+            _ => (0xA4, 0xA5),
+        };
+        KEYS[(wp & 0xFF) as usize].store(key_down(l) || key_down(r), Ordering::Relaxed);
+    }
+}
+
+/// Captures the cursor while the window is focused and capture is wanted
+/// (held at the client area's centre: Raw Input keeps reporting motion),
+/// else releases it.
+unsafe fn update_capture(hwnd: HWND) {
+    if FOCUSED.load(Ordering::Relaxed) && CAPTURE_WANTED.load(Ordering::Relaxed) {
+        let mut r: RECT = unsafe { std::mem::zeroed() };
+        unsafe { GetClientRect(hwnd, &mut r) };
+        let mut p = POINT { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 };
+        unsafe { ClientToScreen(hwnd, &mut p) };
+        let c = RECT { left: p.x, top: p.y, right: p.x + 1, bottom: p.y + 1 };
+        unsafe { ClipCursor(&c) };
+        if !CAPTURED.swap(true, Ordering::SeqCst) {
+            unsafe { SetCursor(std::ptr::null_mut()) };
+            MOUSE_DX.store(0, Ordering::Relaxed);
+            MOUSE_DY.store(0, Ordering::Relaxed);
+            ABS_X.store(i64::MIN, Ordering::Relaxed);
+        }
+    } else if CAPTURED.swap(false, Ordering::SeqCst) {
+        unsafe {
+            ClipCursor(std::ptr::null());
+            SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_ARROW));
+        }
+        MOUSE_BUTTONS.store(0, Ordering::Relaxed);
+        MOUSE_WHEEL.store(0, Ordering::Relaxed);
+    }
+}
+
+/// WM_INPUT: mouse motion, buttons and wheel while the cursor is captured.
+unsafe fn raw_input(lp: LPARAM) {
+    use windows_sys::Win32::UI::Input::*;
+    let mut raw: RAWINPUT = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+    let n = unsafe { GetRawInputData(lp as HRAWINPUT, RID_INPUT, &mut raw as *mut RAWINPUT as *mut _, &mut size, std::mem::size_of::<RAWINPUTHEADER>() as u32) };
+    if n == 0 || n == u32::MAX || raw.header.dwType != RIM_TYPEMOUSE || !CAPTURED.load(Ordering::Relaxed) {
+        return;
+    }
+    let m = unsafe { raw.data.mouse };
+    if m.usFlags & MOUSE_MOVE_ABSOLUTE == 0 {
+        MOUSE_DX.fetch_add(m.lLastX as i64, Ordering::Relaxed);
+        MOUSE_DY.fetch_add(m.lLastY as i64, Ordering::Relaxed);
+    } else {
+        // 0..65535 over the (virtual) desktop: motion in pixels.
+        let virt = m.usFlags & MOUSE_VIRTUAL_DESKTOP != 0;
+        let (w, h) = unsafe {
+            if virt {
+                (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN))
+            } else {
+                (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
+            }
+        };
+        let x = m.lLastX as i64 * w as i64 / 65535;
+        let y = m.lLastY as i64 * h as i64 / 65535;
+        let (px, py) = (ABS_X.swap(x, Ordering::Relaxed), ABS_Y.swap(y, Ordering::Relaxed));
+        if px != i64::MIN {
+            MOUSE_DX.fetch_add(x - px, Ordering::Relaxed);
+            MOUSE_DY.fetch_add(y - py, Ordering::Relaxed);
+        }
+    }
+    let f = unsafe { m.Anonymous.Anonymous.usButtonFlags } as u32;
+    for (down, up, bit) in [(0x1, 0x2, 0), (0x4, 0x8, 1), (0x10, 0x20, 2), (0x40, 0x80, 3), (0x100, 0x200, 4)] {
+        if f & down != 0 {
+            MOUSE_BUTTONS.fetch_or(1 << bit, Ordering::Relaxed);
+        }
+        if f & up != 0 {
+            MOUSE_BUTTONS.fetch_and(!(1 << bit), Ordering::Relaxed);
+        }
+    }
+    if f & 0x400 != 0 {
+        MOUSE_WHEEL.fetch_add(unsafe { m.Anonymous.Anonymous.usButtonData } as i16 as i32, Ordering::Relaxed);
+    }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -41,25 +174,67 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 CLIENT_H.store(h, Ordering::Relaxed);
                 RESIZED.store(true, Ordering::SeqCst);
             }
+            if wp as u32 == SIZE_MINIMIZED {
+                FOCUSED.store(false, Ordering::Relaxed);
+            }
+            unsafe { update_capture(hwnd) };
             0
         }
+        WM_MOVE => {
+            unsafe { update_capture(hwnd) };
+            0
+        }
+        WM_ACTIVATE => {
+            // Active and not minimized.
+            FOCUSED.store((wp & 0xFFFF) as u32 != WA_INACTIVE && (wp >> 16) & 0xFFFF == 0, Ordering::Relaxed);
+            unsafe { update_capture(hwnd) };
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
+        WM_SETCURSOR if CAPTURED.load(Ordering::Relaxed) && (lp & 0xFFFF) as u32 == HTCLIENT => {
+            unsafe { SetCursor(std::ptr::null_mut()) };
+            1
+        }
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN if !CAPTURED.load(Ordering::Relaxed) => {
+            // A click into the client area takes the cursor again.
+            CAPTURE_WANTED.store(true, Ordering::Relaxed);
+            FOCUSED.store(true, Ordering::Relaxed);
+            unsafe { update_capture(hwnd) };
+            0
+        }
+        WM_INPUT => {
+            unsafe { raw_input(lp) };
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
-            KEYS[(wp & 0xFF) as usize].store(true, Ordering::Relaxed);
+            if wp as u16 == VK_F4_CODE && msg == WM_SYSKEYDOWN {
+                // Alt+F4 closes the window.
+                return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+            }
+            if wp as u16 == VK_F1_CODE && (lp >> 30) & 1 == 0 {
+                CAPTURE_WANTED.fetch_xor(true, Ordering::Relaxed);
+                unsafe { update_capture(hwnd) };
+            }
+            set_key(wp, lp, true);
             0
         }
         WM_KEYUP | WM_SYSKEYUP => {
-            KEYS[(wp & 0xFF) as usize].store(false, Ordering::Relaxed);
+            set_key(wp, lp, false);
             0
         }
         WM_KILLFOCUS => {
             for k in KEYS.iter() {
                 k.store(false, Ordering::Relaxed);
             }
+            FOCUSED.store(false, Ordering::Relaxed);
+            unsafe { update_capture(hwnd) };
             0
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }
 }
+
+const VK_F1_CODE: u16 = 0x70;
+const VK_F4_CODE: u16 = 0x73;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -117,6 +292,12 @@ pub fn create(title: &str, width: u32, height: u32) -> Result<&'static Window, S
             }
             CLIENT_W.store(width, Ordering::Relaxed);
             CLIENT_H.store(height, Ordering::Relaxed);
+            // The mouse as a Raw Input device of this window (motion
+            // without pointer acceleration; only while it is in front).
+            let dev = windows_sys::Win32::UI::Input::RAWINPUTDEVICE { usUsagePage: 0x01, usUsage: 0x02, dwFlags: 0, hwndTarget: hwnd };
+            if windows_sys::Win32::UI::Input::RegisterRawInputDevices(&dev, 1, std::mem::size_of::<windows_sys::Win32::UI::Input::RAWINPUTDEVICE>() as u32) == 0 {
+                crate::warn!("window: no raw mouse input ({}): no mouse look", std::io::Error::last_os_error());
+            }
             ShowWindow(hwnd, SW_SHOW);
             let _ = tx.send(Ok((hwnd as isize, hinst as isize)));
             let mut msg: MSG = std::mem::zeroed();

@@ -1,10 +1,16 @@
-//! Host input aggregation for the DualShock 4 pad: XInput controller, the
-//! output window's keyboard, and a scripted timeline for reproducible runs.
+//! Host input aggregation for the PS5 pad: an XInput controller (its own
+//! fixed mapping), the output window's keyboard and mouse in a Dark Souls
+//! III-style PC layout, and a scripted timeline for reproducible runs.
 //!
-//! Keyboard layout (window focused):
-//!   W/A/S/D left stick · I/J/K/L right stick · arrow keys d-pad
-//!   Enter or E = Cross · Escape or Space = Circle · R = Square · F = Triangle
-//!   U = L1 · O = R1 · Y = L2 · P = R2 · C = L3 · V = R3 · Tab = Options · T = Touchpad
+//! Keyboard and mouse (`Layout`, window focused): the layout is read from
+//! local-data/controls.txt, written with the defaults (`DEFAULT_LAYOUT`) on
+//! first start; each line binds a key, mouse button or wheel direction
+//! (optionally with Shift+, Ctrl+ or Alt+) to a pad button, a stick
+//! direction or `walk`. A binding with modifiers wins over the plain one of
+//! the same input while its modifiers are held (Shift+Mouse1 = R2 instead of
+//! Mouse1 = R1). Wheel notches are d-pad taps. Mouse motion (raw counts,
+//! `window`) turns the camera through the right stick: its speed over the
+//! interval since the last pad read sets the deflection (`mouse_look`).
 //!
 //! Scripted input (`DS_INPUT`): `flip:buttons[:hold]` entries separated by
 //! `;`, e.g. `DS_INPUT=700:cross;760:down:3;800:cross`. `buttons` joins names
@@ -12,7 +18,11 @@
 //! l2, r2, l3, r3, options, touchpad, ls_up/down/left/right,
 //! rs_up/down/left/right). Each press lasts `hold` GPU flips (default 6).
 
+use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering::Relaxed;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputGetState};
 
 pub const BTN_L3: u32 = 0x2;
@@ -185,8 +195,31 @@ pub fn press_for(names: &str, dur: std::time::Duration) -> Result<(), String> {
     Ok(())
 }
 
+/// Sticks held at a tilt by the control channel (`hold_stick`): until when,
+/// right stick, x, y.
+static STICKS: parking_lot::Mutex<Vec<(std::time::Instant, bool, i32, i32)>> = parking_lot::Mutex::new(Vec::new());
+
+/// Diagnosis (control channel `stick`): holds the left or right stick at
+/// (x, y) from the centre (-128..127, y down) for `dur`.
+pub fn hold_stick(right: bool, x: i32, y: i32, dur: std::time::Duration) {
+    let now = std::time::Instant::now();
+    let mut g = STICKS.lock();
+    g.retain(|s| s.0 > now);
+    g.push((now + dur, right, x.clamp(-128, 127), y.clamp(-128, 127)));
+}
+
 fn scripted(st: &mut PadState, flip: u64) {
     let now = std::time::Instant::now();
+    for &(until, right, x, y) in STICKS.lock().iter() {
+        if now < until {
+            let (ax, ay) = ((128 + x) as u8, (128 + y) as u8);
+            if right {
+                (st.rx, st.ry) = (ax, ay);
+            } else {
+                (st.lx, st.ly) = (ax, ay);
+            }
+        }
+    }
     for (until, step) in LIVE_TIMED.lock().iter() {
         if now < *until {
             st.buttons |= step.buttons;
@@ -265,56 +298,448 @@ fn xinput(st: &mut PadState) {
     st.ry = axis(g.sThumbRY, true);
 }
 
-fn keyboard(st: &mut PadState) {
-    use crate::gpu::vk::window::key_down;
-    let k = |c: u8| key_down(c);
-    let map: [(&[u8], u32); 16] = [
-        (&[0x0D, b'E'], BTN_CROSS),
-        (&[0x1B, 0x20], BTN_CIRCLE),
-        (&[b'R'], BTN_SQUARE),
-        (&[b'F'], BTN_TRIANGLE),
-        (&[0x26], BTN_UP),
-        (&[0x28], BTN_DOWN),
-        (&[0x25], BTN_LEFT),
-        (&[0x27], BTN_RIGHT),
-        (&[b'U'], BTN_L1),
-        (&[b'O'], BTN_R1),
-        (&[b'Y'], BTN_L2),
-        (&[b'P'], BTN_R2),
-        (&[b'C'], BTN_L3),
-        (&[b'V'], BTN_R3),
-        (&[0x09], BTN_OPTIONS),
-        (&[b'T'], BTN_TOUCHPAD),
-    ];
-    for (keys, b) in map {
-        if keys.iter().any(|&c| k(c)) {
-            st.buttons |= b;
+// ---------------------------------------------------------------------------
+// Keyboard and mouse
+
+/// The default keyboard and mouse layout, also written to controls.txt on
+/// first start: Dark Souls III's PC defaults on the PS5 pad's buttons.
+pub const DEFAULT_LAYOUT: &str = "\
+# Keyboard and mouse layout of the Demon's Souls port (Dark Souls III-style PC
+# controls). An Xbox-style controller keeps its own mapping. Edit and restart;
+# delete this file to get the defaults back.
+#
+# Lines: <input> = <pad target>. Inputs: key names (A..Z, 0..9, Space, Enter,
+# Esc, Tab, Backspace, Up, Down, Left, Right, Shift, LShift, RShift, Ctrl,
+# LCtrl, RCtrl, Alt, LAlt, RAlt, F2..F12, Insert, Delete, Home, End, PageUp,
+# PageDown, CapsLock), mouse buttons (Mouse1 left, Mouse2 right, Mouse3
+# middle, Mouse4 and Mouse5 the side buttons), WheelUp, WheelDown; each may
+# have Shift+, Ctrl+ or Alt+ in front (that binding then wins while the
+# modifier is held). Targets: cross circle square triangle l1 r1 l2 r2 l3 r3
+# options touchpad, up down left right (d-pad), ls_up ls_down ls_left
+# ls_right (left stick), rs_up rs_down rs_left rs_right (right stick, the
+# camera), walk (the left stick at walking tilt).
+# F1 releases the mouse cursor or takes it back.
+
+# Mouse look: 1 on, 0 off; sensitivity (1.0 = full camera speed at 2000 mouse
+# counts per second); invert the vertical axis (1).
+mouse_look = 1
+mouse_sensitivity = 1.0
+mouse_invert_y = 0
+
+W = ls_up
+S = ls_down
+A = ls_left
+D = ls_right
+LAlt = walk
+Space = circle          # dash (hold), backstep, roll; back in menus
+Mouse1 = r1             # attack (right hand)
+Shift+Mouse1 = r2       # strong attack
+Mouse2 = l1             # guard (left hand)
+LCtrl = l2              # parry / left-hand strong attack
+F = triangle            # two-hand
+R = square              # use item
+E = cross               # interact; confirm in menus
+Q = r3                  # lock on / reset camera
+Mouse3 = r3
+G = touchpad            # tool belt
+Esc = options           # menu
+Up = up                 # switch spell
+Down = down             # switch item
+Right = right           # switch right-hand weapon
+Left = left             # switch left-hand weapon
+WheelUp = up
+WheelDown = down
+Shift+WheelUp = right
+Shift+WheelDown = left
+Shift+Left = l1         # menus: previous page
+Shift+Right = r1        # menus: next page
+Enter = cross
+Backspace = circle
+I = rs_up               # camera without a mouse
+K = rs_down
+J = rs_left
+L = rs_right
+";
+
+/// Modifier bits of a binding.
+const MOD_SHIFT: u8 = 1;
+const MOD_CTRL: u8 = 2;
+const MOD_ALT: u8 = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Src {
+    Key(u8),
+    /// Mouse button by bit (`window::MOUSE_BUTTONS`).
+    Mouse(u8),
+    WheelUp,
+    WheelDown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dst {
+    Button(u32),
+    Stick(Stick),
+    Walk,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Bind {
+    src: Src,
+    mods: u8,
+    dst: Dst,
+}
+
+#[derive(Clone, Debug)]
+struct Layout {
+    binds: Vec<Bind>,
+    mouse_look: bool,
+    sensitivity: f32,
+    invert_y: bool,
+}
+
+/// A key name's virtual-key code.
+fn key_code(name: &str) -> Option<u8> {
+    let n = name.trim().to_ascii_lowercase();
+    if n.len() == 1 {
+        let c = n.as_bytes()[0];
+        if c.is_ascii_lowercase() {
+            return Some(c.to_ascii_uppercase());
+        }
+        if c.is_ascii_digit() {
+            return Some(c);
         }
     }
-    if k(b'Y') {
-        st.l2 = 255;
+    if let Some(f) = n.strip_prefix('f').and_then(|d| d.parse::<u8>().ok()) {
+        return (1..=24).contains(&f).then_some(0x6F + f);
     }
-    if k(b'P') {
-        st.r2 = 255;
+    Some(match n.as_str() {
+        "space" => 0x20,
+        "enter" | "return" => 0x0D,
+        "esc" | "escape" => 0x1B,
+        "tab" => 0x09,
+        "backspace" => 0x08,
+        "up" => 0x26,
+        "down" => 0x28,
+        "left" => 0x25,
+        "right" => 0x27,
+        "shift" => 0x10,
+        "lshift" => 0xA0,
+        "rshift" => 0xA1,
+        "ctrl" | "control" => 0x11,
+        "lctrl" => 0xA2,
+        "rctrl" => 0xA3,
+        "alt" => 0x12,
+        "lalt" => 0xA4,
+        "ralt" => 0xA5,
+        "capslock" => 0x14,
+        "insert" => 0x2D,
+        "delete" => 0x2E,
+        "home" => 0x24,
+        "end" => 0x23,
+        "pageup" => 0x21,
+        "pagedown" => 0x22,
+        _ => return None,
+    })
+}
+
+fn parse_src(s: &str) -> Option<(Src, u8)> {
+    let mut mods = 0u8;
+    let mut rest = s.trim();
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let (m, len) = if lower.starts_with("shift+") {
+            (MOD_SHIFT, 6)
+        } else if lower.starts_with("ctrl+") {
+            (MOD_CTRL, 5)
+        } else if lower.starts_with("alt+") {
+            (MOD_ALT, 4)
+        } else {
+            break;
+        };
+        mods |= m;
+        rest = rest[len..].trim_start();
     }
-    let stick = |neg: u8, pos: u8, cur: u8| -> u8 {
-        match (k(neg), k(pos)) {
+    let src = match rest.to_ascii_lowercase().as_str() {
+        "mouse1" => Src::Mouse(0),
+        "mouse2" => Src::Mouse(1),
+        "mouse3" => Src::Mouse(2),
+        "mouse4" => Src::Mouse(3),
+        "mouse5" => Src::Mouse(4),
+        "wheelup" => Src::WheelUp,
+        "wheeldown" => Src::WheelDown,
+        _ => Src::Key(key_code(rest)?),
+    };
+    Some((src, mods))
+}
+
+fn parse_dst(s: &str) -> Option<Dst> {
+    let n = s.trim().to_ascii_lowercase();
+    if n == "walk" {
+        return Some(Dst::Walk);
+    }
+    match parse_name(&n)? {
+        Ok(b) => Some(Dst::Button(b)),
+        Err(st) => Some(Dst::Stick(st)),
+    }
+}
+
+fn parse_layout(text: &str) -> Result<Layout, String> {
+    let mut l = Layout { binds: Vec::new(), mouse_look: true, sensitivity: 1.0, invert_y: false };
+    for (i, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((a, b)) = line.split_once('=') else { return Err(format!("line {}: expected <input> = <target>", i + 1)) };
+        let (a, b) = (a.trim(), b.trim());
+        match a.to_ascii_lowercase().as_str() {
+            "mouse_look" => l.mouse_look = b != "0",
+            "mouse_invert_y" => l.invert_y = b != "0",
+            "mouse_sensitivity" => {
+                l.sensitivity = b.parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0).ok_or_else(|| format!("line {}: bad sensitivity '{b}'", i + 1))?;
+            }
+            _ => {
+                let (src, mods) = parse_src(a).ok_or_else(|| format!("line {}: unknown input '{a}'", i + 1))?;
+                let dst = parse_dst(b).ok_or_else(|| format!("line {}: unknown target '{b}'", i + 1))?;
+                l.binds.push(Bind { src, mods, dst });
+            }
+        }
+    }
+    Ok(l)
+}
+
+static LAYOUT: OnceLock<Layout> = OnceLock::new();
+
+fn layout() -> &'static Layout {
+    LAYOUT.get_or_init(|| parse_layout(DEFAULT_LAYOUT).expect("default layout"))
+}
+
+/// Reads the keyboard and mouse layout from `path` (written with the
+/// defaults when missing; the defaults on errors, logged).
+pub fn init(path: &std::path::Path) {
+    if !path.exists() {
+        if let Err(e) = std::fs::write(path, DEFAULT_LAYOUT) {
+            crate::warn!("input: {} not written ({e})", path.display());
+        }
+    }
+    let l = match std::fs::read_to_string(path) {
+        Ok(text) => match parse_layout(&text) {
+            Ok(l) => {
+                crate::info!("input: keyboard and mouse layout from {} ({} bindings; mouse look {}, sensitivity {}, invert y {})", path.display(), l.binds.len(), l.mouse_look, l.sensitivity, l.invert_y);
+                l
+            }
+            Err(e) => {
+                crate::warn!("input: {}: {e}; the default layout is used", path.display());
+                parse_layout(DEFAULT_LAYOUT).expect("default layout")
+            }
+        },
+        Err(_) => parse_layout(DEFAULT_LAYOUT).expect("default layout"),
+    };
+    let _ = LAYOUT.set(l);
+}
+
+/// Keys and mouse buttons held by the control channel (`inject_hold`):
+/// until when.
+static INJECTED: Mutex<Vec<(Instant, Src)>> = Mutex::new(Vec::new());
+
+/// Diagnosis (control channel `key`): holds a key or mouse button (a layout
+/// input name without modifiers) for `dur`, as if pressed in the window.
+pub fn inject_hold(name: &str, dur: Duration) -> Result<(), String> {
+    let (src, mods) = parse_src(name).ok_or_else(|| format!("unknown input '{name}'"))?;
+    if mods != 0 || matches!(src, Src::WheelUp | Src::WheelDown) {
+        return Err(format!("'{name}': a key or mouse button without modifiers"));
+    }
+    let now = Instant::now();
+    let mut g = INJECTED.lock();
+    g.retain(|x| x.0 > now);
+    g.push((now + dur, src));
+    Ok(())
+}
+
+/// Diagnosis (control channel `mouse`, `wheel`): mouse motion in counts and
+/// wheel notches (up positive), as if reported by the window.
+pub fn inject_motion(dx: i64, dy: i64, wheel: i32) {
+    use crate::gpu::vk::window::{MOUSE_DX, MOUSE_DY, MOUSE_WHEEL};
+    MOUSE_DX.fetch_add(dx, Relaxed);
+    MOUSE_DY.fetch_add(dy, Relaxed);
+    MOUSE_WHEEL.fetch_add(wheel * 120, Relaxed);
+}
+
+/// Whether `src` is held: in the window or by the control channel (a sided
+/// modifier held there also holds the common one).
+fn held(src: Src) -> bool {
+    use crate::gpu::vk::window::{MOUSE_BUTTONS, key_down};
+    let window = match src {
+        Src::Key(k) => key_down(k),
+        Src::Mouse(m) => MOUSE_BUTTONS.load(Relaxed) & (1 << m) != 0,
+        Src::WheelUp | Src::WheelDown => false,
+    };
+    if window {
+        return true;
+    }
+    let now = Instant::now();
+    let g = INJECTED.lock();
+    g.iter().any(|&(until, s)| {
+        now < until
+            && (s == src
+                || matches!((s, src), (Src::Key(0xA0 | 0xA1), Src::Key(0x10)) | (Src::Key(0xA2 | 0xA3), Src::Key(0x11)) | (Src::Key(0xA4 | 0xA5), Src::Key(0x12))))
+    })
+}
+
+/// The modifier bits held now.
+fn held_mods() -> u8 {
+    (if held(Src::Key(0x10)) { MOD_SHIFT } else { 0 }) | (if held(Src::Key(0x11)) { MOD_CTRL } else { 0 }) | (if held(Src::Key(0x12)) { MOD_ALT } else { 0 })
+}
+
+/// Of the bindings of `src`, those that apply with `held` modifiers: the
+/// ones with the most modifiers, all held.
+fn applying(l: &Layout, src: Src, held: u8) -> impl Iterator<Item = &Bind> {
+    let best = l.binds.iter().filter(|b| b.src == src && b.mods & !held == 0).map(|b| b.mods.count_ones()).max();
+    l.binds.iter().filter(move |b| b.src == src && b.mods & !held == 0 && Some(b.mods.count_ones()) == best)
+}
+
+/// Wheel taps not yet given to the title, and the one being given: its
+/// button, whether it is down, pad reads and the flip of its phase's start.
+/// A phase lasts at least two reads and one flip (the title may read the pad
+/// more than once per frame).
+static TAPS: Mutex<(VecDeque<u32>, Option<(u32, bool, u32, u64)>)> = Mutex::new((VecDeque::new(), None));
+
+fn wheel_taps(st: &mut PadState, l: &Layout, held: u8) {
+    use crate::gpu::vk::window::MOUSE_WHEEL;
+    let mut g = TAPS.lock();
+    let w = MOUSE_WHEEL.load(Relaxed);
+    let notches = w / 120;
+    if notches != 0 {
+        MOUSE_WHEEL.fetch_sub(notches * 120, Relaxed);
+        let src = if notches > 0 { Src::WheelUp } else { Src::WheelDown };
+        let buttons: u32 = applying(l, src, held).filter_map(|b| if let Dst::Button(x) = b.dst { Some(x) } else { None }).fold(0, |a, x| a | x);
+        for _ in 0..notches.unsigned_abs() {
+            if buttons != 0 && g.0.len() < 8 {
+                g.0.push_back(buttons);
+            }
+        }
+    }
+    let flip = crate::gpu::FRAMES.load(Relaxed);
+    let (queue, cur) = &mut *g;
+    loop {
+        match cur {
+            None => match queue.pop_front() {
+                Some(b) => *cur = Some((b, true, 0, flip)),
+                None => break,
+            },
+            Some((_, down, reads, since)) if *reads >= 2 && flip > *since => {
+                if *down {
+                    (*down, *reads, *since) = (false, 0, flip);
+                    break;
+                }
+                *cur = None;
+            }
+            Some(_) => break,
+        }
+    }
+    if let Some((b, down, reads, _)) = cur {
+        if *down {
+            st.buttons |= *b;
+        }
+        *reads += 1;
+    }
+}
+
+/// Mouse look: the last deflection given and when the motion was last taken.
+static LOOK: Mutex<(Option<Instant>, f32, f32)> = Mutex::new((None, 0.0, 0.0));
+
+/// Mouse counts per second for a full right-stick deflection at sensitivity 1.
+const FULL_SPEED: f32 = 2000.0;
+/// Deflection added before mouse motion's own (a stick dead zone to step
+/// over). None: the title's camera takes the raw stick, (rx - 128) / 127,
+/// even at 1/127 (its pad layer applies the radial dead zone our
+/// scePadGetControllerInformation reports, 13 of 127, only to values the
+/// camera does not use; FINDINGS.md 2026-10-17).
+const STICK_DEAD: f32 = 0.0;
+
+fn mouse_look(st: &mut PadState, l: &Layout) {
+    use crate::gpu::vk::window::{CAPTURED, CAPTURE_TEST, MOUSE_DX, MOUSE_DY};
+    let mut g = LOOK.lock();
+    if !l.mouse_look || !(CAPTURED.load(Relaxed) || CAPTURE_TEST.load(Relaxed)) {
+        *g = (None, 0.0, 0.0);
+        return;
+    }
+    let now = Instant::now();
+    // The title may read the pad several times a frame: motion is taken
+    // over at least 8 ms, reads in between give the last deflection.
+    let due = g.0.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(8));
+    if due {
+        let secs = g.0.map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f32()).clamp(1.0 / 240.0, 0.25);
+        let (dx, dy) = (MOUSE_DX.swap(0, Relaxed) as f32, MOUSE_DY.swap(0, Relaxed) as f32);
+        let full = FULL_SPEED / l.sensitivity;
+        let dy = if l.invert_y { -dy } else { dy };
+        *g = (Some(now), (dx / secs / full).clamp(-1.0, 1.0), (dy / secs / full).clamp(-1.0, 1.0));
+    }
+    // Radially, as the title removes the dead zone.
+    let m = (g.1 * g.1 + g.2 * g.2).sqrt();
+    if m > 1e-3 {
+        let r = STICK_DEAD + (1.0 - STICK_DEAD) * m.min(1.0);
+        let to_axis = |d: f32| (128.0 + d / m * r * 127.0).round().clamp(0.0, 255.0) as u8;
+        st.rx = to_axis(g.1);
+        st.ry = to_axis(g.2);
+    }
+}
+
+/// Left-stick tilt while `walk` is held.
+const WALK_TILT: f32 = 0.4;
+
+fn keyboard_mouse(st: &mut PadState) {
+    let l = layout();
+    let mods = held_mods();
+    // Stick directions held: left x-, x+, y-, y+, right x-, x+, y-, y+.
+    let mut dirs = [false; 8];
+    let mut walk = false;
+    for b in &l.binds {
+        if b.mods & !mods != 0 || !held(b.src) || !applying(l, b.src, mods).any(|x| x == b) {
+            continue;
+        }
+        match b.dst {
+            Dst::Button(x) => st.buttons |= x,
+            Dst::Walk => walk = true,
+            Dst::Stick(s) => {
+                dirs[match s {
+                    Stick::LLeft => 0,
+                    Stick::LRight => 1,
+                    Stick::LUp => 2,
+                    Stick::LDown => 3,
+                    Stick::RLeft => 4,
+                    Stick::RRight => 5,
+                    Stick::RUp => 6,
+                    Stick::RDown => 7,
+                }] = true
+            }
+        }
+    }
+    let stick = |neg: bool, pos: bool, cur: u8| -> u8 {
+        match (neg, pos) {
             (true, false) => 0,
             (false, true) => 255,
             _ => cur,
         }
     };
-    st.lx = stick(b'A', b'D', st.lx);
-    st.ly = stick(b'W', b'S', st.ly);
-    st.rx = stick(b'J', b'L', st.rx);
-    st.ry = stick(b'I', b'K', st.ry);
+    st.lx = stick(dirs[0], dirs[1], st.lx);
+    st.ly = stick(dirs[2], dirs[3], st.ly);
+    st.rx = stick(dirs[4], dirs[5], st.rx);
+    st.ry = stick(dirs[6], dirs[7], st.ry);
+    if walk {
+        let tilt = |v: u8| (128.0 + (v as f32 - 128.0) * WALK_TILT).round() as u8;
+        st.lx = tilt(st.lx);
+        st.ly = tilt(st.ly);
+    }
+    wheel_taps(st, l, mods);
+    mouse_look(st, l);
 }
 
 /// Current combined pad state.
 pub fn pad_state() -> PadState {
     let mut st = PadState::default();
     xinput(&mut st);
-    keyboard(&mut st);
+    keyboard_mouse(&mut st);
     scripted(&mut st, crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
     if st.l2 > 30 {
         st.buttons |= BTN_L2;
@@ -345,5 +770,39 @@ mod tests {
         assert_eq!(s[1].hold, 3);
         assert!(parse_script("700:jump").is_err());
         assert!(parse_script("x:cross").is_err());
+    }
+
+    #[test]
+    fn default_layout_parses() {
+        let l = parse_layout(DEFAULT_LAYOUT).unwrap();
+        assert!(l.mouse_look && !l.invert_y && l.sensitivity == 1.0);
+        let find = |src: Src, mods: u8| l.binds.iter().find(|b| b.src == src && b.mods == mods).map(|b| b.dst);
+        assert_eq!(find(Src::Mouse(0), 0), Some(Dst::Button(BTN_R1)));
+        assert_eq!(find(Src::Mouse(0), MOD_SHIFT), Some(Dst::Button(BTN_R2)));
+        assert_eq!(find(Src::Key(0x20), 0), Some(Dst::Button(BTN_CIRCLE)));
+        assert_eq!(find(Src::Key(0xA4), 0), Some(Dst::Walk));
+        assert_eq!(find(Src::Key(0x1B), 0), Some(Dst::Button(BTN_OPTIONS)));
+        assert_eq!(find(Src::Key(b'W'), 0), Some(Dst::Stick(Stick::LUp)));
+        assert_eq!(find(Src::WheelDown, MOD_SHIFT), Some(Dst::Button(BTN_LEFT)));
+    }
+
+    #[test]
+    fn modified_binding_wins() {
+        let l = parse_layout("Mouse1 = r1\nShift+Mouse1 = r2\nCtrl+Shift+Mouse1 = l3\n").unwrap();
+        let got = |held: u8| applying(&l, Src::Mouse(0), held).map(|b| b.dst).collect::<Vec<_>>();
+        assert_eq!(got(0), vec![Dst::Button(BTN_R1)]);
+        assert_eq!(got(MOD_SHIFT), vec![Dst::Button(BTN_R2)]);
+        assert_eq!(got(MOD_SHIFT | MOD_CTRL), vec![Dst::Button(BTN_L3)]);
+        assert_eq!(got(MOD_CTRL), vec![Dst::Button(BTN_R1)]);
+    }
+
+    #[test]
+    fn layout_errors_name_the_line() {
+        assert!(parse_layout("W = jump").unwrap_err().contains("line 1"));
+        assert!(parse_layout("\nHyper+W = ls_up").unwrap_err().contains("line 2"));
+        assert!(parse_layout("mouse_sensitivity = -1").is_err());
+        assert_eq!(key_code("f12"), Some(0x7B));
+        assert_eq!(key_code("LAlt"), Some(0xA4));
+        assert_eq!(parse_src("shift+wheelup"), Some((Src::WheelUp, MOD_SHIFT)));
     }
 }
