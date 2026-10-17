@@ -73,6 +73,23 @@ const GFX_PRESENT: usize = 15;
 const GFX_FAILED: usize = 16;
 static STATS: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
 
+/// Compute programs whose pipeline was created or found present, and
+/// scanned draws (stage addresses, baked-state registers' hash) likewise:
+/// scans skip them before their per-scan limit (it filled with programs
+/// compiled already and dropped the new ones further on).
+static KNOWN: Mutex<Option<(std::collections::HashSet<u64>, std::collections::HashSet<(u64, u64, u64)>)>> = Mutex::new(None);
+
+/// A compute program has a pipeline now (`exec`).
+pub fn note_program(addr: u64) {
+    KNOWN.lock().get_or_insert_with(Default::default).0.insert(addr);
+}
+
+/// A draw's pipeline exists now: its stages' addresses and baked-state
+/// registers (`exec::draw`).
+pub fn note_draw(vs: u64, ps: u64, g: &super::exec::GfxRegs) {
+    KNOWN.lock().get_or_insert_with(Default::default).1.insert((vs, ps, g.hash64()));
+}
+
 /// Most compute programs one scan hands over (16 lost the gain: a level's
 /// first frames meet hundreds of programs; of those compiled ahead with 64,
 /// 93% were used, run 20261016-214851).
@@ -204,7 +221,11 @@ fn run_draw(vs: &Slot, ps: Option<&Slot>, g: &super::exec::GfxRegs) {
         return;
     }
     let t = std::time::Instant::now();
-    match super::exec::precompile_gfx(g, &v, p.as_ref()) {
+    let r = super::exec::precompile_gfx(g, &v, p.as_ref());
+    if r.is_some() {
+        note_draw(v.addr, p.as_ref().map_or(0, |p| p.addr), g);
+    }
+    match r {
         Some(true) => {
             STATS[GFX_COMPILED].fetch_add(1, Ordering::Relaxed);
             STATS[GFX_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -220,7 +241,11 @@ fn run_draw(vs: &Slot, ps: Option<&Slot>, g: &super::exec::GfxRegs) {
 
 fn compile(p: &Prepared) {
     let t = std::time::Instant::now();
-    match super::exec::precompile(p) {
+    let r = super::exec::precompile(p);
+    if r.is_some() {
+        note_program(p.addr);
+    }
+    match r {
         Some(true) => {
             STATS[COMPILED].fetch_add(1, Ordering::Relaxed);
             STATS[COMPILE_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -242,9 +267,10 @@ pub fn submit(slots: Vec<Arc<Slot>>, draws: Vec<(Arc<Slot>, Option<Arc<Slot>>, s
     STATS[SCAN_NS].fetch_add(ns, Ordering::Relaxed);
     let mut draw_jobs: Vec<Job> = Vec::new();
     let mut seen_draws: Vec<(u64, u64, super::exec::GfxRegs)> = Vec::new();
+    let known = KNOWN.lock().clone().unwrap_or_default();
     for (vs, ps, g) in draws {
         let (va, pa) = (shaders::ngg_addr_of(vs.regs()), ps.as_ref().map_or(0, |p| shaders::ps_addr_of(p.regs())));
-        if va == 0 || seen_draws.iter().any(|&(a, b, ref o)| a == va && b == pa && o.same(&g)) {
+        if va == 0 || seen_draws.iter().any(|&(a, b, ref o)| a == va && b == pa && o.same(&g)) || known.1.contains(&(va, pa, g.hash64())) {
             continue;
         }
         seen_draws.push((va, pa, g));
@@ -263,7 +289,7 @@ pub fn submit(slots: Vec<Arc<Slot>>, draws: Vec<(Arc<Slot>, Option<Arc<Slot>>, s
         let r = s.regs();
         let addr = ((r.sh(0x20C) as u64) | ((r.sh(0x20D) as u64 & 0xFF) << 32)) << 8;
         let k = (addr, s.wave64());
-        if addr == 0 || seen.contains(&k) {
+        if addr == 0 || seen.contains(&k) || known.0.contains(&addr) {
             continue;
         }
         seen.push(k);
@@ -310,6 +336,9 @@ pub fn submit_prepared(p: Prepared) {
 /// Scans at first uses by why they ended (`ahead::END_*` or an opcode:
 /// buffer end, the command limit, another packet) and the commands found.
 static SCAN_ENDS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Those ended by another packet, by `why` (an opcode, 0x100 + a private
+/// operation, or another `ahead::END_*`).
+static SCAN_STOPS: [AtomicU64; 0x140] = [const { AtomicU64::new(0) }; 0x140];
 
 /// A scan at a first use ended for `why` after finding `n` commands.
 pub fn note_scan_end(why: usize, n: usize) {
@@ -318,6 +347,9 @@ pub fn note_scan_end(why: usize, n: usize) {
         super::ahead::END_MAX => 1,
         _ => 2,
     };
+    if k == 2 {
+        SCAN_STOPS[why.min(0x13F)].fetch_add(1, Ordering::Relaxed);
+    }
     SCAN_ENDS[k].fetch_add(1, Ordering::Relaxed);
     SCAN_ENDS[3].fetch_add(n as u64, Ordering::Relaxed);
 }
@@ -329,6 +361,10 @@ pub fn status() -> String {
         return String::new();
     }
     let (waits, wait_ns, dups) = super::exec::inflight_stats();
+    let mut stops: Vec<(usize, u64)> = SCAN_STOPS.iter().enumerate().map(|(k, c)| (k, c.load(Ordering::Relaxed))).filter(|x| x.1 > 0).collect();
+    stops.sort_by(|a, b| b.1.cmp(&a.1));
+    let stops: Vec<String> = stops.iter().take(6).map(|(k, n)| format!("{k:#x} {n}")).collect();
+    let stops = if stops.is_empty() { String::new() } else { format!(" (by {})", stops.join(", ")) };
     let gfx = if s[DRAWS] > 0 {
         format!(
             "; graphics: {} draws handed over ({} over the per-scan limit), {} prepared, {} pipelines created ({} ms of compiles), {} present already, {} failed, not prepared or recording nothing",
@@ -338,7 +374,7 @@ pub fn status() -> String {
         String::new()
     };
     format!(
-        "    pipelines compiled ahead: {} scans at first uses ({} ms; ended by their buffer's end {}, the command limit {}, another packet {}; {} commands found), {} programs handed to {} workers ({} over the per-scan limit) and {} stages prepared at label waits, {} prepared, {} pipelines created ({} ms of compiles), {} present already, {} failed or not prepared; command processors waited {} times for a pipeline in flight ({} ms), {} compiles of one pipeline avoided{gfx}\n",
+        "    pipelines compiled ahead: {} scans at first uses ({} ms; ended by their buffer's end {}, the command limit {}, another packet {}{stops}; {} commands found), {} programs handed to {} workers ({} over the per-scan limit) and {} stages prepared at label waits, {} prepared, {} pipelines created ({} ms of compiles), {} present already, {} failed or not prepared; command processors waited {} times for a pipeline in flight ({} ms), {} compiles of one pipeline avoided{gfx}\n",
         s[SCANS],
         s[SCAN_NS] / 1_000_000,
         SCAN_ENDS[0].load(Ordering::Relaxed),

@@ -330,7 +330,7 @@ fn hash_gfx_key(key: &GfxKey) -> u64 {
 /// The registers a draw's baked pipeline state is made of, as a scan of the
 /// commands ahead saw them (`gfx_key_ahead`): context registers and the
 /// primitive type (a uconfig register).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct GfxRegs {
     cb_color_control: u32,
     clip: u32,
@@ -373,6 +373,12 @@ impl GfxRegs {
     /// (one compile ahead per such pair of stages and state).
     pub(crate) fn same(&self, o: &GfxRegs) -> bool {
         self == o
+    }
+
+    pub(crate) fn hash64(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut h);
+        h.finish()
     }
 }
 
@@ -1132,6 +1138,9 @@ impl Exec {
                 }
                 let created = std::cell::Cell::new(false);
                 let p = gfx_pipe_with(&key, hkey, &vs, ps.as_ref(), push_mode, &created)?;
+                if crate::gpu::compile::gfx_at_first_uses() {
+                    crate::gpu::compile::note_draw(vs.addr, ps_addr, &GfxRegs::capture(&|r| ctx_reg(cp, r), cp.reg(Space::Uc, 0x242)));
+                }
                 if compile_trace() {
                     crate::info!("first use: vs {:#x} ps {ps_addr:#x} key {hkey:#x} after {} ms{}", vs.addr, t.elapsed().as_millis(), if created.get() { "" } else { " (made by another thread)" });
                 }

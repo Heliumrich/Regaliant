@@ -983,6 +983,7 @@ fn compute_pipe_create(p: &Prepared, push_mode: bool, key: u64, created: &std::c
     created.set(true);
     let t0 = std::time::Instant::now();
     let pipe = compute_pipeline(&p.tr.out, push_mode, Some(key))?;
+    super::compile::note_program(p.addr);
     PIPES_CREATED[0].fetch_add(1, Ordering::Relaxed);
     PIPES_NS[0].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     if pipe.push {
