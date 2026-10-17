@@ -216,8 +216,7 @@ pub fn remap_status() -> String {
         String::new()
     };
     format!(
-        "    direct memory remaps: {} in place ({} MiB, zeroed here), {} of pages last mapped elsewhere ({} MiB, contents not carried); mapping changes {}; readable-range checks {} ({} cache misses); decommits deferred under GPU imports {} ({} MiB; {} done later, {} mapped again first, {} waiting)
-",
+        "    direct memory remaps: {} in place ({} MiB, zeroed here), {} of pages last mapped elsewhere ({} MiB, contents not carried); mapping changes {}; readable-range checks {} ({} cache misses); decommits deferred under GPU imports {} ({} MiB; {} done later, {} mapped again first, {} waiting)\n",
         r.in_place,
         r.in_place_bytes >> 20,
         r.moved,

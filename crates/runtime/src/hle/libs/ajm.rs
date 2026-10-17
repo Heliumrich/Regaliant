@@ -439,8 +439,7 @@ static STATS: Stats = Stats {
 /// Decode statistics for status reports.
 pub fn status() -> String {
     format!(
-        "    ajm: {} run job(s), {} frame(s) decoded, {} PCM bytes, {} with errors (last result {:#x})
-",
+        "    ajm: {} run job(s), {} frame(s) decoded, {} PCM bytes, {} with errors (last result {:#x})\n",
         STATS.jobs.load(Ordering::Relaxed),
         STATS.frames.load(Ordering::Relaxed),
         STATS.bytes.load(Ordering::Relaxed),

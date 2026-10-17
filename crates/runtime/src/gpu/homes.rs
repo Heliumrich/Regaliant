@@ -177,6 +177,10 @@ const SHADOW_WRITES_MAX: usize = 256;
 pub static CPU_WRITTEN_PAGES: AtomicU64 = AtomicU64::new(0);
 pub static EDGE_PAGES: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_CHECKS: AtomicU64 = AtomicU64::new(0);
+/// Nanoseconds the checks took (~130 us each over whole homes, mostly the
+/// write-watch query: a watcher thread starting them when epochs end saved
+/// nothing, 2026-10-17).
+pub static WATCH_NS: AtomicU64 = AtomicU64::new(0);
 /// Frames an argument buffer is watched for CPU writes before its home.
 const OBSERVE_FRAMES: u64 = 120;
 /// Argument buffers watched before their home: (base, size, first frame);
@@ -390,6 +394,12 @@ pub fn note_large_write(base: u64, size: u64) {
 /// wrote there and was not written back yet is lost: logged).
 fn check_cpu_writes(h: &mut Home) {
     WATCH_CHECKS.fetch_add(1, Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
+    check_cpu_writes_inner(h);
+    WATCH_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+fn check_cpu_writes_inner(h: &mut Home) {
     let mut pages = Vec::new();
     let (base, end) = (h.base, h.base + h.size);
     let taken = super::precache::take_written_for(base, h.size, &mut pages, None);
@@ -841,7 +851,7 @@ pub fn take_all() -> Vec<(u64, u64, Arc<HomeBuf>, u64)> {
 
 pub fn status() -> String {
     format!(
-        "    video-memory homes: {} created, {} dropped, {} MiB; {} bindings, {} bytes copied in, {} write-backs ({} KiB), {} partial overlaps, {} unbounded pointer bindings over homes ({} based inside one, {} with GPU-written parts not yet in guest memory within 4 KiB of their base, {} written back first), {} image uploads over GPU-written home data not in guest memory ({} reloads of overwritten images written back first); write-watched: {} checks, {} bytes the CPU changed ({} of them by guest code in homes watched for `homes_watch`), {} written pages covered in part\n",
+        "    video-memory homes: {} created, {} dropped, {} MiB; {} bindings, {} bytes copied in, {} write-backs ({} KiB), {} partial overlaps, {} unbounded pointer bindings over homes ({} based inside one, {} with GPU-written parts not yet in guest memory within 4 KiB of their base, {} written back first), {} image uploads over GPU-written home data not in guest memory ({} reloads of overwritten images written back first); write-watched: {} checks ({} ms), {} bytes the CPU changed ({} of them by guest code in homes watched for `homes_watch`), {} written pages covered in part\n",
         CREATED.load(Ordering::Relaxed),
         DROPPED.load(Ordering::Relaxed),
         USED.load(Ordering::Relaxed) >> 20,
@@ -857,6 +867,7 @@ pub fn status() -> String {
         IMAGE_STALE[0].load(Ordering::Relaxed),
         IMAGE_STALE[1].load(Ordering::Relaxed),
         WATCH_CHECKS.load(Ordering::Relaxed),
+        WATCH_NS.load(Ordering::Relaxed) / 1_000_000,
         CPU_WRITTEN_PAGES.load(Ordering::Relaxed),
         GUEST_CHANGED.load(Ordering::Relaxed),
         EDGE_PAGES.load(Ordering::Relaxed)

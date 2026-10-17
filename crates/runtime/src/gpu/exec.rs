@@ -190,10 +190,11 @@ fn sync_why_status() -> String {
         PUSHED[0].load(Ordering::Relaxed),
         PUSHED[1].load(Ordering::Relaxed)
     ) + &format!(
-        "    first uses on the command processors: {} compute pipelines missing at their dispatch ({} ms creating or waiting for them), graphics pipelines created there as above
-",
+        "    first uses on the command processors: {} compute pipelines missing at their dispatch ({} ms creating or waiting for them); graphics pipelines are created there (above), {} of them ({} ms) for a shader pair seen before with other render state\n",
         FIRST_USES[0].load(Ordering::Relaxed),
-        FIRST_USES[1].load(Ordering::Relaxed) / 1_000_000
+        FIRST_USES[1].load(Ordering::Relaxed) / 1_000_000,
+        draw::GFX_REPEAT_PAIRS[0].load(Ordering::Relaxed),
+        draw::GFX_REPEAT_PAIRS[1].load(Ordering::Relaxed) / 1_000_000
     )
 }
 
@@ -708,8 +709,7 @@ pub(super) fn import_sites_line() -> String {
     let mut v: Vec<(&(&str, u32), &(u64, u64))> = m.iter().collect();
     v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
     let list: Vec<String> = v.iter().take(10).map(|((f, l), (n, b))| format!("{}:{l} {n} ({} MiB)", f.rsplit(['/', '\\']).next().unwrap_or(f), b >> 20)).collect();
-    format!("    imports made with residency on, by site: {}
-", list.join(", "))
+    format!("    imports made with residency on, by site: {}\n", list.join(", "))
 }
 
 /// Imported buffer covering guest [base, base+size): (buffer, window start, window end).
@@ -3880,8 +3880,7 @@ fn place_lines() -> String {
                 format!("{name} {:.0}: {:.1} us ({:.1}/{:.1}/{:.1}/{:.1})", n, us(3), us(0), us(1) - us(0), us(2) - us(1), us(3) - us(2))
             })
             .collect();
-        s.push_str(&format!("    {who}: draws and dispatches by place in their batch (count: us each (prepare/textures and pipeline/bindings/recording)): {}
-", parts.join(", ")));
+        s.push_str(&format!("    {who}: draws and dispatches by place in their batch (count: us each (prepare/textures and pipeline/bindings/recording)): {}\n", parts.join(", ")));
     }
     s
 }
@@ -8932,8 +8931,7 @@ pub fn status() -> String {
             SHADOWS_SHARED[4].load(Ordering::Relaxed)
         )
         + &format!(
-            "    images: {} block-compressed refreshes from GPU-written views ({} with the mip tail from the tail block's view), {} storage bindings one view per mip level, {} draws without attachments
-",
+            "    images: {} block-compressed refreshes from GPU-written views ({} with the mip tail from the tail block's view), {} storage bindings one view per mip level, {} draws without attachments\n",
             BLOCK_COPIES.load(Ordering::Relaxed),
             BLOCK_TAIL_COPIES.load(Ordering::Relaxed),
             MIP_VIEW_BINDINGS.load(Ordering::Relaxed),

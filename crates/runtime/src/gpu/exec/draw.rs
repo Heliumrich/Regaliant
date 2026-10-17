@@ -333,6 +333,12 @@ fn set_layout_bindings(stages: &[(&Prepared, vk::ShaderStageFlags)]) -> Vec<vk::
 /// Creates a graphics pipeline for dynamic rendering (`push_mode`: a push
 /// descriptor layout if it fits, `push_layout`), through the pipeline cache
 /// file of `hkey`.
+/// Shader pairs graphics pipelines were created for (`GFX_REPEAT_PAIRS`).
+static GFX_PAIRS: parking_lot::Mutex<std::collections::BTreeSet<(u64, u64, Option<u32>, bool)>> = parking_lot::Mutex::new(std::collections::BTreeSet::new());
+/// Graphics pipelines created for a shader pair already seen with other
+/// render state, and their nanoseconds (status).
+pub static GFX_REPEAT_PAIRS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Render area of instances without attachments (`tune attachless_draws`).
 const ATTACHLESS_AREA: u32 = 16384;
 /// Draws recorded without attachments (status).
@@ -851,6 +857,13 @@ impl Exec {
                 let p = graphics_pipeline(&key, hkey, &vs, ps.as_ref(), push_mode)?;
                 super::PIPES_CREATED[1].fetch_add(1, Ordering::Relaxed);
                 super::PIPES_NS[1].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                // Pipelines whose shader pair an earlier pipeline had (other
+                // render state only: what pipeline libraries would link
+                // without compiling the shaders again).
+                if !GFX_PAIRS.lock().insert((key.vs, key.ps, key.rect_gs, key.depth_clamp)) {
+                    GFX_REPEAT_PAIRS[0].fetch_add(1, Ordering::Relaxed);
+                    GFX_REPEAT_PAIRS[1].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
                 if p.push {
                     super::PIPES_PUSH[1].fetch_add(1, Ordering::Relaxed);
                 }
