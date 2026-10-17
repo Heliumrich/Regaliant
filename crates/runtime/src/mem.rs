@@ -557,17 +557,80 @@ pub fn write_watch_state() -> String {
 pub static WRITE_WATCH_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 /// Takes that the probe query found clean (`tune ww_probe`).
 pub static PROBE_CLEAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// `take_written` by caller (`WW_WHO_NAMES`) and by size (log2 of the 4 KiB
+/// pages, the last bucket 2^20 and more): [calls, ns, found clean by the
+/// probe] (profile windows).
+pub static WW_BY_WHO: [[std::sync::atomic::AtomicU64; 3]; 8] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 8];
+pub static WW_BY_SIZE: [[std::sync::atomic::AtomicU64; 3]; 21] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 21];
+pub const WW_WHO_NAMES: [&str; 8] = ["copy-cache checks", "copy-cache inserts", "homes watch", "texture scrubbing", "texture re-uploads", "homes candidates", "shadow windows", "other"];
+
+/// Queries in flight (`InFlight`), and the calls and ns by how many other
+/// queries were in flight when each began (0..7, 8 or more).
+static WW_INFLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static WW_BY_CONC: [[std::sync::atomic::AtomicU64; 3]; 9] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 9];
+
+/// A query in flight (counted while it lives); `others`: those in flight
+/// when it began.
+struct InFlight {
+    others: u64,
+}
+
+impl InFlight {
+    fn new() -> InFlight {
+        InFlight { others: WW_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        WW_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn ww_note(who: usize, pages: u64, ns: u64, clean: bool, others: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let b = (64 - pages.max(1).leading_zeros() as usize - 1).min(20);
+    for s in [&WW_BY_WHO[who.min(7)], &WW_BY_SIZE[b], &WW_BY_CONC[(others as usize).min(8)]] {
+        s[0].fetch_add(1, Relaxed);
+        s[1].fetch_add(ns, Relaxed);
+        s[2].fetch_add(clean as u64, Relaxed);
+    }
+}
+
+/// The breakdown of `take_written` since the last profile reset.
+pub fn ww_lines() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let f = |s: &[std::sync::atomic::AtomicU64; 3]| {
+        let n = s[0].load(Relaxed);
+        format!("{n} ({:.1} us, {} clean)", s[1].load(Relaxed) as f64 / n.max(1) as f64 / 1000.0, s[2].load(Relaxed))
+    };
+    let who: Vec<String> = WW_WHO_NAMES.iter().zip(WW_BY_WHO.iter()).filter(|(_, s)| s[0].load(Relaxed) > 0).map(|(n, s)| format!("{n} {}", f(s))).collect();
+    let size: Vec<String> = WW_BY_SIZE.iter().enumerate().filter(|(_, s)| s[0].load(Relaxed) > 0).map(|(k, s)| format!("{}+ {}", 1u64 << k, f(s))).collect();
+    let conc: Vec<String> = WW_BY_CONC.iter().enumerate().filter(|(_, s)| s[0].load(Relaxed) > 0).map(|(k, s)| format!("{k}{} {}", if k == 8 { "+" } else { "" }, f(s))).collect();
+    format!("    write-watch queries by caller: {}\n    by pages: {}\n    by other queries in flight when one began: {}\n", who.join(", "), size.join(", "), conc.join(", "))
+}
+
+pub fn ww_reset() {
+    use std::sync::atomic::Ordering::Relaxed;
+    for c in WW_BY_WHO.iter().chain(WW_BY_SIZE.iter()).chain(WW_BY_CONC.iter()).flatten() {
+        c.store(0, Relaxed);
+    }
+}
 
 /// The 4 KiB pages of guest [base, base+size) the CPU wrote since they were
 /// last taken (their write marks are reset), into `out` (page addresses);
 /// None without write watching or when the query fails (treat as written).
-pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
+/// `who`: the caller (`WW_WHO_NAMES`; statistics).
+pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>, who: usize) -> Option<()> {
     use std::sync::atomic::Ordering::Relaxed;
     if crate::sections::on() {
+        let inflight = InFlight::new();
         let t = std::time::Instant::now();
         let r = crate::gpu::resident::take_written(base, size, out);
+        let ns = t.elapsed().as_nanos() as u64;
+        ww_note(who, size.div_ceil(4096), ns, out.is_empty(), inflight.others);
         WRITE_WATCH_STATS[0].fetch_add(1, Relaxed);
-        WRITE_WATCH_STATS[1].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        WRITE_WATCH_STATS[1].fetch_add(ns, Relaxed);
         WRITE_WATCH_STATS[2].fetch_add(out.len() as u64, Relaxed);
         return r;
     }
@@ -575,6 +638,7 @@ pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
         return None;
     }
     let (lo, hi) = (base & !4095, (base + size).next_multiple_of(4096));
+    let inflight = InFlight::new();
     let t = std::time::Instant::now();
     let mut addrs = [std::ptr::null_mut::<std::ffi::c_void>(); 256];
     let mut at = lo;
@@ -585,8 +649,10 @@ pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
         let mut gran = 0u32;
         let r = unsafe { GetWriteWatch(0, lo as _, (hi - lo) as usize, addrs.as_mut_ptr(), &mut count, &mut gran) };
         if r == 0 && count == 0 {
+            let ns = t.elapsed().as_nanos() as u64;
+            ww_note(who, (hi - lo) / 4096, ns, true, inflight.others);
             WRITE_WATCH_STATS[0].fetch_add(1, Relaxed);
-            WRITE_WATCH_STATS[1].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            WRITE_WATCH_STATS[1].fetch_add(ns, Relaxed);
             PROBE_CLEAN.fetch_add(1, Relaxed);
             return Some(());
         }
@@ -608,8 +674,10 @@ pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
         // More than fit: continue after the last page reported.
         at = addrs[count - 1] as u64 + 4096;
     }
+    let ns = t.elapsed().as_nanos() as u64;
+    ww_note(who, (hi - lo) / 4096, ns, false, inflight.others);
     WRITE_WATCH_STATS[0].fetch_add(1, Relaxed);
-    WRITE_WATCH_STATS[1].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+    WRITE_WATCH_STATS[1].fetch_add(ns, Relaxed);
     WRITE_WATCH_STATS[2].fetch_add(out.len() as u64, Relaxed);
     Some(())
 }

@@ -239,6 +239,8 @@ pub struct Cp {
     /// open promise of this queue, a latched CP write): no CPU write
     /// released it, so it ends no copy-cache epoch (`tune epoch_gpu_waits`).
     last_wait_gpu: bool,
+    /// How the last WAIT_REG_MEM passed (its `label_event` kind; diagnostics).
+    last_wait_kind: u8,
     /// The end of the last run the planner found too short (no new plan
     /// until execution passes it: each command would scan the rest again).
     par_skip: (u64, u64),
@@ -373,6 +375,8 @@ fn is_state(op: u32) -> bool {
 struct AheadCmd {
     at: u64,
     stages: [Option<Arc<super::ahead::Slot>>; 2],
+    /// A draw's baked pipeline state registers (scans for compiles ahead).
+    gfx: Option<Box<super::exec::GfxRegs>>,
 }
 
 /// Commands per scan ahead (a bound on work wasted when execution takes
@@ -508,7 +512,8 @@ fn compare(func: u32, value: u64, reference: u64) -> bool {
 
 /// Last GPU write to each label-sized address: (queue, value, packet address)
 /// for wait diagnostics.
-static LAST_WRITE: parking_lot::Mutex<Option<std::collections::HashMap<u64, (String, u64, u64)>>> = parking_lot::Mutex::new(None);
+/// (and the exact address written: two 4-byte labels share a slot).
+static LAST_WRITE: parking_lot::Mutex<Option<std::collections::HashMap<u64, (String, u64, u64, u64)>>> = parking_lot::Mutex::new(None);
 
 /// Recent CP writes to each polled label (time, value), newest last: a
 /// queue that reaches a WAIT_REG_MEM late still sees the writes made after
@@ -656,7 +661,7 @@ fn note_write(queue: &str, addr: u64, value: u64, at: u64) {
         if m.len() > 1 << 16 {
             m.clear();
         }
-        m.insert(addr & !7, (queue.to_string(), value, at));
+        m.insert(addr & !7, (queue.to_string(), value, at, addr));
     }
     latch_waits(addr & !7, 8);
     label_event(queue, b'W', addr, value, 0, at);
@@ -936,6 +941,7 @@ static WAIT_STATS: parking_lot::Mutex<Option<HashMap<(String, String), (u64, u64
 pub fn reset_wait_stats() {
     *WAIT_STATS.lock() = None;
     *EPOCH_WAITS.lock() = None;
+    *EPOCH_CLASSES.lock() = None;
     *LONG_WAITS.lock() = None;
     LONG_WAITS_LOGGED.store(0, Ordering::Relaxed);
 }
@@ -943,6 +949,9 @@ pub fn reset_wait_stats() {
 /// Waits the CPU released (new copy-cache epochs, DS_PROFILE_GPU): (queue,
 /// label, last CP write there) -> count.
 static EPOCH_WAITS: parking_lot::Mutex<Option<HashMap<(String, u64, String), u64>>> = parking_lot::Mutex::new(None);
+/// The same by (queue, how the wait passed (`Cp::last_wait_kind`), what the
+/// label held) -> (count, labels).
+static EPOCH_CLASSES: parking_lot::Mutex<Option<HashMap<(String, u8, &'static str), (u64, std::collections::HashSet<u64>)>>> = parking_lot::Mutex::new(None);
 
 fn epoch_wait_lines() -> String {
     let g = EPOCH_WAITS.lock();
@@ -953,6 +962,16 @@ fn epoch_wait_lines() -> String {
     let mut s = format!("    waits the CPU released (copy-cache epochs), {total} in all:\n");
     for ((q, a, by), n) in v.iter().take(12) {
         s.push_str(&format!("      {q} label {a:#x} ({by}): {n}\n"));
+    }
+    drop(g);
+    let g = EPOCH_CLASSES.lock();
+    if let Some(m) = g.as_ref() {
+        let mut v: Vec<_> = m.iter().collect();
+        v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        s.push_str("    the same by queue, how the wait passed (I at once, M a write seen since or a counter past it, E after polling, P/L on a GPU write) and what the label held:\n");
+        for ((q, k, what), (n, labels)) in v.iter().take(24) {
+            s.push_str(&format!("      {q} {} {what}: {n} ({} labels)\n", *k as char, labels.len()));
+        }
     }
     s
 }
@@ -1221,7 +1240,20 @@ pub fn last_write_info(addr: u64) -> Option<String> {
 }
 
 fn last_write(addr: u64) -> Option<(String, u64, u64)> {
+    LAST_WRITE.lock().as_ref()?.get(&(addr & !7)).map(|(q, v, pk, _)| (q.clone(), *v, *pk))
+}
+
+/// `last_write` with the exact address written.
+fn last_write_at(addr: u64) -> Option<(String, u64, u64, u64)> {
     LAST_WRITE.lock().as_ref()?.get(&(addr & !7)).cloned()
+}
+
+/// Whether a CP write to exactly `addr` recorded for the label (`LABEL_WRITES`)
+/// had value `v` (the low half for 4-byte labels).
+fn label_wrote(addr: u64, wide: bool, v: u64) -> bool {
+    let g = LABEL_WRITES.lock();
+    let Some(h) = g.as_ref().and_then(|m| m.get(&addr)) else { return false };
+    h.iter().any(|&(_, w)| if wide { w == v } else { w as u32 == v as u32 })
 }
 
 /// What the queue thread is doing (diagnostics).
@@ -1275,6 +1307,7 @@ impl Cp {
             chunk_costs: None,
             run_costs: HashMap::new(),
             last_wait_gpu: false,
+            last_wait_kind: b'-',
         }
     }
 
@@ -1427,6 +1460,17 @@ impl Cp {
         if !by_gpu {
             super::precache::end_scope(1);
             if super::exec::profiling_on() {
+                let what = match last_write_at(a) {
+                    None => "no CP write recorded",
+                    Some((q, _, _, at)) if !q.starts_with("gpu-") => if at == a { "last written by a non-GPU queue" } else { "last written by a non-GPU queue (other half)" },
+                    Some((_, _, _, at)) if !wide && at != a => if label_wrote(a, wide, now) { "a GPU queue's earlier value (slot's last write to the other half)" } else { "no GPU queue's value (slot's last write to the other half)" },
+                    Some(_) => if label_wrote(a, wide, now) { "a GPU queue's earlier value" } else { "no GPU queue's value" },
+                };
+                let mut g = EPOCH_CLASSES.lock();
+                let e = g.get_or_insert_with(HashMap::new).entry((self.name.clone(), self.last_wait_kind, what)).or_default();
+                e.0 += 1;
+                e.1.insert(a);
+                drop(g);
                 let by = match last {
                     Some((q, v, _)) if (if wide { v == now } else { v as u32 == now as u32 }) => format!("written by {q}"),
                     Some((q, _, _)) => format!("{q} wrote another value"),
@@ -1926,9 +1970,19 @@ impl Cp {
         let Some((base, from, end)) = self.compile_ctx.take() else { return };
         // Read in place (the scan does not copy the buffer).
         let f = Fetched { base, words: Vec::new(), live: false };
-        let (cmds, _, ns) = self.scan_commands(&f, from, end, true);
-        let slots: Vec<Arc<super::ahead::Slot>> = cmds.into_iter().filter_map(|c| c.stages.into_iter().next().flatten()).collect();
-        super::compile::submit(slots, ns);
+        let (cmds, why, ns) = self.scan_commands(&f, from, end, true);
+        super::compile::note_scan_end(why, cmds.len());
+        let mut slots: Vec<Arc<super::ahead::Slot>> = Vec::new();
+        let mut draws = Vec::new();
+        for c in cmds {
+            let [a, b] = c.stages;
+            match (c.gfx, a) {
+                (Some(g), Some(vs)) => draws.push((vs, b, *g)),
+                (None, Some(s)) => slots.push(s),
+                _ => {}
+            }
+        }
+        super::compile::submit(slots, draws, ns);
     }
 
     /// The scan of `scan_through` (`whole`: also through runs the parallel
@@ -1951,6 +2005,10 @@ impl Cp {
         ctx.extend_from_slice(&self.regs.ctx);
         let mut draw_base = self.draw_indirect_base;
         let mut cmds: Vec<AheadCmd> = Vec::new();
+        // Draws' baked pipeline state for compiles ahead (`whole` scans), and
+        // VGT_PRIMITIVE_TYPE as the scanned writes leave it.
+        let gfx_state = whole && super::compile::gfx_at_first_uses();
+        let mut prim = self.reg(Space::Uc, 0x242);
         // The synchronization-free run being scanned: its first command's
         // index and its commands.
         let (mut run_first, mut run_len) = (0usize, 0usize);
@@ -2003,6 +2061,7 @@ impl Cp {
                 }
             };
             let mut command: Option<[Option<super::shaders::StageRegs>; 2]> = None;
+            let mut gfx: Option<Box<super::exec::GfxRegs>> = None;
             let mut wave64 = true;
             let mut sync = false;
             match opcode {
@@ -2017,7 +2076,13 @@ impl Cp {
                 // GPU-side synchronization, CP writes and label waits:
                 // passed (they end synchronization-free runs).
                 op::EVENT_WRITE | op::ACQUIRE_MEM | op::RELEASE_MEM | op::WRITE_DATA | op::WAIT_REG_MEM | op::WAIT_REG_MEM64 => sync = true,
-                op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX | op::LOAD_UCONFIG_REG | op::INDEX_TYPE | op::INDEX_BASE | op::INDEX_BUFFER_SIZE | op::NUM_INSTANCES | op::CONTEXT_CONTROL => {}
+                op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX => {
+                    let first = p(0) & 0xFFFF;
+                    if first <= 0x242 && 0x242 < first + (n - 1) as u32 {
+                        prim = p(1 + (0x242 - first) as u64);
+                    }
+                }
+                op::LOAD_UCONFIG_REG | op::INDEX_TYPE | op::INDEX_BASE | op::INDEX_BUFFER_SIZE | op::NUM_INSTANCES | op::CONTEXT_CONTROL => {}
                 op::SET_CONTEXT_REG | op::SET_CONTEXT_REG_INDEX => set(&mut ctx, p(0) & 0xFFFF),
                 op::SET_SH_REG | op::SET_SH_REG_INDEX => set(&mut sh, p(0) & 0xFFFF),
                 op::LOAD_CONTEXT_REG_INDEX | op::LOAD_SH_REG_INDEX => {
@@ -2071,6 +2136,10 @@ impl Cp {
                     }
                     let view = ScanRegs { sh: &sh, ctx: &ctx };
                     let ps = super::shaders::ps_addr_of(&view);
+                    if gfx_state {
+                        let c = &ctx;
+                        gfx = Some(Box::new(super::exec::GfxRegs::capture(&|r: u32| c.get(((r - 0x28000) / 4) as usize).copied().unwrap_or(0), prim)));
+                    }
                     command = Some([
                         Some(super::shaders::StageRegs::capture(super::shaders::StageKind::Vertex, &view)),
                         (ps != 0).then(|| super::shaders::StageRegs::capture(super::shaders::StageKind::Pixel, &view)),
@@ -2099,7 +2168,7 @@ impl Cp {
                 }
                 run_len += 1;
                 let stages = stages.map(|r| r.map(|r| super::ahead::Slot::new(r, wave64)));
-                cmds.push(AheadCmd { at, stages });
+                cmds.push(AheadCmd { at, stages, gfx });
             }
             cur = next;
         }
@@ -2325,7 +2394,7 @@ impl Cp {
             if let Some(stages) = command {
                 let stages = stages.map(|r| r.map(|r| super::ahead::Slot::new(r, wave64)));
                 slots.extend(stages.iter().flatten().cloned());
-                self.ahead.push_back(AheadCmd { at, stages });
+                self.ahead.push_back(AheadCmd { at, stages, gfx: None });
             }
             cur = next;
         }
@@ -2383,7 +2452,7 @@ impl Cp {
         if m.len() > 1 << 16 {
             m.clear();
         }
-        m.insert(a & !7, (self.name.clone(), label.map(|l| l.0).unwrap_or(data[0] as u64), self.cur_packet));
+        m.insert(a & !7, (self.name.clone(), label.map(|l| l.0).unwrap_or(data[0] as u64), self.cur_packet, a));
         true
     }
 
@@ -2988,9 +3057,10 @@ impl Cp {
             if matches!(opcode, op::WAIT_REG_MEM | op::WAIT_REG_MEM64) && !f.live && self.exec.is_some() && super::tune::wait_ahead_for(self.compute) {
                 self.wait_ctx = Some((f.clone(), next, end));
             }
-            // A dispatch whose pipeline turns out missing scans the commands
-            // after it for more first uses (`tune compile_ahead`).
-            if dispatch && !f.live && super::compile::at_first_uses() {
+            // A dispatch or draw whose pipeline turns out missing scans the
+            // commands after it for more first uses (`tune compile_ahead`,
+            // `compile_gfx`).
+            if command && !f.live && (if dispatch { super::compile::at_first_uses() } else { super::compile::gfx_at_first_uses() }) {
                 self.compile_ctx.set(Some((f.base, next, end)));
             }
             let flow = self.packet(opcode, h, cur, n, &p);
@@ -3751,8 +3821,10 @@ impl Cp {
         let read = move || if wide { unsafe { rd64(a) } } else { (unsafe { rd32(a) }) as u64 };
         WAITED.lock().get_or_insert_with(HashSet::new).insert(a & !7);
         self.last_wait_gpu = false;
+        self.last_wait_kind = b'-';
         let v0 = read();
         if compare(func, v0 & mask, reference & mask) {
+            self.last_wait_kind = b'I';
             label_event(&self.name, b'I', a, v0, reference, at);
             return Flow::Next;
         }
@@ -3760,6 +3832,7 @@ impl Cp {
             if let Some(e) = self.exec.as_mut() {
                 e.depend_on(seq, by_cpu);
                 PROMISED.fetch_add(1, Ordering::Relaxed);
+                self.last_wait_kind = b'P';
                 label_event(&self.name, b'P', a, v0, reference, at);
                 self.last_wait_gpu = true;
                 return Flow::Next;
@@ -3773,6 +3846,7 @@ impl Cp {
         // and every queue stopped).
         if self.submitted_at.is_some_and(|since| missed_write(a, wide, func, mask, reference, since)) {
             MISSED.fetch_add(1, Ordering::Relaxed);
+            self.last_wait_kind = b'M';
             label_event(&self.name, b'M', a, v0, reference, at);
             return Flow::Next;
         }
@@ -3787,6 +3861,7 @@ impl Cp {
                 if let Some(e) = self.exec.as_mut() {
                     e.order_after_open_writes();
                 }
+                self.last_wait_kind = b'P';
                 label_event(&self.name, b'P', a, v0, reference, at);
                 self.last_wait_gpu = true;
                 return Flow::Next;
@@ -3799,12 +3874,14 @@ impl Cp {
             if COUNTER_PASSED.fetch_add(1, Ordering::Relaxed) < 20 {
                 crate::info!("gpu[{}]: WAIT_REG_MEM at {at:#x} for [{a:#x}] == {reference:#x} passed: the counter is at {v0:#x}", self.name);
             }
+            self.last_wait_kind = b'M';
             label_event(&self.name, b'M', a, v0, reference, at);
             return Flow::Next;
         }
         // In a replayed frame, a wait the title's CPU released when the frame
         // ran passes (`gpu::replay`).
         if super::replay::pass_wait(at, a) {
+            self.last_wait_kind = b'M';
             label_event(&self.name, b'M', a, v0, reference, at);
             return Flow::Next;
         }
@@ -3902,6 +3979,7 @@ impl Cp {
                 kind = b'P';
             }
         }
+        self.last_wait_kind = kind;
         label_event(&self.name, kind, a, read(), reference, at);
         self.last_wait_gpu = kind == b'P' || kind == b'L';
         long_wait(&self.name, a, wide, func, mask, reference, at, t0, kind);

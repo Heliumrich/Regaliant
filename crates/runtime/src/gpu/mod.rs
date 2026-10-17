@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 124] = [
+    static ALL: [Tunable; 125] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -151,6 +151,7 @@ pub mod tune {
         Tunable { name: "mip_views", env: "DS_MIP_VIEWS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "compile_ahead", env: "DS_COMPILE_AHEAD", default: 4, value: AtomicU64::new(UNSET) },
         Tunable { name: "lane_guards", env: "DS_LANE_GUARDS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "compile_gfx", env: "DS_COMPILE_GFX", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1337,6 +1338,14 @@ pub mod tune {
         get(123) != 0
     }
 
+    /// Graphics pipelines compiled ahead of their first use like compute
+    /// ones (`gpu::compile`; needs `compile_ahead`): a draw whose pipeline
+    /// is missing scans the draws after it, whose pipelines the compile
+    /// workers create from the registers the scan saw.
+    #[inline]
+    pub fn compile_gfx() -> bool {
+        get(124) != 0
+    }
 
     /// A switch's value by name; None if unknown.
     pub fn value(name: &str) -> Option<u64> {
@@ -2024,6 +2033,8 @@ pub fn profile_report() -> String {
     s.push_str(&exec::pre_window_line());
     if !exec::profiling_on() {
         s.push_str(&shaders::prep_cache_line());
+        // (With DS_PROFILE_GPU=1 the shader profile has them.)
+        s.push_str(&crate::mem::ww_lines());
     }
     s.push_str(&exec::push_line());
     s.push_str(&crate::audio::window_line());

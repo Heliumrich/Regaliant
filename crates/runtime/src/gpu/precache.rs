@@ -253,6 +253,42 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// a range dropped before changes nothing (`Exec`'s write-note memo).
 pub static INSERT_GEN: AtomicU64 = AtomicU64::new(0);
 
+/// `DS_TRACE_PRECHECK=<from flip>+<n>`: the first n write-mark takes of
+/// lookups and inserts from that flip on, to prechecks.txt in the run
+/// directory (kind L/I, epoch, base, size, pages found, thread; diagnostics).
+static PRECHECK: Mutex<Option<(u64, u64, std::io::BufWriter<std::fs::File>)>> = Mutex::new(None);
+static PRECHECK_ON: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+
+fn trace_take(kind: char, epoch: u64, base: u64, size: u64, found: Option<usize>) {
+    let Some((from, n)) = *PRECHECK_ON.get_or_init(|| {
+        let v = std::env::var("DS_TRACE_PRECHECK").ok()?;
+        let (a, b) = v.split_once(['+', ','])?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    }) else {
+        return;
+    };
+    if super::FRAMES.load(Ordering::Relaxed) < from {
+        return;
+    }
+    use std::io::Write;
+    let mut g = PRECHECK.lock();
+    if g.is_none() {
+        let Some(dir) = crate::run_dir() else { return };
+        let Ok(f) = std::fs::File::create(dir.join("prechecks.txt")) else { return };
+        *g = Some((0, n, std::io::BufWriter::new(f)));
+    }
+    let Some((done, n, w)) = g.as_mut() else { return };
+    if *done >= *n {
+        return;
+    }
+    *done += 1;
+    let t = std::thread::current();
+    let _ = writeln!(w, "{kind} {epoch} {base:#x} {size:#x} {} {}", found.map_or(-1, |k| k as i64), t.name().unwrap_or("?"));
+    if *done == *n {
+        let _ = w.flush();
+    }
+}
+
 /// Statistics: [hits, copies, checks (epoch changed), dropped by CPU writes,
 /// dropped by GPU/CP/host writes and mapping changes, dropped by eviction,
 /// no space, failed checks, not kept (GPU-written lately), left to a batch
@@ -382,14 +418,22 @@ impl Cache {
 
     /// What a take of [base, base+size)'s write marks found (`r`, the pages
     /// `new`), applied: the pages date the watched windows they fall in (a
-    /// failed query dates those overlapping the range), and texture regions
-    /// on them other than `except` are told (`track::cpu_pages`: taking the
-    /// marks resets them).
-    fn apply_marks(&mut self, base: u64, size: u64, r: Option<()>, new: &[u64], except: Option<u32>) {
+    /// failed query dates those overlapping the range), texture regions on
+    /// them other than `except` are told (`track::cpu_pages`: taking the
+    /// marks resets them), and so are write-watched homes on them unless the
+    /// take is a home's own check (`homes`).
+    fn apply_marks(&mut self, base: u64, size: u64, r: Option<()>, new: &[u64], except: Option<u32>, homes: bool) {
         match r {
             Some(()) if !new.is_empty() => super::track::cpu_pages(new, except),
             Some(()) => {}
             None => super::track::cpu_range(base, size, except),
+        }
+        if homes {
+            match r {
+                Some(()) if !new.is_empty() => super::homes::marks_taken(Some(new), base, size),
+                Some(()) => {}
+                None => super::homes::marks_taken(None, base, size),
+            }
         }
         if self.watched.is_empty() {
             return;
@@ -612,24 +656,24 @@ fn lock() -> Guard {
 /// after (`Cache::apply_marks`, texture regions other than `except` told).
 /// Returns the lock, held, the query's result and the last take number
 /// given when it was applied (`wait_takes`).
-fn take_unlocked(base: u64, size: u64, out: &mut Vec<u64>, except: Option<u32>) -> (Guard, Option<()>, u64) {
+fn take_unlocked(base: u64, size: u64, out: &mut Vec<u64>, except: Option<u32>, who: usize) -> (Guard, Option<()>, u64) {
     if !super::tune::marks_unlocked() {
         // Under the lock: no take is ever in flight.
         let mut g = lock();
         let c = g.get_or_insert_with(Cache::default);
         let first = out.len();
-        let r = crate::mem::take_written(base, size, out);
-        c.apply_marks(base, size, r, &out[first..], except);
+        let r = crate::mem::take_written(base, size, out, who);
+        c.apply_marks(base, size, r, &out[first..], except, who != 2);
         let upto = c.take_seq;
         return (g, r, upto);
     }
     let token = lock().get_or_insert_with(Cache::default).begin_take(base, size);
     let first = out.len();
-    let r = crate::mem::take_written(base, size, out);
+    let r = crate::mem::take_written(base, size, out, who);
     let mut g = lock();
     let c = g.get_or_insert_with(Cache::default);
     c.takes.retain(|t| t.2 != token);
-    c.apply_marks(base, size, r, &out[first..], except);
+    c.apply_marks(base, size, r, &out[first..], except, who != 2);
     let upto = c.take_seq;
     (g, r, upto)
 }
@@ -676,7 +720,8 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     };
     STATS[2].fetch_add(1, Ordering::Relaxed);
     let mut pages = Vec::new();
-    let (mut g, r, upto) = take_unlocked(base, size, &mut pages, None);
+    let (mut g, r, upto) = take_unlocked(base, size, &mut pages, None, 0);
+    trace_take('L', epoch, base, size, r.map(|_| pages.len()));
     {
         let c = g.as_mut()?;
         match r {
@@ -745,7 +790,12 @@ pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     // later), other entries on those pages are stale. (A take in flight
     // over it from another thread can only drop the new entry later.)
     let mut pages = Vec::new();
-    let (mut g, r, _) = take_unlocked(base, size, &mut pages, None);
+    // Nothing to take when the epoch's block probes found the range clean.
+    // The epoch the copy is checked for: read before the take, which covers
+    // it (an epoch that ends meanwhile checks the copy again).
+    let ep = EPOCH.load(Ordering::Acquire);
+    let (mut g, r, _) = take_unlocked(base, size, &mut pages, None, 1);
+    trace_take('I', EPOCH.load(Ordering::Relaxed), base, size, r.map(|_| pages.len()));
     let c = g.get_or_insert_with(Cache::default);
     if r.is_none() {
         STATS[7].fetch_add(1, Ordering::Relaxed);
@@ -772,7 +822,7 @@ pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     c.remove((base, size));
     c.chunks[slot].live += 1;
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    c.entries.insert((base, size), Entry { chunk: chunk.clone(), offset, id, seq: 0, on_copy: false, checked: EPOCH.load(Ordering::Acquire), slot, made: std::time::Instant::now() });
+    c.entries.insert((base, size), Entry { chunk: chunk.clone(), offset, id, seq: 0, on_copy: false, checked: ep, slot, made: std::time::Instant::now() });
     INSERT_GEN.fetch_add(1, Ordering::Release);
     cover(base, size, true);
     c.by_base.entry(base).or_default().push(size);
@@ -811,9 +861,10 @@ pub fn submitted(made: &[(u64, u64, u64, bool)], seq: u64) {
 /// treat it all as written). The marks are taken under the cache's lock like
 /// its own takes: entries on those pages go, watched windows are dated, and
 /// texture regions on them other than `except` (the caller's) are told.
-pub fn take_written_for(base: u64, size: u64, out: &mut Vec<u64>, except: Option<u32>) -> Option<()> {
+/// `who`: the caller (`mem::WW_WHO_NAMES`; statistics).
+pub fn take_written_for(base: u64, size: u64, out: &mut Vec<u64>, except: Option<u32>, who: usize) -> Option<()> {
     let first = out.len();
-    let (mut g, r, upto) = take_unlocked(base, size, out, except);
+    let (mut g, r, upto) = take_unlocked(base, size, out, except, who);
     g.get_or_insert_with(Cache::default).dropped_by_take(base, size, r, &out[first..]);
     // Pages another take over the range reset are told to the texture
     // regions on them once it ends (as when it came first under one lock).
@@ -891,7 +942,7 @@ pub fn invalidate_ranges_except(writes: &super::ranges::Ranges, keep: &[u64]) {
 /// those writes) and the moment returned (`unwritten_since`).
 pub fn watch(base: u64, size: u64) -> u64 {
     let mut pages = Vec::new();
-    let (mut g, r, _) = take_unlocked(base, size, &mut pages, None);
+    let (mut g, r, _) = take_unlocked(base, size, &mut pages, None, 6);
     let c = g.get_or_insert_with(Cache::default);
     c.dropped_by_take(base, size, r, &pages);
     let (lo, hi) = (base & !4095, base.saturating_add(size).next_multiple_of(4096));
@@ -915,7 +966,7 @@ pub fn unwritten_since(base: u64, size: u64, since: u64) -> bool {
         return false;
     }
     let mut pages = Vec::new();
-    let (mut g, r, upto) = take_unlocked(base, size, &mut pages, None);
+    let (mut g, r, upto) = take_unlocked(base, size, &mut pages, None, 6);
     g.get_or_insert_with(Cache::default).dropped_by_take(base, size, r, &pages);
     let g = wait_takes(g, base, size, upto);
     let Some(c) = g.as_ref() else { return false };

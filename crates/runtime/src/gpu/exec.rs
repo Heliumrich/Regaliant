@@ -190,9 +190,13 @@ fn sync_why_status() -> String {
         PUSHED[0].load(Ordering::Relaxed),
         PUSHED[1].load(Ordering::Relaxed)
     ) + &format!(
-        "    first uses on the command processors: {} compute pipelines missing at their dispatch ({} ms creating or waiting for them); graphics pipelines are created there (above), {} of them ({} ms) for a shader pair seen before with other render state\n",
+        "    first uses on the command processors: {} compute pipelines missing at their dispatch ({} ms creating or waiting for them); {} graphics pipelines missing at their draw ({} ms; {} of them waited for one in flight, {} ms), {} created for a shader pair seen before with other render state ({} ms)\n",
         FIRST_USES[0].load(Ordering::Relaxed),
         FIRST_USES[1].load(Ordering::Relaxed) / 1_000_000,
+        draw::GFX_FIRST_USES[0].load(Ordering::Relaxed),
+        draw::GFX_FIRST_USES[1].load(Ordering::Relaxed) / 1_000_000,
+        draw::GFX_FLIGHT_WAITS[0].load(Ordering::Relaxed),
+        draw::GFX_FLIGHT_WAITS[1].load(Ordering::Relaxed) / 1_000_000,
         draw::GFX_REPEAT_PAIRS[0].load(Ordering::Relaxed),
         draw::GFX_REPEAT_PAIRS[1].load(Ordering::Relaxed) / 1_000_000
     )
@@ -885,6 +889,9 @@ pub(crate) fn compute_pipe_known(p: &Prepared) -> bool {
     let key = push_key(p.tr.key, push_fits(&[p]));
     PIPES.lock().as_ref().is_some_and(|m| m.contains_key(&key)) || PIPE_FLIGHTS.lock().as_ref().is_some_and(|m| m.contains_key(&key))
 }
+
+/// The graphics pipeline of a draw scanned ahead of its use (`draw`).
+pub(crate) use draw::{precompile_gfx, GfxRegs};
 
 /// Creates the compute pipeline of a stage prepared ahead of its use
 /// (`gpu::compile` workers): Some(true) when it was created here,
@@ -4464,6 +4471,7 @@ pub fn reset_shader_profile() {
     for c in crate::mem::WRITE_WATCH_STATS.iter() {
         c.store(0, Ordering::Relaxed);
     }
+    crate::mem::ww_reset();
     for c in DRAW_STEPS.iter().flatten().chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(DRAW_STEPS_FIRST.iter()).chain(CS_STEPS_FIRST.iter()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()).chain(BIND_STEPS_BY.iter().flatten()).chain(PRE_STEPS_BY.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
@@ -4537,6 +4545,7 @@ pub fn shader_profile() -> String {
     s.push_str(&bind_steps_line());
     s.push_str(&pre_steps_line());
     s.push_str(&pre_repeat_line());
+    s.push_str(&crate::mem::ww_lines());
     s.push_str(&sync_steps_line());
     s.push_str(&shaders::repeats_line());
     s.push_str(&phases_line("dispatch", &CS_PHASES, ["prepare and waits", "textures, pipeline", "bindings"]));

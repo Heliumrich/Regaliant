@@ -207,6 +207,18 @@ pub static UNBOUNDED_STALE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// written back first (`tune image_homes`)].
 pub static IMAGE_STALE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static ANY: AtomicBool = AtomicBool::new(false);
+/// The write-watched homes (base, end, id), readable without the homes'
+/// lock (`marks_taken` runs under the copy cache's, which a home's check
+/// takes while holding the homes' lock); kept by `publish_watched`.
+static WATCHED_RANGES: parking_lot::RwLock<Vec<(u64, u64, u64)>> = parking_lot::RwLock::new(Vec::new());
+static WATCHED_ON: AtomicBool = AtomicBool::new(false);
+/// Ranges inside watched homes whose write marks other takes reset (texture
+/// re-uploads and scrubbing, copy-cache checks of ranges a home was made
+/// over later): (home id, base, size); the home's next check compares them
+/// too (its own query no longer sees those writes).
+static TAKEN: Mutex<Vec<(u64, u64, u64)>> = Mutex::new(Vec::new());
+/// Pages (or ranges of failed queries) handed over that way.
+static TAKEN_PAGES: AtomicU64 = AtomicU64::new(0);
 static USED: AtomicU64 = AtomicU64::new(0);
 pub static CREATED: AtomicU64 = AtomicU64::new(0);
 pub static DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -225,6 +237,68 @@ pub static STALE_ADDED: AtomicU64 = AtomicU64::new(0);
 /// Whether any home exists (fast path for every binding).
 pub fn any() -> bool {
     ANY.load(Ordering::Relaxed)
+}
+
+/// Republishes the write-watched homes' ranges after homes came or went
+/// (under the homes' lock), forgetting handed-over ranges of homes gone.
+fn publish_watched(g: &[Home]) {
+    let v: Vec<(u64, u64, u64)> = g.iter().filter(|h| h.shared.watched).map(|h| (h.base, h.base + h.size, h.shared.id)).collect();
+    WATCHED_ON.store(!v.is_empty(), Ordering::Release);
+    TAKEN.lock().retain(|t| v.iter().any(|w| w.2 == t.0));
+    *WATCHED_RANGES.write() = v;
+}
+
+/// Another take reset the write marks of `pages` (`precache::apply_marks`;
+/// None: a failed query over [base, base+size), all of it may be written):
+/// those inside write-watched homes are handed to their next check.
+pub fn marks_taken(pages: Option<&[u64]>, base: u64, size: u64) {
+    if !WATCHED_ON.load(Ordering::Acquire) {
+        return;
+    }
+    let w = WATCHED_RANGES.read();
+    let mut add = Vec::new();
+    match pages {
+        Some(pages) => {
+            for &p in pages {
+                for &(b, e, id) in w.iter() {
+                    if p < e && b < p + 4096 {
+                        add.push((id, p, 4096));
+                    }
+                }
+            }
+        }
+        None => {
+            let end = base.saturating_add(size);
+            for &(b, e, id) in w.iter() {
+                if base < e && b < end {
+                    add.push((id, base.max(b), end.min(e) - base.max(b)));
+                }
+            }
+        }
+    }
+    drop(w);
+    if !add.is_empty() {
+        TAKEN_PAGES.fetch_add(add.len() as u64, Ordering::Relaxed);
+        TAKEN.lock().extend(add);
+    }
+}
+
+/// The ranges handed over for home `id` (`marks_taken`), removed.
+fn taken_for(id: u64) -> Vec<(u64, u64)> {
+    let mut g = TAKEN.lock();
+    if g.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    g.retain(|t| {
+        if t.0 == id {
+            out.push((t.1, t.2));
+            false
+        } else {
+            true
+        }
+    });
+    out
 }
 
 /// A binding of guest [base, base+size) in a home.
@@ -399,10 +473,28 @@ fn check_cpu_writes(h: &mut Home) {
     WATCH_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
-fn check_cpu_writes_inner(h: &mut Home) {
+/// What a home's check found: the query's result, the pages it found
+/// written, and the ranges other takes handed over (`marks_taken`).
+type Found = (Option<()>, Vec<u64>, Vec<(u64, u64)>);
+
+/// The write-mark query of a home's check (no lock held).
+fn query_cpu_writes(base: u64, size: u64, id: u64) -> Found {
     let mut pages = Vec::new();
+    let taken = super::precache::take_written_for(base, size, &mut pages, None, 2);
+    // Pages whose marks other takes reset meanwhile (the take above waited
+    // for those in flight over the home to be applied).
+    (taken, pages, taken_for(id))
+}
+
+fn check_cpu_writes_inner(h: &mut Home) {
+    let q = query_cpu_writes(h.base, h.size, h.shared.id);
+    apply_cpu_writes(h, q);
+}
+
+/// The words of a home's pages the CPU wrote (`Found`) that changed are
+/// marked to be copied in (under the homes' lock).
+fn apply_cpu_writes(h: &mut Home, (taken, pages, handed): Found) {
     let (base, end) = (h.base, h.base + h.size);
-    let taken = super::precache::take_written_for(base, h.size, &mut pages, None);
     let resnap: Vec<(u64, u64)> = h.resnap.iter().collect();
     h.resnap.clear();
     let Some(snap) = h.snap.as_mut() else { return };
@@ -414,7 +506,7 @@ fn check_cpu_writes_inner(h: &mut Home) {
             guest_words(a, ((e - a) / 4) as usize, &mut snap[k..]);
         }
     }
-    let ranges: Vec<(u64, u64)> = match taken {
+    let mut ranges: Vec<(u64, u64)> = match taken {
         Some(()) => pages
             .iter()
             .filter_map(|&p| {
@@ -427,6 +519,12 @@ fn check_cpu_writes_inner(h: &mut Home) {
             .collect(),
         None => vec![(base, h.size)],
     };
+    for (a, n) in handed {
+        let (a, e) = (a.max(base), (a + n).min(end));
+        if a < e && taken.is_some() {
+            ranges.push((a, e - a));
+        }
+    }
     // The words that changed, as runs.
     let mut changed: Vec<(u64, u64)> = Vec::new();
     let mut now = [0u32; 1024];
@@ -570,7 +668,7 @@ pub fn ready_args_candidates() -> Vec<(u64, u64)> {
         }
         let frame = super::FRAMES.load(Ordering::Relaxed);
         let mut pages = Vec::new();
-        if super::precache::take_written_for(b, m, &mut pages, None).is_none() {
+        if super::precache::take_written_for(b, m, &mut pages, None, 5).is_none() {
             give_up();
             continue;
         }
@@ -659,6 +757,7 @@ pub fn take_watched() -> Vec<(u64, u64, Arc<HomeBuf>, u64)> {
     DROPPED.fetch_add((before - g.len()) as u64, Ordering::Relaxed);
     ANY.store(!g.is_empty(), Ordering::Relaxed);
     WATCHED_ANY.store(false, Ordering::Release);
+    publish_watched(&g);
     GEN.fetch_add(1, Ordering::AcqRel);
     VOTE_GEN.fetch_add(1, Ordering::AcqRel);
     v
@@ -738,6 +837,7 @@ fn create_with(b: u64, n: u64, watched: bool, args: bool, what: &str) -> bool {
     });
     g.push(Home { base: b, size: n, buf: Arc::new(HomeBuf { buf, mem, size: n }), shared, dirty, stale: Ranges::default(), snap, resnap: Ranges::default() });
     ANY.store(true, Ordering::Relaxed);
+    publish_watched(&g);
     GEN.fetch_add(1, Ordering::AcqRel);
     CREATED.fetch_add(1, Ordering::Relaxed);
     if what.is_empty() {
@@ -827,6 +927,7 @@ pub fn remapped(base: u64, size: u64) {
     });
     DROPPED.fetch_add((before - g.len()) as u64, Ordering::Relaxed);
     ANY.store(!g.is_empty(), Ordering::Relaxed);
+    publish_watched(&g);
     GEN.fetch_add(1, Ordering::AcqRel);
 }
 
@@ -845,13 +946,14 @@ pub fn take_all() -> Vec<(u64, u64, Arc<HomeBuf>, u64)> {
     DROPPED.fetch_add(g.len() as u64, Ordering::Relaxed);
     g.clear();
     ANY.store(false, Ordering::Relaxed);
+    publish_watched(&g);
     GEN.fetch_add(1, Ordering::AcqRel);
     v
 }
 
 pub fn status() -> String {
     format!(
-        "    video-memory homes: {} created, {} dropped, {} MiB; {} bindings, {} bytes copied in, {} write-backs ({} KiB), {} partial overlaps, {} unbounded pointer bindings over homes ({} based inside one, {} with GPU-written parts not yet in guest memory within 4 KiB of their base, {} written back first), {} image uploads over GPU-written home data not in guest memory ({} reloads of overwritten images written back first); write-watched: {} checks ({} ms), {} bytes the CPU changed ({} of them by guest code in homes watched for `homes_watch`), {} written pages covered in part\n",
+        "    video-memory homes: {} created, {} dropped, {} MiB; {} bindings, {} bytes copied in, {} write-backs ({} KiB), {} partial overlaps, {} unbounded pointer bindings over homes ({} based inside one, {} with GPU-written parts not yet in guest memory within 4 KiB of their base, {} written back first), {} image uploads over GPU-written home data not in guest memory ({} reloads of overwritten images written back first); write-watched: {} checks ({} ms), {} bytes the CPU changed ({} of them by guest code in homes watched for `homes_watch`), {} written pages covered in part, {} pages other takes found written handed over\n",
         CREATED.load(Ordering::Relaxed),
         DROPPED.load(Ordering::Relaxed),
         USED.load(Ordering::Relaxed) >> 20,
@@ -870,6 +972,7 @@ pub fn status() -> String {
         WATCH_NS.load(Ordering::Relaxed) / 1_000_000,
         CPU_WRITTEN_PAGES.load(Ordering::Relaxed),
         GUEST_CHANGED.load(Ordering::Relaxed),
-        EDGE_PAGES.load(Ordering::Relaxed)
+        EDGE_PAGES.load(Ordering::Relaxed),
+        TAKEN_PAGES.load(Ordering::Relaxed)
     )
 }

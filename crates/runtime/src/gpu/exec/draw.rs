@@ -320,6 +320,248 @@ thread_local! {
     static LAST_GFX_KEY: std::cell::Cell<Option<(GfxKey, u64)>> = const { std::cell::Cell::new(None) };
 }
 
+/// A key's hash (the persistent cache file's name, so its hasher stays).
+fn hash_gfx_key(key: &GfxKey) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
+/// The registers a draw's baked pipeline state is made of, as a scan of the
+/// commands ahead saw them (`gfx_key_ahead`): context registers and the
+/// primitive type (a uconfig register).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GfxRegs {
+    cb_color_control: u32,
+    clip: u32,
+    col_format: u32,
+    target_mask: u32,
+    zinfo: u32,
+    sinfo: u32,
+    dctl: u32,
+    db_render: u32,
+    sctl: u32,
+    refm: u32,
+    refm_bf: u32,
+    cb_info: [u32; MAX_RT],
+    blend: [u32; MAX_RT],
+    prim: u32,
+}
+
+impl GfxRegs {
+    /// From a context register reader (`ctx(0x28xxx)`) and VGT_PRIMITIVE_TYPE.
+    pub(crate) fn capture(ctx: &dyn Fn(u32) -> u32, prim: u32) -> GfxRegs {
+        GfxRegs {
+            cb_color_control: ctx(0x28808),
+            clip: ctx(0x28810),
+            col_format: ctx(0x28714),
+            target_mask: ctx(0x28238) & ctx(0x2823C),
+            zinfo: ctx(0x28040),
+            sinfo: ctx(0x28044),
+            dctl: ctx(0x28800),
+            db_render: ctx(0x28000),
+            sctl: ctx(0x2842C),
+            refm: ctx(0x28430),
+            refm_bf: ctx(0x28434),
+            cb_info: std::array::from_fn(|n| ctx(0x28C60 + 0x3C * n as u32 + 0x10)),
+            blend: std::array::from_fn(|n| ctx(0x28780 + 4 * n as u32)),
+            prim,
+        }
+    }
+
+    /// Whether two draws' baked state would be made from the same values
+    /// (one compile ahead per such pair of stages and state).
+    pub(crate) fn same(&self, o: &GfxRegs) -> bool {
+        self == o
+    }
+}
+
+/// The pipeline key and its cache hash (with the push-descriptor mode) of a
+/// draw with these registers and stages as `draw_inner` makes them; None
+/// when such a draw records nothing or is not supported. Compiles ahead of
+/// use (`gpu::compile`) take it; a key that differs at execution only cost
+/// a compile.
+fn gfx_key_ahead(g: &GfxRegs, vs: &Prepared, ps: Option<&Prepared>) -> Option<(GfxKey, u64, bool)> {
+    let cb_mode = (g.cb_color_control >> 4) & 7;
+    if cb_mode > 1 || g.clip & (1 << 22) != 0 {
+        return None;
+    }
+    let (class, rect) = match g.prim & 0x3F {
+        1 => (0u8, false),
+        2 | 3 => (1, false),
+        4..=6 => (2, false),
+        7 | 0x11 => (2, true),
+        _ => return None,
+    };
+    let mrt_mask = ps.map(|p| p.tr.out.mrt_mask).unwrap_or(0);
+    let mut colors = [vk::Format::UNDEFINED.as_raw(); MAX_RT];
+    let mut blend = [0u32; MAX_RT];
+    let mut masks = [0u8; MAX_RT];
+    let mut any_color = false;
+    if cb_mode == 1 {
+        for i in 0..MAX_RT {
+            let m = (g.target_mask >> (4 * i)) & 0xF;
+            if m == 0 || mrt_mask & (1 << i) == 0 || (g.col_format >> (4 * i)) & 0xF == 0 {
+                continue;
+            }
+            let info = g.cb_info[i];
+            let fmt = (info >> 2) & 0x1F;
+            if fmt == 0 {
+                continue;
+            }
+            colors[i] = images::cb_format(fmt, (info >> 8) & 7, (info >> 11) & 3)?.as_raw();
+            blend[i] = g.blend[i];
+            masks[i] = m as u8;
+            any_color = true;
+        }
+    }
+    let dformat = match (g.zinfo & 3, g.sinfo & 1) {
+        (0, 0) => None,
+        (1, 0) => Some(vk::Format::D16_UNORM),
+        (3, 0) => Some(vk::Format::D32_SFLOAT),
+        (_, 1) => Some(vk::Format::D32_SFLOAT_S8_UINT),
+        _ => None,
+    };
+    let (has_z, has_s) = match dformat {
+        Some(f) => (images::aspects(f).contains(vk::ImageAspectFlags::DEPTH) && g.zinfo & 3 != 0, images::has_stencil(f)),
+        None => (false, false),
+    };
+    let z_test = has_z && g.dctl & 2 != 0;
+    let z_write = z_test && g.dctl & 4 != 0;
+    let s_test = has_s && g.dctl & 1 != 0;
+    let s_write = s_test && (g.refm | g.refm_bf) & 0x00FF_0000 != 0 && g.sctl & 0xFF_FFFF != 0;
+    let clear_z = has_z && g.db_render & 1 != 0;
+    let clear_s = has_s && g.db_render & 2 != 0;
+    let depth = if z_test || s_test || clear_z || clear_s { dformat } else { None };
+    let mem_writes = vs.tr.plan.resources.iter().any(|r| r.written) || ps.is_some_and(|p| p.tr.plan.resources.iter().any(|r| r.written));
+    if !any_color && !z_write && !s_write && !clear_z && !clear_s && !mem_writes {
+        return None;
+    }
+    if !any_color && depth.is_none() && !super::super::tune::attachless_draws() {
+        return None;
+    }
+    let key = GfxKey {
+        vs: vs.tr.key,
+        ps: ps.map(|p| p.tr.key).unwrap_or(0),
+        rect_gs: rect.then_some(vs.tr.out.param_mask),
+        colors,
+        blend,
+        masks,
+        depth: depth.map(|d| d.as_raw()).unwrap_or(vk::Format::UNDEFINED.as_raw()),
+        topology_class: class,
+        depth_clamp: g.clip & (3 << 26) != 0,
+    };
+    let push_mode = match ps {
+        Some(p) => super::push_fits(&[vs, p]),
+        None => super::push_fits(&[vs]),
+    };
+    Some((key, super::push_key(hash_gfx_key(&key), push_mode), push_mode))
+}
+
+/// Graphics pipelines being created, by cache hash: a thread that needs
+/// one waits for it instead of compiling it again (compiles ahead of use).
+static GFX_FLIGHTS: parking_lot::Mutex<Option<HashMap<u64, std::sync::Arc<PipeFlight>>>> = parking_lot::Mutex::new(None);
+/// Draws that waited for a pipeline in flight: count, nanoseconds, and
+/// compiles that saved.
+pub static GFX_FLIGHT_WAITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Draws whose graphics pipeline was missing and the nanoseconds their
+/// command processors spent creating it or waiting for it (first uses).
+pub static GFX_FIRST_USES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn gfx_known(hkey: u64) -> bool {
+    gfx_pipe(hkey).is_some() || GFX_FLIGHTS.lock().as_ref().is_some_and(|m| m.contains_key(&hkey))
+}
+
+/// Creates the graphics pipeline of a draw scanned ahead of its use
+/// (`gpu::compile` workers): Some(true) when created here, Some(false) when
+/// it existed or was in flight, None when such a draw records nothing or
+/// creating it failed.
+pub(crate) fn precompile_gfx(g: &GfxRegs, vs: &Prepared, ps: Option<&Prepared>) -> Option<bool> {
+    let (key, hkey, push_mode) = gfx_key_ahead(g, vs, ps)?;
+    if gfx_known(hkey) {
+        return Some(false);
+    }
+    let created = std::cell::Cell::new(false);
+    let r = gfx_pipe_with(&key, hkey, vs, ps, push_mode, &created);
+    if compile_trace() && created.get() {
+        AHEAD_KEYS.lock().get_or_insert_with(HashSet::new).insert(hkey);
+        crate::info!("compile ahead: vs {:#x} ps {:#x} key {hkey:#x} created", vs.addr, ps.map_or(0, |p| p.addr));
+    }
+    r.ok().map(|_| created.get())
+}
+
+/// The graphics pipeline of `key` (created on first use; one in flight on
+/// another thread is waited for).
+fn gfx_pipe_with(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared>, push_mode: bool, created: &std::cell::Cell<bool>) -> Result<Pipe, String> {
+    if let Some(x) = gfx_pipe(hkey) {
+        return Ok(x);
+    }
+    let (mine, flight) = {
+        let mut g = GFX_FLIGHTS.lock();
+        let m = g.get_or_insert_with(HashMap::new);
+        match m.get(&hkey) {
+            Some(f) => (false, f.clone()),
+            None => {
+                let f = std::sync::Arc::new(PipeFlight { done: parking_lot::Mutex::new(None), cv: parking_lot::Condvar::new() });
+                m.insert(hkey, f.clone());
+                (true, f)
+            }
+        }
+    };
+    if !mine {
+        let t = std::time::Instant::now();
+        let r = {
+            let mut d = flight.done.lock();
+            while d.is_none() {
+                flight.cv.wait(&mut d);
+            }
+            d.clone().unwrap()
+        };
+        GFX_FLIGHT_WAITS[0].fetch_add(1, Ordering::Relaxed);
+        GFX_FLIGHT_WAITS[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if r.is_ok() {
+            GFX_FLIGHT_WAITS[2].fetch_add(1, Ordering::Relaxed);
+            return r;
+        }
+        return gfx_pipe_create(key, hkey, vs, ps, push_mode, created);
+    }
+    let stored = gfx_pipe(hkey);
+    // A panic must not leave the threads waiting for it blocked.
+    let r = match stored {
+        Some(x) => Ok(x),
+        None => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gfx_pipe_create(key, hkey, vs, ps, push_mode, created))).unwrap_or_else(|_| Err("pipeline creation panicked".to_string())),
+    };
+    *flight.done.lock() = Some(r.clone());
+    flight.cv.notify_all();
+    if let Some(m) = GFX_FLIGHTS.lock().as_mut() {
+        m.remove(&hkey);
+    }
+    r
+}
+
+fn gfx_pipe_create(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared>, push_mode: bool, created: &std::cell::Cell<bool>) -> Result<Pipe, String> {
+    created.set(true);
+    let t0 = std::time::Instant::now();
+    let p = graphics_pipeline(key, hkey, vs, ps, push_mode)?;
+    super::PIPES_CREATED[1].fetch_add(1, Ordering::Relaxed);
+    super::PIPES_NS[1].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    // Pipelines whose shader pair an earlier pipeline had (other render
+    // state only: what pipeline libraries would link without compiling the
+    // shaders again).
+    if !GFX_PAIRS.lock().insert((key.vs, key.ps, key.rect_gs, key.depth_clamp)) {
+        GFX_REPEAT_PAIRS[0].fetch_add(1, Ordering::Relaxed);
+        GFX_REPEAT_PAIRS[1].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    if p.push {
+        super::PIPES_PUSH[1].fetch_add(1, Ordering::Relaxed);
+    }
+    let ms = t0.elapsed().as_millis();
+    if ms >= 200 {
+        crate::info!("gpu: graphics pipeline for vs {:#x} ps {:#x} took {ms} ms", vs.addr, ps.map_or(0, |p| p.addr));
+    }
+    Ok(keep_gfx_pipe(hkey, p))
+}
+
 fn set_layout_bindings(stages: &[(&Prepared, vk::ShaderStageFlags)]) -> Vec<vk::DescriptorSetLayoutBinding<'static>> {
     let mut v = Vec::new();
     for (p, flags) in stages {
@@ -841,37 +1083,61 @@ impl Exec {
         let hkey = {
             let last = LAST_GFX_KEY.with(|c| c.get()).filter(|(k, _)| *k == key).map(|(_, h)| h);
             let h = last.unwrap_or_else(|| {
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                key.hash(&mut h);
-                let h = h.finish();
+                let h = hash_gfx_key(&key);
                 LAST_GFX_KEY.with(|c| c.set(Some((key, h))));
                 h
             });
             super::push_key(h, push_mode)
         };
+        // DS_COMPILE_TRACE: the key a scan ahead would make from these
+        // registers (`gfx_key_ahead`) checked against this one.
+        if compile_trace() {
+            let g = GfxRegs::capture(&|r| ctx_reg(cp, r), cp.reg(Space::Uc, 0x242));
+            let ahead = gfx_key_ahead(&g, &vs, ps.as_ref());
+            if ahead.map(|a| a.1) != Some(hkey) {
+                static N: AtomicU64 = AtomicU64::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 40 {
+                    let why = match ahead {
+                        None => "none".to_string(),
+                        Some((k, _, pm)) => format!(
+                            "colors {} blend {} masks {} depth {} class {} clamp {} rect {} push {}",
+                            k.colors == key.colors,
+                            k.blend == key.blend,
+                            k.masks == key.masks,
+                            k.depth == key.depth,
+                            k.topology_class == key.topology_class,
+                            k.depth_clamp == key.depth_clamp,
+                            k.rect_gs == key.rect_gs,
+                            pm == push_mode
+                        ),
+                    };
+                    crate::info!("compile ahead: key check: vs {:#x} ps {ps_addr:#x} key {hkey:#x} differs from the ahead form ({why}; colors {:?} against {:?})", vs.addr, key.colors, ahead.map(|a| a.0.colors));
+                }
+            }
+        }
         let cached = gfx_pipe(hkey);
         let Pipe { pipeline, layout, set_layout, push } = match cached {
-            Some(x) => x,
+            Some(x) => {
+                if compile_trace() && AHEAD_KEYS.lock().get_or_insert_with(HashSet::new).remove(&hkey) {
+                    crate::info!("used ahead: vs {:#x} ps {ps_addr:#x} key {hkey:#x}", vs.addr);
+                }
+                x
+            }
             None => {
-                let t0 = std::time::Instant::now();
-                let p = graphics_pipeline(&key, hkey, &vs, ps.as_ref(), push_mode)?;
-                super::PIPES_CREATED[1].fetch_add(1, Ordering::Relaxed);
-                super::PIPES_NS[1].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                // Pipelines whose shader pair an earlier pipeline had (other
-                // render state only: what pipeline libraries would link
-                // without compiling the shaders again).
-                if !GFX_PAIRS.lock().insert((key.vs, key.ps, key.rect_gs, key.depth_clamp)) {
-                    GFX_REPEAT_PAIRS[0].fetch_add(1, Ordering::Relaxed);
-                    GFX_REPEAT_PAIRS[1].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                // A first use: the pipelines of the draws after this one are
+                // compiled meanwhile (`gpu::compile`).
+                let t = std::time::Instant::now();
+                if crate::gpu::compile::gfx_at_first_uses() && !gfx_known(hkey) {
+                    cp.prefetch_compiles();
                 }
-                if p.push {
-                    super::PIPES_PUSH[1].fetch_add(1, Ordering::Relaxed);
+                let created = std::cell::Cell::new(false);
+                let p = gfx_pipe_with(&key, hkey, &vs, ps.as_ref(), push_mode, &created)?;
+                if compile_trace() {
+                    crate::info!("first use: vs {:#x} ps {ps_addr:#x} key {hkey:#x} after {} ms{}", vs.addr, t.elapsed().as_millis(), if created.get() { "" } else { " (made by another thread)" });
                 }
-                let ms = t0.elapsed().as_millis();
-                if ms >= 200 {
-                    crate::info!("gpu: graphics pipeline for vs {:#x} ps {ps_addr:#x} took {ms} ms", vs.addr);
-                }
-                keep_gfx_pipe(hkey, p)
+                GFX_FIRST_USES[0].fetch_add(1, Ordering::Relaxed);
+                GFX_FIRST_USES[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                p
             }
         };
         let t_pipe = since(t0);

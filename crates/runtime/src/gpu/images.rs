@@ -905,7 +905,7 @@ fn scrubber() {
                     pages.clear();
                     SCRUB_TAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     SCRUB_TAKE_PAGES.fetch_add(len / 4096, std::sync::atomic::Ordering::Relaxed);
-                    let _ = super::precache::take_written_for(a, len, &mut pages, None);
+                    let _ = super::precache::take_written_for(a, len, &mut pages, None, 3);
                     SCRUB_DIRTY.fetch_add((!pages.is_empty()) as u64, std::sync::atomic::Ordering::Relaxed);
                     // Written pages only where the texture shares a page with
                     // other data (its first and last page).
@@ -1471,7 +1471,7 @@ impl Images {
         let mut written: Vec<(u64, u64)> = Vec::new();
         let precise = precise && {
             let mut pages = Vec::new();
-            let ok = super::precache::take_written_for(t.base, size, &mut pages, region).is_some();
+            let ok = super::precache::take_written_for(t.base, size, &mut pages, region, 4).is_some();
             for p in pages {
                 match written.last_mut() {
                     Some(r) if r.0 + r.1 == p => r.1 += 4096,

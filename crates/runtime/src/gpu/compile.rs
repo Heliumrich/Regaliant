@@ -17,6 +17,14 @@
 //! missing are handed over too, already prepared (`submit_prepared`). A
 //! preparation made from inputs that differ at execution only costs a
 //! compile: execution prepares its stages itself.
+//!
+//! Graphics pipelines the same way (`tune compile_gfx`): a draw whose
+//! pipeline is missing scans the commands after it, and each scanned draw's
+//! stages are prepared on a worker with the registers the scan saw, its
+//! pipeline key made from the context registers the scan saw there (render
+//! target and depth formats, blend, write masks, primitive class, depth
+//! clamp: `exec::precompile_gfx`) and its pipeline created if missing; draws
+//! wait for one in flight.
 
 use super::ahead::Slot;
 use super::shaders::{self, Prepared, RegRead, StageKind};
@@ -25,10 +33,12 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// A stage to prepare from scanned registers, or one prepared already.
+/// A stage to prepare from scanned registers, one prepared already, or a
+/// scanned draw (its stages and baked-state registers).
 enum Job {
     Regs(Arc<Slot>),
     Prepared(Box<Prepared>),
+    Draw(Box<(Arc<Slot>, Option<Arc<Slot>>, super::exec::GfxRegs)>),
 }
 
 struct Pool {
@@ -52,7 +62,16 @@ const COMPILE_NS: usize = 6;
 const PRESENT: usize = 7;
 const DROPPED: usize = 8;
 const AT_WAITS: usize = 9;
-static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// Draws: handed over, over the limit, prepared, pipelines created, their
+/// ns, present already, failed or recording nothing.
+const DRAWS: usize = 10;
+const DRAWS_DROPPED: usize = 11;
+const DRAWS_PREPARED: usize = 12;
+const GFX_COMPILED: usize = 13;
+const GFX_NS: usize = 14;
+const GFX_PRESENT: usize = 15;
+const GFX_FAILED: usize = 16;
+static STATS: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
 
 /// Most compute programs one scan hands over (16 lost the gain: a level's
 /// first frames meet hundreds of programs; of those compiled ahead with 64,
@@ -76,6 +95,11 @@ fn mode() -> u32 {
 /// Scans at first uses wanted.
 pub fn at_first_uses() -> bool {
     enabled() && mode() & 1 != 0
+}
+
+/// Graphics pipelines compiled ahead too (`tune compile_gfx`).
+pub fn gfx_at_first_uses() -> bool {
+    at_first_uses() && super::tune::compile_gfx()
 }
 
 /// Stages prepared at label waits handed over.
@@ -128,6 +152,7 @@ fn worker() {
                 compile(&p);
                 QUEUED.lock().retain(|&k| k != p.tr.key);
             }
+            Job::Draw(d) => run_draw(&d.0, d.1.as_deref(), &d.2),
         }));
     }
 }
@@ -148,6 +173,51 @@ fn run(slot: &Slot) {
     compile(&p);
 }
 
+/// A scanned draw: its stages prepared from the registers the scan saw,
+/// then its graphics pipeline created if missing.
+fn run_draw(vs: &Slot, ps: Option<&Slot>, g: &super::exec::GfxRegs) {
+    let prep = |s: &Slot| {
+        let r = s.regs();
+        let p = match r.kind {
+            StageKind::Vertex => shaders::prepare_ngg(r),
+            StageKind::Pixel => shaders::prepare_ps(r),
+            StageKind::Compute => return None,
+        };
+        p.ok().filter(|_| !r.missed.load(Ordering::Relaxed))
+    };
+    let Some(v) = prep(vs) else {
+        STATS[GFX_FAILED].fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let p = match ps {
+        Some(s) => match prep(s) {
+            Some(p) => Some(p),
+            None => {
+                STATS[GFX_FAILED].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        },
+        None => None,
+    };
+    STATS[DRAWS_PREPARED].fetch_add(1, Ordering::Relaxed);
+    if mode() & 8 != 0 {
+        return;
+    }
+    let t = std::time::Instant::now();
+    match super::exec::precompile_gfx(g, &v, p.as_ref()) {
+        Some(true) => {
+            STATS[GFX_COMPILED].fetch_add(1, Ordering::Relaxed);
+            STATS[GFX_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        Some(false) => {
+            STATS[GFX_PRESENT].fetch_add(1, Ordering::Relaxed);
+        }
+        None => {
+            STATS[GFX_FAILED].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 fn compile(p: &Prepared) {
     let t = std::time::Instant::now();
     match super::exec::precompile(p) {
@@ -164,11 +234,26 @@ fn compile(p: &Prepared) {
     }
 }
 
-/// Hands the compute stages of a scan (`Cp::prefetch_compiles`, after
-/// `ns` of scanning) to the workers, the first of each program only.
-pub fn submit(slots: Vec<Arc<Slot>>, ns: u64) {
+/// Hands the compute stages and draws of a scan (`Cp::prefetch_compiles`,
+/// after `ns` of scanning) to the workers: the first of each program, and of
+/// each pair of draw programs with the same baked-state registers, only.
+pub fn submit(slots: Vec<Arc<Slot>>, draws: Vec<(Arc<Slot>, Option<Arc<Slot>>, super::exec::GfxRegs)>, ns: u64) {
     STATS[SCANS].fetch_add(1, Ordering::Relaxed);
     STATS[SCAN_NS].fetch_add(ns, Ordering::Relaxed);
+    let mut draw_jobs: Vec<Job> = Vec::new();
+    let mut seen_draws: Vec<(u64, u64, super::exec::GfxRegs)> = Vec::new();
+    for (vs, ps, g) in draws {
+        let (va, pa) = (shaders::ngg_addr_of(vs.regs()), ps.as_ref().map_or(0, |p| shaders::ps_addr_of(p.regs())));
+        if va == 0 || seen_draws.iter().any(|&(a, b, ref o)| a == va && b == pa && o.same(&g)) {
+            continue;
+        }
+        seen_draws.push((va, pa, g));
+        if draw_jobs.len() >= MAX_JOBS {
+            STATS[DRAWS_DROPPED].fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        draw_jobs.push(Job::Draw(Box::new((vs, ps, g))));
+    }
     let mut seen: Vec<(u64, bool)> = Vec::new();
     let mut jobs = Vec::new();
     for s in slots {
@@ -188,12 +273,19 @@ pub fn submit(slots: Vec<Arc<Slot>>, ns: u64) {
         }
         jobs.push(s);
     }
-    if jobs.is_empty() || mode() & 4 != 0 {
+    if (jobs.is_empty() && draw_jobs.is_empty()) || mode() & 4 != 0 {
         return;
     }
     ensure_workers();
     STATS[JOBS].fetch_add(jobs.len() as u64, Ordering::Relaxed);
-    POOL.jobs.lock().extend(jobs.into_iter().map(Job::Regs));
+    STATS[DRAWS].fetch_add(draw_jobs.len() as u64, Ordering::Relaxed);
+    {
+        // In program order, compute and draws as the scan found them would be
+        // best; the draws come after the compute stages of the same scan.
+        let mut q = POOL.jobs.lock();
+        q.extend(jobs.into_iter().map(Job::Regs));
+        q.extend(draw_jobs);
+    }
     POOL.cv.notify_all();
 }
 
@@ -215,6 +307,21 @@ pub fn submit_prepared(p: Prepared) {
     POOL.cv.notify_one();
 }
 
+/// Scans at first uses by why they ended (`ahead::END_*` or an opcode:
+/// buffer end, the command limit, another packet) and the commands found.
+static SCAN_ENDS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// A scan at a first use ended for `why` after finding `n` commands.
+pub fn note_scan_end(why: usize, n: usize) {
+    let k = match why {
+        super::ahead::END_BUFFER => 0,
+        super::ahead::END_MAX => 1,
+        _ => 2,
+    };
+    SCAN_ENDS[k].fetch_add(1, Ordering::Relaxed);
+    SCAN_ENDS[3].fetch_add(n as u64, Ordering::Relaxed);
+}
+
 /// One status line ("" before any scan).
 pub fn status() -> String {
     let s: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
@@ -222,10 +329,22 @@ pub fn status() -> String {
         return String::new();
     }
     let (waits, wait_ns, dups) = super::exec::inflight_stats();
+    let gfx = if s[DRAWS] > 0 {
+        format!(
+            "; graphics: {} draws handed over ({} over the per-scan limit), {} prepared, {} pipelines created ({} ms of compiles), {} present already, {} failed, not prepared or recording nothing",
+            s[DRAWS], s[DRAWS_DROPPED], s[DRAWS_PREPARED], s[GFX_COMPILED], s[GFX_NS] / 1_000_000, s[GFX_PRESENT], s[GFX_FAILED]
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "    pipelines compiled ahead: {} scans at first uses ({} ms), {} programs handed to {} workers ({} over the per-scan limit) and {} stages prepared at label waits, {} prepared, {} pipelines created ({} ms of compiles), {} present already, {} failed or not prepared; command processors waited {} times for a pipeline in flight ({} ms), {} compiles of one pipeline avoided\n",
+        "    pipelines compiled ahead: {} scans at first uses ({} ms; ended by their buffer's end {}, the command limit {}, another packet {}; {} commands found), {} programs handed to {} workers ({} over the per-scan limit) and {} stages prepared at label waits, {} prepared, {} pipelines created ({} ms of compiles), {} present already, {} failed or not prepared; command processors waited {} times for a pipeline in flight ({} ms), {} compiles of one pipeline avoided{gfx}\n",
         s[SCANS],
         s[SCAN_NS] / 1_000_000,
+        SCAN_ENDS[0].load(Ordering::Relaxed),
+        SCAN_ENDS[1].load(Ordering::Relaxed),
+        SCAN_ENDS[2].load(Ordering::Relaxed),
+        SCAN_ENDS[3].load(Ordering::Relaxed),
         s[JOBS],
         WORKERS.load(Ordering::Relaxed),
         s[DROPPED],
