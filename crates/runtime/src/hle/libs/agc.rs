@@ -466,6 +466,18 @@ sysv! {
                     let r = REGISTRATIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
                     SHADERS.lock().insert(addr, (stage, size as usize, instance_offset_slot_of(h, stage), r));
                     SHADERS_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    if matches!(stage, 1 | 2) && crate::gpu::tune::precompile() > 0 {
+                        crate::gpu::precompile::created_graphics(addr);
+                    }
+                    if stage == 0 && crate::gpu::tune::precompile() > 0 {
+                        // The registers a compute dispatch takes from it
+                        // (`gpu::precompile`).
+                        let reg = |r: u32| (0..n).map(|k| regs + 8 * k).find(|&a| rd32(a) == r).map(|a| rd32(a + 4));
+                        let sp = rd64(h + SPECIALS);
+                        let modifier = if sp != 0 { rd32(sp + specials::DISPATCH_MODIFIER) } else { 0 };
+                        let threads = |r: u32| reg(r).unwrap_or(1) & 0xFFFF;
+                        crate::gpu::precompile::created(addr, reg(0x213).unwrap_or(0), [threads(0x207), threads(0x208), threads(0x209)], modifier);
+                    }
                     break;
                 }
             }

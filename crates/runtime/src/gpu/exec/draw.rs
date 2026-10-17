@@ -320,6 +320,45 @@ thread_local! {
     static LAST_GFX_KEY: std::cell::Cell<Option<(GfxKey, u64)>> = const { std::cell::Cell::new(None) };
 }
 
+/// A graphics pipeline's state apart from its stages (`GfxKey` without the
+/// translation keys; `gpu::precompile` keeps it with the stages' specs).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct GfxState {
+    pub rect: bool,
+    pub colors: [i32; MAX_RT],
+    pub blend: [u32; MAX_RT],
+    pub masks: [u8; MAX_RT],
+    pub depth: i32,
+    pub topology_class: u8,
+    pub depth_clamp: bool,
+}
+
+/// Creates the graphics pipeline of translations made ahead from shader
+/// objects (`gpu::precompile`) with `state`, under the key its draws look
+/// up: Some(true) when created here, Some(false) when it existed or was in
+/// flight, None when creating it failed.
+pub(crate) fn precompile_gfx_translations(vs: StageTr, ps: Option<StageTr>, state: &GfxState) -> Option<bool> {
+    let key = GfxKey {
+        vs: vs.0.key,
+        ps: ps.map_or(0, |p| p.0.key),
+        rect_gs: state.rect.then_some(vs.0.out.param_mask),
+        colors: state.colors,
+        blend: state.blend,
+        masks: state.masks,
+        depth: state.depth,
+        topology_class: state.topology_class,
+        depth_clamp: state.depth_clamp,
+    };
+    let bindings: u32 = vs.0.out.bindings.iter().chain(ps.iter().flat_map(|p| p.0.out.bindings.iter())).map(|b| super::binding_count(b.kind)).sum();
+    let push_mode = super::super::tune::push_desc() && bindings <= ctx().max_push;
+    let hkey = super::push_key(hash_gfx_key(&key), push_mode);
+    if gfx_known(hkey) {
+        return Some(false);
+    }
+    let created = std::cell::Cell::new(false);
+    gfx_pipe_with(&key, hkey, vs, ps, push_mode, &created).ok().map(|_| created.get())
+}
+
 /// A key's hash (the persistent cache file's name, so its hasher stays).
 fn hash_gfx_key(key: &GfxKey) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -488,7 +527,7 @@ pub(crate) fn precompile_gfx(g: &GfxRegs, vs: &Prepared, ps: Option<&Prepared>) 
         return Some(false);
     }
     let created = std::cell::Cell::new(false);
-    let r = gfx_pipe_with(&key, hkey, vs, ps, push_mode, &created);
+    let r = gfx_pipe_with(&key, hkey, (&**vs.tr, vs.addr), ps.map(|p| (&**p.tr, p.addr)), push_mode, &created);
     if compile_trace() && created.get() {
         AHEAD_KEYS.lock().get_or_insert_with(HashSet::new).insert(hkey);
         crate::info!("compile ahead: vs {:#x} ps {:#x} key {hkey:#x} created", vs.addr, ps.map_or(0, |p| p.addr));
@@ -498,7 +537,10 @@ pub(crate) fn precompile_gfx(g: &GfxRegs, vs: &Prepared, ps: Option<&Prepared>) 
 
 /// The graphics pipeline of `key` (created on first use; one in flight on
 /// another thread is waited for).
-fn gfx_pipe_with(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared>, push_mode: bool, created: &std::cell::Cell<bool>) -> Result<Pipe, String> {
+/// A stage of a graphics pipeline: its translation and program address.
+type StageTr<'a> = (&'a super::super::shaders::Translated, u64);
+
+fn gfx_pipe_with(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, push_mode: bool, created: &std::cell::Cell<bool>) -> Result<Pipe, String> {
     if let Some(x) = gfx_pipe(hkey) {
         return Ok(x);
     }
@@ -508,7 +550,7 @@ fn gfx_pipe_with(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared>, 
         match m.get(&hkey) {
             Some(f) => (false, f.clone()),
             None => {
-                let f = std::sync::Arc::new(PipeFlight { done: parking_lot::Mutex::new(None), cv: parking_lot::Condvar::new() });
+                let f = std::sync::Arc::new(PipeFlight::new());
                 m.insert(hkey, f.clone());
                 (true, f)
             }
@@ -516,6 +558,7 @@ fn gfx_pipe_with(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared>, 
     };
     if !mine {
         let t = std::time::Instant::now();
+        flight.waited();
         let r = {
             let mut d = flight.done.lock();
             while d.is_none() {
@@ -545,10 +588,16 @@ fn gfx_pipe_with(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared>, 
     r
 }
 
-fn gfx_pipe_create(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared>, push_mode: bool, created: &std::cell::Cell<bool>) -> Result<Pipe, String> {
+fn gfx_pipe_create(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, push_mode: bool, created: &std::cell::Cell<bool>) -> Result<Pipe, String> {
     created.set(true);
     let t0 = std::time::Instant::now();
     let p = graphics_pipeline(key, hkey, vs, ps, push_mode)?;
+    // What a later session makes ahead when the title creates these
+    // shaders' objects (`gpu::precompile`).
+    if super::super::tune::precompile() > 0 {
+        let state = GfxState { rect: key.rect_gs.is_some(), colors: key.colors, blend: key.blend, masks: key.masks, depth: key.depth, topology_class: key.topology_class, depth_clamp: key.depth_clamp };
+        super::super::precompile::learn_gfx(vs, ps, &state);
+    }
     super::PIPES_CREATED[1].fetch_add(1, Ordering::Relaxed);
     super::PIPES_NS[1].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     // Pipelines whose shader pair an earlier pipeline had (other render
@@ -563,15 +612,15 @@ fn gfx_pipe_create(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared>
     }
     let ms = t0.elapsed().as_millis();
     if ms >= 200 {
-        crate::info!("gpu: graphics pipeline for vs {:#x} ps {:#x} took {ms} ms", vs.addr, ps.map_or(0, |p| p.addr));
+        crate::info!("gpu: graphics pipeline for vs {:#x} ps {:#x} took {ms} ms", vs.1, ps.map_or(0, |p| p.1));
     }
     Ok(keep_gfx_pipe(hkey, p))
 }
 
-fn set_layout_bindings(stages: &[(&Prepared, vk::ShaderStageFlags)]) -> Vec<vk::DescriptorSetLayoutBinding<'static>> {
+fn set_layout_bindings(stages: &[(&super::super::shaders::Translated, vk::ShaderStageFlags)]) -> Vec<vk::DescriptorSetLayoutBinding<'static>> {
     let mut v = Vec::new();
-    for (p, flags) in stages {
-        for b in &p.tr.out.bindings {
+    for (tr, flags) in stages {
+        for b in &tr.out.bindings {
             v.push(vk::DescriptorSetLayoutBinding::default().binding(b.binding).descriptor_type(descriptor_type(b.kind)).descriptor_count(super::binding_count(b.kind)).stage_flags(*flags));
         }
     }
@@ -592,12 +641,12 @@ const ATTACHLESS_AREA: u32 = 16384;
 /// Draws recorded without attachments (status).
 pub static ATTACHLESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared>, push_mode: bool) -> Result<Pipe, String> {
+fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, push_mode: bool) -> Result<Pipe, String> {
     let c = ctx();
     unsafe {
-        let mut stages_p = vec![(vs, vk::ShaderStageFlags::VERTEX)];
+        let mut stages_p = vec![(vs.0, vk::ShaderStageFlags::VERTEX)];
         if let Some(p) = ps {
-            stages_p.push((p, vk::ShaderStageFlags::FRAGMENT));
+            stages_p.push((p.0, vk::ShaderStageFlags::FRAGMENT));
         }
         let bindings = set_layout_bindings(&stages_p);
         let (push, flags) = super::push_layout(&bindings, push_mode);
@@ -605,12 +654,12 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepare
         let layouts = [set_layout];
         let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None).map_err(|e| format!("pipeline layout: {e}"))?;
         let module = |code: &[u32]| c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&super::module_code(code)), None).map_err(|e| format!("shader module: {e}"));
-        let mut modules = vec![(vk::ShaderStageFlags::VERTEX, module(&vs.tr.out.spirv)?)];
+        let mut modules = vec![(vk::ShaderStageFlags::VERTEX, module(&vs.0.out.spirv)?)];
         if let Some(mask) = key.rect_gs {
             modules.push((vk::ShaderStageFlags::GEOMETRY, module(&rdna::translate::gs::rect_list_gs(mask))?));
         }
         if let Some(p) = ps {
-            modules.push((vk::ShaderStageFlags::FRAGMENT, module(&p.tr.out.spirv)?));
+            modules.push((vk::ShaderStageFlags::FRAGMENT, module(&p.0.out.spirv)?));
         }
         let stages: Vec<vk::PipelineShaderStageCreateInfo> = modules.iter().map(|(s, m)| vk::PipelineShaderStageCreateInfo::default().stage(*s).module(*m).name(c"main")).collect();
         let vi = vk::PipelineVertexInputStateCreateInfo::default();
@@ -691,7 +740,7 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepare
             c.device.destroy_shader_module(m, None);
         }
         let pipeline = r.map_err(|(_, e)| format!("graphics pipeline: {e}"))?[0];
-        crate::gpu::pstats::report(pipeline, &format!("vs {:#x} ps {:#x}", vs.addr, ps.map_or(0, |p| p.addr)));
+        crate::gpu::pstats::report(pipeline, &format!("vs {:#x} ps {:#x}", vs.1, ps.map_or(0, |p| p.1)));
         Ok(Pipe { pipeline, layout, set_layout, push })
     }
 }
@@ -1137,7 +1186,7 @@ impl Exec {
                     cp.prefetch_compiles();
                 }
                 let created = std::cell::Cell::new(false);
-                let p = gfx_pipe_with(&key, hkey, &vs, ps.as_ref(), push_mode, &created)?;
+                let p = gfx_pipe_with(&key, hkey, (&**vs.tr, vs.addr), ps.as_ref().map(|p| (&**p.tr, p.addr)), push_mode, &created)?;
                 if crate::gpu::compile::gfx_at_first_uses() {
                     crate::gpu::compile::note_draw(vs.addr, ps_addr, &GfxRegs::capture(&|r| ctx_reg(cp, r), cp.reg(Space::Uc, 0x242)));
                 }

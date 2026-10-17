@@ -863,6 +863,23 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
 struct PipeFlight {
     done: Mutex<Option<Result<Pipe, String>>>,
     cv: parking_lot::Condvar,
+    /// The creating thread's handle when it runs at the lowest priority
+    /// (`gpu::precompile`): a thread that waits for the pipeline raises it
+    /// (it would otherwise wait behind every normal thread).
+    owner: Option<isize>,
+}
+
+impl PipeFlight {
+    fn new() -> PipeFlight {
+        PipeFlight { done: Mutex::new(None), cv: parking_lot::Condvar::new(), owner: super::precompile::boostable_thread() }
+    }
+
+    /// A thread is about to wait for this pipeline.
+    fn waited(&self) {
+        if let Some(h) = self.owner {
+            super::precompile::boost(h);
+        }
+    }
 }
 
 /// Compute pipelines being created, by key: a thread that needs one waits
@@ -891,7 +908,7 @@ pub(crate) fn compute_pipe_known(p: &Prepared) -> bool {
 }
 
 /// The graphics pipeline of a draw scanned ahead of its use (`draw`).
-pub(crate) use draw::{precompile_gfx, GfxRegs};
+pub(crate) use draw::{precompile_gfx, precompile_gfx_translations, GfxRegs, GfxState};
 
 /// Creates the compute pipeline of a stage prepared ahead of its use
 /// (`gpu::compile` workers): Some(true) when it was created here,
@@ -902,7 +919,7 @@ pub fn precompile(p: &Prepared) -> Option<bool> {
         return Some(false);
     }
     let created = std::cell::Cell::new(false);
-    let r = compute_pipe_with(p, &created);
+    let r = compute_pipe_with(&p.tr, p.addr, &created);
     if compile_trace() && created.get() {
         let key = push_key(p.tr.key, push_fits(&[p]));
         AHEAD_KEYS.lock().get_or_insert_with(HashSet::new).insert(key);
@@ -924,12 +941,31 @@ fn compile_trace() -> bool {
 /// the map's lock; a pipeline another queue created meanwhile wins; one in
 /// flight on another thread is waited for).
 fn compute_pipe(p: &Prepared) -> Result<Pipe, String> {
-    compute_pipe_with(p, &std::cell::Cell::new(false))
+    compute_pipe_with(&p.tr, p.addr, &std::cell::Cell::new(false))
 }
 
-fn compute_pipe_with(p: &Prepared, created: &std::cell::Cell<bool>) -> Result<Pipe, String> {
-    let push_mode = push_fits(&[p]);
-    let key = push_key(p.tr.key, push_mode);
+/// Whether a compute pipeline of this translation gets a push descriptor
+/// layout (`push_fits` of its stage).
+fn push_fits_tr(tr: &super::shaders::Translated) -> bool {
+    super::tune::push_desc() && tr.out.bindings.iter().map(|b| binding_count(b.kind)).sum::<u32>() <= ctx().max_push
+}
+
+/// Creates the compute pipeline of a translation made from a shader object
+/// (`gpu::precompile`) under the key its dispatches look up: Some(true)
+/// when created here, Some(false) when it existed or was in flight, None
+/// when creating it failed.
+pub(crate) fn precompile_translation(tr: &super::shaders::Translated, addr: u64) -> Option<bool> {
+    let key = push_key(tr.key, push_fits_tr(tr));
+    if PIPES.lock().as_ref().is_some_and(|m| m.contains_key(&key)) || PIPE_FLIGHTS.lock().as_ref().is_some_and(|m| m.contains_key(&key)) {
+        return Some(false);
+    }
+    let created = std::cell::Cell::new(false);
+    compute_pipe_with(tr, addr, &created).ok().map(|_| created.get())
+}
+
+fn compute_pipe_with(tr: &super::shaders::Translated, addr: u64, created: &std::cell::Cell<bool>) -> Result<Pipe, String> {
+    let push_mode = push_fits_tr(tr);
+    let key = push_key(tr.key, push_mode);
     if let Some(x) = PIPES.lock().as_ref().and_then(|m| m.get(&key)) {
         return Ok(*x);
     }
@@ -939,7 +975,7 @@ fn compute_pipe_with(p: &Prepared, created: &std::cell::Cell<bool>) -> Result<Pi
         match m.get(&key) {
             Some(f) => (false, f.clone()),
             None => {
-                let f = std::sync::Arc::new(PipeFlight { done: Mutex::new(None), cv: parking_lot::Condvar::new() });
+                let f = std::sync::Arc::new(PipeFlight::new());
                 m.insert(key, f.clone());
                 (true, f)
             }
@@ -947,6 +983,7 @@ fn compute_pipe_with(p: &Prepared, created: &std::cell::Cell<bool>) -> Result<Pi
     };
     if !mine {
         let t = std::time::Instant::now();
+        flight.waited();
         let r = {
             let mut d = flight.done.lock();
             while d.is_none() {
@@ -961,7 +998,7 @@ fn compute_pipe_with(p: &Prepared, created: &std::cell::Cell<bool>) -> Result<Pi
             return r;
         }
         // The other attempt failed: this one reports its own error.
-        return compute_pipe_create(p, push_mode, key, created);
+        return compute_pipe_create(tr, addr, push_mode, key, created);
     }
     // Stored meanwhile by a thread that finished just before this one
     // registered.
@@ -969,7 +1006,7 @@ fn compute_pipe_with(p: &Prepared, created: &std::cell::Cell<bool>) -> Result<Pi
     // A panic must not leave the threads waiting for it blocked.
     let r = match stored {
         Some(x) => Ok(x),
-        None => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compute_pipe_create(p, push_mode, key, created))).unwrap_or_else(|_| Err("pipeline creation panicked".to_string())),
+        None => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compute_pipe_create(tr, addr, push_mode, key, created))).unwrap_or_else(|_| Err("pipeline creation panicked".to_string())),
     };
     *flight.done.lock() = Some(r.clone());
     flight.cv.notify_all();
@@ -979,20 +1016,20 @@ fn compute_pipe_with(p: &Prepared, created: &std::cell::Cell<bool>) -> Result<Pi
     r
 }
 
-fn compute_pipe_create(p: &Prepared, push_mode: bool, key: u64, created: &std::cell::Cell<bool>) -> Result<Pipe, String> {
+fn compute_pipe_create(tr: &super::shaders::Translated, addr: u64, push_mode: bool, key: u64, created: &std::cell::Cell<bool>) -> Result<Pipe, String> {
     created.set(true);
     let t0 = std::time::Instant::now();
-    let pipe = compute_pipeline(&p.tr.out, push_mode, Some(key))?;
-    super::compile::note_program(p.addr);
+    let pipe = compute_pipeline(&tr.out, push_mode, Some(key))?;
+    super::compile::note_program(addr);
     PIPES_CREATED[0].fetch_add(1, Ordering::Relaxed);
     PIPES_NS[0].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     if pipe.push {
         PIPES_PUSH[0].fetch_add(1, Ordering::Relaxed);
     }
-    super::pstats::report(pipe.pipeline, &format!("cs {:#x}", p.addr));
+    super::pstats::report(pipe.pipeline, &format!("cs {:#x}", addr));
     let ms = t0.elapsed().as_millis();
     if ms >= 200 {
-        crate::info!("gpu: compute pipeline for cs {:#x} ({} SPIR-V words) took {ms} ms", p.addr, p.tr.out.spirv.len());
+        crate::info!("gpu: compute pipeline for cs {:#x} ({} SPIR-V words) took {ms} ms", addr, tr.out.spirv.len());
     }
     Ok(keep_pipe(&PIPES, key, pipe))
 }
@@ -2104,9 +2141,6 @@ static UNSUBMITTED_LABELS: Mutex<Option<HashMap<u64, std::sync::Arc<std::sync::a
 /// GPU-side label writes recorded while another queue blocked on the label
 /// (`tune label_early`: their batches were submitted at the next packet).
 pub static LABEL_EARLY: AtomicU64 = AtomicU64::new(0);
-/// A batch holding unsubmitted labels is submitted after recording this long
-/// (CPU threads of the title may poll them).
-const LABEL_LATENCY: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Asks the queue whose unsubmitted batch writes the label at `a` to submit
 /// it (`Cp::wait`, before polling).
@@ -3824,7 +3858,7 @@ fn cs_cpu_lines() -> String {
         }
         if i == 16 + n_main {
             s.push_str(&format!(
-                "    compute queues' indirect dispatches by command-processor time (also those whose arguments the CPU read; dispatches with no groups found after their preparation since boot: {} direct, {} indirect):\n",
+                "    compute queues' indirect dispatches by command-processor time (also those whose arguments the CPU read; dispatches with no groups since boot: {} direct, {} indirect):\n",
                 ZERO_GROUPS[0].load(Ordering::Relaxed),
                 ZERO_GROUPS[1].load(Ordering::Relaxed)
             ));
@@ -3961,8 +3995,8 @@ pub fn set_cpu_indirect(on: bool) {
     CPU_INDIRECT.with(|c| c.set(on));
 }
 
-/// Dispatches with no groups, found after their preparation: [direct, indirect
-/// with the arguments read by the CPU].
+/// Dispatches with no groups (left out before their preparation): [direct,
+/// indirect with the arguments read by the CPU].
 pub static ZERO_GROUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// The bind step (`Exec::bind_stage`) by part (DS_PROFILE_GPU; TSC cycles):
@@ -7249,9 +7283,10 @@ impl Exec {
     }
 
     /// Whether the recording batch should be submitted now: another queue
-    /// waits for one of its labels, or they have waited `LABEL_LATENCY`.
+    /// waits for one of its labels, or the batch has recorded for `tune
+    /// label_latency`.
     pub fn submit_requested(&self) -> bool {
-        self.recording && !self.pending_promises.is_empty() && (self.submit_request.load(Ordering::Relaxed) || self.begun_at.elapsed() > LABEL_LATENCY)
+        self.recording && !self.pending_promises.is_empty() && (self.submit_request.load(Ordering::Relaxed) || self.begun_at.elapsed() > super::tune::label_latency())
     }
 
     /// Indirect arguments at `a` (12 bytes) a resident shadow holds whole and
@@ -8308,6 +8343,13 @@ impl Exec {
         let t_start = std::time::Instant::now();
         let t0 = profiling().then_some(t_start);
         let since = |t0: Option<std::time::Instant>| t0.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        // No groups (direct, or arguments the CPU read): nothing runs, so
+        // nothing is prepared or waited for (~100,000 in a boot to the gate,
+        // ~7 per flip there).
+        if indirect.is_none() && groups.contains(&0) {
+            ZERO_GROUPS[CPU_INDIRECT.with(|c| c.get()) as usize].fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
         let kind = self.cs_kind(indirect.is_some());
         let first = self.batch_shaders.is_empty();
         let mut lap = Laps::for_dispatch(kind, first);
@@ -8948,6 +8990,7 @@ pub fn status() -> String {
             draw::ATTACHLESS.load(Ordering::Relaxed)
         )
         + &super::precache::status()
+        + &super::precompile::status()
         + &super::lockstat::status()
         + &super::pcache::status()
         + &super::images::scrub_status()

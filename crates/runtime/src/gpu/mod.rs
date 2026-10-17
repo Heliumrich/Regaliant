@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 125] = [
+    static ALL: [Tunable; 128] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -152,6 +152,9 @@ pub mod tune {
         Tunable { name: "compile_ahead", env: "DS_COMPILE_AHEAD", default: COMPILE_AHEAD_AUTO, value: AtomicU64::new(UNSET) },
         Tunable { name: "lane_guards", env: "DS_LANE_GUARDS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "compile_gfx", env: "DS_COMPILE_GFX", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "label_latency", env: "DS_LABEL_LATENCY", default: 2000, value: AtomicU64::new(UNSET) },
+        Tunable { name: "precompile", env: "DS_PRECOMPILE", default: 2, value: AtomicU64::new(UNSET) },
+        Tunable { name: "precompile_workers", env: "DS_PRECOMPILE_WORKERS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -941,7 +944,7 @@ pub mod tune {
 
     /// A GPU-side label write recorded while another queue blocks on that
     /// label submits its batch at the next packet (0: when another queue
-    /// asks before the write is recorded, or after `LABEL_LATENCY`).
+    /// asks before the write is recorded, or after `label_latency`).
     #[inline]
     pub fn label_early() -> bool {
         get(84) != 0
@@ -1358,6 +1361,37 @@ pub mod tune {
         get(124) != 0
     }
 
+    /// A batch holding GPU-side label writes is submitted once it has
+    /// recorded this long, us (CPU threads of the title may poll them;
+    /// another queue that waits for one asks at once).
+    #[inline]
+    pub fn label_latency() -> std::time::Duration {
+        std::time::Duration::from_micros(get(125))
+    }
+
+    /// Pipelines made ahead from learned specs (`gpu::precompile`): 1 learns
+    /// each compute program's specs at its first translations and each
+    /// graphics pipeline's stages and state, with the programs' code (and
+    /// compares the guess from a compute object, statistics); 2 (default
+    /// since 2026-10-17) also makes the learned pipelines on
+    /// `precompile_workers` threads at the lowest priority, from the start
+    /// of a session or when the title creates the programs' objects; 3 a
+    /// compute object's guess too; 0 off.
+    #[inline]
+    pub fn precompile() -> u64 {
+        get(126)
+    }
+
+    /// Threads that make pipelines from shader objects (`precompile` 2; at
+    /// the lowest priority). 0: as many as `compile_ahead`'s workers.
+    #[inline]
+    pub fn precompile_workers() -> u64 {
+        match get(127) {
+            0 => compile_ahead(),
+            n => n,
+        }
+    }
+
     /// A switch's value by name; None if unknown.
     pub fn value(name: &str) -> Option<u64> {
         ALL.iter().position(|t| t.name == name).map(get)
@@ -1382,6 +1416,7 @@ pub mod forward;
 pub mod par;
 pub mod prio;
 pub mod precache;
+pub mod precompile;
 pub mod lockstat;
 pub mod exec;
 

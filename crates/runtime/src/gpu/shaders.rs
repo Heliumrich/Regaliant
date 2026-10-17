@@ -1574,6 +1574,348 @@ thread_local! {
     /// that alternating the modes in a replay A/B leaves the map as it was).
     static PREP_LATEST: std::cell::RefCell<[Option<(u64, PrepEntry)>; 2]> = const { std::cell::RefCell::new([None, None]) };
     static LOCAL_DEPS: std::cell::RefCell<super::fx::Map<u64, u32>> = std::cell::RefCell::new(super::fx::Map::default());
+    /// `format_resources` per plan.
+    static LOCAL_FORMATS: std::cell::RefCell<super::fx::Map<u64, u64>> = std::cell::RefCell::new(super::fx::Map::default());
+}
+
+/// The resources of `plan` whose V# format and swizzle the translation
+/// reads (format loads and stores, typed buffer ones included; a bit per
+/// resource, all past 64). Other buffers keep them out of their spec: one
+/// translation whatever the title's descriptors hold there (and a spec a
+/// shader object alone can give, `guess_compute_spec`).
+fn format_resources(insts: &[rdna::Inst], plan: &Plan) -> u64 {
+    if plan.resources.len() > 64 {
+        return u64::MAX;
+    }
+    let mut m = 0u64;
+    for i in insts {
+        let Some(n) = i.name() else { continue };
+        let n = n.strip_prefix('t').unwrap_or(n);
+        if n.starts_with("buffer_load_format_") || n.starts_with("buffer_store_format_") {
+            if let Some(&(r, _)) = plan.inst_res.get(&i.pc) {
+                m |= 1 << r.min(63);
+            }
+        }
+    }
+    m
+}
+
+/// Translates `insts` (planned as `plan`) for `spec` and keeps the
+/// translation under (plan_key, spec_hash) for `key_spec` (the spec it is
+/// kept for: the code base left out).
+fn translate_kept(addr: u64, insts: &[rdna::Inst], plan: &Arc<Plan>, plan_key: u64, spec_hash: u64, spec: &Spec, key_spec: Spec) -> Result<Arc<Translated>, String> {
+    let t0 = std::time::Instant::now();
+    let out = translate::translate(insts, plan, spec).map_err(|e| format!("{:?} shader {addr:#x}: {e}", spec.stage))?;
+    let ms = t0.elapsed().as_millis();
+    if ms >= 100 {
+        crate::info!("{:?} shader {addr:#x}: translated in {ms} ms ({} instructions, {} SPIR-V words)", spec.stage, insts.len(), out.spirv.len());
+    }
+    // Large translations compile for seconds on first use (play stalled
+    // 0.5-3.4 s per effect shader, FINDINGS.md 2026-10-14): each logged
+    // once, its program saved.
+    if out.spirv.len() >= BIG_SPIRV_WORDS && BIG_SPIRV_SEEN.lock().get_or_insert_with(std::collections::HashSet::new).insert(addr) {
+        let saved = super::capture::save_program(addr).map(|f| format!("; program saved to {}", f.display())).unwrap_or_default();
+        crate::info!(
+            "{:?} shader {addr:#x}: {} instructions -> {} SPIR-V words ({:.0} per instruction; wave64 {}, per lane {}, lane votes {}, local size {:?}){saved}",
+            spec.stage,
+            insts.len(),
+            out.spirv.len(),
+            out.spirv.len() as f64 / insts.len().max(1) as f64,
+            spec.wave64,
+            spec.per_lane,
+            spec.lane_votes,
+            spec.cs_local_size
+        );
+    }
+    for w in &out.warnings {
+        crate::warn!("{:?} shader {addr:#x}: {w}", spec.stage);
+    }
+    let mut atomic_res: Vec<usize> = insts
+        .iter()
+        .filter(|i| i.name().is_some_and(|n| n.starts_with("buffer_atomic_") || n.starts_with("global_atomic_")))
+        .filter_map(|i| plan.inst_res.get(&i.pc).map(|r| r.0))
+        .collect();
+    atomic_res.sort_unstable();
+    atomic_res.dedup();
+    let t = Arc::new(Translated { out, plan: Arc::clone(plan), key: plan_key ^ spec_hash.rotate_left(1), atomic_res, spec: key_spec });
+    TRANSLATIONS.lock().get_or_insert_with(HashMap::new).insert((plan_key, spec_hash), t.clone());
+    Ok(t)
+}
+
+/// The code hash of the program at `addr` (as `prepare` keys it).
+pub(crate) fn program_hash(addr: u64) -> Result<u64, String> {
+    program_local(addr).map(|(_, h)| h)
+}
+
+/// The words of the program at `addr` its code hash covers (up to its last
+/// instruction), and that hash (`gpu::precompile` keeps them).
+pub(crate) fn program_code(addr: u64) -> Result<(Vec<u32>, u64), String> {
+    let code = code_slice(addr).ok_or_else(|| format!("shader {addr:#x} not mapped"))?;
+    let insts = rdna::decode_program(code).map_err(|e| format!("decode {addr:#x}: {}", e.0))?;
+    let last = insts.last().ok_or("empty program")?;
+    let words = ((last.pc / 4 + last.len as u32) as usize).min(code.len());
+    Ok((code[..words].to_vec(), hash_words(&code[..words])))
+}
+
+/// The translation of stored program words (`gpu::precompile`, before the
+/// title has loaded the program) for `key_spec`, kept where `prepare`
+/// looks for it (translations do not depend on the program's address).
+pub(crate) fn translate_code_for_spec(code: &[u32], code_hash: u64, key_spec: Spec) -> Result<Arc<Translated>, String> {
+    if super::tune::gpu_loads_mode() != 0 {
+        return Err("gpu_loads".into());
+    }
+    if hash_words(code) != code_hash {
+        return Err("stored code does not match its hash".into());
+    }
+    let plan_key = code_hash ^ (key_spec.user_sgprs as u64) << 48 ^ (key_spec.user_base as u64) << 56;
+    let spec_hash = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key_spec.hash(&mut h);
+        h.finish()
+    };
+    if let Some(t) = TRANSLATIONS.lock().as_ref().and_then(|m| m.get(&(plan_key, spec_hash)).cloned()) {
+        return Ok(t);
+    }
+    let insts = rdna::decode_program(code).map_err(|e| format!("decode stored code: {}", e.0))?;
+    let cached = PLANS.lock().as_ref().and_then(|m| m.get(&plan_key).cloned());
+    let plan = match cached {
+        Some(p) => p,
+        None => {
+            let p = Arc::new(rdna::analysis::analyze_opts(&insts, key_spec.user_sgprs, key_spec.user_base, false));
+            PLANS.lock().get_or_insert_with(HashMap::new).insert(plan_key, p.clone());
+            p
+        }
+    };
+    if !plan.errors.is_empty() {
+        return Err(plan.errors.join("; "));
+    }
+    translate_kept(0, &insts, &plan, plan_key, spec_hash, &key_spec.clone(), key_spec)
+}
+
+/// `program_hash` without keeping the decoded program (`gpu::precompile`
+/// looks at every shader object the title creates, ~40,000 in a session,
+/// and makes pipelines for few).
+pub(crate) fn program_hash_uncached(addr: u64) -> Result<u64, String> {
+    if let Some(p) = PROGRAMS.lock().as_ref().and_then(|m| m.get(&addr).map(|p| (p.words, p.hash))) {
+        if let Some(code) = code_slice(addr) {
+            if p.0 <= code.len() && hash_words(&code[..p.0]) == p.1 {
+                return Ok(p.1);
+            }
+        }
+    }
+    let code = code_slice(addr).ok_or_else(|| format!("shader {addr:#x} not mapped"))?;
+    let insts = rdna::decode_program(code).map_err(|e| format!("decode {addr:#x}: {}", e.0))?;
+    let last = insts.last().ok_or("empty program")?;
+    let words = (last.pc / 4 + last.len as u32) as usize;
+    Ok(hash_words(&code[..words.min(code.len())]))
+}
+
+/// The decoded program at `addr` and its plan for `user_sgprs` user-data
+/// dwords from SGPR `user_base` (as `prepare` makes them without GPU-side
+/// data loads).
+pub(crate) fn stage_plan(addr: u64, user_sgprs: u16, user_base: u16) -> Result<(Arc<Local<Vec<rdna::Inst>>>, Arc<Plan>, u64), String> {
+    let (insts, code_hash) = program_local(addr)?;
+    let plan_key = code_hash ^ (user_sgprs as u64) << 48 ^ (user_base as u64) << 56;
+    let cached = PLANS.lock().as_ref().and_then(|m| m.get(&plan_key).cloned());
+    let plan = match cached {
+        Some(p) => p,
+        None => {
+            let p = Arc::new(rdna::analysis::analyze_opts(&insts, user_sgprs, user_base, false));
+            PLANS.lock().get_or_insert_with(HashMap::new).insert(plan_key, p.clone());
+            p
+        }
+    };
+    if !plan.errors.is_empty() {
+        return Err(plan.errors.join("; "));
+    }
+    Ok((insts, plan, code_hash))
+}
+
+/// The translation of the program at `addr` for `key_spec` (a key spec as
+/// `compute_spec`, `vertex_spec` or `pixel_spec` make it; `gpu::precompile`),
+/// kept where `prepare` looks for it.
+pub(crate) fn translate_for_spec(addr: u64, key_spec: Spec) -> Result<Arc<Translated>, String> {
+    // Only the default form (data loads resolved by the CPU) is made ahead.
+    if super::tune::gpu_loads_mode() != 0 {
+        return Err("gpu_loads".into());
+    }
+    let (insts, plan, code_hash) = stage_plan(addr, key_spec.user_sgprs, key_spec.user_base)?;
+    let plan_key = code_hash ^ (key_spec.user_sgprs as u64) << 48 ^ (key_spec.user_base as u64) << 56;
+    let spec_hash = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key_spec.hash(&mut h);
+        h.finish()
+    };
+    if let Some(t) = TRANSLATIONS.lock().as_ref().and_then(|m| m.get(&(plan_key, spec_hash)).cloned()) {
+        return Ok(t);
+    }
+    let mut spec = key_spec.clone();
+    spec.code_base = addr;
+    translate_kept(addr, &insts, &plan, plan_key, spec_hash, &spec, key_spec)
+}
+
+/// The translation spec of a compute program at `addr` guessed from its
+/// shader object (`gpu::precompile`): the user-data count, RSRC2 and thread
+/// group size it carries; wave64 unless the code saves EXEC in 32 bits;
+/// images by their instructions' dimension as float views, those sampled
+/// with a depth comparison as depth views; buffers as `prepare` keys them
+/// (unknown for format accesses).
+pub(crate) fn guess_compute_spec(addr: u64, insts: &[rdna::Inst], plan: &Plan, code_hash: u64, rsrc2: u32, local: [u32; 3]) -> (Spec, bool) {
+    let wave64 = !insts.iter().any(|i| i.name().is_some_and(|n| n.ends_with("_saveexec_b32") || n.ends_with("_wrexec_b32")));
+    let fmt = format_resources(insts, plan);
+    let user_sgprs = ((rsrc2 >> 1) & 0x1F).min(16) as u16;
+    let plan_key = code_hash ^ (user_sgprs as u64) << 48;
+    let cmp = super::tune::cmp_emulate().then(|| compare_images(plan_key, insts, plan)).unwrap_or(0);
+    let mut known = true;
+    let resources = plan
+        .resources
+        .iter()
+        .enumerate()
+        .map(|(r, res)| match res.kind {
+            ResKind::Buffer if fmt & (1 << r.min(63)) != 0 => {
+                known = false;
+                ResSpec::Buffer { format: 0, dst_sel: 0xFAC }
+            }
+            ResKind::Buffer => ResSpec::Buffer { format: 0, dst_sel: 0 },
+            ResKind::Global => ResSpec::Global,
+            ResKind::Sampler => ResSpec::Sampler,
+            ResKind::Image | ResKind::ImageTable => {
+                let dim = insts
+                    .iter()
+                    .find(|i| i.enc == rdna::Enc::Mimg && plan.inst_res.get(&i.pc).is_some_and(|x| x.0 == r))
+                    .map(|i| match i.mimg_dim() {
+                        0 => ImageDim::D1,
+                        1 => ImageDim::D2,
+                        2 => ImageDim::D3,
+                        3 => ImageDim::Cube,
+                        4 => ImageDim::D1Array,
+                        5 => ImageDim::D2Array,
+                        6 => ImageDim::D2Msaa,
+                        _ => ImageDim::D2MsaaArray,
+                    })
+                    .unwrap_or(ImageDim::D2);
+                // As `prepare` decides: images keep depth views without
+                // comparison emulation, else only the compared ones.
+                let depth = match res.kind {
+                    ResKind::ImageTable => false,
+                    _ if !super::tune::cmp_emulate() => true,
+                    _ => r < 64 && cmp & (1 << r) != 0,
+                };
+                ResSpec::Image { dim, class: NumClass::Float, depth }
+            }
+        })
+        .collect();
+    (compute_spec(addr, code_hash, rsrc2, local, wave64, resources), known)
+}
+
+/// The key spec (code base left out) `prepare_ngg` makes for the vertex
+/// program at `addr` drawn with these registers and descriptors, under the
+/// current switches (None while vertex dumps are on: they depend on the
+/// code).
+pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instance_sgpr: Option<u16>, resources: Vec<ResSpec>) -> Option<Spec> {
+    if super::capture::vs_dump().is_some() {
+        return None;
+    }
+    let _ = addr;
+    Some(Spec {
+        stage: Stage::Vertex,
+        user_sgprs,
+        user_base: 8,
+        code_base: 0,
+        wave64,
+        ps_input_addr: 0,
+        ps_inputs: Vec::new(),
+        barycentric: false,
+        mrt: [MrtSpec::default(); 8],
+        cs_local_size: [1, 1, 1],
+        cs_rsrc2: 0,
+        resources,
+        binding_base: 0,
+        probe: None,
+        dump: None,
+        force_dispatcher: super::tune::block_chain() == 0,
+        dispatcher_for_loops: super::tune::block_chain() == 2,
+        reg_vars: super::tune::reg_vars(),
+        lane_guards: super::tune::lane_guards(),
+        mip_views: super::tune::mip_views(),
+        lod_stats: super::tune::lod_stats() == 3,
+        early_tests: false,
+        per_lane: false,
+        lane_votes: false,
+        base_instance_sgpr,
+    })
+}
+
+/// The key spec `prepare_ps` makes for the pixel program at `addr` drawn
+/// with these registers and descriptors, under the current switches.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr: u32, ps_inputs: Vec<PsInput>, mrt: [MrtSpec; 8], early_tests: bool, resources: Vec<ResSpec>) -> Spec {
+    Spec {
+        stage: Stage::Fragment,
+        user_sgprs,
+        user_base: 0,
+        code_base: 0,
+        wave64,
+        ps_input_addr,
+        ps_inputs,
+        barycentric: super::vk::ctx().barycentric,
+        mrt,
+        cs_local_size: [1, 1, 1],
+        cs_rsrc2: 0,
+        resources,
+        binding_base: PS_BINDING_BASE,
+        probe: probe_for(addr),
+        dump: None,
+        force_dispatcher: super::tune::block_chain() == 0,
+        dispatcher_for_loops: super::tune::block_chain() == 2,
+        reg_vars: super::tune::reg_vars(),
+        lane_guards: super::tune::lane_guards(),
+        mip_views: super::tune::mip_views(),
+        lod_stats: super::tune::lod_stats() == 3,
+        early_tests,
+        per_lane: false,
+        lane_votes: false,
+        base_instance_sgpr: None,
+    }
+}
+
+/// The key spec (code base left out) `prepare_compute` makes for the
+/// compute program at `addr` (code hash `code_hash`) dispatched with these
+/// registers and descriptors, under the current switches.
+pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3], wave64: bool, resources: Vec<ResSpec>) -> Spec {
+    let mut spec = Spec {
+        stage: Stage::Compute,
+        user_sgprs: ((rsrc2 >> 1) & 0x1F).min(16) as u16,
+        user_base: 0,
+        code_base: 0,
+        wave64,
+        ps_input_addr: 0,
+        ps_inputs: Vec::new(),
+        barycentric: false,
+        mrt: [MrtSpec::default(); 8],
+        cs_local_size: local,
+        cs_rsrc2: rsrc2,
+        resources,
+        binding_base: 0,
+        probe: probe_for(addr),
+        dump: dump_for(addr),
+        force_dispatcher: super::tune::block_chain() == 0,
+        dispatcher_for_loops: super::tune::block_chain() == 2,
+        reg_vars: super::tune::reg_vars(),
+        lane_guards: super::tune::lane_guards(),
+        mip_views: super::tune::mip_views(),
+        lod_stats: super::tune::lod_stats() == 3,
+        early_tests: false,
+        per_lane: false,
+        lane_votes: false,
+        base_instance_sgpr: None,
+    };
+    if super::tune::per_lane() != 0 && per_lane_program(code_hash) {
+        let votes = lane_votes_program(code_hash);
+        spec.per_lane = super::tune::per_lane() == 1 || !votes;
+        spec.lane_votes = spec.per_lane && votes;
+    }
+    spec
 }
 /// Preparations served from / missing PREP_CACHE (diagnostics).
 pub static PREP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1812,6 +2154,7 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     let mut res_addrs = pool::addrs(plan.resources.len());
     spec.resources.clear();
     spec.resources.reserve(plan.resources.len());
+    let fmt_mask = if plan.resources.iter().any(|r| r.kind == ResKind::Buffer) { LOCAL_FORMATS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| format_resources(&insts, &plan))) } else { 0 };
     for (i, res) in plan.resources.iter().enumerate() {
         let mut w = [0u32; 8];
         let src = match res.dwords.first() {
@@ -1830,7 +2173,10 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         match res.kind {
             ResKind::Buffer => {
                 let v = Vsharp::decode(&w);
-                spec.resources.push(ResSpec::Buffer { format: v.format, dst_sel: v.dst_sel });
+                // Raw accesses do not read the format and swizzle (see
+                // `format_resources`).
+                let (format, dst_sel) = if fmt_mask & (1 << i.min(63)) != 0 { (v.format, v.dst_sel) } else { (0, 0) };
+                spec.resources.push(ResSpec::Buffer { format, dst_sel });
                 resources.push(Resolved::Buffer(v));
             }
             ResKind::Global => {
@@ -1963,41 +2309,12 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         let t = match cached {
             Some(t) => t,
             None => {
-                let t0 = std::time::Instant::now();
-                let out = translate::translate(&insts, &plan, spec).map_err(|e| format!("{:?} shader {addr:#x}: {e}", spec.stage))?;
-                let ms = t0.elapsed().as_millis();
-                if ms >= 100 {
-                    crate::info!("{:?} shader {addr:#x}: translated in {ms} ms ({} instructions, {} SPIR-V words)", spec.stage, insts.len(), out.spirv.len());
+                if spec.stage == Stage::Compute && super::tune::precompile() > 0 {
+                    if let Some(ks) = &key_spec {
+                        super::precompile::first_translation(addr, &insts, &plan, code_hash, ks);
+                    }
                 }
-                // Large translations compile for seconds on first use (play
-                // stalled 0.5-3.4 s per effect shader, FINDINGS.md
-                // 2026-10-14): each logged once, its program saved.
-                if out.spirv.len() >= BIG_SPIRV_WORDS && BIG_SPIRV_SEEN.lock().get_or_insert_with(std::collections::HashSet::new).insert(addr) {
-                    let saved = super::capture::save_program(addr).map(|f| format!("; program saved to {}", f.display())).unwrap_or_default();
-                    crate::info!(
-                        "{:?} shader {addr:#x}: {} instructions -> {} SPIR-V words ({:.0} per instruction; wave64 {}, per lane {}, lane votes {}, local size {:?}){saved}",
-                        spec.stage,
-                        insts.len(),
-                        out.spirv.len(),
-                        out.spirv.len() as f64 / insts.len().max(1) as f64,
-                        spec.wave64,
-                        spec.per_lane,
-                        spec.lane_votes,
-                        spec.cs_local_size
-                    );
-                }
-                for w in &out.warnings {
-                    crate::warn!("{:?} shader {addr:#x}: {w}", spec.stage);
-                }
-                let mut atomic_res: Vec<usize> = insts
-                    .iter()
-                    .filter(|i| i.name().is_some_and(|n| n.starts_with("buffer_atomic_") || n.starts_with("global_atomic_")))
-                    .filter_map(|i| plan.inst_res.get(&i.pc).map(|r| r.0))
-                    .collect();
-                atomic_res.sort_unstable();
-                atomic_res.dedup();
-                let t = Arc::new(Translated { out, plan: Arc::clone(&plan), key: plan_key ^ spec_hash.rotate_left(1), atomic_res, spec: key_spec.clone().unwrap_or_else(|| spec.clone()) });
-                TRANSLATIONS.lock().get_or_insert_with(HashMap::new).insert((plan_key, spec_hash), t.clone());
+                let t = translate_kept(addr, &insts, &plan, plan_key, spec_hash, spec, key_spec.clone().unwrap_or_else(|| spec.clone()))?;
                 LOCAL_TRANSLATIONS.with(|c| c.borrow_mut().insert((plan_key, spec_hash), t.clone()));
                 t
             }

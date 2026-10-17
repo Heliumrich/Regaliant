@@ -839,6 +839,14 @@ fn main() {
     // store (experiments that start without compiled pipelines).
     let pipe_dir = std::env::var("DS_PIPELINE_DIR").ok().filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')).unwrap_or_else(|| "pipelines".into());
     gpu::pcache::set_dir(cfg.root.join("local-data").join(pipe_dir));
+    // DS_SPECS=<file name under local-data, or a path>: where the shader
+    // programs' learned specs and code are kept (`gpu::precompile`).
+    let specs = std::env::var("DS_SPECS").ok().filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+    gpu::precompile::set_store(match specs {
+        Some(p) if p.components().count() > 1 => p,
+        Some(p) => cfg.root.join("local-data").join(p),
+        None => cfg.root.join("local-data").join("shader-specs.txt"),
+    });
 
     // Modules: the decrypted executable and the title's own libraries.
     let t0 = Instant::now();
