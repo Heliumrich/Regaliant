@@ -613,6 +613,10 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     } else if let Some(list) = arg.strip_prefix("ps=") {
                         // ... reports of the targets of draws with these pixel shaders.
                         gpu::capture::set_draw_ps(list.split(',').filter_map(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()).collect());
+                    } else if let Some(list) = arg.strip_prefix("vs=") {
+                        // ... and of draws with these vertex programs (with
+                        // DS_VS_DUMP, their vertices' registers or positions).
+                        gpu::capture::set_draw_vs(list.split(',').filter_map(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()).collect());
                     } else if let Some(list) = arg.strip_prefix("images=") {
                         // ... only these images (PNG and raw texels) after
                         // each dispatch that writes them.

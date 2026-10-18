@@ -3239,7 +3239,7 @@ impl Cp {
                 match args {
                     Some(a) => {
                         self.draw(a);
-                        if super::capture::draw_dumps() || super::capture::watching() {
+                        if super::capture::draw_dumps() || super::capture::watching() || super::capture::listed_draw(self) {
                             // Per-draw target dumps: complete the draw first.
                             if let Some(e) = self.exec.as_mut() {
                                 e.flush();

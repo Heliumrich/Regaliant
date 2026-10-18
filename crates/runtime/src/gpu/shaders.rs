@@ -1214,7 +1214,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         resources,
         binding_base: 0,
         probe: None,
-        dump: super::capture::vs_dump().and_then(|(first, inst, count)| {
+        dump: super::capture::vs_dump_for(addr).and_then(|(first, inst, count)| {
             let at = super::capture::vs_dump_pc().filter(|pc| insts.iter().any(|i| i.pc == *pc));
             at.or_else(|| pos_export(&insts).map(|i| i.pc)).map(|pc| (pc, [first, inst, count]))
         }),
@@ -1816,7 +1816,7 @@ pub(crate) fn guess_compute_spec(addr: u64, insts: &[rdna::Inst], plan: &Plan, c
 /// current switches (None while vertex dumps are on: they depend on the
 /// code).
 pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instance_sgpr: Option<u16>, resources: Vec<ResSpec>) -> Option<Spec> {
-    if super::capture::vs_dump().is_some() {
+    if super::capture::vs_dump().is_some() || super::capture::vs_dump_for(addr).is_some() {
         return None;
     }
     let _ = addr;

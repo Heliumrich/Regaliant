@@ -39,6 +39,11 @@ pub fn capturing() -> bool {
     ACTIVE.try_lock().is_some_and(|g| g.is_some())
 }
 
+/// A frame is being captured (set and cleared with `ACTIVE`'s capture):
+/// the lock-free form for translation-time checks, where `capturing`'s
+/// try_lock fails whenever another thread writes the capture's record.
+static CAPTURE_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Called by the graphics queue for each flip packet (`flip` = flips so far).
 /// Frames still to capture after the current one (DS_CAPTURE_COUNT).
 static MORE: AtomicU64 = AtomicU64::new(0);
@@ -57,6 +62,7 @@ pub fn on_flip(flip: u64) {
         // Consecutive captures: text only (no texture, target or draw dumps).
         let more = MORE.load(Ordering::SeqCst);
         let last = more == 0;
+        CAPTURE_ON.store(!last, Ordering::SeqCst);
         finish(c, last);
         if !last {
             MORE.store(more - 1, Ordering::SeqCst);
@@ -69,6 +75,7 @@ pub fn on_flip(flip: u64) {
         ARMED.store(u64::MAX, Ordering::SeqCst);
         MORE.store(std::env::var("DS_CAPTURE_COUNT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1).saturating_sub(1), Ordering::SeqCst);
         *g = Some(Capture { flip, text: format!("# frame after flip {flip}\n"), shaders: BTreeSet::new(), events: 0, textures: Default::default() });
+        CAPTURE_ON.store(true, Ordering::SeqCst);
         crate::info!("capture: recording the frame after flip {flip}");
     }
 }
@@ -281,6 +288,33 @@ pub fn set_draw_ps(list: Vec<u64>) {
 
 fn ps_listed(cp: &Cp) -> bool {
     DRAW_PS.lock().as_ref().is_some_and(|l| l.contains(&super::shaders::ps_addr(cp)))
+}
+
+/// Vertex programs whose draws get target reports and, with `DS_VS_DUMP`,
+/// register dumps in every captured frame (`capture vs=<hex>[,<hex>...]`),
+/// wherever they fall in the frame (event numbers move from run to run).
+static DRAW_VS: Mutex<Option<Vec<u64>>> = Mutex::new(None);
+
+pub fn set_draw_vs(list: Vec<u64>) {
+    *DRAW_VS.lock() = Some(list);
+}
+
+fn vs_listed(cp: &Cp) -> bool {
+    DRAW_VS.lock().as_ref().is_some_and(|l| l.contains(&super::shaders::ngg_addr(cp)))
+}
+
+/// A draw on the `capture ps=` / `vs=` lists while a frame is captured: its
+/// report reads its targets (and vertex dumps) after it, so it completes
+/// first.
+pub fn listed_draw(cp: &Cp) -> bool {
+    CAPTURE_ON.load(Ordering::Relaxed) && (ps_listed(cp) || vs_listed(cp))
+}
+
+/// `vs_dump` for the vertex program at `addr`: also while a frame is
+/// captured when the program is on the `capture vs=` list.
+pub fn vs_dump_for(addr: u64) -> Option<(u32, u32, u32)> {
+    let v = vs_dump_env()?;
+    (draw_dumps() || (CAPTURE_ON.load(Ordering::Relaxed) && DRAW_VS.lock().as_ref().is_some_and(|l| l.contains(&addr)))).then_some(v)
 }
 
 fn dumps_env() -> Option<(u64, u64)> {
@@ -646,7 +680,7 @@ pub fn draw(cp: &Cp, what: &str) {
         cp.reg(Space::Uc, 0x25B),
         cp.last_draw
     );
-    if dumps_env().is_some() || ps_listed(cp) || WATCH_PIXEL.lock().is_some() {
+    if dumps_env().is_some() || ps_listed(cp) || vs_listed(cp) || WATCH_PIXEL.lock().is_some() {
         if let Some(n) = dump_draw_target(cp, c.events) {
             let _ = writeln!(s, "    target after draw: {n}");
         }
