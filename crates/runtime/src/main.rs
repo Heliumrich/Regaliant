@@ -34,6 +34,10 @@ pub struct Config {
     pub seconds: Option<u64>,
     /// Development control channel (see `poll_control`).
     pub control: Option<PathBuf>,
+    /// `--cache <dir>`: where compiled pipelines (`pipelines/`) and the
+    /// learned shader specs (`shader-specs.txt`, `.code`) are kept, instead
+    /// of local-data (play-test packages extracted side by side share one).
+    pub cache: Option<PathBuf>,
     /// `--pipeline-test <capture.txt>`: create pipelines for a captured frame and exit.
     pub pipeline_test: Option<String>,
     /// `--record-bench <capture> [<cs address>]` (`gpu::exec::record_bench`).
@@ -125,6 +129,7 @@ fn parse_args() -> Config {
     let mut debug = false;
     let mut headless = false;
     let mut control = None;
+    let mut cache = None;
     let mut app = None;
     let mut pipeline_test = None;
     let mut record_bench = None;
@@ -138,6 +143,7 @@ fn parse_args() -> Config {
             "--headless" => headless = true,
             "--root" => root = PathBuf::from(args.next().expect("--root needs a path")),
             "--control" => control = Some(PathBuf::from(args.next().expect("--control needs a path"))),
+            "--cache" => cache = Some(PathBuf::from(args.next().expect("--cache needs a directory"))),
             "--app" => app = Some(PathBuf::from(args.next().expect("--app needs a path"))),
             "--pipeline-test" => pipeline_test = Some(args.next().expect("--pipeline-test needs a capture file")),
             "--record-bench" => {
@@ -164,6 +170,7 @@ fn parse_args() -> Config {
         debug,
         headless,
         control,
+        cache,
         pipeline_test,
         record_bench,
     }
@@ -453,16 +460,13 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     None => Err("usage: wheel <notches>".into()),
                 }
             }
-            "capture" => {
+            "capture" if matches!(parts.clone().next(), Some("on" | "off")) => {
                 // Diagnosis: `capture on|off`: mouse input counts as if the
-                // window had captured the cursor (headless runs).
-                match parts.next() {
-                    Some(v @ ("on" | "off")) => {
-                        gpu::vk::window::CAPTURE_TEST.store(v == "on", std::sync::atomic::Ordering::Relaxed);
-                        Ok(())
-                    }
-                    _ => Err("usage: capture on|off".into()),
-                }
+                // window had captured the cursor (headless runs). Any other
+                // `capture` is a frame capture (below).
+                let on = parts.next() == Some("on");
+                gpu::vk::window::CAPTURE_TEST.store(on, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
             }
             "watch" => {
                 // Debug: `watch <slot 0-3> <hex address> [w|rw] [1|2|4|8] [all|guest]`
@@ -651,16 +655,33 @@ fn poll_control(path: &Path, offset: &mut u64) {
             "fillimg" => {
                 // Experiment: `fillimg <hex address> <value>` fills the cached
                 // images at that guest address with one value (all channels,
-                // layers and mips).
-                let a = parts.next().and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok());
+                // layers and mips); `fillimg cs=<hex shader> <value>` those
+                // the compute shader last bound as storage images.
+                let arg = parts.next().unwrap_or("");
                 let v = parts.next().and_then(|v| v.parse::<f32>().ok());
-                match (a, v) {
-                    (Some(a), Some(v)) => {
-                        let n = gpu::images::with(|im| im.fill_at(a, v));
-                        info!("control: fillimg {a:#x} {v}: {n} image(s) filled");
-                        Ok(())
-                    }
-                    _ => Err("usage: fillimg <hex address> <value>".into()),
+                let hex = |a: &str| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok();
+                match (arg.strip_prefix("cs="), v) {
+                    (Some(cs), Some(v)) => match hex(cs) {
+                        Some(cs) => {
+                            let (bases, n) = gpu::images::with(|im| {
+                                let b = im.written_by(cs);
+                                let n: usize = b.iter().map(|&a| im.fill_at(a, v)).sum();
+                                (b, n)
+                            });
+                            info!("control: fillimg cs={cs:#x} {v}: {n} image(s) filled at {bases:x?}");
+                            Ok(())
+                        }
+                        None => Err("usage: fillimg cs=<hex shader> <value>".into()),
+                    },
+                    (None, Some(v)) => match hex(arg) {
+                        Some(a) => {
+                            let n = gpu::images::with(|im| im.fill_at(a, v));
+                            info!("control: fillimg {a:#x} {v}: {n} image(s) filled");
+                            Ok(())
+                        }
+                        None => Err("usage: fillimg <hex address>|cs=<hex shader> <value>".into()),
+                    },
+                    _ => Err("usage: fillimg <hex address>|cs=<hex shader> <value>".into()),
                 }
             }
             "imgstat" => {
@@ -1050,17 +1071,25 @@ fn main() {
     hle::libs::savedata::init(cfg.root.join("local-data").join("saves"));
     // Keyboard and mouse layout (written with the defaults when missing).
     input::init(&cfg.root.join("local-data").join("controls.txt"));
-    // DS_PIPELINE_DIR=<directory name under local-data>: another pipeline
+    // Compiled pipelines and learned shader specs: local-data, or the
+    // `--cache` directory (Play.bat: one next to the package folder, so a
+    // new package starts with what earlier ones learned on this machine).
+    let cache_root = cfg.cache.clone().unwrap_or_else(|| cfg.root.join("local-data"));
+    if cfg.cache.is_some() {
+        hle::kernel::fs::ensure_dir(&cache_root);
+        info!("pipeline and shader-spec cache: {}", cache_root.display());
+    }
+    // DS_PIPELINE_DIR=<directory name under the cache>: another pipeline
     // store (experiments that start without compiled pipelines).
     let pipe_dir = std::env::var("DS_PIPELINE_DIR").ok().filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')).unwrap_or_else(|| "pipelines".into());
-    gpu::pcache::set_dir(cfg.root.join("local-data").join(pipe_dir));
-    // DS_SPECS=<file name under local-data, or a path>: where the shader
+    gpu::pcache::set_dir(cache_root.join(pipe_dir));
+    // DS_SPECS=<file name under the cache, or a path>: where the shader
     // programs' learned specs and code are kept (`gpu::precompile`).
     let specs = std::env::var("DS_SPECS").ok().filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
     gpu::precompile::set_store(match specs {
         Some(p) if p.components().count() > 1 => p,
-        Some(p) => cfg.root.join("local-data").join(p),
-        None => cfg.root.join("local-data").join("shader-specs.txt"),
+        Some(p) => cache_root.join(p),
+        None => cache_root.join("shader-specs.txt"),
     });
 
     // Modules: the decrypted executable and the title's own libraries.

@@ -243,6 +243,8 @@ pub static FAST_CLEARS_KNOWN: AtomicU64 = AtomicU64::new(0);
 pub static BLOCK_COPIES: AtomicU64 = AtomicU64::new(0);
 /// Of those, with the mip tail from a view of the tail block (`tune block_tails`).
 pub static BLOCK_TAIL_COPIES: AtomicU64 = AtomicU64::new(0);
+/// Depth planes refreshed from GPU-written color views (`sync_depth_views`).
+pub static DEPTH_COPIES: AtomicU64 = AtomicU64::new(0);
 /// Storage images bound one view per mip level (image_store_mip /
 /// image_load_mip programs).
 pub static MIP_VIEW_BINDINGS: AtomicU64 = AtomicU64::new(0);
@@ -1866,6 +1868,17 @@ fn imported_overlap(lo: u64, hi: u64) -> Option<(u64, u64)> {
 }
 static SCRATCH: std::sync::OnceLock<Option<vk::Buffer>> = std::sync::OnceLock::new();
 
+/// Size of the buffer depth-plane copies pass through (`sync_depth_views`;
+/// a 2560x1440 D32 plane is 14 MiB).
+const DEPTH_COPY_BYTES: u64 = 16 << 20;
+static DEPTH_COPY_BUF: std::sync::OnceLock<Option<vk::Buffer>> = std::sync::OnceLock::new();
+
+/// The graphics command processor's buffer for depth-plane copies (only it
+/// records them: parallel workers stop for them).
+fn depth_copy_buffer() -> Option<vk::Buffer> {
+    *DEPTH_COPY_BUF.get_or_init(|| ctx().device_buffer(DEPTH_COPY_BYTES, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).ok().map(|(b, _)| b))
+}
+
 fn scratch_buffer() -> Option<vk::Buffer> {
     *SCRATCH.get_or_init(|| ctx().device_buffer(SCRATCH_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER).ok().map(|(b, _)| b))
 }
@@ -3236,7 +3249,8 @@ pub(crate) fn image_hazards(stages: &[&Prepared], v: &mut Vec<super::images::Ima
             super::images::pending_hit(&v)
         } else {
             super::images::any_pending() && super::images::with(|im| im.clears_pending(&v) || im.overwrites_pending(&v))
-        } || super::images::block_copies_possible(v);
+        } || super::images::block_copies_possible(v)
+            || (super::tune::depth_views() && super::images::depth_copies_possible(v));
         return pending;
     }
     v.truncate(extra);
@@ -3261,7 +3275,7 @@ pub(crate) fn image_hazards(stages: &[&Prepared], v: &mut Vec<super::images::Ima
                 }
             }
         }
-        im.clears_pending(v) || im.overwrites_pending(v) || im.block_copies_possible(v)
+        im.clears_pending(v) || im.overwrites_pending(v) || im.block_copies_possible(v) || (super::tune::depth_views() && im.depth_feed_possible(v))
     })
 }
 
@@ -6307,6 +6321,83 @@ impl Exec {
         self.barrier();
     }
 
+    /// Copies depth planes that GPU work stored through a color view into the
+    /// depth attachments among `keys` (Images::take_depth_copies), before
+    /// the draws that test against them: through a device-local buffer (a
+    /// depth aspect cannot be the destination of an image copy from a color
+    /// format), in bands of rows when the plane is larger than the buffer.
+    pub(crate) fn sync_depth_views(&mut self, keys: &[super::images::ImageKey]) {
+        if keys.is_empty() || !super::tune::depth_views() || !super::images::depth_copies_possible(keys) {
+            return;
+        }
+        if self.deferred {
+            // The copies must precede every use in program order.
+            if super::images::with(|im| !im.depth_copies(keys).is_empty()) {
+                self.stop("depth copy");
+            }
+            return;
+        }
+        let copies = super::images::with(|im| im.take_depth_copies(keys));
+        if copies.is_empty() {
+            return;
+        }
+        let Some(buf) = depth_copy_buffer() else {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| crate::warn!("images: no buffer for depth-plane copies (depth surfaces written by compute keep stale depth)"));
+            return;
+        };
+        self.begin();
+        self.end_rendering_then_barrier();
+        let c = ctx();
+        let cmd = self.cmd();
+        let transfer = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::TRANSFER_READ)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+        let mut first = true;
+        for d in &copies {
+            let row = d.width as u64 * d.texel as u64;
+            let band = ((DEPTH_COPY_BYTES / row.max(1)) as u32).clamp(1, d.height.max(1));
+            for layer in 0..d.layers {
+                let mut y = 0;
+                while y < d.height {
+                    let h = band.min(d.height - y);
+                    if !first {
+                        // The buffer's previous band is read out before it is overwritten.
+                        unsafe { c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[transfer], &[], &[]) };
+                    }
+                    first = false;
+                    let region = |aspect| vk::BufferImageCopy {
+                        buffer_offset: 0,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: layer, layer_count: 1 },
+                        image_offset: vk::Offset3D { x: 0, y: y as i32, z: 0 },
+                        image_extent: vk::Extent3D { width: d.width, height: h, depth: 1 },
+                    };
+                    unsafe {
+                        c.device.cmd_copy_image_to_buffer(cmd, d.src, vk::ImageLayout::GENERAL, buf, &[region(vk::ImageAspectFlags::COLOR)]);
+                        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[transfer], &[], &[]);
+                        c.device.cmd_copy_buffer_to_image(cmd, buf, d.dst, vk::ImageLayout::GENERAL, &[region(vk::ImageAspectFlags::DEPTH)]);
+                    }
+                    y += h;
+                }
+            }
+            DEPTH_COPIES.fetch_add(1, Ordering::Relaxed);
+            static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+            if SEEN.lock().get_or_insert_with(HashSet::new).insert(d.key.base) {
+                crate::info!(
+                    "images: {:#x} {}x{} {:?}: depth plane copied in from its GPU-written {}-byte color view (logged once; each write of that view)",
+                    d.key.base,
+                    d.width,
+                    d.height,
+                    d.key.format,
+                    d.texel
+                );
+            }
+        }
+        self.barrier();
+    }
+
     /// Submits recorded work and waits for all of this queue's GPU work and
     /// deferred effects.
     #[track_caller]
@@ -8983,9 +9074,10 @@ pub fn status() -> String {
             SHADOWS_SHARED[4].load(Ordering::Relaxed)
         )
         + &format!(
-            "    images: {} block-compressed refreshes from GPU-written views ({} with the mip tail from the tail block's view), {} storage bindings one view per mip level, {} draws without attachments\n",
+            "    images: {} block-compressed refreshes from GPU-written views ({} with the mip tail from the tail block's view), {} depth planes from GPU-written color views, {} storage bindings one view per mip level, {} draws without attachments\n",
             BLOCK_COPIES.load(Ordering::Relaxed),
             BLOCK_TAIL_COPIES.load(Ordering::Relaxed),
+            DEPTH_COPIES.load(Ordering::Relaxed),
             MIP_VIEW_BINDINGS.load(Ordering::Relaxed),
             draw::ATTACHLESS.load(Ordering::Relaxed)
         )

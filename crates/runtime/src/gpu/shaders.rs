@@ -1214,7 +1214,10 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         resources,
         binding_base: 0,
         probe: None,
-        dump: super::capture::vs_dump().and_then(|(first, inst)| pos_export(&insts).map(|i| (i.pc, [first, inst, 0]))),
+        dump: super::capture::vs_dump().and_then(|(first, inst, count)| {
+            let at = super::capture::vs_dump_pc().filter(|pc| insts.iter().any(|i| i.pc == *pc));
+            at.or_else(|| pos_export(&insts).map(|i| i.pc)).map(|pc| (pc, [first, inst, count]))
+        }),
         force_dispatcher: super::tune::block_chain() == 0,
         dispatcher_for_loops: super::tune::block_chain() == 2,
         reg_vars: super::tune::reg_vars(),

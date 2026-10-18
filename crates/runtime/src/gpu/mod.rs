@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 128] = [
+    static ALL: [Tunable; 129] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -155,6 +155,7 @@ pub mod tune {
         Tunable { name: "label_latency", env: "DS_LABEL_LATENCY", default: 2000, value: AtomicU64::new(UNSET) },
         Tunable { name: "precompile", env: "DS_PRECOMPILE", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "precompile_workers", env: "DS_PRECOMPILE_WORKERS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "depth_views", env: "DS_DEPTH_VIEWS", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1390,6 +1391,16 @@ pub mod tune {
             0 => compile_ahead(),
             n => n,
         }
+    }
+
+    /// Depth attachments over memory that GPU work wrote through a color
+    /// view (the half-resolution depth the title's compute shader builds
+    /// and its particles test against) get that view's data copied in
+    /// before their draws (`exec::sync_depth_views`; 0: they keep their own
+    /// contents, as before 2026-10-18: particles showed through walls).
+    #[inline]
+    pub fn depth_views() -> bool {
+        get(128) != 0
     }
 
     /// A switch's value by name; None if unknown.

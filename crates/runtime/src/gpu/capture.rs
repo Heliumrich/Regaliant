@@ -298,45 +298,108 @@ fn dumps_env() -> Option<(u64, u64)> {
     })
 }
 
-/// `DS_VS_DUMP=<first vertex index>[:<instance>]` with per-draw reports
-/// (`DS_CAPTURE_DRAWS=<from>-<to>`): the vertex shaders of those draws store
-/// their registers at their position export for 1024 vertex indices from
-/// the first one (instance 0 unless given); the report writes each dumped
-/// vertex's exported position to draws/<event>_vs.txt.
-pub fn vs_dump() -> Option<(u32, u32)> {
-    static V: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
-    let v = (*V.get_or_init(|| {
+/// `DS_VS_DUMP=<first vertex index>[:<instance>[:<instances>]]` with
+/// per-draw reports (`DS_CAPTURE_DRAWS=<from>-<to>`): the vertex shaders of
+/// those draws store their registers at their position export for 8192
+/// vertex indices from the first one (instance 0 unless given); with an
+/// instance count n above 1 the 8192 slots go to n instances from the given
+/// one, 8192 / n vertex indices each (`0:0:8192`: vertex 0 of 8192
+/// instances). `DS_VS_DUMP_PC=<hex>`: after that instruction instead (any
+/// vertex program with an instruction there). The report writes each dumped
+/// vertex's exported position to draws/<event>_vs.txt (at the export) and
+/// all registers to draws/<event>_vs.bin (per vertex: instance, vertex
+/// index, then `DUMP_STRIDE` dwords: VGPRs, SGPRs at 256, SCC at 384).
+pub fn vs_dump() -> Option<(u32, u32, u32)> {
+    let v = vs_dump_env()?;
+    draw_dumps().then_some(v)
+}
+
+/// `DS_VS_DUMP` parsed (whether or not a draw is being dumped now: the
+/// report runs while the capture's lock is held, which `draw_dumps` tries).
+fn vs_dump_env() -> Option<(u32, u32, u32)> {
+    static V: std::sync::OnceLock<Option<(u32, u32, u32)>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
         let s = std::env::var("DS_VS_DUMP").ok()?;
         let mut it = s.split(':');
         let first = it.next()?.trim().parse().ok()?;
         let inst = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
-        Some((first, inst))
-    }))?;
-    draw_dumps().then_some(v)
+        let count = it.next().and_then(|x| x.trim().parse::<u32>().ok()).unwrap_or(1);
+        // `:pos`: positions only (64 vertex slots per instance, up to 16384
+        // instances; draws/<event>_pos.txt).
+        let pos = it.next().is_some_and(|x| x.trim() == "pos");
+        let count = if pos {
+            count.clamp(1, rdna::translate::DUMP_DWORDS / 4 / rdna::translate::DUMP_POS_VERTICES) | rdna::translate::DUMP_POS
+        } else {
+            count.clamp(1, rdna::translate::DUMP_DWORDS / rdna::translate::DUMP_STRIDE)
+        };
+        Some((first, inst, count))
+    })
+}
+
+/// `DS_VS_DUMP_PC`, when set: the instruction vertex dumps follow.
+pub fn vs_dump_pc() -> Option<u32> {
+    static V: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| u32::from_str_radix(std::env::var("DS_VS_DUMP_PC").ok()?.trim().trim_start_matches("0x"), 16).ok())
 }
 
 fn vs_dump_report(cp: &Cp, event: u64) -> Option<String> {
-    static V: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    let first = (*V.get_or_init(|| std::env::var("DS_VS_DUMP").ok()?.split(':').next()?.trim().parse().ok()))?;
+    let (first, inst0, count) = vs_dump_env()?;
+    if count & rdna::translate::DUMP_POS != 0 {
+        // Positions only: slots of four dwords, 64 per instance; empty ones zero.
+        let regs = super::exec::debug_dump(true);
+        let per = rdna::translate::DUMP_POS_VERTICES as usize;
+        let mut out = String::new();
+        let mut n = 0;
+        for (slot, p) in regs.chunks_exact(4).enumerate() {
+            if p.iter().all(|&w| w == 0) {
+                continue;
+            }
+            n += 1;
+            let f: Vec<f32> = p.iter().map(|&w| f32::from_bits(w)).collect();
+            let _ = writeln!(out, "{} {} {} {} {} {}", inst0 as usize + slot / per, first as usize + slot % per, f[0], f[1], f[2], f[3]);
+        }
+        if n == 0 {
+            return None;
+        }
+        let dir = crate::run_dir()?.join("draws");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join(format!("{event:04}_pos.txt")), out);
+        return Some(format!("{n} vertex positions dumped"));
+    }
+    let per = (rdna::translate::DUMP_DWORDS / rdna::translate::DUMP_STRIDE / count) as usize;
     let addr = super::shaders::ngg_addr(cp);
     let (insts, _) = super::shaders::program(addr).ok()?;
     let exp = super::shaders::pos_export(&insts)?;
+    let at_export = vs_dump_pc().is_none_or(|pc| pc == exp.pc || !insts.iter().any(|i| i.pc == pc));
     let regs = super::exec::debug_dump(true);
     let stride = rdna::translate::DUMP_STRIDE as usize;
     let mut out = String::new();
+    let mut bin: Vec<u8> = Vec::new();
     let mut n = 0;
     for (slot, r) in regs.chunks_exact(stride).enumerate() {
         if r[385] == 0 {
             continue;
         }
         n += 1;
-        let pos: Vec<String> = (0..4).map(|k| format!("{}", f32::from_bits(r[exp.exp_src(k) as usize]))).collect();
-        let _ = writeln!(out, "{} {}", first as usize + slot, pos.join(" "));
+        let (inst, vtx) = (inst0 as usize + slot / per, first as usize + slot % per);
+        if at_export {
+            let pos: Vec<String> = (0..4).map(|k| format!("{}", f32::from_bits(r[exp.exp_src(k) as usize]))).collect();
+            let _ = writeln!(out, "{inst} {vtx} {}", pos.join(" "));
+        }
+        bin.extend_from_slice(&(inst as u32).to_le_bytes());
+        bin.extend_from_slice(&(vtx as u32).to_le_bytes());
+        for w in r {
+            bin.extend_from_slice(&w.to_le_bytes());
+        }
     }
     let dir = crate::run_dir()?.join("draws");
     let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join(format!("{event:04}_vs.txt")), out);
-    Some(format!("vs {addr:#x}: {n} vertices dumped (exp pos0 at {:#x})", exp.pc))
+    if at_export {
+        let _ = std::fs::write(dir.join(format!("{event:04}_vs.txt")), out);
+    }
+    let _ = std::fs::write(dir.join(format!("{event:04}_vs.bin")), bin);
+    let pc = if at_export { exp.pc } else { vs_dump_pc().unwrap_or(exp.pc) };
+    Some(format!("vs {addr:#x}: {n} vertices dumped (registers after {pc:#x}{})", if at_export { ", the position export" } else { "" }))
 }
 
 /// Pixel whose cb0 value per-draw reports follow (`capture ... pixel=x,y`),

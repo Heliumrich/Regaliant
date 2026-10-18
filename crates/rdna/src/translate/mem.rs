@@ -2100,6 +2100,28 @@ pub fn export(tr: &mut T, ins: &Inst) -> R<()> {
             for v in vals.iter() {
                 cs.push(tr.to_f(*v)?);
             }
+            // A position with a NaN or infinite component: the console's
+            // clipper discards the primitive (the D3D rule), which the
+            // title's instancing relies on: a draw covers a fixed number of
+            // instance slots, the unused ones zero records whose vertices
+            // come out NaN (a zero-length normal normalized). Vulkan leaves
+            // such primitives undefined, and the RTX driver drew them as
+            // plant-shaped streaks across the view (the tutorial's opening
+            // tunnel). Such a vertex goes to one point outside the clip
+            // volume (z < 0) instead: a primitive with all three there is
+            // dropped.
+            let bt = tr.t.bool_;
+            let mut bad = tr.bool_c(false);
+            for &c in &cs {
+                let n = e(tr.b.is_nan(bt, None, c))?;
+                let i = e(tr.b.is_inf(bt, None, c))?;
+                let ni = e(tr.b.logical_or(bt, None, n, i))?;
+                bad = e(tr.b.logical_or(bt, None, bad, ni))?;
+            }
+            for (k, c) in cs.iter_mut().enumerate() {
+                let o = tr.f([0.0, 0.0, -1.0, 1.0][k]);
+                *c = e(tr.b.select(tr.t.f32, None, bad, o, *c))?;
+            }
             let p = e(tr.b.composite_construct(tr.t.v4f, None, cs))?;
             ok(tr.b.store(var, p, None, []))?;
         }

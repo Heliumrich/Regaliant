@@ -181,8 +181,12 @@ pub struct Spec {
     /// Debugging (compute): (pc, workgroup id): after each execution of the
     /// instruction at pc, the invocations of that workgroup write their
     /// registers to the debug binding (see [`DUMP_STRIDE`]). Vertex stage:
-    /// (pc, [first vertex index, instance index, 0]): the invocations of that
-    /// instance with vertex indices from the first one (1024 slots) do.
+    /// (pc, [first vertex index, instance index, instances n]): the
+    /// invocations of the n instances from that one with vertex indices from
+    /// the first one do (8192 / n slots per instance; n 0 counts as 1). With
+    /// [`DUMP_POS`] in n, at a position export: only the exported position,
+    /// four dwords per slot, 64 vertex slots per instance (n & !DUMP_POS
+    /// instances, up to 16384).
     pub dump: Option<(u32, [u32; 3])>,
     /// The loop-and-switch dispatcher instead of structured control flow:
     /// for every program, or for programs with loops only (A/B comparisons).
@@ -300,8 +304,13 @@ pub const PROBE_SINT: u32 = 1 << 14;
 /// Dwords per invocation in the debug binding: VGPRs 0..256, SGPRs at 256
 /// (128), SCC at 384, execution count at 385.
 pub const DUMP_STRIDE: u32 = 512;
-/// Size of the debug binding in dwords (up to 1024 invocations).
-pub const DUMP_DWORDS: u32 = 1024 * DUMP_STRIDE;
+/// Size of the debug binding in dwords (up to 8192 invocations: a vertex
+/// of each of thousands of instances).
+pub const DUMP_DWORDS: u32 = 8192 * DUMP_STRIDE;
+/// Flag in a vertex dump's instance count: positions only (see `Spec::dump`).
+pub const DUMP_POS: u32 = 1 << 31;
+/// Vertex slots per instance of a positions-only dump.
+pub const DUMP_POS_VERTICES: u32 = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BindingKind {
@@ -2616,10 +2625,47 @@ fn translate_inst(tr: &mut T, ins: &Inst) -> R<()> {
     }
     if let Some((pc, g)) = tr.spec.dump {
         if ins.pc == pc {
-            emit_dump(tr, g)?;
+            if g[2] & DUMP_POS != 0 && ins.enc == Enc::Exp {
+                emit_pos_dump(tr, ins, g)?;
+            } else {
+                emit_dump(tr, g)?;
+            }
         }
     }
     Ok(())
+}
+
+/// Positions-only vertex dump at a position export (see `Spec::dump`): the
+/// four exported registers of each vertex of the selected instances.
+fn emit_pos_dump(tr: &mut T, ins: &Inst, g: [u32; 3]) -> R<()> {
+    let u = tr.t.u32;
+    let bt = tr.t.bool_;
+    let (Some(buf), Some((vi, ii))) = (tr.dump_buf, tr.vertex_ids) else { return Ok(()) };
+    let count = (g[2] & !DUMP_POS).clamp(1, DUMP_DWORDS / 4 / DUMP_POS_VERTICES);
+    let first = tr.u(g[0]);
+    let v = e(tr.b.i_sub(u, None, vi, first))?;
+    let pn = tr.u(DUMP_POS_VERTICES);
+    let inside = e(tr.b.u_less_than(bt, None, v, pn))?;
+    let inst = tr.u(g[1]);
+    let k = e(tr.b.i_sub(u, None, ii, inst))?;
+    let cn = tr.u(count);
+    let ours = e(tr.b.u_less_than(bt, None, k, cn))?;
+    let cond = e(tr.b.logical_and(bt, None, inside, ours))?;
+    tr.guarded(cond, &mut |tr| {
+        let kp = e(tr.b.i_mul(u, None, k, pn))?;
+        let slot = e(tr.b.i_add(u, None, kp, v))?;
+        let four = tr.u(4);
+        let base = e(tr.b.i_mul(u, None, slot, four))?;
+        let z = tr.u(0);
+        for c in 0..4u32 {
+            let val = tr.vreg(ins.exp_src(c as usize) as u32)?;
+            let kk = tr.u(c);
+            let i = e(tr.b.i_add(u, None, base, kk))?;
+            let p = e(tr.b.access_chain(tr.t.sb_u32, None, buf, [z, i]))?;
+            ok(tr.b.store(p, val, None, []))?;
+        }
+        Ok(())
+    })
 }
 
 /// Register dump of the invocations of workgroup `g`, or of a range of
@@ -2639,13 +2685,19 @@ fn emit_dump(tr: &mut T, g: [u32; 3]) -> R<()> {
             (buf, li, cond)
         }
         (Some(buf), _, _, Some((vi, ii))) => {
+            let count = g[2].clamp(1, DUMP_DWORDS / DUMP_STRIDE);
+            let per = DUMP_DWORDS / DUMP_STRIDE / count;
             let first = tr.u(g[0]);
-            let slot = e(tr.b.i_sub(u, None, vi, first))?;
-            let n = tr.u(DUMP_DWORDS / DUMP_STRIDE);
-            let inside = e(tr.b.u_less_than(bt, None, slot, n))?;
+            let v = e(tr.b.i_sub(u, None, vi, first))?;
+            let pn = tr.u(per);
+            let inside = e(tr.b.u_less_than(bt, None, v, pn))?;
             let inst = tr.u(g[1]);
-            let same = e(tr.b.i_equal(bt, None, ii, inst))?;
-            let cond = e(tr.b.logical_and(bt, None, inside, same))?;
+            let k = e(tr.b.i_sub(u, None, ii, inst))?;
+            let cn = tr.u(count);
+            let ours = e(tr.b.u_less_than(bt, None, k, cn))?;
+            let cond = e(tr.b.logical_and(bt, None, inside, ours))?;
+            let kp = e(tr.b.i_mul(u, None, k, pn))?;
+            let slot = e(tr.b.i_add(u, None, kp, v))?;
             (buf, slot, cond)
         }
         _ => return Ok(()),

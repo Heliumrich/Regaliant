@@ -1226,6 +1226,7 @@ impl Exec {
             self.resolve_fast_clears(&used);
             self.resolve_overwrites(&used);
             self.sync_block_textures(&used);
+            self.sync_depth_views(&used);
             if self.stopped {
                 return Err(super::STOPPED.into());
             }

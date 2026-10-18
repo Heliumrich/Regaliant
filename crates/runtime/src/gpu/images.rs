@@ -81,6 +81,7 @@ struct Tls {
     targets: HashMap<SurfaceKey, Target>,
     grows: HashMap<(u64, u32, u32, i32, u32), Option<ImageKey>>,
     gpu_base: HashMap<u64, bool>,
+    depth_feed: HashMap<u64, bool>,
     views: HashMap<[u32; 8], (u64, u64, u64, vk::ImageView, vk::Image)>,
     samplers: HashMap<([u32; 4], bool), vk::Sampler>,
 }
@@ -101,6 +102,7 @@ fn tls<R>(f: impl FnOnce(&mut Tls) -> R) -> R {
             t.targets.clear();
             t.grows.clear();
             t.gpu_base.clear();
+            t.depth_feed.clear();
         }
         f(&mut t)
     })
@@ -242,6 +244,64 @@ pub fn block_copies_possible(keys: &[ImageKey]) -> bool {
         }
     });
     flags.iter().any(|&f| f)
+}
+
+/// The color format GPU work writes a depth surface's depth plane through
+/// (the title's compute shaders store depth as R32 float texels under D32,
+/// R16 unorm under D16).
+fn depth_feed_format(depth: vk::Format) -> Option<vk::Format> {
+    use vk::Format as F;
+    match depth {
+        F::D32_SFLOAT | F::D32_SFLOAT_S8_UINT => Some(F::R32_SFLOAT),
+        F::D16_UNORM | F::D16_UNORM_S8_UINT => Some(F::R16_UNORM),
+        _ => None,
+    }
+}
+
+/// Whether depth copies may be pending for `keys` (`depth_feed_possible`
+/// from this thread's memo of depth-feed bases).
+pub fn depth_copies_possible(keys: &[ImageKey]) -> bool {
+    let cands: Vec<u64> = keys.iter().filter(|k| depth_feed_format(k.format).is_some()).map(|k| k.base).collect();
+    if cands.is_empty() {
+        return false;
+    }
+    let known: Option<bool> = tls(|m| {
+        let mut any = false;
+        for b in &cands {
+            match m.depth_feed.get(b) {
+                Some(&x) => any |= x,
+                None => return None,
+            }
+        }
+        Some(any)
+    });
+    if let Some(x) = known {
+        return x;
+    }
+    let g = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
+    let flags: Vec<bool> = with(|im| cands.iter().map(|b| im.depth_feeds.contains(b)).collect());
+    tls(|m| {
+        if m.lookup_gen == g {
+            for (b, f) in cands.iter().zip(&flags) {
+                m.depth_feed.insert(*b, *f);
+            }
+        }
+    });
+    flags.iter().any(|&f| f)
+}
+
+/// A depth image's depth plane to refresh from the color image GPU work
+/// stored it through (`Images::take_depth_copies`).
+pub struct DepthCopy {
+    pub key: ImageKey,
+    pub dst: vk::Image,
+    pub src: vk::Image,
+    pub width: u32,
+    pub height: u32,
+    pub layers: u32,
+    /// Bytes per texel of the source (and of the buffer the copy passes through).
+    pub texel: u32,
+    pub seq: u64,
 }
 
 /// Vulkan format of a gfx10 image FORMAT.
@@ -662,6 +722,9 @@ pub struct Image {
     /// GPU buffer writes or CP DMA covered all of its guest bytes since its
     /// last use: guest memory holds its contents (`reload_overwritten`).
     overwritten: bool,
+    /// The shader that last bound it as a storage image (diagnosis:
+    /// `fillimg cs=`).
+    writer: u64,
 }
 
 /// A host-visible buffer texture data is uploaded from (`Images::staging`).
@@ -854,6 +917,9 @@ pub struct Images {
     retired: Vec<vk::Image>,
     /// Depth images grown (status line).
     pub depth_grows: u64,
+    /// Bases of R32 float / R16 unorm images bound as storage: compute
+    /// views of a depth plane (`depth_copies`).
+    depth_feeds: super::fx::Set<u64>,
 }
 
 unsafe impl Send for Images {}
@@ -1013,7 +1079,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
                 .expect("image pool");
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
-            *g = Some(Images { map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), inflight: Default::default(), spare_cmds: Vec::new(), reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), retired: Vec::new(), depth_grows: 0 });
+            *g = Some(Images { map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), inflight: Default::default(), spare_cmds: Vec::new(), reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), retired: Vec::new(), depth_grows: 0, depth_feeds: Default::default() });
         }
     }
     let im = g.as_mut().unwrap();
@@ -1333,6 +1399,15 @@ impl Images {
             });
         }
         imgs.len()
+    }
+
+    /// Guest addresses of the images a shader last bound as storage
+    /// (diagnosis: `fillimg cs=<shader>`).
+    pub fn written_by(&self, shader: u64) -> Vec<u64> {
+        let mut v: Vec<u64> = self.map.values().filter(|i| i.writer == shader).map(|i| i.key.base).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 
     /// Uploads the CPU-sourced textures at guest address `base` (all of
@@ -1859,7 +1934,7 @@ impl Images {
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
         });
-        self.map_insert(new_key, Image { image, key: new_key, views: HashMap::default(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: prev.write_gen, block_gen: 0, span: 0, layout: None, overwritten: false });
+        self.map_insert(new_key, Image { image, key: new_key, views: HashMap::default(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: prev.write_gen, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0 });
         for v in self.stencil_of.values_mut() {
             if *v == old {
                 *v = new_key;
@@ -1960,6 +2035,63 @@ impl Images {
 
     pub fn take_block_copies(&mut self, keys: &[ImageKey]) -> Vec<BlockCopy> {
         let out = self.block_copies(keys);
+        for c in &out {
+            if let Some(i) = self.map.get_mut(&c.key) {
+                i.block_gen = c.seq;
+            }
+        }
+        out
+    }
+
+    /// Whether `depth_copies` may find something for `keys` (depth
+    /// attachments over memory GPU work wrote through a color view).
+    pub fn depth_feed_possible(&self, keys: &[ImageKey]) -> bool {
+        !self.depth_feeds.is_empty() && keys.iter().any(|k| depth_feed_format(k.format).is_some() && self.depth_feeds.contains(&k.base))
+    }
+
+    /// Depth images among `keys` whose depth plane GPU work stored through a
+    /// color view of the same address and size since it was last copied in:
+    /// the title builds its half-resolution depth with a compute shader
+    /// (R32 float storage), then depth-tests particles against that memory
+    /// as a D32 surface (after a full-screen HTILE resummarize, which has no
+    /// counterpart here). Images here do not share memory, so the D32 image
+    /// kept its clear (0, the far plane of a reversed-Z depth) and every
+    /// particle passed the test: fire and embers showed through walls.
+    /// Once per write generation of the source (its storage bindings), so
+    /// depth the attachment's own draws write afterwards is kept.
+    pub fn depth_copies(&self, keys: &[ImageKey]) -> Vec<DepthCopy> {
+        let mut out: Vec<DepthCopy> = Vec::new();
+        for k in keys {
+            let Some(feed) = depth_feed_format(k.format) else { continue };
+            if k.ty3d || !self.depth_feeds.contains(&k.base) || out.iter().any(|c| c.key == *k) {
+                continue;
+            }
+            let Some(dst) = self.map.get(k) else { continue };
+            let src = self
+                .by_base
+                .get(&k.base)
+                .into_iter()
+                .flatten()
+                .filter_map(|kk| self.map.get(kk))
+                .filter(|i| i.gpu_written && i.key.format == feed && !i.key.ty3d && i.key.width == k.width && i.key.height == k.height && i.write_gen > dst.block_gen)
+                .max_by_key(|i| i.write_gen);
+            let Some(src) = src else { continue };
+            out.push(DepthCopy {
+                key: *k,
+                dst: dst.image,
+                src: src.image,
+                width: k.width,
+                height: k.height,
+                layers: k.layers.min(src.key.layers).max(1),
+                texel: if feed == vk::Format::R32_SFLOAT { 4 } else { 2 },
+                seq: src.write_gen,
+            });
+        }
+        out
+    }
+
+    pub fn take_depth_copies(&mut self, keys: &[ImageKey]) -> Vec<DepthCopy> {
+        let out = self.depth_copies(keys);
         for c in &out {
             if let Some(i) = self.map.get_mut(&c.key) {
                 i.block_gen = c.seq;
@@ -2192,7 +2324,7 @@ impl Images {
             self.report(format!("texture {:#x} is not write-tracked (read-only or unmapped pages): later CPU updates are not seen", t.base));
         }
         let hashes = source.map(|(b, n)| all_hashes(b, n)).unwrap_or([0; SLICES]);
-        self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: false, source: region, hashes, checked_frame: frame, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false });
+        self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: false, source: region, hashes, checked_frame: frame, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0 });
         self.note_layout(key, t);
         Ok(key)
     }
@@ -2568,7 +2700,7 @@ impl Images {
         } else {
             let image = self.create(key)?;
             self.to_general(image, key.format);
-            self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false });
+            self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0 });
             self.gpu_bases.insert(key.base);
             crate::info!("images: new render target {:#x} {}x{} {:?} at flip {}", key.base, key.width, key.height, key.format, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
             // DS_CAPTURE_NEW_RT=<hex base>: capture the frame after a render
@@ -3034,9 +3166,15 @@ impl Images {
             self.write_seq += 1;
         }
         let seq = self.write_seq;
+        if storage && matches!(key.format, vk::Format::R32_SFLOAT | vk::Format::R16_UNORM) && self.depth_feeds.insert(key.base) {
+            // A possible compute view of a depth plane: memos of
+            // `depth_copies_possible` see it from now on.
+            LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         let img = self.map.get_mut(&key).unwrap();
         if storage {
             img.write_gen = seq;
+            img.writer = BINDING_SHADER.with(|s| s.get());
             if !img.gpu_written {
                 crate::info!("images: {:#x} {}x{} {:?} becomes a storage image (was uploaded: {}; shader {:#x})", key.base, key.width, key.height, key.format, img.source.is_some(), BINDING_SHADER.with(|s| s.get()));
             }
