@@ -921,6 +921,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         per_lane: false,
         lane_votes: false,
         base_instance_sgpr: None,
+        sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Compute)),
     };
     if super::tune::per_lane() != 0 && per_lane_program(code_hash) {
         let votes = lane_votes_program(code_hash);
@@ -1079,6 +1080,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         per_lane: false,
         lane_votes: false,
         base_instance_sgpr: None,
+        sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Fragment)),
     };
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
@@ -1228,6 +1230,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         per_lane: false,
         lane_votes: false,
         base_instance_sgpr: BASE_INSTANCE.with(|c| c.get()).map(|k| 8 + k),
+        sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Vertex)),
     };
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
@@ -1846,6 +1849,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         per_lane: false,
         lane_votes: false,
         base_instance_sgpr,
+        sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Vertex)),
     })
 }
 
@@ -1879,6 +1883,7 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         per_lane: false,
         lane_votes: false,
         base_instance_sgpr: None,
+        sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Fragment)),
     }
 }
 
@@ -1912,6 +1917,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         per_lane: false,
         lane_votes: false,
         base_instance_sgpr: None,
+        sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Compute)),
     };
     if super::tune::per_lane() != 0 && per_lane_program(code_hash) {
         let votes = lane_votes_program(code_hash);

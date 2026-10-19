@@ -240,11 +240,27 @@ pub struct Spec {
     /// processor writes it into the user SGPR the packet names, and the
     /// instance id VGPR counts from 0.
     pub base_instance_sgpr: Option<u16>,
+    /// The SGPR data binding covers many commands' data and this stage reads
+    /// its own from a dword offset in a push constant at this byte offset
+    /// ([`sgpr_pc_offset`]): the runtime binds its ring once per batch and
+    /// pushes each command's offset, so a command whose resources equal the
+    /// one before pushes no descriptors. None: the binding starts at the
+    /// command's data.
+    pub sgpr_pc: Option<u32>,
 }
 
-/// As derived, except that `base_instance_sgpr` is hashed only when set:
-/// translations and pipelines keyed by the hash of a spec without it keep
-/// their keys (pipeline cache files are named by them).
+/// The byte offset of a stage's SGPR data offset in the push constants
+/// (`Spec::sgpr_pc`): the vertex and pixel stages of a draw push both.
+pub fn sgpr_pc_offset(stage: Stage) -> u32 {
+    match stage {
+        Stage::Fragment => 4,
+        Stage::Vertex | Stage::Compute => 0,
+    }
+}
+
+/// As derived, except that `base_instance_sgpr` and `sgpr_pc` are hashed
+/// only when set: translations and pipelines keyed by the hash of a spec
+/// without them keep their keys (pipeline cache files are named by them).
 impl std::hash::Hash for Spec {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.stage.hash(state);
@@ -273,6 +289,10 @@ impl std::hash::Hash for Spec {
         self.lane_votes.hash(state);
         if let Some(s) = self.base_instance_sgpr {
             s.hash(state);
+        }
+        if let Some(o) = self.sgpr_pc {
+            0x5350_4330u32.hash(state);
+            o.hash(state);
         }
     }
 }
@@ -400,6 +420,9 @@ pub struct Output {
     pub param_mask: u32,
     pub writes_depth: bool,
     pub warnings: Vec<String>,
+    /// The stage reads its SGPR data offset from the push constants at this
+    /// byte offset (`Spec::sgpr_pc`).
+    pub sgpr_pc: Option<u32>,
 }
 
 /// Dwords of user data at the start of the SGPR data buffer.
@@ -504,6 +527,9 @@ pub(crate) struct T<'a> {
     pub consts: HashMap<(Word, u32), Word>,
     pub interface: Vec<Word>,
     pub sgpr_data: Word,
+    /// The command's offset into the SGPR data binding (`Spec::sgpr_pc`),
+    /// loaded in the entry block.
+    pub sgpr_base: Option<Word>,
     pub load_offsets: Vec<u32>,
     pub res_info: u32,
     /// Offset of the program's address in the SGPR data.
@@ -888,10 +914,21 @@ impl<'a> T<'a> {
 
     /// Reads dword `idx` of the SGPR data buffer.
     pub fn sgpr_data(&mut self, idx: u32) -> R<Word> {
-        let z = self.u(0);
         let i = self.u(idx);
+        let i = self.sgpr_index(i)?;
+        let z = self.u(0);
         let p = e(self.b.access_chain(self.t.sb_u32, None, self.sgpr_data, [z, i]))?;
         e(self.b.load(self.t.u32, None, p, None, []))
+    }
+
+    /// The SGPR data binding's index of dword `i` of the command's data:
+    /// offset by the command's base with `Spec::sgpr_pc`.
+    pub fn sgpr_index(&mut self, i: Word) -> R<Word> {
+        if self.spec.sgpr_pc.is_none() {
+            return Ok(i);
+        }
+        let base = self.sgpr_base.ok_or("SGPR data read before its offset was loaded")?;
+        e(self.b.i_add(self.t.u32, None, base, i))
     }
 
     /// The program's address (low, high dword) from the SGPR data.
@@ -1727,6 +1764,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         consts: HashMap::default(),
         interface: Vec::new(),
         sgpr_data: 0,
+        sgpr_base: None,
         load_offsets: load_offsets(plan),
         res_info: res_info_offset(plan),
         code_base_at: code_base_offset(plan),
@@ -1991,6 +2029,22 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         let z = tr.u(0);
         tr.sync_steps = Some(tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, Some(z)));
     }
+    // The command's SGPR data offset (`Spec::sgpr_pc`), loaded once in the
+    // entry block (after its variables), which dominates every read.
+    if let Some(off) = spec.sgpr_pc {
+        // A struct type of its own (rspirv merges identical ones, and
+        // this one's member offset is the stage's).
+        let st = tr.b.id();
+        tr.b.type_struct_id(Some(st), [tr.t.u32]);
+        tr.b.decorate(st, Decoration::Block, []);
+        tr.b.member_decorate(st, 0, Decoration::Offset, [Operand::LiteralBit32(off)]);
+        let pt = tr.b.type_pointer(None, StorageClass::PushConstant, st);
+        let var = tr.global_var(pt, StorageClass::PushConstant);
+        let pu = tr.b.type_pointer(None, StorageClass::PushConstant, tr.t.u32);
+        let z = tr.u(0);
+        let p = e(tr.b.access_chain(pu, None, var, [z]))?;
+        tr.sgpr_base = Some(e(tr.b.load(tr.t.u32, None, p, None, []))?);
+    }
     // Initial state: all registers defined (zero), this lane active.
     let f = tr.bool_c(false);
     tr.set_scc(f)?;
@@ -2101,7 +2155,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     }
     let spirv = tr.b.module().assemble();
     let param_mask = tr.out_params.keys().filter(|&&p| p < 32).fold(0u32, |m, &p| m | 1 << p);
-    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings })
+    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc: spec.sgpr_pc })
 }
 
 /// Wave-mask mode for the shader at `addr` (diagnosis: `DS_WAVEMASK=0`
@@ -2782,6 +2836,7 @@ mod tests {
             per_lane: false,
             lane_votes: false,
             base_instance_sgpr: None,
+            sgpr_pc: None,
         }
     }
 

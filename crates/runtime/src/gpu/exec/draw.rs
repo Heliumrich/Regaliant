@@ -676,7 +676,8 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
         let (push, flags) = super::push_layout(&bindings, push_mode);
         let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().flags(flags).bindings(&bindings), None).map_err(|e| format!("set layout: {e}"))?;
         let layouts = [set_layout];
-        let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None).map_err(|e| format!("pipeline layout: {e}"))?;
+        let ranges = super::sgpr_pc_ranges(vk::ShaderStageFlags::VERTEX, vs.0.out.sgpr_pc.is_some() || ps.is_some_and(|p| p.0.out.sgpr_pc.is_some()));
+        let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(ranges), None).map_err(|e| format!("pipeline layout: {e}"))?;
         let module = |code: &[u32]| c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&super::module_code(code)), None).map_err(|e| format!("shader module: {e}"));
         let mut modules = vec![(vk::ShaderStageFlags::VERTEX, module(&vs.0.out.spirv)?)];
         if let Some(mask) = key.rect_gs {
@@ -1517,7 +1518,7 @@ impl Exec {
             vk::Viewport { x: 0.0, y: 0.0, width: area.0 as f32, height: area.1 as f32, min_depth: 0.0, max_depth: 1.0 }
         };
         let dc = &mut self.dyncache;
-        let mut untimed = false;
+        let untimed;
         unsafe {
             let rebound = dc.pipeline != pipeline;
             if rebound {
@@ -1526,6 +1527,7 @@ impl Exec {
                 dc.pipeline = pipeline;
             }
             super::bind_descriptors(cmd, vk::PipelineBindPoint::GRAPHICS, layout, set, &bounds, &mut dc.pushed[0], rebound);
+            super::push_sgpr_bases(cmd, layout, false, &bounds);
             let vpw = [vp.x.to_bits(), vp.y.to_bits(), vp.width.to_bits(), vp.height.to_bits(), vp.min_depth.to_bits(), vp.max_depth.to_bits()];
             if dc.viewport != Some(vpw) {
                 c.device.cmd_set_viewport(cmd, 0, &[vp]);

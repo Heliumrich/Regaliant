@@ -1111,7 +1111,8 @@ fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: O
             let (push, flags) = push_layout(&bindings, push_mode);
             let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().flags(flags).bindings(&bindings), None).map_err(|e| format!("set layout: {e}"))?;
             let layouts = [set_layout];
-            let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None).map_err(|e| format!("pipeline layout: {e}"))?;
+            let ranges = sgpr_pc_ranges(vk::ShaderStageFlags::COMPUTE, out.sgpr_pc.is_some());
+            let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(ranges), None).map_err(|e| format!("pipeline layout: {e}"))?;
             let code = module_code(&out.spirv);
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("shader module: {e}"))?;
             let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
@@ -1789,6 +1790,41 @@ struct Bound {
     /// holds the data, with `tune race_checks`: (base, size, kind: 1
     /// written, 2 data-only loads read on the GPU, 4 an unbounded pointer).
     in_place: Vec<(u64, u64, u8)>,
+    /// The stage's SGPR data offset as pushed (`Spec::sgpr_pc`): (byte
+    /// offset in the push constants, dword offset in the ring).
+    sgpr_base: Option<(u32, u32)>,
+}
+
+/// The push constant range of a pipeline layout whose stages read their
+/// SGPR data offset from it (`Spec::sgpr_pc`): one dword per stage (a
+/// draw's vertex and pixel stages, `sgpr_pc_offset`).
+fn sgpr_pc_ranges(stages: vk::ShaderStageFlags, used: bool) -> &'static [vk::PushConstantRange] {
+    const GFX: [vk::PushConstantRange; 1] = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::from_raw(vk::ShaderStageFlags::VERTEX.as_raw() | vk::ShaderStageFlags::FRAGMENT.as_raw()), offset: 0, size: 8 }];
+    const CS: [vk::PushConstantRange; 1] = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 4 }];
+    match (used, stages == vk::ShaderStageFlags::COMPUTE) {
+        (false, _) => &[],
+        (true, true) => &CS,
+        (true, false) => &GFX,
+    }
+}
+
+/// Pushes the SGPR data offsets of a command's stages (`Spec::sgpr_pc`;
+/// `layout` has `sgpr_pc_ranges` when one of them reads it).
+fn push_sgpr_bases(cmd: vk::CommandBuffer, layout: vk::PipelineLayout, compute: bool, bounds: &[Bound]) {
+    let mut v = [0u32; 2];
+    let mut any = false;
+    for b in bounds {
+        if let Some((at, base)) = b.sgpr_base {
+            v[(at / 4) as usize & 1] = base;
+            any = true;
+        }
+    }
+    if !any {
+        return;
+    }
+    let (stages, n) = if compute { (vk::ShaderStageFlags::COMPUTE, 4) } else { (sgpr_pc_ranges(vk::ShaderStageFlags::VERTEX, true)[0].stage_flags, 8) };
+    let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, n) };
+    unsafe { ctx().device.cmd_push_constants(cmd, layout, stages, 0, bytes) };
 }
 
 /// Commands about to be recorded with an in-place buffer binding that GPU
@@ -6093,6 +6129,7 @@ impl Exec {
         b.write_src.clear();
         b.placements.clear();
         b.in_place.clear();
+        b.sgpr_base = None;
         self.bound_pool.push(b);
     }
 
@@ -8342,11 +8379,16 @@ impl Exec {
         let Some((ring, ring_ptr)) = self.slots[self.cur].rings[which] else { return Err("no SGPR data ring".into()) };
         let off = self.ring_alloc(which, bytes.len() as u64).ok_or("SGPR data ring exhausted")?;
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ring_ptr.add(off as usize), bytes.len()) };
+        // With `Spec::sgpr_pc` the whole ring, the stage adding its offset
+        // (the binding then stays the same for the batch).
+        let pc = p.tr.out.sgpr_pc;
+        let (at, range) = if pc.is_some() { (0, RING_SEG) } else { (off, bytes.len() as u64) };
         for b in &p.tr.out.bindings {
             if b.kind == BindingKind::SgprData {
-                bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: ring, offset: off, range: bytes.len() as u64 }));
+                bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: ring, offset: at, range }));
             }
         }
+        bound.sgpr_base = pc.map(|k| (k, (off / 4) as u32));
         Ok((ring, off))
     }
 
@@ -8824,6 +8866,7 @@ impl Exec {
                 self.dyncache.cs_pipeline = pipeline;
             }
             bind_descriptors(cmd, vk::PipelineBindPoint::COMPUTE, layout, set, std::slice::from_ref(&bound), &mut self.dyncache.pushed[1], rebound);
+            push_sgpr_bases(cmd, layout, true, std::slice::from_ref(&bound));
             if let Some((buffer, offset)) = args {
                 lap.mark(12);
                 // Work of this batch since its last barrier wrote the

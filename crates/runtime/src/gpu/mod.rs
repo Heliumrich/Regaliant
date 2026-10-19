@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 132] = [
+    static ALL: [Tunable; 133] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -159,6 +159,7 @@ pub mod tune {
         Tunable { name: "pre_trust", env: "DS_PRE_TRUST", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "draw_repeat", env: "DS_DRAW_REPEAT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "cpu_args_base", env: "DS_CPU_ARGS_BASE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "sgpr_pc", env: "DS_SGPR_PC", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1437,6 +1438,19 @@ pub mod tune {
     #[inline]
     pub fn cpu_args_base() -> bool {
         get(131) != 0
+    }
+
+    /// Stages read their SGPR data at an offset they take from a push
+    /// constant (`Spec::sgpr_pc`): the data binding covers the batch's whole
+    /// ring and stays the same from command to command, so a command whose
+    /// resources equal the one before pushes no descriptors. Read when
+    /// stages are specialized: set it at boot (`DS_SGPR_PC`; switched later,
+    /// every stage is translated and its pipelines made again). Off: on
+    /// the RTX 4090 driver it pushed 17% fewer descriptors per push yet
+    /// cost 1.8% more CPU per command (FINDINGS.md 2026-10-19).
+    #[inline]
+    pub fn sgpr_pc() -> bool {
+        get(132) != 0
     }
 
     /// A switch's value by name; None if unknown.
