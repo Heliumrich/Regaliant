@@ -353,6 +353,16 @@ fn console_write(fd: i32, data: &[u8]) {
                 *crate::hle::libs::videoout::SHOT_REQUEST.lock() = Some(name);
             }
         }
+        // `dsport-frames: reset` starts a frame-time window, `dsport-frames:
+        // <name>` logs it (tools/tour.py --frames: each location's frame
+        // rate at the developer camera).
+        if let Some(rest) = line.split("dsport-frames:").nth(1) {
+            let rest = rest.trim();
+            let report = crate::gpu::pacing::report_and_reset();
+            if rest != "reset" {
+                crate::info!("frames at {rest}: {report}");
+            }
+        }
     }
 }
 

@@ -2165,6 +2165,8 @@ pub fn reset_profile() {
     lockstat::reset_stats();
     images::reset_memo_stats();
     exec::reset_pre_window();
+    exec::reset_import_window();
+    crate::mem::reset_host_calls();
     threadcpu::reset_window();
     crate::audio::reset_window();
     crate::guestprof::reset();
@@ -2189,6 +2191,8 @@ pub fn profile_report() -> String {
         s.push_str(&crate::mem::ww_lines());
     }
     s.push_str(&exec::push_line());
+    s.push_str(&exec::import_window_line());
+    s.push_str(&crate::mem::host_calls_line());
     s.push_str(&crate::audio::window_line());
     s.push_str(&crate::guestprof::report());
     s.push_str(&threadcpu::window_line());

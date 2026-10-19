@@ -761,7 +761,59 @@ pub fn reserve_guest_range() -> Result<(), String> {
     Ok(())
 }
 
+/// Host memory calls for guest mappings in the profile window
+/// (`host_calls_line`): [commits, ns, decommits, ns, decommits deferred
+/// under GPU imports, protection changes, ns, unmap notes, ns].
+pub static HOST_CALLS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+static FAULTS_AT_RESET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Adds a call and its time to HOST_CALLS[k], [k + 1].
+fn note_host_call(k: usize, t0: std::time::Instant) {
+    use std::sync::atomic::Ordering::Relaxed;
+    HOST_CALLS[k].fetch_add(1, Relaxed);
+    HOST_CALLS[k + 1].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+}
+
+/// This process's page faults so far.
+fn page_faults() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    let ok = unsafe { GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c, c.cb) };
+    if ok != 0 { c.PageFaultCount as u64 } else { 0 }
+}
+
+/// Clears the window's host-call counts (`profile reset`).
+pub fn reset_host_calls() {
+    use std::sync::atomic::Ordering::Relaxed;
+    for c in &HOST_CALLS {
+        c.store(0, Relaxed);
+    }
+    FAULTS_AT_RESET.store(page_faults(), Relaxed);
+}
+
+/// One profile line: the window's host memory calls and page faults.
+pub fn host_calls_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v: Vec<u64> = HOST_CALLS.iter().map(|c| c.load(Relaxed)).collect();
+    let faults = page_faults().saturating_sub(FAULTS_AT_RESET.load(Relaxed));
+    format!(
+        "    host memory calls in the window: commits {} ({} ms), decommits {} ({} ms; {} more deferred under GPU imports), protection changes {} ({} ms), unmap notes {} ({} ms); page faults {}\n",
+        v[0],
+        v[1] / 1_000_000,
+        v[2],
+        v[3] / 1_000_000,
+        v[4],
+        v[5],
+        v[6] / 1_000_000,
+        v[7],
+        v[8] / 1_000_000,
+        faults
+    )
+}
+
 fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
+    let t0 = std::time::Instant::now();
     crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_COMMIT);
     repaged(addr, size);
     // Parts whose decommit was deferred are still committed with their old
@@ -779,6 +831,7 @@ fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     let _arm = crate::gpu::resident::remap_guard();
     let p = unsafe { VirtualAlloc(addr as _, size as usize, MEM_COMMIT, win_prot(prot)) };
     crate::gpu::resident::settled(addr, size);
+    note_host_call(0, t0);
     if p.is_null() { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
 }
 
@@ -965,6 +1018,7 @@ pub fn describe_host(base: u64, len: u64) -> String {
 }
 
 fn host_decommit(addr: u64, size: u64) {
+    let t0 = std::time::Instant::now();
     crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_DECOMMIT);
     repaged(addr, size);
     if defer_decommits() && crate::gpu::imports_may_cover(addr, size) {
@@ -973,6 +1027,7 @@ fn host_decommit(addr: u64, size: u64) {
         DEFERRED_LEN.store(d.len(), std::sync::atomic::Ordering::Release);
         DEFERRED_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         DEFERRED_STATS[3].fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+        HOST_CALLS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return;
     }
     let _readers_out = GUEST_READERS.write();
@@ -981,9 +1036,11 @@ fn host_decommit(addr: u64, size: u64) {
         VirtualFree(addr as _, size as usize, MEM_DECOMMIT);
     }
     crate::gpu::resident::settled(addr, size);
+    note_host_call(2, t0);
 }
 
 pub fn host_protect(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
+    let t0 = std::time::Instant::now();
     crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_PROTECT);
     let mut old = 0u32;
     let _readers_out = GUEST_READERS.write();
@@ -993,6 +1050,7 @@ pub fn host_protect(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     if ok != 0 {
         crate::gpu::resident::settled(addr, size);
     }
+    note_host_call(5, t0);
     if ok == 0 { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
 }
 
@@ -1013,11 +1071,19 @@ struct UnmapNote {
 static UNMAPS: Mutex<std::collections::VecDeque<UnmapNote>> = Mutex::new(std::collections::VecDeque::new());
 const UNMAP_NOTES: usize = 8192;
 
+/// `DS_UNMAP_FRAMES=1` (boot; diagnosis): unmap notes keep the unmapping
+/// thread's guest frames (costly while the title streams: see `note_unmap`).
+fn unmap_frames() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| env_is("DS_UNMAP_FRAMES", "1"))
+}
+
 /// Notes an unmap (or a protection change to no access) for fault reports
 /// (`unmaps_covering`): the title's level changes free memory that jobs
 /// still read in a share of loads (FINDINGS.md 2026-10-19).
 fn note_unmap(op: &'static str, start: u64, end: u64) {
     static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let t = std::time::Instant::now();
     let ms = T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
     let n = UnmapNote {
         start,
@@ -1026,13 +1092,19 @@ fn note_unmap(op: &'static str, start: u64, end: u64) {
         ms,
         flip: crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed),
         thread: crate::log::thread_name(),
-        frames: crate::exception::current_guest_frames(6),
+        // Guest frames only on request: the unwind queries the operating
+        // system per frame and took ~10 ms per unmap while a level streamed
+        // in (under the memory map's lock: 11.5 s of a 20 s window at 1-1,
+        // the frame rate a third of normal; FINDINGS.md 2026-10-19).
+        frames: if unmap_frames() { crate::exception::current_guest_frames(6) } else { Vec::new() },
     };
     let mut g = UNMAPS.lock();
     if g.len() >= UNMAP_NOTES {
         g.pop_front();
     }
     g.push_back(n);
+    drop(g);
+    note_host_call(7, t);
 }
 
 /// The noted unmaps covering `addr`, newest first (at most four): fault
@@ -1045,7 +1117,10 @@ pub fn unmaps_covering(addr: u64) -> Vec<String> {
         .rev()
         .filter(|n| n.start <= addr && addr < n.end)
         .take(4)
-        .map(|n| format!("{} {:#x}..{:#x} at flip {} ({} ms before the last note) by {}: {}", n.op, n.start, n.end, n.flip, now.saturating_sub(n.ms), n.thread, n.frames.join(" <- ")))
+        .map(|n| {
+            let frames = if n.frames.is_empty() { " (guest frames with DS_UNMAP_FRAMES=1)".to_string() } else { format!(": {}", n.frames.join(" <- ")) };
+            format!("{} {:#x}..{:#x} at flip {} ({} ms before the last note) by {}{frames}", n.op, n.start, n.end, n.flip, now.saturating_sub(n.ms), n.thread)
+        })
         .collect()
 }
 

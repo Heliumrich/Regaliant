@@ -260,6 +260,59 @@ static IMPORTS: AtomicU64 = AtomicU64::new(0);
 static IMPORT_BYTES: AtomicU64 = AtomicU64::new(0);
 static IMPORTS_MULTI: AtomicU64 = AtomicU64::new(0);
 static IMPORTS_STALE: AtomicU64 = AtomicU64::new(0);
+/// The profile window's imports (`import_window_line`): [imports, bytes,
+/// ns, longest ns, span-list lock acquisitions that waited, ns waited].
+static IMPORT_WIN: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static SPAN_GEN_AT_RESET: AtomicU64 = AtomicU64::new(0);
+
+/// Clears the window's import counts (`profile reset`).
+pub(super) fn reset_import_window() {
+    for c in &IMPORT_WIN {
+        c.store(0, Ordering::Relaxed);
+    }
+    SPAN_GEN_AT_RESET.store(SPAN_GEN.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+/// One profile line: the window's guest-memory imports, waits for the span
+/// list's lock (held while importing) and span-list changes (each clears
+/// every thread's span cache).
+pub(super) fn import_window_line() -> String {
+    let v: Vec<u64> = IMPORT_WIN.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    format!(
+        "    guest-memory imports in the window: {} ({} MiB, {} ms, longest {} ms); span-list lock waits {} ({} ms); span-list changes {}\n",
+        v[0],
+        v[1] >> 20,
+        v[2] / 1_000_000,
+        v[3] / 1_000_000,
+        v[4],
+        v[5] / 1_000_000,
+        SPAN_GEN.load(Ordering::Relaxed).saturating_sub(SPAN_GEN_AT_RESET.load(Ordering::Relaxed))
+    )
+}
+
+/// The span list's lock, counting the time waited when another thread
+/// holds it for writing (an import in progress).
+fn spans_read() -> parking_lot::RwLockReadGuard<'static, Vec<Span>> {
+    if let Some(g) = SPANS.try_read() {
+        return g;
+    }
+    let t = std::time::Instant::now();
+    let g = SPANS.read();
+    IMPORT_WIN[4].fetch_add(1, Ordering::Relaxed);
+    IMPORT_WIN[5].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    g
+}
+
+fn spans_write() -> parking_lot::RwLockWriteGuard<'static, Vec<Span>> {
+    if let Some(g) = SPANS.try_write() {
+        return g;
+    }
+    let t = std::time::Instant::now();
+    let g = SPANS.write();
+    IMPORT_WIN[4].fetch_add(1, Ordering::Relaxed);
+    IMPORT_WIN[5].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    g
+}
 
 /// GPU execution enabled (`DS_GPU=1`) and Vulkan available.
 /// `DS_TRACE_WRITES=<hex bytes>`: logs once each shader (and CP DMA) that
@@ -801,7 +854,7 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     if hit.is_some() {
         return hit;
     }
-    let found = SPANS.read().iter().find(|s| s.valid && s.start <= base && end <= s.end).map(|s| (s.buffer, s.start, s.end));
+    let found = spans_read().iter().find(|s| s.valid && s.start <= base && end <= s.end).map(|s| (s.buffer, s.start, s.end));
     let site = std::panic::Location::caller();
     let r = found.or_else(|| {
         let r = import_span(base, size);
@@ -851,7 +904,7 @@ fn guest_pieces(a: u64, n: u64) -> Vec<(vk::Buffer, u64, u64, u64)> {
 /// Imports the guest window around [base, base+size) (another queue may
 /// have done so meanwhile).
 fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
-    let mut g = SPANS.write();
+    let mut g = spans_write();
     if let Some(s) = g.iter().find(|s| s.valid && s.start <= base && base + size <= s.end) {
         return Some((s.buffer, s.start, s.end));
     }
@@ -901,10 +954,15 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     match ctx().import_host(start + alias, end - start, usage) {
         Ok((buffer, mem, va)) => {
             super::vk::note_gpu_range(buffer, va, end - start, || format!("guest import {start:#x}..{end:#x}"));
-            let ms = t0.elapsed().as_millis();
+            let ns = t0.elapsed().as_nanos() as u64;
+            let ms = ns / 1_000_000;
             if ms >= 50 {
                 crate::info!("gpu: importing guest {start:#x}..{end:#x} ({} MiB) took {ms} ms", (end - start) >> 20);
             }
+            IMPORT_WIN[0].fetch_add(1, Ordering::Relaxed);
+            IMPORT_WIN[1].fetch_add(end - start, Ordering::Relaxed);
+            IMPORT_WIN[2].fetch_add(ns, Ordering::Relaxed);
+            IMPORT_WIN[3].fetch_max(ns, Ordering::Relaxed);
             g.push(Span { start, end, buffer, mem, valid: true });
             SPAN_GEN.fetch_add(1, Ordering::AcqRel);
             IMPORTS.fetch_add(1, Ordering::Relaxed);
