@@ -6775,10 +6775,15 @@ impl Exec {
 
     pub fn sync_for(&mut self, reads: &[(u64, u64)], why: usize) -> bool {
         // DS_TRACE_SYNC=1: the first 400 waits, with the read that collided
-        // and the batch writing it.
-        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // and the batch writing it; DS_TRACE_SYNC=<text>: only on queues
+        // whose name contains it (e.g. acb0x50).
+        static TRACE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         static TRACED: AtomicU64 = AtomicU64::new(0);
-        let trace = (*TRACE.get_or_init(|| std::env::var("DS_TRACE_SYNC").ok().as_deref() == Some("1")) && TRACED.load(Ordering::Relaxed) < 400)
+        let traced_here = TRACE
+            .get_or_init(|| std::env::var("DS_TRACE_SYNC").ok().filter(|v| !v.is_empty() && v != "0"))
+            .as_deref()
+            .is_some_and(|v| v == "1" || self.name.contains(v));
+        let trace = (traced_here && TRACED.load(Ordering::Relaxed) < 400)
             || (super::tune::get_trace_sync() && self.would_wait(reads) && super::tune::take_trace_sync());
         let culprit = if trace {
             let done = done_seq();
@@ -8577,7 +8582,12 @@ impl Exec {
         }
         let mut lap = Laps::for_dispatch(self.cs_kind(true), false);
         let r = [(args, 12)];
-        if !(self.overlaps_pending(&r) || INFLIGHT.latest(&r).is_some() || CP_WRITES.latest(&r).is_some()) {
+        // A compute queue's parallel worker cannot see writes of the run's
+        // earlier chunks (not submitted yet, recorded by other threads;
+        // flushes inside a run, `tune par_events`, order them), and the
+        // run's planning does not wait for the arguments: the GPU reads
+        // them, in order.
+        if !(self.deferred && self.compute_cp) && !(self.overlaps_pending(&r) || INFLIGHT.latest(&r).is_some() || CP_WRITES.latest(&r).is_some()) {
             return false;
         }
         // Arguments in a video-memory home: read by the CP after the home's

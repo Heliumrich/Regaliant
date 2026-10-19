@@ -1597,6 +1597,11 @@ impl Cp {
         let mut c = from;
         let mut why = 0x130usize;
         let mut sync = false;
+        // Whether the chunks' indirect dispatches read their arguments on
+        // the GPU (`Exec::dispatch_gpu_indirect`; compute queues' runs,
+        // `tune par_compute`; captures and interpreter checks read them
+        // here).
+        let gpu_dispatch_args = self.compute && super::tune::gpu_indirect() && !super::capture::capturing() && !super::verify::enabled() && !(super::exec::enabled() && super::emucheck::wanted(self));
         // The run's signature: its packet headers (opcode and size), the
         // same when the title records the same pass again.
         let mut sig = 0xcbf2_9ce4_8422_2325u64;
@@ -1636,6 +1641,11 @@ impl Cp {
                 match opc {
                     op::DRAW_INDIRECT => args.push((draw_base + p(0) as u64, 16)),
                     op::DRAW_INDEX_INDIRECT => args.push((draw_base + p(0) as u64, 20)),
+                    // Dispatch arguments the chunks let the GPU read
+                    // (`Exec::dispatch_gpu_indirect`) need no wait here
+                    // (one per run start cost queue 0x50's runs a GPU round
+                    // trip of ~2.5 ms, twice per flip with `par_compute`).
+                    op::DISPATCH_INDIRECT if gpu_dispatch_args => {}
                     op::DISPATCH_INDIRECT => args.push((if n >= 3 { addr64(p(0), p(1)) } else { disp_base + p(0) as u64 }, 12)),
                     _ => {}
                 }
