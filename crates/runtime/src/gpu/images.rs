@@ -1876,8 +1876,15 @@ impl Images {
     /// Key of the image a T# describes.
     pub fn key_of(t: &Tsharp) -> Option<ImageKey> {
         let format = vk_format(t.format)?;
-        // The resource's mip count (T# MAX_MIP), not the view's range.
-        let levels = (t.max_mip + 1).max(t.last_level + 1).max(1);
+        // The resource's mip count (T# MAX_MIP), not the view's range: a
+        // view may name levels past it, which the hardware clamps (the
+        // particle lighting atlas's writers of levels 1-3 bind levels
+        // m..m+3 of its 4-level resource). Keyed by their range, each such
+        // writer got an image of its own that the atlas's readers never
+        // saw: smoke lit from those levels came out black (4-2's fog).
+        // A zero MAX_MIP with a longer view keeps the view's count (no such
+        // descriptor seen: possibly a MAX_MIP not filled in).
+        let levels = if t.max_mip > 0 { t.max_mip + 1 } else { (t.last_level + 1).max(1) };
         let (ty3d, cube) = (t.ty == 10, t.ty == 11);
         let layers = match t.ty {
             10 | 11 | 12 | 13 | 15 => t.depth.max(1),

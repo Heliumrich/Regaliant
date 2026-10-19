@@ -108,7 +108,7 @@ fn dump_textures(dir: &std::path::Path, textures: &std::collections::BTreeMap<u6
             14 => (1, |p| [p[0], p[1], 0, 255]),
             _ => continue,
         };
-        let levels = (t.max_mip + 1).max(t.last_level + 1).max(1);
+        let levels = if t.max_mip > 0 { t.max_mip + 1 } else { (t.last_level + 1).max(1) };
         let Some(l) = super::tiling::layout(t.sw_mode, elem_log2, t.width, t.height, levels, false) else { continue };
         let size = l.size(1);
         if !crate::gpu::cp::guest_readable(*base, size) {
