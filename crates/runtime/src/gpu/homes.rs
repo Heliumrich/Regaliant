@@ -805,7 +805,8 @@ pub fn create(base: u64, size: u64) -> bool {
 /// `create_args`; `args`: of indirect draw arguments).
 fn create_with(b: u64, n: u64, watched: bool, args: bool, what: &str) -> bool {
     let e = b + n;
-    if n > MAX || USED.load(Ordering::Relaxed) + n > BUDGET {
+    // An eighth of the device's budget at most (BUDGET on a 24 GB GPU).
+    if n > MAX || USED.load(Ordering::Relaxed) + n > super::vk::budget_share(8, BUDGET) {
         return false;
     }
     let mut g = super::lockstat::HOMES.lock(&HOMES);

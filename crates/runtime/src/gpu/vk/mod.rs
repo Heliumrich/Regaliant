@@ -566,8 +566,26 @@ impl Ctx {
         let props = p2.memory_properties;
         let i = (0..props.memory_heap_count as usize).filter(|&i| props.memory_heaps[i].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).max_by_key(|&i| props.memory_heaps[i].size)?;
         drop(p2);
-        Some((budget.heap_usage[i], budget.heap_budget[i]))
+        Some((budget.heap_usage[i], budget.heap_budget[i].min(vram_cap())))
     }
+}
+
+/// `DS_VRAM_CAP_MIB=<MiB>` (boot; simulation of a smaller GPU): the
+/// device-local budget our decisions see (`Ctx::device_budget`: texture
+/// eviction, and sizes derived from it) is at most this; allocations are
+/// not limited by it.
+pub fn vram_cap() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| std::env::var("DS_VRAM_CAP_MIB").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&m| m >= 1024).map_or(u64::MAX, |m| m << 20))
+}
+
+/// A share of the device-local budget seen at the first call (`1/div` of
+/// it, at most `max`; `max` without VK_EXT_memory_budget): fixed pools
+/// (the shared copy cache, video-memory homes) sized for the GPU at hand.
+pub fn budget_share(div: u64, max: u64) -> u64 {
+    static BUDGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let b = *BUDGET.get_or_init(|| ctx().device_budget().map(|(_, b)| b));
+    b.map_or(max, |b| (b / div).min(max))
 }
 
 /// `Ctx::heap_report` of the initialized context ("" before).

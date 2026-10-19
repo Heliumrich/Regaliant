@@ -2187,13 +2187,17 @@ fn merge_by_lines(flips: u64) -> String {
 
 /// Device-local shadow space per slot (working and pristine copies).
 const SHADOW_BYTES: u64 = 32 << 20;
-/// A slot's shadow and batch-start copy segments start this small and grow
-/// to what the executor's batches need (`Exec::seg_want`, at most
-/// SHADOW_BYTES and PRE_SEG): fixed full-size segments held 6 GiB of video
-/// memory over 63 slots (FINDINGS.md 2026-10-19 afternoon).
+/// A slot's shadow and batch-start copy segments are made at the size its
+/// executor's batches need (`Exec::seg_want`: this small to start, raised
+/// to what a batch needed, at most SHADOW_BYTES and PRE_SEG) and lowered
+/// again when SEG_DECAY batches in a row used under a quarter of it: fixed
+/// full-size segments held 6 GiB of video memory over 63 slots, growth
+/// without the decay 3 GB after six level loads, and sizes per slot split
+/// batches (-5% at the gate) (FINDINGS.md 2026-10-19).
 /// `DS_SLOT_SEGS=full` (boot; A/B): full size from the start.
 const SHADOW_INIT: u64 = 2 << 20;
 const PRE_INIT: u64 = 4 << 20;
+const SEG_DECAY: u32 = 256;
 /// Largest buffer shadowed (larger atomic targets stay in host memory).
 const SHADOW_MAX: u64 = 4 << 20;
 
@@ -4888,10 +4892,14 @@ pub struct Exec {
     cur: usize,
     /// Slots that could be created (a failed creation caps them).
     slot_limit: usize,
+    /// Full-size slot segments from the start (`DS_SLOT_SEGS=full`).
+    seg_full: bool,
     /// The sizes this executor's slots' shadow and batch-start copy
-    /// segments are made with (SHADOW_INIT, PRE_INIT; doubled when a batch
-    /// ran out of one, up to SHADOW_BYTES and PRE_SEG).
+    /// segments are made with, the most its batches used since the last
+    /// decay check, and the batches since (`SEG_DECAY`).
     seg_want: [u64; 2],
+    seg_peak: [u64; 2],
+    seg_batches: u32,
     /// The SGPR data ring in video memory could not be allocated.
     vram_ring_failed: bool,
     /// Offsets within the current slot's segment of each ring.
@@ -5168,7 +5176,10 @@ impl Exec {
                 slots,
                 cur: 0,
                 slot_limit: MAX_SLOTS,
+                seg_full: std::env::var("DS_SLOT_SEGS").ok().as_deref() == Some("full"),
                 seg_want: if std::env::var("DS_SLOT_SEGS").ok().as_deref() == Some("full") { [SHADOW_BYTES, PRE_SEG] } else { [SHADOW_INIT, PRE_INIT] },
+                seg_peak: [0; 2],
+                seg_batches: 0,
                 vram_ring_failed: false,
                 ring_used: [0; 2],
                 snap_used: 0,
@@ -5283,9 +5294,9 @@ impl Exec {
     }
 
     /// Makes the current slot's shadow space hold `need` bytes: made, or
-    /// made again larger while the batch has none of it in use (`seg_want`
-    /// rises on the way). False: it is in use and too small (the caller
-    /// ends the batch or does without), or no video memory.
+    /// made again larger (at least double) while the batch has none of it
+    /// in use. False: it is in use and too small (the caller ends the batch
+    /// or does without), or no video memory.
     fn shadow_room(&mut self, need: u64) -> bool {
         if need > SHADOW_BYTES {
             return false;
@@ -5300,7 +5311,7 @@ impl Exec {
         if self.shadow_used > 0 {
             return false;
         }
-        let cap = self.seg_want[0];
+        let cap = if self.seg_full { SHADOW_BYTES } else { self.seg_want[0] };
         self.free_slot_seg(0);
         match ctx().device_buffer(cap, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER) {
             Ok((b, m)) => {
@@ -5331,7 +5342,7 @@ impl Exec {
         if self.pre_used > 0 {
             return false;
         }
-        let cap = self.seg_want[1];
+        let cap = if self.seg_full { PRE_SEG } else { self.seg_want[1] };
         self.free_slot_seg(1);
         match ctx().device_buffer(cap, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER) {
             Ok((b, m)) => {
@@ -5527,12 +5538,14 @@ impl Exec {
         note_seg_use(self.deferred, self.compute_cp, self.shadow_used, 0);
         self.shadow_used = 0;
         self.resident.clear();
-        // Segments smaller than the executor now wants are made again at
-        // their first use in this batch (the slot is free here).
-        if self.slots[self.cur].shadow_cap != 0 && self.slots[self.cur].shadow_cap < self.seg_want[0] {
+        // Segments smaller than the executor now wants, or more than twice
+        // that, are made again at their first use in this batch (the slot
+        // is free here).
+        let (want, scap, pcap) = (self.seg_want, self.slots[self.cur].shadow_cap, self.slots[self.cur].pre_cap);
+        if scap != 0 && (scap < want[0] || scap > 2 * want[0]) {
             self.free_slot_seg(0);
         }
-        if self.slots[self.cur].pre_cap != 0 && self.slots[self.cur].pre_cap < self.seg_want[1] && self.pre_used == 0 {
+        if pcap != 0 && (pcap < want[1] || pcap > 2 * want[1]) && self.pre_used == 0 {
             self.free_slot_seg(1);
         }
     }
@@ -5622,6 +5635,20 @@ impl Exec {
             XDRY.fetch_add(1, Ordering::Relaxed);
         }
         let i = self.cur;
+        // The executor's segment sizes come down after SEG_DECAY batches
+        // that used under a quarter of them (after a level load's big
+        // batches; `begin_batch` remakes slots more than twice as large).
+        self.seg_peak = [self.seg_peak[0].max(self.shadow_used), self.seg_peak[1].max(self.pre_used)];
+        self.seg_batches += 1;
+        if self.seg_batches >= SEG_DECAY && !self.seg_full {
+            for (k, init) in [SHADOW_INIT, PRE_INIT].into_iter().enumerate() {
+                if self.seg_want[k] > init && self.seg_peak[k] * 4 <= self.seg_want[k] {
+                    self.seg_want[k] = self.seg_peak[k].next_power_of_two().max(init);
+                }
+            }
+            self.seg_peak = [0; 2];
+            self.seg_batches = 0;
+        }
         let (cmd, fence) = (self.slots[i].cmd, self.slots[i].fence);
         let qp = self.slots[i].queries;
         // Finished by the submission thread (`tune submit_finish`): the

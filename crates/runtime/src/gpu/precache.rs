@@ -605,7 +605,10 @@ impl Cache {
                 return Some((*k, self.chunks[*k].chunk.clone(), off));
             }
         }
-        let max = (super::tune::pre_share_mib() as u64 * (1 << 20) / CHUNK).max(2) as usize;
+        // At most a sixteenth of the device's budget (1 GiB of a 24 GB GPU's
+        // 23 GB budget: `tune pre_share_mib`; ~448 MiB of an 8 GB one).
+        let mib = super::vk::budget_share(16, super::tune::pre_share_mib() as u64 * (1 << 20));
+        let max = (mib / CHUNK).max(2) as usize;
         let idle = |s: &Slot| s.cap == CHUNK && Arc::strong_count(&s.chunk) == 1;
         let k = match self.chunks.iter().position(idle) {
             Some(k) => k,
