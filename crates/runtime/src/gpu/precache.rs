@@ -100,6 +100,9 @@ struct Entry {
     on_copy: bool,
     /// The synchronization epoch it was last checked for CPU writes in.
     checked: u64,
+    /// The flip it was made or last found clean by a take in (`tune
+    /// pre_trust`).
+    clean_flip: u64,
     /// Its chunk's slot (`Slot::live`).
     slot: usize,
     /// When it was made (a copy pending this long is given up: `insert`).
@@ -311,8 +314,8 @@ pub fn window_line() -> String {
     let d: Vec<u64> = STATS.iter().zip(SNAP.iter()).map(|(v, s)| v.load(Ordering::Relaxed).saturating_sub(s.load(Ordering::Relaxed))).collect();
     let e: Vec<u64> = ENDS.iter().zip(ENDS_SNAP.iter()).map(|(v, s)| v.load(Ordering::Relaxed).saturating_sub(s.load(Ordering::Relaxed))).collect();
     format!(
-        "shared: {} copies, {} reused ({} checked for CPU writes in a new epoch, {} of them waited for another thread's take; entries dropped by CPU writes {}), {} without space, {} left to a batch not submitted yet, entries dropped by eviction {}; big copies {}, dropped by writes {}, declined {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND",
-        d[1], d[0], d[2], d[13], d[3], d[6], d[9], d[5], d[10], d[11], d[12], e[0], e[1], e[2]
+        "shared: {} copies, {} reused ({} checked for CPU writes in a new epoch, {} of them waited for another thread's take; entries dropped by CPU writes {}), {} without space, {} left to a batch not submitted yet, entries dropped by eviction {}; big copies {}, dropped by writes {}, declined {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND; {} used without a take since boot (`tune pre_trust`)",
+        d[1], d[0], d[2], d[13], d[3], d[6], d[9], d[5], d[10], d[11], d[12], e[0], e[1], e[2], TRUSTED.load(Ordering::Relaxed)
     )
 }
 
@@ -699,6 +702,9 @@ fn wait_takes(mut g: Guard, base: u64, size: u64, upto: u64) -> Guard {
     g
 }
 
+/// Lookups served without a take by `tune pre_trust` (diagnosis).
+pub static TRUSTED: AtomicU64 = AtomicU64::new(0);
+
 /// A submitted copy of guest [base, base+size) that is still current:
 /// (chunk, offset, the copy queue's timeline value a batch binding it waits
 /// for: the sequence of the batch that copied it there, else 0). Checks it
@@ -714,6 +720,12 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64, u64)> {
         }
         if e.checked == epoch {
             STATS[0].fetch_add(1, Ordering::Relaxed);
+            return Some((e.chunk.clone(), e.offset, if e.on_copy { e.seq } else { 0 }));
+        }
+        let trust = super::tune::pre_trust();
+        if trust > 0 && e.clean_flip.saturating_add(trust) >= super::FRAMES.load(Ordering::Relaxed) {
+            STATS[0].fetch_add(1, Ordering::Relaxed);
+            TRUSTED.fetch_add(1, Ordering::Relaxed);
             return Some((e.chunk.clone(), e.offset, if e.on_copy { e.seq } else { 0 }));
         }
         e.id
@@ -747,6 +759,7 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     let mut g = wait_takes(g, base, size, upto);
     let e = g.as_mut()?.entries.get_mut(&(base, size)).filter(|e| e.id == id)?;
     e.checked = epoch;
+    e.clean_flip = super::FRAMES.load(Ordering::Relaxed);
     STATS[0].fetch_add(1, Ordering::Relaxed);
     Some((e.chunk.clone(), e.offset, if e.on_copy { e.seq } else { 0 }))
 }
@@ -822,7 +835,7 @@ pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     c.remove((base, size));
     c.chunks[slot].live += 1;
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    c.entries.insert((base, size), Entry { chunk: chunk.clone(), offset, id, seq: 0, on_copy: false, checked: ep, slot, made: std::time::Instant::now() });
+    c.entries.insert((base, size), Entry { chunk: chunk.clone(), offset, id, seq: 0, on_copy: false, checked: ep, clean_flip: super::FRAMES.load(Ordering::Relaxed), slot, made: std::time::Instant::now() });
     INSERT_GEN.fetch_add(1, Ordering::Release);
     cover(base, size, true);
     c.by_base.entry(base).or_default().push(size);

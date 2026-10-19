@@ -1187,9 +1187,20 @@ fn main() {
     let start = Instant::now();
     let mut control = cfg.control.clone().map(|p| (p, 0u64));
     let mut ticks = 0u64;
+    // Boot watch (`DS_BOOT_WATCH=<s>`, default 15, 0 off): a boot that has
+    // flipped no frame by then dumps the guest thread stacks once (some
+    // boots stalled ~40 s early in the title's start-up, FINDINGS.md
+    // 2026-10-18 night; a normal boot flips within ~5 s).
+    let mut boot_watch = std::env::var("DS_BOOT_WATCH").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(15);
     loop {
         std::thread::sleep(Duration::from_millis(250));
         ticks += 1;
+        if boot_watch > 0 && start.elapsed() >= Duration::from_secs(boot_watch) {
+            if gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed) == 0 && std::env::var("DS_GPU").ok().as_deref() == Some("1") {
+                warn!("boot watch: no frame flipped {boot_watch} s after start (DS_BOOT_WATCH); guest thread stacks:\n{}", thread_summary_ex(true));
+            }
+            boot_watch = 0;
+        }
         if ticks % 8 == 0 && exception::break_stats_enabled() {
             exception::dump_break_stats();
         }

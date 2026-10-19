@@ -176,10 +176,25 @@ pub enum Space {
     Uc,
 }
 
+/// Chains of repeatable draws ended, by the opcode of the packet that ended
+/// them (`keeps_repeat`; the status line's top ones).
+pub static REPEAT_ENDS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+
+/// The opcodes that ended most chains of repeatable draws (`REPEAT_ENDS`).
+pub fn repeat_ends_line() -> String {
+    let mut v: Vec<(u64, usize)> = REPEAT_ENDS.iter().enumerate().map(|(k, c)| (c.load(Ordering::Relaxed), k)).filter(|x| x.0 > 0).collect();
+    v.sort_unstable_by(|a, b| b.cmp(a));
+    v.iter().take(6).map(|(c, k)| format!("{k:#x} {c}")).collect::<Vec<_>>().join(", ")
+}
+
 pub struct Cp {
     pub name: String,
     /// Outcome of the last draw (frame captures; no allocation per draw).
     pub last_draw: std::borrow::Cow<'static, str>,
+    /// The last packet was an indexed indirect draw with GPU-read arguments
+    /// that the executor can repeat (`tune draw_repeat`): no other packet
+    /// (but NOPs) since, so the registers are the same.
+    repeat_ok: bool,
     pub compute: bool,
     pub regs: Regs,
     index_base: u64,
@@ -1272,6 +1287,7 @@ impl Cp {
         Cp {
             name: name.to_string(),
             last_draw: std::borrow::Cow::Borrowed(""),
+            repeat_ok: false,
             compute,
             regs: Regs::new(),
             index_base: 0,
@@ -1324,6 +1340,7 @@ impl Cp {
     }
 
     pub fn set_chunk_state(&mut self, s: &ChunkState) {
+        self.repeat_ok = false;
         copy_prefix(&mut self.regs.ctx, &s.regs.ctx, high(Space::Ctx, CTX_DWORDS));
         copy_prefix(&mut self.regs.sh, &s.regs.sh, high(Space::Sh, SH_DWORDS));
         copy_prefix(&mut self.regs.uc, &s.regs.uc, high(Space::Uc, UC_DWORDS));
@@ -2656,13 +2673,108 @@ impl Cp {
             }
             return false;
         }
+        // The draw before was like this one, nothing came between them: one
+        // more indirect draw on the state it left (`tune draw_repeat`).
+        if std::mem::take(&mut self.repeat_ok) && super::tune::draw_repeat() {
+            let index_base = self.index_base;
+            if let Some(e) = self.exec.as_mut() {
+                if e.draw_repeat(a, (index_base, sz), index_bytes) {
+                    // (Stage preparations made ahead for it are not used.)
+                    let _ = self.take_ahead();
+                    self.last_draw = std::borrow::Cow::Borrowed("drawn (repeating the draw before)");
+                    self.repeat_ok = true;
+                    self.split_if_due();
+                    return true;
+                }
+            }
+        }
         let g = super::exec::GpuArgs { addr: a, inst_slot: (inst_loc - GS_USER_DATA) as u16, index_bytes };
-        self.draw(super::exec::DrawArgs { count: 0, instances: 0, index: Some((self.index_base, sz)), base_vertex: None, first_instance: 0, gpu_args: Some(g) });
+        self.draw(super::exec::DrawArgs { count: 0, instances: 0, index: Some((self.index_base, sz)), base_vertex: None, first_instance: 0, gpu_args: Some(g), base_inst: None });
         if self.last_draw == super::exec::NEEDS_CPU_ARGS {
             CPU_ARG_FALLBACKS.fetch_add(1, Ordering::Relaxed);
             return false;
         }
+        self.repeat_ok = super::tune::draw_repeat() && self.exec.as_ref().is_some_and(|e| e.repeat_ready());
         true
+    }
+
+    /// Whether a packet leaves the draw state as the last draw had it (a
+    /// repeat of that draw stays possible, `tune draw_repeat`): indexed
+    /// indirect draws, plain NOPs, and register writes and loads and index
+    /// or base settings that only write the values already there.
+    fn keeps_repeat(&self, opcode: u32, n: u64, p: &dyn Fn(u64) -> u32) -> bool {
+        let same = |space: Space| {
+            let first = p(0) & 0xFFFF;
+            (1..n).all(|i| self.reg(space, first + (i - 1) as u32) == p(i))
+        };
+        // {offset, value} pairs in memory, as `load_pairs` reads them.
+        let same_pairs = |space: Space| {
+            let (a, k) = (addr64(p(0), p(1)), p(2) as u64);
+            k <= 4096 && valid(a, 8 * k.max(1)) && (0..k).all(|i| unsafe { self.reg(space, rd32(a + 8 * i) & 0xFFFF) == rd32(a + 8 * i + 4) })
+        };
+        match opcode {
+            op::DRAW_INDEX_INDIRECT => true,
+            op::NOP => !(n >= 2 && p(0) == DS_MAGIC),
+            op::SET_CONTEXT_REG => same(Space::Ctx),
+            op::SET_SH_REG => same(Space::Sh),
+            op::SET_UCONFIG_REG => same(Space::Uc),
+            op::LOAD_CONTEXT_REG_INDEX => same_pairs(Space::Ctx),
+            op::LOAD_SH_REG_INDEX => same_pairs(Space::Sh),
+            op::LOAD_UCONFIG_REG => same_pairs(Space::Uc),
+            op::INDEX_BASE => self.index_base == addr64(p(0), p(1)),
+            op::INDEX_BUFFER_SIZE => self.index_count == p(0),
+            op::NUM_INSTANCES => self.num_instances == p(0).max(1),
+            op::SET_BASE => (if p(0) == 2 { self.dispatch_indirect_base } else { self.draw_indirect_base }) == addr64(p(1), p(2)),
+            _ => false,
+        }
+    }
+
+    /// Whether an indexed indirect draw whose arguments the CPU reads hands
+    /// the start instance over as Vulkan's first instance (`tune
+    /// cpu_args_base`): no base-vertex word, a start-instance word among the
+    /// vertex stage's user data, draw parameters, a vertex program not known
+    /// to need the word on the CPU; not while a frame is captured.
+    fn cpu_args_base_ok(&self, vtx_loc: u32, inst_loc: u32) -> bool {
+        const GS_USER_DATA: u32 = 0x8C;
+        super::tune::cpu_args_base()
+            && vtx_loc == 0
+            && (GS_USER_DATA..GS_USER_DATA + 32).contains(&inst_loc)
+            && !self.exec_failed
+            && !super::capture::capturing()
+            && super::exec::enabled()
+            && super::vk::try_ctx().is_some_and(|c| c.draw_parameters)
+            && !super::shaders::cpu_args_program(super::shaders::ngg_addr(self))
+    }
+
+    /// An indexed indirect draw whose arguments the CPU read (`w`): the
+    /// start instance as Vulkan's first instance, the vertex stage taking
+    /// its user-data word from gl_BaseInstance (`tune cpu_args_base`); a
+    /// repeat of the draw before when it can be (`tune draw_repeat`), else
+    /// recorded in full; a vertex stage that needs the word on the CPU gets
+    /// it in its register as before. The outcome.
+    fn draw_cpu_args_base(&mut self, w: [u32; 5], sz: u32, inst_loc: u32) -> String {
+        const GS_USER_DATA: u32 = 0x8C;
+        let index = (self.index_base + w[2] as u64 * sz as u64, sz);
+        if std::mem::take(&mut self.repeat_ok) && super::tune::draw_repeat() {
+            if let Some(e) = self.exec.as_mut() {
+                if e.draw_repeat_cpu(index, w[0], w[1], w[3] as i32, w[4]) {
+                    // (Stage preparations made ahead for it are not used.)
+                    let _ = self.take_ahead();
+                    self.repeat_ok = true;
+                    self.split_if_due();
+                    return "drawn (repeating the draw before)".into();
+                }
+            }
+        }
+        self.draw(super::exec::DrawArgs { count: w[0], instances: w[1], index: Some(index), base_vertex: Some(w[3] as i32), first_instance: w[4], gpu_args: None, base_inst: Some((inst_loc - GS_USER_DATA) as u16) });
+        if self.last_draw == super::exec::NEEDS_CPU_ARGS {
+            // The start instance in its register, as before.
+            self.set_reg(Space::Sh, inst_loc, w[4]);
+            self.draw(super::exec::DrawArgs { count: w[0], instances: w[1], index: Some(index), base_vertex: Some(w[3] as i32), first_instance: 0, gpu_args: None, base_inst: None });
+            return std::mem::take(&mut self.last_draw).into_owned();
+        }
+        self.repeat_ok = super::tune::draw_repeat() && self.exec.as_ref().is_some_and(|e| e.repeat_ready());
+        std::mem::take(&mut self.last_draw).into_owned()
     }
 
     /// Whether this (main) command processor is recording its own chunk of a
@@ -2729,9 +2841,9 @@ impl Cp {
                 subs.push(format!("{:?}", &w[..rec as usize / 4]));
             }
             let (args, bv, si) = if indexed {
-                (super::exec::DrawArgs { count: w[0], instances: w[1], index: Some((self.index_base + w[2] as u64 * sz as u64, sz)), base_vertex: Some(w[3] as i32), first_instance: w[4], gpu_args: None }, w[3], w[4])
+                (super::exec::DrawArgs { count: w[0], instances: w[1], index: Some((self.index_base + w[2] as u64 * sz as u64, sz)), base_vertex: Some(w[3] as i32), first_instance: w[4], gpu_args: None, base_inst: None }, w[3], w[4])
             } else {
-                (super::exec::DrawArgs { count: w[0], instances: w[1], index: None, base_vertex: Some(w[2] as i32), first_instance: w[3], gpu_args: None }, w[2], w[3])
+                (super::exec::DrawArgs { count: w[0], instances: w[1], index: None, base_vertex: Some(w[2] as i32), first_instance: w[3], gpu_args: None, base_inst: None }, w[2], w[3])
             };
             if vtx_loc != 0 {
                 self.set_reg(Space::Sh, vtx_loc, bv);
@@ -3121,6 +3233,10 @@ impl Cp {
     }
 
     fn packet(&mut self, opcode: u32, h: u32, at: u64, n: u64, p: &dyn Fn(u64) -> u32) -> Flow {
+        if self.repeat_ok && !self.keeps_repeat(opcode, n, p) {
+            self.repeat_ok = false;
+            REPEAT_ENDS[(opcode & 0xFF) as usize].fetch_add(1, Ordering::Relaxed);
+        }
         match opcode {
             op::NOP => {
                 if n >= 2 && p(0) == DS_MAGIC {
@@ -3172,9 +3288,9 @@ impl Cp {
                 let mut multi: Option<String> = None;
                 let mut indirect: Option<String> = None;
                 let args = match opcode {
-                    op::DRAW_INDEX_AUTO => Some(super::exec::DrawArgs { count: p(0), instances, index: None, base_vertex: None, first_instance: 0, gpu_args: None }),
-                    op::DRAW_INDEX_2 => self.index_size().map(|sz| super::exec::DrawArgs { count: p(3), instances, index: Some((addr64(p(1), p(2)), sz)), base_vertex: None, first_instance: 0, gpu_args: None }),
-                    op::DRAW_INDEX_OFFSET_2 => self.index_size().map(|sz| super::exec::DrawArgs { count: p(2), instances, index: Some((self.index_base + p(1) as u64 * sz as u64, sz)), base_vertex: None, first_instance: 0, gpu_args: None }),
+                    op::DRAW_INDEX_AUTO => Some(super::exec::DrawArgs { count: p(0), instances, index: None, base_vertex: None, first_instance: 0, gpu_args: None, base_inst: None }),
+                    op::DRAW_INDEX_2 => self.index_size().map(|sz| super::exec::DrawArgs { count: p(3), instances, index: Some((addr64(p(1), p(2)), sz)), base_vertex: None, first_instance: 0, gpu_args: None, base_inst: None }),
+                    op::DRAW_INDEX_OFFSET_2 => self.index_size().map(|sz| super::exec::DrawArgs { count: p(2), instances, index: Some((self.index_base + p(1) as u64 * sz as u64, sz)), base_vertex: None, first_instance: 0, gpu_args: None, base_inst: None }),
                     op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT if self.draw_gpu_args(opcode, p) => {
                         multi = Some(std::mem::take(&mut self.last_draw).into_owned());
                         if super::capture::capturing() {
@@ -3200,14 +3316,22 @@ impl Cp {
                             if super::capture::capturing() {
                                 indirect = Some(format!("args {w:?} locs {vtx_loc:#x}/{inst_loc:#x}"));
                             }
-                            Some((super::exec::DrawArgs { count: w[0], instances: w[1], index: None, base_vertex: Some(w[2] as i32), first_instance: w[3], gpu_args: None }, w[2], w[3]))
+                            Some((super::exec::DrawArgs { count: w[0], instances: w[1], index: None, base_vertex: Some(w[2] as i32), first_instance: w[3], gpu_args: None, base_inst: None }, w[2], w[3]))
                         } else if opcode == op::DRAW_INDEX_INDIRECT && valid(a, 20) {
                             let w = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), rd32(a + 16)] };
                             if super::capture::capturing() {
                                 let ty = self.reg(Space::Uc, crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE) & 3;
                                 indirect = Some(format!("args {w:?} locs {vtx_loc:#x}/{inst_loc:#x} index {:#x} type {ty} size {}{}", self.index_base, self.index_count, self.index_range(w[2], w[0])));
                             }
-                            self.index_size().map(|sz| (super::exec::DrawArgs { count: w[0], instances: w[1], index: Some((self.index_base + w[2] as u64 * sz as u64, sz)), base_vertex: Some(w[3] as i32), first_instance: w[4], gpu_args: None }, w[3], w[4]))
+                            match self.index_size() {
+                                // The start instance as Vulkan's first instance
+                                // (`tune cpu_args_base`): drawn here.
+                                Some(sz) if self.cpu_args_base_ok(vtx_loc, inst_loc) => {
+                                    multi = Some(self.draw_cpu_args_base(w, sz, inst_loc));
+                                    None
+                                }
+                                sz => sz.map(|sz| (super::exec::DrawArgs { count: w[0], instances: w[1], index: Some((self.index_base + w[2] as u64 * sz as u64, sz)), base_vertex: Some(w[3] as i32), first_instance: w[4], gpu_args: None, base_inst: None }, w[3], w[4])),
+                            }
                         } else {
                             None
                         };

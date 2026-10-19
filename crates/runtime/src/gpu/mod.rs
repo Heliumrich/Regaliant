@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 129] = [
+    static ALL: [Tunable; 132] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -156,6 +156,9 @@ pub mod tune {
         Tunable { name: "precompile", env: "DS_PRECOMPILE", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "precompile_workers", env: "DS_PRECOMPILE_WORKERS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "depth_views", env: "DS_DEPTH_VIEWS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_trust", env: "DS_PRE_TRUST", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "draw_repeat", env: "DS_DRAW_REPEAT", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "cpu_args_base", env: "DS_CPU_ARGS_BASE", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1401,6 +1404,39 @@ pub mod tune {
     #[inline]
     pub fn depth_views() -> bool {
         get(128) != 0
+    }
+
+    /// Diagnosis only (stale copies): a shared batch-start copy found clean
+    /// by a write-mark take is used without another take for this many
+    /// flips (0: checked once per synchronization epoch, as it must be).
+    /// Bounds what the copy cache's checks cost the frame.
+    #[inline]
+    pub fn pre_trust() -> u64 {
+        get(129)
+    }
+
+    /// An indexed indirect draw whose arguments the GPU reads, following one
+    /// like it with no other packet between them (the culled clusters' draws:
+    /// ~3,700 of the gate frame's ~5,600 indirect draws come in such runs),
+    /// is recorded as one more `vkCmdDrawIndexedIndirect` on the state the
+    /// previous draw left (pipeline, descriptors, dynamic state, index
+    /// buffer, rendering instance), without preparing or binding its stages
+    /// again (`Exec::draw_repeat`). Needs `draw_args_gpu`.
+    #[inline]
+    pub fn draw_repeat() -> bool {
+        get(130) != 0
+    }
+
+    /// Indexed indirect draws whose arguments the CPU reads hand the start
+    /// instance to the vertex stage as `draw_args_gpu` does: as Vulkan's
+    /// first instance, the stage taking that user-data word from
+    /// `gl_BaseInstance` (`DrawArgs::base_inst`), instead of in its register
+    /// (which changes the stage's SGPR data per draw). Draws like the one
+    /// before can then be repeated (`draw_repeat`) without GPU-read
+    /// arguments; stages that need the word on the CPU keep the register.
+    #[inline]
+    pub fn cpu_args_base() -> bool {
+        get(131) != 0
     }
 
     /// A switch's value by name; None if unknown.

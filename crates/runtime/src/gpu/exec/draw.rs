@@ -16,6 +16,25 @@ pub static DRAW_NOOP: AtomicU64 = AtomicU64::new(0);
 pub static DRAW_SKIPPED: AtomicU64 = AtomicU64::new(0);
 /// Indexed indirect draws recorded with the GPU reading their arguments.
 pub static GPU_ARG_DRAWS: AtomicU64 = AtomicU64::new(0);
+/// Of them, those recorded as a repeat of the draw before (`draw_repeat`).
+pub static REPEAT_DRAWS: AtomicU64 = AtomicU64::new(0);
+
+/// A draw with GPU-read arguments that another can repeat (`draw_repeat`):
+/// the batch and `cmd_uses` right after it was recorded, its index binding
+/// (base, index size, bytes; the home's buffer and offset bound) and the
+/// arguments' home buffer; or (`cpu`) a draw whose arguments the CPU read,
+/// drawn in `cpu_args_base` mode with its indices in a home (`index_off`:
+/// the offset bound last).
+#[derive(Clone, Copy)]
+pub(crate) struct Repeat {
+    batch: u64,
+    uses: u64,
+    index: (u64, u32, u64),
+    index_buf: vk::Buffer,
+    index_off: u64,
+    args_buf: vk::Buffer,
+    cpu: bool,
+}
 
 const MAX_RT: usize = 8;
 
@@ -87,6 +106,11 @@ pub struct DrawArgs {
     /// `first_instance` are then unused and `index` is the index buffer's
     /// start.
     pub gpu_args: Option<GpuArgs>,
+    /// The vertex stage's user-data word that takes the start instance from
+    /// `gl_BaseInstance`: an indexed indirect draw whose arguments the CPU
+    /// read, drawn with `first_instance` as Vulkan's first instance (`tune
+    /// cpu_args_base`); None: any start instance is in that word's register.
+    pub base_inst: Option<u16>,
 }
 
 /// Arguments read by the GPU (`DrawArgs::gpu_args`).
@@ -788,6 +812,76 @@ impl Exec {
         outcome
     }
 
+    /// Records an indexed indirect draw whose arguments the GPU reads at
+    /// `args` as one more `vkCmdDrawIndexedIndirect` on the state the draw
+    /// before left (pipeline, push descriptors, dynamic state, index buffer,
+    /// rendering instance; `tune draw_repeat`): only when that draw was
+    /// repeatable, nothing was recorded into the batch since, the index
+    /// binding is the same and both homes still hold their ranges without a
+    /// copy in (one would be recorded first: the draw is then recorded in
+    /// full). The command processor calls it only when no packet but such
+    /// draws came between them, so the registers are the same. False: not
+    /// taken.
+    pub fn draw_repeat(&mut self, args: u64, index: (u64, u32), index_bytes: u64) -> bool {
+        let Some(r) = self.repeat.take() else { return false };
+        if r.cpu || DEVICE_LOST.load(Ordering::Relaxed) || !self.recording || self.stopped || self.batch_count != r.batch || self.cmd_uses.get() != r.uses || self.rendering.is_none() || (index.0, index.1, index_bytes) != r.index || sync_mode() {
+            return false;
+        }
+        let Some(ah) = self.home_bind(args, 20, false, HomeUse::Sized) else { return false };
+        let Some(ih) = self.home_bind(index.0, index_bytes, false, HomeUse::Index) else { return false };
+        if self.stopped || self.batch_count != r.batch || self.cmd_uses.get() != r.uses || ah.0 != r.args_buf || (ih.0, ih.1) != (r.index_buf, r.index_off) {
+            return false;
+        }
+        unsafe { ctx().device.cmd_draw_indexed_indirect(self.slots[self.cur].cmd, ah.0, ah.1, 1, 20) };
+        GPU_ARG_DRAWS.fetch_add(1, Ordering::Relaxed);
+        REPEAT_DRAWS.fetch_add(1, Ordering::Relaxed);
+        DRAWN.fetch_add(1, Ordering::Relaxed);
+        self.args_read = true;
+        self.repeat = Some(r);
+        true
+    }
+
+    /// The same for an indexed indirect draw whose arguments the CPU read
+    /// (`tune cpu_args_base`): `index` is its first index's address and the
+    /// index size, the others its arguments. Its indices must lie in the
+    /// home the draw before bound (bound again at their offset).
+    pub fn draw_repeat_cpu(&mut self, index: (u64, u32), count: u32, instances: u32, base_vertex: i32, first_instance: u32) -> bool {
+        let Some(mut r) = self.repeat.take() else { return false };
+        if !r.cpu || DEVICE_LOST.load(Ordering::Relaxed) || !self.recording || self.stopped || self.batch_count != r.batch || self.cmd_uses.get() != r.uses || self.rendering.is_none() || index.1 != r.index.1 || sync_mode() {
+            return false;
+        }
+        if count == 0 || instances == 0 {
+            // Nothing to draw (the full path's "no effect").
+            DRAW_NOOP.fetch_add(1, Ordering::Relaxed);
+            self.repeat = Some(r);
+            return true;
+        }
+        let bytes = count as u64 * index.1 as u64;
+        let Some(ih) = self.home_bind(index.0, bytes, false, HomeUse::Index) else { return false };
+        if self.stopped || self.batch_count != r.batch || self.cmd_uses.get() != r.uses || ih.0 != r.index_buf {
+            return false;
+        }
+        let cmd = self.slots[self.cur].cmd;
+        let c = ctx();
+        unsafe {
+            if ih.1 != r.index_off {
+                let ty = if index.1 == 4 { vk::IndexType::UINT32 } else { vk::IndexType::UINT16 };
+                c.device.cmd_bind_index_buffer(cmd, ih.0, ih.1, ty);
+                r.index_off = ih.1;
+            }
+            c.device.cmd_draw_indexed(cmd, count, instances, 0, base_vertex, first_instance);
+        }
+        REPEAT_DRAWS.fetch_add(1, Ordering::Relaxed);
+        DRAWN.fetch_add(1, Ordering::Relaxed);
+        self.repeat = Some(r);
+        true
+    }
+
+    /// Whether the draw just recorded can be repeated (`draw_repeat`).
+    pub fn repeat_ready(&self) -> bool {
+        self.repeat.is_some_and(|r| r.uses == self.cmd_uses.get() && r.batch == self.batch_count)
+    }
+
     /// Ends the active rendering instance; its attachment writes become
     /// visible to later commands.
     #[track_caller]
@@ -918,18 +1012,21 @@ impl Exec {
         // Stages prepared ahead by the workers (`gpu::ahead`) when they still
         // hold, else here. A draw whose arguments the GPU reads takes the
         // start instance on the GPU (prepared here).
-        let prep_vs = |cp: &Cp| match gpu {
-            Some(g) => shaders::with_base_instance(g.inst_slot, || shaders::prepare_ngg(cp)),
+        // The start instance from gl_BaseInstance: arguments the GPU reads,
+        // or CPU-read ones drawn with it as Vulkan's first instance.
+        let base_slot = gpu.map(|g| g.inst_slot).or(a.base_inst);
+        let prep_vs = |cp: &Cp| match base_slot {
+            Some(s) => shaders::with_base_instance(s, || shaders::prepare_ngg(cp)),
             None => shaders::prepare_ngg(cp),
         };
         let [pre_vs, pre_ps] = cp.take_ahead();
-        let pre_vs = if gpu.is_some() { None } else { pre_vs };
+        let pre_vs = if base_slot.is_some() { None } else { pre_vs };
         let mut vs = match pre_vs.and_then(|s| crate::gpu::ahead::take(&s, cp, true)) {
             Some(p) => p,
             None => prep_vs(cp)?,
         };
-        if let Some(g) = gpu {
-            if shaders::uses_user_word(&vs, g.inst_slot) {
+        if let Some(slot) = base_slot {
+            if shaders::uses_user_word(&vs, slot) {
                 shaders::note_cpu_args_program(vs.addr);
                 return Err(NEEDS_CPU_ARGS.into());
             }
@@ -1420,6 +1517,7 @@ impl Exec {
             vk::Viewport { x: 0.0, y: 0.0, width: area.0 as f32, height: area.1 as f32, min_depth: 0.0, max_depth: 1.0 }
         };
         let dc = &mut self.dyncache;
+        let mut untimed = false;
         unsafe {
             let rebound = dc.pipeline != pipeline;
             if rebound {
@@ -1605,6 +1703,7 @@ impl Exec {
                 a.count as u64 * a.instances as u64
             };
             let timed = qp != vk::QueryPool::null() && ti < super::MAX_TIMED && super::stamp_worth(Some(work), 16384);
+            untimed = !timed;
             if timed {
                 for k in 0..2 {
                     c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, super::STAMPS * ti + k);
@@ -1663,6 +1762,19 @@ impl Exec {
             }
         }
         lap.mark(16);
+        // Another draw like it can be recorded on the state this one left
+        // (`draw_repeat`): GPU-read arguments, indices and arguments in
+        // homes, no buffer writes, no timestamps around it.
+        let no_writes = bounds.iter().all(|b| b.writes.is_empty());
+        let repeat = match (gpu, &args_home, &index_home, a.index) {
+            (Some(g), Some(ah), Some(ih), Some((addr, size))) if untimed && no_writes && self.recording && super::super::tune::draw_repeat() && !sync_mode() => {
+                Some(Repeat { batch: self.batch_count, uses: 0, index: (addr, size, g.index_bytes), index_buf: ih.0, index_off: ih.1, args_buf: ah.0, cpu: false })
+            }
+            (None, None, Some(ih), Some((_, size))) if a.base_inst.is_some() && untimed && no_writes && self.recording && super::super::tune::draw_repeat() && !sync_mode() => {
+                Some(Repeat { batch: self.batch_count, uses: 0, index: (0, size, 0), index_buf: ih.0, index_off: ih.1, args_buf: vk::Buffer::null(), cpu: true })
+            }
+            _ => None,
+        };
         for b in bounds.drain(..) {
             if !b.writes.is_empty() {
                 crate::gpu::mirror::invalidate(&b.writes);
@@ -1679,6 +1791,8 @@ impl Exec {
             self.recycle(b);
         }
         self.draw_bounds = bounds;
+        // (After everything this draw recorded.)
+        self.repeat = repeat.map(|r| Repeat { uses: self.cmd_uses.get(), ..r });
         lap.mark(17);
         if super::profiling() {
             super::note_phases(&super::DRAW_PHASES, [t_prep, t_pipe, t_bind, since(t0)]);

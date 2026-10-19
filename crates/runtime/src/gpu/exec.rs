@@ -4864,6 +4864,14 @@ pub struct Exec {
     since_barrier: Option<Vec<(u64, u64)>>,
     /// The batch's barrier segments so far (`seg_stamps`).
     segs: Vec<SegMark>,
+    /// The last draw, when another like it can be recorded on the state it
+    /// left (`draw_repeat`, `tune draw_repeat`).
+    repeat: Option<draw::Repeat>,
+    /// Bumped by every `cmd()`: anything recorded into the batch's command
+    /// buffer after a draw (the repeat checks it).
+    cmd_uses: std::cell::Cell<u64>,
+    /// Batches begun (the repeat checks it).
+    batch_count: u64,
 }
 
 unsafe impl Send for Exec {}
@@ -5030,6 +5038,9 @@ impl Exec {
                 batch_alt_share: false,
                 since_barrier: Some(Vec::new()),
                 segs: Vec::new(),
+                repeat: None,
+                cmd_uses: std::cell::Cell::new(0),
+                batch_count: 0,
             })
         }
     }
@@ -5043,6 +5054,7 @@ impl Exec {
     }
 
     fn cmd(&self) -> vk::CommandBuffer {
+        self.cmd_uses.set(self.cmd_uses.get().wrapping_add(1));
         self.slots[self.cur].cmd
     }
 
@@ -5064,6 +5076,8 @@ impl Exec {
     }
 
     fn begin_batch(&mut self) {
+        self.batch_count += 1;
+        self.repeat = None;
         // Imports looked up from now on belong to this batch (`reap_spans`).
         if self.open_gen.load(Ordering::Relaxed) == u64::MAX {
             self.open_gen.store(SPAN_GEN.load(Ordering::SeqCst), Ordering::SeqCst);
@@ -9008,7 +9022,7 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; stages prepared again with GPU-side data loads {:?} ({} programs since with them); {} render passes ended into the next full barrier; GPU-performed CP writes after merging resident shadows {} (written before the merge {}); draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills, {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; stages prepared again with GPU-side data loads {:?} ({} programs since with them); {} render passes ended into the next full barrier; GPU-performed CP writes after merging resident shadows {} (written before the merge {}); draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills, {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         SHADOW_ARGS.load(Ordering::Relaxed),
@@ -9038,6 +9052,8 @@ pub fn status() -> String {
         SKIPPED.load(Ordering::Relaxed),
         draw::DRAWN.load(Ordering::Relaxed),
         draw::GPU_ARG_DRAWS.load(Ordering::Relaxed),
+        draw::REPEAT_DRAWS.load(Ordering::Relaxed),
+        super::cp::repeat_ends_line(),
         ARGS_WAR_BARRIERS.load(Ordering::Relaxed),
         draw::DRAW_NOOP.load(Ordering::Relaxed),
         draw::DRAW_SKIPPED.load(Ordering::Relaxed),
