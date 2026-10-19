@@ -9457,6 +9457,7 @@ pub fn status() -> String {
         + &super::track::status()
         + &crate::mem::remap_status()
         + &crate::titlemem::status()
+        + &crate::titlefix::status()
         + &super::lodstats::status()
         + &super::ahead::status()
         + &super::compile::status()

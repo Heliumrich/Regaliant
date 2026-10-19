@@ -437,7 +437,7 @@ pub fn finalize(m: &LoadedModule) -> Result<PatchStats, String> {
     }
     if m.is_main {
         crate::exception::install_text_hooks(&mut p, &ranges);
-        crate::titlefix::apply(p.image);
+        crate::titlefix::apply(&mut p, &ranges);
     }
     let tramp_used = p.tramp_used;
     // Protections. Segments can share a page (PS5: the end of .bss and the

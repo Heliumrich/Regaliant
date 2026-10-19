@@ -14,6 +14,8 @@
 //! * Diagnostic hooks (`DS_TEXT_HOOK`): a `jmp` to a trampoline that saves the
 //!   registers, calls a host function with them, replays the displaced
 //!   instructions and jumps back (`hook`).
+//! * Title fixes (`titlefix`): a `jmp` to a trampoline that runs inserted
+//!   instructions, then the displaced ones, and jumps back (`insert`).
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 
@@ -261,32 +263,8 @@ impl<'a> Patcher<'a> {
     /// interior.
     pub fn hook(&mut self, rel: u64, ranges: &[(u64, u64)], handler: u64, arg: u32) -> Result<u64, String> {
         use iced_x86::code_asm::*;
-        let &(fstart, fend) = ranges.iter().find(|r| r.0 <= rel && rel < r.1).ok_or("not inside a known function")?;
-        let code = self.image[fstart as usize..fend as usize].to_vec();
-        let mut targets = Vec::new();
-        let mut displaced: Vec<Instruction> = Vec::new();
-        let mut dec = Decoder::with_ip(64, &code, self.base + fstart, DecoderOptions::NONE);
-        let mut ins = Instruction::default();
+        let len = self.displaced_len(rel, ranges)?;
         let at = self.base + rel;
-        while dec.can_decode() {
-            dec.decode_out(&mut ins);
-            if matches!(ins.flow_control(), FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch) && ins.op0_kind() == OpKind::NearBranch64 {
-                targets.push(ins.near_branch64());
-            }
-            if ins.ip() >= at && displaced.iter().map(|i| i.len()).sum::<usize>() < 5 {
-                displaced.push(ins);
-            }
-        }
-        let len: usize = displaced.iter().map(|i| i.len()).sum();
-        if displaced.first().map(|i| i.ip()) != Some(at) || len < 5 {
-            return Err("not an instruction boundary (or function too short)".into());
-        }
-        if displaced.iter().any(|i| i.is_ip_rel_memory_operand() || i.flow_control() != FlowControl::Next) {
-            return Err("displaced instructions are RIP-relative or change control flow".into());
-        }
-        if targets.iter().any(|&t| t > at && t < at + len as u64) {
-            return Err("a branch targets the patched bytes".into());
-        }
         let tramp_at = self.tramp_base + self.tramp_used as u64;
         let back = at + len as u64;
         let asm = || -> Result<Vec<u8>, IcedError> {
@@ -321,15 +299,78 @@ impl<'a> Patcher<'a> {
             a.assemble(tramp_at)
         };
         let bytes = asm().map_err(|e| format!("assemble: {e}"))?;
-        let t = self.emit_trampoline(&bytes).ok_or("trampoline space exhausted")?;
+        self.divert(rel, len, &bytes, tramp_at)
+    }
+
+    /// Inline insertion at module-relative `rel`: `code` (machine code that
+    /// does not depend on its address) runs before the instructions there,
+    /// which follow it in a trampoline. The constraints of `hook` apply;
+    /// `code` must leave the registers and the stack as it found them, and
+    /// may change flags only where the displaced instructions set them
+    /// before any use.
+    pub fn insert(&mut self, rel: u64, ranges: &[(u64, u64)], code: &[u8]) -> Result<u64, String> {
+        use iced_x86::code_asm::*;
+        let len = self.displaced_len(rel, ranges)?;
+        let at = self.base + rel;
+        let tramp_at = self.tramp_base + self.tramp_used as u64;
+        let start = rel as usize;
+        let asm = || -> Result<Vec<u8>, IcedError> {
+            let mut a = CodeAssembler::new(64)?;
+            a.db(code)?;
+            a.db(&self.image[start..start + len])?;
+            a.jmp(at + len as u64)?;
+            a.assemble(tramp_at)
+        };
+        let bytes = asm().map_err(|e| format!("assemble: {e}"))?;
+        self.divert(rel, len, &bytes, tramp_at)
+    }
+
+    /// Emits trampoline `bytes` (assembled for `tramp_at`, the next free
+    /// trampoline address) and replaces the `len` bytes at `rel` with a jump
+    /// to it, padded with nops.
+    fn divert(&mut self, rel: u64, len: usize, bytes: &[u8], tramp_at: u64) -> Result<u64, String> {
+        let t = self.emit_trampoline(bytes).ok_or("trampoline space exhausted")?;
         debug_assert_eq!(t, tramp_at);
-        let j = enc_jmp(at, t).ok_or("trampoline out of rel32 range")?;
+        let j = enc_jmp(self.base + rel, t).ok_or("trampoline out of rel32 range")?;
         let off = rel as usize;
         self.image[off..off + 5].copy_from_slice(&j);
         for b in &mut self.image[off + 5..off + len] {
             *b = 0x90;
         }
         Ok(t)
+    }
+
+    /// The length of the instructions at module-relative `rel` that a 5-byte
+    /// jump displaces. They must not be RIP-relative or branches, and no
+    /// branch in the function may target their interior.
+    fn displaced_len(&self, rel: u64, ranges: &[(u64, u64)]) -> Result<usize, String> {
+        let &(fstart, fend) = ranges.iter().find(|r| r.0 <= rel && rel < r.1).ok_or("not inside a known function")?;
+        let code = &self.image[fstart as usize..fend as usize];
+        let mut targets = Vec::new();
+        let mut displaced: Vec<Instruction> = Vec::new();
+        let mut dec = Decoder::with_ip(64, code, self.base + fstart, DecoderOptions::NONE);
+        let mut ins = Instruction::default();
+        let at = self.base + rel;
+        while dec.can_decode() {
+            dec.decode_out(&mut ins);
+            if matches!(ins.flow_control(), FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch) && ins.op0_kind() == OpKind::NearBranch64 {
+                targets.push(ins.near_branch64());
+            }
+            if ins.ip() >= at && displaced.iter().map(|i| i.len()).sum::<usize>() < 5 {
+                displaced.push(ins);
+            }
+        }
+        let len: usize = displaced.iter().map(|i| i.len()).sum();
+        if displaced.first().map(|i| i.ip()) != Some(at) || len < 5 {
+            return Err("not an instruction boundary (or function too short)".into());
+        }
+        if displaced.iter().any(|i| i.is_ip_rel_memory_operand() || i.flow_control() != FlowControl::Next) {
+            return Err("displaced instructions are RIP-relative or change control flow".into());
+        }
+        if targets.iter().any(|&t| t > at && t < at + len as u64) {
+            return Err("a branch targets the patched bytes".into());
+        }
+        Ok(len)
     }
 
     /// Decodes each function range and applies patches. `ranges` are module-relative.
