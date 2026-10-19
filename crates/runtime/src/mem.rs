@@ -996,6 +996,59 @@ pub fn host_protect(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     if ok == 0 { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
 }
 
+/// A recent unmap or protection removal (`note_unmap`): its guest range,
+/// when (ms since the first note, flip), the thread and its guest frames.
+struct UnmapNote {
+    start: u64,
+    end: u64,
+    op: &'static str,
+    ms: u64,
+    flip: u64,
+    thread: String,
+    frames: Vec<String>,
+}
+
+/// The last UNMAP_NOTES unmaps and protection removals (a separate lock:
+/// fault reports read it while the memory map's lock may be held).
+static UNMAPS: Mutex<std::collections::VecDeque<UnmapNote>> = Mutex::new(std::collections::VecDeque::new());
+const UNMAP_NOTES: usize = 8192;
+
+/// Notes an unmap (or a protection change to no access) for fault reports
+/// (`unmaps_covering`): the title's level changes free memory that jobs
+/// still read in a share of loads (FINDINGS.md 2026-10-19).
+fn note_unmap(op: &'static str, start: u64, end: u64) {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let ms = T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let n = UnmapNote {
+        start,
+        end,
+        op,
+        ms,
+        flip: crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed),
+        thread: crate::log::thread_name(),
+        frames: crate::exception::current_guest_frames(6),
+    };
+    let mut g = UNMAPS.lock();
+    if g.len() >= UNMAP_NOTES {
+        g.pop_front();
+    }
+    g.push_back(n);
+}
+
+/// The noted unmaps covering `addr`, newest first (at most four): fault
+/// reports of reads from memory the title freed. Empty while the notes are
+/// being written.
+pub fn unmaps_covering(addr: u64) -> Vec<String> {
+    let Some(g) = UNMAPS.try_lock() else { return vec!["(notes busy)".into()] };
+    let now = g.back().map_or(0, |n| n.ms);
+    g.iter()
+        .rev()
+        .filter(|n| n.start <= addr && addr < n.end)
+        .take(4)
+        .map(|n| format!("{} {:#x}..{:#x} at flip {} ({} ms before the last note) by {}: {}", n.op, n.start, n.end, n.flip, now.saturating_sub(n.ms), n.thread, n.frames.join(" <- ")))
+        .collect()
+}
+
 /// `DS_TRACE_MAP=<hex lo>-<hex hi>`: logs every map, unmap and protection
 /// change that touches [lo, hi), with the calling thread's guest frames.
 fn trace_map(op: &str, start: u64, end: u64, detail: std::fmt::Arguments) {
@@ -1266,6 +1319,7 @@ impl MemState {
     /// `unmap_range`; `why` names the cause of view splits (diagnostics).
     fn unmap_range_for(&mut self, start: u64, end: u64, why: usize) {
         trace_map("unmap", start, end, format_args!(""));
+        note_unmap("unmap", start, end);
         bump_gen(start, end);
         self.split_at(start, why);
         self.split_at(end, why);
@@ -1419,6 +1473,9 @@ impl MemState {
 
     pub fn protect(&mut self, start: u64, end: u64, prot: u32) -> Result<(), MemError> {
         trace_map("protect", start, end, format_args!("prot {prot:#x}"));
+        if prot & 7 == 0 {
+            note_unmap("protect none", start, end);
+        }
         self.split_at(start, crate::sections::SPLIT_PROTECT);
         self.split_at(end, crate::sections::SPLIT_PROTECT);
         let keys: Vec<u64> = self.vmas.range(start..end).map(|(k, _)| *k).collect();

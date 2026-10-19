@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 134] = [
+    static ALL: [Tunable; 138] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -161,6 +161,10 @@ pub mod tune {
         Tunable { name: "cpu_args_base", env: "DS_CPU_ARGS_BASE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "sgpr_pc", env: "DS_SGPR_PC", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ww_gate", env: "DS_WW_GATE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fill_skip", env: "DS_FILL_SKIP", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "image_evict", env: "DS_IMAGE_EVICT", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "vram_high", env: "DS_VRAM_HIGH", default: 85, value: AtomicU64::new(UNSET) },
+        Tunable { name: "vram_low", env: "DS_VRAM_LOW", default: 75, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1460,6 +1464,37 @@ pub mod tune {
     #[inline]
     pub fn ww_gate() -> u64 {
         get(133)
+    }
+
+    /// A zero fill (the fill kernel over a whole range) of 256 KiB or more
+    /// whose range is all the memory of GPU-written images it clears
+    /// (`Images::fill_covered`) clears only the images: their guest memory
+    /// is not kept current, and the store across PCIe cost the GPU ~0.7 ms
+    /// per gate frame (an 18 MB layered render target each frame).
+    #[inline]
+    pub fn fill_skip() -> bool {
+        get(134) != 0
+    }
+
+    /// Images are evicted when video memory runs short (`images::maybe_evict`):
+    /// once this process uses more than `vram_high` percent of the device-local
+    /// heap's budget (VK_EXT_memory_budget), the least recently used images
+    /// go until it is under `vram_low` percent. 0: images are kept for the
+    /// whole session (the earlier behavior: six level loads filled a 24 GB
+    /// GPU, 2026-10-19).
+    #[inline]
+    pub fn image_evict() -> bool {
+        get(135) != 0
+    }
+
+    #[inline]
+    pub fn vram_high() -> u64 {
+        get(136).clamp(10, 100)
+    }
+
+    #[inline]
+    pub fn vram_low() -> u64 {
+        get(137).clamp(5, 100)
     }
 
     /// A switch's value by name; None if unknown.

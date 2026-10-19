@@ -82,7 +82,7 @@ struct Tls {
     grows: HashMap<(u64, u32, u32, i32, u32), Option<ImageKey>>,
     gpu_base: HashMap<u64, bool>,
     depth_feed: HashMap<u64, bool>,
-    views: HashMap<[u32; 8], (u64, u64, u64, vk::ImageView, vk::Image)>,
+    views: HashMap<[u32; 8], (u64, u64, u64, vk::ImageView, vk::Image, UseStamp)>,
     samplers: HashMap<([u32; 4], bool), vk::Sampler>,
 }
 
@@ -167,7 +167,14 @@ pub fn view_hit(t: &Tsharp, frame: u64) -> Option<(vk::ImageView, vk::Image)> {
         Some(_) => 0,
     };
     memo_note(k);
-    if k == 0 { e.map(|e| (e.3, e.4)) } else { None }
+    if k == 0 {
+        e.map(|e| {
+            e.5.stamp(frame);
+            (e.3, e.4)
+        })
+    } else {
+        None
+    }
 }
 
 /// `Images::sampler` from this thread's memo.
@@ -186,6 +193,7 @@ pub fn key_hit(t: &Tsharp, storage: bool) -> Option<Option<ImageKey>> {
 pub fn target(s: &Surface) -> Result<Target, String> {
     let k = surface_key(s);
     if let Some(t) = tls(|m| m.targets.get(&k).copied()) {
+        t.used.stamp(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
         return Ok(t);
     }
     let g = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
@@ -611,6 +619,8 @@ pub struct Target {
     pub key: ImageKey,
     pub image: vk::Image,
     pub view: vk::ImageView,
+    /// The image's use stamp (memoized targets stamp it too).
+    pub used: UseStamp,
     /// Attachment (view) format.
     pub format: vk::Format,
     /// Size of the attached mip level.
@@ -725,6 +735,116 @@ pub struct Image {
     /// The shader that last bound it as a storage image (diagnosis:
     /// `fillimg cs=`).
     writer: u64,
+    /// Its device memory and bytes, and the frame of its last use.
+    mem: vk::DeviceMemory,
+    bytes: u64,
+    used: UseStamp,
+}
+
+/// An image's use stamp: the frame of its last lookup, memoized lookups
+/// included, so that the least recently used images can go when video
+/// memory runs short (`Images::evict`). Leaked (8 bytes per image ever
+/// made): the memos read it without the cache's lock.
+#[derive(Clone, Copy)]
+pub struct UseStamp(&'static std::sync::atomic::AtomicU64);
+
+impl UseStamp {
+    fn new(frame: u64) -> Self {
+        UseStamp(Box::leak(Box::new(std::sync::atomic::AtomicU64::new(frame))))
+    }
+
+    /// Notes a use in `frame` (one store per image and frame).
+    #[inline]
+    pub fn stamp(&self, frame: u64) {
+        if self.0.load(std::sync::atomic::Ordering::Relaxed) < frame {
+            self.0.store(frame, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn get(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl PartialEq for UseStamp {
+    fn eq(&self, o: &Self) -> bool {
+        std::ptr::eq(self.0, o.0)
+    }
+}
+
+impl Eq for UseStamp {}
+
+impl std::fmt::Debug for UseStamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "used at {}", self.get())
+    }
+}
+
+/// An image the cache dropped (`Images::evict`, `grow_depth`), destroyed
+/// once no batch can use it any more (`exec::bury_images`).
+pub struct Evicted {
+    pub image: vk::Image,
+    pub mem: vk::DeviceMemory,
+    pub views: Vec<vk::ImageView>,
+}
+
+/// Video memory of the cached images, bytes.
+static IMAGE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Images evicted: [count, bytes, eviction rounds].
+static EVICTED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// An uploaded image is evicted under pressure only when unused for this
+/// many frames. GPU-written ones, whose contents guest memory does not
+/// hold, are never evicted: evicting those unused for 600 frames (data a
+/// level load wrote and drew much later) lost 4-2's architecture in a
+/// stress tour, and taking images over memory the title unmapped for dead
+/// broke every level (the title maps its direct memory again with its
+/// contents; 2026-10-19).
+const EVICT_AGE: u64 = 120;
+/// Video-memory budget checks at most this often.
+const EVICT_CHECK_MS: u64 = 500;
+
+/// When this process uses more video memory than `tune vram_high` percent of
+/// the device-local budget, evicts the least recently used images until
+/// about `vram_low` percent (completion thread, at most every
+/// EVICT_CHECK_MS; skipped while the cache is busy).
+pub fn maybe_evict() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !super::tune::image_evict() {
+        return;
+    }
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ms = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + EVICT_CHECK_MS;
+    if ms < LAST.load(Relaxed) + EVICT_CHECK_MS {
+        return;
+    }
+    LAST.store(ms, Relaxed);
+    let frame = super::FRAMES.load(Relaxed);
+    let Some((used, budget)) = ctx().device_budget() else { return };
+    if budget == 0 || used <= budget / 100 * super::tune::vram_high() {
+        return;
+    }
+    let want = used.saturating_sub(budget / 100 * super::tune::vram_low());
+    let Some(mut g) = IMAGES.try_lock() else { return };
+    let Some(im) = g.as_mut() else { return };
+    let out = im.evict(frame, want);
+    drop(g);
+    if out.0.is_empty() {
+        return;
+    }
+    let rounds = EVICTED[2].fetch_add(1, Relaxed) + 1;
+    if rounds <= 20 || rounds % 100 == 0 {
+        crate::info!(
+            "images: video memory {} of budget {} MiB at flip {frame}: evicted {} textures ({} MiB), {} images cached ({} MiB)",
+            used >> 20,
+            budget >> 20,
+            out.0.len(),
+            out.1 >> 20,
+            out.2,
+            IMAGE_BYTES.load(Relaxed) >> 20
+        );
+    }
+    super::exec::bury_images(out.0);
 }
 
 /// A host-visible buffer texture data is uploaded from (`Images::staging`).
@@ -864,7 +984,7 @@ pub struct Images {
     /// no tracked texture source was written, `view` would do nothing but
     /// return the same view (draws bind the same textures thousands of times
     /// per frame; each full lookup took the tracker's lock three times).
-    view_memo: HashMap<[u32; 8], (u64, u64, u64, vk::ImageView, vk::Image)>,
+    view_memo: HashMap<[u32; 8], (u64, u64, u64, vk::ImageView, vk::Image, UseStamp)>,
     /// `resolved_key` by (T#, storage): (LOOKUP_GEN, key).
     key_memo: HashMap<([u32; 8], bool), (u64, Option<ImageKey>)>,
     /// Images whose metadata a GPU or CP write covered since (fast clears).
@@ -912,9 +1032,6 @@ pub struct Images {
     partial_seen: super::fx::Set<u64>,
     /// Zero images for unused image table entries, by view type.
     dummies: HashMap<vk::ImageViewType, vk::ImageView>,
-    /// Images replaced by larger ones (`grow_depth`); kept alive, since
-    /// descriptor sets of earlier batches may still name them.
-    retired: Vec<vk::Image>,
     /// Depth images grown (status line).
     pub depth_grows: u64,
     /// Bases of R32 float / R16 unorm images bound as storage: compute
@@ -1079,7 +1196,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
                 .expect("image pool");
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
-            *g = Some(Images { map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), inflight: Default::default(), spare_cmds: Vec::new(), reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), retired: Vec::new(), depth_grows: 0, depth_feeds: Default::default() });
+            *g = Some(Images { map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), inflight: Default::default(), spare_cmds: Vec::new(), reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default() });
         }
     }
     let im = g.as_mut().unwrap();
@@ -1104,7 +1221,7 @@ impl Images {
     }
 
     /// Creates the VkImage for `key` (GENERAL layout, contents undefined).
-    fn create(&mut self, key: ImageKey) -> Result<vk::Image, String> {
+    fn create(&mut self, key: ImageKey) -> Result<(vk::Image, vk::DeviceMemory, u64), String> {
         let c = ctx();
         let props = unsafe { c.instance.get_physical_device_format_properties(c.pdev, key.format) };
         let f = props.optimal_tiling_features;
@@ -1149,7 +1266,7 @@ impl Images {
             let req = c.device.get_image_memory_requirements(image);
             let mem = c.alloc(req, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
             c.device.bind_image_memory(image, mem, 0).map_err(|e| format!("bind image: {e}"))?;
-            Ok(image)
+            Ok((image, mem, req.size))
         }
     }
 
@@ -1861,7 +1978,7 @@ impl Images {
             return Ok(v);
         }
         let key = ImageKey { base: 0, format: vk::Format::R8G8B8A8_UNORM, width: 1, height: 1, layers, levels: 1, ty3d, cube: layers == 6 };
-        let image = self.create(key)?;
+        let (image, _, _) = self.create(key)?;
         self.to_general(image, key.format);
         let ci = vk::ImageViewCreateInfo::default()
             .image(image)
@@ -1923,7 +2040,7 @@ impl Images {
     /// work that used `old`.
     pub fn grow_depth(&mut self, old: ImageKey, layers: u32) -> Result<ImageKey, String> {
         let new_key = ImageKey { layers, ..old };
-        let image = self.create(new_key)?;
+        let (image, mem, bytes) = self.create(new_key)?;
         self.to_general(image, new_key.format);
         let Some(prev) = self.map_remove(&old) else { return Err("grow_depth: image gone".into()) };
         let aspect = aspects(old.format);
@@ -1941,7 +2058,7 @@ impl Images {
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
         });
-        self.map_insert(new_key, Image { image, key: new_key, views: HashMap::default(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: prev.write_gen, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0 });
+        self.map_insert(new_key, Image { image, key: new_key, views: HashMap::default(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: prev.write_gen, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed)) });
         for v in self.stencil_of.values_mut() {
             if *v == old {
                 *v = new_key;
@@ -1958,7 +2075,8 @@ impl Images {
         }
         self.note_gen += 1;
         NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
-        self.retired.push(prev.image);
+        // Destroyed once the batches that may name it are done.
+        super::exec::bury_images(vec![Evicted { image: prev.image, mem: prev.mem, views: prev.views.values().copied().collect() }]);
         self.depth_grows += 1;
         if self.depth_grows <= 16 {
             crate::info!("images: depth image {:#x} {}x{} {:?} grown from {} to {} layers", old.base, old.width, old.height, old.format, old.layers, layers);
@@ -2315,7 +2433,7 @@ impl Images {
             }
             return Ok(k);
         }
-        let image = self.create(key)?;
+        let (image, mem, bytes) = self.create(key)?;
         let source = match self.upload(image, key, t) {
             Ok(s) => Some(s),
             Err(e) => {
@@ -2331,7 +2449,7 @@ impl Images {
             self.report(format!("texture {:#x} is not write-tracked (read-only or unmapped pages): later CPU updates are not seen", t.base));
         }
         let hashes = source.map(|(b, n)| all_hashes(b, n)).unwrap_or([0; SLICES]);
-        self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: false, source: region, hashes, checked_frame: frame, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0 });
+        self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: false, source: region, hashes, checked_frame: frame, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(frame) });
         self.note_layout(key, t);
         Ok(key)
     }
@@ -2446,6 +2564,95 @@ impl Images {
             out.push((img.image, k.format));
         }
         out
+    }
+
+    /// Evicts uploaded images not used for EVICT_AGE frames, least recently
+    /// used first, until `want` bytes are freed: (the images to destroy,
+    /// bytes, images left). A texture evicted is uploaded again from guest
+    /// memory at its next use.
+    pub fn evict(&mut self, frame: u64, want: u64) -> (Vec<Evicted>, u64, usize) {
+        let mut cands: Vec<(u64, ImageKey)> = self
+            .map
+            .iter()
+            .filter(|(_, i)| !i.gpu_written && frame.saturating_sub(i.used.get()) >= EVICT_AGE)
+            .map(|(k, i)| (i.used.get(), *k))
+            .collect();
+        cands.sort_unstable_by_key(|c| c.0);
+        let (mut out, mut freed) = (Vec::new(), 0u64);
+        for (_, k) in cands {
+            if freed >= want {
+                break;
+            }
+            if let Some((e, bytes, _)) = self.drop_image(&k) {
+                freed += bytes;
+                out.push(e);
+            }
+        }
+        EVICTED[0].fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        EVICTED[1].fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
+        (out, freed, self.map.len())
+    }
+
+    /// Removes an image from the cache and every index naming it: (the
+    /// image to destroy, its bytes, whether GPU-written).
+    fn drop_image(&mut self, k: &ImageKey) -> Option<(Evicted, u64, bool)> {
+        let img = self.map_remove(k)?;
+        if let Some(v) = self.owned.get_mut(&k.base) {
+            v.retain(|x| x != k);
+            if v.is_empty() {
+                self.owned.remove(&k.base);
+            }
+        }
+        self.overwritten_keys.remove(k);
+        if img.overwritten {
+            self.pending_overwrites = self.pending_overwrites.saturating_sub(1);
+        }
+        self.pending_clears.remove(k);
+        self.pending_change += 1;
+        self.stencil_of.retain(|_, v| *v != *k);
+        self.meta_of.retain(|_, v| v.0 != *k);
+        if img.gpu_written && !self.by_base.get(&k.base).is_some_and(|ks| ks.iter().any(|x| self.map.get(x).is_some_and(|i| i.gpu_written))) {
+            self.gpu_bases.remove(&k.base);
+        }
+        if let Some(id) = img.source {
+            super::track::unwatch(id);
+        }
+        self.last_note = None;
+        self.note_gen += 1;
+        NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+        let views = img.views.values().copied().collect();
+        Some((Evicted { image: img.image, mem: img.mem, views }, img.bytes, img.gpu_written))
+    }
+
+    /// Whether [base, base+len) is wholly the memory of GPU-written images
+    /// that `zero_filled` clears, with no other image over any of it: a
+    /// zero fill of the range then need not store into guest memory (`tune
+    /// fill_skip`), whose bytes such images do not keep current anyway.
+    pub fn fill_covered(&self, base: u64, len: u64) -> bool {
+        if len == 0 || self.owned.is_empty() {
+            return false;
+        }
+        let end = base.saturating_add(len);
+        let mut spans: Vec<(u64, u64)> = Vec::new();
+        for (k, img) in self.map.iter() {
+            let (a, b) = (k.base, k.base.saturating_add(img.span.max(1)));
+            if b <= base || a >= end {
+                continue;
+            }
+            if !img.gpu_written || img.span == 0 || is_compressed(k.format) || !(base <= a && b <= end && len <= 2 * img.span + (64 << 10)) {
+                return false;
+            }
+            spans.push((a, b));
+        }
+        spans.sort_unstable();
+        let mut at = base;
+        for (a, b) in spans {
+            if a > at {
+                return false;
+            }
+            at = at.max(b);
+        }
+        at >= end
     }
 
     /// The guest bytes of the images among `keys` overwritten through a
@@ -2655,14 +2862,21 @@ impl Images {
         if img.gpu_written || self.gpu_bases.contains(&key.base) {
             gpu_images_changed();
         }
-        if self.map.insert(key, img).is_none() {
-            self.by_base.entry(key.base).or_default().push(key);
+        IMAGE_BYTES.fetch_add(img.bytes, std::sync::atomic::Ordering::Relaxed);
+        match self.map.insert(key, img) {
+            None => self.by_base.entry(key.base).or_default().push(key),
+            Some(old) => {
+                // Replaced: destroyed once no batch can name it.
+                IMAGE_BYTES.fetch_sub(old.bytes, std::sync::atomic::Ordering::Relaxed);
+                super::exec::bury_images(vec![Evicted { image: old.image, mem: old.mem, views: old.views.values().copied().collect() }]);
+            }
         }
         LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     fn map_remove(&mut self, key: &ImageKey) -> Option<Image> {
         let img = self.map.remove(key)?;
+        IMAGE_BYTES.fetch_sub(img.bytes, std::sync::atomic::Ordering::Relaxed);
         LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         if img.gpu_written || self.gpu_bases.contains(&key.base) {
             gpu_images_changed();
@@ -2705,9 +2919,9 @@ impl Images {
         } else if let Some(k) = self.alias(&key, false) {
             k
         } else {
-            let image = self.create(key)?;
+            let (image, mem, bytes) = self.create(key)?;
             self.to_general(image, key.format);
-            self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0 });
+            self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed)) });
             self.gpu_bases.insert(key.base);
             crate::info!("images: new render target {:#x} {}x{} {:?} at flip {}", key.base, key.width, key.height, key.format, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
             // DS_CAPTURE_NEW_RT=<hex base>: capture the frame after a render
@@ -2754,6 +2968,7 @@ impl Images {
     pub fn target(&mut self, s: &Surface) -> Result<Target, String> {
         let k = self.surface_image(s)?;
         let img = self.map.get_mut(&k).unwrap();
+        img.used.stamp(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
         let mip = s.mip.min(img.key.levels - 1);
         let layer = if img.key.ty3d { 0 } else { s.slice.min(img.key.layers - 1) };
         let vkey = (s.format, vk::ImageViewType::TYPE_2D, mip, 1, layer, 1, [4u8, 5, 6, 7], 2u8);
@@ -2773,7 +2988,7 @@ impl Images {
                 v
             }
         };
-        Ok(Target { key: k, image: img.image, view, format: s.format, width: (img.key.width >> mip).max(1), height: (img.key.height >> mip).max(1) })
+        Ok(Target { key: k, image: img.image, view, used: img.used, format: s.format, width: (img.key.width >> mip).max(1), height: (img.key.height >> mip).max(1) })
     }
 
     /// The GPU image last rendered at `base` (display buffers).
@@ -2782,7 +2997,12 @@ impl Images {
             .values()
             .filter(|i| i.key.base == base && i.gpu_written && !is_depth(i.key.format))
             .max_by_key(|i| i.key.width as u64 * i.key.height as u64)
-            .map(|i| (i.image, i.key.format, i.key.width, i.key.height))
+            .map(|i| {
+                // Presented: in use even when not rendered again (a static
+                // screen flipped as it is), so never evicted meanwhile.
+                i.used.stamp(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
+                (i.image, i.key.format, i.key.width, i.key.height)
+            })
     }
 
     /// Reads mip 0 / layer 0 of a color image back (tightly packed texels).
@@ -3087,13 +3307,14 @@ impl Images {
     /// View of a T# (format, type, levels/layers, swizzle) for sampling or storage.
     pub fn view(&mut self, t: &Tsharp, storage: bool, frame: u64) -> Result<(vk::ImageView, vk::Image), String> {
         if storage {
-            return self.view_full(t, storage, frame);
+            return self.view_full(t, storage, frame).map(|r| (r.0, r.1));
         }
         // Generations read first: a change made by the full lookup itself
         // (a new image) makes the entry stale at its next use.
         let (lookup, track) = (LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire), super::track::GEN.load(std::sync::atomic::Ordering::Acquire));
-        if let Some(&(f, g, tg, v, i)) = self.view_memo.get(&t.raw) {
+        if let Some(&(f, g, tg, v, i, u)) = self.view_memo.get(&t.raw) {
             if (f == frame || scrubbing()) && g == lookup && tg == track {
+                u.stamp(frame);
                 // This thread's memo too: without it every thread but the one
                 // that made the entry took this lock for each lookup (64% of
                 // view lookups missed their memo, run 20261012-073715).
@@ -3101,7 +3322,7 @@ impl Images {
                     if m.views.len() >= 1 << 16 {
                         m.views.clear();
                     }
-                    m.views.insert(t.raw, (frame, lookup, track, v, i));
+                    m.views.insert(t.raw, (frame, lookup, track, v, i, u));
                 });
                 return Ok((v, i));
             }
@@ -3110,17 +3331,17 @@ impl Images {
         if self.view_memo.len() >= 1 << 16 {
             self.view_memo.clear();
         }
-        self.view_memo.insert(t.raw, (frame, lookup, track, r.0, r.1));
+        self.view_memo.insert(t.raw, (frame, lookup, track, r.0, r.1, r.2));
         tls(|m| {
             if m.views.len() >= 1 << 16 {
                 m.views.clear();
             }
-            m.views.insert(t.raw, (frame, lookup, track, r.0, r.1));
+            m.views.insert(t.raw, (frame, lookup, track, r.0, r.1, r.2));
         });
-        Ok(r)
+        Ok((r.0, r.1))
     }
 
-    fn view_full(&mut self, t: &Tsharp, storage: bool, frame: u64) -> Result<(vk::ImageView, vk::Image), String> {
+    fn view_full(&mut self, t: &Tsharp, storage: bool, frame: u64) -> Result<(vk::ImageView, vk::Image, UseStamp), String> {
         if storage {
             // DS_TRACE_IMAGE_WRITERS=<hex base> or <w>x<h>x<depth>: each
             // shader that binds such an image for writing, once.
@@ -3195,8 +3416,9 @@ impl Images {
             self.index_owned(key);
         }
         let img = self.map.get_mut(&key).unwrap();
+        img.used.stamp(frame);
         if let Some(&v) = img.views.get(&vkey) {
-            return Ok((v, img.image));
+            return Ok((v, img.image, img.used));
         }
         let comp = |s: u8| match s {
             0 => vk::ComponentSwizzle::ZERO,
@@ -3224,7 +3446,7 @@ impl Images {
         let ci = ci.push_next(&mut usage);
         let v = unsafe { ctx().device.create_image_view(&ci, None) }.map_err(|e| format!("image view {vkey:?}: {e}"))?;
         img.views.insert(vkey, v);
-        Ok((v, img.image))
+        Ok((v, img.image, img.used))
     }
 
     /// Sampler of an S#; `compare`: used by depth-compare instructions (the
@@ -3316,8 +3538,12 @@ impl Images {
             String::new()
         };
         format!(
-            "    images: {} cached, {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; staging buffers made {}, waits for uploads in flight {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages, {} found clean by a probe); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}\n",
+            "    images: {} cached ({} MiB; {} textures evicted, {} MiB, in {} rounds), {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; staging buffers made {}, waits for uploads in flight {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages, {} found clean by a probe); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}\n",
             self.map.len(),
+            IMAGE_BYTES.load(Relaxed) >> 20,
+            EVICTED[0].load(Relaxed),
+            EVICTED[1].load(Relaxed) >> 20,
+            EVICTED[2].load(Relaxed),
             self.uploads,
             self.reuploads,
             self.upload_bytes >> 20,

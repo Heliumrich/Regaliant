@@ -553,6 +553,23 @@ impl Ctx {
     }
 }
 
+impl Ctx {
+    /// This process's usage of the largest device-local heap and its budget,
+    /// bytes (None without VK_EXT_memory_budget).
+    pub fn device_budget(&self) -> Option<(u64, u64)> {
+        if !self.memory_budget {
+            return None;
+        }
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut p2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+        unsafe { self.instance.get_physical_device_memory_properties2(self.pdev, &mut p2) };
+        let props = p2.memory_properties;
+        let i = (0..props.memory_heap_count as usize).filter(|&i| props.memory_heaps[i].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).max_by_key(|&i| props.memory_heaps[i].size)?;
+        drop(p2);
+        Some((budget.heap_usage[i], budget.heap_budget[i]))
+    }
+}
+
 /// `Ctx::heap_report` of the initialized context ("" before).
 pub fn ctx_heaps() -> String {
     CTX.get().map(|c| c.heap_report()).unwrap_or_default()

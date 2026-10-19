@@ -1258,6 +1258,9 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
                         let _ = writeln!(r, "  guest mapping: (map lock held)");
                     }
                 }
+                for l in crate::mem::unmaps_covering(addr) {
+                    let _ = writeln!(r, "  unmapped earlier: {l}");
+                }
             }
         }
         let _ = writeln!(

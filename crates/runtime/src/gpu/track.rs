@@ -222,6 +222,32 @@ pub fn protected() -> bool {
     *ON.get_or_init(|| std::env::var("DS_TRACK").ok().as_deref() == Some("1"))
 }
 
+/// Drops a region (its texture left the cache): no longer reported or
+/// marked. Its pages keep the protection they have (they are made writable
+/// again at their next fault).
+pub fn unwatch(id: u32) {
+    let mut g = TRACK.lock();
+    let Some(t) = g.as_mut() else { return };
+    let Some(slot) = t.regions.get_mut(id as usize) else { return };
+    let Some(r) = slot.take() else { return };
+    if let Some(v) = t.by_base.get_mut(&r.base) {
+        v.retain(|&x| x != id);
+        if v.is_empty() {
+            t.by_base.remove(&r.base);
+        }
+    }
+    if !t.pages.is_empty() {
+        let mut p = r.base & !(PAGE - 1);
+        while p < r.base + r.size {
+            if let Some(e) = t.pages.get_mut(&p) {
+                e.0.retain(|&x| x != id);
+            }
+            p += PAGE;
+        }
+    }
+    RESET_GEN.fetch_add(1, Ordering::Release);
+}
+
 pub fn watch(base: u64, size: u64) -> Option<u32> {
     if !protected() {
         let mut g = TRACK.lock();

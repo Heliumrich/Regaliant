@@ -213,6 +213,12 @@ pub static WATCHDOG_STOPS: AtomicU64 = AtomicU64::new(0);
 pub static FAST_CLEARS: AtomicU64 = AtomicU64::new(0);
 /// Fill-kernel dispatches recorded as buffer fills (`Exec::fill_in_place`).
 pub static FILLS_IN_PLACE: AtomicU64 = AtomicU64::new(0);
+/// Of them, zero fills over GPU-written images only that cleared the
+/// images without storing into guest memory (`tune fill_skip`), and their
+/// bytes.
+pub static FILL_SKIPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Fills `tune fill_skip` considers (smaller ones store as before).
+const FILL_SKIP_MIN: u64 = 256 << 10;
 /// Logs why a big read-only binding stays in place, once per range and
 /// reason (the first 48).
 fn note_big_refusal(base: u64, size: u64, why: &'static str) {
@@ -340,11 +346,67 @@ pub(crate) fn imports_may_cover(base: u64, len: u64) -> bool {
     gy.iter().any(|d| d.span.start < end && base < d.span.end)
 }
 
-/// Frees dropped imports no batch can use any more (completion thread), then
-/// decommits the guest ranges that waited for them (`mem::retry_deferred`).
+/// Frees dropped imports and images no batch can use any more (completion
+/// thread), evicts images when video memory runs short, then decommits the
+/// guest ranges that waited for imports (`mem::retry_deferred`).
 fn reap_spans() {
     reap_dead_spans();
+    reap_dead_images();
+    super::images::maybe_evict();
     crate::mem::retry_deferred();
+}
+
+/// Images the cache dropped (`images::Evicted`), destroyed once no batch can
+/// use them: as dead imports, SPAN_GEN when buried and, once every batch
+/// begun before was submitted, the last batch sequence submitted then.
+struct DeadImage {
+    img: super::images::Evicted,
+    generation: u64,
+    seq: Option<u64>,
+}
+
+static IMAGE_GRAVE: Mutex<Vec<DeadImage>> = Mutex::new(Vec::new());
+static IMAGE_GRAVE_LEN: AtomicU64 = AtomicU64::new(0);
+
+/// Images the cache dropped, to destroy once no batch can name them (a
+/// batch can only name images it looked up while it recorded).
+pub(crate) fn bury_images(v: Vec<super::images::Evicted>) {
+    if v.is_empty() {
+        return;
+    }
+    let generation = SPAN_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+    let mut g = IMAGE_GRAVE.lock();
+    g.extend(v.into_iter().map(|img| DeadImage { img, generation, seq: None }));
+    IMAGE_GRAVE_LEN.store(g.len() as u64, Ordering::Release);
+}
+
+fn reap_dead_images() {
+    if IMAGE_GRAVE_LEN.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let oldest_open = EXEC_GENS.lock().iter().map(|g| g.load(Ordering::SeqCst)).min().unwrap_or(u64::MAX);
+    let next = NEXT_SEQ.load(Ordering::SeqCst);
+    let done = done_seq();
+    let mut g = IMAGE_GRAVE.lock();
+    g.retain_mut(|d| {
+        if d.seq.is_none() && oldest_open >= d.generation {
+            d.seq = Some(next - 1);
+        }
+        match d.seq {
+            Some(s) if done >= s && !DEVICE_LOST.load(Ordering::Relaxed) => {
+                unsafe {
+                    for &v in &d.img.views {
+                        ctx().device.destroy_image_view(v, None);
+                    }
+                    ctx().device.destroy_image(d.img.image, None);
+                    ctx().device.free_memory(d.img.mem, None);
+                }
+                false
+            }
+            _ => true,
+        }
+    });
+    IMAGE_GRAVE_LEN.store(g.len() as u64, Ordering::Release);
 }
 
 fn reap_dead_spans() {
@@ -8618,7 +8680,20 @@ impl Exec {
         }
         if plain && super::tune::fill_dma() {
             if let Some((base, len, v)) = verify::full_fill(&p, groups, local, threads_x) {
-                if self.fill_in_place(base, len, v)? {
+                // A zero fill over nothing but GPU-written images it clears
+                // stores nothing into their guest memory (`tune fill_skip`).
+                let skip = v == 0
+                    && len >= FILL_SKIP_MIN
+                    && super::tune::fill_skip()
+                    && super::tune::zero_fill_clears()
+                    && !super::homes::overlaps(base, len)
+                    && super::images::with(|im| im.fill_covered(base, len));
+                if skip {
+                    self.flush_resident(Some(&[(base, len)]))?;
+                    FILL_SKIPS[0].fetch_add(1, Ordering::Relaxed);
+                    FILL_SKIPS[1].fetch_add(len, Ordering::Relaxed);
+                }
+                if skip || self.fill_in_place(base, len, v)? {
                     let zeroed = super::images::with(|im| {
                         let z = if v == 0 && super::tune::zero_fill_clears() {
                             im.note_meta_writes(&[(base, len)]);
@@ -9065,7 +9140,7 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; stages prepared again with GPU-side data loads {:?} ({} programs since with them); {} render passes ended into the next full barrier; GPU-performed CP writes after merging resident shadows {} (written before the merge {}); draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills, {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; stages prepared again with GPU-side data loads {:?} ({} programs since with them); {} render passes ended into the next full barrier; GPU-performed CP writes after merging resident shadows {} (written before the merge {}); draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         SHADOW_ARGS.load(Ordering::Relaxed),
@@ -9104,6 +9179,8 @@ pub fn status() -> String {
         FAST_CLEARS.load(Ordering::Relaxed),
         FAST_CLEARS_KNOWN.load(Ordering::Relaxed),
         FILLS_IN_PLACE.load(Ordering::Relaxed),
+        FILL_SKIPS[0].load(Ordering::Relaxed),
+        FILL_SKIPS[1].load(Ordering::Relaxed) >> 20,
         NOTES_SKIPPED.load(Ordering::Relaxed),
         FLUSHES.load(Ordering::Relaxed),
         verify::status(),
