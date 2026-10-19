@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 138] = [
+    static ALL: [Tunable; 139] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -165,6 +165,7 @@ pub mod tune {
         Tunable { name: "image_evict", env: "DS_IMAGE_EVICT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "vram_high", env: "DS_VRAM_HIGH", default: 85, value: AtomicU64::new(UNSET) },
         Tunable { name: "vram_low", env: "DS_VRAM_LOW", default: 75, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_window", env: "DS_PRE_WINDOW", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1495,6 +1496,15 @@ pub mod tune {
     #[inline]
     pub fn vram_low() -> u64 {
         get(137).clamp(5, 100)
+    }
+
+    /// Bytes of the aligned window a copy cache check takes write marks
+    /// for (`precache::lookup`): one take checks every entry inside it for
+    /// the epoch. 0: each entry's own range. A power of two.
+    #[inline]
+    pub fn pre_window() -> u64 {
+        let v = get(138);
+        if v == 0 { 0 } else { v.next_power_of_two().max(4096) }
     }
 
     /// A switch's value by name; None if unknown.
