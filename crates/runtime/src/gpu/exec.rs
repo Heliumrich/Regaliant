@@ -2187,6 +2187,13 @@ fn merge_by_lines(flips: u64) -> String {
 
 /// Device-local shadow space per slot (working and pristine copies).
 const SHADOW_BYTES: u64 = 32 << 20;
+/// A slot's shadow and batch-start copy segments start this small and grow
+/// to what the executor's batches need (`Exec::seg_want`, at most
+/// SHADOW_BYTES and PRE_SEG): fixed full-size segments held 6 GiB of video
+/// memory over 63 slots (FINDINGS.md 2026-10-19 afternoon).
+/// `DS_SLOT_SEGS=full` (boot; A/B): full size from the start.
+const SHADOW_INIT: u64 = 2 << 20;
+const PRE_INIT: u64 = 4 << 20;
 /// Largest buffer shadowed (larger atomic targets stay in host memory).
 const SHADOW_MAX: u64 = 4 << 20;
 
@@ -3518,12 +3525,17 @@ struct Slot {
     /// Read-only buffer snapshots in video memory (SNAP_SEG, allocated on
     /// first use).
     snap: Option<(vk::Buffer, *mut u8)>,
-    /// Device-local shadow space (SHADOW_BYTES: working and pristine copies).
+    /// Device-local shadow space (working and pristine copies), `shadow_cap`
+    /// bytes, made on first use (`Exec::shadow_room`; null before).
     shadow: vk::Buffer,
+    shadow_mem: vk::DeviceMemory,
+    shadow_cap: u64,
     /// The batch's prologue: copies of read-only buffers into `pre_buf`
     /// (PRE_SEG, allocated on first use), submitted before `cmd`.
     pre: vk::CommandBuffer,
     pre_buf: Option<vk::Buffer>,
+    pre_mem: vk::DeviceMemory,
+    pre_cap: u64,
     /// The prologue's copies on the copy queue (`DS_COPY_QUEUE`; null
     /// without one): copies of ranges no submitted batch writes.
     xpre: vk::CommandBuffer,
@@ -3559,6 +3571,47 @@ struct SlotReset {
     state: std::sync::Arc<AtomicU64>,
 }
 
+/// Batch slots made and the buffers they hold (status line `batch slots`):
+/// [slots, shadow bytes, batch-start copy segment bytes, snapshot bytes
+/// (video memory the CPU writes), SGPR rings in video memory, host rings
+/// and staging bytes]. Slots live as long as their executor.
+static SLOT_MEM: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// The most a batch used of its slot's shadow and batch-start copy
+/// segments, by executor role (graphics, compute queues, parallel
+/// workers): [shadow bytes, copy bytes] (sizing the segments).
+static SEG_MAX: [[AtomicU64; 2]; 3] = [const { [const { AtomicU64::new(0) }; 2] }; 3];
+
+/// Notes a batch's segment use (`SEG_MAX`).
+fn note_seg_use(deferred: bool, compute: bool, shadow: u64, pre: u64) {
+    let role = if deferred { 2 } else if compute { 1 } else { 0 };
+    SEG_MAX[role][0].fetch_max(shadow, Ordering::Relaxed);
+    SEG_MAX[role][1].fetch_max(pre, Ordering::Relaxed);
+}
+
+/// The `batch slots` status line: what the executors' slots hold.
+fn slot_mem_line() -> String {
+    let v: Vec<u64> = SLOT_MEM.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let device = v[1] + v[2] + v[3] + v[4];
+    let m: Vec<String> = ["graphics", "compute queues", "workers"]
+        .iter()
+        .enumerate()
+        .map(|(k, n)| format!("{n} {}/{} KiB", SEG_MAX[k][0].load(Ordering::Relaxed) >> 10, SEG_MAX[k][1].load(Ordering::Relaxed) >> 10))
+        .collect();
+    format!(
+        "    batch slots: {} ({} MiB of video memory: shadows {}, batch-start copy segments {}, snapshots {}, SGPR rings {}; {} MiB of host rings and staging); most a batch used of its shadow/copy segment: {}
+",
+        v[0],
+        device >> 20,
+        v[1] >> 20,
+        v[2] >> 20,
+        v[3] >> 20,
+        v[4] >> 20,
+        v[5] >> 20,
+        m.join(", ")
+    )
+}
+
 impl Slot {
     fn new(family: u32, xfamily: Option<u32>) -> Result<Slot, String> {
         let c = ctx();
@@ -3580,7 +3633,8 @@ impl Slot {
             // SGPR data in system memory: a copy in video memory, read by
             // every invocation, made no measurable difference (`tune ring_vram`).
             let (ring, _mem, ring_ptr) = c.host_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)?;
-            let (shadow, _smem) = c.device_buffer(SHADOW_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER)?;
+            SLOT_MEM[0].fetch_add(1, Ordering::Relaxed);
+            SLOT_MEM[5].fetch_add(RING_SEG, Ordering::Relaxed);
             Ok(Slot {
                 cmd,
                 fence: c.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| e.to_string())?,
@@ -3593,9 +3647,13 @@ impl Slot {
                 },
                 rings: [Some((ring, ring_ptr)), None],
                 snap: None,
-                shadow,
+                shadow: vk::Buffer::null(),
+                shadow_mem: vk::DeviceMemory::null(),
+                shadow_cap: 0,
                 pre,
                 pre_buf: None,
+                pre_mem: vk::DeviceMemory::null(),
+                pre_cap: 0,
                 stage: None,
                 xpre,
                 homes: Vec::new(),
@@ -4830,6 +4888,10 @@ pub struct Exec {
     cur: usize,
     /// Slots that could be created (a failed creation caps them).
     slot_limit: usize,
+    /// The sizes this executor's slots' shadow and batch-start copy
+    /// segments are made with (SHADOW_INIT, PRE_INIT; doubled when a batch
+    /// ran out of one, up to SHADOW_BYTES and PRE_SEG).
+    seg_want: [u64; 2],
     /// The SGPR data ring in video memory could not be allocated.
     vram_ring_failed: bool,
     /// Offsets within the current slot's segment of each ring.
@@ -5106,6 +5168,7 @@ impl Exec {
                 slots,
                 cur: 0,
                 slot_limit: MAX_SLOTS,
+                seg_want: if std::env::var("DS_SLOT_SEGS").ok().as_deref() == Some("full") { [SHADOW_BYTES, PRE_SEG] } else { [SHADOW_INIT, PRE_INIT] },
                 vram_ring_failed: false,
                 ring_used: [0; 2],
                 snap_used: 0,
@@ -5217,6 +5280,98 @@ impl Exec {
     /// The recording slot's shadow buffer.
     fn shadow(&self) -> vk::Buffer {
         self.slots[self.cur].shadow
+    }
+
+    /// Makes the current slot's shadow space hold `need` bytes: made, or
+    /// made again larger while the batch has none of it in use (`seg_want`
+    /// rises on the way). False: it is in use and too small (the caller
+    /// ends the batch or does without), or no video memory.
+    fn shadow_room(&mut self, need: u64) -> bool {
+        if need > SHADOW_BYTES {
+            return false;
+        }
+        let s = &self.slots[self.cur];
+        if s.shadow != vk::Buffer::null() && s.shadow_cap >= need {
+            return true;
+        }
+        if need > self.seg_want[0] {
+            self.seg_want[0] = need.next_power_of_two().min(SHADOW_BYTES);
+        }
+        if self.shadow_used > 0 {
+            return false;
+        }
+        let cap = self.seg_want[0];
+        self.free_slot_seg(0);
+        match ctx().device_buffer(cap, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER) {
+            Ok((b, m)) => {
+                let s = &mut self.slots[self.cur];
+                (s.shadow, s.shadow_mem, s.shadow_cap) = (b, m, cap);
+                SLOT_MEM[1].fetch_add(cap, Ordering::Relaxed);
+                true
+            }
+            Err(e) => {
+                crate::warn!("gpu[{}]: no video memory for shadows ({e})", self.name);
+                false
+            }
+        }
+    }
+
+    /// The same for the batch-start copy segment (`pre_copy`).
+    fn pre_room(&mut self, need: u64) -> bool {
+        if need > PRE_SEG {
+            return false;
+        }
+        let s = &self.slots[self.cur];
+        if s.pre_buf.is_some() && s.pre_cap >= need {
+            return true;
+        }
+        if need > self.seg_want[1] {
+            self.seg_want[1] = need.next_power_of_two().min(PRE_SEG);
+        }
+        if self.pre_used > 0 {
+            return false;
+        }
+        let cap = self.seg_want[1];
+        self.free_slot_seg(1);
+        match ctx().device_buffer(cap, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER) {
+            Ok((b, m)) => {
+                let s = &mut self.slots[self.cur];
+                (s.pre_buf, s.pre_mem, s.pre_cap) = (Some(b), m, cap);
+                SLOT_MEM[2].fetch_add(cap, Ordering::Relaxed);
+                true
+            }
+            Err(e) => {
+                crate::warn!("gpu[{}]: no video memory for batch-start copies ({e})", self.name);
+                self.pre_failed = true;
+                false
+            }
+        }
+    }
+
+    /// Frees the current slot's shadow (0) or batch-start copy (1) segment:
+    /// only while no batch can use it (the slot's last batch completed,
+    /// nothing of this batch recorded into it).
+    fn free_slot_seg(&mut self, which: usize) {
+        let c = ctx();
+        let s = &mut self.slots[self.cur];
+        unsafe {
+            if which == 0 && s.shadow != vk::Buffer::null() {
+                super::vk::note_gpu_freed(s.shadow);
+                c.device.destroy_buffer(s.shadow, None);
+                c.device.free_memory(s.shadow_mem, None);
+                SLOT_MEM[1].fetch_sub(s.shadow_cap, Ordering::Relaxed);
+                (s.shadow, s.shadow_mem, s.shadow_cap) = (vk::Buffer::null(), vk::DeviceMemory::null(), 0);
+            }
+            if which == 1 {
+                if let Some(b) = s.pre_buf.take() {
+                    super::vk::note_gpu_freed(b);
+                    c.device.destroy_buffer(b, None);
+                    c.device.free_memory(s.pre_mem, None);
+                    SLOT_MEM[2].fetch_sub(s.pre_cap, Ordering::Relaxed);
+                    (s.pre_mem, s.pre_cap) = (vk::DeviceMemory::null(), 0);
+                }
+            }
+        }
     }
 
     fn begin(&mut self) {
@@ -5369,8 +5524,17 @@ impl Exec {
         self.ops = [0; OPS];
         self.ts_deferred.clear();
         self.eop_unordered = false;
+        note_seg_use(self.deferred, self.compute_cp, self.shadow_used, 0);
         self.shadow_used = 0;
         self.resident.clear();
+        // Segments smaller than the executor now wants are made again at
+        // their first use in this batch (the slot is free here).
+        if self.slots[self.cur].shadow_cap != 0 && self.slots[self.cur].shadow_cap < self.seg_want[0] {
+            self.free_slot_seg(0);
+        }
+        if self.slots[self.cur].pre_cap != 0 && self.slots[self.cur].pre_cap < self.seg_want[1] && self.pre_used == 0 {
+            self.free_slot_seg(1);
+        }
     }
 
     /// Commands in the batch being recorded by a command processor (not a
@@ -5513,6 +5677,7 @@ impl Exec {
             self.ring_used = [0; 2];
             self.snap_used = 0;
             self.snaps.clear();
+            note_seg_use(self.deferred, self.compute_cp, 0, self.pre_used);
             self.pre_used = 0;
             self.pres.clear();
             return;
@@ -5614,6 +5779,7 @@ impl Exec {
         self.ring_used = [0; 2];
         self.snap_used = 0;
         self.snaps.clear();
+        note_seg_use(self.deferred, self.compute_cp, 0, self.pre_used);
         self.pre_used = 0;
         self.pres.clear();
         if let Some(t) = t_submit {
@@ -5655,6 +5821,7 @@ impl Exec {
         self.own_checks.clear();
         self.xcopies.clear();
         self.copy_wait = 0;
+        note_seg_use(self.deferred, self.compute_cp, 0, self.pre_used);
         self.pre_used = 0;
         self.pres.clear();
     }
@@ -6088,7 +6255,10 @@ impl Exec {
         let s = &mut self.slots[self.cur];
         if s.stage.is_none() {
             match ctx().host_buffer(STAGE_SEG, vk::BufferUsageFlags::TRANSFER_SRC) {
-                Ok((b, _m, ptr)) => s.stage = Some((b, ptr)),
+                Ok((b, _m, ptr)) => {
+                    SLOT_MEM[5].fetch_add(STAGE_SEG, Ordering::Relaxed);
+                    s.stage = Some((b, ptr))
+                }
                 Err(e) => {
                     crate::warn!("gpu[{}]: no staging for mirror uploads ({e})", self.name);
                     return None;
@@ -6171,19 +6341,9 @@ impl Exec {
             note_big_refusal(base, size, "the shared copies declined it");
             return None;
         }
-        if shared.is_none() && off + n > PRE_SEG {
+        if shared.is_none() && !self.pre_room(off + n) {
             PRE_FULL.fetch_add(1, Ordering::Relaxed);
             return None;
-        }
-        if shared.is_none() && self.slots[self.cur].pre_buf.is_none() {
-            match ctx().device_buffer(PRE_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER) {
-                Ok((b, _m)) => self.slots[self.cur].pre_buf = Some(b),
-                Err(e) => {
-                    crate::warn!("gpu[{}]: no video memory for batch-start copies ({e})", self.name);
-                    self.pre_failed = true;
-                    return None;
-                }
-            }
         }
         let (buf, off) = match &shared {
             Some((chunk, at, _)) => (chunk.buf, *at),
@@ -7729,7 +7889,10 @@ impl Exec {
         }
         if self.slots[self.cur].snap.is_none() {
             match ctx().bar_buffer(SNAP_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER) {
-                Ok((b, _m, p)) => self.slots[self.cur].snap = Some((b, p)),
+                Ok((b, _m, p)) => {
+                    SLOT_MEM[3].fetch_add(SNAP_SEG, Ordering::Relaxed);
+                    self.slots[self.cur].snap = Some((b, p))
+                }
                 Err(e) => {
                     crate::warn!("gpu[{}]: no video memory for buffer snapshots ({e})", self.name);
                     self.snap_failed = true;
@@ -7814,7 +7977,7 @@ impl Exec {
         let seg = RING_SEG;
         let fits = self.ring_used.iter().all(|u| u.next_multiple_of(self.ring_align) + ring <= seg)
             && (0..5).all(|k| self.pool_use[k] + need[k] <= POOL_LIMITS[k])
-            && (shadow == 0 || self.shadow_used + shadow <= SHADOW_BYTES);
+            && (shadow == 0 || self.shadow_used + shadow <= self.slots[self.cur].shadow_cap || self.shadow_room(self.shadow_used + shadow));
         if !fits {
             self.submit_for("full");
             self.begin();
@@ -8090,7 +8253,9 @@ impl Exec {
         bound.bufs.reserve(nb);
         bound.imgs.reserve(nb);
         bound.images.reserve(nb);
-        let seg = SHADOW_BYTES;
+        // The slot's shadow space (grown to what this executor's batches
+        // need: `shadow_room` below).
+        let mut seg = self.slots[self.cur].shadow_cap;
         let fx = fixed();
         BIND_PLACE.with(|f| f.set(place_class(if self.deferred { 2 } else if self.compute_cp { 1 } else { 0 }, self.batch_shaders.len())));
         let mut clk = BindClock::start();
@@ -8266,7 +8431,11 @@ impl Exec {
                                         self.flush_resident(Some(&[window]))?;
                                     }
                                     if want && reuse.is_none() && s_off + 2 * span > seg {
-                                        SHADOW_FULL.fetch_add(1, Ordering::Relaxed);
+                                        if self.shadow_room(s_off + 2 * span) {
+                                            seg = self.slots[self.cur].shadow_cap;
+                                        } else {
+                                            SHADOW_FULL.fetch_add(1, Ordering::Relaxed);
+                                        }
                                     }
                                     if let Some(k) = reuse {
                                         // Its write-back covers this resource's bytes too.
@@ -8493,7 +8662,10 @@ impl Exec {
         };
         if vram && self.slots[self.cur].rings[1].is_none() && !self.vram_ring_failed {
             match ctx().bar_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST) {
-                Ok((b, _m, p)) => self.slots[self.cur].rings[1] = Some((b, p)),
+                Ok((b, _m, p)) => {
+                    SLOT_MEM[4].fetch_add(RING_SEG, Ordering::Relaxed);
+                    self.slots[self.cur].rings[1] = Some((b, p))
+                }
                 Err(e) => {
                     crate::warn!("gpu[{}]: no SGPR data ring in video memory ({e})", self.name);
                     self.vram_ring_failed = true;
@@ -9254,6 +9426,7 @@ pub fn status() -> String {
         verify::status(),
         super::cp::sync_summary()
     ) + &super::images::IMAGES.try_lock().and_then(|g| g.as_ref().map(|i| i.status())).unwrap_or_default()
+        + &slot_mem_line()
         + &super::track::status()
         + &crate::mem::remap_status()
         + &crate::titlemem::status()

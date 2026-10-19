@@ -1364,6 +1364,16 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
                     let _ = writeln!(r, "  [{name}] {a:#x}: {}", q.join(" "));
                 }
             }
+            // Unmaps of the memory registers point into: a pointer read from
+            // freed and reused memory faults elsewhere (the Nexus crash read
+            // an owner pointer from memory holding float data).
+            for (name, v) in regs {
+                if (crate::mem::GUEST_BASE..crate::mem::GUEST_END).contains(&v) {
+                    for l in crate::mem::unmaps_covering(v) {
+                        let _ = writeln!(r, "  [{name}] unmapped earlier: {l}");
+                    }
+                }
+            }
             // The stack (the frame and its caller's links) and, on a fiber
             // stack, the fiber's context.
             if let Some(d) = crate::hle::libs::fiber::describe_stack(ctx.Rsp) {

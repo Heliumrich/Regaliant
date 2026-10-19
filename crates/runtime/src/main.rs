@@ -930,7 +930,10 @@ fn thread_summary_ex(with_stacks: bool) -> String {
 }
 
 pub fn fatal_exit(code: u32, reason: &str) -> ! {
-    crate::log::write(crate::log::Level::Error, format_args!("terminating: {reason}\n{}", thread_summary()));
+    // After a fault, every thread's frames (what the others were doing:
+    // the title's teardown when a job read freed memory).
+    let summary = if reason == "fatal exception" { thread_summary_ex(true) } else { thread_summary() };
+    crate::log::write(crate::log::Level::Error, format_args!("terminating: {reason}\n{summary}"));
     crate::log::try_flush();
     unsafe {
         windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code);

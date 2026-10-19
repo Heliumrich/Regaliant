@@ -63,6 +63,11 @@ const ERR_INVALID_PARAMETER: i32 = 0x8093_0005u32 as i32;
 const ERR_CODEC_NOT_SUPPORTED: i32 = 0x8093_0008u32 as i32;
 const ERR_JOB_CREATION: i32 = 0x8093_0012u32 as i32;
 /// Per-job result codes (SidebandResult.result).
+/// Zeroed bytes kept after a job's gathered input (`run_job`): the
+/// ATRAC9 bit reader reads past a frame's end (a superframe is at most a
+/// few KiB; corrupt data can run further, still inside this slack in
+/// practice).
+const INPUT_SLACK: usize = 16 << 10;
 const RESULT_INVALID_PARAMETER: i32 = 0x0000_0002;
 const RESULT_NOT_INITIALIZED: i32 = 0x0000_0008;
 const RESULT_PARTIAL_INPUT: i32 = 0x0000_0020;
@@ -474,6 +479,15 @@ unsafe fn run_job(p: u64) -> i32 {
                 input.extend_from_slice(std::slice::from_raw_parts(a as *const u8, n as usize));
             }
         }
+        // LibAtrac9's bit reader reads a few bytes past a frame (further
+        // on corrupt data) without bounds: zeroed slack after the input, so
+        // that its allocation never ends right behind the last frame (a job
+        // worker faulted in `PeekInt` reading past a gathered input at an
+        // unmapped page, FINDINGS.md 2026-10-19 afternoon). The decoder sees
+        // the input's length; the slack stays in the allocation.
+        let len = input.len();
+        input.resize(len + INPUT_SLACK, 0);
+        input.truncate(len);
         let out_cap: usize = (0..nout).map(|i| *((outs + 16 * i + 8) as *const u64) as usize).sum();
         let mut pcm = Vec::with_capacity(out_cap);
         let (outcome, fmt) = {
