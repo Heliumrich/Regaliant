@@ -2302,6 +2302,32 @@ pub fn ds(tr: &mut T, ins: &Inst) -> R<()> {
         let (r, _) = tr.lane_fetch_active(v, l)?;
         return tr.set_vreg(vd, r);
     }
+    if name.ends_with("_addtid_b32") && tr.lds.is_none() {
+        // A stage without LDS (vertex, pixel): the lane-addressed forms are
+        // the compiler's register spills (address M0 + offset + lane * 4,
+        // each lane its own dword), held in a private array per invocation.
+        // Dropped before, the spilled values read back as stale registers:
+        // pixel shaders that spill (many) computed garbage after the spill
+        // (1-2's crystal creatures wrote negative colors and bloomed into
+        // vertical streaks).
+        let arr = tr.spill_var();
+        let m0 = tr.sreg(crate::OP_M0 as u32)?;
+        let k = tr.u(off16);
+        let a = e(tr.b.i_add(u, None, m0, k))?;
+        let k7 = tr.u(7);
+        let slot = e(tr.b.shift_right_logical(u, None, a, k7))?;
+        let km = tr.u(super::SPILL_SLOTS - 1);
+        let slot = e(tr.b.bitwise_and(u, None, slot, km))?;
+        let pp = tr.b.type_pointer(None, StorageClass::Private, u);
+        let p = e(tr.b.access_chain(pp, None, arr, [slot]))?;
+        if name.starts_with("ds_read") {
+            let v = e(tr.b.load(u, None, p, None, []))?;
+            return tr.set_vreg(vd, v);
+        }
+        let act = tr.active()?;
+        let v = tr.vreg(d0)?;
+        return tr.guarded(act, &mut |tr| ok(tr.b.store(p, v, None, [])));
+    }
     let Some(lds) = tr.lds else {
         tr.warn(format!("{:#x}: {name} without LDS", ins.pc));
         return Ok(());

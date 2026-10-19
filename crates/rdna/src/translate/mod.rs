@@ -297,6 +297,11 @@ impl std::hash::Hash for Spec {
     }
 }
 
+/// Spill slots of a stage without LDS (`T::spill_var`): one dword per
+/// 128 bytes of LDS address (a spill slot holds a dword per lane, 128 bytes
+/// for wave32 and 256 for wave64), the first 8 KiB.
+pub const SPILL_SLOTS: u32 = 64;
+
 /// Entries of an image table bound as one array of sampled images
 /// (`ResKind::ImageTable`); later entries are not reachable.
 pub const IMAGE_TABLE_LEN: u32 = 64;
@@ -564,6 +569,8 @@ pub(crate) struct T<'a> {
     pub bary: Option<(Word, Word)>,
     pub frag_coord: Option<Word>,
     pub lds: Option<Word>,
+    /// Register spills of stages without LDS (`spill_var`).
+    pub spill: Option<Word>,
     /// GDS storage buffer (when the program uses GDS instructions).
     pub gds: Option<Word>,
     /// Hardware lane index within the wave (compute: from the local index).
@@ -910,6 +917,21 @@ impl<'a> T<'a> {
         if !self.warnings.contains(&s) {
             self.warnings.push(s);
         }
+    }
+
+    /// The per-invocation private array holding a stage's register spills
+    /// through the lane-addressed LDS forms when the stage has no LDS
+    /// (vertex, pixel; `mem::ds`), made at its first use.
+    pub fn spill_var(&mut self) -> Word {
+        if let Some(v) = self.spill {
+            return v;
+        }
+        let n = self.u(SPILL_SLOTS);
+        let arr = self.b.type_array(self.t.u32, n);
+        let pt = self.b.type_pointer(None, StorageClass::Private, arr);
+        let v = self.global_var(pt, StorageClass::Private);
+        self.spill = Some(v);
+        v
     }
 
     /// Reads dword `idx` of the SGPR data buffer.
@@ -1786,6 +1808,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         bary: None,
         frag_coord: None,
         lds: None,
+        spill: None,
         gds: None,
         lane_id: None,
         local_index: None,
