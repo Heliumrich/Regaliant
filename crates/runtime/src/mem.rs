@@ -1063,7 +1063,8 @@ struct UnmapNote {
     ms: u64,
     flip: u64,
     thread: String,
-    frames: Vec<String>,
+    /// Guest return addresses (`exception::current_guest_returns`).
+    frames: Vec<u64>,
 }
 
 /// The last UNMAP_NOTES unmaps and protection removals (a separate lock:
@@ -1071,17 +1072,17 @@ struct UnmapNote {
 static UNMAPS: Mutex<std::collections::VecDeque<UnmapNote>> = Mutex::new(std::collections::VecDeque::new());
 const UNMAP_NOTES: usize = 8192;
 
-/// `DS_UNMAP_FRAMES=1` (boot; diagnosis): unmap notes keep the unmapping
-/// thread's guest frames (costly while the title streams: see `note_unmap`).
+/// `DS_UNMAP_FRAMES=0` (boot): unmap notes without the unmapping thread's
+/// guest frames.
 fn unmap_frames() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| env_is("DS_UNMAP_FRAMES", "1"))
+    *ON.get_or_init(|| !env_is("DS_UNMAP_FRAMES", "0"))
 }
 
 /// Notes an unmap (or a protection change to no access) for fault reports
 /// (`unmaps_covering`): the title's level changes free memory that jobs
 /// still read in a share of loads (FINDINGS.md 2026-10-19).
-fn note_unmap(op: &'static str, start: u64, end: u64) {
+fn note_unmap(st: &MemState, op: &'static str, start: u64, end: u64) {
     static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let t = std::time::Instant::now();
     let ms = T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
@@ -1092,12 +1093,22 @@ fn note_unmap(op: &'static str, start: u64, end: u64) {
         ms,
         flip: crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed),
         thread: crate::log::thread_name(),
-        // Guest frames only on request: the unwind queries the operating
-        // system per frame and took ~10 ms per unmap while a level streamed
-        // in (under the memory map's lock: 11.5 s of a 20 s window at 1-1,
-        // the frame rate a third of normal; FINDINGS.md 2026-10-19).
-        frames: if unmap_frames() { crate::exception::current_guest_frames(6) } else { Vec::new() },
+        // Guest frames checked against the memory map (the caller holds
+        // it), not by an operating-system query per frame: that took ~10 ms
+        // per unmap while a level streamed in (11.5 s of a 20 s window at
+        // 1-1, the frame rate a third of normal; FINDINGS.md 2026-10-19).
+        frames: if unmap_frames() {
+            crate::exception::current_guest_returns(6, &|a| st.find(a).is_some_and(|v| v.kind != VmaKind::Reserved && v.prot != 0))
+        } else {
+            Vec::new()
+        },
     };
+    // The first notes with frames, once (the walk works where it matters).
+    static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if !n.frames.is_empty() && SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+        let v: Vec<String> = n.frames.iter().map(|&a| crate::exception::describe_guest(a)).collect();
+        crate::info!("mem: unmap note {op} {start:#x}..{end:#x} by {}: {}", n.thread, v.join(" <- "));
+    }
     let mut g = UNMAPS.lock();
     if g.len() >= UNMAP_NOTES {
         g.pop_front();
@@ -1118,7 +1129,12 @@ pub fn unmaps_covering(addr: u64) -> Vec<String> {
         .filter(|n| n.start <= addr && addr < n.end)
         .take(4)
         .map(|n| {
-            let frames = if n.frames.is_empty() { " (guest frames with DS_UNMAP_FRAMES=1)".to_string() } else { format!(": {}", n.frames.join(" <- ")) };
+            let frames = if n.frames.is_empty() {
+                String::new()
+            } else {
+                let v: Vec<String> = n.frames.iter().map(|&a| crate::exception::describe_guest(a)).collect();
+                format!(": {}", v.join(" <- "))
+            };
             format!("{} {:#x}..{:#x} at flip {} ({} ms before the last note) by {}{frames}", n.op, n.start, n.end, n.flip, now.saturating_sub(n.ms), n.thread)
         })
         .collect()
@@ -1394,7 +1410,7 @@ impl MemState {
     /// `unmap_range`; `why` names the cause of view splits (diagnostics).
     fn unmap_range_for(&mut self, start: u64, end: u64, why: usize) {
         trace_map("unmap", start, end, format_args!(""));
-        note_unmap("unmap", start, end);
+        note_unmap(self, "unmap", start, end);
         bump_gen(start, end);
         self.split_at(start, why);
         self.split_at(end, why);
@@ -1549,7 +1565,7 @@ impl MemState {
     pub fn protect(&mut self, start: u64, end: u64, prot: u32) -> Result<(), MemError> {
         trace_map("protect", start, end, format_args!("prot {prot:#x}"));
         if prot & 7 == 0 {
-            note_unmap("protect none", start, end);
+            note_unmap(self, "protect none", start, end);
         }
         self.split_at(start, crate::sections::SPLIT_PROTECT);
         self.split_at(end, crate::sections::SPLIT_PROTECT);

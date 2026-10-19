@@ -208,6 +208,66 @@ pub fn current_guest_frames(depth: usize) -> Vec<String> {
     guest[..ng].iter().map(|&a| describe(a)).collect()
 }
 
+/// The calling thread's guest return addresses (at most `depth`), the guest
+/// frame-pointer chain checked with `readable` instead of an operating-system
+/// query per frame (`mem::note_unmap`: the memory map, which its caller
+/// holds). Host frames are unwound from their unwind tables (no system calls
+/// for frames that have them).
+pub fn current_guest_returns(depth: usize, readable: &dyn Fn(u64) -> bool) -> Vec<u64> {
+    use windows_sys::Win32::System::Diagnostics::Debug::{RtlCaptureContext, RtlLookupFunctionEntry, RtlVirtualUnwind};
+    let mut c: AlignedContext = unsafe { std::mem::zeroed() };
+    unsafe { RtlCaptureContext(&mut c.0) };
+    // This thread's own stack (host frames may live there, not in guest
+    // memory).
+    let (mut lo, mut hi) = (0usize, 0usize);
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut lo, &mut hi) };
+    let on_stack = |a: u64| (lo as u64) <= a && a + 8 <= hi as u64;
+    let mut out = Vec::new();
+    for _ in 0..64 {
+        let pc = c.0.Rip;
+        if pc == 0 || in_guest(pc) {
+            break;
+        }
+        let mut base = 0u64;
+        let fe = unsafe { RtlLookupFunctionEntry(pc, &mut base, std::ptr::null_mut()) };
+        if fe.is_null() {
+            // Code without unwind data (a stub): its return address at [rsp].
+            if c.0.Rsp & 7 != 0 || !(on_stack(c.0.Rsp) || readable(c.0.Rsp)) {
+                return out;
+            }
+            c.0.Rip = unsafe { *(c.0.Rsp as *const u64) };
+            c.0.Rsp += 8;
+        } else {
+            let mut handler_data = std::ptr::null_mut();
+            let mut establisher = 0u64;
+            unsafe { RtlVirtualUnwind(0, base, pc, fe, &mut c.0, &mut handler_data, &mut establisher, std::ptr::null_mut()) };
+        }
+    }
+    if !in_guest(c.0.Rip) || depth == 0 {
+        return out;
+    }
+    out.push(c.0.Rip);
+    let mut bp = c.0.Rbp;
+    while out.len() < depth && bp & 7 == 0 && readable(bp) && readable(bp + 8) {
+        let ret = unsafe { *((bp + 8) as *const u64) };
+        if ret < 0x10000 {
+            break;
+        }
+        out.push(ret);
+        let next = unsafe { *(bp as *const u64) };
+        if next <= bp {
+            break;
+        }
+        bp = next;
+    }
+    out
+}
+
+/// `describe` for callers outside this module (module + offset).
+pub fn describe_guest(addr: u64) -> String {
+    describe(addr)
+}
+
 pub fn readable(a: u64) -> bool {
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
     if a < 0x10000 {
