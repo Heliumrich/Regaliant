@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 133] = [
+    static ALL: [Tunable; 134] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -160,6 +160,7 @@ pub mod tune {
         Tunable { name: "draw_repeat", env: "DS_DRAW_REPEAT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "cpu_args_base", env: "DS_CPU_ARGS_BASE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "sgpr_pc", env: "DS_SGPR_PC", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "ww_gate", env: "DS_WW_GATE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1453,6 +1454,14 @@ pub mod tune {
         get(132) != 0
     }
 
+    /// Write-watch queries taking turns (`mem::take_written`): 1 the
+    /// parallel recording workers and the texture scrubber one at a time,
+    /// 2 every thread; 0 none.
+    #[inline]
+    pub fn ww_gate() -> u64 {
+        get(133)
+    }
+
     /// A switch's value by name; None if unknown.
     pub fn value(name: &str) -> Option<u64> {
         ALL.iter().position(|t| t.name == name).map(get)
@@ -2000,6 +2009,7 @@ static PROFILE_THREADS: Mutex<Vec<(&'static str, u32)>> = Mutex::new(Vec::new())
 
 /// Samples the calling thread as `kind` while profiling (`DS_PROFILE_GPU`).
 pub fn profile_this_thread(kind: &'static str) {
+    crate::mem::set_ww_gated(matches!(kind, "par" | "scrub"));
     let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
     PROFILE_THREADS.lock().push((kind, tid));
 }
