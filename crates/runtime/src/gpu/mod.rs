@@ -2113,10 +2113,15 @@ pub fn start_profiler() {
             crate::log::set_thread_name("gpu-profiler");
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(10));
+                // `DS_PROFILE_ACB=<text>`: only the compute queues whose name
+                // (`acb0x50`) holds the text are sampled.
+                static ACB_ONLY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+                let only = ACB_ONLY.get_or_init(|| std::env::var("DS_PROFILE_ACB").ok());
                 let mut targets: Vec<(&'static str, String, u32)> = QUEUES
                     .lock()
                     .iter()
                     .map(|q| if q.id == GFX { ("gfx", "gfx".to_string(), q.tid.load(Ordering::Relaxed)) } else { ("acb", format!("acb{:#x}", q.id), q.tid.load(Ordering::Relaxed)) })
+                    .filter(|t| t.0 != "acb" || only.as_ref().is_none_or(|o| t.1.contains(o.as_str())))
                     .collect();
                 targets.extend(PROFILE_THREADS.lock().iter().map(|&(kind, tid)| (kind, kind.to_string(), tid)));
                 for (kind, name, tid) in targets {
