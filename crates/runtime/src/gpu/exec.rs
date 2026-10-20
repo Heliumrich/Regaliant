@@ -8733,7 +8733,7 @@ impl Exec {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if skip_cs(cp) {
+        if skip_cs(cp) || super::tune::skip_cmds() & 2 != 0 {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -8794,7 +8794,7 @@ impl Exec {
         if super::homes::overlaps(args, 12) {
             return false;
         }
-        if skip_cs(cp) {
+        if skip_cs(cp) || super::tune::skip_cmds() & 2 != 0 {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             return true;
         }

@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 141] = [
+    static ALL: [Tunable; 142] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -168,6 +168,7 @@ pub mod tune {
         Tunable { name: "pre_window", env: "DS_PRE_WINDOW", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "home_submit_epochs", env: "DS_HOME_SUBMIT_EPOCHS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "gfx_core", env: "DS_GFX_CORE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "skip_cmds", env: "DS_SKIP_CMDS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1523,6 +1524,16 @@ pub mod tune {
     #[inline]
     pub fn gfx_core() -> bool {
         get(140) != 0
+    }
+
+    /// Measurement only: draws (bit 0) and dispatches (bit 1) are not
+    /// recorded while the command processors still execute their packets,
+    /// labels and writes: the title's own frame without our GPU work (another
+    /// port's `skip_cmds`). Wrong pictures and GPU-written
+    /// data the title reads stay stale.
+    #[inline]
+    pub fn skip_cmds() -> u64 {
+        get(141)
     }
 
     /// A switch's value by name; None if unknown.

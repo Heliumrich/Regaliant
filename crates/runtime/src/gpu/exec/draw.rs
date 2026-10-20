@@ -783,6 +783,10 @@ impl Exec {
             DRAW_SKIPPED.fetch_add(1, Ordering::Relaxed);
             return "skipped (device lost)".into();
         }
+        if super::super::tune::skip_cmds() & 1 != 0 {
+            DRAW_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            return "skipped (`tune skip_cmds`)".into();
+        }
         let outcome = match self.draw_inner(cp, &args) {
             Ok(true) => {
                 DRAWN.fetch_add(1, Ordering::Relaxed);
