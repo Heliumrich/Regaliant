@@ -1646,6 +1646,7 @@ pub mod tiling;
 pub mod verify;
 pub mod vk;
 pub mod xwait;
+pub mod census;
 
 use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
@@ -2220,6 +2221,7 @@ pub fn reset_profile() {
     exec::reset_pre_window();
     exec::reset_import_window();
     xwait::reset();
+    census::reset();
     crate::mem::reset_host_calls();
     threadcpu::reset_window();
     crate::audio::reset_window();
@@ -2248,6 +2250,9 @@ pub fn profile_report() -> String {
     s.push_str(&exec::import_window_line());
     s.push_str(&crate::mem::host_calls_line());
     s.push_str(&xwait::status());
+    if exec::profiling_on() {
+        s.push_str(&census::status());
+    }
     s.push_str(&crate::audio::window_line());
     s.push_str(&crate::guestprof::report());
     s.push_str(&threadcpu::window_line());

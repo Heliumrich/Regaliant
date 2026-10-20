@@ -6502,6 +6502,9 @@ impl Exec {
         if len == 0 || base % 4 != 0 || len % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(base, len) {
             return Ok(false);
         }
+        if profiling() {
+            super::census::note(base, len, super::census::FILL);
+        }
         let Some((buffer, start, _)) = span(base, len) else { return Ok(false) };
         // Resident shadows holding newer data of the range go back first:
         // their merge would undo the fill.
@@ -7425,6 +7428,9 @@ impl Exec {
         let bytes = 4 * data.len() as u64;
         if bytes == 0 || bytes > 65536 || a % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(a, bytes) {
             return false;
+        }
+        if profiling() {
+            super::census::note(a, bytes, super::census::CP_WRITE);
         }
         let Some((buffer, start, _)) = span(a, bytes) else { return false };
         // CPU-side writes deferred into the recording batch run after it
@@ -8370,6 +8376,10 @@ impl Exec {
                         // bytes (data loads read by the shader).
                         let sized = matches!(found.resources[i], Resolved::Buffer(_) | Resolved::Global(_, Some(_)));
                         let read_only = size > 0 && !found.tr.plan.resources[i].written && sized;
+                        if profiling() && size > 0 {
+                            use super::census::{RO, RO_UNSIZED, WRITTEN};
+                            super::census::note(base, size, if found.tr.plan.resources[i].written { WRITTEN } else if sized { RO } else { RO_UNSIZED });
+                        }
                         // The residency mirror (read-only bindings, `gpu::resident`), or
                         // a video-memory home holding the range (see `homes`).
                         let from_mirror = if read_only && super::resident::enabled() { self.resident_bind(base, size) } else { None };

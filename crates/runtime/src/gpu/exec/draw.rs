@@ -1720,6 +1720,11 @@ impl Exec {
             // across PCIe an instanced foliage draw took 4-8 ms, 0.2-0.3 ms
             // from video memory), made by the GPU at the batch's start, else
             // by the CPU now.
+            if super::profiling() {
+                if let Some((addr, size)) = a.index {
+                    super::super::census::note(addr, a.count as u64 * size as u64, super::super::census::INDEX);
+                }
+            }
             let snap = index_home.as_ref().map(|h| (h.0, h.1, 0)).or_else(|| {
                 a.index.and_then(|(addr, size)| {
                     let bytes = a.count as u64 * size as u64;
