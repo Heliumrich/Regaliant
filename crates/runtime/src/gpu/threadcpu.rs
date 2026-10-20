@@ -78,13 +78,27 @@ struct Window {
     flips: u64,
     commands: u64,
     splits: u64,
+    /// The title's threads: host thread id -> (name, cycles) at the start.
+    title: HashMap<u32, (String, u64)>,
+}
+
+/// The title's live threads' cycles so far, by host thread id.
+fn title_snapshot() -> HashMap<u32, (String, u64)> {
+    let list: Vec<(u32, String)> = crate::thread::THREADS
+        .lock()
+        .iter()
+        .filter(|t| t.exited.try_lock().is_some_and(|e| e.is_none()))
+        .map(|t| (t.host_tid.load(Ordering::Relaxed) as u32, t.name()))
+        .filter(|x| x.0 != 0)
+        .collect();
+    list.into_iter().filter_map(|(tid, name)| thread_cycles(tid).map(|c| (tid, (name, c)))).collect()
 }
 
 static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
 
 /// Starts a profile window (`profile reset`).
 pub fn reset_window() {
-    let w = Window { at: Instant::now(), cycles: snapshot(), flips: super::FRAMES.load(Ordering::Relaxed), commands: commands(), splits: super::cp::SPLITS.load(Ordering::Relaxed) };
+    let w = Window { at: Instant::now(), cycles: snapshot(), flips: super::FRAMES.load(Ordering::Relaxed), commands: commands(), splits: super::cp::SPLITS.load(Ordering::Relaxed), title: title_snapshot() };
     *WINDOW.lock() = Some(w);
 }
 
@@ -100,11 +114,29 @@ pub fn window_line() -> String {
     let parts: Vec<String> = KINDS.iter().zip(&d).map(|(k, &c)| format!("{k} {:.1}", ms(c) / flips as f64)).collect();
     let splits = super::cp::SPLITS.load(Ordering::Relaxed).saturating_sub(w.splits);
     let split = if splits > 0 { format!("; {:.1} batch splits per flip (`split_every`)", splits as f64 / flips as f64) } else { String::new() };
+    // The title's threads (its own frame's CPU side): all, the main thread,
+    // the job workers, the busiest others.
+    let mut per: Vec<(String, f64)> = title_snapshot()
+        .into_iter()
+        .map(|(tid, (name, c))| {
+            let c0 = w.title.get(&tid).map_or(0, |x| x.1);
+            (name, ms(c.saturating_sub(c0)) / flips as f64)
+        })
+        .collect();
+    per.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let title_all: f64 = per.iter().map(|x| x.1).sum();
+    let main: f64 = per.iter().filter(|x| x.0 == "GAME_MainThread").map(|x| x.1).sum();
+    let jobs: Vec<f64> = per.iter().filter(|x| x.0.starts_with("BPE JobWorkerThread")).map(|x| x.1).collect();
+    let others: Vec<String> = per.iter().filter(|x| x.0 != "GAME_MainThread" && !x.0.starts_with("BPE JobWorkerThread")).take(4).map(|x| format!("{} {:.1}", x.0, x.1)).collect();
     format!(
-        "    thread CPU in the window, ms per flip: {} (all {:.1}); {:.2} us per command over all threads; {flips} flips, {cmds} commands in {:.1} s{split}\n",
+        "    thread CPU in the window, ms per flip: {} (all {:.1}); {:.2} us per command over all threads; {flips} flips, {cmds} commands in {:.1} s{split}\n    the title's threads' CPU in the window, ms per flip: all {title_all:.1}; main thread {main:.1}; {} job workers {:.1} (busiest {:.1}); others {}\n",
         parts.join(", "),
         ms(all) / flips as f64,
         ms(all) * 1000.0 / cmds as f64,
-        w.at.elapsed().as_secs_f64()
+        w.at.elapsed().as_secs_f64(),
+        jobs.len(),
+        jobs.iter().sum::<f64>(),
+        jobs.first().copied().unwrap_or(0.0),
+        others.join(", ")
     )
 }
