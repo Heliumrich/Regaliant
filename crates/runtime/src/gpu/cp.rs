@@ -176,6 +176,27 @@ pub enum Space {
     Uc,
 }
 
+/// Draws, those with the last draw's context registers on the same command
+/// processor, and of those the ones with its programs and primitive type too
+/// (`Cp::draw`; `draw_state_line`).
+pub static DRAW_STATE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// For the status report (`DRAW_STATE`).
+pub fn draw_state_line() -> String {
+    let d: Vec<u64> = DRAW_STATE.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if d[0] == 0 {
+        return String::new();
+    }
+    format!(
+        "    draws with the last draw's context registers: {} of {} ({:.1}%), {} with its programs and primitive type too ({:.1}%)\n",
+        d[1],
+        d[0],
+        100.0 * d[1] as f64 / d[0] as f64,
+        d[2],
+        100.0 * d[2] as f64 / d[0] as f64
+    )
+}
+
 /// Chains of repeatable draws ended, by the opcode of the packet that ended
 /// them (`keeps_repeat`; the status line's top ones).
 pub static REPEAT_ENDS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
@@ -195,6 +216,11 @@ pub struct Cp {
     /// that the executor can repeat (`tune draw_repeat`): no other packet
     /// (but NOPs) since, so the registers are the same.
     repeat_ok: bool,
+    /// A context register changed value since the last draw (measurement:
+    /// `DRAW_STATE`), and the last draw's vertex and pixel programs and
+    /// primitive type.
+    ctx_dirty: bool,
+    last_draw_progs: (u64, u64, u32),
     pub compute: bool,
     pub regs: Regs,
     index_base: u64,
@@ -1288,6 +1314,8 @@ impl Cp {
             name: name.to_string(),
             last_draw: std::borrow::Cow::Borrowed(""),
             repeat_ok: false,
+            ctx_dirty: true,
+            last_draw_progs: (0, 0, 0),
             compute,
             regs: Regs::new(),
             index_base: 0,
@@ -1341,6 +1369,7 @@ impl Cp {
 
     pub fn set_chunk_state(&mut self, s: &ChunkState) {
         self.repeat_ok = false;
+        self.ctx_dirty = true;
         copy_prefix(&mut self.regs.ctx, &s.regs.ctx, high(Space::Ctx, CTX_DWORDS));
         copy_prefix(&mut self.regs.sh, &s.regs.sh, high(Space::Sh, SH_DWORDS));
         copy_prefix(&mut self.regs.uc, &s.regs.uc, high(Space::Uc, UC_DWORDS));
@@ -2596,6 +2625,7 @@ impl Cp {
             v
         });
         self.regs.ctx.fill(0);
+        self.ctx_dirty = true;
         for &(i, val) in d {
             self.set_reg(Space::Ctx, i, val);
         }
@@ -2632,6 +2662,19 @@ impl Cp {
                 }
             }
         }
+        // Measurement: draws with the last draw's context registers (and
+        // programs and primitive type), as a draw that took its targets,
+        // dynamic state and pipeline from the last one could.
+        let progs = (super::shaders::ngg_addr(self), super::shaders::ps_addr(self), self.reg(Space::Uc, 0x242));
+        DRAW_STATE[0].fetch_add(1, Ordering::Relaxed);
+        if !self.ctx_dirty {
+            DRAW_STATE[1].fetch_add(1, Ordering::Relaxed);
+            if progs == self.last_draw_progs {
+                DRAW_STATE[2].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.ctx_dirty = false;
+        self.last_draw_progs = progs;
         let mut e = self.exec.take().unwrap();
         self.last_draw = e.draw(self, args);
         self.exec = Some(e);
@@ -2954,6 +2997,9 @@ impl Cp {
             Space::Uc => (&mut self.regs.uc, UC_DWORDS),
         };
         if (index as usize) < n {
+            if space == Space::Ctx && v[index as usize] != value {
+                self.ctx_dirty = true;
+            }
             v[index as usize] = value;
             note_high(space, index as usize);
         }
@@ -4296,7 +4342,10 @@ impl Cp {
                 0 => self.clear_context(),
                 1 => self.ctx_stack.push(self.regs.ctx.clone()),
                 2 => match self.ctx_stack.pop() {
-                    Some(c) => self.regs.ctx = c,
+                    Some(c) => {
+                        self.regs.ctx = c;
+                        self.ctx_dirty = true;
+                    }
                     None => crate::warn!("gpu[{}]: context state pop without push at {at:#x}", self.name),
                 },
                 3 => {
