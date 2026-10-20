@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 139] = [
+    static ALL: [Tunable; 141] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -166,6 +166,8 @@ pub mod tune {
         Tunable { name: "vram_high", env: "DS_VRAM_HIGH", default: 85, value: AtomicU64::new(UNSET) },
         Tunable { name: "vram_low", env: "DS_VRAM_LOW", default: 75, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_window", env: "DS_PRE_WINDOW", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "home_submit_epochs", env: "DS_HOME_SUBMIT_EPOCHS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "gfx_core", env: "DS_GFX_CORE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1505,6 +1507,22 @@ pub mod tune {
     pub fn pre_window() -> u64 {
         let v = get(138);
         if v == 0 { 0 } else { v.next_power_of_two().max(4096) }
+    }
+
+    /// Write-watched video-memory homes check their pages for CPU writes
+    /// once per epoch that a title submission or REWIND ended, not once per
+    /// epoch of any kind (`homes::check_epoch`; default since 2026-10-20:
+    /// +2.4% flips/s at the gate, FINDINGS.md).
+    #[inline]
+    pub fn home_submit_epochs() -> bool {
+        get(139) != 0
+    }
+
+    /// The graphics command processor on a physical core of its own among
+    /// the front end's CPUs (`prio::own_core`).
+    #[inline]
+    pub fn gfx_core() -> bool {
+        get(140) != 0
     }
 
     /// A switch's value by name; None if unknown.

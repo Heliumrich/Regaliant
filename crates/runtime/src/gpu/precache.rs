@@ -1037,11 +1037,23 @@ pub fn epoch() -> u64 {
     EPOCH.load(Ordering::Acquire)
 }
 
+/// Epochs ended by title submissions and REWIND only (not by waits the CPU
+/// released): what write-watched homes check their pages once per with
+/// `tune home_submit_epochs`.
+static SUBMIT_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub fn submit_epoch() -> u64 {
+    SUBMIT_EPOCH.load(Ordering::Acquire)
+}
+
 /// A synchronization epoch ends (a title submission starts, a wait the CPU
 /// released, REWIND; any queue): entries are checked for CPU writes again at
 /// their next use.
 pub fn end_scope(why: usize) {
     ENDS[why.min(2)].fetch_add(1, Ordering::Relaxed);
+    if why != 1 {
+        SUBMIT_EPOCH.fetch_add(1, Ordering::AcqRel);
+    }
     EPOCH.fetch_add(1, Ordering::AcqRel);
 }
 

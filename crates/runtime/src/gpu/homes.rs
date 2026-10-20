@@ -234,6 +234,17 @@ pub static PARTIAL: AtomicU64 = AtomicU64::new(0);
 /// `Exec`'s cache of clean pages holds while it stays the same.
 pub static STALE_ADDED: AtomicU64 = AtomicU64::new(0);
 
+/// The epoch write-watched homes check their pages once per: every
+/// synchronization epoch, or with `tune home_submit_epochs` those ended by
+/// title submissions and REWIND only. Waits the CPU released end most
+/// epochs (hundreds per frame), and the culls' 112 MB index home was
+/// checked in ~19 of them per gate frame (~126 us each, under the homes'
+/// lock that every cull's binding waits for); the CPU writes these homes
+/// see come at level loads, before the submissions that use them.
+fn check_epoch() -> u64 {
+    if super::tune::home_submit_epochs() { super::precache::submit_epoch() } else { super::precache::epoch() }
+}
+
 /// Whether any home exists (fast path for every binding).
 pub fn any() -> bool {
     ANY.load(Ordering::Relaxed)
@@ -337,7 +348,7 @@ pub fn bind(base: u64, size: u64, written: bool, keep: &mut dyn FnMut(&Arc<HomeB
         let Some(i) = r.iter().position(|&(b, n)| b <= base && base + size <= b + n) else { return Fast::Miss };
         let (hb, hn) = r[i];
         let shared = &s[i].1;
-        if !shared.dirty.load(Ordering::Acquire) && (!shared.watched || shared.checked.load(Ordering::Acquire) == super::precache::epoch()) {
+        if !shared.dirty.load(Ordering::Acquire) && (!shared.watched || shared.checked.load(Ordering::Acquire) == check_epoch()) {
             let sgen = shared.stale_gen.load(Ordering::Acquire);
             let id = shared.id;
             if !written || STALE_NOTES.with(|n| n.borrow().iter().any(|&(b, m, h, sg)| h == id && sg == sgen && b <= base && base + size <= b + m)) {
@@ -358,7 +369,7 @@ pub fn bind(base: u64, size: u64, written: bool, keep: &mut dyn FnMut(&Arc<HomeB
     let mut g = super::lockstat::HOMES.lock(&HOMES);
     let h = g.iter_mut().find(|h| h.base <= base && base + size <= h.base + h.size)?;
     if h.shared.watched {
-        let epoch = super::precache::epoch();
+        let epoch = check_epoch();
         if h.shared.checked.load(Ordering::Acquire) != epoch {
             check_cpu_writes(h);
             h.shared.checked.store(epoch, Ordering::Release);
@@ -421,7 +432,7 @@ pub fn copy_in_pending(base: u64, size: u64) -> bool {
     if !any() {
         return false;
     }
-    let epoch = super::precache::epoch();
+    let epoch = check_epoch();
     let state = with_snap(|r, s| {
         r.iter()
             .position(|&(b, n)| b <= base && base + size <= b + n)

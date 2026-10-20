@@ -38,10 +38,13 @@ pub fn apply() {
         3 => MAIN.with(|m| m.get()) as u64,
         p => p,
     };
-    let cpus = match super::tune::cp_cpus() {
+    let mut cpus = match super::tune::cp_cpus() {
         CPUS_AUTO => auto_cpus(),
         m => m,
     };
+    if super::tune::gfx_core() {
+        cpus = own_core(cpus, MAIN.with(|m| m.get()));
+    }
     let want = (level, cpus);
     let had = APPLIED.with(|a| a.replace(want));
     if had != want {
@@ -95,6 +98,67 @@ pub fn auto_cpus() -> u64 {
         }
         m
     })
+}
+
+/// `tune gfx_core`: the graphics command processor (`main`) on the first
+/// physical core of the front end's CPUs (`cpus`, 0 = the process's), the
+/// other front-end threads on the rest (the critical path's thread then
+/// shares its core with no other front-end thread; another port's
+/// graphics CP has a core of its own). Unchanged when the front end has a
+/// single core.
+fn own_core(cpus: u64, main: bool) -> u64 {
+    static CORES: std::sync::OnceLock<(u64, Vec<u64>)> = std::sync::OnceLock::new();
+    let (process, cores) = CORES.get_or_init(|| (process_mask(), core_groups()));
+    split_core(if cpus == 0 { *process } else { cpus }, cores, main).unwrap_or(cpus)
+}
+
+/// `front` split into its first physical core (for `main`) and the rest;
+/// None when it has a single core.
+fn split_core(front: u64, cores: &[u64], main: bool) -> Option<u64> {
+    if front == 0 {
+        return None;
+    }
+    let first = 1u64 << front.trailing_zeros();
+    let core = cores.iter().find(|&&c| c & first != 0).map_or(first, |&c| c & front);
+    if front & !core == 0 {
+        return None;
+    }
+    Some(if main { core } else { front & !core })
+}
+
+/// The CPU masks of the physical cores in processor group 0
+/// (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX records of RelationProcessorCore:
+/// PROCESSOR_RELATIONSHIP from 8, GroupMask[0].Mask at 32, .Group at 40).
+fn core_groups() -> Vec<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GetLogicalProcessorInformationEx, RelationProcessorCore};
+    let mut len = 0u32;
+    unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut len) };
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+    if unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, buf.as_mut_ptr() as *mut _, &mut len) } == 0 {
+        return Vec::new();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, len as usize) };
+    let u32_at = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 8 <= bytes.len() {
+        let (rel, size) = (u32_at(off), u32_at(off + 4) as usize);
+        if size < 8 || off + size > bytes.len() {
+            break;
+        }
+        if rel == RelationProcessorCore as u32 && size >= 42 {
+            let mask = u64::from_le_bytes(bytes[off + 32..off + 40].try_into().unwrap());
+            let group = u16::from_le_bytes([bytes[off + 40], bytes[off + 41]]);
+            if group == 0 && mask != 0 {
+                out.push(mask);
+            }
+        }
+        off += size;
+    }
+    out
 }
 
 /// The process's affinity mask (processor group 0).
@@ -168,7 +232,20 @@ fn choose(groups: &[u64], process: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::choose;
+    use super::{choose, split_core};
+
+    #[test]
+    fn graphics_cp_core() {
+        // 5900X: SMT pairs; the front end on the first CCD (CPUs 0-11).
+        let cores: Vec<u64> = (0..12).map(|i| 0b11u64 << (2 * i)).collect();
+        assert_eq!(split_core(0xfff, &cores, true), Some(0b11));
+        assert_eq!(split_core(0xfff, &cores, false), Some(0xffc));
+        // One core only: unchanged.
+        assert_eq!(split_core(0b11, &cores, true), None);
+        // No core information: the lowest CPU alone.
+        assert_eq!(split_core(0xf0, &[], true), Some(0x10));
+        assert_eq!(split_core(0xf0, &[], false), Some(0xe0));
+    }
 
     #[test]
     fn front_end_cpus_from_cache_groups() {
