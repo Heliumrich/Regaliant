@@ -4070,6 +4070,59 @@ fn note_cs_cpu(addr: u64, kind: usize, t: [std::time::Duration; 4]) {
     }
 }
 
+/// `DS_PROFILE_CS_QUEUE=<text>`: the same per compute shader for the queues
+/// whose name holds the text alone (`acb0x50`), in a table of its own.
+static CS_CPU_Q: Mutex<Option<HashMap<u64, [u64; 5]>>> = Mutex::new(None);
+
+fn cs_queue_filter() -> Option<&'static str> {
+    static F: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    F.get_or_init(|| std::env::var("DS_PROFILE_CS_QUEUE").ok().filter(|v| !v.is_empty())).as_deref()
+}
+
+fn cs_queue_profiled(name: &str) -> bool {
+    cs_queue_filter().is_some_and(|f| name.contains(f))
+}
+
+fn note_cs_cpu_queue(addr: u64, t: [std::time::Duration; 4]) {
+    let mut g = CS_CPU_Q.lock();
+    let e = g.get_or_insert_with(HashMap::new).entry(addr).or_insert([0; 5]);
+    e[0] += 1;
+    for k in 0..4 {
+        e[k + 1] += t[k].as_nanos() as u64;
+    }
+}
+
+/// The table of `DS_PROFILE_CS_QUEUE`'s queues (profile).
+fn cs_cpu_queue_lines() -> String {
+    let Some(f) = cs_queue_filter() else { return String::new() };
+    let g = CS_CPU_Q.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(&u64, &[u64; 5])> = m.iter().collect();
+    v.sort_by(|a, b| b.1[4].cmp(&a.1[4]));
+    let all: u64 = v.iter().map(|x| x.1[4]).sum();
+    let mut s = format!("    command-processor time by compute shader on queues matching {f} ({} ms in all):\n", all / 1_000_000);
+    for (i, (a, x)) in v.iter().take(25).enumerate() {
+        let n = x[0].max(1) as f64;
+        let us = |k: usize| x[k] as f64 / n / 1000.0;
+        s.push_str(&format!(
+            "      cs {a:#x}: {} dispatches, {} ms, us each: prepare and waits {:.1}, textures and pipeline {:.1}, bindings {:.1}, recording {:.1}\n",
+            x[0],
+            x[4] / 1_000_000,
+            us(1),
+            us(2) - us(1),
+            us(3) - us(2),
+            us(4) - us(3)
+        ));
+        if i < 12 {
+            if let Some(l) = placement_line(**a) {
+                s.push_str(&l);
+                s.push('\n');
+            }
+        }
+    }
+    s
+}
+
 /// The compute shaders taking the most command-processor time (profile).
 fn cs_cpu_lines() -> String {
     let g = CS_CPU.lock();
@@ -4818,6 +4871,7 @@ pub fn shader_profile() -> String {
     s.push_str(&phases_line("dispatch", &CS_PHASES, ["prepare and waits", "textures, pipeline", "bindings"]));
     s.push_str(&place_lines());
     s.push_str(&cs_cpu_lines());
+    s.push_str(&cs_cpu_queue_lines());
     {
         let n: Vec<u64> = SYNC_WHY.iter().zip(SYNC_WHY_AT_RESET.iter()).map(|(c, r)| c.load(Ordering::Relaxed).saturating_sub(r.load(Ordering::Relaxed))).collect();
         s.push_str(&format!(
@@ -6961,6 +7015,9 @@ impl Exec {
     }
 
     pub fn sync_for(&mut self, reads: &[(u64, u64)], why: usize) -> bool {
+        if super::xwait::on() {
+            super::xwait::note_reads(&self.name, reads, why);
+        }
         // DS_TRACE_SYNC=1: the first 400 waits, with the read that collided
         // and the batch writing it; DS_TRACE_SYNC=<text>: only on queues
         // whose name contains it (e.g. acb0x50).
@@ -8395,6 +8452,9 @@ impl Exec {
                             if found.tr.plan.resources[i].written {
                                 trace_writes(|| format!("{:?} shader {:#x}", p.stage, p.addr), base, size);
                                 bound.writes.push((base, size));
+                                if super::xwait::on() {
+                                    super::xwait::note_write(&self.name, base, size);
+                                }
                                 if matches!(found.resources[i], Resolved::Buffer(_)) {
                                     bound.sized_writes.push((base, size));
                                 }
@@ -8439,6 +8499,9 @@ impl Exec {
                                     if found.tr.plan.resources[i].written {
                                         trace_writes(|| format!("{:?} shader {:#x}", p.stage, p.addr), base, size);
                                         bound.writes.push((base, size));
+                                        if super::xwait::on() {
+                                            super::xwait::note_write(&self.name, base, size);
+                                        }
                                         if matches!(found.resources[i], Resolved::Buffer(_)) {
                                             bound.sized_writes.push((base, size));
                                         }
@@ -9352,6 +9415,9 @@ impl Exec {
             note_phases(&CS_PHASES, [t_prep, t_pipe, t_bind, total]);
             note_place(self.deferred, self.batch_shaders.len().saturating_sub(1), [t_prep, t_pipe, t_bind, total]);
             note_cs_cpu(p.addr, kind, [t_prep, t_pipe, t_bind, total]);
+            if cs_queue_profiled(&self.name) {
+                note_cs_cpu_queue(p.addr, [t_prep, t_pipe, t_bind, total]);
+            }
             if first {
                 CS_STEPS_FIRST[CS_STEP_COUNT].fetch_add(1, Ordering::Relaxed);
             } else {
@@ -9459,6 +9525,7 @@ pub fn status() -> String {
         + &crate::titlemem::status()
         + &crate::titlefix::status()
         + &super::cp::draw_state_line()
+        + &super::xwait::status()
         + &super::lodstats::status()
         + &super::ahead::status()
         + &super::compile::status()

@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 142] = [
+    static ALL: [Tunable; 143] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -169,6 +169,7 @@ pub mod tune {
         Tunable { name: "home_submit_epochs", env: "DS_HOME_SUBMIT_EPOCHS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "gfx_core", env: "DS_GFX_CORE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "skip_cmds", env: "DS_SKIP_CMDS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "xwait_skip", env: "DS_XWAIT_SKIP", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1536,6 +1537,13 @@ pub mod tune {
         get(141)
     }
 
+    /// Measurement only (unsafe): the graphics CP skips its waits for labels
+    /// compute queue 0x50 wrote last (`Cp::wait`).
+    #[inline]
+    pub fn xwait_skip() -> bool {
+        get(142) != 0
+    }
+
     /// A switch's value by name; None if unknown.
     pub fn value(name: &str) -> Option<u64> {
         ALL.iter().position(|t| t.name == name).map(get)
@@ -1637,6 +1645,7 @@ pub mod swizzle_tables;
 pub mod tiling;
 pub mod verify;
 pub mod vk;
+pub mod xwait;
 
 use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
@@ -2210,6 +2219,7 @@ pub fn reset_profile() {
     images::reset_memo_stats();
     exec::reset_pre_window();
     exec::reset_import_window();
+    xwait::reset();
     crate::mem::reset_host_calls();
     threadcpu::reset_window();
     crate::audio::reset_window();
@@ -2237,6 +2247,7 @@ pub fn profile_report() -> String {
     s.push_str(&exec::push_line());
     s.push_str(&exec::import_window_line());
     s.push_str(&crate::mem::host_calls_line());
+    s.push_str(&xwait::status());
     s.push_str(&crate::audio::window_line());
     s.push_str(&crate::guestprof::report());
     s.push_str(&threadcpu::window_line());

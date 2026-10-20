@@ -2603,6 +2603,7 @@ impl Cp {
             }
         }
         let mut e = self.exec.take().unwrap();
+        super::xwait::note_command(&self.name);
         e.dispatch(self, groups, initiator);
         self.exec = Some(e);
         self.split_if_due();
@@ -2675,6 +2676,7 @@ impl Cp {
         }
         self.ctx_dirty = false;
         self.last_draw_progs = progs;
+        super::xwait::note_command(&self.name);
         let mut e = self.exec.take().unwrap();
         self.last_draw = e.draw(self, args);
         self.exec = Some(e);
@@ -4125,6 +4127,19 @@ impl Cp {
         // promise, a latched CP write or a GPU-performed write seen
         // (`wake_label`).
         let gpu_label = last_write(a).is_some_and(|(q, _, _)| q.starts_with("gpu-"));
+        // Measurement only (`tune xwait_skip`, unsafe): the graphics CP does
+        // not wait for labels compute queue 0x50 wrote last (an upper bound
+        // for recording past them; what follows may read stale data).
+        if super::tune::xwait_skip() && self.name == "gpu-gfx" && last_write(a).is_some_and(|(q, _, _)| q == "gpu-acb0x50") {
+            self.note("`tune xwait_skip`: label waits for gpu-acb0x50 skipped (measurement; pictures may be wrong)");
+            return Flow::Next;
+        }
+        let probe = super::xwait::on() && self.name == "gpu-gfx";
+        if probe {
+            if let Some((q, _, _)) = last_write(a) {
+                super::xwait::wait_start(&q);
+            }
+        }
         let r = self.poll_until_wake(
             at,
             &what,
@@ -4132,6 +4147,9 @@ impl Cp {
             &mut work,
             (gpu_label && super::tune::label_wake() && a % if wide { 8 } else { 4 } == 0).then_some((a, wide)),
         );
+        if probe {
+            super::xwait::wait_end();
+        }
         {
             let by = last_write(a).map(|w| w.0).unwrap_or_else(|| "cpu".into());
             tw.end(&self.name, || format!("wait: label {a:#x} (written by {by})"));
