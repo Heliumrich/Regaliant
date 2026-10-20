@@ -373,7 +373,7 @@ pub(crate) fn precompile_gfx_translations(vs: StageTr, ps: Option<StageTr>, stat
         topology_class: state.topology_class,
         depth_clamp: state.depth_clamp,
     };
-    let bindings: u32 = vs.0.out.bindings.iter().chain(ps.iter().flat_map(|p| p.0.out.bindings.iter())).map(|b| super::binding_count(b.kind)).sum();
+    let bindings: u32 = super::descriptor_bindings(&vs.0.out).chain(ps.iter().flat_map(|p| super::descriptor_bindings(&p.0.out))).map(|b| super::binding_count(b.kind)).sum();
     let push_mode = super::super::tune::push_desc() && bindings <= ctx().max_push;
     let hkey = super::push_key(hash_gfx_key(&key), push_mode);
     if gfx_known(hkey) {
@@ -644,7 +644,7 @@ fn gfx_pipe_create(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, pu
 fn set_layout_bindings(stages: &[(&super::super::shaders::Translated, vk::ShaderStageFlags)]) -> Vec<vk::DescriptorSetLayoutBinding<'static>> {
     let mut v = Vec::new();
     for (tr, flags) in stages {
-        for b in &tr.out.bindings {
+        for b in super::descriptor_bindings(&tr.out) {
             v.push(vk::DescriptorSetLayoutBinding::default().binding(b.binding).descriptor_type(descriptor_type(b.kind)).descriptor_count(super::binding_count(b.kind)).stage_flags(*flags));
         }
     }

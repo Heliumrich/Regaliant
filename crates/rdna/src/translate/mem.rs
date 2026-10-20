@@ -152,14 +152,130 @@ fn dword_ptr(tr: &mut T, var: Word, idx: Word) -> R<Word> {
     e(tr.b.access_chain(tr.t.sb_u32, None, var, [z, idx]))
 }
 
+/// `Spec::addresses`: the resource a buffer placeholder stands for.
+fn addressed(tr: &T, var: Word) -> Option<usize> {
+    tr.buffer_res.get(&var).copied()
+}
+
+/// The u64 of two dwords (low, high).
+fn u64_of(tr: &mut T, lo: Word, hi: Word) -> R<Word> {
+    let v = e(tr.b.composite_construct(tr.t.v2u, None, [lo, hi]))?;
+    e(tr.b.bitcast(tr.t.u64, None, v))
+}
+
+/// A device pointer to `ty` (`bytes` wide) at byte `off` of the bound range
+/// of address-mode resource `r`, and whether the access lies inside the
+/// range; outside it the pointer is the zero page's (loads read 0; stores
+/// and atomics are skipped by their callers).
+fn addr_ref(tr: &mut T, r: usize, off: Word, ty: Word, bytes: u32) -> R<(Word, Word)> {
+    let (u, u64t, b) = (tr.t.u32, tr.t.u64, tr.t.bool_);
+    let (base, range) = match tr.addr_vals.get(&r) {
+        Some(&v) => v,
+        None => {
+            let lo = tr.addr_info(r, 0)?;
+            let hi = tr.addr_info(r, 1)?;
+            let range = tr.addr_info(r, 2)?;
+            (u64_of(tr, lo, hi)?, range)
+        }
+    };
+    // off + bytes <= range without wrapping: range >= bytes, off <= range - bytes.
+    let nb = tr.u(bytes);
+    let fits = e(tr.b.u_greater_than_equal(b, None, range, nb))?;
+    let lim = e(tr.b.i_sub(u, None, range, nb))?;
+    let le = e(tr.b.u_less_than_equal(b, None, off, lim))?;
+    let inr = e(tr.b.logical_and(b, None, fits, le))?;
+    let o = e(tr.b.u_convert(u64t, None, off))?;
+    let a = e(tr.b.i_add(u64t, None, base, o))?;
+    let z = match tr.zero_addr {
+        Some(z) => z,
+        None => {
+            let zlo = tr.addr_header(0)?;
+            let zhi = tr.addr_header(1)?;
+            u64_of(tr, zlo, zhi)?
+        }
+    };
+    let a = e(tr.b.select(u64t, None, inr, a, z))?;
+    let pt = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, ty);
+    let p = e(tr.b.convert_u_to_ptr(pt, None, a))?;
+    Ok((p, inr))
+}
+
+/// Loads the address-mode resources' addresses and ranges and the zero
+/// page's address (`T::addr_vals`); call in the entry block, after the SGPR
+/// data's base is known.
+pub fn preload_addresses(tr: &mut T) -> R<()> {
+    let mut rs: Vec<usize> = tr.buffer_res.values().copied().collect();
+    rs.sort_unstable();
+    for r in rs {
+        let lo = tr.addr_info(r, 0)?;
+        let hi = tr.addr_info(r, 1)?;
+        let range = tr.addr_info(r, 2)?;
+        let base = u64_of(tr, lo, hi)?;
+        tr.addr_vals.insert(r, (base, range));
+    }
+    let zlo = tr.addr_header(0)?;
+    let zhi = tr.addr_header(1)?;
+    tr.zero_addr = Some(u64_of(tr, zlo, zhi)?);
+    Ok(())
+}
+
+/// A pointer to dword `idx` of buffer `var`, and for an address-mode
+/// resource whether the dword lies inside its range (writes must check).
+fn dword_ref(tr: &mut T, var: Word, idx: Word) -> R<(Word, Option<Word>)> {
+    if let Some(r) = addressed(tr, var) {
+        let two = tr.u(2);
+        let off = e(tr.b.shift_left_logical(tr.t.u32, None, idx, two))?;
+        let u = tr.t.u32;
+        let (p, inr) = addr_ref(tr, r, off, u, 4)?;
+        return Ok((p, Some(inr)));
+    }
+    Ok((dword_ptr(tr, var, idx)?, None))
+}
+
+/// The Aligned memory operand of a device-pointer access of `n` bytes.
+fn aligned(n: u32) -> (Option<spirv::MemoryAccess>, [Operand; 1]) {
+    (Some(spirv::MemoryAccess::ALIGNED), [Operand::LiteralBit32(n)])
+}
+
 fn load_dword(tr: &mut T, var: Word, idx: Word) -> R<Word> {
-    let p = dword_ptr(tr, var, idx)?;
+    let (p, inr) = dword_ref(tr, var, idx)?;
+    if inr.is_some() {
+        let (ma, ops) = aligned(4);
+        return e(tr.b.load(tr.t.u32, None, p, ma, ops));
+    }
     e(tr.b.load(tr.t.u32, None, p, None, []))
 }
 
 fn store_dword(tr: &mut T, var: Word, idx: Word, v: Word) -> R<()> {
-    let p = dword_ptr(tr, var, idx)?;
-    ok(tr.b.store(p, v, None, []))
+    let (p, inr) = dword_ref(tr, var, idx)?;
+    match inr {
+        Some(c) => tr.guarded(c, &mut |tr| {
+            let (ma, ops) = aligned(4);
+            ok(tr.b.store(p, v, ma, ops))
+        }),
+        None => ok(tr.b.store(p, v, None, [])),
+    }
+}
+
+/// How an aligned 8/16-byte access of a buffer is made: through a vector
+/// view of its binding, or (address mode) a device pointer and its range
+/// check.
+#[derive(Clone, Copy)]
+enum VecAccess {
+    View(Word),
+    Addr(Word, Word),
+}
+
+fn vec_access(tr: &mut T, var: Word, addr: Word, n: u32) -> R<Option<VecAccess>> {
+    if n != 2 && n != 4 {
+        return Ok(None);
+    }
+    if let Some(r) = addressed(tr, var) {
+        let vt = if n == 2 { tr.t.v2u } else { tr.t.v4u };
+        let (p, inr) = addr_ref(tr, r, addr, vt, 4 * n)?;
+        return Ok(Some(VecAccess::Addr(p, inr)));
+    }
+    Ok(tr.vec_view(var, n).map(VecAccess::View))
 }
 
 /// Loads `n` dwords at byte address `addr`: one 8/16-byte access when the
@@ -186,22 +302,32 @@ fn load_dwords(tr: &mut T, var: Word, addr: Word, n: u32, bytes: bool) -> R<Vec<
         }
         Ok(v)
     };
-    let view = if n == 2 || n == 4 { tr.vec_view(var, n) } else { None };
-    let Some(view) = view else { return scalar(tr) };
+    let Some(how) = vec_access(tr, var, addr, n)? else { return scalar(tr) };
     let mask = tr.u(4 * n - 1);
     let low = e(tr.b.bitwise_and(u, None, addr, mask))?;
     let z = tr.u(0);
-    let aligned = e(tr.b.i_equal(tr.t.bool_, None, low, z))?;
+    let mut aligned_ = e(tr.b.i_equal(tr.t.bool_, None, low, z))?;
+    if let VecAccess::Addr(_, inr) = how {
+        aligned_ = e(tr.b.logical_and(tr.t.bool_, None, aligned_, inr))?;
+    }
     let (merge, then_b, else_b) = (tr.b.id(), tr.b.id(), tr.b.id());
     ok(tr.b.selection_merge(merge, spirv::SelectionControl::NONE))?;
-    ok(tr.b.branch_conditional(aligned, then_b, else_b, []))?;
+    ok(tr.b.branch_conditional(aligned_, then_b, else_b, []))?;
     e(tr.b.begin_block(Some(then_b)))?;
     let vt = if n == 2 { tr.t.v2u } else { tr.t.v4u };
-    let sh = tr.u(if n == 2 { 3 } else { 4 });
-    let idx = e(tr.b.shift_right_logical(u, None, addr, sh))?;
-    let pt = tr.b.type_pointer(None, StorageClass::StorageBuffer, vt);
-    let p = e(tr.b.access_chain(pt, None, view, [z, idx]))?;
-    let vv = e(tr.b.load(vt, None, p, None, []))?;
+    let vv = match how {
+        VecAccess::View(view) => {
+            let sh = tr.u(if n == 2 { 3 } else { 4 });
+            let idx = e(tr.b.shift_right_logical(u, None, addr, sh))?;
+            let pt = tr.b.type_pointer(None, StorageClass::StorageBuffer, vt);
+            let p = e(tr.b.access_chain(pt, None, view, [z, idx]))?;
+            e(tr.b.load(vt, None, p, None, []))?
+        }
+        VecAccess::Addr(p, _) => {
+            let (ma, ops) = aligned(4 * n);
+            e(tr.b.load(vt, None, p, ma, ops))?
+        }
+    };
     let mut va = Vec::new();
     for k in 0..n {
         va.push(e(tr.b.composite_extract(u, None, vv, [k]))?);
@@ -234,23 +360,33 @@ fn store_dwords(tr: &mut T, var: Word, addr: Word, vals: &[Word]) -> R<()> {
         }
         Ok(())
     };
-    let view = if n == 2 || n == 4 { tr.vec_view(var, n) } else { None };
-    let Some(view) = view else { return scalar(tr) };
+    let Some(how) = vec_access(tr, var, addr, n)? else { return scalar(tr) };
     let mask = tr.u(4 * n - 1);
     let low = e(tr.b.bitwise_and(u, None, addr, mask))?;
     let z = tr.u(0);
-    let aligned = e(tr.b.i_equal(tr.t.bool_, None, low, z))?;
+    let mut aligned_ = e(tr.b.i_equal(tr.t.bool_, None, low, z))?;
+    if let VecAccess::Addr(_, inr) = how {
+        aligned_ = e(tr.b.logical_and(tr.t.bool_, None, aligned_, inr))?;
+    }
     let (merge, then_b, else_b) = (tr.b.id(), tr.b.id(), tr.b.id());
     ok(tr.b.selection_merge(merge, spirv::SelectionControl::NONE))?;
-    ok(tr.b.branch_conditional(aligned, then_b, else_b, []))?;
+    ok(tr.b.branch_conditional(aligned_, then_b, else_b, []))?;
     e(tr.b.begin_block(Some(then_b)))?;
     let vt = if n == 2 { tr.t.v2u } else { tr.t.v4u };
-    let sh = tr.u(if n == 2 { 3 } else { 4 });
-    let idx = e(tr.b.shift_right_logical(u, None, addr, sh))?;
-    let pt = tr.b.type_pointer(None, StorageClass::StorageBuffer, vt);
-    let p = e(tr.b.access_chain(pt, None, view, [z, idx]))?;
     let vv = e(tr.b.composite_construct(vt, None, vals.to_vec()))?;
-    ok(tr.b.store(p, vv, None, []))?;
+    match how {
+        VecAccess::View(view) => {
+            let sh = tr.u(if n == 2 { 3 } else { 4 });
+            let idx = e(tr.b.shift_right_logical(u, None, addr, sh))?;
+            let pt = tr.b.type_pointer(None, StorageClass::StorageBuffer, vt);
+            let p = e(tr.b.access_chain(pt, None, view, [z, idx]))?;
+            ok(tr.b.store(p, vv, None, []))?;
+        }
+        VecAccess::Addr(p, _) => {
+            let (ma, ops) = aligned(4 * n);
+            ok(tr.b.store(p, vv, ma, ops))?;
+        }
+    }
     ok(tr.b.branch(merge))?;
     e(tr.b.begin_block(Some(else_b)))?;
     scalar(tr)?;
@@ -297,13 +433,19 @@ fn store_bytes(tr: &mut T, var: Word, addr: Word, v: Word, nbytes: u32) -> R<()>
     let mask = e(tr.b.shift_left_logical(u, None, m, sh))?;
     let vm = e(tr.b.bitwise_and(u, None, v, m))?;
     let vs = e(tr.b.shift_left_logical(u, None, vm, sh))?;
-    let p = dword_ptr(tr, var, idx)?;
+    let (p, inr) = dword_ref(tr, var, idx)?;
     let scope = tr.u(spirv::Scope::Device as u32);
     let sem = tr.u(0);
     let nm = e(tr.b.not(u, None, mask))?;
-    e(tr.b.atomic_and(u, None, p, scope, sem, nm))?;
-    e(tr.b.atomic_or(u, None, p, scope, sem, vs))?;
-    Ok(())
+    let mut rmw = |tr: &mut T| -> R<()> {
+        e(tr.b.atomic_and(u, None, p, scope, sem, nm))?;
+        e(tr.b.atomic_or(u, None, p, scope, sem, vs))?;
+        Ok(())
+    };
+    match inr {
+        Some(c) => tr.guarded(c, &mut rmw),
+        None => rmw(tr),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -972,7 +1114,7 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, var: Word, addr: Word, fmt: u1
             return Ok(());
         }
         let idx = e(tr.b.shift_right_logical(u, None, addr, two))?;
-        let p = dword_ptr(tr, var, idx)?;
+        let (p, inr) = dword_ref(tr, var, idx)?;
         let v = tr.vreg(vd)?;
         let cmp = if op == "cmpswap" { Some(tr.vreg(vd + 1)?) } else { None };
         let glc = match ins.enc {
@@ -980,6 +1122,11 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, var: Word, addr: Word, fmt: u1
             _ => bits(ins.w0, 14, 1) != 0,
         };
         let act = tr.active()?;
+        // Address mode: an atomic outside the bound range does nothing.
+        let act = match inr {
+            Some(c) => e(tr.b.logical_and(tr.t.bool_, None, act, c))?,
+            None => act,
+        };
         let ret = if ins.enc == Enc::Global { rdst } else { vd };
         tr.guarded(act, &mut |tr| {
             if let Some(old) = atomic_op(tr, op, p, spirv::Scope::Device, v, cmp)? {

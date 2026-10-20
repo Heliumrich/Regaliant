@@ -247,6 +247,13 @@ pub struct Spec {
     /// one before pushes no descriptors. None: the binding starts at the
     /// command's data.
     pub sgpr_pc: Option<u32>,
+    /// Buffer resources are read and written through device addresses
+    /// (`PhysicalStorageBuffer64`): each is listed as `BindingKind::Address`
+    /// without a descriptor, and the runtime writes its range's address and
+    /// size into the SGPR data's address block ([`addr_info_offset`]).
+    /// Accesses outside the range read 0 (the block's zero page) and do not
+    /// write, as robust buffer access did for descriptors.
+    pub addresses: bool,
 }
 
 /// The byte offset of a stage's SGPR data offset in the push constants
@@ -293,6 +300,9 @@ impl std::hash::Hash for Spec {
         if let Some(o) = self.sgpr_pc {
             0x5350_4330u32.hash(state);
             o.hash(state);
+        }
+        if self.addresses {
+            0x4144_4452u32.hash(state);
         }
     }
 }
@@ -367,6 +377,10 @@ pub enum BindingKind {
     Watchdog,
     /// u32 array of LOD_STATS_DWORDS: the LOD statistics (`Spec::lod_stats`).
     LodStats,
+    /// A buffer resource read through its device address (`Spec::addresses`):
+    /// no descriptor (its `binding` is unused); the runtime places it as a
+    /// `Buffer` and writes the address block.
+    Address(usize),
 }
 
 /// Size of the global data share.
@@ -407,7 +421,7 @@ impl Binding {
     /// Plan resource index of a resource binding.
     pub fn kind_resource(&self) -> Option<usize> {
         match self.kind {
-            BindingKind::Buffer(i) | BindingKind::Image(i) | BindingKind::StorageImage(i) | BindingKind::StorageImageMips(i) | BindingKind::ImageArray(i) | BindingKind::Sampler(i) | BindingKind::CompareSampler(i) => Some(i),
+            BindingKind::Buffer(i) | BindingKind::Address(i) | BindingKind::Image(i) | BindingKind::StorageImage(i) | BindingKind::StorageImageMips(i) | BindingKind::ImageArray(i) | BindingKind::Sampler(i) | BindingKind::CompareSampler(i) => Some(i),
             _ => None,
         }
     }
@@ -474,9 +488,22 @@ pub fn table_slot(plan: &Plan, r: usize) -> u32 {
     plan.resources[..r].iter().filter(|x| x.kind == ResKind::ImageTable).count() as u32
 }
 
+/// Dwords per resource in the address block (`Spec::addresses`): the
+/// address of the bound range (low, high dword), its size in bytes, unused.
+pub const ADDR_INFO_DWORDS: u32 = 4;
+/// Dwords before the resources' entries in the address block: the zero
+/// page's address (low, high; out-of-range reads load from it), unused.
+pub const ADDR_HEADER_DWORDS: u32 = 4;
+
+/// Dword offset of the address block in the SGPR data buffer, after the
+/// image tables' LOD information (the earlier layout ended there).
+pub fn addr_info_offset(plan: &Plan) -> u32 {
+    lod_info_offset(plan) + IMAGE_TABLE_LEN * plan.resources.iter().filter(|x| x.kind == ResKind::ImageTable).count() as u32
+}
+
 /// Total dwords of the SGPR data buffer.
 pub fn sgpr_data_dwords(plan: &Plan) -> u32 {
-    lod_info_offset(plan) + IMAGE_TABLE_LEN * plan.resources.iter().filter(|x| x.kind == ResKind::ImageTable).count() as u32
+    addr_info_offset(plan) + ADDR_HEADER_DWORDS + ADDR_INFO_DWORDS * plan.resources.len() as u32
 }
 
 pub(crate) struct Types {
@@ -650,6 +677,17 @@ pub(crate) struct T<'a> {
     pub buffer_views: HashMap<(Word, u32), Word>,
     /// Block struct types of the vector views (created once: types are deduplicated).
     pub view_structs: HashMap<u32, Word>,
+    /// `Spec::addresses`: the resource index of each buffer resource's
+    /// placeholder id (stands for the resource where a variable would).
+    pub buffer_res: HashMap<Word, usize>,
+    /// Dword offset of the address block in the SGPR data.
+    pub addr_info_at: u32,
+    /// Address-mode resources' base address (u64) and range, and the zero
+    /// page's address, loaded once in the entry block (`mem::preload_addresses`):
+    /// loaded at every access they put three dependent reads before each
+    /// load and store (the gate ran 35% slower, GPU-bound).
+    pub addr_vals: HashMap<usize, (Word, Word)>,
+    pub zero_addr: Option<Word>,
 }
 
 pub type R<T> = Result<T, String>;
@@ -962,6 +1000,19 @@ impl<'a> T<'a> {
     /// Dword `k` of resource `r`'s info block (0 bias, 1 stride, 2 num_records).
     pub fn res_info(&mut self, r: usize, k: u32) -> R<Word> {
         let idx = self.res_info + RES_INFO_DWORDS * r as u32 + k;
+        self.sgpr_data(idx)
+    }
+
+    /// Dword `k` of resource `r`'s address entry (`Spec::addresses`: 0, 1
+    /// the address of its bound range, 2 the range's size in bytes).
+    pub fn addr_info(&mut self, r: usize, k: u32) -> R<Word> {
+        let idx = self.addr_info_at + ADDR_HEADER_DWORDS + ADDR_INFO_DWORDS * r as u32 + k;
+        self.sgpr_data(idx)
+    }
+
+    /// Dword `k` of the address block's header (0, 1: the zero page).
+    pub fn addr_header(&mut self, k: u32) -> R<Word> {
+        let idx = self.addr_info_at + k;
         self.sgpr_data(idx)
     }
 
@@ -1732,8 +1783,13 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     b.capability(Capability::ImageCubeArray);
     b.capability(Capability::ImageGatherExtended);
     b.extension("SPV_KHR_storage_buffer_storage_class");
+    if spec.addresses {
+        b.capability(Capability::PhysicalStorageBufferAddresses);
+        b.extension("SPV_KHR_physical_storage_buffer");
+    }
     let glsl = b.ext_inst_import("GLSL.std.450");
-    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+    let addressing = if spec.addresses { spirv::AddressingModel::PhysicalStorageBuffer64 } else { spirv::AddressingModel::Logical };
+    b.memory_model(addressing, spirv::MemoryModel::GLSL450);
     let void = b.type_void();
     let bool_ = b.type_bool();
     let u32t = b.type_int(32, 0);
@@ -1851,6 +1907,10 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         buffer_binding: HashMap::default(),
         buffer_views: HashMap::default(),
         view_structs: HashMap::default(),
+        buffer_res: HashMap::default(),
+        addr_info_at: addr_info_offset(plan),
+        addr_vals: HashMap::default(),
+        zero_addr: None,
     };
     let mut elected: Vec<u32> = tr.elections.keys().copied().collect();
     elected.sort();
@@ -1861,6 +1921,10 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     let sd = tr.sb_var();
     let bnd = tr.alloc_binding(BindingKind::SgprData);
     tr.decorate_binding(sd, bnd);
+    if spec.addresses {
+        // Read-only: its loads need not wait for device-pointer stores.
+        tr.b.decorate(sd, Decoration::NonWritable, []);
+    }
     tr.sgpr_data = sd;
     if code.iter().any(|i| i.enc == Enc::Ds && i.ds_gds()) {
         let v = tr.sb_var();
@@ -1896,6 +1960,13 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     // Resource bindings in plan order.
     for (i, r) in plan.resources.iter().enumerate() {
         match (r.kind, spec.resources.get(i)) {
+            (ResKind::Buffer | ResKind::Global, _) if spec.addresses => {
+                // A placeholder id in place of a variable (`T::buffer_res`).
+                let v = tr.b.id();
+                tr.bindings.push(Binding { binding: u32::MAX, kind: BindingKind::Address(i) });
+                tr.buffer_res.insert(v, i);
+                tr.buffers.insert(i, v);
+            }
             (ResKind::Buffer | ResKind::Global, _) => {
                 let v = tr.sb_var();
                 let bnd = tr.alloc_binding(BindingKind::Buffer(i));
@@ -2093,6 +2164,9 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     for i in 0..spec.user_sgprs.min(SGPR_DATA_USER as u16) as u32 {
         let v = tr.sgpr_data(i)?;
         tr.set_sreg(spec.user_base as u32 + i, v)?;
+    }
+    if spec.addresses {
+        mem::preload_addresses(&mut tr)?;
     }
     mem::stage_inputs(&mut tr)?;
     if tr.wave_masks {
@@ -2860,6 +2934,7 @@ mod tests {
             lane_votes: false,
             base_instance_sgpr: None,
             sgpr_pc: None,
+            addresses: false,
         }
     }
 
@@ -2875,6 +2950,39 @@ mod tests {
         assert_eq!(e.into_iter().collect::<Vec<_>>(), vec![(0x9c, 1)]);
         // Not for groups of several waves.
         assert!(lane0_elections(&code, &cs_spec([16, 8, 1])).is_empty());
+    }
+
+    /// `Spec::addresses`: the append kernel above without buffer
+    /// descriptors - its buffers listed as address entries, the module with
+    /// the PhysicalStorageBufferAddresses capability (validated with spvval
+    /// over a frame capture: `rdnadis --translate` with RDNA_ADDRESSES).
+    #[test]
+    fn buffers_by_device_address() {
+        let words = [0u32; 83];
+        let code = crate::decode_program(&words).unwrap();
+        let plan = crate::analysis::analyze(&code, 2, 0);
+        let mut spec = cs_spec([8, 8, 1]);
+        spec.resources = plan
+            .resources
+            .iter()
+            .map(|r| match r.kind {
+                ResKind::Global => ResSpec::Global,
+                _ => ResSpec::Buffer { format: 0, dst_sel: 0xFAC },
+            })
+            .collect();
+        let a = translate(&code, &plan, &spec).unwrap();
+        spec.addresses = true;
+        let b = translate(&code, &plan, &spec).unwrap();
+        let count = |o: &Output, addr: bool| o.bindings.iter().filter(|x| if addr { matches!(x.kind, BindingKind::Address(_)) } else { matches!(x.kind, BindingKind::Buffer(_)) }).count();
+        assert!(count(&a, false) > 0);
+        assert_eq!(count(&a, true), 0);
+        assert_eq!(count(&b, false), 0);
+        assert_eq!(count(&b, true), count(&a, false));
+        // OpCapability PhysicalStorageBufferAddresses (5347).
+        let cap = |w: &[u32]| w.windows(2).any(|x| x[0] == (2 << 16 | 17) && x[1] == 5347);
+        assert!(cap(&b.spirv) && !cap(&a.spirv));
+        // (The test's buffer specs have no format: its formatted store warns in both.)
+        assert_eq!(a.warnings, b.warnings);
     }
 
     /// A program's translation does not depend on its address (s_getpc_b64,

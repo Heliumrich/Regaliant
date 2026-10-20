@@ -512,13 +512,14 @@ fn init_inner() -> Result<(), String> {
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
             ctx.instance.get_physical_device_properties2(pdev, &mut p2);
             crate::info!(
-                "Vulkan limits: maxStorageBufferRange {:#x}, minStorageBufferOffsetAlignment {}, external_memory_host {} (import alignment {:#x}), buffer_device_address {}, maxPushDescriptors {}",
+                "Vulkan limits: maxStorageBufferRange {:#x}, minStorageBufferOffsetAlignment {}, external_memory_host {} (import alignment {:#x}), buffer_device_address {}, maxPushDescriptors {}, maxMemoryAllocationCount {}",
                 ctx.limits.max_storage_buffer_range,
                 ctx.limits.min_storage_buffer_offset_alignment,
                 has(ash::ext::external_memory_host::NAME),
                 host.min_imported_host_pointer_alignment,
                 has(ash::khr::buffer_device_address::NAME),
-                ctx.max_push
+                ctx.max_push,
+                ctx.limits.max_memory_allocation_count
             );
         }
         CTX.set(ctx).ok();
@@ -784,6 +785,33 @@ impl Ctx {
         unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory({}): {e}", req.size))
     }
 
+    /// `alloc` for buffer memory: with bufferDeviceAddress the buffers bound
+    /// to it may be addressed by shaders (`buffer_address`).
+    pub fn alloc_buffer_mem(&self, req: vk::MemoryRequirements, want: vk::MemoryPropertyFlags) -> Result<vk::DeviceMemory, String> {
+        if !self.device_addresses {
+            return self.alloc(req, want);
+        }
+        let ty = self.memory_type(req.memory_type_bits, want).ok_or("no suitable memory type")?;
+        let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty).push_next(&mut fl);
+        unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory({}): {e}", req.size))
+    }
+
+    /// Usage flags for a buffer that shaders may address (`tune addresses`).
+    pub fn addressable(&self, usage: vk::BufferUsageFlags) -> vk::BufferUsageFlags {
+        if self.device_addresses { usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS } else { usage }
+    }
+
+    /// The device address of `buf` (0 without bufferDeviceAddress). Every
+    /// buffer our helpers create is addressable.
+    #[inline]
+    pub fn buffer_address(&self, buf: vk::Buffer) -> u64 {
+        if !self.device_addresses {
+            return 0;
+        }
+        unsafe { self.device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buf)) }
+    }
+
     /// Device-local buffer with a GPU address (0 without bufferDeviceAddress):
     /// video-memory homes, named in device fault reports.
     pub fn device_buffer_addressed(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, u64), String> {
@@ -831,10 +859,10 @@ impl Ctx {
     /// Device-local buffer (not host-visible).
     pub fn device_buffer(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory), String> {
         unsafe {
-            let bi = self.shared(vk::BufferCreateInfo::default().size(size).usage(usage));
+            let bi = self.shared(vk::BufferCreateInfo::default().size(size).usage(self.addressable(usage)));
             let buf = self.device.create_buffer(&bi, None).map_err(|e| format!("vkCreateBuffer: {e}"))?;
             let req = self.device.get_buffer_memory_requirements(buf);
-            let mem = self.alloc(req, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+            let mem = self.alloc_buffer_mem(req, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
             self.device.bind_buffer_memory(buf, mem, 0).map_err(|e| format!("bind buffer: {e}"))?;
             Ok((buf, mem))
         }
@@ -893,11 +921,11 @@ impl Ctx {
     /// GPU reads stay in video memory, unlike `host_buffer`.
     pub fn bar_buffer(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), String> {
         unsafe {
-            let bi = self.shared(vk::BufferCreateInfo::default().size(size).usage(usage));
+            let bi = self.shared(vk::BufferCreateInfo::default().size(size).usage(self.addressable(usage)));
             let buf = self.device.create_buffer(&bi, None).map_err(|e| format!("vkCreateBuffer: {e}"))?;
             let req = self.device.get_buffer_memory_requirements(buf);
             let want = vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            let mem = match self.alloc(req, want) {
+            let mem = match self.alloc_buffer_mem(req, want) {
                 Ok(m) => m,
                 Err(e) => {
                     self.device.destroy_buffer(buf, None);
@@ -913,13 +941,13 @@ impl Ctx {
     /// Host-visible, coherent buffer (staging / per-draw data).
     pub fn host_buffer(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), String> {
         unsafe {
-            let bi = self.shared(vk::BufferCreateInfo::default().size(size).usage(usage));
+            let bi = self.shared(vk::BufferCreateInfo::default().size(size).usage(self.addressable(usage)));
             let buf = self.device.create_buffer(&bi, None).map_err(|e| format!("vkCreateBuffer: {e}"))?;
             let req = self.device.get_buffer_memory_requirements(buf);
             // Prefer cached host memory: results are read back by the CPU
             // (buffer write-back), which is very slow from write-combined memory.
             let hv = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            let mem = self.alloc(req, hv | vk::MemoryPropertyFlags::HOST_CACHED).or_else(|_| self.alloc(req, hv))?;
+            let mem = self.alloc_buffer_mem(req, hv | vk::MemoryPropertyFlags::HOST_CACHED).or_else(|_| self.alloc_buffer_mem(req, hv))?;
             self.device.bind_buffer_memory(buf, mem, 0).map_err(|e| format!("bind buffer: {e}"))?;
             let ptr = self.device.map_memory(mem, 0, size, vk::MemoryMapFlags::empty()).map_err(|e| format!("map: {e}"))? as *mut u8;
             Ok((buf, mem, ptr))

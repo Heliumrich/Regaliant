@@ -518,7 +518,7 @@ fn push_layout(bindings: &[vk::DescriptorSetLayoutBinding], push_mode: bool) -> 
 /// Whether a pipeline of these stages gets a push descriptor layout: the
 /// switch on and all their descriptors within maxPushDescriptors.
 fn push_fits(stages: &[&Prepared]) -> bool {
-    super::tune::push_desc() && stages.iter().flat_map(|p| p.tr.out.bindings.iter()).map(|b| binding_count(b.kind)).sum::<u32>() <= ctx().max_push
+    super::tune::push_desc() && stages.iter().flat_map(|p| descriptor_bindings(&p.tr.out)).map(|b| binding_count(b.kind)).sum::<u32>() <= ctx().max_push
 }
 
 /// Pipelines with push descriptor layouts are cached under keys of their
@@ -538,6 +538,9 @@ struct Fixed {
     watchdog: vk::Buffer,
     /// Zero-filled buffer bound for empty or unmapped resources.
     dummy: vk::Buffer,
+    /// Zero-filled and never written (`Spec::addresses`: reads outside a
+    /// resource's range load from it; writes there are skipped): its address.
+    zero_va: u64,
     /// Hardware LOD statistics measured by the sampling instructions
     /// (`BindingKind::LodStats`; `lodstats`).
     lodstats: vk::Buffer,
@@ -599,6 +602,15 @@ const WINDOW: u64 = 64 << 20;
 /// Bindings without a bounds check extend at most this far.
 const UNBOUNDED_MAX: u64 = 256 << 20;
 const DUMMY_BYTES: u64 = 64 << 10;
+/// The zero page of address-mode translations (`Fixed::zero_va`): covers
+/// the widest access (16 bytes).
+const ZERO_PAGE_BYTES: u64 = 4 << 10;
+
+/// The bindings of a translation that are descriptors (address-mode buffers,
+/// `BindingKind::Address`, are not).
+pub(super) fn descriptor_bindings(out: &rdna::translate::Output) -> impl Iterator<Item = &rdna::translate::Binding> {
+    out.bindings.iter().filter(|b| !matches!(b.kind, BindingKind::Address(_)))
+}
 
 fn fixed() -> &'static Fixed {
     FIXED.get_or_init(|| {
@@ -606,6 +618,7 @@ fn fixed() -> &'static Fixed {
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC;
         let (gds, _) = c.device_buffer(rdna::translate::GDS_BYTES as u64, usage).expect("GDS buffer");
         let (dummy, _) = c.device_buffer(DUMMY_BYTES, usage).expect("dummy buffer");
+        let (zero, _) = c.device_buffer(ZERO_PAGE_BYTES, usage).expect("zero page");
         let (debug, _, debug_ptr) = c.host_buffer(rdna::translate::DUMP_DWORDS as u64 * 4, usage).expect("debug buffer");
         let (lodstats, _) = c.device_buffer(super::lodstats::SLOT_BYTES, usage).expect("LOD statistics buffer");
         let (lod_readback, _, lod_readback_ptr) = c.host_buffer(super::lodstats::SLOT_BYTES * super::lodstats::RING as u64, usage).expect("LOD statistics readback");
@@ -623,6 +636,7 @@ fn fixed() -> &'static Fixed {
             c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
             c.device.cmd_fill_buffer(cmd, gds, 0, vk::WHOLE_SIZE, 0);
             c.device.cmd_fill_buffer(cmd, dummy, 0, vk::WHOLE_SIZE, 0);
+            c.device.cmd_fill_buffer(cmd, zero, 0, vk::WHOLE_SIZE, 0);
             // Every bank: no mip sampled (15), count 0.
             c.device.cmd_fill_buffer(cmd, lodstats, 0, super::lodstats::SLOT_BYTES / 2, 15);
             c.device.cmd_fill_buffer(cmd, lodstats, super::lodstats::SLOT_BYTES / 2, super::lodstats::SLOT_BYTES / 2, 0);
@@ -633,7 +647,7 @@ fn fixed() -> &'static Fixed {
             c.device.destroy_fence(fence, None);
             c.device.destroy_command_pool(pool, None);
         }
-        Fixed { gds, debug, debug_ptr, watchdog, dummy, lodstats, lod_readback, lod_readback_ptr, import_align: host.min_imported_host_pointer_alignment.max(4096) }
+        Fixed { gds, debug, debug_ptr, watchdog, dummy, zero_va: c.buffer_address(zero), lodstats, lod_readback, lod_readback_ptr, import_align: host.min_imported_host_pointer_alignment.max(4096) }
     })
 }
 
@@ -1069,7 +1083,7 @@ fn compute_pipe(p: &Prepared) -> Result<Pipe, String> {
 /// Whether a compute pipeline of this translation gets a push descriptor
 /// layout (`push_fits` of its stage).
 fn push_fits_tr(tr: &super::shaders::Translated) -> bool {
-    super::tune::push_desc() && tr.out.bindings.iter().map(|b| binding_count(b.kind)).sum::<u32>() <= ctx().max_push
+    super::tune::push_desc() && descriptor_bindings(&tr.out).map(|b| binding_count(b.kind)).sum::<u32>() <= ctx().max_push
 }
 
 /// Creates the compute pipeline of a translation made from a shader object
@@ -1217,9 +1231,7 @@ fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: O
     let c = ctx();
     {
         unsafe {
-            let bindings: Vec<vk::DescriptorSetLayoutBinding> = out
-                .bindings
-                .iter()
+            let bindings: Vec<vk::DescriptorSetLayoutBinding> = descriptor_bindings(out)
                 .map(|b| {
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(b.binding)
@@ -1339,7 +1351,7 @@ pub fn pipeline_test(capture: &str) -> i32 {
         };
         let tc = t0.elapsed().as_millis();
         create_ms += tc;
-        let buffers_only = out.bindings.iter().all(|b| descriptor_type(b.kind) == vk::DescriptorType::STORAGE_BUFFER);
+        let buffers_only = descriptor_bindings(out).all(|b| descriptor_type(b.kind) == vk::DescriptorType::STORAGE_BUFFER);
         let mut tr = 0u128;
         if buffers_only {
             unsafe {
@@ -1527,7 +1539,7 @@ pub fn record_bench(capture: &str, shader: Option<u64>) -> i32 {
 
 fn descriptor_type(k: BindingKind) -> vk::DescriptorType {
     match k {
-        BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Gds | BindingKind::Debug | BindingKind::Watchdog | BindingKind::LodStats => vk::DescriptorType::STORAGE_BUFFER,
+        BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Address(_) | BindingKind::Gds | BindingKind::Debug | BindingKind::Watchdog | BindingKind::LodStats => vk::DescriptorType::STORAGE_BUFFER,
         BindingKind::Image(_) | BindingKind::ImageArray(_) => vk::DescriptorType::SAMPLED_IMAGE,
         BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_) => vk::DescriptorType::STORAGE_IMAGE,
         BindingKind::Sampler(_) | BindingKind::CompareSampler(_) => vk::DescriptorType::SAMPLER,
@@ -1622,7 +1634,14 @@ fn note_push(partial: bool, pushed: usize, left: usize) {
 /// Status line: push descriptor writes left out as unchanged.
 pub(super) fn push_line() -> String {
     let v: Vec<u64> = PUSH_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    format!("    descriptor pushes: {} full, {} partial; {} descriptors pushed, {} left out as unchanged\n", v[0], v[1], v[2], v[3])
+    format!(
+        "    descriptor pushes: {} full, {} partial; {} descriptors pushed, {} left out as unchanged; buffer bindings by device address {}\n",
+        v[0],
+        v[1],
+        v[2],
+        v[3],
+        ADDRESSED.load(Ordering::Relaxed)
+    )
 }
 
 /// Records a command's descriptors: pushed into the command buffer (push
@@ -4279,6 +4298,9 @@ thread_local! {
 pub fn set_cpu_indirect(on: bool) {
     CPU_INDIRECT.with(|c| c.set(on));
 }
+
+/// Buffer bindings made as device addresses (`tune addresses`).
+pub static ADDRESSED: AtomicU64 = AtomicU64::new(0);
 
 /// Dispatches with no groups (left out before their preparation): [direct,
 /// indirect with the arguments read by the CPU].
@@ -8036,7 +8058,7 @@ impl Exec {
             if push {
                 continue;
             }
-            for b in &p.tr.out.bindings {
+            for b in descriptor_bindings(&p.tr.out) {
                 let ty = descriptor_type(b.kind);
                 if let Some(k) = POOL_TYPES.iter().position(|&t| t == ty) {
                     need[1 + k] += binding_count(b.kind);
@@ -8048,7 +8070,7 @@ impl Exec {
         let mut shadow = 0u64;
         for p in stages {
             for b in &p.tr.out.bindings {
-                if let BindingKind::Buffer(i) = b.kind {
+                if let BindingKind::Buffer(i) | BindingKind::Address(i) = b.kind {
                     if !p.tr.plan.resources[i].written {
                         continue;
                     }
@@ -8350,9 +8372,16 @@ impl Exec {
         BIND_PLACE.with(|f| f.set(place_class(if self.deferred { 2 } else if self.compute_cp { 1 } else { 0 }, self.batch_shaders.len())));
         let mut clk = BindClock::start();
         {
+            // Address-mode translations: the zero page in the address block's
+            // header (`Spec::addresses`).
+            let addr_at = rdna::translate::addr_info_offset(&found.tr.plan) as usize;
+            if found.tr.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::Address(_))) {
+                p.sgpr_data[addr_at] = fx.zero_va as u32;
+                p.sgpr_data[addr_at + 1] = (fx.zero_va >> 32) as u32;
+            }
             for b in &found.tr.out.bindings {
                 match b.kind {
-                    BindingKind::Buffer(i) => {
+                    BindingKind::Buffer(i) | BindingKind::Address(i) => {
                         let (base, size, stride, limit) = match &found.resources[i] {
                             Resolved::Buffer(v) => (v.base, v.byte_size(), v.stride, v.index_limit()),
                             Resolved::Global(a, n) => (*a, *n, 0, u32::MAX),
@@ -8603,7 +8632,17 @@ impl Exec {
                         p.sgpr_data[ri + 1] = stride;
                         p.sgpr_data[ri + 2] = bound_size.min(u32::MAX as u64) as u32;
                         p.sgpr_data[ri + 3] = limit;
-                        bound.bufs.push((b.binding, info));
+                        if matches!(b.kind, BindingKind::Address(_)) {
+                            // The descriptor's range as an address and size.
+                            let va = ctx().buffer_address(info.buffer) + info.offset;
+                            let ai = addr_at + (rdna::translate::ADDR_HEADER_DWORDS + rdna::translate::ADDR_INFO_DWORDS * i as u32) as usize;
+                            p.sgpr_data[ai] = va as u32;
+                            p.sgpr_data[ai + 1] = (va >> 32) as u32;
+                            p.sgpr_data[ai + 2] = info.range.min(u32::MAX as u64) as u32;
+                            ADDRESSED.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            bound.bufs.push((b.binding, info));
+                        }
                         BindClock::mark(&mut clk, 6);
                         BindClock::count_buffer(&mut clk);
                     }

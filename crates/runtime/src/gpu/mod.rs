@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 143] = [
+    static ALL: [Tunable; 144] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -170,6 +170,7 @@ pub mod tune {
         Tunable { name: "gfx_core", env: "DS_GFX_CORE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "skip_cmds", env: "DS_SKIP_CMDS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "xwait_skip", env: "DS_XWAIT_SKIP", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "addresses", env: "DS_ADDRESSES", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1542,6 +1543,14 @@ pub mod tune {
     #[inline]
     pub fn xwait_skip() -> bool {
         get(142) != 0
+    }
+
+    /// Buffers bound by device address (`Spec::addresses`: no buffer
+    /// descriptors; translations made from then on). Needs
+    /// bufferDeviceAddress.
+    #[inline]
+    pub fn addresses() -> bool {
+        get(143) != 0 && super::vk::ctx().device_addresses
     }
 
     /// A switch's value by name; None if unknown.

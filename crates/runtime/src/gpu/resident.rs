@@ -1033,7 +1033,7 @@ fn make_mirror() -> Result<Mirror, String> {
         | vk::BufferUsageFlags::TRANSFER_DST
         | vk::BufferUsageFlags::INDEX_BUFFER
         | vk::BufferUsageFlags::INDIRECT_BUFFER;
-    let mut bi = vk::BufferCreateInfo::default().size(size).usage(usage).flags(vk::BufferCreateFlags::SPARSE_BINDING | vk::BufferCreateFlags::SPARSE_RESIDENCY);
+    let mut bi = vk::BufferCreateInfo::default().size(size).usage(c.addressable(usage)).flags(vk::BufferCreateFlags::SPARSE_BINDING | vk::BufferCreateFlags::SPARSE_RESIDENCY);
     if c.families.len() > 1 {
         bi = bi.sharing_mode(vk::SharingMode::CONCURRENT).queue_family_indices(&c.families);
     }
@@ -1071,8 +1071,10 @@ pub fn back(base: u64, len: u64) -> Result<(), String> {
             continue;
         }
         if g.1 + m.page > BLOCK {
-            let mem = unsafe { c.device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(BLOCK).memory_type_index(m.mem_type), None) }
-                .map_err(|e| format!("vkAllocateMemory (mirror block): {e}"))?;
+            let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+            let ai = vk::MemoryAllocateInfo::default().allocation_size(BLOCK).memory_type_index(m.mem_type);
+            let ai = if c.device_addresses { ai.push_next(&mut fl) } else { ai };
+            let mem = unsafe { c.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory (mirror block): {e}"))?;
             g.0.push(mem);
             g.1 = 0;
         }
