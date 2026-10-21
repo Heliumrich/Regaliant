@@ -2655,6 +2655,23 @@ impl Images {
         at >= end
     }
 
+    /// Diagnosis: the images over [base, base+len) with what `fill_covered`
+    /// checks (written by the GPU, span, compressed, 3D, layers).
+    pub fn fill_cover_report(&self, base: u64, len: u64) -> String {
+        let end = base.saturating_add(len);
+        let parts: Vec<String> = self
+            .map
+            .iter()
+            .filter(|(k, img)| {
+                let b = k.base.saturating_add(img.span.max(1));
+                k.base < end && b > base
+            })
+            .take(8)
+            .map(|(k, img)| format!("{:#x} {}x{}x{} {:?}{} gpu_written {} span {:#x}", k.base, k.width, k.height, k.layers, k.format, if k.ty3d { " 3D" } else { "" }, img.gpu_written, img.span))
+            .collect();
+        if parts.is_empty() { "no image".into() } else { parts.join(", ") }
+    }
+
     /// The guest bytes of the images among `keys` overwritten through a
     /// buffer (`reload_overwritten` reads them).
     pub fn overwritten_spans(&self, keys: &[ImageKey]) -> Vec<(u64, u64)> {

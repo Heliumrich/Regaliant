@@ -9946,6 +9946,28 @@ impl Exec {
                     self.flush_resident(Some(&[(base, len)]))?;
                     FILL_SKIPS[0].fetch_add(1, Ordering::Relaxed);
                     FILL_SKIPS[1].fetch_add(len, Ordering::Relaxed);
+                } else if v == 0 && len >= FILL_SKIP_MIN && profiling() {
+                    // Why a large zero fill stores into guest memory (a range's
+                    // 1st and 300th time, the first 24 ranges; `DS_PROFILE_GPU=1`).
+                    static SEEN: Mutex<Vec<(u64, u64, u64)>> = Mutex::new(Vec::new());
+                    let mut g = SEEN.lock();
+                    let n = match g.iter().position(|e| e.0 == base && e.1 == len) {
+                        Some(i) => {
+                            g[i].2 += 1;
+                            g[i].2
+                        }
+                        None if g.len() < 24 => {
+                            g.push((base, len, 1));
+                            1
+                        }
+                        None => 0,
+                    };
+                    if n == 1 || n == 300 {
+                        drop(g);
+                        let homed = super::homes::overlaps(base, len);
+                        let report = super::images::with(|im| im.fill_cover_report(base, len));
+                        crate::info!("gpu: zero fill {base:#x}+{len:#x} (#{n}) stores into guest memory (home {homed}): {report}");
+                    }
                 }
                 if skip || self.fill_in_place(base, len, v)? {
                     let zeroed = super::images::with(|im| {
