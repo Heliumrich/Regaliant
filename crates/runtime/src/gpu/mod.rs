@@ -454,7 +454,7 @@ pub mod tune {
 
     /// Worker command processors that record chunks of long
     /// synchronization-free runs in parallel (`gpu::par`); 0: off; 1000 (the
-    /// default): a third of the logical CPUs, 2 to 8 (`par::workers`).
+    /// default): half the logical CPUs, 2 to 8 (`par::workers`).
     #[inline]
     pub fn par() -> u64 {
         get(29)

@@ -25,15 +25,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Chunk workers wanted (`tune par`; 0: runs are recorded by the command
-/// processor alone). By default a third of the logical CPUs, 2 to 8: on 24
-/// logical CPUs 6, 7 and 8 workers recorded +2.0%, +2.2% and +2.4% against 5
-/// (FINDINGS.md 2026-10-14); fewer CPUs keep fewer threads busy beside the
-/// title's 13 job workers.
+/// processor alone). By default half the logical CPUs, 2 to 8: on 24 logical
+/// CPUs 6, 7 and 8 workers recorded +2.0%, +2.2% and +2.4% against 5
+/// (FINDINGS.md 2026-10-14) and 12 no more than 8; on 8 logical CPUs 4
+/// workers +6% against 2 and 8 none more (2026-10-21, with the title's idle
+/// job workers asleep: a third was for CPUs shared with their polling).
 pub fn workers() -> usize {
     match super::tune::par() {
         1000 => {
             static AUTO: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-            *AUTO.get_or_init(|| std::thread::available_parallelism().map_or(5, |n| (n.get() / 3).clamp(2, 8)))
+            *AUTO.get_or_init(|| std::thread::available_parallelism().map_or(5, |n| (n.get() / 2).clamp(2, 8)))
         }
         v => (v as usize).min(16),
     }
