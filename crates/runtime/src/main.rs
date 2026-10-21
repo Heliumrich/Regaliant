@@ -17,6 +17,7 @@ mod sections;
 mod patch;
 mod jobidle;
 mod camhook;
+mod dispmode;
 mod thread;
 mod titlefix;
 mod titlemem;

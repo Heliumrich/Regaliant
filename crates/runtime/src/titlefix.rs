@@ -130,6 +130,63 @@ const FIXES: &[Fix] = &[
         why: "the `cam` command lists the camera rigs and their controllers",
         only_with: Some("DS_CAMDEBUG"),
     },
+    // The render resolution (`dispmode`, `DS_DISPLAY_MODE`): the per-frame
+    // display mode choice (eboot+0x9fe6a3..), `test ecx,ecx; cmovne esi,ecx`
+    // before `test eax,eax; cmovne esi,eax` (eax the options' mode).
+    Fix {
+        name: "display mode held (render resolution)",
+        offset: 0x9fe6a8,
+        from: &[0x85, 0xc9, 0x0f, 0x45, 0xf1],
+        change: Change::Hook { at: 0, handler: crate::dispmode::hook_rax },
+        kind: "PC settings, `DS_DISPLAY_MODE`",
+        why: "the title's render resolution follows its options (2560x1440 at the gate) and no PC setting",
+        only_with: Some("DS_DISPLAY_MODE"),
+    },
+    // ... the same choice kept as the effective mode (eboot+0xb26030, +0xD28),
+    // the same instructions ...
+    Fix {
+        name: "display mode held (effective mode)",
+        offset: 0xb2606e,
+        from: &[0x85, 0xc9, 0x0f, 0x45, 0xf1],
+        change: Change::Hook { at: 0, handler: crate::dispmode::hook_rax },
+        kind: "PC settings, `DS_DISPLAY_MODE`",
+        why: "the effective mode follows the options",
+        only_with: Some("DS_DISPLAY_MODE"),
+    },
+    // ... and the UI's 4K output test (eboot+0xde88c0): `test r15d,r15d; mov
+    // rcx,[rdx]` before `cmovne eax,r15d` (r15d the options' mode).
+    Fix {
+        name: "display mode held (UI scale)",
+        offset: 0xde88c0,
+        from: &[0x45, 0x85, 0xff, 0x48, 0x8b, 0x0a],
+        change: Change::Hook { at: 0, handler: crate::dispmode::hook_r15 },
+        kind: "PC settings, `DS_DISPLAY_MODE`",
+        why: "the UI's scale follows the options' mode (4K for modes 3-5)",
+        only_with: Some("DS_DISPLAY_MODE"),
+    },
+    // ... and the frame's copy of the settings (eboot+0xa4f2dd: memcpy of
+    // 0xD8A bytes to r14+0x390), after it: `mov edx,1`.
+    Fix {
+        name: "display mode held (frame settings)",
+        offset: 0xa4f2e9,
+        from: &[0xba, 0x01, 0x00, 0x00, 0x00],
+        change: Change::Hook { at: 0, handler: crate::dispmode::hook_snapshot },
+        kind: "PC settings, `DS_DISPLAY_MODE`",
+        why: "the frame's copy of the settings keeps the options' mode",
+        only_with: Some("DS_DISPLAY_MODE"),
+    },
+    // The render size within a mode (`dispmode`, `DS_RENDER_SIZE`): set
+    // display mode (eboot+0x90a600) after it built the sizes for the render
+    // resolution manager: `lea rdi,[rbx+0A8h]` before its call.
+    Fix {
+        name: "render size",
+        offset: 0x90a6fc,
+        from: &[0x48, 0x8d, 0xbb, 0xa8, 0x00, 0x00, 0x00],
+        change: Change::Hook { at: 0, handler: crate::dispmode::hook_render_size },
+        kind: "PC settings, `DS_RENDER_SIZE`",
+        why: "the title renders at its mode's size (2560x1440 at the gate) and no PC setting",
+        only_with: Some("DS_RENDER_SIZE"),
+    },
 ];
 
 /// `mov dword ptr [rcx+33Ch], -1` after counting the run (rax kept; the
@@ -151,6 +208,7 @@ pub fn apply(p: &mut crate::patch::Patcher, ranges: &[(u64, u64)]) {
         crate::info!("title fixes off (DS_TITLEFIX=0)");
         return;
     }
+    crate::dispmode::init();
     for (i, f) in FIXES.iter().enumerate() {
         if f.only_with.is_some_and(|v| std::env::var_os(v).is_none()) {
             continue;
@@ -190,5 +248,5 @@ pub fn status() -> String {
         .map(|(i, f)| format!("'{}' ran {} times", f.name, RUNS[i].load(Ordering::Relaxed)))
         .collect();
     let fixes = if runs.is_empty() { String::new() } else { format!("    title fixes: {}\n", runs.join(", ")) };
-    fixes + &crate::jobidle::status() + &crate::camhook::status()
+    fixes + &crate::jobidle::status() + &crate::camhook::status() + &crate::dispmode::status()
 }
