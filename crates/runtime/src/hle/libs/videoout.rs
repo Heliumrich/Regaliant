@@ -399,6 +399,11 @@ pub fn register(r: &mut Registry) {
     ]);
 }
 
+/// The size display buffer `b` is registered with (its set's attribute).
+fn registered_size(b: &DisplayBuffer) -> Option<(u32, u32)> {
+    PORT.lock().as_ref().and_then(|p| p.sets.get(b.set as usize).copied().flatten()).map(|a| (a.width, a.height))
+}
+
 /// Presents a flipped display buffer: the GPU image the title rendered at
 /// the buffer's address (`DS_GPU=1`), else a black frame of the buffer's size
 /// (never raw guest memory, which is tiled).
@@ -407,7 +412,8 @@ fn present_buffer(b: &DisplayBuffer) {
         return;
     }
     if crate::gpu::exec::enabled() {
-        if let Some((image, _, width, height)) = crate::gpu::images::with(|im| im.rendered_at(b.addr)) {
+        let size = registered_size(b);
+        if let Some((image, _, width, height)) = crate::gpu::images::with(|im| im.rendered_at(b.addr, size)) {
             crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Image { image, layout: ash::vk::ImageLayout::GENERAL, width, height });
             return;
         }
@@ -436,7 +442,7 @@ fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
             return Err("GPU execution is off (DS_GPU=1 renders frames)".into());
         }
         let (rgba, w, h) = crate::gpu::images::with(|im| -> Result<(Vec<u8>, u32, u32), String> {
-            let (image, format, w, h) = im.rendered_at(b.addr).ok_or("nothing was rendered to the buffer")?;
+            let (image, format, w, h) = im.rendered_at(b.addr, registered_size(b)).ok_or("nothing was rendered to the buffer")?;
             let raw = im.read_back(image, format, w, h)?;
             Ok((crate::gpu::images::to_rgba8(format, &raw).ok_or_else(|| format!("no RGBA8 conversion for {format:?}"))?, w, h))
         })?;

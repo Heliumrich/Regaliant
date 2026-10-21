@@ -2992,11 +2992,15 @@ impl Images {
     }
 
     /// The GPU image last rendered at `base` (display buffers).
-    pub fn rendered_at(&self, base: u64) -> Option<(vk::Image, vk::Format, u32, u32)> {
-        self.map
-            .values()
-            .filter(|i| i.key.base == base && i.gpu_written && !is_depth(i.key.format))
-            .max_by_key(|i| i.key.width as u64 * i.key.height as u64)
+    /// `size`: the size the buffer is registered with: an image of that
+    /// size first (the title draws a display buffer at another size after
+    /// it changes its display mode, and the larger image of the old size
+    /// stays at the address, no longer drawn), else the largest.
+    pub fn rendered_at(&self, base: u64, size: Option<(u32, u32)>) -> Option<(vk::Image, vk::Format, u32, u32)> {
+        let at = || self.map.values().filter(|i| i.key.base == base && i.gpu_written && !is_depth(i.key.format));
+        let area = |i: &&Image| i.key.width as u64 * i.key.height as u64;
+        size.and_then(|(w, h)| at().filter(|i| (i.key.width, i.key.height) == (w, h)).max_by_key(area))
+            .or_else(|| at().max_by_key(area))
             .map(|i| {
                 // Presented: in use even when not rendered again (a static
                 // screen flipped as it is), so never evicted meanwhile.
