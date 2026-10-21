@@ -1,6 +1,7 @@
 //! Patches of the title's own code (PPSA01341 01.007.000): stand-ins for
 //! behavior this port does not reproduce yet, fixes of title bugs the port's
-//! runs reach, and adaptations to a shared PC (`jobidle`). Each fix checks the original bytes first (another
+//! runs reach, adaptations to a shared PC (`jobidle`) and PC controls
+//! (`camhook`). Each fix checks the original bytes first (another
 //! title version is left alone and the mismatch logged), every applied fix is
 //! logged, and `DS_TITLEFIX=0` turns them all off (to investigate the
 //! underlying problem).
@@ -25,13 +26,15 @@ struct Fix {
     change: Change,
     kind: &'static str,
     why: &'static str,
+    /// Applied only when this environment variable is set (diagnosis).
+    only_with: Option<&'static str>,
 }
 
 /// How many times each fix's inserted code ran (`status`; hooks keep their
 /// own statistics).
-static RUNS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static RUNS: [AtomicU64; FIXES.len()] = [const { AtomicU64::new(0) }; FIXES.len()];
 /// Which fixes were applied.
-static APPLIED: [std::sync::atomic::AtomicBool; 4] = [const { std::sync::atomic::AtomicBool::new(false) }; 4];
+static APPLIED: [std::sync::atomic::AtomicBool; FIXES.len()] = [const { std::sync::atomic::AtomicBool::new(false) }; FIXES.len()];
 
 /// The stand-in used until 2026-10-11 (a byte patch) kept static meshes off
 /// the GPU-driven batches (eboot+0xa21e77 `jne` -> `nop; jmp`), which drew
@@ -56,6 +59,7 @@ const FIXES: &[Fix] = &[
         change: Change::Insert { at: 4, code: cmesh_unload_code },
         kind: "title bug",
         why: "components the collision mesh unload returns to the pending list lose their slot index",
+        only_with: None,
     },
     // BPE's wait for work (eboot+0x83b640), where its scan of this worker's
     // job counters found nothing: `pause; mov r15,[rbx+r14*8+0E10h]`.
@@ -66,6 +70,7 @@ const FIXES: &[Fix] = &[
         change: Change::Hook { at: 0, handler: crate::jobidle::wait_hook },
         kind: "shared-PC adaptation, `tune job_idle`",
         why: "the title's 13 job workers poll for work on 13 logical CPUs at all times",
+        only_with: None,
     },
     // BPE's take (eboot+0x83b880), at the end of its pass over one queue
     // (`add r15,9220h`; the last queue's end is a take that found nothing).
@@ -76,6 +81,7 @@ const FIXES: &[Fix] = &[
         change: Change::Hook { at: 0, handler: crate::jobidle::take_hook },
         kind: "shared-PC adaptation, `tune job_idle`",
         why: "jobs whose conditions do not hold yet are taken and put back by every worker without pause",
+        only_with: None,
     },
     // The worker loop (eboot+0x83b520) running a job it took: `mov rdi,rbx;
     // mov rsi,r15` before the call.
@@ -86,6 +92,43 @@ const FIXES: &[Fix] = &[
         change: Change::Hook { at: 0, handler: crate::jobidle::run_hook },
         kind: "shared-PC adaptation, `tune job_idle`",
         why: "a worker that runs a job is busy again",
+        only_with: None,
+    },
+    // Raw mouse look (`camhook`, FINDINGS.md 2026-10-21 evening): the camera
+    // stick reader (eboot+0x18bd60) after it loaded the stick into rdx: `mov
+    // edi,[rbx+74h]; mov rsi,[rbx]` (rbx the camera's work context).
+    Fix {
+        name: "raw mouse look (stick)",
+        offset: 0x18bd99,
+        from: &[0x8b, 0x7b, 0x74, 0x48, 0x8b, 0x33],
+        change: Change::Hook { at: 0, handler: crate::camhook::stick_hook },
+        kind: "PC controls, `mouse_look_raw`",
+        why: "mouse look through the right stick inherits the stick's response curve and top speed",
+        only_with: None,
+    },
+    // ... and the end of the stage that adds the stick to the camera's pitch
+    // and yaw (eboot+0x18cf00), which all of its paths reach: `mov
+    // rax,[r15]; cmp rax,[rbp-20h]` (its stack guard check; rbx the context).
+    Fix {
+        name: "raw mouse look (angles)",
+        offset: 0x18d1c4,
+        from: &[0x49, 0x8b, 0x07, 0x48, 0x3b, 0x45, 0xe0],
+        change: Change::Hook { at: 0, handler: crate::camhook::apply_hook },
+        kind: "PC controls, `mouse_look_raw`",
+        why: "the mouse turns the camera by its counts, not through the stick",
+        only_with: None,
+    },
+    // Diagnosis (`DS_CAMDEBUG=1`): the camera rig update's entry
+    // (eboot+0x181b00: `push rbp; mov rbp,rsp; push r15`), rdi the rig: the
+    // rigs seen, for the `cam` control command.
+    Fix {
+        name: "camera rigs (diagnosis)",
+        offset: 0x181b00,
+        from: &[0x55, 0x48, 0x89, 0xe5, 0x41, 0x57],
+        change: Change::Hook { at: 0, handler: crate::camhook::rig_hook },
+        kind: "diagnosis",
+        why: "the `cam` command lists the camera rigs and their controllers",
+        only_with: Some("DS_CAMDEBUG"),
     },
 ];
 
@@ -109,6 +152,9 @@ pub fn apply(p: &mut crate::patch::Patcher, ranges: &[(u64, u64)]) {
         return;
     }
     for (i, f) in FIXES.iter().enumerate() {
+        if f.only_with.is_some_and(|v| std::env::var_os(v).is_none()) {
+            continue;
+        }
         if p.image.get(f.offset..f.offset + f.from.len()) != Some(f.from) {
             crate::warn!("title fix '{}': unexpected bytes at eboot+{:#x} (another title version?); not applied", f.name, f.offset);
             continue;
@@ -129,6 +175,10 @@ pub fn apply(p: &mut crate::patch::Patcher, ranges: &[(u64, u64)]) {
     if (1..=3).all(|i| APPLIED[i].load(Ordering::Relaxed)) {
         crate::jobidle::enable();
     }
+    // Raw mouse look needs both of its hooks.
+    if (4..=5).all(|i| APPLIED[i].load(Ordering::Relaxed)) {
+        crate::camhook::enable();
+    }
 }
 
 /// For the status report: how often the applied fixes' code ran.
@@ -140,5 +190,5 @@ pub fn status() -> String {
         .map(|(i, f)| format!("'{}' ran {} times", f.name, RUNS[i].load(Ordering::Relaxed)))
         .collect();
     let fixes = if runs.is_empty() { String::new() } else { format!("    title fixes: {}\n", runs.join(", ")) };
-    fixes + &crate::jobidle::status()
+    fixes + &crate::jobidle::status() + &crate::camhook::status()
 }

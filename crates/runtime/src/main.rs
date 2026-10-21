@@ -16,6 +16,7 @@ mod mem;
 mod sections;
 mod patch;
 mod jobidle;
+mod camhook;
 mod thread;
 mod titlefix;
 mod titlemem;
@@ -206,6 +207,8 @@ fn prune_runs(runs: &Path, keep: usize) {
 ///   fscan start|changed|same|floats [+|-|=|*]  search the title's flexible memory for a value by
 ///                            how it changes (pages, then f32 values; see `fscan`)
 ///   fmat                     yaw-only rotation matrices in the title's flexible memory (see `fmat`)
+///   cam                      the gameplay camera's controllers (raw mouse look), with
+///                            DS_CAMDEBUG=1 also its rigs
 ///   shot <name>              screenshot of the next presented flip -> shot_<name>.png
 ///   dump                     dump all GPU images at the next flip
 ///   trace                    log every draw/dispatch of an upcoming flip (FRAME lines)
@@ -218,6 +221,7 @@ fn prune_runs(runs: &Path, keep: usize) {
 ///   watch <slot> <addr>|off [w|rw] [len] [all|guest]  hardware watchpoint (DR0-3) at run time
 ///   findstr <text>           guest addresses holding that ASCII text (first 64)
 ///   poke <addr> <u64> [<mask>]  write guest memory (experiments; logged)
+///   note <text>              log the text (a marker for scripted runs)
 ///   quit                     orderly shutdown
 fn poll_control(path: &Path, offset: &mut u64) {
     use std::io::{Read, Seek, SeekFrom};
@@ -330,6 +334,17 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 }
             }
             "fmat" => fmat(),
+            "note" => {
+                // A marker in the log for scripted runs.
+                info!("control: note {}", parts.by_ref().collect::<Vec<_>>().join(" "));
+                Ok(())
+            }
+            "cam" => {
+                // Debug: the gameplay camera's controllers (`camhook`) and,
+                // with DS_CAMDEBUG=1, its rigs.
+                info!("cam: {}", camhook::describe());
+                Ok(())
+            }
             "fscan" => {
                 // Debug (finding a value the title keeps, e.g. the camera's
                 // angles): `fscan start` hashes the pages of the title's
