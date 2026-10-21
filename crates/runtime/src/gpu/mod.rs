@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 145] = [
+    static ALL: [Tunable; 148] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -172,6 +172,9 @@ pub mod tune {
         Tunable { name: "xwait_skip", env: "DS_XWAIT_SKIP", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "addresses", env: "DS_ADDRESSES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "batch_cs", env: "DS_BATCH_CS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "job_idle", env: "DS_JOB_IDLE", default: 50, value: AtomicU64::new(UNSET) },
+        Tunable { name: "job_sleep", env: "DS_JOB_SLEEP", default: 200, value: AtomicU64::new(UNSET) },
+        Tunable { name: "job_watch", env: "DS_JOB_WATCH", default: 2000, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1563,6 +1566,31 @@ pub mod tune {
     #[inline]
     pub fn batch_cs() -> bool {
         get(144) != 0 && super::vk::ctx().device_addresses
+    }
+
+    /// The title's job workers without work (`jobidle`): microseconds a
+    /// worker finds nothing to run before it sleeps between looks (one such
+    /// worker, the watcher, keeps looking); 0: the title's own polling.
+    /// Default 50: at the gate +7.8% flips/s, -8.5% CPU per command, the
+    /// process ~6 logical CPUs instead of ~17; on 8 logical CPUs ~20 flips/s
+    /// instead of ~6 and no audio underruns (FINDINGS.md 2026-10-21).
+    #[inline]
+    pub fn job_idle() -> u64 {
+        get(145)
+    }
+
+    /// Microseconds such a worker sleeps before each further look
+    /// (`job_idle`).
+    #[inline]
+    pub fn job_sleep() -> u64 {
+        get(146)
+    }
+
+    /// Microseconds one such worker at a time looks without sleeps (the
+    /// watch rotates; 0: no watcher; `job_idle`).
+    #[inline]
+    pub fn job_watch() -> u64 {
+        get(147)
     }
 
     /// A switch's value by name; None if unknown.

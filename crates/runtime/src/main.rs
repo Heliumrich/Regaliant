@@ -15,6 +15,7 @@ mod loader;
 mod mem;
 mod sections;
 mod patch;
+mod jobidle;
 mod thread;
 mod titlefix;
 mod titlemem;
