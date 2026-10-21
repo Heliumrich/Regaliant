@@ -205,6 +205,7 @@ fn prune_runs(runs: &Path, keep: usize) {
 ///   find32 <hex u32>|<lo>-<hi>  guest addresses (4-byte aligned) holding a 32-bit value (first 64)
 ///   fscan start|changed|same|floats [+|-|=|*]  search the title's flexible memory for a value by
 ///                            how it changes (pages, then f32 values; see `fscan`)
+///   fmat                     yaw-only rotation matrices in the title's flexible memory (see `fmat`)
 ///   shot <name>              screenshot of the next presented flip -> shot_<name>.png
 ///   dump                     dump all GPU images at the next flip
 ///   trace                    log every draw/dispatch of an upcoming flip (FRAME lines)
@@ -328,6 +329,7 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     None => Err("usage: find <hex u64> | <hex lo>-<hex hi>".into()),
                 }
             }
+            "fmat" => fmat(),
             "fscan" => {
                 // Debug (finding a value the title keeps, e.g. the camera's
                 // angles): `fscan start` hashes the pages of the title's
@@ -795,6 +797,35 @@ fn page_hash(a: u64) -> u64 {
         h = (h ^ unsafe { p.add(i).read_volatile() }).wrapping_mul(0x100_0000_01b3);
     }
     h
+}
+
+/// Debug (finding the gameplay camera's frame): 4x4 f32 matrices in the
+/// title's flexible memory whose upper 3x3 is a rotation about the vertical
+/// axis only (rows [c 0 s] [0 1 0] [-s 0 c], 16 bytes apart, c*c + s*s = 1,
+/// not the identity); logs each with c, s and its fourth row (translation),
+/// at most 64.
+fn fmat() -> Result<(), String> {
+    let t0 = Instant::now();
+    let spans: Vec<(u64, u64)> = mem::MEM.lock().vmas.values().filter(|m| m.kind == mem::VmaKind::Flexible && m.prot & 3 == 3).map(|m| (m.start, m.end())).collect();
+    let rd = |a: u64| f32::from_bits(unsafe { (a as *const u32).read_volatile() });
+    let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+    let mut found: Vec<String> = Vec::new();
+    let mut n = 0usize;
+    for (lo, hi) in spans {
+        let mut a = lo.next_multiple_of(16);
+        while a + 64 <= hi {
+            let (c, s) = (rd(a), rd(a + 8));
+            if c.is_finite() && s.is_finite() && c.abs() <= 1.0 && s.abs() > 1e-3 && near(c * c + s * s, 1.0) && near(rd(a + 0x28), c) && near(rd(a + 0x20), -s) && near(rd(a + 0x14), 1.0) && near(rd(a + 4), 0.0) && near(rd(a + 0x10), 0.0) && near(rd(a + 0x18), 0.0) && near(rd(a + 0x24), 0.0) {
+                n += 1;
+                if found.len() < 64 {
+                    found.push(format!("{a:#x} c {c:.5} s {s:.5} t ({:.3}, {:.3}, {:.3})", rd(a + 0x30), rd(a + 0x34), rd(a + 0x38)));
+                }
+            }
+            a += 16;
+        }
+    }
+    info!("fmat: {n} yaw matrices ({} ms): {}", t0.elapsed().as_millis(), found.join("; "));
+    Ok(())
 }
 
 fn fscan(cmd: &str, arg: &str) -> Result<(), String> {

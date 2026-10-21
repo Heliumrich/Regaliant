@@ -2281,6 +2281,22 @@ static MERGE_BY: Mutex<Option<HashMap<(u64, u64), [u64; 3]>>> = Mutex::new(None)
 /// The flip MERGE_BY started counting at.
 static MERGE_FROM: AtomicU64 = AtomicU64::new(0);
 
+/// Buffer fills in place by range (DS_PROFILE_GPU): (base, len) -> [fills, value].
+static FILL_BY: Mutex<Option<HashMap<(u64, u64), [u64; 2]>>> = Mutex::new(None);
+
+fn fill_by_lines(flips: u64) -> String {
+    let g = FILL_BY.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(&(u64, u64), &[u64; 2])> = m.iter().collect();
+    v.sort_by(|a, b| (b.1[0] * b.0 .1).cmp(&(a.1[0] * a.0 .1)));
+    let total: u64 = v.iter().map(|x| x.1[0]).sum();
+    let bytes: u64 = v.iter().map(|x| x.1[0] * x.0 .1).sum();
+    let per = |n: u64| n as f64 / flips.max(1) as f64;
+    let parts: Vec<String> = v.iter().take(12).map(|((b, n), x)| format!("{b:#x}+{n:#x} (value {:#x}) {:.1}", x[1], per(x[0]))).collect();
+    format!("    buffer fills in place by range, per flip ({:.1} in all, {:.2} MiB, {} ranges): {}
+", per(total), per(bytes) / 1048576.0, v.len(), parts.join(", "))
+}
+
 fn merge_by_lines(flips: u64) -> String {
     let g = MERGE_BY.lock();
     let Some(m) = g.as_ref() else { return String::new() };
@@ -4943,6 +4959,7 @@ pub fn reset_shader_profile() {
     *SHADER_PLACEMENTS.lock() = None;
     *SEG_TIME.lock() = None;
     *MERGE_BY.lock() = None;
+    *FILL_BY.lock() = None;
     *FLUSH_SITES.lock() = None;
     MERGE_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
     *SEG_EMPTY.lock() = None;
@@ -5014,6 +5031,7 @@ pub fn shader_profile() -> String {
         s.push_str(&seg_lines());
     }
     s.push_str(&merge_by_lines(super::FRAMES.load(Ordering::Relaxed).saturating_sub(MERGE_FROM.load(Ordering::Relaxed))));
+    s.push_str(&fill_by_lines(super::FRAMES.load(Ordering::Relaxed).saturating_sub(MERGE_FROM.load(Ordering::Relaxed))));
     s.push_str(&flush_site_lines(super::FRAMES.load(Ordering::Relaxed).saturating_sub(MERGE_FROM.load(Ordering::Relaxed))));
     s.push_str(&batch_by_lines());
     s.push_str(&begin_stats_line());
@@ -7235,6 +7253,12 @@ impl Exec {
             self.dispatched = false;
         }
         unsafe { ctx().device.cmd_fill_buffer(cmd, buffer, base - start, len, v) };
+        if profiling() {
+            let mut g = FILL_BY.lock();
+            let e = g.get_or_insert_with(HashMap::new).entry((base, len)).or_insert([0, 0]);
+            e[0] += 1;
+            e[1] = v as u64;
+        }
         self.ops[OP_FILLS] += 1;
         self.ops[OP_FILL_BYTES] += len;
         if !lazy_barriers() {
