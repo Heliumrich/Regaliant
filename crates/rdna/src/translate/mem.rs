@@ -1869,9 +1869,7 @@ fn record_lod(tr: &mut T, ins: &Inst, image: Word, simg: Word, coord: Word, rdim
             let base = tr.u(super::lod_info_offset(&tr.plan) + super::IMAGE_TABLE_LEN * super::table_slot(&tr.plan, r));
             let i = e(tr.b.i_add(u, None, base, idx))?;
             let i = tr.sgpr_index(i)?;
-            let z = tr.u(0);
-            let p = e(tr.b.access_chain(tr.t.sb_u32, None, tr.sgpr_data, [z, i]))?;
-            e(tr.b.load(u, None, p, None, []))?
+            tr.sgpr_raw(i)?
         }
         None => tr.res_info(r, 0)?,
     };

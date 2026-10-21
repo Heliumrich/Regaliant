@@ -98,6 +98,154 @@ fn build_merge() -> Result<Vec<u32>, rspirv::dr::Error> {
     Ok(b.module().assemble())
 }
 
+/// Dwords per entry of `shadow_merge_many`'s table.
+pub const MERGE_ENTRY_DWORDS: u32 = 8;
+/// Entries one `shadow_merge_many` dispatch takes (its search's reach).
+pub const MERGE_MANY_MAX: u32 = 256;
+
+/// The write-back of several shadows in one dispatch (`shadow_merge` for
+/// each): binding 0 holds their working and pristine copies, binding 1 the
+/// table: `n` entries (push constant 1, at most MERGE_MANY_MAX) from dword
+/// `at` (push constant 0), MERGE_ENTRY_DWORDS each: [first workgroup, the
+/// working copy's dword offset in binding 0, the pristine copy's, first
+/// dword, end dword, the destination's device address (low, high: guest
+/// memory at the copy's start), 0], in increasing first-workgroup order from
+/// 0. Workgroup g takes the last entry whose first workgroup is at most g
+/// (an unrolled binary search) and its dwords first + (g - first workgroup)
+/// * MERGE_LOCAL_SIZE + local x below end: one that differs from its
+/// pristine copy is stored to the destination + 4 * index.
+pub fn shadow_merge_many() -> Vec<u32> {
+    build_merge_many().expect("shadow merge (many) kernel")
+}
+
+fn build_merge_many() -> Result<Vec<u32>, rspirv::dr::Error> {
+    let lit = Operand::LiteralBit32;
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.capability(Capability::Int64);
+    b.capability(Capability::PhysicalStorageBufferAddresses);
+    b.extension("SPV_KHR_storage_buffer_storage_class");
+    b.extension("SPV_KHR_physical_storage_buffer");
+    b.memory_model(spirv::AddressingModel::PhysicalStorageBuffer64, spirv::MemoryModel::GLSL450);
+    let void = b.type_void();
+    let bool_ = b.type_bool();
+    let u32t = b.type_int(32, 0);
+    let u64t = b.type_int(64, 0);
+    let v3 = b.type_vector(u32t, 3);
+    let rta = b.type_runtime_array(u32t);
+    b.decorate(rta, Decoration::ArrayStride, [lit(4)]);
+    let st = b.type_struct([rta]);
+    b.decorate(st, Decoration::Block, []);
+    b.member_decorate(st, 0, Decoration::Offset, [lit(0)]);
+    let p_st = b.type_pointer(None, StorageClass::StorageBuffer, st);
+    let p_u = b.type_pointer(None, StorageClass::StorageBuffer, u32t);
+    let p_dev = b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u32t);
+    let pc = b.type_struct([u32t, u32t]);
+    b.decorate(pc, Decoration::Block, []);
+    b.member_decorate(pc, 0, Decoration::Offset, [lit(0)]);
+    b.member_decorate(pc, 1, Decoration::Offset, [lit(4)]);
+    let p_pc = b.type_pointer(None, StorageClass::PushConstant, pc);
+    let p_pcu = b.type_pointer(None, StorageClass::PushConstant, u32t);
+    let p_in = b.type_pointer(None, StorageClass::Input, v3);
+    let lid_v = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(lid_v, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::LocalInvocationId)]);
+    let wid_v = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(wid_v, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::WorkgroupId)]);
+    let mut bufs = [0; 2];
+    for (i, v) in bufs.iter_mut().enumerate() {
+        *v = global(&mut b, p_st, StorageClass::StorageBuffer);
+        b.decorate(*v, Decoration::DescriptorSet, [lit(0)]);
+        b.decorate(*v, Decoration::Binding, [lit(i as u32)]);
+        b.decorate(*v, Decoration::NonWritable, []);
+    }
+    let (copies, table) = (bufs[0], bufs[1]);
+    let pcv = global(&mut b, p_pc, StorageClass::PushConstant);
+    let c = |b: &mut Builder, v: u32| b.constant_bit32(u32t, v);
+    let (c0, c1, c4) = (c(&mut b, 0), c(&mut b, 1), c(&mut b, 4));
+    let c32_64 = b.constant_bit64(u64t, 32);
+    let ced = c(&mut b, MERGE_ENTRY_DWORDS);
+    let cls = c(&mut b, MERGE_LOCAL_SIZE);
+    let fty = b.type_function(void, []);
+    let f = b.begin_function(void, None, FunctionControl::NONE, fty)?;
+    b.begin_block(None)?;
+    let l = b.load(v3, None, lid_v, None, [])?;
+    let lx = b.composite_extract(u32t, None, l, [0])?;
+    let w = b.load(v3, None, wid_v, None, [])?;
+    let g = b.composite_extract(u32t, None, w, [0])?;
+    let pa = b.access_chain(p_pcu, None, pcv, [c0])?;
+    let at = b.load(u32t, None, pa, None, [])?;
+    let pn = b.access_chain(p_pcu, None, pcv, [c1])?;
+    let n = b.load(u32t, None, pn, None, [])?;
+    let word = |b: &mut Builder, e: Word, k: u32| -> Result<Word, rspirv::dr::Error> {
+        let ck = b.constant_bit32(u32t, k);
+        let base = b.i_mul(u32t, None, e, ced)?;
+        let i = b.i_add(u32t, None, at, base)?;
+        let i = b.i_add(u32t, None, i, ck)?;
+        let p = b.access_chain(p_u, None, table, [c0, i])?;
+        b.load(u32t, None, p, None, [])
+    };
+    // The last entry whose first workgroup is at most g.
+    let mut lo = c0;
+    let mut step = MERGE_MANY_MAX / 2;
+    while step > 0 {
+        let cs = b.constant_bit32(u32t, step);
+        let cand = b.i_add(u32t, None, lo, cs)?;
+        let inr = b.u_less_than(bool_, None, cand, n)?;
+        // Entries past n are not read (their index is clamped to 0).
+        let safe = b.select(u32t, None, inr, cand, c0)?;
+        let wg = word(&mut b, safe, 0)?;
+        let le = b.u_less_than_equal(bool_, None, wg, g)?;
+        let take = b.logical_and(bool_, None, inr, le)?;
+        lo = b.select(u32t, None, take, cand, lo)?;
+        step /= 2;
+    }
+    let wg0 = word(&mut b, lo, 0)?;
+    let wdw = word(&mut b, lo, 1)?;
+    let pdw = word(&mut b, lo, 2)?;
+    let first = word(&mut b, lo, 3)?;
+    let end = word(&mut b, lo, 4)?;
+    let dlo = word(&mut b, lo, 5)?;
+    let dhi = word(&mut b, lo, 6)?;
+    let rel = b.i_sub(u32t, None, g, wg0)?;
+    let rel = b.i_mul(u32t, None, rel, cls)?;
+    let i = b.i_add(u32t, None, first, rel)?;
+    let i = b.i_add(u32t, None, i, lx)?;
+    let inside = b.u_less_than(bool_, None, i, end)?;
+    let (l_body, l_store, l_join, l_end) = (b.id(), b.id(), b.id(), b.id());
+    b.selection_merge(l_end, SelectionControl::NONE)?;
+    b.branch_conditional(inside, l_body, l_end, [])?;
+    b.begin_block(Some(l_body))?;
+    let wi = b.i_add(u32t, None, wdw, i)?;
+    let pw = b.access_chain(p_u, None, copies, [c0, wi])?;
+    let wv = b.load(u32t, None, pw, None, [])?;
+    let pi = b.i_add(u32t, None, pdw, i)?;
+    let pp = b.access_chain(p_u, None, copies, [c0, pi])?;
+    let old = b.load(u32t, None, pp, None, [])?;
+    let changed = b.i_not_equal(bool_, None, wv, old)?;
+    b.selection_merge(l_join, SelectionControl::NONE)?;
+    b.branch_conditional(changed, l_store, l_join, [])?;
+    b.begin_block(Some(l_store))?;
+    let lo64 = b.u_convert(u64t, None, dlo)?;
+    let hi64 = b.u_convert(u64t, None, dhi)?;
+    let hi64 = b.shift_left_logical(u64t, None, hi64, c32_64)?;
+    let base = b.bitwise_or(u64t, None, lo64, hi64)?;
+    let i4 = b.i_mul(u32t, None, i, c4)?;
+    let i64_ = b.u_convert(u64t, None, i4)?;
+    let a = b.i_add(u64t, None, base, i64_)?;
+    let ptr = b.convert_u_to_ptr(p_dev, None, a)?;
+    b.store(ptr, wv, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+    b.branch(l_join)?;
+    b.begin_block(Some(l_join))?;
+    b.branch(l_end)?;
+    b.begin_block(Some(l_end))?;
+    b.ret()?;
+    b.end_function()?;
+    b.entry_point(ExecutionModel::GLCompute, f, "main", [lid_v, wid_v]);
+    b.execution_mode(f, ExecutionMode::LocalSize, [MERGE_LOCAL_SIZE, 1, 1]);
+    Ok(b.module().assemble())
+}
+
 /// The written-bit map's layout (`Spec::write_marks`), in u32 words of its
 /// buffer: one bit per dword of the mirror's span (MARK_SPAN_BYTES), then
 /// one bit per 4 KiB page of it (pages with marks in the batch running),
@@ -535,6 +683,15 @@ mod tests {
         if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
             let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("shadow_merge.spv"), bytes).unwrap();
+        }
+    }
+    #[test]
+    fn merge_many_kernel_assembles() {
+        let w = super::shadow_merge_many();
+        assert_eq!(w[0], 0x0723_0203);
+        if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("shadow_merge_many.spv"), bytes).unwrap();
         }
     }
 }

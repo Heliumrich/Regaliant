@@ -1603,6 +1603,7 @@ pub fn record_bench(capture: &str, shader: Option<u64>) -> i32 {
 fn descriptor_type(k: BindingKind) -> vk::DescriptorType {
     match k {
         BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Address(_) | BindingKind::Gds | BindingKind::Debug | BindingKind::Watchdog | BindingKind::LodStats | BindingKind::Marks => vk::DescriptorType::STORAGE_BUFFER,
+        BindingKind::SgprUniform => vk::DescriptorType::UNIFORM_BUFFER,
         BindingKind::Image(_) | BindingKind::ImageArray(_) => vk::DescriptorType::SAMPLED_IMAGE,
         BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_) => vk::DescriptorType::STORAGE_IMAGE,
         BindingKind::Sampler(_) | BindingKind::CompareSampler(_) => vk::DescriptorType::SAMPLER,
@@ -1624,7 +1625,7 @@ fn descriptor_writes(set: vk::DescriptorSet, bounds: &[Bound]) -> Vec<vk::WriteD
     let mut writes: Vec<vk::WriteDescriptorSet> = Vec::with_capacity(bounds.iter().map(|b| b.bufs.len() + b.imgs.len() + b.img_arrays.len()).sum());
     for b in bounds {
         for (binding, info) in &b.bufs {
-            writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)));
+            writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(b.buffer_type(*binding)).buffer_info(std::slice::from_ref(info)));
         }
         for (binding, ty, info) in &b.imgs {
             writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(*ty).image_info(std::slice::from_ref(info)));
@@ -1766,7 +1767,7 @@ fn bind_descriptors(cmd: vk::CommandBuffer, at: vk::PipelineBindPoint, layout: v
             for b in bounds {
                 for (binding, info) in &b.bufs {
                     if !keep(*binding, PushedDesc::Buffer(info.buffer, info.offset, info.range)) {
-                        buf[k].write(vk::WriteDescriptorSet::default().dst_binding(*binding).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)));
+                        buf[k].write(vk::WriteDescriptorSet::default().dst_binding(*binding).descriptor_type(b.buffer_type(*binding)).buffer_info(std::slice::from_ref(info)));
                         k += 1;
                     }
                 }
@@ -1927,8 +1928,8 @@ fn global_barrier(cmd: vk::CommandBuffer) {
 /// SGPR data ring space per slot.
 const RING_SEG: u64 = 4 << 20;
 /// Descriptor pool of a slot: sets, then descriptors of each POOL_TYPES type.
-const POOL_LIMITS: [u32; 5] = [4096, 32768, 8192, 2048, 8192];
-const POOL_TYPES: [vk::DescriptorType; 4] = [vk::DescriptorType::STORAGE_BUFFER, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorType::STORAGE_IMAGE, vk::DescriptorType::SAMPLER];
+const POOL_LIMITS: [u32; 6] = [4096, 32768, 8192, 2048, 8192, 4096];
+const POOL_TYPES: [vk::DescriptorType; 5] = [vk::DescriptorType::STORAGE_BUFFER, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorType::STORAGE_IMAGE, vk::DescriptorType::SAMPLER, vk::DescriptorType::UNIFORM_BUFFER];
 
 /// `DS_TRACE_CS=<hex address>[,...]`: logs those compute shaders' scalar-load
 /// values and resources whenever the loads change (diagnosing data-dependent
@@ -2002,6 +2003,23 @@ struct Bound {
     /// The stage's SGPR data offset as pushed (`Spec::sgpr_pc`): (byte
     /// offset in the push constants, dword offset in the ring).
     sgpr_base: Option<(u32, u32)>,
+    /// The binding of its SGPR data when that is a uniform buffer
+    /// (`BindingKind::SgprUniform`); its other buffers are storage buffers.
+    ubo: Option<u32>,
+    /// A batched translation's uniform window of the ring (`Spec::sgpr_ubo`
+    /// 3): its offset (the table and SGPR data offsets are relative to it).
+    window: Option<u64>,
+}
+
+impl Bound {
+    /// The descriptor type of buffer binding `binding`.
+    fn buffer_type(&self, binding: u32) -> vk::DescriptorType {
+        if self.ubo == Some(binding) {
+            vk::DescriptorType::UNIFORM_BUFFER
+        } else {
+            vk::DescriptorType::STORAGE_BUFFER
+        }
+    }
 }
 
 /// The push constant range of a pipeline layout whose stages read their
@@ -2564,6 +2582,36 @@ fn merge_pipe() -> Result<&'static MergePipe, String> {
     .as_ref()
     .map_err(|e| e.clone())
 }
+
+/// The many-shadow write-back kernel (`rdna::kernels::shadow_merge_many`):
+/// binding 0 the shadows, binding 1 its table; push constants {at, n}.
+fn merge_many_pipe() -> Result<&'static MergePipe, String> {
+    static PIPE: std::sync::OnceLock<Result<MergePipe, String>> = std::sync::OnceLock::new();
+    PIPE.get_or_init(|| {
+        let c = ctx();
+        unsafe {
+            let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..2)
+                .map(|b| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
+                .collect();
+            let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("merge-many set layout: {e}"))?;
+            let layouts = [set_layout];
+            let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 8 }];
+            let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("merge-many layout: {e}"))?;
+            let code = rdna::kernels::shadow_merge_many();
+            let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("merge-many module: {e}"))?;
+            let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+            let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
+            let pipeline = super::pcache::with_cache('i', 2, |cache| c.device.create_compute_pipelines(cache, &[ci], None)).map_err(|(_, e)| format!("merge-many pipeline: {e}"));
+            c.device.destroy_shader_module(module, None);
+            Ok(MergePipe { pipeline: pipeline?[0], layout, set_layout })
+        }
+    })
+    .as_ref()
+    .map_err(|e| e.clone())
+}
+
+/// Write-backs merged by one dispatch (`tune merge_many`): [dispatches, shadows].
+static MERGE_MANY: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Mirror mode's write-back kernel (`rdna::kernels::mirror_gather`).
 fn gather_pipe() -> Result<&'static MergePipe, String> {
@@ -3758,7 +3806,7 @@ impl Slot {
             };
             // SGPR data in system memory: a copy in video memory, read by
             // every invocation, made no measurable difference (`tune ring_vram`).
-            let (ring, _mem, ring_ptr) = c.host_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER)?;
+            let (ring, _mem, ring_ptr) = c.host_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER)?;
             SLOT_MEM[0].fetch_add(1, Ordering::Relaxed);
             SLOT_MEM[5].fetch_add(RING_SEG, Ordering::Relaxed);
             Ok(Slot {
@@ -5120,6 +5168,8 @@ pub struct Exec {
     xcopies: Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>,
     copy_wait: u64,
     ring_align: u64,
+    /// Offset alignment of SGPR data bound as a uniform buffer.
+    ubo_align: u64,
     recording: bool,
     /// When the batch being recorded was begun.
     begun_at: std::time::Instant,
@@ -5209,7 +5259,7 @@ pub struct Exec {
     /// A draw's stage bindings (the vector reused).
     draw_bounds: Vec<Bound>,
     /// Descriptor pool usage of the recording slot (see POOL_LIMITS).
-    pool_use: [u32; 5],
+    pool_use: [u32; 6],
     /// Shadow space used in the recording slot.
     shadow_used: u64,
     /// Shadows of this batch whose working copies hold newer data than
@@ -5362,7 +5412,13 @@ struct CsRun {
     args: *mut u32,
     table: *mut u32,
     groups: u32,
+    /// The ring and its uniform window (`Bound::window`; 0 without one).
+    ring: vk::Buffer,
+    window: u64,
 }
+
+/// Bytes of a batched translation's uniform window of the ring.
+const SGPR_WINDOW_BYTES: u64 = 4 * rdna::translate::SGPR_WINDOW_DWORDS as u64;
 
 /// [commands appended to an open batched dispatch, batched dispatches
 /// recorded, commands of batched programs run on their own].
@@ -5504,6 +5560,7 @@ impl Exec {
                 xcopies: Vec::new(),
                 copy_wait: 0,
                 ring_align: c.limits.min_storage_buffer_offset_alignment.max(16),
+                ubo_align: c.limits.min_uniform_buffer_offset_alignment.max(c.limits.min_storage_buffer_offset_alignment).max(16),
                 recording: false,
                 begun_at: std::time::Instant::now(),
                 begun_mark: None,
@@ -5542,7 +5599,7 @@ impl Exec {
                 dirty_reads: Vec::new(),
                 last_notes: (Vec::new(), Vec::new(), [u64::MAX; 4]),
                 draw_bounds: Vec::new(),
-                pool_use: [0; 5],
+                pool_use: [0; 6],
                 shadow_used: 0,
                 resident: Vec::new(),
                 sync_readers: [0; 2],
@@ -5869,7 +5926,7 @@ impl Exec {
         self.dyncache = Default::default();
         self.begun_at = std::time::Instant::now();
         self.begun_mark = super::timeline::mark();
-        self.pool_use = [0; 5];
+        self.pool_use = [0; 6];
         self.ts_used = 0;
         self.ops = [0; OPS];
         self.ts_deferred.clear();
@@ -7146,6 +7203,8 @@ impl Exec {
         b.placements.clear();
         b.in_place.clear();
         b.sgpr_base = None;
+        b.ubo = None;
+        b.window = None;
         self.bound_pool.push(b);
     }
 
@@ -8504,7 +8563,8 @@ impl Exec {
         let merge = if shadow_merge() { Some(merge_pipe()?) } else { None };
         // Diagnosis (`tune skip_copies 2`): the merges left out (timing only).
         let flushing: &[Shadow] = if super::tune::skip_copies() & 2 != 0 { &[] } else { &flush };
-        for sh in flushing {
+        let many = merge.is_some() && flushing.len() > 1 && super::tune::merge_many() && c.device_addresses && self.merge_many(flushing)?;
+        for sh in flushing.iter().filter(|_| !many) {
             let own = sh.size.min(sh.range - sh.bias);
             match merge {
                 Some(m) => {
@@ -8561,6 +8621,65 @@ impl Exec {
         self.dispatched = false;
         MERGES.fetch_add(flush.len() as u64, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// The write-back of `flushing` by one dispatch per MERGE_MANY_MAX
+    /// shadows (`tune merge_many`): a table in the ring, destinations by
+    /// device address. False when that is not possible here (no ring room,
+    /// an import without an address): the per-shadow merges run instead.
+    fn merge_many(&mut self, flushing: &[Shadow]) -> Result<bool, String> {
+        use rdna::kernels::{MERGE_ENTRY_DWORDS, MERGE_LOCAL_SIZE, MERGE_MANY_MAX};
+        let c = ctx();
+        let Ok(m) = merge_many_pipe() else { return Ok(false) };
+        let Some((ring, ring_ptr)) = self.slots[self.cur].rings[0] else { return Ok(false) };
+        let mut entries: Vec<[u32; MERGE_ENTRY_DWORDS as usize]> = Vec::with_capacity(flushing.len());
+        for sh in flushing {
+            let va = c.buffer_address(sh.host);
+            if va == 0 {
+                return Ok(false);
+            }
+            let own = sh.size.min(sh.range - sh.bias);
+            let first = (sh.bias / 4) as u32;
+            let end = ((sh.bias + own).div_ceil(4)).min(sh.range / 4) as u32;
+            let dst = va + sh.host_off;
+            entries.push([0, (sh.shadow_off / 4) as u32, (sh.pristine_off / 4) as u32, first, end, dst as u32, (dst >> 32) as u32, 0]);
+        }
+        let bytes = 4 * MERGE_ENTRY_DWORDS as u64 * entries.len() as u64;
+        let Some(off) = self.ring_alloc(0, bytes) else { return Ok(false) };
+        // Chunks of MERGE_MANY_MAX entries, each a dispatch whose first
+        // workgroup is 0: (first entry, entries, workgroups).
+        let mut chunks: Vec<(u32, u32, u32)> = Vec::new();
+        for (k, chunk) in entries.chunks_mut(MERGE_MANY_MAX as usize).enumerate() {
+            let mut wg = 0u32;
+            for e in chunk.iter_mut() {
+                e[0] = wg;
+                wg += e[4].saturating_sub(e[3]).div_ceil(MERGE_LOCAL_SIZE).max(1);
+            }
+            chunks.push((k as u32 * MERGE_MANY_MAX, chunk.len() as u32, wg));
+        }
+        unsafe { std::ptr::copy_nonoverlapping(entries.as_ptr() as *const u8, ring_ptr.add(off as usize), bytes as usize) };
+        let set = self.alloc_set(m.set_layout)?;
+        let infos = [vk::DescriptorBufferInfo { buffer: self.shadow(), offset: 0, range: vk::WHOLE_SIZE }, vk::DescriptorBufferInfo { buffer: ring, offset: off, range: bytes }];
+        let writes: Vec<vk::WriteDescriptorSet> = infos
+            .iter()
+            .enumerate()
+            .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
+            .collect();
+        unsafe {
+            let cmd = self.cmd();
+            c.device.update_descriptor_sets(&writes, &[]);
+            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, m.pipeline);
+            c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, m.layout, 0, &[set], &[]);
+            for &(first, n, wg) in &chunks {
+                let pc: Vec<u8> = [first * MERGE_ENTRY_DWORDS, n].iter().flat_map(|x| x.to_le_bytes()).collect();
+                c.device.cmd_push_constants(cmd, m.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
+                c.device.cmd_dispatch(cmd, wg.max(1), 1, 1);
+            }
+        }
+        self.dyncache.cs_pipeline = m.pipeline;
+        MERGE_MANY[0].fetch_add(chunks.len() as u64, Ordering::Relaxed);
+        MERGE_MANY[1].fetch_add(flushing.len() as u64, Ordering::Relaxed);
+        Ok(true)
     }
 
     /// After the merge of `flush` (recorded): the working copies of the
@@ -8670,8 +8789,13 @@ impl Exec {
 
     /// Allocates SGPR data space in the current slot's ring segment.
     fn ring_alloc(&mut self, which: usize, bytes: u64) -> Option<u64> {
+        self.ring_alloc_at(which, bytes, self.ring_align)
+    }
+
+    /// `ring_alloc` at a multiple of `align`.
+    fn ring_alloc_at(&mut self, which: usize, bytes: u64, align: u64) -> Option<u64> {
         let seg = RING_SEG;
-        let off = self.ring_used[which].next_multiple_of(self.ring_align);
+        let off = self.ring_used[which].next_multiple_of(align);
         if off + bytes > seg {
             return None;
         }
@@ -8687,10 +8811,11 @@ impl Exec {
         if !self.recording {
             return;
         }
-        let mut need = [if push { 0 } else { stages.len() as u32 }, 0, 0, 0, 0];
+        let mut need = [if push { 0 } else { stages.len() as u32 }, 0, 0, 0, 0, 0];
         let mut ring = 0u64;
         for p in stages {
-            ring += 4 * p.sgpr_data.len() as u64 + self.ring_align;
+            // Room for the uniform buffer's alignment and 16-byte rounding.
+            ring += 4 * p.sgpr_data.len() as u64 + self.ubo_align + 16;
             if push {
                 continue;
             }
@@ -8724,7 +8849,7 @@ impl Exec {
         }
         let seg = RING_SEG;
         let fits = self.ring_used.iter().all(|u| u.next_multiple_of(self.ring_align) + ring <= seg)
-            && (0..5).all(|k| self.pool_use[k] + need[k] <= POOL_LIMITS[k])
+            && (0..6).all(|k| self.pool_use[k] + need[k] <= POOL_LIMITS[k])
             && (shadow == 0 || self.shadow_used + shadow <= self.slots[self.cur].shadow_cap || self.shadow_room(self.shadow_used + shadow));
         if !fits {
             self.submit_for("full");
@@ -8733,7 +8858,7 @@ impl Exec {
                 return;
             }
         }
-        for k in 0..5 {
+        for k in 0..6 {
             self.pool_use[k] += need[k];
         }
     }
@@ -9474,7 +9599,7 @@ impl Exec {
             _ => false,
         };
         if vram && self.slots[self.cur].rings[1].is_none() && !self.vram_ring_failed {
-            match ctx().bar_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER) {
+            match ctx().bar_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER) {
                 Ok((b, _m, p)) => {
                     SLOT_MEM[4].fetch_add(RING_SEG, Ordering::Relaxed);
                     self.slots[self.cur].rings[1] = Some((b, p))
@@ -9487,19 +9612,59 @@ impl Exec {
         }
         let which = if vram && self.slots[self.cur].rings[1].is_some() { 1 } else { 0 };
         let Some((ring, ring_ptr)) = self.slots[self.cur].rings[which] else { return Err("no SGPR data ring".into()) };
-        let off = self.ring_alloc(which, bytes.len() as u64).ok_or("SGPR data ring exhausted")?;
+        // A uniform buffer (`Spec::sgpr_ubo`) is bound at its alignment, with
+        // the translation's whole uvec4 array (16-byte rounding).
+        let ubo = p.tr.out.bindings.iter().any(|b| b.kind == BindingKind::SgprUniform);
+        let pc = p.tr.out.sgpr_pc;
+        // A batched translation's uniform window of the ring (`Spec::sgpr_ubo`
+        // 3): its data placed as for a storage buffer.
+        let window = ubo && pc.is_some();
+        let len = bytes.len() as u64;
+        let off = if ubo && !window { self.ring_alloc_at(which, len.next_multiple_of(16), self.ubo_align) } else { self.ring_alloc(which, len) }.ok_or("SGPR data ring exhausted")?;
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ring_ptr.add(off as usize), bytes.len()) };
         // With `Spec::sgpr_pc` the whole ring, the stage adding its offset
         // (the binding then stays the same for the batch).
-        let pc = p.tr.out.sgpr_pc;
-        let (at, range) = if pc.is_some() { (0, RING_SEG) } else { (off, bytes.len() as u64) };
+        let (at, range) = if pc.is_some() { (0, RING_SEG) } else { (off, len) };
+        // The open batched run's window when this command's data lies inside
+        // it (its descriptors then match the run's), else one from here on.
+        let wb = match &self.cs_run {
+            Some(r) if window && r.batch == self.batch_count && r.ring == ring && r.window <= off && off + len <= r.window + SGPR_WINDOW_BYTES => r.window,
+            _ if window => self.window_at(off),
+            _ => 0,
+        };
         for b in &p.tr.out.bindings {
             if b.kind == BindingKind::SgprData {
                 bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: ring, offset: at, range }));
+            } else if b.kind == BindingKind::SgprUniform {
+                let (o, r) = if window { (wb, SGPR_WINDOW_BYTES) } else { (off, range.next_multiple_of(16)) };
+                bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: ring, offset: o, range: r }));
+                bound.ubo = Some(b.binding);
             }
+        }
+        if window {
+            bound.window = Some(wb);
         }
         bound.sgpr_base = pc.map(|k| (k, (off / 4) as u32));
         Ok((ring, off))
+    }
+
+    /// A uniform window of the ring that holds offset `off` (`Bound::window`):
+    /// from `off` down to the uniform alignment, inside the ring segment.
+    fn window_at(&self, off: u64) -> u64 {
+        let a = self.ubo_align;
+        (off / a * a).min((RING_SEG - SGPR_WINDOW_BYTES) / a * a)
+    }
+
+    /// Moves a command's uniform window (`Bound::window`) to `wb`.
+    fn move_window(bound: &mut Bound, wb: u64) {
+        if let (Some(_), Some(u)) = (bound.window, bound.ubo) {
+            for (b, info) in bound.bufs.iter_mut() {
+                if *b == u {
+                    info.offset = wb;
+                }
+            }
+            bound.window = Some(wb);
+        }
     }
 
     fn alloc_set(&mut self, layout: vk::DescriptorSetLayout) -> Result<vk::DescriptorSet, String> {
@@ -10017,7 +10182,8 @@ impl Exec {
         // match, else recorded as a new one (a direct 1-D dispatch) or on
         // its own.
         let simple = batched && indirect.is_none() && start == [0, 0, 0] && patches.is_none() && set.is_none() && groups[1] == 1 && groups[2] == 1 && groups[0] <= BATCH_MAX_GROUPS;
-        let item = (at / 4) as u32;
+        // SGPR data offsets are relative to the uniform window, if any.
+        let mut item = ((at - bound.window.unwrap_or(0)) / 4) as u32;
         let appended = simple
             && match self.cs_run.as_mut() {
                 Some(r) if r.batch == self.batch_count && r.uses == self.cmd_uses.get() && r.pipeline == pipeline && r.groups + groups[0] <= BATCH_MAX_GROUPS && same_descs(&bound, &r.descs) => {
@@ -10040,7 +10206,22 @@ impl Exec {
             // A new batched dispatch: its arguments and table in the ring.
             let which = if self.slots[self.cur].rings[1].is_some_and(|r| r.0 == ring) { 1 } else { 0 };
             let table_bytes = 16 + 4 * (rdna::translate::BATCH_ENTRY_DWORDS * BATCH_MAX_GROUPS) as u64;
-            let run_at = if simple { self.ring_alloc(which, table_bytes) } else { None };
+            let mut run_at = if simple { self.ring_alloc(which, table_bytes) } else { None };
+            // The table inside the uniform window: else the window moves to
+            // this command's data (the table follows it), or the dispatch
+            // runs on its own.
+            if let (Some(wb), Some(t)) = (bound.window, run_at) {
+                if t + table_bytes > wb + SGPR_WINDOW_BYTES {
+                    let nb = self.window_at(at);
+                    if t + table_bytes <= nb + SGPR_WINDOW_BYTES {
+                        Self::move_window(&mut bound, nb);
+                        item = ((at - nb) / 4) as u32;
+                    } else {
+                        run_at = None;
+                    }
+                }
+            }
+            let wbase = bound.window.unwrap_or(0);
             let ring_ptr = self.slots[self.cur].rings[which].map(|r| r.1);
             unsafe {
                 let cmd = self.cmd();
@@ -10063,10 +10244,10 @@ impl Exec {
                         args.write(groups[0]);
                         args.add(1).write(1);
                         args.add(2).write(1);
-                        let t = ((off + 16) / 4) as u32;
+                        let t = ((off + 16 - wbase) / 4) as u32;
                         c.device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &t.to_le_bytes());
                         c.device.cmd_dispatch_indirect(cmd, ring, off);
-                        self.cs_run = Some(CsRun { batch: self.batch_count, uses: self.cmd_uses.get(), pipeline, descs: desc_signature(&bound), args, table, groups: groups[0] });
+                        self.cs_run = Some(CsRun { batch: self.batch_count, uses: self.cmd_uses.get(), pipeline, descs: desc_signature(&bound), args, table, groups: groups[0], ring, window: wbase });
                         BATCHED[1].fetch_add(1, Ordering::Relaxed);
                     }
                     _ => {
@@ -10305,7 +10486,7 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; stages prepared again with GPU-side data loads {:?} ({} programs since with them); {} render passes ended into the next full barrier; GPU-performed CP writes after merging resident shadows {} (written before the merge {}); draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges, {} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; stages prepared again with GPU-side data loads {:?} ({} programs since with them); {} render passes ended into the next full barrier; GPU-performed CP writes after merging resident shadows {} (written before the merge {}); draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges ({} of them by {} dispatches of `merge_many`), {} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         SHADOW_ARGS.load(Ordering::Relaxed),
@@ -10331,6 +10512,8 @@ pub fn status() -> String {
         SHADOWS_REUSED.load(Ordering::Relaxed),
         RESIDENT_READS.load(Ordering::Relaxed),
         MERGES.load(Ordering::Relaxed),
+        MERGE_MANY[1].load(Ordering::Relaxed),
+        MERGE_MANY[0].load(Ordering::Relaxed),
         EARLY_MERGES.load(Ordering::Relaxed),
         SKIPPED.load(Ordering::Relaxed),
         draw::DRAWN.load(Ordering::Relaxed),

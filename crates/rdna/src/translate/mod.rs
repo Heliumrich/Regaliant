@@ -273,7 +273,27 @@ pub struct Spec {
     /// entry (u32::MAX: not marked; a marked binding starts at a multiple of
     /// 128 bytes of the mirror). Only dwords inside the bound range count.
     pub write_marks: bool,
+    /// How the SGPR data binding is declared: 0 a storage buffer (u32
+    /// array), 1 a uniform buffer (`BindingKind::SgprUniform`: a std140
+    /// array of uvec4 sized to the plan's SGPR data) where the binding is the
+    /// command's own range (not with `sgpr_pc` or `batched`, whose binding is
+    /// the whole ring; at most [`SGPR_UBO_MAX_DWORDS`]), else a storage
+    /// buffer decorated NonWritable; 2 a storage buffer decorated
+    /// NonWritable; 3 as 1, and batched compute translations read a uniform
+    /// buffer of [`SGPR_WINDOW_DWORDS`] (the runtime binds a window of the
+    /// ring holding the run's table and its commands' SGPR data, the table
+    /// offset and the entries relative to it). NVIDIA reads uniform buffers
+    /// through the constant cache (operands and uniform registers instead of
+    /// per-lane loads).
+    pub sgpr_ubo: u8,
 }
+
+/// The largest SGPR data a uniform-buffer binding holds (`Spec::sgpr_ubo`;
+/// Vulkan guarantees maxUniformBufferRange >= 16 KiB).
+pub const SGPR_UBO_MAX_DWORDS: u32 = 4096;
+/// A batched compute translation's uniform window of the ring
+/// (`Spec::sgpr_ubo` 3; needs maxUniformBufferRange >= 64 KiB).
+pub const SGPR_WINDOW_DWORDS: u32 = 16384;
 
 /// Dwords per workgroup in a batched dispatch's table (`Spec::batched`):
 /// the command's SGPR data offset, the workgroup's x in its command.
@@ -298,9 +318,10 @@ pub fn sgpr_pc_offset(stage: Stage) -> u32 {
     }
 }
 
-/// As derived, except that `base_instance_sgpr` and `sgpr_pc` are hashed
-/// only when set: translations and pipelines keyed by the hash of a spec
-/// without them keep their keys (pipeline cache files are named by them).
+/// As derived, except that `base_instance_sgpr`, `sgpr_pc` and the later
+/// switches are hashed only when set: translations and pipelines keyed by
+/// the hash of a spec without them keep their keys (pipeline cache files
+/// are named by them).
 impl std::hash::Hash for Spec {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.stage.hash(state);
@@ -342,6 +363,9 @@ impl std::hash::Hash for Spec {
         }
         if self.write_marks {
             0x4D41_524Bu32.hash(state);
+        }
+        if self.sgpr_ubo != 0 {
+            (0x5542_4F00u32 | self.sgpr_ubo as u32).hash(state);
         }
     }
 }
@@ -391,6 +415,8 @@ pub enum BindingKind {
     /// u32 array: user data, resolved scalar loads, resource info blocks
     /// (see [`SGPR_DATA_USER`], [`load_offsets`], [`res_info_offset`]).
     SgprData,
+    /// The same data as a uniform buffer (`Spec::sgpr_ubo`): uvec4 array.
+    SgprUniform,
     /// Raw u32 storage buffer: a V# range or a global base address.
     Buffer(usize),
     Image(usize),
@@ -604,6 +630,9 @@ pub(crate) struct T<'a> {
     pub consts: HashMap<(Word, u32), Word>,
     pub interface: Vec<Word>,
     pub sgpr_data: Word,
+    /// The SGPR data is a uniform buffer (`Spec::sgpr_ubo`): the pointer
+    /// type of its dwords (Uniform u32).
+    pub sgpr_ub: Option<Word>,
     /// The command's offset into the SGPR data binding (`Spec::sgpr_pc`),
     /// loaded in the entry block.
     pub sgpr_base: Option<Word>,
@@ -1025,16 +1054,31 @@ impl<'a> T<'a> {
 
     /// Reads dword `idx` of the SGPR data buffer.
     pub fn sgpr_data(&mut self, idx: u32) -> R<Word> {
+        if let (Some(pt), false) = (self.sgpr_ub, self.spec.batched) {
+            // A command's own uniform buffer (no command base): constant
+            // element and component.
+            let z = self.u(0);
+            let q = self.u(idx / 4);
+            let r = self.u(idx % 4);
+            let p = e(self.b.access_chain(pt, None, self.sgpr_data, [z, q, r]))?;
+            return e(self.b.load(self.t.u32, None, p, None, []));
+        }
         let i = self.u(idx);
         let i = self.sgpr_index(i)?;
-        let z = self.u(0);
-        let p = e(self.b.access_chain(self.t.sb_u32, None, self.sgpr_data, [z, i]))?;
-        e(self.b.load(self.t.u32, None, p, None, []))
+        self.sgpr_raw(i)
     }
 
     /// Reads dword `i` of the SGPR data binding itself (no command offset).
     pub fn sgpr_raw(&mut self, i: Word) -> R<Word> {
         let z = self.u(0);
+        if let Some(pt) = self.sgpr_ub {
+            let two = self.u(2);
+            let three = self.u(3);
+            let q = e(self.b.shift_right_logical(self.t.u32, None, i, two))?;
+            let r = e(self.b.bitwise_and(self.t.u32, None, i, three))?;
+            let p = e(self.b.access_chain(pt, None, self.sgpr_data, [z, q, r]))?;
+            return e(self.b.load(self.t.u32, None, p, None, []));
+        }
         let p = e(self.b.access_chain(self.t.sb_u32, None, self.sgpr_data, [z, i]))?;
         e(self.b.load(self.t.u32, None, p, None, []))
     }
@@ -1114,6 +1158,23 @@ impl<'a> T<'a> {
     fn decorate_binding(&mut self, var: Word, binding: u32) {
         self.b.decorate(var, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
         self.b.decorate(var, Decoration::Binding, [Operand::LiteralBit32(binding)]);
+    }
+
+    /// Uniform buffer `struct { uvec4 data[n]; }` variable holding `dwords`
+    /// (`Spec::sgpr_ubo`; std140: 16-byte array stride). Its array and
+    /// struct types are its own (layout decorations on shared types would
+    /// reach other uses).
+    fn sgpr_ubo_var(&mut self, dwords: u32) -> Word {
+        let n = self.u(dwords.div_ceil(4).max(1));
+        let arr = self.b.id();
+        self.b.type_array_id(Some(arr), self.t.v4u, n);
+        self.b.decorate(arr, Decoration::ArrayStride, [Operand::LiteralBit32(16)]);
+        let st = self.b.id();
+        self.b.type_struct_id(Some(st), [arr]);
+        self.b.decorate(st, Decoration::Block, []);
+        self.b.member_decorate(st, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
+        let pt = self.b.type_pointer(None, StorageClass::Uniform, st);
+        self.global_var(pt, StorageClass::Uniform)
     }
 
     /// Storage buffer `struct { uint data[]; }` variable.
@@ -1900,6 +1961,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         consts: HashMap::default(),
         interface: Vec::new(),
         sgpr_data: 0,
+        sgpr_ub: None,
         sgpr_base: None,
         load_offsets: load_offsets(plan),
         res_info: res_info_offset(plan),
@@ -1978,14 +2040,20 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         tr.warn(format!("{pc:#x}: lane-0 election of a wave-aggregated atomic taken by every lane (each appends itself)"));
     }
     // SGPR data buffer (binding base + 0).
-    let sd = tr.sb_var();
-    let bnd = tr.alloc_binding(BindingKind::SgprData);
+    let sgpr_dwords = sgpr_data_dwords(plan);
+    let window = spec.sgpr_ubo == 3 && spec.batched && spec.stage == Stage::Compute;
+    let ubo = window || (spec.sgpr_ubo & 1 == 1 && !spec.batched && spec.sgpr_pc.is_none() && sgpr_dwords <= SGPR_UBO_MAX_DWORDS);
+    let sd = if ubo { tr.sgpr_ubo_var(if window { SGPR_WINDOW_DWORDS } else { sgpr_dwords }) } else { tr.sb_var() };
+    let bnd = tr.alloc_binding(if ubo { BindingKind::SgprUniform } else { BindingKind::SgprData });
     tr.decorate_binding(sd, bnd);
-    if spec.addresses {
+    if !ubo && (spec.addresses || spec.sgpr_ubo != 0) {
         // Read-only: its loads need not wait for device-pointer stores.
         tr.b.decorate(sd, Decoration::NonWritable, []);
     }
     tr.sgpr_data = sd;
+    if ubo {
+        tr.sgpr_ub = Some(tr.b.type_pointer(None, StorageClass::Uniform, tr.t.u32));
+    }
     if code.iter().any(|i| i.enc == Enc::Ds && i.ds_gds()) {
         let v = tr.sb_var();
         let bnd = tr.alloc_binding(BindingKind::Gds);
@@ -3075,6 +3143,7 @@ mod tests {
             addresses: false,
             batched: false,
             write_marks: false,
+            sgpr_ubo: 0,
         }
     }
 

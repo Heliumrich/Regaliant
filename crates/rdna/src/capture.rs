@@ -135,6 +135,8 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         addresses: std::env::var_os("RDNA_ADDRESSES").is_some() || std::env::var_os("RDNA_BATCHED").is_some(),
         batched: std::env::var_os("RDNA_BATCHED").is_some(),
         write_marks: std::env::var_os("RDNA_WRITE_MARKS").is_some(),
+        // RDNA_SGPR_UBO=<n>: `Spec::sgpr_ubo` (validation).
+        sgpr_ubo: std::env::var("RDNA_SGPR_UBO").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         stage: u.stage,
         user_sgprs: users,
         user_base,

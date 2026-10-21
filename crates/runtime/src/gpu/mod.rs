@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 150] = [
+    static ALL: [Tunable; 152] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -177,6 +177,8 @@ pub mod tune {
         Tunable { name: "job_watch", env: "DS_JOB_WATCH", default: 2000, value: AtomicU64::new(UNSET) },
         Tunable { name: "draw_again", env: "DS_DRAW_AGAIN", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "batch_draws", env: "DS_BATCH_DRAWS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "sgpr_ubo", env: "DS_SGPR_UBO", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "merge_many", env: "DS_MERGE_MANY", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1612,6 +1614,30 @@ pub mod tune {
     #[inline]
     pub fn batch_draws() -> bool {
         get(149) != 0 && super::vk::ctx().draw_indirect_count && super::vk::ctx().device_addresses
+    }
+
+    /// How translations declare their SGPR data (`Spec::sgpr_ubo`): 0 a
+    /// storage buffer, 1 a uniform buffer where the binding is the command's
+    /// own range (else a read-only storage buffer), 2 a read-only storage
+    /// buffer, 3 as 1 and batched compute translations through a uniform
+    /// window of the ring (1 where uniform buffers cannot span 64 KiB).
+    /// Takes effect for translations made after a change.
+    #[inline]
+    pub fn sgpr_ubo() -> u8 {
+        let v = get(150).min(3) as u8;
+        if v == 3 && super::vk::ctx().limits.max_uniform_buffer_range < 4 * rdna::translate::SGPR_WINDOW_DWORDS {
+            1
+        } else {
+            v
+        }
+    }
+
+    /// The shadows a write-back flushes merged by one dispatch
+    /// (`rdna::kernels::shadow_merge_many`, destinations by device address)
+    /// instead of one dispatch and descriptor set each.
+    #[inline]
+    pub fn merge_many() -> bool {
+        get(151) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
