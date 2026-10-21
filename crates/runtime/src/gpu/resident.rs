@@ -586,6 +586,9 @@ pub fn remapped(base: u64, len: u64) {
             }
             OWN_STATS[O_REMAP_DROPS].fetch_add(1, Ordering::Relaxed);
         }
+        if mirror_mode() {
+            baseline_drop(p, p + PAGE);
+        }
         p += PAGE;
     }
     STATS[S_RESETS].fetch_add(1, Ordering::Relaxed);
@@ -657,6 +660,11 @@ pub fn on_fault(addr: u64, write: bool) -> bool {
             return false;
         }
         if s.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            // Mirror mode: the page's bytes before the CPU's writes (the
+            // mirror's from the CPU's side) for its next copy there.
+            if mirror_mode() && cur & ST_VALID != 0 {
+                baseline_snap(page);
+            }
             protect(page, PAGE, PAGE_READWRITE);
             // Written again soon after the last write: volatile from now on.
             let frame = super::FRAMES.load(Ordering::Relaxed) as u32 + 1;
@@ -1531,7 +1539,7 @@ pub fn status() -> String {
 // batch's end the gather kernel (`rdna::kernels::mirror_gather`) records the
 // pages with marked dwords and those dwords in host memory and clears their
 // bits, and the batch's first completion action stores them to guest memory
-// (`apply_records`), so the title sees them when it sees the batch done.
+// (`apply_masks_copy`), so the title sees them when it sees the batch done.
 // Dwords no shader wrote keep what the CPU wrote (a binding's range can share
 // pages with CPU data: allocator bitmaps, job stacks). All batches run on one
 // Vulkan queue in submission order, so one map serves every queue.
@@ -1543,8 +1551,10 @@ pub fn mirror_mode() -> bool {
     MODE2.load(Ordering::Acquire)
 }
 
-/// Bytes of the written-bit map: one bit per dword of the mirror's span.
-pub const MARK_BYTES: u64 = (MIRROR_END - MIRROR_BASE) / 32;
+/// Bytes of the written-bit map (`rdna::kernels::MARK_TOTAL_WORDS`: one bit
+/// per dword of the mirror's span, one per page, the touched-page list).
+pub const MARK_BYTES: u64 = 4 * rdna::kernels::MARK_TOTAL_WORDS as u64;
+const _: () = assert!(MIRROR_END - MIRROR_BASE == rdna::kernels::MARK_SPAN_BYTES);
 /// The written-bit map (video memory, zeroed by mirror mode's self-test).
 static MARKS: std::sync::OnceLock<vk::Buffer> = std::sync::OnceLock::new();
 
@@ -1554,7 +1564,12 @@ pub fn marks() -> Option<vk::Buffer> {
 }
 
 /// Mirror mode's statistics (`owned_line`).
-static OWN_STATS: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
+static OWN_STATS: [AtomicU64; 22] = [const { AtomicU64::new(0) }; 22];
+/// Baselines: taken at CPU writes, copies diffed against one, dwords those
+/// copies took.
+const O_BASE_SNAPS: usize = 19;
+const O_BASE_DIFFS: usize = 20;
+const O_BASE_DWORDS: usize = 21;
 /// Write-backs: batches, pages (records), dwords stored, protection changes
 /// around the stores, pages left out (not writable guest memory any more),
 /// nanoseconds; records a batch's output had no room for (gathered later).
@@ -1587,13 +1602,240 @@ const O_REMAP_DROPS: usize = 17;
 /// Records of lazy gathers (pages made or kept dirty).
 const O_MASK_RECORDS: usize = 18;
 
-/// Write-backs at batch completion: every marked dword is stored then
-/// (`apply_records`); with `DS_MM_LAZY=1` when the CPU side touches its page
-/// instead (`apply_masks`, `release_dirty`; our image cache reads nearly
-/// every page GPU work writes, FINDINGS.md 2026-10-21 morning).
-pub fn eager_writebacks() -> bool {
+/// Lazy write-backs (`DS_MM_LAZY=1`): pages with marked dwords stay
+/// no-access until the CPU side touches them (`apply_masks`,
+/// `release_dirty`); by default they are copied from the mirror at their
+/// batch's completion (`apply_masks_copy`; the image cache reads nearly
+/// every page GPU work writes over textures, FINDINGS.md 2026-10-21
+/// morning).
+pub fn lazy_writebacks() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_MM_LAZY").ok().as_deref() != Some("1"))
+    *ON.get_or_init(|| std::env::var("DS_MM_LAZY").ok().as_deref() == Some("1"))
+}
+
+/// The copy context of eager write-backs by copy (the completion thread's):
+/// command buffer, fence and a host staging buffer that grows.
+struct EagerCtx {
+    _pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+    copy: bool,
+    stage: (vk::Buffer, vk::DeviceMemory, *mut u8, u64),
+}
+unsafe impl Send for EagerCtx {}
+static EAGER: Mutex<Option<EagerCtx>> = Mutex::new(None);
+
+fn eager_ctx() -> Result<EagerCtx, String> {
+    let c = ctx();
+    let (family, copy) = match &c.copy {
+        Some(q) => (q.family, true),
+        None => (c.queue_family, false),
+    };
+    unsafe {
+        let pool = c.device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).map_err(|e| format!("pool: {e}"))?;
+        let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).map_err(|e| format!("cmd: {e}"))?[0];
+        let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| format!("fence: {e}"))?;
+        let (b, m, ptr) = c.host_buffer(16 << 20, vk::BufferUsageFlags::TRANSFER_DST)?;
+        Ok(EagerCtx { _pool: pool, cmd, fence, copy, stage: (b, m, ptr, 16 << 20) })
+    }
+}
+
+/// Eager write-back by copy (the first completion action of the batch whose
+/// effects this thread performs): `out` holds the gather kernel's mask
+/// records (at most `cap`); the pages are copied from the mirror into host
+/// memory on the copy queue (one submission, runs of pages) and their marked
+/// dwords stored to guest memory, run by run: runs no longer mapped are left
+/// out (the guest mapping table, consistent under the arming lock); pages
+/// made writable around the stores get their protection back (armed: read-
+/// only; others as the guest mapped them). A page a later batch uploaded
+/// into the mirror meanwhile is made not device-valid (its upload may
+/// predate these dwords in guest memory).
+/// Returns the records the output had no room for.
+pub fn apply_masks_copy(out: *const u32, cap: u32) -> u32 {
+    use rdna::kernels::{GATHER_HEADER_DWORDS, GATHER_MASK_RECORD_DWORDS};
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_READONLY, PAGE_READWRITE};
+    let t = std::time::Instant::now();
+    let seq = super::cp::after_batch();
+    let count = unsafe { std::ptr::read_volatile(out) };
+    let n = count.min(cap) as usize;
+    if n == 0 {
+        return count.saturating_sub(cap);
+    }
+    let rec = |k: usize| unsafe { out.add(GATHER_HEADER_DWORDS as usize + k * GATHER_MASK_RECORD_DWORDS as usize) };
+    let mut order: Vec<(u32, usize)> = (0..n).map(|k| (unsafe { *rec(k) }, k)).collect();
+    order.sort_unstable();
+    order.dedup_by_key(|x| x.0);
+    note_shared(&order);
+    // Runs of consecutive pages: (first index in `order`, count).
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for i in 0..order.len() {
+        match runs.last_mut() {
+            Some((a, k)) if order[*a + *k - 1].0 + 1 == order[i].0 => *k += 1,
+            _ => runs.push((i, 1)),
+        }
+    }
+    let Some(m) = MIRROR.get() else { return 0 };
+    let mut g = EAGER.lock();
+    if g.is_none() {
+        match eager_ctx() {
+            Ok(x) => *g = Some(x),
+            Err(e) => {
+                crate::error!("resident: no eager write-back context: {e}");
+                return 0;
+            }
+        }
+    }
+    let x = g.as_mut().expect("eager context");
+    let c = ctx();
+    let bytes = order.len() as u64 * PAGE;
+    if x.stage.3 < bytes {
+        unsafe {
+            c.device.destroy_buffer(x.stage.0, None);
+            c.device.free_memory(x.stage.1, None);
+        }
+        let capb = bytes.next_power_of_two();
+        match c.host_buffer(capb, vk::BufferUsageFlags::TRANSFER_DST) {
+            Ok((b, mm, ptr)) => x.stage = (b, mm, ptr, capb),
+            Err(e) => {
+                crate::error!("resident: no staging for an eager write-back of {} pages: {e}", order.len());
+                x.stage = (vk::Buffer::null(), vk::DeviceMemory::null(), std::ptr::null_mut(), 0);
+                return 0;
+            }
+        }
+    }
+    let regions: Vec<vk::BufferCopy> = runs.iter().map(|&(a, k)| vk::BufferCopy { src_offset: order[a].0 as u64 * PAGE, dst_offset: a as u64 * PAGE, size: k as u64 * PAGE }).collect();
+    let copied = unsafe {
+        (|| -> Result<(), String> {
+            c.device.reset_command_buffer(x.cmd, vk::CommandBufferResetFlags::empty()).map_err(|e| format!("reset: {e}"))?;
+            c.device.begin_command_buffer(x.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(|e| format!("begin: {e}"))?;
+            c.device.cmd_copy_buffer(x.cmd, m.buf, x.stage.0, &regions);
+            c.device.end_command_buffer(x.cmd).map_err(|e| format!("end: {e}"))?;
+            c.device.reset_fences(&[x.fence]).map_err(|e| format!("fence reset: {e}"))?;
+            c.submit_timeline(x.copy, &[x.cmd], &[], &[], x.fence)?;
+            c.device.wait_for_fences(&[x.fence], true, 10_000_000_000).map_err(|e| format!("wait: {e}"))
+        })()
+    };
+    if let Err(err) = copied {
+        crate::error!("resident: eager write-back copy of {} pages: {err}", order.len());
+        return 0;
+    }
+    let stage = x.stage.2 as *const u8;
+    let (mut n_dw, mut n_pg, mut n_prot, mut n_skip, mut n_stale) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    // The memory manager's lock order: its table, guest readers, arming (it
+    // holds the first across mapping changes, which take the others).
+    let st = crate::mem::MEM.lock();
+    let _readers = crate::mem::GUEST_READERS.read();
+    let _arming = ARM_LOCK.read();
+    for &(ra, rk) in &runs {
+        let a = MIRROR_BASE + order[ra].0 as u64 * PAGE;
+        let e = a + rk as u64 * PAGE;
+        // Mapped still, and how the guest mapped it.
+        let guest_prot = {
+            let mut at = a;
+            let mut prot = None;
+            while at < e {
+                match st.find(at) {
+                    Some(v) if v.kind != crate::mem::VmaKind::Reserved && v.prot != 0 => {
+                        let wp = crate::mem::win_prot(v.prot);
+                        prot = Some(match prot {
+                            None => wp,
+                            Some(p) if p == wp => p,
+                            Some(_) => PAGE_READONLY,
+                        });
+                        at = v.start + v.size;
+                    }
+                    _ => {
+                        prot = None;
+                        break;
+                    }
+                }
+            }
+            prot
+        };
+        let Some(guest_prot) = guest_prot else {
+            n_skip += rk as u64;
+            continue;
+        };
+        busy_range(a, e);
+        let plain = guest_prot == PAGE_READWRITE && {
+            let mut all_rw = true;
+            let mut q = a;
+            while q < e {
+                if chunk(q, false).is_some_and(|c| c.pages[idx(q)].load(Ordering::Acquire) & (ST_ARMED | ST_GUEST_RO) != 0) {
+                    all_rw = false;
+                    break;
+                }
+                q += PAGE;
+            }
+            all_rw
+        };
+        let mut old = 0u32;
+        if !plain {
+            unsafe { VirtualProtect(a as _, (e - a) as usize, PAGE_READWRITE, &mut old) };
+            n_prot += 1;
+        }
+        for j in 0..rk {
+            let r = rec(order[ra + j].1);
+            let masks = unsafe { r.add(1) };
+            let src = unsafe { stage.add((ra + j) * PAGE as usize) } as *const u32;
+            let pg = a + j as u64 * PAGE;
+            baseline_merge(pg, unsafe { std::slice::from_raw_parts(masks, 32) }, src);
+            note_writeback(pg, seq, unsafe { std::slice::from_raw_parts(masks, 32) });
+            for w in 0..32usize {
+                let mut mm = unsafe { *masks.add(w) };
+                while mm != 0 {
+                    let d = w * 32 + mm.trailing_zeros() as usize;
+                    unsafe { std::ptr::write_volatile((pg + 4 * d as u64) as *mut u32, *src.add(d)) };
+                    n_dw += 1;
+                    mm &= mm - 1;
+                }
+            }
+            n_pg += 1;
+        }
+        if !plain {
+            // Back: armed pages read-only, others as the guest mapped them
+            // (runs of pages with the same protection).
+            let target = |q: u64| {
+                let armed = chunk(q, false).is_some_and(|c| c.pages[idx(q)].load(Ordering::Acquire) & ST_ARMED != 0);
+                if armed { PAGE_READONLY } else { guest_prot }
+            };
+            let mut q = a;
+            while q < e {
+                let pt = target(q);
+                let mut q2 = q + PAGE;
+                while q2 < e && target(q2) == pt {
+                    q2 += PAGE;
+                }
+                let mut tmp = 0u32;
+                unsafe { VirtualProtect(q as _, (q2 - q) as usize, pt, &mut tmp) };
+                q = q2;
+            }
+        }
+        // Uploaded by a later batch (or one recording): its copy may lack
+        // these dwords.
+        let mut q = a;
+        while q < e {
+            if let Some(c) = chunk(q, false) {
+                let k = idx(q);
+                let up = c.seqs[k].load(Ordering::Acquire);
+                if up == PENDING || (up > seq && seq != 0) {
+                    c.pages[k].fetch_and(!ST_VALID, Ordering::AcqRel);
+                    flag(c, k);
+                    n_stale += 1;
+                }
+            }
+            q += PAGE;
+        }
+        unbusy_range(a, e);
+    }
+    OWN_STATS[O_WB_BATCHES].fetch_add(1, Ordering::Relaxed);
+    OWN_STATS[O_WB_PAGES].fetch_add(n_pg, Ordering::Relaxed);
+    OWN_STATS[O_WB_DWORDS].fetch_add(n_dw, Ordering::Relaxed);
+    OWN_STATS[O_WB_PROTECTS].fetch_add(n_prot, Ordering::Relaxed);
+    OWN_STATS[O_WB_SKIPPED].fetch_add(n_skip, Ordering::Relaxed);
+    OWN_STATS[O_WB_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    OWN_STATS[O_STALE].fetch_add(n_stale, Ordering::Relaxed);
+    count.saturating_sub(cap)
 }
 
 /// A GPU-dirty page: the mask words of the dwords guest memory lacks and
@@ -1631,6 +1873,7 @@ pub fn apply_masks(out: *const u32, cap: u32) -> u32 {
     let mut order: Vec<(u32, usize)> = (0..n).map(|k| (unsafe { *rec(k) }, k)).collect();
     order.sort_unstable();
     OWN_STATS[O_MASK_RECORDS].fetch_add(n as u64, Ordering::Relaxed);
+    note_shared(&order);
     let _arming = ARM_LOCK.read();
     let mut g = DIRTY.lock();
     let map = g.get_or_insert_with(Default::default);
@@ -1677,6 +1920,164 @@ pub fn apply_masks(out: *const u32, cap: u32) -> u32 {
         i = j;
     }
     count.saturating_sub(cap)
+}
+
+/// Mirror mode: the baselines of pages the CPU writes: the page's dwords as
+/// the mirror holds them from the CPU's side (its guest bytes at their last
+/// copy into the mirror, GPU-written dwords merged since). A copy into the
+/// mirror takes only the dwords that differ from the baseline, so dwords
+/// GPU work wrote there meanwhile (a batch still running, its write-back
+/// not stored yet) stay. Taken at an armed page's first CPU write
+/// (`on_fault`), kept for pages copied without a claim (volatile) at their
+/// copies; dropped when a claim arms the page again, at remaps.
+static BASE: Mutex<Option<std::collections::HashMap<u64, Box<[u32; 1024]>>>> = Mutex::new(None);
+static BASE_N: AtomicU64 = AtomicU64::new(0);
+
+/// Takes page `page`'s baseline from its guest bytes unless it has one.
+fn baseline_snap(page: u64) {
+    let mut b = Box::new([0u32; 1024]);
+    unsafe { std::ptr::copy_nonoverlapping(page as *const u32, b.as_mut_ptr(), 1024) };
+    let mut g = BASE.lock();
+    let m = g.get_or_insert_with(Default::default);
+    if !m.contains_key(&page) {
+        m.insert(page, b);
+        BASE_N.store(m.len() as u64, Ordering::Release);
+        OWN_STATS[O_BASE_SNAPS].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The dword runs (first dword, dwords) of page `page`, whose current bytes
+/// are at `now`, that differ from its baseline (None: no baseline, the whole
+/// page). `keep`: the baseline becomes `now` (pages copied without a claim);
+/// otherwise it is dropped (a claim armed the page: its next CPU write takes
+/// one again).
+pub fn baseline_diff(page: u64, now: *const u32, keep: bool) -> Option<Vec<(u32, u32)>> {
+    if BASE_N.load(Ordering::Acquire) == 0 && !keep {
+        return None;
+    }
+    // Read before the lock: the page may be GPU-dirty (lazy write-backs),
+    // and its fault's release takes the lock too (`baseline_merge`).
+    let mut copy = [0u32; 1024];
+    unsafe { std::ptr::copy_nonoverlapping(now, copy.as_mut_ptr(), 1024) };
+    let mut g = BASE.lock();
+    let m = g.get_or_insert_with(Default::default);
+    let now = &copy[..];
+    let runs = match m.get_mut(&page) {
+        Some(b) => {
+            let mut runs: Vec<(u32, u32)> = Vec::new();
+            for (d, (&x, y)) in now.iter().zip(b.iter_mut()).enumerate() {
+                if x != *y {
+                    match runs.last_mut() {
+                        Some((s, n)) if *s + *n == d as u32 => *n += 1,
+                        _ => runs.push((d as u32, 1)),
+                    }
+                    if keep {
+                        *y = x;
+                    }
+                }
+            }
+            OWN_STATS[O_BASE_DIFFS].fetch_add(1, Ordering::Relaxed);
+            OWN_STATS[O_BASE_DWORDS].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
+            if !keep {
+                m.remove(&page);
+            }
+            Some(runs)
+        }
+        None => {
+            if keep {
+                let mut b = Box::new([0u32; 1024]);
+                b.copy_from_slice(now);
+                m.insert(page, b);
+            }
+            None
+        }
+    };
+    BASE_N.store(m.len() as u64, Ordering::Release);
+    runs
+}
+
+/// A write-back stored GPU-written dwords of page `page` (masks: bit k of
+/// word j for dword 32j+k, values at `src`): its baseline takes them too
+/// (they are the mirror's, not CPU writes).
+fn baseline_merge(page: u64, masks: &[u32], src: *const u32) {
+    if BASE_N.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut g = BASE.lock();
+    let Some(b) = g.as_mut().and_then(|m| m.get_mut(&page)) else { return };
+    for (w, &mw) in masks.iter().enumerate() {
+        let mut mm = mw;
+        while mm != 0 {
+            let d = w * 32 + mm.trailing_zeros() as usize;
+            b[d] = unsafe { *src.add(d) };
+            mm &= mm - 1;
+        }
+    }
+}
+
+/// Drops the baselines of [lo, hi) (remaps).
+fn baseline_drop(lo: u64, hi: u64) {
+    if BASE_N.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut g = BASE.lock();
+    if let Some(m) = g.as_mut() {
+        let mut p = lo;
+        while p < hi {
+            m.remove(&p);
+            p += PAGE;
+        }
+        BASE_N.store(m.len() as u64, Ordering::Release);
+    }
+}
+
+/// Diagnostics: mirror mode's write-backs by page (the last eight: time in
+/// ms, batch, dwords, first dword), for fault reports (`writeback_history`).
+static WB_LOG: Mutex<Option<std::collections::HashMap<u64, std::collections::VecDeque<(u64, u64, u32, u32)>>>> = Mutex::new(None);
+
+fn note_writeback(page: u64, seq: u64, masks: &[u32]) {
+    let n: u32 = masks.iter().map(|m| m.count_ones()).sum();
+    let first = masks.iter().enumerate().find(|&(_, &m)| m != 0).map(|(w, m)| w as u32 * 32 + m.trailing_zeros()).unwrap_or(0);
+    let t = crate::log::elapsed_ms() as u64;
+    let mut g = WB_LOG.lock();
+    let m = g.get_or_insert_with(Default::default);
+    if m.len() > 1 << 20 {
+        m.clear();
+    }
+    let e = m.entry(page).or_default();
+    if e.len() >= 8 {
+        e.pop_front();
+    }
+    e.push_back((t, seq, n, first));
+}
+
+/// The write-backs into the page holding `addr` (fault reports).
+pub fn writeback_history(addr: u64) -> Option<String> {
+    let g = WB_LOG.try_lock()?;
+    let e = g.as_ref()?.get(&(addr & !(PAGE - 1)))?;
+    Some(e.iter().map(|(t, s, n, f)| format!("at {t} ms batch {s}: {n} dwords from dword {f}")).collect::<Vec<_>>().join("; "))
+}
+
+/// Diagnostics: pages GPU work wrote (gather records) that the CPU wrote
+/// too since their last upload (not device-valid, or volatile): the first
+/// 64 logged.
+fn note_shared(order: &[(u32, usize)]) {
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if LOGGED.load(Ordering::Relaxed) >= 64 {
+        return;
+    }
+    for &(page, _) in order {
+        let p = MIRROR_BASE + page as u64 * PAGE;
+        let Some(c) = chunk(p, false) else { continue };
+        let s = c.pages[idx(p)].load(Ordering::Acquire);
+        if s & ST_VALID == 0 || s & ST_VOLATILE != 0 {
+            let n = LOGGED.fetch_add(1, Ordering::Relaxed);
+            if n >= 64 {
+                return;
+            }
+            crate::info!("resident: page {p:#x} written by GPU work and by the CPU since its upload (state {s:#x})");
+        }
+    }
 }
 
 /// Takes [a, e)'s pages busy (spinning while another thread has one).
@@ -1778,6 +2179,8 @@ fn release_dirty(page: u64, fault: bool) -> bool {
             let mut old = 0u32;
             unsafe { VirtualProtect(q as _, PAGE as usize, PAGE_READWRITE, &mut old) };
             let src = unsafe { rb.ptr.add((q - a) as usize) } as *const u32;
+            baseline_merge(q, &d.masks, src);
+            note_writeback(q, 0, &d.masks);
             for (w, &mw) in d.masks.iter().enumerate() {
                 let mut mm = mw;
                 while mm != 0 {
@@ -1913,6 +2316,9 @@ pub fn cp_wrote(a: u64, n: u64) {
 /// The pages of [lo, hi) CP writes changed since their last copy into the
 /// mirror (taken out first: a write after this copy notes its page again).
 pub fn take_cp_pages(lo: u64, hi: u64) -> Vec<u64> {
+    if lo >= hi {
+        return Vec::new();
+    }
     let mut g = CP_PAGES.lock();
     let v: Vec<u64> = g.range(lo..hi).copied().collect();
     for p in &v {
@@ -1920,126 +2326,6 @@ pub fn take_cp_pages(lo: u64, hi: u64) -> Vec<u64> {
     }
     OWN_STATS[O_CP_COPIES].fetch_add(v.len() as u64, Ordering::Relaxed);
     v
-}
-
-/// Mirror mode's write-back (the first completion action of the batch whose
-/// effects this thread performs, `cp::after_batch`): `out` holds the gather
-/// kernel's output (`rdna::kernels::mirror_gather`; at most `cap` records:
-/// a page's index in the mirror, its mask words, its marked dwords). The
-/// marked dwords are stored to guest memory, runs of consecutive pages
-/// region by region: committed regions that are not plain read-write (armed
-/// by us, read-only for the guest) are made writable around the stores and
-/// get their protection back (page states unchanged: the mirror holds those
-/// dwords too); regions not committed or no-access for the guest are left
-/// out. A page a later batch uploaded into the mirror meanwhile is made not
-/// device-valid (its upload may predate these dwords in guest memory).
-/// Returns the records the output had no room for.
-pub fn apply_records(out: *const u32, cap: u32) -> u32 {
-    use rdna::kernels::{GATHER_HEADER_DWORDS, GATHER_RECORD_DWORDS};
-    use windows_sys::Win32::System::Memory::{VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE};
-    let t = std::time::Instant::now();
-    let seq = super::cp::after_batch();
-    let count = unsafe { std::ptr::read_volatile(out) };
-    let n = count.min(cap) as usize;
-    let rec = |k: usize| unsafe { out.add(GATHER_HEADER_DWORDS as usize + k * GATHER_RECORD_DWORDS as usize) };
-    let mut order: Vec<(u32, usize)> = (0..n).map(|k| (unsafe { *rec(k) }, k)).collect();
-    order.sort_unstable();
-    let (mut n_dw, mut n_pg, mut n_prot, mut n_skip, mut n_stale) = (0u64, 0u64, 0u64, 0u64, 0u64);
-    let _arming = ARM_LOCK.read();
-    let mut i = 0;
-    while i < order.len() {
-        let mut j = i + 1;
-        while j < order.len() && order[j].0 == order[j - 1].0 + 1 {
-            j += 1;
-        }
-        let page_at = |k: usize| MIRROR_BASE + order[k].0 as u64 * PAGE;
-        let (a, e) = (page_at(i), page_at(j - 1) + PAGE);
-        // Busy while protections change (a write fault on one waits).
-        let mut q = a;
-        while q < e {
-            if let Some(c) = chunk(q, false) {
-                let st = &c.pages[idx(q)];
-                loop {
-                    let cur = st.load(Ordering::Acquire);
-                    if cur & ST_BUSY != 0 {
-                        std::hint::spin_loop();
-                        continue;
-                    }
-                    if st.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                        break;
-                    }
-                }
-            }
-            q += PAGE;
-        }
-        q = a;
-        while q < e {
-            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-            if unsafe { VirtualQuery(q as _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
-                n_skip += (e - q) / PAGE;
-                break;
-            }
-            let r_end = (info.BaseAddress as u64 + info.RegionSize as u64).min(e).max(q + PAGE);
-            let usable = info.State == MEM_COMMIT && info.Protect != 0 && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0;
-            let plain = info.Protect == PAGE_READWRITE;
-            let mut old = 0u32;
-            if !usable || (!plain && unsafe { VirtualProtect(q as _, (r_end - q) as usize, PAGE_READWRITE, &mut old) } == 0) {
-                n_skip += (r_end - q) / PAGE;
-                q = r_end;
-                continue;
-            }
-            if !plain {
-                n_prot += 1;
-            }
-            let mut pg = q;
-            while pg < r_end {
-                let r = rec(order[i + ((pg - a) / PAGE) as usize].1);
-                let (masks, data) = unsafe { (r.add(1), r.add(33)) };
-                for w in 0..32usize {
-                    let mut m = unsafe { *masks.add(w) };
-                    while m != 0 {
-                        let d = w * 32 + m.trailing_zeros() as usize;
-                        unsafe { std::ptr::write_volatile((pg + 4 * d as u64) as *mut u32, *data.add(d)) };
-                        n_dw += 1;
-                        m &= m - 1;
-                    }
-                }
-                n_pg += 1;
-                pg += PAGE;
-            }
-            if !plain {
-                let mut tmp = 0u32;
-                unsafe { VirtualProtect(q as _, (r_end - q) as usize, old, &mut tmp) };
-            }
-            q = r_end;
-        }
-        q = a;
-        while q < e {
-            if let Some(c) = chunk(q, false) {
-                let k = idx(q);
-                // Uploaded by a later batch (or one recording): its copy may
-                // lack these dwords.
-                let up = c.seqs[k].load(Ordering::Acquire);
-                if up == PENDING || (up > seq && seq != 0) {
-                    c.pages[k].fetch_and(!(ST_VALID | ST_BUSY), Ordering::AcqRel);
-                    flag(c, k);
-                    n_stale += 1;
-                } else {
-                    c.pages[k].fetch_and(!ST_BUSY, Ordering::AcqRel);
-                }
-            }
-            q += PAGE;
-        }
-        i = j;
-    }
-    OWN_STATS[O_WB_BATCHES].fetch_add(1, Ordering::Relaxed);
-    OWN_STATS[O_WB_PAGES].fetch_add(n_pg, Ordering::Relaxed);
-    OWN_STATS[O_WB_DWORDS].fetch_add(n_dw, Ordering::Relaxed);
-    OWN_STATS[O_WB_PROTECTS].fetch_add(n_prot, Ordering::Relaxed);
-    OWN_STATS[O_WB_SKIPPED].fetch_add(n_skip, Ordering::Relaxed);
-    OWN_STATS[O_WB_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    OWN_STATS[O_STALE].fetch_add(n_stale, Ordering::Relaxed);
-    count.saturating_sub(cap)
 }
 
 thread_local! {
@@ -2164,7 +2450,7 @@ pub fn owned_line() -> String {
     }
     let v: Vec<u64> = OWN_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    mirror mode: write-backs of marked dwords: {} batches, {} pages, {} dwords ({} MiB), {:.1} ms ({:.1} us per batch), {} protection changes, {} pages left out (not writable), {} records without room (gathered again; capacity now {}), {} pages uploaded meanwhile (made stale); {} pages copied again after CP writes; lazy: {} records, {} pages made GPU-dirty ({} protection calls), {} faults and {} explicit releases, {} runs read back ({} pages, {} dwords stored, {:.1} us each), {} dirty pages dropped by remaps\n",
+        "    mirror mode: write-backs of marked dwords: {} batches, {} pages, {} dwords ({} MiB), {:.1} ms ({:.1} us per batch), {} protection changes, {} pages left out (not writable), {} records without room (gathered again; capacity now {}), {} pages uploaded meanwhile (made stale); {} pages copied again after CP writes; lazy: {} records, {} pages made GPU-dirty ({} protection calls), {} faults and {} explicit releases, {} runs read back ({} pages, {} dwords stored, {:.1} us each), {} dirty pages dropped by remaps; baselines: {} taken at CPU writes, {} copies by difference ({} dwords)\n",
         v[O_WB_BATCHES],
         v[O_WB_PAGES],
         v[O_WB_DWORDS],
@@ -2186,7 +2472,10 @@ pub fn owned_line() -> String {
         v[O_RB_PAGES],
         v[O_RB_DWORDS],
         v[O_RB_NS] as f64 / v[O_RB_RUNS].max(1) as f64 / 1e3,
-        v[O_REMAP_DROPS]
+        v[O_REMAP_DROPS],
+        v[O_BASE_SNAPS],
+        v[O_BASE_DIFFS],
+        v[O_BASE_DWORDS]
     ) + &dirty_sites_line()
 }
 
@@ -2216,8 +2505,16 @@ fn owned_self_test() -> Result<String, String> {
     *READBACK.lock() = Some(rb);
     // The written-bit map, zeroed.
     let c = ctx();
-    let (buf, _mem) = c.device_buffer(MARK_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)?;
-    one_off(|cmd| unsafe { c.device.cmd_fill_buffer(cmd, buf, 0, vk::WHOLE_SIZE, 0) })?;
+    let (buf, _mem) = c.device_buffer(MARK_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER)?;
+    // Zeroed; the touched-page list's header [count, 1, 1, 0] is the list
+    // gather's indirect dispatch.
+    let header: Vec<u8> = [0u32, 1, 1, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
+    one_off(|cmd| unsafe {
+        c.device.cmd_fill_buffer(cmd, buf, 0, vk::WHOLE_SIZE, 0);
+        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        c.device.cmd_update_buffer(cmd, buf, rdna::kernels::MARK_LIST_AT as u64 * 4, &header);
+    })?;
     let _ = MARKS.set(buf);
     Ok(format!("read-back context on the {queue}, written-bit map of {} MiB", MARK_BYTES >> 20))
 }

@@ -98,30 +98,39 @@ fn build_merge() -> Result<Vec<u32>, rspirv::dr::Error> {
     Ok(b.module().assemble())
 }
 
-/// Workgroup size of `mirror_gather` (one workgroup per 4 KiB page, four
-/// dwords per invocation).
-pub const GATHER_LOCAL_SIZE: u32 = 256;
-/// Dwords per record of `mirror_gather`: the page's index, its 32 mask
-/// words, its 1024 dwords.
-pub const GATHER_RECORD_DWORDS: u32 = 1 + 32 + 1024;
-/// Dwords before the first record (dword 0: the record count).
-pub const GATHER_HEADER_DWORDS: u32 = 4;
-/// Dwords per record without the page's dwords (`mirror_gather` flags bit
-/// 0 clear): its index and its 32 mask words.
-pub const GATHER_MASK_RECORD_DWORDS: u32 = 1 + 32;
+/// The written-bit map's layout (`Spec::write_marks`), in u32 words of its
+/// buffer: one bit per dword of the mirror's span (MARK_SPAN_BYTES), then
+/// one bit per 4 KiB page of it (pages with marks in the batch running),
+/// then the batch's touched-page list: [count, 1, 1, 0] (an indirect
+/// dispatch's arguments) and up to MARK_LIST_CAP page indices.
+pub const MARK_SPAN_BYTES: u64 = 32 << 30;
+pub const MARK_WORDS: u32 = (MARK_SPAN_BYTES / 128) as u32;
+pub const MARK_PAGE_BITS_AT: u32 = MARK_WORDS;
+pub const MARK_LIST_AT: u32 = MARK_PAGE_BITS_AT + (MARK_SPAN_BYTES / 4096 / 32) as u32;
+pub const MARK_LIST_CAP: u32 = 1 << 20;
+pub const MARK_TOTAL_WORDS: u32 = MARK_LIST_AT + 4 + MARK_LIST_CAP;
 
-/// Mirror mode's write-back gather: workgroup g handles page g of a written
-/// range. Binding 0 is the written-bit map from the range's first word (32
-/// words per page: bit k of word j marks dword 32j+k), binding 1 the
-/// mirror from the range's first byte, binding 2 the host output: dword 0
-/// counts records, records start at dword GATHER_HEADER_DWORDS
-/// (GATHER_RECORD_DWORDS each). A page with marked dwords takes a record
-/// (while fewer than `cap` were taken): `first_page + g`, its mask words,
-/// its marked dwords at their indices (the others are not written), and
-/// clears the bits it recorded (bits set meanwhile stay for a later
-/// gather). Pages over the capacity keep their bits. Push constants
-/// `{pages, cap, first_page, flags}`: flags bit 0 clear leaves the dwords
-/// out (records of GATHER_MASK_RECORD_DWORDS).
+/// Workgroup size of `mirror_gather`: one invocation per mark word of a
+/// page.
+pub const GATHER_LOCAL_SIZE: u32 = 32;
+/// Dwords per record of `mirror_gather`: the page's index and its 32 mask
+/// words.
+pub const GATHER_MASK_RECORD_DWORDS: u32 = 1 + 32;
+/// Dwords before the first record: the record count, the touched-page
+/// list's count (list mode), two unused.
+pub const GATHER_HEADER_DWORDS: u32 = 4;
+
+/// Mirror mode's write-back gather: workgroup g takes a page of the mirror,
+/// with flags bit 0 the g-th of the touched-page list (MARK_LIST_AT; past
+/// its count or MARK_LIST_CAP it does nothing; workgroup 0 copies the
+/// list's count to output dword 1), else page `first_page + g` for g below
+/// `pages`. Binding 0 is the whole written-bit map, binding 1 the host
+/// output: dword 0 counts records, records start at dword
+/// GATHER_HEADER_DWORDS. A page with marked dwords takes a record (while
+/// fewer than `cap` were taken): its index and its 32 mask words, whose
+/// bits it clears; a page over the capacity keeps its bits (a later range
+/// gather takes them). Every page taken gets its touched bit cleared. Push
+/// constants `{pages, cap, first_page, flags}`.
 pub fn mirror_gather() -> Vec<u32> {
     build_gather().expect("mirror gather kernel")
 }
@@ -131,6 +140,9 @@ fn build_gather() -> Result<Vec<u32>, rspirv::dr::Error> {
     let mut b = Builder::new();
     b.set_version(1, 3);
     b.capability(Capability::Shader);
+    b.capability(Capability::GroupNonUniform);
+    b.capability(Capability::GroupNonUniformVote);
+    b.capability(Capability::GroupNonUniformBallot);
     b.extension("SPV_KHR_storage_buffer_storage_class");
     b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
     let void = b.type_void();
@@ -156,33 +168,24 @@ fn build_gather() -> Result<Vec<u32>, rspirv::dr::Error> {
     b.decorate(lid_v, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::LocalInvocationId)]);
     let wid_v = global(&mut b, p_in, StorageClass::Input);
     b.decorate(wid_v, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::WorkgroupId)]);
-    let mut bufs = [0; 3];
+    let mut bufs = [0; 2];
     for (i, v) in bufs.iter_mut().enumerate() {
         *v = global(&mut b, p_st, StorageClass::StorageBuffer);
         b.decorate(*v, Decoration::DescriptorSet, [lit(0)]);
         b.decorate(*v, Decoration::Binding, [lit(i as u32)]);
     }
-    let (marks, mirror, out) = (bufs[0], bufs[1], bufs[2]);
-    b.decorate(mirror, Decoration::NonWritable, []);
+    let (marks, out) = (bufs[0], bufs[1]);
     let pcv = global(&mut b, p_pc, StorageClass::PushConstant);
     let c = |b: &mut Builder, v: u32| b.constant_bit32(u32t, v);
-    let (c0, c1, c2, c3, c31, c32) = (c(&mut b, 0), c(&mut b, 1), c(&mut b, 2), c(&mut b, 3), c(&mut b, 31), c(&mut b, 32));
-    let c1024 = c(&mut b, 1024);
-    let c33 = c(&mut b, 33);
-    let rec_full = c(&mut b, GATHER_RECORD_DWORDS);
-    let rec_mask = c(&mut b, GATHER_MASK_RECORD_DWORDS);
+    let (c0, c1, c2, c3, c5, c31, c32) = (c(&mut b, 0), c(&mut b, 1), c(&mut b, 2), c(&mut b, 3), c(&mut b, 5), c(&mut b, 31), c(&mut b, 32));
+    let list_at = c(&mut b, MARK_LIST_AT);
+    let list_first = c(&mut b, MARK_LIST_AT + 4);
+    let list_cap = c(&mut b, MARK_LIST_CAP);
+    let bits_at = c(&mut b, MARK_PAGE_BITS_AT);
+    let rec_dw = c(&mut b, GATHER_MASK_RECORD_DWORDS);
     let hdr = c(&mut b, GATHER_HEADER_DWORDS);
-    let arr32 = b.type_array(u32t, c32);
-    let p_arr = b.type_pointer(None, StorageClass::Workgroup, arr32);
-    let p_wu = b.type_pointer(None, StorageClass::Workgroup, u32t);
-    let m_sh = global(&mut b, p_arr, StorageClass::Workgroup);
-    let any_sh = global(&mut b, p_wu, StorageClass::Workgroup);
-    let slot_sh = global(&mut b, p_wu, StorageClass::Workgroup);
-    // Workgroup scope (2), device scope (1); acquire-release (0x8) of
-    // workgroup memory (0x100).
-    let scope_wg = c(&mut b, 2);
+    let scope_sg = c(&mut b, 3);
     let scope_dev = c(&mut b, 1);
-    let sem_bar = c(&mut b, 0x108);
     let sem_none = c0;
     let fty = b.type_function(void, []);
     let f = b.begin_function(void, None, FunctionControl::NONE, fty)?;
@@ -190,132 +193,106 @@ fn build_gather() -> Result<Vec<u32>, rspirv::dr::Error> {
     let l = b.load(v3, None, lid_v, None, [])?;
     let lid = b.composite_extract(u32t, None, l, [0])?;
     let w = b.load(v3, None, wid_v, None, [])?;
-    let pg = b.composite_extract(u32t, None, w, [0])?;
+    let g = b.composite_extract(u32t, None, w, [0])?;
     let pc_at = |b: &mut Builder, k: Word| -> Result<Word, rspirv::dr::Error> {
         let p = b.access_chain(p_pcu, None, pcv, [k])?;
         b.load(u32t, None, p, None, [])
     };
+    let pages = pc_at(&mut b, c0)?;
     let cap = pc_at(&mut b, c1)?;
     let first_page = pc_at(&mut b, c2)?;
     let flags = pc_at(&mut b, c3)?;
-    let data_bit = b.bitwise_and(u32t, None, flags, c1)?;
-    let with_data = b.i_not_equal(bool_, None, data_bit, c0)?;
-    let rec_dw = b.select(u32t, None, with_data, rec_full, rec_mask)?;
+    let lb = b.bitwise_and(u32t, None, flags, c1)?;
+    let list = b.i_not_equal(bool_, None, lb, c0)?;
     let is0 = b.i_equal(bool_, None, lid, c0)?;
-    let lt32 = b.u_less_than(bool_, None, lid, c32)?;
-    // any = 0
-    let (l_z, l_zd) = (b.id(), b.id());
-    b.selection_merge(l_zd, SelectionControl::NONE)?;
-    b.branch_conditional(is0, l_z, l_zd, [])?;
-    b.begin_block(Some(l_z))?;
-    b.store(any_sh, c0, None, [])?;
-    b.branch(l_zd)?;
-    b.begin_block(Some(l_zd))?;
-    b.control_barrier(scope_wg, scope_wg, sem_bar)?;
-    // The page's mask words.
-    let pg32 = b.i_mul(u32t, None, pg, c32)?;
-    let wi = b.i_add(u32t, None, pg32, lid)?;
-    let (l_m, l_md, l_any, l_anyd) = (b.id(), b.id(), b.id(), b.id());
-    b.selection_merge(l_md, SelectionControl::NONE)?;
-    b.branch_conditional(lt32, l_m, l_md, [])?;
-    b.begin_block(Some(l_m))?;
+    // List mode: the list's count (workgroup 0 copies it out).
+    let pcount = b.access_chain(p_u, None, marks, [c0, list_at])?;
+    let lcount = b.load(u32t, None, pcount, None, [])?;
+    let g0 = b.i_equal(bool_, None, g, c0)?;
+    let copy_count = b.logical_and(bool_, None, list, g0)?;
+    let copy_count = b.logical_and(bool_, None, copy_count, is0)?;
+    let (l_cc, l_ccd) = (b.id(), b.id());
+    b.selection_merge(l_ccd, SelectionControl::NONE)?;
+    b.branch_conditional(copy_count, l_cc, l_ccd, [])?;
+    b.begin_block(Some(l_cc))?;
+    let po1 = b.access_chain(p_u, None, out, [c0, c1])?;
+    b.store(po1, lcount, None, [])?;
+    b.branch(l_ccd)?;
+    b.begin_block(Some(l_ccd))?;
+    let under = b.u_less_than(bool_, None, lcount, list_cap)?;
+    let lim_list = b.select(u32t, None, under, lcount, list_cap)?;
+    let limit = b.select(u32t, None, list, lim_list, pages)?;
+    let inside = b.u_less_than(bool_, None, g, limit)?;
+    let (l_in, l_end) = (b.id(), b.id());
+    b.selection_merge(l_end, SelectionControl::NONE)?;
+    b.branch_conditional(inside, l_in, l_end, [])?;
+    b.begin_block(Some(l_in))?;
+    let li = b.i_add(u32t, None, list_first, g)?;
+    let pli = b.access_chain(p_u, None, marks, [c0, li])?;
+    let from_list = b.load(u32t, None, pli, None, [])?;
+    let from_range = b.i_add(u32t, None, first_page, g)?;
+    let page = b.select(u32t, None, list, from_list, from_range)?;
+    let p32 = b.i_mul(u32t, None, page, c32)?;
+    let wi = b.i_add(u32t, None, p32, lid)?;
     let pm = b.access_chain(p_u, None, marks, [c0, wi])?;
     let mw = b.load(u32t, None, pm, None, [])?;
-    let psm = b.access_chain(p_wu, None, m_sh, [lid])?;
-    b.store(psm, mw, None, [])?;
     let nz = b.i_not_equal(bool_, None, mw, c0)?;
-    b.selection_merge(l_anyd, SelectionControl::NONE)?;
-    b.branch_conditional(nz, l_any, l_anyd, [])?;
-    b.begin_block(Some(l_any))?;
-    b.atomic_or(u32t, None, any_sh, scope_wg, sem_none, c1)?;
-    b.branch(l_anyd)?;
-    b.begin_block(Some(l_anyd))?;
-    b.branch(l_md)?;
-    b.begin_block(Some(l_md))?;
-    b.control_barrier(scope_wg, scope_wg, sem_bar)?;
-    let any = b.load(u32t, None, any_sh, None, [])?;
-    let touched = b.i_not_equal(bool_, None, any, c0)?;
-    // Invocation 0 of a touched page takes a record.
-    let take = b.logical_and(bool_, None, touched, is0)?;
+    let any = b.group_non_uniform_any(bool_, None, scope_sg, nz)?;
+    // The page's touched bit, cleared.
+    let (l_pb, l_pbd) = (b.id(), b.id());
+    b.selection_merge(l_pbd, SelectionControl::NONE)?;
+    b.branch_conditional(is0, l_pb, l_pbd, [])?;
+    b.begin_block(Some(l_pb))?;
+    let pw = b.shift_right_logical(u32t, None, page, c5)?;
+    let pwi = b.i_add(u32t, None, bits_at, pw)?;
+    let pbit = b.bitwise_and(u32t, None, page, c31)?;
+    let pmask = b.shift_left_logical(u32t, None, c1, pbit)?;
+    let pinv = b.not(u32t, None, pmask)?;
+    let ppb = b.access_chain(p_u, None, marks, [c0, pwi])?;
+    b.atomic_and(u32t, None, ppb, scope_dev, sem_none, pinv)?;
+    b.branch(l_pbd)?;
+    b.begin_block(Some(l_pbd))?;
+    let (l_rec, l_recd) = (b.id(), b.id());
+    b.selection_merge(l_recd, SelectionControl::NONE)?;
+    b.branch_conditional(any, l_rec, l_recd, [])?;
+    b.begin_block(Some(l_rec))?;
+    // Lane 0 takes a record; the others learn its slot.
     let (l_t, l_td) = (b.id(), b.id());
     b.selection_merge(l_td, SelectionControl::NONE)?;
-    b.branch_conditional(take, l_t, l_td, [])?;
+    b.branch_conditional(is0, l_t, l_td, [])?;
     b.begin_block(Some(l_t))?;
-    let pcount = b.access_chain(p_u, None, out, [c0, c0])?;
-    let s = b.atomic_i_add(u32t, None, pcount, scope_dev, sem_none, c1)?;
-    b.store(slot_sh, s, None, [])?;
+    let pcnt = b.access_chain(p_u, None, out, [c0, c0])?;
+    let s_taken = b.atomic_i_add(u32t, None, pcnt, scope_dev, sem_none, c1)?;
     b.branch(l_td)?;
     b.begin_block(Some(l_td))?;
-    b.control_barrier(scope_wg, scope_wg, sem_bar)?;
-    let slot = b.load(u32t, None, slot_sh, None, [])?;
+    let s_phi = b.phi(u32t, None, [(s_taken, l_t), (c0, l_rec)])?;
+    let slot = b.group_non_uniform_broadcast_first(u32t, None, scope_sg, s_phi)?;
     let room = b.u_less_than(bool_, None, slot, cap)?;
-    let go = b.logical_and(bool_, None, touched, room)?;
-    let (l_go, l_end) = (b.id(), b.id());
-    b.selection_merge(l_end, SelectionControl::NONE)?;
-    b.branch_conditional(go, l_go, l_end, [])?;
-    b.begin_block(Some(l_go))?;
+    let (l_r, l_rd) = (b.id(), b.id());
+    b.selection_merge(l_rd, SelectionControl::NONE)?;
+    b.branch_conditional(room, l_r, l_rd, [])?;
+    b.begin_block(Some(l_r))?;
     let sr = b.i_mul(u32t, None, slot, rec_dw)?;
     let rec = b.i_add(u32t, None, hdr, sr)?;
-    // Header: the page's index.
     let (l_h, l_hd) = (b.id(), b.id());
     b.selection_merge(l_hd, SelectionControl::NONE)?;
     b.branch_conditional(is0, l_h, l_hd, [])?;
     b.begin_block(Some(l_h))?;
-    let page_abs = b.i_add(u32t, None, first_page, pg)?;
     let ph = b.access_chain(p_u, None, out, [c0, rec])?;
-    b.store(ph, page_abs, None, [])?;
+    b.store(ph, page, None, [])?;
     b.branch(l_hd)?;
     b.begin_block(Some(l_hd))?;
-    // Mask words: recorded, and their bits cleared in the map.
-    let (l_k, l_kd) = (b.id(), b.id());
-    b.selection_merge(l_kd, SelectionControl::NONE)?;
-    b.branch_conditional(lt32, l_k, l_kd, [])?;
-    b.begin_block(Some(l_k))?;
-    let psm2 = b.access_chain(p_wu, None, m_sh, [lid])?;
-    let mv = b.load(u32t, None, psm2, None, [])?;
     let r1 = b.i_add(u32t, None, rec, c1)?;
     let ri = b.i_add(u32t, None, r1, lid)?;
     let pr = b.access_chain(p_u, None, out, [c0, ri])?;
-    b.store(pr, mv, None, [])?;
-    let inv = b.not(u32t, None, mv)?;
+    b.store(pr, mw, None, [])?;
+    let inv = b.not(u32t, None, mw)?;
     let pm2 = b.access_chain(p_u, None, marks, [c0, wi])?;
     b.atomic_and(u32t, None, pm2, scope_dev, sem_none, inv)?;
-    b.branch(l_kd)?;
-    b.begin_block(Some(l_kd))?;
-    // Four dwords per invocation (dwords 4*lid.. share mask word lid / 8),
-    // with data.
-    let (l_dd, l_ddd) = (b.id(), b.id());
-    b.selection_merge(l_ddd, SelectionControl::NONE)?;
-    b.branch_conditional(with_data, l_dd, l_ddd, [])?;
-    b.begin_block(Some(l_dd))?;
-    let wsel = b.shift_right_logical(u32t, None, lid, c3)?;
-    let psm3 = b.access_chain(p_wu, None, m_sh, [wsel])?;
-    let word = b.load(u32t, None, psm3, None, [])?;
-    let d_base = b.shift_left_logical(u32t, None, lid, c2)?;
-    let pg1024 = b.i_mul(u32t, None, pg, c1024)?;
-    let rdata = b.i_add(u32t, None, rec, c33)?;
-    for k in 0..4u32 {
-        let kk = c(&mut b, k);
-        let d = b.i_add(u32t, None, d_base, kk)?;
-        let bit = b.bitwise_and(u32t, None, d, c31)?;
-        let sh = b.shift_right_logical(u32t, None, word, bit)?;
-        let one = b.bitwise_and(u32t, None, sh, c1)?;
-        let set = b.i_not_equal(bool_, None, one, c0)?;
-        let (l_s, l_sd) = (b.id(), b.id());
-        b.selection_merge(l_sd, SelectionControl::NONE)?;
-        b.branch_conditional(set, l_s, l_sd, [])?;
-        b.begin_block(Some(l_s))?;
-        let md = b.i_add(u32t, None, pg1024, d)?;
-        let pmd = b.access_chain(p_u, None, mirror, [c0, md])?;
-        let v = b.load(u32t, None, pmd, None, [])?;
-        let od = b.i_add(u32t, None, rdata, d)?;
-        let pod = b.access_chain(p_u, None, out, [c0, od])?;
-        b.store(pod, v, None, [])?;
-        b.branch(l_sd)?;
-        b.begin_block(Some(l_sd))?;
-    }
-    b.branch(l_ddd)?;
-    b.begin_block(Some(l_ddd))?;
+    b.branch(l_rd)?;
+    b.begin_block(Some(l_rd))?;
+    b.branch(l_recd)?;
+    b.begin_block(Some(l_recd))?;
     b.branch(l_end)?;
     b.begin_block(Some(l_end))?;
     b.ret()?;

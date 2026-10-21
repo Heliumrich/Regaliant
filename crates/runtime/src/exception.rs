@@ -1376,6 +1376,10 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
                     for l in crate::mem::unmaps_covering(v) {
                         let _ = writeln!(r, "  [{name}] unmapped earlier: {l}");
                     }
+                    // Mirror mode: GPU-written dwords stored to its page.
+                    if let Some(h) = crate::gpu::resident::writeback_history(v) {
+                        let _ = writeln!(r, "  [{name}] mirror write-backs into its page: {h}");
+                    }
                 }
             }
             // The stack (the frame and its caller's links) and, on a fiber

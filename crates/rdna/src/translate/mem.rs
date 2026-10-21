@@ -1007,26 +1007,83 @@ fn mark_dwords(tr: &mut T, r: usize, d0: Word, n: u32) -> R<()> {
     let inr = e(tr.b.logical_and(b, None, fits, le))?;
     let cond = e(tr.b.logical_and(b, None, marked, inr))?;
     tr.guarded(cond, &mut |tr| {
-        let (five, k31) = (tr.u(5), tr.u(31));
+        let (five, k31, k32) = (tr.u(5), tr.u(31), tr.u(32));
         let w = e(tr.b.shift_right_logical(u, None, d0, five))?;
         let w = e(tr.b.i_add(u, None, base, w))?;
         let lo = e(tr.b.bitwise_and(u, None, d0, k31))?;
         let bits = tr.u((1u32 << n) - 1);
-        let m0 = e(tr.b.shift_left_logical(u, None, bits, lo))?;
-        let scope = tr.u(spirv::Scope::Device as u32);
-        let sem = tr.u(0);
         let z = tr.u(0);
-        let p0 = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, w]))?;
-        e(tr.b.atomic_or(u, None, p0, scope, sem, m0))?;
-        if n > 1 {
-            // Dwords past the word's end go to the next word.
-            let k32 = tr.u(32);
+        // The bits in its word, and those past the word's end in the next.
+        let m0 = e(tr.b.shift_left_logical(u, None, bits, lo))?;
+        let m1 = if n > 1 {
             let end = e(tr.b.i_add(u, None, lo, nn))?;
             let spill = e(tr.b.u_greater_than(b, None, end, k32))?;
-            tr.guarded(spill, &mut |tr| {
-                let k32 = tr.u(32);
-                let sh = e(tr.b.i_sub(u, None, k32, lo))?;
-                let m1 = e(tr.b.shift_right_logical(u, None, bits, sh))?;
+            let sh = e(tr.b.i_sub(u, None, k32, lo))?;
+            let hi = e(tr.b.shift_right_logical(u, None, bits, sh))?;
+            e(tr.b.select(u, None, spill, hi, z))?
+        } else {
+            z
+        };
+        // Lanes whose words lie within four of the first active lane's
+        // (consecutive stores: usually all) combine their bits: one lane
+        // stores at most five words for them. The others store their own.
+        tr.b.capability(spirv::Capability::GroupNonUniform);
+        tr.b.capability(spirv::Capability::GroupNonUniformBallot);
+        tr.b.capability(spirv::Capability::GroupNonUniformArithmetic);
+        let sg = tr.u(spirv::Scope::Subgroup as u32);
+        let first = e(tr.b.group_non_uniform_broadcast_first(u, None, sg, w))?;
+        let dl = e(tr.b.i_sub(u, None, w, first))?;
+        let k4 = tr.u(4);
+        let near = e(tr.b.u_less_than(b, None, dl, k4))?;
+        let (merge, near_b, far_b) = (tr.b.id(), tr.b.id(), tr.b.id());
+        ok(tr.b.selection_merge(merge, spirv::SelectionControl::NONE))?;
+        ok(tr.b.branch_conditional(near, near_b, far_b, []))?;
+        e(tr.b.begin_block(Some(near_b)))?;
+        let words = if n > 1 { 5 } else { 4 };
+        let mut ors = Vec::with_capacity(words);
+        for k in 0..words as u32 {
+            let kk = tr.u(k);
+            let at0 = e(tr.b.i_equal(b, None, dl, kk))?;
+            let mut c = e(tr.b.select(u, None, at0, m0, z))?;
+            if n > 1 && k > 0 {
+                let km = tr.u(k - 1);
+                let at1 = e(tr.b.i_equal(b, None, dl, km))?;
+                let c1 = e(tr.b.select(u, None, at1, m1, z))?;
+                c = e(tr.b.bitwise_or(u, None, c, c1))?;
+            }
+            ors.push(e(tr.b.group_non_uniform_bitwise_or(u, None, sg, spirv::GroupOperation::Reduce, c, None))?);
+        }
+        let el = e(tr.b.group_non_uniform_elect(b, None, sg))?;
+        tr.guarded(el, &mut |tr| {
+            let scope = tr.u(spirv::Scope::Device as u32);
+            let sem = tr.u(0);
+            for (k, &o) in ors.iter().enumerate() {
+                let z = tr.u(0);
+                let any = e(tr.b.i_not_equal(tr.t.bool_, None, o, z))?;
+                tr.guarded(any, &mut |tr| {
+                    let kk = tr.u(k as u32);
+                    let wk = e(tr.b.i_add(u, None, first, kk))?;
+                    let z = tr.u(0);
+                    let p = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, wk]))?;
+                    let scope = tr.u(spirv::Scope::Device as u32);
+                    let sem = tr.u(0);
+                    e(tr.b.atomic_or(u, None, p, scope, sem, o))?;
+                    touch_page(tr, marks, wk)
+                })?;
+            }
+            let _ = (scope, sem);
+            Ok(())
+        })?;
+        ok(tr.b.branch(merge))?;
+        e(tr.b.begin_block(Some(far_b)))?;
+        let scope = tr.u(spirv::Scope::Device as u32);
+        let sem = tr.u(0);
+        let p0 = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, w]))?;
+        e(tr.b.atomic_or(u, None, p0, scope, sem, m0))?;
+        touch_page(tr, marks, w)?;
+        if n > 1 {
+            let any = e(tr.b.i_not_equal(b, None, m1, z))?;
+            tr.guarded(any, &mut |tr| {
                 let one = tr.u(1);
                 let w1 = e(tr.b.i_add(u, None, w, one))?;
                 let z = tr.u(0);
@@ -1034,10 +1091,54 @@ fn mark_dwords(tr: &mut T, r: usize, d0: Word, n: u32) -> R<()> {
                 let scope = tr.u(spirv::Scope::Device as u32);
                 let sem = tr.u(0);
                 e(tr.b.atomic_or(u, None, p1, scope, sem, m1))?;
-                Ok(())
+                touch_page(tr, marks, w1)
             })?;
         }
+        ok(tr.b.branch(merge))?;
+        e(tr.b.begin_block(Some(merge)))?;
         Ok(())
+    })
+}
+
+/// After marking map word `w`: its page's touched bit, and on the page's
+/// first touch in the batch its index appended to the touched-page list
+/// (`kernels::MARK_LIST_AT`; past MARK_LIST_CAP entries only counted: a
+/// range gather takes the rest).
+fn touch_page(tr: &mut T, marks: Word, w: Word) -> R<()> {
+    use crate::kernels::{MARK_LIST_AT, MARK_LIST_CAP, MARK_PAGE_BITS_AT};
+    let (u, b) = (tr.t.u32, tr.t.bool_);
+    let (five, k31, one, z) = (tr.u(5), tr.u(31), tr.u(1), tr.u(0));
+    let page = e(tr.b.shift_right_logical(u, None, w, five))?;
+    let pw = e(tr.b.shift_right_logical(u, None, page, five))?;
+    let at = tr.u(MARK_PAGE_BITS_AT);
+    let pw = e(tr.b.i_add(u, None, at, pw))?;
+    let pbit = e(tr.b.bitwise_and(u, None, page, k31))?;
+    let pb = e(tr.b.shift_left_logical(u, None, one, pbit))?;
+    let scope = tr.u(spirv::Scope::Device as u32);
+    let sem = tr.u(0);
+    let pp = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, pw]))?;
+    let old = e(tr.b.atomic_or(u, None, pp, scope, sem, pb))?;
+    let had = e(tr.b.bitwise_and(u, None, old, pb))?;
+    let first = e(tr.b.i_equal(b, None, had, z))?;
+    tr.guarded(first, &mut |tr| {
+        let (u, b) = (tr.t.u32, tr.t.bool_);
+        let z = tr.u(0);
+        let one = tr.u(1);
+        let la = tr.u(MARK_LIST_AT);
+        let pc = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, la]))?;
+        let scope = tr.u(spirv::Scope::Device as u32);
+        let sem = tr.u(0);
+        let idx = e(tr.b.atomic_i_add(u, None, pc, scope, sem, one))?;
+        let capc = tr.u(MARK_LIST_CAP);
+        let room = e(tr.b.u_less_than(b, None, idx, capc))?;
+        tr.guarded(room, &mut |tr| {
+            let u = tr.t.u32;
+            let z = tr.u(0);
+            let l0 = tr.u(MARK_LIST_AT + 4);
+            let li = e(tr.b.i_add(u, None, l0, idx))?;
+            let pl = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, li]))?;
+            ok(tr.b.store(pl, page, None, []))
+        })
     })
 }
 

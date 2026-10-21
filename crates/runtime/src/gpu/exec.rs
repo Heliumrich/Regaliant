@@ -2571,7 +2571,7 @@ fn gather_pipe() -> Result<&'static MergePipe, String> {
     PIPE.get_or_init(|| {
         let c = ctx();
         unsafe {
-            let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..3)
+            let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..2)
                 .map(|b| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
                 .collect();
             let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("gather set layout: {e}"))?;
@@ -2582,7 +2582,7 @@ fn gather_pipe() -> Result<&'static MergePipe, String> {
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("gather module: {e}"))?;
             let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
             let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
-            let pipeline = super::pcache::with_cache('i', 5, |cache| c.device.create_compute_pipelines(cache, &[ci], None)).map_err(|(_, e)| format!("gather pipeline: {e}"));
+            let pipeline = super::pcache::with_cache('i', 6, |cache| c.device.create_compute_pipelines(cache, &[ci], None)).map_err(|(_, e)| format!("gather pipeline: {e}"));
             c.device.destroy_shader_module(module, None);
             Ok(MergePipe { pipeline: pipeline?[0], layout, set_layout })
         }
@@ -3671,9 +3671,10 @@ struct Slot {
     /// Mirror mode: more staging when the batch uploads more than STAGE_SEG
     /// (level loads; freed when the slot is reused).
     stage_extra: Vec<(vk::Buffer, vk::DeviceMemory, *mut u8)>,
-    /// Mirror mode's write-backs: the gather kernel's output (host memory)
-    /// and its size (grown when a batch needs more).
-    mm_out: (vk::Buffer, vk::DeviceMemory, *mut u8, u64),
+    /// Mirror mode's write-backs: the gather kernel's outputs (host memory;
+    /// records with the dwords, records of masks) and their sizes (grown
+    /// when a batch needs more).
+    mm_out: [(vk::Buffer, vk::DeviceMemory, *mut u8, u64); 2],
     /// The slot's own command pools (its queue's family; the copy queue's,
     /// null without one), so that a whole slot can be reset at once.
     cpool: vk::CommandPool,
@@ -3781,7 +3782,7 @@ impl Slot {
                 pre_cap: 0,
                 stage: None,
                 stage_extra: Vec::new(),
-                mm_out: (vk::Buffer::null(), vk::DeviceMemory::null(), std::ptr::null_mut(), 0),
+                mm_out: [(vk::Buffer::null(), vk::DeviceMemory::null(), std::ptr::null_mut(), 0); 2],
                 xpre,
                 homes: Vec::new(),
                 keep: Vec::new(),
@@ -5305,6 +5306,9 @@ pub struct Exec {
     mm_unsized: bool,
 }
 
+/// The most gather records a batch's output holds (mirror mode; 34 MB).
+const MM_RECORDS_MAX: u64 = 1 << 18;
+
 /// Extra staging per buffer (mirror mode, `Slot::stage_extra`).
 const EXTRA_SEG: u64 = 64 << 20;
 
@@ -5801,6 +5805,11 @@ impl Exec {
             let qp = self.slots[self.cur].queries;
             if qp != vk::QueryPool::null() {
                 ctx().device.cmd_reset_query_pool(self.cmd(), qp, 0, STAMPS * MAX_TIMED + 2);
+            }
+            // Mirror mode: the batch's touched-page list starts empty (the
+            // full barrier below orders it before the batch's work).
+            if let Some(m) = super::resident::marks() {
+                ctx().device.cmd_fill_buffer(self.cmd(), m, rdna::kernels::MARK_LIST_AT as u64 * 4, 4, 0);
             }
         }
         // Every batch follows all earlier ones: also a parallel run's chunks,
@@ -6620,20 +6629,21 @@ impl Exec {
         Some((mbuf, base - res::MIRROR_BASE, hi - base))
     }
 
-    /// Mirror mode's write-back of the batch's written ranges (disjoint
-    /// segments of `owned`, with ranges an earlier gather could not record
-    /// for want of room): at the batch's end the gather kernel records the
-    /// pages with dwords its shaders marked (`Spec::write_marks`) with those
-    /// dwords in host memory and clears their bits, and the batch's first
-    /// completion action stores them to guest memory
-    /// (`resident::apply_records`), before its command-processor effects
-    /// show the batch done. Dwords not written keep what the CPU wrote.
+    /// Mirror mode's write-back: at the batch's end the gather kernel
+    /// (`rdna::kernels::mirror_gather`) records the pages of the batch's
+    /// touched-page list (the pages its shaders marked dwords in:
+    /// `Spec::write_marks`), and the pages of ranges an earlier gather left
+    /// marks in (`resident::take_regather`), with their mask words, in host
+    /// memory; the batch's first completion action copies those pages from
+    /// the mirror and stores the marked dwords to guest memory
+    /// (`resident::apply_masks_copy`; lazily with `DS_MM_LAZY=1`) before its
+    /// command-processor effects show the batch done. Dwords not written
+    /// keep what the CPU wrote. When the list or the output overflows, the
+    /// batch's written ranges (`owned`) are gathered again by range.
     fn record_mirror_writeback(&mut self) -> Result<(), String> {
         use super::resident as res;
-        let Some((mbuf, _)) = res::mirror() else { return Ok(()) };
         let Some(marks) = res::marks() else { return Ok(()) };
         let mut segs: Vec<(u64, u64)> = std::mem::take(&mut self.owned);
-        segs.extend(res::take_regather());
         segs.sort_unstable();
         let mut merged: Vec<(u64, u64)> = Vec::with_capacity(segs.len());
         for (a, e) in segs {
@@ -6642,47 +6652,68 @@ impl Exec {
                 _ => merged.push((a, e)),
             }
         }
-        let pages: u64 = merged.iter().map(|&(a, e)| (e - a) / res::PAGE).sum();
-        // Room for every page up to a size; more waits for a later gather.
-        // Lazy write-backs record the masks alone (`resident::apply_masks`).
-        let eager = res::eager_writebacks();
-        let cap = if eager { pages.min(res::gather_cap()) } else { pages.min(8 * res::gather_cap()) }.max(1);
-        let rec = 4 * if eager { rdna::kernels::GATHER_RECORD_DWORDS } else { rdna::kernels::GATHER_MASK_RECORD_DWORDS } as u64;
-        let (obuf, optr, cap) = self.mm_buffers(4 * rdna::kernels::GATHER_HEADER_DWORDS as u64 + cap * rec, rec)?;
-        unsafe { std::ptr::write_volatile(optr as *mut u32, 0) };
+        let mut leftover = res::take_regather();
+        leftover.sort_unstable();
+        let mut regather: Vec<(u64, u64)> = Vec::with_capacity(leftover.len());
+        for (a, e) in leftover {
+            match regather.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(e),
+                _ => regather.push((a, e)),
+            }
+        }
+        let range_pages: u64 = regather.iter().map(|&(a, e)| (e - a) / res::PAGE).sum();
+        let pages: u64 = merged.iter().map(|&(a, e)| (e - a) / res::PAGE).sum::<u64>().min(rdna::kernels::MARK_LIST_CAP as u64);
+        // Room for every page of the written and leftover ranges (records of
+        // 132 bytes) up to MM_RECORDS_MAX: a page left over is written back
+        // with a later batch, after CPU writes it may then overwrite.
+        let cap = (pages + range_pages).clamp(1, MM_RECORDS_MAX);
+        let rec = 4 * rdna::kernels::GATHER_MASK_RECORD_DWORDS as u64;
+        let (obuf, optr, room) = self.mm_buffers(1, 4 * rdna::kernels::GATHER_HEADER_DWORDS as u64 + cap * rec, rec)?;
+        let cap = room.min(u32::MAX as u64) as u32;
+        unsafe {
+            std::ptr::write_volatile(optr as *mut u32, 0);
+            std::ptr::write_volatile((optr as *mut u32).add(1), 0);
+        }
         let pipe = gather_pipe()?;
         let c = ctx();
         let cmd = self.cmd();
         global_barrier(cmd);
         unsafe { c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe.pipeline) };
         self.dyncache.cs_pipeline = pipe.pipeline;
-        // At most 2^20 pages (4 GiB) per dispatch.
-        const PART: u64 = 1 << 20;
-        for &(a, e) in &merged {
-            let n_all = (e - a) / res::PAGE;
-            let mut at = 0u64;
-            while at < n_all {
-                let n = (n_all - at).min(PART);
-                let first = a + at * res::PAGE - res::MIRROR_BASE;
-                let set = self.alloc_set(pipe.set_layout)?;
-                let infos = [
-                    vk::DescriptorBufferInfo { buffer: marks, offset: first / 32, range: n * 128 },
-                    vk::DescriptorBufferInfo { buffer: mbuf, offset: first, range: n * res::PAGE },
-                    vk::DescriptorBufferInfo { buffer: obuf, offset: 0, range: vk::WHOLE_SIZE },
-                ];
-                let writes: Vec<vk::WriteDescriptorSet> = infos
-                    .iter()
-                    .enumerate()
-                    .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
-                    .collect();
-                let pc: Vec<u8> = [n as u32, cap as u32, (first / res::PAGE) as u32, eager as u32].iter().flat_map(|x| x.to_le_bytes()).collect();
-                unsafe {
-                    c.device.update_descriptor_sets(&writes, &[]);
-                    c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, pipe.layout, 0, &[set], &[]);
-                    c.device.cmd_push_constants(cmd, pipe.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
-                    c.device.cmd_dispatch(cmd, n as u32, 1, 1);
+        let set = self.alloc_set(pipe.set_layout)?;
+        let infos = [vk::DescriptorBufferInfo { buffer: marks, offset: 0, range: res::MARK_BYTES }, vk::DescriptorBufferInfo { buffer: obuf, offset: 0, range: vk::WHOLE_SIZE }];
+        let writes: Vec<vk::WriteDescriptorSet> = infos
+            .iter()
+            .enumerate()
+            .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
+            .collect();
+        let push = |c: &super::vk::Ctx, v: [u32; 4]| {
+            let pc: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            unsafe { c.device.cmd_push_constants(cmd, pipe.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc) };
+        };
+        unsafe {
+            c.device.update_descriptor_sets(&writes, &[]);
+            c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, pipe.layout, 0, &[set], &[]);
+        }
+        // The touched-page list (its header is the dispatch's arguments).
+        push(c, [0, cap, 0, 1]);
+        unsafe { c.device.cmd_dispatch_indirect(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4) };
+        // Ranges an earlier gather left marks in, by range (after the list:
+        // its pages' records come first).
+        if !regather.is_empty() {
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            unsafe { c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]) };
+            const PART: u64 = 1 << 20;
+            for &(a, e) in &regather {
+                let n_all = (e - a) / res::PAGE;
+                let mut at = 0u64;
+                while at < n_all {
+                    let n = (n_all - at).min(PART);
+                    let first = (a - res::MIRROR_BASE) / res::PAGE + at;
+                    push(c, [n as u32, cap, first as u32, 0]);
+                    unsafe { c.device.cmd_dispatch(cmd, n as u32, 1, 1) };
+                    at += n;
                 }
-                at += n;
             }
         }
         unsafe {
@@ -6691,10 +6722,13 @@ impl Exec {
         }
         let base = optr as usize;
         let action: Action = Box::new(move || {
-            let over = if eager { res::apply_records(base as *const u32, cap as u32) } else { res::apply_masks(base as *const u32, cap as u32) };
-            if over > 0 {
-                // The pages left over keep their bits: a later gather takes them.
-                res::regather(&merged, over);
+            let out = base as *const u32;
+            let listed = unsafe { std::ptr::read_volatile(out.add(1)) };
+            let over = if res::lazy_writebacks() { res::apply_masks(out, cap) } else { res::apply_masks_copy(out, cap) };
+            // A full list or output: the batch's written ranges keep marks
+            // (the pages past them): gathered by range next time.
+            if over > 0 || listed > rdna::kernels::MARK_LIST_CAP {
+                res::regather(&merged, over.max(listed.saturating_sub(rdna::kernels::MARK_LIST_CAP)));
             }
         });
         if self.deferred {
@@ -6705,25 +6739,27 @@ impl Exec {
         Ok(())
     }
 
-    /// The current slot's host buffer for mirror write-backs, grown to hold
-    /// at least `bytes`: (buffer, its mapping, records it holds of
-    /// `record` bytes after the header).
-    fn mm_buffers(&mut self, bytes: u64, record: u64) -> Result<(vk::Buffer, *mut u8, u64), String> {
+    /// The current slot's host buffer `k` (0: records with dwords, 1: mask
+    /// records) for mirror write-backs, grown to hold at least `bytes`:
+    /// (buffer, its mapping, records it holds of `record` bytes after the
+    /// header).
+    fn mm_buffers(&mut self, k: usize, bytes: u64, record: u64) -> Result<(vk::Buffer, *mut u8, u64), String> {
         let c = ctx();
         let s = &mut self.slots[self.cur];
-        if s.mm_out.3 < bytes {
+        let o = &mut s.mm_out[k];
+        if o.3 < bytes {
             unsafe {
-                if s.mm_out.0 != vk::Buffer::null() {
-                    c.device.destroy_buffer(s.mm_out.0, None);
-                    c.device.free_memory(s.mm_out.1, None);
+                if o.0 != vk::Buffer::null() {
+                    c.device.destroy_buffer(o.0, None);
+                    c.device.free_memory(o.1, None);
                 }
             }
             let cap = bytes.max(1 << 20).next_power_of_two();
             let (b, m, ptr) = c.host_buffer(cap, vk::BufferUsageFlags::STORAGE_BUFFER)?;
-            s.mm_out = (b, m, ptr, cap);
+            *o = (b, m, ptr, cap);
         }
         let header = 4 * rdna::kernels::GATHER_HEADER_DWORDS as u64;
-        Ok((s.mm_out.0, s.mm_out.2, (s.mm_out.3 - header) / record))
+        Ok((o.0, o.2, (o.3 - header) / record))
     }
 
     /// Mirror mode: the pages of placements that deferred CP writes wrote
@@ -6737,6 +6773,10 @@ impl Exec {
         ranges.sort_unstable();
         let mut at = 0;
         for (lo, hi) in ranges {
+            // Inside a range done already: nothing left.
+            if lo.max(at) >= hi {
+                continue;
+            }
             for p in res::take_cp_pages(lo.max(at), hi) {
                 if self.mirror_stage(mbuf, p).is_none() {
                     return Err(format!("no staging to copy {p:#x}"));
@@ -6769,13 +6809,64 @@ impl Exec {
         copy.extend_from_slice(&claim[claimed..]);
         let _ = self.open_pre();
         for (k, &pg) in claim[..claimed].iter().chain(copy.iter()).enumerate() {
-            if self.mirror_stage(mbuf, pg).is_none() {
-                return false;
+            // Pages with a baseline: only the dwords the CPU changed (dwords
+            // GPU work wrote meanwhile stay in the mirror).
+            match res::baseline_diff(pg, pg as *const u32, k >= claimed) {
+                Some(runs) => {
+                    if !self.mirror_stage_runs(mbuf, pg, &runs) {
+                        return false;
+                    }
+                }
+                None => {
+                    if self.mirror_stage(mbuf, pg).is_none() {
+                        return false;
+                    }
+                }
             }
             if k < claimed {
                 self.res_pages.push(pg);
             }
             self.res_mine.insert(pg);
+        }
+        true
+    }
+
+    /// Copies the dword runs `runs` (first dword, dwords) of guest page `pg`
+    /// into the batch's staging and records their copies into the mirror.
+    fn mirror_stage_runs(&mut self, mbuf: vk::Buffer, pg: u64, runs: &[(u32, u32)]) -> bool {
+        use super::resident as res;
+        let bytes: u64 = runs.iter().map(|r| 4 * r.1 as u64).sum();
+        if bytes == 0 {
+            return true;
+        }
+        let (sbuf, sptr, mut at) = if self.stage_used + bytes <= STAGE_SEG {
+            let Some((sbuf, sptr)) = self.stage_buffer() else { return false };
+            let at = self.stage_used;
+            self.stage_used += bytes;
+            (sbuf, sptr, at)
+        } else {
+            if self.slots[self.cur].stage_extra.is_empty() || self.extra_used + bytes > EXTRA_SEG {
+                match ctx().host_buffer(EXTRA_SEG, vk::BufferUsageFlags::TRANSFER_SRC) {
+                    Ok(x) => {
+                        self.slots[self.cur].stage_extra.push(x);
+                        self.extra_used = 0;
+                    }
+                    Err(e) => {
+                        crate::warn!("gpu[{}]: no extra staging for mirror uploads ({e})", self.name);
+                        return false;
+                    }
+                }
+            }
+            let (sbuf, _, sptr) = *self.slots[self.cur].stage_extra.last().expect("extra staging");
+            let at = self.extra_used;
+            self.extra_used += bytes;
+            (sbuf, sptr, at)
+        };
+        for &(d, n) in runs {
+            let len = 4 * n as u64;
+            unsafe { std::ptr::copy_nonoverlapping((pg + 4 * d as u64) as *const u8, sptr.add(at as usize), len as usize) };
+            self.pre_copies.push((sbuf, mbuf, vk::BufferCopy { src_offset: at, dst_offset: pg - res::MIRROR_BASE + 4 * d as u64, size: len }));
+            at += len;
         }
         true
     }
