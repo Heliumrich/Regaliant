@@ -1724,10 +1724,41 @@ pub fn any_owned(base: u64, len: u64) -> bool {
     false
 }
 
+thread_local! {
+    /// The faulting instruction of the access violation being handled (set
+    /// by the exception handler before `on_fault`).
+    pub static FAULT_RIP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Faults on GPU-owned pages by (thread, instruction) and pages read back
+/// (`owned_line`): who reads what the GPU wrote.
+static FAULT_SITES: Mutex<Option<std::collections::HashMap<(String, u64), (u64, u64)>>> = Mutex::new(None);
+
 /// A fault on a GPU-owned page (any access): its run is read back (waiting
 /// for the owner batch); true: retry the access.
 fn owned_fault(page: u64) -> bool {
     OWN_STATS[O_FAULTS].fetch_add(1, Ordering::Relaxed);
+    let site = (crate::log::thread_name(), FAULT_RIP.with(|r| r.get()));
+    let r = owned_fault_inner(page);
+    let mut g = FAULT_SITES.lock();
+    let e = g.get_or_insert_with(Default::default).entry(site).or_default();
+    e.0 += 1;
+    e.1 += r.unwrap_or(0);
+    r.is_some()
+}
+
+fn owned_fault_inner(page: u64) -> Option<u64> {
+    match release_owned(page) {
+        Some(n) => Some(n),
+        None => {
+            crate::error!("resident: GPU-owned page {page:#x} could not be read back");
+            None
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn owned_fault_old(page: u64) -> bool {
     match release_owned(page) {
         Some(_) => true,
         None => {
@@ -1806,7 +1837,7 @@ fn release_owned(page: u64) -> Option<u64> {
     if owner == 0 || owner & OWN_REC != 0 {
         return Some(0);
     }
-    if !super::exec::wait_done_for(owner, std::time::Duration::from_secs(10)) {
+    if !super::exec::wait_gpu_done_for(owner, std::time::Duration::from_secs(10)) {
         crate::error!("resident: batch {owner} (owner of {page:#x}) did not complete within 10 s");
         return None;
     }
@@ -1874,6 +1905,47 @@ fn release_owned(page: u64) -> Option<u64> {
     r.ok().map(|_| (e - a) / PAGE)
 }
 
+/// What mirror mode's placement does with a page (`mm_page`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MmPage {
+    /// The mirror holds its current contents (uploaded by a submitted batch,
+    /// or GPU-owned).
+    Current,
+    /// Needs an upload with a claim (armed, so a later CPU write faults).
+    Claim,
+    /// Copied into this batch without a claim: its writes are not tracked
+    /// (volatile, being written by a host write, not plain read-write) or
+    /// another batch's upload of it is pending.
+    Copy,
+    /// Host class: imported (CP writes), never in the mirror.
+    Host,
+}
+
+/// Mirror mode's view of the page at `p` (`mine`: pages this batch uploads).
+pub fn mm_page(p: u64, mine: &super::fx::Set<u64>) -> MmPage {
+    let Some(c) = chunk(p, false) else { return MmPage::Claim };
+    let i = idx(p);
+    let s = c.pages[i].load(Ordering::Acquire);
+    if s & ST_HOST != 0 {
+        return MmPage::Host;
+    }
+    if c.owner[i].load(Ordering::Acquire) != 0 && s & ST_VALID != 0 {
+        return MmPage::Current;
+    }
+    if mine.contains(&p) {
+        return MmPage::Current;
+    }
+    let seq = c.seqs[i].load(Ordering::Acquire);
+    if s & (ST_VOLATILE | ST_BUSY) != 0 || c.writing[i].load(Ordering::Acquire) != 0 || seq == PENDING {
+        return MmPage::Copy;
+    }
+    if s & (ST_VALID | ST_ARMED) == ST_VALID | ST_ARMED && seq != 0 {
+        MmPage::Current
+    } else {
+        MmPage::Claim
+    }
+}
+
 /// Mirror mode's status line part.
 pub fn owned_line() -> String {
     if !mirror_mode() {
@@ -1892,7 +1964,23 @@ pub fn owned_line() -> String {
         v[O_NS] as f64 / v[O_RUNS].max(1) as f64 / 1000.0,
         v[O_EXPLICIT],
         v[O_REMAP_DROPS]
-    )
+    ) + &fault_sites_line()
+}
+
+fn fault_sites_line() -> String {
+    let g = FAULT_SITES.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(&(String, u64), &(u64, u64))> = m.iter().collect();
+    v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    let parts: Vec<String> = v
+        .iter()
+        .take(16)
+        .map(|((t, rip), (n, pages))| {
+            let at = if *rip >= crate::mem::GUEST_BASE && *rip < crate::mem::GUEST_END { crate::exception::describe_guest(*rip) } else { crate::exception::host_symbol(*rip) };
+            format!("{t} at {at}: {n} faults, {pages} pages")
+        })
+        .collect();
+    format!("      faults on GPU-owned pages by site (pages read back): {}\n", parts.join("; "))
 }
 
 /// Mirror mode's boot self-test: the read-back context can be made and a

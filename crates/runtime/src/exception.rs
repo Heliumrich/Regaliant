@@ -1198,8 +1198,12 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
         if code == 0xC0000005 && rec.NumberParameters >= 2 && crate::sections::wait_split(rec.ExceptionInformation[1] as u64) {
             return -1; // EXCEPTION_CONTINUE_EXECUTION
         }
-        // A CPU write to a page the residency mirror armed (`gpu::resident`).
-        if code == 0xC0000005 && rec.NumberParameters >= 2 && rec.ExceptionInformation[0] == 1 && crate::gpu::resident::on_fault(rec.ExceptionInformation[1] as u64, true) {
+        // A CPU write to a page the residency mirror armed, or any access to
+        // a GPU-owned page of mirror mode (`gpu::resident`).
+        if code == 0xC0000005 && rec.NumberParameters >= 2 && {
+            crate::gpu::resident::FAULT_RIP.with(|r| r.set((*(*info).ContextRecord).Rip));
+            crate::gpu::resident::on_fault(rec.ExceptionInformation[1] as u64, rec.ExceptionInformation[0] == 1)
+        } {
             return -1; // EXCEPTION_CONTINUE_EXECUTION
         }
         // A CPU write to a write-tracked guest page (texture cache).
