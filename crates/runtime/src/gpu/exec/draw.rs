@@ -1086,6 +1086,12 @@ impl Exec {
             ps = if ps_addr != 0 { Some(shaders::prepare_ps(cp)?) } else { None };
         }
         lap.mark(2);
+        // Measurement: what differs from the last draw of the same programs
+        // on this executor (batching candidates; profiling only).
+        if super::profiling() {
+            let sig = draw_sig(&vs, ps.as_ref());
+            note_draw_diff(&mut self.last_draw_sig, sig);
+        }
         let t_prep = since(t0);
         let mut textures = std::mem::take(&mut self.tex_scratch);
         textures.clear();
@@ -1816,4 +1822,58 @@ impl Exec {
         }
         Ok(true)
     }
+}
+
+/// Draws after a draw of the same programs on the same executor, by what
+/// differs: [nothing, the user data only, buffer resources (images the
+/// same), image resources]; and draws of other programs (profiling).
+static DRAW_DIFFS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// A draw's programs and hashes of its buffer resources, image and sampler
+/// resources and user data.
+fn draw_sig(vs: &shaders::Prepared, ps: Option<&shaders::Prepared>) -> [u64; 5] {
+    use std::hash::{Hash, Hasher};
+    let (mut hb, mut hi, mut hu) = (std::collections::hash_map::DefaultHasher::new(), std::collections::hash_map::DefaultHasher::new(), std::collections::hash_map::DefaultHasher::new());
+    for p in std::iter::once(vs).chain(ps) {
+        for r in p.resources.iter() {
+            match r {
+                shaders::Resolved::Buffer(v) => v.hash(&mut hb),
+                shaders::Resolved::Global(a, n) => (a, n).hash(&mut hb),
+                shaders::Resolved::Image(t) => t.hash(&mut hi),
+                shaders::Resolved::ImageTable(e) => e.hash(&mut hi),
+                shaders::Resolved::Sampler(sm) => sm.hash(&mut hi),
+            }
+        }
+        let n = p.sgpr_data.len().min(rdna::translate::SGPR_DATA_USER as usize);
+        p.sgpr_data[..n].hash(&mut hu);
+    }
+    [vs.addr, ps.map_or(0, |p| p.addr), hb.finish(), hi.finish(), hu.finish()]
+}
+
+fn note_draw_diff(last: &mut [u64; 5], sig: [u64; 5]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let k = if sig[0] != last[0] || sig[1] != last[1] {
+        4
+    } else if sig[2] == last[2] && sig[3] == last[3] {
+        if sig[4] == last[4] { 0 } else { 1 }
+    } else if sig[3] == last[3] {
+        2
+    } else {
+        3
+    };
+    DRAW_DIFFS[k].fetch_add(1, Relaxed);
+    *last = sig;
+}
+
+/// Status part: `DRAW_DIFFS`.
+pub(super) fn draw_diff_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v: Vec<u64> = DRAW_DIFFS.iter().map(|c| c.load(Relaxed)).collect();
+    if v.iter().sum::<u64>() == 0 {
+        return String::new();
+    }
+    format!(
+        "    draws after a draw of the same programs (same executor): nothing different {}, the user data only {}, buffer resources (same images) {}, image resources {}; after other programs {}\n",
+        v[0], v[1], v[2], v[3], v[4]
+    )
 }

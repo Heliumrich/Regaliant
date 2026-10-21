@@ -5243,6 +5243,9 @@ pub struct Exec {
     shared_kept: Vec<u64>,
     /// A draw's texture ranges (`texture_ranges_into`), reused per draw.
     tex_scratch: Vec<((u64, u64), super::desc::Tsharp)>,
+    /// The last draw's programs and hashes of its buffer resources, image
+    /// resources and user data (profiling: `exec::draw::DRAW_DIFFS`).
+    last_draw_sig: [u64; 5],
     /// Speculations on words this batch writes (`speculate`): checked once
     /// it completed, its sequence set at submission.
     own_checks: Vec<SpecCheck>,
@@ -5537,6 +5540,7 @@ impl Exec {
                 shared_pending: Vec::new(),
                 shared_kept: Vec::new(),
                 tex_scratch: Vec::new(),
+                last_draw_sig: [0; 5],
                 own_checks: Vec::new(),
                 race_pending: Vec::new(),
                 race_id: RACE_IDS.fetch_add(1, Ordering::Relaxed),
@@ -10317,6 +10321,7 @@ pub fn status() -> String {
         + &crate::titlemem::status()
         + &crate::titlefix::status()
         + &super::cp::draw_state_line()
+        + &draw::draw_diff_line()
         + &super::xwait::status()
         + &super::resident::owned_line()
         + &mm_place_line()
