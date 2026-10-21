@@ -5839,10 +5839,13 @@ impl Exec {
         // Every batch follows all earlier ones: also a parallel run's chunks,
         // which the title left unordered, as their shadows of a buffer they
         // all write (the culls' appends) are copied in and merged back per
-        // batch (FINDINGS.md 2026-10-14 night).
+        // batch (FINDINGS.md 2026-10-14 night). (`tune skip_barriers` 64:
+        // left out, timing only.)
         self.ops = [0; OPS];
         self.segs.clear();
-        self.barrier();
+        if super::tune::skip_barriers() & 64 == 0 {
+            self.barrier();
+        }
         self.barrier_wanted = false;
         self.dispatched = false;
         let qp = self.slots[self.cur].queries;
@@ -7863,8 +7866,11 @@ impl Exec {
                     c.device.cmd_reset_query_pool(pre, qp, STAMPS * MAX_TIMED + 2, 2);
                 }
             }
-            // After all earlier submitted work.
-            global_barrier(pre);
+            // After all earlier submitted work (`tune skip_barriers` 128:
+            // left out, timing only).
+            if super::tune::skip_barriers() & 128 == 0 {
+                global_barrier(pre);
+            }
             if qp != vk::QueryPool::null() {
                 unsafe { c.device.cmd_write_timestamp(pre, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED + 2) };
             }
