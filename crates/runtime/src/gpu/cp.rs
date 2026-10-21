@@ -181,19 +181,47 @@ pub enum Space {
 /// (`Cp::draw`; `draw_state_line`).
 pub static DRAW_STATE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-/// For the status report (`DRAW_STATE`).
+/// Runs of draws with the last draw's context registers, programs and
+/// primitive type, by length (1, 2, 3-4, 5-8, 9-16, 17-32, more): [runs,
+/// draws].
+static DRAW_RUNS: [[AtomicU64; 2]; 7] = [const { [const { AtomicU64::new(0) }; 2] }; 7];
+
+fn note_draw_run(n: u32) {
+    if n == 0 {
+        return;
+    }
+    let k = match n {
+        1 => 0,
+        2 => 1,
+        3..=4 => 2,
+        5..=8 => 3,
+        9..=16 => 4,
+        17..=32 => 5,
+        _ => 6,
+    };
+    DRAW_RUNS[k][0].fetch_add(1, Ordering::Relaxed);
+    DRAW_RUNS[k][1].fetch_add(n as u64, Ordering::Relaxed);
+}
+
+/// For the status report (`DRAW_STATE`, `DRAW_RUNS`).
 pub fn draw_state_line() -> String {
     let d: Vec<u64> = DRAW_STATE.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     if d[0] == 0 {
         return String::new();
     }
+    let runs: Vec<String> = ["1", "2", "3-4", "5-8", "9-16", "17-32", ">32"]
+        .iter()
+        .zip(DRAW_RUNS.iter())
+        .map(|(l, r)| format!("{l}: {} runs, {} draws", r[0].load(Ordering::Relaxed), r[1].load(Ordering::Relaxed)))
+        .collect();
     format!(
-        "    draws with the last draw's context registers: {} of {} ({:.1}%), {} with its programs and primitive type too ({:.1}%)\n",
+        "    draws with the last draw's context registers: {} of {} ({:.1}%), {} with its programs and primitive type too ({:.1}%); runs of such draws by length: {}\n",
         d[1],
         d[0],
         100.0 * d[1] as f64 / d[0] as f64,
         d[2],
-        100.0 * d[2] as f64 / d[0] as f64
+        100.0 * d[2] as f64 / d[0] as f64,
+        runs.join(", ")
     )
 }
 
@@ -221,6 +249,9 @@ pub struct Cp {
     /// primitive type.
     ctx_dirty: bool,
     last_draw_progs: (u64, u64, u32),
+    /// Draws in the current run of draws with the last draw's context
+    /// registers, programs and primitive type (`note_draw_run`).
+    same_run: u32,
     pub compute: bool,
     pub regs: Regs,
     index_base: u64,
@@ -1322,6 +1353,7 @@ impl Cp {
             repeat_ok: false,
             ctx_dirty: true,
             last_draw_progs: (0, 0, 0),
+            same_run: 0,
             compute,
             regs: Regs::new(),
             index_base: 0,
@@ -2683,11 +2715,19 @@ impl Cp {
         // dynamic state and pipeline from the last one could.
         let progs = (super::shaders::ngg_addr(self), super::shaders::ps_addr(self), self.reg(Space::Uc, 0x242));
         DRAW_STATE[0].fetch_add(1, Ordering::Relaxed);
+        let same = !self.ctx_dirty && progs == self.last_draw_progs;
         if !self.ctx_dirty {
             DRAW_STATE[1].fetch_add(1, Ordering::Relaxed);
-            if progs == self.last_draw_progs {
+            if same {
                 DRAW_STATE[2].fetch_add(1, Ordering::Relaxed);
             }
+        }
+        // Runs of such draws (batching candidates), by length.
+        if same {
+            self.same_run += 1;
+        } else {
+            note_draw_run(self.same_run);
+            self.same_run = 1;
         }
         self.ctx_dirty = false;
         self.last_draw_progs = progs;
