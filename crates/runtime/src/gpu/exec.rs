@@ -5257,6 +5257,8 @@ pub struct Exec {
     /// (profiling: `exec::draw::CONSEC_DIFFS`).
     pub(crate) draw_same: bool,
     last_draw_end: (u64, u64),
+    /// The last draw's GPU-read arguments and index base (`DS_DRAW_STATS`).
+    last_draw_where: (Option<u64>, Option<u64>),
     /// The last full draw, when a draw right after it can be recorded on the
     /// state it left (`draw_again`), and the stages of the full draw in
     /// progress as prepared (before binding filled their SGPR data).
@@ -5559,6 +5561,7 @@ impl Exec {
                 last_draw_sig: [0; 5],
                 draw_same: false,
                 last_draw_end: (u64::MAX, 0),
+                last_draw_where: (None, None),
                 again: None,
                 again_next: None,
                 own_checks: Vec::new(),

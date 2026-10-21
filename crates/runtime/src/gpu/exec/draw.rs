@@ -1093,7 +1093,27 @@ impl Exec {
             // Consecutive: nothing recorded since the last full draw (repeats
             // record on its state) and the same context state.
             let consecutive = self.draw_same && (self.batch_count, self.cmd_uses.get()) == self.last_draw_end;
-            note_draw_diff(&mut self.last_draw_sig, sig, consecutive);
+            let k = note_draw_diff(&mut self.last_draw_sig, sig, consecutive);
+            // Batched-draw candidates (buffers differ): where their arguments
+            // and indices are against the draw before.
+            let here = (gpu.map(|g| g.addr), a.index.map(|i| i.0));
+            if consecutive && k == 2 {
+                let (args, index) = self.last_draw_where;
+                let c = &BATCH_CANDS;
+                match (here.0, args) {
+                    (Some(x), Some(y)) if x == y + 20 => c[1].fetch_add(1, Ordering::Relaxed),
+                    (Some(x), Some(y)) if x == y => c[2].fetch_add(1, Ordering::Relaxed),
+                    (Some(_), _) => c[3].fetch_add(1, Ordering::Relaxed),
+                    (None, _) => c[0].fetch_add(1, Ordering::Relaxed),
+                };
+                match (here.1, index) {
+                    (Some(x), Some(y)) if x == y => c[4].fetch_add(1, Ordering::Relaxed),
+                    (Some(x), Some(y)) if x.abs_diff(y) < 64 << 20 => c[5].fetch_add(1, Ordering::Relaxed),
+                    (Some(_), _) => c[6].fetch_add(1, Ordering::Relaxed),
+                    (None, _) => c[7].fetch_add(1, Ordering::Relaxed),
+                };
+            }
+            self.last_draw_where = here;
         }
         // A draw right after the last full draw, with its context state and
         // the same stages (`tune draw_again`): one more draw call on the
@@ -1952,7 +1972,7 @@ static AGAIN: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// `profile reset`: the draw statistics of this module.
 pub(super) fn reset_draw_stats() {
-    for c in DRAW_DIFFS.iter().chain(CONSEC_DIFFS.iter()).chain(AGAIN.iter()) {
+    for c in DRAW_DIFFS.iter().chain(CONSEC_DIFFS.iter()).chain(AGAIN.iter()).chain(BATCH_CANDS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
 }
@@ -2126,7 +2146,13 @@ fn draw_sig(vs: &shaders::Prepared, ps: Option<&shaders::Prepared>) -> [u64; 5] 
     [vs.addr, ps.map_or(0, |p| p.addr), hb.finish(), hi.finish(), hu.finish()]
 }
 
-fn note_draw_diff(last: &mut [u64; 5], sig: [u64; 5], consecutive: bool) {
+/// Batched-draw candidates (right after a like draw, buffers differing):
+/// [arguments read by the CPU or none, GPU-read arguments 20 bytes after the
+/// draw before's, at the same address, elsewhere; the same index base, one
+/// within 64 MiB, farther, not indexed].
+static BATCH_CANDS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+fn note_draw_diff(last: &mut [u64; 5], sig: [u64; 5], consecutive: bool) -> usize {
     use std::sync::atomic::Ordering::Relaxed;
     let k = if sig[0] != last[0] || sig[1] != last[1] {
         4
@@ -2142,6 +2168,7 @@ fn note_draw_diff(last: &mut [u64; 5], sig: [u64; 5], consecutive: bool) {
         CONSEC_DIFFS[k].fetch_add(1, Relaxed);
     }
     *last = sig;
+    k
 }
 
 /// Status part: `DRAW_DIFFS`.
@@ -2152,8 +2179,9 @@ pub(super) fn draw_diff_line() -> String {
         return String::new();
     }
     let c: Vec<u64> = CONSEC_DIFFS.iter().map(|x| x.load(Relaxed)).collect();
+    let b: Vec<u64> = BATCH_CANDS.iter().map(|x| x.load(Relaxed)).collect();
     format!(
-        "    draws after a draw of the same programs (same executor): nothing different {}, the user data only {}, buffer resources (same images) {}, image resources {}; after other programs {}; right after it with the same context state (nothing recorded between): nothing different {}, the user data only {}, buffer resources {}, image resources {}\n",
-        v[0], v[1], v[2], v[3], v[4], c[0], c[1], c[2], c[3]
+        "    draws after a draw of the same programs (same executor): nothing different {}, the user data only {}, buffer resources (same images) {}, image resources {}; after other programs {}; right after it with the same context state (nothing recorded between): nothing different {}, the user data only {}, buffer resources {}, image resources {}; of the last, arguments by the CPU or none {}, GPU-read arguments next to the last's {}, at the same address {}, elsewhere {}; index base the same {}, within 64 MiB {}, farther {}, not indexed {}\n",
+        v[0], v[1], v[2], v[3], v[4], c[0], c[1], c[2], c[3], b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]
     )
 }
