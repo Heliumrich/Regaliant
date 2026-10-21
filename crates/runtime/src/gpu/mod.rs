@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 144] = [
+    static ALL: [Tunable; 145] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -171,6 +171,7 @@ pub mod tune {
         Tunable { name: "skip_cmds", env: "DS_SKIP_CMDS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "xwait_skip", env: "DS_XWAIT_SKIP", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "addresses", env: "DS_ADDRESSES", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "batch_cs", env: "DS_BATCH_CS", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1551,6 +1552,15 @@ pub mod tune {
     #[inline]
     pub fn addresses() -> bool {
         get(143) != 0 && super::vk::ctx().device_addresses
+    }
+
+    /// Consecutive direct dispatches of a program run as one dispatch
+    /// (`Spec::batched`; programs seen in runs, `shaders::mark_batchable`).
+    /// Needs bufferDeviceAddress (batched translations address their
+    /// buffers).
+    #[inline]
+    pub fn batch_cs() -> bool {
+        get(144) != 0 && super::vk::ctx().device_addresses
     }
 
     /// A switch's value by name; None if unknown.

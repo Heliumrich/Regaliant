@@ -254,7 +254,20 @@ pub struct Spec {
     /// Accesses outside the range read 0 (the block's zero page) and do not
     /// write, as robust buffer access did for descriptors.
     pub addresses: bool,
+    /// Compute, with `addresses`: one dispatch runs consecutive dispatches of
+    /// the program (`BATCH_ENTRY_DWORDS` per workgroup): the push constant
+    /// at byte 0 holds the dword offset of a table in the SGPR data binding
+    /// (the whole ring), and workgroup x's entry gives its command's SGPR
+    /// data offset and its workgroup x within that command.
+    pub batched: bool,
 }
+
+/// Dwords per workgroup in a batched dispatch's table (`Spec::batched`):
+/// the command's SGPR data offset, the workgroup's x in its command.
+pub const BATCH_ENTRY_DWORDS: u32 = 2;
+/// A batched translation's push constant with this bit set holds the
+/// command's own SGPR data offset (a dispatch of its own, no table).
+pub const BATCH_SINGLE: u32 = 1 << 31;
 
 /// The byte offset of a stage's SGPR data offset in the push constants
 /// (`Spec::sgpr_pc`): the vertex and pixel stages of a draw push both.
@@ -303,6 +316,9 @@ impl std::hash::Hash for Spec {
         }
         if self.addresses {
             0x4144_4452u32.hash(state);
+        }
+        if self.batched {
+            0x4241_5443u32.hash(state);
         }
     }
 }
@@ -442,6 +458,9 @@ pub struct Output {
     /// The stage reads its SGPR data offset from the push constants at this
     /// byte offset (`Spec::sgpr_pc`).
     pub sgpr_pc: Option<u32>,
+    /// `Spec::batched`: the SGPR data binding is the whole ring and the push
+    /// constant at byte 0 the dword offset of the workgroups' table.
+    pub batched: bool,
 }
 
 /// Dwords of user data at the start of the SGPR data buffer.
@@ -688,6 +707,9 @@ pub(crate) struct T<'a> {
     /// load and store (the gate ran 35% slower, GPU-bound).
     pub addr_vals: HashMap<usize, (Word, Word)>,
     pub zero_addr: Option<Word>,
+    /// `Spec::batched`: this workgroup's x within its command, and its
+    /// WorkgroupId as loaded (loaded once in the entry block).
+    pub batch_wg: Option<(Word, Word)>,
 }
 
 pub type R<T> = Result<T, String>;
@@ -981,10 +1003,17 @@ impl<'a> T<'a> {
         e(self.b.load(self.t.u32, None, p, None, []))
     }
 
+    /// Reads dword `i` of the SGPR data binding itself (no command offset).
+    pub fn sgpr_raw(&mut self, i: Word) -> R<Word> {
+        let z = self.u(0);
+        let p = e(self.b.access_chain(self.t.sb_u32, None, self.sgpr_data, [z, i]))?;
+        e(self.b.load(self.t.u32, None, p, None, []))
+    }
+
     /// The SGPR data binding's index of dword `i` of the command's data:
     /// offset by the command's base with `Spec::sgpr_pc`.
     pub fn sgpr_index(&mut self, i: Word) -> R<Word> {
-        if self.spec.sgpr_pc.is_none() {
+        if self.spec.sgpr_pc.is_none() && !self.spec.batched {
             return Ok(i);
         }
         let base = self.sgpr_base.ok_or("SGPR data read before its offset was loaded")?;
@@ -1911,6 +1940,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         addr_info_at: addr_info_offset(plan),
         addr_vals: HashMap::default(),
         zero_addr: None,
+        batch_wg: None,
     };
     let mut elected: Vec<u32> = tr.elections.keys().copied().collect();
     elected.sort();
@@ -2125,7 +2155,42 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     }
     // The command's SGPR data offset (`Spec::sgpr_pc`), loaded once in the
     // entry block (after its variables), which dominates every read.
-    if let Some(off) = spec.sgpr_pc {
+    if spec.batched && spec.stage == Stage::Compute {
+        // The table's offset (push constant byte 0), this workgroup's entry:
+        // its command's SGPR data offset and its x within that command.
+        let st = tr.b.id();
+        tr.b.type_struct_id(Some(st), [tr.t.u32]);
+        tr.b.decorate(st, Decoration::Block, []);
+        tr.b.member_decorate(st, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
+        let pt = tr.b.type_pointer(None, StorageClass::PushConstant, st);
+        let var = tr.global_var(pt, StorageClass::PushConstant);
+        let pu = tr.b.type_pointer(None, StorageClass::PushConstant, tr.t.u32);
+        let z = tr.u(0);
+        let p = e(tr.b.access_chain(pu, None, var, [z]))?;
+        let pc = e(tr.b.load(tr.t.u32, None, p, None, []))?;
+        let wid = tr.input(tr.t.v3u, Some(BuiltIn::WorkgroupId), None);
+        let w = e(tr.b.load(tr.t.v3u, None, wid, None, []))?;
+        let gx = e(tr.b.composite_extract(tr.t.u32, None, w, [0]))?;
+        // [`BATCH_SINGLE`] set: a dispatch of its own, the value its SGPR
+        // data offset (indirect dispatches, ones the runtime does not batch).
+        let flag = tr.u(BATCH_SINGLE);
+        let low = tr.u(!BATCH_SINGLE);
+        let fl = e(tr.b.bitwise_and(tr.t.u32, None, pc, flag))?;
+        let single = e(tr.b.i_not_equal(tr.t.bool_, None, fl, z))?;
+        let own = e(tr.b.bitwise_and(tr.t.u32, None, pc, low))?;
+        let k = tr.u(BATCH_ENTRY_DWORDS);
+        let at = e(tr.b.i_mul(tr.t.u32, None, gx, k))?;
+        let at = e(tr.b.i_add(tr.t.u32, None, at, pc))?;
+        let at = e(tr.b.select(tr.t.u32, None, single, z, at))?;
+        let one = tr.u(1);
+        let at1 = e(tr.b.i_add(tr.t.u32, None, at, one))?;
+        let base = tr.sgpr_raw(at)?;
+        let local = tr.sgpr_raw(at1)?;
+        let base = e(tr.b.select(tr.t.u32, None, single, own, base))?;
+        let local = e(tr.b.select(tr.t.u32, None, single, gx, local))?;
+        tr.sgpr_base = Some(base);
+        tr.batch_wg = Some((local, w));
+    } else if let Some(off) = spec.sgpr_pc {
         // A struct type of its own (rspirv merges identical ones, and
         // this one's member offset is the stage's).
         let st = tr.b.id();
@@ -2252,7 +2317,9 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     }
     let spirv = tr.b.module().assemble();
     let param_mask = tr.out_params.keys().filter(|&&p| p < 32).fold(0u32, |m, &p| m | 1 << p);
-    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc: spec.sgpr_pc })
+    let batched = spec.batched && spec.stage == Stage::Compute;
+    let sgpr_pc = if batched { Some(0) } else { spec.sgpr_pc };
+    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched })
 }
 
 /// Wave-mask mode for the shader at `addr` (diagnosis: `DS_WAVEMASK=0`
@@ -2935,6 +3002,7 @@ mod tests {
             base_instance_sgpr: None,
             sgpr_pc: None,
             addresses: false,
+            batched: false,
         }
     }
 

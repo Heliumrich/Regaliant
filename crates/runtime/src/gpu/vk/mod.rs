@@ -606,6 +606,11 @@ pub mod mark {
 
 /// Records a diagnostic checkpoint (DS_GPU_CHECKPOINTS=1): `kind` and a
 /// 56-bit value (shader or guest address, sequence number).
+/// Diagnostic checkpoints are recorded (VK_NV_device_diagnostic_checkpoints).
+pub fn checkpoints_on() -> bool {
+    try_ctx().is_some_and(|c| c.checkpoints.is_some())
+}
+
 pub fn checkpoint(cmd: vk::CommandBuffer, kind: u64, value: u64) {
     if let Some(c) = try_ctx() {
         if let Some(cp) = &c.checkpoints {

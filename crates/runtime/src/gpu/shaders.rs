@@ -886,6 +886,31 @@ const CS_USER_DATA: u32 = 0x240;
 
 /// Resolves and translates the compute shader bound on `cp`. `wave64` comes
 /// from the dispatch initiator (CS_W32_EN clear).
+/// Programs dispatched in runs of consecutive direct dispatches (`tune
+/// batch_cs`, `Exec::note_cs_streak`): translated batched (`Spec::batched`).
+static BATCHABLE: [std::sync::atomic::AtomicU64; 64] = [const { std::sync::atomic::AtomicU64::new(0) }; 64];
+
+pub fn batchable(addr: u64) -> bool {
+    BATCHABLE.iter().any(|a| a.load(std::sync::atomic::Ordering::Relaxed) == addr)
+}
+
+/// Marks program `addr` batchable (at most 64 programs).
+pub fn mark_batchable(addr: u64) {
+    use std::sync::atomic::Ordering;
+    if batchable(addr) {
+        return;
+    }
+    for a in &BATCHABLE {
+        if a.compare_exchange(0, addr, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            crate::info!("gpu: cs {addr:#x} batched from now on (runs of consecutive dispatches)");
+            return;
+        }
+        if a.load(Ordering::Acquire) == addr {
+            return;
+        }
+    }
+}
+
 pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prepared, String> {
     let sh = |i: u32| cp.sh(i);
     let addr = ((sh(CS_PGM_LO) as u64) | ((sh(CS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
@@ -922,7 +947,8 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         lane_votes: false,
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Compute)),
-        addresses: super::tune::addresses(),
+        addresses: super::tune::addresses() || (super::tune::batch_cs() && batchable(addr)),
+        batched: super::tune::batch_cs() && batchable(addr),
     };
     if super::tune::per_lane() != 0 && per_lane_program(code_hash) {
         let votes = lane_votes_program(code_hash);
@@ -1083,6 +1109,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Fragment)),
         addresses: super::tune::addresses(),
+        batched: false,
     };
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
@@ -1234,6 +1261,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         base_instance_sgpr: BASE_INSTANCE.with(|c| c.get()).map(|k| 8 + k),
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Vertex)),
         addresses: super::tune::addresses(),
+        batched: false,
     };
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
@@ -1854,6 +1882,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         base_instance_sgpr,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Vertex)),
         addresses: super::tune::addresses(),
+        batched: false,
     })
 }
 
@@ -1889,6 +1918,7 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Fragment)),
         addresses: super::tune::addresses(),
+        batched: false,
     }
 }
 
@@ -1923,7 +1953,8 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         lane_votes: false,
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Compute)),
-        addresses: super::tune::addresses(),
+        addresses: super::tune::addresses() || (super::tune::batch_cs() && batchable(addr)),
+        batched: super::tune::batch_cs() && batchable(addr),
     };
     if super::tune::per_lane() != 0 && per_lane_program(code_hash) {
         let votes = lane_votes_program(code_hash);

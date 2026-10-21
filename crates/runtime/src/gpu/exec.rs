@@ -1635,12 +1635,15 @@ fn note_push(partial: bool, pushed: usize, left: usize) {
 pub(super) fn push_line() -> String {
     let v: Vec<u64> = PUSH_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    descriptor pushes: {} full, {} partial; {} descriptors pushed, {} left out as unchanged; buffer bindings by device address {}\n",
+        "    descriptor pushes: {} full, {} partial; {} descriptors pushed, {} left out as unchanged; buffer bindings by device address {}; batched dispatches {} holding {} more commands, {} commands of batched programs on their own\n",
         v[0],
         v[1],
         v[2],
         v[3],
-        ADDRESSED.load(Ordering::Relaxed)
+        ADDRESSED.load(Ordering::Relaxed),
+        BATCHED[1].load(Ordering::Relaxed),
+        BATCHED[0].load(Ordering::Relaxed),
+        BATCHED[2].load(Ordering::Relaxed)
     )
 }
 
@@ -3655,7 +3658,7 @@ impl Slot {
             };
             // SGPR data in system memory: a copy in video memory, read by
             // every invocation, made no measurable difference (`tune ring_vram`).
-            let (ring, _mem, ring_ptr) = c.host_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)?;
+            let (ring, _mem, ring_ptr) = c.host_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER)?;
             SLOT_MEM[0].fetch_add(1, Ordering::Relaxed);
             SLOT_MEM[5].fetch_add(RING_SEG, Ordering::Relaxed);
             Ok(Slot {
@@ -5174,6 +5177,78 @@ pub struct Exec {
     cmd_uses: std::cell::Cell<u64>,
     /// Batches begun (the repeat checks it).
     batch_count: u64,
+    /// The program of the last direct dispatches and how many in a row
+    /// (`tune batch_cs`: a run of BATCH_STREAK makes it batchable).
+    cs_streak: (u64, u32),
+    /// The open batched dispatch (`tune batch_cs`).
+    cs_run: Option<CsRun>,
+}
+
+/// Consecutive direct dispatches of a program that make it batchable, each
+/// of at most BATCH_SMALL workgroups (per-dispatch costs dominate there;
+/// larger dispatches of buffer-heavy programs lose more to the GPU cost of
+/// device addresses than batching saves).
+const BATCH_STREAK: u32 = 4;
+const BATCH_SMALL: u64 = 64;
+/// Workgroups one batched dispatch may hold (its table in the SGPR ring:
+/// `BATCH_ENTRY_DWORDS` each).
+const BATCH_MAX_GROUPS: u32 = 4096;
+
+/// A batched dispatch open for more commands of its program (`Spec::batched`):
+/// recorded as an indirect dispatch whose group count, in the SGPR ring,
+/// grows with every command appended while nothing else is recorded.
+struct CsRun {
+    batch: u64,
+    /// `cmd_uses` right after it was recorded.
+    uses: u64,
+    pipeline: vk::Pipeline,
+    /// The descriptors it was recorded with (buffers and images).
+    descs: Vec<u64>,
+    /// Its arguments (x, y, z) and table in the ring (host pointers).
+    args: *mut u32,
+    table: *mut u32,
+    groups: u32,
+}
+
+/// [commands appended to an open batched dispatch, batched dispatches
+/// recorded, commands of batched programs run on their own].
+pub static BATCHED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Whether a command's descriptors equal a run's (`desc_signature`), without
+/// building its own signature.
+fn same_descs(bound: &Bound, sig: &[u64]) -> bool {
+    use ash::vk::Handle;
+    if sig.len() != 4 * (bound.bufs.len() + bound.imgs.len()) {
+        return false;
+    }
+    let mut k = 0;
+    for (b, i) in &bound.bufs {
+        if sig[k..k + 4] != [*b as u64, i.buffer.as_raw(), i.offset, i.range] {
+            return false;
+        }
+        k += 4;
+    }
+    for (b, t, i) in &bound.imgs {
+        if sig[k..k + 4] != [*b as u64 | (t.as_raw() as u64) << 32, i.sampler.as_raw(), i.image_view.as_raw(), i.image_layout.as_raw() as u64] {
+            return false;
+        }
+        k += 4;
+    }
+    true
+}
+
+/// A command's descriptors as plain words (batched dispatches append only
+/// commands whose descriptors equal the run's).
+fn desc_signature(bound: &Bound) -> Vec<u64> {
+    use ash::vk::Handle;
+    let mut v = Vec::with_capacity(4 * (bound.bufs.len() + bound.imgs.len()));
+    for (b, i) in &bound.bufs {
+        v.extend([*b as u64, i.buffer.as_raw(), i.offset, i.range]);
+    }
+    for (b, t, i) in &bound.imgs {
+        v.extend([*b as u64 | (t.as_raw() as u64) << 32, i.sampler.as_raw(), i.image_view.as_raw(), i.image_layout.as_raw() as u64]);
+    }
+    v
 }
 
 unsafe impl Send for Exec {}
@@ -5346,6 +5421,8 @@ impl Exec {
                 segs: Vec::new(),
                 repeat: None,
                 cmd_uses: std::cell::Cell::new(0),
+                cs_streak: (0, 0),
+                cs_run: None,
                 batch_count: 0,
             })
         }
@@ -8800,7 +8877,7 @@ impl Exec {
             _ => false,
         };
         if vram && self.slots[self.cur].rings[1].is_none() && !self.vram_ring_failed {
-            match ctx().bar_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST) {
+            match ctx().bar_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER) {
                 Ok((b, _m, p)) => {
                     SLOT_MEM[4].fetch_add(RING_SEG, Ordering::Relaxed);
                     self.slots[self.cur].rings[1] = Some((b, p))
@@ -8941,6 +9018,18 @@ impl Exec {
         let kind = self.cs_kind(indirect.is_some());
         let first = self.batch_shaders.is_empty();
         let mut lap = Laps::for_dispatch(kind, first);
+        // Runs of direct dispatches of one program make it batchable.
+        if super::tune::batch_cs() && indirect.is_none() && groups.iter().map(|&g| g as u64).product::<u64>() <= BATCH_SMALL {
+            let a = cs_addr(cp);
+            if self.cs_streak.0 == a {
+                self.cs_streak.1 += 1;
+                if self.cs_streak.1 == BATCH_STREAK {
+                    super::shaders::mark_batchable(a);
+                }
+            } else {
+                self.cs_streak = (a, 1);
+            }
+        }
         if let Some(a) = indirect {
             // A resident shadow holding newer arguments is merged back first,
             // unless the GPU reads them from its working copy (`tune
@@ -9182,8 +9271,11 @@ impl Exec {
         let c = ctx();
         let qp = self.slots[self.cur].queries;
         let ti = self.batch_shaders.len() as u32;
-        let stamp_cmd = self.cmd();
-        let stamped = stamp_worth(indirect.map_or(Some(groups[0] as u64 * groups[1] as u64 * groups[2] as u64), |_| None), 256);
+        let batched = p.tr.out.batched;
+        let stamped = !batched && stamp_worth(indirect.map_or(Some(groups[0] as u64 * groups[1] as u64 * groups[2] as u64), |_| None), 256);
+        // Counted as a use only when stamps are recorded (an open batched
+        // dispatch takes more commands while nothing was recorded since).
+        let stamp_cmd = if qp != vk::QueryPool::null() && ti < MAX_TIMED && stamped { self.cmd() } else { self.slots[self.cur].cmd };
         let stamp = |k: u32| {
             if qp != vk::QueryPool::null() && ti < MAX_TIMED && stamped {
                 unsafe { ctx().device.cmd_write_timestamp(stamp_cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * ti + k) };
@@ -9293,7 +9385,9 @@ impl Exec {
         }
         stamp(1);
         lap.mark(11);
-        super::vk::checkpoint(self.cmd(), super::vk::mark::DISPATCH, p.addr);
+        if super::vk::checkpoints_on() {
+            super::vk::checkpoint(self.cmd(), super::vk::mark::DISPATCH, p.addr);
+        }
         let start = [cp.reg(Space::Sh, 0x204), cp.reg(Space::Sh, 0x205), cp.reg(Space::Sh, 0x206)];
         let args = match indirect {
             // Still held by a resident shadow (binding and batch changes since
@@ -9311,6 +9405,87 @@ impl Exec {
             }
             None => None,
         };
+        // A batched program (`Spec::batched`): appended to the open batched
+        // dispatch when nothing was recorded since it and its descriptors
+        // match, else recorded as a new one (a direct 1-D dispatch) or on
+        // its own.
+        let simple = batched && indirect.is_none() && start == [0, 0, 0] && patches.is_none() && set.is_none() && groups[1] == 1 && groups[2] == 1 && groups[0] <= BATCH_MAX_GROUPS;
+        let item = (at / 4) as u32;
+        let appended = simple
+            && match self.cs_run.as_mut() {
+                Some(r) if r.batch == self.batch_count && r.uses == self.cmd_uses.get() && r.pipeline == pipeline && r.groups + groups[0] <= BATCH_MAX_GROUPS && same_descs(&bound, &r.descs) => {
+                    unsafe {
+                        for g in 0..groups[0] {
+                            let e = r.table.add((rdna::translate::BATCH_ENTRY_DWORDS * (r.groups + g)) as usize);
+                            e.write(item);
+                            e.add(1).write(g);
+                        }
+                        r.groups += groups[0];
+                        r.args.write(r.groups);
+                    }
+                    true
+                }
+                _ => false,
+            };
+        if appended {
+            BATCHED[0].fetch_add(1, Ordering::Relaxed);
+        } else if batched {
+            // A new batched dispatch: its arguments and table in the ring.
+            let which = if self.slots[self.cur].rings[1].is_some_and(|r| r.0 == ring) { 1 } else { 0 };
+            let table_bytes = 16 + 4 * (rdna::translate::BATCH_ENTRY_DWORDS * BATCH_MAX_GROUPS) as u64;
+            let run_at = if simple { self.ring_alloc(which, table_bytes) } else { None };
+            let ring_ptr = self.slots[self.cur].rings[which].map(|r| r.1);
+            unsafe {
+                let cmd = self.cmd();
+                let rebound = !super::tune::lean_cmd() || self.dyncache.cs_pipeline != pipeline;
+                if rebound {
+                    note_vk(VK_CS_PIPELINES);
+                    c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    self.dyncache.cs_pipeline = pipeline;
+                }
+                bind_descriptors(cmd, vk::PipelineBindPoint::COMPUTE, layout, set, std::slice::from_ref(&bound), &mut self.dyncache.pushed[1], rebound);
+                match (run_at, ring_ptr) {
+                    (Some(off), Some(rp)) => {
+                        let args = rp.add(off as usize) as *mut u32;
+                        let table = args.add(4);
+                        for g in 0..groups[0] {
+                            let e = table.add((rdna::translate::BATCH_ENTRY_DWORDS * g) as usize);
+                            e.write(item);
+                            e.add(1).write(g);
+                        }
+                        args.write(groups[0]);
+                        args.add(1).write(1);
+                        args.add(2).write(1);
+                        let t = ((off + 16) / 4) as u32;
+                        c.device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &t.to_le_bytes());
+                        c.device.cmd_dispatch_indirect(cmd, ring, off);
+                        self.cs_run = Some(CsRun { batch: self.batch_count, uses: self.cmd_uses.get(), pipeline, descs: desc_signature(&bound), args, table, groups: groups[0] });
+                        BATCHED[1].fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {
+                        // On its own: the push constant names its SGPR data.
+                        let pc = rdna::translate::BATCH_SINGLE | item;
+                        c.device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &pc.to_le_bytes());
+                        BATCHED[2].fetch_add(1, Ordering::Relaxed);
+                        if let Some((buffer, offset)) = args {
+                            let a = indirect.unwrap_or(0);
+                            if super::tune::skip_barriers() & 2 == 0 && (!super::tune::exact_indirect() || self.written_since_barrier(a, 12)) {
+                                self.barrier();
+                                INDIRECT_BARRIERS[0].fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                INDIRECT_BARRIERS[1].fetch_add(1, Ordering::Relaxed);
+                            }
+                            c.device.cmd_dispatch_indirect(self.cmd(), buffer, offset);
+                        } else if start != [0, 0, 0] {
+                            c.device.cmd_dispatch_base(cmd, start[0], start[1], start[2], groups[0].saturating_sub(start[0]), groups[1].saturating_sub(start[1]), groups[2].saturating_sub(start[2]));
+                        } else {
+                            c.device.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
+                        }
+                    }
+                }
+            }
+        }
+        if !batched {
         unsafe {
             let cmd = self.cmd();
             let rebound = !super::tune::lean_cmd() || self.dyncache.cs_pipeline != pipeline;
@@ -9340,6 +9515,7 @@ impl Exec {
             } else {
                 c.device.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
             }
+        }
         }
         stamp(2);
         lap.mark(12);

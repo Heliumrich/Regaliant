@@ -99,7 +99,9 @@ pub fn stage_inputs(tr: &mut T) -> R<()> {
         }
         Stage::Compute => {
             let lid = tr.input(tr.t.v3u, Some(BuiltIn::LocalInvocationId), None);
-            let wid = tr.input(tr.t.v3u, Some(BuiltIn::WorkgroupId), None);
+            // Batched dispatches loaded WorkgroupId in the entry block (one
+            // variable per built-in).
+            let wid = if tr.batch_wg.is_none() { Some(tr.input(tr.t.v3u, Some(BuiltIn::WorkgroupId), None)) } else { None };
             let lidx = tr.input(tr.t.u32, Some(BuiltIn::LocalInvocationIndex), None);
             let l = e(tr.b.load(tr.t.v3u, None, lid, None, []))?;
             let tid_cnt = (tr.spec.cs_rsrc2 >> 11) & 3;
@@ -107,7 +109,12 @@ pub fn stage_inputs(tr: &mut T) -> R<()> {
                 let c = e(tr.b.composite_extract(tr.t.u32, None, l, [k]))?;
                 tr.set_vreg_raw(k, c)?;
             }
-            let w = e(tr.b.load(tr.t.v3u, None, wid, None, []))?;
+            // Batched dispatches: x within the workgroup's own command.
+            let w = match (tr.batch_wg, wid) {
+                (Some((local, w0)), _) => e(tr.b.composite_insert(tr.t.v3u, None, local, w0, [0]))?,
+                (None, Some(wid)) => e(tr.b.load(tr.t.v3u, None, wid, None, []))?,
+                (None, None) => return Err("no workgroup id".into()),
+            };
             tr.wg_id = Some(w);
             let mut s = tr.spec.user_base as u32 + tr.spec.user_sgprs as u32;
             for k in 0..3 {
