@@ -143,6 +143,37 @@ fn note_region(base: u64, size: u64) {
 }
 
 /// Whether a region may overlap [base, base+len) (false: certainly none).
+/// Whether [base, base+len) may overlap a tracked texture region (a cheap,
+/// conservative filter).
+pub fn may_overlap(base: u64, len: u64) -> bool {
+    may_have_region(base, len)
+}
+
+/// Whether [base, base+len) overlaps a tracked texture region (exact).
+pub fn overlaps(base: u64, len: u64) -> bool {
+    if !may_have_region(base, len) {
+        return false;
+    }
+    let mut g = TRACK.lock();
+    let Some(t) = g.as_mut() else { return false };
+    let mut found = false;
+    t.each_overlapping(base, len, |_| found = true);
+    found
+}
+
+/// The tracked texture regions overlapping [base, base+len) as (base, size)
+/// (diagnostics).
+pub fn overlapping(base: u64, len: u64) -> Vec<(u64, u64)> {
+    if !may_have_region(base, len) {
+        return Vec::new();
+    }
+    let mut g = TRACK.lock();
+    let Some(t) = g.as_mut() else { return Vec::new() };
+    let mut v = Vec::new();
+    t.each_overlapping(base, len, |r| v.push((r.base, r.size)));
+    v
+}
+
 fn may_have_region(base: u64, len: u64) -> bool {
     let len = len.max(1);
     let (first, last) = (base >> 16, (base + len - 1) >> 16);

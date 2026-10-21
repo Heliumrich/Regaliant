@@ -560,6 +560,7 @@ pub fn remapped(base: u64, len: u64) {
         // next use uploads the new mapping's contents after it).
         if c.owner[idx(p)].swap(0, Ordering::AcqRel) != 0 {
             OWN_STATS[O_REMAP_DROPS].fetch_add(1, Ordering::Relaxed);
+            drop_snaps(p, p + PAGE);
         }
         p += PAGE;
     }
@@ -632,6 +633,11 @@ pub fn on_fault(addr: u64, write: bool) -> bool {
             return false;
         }
         if s.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            // Mirror mode: a page a recording batch owns keeps its contents
+            // before this write (its write-back keeps the CPU's bytes).
+            if mirror_mode() && c.owner[idx(page)].load(Ordering::Acquire) & OWN_REC != 0 {
+                snap_page(page, page as *const u8, true);
+            }
             protect(page, PAGE, PAGE_READWRITE);
             // Written again soon after the last write: volatile from now on.
             let frame = super::FRAMES.load(Ordering::Relaxed) as u32 + 1;
@@ -1526,8 +1532,30 @@ pub fn mirror_mode() -> bool {
 /// pages read back, readback ns, (unused), ownerships dropped by remaps,
 /// explicit read-backs (`read_back`), ownership refusals, pages the CPU
 /// wrote between `own` and the submission].
-static OWN_STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static OWN_STATS: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
+/// Snapshots of owned pages the CPU may write during their ownership: taken
+/// when they became owned unarmed (`snap_page`), at a CPU write while their
+/// batch recorded (`on_fault`); pages copied into their batch again at its
+/// close (`snapped_pages`); pages whose write-back kept CPU bytes (merged),
+/// and those bytes.
+const O_SNAP_OWN: usize = 14;
+const O_SNAP_FAULT: usize = 15;
+const O_RESTAGED: usize = 16;
+const O_MERGED: usize = 17;
+const O_MERGED_BYTES: usize = 18;
 const O_CPU_WROTE: usize = 10;
+/// Pages written back eagerly at their batch's completion.
+const O_EAGER: usize = 11;
+/// Owned pages chosen for eager write-back: over uploaded textures' regions,
+/// over GPU-owned images a written range covers.
+const O_EAGER_TRACK: usize = 12;
+const O_EAGER_COVER: usize = 13;
+
+/// Counts owned pages chosen for eager write-back (`cover`: for GPU-owned
+/// images a written range covers; else uploaded textures' regions).
+pub fn note_eager(cover: bool, pages: u64) {
+    OWN_STATS[if cover { O_EAGER_COVER } else { O_EAGER_TRACK }].fetch_add(pages, Ordering::Relaxed);
+}
 const O_OWNED: usize = 0;
 const O_PROTECTS: usize = 1;
 const O_FAULTS: usize = 2;
@@ -1667,6 +1695,7 @@ pub fn owned_submitted(ranges: &[(u64, u64)], exec: u32, seq: u64) {
 pub fn owned_dropped(ranges: &[(u64, u64)], exec: u32) {
     let word = OWN_REC | exec as u64;
     for &(lo, hi) in ranges {
+        drop_snaps(lo, hi);
         let mut p = lo;
         while p < hi {
             if let Some(c) = chunk(p, false) {
@@ -1797,7 +1826,7 @@ fn readback_ctx() -> Result<Readback, String> {
 
 /// Reads the mirror's [a, e) into guest memory (pages made writable, filled,
 /// then armed read-only and device-valid). The caller holds READBACK.
-fn copy_back(rb: &Readback, a: u64, e: u64) -> Result<(), String> {
+fn copy_back(rb: &Readback, a: u64, e: u64, kept: &mut Vec<u64>) -> Result<(), String> {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     let m = MIRROR.get().ok_or("no mirror")?;
     let c = ctx();
@@ -1816,7 +1845,9 @@ fn copy_back(rb: &Readback, a: u64, e: u64) -> Result<(), String> {
     // between (it has not faulted) may see it half filled - the same window
     // a write-back has on the console's GPU, but by us; kept short.
     protect_regions(a, e, PAGE_READWRITE, false);
+    let merges = begin_merge(a, e);
     unsafe { std::ptr::copy_nonoverlapping(rb.ptr, a as *mut u8, n as usize) };
+    *kept = finish_merge(merges);
     OWN_STATS[O_RUNS].fetch_add(1, Ordering::Relaxed);
     OWN_STATS[O_PAGES].fetch_add(n / PAGE, Ordering::Relaxed);
     OWN_STATS[O_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1884,7 +1915,8 @@ fn release_owned(page: u64) -> Option<u64> {
         }
         p += PAGE;
     }
-    let r = copy_back(rb, a, e);
+    let mut kept = Vec::new();
+    let r = copy_back(rb, a, e, &mut kept);
     if let Err(ref err) = r {
         crate::error!("resident: reading back {a:#x}..{e:#x}: {err}");
     }
@@ -1896,13 +1928,188 @@ fn release_owned(page: u64) -> Option<u64> {
         let c = chunk(p, false)?;
         let i = idx(p);
         let _ = c.owner[i].compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire);
-        let keep = if armed { ST_ARMED | ST_VALID } else { 0 };
+        // Pages that kept CPU bytes: the mirror lacks them (uploaded again).
+        let keep = if !armed { 0 } else if kept.contains(&p) { ST_ARMED } else { ST_ARMED | ST_VALID };
         let cur = c.pages[i].load(Ordering::Acquire);
         c.pages[i].store((cur & !(ST_BUSY | ST_ARMED | ST_VALID | ST_CLEAN)) | keep, Ordering::Release);
         flag(c, i);
         p += PAGE;
     }
     r.ok().map(|_| (e - a) / PAGE)
+}
+
+/// Eager write-back (mirror mode): `data` holds the mirror's contents of
+/// `ranges` (packed in order) after the batch whose completion runs this
+/// (`cp::after_batch`); the pages it still owns get them in guest memory and
+/// are released (armed read-only, device-valid). Pages a later batch owns
+/// are left to it. Written ranges over texture memory go this way: the
+/// image cache hashes and uploads textures from guest memory.
+pub fn write_back_eager(ranges: &[(u64, u64)], data: *const u8) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
+    let seq = super::cp::after_batch();
+    if seq == 0 {
+        return;
+    }
+    let _arming = ARM_LOCK.read();
+    let mut off = 0u64;
+    for &(lo, hi) in ranges {
+        let mut p = lo;
+        while p < hi {
+            // A run of pages this batch still owns, taken busy.
+            let mut e = p;
+            while e < hi {
+                let Some(c) = chunk(e, false) else { break };
+                let i = idx(e);
+                if c.owner[i].load(Ordering::Acquire) != seq {
+                    break;
+                }
+                let s = &c.pages[i];
+                loop {
+                    let cur = s.load(Ordering::Acquire);
+                    if cur & ST_BUSY != 0 {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    if s.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                        break;
+                    }
+                }
+                e += PAGE;
+            }
+            if e > p {
+                protect_regions(p, e, PAGE_READWRITE, false);
+                let merges = begin_merge(p, e);
+                unsafe { std::ptr::copy_nonoverlapping(data.add((off + p - lo) as usize), p as *mut u8, (e - p) as usize) };
+                let kept = finish_merge(merges);
+                let armed = protect_regions(p, e, PAGE_READONLY, false);
+                let mut q = p;
+                while q < e {
+                    if let Some(c) = chunk(q, false) {
+                        let i = idx(q);
+                        let _ = c.owner[i].compare_exchange(seq, 0, Ordering::AcqRel, Ordering::Acquire);
+                        let cur = c.pages[i].load(Ordering::Acquire);
+                        let keep = if !armed { 0 } else if kept.contains(&q) { ST_ARMED } else { ST_ARMED | ST_VALID };
+                        c.pages[i].store((cur & !(ST_BUSY | ST_ARMED | ST_VALID | ST_CLEAN)) | keep, Ordering::Release);
+                        flag(c, i);
+                    }
+                    q += PAGE;
+                }
+                OWN_STATS[O_EAGER].fetch_add((e - p) / PAGE, Ordering::Relaxed);
+                p = e;
+            } else {
+                p += PAGE;
+            }
+        }
+        off += hi - lo;
+    }
+}
+
+/// Mirror mode: the base contents of GPU-owned pages the CPU may write
+/// while they are owned (what the mirror holds from before the GPU's work).
+/// A write-back of such a page (read-back, eager) keeps the bytes the CPU
+/// changed since (a byte merge: `begin_merge`, `finish_merge`); the GPU's
+/// bytes win where both wrote. Taken for pages that become owned without a
+/// write fault to catch the CPU's writes (`snap_page`), and for armed pages
+/// at the CPU's first write while their batch records (`on_fault`). A
+/// snapshot lives until its page is written back or its ownership dropped.
+static SNAPS: Mutex<std::collections::BTreeMap<u64, Box<[u8; PAGE as usize]>>> = Mutex::new(std::collections::BTreeMap::new());
+static SNAP_N: AtomicU64 = AtomicU64::new(0);
+
+/// Takes a snapshot of owned page `page` from `src` (its contents as the
+/// mirror gets them) unless it has one (the older base keeps every CPU
+/// write since it). `at_fault`: taken at a CPU write (statistics).
+pub fn snap_page(page: u64, src: *const u8, at_fault: bool) {
+    // Copied before the lock: no access under it can fault.
+    let mut b = Box::new([0u8; PAGE as usize]);
+    unsafe { std::ptr::copy_nonoverlapping(src, b.as_mut_ptr(), PAGE as usize) };
+    let mut g = SNAPS.lock();
+    if g.contains_key(&page) {
+        return;
+    }
+    g.insert(page, b);
+    SNAP_N.store(g.len() as u64, Ordering::Release);
+    OWN_STATS[if at_fault { O_SNAP_FAULT } else { O_SNAP_OWN }].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The pages of [lo, hi) with snapshots that executor `exec`'s recording
+/// batch owns: copied into the batch again at its close (the CPU may have
+/// written them since they became owned; the GPU's work then reads that).
+pub fn snapped_pages(lo: u64, hi: u64, exec: u32) -> Vec<u64> {
+    if SNAP_N.load(Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
+    let word = OWN_REC | exec as u64;
+    let g = SNAPS.lock();
+    let v: Vec<u64> = g.range(lo..hi).map(|(&k, _)| k).filter(|&k| chunk(k, false).is_some_and(|c| c.owner[idx(k)].load(Ordering::Acquire) == word)).collect();
+    OWN_STATS[O_RESTAGED].fetch_add(v.len() as u64, Ordering::Relaxed);
+    v
+}
+
+/// Drops the snapshots of [lo, hi) (ownership dropped).
+fn drop_snaps(lo: u64, hi: u64) {
+    if SNAP_N.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut g = SNAPS.lock();
+    let keys: Vec<u64> = g.range(lo..hi).map(|(&k, _)| k).collect();
+    for k in keys {
+        g.remove(&k);
+    }
+    SNAP_N.store(g.len() as u64, Ordering::Release);
+}
+
+/// A page's merge in a write-back: its snapshot and its guest bytes before
+/// the write-back.
+pub struct Merge {
+    page: u64,
+    snap: Box<[u8; PAGE as usize]>,
+    cur: Box<[u8; PAGE as usize]>,
+}
+
+/// Before a write-back of [a, e) (its guest pages readable): takes the
+/// snapshots there with the pages' current guest bytes.
+pub fn begin_merge(a: u64, e: u64) -> Vec<Merge> {
+    if SNAP_N.load(Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
+    let taken: Vec<(u64, Box<[u8; PAGE as usize]>)> = {
+        let mut g = SNAPS.lock();
+        let keys: Vec<u64> = g.range(a..e).map(|(&k, _)| k).collect();
+        let t = keys.into_iter().map(|k| (k, g.remove(&k).expect("snapshot"))).collect();
+        SNAP_N.store(g.len() as u64, Ordering::Release);
+        t
+    };
+    // The guest bytes read outside the lock.
+    taken
+        .into_iter()
+        .map(|(k, snap)| {
+            let mut cur = Box::new([0u8; PAGE as usize]);
+            unsafe { std::ptr::copy_nonoverlapping(k as *const u8, cur.as_mut_ptr(), PAGE as usize) };
+            Merge { page: k, snap, cur }
+        })
+        .collect()
+}
+
+/// After the write-back (guest pages writable): puts back the bytes the CPU
+/// changed since each snapshot. Returns the pages that kept CPU bytes (the
+/// mirror lacks them: not device-valid).
+pub fn finish_merge(merges: Vec<Merge>) -> Vec<u64> {
+    let mut kept = Vec::new();
+    for m in merges {
+        let mut n = 0u64;
+        for j in 0..PAGE as usize {
+            if m.cur[j] != m.snap[j] {
+                unsafe { std::ptr::write_volatile((m.page + j as u64) as *mut u8, m.cur[j]) };
+                n += 1;
+            }
+        }
+        if n > 0 {
+            OWN_STATS[O_MERGED].fetch_add(1, Ordering::Relaxed);
+            OWN_STATS[O_MERGED_BYTES].fetch_add(n, Ordering::Relaxed);
+            kept.push(m.page);
+        }
+    }
+    kept
 }
 
 /// What mirror mode's placement does with a page (`mm_page`).
@@ -1919,6 +2126,16 @@ pub enum MmPage {
     Copy,
     /// Host class: imported (CP writes), never in the mirror.
     Host,
+}
+
+/// Mirror mode: whether page `p` is GPU-owned by a submitted batch (no
+/// access), and whether it is armed and device-valid (a CPU write faults).
+pub fn mm_owned_armed(p: u64) -> (bool, bool) {
+    let Some(c) = chunk(p, false) else { return (false, false) };
+    let i = idx(p);
+    let o = c.owner[i].load(Ordering::Acquire);
+    let s = c.pages[i].load(Ordering::Acquire);
+    (o != 0 && o & OWN_REC == 0, s & (ST_VALID | ST_ARMED) == ST_VALID | ST_ARMED)
 }
 
 /// Mirror mode's view of the page at `p` (`mine`: pages this batch uploads).
@@ -1953,17 +2170,25 @@ pub fn owned_line() -> String {
     }
     let v: Vec<u64> = OWN_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    mirror mode: {} pages made GPU-owned ({} no-access calls, {} refused, {} written by the CPU before their batch was submitted), {} faults on them, {} runs read back ({} pages, {:.1} us each; {} by our readers), {} ownerships dropped by remaps\n",
+        "    mirror mode: {} pages made GPU-owned ({} no-access calls, {} refused, {} written by the CPU before their batch was submitted), {} written back at their batch's completion (texture memory: {} chosen over uploaded textures, {} over images a write covers), {} faults on them, {} runs read back ({} pages, {:.1} us each; {} by our readers), {} ownerships dropped by remaps; CPU writes during ownership: {} snapshots at ownership (unarmed pages), {} at a write while recording, {} pages copied again at their batch's close, {} write-backs kept CPU bytes ({} bytes)\n",
         v[O_OWNED],
         v[O_PROTECTS],
         v[O_REFUSED],
         v[O_CPU_WROTE],
+        v[O_EAGER],
+        v[O_EAGER_TRACK],
+        v[O_EAGER_COVER],
         v[O_FAULTS],
         v[O_RUNS],
         v[O_PAGES],
         v[O_NS] as f64 / v[O_RUNS].max(1) as f64 / 1000.0,
         v[O_EXPLICIT],
-        v[O_REMAP_DROPS]
+        v[O_REMAP_DROPS],
+        v[O_SNAP_OWN],
+        v[O_SNAP_FAULT],
+        v[O_RESTAGED],
+        v[O_MERGED],
+        v[O_MERGED_BYTES]
     ) + &fault_sites_line()
 }
 

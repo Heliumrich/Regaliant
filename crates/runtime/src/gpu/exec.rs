@@ -844,8 +844,19 @@ pub(super) fn import_sites_line() -> String {
     let mut v: Vec<(&(&str, u32), &(u64, u64))> = m.iter().collect();
     v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
     let list: Vec<String> = v.iter().take(10).map(|((f, l), (n, b))| format!("{}:{l} {n} ({} MiB)", f.rsplit(['/', '\\']).next().unwrap_or(f), b >> 20)).collect();
-    format!("    imports made with residency on, by site: {}\n", list.join(", "))
+    let mut s = format!("    imports made with residency on, by site: {}\n", list.join(", "));
+    if let Some(m) = MM_IMPORT_REFUSED.lock().as_ref() {
+        let mut v: Vec<(&(&str, u32), &u64)> = m.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        let list: Vec<String> = v.iter().take(10).map(|((f, l), n)| format!("{}:{l} {n}", f.rsplit(['/', '\\']).next().unwrap_or(f))).collect();
+        s += &format!("    imports refused in mirror mode, by site: {}\n", list.join(", "));
+    }
+    s
 }
+
+/// Mirror mode: imports of the mirror's span refused (`span`), by the code
+/// that asked for them.
+static MM_IMPORT_REFUSED: Mutex<Option<HashMap<(&'static str, u32), u64>>> = Mutex::new(None);
 
 /// Imported buffer covering guest [base, base+size): (buffer, window start, window end).
 #[track_caller]
@@ -870,6 +881,14 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     }
     let found = spans_read().iter().find(|s| s.valid && s.start <= base && end <= s.end).map(|s| (s.buffer, s.start, s.end));
     let site = std::panic::Location::caller();
+    // Mirror mode: memory of the mirror's span is never imported (its pages
+    // may be GPU-owned, no-access, which the driver cannot pin; an import
+    // would make them host class for good): the caller's other path runs.
+    if found.is_none() && super::resident::mirror_mode() && base < super::resident::MIRROR_END && end > super::resident::MIRROR_BASE {
+        let mut g = MM_IMPORT_REFUSED.lock();
+        *g.get_or_insert_with(HashMap::new).entry((site.file(), site.line())).or_default() += 1;
+        return None;
+    }
     let r = found.or_else(|| {
         let r = import_span(base, size);
         if let (Some((_, st, e)), true) = (r, super::resident::enabled()) {
@@ -894,6 +913,26 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
         });
     }
     r
+}
+
+/// Mirror mode: whether the pages to be copied into the mirror (ascending
+/// lists) are readable guest memory, one query per run of pages.
+fn staged_readable(claim: &[u64], copy: &[u64]) -> bool {
+    let page = super::resident::PAGE;
+    for list in [claim, copy] {
+        let mut i = 0;
+        while i < list.len() {
+            let mut j = i + 1;
+            while j < list.len() && list[j] == list[j - 1] + page {
+                j += 1;
+            }
+            if !crate::mem::os_readable(list[i], list[j - 1] + page - list[i]) {
+                return false;
+            }
+            i = j;
+        }
+    }
+    true
 }
 
 /// Guest [a, a+n) as pieces of imported buffers: (buffer, offset in it,
@@ -5243,6 +5282,16 @@ pub struct Exec {
     owned: Vec<(u64, u64)>,
     extra_used: u64,
     mm_copy: Vec<u64>,
+    /// Mirror mode: the pages one placement copied into the batch, with
+    /// where their copies are (`mirror_place`'s snapshots).
+    mm_staged: Vec<(u64, usize)>,
+    /// What the placement in progress binds (diagnostics).
+    mm_kind: &'static str,
+    /// Owned page runs written back at the batch's completion (texture
+    /// memory), and that write-back for a parallel worker's batch (carried
+    /// by `Closed`: chunk batches take no other completion actions).
+    eager: Vec<(u64, u64)>,
+    eager_action: Option<Action>,
 }
 
 /// Extra staging per buffer (mirror mode, `Slot::stage_extra`).
@@ -5338,9 +5387,11 @@ struct Closed {
     segs: Vec<SegMark>,
     /// Pages it uploads into the residency mirror (`Exec::res_pages`).
     res_pages: Vec<u64>,
-    /// Mirror mode: the page runs it owns and its executor's id.
+    /// Mirror mode: the page runs it owns and its executor's id, and the
+    /// write-back of its texture-memory runs (`Exec::eager_action`).
     owned: Vec<(u64, u64)>,
     res_exec: u32,
+    eager_action: Option<Action>,
 }
 
 /// Slot sequence of a batch closed but not yet submitted.
@@ -5494,6 +5545,10 @@ impl Exec {
                 owned: Vec::new(),
                 extra_used: 0,
                 mm_copy: Vec::new(),
+                mm_staged: Vec::new(),
+                mm_kind: "",
+                eager: Vec::new(),
+                eager_action: None,
                 batch_count: 0,
             })
         }
@@ -5855,6 +5910,30 @@ impl Exec {
         st.mark(1);
         self.resolve_timestamps();
         st.mark(2);
+        // Mirror mode: owned runs the image cache reads from guest memory
+        // are written back when the batch completes: over uploaded textures'
+        // regions (re-uploaded when their contents changed) and over
+        // GPU-owned images they cover (reloaded at their next use); decided
+        // once per batch with exact queries. Writes over part of a GPU-owned
+        // image are not applied to it (`images::note_overwrites`).
+        if super::resident::mirror_mode() && !self.owned.is_empty() {
+            let owned = &self.owned;
+            let mut eager: Vec<(u64, u64)> = owned.iter().copied().filter(|&(a, e)| super::track::overlaps(a, e - a)).collect();
+            super::resident::note_eager(false, eager.iter().map(|&(a, e)| (e - a) / super::resident::PAGE).sum());
+            if super::images::may_note(owned) {
+                let more: Vec<(u64, u64)> = super::images::with(|im| owned.iter().copied().filter(|&(a, e)| im.owned_cover(a, e - a)).collect());
+                for r in more {
+                    if !eager.contains(&r) {
+                        super::resident::note_eager(true, (r.1 - r.0) / super::resident::PAGE);
+                        eager.push(r);
+                    }
+                }
+            }
+            self.eager = eager;
+        }
+        if !self.eager.is_empty() {
+            self.record_eager_writeback();
+        }
         if !self.deferred && !self.xcopies.is_empty() && super::tune::xpre_dry() && gpu_ran_dry() {
             // The GPU waits for this batch: its copies go into its prologue
             // (`tune xpre_dry`).
@@ -5885,6 +5964,20 @@ impl Exec {
         // Finished by the submission thread (`tune submit_finish`): the
         // prologue left open with its copies, the copy-queue copies, the
         // command buffer's end.
+        // Mirror mode: owned pages with snapshots are copied into the batch
+        // again (the CPU may have written them since they became owned).
+        if super::resident::mirror_mode() && !self.owned.is_empty() {
+            if let Some((mbuf, _)) = super::resident::mirror() {
+                let mut pages: Vec<u64> = self.owned.clone().into_iter().flat_map(|(lo, hi)| super::resident::snapped_pages(lo, hi, self.res_exec)).collect();
+                pages.sort_unstable();
+                pages.dedup();
+                for p in pages {
+                    if self.mirror_stage(mbuf, p).is_none() {
+                        crate::warn!("gpu[{}]: owned page {p:#x} not copied again (no staging)", self.name);
+                    }
+                }
+            }
+        }
         let finish = !self.deferred && super::tune::submit_finish() && super::tune::submit_thread();
         let (pre, xpre, pre_job, xpre_job) = if finish {
             let pre_job = self.take_pre();
@@ -5924,7 +6017,7 @@ impl Exec {
                 crate::error!("gpu[{}]: CP effects in a parallel run (dropped)", self.name);
             }
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), owned: std::mem::take(&mut self.owned), res_exec: self.res_exec });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), owned: std::mem::take(&mut self.owned), res_exec: self.res_exec, eager_action: self.eager_action.take() });
             self.res_mine.clear();
             self.stage_used = 0;
             self.slots[i].seq = PENDING;
@@ -6075,6 +6168,8 @@ impl Exec {
         self.resident.clear();
         super::resident::dropped(&std::mem::take(&mut self.res_pages));
         super::resident::owned_dropped(&std::mem::take(&mut self.owned), self.res_exec);
+        self.eager.clear();
+        self.eager_action = None;
         self.res_mine.clear();
         self.stage_used = 0;
         self.recording = false;
@@ -6105,6 +6200,11 @@ impl Exec {
         }
         // Mirror mode: the mirror is every range's home.
         if super::resident::mirror_mode() {
+            self.mm_kind = match kind {
+                HomeUse::Sized => "home: sized",
+                HomeUse::Unbounded => "home: unsized",
+                HomeUse::Index => "index buffer",
+            };
             return self.mirror_place(base, size, written).map(|(b, o, a)| (b, o, a, None));
         }
         if !super::tune::homes() && super::homes::any() {
@@ -6492,6 +6592,7 @@ impl Exec {
         claim.clear();
         let mut copy = std::mem::take(&mut self.mm_copy);
         copy.clear();
+        self.mm_staged.clear();
         let mut host = false;
         let mut p = lo;
         while p < hi {
@@ -6505,6 +6606,19 @@ impl Exec {
                 }
             }
             p += res::PAGE;
+        }
+        // A descriptor reaching past the end of its mappings (generic sizes
+        // on ring allocations): the mapped part is placed, the rest reads 0.
+        if !host && !staged_readable(&claim, &copy) {
+            self.res_need = claim;
+            self.mm_copy = copy;
+            if let Some((_, me, _)) = mapping_run(base, lo, hi) {
+                if me > base && me < end {
+                    return self.mirror_place(base, me - base, written);
+                }
+            }
+            res::refused(6);
+            return None;
         }
         let ok = !host && self.mirror_fill(lo, hi, mbuf, &mut claim, &mut copy);
         self.res_need = claim;
@@ -6522,9 +6636,97 @@ impl Exec {
                 return None;
             }
             self.owned.push((lo, hi));
+            // Diagnostics: owned ranges over fiber stacks (the title takes
+            // job fibers' stacks from the pools its GPU buffers come from).
+            static STACK_HITS: AtomicU64 = AtomicU64::new(0);
+            if STACK_HITS.load(Ordering::Relaxed) < 24 {
+                let hits = crate::hle::libs::fiber::contexts_overlapping(lo, hi);
+                if !hits.is_empty() && STACK_HITS.fetch_add(1, Ordering::Relaxed) < 24 {
+                    crate::warn!("gpu[{}]: mirror mode: shader {:#x} owns {base:#x}+{size:#x} ({}) over {} fiber stacks: {}", self.name, super::images::BINDING_SHADER.with(|s| s.get()), self.mm_kind, hits.len(), hits.iter().take(3).cloned().collect::<Vec<_>>().join("; "));
+                }
+            }
+            // Diagnostics: written ranges over uploaded textures' regions
+            // (written back eagerly), the first range of each region.
+            static TEX_SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+            static TEX_FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !TEX_FULL.load(Ordering::Relaxed) && super::track::may_overlap(lo, hi - lo) {
+                for (rb, rs) in super::track::overlapping(lo, hi - lo) {
+                    let mut g = TEX_SEEN.lock();
+                    let seen = g.get_or_insert_with(HashSet::new);
+                    if seen.len() >= 48 {
+                        TEX_FULL.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    if seen.insert(rb) {
+                        crate::info!("gpu[{}]: mirror mode: shader {:#x} writes {base:#x}+{size:#x} over uploaded texture region {rb:#x}+{rs:#x}", self.name, super::images::BINDING_SHADER.with(|s| s.get()));
+                    }
+                }
+            }
+            // Pages the CPU can write without a fault (not armed): their
+            // contents as the mirror gets them are kept, so the write-back
+            // keeps the CPU's writes made while the GPU owns them; copied
+            // now unless this placement just did. Armed pages are kept at
+            // their first write fault (`resident::on_fault`).
+            self.mm_staged.sort_unstable();
+            let mut p = lo;
+            while p < hi {
+                let (owned_sub, armed) = res::mm_owned_armed(p);
+                if !owned_sub && !armed {
+                    let at = match self.mm_staged.binary_search_by_key(&p, |x| x.0) {
+                        Ok(k) => Some(self.mm_staged[k].1 as *const u8),
+                        Err(_) => self.mirror_stage(mbuf, p),
+                    };
+                    match at {
+                        Some(at) => res::snap_page(p, at, false),
+                        None => crate::warn!("gpu[{}]: owned page {p:#x} not copied (no staging): CPU writes to it while owned may be lost", self.name),
+                    }
+                }
+                p += res::PAGE;
+            }
         }
         res::served((hi - lo) / res::PAGE);
         Some((mbuf, base - res::MIRROR_BASE, hi - base))
+    }
+
+    /// Mirror mode: copies the mirror's contents of the batch's eager runs
+    /// into a host buffer at the batch's end, and a completion action writes
+    /// them into guest memory (`resident::write_back_eager`).
+    fn record_eager_writeback(&mut self) {
+        let ranges = std::mem::take(&mut self.eager);
+        let Some((mbuf, _)) = super::resident::mirror() else { return };
+        let total: u64 = ranges.iter().map(|&(a, e)| e - a).sum();
+        let (rb, rbm, ptr) = match ctx().host_buffer(total.max(4), vk::BufferUsageFlags::TRANSFER_DST) {
+            Ok(x) => x,
+            Err(e) => {
+                crate::warn!("gpu[{}]: no buffer for an eager write-back ({e}); the pages stay GPU-owned", self.name);
+                return;
+            }
+        };
+        let cmd = self.cmd();
+        let mut regions = Vec::with_capacity(ranges.len());
+        let mut off = 0;
+        for &(a, e) in &ranges {
+            regions.push(vk::BufferCopy { src_offset: a - super::resident::MIRROR_BASE, dst_offset: off, size: e - a });
+            off += e - a;
+        }
+        unsafe {
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            ctx().device.cmd_copy_buffer(cmd, mbuf, rb, &regions);
+        }
+        let p = ptr as usize;
+        let action: Action = Box::new(move || {
+            super::resident::write_back_eager(&ranges, p as *const u8);
+            unsafe {
+                ctx().device.destroy_buffer(rb, None);
+                ctx().device.free_memory(rbm, None);
+            }
+        });
+        if self.deferred {
+            self.eager_action = Some(action);
+        } else {
+            self.actions.push(action);
+        }
     }
 
     /// Uploads the pages of `claim` (claimed and armed first) and `copy`
@@ -6536,7 +6738,9 @@ impl Exec {
             return true;
         }
         let _readers = crate::mem::GUEST_READERS.read();
-        if !crate::mem::os_readable(lo, hi - lo) {
+        // Readable where pages are copied (GPU-owned pages in between are
+        // no-access: the mirror holds them).
+        if !staged_readable(claim, copy) {
             return false;
         }
         if res::back(lo, hi - lo).is_err() {
@@ -6547,9 +6751,8 @@ impl Exec {
         copy.extend_from_slice(&claim[claimed..]);
         let _ = self.open_pre();
         for (k, &pg) in claim[..claimed].iter().chain(copy.iter()).enumerate() {
-            if !self.mirror_stage(mbuf, pg) {
-                return false;
-            }
+            let Some(at) = self.mirror_stage(mbuf, pg) else { return false };
+            self.mm_staged.push((pg, at as usize));
             if k < claimed {
                 self.res_pages.push(pg);
             }
@@ -6560,16 +6763,16 @@ impl Exec {
 
     /// Copies guest page `pg` into the batch's staging and records its copy
     /// into the mirror (the batch's prologue); past STAGE_SEG, into extra
-    /// staging buffers of the slot.
-    fn mirror_stage(&mut self, mbuf: vk::Buffer, pg: u64) -> bool {
+    /// staging buffers of the slot. Returns where the copy is.
+    fn mirror_stage(&mut self, mbuf: vk::Buffer, pg: u64) -> Option<*const u8> {
         use super::resident as res;
         if self.stage_used + res::PAGE <= STAGE_SEG {
-            let Some((sbuf, sptr)) = self.stage_buffer() else { return false };
+            let (sbuf, sptr) = self.stage_buffer()?;
             let at = self.stage_used;
             unsafe { std::ptr::copy_nonoverlapping(pg as *const u8, sptr.add(at as usize), res::PAGE as usize) };
             self.pre_copies.push((sbuf, mbuf, vk::BufferCopy { src_offset: at, dst_offset: pg - res::MIRROR_BASE, size: res::PAGE }));
             self.stage_used += res::PAGE;
-            return true;
+            return Some(unsafe { sptr.add(at as usize) } as *const u8);
         }
         if self.slots[self.cur].stage_extra.is_empty() || self.extra_used + res::PAGE > EXTRA_SEG {
             match ctx().host_buffer(EXTRA_SEG, vk::BufferUsageFlags::TRANSFER_SRC) {
@@ -6579,7 +6782,7 @@ impl Exec {
                 }
                 Err(e) => {
                     crate::warn!("gpu[{}]: no extra staging for mirror uploads ({e})", self.name);
-                    return false;
+                    return None;
                 }
             }
         }
@@ -6588,7 +6791,7 @@ impl Exec {
         unsafe { std::ptr::copy_nonoverlapping(pg as *const u8, sptr.add(at as usize), res::PAGE as usize) };
         self.pre_copies.push((sbuf, mbuf, vk::BufferCopy { src_offset: at, dst_offset: pg - res::MIRROR_BASE, size: res::PAGE }));
         self.extra_used += res::PAGE;
-        true
+        Some(unsafe { sptr.add(at as usize) } as *const u8)
     }
 
     /// Uploads `need` (pages of [lo, hi) the mirror lacks) as far as the
@@ -8566,7 +8769,7 @@ impl Exec {
             let (pre, copy_wait) = (b.pre, b.copy_wait);
             note_copy_waits(false, copy_wait);
             let reset = self.slot_reset(b.slot);
-            let seq = push_batch(fence, queries, Vec::new(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, reset, move |seq| {
+            let seq = push_batch(fence, queries, b.eager_action.into_iter().collect(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, reset, move |seq| {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
                     return;
                 }
@@ -8701,6 +8904,11 @@ impl Exec {
                         // The residency mirror (read-only bindings, `gpu::resident`), or
                         // a video-memory home holding the range (see `homes`).
                         let from_mirror = if super::resident::mirror_mode() {
+                            self.mm_kind = match found.resources[i] {
+                                Resolved::Global(_, None) => "unsized pointer",
+                                Resolved::Global(_, Some(_)) => "sized pointer",
+                                _ => "buffer",
+                            };
                             self.mirror_place(base, size, found.tr.plan.resources[i].written)
                         } else if read_only && super::resident::enabled() {
                             self.resident_bind(base, size)
@@ -9313,10 +9521,10 @@ impl Exec {
         // The per-view copy kernel as a buffer update of the words it leaves
         // (`tune copy_update`); its computation is reused for forwarding when
         // it stays a dispatch (None: not tried, Some(None): refused).
-        let forward_here = super::tune::forward_copies() && !self.deferred && indirect.is_none() && self.name == "gpu-gfx";
+        let forward_here = super::tune::forward_copies() && !self.deferred && indirect.is_none() && self.name == "gpu-gfx" && !super::resident::mirror_mode();
         // The graphics queue's parallel workers (`copy_update 2`): updates
         // checked once their batches completed, never forwarded.
-        let worker_here = super::tune::forward_copies() && self.deferred && indirect.is_none() && self.name.starts_with("gpu-gfx") && super::tune::copy_update_workers();
+        let worker_here = super::tune::forward_copies() && self.deferred && indirect.is_none() && self.name.starts_with("gpu-gfx") && super::tune::copy_update_workers() && !super::resident::mirror_mode();
         let mut forwarded: Option<Option<(u64, Vec<u32>, super::forward::Inputs)>> = None;
         if (forward_here || worker_here)
             && super::tune::copy_update()

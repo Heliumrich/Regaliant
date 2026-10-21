@@ -98,6 +98,145 @@ fn build_merge() -> Result<Vec<u32>, rspirv::dr::Error> {
     Ok(b.module().assemble())
 }
 
+/// Workgroup size of `mirror_diff` (dwords per workgroup; 8 mask words).
+pub const DIFF_LOCAL_SIZE: u32 = 256;
+
+/// Mirror mode's write-back of a batch's written range: every dword of
+/// binding 0 (the mirror after the batch) that differs from binding 1 (its
+/// copy from the batch's start) is stored at its index in binding 2 (host
+/// memory), and binding 3 gets one mask word per 32 dwords (bit k: dword
+/// 32j+k changed), for dword indices below `count` (push constant
+/// `{count}`). Every mask word below the count is written (no clearing
+/// first), so the CPU applies exactly the dwords the GPU changed.
+pub fn mirror_diff() -> Vec<u32> {
+    build_diff().expect("mirror diff kernel")
+}
+
+fn build_diff() -> Result<Vec<u32>, rspirv::dr::Error> {
+    let lit = Operand::LiteralBit32;
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.extension("SPV_KHR_storage_buffer_storage_class");
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+    let void = b.type_void();
+    let bool_ = b.type_bool();
+    let u32t = b.type_int(32, 0);
+    let v3 = b.type_vector(u32t, 3);
+    let rta = b.type_runtime_array(u32t);
+    b.decorate(rta, Decoration::ArrayStride, [lit(4)]);
+    let st = b.type_struct([rta]);
+    b.decorate(st, Decoration::Block, []);
+    b.member_decorate(st, 0, Decoration::Offset, [lit(0)]);
+    let p_st = b.type_pointer(None, StorageClass::StorageBuffer, st);
+    let p_u = b.type_pointer(None, StorageClass::StorageBuffer, u32t);
+    let pc = b.type_struct([u32t]);
+    b.decorate(pc, Decoration::Block, []);
+    b.member_decorate(pc, 0, Decoration::Offset, [lit(0)]);
+    let p_pc = b.type_pointer(None, StorageClass::PushConstant, pc);
+    let p_pcu = b.type_pointer(None, StorageClass::PushConstant, u32t);
+    let p_in = b.type_pointer(None, StorageClass::Input, v3);
+    let gid = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(gid, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let lid = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(lid, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::LocalInvocationId)]);
+    let wid = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(wid, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::WorkgroupId)]);
+    let mut bufs = [0; 4];
+    for (i, v) in bufs.iter_mut().enumerate() {
+        *v = global(&mut b, p_st, StorageClass::StorageBuffer);
+        b.decorate(*v, Decoration::DescriptorSet, [lit(0)]);
+        b.decorate(*v, Decoration::Binding, [lit(i as u32)]);
+    }
+    b.decorate(bufs[0], Decoration::NonWritable, []);
+    b.decorate(bufs[1], Decoration::NonWritable, []);
+    b.decorate(bufs[2], Decoration::NonReadable, []);
+    b.decorate(bufs[3], Decoration::NonReadable, []);
+    let pcv = global(&mut b, p_pc, StorageClass::PushConstant);
+    let c0 = b.constant_bit32(u32t, 0);
+    let c1 = b.constant_bit32(u32t, 1);
+    let c5 = b.constant_bit32(u32t, 5);
+    let c31 = b.constant_bit32(u32t, 31);
+    let words = b.constant_bit32(u32t, DIFF_LOCAL_SIZE / 32);
+    let arr = b.type_array(u32t, words);
+    let p_arr = b.type_pointer(None, StorageClass::Workgroup, arr);
+    let p_wu = b.type_pointer(None, StorageClass::Workgroup, u32t);
+    let masks = global(&mut b, p_arr, StorageClass::Workgroup);
+    // Workgroup scope (2); acquire-release (0x8) of workgroup memory (0x100).
+    let scope_wg = b.constant_bit32(u32t, 2);
+    let sem_bar = b.constant_bit32(u32t, 0x108);
+    let sem_none = b.constant_bit32(u32t, 0);
+    let fty = b.type_function(void, []);
+    let f = b.begin_function(void, None, FunctionControl::NONE, fty)?;
+    b.begin_block(None)?;
+    let g = b.load(v3, None, gid, None, [])?;
+    let i = b.composite_extract(u32t, None, g, [0])?;
+    let l = b.load(v3, None, lid, None, [])?;
+    let x = b.composite_extract(u32t, None, l, [0])?;
+    let w = b.load(v3, None, wid, None, [])?;
+    let wg = b.composite_extract(u32t, None, w, [0])?;
+    let pcount = b.access_chain(p_pcu, None, pcv, [c0])?;
+    let count = b.load(u32t, None, pcount, None, [])?;
+    // The workgroup's mask words start at zero.
+    let first8 = b.u_less_than(bool_, None, x, words)?;
+    let (l_zero, l_zeroed) = (b.id(), b.id());
+    b.selection_merge(l_zeroed, SelectionControl::NONE)?;
+    b.branch_conditional(first8, l_zero, l_zeroed, [])?;
+    b.begin_block(Some(l_zero))?;
+    let pz = b.access_chain(p_wu, None, masks, [x])?;
+    b.store(pz, c0, None, [])?;
+    b.branch(l_zeroed)?;
+    b.begin_block(Some(l_zeroed))?;
+    b.control_barrier(scope_wg, scope_wg, sem_bar)?;
+    // Each changed dword: stored, and its bit set.
+    let inside = b.u_less_than(bool_, None, i, count)?;
+    let (l_cmp, l_store, l_join, l_done) = (b.id(), b.id(), b.id(), b.id());
+    b.selection_merge(l_done, SelectionControl::NONE)?;
+    b.branch_conditional(inside, l_cmp, l_done, [])?;
+    b.begin_block(Some(l_cmp))?;
+    let pm = b.access_chain(p_u, None, bufs[0], [c0, i])?;
+    let now = b.load(u32t, None, pm, None, [])?;
+    let pp = b.access_chain(p_u, None, bufs[1], [c0, i])?;
+    let old = b.load(u32t, None, pp, None, [])?;
+    let changed = b.i_not_equal(bool_, None, now, old)?;
+    b.selection_merge(l_join, SelectionControl::NONE)?;
+    b.branch_conditional(changed, l_store, l_join, [])?;
+    b.begin_block(Some(l_store))?;
+    let po = b.access_chain(p_u, None, bufs[2], [c0, i])?;
+    b.store(po, now, None, [])?;
+    let k = b.shift_right_logical(u32t, None, x, c5)?;
+    let bit = b.bitwise_and(u32t, None, x, c31)?;
+    let m = b.shift_left_logical(u32t, None, c1, bit)?;
+    let pk = b.access_chain(p_wu, None, masks, [k])?;
+    b.atomic_or(u32t, None, pk, scope_wg, sem_none, m)?;
+    b.branch(l_join)?;
+    b.begin_block(Some(l_join))?;
+    b.branch(l_done)?;
+    b.begin_block(Some(l_done))?;
+    b.control_barrier(scope_wg, scope_wg, sem_bar)?;
+    // The mask words of the workgroup's dwords (those below the count).
+    let wbase = b.i_mul(u32t, None, wg, words)?;
+    let j = b.i_add(u32t, None, wbase, x)?;
+    let j32 = b.shift_left_logical(u32t, None, j, c5)?;
+    let in_count = b.u_less_than(bool_, None, j32, count)?;
+    let write = b.logical_and(bool_, None, first8, in_count)?;
+    let (l_mask, l_end) = (b.id(), b.id());
+    b.selection_merge(l_end, SelectionControl::NONE)?;
+    b.branch_conditional(write, l_mask, l_end, [])?;
+    b.begin_block(Some(l_mask))?;
+    let pw = b.access_chain(p_wu, None, masks, [x])?;
+    let mv = b.load(u32t, None, pw, None, [])?;
+    let pd = b.access_chain(p_u, None, bufs[3], [c0, j])?;
+    b.store(pd, mv, None, [])?;
+    b.branch(l_end)?;
+    b.begin_block(Some(l_end))?;
+    b.ret()?;
+    b.end_function()?;
+    b.entry_point(ExecutionModel::GLCompute, f, "main", [gid, lid, wid]);
+    b.execution_mode(f, ExecutionMode::LocalSize, [DIFF_LOCAL_SIZE, 1, 1]);
+    Ok(b.module().assemble())
+}
+
 /// A GPU timestamp stored in the title's GPU clock (an end-of-pipe
 /// RELEASE_MEM timestamp performed by the GPU): one invocation reads the
 /// 64-bit timestamp at index `query` of binding 0 (copied from a query pool,
@@ -311,6 +450,16 @@ mod tests {
         if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
             let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("timestamp_store.spv"), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn diff_kernel_assembles() {
+        let w = super::mirror_diff();
+        assert_eq!(w[0], 0x0723_0203);
+        if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("mirror_diff.spv"), bytes).unwrap();
         }
     }
 

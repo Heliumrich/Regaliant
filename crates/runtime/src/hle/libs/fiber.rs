@@ -393,6 +393,14 @@ pub fn describe_stack(addr: u64) -> Option<String> {
     Some(format!("fiber {fiber:#x} '{}' context {:#x}+{:#x} (at +{:#x})", f.name, f.ctx, f.ctx_size, addr - f.ctx))
 }
 
+/// The fibers whose contexts overlap [lo, hi) (diagnostics: GPU-owned
+/// ranges over fiber stacks; does not wait for the bookkeeping lock).
+pub fn contexts_overlapping(lo: u64, hi: u64) -> Vec<String> {
+    let Some(g) = FIBERS.try_lock() else { return Vec::new() };
+    let Some(m) = g.as_ref() else { return Vec::new() };
+    m.iter().filter(|(_, f)| f.ctx < hi && lo < f.ctx + f.ctx_size).map(|(fiber, f)| format!("fiber {fiber:#x} '{}' context {:#x}+{:#x}", f.name, f.ctx, f.ctx_size)).collect()
+}
+
 fn with<R>(f: impl FnOnce(&mut HashMap<u64, Fiber>) -> R) -> R {
     f(FIBERS.lock().get_or_insert_with(HashMap::new))
 }

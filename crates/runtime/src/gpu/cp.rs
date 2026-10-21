@@ -634,6 +634,12 @@ pub fn set_after_batch(seq: u64) {
     AFTER_BATCH.with(|c| c.set(seq));
 }
 
+/// The batch whose effects this thread performs (the completion thread's
+/// actions; 0 elsewhere).
+pub fn after_batch() -> u64 {
+    AFTER_BATCH.with(|c| c.get())
+}
+
 fn cpw_note(queue: &str, a: u64, n: u64, at: u64, opcode: u32) {
     if !super::tune::race_checks() {
         return;
