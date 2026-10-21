@@ -5264,6 +5264,10 @@ pub struct Exec {
     /// progress as prepared (before binding filled their SGPR data).
     again: Option<draw::Again>,
     again_next: Option<[Option<draw::StageSig>; 2]>,
+    /// The open batched draw run (`tune batch_draws`) and the program pair
+    /// of the last draws with the same context state and how many in a row.
+    draw_run: Option<draw::DrawRun>,
+    draw_streak: ((u64, u64), u32),
     /// Speculations on words this batch writes (`speculate`): checked once
     /// it completed, its sequence set at submission.
     own_checks: Vec<SpecCheck>,
@@ -5564,6 +5568,8 @@ impl Exec {
                 last_draw_where: (None, None),
                 again: None,
                 again_next: None,
+                draw_run: None,
+                draw_streak: ((0, 0), 0),
                 own_checks: Vec::new(),
                 race_pending: Vec::new(),
                 race_id: RACE_IDS.fetch_add(1, Ordering::Relaxed),
@@ -10352,6 +10358,7 @@ pub fn status() -> String {
         + &super::cp::draw_state_line()
         + &draw::draw_diff_line()
         + &draw::again_line()
+        + &draw::batch_line()
         + &super::xwait::status()
         + &super::resident::owned_line()
         + &mm_place_line()

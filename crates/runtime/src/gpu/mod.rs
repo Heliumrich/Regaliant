@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 149] = [
+    static ALL: [Tunable; 150] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -176,6 +176,7 @@ pub mod tune {
         Tunable { name: "job_sleep", env: "DS_JOB_SLEEP", default: 200, value: AtomicU64::new(UNSET) },
         Tunable { name: "job_watch", env: "DS_JOB_WATCH", default: 2000, value: AtomicU64::new(UNSET) },
         Tunable { name: "draw_again", env: "DS_DRAW_AGAIN", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "batch_draws", env: "DS_BATCH_DRAWS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1601,6 +1602,23 @@ pub mod tune {
     #[inline]
     pub fn draw_again() -> bool {
         get(148) != 0
+    }
+
+    /// Batched draws: consecutive draws of a program pair with the same
+    /// context state (and images) as one multi-draw whose arguments and
+    /// per-draw SGPR data offsets the CPU appends (`exec::draw` draw runs;
+    /// the pair's stages translated batched, buffers by device address).
+    /// Needs drawIndirectCount and bufferDeviceAddress.
+    #[inline]
+    pub fn batch_draws() -> bool {
+        get(149) != 0 && super::vk::ctx().draw_indirect_count && super::vk::ctx().device_addresses
+    }
+
+    /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
+    /// without appends).
+    #[inline]
+    pub fn batch_draws_appends() -> bool {
+        get(149) != 2
     }
 
     /// A switch's value by name; None if unknown.

@@ -31,6 +31,65 @@ thread_local! {
     /// Vertex stages prepared inside `with_base_instance`: the user-data
     /// word that receives the draw's start instance on the GPU.
     static BASE_INSTANCE: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+    /// Draw stages prepared while a `BatchedDraw` guard is held: translated
+    /// batched (`Spec::batched`, buffers by device address).
+    static BATCHED_DRAW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While held, the draw stages this thread prepares are translated batched
+/// (a batched draw run, `exec::draw`); cleared when dropped.
+pub struct BatchedDraw(bool);
+
+pub fn batched_draw(on: bool) -> BatchedDraw {
+    if on {
+        BATCHED_DRAW.with(|c| c.set(true));
+    }
+    BatchedDraw(on)
+}
+
+impl Drop for BatchedDraw {
+    fn drop(&mut self) {
+        if self.0 {
+            BATCHED_DRAW.with(|c| c.set(false));
+        }
+    }
+}
+
+fn batched_draw_now() -> bool {
+    BATCHED_DRAW.with(|c| c.get())
+}
+
+/// Program pairs (vertex, pixel) whose consecutive draws with the same
+/// context state run batched (`mark_draw_batchable`), and pairs refused
+/// (their stages write memory or use the varying's location).
+static DRAW_PAIRS: parking_lot::RwLock<Option<(std::collections::HashSet<(u64, u64)>, std::collections::HashSet<(u64, u64)>)>> = parking_lot::RwLock::new(None);
+static DRAW_PAIRS_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn draw_batchable(vs: u64, ps: u64) -> bool {
+    DRAW_PAIRS_ANY.load(std::sync::atomic::Ordering::Relaxed) && DRAW_PAIRS.read().as_ref().is_some_and(|(on, _)| on.contains(&(vs, ps)))
+}
+
+/// Pair (vs, ps) is batched from now on (unless refused before).
+pub fn mark_draw_batchable(vs: u64, ps: u64) {
+    let mut g = DRAW_PAIRS.write();
+    let (on, refused) = g.get_or_insert_with(Default::default);
+    if refused.contains(&(vs, ps)) || !on.insert((vs, ps)) {
+        return;
+    }
+    DRAW_PAIRS_ANY.store(true, std::sync::atomic::Ordering::Relaxed);
+    if on.len() <= 64 || on.len() % 64 == 0 {
+        crate::info!("gpu: draws of vs {vs:#x} ps {ps:#x} batched from now on ({} pairs)", on.len());
+    }
+}
+
+/// Pair (vs, ps) cannot run batched: never again.
+pub fn refuse_draw_batchable(vs: u64, ps: u64, why: &str) {
+    let mut g = DRAW_PAIRS.write();
+    let (on, refused) = g.get_or_insert_with(Default::default);
+    on.remove(&(vs, ps));
+    if refused.insert((vs, ps)) && refused.len() <= 40 {
+        crate::info!("gpu: draws of vs {vs:#x} ps {ps:#x} not batched: {why}");
+    }
 }
 
 /// Runs `f` with the vertex stages it prepares taking user-data word `slot`
@@ -1109,8 +1168,8 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         lane_votes: false,
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Fragment)),
-        addresses: super::tune::addresses(),
-        batched: false,
+        addresses: super::tune::addresses() || batched_draw_now(),
+        batched: batched_draw_now(),
         write_marks: super::resident::mirror_wanted(),
     };
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
@@ -1262,8 +1321,8 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         lane_votes: false,
         base_instance_sgpr: BASE_INSTANCE.with(|c| c.get()).map(|k| 8 + k),
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Vertex)),
-        addresses: super::tune::addresses(),
-        batched: false,
+        addresses: super::tune::addresses() || batched_draw_now(),
+        batched: batched_draw_now(),
         write_marks: super::resident::mirror_wanted(),
     };
     let r = prepare(addr, insts, code_hash, &user, &mut spec);

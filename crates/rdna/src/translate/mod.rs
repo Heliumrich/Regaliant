@@ -259,6 +259,12 @@ pub struct Spec {
     /// at byte 0 holds the dword offset of a table in the SGPR data binding
     /// (the whole ring), and workgroup x's entry gives its command's SGPR
     /// data offset and its workgroup x within that command.
+    /// Vertex and pixel stages, with `addresses`: one multi-draw runs
+    /// consecutive draws of the programs (`BATCH_DRAW_ENTRY_DWORDS` per
+    /// draw): the vertex stage reads the table's offset from push constant
+    /// byte 0 and its draw's entry by `DrawIndex` (its own SGPR data offset
+    /// and the pixel stage's), and hands the pixel stage its offset in a
+    /// flat varying at `BATCH_VARYING`.
     pub batched: bool,
     /// Mirror mode (the runtime's `DS_RESIDENT=2`): every buffer store and
     /// atomic also sets the bits of the dwords it writes in the written-bit
@@ -275,6 +281,13 @@ pub const BATCH_ENTRY_DWORDS: u32 = 2;
 /// A batched translation's push constant with this bit set holds the
 /// command's own SGPR data offset (a dispatch of its own, no table).
 pub const BATCH_SINGLE: u32 = 1 << 31;
+/// Dwords per draw in a batched draw's table (`Spec::batched`): the vertex
+/// and the pixel stage's SGPR data offsets.
+pub const BATCH_DRAW_ENTRY_DWORDS: u32 = 2;
+/// The location of the flat varying that carries a batched draw's pixel
+/// stage's SGPR data offset (the vertex stage's parameters must leave it
+/// free: `Output::param_mask` bit 31).
+pub const BATCH_VARYING: u32 = 31;
 
 /// The byte offset of a stage's SGPR data offset in the push constants
 /// (`Spec::sgpr_pc`): the vertex and pixel stages of a draw push both.
@@ -2213,6 +2226,39 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         let local = e(tr.b.select(tr.t.u32, None, single, gx, local))?;
         tr.sgpr_base = Some(base);
         tr.batch_wg = Some((local, w));
+    } else if spec.batched && spec.stage == Stage::Vertex {
+        // A batched draw: the table's offset (push constant byte 0), this
+        // draw's entry by its draw index (DrawParameters is core in SPIR-V
+        // 1.3): its SGPR data offset, and the pixel stage's for the varying.
+        tr.b.capability(Capability::DrawParameters);
+        let st = tr.b.id();
+        tr.b.type_struct_id(Some(st), [tr.t.u32]);
+        tr.b.decorate(st, Decoration::Block, []);
+        tr.b.member_decorate(st, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
+        let pt = tr.b.type_pointer(None, StorageClass::PushConstant, st);
+        let var = tr.global_var(pt, StorageClass::PushConstant);
+        let pu = tr.b.type_pointer(None, StorageClass::PushConstant, tr.t.u32);
+        let z = tr.u(0);
+        let p = e(tr.b.access_chain(pu, None, var, [z]))?;
+        let pc = e(tr.b.load(tr.t.u32, None, p, None, []))?;
+        let dv = tr.input(tr.t.u32, Some(BuiltIn::DrawIndex), None);
+        let di = e(tr.b.load(tr.t.u32, None, dv, None, []))?;
+        let k = tr.u(BATCH_DRAW_ENTRY_DWORDS);
+        let at = e(tr.b.i_mul(tr.t.u32, None, di, k))?;
+        let at = e(tr.b.i_add(tr.t.u32, None, at, pc))?;
+        let one = tr.u(1);
+        let at1 = e(tr.b.i_add(tr.t.u32, None, at, one))?;
+        let own = tr.sgpr_raw(at)?;
+        let ps = tr.sgpr_raw(at1)?;
+        tr.sgpr_base = Some(own);
+        let out = tr.output(tr.t.u32, None, Some(BATCH_VARYING));
+        ok(tr.b.store(out, ps, None, []))?;
+    } else if spec.batched && spec.stage == Stage::Fragment {
+        // A batched draw's pixel stage: its SGPR data offset from the
+        // vertex stage.
+        let v = tr.input(tr.t.u32, None, Some(BATCH_VARYING));
+        tr.b.decorate(v, Decoration::Flat, []);
+        tr.sgpr_base = Some(e(tr.b.load(tr.t.u32, None, v, None, []))?);
     } else if let Some(off) = spec.sgpr_pc {
         // A struct type of its own (rspirv merges identical ones, and
         // this one's member offset is the stage's).
@@ -2340,8 +2386,10 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     }
     let spirv = tr.b.module().assemble();
     let param_mask = tr.out_params.keys().filter(|&&p| p < 32).fold(0u32, |m, &p| m | 1 << p);
-    let batched = spec.batched && spec.stage == Stage::Compute;
-    let sgpr_pc = if batched { Some(0) } else { spec.sgpr_pc };
+    // Batched translations bind the whole ring as their SGPR data (their
+    // offsets come from a table): the runtime takes that from `sgpr_pc`.
+    let batched = spec.batched;
+    let sgpr_pc = if batched { Some(sgpr_pc_offset(spec.stage)) } else { spec.sgpr_pc };
     Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched })
 }
 

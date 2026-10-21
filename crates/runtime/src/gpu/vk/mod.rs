@@ -46,6 +46,9 @@ pub struct Ctx {
     /// bufferDeviceAddress enabled: guest imports and video-memory homes get
     /// GPU addresses that fault reports name (`note_gpu_range`).
     pub device_addresses: bool,
+    /// drawIndirectCount enabled: batched draws grow after recording
+    /// (`exec::draw` draw runs).
+    pub draw_indirect_count: bool,
     /// sparseBinding and sparseResidencyBuffer enabled (`DS_RESIDENT=1`:
     /// the residency mirror, `gpu::resident`).
     pub sparse_buffers: bool,
@@ -393,8 +396,10 @@ fn init_inner() -> Result<(), String> {
             crate::warn!("Vulkan: storage image arrays without non-uniform indexing (programs that select mip levels per lane may fail or write wrong levels)");
         }
         let device_addresses = f12_supported.buffer_device_address != 0;
+        let draw_indirect_count = f12_supported.draw_indirect_count != 0;
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(device_addresses)
+            .draw_indirect_count(draw_indirect_count)
             .shader_sampled_image_array_non_uniform_indexing(nonuniform)
             .shader_storage_image_array_non_uniform_indexing(storage_nonuniform)
             .timeline_semaphore(true)
@@ -485,6 +490,7 @@ fn init_inner() -> Result<(), String> {
             calibrated: calibrated.then(|| ash::ext::calibrated_timestamps::Device::new(&instance, &device)),
             fault: has_fault.then(|| ash::ext::device_fault::Device::new(&instance, &device)),
             device_addresses,
+            draw_indirect_count,
             sparse_buffers,
             draw_parameters: draw_parameters && first_instance,
             families,

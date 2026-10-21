@@ -133,7 +133,7 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         // RDNA_SGPR_PC=1: SGPR data at a push-constant offset (validation).
         sgpr_pc: std::env::var_os("RDNA_SGPR_PC").is_some().then(|| crate::translate::sgpr_pc_offset(u.stage)),
         addresses: std::env::var_os("RDNA_ADDRESSES").is_some() || std::env::var_os("RDNA_BATCHED").is_some(),
-        batched: std::env::var_os("RDNA_BATCHED").is_some() && u.stage == Stage::Compute,
+        batched: std::env::var_os("RDNA_BATCHED").is_some(),
         write_marks: std::env::var_os("RDNA_WRITE_MARKS").is_some(),
         stage: u.stage,
         user_sgprs: users,
