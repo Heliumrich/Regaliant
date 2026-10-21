@@ -1088,10 +1088,41 @@ impl Exec {
         lap.mark(2);
         // Measurement: what differs from the last draw of the same programs
         // on this executor (batching candidates; profiling only).
-        if super::profiling() {
+        if draw_stats() {
             let sig = draw_sig(&vs, ps.as_ref());
-            note_draw_diff(&mut self.last_draw_sig, sig);
+            // Consecutive: nothing recorded since the last full draw (repeats
+            // record on its state) and the same context state.
+            let consecutive = self.draw_same && (self.batch_count, self.cmd_uses.get()) == self.last_draw_end;
+            note_draw_diff(&mut self.last_draw_sig, sig, consecutive);
         }
+        // A draw right after the last full draw, with its context state and
+        // the same stages (`tune draw_again`): one more draw call on the
+        // state that draw left.
+        let again_on = super::super::tune::draw_again() && self.recording && !sync_mode() && !TINY_ANY.load(Ordering::Relaxed);
+        if again_on && self.draw_same && (self.batch_count, self.cmd_uses.get()) == self.last_draw_end {
+            let k = match self.again.as_ref() {
+                None => 2,
+                Some(g) if (g.batch, g.uses) != (self.batch_count, self.cmd_uses.get()) => 3,
+                Some(g) if g.indexed != a.index.is_some() || g.gpu_args != gpu.is_some() => 4,
+                Some(g) => match g.differs(&vs, ps.as_ref()) {
+                    0 => 9,
+                    d => 4 + d,
+                },
+            };
+            AGAIN[k].fetch_add(1, Ordering::Relaxed);
+        }
+        if again_on
+            && self.draw_same
+            && self.again.as_ref().is_some_and(|g| (g.batch, g.uses) == (self.batch_count, self.cmd_uses.get()) && g.indexed == a.index.is_some() && g.gpu_args == gpu.is_some() && g.same_stages(&vs, ps.as_ref()))
+        {
+            if let Some(drawn) = self.draw_again(cp, a, &vs, ps.as_ref())? {
+                return Ok(drawn);
+            }
+            AGAIN[1].fetch_add(1, Ordering::Relaxed);
+        }
+        // A full draw: a later one can follow it only once it is recorded.
+        self.again = None;
+        self.again_next = again_on.then(|| [Some(StageSig::of(&vs)), ps.as_ref().map(StageSig::of)]);
         let t_prep = since(t0);
         let mut textures = std::mem::take(&mut self.tex_scratch);
         textures.clear();
@@ -1810,6 +1841,14 @@ impl Exec {
         self.draw_bounds = bounds;
         // (After everything this draw recorded.)
         self.repeat = repeat.map(|r| Repeat { uses: self.cmd_uses.get(), ..r });
+        self.last_draw_end = (self.batch_count, self.cmd_uses.get());
+        // Draws right after this one can be recorded on its state
+        // (`draw_again`): no memory writes or clears, a rendering instance.
+        let next = self.again_next.take();
+        if let Some(stages) = next.filter(|_| no_writes && !mem_writes && !clear_z && !clear_s && self.rendering.is_some()) {
+            let targets = colors.iter().flatten().chain(depth.iter()).map(|t| t.key).collect();
+            self.again = Some(Again { batch: self.batch_count, uses: self.cmd_uses.get(), indexed: a.index.is_some(), gpu_args: gpu.is_some(), stages, targets });
+        }
         lap.mark(17);
         if super::profiling() {
             super::note_phases(&super::DRAW_PHASES, [t_prep, t_pipe, t_bind, since(t0)]);
@@ -1824,10 +1863,247 @@ impl Exec {
     }
 }
 
+/// A stage as prepared for a full draw, before binding filled its SGPR data
+/// (`Again`): its translation and resources, user data and SGPR data.
+pub(crate) struct StageSig {
+    found: std::sync::Arc<shaders::Found>,
+    user: shaders::UserData,
+    sgpr: Vec<u32>,
+}
+
+impl StageSig {
+    fn of(p: &shaders::Prepared) -> StageSig {
+        StageSig { found: p.found.clone(), user: p.user, sgpr: p.sgpr_data.clone() }
+    }
+
+    /// What differs from `p` (diagnosis): 0 nothing, 1 the translation, 2
+    /// resources, 3 user data, 4 SGPR data.
+    fn differs(&self, p: &shaders::Prepared) -> usize {
+        if std::sync::Arc::ptr_eq(&self.found, &p.found) {
+            return if self.user != p.user { 3 } else if self.sgpr != p.sgpr_data { 4 } else { 0 };
+        }
+        if !std::sync::Arc::ptr_eq(&self.found.tr, &p.found.tr) {
+            1
+        } else if self.found.resources != p.found.resources {
+            2
+        } else if self.user != p.user {
+            3
+        } else if self.sgpr != p.sgpr_data {
+            4
+        } else {
+            0
+        }
+    }
+
+    /// Whether `p` would bind exactly what this stage bound.
+    fn same(&self, p: &shaders::Prepared) -> bool {
+        self.user == p.user
+            && self.sgpr == p.sgpr_data
+            && (std::sync::Arc::ptr_eq(&self.found, &p.found) || (std::sync::Arc::ptr_eq(&self.found.tr, &p.found.tr) && self.found.resources == p.found.resources))
+    }
+}
+
+/// The last full draw of an executor, which a draw right after it with its
+/// context state and the same stages can follow as one more draw call
+/// (`tune draw_again`): the batch and `cmd_uses` right after it, whether it
+/// was indexed and read its arguments on the GPU, its stages and its
+/// attachments' image keys.
+pub(crate) struct Again {
+    batch: u64,
+    uses: u64,
+    indexed: bool,
+    gpu_args: bool,
+    stages: [Option<StageSig>; 2],
+    targets: Vec<images::ImageKey>,
+}
+
+impl Again {
+    /// `StageSig::differs` of the first stage that differs (0: none).
+    fn differs(&self, vs: &shaders::Prepared, ps: Option<&shaders::Prepared>) -> usize {
+        let Some(s) = self.stages[0].as_ref() else { return 1 };
+        let d = s.differs(vs);
+        if d != 0 {
+            return d;
+        }
+        match (&self.stages[1], ps) {
+            (Some(s), Some(p)) => s.differs(p),
+            (None, None) => 0,
+            _ => 1,
+        }
+    }
+
+    fn same_stages(&self, vs: &shaders::Prepared, ps: Option<&shaders::Prepared>) -> bool {
+        self.stages[0].as_ref().is_some_and(|s| s.same(vs))
+            && match (&self.stages[1], ps) {
+                (Some(s), Some(p)) => s.same(p),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+/// [draws recorded on the last full draw's state (`draw_again`), candidates
+/// recorded in full after all (pending image work, indices placed with a
+/// recording)], then (diagnosis) consecutive draws with the same context
+/// state by why they did not go again: [no eligible last draw, not right
+/// after it, indexing or argument kind, a translation, resources, user data,
+/// SGPR data differ, nothing differs].
+static AGAIN: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+/// `profile reset`: the draw statistics of this module.
+pub(super) fn reset_draw_stats() {
+    for c in DRAW_DIFFS.iter().chain(CONSEC_DIFFS.iter()).chain(AGAIN.iter()) {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Status part: `AGAIN`.
+pub(super) fn again_line() -> String {
+    let v: Vec<u64> = AGAIN.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if v[0] + v[1] == 0 {
+        return String::new();
+    }
+    format!(
+        "    draws recorded again on the last full draw's state (`draw_again`): {}, candidates recorded in full after all {}; consecutive draws with the same context state: no eligible last draw {}, not right after it {}, indexing or argument kind {}, translation {}, resources {}, user data {}, SGPR data {}, nothing different {}\n",
+        v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9]
+    )
+}
+
+impl Exec {
+    /// `draw_inner` for a draw right after the last full draw with its
+    /// context state and the same stages (`Again`): its textures checked and
+    /// its indices placed as there, then one more draw call on the state that
+    /// draw left. None: something pending or recorded meanwhile (the full
+    /// path records it).
+    fn draw_again(&mut self, cp: &Cp, a: &DrawArgs, vs: &Prepared, ps: Option<&Prepared>) -> Result<Option<bool>, String> {
+        let at = (self.batch_count, self.cmd_uses.get());
+        // Textures the CPU wrote since (the full path's check).
+        let mut textures = std::mem::take(&mut self.tex_scratch);
+        textures.clear();
+        super::texture_ranges_into(vs, &mut textures);
+        if let Some(p) = ps {
+            super::texture_ranges_into(p, &mut textures);
+        }
+        self.sync_textures(&textures, SYNC_DRAW_TEXTURES);
+        self.tex_scratch = textures;
+        if self.stopped {
+            return Err(super::STOPPED.into());
+        }
+        // Fast clears, overwrites, block or depth copies pending on its
+        // images: the full path resolves them.
+        let mut used = std::mem::take(&mut self.keys_scratch);
+        used.clear();
+        if let Some(g) = &self.again {
+            used.extend(g.targets.iter().copied());
+        }
+        let pending = match ps {
+            Some(p) => super::image_hazards(&[vs, p], &mut used),
+            None => super::image_hazards(&[vs], &mut used),
+        };
+        self.keys_scratch = used;
+        if pending {
+            return Ok(None);
+        }
+        // Indices, placed as the full path places them (and arguments the GPU
+        // reads, from their home).
+        let base_vertex = a.base_vertex.unwrap_or(ctx_reg(cp, 0x28408) as i32);
+        let args = match a.gpu_args {
+            Some(g) => {
+                let Some(h) = self.home_bind(g.addr, 20, false, super::HomeUse::Sized) else { return Ok(None) };
+                if self.stopped {
+                    return Err(super::STOPPED.into());
+                }
+                if !self.keep_home(h.0, h.3.as_ref()) {
+                    return Ok(None);
+                }
+                Some((h.0, h.1))
+            }
+            None => None,
+        };
+        let index = match a.index {
+            Some((addr, size)) => {
+                let bytes = a.gpu_args.map_or(a.count as u64 * size as u64, |g| g.index_bytes);
+                let h = self.home_bind(addr, bytes, false, super::HomeUse::Index);
+                if h.is_none() {
+                    if a.gpu_args.is_some() {
+                        return Ok(None);
+                    }
+                    self.sync_for(&[(addr, bytes)], SYNC_DRAW_INDICES);
+                }
+                if self.stopped {
+                    return Err(super::STOPPED.into());
+                }
+                if let Some(h) = &h {
+                    if !self.keep_home(h.0, h.3.as_ref()) {
+                        return Ok(None);
+                    }
+                }
+                self.flush_resident(Some(&[(addr, bytes)]))?;
+                let snap = h.as_ref().map(|h| (h.0, h.1, 0)).or_else(|| self.pre_copy(addr, bytes).or_else(|| self.snapshot(addr, bytes, crate::gpu::tune::snap_index())));
+                let ty = if size == 4 { vk::IndexType::UINT32 } else { vk::IndexType::UINT16 };
+                match snap {
+                    Some((b, off, bias)) => Some((b, off + bias, ty)),
+                    None => {
+                        let Some((buffer, start, _)) = super::span(addr, bytes) else { return Ok(None) };
+                        if let Some(s) = super::CP_WRITES.latest(&[(addr, bytes)]) {
+                            self.submit_after = self.submit_after.max(s);
+                        }
+                        Some((buffer, addr - start, ty))
+                    }
+                }
+            }
+            None => None,
+        };
+        // Anything recorded meanwhile (copies in, merges) changed the state.
+        if (self.batch_count, self.cmd_uses.get()) != at || self.rendering.is_none() || self.stopped {
+            return Ok(None);
+        }
+        let cmd = self.slots[self.cur].cmd;
+        let c = ctx();
+        unsafe {
+            match (index, args) {
+                (Some((b, off, ty)), Some((ab, aoff))) => {
+                    c.device.cmd_bind_index_buffer(cmd, b, off, ty);
+                    c.device.cmd_draw_indexed_indirect(cmd, ab, aoff, 1, 20);
+                    self.args_read = true;
+                    GPU_ARG_DRAWS.fetch_add(1, Ordering::Relaxed);
+                    self.repeat = None;
+                }
+                (Some((b, off, ty)), None) => {
+                    c.device.cmd_bind_index_buffer(cmd, b, off, ty);
+                    c.device.cmd_draw_indexed(cmd, a.count, a.instances, 0, base_vertex, a.first_instance);
+                    // The index binding moved: a repeat of an indirect draw
+                    // (`draw_repeat`, `draw_repeat_cpu`) would assume its own.
+                    self.repeat = None;
+                }
+                (None, None) => c.device.cmd_draw(cmd, a.count, a.instances, base_vertex as u32, a.first_instance),
+                (None, Some(_)) => return Ok(None),
+            }
+        }
+        if super::profiling() {
+            self.batch_shaders.push(super::DRAW_KEY | ps.map_or(vs.addr, |p| p.addr));
+        }
+        AGAIN[0].fetch_add(1, Ordering::Relaxed);
+        Ok(Some(true))
+    }
+}
+
+/// The draw-difference statistics (`DRAW_DIFFS`, `CONSEC_DIFFS`): with
+/// `DS_PROFILE_GPU=1` or `DS_DRAW_STATS=1` (without the timestamps of the
+/// former, which keep timed draws from `draw_repeat`).
+fn draw_stats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| super::profiling() || std::env::var("DS_DRAW_STATS").ok().as_deref() == Some("1"))
+}
+
 /// Draws after a draw of the same programs on the same executor, by what
 /// differs: [nothing, the user data only, buffer resources (images the
 /// same), image resources]; and draws of other programs (profiling).
 static DRAW_DIFFS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// The same for draws right after the draw before them (nothing recorded
+/// between, the same context state): [nothing different, the user data
+/// only, buffer resources, image resources].
+static CONSEC_DIFFS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// A draw's programs and hashes of its buffer resources, image and sampler
 /// resources and user data.
@@ -1850,7 +2126,7 @@ fn draw_sig(vs: &shaders::Prepared, ps: Option<&shaders::Prepared>) -> [u64; 5] 
     [vs.addr, ps.map_or(0, |p| p.addr), hb.finish(), hi.finish(), hu.finish()]
 }
 
-fn note_draw_diff(last: &mut [u64; 5], sig: [u64; 5]) {
+fn note_draw_diff(last: &mut [u64; 5], sig: [u64; 5], consecutive: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     let k = if sig[0] != last[0] || sig[1] != last[1] {
         4
@@ -1862,6 +2138,9 @@ fn note_draw_diff(last: &mut [u64; 5], sig: [u64; 5]) {
         3
     };
     DRAW_DIFFS[k].fetch_add(1, Relaxed);
+    if consecutive && k < 4 {
+        CONSEC_DIFFS[k].fetch_add(1, Relaxed);
+    }
     *last = sig;
 }
 
@@ -1872,8 +2151,9 @@ pub(super) fn draw_diff_line() -> String {
     if v.iter().sum::<u64>() == 0 {
         return String::new();
     }
+    let c: Vec<u64> = CONSEC_DIFFS.iter().map(|x| x.load(Relaxed)).collect();
     format!(
-        "    draws after a draw of the same programs (same executor): nothing different {}, the user data only {}, buffer resources (same images) {}, image resources {}; after other programs {}\n",
-        v[0], v[1], v[2], v[3], v[4]
+        "    draws after a draw of the same programs (same executor): nothing different {}, the user data only {}, buffer resources (same images) {}, image resources {}; after other programs {}; right after it with the same context state (nothing recorded between): nothing different {}, the user data only {}, buffer resources {}, image resources {}\n",
+        v[0], v[1], v[2], v[3], v[4], c[0], c[1], c[2], c[3]
     )
 }

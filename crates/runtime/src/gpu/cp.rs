@@ -203,6 +203,13 @@ fn note_draw_run(n: u32) {
     DRAW_RUNS[k][1].fetch_add(n as u64, Ordering::Relaxed);
 }
 
+/// `profile reset`: `DRAW_STATE` and `DRAW_RUNS`.
+pub fn reset_draw_state() {
+    for c in DRAW_STATE.iter().chain(DRAW_RUNS.iter().flatten()) {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
 /// For the status report (`DRAW_STATE`, `DRAW_RUNS`).
 pub fn draw_state_line() -> String {
     let d: Vec<u64> = DRAW_STATE.iter().map(|c| c.load(Ordering::Relaxed)).collect();
@@ -2733,6 +2740,7 @@ impl Cp {
         self.last_draw_progs = progs;
         super::xwait::note_command(&self.name);
         let mut e = self.exec.take().unwrap();
+        e.draw_same = same;
         self.last_draw = e.draw(self, args);
         self.exec = Some(e);
         self.split_if_due();

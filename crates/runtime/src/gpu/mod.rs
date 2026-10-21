@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 148] = [
+    static ALL: [Tunable; 149] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -175,6 +175,7 @@ pub mod tune {
         Tunable { name: "job_idle", env: "DS_JOB_IDLE", default: 50, value: AtomicU64::new(UNSET) },
         Tunable { name: "job_sleep", env: "DS_JOB_SLEEP", default: 200, value: AtomicU64::new(UNSET) },
         Tunable { name: "job_watch", env: "DS_JOB_WATCH", default: 2000, value: AtomicU64::new(UNSET) },
+        Tunable { name: "draw_again", env: "DS_DRAW_AGAIN", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1591,6 +1592,15 @@ pub mod tune {
     #[inline]
     pub fn job_watch() -> u64 {
         get(147)
+    }
+
+    /// A draw right after the last full draw with its context state and the
+    /// same stages (programs, resources, user data and SGPR data) is
+    /// recorded as one more draw call on the state that draw left
+    /// (`Exec::draw_again`; 37% of the draws, FINDINGS.md 2026-10-21).
+    #[inline]
+    pub fn draw_again() -> bool {
+        get(148) != 0
     }
 
     /// A switch's value by name; None if unknown.

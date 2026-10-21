@@ -4882,6 +4882,8 @@ fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str, seq: u6
 
 /// Clears the dispatch timings (`profile reset` control command).
 pub fn reset_shader_profile() {
+    draw::reset_draw_stats();
+    super::cp::reset_draw_state();
     if let Some(m) = SHADER_TIME.lock().as_mut() {
         m.clear();
     }
@@ -4989,6 +4991,9 @@ pub fn shader_profile() -> String {
     }
     s.push_str(&phases_line("draw", &DRAW_PHASES, ["prepare and shader-read waits", "textures, targets, pipeline", "bindings"]));
     s.push_str(&draw_steps_line());
+    s.push_str(&super::cp::draw_state_line());
+    s.push_str(&draw::draw_diff_line());
+    s.push_str(&draw::again_line());
     s.push_str(&bind_steps_line());
     s.push_str(&pre_steps_line());
     s.push_str(&pre_repeat_line());
@@ -5246,6 +5251,17 @@ pub struct Exec {
     /// The last draw's programs and hashes of its buffer resources, image
     /// resources and user data (profiling: `exec::draw::DRAW_DIFFS`).
     last_draw_sig: [u64; 5],
+    /// The draw being executed has the last draw's context registers,
+    /// programs and primitive type (set by the command processor), and
+    /// [batch, `cmd_uses`] right after the last full draw was recorded
+    /// (profiling: `exec::draw::CONSEC_DIFFS`).
+    pub(crate) draw_same: bool,
+    last_draw_end: (u64, u64),
+    /// The last full draw, when a draw right after it can be recorded on the
+    /// state it left (`draw_again`), and the stages of the full draw in
+    /// progress as prepared (before binding filled their SGPR data).
+    again: Option<draw::Again>,
+    again_next: Option<[Option<draw::StageSig>; 2]>,
     /// Speculations on words this batch writes (`speculate`): checked once
     /// it completed, its sequence set at submission.
     own_checks: Vec<SpecCheck>,
@@ -5541,6 +5557,10 @@ impl Exec {
                 shared_kept: Vec::new(),
                 tex_scratch: Vec::new(),
                 last_draw_sig: [0; 5],
+                draw_same: false,
+                last_draw_end: (u64::MAX, 0),
+                again: None,
+                again_next: None,
                 own_checks: Vec::new(),
                 race_pending: Vec::new(),
                 race_id: RACE_IDS.fetch_add(1, Ordering::Relaxed),
@@ -10322,6 +10342,7 @@ pub fn status() -> String {
         + &crate::titlefix::status()
         + &super::cp::draw_state_line()
         + &draw::draw_diff_line()
+        + &draw::again_line()
         + &super::xwait::status()
         + &super::resident::owned_line()
         + &mm_place_line()
