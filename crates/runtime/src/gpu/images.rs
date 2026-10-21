@@ -2495,21 +2495,6 @@ impl Images {
     /// bytes a write covers entirely takes its contents from guest memory at
     /// its next use (`reload_overwritten`). Writes over part of an image are
     /// reported, not applied: the rest of its guest bytes are stale.
-    /// Whether [base, base+len) overlaps the guest span of a GPU-owned image
-    /// (exact; mirror mode's eager write-backs).
-    pub fn owned_overlap(&self, base: u64, len: u64) -> bool {
-        let end = base.saturating_add(len);
-        self.owned.range(base.saturating_sub(self.max_span)..end).any(|(_, keys)| keys.iter().any(|k| self.map.get(k).is_some_and(|i| i.gpu_written && k.base < end && base < k.base + i.span)))
-    }
-
-    /// Whether [base, base+len) covers a GPU-owned image as
-    /// `note_overwrites` counts covering (its next use reloads it from guest
-    /// memory; writes over part of an image are not applied).
-    pub fn owned_cover(&self, base: u64, len: u64) -> bool {
-        let end = base.saturating_add(len);
-        self.owned.range(base..end).any(|(_, keys)| keys.iter().any(|k| self.map.get(k).is_some_and(|i| i.gpu_written && i.span > 0 && k.base + i.span <= end && len <= 2 * i.span + (64 << 10))))
-    }
-
     pub fn note_overwrites(&mut self, writes: &[(u64, u64)]) {
         if writes.is_empty() || self.owned.is_empty() {
             return;

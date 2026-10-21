@@ -560,7 +560,6 @@ pub fn remapped(base: u64, len: u64) {
         // next use uploads the new mapping's contents after it).
         if c.owner[idx(p)].swap(0, Ordering::AcqRel) != 0 {
             OWN_STATS[O_REMAP_DROPS].fetch_add(1, Ordering::Relaxed);
-            drop_snaps(p, p + PAGE);
         }
         p += PAGE;
     }
@@ -603,15 +602,6 @@ pub fn on_fault(addr: u64, write: bool) -> bool {
         return false;
     }
     let page = addr & !(PAGE - 1);
-    // Mirror mode: a GPU-owned page (no-access) is read back first.
-    if mirror_mode() {
-        if let Some(c) = chunk(page, false) {
-            let o = c.owner[idx(page)].load(Ordering::Acquire);
-            if o != 0 && o & OWN_REC == 0 {
-                return owned_fault(page);
-            }
-        }
-    }
     if !write {
         return false;
     }
@@ -633,11 +623,6 @@ pub fn on_fault(addr: u64, write: bool) -> bool {
             return false;
         }
         if s.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            // Mirror mode: a page a recording batch owns keeps its contents
-            // before this write (its write-back keeps the CPU's bytes).
-            if mirror_mode() && c.owner[idx(page)].load(Ordering::Acquire) & OWN_REC != 0 {
-                snap_page(page, page as *const u8, true);
-            }
             protect(page, PAGE, PAGE_READWRITE);
             // Written again soon after the last write: volatile from now on.
             let frame = super::FRAMES.load(Ordering::Relaxed) as u32 + 1;
@@ -926,11 +911,6 @@ pub fn host_write_begin(base: u64, len: u64) {
     };
     if lo >= hi {
         return;
-    }
-    // Mirror mode: GPU-owned pages first get the GPU's data (a file read may
-    // cover pages in part).
-    if mirror_mode() {
-        read_back(lo, hi - lo);
     }
     let mut p = lo;
     while p < hi {
@@ -1507,64 +1487,68 @@ pub fn status() -> String {
 
 // ---------------------------------------------------------------------------
 // Mirror mode (`DS_RESIDENT=2`; RENDERER.md "Mirror mode"): GPU writes land in
-// the mirror. A page GPU work writes is GPU-owned from the moment the write
-// is recorded (`own`) until something on the CPU side needs it: its guest
-// page is no-access meanwhile, so neither the title nor our code reads stale
-// data or writes behind the GPU's back. A CPU access faults (`owned_fault`):
-// the owner batch is asked to submit if it has not, waited for, and the
-// owned run around the page is read back from the mirror (the copy queue)
-// into guest memory, which is then armed (read-only) again. Our own readers
-// call `read_back` before reading. A remap drops ownership (the mirror's
-// contents belong to the old mapping).
+// the mirror. A batch's written ranges (its bindings' whole ranges) are
+// copied in the mirror at its start and compared with it at its end
+// (`rdna::kernels::mirror_diff`): the dwords its work changed are stored to
+// guest memory when it completes, as its first completion action
+// (`apply_diff`), so the title sees them when it sees the batch done, and
+// bytes the CPU wrote meanwhile stay (written ranges can share pages with
+// CPU data: allocator bitmaps, job stacks). Pages a batch writes are owned
+// by it from the moment the write is recorded (`own`) until its write-back:
+// one the CPU wrote meanwhile is copied into the mirror again at the batch's
+// close (`restage_needed`). A remap drops ownership.
 
 /// Owner word of a page still being recorded: OWN_REC | executor id.
 const OWN_REC: u64 = 1 << 63;
 static MODE2: AtomicBool = AtomicBool::new(false);
-/// Pages read back per run at most.
-const READBACK_MAX: u64 = 1 << 20;
 
 /// Mirror mode is on (`DS_RESIDENT=2` and its self-test passed).
 pub fn mirror_mode() -> bool {
     MODE2.load(Ordering::Acquire)
 }
 
-/// [pages owned, no-access calls, faults on owned pages, runs read back,
-/// pages read back, readback ns, (unused), ownerships dropped by remaps,
-/// explicit read-backs (`read_back`), ownership refusals, pages the CPU
-/// wrote between `own` and the submission].
-static OWN_STATS: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
-/// Snapshots of owned pages the CPU may write during their ownership: taken
-/// when they became owned unarmed (`snap_page`), at a CPU write while their
-/// batch recorded (`on_fault`); pages copied into their batch again at its
-/// close (`snapped_pages`); pages whose write-back kept CPU bytes (merged),
-/// and those bytes.
-const O_SNAP_OWN: usize = 14;
-const O_SNAP_FAULT: usize = 15;
-const O_RESTAGED: usize = 16;
-const O_MERGED: usize = 17;
-const O_MERGED_BYTES: usize = 18;
-const O_CPU_WROTE: usize = 10;
-/// Pages written back eagerly at their batch's completion.
-const O_EAGER: usize = 11;
-/// Owned pages chosen for eager write-back: over uploaded textures' regions,
-/// over GPU-owned images a written range covers.
-const O_EAGER_TRACK: usize = 12;
-const O_EAGER_COVER: usize = 13;
-
-/// Counts owned pages chosen for eager write-back (`cover`: for GPU-owned
-/// images a written range covers; else uploaded textures' regions).
-pub fn note_eager(cover: bool, pages: u64) {
-    OWN_STATS[if cover { O_EAGER_COVER } else { O_EAGER_TRACK }].fetch_add(pages, Ordering::Relaxed);
-}
+/// Mirror mode's statistics (`owned_line`).
+static OWN_STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+/// Pages made owned; ownership refusals (host-class pages, host writes in
+/// progress); ownerships dropped by remaps.
 const O_OWNED: usize = 0;
-const O_PROTECTS: usize = 1;
-const O_FAULTS: usize = 2;
-const O_RUNS: usize = 3;
-const O_PAGES: usize = 4;
-const O_NS: usize = 5;
-const O_REMAP_DROPS: usize = 7;
-const O_EXPLICIT: usize = 8;
-const O_REFUSED: usize = 9;
+const O_REFUSED: usize = 1;
+const O_REMAP_DROPS: usize = 2;
+/// Owned pages the CPU wrote while their batch recorded, and the pages
+/// copied into the mirror again at their batch's close.
+const O_CPU_WROTE: usize = 3;
+const O_RESTAGED: usize = 4;
+/// Write-backs: ranges, dwords stored, pages stored to, protection changes
+/// around the stores, pages left out (not writable guest memory any more),
+/// nanoseconds.
+const O_WB_SEGS: usize = 5;
+const O_WB_DWORDS: usize = 6;
+const O_WB_PAGES: usize = 7;
+const O_WB_PROTECTS: usize = 8;
+const O_WB_SKIPPED: usize = 9;
+const O_WB_NS: usize = 10;
+/// Pages copied into the mirror while a submitted batch writing them had
+/// not completed (the copy may land after that batch's writes there).
+const O_INFLIGHT: usize = 11;
+/// Pages copied into the mirror again at a batch's close after deferred CP
+/// writes into them (`needs_copy`).
+const O_CP_COPIES: usize = 12;
+
+/// Counts pages copied again at a batch's close.
+pub fn note_restaged(n: u64) {
+    OWN_STATS[O_RESTAGED].fetch_add(n, Ordering::Relaxed);
+}
+
+/// Counts the pages of `pages` (about to be copied into the mirror) that a
+/// submitted batch still running writes.
+pub fn note_inflight(pages: &[u64]) {
+    if pages.is_empty() {
+        return;
+    }
+    let done = super::exec::completed_seq();
+    let n = pages.iter().filter(|&&p| chunk(p, false).is_some_and(|c| { let o = c.owner[idx(p)].load(Ordering::Acquire); o != 0 && o & OWN_REC == 0 && o > done })).count();
+    OWN_STATS[O_INFLIGHT].fetch_add(n as u64, Ordering::Relaxed);
+}
 
 /// Submit requests of recording executors (`register_exec`), by id.
 static EXECS: Mutex<Vec<std::sync::Arc<AtomicBool>>> = Mutex::new(Vec::new());
@@ -1578,13 +1562,10 @@ pub fn register_exec(flag: std::sync::Arc<AtomicBool>) -> u32 {
 }
 
 /// Makes the pages of [lo, hi) (page-aligned) GPU-owned by the batch
-/// executor `exec` records. Their mirror contents must be current (uploaded
-/// by this batch or valid). The guest pages stay accessible until the batch
-/// is submitted (`owned_submitted`): a reader before that sees what the GPU
-/// has not overwritten yet, and no thread can fault waiting for a batch that
-/// is still being recorded (its own command processor's, say). Pages a
-/// submitted batch owns keep that owner until then. False (nothing changed):
-/// a page is host class or being written by a host write.
+/// executor `exec` records (their mirror contents must be current: uploaded
+/// by this batch or valid). Pages a submitted batch owns keep that owner
+/// until this one is submitted. False (nothing changed): a page is host
+/// class or being written by a host write.
 pub fn own(lo: u64, hi: u64, exec: u32) -> bool {
     let mut p = lo;
     while p < hi {
@@ -1610,92 +1591,59 @@ pub fn own(lo: u64, hi: u64, exec: u32) -> bool {
 }
 
 /// The batch recording executor `exec` made, owning the pages of `ranges`,
-/// was queued for submission as `seq`: the pages are its now and their
-/// guest pages no-access (one call per run of pages not no-access yet).
-/// A page the CPU wrote since `own` (its write faulted on the armed page)
-/// is counted: the GPU's copy of it lacks that write.
+/// was queued for submission as `seq`: the pages are its (the latest
+/// submission among batches writing a page owns it) until its write-back.
 pub fn owned_submitted(ranges: &[(u64, u64)], exec: u32, seq: u64) {
-    use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
-    let _arming = ARM_LOCK.read();
     let word = OWN_REC | exec as u64;
-    let mut run: Option<(u64, u64)> = None;
-    let flush = |run: &mut Option<(u64, u64)>| {
-        if let Some((a, e)) = run.take() {
-            let mut q = a;
-            while q < e {
-                let (r_end, kind) = region_kind(q, e);
-                if matches!(kind, RegionKind::Rw | RegionKind::NotWritable) {
-                    protect(q, r_end - q, PAGE_NOACCESS);
-                    OWN_STATS[O_PROTECTS].fetch_add(1, Ordering::Relaxed);
-                }
-                q = r_end;
-            }
-            let mut q = a;
-            while q < e {
-                if let Some(c) = chunk(q, false) {
-                    c.pages[idx(q)].fetch_and(!ST_BUSY, Ordering::AcqRel);
-                }
-                q += PAGE;
-            }
-        }
-    };
     for &(lo, hi) in ranges {
         let mut p = lo;
         while p < hi {
-            let Some(c) = chunk(p, false) else {
-                flush(&mut run);
-                p += PAGE;
-                continue;
-            };
-            let i = idx(p);
-            // Busy while its protection changes (faults on it wait).
-            loop {
-                let cur = c.pages[i].load(Ordering::Acquire);
-                if cur & ST_BUSY != 0 {
-                    std::hint::spin_loop();
-                    continue;
+            if let Some(c) = chunk(p, false) {
+                let i = idx(p);
+                let prev = c.owner[i].load(Ordering::Acquire);
+                if prev == word || prev == 0 || prev & OWN_REC != 0 || prev < seq {
+                    c.owner[i].store(seq, Ordering::Release);
                 }
-                if c.pages[i].compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                    if cur & ST_VALID == 0 {
-                        OWN_STATS[O_CPU_WROTE].fetch_add(1, Ordering::Relaxed);
-                    }
-                    break;
-                }
-            }
-            let prev = c.owner[i].swap(seq, Ordering::AcqRel);
-            // No-access already (an earlier batch's): nothing to change.
-            let protect_it = prev == 0 || prev & OWN_REC != 0;
-            if prev != word && prev & OWN_REC != 0 {
-                // Another executor's recording batch owns it too (both write
-                // it); the later submission wins.
-            }
-            let cur = c.pages[i].load(Ordering::Acquire);
-            c.pages[i].store((cur | ST_VALID) & !(ST_ARMED | ST_CLEAN), Ordering::Release);
-            flag(c, i);
-            if protect_it {
-                run = Some(match run {
-                    Some((a, e)) if e == p => (a, p + PAGE),
-                    mut other => {
-                        flush(&mut other);
-                        (p, p + PAGE)
-                    }
-                });
-            } else {
-                c.pages[i].fetch_and(!ST_BUSY, Ordering::AcqRel);
-                flush(&mut run);
             }
             p += PAGE;
         }
-        flush(&mut run);
     }
 }
 
+/// Whether page `p`, owned by executor `exec`'s recording batch, is copied
+/// into the mirror again at the batch's close: the CPU may have written it
+/// since its copy there (it is not armed and device-valid, or volatile).
+pub fn restage_needed(p: u64, exec: u32) -> bool {
+    let Some(c) = chunk(p, false) else { return false };
+    let i = idx(p);
+    if c.owner[i].load(Ordering::Acquire) != OWN_REC | exec as u64 {
+        return false;
+    }
+    let s = c.pages[i].load(Ordering::Acquire);
+    if s & ST_VALID == 0 {
+        OWN_STATS[O_CPU_WROTE].fetch_add(1, Ordering::Relaxed);
+    }
+    s & (ST_VALID | ST_ARMED) != ST_VALID | ST_ARMED || s & ST_VOLATILE != 0
+}
+
+/// Whether page `p` is copied into the mirror again at a batch's close after
+/// deferred CP writes into the placement holding it: the CPU wrote it since
+/// its copy there (not armed and device-valid, or volatile). Counted.
+pub fn needs_copy(p: u64) -> bool {
+    let Some(c) = chunk(p, false) else { return false };
+    let s = c.pages[idx(p)].load(Ordering::Acquire);
+    let need = s & (ST_VALID | ST_ARMED) != ST_VALID | ST_ARMED || s & ST_VOLATILE != 0;
+    if need {
+        OWN_STATS[O_CP_COPIES].fetch_add(1, Ordering::Relaxed);
+    }
+    need
+}
+
 /// The batch recording executor `exec` made was dropped (device lost, stop):
-/// its pages are released unwritten (the mirror's copies are not current).
+/// its pages are released (the mirror's copies are not current).
 pub fn owned_dropped(ranges: &[(u64, u64)], exec: u32) {
     let word = OWN_REC | exec as u64;
     for &(lo, hi) in ranges {
-        drop_snaps(lo, hi);
         let mut p = lo;
         while p < hi {
             if let Some(c) = chunk(p, false) {
@@ -1708,49 +1656,117 @@ pub fn owned_dropped(ranges: &[(u64, u64)], exec: u32) {
     }
 }
 
-/// Our own readers' read-back (command-processor reads, texture uploads,
-/// host writes): the GPU-owned pages of [base, base+len) get the mirror's
-/// data in guest memory. Returns the pages read back.
-pub fn read_back(base: u64, len: u64) -> u64 {
-    if !mirror_mode() || len == 0 {
-        return 0;
-    }
-    let (lo, hi) = ((base & !(PAGE - 1)).max(MIRROR_BASE), base.saturating_add(len).next_multiple_of(PAGE).min(MIRROR_END));
-    let mut n = 0;
-    let mut p = lo;
-    while p < hi {
-        let Some(c) = chunk(p, false) else {
-            p = ((p >> CHUNK_SHIFT) + 1) << CHUNK_SHIFT;
+/// Mirror mode's write-back (the first completion action of the batch whose
+/// effects this thread performs, `cp::after_batch`): its written segment
+/// [lo, lo + 4*dwords) (page-aligned) has the mirror's dwords after the
+/// batch in `data` at their indices and one mask word per 32 dwords in
+/// `mask` (bit k: dword 32j+k changed). The changed dwords are stored to
+/// guest memory, run of changed pages by run, region by region: committed
+/// regions that are not plain read-write (armed by us, read-only for the
+/// guest) are made writable around the stores and get their protection
+/// back (page states unchanged: the mirror holds those dwords too); regions
+/// not committed or no-access for the guest are left out. The pages the
+/// batch owns are released.
+pub fn apply_diff(lo: u64, dwords: u64, data: *const u32, mask: *const u32) {
+    use windows_sys::Win32::System::Memory::{VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE};
+    let t = std::time::Instant::now();
+    let seq = super::cp::after_batch();
+    let words = dwords.div_ceil(32) as usize;
+    let mask = unsafe { std::slice::from_raw_parts(mask, words) };
+    // Mask words per page.
+    const WPP: usize = (PAGE / 128) as usize;
+    let pages = (4 * dwords).div_ceil(PAGE) as usize;
+    let changed = |pg: usize| mask[pg * WPP..((pg + 1) * WPP).min(words)].iter().any(|&m| m != 0);
+    let (mut n_dw, mut n_pg, mut n_prot, mut n_skip) = (0u64, 0u64, 0u64, 0u64);
+    let _arming = ARM_LOCK.read();
+    let mut pg = 0;
+    while pg < pages {
+        if !changed(pg) {
+            pg += 1;
             continue;
-        };
-        if c.owner[idx(p)].load(Ordering::Acquire) != 0 {
-            OWN_STATS[O_EXPLICIT].fetch_add(1, Ordering::Relaxed);
-            n += release_owned(p).unwrap_or(0);
+        }
+        let mut end = pg + 1;
+        while end < pages && changed(end) {
+            end += 1;
+        }
+        let (a, e) = (lo + pg as u64 * PAGE, lo + end as u64 * PAGE);
+        // Busy while protections change (a write fault on one waits).
+        let mut q = a;
+        while q < e {
+            if let Some(c) = chunk(q, false) {
+                let st = &c.pages[idx(q)];
+                loop {
+                    let cur = st.load(Ordering::Acquire);
+                    if cur & ST_BUSY != 0 {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    if st.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                        break;
+                    }
+                }
+            }
+            q += PAGE;
+        }
+        q = a;
+        while q < e {
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            if unsafe { VirtualQuery(q as _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+                n_skip += (e - q) / PAGE;
+                break;
+            }
+            let r_end = (info.BaseAddress as u64 + info.RegionSize as u64).min(e).max(q + PAGE);
+            let usable = info.State == MEM_COMMIT && info.Protect != 0 && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0;
+            let mut old = 0u32;
+            let plain = info.Protect == PAGE_READWRITE;
+            if !usable || (!plain && unsafe { VirtualProtect(q as _, (r_end - q) as usize, PAGE_READWRITE, &mut old) } == 0) {
+                n_skip += (r_end - q) / PAGE;
+                q = r_end;
+                continue;
+            }
+            if !plain {
+                n_prot += 1;
+            }
+            let (j0, j1) = (((q - lo) / 128) as usize, (((r_end - lo) / 128) as usize).min(words));
+            for (j, &mw) in mask.iter().enumerate().take(j1).skip(j0) {
+                let mut m = mw;
+                while m != 0 {
+                    let d = j * 32 + m.trailing_zeros() as usize;
+                    unsafe { std::ptr::write_volatile((lo + 4 * d as u64) as *mut u32, *data.add(d)) };
+                    n_dw += 1;
+                    m &= m - 1;
+                }
+            }
+            n_pg += (r_end - q) / PAGE;
+            if !plain {
+                let mut tmp = 0u32;
+                unsafe { VirtualProtect(q as _, (r_end - q) as usize, old, &mut tmp) };
+            }
+            q = r_end;
+        }
+        q = a;
+        while q < e {
+            if let Some(c) = chunk(q, false) {
+                c.pages[idx(q)].fetch_and(!ST_BUSY, Ordering::AcqRel);
+            }
+            q += PAGE;
+        }
+        pg = end;
+    }
+    // Released (a later batch's ownership stays).
+    let mut p = lo;
+    while p < lo + pages as u64 * PAGE {
+        if let Some(c) = chunk(p, false) {
+            let _ = c.owner[idx(p)].compare_exchange(seq, 0, Ordering::AcqRel, Ordering::Acquire);
         }
         p += PAGE;
     }
-    n
-}
-
-/// Whether any page of [base, base+len) is GPU-owned (mirror mode).
-pub fn any_owned(base: u64, len: u64) -> bool {
-    if !mirror_mode() || len == 0 {
-        return false;
-    }
-    let (lo, hi) = ((base & !(PAGE - 1)).max(MIRROR_BASE), base.saturating_add(len).next_multiple_of(PAGE).min(MIRROR_END));
-    let mut p = lo;
-    while p < hi {
-        match chunk(p, false) {
-            Some(c) => {
-                if c.owner[idx(p)].load(Ordering::Acquire) != 0 {
-                    return true;
-                }
-                p += PAGE;
-            }
-            None => p = ((p >> CHUNK_SHIFT) + 1) << CHUNK_SHIFT,
-        }
-    }
-    false
+    OWN_STATS[O_WB_SEGS].fetch_add(1, Ordering::Relaxed);
+    OWN_STATS[O_WB_DWORDS].fetch_add(n_dw, Ordering::Relaxed);
+    OWN_STATS[O_WB_PAGES].fetch_add(n_pg, Ordering::Relaxed);
+    OWN_STATS[O_WB_PROTECTS].fetch_add(n_prot, Ordering::Relaxed);
+    OWN_STATS[O_WB_SKIPPED].fetch_add(n_skip, Ordering::Relaxed);
+    OWN_STATS[O_WB_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
 thread_local! {
@@ -1759,47 +1775,9 @@ thread_local! {
     pub static FAULT_RIP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Faults on GPU-owned pages by (thread, instruction) and pages read back
-/// (`owned_line`): who reads what the GPU wrote.
-static FAULT_SITES: Mutex<Option<std::collections::HashMap<(String, u64), (u64, u64)>>> = Mutex::new(None);
-
-/// A fault on a GPU-owned page (any access): its run is read back (waiting
-/// for the owner batch); true: retry the access.
-fn owned_fault(page: u64) -> bool {
-    OWN_STATS[O_FAULTS].fetch_add(1, Ordering::Relaxed);
-    let site = (crate::log::thread_name(), FAULT_RIP.with(|r| r.get()));
-    let r = owned_fault_inner(page);
-    let mut g = FAULT_SITES.lock();
-    let e = g.get_or_insert_with(Default::default).entry(site).or_default();
-    e.0 += 1;
-    e.1 += r.unwrap_or(0);
-    r.is_some()
-}
-
-fn owned_fault_inner(page: u64) -> Option<u64> {
-    match release_owned(page) {
-        Some(n) => Some(n),
-        None => {
-            crate::error!("resident: GPU-owned page {page:#x} could not be read back");
-            None
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn owned_fault_old(page: u64) -> bool {
-    match release_owned(page) {
-        Some(_) => true,
-        None => {
-            crate::error!("resident: GPU-owned page {page:#x} could not be read back");
-            false
-        }
-    }
-}
-
-/// Serializes read-backs (one staging buffer and command buffer).
+/// The mirror's read-back context (the boot self-test's copy).
 struct Readback {
-    pool: vk::CommandPool,
+    _pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     buf: vk::Buffer,
@@ -1819,297 +1797,9 @@ fn readback_ctx() -> Result<Readback, String> {
         let pool = c.device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).map_err(|e| format!("pool: {e}"))?;
         let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).map_err(|e| format!("cmd: {e}"))?[0];
         let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| format!("fence: {e}"))?;
-        let (buf, _mem, ptr) = c.host_buffer(READBACK_MAX, vk::BufferUsageFlags::TRANSFER_DST)?;
-        Ok(Readback { pool, cmd, fence, buf, ptr, copy })
+        let (buf, _mem, ptr) = c.host_buffer(PAGE, vk::BufferUsageFlags::TRANSFER_DST)?;
+        Ok(Readback { _pool: pool, cmd, fence, buf, ptr, copy })
     }
-}
-
-/// Reads the mirror's [a, e) into guest memory (pages made writable, filled,
-/// then armed read-only and device-valid). The caller holds READBACK.
-fn copy_back(rb: &Readback, a: u64, e: u64, kept: &mut Vec<u64>) -> Result<(), String> {
-    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
-    let m = MIRROR.get().ok_or("no mirror")?;
-    let c = ctx();
-    let n = e - a;
-    let t = std::time::Instant::now();
-    unsafe {
-        c.device.reset_command_buffer(rb.cmd, vk::CommandBufferResetFlags::empty()).map_err(|e| format!("reset: {e}"))?;
-        c.device.begin_command_buffer(rb.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(|e| format!("begin: {e}"))?;
-        c.device.cmd_copy_buffer(rb.cmd, m.buf, rb.buf, &[vk::BufferCopy { src_offset: a - MIRROR_BASE, dst_offset: 0, size: n }]);
-        c.device.end_command_buffer(rb.cmd).map_err(|e| format!("end: {e}"))?;
-        c.device.reset_fences(&[rb.fence]).map_err(|e| format!("fence reset: {e}"))?;
-        c.submit_timeline(rb.copy, &[rb.cmd], &[], &[], rb.fence)?;
-        c.device.wait_for_fences(&[rb.fence], true, 10_000_000_000).map_err(|e| format!("wait: {e}"))?;
-    }
-    // Guest pages writable, filled, read-only: a thread that reads one in
-    // between (it has not faulted) may see it half filled - the same window
-    // a write-back has on the console's GPU, but by us; kept short.
-    protect_regions(a, e, PAGE_READWRITE, false);
-    let merges = begin_merge(a, e);
-    unsafe { std::ptr::copy_nonoverlapping(rb.ptr, a as *mut u8, n as usize) };
-    *kept = finish_merge(merges);
-    OWN_STATS[O_RUNS].fetch_add(1, Ordering::Relaxed);
-    OWN_STATS[O_PAGES].fetch_add(n / PAGE, Ordering::Relaxed);
-    OWN_STATS[O_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    Ok(())
-}
-
-/// Reads back the run of GPU-owned pages around `page` with its owner
-/// (at most READBACK_MAX): waits for the owner batch (asking its executor
-/// to submit while it records), copies the mirror's data into guest memory
-/// and releases the pages (armed read-only, device-valid). Returns the pages
-/// released; None on failure (device lost, timeout).
-fn release_owned(page: u64) -> Option<u64> {
-    let c = chunk(page, false)?;
-    // A batch still being recorded has not written it: guest memory holds
-    // what a reader may see (its command processor flushes first when it
-    // needs the GPU's result).
-    let owner = c.owner[idx(page)].load(Ordering::Acquire);
-    if owner == 0 || owner & OWN_REC != 0 {
-        return Some(0);
-    }
-    if !super::exec::wait_gpu_done_for(owner, std::time::Duration::from_secs(10)) {
-        crate::error!("resident: batch {owner} (owner of {page:#x}) did not complete within 10 s");
-        return None;
-    }
-    let mut g = READBACK.lock();
-    if g.is_none() {
-        match readback_ctx() {
-            Ok(r) => *g = Some(r),
-            Err(e) => {
-                crate::error!("resident: no read-back context: {e}");
-                return None;
-            }
-        }
-    }
-    let rb = g.as_ref()?;
-    // The run: contiguous pages with the same owner (read back already by
-    // another thread meanwhile: nothing to do).
-    if c.owner[idx(page)].load(Ordering::Acquire) != owner {
-        return Some(0);
-    }
-    let base = page & !(READBACK_MAX - 1);
-    let same = |p: u64| chunk(p, false).is_some_and(|c| c.owner[idx(p)].load(Ordering::Acquire) == owner);
-    let mut a = page;
-    while a > base && same(a - PAGE) {
-        a -= PAGE;
-    }
-    let mut e = page + PAGE;
-    while e < base + READBACK_MAX && same(e) {
-        e += PAGE;
-    }
-    // Busy while the guest pages change (a write fault in between waits).
-    let mut p = a;
-    while p < e {
-        let c = chunk(p, false)?;
-        let s = &c.pages[idx(p)];
-        loop {
-            let cur = s.load(Ordering::Acquire);
-            if cur & ST_BUSY != 0 {
-                std::hint::spin_loop();
-                continue;
-            }
-            if s.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                break;
-            }
-        }
-        p += PAGE;
-    }
-    let mut kept = Vec::new();
-    let r = copy_back(rb, a, e, &mut kept);
-    if let Err(ref err) = r {
-        crate::error!("resident: reading back {a:#x}..{e:#x}: {err}");
-    }
-    // Armed read-only (the copy left them writable), device-valid, released.
-    use windows_sys::Win32::System::Memory::PAGE_READONLY;
-    let armed = r.is_ok() && protect_regions(a, e, PAGE_READONLY, false);
-    p = a;
-    while p < e {
-        let c = chunk(p, false)?;
-        let i = idx(p);
-        let _ = c.owner[i].compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire);
-        // Pages that kept CPU bytes: the mirror lacks them (uploaded again).
-        let keep = if !armed { 0 } else if kept.contains(&p) { ST_ARMED } else { ST_ARMED | ST_VALID };
-        let cur = c.pages[i].load(Ordering::Acquire);
-        c.pages[i].store((cur & !(ST_BUSY | ST_ARMED | ST_VALID | ST_CLEAN)) | keep, Ordering::Release);
-        flag(c, i);
-        p += PAGE;
-    }
-    r.ok().map(|_| (e - a) / PAGE)
-}
-
-/// Eager write-back (mirror mode): `data` holds the mirror's contents of
-/// `ranges` (packed in order) after the batch whose completion runs this
-/// (`cp::after_batch`); the pages it still owns get them in guest memory and
-/// are released (armed read-only, device-valid). Pages a later batch owns
-/// are left to it. Written ranges over texture memory go this way: the
-/// image cache hashes and uploads textures from guest memory.
-pub fn write_back_eager(ranges: &[(u64, u64)], data: *const u8) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
-    let seq = super::cp::after_batch();
-    if seq == 0 {
-        return;
-    }
-    let _arming = ARM_LOCK.read();
-    let mut off = 0u64;
-    for &(lo, hi) in ranges {
-        let mut p = lo;
-        while p < hi {
-            // A run of pages this batch still owns, taken busy.
-            let mut e = p;
-            while e < hi {
-                let Some(c) = chunk(e, false) else { break };
-                let i = idx(e);
-                if c.owner[i].load(Ordering::Acquire) != seq {
-                    break;
-                }
-                let s = &c.pages[i];
-                loop {
-                    let cur = s.load(Ordering::Acquire);
-                    if cur & ST_BUSY != 0 {
-                        std::hint::spin_loop();
-                        continue;
-                    }
-                    if s.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                        break;
-                    }
-                }
-                e += PAGE;
-            }
-            if e > p {
-                protect_regions(p, e, PAGE_READWRITE, false);
-                let merges = begin_merge(p, e);
-                unsafe { std::ptr::copy_nonoverlapping(data.add((off + p - lo) as usize), p as *mut u8, (e - p) as usize) };
-                let kept = finish_merge(merges);
-                let armed = protect_regions(p, e, PAGE_READONLY, false);
-                let mut q = p;
-                while q < e {
-                    if let Some(c) = chunk(q, false) {
-                        let i = idx(q);
-                        let _ = c.owner[i].compare_exchange(seq, 0, Ordering::AcqRel, Ordering::Acquire);
-                        let cur = c.pages[i].load(Ordering::Acquire);
-                        let keep = if !armed { 0 } else if kept.contains(&q) { ST_ARMED } else { ST_ARMED | ST_VALID };
-                        c.pages[i].store((cur & !(ST_BUSY | ST_ARMED | ST_VALID | ST_CLEAN)) | keep, Ordering::Release);
-                        flag(c, i);
-                    }
-                    q += PAGE;
-                }
-                OWN_STATS[O_EAGER].fetch_add((e - p) / PAGE, Ordering::Relaxed);
-                p = e;
-            } else {
-                p += PAGE;
-            }
-        }
-        off += hi - lo;
-    }
-}
-
-/// Mirror mode: the base contents of GPU-owned pages the CPU may write
-/// while they are owned (what the mirror holds from before the GPU's work).
-/// A write-back of such a page (read-back, eager) keeps the bytes the CPU
-/// changed since (a byte merge: `begin_merge`, `finish_merge`); the GPU's
-/// bytes win where both wrote. Taken for pages that become owned without a
-/// write fault to catch the CPU's writes (`snap_page`), and for armed pages
-/// at the CPU's first write while their batch records (`on_fault`). A
-/// snapshot lives until its page is written back or its ownership dropped.
-static SNAPS: Mutex<std::collections::BTreeMap<u64, Box<[u8; PAGE as usize]>>> = Mutex::new(std::collections::BTreeMap::new());
-static SNAP_N: AtomicU64 = AtomicU64::new(0);
-
-/// Takes a snapshot of owned page `page` from `src` (its contents as the
-/// mirror gets them) unless it has one (the older base keeps every CPU
-/// write since it). `at_fault`: taken at a CPU write (statistics).
-pub fn snap_page(page: u64, src: *const u8, at_fault: bool) {
-    // Copied before the lock: no access under it can fault.
-    let mut b = Box::new([0u8; PAGE as usize]);
-    unsafe { std::ptr::copy_nonoverlapping(src, b.as_mut_ptr(), PAGE as usize) };
-    let mut g = SNAPS.lock();
-    if g.contains_key(&page) {
-        return;
-    }
-    g.insert(page, b);
-    SNAP_N.store(g.len() as u64, Ordering::Release);
-    OWN_STATS[if at_fault { O_SNAP_FAULT } else { O_SNAP_OWN }].fetch_add(1, Ordering::Relaxed);
-}
-
-/// The pages of [lo, hi) with snapshots that executor `exec`'s recording
-/// batch owns: copied into the batch again at its close (the CPU may have
-/// written them since they became owned; the GPU's work then reads that).
-pub fn snapped_pages(lo: u64, hi: u64, exec: u32) -> Vec<u64> {
-    if SNAP_N.load(Ordering::Acquire) == 0 {
-        return Vec::new();
-    }
-    let word = OWN_REC | exec as u64;
-    let g = SNAPS.lock();
-    let v: Vec<u64> = g.range(lo..hi).map(|(&k, _)| k).filter(|&k| chunk(k, false).is_some_and(|c| c.owner[idx(k)].load(Ordering::Acquire) == word)).collect();
-    OWN_STATS[O_RESTAGED].fetch_add(v.len() as u64, Ordering::Relaxed);
-    v
-}
-
-/// Drops the snapshots of [lo, hi) (ownership dropped).
-fn drop_snaps(lo: u64, hi: u64) {
-    if SNAP_N.load(Ordering::Acquire) == 0 {
-        return;
-    }
-    let mut g = SNAPS.lock();
-    let keys: Vec<u64> = g.range(lo..hi).map(|(&k, _)| k).collect();
-    for k in keys {
-        g.remove(&k);
-    }
-    SNAP_N.store(g.len() as u64, Ordering::Release);
-}
-
-/// A page's merge in a write-back: its snapshot and its guest bytes before
-/// the write-back.
-pub struct Merge {
-    page: u64,
-    snap: Box<[u8; PAGE as usize]>,
-    cur: Box<[u8; PAGE as usize]>,
-}
-
-/// Before a write-back of [a, e) (its guest pages readable): takes the
-/// snapshots there with the pages' current guest bytes.
-pub fn begin_merge(a: u64, e: u64) -> Vec<Merge> {
-    if SNAP_N.load(Ordering::Acquire) == 0 {
-        return Vec::new();
-    }
-    let taken: Vec<(u64, Box<[u8; PAGE as usize]>)> = {
-        let mut g = SNAPS.lock();
-        let keys: Vec<u64> = g.range(a..e).map(|(&k, _)| k).collect();
-        let t = keys.into_iter().map(|k| (k, g.remove(&k).expect("snapshot"))).collect();
-        SNAP_N.store(g.len() as u64, Ordering::Release);
-        t
-    };
-    // The guest bytes read outside the lock.
-    taken
-        .into_iter()
-        .map(|(k, snap)| {
-            let mut cur = Box::new([0u8; PAGE as usize]);
-            unsafe { std::ptr::copy_nonoverlapping(k as *const u8, cur.as_mut_ptr(), PAGE as usize) };
-            Merge { page: k, snap, cur }
-        })
-        .collect()
-}
-
-/// After the write-back (guest pages writable): puts back the bytes the CPU
-/// changed since each snapshot. Returns the pages that kept CPU bytes (the
-/// mirror lacks them: not device-valid).
-pub fn finish_merge(merges: Vec<Merge>) -> Vec<u64> {
-    let mut kept = Vec::new();
-    for m in merges {
-        let mut n = 0u64;
-        for j in 0..PAGE as usize {
-            if m.cur[j] != m.snap[j] {
-                unsafe { std::ptr::write_volatile((m.page + j as u64) as *mut u8, m.cur[j]) };
-                n += 1;
-            }
-        }
-        if n > 0 {
-            OWN_STATS[O_MERGED].fetch_add(1, Ordering::Relaxed);
-            OWN_STATS[O_MERGED_BYTES].fetch_add(n, Ordering::Relaxed);
-            kept.push(m.page);
-        }
-    }
-    kept
 }
 
 /// What mirror mode's placement does with a page (`mm_page`).
@@ -2126,16 +1816,6 @@ pub enum MmPage {
     Copy,
     /// Host class: imported (CP writes), never in the mirror.
     Host,
-}
-
-/// Mirror mode: whether page `p` is GPU-owned by a submitted batch (no
-/// access), and whether it is armed and device-valid (a CPU write faults).
-pub fn mm_owned_armed(p: u64) -> (bool, bool) {
-    let Some(c) = chunk(p, false) else { return (false, false) };
-    let i = idx(p);
-    let o = c.owner[i].load(Ordering::Acquire);
-    let s = c.pages[i].load(Ordering::Acquire);
-    (o != 0 && o & OWN_REC == 0, s & (ST_VALID | ST_ARMED) == ST_VALID | ST_ARMED)
 }
 
 /// Mirror mode's view of the page at `p` (`mine`: pages this batch uploads).
@@ -2170,42 +1850,23 @@ pub fn owned_line() -> String {
     }
     let v: Vec<u64> = OWN_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    mirror mode: {} pages made GPU-owned ({} no-access calls, {} refused, {} written by the CPU before their batch was submitted), {} written back at their batch's completion (texture memory: {} chosen over uploaded textures, {} over images a write covers), {} faults on them, {} runs read back ({} pages, {:.1} us each; {} by our readers), {} ownerships dropped by remaps; CPU writes during ownership: {} snapshots at ownership (unarmed pages), {} at a write while recording, {} pages copied again at their batch's close, {} write-backs kept CPU bytes ({} bytes)\n",
+        "    mirror mode: {} pages made GPU-owned ({} refused, {} ownerships dropped by remaps), {} written by the CPU while their batch recorded, {} copied again at their batch's close, {} after deferred CP writes; {} pages copied in while a batch writing them ran; write-backs of changed dwords: {} ranges, {} dwords ({} MiB) on {} pages, {:.1} ms ({:.1} us per range), {} protection changes, {} pages left out (not writable)\n",
         v[O_OWNED],
-        v[O_PROTECTS],
         v[O_REFUSED],
-        v[O_CPU_WROTE],
-        v[O_EAGER],
-        v[O_EAGER_TRACK],
-        v[O_EAGER_COVER],
-        v[O_FAULTS],
-        v[O_RUNS],
-        v[O_PAGES],
-        v[O_NS] as f64 / v[O_RUNS].max(1) as f64 / 1000.0,
-        v[O_EXPLICIT],
         v[O_REMAP_DROPS],
-        v[O_SNAP_OWN],
-        v[O_SNAP_FAULT],
+        v[O_CPU_WROTE],
         v[O_RESTAGED],
-        v[O_MERGED],
-        v[O_MERGED_BYTES]
-    ) + &fault_sites_line()
-}
-
-fn fault_sites_line() -> String {
-    let g = FAULT_SITES.lock();
-    let Some(m) = g.as_ref() else { return String::new() };
-    let mut v: Vec<(&(String, u64), &(u64, u64))> = m.iter().collect();
-    v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
-    let parts: Vec<String> = v
-        .iter()
-        .take(16)
-        .map(|((t, rip), (n, pages))| {
-            let at = if *rip >= crate::mem::GUEST_BASE && *rip < crate::mem::GUEST_END { crate::exception::describe_guest(*rip) } else { crate::exception::host_symbol(*rip) };
-            format!("{t} at {at}: {n} faults, {pages} pages")
-        })
-        .collect();
-    format!("      faults on GPU-owned pages by site (pages read back): {}\n", parts.join("; "))
+        v[O_CP_COPIES],
+        v[O_INFLIGHT],
+        v[O_WB_SEGS],
+        v[O_WB_DWORDS],
+        (4 * v[O_WB_DWORDS]) >> 20,
+        v[O_WB_PAGES],
+        v[O_WB_NS] as f64 / 1e6,
+        v[O_WB_NS] as f64 / v[O_WB_SEGS].max(1) as f64 / 1e3,
+        v[O_WB_PROTECTS],
+        v[O_WB_SKIPPED]
+    )
 }
 
 /// Mirror mode's boot self-test: the read-back context can be made and a
