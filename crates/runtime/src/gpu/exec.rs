@@ -4994,6 +4994,7 @@ pub fn shader_profile() -> String {
     s.push_str(&super::cp::draw_state_line());
     s.push_str(&draw::draw_diff_line());
     s.push_str(&draw::again_line());
+    s.push_str(&draw::prep_repeat_line());
     s.push_str(&bind_steps_line());
     s.push_str(&pre_steps_line());
     s.push_str(&pre_repeat_line());
@@ -10357,6 +10358,7 @@ pub fn status() -> String {
         + &crate::titlefix::status()
         + &super::cp::draw_state_line()
         + &draw::draw_diff_line()
+        + &draw::prep_repeat_line()
         + &draw::again_line()
         + &draw::batch_line()
         + &super::xwait::status()

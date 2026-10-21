@@ -1164,6 +1164,7 @@ impl Exec {
                 };
             }
             self.last_draw_where = here;
+            note_prep_repeat(&vs, ps.as_ref());
         }
         // A draw right after the last full draw, with its context state and
         // the same stages (`tune draw_again`): one more draw call on the
@@ -1252,12 +1253,33 @@ impl Exec {
         let mut blend = [0u32; MAX_RT];
         let mut masks = [0u8; MAX_RT];
         if cb_mode == 1 {
+            // The surfaces first: slots that bind slices of one array (the
+            // G-buffer: CB_COLOR_VIEW selects the slice, CB_COLOR_ATTRIB3
+            // gives no depth) need it with all their slices, or an image made
+            // for the first slot alone has one layer and the others clamp to
+            // it (the G-buffer made again after the title changed its display
+            // mode lost three of its four layers, FINDINGS.md 2026-10-21).
+            let mut surfs: [Option<Surface>; MAX_RT] = [None; MAX_RT];
             for i in 0..MAX_RT as u32 {
                 let m = (target_mask >> (4 * i)) & 0xF;
                 if m == 0 || mrt_mask & (1 << i) == 0 || (col_format >> (4 * i)) & 0xF == 0 {
                     continue;
                 }
-                let Some(s) = color_surface(cp, i)? else { continue };
+                surfs[i as usize] = color_surface(cp, i)?;
+            }
+            for i in 0..MAX_RT {
+                let Some(s) = surfs[i] else { continue };
+                if s.ty3d {
+                    continue;
+                }
+                let need = surfs.iter().flatten().filter(|o| o.base == s.base && !o.ty3d && (o.width, o.height) == (s.width, s.height)).map(|o| o.slice + 1).max().unwrap_or(1);
+                if let Some(x) = surfs[i].as_mut() {
+                    x.layers = x.layers.max(need);
+                }
+            }
+            for i in 0..MAX_RT as u32 {
+                let m = (target_mask >> (4 * i)) & 0xF;
+                let Some(s) = surfs[i as usize] else { continue };
                 let t = images::target(&s)?;
                 if colors.iter().flatten().any(|c| c.view == t.view) {
                     self.report(format!("color target {:#x} bound to two MRT slots (second ignored)", s.base));
@@ -2361,7 +2383,7 @@ static AGAIN: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// `profile reset`: the draw statistics of this module.
 pub(super) fn reset_draw_stats() {
-    for c in DRAW_DIFFS.iter().chain(CONSEC_DIFFS.iter()).chain(AGAIN.iter()).chain(BATCH_CANDS.iter()) {
+    for c in DRAW_DIFFS.iter().chain(CONSEC_DIFFS.iter()).chain(AGAIN.iter()).chain(BATCH_CANDS.iter()).chain(PREP_REPEAT.iter()) {
         c.store(0, Ordering::Relaxed);
     }
 }
@@ -2558,6 +2580,54 @@ fn note_draw_diff(last: &mut [u64; 5], sig: [u64; 5], consecutive: bool) -> usiz
     }
     *last = sig;
     k
+}
+
+/// Draws with the programs and user data of a draw of a recent flip:
+/// [draws, then per distance 1-4 flips back: such repeats, of them with
+/// unchanged words read by their preparation] (`DS_DRAW_STATS`: a
+/// cross-flip preparation cache's hits).
+static PREP_REPEAT: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// [flip, the keys -> words hash of this flip and the four before].
+#[allow(clippy::type_complexity)]
+static PREP_SEEN: parking_lot::Mutex<(u64, [Option<HashMap<u64, u64>>; 5])> = parking_lot::Mutex::new((0, [None, None, None, None, None]));
+
+fn note_prep_repeat(vs: &shaders::Prepared, ps: Option<&shaders::Prepared>) {
+    let mut hk = super::super::fx::FxHasher::default();
+    let mut hw = super::super::fx::FxHasher::default();
+    for p in std::iter::once(vs).chain(ps) {
+        p.addr.hash(&mut hk);
+        p.user.hash(&mut hk);
+        p.found.words.hash(&mut hw);
+    }
+    let (key, words) = (hk.finish(), hw.finish());
+    let frame = super::super::FRAMES.load(Ordering::Relaxed);
+    let mut g = PREP_SEEN.lock();
+    if g.0 != frame {
+        // One map per flip: the oldest dropped.
+        g.1.rotate_right(1);
+        g.1[0] = Some(HashMap::new());
+        g.0 = frame;
+    }
+    PREP_REPEAT[0].fetch_add(1, Ordering::Relaxed);
+    for d in 1..5 {
+        if let Some(&w) = g.1[d].as_ref().and_then(|m| m.get(&key)) {
+            PREP_REPEAT[2 * d - 1].fetch_add(1, Ordering::Relaxed);
+            if w == words {
+                PREP_REPEAT[2 * d].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    g.1[0].get_or_insert_with(HashMap::new).insert(key, words);
+}
+
+/// The status line of `PREP_REPEAT`.
+pub(super) fn prep_repeat_line() -> String {
+    let r: Vec<u64> = PREP_REPEAT.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+    if r[0] == 0 {
+        return String::new();
+    }
+    let parts: Vec<String> = (1..5).map(|d| format!("{d} back {:.1}% ({:.1}% with unchanged words)", 100.0 * r[2 * d - 1] as f64 / r[0] as f64, 100.0 * r[2 * d] as f64 / r[0] as f64)).collect();
+    format!("    draws with the programs and user data of a draw of a recent flip (of {}): {}\n", r[0], parts.join(", "))
 }
 
 /// Status part: `DRAW_DIFFS`.

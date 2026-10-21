@@ -696,7 +696,7 @@ impl Drop for Prepared {
 
 /// A stage's user-data dwords (at most 32), held inline: a preparation
 /// and each copy of one would otherwise allocate them.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UserData {
     n: u8,
     w: [u32; 32],
