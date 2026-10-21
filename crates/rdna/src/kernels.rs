@@ -98,21 +98,35 @@ fn build_merge() -> Result<Vec<u32>, rspirv::dr::Error> {
     Ok(b.module().assemble())
 }
 
-/// Workgroup size of `mirror_diff` (dwords per workgroup; 8 mask words).
-pub const DIFF_LOCAL_SIZE: u32 = 256;
+/// Workgroup size of `mirror_gather` (one workgroup per 4 KiB page, four
+/// dwords per invocation).
+pub const GATHER_LOCAL_SIZE: u32 = 256;
+/// Dwords per record of `mirror_gather`: the page's index, its 32 mask
+/// words, its 1024 dwords.
+pub const GATHER_RECORD_DWORDS: u32 = 1 + 32 + 1024;
+/// Dwords before the first record (dword 0: the record count).
+pub const GATHER_HEADER_DWORDS: u32 = 4;
+/// Dwords per record without the page's dwords (`mirror_gather` flags bit
+/// 0 clear): its index and its 32 mask words.
+pub const GATHER_MASK_RECORD_DWORDS: u32 = 1 + 32;
 
-/// Mirror mode's write-back of a batch's written range: every dword of
-/// binding 0 (the mirror after the batch) that differs from binding 1 (its
-/// copy from the batch's start) is stored at its index in binding 2 (host
-/// memory), and binding 3 gets one mask word per 32 dwords (bit k: dword
-/// 32j+k changed), for dword indices below `count` (push constant
-/// `{count}`). Every mask word below the count is written (no clearing
-/// first), so the CPU applies exactly the dwords the GPU changed.
-pub fn mirror_diff() -> Vec<u32> {
-    build_diff().expect("mirror diff kernel")
+/// Mirror mode's write-back gather: workgroup g handles page g of a written
+/// range. Binding 0 is the written-bit map from the range's first word (32
+/// words per page: bit k of word j marks dword 32j+k), binding 1 the
+/// mirror from the range's first byte, binding 2 the host output: dword 0
+/// counts records, records start at dword GATHER_HEADER_DWORDS
+/// (GATHER_RECORD_DWORDS each). A page with marked dwords takes a record
+/// (while fewer than `cap` were taken): `first_page + g`, its mask words,
+/// its marked dwords at their indices (the others are not written), and
+/// clears the bits it recorded (bits set meanwhile stay for a later
+/// gather). Pages over the capacity keep their bits. Push constants
+/// `{pages, cap, first_page, flags}`: flags bit 0 clear leaves the dwords
+/// out (records of GATHER_MASK_RECORD_DWORDS).
+pub fn mirror_gather() -> Vec<u32> {
+    build_gather().expect("mirror gather kernel")
 }
 
-fn build_diff() -> Result<Vec<u32>, rspirv::dr::Error> {
+fn build_gather() -> Result<Vec<u32>, rspirv::dr::Error> {
     let lit = Operand::LiteralBit32;
     let mut b = Builder::new();
     b.set_version(1, 3);
@@ -130,110 +144,184 @@ fn build_diff() -> Result<Vec<u32>, rspirv::dr::Error> {
     b.member_decorate(st, 0, Decoration::Offset, [lit(0)]);
     let p_st = b.type_pointer(None, StorageClass::StorageBuffer, st);
     let p_u = b.type_pointer(None, StorageClass::StorageBuffer, u32t);
-    let pc = b.type_struct([u32t]);
+    let pc = b.type_struct([u32t, u32t, u32t, u32t]);
     b.decorate(pc, Decoration::Block, []);
-    b.member_decorate(pc, 0, Decoration::Offset, [lit(0)]);
+    for (k, off) in [0u32, 4, 8, 12].into_iter().enumerate() {
+        b.member_decorate(pc, k as u32, Decoration::Offset, [lit(off)]);
+    }
     let p_pc = b.type_pointer(None, StorageClass::PushConstant, pc);
     let p_pcu = b.type_pointer(None, StorageClass::PushConstant, u32t);
     let p_in = b.type_pointer(None, StorageClass::Input, v3);
-    let gid = global(&mut b, p_in, StorageClass::Input);
-    b.decorate(gid, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
-    let lid = global(&mut b, p_in, StorageClass::Input);
-    b.decorate(lid, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::LocalInvocationId)]);
-    let wid = global(&mut b, p_in, StorageClass::Input);
-    b.decorate(wid, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::WorkgroupId)]);
-    let mut bufs = [0; 4];
+    let lid_v = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(lid_v, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::LocalInvocationId)]);
+    let wid_v = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(wid_v, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::WorkgroupId)]);
+    let mut bufs = [0; 3];
     for (i, v) in bufs.iter_mut().enumerate() {
         *v = global(&mut b, p_st, StorageClass::StorageBuffer);
         b.decorate(*v, Decoration::DescriptorSet, [lit(0)]);
         b.decorate(*v, Decoration::Binding, [lit(i as u32)]);
     }
-    b.decorate(bufs[0], Decoration::NonWritable, []);
-    b.decorate(bufs[1], Decoration::NonWritable, []);
-    b.decorate(bufs[2], Decoration::NonReadable, []);
-    b.decorate(bufs[3], Decoration::NonReadable, []);
+    let (marks, mirror, out) = (bufs[0], bufs[1], bufs[2]);
+    b.decorate(mirror, Decoration::NonWritable, []);
     let pcv = global(&mut b, p_pc, StorageClass::PushConstant);
-    let c0 = b.constant_bit32(u32t, 0);
-    let c1 = b.constant_bit32(u32t, 1);
-    let c5 = b.constant_bit32(u32t, 5);
-    let c31 = b.constant_bit32(u32t, 31);
-    let words = b.constant_bit32(u32t, DIFF_LOCAL_SIZE / 32);
-    let arr = b.type_array(u32t, words);
-    let p_arr = b.type_pointer(None, StorageClass::Workgroup, arr);
+    let c = |b: &mut Builder, v: u32| b.constant_bit32(u32t, v);
+    let (c0, c1, c2, c3, c31, c32) = (c(&mut b, 0), c(&mut b, 1), c(&mut b, 2), c(&mut b, 3), c(&mut b, 31), c(&mut b, 32));
+    let c1024 = c(&mut b, 1024);
+    let c33 = c(&mut b, 33);
+    let rec_full = c(&mut b, GATHER_RECORD_DWORDS);
+    let rec_mask = c(&mut b, GATHER_MASK_RECORD_DWORDS);
+    let hdr = c(&mut b, GATHER_HEADER_DWORDS);
+    let arr32 = b.type_array(u32t, c32);
+    let p_arr = b.type_pointer(None, StorageClass::Workgroup, arr32);
     let p_wu = b.type_pointer(None, StorageClass::Workgroup, u32t);
-    let masks = global(&mut b, p_arr, StorageClass::Workgroup);
-    // Workgroup scope (2); acquire-release (0x8) of workgroup memory (0x100).
-    let scope_wg = b.constant_bit32(u32t, 2);
-    let sem_bar = b.constant_bit32(u32t, 0x108);
-    let sem_none = b.constant_bit32(u32t, 0);
+    let m_sh = global(&mut b, p_arr, StorageClass::Workgroup);
+    let any_sh = global(&mut b, p_wu, StorageClass::Workgroup);
+    let slot_sh = global(&mut b, p_wu, StorageClass::Workgroup);
+    // Workgroup scope (2), device scope (1); acquire-release (0x8) of
+    // workgroup memory (0x100).
+    let scope_wg = c(&mut b, 2);
+    let scope_dev = c(&mut b, 1);
+    let sem_bar = c(&mut b, 0x108);
+    let sem_none = c0;
     let fty = b.type_function(void, []);
     let f = b.begin_function(void, None, FunctionControl::NONE, fty)?;
     b.begin_block(None)?;
-    let g = b.load(v3, None, gid, None, [])?;
-    let i = b.composite_extract(u32t, None, g, [0])?;
-    let l = b.load(v3, None, lid, None, [])?;
-    let x = b.composite_extract(u32t, None, l, [0])?;
-    let w = b.load(v3, None, wid, None, [])?;
-    let wg = b.composite_extract(u32t, None, w, [0])?;
-    let pcount = b.access_chain(p_pcu, None, pcv, [c0])?;
-    let count = b.load(u32t, None, pcount, None, [])?;
-    // The workgroup's mask words start at zero.
-    let first8 = b.u_less_than(bool_, None, x, words)?;
-    let (l_zero, l_zeroed) = (b.id(), b.id());
-    b.selection_merge(l_zeroed, SelectionControl::NONE)?;
-    b.branch_conditional(first8, l_zero, l_zeroed, [])?;
-    b.begin_block(Some(l_zero))?;
-    let pz = b.access_chain(p_wu, None, masks, [x])?;
-    b.store(pz, c0, None, [])?;
-    b.branch(l_zeroed)?;
-    b.begin_block(Some(l_zeroed))?;
+    let l = b.load(v3, None, lid_v, None, [])?;
+    let lid = b.composite_extract(u32t, None, l, [0])?;
+    let w = b.load(v3, None, wid_v, None, [])?;
+    let pg = b.composite_extract(u32t, None, w, [0])?;
+    let pc_at = |b: &mut Builder, k: Word| -> Result<Word, rspirv::dr::Error> {
+        let p = b.access_chain(p_pcu, None, pcv, [k])?;
+        b.load(u32t, None, p, None, [])
+    };
+    let cap = pc_at(&mut b, c1)?;
+    let first_page = pc_at(&mut b, c2)?;
+    let flags = pc_at(&mut b, c3)?;
+    let data_bit = b.bitwise_and(u32t, None, flags, c1)?;
+    let with_data = b.i_not_equal(bool_, None, data_bit, c0)?;
+    let rec_dw = b.select(u32t, None, with_data, rec_full, rec_mask)?;
+    let is0 = b.i_equal(bool_, None, lid, c0)?;
+    let lt32 = b.u_less_than(bool_, None, lid, c32)?;
+    // any = 0
+    let (l_z, l_zd) = (b.id(), b.id());
+    b.selection_merge(l_zd, SelectionControl::NONE)?;
+    b.branch_conditional(is0, l_z, l_zd, [])?;
+    b.begin_block(Some(l_z))?;
+    b.store(any_sh, c0, None, [])?;
+    b.branch(l_zd)?;
+    b.begin_block(Some(l_zd))?;
     b.control_barrier(scope_wg, scope_wg, sem_bar)?;
-    // Each changed dword: stored, and its bit set.
-    let inside = b.u_less_than(bool_, None, i, count)?;
-    let (l_cmp, l_store, l_join, l_done) = (b.id(), b.id(), b.id(), b.id());
-    b.selection_merge(l_done, SelectionControl::NONE)?;
-    b.branch_conditional(inside, l_cmp, l_done, [])?;
-    b.begin_block(Some(l_cmp))?;
-    let pm = b.access_chain(p_u, None, bufs[0], [c0, i])?;
-    let now = b.load(u32t, None, pm, None, [])?;
-    let pp = b.access_chain(p_u, None, bufs[1], [c0, i])?;
-    let old = b.load(u32t, None, pp, None, [])?;
-    let changed = b.i_not_equal(bool_, None, now, old)?;
-    b.selection_merge(l_join, SelectionControl::NONE)?;
-    b.branch_conditional(changed, l_store, l_join, [])?;
-    b.begin_block(Some(l_store))?;
-    let po = b.access_chain(p_u, None, bufs[2], [c0, i])?;
-    b.store(po, now, None, [])?;
-    let k = b.shift_right_logical(u32t, None, x, c5)?;
-    let bit = b.bitwise_and(u32t, None, x, c31)?;
-    let m = b.shift_left_logical(u32t, None, c1, bit)?;
-    let pk = b.access_chain(p_wu, None, masks, [k])?;
-    b.atomic_or(u32t, None, pk, scope_wg, sem_none, m)?;
-    b.branch(l_join)?;
-    b.begin_block(Some(l_join))?;
-    b.branch(l_done)?;
-    b.begin_block(Some(l_done))?;
+    // The page's mask words.
+    let pg32 = b.i_mul(u32t, None, pg, c32)?;
+    let wi = b.i_add(u32t, None, pg32, lid)?;
+    let (l_m, l_md, l_any, l_anyd) = (b.id(), b.id(), b.id(), b.id());
+    b.selection_merge(l_md, SelectionControl::NONE)?;
+    b.branch_conditional(lt32, l_m, l_md, [])?;
+    b.begin_block(Some(l_m))?;
+    let pm = b.access_chain(p_u, None, marks, [c0, wi])?;
+    let mw = b.load(u32t, None, pm, None, [])?;
+    let psm = b.access_chain(p_wu, None, m_sh, [lid])?;
+    b.store(psm, mw, None, [])?;
+    let nz = b.i_not_equal(bool_, None, mw, c0)?;
+    b.selection_merge(l_anyd, SelectionControl::NONE)?;
+    b.branch_conditional(nz, l_any, l_anyd, [])?;
+    b.begin_block(Some(l_any))?;
+    b.atomic_or(u32t, None, any_sh, scope_wg, sem_none, c1)?;
+    b.branch(l_anyd)?;
+    b.begin_block(Some(l_anyd))?;
+    b.branch(l_md)?;
+    b.begin_block(Some(l_md))?;
     b.control_barrier(scope_wg, scope_wg, sem_bar)?;
-    // The mask words of the workgroup's dwords (those below the count).
-    let wbase = b.i_mul(u32t, None, wg, words)?;
-    let j = b.i_add(u32t, None, wbase, x)?;
-    let j32 = b.shift_left_logical(u32t, None, j, c5)?;
-    let in_count = b.u_less_than(bool_, None, j32, count)?;
-    let write = b.logical_and(bool_, None, first8, in_count)?;
-    let (l_mask, l_end) = (b.id(), b.id());
+    let any = b.load(u32t, None, any_sh, None, [])?;
+    let touched = b.i_not_equal(bool_, None, any, c0)?;
+    // Invocation 0 of a touched page takes a record.
+    let take = b.logical_and(bool_, None, touched, is0)?;
+    let (l_t, l_td) = (b.id(), b.id());
+    b.selection_merge(l_td, SelectionControl::NONE)?;
+    b.branch_conditional(take, l_t, l_td, [])?;
+    b.begin_block(Some(l_t))?;
+    let pcount = b.access_chain(p_u, None, out, [c0, c0])?;
+    let s = b.atomic_i_add(u32t, None, pcount, scope_dev, sem_none, c1)?;
+    b.store(slot_sh, s, None, [])?;
+    b.branch(l_td)?;
+    b.begin_block(Some(l_td))?;
+    b.control_barrier(scope_wg, scope_wg, sem_bar)?;
+    let slot = b.load(u32t, None, slot_sh, None, [])?;
+    let room = b.u_less_than(bool_, None, slot, cap)?;
+    let go = b.logical_and(bool_, None, touched, room)?;
+    let (l_go, l_end) = (b.id(), b.id());
     b.selection_merge(l_end, SelectionControl::NONE)?;
-    b.branch_conditional(write, l_mask, l_end, [])?;
-    b.begin_block(Some(l_mask))?;
-    let pw = b.access_chain(p_wu, None, masks, [x])?;
-    let mv = b.load(u32t, None, pw, None, [])?;
-    let pd = b.access_chain(p_u, None, bufs[3], [c0, j])?;
-    b.store(pd, mv, None, [])?;
+    b.branch_conditional(go, l_go, l_end, [])?;
+    b.begin_block(Some(l_go))?;
+    let sr = b.i_mul(u32t, None, slot, rec_dw)?;
+    let rec = b.i_add(u32t, None, hdr, sr)?;
+    // Header: the page's index.
+    let (l_h, l_hd) = (b.id(), b.id());
+    b.selection_merge(l_hd, SelectionControl::NONE)?;
+    b.branch_conditional(is0, l_h, l_hd, [])?;
+    b.begin_block(Some(l_h))?;
+    let page_abs = b.i_add(u32t, None, first_page, pg)?;
+    let ph = b.access_chain(p_u, None, out, [c0, rec])?;
+    b.store(ph, page_abs, None, [])?;
+    b.branch(l_hd)?;
+    b.begin_block(Some(l_hd))?;
+    // Mask words: recorded, and their bits cleared in the map.
+    let (l_k, l_kd) = (b.id(), b.id());
+    b.selection_merge(l_kd, SelectionControl::NONE)?;
+    b.branch_conditional(lt32, l_k, l_kd, [])?;
+    b.begin_block(Some(l_k))?;
+    let psm2 = b.access_chain(p_wu, None, m_sh, [lid])?;
+    let mv = b.load(u32t, None, psm2, None, [])?;
+    let r1 = b.i_add(u32t, None, rec, c1)?;
+    let ri = b.i_add(u32t, None, r1, lid)?;
+    let pr = b.access_chain(p_u, None, out, [c0, ri])?;
+    b.store(pr, mv, None, [])?;
+    let inv = b.not(u32t, None, mv)?;
+    let pm2 = b.access_chain(p_u, None, marks, [c0, wi])?;
+    b.atomic_and(u32t, None, pm2, scope_dev, sem_none, inv)?;
+    b.branch(l_kd)?;
+    b.begin_block(Some(l_kd))?;
+    // Four dwords per invocation (dwords 4*lid.. share mask word lid / 8),
+    // with data.
+    let (l_dd, l_ddd) = (b.id(), b.id());
+    b.selection_merge(l_ddd, SelectionControl::NONE)?;
+    b.branch_conditional(with_data, l_dd, l_ddd, [])?;
+    b.begin_block(Some(l_dd))?;
+    let wsel = b.shift_right_logical(u32t, None, lid, c3)?;
+    let psm3 = b.access_chain(p_wu, None, m_sh, [wsel])?;
+    let word = b.load(u32t, None, psm3, None, [])?;
+    let d_base = b.shift_left_logical(u32t, None, lid, c2)?;
+    let pg1024 = b.i_mul(u32t, None, pg, c1024)?;
+    let rdata = b.i_add(u32t, None, rec, c33)?;
+    for k in 0..4u32 {
+        let kk = c(&mut b, k);
+        let d = b.i_add(u32t, None, d_base, kk)?;
+        let bit = b.bitwise_and(u32t, None, d, c31)?;
+        let sh = b.shift_right_logical(u32t, None, word, bit)?;
+        let one = b.bitwise_and(u32t, None, sh, c1)?;
+        let set = b.i_not_equal(bool_, None, one, c0)?;
+        let (l_s, l_sd) = (b.id(), b.id());
+        b.selection_merge(l_sd, SelectionControl::NONE)?;
+        b.branch_conditional(set, l_s, l_sd, [])?;
+        b.begin_block(Some(l_s))?;
+        let md = b.i_add(u32t, None, pg1024, d)?;
+        let pmd = b.access_chain(p_u, None, mirror, [c0, md])?;
+        let v = b.load(u32t, None, pmd, None, [])?;
+        let od = b.i_add(u32t, None, rdata, d)?;
+        let pod = b.access_chain(p_u, None, out, [c0, od])?;
+        b.store(pod, v, None, [])?;
+        b.branch(l_sd)?;
+        b.begin_block(Some(l_sd))?;
+    }
+    b.branch(l_ddd)?;
+    b.begin_block(Some(l_ddd))?;
     b.branch(l_end)?;
     b.begin_block(Some(l_end))?;
     b.ret()?;
     b.end_function()?;
-    b.entry_point(ExecutionModel::GLCompute, f, "main", [gid, lid, wid]);
-    b.execution_mode(f, ExecutionMode::LocalSize, [DIFF_LOCAL_SIZE, 1, 1]);
+    b.entry_point(ExecutionModel::GLCompute, f, "main", [lid_v, wid_v]);
+    b.execution_mode(f, ExecutionMode::LocalSize, [GATHER_LOCAL_SIZE, 1, 1]);
     Ok(b.module().assemble())
 }
 
@@ -454,12 +542,12 @@ mod tests {
     }
 
     #[test]
-    fn diff_kernel_assembles() {
-        let w = super::mirror_diff();
+    fn gather_kernel_assembles() {
+        let w = super::mirror_gather();
         assert_eq!(w[0], 0x0723_0203);
         if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
             let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
-            std::fs::write(std::path::Path::new(&dir).join("mirror_diff.spv"), bytes).unwrap();
+            std::fs::write(std::path::Path::new(&dir).join("mirror_gather.spv"), bytes).unwrap();
         }
     }
 

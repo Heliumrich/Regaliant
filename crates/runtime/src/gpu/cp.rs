@@ -2523,6 +2523,15 @@ impl Cp {
             super::replay::note_cp_write(a, n);
             super::forward::written(a, n);
         }
+        // Mirror mode: the pages it changes are copied into the mirror at
+        // the next placement over them (`resident::cp_wrote`).
+        let f = match write {
+            Some((a, n)) if super::resident::mirror_mode() => Box::new(move || {
+                f();
+                super::resident::cp_wrote(a, n);
+            }) as Box<dyn FnOnce() + Send>,
+            _ => f,
+        };
         let needs_prior = end_of_pipe || self.fence_pending;
         match self.exec.as_mut() {
             Some(e) if e.busy() && (needs_prior || e.deferred_pending()) => {

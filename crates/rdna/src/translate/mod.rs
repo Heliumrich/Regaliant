@@ -260,6 +260,13 @@ pub struct Spec {
     /// (the whole ring), and workgroup x's entry gives its command's SGPR
     /// data offset and its workgroup x within that command.
     pub batched: bool,
+    /// Mirror mode (the runtime's `DS_RESIDENT=2`): every buffer store and
+    /// atomic also sets the bits of the dwords it writes in the written-bit
+    /// map (`BindingKind::Marks`: one bit per dword of the mirror), from its
+    /// resource's first map word in dword 3 of the resource's address-block
+    /// entry (u32::MAX: not marked; a marked binding starts at a multiple of
+    /// 128 bytes of the mirror). Only dwords inside the bound range count.
+    pub write_marks: bool,
 }
 
 /// Dwords per workgroup in a batched dispatch's table (`Spec::batched`):
@@ -319,6 +326,9 @@ impl std::hash::Hash for Spec {
         }
         if self.batched {
             0x4241_5443u32.hash(state);
+        }
+        if self.write_marks {
+            0x4D41_524Bu32.hash(state);
         }
     }
 }
@@ -397,6 +407,8 @@ pub enum BindingKind {
     /// no descriptor (its `binding` is unused); the runtime places it as a
     /// `Buffer` and writes the address block.
     Address(usize),
+    /// u32 array: mirror mode's written-bit map (`Spec::write_marks`).
+    Marks,
 }
 
 /// Size of the global data share.
@@ -508,7 +520,8 @@ pub fn table_slot(plan: &Plan, r: usize) -> u32 {
 }
 
 /// Dwords per resource in the address block (`Spec::addresses`): the
-/// address of the bound range (low, high dword), its size in bytes, unused.
+/// address of the bound range (low, high dword), its size in bytes, and its
+/// first word in the written-bit map (`Spec::write_marks`).
 pub const ADDR_INFO_DWORDS: u32 = 4;
 /// Dwords before the resources' entries in the address block: the zero
 /// page's address (low, high; out-of-range reads load from it), unused.
@@ -619,6 +632,9 @@ pub(crate) struct T<'a> {
     pub spill: Option<Word>,
     /// GDS storage buffer (when the program uses GDS instructions).
     pub gds: Option<Word>,
+    /// The written-bit map binding (`Spec::write_marks`, programs with
+    /// written buffers).
+    pub marks: Option<Word>,
     /// Hardware lane index within the wave (compute: from the local index).
     pub lane_id: Option<Word>,
     /// LocalInvocationIndex (compute).
@@ -1895,6 +1911,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         lds: None,
         spill: None,
         gds: None,
+        marks: None,
         lane_id: None,
         local_index: None,
         xchg: None,
@@ -1961,6 +1978,12 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         let bnd = tr.alloc_binding(BindingKind::Gds);
         tr.decorate_binding(v, bnd);
         tr.gds = Some(v);
+    }
+    if spec.write_marks && plan.resources.iter().any(|r| r.written) {
+        let v = tr.sb_var();
+        let bnd = tr.alloc_binding(BindingKind::Marks);
+        tr.decorate_binding(v, bnd);
+        tr.marks = Some(v);
     }
     if code.iter().any(|i| i.branch_target().is_some_and(|t| t <= i.pc)) {
         let v = tr.sb_var();
@@ -3003,6 +3026,7 @@ mod tests {
             sgpr_pc: None,
             addresses: false,
             batched: false,
+            write_marks: false,
         }
     }
 
@@ -3051,6 +3075,38 @@ mod tests {
         assert!(cap(&b.spirv) && !cap(&a.spirv));
         // (The test's buffer specs have no format: its formatted store warns in both.)
         assert_eq!(a.warnings, b.warnings);
+    }
+
+    /// `Spec::write_marks`: a program with buffer stores gets the marks
+    /// binding (and nothing else changes: the same bindings otherwise).
+    /// RDNA_MARKS_DUMP=<dir> writes the module for spvval.
+    #[test]
+    fn write_marks_binding() {
+        let words = [0u32; 83];
+        let code = crate::decode_program(&words).unwrap();
+        let plan = crate::analysis::analyze(&code, 2, 0);
+        assert!(plan.resources.iter().any(|r| r.written));
+        let mut spec = cs_spec([8, 8, 1]);
+        spec.resources = plan
+            .resources
+            .iter()
+            .map(|r| match r.kind {
+                ResKind::Global => ResSpec::Global,
+                _ => ResSpec::Buffer { format: 0, dst_sel: 0xFAC },
+            })
+            .collect();
+        let a = translate(&code, &plan, &spec).unwrap();
+        spec.write_marks = true;
+        let b = translate(&code, &plan, &spec).unwrap();
+        let marks = |o: &Output| o.bindings.iter().filter(|x| x.kind == BindingKind::Marks).count();
+        assert_eq!(marks(&a), 0);
+        assert_eq!(marks(&b), 1);
+        assert_eq!(a.bindings.len() + 1, b.bindings.len());
+        assert_eq!(a.warnings, b.warnings);
+        if let Ok(dir) = std::env::var("RDNA_MARKS_DUMP") {
+            let bytes: Vec<u8> = b.spirv.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("write_marks.spv"), bytes).unwrap();
+        }
     }
 
     /// A program's translation does not depend on its address (s_getpc_b64,

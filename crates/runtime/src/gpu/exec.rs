@@ -1602,7 +1602,7 @@ pub fn record_bench(capture: &str, shader: Option<u64>) -> i32 {
 
 fn descriptor_type(k: BindingKind) -> vk::DescriptorType {
     match k {
-        BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Address(_) | BindingKind::Gds | BindingKind::Debug | BindingKind::Watchdog | BindingKind::LodStats => vk::DescriptorType::STORAGE_BUFFER,
+        BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Address(_) | BindingKind::Gds | BindingKind::Debug | BindingKind::Watchdog | BindingKind::LodStats | BindingKind::Marks => vk::DescriptorType::STORAGE_BUFFER,
         BindingKind::Image(_) | BindingKind::ImageArray(_) => vk::DescriptorType::SAMPLED_IMAGE,
         BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_) => vk::DescriptorType::STORAGE_IMAGE,
         BindingKind::Sampler(_) | BindingKind::CompareSampler(_) => vk::DescriptorType::SAMPLER,
@@ -2565,24 +2565,24 @@ fn merge_pipe() -> Result<&'static MergePipe, String> {
     .map_err(|e| e.clone())
 }
 
-/// Mirror mode's write-back kernel (`rdna::kernels::mirror_diff`).
-fn diff_pipe() -> Result<&'static MergePipe, String> {
+/// Mirror mode's write-back kernel (`rdna::kernels::mirror_gather`).
+fn gather_pipe() -> Result<&'static MergePipe, String> {
     static PIPE: std::sync::OnceLock<Result<MergePipe, String>> = std::sync::OnceLock::new();
     PIPE.get_or_init(|| {
         let c = ctx();
         unsafe {
-            let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..4)
+            let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..3)
                 .map(|b| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
                 .collect();
-            let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("diff set layout: {e}"))?;
+            let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("gather set layout: {e}"))?;
             let layouts = [set_layout];
-            let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 4 }];
-            let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("diff layout: {e}"))?;
-            let code = rdna::kernels::mirror_diff();
-            let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("diff module: {e}"))?;
+            let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 16 }];
+            let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("gather layout: {e}"))?;
+            let code = rdna::kernels::mirror_gather();
+            let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("gather module: {e}"))?;
             let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
             let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
-            let pipeline = super::pcache::with_cache('i', 4, |cache| c.device.create_compute_pipelines(cache, &[ci], None)).map_err(|(_, e)| format!("diff pipeline: {e}"));
+            let pipeline = super::pcache::with_cache('i', 5, |cache| c.device.create_compute_pipelines(cache, &[ci], None)).map_err(|(_, e)| format!("gather pipeline: {e}"));
             c.device.destroy_shader_module(module, None);
             Ok(MergePipe { pipeline: pipeline?[0], layout, set_layout })
         }
@@ -3671,10 +3671,8 @@ struct Slot {
     /// Mirror mode: more staging when the batch uploads more than STAGE_SEG
     /// (level loads; freed when the slot is reused).
     stage_extra: Vec<(vk::Buffer, vk::DeviceMemory, *mut u8)>,
-    /// Mirror mode's write-backs: the copy of the written ranges from the
-    /// batch's start (video memory) and the diff kernel's output (host
-    /// memory), with their sizes (grown when a batch needs more).
-    mm_pristine: (vk::Buffer, vk::DeviceMemory, u64),
+    /// Mirror mode's write-backs: the gather kernel's output (host memory)
+    /// and its size (grown when a batch needs more).
     mm_out: (vk::Buffer, vk::DeviceMemory, *mut u8, u64),
     /// The slot's own command pools (its queue's family; the copy queue's,
     /// null without one), so that a whole slot can be reset at once.
@@ -3783,7 +3781,6 @@ impl Slot {
                 pre_cap: 0,
                 stage: None,
                 stage_extra: Vec::new(),
-                mm_pristine: (vk::Buffer::null(), vk::DeviceMemory::null(), 0),
                 mm_out: (vk::Buffer::null(), vk::DeviceMemory::null(), std::ptr::null_mut(), 0),
                 xpre,
                 homes: Vec::new(),
@@ -5286,11 +5283,9 @@ pub struct Exec {
     cs_streak: (u64, u32),
     /// The open batched dispatch (`tune batch_cs`).
     cs_run: Option<CsRun>,
-    /// Mirror mode: this executor's id for page ownership (`resident::own`;
-    /// u32::MAX before its first written binding), the page runs its batch
-    /// owns, bytes used in the slot's last extra staging buffer, and pages
-    /// copied without a claim.
-    res_exec: u32,
+    /// Mirror mode: the page runs its batch's bindings write (gathered at
+    /// its end: `record_mirror_writeback`), bytes used in the slot's last
+    /// extra staging buffer, and pages copied without a claim.
     owned: Vec<(u64, u64)>,
     extra_used: u64,
     mm_copy: Vec<u64>,
@@ -5403,10 +5398,7 @@ struct Closed {
     segs: Vec<SegMark>,
     /// Pages it uploads into the residency mirror (`Exec::res_pages`).
     res_pages: Vec<u64>,
-    /// Mirror mode: the page runs it owns and its executor's id, and the
-    /// write-back of its texture-memory runs (`Exec::eager_action`).
-    owned: Vec<(u64, u64)>,
-    res_exec: u32,
+    /// Mirror mode: its write-back (`Exec::eager_action`).
     eager_action: Option<Action>,
 }
 
@@ -5557,7 +5549,6 @@ impl Exec {
                 cmd_uses: std::cell::Cell::new(0),
                 cs_streak: (0, 0),
                 cs_run: None,
-                res_exec: u32::MAX,
                 owned: Vec::new(),
                 extra_used: 0,
                 mm_copy: Vec::new(),
@@ -6009,7 +6000,7 @@ impl Exec {
                 crate::error!("gpu[{}]: CP effects in a parallel run (dropped)", self.name);
             }
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), owned: std::mem::take(&mut self.owned), res_exec: self.res_exec, eager_action: self.eager_action.take() });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take() });
             self.res_mine.clear();
             self.stage_used = 0;
             self.slots[i].seq = PENDING;
@@ -6068,9 +6059,7 @@ impl Exec {
             super::resident::submitted(&std::mem::take(&mut self.res_pages), seq);
         }
         self.res_mine.clear();
-        if !self.owned.is_empty() {
-            super::resident::owned_submitted(&std::mem::take(&mut self.owned), self.res_exec, seq);
-        }
+        self.owned.clear();
         self.stage_used = 0;
         if !self.own_checks.is_empty() {
             let mut g = SPEC_CHECKS.lock();
@@ -6159,7 +6148,7 @@ impl Exec {
         self.batch_shaders.clear();
         self.resident.clear();
         super::resident::dropped(&std::mem::take(&mut self.res_pages));
-        super::resident::owned_dropped(&std::mem::take(&mut self.owned), self.res_exec);
+        self.owned.clear();
         self.eager_action = None;
         self.pre_after.clear();
         self.mm_cp.clear();
@@ -6576,7 +6565,7 @@ impl Exec {
     /// GPU-owned (no-access once the batch is submitted). None: a page is
     /// host class (CP writes) or not readable; the old paths take it.
     fn mirror_place(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
-        use super::resident::{self as res, MmPage};
+        use super::resident as res;
         let (mbuf, _) = res::mirror()?;
         let end = base.checked_add(size)?;
         if size == 0 || base < res::MIRROR_BASE || end > res::MIRROR_END {
@@ -6587,20 +6576,7 @@ impl Exec {
         claim.clear();
         let mut copy = std::mem::take(&mut self.mm_copy);
         copy.clear();
-        let mut host = false;
-        let mut p = lo;
-        while p < hi {
-            match res::mm_page(p, &self.res_mine) {
-                MmPage::Current => {}
-                MmPage::Claim => claim.push(p),
-                MmPage::Copy => copy.push(p),
-                MmPage::Host => {
-                    host = true;
-                    break;
-                }
-            }
-            p += res::PAGE;
-        }
+        let host = !res::mm_scan(lo, hi, &self.res_mine, &mut claim, &mut copy);
         // A descriptor reaching past the end of its mappings (generic sizes
         // on ring allocations): the mapped part is placed, the rest reads 0.
         if !host && !staged_readable(&claim, &copy) {
@@ -6622,13 +6598,6 @@ impl Exec {
             return None;
         }
         if written {
-            if self.res_exec == u32::MAX {
-                self.res_exec = res::register_exec(self.submit_request.clone());
-            }
-            if !res::own(lo, hi, self.res_exec) {
-                res::refused(2);
-                return None;
-            }
             self.owned.push((lo, hi));
         }
         // Deferred CP writes into the range not performed yet: the batch is
@@ -6652,19 +6621,19 @@ impl Exec {
     }
 
     /// Mirror mode's write-back of the batch's written ranges (disjoint
-    /// segments of `owned`): their pages the CPU may have written since they
-    /// became owned are copied into the mirror again (the prologue), then a
-    /// copy of the mirror there is taken (after the prologue's other copies,
-    /// before the batch's work); at the batch's end the diff kernel stores
-    /// the dwords the work changed, with their masks, in host memory, and the
-    /// batch's first completion action stores those dwords to guest memory
-    /// (`resident::apply_diff`), before its command-processor effects show
-    /// the batch done. Dwords the work did not change keep what the CPU
-    /// wrote meanwhile (a binding's whole range counts as written).
+    /// segments of `owned`, with ranges an earlier gather could not record
+    /// for want of room): at the batch's end the gather kernel records the
+    /// pages with dwords its shaders marked (`Spec::write_marks`) with those
+    /// dwords in host memory and clears their bits, and the batch's first
+    /// completion action stores them to guest memory
+    /// (`resident::apply_records`), before its command-processor effects
+    /// show the batch done. Dwords not written keep what the CPU wrote.
     fn record_mirror_writeback(&mut self) -> Result<(), String> {
         use super::resident as res;
         let Some((mbuf, _)) = res::mirror() else { return Ok(()) };
-        let mut segs: Vec<(u64, u64)> = self.owned.clone();
+        let Some(marks) = res::marks() else { return Ok(()) };
+        let mut segs: Vec<(u64, u64)> = std::mem::take(&mut self.owned);
+        segs.extend(res::take_regather());
         segs.sort_unstable();
         let mut merged: Vec<(u64, u64)> = Vec::with_capacity(segs.len());
         for (a, e) in segs {
@@ -6673,70 +6642,45 @@ impl Exec {
                 _ => merged.push((a, e)),
             }
         }
-        // Pages the CPU may have written since their copy in the mirror.
-        let mut restaged = 0;
-        for &(a, e) in &merged {
-            let mut p = a;
-            while p < e {
-                if res::restage_needed(p, self.res_exec) {
-                    if self.mirror_stage(mbuf, p).is_none() {
-                        return Err(format!("no staging to copy {p:#x} again"));
-                    }
-                    restaged += 1;
-                }
-                p += res::PAGE;
-            }
-        }
-        res::note_restaged(restaged);
-        // Per segment: its copy, its changed dwords and its mask words.
-        const ALIGN: u64 = 256;
-        let (mut poff, mut ooff) = (0u64, 0u64);
-        let mut layout = Vec::with_capacity(merged.len());
-        for &(a, e) in &merged {
-            let dwords = (e - a) / 4;
-            let p0 = poff;
-            poff = (poff + 4 * dwords).next_multiple_of(ALIGN);
-            let d0 = ooff;
-            ooff = (ooff + 4 * dwords).next_multiple_of(ALIGN);
-            let m0 = ooff;
-            ooff = (ooff + 4 * dwords.div_ceil(32)).next_multiple_of(ALIGN);
-            layout.push((a, dwords, p0, d0, m0));
-        }
-        let (pbuf, obuf, optr) = self.mm_buffers(poff, ooff)?;
-        let _ = self.open_pre();
-        for &(a, dwords, p0, _, _) in &layout {
-            self.pre_after.push((mbuf, pbuf, vk::BufferCopy { src_offset: a - res::MIRROR_BASE, dst_offset: p0, size: 4 * dwords }));
-        }
-        let pipe = diff_pipe()?;
+        let pages: u64 = merged.iter().map(|&(a, e)| (e - a) / res::PAGE).sum();
+        // Room for every page up to a size; more waits for a later gather.
+        // Lazy write-backs record the masks alone (`resident::apply_masks`).
+        let eager = res::eager_writebacks();
+        let cap = if eager { pages.min(res::gather_cap()) } else { pages.min(8 * res::gather_cap()) }.max(1);
+        let rec = 4 * if eager { rdna::kernels::GATHER_RECORD_DWORDS } else { rdna::kernels::GATHER_MASK_RECORD_DWORDS } as u64;
+        let (obuf, optr, cap) = self.mm_buffers(4 * rdna::kernels::GATHER_HEADER_DWORDS as u64 + cap * rec, rec)?;
+        unsafe { std::ptr::write_volatile(optr as *mut u32, 0) };
+        let pipe = gather_pipe()?;
         let c = ctx();
         let cmd = self.cmd();
         global_barrier(cmd);
         unsafe { c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe.pipeline) };
         self.dyncache.cs_pipeline = pipe.pipeline;
-        // At most 2^26 dwords per dispatch (a multiple of 32: mask words stay
-        // aligned).
-        const PART: u64 = 1 << 26;
-        for &(a, dwords, p0, d0, m0) in &layout {
+        // At most 2^20 pages (4 GiB) per dispatch.
+        const PART: u64 = 1 << 20;
+        for &(a, e) in &merged {
+            let n_all = (e - a) / res::PAGE;
             let mut at = 0u64;
-            while at < dwords {
-                let n = (dwords - at).min(PART);
+            while at < n_all {
+                let n = (n_all - at).min(PART);
+                let first = a + at * res::PAGE - res::MIRROR_BASE;
                 let set = self.alloc_set(pipe.set_layout)?;
                 let infos = [
-                    vk::DescriptorBufferInfo { buffer: mbuf, offset: a - res::MIRROR_BASE + 4 * at, range: 4 * n },
-                    vk::DescriptorBufferInfo { buffer: pbuf, offset: p0 + 4 * at, range: 4 * n },
-                    vk::DescriptorBufferInfo { buffer: obuf, offset: d0 + 4 * at, range: 4 * n },
-                    vk::DescriptorBufferInfo { buffer: obuf, offset: m0 + 4 * (at / 32), range: 4 * n.div_ceil(32) },
+                    vk::DescriptorBufferInfo { buffer: marks, offset: first / 32, range: n * 128 },
+                    vk::DescriptorBufferInfo { buffer: mbuf, offset: first, range: n * res::PAGE },
+                    vk::DescriptorBufferInfo { buffer: obuf, offset: 0, range: vk::WHOLE_SIZE },
                 ];
                 let writes: Vec<vk::WriteDescriptorSet> = infos
                     .iter()
                     .enumerate()
                     .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
                     .collect();
+                let pc: Vec<u8> = [n as u32, cap as u32, (first / res::PAGE) as u32, eager as u32].iter().flat_map(|x| x.to_le_bytes()).collect();
                 unsafe {
                     c.device.update_descriptor_sets(&writes, &[]);
                     c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, pipe.layout, 0, &[set], &[]);
-                    c.device.cmd_push_constants(cmd, pipe.layout, vk::ShaderStageFlags::COMPUTE, 0, &(n as u32).to_le_bytes());
-                    c.device.cmd_dispatch(cmd, n.div_ceil(rdna::kernels::DIFF_LOCAL_SIZE as u64) as u32, 1, 1);
+                    c.device.cmd_push_constants(cmd, pipe.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
+                    c.device.cmd_dispatch(cmd, n as u32, 1, 1);
                 }
                 at += n;
             }
@@ -6745,11 +6689,12 @@ impl Exec {
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[mb], &[], &[]);
         }
-        let segs: Vec<(u64, u64, u64, u64)> = layout.iter().map(|&(a, dwords, _, d0, m0)| (a, dwords, d0, m0)).collect();
         let base = optr as usize;
         let action: Action = Box::new(move || {
-            for &(a, dwords, d0, m0) in &segs {
-                res::apply_diff(a, dwords, (base + d0 as usize) as *const u32, (base + m0 as usize) as *const u32);
+            let over = if eager { res::apply_records(base as *const u32, cap as u32) } else { res::apply_masks(base as *const u32, cap as u32) };
+            if over > 0 {
+                // The pages left over keep their bits: a later gather takes them.
+                res::regather(&merged, over);
             }
         });
         if self.deferred {
@@ -6760,9 +6705,31 @@ impl Exec {
         Ok(())
     }
 
+    /// The current slot's host buffer for mirror write-backs, grown to hold
+    /// at least `bytes`: (buffer, its mapping, records it holds of
+    /// `record` bytes after the header).
+    fn mm_buffers(&mut self, bytes: u64, record: u64) -> Result<(vk::Buffer, *mut u8, u64), String> {
+        let c = ctx();
+        let s = &mut self.slots[self.cur];
+        if s.mm_out.3 < bytes {
+            unsafe {
+                if s.mm_out.0 != vk::Buffer::null() {
+                    c.device.destroy_buffer(s.mm_out.0, None);
+                    c.device.free_memory(s.mm_out.1, None);
+                }
+            }
+            let cap = bytes.max(1 << 20).next_power_of_two();
+            let (b, m, ptr) = c.host_buffer(cap, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            s.mm_out = (b, m, ptr, cap);
+        }
+        let header = 4 * rdna::kernels::GATHER_HEADER_DWORDS as u64;
+        Ok((s.mm_out.0, s.mm_out.2, (s.mm_out.3 - header) / record))
+    }
+
     /// Mirror mode: the pages of placements that deferred CP writes wrote
     /// into (performed by now: the batch waited for them before its close)
-    /// that the CPU changed are copied into the mirror again (the prologue).
+    /// are copied into the mirror again (the prologue), those the CPU's CP
+    /// writes changed (`resident::take_cp_pages`).
     fn mirror_cp_copies(&mut self) -> Result<(), String> {
         use super::resident as res;
         let Some((mbuf, _)) = res::mirror() else { return Ok(()) };
@@ -6770,48 +6737,14 @@ impl Exec {
         ranges.sort_unstable();
         let mut at = 0;
         for (lo, hi) in ranges {
-            let mut p = lo.max(at);
-            while p < hi {
-                if res::needs_copy(p) && self.mirror_stage(mbuf, p).is_none() {
+            for p in res::take_cp_pages(lo.max(at), hi) {
+                if self.mirror_stage(mbuf, p).is_none() {
                     return Err(format!("no staging to copy {p:#x}"));
                 }
-                p += res::PAGE;
             }
             at = at.max(hi);
         }
         Ok(())
-    }
-
-    /// The current slot's buffers for mirror write-backs, grown to at least
-    /// `pristine` bytes of video memory and `out` bytes of host memory:
-    /// (copy buffer, output buffer, its mapping).
-    fn mm_buffers(&mut self, pristine: u64, out: u64) -> Result<(vk::Buffer, vk::Buffer, *mut u8), String> {
-        let c = ctx();
-        let s = &mut self.slots[self.cur];
-        if s.mm_pristine.2 < pristine.max(1) {
-            unsafe {
-                if s.mm_pristine.0 != vk::Buffer::null() {
-                    super::vk::note_gpu_freed(s.mm_pristine.0);
-                    c.device.destroy_buffer(s.mm_pristine.0, None);
-                    c.device.free_memory(s.mm_pristine.1, None);
-                }
-            }
-            let cap = pristine.max(1 << 20).next_power_of_two();
-            let (b, m) = c.device_buffer(cap, vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER)?;
-            s.mm_pristine = (b, m, cap);
-        }
-        if s.mm_out.3 < out.max(1) {
-            unsafe {
-                if s.mm_out.0 != vk::Buffer::null() {
-                    c.device.destroy_buffer(s.mm_out.0, None);
-                    c.device.free_memory(s.mm_out.1, None);
-                }
-            }
-            let cap = out.max(1 << 20).next_power_of_two();
-            let (b, m, ptr) = c.host_buffer(cap, vk::BufferUsageFlags::STORAGE_BUFFER)?;
-            s.mm_out = (b, m, ptr, cap);
-        }
-        Ok((s.mm_pristine.0, s.mm_out.0, s.mm_out.2))
     }
 
     /// Uploads the pages of `claim` (claimed and armed first) and `copy`
@@ -6831,8 +6764,6 @@ impl Exec {
         if res::back(lo, hi - lo).is_err() {
             return false;
         }
-        res::note_inflight(claim);
-        res::note_inflight(copy);
         let claimed = if claim.is_empty() { 0 } else { res::claim_pages(claim) };
         // Pages another thread claimed meanwhile: copied without a claim.
         copy.extend_from_slice(&claim[claimed..]);
@@ -8876,9 +8807,6 @@ impl Exec {
             }
             super::precache::submitted(&b.shared, seq);
             super::resident::submitted(&b.res_pages, seq);
-            if !b.owned.is_empty() {
-                super::resident::owned_submitted(&b.owned, b.res_exec, seq);
-            }
             INFLIGHT.note_ranges(seq, &b.writes);
             if !super::resident::mirror_mode() {
                 super::resident::gpu_wrote(&b.writes);
@@ -8915,7 +8843,6 @@ impl Exec {
         for b in std::mem::take(&mut self.closed) {
             super::forward::drop_checks(&b.forward_ids);
             super::resident::dropped(&b.res_pages);
-            super::resident::owned_dropped(&b.owned, b.res_exec);
             let s = &mut self.slots[b.slot];
             unsafe {
                 c.device.reset_command_buffer(s.cmd, vk::CommandBufferResetFlags::empty()).ok();
@@ -8955,6 +8882,7 @@ impl Exec {
             // Address-mode translations: the zero page in the address block's
             // header (`Spec::addresses`).
             let addr_at = rdna::translate::addr_info_offset(&found.tr.plan) as usize;
+            let has_marks = found.tr.out.bindings.iter().any(|b| b.kind == BindingKind::Marks);
             if found.tr.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::Address(_))) {
                 p.sgpr_data[addr_at] = fx.zero_va as u32;
                 p.sgpr_data[addr_at + 1] = (fx.zero_va >> 32) as u32;
@@ -9084,7 +9012,8 @@ impl Exec {
                         }
                         if let Some((hbuf, hoff, avail)) = home {
                             placement = if from_mirror.is_some() { Placement::Mirrored } else { Placement::Home };
-                            let align = ctx().limits.min_storage_buffer_offset_alignment.max(4);
+                            // Mirror placements start at a mark word (`Spec::write_marks`).
+                            let align = if from_mirror.is_some() { 128 } else { ctx().limits.min_storage_buffer_offset_alignment.max(4) };
                             let off = hoff & !(align - 1);
                             bias = hoff - off;
                             info = vk::DescriptorBufferInfo { buffer: hbuf, offset: off, range: (bias + size).next_multiple_of(4).min(bias + avail) };
@@ -9233,6 +9162,12 @@ impl Exec {
                         p.sgpr_data[ri + 1] = stride;
                         p.sgpr_data[ri + 2] = bound_size.min(u32::MAX as u64) as u32;
                         p.sgpr_data[ri + 3] = limit;
+                        // Mirror mode: the resource's first word in the written-bit
+                        // map (its stores mark the dwords they write), or none.
+                        if has_marks {
+                            let ai = addr_at + (rdna::translate::ADDR_HEADER_DWORDS + rdna::translate::ADDR_INFO_DWORDS * i as u32) as usize;
+                            p.sgpr_data[ai + 3] = if placement == Placement::Mirrored && found.tr.plan.resources[i].written { (info.offset / 128) as u32 } else { u32::MAX };
+                        }
                         if matches!(b.kind, BindingKind::Address(_)) {
                             // The descriptor's range as an address and size.
                             let va = ctx().buffer_address(info.buffer) + info.offset;
@@ -9251,6 +9186,13 @@ impl Exec {
                     BindingKind::Debug => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.debug, offset: 0, range: rdna::translate::DUMP_DWORDS as u64 * 4 })),
                     BindingKind::Watchdog => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.watchdog, offset: 0, range: rdna::translate::WATCHDOG_DWORDS as u64 * 4 })),
                     BindingKind::LodStats => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.lodstats, offset: 0, range: super::lodstats::SLOT_BYTES })),
+                    BindingKind::Marks => bound.bufs.push((
+                        b.binding,
+                        match super::resident::marks() {
+                            Some(m) => vk::DescriptorBufferInfo { buffer: m, offset: 0, range: super::resident::MARK_BYTES },
+                            None => vk::DescriptorBufferInfo { buffer: fx.dummy, offset: 0, range: DUMMY_BYTES },
+                        },
+                    )),
                     _ => {}
                 }
             }

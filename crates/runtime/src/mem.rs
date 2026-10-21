@@ -958,6 +958,8 @@ pub static KERNEL_IO: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::at
 /// with what the range looked like logged.
 pub fn kernel_io<T>(what: &dyn Fn() -> String, base: u64, len: u64, into_guest: bool, mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
     use std::sync::atomic::Ordering::Relaxed;
+    // Mirror mode: no-access pages with GPU-written dwords first.
+    crate::gpu::resident::release_range(base, len);
     const TRIES: u32 = 8;
     let mut tries = 0;
     loop {
@@ -1041,6 +1043,9 @@ fn host_decommit(addr: u64, size: u64) {
 
 pub fn host_protect(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     let t0 = std::time::Instant::now();
+    // Mirror mode: GPU-written dwords reach guest memory before its
+    // protection changes (their pages' protections are restored first).
+    crate::gpu::resident::release_range(addr, size);
     crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_PROTECT);
     let mut old = 0u32;
     let _readers_out = GUEST_READERS.write();

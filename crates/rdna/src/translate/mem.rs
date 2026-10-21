@@ -960,7 +960,7 @@ pub fn buffer(tr: &mut T, ins: &Inst) -> R<()> {
         _ => (0, 0xFAC), // identity swizzle
     };
     let fmt = if ins.enc == Enc::Mtbuf { ins.mtbuf_format() as u16 } else { vfmt };
-    mem_access(tr, ins, name.trim_start_matches('t'), var, addr, fmt, dst_sel)
+    mem_access(tr, ins, name.trim_start_matches('t'), r, var, addr, fmt, dst_sel)
 }
 
 /// GLOBAL instructions with an SGPR base: the base is a bound resource.
@@ -978,11 +978,102 @@ pub fn global(tr: &mut T, ins: &Inst) -> R<()> {
     let bias = tr.res_info(r, 0)?;
     let addr = e(tr.b.i_add(u, None, a, bias))?;
     let name = name.replacen("global_", "buffer_", 1);
-    mem_access(tr, ins, &name, var, addr, 0, 0xFAC)
+    mem_access(tr, ins, &name, r, var, addr, 0, 0xFAC)
 }
 
-/// Shared MUBUF/GLOBAL semantics on a raw storage buffer at byte `addr`.
-fn mem_access(tr: &mut T, ins: &Inst, name: &str, var: Word, addr: Word, fmt: u16, dst_sel: u16) -> R<()> {
+/// `Spec::write_marks`: sets the bits of `n` dwords (1..=4, a constant)
+/// from dword `d0` of resource `r`'s binding in the written-bit map, when
+/// the resource is marked and the dwords lie inside its bound bytes. Run it
+/// where the store happens (active lanes).
+fn mark_dwords(tr: &mut T, r: usize, d0: Word, n: u32) -> R<()> {
+    let Some(marks) = tr.marks else { return Ok(()) };
+    let (u, b) = (tr.t.u32, tr.t.bool_);
+    let base = tr.addr_info(r, 3)?;
+    let none = tr.u(u32::MAX);
+    let marked = e(tr.b.i_not_equal(b, None, base, none))?;
+    // The binding's dwords end at bias + bound bytes (rounded up: robust
+    // access takes the last dword whole): d0 + n <= that, without wrapping.
+    let bias = tr.res_info(r, 0)?;
+    let bound = tr.res_info(r, 2)?;
+    let k3 = tr.u(3);
+    let end = e(tr.b.i_add(u, None, bound, bias))?;
+    let end = e(tr.b.i_add(u, None, end, k3))?;
+    let two = tr.u(2);
+    let bdw = e(tr.b.shift_right_logical(u, None, end, two))?;
+    let nn = tr.u(n);
+    let fits = e(tr.b.u_greater_than_equal(b, None, bdw, nn))?;
+    let lim = e(tr.b.i_sub(u, None, bdw, nn))?;
+    let le = e(tr.b.u_less_than_equal(b, None, d0, lim))?;
+    let inr = e(tr.b.logical_and(b, None, fits, le))?;
+    let cond = e(tr.b.logical_and(b, None, marked, inr))?;
+    tr.guarded(cond, &mut |tr| {
+        let (five, k31) = (tr.u(5), tr.u(31));
+        let w = e(tr.b.shift_right_logical(u, None, d0, five))?;
+        let w = e(tr.b.i_add(u, None, base, w))?;
+        let lo = e(tr.b.bitwise_and(u, None, d0, k31))?;
+        let bits = tr.u((1u32 << n) - 1);
+        let m0 = e(tr.b.shift_left_logical(u, None, bits, lo))?;
+        let scope = tr.u(spirv::Scope::Device as u32);
+        let sem = tr.u(0);
+        let z = tr.u(0);
+        let p0 = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, w]))?;
+        e(tr.b.atomic_or(u, None, p0, scope, sem, m0))?;
+        if n > 1 {
+            // Dwords past the word's end go to the next word.
+            let k32 = tr.u(32);
+            let end = e(tr.b.i_add(u, None, lo, nn))?;
+            let spill = e(tr.b.u_greater_than(b, None, end, k32))?;
+            tr.guarded(spill, &mut |tr| {
+                let k32 = tr.u(32);
+                let sh = e(tr.b.i_sub(u, None, k32, lo))?;
+                let m1 = e(tr.b.shift_right_logical(u, None, bits, sh))?;
+                let one = tr.u(1);
+                let w1 = e(tr.b.i_add(u, None, w, one))?;
+                let z = tr.u(0);
+                let p1 = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, w1]))?;
+                let scope = tr.u(spirv::Scope::Device as u32);
+                let sem = tr.u(0);
+                e(tr.b.atomic_or(u, None, p1, scope, sem, m1))?;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    })
+}
+
+/// `mark_dwords` for a store of `nbytes` (1 or 2) at byte `addr`: the one or
+/// two dwords holding them.
+fn mark_bytes(tr: &mut T, r: usize, addr: Word, nbytes: u32) -> R<()> {
+    if tr.marks.is_none() {
+        return Ok(());
+    }
+    let u = tr.t.u32;
+    let two = tr.u(2);
+    let d0 = e(tr.b.shift_right_logical(u, None, addr, two))?;
+    if nbytes == 1 {
+        return mark_dwords(tr, r, d0, 1);
+    }
+    // A short at byte 3 of a dword spans two.
+    let k3 = tr.u(3);
+    let sub = e(tr.b.bitwise_and(u, None, addr, k3))?;
+    let spans = e(tr.b.i_equal(tr.t.bool_, None, sub, k3))?;
+    let (merge, two_b, one_b) = (tr.b.id(), tr.b.id(), tr.b.id());
+    ok(tr.b.selection_merge(merge, spirv::SelectionControl::NONE))?;
+    ok(tr.b.branch_conditional(spans, two_b, one_b, []))?;
+    e(tr.b.begin_block(Some(two_b)))?;
+    mark_dwords(tr, r, d0, 2)?;
+    ok(tr.b.branch(merge))?;
+    e(tr.b.begin_block(Some(one_b)))?;
+    mark_dwords(tr, r, d0, 1)?;
+    ok(tr.b.branch(merge))?;
+    e(tr.b.begin_block(Some(merge)))?;
+    Ok(())
+}
+
+/// Shared MUBUF/GLOBAL semantics on a raw storage buffer at byte `addr`
+/// (resource `r`).
+#[allow(clippy::too_many_arguments)]
+fn mem_access(tr: &mut T, ins: &Inst, name: &str, r: usize, var: Word, addr: Word, fmt: u16, dst_sel: u16) -> R<()> {
     let u = tr.t.u32;
     let vd = match ins.enc {
         Enc::Global | Enc::Flat | Enc::Scratch => {
@@ -1021,7 +1112,19 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, var: Word, addr: Word, fmt: u1
             vals.push(tr.store_vreg(vd + k)?);
         }
         let act = tr.active()?;
-        return tr.guarded(act, &mut |tr| store_formatted(tr, var, addr, &vals, fmt));
+        let size = format::gfx10(fmt).filter(|f| !f.block && f.components() > 0).map(|f| f.bytes());
+        return tr.guarded(act, &mut |tr| {
+            store_formatted(tr, var, addr, &vals, fmt)?;
+            match size {
+                Some(sz) if sz >= 4 => {
+                    let two = tr.u(2);
+                    let d0 = e(tr.b.shift_right_logical(tr.t.u32, None, addr, two))?;
+                    mark_dwords(tr, r, d0, sz.div_ceil(4))
+                }
+                Some(sz) => mark_bytes(tr, r, addr, sz),
+                None => Ok(()),
+            }
+        });
     }
     if let Some(kind) = name.strip_prefix("buffer_load_") {
         match kind {
@@ -1096,6 +1199,9 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, var: Word, addr: Word, fmt: u1
                         vals.push(tr.store_vreg(vd + k)?);
                     }
                     store_dwords(tr, var, addr, &vals)?;
+                    let two = tr.u(2);
+                    let d0 = e(tr.b.shift_right_logical(u, None, addr, two))?;
+                    mark_dwords(tr, r, d0, n)?;
                 }
                 "byte" | "short" | "byte_d16_hi" | "short_d16_hi" => {
                     let nb = if kind.starts_with("byte") { 1 } else { 2 };
@@ -1105,6 +1211,7 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, var: Word, addr: Word, fmt: u1
                         v = e(tr.b.shift_right_logical(u, None, v, k16))?;
                     }
                     store_bytes(tr, var, addr, v, nb)?;
+                    mark_bytes(tr, r, addr, nb)?;
                 }
                 _ => unsupported = true,
             }
@@ -1141,7 +1248,7 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, var: Word, addr: Word, fmt: u1
                     tr.set_vreg_raw(ret, old)?;
                 }
             }
-            Ok(())
+            mark_dwords(tr, r, idx, 1)
         })?;
         return Ok(());
     }

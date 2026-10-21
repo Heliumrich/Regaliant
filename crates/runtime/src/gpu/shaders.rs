@@ -949,6 +949,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Compute)),
         addresses: super::tune::addresses() || (super::tune::batch_cs() && batchable(addr)),
         batched: super::tune::batch_cs() && batchable(addr),
+        write_marks: super::resident::mirror_wanted(),
     };
     if super::tune::per_lane() != 0 && per_lane_program(code_hash) {
         let votes = lane_votes_program(code_hash);
@@ -1110,6 +1111,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Fragment)),
         addresses: super::tune::addresses(),
         batched: false,
+        write_marks: super::resident::mirror_wanted(),
     };
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
@@ -1262,6 +1264,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Vertex)),
         addresses: super::tune::addresses(),
         batched: false,
+        write_marks: super::resident::mirror_wanted(),
     };
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
@@ -1883,6 +1886,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Vertex)),
         addresses: super::tune::addresses(),
         batched: false,
+        write_marks: super::resident::mirror_wanted(),
     })
 }
 
@@ -1919,6 +1923,7 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Fragment)),
         addresses: super::tune::addresses(),
         batched: false,
+        write_marks: super::resident::mirror_wanted(),
     }
 }
 
@@ -1955,6 +1960,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Compute)),
         addresses: super::tune::addresses() || (super::tune::batch_cs() && batchable(addr)),
         batched: super::tune::batch_cs() && batchable(addr),
+        write_marks: super::resident::mirror_wanted(),
     };
     if super::tune::per_lane() != 0 && per_lane_program(code_hash) {
         let votes = lane_votes_program(code_hash);
