@@ -105,6 +105,9 @@ struct Chunk {
     /// ends, and how many times they turned volatile.
     vol_until: Box<[AtomicU32]>,
     vol_level: Box<[AtomicU8]>,
+    /// Mirror mode: the GPU owner of the page (`own`): 0 none, OWN_REC |
+    /// executor id while the writing batch records, else its sequence.
+    owner: Box<[AtomicU64]>,
     /// Attention bits, one per page: set when the page may not be clean
     /// (write faults, disarming, file reads, remaps, new chunks; pages that
     /// cannot be armed keep it), cleared by the take that makes it clean.
@@ -208,10 +211,16 @@ const S_READBACKS: usize = 6;
 const S_RESETS: usize = 7;
 const S_RACES: usize = 8;
 
-/// `DS_RESIDENT=1`: residency is wanted (the device enables sparse buffers).
+/// `DS_RESIDENT=1`: residency is wanted (the device enables sparse buffers);
+/// `DS_RESIDENT=2`: mirror mode (`mirror_mode`).
 pub fn wanted() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *W.get_or_init(|| std::env::var("DS_RESIDENT").ok().as_deref() == Some("1"))
+    *W.get_or_init(|| matches!(std::env::var("DS_RESIDENT").ok().as_deref(), Some("1" | "2")))
+}
+
+fn wanted_mode2() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_RESIDENT").ok().as_deref() == Some("2"))
 }
 
 /// Residency runs (wanted, and the mirror was made).
@@ -243,6 +252,7 @@ fn chunk(addr: u64, create: bool) -> Option<&'static Chunk> {
         vol_until: (0..CHUNK_PAGES).map(|_| AtomicU32::new(0)).collect(),
         vol_level: (0..CHUNK_PAGES).map(|_| AtomicU8::new(0)).collect(),
         attn: (0..CHUNK_PAGES / 64).map(|_| AtomicU64::new(u64::MAX)).collect(),
+        owner: (0..CHUNK_PAGES).map(|_| AtomicU64::new(0)).collect(),
     }));
     match slot.compare_exchange(std::ptr::null_mut(), new, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => Some(unsafe { &*new }),
@@ -545,6 +555,12 @@ pub fn remapped(base: u64, len: u64) {
         // Uncommitted pages a take skipped have no attention: committing
         // them comes here.
         flag(c, idx(p));
+        // Mirror mode: a GPU-owned page's mirror contents belong to the old
+        // mapping (a batch still writing them writes the mirror only; the
+        // next use uploads the new mapping's contents after it).
+        if c.owner[idx(p)].swap(0, Ordering::AcqRel) != 0 {
+            OWN_STATS[O_REMAP_DROPS].fetch_add(1, Ordering::Relaxed);
+        }
         p += PAGE;
     }
     STATS[S_RESETS].fetch_add(1, Ordering::Relaxed);
@@ -582,10 +598,22 @@ pub fn settled(base: u64, len: u64) {
 /// (the table's read lock only).
 pub fn on_fault(addr: u64, write: bool) -> bool {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
-    if !write || !tracking() {
+    if !tracking() {
         return false;
     }
     let page = addr & !(PAGE - 1);
+    // Mirror mode: a GPU-owned page (no-access) is read back first.
+    if mirror_mode() {
+        if let Some(c) = chunk(page, false) {
+            let o = c.owner[idx(page)].load(Ordering::Acquire);
+            if o != 0 && o & OWN_REC == 0 {
+                return owned_fault(page);
+            }
+        }
+    }
+    if !write {
+        return false;
+    }
     let Some(c) = chunk(page, false) else { return false };
     let s = slot(c, page);
     loop {
@@ -893,6 +921,11 @@ pub fn host_write_begin(base: u64, len: u64) {
     if lo >= hi {
         return;
     }
+    // Mirror mode: GPU-owned pages first get the GPU's data (a file read may
+    // cover pages in part).
+    if mirror_mode() {
+        read_back(lo, hi - lo);
+    }
     let mut p = lo;
     while p < hi {
         if let Some(c) = chunk(p, true) {
@@ -1176,7 +1209,18 @@ pub fn init() {
     }
     ON.store(true, Ordering::Release);
     match self_test() {
-        Ok(s) => crate::info!("resident: self-test passed ({s})"),
+        Ok(s) => {
+            crate::info!("resident: self-test passed ({s})");
+            if wanted_mode2() {
+                match owned_self_test() {
+                    Ok(s) => {
+                        MODE2.store(true, Ordering::Release);
+                        crate::info!("resident: mirror mode (DS_RESIDENT=2): {s}");
+                    }
+                    Err(e) => crate::error!("resident: mirror mode's self-test failed: {e}; mirror mode off"),
+                }
+            }
+        }
         Err(e) => {
             crate::error!("resident: self-test failed: {e}; residency off");
             ON.store(false, Ordering::Release);
@@ -1453,6 +1497,429 @@ pub fn status() -> String {
         v[S_RESETS],
         refused.join(", ")
     )
+}
+
+// ---------------------------------------------------------------------------
+// Mirror mode (`DS_RESIDENT=2`; RENDERER.md "Mirror mode"): GPU writes land in
+// the mirror. A page GPU work writes is GPU-owned from the moment the write
+// is recorded (`own`) until something on the CPU side needs it: its guest
+// page is no-access meanwhile, so neither the title nor our code reads stale
+// data or writes behind the GPU's back. A CPU access faults (`owned_fault`):
+// the owner batch is asked to submit if it has not, waited for, and the
+// owned run around the page is read back from the mirror (the copy queue)
+// into guest memory, which is then armed (read-only) again. Our own readers
+// call `read_back` before reading. A remap drops ownership (the mirror's
+// contents belong to the old mapping).
+
+/// Owner word of a page still being recorded: OWN_REC | executor id.
+const OWN_REC: u64 = 1 << 63;
+static MODE2: AtomicBool = AtomicBool::new(false);
+/// Pages read back per run at most.
+const READBACK_MAX: u64 = 1 << 20;
+
+/// Mirror mode is on (`DS_RESIDENT=2` and its self-test passed).
+pub fn mirror_mode() -> bool {
+    MODE2.load(Ordering::Acquire)
+}
+
+/// [pages owned, no-access calls, faults on owned pages, runs read back,
+/// pages read back, readback ns, (unused), ownerships dropped by remaps,
+/// explicit read-backs (`read_back`), ownership refusals, pages the CPU
+/// wrote between `own` and the submission].
+static OWN_STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+const O_CPU_WROTE: usize = 10;
+const O_OWNED: usize = 0;
+const O_PROTECTS: usize = 1;
+const O_FAULTS: usize = 2;
+const O_RUNS: usize = 3;
+const O_PAGES: usize = 4;
+const O_NS: usize = 5;
+const O_REMAP_DROPS: usize = 7;
+const O_EXPLICIT: usize = 8;
+const O_REFUSED: usize = 9;
+
+/// Submit requests of recording executors (`register_exec`), by id.
+static EXECS: Mutex<Vec<std::sync::Arc<AtomicBool>>> = Mutex::new(Vec::new());
+
+/// Registers an executor's submit request flag; its id names its batches
+/// while they record (`own`).
+pub fn register_exec(flag: std::sync::Arc<AtomicBool>) -> u32 {
+    let mut g = EXECS.lock();
+    g.push(flag);
+    (g.len() - 1) as u32
+}
+
+/// Makes the pages of [lo, hi) (page-aligned) GPU-owned by the batch
+/// executor `exec` records. Their mirror contents must be current (uploaded
+/// by this batch or valid). The guest pages stay accessible until the batch
+/// is submitted (`owned_submitted`): a reader before that sees what the GPU
+/// has not overwritten yet, and no thread can fault waiting for a batch that
+/// is still being recorded (its own command processor's, say). Pages a
+/// submitted batch owns keep that owner until then. False (nothing changed):
+/// a page is host class or being written by a host write.
+pub fn own(lo: u64, hi: u64, exec: u32) -> bool {
+    let mut p = lo;
+    while p < hi {
+        let c = chunk(p, true).expect("chunk");
+        let i = idx(p);
+        if c.pages[i].load(Ordering::Acquire) & ST_HOST != 0 || c.writing[i].load(Ordering::Acquire) != 0 {
+            OWN_STATS[O_REFUSED].fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        p += PAGE;
+    }
+    let word = OWN_REC | exec as u64;
+    p = lo;
+    while p < hi {
+        let c = chunk(p, false).expect("chunk");
+        let i = idx(p);
+        if c.owner[i].compare_exchange(0, word, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            OWN_STATS[O_OWNED].fetch_add(1, Ordering::Relaxed);
+        }
+        p += PAGE;
+    }
+    true
+}
+
+/// The batch recording executor `exec` made, owning the pages of `ranges`,
+/// was queued for submission as `seq`: the pages are its now and their
+/// guest pages no-access (one call per run of pages not no-access yet).
+/// A page the CPU wrote since `own` (its write faulted on the armed page)
+/// is counted: the GPU's copy of it lacks that write.
+pub fn owned_submitted(ranges: &[(u64, u64)], exec: u32, seq: u64) {
+    use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
+    let _arming = ARM_LOCK.read();
+    let word = OWN_REC | exec as u64;
+    let mut run: Option<(u64, u64)> = None;
+    let flush = |run: &mut Option<(u64, u64)>| {
+        if let Some((a, e)) = run.take() {
+            let mut q = a;
+            while q < e {
+                let (r_end, kind) = region_kind(q, e);
+                if matches!(kind, RegionKind::Rw | RegionKind::NotWritable) {
+                    protect(q, r_end - q, PAGE_NOACCESS);
+                    OWN_STATS[O_PROTECTS].fetch_add(1, Ordering::Relaxed);
+                }
+                q = r_end;
+            }
+            let mut q = a;
+            while q < e {
+                if let Some(c) = chunk(q, false) {
+                    c.pages[idx(q)].fetch_and(!ST_BUSY, Ordering::AcqRel);
+                }
+                q += PAGE;
+            }
+        }
+    };
+    for &(lo, hi) in ranges {
+        let mut p = lo;
+        while p < hi {
+            let Some(c) = chunk(p, false) else {
+                flush(&mut run);
+                p += PAGE;
+                continue;
+            };
+            let i = idx(p);
+            // Busy while its protection changes (faults on it wait).
+            loop {
+                let cur = c.pages[i].load(Ordering::Acquire);
+                if cur & ST_BUSY != 0 {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                if c.pages[i].compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    if cur & ST_VALID == 0 {
+                        OWN_STATS[O_CPU_WROTE].fetch_add(1, Ordering::Relaxed);
+                    }
+                    break;
+                }
+            }
+            let prev = c.owner[i].swap(seq, Ordering::AcqRel);
+            // No-access already (an earlier batch's): nothing to change.
+            let protect_it = prev == 0 || prev & OWN_REC != 0;
+            if prev != word && prev & OWN_REC != 0 {
+                // Another executor's recording batch owns it too (both write
+                // it); the later submission wins.
+            }
+            let cur = c.pages[i].load(Ordering::Acquire);
+            c.pages[i].store((cur | ST_VALID) & !(ST_ARMED | ST_CLEAN), Ordering::Release);
+            flag(c, i);
+            if protect_it {
+                run = Some(match run {
+                    Some((a, e)) if e == p => (a, p + PAGE),
+                    mut other => {
+                        flush(&mut other);
+                        (p, p + PAGE)
+                    }
+                });
+            } else {
+                c.pages[i].fetch_and(!ST_BUSY, Ordering::AcqRel);
+                flush(&mut run);
+            }
+            p += PAGE;
+        }
+        flush(&mut run);
+    }
+}
+
+/// The batch recording executor `exec` made was dropped (device lost, stop):
+/// its pages are released unwritten (the mirror's copies are not current).
+pub fn owned_dropped(ranges: &[(u64, u64)], exec: u32) {
+    let word = OWN_REC | exec as u64;
+    for &(lo, hi) in ranges {
+        let mut p = lo;
+        while p < hi {
+            if let Some(c) = chunk(p, false) {
+                if c.owner[idx(p)].compare_exchange(word, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    c.pages[idx(p)].fetch_and(!ST_VALID, Ordering::AcqRel);
+                }
+            }
+            p += PAGE;
+        }
+    }
+}
+
+/// Our own readers' read-back (command-processor reads, texture uploads,
+/// host writes): the GPU-owned pages of [base, base+len) get the mirror's
+/// data in guest memory. Returns the pages read back.
+pub fn read_back(base: u64, len: u64) -> u64 {
+    if !mirror_mode() || len == 0 {
+        return 0;
+    }
+    let (lo, hi) = ((base & !(PAGE - 1)).max(MIRROR_BASE), base.saturating_add(len).next_multiple_of(PAGE).min(MIRROR_END));
+    let mut n = 0;
+    let mut p = lo;
+    while p < hi {
+        let Some(c) = chunk(p, false) else {
+            p = ((p >> CHUNK_SHIFT) + 1) << CHUNK_SHIFT;
+            continue;
+        };
+        if c.owner[idx(p)].load(Ordering::Acquire) != 0 {
+            OWN_STATS[O_EXPLICIT].fetch_add(1, Ordering::Relaxed);
+            n += release_owned(p).unwrap_or(0);
+        }
+        p += PAGE;
+    }
+    n
+}
+
+/// Whether any page of [base, base+len) is GPU-owned (mirror mode).
+pub fn any_owned(base: u64, len: u64) -> bool {
+    if !mirror_mode() || len == 0 {
+        return false;
+    }
+    let (lo, hi) = ((base & !(PAGE - 1)).max(MIRROR_BASE), base.saturating_add(len).next_multiple_of(PAGE).min(MIRROR_END));
+    let mut p = lo;
+    while p < hi {
+        match chunk(p, false) {
+            Some(c) => {
+                if c.owner[idx(p)].load(Ordering::Acquire) != 0 {
+                    return true;
+                }
+                p += PAGE;
+            }
+            None => p = ((p >> CHUNK_SHIFT) + 1) << CHUNK_SHIFT,
+        }
+    }
+    false
+}
+
+/// A fault on a GPU-owned page (any access): its run is read back (waiting
+/// for the owner batch); true: retry the access.
+fn owned_fault(page: u64) -> bool {
+    OWN_STATS[O_FAULTS].fetch_add(1, Ordering::Relaxed);
+    match release_owned(page) {
+        Some(_) => true,
+        None => {
+            crate::error!("resident: GPU-owned page {page:#x} could not be read back");
+            false
+        }
+    }
+}
+
+/// Serializes read-backs (one staging buffer and command buffer).
+struct Readback {
+    pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+    buf: vk::Buffer,
+    ptr: *mut u8,
+    copy: bool,
+}
+unsafe impl Send for Readback {}
+static READBACK: Mutex<Option<Readback>> = Mutex::new(None);
+
+fn readback_ctx() -> Result<Readback, String> {
+    let c = ctx();
+    let (family, copy) = match &c.copy {
+        Some(q) => (q.family, true),
+        None => (c.queue_family, false),
+    };
+    unsafe {
+        let pool = c.device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).map_err(|e| format!("pool: {e}"))?;
+        let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).map_err(|e| format!("cmd: {e}"))?[0];
+        let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| format!("fence: {e}"))?;
+        let (buf, _mem, ptr) = c.host_buffer(READBACK_MAX, vk::BufferUsageFlags::TRANSFER_DST)?;
+        Ok(Readback { pool, cmd, fence, buf, ptr, copy })
+    }
+}
+
+/// Reads the mirror's [a, e) into guest memory (pages made writable, filled,
+/// then armed read-only and device-valid). The caller holds READBACK.
+fn copy_back(rb: &Readback, a: u64, e: u64) -> Result<(), String> {
+    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+    let m = MIRROR.get().ok_or("no mirror")?;
+    let c = ctx();
+    let n = e - a;
+    let t = std::time::Instant::now();
+    unsafe {
+        c.device.reset_command_buffer(rb.cmd, vk::CommandBufferResetFlags::empty()).map_err(|e| format!("reset: {e}"))?;
+        c.device.begin_command_buffer(rb.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(|e| format!("begin: {e}"))?;
+        c.device.cmd_copy_buffer(rb.cmd, m.buf, rb.buf, &[vk::BufferCopy { src_offset: a - MIRROR_BASE, dst_offset: 0, size: n }]);
+        c.device.end_command_buffer(rb.cmd).map_err(|e| format!("end: {e}"))?;
+        c.device.reset_fences(&[rb.fence]).map_err(|e| format!("fence reset: {e}"))?;
+        c.submit_timeline(rb.copy, &[rb.cmd], &[], &[], rb.fence)?;
+        c.device.wait_for_fences(&[rb.fence], true, 10_000_000_000).map_err(|e| format!("wait: {e}"))?;
+    }
+    // Guest pages writable, filled, read-only: a thread that reads one in
+    // between (it has not faulted) may see it half filled - the same window
+    // a write-back has on the console's GPU, but by us; kept short.
+    protect_regions(a, e, PAGE_READWRITE, false);
+    unsafe { std::ptr::copy_nonoverlapping(rb.ptr, a as *mut u8, n as usize) };
+    OWN_STATS[O_RUNS].fetch_add(1, Ordering::Relaxed);
+    OWN_STATS[O_PAGES].fetch_add(n / PAGE, Ordering::Relaxed);
+    OWN_STATS[O_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Reads back the run of GPU-owned pages around `page` with its owner
+/// (at most READBACK_MAX): waits for the owner batch (asking its executor
+/// to submit while it records), copies the mirror's data into guest memory
+/// and releases the pages (armed read-only, device-valid). Returns the pages
+/// released; None on failure (device lost, timeout).
+fn release_owned(page: u64) -> Option<u64> {
+    let c = chunk(page, false)?;
+    // A batch still being recorded has not written it: guest memory holds
+    // what a reader may see (its command processor flushes first when it
+    // needs the GPU's result).
+    let owner = c.owner[idx(page)].load(Ordering::Acquire);
+    if owner == 0 || owner & OWN_REC != 0 {
+        return Some(0);
+    }
+    if !super::exec::wait_done_for(owner, std::time::Duration::from_secs(10)) {
+        crate::error!("resident: batch {owner} (owner of {page:#x}) did not complete within 10 s");
+        return None;
+    }
+    let mut g = READBACK.lock();
+    if g.is_none() {
+        match readback_ctx() {
+            Ok(r) => *g = Some(r),
+            Err(e) => {
+                crate::error!("resident: no read-back context: {e}");
+                return None;
+            }
+        }
+    }
+    let rb = g.as_ref()?;
+    // The run: contiguous pages with the same owner (read back already by
+    // another thread meanwhile: nothing to do).
+    if c.owner[idx(page)].load(Ordering::Acquire) != owner {
+        return Some(0);
+    }
+    let base = page & !(READBACK_MAX - 1);
+    let same = |p: u64| chunk(p, false).is_some_and(|c| c.owner[idx(p)].load(Ordering::Acquire) == owner);
+    let mut a = page;
+    while a > base && same(a - PAGE) {
+        a -= PAGE;
+    }
+    let mut e = page + PAGE;
+    while e < base + READBACK_MAX && same(e) {
+        e += PAGE;
+    }
+    // Busy while the guest pages change (a write fault in between waits).
+    let mut p = a;
+    while p < e {
+        let c = chunk(p, false)?;
+        let s = &c.pages[idx(p)];
+        loop {
+            let cur = s.load(Ordering::Acquire);
+            if cur & ST_BUSY != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            if s.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                break;
+            }
+        }
+        p += PAGE;
+    }
+    let r = copy_back(rb, a, e);
+    if let Err(ref err) = r {
+        crate::error!("resident: reading back {a:#x}..{e:#x}: {err}");
+    }
+    // Armed read-only (the copy left them writable), device-valid, released.
+    use windows_sys::Win32::System::Memory::PAGE_READONLY;
+    let armed = r.is_ok() && protect_regions(a, e, PAGE_READONLY, false);
+    p = a;
+    while p < e {
+        let c = chunk(p, false)?;
+        let i = idx(p);
+        let _ = c.owner[i].compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire);
+        let keep = if armed { ST_ARMED | ST_VALID } else { 0 };
+        let cur = c.pages[i].load(Ordering::Acquire);
+        c.pages[i].store((cur & !(ST_BUSY | ST_ARMED | ST_VALID | ST_CLEAN)) | keep, Ordering::Release);
+        flag(c, i);
+        p += PAGE;
+    }
+    r.ok().map(|_| (e - a) / PAGE)
+}
+
+/// Mirror mode's status line part.
+pub fn owned_line() -> String {
+    if !mirror_mode() {
+        return String::new();
+    }
+    let v: Vec<u64> = OWN_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    format!(
+        "    mirror mode: {} pages made GPU-owned ({} no-access calls, {} refused, {} written by the CPU before their batch was submitted), {} faults on them, {} runs read back ({} pages, {:.1} us each; {} by our readers), {} ownerships dropped by remaps\n",
+        v[O_OWNED],
+        v[O_PROTECTS],
+        v[O_REFUSED],
+        v[O_CPU_WROTE],
+        v[O_FAULTS],
+        v[O_RUNS],
+        v[O_PAGES],
+        v[O_NS] as f64 / v[O_RUNS].max(1) as f64 / 1000.0,
+        v[O_EXPLICIT],
+        v[O_REMAP_DROPS]
+    )
+}
+
+/// Mirror mode's boot self-test: the read-back context can be made and a
+/// copy through it returns what the mirror holds (ownership itself is
+/// exercised in the game: guest pages are needed).
+fn owned_self_test() -> Result<String, String> {
+    let m = MIRROR.get().ok_or("no mirror")?;
+    let at = MIRROR_END - m.page;
+    let data: Vec<u8> = (0..PAGE).map(|i| (i * 13 + 5) as u8).collect();
+    upload_now(at, &data)?;
+    let rb = readback_ctx()?;
+    let c = ctx();
+    unsafe {
+        c.device.begin_command_buffer(rb.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(|e| format!("begin: {e}"))?;
+        c.device.cmd_copy_buffer(rb.cmd, m.buf, rb.buf, &[vk::BufferCopy { src_offset: at - MIRROR_BASE, dst_offset: 0, size: PAGE }]);
+        c.device.end_command_buffer(rb.cmd).map_err(|e| format!("end: {e}"))?;
+        c.submit_timeline(rb.copy, &[rb.cmd], &[], &[], rb.fence)?;
+        c.device.wait_for_fences(&[rb.fence], true, 10_000_000_000).map_err(|e| format!("wait: {e}"))?;
+        c.device.reset_fences(&[rb.fence]).map_err(|e| format!("fence reset: {e}"))?;
+    }
+    let back = unsafe { std::slice::from_raw_parts(rb.ptr, PAGE as usize) };
+    if back != data.as_slice() {
+        return Err("read-back context returned other data".into());
+    }
+    let queue = if rb.copy { "copy queue" } else { "main queue" };
+    *READBACK.lock() = Some(rb);
+    Ok(format!("read-back context on the {queue}"))
 }
 
 #[cfg(test)]
