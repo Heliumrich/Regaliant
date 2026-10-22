@@ -906,7 +906,7 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     // Mirror mode: memory of the mirror's span is never imported (its pages
     // may be GPU-owned, no-access, which the driver cannot pin; an import
     // would make them host class for good): the caller's other path runs.
-    if found.is_none() && super::resident::mirror_mode() && base < super::resident::MIRROR_END && end > super::resident::MIRROR_BASE {
+    if found.is_none() && super::resident::mirror_mode() && base < super::resident::MIRROR_END && end > super::resident::MIRROR_BASE && !super::resident::all_host(base, size) {
         let mut g = MM_IMPORT_REFUSED.lock();
         *g.get_or_insert_with(HashMap::new).entry((site.file(), site.line())).or_default() += 1;
         return None;
@@ -8173,6 +8173,9 @@ impl Exec {
         if profiling() {
             super::census::note(a, bytes, super::census::CP_WRITE);
         }
+        // Mirror mode: the target pages become host class first (imported
+        // exactly, written in place: `resident::host_for_cp`).
+        super::resident::host_for_cp(a, bytes);
         let Some((buffer, start, _)) = span(a, bytes) else { return false };
         // CPU-side writes deferred into the recording batch run after it
         // completes: this one would pass them. Earlier batches' run before

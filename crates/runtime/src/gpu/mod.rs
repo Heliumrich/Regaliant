@@ -350,9 +350,9 @@ pub mod tune {
     /// took the CPU path, ~90% of them in the courtyard (run 20261012-040642).
     #[inline]
     pub fn gpu_cp_writes() -> bool {
-        // Mirror mode: CP writes are made by the CPU after their batch (no
-        // import of their pages; a GPU write there would need one).
-        get(13) != 0 && !super::resident::mirror_mode()
+        // Mirror mode too: their pages become host class, imported exactly
+        // (`resident::host_for_cp`).
+        get(13) != 0
     }
 
     /// Batch slots a queue cycles through (`exec::MAX_SLOTS` at most): it

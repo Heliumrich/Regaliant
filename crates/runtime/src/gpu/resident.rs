@@ -2294,6 +2294,57 @@ pub fn take_regather() -> Vec<(u64, u64)> {
     std::mem::take(&mut *REGATHER.lock())
 }
 
+/// Mirror mode, CP writes the GPU performs (`host_for_cp`): [calls, pages
+/// made host class, of them pages with GPU-written dwords released first].
+static CP_HOSTED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Mirror mode: the pages of [a, a+n) a CP write the GPU performs targets
+/// (labels, WRITE_DATA, timestamps) become host class, as RENDERER.md's
+/// design has it: imported exactly (`exec::span` takes ranges made only of
+/// host-class pages), never armed or mirrored, read and written in place,
+/// so the GPU writes them in order and other queues may pass on its
+/// promised writes. GPU-written dwords the mirror holds there are released
+/// into guest memory first. False outside mirror mode or the span.
+pub fn host_for_cp(a: u64, n: u64) -> bool {
+    if !mirror_mode() || n == 0 {
+        return false;
+    }
+    let (lo, hi) = (a & !(PAGE - 1), (a + n).next_multiple_of(PAGE));
+    if lo < MIRROR_BASE || hi > MIRROR_END {
+        return false;
+    }
+    CP_HOSTED[0].fetch_add(1, Ordering::Relaxed);
+    let mut p = lo;
+    while p < hi {
+        if state(p) & ST_HOST == 0 {
+            if let Some(c) = chunk(p, false) {
+                if is_dirty(c, idx(p)) {
+                    CP_HOSTED[2].fetch_add(1, Ordering::Relaxed);
+                    release_dirty(p, false);
+                }
+            }
+            mark_host(p, PAGE);
+            CP_HOSTED[1].fetch_add(1, Ordering::Relaxed);
+        }
+        p += PAGE;
+    }
+    true
+}
+
+/// Whether every page of [a, a+n) is host class (an exact import of it is
+/// allowed in mirror mode).
+pub fn all_host(a: u64, n: u64) -> bool {
+    let (lo, hi) = (a & !(PAGE - 1), a.saturating_add(n).next_multiple_of(PAGE));
+    let mut p = lo;
+    while p < hi {
+        if state(p) & ST_HOST == 0 {
+            return false;
+        }
+        p += PAGE;
+    }
+    hi > lo
+}
+
 /// Mirror mode: pages of the mirror's span CP writes performed by the CPU
 /// changed (`cp_wrote`), until a placement over them copies them into the
 /// mirror again (`take_cp_pages`).
@@ -2476,6 +2527,12 @@ pub fn owned_line() -> String {
         v[O_BASE_SNAPS],
         v[O_BASE_DIFFS],
         v[O_BASE_DWORDS]
+    ) + &format!(
+        "    mirror mode, CP writes the GPU performs: {} calls, {} pages made host class ({} with GPU-written dwords released first)
+",
+        CP_HOSTED[0].load(Ordering::Relaxed),
+        CP_HOSTED[1].load(Ordering::Relaxed),
+        CP_HOSTED[2].load(Ordering::Relaxed)
     ) + &dirty_sites_line()
 }
 
