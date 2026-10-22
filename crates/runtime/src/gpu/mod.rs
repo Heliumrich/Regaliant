@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 153] = [
+    static ALL: [Tunable; 154] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -180,6 +180,7 @@ pub mod tune {
         Tunable { name: "sgpr_ubo", env: "DS_SGPR_UBO", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "merge_many", env: "DS_MERGE_MANY", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "power_optout", env: "DS_POWER_OPTOUT", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "flip_grid", env: "DS_FLIP_GRID", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1648,6 +1649,16 @@ pub mod tune {
     #[inline]
     pub fn power_optout() -> bool {
         get(152) != 0
+    }
+
+    /// Flips only at the emulated vblanks (59.94 Hz: a frame that misses one
+    /// waits up to 16.7 ms more). 0: a ready flip is shown at the vblank
+    /// thread's next 1 ms tick once the title's flip rate allows it (as many
+    /// vblank periods since the last flip as the rate asks), while the
+    /// title still sees its vblanks at 59.94 Hz (`hle::libs::videoout`).
+    #[inline]
+    pub fn flip_grid() -> bool {
+        get(153) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

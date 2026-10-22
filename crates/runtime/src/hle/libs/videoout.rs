@@ -1,7 +1,9 @@
 //! libSceVideoOut (PS5 API): display buffer sets, flip queue, vblank pacing,
 //! output status and color settings.
 //!
-//! A vblank thread executes queued flips at 59.94 Hz (scaled by the flip rate).
+//! A vblank thread executes queued flips at 59.94 Hz (scaled by the flip rate);
+//! with `tune flip_grid` 0 it shows a ready flip as soon as the flip rate
+//! allows, between the vblanks the title sees.
 //! Until the GPU renders into display buffers, presentation shows black: the
 //! guest display memory is not produced by the title's GPU work yet, so
 //! nothing else would be truthful. Color settings are recorded, not applied.
@@ -96,31 +98,55 @@ fn vblank_thread() {
         }
         None => Duration::from_nanos(16_683_333), // 59.94 Hz
     };
+    // Flips off the vblank grid (`tune flip_grid` 0): the thread also wakes
+    // every FLIP_TICK to show a ready flip as soon as the title's flip rate
+    // allows (time since the last flip), while the title's vblanks (count,
+    // events, waits) stay at the emulated rate.
+    const FLIP_TICK: Duration = Duration::from_millis(1);
     let mut next = Instant::now() + period;
+    let mut last_flip = Instant::now();
     loop {
+        let grid = crate::gpu::tune::flip_grid();
         let now = Instant::now();
-        if next > now {
-            std::thread::sleep(next - now);
+        let wake = if grid { next } else { next.min(now + FLIP_TICK) };
+        if wake > now {
+            crate::thread::short_sleep(wake - now);
         }
-        next += period;
+        let now = Instant::now();
+        let tick = now >= next;
+        if tick {
+            next += period;
+        }
         let mut show: Option<DisplayBuffer> = None;
         let mut flipped = None;
         {
             let mut g = PORT.lock();
             let Some(p) = g.as_mut() else { continue };
-            p.vblanks += 1;
-            p.vblank_time = crate::hle::kernel::time::process_time_us();
-            p.vblank_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+            if tick {
+                p.vblanks += 1;
+                p.vblank_time = crate::hle::kernel::time::process_time_us();
+                p.vblank_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+            }
             let interval = p.flip_rate as u64 + 1;
-            if p.pending.front().is_some_and(|f| f.ready) && p.vblanks - p.last_flip_vblank >= interval {
+            // On the grid: at a vblank, `interval` vblanks after the last
+            // flip. Off it: once `interval` vblank periods have passed since
+            // the last flip (half a millisecond early is close enough).
+            let due = if grid { tick && p.vblanks - p.last_flip_vblank >= interval } else { now.duration_since(last_flip) + Duration::from_micros(500) >= period * interval as u32 };
+            if p.pending.front().is_some_and(|f| f.ready) && due {
                 let f = p.pending.pop_front().unwrap();
                 p.current = f.index;
                 p.count += 1;
                 p.flip_arg = f.arg;
                 p.submit_tsc = f.submit_tsc;
-                p.process_time = p.vblank_time;
-                p.tsc = p.vblank_tsc;
+                if tick {
+                    p.process_time = p.vblank_time;
+                    p.tsc = p.vblank_tsc;
+                } else {
+                    p.process_time = crate::hle::kernel::time::process_time_us();
+                    p.tsc = unsafe { core::arch::x86_64::_rdtsc() };
+                }
                 p.last_flip_vblank = p.vblanks;
+                last_flip = now;
                 if p.count <= 3 || p.count % 600 == 0 {
                     crate::info!("flip #{} -> buffer {} (arg {:#x})", p.count, f.index, f.arg);
                 }
@@ -128,11 +154,13 @@ fn vblank_thread() {
                     show = p.buffers[f.index as usize];
                 }
                 crate::gpu::FRAMES.store(p.count, std::sync::atomic::Ordering::Relaxed);
-                crate::gpu::pacing::note_flip(p.count as u64, p.vblank_time);
+                crate::gpu::pacing::note_flip(p.count as u64, p.process_time);
                 flipped = Some(p.count);
                 FLIP_CV.notify_all();
             }
-            VBLANK_CV.notify_all();
+            if tick {
+                VBLANK_CV.notify_all();
+            }
         }
         if let Some(n) = flipped {
             crate::gpu::timeline::flipped(n as u64);
