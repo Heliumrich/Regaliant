@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 152] = [
+    static ALL: [Tunable; 153] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -179,6 +179,7 @@ pub mod tune {
         Tunable { name: "batch_draws", env: "DS_BATCH_DRAWS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "sgpr_ubo", env: "DS_SGPR_UBO", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "merge_many", env: "DS_MERGE_MANY", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "power_optout", env: "DS_POWER_OPTOUT", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1638,6 +1639,15 @@ pub mod tune {
     #[inline]
     pub fn merge_many() -> bool {
         get(151) != 0
+    }
+
+    /// The process opts out of Windows' power throttling (execution speed
+    /// and the timer-resolution rule for hidden or occluded windows) and
+    /// raises the timer resolution to 1 ms (`thread::apply_power_optout`,
+    /// applied at start and when `tune power_optout` changes).
+    #[inline]
+    pub fn power_optout() -> bool {
+        get(152) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

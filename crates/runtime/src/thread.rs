@@ -221,6 +221,48 @@ pub fn apply_guest_cpus(mask: u64) {
     crate::info!("guest threads ({}) restricted to CPU mask {mask:#x} (0: all)", tids.len());
 }
 
+/// Whether `apply_power_optout` holds a 1 ms timer resolution.
+static TIMER_PERIOD_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `tune power_optout` (FINDINGS.md 2026-10-22): on, the process opts out of
+/// Windows' power throttling (execution speed, and the rule that drops the
+/// timer-resolution guarantee for a window that is hidden, occluded or
+/// minimized) and asks for a 1 ms timer resolution (`timeBeginPeriod`: a
+/// process keeps the 15.6 ms tick for timed waits otherwise; our sleeps use
+/// high-resolution waitable timers, but timed waits on condition variables
+/// and events round to the tick); off, the system's defaults.
+pub fn apply_power_optout(on: bool) {
+    use windows_sys::Win32::Media::{timeBeginPeriod, timeEndPeriod};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE};
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        // Controlled with the state bits clear: throttling off. Not
+        // controlled: the system decides.
+        ControlMask: if on { PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION } else { 0 },
+        StateMask: 0,
+    };
+    let set = unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state as *const _ as *const core::ffi::c_void, std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32) } != 0;
+    let held = TIMER_PERIOD_HELD.load(Ordering::Relaxed);
+    let timer = if on && !held {
+        let ok = unsafe { timeBeginPeriod(1) } == 0;
+        TIMER_PERIOD_HELD.store(ok, Ordering::Relaxed);
+        ok
+    } else if !on && held {
+        unsafe { timeEndPeriod(1) };
+        TIMER_PERIOD_HELD.store(false, Ordering::Relaxed);
+        true
+    } else {
+        true
+    };
+    crate::info!(
+        "power throttling {} and timer resolution {} (`tune power_optout` {}){}",
+        if on { "opted out" } else { "left to the system" },
+        if on { "1 ms" } else { "the system's" },
+        on as u8,
+        if set && timer { "" } else { "; a call failed" }
+    );
+}
+
 /// Runs guest code `entry(a0, a1)` on the current (already entered) thread.
 /// Returns when the function returns or the thread calls pthread_exit.
 pub fn run_entry(t: &'static GuestThread, entry: u64, a0: u64, a1: u64) -> u64 {

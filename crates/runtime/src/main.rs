@@ -728,6 +728,9 @@ fn poll_control(path: &Path, offset: &mut u64) {
                         if name == "guest_cpus" {
                             thread::apply_guest_cpus(v);
                         }
+                        if name == "power_optout" {
+                            thread::apply_power_optout(v != 0);
+                        }
                         Ok(())
                     }
                     _ => Err("usage: tune <switch> <value> (see gpu::tune)".into()),
@@ -1100,6 +1103,7 @@ fn main() {
         info!("DS_TEST_FAULT: writing to an invalid address from host code");
         unsafe { std::ptr::write_volatile(0x32c3be8 as *mut u64, 1) };
     }
+    thread::apply_power_optout(gpu::tune::power_optout());
     hle::kernel::time::init();
     if !cfg.headless {
         if let Err(e) = gpu::vk::present::init("dsport - Demon's Souls (PPSA01341)") {
