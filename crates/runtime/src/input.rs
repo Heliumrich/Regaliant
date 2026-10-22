@@ -324,10 +324,12 @@ pub const DEFAULT_LAYOUT: &str = "\
 # without acceleration, smoothing or a speed cap; 0: through the right stick,
 # with the game's response curve and top speed); sensitivity (1.0: 2000 mouse
 # counts turn the camera as far as a second of full right stick at the game's
-# base camera speed); invert the vertical axis (1).
+# base camera speed); the vertical axis's own sensitivity (optional, the same
+# as mouse_sensitivity when left out); invert the vertical axis (1).
 mouse_look = 1
 mouse_look_raw = 1
 mouse_sensitivity = 1.0
+# mouse_sensitivity_y = 1.0
 mouse_invert_y = 0
 
 W = ls_up
@@ -398,6 +400,9 @@ struct Layout {
     binds: Vec<Bind>,
     mouse_look: bool,
     sensitivity: f32,
+    /// The vertical axis's own sensitivity (`mouse_sensitivity_y`; None: the
+    /// same as `sensitivity`).
+    sensitivity_y: Option<f32>,
     invert_y: bool,
     /// Mouse counts turn the gameplay camera directly (`camhook`), not
     /// through the stick (`mouse_look_raw`, default 1 since 2026-10-21, also
@@ -492,7 +497,7 @@ fn parse_dst(s: &str) -> Option<Dst> {
 }
 
 fn parse_layout(text: &str) -> Result<Layout, String> {
-    let mut l = Layout { binds: Vec::new(), mouse_look: true, sensitivity: 1.0, invert_y: false, mouse_raw: true };
+    let mut l = Layout { binds: Vec::new(), mouse_look: true, sensitivity: 1.0, sensitivity_y: None, invert_y: false, mouse_raw: true };
     for (i, line) in text.lines().enumerate() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -506,6 +511,9 @@ fn parse_layout(text: &str) -> Result<Layout, String> {
             "mouse_look_raw" => l.mouse_raw = b != "0",
             "mouse_sensitivity" => {
                 l.sensitivity = b.parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0).ok_or_else(|| format!("line {}: bad sensitivity '{b}'", i + 1))?;
+            }
+            "mouse_sensitivity_y" => {
+                l.sensitivity_y = Some(b.parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0).ok_or_else(|| format!("line {}: bad sensitivity '{b}'", i + 1))?);
             }
             _ => {
                 let (src, mods) = parse_src(a).ok_or_else(|| format!("line {}: unknown input '{a}'", i + 1))?;
@@ -534,7 +542,7 @@ pub fn init(path: &std::path::Path) {
     let mut l = match std::fs::read_to_string(path) {
         Ok(text) => match parse_layout(&text) {
             Ok(l) => {
-                crate::info!("input: keyboard and mouse layout from {} ({} bindings; mouse look {}{}, sensitivity {}, invert y {})", path.display(), l.binds.len(), l.mouse_look, if l.mouse_raw { " (raw)" } else { "" }, l.sensitivity, l.invert_y);
+                crate::info!("input: keyboard and mouse layout from {} ({} bindings; mouse look {}{}, sensitivity {}{}, invert y {})", path.display(), l.binds.len(), l.mouse_look, if l.mouse_raw { " (raw)" } else { "" }, l.sensitivity, l.sensitivity_y.map(|v| format!(" (vertical {v})")).unwrap_or_default(), l.invert_y);
                 l
             }
             Err(e) => {
@@ -704,14 +712,16 @@ pub fn take_camera_motion() -> Option<(i64, i64)> {
 const RAW_FALLBACK_YAW_SPEED: f32 = 2.2;
 
 /// Radians of yaw and of pitch per mouse count (raw mouse look), the same on
-/// both axes: FULL_SPEED counts at sensitivity 1 turn as far as a second of
+/// both axes unless `mouse_sensitivity_y` sets the vertical one: FULL_SPEED
+/// counts at sensitivity 1 turn as far as a second of
 /// full stick at the camera's base yaw speed (`yaw_speed`, radians per
 /// second), as mouse look through the stick does below full tilt. Signs as
 /// the camera's angles turn for right and downward motion.
 pub fn camera_radians_per_count(yaw_speed: f32) -> (f32, f32) {
     let speed = if yaw_speed.is_finite() && yaw_speed > 0.0 && yaw_speed < 100.0 { yaw_speed } else { RAW_FALLBACK_YAW_SPEED };
-    let k = speed / FULL_SPEED * layout().sensitivity;
-    (k * RAW_YAW_SIGN, k * RAW_PITCH_SIGN)
+    let l = layout();
+    let k = speed / FULL_SPEED;
+    (k * l.sensitivity * RAW_YAW_SIGN, k * l.sensitivity_y.unwrap_or(l.sensitivity) * RAW_PITCH_SIGN)
 }
 
 /// The camera's yaw and pitch rise for rightward and downward motion, as for
@@ -736,8 +746,9 @@ fn mouse_look(st: &mut PadState, l: &Layout) {
         let secs = g.0.map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f32()).clamp(1.0 / 240.0, 0.25);
         let (dx, dy) = (MOUSE_DX.swap(0, Relaxed) as f32, MOUSE_DY.swap(0, Relaxed) as f32);
         let full = FULL_SPEED / l.sensitivity;
+        let full_y = FULL_SPEED / l.sensitivity_y.unwrap_or(l.sensitivity);
         let dy = if l.invert_y { -dy } else { dy };
-        *g = (Some(now), (dx / secs / full).clamp(-1.0, 1.0), (dy / secs / full).clamp(-1.0, 1.0));
+        *g = (Some(now), (dx / secs / full).clamp(-1.0, 1.0), (dy / secs / full_y).clamp(-1.0, 1.0));
     }
     // Radially, as the title removes the dead zone.
     let m = (g.1 * g.1 + g.2 * g.2).sqrt();
@@ -868,6 +879,10 @@ mod tests {
         assert!(parse_layout("W = jump").unwrap_err().contains("line 1"));
         assert!(parse_layout("\nHyper+W = ls_up").unwrap_err().contains("line 2"));
         assert!(parse_layout("mouse_sensitivity = -1").is_err());
+        assert!(parse_layout("mouse_sensitivity_y = 0").is_err());
+        let l = parse_layout("mouse_sensitivity = 2\nmouse_sensitivity_y = 0.5").unwrap();
+        assert!(l.sensitivity == 2.0 && l.sensitivity_y == Some(0.5));
+        assert_eq!(parse_layout(DEFAULT_LAYOUT).unwrap().sensitivity_y, None);
         assert_eq!(key_code("f12"), Some(0x7B));
         assert_eq!(key_code("LAlt"), Some(0xA4));
         assert_eq!(parse_src("shift+wheelup"), Some((Src::WheelUp, MOD_SHIFT)));
