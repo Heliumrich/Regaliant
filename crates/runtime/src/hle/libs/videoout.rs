@@ -105,6 +105,7 @@ fn vblank_thread() {
     const FLIP_TICK: Duration = Duration::from_millis(1);
     let mut next = Instant::now() + period;
     let mut last_flip = Instant::now();
+    let mut last_cap = 0;
     loop {
         let grid = crate::gpu::tune::flip_grid();
         let now = Instant::now();
@@ -127,11 +128,23 @@ fn vblank_thread() {
                 p.vblank_time = crate::hle::kernel::time::process_time_us();
                 p.vblank_tsc = unsafe { core::arch::x86_64::_rdtsc() };
             }
-            let interval = p.flip_rate as u64 + 1;
+            let mut interval = p.flip_rate as u64 + 1;
+            // A frame cap (`tune frame_cap`): at least 1/cap between flips,
+            // on the grid the whole number of vblanks that keeps under it.
+            let cap = crate::gpu::tune::frame_cap();
+            let min_gap = if cap > 0 { Duration::from_secs_f64(1.0 / cap as f64) } else { Duration::ZERO };
+            if cap > 0 {
+                interval = interval.max((min_gap.as_secs_f64() / period.as_secs_f64() - 0.01).ceil().max(1.0) as u64);
+            }
+            if cap != last_cap {
+                last_cap = cap;
+                crate::info!("frame cap {} (`tune frame_cap`): flips at least {interval} vblank(s) apart", if cap > 0 { format!("{cap} fps") } else { "off".into() });
+            }
             // On the grid: at a vblank, `interval` vblanks after the last
-            // flip. Off it: once `interval` vblank periods have passed since
-            // the last flip (half a millisecond early is close enough).
-            let due = if grid { tick && p.vblanks - p.last_flip_vblank >= interval } else { now.duration_since(last_flip) + Duration::from_micros(500) >= period * interval as u32 };
+            // flip. Off it: once `interval` vblank periods (and 1/cap) have
+            // passed since the last flip (half a millisecond early is close
+            // enough).
+            let due = if grid { tick && p.vblanks - p.last_flip_vblank >= interval } else { now.duration_since(last_flip) + Duration::from_micros(500) >= (period * interval as u32).max(min_gap) };
             if p.pending.front().is_some_and(|f| f.ready) && due {
                 let f = p.pending.pop_front().unwrap();
                 p.current = f.index;

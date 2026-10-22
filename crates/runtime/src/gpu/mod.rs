@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 155] = [
+    static ALL: [Tunable; 156] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -182,6 +182,7 @@ pub mod tune {
         Tunable { name: "power_optout", env: "DS_POWER_OPTOUT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "flip_grid", env: "DS_FLIP_GRID", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "present_fit", env: "DS_PRESENT_FIT", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "frame_cap", env: "DS_FRAME_CAP", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1668,6 +1669,15 @@ pub mod tune {
     #[inline]
     pub fn present_fit() -> bool {
         get(154) != 0
+    }
+
+    /// A frame-rate cap in frames per second (0: none): flips are shown at
+    /// least 1/cap apart, on the vblank grid a whole number of vblanks
+    /// (`hle::libs::videoout`; 30 -> every 2nd vblank at 59.94 Hz, 20 -> 3rd).
+    /// The title's game time follows real time, so its speed is kept.
+    #[inline]
+    pub fn frame_cap() -> u64 {
+        get(155)
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
