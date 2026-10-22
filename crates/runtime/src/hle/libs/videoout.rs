@@ -441,8 +441,29 @@ fn present_buffer(b: &DisplayBuffer) {
     }
     if crate::gpu::exec::enabled() {
         let size = registered_size(b);
-        if let Some((image, _, width, height)) = crate::gpu::images::with(|im| im.rendered_at(b.addr, size)) {
-            crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Image { image, layout: ash::vk::ImageLayout::GENERAL, width, height });
+        if let Some((image, format, width, height)) = crate::gpu::images::with(|im| im.rendered_at(b.addr, size)) {
+            // Diagnosis: the image each buffer presents, logged when it changes.
+            static LAST: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+            let id = ash::vk::Handle::as_raw(image);
+            let changed = {
+                let mut last = LAST.lock();
+                match last.iter_mut().find(|(a, _)| *a == b.addr) {
+                    Some(e) if e.1 == id => false,
+                    Some(e) => {
+                        e.1 = id;
+                        true
+                    }
+                    None => {
+                        last.push((b.addr, id));
+                        true
+                    }
+                }
+            };
+            if changed {
+                let all = crate::gpu::images::with(|im| im.at_base_report(b.addr));
+                crate::info!("present: buffer {:#x} shows {format:?} {width}x{height} (registered {size:?}); images there: {all}", b.addr);
+            }
+            crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Image { image, format, layout: ash::vk::ImageLayout::GENERAL, width, height });
             return;
         }
     }

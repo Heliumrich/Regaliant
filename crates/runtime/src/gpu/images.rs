@@ -3008,6 +3008,19 @@ impl Images {
         Ok(Target { key: k, image: img.image, view, used: img.used, format: s.format, width: (img.key.width >> mip).max(1), height: (img.key.height >> mip).max(1) })
     }
 
+    /// Every image at `base` (diagnosis of the image a display buffer
+    /// presents): format, size, layers, GPU-written, frame of last use.
+    pub fn at_base_report(&self, base: u64) -> String {
+        let mut v: Vec<String> = self
+            .map
+            .values()
+            .filter(|i| i.key.base == base)
+            .map(|i| format!("{:?} {}x{}x{} gpu {} used {}", i.key.format, i.key.width, i.key.height, i.key.layers, i.gpu_written, i.used.get()))
+            .collect();
+        v.sort();
+        v.join("; ")
+    }
+
     /// The GPU image last rendered at `base` (display buffers).
     /// `size`: the size the buffer is registered with: an image of that
     /// size first (the title draws a display buffer at another size after

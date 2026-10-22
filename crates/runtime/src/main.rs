@@ -346,6 +346,28 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 info!("cam: {}", camhook::describe());
                 Ok(())
             }
+            "wshot" => {
+                // The next presented frame as the window shows it
+                // (`window-<n>.png` in the run directory).
+                gpu::vk::present::shot_next();
+                Ok(())
+            }
+            "window" => {
+                // `window fullscreen|windowed|toggle`: what Alt+Enter does;
+                // `window size <w>x<h>`: the windowed window's client size.
+                let size = |v: &str| v.split_once('x').and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))).filter(|&(w, h)| (160..=16384).contains(&w) && (90..=16384).contains(&h));
+                match (parts.next(), parts.next()) {
+                    (Some("fullscreen"), _) => Ok(gpu::vk::window::set_fullscreen(Some(true))),
+                    (Some("windowed"), _) => Ok(gpu::vk::window::set_fullscreen(Some(false))),
+                    (Some("toggle"), _) => Ok(gpu::vk::window::set_fullscreen(None)),
+                    (Some("size"), Some(v)) if size(v).is_some() => {
+                        let (w, h) = size(v).unwrap();
+                        gpu::vk::window::set_client_size(w, h);
+                        Ok(())
+                    }
+                    _ => Err("usage: window fullscreen|windowed|toggle | window size <w>x<h>".into()),
+                }
+            }
             "fscan" => {
                 // Debug (finding a value the title keeps, e.g. the camera's
                 // angles): `fscan start` hashes the pages of the title's

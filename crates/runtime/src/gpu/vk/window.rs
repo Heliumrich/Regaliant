@@ -10,11 +10,21 @@
 //! camera. Leaving the window (Alt+Tab) releases it until the window is
 //! focused again; F1 releases it or takes it back. Buttons and motion count
 //! only while it is captured (the capturing click is not an attack).
+//!
+//! Modes: the window is per-monitor DPI aware (its client area in physical
+//! pixels, which the presenter fits the frame to) and opens at 1280x720
+//! scaled by its monitor's DPI, inside the work area and centred
+//! (`DS_WINDOW_SIZE=<w>x<h>`: that client size in pixels). Alt+Enter or F11
+//! switches between it and borderless fullscreen on the window's monitor
+//! (`DS_FULLSCREEN=1`: fullscreen from the start); neither reaches the game
+//! as a key. `DS_WINDOW_BEHIND=1` (test runs on a shared desktop): shown
+//! without activation at the bottom of the z-order, fullscreen too.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
+use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetThreadDpiAwarenessContext};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -53,6 +63,17 @@ pub static CAPTURE_TEST: AtomicBool = AtomicBool::new(false);
 /// (remote sessions, tablets; i64::MIN: none yet).
 static ABS_X: AtomicI64 = AtomicI64::new(i64::MIN);
 static ABS_Y: AtomicI64 = AtomicI64::new(i64::MIN);
+/// Borderless fullscreen (`apply_fullscreen`).
+pub static FULLSCREEN: AtomicBool = AtomicBool::new(false);
+/// The windowed placement fullscreen returns to.
+static PLACEMENT: parking_lot::Mutex<Option<WINDOWPLACEMENT>> = parking_lot::Mutex::new(None);
+/// Asks the UI thread for a mode (wParam 0 windowed, 1 fullscreen, 2 the
+/// other one).
+const WM_DS_MODE: u32 = WM_APP + 1;
+/// `DS_WINDOW_BEHIND=1`: never activated or raised (test runs).
+static BEHIND: AtomicBool = AtomicBool::new(false);
+/// Asks the UI thread for a client size (wParam width, lParam height).
+const WM_DS_SIZE: u32 = WM_APP + 2;
 
 pub fn get() -> Option<&'static Window> {
     WINDOW.get()
@@ -112,6 +133,67 @@ unsafe fn update_capture(hwnd: HWND) {
         }
         MOUSE_BUTTONS.store(0, Ordering::Relaxed);
         MOUSE_WHEEL.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Asks the window for borderless fullscreen (`Some(true)`), windowed
+/// (`Some(false)`) or the other one (`None`); from any thread.
+pub fn set_fullscreen(on: Option<bool>) {
+    if let Some(w) = WINDOW.get() {
+        let mode = match on {
+            Some(false) => 0,
+            Some(true) => 1,
+            None => 2,
+        };
+        unsafe { PostMessageW(w.hwnd as HWND, WM_DS_MODE, mode, 0) };
+    }
+}
+
+/// Asks the windowed window for a client size in pixels (ignored in
+/// fullscreen); from any thread.
+pub fn set_client_size(w: u32, h: u32) {
+    if let Some(win) = WINDOW.get() {
+        unsafe { PostMessageW(win.hwnd as HWND, WM_DS_SIZE, w as WPARAM, h as LPARAM) };
+    }
+}
+
+/// UI thread: borderless fullscreen on the window's monitor, or back to the
+/// windowed placement it had.
+unsafe fn apply_fullscreen(hwnd: HWND, on: bool) {
+    if on == FULLSCREEN.load(Ordering::Relaxed) {
+        return;
+    }
+    unsafe {
+        if on {
+            let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
+            wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+            let mut mi: MONITORINFO = std::mem::zeroed();
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if GetWindowPlacement(hwnd, &mut wp) == 0 || GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi) == 0 {
+                crate::warn!("window: no fullscreen ({})", std::io::Error::last_os_error());
+                return;
+            }
+            *PLACEMENT.lock() = Some(wp);
+            FULLSCREEN.store(true, Ordering::Relaxed);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE) as isize);
+            let r = mi.rcMonitor;
+            let behind = BEHIND.load(Ordering::Relaxed);
+            let (after, quiet) = if behind { (HWND_BOTTOM, SWP_NOACTIVATE) } else { (HWND_TOP, 0) };
+            SetWindowPos(hwnd, after, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED | quiet);
+            crate::info!("window: borderless fullscreen {}x{}", r.right - r.left, r.bottom - r.top);
+        } else {
+            FULLSCREEN.store(false, Ordering::Relaxed);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_VISIBLE) as isize);
+            let saved = PLACEMENT.lock().take();
+            if let Some(mut wp) = saved {
+                if BEHIND.load(Ordering::Relaxed) && wp.showCmd == SW_SHOWNORMAL as u32 {
+                    wp.showCmd = SW_SHOWNOACTIVATE as u32;
+                }
+                SetWindowPlacement(hwnd, &wp);
+            }
+            SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
+            crate::info!("window: windowed");
+        }
     }
 }
 
@@ -210,6 +292,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 // Alt+F4 closes the window.
                 return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
             }
+            if (wp as u16 == VK_RETURN_CODE && msg == WM_SYSKEYDOWN) || wp as u16 == VK_F11_CODE {
+                // Alt+Enter, F11: windowed / borderless fullscreen.
+                if (lp >> 30) & 1 == 0 {
+                    unsafe { apply_fullscreen(hwnd, !FULLSCREEN.load(Ordering::Relaxed)) };
+                }
+                return 0;
+            }
             if wp as u16 == VK_F1_CODE && (lp >> 30) & 1 == 0 {
                 CAPTURE_WANTED.fetch_xor(true, Ordering::Relaxed);
                 unsafe { update_capture(hwnd) };
@@ -219,6 +308,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_KEYUP | WM_SYSKEYUP => {
             set_key(wp, lp, false);
+            0
+        }
+        // Alt with a key (Alt is walk): no menu mnemonic and its beep; Alt+Space
+        // still opens the window menu.
+        WM_SYSCHAR if wp != b' ' as WPARAM => 0,
+        WM_DS_MODE => {
+            let on = match wp {
+                0 => false,
+                1 => true,
+                _ => !FULLSCREEN.load(Ordering::Relaxed),
+            };
+            unsafe { apply_fullscreen(hwnd, on) };
+            0
+        }
+        WM_DS_SIZE if !FULLSCREEN.load(Ordering::Relaxed) => {
+            let mut r = RECT { left: 0, top: 0, right: wp as i32, bottom: lp as i32 };
+            unsafe {
+                AdjustWindowRectExForDpi(&mut r, WS_OVERLAPPEDWINDOW, 0, 0, GetDpiForWindow(hwnd).max(96));
+                SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            crate::info!("window: client size {wp}x{lp} asked");
+            0
+        }
+        WM_DPICHANGED => {
+            // Moved to a monitor of another DPI: the size Windows suggests
+            // (fullscreen keeps the monitor's).
+            if !FULLSCREEN.load(Ordering::Relaxed) {
+                let r = unsafe { &*(lp as *const RECT) };
+                unsafe { SetWindowPos(hwnd, std::ptr::null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE) };
+            }
             0
         }
         WM_KILLFOCUS => {
@@ -235,6 +354,58 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 
 const VK_F1_CODE: u16 = 0x70;
 const VK_F4_CODE: u16 = 0x73;
+const VK_F11_CODE: u16 = 0x7A;
+const VK_RETURN_CODE: u16 = 0x0D;
+
+/// `DS_WINDOW_SIZE=<w>x<h>`: the client size asked for (pixels).
+fn size_override() -> Option<(i32, i32)> {
+    let v = std::env::var("DS_WINDOW_SIZE").ok()?;
+    let size = v.trim().split_once(['x', 'X']).and_then(|(w, h)| Some((w.trim().parse::<i32>().ok()?, h.trim().parse::<i32>().ok()?)));
+    match size {
+        Some((w, h)) if (160..=16384).contains(&w) && (90..=16384).contains(&h) => Some((w, h)),
+        _ => {
+            crate::warn!("DS_WINDOW_SIZE={v}: not a size (WxH); the default is used");
+            None
+        }
+    }
+}
+
+/// UI thread, before the window is shown: its client area at `width`x`height`
+/// scaled by the monitor's DPI (or `DS_WINDOW_SIZE`), at most the work area
+/// (aspect kept), centred in it.
+unsafe fn place_initial(hwnd: HWND, style: WINDOW_STYLE, width: u32, height: u32) {
+    unsafe {
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        let have_area = GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi) != 0;
+        let area = mi.rcWork;
+        let frame = |w: i32, h: i32| {
+            let mut r = RECT { left: 0, top: 0, right: w, bottom: h };
+            AdjustWindowRectExForDpi(&mut r, style, 0, 0, dpi);
+            (r.right - r.left, r.bottom - r.top)
+        };
+        let asked = size_override();
+        let (mut w, mut h) = asked.unwrap_or(((width * dpi / 96) as i32, (height * dpi / 96) as i32));
+        if have_area && asked.is_none() {
+            // Shrink (aspect kept) until the framed window fits the work area.
+            let (fw, fh) = frame(w, h);
+            let (aw, ah) = (area.right - area.left, area.bottom - area.top);
+            if fw > aw || fh > ah {
+                let s = ((aw - (fw - w)) as f64 / w as f64).min((ah - (fh - h)) as f64 / h as f64);
+                (w, h) = (((w as f64 * s) as i32).max(160), ((h as f64 * s) as i32).max(90));
+            }
+        }
+        let (fw, fh) = frame(w, h);
+        let (x, y) = if have_area { (area.left + ((area.right - area.left - fw) / 2).max(0), area.top + ((area.bottom - area.top - fh) / 2).max(0)) } else { (0, 0) };
+        SetWindowPos(hwnd, std::ptr::null_mut(), x, y, fw, fh, SWP_NOZORDER | SWP_NOACTIVATE);
+        let mut c: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut c);
+        CLIENT_W.store((c.right - c.left).max(1) as u32, Ordering::Relaxed);
+        CLIENT_H.store((c.bottom - c.top).max(1) as u32, Ordering::Relaxed);
+        crate::info!("window: client {}x{} at DPI {dpi}", c.right - c.left, c.bottom - c.top);
+    }
+}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -268,6 +439,9 @@ pub fn create(title: &str, width: u32, height: u32) -> Result<&'static Window, S
                 hIconSm: std::ptr::null_mut(),
             };
             RegisterClassExW(&wc);
+            // Per-monitor DPI awareness for this thread's windows only (the
+            // text entry dialog keeps the system's scaling).
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
             let style = WS_OVERLAPPEDWINDOW;
             let mut rect = windows_sys::Win32::Foundation::RECT { left: 0, top: 0, right: width as i32, bottom: height as i32 };
             AdjustWindowRect(&mut rect, style, 0);
@@ -292,13 +466,23 @@ pub fn create(title: &str, width: u32, height: u32) -> Result<&'static Window, S
             }
             CLIENT_W.store(width, Ordering::Relaxed);
             CLIENT_H.store(height, Ordering::Relaxed);
+            place_initial(hwnd, style, width, height);
             // The mouse as a Raw Input device of this window (motion
             // without pointer acceleration; only while it is in front).
             let dev = windows_sys::Win32::UI::Input::RAWINPUTDEVICE { usUsagePage: 0x01, usUsage: 0x02, dwFlags: 0, hwndTarget: hwnd };
             if windows_sys::Win32::UI::Input::RegisterRawInputDevices(&dev, 1, std::mem::size_of::<windows_sys::Win32::UI::Input::RAWINPUTDEVICE>() as u32) == 0 {
                 crate::warn!("window: no raw mouse input ({}): no mouse look", std::io::Error::last_os_error());
             }
-            ShowWindow(hwnd, SW_SHOW);
+            if std::env::var("DS_WINDOW_BEHIND").is_ok_and(|v| v.trim() == "1") {
+                BEHIND.store(true, Ordering::Relaxed);
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            } else {
+                ShowWindow(hwnd, SW_SHOW);
+            }
+            if std::env::var("DS_FULLSCREEN").is_ok_and(|v| v.trim() == "1") {
+                apply_fullscreen(hwnd, true);
+            }
             let _ = tx.send(Ok((hwnd as isize, hinst as isize)));
             let mut msg: MSG = std::mem::zeroed();
             while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {

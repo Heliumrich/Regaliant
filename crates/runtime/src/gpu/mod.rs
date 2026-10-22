@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 154] = [
+    static ALL: [Tunable; 155] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -181,6 +181,7 @@ pub mod tune {
         Tunable { name: "merge_many", env: "DS_MERGE_MANY", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "power_optout", env: "DS_POWER_OPTOUT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "flip_grid", env: "DS_FLIP_GRID", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "present_fit", env: "DS_PRESENT_FIT", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1659,6 +1660,14 @@ pub mod tune {
     #[inline]
     pub fn flip_grid() -> bool {
         get(153) != 0
+    }
+
+    /// The presenter keeps the frame's aspect and halves a frame more than
+    /// twice the window's size before its last blit (`gpu::vk::present`). 0:
+    /// one blit stretched over the whole window (comparison).
+    #[inline]
+    pub fn present_fit() -> bool {
+        get(154) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

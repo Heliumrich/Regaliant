@@ -1,10 +1,26 @@
 //! Swapchain presentation: blits a rendered image (or uploaded pixels) to the window.
+//!
+//! The frame keeps its aspect (centred, black bars where the window's aspect
+//! differs by 1% or more). A frame more than twice the window's size is first
+//! halved by 2:1 linear blits (2x2 box filters) until the last blit reduces by
+//! at most 2:1: a single linear blit samples 2x2 texels per pixel, so beyond
+//! 2:1 it skips texels (a 3840x2160 frame in a 1280x720 window was point
+//! sampled: aliased HUD text and edges).
 
 use super::{ctx, window};
 use ash::vk;
 use parking_lot::Mutex;
 
 const FRAMES: usize = 2;
+
+/// An intermediate image of the halving chain.
+struct Half {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    format: vk::Format,
+    width: u32,
+    height: u32,
+}
 
 struct Presenter {
     surface: vk::SurfaceKHR,
@@ -20,22 +36,35 @@ struct Presenter {
     frame: usize,
     staging: Option<(vk::Buffer, vk::DeviceMemory, *mut u8, u64)>,
     upload: Option<(vk::Image, vk::DeviceMemory, u32, u32)>,
+    /// The halving chain's images, largest first.
+    halves: Vec<Half>,
+    /// The last (frame size, window size) logged.
+    logged: (u32, u32, u32, u32),
 }
 
 unsafe impl Send for Presenter {}
 
 static PRESENTER: Mutex<Option<Presenter>> = Mutex::new(None);
 
+/// The next presented frame is read back (`shot_next`).
+static SHOT_NEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Control channel `wshot`: the next presented frame to `window-<n>.png`.
+pub fn shot_next() {
+    SHOT_NEXT.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// `DS_WINDOW_SHOT=<n,...>`: presented frame numbers whose swapchain image is
 /// read back to `window-<n>.png` (what the window shows, after scaling).
 fn window_shot(frame: usize) -> bool {
     static LIST: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| std::env::var("DS_WINDOW_SHOT").map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default()).contains(&frame)
+    SHOT_NEXT.swap(false, std::sync::atomic::Ordering::SeqCst)
+        || LIST.get_or_init(|| std::env::var("DS_WINDOW_SHOT").map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default()).contains(&frame)
 }
 
 pub enum Source {
     /// An image in TRANSFER_SRC_OPTIMAL-compatible state; `layout` is its current layout.
-    Image { image: vk::Image, layout: vk::ImageLayout, width: u32, height: u32 },
+    Image { image: vk::Image, format: vk::Format, layout: vk::ImageLayout, width: u32, height: u32 },
     /// Linear BGRA8 pixels.
     Pixels { data: Vec<u8>, width: u32, height: u32 },
 }
@@ -133,6 +162,8 @@ pub fn init(title: &str) -> Result<(), String> {
             frame: 0,
             staging: None,
             upload: None,
+            halves: Vec::new(),
+            logged: (0, 0, 0, 0),
         };
         create_swapchain(&mut p)?;
         *PRESENTER.lock() = Some(p);
@@ -187,16 +218,16 @@ pub fn present(src: Source) -> bool {
         c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
         let dst = p.images[idx as usize];
         barrier(c, cmd, dst, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
-        let (src_img, src_layout, sw, sh) = match src {
-            Source::Image { image, layout, width, height } => {
+        let (src_img, src_format, src_layout, sw, sh) = match src {
+            Source::Image { image, format, layout, width, height } => {
                 // GENERAL images are blitted in place (after a barrier that
                 // makes earlier GPU writes visible).
                 let to = if layout == vk::ImageLayout::GENERAL { layout } else { vk::ImageLayout::TRANSFER_SRC_OPTIMAL };
                 barrier(c, cmd, image, layout, to);
-                (image, layout, width, height)
+                (image, format, layout, width, height)
             }
             Source::Pixels { data, width, height } => match upload_pixels(p, cmd, &data, width, height) {
-                Ok(img) => (img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, width, height),
+                Ok(img) => (img, vk::Format::B8G8R8A8_SRGB, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, width, height),
                 Err(e) => {
                     crate::error!("present upload: {e}");
                     c.device.end_command_buffer(cmd).ok();
@@ -204,14 +235,39 @@ pub fn present(src: Source) -> bool {
                 }
             },
         };
-        let blit = vk::ImageBlit {
-            src_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
-            src_offsets: [vk::Offset3D::default(), vk::Offset3D { x: sw as i32, y: sh as i32, z: 1 }],
-            dst_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
-            dst_offsets: [vk::Offset3D::default(), vk::Offset3D { x: p.extent.width as i32, y: p.extent.height as i32, z: 1 }],
-        };
         let blit_layout = if src_layout == vk::ImageLayout::GENERAL { src_layout } else { vk::ImageLayout::TRANSFER_SRC_OPTIMAL };
-        c.device.cmd_blit_image(cmd, src_img, blit_layout, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR);
+        let fitted = crate::gpu::tune::present_fit();
+        let (rx, ry, rw, rh) = if fitted { fit(sw, sh, p.extent.width, p.extent.height) } else { (0, 0, p.extent.width, p.extent.height) };
+        if (rw, rh) != (p.extent.width, p.extent.height) {
+            let black = vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] };
+            let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+            c.device.cmd_clear_color_image(cmd, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &black, &[range]);
+            barrier(c, cmd, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        }
+        // Halvings while the frame is more than twice the destination's size.
+        let (mut from, mut from_layout, mut fw, mut fh) = (src_img, blit_layout, sw, sh);
+        let mut level = 0;
+        while fitted && (fw > 2 * rw || fh > 2 * rh) {
+            let (hw, hh) = (fw.div_ceil(2), fh.div_ceil(2));
+            let half = match half_image(p, f, level, src_format, hw, hh) {
+                Ok(h) => h,
+                Err(e) => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| crate::warn!("present: no {hw}x{hh} halving image ({e}): one blit"));
+                    break;
+                }
+            };
+            barrier(c, cmd, half, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            blit(c, cmd, from, from_layout, (0, 0, fw, fh), half, (0, 0, hw, hh));
+            barrier(c, cmd, half, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+            (from, from_layout, fw, fh) = (half, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, hw, hh);
+            level += 1;
+        }
+        blit(c, cmd, from, from_layout, (0, 0, fw, fh), dst, (rx, ry, rw, rh));
+        if p.logged != (sw, sh, p.extent.width, p.extent.height) {
+            p.logged = (sw, sh, p.extent.width, p.extent.height);
+            crate::info!("present: {sw}x{sh} frame into a {}x{} window at {rw}x{rh}+{rx}+{ry}: {level} halving(s), then {fw}x{fh} -> {rw}x{rh}", p.extent.width, p.extent.height);
+        }
         if src_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL && src_layout != vk::ImageLayout::GENERAL && src_img != vk::Image::null() {
             barrier(c, cmd, src_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, src_layout);
         }
@@ -273,6 +329,79 @@ pub fn present(src: Source) -> bool {
     true
 }
 
+/// Where a `sw`x`sh` frame goes in a `dw`x`dh` window (x, y, width, height):
+/// as large as fits with its aspect kept, centred; the whole window when the
+/// aspects differ by under 1%.
+fn fit(sw: u32, sh: u32, dw: u32, dh: u32) -> (u32, u32, u32, u32) {
+    let (a, b) = (sw as u64 * dh as u64, dw as u64 * sh as u64);
+    if sw == 0 || sh == 0 || a.abs_diff(b) * 100 < a.max(b) {
+        return (0, 0, dw, dh);
+    }
+    if a > b {
+        // Wider than the window: bars above and below.
+        let h = ((dw as u64 * sh as u64 + sw as u64 / 2) / sw as u64).clamp(1, dh as u64) as u32;
+        (0, (dh - h) / 2, dw, h)
+    } else {
+        let w = ((dh as u64 * sw as u64 + sh as u64 / 2) / sh as u64).clamp(1, dw as u64) as u32;
+        ((dw - w) / 2, 0, w, dh)
+    }
+}
+
+/// A linear blit of rectangle `s` (x, y, width, height) of `src` to rectangle
+/// `d` of `dst` (in TRANSFER_DST_OPTIMAL).
+fn blit(c: &super::Ctx, cmd: vk::CommandBuffer, src: vk::Image, src_layout: vk::ImageLayout, s: (u32, u32, u32, u32), dst: vk::Image, d: (u32, u32, u32, u32)) {
+    let layers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
+    let corners = |(x, y, w, h): (u32, u32, u32, u32)| [vk::Offset3D { x: x as i32, y: y as i32, z: 0 }, vk::Offset3D { x: (x + w) as i32, y: (y + h) as i32, z: 1 }];
+    let region = vk::ImageBlit { src_subresource: layers, src_offsets: corners(s), dst_subresource: layers, dst_offsets: corners(d) };
+    unsafe { c.device.cmd_blit_image(cmd, src, src_layout, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region], vk::Filter::LINEAR) };
+}
+
+/// The halving chain's image `level` at `w`x`h`: the frame's format when it
+/// can be blitted to and from, else 10:10:10:2. Made or remade on demand
+/// (after the presenter's other frames in flight, the only other users, are
+/// done; `current` is the frame being recorded).
+unsafe fn half_image(p: &mut Presenter, current: usize, level: usize, format: vk::Format, w: u32, h: u32) -> Result<vk::Image, String> {
+    let c = ctx();
+    let blittable = |f: vk::Format| {
+        let props = unsafe { c.instance.get_physical_device_format_properties(c.pdev, f) };
+        props.optimal_tiling_features.contains(vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
+    };
+    let format = if blittable(format) { format } else { vk::Format::A2B10G10R10_UNORM_PACK32 };
+    if let Some(h_) = p.halves.get(level) {
+        if (h_.format, h_.width, h_.height) == (format, w, h) {
+            return Ok(h_.image);
+        }
+    }
+    unsafe {
+        let others: Vec<vk::Fence> = p.fences.iter().enumerate().filter(|&(i, _)| i != current).map(|(_, &f)| f).collect();
+        c.device.wait_for_fences(&others, true, u64::MAX).ok();
+        for old in p.halves.drain(level..) {
+            c.device.destroy_image(old.image, None);
+            c.device.free_memory(old.memory, None);
+        }
+        let ici = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width: w, height: h, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC);
+        let image = c.device.create_image(&ici, None).map_err(|e| e.to_string())?;
+        let memory = match c.alloc(c.device.get_image_memory_requirements(image), vk::MemoryPropertyFlags::DEVICE_LOCAL) {
+            Ok(m) => m,
+            Err(e) => {
+                c.device.destroy_image(image, None);
+                return Err(e);
+            }
+        };
+        c.device.bind_image_memory(image, memory, 0).map_err(|e| e.to_string())?;
+        p.halves.push(Half { image, memory, format, width: w, height: h });
+        Ok(image)
+    }
+}
+
 unsafe fn upload_pixels(p: &mut Presenter, cmd: vk::CommandBuffer, data: &[u8], w: u32, h: u32) -> Result<vk::Image, String> {
     let c = ctx();
     let size = (w * h * 4) as u64;
@@ -311,5 +440,20 @@ unsafe fn upload_pixels(p: &mut Presenter, cmd: vk::CommandBuffer, data: &[u8], 
         c.device.cmd_copy_buffer_to_image(cmd, sb, img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
         barrier(c, cmd, img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         Ok(img)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit;
+
+    #[test]
+    fn fit_keeps_the_frame_shape() {
+        assert_eq!(fit(3840, 2160, 1280, 720), (0, 0, 1280, 720));
+        assert_eq!(fit(3840, 2160, 1280, 1024), (0, 152, 1280, 720));
+        assert_eq!(fit(3840, 2160, 1600, 600), (266, 0, 1067, 600));
+        // Under 1% off: the whole window, no 1-pixel bars.
+        assert_eq!(fit(3840, 2160, 1366, 768), (0, 0, 1366, 768));
+        assert_eq!(fit(0, 0, 800, 600), (0, 0, 800, 600));
     }
 }

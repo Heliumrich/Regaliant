@@ -175,9 +175,10 @@ const FIXES: &[Fix] = &[
         why: "the frame's copy of the settings keeps the options' mode",
         only_with: Some("DS_DISPLAY_MODE"),
     },
-    // The render size within a mode (`dispmode`, `DS_RENDER_SIZE`): set
-    // display mode (eboot+0x90a600) after it built the sizes for the render
-    // resolution manager: `lea rdi,[rbx+0A8h]` before its call.
+    // The render size within a mode (`dispmode`, `DS_RENDER_SIZE`; and the
+    // output size, `DS_OUTPUT_SIZE`): set display mode (eboot+0x90a600)
+    // after it built the sizes for the render resolution manager: `lea
+    // rdi,[rbx+0A8h]` before its call.
     Fix {
         name: "render size",
         offset: 0x90a6fc,
@@ -185,7 +186,61 @@ const FIXES: &[Fix] = &[
         change: Change::Hook { at: 0, handler: crate::dispmode::hook_render_size },
         kind: "PC settings, `DS_RENDER_SIZE`",
         why: "the title renders at its mode's size (2560x1440 at the gate) and no PC setting",
-        only_with: Some("DS_RENDER_SIZE"),
+        only_with: Some("DS_RENDER_SIZE|DS_OUTPUT_SIZE"),
+    },
+    // The output size (`dispmode`, `DS_OUTPUT_SIZE`, experiment): the
+    // video-out constructor's size block before its use, `mov rsi,r15; mov
+    // rdi,[rax]` ...
+    Fix {
+        name: "output size (constructor)",
+        offset: 0x90b278,
+        from: &[0x4c, 0x89, 0xfe, 0x48, 0x8b, 0x38],
+        change: Change::Hook { at: 0, handler: crate::dispmode::hook_ctor_sizes },
+        kind: "PC settings, `DS_OUTPUT_SIZE`",
+        why: "the title outputs 3840x2160 whatever the display",
+        only_with: Some("DS_OUTPUT_SIZE"),
+    },
+    // ... its two display targets, after `mov edi,0F00h; mov esi,870h`:
+    // `mov edx,1` ...
+    Fix {
+        name: "output size (display target 0)",
+        offset: 0x90af7e,
+        from: &[0xba, 0x01, 0x00, 0x00, 0x00],
+        change: Change::Hook { at: 0, handler: crate::dispmode::hook_targets },
+        kind: "PC settings, `DS_OUTPUT_SIZE`",
+        why: "the display targets are made at 3840x2160",
+        only_with: Some("DS_OUTPUT_SIZE"),
+    },
+    Fix {
+        name: "output size (display target 1)",
+        offset: 0x90b06b,
+        from: &[0xba, 0x01, 0x00, 0x00, 0x00],
+        change: Change::Hook { at: 0, handler: crate::dispmode::hook_targets },
+        kind: "PC settings, `DS_OUTPUT_SIZE`",
+        why: "the display targets are made at 3840x2160",
+        only_with: Some("DS_OUTPUT_SIZE"),
+    },
+    // ... the current mode's size getter (eboot+0x90ab90) before it stores
+    // the output size: `mov [rsi+0Ch],rdx; mov [rsi+14h],r9d` ...
+    Fix {
+        name: "output size (size getter)",
+        offset: 0x90ac57,
+        from: &[0x48, 0x89, 0x56, 0x0c, 0x44, 0x89, 0x4e, 0x14],
+        change: Change::Hook { at: 0, handler: crate::dispmode::hook_size_getter },
+        kind: "PC settings, `DS_OUTPUT_SIZE`",
+        why: "the mode's sizes come from per-mode tables (the UI's target among their users)",
+        only_with: Some("DS_OUTPUT_SIZE"),
+    },
+    // ... and the UI's canvas before its layout (eboot+0xde8680): `lea
+    // rsi,[rbp-30h]; mov rdi,rbx`.
+    Fix {
+        name: "output size (UI canvas)",
+        offset: 0xde85db,
+        from: &[0x48, 0x8d, 0x75, 0xd0, 0x48, 0x89, 0xdf],
+        change: Change::Hook { at: 0, handler: crate::dispmode::hook_ui_canvas },
+        kind: "PC settings, `DS_OUTPUT_SIZE`",
+        why: "the UI is laid out on a 3840x2160 canvas in modes 3-5",
+        only_with: Some("DS_OUTPUT_SIZE"),
     },
 ];
 
@@ -210,7 +265,7 @@ pub fn apply(p: &mut crate::patch::Patcher, ranges: &[(u64, u64)]) {
     }
     crate::dispmode::init();
     for (i, f) in FIXES.iter().enumerate() {
-        if f.only_with.is_some_and(|v| std::env::var_os(v).is_none()) {
+        if f.only_with.is_some_and(|v| v.split('|').all(|n| std::env::var_os(n).is_none())) {
             continue;
         }
         if p.image.get(f.offset..f.offset + f.from.len()) != Some(f.from) {
