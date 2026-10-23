@@ -2645,6 +2645,9 @@ impl Cp {
     }
 
     fn dispatch(&mut self, groups: [u32; 3], initiator: u32) {
+        if super::frameprobe::on() && self.name == "gpu-gfx" {
+            super::frameprobe::command();
+        }
         if !super::exec::enabled() || self.exec_failed {
             self.note("dispatches are decoded but not executed (set DS_GPU=1 to run them)");
             return;
@@ -2706,6 +2709,9 @@ impl Cp {
 
     /// Executes a draw (when GPU execution is enabled).
     fn draw(&mut self, args: super::exec::DrawArgs) {
+        if super::frameprobe::on() && self.name == "gpu-gfx" {
+            super::frameprobe::command();
+        }
         if !super::exec::enabled() || self.exec_failed {
             self.note("draws are decoded but not rendered (set DS_GPU=1 to render them)");
             return;
@@ -3059,6 +3065,13 @@ impl Cp {
     }
 
     fn set_reg(&mut self, space: Space, index: u32, value: u32) {
+        if super::frameprobe::on() && self.name == "gpu-gfx" {
+            super::frameprobe::reg_written(match space {
+                Space::Ctx => 0,
+                Space::Sh => 1,
+                Space::Uc => 2,
+            }, index);
+        }
         let (v, n) = match space {
             Space::Ctx => (&mut self.regs.ctx, CTX_DWORDS),
             Space::Sh => (&mut self.regs.sh, SH_DWORDS),
@@ -4349,6 +4362,9 @@ impl Cp {
                 super::capture::on_flip(n);
                 if !self.compute {
                     super::note_run_ahead();
+                    if super::frameprobe::on() && self.name == "gpu-gfx" {
+                        super::frameprobe::flip([&self.regs.ctx, &self.regs.sh, &self.regs.uc]);
+                    }
                 }
             }
             pop::FLIP => {

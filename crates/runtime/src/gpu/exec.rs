@@ -7773,6 +7773,9 @@ impl Exec {
             self.stop(why);
             return;
         }
+        if super::frameprobe::on() && self.name == "gpu-gfx" {
+            super::frameprobe::flushed(self.flush_why);
+        }
         let t0 = profiling().then(std::time::Instant::now);
         self.submit_for("sync");
         let tw = super::timeline::wait_start();

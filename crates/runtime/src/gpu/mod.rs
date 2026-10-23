@@ -11,6 +11,7 @@ pub mod capture;
 pub mod cp;
 pub mod desc;
 pub mod emucheck;
+pub mod frameprobe;
 pub mod keep;
 pub mod smalltrack;
 /// Run-time switches for A/B measurements within one run (`tune <name>
@@ -2469,6 +2470,7 @@ pub fn reset_profile() {
     census::reset();
     smalltrack::reset();
     RUN_AHEAD.lock().clear();
+    frameprobe::reset();
     crate::mem::reset_host_calls();
     threadcpu::reset_window();
     crate::audio::reset_window();
@@ -2507,6 +2509,9 @@ pub fn profile_report() -> String {
     s.push_str(&crate::guestprof::report());
     s.push_str(&threadcpu::window_line());
     s.push_str(&run_ahead_line());
+    if frameprobe::on() {
+        s.push_str(&frameprobe::report());
+    }
     s
 }
 
