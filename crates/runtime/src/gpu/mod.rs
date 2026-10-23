@@ -194,7 +194,7 @@ pub mod tune {
         Tunable { name: "shadow_share_min", env: "DS_SHADOW_SHARE_MIN", default: 16384, value: AtomicU64::new(UNSET) },
         Tunable { name: "keep_small", env: "DS_KEEP_SMALL", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "frame_ahead", env: "DS_FRAME_AHEAD", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "past_runs", env: "DS_PAST_RUNS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "past_runs", env: "DS_PAST_RUNS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_drop", env: "DS_PAST_DROP", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
@@ -1758,7 +1758,8 @@ pub mod tune {
     /// The graphics command processor records past its parallel runs
     /// before collecting their chunks (`Cp::past_start`): its batches after
     /// a run held until a stop (at the latest its submission's end), then
-    /// submitted after the chunks' or dropped and recorded again; 0 off.
+    /// submitted after the chunks' or dropped and recorded again (default;
+    /// +0.8% at the gate, FINDINGS.md 2026-10-23); 0 off.
     #[inline]
     pub fn past_runs() -> bool {
         get(162) != 0
