@@ -632,6 +632,14 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 info!("file traffic at flip {flip}:\n{}", hle::iostat::status());
                 Ok(())
             }
+            "audio" => {
+                // `audio capture <seconds>`: the mix as played, to
+                // `<run dir>/audio-<n>.wav`.
+                match (parts.next(), parts.next().and_then(|s| s.parse::<f64>().ok())) {
+                    (Some("capture"), Some(s)) if s > 0.0 && s <= 600.0 => audio::start_capture(s),
+                    _ => Err("usage: audio capture <seconds 0-600>".into()),
+                }
+            }
             "frametimes" => {
                 // Intervals between presented flips since the last
                 // `frametimes` (`gpu::pacing`).

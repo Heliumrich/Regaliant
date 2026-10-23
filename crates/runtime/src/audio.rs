@@ -47,6 +47,91 @@ pub fn window_line() -> String {
     format!("    audio in the window: {:.1} s played, {:.2} s underrun\n", p as f64 / RATE as f64, u as f64 / RATE as f64)
 }
 
+/// A capture of the mix as played (`audio capture <seconds>`): 32-bit float
+/// stereo WAV in the run directory.
+struct Capture {
+    path: std::path::PathBuf,
+    frames_left: usize,
+    samples: Vec<f32>,
+    /// Samples the soft knee compressed (above `SOFT_KNEE` in the mix).
+    knee: u64,
+}
+
+static CAPTURE: Mutex<Option<Capture>> = Mutex::new(None);
+static CAPTURING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Starts capturing the next `seconds` of the mix to `<run dir>/audio-<n>.wav`.
+pub fn start_capture(seconds: f64) -> Result<(), String> {
+    let dir = crate::run_dir().ok_or("no run directory")?;
+    let mut c = CAPTURE.lock();
+    if c.is_some() {
+        return Err("a capture is in progress".into());
+    }
+    let path = (0..).map(|n| dir.join(format!("audio-{n}.wav"))).find(|p| !p.exists()).unwrap();
+    let frames = (seconds * RATE as f64) as usize;
+    crate::info!("audio: capturing {seconds} s of the mix to {}", path.display());
+    *c = Some(Capture { path, frames_left: frames, samples: Vec::with_capacity(2 * frames), knee: 0 });
+    CAPTURING.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Appends mixed frames (before the soft knee) to the capture in progress
+/// and writes the file once it is complete.
+fn capture(mix: &[f32]) {
+    let mut g = CAPTURE.lock();
+    let Some(c) = g.as_mut() else { return };
+    let n = (mix.len() / 2).min(c.frames_left);
+    for &v in &mix[..2 * n] {
+        if v.abs() > SOFT_KNEE {
+            c.knee += 1;
+        }
+        c.samples.push(soft_knee(v));
+    }
+    c.frames_left -= n;
+    if c.frames_left > 0 {
+        return;
+    }
+    let c = g.take().unwrap();
+    CAPTURING.store(false, Ordering::Relaxed);
+    drop(g);
+    let peak = c.samples.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let rms = (c.samples.iter().map(|&v| v as f64 * v as f64).sum::<f64>() / c.samples.len().max(1) as f64).sqrt();
+    match write_wav(&c.path, &c.samples) {
+        Ok(()) => crate::info!(
+            "audio: capture written: {} ({:.1} s, rms {rms:.4}, peak {peak:.3}, {} samples above the knee)",
+            c.path.display(),
+            c.samples.len() as f64 / 2.0 / RATE as f64,
+            c.knee
+        ),
+        Err(e) => crate::warn!("audio: capture {}: {e}", c.path.display()),
+    }
+}
+
+fn write_wav(path: &std::path::Path, samples: &[f32]) -> std::io::Result<()> {
+    let data = 4 * samples.len() as u32;
+    let mut b = Vec::with_capacity(58 + data as usize);
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(50 + data).to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    b.extend_from_slice(&18u32.to_le_bytes());
+    b.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+    b.extend_from_slice(&2u16.to_le_bytes());
+    b.extend_from_slice(&RATE.to_le_bytes());
+    b.extend_from_slice(&(RATE * 8).to_le_bytes());
+    b.extend_from_slice(&8u16.to_le_bytes());
+    b.extend_from_slice(&32u16.to_le_bytes());
+    b.extend_from_slice(&0u16.to_le_bytes());
+    b.extend_from_slice(b"fact");
+    b.extend_from_slice(&4u32.to_le_bytes());
+    b.extend_from_slice(&(samples.len() as u32 / 2).to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&data.to_le_bytes());
+    for v in samples {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(path, b)
+}
+
 /// Stream 0 belongs to AudioOut2 (one context mixes everything it pushes).
 pub const STREAM_AUDIOOUT2: usize = 0;
 
@@ -154,15 +239,20 @@ fn mix_into(out: &mut [f32], frames: usize) {
     if starved {
         UNDERRUN_FRAMES.fetch_add(frames as u64, Ordering::Relaxed);
     }
-    // A soft knee above 0.8 instead of clipping at full scale (loud
-    // transients of the 3D mix reached ~1.2 in combat).
+    if CAPTURING.load(Ordering::Relaxed) {
+        capture(&out[..2 * frames]);
+    }
     for v in out[..2 * frames].iter_mut() {
-        let a = v.abs();
-        if a > SOFT_KNEE {
-            *v = v.signum() * (SOFT_KNEE + (1.0 - SOFT_KNEE) * ((a - SOFT_KNEE) / (1.0 - SOFT_KNEE)).tanh());
-        }
+        *v = soft_knee(*v);
     }
     PLAYED_FRAMES.fetch_add(frames as u64, Ordering::Relaxed);
+}
+
+/// A soft knee above 0.8 instead of clipping at full scale (loud transients
+/// of the 3D mix reached ~1.2 in combat).
+fn soft_knee(v: f32) -> f32 {
+    let a = v.abs();
+    if a > SOFT_KNEE { v.signum() * (SOFT_KNEE + (1.0 - SOFT_KNEE) * ((a - SOFT_KNEE) / (1.0 - SOFT_KNEE)).tanh()) } else { v }
 }
 
 /// Output level from which samples are compressed smoothly toward full

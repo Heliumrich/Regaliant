@@ -4187,7 +4187,10 @@ impl Cp {
         // buffer's end included); leaving the buffer with one unsettled
         // would skip the packets after it.
         if self.past.is_some() && !self.past_goes_on() && self.rewind.is_none() {
-            crate::error!("gpu[{}]: left a command buffer at {cur:#x} while recording past a parallel run (settled here)", self.name);
+            // (Waits ended by the shutdown leave it as well.)
+            if !crate::gpu::shutting_down() {
+                crate::error!("gpu[{}]: left a command buffer at {cur:#x} while recording past a parallel run (settled here)", self.name);
+            }
             let _ = self.past_settle();
             self.rewind = None;
         }

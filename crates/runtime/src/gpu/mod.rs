@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 164] = [
+    static ALL: [Tunable; 165] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -196,6 +196,7 @@ pub mod tune {
         Tunable { name: "frame_ahead", env: "DS_FRAME_AHEAD", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_runs", env: "DS_PAST_RUNS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_drop", env: "DS_PAST_DROP", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "acm_reverb", env: "DS_ACM_REVERB", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1772,6 +1773,14 @@ pub mod tune {
         get(163) != 0
     }
 
+    /// The title's convolution reverb computed (`hle::libs::acm_conv`,
+    /// default); 0: its jobs left undone (no reverb, the stand-in before
+    /// 2026-10-23).
+    #[inline]
+    pub fn acm_reverb() -> bool {
+        get(164) != 0
+    }
+
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
     /// without appends).
     #[inline]
@@ -2572,6 +2581,7 @@ pub fn profile_report() -> String {
         s.push_str(&smalltrack::report());
     }
     s.push_str(&crate::audio::window_line());
+    s.push_str(&crate::hle::libs::acm_conv::status());
     s.push_str(&crate::guestprof::report());
     s.push_str(&threadcpu::window_line());
     s.push_str(&run_ahead_line());

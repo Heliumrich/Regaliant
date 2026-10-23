@@ -1,6 +1,8 @@
 //! HLE for PS5 system libraries other than libkernel.
 
 pub mod acm;
+pub mod acm_conv;
+pub mod acm_fft;
 pub mod agc;
 pub mod agc_cmd;
 pub mod agc_defaults;
