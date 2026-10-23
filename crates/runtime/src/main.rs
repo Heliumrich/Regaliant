@@ -226,21 +226,25 @@ fn prune_runs(runs: &Path, keep: usize) {
 ///   quit                     orderly shutdown
 fn poll_control(path: &Path, offset: &mut u64) {
     use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut f) = std::fs::File::open(path) else { return };
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    if len < *offset {
-        *offset = 0; // truncated: start over
+    // Lines the title's automation asked for first (`INJECTED`).
+    let mut buf: String = std::mem::take(&mut *INJECTED.lock()).into_iter().map(|l| l + "\n").collect();
+    if let Ok(mut f) = std::fs::File::open(path) {
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if len < *offset {
+            *offset = 0; // truncated: start over
+        }
+        let mut file = String::new();
+        if len > *offset && f.seek(SeekFrom::Start(*offset)).is_ok() && f.read_to_string(&mut file).is_ok() {
+            if let Some(end) = file.rfind('\n') {
+                *offset += end as u64 + 1;
+                buf.push_str(&file[..=end]);
+            }
+        }
     }
-    if len == *offset || f.seek(SeekFrom::Start(*offset)).is_err() {
+    if buf.is_empty() {
         return;
     }
-    let mut buf = String::new();
-    if f.read_to_string(&mut buf).is_err() {
-        return;
-    }
-    let Some(end) = buf.rfind('\n') else { return };
-    *offset += end as u64 + 1;
-    for line in buf[..end].lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+    for line in buf.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
         let mut parts = line.split_whitespace();
         let cmd = parts.next().unwrap_or("");
         let flip = gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
@@ -824,6 +828,12 @@ fn poll_control(path: &Path, offset: &mut u64) {
         }
     }
 }
+
+/// Control lines asked for by the title's developer automation (a guest
+/// print of `dsport-control: <line>`, `hle::kernel::fs`), run before the
+/// control file's next lines (tools/devscript.sh scripts pressing buttons at
+/// their own points, e.g. at a boss's fog door).
+pub static INJECTED: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
 
 /// `fscan` state: page hashes, candidate pages, their copies, candidate
 /// float addresses.

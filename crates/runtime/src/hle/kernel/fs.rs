@@ -363,6 +363,20 @@ fn console_write(fd: i32, data: &[u8]) {
                 crate::info!("frames at {rest}: {report}");
             }
         }
+        // `dsport-textreset` forgets the title's strings logged so far
+        // (`text:` lines come once per string: tools/devscript.sh scripts
+        // checking several bosses' banners in one run).
+        if line.contains("dsport-textreset") {
+            crate::exception::text_reset();
+        }
+        // `dsport-control: <line>` runs a control command (`press cross
+        // 200ms`, `audio capture 30`, ...) at the script's point.
+        if let Some(rest) = line.split("dsport-control:").nth(1) {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                crate::INJECTED.lock().push(rest.to_string());
+            }
+        }
     }
 }
 
