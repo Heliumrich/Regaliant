@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-pub const KINDS: [&str; 7] = ["gfx", "acb", "par", "prep", "submit", "complete", "scrub"];
+pub const KINDS: [&str; 8] = ["gfx", "acb", "par", "prep", "submit", "complete", "scrub", "ahead"];
 
 /// Thread handles by host thread id, kept open (the threads live as long as
 /// the process).

@@ -2336,6 +2336,79 @@ impl Images {
         }
     }
 
+    /// What `note_writes` (then `note_meta_fill` for a fill of `fill`)
+    /// would note, without noting it (the frame-ahead recorder keeps its
+    /// own: `Exec::held_note`): the fast clears made pending (image,
+    /// metadata address, the value when the fill gives it; later entries
+    /// win) and the GPU-owned images overwritten.
+    pub fn notes_for(&self, writes: &[(u64, u64)], sized: &[(u64, u64)], fill: Option<((u64, u64), u32)>) -> (Vec<(ImageKey, u64, Option<u32>)>, Vec<ImageKey>) {
+        let mut clears = Vec::new();
+        if !self.meta_of.is_empty() {
+            for &(b, n) in writes {
+                for (&meta, &(key, _)) in self.meta_of.range(b..b.saturating_add(n)) {
+                    clears.push((key, meta, None));
+                }
+            }
+            if let Some(((base, len), v)) = fill {
+                let end = base.saturating_add(len);
+                for (&meta, &(key, _)) in self.meta_of.range(base..end) {
+                    if meta + 4 <= end {
+                        clears.push((key, meta, Some(v)));
+                    }
+                }
+            }
+        }
+        let mut over = Vec::new();
+        if !self.owned.is_empty() {
+            for &(b, n) in sized {
+                let end = b.saturating_add(n);
+                for (_, v) in self.owned.range(b.saturating_sub(self.max_span)..end) {
+                    for &k in v {
+                        let Some(img) = self.map.get(&k) else { continue };
+                        let span = img.span;
+                        if k.base + span <= b || !img.gpu_written {
+                            continue;
+                        }
+                        if b <= k.base && k.base + span <= end && n <= 2 * span + (64 << 10) && !over.contains(&k) {
+                            over.push(k);
+                        }
+                    }
+                }
+            }
+        }
+        (clears, over)
+    }
+
+    /// The GPU-owned images a zero fill of [base, base+len) clears as
+    /// `zero_filled` chooses them, nothing noted (the frame-ahead recorder).
+    pub fn zero_fill_targets(&self, base: u64, len: u64) -> Vec<(ImageKey, vk::Image, vk::Format)> {
+        let mut out = Vec::new();
+        if len == 0 || self.owned.is_empty() {
+            return out;
+        }
+        let end = base.saturating_add(len);
+        for (_, v) in self.owned.range(base.saturating_sub(self.max_span)..end) {
+            for &k in v {
+                let Some(img) = self.map.get(&k) else { continue };
+                let span = img.span;
+                if !img.gpu_written || is_compressed(k.format) || !(base <= k.base && k.base + span <= end && len <= 2 * span + (64 << 10)) {
+                    continue;
+                }
+                if !out.iter().any(|x: &(ImageKey, vk::Image, vk::Format)| x.0 == k) {
+                    out.push((k, img.image, k.format));
+                }
+            }
+        }
+        out
+    }
+
+    /// The fast clear of image `k` with metadata at `meta` (`take_clears`'s
+    /// entry for a clear the frame-ahead recorder noted itself).
+    pub fn fast_clear_of(&self, k: ImageKey, meta: u64, known: Option<u32>) -> Option<FastClear> {
+        let (Some(img), Some(&(_, clear))) = (self.map.get(&k), self.meta_of.get(&meta)) else { return None };
+        Some(FastClear { key: k, image: img.image, meta, clear, known })
+    }
+
     /// The fill kernel stored `v` in every word of [base, base+len): the fast
     /// clears pending on metadata inside it read `v` (after `note_writes`
     /// for the same dispatch, which marked them unknown).
@@ -2363,6 +2436,11 @@ impl Images {
     /// The images with a fast clear pending.
     pub fn pending_clear_keys(&self) -> Vec<ImageKey> {
         self.pending_clears.keys().copied().collect()
+    }
+
+    /// The images with a fast clear or an overwrite reload pending.
+    pub fn pending_keys(&self) -> Vec<ImageKey> {
+        self.pending_clears.keys().chain(self.overwritten_keys.iter()).copied().collect()
     }
 
     /// Whether any of `keys` has a fast clear pending.

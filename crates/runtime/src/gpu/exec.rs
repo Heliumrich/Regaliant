@@ -5476,6 +5476,24 @@ pub struct Exec {
     /// would need that stops the chunk (`stopped`) before the command
     /// records its own work.
     deferred: bool,
+    /// The frame-ahead recorder's executor (`gpu::frameahead`, `set_held`):
+    /// a deferred one whose closed batches keep their label writes (its
+    /// later waits pass on them) and which stops before anything the
+    /// current frame's work would see (CPU-side effects, image-cache notes,
+    /// fast clears and storage images).
+    held: bool,
+    /// Its closed batches' label writes (`open_promise`).
+    held_promises: Vec<(u64, u64, u8)>,
+    /// Guest ranges it read on the CPU while recording (stage preparations,
+    /// command-processor reads, textures' guest memory), since `held_reset`.
+    held_reads: Vec<(u64, u64)>,
+    /// Its own image-cache notes (`Images::notes_for`), never in the image
+    /// cache before a hand-over: fast clears pending (metadata address,
+    /// value when known) and GPU-owned images overwritten by its work.
+    held_clears: HashMap<super::images::ImageKey, (u64, Option<u32>)>,
+    held_over: HashSet<super::images::ImageKey>,
+    /// The images its commands used.
+    held_keys: HashSet<super::images::ImageKey>,
     /// A worker's: what the main command processor's batch, not yet
     /// submitted when the run was planned, writes (`tune par_main_writes`),
     /// and (mode 3) whether it has been submitted since.
@@ -5698,6 +5716,9 @@ struct Closed {
 const PENDING: u64 = u64::MAX;
 /// Batch slots a deferred executor may create.
 const DEFERRED_SLOTS: usize = 6;
+/// The frame-ahead recorder's (`Exec::set_held`): it holds a frame's
+/// prefix of batches.
+const HELD_SLOTS: usize = 12;
 /// Writes `Exec::since_barrier` lists (more: any range counts as written).
 const SINCE_MAX: usize = 128;
 /// Indirect dispatches with a barrier of their own, and without one (their
@@ -5814,6 +5835,12 @@ impl Exec {
                 sync_readers: [0; 2],
                 sync_culprit: None,
                 deferred: false,
+                held: false,
+                held_promises: Vec::new(),
+                held_reads: Vec::new(),
+                held_clears: HashMap::new(),
+                held_over: HashSet::new(),
+                held_keys: HashSet::new(),
                 main_writes: None,
                 main_submitted: None,
                 stopped: false,
@@ -6009,7 +6036,7 @@ impl Exec {
                 match next(&free) {
                     Some(k) => self.cur = k,
                     None => {
-                        let made = if n < DEFERRED_SLOTS { Slot::new(self.family, self.xfamily).ok() } else { None };
+                        let made = if n < if self.held { HELD_SLOTS } else { DEFERRED_SLOTS } { Slot::new(self.family, self.xfamily).ok() } else { None };
                         match made {
                             Some(s) => {
                                 self.slots.push(s);
@@ -6313,7 +6340,10 @@ impl Exec {
             ch.overwritten = self.pending_log.get(ch.writes_mark..).unwrap_or(&[]).iter().any(|&(w, m)| w < a + n && a < w + m);
         }
         if self.deferred {
-            if has_actions || !self.pending_promises.is_empty() {
+            if self.held && !has_actions {
+                // Its later waits pass on them (`open_promise`).
+                self.held_promises.append(&mut self.pending_promises);
+            } else if has_actions || !self.pending_promises.is_empty() {
                 crate::error!("gpu[{}]: CP effects in a parallel run (dropped)", self.name);
             }
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
@@ -6401,6 +6431,9 @@ impl Exec {
         let writes = std::mem::take(&mut self.pending);
         self.pending_log.clear();
         INFLIGHT.note_ranges(seq, &writes);
+        if self.name == "gpu-gfx" {
+            super::frameahead::a_wrote_ranges(&writes);
+        }
         if !super::resident::mirror_mode() {
             super::resident::gpu_wrote(&writes);
         }
@@ -7486,6 +7519,30 @@ impl Exec {
     /// never compressed, so the metadata is read back and the image cleared.
     /// Runs before a draw or dispatch reserves its slot (it flushes).
     pub(crate) fn resolve_fast_clears(&mut self, keys: &[super::images::ImageKey]) {
+        if self.held && !keys.is_empty() {
+            // The current frame's clears are not the frame-ahead recorder's
+            // to take; its own are, once their values are known (else they
+            // wait for its own unsubmitted work).
+            if pending_for(keys) && super::images::with(|im| im.clears_pending(keys)) {
+                self.stop("fast clear (the current frame's)");
+                return;
+            }
+            let mine: Vec<(super::images::ImageKey, u64, Option<u32>)> = keys.iter().filter_map(|k| self.held_clears.get(k).map(|&(m, v)| (*k, m, v))).collect();
+            if mine.is_empty() {
+                return;
+            }
+            if mine.iter().any(|x| x.2.is_none()) {
+                self.stop("fast clear (its own, value unknown)");
+                return;
+            }
+            for x in &mine {
+                self.held_clears.remove(&x.0);
+            }
+            let clears = super::images::with(|im| mine.iter().filter_map(|&(k, m, v)| im.fast_clear_of(k, m, v)).collect::<Vec<_>>());
+            self.end_rendering();
+            self.record_fast_clears(clears, false);
+            return;
+        }
         if keys.is_empty() || !pending_for(keys) || !super::images::with(|im| im.clears_pending(keys)) {
             return;
         }
@@ -7502,6 +7559,13 @@ impl Exec {
             }
         }
         let clears = super::images::with(|im| im.take_clears(keys));
+        self.record_fast_clears(clears, check);
+    }
+
+    /// Records `clears` (`resolve_fast_clears`): each image cleared to the
+    /// value its metadata gives (known, else read now); `check`: known
+    /// values compared with the metadata (`DS_GPU_VERIFY`).
+    fn record_fast_clears(&mut self, clears: Vec<super::images::FastClear>, check: bool) {
         for c in clears {
             let v = match c.known {
                 Some(v) => {
@@ -7597,6 +7661,10 @@ impl Exec {
     /// writers have completed. Runs before a draw or dispatch reserves its
     /// slot (it flushes).
     pub(crate) fn resolve_overwrites(&mut self, keys: &[super::images::ImageKey]) {
+        if self.held && keys.iter().any(|k| self.held_over.contains(k)) {
+            self.stop("overwritten image (its own)");
+            return;
+        }
         if keys.is_empty() || !pending_for(keys) || !super::images::with(|im| im.overwrites_pending(keys)) {
             return;
         }
@@ -7839,6 +7907,16 @@ impl Exec {
     /// read; `CP_WRITES`). Returns the batch
     /// sequence it runs after (None: performed now).
     pub fn after_gpu(&mut self, f: Action, write: Option<(u64, u64)>, ordered: bool) -> Option<u64> {
+        if self.held {
+            // Never before the current frame's work (`Cp::effect` stops
+            // the frame-ahead recorder first).
+            drop(f);
+            self.stop("CP effect");
+            return None;
+        }
+        if let (Some(w), true) = (write, self.name == "gpu-gfx") {
+            super::frameahead::a_wrote(&[w]);
+        }
         if self.deferred {
             crate::error!("gpu[{}]: a CP effect in a parallel run (performed now)", self.name);
             self.stop("CP effect");
@@ -7943,6 +8021,10 @@ impl Exec {
     /// work was writing, e.g. the ranges of unbounded global-pointer
     /// bindings: ~2 needless waits of 5-7 ms per frame in the courtyard).
     pub fn sync_textures(&mut self, textures: &[((u64, u64), super::desc::Tsharp)], why: usize) -> bool {
+        if self.held {
+            // Textures are taken from guest memory as it is now.
+            self.held_reads.extend(textures.iter().map(|x| x.0));
+        }
         if textures.is_empty() || super::tune::skip_steps() & 1 != 0 {
             return false;
         }
@@ -8428,6 +8510,9 @@ impl Exec {
             self.submit_after = self.submit_after.max(cpu);
         }
         self.begin();
+        if !self.recording {
+            return false;
+        }
         // What earlier work of this batch wrote into resident shadows reaches
         // guest memory before this write does: a title thread that sees the
         // label reads it there (the shadows were merged only when the batch
@@ -8496,11 +8581,15 @@ impl Exec {
         }
         if let Some((v, n)) = label {
             self.pending_promises.push((a, v, n));
-            UNSUBMITTED_LABELS.lock().get_or_insert_with(HashMap::new).insert(a & !7, self.submit_request.clone());
-            // Another queue already blocks on it: submit at the next packet.
-            if super::tune::label_early() && super::cp::waited_now(a) {
-                self.submit_request.store(true, Ordering::SeqCst);
-                LABEL_EARLY.fetch_add(1, Ordering::Relaxed);
+            // (The frame-ahead recorder's come after the current frame's
+            // work: nothing it holds is submitted on request.)
+            if !self.held {
+                UNSUBMITTED_LABELS.lock().get_or_insert_with(HashMap::new).insert(a & !7, self.submit_request.clone());
+                // Another queue already blocks on it: submit at the next packet.
+                if super::tune::label_early() && super::cp::waited_now(a) {
+                    self.submit_request.store(true, Ordering::SeqCst);
+                    LABEL_EARLY.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         GPU_CP_WRITES.fetch_add(1, Ordering::Relaxed);
@@ -8593,7 +8682,7 @@ impl Exec {
     /// ended every batch at such a write (~400 per courtyard frame). False:
     /// the CPU path (no calibration, memory the GPU cannot write here).
     pub fn gpu_timestamp(&mut self, a: u64) -> bool {
-        if self.deferred || a % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(a, 8) {
+        if (self.deferred && !self.held) || a % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(a, 8) {
             return false;
         }
         let Some(k) = title_clock_k() else { return false };
@@ -8611,6 +8700,9 @@ impl Exec {
         if self.ts_used >= TS_PER_BATCH || self.pool_use[0] + 1 > POOL_LIMITS[0] || self.pool_use[1] + 2 > POOL_LIMITS[1] {
             self.submit_for("timestamps");
             self.begin();
+        }
+        if !self.recording {
+            return false;
         }
         let c = ctx();
         if self.slots[self.cur].ts.is_none() {
@@ -8794,7 +8886,8 @@ impl Exec {
     /// The value the recording batch writes last to label `a` on the GPU
     /// (`gpu_cp_write`) and its size.
     pub fn open_promise(&self, a: u64) -> Option<(u64, u8)> {
-        self.pending_promises.iter().rev().find(|p| p.0 == a).map(|p| (p.1, p.2))
+        let find = |v: &[(u64, u64, u8)]| v.iter().rev().find(|p| p.0 == a).map(|p| (p.1, p.2));
+        find(&self.pending_promises).or_else(|| find(&self.held_promises))
     }
 
     /// Whether the recording batch should be submitted now: another queue
@@ -9057,7 +9150,9 @@ impl Exec {
     }
 
     fn snapshot_as(&mut self, base: u64, size: u64, limit: u64, reuse: bool) -> Option<(vk::Buffer, u64, u64)> {
-        if size == 0 || size > limit || self.snap_failed || super::homes::overlaps(base, size) {
+        // The frame-ahead recorder copies at its batch's start instead: on
+        // the GPU, after the current frame's work (`set_held`).
+        if size == 0 || size > limit || self.snap_failed || self.held || super::homes::overlaps(base, size) {
             return None;
         }
         let r = [(base, size)];
@@ -9327,6 +9422,90 @@ impl Exec {
         self.deferred
     }
 
+    /// Makes this the frame-ahead recorder's executor (`held`).
+    pub fn set_held(&mut self) {
+        self.deferred = true;
+        self.held = true;
+    }
+
+    /// The frame-ahead recorder starts a frame: not stopped, nothing read
+    /// or noted.
+    pub fn held_reset(&mut self) {
+        self.stopped = false;
+        self.stop_why = "";
+        self.held_reads.clear();
+        self.held_clears.clear();
+        self.held_over.clear();
+        self.held_keys.clear();
+    }
+
+    /// The images the frame-ahead recorder's commands used since
+    /// `held_reset`.
+    pub fn held_keys(&self) -> &HashSet<super::images::ImageKey> {
+        &self.held_keys
+    }
+
+    /// The frame-ahead recorder's own notes of writes `writes` (`sized`:
+    /// the bounded ones) and of a fill (`Images::notes_for`).
+    fn held_note(&mut self, writes: &[(u64, u64)], sized: &[(u64, u64)], fill: Option<((u64, u64), u32)>) {
+        let (clears, over) = super::images::with(|im| im.notes_for(writes, sized, fill));
+        for (k, meta, v) in clears {
+            self.held_clears.insert(k, (meta, v));
+        }
+        self.held_over.extend(over);
+    }
+
+    /// Its notes of a buffer fill of `v` over [base, base+len) recorded in
+    /// place; the GPU-owned images a zero fill clears (`zero_filled`).
+    fn held_fill(&mut self, base: u64, len: u64, v: u32) -> Vec<(vk::Image, vk::Format)> {
+        let zero = v == 0 && super::tune::zero_fill_clears();
+        let r = [(base, len)];
+        let (clears, over, zeroed) = super::images::with(|im| {
+            let (c, o) = im.notes_for(&r, if zero { &[] } else { &r }, Some(((base, len), v)));
+            (c, o, if zero { im.zero_fill_targets(base, len) } else { Vec::new() })
+        });
+        for (k, meta, v) in clears {
+            self.held_clears.insert(k, (meta, v));
+        }
+        self.held_over.extend(over);
+        for z in &zeroed {
+            self.held_over.remove(&z.0);
+        }
+        zeroed.into_iter().map(|(_, i, f)| (i, f)).collect()
+    }
+
+    /// Notes the images a frame-ahead recorder's command uses; whether one
+    /// has a fast clear or an overwrite of its own pending.
+    pub(crate) fn held_hit(&mut self, keys: &[super::images::ImageKey]) -> bool {
+        if !self.held {
+            return false;
+        }
+        self.held_keys.extend(keys.iter().copied());
+        keys.iter().any(|k| self.held_clears.contains_key(k) || self.held_over.contains(k))
+    }
+
+    /// Stops the frame-ahead recorder (`Cp::held_stop`).
+    pub fn stop_held(&mut self, why: &'static str) {
+        self.stop(why);
+    }
+
+    /// Guest ranges the frame-ahead recorder read on the CPU.
+    pub fn note_held_reads(&mut self, reads: &[(u64, u64)]) {
+        if self.held {
+            self.held_reads.extend_from_slice(reads);
+        }
+    }
+
+    /// What it read on the CPU since `held_reset`.
+    pub fn held_reads(&self) -> &[(u64, u64)] {
+        &self.held_reads
+    }
+
+    /// Batches closed and held (not submitted).
+    pub fn closed_count(&self) -> usize {
+        self.closed.len()
+    }
+
     /// Stops a deferred executor's chunk (see `deferred`).
     fn stop(&mut self, why: &'static str) {
         if !self.stopped {
@@ -9384,6 +9563,9 @@ impl Exec {
             super::precache::submitted(&b.shared, seq);
             super::resident::submitted(&b.res_pages, seq);
             INFLIGHT.note_ranges(seq, &b.writes);
+            if self.name.starts_with("gpu-gfx-par") {
+                super::frameahead::a_wrote_ranges(&b.writes);
+            }
             if !super::resident::mirror_mode() {
                 super::resident::gpu_wrote(&b.writes);
             }
@@ -9430,6 +9612,7 @@ impl Exec {
             s.kept.clear();
             s.seq = 0;
         }
+        self.held_promises.clear();
         if !self.recording {
             self.open_gen.store(u64::MAX, Ordering::SeqCst);
         }
@@ -9441,6 +9624,9 @@ impl Exec {
         // What the preparation found (its own block, shared with its cache
         // entry), apart from the SGPR data written below.
         let found = p.found.clone();
+        if self.held {
+            self.held_reads.extend_from_slice(&found.reads);
+        }
         super::images::BINDING_SHADER.with(|s| s.set(p.addr));
         let res_info = rdna::translate::res_info_offset(&found.tr.plan) as usize;
         let nb = found.tr.out.bindings.len();
@@ -9833,6 +10019,12 @@ impl Exec {
         if memo {
             return Ok(bound);
         }
+        // Frame-ahead recording: a storage image's binding marks it written
+        // in the image cache, which the current frame's work would see.
+        if self.held && found.tr.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_))) {
+            self.stop("storage image");
+            return Err(STOPPED.into());
+        }
         bound.imgs.clear();
         bound.images.clear();
         bound.stored.clear();
@@ -10201,7 +10393,7 @@ impl Exec {
         let forward_here = super::tune::forward_copies() && !self.deferred && indirect.is_none() && self.name == "gpu-gfx" && !super::resident::mirror_mode();
         // The graphics queue's parallel workers (`copy_update 2`): updates
         // checked once their batches completed, never forwarded.
-        let worker_here = super::tune::forward_copies() && self.deferred && indirect.is_none() && self.name.starts_with("gpu-gfx") && super::tune::copy_update_workers() && !super::resident::mirror_mode();
+        let worker_here = super::tune::forward_copies() && self.deferred && !self.held && indirect.is_none() && self.name.starts_with("gpu-gfx") && super::tune::copy_update_workers() && !super::resident::mirror_mode();
         let mut forwarded: Option<Option<(u64, Vec<u32>, super::forward::Inputs)>> = None;
         if (forward_here || worker_here)
             && super::tune::copy_update()
@@ -10231,7 +10423,8 @@ impl Exec {
         // when one may be pending.
         let mut keys = std::mem::take(&mut self.keys_scratch);
         keys.clear();
-        if image_hazards(&[&p], &mut keys) {
+        let hz = image_hazards(&[&p], &mut keys);
+        if self.held_hit(&keys) || hz {
             self.resolve_fast_clears(&keys);
             self.resolve_overwrites(&keys);
             self.sync_block_textures(&keys);
@@ -10286,7 +10479,10 @@ impl Exec {
                     }
                 }
                 if skip || self.fill_in_place(base, len, v)? {
-                    let zeroed = super::images::with(|im| {
+                    let zeroed = if self.held {
+                        self.held_fill(base, len, v)
+                    } else {
+                        super::images::with(|im| {
                         let z = if v == 0 && super::tune::zero_fill_clears() {
                             im.note_meta_writes(&[(base, len)]);
                             im.zero_filled(base, len)
@@ -10296,7 +10492,8 @@ impl Exec {
                         };
                         im.note_meta_fill(base, len, v);
                         z
-                    });
+                        })
+                    };
                     if !zeroed.is_empty() {
                         self.clear_images_zero(&zeroed);
                     }
@@ -10377,8 +10574,14 @@ impl Exec {
         let gens = note_gens();
         let repeat = super::tune::lean_notes() && fill.is_none() && !writes_here.is_empty() && self.last_notes.2 == gens && self.last_notes.0 == writes_here && self.last_notes.1 == sized_here;
         // Writes on no page of a GPU-owned image or fast-clear metadata have
-        // nothing to note there (`images::may_note`).
-        if !repeat && (fill.is_some() || super::images::may_note(&writes_here)) {
+        // nothing to note there (`images::may_note`). The frame-ahead
+        // recorder notes them for itself (the image cache must not see
+        // writes the current frame's work comes before).
+        if self.held {
+            if super::images::may_note(&writes_here) {
+                self.held_note(&writes_here, &sized_here, fill);
+            }
+        } else if !repeat && (fill.is_some() || super::images::may_note(&writes_here)) {
             super::images::with(|im| {
                 im.note_writes(&writes_here, &sized_here);
                 if let Some(((base, len), v)) = fill {

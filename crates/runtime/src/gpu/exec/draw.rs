@@ -1496,6 +1496,7 @@ impl Exec {
                 Some(p) => super::image_hazards(&[&vs, p], &mut used),
                 None => super::image_hazards(&[&vs], &mut used),
             };
+        let pending = self.held_hit(&used) || pending;
         let hz_t2 = hz_t.map(|_| std::time::Instant::now());
         if self.stopped {
             return Err(super::STOPPED.into());
@@ -2005,7 +2006,12 @@ impl Exec {
                 crate::gpu::track::gpu_write(base, n);
             }
             if !b.sized_writes.is_empty() {
-                crate::gpu::images::with(|im| im.note_overwrites(&b.sized_writes));
+                // The frame-ahead recorder notes them for itself.
+                if self.held {
+                    self.held_note(&[], &b.sized_writes, None);
+                } else {
+                    crate::gpu::images::with(|im| im.note_overwrites(&b.sized_writes));
+                }
             }
             for &(w, n) in &b.writes {
                 self.note_write(w, n);
@@ -2232,6 +2238,7 @@ impl Exec {
             used.extend(r.colors.iter().flatten().chain(r.depth.iter()).map(|t| t.key));
         }
         let pending = super::image_hazards(&[&*vs, &*ps], &mut used);
+        let pending = self.held_hit(&used) || pending;
         self.keys_scratch = used;
         if pending {
             return Ok(None);
@@ -2478,6 +2485,7 @@ impl Exec {
             Some(p) => super::image_hazards(&[vs, p], &mut used),
             None => super::image_hazards(&[vs], &mut used),
         };
+        let pending = self.held_hit(&used) || pending;
         self.keys_scratch = used;
         if pending {
             return Ok(None);

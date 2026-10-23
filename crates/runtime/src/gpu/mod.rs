@@ -11,6 +11,7 @@ pub mod capture;
 pub mod cp;
 pub mod desc;
 pub mod emucheck;
+pub mod frameahead;
 pub mod frameprobe;
 pub mod keep;
 pub mod smalltrack;
@@ -29,7 +30,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 161] = [
+    static ALL: [Tunable; 162] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -191,6 +192,7 @@ pub mod tune {
         Tunable { name: "stencil_export", env: "DS_STENCIL_EXPORT", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_share_min", env: "DS_SHADOW_SHARE_MIN", default: 16384, value: AtomicU64::new(UNSET) },
         Tunable { name: "keep_small", env: "DS_KEEP_SMALL", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "frame_ahead", env: "DS_FRAME_AHEAD", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1741,6 +1743,15 @@ pub mod tune {
         get(160) != 0
     }
 
+    /// Frame-ahead recording (`gpu::frameahead`): a second graphics
+    /// recorder takes the next frame while the graphics command processor
+    /// finishes the current one; 1: what it records is dropped at the flip
+    /// (stage 1, a measurement); 0 off.
+    #[inline]
+    pub fn frame_ahead() -> u64 {
+        get(161)
+    }
+
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
     /// without appends).
     #[inline]
@@ -1886,6 +1897,8 @@ struct Submission {
     at: std::time::Instant,
     /// Work other than command buffers (frame replay).
     ctl: Option<Ctl>,
+    /// The queue's submission count when it was queued (its number).
+    index: u64,
 }
 
 /// Work for a queue's command processor besides command buffers (frame
@@ -1905,8 +1918,8 @@ pub(crate) enum Ctl {
 pub(crate) fn enqueue(queue_id: u32, bufs: Vec<(u64, u32)>, ctl: Option<Ctl>) {
     let q = queue(queue_id);
     let mut g = q.pending.lock();
-    q.submitted.fetch_add(1, Ordering::SeqCst);
-    g.push_back(Submission { bufs, hashes: Vec::new(), copies: Vec::new(), at: std::time::Instant::now(), ctl });
+    let index = q.submitted.fetch_add(1, Ordering::SeqCst) + 1;
+    g.push_back(Submission { bufs, hashes: Vec::new(), copies: Vec::new(), at: std::time::Instant::now(), ctl, index });
     drop(g);
     q.cv.notify_one();
 }
@@ -2166,6 +2179,9 @@ fn worker(q: &'static Queue, name: &str) {
         if q.id == GFX && frameprobe::on() {
             frameprobe::submission(&batch.bufs);
         }
+        if q.id == GFX && frameahead::on() {
+            frameahead::post(&cp, batch.index, &batch.bufs, batch.at);
+        }
         let nbufs = batch.bufs.len();
         for (i, &(addr, size)) in batch.bufs.iter().enumerate() {
             cp.next_in_submission = i + 1 < nbufs;
@@ -2293,7 +2309,7 @@ pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
     }
     // In queue order (under the queue's lock): the replay keeps each queue's.
     replay::note_submitted(queue_id, &buffers);
-    g.push_back(Submission { bufs: buffers, hashes, copies, at: std::time::Instant::now(), ctl: None });
+    g.push_back(Submission { bufs: buffers, hashes, copies, at: std::time::Instant::now(), ctl: None, index });
     q.cv.notify_one();
     // DS_SUBMIT_SYNC=small (up to SMALL_SUBMIT dwords) or =1 (all),
     // diagnostic: the submit returns once its work completed (no CPU/GPU
@@ -2307,6 +2323,9 @@ pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
     }
     drop(g);
     q.cv.notify_one();
+    if queue_id == GFX {
+        frameahead::submitted();
+    }
 }
 
 /// `DS_PROFILE_GPU=1`: samples the GPU queue threads every 10 ms; the most
@@ -2342,7 +2361,7 @@ static PROFILE_THREADS: Mutex<Vec<(&'static str, u32)>> = Mutex::new(Vec::new())
 
 /// Samples the calling thread as `kind` while profiling (`DS_PROFILE_GPU`).
 pub fn profile_this_thread(kind: &'static str) {
-    crate::mem::set_ww_gated(matches!(kind, "par" | "scrub"));
+    crate::mem::set_ww_gated(matches!(kind, "par" | "scrub" | "ahead"));
     let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
     PROFILE_THREADS.lock().push((kind, tid));
 }
@@ -2474,6 +2493,7 @@ pub fn reset_profile() {
     smalltrack::reset();
     RUN_AHEAD.lock().clear();
     frameprobe::reset();
+    frameahead::reset();
     crate::mem::reset_host_calls();
     threadcpu::reset_window();
     crate::audio::reset_window();
@@ -2515,6 +2535,7 @@ pub fn profile_report() -> String {
     if frameprobe::on() {
         s.push_str(&frameprobe::report());
     }
+    s.push_str(&frameahead::status());
     s
 }
 
