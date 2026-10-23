@@ -4347,6 +4347,9 @@ impl Cp {
                 }
                 let n = crate::gpu::FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
                 super::capture::on_flip(n);
+                if !self.compute {
+                    super::note_run_ahead();
+                }
             }
             pop::FLIP => {
                 self.sync();

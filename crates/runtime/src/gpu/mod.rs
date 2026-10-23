@@ -2202,6 +2202,48 @@ fn worker(q: &'static Queue, name: &str) {
 }
 
 /// Queues command buffers (address, size in dwords) for execution on `queue_id`.
+/// The graphics queue at each flip it reaches (`profile report`, since
+/// `profile reset`): title submissions queued behind the flip and how long
+/// the oldest has waited, ms (how far the title runs ahead of recording).
+static RUN_AHEAD: parking_lot::Mutex<Vec<(u32, f32)>> = parking_lot::Mutex::new(Vec::new());
+
+pub(crate) fn note_run_ahead() {
+    let q = queue(GFX);
+    let (n, age) = {
+        let g = q.pending.lock();
+        (g.len() as u32, g.front().map_or(0.0, |s| s.at.elapsed().as_secs_f32() * 1000.0))
+    };
+    let mut r = RUN_AHEAD.lock();
+    if r.len() < 1 << 16 {
+        r.push((n, age));
+    }
+}
+
+fn run_ahead_line() -> String {
+    let mut r = RUN_AHEAD.lock().clone();
+    if r.is_empty() {
+        return String::new();
+    }
+    let pct = |v: &mut Vec<f32>, q: f32| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[((v.len() - 1) as f32 * q) as usize]
+    };
+    let mut n: Vec<f32> = r.iter().map(|x| x.0 as f32).collect();
+    let mut a: Vec<f32> = r.iter().map(|x| x.1).collect();
+    let line = format!(
+        "    graphics queue at its flips ({}): title submissions queued behind p10 {:.0}, p50 {:.0}, p90 {:.0}; the oldest waited p10 {:.1}, p50 {:.1}, p90 {:.1} ms\n",
+        r.len(),
+        pct(&mut n, 0.1),
+        pct(&mut n, 0.5),
+        pct(&mut n, 0.9),
+        pct(&mut a, 0.1),
+        pct(&mut a, 0.5),
+        pct(&mut a, 0.9)
+    );
+    r.clear();
+    line
+}
+
 pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
     if buffers.is_empty() {
         return;
@@ -2426,6 +2468,7 @@ pub fn reset_profile() {
     xwait::reset();
     census::reset();
     smalltrack::reset();
+    RUN_AHEAD.lock().clear();
     crate::mem::reset_host_calls();
     threadcpu::reset_window();
     crate::audio::reset_window();
@@ -2463,6 +2506,7 @@ pub fn profile_report() -> String {
     s.push_str(&crate::audio::window_line());
     s.push_str(&crate::guestprof::report());
     s.push_str(&threadcpu::window_line());
+    s.push_str(&run_ahead_line());
     s
 }
 
