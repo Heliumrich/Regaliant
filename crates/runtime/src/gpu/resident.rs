@@ -113,6 +113,14 @@ struct Chunk {
     /// Mirror mode: one bit per page with dwords GPU work wrote that guest
     /// memory lacks (no-access until released: `DIRTY`, `release_dirty`).
     gdirty: Box<[AtomicU64]>,
+    /// Lazy mirror mode: one bit per page made no-access for GPU ownership
+    /// (`own_begin`: from before the writing batch's submission; dirty or
+    /// not) until a CPU access settles it (`settle`).
+    gprot: Box<[AtomicU64]>,
+    /// The batch sequence the next batch would have had when the page was
+    /// last remapped: masks of batches submitted before it belong to the old
+    /// mapping and are dropped (`apply_masks`).
+    rseq: Box<[AtomicU64]>,
     /// Attention bits, one per page: set when the page may not be clean
     /// (write faults, disarming, file reads, remaps, new chunks; pages that
     /// cannot be armed keep it), cleared by the take that makes it clean.
@@ -277,6 +285,8 @@ fn chunk(addr: u64, create: bool) -> Option<&'static Chunk> {
         attn: (0..CHUNK_PAGES / 64).map(|_| AtomicU64::new(u64::MAX)).collect(),
         cur: (0..CHUNK_PAGES / 64).map(|_| AtomicU64::new(0)).collect(),
         gdirty: (0..CHUNK_PAGES / 64).map(|_| AtomicU64::new(0)).collect(),
+        gprot: (0..CHUNK_PAGES / 64).map(|_| AtomicU64::new(0)).collect(),
+        rseq: (0..CHUNK_PAGES).map(|_| AtomicU64::new(0)).collect(),
     }));
     match slot.compare_exchange(std::ptr::null_mut(), new, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => Some(unsafe { &*new }),
@@ -395,6 +405,59 @@ fn region_kind(p: u64, e: u64) -> (u64, RegionKind) {
 }
 
 /// Whether [a, a+n) is committed plain read-write memory now.
+/// `DS_TRACE_PAGES=<hex lo>-<hex hi>` (diagnosis): mirror mode's page
+/// events in that range are logged (GPU-written dword runs per batch at
+/// completion, CPU write faults with the faulting instruction, releases).
+fn trace_range() -> (u64, u64) {
+    static R: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        let v = std::env::var("DS_TRACE_PAGES").unwrap_or_default();
+        let num = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+        v.split_once('-').and_then(|(a, b)| Some((num(a)?, num(b)?))).unwrap_or((0, 0))
+    })
+}
+
+fn traced(p: u64) -> bool {
+    let (lo, hi) = trace_range();
+    p + PAGE > lo && p < hi
+}
+
+/// Logs a traced page event (at most 3,000 lines).
+fn trace_event(p: u64, what: std::fmt::Arguments) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 3000 {
+        crate::info!("mm trace {p:#x}: {what} (flip {}, {})", super::FRAMES.load(Ordering::Relaxed), crate::log::thread_name());
+    }
+}
+
+/// The runs of set bits of 32 mask words as "first+count" dword runs.
+fn mask_runs(masks: &[u32]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut k = 0usize;
+    while k < 32 * masks.len() {
+        if masks[k / 32] >> (k % 32) & 1 != 0 {
+            let s = k;
+            while k < 32 * masks.len() && masks[k / 32] >> (k % 32) & 1 != 0 {
+                k += 1;
+            }
+            out.push(format!("{s}+{}", k - s));
+        } else {
+            k += 1;
+        }
+    }
+    out.join(",")
+}
+
+/// Whether the page holding `a` is committed and readable now.
+fn readable_now(a: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { VirtualQuery(a as _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+        return false;
+    }
+    info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && info.Protect != 0
+}
+
 fn plain_rw(a: u64, n: u64) -> bool {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_READWRITE};
     let mut p = a;
@@ -588,6 +651,10 @@ pub fn remapped(base: u64, len: u64) {
         }
         if mirror_mode() {
             baseline_drop(p, p + PAGE);
+            // The remap set the page's protection anew; batches submitted
+            // before it wrote the old mapping (`apply_masks` drops theirs).
+            clear_gprot(c, idx(p));
+            c.rseq[idx(p)].store(super::exec::next_seq(), Ordering::Release);
         }
         p += PAGE;
     }
@@ -631,12 +698,22 @@ pub fn on_fault(addr: u64, write: bool) -> bool {
     }
     let page = addr & !(PAGE - 1);
     // Mirror mode: a page with GPU-written dwords guest memory lacks gets
-    // them first (any access).
+    // them first (any access); a page owned by batches in flight waits for
+    // them (lazy write-backs: `settle`).
     if mirror_mode() {
         if let Some(c) = chunk(page, false) {
+            if is_gprot(c, idx(page)) {
+                return settle(page, true);
+            }
             if is_dirty(c, idx(page)) {
                 return release_dirty(page, true);
             }
+        }
+        // Settled by another thread between the fault and these checks:
+        // the access may be retried when the page now allows it.
+        if !write && readable_now(page) {
+            STATS[S_RACES].fetch_add(1, Ordering::Relaxed);
+            return true;
         }
     }
     if !write {
@@ -660,6 +737,11 @@ pub fn on_fault(addr: u64, write: bool) -> bool {
             return false;
         }
         if s.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if traced(page) {
+                let rip = FAULT_RIP.with(|r| r.get());
+                let at = if rip >= crate::mem::GUEST_BASE && rip < crate::mem::GUEST_END { crate::exception::describe_guest(rip) } else { crate::exception::host_symbol(rip) };
+                trace_event(page, format_args!("CPU write fault at {at} (state {cur:#x})"));
+            }
             // Mirror mode: the page's bytes before the CPU's writes (the
             // mirror's from the CPU's side) for its next copy there.
             if mirror_mode() && cur & ST_VALID != 0 {
@@ -1849,6 +1931,214 @@ struct DirtyPage {
 static DIRTY: Mutex<Option<std::collections::HashMap<u64, DirtyPage>>> = Mutex::new(None);
 
 #[inline]
+fn is_gprot(c: &Chunk, i: usize) -> bool {
+    c.gprot[i >> 6].load(Ordering::Acquire) & (1u64 << (i & 63)) != 0
+}
+
+#[inline]
+fn set_gprot(c: &Chunk, i: usize) {
+    c.gprot[i >> 6].fetch_or(1u64 << (i & 63), Ordering::AcqRel);
+}
+
+#[inline]
+fn clear_gprot(c: &Chunk, i: usize) {
+    if is_gprot(c, i) {
+        c.gprot[i >> 6].fetch_and(!(1u64 << (i & 63)), Ordering::AcqRel);
+    }
+}
+
+/// Lazy mirror mode: one batch's written ranges, no-access from before its
+/// submission (`own_begin`) until a CPU access settles each page (`settle`),
+/// so no CPU access can fall between the GPU's writes and their masks: the
+/// title may see a batch's label (written by the GPU in place) before our
+/// completion thread notes its masks, and memory it reused meanwhile then
+/// took stale GPU dwords at the release (the allocator crash at
+/// eboot+0xad92d6, FINDINGS.md 2026-10-21 and 2026-10-23).
+pub struct Owned {
+    /// The batch's sequence (0 until `own_submitted`).
+    seq: AtomicU64,
+    ranges: Vec<(u64, u64)>,
+}
+
+/// Batches in flight that own ranges (removed by `own_done` after their
+/// masks are noted).
+static INFLIGHT_OWNED: Mutex<Vec<std::sync::Arc<Owned>>> = Mutex::new(Vec::new());
+
+/// Ownership statistics (`owned_line`): batches registered, pages made
+/// no-access at submission, protection calls for it, settles by faults,
+/// settles by explicit releases, settles that waited for a batch, masks
+/// dropped for pages remapped after their batch's submission, settles that
+/// gave up waiting.
+static OWN_PROT: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+const O7_BATCHES: usize = 0;
+const O7_PAGES: usize = 1;
+const O7_PROTECTS: usize = 2;
+const O7_FAULTS: usize = 3;
+const O7_EXPLICIT: usize = 4;
+const O7_WAITED: usize = 5;
+const O7_REMAPPED: usize = 6;
+const O7_TIMEOUTS: usize = 7;
+const O7_UNPROTECTED: usize = 8;
+
+/// Lazy mirror mode, before a batch with written ranges is submitted: the
+/// pages of `ranges` not yet owned become no-access (committed regions
+/// only; host-class pages never) and the batch is registered. None outside
+/// lazy mirror mode.
+pub fn own_begin(ranges: &[(u64, u64)]) -> Option<std::sync::Arc<Owned>> {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_NOACCESS};
+    if !mirror_mode() || !lazy_writebacks() || ranges.is_empty() {
+        return None;
+    }
+    let _arming = ARM_LOCK.read();
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for &(a, e) in ranges {
+        let (lo, hi) = ((a & !(PAGE - 1)).max(MIRROR_BASE), e.next_multiple_of(PAGE).min(MIRROR_END));
+        let mut p = lo;
+        while p < hi {
+            let Some(c) = chunk(p, true) else {
+                p += PAGE;
+                continue;
+            };
+            let i = idx(p);
+            if i & 63 == 0 && p + 64 * PAGE <= hi && c.gprot[i >> 6].load(Ordering::Acquire) == u64::MAX {
+                p += 64 * PAGE;
+                continue;
+            }
+            if !is_gprot(c, i) && c.pages[i].load(Ordering::Acquire) & ST_HOST == 0 {
+                match runs.last_mut() {
+                    Some(r) if r.1 == p => r.1 = p + PAGE,
+                    _ => runs.push((p, p + PAGE)),
+                }
+            }
+            p += PAGE;
+        }
+    }
+    // Registered first: an access that faults from here on finds its
+    // owner (and waits for the batch's sequence).
+    let o = std::sync::Arc::new(Owned { seq: AtomicU64::new(0), ranges: ranges.to_vec() });
+    INFLIGHT_OWNED.lock().push(o.clone());
+    OWN_PROT[O7_BATCHES].fetch_add(1, Ordering::Relaxed);
+    let mark = |a: u64, e: u64, on: bool| {
+        let mut q = a;
+        while q < e {
+            if let Some(c) = chunk(q, false) {
+                if on {
+                    set_gprot(c, idx(q));
+                } else {
+                    clear_gprot(c, idx(q));
+                }
+            }
+            q += PAGE;
+        }
+    };
+    for &(a, e) in &runs {
+        busy_range(a, e);
+        // Region by region: committed ones only (a range past its mapping
+        // keeps the rest as it is). The bits go first, as `apply_masks`
+        // does: an access faulting while the protection changes is ours.
+        let mut p = a;
+        while p < e {
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            if unsafe { VirtualQuery(p as _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+                break;
+            }
+            let end = (info.BaseAddress as u64 + info.RegionSize as u64).min(e).max(p + PAGE);
+            if info.State == MEM_COMMIT {
+                mark(p, end, true);
+                if protect(p, end - p, PAGE_NOACCESS) {
+                    OWN_PROT[O7_PROTECTS].fetch_add(1, Ordering::Relaxed);
+                    OWN_PROT[O7_PAGES].fetch_add((end - p) / PAGE, Ordering::Relaxed);
+                } else {
+                    mark(p, end, false);
+                }
+            }
+            p = end;
+        }
+        unbusy_range(a, e);
+    }
+    Some(o)
+}
+
+/// The batch `o` was registered for was handed over with sequence `seq`.
+pub fn own_submitted(o: &Owned, seq: u64) {
+    o.seq.store(seq, Ordering::Release);
+}
+
+/// The batch's masks are noted (its completion's first action): it no
+/// longer owns anything in flight.
+pub fn own_done(o: &std::sync::Arc<Owned>) {
+    INFLIGHT_OWNED.lock().retain(|x| !std::sync::Arc::ptr_eq(x, o));
+}
+
+/// A CPU access (`fault`) or an explicit release reached a page owned for
+/// GPU writes: the batches in flight that own it complete first (their
+/// masks noted; on the completion thread only those up to the batch it is
+/// completing, which it cannot wait past), then its GPU-written dwords are
+/// stored to guest memory and its protection restored. True when the
+/// access may be retried.
+fn settle(page: u64, fault: bool) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
+    let Some(c) = chunk(page, false) else { return false };
+    let i = idx(page);
+    if !is_gprot(c, i) {
+        return true;
+    }
+    OWN_PROT[if fault { O7_FAULTS } else { O7_EXPLICIT }].fetch_add(1, Ordering::Relaxed);
+    let limit = if crate::log::thread_name() == "gpu-complete" { super::cp::after_batch() } else { u64::MAX };
+    let t0 = std::time::Instant::now();
+    loop {
+        let (max_seq, unknown) = {
+            let g = INFLIGHT_OWNED.lock();
+            g.iter().filter(|o| o.ranges.iter().any(|&(a, e)| page + PAGE > a && page < e)).fold((0u64, false), |(m, u), o| {
+                let s = o.seq.load(Ordering::Acquire);
+                if s == 0 {
+                    (m, true)
+                } else if s <= limit {
+                    (m.max(s), u)
+                } else {
+                    (m, u)
+                }
+            })
+        };
+        if unknown && limit == u64::MAX {
+            if t0.elapsed() > std::time::Duration::from_secs(10) {
+                OWN_PROT[O7_TIMEOUTS].fetch_add(1, Ordering::Relaxed);
+                crate::error!("resident: page {page:#x} owned by a batch never handed over (10 s)");
+                break;
+            }
+            std::thread::yield_now();
+            continue;
+        }
+        if max_seq > 0 && super::exec::completed_seq() < max_seq {
+            OWN_PROT[O7_WAITED].fetch_add(1, Ordering::Relaxed);
+            if !super::exec::wait_done_for(max_seq, std::time::Duration::from_secs(30)) {
+                OWN_PROT[O7_TIMEOUTS].fetch_add(1, Ordering::Relaxed);
+                crate::error!("resident: page {page:#x}: its owner batch {max_seq} did not complete in 30 s");
+            }
+        }
+        break;
+    }
+    if is_dirty(c, i) {
+        return release_dirty(page, fault);
+    }
+    // Owned but not written by GPU work: its protection back (after a
+    // protection change in progress: `own_begin` holds the page busy).
+    let _arming = ARM_LOCK.read();
+    busy_range(page, page + PAGE);
+    if !is_gprot(c, i) {
+        unbusy_range(page, page + PAGE);
+        return true;
+    }
+    let st = c.pages[i].load(Ordering::Acquire);
+    let prot = if st & (ST_ARMED | ST_GUEST_RO) != 0 { PAGE_READONLY } else { PAGE_READWRITE };
+    protect(page, PAGE, prot);
+    clear_gprot(c, i);
+    OWN_PROT[O7_UNPROTECTED].fetch_add(1, Ordering::Relaxed);
+    unbusy_range(page, page + PAGE);
+    true
+}
+
+#[inline]
 fn is_dirty(c: &Chunk, i: usize) -> bool {
     c.gdirty[i >> 6].load(Ordering::Acquire) & (1u64 << (i & 63)) != 0
 }
@@ -1874,16 +2164,27 @@ pub fn apply_masks(out: *const u32, cap: u32) -> u32 {
     order.sort_unstable();
     OWN_STATS[O_MASK_RECORDS].fetch_add(n as u64, Ordering::Relaxed);
     note_shared(&order);
+    // The batch whose completion this is (its masks of pages remapped since
+    // it was submitted belong to the old mapping).
+    let seq = super::cp::after_batch();
     let _arming = ARM_LOCK.read();
     let mut g = DIRTY.lock();
     let map = g.get_or_insert_with(Default::default);
-    // Pages newly dirty, in runs, protected after their marks are noted.
+    // Pages newly dirty, in runs, protected after their marks are noted
+    // (pages owned since the batch's submission already are: `own_begin`).
     let mut fresh: Vec<u64> = Vec::new();
     for &(page, k) in &order {
         let p = MIRROR_BASE + page as u64 * PAGE;
         let Some(c) = chunk(p, false) else { continue };
         let i = idx(p);
+        if seq != 0 && c.rseq[i].load(Ordering::Acquire) > seq {
+            OWN_PROT[O7_REMAPPED].fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         let masks = unsafe { std::slice::from_raw_parts(rec(k).add(1), 32) };
+        if traced(p) {
+            trace_event(p, format_args!("batch {seq} GPU wrote dwords {}", mask_runs(masks)));
+        }
         match map.get_mut(&p) {
             Some(d) => {
                 for w in 0..32 {
@@ -1899,7 +2200,9 @@ pub fn apply_masks(out: *const u32, cap: u32) -> u32 {
                 m.copy_from_slice(masks);
                 map.insert(p, DirtyPage { masks: m, prot });
                 c.gdirty[i >> 6].fetch_or(1u64 << (i & 63), Ordering::AcqRel);
-                fresh.push(p);
+                if !is_gprot(c, i) {
+                    fresh.push(p);
+                }
             }
         }
     }
@@ -1914,7 +2217,15 @@ pub fn apply_masks(out: *const u32, cap: u32) -> u32 {
         }
         let (a, e) = (fresh[i], fresh[j - 1] + PAGE);
         busy_range(a, e);
-        protect_regions(a, e, windows_sys::Win32::System::Memory::PAGE_NOACCESS, false);
+        if protect_regions(a, e, windows_sys::Win32::System::Memory::PAGE_NOACCESS, false) {
+            let mut q = a;
+            while q < e {
+                if let Some(c) = chunk(q, false) {
+                    set_gprot(c, idx(q));
+                }
+                q += PAGE;
+            }
+        }
         OWN_STATS[O_DIRTY_PROTECTS].fetch_add(1, Ordering::Relaxed);
         unbusy_range(a, e);
         i = j;
@@ -2179,6 +2490,11 @@ fn release_dirty(page: u64, fault: bool) -> bool {
             let mut old = 0u32;
             unsafe { VirtualProtect(q as _, PAGE as usize, PAGE_READWRITE, &mut old) };
             let src = unsafe { rb.ptr.add((q - a) as usize) } as *const u32;
+            if traced(q) {
+                let rip = FAULT_RIP.with(|r| r.get());
+                let at = if !fault { "explicit".to_string() } else if rip >= crate::mem::GUEST_BASE && rip < crate::mem::GUEST_END { crate::exception::describe_guest(rip) } else { crate::exception::host_symbol(rip) };
+                trace_event(q, format_args!("released dwords {} (access at {at}); first dwords now {:08x} {:08x}, mirror {:08x} {:08x}", mask_runs(&d.masks), unsafe { *(q as *const u32) }, unsafe { *((q + 4) as *const u32) }, unsafe { *src }, unsafe { *src.add(1) }));
+            }
             baseline_merge(q, &d.masks, src);
             note_writeback(q, 0, &d.masks);
             for (w, &mw) in d.masks.iter().enumerate() {
@@ -2194,6 +2510,7 @@ fn release_dirty(page: u64, fault: bool) -> bool {
             unsafe { VirtualProtect(q as _, PAGE as usize, d.prot, &mut tmp) };
         }
         undirty(c, i);
+        clear_gprot(c, i);
         q += PAGE;
     }
     drop(dg);
@@ -2248,11 +2565,13 @@ pub fn release_range(base: u64, len: u64) {
             continue;
         };
         let i = idx(p);
-        if i & 63 == 0 && c.gdirty[i >> 6].load(Ordering::Acquire) == 0 {
+        if i & 63 == 0 && c.gdirty[i >> 6].load(Ordering::Acquire) == 0 && c.gprot[i >> 6].load(Ordering::Acquire) == 0 {
             p += 64 * PAGE;
             continue;
         }
-        if is_dirty(c, i) {
+        if is_gprot(c, i) {
+            settle(p, false);
+        } else if is_dirty(c, i) {
             release_dirty(p, false);
         }
         p += PAGE;
@@ -2318,7 +2637,10 @@ pub fn host_for_cp(a: u64, n: u64) -> bool {
     while p < hi {
         if state(p) & ST_HOST == 0 {
             if let Some(c) = chunk(p, false) {
-                if is_dirty(c, idx(p)) {
+                if is_gprot(c, idx(p)) {
+                    CP_HOSTED[2].fetch_add(1, Ordering::Relaxed);
+                    settle(p, false);
+                } else if is_dirty(c, idx(p)) {
                     CP_HOSTED[2].fetch_add(1, Ordering::Relaxed);
                     release_dirty(p, false);
                 }
@@ -2528,11 +2850,19 @@ pub fn owned_line() -> String {
         v[O_BASE_DIFFS],
         v[O_BASE_DWORDS]
     ) + &format!(
-        "    mirror mode, CP writes the GPU performs: {} calls, {} pages made host class ({} with GPU-written dwords released first)
-",
+        "    mirror mode, CP writes the GPU performs: {} calls, {} pages made host class ({} with GPU-written dwords released first)\n    mirror mode, ownership at submission (lazy): {} batches, {} pages made no-access ({} calls); settled by {} faults and {} releases ({} waited for their batch, {} gave up waiting, {} without GPU-written dwords); {} masks dropped for pages remapped since their batch\n",
         CP_HOSTED[0].load(Ordering::Relaxed),
         CP_HOSTED[1].load(Ordering::Relaxed),
-        CP_HOSTED[2].load(Ordering::Relaxed)
+        CP_HOSTED[2].load(Ordering::Relaxed),
+        OWN_PROT[O7_BATCHES].load(Ordering::Relaxed),
+        OWN_PROT[O7_PAGES].load(Ordering::Relaxed),
+        OWN_PROT[O7_PROTECTS].load(Ordering::Relaxed),
+        OWN_PROT[O7_FAULTS].load(Ordering::Relaxed),
+        OWN_PROT[O7_EXPLICIT].load(Ordering::Relaxed),
+        OWN_PROT[O7_WAITED].load(Ordering::Relaxed),
+        OWN_PROT[O7_TIMEOUTS].load(Ordering::Relaxed),
+        OWN_PROT[O7_UNPROTECTED].load(Ordering::Relaxed),
+        OWN_PROT[O7_REMAPPED].load(Ordering::Relaxed)
     ) + &dirty_sites_line()
 }
 

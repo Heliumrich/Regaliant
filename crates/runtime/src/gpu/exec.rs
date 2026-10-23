@@ -2810,6 +2810,11 @@ pub fn completed_seq() -> u64 {
     done_seq()
 }
 
+/// The sequence the next batch handed over will get (earlier ones were).
+pub fn next_seq() -> u64 {
+    NEXT_SEQ.load(Ordering::Acquire)
+}
+
 /// Guest ranges written by unfinished batches, by sequence number
 /// (`ranges::SeqRanges`: per batch a coalesced union, so the title's
 /// thousands of writes per batch to the same buffers stay a few entries and a
@@ -5382,6 +5387,9 @@ pub struct Exec {
     /// its end: `record_mirror_writeback`), bytes used in the slot's last
     /// extra staging buffer, and pages copied without a claim.
     owned: Vec<(u64, u64)>,
+    /// Lazy mirror mode: the batch's ownership of its written ranges (made
+    /// no-access before it is handed over: `resident::own_begin`).
+    mm_own: Option<std::sync::Arc<super::resident::Owned>>,
     extra_used: u64,
     mm_copy: Vec<u64>,
     /// Mirror mode: a parallel worker's batch's write-back (carried by
@@ -5502,8 +5510,10 @@ struct Closed {
     segs: Vec<SegMark>,
     /// Pages it uploads into the residency mirror (`Exec::res_pages`).
     res_pages: Vec<u64>,
-    /// Mirror mode: its write-back (`Exec::eager_action`).
+    /// Mirror mode: its write-back (`Exec::eager_action`) and its ownership
+    /// (`Exec::mm_own`).
     eager_action: Option<Action>,
+    mm_own: Option<std::sync::Arc<super::resident::Owned>>,
 }
 
 /// Slot sequence of a batch closed but not yet submitted.
@@ -5663,6 +5673,7 @@ impl Exec {
                 cs_streak: (0, 0),
                 cs_run: None,
                 owned: Vec::new(),
+                mm_own: None,
                 extra_used: 0,
                 mm_copy: Vec::new(),
                 pre_after: Vec::new(),
@@ -6121,7 +6132,7 @@ impl Exec {
                 crate::error!("gpu[{}]: CP effects in a parallel run (dropped)", self.name);
             }
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take() });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take() });
             self.res_mine.clear();
             self.stage_used = 0;
             self.slots[i].seq = PENDING;
@@ -6193,6 +6204,9 @@ impl Exec {
         }
         if !self.forward_ids.is_empty() {
             super::forward::submitted(&std::mem::take(&mut self.forward_ids), seq);
+        }
+        if let Some(o) = self.mm_own.take() {
+            super::resident::own_submitted(&o, seq);
         }
         st.mark(6);
         // The batch's writes are noted before its labels are promised: a
@@ -6764,6 +6778,10 @@ impl Exec {
                 _ => merged.push((a, e)),
             }
         }
+        // Lazy write-backs: the written ranges are no-access from now on
+        // (before the batch is handed over), until a CPU access settles them.
+        let own = res::own_begin(&merged);
+        self.mm_own = own.clone();
         let mut leftover = res::take_regather();
         leftover.sort_unstable();
         let mut regather: Vec<(u64, u64)> = Vec::with_capacity(leftover.len());
@@ -6837,6 +6855,9 @@ impl Exec {
             let out = base as *const u32;
             let listed = unsafe { std::ptr::read_volatile(out.add(1)) };
             let over = if res::lazy_writebacks() { res::apply_masks(out, cap) } else { res::apply_masks_copy(out, cap) };
+            if let Some(o) = &own {
+                res::own_done(o);
+            }
             // A full list or output: the batch's written ranges keep marks
             // (the pages past them): gathered by range next time.
             if over > 0 || listed > rdna::kernels::MARK_LIST_CAP {
@@ -8116,15 +8137,23 @@ impl Exec {
     /// A guest range the batch being recorded writes.
     #[track_caller]
     pub(super) fn note_write(&mut self, a: u64, n: u64) {
-        // DS_TRACE_NOTE=<hex address>: the first 40 notes covering it
-        // (diagnosis: who writes a word stage preparations wait for).
-        static AT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let at = *AT.get_or_init(|| std::env::var("DS_TRACE_NOTE").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0));
-        if at != 0 && a <= at && at < a.saturating_add(n) {
+        // DS_TRACE_NOTE=<hex address>[-<hex end>]: the first 400 notes
+        // covering it or overlapping the range (diagnosis: who writes a word
+        // stage preparations wait for, or a region).
+        static AT: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+        let (at, at_end) = *AT.get_or_init(|| {
+            let v = std::env::var("DS_TRACE_NOTE").unwrap_or_default();
+            let num = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+            match v.split_once('-') {
+                Some((lo, hi)) => (num(lo).unwrap_or(0), num(hi).unwrap_or(0)),
+                None => num(&v).map_or((0, 0), |x| (x, x + 1)),
+            }
+        });
+        if at != 0 && a < at_end && at < a.saturating_add(n) {
             static N: AtomicU64 = AtomicU64::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 40 {
+            if N.fetch_add(1, Ordering::Relaxed) < 400 {
                 let l = std::panic::Location::caller();
-                crate::info!("gpu[{}]: note_write {a:#x}+{n:#x} covers {at:#x} at {}:{} (last shader {:#x}, {} commands in the batch)", self.name, l.file(), l.line(), self.batch_shaders.last().copied().unwrap_or(0), self.batch_shaders.len());
+                crate::info!("gpu[{}]: note_write {a:#x}+{n:#x} overlaps {at:#x}..{at_end:#x} at {}:{} (last shader {:#x}, {} commands in the batch, flip {})", self.name, l.file(), l.line(), self.batch_shaders.last().copied().unwrap_or(0), self.batch_shaders.len(), super::FRAMES.load(Ordering::Relaxed));
             }
         }
         super::precache::invalidate_gpu(a, n);
@@ -9071,6 +9100,7 @@ impl Exec {
             let (pre, copy_wait) = (b.pre, b.copy_wait);
             note_copy_waits(false, copy_wait);
             let reset = self.slot_reset(b.slot);
+            let own = b.mm_own;
             let seq = push_batch(fence, queries, b.eager_action.into_iter().collect(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, reset, move |seq| {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
                     return;
@@ -9083,6 +9113,9 @@ impl Exec {
                 }
             });
             self.slots[b.slot].seq = seq;
+            if let Some(o) = &own {
+                super::resident::own_submitted(o, seq);
+            }
             super::forward::submitted(&b.forward_ids, seq);
             if !b.races.is_empty() {
                 let cpw_submit = super::cp::CPW_SEQ.load(Ordering::Acquire);
