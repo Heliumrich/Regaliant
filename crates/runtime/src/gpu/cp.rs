@@ -2561,6 +2561,9 @@ impl Cp {
         if let Some((a, n)) = write {
             super::replay::note_cp_write(a, n);
             super::forward::written(a, n);
+            if super::smalltrack::on() {
+                super::smalltrack::cp_write(a, n, false);
+            }
         }
         // Mirror mode: the pages it changes are copied into the mirror at
         // the next placement over them (`resident::cp_wrote`).

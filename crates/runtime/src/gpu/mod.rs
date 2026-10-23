@@ -11,6 +11,7 @@ pub mod capture;
 pub mod cp;
 pub mod desc;
 pub mod emucheck;
+pub mod smalltrack;
 /// Run-time switches for A/B measurements within one run (`tune <name>
 /// <value>`; slowly varying load from other GPU users cancels out), each
 /// seeded from its environment variable.
@@ -26,7 +27,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 159] = [
+    static ALL: [Tunable; 160] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -186,6 +187,7 @@ pub mod tune {
         Tunable { name: "scrub_ms", env: "DS_SCRUB_MS", default: 10, value: AtomicU64::new(UNSET) },
         Tunable { name: "skip_steps", env: "DS_SKIP_STEPS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "stencil_export", env: "DS_STENCIL_EXPORT", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "shadow_share_min", env: "DS_SHADOW_SHARE_MIN", default: 16384, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -847,7 +849,9 @@ pub mod tune {
     /// a CP memory write the GPU performs, 8 around a GPU timestamp store,
     /// 16 the title's synchronization (partial flushes, cache actions,
     /// end-of-pipe events) before the next command, 32 between dispatches
-    /// and the draws after them.
+    /// and the draws after them, 64 a batch's opening barrier, 128 the
+    /// prologue's barrier after earlier work, 256 the barrier before an
+    /// end-of-pipe CP write (`eop_light`).
     #[inline]
     pub fn skip_barriers() -> u64 {
         get(70)
@@ -1069,7 +1073,15 @@ pub mod tune {
     /// and video memory left out, as if the data lived in video memory: 1
     /// the copies into new shadows (use only with 2: the merges would store
     /// garbage), 2 the merges of shadows back to guest memory (guest memory
-    /// keeps older values), 4 the batch-start copies (read-only data).
+    /// keeps older values), 4 the batch-start copies (read-only data), 8 the
+    /// fill kernel's large zero fills stored in place (guest memory keeps
+    /// older values; images they cover are still cleared), 16 / 32 / 64 the
+    /// merges of windows of at least 1 MiB / 256 KiB to 1 MiB / under 256 KiB;
+    /// windows under 256 KiB written back by a whole copy instead of the
+    /// merge kernel (128; CPU-written words in them are lost) or merged into
+    /// video memory instead of guest memory (256) or into host memory
+    /// nothing reads (2048); 512 the title's timestamps stored into video
+    /// memory; 1024 GPU-performed end-of-pipe label writes made twice.
     #[inline]
     pub fn skip_copies() -> u64 {
         get(94)
@@ -1707,6 +1719,14 @@ pub mod tune {
     #[inline]
     pub fn stencil_export() -> u64 {
         get(158)
+    }
+
+    /// Smallest written-buffer shadow whose working copy is shared after its
+    /// merge (`shadow_share`), bytes (the copy cache's own floor is
+    /// `pre_share_min`).
+    #[inline]
+    pub fn shadow_share_min() -> u64 {
+        get(159)
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
@@ -2394,6 +2414,7 @@ pub fn reset_profile() {
     exec::reset_import_window();
     xwait::reset();
     census::reset();
+    smalltrack::reset();
     crate::mem::reset_host_calls();
     threadcpu::reset_window();
     crate::audio::reset_window();
@@ -2424,6 +2445,9 @@ pub fn profile_report() -> String {
     s.push_str(&xwait::status());
     if census::on() {
         s.push_str(&census::status());
+    }
+    if smalltrack::on() {
+        s.push_str(&smalltrack::report());
     }
     s.push_str(&crate::audio::window_line());
     s.push_str(&crate::guestprof::report());

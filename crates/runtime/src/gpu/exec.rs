@@ -2290,6 +2290,27 @@ fn depth_copy_buffer() -> Option<vk::Buffer> {
     *DEPTH_COPY_BUF.get_or_init(|| ctx().device_buffer(DEPTH_COPY_BYTES, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).ok().map(|(b, _)| b))
 }
 
+/// Host memory nothing reads, for `tune skip_copies` 2048 (diagnosis).
+fn host_scratch() -> Option<vk::Buffer> {
+    static B: std::sync::OnceLock<Option<vk::Buffer>> = std::sync::OnceLock::new();
+    *B.get_or_init(|| ctx().host_buffer(1 << 20, vk::BufferUsageFlags::STORAGE_BUFFER).ok().map(|(b, _, _)| b))
+}
+
+/// Our own write-watched memory imported as guest memory is, nothing else
+/// using it, for `tune skip_copies` 4096 (diagnosis).
+fn imported_scratch() -> Option<vk::Buffer> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+    static B: std::sync::OnceLock<Option<vk::Buffer>> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 1 << 20, MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) } as u64;
+        if p == 0 {
+            return None;
+        }
+        ctx().import_host(p, 1 << 20, vk::BufferUsageFlags::STORAGE_BUFFER).ok().map(|(b, _, _)| b)
+    })
+}
+
 fn scratch_buffer() -> Option<vk::Buffer> {
     *SCRATCH.get_or_init(|| ctx().device_buffer(SCRATCH_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER).ok().map(|(b, _)| b))
 }
@@ -7406,6 +7427,9 @@ impl Exec {
         if super::census::on() {
             super::census::note(base, len, super::census::FILL);
         }
+        if super::smalltrack::on() {
+            super::smalltrack::cp_write(base, len, true);
+        }
         let Some((buffer, start, _)) = span(base, len) else { return Ok(false) };
         // Resident shadows holding newer data of the range go back first:
         // their merge would undo the fill.
@@ -7928,6 +7952,9 @@ impl Exec {
         if super::xwait::on() {
             super::xwait::note_reads(&self.name, reads, why);
         }
+        if super::smalltrack::on() {
+            super::smalltrack::cpu_read(reads, why, &self.name);
+        }
         // DS_TRACE_SYNC=1: the first 400 waits, with the read that collided
         // and the batch writing it; DS_TRACE_SYNC=<text>: only on queues
         // whose name contains it (e.g. acb0x50).
@@ -8350,6 +8377,9 @@ impl Exec {
         if super::census::on() {
             super::census::note(a, bytes, super::census::CP_WRITE);
         }
+        if super::smalltrack::on() {
+            super::smalltrack::cp_write(a, bytes, false);
+        }
         // Mirror mode: the target pages become host class first (imported
         // exactly, written in place: `resident::host_for_cp`).
         super::resident::host_for_cp(a, bytes);
@@ -8400,8 +8430,16 @@ impl Exec {
             // the work after it (`order_after_open_writes`).
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
             unsafe {
-                ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+                if super::tune::skip_barriers() & 256 == 0 {
+                    ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+                }
                 ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw);
+                // Diagnosis (`tune skip_copies` 1024, timing only): written
+                // twice, with a barrier between (what one more costs).
+                if super::tune::skip_copies() & 1024 != 0 {
+                    ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+                    ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw);
+                }
             }
             self.eop_unordered = true;
             EOP_LIGHT[0].fetch_add(1, Ordering::Relaxed);
@@ -8680,7 +8718,13 @@ impl Exec {
             let lo = group.iter().map(|e| e.off).min().unwrap_or(0) / align * align;
             let hi = group.iter().map(|e| e.off + 8).max().unwrap_or(8);
             let Ok(set) = self.alloc_set(tp.set_layout) else { return };
-            let infos = [vk::DescriptorBufferInfo { buffer: tbuf, offset: 0, range: TS_PER_BATCH as u64 * 8 }, vk::DescriptorBufferInfo { buffer: first.buffer, offset: lo, range: hi - lo }];
+            // Diagnosis (`tune skip_copies` 512, timing only): stored into
+            // video memory instead of guest memory.
+            let dst = match scratch_buffer() {
+                Some(sb) if super::tune::skip_copies() & 512 != 0 => (sb, 0),
+                _ => (first.buffer, lo),
+            };
+            let infos = [vk::DescriptorBufferInfo { buffer: tbuf, offset: 0, range: TS_PER_BATCH as u64 * 8 }, vk::DescriptorBufferInfo { buffer: dst.0, offset: dst.1, range: hi - lo }];
             let writes: Vec<vk::WriteDescriptorSet> = infos
                 .iter()
                 .enumerate()
@@ -8766,17 +8810,42 @@ impl Exec {
         super::vk::checkpoint(self.cmd(), super::vk::mark::SHADOW_OUT, 0);
         let merge = if shadow_merge() { Some(merge_pipe()?) } else { None };
         // Diagnosis (`tune skip_copies 2`): the merges left out (timing only).
-        let flushing: &[Shadow] = if super::tune::skip_copies() & 2 != 0 { &[] } else { &flush };
+        // 16/32/64: only those of windows of at least 1 MiB / 256 KiB to 1 MiB
+        // / under 256 KiB.
+        let skip = super::tune::skip_copies();
+        let by_class: Vec<Shadow>;
+        let flushing: &[Shadow] = if skip & 2 != 0 {
+            &[]
+        } else if skip & 112 != 0 {
+            let class = |r: u64| if r >= 1 << 20 { 16 } else if r >= 256 << 10 { 32 } else { 64 };
+            by_class = flush.iter().filter(|s| skip & class(s.range) == 0).copied().collect();
+            &by_class
+        } else {
+            &flush
+        };
         let many = merge.is_some() && flushing.len() > 1 && super::tune::merge_many() && c.device_addresses && self.merge_many(flushing)?;
         for sh in flushing.iter().filter(|_| !many) {
             let own = sh.size.min(sh.range - sh.bias);
+            // Diagnosis (`tune skip_copies`, timing only): windows under 256
+            // KiB written back by a whole copy (128) or merged into video
+            // memory instead of guest memory (256).
+            let small = sh.range < 256 << 10;
+            let merge = if small && skip & 128 != 0 { None } else { merge };
+            let dst = match (scratch_buffer(), host_scratch()) {
+                (Some(sb), _) if small && skip & 256 != 0 => (sb, 0),
+                (_, Some(hb)) if small && skip & 2048 != 0 => (hb, 0),
+                _ => match imported_scratch() {
+                    Some(ib) if small && skip & 4096 != 0 => (ib, 0),
+                    _ => (sh.host, sh.host_off),
+                },
+            };
             match merge {
                 Some(m) => {
                     let set = self.alloc_set(m.set_layout)?;
                     let infos = [
                         vk::DescriptorBufferInfo { buffer: self.shadow(), offset: sh.shadow_off, range: sh.range },
                         vk::DescriptorBufferInfo { buffer: self.shadow(), offset: sh.pristine_off, range: sh.range },
-                        vk::DescriptorBufferInfo { buffer: sh.host, offset: sh.host_off, range: sh.range },
+                        vk::DescriptorBufferInfo { buffer: dst.0, offset: dst.1, range: sh.range },
                     ];
                     let writes: Vec<vk::WriteDescriptorSet> = infos
                         .iter()
@@ -8806,6 +8875,11 @@ impl Exec {
         }
         if merge.is_some() && super::tune::shadow_share() && super::precache::enabled() {
             self.share_shadows(&flush);
+        }
+        if super::smalltrack::on() {
+            for sh in &flush {
+                super::smalltrack::merged(sh.guest, sh.range, &self.name);
+            }
         }
         if profiling() {
             let mut g = MERGE_BY.lock();
@@ -9621,6 +9695,10 @@ impl Exec {
                         if profiling() {
                             bound.placements.push((placement, bound_size, found.tr.plan.resources[i].written));
                         }
+                        if super::smalltrack::on() {
+                            let k = PLACEMENTS.iter().position(|&x| x == placement).unwrap_or(7);
+                            super::smalltrack::bound(base, size, found.tr.plan.resources[i].written, k, &self.name, p.addr, matches!(found.resources[i], Resolved::Global(_, None)));
+                        }
                         let ri = res_info + RES_INFO_DWORDS as usize * i;
                         p.sgpr_data[ri] = bias as u32;
                         p.sgpr_data[ri + 1] = stride;
@@ -10123,10 +10201,9 @@ impl Exec {
                 // stores nothing into their guest memory (`tune fill_skip`).
                 let skip = v == 0
                     && len >= FILL_SKIP_MIN
-                    && super::tune::fill_skip()
                     && super::tune::zero_fill_clears()
                     && !super::homes::overlaps(base, len)
-                    && super::images::with(|im| im.fill_covered(base, len));
+                    && ((super::tune::fill_skip() && super::images::with(|im| im.fill_covered(base, len))) || super::tune::skip_copies() & 8 != 0);
                 if skip {
                     self.flush_resident(Some(&[(base, len)]))?;
                     FILL_SKIPS[0].fetch_add(1, Ordering::Relaxed);
@@ -10306,7 +10383,7 @@ impl Exec {
             let share = shadow_merge() && super::tune::shadow_share() && super::precache::enabled();
             let mut kept: Vec<Option<(vk::Buffer, u64)>> = Vec::with_capacity(fresh.len());
             for sh in &fresh {
-                if !share || !super::precache::worth(sh.range) {
+                if !share || sh.range < super::tune::shadow_share_min() {
                     kept.push(None);
                     continue;
                 }
