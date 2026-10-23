@@ -376,6 +376,64 @@ fn cost_firsts(costs: &[f32], main_n: usize, n: usize, m: usize, min: usize) -> 
     firsts.windows(2).all(|w| w[1] >= w[0] + min).then_some(firsts)
 }
 
+/// The context registers' clear-state values: zero, except the registers
+/// with a non-zero Agc register default (see `Cp::clear_context`).
+fn context_defaults() -> &'static [(u32, u32)] {
+    static DEFAULTS: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        let mut v = Vec::new();
+        for def in crate::hle::libs::agc_defaults::PUBLIC.iter().chain(crate::hle::libs::agc_defaults::INTERNAL) {
+            if matches!(def.table(), 0 | 3) {
+                v.extend(def.regs.iter().filter(|r| r.1 != 0).copied());
+            }
+        }
+        v
+    })
+}
+
+/// `clear_context` on a walked state.
+fn walk_clear(st: &mut ChunkState) {
+    st.regs.ctx.fill(0);
+    for &(i, val) in context_defaults() {
+        put_reg(&mut st.regs.ctx, Space::Ctx, CTX_DWORDS, i as usize, val);
+    }
+}
+
+/// A command processor's state as `Cp::walk_state` follows it.
+pub struct WalkState {
+    pub st: ChunkState,
+    /// The context-state stack (`pop::CONTEXT_STATE`).
+    pub stack: Vec<Vec<u32>>,
+    /// SH registers indirect draws set from their arguments.
+    pub unknown: Vec<u32>,
+}
+
+impl WalkState {
+    /// Registers that differ from `other`'s: (space 0 ctx / 1 sh / 2 uc,
+    /// index), SH registers in `unknown` left out; and whether the CP's own
+    /// fields and stack depth agree.
+    pub fn diff(&self, other: &WalkState) -> (Vec<(usize, u32)>, bool) {
+        let mut out = Vec::new();
+        let spaces = [(&self.st.regs.ctx, &other.st.regs.ctx), (&self.st.regs.sh, &other.st.regs.sh), (&self.st.regs.uc, &other.st.regs.uc)];
+        for (k, (a, b)) in spaces.iter().enumerate() {
+            let n = a.len().max(b.len());
+            for i in 0..n {
+                let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+                if x != y && !(k == 1 && (self.unknown.contains(&(i as u32)) || other.unknown.contains(&(i as u32)))) {
+                    out.push((k, i as u32));
+                }
+            }
+        }
+        let fields = self.st.index_base == other.st.index_base
+            && self.st.index_count == other.st.index_count
+            && self.st.num_instances == other.st.num_instances
+            && self.st.draw_indirect_base == other.st.draw_indirect_base
+            && self.st.dispatch_indirect_base == other.st.dispatch_indirect_base
+            && self.stack.len() == other.stack.len();
+        (out, fields)
+    }
+}
+
 /// The command-processor state a chunk of a parallel run starts from and
 /// ends with (`gpu::par`).
 #[derive(Clone)]
@@ -2675,21 +2733,111 @@ impl Cp {
     /// bottom-right corners 0x40004000: the title leaves these unprogrammed
     /// for ordinary draws).
     fn clear_context(&mut self) {
-        static DEFAULTS: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
-        let d = DEFAULTS.get_or_init(|| {
-            let mut v = Vec::new();
-            for def in crate::hle::libs::agc_defaults::PUBLIC.iter().chain(crate::hle::libs::agc_defaults::INTERNAL) {
-                if matches!(def.table(), 0 | 3) {
-                    v.extend(def.regs.iter().filter(|r| r.1 != 0).copied());
-                }
-            }
-            v
-        });
         self.regs.ctx.fill(0);
         self.ctx_dirty = true;
-        for &(i, val) in d {
+        for &(i, val) in context_defaults() {
             self.set_reg(Space::Ctx, i, val);
         }
+    }
+
+    /// The whole state now, as `walk_state` follows it (frame-ahead
+    /// recording's start-state prediction).
+    pub fn walk_start(&self) -> WalkState {
+        WalkState {
+            st: ChunkState {
+                regs: Regs { ctx: self.regs.ctx.clone(), sh: self.regs.sh.clone(), uc: self.regs.uc.clone() },
+                index_base: self.index_base,
+                index_count: self.index_count,
+                num_instances: self.num_instances,
+                draw_indirect_base: self.draw_indirect_base,
+                dispatch_indirect_base: self.dispatch_indirect_base,
+            },
+            stack: self.ctx_stack.clone(),
+            unknown: Vec::new(),
+        }
+    }
+
+    /// Applies the state effects of the packets in [addr, addr + 4 size) to
+    /// `w` as `run` would, without executing anything: Ok(true) at a FLIP
+    /// (the walk stops before it), Ok(false) at the buffer's end, Err at a
+    /// packet whose effect cannot be known before it executes (COND_EXEC
+    /// reads memory GPU work may write, an indirect buffer, a bad packet).
+    /// The user SGPRs indirect draws set from their arguments (memory GPU
+    /// work writes) are listed in `unknown`.
+    pub fn walk_state(w: &mut WalkState, addr: u64, size: u32) -> Result<bool, &'static str> {
+        let f = Fetched::new(addr, size);
+        let end = addr + 4 * size as u64;
+        let mut cur = addr;
+        while cur < end {
+            if !valid(cur, 4) {
+                return Err("outside guest memory");
+            }
+            let h = f.rd(cur);
+            match h >> 30 {
+                3 => {}
+                2 => {
+                    cur += 4;
+                    continue;
+                }
+                0 => {
+                    cur += 4 * (((h >> 16) & 0x3FFF) as u64 + 2);
+                    continue;
+                }
+                _ => return Err("bad packet header"),
+            }
+            let count = (h >> 16) & 0x3FFF;
+            let opcode = (h >> 8) & 0xFF;
+            if count == 0x3FFF {
+                cur += 4;
+                continue;
+            }
+            let n = count as u64 + 1;
+            if !valid(cur, 4 * (n + 1)) {
+                return Err("packet outside guest memory");
+            }
+            let at = cur;
+            let p = |i: u64| f.rd(at + 4 * (1 + i));
+            match opcode {
+                op::NOP if n >= 2 && p(0) == DS_MAGIC => match p(1) {
+                    pop::FLIP => return Ok(true),
+                    pop::CONTEXT_STATE if n >= 3 => match p(2) {
+                        0 => walk_clear(&mut w.st),
+                        1 => w.stack.push(w.st.regs.ctx.clone()),
+                        2 => match w.stack.pop() {
+                            Some(c) => w.st.regs.ctx = c,
+                            None => return Err("context state pop without push"),
+                        },
+                        3 => {
+                            w.stack.push(w.st.regs.ctx.clone());
+                            walk_clear(&mut w.st);
+                        }
+                        _ => return Err("unknown context state operation"),
+                    },
+                    _ => {}
+                },
+                op::CLEAR_STATE => walk_clear(&mut w.st),
+                op::COND_EXEC => return Err("COND_EXEC"),
+                op::INDIRECT_BUFFER => return Err("indirect buffer"),
+                op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT => {
+                    let (vtx_loc, inst_loc) = (p(1) & 0xFFFF, p(1) >> 16);
+                    let inst_loc = if inst_loc != 0 {
+                        inst_loc
+                    } else {
+                        let r = ScanRegs { sh: &w.st.regs.sh, ctx: &w.st.regs.ctx };
+                        crate::hle::libs::agc::instance_offset_slot(super::shaders::ngg_addr_of(&r)).map_or(0, |s| 0x8C + s)
+                    };
+                    for r in [vtx_loc, inst_loc] {
+                        if r != 0 && !w.unknown.contains(&r) {
+                            w.unknown.push(r);
+                        }
+                    }
+                    Self::apply_state(&mut w.st, opcode, n, &p);
+                }
+                _ => Self::apply_state(&mut w.st, opcode, n, &p),
+            }
+            cur = at + 4 * (n + 1);
+        }
+        Ok(false)
     }
 
     /// Diagnostics (`tune split_every`): ends the graphics queue's batch
@@ -4364,6 +4512,7 @@ impl Cp {
                     super::note_run_ahead();
                     if super::frameprobe::on() && self.name == "gpu-gfx" {
                         super::frameprobe::flip([&self.regs.ctx, &self.regs.sh, &self.regs.uc]);
+                        super::frameprobe::flip_walk(self.walk_start(), at, 4 * (n + 3));
                     }
                 }
             }

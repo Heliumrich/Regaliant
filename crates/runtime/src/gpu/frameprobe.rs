@@ -9,7 +9,9 @@
 //! recorder, started from the previous frame's starting state, would have
 //! wrong) that the frame has not set yet when its first draw or dispatch
 //! comes ("risky": used with the wrong value unless that command ignores
-//! them).
+//! them). And the start-state prediction itself: at each flip the frame's
+//! command buffers are walked (`Cp::walk_state`) from the previous flip's
+//! state and the result compared with the real state.
 
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
@@ -36,9 +38,82 @@ struct State {
     /// differing, risky, commands before the first flush).
     frames: Vec<(Option<f32>, f32, usize, usize, u64)>,
     whys: std::collections::HashMap<&'static str, u64>,
+    /// The state at the previous flip, and the frame's command buffers
+    /// since it ((start, end) ranges, the first one the rest of the buffer
+    /// the flip was in).
+    walk_from: Option<super::cp::WalkState>,
+    walk_bufs: Vec<(u64, u64)>,
+    /// The current submission's buffers (the flip's is found among them).
+    sub_bufs: Vec<(u64, u64)>,
+    /// Walk results: exact, registers that differed (frames, total), the
+    /// CP's own fields differing, errors by reason.
+    walk_exact: u64,
+    walk_diff: (u64, u64),
+    walk_fields: u64,
+    walk_errors: std::collections::HashMap<&'static str, u64>,
+    walk_regs: std::collections::HashMap<(usize, u32), u64>,
 }
 
 static ST: Mutex<Option<State>> = Mutex::new(None);
+
+/// The graphics command processor takes a title submission of these
+/// command buffers.
+pub fn submission(bufs: &[(u64, u32)]) {
+    let mut g = ST.lock();
+    let s = g.get_or_insert_with(State::default);
+    s.sub_bufs = bufs.iter().map(|&(a, n)| (a, a + 4 * n as u64)).collect();
+    s.walk_bufs.extend(s.sub_bufs.iter().copied());
+}
+
+/// The graphics command processor reached the flip packet at `at` (`len`
+/// bytes) with state `actual`: the walk from the previous flip is checked.
+pub fn flip_walk(actual: super::cp::WalkState, at: u64, len: u64) {
+    let mut g = ST.lock();
+    let s = g.get_or_insert_with(State::default);
+    if let Some(mut w) = s.walk_from.take() {
+        let mut result: Result<bool, &'static str> = Ok(false);
+        for &(a, e) in &s.walk_bufs {
+            result = super::cp::Cp::walk_state(&mut w, a, ((e - a) / 4) as u32);
+            if !matches!(result, Ok(false)) {
+                break;
+            }
+        }
+        match result {
+            Ok(true) => {
+                let (d, fields) = w.diff(&actual);
+                if d.is_empty() && fields {
+                    s.walk_exact += 1;
+                } else {
+                    if !d.is_empty() {
+                        s.walk_diff.0 += 1;
+                        s.walk_diff.1 += d.len() as u64;
+                        for r in d {
+                            *s.walk_regs.entry(r).or_default() += 1;
+                        }
+                    }
+                    if !fields {
+                        s.walk_fields += 1;
+                    }
+                }
+            }
+            Ok(false) => *s.walk_errors.entry("no flip in the frame's buffers").or_default() += 1,
+            Err(e) => *s.walk_errors.entry(e).or_default() += 1,
+        }
+    }
+    // The next frame's buffers: the rest of the one the flip is in, then the
+    // submission's later ones.
+    let next = at + len;
+    s.walk_bufs.clear();
+    if let Some(k) = s.sub_bufs.iter().position(|&(a, e)| a <= at && at < e) {
+        let e = s.sub_bufs[k].1;
+        if next < e {
+            s.walk_bufs.push((next, e));
+        }
+        let rest: Vec<(u64, u64)> = s.sub_bufs[k + 1..].to_vec();
+        s.walk_bufs.extend(rest);
+        s.walk_from = Some(actual);
+    }
+}
 
 /// The graphics command processor reached a flip with registers `regs`.
 pub fn flip(regs: [&[u32]; 3]) {
@@ -138,7 +213,20 @@ pub fn report() -> String {
     let mut regs: Vec<(&(usize, u32), &u64)> = s.risky_regs.iter().collect();
     regs.sort_by(|a, b| b.1.cmp(a.1));
     let regs: Vec<String> = regs.iter().take(12).map(|((k, i), c)| format!("{}:{i:#x} {c}", ["ctx", "sh", "uc"][*k])).collect();
-    format!(
+    let mut wregs: Vec<(&(usize, u32), &u64)> = s.walk_regs.iter().collect();
+    wregs.sort_by(|a, b| b.1.cmp(a.1));
+    let wregs: Vec<String> = wregs.iter().take(10).map(|((k, i), c)| format!("{}:{i:#x} {c}", ["ctx", "sh", "uc"][*k])).collect();
+    let werr: Vec<String> = s.walk_errors.iter().map(|(k, v)| format!("{k} {v}")).collect();
+    let walk = format!(
+        "      start-state walk: exact {}, registers differing in {} frames ({} in all: {}), CP fields or stack differing {}, not walked: {}\n",
+        s.walk_exact,
+        s.walk_diff.0,
+        s.walk_diff.1,
+        wregs.join(", "),
+        s.walk_fields,
+        if werr.is_empty() { "-".into() } else { werr.join(", ") }
+    );
+    walk + &format!(
         "    frame probe ({n} frames): first own flush after p10 {:.1}, p50 {:.1}, p90 {:.1} ms ({} frames without one) of frames p50 {:.1} ms; share of the frame before it p10 {:.2}, p50 {:.2}, p90 {:.2}; commands before it p50 {:.0}; why: {}\n      registers differing from the frame before at the start p50 {:.0}, p90 {:.0}; not yet set at the first command p50 {:.0}, p90 {:.0}, max {:.0}; most often: {}\n",
         pct(flushed.clone(), 0.1),
         pct(flushed.clone(), 0.5),

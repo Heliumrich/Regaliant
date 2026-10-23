@@ -2163,6 +2163,9 @@ fn worker(q: &'static Queue, name: &str) {
         }
         cp.submitted_at = Some(batch.at);
         cp.new_submission();
+        if q.id == GFX && frameprobe::on() {
+            frameprobe::submission(&batch.bufs);
+        }
         let nbufs = batch.bufs.len();
         for (i, &(addr, size)) in batch.bufs.iter().enumerate() {
             cp.next_in_submission = i + 1 < nbufs;
