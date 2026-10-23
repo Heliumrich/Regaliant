@@ -1388,6 +1388,7 @@ fn long_wait(waiter: &str, a: u64, wide: bool, func: u32, mask: u64, reference: 
         return;
     }
     let (by, wv, wpk) = last_write(a).unwrap_or_else(|| ("cpu".into(), 0, 0));
+    super::hitch::note_since(super::hitch::Kind::CpWait, t0, || format!("label {a:#x} written by {by}"));
     let p = PROMISES.lock().as_ref().and_then(|m| m.get(&a).copied());
     let slot = match (kind, p) {
         (b'P', _) => 4,

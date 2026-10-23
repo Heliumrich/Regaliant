@@ -673,6 +673,7 @@ fn gfx_pipe_create(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, pu
     if p.push {
         super::PIPES_PUSH[1].fetch_add(1, Ordering::Relaxed);
     }
+    super::super::hitch::note_since(super::super::hitch::Kind::Pipeline, t0, || format!("vs {:#x} ps {:#x}", vs.1, ps.map_or(0, |p| p.1)));
     let ms = t0.elapsed().as_millis();
     if ms >= 200 {
         crate::info!("gpu: graphics pipeline for vs {:#x} ps {:#x} took {ms} ms", vs.1, ps.map_or(0, |p| p.1));

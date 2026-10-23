@@ -1708,6 +1708,7 @@ fn format_resources(insts: &[rdna::Inst], plan: &Plan) -> u64 {
 fn translate_kept(addr: u64, insts: &[rdna::Inst], plan: &Arc<Plan>, plan_key: u64, spec_hash: u64, spec: &Spec, key_spec: Spec) -> Result<Arc<Translated>, String> {
     let t0 = std::time::Instant::now();
     let out = translate::translate(insts, plan, spec).map_err(|e| format!("{:?} shader {addr:#x}: {e}", spec.stage))?;
+    super::hitch::note_since(super::hitch::Kind::Translate, t0, || format!("{:?} {addr:#x}", spec.stage));
     let ms = t0.elapsed().as_millis();
     if ms >= 100 {
         crate::info!("{:?} shader {addr:#x}: translated in {ms} ms ({} instructions, {} SPIR-V words)", spec.stage, insts.len(), out.spirv.len());

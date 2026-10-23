@@ -1227,6 +1227,7 @@ fn compute_pipe_create(tr: &super::shaders::Translated, addr: u64, push_mode: bo
         PIPES_PUSH[0].fetch_add(1, Ordering::Relaxed);
     }
     super::pstats::report(pipe.pipeline, &format!("cs {:#x}", addr));
+    super::hitch::note_since(super::hitch::Kind::Pipeline, t0, || format!("cs {addr:#x}"));
     let ms = t0.elapsed().as_millis();
     if ms >= 200 {
         crate::info!("gpu: compute pipeline for cs {:#x} ({} SPIR-V words) took {ms} ms", addr, tr.out.spirv.len());
@@ -3539,6 +3540,7 @@ pub fn wait_done_for(seq: u64, max: std::time::Duration) -> bool {
 
 /// Blocks until batch `seq` and all earlier ones completed (with their actions).
 pub fn wait_done(seq: u64) {
+    let t0 = std::time::Instant::now();
     let mut d = DONE.lock();
     while *d < seq {
         if super::shutting_down() {
@@ -3546,6 +3548,8 @@ pub fn wait_done(seq: u64) {
         }
         DONE_CV.wait_for(&mut d, std::time::Duration::from_millis(100));
     }
+    drop(d);
+    super::hitch::note_since(super::hitch::Kind::GpuWait, t0, || format!("batch {seq}"));
 }
 
 /// Queues a batch: `submit` runs (the vkQueueSubmit) under the queue lock so

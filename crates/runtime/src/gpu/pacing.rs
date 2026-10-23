@@ -1,7 +1,7 @@
 //! Frame pacing: the intervals between presented flips (host time at the
 //! vblank that shows each frame), for the `frametimes` control command
 //! (statistics since the last one; flips/s alone hide stalls and uneven
-//! frames).
+//! frames), with the window's hitches by cause (`gpu::hitch`).
 
 use parking_lot::Mutex;
 
@@ -27,11 +27,14 @@ pub fn note_flip(n: u64, us: u64) {
         }
     }
     s.last = Some((us, n));
+    drop(s);
+    super::hitch::flip(n, us);
 }
 
 /// The window's statistics (one line), and a new window.
 pub fn report_and_reset() -> String {
     let iv = std::mem::take(&mut STATE.lock().intervals);
+    let hitches = super::hitch::window_report_and_reset();
     if iv.is_empty() {
         return "no flips".into();
     }
@@ -54,7 +57,7 @@ pub fn report_and_reset() -> String {
     worst.sort_by(|a, b| b.0.cmp(&a.0));
     let worst: Vec<String> = worst.iter().take(5).map(|&(d, f)| format!("{:.0} ms (flip {f})", d as f64 / 1000.0)).collect();
     format!(
-        "{n} intervals, {:.2} flips/s; ms mean {:.1}, p50 {:.1}, p90 {:.1}, p99 {:.1}, max {:.1}; by vblanks {}; stalls (>2x median) {} ({:.0} ms); worst {}",
+        "{n} intervals, {:.2} flips/s; ms mean {:.1}, p50 {:.1}, p90 {:.1}, p99 {:.1}, max {:.1}; by vblanks {}; stalls (>2x median) {} ({:.0} ms); worst {}; {hitches}",
         n as f64 * 1000.0 / total,
         total / n as f64,
         median,

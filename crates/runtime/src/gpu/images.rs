@@ -1603,6 +1603,7 @@ impl Images {
         let r = self.upload_inner(image, key, t, only, all);
         if let Ok((_, n)) = &r {
             self.upload_bytes += n;
+            super::hitch::note_since(super::hitch::Kind::Upload, t0, || format!("{}x{} {} KiB", key.width, key.height, n >> 10));
         }
         self.upload_ns += t0.elapsed().as_nanos() as u64;
         r

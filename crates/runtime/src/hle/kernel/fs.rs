@@ -384,6 +384,7 @@ pub fn pread_fd(fd: i32, buf: &mut [u8], off: u64) -> Result<usize, i32> {
     let f = get_fd(fd).ok_or(EBADF)?;
     match &f.kind {
         Kind::File { file, .. } => {
+            let t0 = std::time::Instant::now();
             // The kernel writes the buffer: write-tracked pages cannot fault.
             let _w = crate::gpu::track::host_write(buf.as_ptr() as u64, buf.len() as u64);
             crate::gpu::exec::trace_writes(|| format!("file read (fd {fd}) [{off:#x}]"), buf.as_ptr() as u64, buf.len() as u64);
@@ -400,6 +401,7 @@ pub fn pread_fd(fd: i32, buf: &mut [u8], off: u64) -> Result<usize, i32> {
             if crate::hle::iostat::note("kernel", &f.path, crate::hle::iostat::What::Read, done as u64) {
                 crate::info!("read '{}' [{off:#x}+{:#x}] -> {done:#x} bytes", f.path, buf.len());
             }
+            crate::gpu::hitch::note_since(crate::gpu::hitch::Kind::File, t0, || format!("read '{}' {} KiB", f.path, done >> 10));
             Ok(done)
         }
         Kind::Dir { .. } => Err(EISDIR),
@@ -428,6 +430,7 @@ pub fn pwrite_fd(fd: i32, data: &[u8], off: Option<u64>) -> Result<usize, i32> {
             if !writable {
                 return Err(EBADF);
             }
+            let t0 = std::time::Instant::now();
             let mut pos = f.pos.lock();
             let at = off.unwrap_or(*pos);
             let mut done = 0;
@@ -441,6 +444,7 @@ pub fn pwrite_fd(fd: i32, data: &[u8], off: Option<u64>) -> Result<usize, i32> {
             if off.is_none() {
                 *pos = at + done as u64;
             }
+            crate::gpu::hitch::note_since(crate::gpu::hitch::Kind::File, t0, || format!("write '{}' {} KiB", f.path, done >> 10));
             Ok(done)
         }
         Kind::Dir { .. } => Err(EISDIR),

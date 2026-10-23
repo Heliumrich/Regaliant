@@ -13,6 +13,7 @@ pub mod desc;
 pub mod emucheck;
 pub mod frameahead;
 pub mod frameprobe;
+pub mod hitch;
 pub mod keep;
 pub mod runprobe;
 pub mod smalltrack;
