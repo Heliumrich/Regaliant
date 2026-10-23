@@ -1069,7 +1069,7 @@ fn scrubber() {
     super::profile_this_thread("scrub");
     loop {
         let marks = super::tune::tex_scrub_mode() == 2;
-        std::thread::sleep(std::time::Duration::from_millis(if marks { 10 } else { 2 }));
+        std::thread::sleep(std::time::Duration::from_millis(if marks { super::tune::scrub_ms() } else { 2 }));
         if !scrubbing() || super::shutting_down() {
             continue;
         }
