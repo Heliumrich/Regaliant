@@ -1970,6 +1970,154 @@ fn trace_loads(queue: &str, p: &Prepared, groups: [u32; 3]) {
     }
 }
 
+/// `DS_CULL_CENSUS=<hex shader>` (diagnosis, the culls' experiment): what
+/// that program's dispatches read through their first user-data pointer
+/// (the item block and its first four buffer descriptors), how often an
+/// item's block and descriptors change, the per-mesh buffers' extent; a
+/// summary line every 300 flips.
+fn cull_census(p: &Prepared) {
+    static ADDR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let want = *ADDR.get_or_init(|| std::env::var("DS_CULL_CENSUS").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(u64::MAX));
+    if p.addr != want {
+        return;
+    }
+    #[derive(Default)]
+    struct Item {
+        /// Hashes of the block without its pass pointer (+8), of the four
+        /// descriptors, of the data at the block's +24 pointer, and the
+        /// pointers at +0, +16, +24, +32.
+        hash: [u64; 4],
+        frames: u32,
+        changes: [u32; 4],
+        last: u64,
+    }
+    #[derive(Default)]
+    struct Census {
+        items: HashMap<u64, Item>,
+        passes: HashMap<u64, u64>,
+        buffers: HashSet<(u64, u64)>,
+        pages: HashSet<u64>,
+        desc_pages: HashSet<u64>,
+        item_pages: HashSet<u64>,
+        in_homes: u64,
+        lo: u64,
+        hi: u64,
+        dispatches: u64,
+        window_dispatches: u64,
+        window_start: u64,
+        window_items: u64,
+        window_changed: [u64; 4],
+        unreadable: u64,
+    }
+    static C: Mutex<Option<Census>> = Mutex::new(None);
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    let rd = |a: u64, n: usize| -> Option<Vec<u32>> {
+        if !super::cp::guest_readable(a, 4 * n as u64) {
+            return None;
+        }
+        Some((0..n).map(|k| unsafe { std::ptr::read_volatile((a + 4 * k as u64) as *const u32) }).collect())
+    };
+    let user = p.user;
+    if user.len() < 2 {
+        return;
+    }
+    let item = user[0] as u64 | (user[1] as u64) << 32;
+    let mut g = C.lock();
+    let c = g.get_or_insert_with(|| Census { lo: u64::MAX, window_start: frame, ..Default::default() });
+    c.dispatches += 1;
+    c.window_dispatches += 1;
+    let Some(block) = rd(item, 10) else {
+        c.unreadable += 1;
+        return;
+    };
+    let fnv = |ws: &[u32]| ws.iter().fold(0xcbf29ce484222325u64, |h, &w| (h ^ w as u64).wrapping_mul(0x100000001b3));
+    let mut desc = Vec::with_capacity(16);
+    for i in 0..4 {
+        if let Some(Some(a)) = p.res_addrs.get(i) {
+            desc.extend(rd(*a, 4).unwrap_or_default());
+            c.desc_pages.insert(a & !0xFFF);
+        }
+    }
+    let p24 = block[6] as u64 | (block[7] as u64) << 32;
+    let data24 = rd(p24, 6).unwrap_or_default();
+    let ptrs = [block[0], block[1], block[4], block[5], block[6], block[7], block[8], block[9]];
+    c.item_pages.insert(item & !0xFFF);
+    let mut wo_pass = block.clone();
+    wo_pass[2] = 0;
+    wo_pass[3] = 0;
+    let hash = [fnv(&wo_pass), fnv(&desc), fnv(&data24), fnv(&ptrs)];
+    let e = c.items.entry(item).or_default();
+    for k in 0..4 {
+        if e.frames != 0 && e.hash[k] != hash[k] {
+            e.changes[k] += 1;
+            c.window_changed[k] += 1;
+        }
+    }
+    e.hash = hash;
+    if e.last != frame + 1 {
+        e.frames += 1;
+        e.last = frame + 1;
+        c.window_items += 1;
+    }
+    let pass = block[2] as u64 | (block[3] as u64) << 32;
+    *c.passes.entry(pass).or_default() += 1;
+    for i in 0..4 {
+        if let Some(Resolved::Buffer(v)) = p.resources.get(i) {
+            let size = if v.stride != 0 { v.stride as u64 * v.num_records as u64 } else { v.num_records as u64 };
+            if size != 0 && c.buffers.insert((v.base, size)) {
+                c.lo = c.lo.min(v.base);
+                c.hi = c.hi.max(v.base + size);
+                if super::homes::overlaps(v.base, size) {
+                    c.in_homes += 1;
+                }
+                let mut q = v.base & !0xFFF;
+                while q < v.base + size {
+                    c.pages.insert(q);
+                    q += 0x1000;
+                }
+            }
+        }
+    }
+    if frame >= c.window_start + 300 {
+        let flips = (frame - c.window_start).max(1);
+        let bytes: u64 = c.buffers.iter().map(|b| b.1).sum();
+        let changed = |k: usize| c.items.values().filter(|i| i.changes[k] > 0).count();
+        let mut passes: Vec<(u64, u64)> = c.passes.iter().map(|(&a, &n)| (a, n)).collect();
+        passes.sort_by_key(|p| std::cmp::Reverse(p.1));
+        let top: Vec<String> = passes.iter().take(4).map(|(a, n)| format!("{a:#x} x{n}")).collect();
+        crate::info!(
+            "cull census {:#x}: {:.0} dispatches/flip over {flips} flips; items {} in all ({:.0}/flip seen); items changed (block without +8 / descriptors / +24 data / pointers): {} / {} / {} / {} ever, {} / {} / {} / {} changes this window; pass blocks {} [{}]; per-mesh buffers {} ({:.1} MiB, pages {:.1} MiB in {:#x}..{:#x}, {} in homes); item pages {}, descriptor pages {}; unreadable {}",
+            want,
+            c.window_dispatches as f64 / flips as f64,
+            c.items.len(),
+            c.window_items as f64 / flips as f64,
+            changed(0),
+            changed(1),
+            changed(2),
+            changed(3),
+            c.window_changed[0],
+            c.window_changed[1],
+            c.window_changed[2],
+            c.window_changed[3],
+            c.passes.len(),
+            top.join(", "),
+            c.buffers.len(),
+            bytes as f64 / (1 << 20) as f64,
+            (c.pages.len() as u64 * 4096) as f64 / (1 << 20) as f64,
+            c.lo,
+            c.hi,
+            c.in_homes,
+            c.item_pages.len(),
+            c.desc_pages.len(),
+            c.unreadable
+        );
+        c.window_start = frame;
+        c.window_dispatches = 0;
+        c.window_items = 0;
+        c.window_changed = [0; 4];
+    }
+}
+
 /// Descriptor writes of one shader stage.
 #[derive(Default)]
 struct Bound {
@@ -7255,7 +7403,7 @@ impl Exec {
         if len == 0 || base % 4 != 0 || len % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(base, len) {
             return Ok(false);
         }
-        if profiling() {
+        if super::census::on() {
             super::census::note(base, len, super::census::FILL);
         }
         let Some((buffer, start, _)) = span(base, len) else { return Ok(false) };
@@ -8199,7 +8347,7 @@ impl Exec {
         if bytes == 0 || bytes > 65536 || a % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(a, bytes) {
             return false;
         }
-        if profiling() {
+        if super::census::on() {
             super::census::note(a, bytes, super::census::CP_WRITE);
         }
         // Mirror mode: the target pages become host class first (imported
@@ -9229,7 +9377,7 @@ impl Exec {
                         // bytes (data loads read by the shader).
                         let sized = matches!(found.resources[i], Resolved::Buffer(_) | Resolved::Global(_, Some(_)));
                         let read_only = size > 0 && !found.tr.plan.resources[i].written && sized;
-                        if profiling() && size > 0 {
+                        if size > 0 && super::census::on() {
                             use super::census::{RO, RO_UNSIZED, WRITTEN};
                             super::census::note(base, size, if found.tr.plan.resources[i].written { WRITTEN } else if sized { RO } else { RO_UNSIZED });
                         }
@@ -9888,6 +10036,7 @@ impl Exec {
             READ_WAIT_WORDS[if shaders::words_unchanged(&p) { 2 } else { 3 }].fetch_add(1, Ordering::Relaxed);
             p = shaders::prepare_compute(cp, wave64)?;
         }
+        cull_census(&p);
         lap.mark(1);
         // Textures are uploaded from guest memory: earlier GPU writes first.
         let mut textures = std::mem::take(&mut self.tex_scratch);

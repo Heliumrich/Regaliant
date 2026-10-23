@@ -2393,7 +2393,7 @@ pub fn profile_report() -> String {
     s.push_str(&exec::import_window_line());
     s.push_str(&crate::mem::host_calls_line());
     s.push_str(&xwait::status());
-    if exec::profiling_on() {
+    if census::on() {
         s.push_str(&census::status());
     }
     s.push_str(&crate::audio::window_line());

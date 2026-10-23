@@ -9,6 +9,14 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+/// The census runs (`DS_CENSUS=1` with `DS_PROFILE_GPU=1`): its notes (page
+/// bitmaps per binding) cost a cull's bind step +4.2 us and CPU per command
+/// +7% (2026-10-23), so profiles of per-step costs run without it.
+pub fn on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| super::exec::profiling_on() && std::env::var("DS_CENSUS").ok().as_deref() == Some("1"))
+}
+
 /// Use kinds (bits of a window's flags).
 pub const RO: u32 = 1;
 pub const RO_UNSIZED: u32 = 2;
