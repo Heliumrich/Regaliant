@@ -11,6 +11,7 @@ pub mod capture;
 pub mod cp;
 pub mod desc;
 pub mod emucheck;
+pub mod keep;
 pub mod smalltrack;
 /// Run-time switches for A/B measurements within one run (`tune <name>
 /// <value>`; slowly varying load from other GPU users cancels out), each
@@ -27,7 +28,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 160] = [
+    static ALL: [Tunable; 161] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -188,6 +189,7 @@ pub mod tune {
         Tunable { name: "skip_steps", env: "DS_SKIP_STEPS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "stencil_export", env: "DS_STENCIL_EXPORT", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_share_min", env: "DS_SHADOW_SHARE_MIN", default: 16384, value: AtomicU64::new(UNSET) },
+        Tunable { name: "keep_small", env: "DS_KEEP_SMALL", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1727,6 +1729,15 @@ pub mod tune {
     #[inline]
     pub fn shadow_share_min() -> u64 {
         get(159)
+    }
+
+    /// Small written windows (under 256 KiB, where dispatches got per-batch
+    /// shadows) kept in video memory across batches, written back to guest
+    /// memory only for readers there (`gpu::keep`); 0 off (windows kept so
+    /// far are written back and dropped by their queues).
+    #[inline]
+    pub fn keep_small() -> bool {
+        get(160) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

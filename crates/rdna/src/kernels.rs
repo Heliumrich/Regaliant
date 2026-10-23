@@ -98,6 +98,111 @@ fn build_merge() -> Result<Vec<u32>, rspirv::dr::Error> {
     Ok(b.module().assemble())
 }
 
+/// The sync of a kept window (`gpu::keep`), for dword indices `first..end`
+/// (push constants `{first, end, give}`), with binding 0 guest memory,
+/// binding 1 the pristine copy (what guest memory and the video-memory copy
+/// last agreed on) and binding 2 the video-memory copy: a dword the CPU
+/// changed (guest memory differs from the pristine copy) goes to the copy and
+/// the pristine copy, whatever the GPU did (the title rewrites memory after
+/// the GPU is done with it: ring allocations); with `give` set, a dword only
+/// the GPU changed goes to guest memory and the pristine copy. Dwords neither
+/// side changed are left alone (MERGE_LOCAL_SIZE per workgroup).
+pub fn keep_sync() -> Vec<u32> {
+    build_sync().expect("keep sync kernel")
+}
+
+fn build_sync() -> Result<Vec<u32>, rspirv::dr::Error> {
+    let lit = Operand::LiteralBit32;
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.extension("SPV_KHR_storage_buffer_storage_class");
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+    let void = b.type_void();
+    let bool_ = b.type_bool();
+    let u32t = b.type_int(32, 0);
+    let v3 = b.type_vector(u32t, 3);
+    let rta = b.type_runtime_array(u32t);
+    b.decorate(rta, Decoration::ArrayStride, [lit(4)]);
+    let st = b.type_struct([rta]);
+    b.decorate(st, Decoration::Block, []);
+    b.member_decorate(st, 0, Decoration::Offset, [lit(0)]);
+    let p_st = b.type_pointer(None, StorageClass::StorageBuffer, st);
+    let p_u = b.type_pointer(None, StorageClass::StorageBuffer, u32t);
+    let pc = b.type_struct([u32t, u32t, u32t]);
+    b.decorate(pc, Decoration::Block, []);
+    for k in 0..3 {
+        b.member_decorate(pc, k, Decoration::Offset, [lit(4 * k)]);
+    }
+    let p_pc = b.type_pointer(None, StorageClass::PushConstant, pc);
+    let p_pcu = b.type_pointer(None, StorageClass::PushConstant, u32t);
+    let p_in = b.type_pointer(None, StorageClass::Input, v3);
+    let gid = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(gid, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let mut bufs = [0; 3];
+    for (i, v) in bufs.iter_mut().enumerate() {
+        *v = global(&mut b, p_st, StorageClass::StorageBuffer);
+        b.decorate(*v, Decoration::DescriptorSet, [lit(0)]);
+        b.decorate(*v, Decoration::Binding, [lit(i as u32)]);
+    }
+    let pcv = global(&mut b, p_pc, StorageClass::PushConstant);
+    let c0 = b.constant_bit32(u32t, 0);
+    let c1 = b.constant_bit32(u32t, 1);
+    let c2 = b.constant_bit32(u32t, 2);
+    let fty = b.type_function(void, []);
+    let f = b.begin_function(void, None, FunctionControl::NONE, fty)?;
+    b.begin_block(None)?;
+    let g = b.load(v3, None, gid, None, [])?;
+    let x = b.composite_extract(u32t, None, g, [0])?;
+    let pf = b.access_chain(p_pcu, None, pcv, [c0])?;
+    let first = b.load(u32t, None, pf, None, [])?;
+    let pe = b.access_chain(p_pcu, None, pcv, [c1])?;
+    let end = b.load(u32t, None, pe, None, [])?;
+    let pg = b.access_chain(p_pcu, None, pcv, [c2])?;
+    let give = b.load(u32t, None, pg, None, [])?;
+    let i = b.i_add(u32t, None, x, first)?;
+    let inside = b.u_less_than(bool_, None, i, end)?;
+    let (l_body, l_cpu, l_else, l_gpu, l_join2, l_join, l_end) = (b.id(), b.id(), b.id(), b.id(), b.id(), b.id(), b.id());
+    b.selection_merge(l_end, SelectionControl::NONE)?;
+    b.branch_conditional(inside, l_body, l_end, [])?;
+    b.begin_block(Some(l_body))?;
+    let ph = b.access_chain(p_u, None, bufs[0], [c0, i])?;
+    let h = b.load(u32t, None, ph, None, [])?;
+    let pp = b.access_chain(p_u, None, bufs[1], [c0, i])?;
+    let p = b.load(u32t, None, pp, None, [])?;
+    let pw = b.access_chain(p_u, None, bufs[2], [c0, i])?;
+    let w = b.load(u32t, None, pw, None, [])?;
+    let cpu = b.i_not_equal(bool_, None, h, p)?;
+    b.selection_merge(l_join, SelectionControl::NONE)?;
+    b.branch_conditional(cpu, l_cpu, l_else, [])?;
+    // The CPU changed it: the copy follows.
+    b.begin_block(Some(l_cpu))?;
+    b.store(pw, h, None, [])?;
+    b.store(pp, h, None, [])?;
+    b.branch(l_join)?;
+    // Only the GPU changed it: back to guest memory when giving.
+    b.begin_block(Some(l_else))?;
+    let giving = b.i_not_equal(bool_, None, give, c0)?;
+    let gpu = b.i_not_equal(bool_, None, w, p)?;
+    let both = b.logical_and(bool_, None, giving, gpu)?;
+    b.selection_merge(l_join2, SelectionControl::NONE)?;
+    b.branch_conditional(both, l_gpu, l_join2, [])?;
+    b.begin_block(Some(l_gpu))?;
+    b.store(ph, w, None, [])?;
+    b.store(pp, w, None, [])?;
+    b.branch(l_join2)?;
+    b.begin_block(Some(l_join2))?;
+    b.branch(l_join)?;
+    b.begin_block(Some(l_join))?;
+    b.branch(l_end)?;
+    b.begin_block(Some(l_end))?;
+    b.ret()?;
+    b.end_function()?;
+    b.entry_point(ExecutionModel::GLCompute, f, "main", [gid]);
+    b.execution_mode(f, ExecutionMode::LocalSize, [MERGE_LOCAL_SIZE, 1, 1]);
+    Ok(b.module().assemble())
+}
+
 /// Dwords per entry of `shadow_merge_many`'s table.
 pub const MERGE_ENTRY_DWORDS: u32 = 8;
 /// Entries one `shadow_merge_many` dispatch takes (its search's reach).

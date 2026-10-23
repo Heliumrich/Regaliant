@@ -438,7 +438,7 @@ pub fn compute(p: &Prepared, groups: [u32; 3], local: [u32; 3], busy: impl Fn(&[
     }
     let src_bytes = (in_src - 1) * src.stride as u64 + 4;
     let inputs = [(cb.base, 8), (src.base, src_bytes)];
-    if busy(&inputs) || super::homes::any_stale(&inputs) || !super::cp::guest_readable(src.base, src_bytes) {
+    if busy(&inputs) || super::homes::any_stale(&inputs) || super::keep::any_dirty(&inputs) || !super::cp::guest_readable(src.base, src_bytes) {
         return refuse();
     }
     let src_words: Vec<u32> = (0..in_src).map(|j| unsafe { std::ptr::read_volatile((src.base + j * src.stride as u64) as *const u32) }).collect();
