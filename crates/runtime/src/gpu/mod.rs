@@ -14,6 +14,7 @@ pub mod emucheck;
 pub mod frameahead;
 pub mod frameprobe;
 pub mod keep;
+pub mod runprobe;
 pub mod smalltrack;
 /// Run-time switches for A/B measurements within one run (`tune <name>
 /// <value>`; slowly varying load from other GPU users cancels out), each
@@ -2494,6 +2495,7 @@ pub fn reset_profile() {
     RUN_AHEAD.lock().clear();
     frameprobe::reset();
     frameahead::reset();
+    runprobe::reset();
     crate::mem::reset_host_calls();
     threadcpu::reset_window();
     crate::audio::reset_window();
@@ -2536,6 +2538,9 @@ pub fn profile_report() -> String {
         s.push_str(&frameprobe::report());
     }
     s.push_str(&frameahead::status());
+    if runprobe::on() {
+        s.push_str(&runprobe::report());
+    }
     s
 }
 

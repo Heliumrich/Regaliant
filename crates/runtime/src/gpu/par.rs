@@ -109,6 +109,8 @@ pub struct Done {
     /// TSC cycles each command recorded took, in order (`tune par_cost`;
     /// the first one with the chunk's setup).
     pub costs: Vec<u32>,
+    /// What its batches write (`DS_RUN_PROBE` only).
+    pub writes: super::ranges::Ranges,
 }
 
 /// The chunks of a parallel run that the workers record (all but the main
@@ -497,11 +499,12 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
             return;
         }
         let done = if failed {
-            Done { stopped, state: *state, last: None, why: "failed", costs: Vec::new() }
+            Done { stopped, state: *state, last: None, why: "failed", costs: Vec::new(), writes: Default::default() }
         } else {
+            let writes = if super::runprobe::on() { cp.worker_writes() } else { Default::default() };
             let last = cp.worker_submit();
             let why = if stopped.is_some() { cp.worker_stop_why() } else { "" };
-            Done { stopped, state: cp.chunk_state(), last, why, costs: cp.chunk_costs.take().unwrap_or_default() }
+            Done { stopped, state: cp.chunk_state(), last, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes }
         };
         drop(cp);
         run.results.lock()[i] = Some(done);

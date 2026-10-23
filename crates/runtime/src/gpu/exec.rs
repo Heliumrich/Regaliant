@@ -6229,6 +6229,9 @@ impl Exec {
         if !self.recording {
             return;
         }
+        if super::runprobe::on() && self.name == "gpu-gfx" {
+            super::runprobe::stop(why);
+        }
         if super::shutting_down() {
             self.discard();
             return;
@@ -7844,6 +7847,9 @@ impl Exec {
         if super::frameprobe::on() && self.name == "gpu-gfx" {
             super::frameprobe::flushed(self.flush_why);
         }
+        if super::runprobe::on() && self.name == "gpu-gfx" {
+            super::runprobe::stop("flush");
+        }
         let t0 = profiling().then(std::time::Instant::now);
         self.submit_for("sync");
         let tw = super::timeline::wait_start();
@@ -7916,6 +7922,9 @@ impl Exec {
         }
         if let (Some(w), true) = (write, self.name == "gpu-gfx") {
             super::frameahead::a_wrote(&[w]);
+        }
+        if super::runprobe::on() && self.name == "gpu-gfx" {
+            super::runprobe::stop("CP effect");
         }
         if self.deferred {
             crate::error!("gpu[{}]: a CP effect in a parallel run (performed now)", self.name);
@@ -8054,6 +8063,9 @@ impl Exec {
     }
 
     pub fn sync_for(&mut self, reads: &[(u64, u64)], why: usize) -> bool {
+        if super::runprobe::on() && self.name == "gpu-gfx" {
+            super::runprobe::reads(reads);
+        }
         if super::xwait::on() {
             super::xwait::note_reads(&self.name, reads, why);
         }
@@ -9504,6 +9516,15 @@ impl Exec {
     /// Batches closed and held (not submitted).
     pub fn closed_count(&self) -> usize {
         self.closed.len()
+    }
+
+    /// What the closed batches write.
+    pub fn closed_writes(&self) -> super::ranges::Ranges {
+        let mut r = super::ranges::Ranges::new();
+        for b in &self.closed {
+            r.extend(&b.writes);
+        }
+        r
     }
 
     /// Stops a deferred executor's chunk (see `deferred`).

@@ -476,6 +476,8 @@ struct ParRun {
     sig: u64,
     n: usize,
     firsts: Vec<usize>,
+    /// What its chunks' batches write (`DS_RUN_PROBE` only).
+    writes: super::ranges::Ranges,
 }
 
 /// Commands per chunk at least (a third of `tune par_min`, the commands a
@@ -1857,6 +1859,11 @@ impl Cp {
         }
     }
 
+    /// What the batches this worker closed write (`DS_RUN_PROBE`).
+    pub fn worker_writes(&self) -> super::ranges::Ranges {
+        self.exec.as_ref().map(|e| e.closed_writes()).unwrap_or_default()
+    }
+
     /// Submits the batches this worker closed (the main command processor,
     /// in program order); the last one's sequence.
     pub fn worker_submit(&mut self) -> Option<u64> {
@@ -2221,7 +2228,7 @@ impl Cp {
         lap.mark(10);
         super::par::RUNS.fetch_add(1, Ordering::Relaxed);
         super::par::CHUNKS.fetch_add(starts.len() as u64, Ordering::Relaxed);
-        self.par = Some(ParRun { starts, end: run_end, next: 0, run, waited_ns: 0, sync, sig, n, firsts });
+        self.par = Some(ParRun { starts, end: run_end, next: 0, run, waited_ns: 0, sync, sig, n, firsts, writes: Default::default() });
         lap.mark(5);
         PLAN_PHASES[6].fetch_add(1, Ordering::Relaxed);
     }
@@ -2252,9 +2259,18 @@ impl Cp {
         match self.par.as_mut() {
             Some(pr) if last => {
                 super::par::note_main_wait(pr.waited_ns + waited);
+                if self.main_gfx && super::runprobe::on() {
+                    pr.writes.extend(&done.writes);
+                    super::runprobe::run_end(pr.waited_ns + waited, std::mem::take(&mut pr.writes));
+                }
                 self.par = None;
             }
-            Some(pr) => pr.waited_ns += waited,
+            Some(pr) => {
+                pr.waited_ns += waited;
+                if !done.writes.is_empty() {
+                    pr.writes.extend(&done.writes);
+                }
+            }
             None => {}
         }
         if done.stopped.is_some() {
@@ -4809,6 +4825,9 @@ impl Cp {
                     }
                     if self.name == "gpu-gfx" {
                         super::frameahead::flipped(self);
+                        if super::runprobe::on() {
+                            super::runprobe::flip();
+                        }
                     }
                 }
             }
