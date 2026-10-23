@@ -999,6 +999,9 @@ pub struct Images {
     /// waiting (command buffer, fence, the staging buffer it reads; oldest
     /// first) and the command buffers and fences of completed ones.
     staging_free: Vec<Staging>,
+    /// The staging buffer of uploads waited for (`tune upload_async` 0):
+    /// kept and grown, not allocated and freed per upload.
+    sync_staging: Option<Staging>,
     inflight: std::collections::VecDeque<(vk::CommandBuffer, vk::Fence, Staging)>,
     spare_cmds: Vec<(vk::CommandBuffer, vk::Fence)>,
     reported: HashMap<String, u64>,
@@ -1196,7 +1199,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
                 .expect("image pool");
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
-            *g = Some(Images { map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), inflight: Default::default(), spare_cmds: Vec::new(), reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default() });
+            *g = Some(Images { map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), sync_staging: None, inflight: Default::default(), spare_cmds: Vec::new(), reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default() });
         }
     }
     let im = g.as_mut().unwrap();
@@ -1856,8 +1859,28 @@ impl Images {
         let st = if asynchronous {
             self.staging(total.max(4) as u64)?
         } else {
-            let (buf, mem, ptr) = ctx().host_buffer(total.max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
-            Staging { buf, mem, ptr, cap: total.max(4) as u64 }
+            // Uploads waited for reuse one staging buffer: allocating and
+            // freeing host-visible memory per upload cost time on the
+            // recording threads (FINDINGS.md 2026-10-23).
+            match self.sync_staging.take() {
+                Some(s) if s.cap >= total as u64 => s,
+                old => {
+                    if let Some(s) = old {
+                        let d = &ctx().device;
+                        unsafe {
+                            d.destroy_buffer(s.buf, None);
+                            d.unmap_memory(s.mem);
+                            d.free_memory(s.mem, None);
+                        }
+                    }
+                    let cap = (total.max(4) as u64).max(1 << 20).next_power_of_two();
+                    let t0 = std::time::Instant::now();
+                    let (buf, mem, ptr) = ctx().host_buffer(cap, vk::BufferUsageFlags::TRANSFER_SRC)?;
+                    super::hitch::note_since(super::hitch::Kind::Upload, t0, || format!("the upload staging buffer grown to {} MiB", cap >> 20));
+                    STAGING_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Staging { buf, mem, ptr, cap }
+                }
+            }
         };
         let dst = unsafe { std::slice::from_raw_parts_mut(st.ptr, total) };
         for &(mip, layer, off, len) in &parts {
@@ -1929,11 +1952,9 @@ impl Images {
         self.one_shot(record);
         let t_free = std::time::Instant::now();
         UPLOAD_SPLIT[2].fetch_add((t_free - t_copy).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        unsafe {
-            c.device.destroy_buffer(buf, None);
-            c.device.unmap_memory(mem);
-            c.device.free_memory(mem, None);
-        }
+        // The GPU is done with it (one_shot waited): kept for the next upload.
+        let _ = (buf, mem);
+        self.sync_staging = Some(st);
         UPLOAD_SPLIT[1].fetch_add(t_free.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         self.uploads += 1;
         Ok((t.base, size))
