@@ -5482,6 +5482,10 @@ pub struct Exec {
     /// current frame's work would see (CPU-side effects, image-cache notes,
     /// fast clears and storage images).
     held: bool,
+    /// The graphics command processor's executor while it records past a
+    /// parallel run (`past_begin`): held, its batches in its own slot
+    /// rotation, until `past_commit` or `past_drop`.
+    past: bool,
     /// Its closed batches' label writes (`open_promise`).
     held_promises: Vec<(u64, u64, u8)>,
     /// Guest ranges it read on the CPU while recording (stage preparations,
@@ -5710,6 +5714,9 @@ struct Closed {
     /// (`Exec::mm_own`).
     eager_action: Option<Action>,
     mm_own: Option<std::sync::Arc<super::resident::Owned>>,
+    /// A held executor's label writes in it (address, value, bytes):
+    /// promised when it is submitted.
+    promises: Vec<(u64, u64, u8)>,
 }
 
 /// Slot sequence of a batch closed but not yet submitted.
@@ -5836,6 +5843,7 @@ impl Exec {
                 sync_culprit: None,
                 deferred: false,
                 held: false,
+                past: false,
                 held_promises: Vec::new(),
                 held_reads: Vec::new(),
                 held_clears: HashMap::new(),
@@ -6022,7 +6030,13 @@ impl Exec {
         if self.open_gen.load(Ordering::Relaxed) == u64::MAX {
             self.open_gen.store(SPAN_GEN.load(Ordering::SeqCst), Ordering::SeqCst);
         }
-        if self.deferred {
+        if self.past && self.slots.get(self.cur).is_some_and(|s| s.seq == PENDING) {
+            // Recording past a run: a slot holding one of its held batches
+            // came round again.
+            self.stop("no batch slot");
+            return;
+        }
+        if self.deferred && !self.past {
             // A slot whose batch is closed but not submitted cannot be reused,
             // and one whose batch the GPU still executes would make the chunk
             // wait for it (a worker records several chunks of a run): a free
@@ -6343,15 +6357,20 @@ impl Exec {
             ch.overwritten = self.pending_log.get(ch.writes_mark..).unwrap_or(&[]).iter().any(|&(w, m)| w < a + n && a < w + m);
         }
         if self.deferred {
-            if self.held && !has_actions {
-                // Its later waits pass on them (`open_promise`).
-                self.held_promises.append(&mut self.pending_promises);
-            } else if has_actions || !self.pending_promises.is_empty() {
-                crate::error!("gpu[{}]: CP effects in a parallel run (dropped)", self.name);
-            }
+            let promises = if self.held && !has_actions {
+                // Its later waits pass on them (`open_promise`); promised
+                // when the batch is submitted (`submit_closed`).
+                self.held_promises.extend_from_slice(&self.pending_promises);
+                std::mem::take(&mut self.pending_promises)
+            } else {
+                if has_actions || !self.pending_promises.is_empty() {
+                    crate::error!("gpu[{}]: CP effects in a parallel run (dropped)", self.name);
+                }
+                Vec::new()
+            };
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
             self.keep_submitted(0);
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take() });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises });
             self.res_mine.clear();
             self.stage_used = 0;
             self.slots[i].seq = PENDING;
@@ -8472,13 +8491,19 @@ impl Exec {
 
     /// `overlaps_pending` without pruning (a shared borrow).
     fn overlaps_pending_ro(&self, reads: &[(u64, u64)]) -> bool {
-        self.pending.overlaps_any(reads) || self.inflight.latest(reads, done_seq()).is_some() || self.main_pending(reads)
+        self.pending.overlaps_any(reads) || self.inflight.latest(reads, done_seq()).is_some() || self.main_pending(reads) || self.closed_overlap(reads)
     }
 
     fn overlaps_pending(&mut self, reads: &[(u64, u64)]) -> bool {
         let done = done_seq();
         self.inflight.prune(done);
-        self.pending.overlaps_any(reads) || self.inflight.latest(reads, done).is_some() || self.main_pending(reads)
+        self.pending.overlaps_any(reads) || self.inflight.latest(reads, done).is_some() || self.main_pending(reads) || self.closed_overlap(reads)
+    }
+
+    /// Whether a closed batch not yet submitted (a deferred executor's)
+    /// writes into `reads`.
+    fn closed_overlap(&self, reads: &[(u64, u64)]) -> bool {
+        !self.closed.is_empty() && self.closed.iter().any(|b| b.writes.overlaps_any(reads))
     }
 
     /// A worker's: whether `reads` overlap what the main command processor's
@@ -8594,8 +8619,9 @@ impl Exec {
         if let Some((v, n)) = label {
             self.pending_promises.push((a, v, n));
             // (The frame-ahead recorder's come after the current frame's
-            // work: nothing it holds is submitted on request.)
-            if !self.held {
+            // work: nothing it holds is submitted on request. Past a run, a
+            // request ends the stretch: `Cp::run` settles it and submits.)
+            if !self.held || self.past {
                 UNSUBMITTED_LABELS.lock().get_or_insert_with(HashMap::new).insert(a & !7, self.submit_request.clone());
                 // Another queue already blocks on it: submit at the next packet.
                 if super::tune::label_early() && super::cp::waited_now(a) {
@@ -9440,6 +9466,75 @@ impl Exec {
         self.held = true;
     }
 
+    /// The graphics command processor goes on past a parallel run before
+    /// collecting its chunks (`Cp::past_start`): held from here (its own
+    /// slots; its batch before the run was submitted).
+    pub fn past_begin(&mut self) {
+        self.deferred = true;
+        self.held = true;
+        self.past = true;
+        self.held_reset();
+    }
+
+    /// What it recorded past the run holds (`Cp::past_settle`): its closed
+    /// batches go to the GPU after the run's chunks', with their label
+    /// writes; its image notes go to the image cache; the open batch goes
+    /// on as an ordinary one.
+    pub fn past_commit(&mut self) {
+        self.deferred = false;
+        self.held = false;
+        self.past = false;
+        self.stopped = false;
+        self.stop_why = "";
+        if !self.held_clears.is_empty() || !self.held_over.is_empty() {
+            let (c, o) = (std::mem::take(&mut self.held_clears), std::mem::take(&mut self.held_over));
+            super::images::with(|im| im.apply_held(&c, &o));
+        }
+        // The open batch's label writes can be asked for now (`gpu_cp_write`).
+        if self.recording && !self.pending_promises.is_empty() {
+            let mut g = UNSUBMITTED_LABELS.lock();
+            let m = g.get_or_insert_with(HashMap::new);
+            for p in &self.pending_promises {
+                m.insert(p.0 & !7, self.submit_request.clone());
+            }
+        }
+        self.held_promises.clear();
+        self.held_reads.clear();
+        self.held_keys.clear();
+        self.submit_closed();
+    }
+
+    /// What it recorded past the run is dropped (`Cp::past_settle`): its
+    /// closed batches and its open one (begun past the run: the batch
+    /// before it was submitted) never go to the GPU.
+    pub fn past_drop(&mut self) {
+        self.discard_closed();
+        if self.recording {
+            self.discard();
+            let c = ctx();
+            let s = &mut self.slots[self.cur];
+            unsafe {
+                c.device.reset_command_buffer(s.cmd, vk::CommandBufferResetFlags::empty()).ok();
+                c.device.reset_command_buffer(s.pre, vk::CommandBufferResetFlags::empty()).ok();
+                c.device.reset_descriptor_pool(s.desc_pool, vk::DescriptorPoolResetFlags::empty()).ok();
+            }
+            s.homes.clear();
+            s.keep.clear();
+            s.kept.clear();
+            s.seq = 0;
+        }
+        self.deferred = false;
+        self.held = false;
+        self.past = false;
+        self.stopped = false;
+        self.stop_why = "";
+        self.held_clears.clear();
+        self.held_over.clear();
+        self.held_promises.clear();
+        self.held_reads.clear();
+        self.held_keys.clear();
+    }
+
     /// The frame-ahead recorder starts a frame: not stopped, nothing read
     /// or noted.
     pub fn held_reset(&mut self) {
@@ -9596,6 +9691,10 @@ impl Exec {
             }
             super::precache::invalidate_ranges_except(&b.writes, &b.kept);
             self.inflight.insert_all(seq, &b.writes);
+            // (After its writes are noted, as `submit_for` does.)
+            for (a, v, n) in b.promises {
+                super::cp::promise(seq, a, v, n, false);
+            }
             self.own_gen += 1;
             self.last_seq = seq;
             last = Some(seq);

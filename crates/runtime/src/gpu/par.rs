@@ -269,6 +269,29 @@ static STARTS: AtomicU64 = AtomicU64::new(0);
 pub static CANCELLED: AtomicU64 = AtomicU64::new(0);
 static STOP_WHY: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
 
+/// Recording past runs (`tune past_runs`): [runs gone past, committed,
+/// dropped, commands recorded past them, ns from going past to the stop,
+/// ns waited at the stop for the chunks]; stops and drops by reason.
+pub static PAST: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static PAST_STOPS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+static PAST_DROPS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+/// A stretch recorded past a run ended at a stop (`why`); `dropped`: why
+/// it was dropped.
+pub fn note_past(why: &'static str, dropped: Option<&'static str>) {
+    let bump = |l: &Mutex<Vec<(&'static str, u64)>>, w: &'static str| {
+        let mut g = l.lock();
+        match g.iter_mut().find(|e| e.0 == w) {
+            Some(e) => e.1 += 1,
+            None => g.push((w, 1)),
+        }
+    };
+    bump(&PAST_STOPS, why);
+    if let Some(d) = dropped {
+        bump(&PAST_DROPS, d);
+    }
+}
+
 /// Runs the planner saw, by length (commands): [<32, <64, <192, <512,
 /// <2048, more] x [runs, commands]; and by what ended them (PM4 opcode,
 /// 0x100 + private operation, 0x130 buffer end, 0x131 limit, 0x133
@@ -501,7 +524,7 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         let done = if failed {
             Done { stopped, state: *state, last: None, why: "failed", costs: Vec::new(), writes: Default::default() }
         } else {
-            let writes = if super::runprobe::on() { cp.worker_writes() } else { Default::default() };
+            let writes = if super::runprobe::on() || super::tune::past_runs() { cp.worker_writes() } else { Default::default() };
             let last = cp.worker_submit();
             let why = if stopped.is_some() { cp.worker_stop_why() } else { "" };
             Done { stopped, state: cp.chunk_state(), last, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes }
@@ -542,6 +565,11 @@ pub fn reset_stats() {
         c.store(0, Ordering::Relaxed);
     }
     STOP_WHY.lock().clear();
+    for c in &PAST {
+        c.store(0, Ordering::Relaxed);
+    }
+    PAST_STOPS.lock().clear();
+    PAST_DROPS.lock().clear();
     *LENGTHS.lock() = [[0; 2]; 6];
     ENDS.lock().clear();
     *LENGTHS_C.lock() = [[0; 2]; 6];
@@ -579,7 +607,29 @@ pub fn status() -> String {
     let mut why = STOP_WHY.lock().clone();
     why.sort_by(|a, b| b.1.cmp(&a.1));
     let why: Vec<String> = why.iter().map(|(w, n)| format!("{w} {n}")).collect();
-    format!(
+    let past = if PAST[0].load(Ordering::Relaxed) > 0 {
+        let list = |l: &Mutex<Vec<(&'static str, u64)>>| {
+            let mut v = l.lock().clone();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            v.iter().map(|(w, n)| format!("{w} {n}")).collect::<Vec<_>>().join(", ")
+        };
+        let p = |i: usize| PAST[i].load(Ordering::Relaxed);
+        format!(
+            "    recording past runs: {} runs gone past, {} committed, {} dropped ({}), {} commands recorded past them ({:.1} each), {:.0} us from going past to the stop, then {:.0} us waited for the chunks; stops: {}\n",
+            p(0),
+            p(1),
+            p(2),
+            list(&PAST_DROPS),
+            p(3),
+            p(3) as f64 / p(0).max(1) as f64,
+            p(4) as f64 / 1e3 / p(0).max(1) as f64,
+            p(5) as f64 / 1e3 / p(0).max(1) as f64,
+            list(&PAST_STOPS)
+        )
+    } else {
+        String::new()
+    };
+    past + &format!(
         "    parallel runs: {runs} runs ({} split at equal recording cost; {} pre-wakes, {} relayed, spins {} saw their run, {} ran out), {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled, {} worker reads of the main command processor's unsubmitted writes ({} waited {:.0} us on average for its submission); main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}; runs under 32 commands by end {}; compute queues' runs by length {}; by end {}\n",
         super::cp::PAR_COSTED.load(Ordering::Relaxed),
         PREWAKES[0].load(Ordering::Relaxed),

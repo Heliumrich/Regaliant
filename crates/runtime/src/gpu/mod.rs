@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 162] = [
+    static ALL: [Tunable; 164] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -194,6 +194,8 @@ pub mod tune {
         Tunable { name: "shadow_share_min", env: "DS_SHADOW_SHARE_MIN", default: 16384, value: AtomicU64::new(UNSET) },
         Tunable { name: "keep_small", env: "DS_KEEP_SMALL", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "frame_ahead", env: "DS_FRAME_AHEAD", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "past_runs", env: "DS_PAST_RUNS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "past_drop", env: "DS_PAST_DROP", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1753,6 +1755,22 @@ pub mod tune {
         get(161)
     }
 
+    /// The graphics command processor records past its parallel runs
+    /// before collecting their chunks (`Cp::past_start`): its batches after
+    /// a run held until a stop (at the latest its submission's end), then
+    /// submitted after the chunks' or dropped and recorded again; 0 off.
+    #[inline]
+    pub fn past_runs() -> bool {
+        get(162) != 0
+    }
+
+    /// Diagnosis: what it recorded past a run is always dropped (the path
+    /// that records it again, tested).
+    #[inline]
+    pub fn past_drop() -> bool {
+        get(163) != 0
+    }
+
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
     /// without appends).
     #[inline]
@@ -2175,17 +2193,39 @@ fn worker(q: &'static Queue, name: &str) {
             q.done_cv.notify_all();
             continue;
         }
-        cp.submitted_at = Some(batch.at);
-        cp.new_submission();
         if q.id == GFX && frameprobe::on() {
             frameprobe::submission(&batch.bufs);
         }
         if q.id == GFX && frameahead::on() {
             frameahead::post(&cp, batch.index, &batch.bufs, batch.at);
         }
-        let nbufs = batch.bufs.len();
-        for (i, &(addr, size)) in batch.bufs.iter().enumerate() {
+        run_submission(&mut cp, &batch, name);
+        if throttle() || waits_for_completion(&batch.bufs) {
+            cp.finish();
+        }
+        let _g = q.pending.lock();
+        let d = q.done.fetch_add(1, Ordering::SeqCst) + 1;
+        q.done_cv.notify_all();
+        if trace_submit() {
+            crate::info!("submit trace: queue {:#x} #{d} completed ({} ms after submission)", q.id, batch.at.elapsed().as_millis());
+        }
+    }
+}
+
+/// Runs a title submission's command buffers.
+fn run_submission(cp: &mut cp::Cp, batch: &Submission, name: &str) {
+    cp.submitted_at = Some(batch.at);
+    cp.new_submission();
+    let nbufs = batch.bufs.len();
+    // (Recording past a parallel run may go back to an earlier buffer of
+    // the submission: `Cp::take_rewind`.)
+    let mut i = 0usize;
+    let mut from: Option<u64> = None;
+    {
+        while i < nbufs {
+            let (addr, size) = batch.bufs[i];
             cp.next_in_submission = i + 1 < nbufs;
+            cp.cur_buf = i;
             if trace_submit() && size == 277 {
                 // Bink decode command buffers: their counter (dword 272) and
                 // dword 159 at submission and now, and the label the first
@@ -2201,7 +2241,15 @@ fn worker(q: &'static Queue, name: &str) {
                     crate::warn!("gpu[{name}]: command buffer {addr:#x} ({size} dwords) changed between its submission and its execution ({} ms later)", batch.at.elapsed().as_millis());
                 }
             }
-            cp.run(addr, size);
+            match from.take() {
+                Some(a) => cp.run(a, size - ((a - addr) / 4) as u32),
+                None => cp.run(addr, size),
+            }
+            if let Some((j, a)) = cp.take_rewind() {
+                i = j;
+                from = Some(a);
+                continue;
+            }
             if let Some(&h) = batch.hashes.get(i) {
                 if buffer_hash(addr, size) != h {
                     let now = buffer_copy(addr, size);
@@ -2209,15 +2257,7 @@ fn worker(q: &'static Queue, name: &str) {
                     crate::warn!("gpu[{name}]: command buffer {addr:#x} ({size} dwords) changed during its execution ({} ms after submission): {}", batch.at.elapsed().as_millis(), diffs.join(" "));
                 }
             }
-        }
-        if throttle() || waits_for_completion(&batch.bufs) {
-            cp.finish();
-        }
-        let _g = q.pending.lock();
-        let d = q.done.fetch_add(1, Ordering::SeqCst) + 1;
-        q.done_cv.notify_all();
-        if trace_submit() {
-            crate::info!("submit trace: queue {:#x} #{d} completed ({} ms after submission)", q.id, batch.at.elapsed().as_millis());
+            i += 1;
         }
     }
 }

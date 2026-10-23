@@ -337,6 +337,14 @@ pub struct Cp {
     pub(super) held: Option<Box<super::frameahead::HeldCp>>,
     /// The graphics queue's command processor (`gpu-gfx`).
     main_gfx: bool,
+    /// Recording past a parallel run (`tune past_runs`).
+    past: Option<Box<Past>>,
+    /// The index of the submission's command buffer being run (set by the
+    /// queue's worker), and where the worker is to run from next when what
+    /// was recorded past a run is dropped in a later buffer than the run's
+    /// (`take_rewind`: buffer, address).
+    pub cur_buf: usize,
+    rewind: Option<(usize, u64)>,
 }
 
 /// The recording cost of a parallel run's commands as its workers measured
@@ -478,6 +486,53 @@ struct ParRun {
     firsts: Vec<usize>,
     /// What its chunks' batches write (`DS_RUN_PROBE` only).
     writes: super::ranges::Ranges,
+    /// The state at its end, walked when it was planned (`tune
+    /// past_runs`), and the SH registers its last chunk's indirect draws set
+    /// from their arguments (a draw that hands its start instance to Vulkan,
+    /// `tune cpu_args_base`, leaves them as they were: not compared).
+    end_state: Option<ChunkState>,
+    end_unknown: Vec<u32>,
+}
+
+/// The graphics command processor recording past a parallel run before
+/// collecting its chunks (`Cp::past_start`): the run, and what is put back
+/// if what it recorded past the run is dropped.
+struct Past {
+    pr: ParRun,
+    end_state: ChunkState,
+    end_unknown: Vec<u32>,
+    /// The submission's command buffer (`Cp::cur_buf`) the run ended in,
+    /// and whether it may go on into the submission's later ones.
+    buf: usize,
+    across: bool,
+    stack: Vec<Vec<u32>>,
+    markers: Vec<String>,
+    pred: Option<Pred>,
+    fence_pending: bool,
+    began: Instant,
+}
+
+/// Two command-processor states are the same (registers past the shorter
+/// one's held count zero), SH registers `sh_skip` left out.
+fn chunk_states_equal(a: &ChunkState, b: &ChunkState, sh_skip: &[u32]) -> bool {
+    let same = |x: &[u32], y: &[u32]| {
+        let m = x.len().min(y.len());
+        x[..m] == y[..m] && x[m..].iter().all(|&v| v == 0) && y[m..].iter().all(|&v| v == 0)
+    };
+    let sh = if sh_skip.is_empty() {
+        same(&a.regs.sh, &b.regs.sh)
+    } else {
+        let n = a.regs.sh.len().max(b.regs.sh.len());
+        (0..n).all(|i| sh_skip.contains(&(i as u32)) || a.regs.sh.get(i).copied().unwrap_or(0) == b.regs.sh.get(i).copied().unwrap_or(0))
+    };
+    same(&a.regs.ctx, &b.regs.ctx)
+        && sh
+        && same(&a.regs.uc, &b.regs.uc)
+        && a.index_base == b.index_base
+        && a.index_count == b.index_count
+        && a.num_instances == b.num_instances
+        && a.draw_indirect_base == b.draw_indirect_base
+        && a.dispatch_indirect_base == b.dispatch_indirect_base
 }
 
 /// Commands per chunk at least (a third of `tune par_min`, the commands a
@@ -1481,7 +1536,24 @@ impl Cp {
             last_wait_kind: b'-',
             held: None,
             main_gfx: name == "gpu-gfx",
+            past: None,
+            cur_buf: 0,
+            rewind: None,
         }
+    }
+
+    /// Where to run from next (buffer index and address) after a stretch
+    /// recorded past a run was dropped (`past_settle`).
+    pub fn take_rewind(&mut self) -> Option<(usize, u64)> {
+        self.rewind.take()
+    }
+
+    /// Whether recording past a run goes on at the end of the command buffer
+    /// being run into the submission's next one instead of stopping there.
+    /// (Going on into the next submission too lost 2.8%, FINDINGS.md
+    /// 2026-10-23: longer stretches hold work back from the GPU.)
+    fn past_goes_on(&self) -> bool {
+        self.past.as_ref().is_some_and(|p| p.across && self.depth == 1 && self.next_in_submission)
     }
 
     pub fn chunk_state(&self) -> ChunkState {
@@ -1606,6 +1678,7 @@ impl Cp {
             op::COPY_DATA => Some("COPY_DATA"),
             op::REWIND => Some("REWIND"),
             op::COND_EXEC => Some("COND_EXEC"),
+            op::INDIRECT_BUFFER if self.past.is_some() => Some("indirect buffer"),
             _ => None,
         }
     }
@@ -1676,6 +1749,10 @@ impl Cp {
             }
             if spins == 0 && (self.submitted_at.is_some_and(|since| missed_write(a, wide, func, mask, reference, since)) || counter_passed(a, wide, func, mask, reference)) {
                 return self.held_passed(2);
+            }
+            if !self.held.as_ref().is_some_and(|h| h.poll) {
+                self.held_stop("label wait", at);
+                return Flow::Next;
             }
             if super::shutting_down() {
                 return Flow::Stop;
@@ -1816,7 +1893,7 @@ impl Cp {
     /// (`gpu::precache`), unless the label holds what a GPU queue's CP wrote
     /// last (the queues synchronize this way ~250 times per frame).
     fn end_copy_scope_after_wait(&self, a: u64, wide: bool) {
-        if !valid(a, if wide { 8 } else { 4 }) || self.held.is_some() {
+        if !valid(a, if wide { 8 } else { 4 }) || (self.held.is_some() && self.past.is_none()) {
             return;
         }
         if self.last_wait_gpu && super::tune::epoch_gpu_waits() {
@@ -1854,7 +1931,7 @@ impl Cp {
     /// come between submissions, so shared batch-start copies of the
     /// graphics queue are dropped (`gpu::precache`).
     pub fn new_submission(&mut self) {
-        if self.held.is_none() {
+        if self.held.is_none() || self.past.is_some() {
             super::precache::end_scope(0);
         }
     }
@@ -2178,6 +2255,46 @@ impl Cp {
             }
             states.push(Box::new(st.clone()));
         }
+        // The state at the run's end (`tune past_runs`: the graphics command
+        // processor goes on from there before collecting the chunks).
+        let mut end_unknown: Vec<u32> = Vec::new();
+        let end_state = (super::tune::past_runs() && self.main_gfx).then(|| {
+            let mut st = st.clone();
+            let mut c = c;
+            while c < run_end {
+                let h = f.rd(c);
+                if h >> 30 == 2 {
+                    c += 4;
+                    continue;
+                }
+                let count = (h >> 16) & 0x3FFF;
+                if count == 0x3FFF {
+                    c += 4;
+                    continue;
+                }
+                let n = count as u64 + 1;
+                let at = c;
+                let opc = (h >> 8) & 0xFF;
+                let p = |i: u64| f.rd(at + 4 * (1 + i));
+                if matches!(opc, op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT) {
+                    let (vtx_loc, inst_loc) = (p(1) & 0xFFFF, p(1) >> 16);
+                    let inst_loc = if inst_loc != 0 {
+                        inst_loc
+                    } else {
+                        let r = ScanRegs { sh: &st.regs.sh, ctx: &st.regs.ctx };
+                        crate::hle::libs::agc::instance_offset_slot(super::shaders::ngg_addr_of(&r)).map_or(0, |s| 0x8C + s)
+                    };
+                    for r in [vtx_loc, inst_loc] {
+                        if r != 0 && !end_unknown.contains(&r) {
+                            end_unknown.push(r);
+                        }
+                    }
+                }
+                Self::apply_state(&mut st, opc, n, &p);
+                c += 4 * (n + 1);
+            }
+            st
+        });
         lap.mark(4);
         let mut workers = Vec::new();
         for i in 0..k.min(m) {
@@ -2228,7 +2345,7 @@ impl Cp {
         lap.mark(10);
         super::par::RUNS.fetch_add(1, Ordering::Relaxed);
         super::par::CHUNKS.fetch_add(starts.len() as u64, Ordering::Relaxed);
-        self.par = Some(ParRun { starts, end: run_end, next: 0, run, waited_ns: 0, sync, sig, n, firsts, writes: Default::default() });
+        self.par = Some(ParRun { starts, end: run_end, next: 0, run, waited_ns: 0, sync, sig, n, firsts, writes: Default::default(), end_state, end_unknown });
         lap.mark(5);
         PLAN_PHASES[6].fetch_add(1, Ordering::Relaxed);
     }
@@ -2240,6 +2357,9 @@ impl Cp {
     /// state from its end, or from the packet where the worker stopped.
     /// Returns where to continue.
     fn par_collect(&mut self) -> u64 {
+        if self.past_ok() {
+            return self.past_start();
+        }
         let (run, i, to, last) = {
             let pr = self.par.as_mut().unwrap();
             let i = pr.next;
@@ -2292,6 +2412,204 @@ impl Cp {
             }
             None => to,
         }
+    }
+
+    /// Whether to go past the parallel run at its first collect (`tune
+    /// past_runs`): the graphics command processor, its end state walked.
+    fn past_ok(&self) -> bool {
+        super::tune::past_runs()
+            && self.main_gfx
+            && self.held.is_none()
+            && self.exec.is_some()
+            && !super::capture::capturing()
+            && self.par.as_ref().is_some_and(|p| p.next == 0 && p.end_state.is_some())
+    }
+
+    /// Goes past the parallel run: this command processor's work so far to
+    /// the GPU and the first chunk's turn given as at a collect, then on
+    /// from the run's end with its walked end state, the executor held
+    /// (`Exec::past_begin`) until a stop (`past_settle`). Returns the run's
+    /// end.
+    fn past_start(&mut self) -> u64 {
+        let mut pr = self.par.take().unwrap();
+        if pr.sync {
+            self.fence_pending = true;
+        }
+        self.submit_gpu("par");
+        pr.run.grant(0);
+        let end_state = pr.end_state.take().unwrap();
+        let end_unknown = std::mem::take(&mut pr.end_unknown);
+        let end = pr.end;
+        self.set_chunk_state(&end_state);
+        let across = self.depth == 1;
+        self.past = Some(Box::new(Past { pr, end_state, end_unknown, buf: self.cur_buf, across, stack: self.ctx_stack.clone(), markers: self.markers.clone(), pred: self.pred.clone(), fence_pending: self.fence_pending, began: Instant::now() }));
+        self.held = Some(Box::new(super::frameahead::HeldCp { frames: u64::MAX, labels: HashMap::new(), stop: None, commands: 0, waits: [0; 5], poll: false }));
+        if let Some(e) = self.exec.as_mut() {
+            e.past_begin();
+        }
+        super::par::PAST[0].fetch_add(1, Ordering::Relaxed);
+        end
+    }
+
+    /// Recording past a run stopped (`HeldCp::stop`): the run's chunks are
+    /// collected as `par_collect` does and checked: no chunk stopped, the
+    /// end state the same as walked, no CPU read past the run of what the
+    /// chunks wrote, no image used past it with a fast clear or reload
+    /// pending (the chunks note theirs while they record). Then what was
+    /// recorded past the run goes to the GPU after the chunks
+    /// (`Exec::past_commit`) and execution goes on at the stop; else it is
+    /// dropped (`Exec::past_drop`) and execution goes on from the run's end
+    /// (or a stopped chunk's stop, as `par_collect` would). Returns where.
+    fn past_settle(&mut self) -> Option<u64> {
+        let past = self.past.take().unwrap();
+        let held = self.held.take();
+        let (why, at) = held.as_ref().and_then(|h| h.stop).unwrap_or(("stopped", past.pr.end));
+        let t = Instant::now();
+        let mut pr = past.pr;
+        let mut writes = super::ranges::Ranges::new();
+        let mut end_state: Option<ChunkState> = None;
+        let mut stopped: Option<(u64, ChunkState)> = None;
+        while pr.next < pr.starts.len() {
+            let i = pr.next;
+            pr.next += 1;
+            pr.run.grant(i);
+            let (done, waited) = pr.run.collect(i);
+            pr.waited_ns += waited;
+            if let (Some(seq), Some(e)) = (done.last, self.exec.as_mut()) {
+                e.depend_on(seq, false);
+            }
+            if pr.sig != 0 && !done.costs.is_empty() {
+                if let Some(&first) = pr.firsts.get(i) {
+                    let (sig, n) = (pr.sig, pr.n);
+                    self.note_chunk_costs(sig, n, first, &done.costs);
+                }
+            }
+            writes.extend(&done.writes);
+            if let Some(s) = done.stopped {
+                super::par::note_stop(done.why);
+                super::par::STOPS.fetch_add(1, Ordering::Relaxed);
+                stopped = Some((s, done.state));
+                break;
+            }
+            end_state = Some(done.state);
+        }
+        super::par::note_main_wait(pr.waited_ns);
+        super::par::PAST[3].fetch_add(held.as_ref().map_or(0, |h| h.commands), Ordering::Relaxed);
+        super::par::PAST[4].fetch_add(past.began.elapsed().saturating_sub(t.elapsed()).as_nanos() as u64, Ordering::Relaxed);
+        super::par::PAST[5].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let e = self.exec.as_mut().unwrap();
+        let dropped = if stopped.is_some() {
+            Some("a chunk stopped")
+        } else if !end_state.as_ref().is_some_and(|s| chunk_states_equal(s, &past.end_state, &past.end_unknown)) {
+            Some("end state")
+        } else if writes.overlaps_any(e.held_reads()) {
+            Some("read the run's writes")
+        } else if !e.held_keys().is_empty() && super::images::any_pending() && {
+            let keys: Vec<super::images::ImageKey> = e.held_keys().iter().copied().collect();
+            super::images::with(|im| im.clears_pending(&keys) || im.overwrites_pending(&keys))
+        } {
+            Some("images with pending clears or reloads")
+        } else if super::tune::past_drop() {
+            Some("dropped (past_drop)")
+        } else {
+            None
+        };
+        super::par::note_past(why, dropped);
+        if dropped.is_none() {
+            e.past_commit();
+            super::par::PAST[1].fetch_add(1, Ordering::Relaxed);
+            if why == "label" {
+                self.submit_gpu("label");
+            }
+            return Some(at);
+        }
+        e.past_drop();
+        super::par::PAST[2].fetch_add(1, Ordering::Relaxed);
+        // Back to where collecting the run would have left it.
+        self.ctx_stack = past.stack;
+        self.markers = past.markers;
+        self.pred = past.pred;
+        self.fence_pending = past.fence_pending;
+        self.drop_ahead();
+        let to = match stopped {
+            Some((s, st)) => {
+                self.set_chunk_state(&st);
+                if pr.next < pr.starts.len() {
+                    self.par = Some(pr);
+                }
+                s
+            }
+            None => {
+                if let Some(st) = &end_state {
+                    self.set_chunk_state(st);
+                }
+                pr.end
+            }
+        };
+        // The run ended in an earlier command buffer: the worker goes back.
+        if past.buf != self.cur_buf {
+            self.rewind = Some((past.buf, to));
+            return None;
+        }
+        Some(to)
+    }
+
+    /// Whether `par_plan` would split the run that starts at the command at
+    /// `from` (recording past a run stops there); when not, its end is
+    /// skipped as `par_plan` skips it.
+    fn par_would_split(&mut self, f: &Fetched, from: u64, end: u64) -> bool {
+        let mut c = from;
+        let mut n = 0usize;
+        let run_end = loop {
+            if c >= end || !valid(c, 4) {
+                break c;
+            }
+            let h = f.rd(c);
+            match h >> 30 {
+                3 => {}
+                2 => {
+                    c += 4;
+                    continue;
+                }
+                _ => break c,
+            }
+            let count = (h >> 16) & 0x3FFF;
+            if count == 0x3FFF {
+                c += 4;
+                continue;
+            }
+            if h & 1 != 0 {
+                break c;
+            }
+            let opc = (h >> 8) & 0xFF;
+            let len = count as u64 + 1;
+            let next = c + 4 * (len + 1);
+            if next > end || !valid(c, 4 * (len + 1)) {
+                break c;
+            }
+            if is_command(opc) {
+                n += 1;
+                if n >= PAR_MAX {
+                    break next;
+                }
+            } else if opc == op::NOP {
+                if len >= 2 && f.rd(c + 4) == DS_MAGIC && !matches!(f.rd(c + 8), pop::PUSH_MARKER | pop::SET_MARKER | pop::POP_MARKER) {
+                    break c;
+                }
+            } else if !(opc == op::SET_BASE || par_event(opc, self.compute) || is_state(opc)) {
+                break c;
+            }
+            c = next;
+        };
+        let par_min = super::par::min_run().max(48);
+        let chunk_min = (par_min / 3).clamp(16, PAR_CHUNK_MIN);
+        let chunks = ((super::par::workers() + 1) * super::par::split()).min(n / chunk_min);
+        if n < par_min || chunks < 2 {
+            self.par_skip = (end, run_end);
+            self.par_skip_n = n;
+            return false;
+        }
+        true
     }
 
     /// Folds the per-command costs a chunk measured (its first command:
@@ -3555,7 +3873,23 @@ impl Cp {
             SERIAL_WHY[8].fetch_add(1, Ordering::Relaxed);
         }
         let acb_ops = self.compute && super::tune::cp_classes() && self.name.strip_prefix("gpu-acb").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()) == Some(super::tune::cp_classes_acb());
-        while cur < end {
+        loop {
+            if cur >= end {
+                // Past a run, the buffer's end is a stop (what was recorded
+                // past it may be recorded again, from the run's end), unless
+                // the submission's next buffer goes on with it.
+                if self.past.is_some() && !self.past_goes_on() {
+                    self.held_stop("buffer end", cur);
+                    match self.past_settle() {
+                        Some(c) if c < end => {
+                            cur = c;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                break;
+            }
             // The next chunk of a parallel run: collected here.
             if let Some(pr) = &self.par {
                 if pr.starts[pr.next] == cur {
@@ -3575,6 +3909,15 @@ impl Cp {
                 break;
             }
             if self.held.is_some() && self.held_halted(cur, cur) {
+                if self.past.is_some() {
+                    match self.past_settle() {
+                        Some(c) => {
+                            cur = c;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
                 break;
             }
             if self.main_gfx && cur == super::frameahead::TARGET.load(Ordering::Relaxed) {
@@ -3616,6 +3959,17 @@ impl Cp {
                 break;
             }
             let skip = self.par_skip.0 == end && cur < self.par_skip.1;
+            if self.past.is_some() && self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && super::par::workers() > 0 && self.par_would_split(&f, cur, end) {
+                // The next parallel run: planned once this one is collected.
+                self.held_stop("next run", cur);
+                match self.past_settle() {
+                    Some(c) => {
+                        cur = c;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
             if self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && self.exec.is_some() && self.held.is_none() && (if self.compute { super::tune::par_compute() > 0 } else { super::par::workers() > 0 }) && !super::capture::capturing() {
                 let t = class_start(classes);
                 self.par_plan(&f, cur, end);
@@ -3745,6 +4099,17 @@ impl Cp {
             if self.held.is_some() {
                 if let Some(why) = self.held_refuses(opcode, n, &p) {
                     self.held_stop(why, cur);
+                    // Past a run: the packet runs once what was recorded
+                    // past the run is settled.
+                    if self.past.is_some() {
+                        match self.past_settle() {
+                            Some(c) => {
+                                cur = c;
+                                continue;
+                            }
+                            None => break,
+                        }
+                    }
                     break;
                 }
             }
@@ -3763,6 +4128,15 @@ impl Cp {
                     }
                 }
                 if self.held_halted(cur, next) {
+                    if self.past.is_some() {
+                        match self.past_settle() {
+                            Some(c) => {
+                                cur = c;
+                                continue;
+                            }
+                            None => break,
+                        }
+                    }
                     break;
                 }
             }
@@ -3775,6 +4149,17 @@ impl Cp {
                     // Within a parallel run's first chunk, only to its end.
                     let until = self.par.as_ref().map_or(end, |p| p.starts[p.next].min(end));
                     self.scan_ahead(&f, next, until);
+                }
+            }
+            if self.past.is_some() && self.exec.as_ref().is_some_and(|e| e.submit_requested()) {
+                // Another queue waits for a label written past the run.
+                self.held_stop("label", next);
+                match self.past_settle() {
+                    Some(c) => {
+                        cur = c;
+                        continue;
+                    }
+                    None => break,
                 }
             }
             if self.held.is_none() && self.exec.as_ref().is_some_and(|e| e.submit_requested()) {
@@ -3798,8 +4183,17 @@ impl Cp {
                 Flow::Stop => break,
             }
         }
-        // A parallel run planned in this buffer ends in it.
-        if self.par.is_some() {
+        // Every stop past a run settles it within its buffer (a stop at the
+        // buffer's end included); leaving the buffer with one unsettled
+        // would skip the packets after it.
+        if self.past.is_some() && !self.past_goes_on() && self.rewind.is_none() {
+            crate::error!("gpu[{}]: left a command buffer at {cur:#x} while recording past a parallel run (settled here)", self.name);
+            let _ = self.past_settle();
+            self.rewind = None;
+        }
+        // A parallel run planned in this buffer ends in it (unless execution
+        // goes back into it: `take_rewind`).
+        if self.par.is_some() && self.rewind.is_none() {
             self.par_cancel();
         }
         self.depth -= 1;

@@ -49,6 +49,10 @@ pub struct HeldCp {
     /// Label waits passed: [on its own writes, on the current frame's,
     /// on memory, on another queue's promise, after polling].
     pub waits: [u64; 5],
+    /// A wait that does not pass at once is polled while the frame lasts
+    /// (false: it stops there; the graphics command processor recording
+    /// past a run, `Cp::past_start`).
+    pub poll: bool,
 }
 
 /// The graphics command processor's state at the start of a submission.
@@ -333,7 +337,7 @@ fn record_frame(cp: &mut Cp, post: &Post, w: WalkState, next: Vec<NextBuf>, flip
     for &(a, v, n) in &w.labels {
         labels.insert(a, (v, n));
     }
-    let h = Box::new(HeldCp { frames: post.frames, labels, stop: None, commands: 0, waits: [0; 5] });
+    let h = Box::new(HeldCp { frames: post.frames, labels, stop: None, commands: 0, waits: [0; 5], poll: true });
     cp.held_begin(&w, h);
     let stopped = |cp: &Cp| cp.held.as_ref().is_some_and(|h| h.stop.is_some());
     let mut last_sub = flip_sub;

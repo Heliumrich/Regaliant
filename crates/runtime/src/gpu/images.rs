@@ -2402,6 +2402,27 @@ impl Images {
         out
     }
 
+    /// Notes a held executor's own fast clears and overwritten images once
+    /// its batches go to the GPU (`Exec::past_commit`): after the notes of
+    /// the work before them.
+    pub fn apply_held(&mut self, clears: &std::collections::HashMap<ImageKey, (u64, Option<u32>)>, over: &std::collections::HashSet<ImageKey>) {
+        for (k, &(meta, v)) in clears {
+            self.pending_clears.insert(*k, (meta, v));
+            self.pending_change += 1;
+        }
+        for k in over {
+            let Some(img) = self.map.get_mut(k) else { continue };
+            if !img.overwritten {
+                img.overwritten = true;
+                self.overwritten_keys.insert(*k);
+                self.pending_change += 1;
+                self.pending_overwrites += 1;
+            }
+        }
+        self.note_gen += 1;
+        NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
     /// The fast clear of image `k` with metadata at `meta` (`take_clears`'s
     /// entry for a clear the frame-ahead recorder noted itself).
     pub fn fast_clear_of(&self, k: ImageKey, meta: u64, known: Option<u32>) -> Option<FastClear> {
