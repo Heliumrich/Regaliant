@@ -203,6 +203,45 @@ fn stencil_op(op: u32) -> vk::StencilOp {
     }
 }
 
+/// Draws with a stencil state Vulkan's cannot reproduce, by kind: [the
+/// pixel shader exports the test value (DB_SHADER_CONTROL bit 1) and a
+/// compare function or REPLACE_TEST op uses it, it exports the op value
+/// (bit 2) and a REPLACE_OP op writes it, a REPLACE_OP op writes an op
+/// value other than the test value (Vulkan replaces with the reference),
+/// an op without a Vulkan equivalent (ONES, logic ops: KEEP)]. Each
+/// distinct (kind, pixel shader, registers) is logged once.
+pub static STENCIL_GAPS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn note_stencil_gaps(ps: u64, dctl: u32, sctl: u32, refm: u32, refm_bf: u32, dbsc: u32) {
+    let back = dctl & (1 << 7) != 0;
+    let funcs = [(dctl >> 8) & 7, if back { (dctl >> 20) & 7 } else { (dctl >> 8) & 7 }];
+    let bs = if back { sctl >> 12 } else { sctl };
+    let ops = [sctl & 0xF, (sctl >> 4) & 0xF, (sctl >> 8) & 0xF, bs & 0xF, (bs >> 4) & 0xF, (bs >> 8) & 0xF];
+    let uses_ref = funcs.iter().any(|&f| f != 0 && f != 7);
+    let kinds = [
+        dbsc & 2 != 0 && (uses_ref || ops.contains(&3)),
+        dbsc & 4 != 0 && ops.contains(&4),
+        ops.contains(&4) && ((refm >> 24) & 0xFF != refm & 0xFF || (back && (refm_bf >> 24) & 0xFF != refm_bf & 0xFF)),
+        ops.iter().any(|&o| o == 2 || o >= 10),
+    ];
+    if !kinds.iter().any(|&k| k) {
+        return;
+    }
+    static SEEN: parking_lot::Mutex<Option<std::collections::HashSet<(usize, u64, u32, u32, u32, u32)>>> = parking_lot::Mutex::new(None);
+    for (k, &on) in kinds.iter().enumerate() {
+        if !on {
+            continue;
+        }
+        STENCIL_GAPS[k].fetch_add(1, Ordering::Relaxed);
+        let mut g = SEEN.lock();
+        let seen = g.get_or_insert_with(Default::default);
+        if seen.len() < 200 && seen.insert((k, ps, dctl, sctl, refm, dbsc)) {
+            const NAMES: [&str; 4] = ["test value exported and used", "op value exported and replaced", "REPLACE_OP with an op value other than the test value", "an op without a Vulkan equivalent"];
+            crate::info!("stencil gap: {} (ps {ps:#x}, depth_ctl {dctl:#x}, stencil_ctl {sctl:#x}, ref {refm:#x}/{refm_bf:#x}, db_shader {dbsc:#x})", NAMES[k]);
+        }
+    }
+}
+
 /// EQUAL depth test diagnosis (`DS_DEPTH_EQUAL_BIAS` or the `eqbias`
 /// control command): f32 bits, NaN = off, infinity = always pass.
 pub static EQUAL_BIAS: AtomicU32 = AtomicU32::new(0x7FC0_0000);
@@ -1305,7 +1344,14 @@ impl Exec {
         let sctl = reg(0x2842C);
         let refm = reg(0x28430);
         let refm_bf = reg(0x28434);
+        // Diagnosis (`tune stencil_export 1`): draws whose pixel shader exports
+        // the stencil test value (not translated: no stencil export on the
+        // device) replace with 0 instead of the register's test value.
+        let (refm, refm_bf) = if super::super::tune::stencil_export() == 1 && reg(0x2880C) & 2 != 0 { (refm & !0xFF, refm_bf & !0xFF) } else { (refm, refm_bf) };
         let s_write = s_test && (refm | refm_bf) & 0x00FF_0000 != 0 && sctl & 0xFF_FFFF != 0;
+        if s_test {
+            note_stencil_gaps(ps.as_ref().map_or(0, |p| p.addr), dctl, sctl, refm, refm_bf, reg(0x2880C));
+        }
         let clear_z = has_z && db_render & 1 != 0;
         let clear_s = has_s && db_render & 2 != 0;
         if z_test || s_test || clear_z || clear_s {
