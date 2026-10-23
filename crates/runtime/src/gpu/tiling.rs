@@ -330,9 +330,19 @@ impl Layout {
     pub fn detile(&self, src: &[u8], mip: usize, slice: u32, dst: &mut Vec<u8>) {
         let m = &self.mips[mip];
         let e = 1usize << self.elem_log2;
-        let (w, h) = (m.width as usize, m.height as usize);
         dst.clear();
-        dst.resize(w * h * e, 0);
+        dst.resize(m.width as usize * m.height as usize * e, 0);
+        self.detile_into(src, mip, slice, dst);
+    }
+
+    /// `detile` into `dst`, exactly the mip's packed size (the texture
+    /// cache's staging memory: no intermediate copies). Elements beyond
+    /// `src` are written as zeros.
+    pub fn detile_into(&self, src: &[u8], mip: usize, slice: u32, dst: &mut [u8]) {
+        let m = &self.mips[mip];
+        let e = 1usize << self.elem_log2;
+        let (w, h) = (m.width as usize, m.height as usize);
+        debug_assert_eq!(dst.len(), w * h * e);
         if w == 0 || h == 0 {
             return;
         }
@@ -378,6 +388,8 @@ impl Layout {
                 let o = (rb + (((gx >> lw) as u64) << self.block_log2) + (self.xs[gx & mw] ^ ysv) as u64) as usize;
                 if o + N <= src.len() {
                     orow[x * N..x * N + N].copy_from_slice(&src[o..o + N]);
+                } else {
+                    orow[x * N..x * N + N].fill(0);
                 }
             }
         }

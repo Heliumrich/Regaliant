@@ -3540,7 +3540,6 @@ pub fn wait_done_for(seq: u64, max: std::time::Duration) -> bool {
 
 /// Blocks until batch `seq` and all earlier ones completed (with their actions).
 pub fn wait_done(seq: u64) {
-    let t0 = std::time::Instant::now();
     let mut d = DONE.lock();
     while *d < seq {
         if super::shutting_down() {
@@ -3548,8 +3547,6 @@ pub fn wait_done(seq: u64) {
         }
         DONE_CV.wait_for(&mut d, std::time::Duration::from_millis(100));
     }
-    drop(d);
-    super::hitch::note_since(super::hitch::Kind::GpuWait, t0, || format!("batch {seq}"));
 }
 
 /// Queues a batch: `submit` runs (the vkQueueSubmit) under the queue lock so
@@ -6082,6 +6079,7 @@ impl Exec {
                 let tw = super::timeline::wait_start();
                 wait_done(slot.seq);
                 tw.end(&self.name, || format!("wait: batch slot (#{})", slot.seq));
+                super::hitch::note_since(super::hitch::Kind::GpuWait, t, || format!("a free batch slot: the GPU behind (batch {})", slot.seq));
                 WAIT_NS[2].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 WAIT_NS[3].fetch_add(1, Ordering::Relaxed);
                 note_queue_wait(&self.name, 1, t.elapsed());
@@ -6274,8 +6272,10 @@ impl Exec {
         if self.submit_after > done_seq() {
             // Deferred CP writes that this work may read come first.
             let tw = super::timeline::wait_start();
+            let t = std::time::Instant::now();
             wait_done(self.submit_after);
             waited = tw.end(&self.name, || format!("wait: deferred CP writes (#{})", self.submit_after));
+            super::hitch::note_since(super::hitch::Kind::GpuWait, t, || format!("deferred CP writes (batch {})", self.submit_after));
             st.restart();
         }
         self.end_rendering();
@@ -7876,8 +7876,10 @@ impl Exec {
         let t0 = profiling().then(std::time::Instant::now);
         self.submit_for("sync");
         let tw = super::timeline::wait_start();
+        let t = std::time::Instant::now();
         wait_done(self.last_seq);
         tw.end(&self.name, || format!("wait: own batches (#{})", self.last_seq));
+        super::hitch::note_since(super::hitch::Kind::GpuWait, t, || format!("own batches for a CPU-side read ({})", self.flush_why));
         self.inflight.clear();
         if let Some(t0) = t0 {
             let l = std::panic::Location::caller();
@@ -8443,8 +8445,10 @@ impl Exec {
                 waited.get_or_insert_with(std::time::Instant::now);
                 FOREIGN_WAITS.fetch_add(1, Ordering::Relaxed);
                 let tw = super::timeline::wait_start();
+                let t = std::time::Instant::now();
                 wait_done(s);
                 tw.end(&self.name, || format!("wait: batch #{s} writing inputs"));
+                super::hitch::note_since(super::hitch::Kind::GpuWait, t, || format!("another queue's batch {s} writing inputs"));
             }
         }
         lap(2, &mut t);

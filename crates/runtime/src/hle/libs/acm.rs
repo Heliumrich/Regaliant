@@ -208,7 +208,7 @@ fn reverb_on() -> bool {
 /// count, convolvers, input count, impulse response set pointers, gains,
 /// output pointers). One convolver and one set per job is what the title
 /// builds; others are reported once and left undone.
-fn convolve(job: u64, a: [u64; 6]) {
+fn convolve(_job: u64, a: [u64; 6]) {
     let [n_conv, conv, n_in, inputs, gains, outputs] = a;
     if !reverb_on() {
         static OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

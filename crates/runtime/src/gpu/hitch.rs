@@ -20,8 +20,9 @@ pub enum Kind {
     Upload,
     /// A CPU thread waiting for GPU work to complete.
     GpuWait,
-    /// A command processor waiting for a label (the title's CPU or another
-    /// queue).
+    /// The graphics command processor waiting for a label (the title's CPU
+    /// or another queue); the compute queues' waits for the graphics queue
+    /// are the frame's structure, not a cause, and not noted.
     CpWait,
     /// File reads and writes of the title's threads.
     File,
@@ -123,12 +124,26 @@ pub fn flip(n: u64, us: u64) {
         return;
     }
     let lo = prev.saturating_sub(median);
-    let mut sum = [0u64; KINDS];
+    // Per kind the time any of its work ran (concurrent work on several
+    // threads counted once), clipped to the frame and the median before it.
+    let mut spans: [Vec<(u64, u64)>; KINDS] = Default::default();
     let mut over: Vec<(u64, &Event)> = Vec::new();
     for e in s.events.iter().filter(|e| e.end > lo && e.start < us) {
-        let o = e.end.min(us) - e.start.max(lo);
-        sum[e.kind as usize] += o;
-        over.push((o, e));
+        let (a, b) = (e.start.max(lo), e.end.min(us));
+        spans[e.kind as usize].push((a, b));
+        over.push((b - a, e));
+    }
+    let mut sum = [0u64; KINDS];
+    for (k, v) in spans.iter_mut().enumerate() {
+        v.sort_unstable();
+        let mut end = 0u64;
+        for &(a, b) in v.iter() {
+            let a = a.max(end);
+            if b > a {
+                sum[k] += b - a;
+                end = b;
+            }
+        }
     }
     over.sort_by(|a, b| b.0.cmp(&a.0));
     let excess = d - median;

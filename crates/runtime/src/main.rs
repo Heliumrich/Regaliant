@@ -632,6 +632,12 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 info!("guest thread stacks:\n{}", thread_summary_ex(true));
                 Ok(())
             }
+            "status" => {
+                // The status report without stacks (GPU, image cache with its
+                // upload breakdown, audio, file traffic).
+                info!("status at flip {flip}:\n{}", thread_summary());
+                Ok(())
+            }
             "iostat" => {
                 info!("file traffic at flip {flip}:\n{}", hle::iostat::status());
                 Ok(())

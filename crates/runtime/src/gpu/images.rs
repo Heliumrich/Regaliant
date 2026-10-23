@@ -1262,10 +1262,12 @@ impl Images {
             .usage(usage)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         unsafe {
+            let t0 = std::time::Instant::now();
             let image = c.device.create_image(&ci, None).map_err(|e| format!("vkCreateImage {key:?}: {e}"))?;
             let req = c.device.get_image_memory_requirements(image);
             let mem = c.alloc(req, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
             c.device.bind_image_memory(image, mem, 0).map_err(|e| format!("bind image: {e}"))?;
+            super::hitch::note_since(super::hitch::Kind::Upload, t0, || format!("image creation {}x{} ({} MiB)", key.width, key.height, req.size >> 20));
             Ok((image, mem, req.size))
         }
     }
@@ -1279,7 +1281,9 @@ impl Images {
             return Ok(self.staging_free.swap_remove(i));
         }
         let cap = if n > STAGING_POOLED { n } else { n.max(1 << 20).next_power_of_two() };
+        let t0 = std::time::Instant::now();
         let (buf, mem, ptr) = ctx().host_buffer(cap, vk::BufferUsageFlags::TRANSFER_SRC)?;
+        super::hitch::note_since(super::hitch::Kind::Upload, t0, || format!("a new staging buffer of {} MiB", cap >> 20));
         STAGING_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Staging { buf, mem, ptr, cap })
     }
@@ -1312,7 +1316,10 @@ impl Images {
                     break;
                 }
                 UPLOAD_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if let Err(e) = unsafe { c.device.wait_for_fences(&[fence], true, 10_000_000_000) } {
+                let t0 = std::time::Instant::now();
+                let r = unsafe { c.device.wait_for_fences(&[fence], true, 10_000_000_000) };
+                super::hitch::note_since(super::hitch::Kind::GpuWait, t0, || format!("earlier texture uploads ({} in flight, {} MiB)", self.inflight.len(), bytes >> 20));
+                if let Err(e) = r {
                     if !super::exec::DEVICE_LOST.swap(true, std::sync::atomic::Ordering::SeqCst) {
                         crate::error!("images: upload failed: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
                     }
@@ -1368,7 +1375,10 @@ impl Images {
             c.device.end_command_buffer(self.cmd).ok();
             match c.submit(self.cmd, &[], &[], self.fence) {
                 Ok(()) => {
-                    if let Err(e) = c.device.wait_for_fences(&[self.fence], true, 10_000_000_000) {
+                    let t0 = std::time::Instant::now();
+                    let r = c.device.wait_for_fences(&[self.fence], true, 10_000_000_000);
+                    super::hitch::note_since(super::hitch::Kind::GpuWait, t0, || "a texture cache one-shot (upload or transition)".to_string());
+                    if let Err(e) = r {
                         if !super::exec::DEVICE_LOST.swap(true, std::sync::atomic::Ordering::SeqCst) {
                             crate::error!("images: upload/transition failed: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
                         }
@@ -1794,12 +1804,15 @@ impl Images {
         // Detiling reads only mapped regions (holes between them are not read).
         let src = unsafe { std::slice::from_raw_parts(t.base as *const u8, end as usize) };
         let mut skipped = 0;
-        // Detile every (mip, layer) into one staging buffer; unmapped ones
-        // of a first upload copy from one shared zero area at the end.
-        let mut staging: Vec<u8> = Vec::new();
+        // Every wanted, mapped (mip, layer) is detiled straight into the
+        // staging buffer at its offset (sizes first: no intermediate copies,
+        // which took as long as the detiling, FINDINGS.md 2026-10-23);
+        // unmapped ones of a first upload copy from one shared zero area at
+        // the end.
         let mut regions = Vec::new();
         let mut zeroed: Vec<(usize, u32, usize)> = Vec::new();
-        let mut tmp = Vec::new();
+        let mut parts: Vec<(usize, u32, usize, usize)> = Vec::new();
+        let mut total = 0usize;
         let (mut parts_done, mut parts_left) = (0u64, 0u64);
         for mip in 0..key.levels as usize {
             for layer in 0..layers {
@@ -1817,10 +1830,11 @@ impl Images {
                     }
                     continue;
                 }
-                lay.detile(src, mip, layer, &mut tmp);
-                let off = staging.len() as u64;
-                staging.extend_from_slice(&tmp);
                 let m = &lay.mips[mip];
+                let len = m.width as usize * m.height as usize * elem as usize;
+                let off = total as u64;
+                parts.push((mip, layer, total, len));
+                total += len;
                 let (w, h) = (m.texel_w, m.texel_h);
                 regions.push(
                     vk::BufferImageCopy::default()
@@ -1832,10 +1846,28 @@ impl Images {
                 );
             }
         }
+        if regions.is_empty() && zeroed.is_empty() {
+            return Err(format!("texture {:#x}+{size:#x}: no mip mapped", t.base));
+        }
+        let zero_len = zeroed.iter().map(|z| z.2).max().unwrap_or(0);
+        let (detiled, zero_off) = (total, total);
+        total += zero_len;
+        let asynchronous = super::tune::upload_async();
+        let st = if asynchronous {
+            self.staging(total.max(4) as u64)?
+        } else {
+            let (buf, mem, ptr) = ctx().host_buffer(total.max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
+            Staging { buf, mem, ptr, cap: total.max(4) as u64 }
+        };
+        let dst = unsafe { std::slice::from_raw_parts_mut(st.ptr, total) };
+        for &(mip, layer, off, len) in &parts {
+            lay.detile_into(src, mip, layer, &mut dst[off..off + len]);
+        }
+        dst[zero_off..].fill(0);
         // Guest memory is no longer read.
         drop(readers);
         UPLOAD_SPLIT[0].fetch_add(t_detile.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        DETILED.fetch_add(staging.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        DETILED.fetch_add(detiled as u64, std::sync::atomic::Ordering::Relaxed);
         if sums_on {
             SUB_SUMS.lock().get_or_insert_with(HashMap::default).insert(key, sums);
         }
@@ -1844,14 +1876,10 @@ impl Images {
             PART_UPLOADS[0].fetch_add(1, Relaxed);
             PART_UPLOADS[1].fetch_add(parts_done, Relaxed);
             PART_UPLOADS[2].fetch_add(parts_left, Relaxed);
-            PART_UPLOADS[3].fetch_add(staging.len() as u64, Relaxed);
+            PART_UPLOADS[3].fetch_add(detiled as u64, Relaxed);
         }
-        if regions.is_empty() && zeroed.is_empty() {
-            return Err(format!("texture {:#x}+{size:#x}: no mip mapped", t.base));
-        }
-        if let Some(zero_len) = zeroed.iter().map(|z| z.2).max() {
-            let off = staging.len() as u64;
-            staging.resize(staging.len() + zero_len, 0);
+        if zero_len > 0 {
+            let off = zero_off as u64;
             for &(mip, layer, _) in &zeroed {
                 let m = &lay.mips[mip];
                 regions.push(
@@ -1872,15 +1900,7 @@ impl Images {
         }
         let c = ctx();
         let t_stage = std::time::Instant::now();
-        let asynchronous = super::tune::upload_async();
-        let st = if asynchronous {
-            self.staging(staging.len().max(4) as u64)?
-        } else {
-            let (buf, mem, ptr) = c.host_buffer(staging.len().max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
-            Staging { buf, mem, ptr, cap: staging.len().max(4) as u64 }
-        };
         let (buf, mem) = (st.buf, st.mem);
-        unsafe { std::ptr::copy_nonoverlapping(staging.as_ptr(), st.ptr, staging.len()) };
         let base = t.base;
         let t_copy = std::time::Instant::now();
         UPLOAD_SPLIT[1].fetch_add((t_copy - t_stage).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
