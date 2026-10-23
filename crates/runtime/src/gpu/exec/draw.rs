@@ -1445,10 +1445,11 @@ impl Exec {
         let mut used = std::mem::take(&mut self.keys_scratch);
         used.clear();
         used.extend(colors.iter().flatten().chain(depth.iter()).map(|t| t.key));
-        let pending = match &ps {
-            Some(p) => super::image_hazards(&[&vs, p], &mut used),
-            None => super::image_hazards(&[&vs], &mut used),
-        };
+        let pending = super::super::tune::skip_steps() & 2 == 0
+            && match &ps {
+                Some(p) => super::image_hazards(&[&vs, p], &mut used),
+                None => super::image_hazards(&[&vs], &mut used),
+            };
         let hz_t2 = hz_t.map(|_| std::time::Instant::now());
         if self.stopped {
             return Err(super::STOPPED.into());

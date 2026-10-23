@@ -7896,7 +7896,7 @@ impl Exec {
     /// work was writing, e.g. the ranges of unbounded global-pointer
     /// bindings: ~2 needless waits of 5-7 ms per frame in the courtyard).
     pub fn sync_textures(&mut self, textures: &[((u64, u64), super::desc::Tsharp)], why: usize) -> bool {
-        if textures.is_empty() {
+        if textures.is_empty() || super::tune::skip_steps() & 1 != 0 {
             return false;
         }
         if super::tune::tex_waits() == 0 {

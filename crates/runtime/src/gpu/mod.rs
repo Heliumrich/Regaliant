@@ -26,7 +26,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 157] = [
+    static ALL: [Tunable; 158] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -184,6 +184,7 @@ pub mod tune {
         Tunable { name: "present_fit", env: "DS_PRESENT_FIT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "frame_cap", env: "DS_FRAME_CAP", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "scrub_ms", env: "DS_SCRUB_MS", default: 10, value: AtomicU64::new(UNSET) },
+        Tunable { name: "skip_steps", env: "DS_SKIP_STEPS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1687,6 +1688,15 @@ pub mod tune {
     #[inline]
     pub fn scrub_ms() -> u64 {
         get(156).clamp(1, 60_000)
+    }
+
+    /// Diagnosis (timing only, wrong results; for replay A/Bs of what a
+    /// step costs): bit 0 skips draws' and dispatches' texture syncs, bit 1
+    /// draws' image-hazard checks (fast clears, overwrites, block copies,
+    /// depth views are not resolved).
+    #[inline]
+    pub fn skip_steps() -> u64 {
+        get(157)
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
