@@ -1052,7 +1052,14 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
         }
         Err(e) => {
             static REPORTED: AtomicU64 = AtomicU64::new(0);
-            let heaps = if REPORTED.fetch_add(1, Ordering::Relaxed) < 4 { format!(" (memory: {}; {} imports dropped after remapping not freed yet)", super::vk::ctx_heaps(), GRAVEYARD_LEN.load(Ordering::Relaxed)) } else { String::new() };
+            let k = REPORTED.fetch_add(1, Ordering::Relaxed);
+            let heaps = if k < 4 { format!(" (memory: {}; {} imports dropped after remapping not freed yet)", super::vk::ctx_heaps(), GRAVEYARD_LEN.load(Ordering::Relaxed)) } else { String::new() };
+            // What the operating system holds there (the first failures of
+            // each window: uncommitted or protected pages fail an import).
+            static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+            if SEEN.lock().get_or_insert_with(HashSet::new).insert(start) && k < 64 {
+                crate::warn!("gpu: import of {start:#x}..{end:#x} failed over: {}", crate::mem::os_regions(start, end - start, 12));
+            }
             crate::warn!("gpu: importing guest {start:#x}..{end:#x} failed: {e}{heaps}");
             None
         }
@@ -1098,6 +1105,104 @@ pub fn inflight_stats() -> (u64, u64, u64) {
 fn cached_compute_pipe(p: &Prepared) -> Option<Pipe> {
     let key = push_key(p.tr.key, push_fits(&[p]));
     PIPES.lock().as_ref().and_then(|m| m.get(&key)).copied()
+}
+
+/// Background compiles of particle programs' pipelines (`tune
+/// async_particles`): jobs (translation, program address, pipeline key),
+/// the keys queued or failed, workers started, and [dispatches left out,
+/// pipelines made, ns of compiles, failures].
+static ASYNC_JOBS: Mutex<std::collections::VecDeque<(std::sync::Arc<super::shaders::Translated>, u64, u64)>> = Mutex::new(std::collections::VecDeque::new());
+static ASYNC_CV: parking_lot::Condvar = parking_lot::Condvar::new();
+static ASYNC_QUEUED: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+static ASYNC_FAILED: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+static ASYNC_WORKERS: AtomicU64 = AtomicU64::new(0);
+pub static ASYNC_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// The error of a dispatch left out while its pipeline compiles.
+pub(super) const ASYNC_PENDING: &str = "a particle program's pipeline compiles in the background (its dispatches are left out until then)";
+
+/// Starts the background compile of a prepared stage's pipeline unless it
+/// is made, in flight or queued: false when the caller should make it where
+/// it is (the store holds it, or a background compile of it failed and
+/// that reports the error).
+fn compile_in_background(p: &Prepared) -> bool {
+    let key = push_key(p.tr.key, push_fits(&[p]));
+    if ASYNC_FAILED.lock().as_ref().is_some_and(|s| s.contains(&key)) {
+        return false;
+    }
+    // A pipeline the store holds is made in milliseconds: where it is first
+    // used (or waited for when a session-start precompile has it in flight),
+    // so that only a machine's first compiles leave dispatches out.
+    if super::pcache::stored('c', key) {
+        return false;
+    }
+    if compute_pipe_known(p) || !ASYNC_QUEUED.lock().get_or_insert_with(HashSet::new).insert(key) {
+        return true;
+    }
+    ASYNC_JOBS.lock().push_back((p.found.tr.0.clone(), p.addr, key));
+    // As many workers as compile-ahead has (the largest programs take 5-12
+    // s each, and an area's effects come together), below normal priority.
+    let want = super::tune::compile_ahead().clamp(2, 16);
+    while ASYNC_WORKERS.load(Ordering::Relaxed) < want {
+        let i = ASYNC_WORKERS.fetch_add(1, Ordering::Relaxed);
+        if i >= want {
+            break;
+        }
+        let name = format!("gpu-async{i}");
+        let _ = crate::thread::spawn_host(&name.clone(), 8 << 20, Box::new(move || async_worker(name)));
+    }
+    ASYNC_CV.notify_one();
+    true
+}
+
+fn async_worker(name: String) {
+    crate::log::set_thread_name(&name);
+    unsafe {
+        windows_sys::Win32::System::Threading::SetThreadPriority(windows_sys::Win32::System::Threading::GetCurrentThread(), windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL);
+    }
+    loop {
+        let (tr, addr, key) = {
+            let mut g = ASYNC_JOBS.lock();
+            loop {
+                if let Some(j) = g.pop_front() {
+                    break j;
+                }
+                ASYNC_CV.wait(&mut g);
+            }
+        };
+        let t = std::time::Instant::now();
+        let created = std::cell::Cell::new(false);
+        match compute_pipe_with(&tr, addr, &created) {
+            Ok(_) => {
+                if created.get() {
+                    ASYNC_STATS[1].fetch_add(1, Ordering::Relaxed);
+                    ASYNC_STATS[2].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                if ASYNC_STATS[3].fetch_add(1, Ordering::Relaxed) < 8 {
+                    crate::warn!("gpu: background compile of cs {addr:#x} failed: {e}");
+                }
+                ASYNC_FAILED.lock().get_or_insert_with(HashSet::new).insert(key);
+            }
+        }
+        if let Some(s) = ASYNC_QUEUED.lock().as_mut() {
+            s.remove(&key);
+        }
+    }
+}
+
+/// Status line: particle programs and their background compiles.
+pub fn async_line() -> String {
+    let v: Vec<u64> = ASYNC_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    format!(
+        "    particle programs (`async_particles`): {} known from the game files; {} dispatches left out while their pipeline compiled, {} pipelines made in the background ({:.1} s), {} failed; {} queued now\n",
+        super::particles::known(),
+        v[0],
+        v[1],
+        v[2] as f64 / 1e9,
+        v[3],
+        ASYNC_JOBS.lock().len()
+    )
 }
 
 /// Whether the compute pipeline of a prepared shader exists or is being
@@ -1269,7 +1374,7 @@ fn keep_pipe(map: &Mutex<Option<HashMap<u64, Pipe>>>, key: u64, pipe: Pipe) -> P
 pub(super) fn module_code(spirv: &[u32]) -> std::borrow::Cow<'_, [u32]> {
     static NONCE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     let nonce = *NONCE.get_or_init(|| {
-        (std::env::var("DS_SPIRV_NONCE").ok().as_deref() == Some("1")).then(|| {
+        (FORCE_NONCE.load(Ordering::Relaxed) || std::env::var("DS_SPIRV_NONCE").ok().as_deref() == Some("1")).then(|| {
             let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
             crate::warn!("gpu: DS_SPIRV_NONCE=1: shader modules carry a session nonce (the driver's shader cache misses)");
             (t ^ (t >> 32)) as u32 | 1
@@ -1283,6 +1388,26 @@ pub(super) fn module_code(spirv: &[u32]) -> std::borrow::Cow<'_, [u32]> {
         }
         _ => std::borrow::Cow::Borrowed(spirv),
     }
+}
+
+/// Modules carry the session nonce whatever `DS_SPIRV_NONCE` says
+/// (`--compile-bench`; set before the first module is made).
+pub(super) static FORCE_NONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Creates and destroys the compute pipeline of a translation without a
+/// pipeline cache (`--compile-bench`): how long its creation took.
+pub(super) fn bench_compute_pipeline(tr: &super::shaders::Translated) -> Result<std::time::Duration, String> {
+    let t = std::time::Instant::now();
+    let pipe = compute_pipeline(&tr.out, push_fits_tr(tr), None)?;
+    let d = t.elapsed();
+    super::pstats::report(pipe.pipeline, &format!("compile bench {:#018x}", tr.key));
+    unsafe {
+        let dev = &ctx().device;
+        dev.destroy_pipeline(pipe.pipeline, None);
+        dev.destroy_pipeline_layout(pipe.layout, None);
+        dev.destroy_descriptor_set_layout(pipe.set_layout, None);
+    }
+    Ok(d)
 }
 
 /// Pipeline creation flags `compute_pipeline` adds (`--pipeline-test` with
@@ -1710,6 +1835,25 @@ pub(super) fn push_line() -> String {
         BATCHED[1].load(Ordering::Relaxed),
         BATCHED[0].load(Ordering::Relaxed),
         BATCHED[2].load(Ordering::Relaxed)
+    ) + &batch_miss_line()
+}
+
+/// Why batched programs' commands did not join the open batched dispatch
+/// (`BATCH_MISS`).
+fn batch_miss_line() -> String {
+    let m: Vec<u64> = BATCH_MISS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    const WHY: [&str; 8] = ["indirect", "not plain 1-D", "none open", "another batch", "commands since", "another pipeline", "table full", "other descriptors"];
+    let mut progs: Vec<((u64, u8), u64)> = BATCH_MISS_PROGRAMS.lock().as_ref().map(|m| m.iter().map(|(k, v)| (*k, *v)).collect()).unwrap_or_default();
+    progs.sort_by(|a, b| b.1.cmp(&a.1));
+    let progs: Vec<String> = progs.iter().take(10).map(|((a, w), n)| format!("cs {a:#x} {} {n}", WHY[*w as usize])).collect();
+    let mut sites: Vec<(u32, u64)> = BATCH_MISS_SITES.lock().as_ref().map(|m| m.iter().map(|(k, v)| (*k, *v)).collect()).unwrap_or_default();
+    sites.sort_by(|a, b| b.1.cmp(&a.1));
+    let sites: Vec<String> = sites.iter().take(6).map(|(l, n)| format!("exec.rs:{l} {n}")).collect();
+    format!(
+        "    batched programs' commands not joined to the open dispatch: indirect {}, not a plain 1-D direct dispatch {}, none open {}, another batch {}, commands recorded since {}, another pipeline {}, table full {}, other descriptors {}; by program: {}; recorded since by: {}\n",
+        m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+        progs.join(", "),
+        sites.join(", ")
     )
 }
 
@@ -5577,6 +5721,9 @@ pub struct Exec {
     /// Bumped by every `cmd()`: anything recorded into the batch's command
     /// buffer after a draw (the repeat checks it).
     cmd_uses: std::cell::Cell<u64>,
+    /// The source line of the last `cmd()` (what was recorded after an open
+    /// batched dispatch: `BATCH_MISS_SITES`).
+    last_cmd_line: std::cell::Cell<u32>,
     /// Batches begun (the repeat checks it).
     batch_count: u64,
     /// The program of the last direct dispatches and how many in a row
@@ -5650,6 +5797,25 @@ const SGPR_WINDOW_BYTES: u64 = 4 * rdna::translate::SGPR_WINDOW_DWORDS as u64;
 /// [commands appended to an open batched dispatch, batched dispatches
 /// recorded, commands of batched programs run on their own].
 pub static BATCHED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Why a batched program's command opened a new dispatch instead of joining
+/// the open one: [indirect, not a plain 1-D direct dispatch (start, SGPR
+/// patches, a descriptor set, groups), no open dispatch, another batch,
+/// commands recorded since it, another pipeline, its table full, other
+/// descriptors].
+pub static BATCH_MISS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Batched programs' commands not joined, by (program, reason), and the
+/// exec.rs lines that recorded commands after an open batched dispatch.
+static BATCH_MISS_PROGRAMS: Mutex<Option<HashMap<(u64, u8), u64>>> = Mutex::new(None);
+static BATCH_MISS_SITES: Mutex<Option<HashMap<u32, u64>>> = Mutex::new(None);
+
+/// A new window for the batched dispatches' statistics (`profile reset`).
+pub(super) fn reset_batch_misses() {
+    for c in BATCHED.iter().chain(BATCH_MISS.iter()) {
+        c.store(0, Ordering::Relaxed);
+    }
+    *BATCH_MISS_PROGRAMS.lock() = None;
+    *BATCH_MISS_SITES.lock() = None;
+}
 
 /// Whether a command's descriptors equal a run's (`desc_signature`), without
 /// building its own signature.
@@ -5887,6 +6053,7 @@ impl Exec {
                 segs: Vec::new(),
                 repeat: None,
                 cmd_uses: std::cell::Cell::new(0),
+                last_cmd_line: std::cell::Cell::new(0),
                 cs_streak: (0, 0),
                 cs_run: None,
                 owned: Vec::new(),
@@ -5910,8 +6077,10 @@ impl Exec {
         }
     }
 
+    #[track_caller]
     fn cmd(&self) -> vk::CommandBuffer {
         self.cmd_uses.set(self.cmd_uses.get().wrapping_add(1));
+        self.last_cmd_line.set(std::panic::Location::caller().line());
         self.slots[self.cur].cmd
     }
 
@@ -10660,6 +10829,16 @@ impl Exec {
                 if super::compile::at_first_uses() && !compute_pipe_known(&p) {
                     cp.prefetch_compiles();
                 }
+                // A particle program's first use (`tune async_particles`):
+                // its pipeline compiles in the background and its dispatches
+                // are left out until it is made, instead of this command
+                // processor stopping for the compile (5-12 s for the largest:
+                // first visits froze for up to 20.8 s, FINDINGS.md
+                // 2026-10-23). The effect shows up that much later.
+                if super::tune::async_particles() && super::shaders::program_hash(p.addr).is_ok_and(super::particles::is_particle) && compile_in_background(&p) {
+                    ASYNC_STATS[0].fetch_add(1, Ordering::Relaxed);
+                    return Err(ASYNC_PENDING.into());
+                }
                 let r = compute_pipe(&p);
                 if compile_trace() {
                     crate::info!("first use: cs {:#x} key {:#x} after {} ms", p.addr, push_key(p.tr.key, push_fits(&[&p])), t.elapsed().as_millis());
@@ -10899,6 +11078,25 @@ impl Exec {
         if appended {
             BATCHED[0].fetch_add(1, Ordering::Relaxed);
         } else if batched {
+            let miss = if indirect.is_some() {
+                0
+            } else if !simple {
+                1
+            } else {
+                match self.cs_run.as_ref() {
+                    None => 2,
+                    Some(r) if r.batch != self.batch_count => 3,
+                    Some(r) if r.uses != self.cmd_uses.get() => 4,
+                    Some(r) if r.pipeline != pipeline => 5,
+                    Some(r) if r.groups + groups[0] > BATCH_MAX_GROUPS => 6,
+                    Some(_) => 7,
+                }
+            };
+            BATCH_MISS[miss].fetch_add(1, Ordering::Relaxed);
+            *BATCH_MISS_PROGRAMS.lock().get_or_insert_with(HashMap::new).entry((p.addr, miss as u8)).or_default() += 1;
+            if miss == 4 {
+                *BATCH_MISS_SITES.lock().get_or_insert_with(HashMap::new).entry(self.last_cmd_line.get()).or_default() += 1;
+            }
             // A new batched dispatch: its arguments and table in the ring.
             let which = if self.slots[self.cur].rings[1].is_some_and(|r| r.0 == ring) { 1 } else { 0 };
             let table_bytes = 16 + 4 * (rdna::translate::BATCH_ENTRY_DWORDS * BATCH_MAX_GROUPS) as u64;

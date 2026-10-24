@@ -828,6 +828,8 @@ pub fn maybe_evict() {
     let Some(mut g) = IMAGES.try_lock() else { return };
     let Some(im) = g.as_mut() else { return };
     let out = im.evict(frame, want);
+    // What holds the memory (the first reports).
+    let largest = if EVICTED[2].load(Relaxed) < 5 { format!("; largest: {}", im.largest(6)) } else { String::new() };
     drop(g);
     if out.0.is_empty() {
         return;
@@ -835,7 +837,7 @@ pub fn maybe_evict() {
     let rounds = EVICTED[2].fetch_add(1, Relaxed) + 1;
     if rounds <= 20 || rounds % 100 == 0 {
         crate::info!(
-            "images: video memory {} of budget {} MiB at flip {frame}: evicted {} textures ({} MiB), {} images cached ({} MiB)",
+            "images: video memory {} of budget {} MiB at flip {frame}: evicted {} textures ({} MiB), {} images cached ({} MiB){largest}",
             used >> 20,
             budget >> 20,
             out.0.len(),
@@ -999,9 +1001,6 @@ pub struct Images {
     /// waiting (command buffer, fence, the staging buffer it reads; oldest
     /// first) and the command buffers and fences of completed ones.
     staging_free: Vec<Staging>,
-    /// The staging buffer of uploads waited for (`tune upload_async` 0):
-    /// kept and grown, not allocated and freed per upload.
-    sync_staging: Option<Staging>,
     inflight: std::collections::VecDeque<(vk::CommandBuffer, vk::Fence, Staging)>,
     spare_cmds: Vec<(vk::CommandBuffer, vk::Fence)>,
     reported: HashMap<String, u64>,
@@ -1199,7 +1198,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
                 .expect("image pool");
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
-            *g = Some(Images { map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), sync_staging: None, inflight: Default::default(), spare_cmds: Vec::new(), reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default() });
+            *g = Some(Images { map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), inflight: Default::default(), spare_cmds: Vec::new(), reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default() });
         }
     }
     let im = g.as_mut().unwrap();
@@ -1859,28 +1858,14 @@ impl Images {
         let st = if asynchronous {
             self.staging(total.max(4) as u64)?
         } else {
-            // Uploads waited for reuse one staging buffer: allocating and
-            // freeing host-visible memory per upload cost time on the
-            // recording threads (FINDINGS.md 2026-10-23).
-            match self.sync_staging.take() {
-                Some(s) if s.cap >= total as u64 => s,
-                old => {
-                    if let Some(s) = old {
-                        let d = &ctx().device;
-                        unsafe {
-                            d.destroy_buffer(s.buf, None);
-                            d.unmap_memory(s.mem);
-                            d.free_memory(s.mem, None);
-                        }
-                    }
-                    let cap = (total.max(4) as u64).max(1 << 20).next_power_of_two();
-                    let t0 = std::time::Instant::now();
-                    let (buf, mem, ptr) = ctx().host_buffer(cap, vk::BufferUsageFlags::TRANSFER_SRC)?;
-                    super::hitch::note_since(super::hitch::Kind::Upload, t0, || format!("the upload staging buffer grown to {} MiB", cap >> 20));
-                    STAGING_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Staging { buf, mem, ptr, cap }
-                }
-            }
+            // Uploads waited for get a staging buffer of their own, freed
+            // after them: one kept across uploads made the driver refuse to
+            // import guest memory windows thousands of times a session
+            // (2026-10-24: 3,000-75,000 failed imports against 48, then
+            // unmapped textures and device losses at cold boots; the pooled
+            // buffers of `tune upload_async` likewise).
+            let (buf, mem, ptr) = ctx().host_buffer(total.max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
+            Staging { buf, mem, ptr, cap: total.max(4) as u64 }
         };
         let dst = unsafe { std::slice::from_raw_parts_mut(st.ptr, total) };
         for &(mip, layer, off, len) in &parts {
@@ -1952,9 +1937,13 @@ impl Images {
         self.one_shot(record);
         let t_free = std::time::Instant::now();
         UPLOAD_SPLIT[2].fetch_add((t_free - t_copy).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        // The GPU is done with it (one_shot waited): kept for the next upload.
+        // The GPU is done with it (one_shot waited).
         let _ = (buf, mem);
-        self.sync_staging = Some(st);
+        unsafe {
+            c.device.destroy_buffer(st.buf, None);
+            c.device.unmap_memory(st.mem);
+            c.device.free_memory(st.mem, None);
+        }
         UPLOAD_SPLIT[1].fetch_add(t_free.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         self.uploads += 1;
         Ok((t.base, size))
@@ -2711,6 +2700,18 @@ impl Images {
     /// used first, until `want` bytes are freed: (the images to destroy,
     /// bytes, images left). A texture evicted is uploaded again from guest
     /// memory at its next use.
+    /// The `n` largest cached images, one clause each (eviction reports).
+    fn largest(&self, n: usize) -> String {
+        let mut v: Vec<(&ImageKey, &Image)> = self.map.iter().collect();
+        v.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes));
+        let parts: Vec<String> = v
+            .iter()
+            .take(n)
+            .map(|(k, i)| format!("{} MiB at {:#x} {}x{}x{} {:?} {} mips{}{}", i.bytes >> 20, k.base, k.width, k.height, k.layers, k.format, k.levels, if k.ty3d { " 3D" } else { "" }, if i.gpu_written { " GPU-written" } else { "" }))
+            .collect();
+        parts.join(", ")
+    }
+
     pub fn evict(&mut self, frame: u64, want: u64) -> (Vec<Evicted>, u64, usize) {
         let mut cands: Vec<(u64, ImageKey)> = self
             .map

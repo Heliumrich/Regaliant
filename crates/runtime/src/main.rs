@@ -9,6 +9,7 @@ mod exception;
 mod gpu;
 mod guestprof;
 mod heap;
+mod hostload;
 mod hle;
 mod input;
 mod loader;
@@ -45,6 +46,8 @@ pub struct Config {
     pub pipeline_test: Option<String>,
     /// `--record-bench <capture> [<cs address>]` (`gpu::exec::record_bench`).
     pub record_bench: Option<(String, Option<u64>)>,
+    /// `--compile-bench [min instructions] [max programs]` (`gpu::compbench`).
+    pub compile_bench: Option<Vec<String>>,
     pub trace: bool,
     pub lenient: bool,
     pub debug: bool,
@@ -135,6 +138,7 @@ fn parse_args() -> Config {
     let mut cache = None;
     let mut app = None;
     let mut pipeline_test = None;
+    let mut compile_bench: Option<Vec<String>> = None;
     let mut record_bench = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -149,6 +153,11 @@ fn parse_args() -> Config {
             "--cache" => cache = Some(PathBuf::from(args.next().expect("--cache needs a directory"))),
             "--app" => app = Some(PathBuf::from(args.next().expect("--app needs a path"))),
             "--pipeline-test" => pipeline_test = Some(args.next().expect("--pipeline-test needs a capture file")),
+            "--compile-bench" => {
+                let min = args.next().expect("--compile-bench needs <min instructions> <max programs>");
+                let max = args.next().expect("--compile-bench needs <min instructions> <max programs>");
+                compile_bench = Some(vec![min, max]);
+            }
             "--record-bench" => {
                 let file = args.next().expect("--record-bench needs a capture file");
                 let cs = args.next().and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok());
@@ -176,6 +185,7 @@ fn parse_args() -> Config {
         cache,
         pipeline_test,
         record_bench,
+        compile_bench,
     }
 }
 
@@ -1142,9 +1152,11 @@ fn main() {
         log::flush();
         std::process::exit(code);
     }
+    gpu::particles::start(cfg.app.clone());
     gpu::capture::init_from_env();
     gpu::start_profiler();
     guestprof::start();
+    hostload::start();
     if std::env::var_os("DS_TEST_FAULT").is_some() {
         info!("DS_TEST_FAULT: writing to an invalid address from host code");
         unsafe { std::ptr::write_volatile(0x32c3be8 as *mut u64, 1) };
@@ -1196,6 +1208,11 @@ fn main() {
         Some(p) => cache_root.join(p),
         None => cache_root.join("shader-specs.txt"),
     });
+    if let Some(a) = &cfg.compile_bench {
+        let code = gpu::compbench::run(a);
+        log::flush();
+        std::process::exit(code);
+    }
 
     // Modules: the decrypted executable and the title's own libraries.
     let t0 = Instant::now();

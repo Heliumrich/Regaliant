@@ -163,12 +163,19 @@ pub fn shader_code_size(addr: u64) -> Option<usize> {
 /// program at `addr` expects a draw's start instance, if it has one.
 pub fn instance_offset_slot(addr: u64) -> Option<u32> {
     // From this thread's copy: indirect draws ask for every draw, and the
-    // registry's lock is shared by all recording threads.
+    // registry's lock is shared by all recording threads. Consecutive draws
+    // mostly keep their shader: the last answer is checked first (the map
+    // lookup was ~10% of the graphics CP's busy time at a vista).
     thread_local! {
-        static MEMO: std::cell::RefCell<(u64, std::collections::HashMap<u64, Option<u32>>)> = std::cell::RefCell::new((u64::MAX, std::collections::HashMap::new()));
+        static LAST: std::cell::Cell<(u64, u64, Option<u32>)> = const { std::cell::Cell::new((u64::MAX, u64::MAX, None)) };
+        static MEMO: std::cell::RefCell<(u64, crate::gpu::fx::Map<u64, Option<u32>>)> = std::cell::RefCell::new((u64::MAX, Default::default()));
     }
     let g = SHADERS_GEN.load(std::sync::atomic::Ordering::Acquire);
-    MEMO.with(|m| {
+    let (lg, la, lv) = LAST.get();
+    if lg == g && la == addr && crate::gpu::tune::plan_fast() {
+        return lv;
+    }
+    let v = MEMO.with(|m| {
         let mut m = m.borrow_mut();
         if m.0 != g {
             m.0 = g;
@@ -180,7 +187,9 @@ pub fn instance_offset_slot(addr: u64) -> Option<u32> {
         let v = SHADERS.lock().get(&addr).and_then(|&(_, _, s, _)| s).map(u32::from);
         m.1.insert(addr, v);
         v
-    })
+    });
+    LAST.set((g, addr, v));
+    v
 }
 
 /// How many shader objects have been created (changes with every creation).

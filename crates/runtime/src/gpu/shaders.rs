@@ -243,6 +243,7 @@ impl<T> std::ops::Deref for Local<T> {
     }
 }
 
+#[derive(Clone)]
 pub struct Translated {
     pub out: Output,
     pub plan: Arc<Plan>,
@@ -256,7 +257,7 @@ pub struct Translated {
     pub spec: Spec,
 }
 
-fn hash_words(w: &[u32]) -> u64 {
+pub(crate) fn hash_words(w: &[u32]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     w.hash(&mut h);
     h.finish()

@@ -241,6 +241,22 @@ fn keep_code(addr: u64, h: u64) {
     }
 }
 
+/// The learned compute programs whose code is kept, with their specs
+/// (`--compile-bench`).
+pub(crate) fn learned_compute() -> Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<Spec>)> {
+    load();
+    let codes = CODES.lock().clone().unwrap_or_default();
+    learned(|m| {
+        m.iter()
+            .filter_map(|(h, (_, seen))| {
+                let code = codes.get(h)?.clone();
+                let specs = seen.iter().map(|s| super::shaders::compute_spec(0, *h, s.rsrc2, s.local, s.wave64, s.resources.clone())).collect();
+                Some((*h, code, specs))
+            })
+            .collect()
+    })
+}
+
 fn code_of(h: u64) -> Option<std::sync::Arc<Vec<u32>>> {
     load();
     CODES.lock().as_ref().and_then(|m| m.get(&h).cloned())

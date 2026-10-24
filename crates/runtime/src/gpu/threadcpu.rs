@@ -96,6 +96,24 @@ fn title_snapshot() -> HashMap<u32, (String, u64)> {
 
 static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
 
+/// The front end's cycles and commands at the start of the frame window
+/// (`gpu::pacing`, its own windows beside the profile's).
+static FRAMES_WINDOW: Mutex<Option<([u64; KINDS.len()], u64)>> = Mutex::new(None);
+
+/// The frame window's front-end CPU per flip by kind (one clause of the
+/// `frames at` line; cycle counts are not moved by other programs' load the
+/// way frame rates are), and a new window.
+pub fn frames_window_clause(flips: u64) -> String {
+    let now = (snapshot(), commands());
+    let Some((c0, k0)) = FRAMES_WINDOW.lock().replace(now) else { return String::new() };
+    let flips = flips.max(1) as f64;
+    let d: Vec<u64> = (0..KINDS.len()).map(|i| now.0[i].saturating_sub(c0[i])).collect();
+    let all: u64 = d.iter().sum();
+    let cmds = now.1.saturating_sub(k0).max(1);
+    let main: Vec<String> = ["gfx", "acb", "par"].iter().map(|k| format!("{k} {:.1}", ms(d[KINDS.iter().position(|x| x == k).unwrap()]) / flips)).collect();
+    format!("; front-end CPU ms per flip: {} (all {:.1}; {:.2} us per command)", main.join(", "), ms(all) / flips, ms(all) * 1000.0 / cmds as f64)
+}
+
 /// Starts a profile window (`profile reset`).
 pub fn reset_window() {
     let w = Window { at: Instant::now(), cycles: snapshot(), flips: super::FRAMES.load(Ordering::Relaxed), commands: commands(), splits: super::cp::SPLITS.load(Ordering::Relaxed), title: title_snapshot() };

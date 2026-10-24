@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 165] = [
+    static ALL: [Tunable; 168] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -198,6 +198,9 @@ pub mod tune {
         Tunable { name: "past_runs", env: "DS_PAST_RUNS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_drop", env: "DS_PAST_DROP", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "acm_reverb", env: "DS_ACM_REVERB", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "trace_waits", env: "DS_TRACE_WAITS_N", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "plan_fast", env: "DS_PLAN_FAST", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "async_particles", env: "DS_ASYNC_PARTICLES", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1782,6 +1785,31 @@ pub mod tune {
         get(164) != 0
     }
 
+    /// The graphics CP's label waits of 1 ms or more still to be logged in
+    /// detail (`tune trace_waits <n>`: the next n, wherever they happen;
+    /// `DS_TRACE_WAITS=<queue>` logs a queue's first 200 from the start).
+    pub fn take_trace_waits() -> bool {
+        get(165) > 0 && ALL[165].value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| if v != UNSET && v > 0 { Some(v - 1) } else { None }).is_ok()
+    }
+
+    /// The graphics CP's planning of parallel runs without its costliest
+    /// steps (2026-10-23, a vista's profile): indirect-argument ranges
+    /// merged as they come instead of sorted, run costs pruned once a frame,
+    /// the instance-offset slot's last answer reused; 0: as before (A/B).
+    #[inline]
+    pub fn plan_fast() -> bool {
+        get(166) != 0
+    }
+
+    /// The title's particle programs (`agc::is_particle_program`) compile in
+    /// the background at their first use, their dispatches left out until
+    /// then, instead of the command processor stopping for the compile
+    /// (`exec::compile_in_background`); 0: compiled where first used.
+    #[inline]
+    pub fn async_particles() -> bool {
+        get(167) != 0
+    }
+
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
     /// without appends).
     #[inline]
@@ -1807,8 +1835,10 @@ pub mod tune {
 }
 
 pub mod ahead;
+pub mod compbench;
 pub mod compile;
 pub mod pacing;
+pub mod particles;
 pub mod forward;
 pub mod par;
 pub mod prio;
@@ -2534,6 +2564,7 @@ pub fn reset_profile() {
         }
     }
     exec::reset_shader_profile();
+    exec::reset_batch_misses();
     cp::reset_wait_stats();
     par::reset_stats();
     lockstat::reset_stats();
@@ -2572,6 +2603,7 @@ pub fn profile_report() -> String {
         s.push_str(&crate::mem::ww_lines());
     }
     s.push_str(&exec::push_line());
+    s.push_str(&exec::async_line());
     s.push_str(&exec::import_window_line());
     s.push_str(&crate::mem::host_calls_line());
     s.push_str(&xwait::status());

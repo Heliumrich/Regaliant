@@ -944,6 +944,41 @@ pub fn os_readable(a: u64, len: u64) -> bool {
     true
 }
 
+/// The operating system's regions over [a, a+len): one clause each
+/// (state, protection, type), at most `max` (diagnostics of failed imports).
+pub fn os_regions(a: u64, len: u64, max: usize) -> String {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let end = a.saturating_add(len.max(1));
+    let mut p = a;
+    let mut out = Vec::new();
+    while p < end && out.len() < max {
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(p as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+            out.push(format!("{p:#x}: query failed"));
+            break;
+        }
+        let next = (mbi.BaseAddress as u64 + mbi.RegionSize as u64).min(end);
+        let state = match mbi.State {
+            0x1000 => "commit",
+            0x2000 => "reserve",
+            0x10000 => "free",
+            _ => "?",
+        };
+        let ty = match mbi.Type {
+            0x20000 => "private",
+            0x40000 => "mapped",
+            0x1000000 => "image",
+            _ => "-",
+        };
+        out.push(format!("{p:#x}+{:#x} {state} prot {:#x} {ty}", next - p, mbi.Protect));
+        if next <= p {
+            break;
+        }
+        p = next;
+    }
+    out.join(", ")
+}
+
 /// Kernel-mode accesses of guest memory that failed and were retried
 /// (`kernel_io`): [calls, retries, calls that failed for good].
 pub static KERNEL_IO: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];

@@ -320,6 +320,12 @@ pub fn with_cache<T>(kind: char, key: u64, create: impl FnOnce(vk::PipelineCache
     r
 }
 
+/// Whether the store holds the pipeline of `key` (its creation then takes
+/// milliseconds, not the seconds of a first compile).
+pub fn stored(kind: char, key: u64) -> bool {
+    DIR.get().is_some_and(|dir| dir.join(format!("{kind}{key:016x}.bin")).exists())
+}
+
 /// One status line.
 pub fn status() -> String {
     let s: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();

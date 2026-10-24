@@ -332,6 +332,9 @@ pub struct Cp {
     /// Per-command recording costs of the parallel runs seen, by run
     /// signature (`tune par_cost`).
     run_costs: HashMap<u64, RunCost>,
+    /// The frame `run_costs` was last pruned in (at most once a frame: a
+    /// vista's runs keep it above its bound).
+    run_costs_pruned: u64,
     /// The frame-ahead recorder's state while it records a frame ahead
     /// (`gpu::frameahead`; None: an ordinary command processor).
     pub(super) held: Option<Box<super::frameahead::HeldCp>>,
@@ -1406,10 +1409,11 @@ fn long_wait(waiter: &str, a: u64, wide: bool, func: u32, mask: u64, reference: 
         e[slot] += 1;
     }
     // DS_TRACE_WAITS=<queue>: that queue's long waits (the first 200), with
-    // the same detail, whenever they happen.
+    // the same detail, whenever they happen; `tune trace_waits <n>`: the
+    // graphics CP's next n.
     static TRACE_Q: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     static TRACED_Q: AtomicU64 = AtomicU64::new(0);
-    let traced = TRACE_Q.get_or_init(|| std::env::var("DS_TRACE_WAITS").ok()).as_deref() == Some(waiter) && TRACED_Q.fetch_add(1, Ordering::Relaxed) < 200;
+    let traced = (TRACE_Q.get_or_init(|| std::env::var("DS_TRACE_WAITS").ok()).as_deref() == Some(waiter) && TRACED_Q.fetch_add(1, Ordering::Relaxed) < 200) || (waiter == "gpu-gfx" && super::tune::take_trace_waits());
     if traced || LONG_WAITS_LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
         let promise = match p {
             None => "none".to_string(),
@@ -1535,6 +1539,7 @@ impl Cp {
             par_pool: super::par::Pool::new(),
             chunk_costs: None,
             run_costs: HashMap::new(),
+            run_costs_pruned: u64::MAX,
             last_wait_gpu: false,
             last_wait_kind: b'-',
             held: None,
@@ -2161,13 +2166,39 @@ impl Cp {
             }
             args.retain(|&(a, n)| !(n == 20 && super::homes::contains(a, n)));
         }
-        if !args.is_empty() {
+        if !args.is_empty() && !super::tune::plan_fast() {
             args.sort_unstable();
             let mut merged: Vec<(u64, u64)> = Vec::new();
             for (a, n) in args {
                 match merged.last_mut() {
                     Some(m) if a <= m.0 + m.1 + 4096 => m.1 = m.1.max(a + n - m.0),
                     _ => merged.push((a, n)),
+                }
+            }
+            self.sync_reads(&merged);
+        } else if !args.is_empty() {
+            // The records come from a few arrays, interleaved (sorting
+            // thousands per run was ~13% of the graphics CP's busy time at
+            // a vista): each extends the open range it continues (one per
+            // array), then the few ranges left are sorted and merged; the
+            // same ranges as sorting them all (gaps of up to 4 KiB closed).
+            let mut open: Vec<(u64, u64)> = Vec::new();
+            for (a, n) in args {
+                let e = a + n;
+                match open.iter_mut().rev().take(8).find(|r| a <= r.1 + 4096 && e + 4096 >= r.0) {
+                    Some(r) => {
+                        r.0 = r.0.min(a);
+                        r.1 = r.1.max(e);
+                    }
+                    None => open.push((a, e)),
+                }
+            }
+            open.sort_unstable();
+            let mut merged: Vec<(u64, u64)> = Vec::new();
+            for (a, e) in open {
+                match merged.last_mut() {
+                    Some(m) if a <= m.0 + m.1 + 4096 => m.1 = m.1.max(e - m.0),
+                    _ => merged.push((a, e - a)),
                 }
             }
             self.sync_reads(&merged);
@@ -2185,7 +2216,8 @@ impl Cp {
         let sig = if timed { (sig ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1 } else { 0 };
         let frame = super::FRAMES.load(Ordering::Relaxed);
         let costed = if timed {
-            if self.run_costs.len() > 512 {
+            if self.run_costs.len() > 512 && (self.run_costs_pruned != frame || !super::tune::plan_fast()) {
+                self.run_costs_pruned = frame;
                 self.run_costs.retain(|_, r| r.seen + 120 >= frame);
             }
             let rc = self.run_costs.entry(sig).or_insert_with(|| RunCost { costs: vec![f32::NAN; n], seen: frame });
