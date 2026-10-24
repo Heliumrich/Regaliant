@@ -86,7 +86,7 @@ pub mod tune {
         Tunable { name: "pre_big_max", env: "DS_PRE_BIG_MAX", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_big_mib", env: "DS_PRE_BIG_MIB", default: 1024, value: AtomicU64::new(UNSET) },
         Tunable { name: "home_reads", env: "DS_HOME_READS", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "shadow_share", env: "DS_SHADOW_SHARE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "shadow_share", env: "DS_SHADOW_SHARE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "clean_pages", env: "DS_CLEAN_PAGES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "eop_light", env: "DS_EOP_LIGHT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ts_nowait", env: "DS_TS_NOWAIT", default: 1, value: AtomicU64::new(UNSET) },
@@ -699,11 +699,15 @@ pub mod tune {
 
     /// A written-buffer shadow's working copy becomes a shared copy of its
     /// window after its merge (`precache`), and the next shadow of the window
-    /// is copied in from it instead of from guest memory across PCIe. Off by
-    /// default: with it (or `eop_light`) the GPU was lost at a World 5-1
-    /// load after 4-2 and 4-3 in every tour (FINDINGS.md 2026-10-13), and a
-    /// write recorded by another queue after the lookup but executed before
-    /// the copy in is not seen by it.
+    /// is copied in from it instead of from guest memory across PCIe (and
+    /// read-only bindings of the window bind it). On by default since
+    /// 2026-10-24 night: the GPU's work -3 ms a frame in 1-1, +2.5% at the
+    /// vista, tours clean and its self-check (`DS_SHADOW_SHARE_CHECK`) clean
+    /// over 31,490 samples. The device losses of 2026-10-13 with it came from
+    /// the timestamps' waiting copies (`tune ts_nowait`). Known gap: a write
+    /// recorded by another queue after the lookup but executed before the
+    /// copy in is not seen by it (the 2026-10-23 census of the gate's small
+    /// windows found none merged by a second queue).
     #[inline]
     pub fn shadow_share() -> bool {
         get(53) != 0
