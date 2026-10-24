@@ -14,7 +14,127 @@
 
 use std::time::Instant;
 
-pub fn run(args: &[String]) -> i32 {
+/// `DS_CB_GUESS=1`: no compiles; every learned compute program's spec
+/// guessed as from its shader object (`shaders::guess_compute_spec`, with
+/// its learned RSRC2 and thread-group size) and compared with what its
+/// dispatches used, overall and for the engine's own shaders
+/// (coredata/enginesupport/shaders); typed buffers' formats by access.
+fn guess_report(app: &std::path::Path) -> i32 {
+    use rdna::translate::ResSpec;
+    use std::collections::HashMap;
+    // (Specs depend on the device's features.)
+    if let Err(e) = super::vk::init() {
+        crate::error!("guess report: Vulkan: {e}");
+        return 2;
+    }
+    // The engine's programs by code hash.
+    let mut engine = std::collections::HashSet::new();
+    let mut stack = vec![app.join("coredata").join("enginesupport").join("shaders").join("_ps5")];
+    let mut files = 0;
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "csdr") {
+                files += 1;
+                if let Some(v) = std::fs::read(&p).ok().and_then(|b| super::particles::bundle_programs(&b)) {
+                    engine.extend(v.iter().filter(|x| x.stage == 0).map(|x| x.hash));
+                }
+            }
+        }
+    }
+    crate::info!("guess report: {} engine compute programs in {files} engine shader files", engine.len());
+    // [specs, equal, format-only, other] overall and for engine programs.
+    let mut n = [[0u64; 4]; 2];
+    let mut other_why: HashMap<&'static str, u64> = HashMap::new();
+    // Format-accessed buffers: access pattern -> (format, dst_sel) -> count.
+    let mut by_access: HashMap<String, HashMap<(u8, u16), u64>> = HashMap::new();
+    let mut engine_learned = 0;
+    for (h, code, specs) in super::precompile::learned_compute() {
+        let Ok(insts) = rdna::decode_program(&code) else { continue };
+        let is_engine = engine.contains(&h);
+        engine_learned += is_engine as u64;
+        for spec in &specs {
+            let plan = rdna::analysis::analyze_opts(&insts, spec.user_sgprs, spec.user_base, false);
+            let (guess, _) = super::shaders::guess_compute_spec(0, &insts, &plan, h, spec.cs_rsrc2, spec.cs_local_size);
+            let mut actual = spec.clone();
+            actual.code_base = guess.code_base;
+            let class = if guess == actual {
+                1
+            } else {
+                let mut g2 = guess.clone();
+                let mut fmt_only = g2.resources.len() == actual.resources.len();
+                if fmt_only {
+                    for (r, (a, b)) in g2.resources.iter_mut().zip(&actual.resources).enumerate() {
+                        match (&*a, b) {
+                            (ResSpec::Buffer { .. }, ResSpec::Buffer { format, dst_sel }) => {
+                                if a != b {
+                                    // The buffer's format accesses, as a key.
+                                    let mut names: Vec<&str> = insts.iter().filter(|i| plan.inst_res.get(&i.pc).is_some_and(|x| x.0 == r)).filter_map(|i| i.name()).filter(|n| n.contains("_format_")).collect();
+                                    names.sort();
+                                    names.dedup();
+                                    *by_access.entry(names.join("+")).or_default().entry((*format, *dst_sel)).or_default() += 1;
+                                }
+                                *a = b.clone();
+                            }
+                            (ResSpec::Image { dim: d1, class: c1, depth: z1 }, ResSpec::Image { dim: d2, class: c2, depth: z2 }) => {
+                                if d1 != d2 {
+                                    *other_why.entry("an image's dimension").or_default() += 1;
+                                } else if c1 != c2 {
+                                    *other_why.entry("an image's class").or_default() += 1;
+                                } else if z1 != z2 {
+                                    *other_why.entry("an image's depth view").or_default() += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    fmt_only = g2 == actual;
+                }
+                if fmt_only {
+                    2
+                } else {
+                    if g2.resources.len() != actual.resources.len() {
+                        *other_why.entry("resource count").or_default() += 1;
+                    } else if g2.wave64 != actual.wave64 {
+                        *other_why.entry("wave64").or_default() += 1;
+                    }
+                    3
+                }
+            };
+            for (k, on) in [(0, true), (1, is_engine)] {
+                if on {
+                    n[k][0] += 1;
+                    n[k][class] += 1;
+                }
+            }
+        }
+    }
+    for (k, what) in [(0, "all learned"), (1, "engine")] {
+        crate::info!("guess report ({what}): {} specs: guess equal {}, equal but for typed buffers' formats {}, different {}", n[k][0], n[k][1], n[k][2], n[k][3]);
+    }
+    crate::info!("guess report: {engine_learned} of the learned programs are the engine's; other differences: {other_why:?}");
+    let mut keys: Vec<(&String, &HashMap<(u8, u16), u64>)> = by_access.iter().collect();
+    keys.sort_by_key(|(_, m)| std::cmp::Reverse(m.values().sum::<u64>()));
+    let (mut all, mut top) = (0u64, 0u64);
+    for (k, m) in keys {
+        let mut v: Vec<(&(u8, u16), &u64)> = m.iter().collect();
+        v.sort_by_key(|(_, c)| std::cmp::Reverse(**c));
+        let total: u64 = m.values().sum();
+        all += total;
+        top += *v[0].1;
+        let list: Vec<String> = v.iter().take(4).map(|((f, d), c)| format!("{f}/{d:#x} {c}")).collect();
+        crate::info!("    {k}: {total} ({})", list.join(", "));
+    }
+    crate::info!("guess report: the most frequent format of each access pattern would be right for {top} of {all} typed buffers");
+    0
+}
+
+pub fn run(args: &[String], app: &std::path::Path) -> i32 {
+    if std::env::var("DS_CB_GUESS").ok().as_deref() == Some("1") {
+        return guess_report(app);
+    }
     let min_insts: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(2000);
     let max: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(40);
     let mut only: Vec<u64> = std::env::var("DS_CB_HASHES").map(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default();

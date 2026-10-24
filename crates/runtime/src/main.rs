@@ -1209,7 +1209,7 @@ fn main() {
         None => cache_root.join("shader-specs.txt"),
     });
     if let Some(a) = &cfg.compile_bench {
-        let code = gpu::compbench::run(a);
+        let code = gpu::compbench::run(a, &cfg.app);
         log::flush();
         std::process::exit(code);
     }

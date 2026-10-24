@@ -50,29 +50,52 @@ fn scan(app: &std::path::Path) {
     *HASHES.write() = Some(set);
 }
 
-/// Adds the code hashes of a bundle's programs: false when its layout is
-/// not the expected one.
-fn programs(b: &[u8], set: &mut HashSet<u64>) -> bool {
+/// A program of a shader bundle: its stage, code hash, code (up to its last
+/// instruction, as the run time hashes it) and the shader object after it.
+pub(super) struct BundleProgram {
+    pub stage: u32,
+    pub hash: u64,
+    pub code: Vec<u32>,
+    pub object: Vec<u8>,
+}
+
+/// The programs of a shader bundle (`.csdr`), None when its layout is not
+/// the expected one.
+pub(super) fn bundle_programs(b: &[u8]) -> Option<Vec<BundleProgram>> {
     let rd = |o: usize| b.get(o..o + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]));
     // (The first word varies by bundle, 0x1d00-0x3c00 seen.)
-    let (Some(_), Some(n)) = (rd(0), rd(4)) else { return false };
+    let (Some(_), Some(n)) = (rd(0), rd(4)) else { return None };
     if n == 0 || n > 64 {
-        return false;
+        return None;
     }
+    let mut out = Vec::new();
     for i in 0..n as usize {
         let e = 8 + 20 * i;
-        let (Some(size), Some(off)) = (rd(e + 8), rd(e + 16)) else { return false };
+        let (stage, size, meta, off) = (rd(e)?, rd(e + 8)?, rd(e + 12)?, rd(e + 16)?);
         let at = e + 16 + off as usize;
-        let Some(code) = b.get(at..at + size as usize) else { return false };
+        let code = b.get(at..at + size as usize)?;
+        let object = b.get(at + size as usize..at + size as usize + meta as usize).unwrap_or(&[]).to_vec();
         let words: Vec<u32> = code.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-        // As a program's code hash at run time: up to its last instruction.
-        let Some(end) = rdna::decode_program(&words).ok().and_then(|v| v.last().map(|l| (l.pc / 4 + l.len as u32) as usize)) else { return false };
+        let end = rdna::decode_program(&words).ok().and_then(|v| v.last().map(|l| (l.pc / 4 + l.len as u32) as usize))?;
         if end != words.len() {
             STATS[4].fetch_add(1, Ordering::Relaxed);
         }
-        set.insert(super::shaders::hash_words(&words[..end.min(words.len())]));
+        let code = words[..end.min(words.len())].to_vec();
+        out.push(BundleProgram { stage, hash: super::shaders::hash_words(&code), code, object });
     }
-    true
+    Some(out)
+}
+
+/// Adds the code hashes of a bundle's programs: false when its layout is
+/// not the expected one.
+fn programs(b: &[u8], set: &mut HashSet<u64>) -> bool {
+    match bundle_programs(b) {
+        Some(v) => {
+            set.extend(v.iter().map(|p| p.hash));
+            true
+        }
+        None => false,
+    }
 }
 
 /// Whether the program with this code hash is one of the title's particle
