@@ -1977,8 +1977,9 @@ impl Exec {
                     c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, super::STAMPS * ti + k);
                 }
                 self.batch_shaders.push(super::DRAW_KEY | if ps_addr != 0 { ps_addr } else { vs.addr });
-            } else if super::profiling() {
-                // Batch GPU time by command (`note_batch_by`).
+            } else {
+                // The batch's commands (its GPU time by kind: `note_batch_by`,
+                // the hitch reports; slow and lost batches name them).
                 self.batch_shaders.push(super::DRAW_KEY | if ps_addr != 0 { ps_addr } else { vs.addr });
             }
         }
@@ -2341,9 +2342,7 @@ impl Exec {
             r.n += 1;
             r.count.write(r.n);
         }
-        if super::profiling() {
-            self.batch_shaders.push(super::DRAW_KEY | ps.addr);
-        }
+        self.batch_shaders.push(super::DRAW_KEY | ps.addr);
         BATCH_DRAWS[1].fetch_add(1, Ordering::Relaxed);
         Ok(Some(true))
     }
@@ -2567,9 +2566,7 @@ impl Exec {
                 (None, Some(_)) => return Ok(None),
             }
         }
-        if super::profiling() {
-            self.batch_shaders.push(super::DRAW_KEY | ps.map_or(vs.addr, |p| p.addr));
-        }
+        self.batch_shaders.push(super::DRAW_KEY | ps.map_or(vs.addr, |p| p.addr));
         AGAIN[0].fetch_add(1, Ordering::Relaxed);
         Ok(Some(true))
     }
