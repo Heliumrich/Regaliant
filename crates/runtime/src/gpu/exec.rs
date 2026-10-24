@@ -1986,7 +1986,7 @@ fn record_copies(cmd: vk::CommandBuffer, copies: &mut Vec<(vk::Buffer, vk::Buffe
 
 /// Records a prologue's remaining copies and ends it (`Exec::end_pre`; on
 /// the submission thread with `tune submit_finish`).
-fn finish_pre(pre: vk::CommandBuffer, copies: &mut Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>, after: &mut Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>, qp: vk::QueryPool) {
+fn finish_pre(pre: vk::CommandBuffer, copies: &mut Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>, after: &mut Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>, bq: vk::QueryPool) {
     record_copies(pre, copies);
     if !after.is_empty() {
         global_barrier(pre);
@@ -1994,8 +1994,8 @@ fn finish_pre(pre: vk::CommandBuffer, copies: &mut Vec<(vk::Buffer, vk::Buffer, 
     }
     unsafe {
         global_barrier(pre);
-        if qp != vk::QueryPool::null() {
-            ctx().device.cmd_write_timestamp(pre, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED + 3);
+        if bq != vk::QueryPool::null() {
+            ctx().device.cmd_write_timestamp(pre, vk::PipelineStageFlags::BOTTOM_OF_PIPE, bq, BQ_PRE + 1);
         }
         ctx().device.end_command_buffer(pre).ok();
     }
@@ -2010,16 +2010,16 @@ fn finish_xpre(x: vk::CommandBuffer, copies: &mut Vec<(vk::Buffer, vk::Buffer, v
     }
 }
 
-/// Ends a batch's command buffer: its end timestamp (profiling; the
+/// Ends a batch's command buffer: its end timestamp (`Slot::bq`; the
 /// prologue's read as unavailable when it has none) and a barrier making
 /// shader writes to imported memory visible to the host.
-fn finish_main(cmd: vk::CommandBuffer, qp: vk::QueryPool, has_pre: bool) {
+fn finish_main(cmd: vk::CommandBuffer, bq: vk::QueryPool, has_pre: bool) {
     let c = ctx();
     unsafe {
-        if qp != vk::QueryPool::null() {
-            c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED + 1);
+        if bq != vk::QueryPool::null() {
+            c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, bq, BQ_BATCH + 1);
             if !has_pre {
-                c.device.cmd_reset_query_pool(cmd, qp, STAMPS * MAX_TIMED + 2, 2);
+                c.device.cmd_reset_query_pool(cmd, bq, BQ_PRE, 2);
             }
         }
         let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
@@ -3010,6 +3010,8 @@ pub type Action = Box<dyn FnOnce() + Send>;
 /// A submitted batch (or action-only entry) awaiting completion.
 struct Batch {
     queries: vk::QueryPool,
+    /// Its batch and prologue timestamps (`Slot::bq`).
+    bq: vk::QueryPool,
     seq: u64,
     /// Null for action-only entries.
     fence: vk::Fence,
@@ -3703,7 +3705,7 @@ pub fn wait_done(seq: u64) {
 
 /// Queues a batch: `submit` runs (the vkQueueSubmit) under the queue lock so
 /// sequence order is submission order.
-fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, gpu_labels: Vec<(u64, u64, u8)>, ops: [u64; OPS], segs: Vec<SegMark>, reset: Option<SlotReset>, submit: impl FnOnce(u64) + Send + 'static) -> u64 {
+fn push_batch(fence: vk::Fence, queries: vk::QueryPool, bq: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, gpu_labels: Vec<(u64, u64, u8)>, ops: [u64; OPS], segs: Vec<SegMark>, reset: Option<SlotReset>, submit: impl FnOnce(u64) + Send + 'static) -> u64 {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         crate::thread::spawn_host("gpu-complete", 1 << 20, Box::new(completion_thread)).expect("gpu completion thread");
@@ -3726,7 +3728,7 @@ fn push_batch(fence: vk::Fence, queries: vk::QueryPool, actions: Vec<Action>, ch
         submit(seq);
         note_submitted(seq);
     }
-    q.push_back(Batch { queries, seq, fence, actions, checks, shaders, submitted: std::time::Instant::now(), name: name.to_string(), gpu_labels, ops, segs, reset });
+    q.push_back(Batch { queries, bq, seq, fence, actions, checks, shaders, submitted: std::time::Instant::now(), name: name.to_string(), gpu_labels, ops, segs, reset });
     BATCHES_CV.notify_one();
     seq
 }
@@ -3818,7 +3820,7 @@ fn completion_thread() {
                 }
             }
             FLUSHES.fetch_add(1, Ordering::Relaxed);
-            collect_timestamps(b.queries, &b.shaders, &b.name, b.seq, &b.segs, &b.ops);
+            collect_timestamps(b.bq, b.queries, &b.shaders, &b.name, b.seq, &b.segs, &b.ops);
             check_watchdog(&b.name, &b.shaders);
             let ms = b.submitted.elapsed().as_millis();
             if ms >= 250 {
@@ -4030,6 +4032,9 @@ struct Slot {
     seq: u64,
     /// Timestamp queries around each dispatch (DS_PROFILE_GPU=1).
     queries: vk::QueryPool,
+    /// The batch's own timestamps (`batch_stamps`): its start and end
+    /// (BQ_BATCH) and its prologue's (BQ_PRE).
+    bq: vk::QueryPool,
     /// The SGPR data rings (RING_SEG each): system memory and video memory
     /// (allocated when `tune ring_vram` first chooses it).
     rings: [Option<(vk::Buffer, *mut u8)>; 2],
@@ -4161,7 +4166,12 @@ impl Slot {
                 desc_pool: c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(POOL_LIMITS[0]).pool_sizes(&sizes), None).map_err(|e| e.to_string())?,
                 seq: 0,
                 queries: if profiling() {
-                    c.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(STAMPS * MAX_TIMED + 4), None).map_err(|e| e.to_string())?
+                    c.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(STAMPS * MAX_TIMED), None).map_err(|e| e.to_string())?
+                } else {
+                    vk::QueryPool::null()
+                },
+                bq: if batch_stamps() {
+                    c.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(4), None).map_err(|e| e.to_string())?
                 } else {
                     vk::QueryPool::null()
                 },
@@ -4287,6 +4297,21 @@ fn title_clock_k() -> Option<u64> {
 }
 
 const MAX_TIMED: u32 = 4096;
+/// The batch timestamps' queries in `Slot::bq`: the batch's start and end,
+/// its prologue's start and end.
+const BQ_BATCH: u32 = 0;
+const BQ_PRE: u32 = 2;
+
+/// Timestamps at every batch's start and end and its prologue's (`Slot::bq`;
+/// `DS_BATCH_STAMPS=0` at boot: none): each batch's span on the GPU, for the
+/// hitch reports (`hitch::gpu_batch`: what the GPU was doing in a long
+/// frame) and the frame windows' GPU busy time; with DS_PROFILE_GPU the
+/// profile's batch times.
+pub(super) fn batch_stamps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| profiling() || std::env::var("DS_BATCH_STAMPS").ok().as_deref() != Some("0"))
+}
+
 /// Timed draws are keyed by their pixel shader (vertex shader without one)
 /// with this bit set.
 const DRAW_KEY: u64 = 1 << 63;
@@ -5221,12 +5246,29 @@ static IDLE: Mutex<(u64, Option<HashMap<String, [u64; 3]>>)> = Mutex::new((0, No
 /// -> [batches, ns, commands].
 static BATCH_BY: Mutex<Option<HashMap<(String, u64), [u64; 3]>>> = Mutex::new(None);
 
-fn note_batch_by(queue: &str, shaders: &[u64], ns: u64) {
+/// A batch's most frequent command (draws by pixel shader with DRAW_KEY; 0:
+/// none), the key its GPU time is counted under.
+fn batch_key(shaders: &[u64]) -> u64 {
     let mut counts: HashMap<u64, u32> = HashMap::new();
     for &a in shaders {
         *counts.entry(a).or_default() += 1;
     }
-    let key = counts.iter().max_by_key(|(a, n)| (**n, std::cmp::Reverse(**a))).map_or(0, |(a, _)| *a);
+    counts.iter().max_by_key(|(a, n)| (**n, std::cmp::Reverse(**a))).map_or(0, |(a, _)| *a)
+}
+
+/// The name of a batch key (`batch_key`) in reports.
+pub(super) fn batch_key_name(a: u64) -> String {
+    if a & DRAW_KEY != 0 {
+        format!("draws {:#x}", a & !DRAW_KEY)
+    } else if a == 0 {
+        "(no commands)".to_string()
+    } else {
+        format!("cs {a:#x}")
+    }
+}
+
+fn note_batch_by(queue: &str, shaders: &[u64], ns: u64) {
+    let key = batch_key(shaders);
     let mut g = BATCH_BY.lock();
     let e = g.get_or_insert_with(HashMap::new).entry((queue.to_string(), key)).or_insert([0; 3]);
     e[0] += 1;
@@ -5267,14 +5309,31 @@ fn batch_contents(shaders: &[u64]) -> String {
     }
 }
 
-/// Reads a completed batch's dispatch timestamps into SHADER_TIME.
-fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str, seq: u64, segs: &[SegMark], ops: &[u64; OPS]) {
-    if pool == vk::QueryPool::null() {
+/// Reads a completed batch's timestamps: its span on the GPU (`bq`) for the
+/// hitch reports, and with DS_PROFILE_GPU its batch, prologue and dispatch
+/// times (`pool`) into the profile.
+fn collect_timestamps(bq: vk::QueryPool, pool: vk::QueryPool, shaders: &[u64], queue: &str, seq: u64, segs: &[SegMark], ops: &[u64; OPS]) {
+    if bq == vk::QueryPool::null() {
         return;
     }
     let c = ctx();
     let mut be = [0u64; 2];
-    if unsafe { c.device.get_query_pool_results(pool, STAMPS * MAX_TIMED, &mut be, vk::QueryResultFlags::TYPE_64) }.is_ok() {
+    let mut pre = [0u64; 2];
+    let got_be = unsafe { c.device.get_query_pool_results(bq, BQ_BATCH, &mut be, vk::QueryResultFlags::TYPE_64) }.is_ok();
+    let got_pre = unsafe { c.device.get_query_pool_results(bq, BQ_PRE, &mut pre, vk::QueryResultFlags::TYPE_64) }.is_ok();
+    if got_be {
+        let start = if got_pre && pre[0] != 0 && pre[0] < be[0] { pre[0] } else { be[0] };
+        super::hitch::gpu_batch(queue, seq, start, be[1], shaders.len() as u32, batch_key(shaders), || {
+            // Its leading commands and its other operations (copies, fills,
+            // merges and their sizes).
+            let o = ops_line(ops);
+            if o.is_empty() { batch_contents(shaders) } else { format!("{}; {o}", batch_contents(shaders)) }
+        });
+    }
+    if pool == vk::QueryPool::null() {
+        return;
+    }
+    if got_be {
         let period = c.limits.timestamp_period as f64;
         let batch_ns = (be[1].saturating_sub(be[0]) as f64 * period) as u64;
         if super::timeline::on() {
@@ -5301,8 +5360,7 @@ fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str, seq: u6
             collect_segments(pool, shaders, segs, ops, be, queue);
         }
     }
-    let mut pre = [0u64; 2];
-    if unsafe { c.device.get_query_pool_results(pool, STAMPS * MAX_TIMED + 2, &mut pre, vk::QueryResultFlags::TYPE_64) }.is_ok() {
+    if got_pre {
         PRE_NS.fetch_add((pre[1].saturating_sub(pre[0]) as f64 * c.limits.timestamp_period as f64) as u64, Ordering::Relaxed);
         super::timeline::gpu(queue, seq, pre[0], pre[1], " prologue");
     }
@@ -6413,7 +6471,11 @@ impl Exec {
             ctx().device.begin_command_buffer(self.cmd(), &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
             let qp = self.slots[self.cur].queries;
             if qp != vk::QueryPool::null() {
-                ctx().device.cmd_reset_query_pool(self.cmd(), qp, 0, STAMPS * MAX_TIMED + 2);
+                ctx().device.cmd_reset_query_pool(self.cmd(), qp, 0, STAMPS * MAX_TIMED);
+            }
+            let bq = self.slots[self.cur].bq;
+            if bq != vk::QueryPool::null() {
+                ctx().device.cmd_reset_query_pool(self.cmd(), bq, BQ_BATCH, 2);
             }
             // Mirror mode: the batch's touched-page list starts empty (the
             // full barrier below orders it before the batch's work).
@@ -6433,9 +6495,9 @@ impl Exec {
         }
         self.barrier_wanted = false;
         self.dispatched = false;
-        let qp = self.slots[self.cur].queries;
-        if qp != vk::QueryPool::null() {
-            unsafe { ctx().device.cmd_write_timestamp(self.cmd(), vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED) };
+        let bq = self.slots[self.cur].bq;
+        if bq != vk::QueryPool::null() {
+            unsafe { ctx().device.cmd_write_timestamp(self.cmd(), vk::PipelineStageFlags::BOTTOM_OF_PIPE, bq, BQ_BATCH) };
         }
         self.recording = true;
         let aq = super::tune::alt_queue();
@@ -6586,7 +6648,7 @@ impl Exec {
             self.seg_batches = 0;
         }
         let (cmd, fence) = (self.slots[i].cmd, self.slots[i].fence);
-        let qp = self.slots[i].queries;
+        let bq = self.slots[i].bq;
         // Finished by the submission thread (`tune submit_finish`): the
         // prologue left open with its copies, the copy-queue copies, the
         // command buffer's end.
@@ -6598,7 +6660,7 @@ impl Exec {
         } else {
             let pre = self.end_pre();
             let xpre = self.end_xpre();
-            finish_main(cmd, qp, pre.is_some());
+            finish_main(cmd, bq, pre.is_some());
             (pre, xpre, None, None)
         };
         let copy_wait = std::mem::take(&mut self.copy_wait);
@@ -6659,21 +6721,21 @@ impl Exec {
         note_copy_waits(xpre.is_some() || xpre_job.is_some(), copy_wait);
         let alt = self.batch_alt;
         let reset = self.slot_reset(i);
-        let seq = push_batch(fence, self.slots[i].queries, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, std::mem::take(&mut self.segs), reset, move |seq| {
+        let seq = push_batch(fence, self.slots[i].queries, bq, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, std::mem::take(&mut self.segs), reset, move |seq| {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return;
             }
             let (mut pre, mut xpre) = (pre, xpre);
             if finish {
                 pre = pre_job.map(|(p, mut copies, mut after)| {
-                    finish_pre(p, &mut copies, &mut after, qp);
+                    finish_pre(p, &mut copies, &mut after, bq);
                     p
                 });
                 xpre = xpre_job.map(|(x, mut copies)| {
                     finish_xpre(x, &mut copies);
                     x
                 });
-                finish_main(cmd, qp, pre.is_some());
+                finish_main(cmd, bq, pre.is_some());
             }
             let r = submit_batch(seq, xpre, pre, cmd, copy_wait, fence, alt);
             if let Err(e) = r {
@@ -7109,7 +7171,7 @@ impl Exec {
             self.pre_after.clear();
             return None;
         }
-        let (pre, qp) = (self.slots[self.cur].pre, self.slots[self.cur].queries);
+        let (pre, bq) = (self.slots[self.cur].pre, self.slots[self.cur].bq);
         record_copies(pre, &mut self.pre_copies);
         if !self.pre_after.is_empty() {
             global_barrier(pre);
@@ -7117,8 +7179,8 @@ impl Exec {
         }
         unsafe {
             global_barrier(pre);
-            if qp != vk::QueryPool::null() {
-                ctx().device.cmd_write_timestamp(pre, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED + 3);
+            if bq != vk::QueryPool::null() {
+                ctx().device.cmd_write_timestamp(pre, vk::PipelineStageFlags::BOTTOM_OF_PIPE, bq, BQ_PRE + 1);
             }
             ctx().device.end_command_buffer(pre).ok();
         }
@@ -8252,7 +8314,7 @@ impl Exec {
             }
             Some(self.last_seq)
         } else if self.last_seq > done_seq() {
-            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), [0; OPS], Vec::new(), None, |_| {});
+            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), [0; OPS], Vec::new(), None, |_| {});
             self.last_seq = seq;
             self.last_action_seq = seq;
             self.cpu_action_seq = seq;
@@ -8571,12 +8633,12 @@ impl Exec {
     /// after all earlier submitted work and before this batch's.
     fn open_pre(&mut self) -> vk::CommandBuffer {
         let c = ctx();
-        let (pre, qp) = (self.slots[self.cur].pre, self.slots[self.cur].queries);
+        let (pre, bq) = (self.slots[self.cur].pre, self.slots[self.cur].bq);
         if !self.pre_open {
             unsafe {
                 c.device.begin_command_buffer(pre, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
-                if qp != vk::QueryPool::null() {
-                    c.device.cmd_reset_query_pool(pre, qp, STAMPS * MAX_TIMED + 2, 2);
+                if bq != vk::QueryPool::null() {
+                    c.device.cmd_reset_query_pool(pre, bq, BQ_PRE, 2);
                 }
             }
             // After all earlier submitted work (`tune skip_barriers` 128:
@@ -8584,8 +8646,8 @@ impl Exec {
             if super::tune::skip_barriers() & 128 == 0 {
                 global_barrier(pre);
             }
-            if qp != vk::QueryPool::null() {
-                unsafe { c.device.cmd_write_timestamp(pre, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * MAX_TIMED + 2) };
+            if bq != vk::QueryPool::null() {
+                unsafe { c.device.cmd_write_timestamp(pre, vk::PipelineStageFlags::BOTTOM_OF_PIPE, bq, BQ_PRE) };
             }
             self.pre_open = true;
         }
@@ -9940,13 +10002,13 @@ impl Exec {
                 self.slots[b.slot].seq = 0;
                 continue;
             }
-            let (cmd, fence, queries) = (self.slots[b.slot].cmd, self.slots[b.slot].fence, self.slots[b.slot].queries);
+            let (cmd, fence, queries, bq) = (self.slots[b.slot].cmd, self.slots[b.slot].fence, self.slots[b.slot].queries, self.slots[b.slot].bq);
             let name = self.name.clone();
             let (pre, copy_wait) = (b.pre, b.copy_wait);
             note_copy_waits(false, copy_wait);
             let reset = self.slot_reset(b.slot);
             let own = b.mm_own;
-            let seq = push_batch(fence, queries, b.eager_action.into_iter().collect(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, reset, move |seq| {
+            let seq = push_batch(fence, queries, bq, b.eager_action.into_iter().collect(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, reset, move |seq| {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
                     return;
                 }
@@ -11515,6 +11577,11 @@ impl Drop for Exec {
                 }
                 c.device.destroy_fence(s.fence, None);
                 c.device.destroy_descriptor_pool(s.desc_pool, None);
+                for qp in [s.queries, s.bq] {
+                    if qp != vk::QueryPool::null() {
+                        c.device.destroy_query_pool(qp, None);
+                    }
+                }
                 c.device.destroy_command_pool(s.cpool, None);
                 if s.xcpool != vk::CommandPool::null() {
                     c.device.destroy_command_pool(s.xcpool, None);

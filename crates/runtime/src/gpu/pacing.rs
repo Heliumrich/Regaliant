@@ -36,6 +36,7 @@ pub fn note_flip(n: u64, us: u64) {
 pub fn report_and_reset() -> String {
     let iv = std::mem::take(&mut STATE.lock().intervals);
     let hitches = super::hitch::window_report_and_reset();
+    let gpu = super::hitch::gpu_window_clause();
     let host = crate::hostload::window_report_and_reset();
     let cpu = super::threadcpu::frames_window_clause(iv.len() as u64);
     if iv.is_empty() {
@@ -60,7 +61,7 @@ pub fn report_and_reset() -> String {
     worst.sort_by(|a, b| b.0.cmp(&a.0));
     let worst: Vec<String> = worst.iter().take(5).map(|&(d, f)| format!("{:.0} ms (flip {f})", d as f64 / 1000.0)).collect();
     format!(
-        "{n} intervals, {:.2} flips/s; ms mean {:.1}, p50 {:.1}, p90 {:.1}, p99 {:.1}, max {:.1}; by vblanks {}; stalls (>2x median) {} ({:.0} ms); worst {}; {hitches}{cpu}{host}",
+        "{n} intervals, {:.2} flips/s; ms mean {:.1}, p50 {:.1}, p90 {:.1}, p99 {:.1}, max {:.1}; by vblanks {}; stalls (>2x median) {} ({:.0} ms); worst {}; {hitches}{gpu}{cpu}{host}",
         n as f64 * 1000.0 / total,
         total / n as f64,
         median,

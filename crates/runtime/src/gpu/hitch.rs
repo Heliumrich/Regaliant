@@ -6,6 +6,14 @@
 //! judged by the worst frames (STATUS.md). Every run's log gets `hitch:`
 //! lines; the window statistics (`frametimes`, the scripts' `dsport-frames:`
 //! marks) count the hitches and their excess time by cause.
+//!
+//! Every batch's span on the GPU comes in too (`gpu_batch`, from its
+//! timestamps once it completed): each frame's GPU busy time is taken once
+//! its batches are in (a few flips late), the windows report it per frame,
+//! and a hitch gets a second line, `hitch GPU:`, with the GPU's busy time in
+//! that frame against the median frame's, the kinds of batches that took
+//! longest above their usual time per frame and its longest batches (whether
+//! the GPU had more work then, and which).
 
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -37,6 +45,40 @@ const NAMES: [&str; KINDS + 1] = ["pipeline", "translation", "upload", "GPU wait
 const MIN_US: u64 = 2_000;
 /// Recent work kept for the next reports.
 const KEEP: usize = 1024;
+/// Batches' GPU spans kept (a few frames' worth).
+const GPU_KEEP: usize = 16384;
+/// Batches at least this long on the GPU (us) keep what they held.
+const GPU_WHAT_US: u64 = 1_000;
+/// Frames waiting for their batches' GPU spans; beyond this many the oldest
+/// is taken as it is (its last batches may be missing: marked).
+const PENDING_MAX: usize = 6;
+
+/// A batch's execution on the GPU: [start, end) in us on `now_us`'s clock
+/// (its prologue's copies included), its queue (`State::queues`), sequence
+/// and commands, and what it held when long.
+struct GpuSpan {
+    start: u64,
+    end: u64,
+    queue: u8,
+    seq: u64,
+    cmds: u32,
+    /// Its most frequent command (`exec::batch_key`).
+    key: u64,
+    what: Option<String>,
+}
+
+/// The weight of a frame in the per-kind running means of GPU time per
+/// frame (`State::kind_mean`).
+const KIND_ALPHA: f64 = 1.0 / 32.0;
+
+/// A presented frame whose GPU time is taken once its batches are in.
+struct Pending {
+    n: u64,
+    start: u64,
+    end: u64,
+    median: u64,
+    hitch: bool,
+}
 
 struct Event {
     start: u64,
@@ -57,6 +99,19 @@ struct State {
     excess: u64,
     by_kind: [u64; KINDS + 1],
     worst: Vec<(u64, u64)>,
+    /// Batches' GPU spans, oldest first, and the latest end among them.
+    gpu: VecDeque<GpuSpan>,
+    gpu_upto: u64,
+    queues: Vec<String>,
+    /// Frames waiting for their GPU spans, oldest first.
+    pending: VecDeque<Pending>,
+    /// The GPU busy time of the last frames taken (us), for the median, and
+    /// of the window's frames.
+    gpu_recent: VecDeque<u32>,
+    gpu_window: Vec<u32>,
+    /// Per queue and batch kind (`GpuSpan::key`), the running mean of its
+    /// GPU time per frame (us).
+    kind_mean: Option<std::collections::HashMap<(u8, u64), f64>>,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -67,7 +122,193 @@ static STATE: Mutex<State> = Mutex::new(State {
     excess: 0,
     by_kind: [0; KINDS + 1],
     worst: Vec::new(),
+    gpu: VecDeque::new(),
+    gpu_upto: 0,
+    queues: Vec::new(),
+    pending: VecDeque::new(),
+    gpu_recent: VecDeque::new(),
+    gpu_window: Vec::new(),
+    kind_mean: None,
 });
+
+/// GPU timestamps on `now_us`'s clock: when the pair was taken, a GPU
+/// timestamp and `now_us` at it, ns per tick; from a calibrated pair
+/// (VK_EXT_calibrated_timestamps) renewed every second.
+static GPU_CAL: Mutex<Option<(std::time::Instant, u64, u64, f64)>> = Mutex::new(None);
+
+/// (GPU ticks, us, ns per tick) at a recent calibration (None without
+/// calibrated timestamps).
+fn gpu_clock() -> Option<(u64, u64, f64)> {
+    let mut g = GPU_CAL.lock();
+    if let Some((at, t, us, p)) = *g {
+        if at.elapsed() < std::time::Duration::from_secs(1) {
+            return Some((t, us, p));
+        }
+    }
+    let c = super::vk::try_ctx()?;
+    let (t, q) = c.calibrate()?;
+    let (mut q_now, mut f) = (0i64, 0i64);
+    unsafe {
+        windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut q_now);
+        windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut f);
+    }
+    let us_now = now_us();
+    let us = us_now.saturating_sub(((q_now - q).max(0) as u128 * 1_000_000 / f.max(1) as u128) as u64);
+    let p = c.limits.timestamp_period as f64;
+    *g = Some((std::time::Instant::now(), t, us, p));
+    Some((t, us, p))
+}
+
+/// A completed batch of `queue` ran on the GPU from timestamp `start` to
+/// `end` (its prologue's start, its own end) with `cmds` commands; `what`
+/// (its contents) is called only for long ones.
+pub fn gpu_batch(queue: &str, seq: u64, start: u64, end: u64, cmds: u32, key: u64, what: impl FnOnce() -> String) {
+    if end <= start {
+        return;
+    }
+    let Some((t0, us0, p)) = gpu_clock() else { return };
+    let conv = |t: u64| (us0 as i64 + ((t as i64).wrapping_sub(t0 as i64) as f64 * p / 1000.0) as i64).max(0) as u64;
+    let (a, b) = (conv(start), conv(end));
+    let what = (b - a >= GPU_WHAT_US).then(what);
+    let mut s = STATE.lock();
+    let queue = match s.queues.iter().position(|q| q == queue) {
+        Some(i) => i as u8,
+        None if s.queues.len() < 255 => {
+            s.queues.push(queue.to_string());
+            (s.queues.len() - 1) as u8
+        }
+        None => 254,
+    };
+    if s.gpu.len() >= GPU_KEEP {
+        s.gpu.pop_front();
+    }
+    s.gpu.push_back(GpuSpan { start: a, end: b, queue, seq, cmds, key, what });
+    s.gpu_upto = s.gpu_upto.max(b);
+}
+
+/// The GPU's busy time in [a, b) (spans on several queues counted once).
+fn gpu_busy(s: &State, a: u64, b: u64) -> u64 {
+    let mut v: Vec<(u64, u64)> = Vec::new();
+    for g in s.gpu.iter().rev() {
+        if g.end.saturating_add(10_000_000) < a {
+            break;
+        }
+        if g.end > a && g.start < b {
+            v.push((g.start.max(a), g.end.min(b)));
+        }
+    }
+    v.sort_unstable();
+    let (mut sum, mut end) = (0u64, 0u64);
+    for (x, y) in v {
+        let x = x.max(end);
+        if y > x {
+            sum += y - x;
+            end = y;
+        }
+    }
+    sum
+}
+
+fn median_of(v: impl Iterator<Item = u32>) -> u64 {
+    let mut v: Vec<u32> = v.collect();
+    v.sort_unstable();
+    v.get(v.len() / 2).copied().unwrap_or(0) as u64
+}
+
+/// Takes the frames whose batches are all in (or that waited too long):
+/// their GPU busy time into the statistics, a `hitch GPU:` line for hitches.
+fn take_pending(s: &mut State) {
+    while let Some(p) = s.pending.front() {
+        let complete = s.gpu_upto >= p.end;
+        if !complete && s.pending.len() <= PENDING_MAX {
+            break;
+        }
+        let p = s.pending.pop_front().unwrap();
+        let busy = gpu_busy(s, p.start, p.end);
+        // GPU time per queue and batch kind in the frame (clipped to it).
+        let mut kinds: std::collections::HashMap<(u8, u64), u64> = std::collections::HashMap::new();
+        for g in s.gpu.iter().rev() {
+            if g.end.saturating_add(10_000_000) < p.start {
+                break;
+            }
+            if g.end > p.start && g.start < p.end {
+                *kinds.entry((g.queue, g.key)).or_default() += g.end.min(p.end) - g.start.max(p.start);
+            }
+        }
+        // The kinds that took longest above their running mean (before this
+        // frame joins it).
+        let grew: Vec<String> = if p.hitch {
+            let means = s.kind_mean.as_ref();
+            let mut d: Vec<((u8, u64), u64, f64)> = kinds.iter().map(|(&k, &t)| (k, t, means.and_then(|m| m.get(&k)).copied().unwrap_or(0.0))).filter(|x| x.1 as f64 > x.2 + 500.0).collect();
+            d.sort_by(|x, y| (y.1 as f64 - y.2).total_cmp(&(x.1 as f64 - x.2)));
+            d.iter()
+                .take(4)
+                .map(|&((q, k), t, m)| {
+                    let qn = s.queues.get(q as usize).map_or("?", |x| x.as_str());
+                    let kn = if qn == "uploads" { "texture uploads".to_string() } else { super::exec::batch_key_name(k) };
+                    format!("{qn} {kn} +{:.1} ms ({:.1}, usually {:.1})", (t as f64 - m) / 1e3, t as f64 / 1e3, m / 1e3)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let means = s.kind_mean.get_or_insert_with(std::collections::HashMap::new);
+        for (k, m) in means.iter_mut() {
+            *m *= 1.0 - KIND_ALPHA;
+            if let Some(&t) = kinds.get(k) {
+                *m += KIND_ALPHA * t as f64;
+            }
+        }
+        for (k, t) in kinds {
+            means.entry(k).or_insert(KIND_ALPHA * t as f64);
+        }
+        if p.hitch {
+            let typical = median_of(s.gpu_recent.iter().copied());
+            // The longest batches overlapping the frame and the median before it.
+            let lo = p.start.saturating_sub(p.median);
+            let mut long: Vec<&GpuSpan> = s.gpu.iter().rev().take_while(|g| g.end.saturating_add(10_000_000) >= lo).filter(|g| g.end > lo && g.start < p.end).collect();
+            long.sort_by(|x, y| (y.end - y.start).cmp(&(x.end - x.start)));
+            let parts: Vec<String> = long
+                .iter()
+                .take(4)
+                .map(|g| format!("{} #{} {:.1} ms ({} commands{})", s.queues.get(g.queue as usize).map_or("?", |q| q.as_str()), g.seq, (g.end - g.start) as f64 / 1e3, g.cmds, g.what.as_deref().unwrap_or("")))
+                .collect();
+            crate::info!(
+                "hitch GPU: flip {} took {:.0} ms: GPU busy {:.1} ms of it{} (median frame {:.0} ms, GPU busy {:.1}); above their usual GPU time per frame: {}; longest batches: {}",
+                p.n,
+                (p.end - p.start) as f64 / 1e3,
+                busy as f64 / 1e3,
+                if complete { "" } else { ", batches missing" },
+                p.median as f64 / 1e3,
+                typical as f64 / 1e3,
+                if grew.is_empty() { "none".to_string() } else { grew.join("; ") },
+                if parts.is_empty() { "none".to_string() } else { parts.join("; ") }
+            );
+        }
+        let v = busy.min(u32::MAX as u64) as u32;
+        if s.gpu_recent.len() >= 60 {
+            s.gpu_recent.pop_front();
+        }
+        s.gpu_recent.push_back(v);
+        if s.gpu_window.len() < 1 << 20 {
+            s.gpu_window.push(v);
+        }
+    }
+}
+
+/// The window's GPU busy time per frame (a clause of the frame windows'
+/// line, "" without GPU spans), and a new window.
+pub fn gpu_window_clause() -> String {
+    let mut s = STATE.lock();
+    let mut v = std::mem::take(&mut s.gpu_window);
+    if v.is_empty() || s.gpu_upto == 0 {
+        return String::new();
+    }
+    v.sort_unstable();
+    let n = v.len();
+    let pct = |q: f64| v[((q / 100.0 * n as f64).ceil() as usize).clamp(1, n) - 1] as f64 / 1e3;
+    format!("; GPU busy per frame ms p50 {:.1}, p90 {:.1}, max {:.1} ({n} frames)", pct(50.0), pct(90.0), v[n - 1] as f64 / 1e3)
+}
 
 /// The clock the presented flips are timed with (us since start).
 pub fn now_us() -> u64 {
@@ -120,7 +361,11 @@ pub fn flip(n: u64, us: u64) {
         s.recent.pop_front();
     }
     s.recent.push_back(d.min(u32::MAX as u64) as u32);
-    if s.recent.len() < 9 || d * 2 < median * 3 || d < median + 16_667 {
+    let hitch = !(s.recent.len() < 9 || d * 2 < median * 3 || d < median + 16_667);
+    // Its GPU time once its batches are in (`take_pending`).
+    s.pending.push_back(Pending { n, start: prev, end: us, median, hitch });
+    take_pending(&mut s);
+    if !hitch {
         return;
     }
     let lo = prev.saturating_sub(median);

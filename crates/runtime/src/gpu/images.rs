@@ -849,6 +849,46 @@ pub fn maybe_evict() {
     super::exec::bury_images(out.0);
 }
 
+/// Two GPU timestamps for an upload's command buffer: when the GPU reached
+/// it and when it finished (`exec::batch_stamps`; null without them).
+fn upload_stamps() -> vk::QueryPool {
+    if !super::exec::batch_stamps() {
+        return vk::QueryPool::null();
+    }
+    unsafe { ctx().device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(2), None) }.unwrap_or(vk::QueryPool::null())
+}
+
+/// Records an upload command buffer's start (k = 0, after a reset) or end
+/// (k = 1) timestamp.
+unsafe fn stamp(cmd: vk::CommandBuffer, qp: vk::QueryPool, k: u32) {
+    if qp == vk::QueryPool::null() {
+        return;
+    }
+    let d = &ctx().device;
+    unsafe {
+        if k == 0 {
+            d.cmd_reset_query_pool(cmd, qp, 0, 2);
+        }
+        d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, k);
+    }
+}
+
+/// Uploads whose GPU span went to the hitch reports.
+static UPLOAD_SPANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A completed upload's span on the GPU, for the hitch reports' GPU busy
+/// time (`hitch::gpu_batch`, queue "uploads").
+fn note_upload_span(qp: vk::QueryPool, what: impl FnOnce() -> String) {
+    if qp == vk::QueryPool::null() {
+        return;
+    }
+    let mut t = [0u64; 2];
+    if unsafe { ctx().device.get_query_pool_results(qp, 0, &mut t, vk::QueryResultFlags::TYPE_64) }.is_ok() {
+        let n = UPLOAD_SPANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        super::hitch::gpu_batch("uploads", n, t[0], t[1], 1, 0, what);
+    }
+}
+
 /// A host-visible buffer texture data is uploaded from (`Images::staging`).
 struct Staging {
     buf: vk::Buffer,
@@ -1005,12 +1045,15 @@ pub struct Images {
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
+    /// The one-shot's GPU timestamps (`upload_stamps`).
+    qp: vk::QueryPool,
     /// Staging buffers not in use (`staging`), uploads submitted without
-    /// waiting (command buffer, fence, the staging buffer it reads; oldest
-    /// first) and the command buffers and fences of completed ones.
+    /// waiting (command buffer, fence, its timestamps, the staging buffer it
+    /// reads; oldest first) and the command buffers, fences and timestamps
+    /// of completed ones.
     staging_free: Vec<Staging>,
-    inflight: std::collections::VecDeque<(vk::CommandBuffer, vk::Fence, Staging)>,
-    spare_cmds: Vec<(vk::CommandBuffer, vk::Fence)>,
+    inflight: std::collections::VecDeque<(vk::CommandBuffer, vk::Fence, vk::QueryPool, Staging)>,
+    spare_cmds: Vec<(vk::CommandBuffer, vk::Fence, vk::QueryPool)>,
     reported: HashMap<String, u64>,
     pub uploads: u64,
     pub reuploads: u64,
@@ -1206,7 +1249,8 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
                 .expect("image pool");
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
-            *g = Some(Images { map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), inflight: Default::default(), spare_cmds: Vec::new(), reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default() });
+            let qp = upload_stamps();
+            *g = Some(Images { qp, map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), inflight: Default::default(), spare_cmds: Vec::new(), reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default() });
         }
     }
     let im = g.as_mut().unwrap();
@@ -1318,10 +1362,10 @@ impl Images {
     /// buffers, waits for the oldest.
     fn reap(&mut self, max: usize, max_bytes: u64) {
         let c = ctx();
-        while let Some(&(_, fence, _)) = self.inflight.front() {
+        while let Some(&(_, fence, _, _)) = self.inflight.front() {
             let done = unsafe { c.device.get_fence_status(fence) }.unwrap_or(true);
             if !done {
-                let bytes: u64 = self.inflight.iter().map(|x| x.2.cap).sum();
+                let bytes: u64 = self.inflight.iter().map(|x| x.3.cap).sum();
                 if self.inflight.len() <= max && bytes <= max_bytes {
                     break;
                 }
@@ -1335,12 +1379,13 @@ impl Images {
                     }
                 }
             }
-            let (cmd, fence, s) = self.inflight.pop_front().unwrap();
+            let (cmd, fence, qp, s) = self.inflight.pop_front().unwrap();
+            note_upload_span(qp, || format!(": texture upload from a {} KiB staging buffer", s.cap >> 10));
             unsafe {
                 c.device.reset_fences(&[fence]).ok();
                 c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
             }
-            self.spare_cmds.push((cmd, fence));
+            self.spare_cmds.push((cmd, fence, qp));
             self.release_staging(s);
         }
     }
@@ -1352,25 +1397,27 @@ impl Images {
     fn submit_upload(&mut self, s: Staging, f: impl FnOnce(vk::CommandBuffer)) {
         self.reap(MAX_INFLIGHT - 1, MAX_INFLIGHT_BYTES.saturating_sub(s.cap));
         let c = ctx();
-        let (cmd, fence) = match self.spare_cmds.pop() {
+        let (cmd, fence, qp) = match self.spare_cmds.pop() {
             Some(x) => x,
             None => unsafe {
                 let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(self.pool).command_buffer_count(1)).expect("upload cmd")[0];
-                (cmd, c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("upload fence"))
+                (cmd, c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("upload fence"), upload_stamps())
             },
         };
         unsafe {
             c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
+            stamp(cmd, qp, 0);
             f(cmd);
+            stamp(cmd, qp, 1);
             c.device.end_command_buffer(cmd).ok();
             match c.submit(cmd, &[], &[], fence) {
-                Ok(()) => self.inflight.push_back((cmd, fence, s)),
+                Ok(()) => self.inflight.push_back((cmd, fence, qp, s)),
                 Err(e) => {
                     if !super::exec::DEVICE_LOST.swap(true, std::sync::atomic::Ordering::SeqCst) {
                         crate::error!("images: submit failed: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
                     }
                     c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
-                    self.spare_cmds.push((cmd, fence));
+                    self.spare_cmds.push((cmd, fence, qp));
                     self.release_staging(s);
                 }
             }
@@ -1378,16 +1425,22 @@ impl Images {
     }
 
     fn one_shot(&mut self, f: impl FnOnce(vk::CommandBuffer)) {
+        // (Its timestamps: `stamp`, `note_upload_span`.)
         let c = ctx();
         unsafe {
             c.device.begin_command_buffer(self.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
+            stamp(self.cmd, self.qp, 0);
             f(self.cmd);
+            stamp(self.cmd, self.qp, 1);
             c.device.end_command_buffer(self.cmd).ok();
             match c.submit(self.cmd, &[], &[], self.fence) {
                 Ok(()) => {
                     let t0 = std::time::Instant::now();
                     let r = c.device.wait_for_fences(&[self.fence], true, 10_000_000_000);
                     super::hitch::note_since(super::hitch::Kind::GpuWait, t0, || "a texture cache one-shot (upload or transition)".to_string());
+                    if r.is_ok() {
+                        note_upload_span(self.qp, || ": texture cache one-shot (upload or transition)".to_string());
+                    }
                     if let Err(e) = r {
                         if !super::exec::DEVICE_LOST.swap(true, std::sync::atomic::Ordering::SeqCst) {
                             crate::error!("images: upload/transition failed: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
