@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 170] = [
+    static ALL: [Tunable; 171] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -203,6 +203,7 @@ pub mod tune {
         Tunable { name: "async_particles", env: "DS_ASYNC_PARTICLES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_pre", env: "DS_SHADOW_PRE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "home_read_min", env: "DS_HOME_READ_MIN", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "shadow_max", env: "DS_SHADOW_MAX", default: 4 << 20, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1842,6 +1843,17 @@ pub mod tune {
             0 => pre_max() + 1,
             v => v,
         }
+    }
+
+    /// The largest written buffer binding given a VRAM shadow (`Exec`: a
+    /// working and a pristine copy in the slot's shadow segment, merged back
+    /// at its batch's end, its working copy then shared with later readers,
+    /// `tune shadow_share`); larger ones are written in place across PCIe and
+    /// copied back for every batch that reads them (`exec::SHADOW_MAX`, at
+    /// most 12 MiB: both copies fit a segment of `SHADOW_BYTES`).
+    #[inline]
+    pub fn shadow_max() -> u64 {
+        get(170).min(12 << 20)
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

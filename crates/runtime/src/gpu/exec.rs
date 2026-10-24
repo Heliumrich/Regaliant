@@ -2644,7 +2644,9 @@ const SHADOW_BYTES: u64 = 32 << 20;
 const SHADOW_INIT: u64 = 2 << 20;
 const PRE_INIT: u64 = 4 << 20;
 const SEG_DECAY: u32 = 256;
-/// Largest buffer shadowed (larger atomic targets stay in host memory).
+/// Largest buffer shadowed by default (larger atomic targets stay in host
+/// memory; `tune shadow_max`).
+#[allow(dead_code)]
 const SHADOW_MAX: u64 = 4 << 20;
 
 static SHADOWED: AtomicU64 = AtomicU64::new(0);
@@ -6896,7 +6898,7 @@ impl Exec {
         if !super::tune::homes() && super::homes::any() {
             self.homes_evict_all();
         }
-        if kind == HomeUse::Sized && written && size > SHADOW_MAX && size <= super::homes::MAX && super::tune::homes() {
+        if kind == HomeUse::Sized && written && size > super::tune::shadow_max() && size <= super::homes::MAX && super::tune::homes() {
             super::homes::note_large_write(base, size);
         }
         // A large read that may create a home (`tune home_reads`; only when
@@ -9637,11 +9639,11 @@ impl Exec {
                         continue;
                     }
                     // Any written buffer may be shadowed (pointer-addressed
-                    // ones when their mapping ends within SHADOW_MAX).
+                    // ones when their mapping ends within `tune shadow_max`).
                     need[0] += 1;
                     need[1] += 3;
                     if let Some(Resolved::Buffer(v)) = p.resources.get(i) {
-                        if let Some(n) = v.byte_size().filter(|&n| n + 16 <= SHADOW_MAX) {
+                        if let Some(n) = v.byte_size().filter(|&n| n + 16 <= super::tune::shadow_max()) {
                             shadow += 2 * (n + 16 + 256);
                         }
                     }
@@ -10137,7 +10139,7 @@ impl Exec {
                         // Written records of indirect draw arguments (16 or 20
                         // bytes): where draws may read them on the GPU (`tune
                         // draw_args_gpu`, `homes::vote_args`).
-                        if matches!(stride, 16 | 20) && size <= SHADOW_MAX && found.tr.plan.resources[i].written && super::tune::draw_args_gpu() {
+                        if matches!(stride, 16 | 20) && size <= super::tune::shadow_max() && found.tr.plan.resources[i].written && super::tune::draw_args_gpu() {
                             super::homes::note_shadow_write(base, size);
                         }
                         let mut info = vk::DescriptorBufferInfo { buffer: fx.dummy, offset: 0, range: DUMMY_BYTES };
@@ -10331,7 +10333,7 @@ impl Exec {
                                     let span = range.next_multiple_of(256);
                                     let res = &found.tr.plan.resources[i];
                                     let all_scratch = res.written && range <= SCRATCH_BYTES && super::tune::scratch_all();
-                                    let want = !all_scratch && allow_shadow && shadow_writes() && res.written && range <= SHADOW_MAX && (res.atomic || range >= shadow_min());
+                                    let want = !all_scratch && allow_shadow && shadow_writes() && res.written && range <= super::tune::shadow_max() && (res.atomic || range >= shadow_min());
                                     let window = (base - bias, range);
                                     let reuse = if want { self.resident.iter().position(|r| r.host == buffer && r.host_off == off && r.range == range) } else { None };
                                     if reuse.is_none() && self.resident.iter().any(|r| r.guest < window.0 + window.1 && window.0 < r.guest + r.range) {
@@ -10371,7 +10373,7 @@ impl Exec {
                                         placement = Placement::Shadow;
                                         info = vk::DescriptorBufferInfo { buffer: self.shadow(), offset: s_off, range };
                                         SHADOWED.fetch_add(1, Ordering::Relaxed);
-                                    } else if all_scratch || (res.written && range > SHADOW_MAX && range <= SCRATCH_BYTES && super::tune::scratch_writes()) {
+                                    } else if all_scratch || (res.written && range > super::tune::shadow_max() && range <= SCRATCH_BYTES && super::tune::scratch_writes()) {
                                         if let Some(sb) = scratch_buffer() {
                                             placement = Placement::Scratch;
                                             info = vk::DescriptorBufferInfo { buffer: sb, offset: 0, range };
@@ -10947,7 +10949,8 @@ impl Exec {
                         drop(g);
                         let homed = super::homes::overlaps(base, len);
                         let report = super::images::with(|im| im.fill_cover_report(base, len));
-                        crate::info!("gpu: zero fill {base:#x}+{len:#x} (#{n}) stores into guest memory (home {homed}): {report}");
+                        let access = crate::mem::prot_at(base).map_or("unmapped", crate::mem::prot_class);
+                        crate::info!("gpu: zero fill {base:#x}+{len:#x} (#{n}) stores into guest memory (home {homed}, mapping {access}): {report}");
                     }
                 }
                 if skip || self.fill_in_place(base, len, v)? {
@@ -11645,6 +11648,7 @@ pub fn status() -> String {
         + &slot_mem_line()
         + &super::track::status()
         + &crate::mem::remap_status()
+        + &crate::mem::prot_census()
         + &crate::titlemem::status()
         + &crate::titlefix::status()
         + &super::cp::draw_state_line()

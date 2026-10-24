@@ -198,6 +198,40 @@ fn drop_parked(start: u64, end: u64) {
     }
 }
 
+/// A mapping's access class from the title's protection bits: "CPU+GPU",
+/// "GPU only" (no CPU bit: the title's CPU code cannot touch it), "CPU only"
+/// or "none".
+pub fn prot_class(prot: u32) -> &'static str {
+    match (prot & 7 != 0, prot & (PROT_GPU_READ | PROT_GPU_WRITE) != 0) {
+        (true, true) => "CPU+GPU",
+        (false, true) => "GPU only",
+        (true, false) => "CPU only",
+        (false, false) => "none",
+    }
+}
+
+/// The title's protection bits of the mapping holding `a` (None: unmapped).
+pub fn prot_at(a: u64) -> Option<u32> {
+    MEM.lock().find(a).filter(|v| v.kind != VmaKind::Reserved).map(|v| v.prot)
+}
+
+/// Guest mappings by kind and access class (MiB, mappings; status report).
+pub fn prot_census() -> String {
+    let g = MEM.lock();
+    let mut m: std::collections::BTreeMap<(String, &'static str), (u64, u64)> = std::collections::BTreeMap::new();
+    for v in g.vmas.values() {
+        if v.kind == VmaKind::Reserved {
+            continue;
+        }
+        let e = m.entry((format!("{:?}", v.kind), prot_class(v.prot))).or_insert((0, 0));
+        e.0 += v.size;
+        e.1 += 1;
+    }
+    drop(g);
+    let parts: Vec<String> = m.iter().map(|((k, c), (b, n))| format!("{k} {c} {} MiB ({n})", b >> 20)).collect();
+    format!("    guest mappings by kind and the title's access bits: {}\n", parts.join(", "))
+}
+
 pub fn remap_status() -> String {
     let r = REMAP.lock();
     let o = std::sync::atomic::Ordering::Relaxed;

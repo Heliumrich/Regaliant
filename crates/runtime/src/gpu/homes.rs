@@ -5,7 +5,7 @@
 //! system memory), every store crossed PCIe: ~85% of the culls' GPU time
 //! (66 against 8 us per dispatch when the stores went to scratch video
 //! memory, run 20261011-065500). Such buffers are too large for the
-//! per-batch VRAM shadows (`exec::SHADOW_MAX`). A buffer that GPU work
+//! per-batch VRAM shadows (`tune shadow_max`). A buffer that GPU work
 //! writes through a binding over that size (`note_large_write`) and that a
 //! draw then uses as its index buffer gets a home: a device-local copy of
 //! its guest range that every later GPU use inside the range binds
