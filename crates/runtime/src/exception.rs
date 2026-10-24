@@ -93,6 +93,19 @@ pub fn frame_label(addr: u64) -> String {
     label
 }
 
+/// The module containing `addr` and the offset into it (another module's
+/// address in a fatal report: a driver's own frames).
+fn module_offset(addr: u64) -> Option<(String, u64)> {
+    use windows_sys::Win32::System::LibraryLoader::{GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleHandleExW};
+    unsafe {
+        let mut m = std::ptr::null_mut();
+        if GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, addr as *const u16, &mut m) == 0 {
+            return None;
+        }
+        Some((host_module(addr), addr - m as u64))
+    }
+}
+
 /// The file name of the module containing `addr` ("?" if none).
 fn host_module(addr: u64) -> String {
     use windows_sys::Win32::System::LibraryLoader::{GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW, GetModuleHandleExW};
@@ -451,8 +464,16 @@ pub fn host_symbol(addr: u64) -> String {
     let mut g = SYM.lock();
     let ready = sym_ready(&mut g);
     let (b, e) = host_image();
-    let fallback = if addr >= b && addr < e { format!("dsport+{:#x}", addr - b) } else { format!("{addr:#x}") };
-    if !ready {
+    let fallback = if addr >= b && addr < e {
+        format!("dsport+{:#x}", addr - b)
+    } else {
+        match module_offset(addr) {
+            Some((m, off)) => format!("{m}+{off:#x}"),
+            None => format!("{addr:#x}"),
+        }
+    };
+    if !ready || !(addr >= b && addr < e) {
+        // (Other modules: their exports would name the wrong functions.)
         return fallback;
     }
     unsafe {
@@ -484,7 +505,21 @@ pub fn host_image() -> (u64, u64) {
 pub fn install() {
     host_image();
     let h = unsafe { AddVectoredExceptionHandler(1, Some(veh)) };
+    unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(Some(unhandled)) };
     crate::info!("vectored exception handler installed: {:?}", h);
+}
+
+/// Set while `unhandled` reports a fault the vectored handler left to other
+/// code (one deep inside a driver) that no handler took.
+static UNHANDLED: AtomicBool = AtomicBool::new(false);
+
+/// The last chance for a fault no handler took (the first sessions' access
+/// violations inside nvoglv64.dll ended the process with no report of
+/// ours): the fatal report, with the host frames down to our code.
+unsafe extern "system" fn unhandled(info: *const EXCEPTION_POINTERS) -> i32 {
+    UNHANDLED.store(true, Ordering::SeqCst);
+    unsafe { veh_body(info as *mut EXCEPTION_POINTERS) };
+    EXCEPTION_CONTINUE_SEARCH
 }
 
 fn code_name(code: u32) -> &'static str {
@@ -1238,11 +1273,12 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
         let host = host_image();
         let in_host = rip >= host.0 && rip < host.1;
         let stub = crate::loader::STUBS.try_lock().and_then(|s| s.describe(rip)).is_some();
-        if !in_guest(rip) && !in_host && !stub {
+        if !in_guest(rip) && !in_host && !stub && !UNHANDLED.load(Ordering::SeqCst) {
             // A fault in another module counts as ours when the faulting
             // function was called (almost) directly by our image or by guest
             // code, e.g. the C runtime's memcpy given a bad guest pointer.
-            // Exceptions deeper inside system code are left to its handlers.
+            // Exceptions deeper inside system code are left to its handlers
+            // (and reported by `unhandled` when none takes them).
             if code != 0xC0000005 || !called_from_our_code(ctx, 3) {
                 return EXCEPTION_CONTINUE_SEARCH;
             }

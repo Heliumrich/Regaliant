@@ -394,11 +394,15 @@ pub fn flip(n: u64, us: u64) {
     let excess = d - median;
     let top = (0..KINDS).max_by_key(|&k| sum[k]).filter(|&k| sum[k] * 4 >= excess).unwrap_or(KINDS);
     let kinds: Vec<String> = (0..KINDS).filter(|&k| sum[k] > 0).map(|k| format!("{} {:.0} ms", NAMES[k], sum[k] as f64 / 1e3)).collect();
-    let longest: Vec<String> = over
-        .iter()
-        .take(4)
-        .map(|(o, e)| format!("{} {:.0} ms on {} ({})", NAMES[e.kind as usize], *o as f64 / 1e3, e.thread, e.what))
-        .collect();
+    // The four longest, and the longest on a command processor when none
+    // of them is (background compiles at a level load crowd out what the
+    // command processors met).
+    let background = |e: &Event| e.thread.starts_with("gpu-compile") || e.thread.starts_with("gpu-async") || e.thread.starts_with("gpu-precompile");
+    let mut shown: Vec<&(u64, &Event)> = over.iter().take(4).collect();
+    if shown.iter().all(|x| background(x.1)) {
+        shown.extend(over.iter().skip(4).find(|x| !background(x.1)));
+    }
+    let longest: Vec<String> = shown.iter().map(|(o, e)| format!("{} {:.0} ms on {} ({})", NAMES[e.kind as usize], *o as f64 / 1e3, e.thread, e.what)).collect();
     crate::info!(
         "hitch: flip {n} took {:.0} ms (median {:.0}): {}; {}",
         d as f64 / 1e3,

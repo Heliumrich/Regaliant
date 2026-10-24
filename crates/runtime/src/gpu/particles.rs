@@ -154,10 +154,10 @@ pub fn is_particle(code_hash: u64) -> bool {
 }
 
 /// Whether the program with this code hash compiles in the background at
-/// first use (a particle program, or an engine program of a directory in
-/// `DS_ASYNC_ENGINE`).
-pub fn in_background(code_hash: u64) -> bool {
-    is_particle(code_hash) || ENGINE_ASYNC.read().as_ref().is_some_and(|s| s.contains(&code_hash))
+/// first use: an engine program of a directory in `DS_ASYNC_ENGINE`, or
+/// (`particles`) a particle program.
+pub fn in_background(code_hash: u64, particles: bool) -> bool {
+    (particles && is_particle(code_hash)) || ENGINE_ASYNC.read().as_ref().is_some_and(|s| s.contains(&code_hash))
 }
 
 /// Where the program with this code hash comes from: an engine shader

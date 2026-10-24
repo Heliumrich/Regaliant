@@ -71,7 +71,10 @@ const GFX_COMPILED: usize = 13;
 const GFX_NS: usize = 14;
 const GFX_PRESENT: usize = 15;
 const GFX_FAILED: usize = 16;
-static STATS: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
+/// Programs with a pipeline already handed over again (another spec of
+/// them is a first use too).
+const AGAIN: usize = 17;
+static STATS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
 
 /// Compute programs whose pipeline was created or found present, and
 /// scanned draws (stage addresses, baked-state registers' hash) likewise:
@@ -178,8 +181,21 @@ fn run(slot: &Slot) {
     let regs = slot.regs();
     let p = match shaders::prepare_compute(regs, slot.wave64()) {
         Ok(p) if !regs.missed.load(Ordering::Relaxed) => p,
-        _ => {
+        r => {
             STATS[FAILED].fetch_add(1, Ordering::Relaxed);
+            if super::exec::compile_trace_on() {
+                // Each program's first failure and why (the scanned
+                // registers' program address, COMPUTE_PGM_LO/HI).
+                let why = match r {
+                    Err(e) => e,
+                    Ok(_) => format!("register {:#x} outside the snapshot", regs.missed_reg.load(Ordering::Relaxed)),
+                };
+                let addr = ((regs.sh(0x20C) as u64) | ((regs.sh(0x20D) as u64 & 0xFF) << 32)) << 8;
+                static SEEN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+                if SEEN.lock().get_or_insert_with(Default::default).insert(addr) {
+                    crate::info!("compile ahead: cs {addr:#x} not prepared: {why}");
+                }
+            }
             return;
         }
     };
@@ -255,6 +271,9 @@ fn compile(p: &Prepared) {
         }
         None => {
             STATS[FAILED].fetch_add(1, Ordering::Relaxed);
+            if super::exec::compile_trace_on() {
+                crate::info!("compile ahead: cs {:#x} pipeline not created", p.addr);
+            }
         }
     }
 }
@@ -282,6 +301,13 @@ pub fn submit(slots: Vec<Arc<Slot>>, draws: Vec<(Arc<Slot>, Option<Arc<Slot>>, s
     }
     let mut seen: Vec<(u64, bool)> = Vec::new();
     let mut jobs = Vec::new();
+    // Programs with a pipeline already come after the others, within the
+    // limit: a new spec of one (other descriptors: the title's engine
+    // programs at a level change) is a first use too, which the workers
+    // find only by preparing it (20 deferred-lighting programs of 1-2's
+    // first frames compiled one by one on the graphics queue, 1-1.9 s each,
+    // FINDINGS.md 2026-10-24).
+    let mut again = Vec::new();
     for s in slots {
         if s.regs().kind != StageKind::Compute {
             continue;
@@ -289,16 +315,23 @@ pub fn submit(slots: Vec<Arc<Slot>>, draws: Vec<(Arc<Slot>, Option<Arc<Slot>>, s
         let r = s.regs();
         let addr = ((r.sh(0x20C) as u64) | ((r.sh(0x20D) as u64 & 0xFF) << 32)) << 8;
         let k = (addr, s.wave64());
-        if addr == 0 || seen.contains(&k) || known.0.contains(&addr) {
+        if addr == 0 || seen.contains(&k) {
             continue;
         }
         seen.push(k);
+        if known.0.contains(&addr) {
+            again.push(s);
+            continue;
+        }
         if jobs.len() >= MAX_JOBS {
             STATS[DROPPED].fetch_add(1, Ordering::Relaxed);
             continue;
         }
         jobs.push(s);
     }
+    let room = MAX_JOBS.saturating_sub(jobs.len());
+    STATS[AGAIN].fetch_add(again.len().min(room) as u64, Ordering::Relaxed);
+    jobs.extend(again.into_iter().take(room));
     if (jobs.is_empty() && draw_jobs.is_empty()) || mode() & 4 != 0 {
         return;
     }
@@ -374,7 +407,7 @@ pub fn status() -> String {
         String::new()
     };
     format!(
-        "    pipelines compiled ahead: {} scans at first uses ({} ms; ended by their buffer's end {}, the command limit {}, another packet {}{stops}; {} commands found), {} programs handed to {} workers ({} over the per-scan limit) and {} stages prepared at label waits, {} prepared, {} pipelines created ({} ms of compiles), {} present already, {} failed or not prepared; command processors waited {} times for a pipeline in flight ({} ms), {} compiles of one pipeline avoided{gfx}\n",
+        "    pipelines compiled ahead: {} scans at first uses ({} ms; ended by their buffer's end {}, the command limit {}, another packet {}{stops}; {} commands found), {} programs handed to {} workers ({} of them with a pipeline already, for other specs; {} over the per-scan limit) and {} stages prepared at label waits, {} prepared, {} pipelines created ({} ms of compiles), {} present already, {} failed or not prepared; command processors waited {} times for a pipeline in flight ({} ms), {} compiles of one pipeline avoided, {} programs batchable from a run's first dispatch{gfx}\n",
         s[SCANS],
         s[SCAN_NS] / 1_000_000,
         SCAN_ENDS[0].load(Ordering::Relaxed),
@@ -383,6 +416,7 @@ pub fn status() -> String {
         SCAN_ENDS[3].load(Ordering::Relaxed),
         s[JOBS],
         WORKERS.load(Ordering::Relaxed),
+        s[AGAIN],
         s[DROPPED],
         s[AT_WAITS],
         s[PREPARED],
@@ -392,6 +426,7 @@ pub fn status() -> String {
         s[FAILED],
         waits,
         wait_ns / 1_000_000,
-        dups
+        dups,
+        super::exec::BATCHABLE_AHEAD.load(Ordering::Relaxed)
     )
 }

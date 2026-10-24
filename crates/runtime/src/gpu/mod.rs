@@ -200,7 +200,7 @@ pub mod tune {
         Tunable { name: "acm_reverb", env: "DS_ACM_REVERB", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "trace_waits", env: "DS_TRACE_WAITS_N", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "plan_fast", env: "DS_PLAN_FAST", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "async_particles", env: "DS_ASYNC_PARTICLES", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "async_particles", env: "DS_ASYNC_PARTICLES", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_pre", env: "DS_SHADOW_PRE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "home_read_min", env: "DS_HOME_READ_MIN", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_max", env: "DS_SHADOW_MAX", default: 4 << 20, value: AtomicU64::new(UNSET) },
@@ -1813,14 +1813,19 @@ pub mod tune {
         get(166) != 0
     }
 
-    /// The title's particle programs and the engine programs of per-frame
-    /// effects named in `DS_ASYNC_ENGINE` (`particles::in_background`)
-    /// compile in the background at their first use, their dispatches left
-    /// out until then, instead of the command processor stopping for the
-    /// compile (`exec::compile_in_background`); 0: compiled where first used.
+    /// Programs compiled in the background at their first use, their
+    /// dispatches left out until then, instead of the command processor
+    /// stopping for the compile (`exec::compile_in_background`): 2 the
+    /// engine programs of per-frame effects named in `DS_ASYNC_ENGINE`
+    /// (the particles' lighting atlas passes), 1 also the title's particle
+    /// programs (`particles::in_background`), 0 none. Particle programs
+    /// left out broke their effects' state in first sessions (an effect's
+    /// other programs ran on it: shaders looping until the loop watchdog
+    /// stopped them, 43,024 times in a walk of 1-2, and GPU work of 100-190
+    /// ms a frame for minutes; FINDINGS.md 2026-10-24).
     #[inline]
-    pub fn async_particles() -> bool {
-        get(167) != 0
+    pub fn async_particles() -> u64 {
+        get(167)
     }
 
     /// A dispatch's new VRAM shadows get the guest data in the batch's

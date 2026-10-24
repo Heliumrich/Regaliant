@@ -47,13 +47,23 @@ fn guess_report(app: &std::path::Path) -> i32 {
             }
         }
     }
+    // The particle bundles' programs (compiled at their first dispatch: a
+    // guess at level load would have them ready).
+    let mut particle: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let pdir = app.join("particles").join("!cookedparticleshaders").join("version01").join("_ps5");
+    for e in std::fs::read_dir(&pdir).into_iter().flatten().flatten() {
+        if let Some(v) = std::fs::read(e.path()).ok().and_then(|b| super::particles::bundle_programs(&b)) {
+            particle.extend(v.iter().map(|x| x.hash));
+        }
+    }
     // Per engine directory: [specs, equal, format-only, different], and
     // the same for programs binding no image and no typed buffer.
     let mut by_dir: HashMap<String, [u64; 4]> = HashMap::new();
     let mut plain = [0u64; 4];
     crate::info!("guess report: {} engine compute programs in {files} engine shader files", engine.len());
-    // [specs, equal, format-only, other] overall and for engine programs.
-    let mut n = [[0u64; 4]; 2];
+    // [specs, equal, format-only, other] overall, for engine programs and
+    // for particle programs.
+    let mut n = [[0u64; 4]; 3];
     let mut other_why: HashMap<&'static str, u64> = HashMap::new();
     // Format-accessed buffers: access pattern -> (format, dst_sel) -> count.
     let mut by_access: HashMap<String, HashMap<(u8, u16), u64>> = HashMap::new();
@@ -110,7 +120,7 @@ fn guess_report(app: &std::path::Path) -> i32 {
                     3
                 }
             };
-            for (k, on) in [(0, true), (1, is_engine)] {
+            for (k, on) in [(0, true), (1, is_engine), (2, particle.contains(&h))] {
                 if on {
                     n[k][0] += 1;
                     n[k][class] += 1;
@@ -132,7 +142,7 @@ fn guess_report(app: &std::path::Path) -> i32 {
             }
         }
     }
-    for (k, what) in [(0, "all learned"), (1, "engine")] {
+    for (k, what) in [(0, "all learned"), (1, "engine"), (2, "particle bundles")] {
         crate::info!("guess report ({what}): {} specs: guess equal {}, equal but for typed buffers' formats {}, different {}", n[k][0], n[k][1], n[k][2], n[k][3]);
     }
     crate::info!("guess report: {engine_learned} of the learned programs are the engine's; other differences: {other_why:?}");

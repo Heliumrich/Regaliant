@@ -2733,6 +2733,101 @@ impl Cp {
         super::compile::submit(slots, draws, ns);
     }
 
+    /// Direct dispatches of program `addr` of 1 to `small` workgroups right
+    /// after the current command, up to `max`, before a dispatch of another
+    /// program, a draw or a call (`exec`: the first
+    /// dispatch of a run of them makes the program batchable, else its
+    /// first pipeline is made for the run's first dispatches and again
+    /// batched: cs 0x8026f4100 2.1 and 2.7 s in a first session).
+    pub fn streak_after(&self, addr: u64, small: u64, max: u32) -> u32 {
+        let (n, why) = self.streak_scan(addr, small, max);
+        if super::exec::compile_trace_on() {
+            crate::info!("streak lookahead: cs {addr:#x} {n} more (ended by {why})");
+        }
+        n
+    }
+
+    fn streak_scan(&self, addr: u64, small: u64, max: u32) -> (u32, String) {
+        let Some((_, from, end)) = self.compile_ctx.get() else { return (0, "no buffer".into()) };
+        let (mut lo, mut hi) = (self.reg(Space::Sh, 0x20C), self.reg(Space::Sh, 0x20D));
+        let (mut cur, mut n) = (from, 0u32);
+        for _ in 0..256 {
+            if n >= max {
+                return (n, "the count".into());
+            }
+            if cur >= end || !valid(cur, 4) {
+                return (n, "the buffer's end".into());
+            }
+            let h = unsafe { rd32(cur) };
+            match h >> 30 {
+                3 => {}
+                2 => {
+                    cur += 4;
+                    continue;
+                }
+                _ => return (n, "a header".into()),
+            }
+            let count = (h >> 16) & 0x3FFF;
+            if count == 0x3FFF {
+                cur += 4;
+                continue;
+            }
+            let words = count as u64 + 1;
+            let next = cur + 4 * (words + 1);
+            if h & 1 != 0 || next > end || !valid(cur, 4 * (words + 1)) {
+                return (n, "a predicated or cut packet".into());
+            }
+            let at = cur;
+            let p = |i: u64| unsafe { rd32(at + 4 * (1 + i)) };
+            let opcode = (h >> 8) & 0xFF;
+            match opcode {
+                op::SET_SH_REG | op::SET_SH_REG_INDEX => {
+                    let first = p(0) & 0xFFFF;
+                    for i in 1..words {
+                        match first + (i - 1) as u32 {
+                            0x20C => lo = p(i),
+                            0x20D => hi = p(i),
+                            _ => {}
+                        }
+                    }
+                }
+                op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT => {
+                    let a = ((lo as u64) | ((hi as u64 & 0xFF) << 32)) << 8;
+                    if a != addr {
+                        return (n, format!("a dispatch of cs {a:#x}"));
+                    }
+                    if opcode == op::DISPATCH_DIRECT {
+                        let g = p(0) as u64 * p(1) as u64 * p(2) as u64;
+                        if g > 0 && g <= small {
+                            n += 1;
+                        }
+                    }
+                }
+                op::LOAD_SH_REG_INDEX => {
+                    // As `load_pairs`: memory holds {offset, value} pairs
+                    // (the title loads each dispatch's user data this way).
+                    let (a, count) = (addr64(p(0), p(1)), p(2) as u64);
+                    if count > 0 && !valid(a, 8 * count) {
+                        return (n, "a register load's pairs".into());
+                    }
+                    for i in 0..count {
+                        let (o, val) = unsafe { (rd32(a + 8 * i), rd32(a + 8 * i + 4)) };
+                        match o & 0xFFFF {
+                            0x20C => lo = val,
+                            0x20D => hi = val,
+                            _ => {}
+                        }
+                    }
+                }
+                op::DRAW_INDEX_2 | op::DRAW_INDEX_AUTO | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT | op::INDIRECT_BUFFER => return (n, format!("opcode {opcode:#x}")),
+                op::NOP if words >= 2 && p(0) == DS_MAGIC && !matches!(p(1), pop::PUSH_MARKER | pop::SET_MARKER | pop::POP_MARKER) => return (n, format!("private packet {:#x}", p(1))),
+                _ => {}
+            }
+            cur = next;
+        }
+        (n, "the packet limit".into())
+    }
+
     /// The scan of `scan_through` (`whole`: also through runs the parallel
     /// workers would record): the commands, why it ended, its nanoseconds.
     fn scan_commands(&self, f: &Fetched, from: u64, end: u64, whole: bool) -> (Vec<AheadCmd>, usize, u64) {
@@ -2760,6 +2855,12 @@ impl Cp {
         // The synchronization-free run being scanned: its first command's
         // index and its commands.
         let (mut run_first, mut run_len) = (0usize, 0usize);
+        // The program of the last small direct dispatches and how many in a
+        // row: a run makes it batchable before the workers prepare it (as
+        // execution's `cs_streak` would at the run's fourth dispatch; they
+        // compiled it unbatched first, then it was made again batched: 11-25
+        // first uses, 5.7-7.5 s in a first session's walk).
+        let mut streak = (0u64, 0u32);
         let mut cur = from;
         while cur < end {
             if cmds.len() >= WAIT_SCAN_MAX {
@@ -2896,6 +2997,15 @@ impl Cp {
                 op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT => {
                     let initiator = if opcode == op::DISPATCH_DIRECT { p(3) } else if n >= 3 { p(2) } else { p(1) };
                     wave64 = initiator & (1 << 15) == 0;
+                    let groups = if opcode == op::DISPATCH_DIRECT { p(0) as u64 * p(1) as u64 * p(2) as u64 } else { 0 };
+                    if super::tune::batch_cs() && groups > 0 && groups <= super::exec::BATCH_SMALL {
+                        let a = ((sh.get(0x20C).copied().unwrap_or(0) as u64) | ((sh.get(0x20D).copied().unwrap_or(0) as u64 & 0xFF) << 32)) << 8;
+                        streak = if streak.0 == a { (a, streak.1 + 1) } else { (a, 1) };
+                        if streak.1 == super::exec::BATCH_STREAK && !super::shaders::batchable(a) {
+                            super::shaders::mark_batchable(a);
+                            super::exec::BATCHABLE_AHEAD.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     let view = ScanRegs { sh: &sh, ctx: &ctx };
                     command = Some([Some(super::shaders::StageRegs::capture(super::shaders::StageKind::Compute, &view)), None]);
                 }

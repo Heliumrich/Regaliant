@@ -1120,6 +1120,14 @@ pub static ASYNC_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// The error of a dispatch left out while its pipeline compiles.
 pub(super) const ASYNC_PENDING: &str = "a particle program's pipeline compiles in the background (its dispatches are left out until then)";
 
+/// Whether the background compile of a prepared stage's pipeline is queued
+/// (its dispatches are left out until it is made; each would scan the
+/// commands after it again, `Cp::prefetch_compiles`).
+fn async_queued(p: &Prepared) -> bool {
+    let key = push_key(p.tr.key, push_fits(&[p]));
+    ASYNC_QUEUED.lock().as_ref().is_some_and(|s| s.contains(&key))
+}
+
 /// Starts the background compile of a prepared stage's pipeline unless it
 /// is made, in flight or queued: false when the caller should make it where
 /// it is (the store holds it, or a background compile of it failed and
@@ -1139,6 +1147,10 @@ fn compile_in_background(p: &Prepared) -> bool {
         return true;
     }
     ASYNC_JOBS.lock().push_back((p.found.tr.0.clone(), p.addr, key));
+    if compile_trace() {
+        let from = super::particles::origin(p.code_hash).map(|d| format!(" (from {d})")).unwrap_or_default();
+        crate::info!("background compile: cs {:#x} key {key:#x} queued{from}", p.addr);
+    }
     // As many workers as compile-ahead has (the largest programs take 5-12
     // s each, and an area's effects come together), below normal priority.
     let want = super::tune::compile_ahead().clamp(2, 16);
@@ -1176,6 +1188,9 @@ fn async_worker(name: String) {
                 if created.get() {
                     ASYNC_STATS[1].fetch_add(1, Ordering::Relaxed);
                     ASYNC_STATS[2].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+                if compile_trace() {
+                    crate::info!("background compile: cs {addr:#x} key {key:#x} made after {} ms", t.elapsed().as_millis());
                 }
             }
             Err(e) => {
@@ -1228,6 +1243,7 @@ pub fn precompile(p: &Prepared) -> Option<bool> {
     if compile_trace() && created.get() {
         let key = push_key(p.tr.key, push_fits(&[p]));
         AHEAD_KEYS.lock().get_or_insert_with(HashSet::new).insert(key);
+        AHEAD_SPECS.lock().get_or_insert_with(HashMap::new).entry(p.addr).or_default().push((key, p.code_hash, p.tr.spec.clone()));
         crate::info!("compile ahead: cs {:#x} key {:#x} created", p.addr, key);
     }
     r.ok().map(|_| created.get())
@@ -1236,10 +1252,46 @@ pub fn precompile(p: &Prepared) -> Option<bool> {
 /// `DS_COMPILE_TRACE=1`: pipelines compiled ahead and first uses logged
 /// with their keys (which preparations made ahead matched execution).
 static AHEAD_KEYS: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+/// And the keys, code hashes and specs of the compute pipelines compiled
+/// ahead by program address: a first use under another key logs what
+/// differs (`spec_diff`).
+static AHEAD_SPECS: Mutex<Option<HashMap<u64, Vec<(u64, u64, rdna::translate::Spec)>>>> = Mutex::new(None);
+
+/// What differs between a spec made ahead and the one of execution
+/// (`DS_COMPILE_TRACE`).
+fn spec_diff(a: &rdna::translate::Spec, b: &rdna::translate::Spec) -> String {
+    let mut d: Vec<String> = Vec::new();
+    macro_rules! fields {
+        ($($f:ident),*) => {
+            $(if a.$f != b.$f {
+                d.push(format!("{} {:?} -> {:?}", stringify!($f), a.$f, b.$f));
+            })*
+        };
+    }
+    fields!(stage, user_sgprs, user_base, wave64, ps_input_addr, ps_inputs, barycentric, mrt, cs_local_size, cs_rsrc2, binding_base, probe, dump, force_dispatcher, dispatcher_for_loops, reg_vars, lane_guards, mip_views, lod_stats, early_tests, per_lane, lane_votes, base_instance_sgpr, sgpr_pc, addresses, batched, write_marks, sgpr_ubo);
+    if a.resources.len() != b.resources.len() {
+        d.push(format!("resources {:?} -> {:?}", a.resources, b.resources));
+    } else {
+        for (i, (x, y)) in a.resources.iter().zip(&b.resources).enumerate() {
+            if x != y {
+                d.push(format!("resource {i} {x:?} -> {y:?}"));
+            }
+        }
+    }
+    if d.is_empty() {
+        d.push(if a == b { "specs equal".to_string() } else { "code_base only".to_string() });
+    }
+    d.join(", ")
+}
 
 fn compile_trace() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *T.get_or_init(|| std::env::var("DS_COMPILE_TRACE").ok().as_deref() == Some("1"))
+}
+
+/// `compile_trace` for other modules (`gpu::compile`'s failed preparations).
+pub(crate) fn compile_trace_on() -> bool {
+    compile_trace()
 }
 
 /// The compute pipeline of a prepared shader (created on first use, outside
@@ -4019,8 +4071,13 @@ fn check_watchdog(queue: &str, shaders: &[u64]) {
     }
     let list: Vec<String> = shaders.iter().map(|a| format!("{a:#x}")).collect();
     let saved = super::capture::save_program(addr).map(|f| format!("; program saved to {}", f.display())).unwrap_or_default();
+    // Where it comes from, and the background compiles pending then (a
+    // particle program's dispatches run while others of its effect are
+    // left out).
+    let from = super::shaders::program_hash(addr).ok().and_then(super::particles::origin).map(|d| format!(" from {d}")).unwrap_or_default();
+    let pending = ASYNC_QUEUED.lock().as_ref().map_or(0, |s| s.len());
     crate::warn!(
-        "gpu[{queue}]: loop watchdog stopped {n} invocation(s) of shader {addr:#x} after {} blocks; its results are wrong (batch shaders {}){saved}",
+        "gpu[{queue}]: loop watchdog stopped {n} invocation(s) of shader {addr:#x}{from} after {} blocks; its results are wrong (batch shaders {}; {pending} background compiles pending){saved}",
         rdna::translate::loop_limit(),
         list.join(" ")
     );
@@ -5877,6 +5934,9 @@ pub struct Exec {
     /// The program of the last direct dispatches and how many in a row
     /// (`tune batch_cs`: a run of BATCH_STREAK makes it batchable).
     cs_streak: (u64, u32),
+    /// Programs whose dispatches after a run's first were looked at
+    /// (`Cp::streak_after`; once per program).
+    cs_peeked: HashSet<u64>,
     /// The open batched dispatch (`tune batch_cs`).
     cs_run: Option<CsRun>,
     /// Mirror mode: the page runs its batch's bindings write (gathered at
@@ -5914,8 +5974,11 @@ const EXTRA_SEG: u64 = 64 << 20;
 /// of at most BATCH_SMALL workgroups (per-dispatch costs dominate there;
 /// larger dispatches of buffer-heavy programs lose more to the GPU cost of
 /// device addresses than batching saves).
-const BATCH_STREAK: u32 = 4;
-const BATCH_SMALL: u64 = 64;
+pub(super) const BATCH_STREAK: u32 = 4;
+pub(super) const BATCH_SMALL: u64 = 64;
+/// Programs made batchable at the first dispatch of a run (`Cp::streak_after`)
+/// or by a scan ahead that saw the run (`Cp::scan_commands`).
+pub static BATCHABLE_AHEAD: AtomicU64 = AtomicU64::new(0);
 /// Workgroups one batched dispatch may hold (its table in the SGPR ring:
 /// `BATCH_ENTRY_DWORDS` each).
 const BATCH_MAX_GROUPS: u32 = 4096;
@@ -6210,6 +6273,7 @@ impl Exec {
                 cmd_uses: std::cell::Cell::new(0),
                 last_cmd_line: std::cell::Cell::new(0),
                 cs_streak: (0, 0),
+                cs_peeked: HashSet::new(),
                 cs_run: None,
                 owned: Vec::new(),
                 mm_own: None,
@@ -10807,6 +10871,13 @@ impl Exec {
                 }
             } else {
                 self.cs_streak = (a, 1);
+                // A run starting here makes the program batchable now: before
+                // its first pipeline is made (else made twice, the second
+                // time batched when the run's fourth dispatch comes).
+                if !super::shaders::batchable(a) && self.cs_peeked.insert(a) && cp.streak_after(a, BATCH_SMALL, BATCH_STREAK - 1) + 1 >= BATCH_STREAK {
+                    super::shaders::mark_batchable(a);
+                    BATCHABLE_AHEAD.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         if let Some(a) = indirect {
@@ -11015,22 +11086,33 @@ impl Exec {
                 // A first use: the programs of the commands after this one
                 // are compiled meanwhile (`gpu::compile`).
                 let t = std::time::Instant::now();
-                if super::compile::at_first_uses() && !compute_pipe_known(&p) {
+                if super::compile::at_first_uses() && !compute_pipe_known(&p) && !async_queued(&p) {
                     cp.prefetch_compiles();
                 }
-                // A particle program's first use (`tune async_particles`):
-                // its pipeline compiles in the background and its dispatches
-                // are left out until it is made, instead of this command
-                // processor stopping for the compile (5-12 s for the largest:
-                // first visits froze for up to 20.8 s, FINDINGS.md
-                // 2026-10-23). The effect shows up that much later.
-                if super::tune::async_particles() && super::shaders::program_hash(p.addr).is_ok_and(super::particles::in_background) && compile_in_background(&p) {
+                // A first use of a per-frame effect's program (`tune
+                // async_particles`; particle programs too with 1): its
+                // pipeline compiles in the background and its dispatches are
+                // left out until it is made, instead of this command
+                // processor stopping for the compile (5-12 s for the largest
+                // particle programs: first visits froze for up to 20.8 s,
+                // FINDINGS.md 2026-10-23). The effect shows up that much
+                // later; effects whose state persists break (FINDINGS.md
+                // 2026-10-24).
+                let mode = super::tune::async_particles();
+                if mode != 0 && super::shaders::program_hash(p.addr).is_ok_and(|h| super::particles::in_background(h, mode == 1)) && compile_in_background(&p) {
                     ASYNC_STATS[0].fetch_add(1, Ordering::Relaxed);
                     return Err(ASYNC_PENDING.into());
                 }
                 let r = compute_pipe(&p);
                 if compile_trace() {
-                    crate::info!("first use: cs {:#x} key {:#x} after {} ms", p.addr, push_key(p.tr.key, push_fits(&[&p])), t.elapsed().as_millis());
+                    let key = push_key(p.tr.key, push_fits(&[&p]));
+                    let from = super::particles::origin(p.code_hash).map(|d| format!(" (from {d})")).unwrap_or_default();
+                    crate::info!("first use: cs {:#x} key {key:#x} after {} ms{from}", p.addr, t.elapsed().as_millis());
+                    if let Some(v) = AHEAD_SPECS.lock().as_ref().and_then(|m| m.get(&p.addr)) {
+                        if let Some((k, code, s)) = v.last().filter(|_| !v.iter().any(|x| x.0 == key)) {
+                            crate::info!("first use: cs {:#x} key {key:#x} differs from the pipeline compiled ahead ({k:#x}, {} of them; code hash {}): {}", p.addr, v.len(), if *code == p.code_hash { "same" } else { "differs" }, spec_diff(s, &p.tr.spec));
+                        }
+                    }
                 }
                 FIRST_USES[0].fetch_add(1, Ordering::Relaxed);
                 FIRST_USES[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -11673,6 +11755,7 @@ pub fn status() -> String {
         + &super::lodstats::status()
         + &super::ahead::status()
         + &super::compile::status()
+        + &async_line()
         + &super::par::status()
         + &super::keep::status()
         + &format!(
