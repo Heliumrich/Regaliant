@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 169] = [
+    static ALL: [Tunable; 170] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -202,6 +202,7 @@ pub mod tune {
         Tunable { name: "plan_fast", env: "DS_PLAN_FAST", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "async_particles", env: "DS_ASYNC_PARTICLES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_pre", env: "DS_SHADOW_PRE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "home_read_min", env: "DS_HOME_READ_MIN", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1828,6 +1829,19 @@ pub mod tune {
     #[inline]
     pub fn shadow_pre() -> bool {
         get(168) != 0
+    }
+
+    /// The fewest bytes a read-only binding inside a range GPU work writes
+    /// through large bindings needs to give that range a home (`home_reads`;
+    /// 0: over `pre_max`, as before). GPU-written buffers of 4-8 MiB that
+    /// later batches bind read-only were written in place across PCIe and
+    /// copied back for every reading batch (a vista: ~54 MB a frame).
+    #[inline]
+    pub fn home_read_min() -> u64 {
+        match get(169) {
+            0 => pre_max() + 1,
+            v => v,
+        }
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

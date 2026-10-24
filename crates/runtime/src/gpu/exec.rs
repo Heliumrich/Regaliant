@@ -4515,6 +4515,12 @@ static PRE_STABLE: Mutex<(Option<HashMap<(u64, u64), (u64, u64)>>, [u64; 5])> = 
 /// frame, by why the shared copies did not serve them
 /// (`precache::GONE_NAMES`).
 static PRE_UNCHANGED_WHY: Mutex<[u64; 10]> = Mutex::new([0; 10]);
+/// Batch-start copies of 1 MiB or more by range (DS_PROFILE_GPU): [copies,
+/// bytes, repeats within a frame, first-in-frame copies of a range unchanged
+/// since an earlier frame, of a changed one], then copies by why no shared
+/// copy served them (`precache::GONE_NAMES`); and the flip of the last
+/// `profile reset`.
+static PRE_BIG: Mutex<(u64, Option<HashMap<(u64, u64), [u64; 15]>>)> = Mutex::new((0, None));
 
 fn note_pre_stable(base: u64, size: u64, n: u64, frame: u64, why: u8) {
     let h = super::images::sampled_hash(base, size);
@@ -4537,6 +4543,48 @@ fn note_pre_stable(base: u64, size: u64, n: u64, frame: u64, why: u8) {
     if k == 1 {
         PRE_UNCHANGED_WHY.lock()[(why as usize).min(9)] += n;
     }
+    if n >= 1 << 20 && k > 0 {
+        if let Some(e) = PRE_BIG.lock().1.as_mut().and_then(|m| m.get_mut(&(base, size))) {
+            e[2 + k] += 1;
+        }
+    }
+}
+
+/// A batch-start copy of `n` bytes (DS_PROFILE_GPU): ranges of 1 MiB or more
+/// counted by range (`PRE_BIG`; `repeat`: copied before in this frame).
+fn note_pre_big(base: u64, size: u64, n: u64, why: u8, repeat: bool) {
+    if n < 1 << 20 {
+        return;
+    }
+    let mut g = PRE_BIG.lock();
+    let m = g.1.get_or_insert_with(HashMap::new);
+    if m.len() > 1 << 14 {
+        m.clear();
+    }
+    let e = m.entry((base, size)).or_insert([0; 15]);
+    e[0] += 1;
+    e[1] += n;
+    e[2] += repeat as u64;
+    e[5 + (why as usize).min(9)] += 1;
+}
+
+/// The profile line of the largest batch-start copies (`PRE_BIG`).
+fn pre_big_line() -> String {
+    let g = PRE_BIG.lock();
+    let Some(m) = g.1.as_ref() else { return String::new() };
+    let flips = super::FRAMES.load(Ordering::Relaxed).saturating_sub(g.0).max(1) as f64;
+    let mut v: Vec<(&(u64, u64), &[u64; 15])> = m.iter().collect();
+    v.sort_by(|a, b| b.1[1].cmp(&a.1[1]));
+    let total: u64 = m.values().map(|e| e[1]).sum();
+    let parts: Vec<String> = v
+        .iter()
+        .take(12)
+        .map(|((b, s), e)| {
+            let whys: Vec<String> = super::precache::GONE_NAMES.iter().zip(&e[5..15]).filter(|&(_, &c)| c > 0).map(|(n, c)| format!("{n} {c}")).collect();
+            format!("{b:#x}+{s:#x} {:.1}/flip {:.1} MB/flip (repeated in the frame {}, first-in-frame unchanged {} / changed {}; why: {})", e[0] as f64 / flips, e[1] as f64 / flips / 1e6, e[2], e[3], e[4], whys.join(", "))
+        })
+        .collect();
+    format!("    batch-start copies of 1 MiB or more ({:.1} MB/flip in {} ranges), the largest: {}\n", total as f64 / flips / 1e6, m.len(), parts.join("; "))
 }
 
 fn note_pre_repeat(base: u64, size: u64, n: u64, why: u8) {
@@ -4549,11 +4597,12 @@ fn note_pre_repeat(base: u64, size: u64, n: u64, why: u8) {
         }
     }
     let first = g.1.get_or_insert_with(HashSet::new).insert((base, size));
+    drop(g);
+    note_pre_big(base, size, n, why, !first);
     if first {
-        drop(g);
         note_pre_stable(base, size, n, frame, why);
-        g = PRE_REPEAT.lock();
     }
+    let mut g = PRE_REPEAT.lock();
     let k = if first { 0 } else { 2 };
     g.2[k] += 1;
     g.2[k + 1] += n;
@@ -4593,6 +4642,7 @@ fn pre_repeat_line() -> String {
         sizes.join(", ")
     ) + &stable
         + &format!("    first-in-frame copies of unchanged ranges, by why no shared copy served them: {}\n", whys.join(", "))
+        + &pre_big_line()
 }
 
 /// Command-processor time per recorded command by phase (DS_PROFILE_GPU),
@@ -5334,6 +5384,8 @@ pub fn reset_shader_profile() {
         g.3 = [[0; 2]; 4];
     }
     PRE_STABLE.lock().1 = [0; 5];
+    *PRE_UNCHANGED_WHY.lock() = [0; 10];
+    *PRE_BIG.lock() = (super::FRAMES.load(Ordering::Relaxed), None);
     for c in BEGIN_STATS.iter().chain(OFFTHREAD_RESETS.iter()).chain(SUBMIT_STATS.iter()).chain(SUBMIT_STEPS.iter()).chain(SUBMIT_STEPS_RUN.iter()) {
         c.store(0, Ordering::Relaxed);
     }
@@ -6788,7 +6840,7 @@ impl Exec {
         // A large read that may create a home (`tune home_reads`; only when
         // recording in order: a parallel chunk's later neighbours may have
         // bound the range in place already).
-        let read_use = kind == HomeUse::Sized && !written && size > super::tune::pre_max() && !self.deferred && super::tune::homes() && super::tune::home_reads();
+        let read_use = kind == HomeUse::Sized && !written && size >= super::tune::home_read_min() && !self.deferred && super::tune::homes() && super::tune::home_reads();
         if !super::homes::any() && !(kind == HomeUse::Index && super::tune::homes()) && !read_use {
             return None;
         }
@@ -7660,6 +7712,7 @@ impl Exec {
                 unsafe { ctx().device.cmd_copy_buffer(pre, src, buf, &[region]) };
             }
         }
+        let was_shared = shared.is_some();
         match shared {
             Some((chunk, _, id)) => {
                 self.slots[self.cur].keep.push(chunk);
@@ -7672,6 +7725,23 @@ impl Exec {
             }
         }
         self.pres.insert((base, size), (buf, off));
+        // DS_TRACE_PRE=<hex address>[-<hex end>]: the first 80 batch-start
+        // copies over it (which commands read a range copied again and again).
+        static AT: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+        let (at, at_end) = *AT.get_or_init(|| {
+            let v = std::env::var("DS_TRACE_PRE").unwrap_or_default();
+            let num = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+            match v.split_once('-') {
+                Some((lo, hi)) => (num(lo).unwrap_or(0), num(hi).unwrap_or(0)),
+                None => num(&v).map_or((0, 0), |x| (x, x + 1)),
+            }
+        });
+        if at != 0 && base < at_end && at < base + size {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 80 {
+                crate::info!("gpu[{}]: batch-start copy {base:#x}+{size:#x} ({}) for shaders {:#x} {:#x} (flip {}, batch command {})", self.name, if was_shared { "shared" } else { "this batch's" }, self.sync_readers[0], self.sync_readers[1], super::FRAMES.load(Ordering::Relaxed), self.batch_shaders.len());
+            }
+        }
         PRE_COPIES.fetch_add(1, Ordering::Relaxed);
         PRE_BYTES.fetch_add(n, Ordering::Relaxed);
         self.ops[OP_PRE] += 1;
@@ -10137,7 +10207,7 @@ impl Exec {
                             info = vk::DescriptorBufferInfo { buffer: hbuf, offset: off, range: (bias + size).next_multiple_of(4).min(bias + avail) };
                             bound_size = size;
                             if found.tr.plan.resources[i].written {
-                                trace_writes(|| format!("{:?} shader {:#x}", p.stage, p.addr), base, size);
+                                trace_writes(|| format!("{:?} shader {:#x}{}", p.stage, p.addr, super::shaders::program_hash(p.addr).ok().and_then(super::particles::origin).map(|d| format!(" (from {d})")).unwrap_or_default()), base, size);
                                 bound.writes.push((base, size));
                                 if super::xwait::on() {
                                     super::xwait::note_write(&self.name, base, size);
@@ -10184,7 +10254,7 @@ impl Exec {
                                         self.submit_after = self.submit_after.max(s);
                                     }
                                     if found.tr.plan.resources[i].written {
-                                        trace_writes(|| format!("{:?} shader {:#x}", p.stage, p.addr), base, size);
+                                        trace_writes(|| format!("{:?} shader {:#x}{}", p.stage, p.addr, super::shaders::program_hash(p.addr).ok().and_then(super::particles::origin).map(|d| format!(" (from {d})")).unwrap_or_default()), base, size);
                                         bound.writes.push((base, size));
                                         if super::xwait::on() {
                                             super::xwait::note_write(&self.name, base, size);
