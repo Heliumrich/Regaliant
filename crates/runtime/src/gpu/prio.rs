@@ -9,7 +9,11 @@
 //! last-level-cache group when the machine has several (a Ryzen CCD): the
 //! front end's threads share most of their data, which then stays in one L3,
 //! and the title's spinning job workers mostly run elsewhere (FINDINGS.md
-//! 2026-10-16: -11% CPU per command, +6.7% flips/s on a 5900X).
+//! 2026-10-16: -11% CPU per command, +6.7% flips/s on a 5900X). The title's
+//! threads then run on the other groups (`tune guest_cpus` AUTO,
+//! `auto_guest_cpus`): with its job workers sleeping when idle they fit
+//! there, and the front end's recorders no longer share cores with them
+//! (FINDINGS.md 2026-10-24: +4% at a vista).
 
 use std::cell::Cell;
 
@@ -98,6 +102,38 @@ pub fn auto_cpus() -> u64 {
         }
         m
     })
+}
+
+/// The logical CPUs `guest_cpus` AUTO stands for: the process's CPUs
+/// outside the front end's (`cp_cpus`, AUTO resolved), when the front end
+/// has a CPU mask of its own and at least 8 logical CPUs are left; 0 (all)
+/// otherwise. Logged once.
+pub fn auto_guest_cpus() -> u64 {
+    static MASK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MASK.get_or_init(|| {
+        let front = match super::tune::cp_cpus() {
+            CPUS_AUTO => auto_cpus(),
+            m => m,
+        };
+        let m = guest_from(front, process_mask());
+        if m == 0 {
+            crate::info!("guest threads on all logical CPUs (the front end has {front:#x}; `tune guest_cpus` sets a mask)");
+        } else {
+            crate::info!("guest threads on logical CPUs {m:#x}, beside the front end's {front:#x} (`tune guest_cpus 0` for all)");
+        }
+        m
+    })
+}
+
+/// The title's CPUs beside the front end's `front` within `process`
+/// (`auto_guest_cpus`).
+fn guest_from(front: u64, process: u64) -> u64 {
+    let rest = process & !front;
+    if front == 0 || rest.count_ones() < 8 {
+        0
+    } else {
+        rest
+    }
 }
 
 /// `tune gfx_core`: the graphics command processor (`main`) on the first
@@ -232,7 +268,7 @@ fn choose(groups: &[u64], process: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{choose, split_core};
+    use super::{choose, guest_from, split_core};
 
     #[test]
     fn graphics_cp_core() {
@@ -245,6 +281,18 @@ mod tests {
         // No core information: the lowest CPU alone.
         assert_eq!(split_core(0xf0, &[], true), Some(0x10));
         assert_eq!(split_core(0xf0, &[], false), Some(0xe0));
+    }
+
+    #[test]
+    fn guest_cpus_beside_the_front_end() {
+        // 5900X: the front end on the first CCD, the title on the second.
+        assert_eq!(guest_from(0xFFF, 0xFFFFFF), 0xFFF000);
+        // The front end on all CPUs: the title too.
+        assert_eq!(guest_from(0, 0xFFFFFF), 0);
+        // Fewer than 8 CPUs left: all.
+        assert_eq!(guest_from(0xFFF, 0xFFFF), 0);
+        // 7950X: two CCDs of 16.
+        assert_eq!(guest_from(0xFFFF, 0xFFFF_FFFF), 0xFFFF_0000);
     }
 
     #[test]

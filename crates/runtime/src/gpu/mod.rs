@@ -94,7 +94,7 @@ pub mod tune {
         Tunable { name: "upload_async", env: "DS_UPLOAD_ASYNC", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "cp_priority", env: "DS_CP_PRIORITY", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "cp_cpus", env: "DS_CP_CPUS", default: u64::MAX - 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "guest_cpus", env: "DS_GUEST_CPUS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "guest_cpus", env: "DS_GUEST_CPUS", default: u64::MAX - 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy_passes", env: "DS_LAZY_PASSES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "push_partial", env: "DS_PUSH_PARTIAL", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "per_lane", env: "DS_PER_LANE", default: 1, value: AtomicU64::new(UNSET) },
@@ -787,10 +787,14 @@ pub mod tune {
     }
 
     /// Logical CPUs the title's threads may run on (`thread::apply_guest_cpus`;
-    /// a decimal mask, 0 = all of the process's).
+    /// a decimal mask, 0 = all of the process's; AUTO, the default: the
+    /// CPUs the front end leaves, `prio::auto_guest_cpus`).
     #[inline]
     pub fn guest_cpus() -> u64 {
-        get(61)
+        match get(61) {
+            super::prio::CPUS_AUTO => super::prio::auto_guest_cpus(),
+            m => m,
+        }
     }
 
     /// A rendering instance ends without a full barrier: later commands that

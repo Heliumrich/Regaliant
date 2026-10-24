@@ -781,7 +781,7 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     (Some(name), Some(v)) if gpu::tune::set(name, v) => {
                         info!("control: tune {name} = {v} at flip {}", gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
                         if name == "guest_cpus" {
-                            thread::apply_guest_cpus(v);
+                            thread::apply_guest_cpus(gpu::tune::guest_cpus());
                         }
                         if name == "power_optout" {
                             thread::apply_power_optout(v != 0);
