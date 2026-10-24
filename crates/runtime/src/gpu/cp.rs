@@ -5034,6 +5034,16 @@ impl Cp {
             label_event(&self.name, b'M', a, v0, reference, at);
             return Flow::Next;
         }
+        // Measurement only (`tune xwait_skip`, unsafe): the graphics CP does
+        // not wait for labels compute queue 0x50 wrote last (an upper bound
+        // for recording past them; what follows may read stale data). Before
+        // the wait is registered (`ACTIVE_WAITS`): until 2026-10-24 it
+        // returned after that, and the never-removed entries made every
+        // later lookup slower, so its measurements understated the bound.
+        if super::tune::xwait_skip() && self.name == "gpu-gfx" && last_write(a).is_some_and(|(q, _, _)| q == "gpu-acb0x50") {
+            self.note("`tune xwait_skip`: label waits for gpu-acb0x50 skipped (measurement; pictures may be wrong)");
+            return Flow::Next;
+        }
         label_event(&self.name, b'S', a, v0, reference, at);
         // Let recorded work and deferred effects progress while polling; a
         // queue holding this label in an unsubmitted batch submits it.
@@ -5094,13 +5104,6 @@ impl Cp {
         // promise, a latched CP write or a GPU-performed write seen
         // (`wake_label`).
         let gpu_label = last_write(a).is_some_and(|(q, _, _)| q.starts_with("gpu-"));
-        // Measurement only (`tune xwait_skip`, unsafe): the graphics CP does
-        // not wait for labels compute queue 0x50 wrote last (an upper bound
-        // for recording past them; what follows may read stale data).
-        if super::tune::xwait_skip() && self.name == "gpu-gfx" && last_write(a).is_some_and(|(q, _, _)| q == "gpu-acb0x50") {
-            self.note("`tune xwait_skip`: label waits for gpu-acb0x50 skipped (measurement; pictures may be wrong)");
-            return Flow::Next;
-        }
         let probe = super::xwait::on() && self.name == "gpu-gfx";
         if probe {
             if let Some((q, _, _)) = last_write(a) {

@@ -1850,10 +1850,18 @@ fn batch_miss_line() -> String {
     sites.sort_by(|a, b| b.1.cmp(&a.1));
     let sites: Vec<String> = sites.iter().take(6).map(|(l, n)| format!("exec.rs:{l} {n}")).collect();
     format!(
-        "    batched programs' commands not joined to the open dispatch: indirect {}, not a plain 1-D direct dispatch {}, none open {}, another batch {}, commands recorded since {}, another pipeline {}, table full {}, other descriptors {}; by program: {}; recorded since by: {}\n",
+        "    batched programs' commands not joined to the open dispatch: indirect {}, not a plain 1-D direct dispatch {}, none open {}, another batch {}, commands recorded since {}, another pipeline {}, table full {}, other descriptors {}; by program: {}; recorded since by: {}; dispatches' new shadows filled in the prologue {}, before the dispatch {} (`shadow_pre`; off {}, deferred {}, shared copies {}, written earlier in the batch {}, by the main CP's open batch {}, by a closed batch {})\n",
         m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
         progs.join(", "),
-        sites.join(", ")
+        sites.join(", "),
+        SHADOWS_PRE[0].load(Ordering::Relaxed),
+        SHADOWS_PRE[1].load(Ordering::Relaxed),
+        SHADOWS_PRE[2].load(Ordering::Relaxed),
+        SHADOWS_PRE[3].load(Ordering::Relaxed),
+        SHADOWS_PRE[4].load(Ordering::Relaxed),
+        SHADOWS_PRE[5].load(Ordering::Relaxed),
+        SHADOWS_PRE[6].load(Ordering::Relaxed),
+        SHADOWS_PRE[7].load(Ordering::Relaxed)
     )
 }
 
@@ -4353,6 +4361,9 @@ static SEG_TOTAL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// two barriers' sites (the batch's start counts as a site): [ns, segments].
 type SitePair = (&'static str, u32, &'static str, u32);
 static SEG_PAIRS: Mutex<Option<HashMap<SitePair, [u64; 2]>>> = Mutex::new(None);
+/// Segments with commands by queue and the barrier site that ended them:
+/// [ns, segments, commands].
+static SEG_ENDS: Mutex<Option<HashMap<(String, &'static str, u32), [u64; 3]>>> = Mutex::new(None);
 
 /// What a segment without commands recorded (its operation counts' change).
 fn seg_kind(a: &[u64; OPS], b: &[u64; OPS]) -> &'static str {
@@ -4370,7 +4381,7 @@ fn seg_kind(a: &[u64; OPS], b: &[u64; OPS]) -> &'static str {
 }
 
 /// Splits a completed batch's time among its barrier segments (`seg_stamps`).
-fn collect_segments(pool: vk::QueryPool, shaders: &[u64], segs: &[SegMark], ops_end: &[u64; OPS], be: [u64; 2]) {
+fn collect_segments(pool: vk::QueryPool, shaders: &[u64], segs: &[SegMark], ops_end: &[u64; OPS], be: [u64; 2], queue: &str) {
     let c = ctx();
     let mut t = vec![0u64; segs.len()];
     if !segs.is_empty() && unsafe { c.device.get_query_pool_results(pool, 0, &mut t, vk::QueryResultFlags::TYPE_64) }.is_err() {
@@ -4396,6 +4407,8 @@ fn collect_segments(pool: vk::QueryPool, shaders: &[u64], segs: &[SegMark], ops_
     let m = g.get_or_insert_with(HashMap::new);
     let mut ge = SEG_EMPTY.lock();
     let me = ge.get_or_insert_with(HashMap::new);
+    let mut gq = SEG_ENDS.lock();
+    let mq = gq.get_or_insert_with(HashMap::new);
     for w in bounds.windows(2) {
         let d = ((w[1].0 - w[0].0) as f64 * period) as u64;
         let (from, to) = (w[0].1, w[1].1.max(w[0].1));
@@ -4418,6 +4431,10 @@ fn collect_segments(pool: vk::QueryPool, shaders: &[u64], segs: &[SegMark], ops_
                 e[0] += each;
                 e[1] += 1;
             }
+            let e = mq.entry((queue.to_string(), w[1].3 .0, w[1].3 .1)).or_insert([0; 3]);
+            e[0] += d;
+            e[1] += 1;
+            e[2] += cmds.len() as u64;
             SEG_TOTAL[0].fetch_add(d, Ordering::Relaxed);
         }
         SEG_TOTAL[2].fetch_add(1, Ordering::Relaxed);
@@ -4452,6 +4469,24 @@ fn seg_lines() -> String {
         v.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
         let parts: Vec<String> = v.iter().take(16).map(|((f0, l0, f1, l1), x)| format!("{f0}:{l0} -> {f1}:{l1} {} ms ({})", x[0] / 1_000_000, x[1])).collect();
         s.push_str(&format!("      barrier-only segments by their barriers' sites: {}\n", parts.join(", ")));
+    }
+    if let Some(m) = SEG_ENDS.lock().as_ref() {
+        // Per queue (the four with the most such time): the sites whose
+        // barriers ended its segments with commands.
+        let mut by_q: HashMap<&str, (u64, Vec<(&'static str, u32, [u64; 3])>)> = HashMap::new();
+        for ((q, f, l), x) in m.iter() {
+            let e = by_q.entry(q.as_str()).or_default();
+            e.0 += x[0];
+            e.1.push((f, *l, *x));
+        }
+        let mut qs: Vec<(&str, (u64, Vec<(&'static str, u32, [u64; 3])>))> = by_q.into_iter().collect();
+        qs.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        for (q, (ns, mut v)) in qs.into_iter().take(4) {
+            v.sort_by(|a, b| b.2[0].cmp(&a.2[0]));
+            let segs: u64 = v.iter().map(|x| x.2[1]).sum();
+            let parts: Vec<String> = v.iter().take(8).map(|(f, l, x)| format!("{f}:{l} {} ms ({} segments, {:.1} commands, {:.1} us each)", x[0] / 1_000_000, x[1], x[2] as f64 / x[1].max(1) as f64, x[0] as f64 / x[1].max(1) as f64 / 1000.0)).collect();
+            s.push_str(&format!("      {q}: segments with commands {} ms ({segs}), ended by: {}\n", ns / 1_000_000, parts.join(", ")));
+        }
     }
     s
 }
@@ -5213,7 +5248,7 @@ fn collect_timestamps(pool: vk::QueryPool, shaders: &[u64], queue: &str, seq: u6
         g.0 = g.0.max(be[1]);
         drop(g);
         if seg_stamps() {
-            collect_segments(pool, shaders, segs, ops, be);
+            collect_segments(pool, shaders, segs, ops, be, queue);
         }
     }
     let mut pre = [0u64; 2];
@@ -5287,6 +5322,7 @@ pub fn reset_shader_profile() {
     MERGE_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
     *SEG_EMPTY.lock() = None;
     *SEG_PAIRS.lock() = None;
+    *SEG_ENDS.lock() = None;
     for c in &SEG_TOTAL {
         c.store(0, Ordering::Relaxed);
     }
@@ -5797,6 +5833,13 @@ const SGPR_WINDOW_BYTES: u64 = 4 * rdna::translate::SGPR_WINDOW_DWORDS as u64;
 /// [commands appended to an open batched dispatch, batched dispatches
 /// recorded, commands of batched programs run on their own].
 pub static BATCHED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Dispatches' new VRAM shadows filled in the batch's prologue
+/// (`tune shadow_pre`) and before the dispatch itself: [prologue, in place,
+/// then why in place: off (or no merging), a deferred executor's, a shared
+/// copy, a window written earlier in the batch, by the main command
+/// processor's unsubmitted batch, by a closed batch not submitted yet].
+pub static SHADOWS_PRE: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
 /// Why a batched program's command opened a new dispatch instead of joining
 /// the open one: [indirect, not a plain 1-D direct dispatch (start, SGPR
 /// patches, a descriptor set, groups), no open dispatch, another batch,
@@ -5810,7 +5853,7 @@ static BATCH_MISS_SITES: Mutex<Option<HashMap<u32, u64>>> = Mutex::new(None);
 
 /// A new window for the batched dispatches' statistics (`profile reset`).
 pub(super) fn reset_batch_misses() {
-    for c in BATCHED.iter().chain(BATCH_MISS.iter()) {
+    for c in BATCHED.iter().chain(BATCH_MISS.iter()).chain(SHADOWS_PRE.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     *BATCH_MISS_PROGRAMS.lock() = None;
@@ -10972,7 +11015,41 @@ impl Exec {
                     None => kept.push(None),
                 }
             }
-            unsafe {
+            // Into the prologue (`tune shadow_pre`) when no shadow comes from
+            // a shared copy and nothing earlier in the batch (or a batch not
+            // submitted yet that it follows) writes their windows: the
+            // prologue runs before the batch's work, so the copies see guest
+            // memory as they would here, and no barrier stops the GPU in the
+            // middle of the batch.
+            let why = if !super::tune::shadow_pre() || !shadow_merge() {
+                2
+            } else if self.deferred {
+                3
+            } else if kept.iter().any(|k| k.is_some()) {
+                4
+            } else if fresh.iter().any(|sh| self.pending.overlaps(sh.guest, sh.range)) {
+                5
+            } else if fresh.iter().any(|sh| self.main_pending(&[(sh.guest, sh.range)])) {
+                6
+            } else if fresh.iter().any(|sh| self.closed_overlap(&[(sh.guest, sh.range)])) {
+                7
+            } else {
+                0
+            };
+            let to_pre = why == 0;
+            SHADOWS_PRE[why].fetch_add(fresh.len() as u64, Ordering::Relaxed);
+            if why != 0 {
+                SHADOWS_PRE[1].fetch_add(fresh.len() as u64, Ordering::Relaxed);
+            }
+            if to_pre {
+                let _ = self.open_pre();
+                let shadow = self.shadow();
+                for sh in &fresh {
+                    self.pre_copies.push((sh.host, shadow, vk::BufferCopy { src_offset: sh.host_off, dst_offset: sh.pristine_off, size: sh.range }));
+                    self.pre_after.push((shadow, shadow, vk::BufferCopy { src_offset: sh.pristine_off, dst_offset: sh.shadow_off, size: sh.range }));
+                }
+            }
+            if !to_pre { unsafe {
                 if shadow_merge() {
                     // One read of guest memory (the pristine copy), then the
                     // working copy from it: two reads could see different CPU
@@ -11015,7 +11092,7 @@ impl Exec {
                 }
                 let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
                 c.device.cmd_pipeline_barrier(self.cmd(), vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
-            }
+            } }
         }
         stamp(1);
         lap.mark(11);

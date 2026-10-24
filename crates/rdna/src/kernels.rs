@@ -800,3 +800,86 @@ mod tests {
         }
     }
 }
+
+/// Workgroup size of `latency_test`.
+pub const LATENCY_LOCAL_SIZE: u32 = 64;
+
+/// A test kernel (`dsport --dispatch-bench`): each invocation runs `iters`
+/// (push constant 0) steps of a dependent integer chain seeded by its index
+/// and stores the result at dword `base + index` of binding 0 (push constant
+/// 1). `salt` is baked into the code: kernels with different salts are
+/// different programs (and pipelines).
+pub fn latency_test(salt: u32) -> Vec<u32> {
+    build_latency(salt).expect("latency test kernel")
+}
+
+fn build_latency(salt: u32) -> Result<Vec<u32>, rspirv::dr::Error> {
+    let lit = Operand::LiteralBit32;
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.extension("SPV_KHR_storage_buffer_storage_class");
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+    let void = b.type_void();
+    let bool_ = b.type_bool();
+    let u32t = b.type_int(32, 0);
+    let v3 = b.type_vector(u32t, 3);
+    let rta = b.type_runtime_array(u32t);
+    b.decorate(rta, Decoration::ArrayStride, [lit(4)]);
+    let st = b.type_struct([rta]);
+    b.decorate(st, Decoration::Block, []);
+    b.member_decorate(st, 0, Decoration::Offset, [lit(0)]);
+    let p_st = b.type_pointer(None, StorageClass::StorageBuffer, st);
+    let p_u = b.type_pointer(None, StorageClass::StorageBuffer, u32t);
+    let pc = b.type_struct([u32t, u32t]);
+    b.decorate(pc, Decoration::Block, []);
+    b.member_decorate(pc, 0, Decoration::Offset, [lit(0)]);
+    b.member_decorate(pc, 1, Decoration::Offset, [lit(4)]);
+    let p_pc = b.type_pointer(None, StorageClass::PushConstant, pc);
+    let p_pcu = b.type_pointer(None, StorageClass::PushConstant, u32t);
+    let p_in = b.type_pointer(None, StorageClass::Input, v3);
+    let gid = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(gid, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let buf = global(&mut b, p_st, StorageClass::StorageBuffer);
+    b.decorate(buf, Decoration::DescriptorSet, [lit(0)]);
+    b.decorate(buf, Decoration::Binding, [lit(0)]);
+    let pcv = global(&mut b, p_pc, StorageClass::PushConstant);
+    let c0 = b.constant_bit32(u32t, 0);
+    let c1 = b.constant_bit32(u32t, 1);
+    let cm = b.constant_bit32(u32t, 1664525);
+    let ca = b.constant_bit32(u32t, 1013904223u32.wrapping_add(salt.wrapping_mul(2)));
+    let fty = b.type_function(void, []);
+    let f = b.begin_function(void, None, FunctionControl::NONE, fty)?;
+    let l_entry = b.begin_block(None)?;
+    let g = b.load(v3, None, gid, None, [])?;
+    let x0 = b.composite_extract(u32t, None, g, [0])?;
+    let p_it = b.access_chain(p_pcu, None, pcv, [c0])?;
+    let iters = b.load(u32t, None, p_it, None, [])?;
+    let p_base = b.access_chain(p_pcu, None, pcv, [c1])?;
+    let base = b.load(u32t, None, p_base, None, [])?;
+    let (l_head, l_body, l_cont, l_merge) = (b.id(), b.id(), b.id(), b.id());
+    let (x_next, i_next) = (b.id(), b.id());
+    b.branch(l_head)?;
+    b.begin_block(Some(l_head))?;
+    let i = b.phi(u32t, None, [(c0, l_entry), (i_next, l_cont)])?;
+    let x = b.phi(u32t, None, [(x0, l_entry), (x_next, l_cont)])?;
+    b.loop_merge(l_merge, l_cont, spirv::LoopControl::NONE, [])?;
+    let more = b.u_less_than(bool_, None, i, iters)?;
+    b.branch_conditional(more, l_body, l_merge, [])?;
+    b.begin_block(Some(l_body))?;
+    let m = b.i_mul(u32t, None, x, cm)?;
+    b.i_add(u32t, Some(x_next), m, ca)?;
+    b.branch(l_cont)?;
+    b.begin_block(Some(l_cont))?;
+    b.i_add(u32t, Some(i_next), i, c1)?;
+    b.branch(l_head)?;
+    b.begin_block(Some(l_merge))?;
+    let idx = b.i_add(u32t, None, base, x0)?;
+    let p = b.access_chain(p_u, None, buf, [c0, idx])?;
+    b.store(p, x, None, [])?;
+    b.ret()?;
+    b.end_function()?;
+    b.entry_point(ExecutionModel::GLCompute, f, "main", [gid]);
+    b.execution_mode(f, ExecutionMode::LocalSize, [LATENCY_LOCAL_SIZE, 1, 1]);
+    Ok(b.module().assemble())
+}

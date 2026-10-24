@@ -48,6 +48,8 @@ pub struct Config {
     pub record_bench: Option<(String, Option<u64>)>,
     /// `--compile-bench [min instructions] [max programs]` (`gpu::compbench`).
     pub compile_bench: Option<Vec<String>>,
+    /// `--dispatch-bench` (`gpu::dispbench`).
+    pub dispatch_bench: bool,
     pub trace: bool,
     pub lenient: bool,
     pub debug: bool,
@@ -139,6 +141,7 @@ fn parse_args() -> Config {
     let mut app = None;
     let mut pipeline_test = None;
     let mut compile_bench: Option<Vec<String>> = None;
+    let mut dispatch_bench = false;
     let mut record_bench = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -153,6 +156,7 @@ fn parse_args() -> Config {
             "--cache" => cache = Some(PathBuf::from(args.next().expect("--cache needs a directory"))),
             "--app" => app = Some(PathBuf::from(args.next().expect("--app needs a path"))),
             "--pipeline-test" => pipeline_test = Some(args.next().expect("--pipeline-test needs a capture file")),
+            "--dispatch-bench" => dispatch_bench = true,
             "--compile-bench" => {
                 let min = args.next().expect("--compile-bench needs <min instructions> <max programs>");
                 let max = args.next().expect("--compile-bench needs <min instructions> <max programs>");
@@ -186,6 +190,7 @@ fn parse_args() -> Config {
         pipeline_test,
         record_bench,
         compile_bench,
+        dispatch_bench,
     }
 }
 
@@ -1142,6 +1147,11 @@ fn main() {
     hle::LENIENT_IMPORTS.store(cfg.lenient, std::sync::atomic::Ordering::Relaxed);
     info!("dsport {} | run dir {} | TLS slot {} | host heap: {} | guest write watch: {}", env!("CARGO_PKG_VERSION"), cfg.run_dir.display(), slot, heap::name(), mem::write_watch_state());
     exception::install();
+    if cfg.dispatch_bench {
+        let code = gpu::dispbench::run();
+        log::flush();
+        std::process::exit(code);
+    }
     if let Some(c) = &cfg.pipeline_test {
         let code = gpu::exec::pipeline_test(c);
         log::flush();

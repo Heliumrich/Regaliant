@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 168] = [
+    static ALL: [Tunable; 169] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -201,6 +201,7 @@ pub mod tune {
         Tunable { name: "trace_waits", env: "DS_TRACE_WAITS_N", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "plan_fast", env: "DS_PLAN_FAST", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "async_particles", env: "DS_ASYNC_PARTICLES", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "shadow_pre", env: "DS_SHADOW_PRE", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1811,6 +1812,19 @@ pub mod tune {
         get(167) != 0
     }
 
+    /// A dispatch's new VRAM shadows get the guest data in the batch's
+    /// prologue (before all its work) when nothing earlier in the batch
+    /// writes their window, instead of by copies and two barriers before
+    /// the dispatch: those barriers drained the GPU before every such
+    /// dispatch, so the title's particle chain (~1,000 small dispatches a
+    /// frame, each writing small buffers of its own) ran one dispatch at a
+    /// time (`--dispatch-bench`: 256 dispatches overlap in 61 us, 6 ms with
+    /// a barrier between). 0: as before.
+    #[inline]
+    pub fn shadow_pre() -> bool {
+        get(168) != 0
+    }
+
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
     /// without appends).
     #[inline]
@@ -1837,6 +1851,7 @@ pub mod tune {
 
 pub mod ahead;
 pub mod compbench;
+pub mod dispbench;
 pub mod compile;
 pub mod pacing;
 pub mod particles;
