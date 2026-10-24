@@ -114,6 +114,12 @@ pub struct Layout3d {
     pub padded_height: u32,
     pub padded_depth: u32,
     p: [u64; 20],
+    /// Per-axis offset tables over the whole (padded) extent: the in-block
+    /// offset is xs[x] ^ ys[y] ^ zs[z] (XOR swizzles take coordinate bits
+    /// above the block's).
+    xs: Vec<u32>,
+    ys: Vec<u32>,
+    zs: Vec<u32>,
 }
 
 /// Single-mip thick 3D layout (standard swizzles), or None.
@@ -135,6 +141,9 @@ pub fn layout_3d(sw: u32, elem_log2: u32, width: u32, height: u32, depth: u32) -
     let (avg, rest) = (in_1k / 3, in_1k % 3);
     let (bw, bh, bd) = (w0 << avg, h0 << (avg + rest / 2), d0 << (avg + u32::from(rest != 0)));
     let (width, height, depth) = (width.max(1), height.max(1), depth.max(1));
+    let xs = (0..width.next_multiple_of(bw)).map(|x| field_offset(&p, block_log2, 0, x)).collect();
+    let ys = (0..height.next_multiple_of(bh)).map(|y| field_offset(&p, block_log2, 1, y)).collect();
+    let zs = (0..depth.next_multiple_of(bd)).map(|z| field_offset(&p, block_log2, 2, z)).collect();
     Some(Layout3d {
         elem_log2,
         width,
@@ -148,6 +157,9 @@ pub fn layout_3d(sw: u32, elem_log2: u32, width: u32, height: u32, depth: u32) -
         padded_height: height.next_multiple_of(bh),
         padded_depth: depth.next_multiple_of(bd),
         p,
+        xs,
+        ys,
+        zs,
     })
 }
 
@@ -175,15 +187,62 @@ impl Layout3d {
         let e = 1usize << self.elem_log2;
         dst.clear();
         dst.resize(self.width as usize * self.height as usize * self.depth as usize * e, 0);
-        let mut d = 0;
-        for z in 0..self.depth {
-            for y in 0..self.height {
-                for x in 0..self.width {
-                    let o = self.offset(x, y, z) as usize;
-                    if o + e <= src.len() {
-                        dst[d..d + e].copy_from_slice(&src[o..o + e]);
-                    }
-                    d += e;
+        self.detile_into(src, dst);
+    }
+
+    /// `detile` into `dst`, exactly the volume's packed size (the texture
+    /// cache's staging memory), from per-axis offset tables and on several
+    /// threads (slices) for volumes of 1 MiB and more; elements beyond `src`
+    /// are written as zeros. (Per element through the swizzle pattern it
+    /// took 100-230 ms for the title's 8-180 MB volumes, on the recording
+    /// threads, 2026-10-24.)
+    pub fn detile_into(&self, src: &[u8], dst: &mut [u8]) {
+        let e = 1usize << self.elem_log2;
+        let slice = self.width as usize * self.height as usize * e;
+        debug_assert_eq!(dst.len(), slice * self.depth as usize);
+        if slice == 0 {
+            return;
+        }
+        let threads = if dst.len() >= 1 << 20 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8) } else { 1 };
+        let per = (self.depth as usize).div_ceil(threads.max(1));
+        if threads <= 1 || per == 0 {
+            self.slices(src, 0, dst);
+            return;
+        }
+        std::thread::scope(|s| {
+            for (k, chunk) in dst.chunks_mut(per * slice).enumerate() {
+                s.spawn(move || self.slices(src, k * per, chunk));
+            }
+        });
+    }
+
+    /// Detiles whole slices starting at slice `z0` into `out`.
+    fn slices(&self, src: &[u8], z0: usize, out: &mut [u8]) {
+        match self.elem_log2 {
+            0 => self.slices_n::<1>(src, z0, out),
+            1 => self.slices_n::<2>(src, z0, out),
+            2 => self.slices_n::<4>(src, z0, out),
+            3 => self.slices_n::<8>(src, z0, out),
+            _ => self.slices_n::<16>(src, z0, out),
+        }
+    }
+
+    fn slices_n<const N: usize>(&self, src: &[u8], z0: usize, out: &mut [u8]) {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let (lw, lh, ld) = (self.block_w.trailing_zeros(), self.block_h.trailing_zeros(), self.block_d.trailing_zeros());
+        let pitch_blocks = (self.pitch / self.block_w).max(1) as u64;
+        let slab = self.slab_size();
+        for (r, orow) in out.chunks_exact_mut(w * N).enumerate() {
+            let z = z0 + r / h;
+            let y = r % h;
+            let zy = self.zs[z] ^ self.ys[y];
+            let rb = (z >> ld) as u64 * slab + (((y >> lh) as u64 * pitch_blocks) << self.block_log2);
+            for x in 0..w {
+                let o = (rb + (((x >> lw) as u64) << self.block_log2) + (self.xs[x] ^ zy) as u64) as usize;
+                if o + N <= src.len() {
+                    orow[x * N..x * N + N].copy_from_slice(&src[o..o + N]);
+                } else {
+                    orow[x * N..x * N + N].fill(0);
                 }
             }
         }
@@ -409,7 +468,7 @@ mod tests {
     fn fast_detile_matches_offsets() {
         // Every swizzle mode, element size and mip (tails included), and an
         // array slice: the row detiler against the per-element offsets.
-        for sw in [1u32, 5, 9, 24, 25, 27] {
+        for sw in [1u32, 2, 5, 6, 9, 10, 17, 18, 21, 22, 24, 25, 26, 27] {
             for el in 0..5u32 {
                 for (tw, th, levels) in [(300u32, 200u32, 9u32), (1024, 512, 11), (64, 64, 7), (2048, 1024, 1)] {
                     let Some(l) = layout(sw, el, tw, th, levels, false) else { continue };
@@ -434,6 +493,38 @@ mod tests {
                             assert!(got == want, "sw {sw} elem {el} {tw}x{th} mip {mip} slice {slice}");
                         }
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fast_detile_3d_matches_offsets() {
+        // Thick swizzle modes, element sizes and odd sizes: the table-driven
+        // slice detiler against the per-element offsets.
+        for sw in [5u32, 9, 17, 21, 25] {
+            for el in 0..5u32 {
+                for (w, h, d) in [(64u32, 32u32, 16u32), (100, 70, 9), (256, 64, 40), (33, 17, 5)] {
+                    let Some(l) = layout_3d(sw, el, w, h, d) else { continue };
+                    let size = l.size() as usize;
+                    let src: Vec<u8> = (0..size).map(|i| (i * 2654435761usize >> 9) as u8).collect();
+                    let e = 1usize << el;
+                    let mut want = vec![0u8; w as usize * h as usize * d as usize * e];
+                    let mut k = 0;
+                    for z in 0..d {
+                        for y in 0..h {
+                            for x in 0..w {
+                                let o = l.offset(x, y, z) as usize;
+                                if o + e <= src.len() {
+                                    want[k..k + e].copy_from_slice(&src[o..o + e]);
+                                }
+                                k += e;
+                            }
+                        }
+                    }
+                    let mut got = Vec::new();
+                    l.detile(&src, &mut got);
+                    assert!(got == want, "sw {sw} elem {el} {w}x{h}x{d}");
                 }
             }
         }

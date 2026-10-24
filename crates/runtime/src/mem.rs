@@ -434,6 +434,24 @@ pub fn mapped(a: u64, len: u64) -> bool {
     true
 }
 
+/// Whether the mapping table holds [a, a+len) in mappings whose host pages
+/// are committed and readable (`win_prot` not PAGE_NOACCESS): what
+/// `os_readable` asks the operating system, from the table (bulk readers
+/// under `GUEST_READERS` use it from before the lock: `table_view_held`).
+pub fn host_readable(a: u64, len: u64) -> bool {
+    use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
+    let st = MEM.lock();
+    let end = a.saturating_add(len.max(1));
+    let mut p = a;
+    while p < end {
+        match st.find(p) {
+            Some(v) if v.kind != VmaKind::Reserved && win_prot(v.prot) != PAGE_NOACCESS => p = v.end(),
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// The mapped, readable mapping containing `a` as [start, end), if any.
 pub fn mapped_span(a: u64) -> Option<(u64, u64)> {
     let st = MEM.lock();
@@ -918,8 +936,20 @@ pub fn retry_deferred() {
 /// a streamed texture array during a level load while a queue thread
 /// detiled it (fatal access violation, run 20261012-082109). Holders must not
 /// take `MEM` (decommits hold it while they wait here): they check pages with
-/// `os_readable`.
+/// `os_readable`, or with the mapping table before taking this and
+/// `table_view_held` after.
 pub static GUEST_READERS: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
+
+/// Whether a view of the mapping table taken at generation `g0` (`MAP_GEN`
+/// read before the table checks) still holds now that `GUEST_READERS` is
+/// held: no mapping or protection change since. Unmaps and protection
+/// changes move the generation before they change pages, and wait for the
+/// readers, so ranges the table showed readable stay readable while the
+/// lock is held. (`VirtualQuery` sizes its region by walking page tables:
+/// thousands of checks per streamed texture array cost 0.5-0.6 s.)
+pub fn table_view_held(g0: u64) -> bool {
+    MAP_GEN.load(std::sync::atomic::Ordering::SeqCst) == g0
+}
 
 /// Whether every page of [a, a+len) is committed and readable now (operating
 /// system query; takes none of our locks).
@@ -1609,6 +1639,10 @@ impl MemState {
         }
         self.split_at(start, crate::sections::SPLIT_PROTECT);
         self.split_at(end, crate::sections::SPLIT_PROTECT);
+        // Before the pages change too: a bulk reader that checked the table
+        // before taking `GUEST_READERS` sees the generation move
+        // (`table_view_held`).
+        bump_gen(start, end);
         let keys: Vec<u64> = self.vmas.range(start..end).map(|(k, _)| *k).collect();
         for k in keys {
             let v = self.vmas.get_mut(&k).unwrap();

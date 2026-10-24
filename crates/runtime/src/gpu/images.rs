@@ -912,6 +912,10 @@ const SUB_UNMAPPED: u64 = 0x5555_5555_5555_5555;
 /// filled, freed), the transfer (submitted and waited for: the GPU's queue
 /// drains first).
 static UPLOAD_SPLIT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// Uploads whose pages were checked in the mapping table and held (no
+/// mapping change before the reader lock), and those checked again with the
+/// operating system (`mem::table_view_held`).
+static UPLOAD_TABLE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Hash of `n` bytes at `a` (four independent lanes over 64-bit words).
 fn hash_bytes(a: u64, n: usize) -> u64 {
@@ -1619,7 +1623,7 @@ impl Images {
         let r = self.upload_inner(image, key, t, only, all);
         if let Ok((_, n)) = &r {
             self.upload_bytes += n;
-            super::hitch::note_since(super::hitch::Kind::Upload, t0, || format!("{}x{} {} KiB", key.width, key.height, n >> 10));
+            super::hitch::note_since(super::hitch::Kind::Upload, t0, || format!("{}x{}x{}{} {:?} {} KiB", key.width, key.height, key.layers, if key.ty3d { " 3D" } else { "" }, key.format, n >> 10));
         }
         self.upload_ns += t0.elapsed().as_nanos() as u64;
         r
@@ -1678,6 +1682,7 @@ impl Images {
         // next time); taking resets them, so the copy cache and other
         // textures on those pages are told (`precache::take_written_for`).
         let mut written: Vec<(u64, u64)> = Vec::new();
+        let t_take = std::time::Instant::now();
         let precise = precise && {
             let mut pages = Vec::new();
             let ok = super::precache::take_written_for(t.base, size, &mut pages, region, 4).is_some();
@@ -1689,14 +1694,41 @@ impl Images {
             }
             ok
         };
+        let take_ms = t_take.elapsed().as_secs_f64() * 1e3;
         // Pages checked and read under the guest-reader lock: the title may
         // unmap layers of a streamed array meanwhile (`mem::GUEST_READERS`).
+        // Checked in the mapping table first, before the lock (which must
+        // not take the table's), and again with the operating system only
+        // when a mapping changed in between (`mem::table_view_held`).
         let t_detile = std::time::Instant::now();
+        let g0 = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::SeqCst);
+        let table_whole = super::cp::valid(t.base, size) && crate::mem::host_readable(t.base, size);
+        let n_parts = key.levels as usize * layers as usize;
+        let table_parts: Vec<bool> = if table_whole {
+            Vec::new()
+        } else {
+            (0..n_parts)
+                .map(|i| {
+                    let (s, n) = range(i / layers as usize, (i % layers as usize) as u32);
+                    super::cp::valid(t.base + s, n) && crate::mem::host_readable(t.base + s, n)
+                })
+                .collect()
+        };
+        let t_table = std::time::Instant::now();
         let readers = crate::mem::GUEST_READERS.read();
-        let whole = super::cp::valid(t.base, size) && crate::mem::os_readable(t.base, size);
+        let t_locked = std::time::Instant::now();
+        let held = crate::mem::table_view_held(g0);
+        UPLOAD_TABLE[usize::from(!held)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let whole = if held { table_whole } else { super::cp::valid(t.base, size) && crate::mem::os_readable(t.base, size) };
         let mapped = |mip: usize, layer: u32| -> bool {
+            if whole {
+                return true;
+            }
+            if held {
+                return table_parts[mip * layers as usize + layer as usize];
+            }
             let (s, n) = range(mip, layer);
-            whole || (super::cp::valid(t.base + s, n) && crate::mem::os_readable(t.base + s, n))
+            super::cp::valid(t.base + s, n) && crate::mem::os_readable(t.base + s, n)
         };
         let candidate = |mip: usize, layer: u32| -> bool {
             if !precise {
@@ -1722,6 +1754,33 @@ impl Images {
             Vec::new()
         };
         let t_query = std::time::Instant::now();
+        // A re-upload's candidates are hashed first, on several threads when
+        // they are large (one by one, a 1,200-part array's re-upload spent
+        // 50 ms here).
+        let mut pre_hash: Vec<u64> = Vec::new();
+        if sums_on && !first {
+            let todo: Vec<(usize, u64, u64)> = (0..n_sub)
+                .filter_map(|i| {
+                    let (mip, layer) = (i / layers as usize, (i % layers as usize) as u32);
+                    if !candidate(mip, layer) || !mapped(mip, layer) {
+                        return None;
+                    }
+                    let (s, n) = range(mip, layer);
+                    Some((i, t.base + s, n))
+                })
+                .collect();
+            let bytes: u64 = todo.iter().map(|x| x.2).sum();
+            pre_hash = vec![SUB_NONE; n_sub];
+            let threads = if bytes >= 1 << 20 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8) } else { 1 };
+            let per = todo.len().div_ceil(threads.max(1)).max(1);
+            let hashed: Vec<(usize, u64)> = std::thread::scope(|sc| {
+                let handles: Vec<_> = todo.chunks(per).map(|c| sc.spawn(move || c.iter().map(|&(i, a, n)| (i, hash_bytes(a, n as usize))).collect::<Vec<_>>())).collect();
+                handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+            });
+            for (i, h) in hashed {
+                pre_hash[i] = h;
+            }
+        }
         let mut want = vec![false; n_sub];
         let mut use_mapped = vec![false; n_sub];
         let mut end = 0u64;
@@ -1739,8 +1798,11 @@ impl Images {
                     continue;
                 }
                 let (s, n) = range(mip, layer);
-                if sums_on {
-                    let h = hash_bytes(t.base + s, n as usize);
+                // (A first upload hashes its parts after the detiling, on
+                // several threads: one by one here it cost as long as
+                // detiling a large array.)
+                if sums_on && !first {
+                    let h = pre_hash[i];
                     if precise && sums[i] == h {
                         SUB_SAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         continue;
@@ -1753,6 +1815,7 @@ impl Images {
             }
         }
         UPLOAD_SPLIT[3].fetch_add(t_query.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let t_chosen = std::time::Instant::now();
         let wanted = |mip: usize, layer: u32| want[mip * layers as usize + layer as usize];
         if upload_check() {
             let now: Vec<u64> = (0..key.levels as usize)
@@ -1871,11 +1934,66 @@ impl Images {
             let (buf, mem, ptr) = ctx().host_buffer(total.max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
             Staging { buf, mem, ptr, cap: total.max(4) as u64 }
         };
+        let t_alloc = std::time::Instant::now();
         let dst = unsafe { std::slice::from_raw_parts_mut(st.ptr, total) };
+        // Parts of under 1 MiB (array layers, small mips) are detiled on
+        // several threads at once (`detile_into` splits larger ones itself):
+        // a 360-layer array of 288 KiB layers took 91 ms one part at a time.
+        let small: Vec<(usize, u32, usize, usize)> = parts.iter().copied().filter(|p| p.3 < 1 << 20).collect();
+        let small_bytes: usize = small.iter().map(|p| p.3).sum();
         for &(mip, layer, off, len) in &parts {
-            lay.detile_into(src, mip, layer, &mut dst[off..off + len]);
+            if len >= 1 << 20 || small_bytes < 1 << 20 {
+                lay.detile_into(src, mip, layer, &mut dst[off..off + len]);
+            }
         }
+        if small_bytes >= 1 << 20 {
+            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
+            // Disjoint destination slices, handed out in order of offset.
+            let mut rest: &mut [u8] = &mut dst[..];
+            let mut base = 0usize;
+            let mut jobs: Vec<Vec<(usize, u32, &mut [u8])>> = (0..threads).map(|_| Vec::new()).collect();
+            let mut sorted = small;
+            sorted.sort_by_key(|p| p.2);
+            for (k, &(mip, layer, off, len)) in sorted.iter().enumerate() {
+                let (_, tail) = std::mem::take(&mut rest).split_at_mut(off - base);
+                let (mine, after) = tail.split_at_mut(len);
+                rest = after;
+                base = off + len;
+                jobs[k % threads].push((mip, layer, mine));
+            }
+            let lay = &lay;
+            std::thread::scope(|s| {
+                for job in jobs {
+                    s.spawn(move || {
+                        for (mip, layer, out) in job {
+                            lay.detile_into(src, mip, layer, out);
+                        }
+                    });
+                }
+            });
+        }
+        let t_detiled = std::time::Instant::now();
         dst[zero_off..].fill(0);
+        // A first upload's sums (for later partial re-uploads), hashed here
+        // on several threads rather than one by one before the detiling.
+        if sums_on && first {
+            let todo: Vec<(usize, u64, u64)> = parts
+                .iter()
+                .map(|&(mip, layer, _, _)| {
+                    let (s, n) = range(mip, layer);
+                    (mip * layers as usize + layer as usize, t.base + s, n)
+                })
+                .collect();
+            let threads = if detiled >= 1 << 20 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8) } else { 1 };
+            let per = todo.len().div_ceil(threads.max(1)).max(1);
+            let hashed: Vec<(usize, u64)> = std::thread::scope(|sc| {
+                let handles: Vec<_> = todo.chunks(per).map(|c| sc.spawn(move || c.iter().map(|&(i, a, n)| (i, hash_bytes(a, n as usize))).collect::<Vec<_>>())).collect();
+                handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+            });
+            for (i, h) in hashed {
+                sums[i] = h;
+            }
+        }
         // Guest memory is no longer read.
         drop(readers);
         UPLOAD_SPLIT[0].fetch_add(t_detile.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1949,6 +2067,29 @@ impl Images {
             c.device.free_memory(st.mem, None);
         }
         UPLOAD_SPLIT[1].fetch_add(t_free.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        // Uploads of 50 ms or more: where their time went (diagnosis).
+        let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+        let now = std::time::Instant::now();
+        if ms(t_detile, now) >= 50.0 {
+            crate::info!(
+                "images: upload of {:#x} {}x{}x{} {:?} ({} parts, {} KiB) took {:.0} ms: write marks {take_ms:.0}, choosing {:.0} (table {:.0}, reader lock {:.0}, the rest: queries, hashes), staging buffer {:.0}, detiling {:.0}, transfer {:.0}, freeing {:.0}",
+                t.base,
+                key.width,
+                key.height,
+                layers,
+                t.format,
+                parts.len(),
+                detiled >> 10,
+                ms(t_detile, now),
+                ms(t_detile, t_chosen),
+                ms(t_detile, t_table),
+                ms(t_table, t_locked),
+                ms(t_chosen, t_alloc),
+                ms(t_alloc, t_detiled),
+                ms(t_copy, t_free),
+                ms(t_free, now)
+            );
+        }
         self.uploads += 1;
         Ok((t.base, size))
     }
@@ -1961,17 +2102,24 @@ impl Images {
         let el = elem_log2(t.format).ok_or("unknown element size")?;
         let lay = tiling::layout_3d(t.sw_mode, el, key.width, key.height, key.layers).ok_or_else(|| format!("3D swizzle mode {} not supported", t.sw_mode))?;
         let size = lay.size();
+        // As for 2D textures: the mapping table before the lock, the
+        // operating system after it only when a mapping changed meanwhile.
+        let g0 = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::SeqCst);
+        let table = super::cp::valid(t.base, size) && crate::mem::host_readable(t.base, size);
         let readers = crate::mem::GUEST_READERS.read();
-        if !(super::cp::valid(t.base, size) && crate::mem::os_readable(t.base, size)) {
+        let held = crate::mem::table_view_held(g0);
+        UPLOAD_TABLE[usize::from(!held)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ok = if held { table } else { super::cp::valid(t.base, size) && crate::mem::os_readable(t.base, size) };
+        if !ok {
             return Err(format!("3D texture {:#x}+{size:#x} not mapped", t.base));
         }
         let src = unsafe { std::slice::from_raw_parts(t.base as *const u8, size as usize) };
-        let mut staging = Vec::new();
-        lay.detile(src, &mut staging);
-        drop(readers);
+        // Detiled straight into the staging buffer (no intermediate copy).
         let c = ctx();
-        let (buf, mem, ptr) = c.host_buffer(staging.len().max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
-        unsafe { std::ptr::copy_nonoverlapping(staging.as_ptr(), ptr, staging.len()) };
+        let len = lay.width as usize * lay.height as usize * lay.depth as usize * (1usize << el);
+        let (buf, mem, ptr) = c.host_buffer(len.max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
+        lay.detile_into(src, unsafe { std::slice::from_raw_parts_mut(ptr, len) });
+        drop(readers);
         let region = vk::BufferImageCopy::default()
             .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 })
             .image_extent(vk::Extent3D { width: key.width, height: key.height, depth: key.layers });
@@ -3718,7 +3866,7 @@ impl Images {
             String::new()
         };
         format!(
-            "    images: {} cached ({} MiB; GPU-written {} ({} MiB), kept for the session; {} textures evicted, {} MiB, in {} rounds), {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; staging buffers made {}, waits for uploads in flight {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages, {} found clean by a probe); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}\n",
+            "    images: {} cached ({} MiB; GPU-written {} ({} MiB), kept for the session; {} textures evicted, {} MiB, in {} rounds), {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; staging buffers made {}, waits for uploads in flight {}; pages checked in the mapping table {}, again with the operating system {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages, {} found clean by a probe); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}\n",
             self.map.len(),
             IMAGE_BYTES.load(Relaxed) >> 20,
             self.map.values().filter(|i| i.gpu_written).count(),
@@ -3737,6 +3885,8 @@ impl Images {
             UPLOAD_SPLIT[2].load(Relaxed) / 1_000_000,
             STAGING_MADE.load(Relaxed),
             UPLOAD_WAITS.load(Relaxed),
+            UPLOAD_TABLE[0].load(Relaxed),
+            UPLOAD_TABLE[1].load(Relaxed),
             p[0].load(Relaxed),
             p[1].load(Relaxed),
             p[2].load(Relaxed),
