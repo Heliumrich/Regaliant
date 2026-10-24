@@ -10878,7 +10878,7 @@ impl Exec {
                 // processor stopping for the compile (5-12 s for the largest:
                 // first visits froze for up to 20.8 s, FINDINGS.md
                 // 2026-10-23). The effect shows up that much later.
-                if super::tune::async_particles() && super::shaders::program_hash(p.addr).is_ok_and(super::particles::is_particle) && compile_in_background(&p) {
+                if super::tune::async_particles() && super::shaders::program_hash(p.addr).is_ok_and(super::particles::in_background) && compile_in_background(&p) {
                     ASYNC_STATS[0].fetch_add(1, Ordering::Relaxed);
                     return Err(ASYNC_PENDING.into());
                 }

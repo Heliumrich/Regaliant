@@ -8,12 +8,23 @@
 //! dispatches left out until then (`exec::compile_in_background`, `tune
 //! async_particles`): the largest take 5-12 s each to compile, and a first
 //! visit froze while they did (FINDINGS.md 2026-10-23/24).
+//! The engine's own programs (coredata/enginesupport/shaders, one directory
+//! per effect) are read too: each program's directory names it in the logs,
+//! and those of per-frame effects whose results only look late when left
+//! out (`DS_ASYNC_ENGINE`, directory names; default the particles' lighting
+//! atlas passes, particle-lightmap-update) compile in the background the
+//! same way.
 
 use parking_lot::RwLock;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 static HASHES: RwLock<Option<HashSet<u64>>> = RwLock::new(None);
+/// The engine's programs by code hash: their directory.
+static ENGINE: RwLock<Option<HashMap<u64, Arc<str>>>> = RwLock::new(None);
+/// Engine programs compiled in the background (`DS_ASYNC_ENGINE`).
+static ENGINE_ASYNC: RwLock<Option<HashSet<u64>>> = RwLock::new(None);
 /// [bundles read, programs hashed, bundles not understood, ms taken,
 /// programs whose last instruction ends before their code size].
 static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
@@ -48,6 +59,44 @@ fn scan(app: &std::path::Path) {
     STATS[3].store(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
     crate::info!("particles: {} programs in {} shader bundles ({} not understood; {} with code past their last instruction) read in {} ms", set.len(), STATS[0].load(Ordering::Relaxed), STATS[2].load(Ordering::Relaxed), STATS[4].load(Ordering::Relaxed), t0.elapsed().as_millis());
     *HASHES.write() = Some(set);
+    scan_engine(app);
+}
+
+/// The engine's shader files: each program's code hash and its directory.
+fn scan_engine(app: &std::path::Path) {
+    let t0 = std::time::Instant::now();
+    let root = app.join("coredata").join("enginesupport").join("shaders").join("_ps5");
+    let dirs: Vec<String> = std::env::var("DS_ASYNC_ENGINE").unwrap_or_else(|_| "particle-lightmap-update".into()).split(',').map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).collect();
+    let mut map: HashMap<u64, Arc<str>> = HashMap::new();
+    let mut slow = HashSet::new();
+    let (mut files, mut odd) = (0u64, 0u64);
+    let mut stack: Vec<(std::path::PathBuf, Option<Arc<str>>)> = vec![(root.clone(), None)];
+    while let Some((d, top)) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                let name = top.clone().unwrap_or_else(|| Arc::from(e.file_name().to_string_lossy().as_ref()));
+                stack.push((p, Some(name)));
+            } else if p.extension().is_some_and(|x| x == "csdr") {
+                let Some(dir) = top.clone() else { continue };
+                files += 1;
+                match std::fs::read(&p).ok().and_then(|b| bundle_programs(&b)) {
+                    Some(v) => {
+                        for prog in v {
+                            if dirs.iter().any(|x| **x == *dir) {
+                                slow.insert(prog.hash);
+                            }
+                            map.insert(prog.hash, dir.clone());
+                        }
+                    }
+                    None => odd += 1,
+                }
+            }
+        }
+    }
+    crate::info!("particles: the engine's shaders: {} programs in {files} files ({odd} not understood) read in {} ms; {} of them compiled in the background ({})", map.len(), t0.elapsed().as_millis(), slow.len(), dirs.join(", "));
+    *ENGINE.write() = Some(map);
+    *ENGINE_ASYNC.write() = Some(slow);
 }
 
 /// A program of a shader bundle: its stage, code hash, code (up to its last
@@ -102,6 +151,22 @@ fn programs(b: &[u8], set: &mut HashSet<u64>) -> bool {
 /// programs.
 pub fn is_particle(code_hash: u64) -> bool {
     HASHES.read().as_ref().is_some_and(|s| s.contains(&code_hash))
+}
+
+/// Whether the program with this code hash compiles in the background at
+/// first use (a particle program, or an engine program of a directory in
+/// `DS_ASYNC_ENGINE`).
+pub fn in_background(code_hash: u64) -> bool {
+    is_particle(code_hash) || ENGINE_ASYNC.read().as_ref().is_some_and(|s| s.contains(&code_hash))
+}
+
+/// Where the program with this code hash comes from: an engine shader
+/// directory or the particle bundles (logs).
+pub fn origin(code_hash: u64) -> Option<Arc<str>> {
+    if let Some(d) = ENGINE.read().as_ref().and_then(|m| m.get(&code_hash).cloned()) {
+        return Some(d);
+    }
+    is_particle(code_hash).then(|| Arc::from("particle bundles"))
 }
 
 /// Programs known (status lines).

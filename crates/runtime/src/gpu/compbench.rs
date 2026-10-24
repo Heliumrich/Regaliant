@@ -27,23 +27,30 @@ fn guess_report(app: &std::path::Path) -> i32 {
         crate::error!("guess report: Vulkan: {e}");
         return 2;
     }
-    // The engine's programs by code hash.
-    let mut engine = std::collections::HashSet::new();
-    let mut stack = vec![app.join("coredata").join("enginesupport").join("shaders").join("_ps5")];
+    // The engine's programs by code hash: their directory.
+    let mut engine: HashMap<u64, String> = HashMap::new();
+    let root = app.join("coredata").join("enginesupport").join("shaders").join("_ps5");
+    let mut stack: Vec<(std::path::PathBuf, Option<String>)> = vec![(root, None)];
     let mut files = 0;
-    while let Some(d) = stack.pop() {
+    while let Some((d, top)) = stack.pop() {
         for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
             let p = e.path();
             if p.is_dir() {
-                stack.push(p);
+                let name = top.clone().unwrap_or_else(|| e.file_name().to_string_lossy().into_owned());
+                stack.push((p, Some(name)));
             } else if p.extension().is_some_and(|x| x == "csdr") {
                 files += 1;
                 if let Some(v) = std::fs::read(&p).ok().and_then(|b| super::particles::bundle_programs(&b)) {
-                    engine.extend(v.iter().filter(|x| x.stage == 0).map(|x| x.hash));
+                    let dir = top.clone().unwrap_or_default();
+                    engine.extend(v.iter().filter(|x| x.stage == 0).map(|x| (x.hash, dir.clone())));
                 }
             }
         }
     }
+    // Per engine directory: [specs, equal, format-only, different], and
+    // the same for programs binding no image and no typed buffer.
+    let mut by_dir: HashMap<String, [u64; 4]> = HashMap::new();
+    let mut plain = [0u64; 4];
     crate::info!("guess report: {} engine compute programs in {files} engine shader files", engine.len());
     // [specs, equal, format-only, other] overall and for engine programs.
     let mut n = [[0u64; 4]; 2];
@@ -53,7 +60,7 @@ fn guess_report(app: &std::path::Path) -> i32 {
     let mut engine_learned = 0;
     for (h, code, specs) in super::precompile::learned_compute() {
         let Ok(insts) = rdna::decode_program(&code) else { continue };
-        let is_engine = engine.contains(&h);
+        let is_engine = engine.contains_key(&h);
         engine_learned += is_engine as u64;
         for spec in &specs {
             let plan = rdna::analysis::analyze_opts(&insts, spec.user_sgprs, spec.user_base, false);
@@ -109,12 +116,31 @@ fn guess_report(app: &std::path::Path) -> i32 {
                     n[k][class] += 1;
                 }
             }
+            if let Some(dir) = engine.get(&h) {
+                let e = by_dir.entry(dir.clone()).or_default();
+                e[0] += 1;
+                e[class] += 1;
+                // No image and no typed (format) buffer access: the spec is
+                // the code's own (formats and image setups come from the
+                // title's descriptors at run time).
+                let typed = insts.iter().any(|i| i.name().is_some_and(|n| n.contains("_format_")));
+                let images = actual.resources.iter().any(|r| matches!(r, ResSpec::Image { .. }));
+                if !typed && !images {
+                    plain[0] += 1;
+                    plain[class] += 1;
+                }
+            }
         }
     }
     for (k, what) in [(0, "all learned"), (1, "engine")] {
         crate::info!("guess report ({what}): {} specs: guess equal {}, equal but for typed buffers' formats {}, different {}", n[k][0], n[k][1], n[k][2], n[k][3]);
     }
     crate::info!("guess report: {engine_learned} of the learned programs are the engine's; other differences: {other_why:?}");
+    crate::info!("guess report (engine programs binding no image and no typed buffer): {} specs: equal {}, format-only {}, different {}", plain[0], plain[1], plain[2], plain[3]);
+    let mut dirs: Vec<(&String, &[u64; 4])> = by_dir.iter().collect();
+    dirs.sort_by(|a, b| b.1[0].cmp(&a.1[0]).then(a.0.cmp(b.0)));
+    let parts: Vec<String> = dirs.iter().map(|(d, x)| format!("{d} {}/{}/{}/{}", x[0], x[1], x[2], x[3])).collect();
+    crate::info!("guess report by engine directory (specs/equal/format-only/different): {}", parts.join(", "));
     let mut keys: Vec<(&String, &HashMap<(u8, u16), u64>)> = by_access.iter().collect();
     keys.sort_by_key(|(_, m)| std::cmp::Reverse(m.values().sum::<u64>()));
     let (mut all, mut top) = (0u64, 0u64);

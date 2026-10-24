@@ -1719,8 +1719,9 @@ fn translate_kept(addr: u64, insts: &[rdna::Inst], plan: &Arc<Plan>, plan_key: u
     // once, its program saved.
     if out.spirv.len() >= BIG_SPIRV_WORDS && BIG_SPIRV_SEEN.lock().get_or_insert_with(std::collections::HashSet::new).insert(addr) {
         let saved = super::capture::save_program(addr).map(|f| format!("; program saved to {}", f.display())).unwrap_or_default();
+        let from = program_hash(addr).ok().and_then(super::particles::origin).map(|d| format!("; from {d}")).unwrap_or_default();
         crate::info!(
-            "{:?} shader {addr:#x}: {} instructions -> {} SPIR-V words ({:.0} per instruction; wave64 {}, per lane {}, lane votes {}, local size {:?}){saved}",
+            "{:?} shader {addr:#x}: {} instructions -> {} SPIR-V words ({:.0} per instruction; wave64 {}, per lane {}, lane votes {}, local size {:?}){from}{saved}",
             spec.stage,
             insts.len(),
             out.spirv.len(),

@@ -1803,10 +1803,11 @@ pub mod tune {
         get(166) != 0
     }
 
-    /// The title's particle programs (`agc::is_particle_program`) compile in
-    /// the background at their first use, their dispatches left out until
-    /// then, instead of the command processor stopping for the compile
-    /// (`exec::compile_in_background`); 0: compiled where first used.
+    /// The title's particle programs and the engine programs of per-frame
+    /// effects named in `DS_ASYNC_ENGINE` (`particles::in_background`)
+    /// compile in the background at their first use, their dispatches left
+    /// out until then, instead of the command processor stopping for the
+    /// compile (`exec::compile_in_background`); 0: compiled where first used.
     #[inline]
     pub fn async_particles() -> bool {
         get(167) != 0
