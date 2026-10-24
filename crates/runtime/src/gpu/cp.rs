@@ -3886,6 +3886,29 @@ impl Cp {
         }
     }
 
+    /// Command buffer words or a waited label [a, a+bytes) the command
+    /// processor is about to read from guest memory. With homes for reads
+    /// (`tune home_reads`) their pages are noted, so that no such home is
+    /// made over them (the title's command data shares pools that GPU work
+    /// writes: queue 0x50's 4.9 MB particle pools at the 5-3 load, whose
+    /// homes held the GPU's writes while the CP ran the guest memory's older
+    /// packets and the queues waited on labels in a cycle, 2026-10-24);
+    /// GPU-written parts of a home over them are written back first and
+    /// waited for.
+    fn before_fetch(&mut self, a: u64, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        if super::tune::home_reads() {
+            super::homes::note_cp_code(a, bytes);
+        }
+        if super::homes::any_stale(&[(a, bytes)]) {
+            if let Some(e) = self.exec.as_mut() {
+                e.flush_if_writes(&[(a, bytes)]);
+            }
+        }
+    }
+
     /// Executes a command buffer (`size` dwords at `addr`). Small buffers (up
     /// to `FETCH_DWORDS`) are copied when execution starts, as the hardware's
     /// prefetch would have fetched them (a CPU rewrite of a started buffer is
@@ -3901,6 +3924,7 @@ impl Cp {
         self.depth += 1;
         let mut cur = addr;
         let mut end = addr + 4 * size as u64;
+        self.before_fetch(addr, 4 * size as u64);
         let mut f = Fetched::new(addr, size);
         // Time by packet class (the graphics queue; `tune cp_classes`).
         let classes = !self.compute && super::tune::cp_classes();
@@ -4213,6 +4237,7 @@ impl Cp {
                 Flow::Chain(a, s) => {
                     cur = a;
                     end = a + 4 * s as u64;
+                    self.before_fetch(a, 4 * s as u64);
                     f = Fetched::new(a, s);
                 }
                 Flow::Stop => break,
@@ -4967,6 +4992,10 @@ impl Cp {
             crate::error!("gpu[{}]: WAIT_REG_MEM on {a:#x} outside guest memory", self.name);
             return Flow::Next;
         }
+        // The label is read from guest memory: as for command buffers
+        // (`before_fetch`), no home for reads goes over it, and GPU-written
+        // parts of one already there are written back first.
+        self.before_fetch(a, 8);
         let read = move || if wide { unsafe { rd64(a) } } else { (unsafe { rd32(a) }) as u64 };
         WAITED.lock().get_or_insert_with(HashSet::new).insert(a & !7);
         self.last_wait_gpu = false;

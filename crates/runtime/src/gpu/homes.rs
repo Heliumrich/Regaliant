@@ -386,8 +386,13 @@ pub fn bind(base: u64, size: u64, written: bool, keep: &mut dyn FnMut(&Arc<HomeB
         v
     };
     if written {
-        h.stale.insert(base, size);
-        STALE_ADDED.fetch_add(1, Ordering::AcqRel);
+        // Only new stale parts move the generation: every executor's cache of
+        // pages clean of them (`Exec::clean_pages`) is dropped when it moves,
+        // and homes written in every submission epoch moved it constantly.
+        if !h.stale.contains(base, size) {
+            h.stale.insert(base, size);
+            STALE_ADDED.fetch_add(1, Ordering::AcqRel);
+        }
         let note = (base, size, h.shared.id, h.shared.stale_gen.load(Ordering::Acquire));
         STALE_NOTES.with(|n| {
             let mut n = n.borrow_mut();
@@ -777,21 +782,62 @@ pub fn take_watched() -> Vec<(u64, u64, Arc<HomeBuf>, u64)> {
 /// An index buffer [base, base+size) inside a range noted by
 /// `note_large_write`: that range gets a home (`create`).
 pub fn index_use(base: u64, size: u64) -> bool {
-    use_inside(base, size)
+    use_inside(base, size, MAX)
 }
 
 /// A large read-only buffer binding [base, base+size) inside a range noted
-/// by `note_large_write`: that range gets a home (`tune home_reads`).
+/// by `note_large_write`: that range gets a home (`tune home_reads`) when it
+/// is at most READ_HOME_MAX (the GPU-written buffers of 4-8 MiB copied back
+/// for every reading batch; not the pools of 63-180 MiB the title's CPU
+/// writes too, which homes for reads of 1 MiB caught as well, 2026-10-24).
 pub fn read_use(base: u64, size: u64) -> bool {
-    use_inside(base, size)
+    use_inside(base, size, READ_HOME_MAX)
 }
 
-fn use_inside(base: u64, size: u64) -> bool {
+/// The largest range given a home for reads (`read_use`).
+const READ_HOME_MAX: u64 = 16 << 20;
+
+fn use_inside(base: u64, size: u64, max: u64) -> bool {
     let found = LARGE_WRITES.lock().iter().find(|&(a, n)| a <= base && base + size <= a + n);
     match found {
-        Some((a, n)) => create(a, n),
-        None => false,
+        Some((a, n)) if n <= max && (max == MAX || !holds_cp_code(a, n)) => create(a, n),
+        Some((_, n)) if n <= max => {
+            CP_CODE_REFUSED.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        _ => false,
     }
+}
+
+/// 64 KiB pages command processors read command buffers or waited labels
+/// from (`note_cp_code`, kept while homes for reads are on).
+static CP_CODE_PAGES: parking_lot::RwLock<Option<std::collections::HashSet<u64>>> = parking_lot::RwLock::new(None);
+/// Homes for reads refused because their range held command buffers or
+/// waited labels.
+pub static CP_CODE_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// A command processor reads command buffer words or a label [a, a+n)
+/// (`Cp::before_fetch`).
+pub fn note_cp_code(a: u64, n: u64) {
+    let (first, last) = (a >> 16, (a + n - 1) >> 16);
+    {
+        let g = CP_CODE_PAGES.read();
+        if g.as_ref().is_some_and(|s| (first..=last).all(|p| s.contains(&p))) {
+            return;
+        }
+    }
+    let mut g = CP_CODE_PAGES.write();
+    let s = g.get_or_insert_with(std::collections::HashSet::new);
+    for p in first..=last {
+        s.insert(p);
+    }
+}
+
+/// Whether command buffers were read from any page of [a, a+n).
+fn holds_cp_code(a: u64, n: u64) -> bool {
+    let g = CP_CODE_PAGES.read();
+    let Some(s) = g.as_ref() else { return false };
+    (a >> 16..=(a + n - 1) >> 16).any(|p| s.contains(&p))
 }
 
 /// Whether a home holds all of [base, base+size).
@@ -894,6 +940,17 @@ pub fn any_stale(reads: &[(u64, u64)]) -> bool {
         && super::lockstat::HOMES.lock(&HOMES).iter().any(|h| reads.iter().any(|&(a, n)| h.stale.overlaps(a, n)))
 }
 
+/// GPU work wrote guest memory in place over part of a home (a binding that
+/// only partly overlaps it): as for a write from the CPU side, the home
+/// copies that part in before its next GPU use.
+pub fn written_in_place(base: u64, size: u64) {
+    WRITTEN_IN_PLACE.fetch_add(1, Ordering::Relaxed);
+    cpu_written(base, size);
+}
+
+/// Written partial overlaps (`written_in_place`).
+pub static WRITTEN_IN_PLACE: AtomicU64 = AtomicU64::new(0);
+
 /// A write from the CPU side (CP write, file read) into guest memory: the
 /// homes it overlaps copy it in before their next GPU use.
 pub fn cpu_written(base: u64, size: u64) {
@@ -965,7 +1022,7 @@ pub fn take_all() -> Vec<(u64, u64, Arc<HomeBuf>, u64)> {
 
 pub fn status() -> String {
     format!(
-        "    video-memory homes: {} created, {} dropped, {} MiB; {} bindings, {} bytes copied in, {} write-backs ({} KiB), {} partial overlaps, {} unbounded pointer bindings over homes ({} based inside one, {} with GPU-written parts not yet in guest memory within 4 KiB of their base, {} written back first), {} image uploads over GPU-written home data not in guest memory ({} reloads of overwritten images written back first); write-watched: {} checks ({} ms), {} bytes the CPU changed ({} of them by guest code in homes watched for `homes_watch`), {} written pages covered in part, {} pages other takes found written handed over\n",
+        "    video-memory homes: {} created, {} dropped, {} MiB; {} bindings, {} bytes copied in, {} write-backs ({} KiB), {} partial overlaps ({} of them written: copied in again), {} refused for reads over command buffers or labels, {} unbounded pointer bindings over homes ({} based inside one, {} with GPU-written parts not yet in guest memory within 4 KiB of their base, {} written back first), {} image uploads over GPU-written home data not in guest memory ({} reloads of overwritten images written back first); write-watched: {} checks ({} ms), {} bytes the CPU changed ({} of them by guest code in homes watched for `homes_watch`), {} written pages covered in part, {} pages other takes found written handed over\n",
         CREATED.load(Ordering::Relaxed),
         DROPPED.load(Ordering::Relaxed),
         USED.load(Ordering::Relaxed) >> 20,
@@ -974,6 +1031,8 @@ pub fn status() -> String {
         WRITE_BACKS.load(Ordering::Relaxed),
         WRITE_BACK_BYTES.load(Ordering::Relaxed) >> 10,
         PARTIAL.load(Ordering::Relaxed),
+        WRITTEN_IN_PLACE.load(Ordering::Relaxed),
+        CP_CODE_REFUSED.load(Ordering::Relaxed),
         UNBOUNDED_OVERLAPS.load(Ordering::Relaxed),
         UNBOUNDED_STALE[0].load(Ordering::Relaxed),
         UNBOUNDED_STALE[1].load(Ordering::Relaxed),

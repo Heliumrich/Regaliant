@@ -6983,6 +6983,17 @@ impl Exec {
                     );
                 }
                 self.home_write_back(&[(base, size)]);
+                if written && !self.stopped {
+                    // The binding writes guest memory in place over part of
+                    // the home: that part is copied in again before the home's
+                    // next GPU use, or the home's readers keep its old words
+                    // (homes over GPU-written reads, `home_read_min` 1 MiB:
+                    // queue 0x50 wrote 0x1475cdd1e0+0xef10, the last 3.6 KB of
+                    // a 4.9 MB home and beyond, at the 5-3 load, and shaders
+                    // looped on the stale words until the device was lost,
+                    // 2026-10-24).
+                    super::homes::written_in_place(base, size);
+                }
             }
             return None;
         };

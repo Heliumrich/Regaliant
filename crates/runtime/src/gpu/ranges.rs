@@ -106,6 +106,16 @@ impl Ranges {
         self.by_start.insert(start, end);
     }
 
+    /// Whether the union holds all of [a, a + n) (touching ranges are
+    /// merged, so one range must).
+    pub fn contains(&self, a: u64, n: u64) -> bool {
+        if n == 0 {
+            return true;
+        }
+        let end = a.saturating_add(n);
+        self.by_start.range(..=a).next_back().is_some_and(|(_, &e)| e >= end)
+    }
+
     /// Whether [a, a + n) overlaps the union.
     pub fn overlaps(&self, a: u64, n: u64) -> bool {
         if n == 0 || self.by_start.is_empty() || !self.filter_may(a, n) {
@@ -373,6 +383,23 @@ mod tests {
         // A huge range at the top of the address space.
         r.insert(u64::MAX - 10, 100);
         assert!(r.overlaps(u64::MAX - 1, 1));
+    }
+
+    #[test]
+    fn containment() {
+        let mut r = Ranges::default();
+        r.insert(100, 10);
+        r.insert(110, 10); // touching: one range [100,120)
+        r.insert(200, 50);
+        assert!(r.contains(100, 20));
+        assert!(r.contains(105, 5));
+        assert!(!r.contains(95, 10)); // starts before
+        assert!(!r.contains(115, 10)); // runs past the end
+        assert!(!r.contains(150, 1)); // the gap
+        assert!(!r.contains(110, 100)); // spans the gap
+        assert!(r.contains(249, 1));
+        assert!(!r.contains(250, 1));
+        assert!(r.contains(7, 0)); // empty
     }
 
     #[test]
