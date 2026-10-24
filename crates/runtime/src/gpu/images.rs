@@ -859,7 +859,11 @@ struct Staging {
 
 /// Staging buffers kept for reuse: up to this many bytes, each of at most
 /// STAGING_POOLED bytes (larger ones are made for their upload alone).
-const STAGING_KEEP: u64 = 128 << 20;
+/// None: a host-visible staging buffer kept after its upload made the
+/// driver refuse guest-memory imports thousands of times a session
+/// (FINDINGS.md 2026-10-24; with 128 MiB kept, `upload_async` failed 53,832
+/// imports in a tour, none kept 48 like the baseline).
+const STAGING_KEEP: u64 = 0;
 const STAGING_POOLED: u64 = 32 << 20;
 /// Uploads in flight, and their staging bytes, before the next one waits
 /// for the oldest. Unbounded bytes (up to 32 uploads of ~85 MB arrays, freed

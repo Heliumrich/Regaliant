@@ -754,11 +754,12 @@ pub mod tune {
     }
 
     /// Texture uploads are submitted without waiting for them (1; their
-    /// staging buffers pooled and reused once the GPU is done with them):
-    /// -2.3 s of upload time per gate run. Off: with it, guest-memory
-    /// imports failed by the ten thousand (48 per run without) and two tours
-    /// lost the device early (runs 20261013-083710, -084645; FINDINGS.md
-    /// 2026-10-13); the cause is not known yet.
+    /// staging buffers freed once the GPU is done with them): -2.3 s of
+    /// upload time per gate run. Its import failures (thousands a session,
+    /// device losses: FINDINGS.md 2026-10-13) came from the staging buffers
+    /// it pooled; unpooled (2026-10-24) it fails 48 like the default, but a
+    /// warm 1-1 walk showed no gain (upload hitches 29 against 40, all
+    /// hitches 359 against 286): off.
     #[inline]
     pub fn upload_async() -> bool {
         get(58) != 0
