@@ -215,21 +215,43 @@ pub fn prot_at(a: u64) -> Option<u32> {
     MEM.lock().find(a).filter(|v| v.kind != VmaKind::Reserved).map(|v| v.prot)
 }
 
-/// Guest mappings by kind and access class (MiB, mappings; status report).
+/// The memory type the title allocated the direct memory under `a` with
+/// (None: unmapped or not direct memory).
+pub fn mtype_at(a: u64) -> Option<i32> {
+    let g = MEM.lock();
+    let v = g.find(a).filter(|v| v.kind == VmaKind::Direct)?;
+    let phys = v.phys + (a - v.start);
+    g.dmem.range(..=phys).next_back().filter(|(s, b)| phys < **s + b.size).map(|(_, b)| b.mtype)
+}
+
+/// Guest mappings by kind, access class and memory type (MiB, mappings;
+/// status report). The memory type is the one the title asked for (direct
+/// memory: `sceKernelAllocateDirectMemory`'s), which says how it means to
+/// use the memory (CPU-cached for what the CPU reads back, GPU-cached or
+/// write-combined for GPU work).
 pub fn prot_census() -> String {
     let g = MEM.lock();
-    let mut m: std::collections::BTreeMap<(String, &'static str), (u64, u64)> = std::collections::BTreeMap::new();
+    let mut m: std::collections::BTreeMap<(String, &'static str, i32), (u64, u64)> = std::collections::BTreeMap::new();
     for v in g.vmas.values() {
         if v.kind == VmaKind::Reserved {
             continue;
         }
-        let e = m.entry((format!("{:?}", v.kind), prot_class(v.prot))).or_insert((0, 0));
+        let e = m.entry((format!("{:?}", v.kind), prot_class(v.prot), v.mtype)).or_insert((0, 0));
         e.0 += v.size;
         e.1 += 1;
     }
+    // Direct memory by the type the title allocated it with.
+    let mut types: std::collections::BTreeMap<i32, (u64, u64)> = std::collections::BTreeMap::new();
+    for b in g.dmem.values() {
+        let e = types.entry(b.mtype).or_insert((0, 0));
+        e.0 += b.size;
+        e.1 += 1;
+    }
     drop(g);
-    let parts: Vec<String> = m.iter().map(|((k, c), (b, n))| format!("{k} {c} {} MiB ({n})", b >> 20)).collect();
-    format!("    guest mappings by kind and the title's access bits: {}\n", parts.join(", "))
+    let dm: Vec<String> = types.iter().map(|(t, (b, n))| format!("type {t} {} MiB ({n})", b >> 20)).collect();
+    let parts: Vec<String> = m.iter().map(|((k, c, t), (b, n))| format!("{k} {c} type {t} {} MiB ({n})", b >> 20)).collect();
+    format!("    direct memory by the type the title allocated it with: {}\n", dm.join(", "))
+        + &format!("    guest mappings by kind, the title's access bits and memory type: {}\n", parts.join(", "))
 }
 
 pub fn remap_status() -> String {

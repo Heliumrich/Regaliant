@@ -2680,7 +2680,15 @@ fn merge_by_lines(flips: u64) -> String {
     let total: u64 = v.iter().map(|x| x.1[0]).sum();
     let per = |n: u64| n as f64 / flips.max(1) as f64;
     let parts: Vec<String> = v.iter().take(16).map(|((g, r), x)| format!("{g:#x}+{r:#x} (cs {:#x}) {:.1}", x[2], per(x[0]))).collect();
-    format!("    shadow merges by window, per flip ({:.1} in all, {} windows): {}\n", per(total), v.len(), parts.join(", "))
+    // By the memory type the title gave the window's mapping.
+    let mut by_type: std::collections::BTreeMap<Option<i32>, (u64, u64)> = std::collections::BTreeMap::new();
+    for ((g, r), x) in &v {
+        let e = by_type.entry(crate::mem::mtype_at(*g)).or_default();
+        e.0 += x[0];
+        e.1 += *r;
+    }
+    let types: Vec<String> = by_type.iter().map(|(t, (n, b))| format!("type {} {:.1} ({} KiB of windows)", t.map_or("?".to_string(), |t| t.to_string()), per(*n), b >> 10)).collect();
+    format!("    shadow merges by window, per flip ({:.1} in all, {} windows; by memory type: {}): {}\n", per(total), v.len(), types.join(", "), parts.join(", "))
 }
 
 /// Device-local shadow space per slot (working and pristine copies).
