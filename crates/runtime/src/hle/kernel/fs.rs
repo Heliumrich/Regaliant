@@ -241,8 +241,13 @@ const DEVLOG_ARGS: &str = "/devlog/app/commandlineargs.txt";
 /// 1/59.94 s steps, at most `physicsMaxUpdateStepsPerFrame` per frame
 /// (title default 1: below 60 fps physics ran at frame rate / 60, ~0.35x
 /// real time at 21 fps); 6 covers the title's 0.1 s frame-step cap
-/// (`gameMaxDeltaTime`) with the same step (FINDINGS.md 2026-10-15).
-const TITLE_ARGS: &str = "+physicsMaxUpdateStepsPerFrame=6";
+/// (`gameMaxDeltaTime`) with the same step (FINDINGS.md 2026-10-15). The
+/// texture streaming pool fills the title's memory up to
+/// `texturePoolLowMemoryLimitMiBs` (title default 300) of free pages; our
+/// stalls hold back what the title frees, and a first session ran out of
+/// memory (its own stop, free pages 1 MiB): 600 keeps ~300 MiB more free
+/// (FINDINGS.md 2026-10-25).
+const TITLE_ARGS: &str = "+physicsMaxUpdateStepsPerFrame=6 +texturePoolLowMemoryLimitMiBs=600";
 
 fn title_args() -> Option<String> {
     // (`;` separates settings too: run drivers pass variables without spaces.)
