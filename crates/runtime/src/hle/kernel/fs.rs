@@ -245,7 +245,8 @@ const DEVLOG_ARGS: &str = "/devlog/app/commandlineargs.txt";
 const TITLE_ARGS: &str = "+physicsMaxUpdateStepsPerFrame=6";
 
 fn title_args() -> Option<String> {
-    let v = std::env::var("DS_GAME_ARGS").unwrap_or_else(|_| TITLE_ARGS.to_string());
+    // (`;` separates settings too: run drivers pass variables without spaces.)
+    let v = std::env::var("DS_GAME_ARGS").unwrap_or_else(|_| TITLE_ARGS.to_string()).replace(';', " ");
     let v = v.trim();
     (!v.is_empty() && v != "none").then(|| v.to_string())
 }
