@@ -114,6 +114,35 @@ pub fn frames_window_clause(flips: u64) -> String {
     format!("; front-end CPU ms per flip: {} (all {:.1}; {:.2} us per command)", main.join(", "), ms(all) / flips, ms(all) * 1000.0 / cmds as f64)
 }
 
+/// Cycles at the frame window's start of each compute queue's command
+/// processor (by queue id) and of the title's threads (by host thread id).
+static FRAMES_DETAIL: Mutex<Option<(HashMap<u32, u64>, HashMap<u32, (String, u64)>)>> = Mutex::new(None);
+
+/// The frame window's CPU per flip of the compute queues' command
+/// processors (the four busiest) and of the title's threads (job workers,
+/// main thread, the rest): one clause of the `frames at` line.
+pub fn frames_detail_clause(flips: u64) -> String {
+    let queues: HashMap<u32, u64> = super::compute_threads().into_iter().filter_map(|(id, tid)| thread_cycles(tid).map(|c| (id, c))).collect();
+    let now = (queues, title_snapshot());
+    let Some((q0, t0)) = FRAMES_DETAIL.lock().replace(now.clone()) else { return String::new() };
+    let flips = flips.max(1) as f64;
+    let mut qs: Vec<(u32, f64)> = now.0.iter().map(|(&id, &c)| (id, ms(c.saturating_sub(*q0.get(&id).unwrap_or(&c))) / flips)).collect();
+    qs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let (mut job, mut main, mut other) = (0.0, 0.0, 0.0);
+    for (tid, (name, c)) in &now.1 {
+        let d = ms(c.saturating_sub(t0.get(tid).map_or(*c, |x| x.1))) / flips;
+        if name.starts_with("BPE JobWorkerThread") {
+            job += d;
+        } else if name == "GAME_MainThread" {
+            main += d;
+        } else {
+            other += d;
+        }
+    }
+    let q: Vec<String> = qs.iter().take(4).map(|(id, v)| format!("{id:#x} {v:.1}")).collect();
+    format!("; compute queues ms per flip: {}; the title's CPU ms per flip: job workers {job:.1}, main thread {main:.1}, other {other:.1}", q.join(", "))
+}
+
 /// Starts a profile window (`profile reset`).
 pub fn reset_window() {
     let w = Window { at: Instant::now(), cycles: snapshot(), flips: super::FRAMES.load(Ordering::Relaxed), commands: commands(), splits: super::cp::SPLITS.load(Ordering::Relaxed), title: title_snapshot() };

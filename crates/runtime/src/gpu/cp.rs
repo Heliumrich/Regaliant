@@ -4386,6 +4386,7 @@ impl Cp {
     }
 
     fn packet(&mut self, opcode: u32, h: u32, at: u64, n: u64, p: &dyn Fn(u64) -> u32) -> Flow {
+        crate::placement::note(&|| crate::log::thread_name());
         if self.repeat_ok && !self.keeps_repeat(opcode, n, p) {
             self.repeat_ok = false;
             REPEAT_ENDS[(opcode & 0xFF) as usize].fetch_add(1, Ordering::Relaxed);

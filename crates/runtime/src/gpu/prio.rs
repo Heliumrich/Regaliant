@@ -27,11 +27,31 @@ thread_local! {
     static MAIN: Cell<bool> = const { Cell::new(false) };
     /// A compute queue's command processor (`tune acb_cpus`).
     static COMPUTE: Cell<bool> = const { Cell::new(false) };
+    /// That compute queue (`tune acb50_cpus`).
+    static QUEUE: Cell<u32> = const { Cell::new(0) };
 }
 
-/// The calling thread is a compute queue's command processor.
-pub fn set_compute() {
+/// The calling thread is compute queue `id`'s command processor.
+pub fn set_compute(id: u32) {
     COMPUTE.with(|m| m.set(true));
+    QUEUE.with(|m| m.set(id));
+}
+
+/// The physical cores of processor group 0 (`core_groups`, once).
+fn cores() -> &'static [u64] {
+    static C: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    C.get_or_init(core_groups)
+}
+
+/// The index of the physical core holding logical CPU `cpu` (the CPU
+/// itself when the cores are unknown).
+pub fn core_of(cpu: usize) -> usize {
+    cores().iter().position(|&m| cpu < 64 && m >> cpu & 1 != 0).unwrap_or(cpu)
+}
+
+/// The logical CPUs of physical core `core` (0 when unknown).
+pub fn core_mask(core: usize) -> u64 {
+    cores().get(core).copied().unwrap_or(0)
 }
 
 /// The calling thread is the graphics queue's command processor.
@@ -63,6 +83,12 @@ pub fn apply() {
                 }
             }
             m => cpus = m,
+        }
+        // Queue 0x50 (the particle system: on the vista's critical path)
+        // on CPUs of its own (`tune acb50_cpus`; 0: as the other queues).
+        let own = super::tune::acb50_cpus();
+        if own != 0 && QUEUE.with(|q| q.get()) == 0x50 {
+            cpus = own;
         }
     }
     if super::tune::gfx_core() {

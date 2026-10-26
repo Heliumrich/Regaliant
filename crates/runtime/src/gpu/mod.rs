@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 175] = [
+    static ALL: [Tunable; 178] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -208,6 +208,9 @@ pub mod tune {
         Tunable { name: "host_census", env: "DS_HOST_CENSUS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_protect", env: "DS_PRE_PROTECT", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "home_cpu_check", env: "DS_HOME_CPU_CHECK", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "placement", env: "DS_PLACEMENT", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "acb50_cpus", env: "DS_ACB50_CPUS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "tex_exact", env: "DS_TEX_EXACT", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1904,6 +1907,27 @@ pub mod tune {
         get(174) != 0
     }
 
+    /// Diagnostics (`placement`): sampled logical CPUs of the command
+    /// processors and the title's job workers, by physical core.
+    #[inline]
+    pub fn placement() -> bool {
+        get(175) != 0
+    }
+
+    /// Logical CPUs (a decimal mask) of queue 0x50's command processor
+    /// alone; 0: as the other compute queues (`acb_cpus`).
+    #[inline]
+    pub fn acb50_cpus() -> u64 {
+        get(176)
+    }
+
+    /// Texture syncs test the exact guest range of each texture (default;
+    /// 0: up to 16 bytes per texel, the old bound: `exec::texture_bytes`).
+    #[inline]
+    pub fn tex_exact() -> bool {
+        get(177) != 0
+    }
+
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
     /// without appends).
     #[inline]
@@ -2088,6 +2112,11 @@ pub(crate) fn queue_ids() -> Vec<u32> {
 /// Whether every queue has completed all the work queued to it.
 pub(crate) fn queues_idle() -> bool {
     QUEUES.lock().iter().all(|q| q.done.load(Ordering::SeqCst) >= q.submitted.load(Ordering::SeqCst))
+}
+
+/// The compute queues' command processors: (queue id, host thread id).
+pub(crate) fn compute_threads() -> Vec<(u32, u32)> {
+    QUEUES.lock().iter().filter(|q| q.id != GFX).map(|q| (q.id, q.tid.load(Ordering::Relaxed))).filter(|x| x.1 != 0).collect()
 }
 
 /// The GPU front end's threads by kind ("gfx", "acb", "par", "prep",
@@ -2297,7 +2326,7 @@ fn worker(q: &'static Queue, name: &str) {
     }
     shaders::set_compute_queue(q.id != GFX);
     if q.id != GFX {
-        prio::set_compute();
+        prio::set_compute(q.id);
     }
     cp.wait_flag = Some(&q.cp_waiting);
     cp.more_follows = Some(Box::new(move || !q.pending.lock().is_empty()));
@@ -2687,6 +2716,7 @@ pub fn reset_profile() {
 pub fn profile_report() -> String {
     let mut s = profile_summary();
     s.push_str(&exec::shader_profile());
+    s.push_str(&exec::laps_report());
     s.push_str(&cp::wait_stats());
     s.push_str(&cp::classes_line());
     s.push_str(&exec::race_line());

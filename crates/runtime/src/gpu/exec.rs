@@ -3050,7 +3050,7 @@ fn gather_pipe() -> Result<&'static MergePipe, String> {
 /// Appended to `out` (a reused vector: no allocation per command once it
 /// has grown).
 fn texture_ranges_into(p: &Prepared, out: &mut Vec<((u64, u64), super::desc::Tsharp)>) {
-    let coarse = |t: &super::desc::Tsharp| ((t.base, (t.width as u64 * t.height as u64 * t.depth.max(1) as u64 * 16).min(1 << 30)), *t);
+    let coarse = |t: &super::desc::Tsharp| ((t.base, texture_bytes(t)), *t);
     for r in p.resources.iter() {
         match r {
             Resolved::Image(t) => out.push(coarse(t)),
@@ -3059,6 +3059,39 @@ fn texture_ranges_into(p: &Prepared, out: &mut Vec<((u64, u64), super::desc::Tsh
         }
     }
 }
+/// The guest bytes a texture covers for the command processors' texture
+/// syncs (`Exec::sync_textures`): exact (`images::guest_size`, memoized per
+/// thread by the T#'s layout fields; `tune tex_exact`, default), else at
+/// most 16 bytes per texel. That bound reached 16-32 times past the end of
+/// 8-bit and block-compressed textures: in boots where a GPU-written buffer
+/// lay there, every particle dispatch reading such a texture took the slow
+/// path (the image cache's lock, exact ranges) and queue 0x50 recorded its
+/// indirect dispatches in 27.5 instead of 21.8 us (FINDINGS.md 2026-10-26).
+/// The slow path's syncs use the exact size either way.
+fn texture_bytes(t: &super::desc::Tsharp) -> u64 {
+    type Key = (u16, u32, u32, u32, u32, u32, u32, u32, u32);
+    thread_local! {
+        static MEMO: std::cell::RefCell<HashMap<Key, u64>> = std::cell::RefCell::new(HashMap::new());
+    }
+    let rough = (t.width as u64 * t.height as u64 * t.depth.max(1) as u64 * 16).min(1 << 30);
+    if !super::tune::tex_exact() {
+        return rough;
+    }
+    let key = (t.format, t.width, t.height, t.depth, t.sw_mode, t.ty, t.max_mip, t.base_level, t.last_level);
+    MEMO.with(|m| {
+        if let Some(&n) = m.borrow().get(&key) {
+            return n;
+        }
+        let n = super::images::guest_size(t).filter(|&n| n > 0).unwrap_or(rough);
+        let mut m = m.borrow_mut();
+        if m.len() >= 4096 {
+            m.clear();
+        }
+        m.insert(key, n);
+        n
+    })
+}
+
 /// Most batch slots per queue (`tune slots`, default 4): one batch recording
 /// while the batches of the others execute. A queue reuses a slot only after
 /// its batch completed, so more slots let a command processor run further
@@ -4403,6 +4436,16 @@ fn profiling() -> bool {
     *ON.get_or_init(|| std::env::var("DS_PROFILE_GPU").ok().as_deref() == Some("1"))
 }
 
+/// The per-step timers of dispatches, their bindings' parts and their
+/// batch-start copy lookups: with the profiler, or alone with
+/// `DS_STEP_LAPS=1` (light enough not to change what it measures: the
+/// profiler as a whole moved every boot to one speed, FINDINGS.md
+/// 2026-10-26).
+fn laps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| profiling() || std::env::var("DS_STEP_LAPS").ok().as_deref() == Some("1"))
+}
+
 /// Per-command GPU timestamps (DS_PROFILE_GPU=1; `DS_PROFILE_GPU_STAMPS=0`
 /// keeps only the batch ones): BOTTOM_OF_PIPE stamps around every draw and
 /// dispatch serialize the GPU, which inflates the time of small commands.
@@ -5045,7 +5088,7 @@ struct BindClock {
 
 impl BindClock {
     fn start() -> Option<BindClock> {
-        profiling().then(|| BindClock { last: unsafe { core::arch::x86_64::_rdtsc() }, acc: [0; 10] })
+        laps().then(|| BindClock { last: unsafe { core::arch::x86_64::_rdtsc() }, acc: [0; 10] })
     }
 
     fn mark(c: &mut Option<BindClock>, k: usize) {
@@ -5125,7 +5168,7 @@ struct PreClock {
 
 impl PreClock {
     fn start() -> Option<PreClock> {
-        profiling().then(|| PreClock { t0: unsafe { core::arch::x86_64::_rdtsc() }, k: 0 })
+        laps().then(|| PreClock { t0: unsafe { core::arch::x86_64::_rdtsc() }, k: 0 })
     }
 
     fn set(c: &mut Option<PreClock>, k: usize) {
@@ -5188,7 +5231,7 @@ impl Laps {
         Laps { last: profiling().then(std::time::Instant::now), steps: if first { &DRAW_STEPS_FIRST[..18] } else { &DRAW_STEPS[kind][..18] } }
     }
     fn for_dispatch(kind: usize, first: bool) -> Laps {
-        Laps { last: profiling().then(std::time::Instant::now), steps: if first { &CS_STEPS_FIRST[..CS_STEP_COUNT] } else { &CS_STEPS[kind][..CS_STEP_COUNT] } }
+        Laps { last: laps().then(std::time::Instant::now), steps: if first { &CS_STEPS_FIRST[..CS_STEP_COUNT] } else { &CS_STEPS[kind][..CS_STEP_COUNT] } }
     }
     /// Adds the time since the last mark to step `k`.
     pub(super) fn mark(&mut self, k: usize) {
@@ -5547,6 +5590,15 @@ pub fn reset_shader_profile() {
     IDLE.lock().1 = None;
     *STARVED.lock() = None;
     *SUBMIT_WHY.lock() = None;
+}
+
+/// `DS_STEP_LAPS=1` without the profiler: the step lines alone (the
+/// profiler's report has them otherwise).
+pub fn laps_report() -> String {
+    if !laps() || profiling() {
+        return String::new();
+    }
+    draw_steps_line() + &bind_steps_line() + &pre_steps_line()
 }
 
 /// Shaders by total GPU time.
@@ -11650,6 +11702,8 @@ impl Exec {
             if cs_queue_profiled(&self.name) {
                 note_cs_cpu_queue(p.addr, [t_prep, t_pipe, t_bind, total]);
             }
+        }
+        if laps() {
             if first {
                 CS_STEPS_FIRST[CS_STEP_COUNT].fetch_add(1, Ordering::Relaxed);
             } else {
@@ -11764,6 +11818,7 @@ pub fn status() -> String {
         + &crate::mem::prot_census()
         + &crate::hosted::status()
         + &super::precache::protect_line()
+        + &crate::placement::status()
         + &crate::titlemem::status()
         + &crate::titlefix::status()
         + &super::cp::draw_state_line()

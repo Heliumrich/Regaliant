@@ -127,6 +127,7 @@ pub extern "sysv64" fn wait_hook(_: *const u64, _: u32) {
 
 /// The worker runs a job: its streak ends (a watcher stops watching).
 pub extern "sysv64" fn run_hook(_: *const u64, _: u32) {
+    crate::placement::note(&|| crate::log::thread_name());
     if crate::gpu::tune::job_idle() != 0 {
         STATS[5].fetch_add(1, Ordering::Relaxed);
     }

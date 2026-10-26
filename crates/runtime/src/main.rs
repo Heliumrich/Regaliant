@@ -11,6 +11,7 @@ mod guestprof;
 mod heap;
 mod hosted;
 mod hostcensus;
+mod placement;
 mod hostload;
 mod hle;
 mod input;
