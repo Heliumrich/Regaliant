@@ -1,13 +1,16 @@
-//! Draw census for GPU-resolved item draws (RENDERER.md "GPU-resolved item
-//! passes", stage G4; `DS_DRAW_CENSUS=1`): per program pair, the draws, those
+//! Draw and dispatch census for GPU-resolved commands (RENDERER.md
+//! "GPU-resolved item passes", stage G4; `DS_DRAW_CENSUS=1`). Draws: per
+//! program pair, the draws, those
 //! right after a draw of the pair with nothing recorded between and the same
 //! context state (in runs), the roots of each stage's chains (`gpures::Root`:
 //! user dword pairs and the pointers read from them) that vary within runs,
 //! and what the varying (per-item) chains reach: read-only buffers, written
 //! buffers, images, samplers. A sample of draws checks whether their per-item
 //! buffers hold data GPU work wrote and the CPU path would not read from guest
-//! memory (a home, pending GPU or CP writes). `profile reset` clears it; the
-//! profile report prints the totals and the pairs with the most draws.
+//! memory (a home, pending GPU or CP writes). Dispatches: per queue and
+//! program, the dispatches and the program's resources by kind. `profile
+//! reset` clears it; the profile report prints the totals and the pairs and
+//! programs with the most commands.
 
 use super::gpures::{root_of_res, root_value, Root};
 use parking_lot::Mutex;
@@ -138,6 +141,92 @@ pub fn checked(pair: (u64, u64), gpu_written: bool) {
 
 pub fn reset() {
     *PAIRS.lock() = None;
+    *PROGS.lock() = None;
+}
+
+/// Dispatches by queue and program: count, indirect ones, and the program's
+/// resources by kind: [read-only buffers, written buffers, sampled images,
+/// storage images, samplers, image tables, global bases].
+#[derive(Default)]
+struct Prog {
+    n: u64,
+    indirect: u64,
+    kinds: [u32; 7],
+}
+
+static PROGS: Mutex<Option<HashMap<(String, u64), Prog>>> = Mutex::new(None);
+
+/// A dispatch of program `addr` on `queue` (the census of what full GPU
+/// resolution would meet on each queue).
+pub fn observe_cs(queue: &str, addr: u64, plan: &Plan, indirect: bool) {
+    let mut g = PROGS.lock();
+    let m = g.get_or_insert_with(HashMap::new);
+    let key = (queue.trim_start_matches("gpu-").to_string(), addr);
+    let p = m.entry(key).or_insert_with(|| {
+        let mut kinds = [0u32; 7];
+        for r in plan.resources.iter() {
+            let k = match r.kind {
+                ResKind::Buffer if r.written => 1,
+                ResKind::Buffer => 0,
+                ResKind::Image if r.written => 3,
+                ResKind::Image => 2,
+                ResKind::Sampler => 4,
+                ResKind::ImageTable => 5,
+                ResKind::Global => 6,
+            };
+            kinds[k] += 1;
+        }
+        Prog { kinds, ..Default::default() }
+    });
+    p.n += 1;
+    if indirect {
+        p.indirect += 1;
+    }
+}
+
+/// The dispatch census's lines over `flips` flips: per queue the dispatches
+/// a flip and those of programs with buffers only (and of those, with
+/// written buffers), then its programs with the most dispatches.
+fn cs_lines(flips: f64) -> String {
+    let g = PROGS.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut queues: Vec<String> = m.keys().map(|k| k.0.clone()).collect();
+    queues.sort();
+    queues.dedup();
+    let mut s = String::new();
+    for q in queues {
+        let mut v: Vec<(&u64, &Prog)> = m.iter().filter(|(k, _)| k.0 == q).map(|(k, p)| (&k.1, p)).collect();
+        v.sort_by(|a, b| b.1.n.cmp(&a.1.n));
+        let all: u64 = v.iter().map(|x| x.1.n).sum();
+        let bufs: u64 = v.iter().filter(|x| x.1.kinds[2..].iter().all(|&c| c == 0)).map(|x| x.1.n).sum();
+        let bufs_w: u64 = v.iter().filter(|x| x.1.kinds[2..].iter().all(|&c| c == 0) && x.1.kinds[1] > 0).map(|x| x.1.n).sum();
+        let ind: u64 = v.iter().map(|x| x.1.indirect).sum();
+        s += &format!(
+            "    dispatch census {q}: {:.0} a flip ({} programs, {:.0} indirect); programs with buffers only {:.0} (with written buffers {:.0}), with images, samplers or tables {:.0}\n",
+            all as f64 / flips,
+            v.len(),
+            ind as f64 / flips,
+            bufs as f64 / flips,
+            bufs_w as f64 / flips,
+            (all - bufs) as f64 / flips
+        );
+        for (a, p) in v.iter().take(8) {
+            let k = p.kinds;
+            s += &format!(
+                "      cs {a:#x}: {:.1} a flip{}; ro buffers {}, written {}, images {}, storage images {}, samplers {}, tables {}, globals {}\n",
+                p.n as f64 / flips,
+                if p.indirect > 0 { format!(" ({:.0}% indirect)", 100.0 * p.indirect as f64 / p.n as f64) } else { String::new() },
+                k[0],
+                k[1],
+                k[2],
+                k[3],
+                k[4],
+                k[5],
+                k[6]
+            );
+        }
+    }
+    s
 }
 
 /// What a pair's per-item chains reach: [read-only buffers, written buffers,
@@ -173,8 +262,9 @@ pub fn lines(flips: u64) -> String {
     if !on() {
         return String::new();
     }
+    let cs = cs_lines(flips.max(1) as f64);
     let g = PAIRS.lock();
-    let Some(m) = g.as_ref() else { return String::new() };
+    let Some(m) = g.as_ref() else { return cs };
     let flips = flips.max(1);
     let (mut all, mut runs, mut elig, mut imgs, mut written, mut none) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut v: Vec<(&(u64, u64), &Pair)> = m.iter().collect();
@@ -231,5 +321,5 @@ pub fn lines(flips: u64) -> String {
     for t in top {
         s += &format!("      {t}\n");
     }
-    s
+    s + &cs
 }

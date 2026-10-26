@@ -11541,6 +11541,9 @@ impl Exec {
             Some(p) => p,
             None => shaders::prepare_compute(cp, wave64)?,
         };
+        if super::drawcensus::on() {
+            super::drawcensus::observe_cs(&self.name, p.addr, &p.tr.plan, indirect.is_some());
+        }
         if super::tune::gpu_chains() != 0 && p.tr.spec.batched && indirect.is_none() {
             let user = &p.sgpr_data[..p.tr.spec.user_sgprs as usize];
             if p.tr.spec.gpu_res != 0 {
