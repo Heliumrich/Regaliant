@@ -25,6 +25,13 @@ thread_local! {
     static APPLIED: Cell<(u64, u64)> = const { Cell::new((u64::MAX, u64::MAX)) };
     /// The graphics queue's command processor (`tune cp_priority 3`).
     static MAIN: Cell<bool> = const { Cell::new(false) };
+    /// A compute queue's command processor (`tune acb_cpus`).
+    static COMPUTE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The calling thread is a compute queue's command processor.
+pub fn set_compute() {
+    COMPUTE.with(|m| m.set(true));
 }
 
 /// The calling thread is the graphics queue's command processor.
@@ -46,6 +53,18 @@ pub fn apply() {
         CPUS_AUTO => auto_cpus(),
         m => m,
     };
+    if COMPUTE.with(|c| c.get()) {
+        match super::tune::acb_cpus() {
+            0 => {}
+            1 => {
+                let g = auto_guest_cpus();
+                if g != 0 {
+                    cpus = g;
+                }
+            }
+            m => cpus = m,
+        }
+    }
     if super::tune::gfx_core() {
         cpus = own_core(cpus, MAIN.with(|m| m.get()));
     }

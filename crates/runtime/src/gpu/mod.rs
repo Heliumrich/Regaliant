@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 171] = [
+    static ALL: [Tunable; 172] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -204,6 +204,7 @@ pub mod tune {
         Tunable { name: "shadow_pre", env: "DS_SHADOW_PRE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "home_read_min", env: "DS_HOME_READ_MIN", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_max", env: "DS_SHADOW_MAX", default: 4 << 20, value: AtomicU64::new(UNSET) },
+        Tunable { name: "acb_cpus", env: "DS_ACB_CPUS", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1865,6 +1866,17 @@ pub mod tune {
         get(170).min(12 << 20)
     }
 
+    /// Logical CPUs the compute queues' command processors run on (`prio`):
+    /// 0 those of the front end (`cp_cpus`), 1 (default) the title's
+    /// (`guest_cpus` AUTO: its last-level-cache group has cores to spare
+    /// while the front end's runs the graphics command processor and its
+    /// workers; +1.7% at 1-1's vista, FINDINGS.md 2026-10-26; nothing
+    /// changes where there is one such group), else a decimal mask.
+    #[inline]
+    pub fn acb_cpus() -> u64 {
+        get(171)
+    }
+
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
     /// without appends).
     #[inline]
@@ -2256,6 +2268,9 @@ fn worker(q: &'static Queue, name: &str) {
         prio::set_main();
     }
     shaders::set_compute_queue(q.id != GFX);
+    if q.id != GFX {
+        prio::set_compute();
+    }
     cp.wait_flag = Some(&q.cp_waiting);
     cp.more_follows = Some(Box::new(move || !q.pending.lock().is_empty()));
     // Register states kept for a frame replay (`Ctl::Save`).
