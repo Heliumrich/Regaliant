@@ -85,7 +85,7 @@ pub mod tune {
         Tunable { name: "pre_keep", env: "DS_PRE_KEEP", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_big_max", env: "DS_PRE_BIG_MAX", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_big_mib", env: "DS_PRE_BIG_MIB", default: 1024, value: AtomicU64::new(UNSET) },
-        Tunable { name: "home_reads", env: "DS_HOME_READS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "home_reads", env: "DS_HOME_READS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_share", env: "DS_SHADOW_SHARE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "clean_pages", env: "DS_CLEAN_PAGES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "eop_light", env: "DS_EOP_LIGHT", default: 1, value: AtomicU64::new(UNSET) },
@@ -202,7 +202,7 @@ pub mod tune {
         Tunable { name: "plan_fast", env: "DS_PLAN_FAST", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "async_particles", env: "DS_ASYNC_PARTICLES", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_pre", env: "DS_SHADOW_PRE", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "home_read_min", env: "DS_HOME_READ_MIN", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "home_read_min", env: "DS_HOME_READ_MIN", default: 1 << 20, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_max", env: "DS_SHADOW_MAX", default: 4 << 20, value: AtomicU64::new(UNSET) },
         Tunable { name: "acb_cpus", env: "DS_ACB_CPUS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "host_census", env: "DS_HOST_CENSUS", default: 0, value: AtomicU64::new(UNSET) },
@@ -692,13 +692,14 @@ pub mod tune {
         get(51)
     }
 
-    /// A read-only buffer binding over `pre_max` inside a range GPU work
-    /// writes through large bindings gives that range a video-memory home
-    /// (`homes::read_use`), like an index buffer there does. Default 0 (only
-    /// index buffers do): in the courtyard it made five more homes (427 MiB,
-    /// no write-backs) and left their passes' GPU times unchanged (stamped
-    /// replays 20261013-023246 / -030557: the readers read those buffers
-    /// sparsely).
+    /// A read-only buffer binding of `home_read_min` bytes or more inside a
+    /// range GPU work writes through large bindings gives that range a
+    /// video-memory home (`homes::read_use`), like an index buffer there
+    /// does. Default 1 since 2026-10-26 (with `home_read_min` 1 MiB): the
+    /// vista +3% (GPU -2.5 ms a frame), a 1-1 walk at 59.94 Hz +2% (GPU p50
+    /// -1.5 ms), once texture syncs stopped splitting boots into two speeds
+    /// (FINDINGS.md 2026-10-26). In the courtyard of 2026-10-13 it had made
+    /// five more homes (427 MiB) without changing their passes' GPU times.
     #[inline]
     pub fn home_reads() -> bool {
         get(52) != 0
@@ -1850,7 +1851,7 @@ pub mod tune {
 
     /// The fewest bytes a read-only binding inside a range GPU work writes
     /// through large bindings needs to give that range a home (`home_reads`;
-    /// 0: over `pre_max`, as before). GPU-written buffers of 4-8 MiB that
+    /// default 1 MiB; 0: over `pre_max`). GPU-written buffers of 4-8 MiB that
     /// later batches bind read-only were written in place across PCIe and
     /// copied back for every reading batch (a vista: ~54 MB a frame).
     #[inline]
