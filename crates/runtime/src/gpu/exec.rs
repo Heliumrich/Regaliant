@@ -5469,22 +5469,49 @@ fn prog_census_lines() -> String {
 pub(super) struct Laps {
     last: Option<std::time::Instant>,
     steps: &'static [AtomicU64],
+    /// This command's own step times (ns) and the steps' names, for the log
+    /// of slow commands (`slow`).
+    local: [u64; 24],
+    names: &'static [&'static str],
 }
+
+/// Commands slower than this are logged with their steps (`Laps::slow`).
+const SLOW_NS: u64 = 150_000;
+/// Slow commands logged.
+static SLOW_LOGGED: AtomicU64 = AtomicU64::new(0);
 
 impl Laps {
     pub(super) fn for_draw(kind: usize, first: bool) -> Laps {
-        Laps { last: laps().then(std::time::Instant::now), steps: if first { &DRAW_STEPS_FIRST[..18] } else { &DRAW_STEPS[kind][..18] } }
+        Laps { last: laps().then(std::time::Instant::now), steps: if first { &DRAW_STEPS_FIRST[..18] } else { &DRAW_STEPS[kind][..18] }, local: [0; 24], names: &DRAW_STEP_NAMES }
     }
     fn for_dispatch(kind: usize, first: bool) -> Laps {
-        Laps { last: laps().then(std::time::Instant::now), steps: if first { &CS_STEPS_FIRST[..CS_STEP_COUNT] } else { &CS_STEPS[kind][..CS_STEP_COUNT] } }
+        Laps { last: laps().then(std::time::Instant::now), steps: if first { &CS_STEPS_FIRST[..CS_STEP_COUNT] } else { &CS_STEPS[kind][..CS_STEP_COUNT] }, local: [0; 24], names: &CS_STEP_NAMES }
     }
     /// Adds the time since the last mark to step `k`.
     pub(super) fn mark(&mut self, k: usize) {
         if let Some(t) = self.last {
             let now = std::time::Instant::now();
-            self.steps[k].fetch_add((now - t).as_nanos() as u64, Ordering::Relaxed);
+            let ns = (now - t).as_nanos() as u64;
+            self.steps[k].fetch_add(ns, Ordering::Relaxed);
+            if k < self.local.len() {
+                self.local[k] += ns;
+            }
             self.last = Some(now);
         }
+    }
+    /// A command that took SLOW_NS or more in its steps, after the first
+    /// `profile reset` (`DS_STEP_LAPS`): logged with its steps of 5 us or
+    /// more (the first 400).
+    pub(super) fn slow(&self, queue: &str, what: impl FnOnce() -> String) {
+        if self.last.is_none() || MERGE_FROM.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let total: u64 = self.local.iter().sum();
+        if total < SLOW_NS || SLOW_LOGGED.fetch_add(1, Ordering::Relaxed) >= 400 {
+            return;
+        }
+        let parts: Vec<String> = self.names.iter().zip(self.local.iter()).filter(|&(_, &ns)| ns >= 5_000).map(|(n, &ns)| format!("{n} {:.0}", ns as f64 / 1000.0)).collect();
+        crate::info!("gpu[{queue}]: slow command {} at flip {}: {:.0} us ({})", what(), super::FRAMES.load(Ordering::Relaxed), total as f64 / 1000.0, parts.join(", "));
     }
 }
 
@@ -12419,6 +12446,7 @@ impl Exec {
             } else {
                 CS_STEPS[kind][CS_STEP_COUNT].fetch_add(1, Ordering::Relaxed);
             }
+            lap.slow(&self.name, || format!("cs {:#x}{}{}", p.addr, if indirect.is_some() { " indirect" } else { "" }, if first { ", first of its batch" } else { "" }));
         }
         if total.as_millis() >= 200 {
             let phases = if profiling() { format!(" (prepare {} ms, pipeline {} ms, bindings {} ms)", t_prep.as_millis(), (t_pipe - t_prep).as_millis(), (t_bind - t_pipe).as_millis()) } else { String::new() };

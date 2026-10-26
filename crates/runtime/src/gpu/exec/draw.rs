@@ -2129,6 +2129,7 @@ impl Exec {
             } else {
                 super::DRAW_STEPS[kind][18].fetch_add(1, Ordering::Relaxed);
             }
+            lap.slow(&self.name, || format!("vs {vs_addr:#x} ps {ps_addr:#x}{}", if first { ", first of its batch" } else { "" }));
         }
         Ok(true)
     }
