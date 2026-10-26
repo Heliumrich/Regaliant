@@ -140,6 +140,9 @@ fn note_pushed(k: usize) {
 pub(super) static VK_OPS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// Global barriers by the source line that asked for them (profiling).
 static BARRIER_SITES: Mutex<Option<HashMap<(&'static str, u32), u64>>> = Mutex::new(None);
+/// The same by queue class (graphics CP, other compute queues, queue 0x50,
+/// parallel workers): `Exec::barrier`'s callers (profiling).
+static BARRIER_QUEUE_SITES: Mutex<Option<HashMap<(u8, &'static str, u32), u64>>> = Mutex::new(None);
 pub(super) const VK_BARRIERS: usize = 0;
 pub(super) const VK_RENDER_PASSES: usize = 1;
 pub(super) const VK_GFX_PIPELINES: usize = 2;
@@ -2339,6 +2342,11 @@ struct Bound {
     img_arrays: Vec<(u32, vk::DescriptorType, Vec<vk::DescriptorImageInfo>)>,
     /// Guest ranges the stage writes.
     writes: Vec<(u64, u64)>,
+    /// Guest ranges its buffer bindings only read (unbounded pointers to
+    /// their mapping's end; `TITLE_BARRIERS`).
+    reads: Vec<(u64, u64)>,
+    /// It binds the global data share.
+    gds: bool,
     /// Those described by buffer descriptors (not unbounded pointers).
     sized_writes: Vec<(u64, u64)>,
     /// Images it samples or stores to.
@@ -2879,6 +2887,38 @@ static SHARE_CHECKED: AtomicU64 = AtomicU64::new(0);
 static RESIDENT_READS: AtomicU64 = AtomicU64::new(0);
 static MERGES: AtomicU64 = AtomicU64::new(0);
 static EARLY_MERGES: AtomicU64 = AtomicU64::new(0);
+/// The title's barriers before dispatches (a partial flush, cache action or
+/// end-of-pipe event since the last command) by queue class (graphics CP,
+/// other compute queues, queue 0x50, parallel workers) and what the
+/// dispatch after it touches (`Exec::dispatch_hazard`: nothing the work
+/// since the last full barrier wrote or read, not known, ranges written,
+/// ranges read and now written, images or the global data share).
+static TITLE_BARRIERS: [[AtomicU64; 5]; 4] = [const { [const { AtomicU64::new(0) }; 5] }; 4];
+static TITLE_BARRIERS_LAST: Mutex<[[u64; 5]; 4]> = Mutex::new([[0; 5]; 4]);
+
+/// The window's title barriers before dispatches per flip (frame windows;
+/// counted while profiling).
+pub(crate) fn title_barriers_clause(flips: u64) -> String {
+    if !profiling() {
+        return String::new();
+    }
+    let now: Vec<[u64; 5]> = TITLE_BARRIERS.iter().map(|c| std::array::from_fn(|k| c[k].load(Ordering::Relaxed))).collect();
+    let mut last = TITLE_BARRIERS_LAST.lock();
+    let f = flips.max(1) as f64;
+    let mut parts = Vec::new();
+    for (q, name) in ["graphics CP", "compute queues", "queue 0x50", "workers"].iter().enumerate() {
+        let d: Vec<f64> = (0..5).map(|k| now[q][k].saturating_sub(last[q][k]) as f64 / f).collect();
+        let all: f64 = d.iter().sum();
+        if all > 0.0 {
+            parts.push(format!("{name} {all:.0} (none {:.0}, unknown {:.0}, written {:.0}, read {:.0}, images {:.0})", d[0], d[1], d[2], d[3], d[4]));
+        }
+        last[q] = now[q];
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("; title barriers before dispatches per flip, by what they guard: {}", parts.join(", "))
+}
 /// Shadow candidates bound in host memory because the slot's shadow ring was full.
 static SHADOW_FULL: AtomicU64 = AtomicU64::new(0);
 /// Read-only buffer snapshots (`Exec::snapshot`): taken, reused within a
@@ -5559,6 +5599,7 @@ pub fn reset_shader_profile() {
         c.store(0, Ordering::Relaxed);
     }
     *BARRIER_SITES.lock() = None;
+    *BARRIER_QUEUE_SITES.lock() = None;
     *CS_CPU.lock() = None;
     *SHADER_PLACEMENTS.lock() = None;
     *SEG_TIME.lock() = None;
@@ -5662,6 +5703,15 @@ pub fn shader_profile() -> String {
             sites.sort_by(|a, b| b.1.cmp(a.1));
             let list: Vec<String> = sites.iter().take(12).map(|((f, l), n)| format!("{}:{l} {n}", f.rsplit(['/', '\\']).next().unwrap_or(f))).collect();
             s.push_str(&format!("    global barriers by site: {}\n", list.join(", ")));
+        }
+        if let Some(m) = BARRIER_QUEUE_SITES.lock().as_ref() {
+            for (q, name) in ["graphics CP", "compute queues", "queue 0x50", "workers"].iter().enumerate() {
+                let mut sites: Vec<(&(u8, &str, u32), &u64)> = m.iter().filter(|(k, _)| k.0 == q as u8).collect();
+                sites.sort_by(|a, b| b.1.cmp(a.1));
+                let all: u64 = sites.iter().map(|x| *x.1).sum();
+                let list: Vec<String> = sites.iter().take(10).map(|((_, f, l), n)| format!("{}:{l} {n}", f.rsplit(['/', '\\']).next().unwrap_or(f))).collect();
+                s.push_str(&format!("    batch barriers of the {name}: {all}; by site: {}\n", list.join(", ")));
+            }
         }
     }
     if let Some(idle) = IDLE.lock().1.as_ref() {
@@ -6006,6 +6056,15 @@ pub struct Exec {
     /// `barrier` (None: more than `SINCE_MAX`): an indirect dispatch whose
     /// arguments none of them writes needs no barrier of its own.
     since_barrier: Option<Vec<(u64, u64)>>,
+    /// Since that barrier: the guest ranges dispatches read (None: more
+    /// than SINCE_MAX), the images they sampled and stored to, whether
+    /// they used the global data share, whether a rendering instance began
+    /// (`TITLE_BARRIERS`).
+    since_reads: Option<Vec<(u64, u64)>>,
+    since_img_r: Vec<vk::Image>,
+    since_img_w: Vec<vk::Image>,
+    since_gds: bool,
+    since_draws: bool,
     /// The batch's barrier segments so far (`seg_stamps`).
     segs: Vec<SegMark>,
     /// The last draw, when another like it can be recorded on the state it
@@ -6356,6 +6415,11 @@ impl Exec {
                 batch_alt: false,
                 batch_alt_share: false,
                 since_barrier: Some(Vec::new()),
+                since_reads: Some(Vec::new()),
+                since_img_r: Vec::new(),
+                since_img_w: Vec::new(),
+                since_gds: false,
+                since_draws: false,
                 segs: Vec::new(),
                 repeat: None,
                 cmd_uses: std::cell::Cell::new(0),
@@ -7990,6 +8054,8 @@ impl Exec {
         b.imgs.clear();
         b.img_arrays.clear();
         b.writes.clear();
+        b.reads.clear();
+        b.gds = false;
         b.sized_writes.clear();
         b.images.clear();
         b.stored.clear();
@@ -9845,6 +9911,11 @@ impl Exec {
     /// A full barrier in the batch being recorded (see `global_barrier`).
     #[track_caller]
     fn barrier(&mut self) {
+        if profiling() {
+            let class = if self.deferred { 3 } else if self.name == "gpu-acb0x50" { 2 } else if self.compute_cp { 1 } else { 0 };
+            let l = std::panic::Location::caller();
+            *BARRIER_QUEUE_SITES.lock().get_or_insert_with(HashMap::new).entry((class, l.file(), l.line())).or_default() += 1;
+        }
         global_barrier(self.cmd());
         if seg_stamps() {
             let qp = self.slots[self.cur].queries;
@@ -9861,6 +9932,60 @@ impl Exec {
             Some(v) => v.clear(),
             None => self.since_barrier = Some(Vec::new()),
         }
+        match self.since_reads.as_mut() {
+            Some(v) => v.clear(),
+            None => self.since_reads = Some(Vec::new()),
+        }
+        self.since_img_r.clear();
+        self.since_img_w.clear();
+        self.since_gds = false;
+        self.since_draws = false;
+    }
+
+    /// Whether a dispatch binding `bound` (and reading its arguments at
+    /// `args`) touches what the work since the last full barrier wrote, or
+    /// writes what it read: 0 no, 1 not known (a rendering instance, a list
+    /// over SINCE_MAX), 2 it reads or writes a range written, 3 it writes a
+    /// range read, 4 images or the global data share (`TITLE_BARRIERS`).
+    fn dispatch_hazard(&self, bound: &Bound, args: Option<u64>) -> usize {
+        let (Some(w), Some(r)) = (self.since_barrier.as_ref(), self.since_reads.as_ref()) else { return 1 };
+        if self.since_draws {
+            return 1;
+        }
+        let over = |v: &[(u64, u64)], a: u64, n: u64| v.iter().any(|&(x, m)| x < a.saturating_add(n) && a < x.saturating_add(m));
+        if bound.reads.iter().chain(args.map(|a| (a, 12)).iter()).any(|&(a, n)| over(w, a, n)) || bound.writes.iter().any(|&(a, n)| over(w, a, n)) {
+            return 2;
+        }
+        if bound.writes.iter().any(|&(a, n)| over(r, a, n)) {
+            return 3;
+        }
+        if (bound.gds && self.since_gds) || bound.images.iter().any(|i| self.since_img_w.contains(i)) || bound.stored.iter().any(|i| self.since_img_r.contains(i)) {
+            return 4;
+        }
+        0
+    }
+
+    /// A dispatch binding `bound` is recorded: what it reads and samples
+    /// joins the lists since the last barrier (its writes come through
+    /// `note_write`).
+    fn note_since_reads(&mut self, bound: &Bound, args: Option<u64>) {
+        if let Some(v) = self.since_reads.as_mut() {
+            v.extend(bound.reads.iter().copied().chain(args.map(|a| (a, 12))));
+            if v.len() > SINCE_MAX {
+                self.since_reads = None;
+            }
+        }
+        for &i in &bound.images {
+            if !self.since_img_r.contains(&i) {
+                self.since_img_r.push(i);
+            }
+        }
+        for &i in &bound.stored {
+            if !self.since_img_w.contains(&i) {
+                self.since_img_w.push(i);
+            }
+        }
+        self.since_gds |= bound.gds;
     }
 
     /// A GPU write of [a, a + n) recorded in this batch (`since_barrier`).
@@ -10313,6 +10438,9 @@ impl Exec {
                             Some(n) => n,
                             None => mapping(base).map(|(_, e)| (e - base).min(UNBOUNDED_MAX)).unwrap_or(0),
                         };
+                        if size > 0 && !found.tr.plan.resources[i].written {
+                            bound.reads.push((base, size));
+                        }
                         // Written records of indirect draw arguments (16 or 20
                         // bytes): where draws may read them on the GPU (`tune
                         // draw_args_gpu`, `homes::vote_args`).
@@ -10615,7 +10743,10 @@ impl Exec {
                         BindClock::mark(&mut clk, 6);
                         BindClock::count_buffer(&mut clk);
                     }
-                    BindingKind::Gds => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.gds, offset: 0, range: rdna::translate::GDS_BYTES as u64 })),
+                    BindingKind::Gds => {
+                        bound.gds = true;
+                        bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.gds, offset: 0, range: rdna::translate::GDS_BYTES as u64 }))
+                    }
                     BindingKind::Debug => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.debug, offset: 0, range: rdna::translate::DUMP_DWORDS as u64 * 4 })),
                     BindingKind::Watchdog => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.watchdog, offset: 0, range: rdna::translate::WATCHDOG_DWORDS as u64 * 4 })),
                     BindingKind::LodStats => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.lodstats, offset: 0, range: super::lodstats::SLOT_BYTES })),
@@ -11289,11 +11420,18 @@ impl Exec {
             }
         };
         if lazy_barriers() && self.barrier_wanted {
+            if profiling() {
+                let class = if self.deferred { 3 } else if self.name == "gpu-acb0x50" { 2 } else if self.compute_cp { 1 } else { 0 };
+                TITLE_BARRIERS[class][self.dispatch_hazard(&bound, indirect)].fetch_add(1, Ordering::Relaxed);
+            }
             if super::tune::skip_barriers() & 16 == 0 {
                 self.barrier();
             }
             self.barrier_wanted = false;
             self.dispatched = false;
+        }
+        if profiling() {
+            self.note_since_reads(&bound, indirect);
         }
         // Arguments draws read on the GPU since the last barrier, which this
         // dispatch rewrites: the draws read them first.

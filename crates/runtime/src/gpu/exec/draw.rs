@@ -980,6 +980,7 @@ impl Exec {
     }
 
     fn begin_rendering(&mut self, colors: [Option<Target>; MAX_RT], depth: Option<Target>, area: (u32, u32)) {
+        self.since_draws = true;
         let n = colors.iter().rposition(Option::is_some).map(|i| i + 1).unwrap_or(0);
         let color_infos: Vec<vk::RenderingAttachmentInfo> = colors[..n]
             .iter()

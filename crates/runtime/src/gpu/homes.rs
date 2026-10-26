@@ -92,6 +92,9 @@ pub struct Shared {
     /// in (`precache::epoch`).
     watched: bool,
     checked: AtomicU64,
+    /// The epoch a thread is checking it for now, its write-mark query made
+    /// without the homes' lock (`check_unlocked`; 0: none).
+    checking: AtomicU64,
     /// A home of indirect draw arguments (`create_args`).
     args: bool,
 }
@@ -366,14 +369,15 @@ pub fn bind(base: u64, size: u64, written: bool, keep: &mut dyn FnMut(&Arc<HomeB
         }
         Fast::Slow => {}
     }
+    let epoch = check_epoch();
+    if super::tune::home_check_unlocked() {
+        check_before_lock(base, size, epoch);
+    }
     let mut g = super::lockstat::HOMES.lock(&HOMES);
     let h = g.iter_mut().find(|h| h.base <= base && base + size <= h.base + h.size)?;
-    if h.shared.watched {
-        let epoch = check_epoch();
-        if h.shared.checked.load(Ordering::Acquire) != epoch {
-            check_cpu_writes(h);
-            h.shared.checked.store(epoch, Ordering::Release);
-        }
+    if h.shared.watched && h.shared.checked.load(Ordering::Acquire) != epoch {
+        check_cpu_writes(h);
+        h.shared.checked.store(epoch, Ordering::Release);
     }
     let copy_in: Vec<(u64, u64, u64)> = if h.dirty.is_empty() {
         Vec::new()
@@ -450,6 +454,9 @@ pub fn copy_in_pending(base: u64, size: u64) -> bool {
             // A write-watched home not checked in this epoch: checked now
             // (pages the CPU wrote become dirty and wait for the caller's
             // in-order copy in).
+            if super::tune::home_check_unlocked() {
+                check_before_lock(base, size, epoch);
+            }
             let mut g = super::lockstat::HOMES.lock(&HOMES);
             let Some(h) = g.iter_mut().find(|h| h.base <= base && base + size <= h.base + h.size) else { return false };
             if h.shared.checked.load(Ordering::Acquire) != epoch {
@@ -478,6 +485,62 @@ pub fn note_large_write(base: u64, size: u64) {
     LARGE_WRITES.lock().insert(base, size);
     LAST_LARGE.with(|c| c.set((base, size)));
 }
+
+/// The check of the write-watched home holding [base, base+size) for
+/// `epoch`, if it is due, with the homes' lock released for its write-mark
+/// query (`tune home_check_unlocked`): one thread claims it
+/// (`Shared::checking`) and applies what it found under the lock; others
+/// binding that home wait for it, bindings of other homes not at all (the
+/// query of the culls' 112 MB home took ~100 us under the lock that every
+/// recording thread's home bindings waited for: 20,590 contended waits in a
+/// 903-flip vista window, 2.3 s, run 20261026-091347).
+fn check_before_lock(base: u64, size: u64, epoch: u64) {
+    let Some((hb, hn, shared)) = with_snap(|r, s| r.iter().position(|&(b, n)| b <= base && base + size <= b + n).map(|i| (r[i].0, r[i].1, s[i].1.clone()))) else { return };
+    if !shared.watched {
+        return;
+    }
+    let mut spins = 0u32;
+    while shared.checked.load(Ordering::Acquire) != epoch {
+        match shared.checking.compare_exchange(0, epoch, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                WATCH_CHECKS.fetch_add(1, Ordering::Relaxed);
+                let t0 = std::time::Instant::now();
+                let q = query_cpu_writes(hb, hn, shared.id);
+                {
+                    let mut g = super::lockstat::HOMES.lock(&HOMES);
+                    if let Some(h) = g.iter_mut().find(|h| h.shared.id == shared.id) {
+                        apply_cpu_writes(h, q);
+                    }
+                    if shared.checked.load(Ordering::Acquire) < epoch {
+                        shared.checked.store(epoch, Ordering::Release);
+                    }
+                }
+                shared.checking.store(0, Ordering::Release);
+                WATCH_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                UNLOCKED_CHECKS.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Err(_) => {
+                // Another thread's check of this home (for this epoch or an
+                // earlier one) is under way: its result first.
+                spins += 1;
+                if spins < 64 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+                if spins == 64 {
+                    CHECK_WAITS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+/// Checks made by `check_before_lock`, and bindings that waited for another
+/// thread's check of their home.
+static UNLOCKED_CHECKS: AtomicU64 = AtomicU64::new(0);
+static CHECK_WAITS: AtomicU64 = AtomicU64::new(0);
 
 /// The CPU's writes into a write-watched home's pages since they were last
 /// taken: those pages are copied in before its next GPU use (what GPU work
@@ -949,7 +1012,7 @@ fn create_with(b: u64, n: u64, watched: bool, args: bool, what: &str) -> bool {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     // A watched home's first check takes the marks of writes made before it
     // existed: all of it is copied in at its first use anyway.
-    let shared = Arc::new(Shared { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), dirty: AtomicBool::new(true), stale_gen: AtomicU64::new(0), watched, checked: AtomicU64::new(0), args });
+    let shared = Arc::new(Shared { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), dirty: AtomicBool::new(true), stale_gen: AtomicU64::new(0), watched, checked: AtomicU64::new(0), checking: AtomicU64::new(0), args });
     let snap = watched.then(|| {
         let mut v = vec![0u32; (n / 4) as usize];
         guest_words(b, v.len(), &mut v);
@@ -1084,7 +1147,7 @@ pub fn take_all() -> Vec<(u64, u64, Arc<HomeBuf>, u64)> {
 
 pub fn status() -> String {
     format!(
-        "    video-memory homes: {} created, {} refused (the CPU wrote them), {} dropped, {} MiB; {} bindings, {} bytes copied in, {} write-backs ({} KiB), {} partial overlaps ({} of them written: copied in again), {} refused for reads over command buffers or labels, {} unbounded pointer bindings over homes ({} based inside one, {} with GPU-written parts not yet in guest memory within 4 KiB of their base, {} written back first), {} image uploads over GPU-written home data not in guest memory ({} reloads of overwritten images written back first); write-watched: {} checks ({} ms), {} bytes the CPU changed ({} of them by guest code in homes watched for `homes_watch`), {} written pages covered in part, {} pages other takes found written handed over\n",
+        "    video-memory homes: {} created, {} refused (the CPU wrote them), {} dropped, {} MiB; {} bindings, {} bytes copied in, {} write-backs ({} KiB), {} partial overlaps ({} of them written: copied in again), {} refused for reads over command buffers or labels, {} unbounded pointer bindings over homes ({} based inside one, {} with GPU-written parts not yet in guest memory within 4 KiB of their base, {} written back first), {} image uploads over GPU-written home data not in guest memory ({} reloads of overwritten images written back first); write-watched: {} checks ({} ms; {} of them with the query outside the lock, {} bindings waited for another thread's check), {} bytes the CPU changed ({} of them by guest code in homes watched for `homes_watch`), {} written pages covered in part, {} pages other takes found written handed over\n",
         CREATED.load(Ordering::Relaxed),
         REFUSED_CPU.load(Ordering::Relaxed),
         DROPPED.load(Ordering::Relaxed),
@@ -1104,6 +1167,8 @@ pub fn status() -> String {
         IMAGE_STALE[1].load(Ordering::Relaxed),
         WATCH_CHECKS.load(Ordering::Relaxed),
         WATCH_NS.load(Ordering::Relaxed) / 1_000_000,
+        UNLOCKED_CHECKS.load(Ordering::Relaxed),
+        CHECK_WAITS.load(Ordering::Relaxed),
         CPU_WRITTEN_PAGES.load(Ordering::Relaxed),
         GUEST_CHANGED.load(Ordering::Relaxed),
         EDGE_PAGES.load(Ordering::Relaxed),

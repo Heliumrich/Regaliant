@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 178] = [
+    static ALL: [Tunable; 179] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -211,6 +211,7 @@ pub mod tune {
         Tunable { name: "placement", env: "DS_PLACEMENT", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "acb50_cpus", env: "DS_ACB50_CPUS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "tex_exact", env: "DS_TEX_EXACT", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "home_check_unlocked", env: "DS_HOME_CHECK_UNLOCKED", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1933,6 +1934,14 @@ pub mod tune {
     #[inline]
     pub fn tex_exact() -> bool {
         get(177) != 0
+    }
+
+    /// A write-watched home's check for CPU writes queries its pages with
+    /// the homes' lock released (`homes::check_before_lock`; 0: under the
+    /// lock, as before).
+    #[inline]
+    pub fn home_check_unlocked() -> bool {
+        get(178) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
