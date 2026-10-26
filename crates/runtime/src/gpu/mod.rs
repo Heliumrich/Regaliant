@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 172] = [
+    static ALL: [Tunable; 173] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -205,6 +205,7 @@ pub mod tune {
         Tunable { name: "home_read_min", env: "DS_HOME_READ_MIN", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_max", env: "DS_SHADOW_MAX", default: 4 << 20, value: AtomicU64::new(UNSET) },
         Tunable { name: "acb_cpus", env: "DS_ACB_CPUS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "host_census", env: "DS_HOST_CENSUS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1875,6 +1876,15 @@ pub mod tune {
     #[inline]
     pub fn acb_cpus() -> u64 {
         get(171)
+    }
+
+    /// Diagnostics, hosted runs (`hostcensus`): bit 1 arms shared copies
+    /// clean for 30 flips read-only, bit 2 GPU-written windows of up to 4 MiB
+    /// no-access once their batch completed; the host's faults on them are
+    /// counted (observation only).
+    #[inline]
+    pub fn host_census() -> u64 {
+        get(172)
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

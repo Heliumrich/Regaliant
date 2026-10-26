@@ -1096,6 +1096,10 @@ pub fn kernel_io<T>(what: &dyn Fn() -> String, base: u64, len: u64, into_guest: 
                 if into_guest {
                     crate::gpu::resident::disarm_for_host(base, len);
                 }
+                // Pages armed through the host (`hosted`; reads from
+                // no-access pages fail too).
+                crate::hostcensus::release(base, len);
+                crate::hosted::disarm(base, len);
                 std::thread::sleep(std::time::Duration::from_millis(1 << tries.min(5)));
                 continue;
             }

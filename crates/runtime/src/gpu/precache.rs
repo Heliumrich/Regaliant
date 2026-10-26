@@ -107,6 +107,8 @@ struct Entry {
     slot: usize,
     /// When it was made (a copy pending this long is given up: `insert`).
     made: std::time::Instant,
+    /// The flip it was made in (`hostcensus`).
+    born: u64,
 }
 
 struct Slot {
@@ -728,7 +730,11 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64, u64)> {
         }
         if e.checked == epoch {
             STATS[0].fetch_add(1, Ordering::Relaxed);
-            return Some((e.chunk.clone(), e.offset, if e.on_copy { e.seq } else { 0 }));
+            let r = (e.chunk.clone(), e.offset, if e.on_copy { e.seq } else { 0 });
+            let born = e.born;
+            drop(g);
+            crate::hostcensus::copy_used(base, size, born);
+            return Some(r);
         }
         let trust = super::tune::pre_trust();
         if trust > 0 && e.clean_flip.saturating_add(trust) >= super::FRAMES.load(Ordering::Relaxed) {
@@ -746,7 +752,13 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     let win = super::tune::pre_window();
     let (tb, te) = if win > 0 { (base & !(win - 1), (base + size).next_multiple_of(win)) } else { (base, base + size) };
     let mut pages = Vec::new();
+    // `tune host_census`: takes of copies armed as static data are what
+    // write tracking by protection would leave out.
+    let armed = crate::hostcensus::static_live(base, size).then(std::time::Instant::now);
     let (mut g, r, upto) = take_unlocked(tb, te - tb, &mut pages, None, 0);
+    if let Some(t) = armed {
+        crate::hostcensus::note_armed_take(t.elapsed().as_nanos() as u64, !pages.is_empty());
+    }
     trace_take('L', epoch, tb, te - tb, r.map(|_| pages.len()));
     {
         let c = g.as_mut()?;
@@ -879,7 +891,8 @@ pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     c.remove((base, size));
     c.chunks[slot].live += 1;
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    c.entries.insert((base, size), Entry { chunk: chunk.clone(), offset, id, seq: 0, on_copy: false, checked: ep, clean_flip: super::FRAMES.load(Ordering::Relaxed), slot, made: std::time::Instant::now() });
+    let flip = super::FRAMES.load(Ordering::Relaxed);
+    c.entries.insert((base, size), Entry { chunk: chunk.clone(), offset, id, seq: 0, on_copy: false, checked: ep, clean_flip: flip, slot, made: std::time::Instant::now(), born: flip });
     INSERT_GEN.fetch_add(1, Ordering::Release);
     cover(base, size, true);
     c.by_base.entry(base).or_default().push(size);

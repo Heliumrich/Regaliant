@@ -684,6 +684,7 @@ pub fn remap_guard() -> parking_lot::RwLockWriteGuard<'static, ()> {
 /// the change left armed pages read-only and unmarked until it landed).
 pub fn settled(base: u64, len: u64) {
     remapped(base, len);
+    crate::hosted::forget(base, len);
 }
 
 /// An access violation at `addr` (`write`: a write): handled when it is a
@@ -1629,6 +1630,33 @@ fn protect_test() -> Result<String, String> {
     let mut old = 0u32;
     unsafe { VirtualProtect(base as _, size, PAGE_READWRITE, &mut old) };
     let gpu_marks = marks();
+    // Imports made while pages are already protected (write tracking by
+    // protection arms pages that later bindings import): parts 4-5 with
+    // part 4 read-only, parts 6-7 with part 6 no-access; the GPU then fills
+    // the second part of each.
+    let import_over = |p: usize, prot: u32| -> String {
+        let mut old = 0u32;
+        unsafe { VirtualProtect((base + p * PART) as _, PART, prot, &mut old) };
+        let r = c.import_host((base + p * PART) as u64, 2 * PART as u64, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER);
+        let out = match r {
+            Ok((b, m, _)) => {
+                let f = one_off(|cmd| unsafe { c.device.cmd_fill_buffer(cmd, b, PART as u64, PART as u64, 0x77) });
+                unsafe {
+                    c.device.destroy_buffer(b, None);
+                    c.device.free_memory(m, None);
+                }
+                match f {
+                    Ok(()) => "imported, GPU fill done".to_string(),
+                    Err(e) => format!("imported, GPU fill failed: {e}"),
+                }
+            }
+            Err(e) => format!("import failed: {e}"),
+        };
+        unsafe { VirtualProtect((base + p * PART) as _, PART, PAGE_READWRITE, &mut old) };
+        out
+    };
+    let ro = import_over(4, PAGE_READONLY);
+    let na = import_over(6, PAGE_NOACCESS);
     let r = gpu.and_then(|_| {
         for k in 0..16usize {
             let last = (0..ROUNDS).rev().find(|r| *r as usize % 16 == k).unwrap();
@@ -1641,7 +1669,7 @@ fn protect_test() -> Result<String, String> {
             }
         }
         Ok(format!(
-            "{ROUNDS} rounds of GPU fills into and copies out of imported pages while {} protection changes switched them between read-only, no-access and read-write; contents right, no device loss; write marks: {cpu_marks} pages after the CPU's writes, {gpu_marks} after the GPU's",
+            "{ROUNDS} rounds of GPU fills into and copies out of imported pages while {} protection changes switched them between read-only, no-access and read-write; contents right, no device loss; write marks: {cpu_marks} pages after the CPU's writes, {gpu_marks} after the GPU's; an import over pages already read-only: {ro}; over pages already no-access: {na}",
             toggles.load(Ordering::Relaxed)
         ))
     });

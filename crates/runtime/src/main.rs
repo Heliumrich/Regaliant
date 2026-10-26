@@ -9,6 +9,8 @@ mod exception;
 mod gpu;
 mod guestprof;
 mod heap;
+mod hosted;
+mod hostcensus;
 mod hostload;
 mod hle;
 mod input;
@@ -1113,6 +1115,10 @@ fn read_proc_param(m: &loader::LoadedModule) -> (u64, String, i32) {
 }
 
 fn main() {
+    // `--host`: this process only hosts dsport (its debugger; `hosted`).
+    if hosted::wants_host() {
+        hosted::run_host();
+    }
     // The guest address range must be reserved before the process grows
     // (the first heap allocation reserved it already, see `heap`).
     if let Err(e) = mem::reserve_guest_range() {
@@ -1147,6 +1153,8 @@ fn main() {
     hle::LENIENT_IMPORTS.store(cfg.lenient, std::sync::atomic::Ordering::Relaxed);
     info!("dsport {} | run dir {} | TLS slot {} | host heap: {} | guest write watch: {}", env!("CARGO_PKG_VERSION"), cfg.run_dir.display(), slot, heap::name(), mem::write_watch_state());
     exception::install();
+    hosted::init();
+    hosted::self_test_maybe();
     if cfg.dispatch_bench {
         let code = gpu::dispbench::run();
         log::flush();

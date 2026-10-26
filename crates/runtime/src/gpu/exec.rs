@@ -1029,6 +1029,8 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     // pages must be writable while importing (their regions turn dirty
     // and are re-armed on their next use).
     let _w = super::track::protected().then(|| super::track::host_write(start, end - start));
+    // Pages armed through the host likewise (`hostcensus`).
+    crate::hostcensus::release(start, end - start);
     let t0 = std::time::Instant::now();
     match ctx().import_host(start + alias, end - start, usage) {
         Ok((buffer, mem, va)) => {
@@ -3891,6 +3893,9 @@ fn completion_thread() {
                 crate::info!("gpu[{}]: batch #{} of {} command(s) took {ms} ms (shaders {}; {})", b.name, b.seq, b.shaders.len(), list.join(" "), ops_line(&b.ops));
             }
         }
+        // `tune host_census`: its written windows are armed before its CP
+        // effects release anyone who reads them.
+        crate::hostcensus::completed(b.seq);
         // Label writes the GPU performed within the batch (before its CP
         // effects, which come after its work).
         for &(a, v, n) in &b.gpu_labels {
@@ -6858,6 +6863,7 @@ impl Exec {
         let writes = std::mem::take(&mut self.pending);
         self.pending_log.clear();
         INFLIGHT.note_ranges(seq, &writes);
+        crate::hostcensus::gpu_wrote(seq, &writes);
         if self.name == "gpu-gfx" {
             super::frameahead::a_wrote_ranges(&writes);
         }
@@ -10117,6 +10123,7 @@ impl Exec {
             super::precache::submitted(&b.shared, seq);
             super::resident::submitted(&b.res_pages, seq);
             INFLIGHT.note_ranges(seq, &b.writes);
+            crate::hostcensus::gpu_wrote(seq, &b.writes);
             if self.name.starts_with("gpu-gfx-par") {
                 super::frameahead::a_wrote_ranges(&b.writes);
             }
@@ -11751,6 +11758,7 @@ pub fn status() -> String {
         + &super::track::status()
         + &crate::mem::remap_status()
         + &crate::mem::prot_census()
+        + &crate::hosted::status()
         + &crate::titlemem::status()
         + &crate::titlefix::status()
         + &super::cp::draw_state_line()
