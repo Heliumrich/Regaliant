@@ -6374,6 +6374,9 @@ pub static GPU_DRAW_APPENDS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// GPU-resolved commands not appended because a formatted per-item buffer's
 /// V# had another format or swizzle than their translation's.
 pub static GPU_FORMAT_MISSES: AtomicU64 = AtomicU64::new(0);
+/// GPU-resolved draws appended (`DS_STEP_LAPS`): [appends, ns in checks,
+/// imports, image hazards, indices, SGPR data and arguments].
+pub static GPU_APPEND_LAPS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// `DS_GPU_VERIFY=1`: [appended draws verified, of them with differences].
 pub static GPU_VERIFY: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 

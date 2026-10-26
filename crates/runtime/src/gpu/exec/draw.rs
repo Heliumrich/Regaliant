@@ -2364,6 +2364,17 @@ impl Exec {
 
     fn draw_gpu_append_to(&mut self, r: &mut DrawRun, cp: &Cp, a: &DrawArgs, vs_addr: u64, ps_addr: u64) -> Result<Option<bool>, String> {
         let stats = &super::GPU_DRAW_APPENDS;
+        // Step times of appends (`DS_STEP_LAPS`): checks, imports, image
+        // hazards, indices, SGPR data and arguments.
+        let mut t = super::laps().then(std::time::Instant::now);
+        let mut laps = [0u64; 5];
+        let mut mark = |k: usize| {
+            if let Some(t0) = t.as_mut() {
+                let now = std::time::Instant::now();
+                laps[k] = (now - *t0).as_nanos() as u64;
+                *t0 = now;
+            }
+        };
         let at = (self.batch_count, self.cmd_uses.get());
         let Some(g) = r.gpu.as_ref() else { return Ok(None) };
         if g.pair != (vs_addr, ps_addr) || !r.appendable || r.fresh || (r.batch, r.uses) != at || r.n >= r.max || r.index.is_some() != a.index.is_some() || a.gpu_args.is_some() || a.base_inst != g.base_inst || self.rendering.is_none() || self.stopped || [cp.reg(Space::Sh, 0x8B), cp.reg(Space::Sh, 0x0B)] != g.rsrc2 {
@@ -2385,6 +2396,7 @@ impl Exec {
             stats[1].fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
+        mark(0);
         for k in 0..2 {
             let st = &g.stages[k];
             if !super::gpu_pages_mapped(&g.items[k], users[k]) || !super::gpu_res_imported(&st.found, st.addr, st.tr.spec.gpu_res, users[k]) {
@@ -2395,6 +2407,7 @@ impl Exec {
         if gpu_verify() {
             self.gpu_draw_verify(cp, g);
         }
+        mark(1);
         // Pending work on the run's images, as for a batched draw (the
         // textures' CPU writes were checked by the run's first draw).
         let mut used = std::mem::take(&mut self.keys_scratch);
@@ -2409,6 +2422,7 @@ impl Exec {
             stats[3].fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
+        mark(2);
         // Indices, placed as the full path places them: in the run's buffer.
         let base_vertex = a.base_vertex.unwrap_or(ctx_reg(cp, 0x28408) as i32);
         let first = match a.index {
@@ -2454,6 +2468,7 @@ impl Exec {
             stats[3].fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
+        mark(3);
         // Both stages' SGPR data: the run's first draw's with this draw's
         // user data, in the run's ring (the stages bind it whole).
         let which = if self.slots[self.cur].rings[1].is_some_and(|x| x.0 == r.ring) { 1 } else { 0 };
@@ -2498,6 +2513,14 @@ impl Exec {
         self.batch_shaders.push(super::DRAW_KEY | ps_addr);
         stats[0].fetch_add(1, Ordering::Relaxed);
         DRAWN.fetch_add(1, Ordering::Relaxed);
+        mark(4);
+        if t.is_some() {
+            let l = &super::GPU_APPEND_LAPS;
+            l[0].fetch_add(1, Ordering::Relaxed);
+            for (k, ns) in laps.iter().enumerate() {
+                l[1 + k].fetch_add(*ns, Ordering::Relaxed);
+            }
+        }
         Ok(Some(true))
     }
 

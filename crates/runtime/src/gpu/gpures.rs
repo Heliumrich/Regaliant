@@ -390,6 +390,22 @@ pub fn status() -> String {
     let a = &super::exec::GPU_APPENDS;
     let c = &super::exec::GPU_RES_CHECKS;
     let d = &super::exec::GPU_DRAW_APPENDS;
+    let l: Vec<u64> = super::exec::GPU_APPEND_LAPS.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+    let laps = if l[0] > 0 {
+        let us = |k: usize| l[k] as f64 / l[0] as f64 / 1000.0;
+        format!(
+            "    GPU-resolved draws appended, us each by step (`DS_STEP_LAPS`, {} timed): checks {:.2}, imports {:.2}, image hazards {:.2}, indices {:.2}, SGPR data and arguments {:.2} (all {:.2})\n",
+            l[0],
+            us(1),
+            us(2),
+            us(3),
+            us(4),
+            us(5),
+            (1..6).map(us).sum::<f64>()
+        )
+    } else {
+        String::new()
+    };
     format!(
         "    GPU-resolved programs: {} eligible, {} refused; commands appended to their runs {}, recorded in full: run roots differ {}, no open run or other state {}; ranges imported for them {}; reads of those in full checked {}: in a home {}, pending writes {}, in a resident shadow {}, not imported {}\n    GPU-resolved draws: pairs {} eligible, {} refused, {} refused later; draws appended to their runs {}, not appended: run roots, words or data differ {}, indices elsewhere {}, other state {}; commands not appended for a per-item vertex format other than their translation's {}; verified (`DS_GPU_VERIFY`) {}, with differences {}\n",
         STATS[0].load(Ordering::Relaxed),
@@ -413,5 +429,5 @@ pub fn status() -> String {
         super::exec::GPU_FORMAT_MISSES.load(Ordering::Relaxed),
         super::exec::GPU_VERIFY[0].load(Ordering::Relaxed),
         super::exec::GPU_VERIFY[1].load(Ordering::Relaxed)
-    )
+    ) + &laps
 }
