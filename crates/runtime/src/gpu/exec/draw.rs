@@ -2040,6 +2040,8 @@ impl Exec {
         if super::profiling() {
             super::note_phases(&super::DRAW_PHASES, [t_prep, t_pipe, t_bind, since(t0)]);
             super::note_place(self.deferred, self.batch_shaders.len().saturating_sub(1), [t_prep, t_pipe, t_bind, since(t0)]);
+        }
+        if super::laps() {
             if first {
                 super::DRAW_STEPS_FIRST[18].fetch_add(1, Ordering::Relaxed);
             } else {

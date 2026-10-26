@@ -5286,7 +5286,7 @@ pub(super) struct Laps {
 
 impl Laps {
     pub(super) fn for_draw(kind: usize, first: bool) -> Laps {
-        Laps { last: profiling().then(std::time::Instant::now), steps: if first { &DRAW_STEPS_FIRST[..18] } else { &DRAW_STEPS[kind][..18] } }
+        Laps { last: laps().then(std::time::Instant::now), steps: if first { &DRAW_STEPS_FIRST[..18] } else { &DRAW_STEPS[kind][..18] } }
     }
     fn for_dispatch(kind: usize, first: bool) -> Laps {
         Laps { last: laps().then(std::time::Instant::now), steps: if first { &CS_STEPS_FIRST[..CS_STEP_COUNT] } else { &CS_STEPS[kind][..CS_STEP_COUNT] } }
@@ -10454,7 +10454,10 @@ impl Exec {
                         // Sized: buffers, and bases whose loads all read known
                         // bytes (data loads read by the shader).
                         let sized = matches!(found.resources[i], Resolved::Buffer(_) | Resolved::Global(_, Some(_)));
-                        let read_only = size > 0 && !found.tr.plan.resources[i].written && sized;
+                        // Unbounded pointers whose mapping ends within `tune
+                        // pre_unsized` bytes are read-only bindings of that much
+                        // (a VRAM copy instead of reads across PCIe).
+                        let read_only = size > 0 && !found.tr.plan.resources[i].written && (sized || size <= super::tune::pre_unsized());
                         if size > 0 && super::census::on() {
                             use super::census::{RO, RO_UNSIZED, WRITTEN};
                             super::census::note(base, size, if found.tr.plan.resources[i].written { WRITTEN } else if sized { RO } else { RO_UNSIZED });

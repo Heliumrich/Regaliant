@@ -77,6 +77,44 @@ impl Drop for HomeBuf {
     }
 }
 
+/// The windows a write-watched home's checks for CPU writes are made per.
+const CHECK_WIN: u64 = 2 << 20;
+
+impl Shared {
+    /// The windows of [a, a+n) (inside the home).
+    fn win_range(&self, a: u64, n: u64) -> std::ops::Range<usize> {
+        let first = (a.saturating_sub(self.base) / CHECK_WIN) as usize;
+        let last = ((a + n.max(1) - 1).saturating_sub(self.base) / CHECK_WIN) as usize;
+        first.min(self.wins.len())..(last + 1).min(self.wins.len())
+    }
+
+    /// Whether every window of [a, a+n) was checked in `epoch`.
+    fn checked(&self, a: u64, n: u64, epoch: u64) -> bool {
+        self.wins[self.win_range(a, n)].iter().all(|w| w.load(Ordering::Acquire) == epoch)
+    }
+
+    /// The span of the windows of [a, a+n) not checked in `epoch`: (start,
+    /// bytes) inside a home of `size` bytes (None: all checked).
+    fn unchecked_span(&self, a: u64, n: u64, epoch: u64, size: u64) -> Option<(u64, u64)> {
+        // `tune home_check_win` 0: every window of the home at once.
+        let r = if super::tune::home_check_win() { self.win_range(a, n) } else { 0..self.wins.len() };
+        let first = r.clone().find(|&i| self.wins[i].load(Ordering::Acquire) != epoch)?;
+        let last = r.rev().find(|&i| self.wins[i].load(Ordering::Acquire) != epoch)?;
+        let start = first as u64 * CHECK_WIN;
+        let end = ((last as u64 + 1) * CHECK_WIN).min(size);
+        Some((self.base + start, end - start))
+    }
+
+    /// Marks the windows of [a, a+n) checked in `epoch`.
+    fn mark_checked(&self, a: u64, n: u64, epoch: u64) {
+        for w in &self.wins[self.win_range(a, n)] {
+            if w.load(Ordering::Acquire) < epoch {
+                w.store(epoch, Ordering::Release);
+            }
+        }
+    }
+}
+
 /// A home's state readable without the lock (`bind`'s fast path).
 pub struct Shared {
     /// Unique per home (stale notes name it).
@@ -87,11 +125,15 @@ pub struct Shared {
     /// the CPU side): a thread's note that it marked a range stale holds
     /// while it stays the same.
     stale_gen: AtomicU64,
-    /// Write-watched (`create_args`; every home with `tune homes_watch`):
-    /// the synchronization epoch its pages were last checked for CPU writes
-    /// in (`precache::epoch`).
+    /// Write-watched (`create_args`; every home with `tune homes_watch`).
     watched: bool,
-    checked: AtomicU64,
+    /// Per CHECK_WIN bytes of the home from `base` (one for a smaller
+    /// home): the synchronization epoch the window's pages were last checked
+    /// for CPU writes in (`precache::epoch`). A binding checks the windows it
+    /// covers only (the culls' 112 MB index home was checked whole, ~126 us,
+    /// by the first index binding of every epoch, which reads a few KiB).
+    wins: Box<[AtomicU64]>,
+    base: u64,
     /// The epoch a thread is checking it for now, its write-mark query made
     /// without the homes' lock (`check_unlocked`; 0: none).
     checking: AtomicU64,
@@ -351,7 +393,7 @@ pub fn bind(base: u64, size: u64, written: bool, keep: &mut dyn FnMut(&Arc<HomeB
         let Some(i) = r.iter().position(|&(b, n)| b <= base && base + size <= b + n) else { return Fast::Miss };
         let (hb, hn) = r[i];
         let shared = &s[i].1;
-        if !shared.dirty.load(Ordering::Acquire) && (!shared.watched || shared.checked.load(Ordering::Acquire) == check_epoch()) {
+        if !shared.dirty.load(Ordering::Acquire) && (!shared.watched || shared.checked(base, size, check_epoch())) {
             let sgen = shared.stale_gen.load(Ordering::Acquire);
             let id = shared.id;
             if !written || STALE_NOTES.with(|n| n.borrow().iter().any(|&(b, m, h, sg)| h == id && sg == sgen && b <= base && base + size <= b + m)) {
@@ -375,9 +417,8 @@ pub fn bind(base: u64, size: u64, written: bool, keep: &mut dyn FnMut(&Arc<HomeB
     }
     let mut g = super::lockstat::HOMES.lock(&HOMES);
     let h = g.iter_mut().find(|h| h.base <= base && base + size <= h.base + h.size)?;
-    if h.shared.watched && h.shared.checked.load(Ordering::Acquire) != epoch {
-        check_cpu_writes(h);
-        h.shared.checked.store(epoch, Ordering::Release);
+    if h.shared.watched && !h.shared.checked(base, size, epoch) {
+        check_cpu_writes(h, base, size, epoch);
     }
     let copy_in: Vec<(u64, u64, u64)> = if h.dirty.is_empty() {
         Vec::new()
@@ -445,7 +486,7 @@ pub fn copy_in_pending(base: u64, size: u64) -> bool {
     let state = with_snap(|r, s| {
         r.iter()
             .position(|&(b, n)| b <= base && base + size <= b + n)
-            .map(|i| (s[i].1.dirty.load(Ordering::Acquire), s[i].1.watched && s[i].1.checked.load(Ordering::Acquire) != epoch))
+            .map(|i| (s[i].1.dirty.load(Ordering::Acquire), s[i].1.watched && !s[i].1.checked(base, size, epoch)))
     });
     match state {
         None | Some((false, false)) => false,
@@ -459,9 +500,8 @@ pub fn copy_in_pending(base: u64, size: u64) -> bool {
             }
             let mut g = super::lockstat::HOMES.lock(&HOMES);
             let Some(h) = g.iter_mut().find(|h| h.base <= base && base + size <= h.base + h.size) else { return false };
-            if h.shared.checked.load(Ordering::Acquire) != epoch {
-                check_cpu_writes(h);
-                h.shared.checked.store(epoch, Ordering::Release);
+            if !h.shared.checked(base, size, epoch) {
+                check_cpu_writes(h, base, size, epoch);
             }
             h.shared.dirty.load(Ordering::Acquire)
         }
@@ -495,25 +535,28 @@ pub fn note_large_write(base: u64, size: u64) {
 /// recording thread's home bindings waited for: 20,590 contended waits in a
 /// 903-flip vista window, 2.3 s, run 20261026-091347).
 fn check_before_lock(base: u64, size: u64, epoch: u64) {
-    let Some((hb, hn, shared)) = with_snap(|r, s| r.iter().position(|&(b, n)| b <= base && base + size <= b + n).map(|i| (r[i].0, r[i].1, s[i].1.clone()))) else { return };
+    let Some((hn, shared)) = with_snap(|r, s| r.iter().position(|&(b, n)| b <= base && base + size <= b + n).map(|i| (r[i].1, s[i].1.clone()))) else { return };
     if !shared.watched {
         return;
     }
     let mut spins = 0u32;
-    while shared.checked.load(Ordering::Acquire) != epoch {
+    while !shared.checked(base, size, epoch) {
         match shared.checking.compare_exchange(0, epoch, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => {
+                let Some((qa, qn)) = shared.unchecked_span(base, size, epoch, hn) else {
+                    shared.checking.store(0, Ordering::Release);
+                    return;
+                };
                 WATCH_CHECKS.fetch_add(1, Ordering::Relaxed);
+                WATCH_BYTES.fetch_add(qn, Ordering::Relaxed);
                 let t0 = std::time::Instant::now();
-                let q = query_cpu_writes(hb, hn, shared.id);
+                let q = query_cpu_writes(qa, qn, shared.id);
                 {
                     let mut g = super::lockstat::HOMES.lock(&HOMES);
                     if let Some(h) = g.iter_mut().find(|h| h.shared.id == shared.id) {
                         apply_cpu_writes(h, q);
                     }
-                    if shared.checked.load(Ordering::Acquire) < epoch {
-                        shared.checked.store(epoch, Ordering::Release);
-                    }
+                    shared.mark_checked(qa, qn, epoch);
                 }
                 shared.checking.store(0, Ordering::Release);
                 WATCH_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -540,15 +583,22 @@ fn check_before_lock(base: u64, size: u64, epoch: u64) {
 /// Checks made by `check_before_lock`, and bindings that waited for another
 /// thread's check of their home.
 static UNLOCKED_CHECKS: AtomicU64 = AtomicU64::new(0);
+/// Bytes of homes the checks queried.
+static WATCH_BYTES: AtomicU64 = AtomicU64::new(0);
 static CHECK_WAITS: AtomicU64 = AtomicU64::new(0);
 
 /// The CPU's writes into a write-watched home's pages since they were last
-/// taken: those pages are copied in before its next GPU use (what GPU work
-/// wrote there and was not written back yet is lost: logged).
-fn check_cpu_writes(h: &mut Home) {
+/// taken, in the windows of [a, a+n) not checked in `epoch` (then marked):
+/// those pages are copied in before its next GPU use (what GPU work wrote
+/// there and was not written back yet is lost: logged).
+fn check_cpu_writes(h: &mut Home, a: u64, n: u64, epoch: u64) {
+    let Some((qa, qn)) = h.shared.unchecked_span(a, n, epoch, h.size) else { return };
     WATCH_CHECKS.fetch_add(1, Ordering::Relaxed);
+    WATCH_BYTES.fetch_add(qn, Ordering::Relaxed);
     let t0 = std::time::Instant::now();
-    check_cpu_writes_inner(h);
+    let q = query_cpu_writes(qa, qn, h.shared.id);
+    apply_cpu_writes(h, q);
+    h.shared.mark_checked(qa, qn, epoch);
     WATCH_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
@@ -563,11 +613,6 @@ fn query_cpu_writes(base: u64, size: u64, id: u64) -> Found {
     // Pages whose marks other takes reset meanwhile (the take above waited
     // for those in flight over the home to be applied).
     (taken, pages, taken_for(id))
-}
-
-fn check_cpu_writes_inner(h: &mut Home) {
-    let q = query_cpu_writes(h.base, h.size, h.shared.id);
-    apply_cpu_writes(h, q);
 }
 
 /// The words of a home's pages the CPU wrote (`Found`) that changed are
@@ -1012,7 +1057,8 @@ fn create_with(b: u64, n: u64, watched: bool, args: bool, what: &str) -> bool {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     // A watched home's first check takes the marks of writes made before it
     // existed: all of it is copied in at its first use anyway.
-    let shared = Arc::new(Shared { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), dirty: AtomicBool::new(true), stale_gen: AtomicU64::new(0), watched, checked: AtomicU64::new(0), checking: AtomicU64::new(0), args });
+    let wins: Box<[AtomicU64]> = (0..n.div_ceil(CHECK_WIN).max(1)).map(|_| AtomicU64::new(0)).collect();
+    let shared = Arc::new(Shared { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), dirty: AtomicBool::new(true), stale_gen: AtomicU64::new(0), watched, wins, base: b, checking: AtomicU64::new(0), args });
     let snap = watched.then(|| {
         let mut v = vec![0u32; (n / 4) as usize];
         guest_words(b, v.len(), &mut v);
@@ -1147,7 +1193,7 @@ pub fn take_all() -> Vec<(u64, u64, Arc<HomeBuf>, u64)> {
 
 pub fn status() -> String {
     format!(
-        "    video-memory homes: {} created, {} refused (the CPU wrote them), {} dropped, {} MiB; {} bindings, {} bytes copied in, {} write-backs ({} KiB), {} partial overlaps ({} of them written: copied in again), {} refused for reads over command buffers or labels, {} unbounded pointer bindings over homes ({} based inside one, {} with GPU-written parts not yet in guest memory within 4 KiB of their base, {} written back first), {} image uploads over GPU-written home data not in guest memory ({} reloads of overwritten images written back first); write-watched: {} checks ({} ms; {} of them with the query outside the lock, {} bindings waited for another thread's check), {} bytes the CPU changed ({} of them by guest code in homes watched for `homes_watch`), {} written pages covered in part, {} pages other takes found written handed over\n",
+        "    video-memory homes: {} created, {} refused (the CPU wrote them), {} dropped, {} MiB; {} bindings, {} bytes copied in, {} write-backs ({} KiB), {} partial overlaps ({} of them written: copied in again), {} refused for reads over command buffers or labels, {} unbounded pointer bindings over homes ({} based inside one, {} with GPU-written parts not yet in guest memory within 4 KiB of their base, {} written back first), {} image uploads over GPU-written home data not in guest memory ({} reloads of overwritten images written back first); write-watched: {} checks ({} ms, {} MiB queried; {} of them with the query outside the lock, {} bindings waited for another thread's check), {} bytes the CPU changed ({} of them by guest code in homes watched for `homes_watch`), {} written pages covered in part, {} pages other takes found written handed over\n",
         CREATED.load(Ordering::Relaxed),
         REFUSED_CPU.load(Ordering::Relaxed),
         DROPPED.load(Ordering::Relaxed),
@@ -1167,6 +1213,7 @@ pub fn status() -> String {
         IMAGE_STALE[1].load(Ordering::Relaxed),
         WATCH_CHECKS.load(Ordering::Relaxed),
         WATCH_NS.load(Ordering::Relaxed) / 1_000_000,
+        WATCH_BYTES.load(Ordering::Relaxed) >> 20,
         UNLOCKED_CHECKS.load(Ordering::Relaxed),
         CHECK_WAITS.load(Ordering::Relaxed),
         CPU_WRITTEN_PAGES.load(Ordering::Relaxed),

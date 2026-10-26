@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 179] = [
+    static ALL: [Tunable; 181] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -212,6 +212,8 @@ pub mod tune {
         Tunable { name: "acb50_cpus", env: "DS_ACB50_CPUS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "tex_exact", env: "DS_TEX_EXACT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "home_check_unlocked", env: "DS_HOME_CHECK_UNLOCKED", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_unsized", env: "DS_PRE_UNSIZED", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "home_check_win", env: "DS_HOME_CHECK_WIN", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1942,6 +1944,23 @@ pub mod tune {
     #[inline]
     pub fn home_check_unlocked() -> bool {
         get(178) != 0
+    }
+
+    /// Read-only unbounded pointer bindings whose mapping ends within this
+    /// many bytes of their base are placed as sized read-only buffers of
+    /// that size (batch-start copies, mirrors) instead of read in place
+    /// across PCIe (0: never, the default).
+    #[inline]
+    pub fn pre_unsized() -> u64 {
+        get(179)
+    }
+
+    /// A write-watched home's check for CPU writes covers the 2 MiB windows
+    /// of the binding that needs it (`homes::CHECK_WIN`; 0: the whole home
+    /// at once, as before).
+    #[inline]
+    pub fn home_check_win() -> bool {
+        get(180) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
