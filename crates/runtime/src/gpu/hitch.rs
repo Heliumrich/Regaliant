@@ -109,6 +109,10 @@ struct State {
     /// of the window's frames.
     gpu_recent: VecDeque<u32>,
     gpu_window: Vec<u32>,
+    /// The window's GPU time per queue and per (queue, batch kind), summed
+    /// over its frames (us; spans clipped to their frame).
+    window_queues: Option<std::collections::HashMap<u8, u64>>,
+    window_kinds: Option<std::collections::HashMap<(u8, u64), u64>>,
     /// Per queue and batch kind (`GpuSpan::key`), the running mean of its
     /// GPU time per frame (us).
     kind_mean: Option<std::collections::HashMap<(u8, u64), f64>>,
@@ -128,6 +132,8 @@ static STATE: Mutex<State> = Mutex::new(State {
     pending: VecDeque::new(),
     gpu_recent: VecDeque::new(),
     gpu_window: Vec::new(),
+    window_queues: None,
+    window_kinds: None,
     kind_mean: None,
 });
 
@@ -252,6 +258,16 @@ fn take_pending(s: &mut State) {
         } else {
             Vec::new()
         };
+        if s.gpu_window.len() < 1 << 20 {
+            let wq = s.window_queues.get_or_insert_with(std::collections::HashMap::new);
+            for (&(q, _), &t) in &kinds {
+                *wq.entry(q).or_default() += t;
+            }
+            let wk = s.window_kinds.get_or_insert_with(std::collections::HashMap::new);
+            for (&k, &t) in &kinds {
+                *wk.entry(k).or_default() += t;
+            }
+        }
         let means = s.kind_mean.get_or_insert_with(std::collections::HashMap::new);
         for (k, m) in means.iter_mut() {
             *m *= 1.0 - KIND_ALPHA;
@@ -307,7 +323,42 @@ pub fn gpu_window_clause() -> String {
     v.sort_unstable();
     let n = v.len();
     let pct = |q: f64| v[((q / 100.0 * n as f64).ceil() as usize).clamp(1, n) - 1] as f64 / 1e3;
-    format!("; GPU busy per frame ms p50 {:.1}, p90 {:.1}, max {:.1} ({n} frames)", pct(50.0), pct(90.0), v[n - 1] as f64 / 1e3)
+    // Mean GPU time per frame by queue, and the batch kinds that took most
+    // (spans of the copy and upload queues overlap the others').
+    let per = |t: u64| t as f64 / n as f64 / 1e3;
+    let wq = s.window_queues.take().unwrap_or_default();
+    let wk = s.window_kinds.take().unwrap_or_default();
+    let names = s.queues.clone();
+    let qname = |i: u8| names.get(i as usize).map_or("?".to_string(), |x| x.clone());
+    // The parallel workers' chunk batches as one.
+    let mut by_name: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for (i, t) in wq {
+        let n = qname(i);
+        let n = if n.starts_with("gpu-gfx-par") { "gpu-gfx-par".to_string() } else { n };
+        *by_name.entry(n).or_default() += t;
+    }
+    let mut q: Vec<(String, u64)> = by_name.into_iter().collect();
+    q.sort_by(|a, b| b.1.cmp(&a.1));
+    let queues: Vec<String> = q.iter().map(|(n, t)| format!("{n} {:.1}", per(*t))).collect();
+    let mut k: Vec<((u8, u64), u64)> = wk.into_iter().collect();
+    k.sort_by(|a, b| b.1.cmp(&a.1));
+    let kinds: Vec<String> = k
+        .iter()
+        .take(8)
+        .map(|&((i, key), t)| {
+            let qn = qname(i);
+            let kn = if qn == "uploads" { "texture uploads".to_string() } else { super::exec::batch_key_name(key) };
+            format!("{qn} {kn} {:.2}", per(t))
+        })
+        .collect();
+    format!(
+        "; GPU busy per frame ms p50 {:.1}, p90 {:.1}, max {:.1} ({n} frames); GPU ms per frame by queue: {}; by batch kind: {}",
+        pct(50.0),
+        pct(90.0),
+        v[n - 1] as f64 / 1e3,
+        queues.join(", "),
+        kinds.join(", ")
+    )
 }
 
 /// The clock the presented flips are timed with (us since start).
