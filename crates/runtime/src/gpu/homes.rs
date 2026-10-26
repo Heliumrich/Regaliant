@@ -855,7 +855,69 @@ pub fn overlaps(base: u64, size: u64) -> bool {
 /// copied in at its first use.
 pub fn create(base: u64, size: u64) -> bool {
     let (b, e) = (base & !0xFFF, (base + size).next_multiple_of(0x1000));
+    if super::tune::home_cpu_check() && !cpu_clean(b, e - b) {
+        return false;
+    }
     create_with(b, e - b, super::tune::homes_watch(), false, "")
+}
+
+/// Frames a home candidate is watched for CPU writes before it is made
+/// (`tune home_cpu_check`).
+const CPU_OBSERVE: u64 = 30;
+/// Frames a range the CPU wrote stays without a home.
+const CPU_REFUSE: u64 = 600;
+/// Candidates being watched: (base, size, the frame of their first take).
+static CPU_WATCHING: Mutex<Vec<(u64, u64, u64)>> = Mutex::new(Vec::new());
+/// Ranges refused: (base, size, until frame).
+static CPU_REFUSED: Mutex<Vec<(u64, u64, u64)>> = Mutex::new(Vec::new());
+/// Homes refused because the CPU wrote their range while it was watched.
+pub static REFUSED_CPU: AtomicU64 = AtomicU64::new(0);
+
+/// `tune home_cpu_check`: whether [b, b+n) may get a home: its write marks
+/// are taken at the first request (writes from before), and again
+/// CPU_OBSERVE frames later; the CPU writing an interior page meanwhile
+/// refuses it for CPU_REFUSE frames (a home over memory the title writes is
+/// checked and copied in every epoch: 2026-10-26, a 63 MiB pool made the
+/// vista 3-10% slower with homes for reads).
+fn cpu_clean(b: u64, n: u64) -> bool {
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    if CPU_REFUSED.lock().iter().any(|&(rb, rn, until)| rb < b + n && b < rb + rn && frame < until) {
+        return false;
+    }
+    if overlaps(b, n) {
+        return true;
+    }
+    let first = {
+        let mut w = CPU_WATCHING.lock();
+        match w.iter().find(|x| x.0 == b && x.1 == n) {
+            Some(x) if frame < x.2 + CPU_OBSERVE => return false,
+            Some(x) => Some(x.2),
+            None => {
+                if w.len() >= 32 {
+                    w.remove(0);
+                }
+                w.push((b, n, frame));
+                None
+            }
+        }
+    };
+    let mut pages = Vec::new();
+    let taken = super::precache::take_written_for(b, n, &mut pages, None, 5);
+    if first.is_none() {
+        // Writes from before the watch started.
+        return false;
+    }
+    CPU_WATCHING.lock().retain(|x| !(x.0 == b && x.1 == n));
+    let interior = pages.iter().filter(|&&p| p >= b && p + 4096 <= b + n).count();
+    if taken.is_some() && interior == 0 {
+        return true;
+    }
+    let mut r = CPU_REFUSED.lock();
+    r.retain(|x| x.2 > frame);
+    r.push((b, n, frame + CPU_REFUSE));
+    REFUSED_CPU.fetch_add(1, Ordering::Relaxed);
+    crate::info!("gpu: no home for {b:#x}+{n:#x} for {CPU_REFUSE} frames: the CPU wrote {interior} of its pages while it was watched");
+    false
 }
 
 /// A home of exactly [b, b+n) (`watched`: checked for CPU writes, see
@@ -1022,8 +1084,9 @@ pub fn take_all() -> Vec<(u64, u64, Arc<HomeBuf>, u64)> {
 
 pub fn status() -> String {
     format!(
-        "    video-memory homes: {} created, {} dropped, {} MiB; {} bindings, {} bytes copied in, {} write-backs ({} KiB), {} partial overlaps ({} of them written: copied in again), {} refused for reads over command buffers or labels, {} unbounded pointer bindings over homes ({} based inside one, {} with GPU-written parts not yet in guest memory within 4 KiB of their base, {} written back first), {} image uploads over GPU-written home data not in guest memory ({} reloads of overwritten images written back first); write-watched: {} checks ({} ms), {} bytes the CPU changed ({} of them by guest code in homes watched for `homes_watch`), {} written pages covered in part, {} pages other takes found written handed over\n",
+        "    video-memory homes: {} created, {} refused (the CPU wrote them), {} dropped, {} MiB; {} bindings, {} bytes copied in, {} write-backs ({} KiB), {} partial overlaps ({} of them written: copied in again), {} refused for reads over command buffers or labels, {} unbounded pointer bindings over homes ({} based inside one, {} with GPU-written parts not yet in guest memory within 4 KiB of their base, {} written back first), {} image uploads over GPU-written home data not in guest memory ({} reloads of overwritten images written back first); write-watched: {} checks ({} ms), {} bytes the CPU changed ({} of them by guest code in homes watched for `homes_watch`), {} written pages covered in part, {} pages other takes found written handed over\n",
         CREATED.load(Ordering::Relaxed),
+        REFUSED_CPU.load(Ordering::Relaxed),
         DROPPED.load(Ordering::Relaxed),
         USED.load(Ordering::Relaxed) >> 20,
         BINDINGS.load(Ordering::Relaxed),

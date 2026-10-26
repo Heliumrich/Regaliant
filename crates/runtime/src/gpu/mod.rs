@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 174] = [
+    static ALL: [Tunable; 175] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -207,6 +207,7 @@ pub mod tune {
         Tunable { name: "acb_cpus", env: "DS_ACB_CPUS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "host_census", env: "DS_HOST_CENSUS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_protect", env: "DS_PRE_PROTECT", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "home_cpu_check", env: "DS_HOME_CPU_CHECK", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1894,6 +1895,13 @@ pub mod tune {
     #[inline]
     pub fn pre_protect() -> bool {
         get(173) != 0
+    }
+
+    /// Homes (`homes::create`) only over ranges the CPU did not write while
+    /// they were watched for 30 frames; refused ones wait 600 frames.
+    #[inline]
+    pub fn home_cpu_check() -> bool {
+        get(174) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
