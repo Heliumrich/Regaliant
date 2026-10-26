@@ -2552,6 +2552,29 @@ fn scratch_buffer() -> Option<vk::Buffer> {
     *SCRATCH.get_or_init(|| ctx().device_buffer(SCRATCH_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER).ok().map(|(b, _)| b))
 }
 
+/// `DS_TRACE_BINDS=<hex address>[-<hex end>]`: each buffer binding over the
+/// range, once per (shader, written, unbounded, placement): who reads and
+/// writes a buffer, and where it was placed.
+fn trace_bind(queue: &str, shader: u64, base: u64, size: u64, written: bool, unbounded: bool, placement: Placement) {
+    static AT: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    let (at, end) = *AT.get_or_init(|| {
+        let v = std::env::var("DS_TRACE_BINDS").unwrap_or_default();
+        let num = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+        match v.split_once('-') {
+            Some((lo, hi)) => (num(lo).unwrap_or(0), num(hi).unwrap_or(0)),
+            None => num(&v).map_or((0, 0), |x| (x, x + 1)),
+        }
+    });
+    if at == 0 || base >= end || base.saturating_add(size) <= at {
+        return;
+    }
+    static SEEN: Mutex<Option<HashSet<(u64, bool, bool, u8)>>> = Mutex::new(None);
+    let key = (shader, written, unbounded, placement as u8);
+    if SEEN.lock().get_or_insert_with(HashSet::new).insert(key) {
+        crate::info!("gpu[{queue}]: binding {base:#x}+{size:#x} of shader {shader:#x}: {}{}, placed {placement:?} (flip {})", if written { "written" } else { "read" }, if unbounded { ", unbounded pointer" } else { "" }, super::FRAMES.load(Ordering::Relaxed));
+    }
+}
+
 /// Buffer placements and workgroups per compute shader (DS_PROFILE_GPU=1).
 #[derive(Default)]
 struct ShaderPlacements {
@@ -10717,6 +10740,7 @@ impl Exec {
                         if profiling() {
                             bound.placements.push((placement, bound_size, found.tr.plan.resources[i].written));
                         }
+                        trace_bind(&self.name, p.addr, base, size, found.tr.plan.resources[i].written, matches!(found.resources[i], Resolved::Global(_, None)), placement);
                         if super::smalltrack::on() {
                             let k = PLACEMENTS.iter().position(|&x| x == placement).unwrap_or(7);
                             super::smalltrack::bound(base, size, found.tr.plan.resources[i].written, k, &self.name, p.addr, matches!(found.resources[i], Resolved::Global(_, None)));
