@@ -342,6 +342,7 @@ pub fn enabled() -> bool {
                 crate::info!("gpu: executing compute dispatches on Vulkan (DS_GPU=1)");
                 super::resident::init();
                 super::resident::section_test_maybe();
+                super::resident::protect_test_maybe();
                 true
             }
             Err(e) => {

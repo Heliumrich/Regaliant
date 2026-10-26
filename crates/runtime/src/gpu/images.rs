@@ -957,6 +957,20 @@ static UPLOAD_SPLIT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::ato
 /// operating system (`mem::table_view_held`).
 static UPLOAD_TABLE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Hashes of (index, guest address, bytes) parts, `threads` groups at a
+/// time on the helper pool (`pool`).
+fn hash_parts(todo: &[(usize, u64, u64)], threads: usize) -> Vec<(usize, u64)> {
+    let per = todo.len().div_ceil(threads.max(1)).max(1);
+    let out: Vec<std::sync::atomic::AtomicU64> = todo.iter().map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    super::pool::for_each(todo.len().div_ceil(per), &|c| {
+        for k in c * per..((c + 1) * per).min(todo.len()) {
+            let (_, a, n) = todo[k];
+            out[k].store(hash_bytes(a, n as usize), std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    todo.iter().zip(out).map(|(t, h)| (t.0, h.into_inner())).collect()
+}
+
 /// Hash of `n` bytes at `a` (four independent lanes over 64-bit words).
 fn hash_bytes(a: u64, n: usize) -> u64 {
     let mut h = [0x9E37_79B9_7F4A_7C15u64, 0xC2B2_AE3D_27D4_EB4F, 0x1656_67B1_9E37_79F9, 0x27D4_EB2F_1656_67C5];
@@ -1824,13 +1838,8 @@ impl Images {
                 .collect();
             let bytes: u64 = todo.iter().map(|x| x.2).sum();
             pre_hash = vec![SUB_NONE; n_sub];
-            let threads = if bytes >= 1 << 20 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8) } else { 1 };
-            let per = todo.len().div_ceil(threads.max(1)).max(1);
-            let hashed: Vec<(usize, u64)> = std::thread::scope(|sc| {
-                let handles: Vec<_> = todo.chunks(per).map(|c| sc.spawn(move || c.iter().map(|&(i, a, n)| (i, hash_bytes(a, n as usize))).collect::<Vec<_>>())).collect();
-                handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
-            });
-            for (i, h) in hashed {
+            let threads = if bytes >= 1 << 20 { super::pool::threads() } else { 1 };
+            for (i, h) in hash_parts(&todo, threads) {
                 pre_hash[i] = h;
             }
         }
@@ -2000,7 +2009,7 @@ impl Images {
             }
         }
         if small_bytes >= 1 << 20 {
-            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
+            let threads = super::pool::threads();
             // Disjoint destination slices, handed out in order of offset.
             let mut rest: &mut [u8] = &mut dst[..];
             let mut base = 0usize;
@@ -2015,13 +2024,10 @@ impl Images {
                 jobs[k % threads].push((mip, layer, mine));
             }
             let lay = &lay;
-            std::thread::scope(|s| {
-                for job in jobs {
-                    s.spawn(move || {
-                        for (mip, layer, out) in job {
-                            lay.detile_into(src, mip, layer, out);
-                        }
-                    });
+            let jobs: Vec<parking_lot::Mutex<Vec<(usize, u32, &mut [u8])>>> = jobs.into_iter().map(parking_lot::Mutex::new).collect();
+            super::pool::for_each(jobs.len(), &|k| {
+                for (mip, layer, out) in jobs[k].lock().iter_mut() {
+                    lay.detile_into(src, *mip, *layer, out);
                 }
             });
         }
@@ -2037,13 +2043,8 @@ impl Images {
                     (mip * layers as usize + layer as usize, t.base + s, n)
                 })
                 .collect();
-            let threads = if detiled >= 1 << 20 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8) } else { 1 };
-            let per = todo.len().div_ceil(threads.max(1)).max(1);
-            let hashed: Vec<(usize, u64)> = std::thread::scope(|sc| {
-                let handles: Vec<_> = todo.chunks(per).map(|c| sc.spawn(move || c.iter().map(|&(i, a, n)| (i, hash_bytes(a, n as usize))).collect::<Vec<_>>())).collect();
-                handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
-            });
-            for (i, h) in hashed {
+            let threads = if detiled >= 1 << 20 { super::pool::threads() } else { 1 };
+            for (i, h) in hash_parts(&todo, threads) {
                 sums[i] = h;
             }
         }

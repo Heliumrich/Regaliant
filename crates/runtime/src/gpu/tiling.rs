@@ -203,17 +203,13 @@ impl Layout3d {
         if slice == 0 {
             return;
         }
-        let threads = if dst.len() >= 1 << 20 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8) } else { 1 };
+        let threads = if dst.len() >= 1 << 20 { super::pool::threads() } else { 1 };
         let per = (self.depth as usize).div_ceil(threads.max(1));
         if threads <= 1 || per == 0 {
             self.slices(src, 0, dst);
             return;
         }
-        std::thread::scope(|s| {
-            for (k, chunk) in dst.chunks_mut(per * slice).enumerate() {
-                s.spawn(move || self.slices(src, k * per, chunk));
-            }
-        });
+        super::pool::for_each_chunk_mut(dst, per * slice, &|k, chunk| self.slices(src, k * per, chunk));
     }
 
     /// Detiles whole slices starting at slice `z0` into `out`.
@@ -405,17 +401,13 @@ impl Layout {
         if w == 0 || h == 0 {
             return;
         }
-        let threads = if dst.len() >= 1 << 20 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8) } else { 1 };
+        let threads = if dst.len() >= 1 << 20 { super::pool::threads() } else { 1 };
         if threads <= 1 {
             self.detile_rows(src, m, slice, 0, dst);
             return;
         }
         let rows = h.div_ceil(threads);
-        std::thread::scope(|s| {
-            for (k, chunk) in dst.chunks_mut(rows * w * e).enumerate() {
-                s.spawn(move || self.detile_rows(src, m, slice, k * rows, chunk));
-            }
-        });
+        super::pool::for_each_chunk_mut(dst, rows * w * e, &|k, chunk| self.detile_rows(src, m, slice, k * rows, chunk));
     }
 
     /// Detiles whole rows starting at row `y0` into `out`.

@@ -1541,6 +1541,118 @@ fn section_test() -> Result<String, String> {
     }
 }
 
+/// Whether changing the protection of host pages the GPU imports, as guest
+/// memory is imported, disturbs the GPU (`DS_PROTECT_TEST=1`, at the first
+/// GPU use). Write tracking by protection (`track`, DS_TRACK) lost the
+/// device in 3 of 5 runs, but it took its faults inside the title's code,
+/// which overwrites the title's values below its stack pointer (FINDINGS.md
+/// 2026-10-23, 2026-10-26): this separates the two. A 64 MiB region
+/// allocated as guest memory is (write-watched) is imported; for 2,000
+/// rounds the GPU fills parts of it and copies out of other parts while a
+/// second thread keeps switching those parts between read-only, no-access
+/// and read-write; then every part is checked, and the write marks of the
+/// GPU's writes are counted (none expected: the GPU does not set them).
+pub fn protect_test_maybe() {
+    if std::env::var("DS_PROTECT_TEST").ok().as_deref() != Some("1") {
+        return;
+    }
+    match protect_test() {
+        Ok(s) => crate::info!("protect test passed: {s}"),
+        Err(e) => crate::error!("protect test failed: {e}"),
+    }
+}
+
+fn protect_test() -> Result<String, String> {
+    use windows_sys::Win32::System::Memory::{GetWriteWatch, VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE};
+    const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+    const PART: usize = 1 << 20;
+    const PARTS: usize = 64;
+    const ROUNDS: u32 = 2000;
+    let size = PART * PARTS;
+    let c = ctx();
+    let base = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+    if base == 0 {
+        return Err("VirtualAlloc failed".into());
+    }
+    let part = |p: usize| unsafe { std::slice::from_raw_parts_mut((base + p * PART) as *mut u32, PART / 4) };
+    for p in 0..PARTS {
+        part(p).fill(0x1000_0000 + p as u32);
+    }
+    let (buf, mem, _) = match c.import_host(base as u64, size as u64, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER) {
+        Ok(x) => x,
+        Err(e) => {
+            unsafe { VirtualFree(base as _, 0, MEM_RELEASE) };
+            return Err(format!("import: {e}"));
+        }
+    };
+    // Write marks so far (the CPU's pattern) are taken first.
+    let marks = || -> usize {
+        let mut addrs = vec![std::ptr::null_mut::<std::ffi::c_void>(); PARTS * PART / 4096];
+        let (mut n, mut gran) = (addrs.len(), 0u32);
+        unsafe { GetWriteWatch(1, base as _, size, addrs.as_mut_ptr(), &mut n, &mut gran) };
+        n
+    };
+    let cpu_marks = marks();
+    let stop = AtomicBool::new(false);
+    let toggles = AtomicU64::new(0);
+    let gpu = std::thread::scope(|s| {
+        // Parts 32..64: switched between protections all along; the GPU
+        // fills the even ones and copies out of the odd ones.
+        s.spawn(|| {
+            let mut i = 0usize;
+            let mut old = 0u32;
+            while !stop.load(Ordering::Relaxed) {
+                let prot = [PAGE_READONLY, PAGE_NOACCESS, PAGE_READWRITE][i % 3];
+                unsafe { VirtualProtect((base + (32 + (i / 3) % 32) * PART) as _, PART, prot, &mut old) };
+                i += 1;
+                toggles.fetch_add(1, Ordering::Relaxed);
+                if i % 64 == 0 {
+                    std::thread::yield_now();
+                }
+            }
+        });
+        let r = (|| -> Result<(), String> {
+            for round in 0..ROUNDS {
+                let k = round as usize % 16;
+                one_off(|cmd| unsafe {
+                    c.device.cmd_fill_buffer(cmd, buf, ((32 + 2 * k) * PART) as u64, PART as u64, round);
+                    let copy = vk::BufferCopy { src_offset: ((33 + 2 * k) * PART) as u64, dst_offset: (k * PART) as u64, size: PART as u64 };
+                    c.device.cmd_copy_buffer(cmd, buf, buf, &[copy]);
+                })
+                .map_err(|e| format!("round {round}: {e}"))?;
+            }
+            Ok(())
+        })();
+        stop.store(true, Ordering::Relaxed);
+        r
+    });
+    let mut old = 0u32;
+    unsafe { VirtualProtect(base as _, size, PAGE_READWRITE, &mut old) };
+    let gpu_marks = marks();
+    let r = gpu.and_then(|_| {
+        for k in 0..16usize {
+            let last = (0..ROUNDS).rev().find(|r| *r as usize % 16 == k).unwrap();
+            if let Some(i) = part(32 + 2 * k).iter().position(|&w| w != last) {
+                return Err(format!("part {} word {i}: {:#x}, not the last fill {last:#x}", 32 + 2 * k, part(32 + 2 * k)[i]));
+            }
+            let want = 0x1000_0000 + (33 + 2 * k) as u32;
+            if let Some(i) = part(k).iter().position(|&w| w != want) {
+                return Err(format!("part {k} word {i}: {:#x}, not the copy of {want:#x}", part(k)[i]));
+            }
+        }
+        Ok(format!(
+            "{ROUNDS} rounds of GPU fills into and copies out of imported pages while {} protection changes switched them between read-only, no-access and read-write; contents right, no device loss; write marks: {cpu_marks} pages after the CPU's writes, {gpu_marks} after the GPU's",
+            toggles.load(Ordering::Relaxed)
+        ))
+    });
+    unsafe {
+        c.device.destroy_buffer(buf, None);
+        c.device.free_memory(mem, None);
+        VirtualFree(base as _, 0, MEM_RELEASE);
+    }
+    r
+}
+
 /// Status line.
 pub fn status() -> String {
     let v: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
