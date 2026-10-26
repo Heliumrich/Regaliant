@@ -830,6 +830,7 @@ fn revalidate_spans() {
     }
     let generation = SPAN_GEN.fetch_add(1, Ordering::AcqRel) + 1;
     drop(g);
+    let reimport: Vec<(u64, u64)> = if super::pagetable::made() { dead.iter().map(|d| (d.start, d.end)).collect() } else { Vec::new() };
     if !dead.is_empty() {
         let mut gy = GRAVEYARD.lock();
         gy.extend(dead.into_iter().map(|mut span| {
@@ -839,7 +840,37 @@ fn revalidate_spans() {
         }));
         GRAVEYARD_LEN.store(gy.len() as u64, Ordering::Release);
     }
+    // GPU-resolved chains read through the guest page table: a dropped
+    // window's pages still mapped are imported again at once, so that the
+    // table goes from the old window to a new one over the same pages before
+    // the next batch, without clearing them. Batches recorded before the
+    // drop and submitted after it read them through the table (commands bind
+    // windows themselves, and keep the dropped one until they complete).
+    for (s, e) in reimport {
+        let mut a = s;
+        while a < e {
+            // The next usable mapping from `a` on.
+            let next = {
+                let st = crate::mem::MEM.lock();
+                let usable = |p: &crate::mem::Vma| p.kind != crate::mem::VmaKind::Reserved && p.prot != 0;
+                match st.find(a) {
+                    Some(v) if usable(v) => Some(a),
+                    _ => st.vmas.range(a..e).map(|(_, p)| p).find(|p| usable(p)).map(|p| p.start),
+                }
+            };
+            let Some(b) = next else { break };
+            REIMPORTS.fetch_add(1, Ordering::Relaxed);
+            a = match import_span(b, 4) {
+                Some((_, _, end)) if end > b => end,
+                _ => (b & !(WINDOW - 1)) + WINDOW,
+            };
+        }
+    }
 }
+
+/// Import windows made again right after their window was dropped
+/// (`revalidate_spans`, with the guest page table).
+pub static REIMPORTS: AtomicU64 = AtomicU64::new(0);
 
 /// In-place bindings with residency on (they import their pages): by
 /// [written, unsized] and size bucket (<64K, <1M, <16M, more): [bindings,
@@ -6336,6 +6367,15 @@ struct GpuRun {
 /// GPU-resolved commands: [appended to a run, refused (run roots differ),
 /// refused (other: no run, state, room), pages imported for them].
 pub static GPU_APPENDS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// GPU-resolved draws (`draw::draw_gpu_append`): [appended to a run, not
+/// appended because run roots differ, indices elsewhere than the run's
+/// buffer, other (no run, state, pending image work, room)].
+pub static GPU_DRAW_APPENDS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// GPU-resolved commands not appended because a formatted per-item buffer's
+/// V# had another format or swizzle than their translation's.
+pub static GPU_FORMAT_MISSES: AtomicU64 = AtomicU64::new(0);
+/// `DS_GPU_VERIFY=1`: [appended draws verified, of them with differences].
+pub static GPU_VERIFY: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Diagnosis of GPU-resolved commands recorded in full (`gpu_res_check`):
 /// what their shader-resolved reads overlap that the CPU path would have
@@ -6354,7 +6394,7 @@ fn gpu_run_regs(cp: &Cp) -> [u32; 6] {
 static DROP_GEN: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
-    /// GPU-resolved resources whose ranges were imported: (program,
+    /// GPU-resolved resources whose ranges were imported: (translation key,
     /// resource, its root's pointer) -> `DROP_GEN` then.
     static GPU_IMPORTED: std::cell::RefCell<HashMap<(u64, u8, u64), u64>> = std::cell::RefCell::new(HashMap::new());
 }
@@ -6362,7 +6402,9 @@ thread_local! {
 /// Makes sure the ranges a GPU-resolved command's shader-resolved buffers
 /// reach are imported (in the guest page table): per root pointer met the
 /// first time, the V# read from guest memory and its range imported.
-/// False: one cannot be read or imported.
+/// False: one cannot be read or imported, or a formatted one's V# has
+/// another format or swizzle than the translation was made for (its loads
+/// decode with that one: the vertex formats of a draw run's meshes differ).
 fn gpu_res_imported(found: &shaders::Found, addr: u64, mask: u64, user: &[u32]) -> bool {
     let plan = &found.tr.plan;
     let generation = DROP_GEN.load(Ordering::Acquire);
@@ -6371,12 +6413,24 @@ fn gpu_res_imported(found: &shaders::Found, addr: u64, mask: u64, user: &[u32]) 
             continue;
         }
         let Some(root) = super::gpures::root_of_res(&plan.resources[r]) else { continue };
+        // A V# in the user data itself (its root value is only its base), or
+        // one with words of several origins: read again every time.
+        let direct = plan.resources[r].dwords.iter().any(|p| matches!(p, rdna::analysis::Prov::User(_))) || super::gpures::res_roots(&plan.resources[r]).is_none_or(|v| v.len() > 1);
         let rv = super::gpures::root_value(root, user);
-        let key = (addr, r as u8, rv);
-        if GPU_IMPORTED.with(|c| c.borrow().get(&key) == Some(&generation)) {
+        // Per translation: a formatted buffer's check depends on its format.
+        let key = (found.tr.key, r as u8, rv);
+        if !direct && GPU_IMPORTED.with(|c| c.borrow().get(&key) == Some(&generation)) {
             continue;
         }
         let Some(v) = shaders::resource_vsharp(addr, plan, r, user) else { return false };
+        if plan.resources[r].formatted {
+            if let Some(rdna::translate::ResSpec::Buffer { format, dst_sel }) = found.tr.spec.resources.get(r) {
+                if v.format != *format || v.dst_sel != *dst_sel {
+                    GPU_FORMAT_MISSES.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+            }
+        }
         let n = v.extent();
         if n > 0 && v.base != 0 {
             // Within its mapping (unbounded descriptors reach far past it).
@@ -6390,6 +6444,31 @@ fn gpu_res_imported(found: &shaders::Found, addr: u64, mask: u64, user: &[u32]) 
             // Static data the shader reads: into the mirror (`gmirror`).
             super::gmirror::want(v.base, n);
             GPU_APPENDS[3].fetch_add(1, Ordering::Relaxed);
+        }
+        GPU_IMPORTED.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() > 1 << 16 {
+                c.clear();
+            }
+            c.insert(key, generation);
+        });
+    }
+    // The scalar loads the shader resolves: the range each reads (at an
+    // offset from its pointer, perhaps through a pointer read from the
+    // item), once per root pointer value.
+    let loads = found.tr.spec.gpu_loads;
+    for k in 0..plan.loads.len().min(64) {
+        if loads & (1u64 << k) == 0 {
+            continue;
+        }
+        let rv = super::gpures::root_value(super::gpures::root_of_ptr(&plan.loads[k].ptr).unwrap_or((0, None)), user);
+        let key = (found.tr.key, 64 + k as u8, rv);
+        if GPU_IMPORTED.with(|c| c.borrow().get(&key) == Some(&generation)) {
+            continue;
+        }
+        let Some((a, n)) = shaders::load_range(addr, plan, k, user) else { return false };
+        if a != 0 && super::cp::guest_readable(a, n) && span(a, n).is_none() {
+            return false;
         }
         GPU_IMPORTED.with(|c| {
             let mut c = c.borrow_mut();

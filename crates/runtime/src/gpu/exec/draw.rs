@@ -1073,8 +1073,18 @@ impl Exec {
         // multi-draw (`DrawRun`). Rect lists (a geometry stage) and draws
         // whose arguments the GPU reads stay as they are.
         let vs_addr = shaders::ngg_addr(cp);
-        let batch_on = ps_addr != 0 && gpu.is_none() && !rect && self.recording && !sync_mode() && super::super::tune::batch_draws();
-        if batch_on {
+        // GPU-resolved draws (`gpures`, stage G4): a pair whose per-item
+        // chains the shaders resolve runs batched, its draws after a run's
+        // first appended with their user data alone (no preparation).
+        let direct = ps_addr != 0 && gpu.is_none() && !rect && self.recording && !sync_mode();
+        let mut gpu_pair = if direct && super::super::tune::gpu_chains() != 0 { super::super::gpures::draw_decided(vs_addr, ps_addr) } else { None };
+        if gpu_pair.is_some() && self.draw_same {
+            if let Some(drawn) = self.draw_gpu_append(cp, a, vs_addr, ps_addr)? {
+                return Ok(drawn);
+            }
+        }
+        let batch_on = direct && (super::super::tune::batch_draws() || gpu_pair.is_some());
+        if batch_on && super::super::tune::batch_draws() {
             if self.draw_same && self.draw_streak.0 == (vs_addr, ps_addr) {
                 self.draw_streak.1 += 1;
                 if self.draw_streak.1 == DRAW_STREAK {
@@ -1084,8 +1094,10 @@ impl Exec {
                 self.draw_streak = ((vs_addr, ps_addr), 1);
             }
         }
-        let mut batched = batch_on && shaders::draw_batchable(vs_addr, ps_addr);
+        let mut batched = batch_on && (gpu_pair.is_some() || shaders::draw_batchable(vs_addr, ps_addr));
         let mut batched_guard = shaders::batched_draw(batched);
+        let gpu_masks = gpu_pair.as_ref().filter(|_| batched).map(|d| [(d.stages[0].gpu_loads, d.stages[0].gpu_res), (d.stages[1].gpu_loads, d.stages[1].gpu_res)]);
+        let masks_guard = shaders::gpu_draw_masks(gpu_masks);
         let prep_vs = |cp: &Cp| match base_slot {
             Some(s) => shaders::with_base_instance(s, || shaders::prepare_ngg(cp)),
             None => shaders::prepare_ngg(cp),
@@ -1143,6 +1155,32 @@ impl Exec {
             };
             if let Some(why) = why {
                 shaders::refuse_draw_batchable(vs_addr, ps_addr, why);
+                if gpu_pair.take().is_some() {
+                    super::super::gpures::refuse_draw((vs_addr, ps_addr), why);
+                }
+                batched = false;
+                drop(batched_guard);
+                batched_guard = shaders::batched_draw(false);
+                vs = prep_vs(cp)?;
+                ps = Some(shaders::prepare_ps(cp)?);
+            }
+        }
+        // A GPU-resolved pair's draw recorded in full (a run's first): what
+        // its per-item chains start from and reach goes into the page table,
+        // and their data must be guest memory as the CPU path would bind it
+        // (else the pair keeps CPU-resolved chains, this draw included).
+        if let (true, Some(d)) = (batched, gpu_pair.as_ref()) {
+            let p = ps.as_ref().unwrap();
+            let mut why = None;
+            for (k, st) in [&vs, p].into_iter().enumerate() {
+                if !super::gpu_pages_mapped(&d.stages[k].item_roots, &st.user) || !super::gpu_res_imported(&st.found, st.addr, st.tr.spec.gpu_res, &st.user) {
+                    why = Some("its per-item chains reach memory that cannot be imported".to_string());
+                }
+            }
+            why = why.or_else(|| self.gpu_draw_check(&vs, p));
+            if let Some(why) = why {
+                super::super::gpures::refuse_draw((vs_addr, ps_addr), &why);
+                gpu_pair = None;
                 batched = false;
                 drop(batched_guard);
                 batched_guard = shaders::batched_draw(false);
@@ -1175,9 +1213,18 @@ impl Exec {
             ps = if ps_addr != 0 { Some(shaders::prepare_ps(cp)?) } else { None };
         }
         drop(batched_guard);
+        drop(masks_guard);
         lap.mark(2);
-        // A batched draw right after the last one of its run: appended.
-        if batched && self.draw_same {
+        // Pairs not decided yet: learned from the draws the CPU resolves.
+        if direct && gpu_pair.is_none() && super::super::tune::gpu_chains() != 0 {
+            if let Some(p) = &ps {
+                let continues = self.draw_same && (self.batch_count, self.cmd_uses.get()) == self.last_draw_end;
+                super::super::gpures::observe_draw((vs.addr, p.addr), [(&vs.tr.plan, &vs.user[..]), (&p.tr.plan, &p.user[..])], continues);
+            }
+        }
+        // A batched draw right after the last one of its run: appended
+        // (a GPU-resolved pair's draws append before preparation, above).
+        if batched && self.draw_same && gpu_pair.is_none() {
             if let Some(drawn) = self.draw_append(cp, a, &mut vs, ps.as_mut().unwrap(), patches.as_deref())? {
                 return Ok(drawn);
             }
@@ -1967,7 +2014,14 @@ impl Exec {
             };
             if let Some(index) = run_index {
                 let appendable = !(clear_z || clear_s);
-                self.draw_run_open(cmd, layout, a, base_vertex, index, sgpr_ring, sgpr_at, appendable, &vs, ps.as_ref().unwrap())?;
+                // A GPU-resolved pair's run: its later draws are appended from
+                // this draw's bound SGPR data (not when the batch's prologue
+                // patches that data: appended copies would miss the patch).
+                let gpu_run = match (&gpu_pair, &patches) {
+                    (Some(d), None) => Some(Box::new(GpuDrawRun::new((vs_addr, ps_addr), d, &vs, ps.as_ref().unwrap(), [cp.reg(Space::Sh, 0x8B), cp.reg(Space::Sh, 0x0B)], base_slot))),
+                    _ => None,
+                };
+                self.draw_run_open(cmd, layout, a, base_vertex, index, sgpr_ring, sgpr_at, appendable, &vs, ps.as_ref().unwrap(), gpu_run)?;
             } else {
             match a.index {
                 Some((_, size)) if snap.is_some() => {
@@ -2080,6 +2134,13 @@ impl Exec {
     }
 }
 
+/// `DS_GPU_VERIFY=1`: GPU-resolved draws appended are also prepared in
+/// full and compared (`Exec::gpu_draw_verify`; diagnosis).
+fn gpu_verify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_GPU_VERIFY").ok().as_deref() == Some("1"))
+}
+
 /// Draws of a pair with the same context state in a row that make it
 /// batchable (`tune batch_draws`).
 const DRAW_STREAK: u32 = 4;
@@ -2108,6 +2169,50 @@ pub(crate) struct DrawRun {
     /// The stages' translations and image resources.
     tr: [usize; 2],
     images: Vec<shaders::Resolved>,
+    /// A GPU-resolved pair's run (`draw_gpu_append`).
+    gpu: Option<Box<GpuDrawRun>>,
+}
+
+/// A GPU-resolved pair's open run (`gpures`, stage G4): per stage (vertex,
+/// pixel) the SGPR data its first draw bound (the run roots' descriptors and
+/// data in it), its user-data dword count and SH register RSRC2, the run
+/// roots with their values, the per-item roots, the preparation (for the
+/// ranges its per-item buffers reach) and the first draw's stages (their
+/// images' pending work is checked per appended draw).
+pub(crate) struct GpuDrawRun {
+    pair: (u64, u64),
+    templates: [Vec<u32>; 2],
+    users: [usize; 2],
+    rsrc2: [u32; 2],
+    roots: [Vec<(super::super::gpures::Root, u64)>; 2],
+    items: [Vec<super::super::gpures::Root>; 2],
+    stages: [Prepared; 2],
+    /// The user-data words the run's own descriptors take as they are
+    /// (`Decided::run_user`), and the first draw's user data.
+    run_user: [u32; 2],
+    first_user: [[u32; 32]; 2],
+    /// The vertex stage's user word that takes the start instance from
+    /// `gl_BaseInstance` (`DrawArgs::base_inst`): its translation reads it
+    /// there, so every draw of the run must.
+    base_inst: Option<u16>,
+}
+
+impl GpuDrawRun {
+    fn new(pair: (u64, u64), d: &super::super::gpures::DrawDecided, vs: &Prepared, ps: &Prepared, rsrc2: [u32; 2], base_inst: Option<u16>) -> GpuDrawRun {
+        let roots = |k: usize, p: &Prepared| d.stages[k].run_roots.iter().map(|&r| (r, super::super::gpures::root_value(r, &p.user))).collect();
+        GpuDrawRun {
+            pair,
+            templates: [vs.sgpr_data.clone(), ps.sgpr_data.clone()],
+            users: [vs.tr.spec.user_sgprs as usize, ps.tr.spec.user_sgprs as usize],
+            rsrc2,
+            roots: [roots(0, vs), roots(1, ps)],
+            items: [d.stages[0].item_roots.clone(), d.stages[1].item_roots.clone()],
+            stages: [vs.clone(), ps.clone()],
+            run_user: [d.stages[0].run_user, d.stages[1].run_user],
+            first_user: [std::array::from_fn(|i| vs.user.get(i).copied().unwrap_or(0)), std::array::from_fn(|i| ps.user.get(i).copied().unwrap_or(0))],
+            base_inst,
+        }
+    }
 }
 
 /// The image and sampler resources of a draw's stages (a run's draws share
@@ -2164,7 +2269,7 @@ impl Exec {
     /// draw's first index its byte offset / size; at its own offset and not
     /// appendable if not a multiple), one indirect-count draw.
     #[allow(clippy::too_many_arguments)]
-    fn draw_run_open(&mut self, cmd: vk::CommandBuffer, layout: vk::PipelineLayout, a: &DrawArgs, base_vertex: i32, index: Option<(vk::Buffer, u64, u32)>, ring: vk::Buffer, at: [u64; 2], appendable: bool, vs: &Prepared, ps: &Prepared) -> Result<(), String> {
+    fn draw_run_open(&mut self, cmd: vk::CommandBuffer, layout: vk::PipelineLayout, a: &DrawArgs, base_vertex: i32, index: Option<(vk::Buffer, u64, u32)>, ring: vk::Buffer, at: [u64; 2], appendable: bool, vs: &Prepared, ps: &Prepared, gpu: Option<Box<GpuDrawRun>>) -> Result<(), String> {
         let which = if self.slots[self.cur].rings[1].is_some_and(|r| r.0 == ring) { 1 } else { 0 };
         let rec = if index.is_some() { 5u64 } else { 4 };
         let mut max = DRAW_RUN_MAX as u64;
@@ -2232,6 +2337,7 @@ impl Exec {
                 appendable,
                 tr: [run_tr(vs), run_tr(ps)],
                 images: run_images(vs, ps),
+                gpu,
             });
         }
         BATCH_DRAWS[0].fetch_add(1, Ordering::Relaxed);
@@ -2239,6 +2345,277 @@ impl Exec {
             BATCH_DRAWS[2].fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// A GPU-resolved pair's draw right after the last draw of its open run
+    /// (`GpuDrawRun`) with the run's context state: when its run roots hold
+    /// the run's values, its per-item chains' pages and ranges are in the
+    /// page table, the run's images have no pending work and its indices lie
+    /// in the run's index buffer, its arguments, table entry and SGPR data
+    /// (the run's first draw's, with its own user data) are appended to the
+    /// run, before any preparation: no stage is resolved, synced or bound on
+    /// the CPU. None: the full path records it (a new run).
+    pub(super) fn draw_gpu_append(&mut self, cp: &Cp, a: &DrawArgs, vs_addr: u64, ps_addr: u64) -> Result<Option<bool>, String> {
+        let Some(mut run) = self.draw_run.take() else { return Ok(None) };
+        let r = self.draw_gpu_append_to(&mut run, cp, a, vs_addr, ps_addr);
+        self.draw_run = Some(run);
+        r
+    }
+
+    fn draw_gpu_append_to(&mut self, r: &mut DrawRun, cp: &Cp, a: &DrawArgs, vs_addr: u64, ps_addr: u64) -> Result<Option<bool>, String> {
+        let stats = &super::GPU_DRAW_APPENDS;
+        let at = (self.batch_count, self.cmd_uses.get());
+        let Some(g) = r.gpu.as_ref() else { return Ok(None) };
+        if g.pair != (vs_addr, ps_addr) || !r.appendable || r.fresh || (r.batch, r.uses) != at || r.n >= r.max || r.index.is_some() != a.index.is_some() || a.gpu_args.is_some() || a.base_inst != g.base_inst || self.rendering.is_none() || self.stopped || [cp.reg(Space::Sh, 0x8B), cp.reg(Space::Sh, 0x0B)] != g.rsrc2 {
+            stats[3].fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+        let vs_user: [u32; 32] = std::array::from_fn(|i| cp.reg(Space::Sh, 0x8C + i as u32));
+        let ps_user: [u32; 32] = std::array::from_fn(|i| cp.reg(Space::Sh, 0x0C + i as u32));
+        let users: [&[u32]; 2] = [&vs_user[..g.users[0].min(32)], &ps_user[..g.users[1].min(32)]];
+        if (0..2).any(|k| g.roots[k].iter().any(|&(root, v)| super::super::gpures::root_value(root, users[k]) != v) || (0..32).any(|j| g.run_user[k] & (1 << j) != 0 && users[k].get(j).copied().unwrap_or(0) != g.first_user[k][j])) {
+            stats[1].fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+        // The guest memory the run's first draw was resolved from, unchanged:
+        // a CP write between draws (no command recorded) rewrites a run root's
+        // block in place (a 4x4 transform at the same pointer, `DS_GPU_VERIFY`),
+        // which the copied SGPR data would miss.
+        if !shaders::words_unchanged(&g.stages[0]) || !shaders::words_unchanged(&g.stages[1]) {
+            stats[1].fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+        for k in 0..2 {
+            let st = &g.stages[k];
+            if !super::gpu_pages_mapped(&g.items[k], users[k]) || !super::gpu_res_imported(&st.found, st.addr, st.tr.spec.gpu_res, users[k]) {
+                stats[3].fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            }
+        }
+        if gpu_verify() {
+            self.gpu_draw_verify(cp, g);
+        }
+        // Pending work on the run's images, as for a batched draw (the
+        // textures' CPU writes were checked by the run's first draw).
+        let mut used = std::mem::take(&mut self.keys_scratch);
+        used.clear();
+        if let Some(rd) = &self.rendering {
+            used.extend(rd.colors.iter().flatten().chain(rd.depth.iter()).map(|t| t.key));
+        }
+        let pending = super::image_hazards(&[&g.stages[0], &g.stages[1]], &mut used);
+        let pending = self.held_hit(&used) || pending;
+        self.keys_scratch = used;
+        if pending {
+            stats[3].fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+        // Indices, placed as the full path places them: in the run's buffer.
+        let base_vertex = a.base_vertex.unwrap_or(ctx_reg(cp, 0x28408) as i32);
+        let first = match a.index {
+            Some((addr, size)) => {
+                let bytes = a.count as u64 * size as u64;
+                let h = self.home_bind(addr, bytes, false, super::HomeUse::Index);
+                if h.is_none() {
+                    self.sync_for(&[(addr, bytes)], SYNC_DRAW_INDICES);
+                }
+                if self.stopped {
+                    return Err(super::STOPPED.into());
+                }
+                if let Some(h) = &h {
+                    if !self.keep_home(h.0, h.3.as_ref()) {
+                        stats[2].fetch_add(1, Ordering::Relaxed);
+                        return Ok(None);
+                    }
+                }
+                self.flush_resident(Some(&[(addr, bytes)]))?;
+                let snap = h.as_ref().map(|h| (h.0, h.1, 0)).or_else(|| self.pre_copy(addr, bytes).or_else(|| self.snapshot(addr, bytes, crate::gpu::tune::snap_index())));
+                let (b, o) = match snap {
+                    Some((b, off, bias)) => (b, off + bias),
+                    None => {
+                        let Some((buffer, start, _)) = super::span(addr, bytes) else {
+                            stats[2].fetch_add(1, Ordering::Relaxed);
+                            return Ok(None);
+                        };
+                        if let Some(s) = super::CP_WRITES.latest(&[(addr, bytes)]) {
+                            self.submit_after = self.submit_after.max(s);
+                        }
+                        (buffer, addr - start)
+                    }
+                };
+                if r.index != Some((b, size)) || o % size as u64 != 0 {
+                    stats[2].fetch_add(1, Ordering::Relaxed);
+                    return Ok(None);
+                }
+                (o / size as u64) as u32
+            }
+            None => 0,
+        };
+        if (self.batch_count, self.cmd_uses.get()) != at || self.rendering.is_none() || self.stopped {
+            stats[3].fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+        // Both stages' SGPR data: the run's first draw's with this draw's
+        // user data, in the run's ring (the stages bind it whole).
+        let which = if self.slots[self.cur].rings[1].is_some_and(|x| x.0 == r.ring) { 1 } else { 0 };
+        let mut items = [0u64; 2];
+        for k in 0..2 {
+            let bytes = 4 * g.templates[k].len() as u64;
+            let Some(off) = self.ring_alloc(which, bytes) else {
+                stats[3].fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            };
+            let Some((ring, rp)) = self.slots[self.cur].rings[which] else { return Ok(None) };
+            if ring != r.ring {
+                stats[3].fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            }
+            unsafe {
+                let dst = rp.add(off as usize) as *mut u32;
+                std::ptr::copy_nonoverlapping(g.templates[k].as_ptr(), dst, g.templates[k].len());
+                std::ptr::copy_nonoverlapping(users[k].as_ptr(), dst, users[k].len().min(g.templates[k].len()));
+            }
+            items[k] = off;
+        }
+        unsafe {
+            let n = r.n as usize;
+            if r.index.is_some() {
+                let e = r.args.add(5 * n);
+                for (k, v) in [a.count, a.instances, first, base_vertex as u32, a.first_instance].into_iter().enumerate() {
+                    e.add(k).write(v);
+                }
+            } else {
+                let e = r.args.add(4 * n);
+                for (k, v) in [a.count, a.instances, base_vertex as u32, a.first_instance].into_iter().enumerate() {
+                    e.add(k).write(v);
+                }
+            }
+            let t = r.table.add(rdna::translate::BATCH_DRAW_ENTRY_DWORDS as usize * n);
+            t.write((items[0] / 4) as u32);
+            t.add(1).write((items[1] / 4) as u32);
+            r.n += 1;
+            r.count.write(r.n);
+        }
+        self.batch_shaders.push(super::DRAW_KEY | ps_addr);
+        stats[0].fetch_add(1, Ordering::Relaxed);
+        DRAWN.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(true))
+    }
+
+    /// `DS_GPU_VERIFY=1` (diagnosis): an appended draw's stages prepared as
+    /// the full path would prepare them, compared with what the append takes
+    /// from the run's first draw: the data of the loads the CPU resolves for
+    /// the run, the run's descriptors, and per item a formatted buffer's
+    /// format and whether its data is GPU-written. The first differences are
+    /// logged with the pair (counted in `GPU_VERIFY`).
+    fn gpu_draw_verify(&mut self, cp: &Cp, g: &GpuDrawRun) {
+        let masks = [(g.stages[0].tr.spec.gpu_loads, g.stages[0].tr.spec.gpu_res), (g.stages[1].tr.spec.gpu_loads, g.stages[1].tr.spec.gpu_res)];
+        let fresh = {
+            let _b = shaders::batched_draw(true);
+            let _m = shaders::gpu_draw_masks(Some(masks));
+            let vs = match g.base_inst {
+                Some(s) => shaders::with_base_instance(s, || shaders::prepare_ngg(cp)),
+                None => shaders::prepare_ngg(cp),
+            };
+            match (vs, shaders::prepare_ps(cp)) {
+                (Ok(v), Ok(p)) => [v, p],
+                _ => return,
+            }
+        };
+        let v = &super::GPU_VERIFY;
+        v[0].fetch_add(1, Ordering::Relaxed);
+        let mut found: Vec<String> = Vec::new();
+        for k in 0..2 {
+            let (first, now) = (&g.stages[k], &fresh[k]);
+            if !std::sync::Arc::ptr_eq(&first.found.tr, &now.found.tr) && first.tr.key != now.tr.key {
+                // Which part of the specialization differs.
+                let (a, b) = (&first.tr.spec, &now.tr.spec);
+                let mut what: Vec<String> = Vec::new();
+                for (i, (x, y)) in a.resources.iter().zip(b.resources.iter()).enumerate() {
+                    if x != y {
+                        what.push(format!("resource {i} {x:?} -> {y:?}{}", if i < 64 && a.gpu_res & (1u64 << i) != 0 { " (per item)" } else { "" }));
+                    }
+                }
+                if a.resources.len() != b.resources.len() {
+                    what.push("resource count".into());
+                }
+                let mut a2 = a.clone();
+                a2.resources = b.resources.clone();
+                if a2 != *b {
+                    what.push(format!("other fields: {a2:?} -> {b:?}"));
+                }
+                found.push(format!("stage {k} ({:#x}) translated differently: {}", first.addr, what.join(", ")));
+                continue;
+            }
+            // Load data the CPU resolves for the run.
+            let mut at = rdna::translate::SGPR_DATA_USER as usize;
+            for (j, l) in first.tr.plan.loads.iter().enumerate() {
+                let n = l.dwords as usize;
+                if j < 64 && first.tr.spec.gpu_loads & (1u64 << j) == 0 {
+                    let (a, b) = (g.templates[k].get(at..at + n), now.sgpr_data.get(at..at + n));
+                    if a != b {
+                        found.push(format!("stage {k} ({:#x}) run load {j} ({:?}+{:#x} x{n}) differs: run {:x?}, now {:x?}", first.addr, l.ptr, l.offset, a, b));
+                    }
+                }
+                at += n;
+            }
+            // The run's descriptors; per-item buffers' formats and data.
+            for (i, (r0, r1)) in first.resources.iter().zip(now.resources.iter()).enumerate() {
+                let item = i < 64 && first.tr.spec.gpu_res & (1u64 << i) != 0;
+                if !item && r0 != r1 {
+                    found.push(format!("stage {k} ({:#x}) run resource {i} differs: run {r0:?}, now {r1:?}", first.addr));
+                }
+                if let (true, shaders::Resolved::Buffer(vb)) = (item, r1) {
+                    if first.tr.plan.resources[i].formatted {
+                        if let Some(rdna::translate::ResSpec::Buffer { format, dst_sel }) = first.tr.spec.resources.get(i) {
+                            if vb.format != *format || vb.dst_sel != *dst_sel {
+                                found.push(format!("stage {k} ({:#x}) item buffer {i} format {}/{:#x} against the translation's {format}/{dst_sel:#x}", first.addr, vb.format, vb.dst_sel));
+                            }
+                        }
+                    }
+                    let (a, n) = (vb.base, vb.extent().max(4));
+                    let rr = [(a, n)];
+                    if super::super::homes::overlaps(a, n) || self.overlaps_pending(&rr) || super::INFLIGHT.latest(&rr).is_some() || super::CP_WRITES.latest(&rr).is_some() {
+                        found.push(format!("stage {k} ({:#x}) item buffer {i} at {a:#x}+{n:#x} is GPU-written data", first.addr));
+                    }
+                }
+            }
+        }
+        if !found.is_empty() {
+            let n = v[1].fetch_add(1, Ordering::Relaxed);
+            if n < 40 {
+                crate::info!("gpu[{}]: GPU-resolved draw of vs {:#x} ps {:#x} (verify): {}", self.name, g.pair.0, g.pair.1, found.join("; "));
+            }
+        }
+    }
+
+    /// A GPU-resolved pair's draw recorded in full: whether a per-item
+    /// buffer's data is where the CPU path would not read guest memory (a
+    /// video-memory home, pending GPU or CP writes, a resident shadow) or
+    /// not imported; the first such finding.
+    pub(super) fn gpu_draw_check(&mut self, vs: &Prepared, ps: &Prepared) -> Option<String> {
+        for p in [vs, ps] {
+            for (i, r) in p.resources.iter().enumerate().take(64) {
+                if p.tr.spec.gpu_res & (1u64 << i) == 0 {
+                    continue;
+                }
+                let Resolved::Buffer(v) = r else { continue };
+                let (a, n) = (v.base, v.extent().max(4));
+                let rr = [(a, n)];
+                let what = if super::super::homes::overlaps(a, n) {
+                    "in a video-memory home"
+                } else if self.overlaps_pending(&rr) || super::INFLIGHT.latest(&rr).is_some() || super::CP_WRITES.latest(&rr).is_some() {
+                    "written by pending GPU or CP work"
+                } else if self.resident.iter().any(|x| x.guest < a + n && a < x.guest + x.range) {
+                    "in a resident shadow"
+                } else if super::span(a, n).is_none() {
+                    "not imported"
+                } else {
+                    continue;
+                };
+                return Some(format!("{:#x}'s buffer {i} at {a:#x}+{n:#x} is {what}", p.addr));
+            }
+        }
+        None
     }
 
     /// A batched pair's draw right after the last draw of the open run, with

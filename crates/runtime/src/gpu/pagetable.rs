@@ -327,10 +327,11 @@ pub fn status() -> String {
         String::new()
     };
     format!(
-        "    guest page table: {} pages mapped, {} cleared, {} update submissions ({} KiB); shader reads through unmapped pages {n} (last {last:#x}{why})\n",
+        "    guest page table: {} pages mapped, {} cleared, {} update submissions ({} KiB), windows imported again right after a drop {}; shader reads through unmapped pages {n} (last {last:#x}{why})\n",
         STATS[0].load(Ordering::Relaxed),
         STATS[1].load(Ordering::Relaxed),
         STATS[2].load(Ordering::Relaxed),
-        STATS[3].load(Ordering::Relaxed) >> 10
+        STATS[3].load(Ordering::Relaxed) >> 10,
+        super::exec::REIMPORTS.load(Ordering::Relaxed)
     )
 }

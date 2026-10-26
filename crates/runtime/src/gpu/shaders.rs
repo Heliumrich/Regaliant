@@ -34,6 +34,36 @@ thread_local! {
     /// Draw stages prepared while a `BatchedDraw` guard is held: translated
     /// batched (`Spec::batched`, buffers by device address).
     static BATCHED_DRAW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Batched draw stages prepared while a `GpuDrawMasks` guard is held:
+    /// their GPU-resolved loads and buffers (`Spec::gpu_loads`, `gpu_res`;
+    /// vertex stage, pixel stage).
+    static GPU_DRAW_MASKS: std::cell::Cell<Option<[(u64, u64); 2]>> = const { std::cell::Cell::new(None) };
+}
+
+/// While held, the batched draw stages this thread prepares resolve the
+/// given loads and buffers on the GPU (a GPU-resolved pair, `gpures`).
+pub struct GpuDrawMasks(bool);
+
+pub fn gpu_draw_masks(m: Option<[(u64, u64); 2]>) -> GpuDrawMasks {
+    if m.is_some() {
+        GPU_DRAW_MASKS.with(|c| c.set(m));
+    }
+    GpuDrawMasks(m.is_some())
+}
+
+impl Drop for GpuDrawMasks {
+    fn drop(&mut self) {
+        if self.0 {
+            GPU_DRAW_MASKS.with(|c| c.set(None));
+        }
+    }
+}
+
+/// The GPU-resolved masks of a batched draw stage being prepared (0:
+/// vertex, 1: pixel), when the page table exists.
+fn gpu_draw_masks_now(stage: usize) -> Option<(u64, u64)> {
+    let m = GPU_DRAW_MASKS.with(|c| c.get())?;
+    (super::pagetable::address() != 0).then_some(m[stage])
 }
 
 /// While held, the draw stages this thread prepares are translated batched
@@ -1187,6 +1217,12 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         gpu_loads: 0,
         gpu_res: 0,
     };
+    if spec.batched {
+        if let Some((l, r)) = gpu_draw_masks_now(1) {
+            spec.gpu_loads = l;
+            spec.gpu_res = r;
+        }
+    }
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
     r
@@ -1343,6 +1379,12 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         gpu_loads: 0,
         gpu_res: 0,
     };
+    if spec.batched {
+        if let Some((l, r)) = gpu_draw_masks_now(0) {
+            spec.gpu_loads = l;
+            spec.gpu_res = r;
+        }
+    }
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
     r
@@ -1389,6 +1431,16 @@ pub fn resource_vsharp(code_base: u64, plan: &Plan, r: usize, user: &[u32]) -> O
         w[k] = rd.eval(p, user)?;
     }
     Some(Vsharp::decode(&w))
+}
+
+/// The guest range scalar load `k` of `plan` reads for user data `user`,
+/// its pointer chain read from guest memory now (GPU-resolved loads,
+/// `gpures`: imported before the shader reads it). None: unreadable.
+pub fn load_range(code_base: u64, plan: &Plan, k: usize, user: &[u32]) -> Option<(u64, u64)> {
+    let l = plan.loads.get(k)?;
+    let mut rd = Reader::new(code_base);
+    let base = rd.ptr(&l.ptr, user)?;
+    Some((base.wrapping_add(l.offset as u64), 4 * l.dwords as u64))
 }
 
 pub fn read_sources(p: &Prepared) -> Vec<(String, u64, u64)> {
