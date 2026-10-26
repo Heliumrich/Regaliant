@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 183] = [
+    static ALL: [Tunable; 184] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -216,6 +216,7 @@ pub mod tune {
         Tunable { name: "home_check_win", env: "DS_HOME_CHECK_WIN", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "gpu_chains", env: "DS_GPU_CHAINS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "gpu_mirror", env: "DS_GPU_MIRROR", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "past_waits", env: "DS_PAST_WAITS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1982,6 +1983,17 @@ pub mod tune {
         get(182)
     }
 
+    /// The graphics command processor records past a wait on a label a
+    /// compute queue wrote last (`Cp::past_wait_start`): held until the
+    /// label is promised or a stop, then checked against what the other
+    /// queues recorded meanwhile and submitted after the writer's batch, or
+    /// dropped and recorded again from the wait: 1 labels queue 0x50 wrote
+    /// last, 2 any compute queue's; 0 (default) off.
+    #[inline]
+    pub fn past_waits() -> u64 {
+        get(183)
+    }
+
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
     /// without appends).
     #[inline]
@@ -2390,6 +2402,8 @@ fn worker(q: &'static Queue, name: &str) {
     cp.more_follows = Some(Box::new(move || !q.pending.lock().is_empty()));
     // Register states kept for a frame replay (`Ctl::Save`).
     let mut saved: [Option<cp::ChunkState>; 2] = [None, None];
+    // Submissions a stretch past a label wait runs through.
+    let mut kept: Vec<Kept> = Vec::new();
     loop {
         prio::apply();
         let batch = {
@@ -2426,7 +2440,34 @@ fn worker(q: &'static Queue, name: &str) {
         if q.id == GFX && frameahead::on() {
             frameahead::post(&cp, batch.index, &batch.bufs, batch.at);
         }
+        // Recording past a label wait runs on through submissions: they are
+        // kept until it settles, to run again from the wait if what was
+        // recorded past it is dropped (`Cp::take_rewind_sub`).
+        if cp.past_wait_active() {
+            kept.push(Kept { index: batch.index, bufs: batch.bufs.clone(), at: batch.at });
+        }
         run_submission(&mut cp, &batch, name);
+        while let Some((s, buf, addr)) = cp.take_rewind_sub() {
+            let Some(k) = kept.iter().position(|x| x.index == s) else {
+                crate::error!("gpu[{name}]: a stretch past a label wait was dropped but submission {s} is not kept; going on");
+                break;
+            };
+            let again: Vec<Kept> = kept.drain(k..).collect();
+            for (j, x) in again.iter().enumerate() {
+                let from = if j == 0 { Some((buf, addr)) } else { None };
+                run_kept(&mut cp, x, from, name);
+                if cp.rewind_sub_pending() {
+                    break;
+                }
+            }
+        }
+        if cp.past_wait_active() {
+            if !kept.iter().any(|x| x.index == batch.index) {
+                kept.push(Kept { index: batch.index, bufs: batch.bufs.clone(), at: batch.at });
+            }
+        } else {
+            kept.clear();
+        }
         if throttle() || waits_for_completion(&batch.bufs) {
             cp.finish();
         }
@@ -2439,9 +2480,53 @@ fn worker(q: &'static Queue, name: &str) {
     }
 }
 
+/// A submission kept while the graphics command processor records past a
+/// label wait (its number, command buffers and arrival).
+struct Kept {
+    index: u64,
+    bufs: Vec<(u64, u32)>,
+    at: std::time::Instant,
+}
+
+/// Runs a kept submission again, from buffer `from.0` at address `from.1`
+/// (a stretch past a label wait was dropped), or whole.
+fn run_kept(cp: &mut cp::Cp, k: &Kept, from: Option<(usize, u64)>, name: &str) {
+    cp.submitted_at = Some(k.at);
+    cp.sub_index = k.index;
+    cp.new_submission();
+    let nbufs = k.bufs.len();
+    let (mut i, mut at) = match from {
+        Some((b, a)) => (b, Some(a)),
+        None => (0, None),
+    };
+    while i < nbufs {
+        let (addr, size) = k.bufs[i];
+        cp.next_in_submission = i + 1 < nbufs;
+        cp.cur_buf = i;
+        match at.take() {
+            Some(a) if a >= addr && a < addr + 4 * size as u64 => cp.run(a, size - ((a - addr) / 4) as u32),
+            Some(a) => {
+                crate::error!("gpu[{name}]: rewind to {a:#x} outside its command buffer {addr:#x}");
+                cp.run(addr, size)
+            }
+            None => cp.run(addr, size),
+        }
+        if cp.rewind_sub_pending() {
+            return;
+        }
+        if let Some((j, a)) = cp.take_rewind() {
+            i = j;
+            at = Some(a);
+            continue;
+        }
+        i += 1;
+    }
+}
+
 /// Runs a title submission's command buffers.
 fn run_submission(cp: &mut cp::Cp, batch: &Submission, name: &str) {
     cp.submitted_at = Some(batch.at);
+    cp.sub_index = batch.index;
     cp.new_submission();
     let nbufs = batch.bufs.len();
     // (Recording past a parallel run may go back to an earlier buffer of
@@ -2471,6 +2556,9 @@ fn run_submission(cp: &mut cp::Cp, batch: &Submission, name: &str) {
             match from.take() {
                 Some(a) => cp.run(a, size - ((a - addr) / 4) as u32),
                 None => cp.run(addr, size),
+            }
+            if cp.rewind_sub_pending() {
+                return;
             }
             if let Some((j, a)) = cp.take_rewind() {
                 i = j;
@@ -2753,6 +2841,7 @@ pub fn reset_profile() {
     exec::reset_batch_misses();
     cp::reset_wait_stats();
     par::reset_stats();
+    cp::past_wait_reset();
     lockstat::reset_stats();
     images::reset_memo_stats();
     exec::reset_pre_window();
@@ -2782,6 +2871,7 @@ pub fn profile_report() -> String {
     s.push_str(&forward::status_line());
     s.push_str(&crate::hle::kernel::timeouts_line());
     s.push_str(&cp::long_waits_line());
+    s.push_str(&cp::past_wait_status());
     s.push_str(&par::status());
     s.push_str(&images::memo_stats_line());
     s.push_str(&exec::pre_window_line());

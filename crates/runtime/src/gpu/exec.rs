@@ -3538,6 +3538,44 @@ static INFLIGHT: RangeLog = RangeLog::new();
 /// completion thread once their batch finished): a batch binding such a
 /// range is submitted only after that.
 static CP_WRITES: RangeLog = RangeLog::new();
+
+/// Held executors' reads of their own held writes logged (diagnostics).
+static HELD_OWN_LOGGED: AtomicU64 = AtomicU64::new(0);
+
+/// What the batches submitted and the CP writes recorded while the
+/// graphics CP records past a compute queue's label wait write
+/// (`Cp::past_wait_start`): its CPU reads past the wait are checked
+/// against it when it settles. None: no such stretch.
+static PAST_JOURNAL: Mutex<Option<super::ranges::Ranges>> = Mutex::new(None);
+static PAST_JOURNAL_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Starts the journal (a stretch past a label wait begins).
+pub(super) fn journal_begin() {
+    *PAST_JOURNAL.lock() = Some(super::ranges::Ranges::new());
+    PAST_JOURNAL_ON.store(true, Ordering::SeqCst);
+}
+
+/// Ends the journal: what was written since `journal_begin`.
+pub(super) fn journal_end() -> super::ranges::Ranges {
+    PAST_JOURNAL_ON.store(false, Ordering::SeqCst);
+    PAST_JOURNAL.lock().take().unwrap_or_default()
+}
+
+fn journal_note(writes: &super::ranges::Ranges) {
+    if PAST_JOURNAL_ON.load(Ordering::Acquire) && !writes.is_empty() {
+        if let Some(j) = PAST_JOURNAL.lock().as_mut() {
+            j.extend(writes);
+        }
+    }
+}
+
+fn journal_note_one(w: (u64, u64)) {
+    if PAST_JOURNAL_ON.load(Ordering::Acquire) && w.1 > 0 {
+        if let Some(j) = PAST_JOURNAL.lock().as_mut() {
+            j.insert(w.0, w.1);
+        }
+    }
+}
 /// CP reads that waited for another queue's batch (diagnostics).
 pub static FOREIGN_WAITS: AtomicU64 = AtomicU64::new(0);
 /// Reads by parallel workers of what the main command processor's batch,
@@ -6202,6 +6240,12 @@ pub struct Exec {
     /// Guest ranges it read on the CPU while recording (stage preparations,
     /// command-processor reads, textures' guest memory), since `held_reset`.
     held_reads: Vec<(u64, u64)>,
+    /// GPU-performed CP writes recorded while held (diagnostics).
+    cp_written: Vec<(u64, u64)>,
+    /// Held past a label wait (`past_begin_growing`): a slot still holding
+    /// a held batch is passed over for a free or new one (up to
+    /// HELD_SLOTS) instead of stopping.
+    past_grow: bool,
     /// Its own image-cache notes (`Images::notes_for`), never in the image
     /// cache before a hand-over: fast clears pending (metadata address,
     /// value when known) and GPU-owned images overwritten by its work.
@@ -6760,6 +6804,8 @@ impl Exec {
                 past: false,
                 held_promises: Vec::new(),
                 held_reads: Vec::new(),
+                cp_written: Vec::new(),
+                past_grow: false,
                 held_clears: HashMap::new(),
                 held_over: HashSet::new(),
                 held_keys: HashSet::new(),
@@ -6953,13 +6999,13 @@ impl Exec {
         if self.open_gen.load(Ordering::Relaxed) == u64::MAX {
             self.open_gen.store(SPAN_GEN.load(Ordering::SeqCst), Ordering::SeqCst);
         }
-        if self.past && self.slots.get(self.cur).is_some_and(|s| s.seq == PENDING) {
+        if self.past && !self.past_grow && self.slots.get(self.cur).is_some_and(|s| s.seq == PENDING) {
             // Recording past a run: a slot holding one of its held batches
             // came round again.
             self.stop("no batch slot");
             return;
         }
-        if self.deferred && !self.past {
+        if self.deferred && (!self.past || self.past_grow) {
             // A slot whose batch is closed but not submitted cannot be reused,
             // and one whose batch the GPU still executes would make the chunk
             // wait for it (a worker records several chunks of a run): a free
@@ -7383,6 +7429,7 @@ impl Exec {
         let writes = std::mem::take(&mut self.pending);
         self.pending_log.clear();
         INFLIGHT.note_ranges(seq, &writes);
+        journal_note(&writes);
         crate::hostcensus::gpu_wrote(seq, &writes);
         if self.name == "gpu-gfx" {
             super::frameahead::a_wrote_ranges(&writes);
@@ -8323,6 +8370,10 @@ impl Exec {
             // Copied by an earlier submitted batch (`gpu::precache`).
             if let Some((chunk, at, made)) = super::precache::lookup(base, size) {
                 PRE_REUSED.fetch_add(1, Ordering::Relaxed);
+                if self.held {
+                    // (Taken before; checked when held work settles.)
+                    self.held_reads.push((base, size));
+                }
                 self.copy_wait = self.copy_wait.max(made);
                 let buf = chunk.buf;
                 self.slots[self.cur].keep.push(chunk);
@@ -8919,6 +8970,7 @@ impl Exec {
             self.actions.push(f);
             self.submit_for("effect");
             if let Some(w) = write {
+                journal_note_one(w);
                 INFLIGHT.note(self.last_seq, w);
                 if ordered {
                     CP_WRITES.note(self.last_seq, w);
@@ -8933,6 +8985,7 @@ impl Exec {
             self.last_action_seq = seq;
             self.cpu_action_seq = seq;
             if let Some(w) = write {
+                journal_note_one(w);
                 INFLIGHT.note(seq, w);
                 if ordered {
                     CP_WRITES.note(seq, w);
@@ -8942,6 +8995,9 @@ impl Exec {
             }
             Some(seq)
         } else {
+            if let Some(w) = write {
+                journal_note_one(w);
+            }
             f();
             None
         }
@@ -9395,7 +9451,30 @@ impl Exec {
         lap(0, &mut t);
         if self.overlaps_pending(reads) {
             waited.get_or_insert_with(std::time::Instant::now);
-            self.flush_for("reads own writes");
+            if self.past_grow && !(self.pending.overlaps_any(reads) || self.closed_overlap(reads) || self.main_pending(reads)) {
+                // Held past a label wait, and only batches of its own
+                // submitted before write them: waited for as another queue's
+                // would be.
+                let done = done_seq();
+                if let Some(s) = self.inflight.latest(reads, done) {
+                    wait_done(s);
+                }
+            } else {
+                if self.past_grow && HELD_OWN_LOGGED.fetch_add(1, Ordering::Relaxed) < 12 {
+                    // Diagnostics: what a held executor read of its own held work.
+                    let hits: Vec<String> = reads
+                        .iter()
+                        .filter(|&&r| self.pending.overlaps_any(&[r]) || self.closed_overlap(&[r]))
+                        .take(4)
+                        .map(|&(a, n)| {
+                            let cp = self.cp_written.iter().any(|&(b, m)| b < a + n && a < b + m);
+                            format!("{a:#x}+{n:#x}{}", if cp { " (a CP write's)" } else { "" })
+                        })
+                        .collect();
+                    crate::info!("gpu[{}]: held work reads its own held writes: {} (stages {:#x} {:#x})", self.name, hits.join(", "), self.sync_readers[0], self.sync_readers[1]);
+                }
+                self.flush_for("reads own writes");
+            }
         }
         lap(1, &mut t);
         if let Some(s) = INFLIGHT.latest(reads) {
@@ -9579,6 +9658,9 @@ impl Exec {
             self.dispatched = false;
         }
         self.note_write(a, bytes);
+        if self.held && self.cp_written.len() < 4096 {
+            self.cp_written.push((a, bytes));
+        }
         if full {
             // The barrier after it orders it before later work.
             self.ordered_since(a, bytes);
@@ -10514,6 +10596,14 @@ impl Exec {
         self.held_reset();
     }
 
+    /// The graphics command processor goes on past a label wait
+    /// (`Cp::past_wait_start`): held as past a run, with batch slots added
+    /// as its held batches fill them.
+    pub fn past_begin_growing(&mut self) {
+        self.past_begin();
+        self.past_grow = true;
+    }
+
     /// What it recorded past the run holds (`Cp::past_settle`): its closed
     /// batches go to the GPU after the run's chunks', with their label
     /// writes; its image notes go to the image cache; the open batch goes
@@ -10522,6 +10612,7 @@ impl Exec {
         self.deferred = false;
         self.held = false;
         self.past = false;
+        self.past_grow = false;
         self.stopped = false;
         self.stop_why = "";
         if !self.held_clears.is_empty() || !self.held_over.is_empty() {
@@ -10546,6 +10637,7 @@ impl Exec {
     /// closed batches and its open one (begun past the run: the batch
     /// before it was submitted) never go to the GPU.
     pub fn past_drop(&mut self) {
+        super::forward::drop_entries(&std::mem::take(&mut self.forward_ids));
         self.discard_closed();
         if self.recording {
             self.discard();
@@ -10564,6 +10656,7 @@ impl Exec {
         self.deferred = false;
         self.held = false;
         self.past = false;
+        self.past_grow = false;
         self.stopped = false;
         self.stop_why = "";
         self.held_clears.clear();
@@ -10579,6 +10672,7 @@ impl Exec {
         self.stopped = false;
         self.stop_why = "";
         self.held_reads.clear();
+        self.cp_written.clear();
         self.held_clears.clear();
         self.held_over.clear();
         self.held_keys.clear();
@@ -10717,6 +10811,7 @@ impl Exec {
             super::precache::submitted(&b.shared, seq);
             super::resident::submitted(&b.res_pages, seq);
             INFLIGHT.note_ranges(seq, &b.writes);
+            journal_note(&b.writes);
             crate::hostcensus::gpu_wrote(seq, &b.writes);
             if self.name.starts_with("gpu-gfx-par") {
                 super::frameahead::a_wrote_ranges(&b.writes);
@@ -10759,6 +10854,7 @@ impl Exec {
         }
         for b in std::mem::take(&mut self.closed) {
             super::forward::drop_checks(&b.forward_ids);
+            super::forward::drop_entries(&b.forward_ids);
             super::resident::dropped(&b.res_pages);
             let s = &mut self.slots[b.slot];
             unsafe {
@@ -11719,7 +11815,9 @@ impl Exec {
         // The per-view copy kernel as a buffer update of the words it leaves
         // (`tune copy_update`); its computation is reused for forwarding when
         // it stays a dispatch (None: not tried, Some(None): refused).
-        let forward_here = super::tune::forward_copies() && !self.deferred && indirect.is_none() && self.name == "gpu-gfx" && !super::resident::mirror_mode();
+        // (Held past a label wait the graphics command processor records in
+        // program order still: its copies forward as before.)
+        let forward_here = super::tune::forward_copies() && (!self.deferred || self.past_grow) && indirect.is_none() && self.name == "gpu-gfx" && !super::resident::mirror_mode();
         // The graphics queue's parallel workers (`copy_update 2`): updates
         // checked once their batches completed, never forwarded.
         let worker_here = super::tune::forward_copies() && self.deferred && !self.held && indirect.is_none() && self.name.starts_with("gpu-gfx") && super::tune::copy_update_workers() && !super::resident::mirror_mode();
@@ -12571,6 +12669,7 @@ pub fn status() -> String {
         + &super::ahead::status()
         + &super::compile::status()
         + &async_line()
+        + &super::cp::past_wait_status()
         + &super::par::status()
         + &super::keep::status()
         + &format!(

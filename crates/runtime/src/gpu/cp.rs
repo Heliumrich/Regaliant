@@ -296,6 +296,13 @@ pub struct Cp {
     /// need not submit the batch (`tune cmdbuf_merge`).
     pub more_follows: Option<Box<dyn Fn() -> bool + Send>>,
     pub next_in_submission: bool,
+    /// The queue's number of the title submission being run (set by the
+    /// queue's worker), and where to run from again when what was recorded
+    /// past a label wait in an earlier submission is dropped (`take_rewind_sub`:
+    /// submission, buffer, address; the worker keeps the submissions such a
+    /// stretch runs through).
+    pub sub_index: u64,
+    rewind_sub: Option<(u64, usize, u64)>,
     /// Stage preparations started ahead for the next commands of the
     /// current synchronization-free run (`scan_ahead`), in packet order.
     ahead: std::collections::VecDeque<AheadCmd>,
@@ -342,6 +349,10 @@ pub struct Cp {
     main_gfx: bool,
     /// Recording past a parallel run (`tune past_runs`).
     past: Option<Box<Past>>,
+    /// Recording past a label wait (`tune past_waits`), and whether such a
+    /// stretch is settling (its wait is waited for normally then).
+    past_wait: Option<Box<PastWait>>,
+    settling: bool,
     /// The index of the submission's command buffer being run (set by the
     /// queue's worker), and where the worker is to run from next when what
     /// was recorded past a run is dropped in a later buffer than the run's
@@ -513,6 +524,83 @@ struct Past {
     pred: Option<Pred>,
     fence_pending: bool,
     began: Instant,
+}
+
+/// The graphics command processor recording past a wait on a label a
+/// compute queue wrote last (`Cp::past_wait_start`): the wait, and what is
+/// put back if what it recorded past it is dropped.
+struct PastWait {
+    control: u32,
+    a: u64,
+    wide: bool,
+    reference: u64,
+    mask: u64,
+    /// The wait's packet, the command buffer holding it and its
+    /// submission.
+    at: u64,
+    buf: usize,
+    sub: u64,
+    state: ChunkState,
+    stack: Vec<Vec<u32>>,
+    markers: Vec<String>,
+    pred: Option<Pred>,
+    fence_pending: bool,
+    began: Instant,
+    /// Packets since the label was last looked at.
+    ticks: u32,
+}
+
+/// Recording past label waits (`tune past_waits`): [stretches begun,
+/// committed, dropped, commands recorded past the waits, ns from a wait to
+/// its settling, settled once the label was promised, settled at a stop,
+/// ns the stops waited for the label].
+pub static PAST_WAITS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static PAST_WAIT_STOPS: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
+static PAST_WAIT_DROPS: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
+
+fn note_why(l: &parking_lot::Mutex<Vec<(&'static str, u64)>>, why: &'static str) {
+    let mut g = l.lock();
+    match g.iter_mut().find(|x| x.0 == why) {
+        Some(x) => x.1 += 1,
+        None => g.push((why, 1)),
+    }
+}
+
+/// Clears the statistics of recording past label waits (`profile reset`).
+pub fn past_wait_reset() {
+    for c in &PAST_WAITS {
+        c.store(0, Ordering::Relaxed);
+    }
+    PAST_WAIT_STOPS.lock().clear();
+    PAST_WAIT_DROPS.lock().clear();
+}
+
+/// One status line ("" before any stretch past a label wait).
+pub fn past_wait_status() -> String {
+    let p = |i: usize| PAST_WAITS[i].load(Ordering::Relaxed);
+    if p(0) == 0 {
+        return String::new();
+    }
+    let list = |l: &parking_lot::Mutex<Vec<(&'static str, u64)>>| {
+        let mut v = l.lock().clone();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.iter().map(|(w, n)| format!("{w} {n}")).collect::<Vec<_>>().join(", ")
+    };
+    let n = p(0).max(1) as f64;
+    format!(
+        "    recording past label waits: {} stretches, {} committed, {} dropped ({}), {} commands recorded past the waits ({:.1} each), {:.0} us from a wait to its settling; settled once promised {}, at a stop {} ({}; {:.0} us waited for the label there on average)\n",
+        p(0),
+        p(1),
+        p(2),
+        list(&PAST_WAIT_DROPS),
+        p(3),
+        p(3) as f64 / n,
+        p(4) as f64 / 1e3 / n,
+        p(5),
+        p(6),
+        list(&PAST_WAIT_STOPS),
+        p(7) as f64 / 1e3 / p(6).max(1) as f64
+    )
 }
 
 /// Two command-processor states are the same (registers past the shorter
@@ -1526,6 +1614,8 @@ impl Cp {
             fence_pending: false,
             pred: None,
             submitted_at: None,
+            sub_index: 0,
+            rewind_sub: None,
             more_follows: None,
             next_in_submission: false,
             ahead: std::collections::VecDeque::new(),
@@ -1545,6 +1635,8 @@ impl Cp {
             held: None,
             main_gfx: name == "gpu-gfx",
             past: None,
+            past_wait: None,
+            settling: false,
             cur_buf: 0,
             rewind: None,
         }
@@ -1556,12 +1648,30 @@ impl Cp {
         self.rewind.take()
     }
 
+    /// Where to run from after a stretch past a label wait that began in an
+    /// earlier submission was dropped: (submission, buffer, address).
+    pub fn take_rewind_sub(&mut self) -> Option<(u64, usize, u64)> {
+        self.rewind_sub.take()
+    }
+
+    /// Whether a rewind into an earlier submission is pending (the queue's
+    /// worker stops running the current one).
+    pub fn rewind_sub_pending(&self) -> bool {
+        self.rewind_sub.is_some()
+    }
+
+    /// Whether this command processor is recording past a label wait (the
+    /// queue's worker keeps the submissions it runs through meanwhile).
+    pub fn past_wait_active(&self) -> bool {
+        self.past_wait.is_some()
+    }
+
     /// Whether recording past a run goes on at the end of the command buffer
     /// being run into the submission's next one instead of stopping there.
     /// (Going on into the next submission too lost 2.8%, FINDINGS.md
     /// 2026-10-23: longer stretches hold work back from the GPU.)
     fn past_goes_on(&self) -> bool {
-        self.past.as_ref().is_some_and(|p| p.across && self.depth == 1 && self.next_in_submission)
+        self.depth == 1 && (self.past.as_ref().is_some_and(|p| p.across && self.next_in_submission) || (self.past_wait.is_some() && (self.next_in_submission || self.more_follows.as_ref().is_some_and(|f| f()))))
     }
 
     pub fn chunk_state(&self) -> ChunkState {
@@ -1686,7 +1796,7 @@ impl Cp {
             op::COPY_DATA => Some("COPY_DATA"),
             op::REWIND => Some("REWIND"),
             op::COND_EXEC => Some("COND_EXEC"),
-            op::INDIRECT_BUFFER if self.past.is_some() => Some("indirect buffer"),
+            op::INDIRECT_BUFFER if self.past.is_some() || self.past_wait.is_some() => Some("indirect buffer"),
             _ => None,
         }
     }
@@ -1701,6 +1811,11 @@ impl Cp {
         let func = control & 7;
         if (control >> 4) & 3 != 1 || !valid(a, 8) {
             return Flow::Next;
+        }
+        // Past a label wait, a wait for the same value passes when that one
+        // does (the stretch settles on it).
+        if self.past_wait.as_deref().is_some_and(|w| w.a == a && w.wide == wide && w.control & 7 == func && w.reference == reference && w.mask == mask) {
+            return self.held_passed(1);
         }
         let pass = |v: u64| compare(func, v & mask, reference & mask);
         let read = move || if wide { unsafe { rd64(a) } } else { (unsafe { rd32(a) }) as u64 };
@@ -1901,7 +2016,7 @@ impl Cp {
     /// (`gpu::precache`), unless the label holds what a GPU queue's CP wrote
     /// last (the queues synchronize this way ~250 times per frame).
     fn end_copy_scope_after_wait(&self, a: u64, wide: bool) {
-        if !valid(a, if wide { 8 } else { 4 }) || (self.held.is_some() && self.past.is_none()) {
+        if !valid(a, if wide { 8 } else { 4 }) || (self.held.is_some() && self.past.is_none() && self.past_wait.is_none()) {
             return;
         }
         if self.last_wait_gpu && super::tune::epoch_gpu_waits() {
@@ -1939,7 +2054,7 @@ impl Cp {
     /// come between submissions, so shared batch-start copies of the
     /// graphics queue are dropped (`gpu::precache`).
     pub fn new_submission(&mut self) {
-        if self.held.is_none() || self.past.is_some() {
+        if self.held.is_none() || self.past.is_some() || self.past_wait.is_some() {
             super::precache::end_scope(0);
         }
     }
@@ -2446,6 +2561,166 @@ impl Cp {
                 s
             }
             None => to,
+        }
+    }
+
+    /// Whether a wait on `a` that does not pass at once is gone past (`tune
+    /// past_waits`): the graphics command processor at command-buffer depth
+    /// 1 with nothing held, the label last written by a compute queue.
+    fn past_wait_ok(&self, a: u64) -> bool {
+        let mode = super::tune::past_waits();
+        mode != 0
+            && self.main_gfx
+            && !self.settling
+            && self.held.is_none()
+            && self.past.is_none()
+            && self.past_wait.is_none()
+            && self.par.is_none()
+            && self.depth == 1
+            && self.exec.is_some()
+            && !super::capture::capturing()
+            && last_write(a).is_some_and(|(q, _, _)| if mode == 1 { q == "gpu-acb0x50" } else { q.starts_with("gpu-acb") })
+    }
+
+    /// Goes past a label wait (`tune past_waits`): this command processor's
+    /// work so far to the GPU, its state noted, then on from the packet after
+    /// the wait with its executor held (`Exec::past_begin`) until the label
+    /// is promised or a stop (`past_wait_settle`).
+    fn past_wait_start(&mut self, control: u32, a: u64, wide: bool, reference: u64, mask: u64, at: u64) -> Flow {
+        self.submit_gpu("wait");
+        self.past_wait = Some(Box::new(PastWait {
+            control,
+            a,
+            wide,
+            reference,
+            mask,
+            at,
+            buf: self.cur_buf,
+            sub: self.sub_index,
+            state: self.chunk_state(),
+            stack: self.ctx_stack.clone(),
+            markers: self.markers.clone(),
+            pred: self.pred.clone(),
+            fence_pending: self.fence_pending,
+            began: Instant::now(),
+            ticks: 0,
+        }));
+        self.held = Some(Box::new(super::frameahead::HeldCp { frames: u64::MAX, labels: HashMap::new(), stop: None, commands: 0, waits: [0; 5], poll: false }));
+        super::exec::journal_begin();
+        if let Some(e) = self.exec.as_mut() {
+            e.past_begin_growing();
+        }
+        PAST_WAITS[0].fetch_add(1, Ordering::Relaxed);
+        Flow::Next
+    }
+
+    /// Whether the label gone past passes now (in memory or promised).
+    fn past_wait_passes(&self) -> bool {
+        let Some(w) = self.past_wait.as_deref() else { return false };
+        let func = w.control & 7;
+        let v = if w.wide { unsafe { rd64(w.a) } } else { (unsafe { rd32(w.a) }) as u64 };
+        compare(func, v & w.mask, w.reference & w.mask) || promised(w.a, w.wide, func, w.mask, w.reference).is_some()
+    }
+
+    /// Recording past a label wait stopped, or the label was promised: the
+    /// label passes (waited for here after a stop), then what was recorded
+    /// past the wait is checked: no CPU read of what the batches submitted
+    /// and the CP writes recorded meanwhile write (`exec::journal_end`), no
+    /// image used with a fast clear or reload pending. Then it goes to the
+    /// GPU after the label's writer (`Exec::past_commit`) and execution goes
+    /// on at the stop; else it is dropped (`Exec::past_drop`) and execution
+    /// goes back to the wait, which passes now. Returns where.
+    fn past_wait_settle(&mut self) -> Option<u64> {
+        let mut w = self.past_wait.take().unwrap();
+        let held = self.held.take();
+        let (why, at) = held.as_ref().and_then(|h| h.stop).unwrap_or(("stopped", w.at));
+        let commands = held.as_ref().map_or(0, |h| h.commands);
+        let promised_first = why == "promised";
+        let t = Instant::now();
+        self.settling = true;
+        let flow = self.wait(w.control, w.a, w.wide, w.reference, w.mask, w.at);
+        self.settling = false;
+        let waited = t.elapsed();
+        let writes = super::exec::journal_end();
+        PAST_WAITS[3].fetch_add(commands, Ordering::Relaxed);
+        PAST_WAITS[4].fetch_add(w.began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if promised_first {
+            PAST_WAITS[5].fetch_add(1, Ordering::Relaxed);
+        } else {
+            PAST_WAITS[6].fetch_add(1, Ordering::Relaxed);
+            PAST_WAITS[7].fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
+            note_why(&PAST_WAIT_STOPS, why);
+            if PAST_WAITS[6].load(Ordering::Relaxed) <= 40 && valid(at, 4) {
+                let op = (unsafe { rd32(at) } >> 8) & 0xFF;
+                // The packets from the wait to the stop (same buffer only).
+                let mut seq = Vec::new();
+                if w.sub == self.sub_index && w.buf == self.cur_buf && w.at < at && at - w.at < 4096 {
+                    let mut c = w.at;
+                    while c < at && seq.len() < 24 && valid(c, 4) {
+                        let h = unsafe { rd32(c) };
+                        if h >> 30 != 3 {
+                            break;
+                        }
+                        let n = ((h >> 16) & 0x3FFF) as u64 + 1;
+                        let o = (h >> 8) & 0xFF;
+                        seq.push(if o == op::WRITE_DATA && valid(c + 8, 8) { format!("WRITE_DATA->{:#x}", addr64(unsafe { rd32(c + 8) }, unsafe { rd32(c + 12) })) } else { op_name(o) });
+                        c += 4 * (n + 1);
+                    }
+                }
+                let writer = last_write(w.a).map(|x| x.0).unwrap_or_else(|| "cpu".into());
+                crate::info!("gpu[{}]: past the wait at {:#x} on {:#x} (written by {writer}): stopped ({why}) at {at:#x} (opcode {op:#x}) after {commands} commands and {} us, {} submission(s) on; waited {} us for the label; packets: {}", self.name, w.at, w.a, w.began.elapsed().as_micros(), self.sub_index - w.sub, waited.as_micros(), seq.join(" "));
+            }
+        }
+        let e = self.exec.as_mut().unwrap();
+        let dropped = if matches!(flow, Flow::Stop) {
+            Some("shutdown")
+        } else if writes.overlaps_any(e.held_reads()) {
+            Some("read what other queues wrote")
+        } else if !e.held_keys().is_empty() && super::images::any_pending() && {
+            let keys: Vec<super::images::ImageKey> = e.held_keys().iter().copied().collect();
+            super::images::with(|im| im.clears_pending(&keys) || im.overwrites_pending(&keys))
+        } {
+            Some("images with pending clears or reloads")
+        } else if super::tune::past_drop() {
+            Some("dropped (past_drop)")
+        } else {
+            None
+        };
+        if let Some(d) = dropped {
+            note_why(&PAST_WAIT_DROPS, d);
+            e.past_drop();
+            PAST_WAITS[2].fetch_add(1, Ordering::Relaxed);
+            // Back to the wait.
+            self.set_chunk_state(&w.state);
+            self.ctx_stack = std::mem::take(&mut w.stack);
+            self.markers = std::mem::take(&mut w.markers);
+            self.pred = w.pred.take();
+            self.fence_pending = w.fence_pending;
+            self.drop_ahead();
+            if w.sub != self.sub_index {
+                self.rewind_sub = Some((w.sub, w.buf, w.at));
+                return None;
+            }
+            if w.buf != self.cur_buf {
+                self.rewind = Some((w.buf, w.at));
+                return None;
+            }
+            return Some(w.at);
+        }
+        e.past_commit();
+        PAST_WAITS[1].fetch_add(1, Ordering::Relaxed);
+        if why == "label" {
+            self.submit_gpu("label");
+        }
+        Some(at)
+    }
+
+    /// Settles what was recorded past a parallel run or a label wait.
+    fn settle_held(&mut self) -> Option<u64> {
+        if self.past_wait.is_some() {
+            self.past_wait_settle()
+        } else {
+            self.past_settle()
         }
     }
 
@@ -4047,9 +4322,9 @@ impl Cp {
                 // Past a run, the buffer's end is a stop (what was recorded
                 // past it may be recorded again, from the run's end), unless
                 // the submission's next buffer goes on with it.
-                if self.past.is_some() && !self.past_goes_on() {
+                if (self.past.is_some() || self.past_wait.is_some()) && !self.past_goes_on() {
                     self.held_stop("buffer end", cur);
-                    match self.past_settle() {
+                    match self.settle_held() {
                         Some(c) if c < end => {
                             cur = c;
                             continue;
@@ -4078,8 +4353,8 @@ impl Cp {
                 break;
             }
             if self.held.is_some() && self.held_halted(cur, cur) {
-                if self.past.is_some() {
-                    match self.past_settle() {
+                if self.past.is_some() || self.past_wait.is_some() {
+                    match self.settle_held() {
                         Some(c) => {
                             cur = c;
                             continue;
@@ -4088,6 +4363,19 @@ impl Cp {
                     }
                 }
                 break;
+            }
+            if let Some(w) = self.past_wait.as_deref_mut() {
+                w.ticks += 1;
+                if w.ticks % 8 == 0 && self.past_wait_passes() {
+                    self.held_stop("promised", cur);
+                    match self.settle_held() {
+                        Some(c) => {
+                            cur = c;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
             }
             if self.main_gfx && cur == super::frameahead::TARGET.load(Ordering::Relaxed) {
                 super::frameahead::a_reached();
@@ -4268,10 +4556,10 @@ impl Cp {
             if self.held.is_some() {
                 if let Some(why) = self.held_refuses(opcode, n, &p) {
                     self.held_stop(why, cur);
-                    // Past a run: the packet runs once what was recorded
-                    // past the run is settled.
-                    if self.past.is_some() {
-                        match self.past_settle() {
+                    // Past a run or a wait: the packet runs once what was
+                    // recorded past it is settled.
+                    if self.past.is_some() || self.past_wait.is_some() {
+                        match self.settle_held() {
                             Some(c) => {
                                 cur = c;
                                 continue;
@@ -4297,8 +4585,8 @@ impl Cp {
                     }
                 }
                 if self.held_halted(cur, next) {
-                    if self.past.is_some() {
-                        match self.past_settle() {
+                    if self.past.is_some() || self.past_wait.is_some() {
+                        match self.settle_held() {
                             Some(c) => {
                                 cur = c;
                                 continue;
@@ -4320,10 +4608,12 @@ impl Cp {
                     self.scan_ahead(&f, next, until);
                 }
             }
+            // (Past a label wait, the queue asking waits for what follows the
+            // wait in any case: it gets the label when the stretch settles.)
             if self.past.is_some() && self.exec.as_ref().is_some_and(|e| e.submit_requested()) {
                 // Another queue waits for a label written past the run.
                 self.held_stop("label", next);
-                match self.past_settle() {
+                match self.settle_held() {
                     Some(c) => {
                         cur = c;
                         continue;
@@ -4356,12 +4646,12 @@ impl Cp {
         // Every stop past a run settles it within its buffer (a stop at the
         // buffer's end included); leaving the buffer with one unsettled
         // would skip the packets after it.
-        if self.past.is_some() && !self.past_goes_on() && self.rewind.is_none() {
+        if (self.past.is_some() || self.past_wait.is_some()) && !self.past_goes_on() && self.rewind.is_none() {
             // (Waits ended by the shutdown leave it as well.)
             if !crate::gpu::shutting_down() {
-                crate::error!("gpu[{}]: left a command buffer at {cur:#x} while recording past a parallel run (settled here)", self.name);
+                crate::error!("gpu[{}]: left a command buffer at {cur:#x} while recording past a parallel run or label wait (settled here)", self.name);
             }
-            let _ = self.past_settle();
+            let _ = self.settle_held();
             self.rewind = None;
         }
         // A parallel run planned in this buffer ends in it (unless execution
@@ -5183,6 +5473,10 @@ impl Cp {
         if super::tune::xwait_skip() && self.name == "gpu-gfx" && last_write(a).is_some_and(|(q, _, _)| q == "gpu-acb0x50") {
             self.note("`tune xwait_skip`: label waits for gpu-acb0x50 skipped (measurement; pictures may be wrong)");
             return Flow::Next;
+        }
+        // Recording goes on past it, held (`tune past_waits`).
+        if self.past_wait_ok(a) {
+            return self.past_wait_start(control, a, wide, reference, mask, at);
         }
         label_event(&self.name, b'S', a, v0, reference, at);
         // Let recorded work and deferred effects progress while polling; a

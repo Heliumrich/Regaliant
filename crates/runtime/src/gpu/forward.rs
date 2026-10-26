@@ -494,6 +494,21 @@ pub fn add_check(base: u64, words: Vec<u32>) -> u64 {
     id
 }
 
+/// Drops the entries of batches that were never submitted (what the
+/// graphics command processor recorded past a label wait, dropped).
+pub fn drop_entries(ids: &[u64]) {
+    if ids.is_empty() || COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut g = ENTRIES.write();
+    let before = g.len();
+    g.retain(|e| !ids.contains(&e.id));
+    if g.len() != before {
+        COUNT.store(g.len(), Ordering::Release);
+        GEN.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// Drops the checks of batches that were never submitted.
 pub fn drop_checks(ids: &[u64]) {
     if ids.is_empty() || CHECK_COUNT.load(Ordering::Acquire) == 0 {
