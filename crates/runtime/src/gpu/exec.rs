@@ -2522,6 +2522,24 @@ fn imported_scratch() -> Option<vk::Buffer> {
     })
 }
 
+/// `imported_scratch` over SPREAD_BYTES, for `tune skip_copies` 8192
+/// (diagnosis): each window's merge stores at its guest address modulo that
+/// size, over as many pages as into guest memory.
+fn imported_spread() -> Option<vk::Buffer> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+    static B: std::sync::OnceLock<Option<vk::Buffer>> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        let p = unsafe { VirtualAlloc(std::ptr::null(), SPREAD_BYTES as usize, MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) } as u64;
+        if p == 0 {
+            return None;
+        }
+        ctx().import_host(p, SPREAD_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER).ok().map(|(b, _, _)| b)
+    })
+}
+
+const SPREAD_BYTES: u64 = 64 << 20;
+
 fn scratch_buffer() -> Option<vk::Buffer> {
     *SCRATCH.get_or_init(|| ctx().device_buffer(SCRATCH_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER).ok().map(|(b, _)| b))
 }
@@ -9498,40 +9516,52 @@ impl Exec {
             let dst = match (scratch_buffer(), host_scratch()) {
                 (Some(sb), _) if small && skip & 256 != 0 => (sb, 0),
                 (_, Some(hb)) if small && skip & 2048 != 0 => (hb, 0),
-                _ => match imported_scratch() {
-                    Some(ib) if small && skip & 4096 != 0 => (ib, 0),
+                _ => match (imported_scratch(), imported_spread()) {
+                    (Some(ib), _) if small && skip & 4096 != 0 => (ib, 0),
+                    (_, Some(ib)) if small && skip & 8192 != 0 => (ib, (sh.guest % (SPREAD_BYTES - (256 << 10))) & !255),
                     _ => (sh.host, sh.host_off),
                 },
             };
-            match merge {
-                Some(m) => {
-                    let set = self.alloc_set(m.set_layout)?;
-                    let infos = [
-                        vk::DescriptorBufferInfo { buffer: self.shadow(), offset: sh.shadow_off, range: sh.range },
-                        vk::DescriptorBufferInfo { buffer: self.shadow(), offset: sh.pristine_off, range: sh.range },
-                        vk::DescriptorBufferInfo { buffer: dst.0, offset: dst.1, range: sh.range },
-                    ];
-                    let writes: Vec<vk::WriteDescriptorSet> = infos
-                        .iter()
-                        .enumerate()
-                        .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
-                        .collect();
-                    let first = (sh.bias / 4) as u32;
-                    let end = ((sh.bias + own).div_ceil(4)).min(sh.range / 4) as u32;
-                    let pc: Vec<u8> = [first, end].iter().flat_map(|x| x.to_le_bytes()).collect();
-                    unsafe {
-                        let cmd = self.cmd();
-                        c.device.update_descriptor_sets(&writes, &[]);
-                        c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, m.pipeline);
-                        c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, m.layout, 0, &[set], &[]);
-                        c.device.cmd_push_constants(cmd, m.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
-                        c.device.cmd_dispatch(cmd, end.saturating_sub(first).div_ceil(rdna::kernels::MERGE_LOCAL_SIZE).max(1), 1, 1);
+            // Diagnosis (`tune skip_copies`, guest memory merged as always):
+            // windows under 256 KiB merged a second time into guest memory
+            // (32768) or into the spread scratch (65536): what a merge's
+            // stores cost without changing what later work reads.
+            let again = match imported_spread() {
+                Some(ib) if small && skip & 65536 != 0 => Some((ib, (sh.guest % (SPREAD_BYTES - (256 << 10))) & !255)),
+                _ if small && skip & 32768 != 0 => Some(dst),
+                _ => None,
+            };
+            for dst in std::iter::once(dst).chain(again) {
+                match merge {
+                    Some(m) => {
+                        let set = self.alloc_set(m.set_layout)?;
+                        let infos = [
+                            vk::DescriptorBufferInfo { buffer: self.shadow(), offset: sh.shadow_off, range: sh.range },
+                            vk::DescriptorBufferInfo { buffer: self.shadow(), offset: sh.pristine_off, range: sh.range },
+                            vk::DescriptorBufferInfo { buffer: dst.0, offset: dst.1, range: sh.range },
+                        ];
+                        let writes: Vec<vk::WriteDescriptorSet> = infos
+                            .iter()
+                            .enumerate()
+                            .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
+                            .collect();
+                        let first = (sh.bias / 4) as u32;
+                        let end = ((sh.bias + own).div_ceil(4)).min(sh.range / 4) as u32;
+                        let pc: Vec<u8> = [first, end].iter().flat_map(|x| x.to_le_bytes()).collect();
+                        unsafe {
+                            let cmd = self.cmd();
+                            c.device.update_descriptor_sets(&writes, &[]);
+                            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, m.pipeline);
+                            c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, m.layout, 0, &[set], &[]);
+                            c.device.cmd_push_constants(cmd, m.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
+                            c.device.cmd_dispatch(cmd, end.saturating_sub(first).div_ceil(rdna::kernels::MERGE_LOCAL_SIZE).max(1), 1, 1);
+                        }
                     }
+                    None => unsafe {
+                        let r = vk::BufferCopy { src_offset: sh.shadow_off + sh.bias, dst_offset: sh.host_off + sh.bias, size: own };
+                        c.device.cmd_copy_buffer(self.cmd(), self.shadow(), sh.host, &[r]);
+                    },
                 }
-                None => unsafe {
-                    let r = vk::BufferCopy { src_offset: sh.shadow_off + sh.bias, dst_offset: sh.host_off + sh.bias, size: own };
-                    c.device.cmd_copy_buffer(self.cmd(), self.shadow(), sh.host, &[r]);
-                },
             }
         }
         if let Some(m) = merge {

@@ -1113,7 +1113,13 @@ pub mod tune {
     /// windows under 256 KiB written back by a whole copy instead of the
     /// merge kernel (128; CPU-written words in them are lost) or merged into
     /// video memory instead of guest memory (256) or into host memory
-    /// nothing reads (2048); 512 the title's timestamps stored into video
+    /// nothing reads (2048), into our own write-watched imported memory
+    /// nothing reads at one place (4096) or at each window's guest address
+    /// modulo 64 MiB (8192); merged into guest memory and then once more into
+    /// guest memory (32768) or into the spread scratch (65536) (results
+    /// correct: what the stores cost when later work reads the same data;
+    /// the others leave GPU-written data in guest memory stale, which can
+    /// change the title's GPU-driven work); 512 the title's timestamps stored into video
     /// memory; 1024 GPU-performed end-of-pipe label writes made twice.
     #[inline]
     pub fn skip_copies() -> u64 {
