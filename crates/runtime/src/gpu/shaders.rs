@@ -1011,11 +1011,21 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         batched: super::tune::batch_cs() && batchable(addr),
         write_marks: super::resident::mirror_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
+        gpu_loads: 0,
+        gpu_res: 0,
     };
     if super::tune::per_lane() != 0 && per_lane_program(code_hash) {
         let votes = lane_votes_program(code_hash);
         spec.per_lane = super::tune::per_lane() == 1 || !votes;
         spec.lane_votes = spec.per_lane && votes;
+    }
+    // GPU-resolved per-item chains (`gpures`, `tune gpu_chains`; batched
+    // programs, whose translations use device addresses).
+    if spec.batched && super::tune::gpu_chains() != 0 && super::pagetable::address() != 0 {
+        if let Some(d) = super::gpures::decided(addr) {
+            spec.gpu_loads = d.gpu_loads;
+            spec.gpu_res = d.gpu_res;
+        }
     }
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
@@ -1174,6 +1184,8 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         batched: batched_draw_now(),
         write_marks: super::resident::mirror_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
+        gpu_loads: 0,
+        gpu_res: 0,
     };
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
@@ -1328,6 +1340,8 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         batched: batched_draw_now(),
         write_marks: super::resident::mirror_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
+        gpu_loads: 0,
+        gpu_res: 0,
     };
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
@@ -1364,6 +1378,19 @@ pub fn pos_export(insts: &[rdna::Inst]) -> Option<&rdna::Inst> {
 /// One line per resolved resource (frame captures).
 /// Where a prepared stage's CPU-side reads come from (wait traces): each
 /// scalar load and each descriptor read from memory, with its guest range.
+/// The V# of resource `r` of `plan` for user data `user`, read from guest
+/// memory now (GPU-resolved chains, `gpures`: the range such a resource
+/// reaches, imported before the shader reads it). None: unreadable.
+pub fn resource_vsharp(code_base: u64, plan: &Plan, r: usize, user: &[u32]) -> Option<Vsharp> {
+    let res = plan.resources.get(r)?;
+    let mut rd = Reader::new(code_base);
+    let mut w = [0u32; 4];
+    for (k, p) in res.dwords.iter().take(4).enumerate() {
+        w[k] = rd.eval(p, user)?;
+    }
+    Some(Vsharp::decode(&w))
+}
+
 pub fn read_sources(p: &Prepared) -> Vec<(String, u64, u64)> {
     let mut rd = Reader::new(p.addr);
     let mut v = Vec::new();
@@ -1953,6 +1980,8 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         batched: false,
         write_marks: super::resident::mirror_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
+        gpu_loads: 0,
+        gpu_res: 0,
     })
 }
 
@@ -1991,6 +2020,8 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         batched: false,
         write_marks: super::resident::mirror_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
+        gpu_loads: 0,
+        gpu_res: 0,
     }
 }
 
@@ -2029,6 +2060,8 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         batched: super::tune::batch_cs() && batchable(addr),
         write_marks: super::resident::mirror_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
+        gpu_loads: 0,
+        gpu_res: 0,
     };
     if super::tune::per_lane() != 0 && per_lane_program(code_hash) {
         let votes = lane_votes_program(code_hash);

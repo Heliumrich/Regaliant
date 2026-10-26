@@ -286,7 +286,31 @@ pub struct Spec {
     /// through the constant cache (operands and uniform registers instead of
     /// per-lane loads).
     pub sgpr_ubo: u8,
+    /// GPU-resolved chains (RENDERER.md "GPU-resolved item passes"; needs
+    /// `addresses`): bit k set, the plan's load k is read by the shader
+    /// itself from the address its base SGPRs hold when it runs, through the
+    /// guest page table (the address block's header dwords 2-3 hold the
+    /// table's device address; [`PT_BASE`]); its words are not taken from
+    /// the SGPR data. Pages the table does not map read 0.
+    pub gpu_loads: u64,
+    /// Bit r set: buffer resource r (read-only) is addressed through the V#
+    /// its instructions' SGPRs hold when they run and the guest page table:
+    /// base, stride and range from the V# (as `Vsharp::extent` and
+    /// `index_limit`), bytes outside the range read 0; its info block and
+    /// address entry are unused.
+    pub gpu_res: u64,
 }
+
+/// The guest page table of GPU-resolved chains (`Spec::gpu_loads`,
+/// `gpu_res`): per 4 KiB page of [PT_BASE, PT_END) a u64, the device address
+/// where the page's contents are for the GPU (0: none).
+pub const PT_BASE: u64 = 0x10_0000_0000;
+pub const PT_END: u64 = 0x18_0000_0000;
+pub const PT_PAGE_SHIFT: u32 = 12;
+/// Byte offset, from the table's address, of the u64 device address of
+/// its feedback words (u32: reads through unmapped pages, then the last
+/// such guest address, low and high).
+pub const PT_FEEDBACK: u64 = ((PT_END - PT_BASE) >> PT_PAGE_SHIFT) * 8;
 
 /// The largest SGPR data a uniform-buffer binding holds (`Spec::sgpr_ubo`;
 /// Vulkan guarantees maxUniformBufferRange >= 16 KiB).
@@ -366,6 +390,11 @@ impl std::hash::Hash for Spec {
         }
         if self.sgpr_ubo != 0 {
             (0x5542_4F00u32 | self.sgpr_ubo as u32).hash(state);
+        }
+        if self.gpu_loads != 0 || self.gpu_res != 0 {
+            0x4750_5552u32.hash(state);
+            self.gpu_loads.hash(state);
+            self.gpu_res.hash(state);
         }
     }
 }
@@ -768,6 +797,26 @@ pub(crate) struct T<'a> {
     /// `Spec::batched`: this workgroup's x within its command, and its
     /// WorkgroupId as loaded (loaded once in the entry block).
     pub batch_wg: Option<(Word, Word)>,
+    /// GPU-resolved chains: the guest page table's device address (loaded
+    /// in the entry block), the V# of the buffer instruction being
+    /// translated when its resource is GPU-resolved (resource, base u64,
+    /// stride, index limit, range in bytes), and u64 constants.
+    pub pt_addr: Option<Word>,
+    pub rt_vsharp: Option<RtVsharp>,
+    pub consts64: HashMap<u64, Word>,
+}
+
+/// A GPU-resolved buffer resource's V# as its instruction reads it.
+#[derive(Clone, Copy)]
+pub(crate) struct RtVsharp {
+    pub r: usize,
+    /// The V#'s base aligned down to 16 bytes, and the bytes it was moved
+    /// (offsets are from the aligned base, as the CPU path's placements).
+    pub base: Word,
+    pub bias: Word,
+    pub stride: Word,
+    pub limit: Word,
+    pub range: Word,
 }
 
 pub type R<T> = Result<T, String>;
@@ -784,6 +833,10 @@ impl<'a> T<'a> {
     pub fn u(&mut self, v: u32) -> Word {
         let ty = self.t.u32;
         *self.consts.entry((ty, v)).or_insert_with(|| self.b.constant_bit32(ty, v))
+    }
+    pub fn u64c(&mut self, v: u64) -> Word {
+        let ty = self.t.u64;
+        *self.consts64.entry(v).or_insert_with(|| self.b.constant_bit64(ty, v))
     }
     pub fn i(&mut self, v: i32) -> Word {
         let ty = self.t.i32;
@@ -1889,6 +1942,12 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     if code.is_empty() {
         return Err("empty program".into());
     }
+    if (spec.gpu_loads != 0 || spec.gpu_res != 0) && !spec.addresses {
+        return Err("GPU-resolved chains need device addresses (`Spec::addresses`)".into());
+    }
+    if let Some(r) = (0..plan.resources.len().min(64)).find(|&r| spec.gpu_res & (1u64 << r) != 0 && (plan.resources[r].written || plan.resources[r].kind != ResKind::Buffer)) {
+        return Err(format!("GPU-resolved resource {r} is not a read-only buffer"));
+    }
     let mut b = Builder::new();
     b.set_version(1, 3);
     b.capability(Capability::Shader);
@@ -2033,6 +2092,9 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         addr_vals: HashMap::default(),
         zero_addr: None,
         batch_wg: None,
+        pt_addr: None,
+        rt_vsharp: None,
+        consts64: HashMap::default(),
     };
     let mut elected: Vec<u32> = tr.elections.keys().copied().collect();
     elected.sort();
@@ -3144,6 +3206,8 @@ mod tests {
             batched: false,
             write_marks: false,
             sgpr_ubo: 0,
+            gpu_loads: 0,
+            gpu_res: 0,
         }
     }
 

@@ -1183,6 +1183,28 @@ impl Exec {
             }
             BATCH_DRAWS[3].fetch_add(1, Ordering::Relaxed);
         }
+        // Stage G4's census of draw runs (`DS_DRAW_CENSUS=1`): a sampled
+        // draw's per-item buffers checked for data GPU work wrote.
+        if super::super::drawcensus::on() {
+            let pair = (vs.addr, ps.as_ref().map_or(0, |p| p.addr));
+            let consecutive = self.draw_same && (self.batch_count, self.cmd_uses.get()) == self.last_draw_end;
+            let mut stages: Vec<(&std::sync::Arc<rdna::analysis::Plan>, &[u32])> = vec![(&vs.tr.plan, &vs.user[..])];
+            if let Some(p) = &ps {
+                stages.push((&p.tr.plan, &p.user[..]));
+            }
+            if let Some(check) = super::super::drawcensus::observe(pair, &stages, consecutive, gpu.is_some()) {
+                let mut hit = false;
+                for (st, idx) in [Some(&vs), ps.as_ref()].into_iter().flatten().zip(check) {
+                    for i in idx {
+                        if let Some(shaders::Resolved::Buffer(v)) = st.resources.get(i) {
+                            let r = [(v.base, v.extent().max(4))];
+                            hit |= super::super::homes::overlaps(v.base, v.extent().max(4)) || self.overlaps_pending(&r) || super::INFLIGHT.latest(&r).is_some() || super::CP_WRITES.latest(&r).is_some();
+                        }
+                    }
+                }
+                super::super::drawcensus::checked(pair, hit);
+            }
+        }
         // Measurement: what differs from the last draw of the same programs
         // on this executor (batching candidates; profiling only).
         if draw_stats() {

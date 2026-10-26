@@ -534,6 +534,10 @@ pub fn host_write(base: u64, len: u64) -> HostWrite {
     note_event("host write", base, len);
     super::precache::invalidate(base, len);
     super::resident::host_write_begin(base, len);
+    // Pages armed through the host (the GPU-resolved mirror, the copy
+    // cache's protection): writable first (the kernel fails a file read
+    // into a read-only page instead of faulting).
+    crate::hosted::disarm_if_armed(base, len);
     if len == 0 {
         return HostWrite(None, base, 0);
     }

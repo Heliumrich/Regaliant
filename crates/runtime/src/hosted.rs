@@ -54,6 +54,11 @@ struct Shared {
     overflow: AtomicU64,
     /// Faults retried because the page allowed the access by then.
     retried: AtomicU64,
+    /// Debug events by code (1-9: exception, thread and process creation,
+    /// thread and process exit, DLL load and unload, debug string, RIP), and
+    /// the time from each event's report until the host continued it (ns).
+    events: [AtomicU64; 10],
+    event_ns: [AtomicU64; 10],
     /// Ring entries written (by the host).
     head: AtomicU64,
     /// Ring entries dsport took.
@@ -134,6 +139,27 @@ pub fn init() {
         SHARED.store(s, Ordering::Release);
     }
     crate::info!("hosted: under the host (write faults on armed guest pages answered there; {name})");
+    // Every 5 s with debug events or faults since the last look: their
+    // counts (each one stops the whole process while the host handles it).
+    let _ = std::thread::Builder::new().name("host-events".into()).spawn(|| {
+        let Some(s) = shared() else { return };
+        let mut last = [0u64; 11];
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let mut now = [0u64; 11];
+            for (k, n) in now.iter_mut().enumerate().take(10) {
+                *n = s.events[k].load(Ordering::Relaxed);
+            }
+            now[10] = s.faults.load(Ordering::Relaxed);
+            if now == last {
+                continue;
+            }
+            const NAMES: [&str; 10] = ["", "exceptions", "thread starts", "process start", "thread exits", "process exit", "DLL loads", "DLL unloads", "debug strings", "RIPs"];
+            let parts: Vec<String> = (1..10).filter(|&k| now[k] != last[k]).map(|k| format!("{} {}", NAMES[k], now[k] - last[k])).collect();
+            crate::info!("hosted: in 5 s: {}; armed-page faults {}", parts.join(", "), now[10] - last[10]);
+            last = now;
+        }
+    });
 }
 
 /// Arms guest [base, base+len) (whole pages) against writes: its bits set,
@@ -179,6 +205,8 @@ pub fn disarm(base: u64, len: u64) {
     let mut old = 0u32;
     unsafe { VirtualProtect(lo as _, (hi - lo) as usize, PAGE_READWRITE, &mut old) };
     disarm_bits(s, lo, hi);
+    // Mirrored pages no longer protected leave the mirror.
+    crate::gpu::gmirror::disarmed(lo, hi - lo);
 }
 
 /// Whether every page of guest [base, base+len) is armed (no fault on any
@@ -213,6 +241,7 @@ pub fn forget(base: u64, len: u64) {
     let (lo, hi) = (base & !(PAGE - 1), base.saturating_add(len).next_multiple_of(PAGE));
     disarm_bits(s, lo, hi.min(crate::mem::GUEST_END));
     crate::hostcensus::forget(base, len);
+    crate::gpu::gmirror::disarmed(lo, hi.saturating_sub(lo));
 }
 
 /// The faults the host answered since the last call: (page, a write, the
@@ -248,14 +277,22 @@ pub fn drain(out: &mut Vec<u64>) -> bool {
 pub fn status() -> String {
     let Some(s) = shared() else { return String::new() };
     let f = s.faults.load(Ordering::Relaxed);
+    const NAMES: [&str; 10] = ["", "exceptions", "thread starts", "process start", "thread exits", "process exit", "DLL loads", "DLL unloads", "debug strings", "RIPs"];
+    let events: Vec<String> = (1..10)
+        .filter_map(|k| {
+            let n = s.events[k].load(Ordering::Relaxed);
+            (n > 0).then(|| format!("{} {n} ({:.0} ms in the host)", NAMES[k], s.event_ns[k].load(Ordering::Relaxed) as f64 / 1e6))
+        })
+        .collect();
     format!(
-        "    hosted: {} faults on armed pages answered by the host ({:.1} us each there), {} retried (raced an answered one), {} exceptions passed on, {} leaves of the armed-page map, ring overflows {}\n{}",
+        "    hosted: {} faults on armed pages answered by the host ({:.1} us each there), {} retried (raced an answered one), {} exceptions passed on, {} leaves of the armed-page map, ring overflows {}; debug events: {}\n{}",
         f,
         s.host_ns.load(Ordering::Relaxed) as f64 / 1000.0 / f.max(1) as f64,
         s.retried.load(Ordering::Relaxed),
         s.passed.load(Ordering::Relaxed),
         s.leaves_used.load(Ordering::Relaxed),
         s.overflow.load(Ordering::Relaxed),
+        events.join(", "),
         crate::hostcensus::status()
     )
 }
@@ -305,6 +342,8 @@ pub fn run_host() -> ! {
         if unsafe { WaitForDebugEvent(&mut ev, INFINITE) } == 0 {
             break;
         }
+        let t_event = std::time::Instant::now();
+        let kind = (ev.dwDebugEventCode as usize).min(9);
         let mut status = DBG_CONTINUE;
         match ev.dwDebugEventCode {
             CREATE_PROCESS_DEBUG_EVENT => unsafe {
@@ -359,6 +398,8 @@ pub fn run_host() -> ! {
             },
             _ => {}
         }
+        s.events[kind].fetch_add(1, Ordering::Relaxed);
+        s.event_ns[kind].fetch_add(t_event.elapsed().as_nanos() as u64, Ordering::Relaxed);
         unsafe { ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, status) };
     }
     std::process::exit(code as i32);

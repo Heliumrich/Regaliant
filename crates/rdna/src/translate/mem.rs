@@ -176,6 +176,9 @@ fn u64_of(tr: &mut T, lo: Word, hi: Word) -> R<Word> {
 /// and atomics are skipped by their callers).
 fn addr_ref(tr: &mut T, r: usize, off: Word, ty: Word, bytes: u32) -> R<(Word, Word)> {
     let (u, u64t, b) = (tr.t.u32, tr.t.u64, tr.t.bool_);
+    if let Some(v) = tr.rt_vsharp.filter(|v| v.r == r) {
+        return rt_ref(tr, v, off, ty, bytes);
+    }
     let (base, range) = match tr.addr_vals.get(&r) {
         Some(&v) => v,
         None => {
@@ -207,6 +210,234 @@ fn addr_ref(tr: &mut T, r: usize, off: Word, ty: Word, bytes: u32) -> R<(Word, W
     Ok((p, inr))
 }
 
+/// The zero page's device address (loaded once in the entry block).
+fn zero_page(tr: &mut T) -> R<Word> {
+    match tr.zero_addr {
+        Some(z) => Ok(z),
+        None => {
+            let zlo = tr.addr_header(0)?;
+            let zhi = tr.addr_header(1)?;
+            u64_of(tr, zlo, zhi)
+        }
+    }
+}
+
+/// GPU-resolved chains: the device address of guest address `a` (u64)
+/// through the guest page table, and whether the table maps it (else the
+/// address is meaningless: callers use the zero page).
+fn pt_translate(tr: &mut T, a: Word) -> R<(Word, Word)> {
+    let (u64t, b) = (tr.t.u64, tr.t.bool_);
+    let pt = match tr.pt_addr {
+        Some(p) => p,
+        None => {
+            let lo = tr.addr_header(2)?;
+            let hi = tr.addr_header(3)?;
+            u64_of(tr, lo, hi)?
+        }
+    };
+    let lo_c = tr.u64c(super::PT_BASE);
+    let hi_c = tr.u64c(super::PT_END);
+    let ge = e(tr.b.u_greater_than_equal(b, None, a, lo_c))?;
+    let lt = e(tr.b.u_less_than(b, None, a, hi_c))?;
+    let inside = e(tr.b.logical_and(b, None, ge, lt))?;
+    let rel = e(tr.b.i_sub(u64t, None, a, lo_c))?;
+    let z64 = tr.u64c(0);
+    let rel = e(tr.b.select(u64t, None, inside, rel, z64))?;
+    let sh = tr.u64c(super::PT_PAGE_SHIFT as u64);
+    let page = e(tr.b.shift_right_logical(u64t, None, rel, sh))?;
+    let three = tr.u64c(3);
+    let eoff = e(tr.b.shift_left_logical(u64t, None, page, three))?;
+    let ea = e(tr.b.i_add(u64t, None, pt, eoff))?;
+    let pty = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u64t);
+    let ep = e(tr.b.convert_u_to_ptr(pty, None, ea))?;
+    let (ma, ops) = aligned(8);
+    let entry = e(tr.b.load(u64t, None, ep, ma, ops))?;
+    let mapped = e(tr.b.i_not_equal(b, None, entry, z64))?;
+    let ok_ = e(tr.b.logical_and(b, None, inside, mapped))?;
+    let m = tr.u64c((1u64 << super::PT_PAGE_SHIFT) - 1);
+    let low = e(tr.b.bitwise_and(u64t, None, a, m))?;
+    let dev = e(tr.b.i_add(u64t, None, entry, low))?;
+    Ok((dev, ok_))
+}
+
+/// `addr_ref` for a GPU-resolved resource (`Spec::gpu_res`): byte `off` of
+/// the V#'s range at guest address base + off, through the page table.
+fn rt_ref(tr: &mut T, v: super::RtVsharp, off: Word, ty: Word, bytes: u32) -> R<(Word, Word)> {
+    let (u, u64t, b) = (tr.t.u32, tr.t.u64, tr.t.bool_);
+    let nb = tr.u(bytes);
+    let fits = e(tr.b.u_greater_than_equal(b, None, v.range, nb))?;
+    let lim = e(tr.b.i_sub(u, None, v.range, nb))?;
+    let le = e(tr.b.u_less_than_equal(b, None, off, lim))?;
+    let inr = e(tr.b.logical_and(b, None, fits, le))?;
+    let o = e(tr.b.u_convert(u64t, None, off))?;
+    let ga = e(tr.b.i_add(u64t, None, v.base, o))?;
+    let (dev, mapped) = pt_translate(tr, ga)?;
+    let inr = e(tr.b.logical_and(b, None, inr, mapped))?;
+    let z = zero_page(tr)?;
+    let a = e(tr.b.select(u64t, None, inr, dev, z))?;
+    let pt = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, ty);
+    let p = e(tr.b.convert_u_to_ptr(pt, None, a))?;
+    Ok((p, inr))
+}
+
+/// A GPU-resolved resource's V# from the four SGPRs at `sr` (`Spec::gpu_res`).
+fn rt_vsharp(tr: &mut T, r: usize, sr: u32) -> R<super::RtVsharp> {
+    let (u, b) = (tr.t.u32, tr.t.bool_);
+    let w0 = tr.sreg(sr)?;
+    let w1 = tr.sreg(sr + 1)?;
+    let w2 = tr.sreg(sr + 2)?;
+    let w3 = tr.sreg(sr + 3)?;
+    let m16 = tr.u(0xFFFF);
+    let hi = e(tr.b.bitwise_and(u, None, w1, m16))?;
+    // Aligned down to 16 bytes (vector accesses check their alignment
+    // against the offset, as for the CPU path's placements).
+    let k15 = tr.u(15);
+    let bias = e(tr.b.bitwise_and(u, None, w0, k15))?;
+    let nk15 = tr.u(!15);
+    let lo_al = e(tr.b.bitwise_and(u, None, w0, nk15))?;
+    let base = u64_of(tr, lo_al, hi)?;
+    let sixteen = tr.u(16);
+    let st = e(tr.b.shift_right_logical(u, None, w1, sixteen))?;
+    let m14 = tr.u(0x3FFF);
+    let stride = e(tr.b.bitwise_and(u, None, st, m14))?;
+    // OOB_SELECT (word 3 bits 28-29): 2 checks nothing.
+    let k28 = tr.u(28);
+    let os = e(tr.b.shift_right_logical(u, None, w3, k28))?;
+    let three = tr.u(3);
+    let os = e(tr.b.bitwise_and(u, None, os, three))?;
+    let two = tr.u(2);
+    let one = tr.u(1);
+    let unchecked = e(tr.b.i_equal(b, None, os, two))?;
+    let z = tr.u(0);
+    let structured = e(tr.b.i_not_equal(b, None, stride, z))?;
+    let idx_checked = e(tr.b.u_less_than_equal(b, None, os, one))?;
+    let idx_checked = e(tr.b.logical_and(b, None, idx_checked, structured))?;
+    let all = tr.u(u32::MAX);
+    let limit = e(tr.b.select(u, None, idx_checked, w2, all))?;
+    let bytes = e(tr.b.i_mul(u, None, w2, stride))?;
+    let extent = e(tr.b.select(u, None, structured, bytes, w2))?;
+    let extent = e(tr.b.i_add(u, None, extent, bias))?;
+    let range = e(tr.b.select(u, None, unchecked, all, extent))?;
+    Ok(super::RtVsharp { r, base, bias, stride, limit, range })
+}
+
+/// GPU-resolved chains: counts a read through a page the table does not
+/// map when `miss` holds (the table's feedback words: count, the guest
+/// address). Call at an instruction's top level (it opens a block).
+fn report_miss(tr: &mut T, miss: Word, guest: Word) -> R<()> {
+    let (u, u64t) = (tr.t.u32, tr.t.u64);
+    let pt = match tr.pt_addr {
+        Some(p) => p,
+        None => {
+            let lo = tr.addr_header(2)?;
+            let hi = tr.addr_header(3)?;
+            u64_of(tr, lo, hi)?
+        }
+    };
+    tr.guarded(miss, &mut |tr| {
+        let off = tr.u64c(super::PT_FEEDBACK);
+        let fa = e(tr.b.i_add(u64t, None, pt, off))?;
+        let p64 = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u64t);
+        let fp = e(tr.b.convert_u_to_ptr(p64, None, fa))?;
+        let (ma, ops) = aligned(8);
+        let fb = e(tr.b.load(u64t, None, fp, ma, ops))?;
+        let p32 = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u);
+        let cp = e(tr.b.convert_u_to_ptr(p32, None, fb))?;
+        let scope = tr.u(spirv::Scope::Device as u32);
+        let sem = tr.u(0);
+        let one = tr.u(1);
+        e(tr.b.atomic_i_add(u, None, cp, scope, sem, one))?;
+        let eight = tr.u64c(8);
+        let la = e(tr.b.i_add(u64t, None, fb, eight))?;
+        let lp = e(tr.b.convert_u_to_ptr(p64, None, la))?;
+        let (ma, ops) = aligned(8);
+        ok(tr.b.store(lp, guest, ma, ops))
+    })
+}
+
+/// A GPU-resolved resource's first byte through the page table: a read of
+/// its range would miss when the table does not map the page (counted).
+fn check_rt_base(tr: &mut T, v: super::RtVsharp) -> R<()> {
+    let (u, b) = (tr.t.u32, tr.t.bool_);
+    let (_, mapped) = pt_translate(tr, v.base)?;
+    let z = tr.u(0);
+    let some = e(tr.b.u_greater_than(b, None, v.range, z))?;
+    let not_mapped = e(tr.b.logical_not(b, None, mapped))?;
+    let miss = e(tr.b.logical_and(b, None, some, not_mapped))?;
+    let _ = u;
+    report_miss(tr, miss, v.base)
+}
+
+/// Whether resource `r` is GPU-resolved (`Spec::gpu_res`).
+fn gpu_resolved(tr: &T, r: usize) -> bool {
+    r < 64 && tr.spec.gpu_res & (1u64 << r) != 0
+}
+
+/// A GPU-resolved s_load (`Spec::gpu_loads`): `n` dwords from the address
+/// its base SGPRs hold (plus its offsets) through the guest page table;
+/// dwords on pages the table does not map read 0. A load spans at most two
+/// pages.
+fn gpu_smem(tr: &mut T, ins: &Inst, d: u32, n: u32) -> R<()> {
+    let (u, u64t, b) = (tr.t.u32, tr.t.u64, tr.t.bool_);
+    let sb = ins.smem_sbase() as u32;
+    let lo = tr.sreg(sb)?;
+    let hi = tr.sreg(sb + 1)?;
+    let m16 = tr.u(0xFFFF);
+    let hi = e(tr.b.bitwise_and(u, None, hi, m16))?;
+    let base = u64_of(tr, lo, hi)?;
+    let off = tr.u64c(ins.smem_offset() as i64 as u64);
+    let mut a = e(tr.b.i_add(u64t, None, base, off))?;
+    if ins.smem_soffset() != crate::OP_NULL {
+        let so = tr.operand(ins, ins.smem_soffset())?;
+        let so = e(tr.b.u_convert(u64t, None, so))?;
+        a = e(tr.b.i_add(u64t, None, a, so))?;
+    }
+    let am = tr.u64c(!3u64);
+    let a = e(tr.b.bitwise_and(u64t, None, a, am))?;
+    let (dev0, ok0) = pt_translate(tr, a)?;
+    let (dev1, ok1) = if n > 1 {
+        let last = tr.u64c(4 * (n as u64 - 1));
+        let al = e(tr.b.i_add(u64t, None, a, last))?;
+        pt_translate(tr, al)?
+    } else {
+        (dev0, ok0)
+    };
+    let both = e(tr.b.logical_and(b, None, ok0, ok1))?;
+    let miss = e(tr.b.logical_not(b, None, both))?;
+    report_miss(tr, miss, a)?;
+    let pm = tr.u64c((1u64 << super::PT_PAGE_SHIFT) - 1);
+    let low = e(tr.b.bitwise_and(u64t, None, a, pm))?;
+    let low = e(tr.b.u_convert(u, None, low))?;
+    let z = zero_page(tr)?;
+    let zero = tr.u(0);
+    for j in 0..n {
+        // Dword j: on the first page unless low + 4j reaches the next.
+        let (dev, ok_) = if n > 1 {
+            let k = tr.u(4 * j);
+            let at = e(tr.b.i_add(u, None, low, k))?;
+            let page = tr.u(1 << super::PT_PAGE_SHIFT);
+            let first = e(tr.b.u_less_than(b, None, at, page))?;
+            let o0 = tr.u64c(4 * j as u64);
+            let d0 = e(tr.b.i_add(u64t, None, dev0, o0))?;
+            let o1 = tr.u64c(4 * (n - 1 - j) as u64);
+            let d1 = e(tr.b.i_sub(u64t, None, dev1, o1))?;
+            let dev = e(tr.b.select(u64t, None, first, d0, d1))?;
+            let ok_ = e(tr.b.select(b, None, first, ok0, ok1))?;
+            (dev, ok_)
+        } else {
+            (dev0, ok0)
+        };
+        let dev = e(tr.b.select(u64t, None, ok_, dev, z))?;
+        let pty = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u);
+        let p = e(tr.b.convert_u_to_ptr(pty, None, dev))?;
+        let (ma, ops) = aligned(4);
+        let v = e(tr.b.load(u, None, p, ma, ops))?;
+        let v = e(tr.b.select(u, None, ok_, v, zero))?;
+        tr.set_sreg(d + j, v)?;
+    }
+    Ok(())
+}
+
 /// Loads the address-mode resources' addresses and ranges and the zero
 /// page's address (`T::addr_vals`); call in the entry block, after the SGPR
 /// data's base is known.
@@ -223,6 +454,11 @@ pub fn preload_addresses(tr: &mut T) -> R<()> {
     let zlo = tr.addr_header(0)?;
     let zhi = tr.addr_header(1)?;
     tr.zero_addr = Some(u64_of(tr, zlo, zhi)?);
+    if tr.spec.gpu_loads != 0 || tr.spec.gpu_res != 0 {
+        let lo = tr.addr_header(2)?;
+        let hi = tr.addr_header(3)?;
+        tr.pt_addr = Some(u64_of(tr, lo, hi)?);
+    }
     Ok(())
 }
 
@@ -484,6 +720,9 @@ pub fn smem(tr: &mut T, ins: &Inst) -> R<()> {
             }
             return Ok(());
         };
+        if k < 64 && tr.spec.gpu_loads & (1u64 << k) != 0 {
+            return gpu_smem(tr, ins, d, n);
+        }
         let base = tr.load_offsets[k];
         for j in 0..n {
             let v = tr.sgpr_data(base + j)?;
@@ -515,6 +754,24 @@ pub fn smem(tr: &mut T, ins: &Inst) -> R<()> {
         }
         let km = tr.u(!3);
         let off = e(tr.b.bitwise_and(u, None, off, km))?;
+        if gpu_resolved(tr, r) {
+            // The V# in the base SGPRs, as the instruction reads it.
+            let v = rt_vsharp(tr, r, ins.smem_sbase() as u32)?;
+            check_rt_base(tr, v)?;
+            let ut = tr.t.u32;
+            for j in 0..n {
+                let kb = tr.u(4 * j);
+                let o = e(tr.b.i_add(u, None, off, kb))?;
+                let o = e(tr.b.i_add(u, None, o, v.bias))?;
+                let (p, inr) = rt_ref(tr, v, o, ut, 4)?;
+                let (ma, ops) = aligned(4);
+                let x = e(tr.b.load(u, None, p, ma, ops))?;
+                let z = tr.u(0);
+                let x = e(tr.b.select(u, None, inr, x, z))?;
+                tr.set_sreg(d + j, x)?;
+            }
+            return Ok(());
+        }
         let bias = tr.res_info(r, 0)?;
         let size = tr.res_info(r, 2)?;
         let addr = e(tr.b.i_add(u, None, off, bias))?;
@@ -913,17 +1170,24 @@ fn buffer_addr(tr: &mut T, ins: &Inst, r: usize) -> R<Word> {
     let mut addr = tr.u(ins.buf_offset());
     let mut vreg = ins.buf_vaddr() as u32;
     let mut in_range = None;
+    let rt = tr.rt_vsharp.filter(|v| v.r == r);
     if ins.buf_idxen() {
         let idx = tr.vreg(vreg)?;
         vreg += 1;
-        let st = tr.res_info(r, 1)?;
+        let st = match rt {
+            Some(v) => v.stride,
+            None => tr.res_info(r, 1)?,
+        };
         let m = e(tr.b.i_mul(u, None, idx, st))?;
         addr = e(tr.b.i_add(u, None, addr, m))?;
         // Structured buffers check the index before scaling it (an index at
         // or beyond NUM_RECORDS reads 0): titles store flags in the high
         // bits of indices, and the 32-bit product could wrap back into the
         // bound range.
-        let limit = tr.res_info(r, 3)?;
+        let limit = match rt {
+            Some(v) => v.limit,
+            None => tr.res_info(r, 3)?,
+        };
         in_range = Some(e(tr.b.u_less_than(tr.t.bool_, None, idx, limit))?);
     }
     if ins.buf_offen() {
@@ -932,7 +1196,11 @@ fn buffer_addr(tr: &mut T, ins: &Inst, r: usize) -> R<Word> {
     }
     let so = tr.operand(ins, ins.buf_soffset())?;
     addr = e(tr.b.i_add(u, None, addr, so))?;
-    let bias = tr.res_info(r, 0)?;
+    // A GPU-resolved resource's offsets are from its V#'s base.
+    let bias = match rt {
+        Some(v) => v.bias,
+        None => tr.res_info(r, 0)?,
+    };
     let addr = e(tr.b.i_add(u, None, addr, bias))?;
     match in_range {
         // Beyond every bound range: robust access reads 0, drops writes.
@@ -954,13 +1222,20 @@ pub fn buffer(tr: &mut T, ins: &Inst) -> R<()> {
         return Ok(()); // cache invalidations
     }
     let var = tr.buffers[&r];
+    if gpu_resolved(tr, r) {
+        let v = rt_vsharp(tr, r, ins.buf_srsrc() as u32)?;
+        check_rt_base(tr, v)?;
+        tr.rt_vsharp = Some(v);
+    }
     let addr = buffer_addr(tr, ins, r)?;
     let (vfmt, dst_sel) = match tr.spec.resources.get(r) {
         Some(ResSpec::Buffer { format, dst_sel }) => (*format as u16, *dst_sel),
         _ => (0, 0xFAC), // identity swizzle
     };
     let fmt = if ins.enc == Enc::Mtbuf { ins.mtbuf_format() as u16 } else { vfmt };
-    mem_access(tr, ins, name.trim_start_matches('t'), r, var, addr, fmt, dst_sel)
+    let res = mem_access(tr, ins, name.trim_start_matches('t'), r, var, addr, fmt, dst_sel);
+    tr.rt_vsharp = None;
+    res
 }
 
 /// GLOBAL instructions with an SGPR base: the base is a bound resource.

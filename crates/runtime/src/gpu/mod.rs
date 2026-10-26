@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 181] = [
+    static ALL: [Tunable; 183] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -214,6 +214,8 @@ pub mod tune {
         Tunable { name: "home_check_unlocked", env: "DS_HOME_CHECK_UNLOCKED", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_unsized", env: "DS_PRE_UNSIZED", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "home_check_win", env: "DS_HOME_CHECK_WIN", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "gpu_chains", env: "DS_GPU_CHAINS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "gpu_mirror", env: "DS_GPU_MIRROR", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1963,6 +1965,23 @@ pub mod tune {
         get(180) != 0
     }
 
+    /// GPU-resolved chains (RENDERER.md "GPU-resolved item passes"): 0 off,
+    /// 1 the guest page table is kept and programs found eligible resolve
+    /// their per-item chains in the shader.
+    pub fn gpu_chains() -> u64 {
+        get(181)
+    }
+
+    /// GPU-resolved chains' static ranges in a video-memory mirror armed
+    /// through the host (`gmirror`; hosted runs only): 1 on, 0 (default) read
+    /// across PCIe from the import windows. Arming ranges as soon as they are
+    /// met lost the device during level loads (FINDINGS.md 2026-10-26);
+    /// diagnosis modes: 2 armed and copied, not read; 3 copied and read, not
+    /// armed; 4 armed only; 5 copied only.
+    pub fn gpu_mirror() -> u64 {
+        get(182)
+    }
+
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
     /// without appends).
     #[inline]
@@ -1992,6 +2011,10 @@ pub mod compbench;
 pub mod dispbench;
 pub mod compile;
 pub mod pacing;
+pub mod pagetable;
+pub mod gpures;
+pub mod gmirror;
+pub mod drawcensus;
 pub mod particles;
 pub mod forward;
 pub mod par;
@@ -2751,6 +2774,7 @@ pub fn reset_profile() {
 pub fn profile_report() -> String {
     let mut s = profile_summary();
     s.push_str(&exec::shader_profile());
+    s.push_str(&drawcensus::lines(exec::profile_flips()));
     s.push_str(&exec::laps_report());
     s.push_str(&cp::wait_stats());
     s.push_str(&cp::classes_line());
@@ -2898,6 +2922,9 @@ pub fn status_ex(with_stacks: bool) -> String {
     ));
     s.push_str(&format!("    {}\n", throttle_status()));
     s.push_str(&exec::status());
+    s.push_str(&pagetable::status());
+    s.push_str(&gpures::status());
+    s.push_str(&gmirror::status());
     s.push_str(&profile_summary());
     s.push_str(&exec::shader_profile());
     s

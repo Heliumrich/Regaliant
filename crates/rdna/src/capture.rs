@@ -115,6 +115,7 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
     for (i, m) in mrt.iter_mut().enumerate() {
         m.export_format = ((u.col_format >> (4 * i)) & 0xF) as u8;
     }
+    let gpu_chains = std::env::var_os("RDNA_GPU_CHAINS").is_some() && std::env::var_os("RDNA_ADDRESSES").is_some();
     let spec = Spec {
         probe: None,
         dump: None,
@@ -137,6 +138,14 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         write_marks: std::env::var_os("RDNA_WRITE_MARKS").is_some(),
         // RDNA_SGPR_UBO=<n>: `Spec::sgpr_ubo` (validation).
         sgpr_ubo: std::env::var("RDNA_SGPR_UBO").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+        // RDNA_GPU_CHAINS=1 (with RDNA_ADDRESSES): every load and read-only
+        // buffer GPU-resolved (validation of `Spec::gpu_loads`, `gpu_res`).
+        gpu_loads: if gpu_chains { (1u64 << plan.loads.len().min(63)) - 1 } else { 0 },
+        gpu_res: if gpu_chains {
+            plan.resources.iter().enumerate().take(64).filter(|(_, r)| r.kind == ResKind::Buffer && !r.written).fold(0u64, |m, (i, _)| m | 1 << i)
+        } else {
+            0
+        },
         stage: u.stage,
         user_sgprs: users,
         user_base,

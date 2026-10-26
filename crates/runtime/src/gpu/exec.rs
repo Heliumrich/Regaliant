@@ -365,6 +365,8 @@ struct Span {
     /// Still backed by the pages it was imported with (cleared when guest
     /// pages in its range are committed or decommitted).
     valid: bool,
+    /// The flip it was imported at.
+    born: u64,
 }
 
 /// Imports whose guest pages were remapped (`revalidate_spans`), freed once
@@ -603,7 +605,7 @@ pub fn debug_dump(clear: bool) -> Vec<u32> {
 }
 
 /// Import windows are aligned to this size within a guest mapping.
-const WINDOW: u64 = 64 << 20;
+pub(super) const WINDOW: u64 = 64 << 20;
 /// Bindings without a bounds check extend at most this far.
 const UNBOUNDED_MAX: u64 = 256 << 20;
 const DUMMY_BYTES: u64 = 64 << 10;
@@ -766,6 +768,32 @@ fn remaps_over_imports_line() -> String {
     )
 }
 
+/// Diagnosis: the valid import window over guest address `a` (start, end,
+/// device address), without importing.
+pub(super) fn window_of(a: u64) -> Option<(u64, u64, u64)> {
+    window_buffer_of(a).map(|(s, e, va, _, _)| (s, e, va))
+}
+
+/// Whether `buf` is still the valid import window starting at guest
+/// `start` and at least `bytes` long (not dropped, its handle not reused).
+pub(super) fn window_valid(buf: vk::Buffer, start: u64, bytes: u64) -> bool {
+    spans_read().iter().any(|s| s.valid && s.buffer == buf && s.start == start && s.end - s.start >= bytes)
+}
+
+/// The valid import window over guest address `a`: (start, end, device
+/// address, buffer, the flip it was imported at), without importing.
+pub(super) fn window_buffer_of(a: u64) -> Option<(u64, u64, u64, vk::Buffer, u64)> {
+    spans_read().iter().find(|s| s.valid && s.start <= a && a < s.end).map(|s| (s.start, s.end, ctx().buffer_address(s.buffer), s.buffer, s.born))
+}
+
+/// Maps every import window into the guest page table (when it is made).
+pub(super) fn map_imports_into_table() {
+    let c = ctx();
+    for s in spans_read().iter().filter(|s| s.valid) {
+        super::pagetable::map(s.start, s.end - s.start, c.buffer_address(s.buffer));
+    }
+}
+
 /// Drops imports whose guest pages were committed or decommitted since.
 fn revalidate_spans() {
     let changed = crate::mem::take_repaged();
@@ -784,10 +812,21 @@ fn revalidate_spans() {
                 crate::info!("gpu: guest range {:#x}..{:#x} imported for the GPU was remapped (imported again on its next use)", s.start, s.end);
             }
             // Freed once no batch can use it (recorded work may).
+            super::pagetable::unmap(s.start, s.end - s.start);
             dead.push(g.swap_remove(i));
         } else {
             i += 1;
         }
+    }
+    // Windows still valid over the pages just cleared map them again (two
+    // windows may cover the same pages).
+    for d in &dead {
+        for v in g.iter().filter(|v| v.valid && v.start < d.end && d.start < v.end) {
+            super::pagetable::map(v.start, v.end - v.start, ctx().buffer_address(v.buffer));
+        }
+    }
+    if !dead.is_empty() {
+        DROP_GEN.fetch_add(1, Ordering::AcqRel);
     }
     let generation = SPAN_GEN.fetch_add(1, Ordering::AcqRel) + 1;
     drop(g);
@@ -1049,7 +1088,8 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
             IMPORT_WIN[1].fetch_add(end - start, Ordering::Relaxed);
             IMPORT_WIN[2].fetch_add(ns, Ordering::Relaxed);
             IMPORT_WIN[3].fetch_max(ns, Ordering::Relaxed);
-            g.push(Span { start, end, buffer, mem, valid: true });
+            g.push(Span { start, end, buffer, mem, valid: true, born: super::FRAMES.load(Ordering::Relaxed) });
+            super::pagetable::map(start, end - start, va);
             SPAN_GEN.fetch_add(1, Ordering::AcqRel);
             IMPORTS.fetch_add(1, Ordering::Relaxed);
             IMPORT_BYTES.fetch_add(end - start, Ordering::Relaxed);
@@ -2104,6 +2144,8 @@ fn note_copy_waits(own: bool, wait: u64) {
 /// the timeline's signals increase.
 fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, fence: vk::Fence, alt: bool) -> Result<(), String> {
     let c = ctx();
+    // Guest page table updates queued before this batch, ahead of it.
+    super::pagetable::submit_pending(c)?;
     SUBMIT_KIND.with(|k| k.set(if xpre.is_some() { 1 } else if wait > 0 { 2 } else { 0 }));
     let mut wait = wait;
     if let Some(x) = xpre {
@@ -5702,9 +5744,15 @@ fn collect_timestamps(bq: vk::QueryPool, pool: vk::QueryPool, shaders: &[u64], q
     }
 }
 
+/// Flips since the last `profile reset`.
+pub fn profile_flips() -> u64 {
+    super::FRAMES.load(Ordering::Relaxed).saturating_sub(MERGE_FROM.load(Ordering::Relaxed))
+}
+
 /// Clears the dispatch timings (`profile reset` control command).
 pub fn reset_shader_profile() {
     draw::reset_draw_stats();
+    super::drawcensus::reset();
     super::cp::reset_draw_state();
     if let Some(m) = SHADER_TIME.lock().as_mut() {
         m.clear();
@@ -6264,6 +6312,114 @@ struct CsRun {
     /// The ring and its uniform window (`Bound::window`; 0 without one).
     ring: vk::Buffer,
     window: u64,
+    /// A GPU-resolved program's run (`gpures`): later commands are appended
+    /// with their user data alone (`gpu_append`).
+    gpu: Option<Box<GpuRun>>,
+}
+
+/// A GPU-resolved run (`CsRun::gpu`): the program, its run roots with the
+/// run's values, its per-item roots, the run's first command's SGPR data
+/// (the others' differ in their user dwords only), the ring it is in, and
+/// the program registers the run was recorded with.
+struct GpuRun {
+    addr: u64,
+    /// The run's first command's preparation (the plan of its translation).
+    found: std::sync::Arc<shaders::Found>,
+    roots: Vec<(super::gpures::Root, u64)>,
+    items: Vec<super::gpures::Root>,
+    template: Vec<u32>,
+    users: usize,
+    which: usize,
+    regs: [u32; 6],
+}
+
+/// GPU-resolved commands: [appended to a run, refused (run roots differ),
+/// refused (other: no run, state, room), pages imported for them].
+pub static GPU_APPENDS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Diagnosis of GPU-resolved commands recorded in full (`gpu_res_check`):
+/// what their shader-resolved reads overlap that the CPU path would have
+/// bound elsewhere: [checked, a home, pending GPU or CP writes, a resident
+/// shadow, not imported].
+pub static GPU_RES_CHECKS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// The compute registers a GPU-resolved run's commands must share with it
+/// (program, resources, thread counts).
+fn gpu_run_regs(cp: &Cp) -> [u32; 6] {
+    [cp.reg(Space::Sh, 0x20C), cp.reg(Space::Sh, 0x20D), cp.reg(Space::Sh, 0x212), cp.reg(Space::Sh, 0x213), cp.reg(Space::Sh, 0x207), cp.reg(Space::Sh, 0x208) ^ (cp.reg(Space::Sh, 0x209) << 16)]
+}
+
+/// Bumped whenever import windows are dropped (`revalidate_spans`): the
+/// ranges GPU-resolved resources reach are imported again after it.
+static DROP_GEN: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// GPU-resolved resources whose ranges were imported: (program,
+    /// resource, its root's pointer) -> `DROP_GEN` then.
+    static GPU_IMPORTED: std::cell::RefCell<HashMap<(u64, u8, u64), u64>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Makes sure the ranges a GPU-resolved command's shader-resolved buffers
+/// reach are imported (in the guest page table): per root pointer met the
+/// first time, the V# read from guest memory and its range imported.
+/// False: one cannot be read or imported.
+fn gpu_res_imported(found: &shaders::Found, addr: u64, mask: u64, user: &[u32]) -> bool {
+    let plan = &found.tr.plan;
+    let generation = DROP_GEN.load(Ordering::Acquire);
+    for r in 0..plan.resources.len().min(64) {
+        if mask & (1u64 << r) == 0 {
+            continue;
+        }
+        let Some(root) = super::gpures::root_of_res(&plan.resources[r]) else { continue };
+        let rv = super::gpures::root_value(root, user);
+        let key = (addr, r as u8, rv);
+        if GPU_IMPORTED.with(|c| c.borrow().get(&key) == Some(&generation)) {
+            continue;
+        }
+        let Some(v) = shaders::resource_vsharp(addr, plan, r, user) else { return false };
+        let n = v.extent();
+        if n > 0 && v.base != 0 {
+            // Within its mapping (unbounded descriptors reach far past it).
+            let n = match mapping(v.base) {
+                Some((_, e)) => n.min(e - v.base),
+                None => return false,
+            };
+            if span(v.base, n).is_none() {
+                return false;
+            }
+            // Static data the shader reads: into the mirror (`gmirror`).
+            super::gmirror::want(v.base, n);
+            GPU_APPENDS[3].fetch_add(1, Ordering::Relaxed);
+        }
+        GPU_IMPORTED.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() > 1 << 16 {
+                c.clear();
+            }
+            c.insert(key, generation);
+        });
+    }
+    true
+}
+
+/// Makes sure the pages a GPU-resolved command's per-item chains start from
+/// are in the guest page table (imported): the user pointers and the
+/// per-item roots' pointers. False: one cannot be imported.
+fn gpu_pages_mapped(items: &[super::gpures::Root], user: &[u32]) -> bool {
+    for &root in items {
+        let ptr = super::gpures::root_value(root, user);
+        if ptr == 0 {
+            continue;
+        }
+        let k = root.0 as usize;
+        let u = user.get(k).copied().unwrap_or(0) as u64 | ((user.get(k + 1).copied().unwrap_or(0) as u64 & 0xFFFF) << 32);
+        for a in [u, ptr] {
+            if a != 0 && super::cp::guest_readable(a, 4) && span(a, 4).is_none() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Bytes of a batched translation's uniform window of the ring.
@@ -9178,6 +9334,7 @@ impl Exec {
             }
         }
         super::precache::invalidate_gpu(a, n);
+        super::gmirror::gpu_write(a, n, self.batch_shaders.last().copied().unwrap_or(0), &self.name);
         super::forward::written(a, n);
         if super::tune::race_checks() {
             self.note_open_write(a, n);
@@ -10543,8 +10700,16 @@ impl Exec {
                 p.sgpr_data[addr_at] = fx.zero_va as u32;
                 p.sgpr_data[addr_at + 1] = (fx.zero_va >> 32) as u32;
             }
+            let gpu_res = found.tr.spec.gpu_res;
+            if gpu_res != 0 || found.tr.spec.gpu_loads != 0 {
+                let pt = super::pagetable::address();
+                p.sgpr_data[addr_at + 2] = pt as u32;
+                p.sgpr_data[addr_at + 3] = (pt >> 32) as u32;
+            }
             for b in &found.tr.out.bindings {
                 match b.kind {
+                    // Resolved by the shader through the page table.
+                    BindingKind::Address(i) if i < 64 && gpu_res & (1u64 << i) != 0 => {}
                     BindingKind::Buffer(i) | BindingKind::Address(i) => {
                         let (base, size, stride, limit) = match &found.resources[i] {
                             Resolved::Buffer(v) => (v.base, v.byte_size(), v.stride, v.index_limit()),
@@ -11124,6 +11289,12 @@ impl Exec {
             return;
         }
         let t_prog = laps().then(std::time::Instant::now);
+        if super::tune::gpu_chains() != 0 && self.gpu_append(cp, groups, initiator) {
+            if let Some(t) = t_prog {
+                prog_note(self.prog_class(), cs_addr(cp), 0, t.elapsed().as_nanos() as u64);
+            }
+            return;
+        }
         let r = self.dispatch_inner(cp, groups, initiator, None);
         if let Some(t) = t_prog {
             prog_note(self.prog_class(), cs_addr(cp), 0, t.elapsed().as_nanos() as u64);
@@ -11141,6 +11312,114 @@ impl Exec {
             }
         }
         self.split_if_gpu_idle();
+    }
+
+    /// Diagnosis: the reads of a GPU-resolved command's shader-resolved
+    /// loads and buffers that the CPU path would have bound elsewhere than
+    /// guest memory (`GPU_RES_CHECKS`; the first 40 logged).
+    fn gpu_res_check(&mut self, p: &Prepared) {
+        let mut ranges: Vec<(String, u64, u64)> = Vec::new();
+        for (i, r) in p.resources.iter().enumerate().take(64) {
+            if p.tr.spec.gpu_res & (1u64 << i) == 0 {
+                continue;
+            }
+            if let Resolved::Buffer(v) = r {
+                ranges.push((format!("buffer {i} (stride {} records {} format {})", v.stride, v.num_records, v.format), v.base, v.extent().max(4)));
+            }
+        }
+        for (what, a, n) in shaders::read_sources(p) {
+            if let Some(k) = what.strip_prefix("load ").and_then(|x| x.split(' ').next()).and_then(|x| x.parse::<usize>().ok()) {
+                if k < 64 && p.tr.spec.gpu_loads & (1u64 << k) != 0 {
+                    ranges.push((what, a, n));
+                }
+            }
+        }
+        for (what, a, n) in ranges {
+            GPU_RES_CHECKS[0].fetch_add(1, Ordering::Relaxed);
+            let r = [(a, n)];
+            let class = if super::homes::overlaps(a, n) {
+                1
+            } else if self.overlaps_pending(&r) || INFLIGHT.latest(&r).is_some() || CP_WRITES.latest(&r).is_some() {
+                2
+            } else if self.resident.iter().any(|x| x.guest < a + n && a < x.guest + x.range) {
+                3
+            } else if span(a, n).is_none() {
+                4
+            } else {
+                0
+            };
+            if class != 0 {
+                let k = GPU_RES_CHECKS[class].fetch_add(1, Ordering::Relaxed);
+                static LOGGED: AtomicU64 = AtomicU64::new(0);
+                if k < 8 && LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
+                    crate::info!("gpu[{}]: GPU-resolved cs {:#x}: {what} at {a:#x}+{n:#x} is {}", self.name, p.addr, ["", "in a video-memory home", "written by pending GPU or CP work", "in a resident shadow", "not imported"][class]);
+                }
+            }
+        }
+    }
+
+    /// A direct dispatch of the open GPU-resolved run's program
+    /// (`CsRun::gpu`) whose run roots hold the run's values: appended to the
+    /// run's dispatch with its own user data, the rest of its SGPR data the
+    /// run's first command's (no preparation, binding, syncs or notes: what
+    /// it reads apart from the run's resources the shader resolves). False:
+    /// the full path records it.
+    fn gpu_append(&mut self, cp: &Cp, groups: [u32; 3], initiator: u32) -> bool {
+        let Some(mut run) = self.cs_run.take() else { return false };
+        let ok = self.gpu_append_to(&mut run, cp, groups, initiator);
+        self.cs_run = Some(run);
+        ok
+    }
+
+    fn gpu_append_to(&mut self, r: &mut CsRun, cp: &Cp, groups: [u32; 3], initiator: u32) -> bool {
+        let Some(g) = r.gpu.as_ref() else { return false };
+        if cs_addr(cp) != g.addr {
+            return false;
+        }
+        if r.batch != self.batch_count || r.uses != self.cmd_uses.get() || !self.recording || self.held || initiator & (1 << 5) != 0 || groups[1] != 1 || groups[2] != 1 || groups[0] == 0 || r.groups + groups[0] > BATCH_MAX_GROUPS || (0x204..0x207).any(|x| cp.reg(Space::Sh, x) != 0) || gpu_run_regs(cp) != g.regs {
+            GPU_APPENDS[2].fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let user: [u32; 16] = std::array::from_fn(|i| cp.reg(Space::Sh, 0x240 + i as u32));
+        if g.roots.iter().any(|&(root, v)| super::gpures::root_value(root, &user) != v) {
+            GPU_APPENDS[1].fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if !gpu_pages_mapped(&g.items, &user) || !gpu_res_imported(&g.found, g.addr, g.found.tr.spec.gpu_res, &user) {
+            GPU_APPENDS[2].fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let bytes = 4 * g.template.len() as u64;
+        let which = g.which;
+        let Some(off) = self.ring_alloc(which, bytes) else {
+            GPU_APPENDS[2].fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        // Inside the run's uniform window, when it has one.
+        if r.window != 0 && off + bytes > r.window + SGPR_WINDOW_BYTES {
+            GPU_APPENDS[2].fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let Some((_, rp)) = self.slots[self.cur].rings[which] else { return false };
+        let g = r.gpu.as_ref().unwrap();
+        unsafe {
+            let dst = rp.add(off as usize) as *mut u32;
+            std::ptr::copy_nonoverlapping(g.template.as_ptr(), dst, g.template.len());
+            std::ptr::copy_nonoverlapping(user.as_ptr(), dst, g.users.min(16));
+            let item = ((off - r.window) / 4) as u32;
+            for k in 0..groups[0] {
+                let e = r.table.add((rdna::translate::BATCH_ENTRY_DWORDS * (r.groups + k)) as usize);
+                e.write(item);
+                e.add(1).write(k);
+            }
+            r.groups += groups[0];
+            r.args.write(r.groups);
+        }
+        GPU_APPENDS[0].fetch_add(1, Ordering::Relaxed);
+        BATCHED[0].fetch_add(1, Ordering::Relaxed);
+        EXECUTED.fetch_add(1, Ordering::Relaxed);
+        self.batch_shaders.push(g.addr);
+        true
     }
 
     /// The profile's dispatch kind (`CS_KINDS`) of a dispatch recorded here.
@@ -11262,6 +11541,22 @@ impl Exec {
             Some(p) => p,
             None => shaders::prepare_compute(cp, wave64)?,
         };
+        if super::tune::gpu_chains() != 0 && p.tr.spec.batched && indirect.is_none() {
+            let user = &p.sgpr_data[..p.tr.spec.user_sgprs as usize];
+            if p.tr.spec.gpu_res != 0 {
+                // A GPU-resolved command recorded in full (a run's first):
+                // what its chains start from must be in the page table.
+                if let Some(d) = super::gpures::decided(p.addr) {
+                    if !gpu_pages_mapped(&d.item_roots, user) || !gpu_res_imported(&p.found, p.addr, p.tr.spec.gpu_res, user) {
+                        return Err(format!("cs {:#x}: GPU-resolved chains reach memory that cannot be imported", p.addr));
+                    }
+                }
+                self.gpu_res_check(&p);
+            } else {
+                let continues = self.cs_streak.0 == p.addr && self.cs_streak.1 >= 2;
+                super::gpures::observe(p.addr, &p.tr.plan, user, continues);
+            }
+        }
         lap.mark(0);
         // Data GPU work still writes: read by the shader itself (`tune
         // gpu_loads 3`; data the title writes stays captured when recorded).
@@ -11749,6 +12044,17 @@ impl Exec {
                         r.groups += groups[0];
                         r.args.write(r.groups);
                     }
+                    // A GPU-resolved run takes this command's run roots (it
+                    // came here because they differ): the items after it
+                    // that share them are appended alone again.
+                    if let Some(g) = r.gpu.as_mut().filter(|g| g.addr == p.addr && p.tr.spec.gpu_res != 0) {
+                        let user = &p.sgpr_data[..g.users.min(p.sgpr_data.len())];
+                        for (root, v) in g.roots.iter_mut() {
+                            *v = super::gpures::root_value(*root, user);
+                        }
+                        g.template.clear();
+                        g.template.extend_from_slice(&p.sgpr_data);
+                    }
                     true
                 }
                 _ => false,
@@ -11819,7 +12125,24 @@ impl Exec {
                         let t = ((off + 16 - wbase) / 4) as u32;
                         c.device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &t.to_le_bytes());
                         c.device.cmd_dispatch_indirect(cmd, ring, off);
-                        self.cs_run = Some(CsRun { batch: self.batch_count, uses: self.cmd_uses.get(), pipeline, descs: desc_signature(&bound), args, table, groups: groups[0], ring, window: wbase });
+                        let gpu = if p.tr.spec.gpu_res != 0 {
+                            super::gpures::decided(p.addr).map(|d| {
+                                let user = &p.sgpr_data[..p.tr.spec.user_sgprs as usize];
+                                Box::new(GpuRun {
+                                    addr: p.addr,
+                                    found: p.found.clone(),
+                                    roots: d.run_roots.iter().map(|&r| (r, super::gpures::root_value(r, user))).collect(),
+                                    items: d.item_roots.clone(),
+                                    template: p.sgpr_data.clone(),
+                                    users: p.tr.spec.user_sgprs as usize,
+                                    which,
+                                    regs: gpu_run_regs(cp),
+                                })
+                            })
+                        } else {
+                            None
+                        };
+                        self.cs_run = Some(CsRun { batch: self.batch_count, uses: self.cmd_uses.get(), pipeline, descs: desc_signature(&bound), args, table, groups: groups[0], ring, window: wbase, gpu });
                         BATCHED[1].fetch_add(1, Ordering::Relaxed);
                     }
                     _ => {
