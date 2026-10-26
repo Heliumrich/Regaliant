@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 173] = [
+    static ALL: [Tunable; 174] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -206,6 +206,7 @@ pub mod tune {
         Tunable { name: "shadow_max", env: "DS_SHADOW_MAX", default: 4 << 20, value: AtomicU64::new(UNSET) },
         Tunable { name: "acb_cpus", env: "DS_ACB_CPUS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "host_census", env: "DS_HOST_CENSUS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_protect", env: "DS_PRE_PROTECT", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1885,6 +1886,14 @@ pub mod tune {
     #[inline]
     pub fn host_census() -> u64 {
         get(172)
+    }
+
+    /// Hosted runs (`precache`, stage H4): shared batch-start copies clean
+    /// for 30 flips are armed read-only through the host and need no
+    /// write-watch take while all their pages stay armed.
+    #[inline]
+    pub fn pre_protect() -> bool {
+        get(173) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

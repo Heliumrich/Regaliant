@@ -181,6 +181,31 @@ pub fn disarm(base: u64, len: u64) {
     disarm_bits(s, lo, hi);
 }
 
+/// Whether every page of guest [base, base+len) is armed (no fault on any
+/// of them since it was armed, no disarm, no mapping change).
+pub fn all_armed(base: u64, len: u64) -> bool {
+    let Some(s) = shared() else { return false };
+    let (lo, hi) = (base & !(PAGE - 1), (base + len.max(1)).next_multiple_of(PAGE));
+    (lo..hi).step_by(PAGE as usize).all(|a| bit(s, a, false).is_some_and(|(w, m)| w.load(Ordering::Acquire) & m != 0))
+}
+
+/// Disarms guest [base, base+len) if a page of it is armed (imports need
+/// writable pages: the driver pins them for writing).
+pub fn disarm_if_armed(base: u64, len: u64) {
+    let Some(s) = shared() else { return };
+    let (lo, hi) = (base & !(PAGE - 1), base.saturating_add(len).next_multiple_of(PAGE).min(crate::mem::GUEST_END));
+    // Leaf by leaf: a range without a leaf has nothing armed.
+    let mut a = lo;
+    while a < hi {
+        let leaf_end = ((a - crate::mem::GUEST_BASE) / (PAGE * LEAF_PAGES) + 1) * PAGE * LEAF_PAGES + crate::mem::GUEST_BASE;
+        let end = leaf_end.min(hi);
+        if bit(s, a, false).is_some() && (a..end).step_by(PAGE as usize).any(|p| bit(s, p, false).is_some_and(|(w, m)| w.load(Ordering::Acquire) & m != 0)) {
+            disarm(a, end - a);
+        }
+        a = end;
+    }
+}
+
 /// Guest [base, base+len) changed its mapping or protection: its pages are
 /// no longer armed (bits cleared, protection left as the change set it).
 pub fn forget(base: u64, len: u64) {

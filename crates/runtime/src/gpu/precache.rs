@@ -107,8 +107,13 @@ struct Entry {
     slot: usize,
     /// When it was made (a copy pending this long is given up: `insert`).
     made: std::time::Instant,
-    /// The flip it was made in (`hostcensus`).
+    /// The flip it was made in (`hostcensus`, `tune pre_protect`).
     born: u64,
+    /// Armed through the host (`tune pre_protect`): while all its pages stay
+    /// armed, no CPU write reached them and it needs no take.
+    armed: bool,
+    /// Queued for arming (`arm_pending`).
+    arm_queued: bool,
 }
 
 struct Slot {
@@ -724,9 +729,23 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     let id = {
         let mut g = lock();
         let c = g.as_mut()?;
-        let e = c.entries.get(&(base, size))?;
+        let e = c.entries.get_mut(&(base, size))?;
         if e.seq == 0 {
             return None;
+        }
+        // Armed through the host with every page still armed: no CPU write
+        // since (a write faults first, and the host clears the page's bit
+        // before letting it through).
+        if e.checked != epoch && e.armed {
+            if crate::hosted::all_armed(base, size) {
+                e.checked = epoch;
+                e.clean_flip = super::FRAMES.load(Ordering::Relaxed);
+                PROT[1].fetch_add(1, Ordering::Relaxed);
+            } else {
+                e.armed = false;
+                e.arm_queued = false;
+                PROT[3].fetch_add(1, Ordering::Relaxed);
+            }
         }
         if e.checked == epoch {
             STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -813,7 +832,82 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     e.checked = epoch;
     e.clean_flip = flip;
     STATS[0].fetch_add(1, Ordering::Relaxed);
+    // Clean for ARM_AFTER flips: armed through the host (`arm_pending`).
+    if !e.armed && !e.arm_queued && flip.saturating_sub(e.born) >= ARM_AFTER && super::tune::pre_protect() && crate::hosted::on() {
+        e.arm_queued = true;
+        TO_ARM.lock().push((base, size, id));
+    }
     Some((e.chunk.clone(), e.offset, if e.on_copy { e.seq } else { 0 }))
+}
+
+/// Flips a shared copy stays clean before it is armed (`tune pre_protect`).
+const ARM_AFTER: u64 = 30;
+/// Copies armed per call of `arm_pending`.
+const ARM_BUDGET: usize = 32;
+/// Copies to arm: (base, size, entry id).
+static TO_ARM: parking_lot::Mutex<Vec<(u64, u64, u64)>> = parking_lot::Mutex::new(Vec::new());
+/// `tune pre_protect`: [copies armed, takes left out, arming takes that found
+/// writes or failed, armed copies found with a page no longer armed].
+static PROT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Arms queued copies through the host (the completion thread): pages'
+/// bits set and read-only, then one more take, which covers writes made
+/// before the protection; a copy found clean by it is armed.
+pub fn arm_pending() {
+    if !super::tune::pre_protect() || !crate::hosted::on() {
+        return;
+    }
+    let todo: Vec<(u64, u64, u64)> = {
+        let mut q = TO_ARM.lock();
+        let n = q.len().min(ARM_BUDGET);
+        q.drain(..n).collect()
+    };
+    for (base, size, id) in todo {
+        if !lock().as_ref().and_then(|c| c.entries.get(&(base, size))).is_some_and(|e| e.id == id && !e.armed) {
+            continue;
+        }
+        if crate::hosted::arm(base, size).is_err() {
+            PROT[2].fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let mut pages = Vec::new();
+        let (g, r, upto) = take_unlocked(base, size, &mut pages, None, 0);
+        let clean = r.is_some() && pages.is_empty();
+        let mut g = if clean { wait_takes(g, base, size, upto) } else { g };
+        let c = g.get_or_insert_with(Cache::default);
+        if !pages.is_empty() {
+            c.why = 1;
+            let k = c.drop_pages(&pages);
+            STATS[3].fetch_add(k, Ordering::Relaxed);
+            c.bounds_changed();
+        }
+        match c.entries.get_mut(&(base, size)) {
+            Some(e) if e.id == id && clean => {
+                e.armed = true;
+                PROT[0].fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                if let Some(e) = c.entries.get_mut(&(base, size)).filter(|e| e.id == id) {
+                    e.arm_queued = false;
+                }
+                drop(g);
+                crate::hosted::disarm(base, size);
+                PROT[2].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// `tune pre_protect`'s status line ("" when off).
+pub fn protect_line() -> String {
+    if !super::tune::pre_protect() || !crate::hosted::on() {
+        return String::new();
+    }
+    let v: Vec<u64> = PROT.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    format!(
+        "    shared copies' write tracking by protection (`tune pre_protect`): {} armed, {} takes left out, {} arming takes found writes or failed, {} armed copies found with a page written or disarmed\n",
+        v[0], v[1], v[2], v[3]
+    )
 }
 
 /// Entries a window take (`tune pre_window`) checked for its epoch, the
@@ -892,7 +986,7 @@ pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     c.chunks[slot].live += 1;
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let flip = super::FRAMES.load(Ordering::Relaxed);
-    c.entries.insert((base, size), Entry { chunk: chunk.clone(), offset, id, seq: 0, on_copy: false, checked: ep, clean_flip: flip, slot, made: std::time::Instant::now(), born: flip });
+    c.entries.insert((base, size), Entry { chunk: chunk.clone(), offset, id, seq: 0, on_copy: false, checked: ep, clean_flip: flip, slot, made: std::time::Instant::now(), born: flip, armed: false, arm_queued: false });
     INSERT_GEN.fetch_add(1, Ordering::Release);
     cover(base, size, true);
     c.by_base.entry(base).or_default().push(size);

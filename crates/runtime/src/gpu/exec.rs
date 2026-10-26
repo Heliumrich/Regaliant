@@ -1029,8 +1029,10 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     // pages must be writable while importing (their regions turn dirty
     // and are re-armed on their next use).
     let _w = super::track::protected().then(|| super::track::host_write(start, end - start));
-    // Pages armed through the host likewise (`hostcensus`).
+    // Pages armed through the host likewise (`hostcensus`, `precache`'s
+    // write tracking by protection).
     crate::hostcensus::release(start, end - start);
+    crate::hosted::disarm_if_armed(start, end - start);
     let t0 = std::time::Instant::now();
     match ctx().import_host(start + alias, end - start, usage) {
         Ok((buffer, mem, va)) => {
@@ -3896,6 +3898,8 @@ fn completion_thread() {
         // `tune host_census`: its written windows are armed before its CP
         // effects release anyone who reads them.
         crate::hostcensus::completed(b.seq);
+        // `tune pre_protect`: shared copies due for arming.
+        super::precache::arm_pending();
         // Label writes the GPU performed within the batch (before its CP
         // effects, which come after its work).
         for &(a, v, n) in &b.gpu_labels {
@@ -11759,6 +11763,7 @@ pub fn status() -> String {
         + &crate::mem::remap_status()
         + &crate::mem::prot_census()
         + &crate::hosted::status()
+        + &super::precache::protect_line()
         + &crate::titlemem::status()
         + &crate::titlefix::status()
         + &super::cp::draw_state_line()
