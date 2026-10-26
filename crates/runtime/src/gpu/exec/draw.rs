@@ -827,7 +827,13 @@ impl Exec {
             DRAW_SKIPPED.fetch_add(1, Ordering::Relaxed);
             return "skipped (`tune skip_cmds`)".into();
         }
-        let outcome = match self.draw_inner(cp, &args) {
+        let t_prog = super::laps().then(std::time::Instant::now);
+        let r = self.draw_inner(cp, &args);
+        if let Some(t) = t_prog {
+            let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
+            super::prog_note(self.prog_class(), shaders::ngg_addr(cp), ps.max(2), t.elapsed().as_nanos() as u64);
+        }
+        let outcome = match r {
             Ok(true) => {
                 DRAWN.fetch_add(1, Ordering::Relaxed);
                 "drawn".into()

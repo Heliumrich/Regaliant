@@ -5074,21 +5074,21 @@ pub(super) const DRAW_STEP_NAMES: [&str; 18] = [
 
 /// The same per dispatch by kind (`CS_KINDS`), steps of `CS_STEP_NAMES`
 /// and then the count of dispatches recorded to the end.
-pub(super) static CS_STEPS: [[AtomicU64; CS_STEP_COUNT + 1]; 6] = [const { [const { AtomicU64::new(0) }; CS_STEP_COUNT + 1] }; 6];
+pub(super) static CS_STEPS: [[AtomicU64; CS_STEP_COUNT + 1]; 8] = [const { [const { AtomicU64::new(0) }; CS_STEP_COUNT + 1] }; 8];
 /// Steps of draws and dispatches that were their batch's first command
 /// (`place_lines`), the count last.
 pub(super) static DRAW_STEPS_FIRST: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
 pub(super) static CS_STEPS_FIRST: [AtomicU64; CS_STEP_COUNT + 1] = [const { AtomicU64::new(0) }; CS_STEP_COUNT + 1];
-const CS_STEP_COUNT: usize = 19;
+const CS_STEP_COUNT: usize = 20;
 pub(super) const CS_STEP_NAMES: [&str; CS_STEP_COUNT] = [
     "prepare", "shader-read sync", "texture sync", "image hazards", "pipeline", "reserve", "bind", "sgpr data", "set alloc",
     "image notes", "set write", "shadow copies", "dispatch", "shadows after", "mirrors", "write tracking", "argument merge",
-    "indirect checks", "indirect barrier",
+    "indirect checks", "indirect barrier", "forwarding",
 ];
 /// Dispatch kinds of the profile: direct or indirect (arguments read by the
 /// GPU), by the graphics command processor, its parallel workers or a
 /// compute queue's command processor (`Exec::cs_kind`).
-const CS_KINDS: [&str; 6] = ["graphics direct", "graphics indirect", "compute direct", "compute indirect", "graphics workers direct", "graphics workers indirect"];
+const CS_KINDS: [&str; 8] = ["graphics direct", "graphics indirect", "compute direct", "compute indirect", "graphics workers direct", "graphics workers indirect", "queue 0x50 direct", "queue 0x50 indirect"];
 
 thread_local! {
     /// The dispatch being executed is an indirect one whose arguments the
@@ -5299,6 +5299,97 @@ fn pre_steps_of(steps: &[AtomicU64; 12], what: &str) -> String {
         .map(|(k, name)| format!("{name} {} ({:.0} ns each, {:.0} ms)", v[2 * k + 1], v[2 * k] as f64 * 1e9 / hz / v[2 * k + 1].max(1) as f64, v[2 * k] as f64 * 1e3 / hz))
         .collect();
     format!("    batch-start copy lookups by outcome{what}: {calls} calls: {}\n", parts.join(", "))
+}
+
+/// Commands by program (`DS_STEP_LAPS=1`): per (executor class, program
+/// key) the commands and their time from entry to return, collected per
+/// thread and added every PROG_FLUSH commands; `profile reset` clears it.
+/// Classes: 0 the graphics CP, 1 its parallel workers, 2 queue 0x50, 3 the
+/// other compute queues. Keys: a draw's vertex and pixel programs, a
+/// dispatch's program (and 1: indirect).
+static PROG_CENSUS: Mutex<Option<HashMap<(u8, u64, u64), [u64; 2]>>> = Mutex::new(None);
+const PROG_FLUSH: u32 = 256;
+static PROG_FROM: AtomicU64 = AtomicU64::new(0);
+/// Bumped by `profile reset`: a thread's batch counted before it is dropped.
+static PROG_GEN: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static PROG_LOCAL: std::cell::RefCell<(u64, u32, HashMap<(u8, u64, u64), [u64; 2]>)> = std::cell::RefCell::new((0, 0, HashMap::new()));
+}
+
+impl Exec {
+    /// This executor's census class.
+    fn prog_class(&self) -> u8 {
+        if self.deferred {
+            1
+        } else if self.name == "gpu-acb0x50" {
+            2
+        } else if self.compute_cp {
+            3
+        } else {
+            0
+        }
+    }
+}
+
+/// A command of program key (a, b) by class `class` took `ns`.
+pub(super) fn prog_note(class: u8, a: u64, b: u64, ns: u64) {
+    let epoch = PROG_GEN.load(Ordering::Relaxed);
+    PROG_LOCAL.with(|l| {
+        let mut l = l.borrow_mut();
+        if l.0 != epoch {
+            l.0 = epoch;
+            l.1 = 0;
+            l.2.clear();
+        }
+        let e = l.2.entry((class, a, b)).or_insert([0; 2]);
+        e[0] += 1;
+        e[1] += ns;
+        l.1 += 1;
+        if l.1 >= PROG_FLUSH {
+            l.1 = 0;
+            let mut g = PROG_CENSUS.lock();
+            let m = g.get_or_insert_with(HashMap::new);
+            for (k, v) in l.2.drain() {
+                let e = m.entry(k).or_insert([0; 2]);
+                e[0] += v[0];
+                e[1] += v[1];
+            }
+        }
+    });
+}
+
+/// The census's lines (`laps_report`): the costliest programs per class.
+fn prog_census_lines() -> String {
+    let g = PROG_CENSUS.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let flips = super::FRAMES.load(Ordering::Relaxed).saturating_sub(PROG_FROM.load(Ordering::Relaxed)).max(1) as f64;
+    let mut out = String::new();
+    for (c, name) in ["graphics CP", "parallel workers", "queue 0x50", "other compute queues"].iter().enumerate() {
+        let mut v: Vec<(&(u8, u64, u64), &[u64; 2])> = m.iter().filter(|(k, _)| k.0 == c as u8).collect();
+        if v.is_empty() {
+            continue;
+        }
+        let all_n: u64 = v.iter().map(|x| x.1[0]).sum();
+        let all_ns: u64 = v.iter().map(|x| x.1[1]).sum();
+        v.sort_by(|a, b| b.1[1].cmp(&a.1[1]));
+        let top: Vec<String> = v
+            .iter()
+            .take(16)
+            .map(|((_, a, b), x)| {
+                let what = if *b > 1 { format!("vs {a:#x} ps {b:#x}") } else if *b == 1 { format!("cs {a:#x} indirect") } else { format!("cs {a:#x}") };
+                format!("{what} {:.0}/flip at {:.1} us ({:.2} ms)", x[0] as f64 / flips, x[1] as f64 / x[0].max(1) as f64 / 1e3, x[1] as f64 / flips / 1e6)
+            })
+            .collect();
+        out.push_str(&format!(
+            "    commands by program, {name}: {:.0} a flip, {:.2} ms a flip ({} programs; counted per thread every {PROG_FLUSH}): {}\n",
+            all_n as f64 / flips,
+            all_ns as f64 / flips / 1e6,
+            v.len(),
+            top.join("; ")
+        ));
+    }
+    out
 }
 
 /// Lap timer of a command's steps (profiling only).
@@ -5657,6 +5748,9 @@ pub fn reset_shader_profile() {
         c.store(0, Ordering::Relaxed);
     }
     crate::mem::ww_reset();
+    *PROG_CENSUS.lock() = None;
+    PROG_GEN.fetch_add(1, Ordering::Relaxed);
+    PROG_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
     for c in DRAW_STEPS.iter().flatten().chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(DRAW_STEPS_FIRST.iter()).chain(CS_STEPS_FIRST.iter()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()).chain(BIND_STEPS_BY.iter().flatten()).chain(PRE_STEPS_BY.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
@@ -5680,7 +5774,7 @@ pub fn laps_report() -> String {
     if !laps() || profiling() {
         return String::new();
     }
-    draw_steps_line() + &bind_steps_line() + &pre_steps_line()
+    draw_steps_line() + &bind_steps_line() + &pre_steps_line() + &prog_census_lines()
 }
 
 /// Shaders by total GPU time.
@@ -11029,7 +11123,12 @@ impl Exec {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if let Err(e) = self.dispatch_inner(cp, groups, initiator, None) {
+        let t_prog = laps().then(std::time::Instant::now);
+        let r = self.dispatch_inner(cp, groups, initiator, None);
+        if let Some(t) = t_prog {
+            prog_note(self.prog_class(), cs_addr(cp), 0, t.elapsed().as_nanos() as u64);
+        }
+        if let Err(e) = r {
             if e != STOPPED {
                 SKIPPED.fetch_add(1, Ordering::Relaxed);
                 self.report(e);
@@ -11049,7 +11148,9 @@ impl Exec {
         // Indirect dispatches whose arguments the CPU read profile as such.
         let indirect = indirect || CPU_INDIRECT.with(|c| c.get());
         indirect as usize
-            + if self.alt_id != 0 {
+            + if self.name == "gpu-acb0x50" {
+                6
+            } else if self.alt_id != 0 {
                 2
             } else if self.deferred {
                 4
@@ -11092,7 +11193,12 @@ impl Exec {
         }
         lap.mark(17);
         GPU_INDIRECT.fetch_add(1, Ordering::Relaxed);
-        if let Err(e) = self.dispatch_inner(cp, [1, 1, 1], initiator, Some(args)) {
+        let t_prog = laps().then(std::time::Instant::now);
+        let r = self.dispatch_inner(cp, [1, 1, 1], initiator, Some(args));
+        if let Some(t) = t_prog {
+            prog_note(self.prog_class(), cs_addr(cp), 1, t.elapsed().as_nanos() as u64);
+        }
+        if let Err(e) = r {
             if e != STOPPED {
                 SKIPPED.fetch_add(1, Ordering::Relaxed);
                 self.report(e);
@@ -11887,6 +11993,7 @@ impl Exec {
                 self.forward_ids.push(id);
             }
         }
+        lap.mark(19);
         EXECUTED.fetch_add(1, Ordering::Relaxed);
         self.batch_shaders.push(p.addr);
         let total = t_start.elapsed();
