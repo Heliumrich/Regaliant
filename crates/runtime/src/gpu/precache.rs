@@ -617,8 +617,10 @@ impl Cache {
                 return Some((*k, self.chunks[*k].chunk.clone(), off));
             }
         }
-        // At most a sixteenth of the device's budget (1 GiB of a 24 GB GPU's
-        // 23 GB budget: `tune pre_share_mib`; ~448 MiB of an 8 GB one).
+        // At most a sixteenth of the device's budget (`tune pre_share_mib`,
+        // 4 GiB: ~1.44 GiB of a 24 GB GPU's 23 GB budget, ~448 MiB of an 8 GB
+        // one; 1 GiB left a quarter of the vista's shareable copies without
+        // space, FINDINGS.md 2026-10-27).
         let mib = super::vk::budget_share(16, super::tune::pre_share_mib() as u64 * (1 << 20));
         let max = (mib / CHUNK).max(2) as usize;
         let idle = |s: &Slot| s.cap == CHUNK && Arc::strong_count(&s.chunk) == 1;
@@ -1039,7 +1041,9 @@ pub fn take_written_for(base: u64, size: u64, out: &mut Vec<u64>, except: Option
 /// Guest [base, base+len) may have changed (CP, host and mapping changes):
 /// copies overlapping it go, and watched shadow windows it overlaps are dated
 /// (file reads by DMA leave no write marks).
+#[track_caller]
 pub fn invalidate(base: u64, len: u64) {
+    super::rgm::invalidate(base, len);
     let end = base.saturating_add(len);
     if len != 0 && base < WATCH_HI.load(Ordering::Acquire) && WATCH_LO.load(Ordering::Acquire) < end {
         let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);

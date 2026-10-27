@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 187] = [
+    static ALL: [Tunable; 188] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -67,7 +67,7 @@ pub mod tune {
         Tunable { name: "pending_set", env: "DS_PENDING_SET", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "tex_scrub", env: "DS_TEX_SCRUB", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_share_min", env: "DS_PRE_SHARE_MIN", default: 16384, value: AtomicU64::new(UNSET) },
-        Tunable { name: "pre_share_mib", env: "DS_PRE_SHARE_MIB", default: 1024, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pre_share_mib", env: "DS_PRE_SHARE_MIB", default: 4096, value: AtomicU64::new(UNSET) },
         Tunable { name: "pre_share_volatile", env: "DS_PRE_SHARE_VOLATILE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "spec_reads", env: "DS_SPEC_READS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "submit_thread", env: "DS_SUBMIT_THREAD", default: 1, value: AtomicU64::new(UNSET) },
@@ -220,6 +220,7 @@ pub mod tune {
         Tunable { name: "forward_earlier", env: "DS_FORWARD_EARLIER", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "forward_held", env: "DS_FORWARD_HELD", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_backoff", env: "DS_PAST_BACKOFF", default: 16, value: AtomicU64::new(UNSET) },
+        Tunable { name: "rgm", env: "DS_RGM", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2035,6 +2036,17 @@ pub mod tune {
         get(186)
     }
 
+    /// Resident GPU-written data (`gpu::rgm`, RENDERER.md "Resident
+    /// GPU-written data"): 1 sized buffer bindings on a working copy in
+    /// video memory kept across batches and queues, merged into guest
+    /// memory by each writing batch; 2 the same without the merges
+    /// (diagnosis, timing only: guest memory lacks the W writes). Boot (the
+    /// device's sparse buffers); 0 (default) off.
+    #[inline]
+    pub fn rgm() -> u64 {
+        get(187)
+    }
+
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
     /// without appends).
     #[inline]
@@ -2089,6 +2101,7 @@ pub mod mirror;
 pub mod ranges;
 pub mod homes;
 pub mod resident;
+pub mod rgm;
 pub mod timeline;
 pub mod replay;
 pub mod threadcpu;

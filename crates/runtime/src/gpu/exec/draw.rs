@@ -828,6 +828,14 @@ impl Exec {
             return "skipped (`tune skip_cmds`)".into();
         }
         let t_prog = super::laps().then(std::time::Instant::now);
+        // Index data this batch wrote on resident GPU-written data goes back
+        // to guest memory first (`gpu::rgm`).
+        if let (Some((ia, sz)), false) = (args.index, self.rgm_unmerged.is_empty()) {
+            let n = if args.gpu_args.is_some() { args.gpu_args.as_ref().map_or(0, |g| g.index_bytes) } else { args.count as u64 * sz as u64 };
+            if let Err(e) = self.rgm_before_in_place(&[(ia, n.max(4))]) {
+                self.report(format!("rgm merge before a draw: {e}"));
+            }
+        }
         let r = self.draw_inner(cp, &args);
         if let Some(t) = t_prog {
             let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;

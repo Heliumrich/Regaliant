@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod draw;
 pub mod kept;
+pub mod rgm;
 pub(crate) use draw::{color_surface, depth_surface, set_equal_bias, toggle_skip_vs};
 
 /// Dispatches of compute shaders on this list are skipped (`skipcs` control
@@ -928,6 +929,12 @@ pub(super) fn import_sites_line() -> String {
     }
     s
 }
+
+/// Bindings placed on resident GPU-written data (`gpu::rgm`; counted as
+/// homes in the placement statistics), and indirect dispatches whose
+/// arguments were read there.
+static RGM_PLACED: AtomicU64 = AtomicU64::new(0);
+pub(super) static RGM_ARGS: AtomicU64 = AtomicU64::new(0);
 
 /// Mirror mode's placements by [written][unbounded pointer][pages: <16,
 /// <256, <4096, more]: [placements, pages].
@@ -2127,6 +2134,9 @@ fn finish_pre(pre: vk::CommandBuffer, copies: &mut Vec<(vk::Buffer, vk::Buffer, 
         global_barrier(pre);
         if bq != vk::QueryPool::null() {
             ctx().device.cmd_write_timestamp(pre, vk::PipelineStageFlags::BOTTOM_OF_PIPE, bq, BQ_PRE + 1);
+        }
+        if super::vk::labels_on() {
+            super::vk::label_end(pre);
         }
         ctx().device.end_command_buffer(pre).ok();
     }
@@ -6212,6 +6222,15 @@ pub struct Exec {
     res_mine: super::fx::Set<u64>,
     res_need: Vec<u64>,
     stage_used: u64,
+    /// Resident GPU-written data (`gpu::rgm`, `exec/rgm.rs`): the open
+    /// batch's claims and their granules, its W writes (all, and those not
+    /// merged into guest memory yet), the merge table, a page list reused.
+    rgm_claims: Vec<super::rgm::Claim>,
+    rgm_mine: super::fx::Map<usize, (u16, u64)>,
+    rgm_written: super::ranges::Ranges,
+    rgm_unmerged: super::ranges::Ranges,
+    rgm_table: Option<rgm::RgmTable>,
+    rgm_pages: Vec<u64>,
     /// Prologue copies not recorded yet (`tune pre_merge`): (source,
     /// destination, region), recorded grouped by buffers by `end_pre`.
     pre_copies: Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>,
@@ -6784,6 +6803,9 @@ struct Closed {
     segs: Vec<SegMark>,
     /// Pages it uploads into the residency mirror (`Exec::res_pages`).
     res_pages: Vec<u64>,
+    /// Granules whose copies in it records, and its W writes (`gpu::rgm`).
+    rgm_claims: Vec<super::rgm::Claim>,
+    rgm_written: super::ranges::Ranges,
     /// Mirror mode: its write-back (`Exec::eager_action`) and its ownership
     /// (`Exec::mm_own`).
     eager_action: Option<Action>,
@@ -6864,6 +6886,12 @@ impl Exec {
                 res_mine: Default::default(),
                 res_need: Vec::new(),
                 stage_used: 0,
+                rgm_claims: Vec::new(),
+                rgm_mine: Default::default(),
+                rgm_written: Default::default(),
+                rgm_unmerged: Default::default(),
+                rgm_table: None,
+                rgm_pages: Vec::new(),
                 pre_copies: Vec::new(),
                 xcopies: Vec::new(),
                 copy_wait: 0,
@@ -7362,6 +7390,9 @@ impl Exec {
         if let Err(e) = self.keep_end_batch() {
             self.report(format!("kept window write-back: {e}"));
         }
+        if let Err(e) = self.rgm_merge(None) {
+            self.report(format!("rgm merge: {e}"));
+        }
         st.mark(0);
         if self.submit_after > done_seq() {
             // Deferred CP writes that this work may read come first.
@@ -7400,6 +7431,9 @@ impl Exec {
             }
             XDRY.fetch_add(1, Ordering::Relaxed);
         }
+        // Labels opened by the batch's last work (merges, timestamp stores)
+        // end with its command buffer (`DS_GPU_LABELS`).
+        self.label_close();
         let i = self.cur;
         // The executor's segment sizes come down after SEG_DECAY batches
         // that used under a quarter of them (after a level load's big
@@ -7468,8 +7502,9 @@ impl Exec {
             };
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
             self.keep_submitted(0);
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), rgm_claims: std::mem::take(&mut self.rgm_claims), rgm_written: std::mem::take(&mut self.rgm_written), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises });
             self.res_mine.clear();
+            self.rgm_batch_done(true);
             self.stage_used = 0;
             self.slots[i].seq = PENDING;
             self.pending_promises.clear();
@@ -7577,6 +7612,13 @@ impl Exec {
         super::precache::invalidate_ranges_except(&writes, &std::mem::take(&mut self.shared_kept));
         st.mark(9);
         self.inflight.insert_all(seq, &writes);
+        // Writes by other paths dirty resident pages again now that they
+        // precede later batches (a copy in by a batch submitted before this
+        // one ran before them).
+        if super::rgm::get().is_some() {
+            super::rgm::invalidate_except(&writes, &self.rgm_written);
+        }
+        self.rgm_batch_done(true);
         st.mark(10);
         self.keep_submitted(seq);
         self.own_gen += 1;
@@ -7627,6 +7669,7 @@ impl Exec {
         self.batch_shaders.clear();
         self.resident.clear();
         super::resident::dropped(&std::mem::take(&mut self.res_pages));
+        self.rgm_batch_done(false);
         self.owned.clear();
         self.eager_action = None;
         self.pre_after.clear();
@@ -7963,6 +8006,9 @@ impl Exec {
             global_barrier(pre);
             if bq != vk::QueryPool::null() {
                 ctx().device.cmd_write_timestamp(pre, vk::PipelineStageFlags::BOTTOM_OF_PIPE, bq, BQ_PRE + 1);
+            }
+            if super::vk::labels_on() {
+                super::vk::label_end(pre);
             }
             ctx().device.end_command_buffer(pre).ok();
         }
@@ -8644,8 +8690,9 @@ impl Exec {
         let Some((buffer, start, _)) = span(base, len) else { return Ok(false) };
         self.keep_cp_write(base, len);
         // Resident shadows holding newer data of the range go back first:
-        // their merge would undo the fill.
+        // their merge would undo the fill (and so would this batch's W writes').
         self.flush_resident(Some(&[(base, len)]))?;
+        self.rgm_before_in_place(&[(base, len)])?;
         self.begin();
         if !self.recording {
             return Ok(false);
@@ -9452,6 +9499,10 @@ impl Exec {
                     c.device.cmd_reset_query_pool(pre, bq, BQ_PRE, 2);
                 }
             }
+            // The whole prologue is one label range (`DS_GPU_LABELS`).
+            if super::vk::labels_on() {
+                super::vk::label_begin(pre, &format!("{} prologue", self.name));
+            }
             // After all earlier submitted work (`tune skip_barriers` 128:
             // left out, timing only).
             if super::tune::skip_barriers() & 128 == 0 {
@@ -9666,6 +9717,23 @@ impl Exec {
             }
         }
         super::precache::invalidate_gpu(a, n);
+        if !self.rgm_written.contains(a, n) {
+            // (By the caller's site: `note_write` is the common path.)
+            if let Some(r) = super::rgm::get() {
+                let d = r.invalidate(a, n);
+                if d > 0 {
+                    super::rgm::note_site_at(std::panic::Location::caller(), 1, d);
+                    if d >= 64 {
+                        super::rgm::note_big_writer(self.noting, &self.name, a, n, d);
+                    }
+                    // Large writes by other paths (unbounded pointers) into
+                    // resident data recur: those granules take the old paths.
+                    if d >= 16 {
+                        r.demote(a, n);
+                    }
+                }
+            }
+        }
         super::gmirror::gpu_write(a, n, self.batch_shaders.last().copied().unwrap_or(0), &self.name);
         super::forward::written(a, n);
         if super::tune::race_checks() {
@@ -9726,6 +9794,9 @@ impl Exec {
         super::resident::host_for_cp(a, bytes);
         let Some((buffer, start, _)) = span(a, bytes) else { return false };
         self.keep_cp_write(a, bytes);
+        if self.recording && self.rgm_before_in_place(&[(a, bytes)]).is_err() {
+            return false;
+        }
         // CPU-side writes deferred into the recording batch run after it
         // completes: this one would pass them. Earlier batches' run before
         // the batch holding this one is submitted.
@@ -11033,7 +11104,15 @@ impl Exec {
             }
             super::precache::submitted(&b.shared, seq);
             super::resident::submitted(&b.res_pages, seq);
+            if !b.rgm_claims.is_empty() {
+                if let Some(r) = super::rgm::get() {
+                    r.submitted(&b.rgm_claims);
+                }
+            }
             INFLIGHT.note_ranges(seq, &b.writes);
+            if super::rgm::get().is_some() {
+                super::rgm::invalidate_except(&b.writes, &b.rgm_written);
+            }
             journal_note(&b.writes, &self.name);
             crate::hostcensus::gpu_wrote(seq, &b.writes);
             if self.name.starts_with("gpu-gfx-par") {
@@ -11079,6 +11158,11 @@ impl Exec {
             super::forward::drop_checks(&b.forward_ids);
             super::forward::drop_entries(&b.forward_ids);
             super::resident::dropped(&b.res_pages);
+            if !b.rgm_claims.is_empty() {
+                if let Some(r) = super::rgm::get() {
+                    r.dropped(&b.rgm_claims);
+                }
+            }
             let s = &mut self.slots[b.slot];
             unsafe {
                 c.device.reset_command_buffer(s.cmd, vk::CommandBufferResetFlags::empty()).ok();
@@ -11217,6 +11301,29 @@ impl Exec {
                             }
                             None => None,
                         };
+                        // Resident GPU-written data (`gpu::rgm`): sized bindings
+                        // on the working copy W.
+                        let mut from_rgm = false;
+                        let home = match home {
+                            Some(h) => Some(h),
+                            None if sized && from_mirror.is_none() && super::rgm::get().is_some() => {
+                                let h = self.rgm_bind(base, size, found.tr.plan.resources[i].written);
+                                from_rgm = h.is_some();
+                                h
+                            }
+                            None => None,
+                        };
+                        // Otherwise guest memory is used where this batch's W
+                        // writes may be: they go back to it first.
+                        if home.is_none() && !self.rgm_unmerged.is_empty() {
+                            if !sized {
+                                self.rgm_before_in_place(&[(base, size)])?;
+                            } else if found.tr.plan.resources[i].written {
+                                self.rgm_before_in_place(&[(base, size)])?;
+                            } else {
+                                self.rgm_before_in_place(&[(base, size)])?;
+                            }
+                        }
                         BindClock::mark(&mut clk, 1);
                         // Inside a resident shadow: its working copy is newer.
                         let resident = if read_only && home.is_none() { self.resident_read(base, size)? } else { None };
@@ -11284,6 +11391,9 @@ impl Exec {
                         }
                         if let Some((hbuf, hoff, avail)) = home {
                             placement = if from_mirror.is_some() { Placement::Mirrored } else { Placement::Home };
+                            if from_rgm {
+                                RGM_PLACED.fetch_add(1, Ordering::Relaxed);
+                            }
                             // Mirror placements start at a mark word (`Spec::write_marks`).
                             let align = if from_mirror.is_some() { 128 } else { ctx().limits.min_storage_buffer_offset_alignment.max(4) };
                             let off = hoff & !(align - 1);
@@ -11435,6 +11545,25 @@ impl Exec {
                         if super::smalltrack::on() {
                             let k = PLACEMENTS.iter().position(|&x| x == placement).unwrap_or(7);
                             super::smalltrack::bound(base, size, found.tr.plan.resources[i].written, k, &self.name, p.addr, matches!(found.resources[i], Resolved::Global(_, None)));
+                        }
+                        // DS_TRACE_PLACE=<hex shader>: its bindings' placements, the
+                        // first 64 from flip DS_TRACE_PLACE_FROM on (diagnosis: what a
+                        // program reads across PCIe).
+                        static TRACE_PLACE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+                        let (tp, tp_from) = *TRACE_PLACE.get_or_init(|| {
+                            let a = std::env::var("DS_TRACE_PLACE").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0);
+                            (a, std::env::var("DS_TRACE_PLACE_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+                        });
+                        if tp != 0 && tp == p.addr && super::FRAMES.load(Ordering::Relaxed) >= tp_from {
+                            static N: AtomicU64 = AtomicU64::new(0);
+                            if N.fetch_add(1, Ordering::Relaxed) < 64 {
+                                let what = match &found.resources[i] {
+                                    Resolved::Buffer(v) => format!("V# stride {} records {}", v.stride, v.num_records),
+                                    Resolved::Global(_, n) => format!("pointer ({n:?} bytes)"),
+                                    _ => String::new(),
+                                };
+                                crate::info!("place: {:?} shader {:#x} resource {i} {base:#x}+{size:#x} ({what}){}: {placement:?}", p.stage, p.addr, if found.tr.plan.resources[i].written { " written" } else { "" });
+                            }
                         }
                         let ri = res_info + RES_INFO_DWORDS as usize * i;
                         p.sgpr_data[ri] = bias as u32;
@@ -12437,7 +12566,18 @@ impl Exec {
             super::vk::checkpoint(self.cmd(), super::vk::mark::DISPATCH, p.addr);
         }
         let start = [cp.reg(Space::Sh, 0x204), cp.reg(Space::Sh, 0x205), cp.reg(Space::Sh, 0x206)];
+        // Arguments on resident GPU-written data (`gpu::rgm`) are read from
+        // its working copy (the dispatch before typically wrote them there);
+        // else this batch's W writes there go to guest memory first.
+        let rgm_args = indirect.filter(|_| !self.rgm_unmerged.is_empty() || super::rgm::get().is_some()).and_then(|a| self.rgm_bind(a, 12, false)).map(|(b, off, _)| (b, off));
+        if let (Some(a), None) = (indirect, rgm_args) {
+            self.rgm_before_in_place(&[(a, 12)])?;
+        }
         let args = match indirect {
+            Some(_) if rgm_args.is_some() => {
+                RGM_ARGS.fetch_add(1, Ordering::Relaxed);
+                rgm_args
+            }
             // Still held by a resident shadow (binding and batch changes since
             // the check above may have merged it): its working copy.
             Some(a) if self.shadow_args() && self.resident_args(a).is_some() => {
@@ -12903,6 +13043,7 @@ pub fn status() -> String {
         + &super::compile::status()
         + &async_line()
         + &super::cp::past_wait_status()
+        + &super::rgm::status_line(super::FRAMES.load(Ordering::Relaxed))
         + &super::par::status()
         + &super::keep::status()
         + &format!(
