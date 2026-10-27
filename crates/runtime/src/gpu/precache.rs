@@ -1060,6 +1060,16 @@ pub fn invalidate(base: u64, len: u64) {
     drop_overlapping(base, len, false);
 }
 
+/// Whether a shared copy of guest [base, base+size) was dropped for GPU
+/// writes within the last two frames: a long parallel run's chunk neither
+/// reuses nor makes one (an earlier chunk, recorded at the same time, may
+/// write it again; its private batch-start copy runs after that write).
+pub fn gpu_written_lately(base: u64, size: u64) -> bool {
+    let g = lock();
+    let Some(c) = g.as_ref() else { return false };
+    c.volatile.get(&(base, size)).is_some_and(|&f| f.saturating_add(2) >= super::FRAMES.load(Ordering::Relaxed))
+}
+
 /// GPU work writes guest [base, base+len): copies overlapping it go, and
 /// their ranges are not kept for a while (`tune pre_share_volatile`).
 pub fn invalidate_gpu(base: u64, len: u64) {

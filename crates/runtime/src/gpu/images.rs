@@ -2758,6 +2758,14 @@ impl Images {
 
     /// Image for a T#: an existing GPU image at that address with a
     /// compatible size, or a texture uploaded from guest memory.
+    /// Whether the image a storage binding of `t` writes exists and is
+    /// GPU-owned already: binding it changes no ownership (a long parallel
+    /// run's chunk may then bind it, `Exec::long`).
+    pub fn storage_owned(&self, t: &Tsharp) -> bool {
+        let Some(key) = Self::key_of(t) else { return false };
+        self.lookup(&key, true).is_some_and(|(k, _)| self.map.get(&k).is_some_and(|i| i.gpu_written))
+    }
+
     fn image_for(&mut self, t: &Tsharp, frame: u64, storage: bool) -> Result<ImageKey, String> {
         let key = Self::key_of(t).ok_or_else(|| format!("image format {} unsupported", t.format))?;
         if let Some((k, how)) = self.lookup(&key, storage) {

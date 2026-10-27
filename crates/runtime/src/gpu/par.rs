@@ -140,6 +140,86 @@ pub struct Run {
     main_submitted: Arc<AtomicBool>,
     /// The workers time each command (`tune par_cost`).
     pub timed: bool,
+    /// A long run's own state (`tune long_runs`; None: an ordinary run).
+    long: Option<Long>,
+}
+
+/// A long parallel run (`tune long_runs`, RENDERER.md "Long parallel
+/// runs"): its chunks pass the title's GPU-side synchronization, so each is
+/// recorded held (`Cp::long_begin`) and checked at its turn against what the
+/// run's part before it writes.
+struct Long {
+    /// Each worker chunk's predicted labels: the run's last write to each
+    /// label before the chunk (address -> value, bytes; 0 bytes: a
+    /// timestamp).
+    labels: Vec<std::collections::HashMap<u64, (u64, u8)>>,
+    /// What the run before the chunk whose turn it is writes: the main
+    /// command processor's batch when the run was planned, then each
+    /// submitted chunk's and what the main command processor records of the
+    /// run (`add_writes`); in the second, those writes but for the planner's
+    /// copies (`forward::plan`).
+    writes: Mutex<(super::ranges::Ranges, super::ranges::Ranges)>,
+    /// Each worker chunk's copies forwarded before it (`forward::inherited`)
+    /// and all the run's planned copies (packet -> words).
+    inherited: Vec<Vec<super::forward::Planned>>,
+    planned: Arc<std::collections::HashMap<u64, Arc<[u32]>>>,
+    /// A chunk computed a planned copy otherwise: the later chunks were given
+    /// wrong words (each is recorded again).
+    bad: AtomicBool,
+}
+
+/// Long runs (`tune long_runs`): [runs, commands in them, chunks
+/// committed, dropped at their turn, stopped early, (unused)].
+pub static LONG: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static LONG_DROPS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+static LONG_STOPS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+fn bump(l: &Mutex<Vec<(&'static str, u64)>>, w: &'static str) {
+    let mut g = l.lock();
+    match g.iter_mut().find(|e| e.0 == w) {
+        Some(e) => e.1 += 1,
+        None => g.push((w, 1)),
+    }
+}
+
+/// `DS_TRACE_LONG_DROPS=<flip>`: the first 60 chunks of long runs dropped at
+/// their turn from that flip on, with the read that conflicted.
+fn trace_long_drops() -> bool {
+    static FROM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    FROM.get_or_init(|| std::env::var("DS_TRACE_LONG_DROPS").ok().and_then(|v| v.parse().ok())).is_some_and(|f| super::FRAMES.load(Ordering::Relaxed) >= f)
+}
+
+/// Status line of long runs ("" before any).
+pub fn long_line() -> String {
+    let v: Vec<u64> = LONG.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if v[0] == 0 {
+        return String::new();
+    }
+    let list = |l: &Mutex<Vec<(&'static str, u64)>>| {
+        let mut g = l.lock().clone();
+        g.sort_by(|a, b| b.1.cmp(&a.1));
+        g.iter().map(|(w, n)| format!("{w} {n}")).collect::<Vec<_>>().join(", ")
+    };
+    format!(
+        "    long parallel runs: {} runs ({} commands, {:.0} each), chunks committed {}, dropped at their turn {} ({}), stopped early {} ({})\n",
+        v[0],
+        v[1],
+        v[1] as f64 / v[0] as f64,
+        v[2],
+        v[3],
+        list(&LONG_DROPS),
+        v[4],
+        list(&LONG_STOPS)
+    )
+}
+
+/// Clears the long runs' statistics (`profile reset`).
+pub fn long_reset() {
+    for c in &LONG {
+        c.store(0, Ordering::Relaxed);
+    }
+    LONG_DROPS.lock().clear();
+    LONG_STOPS.lock().clear();
 }
 
 impl Run {
@@ -160,6 +240,28 @@ impl Run {
             main_writes,
             main_submitted,
             timed: false,
+            long: None,
+        }
+    }
+
+    /// Makes it a long run: each worker chunk's predicted labels, and what
+    /// the main command processor's batch writes when it was planned.
+    pub fn set_long(&mut self, labels: Vec<std::collections::HashMap<u64, (u64, u8)>>, writes: super::ranges::Ranges, inherited: Vec<Vec<super::forward::Planned>>, planned: Arc<std::collections::HashMap<u64, Arc<[u32]>>>) {
+        self.long = Some(Long { labels, writes: Mutex::new((writes, Default::default())), inherited, planned, bad: AtomicBool::new(false) });
+    }
+
+    /// A long run (`set_long`).
+    pub fn is_long(&self) -> bool {
+        self.long.is_some()
+    }
+
+    /// The main command processor's part of a long run writes `w` (before
+    /// it gives the first chunk its turn).
+    pub fn add_writes(&self, w: &super::ranges::Ranges) {
+        if let Some(l) = &self.long {
+            let mut g = l.writes.lock();
+            g.0.extend(w);
+            g.1.extend(w);
         }
     }
 
@@ -498,6 +600,10 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         cp.set_chunk_state(&state);
         cp.chunk_start(&run.main_writes, &run.main_submitted);
         cp.chunk_costs = run.timed.then(|| Vec::with_capacity(512));
+        let long = run.long.as_ref();
+        if let Some(l) = long {
+            cp.long_begin(l.labels.get(i).cloned().unwrap_or_default(), l.inherited.get(i).map_or(&[][..], |v| &v[..]), l.planned.clone());
+        }
         lap(1, &mut t);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cp.run_chunk(from, to)));
         let failed = r.is_err();
@@ -513,26 +619,76 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         }
         let mut t = std::time::Instant::now();
         let granted = run.turn.load(Ordering::Acquire) > i;
-        if !granted || failed {
-            // Cancelled before its turn, or failed (the main command
+        // A long run's chunk at its turn: recorded again by the main command
+        // processor if it read on the CPU what the run before it writes (or
+        // used an image with a clear or reload pending), else its notes go to
+        // the image cache and its writes to the run's before it submits.
+        let dropped = match long {
+            Some(l) if granted && !failed => {
+                let earlier = l.writes.lock();
+                let d = if l.bad.load(Ordering::Acquire) { Some("an earlier chunk computed a planned copy otherwise") } else { cp.long_check(&earlier.0, &earlier.1) };
+                if d.is_some() && trace_long_drops() {
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) < 60 {
+                        let r = cp.long_read_of(&earlier.0);
+                        let (a, n) = r.unwrap_or((0, 0));
+                        crate::info!("gpu[{name}]: long run chunk {i} at {from:#x}..{to:#x} dropped: {} (read {a:#x}+{n:#x}; {}; earlier writes there {:?})", d.unwrap_or(""), super::forward::describe(a, n), earlier.0.intersect(a, n));
+                    }
+                }
+                drop(earlier);
+                if d.is_none() {
+                    let writes = cp.worker_writes();
+                    let (nonfwd, mismatch) = cp.long_take();
+                    let mut g = l.writes.lock();
+                    g.0.extend(&writes);
+                    g.1.extend(&nonfwd);
+                    if mismatch {
+                        l.bad.store(true, Ordering::Release);
+                    }
+                }
+                d
+            }
+            _ => None,
+        };
+        if let Some(why) = dropped {
+            LONG[3].fetch_add(1, Ordering::Relaxed);
+            bump(&LONG_DROPS, why);
+        }
+        if !granted || failed || dropped.is_some() {
+            // Cancelled before its turn, failed or dropped (the main command
             // processor executes it from its start): never submitted.
             cp.worker_discard();
+        }
+        if long.is_some() {
+            if granted && !failed && dropped.is_none() {
+                LONG[2].fetch_add(1, Ordering::Relaxed);
+                if stopped.is_some() {
+                    LONG[4].fetch_add(1, Ordering::Relaxed);
+                    bump(&LONG_STOPS, cp.worker_stop_why());
+                }
+                cp.long_commit();
+            } else {
+                cp.long_end();
+            }
         }
         if !granted {
             return;
         }
         let done = if failed {
             Done { stopped, state: *state, last: None, why: "failed", costs: Vec::new(), writes: Default::default() }
+        } else if let Some(why) = dropped {
+            Done { stopped: Some(from), state: *state, last: None, why, costs: Vec::new(), writes: Default::default() }
         } else {
             let writes = if super::runprobe::on() || super::tune::past_runs() { cp.worker_writes() } else { Default::default() };
             let last = cp.worker_submit();
             let why = if stopped.is_some() { cp.worker_stop_why() } else { "" };
-            Done { stopped, state: cp.chunk_state(), last, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes }
+            let state = if long.is_some() { cp.chunk_state_stacked() } else { cp.chunk_state() };
+            Done { stopped, state, last, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes }
         };
         drop(cp);
         run.results.lock()[i] = Some(done);
         run.posted.store(i + 1, Ordering::Release);
-        if stopped.is_none() {
+        if stopped.is_none() && dropped.is_none() {
             // The next chunk follows this one's end directly.
             run.turn.fetch_max(i + 2, Ordering::AcqRel);
         }
@@ -575,6 +731,7 @@ pub fn reset_stats() {
     *LENGTHS_C.lock() = [[0; 2]; 6];
     ENDS_C.lock().clear();
     ENDS_SHORT.lock().clear();
+    long_reset();
 }
 
 /// One status line ("" before any parallel run).
@@ -629,7 +786,7 @@ pub fn status() -> String {
     } else {
         String::new()
     };
-    past + &format!(
+    past + &long_line() + &format!(
         "    parallel runs: {runs} runs ({} split at equal recording cost; {} pre-wakes, {} relayed, spins {} saw their run, {} ran out), {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled, {} worker reads of the main command processor's unsubmitted writes ({} waited {:.0} us on average for its submission); main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}; runs under 32 commands by end {}; compute queues' runs by length {}; by end {}\n",
         super::cp::PAR_COSTED.load(Ordering::Relaxed),
         PREWAKES[0].load(Ordering::Relaxed),

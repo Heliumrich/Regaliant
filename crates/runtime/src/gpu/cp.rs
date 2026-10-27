@@ -478,6 +478,30 @@ pub struct ChunkState {
     num_instances: u32,
     draw_indirect_base: u64,
     dispatch_indirect_base: u64,
+    /// The context register stack (CONTEXT_STATE), where a long parallel
+    /// run's chunk starts or ends (`tune long_runs`); None: left as it is.
+    stack: Option<Vec<Vec<u32>>>,
+}
+
+/// A label or timestamp write a long parallel run's planning passed (`tune
+/// long_runs`): its address, value and bytes (0: a timestamp, its value
+/// unknown) and its packet.
+#[derive(Clone, Copy)]
+struct RunLabel {
+    a: u64,
+    v: u64,
+    bytes: u8,
+    at: u64,
+}
+
+/// The labels a long run's chunk starting at packet `start` finds written
+/// by the run before it (the last write to each address).
+fn labels_before(labels: &[RunLabel], start: u64) -> HashMap<u64, (u64, u8)> {
+    let mut m = HashMap::new();
+    for l in labels.iter().filter(|l| l.at < start) {
+        m.insert(l.a, (l.v, l.bytes));
+    }
+    m
 }
 
 /// A parallel run in progress: chunk i + 1 starts at `starts[i]` and is
@@ -685,6 +709,10 @@ fn chunk_states_equal(a: &ChunkState, b: &ChunkState, sh_skip: &[u32]) -> bool {
         && a.num_instances == b.num_instances
         && a.draw_indirect_base == b.draw_indirect_base
         && a.dispatch_indirect_base == b.dispatch_indirect_base
+        && match (&a.stack, &b.stack) {
+            (Some(x), Some(y)) => x == y,
+            _ => true,
+        }
 }
 
 /// Commands per chunk at least (a third of `tune par_min`, the commands a
@@ -1349,8 +1377,8 @@ fn epoch_wait_lines() -> String {
 static CP_CLASSES: [[AtomicU64; 3]; 10] = [const { [const { AtomicU64::new(0) }; 3] }; 10];
 /// The graphics command processor's serial commands by why they were not in
 /// a parallel run (`tune cp_classes`): `SERIAL_WHY_NAMES`.
-static SERIAL_WHY: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
-const SERIAL_WHY_NAMES: [&str; 9] = ["small fetched buffers", "streamed", "runs of 1", "runs of 2-7", "runs of 8-31", "runs of 32-127", "runs of 128 or more", "other", "small fetched buffers' count"];
+static SERIAL_WHY: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+const SERIAL_WHY_NAMES: [&str; 14] = ["small fetched buffers", "streamed", "runs of 1", "runs of 2-7", "runs of 8-31", "runs of 32-127", "runs of 128 or more", "other", "small fetched buffers' count", "past a run", "past a label wait", "predicated", "held otherwise", "no plan made"];
 /// FRAMES when the classes were last cleared.
 static CP_CLASSES_FROM: AtomicU64 = AtomicU64::new(0);
 /// The same per PM4 opcode for the compute queue `tune cp_classes_acb`
@@ -1744,7 +1772,13 @@ impl Cp {
             num_instances: self.num_instances,
             draw_indirect_base: self.draw_indirect_base,
             dispatch_indirect_base: self.dispatch_indirect_base,
+            stack: None,
         }
+    }
+
+    /// `chunk_state` with the context register stack (a long run's chunk).
+    pub fn chunk_state_stacked(&self) -> ChunkState {
+        ChunkState { stack: Some(self.ctx_stack.clone()), ..self.chunk_state() }
     }
 
     pub fn set_chunk_state(&mut self, s: &ChunkState) {
@@ -1758,6 +1792,9 @@ impl Cp {
         self.num_instances = s.num_instances;
         self.draw_indirect_base = s.draw_indirect_base;
         self.dispatch_indirect_base = s.dispatch_indirect_base;
+        if let Some(st) = &s.stack {
+            self.ctx_stack.clone_from(st);
+        }
     }
 
     /// Gives this (worker) command processor a deferred executor.
@@ -1981,6 +2018,64 @@ impl Cp {
         }
     }
 
+    /// A worker starts a chunk of a long parallel run (`tune long_runs`):
+    /// held as the frame-ahead recorder is, its waits passing on `labels`
+    /// (the run's last writes before the chunk), its own writes, memory or
+    /// promises, never polling (`held_wait`); CPU-side effects stop it.
+    pub fn long_begin(&mut self, labels: HashMap<u64, (u64, u8)>, inherited: &[super::forward::Planned], planned: Arc<HashMap<u64, Arc<[u32]>>>) {
+        self.held = Some(Box::new(super::frameahead::HeldCp { frames: u64::MAX, labels, stop: None, commands: 0, waits: [0; 5], poll: false }));
+        self.fence_pending = false;
+        if let Some(e) = self.exec.as_mut() {
+            e.long_begin(planned);
+        }
+        // Its copies forward into its own view, which starts with the copies
+        // the planner forwarded before it (later chunks see its own once it
+        // passed its check: `long_commit`).
+        if !self.compute {
+            super::forward::hold_begin_with(inherited);
+        }
+    }
+
+    /// What its long chunk wrote otherwise than by the planner's copies, and
+    /// whether it computed one otherwise (`Exec::long_take`).
+    pub fn long_take(&mut self) -> (super::ranges::Ranges, bool) {
+        self.exec.as_mut().map(|e| e.long_take()).unwrap_or_default()
+    }
+
+    /// The packet being executed.
+    pub fn cur_packet(&self) -> u64 {
+        self.cur_packet
+    }
+
+    /// Whether the long run's chunk it recorded must be recorded again
+    /// (`Exec::long_conflict`): why.
+    pub fn long_check(&self, earlier: &super::ranges::Ranges, chunks: &super::ranges::Ranges) -> Option<&'static str> {
+        self.exec.as_ref().and_then(|e| e.long_conflict(earlier, chunks))
+    }
+
+    /// The first CPU read of its chunk that `earlier` writes (traces).
+    pub fn long_read_of(&self, earlier: &super::ranges::Ranges) -> Option<(u64, u64)> {
+        self.exec.as_ref().and_then(|e| e.long_conflict_read(earlier))
+    }
+
+    /// The chunk passed its check (`Exec::long_commit`).
+    pub fn long_commit(&mut self) {
+        self.held = None;
+        super::forward::hold_commit();
+        if let Some(e) = self.exec.as_mut() {
+            e.long_commit();
+        }
+    }
+
+    /// The chunk was dropped, cancelled or failed (`Exec::long_end`).
+    pub fn long_end(&mut self) {
+        self.held = None;
+        super::forward::hold_drop();
+        if let Some(e) = self.exec.as_mut() {
+            e.long_end();
+        }
+    }
+
     /// Closes the batch a chunk recorded into.
     pub fn chunk_finish(&mut self) {
         if let Some(e) = self.exec.as_mut() {
@@ -2017,13 +2112,25 @@ impl Cp {
             }
             let n = count as u64 + 1;
             let next = cur + 4 * (n + 1);
-            if next > to || !valid(cur, 4 * (n + 1)) || !(is_command(opcode) || is_state(opcode) || opcode == op::NOP || par_event(opcode, self.compute)) {
+            // A long run's chunk (held: `long_begin`) also executes the
+            // packets its planning went through (`long_passes`).
+            let long = self.held.is_some();
+            let soft = long && matches!(opcode, op::EVENT_WRITE | op::ACQUIRE_MEM | op::PFP_SYNC_ME | op::CLEAR_STATE | op::WRITE_DATA | op::RELEASE_MEM | op::WAIT_REG_MEM | op::WAIT_REG_MEM64);
+            if next > to || !valid(cur, 4 * (n + 1)) || !(is_command(opcode) || is_state(opcode) || opcode == op::NOP || par_event(opcode, self.compute) || soft) {
                 return Some(cur);
             }
             PACKETS.fetch_add(1, Ordering::Relaxed);
             self.cur_packet = cur;
             self.cur_opcode = opcode;
             let p = |i: u64| f.rd(cur + 4 * (1 + i));
+            if long {
+                if let Some(why) = self.held_refuses(opcode, n, &p) {
+                    self.held_stop(why, cur);
+                    super::par::COMMANDS.fetch_add(commands, Ordering::Relaxed);
+                    self.drop_ahead();
+                    return Some(cur);
+                }
+            }
             // Stages prepared ahead within the chunk, as in `run`.
             let command = is_command(opcode);
             if command && !self.ahead.is_empty() {
@@ -2040,10 +2147,11 @@ impl Cp {
                     s.cancel();
                 }
             }
-            if self.exec.as_ref().is_some_and(|e| e.stopped) {
+            if self.exec.as_ref().is_some_and(|e| e.stopped) || self.held.as_ref().is_some_and(|h| h.stop.is_some()) {
                 super::par::COMMANDS.fetch_add(commands, Ordering::Relaxed);
                 self.drop_ahead();
-                return Some(cur);
+                // A held stop names its packet (a wait that did not pass).
+                return Some(self.held.as_ref().and_then(|h| h.stop).map_or(cur, |s| s.1));
             }
             if !matches!(flow, Flow::Next) {
                 self.drop_ahead();
@@ -2138,6 +2246,137 @@ impl Cp {
         }
     }
 
+    /// Whether a long parallel run (`tune long_runs`) goes on through the
+    /// packet `opc` at `at` (neither a command nor register state): flushes,
+    /// cache actions and the PFP's sync (barriers in the chunk), clears of
+    /// the context registers, label and timestamp writes the GPU performs in
+    /// order (noted in `labels`), and waits that pass on the run's last write
+    /// to their label or on memory now (or a promise). A wait passed on a
+    /// value the CPU wrote sets `cpu_wait`: the copy cache's scope ends when
+    /// the run is planned, before any of it is recorded.
+    fn long_passes(opc: u32, n: u64, at: u64, p: &dyn Fn(u64) -> u32, labels: &mut Vec<RunLabel>, cpu_wait: &mut bool) -> bool {
+        match opc {
+            op::EVENT_WRITE | op::ACQUIRE_MEM | op::PFP_SYNC_ME | op::CLEAR_STATE => true,
+            op::WRITE_DATA => {
+                let c = p(0);
+                if !matches!((c >> 8) & 0xF, 1 | 2 | 5) || n < 4 {
+                    return false;
+                }
+                let a = addr64(p(1), p(2));
+                let count = n - 3;
+                if (c >> 16) & 1 != 0 {
+                    labels.push(RunLabel { a, v: p(3 + count - 1) as u64, bytes: 4, at });
+                } else if count == 2 {
+                    labels.push(RunLabel { a, v: addr64(p(3), p(4)), bytes: 8, at });
+                } else {
+                    for i in 0..count {
+                        labels.push(RunLabel { a: a + 4 * i, v: p(3 + i) as u64, bytes: 4, at });
+                    }
+                }
+                true
+            }
+            op::RELEASE_MEM => {
+                let dc = p(1);
+                let (int_sel, data_sel) = ((dc >> 24) & 7, (dc >> 29) & 7);
+                if !(int_sel == 0 || int_sel == 3) || data_sel > 4 {
+                    return false;
+                }
+                let a = addr64(p(2) & !3, p(3));
+                match data_sel {
+                    1 => labels.push(RunLabel { a, v: p(4) as u64, bytes: 4, at }),
+                    2 => labels.push(RunLabel { a, v: addr64(p(4), p(5)), bytes: 8, at }),
+                    3 | 4 => labels.push(RunLabel { a, v: 0, bytes: 0, at }),
+                    _ => {}
+                }
+                true
+            }
+            op::WAIT_REG_MEM | op::WAIT_REG_MEM64 => {
+                let wide = opc == op::WAIT_REG_MEM64;
+                let c = p(0);
+                if (c >> 4) & 3 != 1 {
+                    // On a register: the CP notes it and goes on.
+                    return true;
+                }
+                let a = addr64(p(1), p(2));
+                let (reference, mask) = if wide { (addr64(p(3), p(4)), addr64(p(5), p(6))) } else { (p(3) as u64, p(4) as u64) };
+                let func = c & 7;
+                if let Some(l) = labels.iter().rev().find(|l| l.a == a) {
+                    if l.bytes == 0 || (wide && l.bytes < 8) {
+                        return false;
+                    }
+                    let v = if wide { l.v } else { l.v & 0xFFFF_FFFF };
+                    return compare(func, v & mask, reference & mask);
+                }
+                if !valid(a, 8) {
+                    return false;
+                }
+                let v = if wide { unsafe { rd64(a) } } else { (unsafe { rd32(a) }) as u64 };
+                if compare(func, v & mask, reference & mask) {
+                    let by_gpu = last_write(a).is_some_and(|(q, w, _)| q.starts_with("gpu-") && if wide { w == v } else { w as u32 == v as u32 });
+                    if !by_gpu {
+                        *cpu_wait = true;
+                    }
+                    return true;
+                }
+                promised(a, wide, func, mask, reference).is_some()
+            }
+            _ => false,
+        }
+    }
+
+    /// A direct dispatch of the copy kernel in a long run at packet `at`
+    /// with the run's state `st` before it: its words forwarded ahead
+    /// (`forward::plan`; `prior`: the run's copies planned before it).
+    fn plan_copy(&self, st: &ChunkState, at: u64, p: &dyn Fn(u64) -> u32, prior: &[super::forward::Planned]) -> Option<super::forward::Planned> {
+        use super::shaders::RegRead;
+        if !super::tune::forward_copies() {
+            return None;
+        }
+        let r = ScanRegs { sh: &st.regs.sh, ctx: &st.regs.ctx };
+        let pgm = ((r.sh(0x20C) as u64) | ((r.sh(0x20D) as u64 & 0xFF) << 32)) << 8;
+        if !super::forward::is_copy_program(pgm) {
+            return None;
+        }
+        let initiator = p(3);
+        let slot = super::ahead::Slot::new(super::shaders::StageRegs::capture(super::shaders::StageKind::Compute, &r), initiator & (1 << 15) == 0);
+        super::ahead::prepare_here(&slot);
+        let prep = super::ahead::prepared_compute(&slot)?;
+        let local = [r.sh(0x207) & 0xFFFF, r.sh(0x208) & 0xFFFF, r.sh(0x209) & 0xFFFF];
+        let exec = self.exec.as_deref();
+        super::forward::plan(&prep, at, [p(0), p(1), p(2)], local, |x: &[(u64, u64)]| exec.is_some_and(|e| e.writes_pending(x)), prior)
+    }
+
+    /// Applies a context-state packet (CONTEXT_STATE, CLEAR_STATE) of a long
+    /// run to `st` and its context register stack.
+    fn apply_ctx_state(st: &mut ChunkState, stack: &mut Vec<Vec<u32>>, opc: u32, n: u64, p: &dyn Fn(u64) -> u32) {
+        if opc == op::CLEAR_STATE {
+            walk_clear(st);
+            return;
+        }
+        if opc != op::NOP || n < 3 || p(0) != DS_MAGIC || p(1) != pop::CONTEXT_STATE {
+            return;
+        }
+        let full = |st: &ChunkState| {
+            let mut v = st.regs.ctx.clone();
+            v.resize(CTX_DWORDS, 0);
+            v
+        };
+        match p(2) {
+            0 => walk_clear(st),
+            1 => stack.push(full(st)),
+            2 => {
+                if let Some(c) = stack.pop() {
+                    st.regs.ctx = c;
+                }
+            }
+            3 => {
+                stack.push(full(st));
+                walk_clear(st);
+            }
+            _ => {}
+        }
+    }
+
     /// Applies a state packet of a run to `st` as `packet` would.
     fn apply_state(st: &mut ChunkState, opcode: u32, n: u64, p: &dyn Fn(u64) -> u32) {
         let set = |v: &mut Vec<u32>, space: Space, cap: usize, first: u32| {
@@ -2221,7 +2460,16 @@ impl Cp {
         // the GPU (`Exec::dispatch_gpu_indirect`; compute queues' runs,
         // `tune par_compute`; captures and interpreter checks read them
         // here).
-        let gpu_dispatch_args = self.compute && super::tune::gpu_indirect() && !super::capture::capturing() && !super::verify::enabled() && !(super::exec::enabled() && super::emucheck::wanted(self));
+        // A long run (`tune long_runs`) goes on through the title's GPU-side
+        // synchronization (`long_passes`): the label writes it saw, whether
+        // it passed any such packet, and whether a wait passed on a value the
+        // CPU wrote (the copy cache's scope ends when the run is planned).
+        // Its chunks' indirect dispatches read their arguments on the GPU.
+        let long = super::tune::long_runs() && self.main_gfx && !self.compute;
+        let gpu_dispatch_args = (self.compute || long) && super::tune::gpu_indirect() && !super::capture::capturing() && !super::verify::enabled() && !(super::exec::enabled() && super::emucheck::wanted(self));
+        let mut labels: Vec<RunLabel> = Vec::new();
+        let mut soft = false;
+        let mut cpu_wait = false;
         // The run's signature: its packet headers (opcode and size), the
         // same when the title records the same pass again.
         let mut sig = 0xcbf2_9ce4_8422_2325u64;
@@ -2275,8 +2523,12 @@ impl Cp {
                 }
             } else if opc == op::NOP {
                 if n >= 2 && p(0) == DS_MAGIC && !matches!(p(1), pop::PUSH_MARKER | pop::SET_MARKER | pop::POP_MARKER) {
-                    why = 0x100 + (p(1) as usize).min(0x2F);
-                    break c;
+                    if long && matches!(p(1), pop::CONTEXT_STATE | pop::WORKLOADS_ACTIVE | pop::WORKLOAD_COMPLETE) {
+                        soft = true;
+                    } else {
+                        why = 0x100 + (p(1) as usize).min(0x2F);
+                        break c;
+                    }
                 }
             } else if opc == op::SET_BASE {
                 if p(0) == 2 {
@@ -2286,6 +2538,9 @@ impl Cp {
                 }
             } else if par_event(opc, self.compute) {
                 sync = true;
+            } else if long && !is_state(opc) && Self::long_passes(opc, n, at, &p, &mut labels, &mut cpu_wait) {
+                sync = true;
+                soft = true;
             } else if !is_state(opc) {
                 // EVENT_WRITE by event type (statistics: partial flushes
                 // and cache events order only GPU work).
@@ -2384,7 +2639,10 @@ impl Cp {
         // times a worker's), then equal ones for the workers' queue.
         let m = chunks - 1;
         let w = super::par::main_weight();
-        let main_n = ((n as f64 * w / (w + m as f64)).round() as usize).clamp(chunk_min, n - m * chunk_min);
+        // A long run's chunks are all the workers': the forwarded copies are
+        // then as at the run's start for its first chunk, and this command
+        // processor goes past the run at once.
+        let main_n = if soft { 0 } else { ((n as f64 * w / (w + m as f64)).round() as usize).clamp(chunk_min, n - m * chunk_min) };
         let per = (n - main_n) / m;
         // At equal recording cost when the run was measured before (`tune
         // par_cost`), else at equal command counts.
@@ -2410,16 +2668,20 @@ impl Cp {
             PAR_COSTED.fetch_add(1, Ordering::Relaxed);
         }
         let firsts: Vec<usize> = costed.unwrap_or_else(|| (0..m).map(|i| main_n + i * per).collect());
-        let starts: Vec<u64> = firsts.iter().map(|&i| ends[i - 1]).collect();
+        let starts: Vec<u64> = firsts.iter().map(|&i| if i == 0 { from } else { ends[i - 1] }).collect();
         // The workers are woken now to spin for the run (`tune
         // par_prewake`): the chunk start states and the submission before
         // the run take ~120-150 us more.
         if super::tune::par_prewake() > 0 {
             self.par_pool.prewake();
         }
-        // The state at each chunk's start.
+        // The state at each chunk's start (a long run's with the context
+        // register stack: its chunks may push and pop it).
         let mut st = self.chunk_state();
+        let mut stack = if soft { self.ctx_stack.clone() } else { Vec::new() };
         let mut states: Vec<Box<ChunkState>> = Vec::new();
+        // A long run's copies forwarded ahead (`forward::plan`), in order.
+        let mut planned: Vec<super::forward::Planned> = Vec::new();
         let mut c = from;
         // (`tune plan_check`: the same a register at a time.)
         let mut check = super::tune::plan_check().then(|| self.chunk_state());
@@ -2454,6 +2716,12 @@ impl Cp {
                         };
                         put_regs(v, space, cap, (f.rd(at + 4) & 0xFFFF) as usize, f, at + 8, (n - 1) as usize);
                     }
+                    _ if soft && matches!(opc, op::NOP | op::CLEAR_STATE) => Self::apply_ctx_state(&mut st, &mut stack, opc, n, &|i: u64| f.rd(at + 4 * (1 + i))),
+                    _ if soft && opc == op::DISPATCH_DIRECT => {
+                        if let Some(q) = self.plan_copy(&st, at, &|i: u64| f.rd(at + 4 * (1 + i)), &planned) {
+                            planned.push(q);
+                        }
+                    }
                     _ => Self::apply_state(&mut st, opc, n, &|i: u64| f.rd(at + 4 * (1 + i))),
                 }
                 if let Some(st2) = check.as_mut() {
@@ -2464,13 +2732,14 @@ impl Cp {
             if let Some(st2) = check.as_ref() {
                 plan_check_states(&st, st2, s);
             }
-            states.push(Box::new(st.clone()));
+            states.push(Box::new(if soft { ChunkState { stack: Some(stack.clone()), ..st.clone() } } else { st.clone() }));
         }
         // The state at the run's end (`tune past_runs`: the graphics command
         // processor goes on from there before collecting the chunks).
         let mut end_unknown: Vec<u32> = Vec::new();
         let end_state = (super::tune::past_runs() && self.main_gfx).then(|| {
             let mut st = st.clone();
+            let mut stack = stack.clone();
             let mut c = c;
             while c < run_end {
                 let h = f.rd(c);
@@ -2501,8 +2770,15 @@ impl Cp {
                         }
                     }
                 }
-                Self::apply_state(&mut st, opc, n, &p);
+                if soft && matches!(opc, op::NOP | op::CLEAR_STATE) {
+                    Self::apply_ctx_state(&mut st, &mut stack, opc, n, &p);
+                } else {
+                    Self::apply_state(&mut st, opc, n, &p);
+                }
                 c += 4 * (n + 1);
+            }
+            if soft {
+                st.stack = Some(stack);
             }
             st
         });
@@ -2539,10 +2815,27 @@ impl Cp {
             main_writes = Default::default();
         }
         lap.mark(8);
+        if soft && cpu_wait {
+            // A wait in the run passed on a value the CPU wrote: what it
+            // wrote before is current for the commands after it (recorded
+            // from now on, as passing the wait would make it).
+            super::precache::end_scope(1);
+        }
         let queue = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
         let submitted = Arc::new(std::sync::atomic::AtomicBool::new(!submit_after));
+        let long_writes = soft.then(|| main_writes.clone());
         let mut run = super::par::Run::new(queue, Arc::new(main_writes), submitted.clone());
         run.timed = timed;
+        if let Some(w) = long_writes {
+            if let Some(e) = self.exec.as_mut() {
+                e.rec_begin(&Default::default());
+            }
+            let inherited = starts.iter().map(|&s| super::forward::inherited(&planned, s)).collect();
+            let by_packet: HashMap<u64, Arc<[u32]>> = planned.iter().map(|q| (q.at, q.words.clone())).collect();
+            run.set_long(starts.iter().map(|&s| labels_before(&labels, s)).collect(), w, inherited, Arc::new(by_packet));
+            super::par::LONG[0].fetch_add(1, Ordering::Relaxed);
+            super::par::LONG[1].fetch_add(n as u64, Ordering::Relaxed);
+        }
         let run = Arc::new(run);
         lap.mark(9);
         for w in &workers {
@@ -2580,6 +2873,7 @@ impl Cp {
             }
             (pr.run.clone(), i, if i + 1 < pr.starts.len() { pr.starts[i + 1] } else { pr.end }, pr.next == pr.starts.len())
         };
+        self.long_own_part(&run);
         self.submit_gpu("par");
         run.grant(i);
         let tw = super::timeline::wait_start();
@@ -2619,6 +2913,14 @@ impl Cp {
         match done.stopped {
             Some(s) => {
                 super::par::STOPS.fetch_add(1, Ordering::Relaxed);
+                // A long run's later chunks are checked at their turn against
+                // what the run writes before them: this command processor's
+                // part from the stop is noted for that (`long_own_part`).
+                if run.is_long() && self.par.is_some() {
+                    if let Some(e) = self.exec.as_mut() {
+                        e.rec_begin(&Default::default());
+                    }
+                }
                 s
             }
             None => to,
@@ -2825,6 +3127,7 @@ impl Cp {
         if pr.sync {
             self.fence_pending = true;
         }
+        self.long_own_part(&pr.run);
         self.submit_gpu("par");
         pr.run.grant(0);
         let end_state = pr.end_state.take().unwrap();
@@ -2863,7 +3166,9 @@ impl Cp {
             let i = pr.next;
             pr.next += 1;
             pr.run.grant(i);
+            let tw = super::timeline::wait_start();
             let (done, waited) = pr.run.collect(i);
+            tw.end(&self.name, || "wait: parallel chunk (settling)".into());
             pr.waited_ns += waited;
             if let (Some(seq), Some(e)) = (done.last, self.exec.as_mut()) {
                 e.depend_on(seq, false);
@@ -2925,6 +3230,12 @@ impl Cp {
             Some((s, st)) => {
                 self.set_chunk_state(&st);
                 if pr.next < pr.starts.len() {
+                    if pr.run.is_long() {
+                        // (As `par_collect` does after a long run's stop.)
+                        if let Some(e) = self.exec.as_mut() {
+                            e.rec_begin(&Default::default());
+                        }
+                    }
                     self.par = Some(pr);
                 }
                 s
@@ -2944,12 +3255,25 @@ impl Cp {
         Some(to)
     }
 
+    /// A long run's first chunk is about to get its turn: what this command
+    /// processor recorded since planning it (its own part: `Exec::rec_begin`)
+    /// joins what the run's chunks are checked against.
+    fn long_own_part(&mut self, run: &Arc<super::par::Run>) {
+        if let Some(w) = self.exec.as_mut().and_then(|e| e.rec_take()) {
+            run.add_writes(&w);
+        }
+    }
+
     /// Whether `par_plan` would split the run that starts at the command at
     /// `from` (recording past a run stops there); when not, its end is
     /// skipped as `par_plan` skips it.
     fn par_would_split(&mut self, f: &Fetched, from: u64, end: u64) -> bool {
         let mut c = from;
         let mut n = 0usize;
+        // A long run (`tune long_runs`) goes on as `par_plan`'s scan does.
+        let long = super::tune::long_runs() && self.main_gfx && !self.compute;
+        let mut labels: Vec<RunLabel> = Vec::new();
+        let mut cpu_wait = false;
         let run_end = loop {
             if c >= end || !valid(c, 4) {
                 break c;
@@ -2983,11 +3307,14 @@ impl Cp {
                     break next;
                 }
             } else if opc == op::NOP {
-                if len >= 2 && f.rd(c + 4) == DS_MAGIC && !matches!(f.rd(c + 8), pop::PUSH_MARKER | pop::SET_MARKER | pop::POP_MARKER) {
+                if len >= 2 && f.rd(c + 4) == DS_MAGIC && !matches!(f.rd(c + 8), pop::PUSH_MARKER | pop::SET_MARKER | pop::POP_MARKER) && !(long && matches!(f.rd(c + 8), pop::CONTEXT_STATE | pop::WORKLOADS_ACTIVE | pop::WORKLOAD_COMPLETE)) {
                     break c;
                 }
             } else if !(opc == op::SET_BASE || par_event(opc, self.compute) || is_state(opc)) {
-                break c;
+                let at = c;
+                if !(long && Self::long_passes(opc, len, at, &|i: u64| f.rd(at + 4 * (1 + i)), &mut labels, &mut cpu_wait)) {
+                    break c;
+                }
             }
             c = next;
         };
@@ -3031,6 +3358,10 @@ impl Cp {
     /// chunk or the rest of a stopped one); their chunks are executed here.
     fn par_cancel(&mut self) {
         let Some(pr) = self.par.take() else { return };
+        // (A long run's own part is no longer noted.)
+        if let Some(e) = self.exec.as_mut() {
+            e.rec_take();
+        }
         pr.run.cancel();
         super::par::CANCELLED.fetch_add(1, Ordering::Relaxed);
     }
@@ -3799,7 +4130,10 @@ impl Cp {
         }
         let mut e = self.exec.take().unwrap();
         super::xwait::note_command(&self.name);
+        // A long run's chunk: its planner's copies' writes are noted apart.
+        e.noting_planned = self.held.is_some() && e.long_planned_at(self.cur_packet);
         e.dispatch(self, groups, initiator);
+        e.noting_planned = false;
         self.exec = Some(e);
         self.split_if_due();
     }
@@ -4511,6 +4845,10 @@ impl Cp {
                 let t = class_start(classes);
                 self.par_plan(&f, cur, end);
                 class_end(7, t);
+                // A long run's first chunk starts here: collected at once.
+                if self.par.as_ref().is_some_and(|p| p.starts.first() == Some(&cur)) {
+                    continue;
+                }
             }
             PACKETS.fetch_add(1, Ordering::Relaxed);
             self.cur_packet = cur;
@@ -4605,6 +4943,16 @@ impl Cp {
                         32..=127 => 5,
                         _ => 6,
                     }
+                } else if self.past.is_some() {
+                    9
+                } else if self.past_wait.is_some() {
+                    10
+                } else if h & 1 != 0 {
+                    11
+                } else if self.held.is_some() {
+                    12
+                } else if !super::capture::capturing() && self.exec.is_some() {
+                    13
                 } else {
                     7
                 };

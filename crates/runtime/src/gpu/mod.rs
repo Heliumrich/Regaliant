@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 188] = [
+    static ALL: [Tunable; 189] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -221,6 +221,7 @@ pub mod tune {
         Tunable { name: "forward_held", env: "DS_FORWARD_HELD", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_backoff", env: "DS_PAST_BACKOFF", default: 16, value: AtomicU64::new(UNSET) },
         Tunable { name: "rgm", env: "DS_RGM", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "long_runs", env: "DS_LONG_RUNS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2045,6 +2046,17 @@ pub mod tune {
     #[inline]
     pub fn rgm() -> u64 {
         get(187)
+    }
+
+    /// Long parallel runs (RENDERER.md "Long parallel runs"): the graphics
+    /// queue's runs go on through flushes and cache actions, label and
+    /// timestamp writes the GPU performs and waits on labels written before
+    /// (in the run or in memory when planned); workers record those as held
+    /// recorders do and each chunk's CPU reads are checked against the
+    /// run's earlier writes before it is submitted. 0 (default) off.
+    #[inline]
+    pub fn long_runs() -> bool {
+        get(188) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

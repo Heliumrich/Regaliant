@@ -6382,6 +6382,24 @@ pub struct Exec {
     held_over: HashSet<super::images::ImageKey>,
     /// The images its commands used.
     held_keys: HashSet<super::images::ImageKey>,
+    /// It records a long parallel run's chunk (`long_begin`; held too).
+    long: bool,
+    /// A long chunk's CPU reads served by forwarded copies the run did not
+    /// make (`forward::split_long_reads`): checked against what the run's
+    /// chunks write otherwise than by the planner's copies.
+    held_fwd_reads: Vec<(u64, u64)>,
+    /// The copies its run's planner forwarded (packet -> words), whether the
+    /// dispatch being recorded is one of them (`Cp::dispatch`), what its
+    /// chunk writes otherwise, and whether it computed one of them otherwise
+    /// than planned (the run's later chunks inherited the planned words).
+    long_planned: std::sync::Arc<HashMap<u64, std::sync::Arc<[u32]>>>,
+    pub noting_planned: bool,
+    long_nonfwd: super::ranges::Ranges,
+    long_mismatch: bool,
+    /// What its batches write from `rec_begin` to `rec_take` (the graphics
+    /// command processor's own part of a long parallel run: its workers'
+    /// chunks are checked against it).
+    rec_writes: Option<super::ranges::Ranges>,
     /// A worker's: what the main command processor's batch, not yet
     /// submitted when the run was planned, writes (`tune par_main_writes`),
     /// and (mode 3) whether it has been submitted since.
@@ -6954,6 +6972,13 @@ impl Exec {
                 held_clears: HashMap::new(),
                 held_over: HashSet::new(),
                 held_keys: HashSet::new(),
+                long: false,
+                held_fwd_reads: Vec::new(),
+                long_planned: Default::default(),
+                noting_planned: false,
+                long_nonfwd: Default::default(),
+                long_mismatch: false,
+                rec_writes: None,
                 main_writes: None,
                 main_submitted: None,
                 stopped: false,
@@ -8534,7 +8559,7 @@ impl Exec {
             return Some((buf, at, bias));
         }
         let n = (bias + size).next_multiple_of(4);
-        let share = shares && super::precache::enabled() && super::precache::worth(size);
+        let share = shares && super::precache::enabled() && super::precache::worth(size) && !(self.long && super::precache::gpu_written_lately(base, size));
         if share {
             // Copied by an earlier submitted batch (`gpu::precache`).
             if let Some((chunk, at, made)) = super::precache::lookup(base, size) {
@@ -9740,11 +9765,121 @@ impl Exec {
             self.note_open_write(a, n);
         }
         self.pending.insert(a, n);
+        if let Some(r) = self.rec_writes.as_mut() {
+            r.insert(a, n);
+        }
+        if self.long && !self.noting_planned {
+            self.long_nonfwd.insert(a, n);
+        }
         self.note_since(a, n);
         self.own_gen += 1;
         if verify::enabled() {
             self.pending_log.push((a, n));
         }
+    }
+
+    /// Starts noting what its batches write (`rec_writes`), with `first`.
+    pub fn rec_begin(&mut self, first: &super::ranges::Ranges) {
+        self.rec_writes = Some(first.clone());
+    }
+
+    /// What its batches wrote since `rec_begin` (None: not noting).
+    pub fn rec_take(&mut self) -> Option<super::ranges::Ranges> {
+        self.rec_writes.take()
+    }
+
+    /// A worker records a chunk of a long parallel run (`tune long_runs`):
+    /// held as the frame-ahead recorder is (its label writes promised when
+    /// its batches are submitted, its CPU reads, used images and image-cache
+    /// notes kept for the check at its turn: `Cp::long_check`).
+    pub fn long_begin(&mut self, planned: std::sync::Arc<HashMap<u64, std::sync::Arc<[u32]>>>) {
+        self.long_planned = planned;
+        self.long_nonfwd.clear();
+        self.long_mismatch = false;
+        self.held = true;
+        self.long = true;
+        self.held_reset();
+        self.held_promises.clear();
+    }
+
+    /// The chunk passed its check: its image-cache notes go to the cache
+    /// before its batches are submitted (later chunks check against them).
+    pub fn long_commit(&mut self) {
+        if !self.held_clears.is_empty() || !self.held_over.is_empty() {
+            let (c, o) = (std::mem::take(&mut self.held_clears), std::mem::take(&mut self.held_over));
+            super::images::with(|im| im.apply_held(&c, &o));
+        }
+        self.long_end();
+    }
+
+    /// The chunk ends without its notes going anywhere (dropped, cancelled
+    /// or failed: its batches are discarded by the caller).
+    pub fn long_end(&mut self) {
+        self.held = false;
+        self.long = false;
+        self.stopped = false;
+        self.stop_why = "";
+        self.held_clears.clear();
+        self.held_over.clear();
+        self.held_promises.clear();
+        self.held_reads.clear();
+        self.held_kinds.clear();
+        self.held_keys.clear();
+        self.cp_written.clear();
+        self.held_fwd_reads.clear();
+        self.long_planned = Default::default();
+        self.noting_planned = false;
+    }
+
+    /// What its long chunk wrote otherwise than by the planner's copies, and
+    /// whether it computed one of those otherwise than planned.
+    pub fn long_take(&mut self) -> (super::ranges::Ranges, bool) {
+        (std::mem::take(&mut self.long_nonfwd), std::mem::take(&mut self.long_mismatch))
+    }
+
+    /// Whether the dispatch at packet `at` is a copy its long run's planner
+    /// forwarded.
+    pub fn long_planned_at(&self, at: u64) -> bool {
+        self.long && self.long_planned.contains_key(&at)
+    }
+
+    /// Whether GPU work or a deferred CP write not done yet writes `r`.
+    pub fn writes_pending(&self, r: &[(u64, u64)]) -> bool {
+        self.overlaps_pending_ro(r) || INFLIGHT.latest(r).is_some() || CP_WRITES.latest(r).is_some()
+    }
+
+    /// Whether a long run's chunk recorded with it must be recorded again:
+    /// it read on the CPU what the run's earlier part writes (`earlier`;
+    /// reads served by forwarded copies: what its earlier chunks write,
+    /// `chunks`), or it used an image that has a fast clear or an overwrite
+    /// pending (noted by an earlier chunk, or by the work before the run).
+    pub fn long_conflict(&self, earlier: &super::ranges::Ranges, chunks: &super::ranges::Ranges) -> Option<&'static str> {
+        if chunks.overlaps_any(&self.held_fwd_reads) {
+            return Some("read the run's earlier writes (forwarded copy)");
+        }
+        if let Some(i) = self.held_reads.iter().position(|r| earlier.overlaps(r.0, r.1)) {
+            return Some(match self.held_kinds.get(i).copied() {
+                Some(0) => "read the run's earlier writes (shared copy)",
+                Some(1) => "read the run's earlier writes (texture)",
+                Some(2) => "read the run's earlier writes (binding)",
+                Some(3) => "read the run's earlier writes (CP label poll)",
+                Some(4) => "read the run's earlier writes (CP read)",
+                Some(5) => "read the run's earlier writes (register pairs)",
+                _ => "read the run's earlier writes",
+            });
+        }
+        if !self.held_keys.is_empty() && super::images::any_pending() {
+            let keys: Vec<super::images::ImageKey> = self.held_keys.iter().copied().collect();
+            if super::images::with(|im| im.clears_pending(&keys) || im.overwrites_pending(&keys)) {
+                return Some("images with pending clears or reloads");
+            }
+        }
+        None
+    }
+
+    /// The first CPU read that `earlier` writes (`DS_TRACE_LONG_DROPS`).
+    pub fn long_conflict_read(&self, earlier: &super::ranges::Ranges) -> Option<(u64, u64)> {
+        self.held_reads.iter().copied().find(|r| earlier.overlaps(r.0, r.1))
     }
 
     /// `overlaps_pending` without pruning (a shared borrow).
@@ -11023,7 +11158,7 @@ impl Exec {
 
     /// The kinds of the last `n` held reads (`DS_TRACE_PAST_DROPS`).
     fn note_kinds(&mut self, kind: u8, n: usize) {
-        if trace_past_drops() {
+        if trace_past_drops() || self.long {
             self.held_kinds.resize(self.held_reads.len() - n, u8::MAX);
             self.held_kinds.resize(self.held_reads.len(), kind);
         }
@@ -11187,8 +11322,15 @@ impl Exec {
         // entry), apart from the SGPR data written below.
         let found = p.found.clone();
         if self.held {
-            self.held_reads.extend_from_slice(&found.reads);
-            self.note_kinds(2, found.reads.len());
+            if self.long && super::forward::active() {
+                let (plain, fwd) = super::forward::split_long_reads(&found.reads);
+                self.held_reads.extend_from_slice(&plain);
+                self.note_kinds(2, plain.len());
+                self.held_fwd_reads.extend_from_slice(&fwd);
+            } else {
+                self.held_reads.extend_from_slice(&found.reads);
+                self.note_kinds(2, found.reads.len());
+            }
         }
         super::images::BINDING_SHADER.with(|s| s.set(p.addr));
         let res_info = rdna::translate::res_info_offset(&found.tr.plan) as usize;
@@ -11650,9 +11792,21 @@ impl Exec {
         }
         // Frame-ahead recording: a storage image's binding marks it written
         // in the image cache, which the current frame's work would see.
+        // A long run's chunk binds images the GPU owns already (which binding
+        // leaves as they are).
         if self.held && found.tr.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_))) {
-            self.stop("storage image");
-            return Err(STOPPED.into());
+            let owned = self.long
+                && super::images::with(|im| {
+                    found.tr.out.bindings.iter().all(|b| match (b.kind, b.kind_resource().and_then(|i| found.resources.get(i))) {
+                        (BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_), Some(Resolved::Image(t))) => im.storage_owned(t),
+                        (BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_), _) => false,
+                        _ => true,
+                    })
+                });
+            if !owned {
+                self.stop("storage image");
+                return Err(STOPPED.into());
+            }
         }
         bound.imgs.clear();
         bound.images.clear();
@@ -12019,7 +12173,8 @@ impl Exec {
         // flushes inside a run, `tune par_events`, order them), and the
         // run's planning does not wait for the arguments: the GPU reads
         // them, in order.
-        if !(self.deferred && self.compute_cp) && !(self.overlaps_pending(&r) || INFLIGHT.latest(&r).is_some() || CP_WRITES.latest(&r).is_some() || super::keep::holds(args, 12)) {
+        // (So for a long parallel run's chunk, `long`.)
+        if !(self.deferred && (self.compute_cp || self.long)) && !(self.overlaps_pending(&r) || INFLIGHT.latest(&r).is_some() || CP_WRITES.latest(&r).is_some() || super::keep::holds(args, 12)) {
             return false;
         }
         // Arguments in a video-memory home: read by the CP after the home's
@@ -12173,7 +12328,8 @@ impl Exec {
         // it stays a dispatch (None: not tried, Some(None): refused).
         // (Held past a label wait the graphics command processor records in
         // program order still: its copies forward as before.)
-        let forward_here = super::tune::forward_copies() && (!self.deferred || self.past_grow || (self.past && super::forward::held())) && indirect.is_none() && self.name == "gpu-gfx" && !super::resident::mirror_mode();
+        // (A long run's chunk forwards into its own view: `Cp::long_begin`.)
+        let forward_here = super::tune::forward_copies() && (!self.deferred || self.past_grow || ((self.past || self.long) && super::forward::held())) && indirect.is_none() && (self.name == "gpu-gfx" || (self.long && self.name.starts_with("gpu-gfx-par"))) && !super::resident::mirror_mode();
         // The graphics queue's parallel workers (`copy_update 2`): updates
         // checked once their batches completed, never forwarded.
         let worker_here = super::tune::forward_copies() && self.deferred && !self.held && indirect.is_none() && self.name.starts_with("gpu-gfx") && super::tune::copy_update_workers() && !super::resident::mirror_mode();
@@ -12888,6 +13044,15 @@ impl Exec {
                 None => super::forward::compute(&p, groups, local, busy),
             };
             if let Some((base, words, from)) = computed {
+                // A copy the run's planner forwarded: computed alike?
+                if self.long {
+                    if let Some(w) = self.long_planned.get(&cp.cur_packet()) {
+                        if w[..] != words[..] {
+                            self.long_mismatch = true;
+                            super::forward::PLANNED_STATS[1].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
                 // (Diagnostics: how this dispatch bound the destination.)
                 let how = match bound.shadows.iter().find(|s| s.guest <= base && base < s.guest + s.range) {
                     Some(s) if s.reused => "through a resident shadow",
