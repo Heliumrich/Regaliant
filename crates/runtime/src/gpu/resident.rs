@@ -1243,8 +1243,27 @@ pub fn back(base: u64, len: u64) -> Result<(), String> {
     let c = ctx();
     let first = (base - MIRROR_BASE) / m.page;
     let last = (base + len - 1 - MIRROR_BASE) / m.page;
-    // Backed already (most calls): no lock.
-    if (first..=last).all(|p| m.backed[(p / 64) as usize].load(Ordering::Acquire) & (1u64 << (p % 64)) != 0) {
+    // Backed already (most calls): no lock; whole words of 64 pages (4 MiB
+    // with 64 KiB pages) at a time.
+    let backed = |p: u64| m.backed[(p / 64) as usize].load(Ordering::Acquire) & (1u64 << (p % 64)) != 0;
+    let mut p = first;
+    let mut all = true;
+    while p <= last {
+        if p % 64 == 0 && p + 63 <= last {
+            if m.backed[(p / 64) as usize].load(Ordering::Acquire) != u64::MAX {
+                all = false;
+                break;
+            }
+            p += 64;
+        } else {
+            if !backed(p) {
+                all = false;
+                break;
+            }
+            p += 1;
+        }
+    }
+    if all {
         return Ok(());
     }
     let mut g = m.blocks.lock();

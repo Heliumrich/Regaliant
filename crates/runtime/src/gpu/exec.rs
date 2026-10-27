@@ -6414,6 +6414,10 @@ pub struct Exec {
     fe2_mine: super::fx::Set<u64>,
     fe2_marked: bool,
     fe2_gens: Vec<u32>,
+    /// Runs the batch's bindings left to check at its close
+    /// (`fe2::resolve`), and their pages (the batch's own meanwhile).
+    fe2_pend: Vec<(u64, u64)>,
+    fe2_pend_set: super::fx::Set<u64>,
     /// Resident GPU-written data (`gpu::rgm`, `exec/rgm.rs`): the open
     /// batch's claims and their granules, its W writes (all, and those not
     /// merged into guest memory yet), the merge table, a page list reused.
@@ -7023,6 +7027,9 @@ struct Closed {
     /// A held executor's label writes in it (address, value, bytes):
     /// promised when it is submitted.
     promises: Vec<(u64, u64, u8)>,
+    /// Front end 2: its uploads into the mirror (`Exec::fe2_up`), valid for
+    /// other batches once it is queued.
+    fe2_up: Vec<(u64, u64)>,
 }
 
 /// Slot sequence of a batch closed but not yet submitted.
@@ -7100,6 +7107,8 @@ impl Exec {
                 fe2_mine: Default::default(),
                 fe2_marked: false,
                 fe2_gens: Vec::new(),
+                fe2_pend: Vec::new(),
+                fe2_pend_set: Default::default(),
                 rgm_claims: Vec::new(),
                 rgm_mine: Default::default(),
                 rgm_written: Default::default(),
@@ -7642,9 +7651,13 @@ impl Exec {
         self.resolve_timestamps();
         st.mark(2);
         // Front end 2: what the batch's work wrote into the mirror goes to
-        // guest memory before the batch completes.
+        // guest memory before the batch completes; the checks its bindings
+        // deferred are made now, their uploads into its prologue.
         if self.fe2_marked {
             self.fe2_scatter();
+        }
+        if !self.fe2_pend.is_empty() {
+            self.fe2_resolve();
         }
         // Mirror mode: pages deferred CP writes changed are copied into the
         // mirror again (those writes were waited for above), and the dwords
@@ -7741,13 +7754,12 @@ impl Exec {
             };
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
             self.keep_submitted(0);
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), rgm_claims: std::mem::take(&mut self.rgm_claims), rgm_written: std::mem::take(&mut self.rgm_written), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), rgm_claims: std::mem::take(&mut self.rgm_claims), rgm_written: std::mem::take(&mut self.rgm_written), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new() });
             self.res_mine.clear();
-            if !self.fe2_up.is_empty() {
-                crate::error!("gpu[{}]: front end 2's uploads in a parallel chunk (dropped: uploaded again later)", self.name);
-                self.fe2_up.clear();
-                self.fe2_mine.clear();
+            if let Some(b) = self.closed.last_mut() {
+                b.fe2_up = std::mem::take(&mut self.fe2_up);
             }
+            self.fe2_mine.clear();
             self.rgm_batch_done(true);
             self.stage_used = 0;
             self.slots[i].seq = PENDING;
@@ -7924,6 +7936,8 @@ impl Exec {
         self.fe2_up.clear();
         self.fe2_mine.clear();
         self.fe2_marked = false;
+        self.fe2_pend.clear();
+        self.fe2_pend_set.clear();
         self.rgm_batch_done(false);
         self.owned.clear();
         self.eager_action = None;
@@ -8388,6 +8402,16 @@ impl Exec {
             self.report_error("front end 2: no video memory for the mirror (bound as zeros)", || format!("{lo:#x}..{hi:#x}: {e}"));
             return None;
         }
+        // Its uploads go into the prologue of the batch that will hold the
+        // command: one is begun first (a binding before this one may have
+        // closed the batch, and a deferred executor's next batch may take
+        // another slot, whose prologue an earlier open would not have begun).
+        if !self.recording {
+            self.begin();
+            if !self.recording || self.stopped {
+                return None;
+            }
+        }
         if written {
             if span(lo, hi - lo).is_none() {
                 super::fe2::note_unscatterable();
@@ -8397,10 +8421,12 @@ impl Exec {
         }
         let ep = super::precache::epoch() as u32;
         let mine = std::mem::take(&mut self.fe2_mine);
+        let pend = std::mem::take(&mut self.fe2_pend_set);
         let mut up = std::mem::take(&mut self.fe2_up);
-        let first = up.len();
-        let r = super::fe2::ensure(lo, hi, ep, written, &|p| mine.contains(&p), &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable);
-        let mut mine = mine;
+        let mut deferred = std::mem::take(&mut self.fe2_pend);
+        let (first, first_pend) = (up.len(), deferred.len());
+        let r = super::fe2::ensure(lo, hi, ep, written, &|p| mine.contains(&p) || pend.contains(&p), &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable, super::fe2::defer_checks().then_some(&mut deferred));
+        let (mut mine, mut pend) = (mine, pend);
         for &(a, b) in &up[first..] {
             let mut p = a;
             while p < b {
@@ -8408,7 +8434,16 @@ impl Exec {
                 p += PAGE;
             }
         }
+        for &(a, b) in &deferred[first_pend..] {
+            let mut p = a;
+            while p < b {
+                pend.insert(p);
+                p += PAGE;
+            }
+        }
         self.fe2_mine = mine;
+        self.fe2_pend_set = pend;
+        self.fe2_pend = deferred;
         self.fe2_up = up;
         if let Err(e) = r {
             self.report_error(&format!("front end 2: {e} (bound as the mirror holds it)"), || format!("{lo:#x}..{hi:#x}"));
@@ -8428,6 +8463,10 @@ impl Exec {
     /// for this batch only: CPU writes after it are not in it).
     fn fe2_upload(&mut self, mbuf: vk::Buffer, a: u64, b: u64, up: &mut Vec<(u64, u64)>) -> bool {
         use super::resident::{MIRROR_BASE, PAGE};
+        // (Only into a batch being recorded: `fe2_place` begins one.)
+        if !self.recording {
+            return false;
+        }
         let _ = self.open_pre();
         let mut x = a;
         while x < b {
@@ -8444,6 +8483,8 @@ impl Exec {
                 }
                 None => {
                     if !crate::mem::os_readable(x, PAGE) || self.mirror_stage(mbuf, x).is_none() {
+                        let readable = crate::mem::os_readable(x, PAGE);
+                        self.report_error("front end 2: a page to copy into the mirror has no import window and cannot be copied by the CPU", || format!("{x:#x} (run {a:#x}..{b:#x}; readable {readable})"));
                         return false;
                     }
                     super::fe2::note_memcpy(1);
@@ -8452,6 +8493,32 @@ impl Exec {
             }
         }
         true
+    }
+
+    /// Front end 2's checks the batch's bindings deferred, at its close
+    /// (`fe2::resolve`): their uploads go into its prologue.
+    fn fe2_resolve(&mut self) {
+        let Some((mbuf, _)) = super::resident::mirror_buffer() else { return };
+        let mut runs = std::mem::take(&mut self.fe2_pend);
+        self.fe2_pend_set.clear();
+        let mine = std::mem::take(&mut self.fe2_mine);
+        let mut up = std::mem::take(&mut self.fe2_up);
+        let first = up.len();
+        let r = super::fe2::resolve(&mut runs, &|p| mine.contains(&p), &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable);
+        let mut mine = mine;
+        for &(a, b) in &up[first..] {
+            let mut p = a;
+            while p < b {
+                mine.insert(p);
+                p += super::resident::PAGE;
+            }
+        }
+        self.fe2_mine = mine;
+        self.fe2_up = up;
+        self.fe2_pend = runs;
+        if let Err(e) = r {
+            self.report_error(&format!("front end 2: {e} at a batch's close (its work reads the mirror as it is)"), String::new);
+        }
     }
 
     /// Front end 2's write-back, recorded now (outside a render pass): the
@@ -11590,6 +11657,13 @@ impl Exec {
             note_copy_waits(false, copy_wait);
             let reset = self.slot_reset(b.slot);
             let own = b.mm_own;
+            // Front end 2: the words its uploads touch, before it can run.
+            let fe2_ep = super::precache::epoch() as u32;
+            if !b.fe2_up.is_empty() {
+                let mut gens = std::mem::take(&mut self.fe2_gens);
+                super::fe2::generations(&b.fe2_up, &mut gens);
+                self.fe2_gens = gens;
+            }
             let seq = push_batch(fence, queries, bq, b.eager_action.into_iter().collect(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, reset, false, move |_| {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
                     return None;
@@ -11597,6 +11671,9 @@ impl Exec {
                 Some(SubmitSpec { xpre: None, pre, cmd, wait: copy_wait, fence, alt: false, name })
             });
             self.slots[b.slot].seq = seq;
+            if !b.fe2_up.is_empty() {
+                super::fe2::uploaded(&b.fe2_up, &self.fe2_gens, fe2_ep);
+            }
             if let Some(o) = &own {
                 super::resident::own_submitted(o, seq);
             }

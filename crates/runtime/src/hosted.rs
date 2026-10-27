@@ -67,6 +67,12 @@ struct Shared {
     _pad: u32,
     /// Leaf index + 1 per 128 MiB of guest space (0: none).
     l1: [AtomicU32; L1],
+    /// Per 128 MiB of guest space: armed bits cleared there so far (faults
+    /// the host answered, disarms, mapping changes): a reader's view of
+    /// the leaf is current while the count stays the same.
+    leaf_events: [AtomicU64; L1],
+    /// The same over the whole guest range.
+    all_events: AtomicU64,
     /// (page | 1 for a write, the faulting instruction).
     ring: [[AtomicU64; 2]; RING],
     leaves: [[AtomicU64; (LEAF_PAGES / 64) as usize]; MAX_LEAVES],
@@ -191,11 +197,41 @@ fn arm_as(base: u64, len: u64, prot: u32) -> Result<(), String> {
 }
 
 fn disarm_bits(s: &Shared, lo: u64, hi: u64) {
+    let mut last_leaf = usize::MAX;
     for a in (lo..hi).step_by(PAGE as usize) {
         if let Some((w, m)) = bit(s, a, false) {
             w.fetch_and(!m, Ordering::AcqRel);
+            let leaf = leaf_of(a);
+            if leaf != last_leaf {
+                s.leaf_events[leaf].fetch_add(1, Ordering::AcqRel);
+                s.all_events.fetch_add(1, Ordering::AcqRel);
+                last_leaf = leaf;
+            }
         }
     }
+}
+
+/// The 128 MiB of guest space holding `a` (an index of `Shared::l1`).
+fn leaf_of(a: u64) -> usize {
+    ((a - crate::mem::GUEST_BASE) / PAGE / LEAF_PAGES) as usize
+}
+
+/// Armed bits cleared so far anywhere (0 when not hosted): unchanged, no
+/// armed page lost its bit.
+#[inline]
+pub fn all_events() -> u64 {
+    shared().map_or(0, |s| s.all_events.load(Ordering::Acquire))
+}
+
+/// Armed bits cleared so far in the 128 MiB of guest space holding `a`
+/// (0 when not hosted): unchanged, no armed page there lost its bit.
+#[inline]
+pub fn leaf_events(a: u64) -> u64 {
+    let Some(s) = shared() else { return 0 };
+    if !(crate::mem::GUEST_BASE..crate::mem::GUEST_END).contains(&a) {
+        return 0;
+    }
+    s.leaf_events[leaf_of(a)].load(Ordering::Acquire)
 }
 
 /// Disarms guest [base, base+len): read-write again, then the bits cleared.
@@ -386,6 +422,8 @@ pub fn run_host() -> ! {
                     if let Some((w, m)) = bit(s, page, false) {
                         w.fetch_and(!m, Ordering::AcqRel);
                     }
+                    s.leaf_events[leaf_of(page)].fetch_add(1, Ordering::AcqRel);
+                    s.all_events.fetch_add(1, Ordering::AcqRel);
                     let head = s.head.load(Ordering::Acquire);
                     if head.saturating_sub(s.tail.load(Ordering::Acquire)) >= RING as u64 {
                         s.overflow.fetch_add(1, Ordering::Relaxed);
