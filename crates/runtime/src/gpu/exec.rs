@@ -2778,8 +2778,27 @@ fn flush_site_lines(flips: u64) -> String {
 }
 
 /// Shadow merges by window (DS_PROFILE_GPU): (guest, range) -> [merges,
-/// bytes, the shader that made the last one merged].
-static MERGE_BY: Mutex<Option<HashMap<(u64, u64), [u64; 3]>>> = Mutex::new(None);
+/// bytes, the shader that made the last one merged, its queue
+/// (`queue_tag`)].
+static MERGE_BY: Mutex<Option<HashMap<(u64, u64), [u64; 4]>>> = Mutex::new(None);
+
+/// An executor's queue for profile lines: 0 the graphics command processor,
+/// 1 its parallel workers, else the compute queue's number.
+fn queue_tag(name: &str) -> u64 {
+    match name.strip_prefix("gpu-acb0x") {
+        Some(h) => u64::from_str_radix(h, 16).unwrap_or(2),
+        None if name.contains("-par") => 1,
+        None => 0,
+    }
+}
+
+fn queue_label(tag: u64) -> String {
+    match tag {
+        0 => "graphics".to_string(),
+        1 => "workers".to_string(),
+        q => format!("queue {q:#x}"),
+    }
+}
 /// The flip MERGE_BY started counting at.
 static MERGE_FROM: AtomicU64 = AtomicU64::new(0);
 
@@ -2802,11 +2821,23 @@ fn fill_by_lines(flips: u64) -> String {
 fn merge_by_lines(flips: u64) -> String {
     let g = MERGE_BY.lock();
     let Some(m) = g.as_ref() else { return String::new() };
-    let mut v: Vec<(&(u64, u64), &[u64; 3])> = m.iter().collect();
+    let mut v: Vec<(&(u64, u64), &[u64; 4])> = m.iter().collect();
     v.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
     let total: u64 = v.iter().map(|x| x.1[0]).sum();
     let per = |n: u64| n as f64 / flips.max(1) as f64;
-    let parts: Vec<String> = v.iter().take(16).map(|((g, r), x)| format!("{g:#x}+{r:#x} (cs {:#x}) {:.1}", x[2], per(x[0]))).collect();
+    let parts: Vec<String> = v.iter().take(16).map(|((g, r), x)| format!("{g:#x}+{r:#x} (cs {:#x}, {}) {:.1}", x[2], queue_label(x[3]), per(x[0]))).collect();
+    // The windows with the most bytes merged, and the merges by queue.
+    let mut by_bytes = v.clone();
+    by_bytes.sort_by(|a, b| b.1[1].cmp(&a.1[1]));
+    let mib = |n: u64| per(n) / (1u64 << 20) as f64;
+    let big: Vec<String> = by_bytes.iter().take(12).map(|((g, r), x)| format!("{g:#x}+{r:#x} (cs {:#x}, {}) {:.1} MiB in {:.1}", x[2], queue_label(x[3]), mib(x[1]), per(x[0]))).collect();
+    let mut by_queue: std::collections::BTreeMap<u64, (u64, u64)> = std::collections::BTreeMap::new();
+    for (_, x) in &v {
+        let e = by_queue.entry(x[3]).or_default();
+        e.0 += x[0];
+        e.1 += x[1];
+    }
+    let queues: Vec<String> = by_queue.iter().map(|(q, (n, b))| format!("{} {:.1} ({:.1} MiB)", queue_label(*q), per(*n), mib(*b))).collect();
     // By the memory type the title gave the window's mapping.
     let mut by_type: std::collections::BTreeMap<Option<i32>, (u64, u64)> = std::collections::BTreeMap::new();
     for ((g, r), x) in &v {
@@ -2815,7 +2846,15 @@ fn merge_by_lines(flips: u64) -> String {
         e.1 += *r;
     }
     let types: Vec<String> = by_type.iter().map(|(t, (n, b))| format!("type {} {:.1} ({} KiB of windows)", t.map_or("?".to_string(), |t| t.to_string()), per(*n), b >> 10)).collect();
-    format!("    shadow merges by window, per flip ({:.1} in all, {} windows; by memory type: {}): {}\n", per(total), v.len(), types.join(", "), parts.join(", "))
+    format!(
+        "    shadow merges by window, per flip ({:.1} in all, {} windows; by memory type: {}; by queue: {}): {}\n    shadow merges by window's bytes, per flip (MiB of windows merged, merges): {}\n",
+        per(total),
+        v.len(),
+        types.join(", "),
+        queues.join(", "),
+        parts.join(", "),
+        big.join(", ")
+    )
 }
 
 /// Device-local shadow space per slot (working and pristine copies).
@@ -10010,6 +10049,16 @@ impl Exec {
         self.recording && !self.pending_promises.is_empty() && (self.submit_request.load(Ordering::Relaxed) || self.begun_at.elapsed() > super::tune::label_latency())
     }
 
+    /// Whether this executor's indirect dispatches read their arguments from
+    /// a resident shadow's working copy (`tune shadow_args`).
+    fn shadow_args(&self) -> bool {
+        match super::tune::shadow_args() {
+            0 => false,
+            2 => !self.compute_cp,
+            _ => true,
+        }
+    }
+
     /// Indirect arguments at `a` (12 bytes) a resident shadow holds whole and
     /// nothing wrote in place since its copy in (not tainted): its working
     /// copy has the newest of every dword in its window (`tune shadow_args`).
@@ -10140,11 +10189,13 @@ impl Exec {
         if profiling() {
             let mut g = MERGE_BY.lock();
             let m = g.get_or_insert_with(HashMap::new);
+            let tag = queue_tag(&self.name);
             for sh in &flush {
-                let e = m.entry((sh.guest, sh.range)).or_insert([0; 3]);
+                let e = m.entry((sh.guest, sh.range)).or_insert([0; 4]);
                 e[0] += 1;
                 e[1] += sh.range;
                 e[2] = sh.writer;
+                e[3] = tag;
             }
         }
         // Later work reads guest memory after the write-back (counted
@@ -11763,7 +11814,7 @@ impl Exec {
             // A resident shadow holding newer arguments is merged back first,
             // unless the GPU reads them from its working copy (`tune
             // shadow_args`; checked again where they are bound).
-            if !(super::tune::shadow_args() && self.resident_args(a).is_some()) {
+            if !(self.shadow_args() && self.resident_args(a).is_some()) {
                 self.flush_resident(Some(&[(a, 12)]))?;
             }
             lap.mark(16);
@@ -12238,7 +12289,7 @@ impl Exec {
         let args = match indirect {
             // Still held by a resident shadow (binding and batch changes since
             // the check above may have merged it): its working copy.
-            Some(a) if super::tune::shadow_args() && self.resident_args(a).is_some() => {
+            Some(a) if self.shadow_args() && self.resident_args(a).is_some() => {
                 SHADOW_ARGS.fetch_add(1, Ordering::Relaxed);
                 self.resident_args(a)
             }

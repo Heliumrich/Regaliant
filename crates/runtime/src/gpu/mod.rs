@@ -1073,10 +1073,12 @@ pub mod tune {
 
     /// An indirect dispatch whose arguments a resident shadow holds (an
     /// earlier dispatch of the batch wrote them in its working copy) reads
-    /// them there instead of merging the shadow back first.
+    /// them there instead of merging the shadow back first: 1 on every
+    /// executor, 2 on the graphics queue's (its command processor and
+    /// parallel workers) only.
     #[inline]
-    pub fn shadow_args() -> bool {
-        get(91) != 0
+    pub fn shadow_args() -> u64 {
+        get(91)
     }
 
     /// The command processors whose synchronization-free runs the `ahead`
@@ -2722,6 +2724,9 @@ pub fn profile_this_thread(kind: &'static str) {
     PROFILE_THREADS.lock().push((kind, tid));
 }
 
+/// The thread sampler's period in ms (`DS_PROFILE_MS`).
+static PROFILE_MS: AtomicU64 = AtomicU64::new(10);
+
 /// Kinds of sampled threads, in report order.
 const PROFILE_KINDS: [&str; 5] = ["gfx", "acb", "par", "prep", "submit"];
 
@@ -2733,6 +2738,8 @@ pub fn start_profiler() {
     if !matches!(std::env::var("DS_PROFILE_GPU").ok().as_deref(), Some("1" | "2")) {
         return;
     }
+    // `DS_PROFILE_MS=<ms>`: the sampling period (default 10).
+    PROFILE_MS.store(std::env::var("DS_PROFILE_MS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&ms| ms > 0).unwrap_or(10), Ordering::Relaxed);
     *PROFILE.lock() = Some(std::collections::HashMap::new());
     *PROFILE_FN.lock() = Some(Default::default());
     *PROFILE_BUSY.lock() = Some(Default::default());
@@ -2745,8 +2752,9 @@ pub fn start_profiler() {
         1 << 20,
         Box::new(|| {
             crate::log::set_thread_name("gpu-profiler");
+            let period = PROFILE_MS.load(Ordering::Relaxed);
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                std::thread::sleep(std::time::Duration::from_millis(period));
                 // `DS_PROFILE_ACB=<text>`: only the compute queues whose name
                 // (`acb0x50`) holds the text are sampled.
                 static ACB_ONLY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -2911,7 +2919,7 @@ fn profile_summary() -> String {
     let Some(m) = g.as_ref() else { return String::new() };
     let mut v: Vec<(&String, &u64)> = m.iter().collect();
     v.sort_by(|a, b| b.1.cmp(a.1));
-    let mut s = String::from("    gpu profile (10 ms samples):\n");
+    let mut s = format!("    gpu profile ({} ms samples):\n", PROFILE_MS.load(Ordering::Relaxed));
     for (k, n) in v.iter().take(20) {
         s.push_str(&format!("      {n:6}  {k}\n"));
     }
