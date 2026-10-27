@@ -5055,6 +5055,66 @@ static PRE_STABLE: Mutex<(Option<HashMap<(u64, u64), (u64, u64)>>, [u64; 5])> = 
 /// frame, by why the shared copies did not serve them
 /// (`precache::GONE_NAMES`).
 static PRE_UNCHANGED_WHY: Mutex<[u64; 10]> = Mutex::new([0; 10]);
+/// Batch-start copies by content (DS_PROFILE_GPU with `DS_COPY_CONTENT=1`;
+/// copies under 1 MiB): per (hash of the bytes, size), the frame they were
+/// last copied in and where; per size class (<4 KiB, <64 KiB, <1 MiB),
+/// [copies, bytes] of content copied in the last `CONTENT_FRAMES` frames at
+/// the same address, at another address, and of content not seen so.
+static PRE_CONTENT: Mutex<(Option<HashMap<(u64, u64), (u64, u64)>>, [[[u64; 2]; 3]; 3])> = Mutex::new((None, [[[0; 2]; 3]; 3]));
+/// Frames a copy's content counts as seen (`PRE_CONTENT`).
+const CONTENT_FRAMES: u64 = 8;
+
+/// The content census is on (`PRE_CONTENT`).
+fn copy_content() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_COPY_CONTENT").ok().as_deref() == Some("1"))
+}
+
+/// A batch-start copy of guest [base, base+size) made in `frame`
+/// (`PRE_CONTENT`): its bytes hashed whole.
+fn note_pre_content(base: u64, size: u64, frame: u64) {
+    if size >= 1 << 20 {
+        return;
+    }
+    let h = super::images::hash_bytes(base, size as usize);
+    let class = match size {
+        0..4096 => 0,
+        4096..65536 => 1,
+        _ => 2,
+    };
+    let mut g = PRE_CONTENT.lock();
+    let m = g.0.get_or_insert_with(HashMap::new);
+    if m.len() > 1 << 21 {
+        m.clear();
+    }
+    let k = match m.insert((h, size), (frame, base)) {
+        Some((f, b)) if f + CONTENT_FRAMES >= frame => {
+            if b == base {
+                0
+            } else {
+                1
+            }
+        }
+        _ => 2,
+    };
+    g.1[class][k][0] += 1;
+    g.1[class][k][1] += size;
+}
+
+/// The content census's profile line ("" when off).
+fn pre_content_line() -> String {
+    if !copy_content() {
+        return String::new();
+    }
+    let g = PRE_CONTENT.lock();
+    let mb = |b: u64| b as f64 / (1u64 << 20) as f64;
+    let classes: Vec<String> = ["<4K", "<64K", "<1M"]
+        .iter()
+        .zip(g.1.iter())
+        .map(|(n, c)| format!("{n}: same address {} ({:.0} MiB), another address {} ({:.0} MiB), new {} ({:.0} MiB)", c[0][0], mb(c[0][1]), c[1][0], mb(c[1][1]), c[2][0], mb(c[2][1])))
+        .collect();
+    format!("    batch-start copies under 1 MiB by content (bytes copied in the last {CONTENT_FRAMES} frames): {}\n", classes.join("; "))
+}
 /// Batch-start copies of 1 MiB or more by range (DS_PROFILE_GPU): [copies,
 /// bytes, repeats within a frame, first-in-frame copies of a range unchanged
 /// since an earlier frame, of a changed one], then copies by why no shared
@@ -5138,6 +5198,9 @@ fn note_pre_repeat(base: u64, size: u64, n: u64, why: u8) {
     }
     let first = g.1.get_or_insert_with(HashSet::new).insert((base, size));
     drop(g);
+    if copy_content() {
+        note_pre_content(base, size, frame);
+    }
     note_pre_big(base, size, n, why, !first);
     if first {
         note_pre_stable(base, size, n, frame, why);
@@ -5182,6 +5245,7 @@ fn pre_repeat_line() -> String {
         sizes.join(", ")
     ) + &stable
         + &format!("    first-in-frame copies of unchanged ranges, by why no shared copy served them: {}\n", whys.join(", "))
+        + &pre_content_line()
         + &pre_big_line()
 }
 
@@ -6089,6 +6153,7 @@ pub fn reset_shader_profile() {
     }
     PRE_STABLE.lock().1 = [0; 5];
     *PRE_UNCHANGED_WHY.lock() = [0; 10];
+    PRE_CONTENT.lock().1 = [[[0; 2]; 3]; 3];
     *PRE_BIG.lock() = (super::FRAMES.load(Ordering::Relaxed), None);
     for c in BEGIN_STATS.iter().chain(OFFTHREAD_RESETS.iter()).chain(SUBMIT_STATS.iter()).chain(SUBMIT_STEPS.iter()).chain(SUBMIT_STEPS_RUN.iter()) {
         c.store(0, Ordering::Relaxed);
@@ -7280,7 +7345,9 @@ impl Exec {
             let n = self.slots.len();
             let done = done_seq();
             let free = |s: &Slot| s.seq != PENDING && s.seq <= done;
-            if !free(&self.slots[self.cur]) {
+            // (A slot not made yet is free: `ensure_slot` makes it. A queue
+            // that goes past a wait before using all its slots meets one.)
+            if self.cur < n && !free(&self.slots[self.cur]) {
                 let next = |ok: &dyn Fn(&Slot) -> bool| (0..n).map(|k| (self.cur + k) % n).find(|&k| ok(&self.slots[k]));
                 match next(&free) {
                     Some(k) => self.cur = k,

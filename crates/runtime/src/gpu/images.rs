@@ -972,7 +972,7 @@ fn hash_parts(todo: &[(usize, u64, u64)], threads: usize) -> Vec<(usize, u64)> {
 }
 
 /// Hash of `n` bytes at `a` (four independent lanes over 64-bit words).
-fn hash_bytes(a: u64, n: usize) -> u64 {
+pub(super) fn hash_bytes(a: u64, n: usize) -> u64 {
     let mut h = [0x9E37_79B9_7F4A_7C15u64, 0xC2B2_AE3D_27D4_EB4F, 0x1656_67B1_9E37_79F9, 0x27D4_EB2F_1656_67C5];
     let words = n / 8;
     let p = a as *const u64;

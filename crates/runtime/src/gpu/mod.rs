@@ -1629,10 +1629,17 @@ pub mod tune {
     }
 
     /// Measurement only (unsafe): the graphics CP skips its waits for labels
-    /// compute queue 0x50 wrote last (`Cp::wait`).
+    /// compute queue 0x50 wrote last (`Cp::wait`; 1); queue 0x50 skips its
+    /// waits for labels other queues' GPU work wrote last (2).
     #[inline]
     pub fn xwait_skip() -> bool {
-        get(142) != 0
+        get(142) == 1
+    }
+
+    /// `xwait_skip` 2 (see there).
+    #[inline]
+    pub fn xwait_skip_acb() -> bool {
+        get(142) == 2
     }
 
     /// Buffers bound by device address (`Spec::addresses`: no buffer

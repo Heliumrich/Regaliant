@@ -6019,6 +6019,13 @@ impl Cp {
             self.note("`tune xwait_skip`: label waits for gpu-acb0x50 skipped (measurement; pictures may be wrong)");
             return Flow::Next;
         }
+        // Measurement only (`tune xwait_skip 2`, unsafe): queue 0x50 does not
+        // wait for labels other queues' GPU work wrote last (an upper bound
+        // for its recording past them).
+        if super::tune::xwait_skip_acb() && self.name == "gpu-acb0x50" && last_write(a).is_some_and(|(q, _, _)| q.starts_with("gpu-") && q != self.name) {
+            self.note("`tune xwait_skip 2`: gpu-acb0x50's waits for other queues' labels skipped (measurement; pictures may be wrong)");
+            return Flow::Next;
+        }
         // Recording goes on past it, held (`tune past_waits`).
         if self.past_wait_ok(a) {
             return self.past_wait_start(control, a, wide, reference, mask, at);
