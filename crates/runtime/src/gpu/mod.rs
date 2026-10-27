@@ -2114,6 +2114,7 @@ pub mod forward;
 pub mod par;
 pub mod prio;
 pub mod precache;
+pub mod fe2;
 pub mod precompile;
 pub mod lockstat;
 pub mod exec;

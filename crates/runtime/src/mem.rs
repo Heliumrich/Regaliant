@@ -634,11 +634,13 @@ pub static PROBE_CLEAN: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// `take_written` by caller (`WW_WHO_NAMES`) and by size (log2 of the 4 KiB
 /// pages, the last bucket 2^20 and more): [calls, ns, found clean by the
 /// probe] (profile windows).
-pub static WW_BY_WHO: [[std::sync::atomic::AtomicU64; 3]; 9] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 9];
+pub static WW_BY_WHO: [[std::sync::atomic::AtomicU64; 3]; 10] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 10];
 pub static WW_BY_SIZE: [[std::sync::atomic::AtomicU64; 3]; 21] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 21];
-pub const WW_WHO_NAMES: [&str; 9] = ["copy-cache checks", "copy-cache inserts", "homes watch", "texture scrubbing", "texture re-uploads", "homes candidates", "shadow windows", "other", "resident data"];
+pub const WW_WHO_NAMES: [&str; 10] = ["copy-cache checks", "copy-cache inserts", "homes watch", "texture scrubbing", "texture re-uploads", "homes candidates", "shadow windows", "other", "resident data", "front end 2"];
 /// `take_written` for resident GPU-written data (`gpu::rgm`).
 pub const WW_WHO_RGM: usize = 8;
+/// `take_written` for front end 2's placements (`gpu::fe2`).
+pub const WW_WHO_FE2: usize = 9;
 
 /// Queries in flight (`InFlight`), and the calls and ns by how many other
 /// queries were in flight when each began (0..7, 8 or more).
@@ -666,7 +668,7 @@ impl Drop for InFlight {
 fn ww_note(who: usize, pages: u64, ns: u64, clean: bool, others: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let b = (64 - pages.max(1).leading_zeros() as usize - 1).min(20);
-    for s in [&WW_BY_WHO[who.min(8)], &WW_BY_SIZE[b], &WW_BY_CONC[(others as usize).min(8)]] {
+    for s in [&WW_BY_WHO[who.min(9)], &WW_BY_SIZE[b], &WW_BY_CONC[(others as usize).min(8)]] {
         s[0].fetch_add(1, Relaxed);
         s[1].fetch_add(ns, Relaxed);
         s[2].fetch_add(clean as u64, Relaxed);

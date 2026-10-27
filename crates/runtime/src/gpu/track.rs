@@ -518,6 +518,7 @@ impl Drop for HostWrite {
     fn drop(&mut self) {
         super::homes::cpu_written(self.1, self.2);
         super::resident::host_write_end(self.1, self.2);
+        super::fe2::host_write_end(self.1, self.2);
         if let Some(id) = self.0 {
             if let Some(t) = TRACK.lock().as_mut() {
                 t.busy.retain(|b| b.0 != id);
@@ -534,6 +535,7 @@ pub fn host_write(base: u64, len: u64) -> HostWrite {
     note_event("host write", base, len);
     super::precache::invalidate(base, len);
     super::resident::host_write_begin(base, len);
+    super::fe2::host_write_begin(base, len);
     // Pages armed through the host (the GPU-resolved mirror, the copy
     // cache's protection): writable first (the kernel fails a file read
     // into a read-only page instead of faulting).

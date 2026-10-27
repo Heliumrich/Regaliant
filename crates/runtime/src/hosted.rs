@@ -209,6 +209,15 @@ pub fn disarm(base: u64, len: u64) {
     crate::gpu::gmirror::disarmed(lo, hi - lo);
 }
 
+/// The armed bits of the 64 pages from `a` (a multiple of 64 pages from the
+/// guest range's start): bit i for page a + 4096 * i (0 when not hosted or
+/// none of them was ever armed).
+#[inline]
+pub fn armed_word(a: u64) -> u64 {
+    let Some(s) = shared() else { return 0 };
+    bit(s, a, false).map_or(0, |(w, _)| w.load(Ordering::Acquire))
+}
+
 /// Whether every page of guest [base, base+len) is armed (no fault on any
 /// of them since it was armed, no disarm, no mapping change).
 pub fn all_armed(base: u64, len: u64) -> bool {
@@ -271,6 +280,11 @@ pub fn drain(out: &mut Vec<u64>) -> bool {
     let ok = drain_faults(&mut v);
     out.extend(v.into_iter().map(|(p, _, _)| p));
     ok
+}
+
+/// Write faults on armed pages the host answered so far (0 when not hosted).
+pub fn faults() -> u64 {
+    shared().map_or(0, |s| s.faults.load(Ordering::Relaxed))
 }
 
 /// Status line ("" when not hosted).

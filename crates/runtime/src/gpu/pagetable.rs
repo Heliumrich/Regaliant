@@ -128,6 +128,12 @@ pub fn made() -> bool {
     TABLE.get().is_some_and(|t| t.is_some())
 }
 
+/// The table's buffer, made on first use (front end 2's self-test writes an
+/// entry of its own and clears it again).
+pub(super) fn buffer() -> Option<vk::Buffer> {
+    table().map(|t| t.buf)
+}
+
 /// The pages of guest [guest, guest+len) clipped to the table: (first page,
 /// pages, the clipped range's start).
 fn pages(guest: u64, len: u64) -> Option<(u64, u64, u64)> {

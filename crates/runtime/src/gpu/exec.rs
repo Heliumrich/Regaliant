@@ -345,6 +345,7 @@ pub fn enabled() -> bool {
             Ok(()) => {
                 crate::info!("gpu: executing compute dispatches on Vulkan (DS_GPU=1)");
                 super::resident::init();
+                super::fe2::init();
                 super::resident::section_test_maybe();
                 super::resident::protect_test_maybe();
                 true
@@ -803,6 +804,9 @@ fn revalidate_spans() {
     }
     let ranges: Vec<(u64, u64)> = changed.iter().map(|&(a, b)| (a, b - a)).collect();
     super::mirror::invalidate(&ranges);
+    for &(a, n) in &ranges {
+        super::fe2::invalidate(a, n);
+    }
     let mut g = SPANS.write();
     let mut dead = Vec::new();
     let mut i = 0;
@@ -1017,6 +1021,25 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
         });
     }
     r
+}
+
+/// Front end 2: whether the pages of guest [a, b) may be armed now: every
+/// import over them, live or dropped and not freed yet, is at least
+/// `fe2::SETTLE` flips old (protecting a new import's pages lost the device:
+/// FINDINGS.md 2026-10-26), and a live one covers them all.
+fn fe2_armable(a: u64, b: u64) -> bool {
+    let now = super::FRAMES.load(Ordering::Relaxed);
+    let settled = |born: u64| born + super::fe2::SETTLE <= now;
+    let Some(g) = SPANS.try_read() else { return false };
+    if !g.iter().any(|s| s.valid && s.start <= a && b <= s.end) {
+        return false;
+    }
+    if g.iter().any(|s| s.start < b && a < s.end && !settled(s.born)) {
+        return false;
+    }
+    drop(g);
+    let Some(gy) = GRAVEYARD.try_lock() else { return false };
+    !gy.iter().any(|d| d.span.start < b && a < d.span.end && !settled(d.span.born))
 }
 
 /// Mirror mode: whether the pages to be copied into the mirror (ascending
@@ -6383,6 +6406,14 @@ pub struct Exec {
     res_mine: super::fx::Set<u64>,
     res_need: Vec<u64>,
     stage_used: u64,
+    /// Front end 2 (`fe2`): the batch's uploads into the mirror (runs, and
+    /// their pages as a set: current for the batch's work), whether GPU
+    /// work recorded since the last write-back marks dwords, and the word
+    /// generations taken when the batch is queued (scratch).
+    fe2_up: Vec<(u64, u64)>,
+    fe2_mine: super::fx::Set<u64>,
+    fe2_marked: bool,
+    fe2_gens: Vec<u32>,
     /// Resident GPU-written data (`gpu::rgm`, `exec/rgm.rs`): the open
     /// batch's claims and their granules, its W writes (all, and those not
     /// merged into guest memory yet), the merge table, a page list reused.
@@ -7065,6 +7096,10 @@ impl Exec {
                 res_mine: Default::default(),
                 res_need: Vec::new(),
                 stage_used: 0,
+                fe2_up: Vec::new(),
+                fe2_mine: Default::default(),
+                fe2_marked: false,
+                fe2_gens: Vec::new(),
                 rgm_claims: Vec::new(),
                 rgm_mine: Default::default(),
                 rgm_written: Default::default(),
@@ -7207,6 +7242,16 @@ impl Exec {
         *n += 1;
         if *n == 1 {
             crate::warn!("gpu[{}]: {msg}", self.name);
+        }
+    }
+
+    /// `report` as an error line (front end 2's coherence failures), the
+    /// first `example` given with it.
+    fn report_error(&mut self, msg: &str, example: impl FnOnce() -> String) {
+        let n = self.reported.entry(msg.to_string()).or_insert(0);
+        *n += 1;
+        if *n == 1 {
+            crate::error!("gpu[{}]: {msg} (first: {})", self.name, example());
         }
     }
 
@@ -7466,6 +7511,7 @@ impl Exec {
                 ctx().device.cmd_fill_buffer(self.cmd(), m, rdna::kernels::MARK_LIST_AT as u64 * 4, 4, 0);
             }
         }
+        self.fe2_marked = false;
         // Every batch follows all earlier ones: also a parallel run's chunks,
         // which the title left unordered, as their shadows of a buffer they
         // all write (the culls' appends) are copied in and merged back per
@@ -7595,6 +7641,11 @@ impl Exec {
         st.mark(1);
         self.resolve_timestamps();
         st.mark(2);
+        // Front end 2: what the batch's work wrote into the mirror goes to
+        // guest memory before the batch completes.
+        if self.fe2_marked {
+            self.fe2_scatter();
+        }
         // Mirror mode: pages deferred CP writes changed are copied into the
         // mirror again (those writes were waited for above), and the dwords
         // the batch's work changes in its written ranges go to guest memory
@@ -7692,6 +7743,11 @@ impl Exec {
             self.keep_submitted(0);
             self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), rgm_claims: std::mem::take(&mut self.rgm_claims), rgm_written: std::mem::take(&mut self.rgm_written), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises });
             self.res_mine.clear();
+            if !self.fe2_up.is_empty() {
+                crate::error!("gpu[{}]: front end 2's uploads in a parallel chunk (dropped: uploaded again later)", self.name);
+                self.fe2_up.clear();
+                self.fe2_mine.clear();
+            }
             self.rgm_batch_done(true);
             self.stage_used = 0;
             self.slots[i].seq = PENDING;
@@ -7712,6 +7768,13 @@ impl Exec {
         note_copy_waits(xpre.is_some() || xpre_job.is_some(), copy_wait);
         let alt = self.batch_alt;
         let reset = self.slot_reset(i);
+        // Front end 2: the words its uploads touch, before it can run.
+        let fe2_ep = super::precache::epoch() as u32;
+        if !self.fe2_up.is_empty() {
+            let mut gens = std::mem::take(&mut self.fe2_gens);
+            super::fe2::generations(&self.fe2_up, &mut gens);
+            self.fe2_gens = gens;
+        }
         let seq = push_batch(fence, self.slots[i].queries, bq, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, std::mem::take(&mut self.segs), reset, alt, move |seq| {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return None;
@@ -7741,6 +7804,11 @@ impl Exec {
         }
         self.slots[i].seq = seq;
         self.open_gen.store(u64::MAX, Ordering::SeqCst);
+        if !self.fe2_up.is_empty() {
+            super::fe2::uploaded(&self.fe2_up, &self.fe2_gens, fe2_ep);
+            self.fe2_up.clear();
+        }
+        self.fe2_mine.clear();
         super::precache::submitted(&std::mem::take(&mut self.shared_pending), seq);
         if !self.res_pages.is_empty() {
             super::resident::submitted(&std::mem::take(&mut self.res_pages), seq);
@@ -7853,6 +7921,9 @@ impl Exec {
         self.batch_shaders.clear();
         self.resident.clear();
         super::resident::dropped(&std::mem::take(&mut self.res_pages));
+        self.fe2_up.clear();
+        self.fe2_mine.clear();
+        self.fe2_marked = false;
         self.rgm_batch_done(false);
         self.owned.clear();
         self.eager_action = None;
@@ -7890,6 +7961,10 @@ impl Exec {
         if super::resident::mirror_mode() {
             self.mm_unsized = kind == HomeUse::Unbounded;
             return self.mirror_place(base, size, written).map(|(b, o, a)| (b, o, a, None));
+        }
+        // Front end 2: the mirror, inside its span.
+        if super::fe2::on() && super::fe2::in_span(base, size) {
+            return self.fe2_place(base, size, written).map(|(b, o, a)| (b, o, a, None));
         }
         if !super::tune::homes() && super::homes::any() {
             self.homes_evict_all();
@@ -8024,6 +8099,10 @@ impl Exec {
     /// (once per batch; `held`: the home, if the caller has it); false if
     /// it no longer exists.
     pub(super) fn keep_home(&mut self, buf: vk::Buffer, held: Option<&std::sync::Arc<super::homes::HomeBuf>>) -> bool {
+        // Front end 2's mirror lives as long as the process.
+        if super::fe2::on() && super::resident::mirror_buffer().is_some_and(|(m, _)| m == buf) {
+            return true;
+        }
         self.ensure_slot();
         let l = &mut self.slots[self.cur].homes;
         if l.iter().any(|k| k.buf == buf) {
@@ -8284,6 +8363,108 @@ impl Exec {
     /// tracked are copied for every batch); a written binding's pages become
     /// GPU-owned (no-access once the batch is submitted). None: a page is
     /// host class (CP writes) or not readable; the old paths take it.
+    /// Front end 2's placement (`fe2`): guest [base, base+size) bound from
+    /// the mirror at its guest offset once the mirror holds it current
+    /// (pages it lacks are copied from their import windows in the batch's
+    /// prologue). Written ranges are imported (the write-back stores into
+    /// them) and leave the batch with a write-back to record. A range
+    /// reaching past the end of its mapping is placed up to there (the rest
+    /// reads 0). None: nothing of it is mapped, or no video memory.
+    fn fe2_place(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
+        use super::resident::{MIRROR_BASE, PAGE};
+        let (mbuf, _) = super::resident::mirror_buffer()?;
+        let end = base.checked_add(size)?;
+        if size == 0 || !super::fe2::in_span(base, size) {
+            return None;
+        }
+        let lo = base & !(PAGE - 1);
+        // (The run of mappings around `base`, from this thread's cache.)
+        let (_, mapped_end) = crate::mem::readable_span(base)?;
+        let hi = end.next_multiple_of(PAGE).min(mapped_end.next_multiple_of(PAGE));
+        if hi <= base {
+            return None;
+        }
+        if let Err(e) = super::resident::back(lo, hi - lo) {
+            self.report_error("front end 2: no video memory for the mirror (bound as zeros)", || format!("{lo:#x}..{hi:#x}: {e}"));
+            return None;
+        }
+        if written {
+            if span(lo, hi - lo).is_none() {
+                super::fe2::note_unscatterable();
+                self.report_error("front end 2: a written range cannot be imported (its GPU writes do not reach guest memory)", || format!("{lo:#x}..{hi:#x}"));
+            }
+            self.fe2_marked = true;
+        }
+        let ep = super::precache::epoch() as u32;
+        let mine = std::mem::take(&mut self.fe2_mine);
+        let mut up = std::mem::take(&mut self.fe2_up);
+        let first = up.len();
+        let r = super::fe2::ensure(lo, hi, ep, written, &|p| mine.contains(&p), &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable);
+        let mut mine = mine;
+        for &(a, b) in &up[first..] {
+            let mut p = a;
+            while p < b {
+                mine.insert(p);
+                p += PAGE;
+            }
+        }
+        self.fe2_mine = mine;
+        self.fe2_up = up;
+        if let Err(e) = r {
+            self.report_error(&format!("front end 2: {e} (bound as the mirror holds it)"), || format!("{lo:#x}..{hi:#x}"));
+        }
+        // Deferred CP writes into the range not performed yet: the batch is
+        // queued after them (its prologue's copies read what they wrote).
+        if let Some(s) = CP_WRITES.latest(&[(base, size)]) {
+            self.submit_after = self.submit_after.max(s);
+        }
+        Some((mbuf, base - MIRROR_BASE, hi - base))
+    }
+
+    /// Records the copy of guest [a, b) into the mirror at its offset, in
+    /// the batch's prologue: from the import windows over it (those runs
+    /// appended to `up`: current once the batch is queued), else, for
+    /// memory the driver cannot import, from the CPU's copy now (current
+    /// for this batch only: CPU writes after it are not in it).
+    fn fe2_upload(&mut self, mbuf: vk::Buffer, a: u64, b: u64, up: &mut Vec<(u64, u64)>) -> bool {
+        use super::resident::{MIRROR_BASE, PAGE};
+        let _ = self.open_pre();
+        let mut x = a;
+        while x < b {
+            let e = ((x & !(WINDOW - 1)) + WINDOW).min(b);
+            match span(x, e - x) {
+                Some((buf, start, wend)) => {
+                    let e = e.min(wend);
+                    self.pre_copies.push((buf, mbuf, vk::BufferCopy { src_offset: x - start, dst_offset: x - MIRROR_BASE, size: e - x }));
+                    match up.last_mut() {
+                        Some(l) if l.1 == x => l.1 = e,
+                        _ => up.push((x, e)),
+                    }
+                    x = e;
+                }
+                None => {
+                    if !crate::mem::os_readable(x, PAGE) || self.mirror_stage(mbuf, x).is_none() {
+                        return false;
+                    }
+                    super::fe2::note_memcpy(1);
+                    x += PAGE;
+                }
+            }
+        }
+        true
+    }
+
+    /// Front end 2's write-back, recorded now (outside a render pass): the
+    /// dwords GPU work marked go from the mirror to guest memory.
+    fn fe2_scatter(&mut self) {
+        let cmd = self.cmd();
+        if let Some(pipe) = super::fe2::record_scatter(cmd) {
+            // The next dispatch binds its own pipeline and descriptors.
+            self.dyncache.cs_pipeline = pipe;
+        }
+        self.fe2_marked = false;
+    }
+
     fn mirror_place(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
         use super::resident as res;
         let (mbuf, _) = res::mirror()?;
@@ -8893,6 +9074,13 @@ impl Exec {
             self.dispatched = false;
         }
         unsafe { ctx().device.cmd_fill_buffer(cmd, buffer, base - start, len, v) };
+        // Front end 2: the mirror too (its later write-back of dwords marked
+        // before the fill copies the filled values).
+        if super::fe2::on() && super::fe2::in_span(base, len) {
+            if let (Some((m, _)), Ok(())) = (super::resident::mirror_buffer(), super::resident::back(base & !4095, (base + len).next_multiple_of(4096) - (base & !4095))) {
+                unsafe { ctx().device.cmd_fill_buffer(cmd, m, base - super::resident::MIRROR_BASE, len, v) };
+            }
+        }
         if profiling() {
             let mut g = FILL_BY.lock();
             let e = g.get_or_insert_with(HashMap::new).entry((base, len)).or_insert([0, 0]);
@@ -10133,8 +10321,26 @@ impl Exec {
         // End-of-pipe events are written in order on the console: a title
         // that sees this value may read the timestamps taken before it.
         self.resolve_timestamps();
+        // Front end 2: what earlier work wrote into the mirror reaches guest
+        // memory before this write does (a title thread that sees it reads
+        // that there), and the write goes into the mirror too (later work
+        // reads it there).
+        if self.fe2_marked {
+            self.fe2_scatter();
+        }
+        let fe2_mirror = if super::fe2::on() && super::fe2::in_span(a, bytes) && super::resident::back(a & !4095, (a + bytes).next_multiple_of(4096) - (a & !4095)).is_ok() {
+            super::fe2::note_cp_mirror();
+            super::resident::mirror_buffer().map(|(m, _)| (m, a - super::resident::MIRROR_BASE))
+        } else {
+            None
+        };
         let cmd = self.cmd();
         let raw: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let to_mirror = |cmd: vk::CommandBuffer| {
+            if let Some((m, off)) = fe2_mirror {
+                unsafe { ctx().device.cmd_update_buffer(cmd, m, off, &raw) };
+            }
+        };
         self.taint_resident(a, bytes);
         if end_of_pipe && super::tune::eop_light() {
             self.ops[OP_CP_WRITES] += 1;
@@ -10148,6 +10354,7 @@ impl Exec {
                     ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
                 }
                 ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw);
+                to_mirror(cmd);
                 // Diagnosis (`tune skip_copies` 1024, timing only): written
                 // twice, with a barrier between (what one more costs).
                 if super::tune::skip_copies() & 1024 != 0 {
@@ -10160,12 +10367,14 @@ impl Exec {
         } else if super::tune::skip_barriers() & 4 != 0 {
             self.ops[OP_CP_WRITES] += 1;
             unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
+            to_mirror(cmd);
         } else {
             self.barrier();
             // Counted between its barriers (`seg_stamps` names the segment
             // by it).
             self.ops[OP_CP_WRITES] += 1;
             unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
+            to_mirror(cmd);
             self.barrier();
             self.barrier_wanted = false;
             self.dispatched = false;
@@ -11578,6 +11787,22 @@ impl Exec {
                                 }
                             }
                             self.mirror_place(base, size, found.tr.plan.resources[i].written)
+                        } else if super::fe2::on() && super::fe2::in_span(base, size) {
+                            // Diagnostics: large written bindings, the first of each shader.
+                            if found.tr.plan.resources[i].written && size >= 4 << 20 {
+                                static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+                                let mut g = SEEN.lock();
+                                let seen = g.get_or_insert_with(HashSet::new);
+                                if seen.len() < 40 && seen.insert(p.addr) {
+                                    let what = match &found.resources[i] {
+                                        Resolved::Buffer(v) => format!("V# stride {} records {}", v.stride, v.num_records),
+                                        Resolved::Global(_, n) => format!("pointer ({n:?} bytes)"),
+                                        _ => String::new(),
+                                    };
+                                    crate::info!("gpu[{}]: front end 2: {:?} shader {:#x} writes {base:#x}+{size:#x}: {what}; atomic {}", self.name, p.stage, p.addr, found.tr.plan.resources[i].atomic);
+                                }
+                            }
+                            self.fe2_place(base, size, found.tr.plan.resources[i].written)
                         } else if read_only && super::resident::enabled() {
                             self.resident_bind(base, size)
                         } else {
@@ -12488,7 +12713,7 @@ impl Exec {
         // (Held past a label wait the graphics command processor records in
         // program order still: its copies forward as before.)
         // (A long run's chunk forwards into its own view: `Cp::long_begin`.)
-        let forward_here = super::tune::forward_copies() && (!self.deferred || self.past_grow || ((self.past || self.long) && super::forward::held())) && indirect.is_none() && (self.name == "gpu-gfx" || (self.long && self.name.starts_with("gpu-gfx-par"))) && !super::resident::mirror_mode();
+        let forward_here = super::tune::forward_copies() && (!self.deferred || self.past_grow || ((self.past || self.long) && super::forward::held())) && indirect.is_none() && (self.name == "gpu-gfx" || (self.long && self.name.starts_with("gpu-gfx-par"))) && !super::resident::mirror_mode() && !super::fe2::on();
         // The graphics queue's parallel workers (`copy_update 2`): updates
         // checked once their batches completed, never forwarded.
         let worker_here = super::tune::forward_copies() && self.deferred && !self.held && indirect.is_none() && self.name.starts_with("gpu-gfx") && super::tune::copy_update_workers() && !super::resident::mirror_mode();
@@ -12540,7 +12765,7 @@ impl Exec {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| crate::info!("gpu[{}]: fill kernel cs {:#x} stays a dispatch: indirect {}, COMPUTE_NUM_THREAD_X {:#x}, start {:?}", self.name, p.addr, indirect.is_some(), cp.reg(Space::Sh, 0x207), [cp.reg(Space::Sh, 0x204), cp.reg(Space::Sh, 0x205), cp.reg(Space::Sh, 0x206)]));
         }
-        if plain && super::tune::fill_dma() && !super::resident::mirror_mode() {
+        if plain && (super::tune::fill_dma() || super::fe2::on()) && !super::resident::mirror_mode() {
             if let Some((base, len, v)) = verify::full_fill(&p, groups, local, threads_x) {
                 // A zero fill over nothing but GPU-written images it clears
                 // stores nothing into their guest memory (`tune fill_skip`).
@@ -12899,6 +13124,10 @@ impl Exec {
                 SHADOW_ARGS.fetch_add(1, Ordering::Relaxed);
                 self.resident_args(a)
             }
+            Some(a) if super::fe2::on() && super::fe2::in_span(a, 12) => match self.fe2_place(a, 12, false) {
+                Some((buffer, off, _)) => Some((buffer, off)),
+                None => return Err(format!("cs {:#x}: indirect arguments {a:#x} are not mapped GPU memory (dispatch skipped)", p.addr)),
+            },
             Some(a) if super::resident::mirror_mode() && {
                 self.mm_unsized = false;
                 self.mirror_place(a, 12, false).is_some()
@@ -13409,6 +13638,7 @@ pub fn status() -> String {
         + &super::mirror::status()
         + &super::homes::status()
         + &super::resident::status()
+        + &super::fe2::status()
         + &import_sites_line()
         + &in_place_line()
         + &sync_why_status()

@@ -146,7 +146,7 @@ impl Exec {
     /// (dispatches), which may make a window. None: the binding goes on as
     /// before (after windows it overlaps were written back where needed).
     pub(super) fn keep_bind(&mut self, base: u64, size: u64, written: bool, unbounded: bool, create: bool) -> Result<Option<(vk::Buffer, u64, u64)>, String> {
-        if size == 0 || super::super::resident::mirror_mode() {
+        if size == 0 || super::super::resident::mirror_mode() || super::super::fe2::on() {
             return Ok(None);
         }
         let on = super::super::tune::keep_small();

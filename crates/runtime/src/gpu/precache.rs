@@ -438,6 +438,8 @@ impl Cache {
     /// marks resets them), and so are write-watched homes on them unless the
     /// take is a home's own check (`homes`).
     fn apply_marks(&mut self, base: u64, size: u64, r: Option<()>, new: &[u64], except: Option<u32>, homes: bool) {
+        // Front end 2's pages the take found written leave the mirror.
+        super::fe2::marks_taken(r, base, size, new);
         match r {
             Some(()) if !new.is_empty() => super::track::cpu_pages(new, except),
             Some(()) => {}
@@ -1044,6 +1046,7 @@ pub fn take_written_for(base: u64, size: u64, out: &mut Vec<u64>, except: Option
 #[track_caller]
 pub fn invalidate(base: u64, len: u64) {
     super::rgm::invalidate(base, len);
+    super::fe2::invalidate(base, len);
     let end = base.saturating_add(len);
     if len != 0 && base < WATCH_HI.load(Ordering::Acquire) && WATCH_LO.load(Ordering::Acquire) < end {
         let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);

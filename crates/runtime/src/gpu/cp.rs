@@ -4143,6 +4143,11 @@ impl Cp {
                 f();
                 super::resident::cp_wrote(a, n);
             }) as Box<dyn FnOnce() + Send>,
+            // Front end 2: the mirror no longer holds what it changed.
+            Some((a, n)) if super::fe2::on() => Box::new(move || {
+                f();
+                super::fe2::invalidate(a, n);
+            }) as Box<dyn FnOnce() + Send>,
             _ => f,
         };
         let needs_prior = end_of_pipe || self.fence_pending;

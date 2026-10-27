@@ -1157,6 +1157,37 @@ pub fn mirror() -> Option<(vk::Buffer, u64)> {
     MIRROR.get().map(|m| (m.buf, m.page))
 }
 
+/// The mirror buffer and its sparse page size once made, residency on or
+/// not (front end 2: `fe2`).
+pub fn mirror_buffer() -> Option<(vk::Buffer, u64)> {
+    MIRROR.get().map(|m| (m.buf, m.page))
+}
+
+/// Front end 2 (`fe2`): the mirror and the written-bit map, made without
+/// turning residency on (none of its placements run). Ok: what was made.
+pub fn make_for_fe2() -> Result<String, String> {
+    if MIRROR.get().is_none() {
+        let m = make_mirror()?;
+        let _ = MIRROR.set(m);
+    }
+    let m = MIRROR.get().ok_or("no mirror")?;
+    let at = MIRROR_END - m.page;
+    let data: Vec<u8> = (0..m.page).map(|i| (i * 7 + 3) as u8).collect();
+    upload_now(at, &data)?;
+    if readback_now(at, m.page)? != data {
+        return Err("a page through the mirror and back differs".into());
+    }
+    if MARKS.get().is_none() {
+        make_marks()?;
+    }
+    Ok(format!("mirror of {} GiB (sparse pages of {} KiB), written-bit map of {} MiB", (MIRROR_END - MIRROR_BASE) >> 30, m.page >> 10, MARK_BYTES >> 20))
+}
+
+/// Shared while pages are armed: mapping changes exclude it (`remap_guard`).
+pub fn arm_guard() -> parking_lot::RwLockReadGuard<'static, ()> {
+    ARM_LOCK.read_recursive()
+}
+
 /// The mirror: a sparse buffer over [MIRROR_BASE, MIRROR_END).
 struct Mirror {
     buf: vk::Buffer,
@@ -1212,6 +1243,10 @@ pub fn back(base: u64, len: u64) -> Result<(), String> {
     let c = ctx();
     let first = (base - MIRROR_BASE) / m.page;
     let last = (base + len - 1 - MIRROR_BASE) / m.page;
+    // Backed already (most calls): no lock.
+    if (first..=last).all(|p| m.backed[(p / 64) as usize].load(Ordering::Acquire) & (1u64 << (p % 64)) != 0) {
+        return Ok(());
+    }
     let mut g = m.blocks.lock();
     let mut binds = Vec::new();
     for p in first..=last {
@@ -3030,9 +3065,14 @@ fn owned_self_test() -> Result<String, String> {
     }
     let queue = if rb.copy { "copy queue" } else { "main queue" };
     *READBACK.lock() = Some(rb);
-    // The written-bit map, zeroed.
+    make_marks()?;
+    Ok(format!("read-back context on the {queue}, written-bit map of {} MiB", MARK_BYTES >> 20))
+}
+
+/// The written-bit map, made zeroed (`marks`).
+fn make_marks() -> Result<(), String> {
     let c = ctx();
-    let (buf, _mem) = c.device_buffer(MARK_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER)?;
+    let (buf, _mem) = c.device_buffer(MARK_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::INDIRECT_BUFFER)?;
     // Zeroed; the touched-page list's header [count, 1, 1, 0] is the list
     // gather's indirect dispatch.
     let header: Vec<u8> = [0u32, 1, 1, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
@@ -3043,7 +3083,13 @@ fn owned_self_test() -> Result<String, String> {
         c.device.cmd_update_buffer(cmd, buf, rdna::kernels::MARK_LIST_AT as u64 * 4, &header);
     })?;
     let _ = MARKS.set(buf);
-    Ok(format!("read-back context on the {queue}, written-bit map of {} MiB", MARK_BYTES >> 20))
+    Ok(())
+}
+
+/// Runs `record` in a one-off command buffer on the main queue and waits
+/// (front end 2's self-test).
+pub fn one_off_now(record: impl FnOnce(vk::CommandBuffer)) -> Result<(), String> {
+    one_off(record)
 }
 
 #[cfg(test)]
