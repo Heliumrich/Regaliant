@@ -124,7 +124,7 @@ pub mod tune {
         Tunable { name: "wait_yields", env: "DS_WAIT_YIELDS", default: 800, value: AtomicU64::new(UNSET) },
         Tunable { name: "timer_sleep", env: "DS_TIMER_SLEEP", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "cp_classes_acb", env: "DS_CP_CLASSES_ACB", default: 0x50, value: AtomicU64::new(UNSET) },
-        Tunable { name: "shadow_args", env: "DS_SHADOW_ARGS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "shadow_args", env: "DS_SHADOW_ARGS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ahead_queues", env: "DS_AHEAD_QUEUES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "copy_update", env: "DS_COPY_UPDATE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "skip_copies", env: "DS_SKIP_COPIES", default: 0, value: AtomicU64::new(UNSET) },
@@ -1087,9 +1087,10 @@ pub mod tune {
 
     /// An indirect dispatch whose arguments a resident shadow holds (an
     /// earlier dispatch of the batch wrote them in its working copy) reads
-    /// them there instead of merging the shadow back first: 1 on every
-    /// executor, 2 on the graphics queue's (its command processor and
-    /// parallel workers) only.
+    /// them there instead of merging the shadow back first: 1 (default since
+    /// 2026-10-27: +1.6% at the vista in an in-run A/B) on every executor, 2
+    /// on the graphics queue's (its command processor and parallel workers)
+    /// only, 0 off.
     #[inline]
     pub fn shadow_args() -> u64 {
         get(91)

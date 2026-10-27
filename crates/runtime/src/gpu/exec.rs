@@ -6032,6 +6032,14 @@ fn collect_timestamps(bq: vk::QueryPool, pool: vk::QueryPool, shaders: &[u64], q
             let o = ops_line(ops);
             if o.is_empty() { batch_contents(shaders) } else { format!("{}; {o}", batch_contents(shaders)) }
         });
+        // The timeline's GPU track, from the batch timestamps (with or
+        // without the profiler).
+        if super::timeline::on() {
+            super::timeline::gpu(queue, seq, be[0], be[1], &format!(", {} commands{}", shaders.len(), batch_contents(shaders)));
+            if got_pre && pre[0] != 0 {
+                super::timeline::gpu(queue, seq, pre[0], pre[1], " prologue");
+            }
+        }
     }
     if pool == vk::QueryPool::null() {
         return;
@@ -6039,9 +6047,6 @@ fn collect_timestamps(bq: vk::QueryPool, pool: vk::QueryPool, shaders: &[u64], q
     if got_be {
         let period = c.limits.timestamp_period as f64;
         let batch_ns = (be[1].saturating_sub(be[0]) as f64 * period) as u64;
-        if super::timeline::on() {
-            super::timeline::gpu(queue, seq, be[0], be[1], &format!(", {} commands{}", shaders.len(), batch_contents(shaders)));
-        }
         BATCH_NS.fetch_add(batch_ns, Ordering::Relaxed);
         if !command_stamps() {
             note_batch_by(queue, shaders, batch_ns);
@@ -6065,7 +6070,6 @@ fn collect_timestamps(bq: vk::QueryPool, pool: vk::QueryPool, shaders: &[u64], q
     }
     if got_pre {
         PRE_NS.fetch_add((pre[1].saturating_sub(pre[0]) as f64 * c.limits.timestamp_period as f64) as u64, Ordering::Relaxed);
-        super::timeline::gpu(queue, seq, pre[0], pre[1], " prologue");
     }
     let n = (shaders.len() as u32).min(MAX_TIMED);
     if n == 0 || !command_stamps() {
