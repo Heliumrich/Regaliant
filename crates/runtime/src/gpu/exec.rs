@@ -3122,8 +3122,8 @@ static XDRY_SNAP: AtomicU64 = AtomicU64::new(0);
 /// Why `speculate` left a command to wait (diagnostics, since boot): stale
 /// home, a data load this batch writes or not one mapping, a parallel
 /// chunk's own writes, a stage that writes memory or images, a shader that
-/// mispredicted.
-static SPEC_REFUSED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// mispredicted, descriptor words GPU work writes (`tune spec_reads 2`).
+static SPEC_REFUSED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 static XCOPY_SNAP: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// GPU time of the batches' copy prologues (DS_PROFILE_GPU), ns.
 static PRE_NS: AtomicU64 = AtomicU64::new(0);
@@ -6063,7 +6063,7 @@ pub fn shader_profile() -> String {
     {
         let n: Vec<u64> = SYNC_WHY.iter().zip(SYNC_WHY_AT_RESET.iter()).map(|(c, r)| c.load(Ordering::Relaxed).saturating_sub(r.load(Ordering::Relaxed))).collect();
         s.push_str(&format!(
-            "    command-processor waits for GPU work: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices; speculation (since boot): on words the recording batch writes {}; refused: stale home {}, data this batch writes or not one mapping {}, a parallel chunk's own writes {}, a stage writing memory or images {}, mispredicting shader {}\n",
+            "    command-processor waits for GPU work: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices; speculation (since boot): on words the recording batch writes {}; refused: stale home {}, data this batch writes or not one mapping {}, a parallel chunk's own writes {}, a stage writing memory or images {}, mispredicting shader {}, descriptor words (`spec_reads 2`) {}\n",
             n[0],
             n[1],
             n[2],
@@ -6075,7 +6075,8 @@ pub fn shader_profile() -> String {
             SPEC_REFUSED[1].load(Ordering::Relaxed),
             SPEC_REFUSED[2].load(Ordering::Relaxed),
             SPEC_REFUSED[3].load(Ordering::Relaxed),
-            SPEC_REFUSED[4].load(Ordering::Relaxed)
+            SPEC_REFUSED[4].load(Ordering::Relaxed),
+            SPEC_REFUSED[5].load(Ordering::Relaxed)
         ));
         let w: Vec<u64> = READ_WAIT_WORDS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         s.push_str(&format!(
@@ -6381,6 +6382,8 @@ pub struct Exec {
     compute_cp: bool,
     /// Queue 0x50's (its own place class in the bind-step profile).
     acb50: bool,
+    /// The dispatch whose writes are being noted (`DS_TRACE_NOTE`).
+    noting: u64,
     batch_alt: bool,
     batch_alt_share: bool,
     /// GPU writes this batch recorded since its last full barrier through
@@ -6905,6 +6908,7 @@ impl Exec {
                 on_compute,
                 compute_cp: name.starts_with("gpu-acb"),
                 acb50: name == "gpu-acb0x50",
+                noting: 0,
                 batch_alt: false,
                 batch_alt_share: false,
                 since_barrier: Some(Vec::new()),
@@ -9185,11 +9189,16 @@ impl Exec {
             .get_or_init(|| std::env::var("DS_TRACE_SYNC").ok().filter(|v| !v.is_empty() && v != "0"))
             .as_deref()
             .is_some_and(|v| v == "1" || self.name.contains(v));
-        let trace = (traced_here && TRACED.load(Ordering::Relaxed) < 400)
-            || (super::tune::get_trace_sync() && self.would_wait(reads) && super::tune::take_trace_sync());
+        // `tune trace_sync <n>`: the next n waits (one is taken only when
+        // the read waited: forwarded copies spare many that would).
+        let live = super::tune::get_trace_sync() && self.would_wait(reads);
+        let trace = (traced_here && TRACED.load(Ordering::Relaxed) < 400) || live;
         let culprit = if trace {
             let done = done_seq();
-            reads.iter().find_map(|&r| {
+            // What forwarded copies leave to wait for (as `sync_for_reads`
+            // sees it).
+            let left = super::forward::uncovered(reads);
+            left.as_deref().unwrap_or(reads).iter().find_map(|&r| {
                 let who = if self.pending.overlaps(r.0, r.1) {
                     Some("this batch".to_string())
                 } else if let Some(s) = self.inflight.latest(&[r], done) {
@@ -9202,7 +9211,8 @@ impl Exec {
                     None => ", GPU work".to_string(),
                 };
                 let last = super::cp::last_write_info(r.0).map(|w| format!(" [last CP write there: {w}]")).unwrap_or_default();
-                Some((r, format!("{who}{cp}{last}")))
+                let fwd = format!(" [{}]", super::forward::describe(r.0, r.1));
+                Some((r, format!("{who}{cp}{last}{fwd}")))
             })
         } else {
             None
@@ -9214,7 +9224,7 @@ impl Exec {
             WAIT_NS[1].fetch_add(1, Ordering::Relaxed);
             note_queue_wait(&self.name, 0, t0.elapsed());
             SYNC_WHY[why.min(SYNC_WHY.len() - 1)].fetch_add(1, Ordering::Relaxed);
-            if let Some(((a, n), src)) = culprit {
+            if let Some(((a, n), src)) = culprit.filter(|_| !live || super::tune::take_trace_sync()) {
                 self.sync_culprit = Some((a, n));
                 {
                     TRACED.fetch_add(1, Ordering::Relaxed);
@@ -9317,6 +9327,12 @@ impl Exec {
             let own_writes = self.pending.overlaps_any(&reads);
             let submitted = writer(self, &reads);
             if own_writes || submitted.is_some() {
+                // Data-only patches alone (`tune spec_reads 2`): descriptor
+                // words GPU work writes are waited for as before.
+                if super::tune::spec_reads_mode() == 2 {
+                    SPEC_REFUSED[5].fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
                 if p.tr.plan.resources.iter().any(|r| r.written) && !read_only_descriptors(p, &reads) {
                     SPEC_REFUSED[3].fetch_add(1, Ordering::Relaxed);
                     return None;
@@ -9569,7 +9585,7 @@ impl Exec {
     pub(super) fn note_write(&mut self, a: u64, n: u64) {
         // DS_TRACE_NOTE=<hex address>[-<hex end>]: the first 400 notes
         // covering it or overlapping the range (diagnosis: who writes a word
-        // stage preparations wait for, or a region).
+        // stage preparations wait for, or a region; `DS_TRACE_NOTE_FROM`).
         static AT: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
         let (at, at_end) = *AT.get_or_init(|| {
             let v = std::env::var("DS_TRACE_NOTE").unwrap_or_default();
@@ -9580,10 +9596,13 @@ impl Exec {
             }
         });
         if at != 0 && a < at_end && at < a.saturating_add(n) {
+            // `DS_TRACE_NOTE_FROM=<flip>`: from that flip on.
+            static FROM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let from = *FROM.get_or_init(|| std::env::var("DS_TRACE_NOTE_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
             static N: AtomicU64 = AtomicU64::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 400 {
+            if super::FRAMES.load(Ordering::Relaxed) >= from && N.fetch_add(1, Ordering::Relaxed) < 400 {
                 let l = std::panic::Location::caller();
-                crate::info!("gpu[{}]: note_write {a:#x}+{n:#x} overlaps {at:#x}..{at_end:#x} at {}:{} (last shader {:#x}, {} commands in the batch, flip {})", self.name, l.file(), l.line(), self.batch_shaders.last().copied().unwrap_or(0), self.batch_shaders.len(), super::FRAMES.load(Ordering::Relaxed));
+                crate::info!("gpu[{}]: note_write {a:#x}+{n:#x} overlaps {at:#x}..{at_end:#x} at {}:{} (writer {:#x}, last shader {:#x}, {} commands in the batch, flip {})", self.name, l.file(), l.line(), self.noting, self.batch_shaders.last().copied().unwrap_or(0), self.batch_shaders.len(), super::FRAMES.load(Ordering::Relaxed));
             }
         }
         super::precache::invalidate_gpu(a, n);
@@ -10671,6 +10690,12 @@ impl Exec {
         self.held = true;
         self.past = true;
         self.held_reset();
+        // Its forwarded copies stay its own until the stretch commits (the
+        // run's workers record earlier commands meanwhile: `tune
+        // forward_held`).
+        if super::tune::forward_held() && self.name == "gpu-gfx" {
+            super::forward::hold_begin();
+        }
     }
 
     /// The graphics command processor goes on past a label wait
@@ -10678,6 +10703,9 @@ impl Exec {
     /// as its held batches fill them.
     pub fn past_begin_growing(&mut self) {
         self.past_begin();
+        // Past a label wait it records in program order, with no workers:
+        // its copies forward globally as before.
+        super::forward::hold_drop();
         self.past_grow = true;
     }
 
@@ -10686,6 +10714,9 @@ impl Exec {
     /// writes; its image notes go to the image cache; the open batch goes
     /// on as an ordinary one.
     pub fn past_commit(&mut self) {
+        // Its forwarded copies become everyone's before its batches are
+        // submitted (`forward::submitted` dates them).
+        super::forward::hold_commit();
         self.deferred = false;
         self.held = false;
         self.past = false;
@@ -10714,6 +10745,7 @@ impl Exec {
     /// closed batches and its open one (begun past the run: the batch
     /// before it was submitted) never go to the GPU.
     pub fn past_drop(&mut self) {
+        super::forward::hold_drop();
         super::forward::drop_entries(&std::mem::take(&mut self.forward_ids));
         self.discard_closed();
         if self.recording {
@@ -11897,7 +11929,7 @@ impl Exec {
         // it stays a dispatch (None: not tried, Some(None): refused).
         // (Held past a label wait the graphics command processor records in
         // program order still: its copies forward as before.)
-        let forward_here = super::tune::forward_copies() && (!self.deferred || self.past_grow) && indirect.is_none() && self.name == "gpu-gfx" && !super::resident::mirror_mode();
+        let forward_here = super::tune::forward_copies() && (!self.deferred || self.past_grow || (self.past && super::forward::held())) && indirect.is_none() && self.name == "gpu-gfx" && !super::resident::mirror_mode();
         // The graphics queue's parallel workers (`copy_update 2`): updates
         // checked once their batches completed, never forwarded.
         let worker_here = super::tune::forward_copies() && self.deferred && !self.held && indirect.is_none() && self.name.starts_with("gpu-gfx") && super::tune::copy_update_workers() && !super::resident::mirror_mode();
@@ -12574,9 +12606,11 @@ impl Exec {
             for &(b, n) in &writes_here {
                 super::track::gpu_write(b, n);
             }
+            self.noting = p.addr;
             for &(b, n) in &writes_here {
                 self.note_write(b, n);
             }
+            self.noting = 0;
             if fill.is_some() {
                 // Known values noted: the next write of the range is not a
                 // repeat of this one.

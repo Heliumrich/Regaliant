@@ -39,6 +39,13 @@ struct Entry {
     from: Inputs,
     /// The destination's words when the copy was recorded.
     old: Arc<[u32]>,
+    /// The words of earlier copies into the same destination that the
+    /// GPU may not have run yet when this one was recorded (at most
+    /// EARLIER_MAX): memory holds one of them until this copy runs, which
+    /// is not a sign of the title's rewrite (several copies into one block
+    /// are recorded before the GPU runs the first; such reads had dropped
+    /// the entry, and later readers waited for the GPU).
+    earlier: Arc<[Arc<[u32]>]>,
     /// Diagnostics: how the dispatch bound its destination, the recording
     /// queue, and the home write-backs so far when it was recorded.
     how: &'static str,
@@ -149,6 +156,76 @@ thread_local! {
     static LOCAL: RefCell<(u64, Vec<LocalEntry>, (u64, u64))> = const { RefCell::new((0, Vec::new(), (0, 0))) };
 }
 
+/// Diagnostics (traced waits): the forwarding state over [a, a+n) as this
+/// thread sees it.
+pub fn describe(a: u64, n: u64) -> String {
+    let here = HERE.with(|h| h.get());
+    let global: Vec<String> = ENTRIES.read().iter().filter(|e| e.base < a + n && a < e.base + 4 * e.words.len() as u64).map(|e| format!("{:#x}+{:#x} batch {}", e.base, 4 * e.words.len(), e.seq)).collect();
+    let local = if active() { with_local_span(|v, _| v.iter().filter(|e| e.0 < a + n && a < e.0 + e.1).count()) } else { 0 };
+    format!("forwarding here {here}, entries {} (global: {}), this thread's copy {local}", COUNT.load(Ordering::Acquire), if global.is_empty() { "none".to_string() } else { global.join(", ") })
+}
+
+/// The graphics command processor's own view while it records past a
+/// parallel run (`Exec::past_begin`, `tune forward_held`): the run's workers
+/// record earlier commands at the same time, so the copies it forwards meanwhile
+/// stay its own (`entries`), and the global entries its writes end are only
+/// hidden from it (`hidden`, by id); the stretch's commit publishes both
+/// (`hold_commit`), its drop forgets them (`hold_drop`).
+#[derive(Default)]
+struct Held {
+    entries: Vec<Entry>,
+    hidden: Vec<u64>,
+    /// Bumped at each change (this thread's view is cached by it and GEN).
+    version: u64,
+}
+
+thread_local! {
+    static HELD: RefCell<Option<Held>> = const { RefCell::new(None) };
+}
+
+/// Whether this thread records with a held view (`hold_begin`).
+pub fn held() -> bool {
+    HELD.with(|h| h.borrow().is_some())
+}
+
+/// A held stretch begins on this thread (the graphics CP past a run).
+pub fn hold_begin() {
+    HELD.with(|h| *h.borrow_mut() = Some(Held::default()));
+}
+
+/// The held stretch is committed: its entries become global (submitted with
+/// its batches next, `submitted`) and the global entries its writes ended go.
+pub fn hold_commit() {
+    let Some(held) = HELD.with(|h| h.borrow_mut().take()) else { return };
+    if held.entries.is_empty() && held.hidden.is_empty() {
+        return;
+    }
+    let mut g = ENTRIES.write();
+    g.retain(|e| !held.hidden.contains(&e.id));
+    for e in held.entries {
+        let end = e.base + 4 * e.words.len() as u64;
+        g.retain(|x| !(x.base < end && e.base < x.base + 4 * x.words.len() as u64));
+        if g.len() >= MAX_ENTRIES {
+            g.remove(0);
+        }
+        g.push(e);
+        HELD_STATS[1].fetch_add(1, Ordering::Relaxed);
+    }
+    COUNT.store(g.len(), Ordering::Release);
+    GEN.fetch_add(1, Ordering::AcqRel);
+}
+
+/// The held stretch is dropped (recorded again from where it began): what it
+/// forwarded is forgotten, the global entries are as they were.
+pub fn hold_drop() {
+    if let Some(held) = HELD.with(|h| h.borrow_mut().take()) {
+        HELD_STATS[2].fetch_add(held.entries.len() as u64, Ordering::Relaxed);
+    }
+}
+
+/// [copies forwarded in held stretches, published at their commit, dropped].
+pub static HELD_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// The calling thread records for the graphics queue (its command processor
 /// or one of its parallel workers): its reads may take forwarded words.
 pub fn enable_here() {
@@ -158,21 +235,47 @@ pub fn enable_here() {
 /// Whether reads on this thread may take forwarded words now (cheap).
 #[inline]
 pub fn active() -> bool {
-    COUNT.load(Ordering::Acquire) != 0 && HERE.with(|h| h.get())
+    (COUNT.load(Ordering::Acquire) != 0 || HELD.with(|h| h.borrow().as_ref().is_some_and(|x| !x.entries.is_empty()))) && HERE.with(|h| h.get())
 }
 
-type LocalEntry = (u64, u64, Arc<[u32]>, Arc<[u32]>);
+type LocalEntry = (u64, u64, Arc<[u32]>, Arc<[u32]>, Arc<[Arc<[u32]>]>);
+
+/// Earlier copies' words an entry keeps (`Entry::earlier`).
+const EARLIER_MAX: usize = 8;
+
+/// Entries a write ended (`written`): destination, words, and their words
+/// with their own earlier ones, for the next copy into that destination
+/// (`add`).
+static RECENT: Mutex<Vec<(u64, usize, Arc<[Arc<[u32]>]>)>> = Mutex::new(Vec::new());
+const RECENT_MAX: usize = 16;
+
+/// Whether guest memory's word `mem` at word `k` of an entry is one it can
+/// hold before the entry's copy runs: the old word or an earlier copy's.
+#[inline]
+fn before_copy(old: &[u32], earlier: &[Arc<[u32]>], k: usize, mem: u32) -> bool {
+    old.get(k) == Some(&mem) || earlier.iter().any(|e| e.get(k) == Some(&mem))
+}
 
 /// This thread's copy of the entries with the span they lie in (a read
 /// outside it overlaps none: the entries are destinations within the
 /// per-view block).
 fn with_local_span<R>(f: impl FnOnce(&[LocalEntry], (u64, u64)) -> R) -> R {
-    let generation = GEN.load(Ordering::Acquire);
+    // A held view's own generation is mixed in (its entries and hidden ones).
+    let held_gen = HELD.with(|h| h.borrow().as_ref().map_or(0, |x| x.version.wrapping_add(1) << 40));
+    let generation = GEN.load(Ordering::Acquire) ^ held_gen;
     LOCAL.with(|l| {
         let mut l = l.borrow_mut();
         if l.0 != generation {
             let g = ENTRIES.read();
-            l.1 = g.iter().map(|e| (e.base, 4 * e.words.len() as u64, e.words.clone(), e.old.clone())).collect();
+            l.1 = HELD.with(|h| match h.borrow().as_ref() {
+                None => g.iter().map(|e| (e.base, 4 * e.words.len() as u64, e.words.clone(), e.old.clone(), e.earlier.clone())).collect(),
+                Some(x) => x
+                    .entries
+                    .iter()
+                    .chain(g.iter().filter(|e| !x.hidden.contains(&e.id) && !x.entries.iter().any(|p| p.base < e.base + 4 * e.words.len() as u64 && e.base < p.base + 4 * p.words.len() as u64)))
+                    .map(|e| (e.base, 4 * e.words.len() as u64, e.words.clone(), e.old.clone(), e.earlier.clone()))
+                    .collect(),
+            });
             l.2 = l.1.iter().fold((u64::MAX, 0), |(lo, hi), e| (lo.min(e.0), hi.max(e.0 + e.1)));
             l.0 = generation;
         }
@@ -183,8 +286,27 @@ fn with_local_span<R>(f: impl FnOnce(&[LocalEntry], (u64, u64)) -> R) -> R {
 /// The entry at `base` is stale: a reader found a destination word that is
 /// neither the old nor the copied one (the title's CPU rewrote it).
 fn drop_stale(base: u64) {
+    let in_held = HELD.with(|h| {
+        let mut h = h.borrow_mut();
+        let Some(x) = h.as_mut() else { return false };
+        let before = x.entries.len();
+        x.entries.retain(|e| e.base != base);
+        if x.entries.len() != before {
+            x.version += 1;
+            true
+        } else {
+            false
+        }
+    });
+    if in_held {
+        STATS[8].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     let mut g = ENTRIES.write();
     let before = g.len();
+    if trace_on(base, 4) {
+        trace_life(format_args!("entry at {base:#x} dropped as stale (a word neither old nor copied)"));
+    }
     g.retain(|e| e.base != base);
     if g.len() != before {
         STATS[8].fetch_add(1, Ordering::Relaxed);
@@ -207,11 +329,11 @@ pub fn word_or(addr: u64, mem: u32) -> u32 {
         }
         v.iter().find(|e| e.0 <= addr && addr < e.0 + e.1).map(|e| {
             let k = ((addr - e.0) / 4) as usize;
-            (e.0, e.2[k], e.3.get(k).copied())
+            (e.0, e.2[k], before_copy(&e.3, &e.4, k, mem))
         })
     });
     match hit {
-        Some((_, w, old)) if mem == w || Some(mem) == old => {
+        Some((_, w, known)) if mem == w || known => {
             STATS[3].fetch_add(1, Ordering::Relaxed);
             w
         }
@@ -237,14 +359,14 @@ pub fn overlay(addr: u64, out: &mut [u32]) {
             return 0;
         }
         let mut n = 0u64;
-        for (base, bytes, words, old) in v {
+        for (base, bytes, words, old, earlier) in v {
             let (lo, hi) = (addr.max(*base), end.min(base + bytes));
             if lo >= hi {
                 continue;
             }
             let ok = (lo..hi).step_by(4).all(|a| {
                 let (i, k) = (((a - addr) / 4) as usize, ((a - base) / 4) as usize);
-                out[i] == words[k] || old.get(k) == Some(&out[i])
+                out[i] == words[k] || before_copy(old, earlier, k, out[i])
             });
             if !ok {
                 stale.push(*base);
@@ -281,7 +403,7 @@ pub fn uncovered(reads: &[(u64, u64)]) -> Option<Vec<(u64, u64)>> {
         for &(a, n) in reads {
             // Pieces of [a, a + n) outside every entry.
             let mut pieces = vec![(a, a + n)];
-            for (base, bytes, _, _) in v {
+            for (base, bytes, ..) in v {
                 let (lo, hi) = (*base, base + bytes);
                 let mut next = Vec::with_capacity(pieces.len() + 1);
                 for (s, e) in pieces {
@@ -310,6 +432,7 @@ pub fn uncovered(reads: &[(u64, u64)]) -> Option<Vec<(u64, u64)>> {
 
 /// GPU work or a CP write recorded later in the stream writes [a, a + n):
 /// entries it overlaps end.
+#[track_caller]
 pub fn written(a: u64, n: u64) {
     if n != 0 && CHECK_COUNT.load(Ordering::Acquire) != 0 && (n > 1024 << 16 || check_pages(a, n).any(|slot| slot.load(Ordering::Acquire) != 0)) {
         let mut g = CHECKS.lock();
@@ -324,17 +447,99 @@ pub fn written(a: u64, n: u64) {
         CHECK_STATS[5].fetch_add((before - g.len()) as u64, Ordering::Relaxed);
         CHECK_COUNT.store(g.len(), Ordering::Release);
     }
-    if COUNT.load(Ordering::Acquire) == 0 || n == 0 {
+    if n == 0 {
+        return;
+    }
+    // A held view: its own entries end; global ones are hidden from it.
+    let handled = HELD.with(|h| {
+        let mut h = h.borrow_mut();
+        let Some(x) = h.as_mut() else { return false };
+        let hit = |b: u64, len: usize| b < a + n && a < b + 4 * len as u64;
+        let before = x.entries.len();
+        x.entries.retain(|e| !hit(e.base, e.words.len()));
+        let mut changed = x.entries.len() != before;
+        if COUNT.load(Ordering::Acquire) != 0 {
+            for e in ENTRIES.read().iter().filter(|e| hit(e.base, e.words.len())) {
+                if !x.hidden.contains(&e.id) {
+                    x.hidden.push(e.id);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            x.version += 1;
+            STATS[1].fetch_add(1, Ordering::Relaxed);
+        }
+        true
+    });
+    if handled || COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
     let mut g = ENTRIES.write();
     let before = g.len();
+    if trace_on(a, n) {
+        for e in g.iter().filter(|e| e.base < a + n && a < e.base + 4 * e.words.len() as u64) {
+            trace_end(e.base, 4 * e.words.len() as u64, e.seq, a, n);
+        }
+    }
+    if super::tune::forward_earlier() {
+        // The next copy into the same destination takes them as words memory
+        // may hold before it runs (usually this write is that copy's own).
+        let mut r = RECENT.lock();
+        for e in g.iter().filter(|e| e.base < a + n && a < e.base + 4 * e.words.len() as u64) {
+            r.retain(|x| x.0 != e.base);
+            let mut v: Vec<Arc<[u32]>> = e.earlier.iter().cloned().collect();
+            v.push(e.words.clone());
+            if v.len() > EARLIER_MAX {
+                v.drain(..v.len() - EARLIER_MAX);
+            }
+            r.push((e.base, e.words.len(), v.into()));
+            if r.len() > RECENT_MAX {
+                r.remove(0);
+            }
+        }
+    }
     g.retain(|e| !(e.base < a + n && a < e.base + 4 * e.words.len() as u64));
     let ended = before - g.len();
     if ended > 0 {
         STATS[1].fetch_add(ended as u64, Ordering::Relaxed);
         COUNT.store(g.len(), Ordering::Release);
         GEN.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// `DS_TRACE_FORWARD` (a destination range) from `DS_TRACE_NOTE_FROM` (a
+/// flip) on: whether a write over [a, a+n) is traced.
+fn trace_on(a: u64, n: u64) -> bool {
+    static AT: std::sync::OnceLock<(u64, u64, u64)> = std::sync::OnceLock::new();
+    let (lo, hi, from) = *AT.get_or_init(|| {
+        let v = std::env::var("DS_TRACE_FORWARD").unwrap_or_default();
+        let num = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+        let (lo, hi) = match v.split_once('-') {
+            Some((x, y)) => (num(x).unwrap_or(0), num(y).unwrap_or(0)),
+            None => num(&v).map_or((0, 0), |x| (x, x + 1)),
+        };
+        let from = std::env::var("DS_TRACE_NOTE_FROM").ok();
+        (lo, hi, if from.as_deref() == Some("sync") { u64::MAX } else { from.and_then(|v| v.parse().ok()).unwrap_or(0) })
+    });
+    // `DS_TRACE_NOTE_FROM=sync`: while `tune trace_sync` traces waits.
+    let now = if from == u64::MAX { super::tune::get_trace_sync() } else { super::FRAMES.load(Ordering::Relaxed) >= from };
+    lo != 0 && a < hi && lo < a.saturating_add(n) && now
+}
+
+/// An entry a later write ended (`trace_on`), with the caller of `written`
+/// (who wrote).
+#[track_caller]
+fn trace_end(base: u64, bytes: u64, seq: u64, a: u64, n: u64) {
+    let l = std::panic::Location::caller();
+    trace_life(format_args!("entry {base:#x}+{bytes:#x} (batch {seq}) ended by a write of {a:#x}+{n:#x} (at {}:{})", l.file(), l.line()));
+}
+
+/// The first 300 traced entry events (`trace_on`), with the thread and flip.
+fn trace_life(what: std::fmt::Arguments) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 300 {
+        crate::info!("forward: {what} (flip {})", super::FRAMES.load(Ordering::Relaxed));
     }
 }
 
@@ -439,6 +644,7 @@ pub fn compute(p: &Prepared, groups: [u32; 3], local: [u32; 3], busy: impl Fn(&[
     let src_bytes = (in_src - 1) * src.stride as u64 + 4;
     let inputs = [(cb.base, 8), (src.base, src_bytes)];
     if busy(&inputs) || super::homes::any_stale(&inputs) || super::keep::any_dirty(&inputs) || !super::cp::guest_readable(src.base, src_bytes) {
+        trace_refusal(dst.base, 4 * count, &inputs, &busy);
         return refuse();
     }
     let src_words: Vec<u32> = (0..in_src).map(|j| unsafe { std::ptr::read_volatile((src.base + j * src.stride as u64) as *const u32) }).collect();
@@ -451,6 +657,55 @@ pub fn compute(p: &Prepared, groups: [u32; 3], local: [u32; 3], busy: impl Fn(&[
     Some((dst.base, words, Inputs { src: src.base, stride: src.stride as u64, src_words, cb: cb.base, count: n, modulus: m }))
 }
 
+/// `DS_TRACE_FORWARD=<hex address>[-<hex end>]`: the first 60 copies into
+/// the range that could not be forwarded, with which input was still
+/// written (diagnosis: what a reader of the copy then waits for).
+fn trace_refusal(dst: u64, bytes: u64, inputs: &[(u64, u64); 2], busy: &impl Fn(&[(u64, u64)]) -> bool) {
+    static AT: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    let (lo, hi) = *AT.get_or_init(|| {
+        let v = std::env::var("DS_TRACE_FORWARD").unwrap_or_default();
+        let num = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+        match v.split_once('-') {
+            Some((a, b)) => (num(a).unwrap_or(0), num(b).unwrap_or(0)),
+            None => num(&v).map_or((0, 0), |x| (x, x + 1)),
+        }
+    });
+    if lo == 0 || dst >= hi || dst + bytes <= lo {
+        return;
+    }
+    // From `DS_TRACE_NOTE_FROM` (a flip) on, as the write-note trace.
+    static FROM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    if super::FRAMES.load(Ordering::Relaxed) < *FROM.get_or_init(|| std::env::var("DS_TRACE_NOTE_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 60 {
+        return;
+    }
+    let what = |r: (u64, u64)| {
+        let mut v = Vec::new();
+        if busy(&[r]) {
+            v.push("written by GPU work or a CP write not done");
+        }
+        if super::homes::any_stale(&[r]) {
+            v.push("a home's newer data");
+        }
+        if super::keep::any_dirty(&[r]) {
+            v.push("a kept window's newer data");
+        }
+        if v.is_empty() { "free".to_string() } else { v.join(", ") }
+    };
+    crate::info!(
+        "forward: copy into {dst:#x}+{bytes:#x} not forwarded: counts {:#x}+8 {}, source {:#x}+{:#x} {} (flip {})",
+        inputs[0].0,
+        what(inputs[0]),
+        inputs[1].0,
+        inputs[1].1,
+        what(inputs[1]),
+        super::FRAMES.load(Ordering::Relaxed)
+    );
+}
+
 /// Starts forwarding `words` at `base` (written by the dispatch of `program`
 /// just recorded, after its own writes were noted); returns the entry's id.
 pub fn add(base: u64, words: Vec<u32>, program: u64, hash: u64, from: Inputs, how: &'static str, queue: &str) -> u64 {
@@ -461,16 +716,90 @@ pub fn add(base: u64, words: Vec<u32>, program: u64, hash: u64, from: Inputs, ho
     } else {
         Arc::from(Vec::new())
     };
+    if held() {
+        return add_held(id, base, words, program, hash, from, how, queue, old);
+    }
     let mut g = ENTRIES.write();
     let end = base + 4 * words.len() as u64;
+    // An entry this copy replaces (same destination and length, not retired:
+    // the GPU may not have run its copy yet): its words and its own earlier
+    // ones remain what memory can hold before this copy runs.
+    let earlier: Arc<[Arc<[u32]>]> = match g.iter().find(|e| e.base == base && e.words.len() as u64 == n) {
+        Some(e) if super::tune::forward_earlier() => {
+            let mut v: Vec<Arc<[u32]>> = e.earlier.iter().cloned().collect();
+            v.push(e.words.clone());
+            if v.len() > EARLIER_MAX {
+                v.drain(..v.len() - EARLIER_MAX);
+            }
+            v.into()
+        }
+        // One this copy's own write ended a moment ago (`written`).
+        _ if super::tune::forward_earlier() => {
+            let mut r = RECENT.lock();
+            match r.iter().position(|x| x.0 == base && x.1 as u64 == n) {
+                Some(i) => r.remove(i).2,
+                None => Arc::from(Vec::new()),
+            }
+        }
+        _ => Arc::from(Vec::new()),
+    };
     g.retain(|e| !(e.base < end && base < e.base + 4 * e.words.len() as u64));
     if g.len() >= MAX_ENTRIES {
         g.remove(0);
     }
-    g.push(Entry { id, base, words: words.into(), seq: 0, program, hash, from, old, how, queue: queue.into(), write_backs: super::homes::WRITE_BACKS.load(Ordering::Relaxed) });
+    if trace_on(base, 4 * n) {
+        trace_life(format_args!("entry {id} {base:#x}+{:#x} made by {queue}", 4 * n));
+    }
+    g.push(Entry { id, base, words: words.into(), seq: 0, program, hash, from, old, earlier, how, queue: queue.into(), write_backs: super::homes::WRITE_BACKS.load(Ordering::Relaxed) });
     COUNT.store(g.len(), Ordering::Release);
     GEN.fetch_add(1, Ordering::AcqRel);
     STATS[0].fetch_add(1, Ordering::Relaxed);
+    id
+}
+
+/// `add` on a thread with a held view: the entry is its own; its earlier
+/// words come from the entry it replaces there, else from the global one
+/// over the destination (hidden from it or not), else from `RECENT`.
+#[allow(clippy::too_many_arguments)]
+fn add_held(id: u64, base: u64, words: Vec<u32>, program: u64, hash: u64, from: Inputs, how: &'static str, queue: &str, old: Arc<[u32]>) -> u64 {
+    let n = words.len() as u64;
+    let end = base + 4 * n;
+    let chain = |e: &Entry| -> Arc<[Arc<[u32]>]> {
+        let mut v: Vec<Arc<[u32]>> = e.earlier.iter().cloned().collect();
+        v.push(e.words.clone());
+        if v.len() > EARLIER_MAX {
+            v.drain(..v.len() - EARLIER_MAX);
+        }
+        v.into()
+    };
+    HELD.with(|h| {
+        let mut h = h.borrow_mut();
+        let x = h.as_mut().expect("held view");
+        let earlier: Arc<[Arc<[u32]>]> = if !super::tune::forward_earlier() {
+            Arc::from(Vec::new())
+        } else if let Some(e) = x.entries.iter().find(|e| e.base == base && e.words.len() as u64 == n) {
+            chain(e)
+        } else if let Some(e) = ENTRIES.read().iter().find(|e| e.base == base && e.words.len() as u64 == n) {
+            chain(e)
+        } else {
+            let mut r = RECENT.lock();
+            match r.iter().position(|y| y.0 == base && y.1 as u64 == n) {
+                Some(i) => r.remove(i).2,
+                None => Arc::from(Vec::new()),
+            }
+        };
+        x.entries.retain(|e| !(e.base < end && base < e.base + 4 * e.words.len() as u64));
+        if x.entries.len() >= MAX_ENTRIES {
+            x.entries.remove(0);
+        }
+        if trace_on(base, 4 * n) {
+            trace_life(format_args!("entry {id} {base:#x}+{:#x} made by {queue} (held)", 4 * n));
+        }
+        x.entries.push(Entry { id, base, words: words.into(), seq: 0, program, hash, from, old, earlier, how, queue: queue.into(), write_backs: super::homes::WRITE_BACKS.load(Ordering::Relaxed) });
+        x.version += 1;
+    });
+    STATS[0].fetch_add(1, Ordering::Relaxed);
+    HELD_STATS[0].fetch_add(1, Ordering::Relaxed);
     id
 }
 
@@ -502,6 +831,9 @@ pub fn drop_entries(ids: &[u64]) {
     }
     let mut g = ENTRIES.write();
     let before = g.len();
+    for e in g.iter().filter(|e| ids.contains(&e.id) && trace_on(e.base, 4 * e.words.len() as u64)) {
+        trace_life(format_args!("entry {} {:#x} dropped (its batch was not submitted)", e.id, e.base));
+    }
     g.retain(|e| !ids.contains(&e.id));
     if g.len() != before {
         COUNT.store(g.len(), Ordering::Release);
@@ -542,6 +874,9 @@ pub fn submitted(ids: &[u64], seq: u64) {
     for e in g.iter_mut() {
         if ids.contains(&e.id) {
             e.seq = seq;
+            if trace_on(e.base, 4 * e.words.len() as u64) {
+                trace_life(format_args!("entry {} {:#x} submitted in batch {seq}", e.id, e.base));
+            }
         }
     }
 }
@@ -561,6 +896,9 @@ pub fn completed(done: u64) {
             return;
         }
         let (due, keep): (Vec<Entry>, Vec<Entry>) = std::mem::take(&mut *g).into_iter().partition(|e| e.seq != 0 && e.seq <= done);
+        for e in due.iter().filter(|e| trace_on(e.base, 4 * e.words.len() as u64)) {
+            trace_life(format_args!("entry {} {:#x} retired (batch {} done, {done} completed)", e.id, e.base, e.seq));
+        }
         *g = keep;
         COUNT.store(g.len(), Ordering::Release);
         GEN.fetch_add(1, Ordering::AcqRel);
@@ -691,7 +1029,10 @@ pub fn status_line() -> String {
     let u: Vec<u64> = UPDATES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let k: Vec<u64> = CHECK_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    forwarded copies: {} made ({} not: inputs still written or odd shapes), {} ended by later writes, {} by the title's rewrites, {} retired after their batch ({} into a video-memory home, not compared); {} words served, {} stage reads with no wait for the copy; after the copies ran {} words equal, {} as before the copy (it did not land), {} rewritten since; recorded as buffer updates {} ({} words; {} as dispatches); by the workers {} ({} words; after their batches {} words equal, {} as before, {} rewritten; {} checks ended by later writes)\n",
-        s[0], s[7], s[1], s[8], s[2], s[10], s[3], s[4], s[5], s[6], s[9], u[0], u[1], u[2], k[0], k[1], k[2], k[3], k[4], k[5]
+        "    forwarded copies: {} made ({} not: inputs still written or odd shapes), {} ended by later writes, {} by the title's rewrites, {} retired after their batch ({} into a video-memory home, not compared); {} words served, {} stage reads with no wait for the copy; after the copies ran {} words equal, {} as before the copy (it did not land), {} rewritten since; recorded as buffer updates {} ({} words; {} as dispatches); by the workers {} ({} words; after their batches {} words equal, {} as before, {} rewritten; {} checks ended by later writes); past parallel runs {} (published {}, dropped {})\n",
+        s[0], s[7], s[1], s[8], s[2], s[10], s[3], s[4], s[5], s[6], s[9], u[0], u[1], u[2], k[0], k[1], k[2], k[3], k[4], k[5],
+        HELD_STATS[0].load(Ordering::Relaxed),
+        HELD_STATS[1].load(Ordering::Relaxed),
+        HELD_STATS[2].load(Ordering::Relaxed)
     )
 }

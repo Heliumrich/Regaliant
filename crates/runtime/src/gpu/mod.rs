@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 184] = [
+    static ALL: [Tunable; 186] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -217,6 +217,8 @@ pub mod tune {
         Tunable { name: "gpu_chains", env: "DS_GPU_CHAINS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "gpu_mirror", env: "DS_GPU_MIRROR", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_waits", env: "DS_PAST_WAITS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "forward_earlier", env: "DS_FORWARD_EARLIER", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "forward_held", env: "DS_FORWARD_HELD", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -555,10 +557,18 @@ pub mod tune {
     }
 
     /// Stages whose preparation read what submitted GPU work still writes
-    /// are used as prepared and checked afterwards (`exec::speculate`).
+    /// are used as prepared and checked afterwards (`exec::speculate`): 1
+    /// data-only loads copied into their SGPR data by the batch prologue and
+    /// descriptor words used as read; 2 only the data-only loads (stages
+    /// whose GPU-written words include a descriptor's wait as before).
     #[inline]
     pub fn spec_reads() -> bool {
         get(36) != 0
+    }
+
+    #[inline]
+    pub fn spec_reads_mode() -> u64 {
+        get(36)
     }
 
     /// Batches are submitted to Vulkan by a thread of their own
@@ -1994,6 +2004,25 @@ pub mod tune {
     #[inline]
     pub fn past_waits() -> u64 {
         get(183)
+    }
+
+    /// A forwarded copy's entry also accepts, as words memory holds before
+    /// it runs, those of the earlier copies into the same destination it
+    /// replaced (`forward::Entry::earlier`); 0: only the destination's words
+    /// when it was recorded (a reader that met an earlier copy's word ended
+    /// the entry as the title's rewrite).
+    #[inline]
+    pub fn forward_earlier() -> bool {
+        get(184) != 0
+    }
+
+    /// The graphics CP forwards the per-view copies it records past a
+    /// parallel run too, into a view of its own until the stretch commits
+    /// (`forward::hold_begin`); 0: not forwarded there (readers after them
+    /// waited for the GPU).
+    #[inline]
+    pub fn forward_held() -> bool {
+        get(185) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
