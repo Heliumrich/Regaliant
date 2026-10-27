@@ -921,6 +921,10 @@ fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
         }
     }
     let _arm = crate::gpu::resident::remap_guard();
+    // Pages armed through the host read-write first: whether committing
+    // already committed pages resets their protection is not ours to rely
+    // on, and `settled` only clears their bits.
+    crate::hosted::disarm(addr, size);
     let p = unsafe { VirtualAlloc(addr as _, size as usize, MEM_COMMIT, win_prot(prot)) };
     crate::gpu::resident::settled(addr, size);
     note_host_call(0, t0);
@@ -995,9 +999,14 @@ pub fn retry_deferred() {
             continue;
         }
         let _readers_out = GUEST_READERS.write();
+        let _arm = crate::gpu::resident::remap_guard();
         unsafe {
             VirtualFree(a as _, (e - a) as usize, MEM_DECOMMIT);
         }
+        // Their page states go with them, armed bits too: decommitted pages
+        // still marked armed made a disarm over them and their armed
+        // neighbours fail (FINDINGS.md 2026-10-27 night).
+        crate::gpu::resident::settled(a, e - a);
         DEFERRED_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     *d = keep;

@@ -19,14 +19,19 @@
 //!   and mapping changes (`invalidate`).
 //! - Hosted (`--host`): pages quiet for ARM_QUIET flips (doubled each time an
 //!   arming ended in a write, up to ARM_MAX_LEVEL) and found clean by takes
-//!   in ARM_USES epochs since, not written by GPU work, inside import
-//!   windows at least SETTLE flips old (protecting a new import's pages lost
-//!   the device: FINDINGS.md 2026-10-26) are armed read-only through the
-//!   host; while the host's bit stays set (no write fault, disarm or mapping
-//!   change since) such a page needs no take. Each fault stops the whole
-//!   process for 15-50 us: when the host answers more than FAULT_BURST a
-//!   second (a load rewriting memory armed before it), every page armed is
-//!   disarmed and nothing is armed for ARM_HOLD flips.
+//!   in ARM_USES epochs since, inside import windows at least SETTLE flips
+//!   old (protecting a new import's pages lost the device: FINDINGS.md
+//!   2026-10-26) are armed read-only through the host; while the host's bit
+//!   stays set (no write fault, disarm or mapping change since) such a page
+//!   needs no take. GPU writes do not fault and need none: M holds them
+//!   (`DS_FE2_ARM_GPU=0`: pages GPU work writes are never armed). Each fault
+//!   stops the whole process for 15-50 us: a thread reads the faults the
+//!   host answered (`watch`), and a 64 MiB chunk with CHUNK_BURST of them
+//!   within BURST_MS (or with some while all chunks together had ALL_BURST:
+//!   a load rewriting memory armed before it) has its armed pages disarmed
+//!   and its arming held CHUNK_HOLD flips (doubled for each burst within
+//!   HOLD_MEMORY flips of its last hold, up to CHUNK_HOLD_MAX_LEVEL); the
+//!   other chunks keep theirs.
 //! - A take only spares uploads of pages that did not change: small runs of
 //!   pages found written within HOT_FLIPS flips (the title's rings of
 //!   per-draw data, rewritten every frame) are uploaded without one.
@@ -61,9 +66,16 @@ const ARM_QUIET: u64 = 30;
 const ARM_MAX_LEVEL: u8 = 6;
 /// Epochs a page must have been found clean in since its last write.
 const ARM_USES: u8 = 8;
-/// Faults a second that end all arming, and the flips it then waits.
-const FAULT_BURST: u64 = 250;
-const ARM_HOLD: u64 = 120;
+/// Faults on armed pages within BURST_MS that disarm a chunk (its own, or
+/// all chunks' together while it had some), the flips its arming then
+/// waits, and how a burst within HOLD_MEMORY flips of the chunk's last hold
+/// doubles that (up to CHUNK_HOLD_MAX_LEVEL times).
+const CHUNK_BURST: u32 = 16;
+const ALL_BURST: u32 = 64;
+const BURST_MS: u128 = 100;
+const CHUNK_HOLD: u64 = 60;
+const CHUNK_HOLD_MAX_LEVEL: u8 = 5;
+const HOLD_MEMORY: u64 = 600;
 /// Flips an import window exists before pages in it are armed.
 pub const SETTLE: u64 = 60;
 /// Runs of at most HOT_PAGES pages found written within HOT_FLIPS flips are
@@ -84,7 +96,7 @@ struct Chunk {
     valid: [AtomicU64; WORDS],
     /// Armed by us through the host (the host's bit says whether still).
     armed: [AtomicU64; WORDS],
-    /// Written by GPU work (never armed: the write-back stores into it).
+    /// Written by GPU work (never armed with `DS_FE2_ARM_GPU=0`).
     gpu: [AtomicU64; WORDS],
     /// The epoch every valid page of the word was found clean in (a take
     /// over the whole word), else 0.
@@ -109,6 +121,10 @@ struct Chunk {
     /// host's events of its leaf (`hosted::leaf_events`); 0: none.
     sum: AtomicU64,
     sum_host: AtomicU64,
+    /// No page of the chunk is armed before this flip (after a burst of
+    /// faults: `burst`), and the doublings of its last hold.
+    hold_until: AtomicU64,
+    hold_level: AtomicU8,
 }
 
 /// `Chunk::sum`'s epoch part when every page of the chunk is armed.
@@ -171,6 +187,19 @@ pub fn defer_checks() -> bool {
     *W.get_or_init(|| std::env::var("DS_FE2_DEFER").ok().as_deref() == Some("1"))
 }
 
+/// Pages GPU work writes are armed like others (`DS_FE2_ARM_GPU=0`: never):
+/// GPU writes reach guest memory by the write-back, which does not fault,
+/// and M holds them already.
+fn arm_gpu() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_FE2_ARM_GPU").ok().as_deref() != Some("0"))
+}
+
+/// Where pages may be armed (the executor's import list): calls its third
+/// argument with the parts of [a, b) inside settled import windows, the
+/// list held meanwhile; false: the list was busy.
+pub type Armable = dyn Fn(u64, u64, &mut dyn FnMut(u64, u64)) -> bool;
+
 /// Front end 2 runs (wanted, and its self-test passed).
 #[inline]
 pub fn on() -> bool {
@@ -218,6 +247,8 @@ fn make_chunk(slot: &'static AtomicPtr<Chunk>) -> &'static Chunk {
         cgen: AtomicU32::new(0),
         sum: AtomicU64::new(0),
         sum_host: AtomicU64::new(0),
+        hold_until: AtomicU64::new(0),
+        hold_level: AtomicU8::new(0),
     }));
     match slot.compare_exchange(std::ptr::null_mut(), new, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => unsafe { &*new },
@@ -387,7 +418,7 @@ thread_local! {
 /// With `defer`, runs that need a take are appended there instead (the
 /// caller counts their pages as its batch's own until `resolve` at its
 /// close).
-pub fn ensure(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &dyn Fn(u64, u64) -> bool, mut defer: Option<&mut Vec<(u64, u64)>>) -> Result<(), &'static str> {
+pub fn ensure(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, mut defer: Option<&mut Vec<(u64, u64)>>) -> Result<(), &'static str> {
     STATS[S_ENSURES].fetch_add(1, Ordering::Relaxed);
     STATS[S_ENSURE_PAGES].fetch_add((hi - lo) / PAGE, Ordering::Relaxed);
     let class = &BY_SIZE[size_class((hi - lo) / PAGE)];
@@ -543,14 +574,14 @@ pub fn ensure(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) ->
 /// Arms (`arm`: hosted, where allowed) and takes [a, b), uploads its pages
 /// M lacks (not `mine`), and marks its valid pages clean in epoch `ep`.
 #[allow(clippy::too_many_arguments)]
-fn check_run(a: u64, b: u64, ep: u32, frame: u64, arm: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &dyn Fn(u64, u64) -> bool, written: &mut Vec<u64>, class: &[AtomicU64; 4]) -> Result<(), &'static str> {
+fn check_run(a: u64, b: u64, ep: u32, frame: u64, arm: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, written: &mut Vec<u64>, class: &[AtomicU64; 4]) -> Result<(), &'static str> {
     take_run(a, b, frame, arm, armable, written, class);
     fix_run(a, b, ep, mine, upload)
 }
 
 /// Arms (`arm`: hosted, where allowed) and takes [a, b): pages written since
 /// their last take lose their valid bit.
-fn take_run(a: u64, b: u64, frame: u64, arm: bool, armable: &dyn Fn(u64, u64) -> bool, written: &mut Vec<u64>, class: &[AtomicU64; 4]) {
+fn take_run(a: u64, b: u64, frame: u64, arm: bool, armable: &Armable, written: &mut Vec<u64>, class: &[AtomicU64; 4]) {
     if arm && crate::hosted::on() {
         try_arm(a, b, frame, armable);
     }
@@ -612,7 +643,7 @@ fn fix_run(a: u64, b: u64, ep: u32, mine: &dyn Fn(u64) -> bool, upload: &mut dyn
 /// where allowed, taken, its pages M lacks and not `mine` (uploaded by the
 /// batch already) uploaded into its prologue (`upload`), its valid pages
 /// marked clean in the epoch now. `runs` is left empty.
-pub fn resolve(runs: &mut Vec<(u64, u64)>, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &dyn Fn(u64, u64) -> bool) -> Result<(), &'static str> {
+pub fn resolve(runs: &mut Vec<(u64, u64)>, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable) -> Result<(), &'static str> {
     if runs.is_empty() {
         return Ok(());
     }
@@ -764,8 +795,13 @@ pub fn host_write_begin(base: u64, len: u64) {
     if !on() || len == 0 {
         return;
     }
-    HOST_WRITES.lock().push((base, base.saturating_add(len)));
-    HOST_WRITES_N.fetch_add(1, Ordering::AcqRel);
+    {
+        // (An arming that checked before this is done by now, and the
+        // caller's disarm after this undoes it: `arm_part`.)
+        let _lock = crate::hosted::arm_lock();
+        HOST_WRITES.lock().push((base, base.saturating_add(len)));
+        HOST_WRITES_N.fetch_add(1, Ordering::AcqRel);
+    }
     invalidate(base, len);
 }
 
@@ -787,14 +823,11 @@ fn host_writing(a: u64, b: u64) -> bool {
     HOST_WRITES_N.load(Ordering::Acquire) != 0 && HOST_WRITES.lock().iter().any(|&(x, e)| x < b && a < e)
 }
 
-/// Arms the quiet pages of [a, b) not armed now and not written by GPU
-/// work, by runs inside settled import windows (`armable`), plain
-/// read-write memory only.
-fn try_arm(a: u64, b: u64, frame: u64, armable: &dyn Fn(u64, u64) -> bool) {
-    if arming_held(frame) {
-        NOT_ARMED[R_HELD].fetch_add((b - a) / PAGE, Ordering::Relaxed);
-        return;
-    }
+/// Arms the quiet pages of [a, b) not armed now (nor written by GPU work,
+/// with `DS_FE2_ARM_GPU=0`) outside held chunks, by runs inside settled
+/// import windows (`armable`), plain read-write memory only.
+fn try_arm(a: u64, b: u64, frame: u64, armable: &Armable) {
+    let arm_gpu = arm_gpu();
     // Why a page is not a candidate (None: it is one).
     let why_not = |p: u64| -> Option<usize> {
         let Some(c) = chunk(p, false) else { return Some(R_QUIET) };
@@ -803,7 +836,10 @@ fn try_arm(a: u64, b: u64, frame: u64, armable: &dyn Fn(u64, u64) -> bool) {
         if c.armed[w].load(Ordering::Acquire) & bit != 0 {
             return Some(R_ARMED);
         }
-        if c.gpu[w].load(Ordering::Acquire) & bit != 0 {
+        if frame < c.hold_until.load(Ordering::Acquire) {
+            return Some(R_HELD);
+        }
+        if !arm_gpu && c.gpu[w].load(Ordering::Acquire) & bit != 0 {
             return Some(R_GPU);
         }
         let wrote = c.wrote[i].load(Ordering::Acquire) as u64;
@@ -829,17 +865,18 @@ fn try_arm(a: u64, b: u64, frame: u64, armable: &dyn Fn(u64, u64) -> bool) {
         while y < b && cand(y) {
             y += PAGE;
         }
-        arm_run(x, y, armable);
+        arm_run(x, y, frame, armable);
         x = y;
     }
 }
 
 /// Pages checked by takes that were not armed, by reason: armed already
-/// (its host bit gone), written by GPU work, written within their quiet
-/// time, found clean in fewer than ARM_USES epochs, outside a settled
-/// import window, not plain read-write (or a file read in progress),
-/// arming held after a fault burst.
-static NOT_ARMED: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// (by us, its host bit set), written by GPU work (`DS_FE2_ARM_GPU=0`),
+/// written within their quiet time, found clean in fewer than ARM_USES
+/// epochs, outside settled import windows, not plain read-write (or a file
+/// read in progress), in a chunk held after a burst of faults, the import
+/// list busy.
+static NOT_ARMED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 const R_ARMED: usize = 0;
 const R_GPU: usize = 1;
 const R_QUIET: usize = 2;
@@ -847,93 +884,193 @@ const R_USES: usize = 3;
 const R_WINDOW: usize = 4;
 const R_RW: usize = 5;
 const R_HELD: usize = 6;
+const R_BUSY: usize = 7;
 
-/// The host's fault count when it was last sampled and when (at most every
-/// SAMPLE_MS), and the flip arming is held until.
-static FAULT_SAMPLE: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
-const SAMPLE_MS: u128 = 250;
-static HOLD_UNTIL: AtomicU64 = AtomicU64::new(0);
-static HOLDS: AtomicU64 = AtomicU64::new(0);
-/// The runs armed (some may have lost their pages' bits since).
-static ARMED_RUNS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
-static MASS_DISARMED: AtomicU64 = AtomicU64::new(0);
+/// The faults `watch` read: [on pages of the span, those that ended an
+/// arming of ours (its level raised there), bursts, pages they disarmed,
+/// faults outside the span, ring overflows seen].
+static FAULTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+const F_SPAN: usize = 0;
+const F_ENDED: usize = 1;
+const F_BURSTS: usize = 2;
+const F_DISARMED: usize = 3;
+const F_OUTSIDE: usize = 4;
+const F_LOST: usize = 5;
 
-/// Whether arming waits: faults came in a burst lately (then every page
-/// armed is disarmed: whatever rewrites memory now will rewrite more).
-fn arming_held(frame: u64) -> bool {
-    let burst = {
-        let Some(mut g) = FAULT_SAMPLE.try_lock() else { return frame < HOLD_UNTIL.load(Ordering::Acquire) };
-        let now = crate::hosted::faults();
-        match *g {
-            Some((t, _)) if t.elapsed().as_millis() < SAMPLE_MS => false,
-            Some((t, n)) => {
-                let rate = now.saturating_sub(n) as u128 * 1000 / t.elapsed().as_millis().max(1);
-                *g = Some((std::time::Instant::now(), now));
-                rate > FAULT_BURST as u128
+/// Reads the faults the host answered, every millisecond (a thread of its
+/// own, hosted runs only): each ends its page's arming (the next waits
+/// longer) and restarts its quiet time; a chunk with CHUNK_BURST of them
+/// within BURST_MS, or with some while all chunks together had ALL_BURST,
+/// is disarmed and held (`burst`).
+fn watch() {
+    let mut got: Vec<(u64, bool, u64)> = Vec::new();
+    let mut seen = crate::hosted::faults();
+    // This window's faults per chunk, whether the chunk burst in it, the
+    // chunks with any, and all of them.
+    let mut counts = vec![0u32; CHUNKS];
+    let mut fired = vec![false; CHUNKS];
+    let mut touched: Vec<usize> = Vec::new();
+    let mut total = 0u32;
+    let mut window = std::time::Instant::now();
+    let mut logged = 0u32;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        if window.elapsed().as_millis() >= BURST_MS {
+            for &k in &touched {
+                counts[k] = 0;
+                fired[k] = false;
             }
-            None => {
-                *g = Some((std::time::Instant::now(), now));
-                false
-            }
+            touched.clear();
+            total = 0;
+            window = std::time::Instant::now();
         }
-    };
-    if burst {
-        HOLD_UNTIL.store(frame + ARM_HOLD, Ordering::Release);
-        HOLDS.fetch_add(1, Ordering::Relaxed);
-        disarm_all();
-    }
-    frame < HOLD_UNTIL.load(Ordering::Acquire)
-}
-
-/// Disarms every page we armed that is still armed (its host bit set).
-fn disarm_all() {
-    let runs = std::mem::take(&mut *ARMED_RUNS.lock());
-    let _readers = crate::mem::GUEST_READERS.read_recursive();
-    let _arming = super::resident::arm_guard();
-    for (x, y) in runs {
-        let mut p = x;
-        while p < y {
-            let still = |q: u64| crate::hosted::armed_word(q & !(64 * PAGE - 1)) >> ((q >> 12) & 63) & 1 != 0;
-            if !still(p) {
-                p += PAGE;
+        let n = crate::hosted::faults();
+        if n == seen {
+            continue;
+        }
+        seen = n;
+        got.clear();
+        if !crate::hosted::drain_faults(&mut got) {
+            FAULTS[F_LOST].fetch_add(1, Ordering::Relaxed);
+        }
+        let frame = super::FRAMES.load(Ordering::Relaxed);
+        for &(page, _, rip) in &got {
+            let Some(c) = chunk(page, false) else {
+                FAULTS[F_OUTSIDE].fetch_add(1, Ordering::Relaxed);
                 continue;
-            }
-            let mut e = p + PAGE;
-            while e < y && still(e) {
-                e += PAGE;
-            }
-            crate::hosted::disarm(p, e - p);
-            MASS_DISARMED.fetch_add((e - p) / PAGE, Ordering::Relaxed);
-            p = e;
-        }
-        // Our bits go too (the summary of the chunks with them).
-        let mut q = x;
-        while q < y {
-            let e = word_end(q, y);
-            if let Some(c) = chunk(q, false) {
-                c.armed[idx(q) / 64].fetch_and(!word_mask(q, e), Ordering::AcqRel);
+            };
+            FAULTS[F_SPAN].fetch_add(1, Ordering::Relaxed);
+            let (i, w) = (idx(page), idx(page) / 64);
+            let bit = 1u64 << (i % 64);
+            // (A take's `note_arming_ended` may have seen it first.)
+            if c.armed[w].fetch_and(!bit, Ordering::AcqRel) & bit != 0 {
+                let _ = c.level[i].fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some((v + 1).min(ARM_MAX_LEVEL)));
                 c.cgen.fetch_add(1, Ordering::AcqRel);
                 GEN.fetch_add(1, Ordering::AcqRel);
+                FAULTS[F_ENDED].fetch_add(1, Ordering::Relaxed);
+                STATS[S_ARM_ENDED].fetch_add(1, Ordering::Relaxed);
             }
-            q = e;
+            c.wrote[i].store(frame as u32 + 1, Ordering::Release);
+            c.uses[i].store(0, Ordering::Relaxed);
+            let k = ((page - MIRROR_BASE) >> CHUNK_SHIFT) as usize;
+            if counts[k] == 0 {
+                touched.push(k);
+            }
+            counts[k] += 1;
+            total += 1;
+            if logged < 40 {
+                logged += 1;
+                crate::info!("fe2: write fault on armed page {page:#x} at {}", describe_code(rip));
+            }
+        }
+        for &k in &touched {
+            if !fired[k] && (counts[k] >= CHUNK_BURST || total >= ALL_BURST) {
+                fired[k] = true;
+                burst(k, counts[k], total, frame);
+            }
         }
     }
 }
 
-fn arm_run(x: u64, y: u64, armable: &dyn Fn(u64, u64) -> bool) {
-    if !armable(x, y) {
-        NOT_ARMED[R_WINDOW].fetch_add((y - x) / PAGE, Ordering::Relaxed);
-        return;
+/// Where code at `rip` is (the title's or a host module's).
+fn describe_code(rip: u64) -> String {
+    if (crate::mem::GUEST_BASE..crate::mem::GUEST_END).contains(&rip) {
+        crate::exception::describe_guest(rip)
+    } else {
+        crate::exception::host_symbol(rip)
     }
-    if host_writing(x, y) {
-        NOT_ARMED[R_RW].fetch_add((y - x) / PAGE, Ordering::Relaxed);
-        return;
+}
+
+/// Chunk `k` had `n` faults within BURST_MS (`total` in all chunks): its
+/// armed pages are disarmed and arming there waits CHUNK_HOLD flips (twice
+/// as long for each burst within HOLD_MEMORY flips of the last hold's end).
+fn burst(k: usize, n: u32, total: u32, frame: u64) {
+    let base = MIRROR_BASE + ((k as u64) << CHUNK_SHIFT);
+    let Some(c) = chunk(base, false) else { return };
+    let until = c.hold_until.load(Ordering::Acquire);
+    let level = if until != 0 && frame < until + HOLD_MEMORY { (c.hold_level.load(Ordering::Acquire) + 1).min(CHUNK_HOLD_MAX_LEVEL) } else { 0 };
+    c.hold_level.store(level, Ordering::Release);
+    let hold = CHUNK_HOLD << level;
+    c.hold_until.store(frame + hold, Ordering::Release);
+    let mut pages = 0u64;
+    {
+        // No mapping change meanwhile, no arming between our bits and the
+        // host's (ours go first: a take seeing the host's gone and ours set
+        // would count the arming as ended by a write).
+        let _readers = crate::mem::GUEST_READERS.read_recursive();
+        let _arming = super::resident::arm_guard();
+        let _lock = crate::hosted::arm_lock();
+        let mut pend: Option<(u64, u64)> = None;
+        for w in 0..WORDS {
+            let ours = c.armed[w].load(Ordering::Acquire);
+            if ours == 0 {
+                continue;
+            }
+            let wa = base + (w as u64) * 64 * PAGE;
+            let live = ours & crate::hosted::armed_word(wa);
+            if live == 0 {
+                continue;
+            }
+            c.armed[w].fetch_and(!live, Ordering::AcqRel);
+            let mut r = live;
+            while r != 0 {
+                let b = r.trailing_zeros() as u64;
+                let run = (!(r >> b)).trailing_zeros().min(64 - b as u32) as u64;
+                r &= !(if run >= 64 { u64::MAX } else { ((1u64 << run) - 1) << b });
+                let (x, y) = (wa + b * PAGE, wa + (b + run) * PAGE);
+                pages += run;
+                pend = match pend {
+                    Some((p, q)) if q == x => Some((p, y)),
+                    Some((p, q)) => {
+                        crate::hosted::disarm(p, q - p);
+                        Some((x, y))
+                    }
+                    None => Some((x, y)),
+                };
+            }
+        }
+        if let Some((p, q)) = pend {
+            crate::hosted::disarm(p, q - p);
+        }
+        c.cgen.fetch_add(1, Ordering::AcqRel);
+        GEN.fetch_add(1, Ordering::AcqRel);
     }
-    // No mapping change meanwhile (`resident::remap_guard`).
+    let b = FAULTS[F_BURSTS].fetch_add(1, Ordering::Relaxed);
+    FAULTS[F_DISARMED].fetch_add(pages, Ordering::Relaxed);
+    if b < 40 {
+        crate::info!("fe2: {n} faults within {BURST_MS} ms in {base:#x}+64M ({total} in all): {pages} armed pages there disarmed, arming there held {hold} flips");
+    }
+}
+
+/// Arms the parts of the candidate run [x, y) inside settled import windows.
+fn arm_run(x: u64, y: u64, frame: u64, armable: &Armable) {
+    let mut inside = 0u64;
+    let listed = armable(x, y, &mut |p, q| {
+        inside += q - p;
+        arm_part(p, q, frame);
+    });
+    if !listed {
+        NOT_ARMED[R_BUSY].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+    } else if inside < y - x {
+        NOT_ARMED[R_WINDOW].fetch_add((y - x - inside) / PAGE, Ordering::Relaxed);
+    }
+}
+
+/// Arms [x, y) (inside settled import windows, the import list held: an
+/// import over it waits, then disarms it).
+fn arm_part(x: u64, y: u64, frame: u64) {
+    // No mapping change meanwhile (`resident::remap_guard`), and no other
+    // arm or disarm between the checks and the arming (`hosted::arm_lock`:
+    // a file read beginning now waits, then disarms what is armed).
     let _readers = crate::mem::GUEST_READERS.read_recursive();
     let _arming = super::resident::arm_guard();
-    if !plain_rw(x, y - x) {
+    let _lock = crate::hosted::arm_lock();
+    if host_writing(x, y) || !plain_rw(x, y - x) {
         NOT_ARMED[R_RW].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+        return;
+    }
+    if held(x, y, frame) {
+        NOT_ARMED[R_HELD].fetch_add((y - x) / PAGE, Ordering::Relaxed);
         return;
     }
     STATS[S_ARM_RUNS].fetch_add(1, Ordering::Relaxed);
@@ -949,14 +1086,19 @@ fn arm_run(x: u64, y: u64, armable: &dyn Fn(u64, u64) -> bool) {
         }
         p = e;
     }
-    let mut runs = ARMED_RUNS.lock();
-    if runs.len() >= 1 << 18 {
-        // Runs whose first page lost its bit since: dropped.
-        runs.retain(|&(a, _)| crate::hosted::armed_word(a & !(64 * PAGE - 1)) >> ((a >> 12) & 63) & 1 != 0);
-    }
-    runs.push((x, y));
-    drop(runs);
     STATS[S_ARMED].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+}
+
+/// Whether a chunk of [x, y) holds its arming at `frame` (`burst`).
+fn held(x: u64, y: u64, frame: u64) -> bool {
+    let mut p = x & !(CHUNK_BYTES - 1);
+    while p < y {
+        if chunk(p, false).is_some_and(|c| frame < c.hold_until.load(Ordering::Acquire)) {
+            return true;
+        }
+        p += CHUNK_BYTES;
+    }
+    false
 }
 
 fn plain_rw(a: u64, n: u64) -> bool {
@@ -1178,8 +1320,13 @@ pub fn init() {
     // The old placement and coherence mechanisms are off under it, and so
     // are the recording schemes that exist to hide their costs.
     // (Parallel runs stay: their chunks run in program order, each with
-    // its own uploads and write-backs.)
-    const OFF: [&str; 13] = ["past_waits", "past_runs", "long_runs", "frame_ahead", "forward_copies", "copy_update", "homes", "keep_small", "draw_args_gpu", "gpu_loads", "gpu_chains", "shadow_args", "pre_share"];
+    // its own uploads and write-backs; so does recording past label waits
+    // and runs: held batches are deferred ones, their uploads valid once
+    // they are queued, and a dropped stretch's never happen. So do the
+    // per-view copies as buffer updates, forwarded to the CPU-side reads of
+    // their blocks: the updates write the mirror too.)
+    // (The host census and mirror mode would read the host's faults too.)
+    const OFF: [&str; 11] = ["long_runs", "frame_ahead", "homes", "keep_small", "draw_args_gpu", "gpu_loads", "gpu_chains", "shadow_args", "pre_share", "host_census", "gpu_mirror"];
     for name in OFF {
         if !super::tune::set(name, 0) {
             crate::warn!("fe2: no switch {name}");
@@ -1212,7 +1359,15 @@ pub fn init() {
     match self_test() {
         Ok(s) => {
             ON.store(true, Ordering::Release);
-            crate::info!("fe2: front end 2 on ({made}; {s}; hosted arming {}; switched off: {})", if crate::hosted::on() { "on" } else { "off (not under the host)" }, OFF.join(", "));
+            if crate::hosted::on() {
+                let _ = std::thread::Builder::new().name("fe2-faults".into()).spawn(watch);
+            }
+            crate::info!(
+                "fe2: front end 2 on ({made}; {s}; hosted arming {}{}; switched off: {})",
+                if crate::hosted::on() { "on" } else { "off (not under the host)" },
+                if arm_gpu() { "" } else { ", GPU-written pages never armed" },
+                OFF.join(", ")
+            );
         }
         Err(e) => crate::error!("fe2: the write-back's self-test failed: {e}; front end 2 off"),
     }
@@ -1318,7 +1473,7 @@ pub fn status() -> String {
         })
         .collect();
     format!(
-        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes, {} fault bursts ({} pages disarmed); invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity; CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
+        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes; faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed); invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity; CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
         s[S_ENSURES],
         s[S_ENSURE_PAGES],
         s[S_FAST],
@@ -1344,8 +1499,12 @@ pub fn status() -> String {
         s[S_ARM_RUNS],
         s[S_ARM_FAILED],
         s[S_ARM_ENDED],
-        HOLDS.load(Ordering::Relaxed),
-        MASS_DISARMED.load(Ordering::Relaxed),
+        FAULTS[F_SPAN].load(Ordering::Relaxed),
+        FAULTS[F_ENDED].load(Ordering::Relaxed),
+        FAULTS[F_OUTSIDE].load(Ordering::Relaxed),
+        FAULTS[F_LOST].load(Ordering::Relaxed),
+        FAULTS[F_BURSTS].load(Ordering::Relaxed),
+        FAULTS[F_DISARMED].load(Ordering::Relaxed),
         s[S_INVAL_CALLS],
         s[S_INVAL_TAKEN],
         s[S_SCATTERS],
@@ -1357,7 +1516,7 @@ pub fn status() -> String {
         s[S_MEMCPY],
         s[S_UNSCATTERABLE],
         sizes.join(", "),
-        ["armed (bit gone)", "GPU-written", "written lately", "too few clean epochs", "no settled window", "not plain read-write", "arming held"]
+        ["armed already", "GPU-written", "written lately", "too few clean epochs", "no settled window", "not plain read-write", "chunk held", "import list busy"]
             .iter()
             .zip(NOT_ARMED.iter())
             .map(|(n, c)| format!("{n} {}", c.load(Ordering::Relaxed)))

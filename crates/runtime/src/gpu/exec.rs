@@ -1023,23 +1023,48 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     r
 }
 
-/// Front end 2: whether the pages of guest [a, b) may be armed now: every
-/// import over them, live or dropped and not freed yet, is at least
-/// `fe2::SETTLE` flips old (protecting a new import's pages lost the device:
-/// FINDINGS.md 2026-10-26), and a live one covers them all.
-fn fe2_armable(a: u64, b: u64) -> bool {
+/// Front end 2 (`fe2::Armable`): calls `arm` with the parts of guest [a, b)
+/// that live imports cover and over which every import, live or dropped
+/// and not freed yet, is at least `fe2::SETTLE` flips old (protecting a new
+/// import's pages lost the device: FINDINGS.md 2026-10-26), with the import
+/// list held meanwhile (an import beginning now waits, then disarms what
+/// was armed); false: the lists were busy.
+fn fe2_armable(a: u64, b: u64, arm: &mut dyn FnMut(u64, u64)) -> bool {
     let now = super::FRAMES.load(Ordering::Relaxed);
     let settled = |born: u64| born + super::fe2::SETTLE <= now;
     let Some(g) = SPANS.try_read() else { return false };
-    if !g.iter().any(|s| s.valid && s.start <= a && b <= s.end) {
-        return false;
+    let mut young: Vec<(u64, u64)> = g.iter().filter(|s| s.start < b && a < s.end && !settled(s.born)).map(|s| (s.start, s.end)).collect();
+    {
+        let Some(gy) = GRAVEYARD.try_lock() else { return false };
+        young.extend(gy.iter().filter(|d| d.span.start < b && a < d.span.end && !settled(d.span.born)).map(|d| (d.span.start, d.span.end)));
     }
-    if g.iter().any(|s| s.start < b && a < s.end && !settled(s.born)) {
-        return false;
+    young.sort_unstable();
+    let mut live: Vec<(u64, u64)> = g.iter().filter(|s| s.valid && s.start < b && a < s.end).map(|s| (s.start.max(a), s.end.min(b))).collect();
+    live.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(live.len());
+    for (x, y) in live {
+        match merged.last_mut() {
+            Some(l) if x <= l.1 => l.1 = l.1.max(y),
+            _ => merged.push((x, y)),
+        }
     }
-    drop(g);
-    let Some(gy) = GRAVEYARD.try_lock() else { return false };
-    !gy.iter().any(|d| d.span.start < b && a < d.span.end && !settled(d.span.born))
+    // The covered parts less the young imports.
+    for (x, y) in merged {
+        let mut p = x;
+        for &(s, e) in young.iter().filter(|&&(s, e)| s < y && x < e) {
+            if s > p {
+                arm(p, s);
+            }
+            p = p.max(e);
+            if p >= y {
+                break;
+            }
+        }
+        if p < y {
+            arm(p, y);
+        }
+    }
+    true
 }
 
 /// Mirror mode: whether the pages to be copied into the mirror (ascending
@@ -8488,6 +8513,11 @@ impl Exec {
                         return false;
                     }
                     super::fe2::note_memcpy(1);
+                    if self.held {
+                        // (Read now: checked when held work settles.)
+                        self.held_reads.push((x, PAGE));
+                        self.note_kinds(2, 1);
+                    }
                     x += PAGE;
                 }
             }
@@ -10499,6 +10529,17 @@ impl Exec {
         if base + bytes > end {
             return refuse(c);
         }
+        // Front end 2: the words go into the mirror too (later work reads
+        // them there); without its memory the copy stays a dispatch.
+        let fe2_mirror = if super::fe2::on() && super::fe2::in_span(base, bytes) {
+            let lo = base & !4095;
+            match (super::resident::mirror_buffer(), super::resident::back(lo, (base + bytes).next_multiple_of(4096) - lo)) {
+                (Some((m, _)), Ok(())) => Some(m),
+                _ => return refuse(c),
+            }
+        } else {
+            None
+        };
         self.begin();
         if !self.recording {
             return refuse(c);
@@ -10521,6 +10562,11 @@ impl Exec {
         let cmd = self.cmd();
         for (k, part) in raw.chunks(65536).enumerate() {
             unsafe { ctx().device.cmd_update_buffer(cmd, buffer, base - start + 65536 * k as u64, part) };
+        }
+        if let Some(m) = fe2_mirror {
+            for (k, part) in raw.chunks(65536).enumerate() {
+                unsafe { ctx().device.cmd_update_buffer(cmd, m, base - super::resident::MIRROR_BASE + 65536 * k as u64, part) };
+            }
         }
         if lazy_barriers() {
             // Later draws and dispatches wait for it as for a dispatch.
@@ -11885,6 +11931,12 @@ impl Exec {
                         } else {
                             None
                         };
+                        // Held or parallel recording stopped at this command
+                        // (no batch could be begun for its uploads): it is
+                        // recorded again from here.
+                        if self.stopped && super::fe2::on() {
+                            return Err(STOPPED.into());
+                        }
                         let home = from_mirror.or_else(|| {
                             self.home_bind(base, size, found.tr.plan.resources[i].written, if sized { HomeUse::Sized } else { HomeUse::Unbounded })
                                 .map(|h| (h.0, h.1, h.2))
@@ -12790,7 +12842,7 @@ impl Exec {
         // (Held past a label wait the graphics command processor records in
         // program order still: its copies forward as before.)
         // (A long run's chunk forwards into its own view: `Cp::long_begin`.)
-        let forward_here = super::tune::forward_copies() && (!self.deferred || self.past_grow || ((self.past || self.long) && super::forward::held())) && indirect.is_none() && (self.name == "gpu-gfx" || (self.long && self.name.starts_with("gpu-gfx-par"))) && !super::resident::mirror_mode() && !super::fe2::on();
+        let forward_here = super::tune::forward_copies() && (!self.deferred || self.past_grow || ((self.past || self.long) && super::forward::held())) && indirect.is_none() && (self.name == "gpu-gfx" || (self.long && self.name.starts_with("gpu-gfx-par"))) && !super::resident::mirror_mode();
         // The graphics queue's parallel workers (`copy_update 2`): updates
         // checked once their batches completed, never forwarded.
         let worker_here = super::tune::forward_copies() && self.deferred && !self.held && indirect.is_none() && self.name.starts_with("gpu-gfx") && super::tune::copy_update_workers() && !super::resident::mirror_mode();

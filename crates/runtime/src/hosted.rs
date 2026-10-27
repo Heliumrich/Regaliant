@@ -22,8 +22,9 @@
 //! disarm): the access is retried. Every other exception goes to dsport's
 //! own handlers (first chance not handled). dsport arms a page by setting its bit before
 //! protecting it, so an armed page's fault never reaches its own handlers,
-//! and disarms by unprotecting before clearing the bit; after a mapping
-//! change the bits are only cleared (`forget`).
+//! and disarms by unprotecting before clearing the bit, one arm or disarm
+//! at a time (`arm_lock`); after a mapping change the bits are only cleared
+//! (`forget`).
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use windows_sys::Win32::Foundation::*;
@@ -168,6 +169,18 @@ pub fn init() {
     });
 }
 
+/// Arming and disarming one at a time: a disarm between an arm's bits and
+/// its protection would leave read-only pages without bits (a write there
+/// would reach dsport's own handlers). Callers that check something before
+/// arming (`gpu::fe2`) hold it across the check too.
+static ARM_LOCK: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
+
+/// Holds off every other arm and disarm (re-entrant: `arm` and `disarm`
+/// under it are fine).
+pub fn arm_lock() -> parking_lot::ReentrantMutexGuard<'static, ()> {
+    ARM_LOCK.lock()
+}
+
 /// Arms guest [base, base+len) (whole pages) against writes: its bits set,
 /// then read-only.
 pub fn arm(base: u64, len: u64) -> Result<(), String> {
@@ -182,6 +195,7 @@ pub fn arm_noaccess(base: u64, len: u64) -> Result<(), String> {
 
 fn arm_as(base: u64, len: u64, prot: u32) -> Result<(), String> {
     let s = shared().ok_or("not hosted")?;
+    let _lock = arm_lock();
     let (lo, hi) = (base & !(PAGE - 1), (base + len).next_multiple_of(PAGE));
     for a in (lo..hi).step_by(PAGE as usize) {
         let (w, m) = bit(s, a, true).ok_or_else(|| format!("{a:#x}: outside the guest range or out of leaves"))?;
@@ -234,15 +248,60 @@ pub fn leaf_events(a: u64) -> u64 {
     s.leaf_events[leaf_of(a)].load(Ordering::Acquire)
 }
 
-/// Disarms guest [base, base+len): read-write again, then the bits cleared.
+/// Disarm runs whose pages could not be made read-write (they keep their
+/// bits: the host still answers their faults).
+static DISARM_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// Disarms guest [base, base+len): its armed pages read-write again, then
+/// their bits cleared, run by run within the host's regions. One
+/// VirtualProtect cannot span separately allocated or uncommitted regions,
+/// and clearing the bits after such a failed call left read-only pages
+/// without bits, whose writes reach dsport's own handlers (a title crash
+/// on a page of a writable mapping: FINDINGS.md 2026-10-27 night); pages
+/// not armed keep their protection.
 pub fn disarm(base: u64, len: u64) {
     let Some(s) = shared() else { return };
-    let (lo, hi) = (base & !(PAGE - 1), (base + len).next_multiple_of(PAGE));
-    let mut old = 0u32;
-    unsafe { VirtualProtect(lo as _, (hi - lo) as usize, PAGE_READWRITE, &mut old) };
-    disarm_bits(s, lo, hi);
+    let _lock = arm_lock();
+    let lo = (base & !(PAGE - 1)).max(crate::mem::GUEST_BASE);
+    let hi = base.saturating_add(len).next_multiple_of(PAGE).min(crate::mem::GUEST_END);
+    let armed = |a: u64| bit(s, a, false).is_some_and(|(w, m)| w.load(Ordering::Acquire) & m != 0);
+    let mut a = lo;
+    while a < hi {
+        // The next armed page from a (unarmed words and leaves skipped).
+        let Some((w, _)) = bit(s, a, false) else {
+            a = crate::mem::GUEST_BASE + ((a - crate::mem::GUEST_BASE) / (PAGE * LEAF_PAGES) + 1) * PAGE * LEAF_PAGES;
+            continue;
+        };
+        let i = (a - crate::mem::GUEST_BASE) / PAGE % 64;
+        let rest = w.load(Ordering::Acquire) >> i;
+        if rest == 0 {
+            a += (64 - i) * PAGE;
+            continue;
+        }
+        a += rest.trailing_zeros() as u64 * PAGE;
+        if a >= hi {
+            break;
+        }
+        // Its run: armed pages up to the end of the host region holding it.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let region_end = if unsafe { VirtualQuery(a as _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } != 0 { info.BaseAddress as u64 + info.RegionSize as u64 } else { a + PAGE };
+        let mut e = a + PAGE;
+        while e < hi && e < region_end && armed(e) {
+            e += PAGE;
+        }
+        let mut old = 0u32;
+        if unsafe { VirtualProtect(a as _, (e - a) as usize, PAGE_READWRITE, &mut old) } != 0 {
+            disarm_bits(s, a, e);
+        } else {
+            let err = unsafe { GetLastError() };
+            if DISARM_FAILED.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::warn!("hosted: disarming {a:#x}+{:#x} failed (error {err}): its pages stay armed", e - a);
+            }
+        }
+        a = e;
+    }
     // Mirrored pages no longer protected leave the mirror.
-    crate::gpu::gmirror::disarmed(lo, hi - lo);
+    crate::gpu::gmirror::disarmed(lo, hi.saturating_sub(lo));
 }
 
 /// The armed bits of the 64 pages from `a` (a multiple of 64 pages from the
@@ -335,13 +394,14 @@ pub fn status() -> String {
         })
         .collect();
     format!(
-        "    hosted: {} faults on armed pages answered by the host ({:.1} us each there), {} retried (raced an answered one), {} exceptions passed on, {} leaves of the armed-page map, ring overflows {}; debug events: {}\n{}",
+        "    hosted: {} faults on armed pages answered by the host ({:.1} us each there), {} retried (raced an answered one), {} exceptions passed on, {} leaves of the armed-page map, ring overflows {}, disarms that failed {}; debug events: {}\n{}",
         f,
         s.host_ns.load(Ordering::Relaxed) as f64 / 1000.0 / f.max(1) as f64,
         s.retried.load(Ordering::Relaxed),
         s.passed.load(Ordering::Relaxed),
         s.leaves_used.load(Ordering::Relaxed),
         s.overflow.load(Ordering::Relaxed),
+        DISARM_FAILED.load(Ordering::Relaxed),
         events.join(", "),
         crate::hostcensus::status()
     )
