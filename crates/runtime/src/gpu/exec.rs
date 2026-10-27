@@ -3591,6 +3591,7 @@ static PAST_JOURNAL_ON: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// Starts the journal (a stretch past a label wait begins).
 pub(super) fn journal_begin() {
     *PAST_JOURNAL.lock() = Some(super::ranges::Ranges::new());
+    PAST_JOURNAL_WHO.lock().clear();
     PAST_JOURNAL_ON.store(true, Ordering::SeqCst);
 }
 
@@ -3600,21 +3601,65 @@ pub(super) fn journal_end() -> super::ranges::Ranges {
     PAST_JOURNAL.lock().take().unwrap_or_default()
 }
 
-fn journal_note(writes: &super::ranges::Ranges) {
+fn journal_note(writes: &super::ranges::Ranges, who: &str) {
     if PAST_JOURNAL_ON.load(Ordering::Acquire) && !writes.is_empty() {
         if let Some(j) = PAST_JOURNAL.lock().as_mut() {
             j.extend(writes);
         }
+        if trace_past_drops() {
+            let mut g = PAST_JOURNAL_WHO.lock();
+            for (a, n) in writes.iter().take(256) {
+                if g.len() < 4096 {
+                    g.push((a, n, who.to_string()));
+                }
+            }
+        }
     }
 }
 
-fn journal_note_one(w: (u64, u64)) {
+fn journal_note_one(w: (u64, u64), who: &str) {
     if PAST_JOURNAL_ON.load(Ordering::Acquire) && w.1 > 0 {
         if let Some(j) = PAST_JOURNAL.lock().as_mut() {
             j.insert(w.0, w.1);
         }
+        if trace_past_drops() {
+            let mut g = PAST_JOURNAL_WHO.lock();
+            if g.len() < 4096 {
+                g.push((w.0, w.1, format!("{who} (CP write)")));
+            }
+        }
     }
 }
+
+/// Kinds of the CPU reads of held recording (`Exec::note_held_reads`).
+pub const HELD_READ_KINDS: [&str; 6] = ["shared copy", "texture", "binding", "CP label poll", "CP read", "register pairs"];
+
+/// `DS_TRACE_PAST_DROPS=<n>`: the first n (1: 60) stretches past a label
+/// wait dropped because other queues wrote what they read on the CPU are
+/// logged with that read's kind and range and who wrote it
+/// (`Cp::past_wait_settle`). 0: none.
+pub(super) fn trace_past_drops_max() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("DS_TRACE_PAST_DROPS").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(1) => 60,
+        Some(n) => n,
+        None => 0,
+    })
+}
+
+pub(super) fn trace_past_drops() -> bool {
+    trace_past_drops_max() != 0
+}
+
+/// The journal's writes with their writers (`DS_TRACE_PAST_DROPS`).
+static PAST_JOURNAL_WHO: Mutex<Vec<(u64, u64, String)>> = Mutex::new(Vec::new());
+
+/// The writers of the journal's writes into [a, a+n) (`DS_TRACE_PAST_DROPS`).
+pub(super) fn journal_writers(a: u64, n: u64) -> Vec<String> {
+    let g = PAST_JOURNAL_WHO.lock();
+    g.iter().filter(|w| w.0 < a + n && a < w.0 + w.1).take(4).map(|w| format!("{} [{:#x}+{:#x}]", w.2, w.0, w.1)).collect()
+}
+
 /// CP reads that waited for another queue's batch (diagnostics).
 pub static FOREIGN_WAITS: AtomicU64 = AtomicU64::new(0);
 /// Reads by parallel workers of what the main command processor's batch,
@@ -6303,6 +6348,8 @@ pub struct Exec {
     /// Guest ranges it read on the CPU while recording (stage preparations,
     /// command-processor reads, textures' guest memory), since `held_reset`.
     held_reads: Vec<(u64, u64)>,
+    /// Each held read's kind (`HELD_READ_KINDS`), with `DS_TRACE_PAST_DROPS`.
+    held_kinds: Vec<u8>,
     /// GPU-performed CP writes recorded while held (diagnostics).
     cp_written: Vec<(u64, u64)>,
     /// Held past a label wait (`past_begin_growing`): a slot still holding
@@ -6384,6 +6431,8 @@ pub struct Exec {
     acb50: bool,
     /// The dispatch whose writes are being noted (`DS_TRACE_NOTE`).
     noting: u64,
+    /// A command label is open in the batch's command buffer (`label`).
+    label_open: bool,
     batch_alt: bool,
     batch_alt_share: bool,
     /// GPU writes this batch recorded since its last full barrier through
@@ -6871,6 +6920,7 @@ impl Exec {
                 past: false,
                 held_promises: Vec::new(),
                 held_reads: Vec::new(),
+                held_kinds: Vec::new(),
                 cp_written: Vec::new(),
                 past_grow: false,
                 held_clears: HashMap::new(),
@@ -6909,6 +6959,7 @@ impl Exec {
                 compute_cp: name.starts_with("gpu-acb"),
                 acb50: name == "gpu-acb0x50",
                 noting: 0,
+                label_open: false,
                 batch_alt: false,
                 batch_alt_share: false,
                 since_barrier: Some(Vec::new()),
@@ -7064,6 +7115,7 @@ impl Exec {
     fn begin_batch(&mut self) {
         self.batch_count += 1;
         self.repeat = None;
+        self.label_open = false;
         // Imports looked up from now on belong to this batch (`reap_spans`).
         if self.open_gen.load(Ordering::Relaxed) == u64::MAX {
             self.open_gen.store(SPAN_GEN.load(Ordering::SeqCst), Ordering::SeqCst);
@@ -7283,6 +7335,7 @@ impl Exec {
     /// when it completes).
     /// Submits the recorded batch; `why` (profiling): what ended it.
     pub fn submit_for(&mut self, why: &'static str) {
+        self.label_close();
         if !self.recording {
             return;
         }
@@ -7498,7 +7551,7 @@ impl Exec {
         let writes = std::mem::take(&mut self.pending);
         self.pending_log.clear();
         INFLIGHT.note_ranges(seq, &writes);
-        journal_note(&writes);
+        journal_note(&writes, &self.name);
         crate::hostcensus::gpu_wrote(seq, &writes);
         if self.name == "gpu-gfx" {
             super::frameahead::a_wrote_ranges(&writes);
@@ -7552,6 +7605,7 @@ impl Exec {
     /// Drops the recorded batch (process shutdown: label waits were released,
     /// so the work may lack its inputs). The slot stays free.
     fn discard(&mut self) {
+        self.label_close();
         if self.closed.is_empty() {
             self.open_gen.store(u64::MAX, Ordering::SeqCst);
         }
@@ -8442,6 +8496,7 @@ impl Exec {
                 if self.held {
                     // (Taken before; checked when held work settles.)
                     self.held_reads.push((base, size));
+                    self.note_kinds(0, 1);
                 }
                 self.copy_wait = self.copy_wait.max(made);
                 let buf = chunk.buf;
@@ -8594,6 +8649,10 @@ impl Exec {
         self.begin();
         if !self.recording {
             return Ok(false);
+        }
+        if super::vk::labels_on() {
+            let l = format!("{} fill {len:#x}", self.name);
+            self.label(&l);
         }
         self.end_rendering();
         let cmd = self.cmd();
@@ -9039,7 +9098,7 @@ impl Exec {
             self.actions.push(f);
             self.submit_for("effect");
             if let Some(w) = write {
-                journal_note_one(w);
+                journal_note_one(w, &self.name);
                 INFLIGHT.note(self.last_seq, w);
                 if ordered {
                     CP_WRITES.note(self.last_seq, w);
@@ -9054,7 +9113,7 @@ impl Exec {
             self.last_action_seq = seq;
             self.cpu_action_seq = seq;
             if let Some(w) = write {
-                journal_note_one(w);
+                journal_note_one(w, &self.name);
                 INFLIGHT.note(seq, w);
                 if ordered {
                     CP_WRITES.note(seq, w);
@@ -9065,7 +9124,7 @@ impl Exec {
             Some(seq)
         } else {
             if let Some(w) = write {
-                journal_note_one(w);
+                journal_note_one(w, &self.name);
             }
             f();
             None
@@ -9141,6 +9200,7 @@ impl Exec {
         if self.held {
             // Textures are taken from guest memory as it is now.
             self.held_reads.extend(textures.iter().map(|x| x.0));
+            self.note_kinds(1, textures.len());
         }
         if textures.is_empty() || super::tune::skip_steps() & 1 != 0 {
             return false;
@@ -9695,6 +9755,10 @@ impl Exec {
             }
         }
         self.gpu_writes_open = true;
+        if super::vk::labels_on() {
+            let l = format!("{} cp write", self.name);
+            self.label(&l);
+        }
         let full = !(end_of_pipe && super::tune::eop_light()) && super::tune::skip_barriers() & 4 == 0;
         if full && self.ts_deferred.is_empty() {
             self.end_rendering_before_barrier();
@@ -9974,6 +10038,10 @@ impl Exec {
         if self.ts_deferred.is_empty() {
             return;
         }
+        if super::vk::labels_on() {
+            let l = format!("{} timestamp stores", self.name);
+            self.label(&l);
+        }
         let mut deferred = std::mem::take(&mut self.ts_deferred);
         // A slot written twice in the batch keeps the later value (stored in
         // order, one dispatch each, the later store won; stores of one
@@ -10068,6 +10136,29 @@ impl Exec {
         self.recording && !self.pending_promises.is_empty() && (self.submit_request.load(Ordering::Relaxed) || self.begun_at.elapsed() > super::tune::label_latency())
     }
 
+    /// Command labels (DS_GPU_LABELS=1, Nsight Graphics' GPU Trace): what
+    /// is recorded from here to the next label is named `name` (a dispatch's
+    /// or draw's program, or work of ours: merges, CP writes, timestamp
+    /// stores, fills). Only while a batch is being recorded.
+    pub(super) fn label(&mut self, name: &str) {
+        if !self.recording || !super::vk::labels_on() {
+            return;
+        }
+        let cmd = self.cmd();
+        if self.label_open {
+            super::vk::label_end(cmd);
+        }
+        super::vk::label_begin(cmd, name);
+        self.label_open = true;
+    }
+
+    /// Ends the open label before the batch's command buffer ends.
+    fn label_close(&mut self) {
+        if std::mem::take(&mut self.label_open) && self.recording {
+            super::vk::label_end(self.cmd());
+        }
+    }
+
     /// Whether this executor's indirect dispatches read their arguments from
     /// a resident shadow's working copy (`tune shadow_args`).
     fn shadow_args(&self) -> bool {
@@ -10111,6 +10202,11 @@ impl Exec {
         }
         let (flush, keep): (Vec<Shadow>, Vec<Shadow>) = std::mem::take(&mut self.resident).into_iter().partition(hit);
         self.resident = keep;
+        let n = flush.len();
+        if super::vk::labels_on() {
+            let l = format!("{} merges ({n})", self.name);
+            self.label(&l);
+        }
         let c = ctx();
         // The dispatches' writes to the working copies come first.
         self.end_rendering_then_barrier();
@@ -10737,6 +10833,7 @@ impl Exec {
         }
         self.held_promises.clear();
         self.held_reads.clear();
+        self.held_kinds.clear();
         self.held_keys.clear();
         self.submit_closed();
     }
@@ -10772,6 +10869,7 @@ impl Exec {
         self.held_over.clear();
         self.held_promises.clear();
         self.held_reads.clear();
+        self.held_kinds.clear();
         self.held_keys.clear();
     }
 
@@ -10781,6 +10879,7 @@ impl Exec {
         self.stopped = false;
         self.stop_why = "";
         self.held_reads.clear();
+        self.held_kinds.clear();
         self.cp_written.clear();
         self.held_clears.clear();
         self.held_over.clear();
@@ -10837,16 +10936,31 @@ impl Exec {
         self.stop(why);
     }
 
-    /// Guest ranges the frame-ahead recorder read on the CPU.
-    pub fn note_held_reads(&mut self, reads: &[(u64, u64)]) {
+    /// Guest ranges the frame-ahead recorder read on the CPU (`kind`: an
+    /// index into `HELD_READ_KINDS`).
+    pub fn note_held_reads(&mut self, reads: &[(u64, u64)], kind: u8) {
         if self.held {
             self.held_reads.extend_from_slice(reads);
+            self.note_kinds(kind, reads.len());
         }
     }
 
     /// What it read on the CPU since `held_reset`.
     pub fn held_reads(&self) -> &[(u64, u64)] {
         &self.held_reads
+    }
+
+    /// The kinds of the last `n` held reads (`DS_TRACE_PAST_DROPS`).
+    fn note_kinds(&mut self, kind: u8, n: usize) {
+        if trace_past_drops() {
+            self.held_kinds.resize(self.held_reads.len() - n, u8::MAX);
+            self.held_kinds.resize(self.held_reads.len(), kind);
+        }
+    }
+
+    /// The kind of held read `i` (`DS_TRACE_PAST_DROPS`).
+    pub fn held_read_kind(&self, i: usize) -> &'static str {
+        self.held_kinds.get(i).and_then(|&k| HELD_READ_KINDS.get(k as usize)).copied().unwrap_or("?")
     }
 
     /// Batches closed and held (not submitted).
@@ -10920,7 +11034,7 @@ impl Exec {
             super::precache::submitted(&b.shared, seq);
             super::resident::submitted(&b.res_pages, seq);
             INFLIGHT.note_ranges(seq, &b.writes);
-            journal_note(&b.writes);
+            journal_note(&b.writes, &self.name);
             crate::hostcensus::gpu_wrote(seq, &b.writes);
             if self.name.starts_with("gpu-gfx-par") {
                 super::frameahead::a_wrote_ranges(&b.writes);
@@ -10990,6 +11104,7 @@ impl Exec {
         let found = p.found.clone();
         if self.held {
             self.held_reads.extend_from_slice(&found.reads);
+            self.note_kinds(2, found.reads.len());
         }
         super::images::BINDING_SHADER.with(|s| s.set(p.addr));
         let res_info = rdna::translate::res_info_offset(&found.tr.plan) as usize;
@@ -12107,6 +12222,10 @@ impl Exec {
         self.reserve(&[&p], push);
         if self.stopped {
             return Err(STOPPED.into());
+        }
+        if super::vk::labels_on() {
+            let l = format!("{} cs {:#x}{}", self.name, p.addr, if indirect.is_some() { " indirect" } else { "" });
+            self.label(&l);
         }
         lap.mark(5);
         let mut bound = self.bind_stage(&mut p, true)?;

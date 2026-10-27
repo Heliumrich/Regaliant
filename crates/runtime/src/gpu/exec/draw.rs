@@ -1605,6 +1605,10 @@ impl Exec {
         if self.stopped {
             return Err(super::STOPPED.into());
         }
+        if crate::gpu::vk::labels_on() {
+            let l = format!("{} draw ps {:#x}", self.name, ps.as_ref().map_or(0, |p| p.addr));
+            self.label(&l);
+        }
         if let Some(h) = &index_home {
             // Kept until the batch that draws completes (once per batch).
             if !self.keep_home(h.0, h.3.as_ref()) {

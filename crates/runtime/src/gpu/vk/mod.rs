@@ -34,6 +34,9 @@ pub struct Ctx {
     pub exec_props: Option<ash::khr::pipeline_executable_properties::Device>,
     pub device_name: String,
     pub validation: bool,
+    /// VK_EXT_debug_utils command labels (DS_GPU_LABELS=1): named ranges of
+    /// the recorded work for GPU Trace (Nsight Graphics).
+    pub labels: Option<ash::ext::debug_utils::Device>,
     /// VK_KHR_fragment_shader_barycentric enabled.
     pub barycentric: bool,
     /// VK_EXT_memory_budget enabled (`heap_report`).
@@ -174,7 +177,14 @@ fn init_inner() -> Result<(), String> {
         }
         let layers: Vec<*const c_char> = if validation { vec![validation_name.as_ptr()] } else { vec![] };
         let mut exts = vec![ash::khr::surface::NAME.as_ptr(), ash::khr::win32_surface::NAME.as_ptr()];
-        if validation {
+        // Command labels for GPU Trace (DS_GPU_LABELS=1).
+        let want_labels = std::env::var("DS_GPU_LABELS").ok().as_deref() == Some("1");
+        let has_debug_utils = entry.enumerate_instance_extension_properties(None).unwrap_or_default().iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::debug_utils::NAME);
+        let labels_on = want_labels && has_debug_utils;
+        if want_labels && !has_debug_utils {
+            crate::warn!("DS_GPU_LABELS=1 but VK_EXT_debug_utils is unavailable");
+        }
+        if validation || labels_on {
             exts.push(ash::ext::debug_utils::NAME.as_ptr());
         }
         let ici = vk::InstanceCreateInfo::default().application_info(&app).enabled_layer_names(&layers).enabled_extension_names(&exts);
@@ -489,6 +499,7 @@ fn init_inner() -> Result<(), String> {
             exec_props: has_stats.then(|| ash::khr::pipeline_executable_properties::Device::new(&instance, &device)),
             calibrated: calibrated.then(|| ash::ext::calibrated_timestamps::Device::new(&instance, &device)),
             fault: has_fault.then(|| ash::ext::device_fault::Device::new(&instance, &device)),
+            labels: labels_on.then(|| ash::ext::debug_utils::Device::new(&instance, &device)),
             device_addresses,
             draw_indirect_count,
             sparse_buffers,
@@ -608,6 +619,26 @@ pub mod mark {
     pub const SHADOW_OUT: u64 = 4;
     pub const UPLOAD: u64 = 5;
     pub const BATCH: u64 = 6;
+}
+
+/// Command labels are recorded (DS_GPU_LABELS=1, `Exec::label`).
+pub fn labels_on() -> bool {
+    try_ctx().is_some_and(|c| c.labels.is_some())
+}
+
+/// Begins a named label range in `cmd` (DS_GPU_LABELS=1).
+pub fn label_begin(cmd: vk::CommandBuffer, name: &str) {
+    if let Some(l) = try_ctx().and_then(|c| c.labels.as_ref()) {
+        let s = std::ffi::CString::new(name).unwrap_or_default();
+        unsafe { l.cmd_begin_debug_utils_label(cmd, &vk::DebugUtilsLabelEXT::default().label_name(&s)) };
+    }
+}
+
+/// Ends the innermost label range begun in `cmd`.
+pub fn label_end(cmd: vk::CommandBuffer) {
+    if let Some(l) = try_ctx().and_then(|c| c.labels.as_ref()) {
+        unsafe { l.cmd_end_debug_utils_label(cmd) };
+    }
 }
 
 /// Records a diagnostic checkpoint (DS_GPU_CHECKPOINTS=1): `kind` and a

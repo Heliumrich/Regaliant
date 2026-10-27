@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 186] = [
+    static ALL: [Tunable; 187] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -216,9 +216,10 @@ pub mod tune {
         Tunable { name: "home_check_win", env: "DS_HOME_CHECK_WIN", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "gpu_chains", env: "DS_GPU_CHAINS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "gpu_mirror", env: "DS_GPU_MIRROR", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "past_waits", env: "DS_PAST_WAITS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "past_waits", env: "DS_PAST_WAITS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "forward_earlier", env: "DS_FORWARD_EARLIER", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "forward_held", env: "DS_FORWARD_HELD", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "past_backoff", env: "DS_PAST_BACKOFF", default: 16, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1999,8 +2000,9 @@ pub mod tune {
     /// compute queue wrote last (`Cp::past_wait_start`): held until the
     /// label is promised or a stop, then checked against what the other
     /// queues recorded meanwhile and submitted after the writer's batch, or
-    /// dropped and recorded again from the wait: 1 labels queue 0x50 wrote
-    /// last, 2 any compute queue's; 0 (default) off.
+    /// dropped and recorded again from the wait: 1 (default since
+    /// 2026-10-27) labels queue 0x50 wrote last, 2 any compute queue's; 0
+    /// off.
     #[inline]
     pub fn past_waits() -> u64 {
         get(183)
@@ -2023,6 +2025,14 @@ pub mod tune {
     #[inline]
     pub fn forward_held() -> bool {
         get(185) != 0
+    }
+
+    /// While most of a label's recent stretches past its waits were
+    /// dropped (`past_waits`; each outcome weighs a fourth), only every n-th
+    /// wait on it is gone past (a probe); 0: every one.
+    #[inline]
+    pub fn past_backoff() -> u64 {
+        get(186)
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

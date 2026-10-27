@@ -571,8 +571,68 @@ pub fn past_wait_reset() {
     for c in &PAST_WAITS {
         c.store(0, Ordering::Relaxed);
     }
+    PAST_SKIPPED.store(0, Ordering::Relaxed);
     PAST_WAIT_STOPS.lock().clear();
     PAST_WAIT_DROPS.lock().clear();
+}
+
+/// Per label address gone past: (its stretches' recent drop rate in 1/1024,
+/// waits not gone past since the last probe) (`tune past_backoff`).
+static PAST_BACKOFF: parking_lot::Mutex<Option<HashMap<u64, (u32, u32)>>> = parking_lot::Mutex::new(None);
+/// Waits not gone past because their label's stretches were dropped.
+static PAST_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a wait on label `a` may be gone past: while most of its recent
+/// stretches were dropped, only every `past_backoff`-th wait (a probe).
+fn past_backoff_pass(a: u64) -> bool {
+    let probe = super::tune::past_backoff() as u32;
+    if probe == 0 {
+        return true;
+    }
+    let mut g = PAST_BACKOFF.lock();
+    let Some(e) = g.as_mut().and_then(|m| m.get_mut(&(a & !7))) else { return true };
+    if e.0 < 512 {
+        return true;
+    }
+    e.1 += 1;
+    if e.1 >= probe {
+        e.1 = 0;
+        return true;
+    }
+    PAST_SKIPPED.fetch_add(1, Ordering::Relaxed);
+    false
+}
+
+/// A stretch past a wait on label `a` was dropped (`dropped`) or committed:
+/// the label's drop rate, each outcome weighing a fourth.
+fn past_backoff_note(a: u64, dropped: bool) {
+    let mut g = PAST_BACKOFF.lock();
+    let e = g.get_or_insert_with(HashMap::new).entry(a & !7).or_insert((0, 0));
+    e.0 = e.0 * 3 / 4 + if dropped { 256 } else { 0 };
+}
+
+/// The counters at the frame window's start (`past_wait_window_clause`).
+static PAST_WINDOW: parking_lot::Mutex<Option<[u64; 9]>> = parking_lot::Mutex::new(None);
+
+/// The frame window's stretches past label waits per flip, how many were
+/// dropped and settled at a stop, and their commands: one clause of the
+/// `frames at` line ("" without stretches).
+pub fn past_wait_window_clause(flips: u64) -> String {
+    let now: [u64; 9] = std::array::from_fn(|i| if i < 8 { PAST_WAITS[i].load(Ordering::Relaxed) } else { PAST_SKIPPED.load(Ordering::Relaxed) });
+    let Some(w0) = PAST_WINDOW.lock().replace(now) else { return String::new() };
+    let d: [u64; 9] = std::array::from_fn(|i| now[i].saturating_sub(w0[i]));
+    if d[0] == 0 && d[8] == 0 {
+        return String::new();
+    }
+    let flips = flips.max(1) as f64;
+    format!(
+        "; past label waits per flip: {:.1} stretches ({:.1} dropped, {:.1} settled at a stop), {:.0} commands each, {:.1} waits not gone past after drops",
+        d[0] as f64 / flips,
+        d[2] as f64 / flips,
+        d[6] as f64 / flips,
+        d[3] as f64 / d[0].max(1) as f64,
+        d[8] as f64 / flips
+    )
 }
 
 /// One status line ("" before any stretch past a label wait).
@@ -588,11 +648,12 @@ pub fn past_wait_status() -> String {
     };
     let n = p(0).max(1) as f64;
     format!(
-        "    recording past label waits: {} stretches, {} committed, {} dropped ({}), {} commands recorded past the waits ({:.1} each), {:.0} us from a wait to its settling; settled once promised {}, at a stop {} ({}; {:.0} us waited for the label there on average)\n",
+        "    recording past label waits: {} stretches, {} committed, {} dropped ({}; {} waits not gone past after drops), {} commands recorded past the waits ({:.1} each), {:.0} us from a wait to its settling; settled once promised {}, at a stop {} ({}; {:.0} us waited for the label there on average)\n",
         p(0),
         p(1),
         p(2),
         list(&PAST_WAIT_DROPS),
+        PAST_SKIPPED.load(Ordering::Relaxed),
         p(3),
         p(3) as f64 / n,
         p(4) as f64 / 1e3 / n,
@@ -1854,7 +1915,7 @@ impl Cp {
             }
             if pass(read()) {
                 if let Some(e) = self.exec.as_mut() {
-                    e.note_held_reads(&[(a, if wide { 8 } else { 4 })]);
+                    e.note_held_reads(&[(a, if wide { 8 } else { 4 })], 3);
                 }
                 if spins > 0 {
                     self.held_polled(a, reference, t0, true, std::mem::take(&mut writer_state));
@@ -2580,6 +2641,7 @@ impl Cp {
             && self.exec.is_some()
             && !super::capture::capturing()
             && last_write(a).is_some_and(|(q, _, _)| if mode == 1 { q == "gpu-acb0x50" } else { q.starts_with("gpu-acb") })
+            && past_backoff_pass(a)
     }
 
     /// Goes past a label wait (`tune past_waits`): this command processor's
@@ -2688,8 +2750,25 @@ impl Cp {
         };
         if let Some(d) = dropped {
             note_why(&PAST_WAIT_DROPS, d);
+            if d == "read what other queues wrote" && super::exec::trace_past_drops() {
+                static N: AtomicU64 = AtomicU64::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < super::exec::trace_past_drops_max() {
+                    let hits: Vec<String> = e
+                        .held_reads()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, r)| writes.overlaps(r.0, r.1))
+                        .take(3)
+                        .map(|(i, r)| format!("{} {:#x}+{:#x} written by {}", e.held_read_kind(i), r.0, r.1, super::exec::journal_writers(r.0, r.1).join(", ")))
+                        .collect();
+                    crate::info!("gpu[{}]: stretch past the wait at {:#x} on {:#x} dropped after {commands} commands ({} of its {} CPU reads written meanwhile): {}", self.name, w.at, w.a, e.held_reads().iter().filter(|r| writes.overlaps(r.0, r.1)).count(), e.held_reads().len(), hits.join("; "));
+                }
+            }
             e.past_drop();
             PAST_WAITS[2].fetch_add(1, Ordering::Relaxed);
+            if d != "shutdown" {
+                past_backoff_note(w.a, true);
+            }
             // Back to the wait.
             self.set_chunk_state(&w.state);
             self.ctx_stack = std::mem::take(&mut w.stack);
@@ -2709,6 +2788,7 @@ impl Cp {
         }
         e.past_commit();
         PAST_WAITS[1].fetch_add(1, Ordering::Relaxed);
+        past_backoff_note(w.a, false);
         if why == "label" {
             self.submit_gpu("label");
         }
@@ -3664,7 +3744,7 @@ impl Cp {
     /// the draws after the first then find nothing pending.
     fn sync_reads(&mut self, reads: &[(u64, u64)]) {
         if let (Some(e), true) = (self.exec.as_mut(), self.held.is_some()) {
-            e.note_held_reads(reads);
+            e.note_held_reads(reads, 4);
         }
         if let Some(e) = self.exec.as_mut() {
             if e.flush_if_writes(reads) {
@@ -5073,7 +5153,7 @@ impl Cp {
             return;
         }
         if let (Some(e), true) = (self.exec.as_mut(), self.held.is_some()) {
-            e.note_held_reads(&[(a, 8 * n as u64)]);
+            e.note_held_reads(&[(a, 8 * n as u64)], 5);
         }
         for i in 0..n as u64 {
             let (o, v) = unsafe { (rd32(a + 8 * i), rd32(a + 8 * i + 4)) };
