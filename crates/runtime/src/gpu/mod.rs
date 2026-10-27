@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 189] = [
+    static ALL: [Tunable; 190] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -222,6 +222,7 @@ pub mod tune {
         Tunable { name: "past_backoff", env: "DS_PAST_BACKOFF", default: 16, value: AtomicU64::new(UNSET) },
         Tunable { name: "rgm", env: "DS_RGM", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "long_runs", env: "DS_LONG_RUNS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "submit_coalesce", env: "DS_SUBMIT_COALESCE", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2057,6 +2058,14 @@ pub mod tune {
     #[inline]
     pub fn long_runs() -> bool {
         get(188) != 0
+    }
+
+    /// Batches the submission thread hands to Vulkan in one call when that
+    /// many are queued (`exec::submit_specs`; 1, the default: one call
+    /// each).
+    #[inline]
+    pub fn submit_coalesce() -> u64 {
+        get(189)
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

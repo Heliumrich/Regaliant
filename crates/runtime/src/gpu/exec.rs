@@ -2202,10 +2202,83 @@ fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::Comma
         }
         None => std::slice::from_ref(&cmd),
     };
+    // On the main queue every batch signals the batch timeline with its
+    // sequence (the completion thread waits for that value).
+    let tl = [(c.batches, seq)];
+    let signals: &[(vk::Semaphore, u64)] = if alt { &[] } else { &tl };
     match (&c.copy, wait) {
-        (Some(q), w) if w > 0 => c.submit_timeline_on(false, alt, cmds, &[(q.copied, w, vk::PipelineStageFlags2::ALL_COMMANDS)], &[], fence),
-        _ if alt => c.submit_timeline_on(false, true, cmds, &[], &[], fence),
-        _ => c.submit_cmds(cmds, &[], &[], fence),
+        (Some(q), w) if w > 0 => c.submit_timeline_on(false, alt, cmds, &[(q.copied, w, vk::PipelineStageFlags2::ALL_COMMANDS)], signals, fence),
+        _ => c.submit_timeline_on(false, alt, cmds, &[], signals, fence),
+    }
+}
+
+/// A batch's submission as the submission thread hands it to Vulkan
+/// (`submit_specs`): its command buffers (the copy queue's part, the
+/// prologue, the batch), the copy queue's timeline value it waits for, its
+/// fence, whether it runs on the second queue, its executor's name.
+pub(super) struct SubmitSpec {
+    xpre: Option<vk::CommandBuffer>,
+    pre: Option<vk::CommandBuffer>,
+    cmd: vk::CommandBuffer,
+    wait: u64,
+    fence: vk::Fence,
+    alt: bool,
+    name: String,
+}
+
+/// Batches submitted in one vkQueueSubmit2 with others (`tune
+/// submit_coalesce`): [calls, batches in them].
+pub static COALESCED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Submits batches in sequence order: consecutive ones on the main queue
+/// without a copy-queue part go to Vulkan in one call (`tune
+/// submit_coalesce`: at most that many; the GPU then starts each right
+/// after the one before instead of after a submission of its own), the
+/// others one by one as `submit_batch`.
+fn submit_specs(specs: Vec<(u64, SubmitSpec)>) {
+    if specs.is_empty() || DEVICE_LOST.load(Ordering::Relaxed) {
+        return;
+    }
+    let fail = |e: String, name: &str| {
+        if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
+            crate::error!("gpu[{name}]: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
+        }
+    };
+    let plain = |s: &SubmitSpec| s.xpre.is_none() && !s.alt;
+    let max = (super::tune::submit_coalesce() as usize).max(1);
+    let mut i = 0;
+    while i < specs.len() {
+        if DEVICE_LOST.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut j = i + 1;
+        if plain(&specs[i].1) {
+            while j < specs.len() && j - i < max && plain(&specs[j].1) {
+                j += 1;
+            }
+        }
+        if j - i == 1 {
+            let (seq, s) = &specs[i];
+            if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.fence, s.alt) {
+                fail(e, &s.name);
+            }
+            i = j;
+            continue;
+        }
+        let c = ctx();
+        if let Err(e) = super::pagetable::submit_pending(c) {
+            fail(e, &specs[i].1.name);
+            return;
+        }
+        let cmds: Vec<Vec<vk::CommandBuffer>> = specs[i..j].iter().map(|(_, s)| s.pre.into_iter().chain([s.cmd]).collect()).collect();
+        let list: Vec<(&[vk::CommandBuffer], u64, u64)> = specs[i..j].iter().zip(&cmds).map(|((seq, s), c)| (c.as_slice(), s.wait, *seq)).collect();
+        COALESCED[0].fetch_add(1, Ordering::Relaxed);
+        COALESCED[1].fetch_add((j - i) as u64, Ordering::Relaxed);
+        if let Err(e) = c.submit_batches(&list, specs[j - 1].1.fence) {
+            fail(e, &specs[i].1.name);
+            return;
+        }
+        i = j;
     }
 }
 
@@ -3318,6 +3391,9 @@ struct Batch {
     seq: u64,
     /// Null for action-only entries.
     fence: vk::Fence,
+    /// On the second queue (its fence is waited for, not the batch
+    /// timeline).
+    alt: bool,
     actions: Vec<Action>,
     checks: Vec<verify::Check>,
     shaders: Vec<u64>,
@@ -4091,7 +4167,8 @@ pub fn wait_done(seq: u64) {
 
 /// Queues a batch: `submit` runs (the vkQueueSubmit) under the queue lock so
 /// sequence order is submission order.
-fn push_batch(fence: vk::Fence, queries: vk::QueryPool, bq: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, gpu_labels: Vec<(u64, u64, u8)>, ops: [u64; OPS], segs: Vec<SegMark>, reset: Option<SlotReset>, submit: impl FnOnce(u64) + Send + 'static) -> u64 {
+#[allow(clippy::too_many_arguments)]
+fn push_batch(fence: vk::Fence, queries: vk::QueryPool, bq: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, gpu_labels: Vec<(u64, u64, u8)>, ops: [u64; OPS], segs: Vec<SegMark>, reset: Option<SlotReset>, alt: bool, submit: impl FnOnce(u64) -> Option<SubmitSpec> + Send + 'static) -> u64 {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         crate::thread::spawn_host("gpu-complete", 1 << 20, Box::new(completion_thread)).expect("gpu completion thread");
@@ -4111,10 +4188,12 @@ fn push_batch(fence: vk::Fence, queries: vk::QueryPool, bq: vk::QueryPool, actio
         SUBMIT_CV.notify_one();
     } else {
         drop(sq);
-        submit(seq);
+        if let Some(s) = submit(seq) {
+            submit_specs(vec![(seq, s)]);
+        }
         note_submitted(seq);
     }
-    q.push_back(Batch { queries, bq, seq, fence, actions, checks, shaders, submitted: std::time::Instant::now(), name: name.to_string(), gpu_labels, ops, segs, reset });
+    q.push_back(Batch { queries, bq, seq, fence, alt, actions, checks, shaders, submitted: std::time::Instant::now(), name: name.to_string(), gpu_labels, ops, segs, reset });
     BATCHES_CV.notify_one();
     seq
 }
@@ -4130,7 +4209,7 @@ thread_local! {
 /// vkQueueSubmit of each batch in sequence order, off the command
 /// processors (~7% of the graphics command processor's busy samples, ~220
 /// batches per courtyard frame; profile run 20261012-001629).
-type SubmitJob = Box<dyn FnOnce(u64) + Send>;
+type SubmitJob = Box<dyn FnOnce(u64) -> Option<SubmitSpec> + Send>;
 static SUBMIT_Q: Mutex<std::collections::VecDeque<(u64, SubmitJob)>> = Mutex::new(std::collections::VecDeque::new());
 static SUBMIT_CV: parking_lot::Condvar = parking_lot::Condvar::new();
 /// Highest batch sequence submitted to Vulkan (the completion thread waits
@@ -4151,20 +4230,32 @@ fn submitter_thread() {
     super::profile_this_thread("submit");
     loop {
         super::prio::apply();
-        let (seq, job) = {
+        // The jobs queued (up to `tune submit_coalesce`): their batches are
+        // finished first, then submitted together where they can be.
+        let jobs: Vec<(u64, SubmitJob)> = {
             let mut q = SUBMIT_Q.lock();
             loop {
-                if let Some(j) = q.pop_front() {
-                    break j;
+                if !q.is_empty() {
+                    let n = q.len().min((super::tune::submit_coalesce() as usize).max(1));
+                    break q.drain(..n).collect();
                 }
                 SUBMIT_CV.wait(&mut q);
             }
         };
         let tl = super::timeline::mark();
         SUBMIT_KIND.with(|k| k.set(0));
-        job(seq);
-        super::timeline::end("vk submit", tl, || format!("#{seq}{}", ["", " own copies", " earlier copies"][SUBMIT_KIND.with(|k| k.get()) as usize]));
-        note_submitted(seq);
+        let mut specs = Vec::with_capacity(jobs.len());
+        let mut last = 0;
+        let first = jobs[0].0;
+        for (seq, job) in jobs {
+            last = seq;
+            if let Some(s) = job(seq) {
+                specs.push((seq, s));
+            }
+        }
+        submit_specs(specs);
+        super::timeline::end("vk submit", tl, || if last == first { format!("#{first}{}", ["", " own copies", " earlier copies"][SUBMIT_KIND.with(|k| k.get()) as usize]) } else { format!("#{first}-#{last}") });
+        note_submitted(last);
     }
 }
 
@@ -4197,7 +4288,8 @@ fn completion_thread() {
         if b.fence != vk::Fence::null() && !DEVICE_LOST.load(Ordering::Relaxed) {
             wait_submitted(b.seq);
             let tf = std::time::Instant::now();
-            let r = unsafe { ctx().device.wait_for_fences(&[b.fence], true, 10_000_000_000) };
+            // (Batches submitted together carry one fence, the last's.)
+            let r = if b.alt { unsafe { ctx().device.wait_for_fences(&[b.fence], true, 10_000_000_000) } } else if ctx().wait_batch(b.seq, 10_000_000_000) { Ok(()) } else { Err(vk::Result::TIMEOUT) };
             FENCE_NS.fetch_add(tf.elapsed().as_nanos() as u64, Ordering::Relaxed);
             if let Err(e) = r {
                 if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
@@ -7549,9 +7641,9 @@ impl Exec {
         note_copy_waits(xpre.is_some() || xpre_job.is_some(), copy_wait);
         let alt = self.batch_alt;
         let reset = self.slot_reset(i);
-        let seq = push_batch(fence, self.slots[i].queries, bq, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, std::mem::take(&mut self.segs), reset, move |seq| {
+        let seq = push_batch(fence, self.slots[i].queries, bq, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, std::mem::take(&mut self.segs), reset, alt, move |seq| {
             if DEVICE_LOST.load(Ordering::Relaxed) {
-                return;
+                return None;
             }
             let (mut pre, mut xpre) = (pre, xpre);
             if finish {
@@ -7565,12 +7657,8 @@ impl Exec {
                 });
                 finish_main(cmd, bq, pre.is_some());
             }
-            let r = submit_batch(seq, xpre, pre, cmd, copy_wait, fence, alt);
-            if let Err(e) = r {
-                if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
-                    crate::error!("gpu[{name}]: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
-                }
-            }
+            let _ = seq;
+            Some(SubmitSpec { xpre, pre, cmd, wait: copy_wait, fence, alt, name })
         });
         super::timeline::end(&self.name, self.begun_mark.take(), || format!("batch #{seq}, {commands} commands ({why})"));
         st.mark(5);
@@ -9180,7 +9268,7 @@ impl Exec {
             }
             Some(self.last_seq)
         } else if self.last_seq > done_seq() {
-            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), [0; OPS], Vec::new(), None, |_| {});
+            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), [0; OPS], Vec::new(), None, false, |_| None);
             self.last_seq = seq;
             self.last_action_seq = seq;
             self.cpu_action_seq = seq;
@@ -11169,6 +11257,11 @@ impl Exec {
         self.held_kinds.get(i).and_then(|&k| HELD_READ_KINDS.get(k as usize)).copied().unwrap_or("?")
     }
 
+    /// Whether it holds recorded work (an open batch or closed ones).
+    pub fn has_held_work(&self) -> bool {
+        self.recording || !self.closed.is_empty()
+    }
+
     /// Batches closed and held (not submitted).
     pub fn closed_count(&self) -> usize {
         self.closed.len()
@@ -11217,16 +11310,11 @@ impl Exec {
             note_copy_waits(false, copy_wait);
             let reset = self.slot_reset(b.slot);
             let own = b.mm_own;
-            let seq = push_batch(fence, queries, bq, b.eager_action.into_iter().collect(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, reset, move |seq| {
+            let seq = push_batch(fence, queries, bq, b.eager_action.into_iter().collect(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, reset, false, move |_| {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
-                    return;
+                    return None;
                 }
-                let r = submit_batch(seq, None, pre, cmd, copy_wait, fence, false);
-                if let Err(e) = r {
-                    if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
-                        crate::error!("gpu[{name}]: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
-                    }
-                }
+                Some(SubmitSpec { xpre: None, pre, cmd, wait: copy_wait, fence, alt: false, name })
             });
             self.slots[b.slot].seq = seq;
             if let Some(o) = &own {
@@ -13211,6 +13299,13 @@ pub fn status() -> String {
         + &super::rgm::status_line(super::FRAMES.load(Ordering::Relaxed))
         + &super::par::status()
         + &super::keep::status()
+        + &format!(
+            "    batches submitted together (`tune submit_coalesce` {}): {} calls with {} batches
+",
+            super::tune::submit_coalesce(),
+            COALESCED[0].load(Ordering::Relaxed),
+            COALESCED[1].load(Ordering::Relaxed)
+        )
         + &format!(
             "    end-of-pipe writes without a full barrier: {} labels, {} timestamps (stored by {} dispatches, {} overwritten in their batch); {} waits ordered the work after them\n",
             EOP_LIGHT[0].load(Ordering::Relaxed),

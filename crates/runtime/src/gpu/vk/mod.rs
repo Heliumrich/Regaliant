@@ -68,6 +68,10 @@ pub struct Ctx {
     /// The distinct queue families buffers are used by (the main queue's,
     /// the copy queue's, the compute queue's).
     pub families: Vec<u32>,
+    /// A timeline semaphore each batch on the main queue signals with its
+    /// sequence (`exec`: batches submitted together, completions waited for
+    /// by value).
+    pub batches: vk::Semaphore,
 }
 
 /// A queue of a compute-only family (`Ctx::compute`).
@@ -488,7 +492,12 @@ fn init_inner() -> Result<(), String> {
             instance.get_physical_device_properties2(pdev, &mut p2);
             pd.max_push_descriptors
         };
+        let batches = {
+            let mut tci = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
+            device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tci), None).map_err(|e| format!("batch timeline semaphore: {e}"))?
+        };
         let ctx = Ctx {
+            batches,
             surface_i: ash::khr::surface::Instance::new(&entry, &instance),
             win32_i: ash::khr::win32_surface::Instance::new(&entry, &instance),
             swapchain_d: ash::khr::swapchain::Device::new(&instance, &device),
@@ -1030,6 +1039,34 @@ impl Ctx {
             _ => self.queue.lock(),
         };
         unsafe { self.device.queue_submit2(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit2: {e}"))
+    }
+
+    /// Submits batches to the main queue in one call, in order: each its
+    /// command buffers, an optional wait for the copy queue's timeline value,
+    /// and a signal of `batches` with its sequence; `fence` on the call (the
+    /// last batch's).
+    pub fn submit_batches(&self, batches: &[(&[vk::CommandBuffer], u64, u64)], fence: vk::Fence) -> Result<(), String> {
+        let cbs: Vec<Vec<vk::CommandBufferSubmitInfo>> = batches.iter().map(|b| b.0.iter().map(|&c| vk::CommandBufferSubmitInfo::default().command_buffer(c)).collect()).collect();
+        let copied = self.copy.as_ref().map(|q| q.copied);
+        let ws: Vec<Vec<vk::SemaphoreSubmitInfo>> = batches
+            .iter()
+            .map(|b| match (copied, b.1) {
+                (Some(s), w) if w > 0 => vec![vk::SemaphoreSubmitInfo::default().semaphore(s).value(w).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)],
+                _ => Vec::new(),
+            })
+            .collect();
+        let ss: Vec<[vk::SemaphoreSubmitInfo; 1]> = batches.iter().map(|b| [vk::SemaphoreSubmitInfo::default().semaphore(self.batches).value(b.2).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)]).collect();
+        let infos: Vec<vk::SubmitInfo2> = (0..batches.len()).map(|k| vk::SubmitInfo2::default().command_buffer_infos(&cbs[k]).wait_semaphore_infos(&ws[k]).signal_semaphore_infos(&ss[k])).collect();
+        let q = self.queue.lock();
+        unsafe { self.device.queue_submit2(*q, &infos, fence) }.map_err(|e| format!("vkQueueSubmit2 ({} batches): {e}", batches.len()))
+    }
+
+    /// Waits until the main queue's batch `seq` completed (`batches`);
+    /// false on a timeout or error.
+    pub fn wait_batch(&self, seq: u64, timeout_ns: u64) -> bool {
+        let s = [self.batches];
+        let v = [seq];
+        unsafe { self.device.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&s).values(&v), timeout_ns) }.is_ok()
     }
 
     /// Submits command buffers that execute in order.

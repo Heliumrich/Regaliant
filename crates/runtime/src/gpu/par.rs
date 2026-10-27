@@ -142,6 +142,9 @@ pub struct Run {
     pub timed: bool,
     /// A long run's own state (`tune long_runs`; None: an ordinary run).
     long: Option<Long>,
+    /// A long run planned right after this one (`chain`): its first chunk's
+    /// turn comes when this run's last chunk is posted.
+    chained: Mutex<Option<Arc<Run>>>,
 }
 
 /// A long parallel run (`tune long_runs`, RENDERER.md "Long parallel
@@ -158,7 +161,7 @@ struct Long {
     /// submitted chunk's and what the main command processor records of the
     /// run (`add_writes`); in the second, those writes but for the planner's
     /// copies (`forward::plan`).
-    writes: Mutex<(super::ranges::Ranges, super::ranges::Ranges)>,
+    writes: Arc<Mutex<(super::ranges::Ranges, super::ranges::Ranges)>>,
     /// Each worker chunk's copies forwarded before it (`forward::inherited`)
     /// and all the run's planned copies (packet -> words).
     inherited: Vec<Vec<super::forward::Planned>>,
@@ -169,7 +172,7 @@ struct Long {
 }
 
 /// Long runs (`tune long_runs`): [runs, commands in them, chunks
-/// committed, dropped at their turn, stopped early, (unused)].
+/// committed, dropped at their turn, stopped early, chained after another].
 pub static LONG: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 static LONG_DROPS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
 static LONG_STOPS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
@@ -200,8 +203,16 @@ pub fn long_line() -> String {
         g.sort_by(|a, b| b.1.cmp(&a.1));
         g.iter().map(|(w, n)| format!("{w} {n}")).collect::<Vec<_>>().join(", ")
     };
+    let cw: Vec<u64> = super::cp::CHAIN_WHY.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    long parallel runs: {} runs ({} commands, {:.0} each), chunks committed {}, dropped at their turn {} ({}), stopped early {} ({})\n",
+        "    long parallel runs (chain_next: not long {}, recorded past {}, held work {}, clears pending {}, planned {}, no run {}, not workers' alone {}): {} runs ({} commands, {:.0} each), chunks committed {}, dropped at their turn {} ({}), stopped early {} ({}); {} chained after the run before\n",
+        cw[0],
+        cw[1],
+        cw[2],
+        cw[3],
+        cw[4],
+        cw[5],
+        cw[6],
         v[0],
         v[1],
         v[1] as f64 / v[0] as f64,
@@ -209,7 +220,8 @@ pub fn long_line() -> String {
         v[3],
         list(&LONG_DROPS),
         v[4],
-        list(&LONG_STOPS)
+        list(&LONG_STOPS),
+        v[5]
     )
 }
 
@@ -241,13 +253,40 @@ impl Run {
             main_submitted,
             timed: false,
             long: None,
+            chained: Mutex::new(None),
         }
+    }
+
+    /// `next` follows this run directly (nothing recorded between them):
+    /// its first chunk's turn comes after this run's last chunk, from that
+    /// chunk's worker, or now when it is posted already.
+    pub fn chain(&self, next: &Arc<Run>) {
+        let mut g = self.chained.lock();
+        *g = Some(next.clone());
+        if self.turn.load(Ordering::Acquire) > self.chunks.len() {
+            next.grant(0);
+        }
+    }
+
+    /// The write log its chunks are checked against (a long run's; a run
+    /// chained after it shares it, `set_long`).
+    pub fn long_writes(&self) -> Option<Arc<Mutex<(super::ranges::Ranges, super::ranges::Ranges)>>> {
+        self.long.as_ref().map(|l| l.writes.clone())
     }
 
     /// Makes it a long run: each worker chunk's predicted labels, and what
     /// the main command processor's batch writes when it was planned.
-    pub fn set_long(&mut self, labels: Vec<std::collections::HashMap<u64, (u64, u8)>>, writes: super::ranges::Ranges, inherited: Vec<Vec<super::forward::Planned>>, planned: Arc<std::collections::HashMap<u64, Arc<[u32]>>>) {
-        self.long = Some(Long { labels, writes: Mutex::new((writes, Default::default())), inherited, planned, bad: AtomicBool::new(false) });
+    pub fn set_long(&mut self, labels: Vec<std::collections::HashMap<u64, (u64, u8)>>, writes: super::ranges::Ranges, inherited: Vec<Vec<super::forward::Planned>>, planned: Arc<std::collections::HashMap<u64, Arc<[u32]>>>, shared: Option<Arc<Mutex<(super::ranges::Ranges, super::ranges::Ranges)>>>) {
+        // A chained run shares its predecessor's log (its chunks come after
+        // all of that run's).
+        let writes = match shared {
+            Some(s) => {
+                s.lock().0.extend(&writes);
+                s
+            }
+            None => Arc::new(Mutex::new((writes, Default::default()))),
+        };
+        self.long = Some(Long { labels, writes, inherited, planned, bad: AtomicBool::new(false) });
     }
 
     /// A long run (`set_long`).
@@ -329,7 +368,8 @@ pub struct Worker {
     cp: Mutex<Cp>,
     /// The run to take chunks of, and whether there is one (what a spinning
     /// worker looks at).
-    job: Mutex<Option<Arc<Run>>>,
+    /// Runs given it, taken in order (chained runs follow each other).
+    job: Mutex<std::collections::VecDeque<Arc<Run>>>,
     has_job: AtomicBool,
     /// Its pool's wake word (`Pool::wake`): an idle worker sleeps on it.
     wake: Arc<AtomicU64>,
@@ -491,7 +531,7 @@ impl Pool {
                 crate::warn!("gpu[{wname}]: no executor for a parallel worker ({e})");
                 return None;
             }
-            let w = Arc::new(Worker { cp: Mutex::new(cp), job: Mutex::new(None), has_job: AtomicBool::new(false), wake: self.wake.clone(), pre: self.pre.clone() });
+            let w = Arc::new(Worker { cp: Mutex::new(cp), job: Mutex::new(Default::default()), has_job: AtomicBool::new(false), wake: self.wake.clone(), pre: self.pre.clone() });
             let w2 = w.clone();
             let tname = wname.clone();
             let r = crate::thread::spawn_host(
@@ -533,8 +573,8 @@ fn run_worker(w: &Worker, name: &str) {
             let seen = w.wake.load(Ordering::Acquire);
             {
                 let mut job = w.job.lock();
-                if let Some(r) = job.take() {
-                    w.has_job.store(false, Ordering::Release);
+                if let Some(r) = job.pop_front() {
+                    w.has_job.store(!job.is_empty(), Ordering::Release);
                     break r;
                 }
             }
@@ -689,8 +729,14 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         run.results.lock()[i] = Some(done);
         run.posted.store(i + 1, Ordering::Release);
         if stopped.is_none() && dropped.is_none() {
-            // The next chunk follows this one's end directly.
+            // The next chunk follows this one's end directly (the last one's:
+            // a run chained after this one).
             run.turn.fetch_max(i + 2, Ordering::AcqRel);
+            if i + 1 == run.chunks.len() {
+                if let Some(n) = run.chained.lock().as_ref() {
+                    n.grant(0);
+                }
+            }
         }
         run.notify();
         lap(4, &mut t);
@@ -703,7 +749,7 @@ impl Worker {
     pub fn give(&self, run: Arc<Run>) {
         run.active.fetch_add(1, Ordering::AcqRel);
         let mut job = self.job.lock();
-        *job = Some(run);
+        job.push_back(run);
         self.has_job.store(true, Ordering::Release);
     }
 }

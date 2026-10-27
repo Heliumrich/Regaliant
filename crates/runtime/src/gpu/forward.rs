@@ -343,6 +343,14 @@ pub fn plan(p: &Prepared, at: u64, groups: [u32; 3], local: [u32; 3], busy: impl
     Some(Planned { at, base, words: words.into(), program: p.addr, hash: p.code_hash, from, old, earlier: v.into() })
 }
 
+impl Planned {
+    /// The same copy as one before all of a run chained after its own
+    /// (`Cp::chain_next`): at packet 0.
+    pub fn before_all(&self) -> Planned {
+        Planned { at: 0, ..self.clone() }
+    }
+}
+
 /// [copies a long run's planner forwarded, copies a worker computed
 /// otherwise than planned].
 pub static PLANNED_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];

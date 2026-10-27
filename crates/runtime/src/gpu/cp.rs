@@ -349,6 +349,10 @@ pub struct Cp {
     main_gfx: bool,
     /// Recording past a parallel run (`tune past_runs`).
     past: Option<Box<Past>>,
+    /// What the next run planned starts with when chained after the last
+    /// one past which this command processor records (`chain_next`): its
+    /// label writes, planned copies and write log.
+    chain_seed: Option<(Vec<RunLabel>, Vec<super::forward::Planned>, Option<Arc<parking_lot::Mutex<(super::ranges::Ranges, super::ranges::Ranges)>>>)>,
     /// Recording past a label wait (`tune past_waits`), and whether such a
     /// stretch is settling (its wait is waited for normally then).
     past_wait: Option<Box<PastWait>>,
@@ -483,6 +487,11 @@ pub struct ChunkState {
     stack: Option<Vec<Vec<u32>>>,
 }
 
+/// `Cp::chain_next` calls by outcome: [the run gone past not long, work
+/// recorded past it, held work in the executor, image clears pending,
+/// planned, no run planned, not a run of the workers' alone].
+pub static CHAIN_WHY: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
 /// A label or timestamp write a long parallel run's planning passed (`tune
 /// long_runs`): its address, value and bytes (0: a timestamp, its value
 /// unknown) and its packet.
@@ -530,6 +539,12 @@ struct ParRun {
     /// `tune cpu_args_base`, leaves them as they were: not compared).
     end_state: Option<ChunkState>,
     end_unknown: Vec<u32>,
+    /// A long run's label writes and planned copies, all of them (a run
+    /// chained after it starts with them: `Cp::chain_next`), and the command
+    /// buffer it lies in.
+    labels: Vec<RunLabel>,
+    planned: Vec<super::forward::Planned>,
+    buf: usize,
 }
 
 /// The graphics command processor recording past a parallel run before
@@ -537,6 +552,9 @@ struct ParRun {
 /// if what it recorded past the run is dropped.
 struct Past {
     pr: ParRun,
+    /// Long runs planned past it, each right after the one before
+    /// (`Cp::chain_next`), in order.
+    chained: Vec<ParRun>,
     end_state: ChunkState,
     end_unknown: Vec<u32>,
     /// The submission's command buffer (`Cp::cur_buf`) the run ended in,
@@ -1724,6 +1742,7 @@ impl Cp {
             held: None,
             main_gfx: name == "gpu-gfx",
             past: None,
+            chain_seed: None,
             past_wait: None,
             settling: false,
             cur_buf: 0,
@@ -2467,7 +2486,10 @@ impl Cp {
         // Its chunks' indirect dispatches read their arguments on the GPU.
         let long = super::tune::long_runs() && self.main_gfx && !self.compute;
         let gpu_dispatch_args = (self.compute || long) && super::tune::gpu_indirect() && !super::capture::capturing() && !super::verify::enabled() && !(super::exec::enabled() && super::emucheck::wanted(self));
-        let mut labels: Vec<RunLabel> = Vec::new();
+        // A run chained after another (`chain_next`): that run's label writes
+        // and copies come before all of this one (at packet 0).
+        let seed = self.chain_seed.take();
+        let mut labels: Vec<RunLabel> = seed.as_ref().map(|s| s.0.iter().map(|l| RunLabel { at: 0, ..*l }).collect()).unwrap_or_default();
         let mut soft = false;
         let mut cpu_wait = false;
         // The run's signature: its packet headers (opcode and size), the
@@ -2680,8 +2702,10 @@ impl Cp {
         let mut st = self.chunk_state();
         let mut stack = if soft { self.ctx_stack.clone() } else { Vec::new() };
         let mut states: Vec<Box<ChunkState>> = Vec::new();
-        // A long run's copies forwarded ahead (`forward::plan`), in order.
-        let mut planned: Vec<super::forward::Planned> = Vec::new();
+        // A long run's copies forwarded ahead (`forward::plan`), in order (a
+        // chained run's predecessor's first).
+        let mut planned: Vec<super::forward::Planned> = seed.as_ref().map(|s| s.1.iter().map(|q| q.before_all()).collect()).unwrap_or_default();
+        let shared = seed.and_then(|s| s.2);
         let mut c = from;
         // (`tune plan_check`: the same a register at a time.)
         let mut check = super::tune::plan_check().then(|| self.chunk_state());
@@ -2827,12 +2851,15 @@ impl Cp {
         let mut run = super::par::Run::new(queue, Arc::new(main_writes), submitted.clone());
         run.timed = timed;
         if let Some(w) = long_writes {
-            if let Some(e) = self.exec.as_mut() {
-                e.rec_begin(&Default::default());
+            // (A chained run has no part of this command processor's.)
+            if shared.is_none() {
+                if let Some(e) = self.exec.as_mut() {
+                    e.rec_begin(&Default::default());
+                }
             }
             let inherited = starts.iter().map(|&s| super::forward::inherited(&planned, s)).collect();
-            let by_packet: HashMap<u64, Arc<[u32]>> = planned.iter().map(|q| (q.at, q.words.clone())).collect();
-            run.set_long(starts.iter().map(|&s| labels_before(&labels, s)).collect(), w, inherited, Arc::new(by_packet));
+            let by_packet: HashMap<u64, Arc<[u32]>> = planned.iter().filter(|q| q.at != 0).map(|q| (q.at, q.words.clone())).collect();
+            run.set_long(starts.iter().map(|&s| labels_before(&labels, s)).collect(), w, inherited, Arc::new(by_packet), shared);
             super::par::LONG[0].fetch_add(1, Ordering::Relaxed);
             super::par::LONG[1].fetch_add(n as u64, Ordering::Relaxed);
         }
@@ -2849,7 +2876,8 @@ impl Cp {
         lap.mark(10);
         super::par::RUNS.fetch_add(1, Ordering::Relaxed);
         super::par::CHUNKS.fetch_add(starts.len() as u64, Ordering::Relaxed);
-        self.par = Some(ParRun { starts, end: run_end, next: 0, run, waited_ns: 0, sync, sig, n, firsts, writes: Default::default(), end_state, end_unknown });
+        let buf = self.cur_buf;
+        self.par = Some(ParRun { starts, end: run_end, next: 0, run, waited_ns: 0, sync, sig, n, firsts, writes: Default::default(), end_state, end_unknown, labels, planned, buf });
         lap.mark(5);
         PLAN_PHASES[6].fetch_add(1, Ordering::Relaxed);
     }
@@ -3135,7 +3163,7 @@ impl Cp {
         let end = pr.end;
         self.set_chunk_state(&end_state);
         let across = self.depth == 1;
-        self.past = Some(Box::new(Past { pr, end_state, end_unknown, buf: self.cur_buf, across, stack: self.ctx_stack.clone(), markers: self.markers.clone(), pred: self.pred.clone(), fence_pending: self.fence_pending, began: Instant::now() }));
+        self.past = Some(Box::new(Past { pr, chained: Vec::new(), end_state, end_unknown, buf: self.cur_buf, across, stack: self.ctx_stack.clone(), markers: self.markers.clone(), pred: self.pred.clone(), fence_pending: self.fence_pending, began: Instant::now() }));
         self.held = Some(Box::new(super::frameahead::HeldCp { frames: u64::MAX, labels: HashMap::new(), stop: None, commands: 0, waits: [0; 5], poll: false }));
         if let Some(e) = self.exec.as_mut() {
             e.past_begin();
@@ -3154,14 +3182,19 @@ impl Cp {
     /// dropped (`Exec::past_drop`) and execution goes on from the run's end
     /// (or a stopped chunk's stop, as `par_collect` would). Returns where.
     fn past_settle(&mut self) -> Option<u64> {
-        let past = self.past.take().unwrap();
+        let mut past = self.past.take().unwrap();
         let held = self.held.take();
-        let (why, at) = held.as_ref().and_then(|h| h.stop).unwrap_or(("stopped", past.pr.end));
+        let last_end = past.chained.last().map_or(past.pr.end, |r| r.end);
+        let (why, at) = held.as_ref().and_then(|h| h.stop).unwrap_or(("stopped", last_end));
         let t = Instant::now();
+        // The run gone past, then the runs chained after it, in order; a
+        // stop in one cancels those after it.
+        let mut runs: std::collections::VecDeque<ParRun> = std::mem::take(&mut past.chained).into();
         let mut pr = past.pr;
         let mut writes = super::ranges::Ranges::new();
         let mut end_state: Option<ChunkState> = None;
         let mut stopped: Option<(u64, ChunkState)> = None;
+        loop {
         while pr.next < pr.starts.len() {
             let i = pr.next;
             pr.next += 1;
@@ -3187,6 +3220,21 @@ impl Cp {
                 break;
             }
             end_state = Some(done.state);
+        }
+        if stopped.is_some() {
+            for r in runs.drain(..) {
+                r.run.cancel();
+                super::par::CANCELLED.fetch_add(1, Ordering::Relaxed);
+            }
+            break;
+        }
+        match runs.pop_front() {
+            Some(next) => {
+                super::par::note_main_wait(pr.waited_ns);
+                pr = next;
+            }
+            None => break,
+        }
         }
         super::par::note_main_wait(pr.waited_ns);
         super::par::PAST[3].fetch_add(held.as_ref().map_or(0, |h| h.commands), Ordering::Relaxed);
@@ -3226,6 +3274,9 @@ impl Cp {
         self.pred = past.pred;
         self.fence_pending = past.fence_pending;
         self.drop_ahead();
+        // (The command buffer the stop or the last run's end is in.)
+        let stopped_buf = stopped.as_ref().map(|_| pr.buf);
+        let last_buf = pr.buf;
         let to = match stopped {
             Some((s, st)) => {
                 self.set_chunk_state(&st);
@@ -3248,10 +3299,70 @@ impl Cp {
             }
         };
         // The run ended in an earlier command buffer: the worker goes back.
-        if past.buf != self.cur_buf {
-            self.rewind = Some((past.buf, to));
+        let buf = if stopped_buf.is_some() { stopped_buf.unwrap() } else { last_buf };
+        if buf != self.cur_buf {
+            self.rewind = Some((buf, to));
             return None;
         }
+        Some(to)
+    }
+
+    /// Past a long run with nothing recorded since (`tune long_runs`): the
+    /// long run starting at `cur` is planned now and chained after the last
+    /// one gone past (its first chunk's turn comes after that run's last;
+    /// its chunks start with that run's label writes and copies and are
+    /// checked against the same write log), and this command processor goes
+    /// on past it too. Returns where (None: not chained; it settles first).
+    fn chain_next(&mut self, f: &Fetched, cur: u64, end: u64) -> Option<u64> {
+        if !super::tune::long_runs() || !self.main_gfx {
+            return None;
+        }
+        let why = if !self.past.as_ref().is_some_and(|p| p.chained.last().unwrap_or(&p.pr).run.is_long()) {
+            0
+        } else if !self.held.as_ref().is_some_and(|h| h.commands == 0 && h.stop.is_none()) {
+            1
+        } else if !self.exec.as_ref().is_some_and(|e| !e.has_held_work()) {
+            2
+        } else if super::images::with(|im| !im.pending_clear_keys().is_empty()) {
+            3
+        } else {
+            4
+        };
+        CHAIN_WHY[why].fetch_add(1, Ordering::Relaxed);
+        if why != 4 {
+            return None;
+        }
+        let last = {
+            let p = self.past.as_ref().unwrap();
+            p.chained.last().unwrap_or(&p.pr)
+        };
+        self.chain_seed = Some((last.labels.clone(), last.planned.clone(), last.run.long_writes()));
+        // (Planning is done unheld; the planner's own executor records
+        // nothing for a long run.)
+        let held = self.held.take();
+        self.par_plan(f, cur, end);
+        self.held = held;
+        self.chain_seed = None;
+        let Some(pr) = self.par.take() else {
+            CHAIN_WHY[5].fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        if pr.starts.first() != Some(&cur) || !pr.run.is_long() || pr.end_state.is_none() {
+            CHAIN_WHY[6].fetch_add(1, Ordering::Relaxed);
+            // Not a long run of the workers' alone: given back to be
+            // collected as usual (it starts here).
+            self.par = Some(pr);
+            return None;
+        }
+        let p = self.past.as_mut().unwrap();
+        p.chained.last().unwrap_or(&p.pr).run.chain(&pr.run);
+        let st = pr.end_state.clone().unwrap();
+        p.end_state = st.clone();
+        p.end_unknown = pr.end_unknown.clone();
+        let to = pr.end;
+        p.chained.push(pr);
+        self.set_chunk_state(&st);
+        super::par::LONG[5].fetch_add(1, Ordering::Relaxed);
         Some(to)
     }
 
@@ -4831,6 +4942,12 @@ impl Cp {
             }
             let skip = self.par_skip.0 == end && cur < self.par_skip.1;
             if self.past.is_some() && self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && super::par::workers() > 0 && self.par_would_split(&f, cur, end) {
+                // A long run right after the one(s) gone past, nothing recorded
+                // between: planned now, chained after them (`chain_next`).
+                if let Some(c) = self.chain_next(&f, cur, end) {
+                    cur = c;
+                    continue;
+                }
                 // The next parallel run: planned once this one is collected.
                 self.held_stop("next run", cur);
                 match self.past_settle() {
