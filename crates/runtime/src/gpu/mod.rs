@@ -2947,6 +2947,7 @@ pub fn reset_profile() {
     threadcpu::reset_window();
     crate::audio::reset_window();
     crate::guestprof::reset();
+    fe2::reset_callers();
 }
 
 /// The profile so far (`profile report` control command).
@@ -2959,6 +2960,7 @@ pub fn profile_report() -> String {
     s.push_str(&cp::classes_line());
     s.push_str(&exec::race_line());
     s.push_str(&forward::status_line());
+    s.push_str(&fe2::callers_line());
     s.push_str(&crate::hle::kernel::timeouts_line());
     s.push_str(&cp::long_waits_line());
     s.push_str(&cp::past_wait_status());

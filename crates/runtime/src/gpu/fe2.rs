@@ -23,8 +23,9 @@
 //!   old (protecting a new import's pages lost the device: FINDINGS.md
 //!   2026-10-26) are armed read-only through the host; while the host's bit
 //!   stays set (no write fault, disarm or mapping change since) such a page
-//!   needs no take. GPU writes do not fault and need none: M holds them
-//!   (`DS_FE2_ARM_GPU=0`: pages GPU work writes are never armed). Each fault
+//!   needs no take. Pages GPU work writes are not armed (they are the
+//!   pages the GPU writes through their imports; `DS_FE2_ARM_GPU=1`: armed
+//!   too, as GPU writes do not fault and M holds them). Each fault
 //!   stops the whole process for 15-50 us: a thread reads the faults the
 //!   host answered (`watch`), and a 64 MiB chunk with CHUNK_BURST of them
 //!   within BURST_MS (or with some while all chunks together had ALL_BURST:
@@ -74,7 +75,10 @@ const CHUNK_BURST: u32 = 16;
 const ALL_BURST: u32 = 64;
 const BURST_MS: u128 = 100;
 const CHUNK_HOLD: u64 = 60;
-const CHUNK_HOLD_MAX_LEVEL: u8 = 5;
+/// (5 until 2026-10-27 late night: holds of up to 1,920 flips after a load
+/// left its pools unarmed long after it, their ranges taken every epoch;
+/// the pages' own doubling keeps rewritten ones unarmed.)
+const CHUNK_HOLD_MAX_LEVEL: u8 = 2;
 const HOLD_MEMORY: u64 = 600;
 /// Flips an import window exists before pages in it are armed.
 pub const SETTLE: u64 = 60;
@@ -96,7 +100,7 @@ struct Chunk {
     valid: [AtomicU64; WORDS],
     /// Armed by us through the host (the host's bit says whether still).
     armed: [AtomicU64; WORDS],
-    /// Written by GPU work (never armed with `DS_FE2_ARM_GPU=0`).
+    /// Written by GPU work (never armed, unless `DS_FE2_ARM_GPU=1`).
     gpu: [AtomicU64; WORDS],
     /// The epoch every valid page of the word was found clean in (a take
     /// over the whole word), else 0.
@@ -110,9 +114,15 @@ struct Chunk {
     /// Armings of the page that ended in a write (each doubles the quiet
     /// time before the next).
     level: Box<[AtomicU8]>,
-    /// Epochs a take found the page clean in since its last write (at most
-    /// ARM_USES).
-    uses: Box<[AtomicU8]>,
+    /// Epochs a take looked at the word in since a write to one of its pages
+    /// was last found (at most ARM_USES), and the last epoch counted. (Per
+    /// page until 2026-10-27 late night: every take over a pool of ~113 MB
+    /// then updated ~27,000 pages one by one.)
+    uses: [AtomicU8; WORDS],
+    use_ep: [AtomicU32; WORDS],
+    /// Pages whose `wrote` is set (a page seen for the first time counts as
+    /// written then: `set_clean`).
+    seen: [AtomicU64; WORDS],
     /// Bumped by every invalidation in the chunk and every arming that
     /// ended there (the summary below goes with it).
     cgen: AtomicU32,
@@ -130,28 +140,89 @@ struct Chunk {
 /// `Chunk::sum`'s epoch part when every page of the chunk is armed.
 const SUM_ARMED: u32 = u32::MAX;
 
-/// Bumped by every invalidation and every arming that ended (anywhere):
-/// unchanged, and with the host's events unchanged (`hosted::all_events`),
-/// a range found to need no check still needs none (in the same epoch, or
-/// in any while every page of it is armed).
-static GEN: AtomicU64 = AtomicU64::new(0);
-
 /// Ranges per thread whose last check found every page fine (`RANGES`).
 const RANGE_CACHE: usize = 32;
+/// Ranges over more chunks or host leaves than these are not kept there.
+const FINE_CHUNKS: usize = 8;
+const FINE_LEAVES: usize = 5;
+
+/// A range a thread found needing no check: the generations of the chunks
+/// it covers (`Chunk::cgen`: every invalidation and ended arming there bumps
+/// them) and the host's events of its leaves (`hosted::leaf_events`) as
+/// they were before that check, and its epoch (SUM_ARMED: every page was
+/// armed, any epoch). While they are unchanged it still needs none. (Until
+/// 2026-10-27 late night one generation over the whole span: queue 0x50's
+/// pools of ~113 MB were scanned again after any invalidation anywhere,
+/// ~3 us a binding.)
+#[derive(Clone, Copy)]
+struct Fine {
+    lo: u64,
+    hi: u64,
+    gens: [u32; FINE_CHUNKS],
+    host: [u64; FINE_LEAVES],
+    ep: u32,
+    /// Its words were marked GPU-written (a written binding's check).
+    marked: bool,
+}
 
 thread_local! {
-    /// This thread's ranges found fine: (lo, hi, GEN, host events, epoch or
-    /// SUM_ARMED), most recent first.
-    static RANGES: std::cell::RefCell<Vec<(u64, u64, u64, u64, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// This thread's ranges found fine, most recent first.
+    static RANGES: std::cell::RefCell<Vec<Fine>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The generations of the chunks over [lo, hi) and the host's events of its
+/// leaves (None: more than FINE_CHUNKS or FINE_LEAVES of them).
+#[inline]
+fn snapshot(lo: u64, hi: u64) -> Option<([u32; FINE_CHUNKS], [u64; FINE_LEAVES])> {
+    let (c0, c1) = (((lo - MIRROR_BASE) >> CHUNK_SHIFT) as usize, ((hi - 1 - MIRROR_BASE) >> CHUNK_SHIFT) as usize);
+    if c1 - c0 >= FINE_CHUNKS {
+        return None;
+    }
+    let mut gens = [0u32; FINE_CHUNKS];
+    for (k, g) in (c0..=c1).zip(gens.iter_mut()) {
+        let p = TABLE[k].load(Ordering::Acquire);
+        // (A chunk made later starts at generation 0.)
+        if !p.is_null() {
+            *g = unsafe { &*p }.cgen.load(Ordering::Acquire);
+        }
+    }
+    let mut host = [0u64; FINE_LEAVES];
+    let mut a = lo;
+    let mut k = 0;
+    while a < hi {
+        if k == FINE_LEAVES {
+            return None;
+        }
+        host[k] = crate::hosted::leaf_events(a);
+        k += 1;
+        a = crate::hosted::leaf_end(a);
+    }
+    Some((gens, host))
 }
 
 /// Whether [lo, hi) lies in a range this thread found fine and nothing
-/// changed since.
+/// changed there since.
 #[inline]
-fn range_fine(lo: u64, hi: u64, g: u64, h: u64, ep: u32) -> bool {
+fn range_fine(lo: u64, hi: u64, ep: u32, marked: bool) -> bool {
     RANGES.with(|r| {
         let mut r = r.borrow_mut();
-        let Some(i) = r.iter().position(|&(a, b, rg, rh, re)| a <= lo && hi <= b && rg == g && rh == h && (re == ep || re == SUM_ARMED)) else { return false };
+        let Some(i) = r.iter().position(|f| f.lo <= lo && hi <= f.hi && (f.marked || !marked) && (f.ep == ep || f.ep == SUM_ARMED) && snapshot(f.lo, f.hi).is_some_and(|(g, h)| g == f.gens && h == f.host)) else {
+            if callers_on() {
+                // Why not (the closest reason among the ranges covering it).
+                let covering: Vec<&Fine> = r.iter().filter(|f| f.lo <= lo && hi <= f.hi && (f.marked || !marked)).collect();
+                let why = if covering.is_empty() {
+                    C_NO_RANGE
+                } else if !covering.iter().any(|f| f.ep == ep || f.ep == SUM_ARMED) {
+                    C_EPOCH
+                } else if covering.iter().any(|f| snapshot(f.lo, f.hi).is_some_and(|(g, _)| g == f.gens)) {
+                    C_HOST
+                } else {
+                    C_GENS
+                };
+                caller_count(why, 1);
+            }
+            return false;
+        };
         if i > 0 {
             let e = r.remove(i);
             r.insert(0, e);
@@ -160,11 +231,68 @@ fn range_fine(lo: u64, hi: u64, g: u64, h: u64, ep: u32) -> bool {
     })
 }
 
-fn note_range_fine(lo: u64, hi: u64, g: u64, h: u64, e: u32) {
+/// `DS_FE2_CALLERS=1` (diagnosis): placement checks counted by caller
+/// (`set_caller`), with why the range cache missed.
+pub fn callers_on() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_FE2_CALLERS").ok().as_deref() == Some("1"))
+}
+
+const CALLER_NAMES: [&str; 4] = ["graphics CP", "its parallel workers", "queue 0x50", "other compute queues"];
+/// Per caller: [checks, range-cache hits, misses with no range covering,
+/// misses on another epoch, misses on chunk generations, misses on host
+/// events, words scanned, takes, TSC cycles in all, placements (the
+/// executor's `fe2_place`), their TSC cycles].
+static BY_CALLER: [[AtomicU64; 11]; 4] = [const { [const { AtomicU64::new(0) }; 11] }; 4];
+const C_PLACES: usize = 9;
+const C_PLACE_CYCLES: usize = 10;
+
+/// Clears the checks by caller (`profile reset`).
+pub fn reset_callers() {
+    for c in BY_CALLER.iter().flatten() {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
+/// A placement took `cycles` (TSC; `DS_FE2_CALLERS`).
+pub fn note_place(cycles: u64) {
+    caller_count(C_PLACES, 1);
+    caller_count(C_PLACE_CYCLES, cycles);
+}
+const C_CHECKS: usize = 0;
+const C_HITS: usize = 1;
+const C_NO_RANGE: usize = 2;
+const C_EPOCH: usize = 3;
+const C_GENS: usize = 4;
+const C_HOST: usize = 5;
+const C_WORDS: usize = 6;
+const C_TAKES: usize = 7;
+const C_CYCLES: usize = 8;
+
+thread_local! {
+    static CALLER: std::cell::Cell<usize> = const { std::cell::Cell::new(3) };
+}
+
+/// The caller class of an executor named `name` (`DS_FE2_CALLERS`).
+pub fn set_caller(name: &str) {
+    let k = match name {
+        "gpu-gfx" => 0,
+        n if n.starts_with("gpu-gfx-par") => 1,
+        "gpu-acb0x50" => 2,
+        _ => 3,
+    };
+    CALLER.with(|c| c.set(k));
+}
+
+fn caller_count(what: usize, n: u64) {
+    BY_CALLER[CALLER.with(|c| c.get())][what].fetch_add(n, Ordering::Relaxed);
+}
+
+fn note_range_fine(lo: u64, hi: u64, gens: [u32; FINE_CHUNKS], host: [u64; FINE_LEAVES], ep: u32, marked: bool) {
     RANGES.with(|r| {
         let mut r = r.borrow_mut();
-        r.retain(|&(a, b, ..)| !(lo <= a && b <= hi));
-        r.insert(0, (lo, hi, g, h, e));
+        r.retain(|f| !(lo <= f.lo && f.hi <= hi && (marked || !f.marked)));
+        r.insert(0, Fine { lo, hi, gens, host, ep, marked });
         r.truncate(RANGE_CACHE);
     })
 }
@@ -187,12 +315,16 @@ pub fn defer_checks() -> bool {
     *W.get_or_init(|| std::env::var("DS_FE2_DEFER").ok().as_deref() == Some("1"))
 }
 
-/// Pages GPU work writes are armed like others (`DS_FE2_ARM_GPU=0`: never):
-/// GPU writes reach guest memory by the write-back, which does not fault,
-/// and M holds them already.
+/// `DS_FE2_ARM_GPU=1`: pages GPU work writes are armed like others (GPU
+/// writes reach guest memory by the write-back, which does not fault, and M
+/// holds them already). Off by default: they are the pages the GPU writes
+/// through their imports (write-backs, labels, timestamps), and the two GPU
+/// timeouts of 2026-10-27 late night (driver resets, nvlddmkm 153) came in
+/// the builds that armed them; protecting an import's pages before the
+/// driver pinned them lost the device before (FINDINGS.md 2026-10-26).
 fn arm_gpu() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *W.get_or_init(|| std::env::var("DS_FE2_ARM_GPU").ok().as_deref() != Some("0"))
+    *W.get_or_init(|| std::env::var("DS_FE2_ARM_GPU").ok().as_deref() == Some("1"))
 }
 
 /// Where pages may be armed (the executor's import list): calls its third
@@ -243,7 +375,9 @@ fn make_chunk(slot: &'static AtomicPtr<Chunk>) -> &'static Chunk {
         clean: (0..CHUNK_PAGES).map(|_| AtomicU32::new(0)).collect(),
         wrote: (0..CHUNK_PAGES).map(|_| AtomicU32::new(0)).collect(),
         level: (0..CHUNK_PAGES).map(|_| AtomicU8::new(0)).collect(),
-        uses: (0..CHUNK_PAGES).map(|_| AtomicU8::new(0)).collect(),
+        uses: std::array::from_fn(|_| AtomicU8::new(0)),
+        use_ep: std::array::from_fn(|_| AtomicU32::new(0)),
+        seen: std::array::from_fn(|_| AtomicU64::new(0)),
         cgen: AtomicU32::new(0),
         sum: AtomicU64::new(0),
         sum_host: AtomicU64::new(0),
@@ -413,24 +547,45 @@ thread_local! {
 /// where `armable` allows: the import window over them is settled), and
 /// those M lacks are uploaded by `upload(a, b)` (the GPU copy of guest
 /// [a, b) into M, recorded into the caller's prologue; false: it could not).
-/// `gpu_writes`: GPU work will write the range (its pages are never armed).
+/// `gpu_writes`: GPU work will write the range (its pages are marked so,
+/// and never armed; with `DS_FE2_ARM_GPU=1` it is checked like any).
 /// Err: an upload failed (M lacks some of the range).
 /// With `defer`, runs that need a take are appended there instead (the
 /// caller counts their pages as its batch's own until `resolve` at its
 /// close).
-pub fn ensure(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, mut defer: Option<&mut Vec<(u64, u64)>>) -> Result<(), &'static str> {
+pub fn ensure(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, defer: Option<&mut Vec<(u64, u64)>>) -> Result<(), &'static str> {
+    if !callers_on() {
+        return ensure_inner(lo, hi, ep, gpu_writes, mine, upload, armable, defer);
+    }
+    let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+    caller_count(C_CHECKS, 1);
+    let r = ensure_inner(lo, hi, ep, gpu_writes, mine, upload, armable, defer);
+    caller_count(C_CYCLES, unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0));
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_inner(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, mut defer: Option<&mut Vec<(u64, u64)>>) -> Result<(), &'static str> {
     STATS[S_ENSURES].fetch_add(1, Ordering::Relaxed);
     STATS[S_ENSURE_PAGES].fetch_add((hi - lo) / PAGE, Ordering::Relaxed);
     let class = &BY_SIZE[size_class((hi - lo) / PAGE)];
     class[0].fetch_add(1, Ordering::Relaxed);
     class[1].fetch_add((hi - lo) / PAGE, Ordering::Relaxed);
-    // (Before the scan: a change during it shows as a new value.)
-    let (g0, h0) = (GEN.load(Ordering::Acquire), crate::hosted::all_events());
-    if !gpu_writes && range_fine(lo, hi, g0, h0, ep) {
+    // Written ranges mark their pages GPU-written (kept unarmed) unless
+    // `DS_FE2_ARM_GPU=1`; a range found fine with its marks set passes the
+    // cache like a read one (marking every word on every use, ~430 words
+    // for a pool of ~113 MB, made queue 0x50's dispatches slow).
+    let gpu_writes = gpu_writes && !arm_gpu();
+    if range_fine(lo, hi, ep, gpu_writes) {
         STATS[S_RANGE_HITS].fetch_add(1, Ordering::Relaxed);
         STATS[S_FAST].fetch_add(1, Ordering::Relaxed);
+        if callers_on() {
+            caller_count(C_HITS, 1);
+        }
         return Ok(());
     }
+    // (Before the scan: a change during it shows as a new value.)
+    let snap = snapshot(lo, hi);
     SCRATCH.with(|s| {
         let mut s = s.borrow_mut();
         let (bad, written) = &mut *s;
@@ -445,6 +600,8 @@ pub fn ensure(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) ->
         // page passed for being the caller's upload.
         let mut all_armed = true;
         let mut mine_none = true;
+        // (Words looked at: `DS_FE2_CALLERS`.)
+        let mut words = 0u64;
         while a < hi {
             if a & (CHUNK_BYTES - 1) == 0 && a + CHUNK_BYTES <= hi {
                 let c = chunk(a, true).expect("inside the span");
@@ -461,6 +618,7 @@ pub fn ensure(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) ->
             let e = word_end(a, hi);
             let c = chunk(a, true).expect("inside the span");
             let w = idx(a) / 64;
+            words += 1;
             if gpu_writes {
                 c.gpu[w].fetch_or(word_mask(a, e), Ordering::AcqRel);
             }
@@ -518,12 +676,15 @@ pub fn ensure(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) ->
                 }
             }
         }
+        if callers_on() {
+            caller_count(C_WORDS, words);
+        }
         if bad.is_empty() {
             STATS[S_FAST].fetch_add(1, Ordering::Relaxed);
             // (Not for ranges with pages the caller's batch uploaded: they are
             // fine for its batch only, until it is queued.)
-            if mine_none {
-                note_range_fine(lo, hi, g0, h0, if all_armed { SUM_ARMED } else { ep });
+            if let (true, Some((gens, host))) = (mine_none, snap) {
+                note_range_fine(lo, hi, gens, host, if all_armed { SUM_ARMED } else { ep }, gpu_writes);
             }
             return Ok(());
         }
@@ -593,6 +754,9 @@ fn take_run(a: u64, b: u64, frame: u64, arm: bool, armable: &Armable, written: &
     let tns = tt.elapsed().as_nanos() as u64;
     STATS[S_TAKE_NS].fetch_add(tns, Ordering::Relaxed);
     STATS[S_TAKES].fetch_add(1, Ordering::Relaxed);
+    if callers_on() {
+        caller_count(C_TAKES, 1);
+    }
     class[2].fetch_add(1, Ordering::Relaxed);
     class[3].fetch_add(tns, Ordering::Relaxed);
     STATS[S_TAKE_WRITTEN].fetch_add(written.len() as u64, Ordering::Relaxed);
@@ -605,30 +769,47 @@ fn take_run(a: u64, b: u64, frame: u64, arm: bool, armable: &Armable, written: &
 /// Uploads the pages of [a, b) M lacks (not `mine`) and marks its valid
 /// pages clean in epoch `ep` (after its take).
 fn fix_run(a: u64, b: u64, ep: u32, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool) -> Result<(), &'static str> {
-    // Uploads of the pages M lacks.
+    // Uploads of the pages M lacks, as runs of consecutive ones (word by
+    // word: only the invalid pages are looked at one by one).
     let mut failed = false;
+    let mut run: Option<(u64, u64)> = None;
+    let mut flush = |run: &mut Option<(u64, u64)>, failed: &mut bool| {
+        if let Some((x, y)) = run.take() {
+            if !upload(x, y) {
+                // (The rest of the range is still made current.)
+                STATS[S_UPLOAD_FAILED].fetch_add(1, Ordering::Relaxed);
+                *failed = true;
+            } else {
+                STATS[S_UPLOADS].fetch_add(1, Ordering::Relaxed);
+                STATS[S_UPLOAD_PAGES].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+            }
+        }
+    };
     let mut x = a;
     while x < b {
+        let e = word_end(x, b);
         let c = chunk(x, true).expect("inside the span");
-        let i = idx(x);
-        if c.valid[i / 64].load(Ordering::Acquire) >> (i % 64) & 1 != 0 || mine(x) {
-            x += PAGE;
-            continue;
+        let lacks = word_mask(x, e) & !c.valid[idx(x) / 64].load(Ordering::Acquire);
+        let wa = x & !(64 * PAGE - 1);
+        let mut r = lacks;
+        while r != 0 {
+            let p = wa + r.trailing_zeros() as u64 * PAGE;
+            r &= r - 1;
+            if mine(p) {
+                flush(&mut run, &mut failed);
+                continue;
+            }
+            match run.as_mut() {
+                Some(l) if l.1 == p => l.1 = p + PAGE,
+                _ => {
+                    flush(&mut run, &mut failed);
+                    run = Some((p, p + PAGE));
+                }
+            }
         }
-        let mut y = x + PAGE;
-        while y < b && !mine(y) && chunk(y, true).is_some_and(|c| c.valid[idx(y) / 64].load(Ordering::Acquire) >> (idx(y) % 64) & 1 == 0) {
-            y += PAGE;
-        }
-        if !upload(x, y) {
-            // (The rest of the run is still made current.)
-            STATS[S_UPLOAD_FAILED].fetch_add(1, Ordering::Relaxed);
-            failed = true;
-        } else {
-            STATS[S_UPLOADS].fetch_add(1, Ordering::Relaxed);
-            STATS[S_UPLOAD_PAGES].fetch_add((y - x) / PAGE, Ordering::Relaxed);
-        }
-        x = y;
+        x = e;
     }
+    flush(&mut run, &mut failed);
     // Valid pages are clean in this epoch (uploaded ones become valid when
     // the caller's batch is queued: `uploaded`).
     set_clean(a, b, ep, false);
@@ -720,28 +901,29 @@ fn set_clean(a: u64, b: u64, ep: u32, validate: bool) {
         let (i, w) = (idx(x), idx(x) / 64);
         let mask = word_mask(x, e);
         // A whole word goes by its stamp (`word_ok` reads the pages' own only
-        // when the word's is older); a take's first look at the word in this
-        // epoch counts as a use of its pages.
+        // when the word's is older).
         let whole = mask == u64::MAX;
-        let first_look = c.wclean[w].load(Ordering::Acquire) != ep;
-        for k in i..i + ((e - x) / PAGE) as usize {
-            if !whole {
-                let old = c.clean[k].swap(ep, Ordering::AcqRel);
-                if !validate && old != ep {
-                    let u = &c.uses[k];
-                    if u.load(Ordering::Relaxed) < ARM_USES {
-                        u.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            } else if !validate && first_look {
-                let u = &c.uses[k];
-                if u.load(Ordering::Relaxed) < ARM_USES {
-                    u.fetch_add(1, Ordering::Relaxed);
-                }
+        if !whole {
+            for k in i..i + ((e - x) / PAGE) as usize {
+                c.clean[k].store(ep, Ordering::Release);
             }
-            if c.wrote[k].load(Ordering::Relaxed) == 0 {
+        }
+        // A take's first look at the word in this epoch counts as a use.
+        if !validate && c.use_ep[w].swap(ep, Ordering::AcqRel) != ep {
+            let u = &c.uses[w];
+            if u.load(Ordering::Relaxed) < ARM_USES {
+                u.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let unseen = mask & !c.seen[w].load(Ordering::Acquire);
+        if unseen != 0 {
+            let mut r = unseen;
+            while r != 0 {
+                let k = w * 64 + r.trailing_zeros() as usize;
+                r &= r - 1;
                 let _ = c.wrote[k].compare_exchange(0, f, Ordering::AcqRel, Ordering::Relaxed);
             }
+            c.seen[w].fetch_or(unseen, Ordering::AcqRel);
         }
         if validate {
             c.valid[w].fetch_or(mask, Ordering::AcqRel);
@@ -767,7 +949,6 @@ fn note_arming_ended(a: u64, b: u64) {
             if gone != 0 {
                 c.armed[w].fetch_and(!gone, Ordering::AcqRel);
                 c.cgen.fetch_add(1, Ordering::AcqRel);
-                GEN.fetch_add(1, Ordering::AcqRel);
                 let base = w * 64;
                 let mut r = gone;
                 while r != 0 {
@@ -824,7 +1005,7 @@ fn host_writing(a: u64, b: u64) -> bool {
 }
 
 /// Arms the quiet pages of [a, b) not armed now (nor written by GPU work,
-/// with `DS_FE2_ARM_GPU=0`) outside held chunks, by runs inside settled
+/// unless `DS_FE2_ARM_GPU=1`) outside held chunks, by runs inside settled
 /// import windows (`armable`), plain read-write memory only.
 fn try_arm(a: u64, b: u64, frame: u64, armable: &Armable) {
     let arm_gpu = arm_gpu();
@@ -847,7 +1028,7 @@ fn try_arm(a: u64, b: u64, frame: u64, armable: &Armable) {
         if wrote == 0 || frame.saturating_sub(wrote - 1) < need {
             return Some(R_QUIET);
         }
-        if c.uses[i].load(Ordering::Relaxed) < ARM_USES {
+        if c.uses[w].load(Ordering::Relaxed) < ARM_USES {
             return Some(R_USES);
         }
         None
@@ -871,7 +1052,7 @@ fn try_arm(a: u64, b: u64, frame: u64, armable: &Armable) {
 }
 
 /// Pages checked by takes that were not armed, by reason: armed already
-/// (by us, its host bit set), written by GPU work (`DS_FE2_ARM_GPU=0`),
+/// (by us, its host bit set), written by GPU work (`DS_FE2_ARM_GPU`),
 /// written within their quiet time, found clean in fewer than ARM_USES
 /// epochs, outside settled import windows, not plain read-write (or a file
 /// read in progress), in a chunk held after a burst of faults, the import
@@ -946,12 +1127,11 @@ fn watch() {
             if c.armed[w].fetch_and(!bit, Ordering::AcqRel) & bit != 0 {
                 let _ = c.level[i].fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some((v + 1).min(ARM_MAX_LEVEL)));
                 c.cgen.fetch_add(1, Ordering::AcqRel);
-                GEN.fetch_add(1, Ordering::AcqRel);
                 FAULTS[F_ENDED].fetch_add(1, Ordering::Relaxed);
                 STATS[S_ARM_ENDED].fetch_add(1, Ordering::Relaxed);
             }
             c.wrote[i].store(frame as u32 + 1, Ordering::Release);
-            c.uses[i].store(0, Ordering::Relaxed);
+            c.uses[w].store(0, Ordering::Relaxed);
             let k = ((page - MIRROR_BASE) >> CHUNK_SHIFT) as usize;
             if counts[k] == 0 {
                 touched.push(k);
@@ -1033,7 +1213,6 @@ fn burst(k: usize, n: u32, total: u32, frame: u64) {
             crate::hosted::disarm(p, q - p);
         }
         c.cgen.fetch_add(1, Ordering::AcqRel);
-        GEN.fetch_add(1, Ordering::AcqRel);
     }
     let b = FAULTS[F_BURSTS].fetch_add(1, Ordering::Relaxed);
     FAULTS[F_DISARMED].fetch_add(pages, Ordering::Relaxed);
@@ -1181,9 +1360,8 @@ pub fn cpu_written(pages: &[u64]) {
         c.valid[w].fetch_and(!(1u64 << (i % 64)), Ordering::AcqRel);
         c.wgen[w].fetch_add(1, Ordering::AcqRel);
         c.cgen.fetch_add(1, Ordering::AcqRel);
-        GEN.fetch_add(1, Ordering::AcqRel);
         c.wrote[i].store(f, Ordering::Release);
-        c.uses[i].store(0, Ordering::Relaxed);
+        c.uses[w].store(0, Ordering::Relaxed);
         n += 1;
     }
     STATS[S_INVAL_TAKEN].fetch_add(n, Ordering::Relaxed);
@@ -1211,11 +1389,10 @@ pub fn invalidate(base: u64, len: u64) {
             c.valid[w].fetch_and(!word_mask(x, e), Ordering::AcqRel);
             c.wgen[w].fetch_add(1, Ordering::AcqRel);
             c.cgen.fetch_add(1, Ordering::AcqRel);
-            GEN.fetch_add(1, Ordering::AcqRel);
             for k in idx(x)..idx(x) + ((e - x) / PAGE) as usize {
                 c.wrote[k].store(f, Ordering::Release);
-                c.uses[k].store(0, Ordering::Relaxed);
             }
+            c.uses[w].store(0, Ordering::Relaxed);
             x = e;
         } else {
             // No chunk: nothing valid in it.
@@ -1522,5 +1699,35 @@ pub fn status() -> String {
             .map(|(n, c)| format!("{n} {}", c.load(Ordering::Relaxed)))
             .collect::<Vec<_>>()
             .join(", "),
-    )
+    ) + &callers_line()
+}
+
+/// The placement checks by caller (`DS_FE2_CALLERS=1`; "" otherwise).
+pub fn callers_line() -> String {
+    if !callers_on() {
+        return String::new();
+    }
+    let hz = super::threadcpu::tsc_hz();
+    let parts: Vec<String> = CALLER_NAMES
+        .iter()
+        .zip(BY_CALLER.iter())
+        .map(|(n, c)| {
+            let v: Vec<u64> = c.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+            format!(
+                "{n}: {} placements ({:.1} ms), {} checks ({} by the range cache; missed: no range {}, another epoch {}, chunk generations {}, host events {}), {} words scanned, {} takes, {:.1} ms",
+                v[C_PLACES],
+                v[C_PLACE_CYCLES] as f64 * 1e3 / hz,
+                v[C_CHECKS],
+                v[C_HITS],
+                v[C_NO_RANGE],
+                v[C_EPOCH],
+                v[C_GENS],
+                v[C_HOST],
+                v[C_WORDS],
+                v[C_TAKES],
+                v[C_CYCLES] as f64 * 1e3 / hz
+            )
+        })
+        .collect();
+    format!("    front end 2's checks by caller: {}\n", parts.join("; "))
 }

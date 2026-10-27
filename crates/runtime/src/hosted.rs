@@ -230,11 +230,11 @@ fn leaf_of(a: u64) -> usize {
     ((a - crate::mem::GUEST_BASE) / PAGE / LEAF_PAGES) as usize
 }
 
-/// Armed bits cleared so far anywhere (0 when not hosted): unchanged, no
-/// armed page lost its bit.
+/// The end of the 128 MiB of guest space holding `a` (`leaf_events`' unit).
 #[inline]
-pub fn all_events() -> u64 {
-    shared().map_or(0, |s| s.all_events.load(Ordering::Acquire))
+pub fn leaf_end(a: u64) -> u64 {
+    let leaf = PAGE * LEAF_PAGES;
+    crate::mem::GUEST_BASE + ((a.max(crate::mem::GUEST_BASE) - crate::mem::GUEST_BASE) / leaf + 1) * leaf
 }
 
 /// Armed bits cleared so far in the 128 MiB of guest space holding `a`

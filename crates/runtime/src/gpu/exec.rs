@@ -8410,6 +8410,17 @@ impl Exec {
     /// reaching past the end of its mapping is placed up to there (the rest
     /// reads 0). None: nothing of it is mapped, or no video memory.
     fn fe2_place(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
+        if !super::fe2::callers_on() {
+            return self.fe2_place_inner(base, size, written);
+        }
+        super::fe2::set_caller(&self.name);
+        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+        let r = self.fe2_place_inner(base, size, written);
+        super::fe2::note_place(unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0));
+        r
+    }
+
+    fn fe2_place_inner(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
         use super::resident::{MIRROR_BASE, PAGE};
         let (mbuf, _) = super::resident::mirror_buffer()?;
         let end = base.checked_add(size)?;
@@ -11911,11 +11922,20 @@ impl Exec {
                             }
                             self.mirror_place(base, size, found.tr.plan.resources[i].written)
                         } else if super::fe2::on() && super::fe2::in_span(base, size) {
-                            // Diagnostics: large written bindings, the first of each shader.
-                            if found.tr.plan.resources[i].written && size >= 4 << 20 {
+                            // Diagnostics: large written bindings, the first of each shader
+                            // (the global lock once per shader and thread, until 40 are
+                            // logged: every thread's large written bindings took it).
+                            static SEEN_FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            thread_local! {
+                                static SEEN_HERE: std::cell::RefCell<HashSet<u64>> = std::cell::RefCell::new(HashSet::new());
+                            }
+                            if found.tr.plan.resources[i].written && size >= 4 << 20 && !SEEN_FULL.load(Ordering::Relaxed) && SEEN_HERE.with(|s| s.borrow_mut().insert(p.addr)) {
                                 static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
                                 let mut g = SEEN.lock();
                                 let seen = g.get_or_insert_with(HashSet::new);
+                                if seen.len() >= 40 {
+                                    SEEN_FULL.store(true, Ordering::Relaxed);
+                                }
                                 if seen.len() < 40 && seen.insert(p.addr) {
                                     let what = match &found.resources[i] {
                                         Resolved::Buffer(v) => format!("V# stride {} records {}", v.stride, v.num_records),

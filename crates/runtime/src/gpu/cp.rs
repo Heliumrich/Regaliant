@@ -653,6 +653,39 @@ fn past_backoff_note(a: u64, dropped: bool) {
     e.0 = e.0 * 3 / 4 + if dropped { 256 } else { 0 };
 }
 
+/// Per label address gone past: the CPU reads of its dropped stretches that
+/// other queues wrote meanwhile (most recent last, at most PAST_CONFLICTS_MAX;
+/// e.g. the indirect arguments of particle draws queue 0x50 writes before
+/// its label). A later stretch past a wait on that label stops before such
+/// a read and settles once the label passes, keeping what it recorded, where
+/// reading it would drop the stretch (FINDINGS.md 2026-10-27 late night).
+static PAST_CONFLICTS: parking_lot::Mutex<Option<HashMap<u64, Vec<(u64, u64)>>>> = parking_lot::Mutex::new(None);
+const PAST_CONFLICTS_MAX: usize = 16;
+
+fn past_conflicts_note(a: u64, reads: &[(u64, u64)]) {
+    if reads.is_empty() {
+        return;
+    }
+    let mut g = PAST_CONFLICTS.lock();
+    let v = g.get_or_insert_with(HashMap::new).entry(a & !7).or_default();
+    for &r in reads {
+        v.retain(|&x| x != r);
+        v.push(r);
+    }
+    if v.len() > PAST_CONFLICTS_MAX {
+        let n = v.len() - PAST_CONFLICTS_MAX;
+        v.drain(..n);
+    }
+}
+
+/// Whether `reads` overlap a read that dropped a stretch past a wait on
+/// label `a` before.
+fn past_conflicts_hit(a: u64, reads: &[(u64, u64)]) -> bool {
+    let g = PAST_CONFLICTS.lock();
+    let Some(v) = g.as_ref().and_then(|m| m.get(&(a & !7))) else { return false };
+    reads.iter().any(|&(x, n)| v.iter().any(|&(y, m)| x < y + m && y < x + n))
+}
+
 /// The counters at the frame window's start (`past_wait_window_clause`).
 static PAST_WINDOW: parking_lot::Mutex<Option<[u64; 9]>> = parking_lot::Mutex::new(None);
 
@@ -3080,6 +3113,11 @@ impl Cp {
         };
         if let Some(d) = dropped {
             note_why(&PAST_WAIT_DROPS, d);
+            if d == "read what other queues wrote" {
+                // The next stretch on this label stops before these reads.
+                let hits: Vec<(u64, u64)> = e.held_reads().iter().copied().filter(|r| writes.overlaps(r.0, r.1)).take(PAST_CONFLICTS_MAX).collect();
+                past_conflicts_note(w.a, &hits);
+            }
             if d == "read what other queues wrote" && super::exec::trace_past_drops() {
                 static N: AtomicU64 = AtomicU64::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < super::exec::trace_past_drops_max() {
@@ -4190,6 +4228,16 @@ impl Cp {
     /// arguments are typically written by a culling dispatch shortly before;
     /// the draws after the first then find nothing pending.
     fn sync_reads(&mut self, reads: &[(u64, u64)]) {
+        // Past a label wait, a read that dropped a stretch on this label
+        // before: the stretch stops before it (the packet runs again once
+        // the label passed), keeping what it recorded.
+        if let Some(w) = self.past_wait.as_deref() {
+            if past_conflicts_hit(w.a, reads) {
+                let at = self.cur_packet;
+                self.held_stop("a read its label's writer wrote before", at);
+                return;
+            }
+        }
         if let (Some(e), true) = (self.exec.as_mut(), self.held.is_some()) {
             e.note_held_reads(reads, 4);
         }
