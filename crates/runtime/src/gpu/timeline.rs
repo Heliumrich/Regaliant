@@ -5,9 +5,13 @@
 //! submission thread's vkQueueSubmit calls, the completion thread's CP
 //! effects and, with DS_PROFILE_GPU=1 (best with DS_PROFILE_GPU_STAMPS=0),
 //! every batch's execution on the GPU, its timestamps put on the CPU clock
-//! with VK_EXT_calibrated_timestamps. Written to `timeline-<flip>.json` in the
-//! run directory (Chrome trace format: ui.perfetto.dev, chrome://tracing;
-//! `tools/timeline.py` summarizes it).
+//! with VK_EXT_calibrated_timestamps, and with DS_PROFILE_GPU_STAMPS=seg
+//! every barrier segment of a batch with its programs (track "GPU
+//! segments"). Written to `timeline-<flip>.json` in the run directory (Chrome
+//! trace format: ui.perfetto.dev, chrome://tracing; `tools/timeline.py`
+//! summarizes it); `otherData` holds the performance counter at its zero and
+//! the counter's frequency (`tools/gpuattrib.py` puts Nsight Systems' GPU
+//! metric samples on it).
 
 use parking_lot::Mutex;
 use std::sync::OnceLock;
@@ -116,6 +120,16 @@ pub fn start(flips: u32) -> Result<(), String> {
 
 /// A batch's execution on the GPU between its timestamps `begin` and `end`.
 pub fn gpu(queue: &str, seq: u64, begin: u64, end: u64, what: &str) {
+    gpu_on("GPU", begin, end, || format!("{queue} #{seq}{what}"));
+}
+
+/// A barrier segment of a batch on the GPU (`seg_stamps`): the queue and its
+/// programs (or what it held instead).
+pub fn gpu_segment(begin: u64, end: u64, name: impl FnOnce() -> String) {
+    gpu_on("GPU segments", begin, end, name);
+}
+
+fn gpu_on(track: &str, begin: u64, end: u64, name: impl FnOnce() -> String) {
     if !on() || end < begin {
         return;
     }
@@ -126,7 +140,7 @@ pub fn gpu(queue: &str, seq: u64, begin: u64, end: u64, what: &str) {
     let Some((g0, q0)) = s.cal else { return };
     let conv = |t: u64| q0 + (t.wrapping_sub(g0) as i64 as f64 * period * f / 1e9) as i64;
     if s.spans.len() < MAX_SPANS {
-        s.spans.push(Span { track: "GPU".to_string(), name: format!("{queue} #{seq}{what}"), t0: conv(begin), t1: conv(end) });
+        s.spans.push(Span { track: track.to_string(), name: name(), t0: conv(begin), t1: conv(end) });
     }
 }
 
@@ -178,7 +192,7 @@ fn write(st: State, flip: u64) {
             out.push_str(&format!("{{\"name\":\"{}\",\"ph\":\"X\",\"pid\":1,\"tid\":{},\"ts\":{:.3},\"dur\":{:.3}}}{sep}", esc(&s.name), tid(&s.track), us(s.t0), us(s.t1) - us(s.t0)));
         }
     }
-    out.push_str("]}\n");
+    out.push_str(&format!("],\"otherData\":{{\"qpc_start\":{},\"qpc_freq\":{}}}}}\n", st.started, freq()));
     match std::fs::write(&path, out) {
         Ok(()) => crate::info!("timeline: {} spans on {} tracks written to {}", st.spans.len(), tracks.len(), path.display()),
         Err(e) => crate::warn!("timeline: writing {}: {e}", path.display()),

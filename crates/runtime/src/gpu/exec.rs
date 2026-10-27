@@ -4750,6 +4750,23 @@ fn collect_segments(pool: vk::QueryPool, shaders: &[u64], segs: &[SegMark], ops_
         let d = ((w[1].0 - w[0].0) as f64 * period) as u64;
         let (from, to) = (w[0].1, w[1].1.max(w[0].1));
         let cmds = &shaders[from..to];
+        // On the timeline: the queue and the segment's programs, or what it
+        // held instead of commands.
+        if super::timeline::on() {
+            super::timeline::gpu_segment(w[0].0, w[1].0, || {
+                if cmds.is_empty() {
+                    return format!("{queue}: {}", seg_kind(&w[0].2, &w[1].2));
+                }
+                let mut names: Vec<String> = Vec::new();
+                for &k in cmds {
+                    let n = if k & DRAW_KEY != 0 { format!("draws {:#x}", k & !DRAW_KEY) } else { format!("cs {:#x}", k) };
+                    if !names.contains(&n) {
+                        names.push(n);
+                    }
+                }
+                format!("{queue}: {} ({} commands)", names.join(" + "), cmds.len())
+            });
+        }
         if cmds.is_empty() {
             let kind = seg_kind(&w[0].2, &w[1].2);
             let e = me.entry(kind).or_insert([0; 2]);
@@ -5225,25 +5242,30 @@ pub static ZERO_GROUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// samplers, then the counts of buffer bindings and of stages.
 /// Per place class (`PLACE_CLASSES`: a fresh batch's first commands cost
 /// several times a later one's bindings, `place_lines`).
-pub(super) static BIND_STEPS_BY: [[AtomicU64; 10]; 9] = [const { [const { AtomicU64::new(0) }; 10] }; 9];
-const BIND_STEP_NAMES: [&str; 8] = ["resource and home", "resident shadows", "snapshot", "mirror", "batch-start copy", "mapping span", "placement and rest", "images and samplers"];
+pub(super) static BIND_STEPS_BY: [[AtomicU64; 13]; 12] = [const { [const { AtomicU64::new(0) }; 13] }; 12];
+/// Parts of a buffer binding (`BindClock` marks 0-9); then images and
+/// samplers per stage (10), buffer bindings (11) and stages (12).
+const BIND_STEP_NAMES: [&str; 10] = ["unbounded size", "homes and mirrors", "resident shadows", "snapshot", "mirror", "batch-start copy", "mapping span", "host binding", "written-buffer shadows", "descriptor and rest"];
 
 /// Place classes of the bind-step and batch-start copy tables (`place_class`).
-const PLACE_CLASSES: [&str; 9] = [
+const PLACE_CLASSES: [&str; 12] = [
     "graphics command processor, later commands",
     "graphics command processor, first command of a batch",
     "graphics command processor, 2nd-32nd commands",
-    "compute queues, later commands",
-    "compute queues, first command of a batch",
-    "compute queues, 2nd-32nd commands",
+    "compute queues but 0x50, later commands",
+    "compute queues but 0x50, first command of a batch",
+    "compute queues but 0x50, 2nd-32nd commands",
     "parallel workers, later commands",
     "parallel workers, first command of a batch",
     "parallel workers, 2nd-32nd commands",
+    "queue 0x50, later commands",
+    "queue 0x50, first command of a batch",
+    "queue 0x50, 2nd-32nd commands",
 ];
 
 /// The place class of a command recorded as the `place`-th (from 0) of its
 /// batch by the graphics command processor (`kind` 0), a compute queue's
-/// (1) or a parallel worker (2).
+/// but 0x50's (1), a parallel worker (2) or queue 0x50's (3).
 fn place_class(kind: u8, place: usize) -> u8 {
     3 * kind
         + match place {
@@ -5265,7 +5287,7 @@ fn flush_every(class: usize) -> u64 {
 
 thread_local! {
     /// This thread's BIND_STEPS_BY not yet added.
-    static BIND_LOCAL: std::cell::Cell<[[u64; 10]; 9]> = const { std::cell::Cell::new([[0; 10]; 9]) };
+    static BIND_LOCAL: std::cell::Cell<[[u64; 13]; 12]> = const { std::cell::Cell::new([[0; 13]; 12]) };
     /// The place class of the command being bound (`place_class`).
     static BIND_PLACE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
@@ -5275,12 +5297,12 @@ thread_local! {
 /// images and samplers.
 struct BindClock {
     last: u64,
-    acc: [u64; 10],
+    acc: [u64; 13],
 }
 
 impl BindClock {
     fn start() -> Option<BindClock> {
-        laps().then(|| BindClock { last: unsafe { core::arch::x86_64::_rdtsc() }, acc: [0; 10] })
+        laps().then(|| BindClock { last: unsafe { core::arch::x86_64::_rdtsc() }, acc: [0; 13] })
     }
 
     fn mark(c: &mut Option<BindClock>, k: usize) {
@@ -5293,7 +5315,7 @@ impl BindClock {
 
     fn count_buffer(c: &mut Option<BindClock>) {
         if let Some(c) = c {
-            c.acc[8] += 1;
+            c.acc[11] += 1;
         }
     }
 }
@@ -5301,19 +5323,19 @@ impl BindClock {
 impl Drop for BindClock {
     fn drop(&mut self) {
         let now = unsafe { core::arch::x86_64::_rdtsc() };
-        self.acc[7] += now.wrapping_sub(self.last);
-        self.acc[9] += 1;
+        self.acc[10] += now.wrapping_sub(self.last);
+        self.acc[12] += 1;
         let k = BIND_PLACE.with(|f| f.get()) as usize;
         BIND_LOCAL.with(|l| {
             let mut v = l.get();
             for (x, a) in v[k].iter_mut().zip(self.acc.iter()) {
                 *x += a;
             }
-            if v[k][9] >= flush_every(k) {
+            if v[k][12] >= flush_every(k) {
                 for (c, x) in BIND_STEPS_BY[k].iter().zip(v[k].iter()) {
                     c.fetch_add(*x, Ordering::Relaxed);
                 }
-                v[k] = [0; 10];
+                v[k] = [0; 13];
             }
             l.set(v);
         });
@@ -5325,31 +5347,32 @@ fn bind_steps_line() -> String {
     BIND_STEPS_BY.iter().zip(PLACE_CLASSES).map(|(t, what)| bind_steps_of(t, &format!(" ({what})"))).collect()
 }
 
-fn bind_steps_of(steps: &[AtomicU64; 10], what: &str) -> String {
+fn bind_steps_of(steps: &[AtomicU64; 13], what: &str) -> String {
     let v: Vec<u64> = steps.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    if v[9] == 0 {
+    if v[12] == 0 {
         return String::new();
     }
     let ns = |cycles: u64, n: u64| cycles as f64 * 1e9 / super::threadcpu::tsc_hz() / n.max(1) as f64;
-    let parts: Vec<String> = BIND_STEP_NAMES[..7].iter().enumerate().map(|(k, name)| format!("{name} {:.0}", ns(v[k], v[8]))).collect();
+    let parts: Vec<String> = BIND_STEP_NAMES.iter().enumerate().map(|(k, name)| format!("{name} {:.0}", ns(v[k], v[11]))).collect();
     format!(
-        "    bind step by part{what}: {} stages, {} buffer bindings ({:.1} per stage); ns per buffer binding: {}; images and samplers {:.0} ns per stage\n",
-        v[9],
-        v[8],
-        v[8] as f64 / v[9] as f64,
+        "    bind step by part{what}: {} stages, {} buffer bindings ({:.1} per stage), {:.0} ns per stage; ns per buffer binding: {}; images and samplers {:.0} ns per stage\n",
+        v[12],
+        v[11],
+        v[11] as f64 / v[12] as f64,
+        ns(v[..11].iter().sum(), v[12]),
         parts.join(", "),
-        ns(v[7], v[9])
+        ns(v[10], v[12])
     )
 }
 
 /// `Exec::pre_copy` by outcome (DS_PROFILE_GPU) per place class
 /// (`PLACE_CLASSES`): TSC cycles and calls per `PRE_STEP_NAMES`.
-static PRE_STEPS_BY: [[AtomicU64; 12]; 9] = [const { [const { AtomicU64::new(0) }; 12] }; 9];
+static PRE_STEPS_BY: [[AtomicU64; 12]; 12] = [const { [const { AtomicU64::new(0) }; 12] }; 12];
 const PRE_STEP_NAMES: [&str; 6] = ["refused at once", "reused in the batch", "shared copy reused", "copied for the batch", "copied into the shared cache", "refused after looking"];
 
 thread_local! {
     /// This thread's PRE_STEPS_BY not yet added.
-    static PRE_LOCAL: std::cell::Cell<[[u64; 12]; 9]> = const { std::cell::Cell::new([[0; 12]; 9]) };
+    static PRE_LOCAL: std::cell::Cell<[[u64; 12]; 12]> = const { std::cell::Cell::new([[0; 12]; 12]) };
 }
 
 /// Times one `pre_copy` call; `k` is its outcome when it returns.
@@ -6317,6 +6340,8 @@ pub struct Exec {
     /// A compute queue's command processor records into it (profile
     /// classes).
     compute_cp: bool,
+    /// Queue 0x50's (its own place class in the bind-step profile).
+    acb50: bool,
     batch_alt: bool,
     batch_alt_share: bool,
     /// GPU writes this batch recorded since its last full barrier through
@@ -6840,6 +6865,7 @@ impl Exec {
                 alt_id,
                 on_compute,
                 compute_cp: name.starts_with("gpu-acb"),
+                acb50: name == "gpu-acb0x50",
                 batch_alt: false,
                 batch_alt_share: false,
                 since_barrier: Some(Vec::new()),
@@ -10894,7 +10920,7 @@ impl Exec {
         // need: `shadow_room` below).
         let mut seg = self.slots[self.cur].shadow_cap;
         let fx = fixed();
-        BIND_PLACE.with(|f| f.set(place_class(if self.deferred { 2 } else if self.compute_cp { 1 } else { 0 }, self.batch_shaders.len())));
+        BIND_PLACE.with(|f| f.set(place_class(if self.deferred { 2 } else if self.acb50 { 3 } else if self.compute_cp { 1 } else { 0 }, self.batch_shaders.len())));
         let mut clk = BindClock::start();
         {
             // Address-mode translations: the zero page in the address block's
@@ -10925,6 +10951,7 @@ impl Exec {
                             Some(n) => n,
                             None => mapping(base).map(|(_, e)| (e - base).min(UNBOUNDED_MAX)).unwrap_or(0),
                         };
+                        BindClock::mark(&mut clk, 0);
                         if size > 0 && !found.tr.plan.resources[i].written {
                             bound.reads.push((base, size));
                         }
@@ -10992,10 +11019,10 @@ impl Exec {
                             }
                             None => None,
                         };
-                        BindClock::mark(&mut clk, 0);
+                        BindClock::mark(&mut clk, 1);
                         // Inside a resident shadow: its working copy is newer.
                         let resident = if read_only && home.is_none() { self.resident_read(base, size)? } else { None };
-                        BindClock::mark(&mut clk, 1);
+                        BindClock::mark(&mut clk, 2);
                         // Small read-only buffers: a snapshot in video memory.
                         // Data-only loads read on the GPU (`gpu_loads`) of data
                         // no GPU work still writes: as memory holds it now, as
@@ -11011,17 +11038,17 @@ impl Exec {
                         } else {
                             self.snapshot(base, size, super::tune::snap_max())
                         };
-                        BindClock::mark(&mut clk, 2);
+                        BindClock::mark(&mut clk, 3);
                         // Read-only bindings of buffers GPU work wrote: VRAM mirrors.
                         let mirrored = if read_only && snap.is_none() && home.is_none() { resident.or_else(|| super::mirror::lookup(base, size)) } else { None };
-                        BindClock::mark(&mut clk, 3);
+                        BindClock::mark(&mut clk, 4);
                         // Other read-only buffers: a copy made at the batch's start
                         // (dispatches only with `tune pre_cs`).
                         let pre = if read_only && snap.is_none() && mirrored.is_none() && home.is_none() && (!allow_shadow || super::tune::pre_cs()) { self.pre_copy(base, size) } else { None };
                         if pre.is_some() {
                             placement = Placement::PreCopy;
                         }
-                        BindClock::mark(&mut clk, 4);
+                        BindClock::mark(&mut clk, 5);
                         // Diagnosis: ranges read when the batch executes.
                         if read_only && super::tune::race_checks() && size <= 1 << 28 {
                             self.note_open_read(p.addr, base, size);
@@ -11051,7 +11078,7 @@ impl Exec {
                                 }
                             }
                         }
-                        BindClock::mark(&mut clk, 5);
+                        BindClock::mark(&mut clk, 6);
                         if super::tune::race_checks() && size > 0 && snap.is_none() && mirrored.is_none() && (home.is_some() || span.is_some()) {
                             let unbounded = matches!(found.resources[i], Resolved::Global(_, None));
                             let kind = if found.tr.plan.resources[i].written { 1 } else { 0 } | if data_load { 2 } else { 0 } | if unbounded { 4 } else { 0 };
@@ -11122,6 +11149,7 @@ impl Exec {
                                             bound.sized_writes.push((base, size));
                                         }
                                     }
+                                    BindClock::mark(&mut clk, 7);
                                     // Written buffers: a device-local copy for this dispatch
                                     // (GPU atomics and stores to host memory are slow).
                                     let s_off = self.shadow_used.next_multiple_of(256);
@@ -11178,6 +11206,7 @@ impl Exec {
                                         // Within the bound range (clamped to the mapping).
                                         bound.write_src.push((base, size.min(range - bias), info.buffer, info.offset + bias));
                                     }
+                                    BindClock::mark(&mut clk, 8);
                                 }
                                 None => {
                                     // Memory the driver cannot import (e.g. the
@@ -11231,7 +11260,7 @@ impl Exec {
                         } else {
                             bound.bufs.push((b.binding, info));
                         }
-                        BindClock::mark(&mut clk, 6);
+                        BindClock::mark(&mut clk, 9);
                         BindClock::count_buffer(&mut clk);
                     }
                     BindingKind::Gds => {
