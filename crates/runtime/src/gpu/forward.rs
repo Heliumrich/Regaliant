@@ -107,6 +107,10 @@ struct Check {
     old: Vec<u32>,
     /// Its batch (0 until submitted).
     seq: u64,
+    /// What it checks (a worker's buffer update, or a copy left a dispatch:
+    /// `add_check`) and the recording queue (diagnostics).
+    what: &'static str,
+    queue: Arc<str>,
 }
 
 static CHECKS: Mutex<Vec<Check>> = Mutex::new(Vec::new());
@@ -978,8 +982,11 @@ fn add_held(id: u64, base: u64, words: Vec<u32>, program: u64, hash: u64, from: 
     id
 }
 
-/// Starts a check of a parallel worker's buffer update (`Check`); its id.
-pub fn add_check(base: u64, words: Vec<u32>) -> u64 {
+/// Starts a check of a parallel worker's buffer update, or of a copy left a
+/// dispatch on a queue whose copies are not forwarded (`fe2::check_copies`:
+/// a stale source in the mirror shows as words still as before) (`Check`);
+/// its id.
+pub fn add_check(base: u64, words: Vec<u32>, what: &'static str, queue: &str) -> u64 {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let n = words.len() as u64;
     let old: Vec<u32> = if super::cp::guest_readable(base, 4 * n) { (0..n).map(|k| unsafe { std::ptr::read_volatile((base + 4 * k) as *const u32) }).collect() } else { Vec::new() };
@@ -993,7 +1000,7 @@ pub fn add_check(base: u64, words: Vec<u32>) -> u64 {
     for slot in check_pages(base, 4 * n) {
         slot.fetch_add(1, Ordering::AcqRel);
     }
-    g.push(Check { id, base, words, old, seq: 0 });
+    g.push(Check { id, base, words, old, seq: 0, what, queue: queue.into() });
     CHECK_COUNT.store(g.len(), Ordering::Release);
     id
 }
@@ -1189,7 +1196,7 @@ fn complete_checks(done: u64) {
         if stale > 0 {
             static LOGGED: AtomicU64 = AtomicU64::new(0);
             if LOGGED.fetch_add(1, Ordering::Relaxed) < 20 {
-                crate::warn!("gpu: a worker's buffer update to {:#x} (batch {}): {stale} of {} words still as before it after it ran", c.base, c.seq, c.words.len());
+                crate::warn!("gpu: {} to {:#x} ({}, batch {}): {stale} of {} words still as before it after it ran", c.what, c.base, c.queue, c.seq, c.words.len());
             }
         }
     }

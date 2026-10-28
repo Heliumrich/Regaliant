@@ -546,6 +546,13 @@ fn arm_gpu() -> bool {
     *W.get_or_init(|| std::env::var("DS_FE2_ARM_GPU").ok().as_deref() == Some("1"))
 }
 
+/// Diagnosis (`DS_FE2_CHECK_COPIES=1`): copy kernels' dispatches outside the
+/// graphics CP checked after their batches (`Exec::dispatch_inner`).
+pub fn check_copies() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_FE2_CHECK_COPIES").ok().as_deref() == Some("1"))
+}
+
 /// Held past a label wait, the graphics command processor's checks need the
 /// epoch now, not its view (`DS_FE2_STRETCH_VIEW=1`: the view, as before
 /// 2026-10-28 night's fix; `Exec::fe2_place_inner`).
@@ -2171,7 +2178,72 @@ pub fn status() -> String {
             .map(|(n, c)| format!("{n} {}", c.load(Ordering::Relaxed)))
             .collect::<Vec<_>>()
             .join(", "),
-    ) + &callers_line()
+    ) + &census_line()
+        + &callers_line()
+}
+
+/// One status line: the mirror's pages by state now (a scan of every
+/// chunk's words): valid, armed (the host's bit set), GPU-written, and those
+/// found written (or first seen) within the last 8, 60 and 600 flips with the
+/// runs they form (the volatile set a coherence without per-binding checks
+/// would have to keep current: FRONTEND2.md, F3).
+fn census_line() -> String {
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    let (mut valid, mut armed, mut gpu) = (0u64, 0u64, 0u64);
+    let mut lately = [0u64; 3];
+    let mut runs = [0u64; 3];
+    let windows = [8u64, 60, 600];
+    for (k, slot) in TABLE.iter().enumerate() {
+        let p = slot.load(Ordering::Acquire);
+        if p.is_null() {
+            continue;
+        }
+        let c = unsafe { &*p };
+        let base = MIRROR_BASE + ((k as u64) << CHUNK_SHIFT);
+        let mut prev = [false; 3];
+        for w in 0..WORDS {
+            let v = c.valid[w].load(Ordering::Relaxed);
+            valid += v.count_ones() as u64;
+            armed += (c.armed[w].load(Ordering::Relaxed) & crate::hosted::armed_word(base + (w as u64) * 64 * PAGE)).count_ones() as u64;
+            gpu += c.gpu[w].load(Ordering::Relaxed).count_ones() as u64;
+            if c.seen[w].load(Ordering::Relaxed) == 0 {
+                prev = [false; 3];
+                continue;
+            }
+            for b in 0..64 {
+                let wrote = c.wrote[w * 64 + b].load(Ordering::Relaxed) as u64;
+                for (i, &n) in windows.iter().enumerate() {
+                    let hit = wrote != 0 && frame.saturating_sub(wrote - 1) < n;
+                    if hit {
+                        lately[i] += 1;
+                        if !prev[i] {
+                            runs[i] += 1;
+                        }
+                    }
+                    prev[i] = hit;
+                }
+            }
+        }
+    }
+    let mib = |pages: u64| (pages * PAGE) >> 20;
+    format!(
+        "    front end 2's pages now: valid {} ({} MiB), armed {} ({} MiB), GPU-written {}; written or first seen within 8 / 60 / 600 flips: {} / {} / {} pages ({} / {} / {} MiB) in {} / {} / {} runs
+",
+        valid,
+        mib(valid),
+        armed,
+        mib(armed),
+        gpu,
+        lately[0],
+        lately[1],
+        lately[2],
+        mib(lately[0]),
+        mib(lately[1]),
+        mib(lately[2]),
+        runs[0],
+        runs[1],
+        runs[2]
+    )
 }
 
 /// The placement checks by caller (`DS_FE2_CALLERS=1`; "" otherwise).

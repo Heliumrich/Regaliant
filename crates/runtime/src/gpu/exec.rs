@@ -10872,7 +10872,7 @@ impl Exec {
         // The next dispatch notes its writes again (these changed the record).
         self.last_notes.2 = [u64::MAX; 4];
         let id = if check_only {
-            super::forward::add_check(base, words)
+            super::forward::add_check(base, words, "a worker's buffer update", &self.name)
         } else {
             super::forward::UPDATES[0].fetch_add(1, Ordering::Relaxed);
             super::forward::UPDATES[1].fetch_add(words.len() as u64, Ordering::Relaxed);
@@ -13169,6 +13169,18 @@ impl Exec {
                 None => forwarded = Some(None),
             }
         }
+        // Diagnosis (`DS_FE2_CHECK_COPIES=1`): a copy kernel's dispatch on a
+        // queue whose copies are not forwarded (compute queues, the graphics
+        // queue's workers) is checked once its batch completed against the
+        // words its inputs give now: a stale source in the mirror shows as
+        // words still as before (forwarding checks only the graphics CP's).
+        if super::fe2::check_copies() && !forward_here && forwarded.is_none() && indirect.is_none() && patches.is_none() {
+            let busy = |r: &[(u64, u64)]| self.overlaps_pending_ro(r) || INFLIGHT.latest(r).is_some() || CP_WRITES.latest(r).is_some() || self.main_writes.as_ref().is_some_and(|m| m.overlaps_any(r));
+            if let Some((base, words, _)) = super::forward::compute(&p, groups, local, busy) {
+                let id = super::forward::add_check(base, words, "a copy kernel's dispatch", &self.name);
+                self.forward_ids.push(id);
+            }
+        }
         self.grow_sampled_depth(&[&p]);
         // Fast clears, overwrite reloads and block copies of the images, as
         // for draws: the keys from this thread's memos, the cache's lock only
@@ -14026,6 +14038,7 @@ pub fn status() -> String {
         + &async_line()
         + &super::cp::past_wait_status()
         + &held_own_line()
+        + &super::forward::status_line()
         + &super::rgm::status_line(super::FRAMES.load(Ordering::Relaxed))
         + &super::par::status()
         + &super::keep::status()
