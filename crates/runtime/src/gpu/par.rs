@@ -17,7 +17,11 @@
 //! par_split`: chunks per recorder). A command the worker cannot record
 //! without flushing or waiting for its own unsubmitted work stops the chunk
 //! there; the main command processor executes the rest of that chunk itself
-//! and then gives the next chunk its turn.
+//! and then gives the next chunk its turn. With `tune par_park` a worker
+//! whose long-run chunk is recorded before its turn parks it in its recorder
+//! (a command processor with its own executor, `Recorder`) and records the
+//! next chunk into a spare one; the thread that gives the parked chunk its
+//! turn commits it (`commit_parked`).
 
 use super::cp::{ChunkState, Cp};
 use parking_lot::{Condvar, Mutex};
@@ -148,7 +152,49 @@ pub struct Run {
     /// Front end 2: the command processor's view when it planned the run
     /// (`fe2::gfx_views`; NO_VIEW: the epoch now).
     pub fe2_view: u32,
+    /// Chunks recorded before their turn (`tune par_park`), by index.
+    parked: Mutex<Vec<Option<Parked>>>,
 }
+
+/// A recorder of chunks: a command processor with its own executor. A
+/// worker records into its own one, and with `tune par_park` into a spare
+/// while the other holds a parked chunk.
+struct Recorder {
+    cp: Mutex<Cp>,
+    /// It holds a chunk recorded before its turn (`Parked`).
+    parked: AtomicBool,
+}
+
+/// Recorders a worker has at most (its own and spares).
+const RECORDERS: usize = 2;
+
+/// A long run's chunk recorded before its turn (`tune par_park`): its
+/// recorder keeps its batches and notes until the thread that gives it its
+/// turn commits it (`commit_parked`).
+struct Parked {
+    rec: Arc<Recorder>,
+    /// Its worker's word bumped when one of its recorders is free again.
+    freed: Arc<AtomicU64>,
+    from: u64,
+    to: u64,
+    stopped: Option<u64>,
+    failed: bool,
+    /// Its start state.
+    state: Box<ChunkState>,
+}
+
+/// A parked chunk's recorder is free again (its chunk committed or
+/// discarded): its worker may record into it.
+fn release(rec: &Recorder, freed: &Arc<AtomicU64>) {
+    rec.parked.store(false, Ordering::Release);
+    freed.fetch_add(1, Ordering::AcqRel);
+    unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll(Arc::as_ptr(freed) as *const core::ffi::c_void) };
+}
+
+/// Parked chunks (`tune par_park`): [parked, committed by the thread that
+/// gave them their turn, waits of a worker for a free recorder, spare
+/// recorders made].
+pub static PARKS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// A long parallel run (`tune long_runs`, RENDERER.md "Long parallel
 /// runs"): its chunks pass the title's GPU-side synchronization, so each is
@@ -208,7 +254,7 @@ pub fn long_line() -> String {
     };
     let cw: Vec<u64> = super::cp::CHAIN_WHY.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    long parallel runs (chain_next: not long {}, recorded past {}, held work {}, clears pending {}, planned {}, no run {}, not workers' alone {}): {} runs ({} commands, {:.0} each), chunks committed {}, dropped at their turn {} ({}), stopped early {} ({}); {} chained after the run before\n",
+        "    long parallel runs (chain_next: not long {}, recorded past {}, held work {}, clears pending {}, planned {}, no run {}, not workers' alone {}): {} runs ({} commands, {:.0} each), chunks committed {}, dropped at their turn {} ({}), stopped early {} ({}); {} chained after the run before; parked before their turn {} ({} committed by the thread giving it, waits for a free recorder {}, spare recorders {}); chained across the planner's sealed work {} (not sealed {}), sealed work committed while recording {}, at settling {}, dropped {}\n",
         cw[0],
         cw[1],
         cw[2],
@@ -224,13 +270,22 @@ pub fn long_line() -> String {
         list(&LONG_DROPS),
         v[4],
         list(&LONG_STOPS),
-        v[5]
+        v[5],
+        PARKS[0].load(Ordering::Relaxed),
+        PARKS[1].load(Ordering::Relaxed),
+        PARKS[2].load(Ordering::Relaxed),
+        PARKS[3].load(Ordering::Relaxed),
+        super::cp::SEALS[0].load(Ordering::Relaxed),
+        super::cp::SEALS[1].load(Ordering::Relaxed),
+        super::cp::SEALS[2].load(Ordering::Relaxed),
+        super::cp::SEALS[3].load(Ordering::Relaxed),
+        super::cp::SEALS[4].load(Ordering::Relaxed)
     )
 }
 
 /// Clears the long runs' statistics (`profile reset`).
 pub fn long_reset() {
-    for c in &LONG {
+    for c in LONG.iter().chain(PARKS[..3].iter()).chain(super::cp::SEALS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     LONG_DROPS.lock().clear();
@@ -258,6 +313,7 @@ impl Run {
             long: None,
             chained: Mutex::new(None),
             fe2_view: super::fe2::NO_VIEW,
+            parked: Mutex::new((0..n).map(|_| None).collect()),
         }
     }
 
@@ -336,16 +392,85 @@ impl Run {
     }
 
     /// Chunk `i` may submit (the main command processor's work before it went
-    /// to the GPU).
+    /// to the GPU); parked, it is committed here.
     pub fn grant(&self, i: usize) {
         if self.turn.fetch_max(i + 1, Ordering::AcqRel) <= i {
             self.notify();
         }
+        commit_parked(self, i);
+    }
+
+    /// Parks chunk `i`, recorded before its turn, unless the turn came or the
+    /// run was cancelled meanwhile: then it is given back to be committed by
+    /// its worker. (Checked under the lock the thread giving the turn takes
+    /// it out under, after giving it: one of them commits it.)
+    fn park(&self, i: usize, p: Parked) -> Option<Parked> {
+        let mut g = self.parked.lock();
+        if self.turn.load(Ordering::Acquire) > i || self.cancelled.load(Ordering::Acquire) {
+            return Some(p);
+        }
+        p.rec.parked.store(true, Ordering::Release);
+        g[i] = Some(p);
+        PARKS[0].fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    /// Whether every chunk was posted.
+    pub fn all_posted(&self) -> bool {
+        self.posted.load(Ordering::Acquire) >= self.chunks.len()
+    }
+
+    /// Every chunk posted, none collected yet: whether one stopped early
+    /// (None: not all posted).
+    pub fn posted_stop(&self) -> Option<bool> {
+        if !self.all_posted() {
+            return None;
+        }
+        Some(self.results.lock().iter().any(|d| d.as_ref().is_some_and(|d| d.stopped.is_some())))
+    }
+
+    /// The parked chunk `i`, taken out to be committed (None: not parked).
+    fn take_parked(&self, i: usize) -> Option<Parked> {
+        self.parked.lock().get_mut(i).and_then(|p| p.take())
     }
 
     /// Waits for chunk `i` to be posted: it and how long the wait took (ns).
+    /// (A wait of more than 3 s logs the run's state once: a run that cannot
+    /// go on.)
     pub fn collect(&self, i: usize) -> (Done, u64) {
-        let ns = self.wait_until(|| self.posted.load(Ordering::Acquire) > i);
+        let ready = || self.posted.load(Ordering::Acquire) > i;
+        let ns = if ready() {
+            0
+        } else {
+            let t = std::time::Instant::now();
+            let mut spins = 0;
+            let limit = super::tune::par_spins();
+            while spins < limit && !ready() {
+                std::hint::spin_loop();
+                spins += 1;
+            }
+            let mut g = self.lock.lock();
+            let mut logged = false;
+            while !ready() {
+                if self.cv.wait_for(&mut g, std::time::Duration::from_secs(3)).timed_out() && !logged && !ready() {
+                    logged = true;
+                    let parked: Vec<usize> = self.parked.lock().iter().enumerate().filter(|(_, p)| p.is_some()).map(|(k, _)| k).collect();
+                    crate::warn!(
+                        "gpu: waiting > 3 s for chunk {i} of a {} run of {} chunks: posted {}, turn {}, taken {}, workers on it {}, cancelled {}, parked {:?}, chained after it {}",
+                        if self.long.is_some() { "long" } else { "parallel" },
+                        self.chunks.len(),
+                        self.posted.load(Ordering::Acquire),
+                        self.turn.load(Ordering::Acquire),
+                        self.next.load(Ordering::Acquire),
+                        self.active.load(Ordering::Acquire),
+                        self.cancelled.load(Ordering::Acquire),
+                        parked,
+                        self.chained.lock().is_some()
+                    );
+                }
+            }
+            t.elapsed().as_nanos() as u64
+        };
         WAIT_NS.fetch_add(ns, Ordering::Relaxed);
         let d = self.results.lock()[i].take().expect("parallel chunk posted twice");
         (d, ns)
@@ -354,9 +479,31 @@ impl Run {
     /// Abandons the run: chunks not yet submitted are dropped by their
     /// workers; returns once every worker left it.
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.cancelled.store(true, Ordering::SeqCst);
         self.notify();
-        self.wait_until(|| self.active.load(Ordering::Acquire) == 0);
+        // Chunks parked before their turn: discarded (none of them gets one
+        // now; one whose turn came before the cancel is committed), before
+        // the wait for the workers, which may wait for their recorders. (No
+        // chunk is parked once the run is cancelled: `park`.)
+        let parked: Vec<(usize, Parked)> = self.parked.lock().iter_mut().enumerate().filter_map(|(i, p)| p.take().map(|p| (i, p))).collect();
+        for (i, p) in parked {
+            let Parked { rec, freed, from, to, stopped, failed, state } = p;
+            commit(self, i, rec.cp.lock(), from, to, stopped, failed, state);
+            release(&rec, &freed);
+        }
+        let t = std::time::Instant::now();
+        let mut logged = false;
+        while self.active.load(Ordering::SeqCst) != 0 {
+            let mut g = self.lock.lock();
+            if self.active.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            let _ = self.cv.wait_for(&mut g, std::time::Duration::from_millis(100));
+            if !logged && t.elapsed() > std::time::Duration::from_secs(3) {
+                logged = true;
+                crate::warn!("gpu: a cancelled run waits > 3 s for its workers to leave ({} on it, posted {} of {}, turn {}, taken {})", self.active.load(Ordering::Acquire), self.posted.load(Ordering::Acquire), self.chunks.len(), self.turn.load(Ordering::Acquire), self.next.load(Ordering::Acquire));
+            }
+        }
     }
 
     fn leave(&self) {
@@ -367,9 +514,16 @@ impl Run {
 }
 
 pub struct Worker {
-    /// The worker's command processor (locked by the worker while it runs a
-    /// chunk).
-    cp: Mutex<Cp>,
+    /// The worker's recorders (each locked by the thread recording or
+    /// committing a chunk in it): its own first, spares after it (`tune
+    /// par_park`).
+    recs: Mutex<Vec<Arc<Recorder>>>,
+    /// Bumped when one of its recorders is free again (a parked chunk
+    /// committed): a worker without a free one waits on it.
+    freed: Arc<AtomicU64>,
+    /// Its name and kind (a spare recorder is made like its own).
+    name: String,
+    compute: bool,
     /// The run to take chunks of, and whether there is one (what a spinning
     /// worker looks at).
     /// Runs given it, taken in order (chained runs follow each other).
@@ -535,7 +689,8 @@ impl Pool {
                 crate::warn!("gpu[{wname}]: no executor for a parallel worker ({e})");
                 return None;
             }
-            let w = Arc::new(Worker { cp: Mutex::new(cp), job: Mutex::new(Default::default()), has_job: AtomicBool::new(false), wake: self.wake.clone(), pre: self.pre.clone() });
+            let rec = Arc::new(Recorder { cp: Mutex::new(cp), parked: AtomicBool::new(false) });
+            let w = Arc::new(Worker { recs: Mutex::new(vec![rec]), freed: Arc::new(AtomicU64::new(0)), name: wname.clone(), compute, job: Mutex::new(Default::default()), has_job: AtomicBool::new(false), wake: self.wake.clone(), pre: self.pre.clone() });
             let w2 = w.clone();
             let tname = wname.clone();
             let r = crate::thread::spawn_host(
@@ -613,13 +768,20 @@ fn run_worker(w: &Worker, name: &str) {
                 )
             };
         };
+        // (Counted on the run from here: a cancel waits for the workers
+        // recording or committing its chunks, not for those given it that
+        // are still busy with earlier runs, which may wait for recorders
+        // only the canceller's later work frees.)
+        run.active.fetch_add(1, Ordering::SeqCst);
         take_chunks(w, &run, name);
         run.leave();
     }
 }
 
 /// Records, submits and posts chunks of `run` until none is left or the run
-/// is cancelled.
+/// is cancelled. With `tune par_park` a long run's chunk recorded before its
+/// turn is parked in its recorder (`Run::park`) and the worker goes on into
+/// another; the thread that gives it its turn commits it.
 fn take_chunks(w: &Worker, run: &Run, name: &str) {
     let mut first = true;
     let lap = |k: usize, t: &mut std::time::Instant| {
@@ -627,7 +789,15 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         PHASE_NS[k].fetch_add((now - *t).as_nanos() as u64, Ordering::Relaxed);
         *t = now;
     };
+    let long = run.long.as_ref();
+    let park = long.is_some() && super::tune::par_park();
     loop {
+        if run.cancelled.load(Ordering::SeqCst) {
+            return;
+        }
+        // (A recorder before a chunk: a worker waiting for one holds none,
+        // so the earliest chunk not committed is always being recorded.)
+        let Some(rec) = w.recorder(run) else { return };
         if run.cancelled.load(Ordering::Acquire) {
             return;
         }
@@ -640,12 +810,11 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
             PHASE_NS[0].fetch_add((t - run.born).as_nanos() as u64, Ordering::Relaxed);
             STARTS.fetch_add(1, Ordering::Relaxed);
         }
-        let mut cp = w.cp.lock();
+        let mut cp = rec.cp.lock();
         cp.set_chunk_state(&state);
         cp.fe2_set_view(run.fe2_view);
         cp.chunk_start(&run.main_writes, &run.main_submitted);
         cp.chunk_costs = run.timed.then(|| Vec::with_capacity(512));
-        let long = run.long.as_ref();
         if let Some(l) = long {
             cp.long_begin(l.labels.get(i).cloned().unwrap_or_default(), l.inherited.get(i).map_or(&[][..], |v| &v[..]), l.planned.clone());
         }
@@ -655,104 +824,200 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         let stopped = r.unwrap_or(Some(from));
         lap(2, &mut t);
         cp.chunk_finish();
+        if long.is_some() {
+            // (Its held view of the forwarded copies goes with the recorder.)
+            cp.long_park();
+        }
         lap(3, &mut t);
         let ready = || run.turn.load(Ordering::Acquire) > i || run.cancelled.load(Ordering::Acquire);
+        let mut state = state;
+        if park && !ready() {
+            drop(cp);
+            match run.park(i, Parked { rec: rec.clone(), freed: w.freed.clone(), from, to, stopped, failed, state }) {
+                None => continue,
+                Some(p) => {
+                    // Its turn came meanwhile.
+                    state = p.state;
+                    cp = rec.cp.lock();
+                }
+            }
+        }
         if !ready() {
             let tl = super::timeline::mark();
             TURN_NS.fetch_add(run.wait_until(ready), Ordering::Relaxed);
             super::timeline::end(name, tl, || "wait: chunk turn".into());
         }
-        let mut t = std::time::Instant::now();
-        let granted = run.turn.load(Ordering::Acquire) > i;
-        // A long run's chunk at its turn: recorded again by the main command
-        // processor if it read on the CPU what the run before it writes (or
-        // used an image with a clear or reload pending), else its notes go to
-        // the image cache and its writes to the run's before it submits.
-        let dropped = match long {
-            Some(l) if granted && !failed => {
-                let earlier = l.writes.lock();
-                let d = if l.bad.load(Ordering::Acquire) { Some("an earlier chunk computed a planned copy otherwise") } else { cp.long_check(&earlier.0, &earlier.1) };
-                if d.is_some() && trace_long_drops() {
-                    static N: AtomicU64 = AtomicU64::new(0);
-                    if N.fetch_add(1, Ordering::Relaxed) < 60 {
-                        let r = cp.long_read_of(&earlier.0);
-                        let (a, n) = r.unwrap_or((0, 0));
-                        crate::info!("gpu[{name}]: long run chunk {i} at {from:#x}..{to:#x} dropped: {} (read {a:#x}+{n:#x}; {}; earlier writes there {:?})", d.unwrap_or(""), super::forward::describe(a, n), earlier.0.intersect(a, n));
-                    }
+        if commit(run, i, cp, from, to, stopped, failed, state) {
+            commit_parked(run, i + 1);
+        }
+    }
+}
+
+/// Chunk `i` of `run` at its turn, recorded in `cp` (or the run cancelled
+/// before its turn: discarded, not posted): a long run's is checked against
+/// what the run before it writes; then it is submitted and posted, or
+/// discarded and posted for the main command processor to record again.
+/// Returns whether it ran to its end and gave the next chunk its turn.
+#[allow(clippy::too_many_arguments)]
+fn commit(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, from: u64, to: u64, stopped: Option<u64>, failed: bool, state: Box<ChunkState>) -> bool {
+    let mut t = std::time::Instant::now();
+    let long = run.long.as_ref();
+    let granted = run.turn.load(Ordering::Acquire) > i;
+    // A long run's chunk at its turn: recorded again by the main command
+    // processor if it read on the CPU what the run before it writes (or
+    // used an image with a clear or reload pending), else its notes go to
+    // the image cache and its writes to the run's before it submits.
+    let dropped = match long {
+        Some(l) if granted && !failed => {
+            let earlier = l.writes.lock();
+            let d = if l.bad.load(Ordering::Acquire) { Some("an earlier chunk computed a planned copy otherwise") } else { cp.long_check(&earlier.0, &earlier.1) };
+            if d.is_some() && trace_long_drops() {
+                static N: AtomicU64 = AtomicU64::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 60 {
+                    let r = cp.long_read_of(&earlier.0);
+                    let (a, n) = r.unwrap_or((0, 0));
+                    crate::info!("gpu[{}]: long run chunk {i} at {from:#x}..{to:#x} dropped: {} (read {a:#x}+{n:#x}; {}; earlier writes there {:?})", cp.name, d.unwrap_or(""), super::forward::describe(a, n), earlier.0.intersect(a, n));
                 }
-                drop(earlier);
-                if d.is_none() {
-                    let writes = cp.worker_writes();
-                    let (nonfwd, mismatch) = cp.long_take();
-                    let mut g = l.writes.lock();
-                    g.0.extend(&writes);
-                    g.1.extend(&nonfwd);
-                    if mismatch {
-                        l.bad.store(true, Ordering::Release);
-                    }
-                }
-                d
             }
-            _ => None,
-        };
-        if let Some(why) = dropped {
-            LONG[3].fetch_add(1, Ordering::Relaxed);
-            bump(&LONG_DROPS, why);
-        }
-        if !granted || failed || dropped.is_some() {
-            // Cancelled before its turn, failed or dropped (the main command
-            // processor executes it from its start): never submitted.
-            cp.worker_discard();
-        }
-        if long.is_some() {
-            if granted && !failed && dropped.is_none() {
-                LONG[2].fetch_add(1, Ordering::Relaxed);
-                if stopped.is_some() {
-                    LONG[4].fetch_add(1, Ordering::Relaxed);
-                    bump(&LONG_STOPS, cp.worker_stop_why());
+            drop(earlier);
+            if d.is_none() {
+                let writes = cp.worker_writes();
+                let (nonfwd, mismatch) = cp.long_take();
+                let mut g = l.writes.lock();
+                g.0.extend(&writes);
+                g.1.extend(&nonfwd);
+                if mismatch {
+                    l.bad.store(true, Ordering::Release);
                 }
-                cp.long_commit();
-            } else {
-                cp.long_end();
+            }
+            d
+        }
+        _ => None,
+    };
+    if let Some(why) = dropped {
+        LONG[3].fetch_add(1, Ordering::Relaxed);
+        bump(&LONG_DROPS, why);
+    }
+    if !granted || failed || dropped.is_some() {
+        // Cancelled before its turn, failed or dropped (the main command
+        // processor executes it from its start): never submitted.
+        cp.worker_discard();
+    }
+    if long.is_some() {
+        if granted && !failed && dropped.is_none() {
+            LONG[2].fetch_add(1, Ordering::Relaxed);
+            if stopped.is_some() {
+                LONG[4].fetch_add(1, Ordering::Relaxed);
+                bump(&LONG_STOPS, cp.worker_stop_why());
+            }
+            cp.long_commit();
+        } else {
+            cp.long_end();
+        }
+    }
+    if !granted {
+        return false;
+    }
+    let done = if failed {
+        Done { stopped, state: *state, last: None, why: "failed", costs: Vec::new(), writes: Default::default() }
+    } else if let Some(why) = dropped {
+        Done { stopped: Some(from), state: *state, last: None, why, costs: Vec::new(), writes: Default::default() }
+    } else {
+        let writes = if super::runprobe::on() || super::tune::past_runs() { cp.worker_writes() } else { Default::default() };
+        let last = cp.worker_submit();
+        let why = if stopped.is_some() { cp.worker_stop_why() } else { "" };
+        let state = if long.is_some() { cp.chunk_state_stacked() } else { cp.chunk_state() };
+        Done { stopped, state, last, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes }
+    };
+    drop(cp);
+    run.results.lock()[i] = Some(done);
+    run.posted.store(i + 1, Ordering::Release);
+    let next = stopped.is_none() && dropped.is_none();
+    if next {
+        // The next chunk follows this one's end directly (the last one's:
+        // a run chained after this one).
+        run.turn.fetch_max(i + 2, Ordering::AcqRel);
+        if i + 1 == run.chunks.len() {
+            let chained = run.chained.lock().clone();
+            if let Some(n) = chained {
+                n.grant(0);
             }
         }
-        if !granted {
+    }
+    run.notify();
+    lap4(&mut t);
+    next
+}
+
+fn lap4(t: &mut std::time::Instant) {
+    PHASE_NS[4].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Commits the chunks parked from `i` on, in order, while their turn has
+/// come (each that runs to its end gives the next its turn).
+fn commit_parked(run: &Run, mut i: usize) {
+    loop {
+        if run.turn.load(Ordering::Acquire) <= i {
             return;
         }
-        let done = if failed {
-            Done { stopped, state: *state, last: None, why: "failed", costs: Vec::new(), writes: Default::default() }
-        } else if let Some(why) = dropped {
-            Done { stopped: Some(from), state: *state, last: None, why, costs: Vec::new(), writes: Default::default() }
-        } else {
-            let writes = if super::runprobe::on() || super::tune::past_runs() { cp.worker_writes() } else { Default::default() };
-            let last = cp.worker_submit();
-            let why = if stopped.is_some() { cp.worker_stop_why() } else { "" };
-            let state = if long.is_some() { cp.chunk_state_stacked() } else { cp.chunk_state() };
-            Done { stopped, state, last, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes }
-        };
-        drop(cp);
-        run.results.lock()[i] = Some(done);
-        run.posted.store(i + 1, Ordering::Release);
-        if stopped.is_none() && dropped.is_none() {
-            // The next chunk follows this one's end directly (the last one's:
-            // a run chained after this one).
-            run.turn.fetch_max(i + 2, Ordering::AcqRel);
-            if i + 1 == run.chunks.len() {
-                if let Some(n) = run.chained.lock().as_ref() {
-                    n.grant(0);
-                }
-            }
+        let Some(p) = run.take_parked(i) else { return };
+        let Parked { rec, freed, from, to, stopped, failed, state } = p;
+        let next = commit(run, i, rec.cp.lock(), from, to, stopped, failed, state);
+        PARKS[1].fetch_add(1, Ordering::Relaxed);
+        release(&rec, &freed);
+        if !next {
+            return;
         }
-        run.notify();
-        lap(4, &mut t);
+        i += 1;
     }
 }
 
 impl Worker {
-    /// Gives it `run` to take chunks of (`Run::active` counts it); it
-    /// starts once its pool wakes (`Pool::wake`).
+    /// A recorder of its own not holding a parked chunk: its own, else a
+    /// spare (made on first need, `RECORDERS` at most), else it waits for
+    /// one to be committed; None once `run` is cancelled meanwhile (its
+    /// canceller waits for this worker to leave it, and the parked chunks
+    /// may belong to an earlier run that stopped, whose next turn comes
+    /// from that same command processor).
+    fn recorder(&self, run: &Run) -> Option<Arc<Recorder>> {
+        let t = std::time::Instant::now();
+        let mut logged = false;
+        loop {
+            if !logged && t.elapsed() > std::time::Duration::from_secs(3) {
+                logged = true;
+                crate::warn!("gpu[{}]: waiting > 3 s for a free recorder ({} recorders, all holding parked chunks)", self.name, self.recs.lock().len());
+            }
+            let seen = self.freed.load(Ordering::Acquire);
+            {
+                let mut g = self.recs.lock();
+                if let Some(r) = g.iter().find(|r| !r.parked.load(Ordering::Acquire)) {
+                    return Some(r.clone());
+                }
+                if g.len() < RECORDERS {
+                    let mut cp = Cp::new(&self.name, self.compute);
+                    match cp.make_worker_exec() {
+                        Ok(()) => {
+                            let r = Arc::new(Recorder { cp: Mutex::new(cp), parked: AtomicBool::new(false) });
+                            g.push(r.clone());
+                            PARKS[3].fetch_add(1, Ordering::Relaxed);
+                            return Some(r);
+                        }
+                        Err(e) => crate::warn!("gpu[{}]: no executor for a spare recorder ({e})", self.name),
+                    }
+                }
+            }
+            if run.cancelled.load(Ordering::Acquire) {
+                return None;
+            }
+            PARKS[2].fetch_add(1, Ordering::Relaxed);
+            // (Woken by a release; a millisecond at most, for a cancel.)
+            unsafe { windows_sys::Win32::System::Threading::WaitOnAddress(Arc::as_ptr(&self.freed) as *const core::ffi::c_void, &seen as *const u64 as *const core::ffi::c_void, 8, 1) };
+        }
+    }
+
+    /// Gives it `run` to take chunks of; it starts once its pool wakes
+    /// (`Pool::wake`; `Run::active` counts it from then on).
     pub fn give(&self, run: Arc<Run>) {
-        run.active.fetch_add(1, Ordering::AcqRel);
         let mut job = self.job.lock();
         job.push_back(run);
         self.has_job.store(true, Ordering::Release);

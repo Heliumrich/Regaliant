@@ -4411,13 +4411,22 @@ pub fn wait_done_for(seq: u64, max: std::time::Duration) -> bool {
 }
 
 /// Blocks until batch `seq` and all earlier ones completed (with their actions).
+/// (A wait of more than 3 s is logged once, with its caller.)
+#[track_caller]
 pub fn wait_done(seq: u64) {
+    let t = std::time::Instant::now();
+    let mut logged = false;
     let mut d = DONE.lock();
     while *d < seq {
         if super::shutting_down() {
             return;
         }
         DONE_CV.wait_for(&mut d, std::time::Duration::from_millis(100));
+        if !logged && *d < seq && t.elapsed() > std::time::Duration::from_secs(3) {
+            logged = true;
+            let l = std::panic::Location::caller();
+            crate::warn!("gpu: waiting > 3 s for batch {seq} to complete (done {}) at {}:{}", *d, l.file(), l.line());
+        }
     }
 }
 
@@ -6859,6 +6868,8 @@ pub struct Exec {
     pub(crate) stop_why: &'static str,
     flush_why: &'static str,
     closed: Vec<Closed>,
+    /// Seals of the held work past a run, oldest first (`past_seal`).
+    seals: std::collections::VecDeque<SealParts>,
     /// SPAN_GEN when its oldest batch not yet submitted began (u64::MAX:
     /// none), registered in EXEC_GENS (`reap_spans`).
     open_gen: std::sync::Arc<AtomicU64>,
@@ -7346,6 +7357,24 @@ struct Closed {
     fe2_spans: Vec<(u64, vk::Buffer)>,
 }
 
+/// A seal of the graphics CP's held work past a run (`Exec::past_seal`):
+/// what of the held lists comes before it, counted from the seal before.
+struct SealParts {
+    closed: usize,
+    promises: usize,
+    cp_written: usize,
+}
+
+/// What a sealed part of the held work is checked by before it commits
+/// (`Cp::past_roll`): its CPU reads and used images, what its batches
+/// write, and its forwarded copies as at the seal.
+pub struct SealCheck {
+    pub reads: Vec<(u64, u64)>,
+    pub keys: HashSet<super::images::ImageKey>,
+    pub writes: super::ranges::Ranges,
+    pub fwd: Option<super::forward::HeldView>,
+}
+
 /// Slot sequence of a batch closed but not yet submitted.
 const PENDING: u64 = u64::MAX;
 /// Batch slots a deferred executor may create.
@@ -7512,6 +7541,7 @@ impl Exec {
                 stop_why: "",
                 flush_why: "",
                 closed: Vec::new(),
+                seals: Default::default(),
                 open_gen: {
                     let g = std::sync::Arc::new(AtomicU64::new(u64::MAX));
                     EXEC_GENS.lock().push(g.clone());
@@ -7758,6 +7788,9 @@ impl Exec {
             if slot.seq > done_seq() {
                 let t = std::time::Instant::now();
                 let tw = super::timeline::wait_start();
+                if !wait_done_for(slot.seq, std::time::Duration::from_secs(3)) {
+                    crate::warn!("gpu[{}]: waiting > 3 s for a free batch slot (batch {}, done {}; held {}, past {})", self.name, slot.seq, done_seq(), self.held, self.past);
+                }
                 wait_done(slot.seq);
                 tw.end(&self.name, || format!("wait: batch slot (#{})", slot.seq));
                 super::hitch::note_since(super::hitch::Kind::GpuWait, t, || format!("a free batch slot: the GPU behind (batch {})", slot.seq));
@@ -11357,6 +11390,14 @@ impl Exec {
         self.recording && !self.pending_promises.is_empty() && (self.submit_request.load(Ordering::Relaxed) || self.begun_at.elapsed() > super::tune::label_latency())
     }
 
+    /// Held past a run: whether another queue waits for a label of a batch
+    /// it closed and holds (a stretch going on into later title submissions,
+    /// `tune past_subs`, closes its batches at their ends); the stretch then
+    /// settles, as for the recording batch's (`submit_requested`).
+    pub fn held_label_requested(&self) -> bool {
+        self.past && !self.held_promises.is_empty() && self.submit_request.load(Ordering::Relaxed)
+    }
+
     /// Command labels (DS_GPU_LABELS=1, Nsight Graphics' GPU Trace): what
     /// is recorded from here to the next label is named `name` (a dispatch's
     /// or draw's program, or work of ours: merges, CP writes, timestamp
@@ -12007,6 +12048,9 @@ impl Exec {
         self.held = true;
         self.past = true;
         self.held_reset();
+        // (Its work so far was submitted: a request now is for a label it
+        // holds, `held_label_requested`.)
+        self.submit_request.store(false, Ordering::SeqCst);
         // Its forwarded copies stay its own until the stretch commits (the
         // run's workers record earlier commands meanwhile: `tune
         // forward_held`).
@@ -12034,6 +12078,7 @@ impl Exec {
         // Its forwarded copies become everyone's before its batches are
         // submitted (`forward::submitted` dates them).
         super::forward::hold_commit();
+        self.seals.clear();
         self.deferred = false;
         self.held = false;
         self.past = false;
@@ -12059,11 +12104,66 @@ impl Exec {
         self.submit_closed();
     }
 
+    /// The held work past a run is sealed here (`tune past_seal`: a long run
+    /// is chained after it): its open batch is closed, and what it holds up
+    /// to here commits before that run's chunks (`past_commit_sealed`). None
+    /// (not sealed) when it holds image notes (fast clears or overwrites:
+    /// they are not split) or its batch cannot be closed.
+    pub fn past_seal(&mut self) -> Option<SealCheck> {
+        if !self.past || self.past_grow || self.stopped || !self.held_clears.is_empty() || !self.held_over.is_empty() {
+            return None;
+        }
+        if self.recording {
+            self.submit_for("seal");
+        }
+        if self.recording || self.stopped {
+            return None;
+        }
+        let (c, p, w) = self.seals.iter().fold((0, 0, 0), |a, s| (a.0 + s.closed, a.1 + s.promises, a.2 + s.cp_written));
+        let mut writes = super::ranges::Ranges::new();
+        for x in &self.closed[c.min(self.closed.len())..] {
+            writes.extend(&x.writes);
+        }
+        self.seals.push_back(SealParts { closed: self.closed.len() - c, promises: self.held_promises.len().saturating_sub(p), cp_written: self.cp_written.len().saturating_sub(w) });
+        self.held_kinds.clear();
+        Some(SealCheck { reads: std::mem::take(&mut self.held_reads), keys: std::mem::take(&mut self.held_keys), writes, fwd: super::forward::hold_snapshot() })
+    }
+
+    /// A seal given back unused (no run was chained after it): what it took
+    /// out of the held lists goes back to them, and the work it closed stays
+    /// held with what follows.
+    pub fn past_unseal(&mut self, s: SealCheck) {
+        self.seals.pop_back();
+        self.held_reads.extend(s.reads);
+        self.held_keys.extend(s.keys);
+    }
+
+    /// Its held label writes (address, value, bytes): a run chained after
+    /// its held work sees them as written before it (`Cp::chain_next`).
+    pub fn held_promise_labels(&self) -> Vec<(u64, u64, u8)> {
+        self.held_promises.clone()
+    }
+
+    /// The oldest sealed part of the held work commits (`Cp::past_roll`):
+    /// its forwarded copies become everyone's, its batches go to the GPU with
+    /// their label writes; the rest stays held.
+    pub fn past_commit_sealed(&mut self, fwd: Option<super::forward::HeldView>) {
+        let Some(s) = self.seals.pop_front() else { return };
+        if let Some(v) = fwd {
+            super::forward::commit_snapshot(v);
+        }
+        self.held_promises.drain(..s.promises.min(self.held_promises.len()));
+        self.cp_written.drain(..s.cp_written.min(self.cp_written.len()));
+        let front: Vec<Closed> = self.closed.drain(..s.closed.min(self.closed.len())).collect();
+        self.submit_closed_list(front);
+    }
+
     /// What it recorded past the run is dropped (`Cp::past_settle`): its
     /// closed batches and its open one (begun past the run: the batch
     /// before it was submitted) never go to the GPU.
     pub fn past_drop(&mut self) {
         super::forward::hold_drop();
+        self.seals.clear();
         super::forward::drop_entries(&std::mem::take(&mut self.forward_ids));
         self.discard_closed();
         if self.recording {
@@ -12223,8 +12323,15 @@ impl Exec {
     /// main command processor, after the work before them); returns the
     /// last one's sequence. At shutdown they are dropped.
     pub fn submit_closed(&mut self) -> Option<u64> {
+        let all = std::mem::take(&mut self.closed);
+        self.submit_closed_list(all)
+    }
+
+    /// Submits `list`, batches this deferred executor closed, in order; the
+    /// last one's sequence.
+    fn submit_closed_list(&mut self, list: Vec<Closed>) -> Option<u64> {
         let mut last = None;
-        for b in std::mem::take(&mut self.closed) {
+        for b in list {
             if super::shutting_down() {
                 // Never submitted: free for reuse (begin resets a command
                 // buffer it records again).

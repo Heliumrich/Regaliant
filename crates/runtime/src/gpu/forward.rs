@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use super::shaders::{Prepared, Resolved};
 
 /// The words a copy leaves at `base` as the command processor computed them.
+#[derive(Clone)]
 struct Entry {
     id: u64,
     base: u64,
@@ -224,7 +225,62 @@ pub fn hold_begin() {
 /// (A long run's chunk publishes its own copies; the planner's it was given
 /// are the run's earlier chunks' to publish.)
 pub fn hold_commit() {
-    let Some(held) = HELD.with(|h| h.borrow_mut().take()) else { return };
+    if let Some(held) = HELD.with(|h| h.borrow_mut().take()) {
+        publish(held);
+    }
+}
+
+/// A held view taken off its thread (`hold_take`): a long run's chunk
+/// recorded before its turn, which the thread that gives it its turn
+/// commits (`par::Run::grant`).
+pub struct HeldView(Held);
+
+/// This thread's held view, taken off it (None: it has none).
+pub fn hold_take() -> Option<HeldView> {
+    HELD.with(|h| h.borrow_mut().take()).map(HeldView)
+}
+
+/// A held view taken off its thread is committed (as `hold_commit`).
+pub fn commit_held(v: HeldView) {
+    publish(v.0);
+}
+
+/// A copy of this thread's held view (a seal of the graphics CP's held
+/// work: what it forwarded up to there, `commit_snapshot`).
+pub fn hold_snapshot() -> Option<HeldView> {
+    HELD.with(|h| h.borrow().as_ref().map(|x| HeldView(Held { entries: x.entries.clone(), hidden: x.hidden.clone(), version: 0 })))
+}
+
+/// A sealed part of this thread's held work commits: what its view held at
+/// the seal becomes global, and the entries the work after the seal has
+/// ended since stay hidden from this thread's view (they are global now).
+pub fn commit_snapshot(v: HeldView) {
+    let ids: Vec<u64> = v.0.entries.iter().map(|e| e.id).collect();
+    publish(v.0);
+    HELD.with(|h| {
+        if let Some(x) = h.borrow_mut().as_mut() {
+            let mut changed = false;
+            for id in ids {
+                if !x.entries.iter().any(|e| e.id == id) && !x.hidden.contains(&id) {
+                    x.hidden.push(id);
+                    changed = true;
+                }
+            }
+            if changed {
+                x.version += 1;
+            }
+        }
+    });
+}
+
+/// A held view taken off its thread is dropped (as `hold_drop`).
+pub fn drop_held(v: HeldView) {
+    HELD_STATS[2].fetch_add(v.0.entries.len() as u64, Ordering::Relaxed);
+}
+
+/// A held stretch's entries become global and the global entries its
+/// writes ended go (`hold_commit`).
+fn publish(held: Held) {
     if held.entries.is_empty() && held.hidden.is_empty() {
         return;
     }

@@ -300,6 +300,15 @@ pub struct Cp {
     /// need not submit the batch (`tune cmdbuf_merge`).
     pub more_follows: Option<Box<dyn Fn() -> bool + Send>>,
     pub next_in_submission: bool,
+    /// A long run's chunk recorded before its turn: its held view of the
+    /// forwarded copies, taken off the recording thread (`long_park`) for
+    /// the thread that commits it.
+    fwd_held: Option<super::forward::HeldView>,
+    /// The title submission a stretch past a run was last dropped in while
+    /// it went on across submissions (`tune past_subs`): until execution is
+    /// past it, stretches stop at submission ends again (running the dropped
+    /// range again went past the same runs and was dropped the same way).
+    subs_after: u64,
     /// The queue's number of the title submission being run (set by the
     /// queue's worker), and where to run from again when what was recorded
     /// past a label wait in an earlier submission is dropped (`take_rewind_sub`:
@@ -496,6 +505,12 @@ pub struct ChunkState {
 /// planned, no run planned, not a run of the workers' alone].
 pub static CHAIN_WHY: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// The planner's sealed work between chained long runs (`tune
+/// past_seal`): [runs chained across it, seals refused (image notes held,
+/// its batch not closed), sealed parts committed while it recorded on
+/// (`Cp::past_roll`), committed at settling, dropped by their check].
+pub static SEALS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
 /// A label or timestamp write a long parallel run's planning passed (`tune
 /// long_runs`): its address, value and bytes (0: a timestamp, its value
 /// unknown) and its packet.
@@ -545,10 +560,11 @@ struct ParRun {
     end_unknown: Vec<u32>,
     /// A long run's label writes and planned copies, all of them (a run
     /// chained after it starts with them: `Cp::chain_next`), and the command
-    /// buffer it lies in.
+    /// buffer and title submission it lies in.
     labels: Vec<RunLabel>,
     planned: Vec<super::forward::Planned>,
     buf: usize,
+    sub: u64,
 }
 
 /// The graphics command processor recording past a parallel run before
@@ -559,6 +575,17 @@ struct Past {
     /// Long runs planned past it, each right after the one before
     /// (`Cp::chain_next`), in order.
     chained: Vec<ParRun>,
+    /// The planner's sealed work before each chained run (None: chained
+    /// directly, its first turn from the run before), aligned with
+    /// `chained` (`tune past_seal`).
+    seals: Vec<Option<Box<Sealed>>>,
+    /// What the runs collected while it recorded on wrote and the end state
+    /// the last of them posted (`Cp::past_roll`), and why sealed work failed
+    /// its check there (the stretch is then dropped from the end of `pr`,
+    /// the last of them).
+    writes: super::ranges::Ranges,
+    posted: Option<ChunkState>,
+    failed: Option<&'static str>,
     end_state: ChunkState,
     end_unknown: Vec<u32>,
     /// The submission's command buffer (`Cp::cur_buf`) the run ended in,
@@ -570,6 +597,35 @@ struct Past {
     pred: Option<Pred>,
     fence_pending: bool,
     began: Instant,
+}
+
+/// The graphics CP's held work between two long runs it chained (`tune
+/// past_seal`): what it is checked by before it commits, and the end state
+/// it was recorded from (the run before it, as walked).
+struct Sealed {
+    check: super::exec::SealCheck,
+    walked: ChunkState,
+    unknown: Vec<u32>,
+}
+
+/// Why sealed work fails its check once the runs before it were collected
+/// (None: it commits): the last of them posted another end state than the
+/// work was recorded from, the work read on the CPU what they wrote, or it
+/// used an image with a fast clear or reload pending.
+fn seal_bad(s: &Sealed, posted: &Option<ChunkState>, writes: &super::ranges::Ranges) -> Option<&'static str> {
+    if !posted.as_ref().is_some_and(|st| chunk_states_equal(st, &s.walked, &s.unknown)) {
+        return Some("end state (sealed work)");
+    }
+    if writes.overlaps_any(&s.check.reads) {
+        return Some("read the run's writes (sealed work)");
+    }
+    if !s.check.keys.is_empty() && super::images::any_pending() {
+        let keys: Vec<super::images::ImageKey> = s.check.keys.iter().copied().collect();
+        if super::images::with(|im| im.clears_pending(&keys) || im.overwrites_pending(&keys)) {
+            return Some("images with pending clears or reloads (sealed work)");
+        }
+    }
+    None
 }
 
 /// The graphics command processor recording past a wait on a label a
@@ -1763,6 +1819,8 @@ impl Cp {
             rewind_sub: None,
             more_follows: None,
             next_in_submission: false,
+            fwd_held: None,
+            subs_after: 0,
             ahead: std::collections::VecDeque::new(),
             cur_ahead: std::cell::RefCell::new([None, None]),
             scan_regs: std::cell::RefCell::new((Vec::new(), Vec::new())),
@@ -1806,18 +1864,23 @@ impl Cp {
         self.rewind_sub.is_some()
     }
 
-    /// Whether this command processor is recording past a label wait (the
-    /// queue's worker keeps the submissions it runs through meanwhile).
-    pub fn past_wait_active(&self) -> bool {
-        self.past_wait.is_some()
+    /// Whether recording past a run goes on at the end of the command buffer
+    /// being run into the submission's next one instead of stopping there,
+    /// or with `tune past_subs` into the next title submission when one is
+    /// queued. (Going on into the next submission too lost 2.8% in the old
+    /// front end, FINDINGS.md 2026-10-23: longer stretches held work back
+    /// from the GPU.)
+    fn past_goes_on(&self) -> bool {
+        let more = || self.more_follows.as_ref().is_some_and(|f| f());
+        self.depth == 1 && (self.past.as_ref().is_some_and(|p| p.across && (self.next_in_submission || (super::tune::past_subs() && self.sub_index > self.subs_after && more()))) || (self.past_wait.is_some() && (self.next_in_submission || more())))
     }
 
-    /// Whether recording past a run goes on at the end of the command buffer
-    /// being run into the submission's next one instead of stopping there.
-    /// (Going on into the next submission too lost 2.8%, FINDINGS.md
-    /// 2026-10-23: longer stretches hold work back from the GPU.)
-    fn past_goes_on(&self) -> bool {
-        self.depth == 1 && (self.past.as_ref().is_some_and(|p| p.across && self.next_in_submission) || (self.past_wait.is_some() && (self.next_in_submission || self.more_follows.as_ref().is_some_and(|f| f()))))
+    /// Whether what this command processor records now may be recorded
+    /// again from an earlier title submission (a stretch past a label wait,
+    /// or past a run with `tune past_subs`): the queue's worker keeps the
+    /// submissions it runs through meanwhile (`take_rewind_sub`).
+    pub fn holds_across(&self) -> bool {
+        self.past_wait.is_some() || (self.past.is_some() && super::tune::past_subs())
     }
 
     pub fn chunk_state(&self) -> ChunkState {
@@ -2115,10 +2178,19 @@ impl Cp {
         self.exec.as_ref().and_then(|e| e.long_conflict_read(earlier))
     }
 
+    /// The long run's chunk it recorded keeps its held view of the forwarded
+    /// copies with it (taken off this thread): any thread may commit it.
+    pub fn long_park(&mut self) {
+        self.fwd_held = super::forward::hold_take();
+    }
+
     /// The chunk passed its check (`Exec::long_commit`).
     pub fn long_commit(&mut self) {
         self.held = None;
-        super::forward::hold_commit();
+        match self.fwd_held.take() {
+            Some(v) => super::forward::commit_held(v),
+            None => super::forward::hold_commit(),
+        }
         if let Some(e) = self.exec.as_mut() {
             e.long_commit();
         }
@@ -2127,7 +2199,10 @@ impl Cp {
     /// The chunk was dropped, cancelled or failed (`Exec::long_end`).
     pub fn long_end(&mut self) {
         self.held = None;
-        super::forward::hold_drop();
+        match self.fwd_held.take() {
+            Some(v) => super::forward::drop_held(v),
+            None => super::forward::hold_drop(),
+        }
         if let Some(e) = self.exec.as_mut() {
             e.long_end();
         }
@@ -2347,8 +2422,11 @@ impl Cp {
     /// order (noted in `labels`), and waits that pass on the run's last write
     /// to their label or on memory now (or a promise). A wait passed on a
     /// value the CPU wrote sets `cpu_wait`: the copy cache's scope ends when
-    /// the run is planned, before any of it is recorded.
-    fn long_passes(opc: u32, n: u64, at: u64, p: &dyn Fn(u64) -> u32, labels: &mut Vec<RunLabel>, cpu_wait: &mut bool) -> bool {
+    /// the run is planned, before any of it is recorded. One passed on a
+    /// value a GPU queue's CP wrote or promised notes that queue in
+    /// `writers` (None: not known): under front end 2 the planner adopts
+    /// their views, as passing the wait would.
+    fn long_passes(opc: u32, n: u64, at: u64, p: &dyn Fn(u64) -> u32, labels: &mut Vec<RunLabel>, cpu_wait: &mut bool, writers: &mut Vec<Option<String>>) -> bool {
         match opc {
             op::EVENT_WRITE | op::ACQUIRE_MEM | op::PFP_SYNC_ME | op::CLEAR_STATE => true,
             op::WRITE_DATA => {
@@ -2405,14 +2483,21 @@ impl Cp {
                     return false;
                 }
                 let v = if wide { unsafe { rd64(a) } } else { (unsafe { rd32(a) }) as u64 };
+                let last = last_write(a);
                 if compare(func, v & mask, reference & mask) {
-                    let by_gpu = last_write(a).is_some_and(|(q, w, _)| q.starts_with("gpu-") && if wide { w == v } else { w as u32 == v as u32 });
-                    if !by_gpu {
+                    let by_gpu = last.as_ref().is_some_and(|(q, w, _)| q.starts_with("gpu-") && if wide { *w == v } else { *w as u32 == v as u32 });
+                    if by_gpu {
+                        writers.push(last.map(|w| w.0));
+                    } else {
                         *cpu_wait = true;
                     }
                     return true;
                 }
-                promised(a, wide, func, mask, reference).is_some()
+                if promised(a, wide, func, mask, reference).is_none() {
+                    return false;
+                }
+                writers.push(last.map(|w| w.0).filter(|q| q.starts_with("gpu-")));
+                true
             }
             _ => false,
         }
@@ -2567,6 +2652,7 @@ impl Cp {
         let mut labels: Vec<RunLabel> = seed.as_ref().map(|s| s.0.iter().map(|l| RunLabel { at: 0, ..*l }).collect()).unwrap_or_default();
         let mut soft = false;
         let mut cpu_wait = false;
+        let mut writers: Vec<Option<String>> = Vec::new();
         // The run's signature: its packet headers (opcode and size), the
         // same when the title records the same pass again.
         let mut sig = 0xcbf2_9ce4_8422_2325u64;
@@ -2635,7 +2721,7 @@ impl Cp {
                 }
             } else if par_event(opc, self.compute) {
                 sync = true;
-            } else if long && !is_state(opc) && Self::long_passes(opc, n, at, &p, &mut labels, &mut cpu_wait) {
+            } else if long && !is_state(opc) && Self::long_passes(opc, n, at, &p, &mut labels, &mut cpu_wait, &mut writers) {
                 sync = true;
                 soft = true;
             } else if !is_state(opc) {
@@ -2921,6 +3007,13 @@ impl Cp {
             super::precache::end_scope(1);
             self.fe2_sync(None);
         }
+        if soft {
+            // Waits passed on other queues' labels: their views (front end
+            // 2), as passing them would adopt.
+            for w in &writers {
+                self.fe2_adopt(w.as_deref());
+            }
+        }
         let queue = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
         let submitted = Arc::new(std::sync::atomic::AtomicBool::new(!submit_after));
         let long_writes = soft.then(|| main_writes.clone());
@@ -2955,7 +3048,7 @@ impl Cp {
         super::par::RUNS.fetch_add(1, Ordering::Relaxed);
         super::par::CHUNKS.fetch_add(starts.len() as u64, Ordering::Relaxed);
         let buf = self.cur_buf;
-        self.par = Some(ParRun { starts, end: run_end, next: 0, run, waited_ns: 0, sync, sig, n, firsts, writes: Default::default(), end_state, end_unknown, labels, planned, buf });
+        self.par = Some(ParRun { starts, end: run_end, next: 0, run, waited_ns: 0, sync, sig, n, firsts, writes: Default::default(), end_state, end_unknown, labels, planned, buf, sub: self.sub_index });
         lap.mark(5);
         PLAN_PHASES[6].fetch_add(1, Ordering::Relaxed);
     }
@@ -3252,7 +3345,7 @@ impl Cp {
         let end = pr.end;
         self.set_chunk_state(&end_state);
         let across = self.depth == 1;
-        self.past = Some(Box::new(Past { pr, chained: Vec::new(), end_state, end_unknown, buf: self.cur_buf, across, stack: self.ctx_stack.clone(), markers: self.markers.clone(), pred: self.pred.clone(), fence_pending: self.fence_pending, began: Instant::now() }));
+        self.past = Some(Box::new(Past { pr, chained: Vec::new(), seals: Vec::new(), writes: Default::default(), posted: None, failed: None, end_state, end_unknown, buf: self.cur_buf, across, stack: self.ctx_stack.clone(), markers: self.markers.clone(), pred: self.pred.clone(), fence_pending: self.fence_pending, began: Instant::now() }));
         self.held = Some(Box::new(super::frameahead::HeldCp { frames: u64::MAX, labels: HashMap::new(), stop: None, commands: 0, waits: [0; 5], poll: false }));
         if let Some(e) = self.exec.as_mut() {
             e.past_begin();
@@ -3278,12 +3371,24 @@ impl Cp {
         let t = Instant::now();
         // The run gone past, then the runs chained after it, in order; a
         // stop in one cancels those after it.
+        let n_chained = past.chained.len();
+        let first_start = past.pr.starts.first().copied().unwrap_or(0);
         let mut runs: std::collections::VecDeque<ParRun> = std::mem::take(&mut past.chained).into();
+        let mut seals: std::collections::VecDeque<Option<Box<Sealed>>> = std::mem::take(&mut past.seals).into();
         let mut pr = past.pr;
-        let mut writes = super::ranges::Ranges::new();
-        let mut end_state: Option<ChunkState> = None;
+        // (Runs collected while it recorded on, `past_roll`: what they wrote
+        // and the last one's end state.)
+        let mut writes = std::mem::take(&mut past.writes);
+        let mut end_state: Option<ChunkState> = past.posted.take();
         let mut stopped: Option<(u64, ChunkState)> = None;
-        loop {
+        let mut sealed_drop = past.failed;
+        if sealed_drop.is_some() {
+            for r in runs.drain(..) {
+                r.run.cancel();
+                super::par::CANCELLED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        while sealed_drop.is_none() {
         while pr.next < pr.starts.len() {
             let i = pr.next;
             pr.next += 1;
@@ -3320,6 +3425,30 @@ impl Cp {
         match runs.pop_front() {
             Some(next) => {
                 super::par::note_main_wait(pr.waited_ns);
+                // The planner's work sealed before it: checked against the
+                // runs before it and committed, then its chunks' turn.
+                if let Some(s) = seals.pop_front().flatten() {
+                    if let Some(why) = seal_bad(&s, &end_state, &writes) {
+                        SEALS[4].fetch_add(1, Ordering::Relaxed);
+                        sealed_drop = Some(why);
+                        next.run.cancel();
+                        super::par::CANCELLED.fetch_add(1, Ordering::Relaxed);
+                        for r in runs.drain(..) {
+                            r.run.cancel();
+                            super::par::CANCELLED.fetch_add(1, Ordering::Relaxed);
+                        }
+                        break;
+                    }
+                    if let Some(log) = next.run.long_writes() {
+                        let mut g = log.lock();
+                        g.0.extend(&s.check.writes);
+                        g.1.extend(&s.check.writes);
+                    }
+                    if let Some(e) = self.exec.as_mut() {
+                        e.past_commit_sealed(s.check.fwd);
+                    }
+                    SEALS[3].fetch_add(1, Ordering::Relaxed);
+                }
                 pr = next;
             }
             None => break,
@@ -3332,6 +3461,8 @@ impl Cp {
         let e = self.exec.as_mut().unwrap();
         let dropped = if stopped.is_some() {
             Some("a chunk stopped")
+        } else if sealed_drop.is_some() {
+            sealed_drop
         } else if !end_state.as_ref().is_some_and(|s| chunk_states_equal(s, &past.end_state, &past.end_unknown)) {
             Some("end state")
         } else if writes.overlaps_any(e.held_reads()) {
@@ -3363,9 +3494,11 @@ impl Cp {
         self.pred = past.pred;
         self.fence_pending = past.fence_pending;
         self.drop_ahead();
-        // (The command buffer the stop or the last run's end is in.)
+        // (The command buffer and title submission the stop or the last
+        // run's end is in.)
         let stopped_buf = stopped.as_ref().map(|_| pr.buf);
         let last_buf = pr.buf;
+        let run_sub = pr.sub;
         let to = match stopped {
             Some((s, st)) => {
                 self.set_chunk_state(&st);
@@ -3387,13 +3520,114 @@ impl Cp {
                 pr.end
             }
         };
-        // The run ended in an earlier command buffer: the worker goes back.
+        // The run ended in an earlier command buffer: the worker goes back
+        // (into an earlier title submission with `tune past_subs`).
         let buf = if stopped_buf.is_some() { stopped_buf.unwrap() } else { last_buf };
+        if run_sub != self.sub_index {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 40 {
+                crate::info!("gpu[{}]: stretch past a run dropped ({}; stop: {why}) back into submission {run_sub} at {to:#x} from submission {} (the first run gone past from {first_start:#x}, {n_chained} chained after it)", self.name, dropped.unwrap_or("?"), self.sub_index);
+            }
+            self.subs_after = self.subs_after.max(self.sub_index);
+            self.rewind_sub = Some((run_sub, buf, to));
+            return None;
+        }
         if buf != self.cur_buf {
             self.rewind = Some((buf, to));
             return None;
         }
         Some(to)
+    }
+
+    /// The planner's sealed work past runs (`tune past_seal`): once the runs
+    /// before the oldest seal posted every chunk, none stopped, they are
+    /// collected here and the sealed work is checked as a settle checks it;
+    /// it then commits and the run after it gets its first turn while this
+    /// command processor records on. A stopped chunk or a failed check makes
+    /// the stretch stop here and settle (dropped from that run's end).
+    fn past_roll(&mut self, cur: u64) {
+        let k = {
+            let Some(p) = self.past.as_ref() else { return };
+            if p.failed.is_some() {
+                return;
+            }
+            let Some(k) = p.seals.iter().position(|s| s.is_some()) else { return };
+            let mut stopped = false;
+            for r in std::iter::once(&p.pr).chain(p.chained[..k].iter()) {
+                match r.run.posted_stop() {
+                    None => return,
+                    Some(s) => stopped |= s,
+                }
+            }
+            if stopped {
+                self.held_stop("a chunk stopped", cur);
+                return;
+            }
+            k
+        };
+        let mut p = self.past.take().unwrap();
+        let mut writes = std::mem::take(&mut p.writes);
+        let mut posted = p.posted.take();
+        let next = p.chained.remove(k);
+        let sealed = p.seals.remove(k).expect("a seal at k");
+        let mut before = vec![std::mem::replace(&mut p.pr, next)];
+        before.extend(p.chained.drain(..k));
+        p.seals.drain(..k);
+        for r in before.iter_mut() {
+            if let Some(s) = self.collect_posted(r, &mut writes) {
+                posted = Some(s);
+            }
+        }
+        if let Some(why) = seal_bad(&sealed, &posted, &writes) {
+            SEALS[4].fetch_add(1, Ordering::Relaxed);
+            // Dropped there: the stretch settles now, back to the end of the
+            // last run before the seal (the runs after it are cancelled).
+            let last = before.pop().expect("a run before the seal");
+            let next = std::mem::replace(&mut p.pr, last);
+            p.chained.insert(0, next);
+            p.seals.insert(0, None);
+            p.writes = writes;
+            p.posted = posted;
+            p.failed = Some(why);
+            self.past = Some(p);
+            self.held_stop("sealed work dropped", cur);
+            return;
+        }
+        if let Some(log) = p.pr.run.long_writes() {
+            let mut g = log.lock();
+            g.0.extend(&sealed.check.writes);
+            g.1.extend(&sealed.check.writes);
+        }
+        if let Some(e) = self.exec.as_mut() {
+            e.past_commit_sealed(sealed.check.fwd);
+        }
+        SEALS[2].fetch_add(1, Ordering::Relaxed);
+        p.writes = writes;
+        p.posted = posted;
+        let run = p.pr.run.clone();
+        self.past = Some(p);
+        run.grant(0);
+    }
+
+    /// Collects the rest of `r`, every chunk posted and none stopped
+    /// (`past_roll`): what they write joins `writes`; the last one's end
+    /// state.
+    fn collect_posted(&mut self, r: &mut ParRun, writes: &mut super::ranges::Ranges) -> Option<ChunkState> {
+        let mut st = None;
+        while r.next < r.starts.len() {
+            let i = r.next;
+            r.next += 1;
+            r.run.grant(i);
+            let (done, waited) = r.run.collect(i);
+            r.waited_ns += waited;
+            if let (Some(seq), Some(e)) = (done.last, self.exec.as_mut()) {
+                e.depend_on(seq, false);
+            }
+            writes.extend(&done.writes);
+            st = Some(done.state);
+        }
+        super::par::note_main_wait(r.waited_ns);
+        st
     }
 
     /// Past a long run with nothing recorded since (`tune long_runs`): the
@@ -3418,14 +3652,39 @@ impl Cp {
             4
         };
         CHAIN_WHY[why].fetch_add(1, Ordering::Relaxed);
-        if why != 4 {
+        // Work recorded past the runs: sealed, to commit before this run's
+        // chunks get their turn (`tune past_seal`), else it settles first.
+        let mut sealed: Option<Box<Sealed>> = None;
+        if (why == 1 || why == 2) && super::tune::past_seal() && self.held.as_ref().is_some_and(|h| h.stop.is_none()) && super::images::with(|im| im.pending_clear_keys().is_empty()) {
+            let (walked, unknown) = {
+                let p = self.past.as_ref().unwrap();
+                (p.end_state.clone(), p.end_unknown.clone())
+            };
+            match self.exec.as_mut().and_then(|e| e.past_seal()) {
+                Some(check) => sealed = Some(Box::new(Sealed { check, walked, unknown })),
+                None => {
+                    SEALS[1].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        if why != 4 && sealed.is_none() {
             return None;
+        }
+        let mut labels = {
+            let p = self.past.as_ref().unwrap();
+            p.chained.last().unwrap_or(&p.pr).labels.clone()
+        };
+        if sealed.is_some() {
+            // (The sealed work's label writes come before the run too.)
+            if let Some(e) = self.exec.as_ref() {
+                labels.extend(e.held_promise_labels().into_iter().map(|(a, v, bytes)| RunLabel { a, v, bytes, at: 0 }));
+            }
         }
         let last = {
             let p = self.past.as_ref().unwrap();
             p.chained.last().unwrap_or(&p.pr)
         };
-        self.chain_seed = Some((last.labels.clone(), last.planned.clone(), last.run.long_writes()));
+        self.chain_seed = Some((labels, last.planned.clone(), last.run.long_writes()));
         // (Planning is done unheld; the planner's own executor records
         // nothing for a long run.)
         let held = self.held.take();
@@ -3434,17 +3693,30 @@ impl Cp {
         self.chain_seed = None;
         let Some(pr) = self.par.take() else {
             CHAIN_WHY[5].fetch_add(1, Ordering::Relaxed);
+            if let (Some(s), Some(e)) = (sealed, self.exec.as_mut()) {
+                e.past_unseal(s.check);
+            }
             return None;
         };
         if pr.starts.first() != Some(&cur) || !pr.run.is_long() || pr.end_state.is_none() {
             CHAIN_WHY[6].fetch_add(1, Ordering::Relaxed);
+            if let (Some(s), Some(e)) = (sealed, self.exec.as_mut()) {
+                e.past_unseal(s.check);
+            }
             // Not a long run of the workers' alone: given back to be
             // collected as usual (it starts here).
             self.par = Some(pr);
             return None;
         }
         let p = self.past.as_mut().unwrap();
-        p.chained.last().unwrap_or(&p.pr).run.chain(&pr.run);
+        // (After sealed work its first turn comes once that work commits:
+        // `past_roll`, or the settle.)
+        if sealed.is_none() {
+            p.chained.last().unwrap_or(&p.pr).run.chain(&pr.run);
+        } else {
+            SEALS[0].fetch_add(1, Ordering::Relaxed);
+        }
+        p.seals.push(sealed);
         let st = pr.end_state.clone().unwrap();
         p.end_state = st.clone();
         p.end_unknown = pr.end_unknown.clone();
@@ -3474,6 +3746,7 @@ impl Cp {
         let long = super::tune::long_runs() && self.main_gfx && !self.compute;
         let mut labels: Vec<RunLabel> = Vec::new();
         let mut cpu_wait = false;
+        let mut writers = Vec::new();
         let run_end = loop {
             if c >= end || !valid(c, 4) {
                 break c;
@@ -3512,7 +3785,7 @@ impl Cp {
                 }
             } else if !(opc == op::SET_BASE || par_event(opc, self.compute) || is_state(opc)) {
                 let at = c;
-                if !(long && Self::long_passes(opc, len, at, &|i: u64| f.rd(at + 4 * (1 + i)), &mut labels, &mut cpu_wait)) {
+                if !(long && Self::long_passes(opc, len, at, &|i: u64| f.rd(at + 4 * (1 + i)), &mut labels, &mut cpu_wait, &mut writers)) {
                     break c;
                 }
             }
@@ -4981,6 +5254,11 @@ impl Cp {
                 // them would run without its inputs. Nothing more runs.
                 break;
             }
+            // The planner's sealed work past runs commits as the runs
+            // before it post (`tune past_seal`).
+            if self.past.as_ref().is_some_and(|p| !p.seals.is_empty()) {
+                self.past_roll(cur);
+            }
             if self.held.is_some() && self.held_halted(cur, cur) {
                 if self.past.is_some() || self.past_wait.is_some() {
                     match self.settle_held() {
@@ -5259,8 +5537,9 @@ impl Cp {
             }
             // (Past a label wait, the queue asking waits for what follows the
             // wait in any case: it gets the label when the stretch settles.)
-            if self.past.is_some() && self.exec.as_ref().is_some_and(|e| e.submit_requested()) {
-                // Another queue waits for a label written past the run.
+            if self.past.is_some() && self.exec.as_ref().is_some_and(|e| e.submit_requested() || e.held_label_requested()) {
+                // Another queue waits for a label written past the run (in
+                // the recording batch or one closed and held since).
                 self.held_stop("label", next);
                 match self.settle_held() {
                     Some(c) => {
@@ -5304,8 +5583,11 @@ impl Cp {
             self.rewind = None;
         }
         // A parallel run planned in this buffer ends in it (unless execution
-        // goes back into it: `take_rewind`).
-        if self.par.is_some() && self.rewind.is_none() {
+        // goes back into it: `take_rewind`, or into an earlier submission:
+        // `take_rewind_sub`, a stretch past a run dropped there, the run kept
+        // to collect from a chunk's stop; cancelled, the run was planned
+        // again at the stop and its chunk stopped there again, endlessly).
+        if self.par.is_some() && self.rewind.is_none() && self.rewind_sub.is_none() {
             self.par_cancel();
         }
         self.depth -= 1;

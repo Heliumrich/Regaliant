@@ -2258,7 +2258,12 @@ pub fn init() {
     // (GPU-resolved chains stay as set: stage F3, they read the mirror at
     // guest offsets, `Spec::pt_linear`, their per-item ranges placed per
     // command, `exec::fe2_gpu_ranges`.)
-    const OFF: [&str; 10] = ["long_runs", "frame_ahead", "homes", "keep_small", "draw_args_gpu", "gpu_loads", "shadow_args", "pre_share", "host_census", "gpu_mirror"];
+    // (So do long runs, off by default: a chunk recorded before an earlier
+    // one still uploads what it finds invalid, its uploads read guest memory
+    // when they execute, after the earlier chunks' write-backs, and its pages
+    // are valid only once it is queued, in program order; its CPU reads are
+    // checked at its turn against the run's earlier writes as before.)
+    const OFF: [&str; 9] = ["frame_ahead", "homes", "keep_small", "draw_args_gpu", "gpu_loads", "shadow_args", "pre_share", "host_census", "gpu_mirror"];
     for name in OFF {
         if !super::tune::set(name, 0) {
             crate::warn!("fe2: no switch {name}");

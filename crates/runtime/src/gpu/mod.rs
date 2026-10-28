@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 190] = [
+    static ALL: [Tunable; 193] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -223,6 +223,9 @@ pub mod tune {
         Tunable { name: "rgm", env: "DS_RGM", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "long_runs", env: "DS_LONG_RUNS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "submit_coalesce", env: "DS_SUBMIT_COALESCE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "past_subs", env: "DS_PAST_SUBS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par_park", env: "DS_PAR_PARK", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "past_seal", env: "DS_PAST_SEAL", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2078,6 +2081,33 @@ pub mod tune {
         get(189)
     }
 
+    /// Recording past a parallel run goes on at its submission's end into
+    /// the next title submission when one is queued (`Cp::past_goes_on`; the
+    /// queue's worker keeps the submissions it runs through, as for a
+    /// stretch past a label wait), so that a long run there can be chained
+    /// after the runs gone past (`Cp::chain_next`). Off by default: in the
+    /// old front end it lost 2.8% (FINDINGS.md 2026-10-23).
+    pub fn past_subs() -> bool {
+        get(190) != 0
+    }
+
+    /// A worker whose long-run chunk is recorded before its turn parks it
+    /// in its recorder and records the next chunk into a spare one instead
+    /// of waiting for the turn; the thread that gives the parked chunk its
+    /// turn commits it (`par::take_chunks`, `Run::grant`).
+    pub fn par_park() -> bool {
+        get(191) != 0
+    }
+
+    /// A long run is chained after the graphics CP's own held work past the
+    /// runs before it (`Cp::chain_next`): that work is sealed (`Exec::past_seal`)
+    /// and committed once the runs before it are all posted and it passes
+    /// their checks, while the CP records on (`Cp::past_roll`); then the run's
+    /// chunks get their turn.
+    pub fn past_seal() -> bool {
+        get(192) != 0
+    }
+
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
     /// without appends).
     #[inline]
@@ -2511,12 +2541,23 @@ fn worker(q: &'static Queue, name: &str) {
         let batch = {
             let mut g = q.pending.lock();
             let mut idle = None;
+            let mut since: Option<std::time::Instant> = None;
             let b = loop {
                 if let Some(b) = g.pop_front() {
                     break b;
                 }
                 idle = idle.or_else(timeline::mark);
-                q.cv.wait(&mut g);
+                if cp.holds_across() {
+                    // (Recording past a run or a label wait with no title
+                    // submission to go on with: what it holds waits too.)
+                    let t = *since.get_or_insert_with(std::time::Instant::now);
+                    if q.cv.wait_for(&mut g, std::time::Duration::from_secs(1)).timed_out() && t.elapsed() > std::time::Duration::from_secs(2) && since.is_some() {
+                        crate::warn!("gpu[{name}]: no title submission for 2 s while recording past a run or label wait (its held work waits too)");
+                        since = None;
+                    }
+                } else {
+                    q.cv.wait(&mut g);
+                }
             };
             timeline::end(name, idle, || "idle: no title submission".into());
             b
@@ -2542,19 +2583,26 @@ fn worker(q: &'static Queue, name: &str) {
         if q.id == GFX && frameahead::on() {
             frameahead::post(&cp, batch.index, &batch.bufs, batch.at);
         }
-        // Recording past a label wait runs on through submissions: they are
-        // kept until it settles, to run again from the wait if what was
-        // recorded past it is dropped (`Cp::take_rewind_sub`).
-        if cp.past_wait_active() {
+        // Recording past a label wait (or past a run, `tune past_subs`) runs
+        // on through submissions: they are kept until it settles, to run
+        // again from the wait or the run's end if what was recorded past it
+        // is dropped (`Cp::take_rewind_sub`).
+        if cp.holds_across() {
             kept.push(Kept { index: batch.index, bufs: batch.bufs.clone(), at: batch.at });
         }
         run_submission(&mut cp, &batch, name);
         while let Some((s, buf, addr)) = cp.take_rewind_sub() {
             let Some(k) = kept.iter().position(|x| x.index == s) else {
-                crate::error!("gpu[{name}]: a stretch past a label wait was dropped but submission {s} is not kept; going on");
+                crate::error!("gpu[{name}]: a stretch past a label wait or run was dropped but submission {s} is not kept; going on");
                 break;
             };
-            let again: Vec<Kept> = kept.drain(k..).collect();
+            // (They stay kept while they run again: a stretch recorded there
+            // may be dropped again, back into one of them.)
+            static REWINDS: AtomicU64 = AtomicU64::new(0);
+            if REWINDS.fetch_add(1, Ordering::Relaxed) < 40 {
+                crate::info!("gpu[{name}]: going back into submission {s} at {addr:#x} (buffer {buf}; {} submissions kept, from {})", kept.len(), kept.first().map_or(0, |x| x.index));
+            }
+            let again: Vec<Kept> = kept[k..].to_vec();
             for (j, x) in again.iter().enumerate() {
                 let from = if j == 0 { Some((buf, addr)) } else { None };
                 run_kept(&mut cp, x, from, name);
@@ -2563,7 +2611,7 @@ fn worker(q: &'static Queue, name: &str) {
                 }
             }
         }
-        if cp.past_wait_active() {
+        if cp.holds_across() {
             if !kept.iter().any(|x| x.index == batch.index) {
                 kept.push(Kept { index: batch.index, bufs: batch.bufs.clone(), at: batch.at });
             }
@@ -2583,7 +2631,8 @@ fn worker(q: &'static Queue, name: &str) {
 }
 
 /// A submission kept while the graphics command processor records past a
-/// label wait (its number, command buffers and arrival).
+/// label wait or a run (its number, command buffers and arrival).
+#[derive(Clone)]
 struct Kept {
     index: u64,
     bufs: Vec<(u64, u32)>,
@@ -2606,7 +2655,10 @@ fn run_kept(cp: &mut cp::Cp, k: &Kept, from: Option<(usize, u64)>, name: &str) {
         cp.next_in_submission = i + 1 < nbufs;
         cp.cur_buf = i;
         match at.take() {
-            Some(a) if a >= addr && a < addr + 4 * size as u64 => cp.run(a, size - ((a - addr) / 4) as u32),
+            // (Its end too: a run gone past that ended there, nothing left
+            // of the buffer to run; taken for outside, the buffer ran again
+            // from its start.)
+            Some(a) if a >= addr && a <= addr + 4 * size as u64 => cp.run(a, size - ((a - addr) / 4) as u32),
             Some(a) => {
                 crate::error!("gpu[{name}]: rewind to {a:#x} outside its command buffer {addr:#x}");
                 cp.run(addr, size)
