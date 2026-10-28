@@ -486,8 +486,8 @@ fn arm_gpu() -> bool {
 }
 
 /// Where pages may be armed (the executor's import list): calls its third
-/// argument with the parts of [a, b) inside settled import windows, the
-/// list held meanwhile; false: the list was busy.
+/// argument with the parts of [a, b) inside settled import windows (asked
+/// again under the arm lock: `arm_part`); false: the list was busy.
 pub type Armable = dyn Fn(u64, u64, &mut dyn FnMut(u64, u64)) -> bool;
 
 /// Front end 2 runs (wanted, and its self-test passed).
@@ -1203,15 +1203,7 @@ pub fn host_write_begin(base: u64, len: u64) {
     if !on() || len == 0 {
         return;
     }
-    {
-        // (An arming that checked before this is done by now, and the
-        // caller's disarm after this undoes it: `arm_part`.)
-        let t = std::time::Instant::now();
-        let _lock = crate::hosted::arm_lock();
-        super::hitch::note_since(super::hitch::Kind::Mirror, t, || format!("a file read into {base:#x}+{len:#x} waiting for an arming"));
-        HOST_WRITES.lock().push((base, base.saturating_add(len)));
-        HOST_WRITES_N.fetch_add(1, Ordering::AcqRel);
-    }
+    hold_begin(base, len, "a file read");
     invalidate(base, len);
 }
 
@@ -1220,13 +1212,49 @@ pub fn host_write_end(base: u64, len: u64) {
     if !on() || len == 0 {
         return;
     }
+    hold_end(base, len);
+    invalidate(base, len);
+}
+
+/// Guest [base, base+len) armed by none until `hold_end` (`HOST_WRITES`).
+fn hold_begin(base: u64, len: u64, who: &str) {
+    // (An arming that checked before this is done by now, and the caller's
+    // disarm after this undoes it: `arm_part`.)
+    let t = std::time::Instant::now();
+    let _lock = crate::hosted::arm_lock();
+    super::hitch::note_since(super::hitch::Kind::Mirror, t, || format!("{who} into {base:#x}+{len:#x} waiting for an arming"));
+    HOST_WRITES.lock().push((base, base.saturating_add(len)));
+    HOST_WRITES_N.fetch_add(1, Ordering::AcqRel);
+}
+
+fn hold_end(base: u64, len: u64) {
     let mut g = HOST_WRITES.lock();
     if let Some(i) = g.iter().position(|&(a, e)| a == base && e == base.saturating_add(len)) {
         g.swap_remove(i);
         HOST_WRITES_N.fetch_sub(1, Ordering::AcqRel);
     }
-    drop(g);
-    invalidate(base, len);
+}
+
+/// Guest [base, base+len) held unarmed while this lives (`hold_begin`).
+pub struct Hold(Option<(u64, u64)>);
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        if let Some((base, len)) = self.0 {
+            hold_end(base, len);
+        }
+    }
+}
+
+/// An import of guest [base, base+len) begins (`exec::import_span`, before
+/// its disarm and the driver's call): its pages are armed by none until it
+/// is listed, young (the import list is no longer held while arming).
+pub fn hold(base: u64, len: u64) -> Hold {
+    if !on() || len == 0 {
+        return Hold(None);
+    }
+    hold_begin(base, len, "an import");
+    Hold(Some((base, len)))
 }
 
 fn host_writing(a: u64, b: u64) -> bool {
@@ -1328,8 +1356,8 @@ fn try_arm(a: u64, b: u64, frame: u64, armable: &Armable) {
 /// (by us, its host bit set), written by GPU work (`DS_FE2_ARM_GPU`),
 /// written within their quiet time, found clean in fewer than ARM_USES
 /// epochs, outside settled import windows, not plain read-write (or a file
-/// read in progress), in a chunk held after a burst of faults, the import
-/// list busy.
+/// read or an import in progress), in a chunk held after a burst of faults,
+/// the import list busy.
 static NOT_ARMED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 const R_ARMED: usize = 0;
 const R_GPU: usize = 1;
@@ -1570,8 +1598,8 @@ fn arm_run(x: u64, y: u64, frame: u64, armable: &Armable) {
     }
 }
 
-/// Arms [x, y) (inside settled import windows, the import list held: an
-/// import over it waits, then disarms it).
+/// Arms [x, y) (inside settled import windows, asked again under the arm
+/// lock: an import beginning meanwhile waits for it, then disarms it).
 fn arm_part(x: u64, y: u64, frame: u64) {
     // No mapping change meanwhile (`resident::remap_guard`), and no other
     // arm or disarm between the checks and the arming (`hosted::arm_lock`:
@@ -1581,6 +1609,12 @@ fn arm_part(x: u64, y: u64, frame: u64) {
     let _lock = crate::hosted::arm_lock();
     if host_writing(x, y) || !plain_rw(x, y - x) {
         NOT_ARMED[R_RW].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+        return;
+    }
+    // (Still inside settled imports: the caller looked without the arm lock,
+    // and an import listed since is young.)
+    if super::exec::fe2_settled_over(x, y) != Some(true) {
+        NOT_ARMED[R_WINDOW].fetch_add((y - x) / PAGE, Ordering::Relaxed);
         return;
     }
     if held(x, y, frame) {

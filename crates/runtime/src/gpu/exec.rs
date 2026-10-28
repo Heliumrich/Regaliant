@@ -268,30 +268,31 @@ static IMPORTS_STALE: AtomicU64 = AtomicU64::new(0);
 /// The profile window's imports (`import_window_line`): [imports, bytes,
 /// ns, longest ns, span-list lock acquisitions that waited, ns waited].
 static IMPORT_WIN: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
-static SPAN_GEN_AT_RESET: AtomicU64 = AtomicU64::new(0);
+static CACHE_GEN_AT_RESET: AtomicU64 = AtomicU64::new(0);
 
 /// Clears the window's import counts (`profile reset`).
 pub(super) fn reset_import_window() {
     for c in &IMPORT_WIN {
         c.store(0, Ordering::Relaxed);
     }
-    SPAN_GEN_AT_RESET.store(SPAN_GEN.load(Ordering::Relaxed), Ordering::Relaxed);
+    CACHE_GEN_AT_RESET.store(CACHE_GEN.load(Ordering::Relaxed), Ordering::Relaxed);
 }
 
 /// One profile line: the window's guest-memory imports, waits for the span
-/// list's lock (held while importing) and span-list changes (each clears
-/// every thread's span cache).
+/// list's lock and the times imports left the list (each clears every
+/// thread's span cache).
 pub(super) fn import_window_line() -> String {
     let v: Vec<u64> = IMPORT_WIN.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    guest-memory imports in the window: {} ({} MiB, {} ms, longest {} ms); span-list lock waits {} ({} ms); span-list changes {}\n",
+        "    guest-memory imports in the window: {} ({} MiB, {} ms, longest {} ms); span-list lock waits {} ({} ms); span caches cleared {} times; imports dropped for a mapping change while in progress {}\n",
         v[0],
         v[1] >> 20,
         v[2] / 1_000_000,
         v[3] / 1_000_000,
         v[4],
         v[5] / 1_000_000,
-        SPAN_GEN.load(Ordering::Relaxed).saturating_sub(SPAN_GEN_AT_RESET.load(Ordering::Relaxed))
+        CACHE_GEN.load(Ordering::Relaxed).saturating_sub(CACHE_GEN_AT_RESET.load(Ordering::Relaxed)),
+        IMPORTS_RACED.load(Ordering::Relaxed)
     )
 }
 
@@ -410,6 +411,14 @@ static EXEC_GENS: Mutex<Vec<std::sync::Arc<AtomicU64>>> = Mutex::new(Vec::new())
 /// takes that lock).
 pub(crate) fn imports_may_cover(base: u64, len: u64) -> bool {
     let end = base.saturating_add(len);
+    // (Imports in progress too: the driver pins their pages before they are
+    // listed.)
+    {
+        let Some(m) = IMPORTING.try_lock() else { return true };
+        if m.iter().any(|x| x.start < end && base < x.end) {
+            return true;
+        }
+    }
     let Some(g) = SPANS.try_read() else { return true };
     if g.iter().any(|s| s.start < end && base < s.end) {
         return true;
@@ -578,17 +587,24 @@ static FIXED: std::sync::OnceLock<Fixed> = std::sync::OnceLock::new();
 
 /// Imported guest-memory windows. Every buffer binding of every queue looks
 /// one up, imports and remap invalidations are rare: a read-mostly lock, and
-/// `SPAN_GEN` changes with every change so that threads can keep their
-/// recent hits (`SPAN_CACHE`). (One mutex used to guard these, the pipeline
+/// `CACHE_GEN` changes whenever an import leaves it so that threads can keep
+/// their recent hits (`SPAN_CACHE`; a new import cannot make a hit stale,
+/// and until 2026-10-28 every import, remapping anywhere and image burial
+/// cleared them, ~1,800 times in a stream-in window). Imports are made
+/// outside its lock (`import_span`). (One mutex used to guard these, the pipeline
 /// maps and the fixed buffers, held across whole binding loops and pipeline
 /// compiles: the queue threads spent as much time waiting for it as working.)
 static SPANS: parking_lot::RwLock<Vec<Span>> = parking_lot::RwLock::new(Vec::new());
+/// Advances when an import leaves the list or an image is buried: batches
+/// begun before may still name them (`reap_spans`).
 static SPAN_GEN: AtomicU64 = AtomicU64::new(1);
+/// Advances when an import leaves the list (`SPAN_CACHE`).
+static CACHE_GEN: AtomicU64 = AtomicU64::new(1);
 const SPAN_CACHE_LEN: usize = 16;
 
 thread_local! {
     /// Recently used imports of this thread (start, end, buffer), valid for
-    /// one `SPAN_GEN`, most recent first.
+    /// one `CACHE_GEN`, most recent first.
     static SPAN_CACHE: std::cell::RefCell<(u64, Vec<(u64, u64, vk::Buffer)>)> = const { std::cell::RefCell::new((0, Vec::new())) };
 }
 
@@ -818,6 +834,18 @@ fn revalidate_spans() {
     for &(a, n) in &ranges {
         super::fe2::invalidate(a, n);
     }
+    // Imports in progress over the changed pages are dropped when they end
+    // (they may pin pages no longer mapped there): before the list is
+    // looked at, so that one listed meanwhile is met below.
+    for m in IMPORTING.lock().iter().filter(|m| changed.iter().any(|&(a, b)| a < m.end && m.start < b)) {
+        m.stale.store(true, Ordering::SeqCst);
+    }
+    // The list is written only when an import in it is met: most mapping
+    // changes are outside imports, and a writer waiting made every lookup
+    // wait behind it.
+    if !spans_read().iter().any(|s| s.valid && changed.iter().any(|&(a, b)| a < s.end && s.start < b)) {
+        return;
+    }
     let mut g = SPANS.write();
     let mut dead = Vec::new();
     let mut i = 0;
@@ -843,6 +871,7 @@ fn revalidate_spans() {
     }
     if !dead.is_empty() {
         DROP_GEN.fetch_add(1, Ordering::AcqRel);
+        CACHE_GEN.fetch_add(1, Ordering::AcqRel);
     }
     let generation = SPAN_GEN.fetch_add(1, Ordering::AcqRel) + 1;
     drop(g);
@@ -981,7 +1010,7 @@ static MM_IMPORT_REFUSED: Mutex<Option<HashMap<(&'static str, u32), u64>>> = Mut
 #[track_caller]
 fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     revalidate_spans();
-    let generation = SPAN_GEN.load(Ordering::Acquire);
+    let generation = CACHE_GEN.load(Ordering::Acquire);
     let end = base.saturating_add(size);
     let hit = SPAN_CACHE.with(|c| {
         let mut c = c.borrow_mut();
@@ -1021,7 +1050,7 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     if let Some((b, st, e)) = r {
         SPAN_CACHE.with(|c| {
             let mut c = c.borrow_mut();
-            if SPAN_GEN.load(Ordering::Acquire) == generation {
+            if CACHE_GEN.load(Ordering::Acquire) == generation {
                 if c.0 != generation {
                     c.0 = generation;
                     c.1.clear();
@@ -1036,11 +1065,26 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
 
 /// Front end 2 (`fe2::Armable`): calls `arm` with the parts of guest [a, b)
 /// that live imports cover and over which every import, live or dropped
-/// and not freed yet, is at least `fe2::SETTLE` flips old (protecting a new
-/// import's pages lost the device: FINDINGS.md 2026-10-26), with the import
-/// list held meanwhile (an import beginning now waits, then disarms what
-/// was armed); false: the lists were busy.
+/// and not freed yet, is settled (`fe2::SETTLE` flips past its first
+/// completed use; protecting a new import's pages lost the device:
+/// FINDINGS.md 2026-10-26); false: the lists were busy. The list is not
+/// held while arming (an arming's host calls held it, and every lookup
+/// waited behind an import waiting for it): `fe2::arm_part` asks
+/// `fe2_settled_over` again under the arm lock, and an import holds its
+/// pages unarmed from before its driver call until it is listed
+/// (`fe2::hold`).
 fn fe2_armable(a: u64, b: u64, arm: &mut dyn FnMut(u64, u64)) -> bool {
+    let Some(parts) = settled_parts(a, b) else { return false };
+    for (p, q) in parts {
+        arm(p, q);
+    }
+    true
+}
+
+/// The parts of guest [a, b) that live imports cover, less those over which
+/// an import, live or dropped and not freed yet, is not settled (`fe2_armable`);
+/// None: the lists were busy.
+fn settled_parts(a: u64, b: u64) -> Option<Vec<(u64, u64)>> {
     let now = super::FRAMES.load(Ordering::Relaxed);
     let settled = |born: u64| born + super::fe2::SETTLE <= now;
     let done = done_seq();
@@ -1056,14 +1100,15 @@ fn fe2_armable(a: u64, b: u64, arm: &mut dyn FnMut(u64, u64)) -> bool {
         }
         false
     };
-    let Some(g) = SPANS.try_read() else { return false };
+    let g = SPANS.try_read()?;
     let mut young: Vec<(u64, u64)> = g.iter().filter(|s| s.start < b && a < s.end && !(settled(s.born) && used(s))).map(|s| (s.start, s.end)).collect();
     {
-        let Some(gy) = GRAVEYARD.try_lock() else { return false };
+        let gy = GRAVEYARD.try_lock()?;
         young.extend(gy.iter().filter(|d| d.span.start < b && a < d.span.end && !settled(d.span.born)).map(|d| (d.span.start, d.span.end)));
     }
     young.sort_unstable();
     let mut live: Vec<(u64, u64)> = g.iter().filter(|s| s.valid && s.start < b && a < s.end).map(|s| (s.start.max(a), s.end.min(b))).collect();
+    drop(g);
     live.sort_unstable();
     let mut merged: Vec<(u64, u64)> = Vec::with_capacity(live.len());
     for (x, y) in live {
@@ -1073,11 +1118,12 @@ fn fe2_armable(a: u64, b: u64, arm: &mut dyn FnMut(u64, u64)) -> bool {
         }
     }
     // The covered parts less the young imports.
+    let mut parts = Vec::with_capacity(merged.len());
     for (x, y) in merged {
         let mut p = x;
         for &(s, e) in young.iter().filter(|&&(s, e)| s < y && x < e) {
             if s > p {
-                arm(p, s);
+                parts.push((p, s));
             }
             p = p.max(e);
             if p >= y {
@@ -1085,10 +1131,18 @@ fn fe2_armable(a: u64, b: u64, arm: &mut dyn FnMut(u64, u64)) -> bool {
             }
         }
         if p < y {
-            arm(p, y);
+            parts.push((p, y));
         }
     }
-    true
+    Some(parts)
+}
+
+/// Front end 2 (`fe2::arm_part`, under the arm lock): whether guest [a, b)
+/// is still wholly inside settled live imports (an import listed since the
+/// caller looked is young); None: the lists were busy.
+pub(super) fn fe2_settled_over(a: u64, b: u64) -> Option<bool> {
+    let parts = settled_parts(a, b)?;
+    Some(parts.len() == 1 && parts[0] == (a, b))
 }
 
 /// Front end 2: batch `seq` (queued) uploads from these imports.
@@ -1151,20 +1205,78 @@ fn guest_pieces(a: u64, n: u64) -> Vec<(vk::Buffer, u64, u64, u64)> {
     v
 }
 
-/// Imports the guest window around [base, base+size) (another queue may
-/// have done so meanwhile).
-fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
-    let mut g = spans_write();
-    if let Some(s) = g.iter().find(|s| s.valid && s.start <= base && base + size <= s.end) {
-        return Some((s.buffer, s.start, s.end));
+/// Imports in progress (`import_span`, outside the import list's lock):
+/// the windows they may take (registered before the mapping is looked at),
+/// and whether a mapping change met one meanwhile (`revalidate_spans`: it
+/// is dropped when it ends, and made again).
+struct Importing {
+    start: u64,
+    end: u64,
+    stale: std::sync::atomic::AtomicBool,
+}
+
+static IMPORTING: Mutex<Vec<std::sync::Arc<Importing>>> = Mutex::new(Vec::new());
+/// An import in progress ended (`IMPORTING`).
+static IMPORTING_DONE: parking_lot::Condvar = parking_lot::Condvar::new();
+/// Imports dropped because a mapping change met them in progress.
+static IMPORTS_RACED: AtomicU64 = AtomicU64::new(0);
+
+/// Its import ended (dropped at every return of `import_once`, after the
+/// import was listed): unregistered, and those waiting for it woken.
+struct Registered(std::sync::Arc<Importing>);
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        IMPORTING.lock().retain(|m| !std::sync::Arc::ptr_eq(m, &self.0));
+        IMPORTING_DONE.notify_all();
     }
+}
+
+/// Imports the guest window around [base, base+size) (another queue may
+/// have done so meanwhile). The driver's import (it pins the pages: up to
+/// tens of milliseconds) runs outside the import list's lock: held for
+/// writing meanwhile, every thread's lookups waited (282 waits, 959 ms,
+/// against 296 ms of imports in a stream-in window, 2026-10-28 night); an
+/// import over the same window waits for the one in progress instead.
+fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
+    // (A mapping change met the import: made again, three times at most.)
+    for _ in 0..3 {
+        if let Some(r) = import_once(base, size) {
+            return r;
+        }
+    }
+    None
+}
+
+/// One `import_span`: None when a mapping change met the import.
+fn import_once(base: u64, size: u64) -> Option<Option<(vk::Buffer, u64, u64)>> {
     // Residency: smaller windows (their pages become host class).
     // Mirror mode: exact pages (imports are only for what the mirror cannot
     // hold: CP writes, host-class pages), so they cover no mirror page.
     let window = if super::resident::mirror_mode() { 4096 } else if super::resident::enabled() { RES_WINDOW } else { WINDOW };
-    let (vs, ve, pieces) = mapping_run(base, base & !(window - 1), (base + size).next_multiple_of(window))?;
+    let (lo, hi) = (base & !(window - 1), (base + size).next_multiple_of(window));
+    let me = loop {
+        if let Some(s) = spans_read().iter().find(|s| s.valid && s.start <= base && base + size <= s.end) {
+            return Some(Some((s.buffer, s.start, s.end)));
+        }
+        // Registered over the windows it may take, unless an import there is
+        // in progress: then its end is waited for and the list looked at
+        // again.
+        let mut g = IMPORTING.lock();
+        if g.iter().any(|m| m.start < hi && lo < m.end) {
+            let t = std::time::Instant::now();
+            IMPORTING_DONE.wait_for(&mut g, std::time::Duration::from_millis(50));
+            drop(g);
+            super::hitch::note_since(super::hitch::Kind::Mirror, t, || format!("waiting for an import in progress over {lo:#x}..{hi:#x}"));
+            continue;
+        }
+        let me = std::sync::Arc::new(Importing { start: lo, end: hi, stale: std::sync::atomic::AtomicBool::new(false) });
+        g.push(me.clone());
+        break Registered(me);
+    };
+    let Some((vs, ve, pieces)) = mapping_run(base, lo, hi) else { return Some(None) };
     if base + size > ve {
-        return None;
+        return Some(None);
     }
     // Imported pages must never be protected: host class from now on
     // (section-backed memory imports alias views instead).
@@ -1181,7 +1293,7 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     let a = fixed().import_align;
     let (mut start, mut end) = (vs & !(a - 1), ve.next_multiple_of(a).min(ve));
     if start < vs || end <= start {
-        return None;
+        return Some(None);
     }
     // Section-backed memory: the import is of the alias views (contiguous in
     // one slot), the window narrowed to the binding when the run is not.
@@ -1193,7 +1305,7 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
         });
         let Some(slot) = slot else {
             ALIAS_MISSES.fetch_add(1, Ordering::Relaxed);
-            return None;
+            return Some(None);
         };
         alias = crate::sections::alias_of(0, slot);
     }
@@ -1204,6 +1316,8 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     let _w = super::track::protected().then(|| super::track::host_write(start, end - start));
     // (A long one, its disarm included, is a hitch cause: `gpu::hitch`.)
     let tw = std::time::Instant::now();
+    // Front end 2 arms none of its pages until it is listed (young then).
+    let _hold = super::fe2::hold(start, end - start);
     // Pages armed through the host likewise (`hostcensus`, `precache`'s
     // write tracking by protection).
     crate::hostcensus::release(start, end - start);
@@ -1213,8 +1327,19 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     super::hitch::note_since(super::hitch::Kind::Mirror, tw, || format!("an import of {start:#x}..{end:#x} ({} MiB; the driver's part {} ms)", (end - start) >> 20, t0.elapsed().as_millis()));
     match imported {
         Ok((buffer, mem, va)) => {
-            super::vk::note_gpu_range(buffer, va, end - start, || format!("guest import {start:#x}..{end:#x}"));
             let ns = t0.elapsed().as_nanos() as u64;
+            let mut g = spans_write();
+            if me.0.stale.load(Ordering::SeqCst) {
+                // No batch saw it: freed now.
+                drop(g);
+                IMPORTS_RACED.fetch_add(1, Ordering::Relaxed);
+                unsafe {
+                    ctx().device.destroy_buffer(buffer, None);
+                    ctx().device.free_memory(mem, None);
+                }
+                return None;
+            }
+            super::vk::note_gpu_range(buffer, va, end - start, || format!("guest import {start:#x}..{end:#x}"));
             let ms = ns / 1_000_000;
             if ms >= 50 {
                 crate::info!("gpu: importing guest {start:#x}..{end:#x} ({} MiB) took {ms} ms", (end - start) >> 20);
@@ -1225,13 +1350,13 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
             IMPORT_WIN[3].fetch_max(ns, Ordering::Relaxed);
             g.push(Span { start, end, buffer, mem, valid: true, born: super::FRAMES.load(Ordering::Relaxed), first_use: AtomicU64::new(u64::MAX), used_at: AtomicU64::new(u64::MAX) });
             super::pagetable::map(start, end - start, va);
-            SPAN_GEN.fetch_add(1, Ordering::AcqRel);
+            drop(g);
             IMPORTS.fetch_add(1, Ordering::Relaxed);
             IMPORT_BYTES.fetch_add(end - start, Ordering::Relaxed);
             if pieces > 1 {
                 IMPORTS_MULTI.fetch_add(1, Ordering::Relaxed);
             }
-            Some((buffer, start, end))
+            Some(Some((buffer, start, end)))
         }
         Err(e) => {
             static REPORTED: AtomicU64 = AtomicU64::new(0);
@@ -1244,7 +1369,7 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
                 crate::warn!("gpu: import of {start:#x}..{end:#x} failed over: {}", crate::mem::os_regions(start, end - start, 12));
             }
             crate::warn!("gpu: importing guest {start:#x}..{end:#x} failed: {e}{heaps}");
-            None
+            Some(None)
         }
     }
 }
