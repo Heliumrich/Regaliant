@@ -1030,16 +1030,62 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
 /// M lacks (not `mine`), and marks its valid pages clean in epoch `ep`.
 #[allow(clippy::too_many_arguments)]
 fn check_run(a: u64, b: u64, ep: u32, frame: u64, arm: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, written: &mut Vec<u64>, class: &[AtomicU64; 4]) -> Result<(), &'static str> {
-    take_run(a, b, frame, arm, armable, written, class);
+    let (ta, tb) = widen(a, b);
+    take_run(a, b, ta, tb, frame, arm, armable, written, class);
     let t = tsc();
     let r = fix_run(a, b, ep, mine, upload);
+    // The words around a small run were taken too: clean in this epoch.
+    if ta < a {
+        set_clean(ta, a, ep, false);
+    }
+    if b < tb {
+        set_clean(b, tb, ep, false);
+    }
     caller_since(C_FIX, t);
     r
 }
 
-/// Arms (`arm`: hosted, where allowed) and takes [a, b): pages written since
-/// their last take lose their valid bit.
-fn take_run(a: u64, b: u64, frame: u64, arm: bool, armable: &Armable, written: &mut Vec<u64>, class: &[AtomicU64; 4]) {
+/// Runs of at most WIDE_TAKE pages are taken with their whole 64-page words,
+/// within the readable mappings around them (`widen`): a take costs its call,
+/// not its pages, and a word's other pages are then clean in its epoch, so
+/// later checks of small ranges beside it in the same view need no take of
+/// their own (at the gate ~3,650 takes a flip were of ranges under 64 KiB with
+/// GPU-written pages unarmed: 2026-10-28; `DS_FE2_WIDE_TAKES=0`: the run
+/// alone).
+const WIDE_TAKE: u64 = 16;
+
+fn wide_takes() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_FE2_WIDE_TAKES").ok().as_deref() != Some("0"))
+}
+
+/// The range a check's take of [a, b) covers (`WIDE_TAKE`): the run of
+/// GPU-written pages around it within its words and mappings. (Whole words
+/// took the CPU's per-frame data beside small ranges too: a take that finds
+/// written pages resets them, its costly part, and the gate's takes went
+/// from ~4,100 to ~2,250 a flip but from ~27 to ~31 ms; 2026-10-28.)
+fn widen(a: u64, b: u64) -> (u64, u64) {
+    if (b - a) / PAGE > WIDE_TAKE || !wide_takes() {
+        return (a, b);
+    }
+    let (wa, wb) = (a & !(64 * PAGE - 1), b.next_multiple_of(64 * PAGE));
+    let Some((s, e)) = crate::mem::readable_span(a).filter(|&(s, e)| s <= a && b <= e) else { return (a, b) };
+    let (lo, hi) = (wa.max(s.next_multiple_of(PAGE)), wb.min(e & !(PAGE - 1)));
+    let gpu = |p: u64| chunk(p, false).is_some_and(|c| c.gpu[idx(p) / 64].load(Ordering::Relaxed) >> (idx(p) % 64) & 1 != 0);
+    let (mut ta, mut tb) = (a, b);
+    while ta > lo && gpu(ta - PAGE) {
+        ta -= PAGE;
+    }
+    while tb < hi && gpu(tb) {
+        tb += PAGE;
+    }
+    (ta, tb)
+}
+
+/// Arms [a, b) (`arm`: hosted, where allowed) and takes [ta, tb) (around it:
+/// `widen`): pages written since their last take lose their valid bit.
+#[allow(clippy::too_many_arguments)]
+fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &Armable, written: &mut Vec<u64>, class: &[AtomicU64; 4]) {
     if arm && crate::hosted::on() {
         let t = tsc();
         try_arm(a, b, frame, armable);
@@ -1050,9 +1096,9 @@ fn take_run(a: u64, b: u64, frame: u64, arm: bool, armable: &Armable, written: &
     written.clear();
     let tt = std::time::Instant::now();
     let t = tsc();
-    let r = super::precache::take_written_for(a, b - a, written, None, crate::mem::WW_WHO_FE2);
+    let r = super::precache::take_written_for(ta, tb - ta, written, None, crate::mem::WW_WHO_FE2);
     caller_since(C_TAKE, t);
-    super::hitch::note_since(super::hitch::Kind::Mirror, tt, || format!("take of {a:#x}..{b:#x} ({} pages)", (b - a) / PAGE));
+    super::hitch::note_since(super::hitch::Kind::Mirror, tt, || format!("take of {ta:#x}..{tb:#x} ({} pages)", (tb - ta) / PAGE));
     let tns = tt.elapsed().as_nanos() as u64;
     STATS[S_TAKE_NS].fetch_add(tns, Ordering::Relaxed);
     STATS[S_TAKES].fetch_add(1, Ordering::Relaxed);
@@ -1064,7 +1110,7 @@ fn take_run(a: u64, b: u64, frame: u64, arm: bool, armable: &Armable, written: &
     STATS[S_TAKE_WRITTEN].fetch_add(written.len() as u64, Ordering::Relaxed);
     if r.is_none() {
         STATS[S_TAKE_FAILED].fetch_add(1, Ordering::Relaxed);
-        invalidate(a, b - a);
+        invalidate(ta, tb - ta);
     }
 }
 
@@ -1161,7 +1207,7 @@ pub fn resolve(runs: &mut Vec<(u64, u64)>, mine: &dyn Fn(u64) -> bool, upload: &
         let mut r = Ok(());
         for &(a, b, i, j) in &merged {
             note_arming_ended(a, b);
-            take_run(a, b, frame, true, armable, written, &BY_SIZE[size_class((b - a) / PAGE)]);
+            take_run(a, b, a, b, frame, true, armable, written, &BY_SIZE[size_class((b - a) / PAGE)]);
             // Only the pages the batch bound need M current.
             for &(x, y) in &runs[i..j] {
                 if let Err(e) = fix_run(x, y, ep, mine, upload) {
