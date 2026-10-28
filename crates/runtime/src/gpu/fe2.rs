@@ -1035,6 +1035,18 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
                 STATS[S_DEFERRED].fetch_add(1, Ordering::Relaxed);
                 continue;
             }
+            // Another thread's take around this run, for a requirement at
+            // least ours, instead of one of our own (`follow_take`).
+            if follow_take(a, b, want) {
+                match followed(a, b, want, mine, upload) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        STATS[S_SLOW_NS].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        return Err(e);
+                    }
+                }
+            }
             if let Err(e) = check_run(a, b, ep, frame, !gpu_writes, mine, upload, armable, written, class) {
                 STATS[S_SLOW_NS].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 return Err(e);
@@ -1052,6 +1064,8 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
 #[allow(clippy::too_many_arguments)]
 fn check_run(a: u64, b: u64, ep: u32, frame: u64, arm: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, written: &mut Vec<u64>, class: &[AtomicU64; 4]) -> Result<(), &'static str> {
     let (ta, tb) = widen(a, b);
+    // (Until its pages are stamped: `follow_take`.)
+    let _taking = Taking::new(ta, tb, ep);
     take_run(a, b, ta, tb, frame, arm, armable, written, class);
     let t = tsc();
     let r = fix_run(a, b, ep, mine, upload);
@@ -1232,20 +1246,36 @@ fn take_all() -> bool {
 /// Uploads the pages of [a, b) M lacks (not `mine`) and marks its valid
 /// pages clean in epoch `ep` (after its take).
 fn fix_run(a: u64, b: u64, ep: u32, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool) -> Result<(), &'static str> {
-    // Uploads of the pages M lacks, as runs of consecutive ones (word by
-    // word: only the invalid pages are looked at one by one).
+    let (_, failed) = upload_lacking(a, b, mine, upload);
+    // Valid pages are clean in this epoch (uploaded ones become valid when
+    // the caller's batch is queued: `uploaded`).
+    let tc = std::time::Instant::now();
+    set_clean(a, b, ep, false);
+    super::hitch::note_since(super::hitch::Kind::Mirror, tc, || format!("clean marks of {a:#x}..{b:#x}"));
+    if failed {
+        return Err("an upload into the mirror failed");
+    }
+    Ok(())
+}
+
+/// Uploads the pages of [a, b) M lacks (not `mine`), as runs of consecutive
+/// ones (word by word: only the invalid pages are looked at one by one):
+/// (pages, whether an upload failed; the rest of the range is still made
+/// current).
+fn upload_lacking(a: u64, b: u64, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool) -> (u64, bool) {
     let tu = std::time::Instant::now();
     let mut failed = false;
+    let mut pages = 0u64;
     let mut run: Option<(u64, u64)> = None;
-    let mut flush = |run: &mut Option<(u64, u64)>, failed: &mut bool| {
+    let mut flush = |run: &mut Option<(u64, u64)>, failed: &mut bool, pages: &mut u64| {
         if let Some((x, y)) = run.take() {
             if !upload(x, y) {
-                // (The rest of the range is still made current.)
                 STATS[S_UPLOAD_FAILED].fetch_add(1, Ordering::Relaxed);
                 *failed = true;
             } else {
                 STATS[S_UPLOADS].fetch_add(1, Ordering::Relaxed);
                 STATS[S_UPLOAD_PAGES].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+                *pages += (y - x) / PAGE;
             }
         }
     };
@@ -1260,31 +1290,122 @@ fn fix_run(a: u64, b: u64, ep: u32, mine: &dyn Fn(u64) -> bool, upload: &mut dyn
             let p = wa + r.trailing_zeros() as u64 * PAGE;
             r &= r - 1;
             if mine(p) {
-                flush(&mut run, &mut failed);
+                flush(&mut run, &mut failed, &mut pages);
                 continue;
             }
             match run.as_mut() {
                 Some(l) if l.1 == p => l.1 = p + PAGE,
                 _ => {
-                    flush(&mut run, &mut failed);
+                    flush(&mut run, &mut failed, &mut pages);
                     run = Some((p, p + PAGE));
                 }
             }
         }
         x = e;
     }
-    flush(&mut run, &mut failed);
+    flush(&mut run, &mut failed, &mut pages);
     // (Long parts are hitch causes: `gpu::hitch`.)
     super::hitch::note_since(super::hitch::Kind::Mirror, tu, || format!("uploads of {a:#x}..{b:#x} into the mirror"));
-    // Valid pages are clean in this epoch (uploaded ones become valid when
-    // the caller's batch is queued: `uploaded`).
-    let tc = std::time::Instant::now();
-    set_clean(a, b, ep, false);
-    super::hitch::note_since(super::hitch::Kind::Mirror, tc, || format!("clean marks of {a:#x}..{b:#x}"));
+    (pages, failed)
+}
+
+/// Our takes in flight, as `check_run` makes them: (taken range, the epoch
+/// its pages are stamped with, id). The chunks of a parallel run start
+/// together, and each one's first command checked the same GPU-written
+/// ranges at the run's view: every worker took them, one after another
+/// (~10 commands a flip at ~1.3 ms each on the workers at the vista,
+/// 2026-10-28). A check of a run inside one of them, for a requirement it
+/// meets, waits for it and uses what it found (`follow_take`, `followed`).
+static TAKING: Mutex<Vec<(u64, u64, u32, u64)>> = Mutex::new(Vec::new());
+static TAKING_IDS: AtomicU64 = AtomicU64::new(1);
+/// Bumped as each of them ends (the waiters watch it).
+static TAKING_ENDED: AtomicU64 = AtomicU64::new(0);
+/// [runs that followed another's take without one of their own, pages they
+/// uploaded, runs that followed and still needed a take].
+static FOLLOW: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// `DS_FE2_FOLLOW=0` (A/B): every check takes for itself, as before
+/// 2026-10-28 evening.
+fn follow_on() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_FE2_FOLLOW").ok().as_deref() != Some("0"))
+}
+
+/// Takes in flight from here until dropped.
+struct Taking(u64);
+
+impl Taking {
+    fn new(ta: u64, tb: u64, ep: u32) -> Taking {
+        let id = TAKING_IDS.fetch_add(1, Ordering::Relaxed);
+        TAKING.lock().push((ta, tb, ep, id));
+        Taking(id)
+    }
+}
+
+impl Drop for Taking {
+    fn drop(&mut self) {
+        TAKING.lock().retain(|e| e.3 != self.0);
+        TAKING_ENDED.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Whether another thread's take covering [a, b) whose stamps meet `want`
+/// was in flight: waited for until it ended (its clean stamps set, the
+/// pages it found written invalid).
+fn follow_take(a: u64, b: u64, want: u32) -> bool {
+    if !follow_on() {
+        return false;
+    }
+    let id = {
+        let g = TAKING.lock();
+        match g.iter().find(|e| e.0 <= a && b <= e.1 && e.2 >= want) {
+            Some(e) => e.3,
+            None => return false,
+        }
+    };
+    let mut k = 0u32;
+    loop {
+        // (Read before the list: an end after it shows as a change.)
+        let seen = TAKING_ENDED.load(Ordering::Acquire);
+        if !TAKING.lock().iter().any(|e| e.3 == id) {
+            return true;
+        }
+        while TAKING_ENDED.load(Ordering::Acquire) == seen {
+            k += 1;
+            if k < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+/// After another's take over [a, b) (`follow_take`): Ok(true) when nothing
+/// needs a take of our own (pages valid and clean for `want`; pages not
+/// valid, which that take found written or the mirror never held, uploaded
+/// here as after a take: they become valid and clean when the caller's
+/// batch is queued, `uploaded`); Ok(false) when a valid page is not clean
+/// for `want`.
+fn followed(a: u64, b: u64, want: u32, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool) -> Result<bool, &'static str> {
+    let mut x = a;
+    while x < b {
+        let e = word_end(x, b);
+        let c = chunk(x, true).expect("inside the span");
+        let need = word_mask(x, e) & !word_ok(c, x, e, want);
+        if need & c.valid[idx(x) / 64].load(Ordering::Acquire) != 0 {
+            FOLLOW[2].fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        x = e;
+    }
+    let (pages, failed) = upload_lacking(a, b, mine, upload);
+    FOLLOW[0].fetch_add(1, Ordering::Relaxed);
+    FOLLOW[1].fetch_add(pages, Ordering::Relaxed);
     if failed {
         return Err("an upload into the mirror failed");
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The checks a batch's bindings deferred (`ensure` with a list), at its
@@ -2290,7 +2411,7 @@ pub fn status() -> String {
         })
         .collect();
     format!(
-        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes, {} writes found on pages armed and taken since (holes); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity; CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
+        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity; CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
         s[S_ENSURES],
         s[S_ENSURE_PAGES],
         s[S_FAST],
@@ -2317,6 +2438,9 @@ pub fn status() -> String {
         s[S_ARM_FAILED],
         s[S_ARM_ENDED],
         HOLES.load(Ordering::Relaxed),
+        FOLLOW[0].load(Ordering::Relaxed),
+        FOLLOW[1].load(Ordering::Relaxed),
+        FOLLOW[2].load(Ordering::Relaxed),
         FAULTS[F_SPAN].load(Ordering::Relaxed),
         FAULTS[F_ENDED].load(Ordering::Relaxed),
         FAULTS[F_OUTSIDE].load(Ordering::Relaxed),
