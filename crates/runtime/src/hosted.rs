@@ -19,8 +19,10 @@
 //! with the access and the faulting instruction put in the ring, the access
 //! retried. A fault on a guest page that allows the access by the time the
 //! host sees it raced one the host answered for another thread (or a
-//! disarm): the access is retried. Every other exception goes to dsport's
-//! own handlers (first chance not handled). dsport arms a page by setting its bit before
+//! disarm): the access is retried, as is one inside a range a view split
+//! has unmapped for the moment (section-backed memory: `splitting`).
+//! Every other exception goes to dsport's own handlers (first chance not
+//! handled; the first PASSED_LOG are recorded for the status line). dsport arms a page by setting its bit before
 //! protecting it, so an armed page's fault never reaches its own handlers,
 //! and disarms by unprotecting before clearing the bit, one arm or disarm
 //! at a time (`arm_lock`); after a mapping change the bits are only cleared
@@ -41,6 +43,8 @@ const L1: usize = ((crate::mem::GUEST_END - crate::mem::GUEST_BASE) / PAGE / LEA
 const MAX_LEAVES: usize = 4096;
 /// Ring entries.
 const RING: usize = 1 << 16;
+/// Exceptions passed on that are recorded (`Shared::passed_log`).
+const PASSED_LOG: usize = 16;
 const MAGIC: u64 = 0x6473_706f_7274_4831; // "dsportH1"
 
 /// The shared mapping.
@@ -81,6 +85,15 @@ struct Shared {
     arming: [AtomicU64; 2],
     /// Pages the host made read-write with a faulted page's word.
     word_pages: AtomicU64,
+    /// The first PASSED_LOG exceptions passed on: (code | first chance <<
+    /// 32 | access kind << 40, address accessed, faulting instruction,
+    /// thread id).
+    passed_log: [[AtomicU64; 4]; PASSED_LOG],
+    /// The guest range a view split has unmapped for the moment, [lo, hi)
+    /// (hi 0: none; section-backed memory, `sections::split_begin`), and
+    /// the faults inside it the host retried.
+    split: [AtomicU64; 2],
+    split_retried: AtomicU64,
     /// (page | 1 for a write, the faulting instruction).
     ring: [[AtomicU64; 2]; RING],
     leaves: [[AtomicU64; (LEAF_PAGES / 64) as usize]; MAX_LEAVES],
@@ -174,6 +187,15 @@ pub fn init() {
             last = now;
         }
     });
+}
+
+/// A view split has unmapped guest [lo, hi) until the next call (hi 0:
+/// done): the host retries faults inside it instead of passing them on.
+pub fn splitting(lo: u64, hi: u64) {
+    if let Some(s) = shared() {
+        s.split[0].store(lo, Ordering::SeqCst);
+        s.split[1].store(hi, Ordering::SeqCst);
+    }
 }
 
 /// `Shared::flags`: a fault on an armed page makes every armed page of its
@@ -426,13 +448,42 @@ pub fn status() -> String {
             (n > 0).then(|| format!("{} {n} ({:.0} ms in the host)", NAMES[k], s.event_ns[k].load(Ordering::Relaxed) as f64 / 1e6))
         })
         .collect();
+    // (What the first ones were: each was handled inside the process.)
+    let passed = s.passed.load(Ordering::Relaxed);
+    let which: Vec<String> = (0..(passed as usize).min(PASSED_LOG))
+        .filter_map(|k| {
+            let l = &s.passed_log[k];
+            let tid = l[3].load(Ordering::Acquire);
+            if tid == 0 {
+                return None;
+            }
+            let w = l[0].load(Ordering::Relaxed);
+            let (code, first, kind) = (w as u32, (w >> 32) & 0xff != 0, (w >> 40) & 0xff);
+            let rip = l[2].load(Ordering::Relaxed);
+            let at = if (crate::mem::GUEST_BASE..crate::mem::GUEST_END).contains(&rip) { crate::exception::describe_guest(rip) } else { crate::exception::host_symbol(rip) };
+            let chance = if first { "" } else { ", second chance" };
+            Some(if code == 0xC000_0005 {
+                let access = match kind {
+                    0 => "read",
+                    1 => "write",
+                    8 => "execute",
+                    _ => "access",
+                };
+                format!("{code:#x} ({access} of {:#x}{chance}) at {at}, thread {tid}", l[1].load(Ordering::Relaxed))
+            } else {
+                format!("{code:#x}{chance} at {at}, thread {tid}")
+            })
+        })
+        .collect();
+    let which = if which.is_empty() { String::new() } else { format!(" ({})", which.join("; ")) };
     format!(
-        "    hosted: {} faults on armed pages answered by the host ({:.1} us each there; {} more pages made read-write with their words), {} retried (raced an answered one), {} exceptions passed on, {} leaves of the armed-page map, ring overflows {}, disarms that failed {}; debug events: {}\n{}",
+        "    hosted: {} faults on armed pages answered by the host ({:.1} us each there; {} more pages made read-write with their words), {} retried (raced an answered one), {} retried inside a view split, {} exceptions passed on{which}, {} leaves of the armed-page map, ring overflows {}, disarms that failed {}; debug events: {}\n{}",
         f,
         s.host_ns.load(Ordering::Relaxed) as f64 / 1000.0 / f.max(1) as f64,
         s.word_pages.load(Ordering::Relaxed),
         s.retried.load(Ordering::Relaxed),
-        s.passed.load(Ordering::Relaxed),
+        s.split_retried.load(Ordering::Relaxed),
+        passed,
         s.leaves_used.load(Ordering::Relaxed),
         s.overflow.load(Ordering::Relaxed),
         DISARM_FAILED.load(Ordering::Relaxed),
@@ -532,13 +583,26 @@ pub fn run_host() -> ! {
                     s.head.store(head + 1, Ordering::Release);
                     s.faults.fetch_add(1, Ordering::Relaxed);
                     s.host_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                } else if exc == 0xC000_0005 && e.dwFirstChance != 0 && (s.split[0].load(Ordering::SeqCst)..s.split[1].load(Ordering::SeqCst)).contains(&addr) {
+                    // Inside a view split (section-backed memory): tried
+                    // again until the split maps the page back (dsport's own
+                    // wait would run on the faulting thread's stack, over
+                    // the guest's red zone).
+                    s.split_retried.fetch_add(1, Ordering::Relaxed);
                 } else if exc == 0xC000_0005 && e.dwFirstChance != 0 && rec.ExceptionInformation[0] <= 1 && allows(pi.hProcess, addr, write) {
                     s.retried.fetch_add(1, Ordering::Relaxed);
                 } else if exc == 0x8000_0003 && first_bp {
                     first_bp = false;
                 } else {
                     status = DBG_EXCEPTION_NOT_HANDLED;
-                    s.passed.fetch_add(1, Ordering::Relaxed);
+                    let k = s.passed.fetch_add(1, Ordering::Relaxed) as usize;
+                    if k < PASSED_LOG {
+                        let l = &s.passed_log[k];
+                        l[0].store(exc as u64 | (e.dwFirstChance as u64) << 32 | (rec.ExceptionInformation[0] as u64 & 0xff) << 40, Ordering::Relaxed);
+                        l[1].store(addr, Ordering::Relaxed);
+                        l[2].store(rec.ExceptionAddress as u64, Ordering::Relaxed);
+                        l[3].store(ev.dwThreadId as u64, Ordering::Release);
+                    }
                 }
             },
             EXIT_PROCESS_DEBUG_EVENT => unsafe {
@@ -712,7 +776,56 @@ fn self_test() -> Result<String, String> {
     if drained.len() as u64 != N || !wrong.is_empty() || !ok {
         return Err(format!("{} pages in the ring for {N} faults (wrong: {wrong:x?}, overflow: {})", drained.len(), !ok));
     }
-    Ok(format!("{N} write faults on armed guest pages answered by the host, {us:.1} us per arm and fault, the values below the stack pointer intact, every page in the ring in order"))
+    let tracking = if crate::sections::on() { format!("; {}", tracking_test()?) } else { String::new() };
+    Ok(format!("{N} write faults on armed guest pages answered by the host, {us:.1} us per arm and fault, the values below the stack pointer intact, every page in the ring in order{tracking}"))
+}
+
+/// Section-backed memory's write tracking through the host
+/// (`gpu::resident::take_written`): a take reports new pages and arms them
+/// through the host; writes (one from code that keeps values below its
+/// stack pointer) are answered by the host, the values intact, nothing
+/// passed on to dsport, and each written page is reported by the next take
+/// only.
+fn tracking_test() -> Result<String, String> {
+    const PAGES: u64 = 16;
+    let s = shared().ok_or("not hosted")?;
+    let a = crate::mem::MEM
+        .lock()
+        .alloc_internal(1 << 20, crate::mem::PROT_CPU_READ | crate::mem::PROT_CPU_WRITE, "host-track-test")
+        .map_err(|e| format!("no guest memory for the tracking test: {e:?}"))?;
+    let passed = s.passed.load(Ordering::Acquire);
+    let mut out = Vec::new();
+    let mut take = |what: &str, want: &[u64]| -> Result<(), String> {
+        out.clear();
+        crate::gpu::resident::take_written(a, PAGES * PAGE, &mut out).ok_or("a take failed")?;
+        let want: Vec<u64> = want.iter().map(|k| a + k * PAGE).collect();
+        if out != want {
+            return Err(format!("{what}: a take reported {:?} (pages), not {:?}", out.iter().map(|p| (p - a) / PAGE).collect::<Vec<_>>(), want.iter().map(|p| (p - a) / PAGE).collect::<Vec<_>>()));
+        }
+        Ok(())
+    };
+    take("new pages", &(0..PAGES).collect::<Vec<_>>())?;
+    take("nothing written", &[])?;
+    if !all_armed(a, PAGES * PAGE) {
+        return Err("taken pages not armed through the host".into());
+    }
+    if unsafe { probe((a + 3 * PAGE) as *mut u32) } != 0 {
+        return Err("a write fault on a taken page changed the values below the stack pointer".into());
+    }
+    take("page 3 written", &[3])?;
+    take("nothing written since", &[])?;
+    unsafe {
+        std::ptr::write_volatile((a + 5 * PAGE) as *mut u32, 7);
+        std::ptr::write_volatile((a + 9 * PAGE + 100) as *mut u32, 7);
+    }
+    take("pages 5 and 9 written", &[5, 9])?;
+    take("nothing written since", &[])?;
+    disarm(a, PAGES * PAGE);
+    let more = s.passed.load(Ordering::Acquire) - passed;
+    if more != 0 {
+        return Err(format!("{more} exceptions passed on to dsport during the tracking test"));
+    }
+    Ok("write tracking on sections through the host: writes to taken pages answered there (the values below the stack pointer intact, nothing passed on) and reported by the next take only".into())
 }
 
 /// The host process's command line flag.

@@ -202,6 +202,9 @@ pub fn split_begin(lo: u64, hi: u64, why: usize) {
     *LAST_SPLIT.lock() = (lo, hi, crate::log::elapsed_ms());
     SPLIT_LO.store(lo, Ordering::SeqCst);
     SPLIT_HI.store(hi, Ordering::SeqCst);
+    // (The host retries faults inside it: handled here they would
+    // overwrite the guest's red zone.)
+    crate::hosted::splitting(lo, hi);
 }
 
 /// Waits while a split overlapping [lo, hi) is in progress (kernel-mode
@@ -237,6 +240,7 @@ pub fn split_line() -> String {
 pub fn split_end() {
     SPLIT_HI.store(0, Ordering::SeqCst);
     SPLIT_LO.store(0, Ordering::SeqCst);
+    crate::hosted::splitting(0, 0);
 }
 
 /// A fault at `addr` inside a range being split: waits for the split to end

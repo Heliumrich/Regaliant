@@ -44,6 +44,14 @@
 //! access to memory location") announce themselves (`host_write_begin` and
 //! `_end`, from `track::host_write`'s guard): their pages are disarmed and
 //! not armed again until the write ends.
+//! Hosted (`--host`), that tracking arms through the host (`via_host`,
+//! `hosted::arm`): the host answers its write faults (each one handled here
+//! overwrites the guest's red zone: 459,145 of them in front end 2's probe
+//! on sections, FINDINGS.md 2026-10-28) and clears the page's bit, so takes
+//! compare the pages armed so (`Chunk::harmed`) with the host's bits
+//! (`reconcile`) and end the arming of those whose bit is gone as a fault
+//! here would. Pages another armed through the host (front end 2) are
+//! joined, not taken for read-only to the guest (`host_mark`).
 
 use super::vk::ctx;
 use ash::vk;
@@ -126,6 +134,14 @@ struct Chunk {
     /// cannot be armed keep it), cleared by the take that makes it clean.
     /// Takes visit only these pages (`take_written`).
     attn: Box<[AtomicU64]>,
+    /// Hosted write tracking: one bit per page armed through the host (by
+    /// us, or joined: its host bit was set already). The host clears its
+    /// own bit when it answers a write fault there; takes find such pages
+    /// (`reconcile`).
+    harmed: Box<[AtomicU64]>,
+    /// The host's count of bits cleared in this chunk's 128 MiB
+    /// (`hosted::leaf_events`) as of the last `reconcile` of the chunk.
+    host_ev: AtomicU64,
 }
 
 /// Flags page `i` of `c` for the next take's attention (`Chunk::attn`); it
@@ -287,6 +303,8 @@ fn chunk(addr: u64, create: bool) -> Option<&'static Chunk> {
         gdirty: (0..CHUNK_PAGES / 64).map(|_| AtomicU64::new(0)).collect(),
         gprot: (0..CHUNK_PAGES / 64).map(|_| AtomicU64::new(0)).collect(),
         rseq: (0..CHUNK_PAGES).map(|_| AtomicU64::new(0)).collect(),
+        harmed: (0..CHUNK_PAGES / 64).map(|_| AtomicU64::new(0)).collect(),
+        host_ev: AtomicU64::new(0),
     }));
     match slot.compare_exchange(std::ptr::null_mut(), new, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => Some(unsafe { &*new }),
@@ -474,6 +492,156 @@ fn plain_rw(a: u64, n: u64) -> bool {
     true
 }
 
+/// Hosted write tracking (`status`): pages takes found answered by the host
+/// (or disarmed through it), write faults on pages armed through the host
+/// that reached us anyway, pages answered between their arming and its
+/// marks, pages joined (armed through the host by another already), chunk
+/// scans (`reconcile`), armings through the host that failed.
+static HOST_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+const H_ANSWERED: usize = 0;
+const H_IN_PROCESS: usize = 1;
+const H_LOST: usize = 2;
+const H_JOINED: usize = 3;
+const H_SCANS: usize = 4;
+const H_FAILED: usize = 5;
+
+/// Write tracking arms through the host (`--host`, section-backed memory):
+/// the host answers its write faults, so they leave the guest's red zone
+/// intact (`hosted`).
+#[inline]
+fn via_host() -> bool {
+    crate::hosted::on() && crate::sections::on()
+}
+
+/// Whether the host's bit of page `q` is set (armed through the host).
+#[inline]
+fn host_armed(q: u64) -> bool {
+    crate::hosted::armed_word(q & !(64 * PAGE - 1)) >> ((q >> 12) & 63) & 1 != 0
+}
+
+/// Arms [a, a+n) (one region, plain read-write) through the host.
+fn arm_host(a: u64, n: u64) -> bool {
+    let t = std::time::Instant::now();
+    let r = crate::hosted::arm(a, n);
+    STATS[S_PROTECTS].fetch_add(1, Ordering::Relaxed);
+    STATS[S_PROTECT_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if let Err(e) = &r {
+        if HOST_STATS[H_FAILED].fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::warn!("resident: arming {a:#x}+{n:#x} through the host failed: {e}");
+        }
+    }
+    r.is_ok()
+}
+
+/// Clears page `i`'s host-armed bit; whether it was set.
+#[inline]
+fn clear_harmed(c: &Chunk, i: usize) -> bool {
+    let m = 1u64 << (i & 63);
+    c.harmed[i >> 6].load(Ordering::Acquire) & m != 0 && c.harmed[i >> 6].fetch_and(!m, Ordering::AcqRel) & m != 0
+}
+
+/// Hosted write tracking: the pages of chunk `c` (at `base`) armed through
+/// the host whose bit the host has cleared since (a write fault it answered
+/// for the page or for its 64-page word, a disarm, a mapping change) end
+/// their arming as a write fault here would (`on_fault`). Skipped while the
+/// host's count of cleared bits for the chunk is the one a scan read before
+/// it began (an arming whose bits are cleared before its marks finds that
+/// itself: `arm_with`).
+fn reconcile(c: &Chunk, base: u64) {
+    let ev = crate::hosted::leaf_events(base);
+    if c.host_ev.load(Ordering::Acquire) == ev {
+        return;
+    }
+    HOST_STATS[H_SCANS].fetch_add(1, Ordering::Relaxed);
+    let frame = super::FRAMES.load(Ordering::Relaxed) as u32 + 1;
+    for w in 0..CHUNK_PAGES / 64 {
+        let ours = c.harmed[w].load(Ordering::Acquire);
+        if ours == 0 {
+            continue;
+        }
+        let gone = ours & !crate::hosted::armed_word(base + (w as u64) * 64 * PAGE);
+        if gone == 0 {
+            continue;
+        }
+        // (Claimed: each page is done by one scan.)
+        let mut r = c.harmed[w].fetch_and(!gone, Ordering::AcqRel) & gone;
+        while r != 0 {
+            let i = w * 64 + r.trailing_zeros() as usize;
+            r &= r - 1;
+            host_answered(c, i, frame);
+        }
+    }
+    c.host_ev.store(ev, Ordering::Release);
+}
+
+/// Page `i` of `c` lost its host bit while armed through the host: no
+/// longer armed or clean, volatile when written again soon (as `on_fault`).
+fn host_answered(c: &Chunk, i: usize, frame: u32) {
+    let s = &c.pages[i];
+    loop {
+        let cur = s.load(Ordering::Acquire);
+        if cur & ST_BUSY != 0 {
+            // A protection change in progress (a disarm): retry after.
+            std::hint::spin_loop();
+            continue;
+        }
+        if cur & ST_ARMED == 0 {
+            // Disarmed or reset meanwhile: their marks stand.
+            return;
+        }
+        if s.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            let last = c.faulted[i].swap(frame, Ordering::AcqRel);
+            let volatile = last != 0 && frame.wrapping_sub(last) <= VOLATILE_FRAMES;
+            if volatile {
+                let level = c.vol_level[i].load(Ordering::Acquire).saturating_add(1).min(VOL_MAX_LEVEL);
+                c.vol_level[i].store(level, Ordering::Release);
+                c.vol_until[i].store(frame.wrapping_add(VOL_BASE << level), Ordering::Release);
+                STATS[S_VOLATILE].fetch_add(1, Ordering::Relaxed);
+            }
+            s.store((cur & !(ST_ARMED | ST_VALID | ST_BUSY | ST_CLEAN)) | if volatile { ST_VOLATILE } else { 0 }, Ordering::Release);
+            flag(c, i);
+            HOST_STATS[H_ANSWERED].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// Hosted write tracking, under the host's arm lock (`arm_with`): the mark
+/// of page `q` (busy), just armed through the host (`armed_now`) or in a
+/// region read-only when looked at (for the guest, or for another's arming
+/// through the host).
+fn host_mark(c: &Chunk, q: u64, armed_now: bool) -> u8 {
+    let i = idx(q);
+    if host_armed(q) {
+        // Ours to watch while its host bit stays (marked before the second
+        // look: a bit the host clears after it is found by `reconcile`).
+        c.harmed[i >> 6].fetch_or(1u64 << (i & 63), Ordering::AcqRel);
+        if host_armed(q) {
+            if !armed_now {
+                HOST_STATS[H_JOINED].fetch_add(1, Ordering::Relaxed);
+            }
+            return ST_ARMED;
+        }
+        clear_harmed(c, i);
+        HOST_STATS[H_LOST].fetch_add(1, Ordering::Relaxed);
+        return 0;
+    }
+    if armed_now {
+        // The host answered a write there already.
+        HOST_STATS[H_LOST].fetch_add(1, Ordering::Relaxed);
+        return 0;
+    }
+    // Read-only without a host bit: no arming can begin under the lock and
+    // the host only makes pages writable, so the guest's own protection,
+    // unless the host answered a fault there since the region was looked
+    // at (writable now: flagged for the next take).
+    if region_kind(q, q + PAGE).1 == RegionKind::NotWritable {
+        ST_GUEST_RO
+    } else {
+        0
+    }
+}
+
 /// Arms the pages of [base, base+len) (rounded out to pages): read-only,
 /// device-valid. Pages of the host class, busy or already armed are left;
 /// a run that is not plain read-write memory is not armed. Returns the
@@ -488,6 +656,12 @@ fn arm_with(base: u64, len: u64, extra: u8) -> u64 {
     use windows_sys::Win32::System::Memory::PAGE_READONLY;
     // No mapping change meanwhile (`ARM_LOCK`).
     let _arming = ARM_LOCK.read();
+    // Write tracking through the host (`via_host`): no other arm or disarm
+    // between a page's host bit and protection being looked at and its
+    // marks (`hosted::arm_lock`; the host itself only makes pages
+    // writable).
+    let host = extra == 0 && via_host();
+    let _host_lock = host.then(crate::hosted::arm_lock);
     let (lo, hi) = (base & !(PAGE - 1), (base + len).next_multiple_of(PAGE));
     let mut armed = 0;
     let mut p = lo;
@@ -501,7 +675,7 @@ fn arm_with(base: u64, len: u64, extra: u8) -> u64 {
             let mut p = a;
             while p < e {
                 let (r_end, kind) = region_kind(p, e);
-                let ok = kind == RegionKind::Rw && protect(p, r_end - p, PAGE_READONLY);
+                let ok = kind == RegionKind::Rw && if host { arm_host(p, r_end - p) } else { protect(p, r_end - p, PAGE_READONLY) };
                 let mark = if ok {
                     ST_ARMED | extra
                 } else if matches!(kind, RegionKind::NotWritable | RegionKind::Uncommitted) {
@@ -515,16 +689,17 @@ fn arm_with(base: u64, len: u64, extra: u8) -> u64 {
                 let mut q = p;
                 while q < r_end {
                     if let Some(c) = chunk(q, false) {
+                        let m = if host && (ok || kind == RegionKind::NotWritable) { host_mark(c, q, ok) } else { mark };
                         let s = slot(c, q);
-                        s.store((s.load(Ordering::Acquire) | mark) & !ST_BUSY, Ordering::Release);
-                        if mark == 0 {
+                        s.store((s.load(Ordering::Acquire) | m) & !ST_BUSY, Ordering::Release);
+                        if m == 0 {
                             flag(c, idx(q));
+                        }
+                        if m & ST_ARMED != 0 {
+                            *armed += 1;
                         }
                     }
                     q += PAGE;
-                }
-                if ok {
-                    *armed += (r_end - p) / PAGE;
                 }
                 p = r_end;
             }
@@ -559,12 +734,21 @@ fn arm_with(base: u64, len: u64, extra: u8) -> u64 {
 /// one call each (an import window covers up to 16,384 pages).
 fn disarm_range(lo: u64, hi: u64) {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+    let host = via_host();
     let release = |a: u64, e: u64| {
+        // Pages armed through the host: writable, then their host bits
+        // cleared (`hosted::disarm`), before anything else is made
+        // writable (a writable page keeping its bit would hide writes from
+        // front end 2).
+        if host {
+            crate::hosted::disarm(a, e - a);
+        }
         protect_regions(a, e, PAGE_READWRITE, false);
         let mut q = a;
         while q < e {
             if let Some(c) = chunk(q, false) {
                 slot(c, q).fetch_and(!(ST_ARMED | ST_VALID | ST_BUSY | ST_CLEAN), Ordering::AcqRel);
+                clear_harmed(c, idx(q));
                 flag(c, idx(q));
             }
             q += PAGE;
@@ -639,6 +823,8 @@ pub fn remapped(base: u64, len: u64) {
                 break;
             }
         }
+        // (Its host bit goes with the change: `settled`.)
+        clear_harmed(c, idx(p));
         // Uncommitted pages a take skipped have no attention: committing
         // them comes here.
         flag(c, idx(p));
@@ -738,6 +924,11 @@ pub fn on_fault(addr: u64, write: bool) -> bool {
             return false;
         }
         if s.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            // (Armed through the host, whose bit is gone without its
+            // answer: none expected.)
+            if clear_harmed(c, idx(page)) {
+                HOST_STATS[H_IN_PROCESS].fetch_add(1, Ordering::Relaxed);
+            }
             if traced(page) {
                 let rip = FAULT_RIP.with(|r| r.get());
                 let at = if rip >= crate::mem::GUEST_BASE && rip < crate::mem::GUEST_END { crate::exception::describe_guest(rip) } else { crate::exception::host_symbol(rip) };
@@ -801,6 +992,9 @@ pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
     // report, no table chunks made, their attention cleared until a commit.
     let (mut region_end, mut region) = (lo, RegionKind::Other);
     let (mut walked, mut queries, mut unarmed) = (0u64, 0u64, 0u64);
+    // Hosted: each chunk's pages the host answered are flagged first.
+    let host = via_host();
+    let mut seen = u64::MAX;
     let mut p = lo;
     while p < hi {
         let chunk_end = (((p >> CHUNK_SHIFT) + 1) << CHUNK_SHIFT).min(hi);
@@ -819,6 +1013,10 @@ pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
                 chunk(p, true)?
             }
         };
+        if host && p >> CHUNK_SHIFT != seen {
+            seen = p >> CHUNK_SHIFT;
+            reconcile(c, seen << CHUNK_SHIFT);
+        }
         // Only pages flagged for attention can be other than clean.
         let Some(q) = (if full { Some(p) } else { next_flagged(c, p, chunk_end) }) else {
             flush(&mut run, &mut armed);
@@ -1763,7 +1961,7 @@ pub fn status() -> String {
     if crate::sections::on() {
         let t: Vec<u64> = TAKE_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         out = format!(
-            "    write tracking by protection (sections): {} takes visited {} pages ({} region queries), reported {} ({} of them unarmable: once per epoch), armed {} ({} left for other protections); {} write faults ({} races), {} turned volatile ({} armed again after their stay), {} host class; {} arming calls ({:.1} us each), {} disarming calls ({:.1} us each); {} host writes ({} pages); {} remaps; {}; {:.0} MiB zeroed for new mappings (direct {:.0}); {} imports without an alias slot ({} alias views bridged); kernel-mode accesses retried {} ({} retries, {} failed for good); unmapped with GPU writes pending {} (direct {}), mapped again while pending {} ({} waited for)\n",
+            "    write tracking by protection (sections): {} takes visited {} pages ({} region queries), reported {} ({} of them unarmable: once per epoch), armed {} ({} left for other protections); {} write faults ({} races){}, {} turned volatile ({} armed again after their stay), {} host class; {} arming calls ({:.1} us each), {} disarming calls ({:.1} us each); {} host writes ({} pages); {} remaps; {}; {:.0} MiB zeroed for new mappings (direct {:.0}); {} imports without an alias slot ({} alias views bridged); kernel-mode accesses retried {} ({} retries, {} failed for good); unmapped with GPU writes pending {} (direct {}), mapped again while pending {} ({} waited for)\n",
             t[0],
             t[3],
             t[4],
@@ -1773,6 +1971,15 @@ pub fn status() -> String {
             v[S_OTHER_PROT],
             v[S_FAULTS],
             v[S_RACES],
+            if via_host() {
+                let h: Vec<u64> = HOST_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+                format!(
+                    " handled here; armed through the host: {} pages the host answered (or disarmed) found by takes ({} chunk scans), {} joined (armed through the host by another), {} answered before their marks, {} faults on them that reached us, {} armings that failed",
+                    h[H_ANSWERED], h[H_SCANS], h[H_JOINED], h[H_LOST], h[H_IN_PROCESS], h[H_FAILED]
+                )
+            } else {
+                String::new()
+            },
             v[S_VOLATILE],
             v[S_VOL_REARMED],
             v[S_HOSTED],

@@ -2066,7 +2066,11 @@ pub fn init() {
         Ok(s) => {
             ON.store(true, Ordering::Release);
             if crate::hosted::on() {
-                crate::hosted::set_word_mode();
+                // (`DS_FE2_WORD=0`, diagnosis: the host answers a fault for
+                // its page only.)
+                if std::env::var("DS_FE2_WORD").ok().as_deref() != Some("0") {
+                    crate::hosted::set_word_mode();
+                }
                 let _ = std::thread::Builder::new().name("fe2-faults".into()).spawn(watch);
             }
             crate::info!(
