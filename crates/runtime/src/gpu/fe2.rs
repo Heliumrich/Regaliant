@@ -1111,7 +1111,19 @@ fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &A
     if r.is_none() {
         STATS[S_TAKE_FAILED].fetch_add(1, Ordering::Relaxed);
         invalidate(ta, tb - ta);
+    } else if take_all() {
+        // Diagnosis: as if the take found every page written (what takes
+        // on section-backed memory report for pages they cannot arm).
+        invalidate(ta, tb - ta);
     }
+}
+
+/// `DS_FE2_TAKE_ALL=1` (diagnosis): every take invalidates its whole range,
+/// so its pages, GPU-written ones included, are uploaded into the mirror
+/// again in every epoch they are checked in.
+fn take_all() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_FE2_TAKE_ALL").ok().as_deref() == Some("1"))
 }
 
 /// Uploads the pages of [a, b) M lacks (not `mine`) and marks its valid
