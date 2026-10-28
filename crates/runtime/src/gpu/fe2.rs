@@ -94,9 +94,14 @@ const CHUNK_HOLD_MAX_LEVEL: u8 = 1;
 const HOLD_MEMORY: u64 = 120;
 /// Flips an import window exists before pages in it are armed.
 pub const SETTLE: u64 = 60;
-/// Runs of at most HOT_PAGES pages found written within HOT_FLIPS flips are
-/// uploaded without a take (larger ones, as loads write them, would be
-/// uploaded again at every epoch where a take finds them unchanged).
+/// Runs of at most HOT_PAGES pages found written within HOT_FLIPS flips, or
+/// within their quiet time before arming (`hot_quiet`), are uploaded without a
+/// take (larger ones, as loads write them, would be uploaded again at every
+/// epoch where a take finds them unchanged). A take of a page within its
+/// quiet time found it unchanged 93% of the time over a 1-1 walk (~1,880
+/// takes a flip, 3.6 us each, 87% of ranges under 64 KiB: FINDINGS.md
+/// 2026-10-28 night), and each move of a view repeats it; an upload is a
+/// copy region in the batch's prologue.
 const HOT_FLIPS: u64 = 8;
 const HOT_PAGES: u64 = 16;
 /// Runs to check at most this many pages apart get one take (a take's
@@ -256,6 +261,28 @@ struct Fine {
 thread_local! {
     /// This thread's ranges found fine, most recent first.
     static RANGES: std::cell::RefCell<Vec<Fine>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// This thread's exact ranges found fine (`EXACT_SLOTS`, by `exact_slot`;
+    /// an empty slot has `hi` 0).
+    static EXACT: std::cell::RefCell<Vec<Fine>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Slots of each thread's table of exact ranges found fine, beside the
+/// RANGE_CACHE ranges that may cover a binding: a frame's distinct bindings
+/// outnumber those (the graphics CP found no covering range in 42% of its
+/// ~15,850 checks a flip at Sec09 Firebridge, 2026-10-28 night). A slot
+/// holds the last range hashed there (`DS_FE2_EXACT=0`: none).
+const EXACT_SLOTS: usize = 4096;
+
+fn exact_on() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_FE2_EXACT").ok().as_deref() != Some("0"))
+}
+
+/// The slot of page-aligned [lo, hi) in `EXACT`.
+#[inline]
+fn exact_slot(lo: u64, hi: u64) -> usize {
+    let h = (lo >> 12).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (hi >> 12).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    (h >> (64 - EXACT_SLOTS.trailing_zeros())) as usize
 }
 
 /// The generations of the chunks over [lo, hi) and the host's events of its
@@ -292,10 +319,35 @@ fn snapshot(lo: u64, hi: u64) -> Option<([u32; FINE_CHUNKS], [u64; FINE_LEAVES])
 /// changed there since.
 #[inline]
 fn range_fine(lo: u64, hi: u64, want: u32, marked: bool) -> bool {
+    // The exact range first.
+    let mut exact_why = None;
+    if exact_on() {
+        let hit = EXACT.with(|t| {
+            let mut t = t.borrow_mut();
+            let k = exact_slot(lo, hi);
+            let f = t.get(k)?;
+            if f.lo != lo || f.hi != hi || (marked && !f.marked) {
+                return None;
+            }
+            match changed(f) {
+                Some(c) => {
+                    t[k].hi = 0;
+                    Some(Err(c))
+                }
+                None if f.ep >= want => Some(Ok(())),
+                None => Some(Err(C_EPOCH)),
+            }
+        });
+        match hit {
+            Some(Ok(())) => return true,
+            Some(Err(c)) => exact_why = Some(c),
+            None => {}
+        }
+    }
     RANGES.with(|r| {
         let mut r = r.borrow_mut();
         // (Why not, for `DS_FE2_CALLERS`: the last covering range's reason.)
-        let mut why = C_NO_RANGE;
+        let mut why = exact_why.unwrap_or(C_NO_RANGE);
         let mut i = 0;
         while i < r.len() {
             let f = &r[i];
@@ -447,6 +499,15 @@ fn caller_count(what: usize, n: u64) {
 }
 
 fn note_range_fine(lo: u64, hi: u64, gens: [u32; FINE_CHUNKS], host: [u64; FINE_LEAVES], ep: u32, marked: bool) {
+    if exact_on() {
+        EXACT.with(|t| {
+            let mut t = t.borrow_mut();
+            if t.is_empty() {
+                t.resize(EXACT_SLOTS, Fine { lo: 0, hi: 0, gens: [0; FINE_CHUNKS], host: [0; FINE_LEAVES], ep: 0, marked: false });
+            }
+            t[exact_slot(lo, hi)] = Fine { lo, hi, gens, host, ep, marked };
+        });
+    }
     RANGES.with(|r| {
         let mut r = r.borrow_mut();
         r.retain(|f| !(lo <= f.lo && f.hi <= hi && (marked || !f.marked)));
@@ -483,6 +544,14 @@ pub fn defer_checks() -> bool {
 fn arm_gpu() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *W.get_or_init(|| std::env::var("DS_FE2_ARM_GPU").ok().as_deref() == Some("1"))
+}
+
+/// Small runs are uploaded without a take while their pages are within their
+/// quiet time, not only HOT_FLIPS after a write (`hot_run`; `DS_FE2_HOT_QUIET=0`:
+/// HOT_FLIPS only, as before 2026-10-28).
+fn hot_quiet() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_FE2_HOT_QUIET").ok().as_deref() != Some("0"))
 }
 
 /// Where pages may be armed (the executor's import list): calls its third
@@ -1098,11 +1167,14 @@ fn hot_run(a: u64, b: u64, frame: u64) -> bool {
     if (b - a) / PAGE > HOT_PAGES {
         return false;
     }
+    let quiet = hot_quiet();
     let mut x = a;
     while x < b {
         let Some(c) = chunk(x, false) else { return false };
-        let wrote = c.wrote[idx(x)].load(Ordering::Relaxed) as u64;
-        if wrote == 0 || frame.saturating_sub(wrote - 1) >= HOT_FLIPS {
+        let i = idx(x);
+        let wrote = c.wrote[i].load(Ordering::Relaxed) as u64;
+        let window = if quiet { HOT_FLIPS.max(ARM_QUIET << c.level[i].load(Ordering::Relaxed)) } else { HOT_FLIPS };
+        if wrote == 0 || frame.saturating_sub(wrote - 1) >= window {
             return false;
         }
         x += PAGE;
