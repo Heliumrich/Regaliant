@@ -2264,6 +2264,17 @@ pub fn init() {
             crate::warn!("fe2: no switch {name}");
         }
     }
+    // Compute queues' synchronization-free runs are recorded in parallel
+    // (four workers, flushes kept inside runs, runs from 64 commands: +6-10%
+    // at the vista once checks follow each other's takes; a loss in the
+    // default front end, FINDINGS.md 2026-10-28 night), unless set
+    // explicitly.
+    const PAR: [(&str, u64); 3] = [("par_compute", 4), ("par_events", 1), ("par_min_compute", 64)];
+    for (name, v) in PAR {
+        if !super::tune::set_default(name, v) {
+            crate::warn!("fe2: no switch {name}");
+        }
+    }
     let made = match super::resident::make_for_fe2() {
         Ok(s) => s,
         Err(e) => {
@@ -2300,10 +2311,13 @@ pub fn init() {
                 let _ = std::thread::Builder::new().name("fe2-faults".into()).spawn(watch);
             }
             crate::info!(
-                "fe2: front end 2 on ({made}; {s}; hosted arming {}{}; switched off: {})",
+                "fe2: front end 2 on ({made}; {s}; hosted arming {}{}; switched off: {}; compute runs recorded in parallel on {} workers (par_events {}, from {} commands))",
                 if crate::hosted::on() { "on" } else { "off (not under the host)" },
                 if arm_gpu() { "" } else { ", GPU-written pages never armed" },
-                OFF.join(", ")
+                OFF.join(", "),
+                super::tune::par_compute(),
+                super::tune::par_events(),
+                super::tune::par_min_compute()
             );
         }
         Err(e) => crate::error!("fe2: the write-back's self-test failed: {e}; front end 2 off"),

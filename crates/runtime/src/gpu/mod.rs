@@ -2100,6 +2100,21 @@ pub mod tune {
             None => false,
         }
     }
+
+    /// Sets switch `name` to `v` unless its environment variable is set (a
+    /// mode's own defaults, which A/Bs can still override). False: no such
+    /// switch.
+    pub fn set_default(name: &str, v: u64) -> bool {
+        match ALL.iter().find(|t| t.name == name) {
+            Some(t) => {
+                if std::env::var_os(t.env).is_none() {
+                    t.value.store(v, Ordering::Relaxed);
+                }
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 pub mod ahead;

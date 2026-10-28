@@ -6716,6 +6716,8 @@ pub struct Exec {
     submit_after: u64,
     /// CP timestamp writes the GPU performs in the recording batch.
     ts_used: u32,
+    /// The recording batch reset its timestamp pool whole (`gpu_timestamp`).
+    ts_pool_reset: bool,
     /// End-of-pipe timestamps of the batch whose readback and store wait for
     /// its end (`tune eop_light`).
     ts_deferred: Vec<TsEntry>,
@@ -7453,6 +7455,7 @@ impl Exec {
                 last_action_seq: 0,
                 submit_after: 0,
                 ts_used: 0,
+                ts_pool_reset: false,
                 ts_deferred: Vec::new(),
                 kept_taken: Vec::new(),
                 kept_written: Vec::new(),
@@ -7865,6 +7868,7 @@ impl Exec {
         self.begun_mark = super::timeline::mark();
         self.pool_use = [0; 6];
         self.ts_used = 0;
+        self.ts_pool_reset = false;
         self.ops = [0; OPS];
         self.ts_deferred.clear();
         self.eop_unordered = false;
@@ -8774,7 +8778,9 @@ impl Exec {
         let mut up = std::mem::take(&mut self.fe2_up);
         let mut deferred = std::mem::take(&mut self.fe2_pend);
         let (first, first_pend) = (up.len(), deferred.len());
-        let r = super::fe2::ensure(lo, hi, want, ep, written, &|p| mine.contains(&p) || pend.contains(&p), &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable, super::fe2::defer_checks().then_some(&mut deferred));
+        // (Asked per page of the runs a check needs: empty sets are not
+        // hashed into.)
+        let r = super::fe2::ensure(lo, hi, want, ep, written, &|p| (!mine.is_empty() && mine.contains(&p)) || (!pend.is_empty() && pend.contains(&p)), &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable, super::fe2::defer_checks().then_some(&mut deferred));
         let t3 = tsc();
         let (mut mine, mut pend) = (mine, pend);
         for &(a, b) in &up[first..] {
@@ -11168,9 +11174,11 @@ impl Exec {
         self.pool_use[0] += 1;
         self.pool_use[1] += 2;
         self.gpu_writes_open = true;
+        // (A light one inside a rendering instance once the batch's pool is
+        // reset: a timestamp write may come there, a query reset may not.)
         if !super::tune::eop_light() && super::tune::ts_nowait() && super::tune::skip_barriers() & 8 == 0 {
             self.end_rendering_before_barrier();
-        } else {
+        } else if !(eop && self.ts_pool_reset) {
             self.end_rendering();
         }
         let q = self.ts_used;
@@ -11183,9 +11191,15 @@ impl Exec {
             // Taken when the work before it completed, without holding later
             // work back; read and stored to guest memory at the batch's end
             // (`resolve_timestamps`; the CPU reads it after completion, and a
-            // command-processor read of it waits for the batch).
+            // command-processor read of it waits for the batch). The batch's
+            // first resets every query of the pool, so the later ones need
+            // not end the rendering instance they come in (~400 a frame at
+            // the courtyard, each a restart of rendering for the next draw).
             unsafe {
-                c.device.cmd_reset_query_pool(cmd, pool, q, 1);
+                if !self.ts_pool_reset {
+                    c.device.cmd_reset_query_pool(cmd, pool, 0, TS_PER_BATCH);
+                    self.ts_pool_reset = true;
+                }
                 c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, q);
             }
             self.ts_deferred.push(TsEntry { q, buffer, off, k });

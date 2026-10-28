@@ -76,6 +76,20 @@ static ENTRIES: RwLock<Vec<Entry>> = RwLock::new(Vec::new());
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 static GEN: AtomicU64 = AtomicU64::new(1);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// Where the live entries' destinations lie, [SPAN[0], SPAN[1]) (set with
+/// every change of `ENTRIES`, under its lock): a read outside it and the
+/// thread's held entries overlaps none, and `uncovered` answers without
+/// making the thread's copy of the entries again (made again after every
+/// change: ~1,400 a flip at the vista, ~3-4% of the graphics command
+/// processor's time, 2026-10-28).
+static SPAN: [AtomicU64; 2] = [AtomicU64::new(u64::MAX), AtomicU64::new(0)];
+
+/// `SPAN` for the entries `g` (under the entries' lock).
+fn note_span(g: &[Entry]) {
+    let (lo, hi) = g.iter().fold((u64::MAX, 0u64), |(lo, hi), e| (lo.min(e.base), hi.max(e.base + 4 * e.words.len() as u64)));
+    SPAN[0].store(lo, Ordering::Release);
+    SPAN[1].store(hi, Ordering::Release);
+}
 /// At most this many entries live (the oldest goes first).
 const MAX_ENTRIES: usize = 64;
 
@@ -226,6 +240,7 @@ pub fn hold_commit() {
         HELD_STATS[1].fetch_add(1, Ordering::Relaxed);
     }
     COUNT.store(g.len(), Ordering::Release);
+    note_span(&g);
     GEN.fetch_add(1, Ordering::AcqRel);
 }
 
@@ -483,6 +498,7 @@ fn drop_stale(base: u64) {
     if g.len() != before {
         STATS[8].fetch_add(1, Ordering::Relaxed);
         COUNT.store(g.len(), Ordering::Release);
+        note_span(&g);
         GEN.fetch_add(1, Ordering::AcqRel);
     }
 }
@@ -566,36 +582,47 @@ pub fn uncovered(reads: &[(u64, u64)]) -> Option<Vec<(u64, u64)>> {
     if !active() {
         return None;
     }
+    // Reads outside every entry need not make this thread's copy. (A span
+    // read while it changes can only miss a cover: the reads are then
+    // waited for as without forwarding.)
+    let (lo, hi) = (SPAN[0].load(Ordering::Acquire), SPAN[1].load(Ordering::Acquire));
+    let held = HELD.with(|h| h.borrow().as_ref().is_some_and(|x| x.entries.iter().any(|e| reads.iter().any(|&(a, n)| e.base < a + n && a < e.base + 4 * e.words.len() as u64))));
+    if !held && !reads.iter().any(|&(a, n)| a < hi && lo < a + n) {
+        return None;
+    }
     with_local_span(|v, (lo, hi)| {
         if !reads.iter().any(|&(a, n)| a < hi && lo < a + n && v.iter().any(|e| e.0 < a + n && a < e.0 + e.1)) {
             return None;
         }
         let mut out = Vec::with_capacity(reads.len());
         let mut covered = 0u64;
+        // The entries over one read, clipped to it (one buffer for all: this
+        // allocated a vector per read and entry, ~1.6% of the graphics
+        // command processor's time at the vista, 2026-10-28).
+        let mut over: Vec<(u64, u64)> = Vec::new();
         for &(a, n) in reads {
-            // Pieces of [a, a + n) outside every entry.
-            let mut pieces = vec![(a, a + n)];
-            for (base, bytes, ..) in v {
-                let (lo, hi) = (*base, base + bytes);
-                let mut next = Vec::with_capacity(pieces.len() + 1);
-                for (s, e) in pieces {
-                    if e <= lo || hi <= s {
-                        next.push((s, e));
-                        continue;
-                    }
-                    if s < lo {
-                        next.push((s, lo));
-                    }
-                    if hi < e {
-                        next.push((hi, e));
-                    }
-                }
-                pieces = next;
+            let end = a + n;
+            over.clear();
+            over.extend(v.iter().filter(|e| e.0 < end && a < e.0 + e.1).map(|e| (e.0.max(a), (e.0 + e.1).min(end))));
+            if over.is_empty() {
+                out.push((a, n));
+                continue;
             }
-            if pieces.is_empty() {
+            // Pieces of [a, end) outside every entry, in order.
+            over.sort_unstable();
+            let (mut at, before) = (a, out.len());
+            for &(s, e) in &over {
+                if s > at {
+                    out.push((at, s - at));
+                }
+                at = at.max(e);
+            }
+            if at < end {
+                out.push((at, end - at));
+            }
+            if out.len() == before {
                 covered += 1;
             }
-            out.extend(pieces.into_iter().map(|(s, e)| (s, e - s)));
         }
         STATS[4].fetch_add(covered, Ordering::Relaxed);
         Some(out)
@@ -676,6 +703,7 @@ pub fn written(a: u64, n: u64) {
     if ended > 0 {
         STATS[1].fetch_add(ended as u64, Ordering::Relaxed);
         COUNT.store(g.len(), Ordering::Release);
+        note_span(&g);
         GEN.fetch_add(1, Ordering::AcqRel);
     }
 }
@@ -931,6 +959,7 @@ pub fn add(base: u64, words: Vec<u32>, program: u64, hash: u64, from: Inputs, ho
     }
     g.push(Entry { id, base, words: words.into(), seq: 0, program, hash, from, old, earlier, how, queue: queue.into(), write_backs: super::homes::WRITE_BACKS.load(Ordering::Relaxed) });
     COUNT.store(g.len(), Ordering::Release);
+    note_span(&g);
     GEN.fetch_add(1, Ordering::AcqRel);
     STATS[0].fetch_add(1, Ordering::Relaxed);
     id
@@ -1019,6 +1048,7 @@ pub fn drop_entries(ids: &[u64]) {
     g.retain(|e| !ids.contains(&e.id));
     if g.len() != before {
         COUNT.store(g.len(), Ordering::Release);
+        note_span(&g);
         GEN.fetch_add(1, Ordering::AcqRel);
     }
 }
@@ -1083,6 +1113,7 @@ pub fn completed(done: u64) {
         }
         *g = keep;
         COUNT.store(g.len(), Ordering::Release);
+        note_span(&g);
         GEN.fetch_add(1, Ordering::AcqRel);
         due
     };
