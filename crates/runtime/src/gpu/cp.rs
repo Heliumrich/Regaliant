@@ -3199,6 +3199,12 @@ impl Cp {
         e.past_commit();
         PAST_WAITS[1].fetch_add(1, Ordering::Relaxed);
         past_backoff_note(w.a, false);
+        // The label passed: front end 2's view as after any wait (the
+        // writer's, or the epoch now; the stretch checked as of the epoch
+        // at each check). (The default front end's scopes stay as before.)
+        if super::fe2::on() {
+            self.end_copy_scope_after_wait(w.a, w.wide);
+        }
         if why == "label" {
             self.submit_gpu("label");
         }

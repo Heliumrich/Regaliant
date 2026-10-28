@@ -3667,7 +3667,9 @@ const OP_WRITE_BACK_BYTES: usize = 9;
 const OP_FAST_CLEARS: usize = 10;
 /// Rendering instances ended (`seg_stamps` names segments by it).
 pub(super) const OP_PASS_ENDS: usize = 11;
-const OPS: usize = 12;
+/// Front end 2's write-backs (`Exec::fe2_scatter`).
+const OP_FE2_SCATTERS: usize = 12;
+const OPS: usize = 13;
 
 fn ops_line(ops: &[u64; OPS]) -> String {
     let kib = |b: u64| b.div_ceil(1024);
@@ -5144,7 +5146,8 @@ static SEG_ENDS: Mutex<Option<HashMap<(String, &'static str, u32), [u64; 3]>>> =
 
 /// What a segment without commands recorded (its operation counts' change).
 fn seg_kind(a: &[u64; OPS], b: &[u64; OPS]) -> &'static str {
-    const KINDS: [(usize, &str); 8] = [
+    const KINDS: [(usize, &str); 9] = [
+        (OP_FE2_SCATTERS, "front end 2 write-backs"),
         (OP_MERGES, "shadow merges"),
         (OP_SHADOWS_IN, "shadow copies in"),
         (OP_TIMESTAMPS, "timestamps"),
@@ -8681,7 +8684,17 @@ impl Exec {
         let t2 = tsc();
         // (Read before any take: what its pages are stamped with.)
         let ep = super::precache::epoch() as u32;
+        // Held past a label wait, the work runs after the label, whose writer
+        // may synchronize again before writing it: the view now does not
+        // cover the CPU writes it must see, and the epoch now does (as for
+        // every check before views). With the view, a per-view copy kernel's
+        // source passed stale in the mirror after a warp, its forwarded
+        // words then differed from what the copy left (`forward`: "did not
+        // land"), the block was no longer forwarded, and every later draw
+        // reading it stopped the stretch and waited for the label (~9 ms
+        // each, 732 times in one window; 2 of ~20 boots, 2026-10-28 night).
         let want = match self.fe2_view.load(Ordering::Acquire) {
+            _ if self.past_grow && super::fe2::stretch_epoch() => ep,
             super::fe2::NO_VIEW => ep,
             v => v.min(ep),
         };
@@ -8801,10 +8814,21 @@ impl Exec {
     /// Front end 2's write-back, recorded now (outside a render pass): the
     /// dwords GPU work marked go from the mirror to guest memory.
     fn fe2_scatter(&mut self) {
+        // (`DS_PROFILE_GPU_STAMPS=seg`: a segment of its own, `front end 2
+        // write-backs`; its own barriers write no segment stamps, and its
+        // time went to the commands before it.)
+        let seg = seg_stamps();
+        if seg {
+            self.barrier();
+        }
         let cmd = self.cmd();
         if let Some(pipe) = super::fe2::record_scatter(cmd) {
             // The next dispatch binds its own pipeline and descriptors.
             self.dyncache.cs_pipeline = pipe;
+        }
+        self.ops[OP_FE2_SCATTERS] += 1;
+        if seg {
+            self.barrier();
         }
         self.fe2_marked = false;
     }

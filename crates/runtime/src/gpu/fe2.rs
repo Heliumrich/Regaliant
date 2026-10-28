@@ -546,6 +546,14 @@ fn arm_gpu() -> bool {
     *W.get_or_init(|| std::env::var("DS_FE2_ARM_GPU").ok().as_deref() == Some("1"))
 }
 
+/// Held past a label wait, the graphics command processor's checks need the
+/// epoch now, not its view (`DS_FE2_STRETCH_VIEW=1`: the view, as before
+/// 2026-10-28 night's fix; `Exec::fe2_place_inner`).
+pub fn stretch_epoch() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_FE2_STRETCH_VIEW").ok().as_deref() != Some("1"))
+}
+
 /// Small runs are uploaded without a take while their pages are within their
 /// quiet time, not only HOT_FLIPS after a write (`hot_run`; `DS_FE2_HOT_QUIET=0`:
 /// HOT_FLIPS only, as before 2026-10-28).
