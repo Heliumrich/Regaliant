@@ -117,6 +117,11 @@ struct Chunk {
     valid: [AtomicU64; WORDS],
     /// Armed by us through the host (the host's bit says whether still).
     armed: [AtomicU64; WORDS],
+    /// Armed and taken since (by one of our takes that began with the page
+    /// armed): from then on only a write fault may change it; a take that
+    /// finds such a page written found a write the protection missed
+    /// (`take_run`: a hole).
+    varmed: [AtomicU64; WORDS],
     /// Written by GPU work (never armed, unless `DS_FE2_ARM_GPU=1`).
     gpu: [AtomicU64; WORDS],
     /// The epoch every valid page of the word was found clean in (a take
@@ -611,6 +616,7 @@ fn make_chunk(slot: &'static AtomicPtr<Chunk>) -> &'static Chunk {
     let new = Box::into_raw(Box::new(Chunk {
         valid: std::array::from_fn(|_| AtomicU64::new(0)),
         armed: std::array::from_fn(|_| AtomicU64::new(0)),
+        varmed: std::array::from_fn(|_| AtomicU64::new(0)),
         gpu: std::array::from_fn(|_| AtomicU64::new(0)),
         wclean: std::array::from_fn(|_| AtomicU32::new(0)),
         wgen: std::array::from_fn(|_| AtomicU32::new(0)),
@@ -732,6 +738,21 @@ pub fn note_scatter() {
 /// Counts a CP write the GPU performs that also went into the mirror.
 pub fn note_cp_mirror() {
     STATS[S_CP_MIRROR].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Pages of [lo, hi) GPU work wrote (as far as front end 2 knows: its
+/// write marks' pages; `fe2census`).
+pub fn gpu_pages(lo: u64, hi: u64) -> u64 {
+    let (mut x, hi) = ((lo & !(PAGE - 1)).max(MIRROR_BASE), hi.min(MIRROR_END));
+    let mut n = 0;
+    while x < hi {
+        let e = word_end(x, hi);
+        if let Some(c) = chunk(x, false) {
+            n += (c.gpu[idx(x) / 64].load(Ordering::Relaxed) & word_mask(x, e)).count_ones() as u64;
+        }
+        x = e;
+    }
+    n
 }
 
 /// Counts pages copied into the mirror by the CPU (no import window).
@@ -1094,10 +1115,14 @@ fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &A
     // The take: pages written since their last take lose their valid bit
     // (`marks_taken`, for any take's pages).
     written.clear();
+    hole_snapshot(ta, tb);
     let tt = std::time::Instant::now();
     let t = tsc();
     let r = super::precache::take_written_for(ta, tb - ta, written, None, crate::mem::WW_WHO_FE2);
     caller_since(C_TAKE, t);
+    if r.is_some() {
+        hole_check(written);
+    }
     super::hitch::note_since(super::hitch::Kind::Mirror, tt, || format!("take of {ta:#x}..{tb:#x} ({} pages)", (tb - ta) / PAGE));
     let tns = tt.elapsed().as_nanos() as u64;
     STATS[S_TAKE_NS].fetch_add(tns, Ordering::Relaxed);
@@ -1108,6 +1133,9 @@ fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &A
     class[2].fetch_add(1, Ordering::Relaxed);
     class[3].fetch_add(tns, Ordering::Relaxed);
     STATS[S_TAKE_WRITTEN].fetch_add(written.len() as u64, Ordering::Relaxed);
+    if super::fe2census::on() {
+        super::fe2census::note_take(ta, tb, written, CALLER.with(|c| c.get()));
+    }
     if r.is_none() {
         STATS[S_TAKE_FAILED].fetch_add(1, Ordering::Relaxed);
         invalidate(ta, tb - ta);
@@ -1116,6 +1144,81 @@ fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &A
         // on section-backed memory report for pages they cannot arm).
         invalidate(ta, tb - ta);
     }
+}
+
+thread_local! {
+    /// `take_run`'s words with armed pages as its take began: (word address,
+    /// pages armed and taken since, pages armed).
+    static HOLE_WORDS: std::cell::RefCell<Vec<(u64, u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Pages our takes found written while armed and taken since (no fault
+/// ended the arming: a write the protection missed, whose page the mirror
+/// would have kept stale where it trusts armed pages).
+static HOLES: AtomicU64 = AtomicU64::new(0);
+
+/// Before a take of [ta, tb): its pages armed (the host's bit set), and
+/// those of them taken since their arming (`Chunk::varmed`).
+fn hole_snapshot(ta: u64, tb: u64) {
+    HOLE_WORDS.with(|h| {
+        let mut h = h.borrow_mut();
+        h.clear();
+        let (mut x, hi) = (ta.max(MIRROR_BASE), tb.min(MIRROR_END));
+        while x < hi {
+            let e = word_end(x, hi);
+            if let Some(c) = chunk(x, false) {
+                let w = idx(x) / 64;
+                let armed = c.armed[w].load(Ordering::Acquire) & word_mask(x, e);
+                if armed != 0 {
+                    let wa = x & !(64 * PAGE - 1);
+                    let now = armed & crate::hosted::armed_word(wa);
+                    if now != 0 {
+                        h.push((wa, c.varmed[w].load(Ordering::Acquire) & now, now));
+                    }
+                }
+            }
+            x = e;
+        }
+    });
+}
+
+/// After that take (it found `written`): a page armed and taken since
+/// before it began, found written and still armed and taken since (no
+/// fault cleared its bit, no new arming began) is a hole; the pages armed
+/// as it began and still armed are taken since their arming now.
+fn hole_check(written: &[u64]) {
+    HOLE_WORDS.with(|h| {
+        let h = h.borrow();
+        if h.is_empty() {
+            return;
+        }
+        for &p in written {
+            let wa = p & !(64 * PAGE - 1);
+            let Ok(k) = h.binary_search_by_key(&wa, |e| e.0) else { continue };
+            let bit = 1u64 << (idx(p) % 64);
+            if h[k].1 & bit == 0 {
+                continue;
+            }
+            let Some(c) = chunk(p, false) else { continue };
+            let w = idx(p) / 64;
+            if c.varmed[w].load(Ordering::Acquire) & c.armed[w].load(Ordering::Acquire) & crate::hosted::armed_word(wa) & bit != 0 {
+                let n = HOLES.fetch_add(1, Ordering::Relaxed);
+                if n < 32 {
+                    // (try_lock: the caller may hold the memory map.)
+                    let map = crate::mem::MEM.try_lock().map_or_else(|| "busy".into(), |m| m.find(p).map_or_else(|| "none".into(), |v| format!("{:#x}+{:#x} {:?} '{}'", v.start, v.size, v.kind, v.name)));
+                    crate::warn!("fe2: a take found page {p:#x} written while armed and taken since (no write fault; flip {}, thread {}; mapping {map})", super::FRAMES.load(Ordering::Relaxed), std::thread::current().name().unwrap_or("?"));
+                }
+            }
+        }
+        for &(wa, _, now) in h.iter() {
+            let Some(c) = chunk(wa, false) else { continue };
+            let w = idx(wa) / 64;
+            let live = now & c.armed[w].load(Ordering::Acquire) & crate::hosted::armed_word(wa);
+            if live != 0 {
+                c.varmed[w].fetch_or(live, Ordering::AcqRel);
+            }
+        }
+    });
 }
 
 /// `DS_FE2_TAKE_ALL=1` (diagnosis): every take invalidates its whole range,
@@ -1778,6 +1881,8 @@ fn arm_part(x: u64, y: u64, frame: u64) {
     while p < y {
         let e = word_end(p, y);
         if let Some(c) = chunk(p, false) {
+            // (Not taken since this arming yet: `take_run`.)
+            c.varmed[idx(p) / 64].fetch_and(!word_mask(p, e), Ordering::AcqRel);
             c.armed[idx(p) / 64].fetch_or(word_mask(p, e), Ordering::AcqRel);
         }
         p = e;
@@ -2185,7 +2290,7 @@ pub fn status() -> String {
         })
         .collect();
     format!(
-        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes; faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity; CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
+        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes, {} writes found on pages armed and taken since (holes); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity; CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
         s[S_ENSURES],
         s[S_ENSURE_PAGES],
         s[S_FAST],
@@ -2211,6 +2316,7 @@ pub fn status() -> String {
         s[S_ARM_RUNS],
         s[S_ARM_FAILED],
         s[S_ARM_ENDED],
+        HOLES.load(Ordering::Relaxed),
         FAULTS[F_SPAN].load(Ordering::Relaxed),
         FAULTS[F_ENDED].load(Ordering::Relaxed),
         FAULTS[F_OUTSIDE].load(Ordering::Relaxed),

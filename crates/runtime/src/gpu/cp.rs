@@ -2299,6 +2299,9 @@ impl Cp {
         if let Some(c) = self.fe2_view.as_ref() {
             if super::fe2::sync_view(c, adopt.unwrap_or_else(|| super::precache::epoch() as u32)) {
                 super::fe2::note_raise(self.compute);
+                if super::fe2census::on() {
+                    super::fe2census::note_raise(&self.name);
+                }
             }
         }
     }
