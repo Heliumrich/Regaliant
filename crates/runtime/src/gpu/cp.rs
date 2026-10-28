@@ -284,6 +284,9 @@ pub struct Cp {
     /// pointer moved per draw and dispatch, not the whole executor).
     exec: Option<Box<super::exec::Exec>>,
     exec_failed: bool,
+    /// Front end 2's view of a compute queue (`fe2::views_on`): advanced at
+    /// its synchronization points (`fe2_sync`).
+    fe2_view: Option<Arc<std::sync::atomic::AtomicU32>>,
     /// A partial flush / acquire was requested: the next CP memory write
     /// must wait for the GPU work before it.
     fence_pending: bool,
@@ -1751,6 +1754,7 @@ impl Cp {
             depth: 0,
             exec: None,
             exec_failed: false,
+            fe2_view: (compute && super::fe2::wanted() && super::fe2::views_on()).then(|| super::fe2::view_cell(name)),
             fence_pending: false,
             pred: None,
             submitted_at: None,
@@ -2238,17 +2242,23 @@ impl Cp {
     /// last (the queues synchronize this way ~250 times per frame).
     fn end_copy_scope_after_wait(&self, a: u64, wide: bool) {
         if !valid(a, if wide { 8 } else { 4 }) || (self.held.is_some() && self.past.is_none() && self.past_wait.is_none()) {
+            // (A compute queue's view: the epoch now, whatever the label.)
+            self.fe2_sync(None);
             return;
         }
         if self.last_wait_gpu && super::tune::epoch_gpu_waits() {
             EPOCH_GPU_WAITS.fetch_add(1, Ordering::Relaxed);
+            self.fe2_adopt(last_write(a).map(|w| w.0).as_deref());
             return;
         }
         let now = unsafe { if wide { rd64(a) } else { rd32(a) as u64 } };
         let last = last_write(a);
         let by_gpu = last.as_ref().is_some_and(|(q, v, _)| q.starts_with("gpu-") && if wide { *v == now } else { *v as u32 == now as u32 });
-        if !by_gpu {
+        if by_gpu {
+            self.fe2_adopt(last.as_ref().map(|w| w.0.as_str()));
+        } else {
             super::precache::end_scope(1);
+            self.fe2_sync(None);
             if super::exec::profiling_on() {
                 let what = match last_write_at(a) {
                     None => "no CP write recorded",
@@ -2277,6 +2287,25 @@ impl Cp {
     pub fn new_submission(&mut self) {
         if self.held.is_none() || self.past.is_some() || self.past_wait.is_some() {
             super::precache::end_scope(0);
+            self.fe2_sync(None);
+        }
+    }
+
+    /// Front end 2 (compute queues, `fe2::views_on`): this queue
+    /// synchronized; its checks need pages current as of the epoch now, or
+    /// as of the view `adopt`.
+    fn fe2_sync(&self, adopt: Option<u32>) {
+        if let Some(c) = self.fe2_view.as_ref() {
+            super::fe2::sync_view(c, adopt.unwrap_or_else(|| super::precache::epoch() as u32));
+        }
+    }
+
+    /// A wait passed on a value the CP of queue `writer` wrote: that
+    /// queue's view (the epoch now for queues without one, the graphics
+    /// queue's among them).
+    fn fe2_adopt(&self, writer: Option<&str>) {
+        if self.fe2_view.is_some() {
+            self.fe2_sync(Some(writer.and_then(super::fe2::view_of).unwrap_or_else(|| super::precache::epoch() as u32)));
         }
     }
 

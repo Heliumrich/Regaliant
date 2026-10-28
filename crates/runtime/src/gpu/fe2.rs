@@ -11,12 +11,15 @@
 //!   the dwords it marked into guest memory, so guest memory is current at
 //!   batch boundaries for the CPU, the command processors and the image
 //!   cache.
-//! - CPU writes are found by write watching. A valid page that is not armed
-//!   is trusted for the synchronization epoch (`precache::epoch`) a take
-//!   found it unwritten in; every take, ours or another's (`precache` applies
-//!   them all under one protocol), clears the valid bit of the pages it
-//!   reports (`marks_taken`), as do file reads, CP writes the CPU performs
-//!   and mapping changes (`invalidate`).
+//! - CPU writes are found by write watching. A take stamps the pages it
+//!   found unwritten with the synchronization epoch (`precache::epoch`) read
+//!   before it; a valid page that is not armed is trusted by a check whose
+//!   queue's view (`views_on`: a compute queue's last synchronization point;
+//!   the epoch now for the graphics queue and its workers) is at most its
+//!   stamp. Every take, ours or another's (`precache` applies them all under
+//!   one protocol), clears the valid bit of the pages it reports
+//!   (`marks_taken`), as do file reads, CP writes the CPU performs and
+//!   mapping changes (`invalidate`).
 //! - Hosted (`--host`): pages quiet for ARM_QUIET flips (doubled each time an
 //!   arming ended in a write, up to ARM_MAX_LEVEL) and found clean by takes
 //!   in ARM_USES epochs since, inside import windows at least SETTLE flips
@@ -26,8 +29,10 @@
 //!   needs no take. Pages GPU work writes are not armed (they are the
 //!   pages the GPU writes through their imports; `DS_FE2_ARM_GPU=1`: armed
 //!   too, as GPU writes do not fault and M holds them). Each fault
-//!   stops the whole process for 15-50 us: a thread reads the faults the
-//!   host answered (`watch`), and a 64 MiB chunk with CHUNK_BURST of them
+//!   stops the whole process for 15-50 us, and the host answers it for its
+//!   page's whole 64-page word (`hosted::set_word_mode`): a thread reads the
+//!   faults the host answered (`watch`; the word's pages take the faulted
+//!   page's backoff level), and a 64 MiB chunk with CHUNK_BURST of them
 //!   within BURST_MS (or with some while all chunks together had ALL_BURST:
 //!   a load rewriting memory armed before it) has its armed pages disarmed
 //!   and its arming held CHUNK_HOLD flips (doubled for each burst within
@@ -70,16 +75,23 @@ const ARM_USES: u8 = 8;
 /// Faults on armed pages within BURST_MS that disarm a chunk (its own, or
 /// all chunks' together while it had some), the flips its arming then
 /// waits, and how a burst within HOLD_MEMORY flips of the chunk's last hold
-/// doubles that (up to CHUNK_HOLD_MAX_LEVEL times).
-const CHUNK_BURST: u32 = 16;
-const ALL_BURST: u32 = 64;
+/// doubles that (up to CHUNK_HOLD_MAX_LEVEL times). A burst is a load-like
+/// storm: 64 faults in 100 ms cost ~1.7 ms of stopped process. (16 and 64
+/// until 2026-10-28 small hours: at the gate, ~1.2 faults a flip in
+/// clusters still held ~20 chunks a window, and their pages were taken every
+/// epoch. 256 and 1024, tried the same night, let the page-by-page backoff
+/// learn the gate's writes alone: 52 faults a flip against 6, 12 flips/s.)
+const CHUNK_BURST: u32 = 64;
+const ALL_BURST: u32 = 256;
 const BURST_MS: u128 = 100;
+/// Holds double only while bursts follow each other (a load going on): the
+/// gate's storms, ~20 s apart, held their chunks 120 flips each with the
+/// doubling counted over 600 flips, and a held chunk's pages are taken
+/// every epoch; 8-flip holds made arming churn (~300 pages armed and
+/// disarmed a flip, faults 6 -> 10 a flip; 2026-10-28).
 const CHUNK_HOLD: u64 = 60;
-/// (5 until 2026-10-27 late night: holds of up to 1,920 flips after a load
-/// left its pools unarmed long after it, their ranges taken every epoch;
-/// the pages' own doubling keeps rewritten ones unarmed.)
-const CHUNK_HOLD_MAX_LEVEL: u8 = 2;
-const HOLD_MEMORY: u64 = 600;
+const CHUNK_HOLD_MAX_LEVEL: u8 = 1;
+const HOLD_MEMORY: u64 = 120;
 /// Flips an import window exists before pages in it are armed.
 pub const SETTLE: u64 = 60;
 /// Runs of at most HOT_PAGES pages found written within HOT_FLIPS flips are
@@ -127,8 +139,9 @@ struct Chunk {
     /// ended there (the summary below goes with it).
     cgen: AtomicU32,
     /// The chunk's summary: every page of it needed no check as of (`cgen`
-    /// << 32 | epoch, or SUM_ARMED for every page armed: any epoch) and the
-    /// host's events of its leaf (`hosted::leaf_events`); 0: none.
+    /// << 32 | the requirement it met (`ensure`'s `want`: met for any lower
+    /// one too), or SUM_ARMED for every page armed: any) and the host's
+    /// events of its leaf (`hosted::leaf_events`); 0: none.
     sum: AtomicU64,
     sum_host: AtomicU64,
     /// No page of the chunk is armed before this flip (after a burst of
@@ -140,6 +153,55 @@ struct Chunk {
 /// `Chunk::sum`'s epoch part when every page of the chunk is armed.
 const SUM_ARMED: u32 = u32::MAX;
 
+/// A queue without a view of its own (`view_cell`): its checks need pages
+/// current as of the epoch now (the graphics queue and its workers).
+pub const NO_VIEW: u32 = u32::MAX;
+
+/// Per-queue views (`DS_FE2_VIEWS`, on by default; 0: every check needs the
+/// epoch now): a compute queue's checks need pages current as of its own
+/// last synchronization point (a title submission, a wait the CPU released:
+/// the epoch then; a wait on a label another queue's CP wrote: that queue's
+/// view, the epoch now for queues without one), not as of every queue's.
+/// The epoch ends at any queue's (~260 times a flip at the gate), and queue
+/// 0x50 checked its pools again after each. A take's pages are stamped with
+/// the epoch before it, so a page stamped at or after a queue's view
+/// reflects every CPU write before that queue's synchronization point.
+static VIEWS: Mutex<Vec<(String, std::sync::Arc<AtomicU32>)>> = Mutex::new(Vec::new());
+
+pub fn views_on() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_FE2_VIEWS").ok().as_deref() != Some("0"))
+}
+
+/// The view of the queue named `name` (made at NO_VIEW).
+pub fn view_cell(name: &str) -> std::sync::Arc<AtomicU32> {
+    let mut g = VIEWS.lock();
+    if let Some((_, c)) = g.iter().find(|(n, _)| n == name) {
+        return c.clone();
+    }
+    let c = std::sync::Arc::new(AtomicU32::new(NO_VIEW));
+    g.push((name.to_string(), c.clone()));
+    c
+}
+
+/// The view of the queue named `name` (None: it has none).
+pub fn view_of(name: &str) -> Option<u32> {
+    let g = VIEWS.lock();
+    g.iter().find(|(n, _)| n == name).map(|(_, c)| c.load(Ordering::Acquire)).filter(|&v| v != NO_VIEW)
+}
+
+/// A queue synchronized: its view becomes at least `v`.
+pub fn sync_view(cell: &AtomicU32, v: u32) {
+    let old = cell.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| Some(if c == NO_VIEW { v } else { c.max(v) })).unwrap_or(NO_VIEW);
+    VIEW_SYNCS[0].fetch_add(1, Ordering::Relaxed);
+    if old == NO_VIEW || old < v {
+        VIEW_SYNCS[1].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Views synchronized, and those it raised (`status`).
+static VIEW_SYNCS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// Ranges per thread whose last check found every page fine (`RANGES`).
 const RANGE_CACHE: usize = 32;
 /// Ranges over more chunks or host leaves than these are not kept there.
@@ -147,13 +209,14 @@ const FINE_CHUNKS: usize = 8;
 const FINE_LEAVES: usize = 5;
 
 /// A range a thread found needing no check: the generations of the chunks
-/// it covers (`Chunk::cgen`: every invalidation and ended arming there bumps
-/// them) and the host's events of its leaves (`hosted::leaf_events`) as
-/// they were before that check, and its epoch (SUM_ARMED: every page was
-/// armed, any epoch). While they are unchanged it still needs none. (Until
-/// 2026-10-27 late night one generation over the whole span: queue 0x50's
-/// pools of ~113 MB were scanned again after any invalidation anywhere,
-/// ~3 us a binding.)
+/// it covers (`Chunk::cgen`: every invalidation and every ended arming
+/// there bumps them) and the host's events of its leaves
+/// (`hosted::leaf_events`) as they were before that check, and the
+/// requirement it met (`ensure`'s `want`; SUM_ARMED: every page was armed,
+/// any). While they are unchanged it still needs none. (Until 2026-10-27
+/// late night one generation over the whole span: queue 0x50's pools of
+/// ~113 MB were scanned again after any invalidation anywhere, ~3 us a
+/// binding.)
 #[derive(Clone, Copy)]
 struct Fine {
     lo: u64,
@@ -203,16 +266,16 @@ fn snapshot(lo: u64, hi: u64) -> Option<([u32; FINE_CHUNKS], [u64; FINE_LEAVES])
 /// Whether [lo, hi) lies in a range this thread found fine and nothing
 /// changed there since.
 #[inline]
-fn range_fine(lo: u64, hi: u64, ep: u32, marked: bool) -> bool {
+fn range_fine(lo: u64, hi: u64, want: u32, marked: bool) -> bool {
     RANGES.with(|r| {
         let mut r = r.borrow_mut();
-        let Some(i) = r.iter().position(|f| f.lo <= lo && hi <= f.hi && (f.marked || !marked) && (f.ep == ep || f.ep == SUM_ARMED) && snapshot(f.lo, f.hi).is_some_and(|(g, h)| g == f.gens && h == f.host)) else {
+        let Some(i) = r.iter().position(|f| f.lo <= lo && hi <= f.hi && (f.marked || !marked) && f.ep >= want && snapshot(f.lo, f.hi).is_some_and(|(g, h)| g == f.gens && h == f.host)) else {
             if callers_on() {
                 // Why not (the closest reason among the ranges covering it).
                 let covering: Vec<&Fine> = r.iter().filter(|f| f.lo <= lo && hi <= f.hi && (f.marked || !marked)).collect();
                 let why = if covering.is_empty() {
                     C_NO_RANGE
-                } else if !covering.iter().any(|f| f.ep == ep || f.ep == SUM_ARMED) {
+                } else if !covering.iter().any(|f| f.ep >= want) {
                     C_EPOCH
                 } else if covering.iter().any(|f| snapshot(f.lo, f.hi).is_some_and(|(g, _)| g == f.gens)) {
                     C_HOST
@@ -243,9 +306,47 @@ const CALLER_NAMES: [&str; 4] = ["graphics CP", "its parallel workers", "queue 0
 /// misses on another epoch, misses on chunk generations, misses on host
 /// events, words scanned, takes, TSC cycles in all, placements (the
 /// executor's `fe2_place`), their TSC cycles].
-static BY_CALLER: [[AtomicU64; 11]; 4] = [const { [const { AtomicU64::new(0) }; 11] }; 4];
+static BY_CALLER: [[AtomicU64; 18]; 4] = [const { [const { AtomicU64::new(0) }; 18] }; 4];
 const C_PLACES: usize = 9;
 const C_PLACE_CYCLES: usize = 10;
+/// A placement's parts outside `ensure` (TSC cycles): finding its mapping
+/// and backing the mirror, beginning the batch and the written range's
+/// import, the bookkeeping after `ensure` (its uploads' pages, deferred CP
+/// writes).
+const C_PART_MAP: usize = 11;
+const C_PART_BEGIN: usize = 12;
+const C_PART_AFTER: usize = 13;
+/// The checks' parts (TSC cycles): scanning words, arming (`try_arm`),
+/// takes, making runs current (`fix_run`).
+const C_SCAN: usize = 14;
+const C_ARM: usize = 15;
+const C_TAKE: usize = 16;
+const C_FIX: usize = 17;
+
+/// The TSC when `DS_FE2_CALLERS` is on, else 0.
+#[inline]
+fn tsc() -> u64 {
+    if callers_on() {
+        unsafe { core::arch::x86_64::_rdtsc() }
+    } else {
+        0
+    }
+}
+
+/// Adds the cycles since `t0` (`tsc`) to part `what`.
+#[inline]
+fn caller_since(what: usize, t0: u64) {
+    if t0 != 0 {
+        caller_count(what, unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0));
+    }
+}
+
+/// Cycles of a placement's parts (`DS_FE2_CALLERS`): map, begin, after.
+pub fn note_place_parts(map: u64, begin: u64, after: u64) {
+    caller_count(C_PART_MAP, map);
+    caller_count(C_PART_BEGIN, begin);
+    caller_count(C_PART_AFTER, after);
+}
 
 /// Clears the checks by caller (`profile reset`).
 pub fn reset_callers() {
@@ -395,15 +496,15 @@ fn make_chunk(slot: &'static AtomicPtr<Chunk>) -> &'static Chunk {
 
 const CHUNK_BYTES: u64 = 1 << CHUNK_SHIFT;
 
-/// Whether chunk `c` (at `a`) has a summary current in epoch `ep`.
+/// Whether chunk `c` (at `a`) has a summary that meets `want`.
 #[inline]
-fn summary_ok(c: &Chunk, a: u64, ep: u32) -> bool {
+fn summary_ok(c: &Chunk, a: u64, want: u32) -> bool {
     let s = c.sum.load(Ordering::Acquire);
     if s == 0 || (s >> 32) as u32 != c.cgen.load(Ordering::Acquire) {
         return false;
     }
     let e = s as u32;
-    (e == SUM_ARMED || e == ep) && c.sum_host.load(Ordering::Acquire) == crate::hosted::leaf_events(a)
+    e >= want && c.sum_host.load(Ordering::Acquire) == crate::hosted::leaf_events(a)
 }
 
 /// Page index of `addr` in its chunk.
@@ -503,10 +604,11 @@ pub fn note_unscatterable() {
     STATS[S_UNSCATTERABLE].fetch_add(1, Ordering::Relaxed);
 }
 
-/// Pages of [a, e) (one word) that need no check now in epoch `ep`: valid,
-/// and armed (the host's bit still set) or found clean in `ep`.
+/// Pages of [a, e) (one word) that need no check for requirement `want`:
+/// valid, and armed (the host's bit still set) or found clean at or after
+/// epoch `want`.
 #[inline]
-fn word_ok(c: &Chunk, a: u64, e: u64, ep: u32) -> u64 {
+fn word_ok(c: &Chunk, a: u64, e: u64, want: u32) -> u64 {
     let w = idx(a) / 64;
     let mask = word_mask(a, e);
     let v = c.valid[w].load(Ordering::Acquire) & mask;
@@ -519,7 +621,7 @@ fn word_ok(c: &Chunk, a: u64, e: u64, ep: u32) -> u64 {
     if rest == 0 {
         return armed;
     }
-    if c.wclean[w].load(Ordering::Acquire) == ep {
+    if c.wclean[w].load(Ordering::Acquire) >= want {
         return v;
     }
     let mut ok = armed;
@@ -528,7 +630,7 @@ fn word_ok(c: &Chunk, a: u64, e: u64, ep: u32) -> u64 {
     while r != 0 {
         let b = r.trailing_zeros() as usize;
         r &= r - 1;
-        if c.clean[base + b].load(Ordering::Acquire) == ep {
+        if c.clean[base + b].load(Ordering::Acquire) >= want {
             ok |= 1u64 << b;
         }
     }
@@ -552,20 +654,23 @@ thread_local! {
 /// Err: an upload failed (M lacks some of the range).
 /// With `defer`, runs that need a take are appended there instead (the
 /// caller counts their pages as its batch's own until `resolve` at its
-/// close).
-pub fn ensure(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, defer: Option<&mut Vec<(u64, u64)>>) -> Result<(), &'static str> {
+/// close). `want`: pages must reflect every CPU write before epoch `want`
+/// began (the caller's view, `views_on`); `ep`: the epoch now, read before
+/// any take (what takes stamp their pages with).
+#[allow(clippy::too_many_arguments)]
+pub fn ensure(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, defer: Option<&mut Vec<(u64, u64)>>) -> Result<(), &'static str> {
     if !callers_on() {
-        return ensure_inner(lo, hi, ep, gpu_writes, mine, upload, armable, defer);
+        return ensure_inner(lo, hi, want, ep, gpu_writes, mine, upload, armable, defer);
     }
     let t0 = unsafe { core::arch::x86_64::_rdtsc() };
     caller_count(C_CHECKS, 1);
-    let r = ensure_inner(lo, hi, ep, gpu_writes, mine, upload, armable, defer);
+    let r = ensure_inner(lo, hi, want, ep, gpu_writes, mine, upload, armable, defer);
     caller_count(C_CYCLES, unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0));
     r
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ensure_inner(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, mut defer: Option<&mut Vec<(u64, u64)>>) -> Result<(), &'static str> {
+fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, mut defer: Option<&mut Vec<(u64, u64)>>) -> Result<(), &'static str> {
     STATS[S_ENSURES].fetch_add(1, Ordering::Relaxed);
     STATS[S_ENSURE_PAGES].fetch_add((hi - lo) / PAGE, Ordering::Relaxed);
     let class = &BY_SIZE[size_class((hi - lo) / PAGE)];
@@ -576,7 +681,7 @@ fn ensure_inner(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) 
     // cache like a read one (marking every word on every use, ~430 words
     // for a pool of ~113 MB, made queue 0x50's dispatches slow).
     let gpu_writes = gpu_writes && !arm_gpu();
-    if range_fine(lo, hi, ep, gpu_writes) {
+    if range_fine(lo, hi, want, gpu_writes) {
         STATS[S_RANGE_HITS].fetch_add(1, Ordering::Relaxed);
         STATS[S_FAST].fetch_add(1, Ordering::Relaxed);
         if callers_on() {
@@ -586,6 +691,7 @@ fn ensure_inner(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) 
     }
     // (Before the scan: a change during it shows as a new value.)
     let snap = snapshot(lo, hi);
+    let ts = tsc();
     SCRATCH.with(|s| {
         let mut s = s.borrow_mut();
         let (bad, written) = &mut *s;
@@ -605,7 +711,7 @@ fn ensure_inner(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) 
         while a < hi {
             if a & (CHUNK_BYTES - 1) == 0 && a + CHUNK_BYTES <= hi {
                 let c = chunk(a, true).expect("inside the span");
-                if !gpu_writes && summary_ok(c, a, ep) {
+                if !gpu_writes && summary_ok(c, a, want) {
                     STATS[S_SUMMARY].fetch_add(1, Ordering::Relaxed);
                     if c.sum.load(Ordering::Acquire) as u32 != SUM_ARMED {
                         all_armed = false;
@@ -622,7 +728,7 @@ fn ensure_inner(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) 
             if gpu_writes {
                 c.gpu[w].fetch_or(word_mask(a, e), Ordering::AcqRel);
             }
-            let need = word_mask(a, e) & !word_ok(c, a, e, ep);
+            let need = word_mask(a, e) & !word_ok(c, a, e, want);
             if all_armed && need == 0 {
                 let armed = c.armed[w].load(Ordering::Acquire) & crate::hosted::armed_word(a & !(64 * PAGE - 1));
                 all_armed = armed & word_mask(a, e) == word_mask(a, e);
@@ -670,7 +776,7 @@ fn ensure_inner(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) 
                     if ok {
                         let c = chunk(start, false).expect("scanned");
                         c.sum_host.store(h, Ordering::Release);
-                        c.sum.store((g as u64) << 32 | if armed { SUM_ARMED } else { ep } as u64, Ordering::Release);
+                        c.sum.store((g as u64) << 32 | if armed { SUM_ARMED } else { want } as u64, Ordering::Release);
                     }
                     whole = None;
                 }
@@ -678,13 +784,14 @@ fn ensure_inner(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) 
         }
         if callers_on() {
             caller_count(C_WORDS, words);
+            caller_since(C_SCAN, ts);
         }
         if bad.is_empty() {
             STATS[S_FAST].fetch_add(1, Ordering::Relaxed);
             // (Not for ranges with pages the caller's batch uploaded: they are
             // fine for its batch only, until it is queued.)
             if let (true, Some((gens, host))) = (mine_none, snap) {
-                note_range_fine(lo, hi, gens, host, if all_armed { SUM_ARMED } else { ep }, gpu_writes);
+                note_range_fine(lo, hi, gens, host, if all_armed { SUM_ARMED } else { want }, gpu_writes);
             }
             return Ok(());
         }
@@ -737,20 +844,27 @@ fn ensure_inner(lo: u64, hi: u64, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) 
 #[allow(clippy::too_many_arguments)]
 fn check_run(a: u64, b: u64, ep: u32, frame: u64, arm: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, written: &mut Vec<u64>, class: &[AtomicU64; 4]) -> Result<(), &'static str> {
     take_run(a, b, frame, arm, armable, written, class);
-    fix_run(a, b, ep, mine, upload)
+    let t = tsc();
+    let r = fix_run(a, b, ep, mine, upload);
+    caller_since(C_FIX, t);
+    r
 }
 
 /// Arms (`arm`: hosted, where allowed) and takes [a, b): pages written since
 /// their last take lose their valid bit.
 fn take_run(a: u64, b: u64, frame: u64, arm: bool, armable: &Armable, written: &mut Vec<u64>, class: &[AtomicU64; 4]) {
     if arm && crate::hosted::on() {
+        let t = tsc();
         try_arm(a, b, frame, armable);
+        caller_since(C_ARM, t);
     }
     // The take: pages written since their last take lose their valid bit
     // (`marks_taken`, for any take's pages).
     written.clear();
     let tt = std::time::Instant::now();
+    let t = tsc();
     let r = super::precache::take_written_for(a, b - a, written, None, crate::mem::WW_WHO_FE2);
+    caller_since(C_TAKE, t);
     let tns = tt.elapsed().as_nanos() as u64;
     STATS[S_TAKE_NS].fetch_add(tns, Ordering::Relaxed);
     STATS[S_TAKES].fetch_add(1, Ordering::Relaxed);
@@ -935,8 +1049,10 @@ fn set_clean(a: u64, b: u64, ep: u32, validate: bool) {
     }
 }
 
-/// Pages of [a, b) we armed whose host bit is gone (a write fault, a disarm
-/// or a mapping change): no longer ours; the next arming waits longer.
+/// Pages of [a, b) we armed whose host bit is gone (a write fault, its
+/// word's, a disarm or a mapping change): no longer ours; the next arming
+/// waits longer, its quiet time from now (the fault watcher may not have
+/// seen the fault yet).
 fn note_arming_ended(a: u64, b: u64) {
     let mut x = a;
     while x < b {
@@ -950,12 +1066,14 @@ fn note_arming_ended(a: u64, b: u64) {
                 c.armed[w].fetch_and(!gone, Ordering::AcqRel);
                 c.cgen.fetch_add(1, Ordering::AcqRel);
                 let base = w * 64;
+                let f = super::FRAMES.load(Ordering::Relaxed) as u32 + 1;
                 let mut r = gone;
                 while r != 0 {
                     let k = r.trailing_zeros() as usize;
                     r &= r - 1;
                     let l = &c.level[base + k];
                     let _ = l.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some((v + 1).min(ARM_MAX_LEVEL)));
+                    c.wrote[base + k].store(f, Ordering::Release);
                 }
                 STATS[S_ARM_ENDED].fetch_add(gone.count_ones() as u64, Ordering::Relaxed);
             }
@@ -1009,45 +1127,89 @@ fn host_writing(a: u64, b: u64) -> bool {
 /// import windows (`armable`), plain read-write memory only.
 fn try_arm(a: u64, b: u64, frame: u64, armable: &Armable) {
     let arm_gpu = arm_gpu();
-    // Why a page is not a candidate (None: it is one).
-    let why_not = |p: u64| -> Option<usize> {
-        let Some(c) = chunk(p, false) else { return Some(R_QUIET) };
-        let (i, w) = (idx(p), idx(p) / 64);
-        let bit = 1u64 << (i % 64);
-        if c.armed[w].load(Ordering::Acquire) & bit != 0 {
-            return Some(R_ARMED);
-        }
-        if frame < c.hold_until.load(Ordering::Acquire) {
-            return Some(R_HELD);
-        }
-        if !arm_gpu && c.gpu[w].load(Ordering::Acquire) & bit != 0 {
-            return Some(R_GPU);
-        }
-        let wrote = c.wrote[i].load(Ordering::Acquire) as u64;
-        let need = ARM_QUIET << c.level[i].load(Ordering::Acquire);
-        if wrote == 0 || frame.saturating_sub(wrote - 1) < need {
-            return Some(R_QUIET);
-        }
-        if c.uses[w].load(Ordering::Relaxed) < ARM_USES {
-            return Some(R_USES);
-        }
-        None
-    };
+    // A word at a time, the pages not armed counted here and added once
+    // (until 2026-10-28 page by page, each such page a shared atomic add:
+    // ~170,000 pages of held chunks a flip at the gate). A page's reason is
+    // the first of: armed already, its chunk held, GPU-written, its word
+    // found clean in too few epochs, its quiet time.
+    let mut not = [0u64; 8];
+    // The run of candidates being gathered (armed when a page that is not
+    // one ends it).
+    let mut run: Option<(u64, u64)> = None;
     let mut x = a;
     while x < b {
-        // The next run of candidates from x.
-        if let Some(r) = why_not(x) {
-            NOT_ARMED[r].fetch_add(1, Ordering::Relaxed);
-            x += PAGE;
+        let e = word_end(x, b);
+        let Some(c) = chunk(x, false) else {
+            not[R_QUIET] += (e - x) / PAGE;
+            if let Some((p, q)) = run.take() {
+                arm_run(p, q, frame, armable);
+            }
+            x = e;
             continue;
+        };
+        let w = idx(x) / 64;
+        let mask = word_mask(x, e);
+        let armed = c.armed[w].load(Ordering::Acquire) & mask;
+        not[R_ARMED] += armed.count_ones() as u64;
+        let mut cand = mask & !armed;
+        if cand != 0 && frame < c.hold_until.load(Ordering::Acquire) {
+            not[R_HELD] += cand.count_ones() as u64;
+            cand = 0;
         }
-        let cand = |p: u64| why_not(p).is_none();
-        let mut y = x + PAGE;
-        while y < b && cand(y) {
-            y += PAGE;
+        if cand != 0 && !arm_gpu {
+            let g = c.gpu[w].load(Ordering::Acquire) & cand;
+            not[R_GPU] += g.count_ones() as u64;
+            cand &= !g;
         }
-        arm_run(x, y, frame, armable);
-        x = y;
+        if cand != 0 && c.uses[w].load(Ordering::Relaxed) < ARM_USES {
+            not[R_USES] += cand.count_ones() as u64;
+            cand = 0;
+        }
+        let base = w * 64;
+        let mut r = cand;
+        while r != 0 {
+            let k = r.trailing_zeros() as usize;
+            r &= r - 1;
+            let wrote = c.wrote[base + k].load(Ordering::Acquire) as u64;
+            let need = ARM_QUIET << c.level[base + k].load(Ordering::Acquire);
+            if wrote == 0 || frame.saturating_sub(wrote - 1) < need {
+                not[R_QUIET] += 1;
+                cand &= !(1u64 << k);
+            }
+        }
+        // The word's runs of candidates (a run goes on across words).
+        let wa = x & !(64 * PAGE - 1);
+        let (mut pos, end) = ((idx(x) % 64) as u32, (idx(x) % 64) as u32 + ((e - x) / PAGE) as u32);
+        while pos < end {
+            let rest = cand >> pos;
+            if rest & 1 != 0 {
+                let ones = (!rest).trailing_zeros().min(end - pos);
+                let (p, q) = (wa + pos as u64 * PAGE, wa + (pos + ones) as u64 * PAGE);
+                match run.as_mut() {
+                    Some(l) if l.1 == p => l.1 = q,
+                    _ => {
+                        if let Some((s, t)) = run.replace((p, q)) {
+                            arm_run(s, t, frame, armable);
+                        }
+                    }
+                }
+                pos += ones;
+            } else {
+                if let Some((s, t)) = run.take() {
+                    arm_run(s, t, frame, armable);
+                }
+                pos += if rest == 0 { end - pos } else { rest.trailing_zeros().min(end - pos) };
+            }
+        }
+        x = e;
+    }
+    if let Some((p, q)) = run.take() {
+        arm_run(p, q, frame, armable);
+    }
+    for (k, &n) in not.iter().enumerate() {
+        if n != 0 {
+            NOT_ARMED[k].fetch_add(n, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1070,13 +1232,16 @@ const R_BUSY: usize = 7;
 /// The faults `watch` read: [on pages of the span, those that ended an
 /// arming of ours (its level raised there), bursts, pages they disarmed,
 /// faults outside the span, ring overflows seen].
-static FAULTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static FAULTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 const F_SPAN: usize = 0;
 const F_ENDED: usize = 1;
 const F_BURSTS: usize = 2;
 const F_DISARMED: usize = 3;
 const F_OUTSIDE: usize = 4;
 const F_LOST: usize = 5;
+/// Pages of ours the host made read-write with a faulted page's word
+/// (`word_ended`).
+const F_WORD_DISARMED: usize = 6;
 
 /// Reads the faults the host answered, every millisecond (a thread of its
 /// own, hosted runs only): each ends its page's arming (the next waits
@@ -1090,10 +1255,21 @@ fn watch() {
     // chunks with any, and all of them.
     let mut counts = vec![0u32; CHUNKS];
     let mut fired = vec![false; CHUNKS];
+    // (The code of each chunk's first fault in the window: the burst log.)
+    let mut first_rip = vec![0u64; CHUNKS];
     let mut touched: Vec<usize> = Vec::new();
     let mut total = 0u32;
     let mut window = std::time::Instant::now();
     let mut logged = 0u32;
+    // `DS_FE2_FAULT_LOG=1` (diagnosis): every fault as "flip page code"
+    // into the run's fe2-faults.txt.
+    let mut flog = (std::env::var("DS_FE2_FAULT_LOG").ok().as_deref() == Some("1"))
+        .then(|| crate::run_dir().and_then(|d| std::fs::File::create(d.join("fe2-faults.txt")).ok()))
+        .flatten()
+        .map(std::io::BufWriter::new);
+    let mut names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    // (This read's words with an arming a fault ended, and the level.)
+    let mut hit: Vec<(u64, u8)> = Vec::new();
     loop {
         std::thread::sleep(std::time::Duration::from_millis(1));
         if window.elapsed().as_millis() >= BURST_MS {
@@ -1115,6 +1291,15 @@ fn watch() {
             FAULTS[F_LOST].fetch_add(1, Ordering::Relaxed);
         }
         let frame = super::FRAMES.load(Ordering::Relaxed);
+        hit.clear();
+        if let Some(f) = flog.as_mut() {
+            use std::io::Write;
+            for &(page, _, rip) in &got {
+                let name = names.entry(rip).or_insert_with(|| describe_code(rip));
+                let _ = writeln!(f, "{frame} {page:#x} {name}");
+            }
+            let _ = f.flush();
+        }
         for &(page, _, rip) in &got {
             let Some(c) = chunk(page, false) else {
                 FAULTS[F_OUTSIDE].fetch_add(1, Ordering::Relaxed);
@@ -1125,16 +1310,23 @@ fn watch() {
             let bit = 1u64 << (i % 64);
             // (A take's `note_arming_ended` may have seen it first.)
             if c.armed[w].fetch_and(!bit, Ordering::AcqRel) & bit != 0 {
-                let _ = c.level[i].fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some((v + 1).min(ARM_MAX_LEVEL)));
+                let v = c.level[i].fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some((v + 1).min(ARM_MAX_LEVEL))).unwrap_or(0);
                 c.cgen.fetch_add(1, Ordering::AcqRel);
                 FAULTS[F_ENDED].fetch_add(1, Ordering::Relaxed);
                 STATS[S_ARM_ENDED].fetch_add(1, Ordering::Relaxed);
+                let wa = page & !(64 * PAGE - 1);
+                let lv = (v + 1).min(ARM_MAX_LEVEL);
+                match hit.iter_mut().find(|h| h.0 == wa) {
+                    Some(h) => h.1 = h.1.max(lv),
+                    None => hit.push((wa, lv)),
+                }
             }
             c.wrote[i].store(frame as u32 + 1, Ordering::Release);
             c.uses[w].store(0, Ordering::Relaxed);
             let k = ((page - MIRROR_BASE) >> CHUNK_SHIFT) as usize;
             if counts[k] == 0 {
                 touched.push(k);
+                first_rip[k] = rip;
             }
             counts[k] += 1;
             total += 1;
@@ -1143,13 +1335,44 @@ fn watch() {
                 crate::info!("fe2: write fault on armed page {page:#x} at {}", describe_code(rip));
             }
         }
+        for &(wa, lv) in &hit {
+            let n = word_ended(wa, lv, frame);
+            FAULTS[F_WORD_DISARMED].fetch_add(n, Ordering::Relaxed);
+        }
         for &k in &touched {
             if !fired[k] && (counts[k] >= CHUNK_BURST || total >= ALL_BURST) {
                 fired[k] = true;
-                burst(k, counts[k], total, frame);
+                burst(k, counts[k], total, frame, first_rip[k]);
             }
         }
     }
+}
+
+/// A fault ended an arming in the 64-page word at `wa`, and the host's
+/// answer made the word's other armed pages read-write too
+/// (`hosted::set_word_mode`): those of ours are no longer armed, their
+/// quiet time restarts and their level becomes at least `level` (the
+/// faulted page's). Titles write runs of pages (at the gate a word's pages
+/// faulted one after another within the millisecond, each page written once
+/// in ~200 flips), and the backoff learnt page by page. The pages.
+fn word_ended(wa: u64, level: u8, frame: u64) -> u64 {
+    let Some(c) = chunk(wa, false) else { return 0 };
+    let w = idx(wa) / 64;
+    let gone = c.armed[w].load(Ordering::Acquire) & !crate::hosted::armed_word(wa);
+    if gone == 0 {
+        return 0;
+    }
+    c.armed[w].fetch_and(!gone, Ordering::AcqRel);
+    let base = w * 64;
+    let mut r = gone;
+    while r != 0 {
+        let k = r.trailing_zeros() as usize;
+        r &= r - 1;
+        c.wrote[base + k].store(frame as u32 + 1, Ordering::Release);
+        c.level[base + k].fetch_max(level, Ordering::AcqRel);
+    }
+    c.cgen.fetch_add(1, Ordering::AcqRel);
+    gone.count_ones() as u64
 }
 
 /// Where code at `rip` is (the title's or a host module's).
@@ -1164,7 +1387,7 @@ fn describe_code(rip: u64) -> String {
 /// Chunk `k` had `n` faults within BURST_MS (`total` in all chunks): its
 /// armed pages are disarmed and arming there waits CHUNK_HOLD flips (twice
 /// as long for each burst within HOLD_MEMORY flips of the last hold's end).
-fn burst(k: usize, n: u32, total: u32, frame: u64) {
+fn burst(k: usize, n: u32, total: u32, frame: u64, rip: u64) {
     let base = MIRROR_BASE + ((k as u64) << CHUNK_SHIFT);
     let Some(c) = chunk(base, false) else { return };
     let until = c.hold_until.load(Ordering::Acquire);
@@ -1216,8 +1439,9 @@ fn burst(k: usize, n: u32, total: u32, frame: u64) {
     }
     let b = FAULTS[F_BURSTS].fetch_add(1, Ordering::Relaxed);
     FAULTS[F_DISARMED].fetch_add(pages, Ordering::Relaxed);
-    if b < 40 {
-        crate::info!("fe2: {n} faults within {BURST_MS} ms in {base:#x}+64M ({total} in all): {pages} armed pages there disarmed, arming there held {hold} flips");
+    // (The first 40, then every 16th.)
+    if b < 40 || b % 16 == 0 {
+        crate::info!("fe2: burst {b}: {n} faults within {BURST_MS} ms in {base:#x}+64M ({total} in all; the first at {}): {pages} armed pages there disarmed, arming there held {hold} flips", describe_code(rip));
     }
 }
 
@@ -1537,6 +1761,7 @@ pub fn init() {
         Ok(s) => {
             ON.store(true, Ordering::Release);
             if crate::hosted::on() {
+                crate::hosted::set_word_mode();
                 let _ = std::thread::Builder::new().name("fe2-faults".into()).spawn(watch);
             }
             crate::info!(
@@ -1640,6 +1865,7 @@ pub fn status() -> String {
     }
     let s: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let k = counters();
+    let spans = super::exec::fe2_span_census();
     let ms = |ns: u64| ns as f64 / 1e6;
     let sizes: Vec<String> = ["<64K", "<1M", "<16M", ">=16M"]
         .iter()
@@ -1650,7 +1876,7 @@ pub fn status() -> String {
         })
         .collect();
     format!(
-        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes; faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed); invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity; CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
+        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes; faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity; CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); compute queues' views synchronized {} times ({} raised)\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
         s[S_ENSURES],
         s[S_ENSURE_PAGES],
         s[S_FAST],
@@ -1682,6 +1908,7 @@ pub fn status() -> String {
         FAULTS[F_LOST].load(Ordering::Relaxed),
         FAULTS[F_BURSTS].load(Ordering::Relaxed),
         FAULTS[F_DISARMED].load(Ordering::Relaxed),
+        FAULTS[F_WORD_DISARMED].load(Ordering::Relaxed),
         s[S_INVAL_CALLS],
         s[S_INVAL_TAKEN],
         s[S_SCATTERS],
@@ -1692,6 +1919,11 @@ pub fn status() -> String {
         s[S_CP_MIRROR],
         s[S_MEMCPY],
         s[S_UNSCATTERABLE],
+        spans.0,
+        spans.1,
+        spans.2,
+        VIEW_SYNCS[0].load(Ordering::Relaxed),
+        VIEW_SYNCS[1].load(Ordering::Relaxed),
         sizes.join(", "),
         ["armed already", "GPU-written", "written lately", "too few clean epochs", "no settled window", "not plain read-write", "chunk held", "import list busy"]
             .iter()
@@ -1714,9 +1946,12 @@ pub fn callers_line() -> String {
         .map(|(n, c)| {
             let v: Vec<u64> = c.iter().map(|x| x.load(Ordering::Relaxed)).collect();
             format!(
-                "{n}: {} placements ({:.1} ms), {} checks ({} by the range cache; missed: no range {}, another epoch {}, chunk generations {}, host events {}), {} words scanned, {} takes, {:.1} ms",
+                "{n}: {} placements ({:.1} ms; outside the checks: mapping and backing {:.1}, batch and import {:.1}, after {:.1}), {} checks ({} by the range cache; missed: no range {}, another epoch {}, chunk generations {}, host events {}), {} words scanned, {} takes, {:.1} ms (scans {:.1}, arming {:.1}, takes {:.1}, runs made current {:.1})",
                 v[C_PLACES],
                 v[C_PLACE_CYCLES] as f64 * 1e3 / hz,
+                v[C_PART_MAP] as f64 * 1e3 / hz,
+                v[C_PART_BEGIN] as f64 * 1e3 / hz,
+                v[C_PART_AFTER] as f64 * 1e3 / hz,
                 v[C_CHECKS],
                 v[C_HITS],
                 v[C_NO_RANGE],
@@ -1725,7 +1960,11 @@ pub fn callers_line() -> String {
                 v[C_HOST],
                 v[C_WORDS],
                 v[C_TAKES],
-                v[C_CYCLES] as f64 * 1e3 / hz
+                v[C_CYCLES] as f64 * 1e3 / hz,
+                v[C_SCAN] as f64 * 1e3 / hz,
+                v[C_ARM] as f64 * 1e3 / hz,
+                v[C_TAKE] as f64 * 1e3 / hz,
+                v[C_FIX] as f64 * 1e3 / hz
             )
         })
         .collect();

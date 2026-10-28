@@ -306,6 +306,9 @@ fn trace_take(kind: char, epoch: u64, base: u64, size: u64, found: Option<usize>
 /// writes, big copies declined (changed lately), checks that waited for
 /// another thread's take].
 static STATS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+/// Bumped (under the lock) whenever a take made without it ends
+/// (`wait_takes` waits for one).
+static TAKES_ENDED: AtomicU64 = AtomicU64::new(0);
 /// STATS at the last `profile reset` (`window_line`).
 static SNAP: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
 
@@ -695,6 +698,7 @@ fn take_unlocked(base: u64, size: u64, out: &mut Vec<u64>, except: Option<u32>, 
     let mut g = lock();
     let c = g.get_or_insert_with(Cache::default);
     c.takes.retain(|t| t.2 != token);
+    TAKES_ENDED.fetch_add(1, Ordering::AcqRel);
     c.apply_marks(base, size, r, &out[first..], except, who != 2);
     let upto = c.take_seq;
     (g, r, upto)
@@ -706,13 +710,22 @@ fn take_unlocked(base: u64, size: u64, out: &mut Vec<u64>, except: Option<u32>, 
 fn wait_takes(mut g: Guard, base: u64, size: u64, upto: u64) -> Guard {
     let mut n = 0u32;
     while g.as_ref().is_some_and(|c| c.takes_over(base, size, upto)) {
+        // The lock again only once a take ended (until 2026-10-28 every spin
+        // took it: front end 2's threads taking one pool at once made ~1.2
+        // million lock waits a run). (Read before the lock goes: a take
+        // ends under it.)
+        let seen = TAKES_ENDED.load(Ordering::Acquire);
         drop(g);
-        n += 1;
-        if n < 64 {
-            std::hint::spin_loop();
-        } else {
-            std::thread::yield_now();
+        let mut k = 0u32;
+        while TAKES_ENDED.load(Ordering::Acquire) == seen {
+            k += 1;
+            if k < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
         }
+        n += 1;
         g = lock();
     }
     if n > 0 {

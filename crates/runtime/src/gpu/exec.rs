@@ -369,6 +369,15 @@ struct Span {
     valid: bool,
     /// The flip it was imported at.
     born: u64,
+    /// Front end 2: the sequence of the first queued batch that uploaded
+    /// from it, and the flip that batch was first seen completed (u64::MAX:
+    /// none yet). Its pages are armed only SETTLE flips after that: the
+    /// driver pins an import's pages after `vkAllocateMemory` returns
+    /// (protecting a new import's pages lost the device, FINDINGS.md
+    /// 2026-10-26), and an import first used long after its creation (a
+    /// batch dropped past a label wait) was settled by age alone.
+    first_use: AtomicU64,
+    used_at: AtomicU64,
 }
 
 /// Imports whose guest pages were remapped (`revalidate_spans`), freed once
@@ -1032,8 +1041,21 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
 fn fe2_armable(a: u64, b: u64, arm: &mut dyn FnMut(u64, u64)) -> bool {
     let now = super::FRAMES.load(Ordering::Relaxed);
     let settled = |born: u64| born + super::fe2::SETTLE <= now;
+    let done = done_seq();
+    // A live import counts from the completion of the first batch that
+    // uploaded from it (`Span::first_use`), first seen here.
+    let used = |s: &Span| {
+        let u = s.used_at.load(Ordering::Acquire);
+        if u != u64::MAX {
+            return u + super::fe2::SETTLE <= now;
+        }
+        if s.first_use.load(Ordering::Acquire) <= done {
+            s.used_at.store(now, Ordering::Release);
+        }
+        false
+    };
     let Some(g) = SPANS.try_read() else { return false };
-    let mut young: Vec<(u64, u64)> = g.iter().filter(|s| s.start < b && a < s.end && !settled(s.born)).map(|s| (s.start, s.end)).collect();
+    let mut young: Vec<(u64, u64)> = g.iter().filter(|s| s.start < b && a < s.end && !(settled(s.born) && used(s))).map(|s| (s.start, s.end)).collect();
     {
         let Some(gy) = GRAVEYARD.try_lock() else { return false };
         young.extend(gy.iter().filter(|d| d.span.start < b && a < d.span.end && !settled(d.span.born)).map(|d| (d.span.start, d.span.end)));
@@ -1065,6 +1087,27 @@ fn fe2_armable(a: u64, b: u64, arm: &mut dyn FnMut(u64, u64)) -> bool {
         }
     }
     true
+}
+
+/// Front end 2: batch `seq` (queued) uploads from these imports.
+fn note_span_uses(used: &[(u64, vk::Buffer)], seq: u64) {
+    let g = SPANS.read();
+    for &(start, buf) in used {
+        if let Some(s) = g.iter().find(|s| s.start == start && s.buffer == buf) {
+            s.first_use.fetch_min(seq, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Front end 2: live imports, those an upload has used, and those settled
+/// for arming (used SETTLE flips ago).
+pub(super) fn fe2_span_census() -> (usize, usize, usize) {
+    let now = super::FRAMES.load(Ordering::Relaxed);
+    let Some(g) = SPANS.try_read() else { return (0, 0, 0) };
+    let live: Vec<&Span> = g.iter().filter(|s| s.valid).collect();
+    let used = live.iter().filter(|s| s.first_use.load(Ordering::Relaxed) != u64::MAX).count();
+    let settled = live.iter().filter(|s| s.used_at.load(Ordering::Relaxed).checked_add(super::fe2::SETTLE).is_some_and(|t| t <= now)).count();
+    (live.len(), used, settled)
 }
 
 /// Mirror mode: whether the pages to be copied into the mirror (ascending
@@ -1174,7 +1217,7 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
             IMPORT_WIN[1].fetch_add(end - start, Ordering::Relaxed);
             IMPORT_WIN[2].fetch_add(ns, Ordering::Relaxed);
             IMPORT_WIN[3].fetch_max(ns, Ordering::Relaxed);
-            g.push(Span { start, end, buffer, mem, valid: true, born: super::FRAMES.load(Ordering::Relaxed) });
+            g.push(Span { start, end, buffer, mem, valid: true, born: super::FRAMES.load(Ordering::Relaxed), first_use: AtomicU64::new(u64::MAX), used_at: AtomicU64::new(u64::MAX) });
             super::pagetable::map(start, end - start, va);
             SPAN_GEN.fetch_add(1, Ordering::AcqRel);
             IMPORTS.fetch_add(1, Ordering::Relaxed);
@@ -3639,6 +3682,10 @@ impl RangeLog {
         for p in first..=last {
             self.pages[page_bucket(p)].fetch_max(seq, Ordering::SeqCst);
         }
+        // Its 4 MiB blocks too (at most two): what large reads look at.
+        for p in (a >> COARSE_SHIFT)..=((a + n - 1) >> COARSE_SHIFT) {
+            self.coarse[coarse_bucket(p)].fetch_max(seq, Ordering::SeqCst);
+        }
     }
 
     /// Whether some unfinished batch may write into one of `reads` (false:
@@ -3649,11 +3696,17 @@ impl RangeLog {
                 return false;
             }
             let (first, last) = (a >> PAGE_SHIFT, (a + n - 1) >> PAGE_SHIFT);
+            let coarse = || {
+                let (c0, c1) = (a >> COARSE_SHIFT, (a + n - 1) >> COARSE_SHIFT);
+                c1 - c0 >= COARSE_BUCKETS as u64 || (c0..=c1).any(|p| self.coarse[coarse_bucket(p)].load(Ordering::SeqCst) > done)
+            };
+            // Large reads go by the coarse buckets alone (every write marks
+            // its own: until 2026-10-28 reads of 4 MiB or more always took
+            // the log's lock, front end 2's ~113 MB pools at every binding).
             if last - first >= 64 {
-                return true;
+                return coarse();
             }
-            (first..=last).any(|p| self.pages[page_bucket(p)].load(Ordering::SeqCst) > done)
-                || ((a >> COARSE_SHIFT)..=((a + n - 1) >> COARSE_SHIFT)).any(|p| self.coarse[coarse_bucket(p)].load(Ordering::SeqCst) > done)
+            (first..=last).any(|p| self.pages[page_bucket(p)].load(Ordering::SeqCst) > done) || coarse()
         })
     }
 
@@ -6436,6 +6489,8 @@ pub struct Exec {
     /// work recorded since the last write-back marks dwords, and the word
     /// generations taken when the batch is queued (scratch).
     fe2_up: Vec<(u64, u64)>,
+    /// The imports (start, buffer) its uploads read (`Span::first_use`).
+    fe2_spans: Vec<(u64, vk::Buffer)>,
     fe2_mine: super::fx::Set<u64>,
     fe2_marked: bool,
     fe2_gens: Vec<u32>,
@@ -6443,6 +6498,8 @@ pub struct Exec {
     /// (`fe2::resolve`), and their pages (the batch's own meanwhile).
     fe2_pend: Vec<(u64, u64)>,
     fe2_pend_set: super::fx::Set<u64>,
+    /// This queue's view (`fe2::view_cell`): what its checks need.
+    fe2_view: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Resident GPU-written data (`gpu::rgm`, `exec/rgm.rs`): the open
     /// batch's claims and their granules, its W writes (all, and those not
     /// merged into guest memory yet), the merge table, a page list reused.
@@ -7053,8 +7110,10 @@ struct Closed {
     /// promised when it is submitted.
     promises: Vec<(u64, u64, u8)>,
     /// Front end 2: its uploads into the mirror (`Exec::fe2_up`), valid for
-    /// other batches once it is queued.
+    /// other batches once it is queued, and the imports they read
+    /// (`Exec::fe2_spans`).
     fe2_up: Vec<(u64, u64)>,
+    fe2_spans: Vec<(u64, vk::Buffer)>,
 }
 
 /// Slot sequence of a batch closed but not yet submitted.
@@ -7129,11 +7188,13 @@ impl Exec {
                 res_need: Vec::new(),
                 stage_used: 0,
                 fe2_up: Vec::new(),
+                fe2_spans: Vec::new(),
                 fe2_mine: Default::default(),
                 fe2_marked: false,
                 fe2_gens: Vec::new(),
                 fe2_pend: Vec::new(),
                 fe2_pend_set: Default::default(),
+                fe2_view: super::fe2::view_cell(name),
                 rgm_claims: Vec::new(),
                 rgm_mine: Default::default(),
                 rgm_written: Default::default(),
@@ -7779,10 +7840,11 @@ impl Exec {
             };
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
             self.keep_submitted(0);
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), rgm_claims: std::mem::take(&mut self.rgm_claims), rgm_written: std::mem::take(&mut self.rgm_written), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new() });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), rgm_claims: std::mem::take(&mut self.rgm_claims), rgm_written: std::mem::take(&mut self.rgm_written), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new() });
             self.res_mine.clear();
             if let Some(b) = self.closed.last_mut() {
                 b.fe2_up = std::mem::take(&mut self.fe2_up);
+                b.fe2_spans = std::mem::take(&mut self.fe2_spans);
             }
             self.fe2_mine.clear();
             self.rgm_batch_done(true);
@@ -7844,6 +7906,9 @@ impl Exec {
         if !self.fe2_up.is_empty() {
             super::fe2::uploaded(&self.fe2_up, &self.fe2_gens, fe2_ep);
             self.fe2_up.clear();
+        }
+        if !self.fe2_spans.is_empty() {
+            note_span_uses(&std::mem::take(&mut self.fe2_spans), seq);
         }
         self.fe2_mine.clear();
         super::precache::submitted(&std::mem::take(&mut self.shared_pending), seq);
@@ -7959,6 +8024,7 @@ impl Exec {
         self.resident.clear();
         super::resident::dropped(&std::mem::take(&mut self.res_pages));
         self.fe2_up.clear();
+        self.fe2_spans.clear();
         self.fe2_mine.clear();
         self.fe2_marked = false;
         self.fe2_pend.clear();
@@ -8422,6 +8488,9 @@ impl Exec {
 
     fn fe2_place_inner(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
         use super::resident::{MIRROR_BASE, PAGE};
+        // (Parts timed for `DS_FE2_CALLERS`.)
+        let tsc = || if super::fe2::callers_on() { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
+        let t0 = tsc();
         let (mbuf, _) = super::resident::mirror_buffer()?;
         let end = base.checked_add(size)?;
         if size == 0 || !super::fe2::in_span(base, size) {
@@ -8438,6 +8507,7 @@ impl Exec {
             self.report_error("front end 2: no video memory for the mirror (bound as zeros)", || format!("{lo:#x}..{hi:#x}: {e}"));
             return None;
         }
+        let t1 = tsc();
         // Its uploads go into the prologue of the batch that will hold the
         // command: one is begun first (a binding before this one may have
         // closed the batch, and a deferred executor's next batch may take
@@ -8455,13 +8525,20 @@ impl Exec {
             }
             self.fe2_marked = true;
         }
+        let t2 = tsc();
+        // (Read before any take: what its pages are stamped with.)
         let ep = super::precache::epoch() as u32;
+        let want = match self.fe2_view.load(Ordering::Acquire) {
+            super::fe2::NO_VIEW => ep,
+            v => v.min(ep),
+        };
         let mine = std::mem::take(&mut self.fe2_mine);
         let pend = std::mem::take(&mut self.fe2_pend_set);
         let mut up = std::mem::take(&mut self.fe2_up);
         let mut deferred = std::mem::take(&mut self.fe2_pend);
         let (first, first_pend) = (up.len(), deferred.len());
-        let r = super::fe2::ensure(lo, hi, ep, written, &|p| mine.contains(&p) || pend.contains(&p), &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable, super::fe2::defer_checks().then_some(&mut deferred));
+        let r = super::fe2::ensure(lo, hi, want, ep, written, &|p| mine.contains(&p) || pend.contains(&p), &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable, super::fe2::defer_checks().then_some(&mut deferred));
+        let t3 = tsc();
         let (mut mine, mut pend) = (mine, pend);
         for &(a, b) in &up[first..] {
             let mut p = a;
@@ -8489,6 +8566,9 @@ impl Exec {
         if let Some(s) = CP_WRITES.latest(&[(base, size)]) {
             self.submit_after = self.submit_after.max(s);
         }
+        if t0 != 0 {
+            super::fe2::note_place_parts(t1.wrapping_sub(t0), t2.wrapping_sub(t1), tsc().wrapping_sub(t3));
+        }
         Some((mbuf, base - MIRROR_BASE, hi - base))
     }
 
@@ -8510,6 +8590,9 @@ impl Exec {
             match span(x, e - x) {
                 Some((buf, start, wend)) => {
                     let e = e.min(wend);
+                    if !self.fe2_spans.iter().any(|&(s, b)| s == start && b == buf) {
+                        self.fe2_spans.push((start, buf));
+                    }
                     self.pre_copies.push((buf, mbuf, vk::BufferCopy { src_offset: x - start, dst_offset: x - MIRROR_BASE, size: e - x }));
                     match up.last_mut() {
                         Some(l) if l.1 == x => l.1 = e,
@@ -11730,6 +11813,9 @@ impl Exec {
             self.slots[b.slot].seq = seq;
             if !b.fe2_up.is_empty() {
                 super::fe2::uploaded(&b.fe2_up, &self.fe2_gens, fe2_ep);
+            }
+            if !b.fe2_spans.is_empty() {
+                note_span_uses(&b.fe2_spans, seq);
             }
             if let Some(o) = &own {
                 super::resident::own_submitted(o, seq);

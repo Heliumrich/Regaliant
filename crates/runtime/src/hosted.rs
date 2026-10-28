@@ -65,7 +65,8 @@ struct Shared {
     /// Ring entries dsport took.
     tail: AtomicU64,
     leaves_used: AtomicU32,
-    _pad: u32,
+    /// WORD_MODE: a fault makes its 64-page word's armed pages read-write.
+    flags: AtomicU32,
     /// Leaf index + 1 per 128 MiB of guest space (0: none).
     l1: [AtomicU32; L1],
     /// Per 128 MiB of guest space: armed bits cleared there so far (faults
@@ -74,6 +75,12 @@ struct Shared {
     leaf_events: [AtomicU64; L1],
     /// The same over the whole guest range.
     all_events: AtomicU64,
+    /// The pages of the arm in progress, [lo, hi) (hi 0: none): their bits
+    /// may be set before their protection (the host's word answers leave
+    /// them alone).
+    arming: [AtomicU64; 2],
+    /// Pages the host made read-write with a faulted page's word.
+    word_pages: AtomicU64,
     /// (page | 1 for a write, the faulting instruction).
     ring: [[AtomicU64; 2]; RING],
     leaves: [[AtomicU64; (LEAF_PAGES / 64) as usize]; MAX_LEAVES],
@@ -169,6 +176,20 @@ pub fn init() {
     });
 }
 
+/// `Shared::flags`: a fault on an armed page makes every armed page of its
+/// 64-page word read-write and clears their bits (the title writes runs of
+/// pages: several pages of a word faulted within the millisecond before
+/// dsport could disarm the rest, FINDINGS.md 2026-10-28). Not for pages
+/// armed against reads (`arm_noaccess`): set by front end 2 only.
+const WORD_MODE: u32 = 1;
+
+/// Faults answer for their whole 64-page word from now on (`WORD_MODE`).
+pub fn set_word_mode() {
+    if let Some(s) = shared() {
+        s.flags.fetch_or(WORD_MODE, Ordering::AcqRel);
+    }
+}
+
 /// Arming and disarming one at a time: a disarm between an arm's bits and
 /// its protection would leave read-only pages without bits (a write there
 /// would reach dsport's own handlers). Callers that check something before
@@ -197,17 +218,29 @@ fn arm_as(base: u64, len: u64, prot: u32) -> Result<(), String> {
     let s = shared().ok_or("not hosted")?;
     let _lock = arm_lock();
     let (lo, hi) = (base & !(PAGE - 1), (base + len).next_multiple_of(PAGE));
-    for a in (lo..hi).step_by(PAGE as usize) {
-        let (w, m) = bit(s, a, true).ok_or_else(|| format!("{a:#x}: outside the guest range or out of leaves"))?;
-        w.fetch_or(m, Ordering::AcqRel);
-    }
-    let mut old = 0u32;
-    if unsafe { VirtualProtect(lo as _, (hi - lo) as usize, prot, &mut old) } == 0 {
-        let e = unsafe { GetLastError() };
-        disarm_bits(s, lo, hi);
-        return Err(format!("VirtualProtect {lo:#x}+{:#x}: error {e}", hi - lo));
-    }
-    Ok(())
+    // (Told to the host first: its word answers skip these pages.)
+    s.arming[0].store(lo, Ordering::Release);
+    s.arming[1].store(hi, Ordering::Release);
+    let r = (|| {
+        for a in (lo..hi).step_by(PAGE as usize) {
+            // (Bits set so far go again: armed bits on writable pages would
+            // pass their writes unseen.)
+            let Some((w, m)) = bit(s, a, true) else {
+                disarm_bits(s, lo, a);
+                return Err(format!("{a:#x}: outside the guest range or out of leaves"));
+            };
+            w.fetch_or(m, Ordering::AcqRel);
+        }
+        let mut old = 0u32;
+        if unsafe { VirtualProtect(lo as _, (hi - lo) as usize, prot, &mut old) } == 0 {
+            let e = unsafe { GetLastError() };
+            disarm_bits(s, lo, hi);
+            return Err(format!("VirtualProtect {lo:#x}+{:#x}: error {e}", hi - lo));
+        }
+        Ok(())
+    })();
+    s.arming[1].store(0, Ordering::Release);
+    r
 }
 
 fn disarm_bits(s: &Shared, lo: u64, hi: u64) {
@@ -394,9 +427,10 @@ pub fn status() -> String {
         })
         .collect();
     format!(
-        "    hosted: {} faults on armed pages answered by the host ({:.1} us each there), {} retried (raced an answered one), {} exceptions passed on, {} leaves of the armed-page map, ring overflows {}, disarms that failed {}; debug events: {}\n{}",
+        "    hosted: {} faults on armed pages answered by the host ({:.1} us each there; {} more pages made read-write with their words), {} retried (raced an answered one), {} exceptions passed on, {} leaves of the armed-page map, ring overflows {}, disarms that failed {}; debug events: {}\n{}",
         f,
         s.host_ns.load(Ordering::Relaxed) as f64 / 1000.0 / f.max(1) as f64,
+        s.word_pages.load(Ordering::Relaxed),
         s.retried.load(Ordering::Relaxed),
         s.passed.load(Ordering::Relaxed),
         s.leaves_used.load(Ordering::Relaxed),
@@ -482,6 +516,10 @@ pub fn run_host() -> ! {
                     if let Some((w, m)) = bit(s, page, false) {
                         w.fetch_and(!m, Ordering::AcqRel);
                     }
+                    if s.flags.load(Ordering::Acquire) & WORD_MODE != 0 {
+                        let n = answer_word(s, pi.hProcess, page);
+                        s.word_pages.fetch_add(n, Ordering::Relaxed);
+                    }
                     s.leaf_events[leaf_of(page)].fetch_add(1, Ordering::AcqRel);
                     s.all_events.fetch_add(1, Ordering::AcqRel);
                     let head = s.head.load(Ordering::Acquire);
@@ -515,6 +553,47 @@ pub fn run_host() -> ! {
         unsafe { ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, status) };
     }
     std::process::exit(code as i32);
+}
+
+/// `WORD_MODE` (the debuggee stopped): the armed pages of `page`'s 64-page
+/// word other than those of an arm in progress made read-write, run by run
+/// (page by page where a run fails: it may cross separately allocated
+/// regions), and their bits cleared where that worked. The pages it did.
+unsafe fn answer_word(s: &Shared, process: HANDLE, page: u64) -> u64 {
+    let wa = page & !(64 * PAGE - 1);
+    let Some((w, _)) = bit(s, wa, false) else { return 0 };
+    let mut bits = w.load(Ordering::Acquire);
+    let (alo, ahi) = (s.arming[0].load(Ordering::Acquire), s.arming[1].load(Ordering::Acquire));
+    if ahi > wa && alo < wa + 64 * PAGE {
+        for k in 0..64 {
+            let a = wa + k * PAGE;
+            if (alo..ahi).contains(&a) {
+                bits &= !(1u64 << k);
+            }
+        }
+    }
+    let mut done = 0u64;
+    let mut r = bits;
+    while r != 0 {
+        let b = r.trailing_zeros() as u64;
+        let run = (!(r >> b)).trailing_zeros().min(64 - b as u32) as u64;
+        let m = if run >= 64 { u64::MAX } else { ((1u64 << run) - 1) << b };
+        r &= !m;
+        let mut old = 0u32;
+        if VirtualProtectEx(process, (wa + b * PAGE) as _, (run * PAGE) as usize, PAGE_READWRITE, &mut old) != 0 {
+            done |= m;
+        } else {
+            for k in b..b + run {
+                if VirtualProtectEx(process, (wa + k * PAGE) as _, PAGE as usize, PAGE_READWRITE, &mut old) != 0 {
+                    done |= 1u64 << k;
+                }
+            }
+        }
+    }
+    if done != 0 {
+        w.fetch_and(!done, Ordering::AcqRel);
+    }
+    done.count_ones() as u64
 }
 
 /// Whether the debuggee's guest page at `addr` is committed and allows the
