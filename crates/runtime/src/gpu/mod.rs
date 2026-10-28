@@ -1992,7 +1992,9 @@ pub mod tune {
 
     /// GPU-resolved chains (RENDERER.md "GPU-resolved item passes"): 0 off,
     /// 1 the guest page table is kept and programs found eligible resolve
-    /// their per-item chains in the shader.
+    /// their per-item chains in the shader (batched compute programs and draw
+    /// pairs), 2 compute programs only (front end 2's stage F3: the draws'
+    /// runs cost more than they save, FINDINGS.md 2026-10-28).
     pub fn gpu_chains() -> u64 {
         get(181)
     }

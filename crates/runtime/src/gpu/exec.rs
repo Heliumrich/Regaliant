@@ -6656,6 +6656,19 @@ pub struct Exec {
     fe2_pend_set: super::fx::Set<u64>,
     /// This queue's view (`fe2::view_cell`): what its checks need.
     fe2_view: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// GPU-resolved chains under front end 2 (`fe2_gpu_ranges`, scratch):
+    /// the ranges a command's shader reads, the words read for them.
+    f3_ranges: Vec<(u64, u64)>,
+    f3_loads: Vec<(u64, u64)>,
+    f3_reads: Vec<(u64, u64)>,
+    /// Runs `fe2_gpu_ranges` placed in the batch being recorded, with the
+    /// epoch their checks needed: current for its later work that needs no
+    /// later one (as a run's first command's bindings are for its appends).
+    f3_placed: super::fx::Set<(u64, u64, u32)>,
+    /// The lowest epoch front end 2's placements needed since the command
+    /// being recorded began (u32::MAX: none): what a GPU-resolved run its
+    /// first command opens was checked for (`fe2_run_want`).
+    fe2_min_want: u32,
     /// Resident GPU-written data (`gpu::rgm`, `exec/rgm.rs`): the open
     /// batch's claims and their granules, its W writes (all, and those not
     /// merged into guest memory yet), the merge table, a page list reused.
@@ -7020,6 +7033,10 @@ struct GpuRun {
     users: usize,
     which: usize,
     regs: [u32; 6],
+    /// Front end 2: the epoch its first command's checks needed
+    /// (`Exec::fe2_run_want`); later commands append while no check needs a
+    /// later one.
+    fe2_want: u32,
 }
 
 /// GPU-resolved commands: [appended to a run, refused (run roots differ),
@@ -7037,6 +7054,61 @@ pub static GPU_FORMAT_MISSES: AtomicU64 = AtomicU64::new(0);
 pub static GPU_APPEND_LAPS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// `DS_GPU_VERIFY=1`: [appended draws verified, of them with differences].
 pub static GPU_VERIFY: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Front end 2's GPU-resolved chains (stage F3, `Exec::fe2_gpu_ranges`):
+/// commands whose per-item chains were not placed, by why (`F3_WHY`).
+pub static F3_REFUSED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+pub(super) const F3_VIEW: usize = 0;
+pub(super) const F3_PENDING: usize = 1;
+pub(super) const F3_UNREADABLE: usize = 2;
+pub(super) const F3_FORMAT: usize = 3;
+pub(super) const F3_OUTSIDE: usize = 4;
+pub(super) const F3_PLACE: usize = 5;
+pub(super) const F3_WHY: [&str; 6] = ["the view moved since the run's first command", "words of the chains pending GPU or CP writes", "a chain or range unreadable", "a formatted buffer's format", "outside the mirror's span", "a placement failed"];
+/// [ranges placed for them, their bytes; draws, dispatches recorded with
+/// CPU-resolved chains after a refusal].
+pub static F3_PLACED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// `DS_STEP_LAPS`: [stages placed, TSC cycles reading their chains, checking
+/// the loads' imports and pending writes, placing the buffers; ranges found,
+/// runs placed, runs the batch uploads or placed already].
+pub static F3_LAPS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// Runs of at most this many pages pass `fe2_gpu_ranges` without a
+/// placement when the batch uploads every page of them already.
+const F3_MINE_PAGES: u64 = 4;
+/// Runs a batch remembers as placed (`Exec::f3_placed`).
+const F3_PLACED_MAX: usize = 4096;
+
+/// Status part of stage F3 ("" unless front end 2 is on).
+pub fn f3_line() -> String {
+    if !super::fe2::on() {
+        return String::new();
+    }
+    let v: Vec<u64> = F3_PLACED.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let why: Vec<String> = F3_REFUSED.iter().zip(F3_WHY).map(|(c, w)| format!("{w} {}", c.load(Ordering::Relaxed))).collect();
+    let l: Vec<u64> = F3_LAPS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let laps = if l[0] > 0 {
+        let us = |c: u64| c as f64 * 1e6 / super::threadcpu::tsc_hz() / l[0] as f64;
+        format!(
+            "    front end 2's GPU-resolved chains by part (`DS_STEP_LAPS`, {} stages): reading the chains {:.2} us, the loads' imports and pending writes {:.2} us, placing the buffers {:.2} us; {:.1} ranges, {:.1} placements and {:.1} runs the batch uploads or placed already a stage\n",
+            l[0],
+            us(l[1]),
+            us(l[2]),
+            us(l[3]),
+            l[4] as f64 / l[0] as f64,
+            l[5] as f64 / l[0] as f64,
+            l[6] as f64 / l[0] as f64
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "    front end 2's GPU-resolved chains: {} ranges placed ({} MiB); not placed: {}; recorded with CPU-resolved chains after that: {} draws, {} dispatches\n",
+        v[0],
+        v[1] >> 20,
+        why.join(", "),
+        v[2],
+        v[3]
+    ) + &laps
+}
 
 /// Diagnosis of GPU-resolved commands recorded in full (`gpu_res_check`):
 /// what their shader-resolved reads overlap that the CPU path would have
@@ -7351,6 +7423,11 @@ impl Exec {
                 fe2_pend: Vec::new(),
                 fe2_pend_set: Default::default(),
                 fe2_view: super::fe2::view_cell(name),
+                f3_ranges: Vec::new(),
+                f3_loads: Vec::new(),
+                f3_reads: Vec::new(),
+                f3_placed: Default::default(),
+                fe2_min_want: u32::MAX,
                 rgm_claims: Vec::new(),
                 rgm_mine: Default::default(),
                 rgm_written: Default::default(),
@@ -8003,6 +8080,7 @@ impl Exec {
                 b.fe2_spans = std::mem::take(&mut self.fe2_spans);
             }
             self.fe2_mine.clear();
+            self.f3_placed.clear();
             self.rgm_batch_done(true);
             self.stage_used = 0;
             self.slots[i].seq = PENDING;
@@ -8067,6 +8145,7 @@ impl Exec {
             note_span_uses(&std::mem::take(&mut self.fe2_spans), seq);
         }
         self.fe2_mine.clear();
+        self.f3_placed.clear();
         super::precache::submitted(&std::mem::take(&mut self.shared_pending), seq);
         if !self.res_pages.is_empty() {
             super::resident::submitted(&std::mem::take(&mut self.res_pages), seq);
@@ -8182,6 +8261,7 @@ impl Exec {
         self.fe2_up.clear();
         self.fe2_spans.clear();
         self.fe2_mine.clear();
+        self.f3_placed.clear();
         self.fe2_marked = false;
         self.fe2_pend.clear();
         self.fe2_pend_set.clear();
@@ -8684,20 +8764,8 @@ impl Exec {
         let t2 = tsc();
         // (Read before any take: what its pages are stamped with.)
         let ep = super::precache::epoch() as u32;
-        // Held past a label wait, the work runs after the label, whose writer
-        // may synchronize again before writing it: the view now does not
-        // cover the CPU writes it must see, and the epoch now does (as for
-        // every check before views). With the view, a per-view copy kernel's
-        // source passed stale in the mirror after a warp, its forwarded
-        // words then differed from what the copy left (`forward`: "did not
-        // land"), the block was no longer forwarded, and every later draw
-        // reading it stopped the stretch and waited for the label (~9 ms
-        // each, 732 times in one window; 2 of ~20 boots, 2026-10-28 night).
-        let want = match self.fe2_view.load(Ordering::Acquire) {
-            _ if self.past_grow && super::fe2::stretch_epoch() => ep,
-            super::fe2::NO_VIEW => ep,
-            v => v.min(ep),
-        };
+        let want = self.fe2_want(ep);
+        self.fe2_min_want = self.fe2_min_want.min(want);
         let mine = std::mem::take(&mut self.fe2_mine);
         let pend = std::mem::take(&mut self.fe2_pend_set);
         let mut up = std::mem::take(&mut self.fe2_up);
@@ -8736,6 +8804,167 @@ impl Exec {
             super::fe2::note_place_parts(t1.wrapping_sub(t0), t2.wrapping_sub(t1), tsc().wrapping_sub(t3));
         }
         Some((mbuf, base - MIRROR_BASE, hi - base))
+    }
+
+    /// The epoch front end 2's checks need now (`ep`: the epoch now): this
+    /// queue's view, or the epoch now without one.
+    fn fe2_want(&self, ep: u32) -> u32 {
+        // Held past a label wait, the work runs after the label, whose writer
+        // may synchronize again before writing it: the view now does not
+        // cover the CPU writes it must see, and the epoch now does (as for
+        // every check before views). With the view, a per-view copy kernel's
+        // source passed stale in the mirror after a warp, its forwarded
+        // words then differed from what the copy left (`forward`: "did not
+        // land"), the block was no longer forwarded, and every later draw
+        // reading it stopped the stretch and waited for the label (~9 ms
+        // each, 732 times in one window; 2 of ~20 boots, 2026-10-28 night).
+        match self.fe2_view.load(Ordering::Acquire) {
+            _ if self.past_grow && super::fe2::stretch_epoch() => ep,
+            super::fe2::NO_VIEW => ep,
+            v => v.min(ep),
+        }
+    }
+
+    /// The epoch a GPU-resolved run opened by the command being recorded was
+    /// checked for: the lowest its placements needed (the epoch can advance
+    /// while a command binds), else what a check would need now.
+    pub(super) fn fe2_run_want(&self) -> u32 {
+        match self.fe2_min_want {
+            u32::MAX => self.fe2_want(super::precache::epoch() as u32),
+            w => w,
+        }
+    }
+
+    /// Front end 2 for a GPU-resolved command's per-item chains (stage F3;
+    /// `gpures`, `Spec::gpu_res`, `gpu_loads`, `pt_linear`), their chains and
+    /// V#s read from guest memory now: the ranges its shader-resolved loads
+    /// read are read by the shader from guest memory through the page table
+    /// (data the CPU path copies into the SGPR data when it records: per-item
+    /// blocks the title rewrites every frame, which the mirror would take
+    /// again in every view), so they must be imported and no GPU or CP work
+    /// may still be pending on them; the ranges its shader-resolved buffers
+    /// reach are placed in the mirror as of this executor's view as any
+    /// binding is (once per batch and view: `f3_placed`). The words read for
+    /// them must be current too (else `F3_PENDING`: the command is recorded
+    /// with CPU-resolved chains, which wait). Err: why not (an index into
+    /// `F3_REFUSED`).
+    fn fe2_gpu_ranges(&mut self, found: &shaders::Found, addr: u64, user: &[u32]) -> Result<(), usize> {
+        let mut ranges = std::mem::take(&mut self.f3_ranges);
+        let mut loads = std::mem::take(&mut self.f3_loads);
+        let mut reads = std::mem::take(&mut self.f3_reads);
+        ranges.clear();
+        loads.clear();
+        reads.clear();
+        let r = self.fe2_gpu_ranges_in(found, addr, user, &mut loads, &mut ranges, &mut reads);
+        self.f3_ranges = ranges;
+        self.f3_loads = loads;
+        self.f3_reads = reads;
+        if let Err(k) = r {
+            F3_REFUSED[k].fetch_add(1, Ordering::Relaxed);
+        }
+        r
+    }
+
+    fn fe2_gpu_ranges_in(&mut self, found: &shaders::Found, addr: u64, user: &[u32], loads: &mut Vec<(u64, u64)>, ranges: &mut Vec<(u64, u64)>, reads: &mut Vec<(u64, u64)>) -> Result<(), usize> {
+        use super::resident::PAGE;
+        // (Parts timed with `DS_STEP_LAPS`: `F3_LAPS`.)
+        let tsc = || if laps() { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
+        let t0 = tsc();
+        let r = shaders::gpu_chain_ranges(addr, &found.tr.plan, &found.tr.spec, user, loads, ranges, reads);
+        let t1 = tsc();
+        match r {
+            Ok(()) => {}
+            Err(0) => return Err(F3_UNREADABLE),
+            Err(_) => {
+                GPU_FORMAT_MISSES.fetch_add(1, Ordering::Relaxed);
+                return Err(F3_FORMAT);
+            }
+        }
+        // The loads' ranges in import windows (the page table maps them for
+        // the batches queued from now on); outside the span the shader reads
+        // zeros, which the CPU path would not for readable memory there.
+        loads.retain(|&(a, n)| a != 0 && n != 0);
+        for &(a, n) in loads.iter() {
+            if !super::fe2::in_span(a, n) {
+                if super::cp::guest_readable(a, n) {
+                    return Err(F3_OUTSIDE);
+                }
+                continue;
+            }
+            if span(a, n).is_none() {
+                return Err(F3_UNREADABLE);
+            }
+        }
+        let pending = |s: &mut Self, r: &[(u64, u64)]| !r.is_empty() && (s.would_wait(r) || CP_WRITES.latest(r).is_some());
+        if pending(self, reads) || pending(self, loads) {
+            return Err(F3_PENDING);
+        }
+        let t2 = tsc();
+        // (Read on the CPU now: checked when held work settles, as a
+        // preparation's reads are.)
+        if self.held {
+            self.held_reads.extend_from_slice(reads);
+            self.note_kinds(2, reads.len());
+        }
+        // Within their mappings (unbounded descriptors reach far past them),
+        // runs on the same or adjacent pages placed as one.
+        ranges.sort_unstable();
+        let want = self.fe2_want(super::precache::epoch() as u32);
+        let mut run: Option<(u64, u64)> = None;
+        let (mut placed, mut bytes, mut mine) = (0u64, 0u64, 0u64);
+        for i in 0..=ranges.len() {
+            let next = match ranges.get(i) {
+                Some(&(a, n)) => {
+                    if n == 0 || a == 0 {
+                        continue;
+                    }
+                    let Some((_, e)) = mapping(a) else { return Err(F3_UNREADABLE) };
+                    // (Unchecked buffers to the mapping's end, as bound in full.)
+                    let n = if n == u64::MAX { (e - a).min(UNBOUNDED_MAX) } else { n.min(e - a) };
+                    if !super::fe2::in_span(a, n) {
+                        return Err(F3_OUTSIDE);
+                    }
+                    match run.as_mut() {
+                        Some(l) if a <= l.1.next_multiple_of(PAGE) => {
+                            l.1 = l.1.max(a + n);
+                            continue;
+                        }
+                        _ => Some((a, a + n)),
+                    }
+                }
+                None => None,
+            };
+            if let Some((a, b)) = std::mem::replace(&mut run, next) {
+                // Small runs whose pages this batch uploads already (a ring of
+                // per-draw blocks: the draws before in the batch placed them)
+                // are current for all of its work: only deferred CP writes
+                // into them still order the batch.
+                if (b - a <= F3_MINE_PAGES * PAGE && (a & !(PAGE - 1)..b).step_by(PAGE as usize).all(|p| self.fe2_mine.contains(&p))) || self.f3_placed.contains(&(a, b, want)) {
+                    if let Some(s) = CP_WRITES.latest(&[(a, b - a)]) {
+                        self.submit_after = self.submit_after.max(s);
+                    }
+                    mine += 1;
+                    continue;
+                }
+                if self.fe2_place(a, b - a, false).is_none() {
+                    return Err(F3_PLACE);
+                }
+                if self.f3_placed.len() < F3_PLACED_MAX {
+                    self.f3_placed.insert((a, b, want));
+                }
+                placed += 1;
+                bytes += b - a;
+            }
+        }
+        F3_PLACED[0].fetch_add(placed, Ordering::Relaxed);
+        F3_PLACED[1].fetch_add(bytes, Ordering::Relaxed);
+        if t0 != 0 {
+            let t3 = tsc();
+            for (k, v) in [1, t1.wrapping_sub(t0), t2.wrapping_sub(t1), t3.wrapping_sub(t2), (loads.len() + ranges.len()) as u64, placed, mine].into_iter().enumerate() {
+                F3_LAPS[k].fetch_add(v, Ordering::Relaxed);
+            }
+        }
+        Ok(())
     }
 
     /// Records the copy of guest [a, b) into the mirror at its offset, in
@@ -12145,8 +12374,17 @@ impl Exec {
             }
             for b in &found.tr.out.bindings {
                 match b.kind {
-                    // Resolved by the shader through the page table.
-                    BindingKind::Address(i) if i < 64 && gpu_res & (1u64 << i) != 0 => {}
+                    // Resolved by the shader through the page table (front end
+                    // 2: in the mirror at guest offsets, its device address in
+                    // the resource's address entry, `Spec::pt_linear`).
+                    BindingKind::Address(i) if i < 64 && gpu_res & (1u64 << i) != 0 => {
+                        if found.tr.spec.pt_linear {
+                            let m = super::resident::mirror_address();
+                            let ai = addr_at + (rdna::translate::ADDR_HEADER_DWORDS + rdna::translate::ADDR_INFO_DWORDS * i as u32) as usize;
+                            p.sgpr_data[ai] = m as u32;
+                            p.sgpr_data[ai + 1] = (m >> 32) as u32;
+                        }
+                    }
                     BindingKind::Buffer(i) | BindingKind::Address(i) => {
                         let (base, size, stride, limit) = match &found.resources[i] {
                             Resolved::Buffer(v) => (v.base, v.byte_size(), v.stride, v.index_limit()),
@@ -12913,7 +13151,21 @@ impl Exec {
             GPU_APPENDS[1].fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        if !gpu_pages_mapped(&g.items, &user) || !gpu_res_imported(&g.found, g.addr, g.found.tr.spec.gpu_res, &user) {
+        if super::fe2::on() {
+            // Front end 2 (stage F3): the run's bindings were checked for the
+            // view its first command had; this command's per-item chains are
+            // placed now.
+            if self.fe2_want(super::precache::epoch() as u32) > g.fe2_want {
+                F3_REFUSED[F3_VIEW].fetch_add(1, Ordering::Relaxed);
+                GPU_APPENDS[2].fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            let (found, addr) = (g.found.clone(), g.addr);
+            if self.fe2_gpu_ranges(&found, addr, &user).is_err() {
+                GPU_APPENDS[2].fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        } else if !gpu_pages_mapped(&g.items, &user) || !gpu_res_imported(&g.found, g.addr, g.found.tr.spec.gpu_res, &user) {
             GPU_APPENDS[2].fetch_add(1, Ordering::Relaxed);
             return false;
         }
@@ -13023,6 +13275,7 @@ impl Exec {
         // Phase times only when profiling (a clock read costs ~20 ns); the
         // total always (slow dispatches are reported).
         let t_start = std::time::Instant::now();
+        self.fe2_min_want = u32::MAX;
         let t0 = profiling().then_some(t_start);
         let since = |t0: Option<std::time::Instant>| t0.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         // No groups (direct, or arguments the CPU read): nothing runs, so
@@ -13075,7 +13328,14 @@ impl Exec {
         }
         if super::tune::gpu_chains() != 0 && p.tr.spec.batched && indirect.is_none() {
             let user = &p.sgpr_data[..p.tr.spec.user_sgprs as usize];
-            if p.tr.spec.gpu_res != 0 {
+            if p.tr.spec.gpu_res != 0 && super::fe2::on() {
+                // Front end 2 (stage F3): what its per-item chains read placed
+                // in the mirror; else this command resolves them on the CPU.
+                if self.fe2_gpu_ranges(&p.found, p.addr, user).is_err() {
+                    F3_PLACED[3].fetch_add(1, Ordering::Relaxed);
+                    p = shaders::without_gpu_chains(|| shaders::prepare_compute(cp, wave64))?;
+                }
+            } else if p.tr.spec.gpu_res != 0 {
                 // A GPU-resolved command recorded in full (a run's first):
                 // what its chains start from must be in the page table.
                 if let Some(d) = super::gpures::decided(p.addr) {
@@ -13703,6 +13963,7 @@ impl Exec {
                                     users: p.tr.spec.user_sgprs as usize,
                                     which,
                                     regs: gpu_run_regs(cp),
+                                    fe2_want: self.fe2_run_want(),
                                 })
                             })
                         } else {

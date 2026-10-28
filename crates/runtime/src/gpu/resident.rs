@@ -1163,6 +1163,18 @@ pub fn mirror_buffer() -> Option<(vk::Buffer, u64)> {
     MIRROR.get().map(|m| (m.buf, m.page))
 }
 
+/// The mirror's device address (guest MIRROR_BASE's), 0 before it is made
+/// (front end 2's GPU-resolved chains, `rdna::translate::Spec::pt_linear`).
+pub fn mirror_address() -> u64 {
+    static VA: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    match MIRROR.get() {
+        Some(m) => *VA.get_or_init(|| ctx().buffer_address(m.buf)),
+        None => 0,
+    }
+}
+
+const _: () = assert!(MIRROR_BASE == rdna::translate::PT_BASE && MIRROR_END == rdna::translate::PT_END);
+
 /// Front end 2 (`fe2`): the mirror and the written-bit map, made without
 /// turning residency on (none of its placements run). Ok: what was made.
 pub fn make_for_fe2() -> Result<String, String> {

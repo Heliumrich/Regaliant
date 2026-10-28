@@ -2017,7 +2017,10 @@ pub fn init() {
     // per-view copies as buffer updates, forwarded to the CPU-side reads of
     // their blocks: the updates write the mirror too.)
     // (The host census and mirror mode would read the host's faults too.)
-    const OFF: [&str; 11] = ["long_runs", "frame_ahead", "homes", "keep_small", "draw_args_gpu", "gpu_loads", "gpu_chains", "shadow_args", "pre_share", "host_census", "gpu_mirror"];
+    // (GPU-resolved chains stay as set: stage F3, they read the mirror at
+    // guest offsets, `Spec::pt_linear`, their per-item ranges placed per
+    // command, `exec::fe2_gpu_ranges`.)
+    const OFF: [&str; 10] = ["long_runs", "frame_ahead", "homes", "keep_small", "draw_args_gpu", "gpu_loads", "shadow_args", "pre_share", "host_census", "gpu_mirror"];
     for name in OFF {
         if !super::tune::set(name, 0) {
             crate::warn!("fe2: no switch {name}");

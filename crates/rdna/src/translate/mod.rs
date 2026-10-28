@@ -299,6 +299,13 @@ pub struct Spec {
     /// `index_limit`), bytes outside the range read 0; its info block and
     /// address entry are unused.
     pub gpu_res: u64,
+    /// GPU-resolved buffers (`gpu_res`) read one buffer that holds
+    /// [PT_BASE, PT_END) at guest offsets (front end 2's mirror) instead of
+    /// going through the page table: the device address of guest PT_BASE in
+    /// it is in the resource's address entry (dwords 0-1, unused otherwise),
+    /// addresses outside the span read 0, and their reads are not counted.
+    /// GPU-resolved loads still go through the page table.
+    pub pt_linear: bool,
 }
 
 /// The guest page table of GPU-resolved chains (`Spec::gpu_loads`,
@@ -395,6 +402,9 @@ impl std::hash::Hash for Spec {
             0x4750_5552u32.hash(state);
             self.gpu_loads.hash(state);
             self.gpu_res.hash(state);
+            if self.pt_linear {
+                0x4C49_4E52u32.hash(state);
+            }
         }
     }
 }
@@ -3208,6 +3218,7 @@ mod tests {
             sgpr_ubo: 0,
             gpu_loads: 0,
             gpu_res: 0,
+            pt_linear: false,
         }
     }
 

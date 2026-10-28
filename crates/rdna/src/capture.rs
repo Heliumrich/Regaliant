@@ -146,6 +146,9 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         } else {
             0
         },
+        // RDNA_PT_LINEAR=1 (with RDNA_GPU_CHAINS): buffers through one
+        // buffer at guest offsets (`Spec::pt_linear`, front end 2).
+        pt_linear: gpu_chains && std::env::var_os("RDNA_PT_LINEAR").is_some(),
         stage: u.stage,
         user_sgprs: users,
         user_base,

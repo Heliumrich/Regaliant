@@ -1023,6 +1023,7 @@ impl Exec {
 
     /// Records the draw; Ok(false) when it has no effect here.
     fn draw_inner(&mut self, cp: &Cp, a: &DrawArgs) -> Result<bool, String> {
+        self.fe2_min_want = u32::MAX;
         let gpu = a.gpu_args;
         if gpu.is_none() && (a.count == 0 || a.instances == 0) {
             return Ok(false);
@@ -1085,7 +1086,7 @@ impl Exec {
         // chains the shaders resolve runs batched, its draws after a run's
         // first appended with their user data alone (no preparation).
         let direct = ps_addr != 0 && gpu.is_none() && !rect && self.recording && !sync_mode();
-        let mut gpu_pair = if direct && super::super::tune::gpu_chains() != 0 { super::super::gpures::draw_decided(vs_addr, ps_addr) } else { None };
+        let mut gpu_pair = if direct && super::super::tune::gpu_chains() == 1 { super::super::gpures::draw_decided(vs_addr, ps_addr) } else { None };
         if gpu_pair.is_some() && self.draw_same {
             if let Some(drawn) = self.draw_gpu_append(cp, a, vs_addr, ps_addr)? {
                 return Ok(drawn);
@@ -1180,14 +1181,27 @@ impl Exec {
         if let (true, Some(d)) = (batched, gpu_pair.as_ref()) {
             let p = ps.as_ref().unwrap();
             let mut why = None;
-            for (k, st) in [&vs, p].into_iter().enumerate() {
-                if !super::gpu_pages_mapped(&d.stages[k].item_roots, &st.user) || !super::gpu_res_imported(&st.found, st.addr, st.tr.spec.gpu_res, &st.user) {
-                    why = Some("its per-item chains reach memory that cannot be imported".to_string());
+            // Front end 2 (stage F3): what the per-item chains read placed in
+            // the mirror; else this draw resolves them on the CPU (the pair
+            // stays GPU-resolved).
+            let mut cpu_this = false;
+            if super::super::fe2::on() {
+                cpu_this = self.fe2_gpu_ranges(&vs.found, vs.addr, &vs.user).is_err() || self.fe2_gpu_ranges(&p.found, p.addr, &p.user).is_err();
+                if cpu_this {
+                    super::F3_PLACED[2].fetch_add(1, Ordering::Relaxed);
                 }
+            } else {
+                for (k, st) in [&vs, p].into_iter().enumerate() {
+                    if !super::gpu_pages_mapped(&d.stages[k].item_roots, &st.user) || !super::gpu_res_imported(&st.found, st.addr, st.tr.spec.gpu_res, &st.user) {
+                        why = Some("its per-item chains reach memory that cannot be imported".to_string());
+                    }
+                }
+                why = why.or_else(|| self.gpu_draw_check(&vs, p));
             }
-            why = why.or_else(|| self.gpu_draw_check(&vs, p));
-            if let Some(why) = why {
-                super::super::gpures::refuse_draw((vs_addr, ps_addr), &why);
+            if why.is_some() || cpu_this {
+                if let Some(why) = why {
+                    super::super::gpures::refuse_draw((vs_addr, ps_addr), &why);
+                }
                 gpu_pair = None;
                 batched = false;
                 drop(batched_guard);
@@ -1224,7 +1238,7 @@ impl Exec {
         drop(masks_guard);
         lap.mark(2);
         // Pairs not decided yet: learned from the draws the CPU resolves.
-        if direct && gpu_pair.is_none() && super::super::tune::gpu_chains() != 0 {
+        if direct && gpu_pair.is_none() && super::super::tune::gpu_chains() == 1 {
             if let Some(p) = &ps {
                 let continues = self.draw_same && (self.batch_count, self.cmd_uses.get()) == self.last_draw_end;
                 super::super::gpures::observe_draw((vs.addr, p.addr), [(&vs.tr.plan, &vs.user[..]), (&p.tr.plan, &p.user[..])], continues);
@@ -2030,7 +2044,7 @@ impl Exec {
                 // this draw's bound SGPR data (not when the batch's prologue
                 // patches that data: appended copies would miss the patch).
                 let gpu_run = match (&gpu_pair, &patches) {
-                    (Some(d), None) => Some(Box::new(GpuDrawRun::new((vs_addr, ps_addr), d, &vs, ps.as_ref().unwrap(), [cp.reg(Space::Sh, 0x8B), cp.reg(Space::Sh, 0x0B)], base_slot))),
+                    (Some(d), None) => Some(Box::new(GpuDrawRun::new((vs_addr, ps_addr), d, &vs, ps.as_ref().unwrap(), [cp.reg(Space::Sh, 0x8B), cp.reg(Space::Sh, 0x0B)], base_slot, self.fe2_run_want()))),
                     _ => None,
                 };
                 self.draw_run_open(cmd, layout, a, base_vertex, index, sgpr_ring, sgpr_at, appendable, &vs, ps.as_ref().unwrap(), gpu_run)?;
@@ -2176,8 +2190,9 @@ pub(crate) struct DrawRun {
     table: *mut u32,
     n: u32,
     max: u32,
-    /// Its index buffer (bound at offset 0) and index size; None: not indexed.
-    index: Option<(vk::Buffer, u32)>,
+    /// Its index buffer, index size and the offset the buffer is bound at
+    /// (`draw_run_open`); None: not indexed.
+    index: Option<(vk::Buffer, u32, u64)>,
     appendable: bool,
     /// The stages' translations and image resources.
     tr: [usize; 2],
@@ -2208,10 +2223,14 @@ pub(crate) struct GpuDrawRun {
     /// `gl_BaseInstance` (`DrawArgs::base_inst`): its translation reads it
     /// there, so every draw of the run must.
     base_inst: Option<u16>,
+    /// Front end 2: the epoch its first draw's checks needed
+    /// (`Exec::fe2_run_want`); later draws append while no check needs a
+    /// later one.
+    fe2_want: u32,
 }
 
 impl GpuDrawRun {
-    fn new(pair: (u64, u64), d: &super::super::gpures::DrawDecided, vs: &Prepared, ps: &Prepared, rsrc2: [u32; 2], base_inst: Option<u16>) -> GpuDrawRun {
+    fn new(pair: (u64, u64), d: &super::super::gpures::DrawDecided, vs: &Prepared, ps: &Prepared, rsrc2: [u32; 2], base_inst: Option<u16>, fe2_want: u32) -> GpuDrawRun {
         let roots = |k: usize, p: &Prepared| d.stages[k].run_roots.iter().map(|&r| (r, super::super::gpures::root_value(r, &p.user))).collect();
         GpuDrawRun {
             pair,
@@ -2224,6 +2243,7 @@ impl GpuDrawRun {
             run_user: [d.stages[0].run_user, d.stages[1].run_user],
             first_user: [std::array::from_fn(|i| vs.user.get(i).copied().unwrap_or(0)), std::array::from_fn(|i| ps.user.get(i).copied().unwrap_or(0))],
             base_inst,
+            fe2_want,
         }
     }
 }
@@ -2255,8 +2275,25 @@ fn run_tr(p: &shaders::Prepared) -> usize {
 
 /// [runs opened, draws appended, runs that could not append (opened
 /// without room), appends refused (another index buffer, images, a
-/// recording meanwhile...)].
-static BATCH_DRAWS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// recording meanwhile...); runs that could not append by why: a clear,
+/// no room in the ring, indices at an offset not a multiple of their size].
+static BATCH_DRAWS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// The alignment of a draw run's index binding when first indices from
+/// offset 0 would pass u32 (`draw_run_open`).
+const INDEX_BASE_ALIGN: u64 = 1 << 30;
+
+/// The first index of a draw whose indices are at byte `o` of buffer `b`
+/// (`size` bytes each, `count` of them) in a run whose index binding is
+/// `run` (`DrawRun::index`); None: it cannot join the run.
+fn run_first_index(run: Option<(vk::Buffer, u32, u64)>, b: vk::Buffer, o: u64, size: u32, count: u32) -> Option<u32> {
+    let (rb, rsize, base) = run?;
+    if rb != b || rsize != size || o < base || (o - base) % size as u64 != 0 {
+        return None;
+    }
+    let first = (o - base) / size as u64;
+    (first + count as u64 <= u32::MAX as u64).then_some(first as u32)
+}
 
 /// Status part: `BATCH_DRAWS`.
 pub(super) fn batch_line() -> String {
@@ -2265,11 +2302,14 @@ pub(super) fn batch_line() -> String {
         return String::new();
     }
     format!(
-        "    batched draws (`batch_draws`): {} runs, {} draws appended ({:.1} per run), {} runs without room to append, {} appends refused\n",
+        "    batched draws (`batch_draws`): {} runs, {} draws appended ({:.1} per run), {} runs without room to append (a clear {}, no room in the ring {}, indices at an offset not a multiple of their size {}), {} appends refused\n",
         v[0],
         v[1],
         (v[0] + v[1]) as f64 / v[0] as f64,
         v[2],
+        v[4],
+        v[5],
+        v[6],
         v[3]
     )
 }
@@ -2278,9 +2318,11 @@ impl Exec {
     /// Records a batched pair's draw as a new run: its count, arguments and
     /// table in the SGPR data ring (`ring`, which the stages bind whole), the
     /// table's offset as push constant byte 0 (the vertex stage reads its
-    /// draw's entry by DrawIndex), the index buffer bound at offset 0 (each
-    /// draw's first index its byte offset / size; at its own offset and not
-    /// appendable if not a multiple), one indirect-count draw.
+    /// draw's entry by DrawIndex), the index buffer bound at a base, offset 0
+    /// or the 1 GiB boundary below the draw's indices when first indices
+    /// (u32) do not reach them from 0 (front end 2's mirror spans 32 GiB),
+    /// each draw's first index its byte offset from there / size (at its own
+    /// offset and not appendable if not a multiple), one indirect-count draw.
     #[allow(clippy::too_many_arguments)]
     fn draw_run_open(&mut self, cmd: vk::CommandBuffer, layout: vk::PipelineLayout, a: &DrawArgs, base_vertex: i32, index: Option<(vk::Buffer, u64, u32)>, ring: vk::Buffer, at: [u64; 2], appendable: bool, vs: &Prepared, ps: &Prepared, gpu: Option<Box<GpuDrawRun>>) -> Result<(), String> {
         let which = if self.slots[self.cur].rings[1].is_some_and(|r| r.0 == ring) { 1 } else { 0 };
@@ -2299,12 +2341,22 @@ impl Exec {
         let Some((_, ring_ptr)) = self.slots[self.cur].rings[which] else { return Err("no SGPR data ring".into()) };
         let args_off = off + 16;
         let table_off = args_off + 4 * rec * max;
-        let (index, first) = match index {
-            Some((b, o, size)) if o % size as u64 == 0 => (Some((b, 0u64, size)), (o / size as u64) as u32),
-            Some((b, o, size)) => (Some((b, o, size)), 0),
-            None => (None, 0),
+        let (index, first, at_base) = match index {
+            Some((b, o, size)) if o % size as u64 == 0 => {
+                let base = if o / size as u64 + a.count as u64 <= u32::MAX as u64 { 0 } else { o & !(INDEX_BASE_ALIGN - 1) };
+                (Some((b, base, size)), ((o - base) / size as u64) as u32, true)
+            }
+            Some((b, o, size)) => (Some((b, o, size)), 0, false),
+            None => (None, 0, true),
         };
-        let appendable = appendable && max > 1 && index.is_none_or(|i| i.1 == 0);
+        if !appendable {
+            BATCH_DRAWS[4].fetch_add(1, Ordering::Relaxed);
+        } else if max == 1 {
+            BATCH_DRAWS[5].fetch_add(1, Ordering::Relaxed);
+        } else if !at_base {
+            BATCH_DRAWS[6].fetch_add(1, Ordering::Relaxed);
+        }
+        let appendable = appendable && max > 1 && at_base;
         unsafe {
             let count = ring_ptr.add(off as usize) as *mut u32;
             let args = ring_ptr.add(args_off as usize) as *mut u32;
@@ -2346,7 +2398,7 @@ impl Exec {
                 table,
                 n: 1,
                 max: max as u32,
-                index: index.map(|(b, _, size)| (b, size)),
+                index: index.map(|(b, base, size)| (b, size, base)),
                 appendable,
                 tr: [run_tr(vs), run_tr(ps)],
                 images: run_images(vs, ps),
@@ -2410,11 +2462,29 @@ impl Exec {
             return Ok(None);
         }
         mark(0);
-        for k in 0..2 {
-            let st = &g.stages[k];
-            if !super::gpu_pages_mapped(&g.items[k], users[k]) || !super::gpu_res_imported(&st.found, st.addr, st.tr.spec.gpu_res, users[k]) {
+        if super::super::fe2::on() {
+            // Front end 2 (stage F3): the run's bindings were checked for the
+            // view its first draw had; this draw's per-item chains are placed
+            // now.
+            if self.fe2_want(crate::gpu::precache::epoch() as u32) > g.fe2_want {
+                super::F3_REFUSED[super::F3_VIEW].fetch_add(1, Ordering::Relaxed);
                 stats[3].fetch_add(1, Ordering::Relaxed);
                 return Ok(None);
+            }
+            for k in 0..2 {
+                let st = &g.stages[k];
+                if self.fe2_gpu_ranges(&st.found, st.addr, users[k]).is_err() {
+                    stats[3].fetch_add(1, Ordering::Relaxed);
+                    return Ok(None);
+                }
+            }
+        } else {
+            for k in 0..2 {
+                let st = &g.stages[k];
+                if !super::gpu_pages_mapped(&g.items[k], users[k]) || !super::gpu_res_imported(&st.found, st.addr, st.tr.spec.gpu_res, users[k]) {
+                    stats[3].fetch_add(1, Ordering::Relaxed);
+                    return Ok(None);
+                }
             }
         }
         if gpu_verify() {
@@ -2469,11 +2539,11 @@ impl Exec {
                         (buffer, addr - start)
                     }
                 };
-                if r.index != Some((b, size)) || o % size as u64 != 0 {
+                let Some(first) = run_first_index(r.index, b, o, size, a.count) else {
                     stats[2].fetch_add(1, Ordering::Relaxed);
                     return Ok(None);
-                }
-                (o / size as u64) as u32
+                };
+                first
             }
             None => 0,
         };
@@ -2718,11 +2788,11 @@ impl Exec {
                         (buffer, addr - start)
                     }
                 };
-                if self.draw_run.as_ref().and_then(|r| r.index) != Some((b, size)) || o % size as u64 != 0 {
+                let Some(first) = run_first_index(self.draw_run.as_ref().and_then(|r| r.index), b, o, size, a.count) else {
                     BATCH_DRAWS[3].fetch_add(1, Ordering::Relaxed);
                     return Ok(None);
-                }
-                (o / size as u64) as u32
+                };
+                first
             }
             None => 0,
         };

@@ -430,4 +430,5 @@ pub fn status() -> String {
         super::exec::GPU_VERIFY[0].load(Ordering::Relaxed),
         super::exec::GPU_VERIFY[1].load(Ordering::Relaxed)
     ) + &laps
+        + &super::exec::f3_line()
 }

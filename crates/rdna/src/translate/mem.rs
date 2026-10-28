@@ -224,8 +224,11 @@ fn zero_page(tr: &mut T) -> R<Word> {
 
 /// GPU-resolved chains: the device address of guest address `a` (u64)
 /// through the guest page table, and whether the table maps it (else the
-/// address is meaningless: callers use the zero page).
-fn pt_translate(tr: &mut T, a: Word) -> R<(Word, Word)> {
+/// address is meaningless: callers use the zero page). `linear`: the
+/// GPU-resolved buffer it is read for; with `Spec::pt_linear` such reads
+/// go to one buffer at guest offsets instead (front end 2's mirror, its
+/// device address in the resource's address entry), inside the span only.
+fn pt_translate(tr: &mut T, a: Word, linear: Option<usize>) -> R<(Word, Word)> {
     let (u64t, b) = (tr.t.u64, tr.t.bool_);
     let pt = match tr.pt_addr {
         Some(p) => p,
@@ -243,6 +246,13 @@ fn pt_translate(tr: &mut T, a: Word) -> R<(Word, Word)> {
     let rel = e(tr.b.i_sub(u64t, None, a, lo_c))?;
     let z64 = tr.u64c(0);
     let rel = e(tr.b.select(u64t, None, inside, rel, z64))?;
+    if let (true, Some(r)) = (tr.spec.pt_linear, linear) {
+        let lo = tr.addr_info(r, 0)?;
+        let hi = tr.addr_info(r, 1)?;
+        let base = u64_of(tr, lo, hi)?;
+        let dev = e(tr.b.i_add(u64t, None, base, rel))?;
+        return Ok((dev, inside));
+    }
     let sh = tr.u64c(super::PT_PAGE_SHIFT as u64);
     let page = e(tr.b.shift_right_logical(u64t, None, rel, sh))?;
     let three = tr.u64c(3);
@@ -271,7 +281,7 @@ fn rt_ref(tr: &mut T, v: super::RtVsharp, off: Word, ty: Word, bytes: u32) -> R<
     let inr = e(tr.b.logical_and(b, None, fits, le))?;
     let o = e(tr.b.u_convert(u64t, None, off))?;
     let ga = e(tr.b.i_add(u64t, None, v.base, o))?;
-    let (dev, mapped) = pt_translate(tr, ga)?;
+    let (dev, mapped) = pt_translate(tr, ga, Some(v.r))?;
     let inr = e(tr.b.logical_and(b, None, inr, mapped))?;
     let z = zero_page(tr)?;
     let a = e(tr.b.select(u64t, None, inr, dev, z))?;
@@ -358,8 +368,12 @@ fn report_miss(tr: &mut T, miss: Word, guest: Word) -> R<()> {
 /// A GPU-resolved resource's first byte through the page table: a read of
 /// its range would miss when the table does not map the page (counted).
 fn check_rt_base(tr: &mut T, v: super::RtVsharp) -> R<()> {
+    // (Read from the mirror: no table entry to miss, `Spec::pt_linear`.)
+    if tr.spec.pt_linear {
+        return Ok(());
+    }
     let (u, b) = (tr.t.u32, tr.t.bool_);
-    let (_, mapped) = pt_translate(tr, v.base)?;
+    let (_, mapped) = pt_translate(tr, v.base, None)?;
     let z = tr.u(0);
     let some = e(tr.b.u_greater_than(b, None, v.range, z))?;
     let not_mapped = e(tr.b.logical_not(b, None, mapped))?;
@@ -394,11 +408,11 @@ fn gpu_smem(tr: &mut T, ins: &Inst, d: u32, n: u32) -> R<()> {
     }
     let am = tr.u64c(!3u64);
     let a = e(tr.b.bitwise_and(u64t, None, a, am))?;
-    let (dev0, ok0) = pt_translate(tr, a)?;
+    let (dev0, ok0) = pt_translate(tr, a, None)?;
     let (dev1, ok1) = if n > 1 {
         let last = tr.u64c(4 * (n as u64 - 1));
         let al = e(tr.b.i_add(u64t, None, a, last))?;
-        pt_translate(tr, al)?
+        pt_translate(tr, al, None)?
     } else {
         (dev0, ok0)
     };

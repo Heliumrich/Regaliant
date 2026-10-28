@@ -165,6 +165,21 @@ pub fn with_gpu_loads<T>(f: impl FnOnce() -> T) -> T {
     r
 }
 
+thread_local! {
+    /// Set while `without_gpu_chains` runs.
+    static NO_GPU_CHAINS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the compute preparations it makes resolving every chain on
+/// the CPU, a GPU-resolved program's included (front end 2: a command whose
+/// per-item chains it cannot take on the GPU, `exec::fe2_gpu_ranges`).
+pub fn without_gpu_chains<T>(f: impl FnOnce() -> T) -> T {
+    NO_GPU_CHAINS.with(|c| c.set(true));
+    let r = f();
+    NO_GPU_CHAINS.with(|c| c.set(false));
+    r
+}
+
 /// Programs whose data-only loads GPU work was found writing when they were
 /// prepared (`tune gpu_loads 3`): prepared with GPU-side loads from then on
 /// (no second preparation per command); a generation for the threads'
@@ -1043,6 +1058,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
+        pt_linear: false,
     };
     if super::tune::per_lane() != 0 && per_lane_program(code_hash) {
         let votes = lane_votes_program(code_hash);
@@ -1051,10 +1067,12 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
     }
     // GPU-resolved per-item chains (`gpures`, `tune gpu_chains`; batched
     // programs, whose translations use device addresses).
-    if spec.batched && super::tune::gpu_chains() != 0 && super::pagetable::address() != 0 {
+    if spec.batched && super::tune::gpu_chains() != 0 && super::pagetable::address() != 0 && !NO_GPU_CHAINS.with(|c| c.get()) {
         if let Some(d) = super::gpures::decided(addr) {
             spec.gpu_loads = d.gpu_loads;
             spec.gpu_res = d.gpu_res;
+            // Front end 2: its buffers from the mirror at guest offsets.
+            spec.pt_linear = super::fe2::on();
         }
     }
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
@@ -1216,11 +1234,13 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
+        pt_linear: false,
     };
     if spec.batched {
         if let Some((l, r)) = gpu_draw_masks_now(1) {
             spec.gpu_loads = l;
             spec.gpu_res = r;
+            spec.pt_linear = super::fe2::on();
         }
     }
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
@@ -1378,11 +1398,13 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
+        pt_linear: false,
     };
     if spec.batched {
         if let Some((l, r)) = gpu_draw_masks_now(0) {
             spec.gpu_loads = l;
             spec.gpu_res = r;
+            spec.pt_linear = super::fe2::on();
         }
     }
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
@@ -1441,6 +1463,52 @@ pub fn load_range(code_base: u64, plan: &Plan, k: usize, user: &[u32]) -> Option
     let mut rd = Reader::new(code_base);
     let base = rd.ptr(&l.ptr, user)?;
     Some((base.wrapping_add(l.offset as u64), 4 * l.dwords as u64))
+}
+
+/// Front end 2's GPU-resolved chains (stage F3, `exec::fe2_gpu_ranges`):
+/// into `loads` the guest ranges the shader-resolved loads of `spec`
+/// (`gpu_loads`) read, into `bufs` those its shader-resolved buffers
+/// (`gpu_res`) reach (u64::MAX bytes: to the end of the mapping), for user
+/// data `user`, their pointer chains and V#s read from guest memory now
+/// (forwarded words as `Reader` reads them); into `reads` the words read for
+/// that. Err(0): a chain is unreadable; Err(1): a formatted buffer's V# has
+/// another format or swizzle than the translation's (its loads decode with
+/// that one).
+pub fn gpu_chain_ranges(code_base: u64, plan: &Plan, spec: &Spec, user: &[u32], loads: &mut Vec<(u64, u64)>, bufs: &mut Vec<(u64, u64)>, reads: &mut Vec<(u64, u64)>) -> Result<(), u8> {
+    let mut rd = Reader::new(code_base);
+    for (k, l) in plan.loads.iter().enumerate().take(64) {
+        if spec.gpu_loads & (1u64 << k) == 0 {
+            continue;
+        }
+        let base = rd.ptr(&l.ptr, user).ok_or(0u8)?;
+        loads.push((base.wrapping_add(l.offset as u64), 4 * l.dwords as u64));
+    }
+    for (r, res) in plan.resources.iter().enumerate().take(64) {
+        if spec.gpu_res & (1u64 << r) == 0 {
+            continue;
+        }
+        let mut w = [0u32; 4];
+        for (k, p) in res.dwords.iter().take(4).enumerate() {
+            w[k] = rd.eval(p, user).ok_or(0u8)?;
+        }
+        let v = Vsharp::decode(&w);
+        if res.formatted {
+            if let Some(translate::ResSpec::Buffer { format, dst_sel }) = spec.resources.get(r) {
+                if v.format != *format || v.dst_sel != *dst_sel {
+                    return Err(1);
+                }
+            }
+        }
+        // Without range checks (OOB_SELECT 2) the shader reaches past the
+        // records: to the end of the mapping, as the CPU path binds it
+        // (u64::MAX here; `exec::fe2_gpu_ranges` clips it).
+        let n = v.byte_size().unwrap_or(u64::MAX);
+        if n > 0 && v.base != 0 {
+            bufs.push((v.base, n));
+        }
+    }
+    reads.extend_from_slice(&rd.reads);
+    Ok(())
 }
 
 pub fn read_sources(p: &Prepared) -> Vec<(String, u64, u64)> {
@@ -2034,6 +2102,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
+        pt_linear: false,
     })
 }
 
@@ -2074,6 +2143,7 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
+        pt_linear: false,
     }
 }
 
@@ -2114,6 +2184,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
+        pt_linear: false,
     };
     if super::tune::per_lane() != 0 && per_lane_program(code_hash) {
         let votes = lane_votes_program(code_hash);
