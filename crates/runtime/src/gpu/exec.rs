@@ -305,6 +305,7 @@ fn spans_read() -> parking_lot::RwLockReadGuard<'static, Vec<Span>> {
     let g = SPANS.read();
     IMPORT_WIN[4].fetch_add(1, Ordering::Relaxed);
     IMPORT_WIN[5].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    super::hitch::note_since(super::hitch::Kind::Mirror, t, || "waiting for the import list (an import or a remapping)".into());
     g
 }
 
@@ -316,6 +317,7 @@ fn spans_write() -> parking_lot::RwLockWriteGuard<'static, Vec<Span>> {
     let g = SPANS.write();
     IMPORT_WIN[4].fetch_add(1, Ordering::Relaxed);
     IMPORT_WIN[5].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    super::hitch::note_since(super::hitch::Kind::Mirror, t, || "waiting for the import list to change it".into());
     g
 }
 
@@ -1200,12 +1202,16 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     // pages must be writable while importing (their regions turn dirty
     // and are re-armed on their next use).
     let _w = super::track::protected().then(|| super::track::host_write(start, end - start));
+    // (A long one, its disarm included, is a hitch cause: `gpu::hitch`.)
+    let tw = std::time::Instant::now();
     // Pages armed through the host likewise (`hostcensus`, `precache`'s
     // write tracking by protection).
     crate::hostcensus::release(start, end - start);
     crate::hosted::disarm_if_armed(start, end - start);
     let t0 = std::time::Instant::now();
-    match ctx().import_host(start + alias, end - start, usage) {
+    let imported = ctx().import_host(start + alias, end - start, usage);
+    super::hitch::note_since(super::hitch::Kind::Mirror, tw, || format!("an import of {start:#x}..{end:#x} ({} MiB; the driver's part {} ms)", (end - start) >> 20, t0.elapsed().as_millis()));
+    match imported {
         Ok((buffer, mem, va)) => {
             super::vk::note_gpu_range(buffer, va, end - start, || format!("guest import {start:#x}..{end:#x}"));
             let ns = t0.elapsed().as_nanos() as u64;

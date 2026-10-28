@@ -284,8 +284,9 @@ pub struct Cp {
     /// pointer moved per draw and dispatch, not the whole executor).
     exec: Option<Box<super::exec::Exec>>,
     exec_failed: bool,
-    /// Front end 2's view of a compute queue (`fe2::views_on`): advanced at
-    /// its synchronization points (`fe2_sync`).
+    /// Front end 2's view of this queue (`fe2::views_on`; the graphics
+    /// queue's and its workers' with `fe2::gfx_views`): advanced at its
+    /// synchronization points (`fe2_sync`), a worker's set from its run.
     fe2_view: Option<Arc<std::sync::atomic::AtomicU32>>,
     /// A partial flush / acquire was requested: the next CP memory write
     /// must wait for the GPU work before it.
@@ -1754,7 +1755,7 @@ impl Cp {
             depth: 0,
             exec: None,
             exec_failed: false,
-            fe2_view: (compute && super::fe2::wanted() && super::fe2::views_on()).then(|| super::fe2::view_cell(name)),
+            fe2_view: (super::fe2::wanted() && super::fe2::views_on() && (compute || super::fe2::gfx_views())).then(|| super::fe2::view_cell(name)),
             fence_pending: false,
             pred: None,
             submitted_at: None,
@@ -2296,13 +2297,22 @@ impl Cp {
     /// as of the view `adopt`.
     fn fe2_sync(&self, adopt: Option<u32>) {
         if let Some(c) = self.fe2_view.as_ref() {
-            super::fe2::sync_view(c, adopt.unwrap_or_else(|| super::precache::epoch() as u32));
+            if super::fe2::sync_view(c, adopt.unwrap_or_else(|| super::precache::epoch() as u32)) {
+                super::fe2::note_raise(self.compute);
+            }
+        }
+    }
+
+    /// A parallel worker records a chunk of a run planned at view `v`
+    /// (`par::Run::fe2_view`).
+    pub fn fe2_set_view(&self, v: u32) {
+        if let (Some(c), true) = (self.fe2_view.as_ref(), v != super::fe2::NO_VIEW) {
+            let _ = super::fe2::sync_view(c, v);
         }
     }
 
     /// A wait passed on a value the CP of queue `writer` wrote: that
-    /// queue's view (the epoch now for queues without one, the graphics
-    /// queue's among them).
+    /// queue's view (the epoch now for queues without one).
     fn fe2_adopt(&self, writer: Option<&str>) {
         if self.fe2_view.is_some() {
             self.fe2_sync(Some(writer.and_then(super::fe2::view_of).unwrap_or_else(|| super::precache::epoch() as u32)));
@@ -2906,12 +2916,15 @@ impl Cp {
             // wrote before is current for the commands after it (recorded
             // from now on, as passing the wait would make it).
             super::precache::end_scope(1);
+            self.fe2_sync(None);
         }
         let queue = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
         let submitted = Arc::new(std::sync::atomic::AtomicBool::new(!submit_after));
         let long_writes = soft.then(|| main_writes.clone());
         let mut run = super::par::Run::new(queue, Arc::new(main_writes), submitted.clone());
         run.timed = timed;
+        // (Its workers check as of this command processor's view now.)
+        run.fe2_view = self.fe2_view.as_ref().map_or(super::fe2::NO_VIEW, |c| c.load(Ordering::Acquire));
         if let Some(w) = long_writes {
             // (A chained run has no part of this command processor's.)
             if shared.is_none() {
@@ -5668,6 +5681,7 @@ impl Cp {
             op::REWIND => {
                 if !self.compute {
                     super::precache::end_scope(2);
+                    self.fe2_sync(None);
                 }
                 // The parser stalls until the CPU marks the packet valid.
                 if p(0) & (1 << 31) == 0 {

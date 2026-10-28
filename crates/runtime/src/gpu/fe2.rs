@@ -173,7 +173,21 @@ pub fn views_on() -> bool {
     *W.get_or_init(|| std::env::var("DS_FE2_VIEWS").ok().as_deref() != Some("0"))
 }
 
-/// The view of the queue named `name` (made at NO_VIEW).
+/// `DS_FE2_GFX_VIEWS` (on by default; 0: the graphics queue and its
+/// workers need the epoch now, as before 2026-10-28 night): the graphics
+/// queue has a view of its own too (its submissions, waits the CPU
+/// released, REWINDs, waits in parallel runs the CPU released; the waits on
+/// other queues' labels adopt theirs), and each parallel run's workers
+/// check as of the view its command processor had when it planned the run.
+/// While the camera moved its checks re-took the pages of every epoch any
+/// queue ended (~3,400 takes a flip in a 1-1 walk window).
+pub fn gfx_views() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_FE2_GFX_VIEWS").ok().as_deref() != Some("0"))
+}
+
+/// The view of the queue (or parallel worker) named `name` (made at
+/// NO_VIEW).
 pub fn view_cell(name: &str) -> std::sync::Arc<AtomicU32> {
     let mut g = VIEWS.lock();
     if let Some((_, c)) = g.iter().find(|(n, _)| n == name) {
@@ -190,17 +204,28 @@ pub fn view_of(name: &str) -> Option<u32> {
     g.iter().find(|(n, _)| n == name).map(|(_, c)| c.load(Ordering::Acquire)).filter(|&v| v != NO_VIEW)
 }
 
-/// A queue synchronized: its view becomes at least `v`.
-pub fn sync_view(cell: &AtomicU32, v: u32) {
+/// A queue synchronized: its view becomes at least `v`; whether that
+/// raised it.
+pub fn sync_view(cell: &AtomicU32, v: u32) -> bool {
     let old = cell.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| Some(if c == NO_VIEW { v } else { c.max(v) })).unwrap_or(NO_VIEW);
     VIEW_SYNCS[0].fetch_add(1, Ordering::Relaxed);
-    if old == NO_VIEW || old < v {
+    let raised = old == NO_VIEW || old < v;
+    if raised {
         VIEW_SYNCS[1].fetch_add(1, Ordering::Relaxed);
     }
+    raised
 }
 
 /// Views synchronized, and those it raised (`status`).
 static VIEW_SYNCS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Views raised by the queues' own synchronization (`Cp::fe2_sync`): the
+/// graphics command processor's, the compute queues' (`status`).
+static VIEW_RAISES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Queue `name`'s own synchronization raised its view (`status`).
+pub fn note_raise(compute: bool) {
+    VIEW_RAISES[compute as usize].fetch_add(1, Ordering::Relaxed);
+}
 
 /// Ranges per thread whose last check found every page fine (`RANGES`).
 const RANGE_CACHE: usize = 32;
@@ -209,8 +234,8 @@ const FINE_CHUNKS: usize = 8;
 const FINE_LEAVES: usize = 5;
 
 /// A range a thread found needing no check: the generations of the chunks
-/// it covers (`Chunk::cgen`: every invalidation and every ended arming
-/// there bumps them) and the host's events of its leaves
+/// it covers (`Chunk::cgen`: every invalidation of a valid page and every
+/// ended arming there bumps them) and the host's events of its leaves
 /// (`hosted::leaf_events`) as they were before that check, and the
 /// requirement it met (`ensure`'s `want`; SUM_ARMED: every page was armed,
 /// any). While they are unchanged it still needs none. (Until 2026-10-27
@@ -269,29 +294,61 @@ fn snapshot(lo: u64, hi: u64) -> Option<([u32; FINE_CHUNKS], [u64; FINE_LEAVES])
 fn range_fine(lo: u64, hi: u64, want: u32, marked: bool) -> bool {
     RANGES.with(|r| {
         let mut r = r.borrow_mut();
-        let Some(i) = r.iter().position(|f| f.lo <= lo && hi <= f.hi && (f.marked || !marked) && f.ep >= want && snapshot(f.lo, f.hi).is_some_and(|(g, h)| g == f.gens && h == f.host)) else {
-            if callers_on() {
-                // Why not (the closest reason among the ranges covering it).
-                let covering: Vec<&Fine> = r.iter().filter(|f| f.lo <= lo && hi <= f.hi && (f.marked || !marked)).collect();
-                let why = if covering.is_empty() {
-                    C_NO_RANGE
-                } else if !covering.iter().any(|f| f.ep >= want) {
-                    C_EPOCH
-                } else if covering.iter().any(|f| snapshot(f.lo, f.hi).is_some_and(|(g, _)| g == f.gens)) {
-                    C_HOST
-                } else {
-                    C_GENS
-                };
-                caller_count(why, 1);
+        // (Why not, for `DS_FE2_CALLERS`: the last covering range's reason.)
+        let mut why = C_NO_RANGE;
+        let mut i = 0;
+        while i < r.len() {
+            let f = &r[i];
+            if f.lo <= lo && hi <= f.hi && (f.marked || !marked) {
+                let ep_ok = f.ep >= want;
+                match changed(f) {
+                    // Generations and events only grow: it never holds again.
+                    Some(c) => {
+                        why = c;
+                        r.remove(i);
+                        continue;
+                    }
+                    None if ep_ok => {
+                        // (One step forward a hit: no move of the whole list.)
+                        if i > 0 {
+                            r.swap(i, i - 1);
+                        }
+                        return true;
+                    }
+                    None => why = C_EPOCH,
+                }
             }
-            return false;
-        };
-        if i > 0 {
-            let e = r.remove(i);
-            r.insert(0, e);
+            i += 1;
         }
-        true
+        if callers_on() {
+            caller_count(why, 1);
+        }
+        false
     })
+}
+
+/// What changed in `f`'s chunks (C_GENS) or host leaves (C_HOST) since it
+/// was found fine, compared as read (None: nothing).
+#[inline]
+fn changed(f: &Fine) -> Option<usize> {
+    let (c0, c1) = (((f.lo - MIRROR_BASE) >> CHUNK_SHIFT) as usize, ((f.hi - 1 - MIRROR_BASE) >> CHUNK_SHIFT) as usize);
+    for (k, &g) in (c0..=c1).zip(f.gens.iter()) {
+        let p = TABLE[k].load(Ordering::Acquire);
+        // (A chunk made later starts at generation 0.)
+        let now = if p.is_null() { 0 } else { unsafe { &*p }.cgen.load(Ordering::Acquire) };
+        if now != g {
+            return Some(C_GENS);
+        }
+    }
+    let (mut a, mut k) = (f.lo, 0);
+    while a < f.hi && k < FINE_LEAVES {
+        if crate::hosted::leaf_events(a) != f.host[k] {
+            return Some(C_HOST);
+        }
+        k += 1;
+        a = crate::hosted::leaf_end(a);
+    }
+    None
 }
 
 /// `DS_FE2_CALLERS=1` (diagnosis): placement checks counted by caller
@@ -637,6 +694,52 @@ fn word_ok(c: &Chunk, a: u64, e: u64, want: u32) -> u64 {
     ok
 }
 
+/// The checks' commonest counts, kept per thread and added to STATS and
+/// BY_SIZE every LOCAL_FLUSH checks (shared atomics on every check, from
+/// every recording thread, bounced their cache lines: ~45,000 checks a flip
+/// at the vista, four to six adds each). Slots: checks, their pages, range
+/// cache hits, checks needing nothing, chunks passed by their summary, then
+/// checks and pages per size class.
+const L_CHECKS: usize = 0;
+const L_PAGES: usize = 1;
+const L_HITS: usize = 2;
+const L_FAST: usize = 3;
+const L_SUMMARY: usize = 4;
+const L_CLASS: usize = 5;
+const LOCAL_SLOTS: usize = L_CLASS + 8;
+const LOCAL_FLUSH: u64 = 256;
+
+thread_local! {
+    static LOCAL: std::cell::RefCell<[u64; LOCAL_SLOTS]> = const { std::cell::RefCell::new([0; LOCAL_SLOTS]) };
+}
+
+#[inline]
+fn local_add(k: usize, n: u64) {
+    LOCAL.with(|l| l.borrow_mut()[k] += n);
+}
+
+/// A check of `pages` pages in size class `class` begins (the thread's
+/// counts go to the shared ones every LOCAL_FLUSH checks).
+#[inline]
+fn local_check(class: usize, pages: u64) {
+    LOCAL.with(|l| {
+        let mut l = l.borrow_mut();
+        l[L_CHECKS] += 1;
+        l[L_PAGES] += pages;
+        l[L_CLASS + 2 * class] += 1;
+        l[L_CLASS + 2 * class + 1] += pages;
+        if l[L_CHECKS] >= LOCAL_FLUSH {
+            for (k, s) in [(L_CHECKS, S_ENSURES), (L_PAGES, S_ENSURE_PAGES), (L_HITS, S_RANGE_HITS), (L_FAST, S_FAST), (L_SUMMARY, S_SUMMARY)] {
+                STATS[s].fetch_add(std::mem::take(&mut l[k]), Ordering::Relaxed);
+            }
+            for c in 0..4 {
+                BY_SIZE[c][0].fetch_add(std::mem::take(&mut l[L_CLASS + 2 * c]), Ordering::Relaxed);
+                BY_SIZE[c][1].fetch_add(std::mem::take(&mut l[L_CLASS + 2 * c + 1]), Ordering::Relaxed);
+            }
+        }
+    });
+}
+
 thread_local! {
     /// Scratch of `ensure`: runs to check, pages a take reported.
     static SCRATCH: std::cell::RefCell<(Vec<(u64, u64)>, Vec<u64>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
@@ -671,19 +774,17 @@ pub fn ensure(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn
 
 #[allow(clippy::too_many_arguments)]
 fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, mut defer: Option<&mut Vec<(u64, u64)>>) -> Result<(), &'static str> {
-    STATS[S_ENSURES].fetch_add(1, Ordering::Relaxed);
-    STATS[S_ENSURE_PAGES].fetch_add((hi - lo) / PAGE, Ordering::Relaxed);
-    let class = &BY_SIZE[size_class((hi - lo) / PAGE)];
-    class[0].fetch_add(1, Ordering::Relaxed);
-    class[1].fetch_add((hi - lo) / PAGE, Ordering::Relaxed);
+    let sc = size_class((hi - lo) / PAGE);
+    local_check(sc, (hi - lo) / PAGE);
+    let class = &BY_SIZE[sc];
     // Written ranges mark their pages GPU-written (kept unarmed) unless
     // `DS_FE2_ARM_GPU=1`; a range found fine with its marks set passes the
     // cache like a read one (marking every word on every use, ~430 words
     // for a pool of ~113 MB, made queue 0x50's dispatches slow).
     let gpu_writes = gpu_writes && !arm_gpu();
     if range_fine(lo, hi, want, gpu_writes) {
-        STATS[S_RANGE_HITS].fetch_add(1, Ordering::Relaxed);
-        STATS[S_FAST].fetch_add(1, Ordering::Relaxed);
+        local_add(L_HITS, 1);
+        local_add(L_FAST, 1);
         if callers_on() {
             caller_count(C_HITS, 1);
         }
@@ -712,7 +813,7 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
             if a & (CHUNK_BYTES - 1) == 0 && a + CHUNK_BYTES <= hi {
                 let c = chunk(a, true).expect("inside the span");
                 if !gpu_writes && summary_ok(c, a, want) {
-                    STATS[S_SUMMARY].fetch_add(1, Ordering::Relaxed);
+                    local_add(L_SUMMARY, 1);
                     if c.sum.load(Ordering::Acquire) as u32 != SUM_ARMED {
                         all_armed = false;
                     }
@@ -787,7 +888,7 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
             caller_since(C_SCAN, ts);
         }
         if bad.is_empty() {
-            STATS[S_FAST].fetch_add(1, Ordering::Relaxed);
+            local_add(L_FAST, 1);
             // (Not for ranges with pages the caller's batch uploaded: they are
             // fine for its batch only, until it is queued.)
             if let (true, Some((gens, host))) = (mine_none, snap) {
@@ -835,6 +936,8 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
             }
         }
         STATS[S_SLOW_NS].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        // (A long one is a hitch cause: `gpu::hitch`.)
+        super::hitch::note_since(super::hitch::Kind::Mirror, t0, || format!("check of {lo:#x}..{hi:#x}: {} runs, {} pages", bad.len(), bad.iter().map(|r| (r.1 - r.0) / PAGE).sum::<u64>()));
         Ok(())
     })
 }
@@ -865,6 +968,7 @@ fn take_run(a: u64, b: u64, frame: u64, arm: bool, armable: &Armable, written: &
     let t = tsc();
     let r = super::precache::take_written_for(a, b - a, written, None, crate::mem::WW_WHO_FE2);
     caller_since(C_TAKE, t);
+    super::hitch::note_since(super::hitch::Kind::Mirror, tt, || format!("take of {a:#x}..{b:#x} ({} pages)", (b - a) / PAGE));
     let tns = tt.elapsed().as_nanos() as u64;
     STATS[S_TAKE_NS].fetch_add(tns, Ordering::Relaxed);
     STATS[S_TAKES].fetch_add(1, Ordering::Relaxed);
@@ -885,6 +989,7 @@ fn take_run(a: u64, b: u64, frame: u64, arm: bool, armable: &Armable, written: &
 fn fix_run(a: u64, b: u64, ep: u32, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool) -> Result<(), &'static str> {
     // Uploads of the pages M lacks, as runs of consecutive ones (word by
     // word: only the invalid pages are looked at one by one).
+    let tu = std::time::Instant::now();
     let mut failed = false;
     let mut run: Option<(u64, u64)> = None;
     let mut flush = |run: &mut Option<(u64, u64)>, failed: &mut bool| {
@@ -924,9 +1029,13 @@ fn fix_run(a: u64, b: u64, ep: u32, mine: &dyn Fn(u64) -> bool, upload: &mut dyn
         x = e;
     }
     flush(&mut run, &mut failed);
+    // (Long parts are hitch causes: `gpu::hitch`.)
+    super::hitch::note_since(super::hitch::Kind::Mirror, tu, || format!("uploads of {a:#x}..{b:#x} into the mirror"));
     // Valid pages are clean in this epoch (uploaded ones become valid when
     // the caller's batch is queued: `uploaded`).
+    let tc = std::time::Instant::now();
     set_clean(a, b, ep, false);
+    super::hitch::note_since(super::hitch::Kind::Mirror, tc, || format!("clean marks of {a:#x}..{b:#x}"));
     if failed {
         return Err("an upload into the mirror failed");
     }
@@ -1097,7 +1206,9 @@ pub fn host_write_begin(base: u64, len: u64) {
     {
         // (An arming that checked before this is done by now, and the
         // caller's disarm after this undoes it: `arm_part`.)
+        let t = std::time::Instant::now();
         let _lock = crate::hosted::arm_lock();
+        super::hitch::note_since(super::hitch::Kind::Mirror, t, || format!("a file read into {base:#x}+{len:#x} waiting for an arming"));
         HOST_WRITES.lock().push((base, base.saturating_add(len)));
         HOST_WRITES_N.fetch_add(1, Ordering::AcqRel);
     }
@@ -1477,7 +1588,10 @@ fn arm_part(x: u64, y: u64, frame: u64) {
         return;
     }
     STATS[S_ARM_RUNS].fetch_add(1, Ordering::Relaxed);
-    if crate::hosted::arm(x, y - x).is_err() {
+    let t = std::time::Instant::now();
+    let r = crate::hosted::arm(x, y - x);
+    super::hitch::note_since(super::hitch::Kind::Mirror, t, || format!("arming {x:#x}+{:#x}", y - x));
+    if r.is_err() {
         STATS[S_ARM_FAILED].fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -1581,9 +1695,14 @@ pub fn cpu_written(pages: &[u64]) {
     for &p in pages {
         let Some(c) = chunk(p, false) else { continue };
         let (i, w) = (idx(p), idx(p) / 64);
-        c.valid[w].fetch_and(!(1u64 << (i % 64)), Ordering::AcqRel);
+        let bit = 1u64 << (i % 64);
+        // (The chunk's generation only for a page that was valid: ranges
+        // found fine cover valid pages only, and every thread's range cache
+        // reads it; an upload in flight still sees the word's generation.)
+        if c.valid[w].fetch_and(!bit, Ordering::AcqRel) & bit != 0 {
+            c.cgen.fetch_add(1, Ordering::AcqRel);
+        }
         c.wgen[w].fetch_add(1, Ordering::AcqRel);
-        c.cgen.fetch_add(1, Ordering::AcqRel);
         c.wrote[i].store(f, Ordering::Release);
         c.uses[w].store(0, Ordering::Relaxed);
         n += 1;
@@ -1610,9 +1729,13 @@ pub fn invalidate(base: u64, len: u64) {
         let e = word_end(x, hi);
         if let Some(c) = chunk(x, false) {
             let w = idx(x) / 64;
-            c.valid[w].fetch_and(!word_mask(x, e), Ordering::AcqRel);
+            let mask = word_mask(x, e);
+            // (The chunk's generation only where a page was valid, as
+            // `cpu_written`.)
+            if c.valid[w].fetch_and(!mask, Ordering::AcqRel) & mask != 0 {
+                c.cgen.fetch_add(1, Ordering::AcqRel);
+            }
             c.wgen[w].fetch_add(1, Ordering::AcqRel);
-            c.cgen.fetch_add(1, Ordering::AcqRel);
             for k in idx(x)..idx(x) + ((e - x) / PAGE) as usize {
                 c.wrote[k].store(f, Ordering::Release);
             }
@@ -1876,7 +1999,7 @@ pub fn status() -> String {
         })
         .collect();
     format!(
-        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes; faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity; CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); compute queues' views synchronized {} times ({} raised)\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
+        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes; faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity; CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
         s[S_ENSURES],
         s[S_ENSURE_PAGES],
         s[S_FAST],
@@ -1924,6 +2047,9 @@ pub fn status() -> String {
         spans.2,
         VIEW_SYNCS[0].load(Ordering::Relaxed),
         VIEW_SYNCS[1].load(Ordering::Relaxed),
+        VIEW_RAISES[0].load(Ordering::Relaxed),
+        VIEW_RAISES[1].load(Ordering::Relaxed),
+        super::resident::backed_mib(),
         sizes.join(", "),
         ["armed already", "GPU-written", "written lately", "too few clean epochs", "no settled window", "not plain read-write", "chunk held", "import list busy"]
             .iter()

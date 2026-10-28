@@ -1306,6 +1306,13 @@ pub fn back(base: u64, len: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Video memory backing the mirror so far, in MiB (pages are never
+/// unbound).
+pub fn backed_mib() -> u64 {
+    let page = MIRROR.get().map_or(64 << 10, |m| m.page);
+    (STATS[S_BACKED].load(Ordering::Relaxed) * page) >> 20
+}
+
 /// Runs `record` in a one-off command buffer on the main queue and waits.
 fn one_off(record: impl FnOnce(vk::CommandBuffer)) -> Result<(), String> {
     let c = ctx();

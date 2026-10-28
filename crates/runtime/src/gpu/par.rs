@@ -145,6 +145,9 @@ pub struct Run {
     /// A long run planned right after this one (`chain`): its first chunk's
     /// turn comes when this run's last chunk is posted.
     chained: Mutex<Option<Arc<Run>>>,
+    /// Front end 2: the command processor's view when it planned the run
+    /// (`fe2::gfx_views`; NO_VIEW: the epoch now).
+    pub fe2_view: u32,
 }
 
 /// A long parallel run (`tune long_runs`, RENDERER.md "Long parallel
@@ -254,6 +257,7 @@ impl Run {
             timed: false,
             long: None,
             chained: Mutex::new(None),
+            fe2_view: super::fe2::NO_VIEW,
         }
     }
 
@@ -638,6 +642,7 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         }
         let mut cp = w.cp.lock();
         cp.set_chunk_state(&state);
+        cp.fe2_set_view(run.fe2_view);
         cp.chunk_start(&run.main_writes, &run.main_submitted);
         cp.chunk_costs = run.timed.then(|| Vec::with_capacity(512));
         let long = run.long.as_ref();

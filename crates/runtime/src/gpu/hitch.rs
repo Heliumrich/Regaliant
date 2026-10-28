@@ -36,10 +36,14 @@ pub enum Kind {
     File,
     /// One command's recording, beyond the parts above.
     Record,
+    /// Keeping memory coherent: front end 2's placement checks (takes and
+    /// uploads) and armings (`gpu::fe2`), a file read waiting for an
+    /// arming, a mapping change waiting for the guest memory's readers.
+    Mirror,
 }
 
-const KINDS: usize = 7;
-const NAMES: [&str; KINDS + 1] = ["pipeline", "translation", "upload", "GPU wait", "CP wait", "file", "recording", "unexplained"];
+const KINDS: usize = 8;
+const NAMES: [&str; KINDS + 1] = ["pipeline", "translation", "upload", "GPU wait", "CP wait", "file", "recording", "memory", "unexplained"];
 
 /// Work shorter than this is not kept (us).
 const MIN_US: u64 = 2_000;

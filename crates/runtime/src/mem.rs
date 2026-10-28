@@ -864,6 +864,9 @@ fn note_host_call(k: usize, t0: std::time::Instant) {
     use std::sync::atomic::Ordering::Relaxed;
     HOST_CALLS[k].fetch_add(1, Relaxed);
     HOST_CALLS[k + 1].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    // (A long one, its waits for the guest memory's readers and armings
+    // included, is a hitch cause.)
+    crate::gpu::hitch::note_since(crate::gpu::hitch::Kind::Mirror, t0, || ["a commit", "", "a decommit", "", "", "a protection change", "", "an unmap note"].get(k).copied().unwrap_or("a host memory call").to_string());
 }
 
 /// This process's page faults so far.
@@ -911,22 +914,36 @@ fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     // Parts whose decommit was deferred are still committed with their old
     // contents: a new mapping starts zeroed, as after a decommit.
     let stale = cancel_deferred(addr, addr + size);
+    // (Its parts, when long, are hitch causes of their own: `gpu::hitch`.)
+    use crate::gpu::hitch::{note_since, Kind::Mirror};
     if !stale.is_empty() {
+        let t = std::time::Instant::now();
         let _readers_out = GUEST_READERS.write();
+        note_since(Mirror, t, || format!("a commit of {addr:#x}+{size:#x} waiting for the guest memory's readers"));
+        let t = std::time::Instant::now();
         for &(a, e) in &stale {
             let p = unsafe { VirtualAlloc(a as _, (e - a) as usize, MEM_COMMIT, PAGE_READWRITE) };
             if !p.is_null() {
                 unsafe { std::ptr::write_bytes(a as *mut u8, 0, (e - a) as usize) };
             }
         }
+        note_since(Mirror, t, || format!("a commit of {addr:#x}+{size:#x} zeroing {} bytes left by deferred decommits", stale.iter().map(|r| r.1 - r.0).sum::<u64>()));
     }
+    let t = std::time::Instant::now();
     let _arm = crate::gpu::resident::remap_guard();
+    note_since(Mirror, t, || format!("a commit of {addr:#x}+{size:#x} waiting for armings"));
     // Pages armed through the host read-write first: whether committing
     // already committed pages resets their protection is not ours to rely
     // on, and `settled` only clears their bits.
+    let t = std::time::Instant::now();
     crate::hosted::disarm(addr, size);
+    note_since(Mirror, t, || format!("a commit of {addr:#x}+{size:#x}: its disarm"));
+    let t = std::time::Instant::now();
     let p = unsafe { VirtualAlloc(addr as _, size as usize, MEM_COMMIT, win_prot(prot)) };
+    note_since(Mirror, t, || format!("a commit of {addr:#x}+{size:#x}: VirtualAlloc"));
+    let t = std::time::Instant::now();
     crate::gpu::resident::settled(addr, size);
+    note_since(Mirror, t, || format!("a commit of {addr:#x}+{size:#x}: its pages' states reset"));
     note_host_call(0, t0);
     if p.is_null() { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
 }
