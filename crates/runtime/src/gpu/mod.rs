@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 193] = [
+    static ALL: [Tunable; 194] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -226,6 +226,7 @@ pub mod tune {
         Tunable { name: "past_subs", env: "DS_PAST_SUBS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_park", env: "DS_PAR_PARK", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_seal", env: "DS_PAST_SEAL", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe2_gpu_waits", env: "DS_FE2_GPU_WAITS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2106,6 +2107,17 @@ pub mod tune {
     /// chunks get their turn.
     pub fn past_seal() -> bool {
         get(192) != 0
+    }
+
+    /// Front end 2: a label wait that passed on a GPU queue's write (a
+    /// promise, a latched CP write) ends no epoch; its queue's view becomes
+    /// at least the epoch the promise was made in (the writer's earlier
+    /// waits had all passed then), or the epoch now for a latched write.
+    /// Off, such waits count as released by the CPU: the epoch ends there
+    /// (~340 times a flip at the gate) and the queue's checks take its
+    /// GPU-written ranges again.
+    pub fn fe2_gpu_waits() -> bool {
+        get(193) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

@@ -340,6 +340,9 @@ pub struct Cp {
     last_wait_gpu: bool,
     /// How the last WAIT_REG_MEM passed (its `label_event` kind; diagnostics).
     last_wait_kind: u8,
+    /// The epoch the promise the last WAIT_REG_MEM passed on was made in (0:
+    /// this queue's own open promise; `tune fe2_gpu_waits`).
+    last_wait_epoch: u32,
     /// The end of the last run the planner found too short (no new plan
     /// until execution passes it: each command would scan the rest again).
     par_skip: (u64, u64),
@@ -1322,13 +1325,14 @@ static WAITED: parking_lot::Mutex<Option<HashSet<u64>>> = parking_lot::Mutex::ne
 
 /// Label values deferred CP writes will store: address -> (batch sequence,
 /// value, bytes, whether the CPU stores it after the batch completed rather
-/// than the GPU within it). A WAIT_REG_MEM that a promised value satisfies passes at
+/// than the GPU within it, when it was made, the epoch it was made in: its
+/// writer's waits before the write had all passed then). A WAIT_REG_MEM that a promised value satisfies passes at
 /// once and orders its queue after that batch (`Exec::depend_on`): its later
 /// GPU work follows the batch on the device queue, its CP writes wait for
 /// it, its CP reads wait for unfinished writers (`Exec::sync_for_reads`), so
 /// the command processors record ahead of the GPU instead of idling until
 /// each batch completes. `DS_PROMISES=0` turns this off.
-static PROMISES: parking_lot::Mutex<Option<HashMap<u64, (u64, u64, u8, bool, Instant)>>> = parking_lot::Mutex::new(None);
+static PROMISES: parking_lot::Mutex<Option<HashMap<u64, (u64, u64, u8, bool, Instant, u32)>>> = parking_lot::Mutex::new(None);
 /// Moves with every promise made: a polling wait looks at the promises
 /// again only then (one that did not satisfy it cannot start to; it can
 /// only go stale). Every poll took PROMISES' lock before: ~6% of the
@@ -1368,22 +1372,26 @@ pub(super) fn promise(seq: u64, addr: u64, value: u64, bytes: u8, by_cpu: bool) 
         let done = super::exec::completed_seq();
         m.retain(|_, p| p.0 > done);
     }
-    m.insert(addr, (seq, value, bytes, by_cpu, Instant::now()));
+    // (Made where its writer's batch was submitted, or for a CP effect
+    // recorded by a command processor holding nothing: every wait before
+    // the write had passed, so the CPU writes the title ordered before it
+    // are older than this epoch.)
+    m.insert(addr, (seq, value, bytes, by_cpu, Instant::now(), super::precache::epoch() as u32));
     drop(g);
     PROMISE_GEN.fetch_add(1, Ordering::Release);
     wake_label(addr, bytes);
 }
 
-/// The batch whose promised write to `addr` satisfies the comparison, and
-/// whether the CPU performs that write.
-fn promised(addr: u64, wide: bool, func: u32, mask: u64, reference: u64) -> Option<(u64, bool)> {
+/// The batch whose promised write to `addr` satisfies the comparison,
+/// whether the CPU performs that write, and the epoch it was promised in.
+fn promised(addr: u64, wide: bool, func: u32, mask: u64, reference: u64) -> Option<(u64, bool, u32)> {
     let g = PROMISES.lock();
-    let &(seq, value, bytes, by_cpu, _) = g.as_ref()?.get(&addr)?;
+    let &(seq, value, bytes, by_cpu, _, epoch) = g.as_ref()?.get(&addr)?;
     if seq <= super::exec::completed_seq() || (wide && bytes < 8) {
         return None;
     }
     let v = if wide { value } else { value & 0xFFFF_FFFF };
-    compare(func, v & mask, reference & mask).then_some((seq, by_cpu))
+    compare(func, v & mask, reference & mask).then_some((seq, by_cpu, epoch))
 }
 const LABEL_LOG_CAP: usize = 1 << 15;
 
@@ -1705,7 +1713,7 @@ fn long_wait(waiter: &str, a: u64, wide: bool, func: u32, mask: u64, reference: 
     if traced || LONG_WAITS_LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
         let promise = match p {
             None => "none".to_string(),
-            Some((seq, v, bytes, by_cpu, t)) => {
+            Some((seq, v, bytes, by_cpu, t, _)) => {
                 let since = t.checked_duration_since(t0).map(|d| format!("{:.2} ms into the wait", d.as_secs_f64() * 1e3)).unwrap_or_else(|| format!("{:.2} ms before the wait", t0.duration_since(t).as_secs_f64() * 1e3));
                 let vv = if wide { v } else { v & 0xFFFF_FFFF };
                 format!("batch {seq} ({}; completed through {}), value {v:#x} ({bytes} bytes{}), made {since}, satisfies: {}", if by_cpu { "CPU after it" } else { "GPU in it" }, super::exec::completed_seq(), "", !(wide && bytes < 8) && compare(func, vv & mask, reference & mask))
@@ -1835,6 +1843,7 @@ impl Cp {
             run_costs_pruned: u64::MAX,
             last_wait_gpu: false,
             last_wait_kind: b'-',
+            last_wait_epoch: 0,
             held: None,
             main_gfx: name == "gpu-gfx",
             past: None,
@@ -2079,7 +2088,7 @@ impl Cp {
                 }
                 return self.held_passed(if spins == 0 { 2 } else { 4 });
             }
-            if let Some((seq, by_cpu)) = promised(a, wide, func, mask, reference) {
+            if let Some((seq, by_cpu, _)) = promised(a, wide, func, mask, reference) {
                 if let Some(e) = self.exec.as_mut() {
                     e.depend_on(seq, by_cpu);
                 }
@@ -2322,6 +2331,15 @@ impl Cp {
             self.fe2_sync(None);
             return;
         }
+        // Front end 2: passed on another queue's promise or a latched CP
+        // write, no CPU write released the wait: the CPU writes the title
+        // ordered before it came before the writer's synchronization, which
+        // the promise's epoch (or the epoch now) covers; no epoch ends.
+        if self.last_wait_gpu && super::fe2::on() && super::tune::fe2_gpu_waits() {
+            EPOCH_GPU_WAITS.fetch_add(1, Ordering::Relaxed);
+            self.fe2_adopt_epoch(if self.last_wait_kind == b'P' { self.last_wait_epoch } else { super::precache::epoch() as u32 });
+            return;
+        }
         if self.last_wait_gpu && super::tune::epoch_gpu_waits() {
             EPOCH_GPU_WAITS.fetch_add(1, Ordering::Relaxed);
             self.fe2_adopt(last_write(a).map(|w| w.0).as_deref());
@@ -2397,6 +2415,15 @@ impl Cp {
         }
     }
 
+    /// This queue's checks need at least epoch `v` from here on (`tune
+    /// fe2_gpu_waits`); one without a view yet takes the epoch now.
+    fn fe2_adopt_epoch(&self, v: u32) {
+        if let Some(c) = self.fe2_view.as_ref() {
+            let v = if c.load(Ordering::Acquire) == super::fe2::NO_VIEW { super::precache::epoch() as u32 } else { v };
+            self.fe2_sync(Some(v));
+        }
+    }
+
     /// What the batches this worker closed write (`DS_RUN_PROBE`).
     pub fn worker_writes(&self) -> super::ranges::Ranges {
         self.exec.as_ref().map(|e| e.closed_writes()).unwrap_or_default()
@@ -2423,10 +2450,11 @@ impl Cp {
     /// to their label or on memory now (or a promise). A wait passed on a
     /// value the CPU wrote sets `cpu_wait`: the copy cache's scope ends when
     /// the run is planned, before any of it is recorded. One passed on a
-    /// value a GPU queue's CP wrote or promised notes that queue in
-    /// `writers` (None: not known): under front end 2 the planner adopts
-    /// their views, as passing the wait would.
-    fn long_passes(opc: u32, n: u64, at: u64, p: &dyn Fn(u64) -> u32, labels: &mut Vec<RunLabel>, cpu_wait: &mut bool, writers: &mut Vec<Option<String>>) -> bool {
+    /// value a GPU queue's CP wrote or promised notes in `writers` the epoch
+    /// its passing would need: that queue's view (the epoch now for one
+    /// without), or with `tune fe2_gpu_waits` a promise's epoch; under front
+    /// end 2 the planner adopts them, as passing the wait would.
+    fn long_passes(opc: u32, n: u64, at: u64, p: &dyn Fn(u64) -> u32, labels: &mut Vec<RunLabel>, cpu_wait: &mut bool, writers: &mut Vec<u32>) -> bool {
         match opc {
             op::EVENT_WRITE | op::ACQUIRE_MEM | op::PFP_SYNC_ME | op::CLEAR_STATE => true,
             op::WRITE_DATA => {
@@ -2484,19 +2512,18 @@ impl Cp {
                 }
                 let v = if wide { unsafe { rd64(a) } } else { (unsafe { rd32(a) }) as u64 };
                 let last = last_write(a);
+                let view = |q: Option<String>| q.as_deref().and_then(super::fe2::view_of).unwrap_or_else(|| super::precache::epoch() as u32);
                 if compare(func, v & mask, reference & mask) {
                     let by_gpu = last.as_ref().is_some_and(|(q, w, _)| q.starts_with("gpu-") && if wide { *w == v } else { *w as u32 == v as u32 });
                     if by_gpu {
-                        writers.push(last.map(|w| w.0));
+                        writers.push(view(last.map(|w| w.0)));
                     } else {
                         *cpu_wait = true;
                     }
                     return true;
                 }
-                if promised(a, wide, func, mask, reference).is_none() {
-                    return false;
-                }
-                writers.push(last.map(|w| w.0).filter(|q| q.starts_with("gpu-")));
+                let Some((_, _, epoch)) = promised(a, wide, func, mask, reference) else { return false };
+                writers.push(if super::tune::fe2_gpu_waits() { epoch } else { view(last.map(|w| w.0).filter(|q| q.starts_with("gpu-"))) });
                 true
             }
             _ => false,
@@ -2652,7 +2679,7 @@ impl Cp {
         let mut labels: Vec<RunLabel> = seed.as_ref().map(|s| s.0.iter().map(|l| RunLabel { at: 0, ..*l }).collect()).unwrap_or_default();
         let mut soft = false;
         let mut cpu_wait = false;
-        let mut writers: Vec<Option<String>> = Vec::new();
+        let mut writers: Vec<u32> = Vec::new();
         // The run's signature: its packet headers (opcode and size), the
         // same when the title records the same pass again.
         let mut sig = 0xcbf2_9ce4_8422_2325u64;
@@ -3010,8 +3037,8 @@ impl Cp {
         if soft {
             // Waits passed on other queues' labels: their views (front end
             // 2), as passing them would adopt.
-            for w in &writers {
-                self.fe2_adopt(w.as_deref());
+            for &v in &writers {
+                self.fe2_adopt_epoch(v);
             }
         }
         let queue = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
@@ -6339,11 +6366,12 @@ impl Cp {
             label_event(&self.name, b'I', a, v0, reference, at);
             return Flow::Next;
         }
-        if let Some((seq, by_cpu)) = promised(a, wide, func, mask, reference) {
+        if let Some((seq, by_cpu, epoch)) = promised(a, wide, func, mask, reference) {
             if let Some(e) = self.exec.as_mut() {
                 e.depend_on(seq, by_cpu);
                 PROMISED.fetch_add(1, Ordering::Relaxed);
                 self.last_wait_kind = b'P';
+                self.last_wait_epoch = epoch;
                 label_event(&self.name, b'P', a, v0, reference, at);
                 self.last_wait_gpu = true;
                 return Flow::Next;
@@ -6373,6 +6401,7 @@ impl Cp {
                     e.order_after_open_writes();
                 }
                 self.last_wait_kind = b'P';
+                self.last_wait_epoch = 0;
                 label_event(&self.name, b'P', a, v0, reference, at);
                 self.last_wait_gpu = true;
                 return Flow::Next;
@@ -6514,10 +6543,11 @@ impl Cp {
         // Passed on a promise (its batch may have completed meanwhile).
         let mut kind = if latched { b'L' } else { b'E' };
         if !in_memory && !latched {
-            if let (Some((seq, by_cpu)), Some(e)) = (promised(a, wide, func, mask, reference), self.exec.as_mut()) {
+            if let (Some((seq, by_cpu, epoch)), Some(e)) = (promised(a, wide, func, mask, reference), self.exec.as_mut()) {
                 e.depend_on(seq, by_cpu);
                 PROMISED.fetch_add(1, Ordering::Relaxed);
                 kind = b'P';
+                self.last_wait_epoch = epoch;
             }
         }
         self.last_wait_kind = kind;

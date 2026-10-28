@@ -2420,6 +2420,7 @@ pub fn status() -> String {
     let s: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let k = counters();
     let spans = super::exec::fe2_span_census();
+    let ends = super::precache::epoch_ends();
     let ms = |ns: u64| ns as f64 / 1e6;
     let sizes: Vec<String> = ["<64K", "<1M", "<16M", ">=16M"]
         .iter()
@@ -2430,7 +2431,7 @@ pub fn status() -> String {
         })
         .collect();
     format!(
-        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity; CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
+        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity; CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
         s[S_ENSURES],
         s[S_ENSURE_PAGES],
         s[S_FAST],
@@ -2484,6 +2485,10 @@ pub fn status() -> String {
         VIEW_SYNCS[1].load(Ordering::Relaxed),
         VIEW_RAISES[0].load(Ordering::Relaxed),
         VIEW_RAISES[1].load(Ordering::Relaxed),
+        ends[0],
+        ends[1],
+        ends[2],
+        super::cp::EPOCH_GPU_WAITS.load(Ordering::Relaxed),
         super::resident::backed_mib(),
         sizes.join(", "),
         ["armed already", "GPU-written", "written lately", "too few clean epochs", "no settled window", "not plain read-write", "chunk held", "import list busy"]

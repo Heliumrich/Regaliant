@@ -339,6 +339,11 @@ static ENDS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// ENDS at the last `profile reset` (`window_line`).
 static ENDS_SNAP: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// Epochs ended since boot by reason (`ENDS`; front end 2's status).
+pub fn epoch_ends() -> [u64; 3] {
+    [0, 1, 2].map(|i| ENDS[i].load(Ordering::Relaxed))
+}
+
 /// Shared copies on (`tune pre_share`, and the guest range write-watched).
 pub fn enabled() -> bool {
     super::tune::pre_share() && crate::mem::write_watched()
