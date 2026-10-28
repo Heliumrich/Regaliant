@@ -3898,6 +3898,28 @@ static CP_WRITES: RangeLog = RangeLog::new();
 
 /// Held executors' reads of their own held writes logged (diagnostics).
 static HELD_OWN_LOGGED: AtomicU64 = AtomicU64::new(0);
+/// Stretches past label waits stopped because a preparation read what the
+/// stretch's own held batches write, by (the reading stages, the first range
+/// read that overlaps, which held writes: 0 the recording batch's, 1 a closed
+/// batch's, 2 the main command processor's): count (`held_own_line`).
+static HELD_OWN: Mutex<Option<HashMap<(u64, u64, u64, u64, u8), u64>>> = Mutex::new(None);
+
+/// One status line: the commonest reads of held work's own writes that
+/// stopped a stretch past a label wait ("" before any).
+fn held_own_line() -> String {
+    let g = HELD_OWN.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(&(u64, u64, u64, u64, u8), &u64)> = m.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1));
+    let total: u64 = m.values().sum();
+    let top: Vec<String> = v
+        .iter()
+        .take(10)
+        .map(|((s0, s1, a, n, by), c)| format!("{c}x stages {s0:#x} {s1:#x} read {a:#x}+{n:#x} ({})", ["the recording batch's writes", "a closed batch's", "the main CP's"][*by as usize]))
+        .collect();
+    format!("    stretches past label waits stopped by reads of their own held writes: {total} ({} kinds): {}
+", m.len(), top.join("; "))
+}
 
 /// What the batches submitted and the CP writes recorded while the
 /// graphics CP records past a compute queue's label wait write
@@ -10346,6 +10368,23 @@ impl Exec {
                     wait_done(s);
                 }
             } else {
+                if self.past_grow {
+                    // (Diagnostics: by reader and range, `held_own_line`.)
+                    let hit = reads.iter().find_map(|&r| {
+                        if self.pending.overlaps_any(&[r]) {
+                            Some((r, 0u8))
+                        } else if self.closed_overlap(&[r]) {
+                            Some((r, 1))
+                        } else if self.main_pending(&[r]) {
+                            Some((r, 2))
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(((a, n), by)) = hit {
+                        *HELD_OWN.lock().get_or_insert_with(HashMap::new).entry((self.sync_readers[0], self.sync_readers[1], a, n, by)).or_default() += 1;
+                    }
+                }
                 if self.past_grow && HELD_OWN_LOGGED.fetch_add(1, Ordering::Relaxed) < 12 {
                     // Diagnostics: what a held executor read of its own held work.
                     let hits: Vec<String> = reads
@@ -13962,6 +14001,7 @@ pub fn status() -> String {
         + &super::compile::status()
         + &async_line()
         + &super::cp::past_wait_status()
+        + &held_own_line()
         + &super::rgm::status_line(super::FRAMES.load(Ordering::Relaxed))
         + &super::par::status()
         + &super::keep::status()
