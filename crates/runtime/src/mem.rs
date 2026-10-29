@@ -355,6 +355,57 @@ fn revalidate(runs: &mut Vec<(u64, u64, bool)>, from: u64, to: u64) -> bool {
     true
 }
 
+thread_local! {
+    /// This thread's recently found mappings (`vma_bounds`): [start, end),
+    /// sorted and disjoint, valid for one MAP_GEN value.
+    static VMAS: std::cell::RefCell<(u64, Vec<(u64, u64)>)> = const { std::cell::RefCell::new((u64::MAX, Vec::new())) };
+}
+
+/// Mappings cached per thread (`vma_bounds`).
+const VMA_CACHED: usize = 256;
+
+/// [start, end) of the guest mapping holding `a` as the mapping table has
+/// it (None in a gap or a reservation), from a per-thread cache while the
+/// table has not changed since (`tune vma_cache`: the GPU executors look up
+/// every range of a GPU-resolved command's chains and every unsized
+/// binding, and the table's lock is shared with the title's threads).
+pub fn vma_bounds(a: u64) -> Option<(u64, u64)> {
+    let generation = MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
+    let hit = VMAS.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0 != generation {
+            c.0 = generation;
+            c.1.clear();
+            return None;
+        }
+        let i = c.1.partition_point(|r| r.0 <= a);
+        i.checked_sub(1).map(|i| c.1[i]).filter(|r| a < r.1)
+    });
+    if hit.is_some() {
+        return hit;
+    }
+    let found = {
+        let st = MEM.lock();
+        st.find(a).filter(|v| v.kind != VmaKind::Reserved).map(|v| (v.start, v.end()))
+    };
+    if let Some((s, e)) = found {
+        VMAS.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.0 != generation {
+                c.0 = generation;
+                c.1.clear();
+            }
+            c.1.retain(|r| r.1 <= s || e <= r.0);
+            if c.1.len() >= VMA_CACHED {
+                c.1.clear();
+            }
+            let i = c.1.partition_point(|r| r.0 < s);
+            c.1.insert(i, (s, e));
+        });
+    }
+    found
+}
+
 /// Cached runs per thread (`tune span_runs`: READABLE_RUNS_WIDE).
 const READABLE_RUNS: usize = 64;
 const READABLE_RUNS_WIDE: usize = 512;

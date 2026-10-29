@@ -716,6 +716,9 @@ pub(super) fn fe2_precheck_stage(found: &super::shaders::Found) {
 
 /// Guest mapping containing `addr`: [start, end) of its VMA.
 fn mapping(addr: u64) -> Option<(u64, u64)> {
+    if super::tune::vma_cache() {
+        return crate::mem::vma_bounds(addr);
+    }
     let st = crate::mem::MEM.lock();
     let v = st.find(addr)?;
     if v.kind == crate::mem::VmaKind::Reserved {
@@ -7222,6 +7225,111 @@ const F3_MINE_PAGES: u64 = 4;
 /// Runs a batch remembers as placed (`Exec::f3_placed`).
 const F3_PLACED_MAX: usize = 4096;
 
+/// `DS_F3_REGIONS=1` (diagnosis): per GPU-resolved stage program, its F3
+/// calls (`Exec::fe2_gpu_ranges`) and the guest mappings its per-item chains
+/// reach: the buffers placed in the mirror, the per-item blocks the shader
+/// loads through the page table (FRONTEND2.md "F3": step two's regions).
+fn f3_regions_on() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_F3_REGIONS").ok().as_deref() == Some("1"))
+}
+
+#[derive(Default)]
+struct F3Regions {
+    calls: u64,
+    /// The mappings [start, end) reached by buffers, by loads.
+    bufs: HashSet<(u64, u64)>,
+    loads: HashSet<(u64, u64)>,
+    /// Ranges seen, by kind, and those outside any mapping.
+    buf_ranges: u64,
+    load_ranges: u64,
+    unmapped: u64,
+}
+
+static F3_REGIONS: Mutex<Option<HashMap<u64, F3Regions>>> = Mutex::new(None);
+
+/// A GPU-resolved stage of program `addr` with per-item `loads` and `bufs`
+/// (`f3_regions_on`).
+fn note_f3_regions(addr: u64, loads: &[(u64, u64)], bufs: &[(u64, u64)]) {
+    let mut g = F3_REGIONS.lock();
+    let e = g.get_or_insert_with(HashMap::new).entry(addr).or_default();
+    e.calls += 1;
+    for (list, is_buf) in [(bufs, true), (loads, false)] {
+        for &(a, n) in list {
+            if a == 0 || n == 0 {
+                continue;
+            }
+            match crate::mem::vma_bounds(a) {
+                Some(m) => {
+                    if is_buf {
+                        e.buf_ranges += 1;
+                        e.bufs.insert(m);
+                    } else {
+                        e.load_ranges += 1;
+                        e.loads.insert(m);
+                    }
+                }
+                None => e.unmapped += 1,
+            }
+        }
+    }
+}
+
+/// Clears the census (`profile reset`).
+pub fn reset_f3_regions() {
+    *F3_REGIONS.lock() = None;
+}
+
+/// The census (`DS_F3_REGIONS=1`; "" otherwise).
+pub fn f3_regions_line() -> String {
+    if !f3_regions_on() {
+        return String::new();
+    }
+    let g = F3_REGIONS.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mib = |s: &HashSet<(u64, u64)>| s.iter().map(|&(a, b)| b - a).sum::<u64>() as f64 / (1u64 << 20) as f64;
+    let mut all_bufs: HashSet<(u64, u64)> = HashSet::new();
+    let mut all_loads: HashSet<(u64, u64)> = HashSet::new();
+    let calls: u64 = m.values().map(|e| e.calls).sum();
+    // Calls by how many mappings their program's buffers reached: 1, 2, 3-4,
+    // 5-8, more.
+    let mut by_count = [0u64; 5];
+    for e in m.values() {
+        all_bufs.extend(e.bufs.iter().copied());
+        all_loads.extend(e.loads.iter().copied());
+        let k = match e.bufs.len() {
+            0 | 1 => 0,
+            2 => 1,
+            3..=4 => 2,
+            5..=8 => 3,
+            _ => 4,
+        };
+        by_count[k] += e.calls;
+    }
+    let mut top: Vec<(&u64, &F3Regions)> = m.iter().collect();
+    top.sort_by(|a, b| b.1.calls.cmp(&a.1.calls));
+    let tops: Vec<String> = top
+        .iter()
+        .take(10)
+        .map(|(a, e)| format!("{a:#x}: {} calls, buffers {:.1} ranges a call in {} mappings ({:.1} MiB), loads {:.1} in {} ({:.1} MiB), {} unmapped", e.calls, e.buf_ranges as f64 / e.calls.max(1) as f64, e.bufs.len(), mib(&e.bufs), e.load_ranges as f64 / e.calls.max(1) as f64, e.loads.len(), mib(&e.loads), e.unmapped))
+        .collect();
+    let pct = |n: u64| 100.0 * n as f64 / calls.max(1) as f64;
+    format!(
+        "    stage F3's regions (`DS_F3_REGIONS`): {} programs, {calls} calls; the buffers their chains reach in {} mappings ({:.1} MiB), the per-item blocks in {} ({:.1} MiB); calls by their program's buffer mappings: 1 {:.1}%, 2 {:.1}%, 3-4 {:.1}%, 5-8 {:.1}%, more {:.1}%; by calls: {}\n",
+        m.len(),
+        all_bufs.len(),
+        mib(&all_bufs),
+        all_loads.len(),
+        mib(&all_loads),
+        pct(by_count[0]),
+        pct(by_count[1]),
+        pct(by_count[2]),
+        pct(by_count[3]),
+        pct(by_count[4]),
+        tops.join("; ")
+    )
+}
+
 /// Status part of stage F3 ("" unless front end 2 is on).
 pub fn f3_line() -> String {
     if !super::fe2::on() {
@@ -9109,6 +9217,9 @@ impl Exec {
         // the batches queued from now on); outside the span the shader reads
         // zeros, which the CPU path would not for readable memory there.
         loads.retain(|&(a, n)| a != 0 && n != 0);
+        if f3_regions_on() {
+            note_f3_regions(addr, loads, ranges);
+        }
         for &(a, n) in loads.iter() {
             if !super::fe2::in_span(a, n) {
                 if super::cp::guest_readable(a, n) {

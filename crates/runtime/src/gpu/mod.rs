@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 215] = [
+    static ALL: [Tunable; 216] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -248,6 +248,7 @@ pub mod tune {
         Tunable { name: "span_runs", env: "DS_SPAN_RUNS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "log_big", env: "DS_LOG_BIG", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_mine_fast", env: "DS_FE2_MINE_FAST", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "vma_cache", env: "DS_VMA_CACHE", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2330,6 +2331,17 @@ pub mod tune {
         get(214) != 0
     }
 
+    /// The GPU executors' lookups of a guest mapping's bounds (every range
+    /// of a GPU-resolved command's chains, every unsized binding) from a
+    /// per-thread cache valid while the mapping table has not changed
+    /// (`mem::vma_bounds`; 0: under the table's lock each time). Default
+    /// since 2026-10-29 night (replay A/Bs: CPU per command 0.992 with F3,
+    /// 0.998 without).
+    #[inline]
+    pub fn vma_cache() -> bool {
+        get(215) != 0
+    }
+
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
     /// without appends).
     #[inline]
@@ -3241,6 +3253,7 @@ pub fn reset_profile() {
     crate::guestprof::reset();
     fe2::reset_callers();
     fe2census::reset();
+    exec::reset_f3_regions();
 }
 
 /// The profile so far (`profile report` control command).
@@ -3253,6 +3266,7 @@ pub fn profile_report() -> String {
     s.push_str(&cp::classes_line());
     s.push_str(&cp::cb_census_line());
     s.push_str(&exec::write_logs_line());
+    s.push_str(&exec::f3_regions_line());
     s.push_str(&exec::race_line());
     s.push_str(&forward::status_line());
     s.push_str(&fe2::callers_line());
