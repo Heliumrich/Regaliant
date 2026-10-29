@@ -2151,7 +2151,7 @@ impl Exec {
         }
         if super::laps() {
             if first {
-                super::DRAW_STEPS_FIRST[18].fetch_add(1, Ordering::Relaxed);
+                super::DRAW_STEPS_FIRST[kind][18].fetch_add(1, Ordering::Relaxed);
             } else {
                 super::DRAW_STEPS[kind][18].fetch_add(1, Ordering::Relaxed);
             }

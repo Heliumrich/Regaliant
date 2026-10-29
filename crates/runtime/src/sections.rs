@@ -518,6 +518,103 @@ pub fn alias_slot_for(a: u64, n: u64) -> Option<u8> {
 mod tests {
     use super::*;
 
+    /// A mixed guest range (FINDINGS.md 2026-10-29): placeholders replaced
+    /// by private memory that keeps write watching beside a section view and
+    /// its alias, so that mappings GPU work writes and the CPU leaves alone
+    /// could be views (their guest pages armed behind never-protected alias
+    /// imports) while the rest keeps write watching. Raw calls in a private
+    /// range of their own (no `reserve`).
+    #[test]
+    fn write_watch_beside_views() {
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        const WRITE_WATCH_FLAG_RESET: u32 = 1;
+        let base = 0x6100_0000_0000u64;
+        let m = 4u64 << 20;
+        unsafe {
+            // Three placeholders: [private][private][view].
+            let p = VirtualAlloc2(std::ptr::null_mut(), base as _, (3 * m) as usize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0);
+            assert!(!p.is_null(), "placeholder: error {}", GetLastError());
+            assert!(VirtualFree(base as _, m as usize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0, "split 1: error {}", GetLastError());
+            assert!(VirtualFree((base + m) as _, m as usize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0, "split 2: error {}", GetLastError());
+            for k in 0..2 {
+                let q = VirtualAlloc2(std::ptr::null_mut(), (base + k * m) as _, m as usize, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | MEM_WRITE_WATCH, PAGE_READWRITE, std::ptr::null_mut(), 0);
+                assert!(!q.is_null(), "private write-watched memory in placeholder {k}: error {}", GetLastError());
+            }
+            let sec = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, m as u32, std::ptr::null());
+            assert!(!sec.is_null());
+            let v = MapViewOfFile3(sec, GetCurrentProcess(), (base + 2 * m) as _, 0, m as usize, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
+            assert!(!v.Value.is_null(), "view: error {}", GetLastError());
+            // Writes in the first private part are reported there alone.
+            std::ptr::write_volatile((base + 0x1000) as *mut u32, 1);
+            std::ptr::write_volatile((base + 0x5000) as *mut u32, 2);
+            std::ptr::write_volatile((base + m + 0x3000) as *mut u32, 3);
+            std::ptr::write_volatile((base + 2 * m + 0x2000) as *mut u32, 4);
+            let mut addrs = [std::ptr::null_mut::<std::ffi::c_void>(); 16];
+            let (mut count, mut gran) = (addrs.len(), 0u32);
+            let r = GetWriteWatch(WRITE_WATCH_FLAG_RESET, base as _, m as usize, addrs.as_mut_ptr(), &mut count, &mut gran);
+            assert_eq!(r, 0, "query of the first part: error {}", GetLastError());
+            let got: Vec<u64> = addrs[..count].iter().map(|&a| a as u64 - base).collect();
+            assert_eq!(got, vec![0x1000, 0x5000], "pages written in the first part");
+            // The second part on its own.
+            let (mut count, mut gran) = (addrs.len(), 0u32);
+            let r = GetWriteWatch(WRITE_WATCH_FLAG_RESET, (base + m) as _, m as usize, addrs.as_mut_ptr(), &mut count, &mut gran);
+            assert_eq!(r, 0, "query of the second part: error {}", GetLastError());
+            assert_eq!(count, 1);
+            // A query across both private parts (two allocations): whether
+            // one query may span them (takes would otherwise split).
+            std::ptr::write_volatile((base + 0x2000) as *mut u32, 5);
+            let (mut count, mut gran) = (addrs.len(), 0u32);
+            let r = GetWriteWatch(0, base as _, (2 * m) as usize, addrs.as_mut_ptr(), &mut count, &mut gran);
+            eprintln!("write_watch_beside_views: a query across two write-watched allocations returned {r} (error {}), {count} pages", if r != 0 { GetLastError() } else { 0 });
+            // The view is protectable while its alias is not (the scheme's
+            // premise), and its pages report nothing to write watching.
+            let mut old = 0u32;
+            assert!(VirtualProtect((base + 2 * m) as _, 0x1000, windows_sys::Win32::System::Memory::PAGE_READONLY, &mut old) != 0);
+            assert!(VirtualProtect((base + 2 * m) as _, 0x1000, PAGE_READWRITE, &mut old) != 0);
+            UnmapViewOfFile2(GetCurrentProcess(), v, 0);
+            windows_sys::Win32::Foundation::CloseHandle(sec);
+            VirtualFree(base as _, 0, MEM_RELEASE);
+            VirtualFree((base + m) as _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// The same at the guest's 16 KiB granularity: a placeholder split at
+    /// 16 KiB, a 16 KiB private write-watched allocation in it beside a 16
+    /// KiB view, and an allocation released back to a placeholder and
+    /// coalesced (a mapping unmapped).
+    #[test]
+    fn write_watch_at_16k() {
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let base = 0x6200_0000_0000u64;
+        let k = 16u64 << 10;
+        unsafe {
+            let p = VirtualAlloc2(std::ptr::null_mut(), base as _, (4 * k) as usize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0);
+            assert!(!p.is_null(), "placeholder: error {}", GetLastError());
+            for i in 0..3 {
+                assert!(VirtualFree((base + i * k) as _, k as usize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0, "split at {i}: error {}", GetLastError());
+            }
+            let q = VirtualAlloc2(std::ptr::null_mut(), (base + k) as _, k as usize, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | MEM_WRITE_WATCH, PAGE_READWRITE, std::ptr::null_mut(), 0);
+            assert!(!q.is_null(), "a 16 KiB private write-watched allocation: error {}", GetLastError());
+            let sec = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, k as u32, std::ptr::null());
+            let v = MapViewOfFile3(sec, GetCurrentProcess(), (base + 2 * k) as _, 0, k as usize, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
+            assert!(!v.Value.is_null(), "a 16 KiB view: error {}", GetLastError());
+            std::ptr::write_volatile((base + k + 0x2000) as *mut u32, 1);
+            let mut addrs = [std::ptr::null_mut::<std::ffi::c_void>(); 8];
+            let (mut count, mut gran) = (addrs.len(), 0u32);
+            assert_eq!(GetWriteWatch(1, (base + k) as _, k as usize, addrs.as_mut_ptr(), &mut count, &mut gran), 0, "query: error {}", GetLastError());
+            assert_eq!((count, addrs[0] as u64), (1, base + k + 0x2000));
+            // Unmapped: back to a placeholder, coalesced with its neighbour.
+            assert!(VirtualFree((base + k) as _, k as usize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0, "release to a placeholder: error {}", GetLastError());
+            assert!(VirtualFree(base as _, (2 * k) as usize, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0, "coalesce: error {}", GetLastError());
+            UnmapViewOfFile2(GetCurrentProcess(), v, 0);
+            windows_sys::Win32::Foundation::CloseHandle(sec);
+            VirtualFree(base as _, 0, MEM_RELEASE);
+            VirtualFree((base + 3 * k) as _, 0, MEM_RELEASE);
+        }
+    }
+
     /// Views, splits, aliases and contents that follow the section pages,
     /// in a private test range.
     #[test]

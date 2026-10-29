@@ -5736,9 +5736,9 @@ pub(super) const DRAW_STEP_NAMES: [&str; 18] = [
 /// and then the count of dispatches recorded to the end.
 pub(super) static CS_STEPS: [[AtomicU64; CS_STEP_COUNT + 1]; 8] = [const { [const { AtomicU64::new(0) }; CS_STEP_COUNT + 1] }; 8];
 /// Steps of draws and dispatches that were their batch's first command
-/// (`place_lines`), the count last.
-pub(super) static DRAW_STEPS_FIRST: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
-pub(super) static CS_STEPS_FIRST: [AtomicU64; CS_STEP_COUNT + 1] = [const { AtomicU64::new(0) }; CS_STEP_COUNT + 1];
+/// (`place_lines`), by kind (`DRAW_KINDS`, `CS_KINDS`), the count last.
+pub(super) static DRAW_STEPS_FIRST: [[AtomicU64; 19]; 3] = [const { [const { AtomicU64::new(0) }; 19] }; 3];
+pub(super) static CS_STEPS_FIRST: [[AtomicU64; CS_STEP_COUNT + 1]; 8] = [const { [const { AtomicU64::new(0) }; CS_STEP_COUNT + 1] }; 8];
 const CS_STEP_COUNT: usize = 20;
 pub(super) const CS_STEP_NAMES: [&str; CS_STEP_COUNT] = [
     "prepare", "shader-read sync", "texture sync", "image hazards", "pipeline", "reserve", "bind", "sgpr data", "set alloc",
@@ -6075,10 +6075,10 @@ static SLOW_LOGGED: AtomicU64 = AtomicU64::new(0);
 
 impl Laps {
     pub(super) fn for_draw(kind: usize, first: bool) -> Laps {
-        Laps { last: laps().then(std::time::Instant::now), steps: if first { &DRAW_STEPS_FIRST[..18] } else { &DRAW_STEPS[kind][..18] }, local: [0; 24], names: &DRAW_STEP_NAMES }
+        Laps { last: laps().then(std::time::Instant::now), steps: if first { &DRAW_STEPS_FIRST[kind][..18] } else { &DRAW_STEPS[kind][..18] }, local: [0; 24], names: &DRAW_STEP_NAMES }
     }
     fn for_dispatch(kind: usize, first: bool) -> Laps {
-        Laps { last: laps().then(std::time::Instant::now), steps: if first { &CS_STEPS_FIRST[..CS_STEP_COUNT] } else { &CS_STEPS[kind][..CS_STEP_COUNT] }, local: [0; 24], names: &CS_STEP_NAMES }
+        Laps { last: laps().then(std::time::Instant::now), steps: if first { &CS_STEPS_FIRST[kind][..CS_STEP_COUNT] } else { &CS_STEPS[kind][..CS_STEP_COUNT] }, local: [0; 24], names: &CS_STEP_NAMES }
     }
     /// Adds the time since the last mark to step `k`.
     pub(super) fn mark(&mut self, k: usize) {
@@ -6166,18 +6166,24 @@ fn sync_steps_line_inner() -> String {
 
 fn draw_steps_line() -> String {
     let mut s = String::new();
-    // Batches' first commands.
-    let n = DRAW_STEPS_FIRST[18].load(Ordering::Relaxed);
-    if n > 0 {
-        let total: u64 = DRAW_STEPS_FIRST[..18].iter().map(|c| c.load(Ordering::Relaxed)).sum();
-        let parts: Vec<String> = DRAW_STEP_NAMES.iter().zip(DRAW_STEPS_FIRST.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
-        s.push_str(&format!("    command processor per draw by step, first command of a batch ({n} draws, {:.2} us each): {}\n", total as f64 / n as f64 / 1000.0, parts.join(", ")));
+    // Batches' first commands, by kind.
+    for (kind, steps) in DRAW_KINDS.iter().zip(DRAW_STEPS_FIRST.iter()) {
+        let n = steps[18].load(Ordering::Relaxed);
+        if n == 0 {
+            continue;
+        }
+        let total: u64 = steps[..18].iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        let parts: Vec<String> = DRAW_STEP_NAMES.iter().zip(steps.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
+        s.push_str(&format!("    command processor per draw by step, first command of a batch, {kind} ({n} draws, {:.2} us each): {}\n", total as f64 / n as f64 / 1000.0, parts.join(", ")));
     }
-    let n = CS_STEPS_FIRST[CS_STEP_COUNT].load(Ordering::Relaxed);
-    if n > 0 {
-        let parts: Vec<String> = CS_STEP_NAMES.iter().zip(CS_STEPS_FIRST.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
-        let total: u64 = CS_STEPS_FIRST[..CS_STEP_COUNT].iter().map(|c| c.load(Ordering::Relaxed)).sum();
-        s.push_str(&format!("    command processor per dispatch by step, first command of a batch ({n} dispatches, {:.2} us each): {}\n", total as f64 / n as f64 / 1000.0, parts.join(", ")));
+    for (kind, steps) in CS_KINDS.iter().zip(CS_STEPS_FIRST.iter()) {
+        let n = steps[CS_STEP_COUNT].load(Ordering::Relaxed);
+        if n == 0 {
+            continue;
+        }
+        let parts: Vec<String> = CS_STEP_NAMES.iter().zip(steps.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
+        let total: u64 = steps[..CS_STEP_COUNT].iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        s.push_str(&format!("    command processor per dispatch by step, first command of a batch, {kind} ({n} dispatches, {:.2} us each): {}\n", total as f64 / n as f64 / 1000.0, parts.join(", ")));
     }
     for (kind, steps) in DRAW_KINDS.iter().zip(DRAW_STEPS.iter()) {
         let n = steps[18].load(Ordering::Relaxed);
@@ -6455,7 +6461,7 @@ pub fn reset_shader_profile() {
     *PROG_CENSUS.lock() = None;
     PROG_GEN.fetch_add(1, Ordering::Relaxed);
     PROG_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
-    for c in DRAW_STEPS.iter().flatten().chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(DRAW_STEPS_FIRST.iter()).chain(CS_STEPS_FIRST.iter()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()).chain(BIND_STEPS_BY.iter().flatten()).chain(PRE_STEPS_BY.iter().flatten()) {
+    for c in DRAW_STEPS.iter().flatten().chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(DRAW_STEPS_FIRST.iter().flatten()).chain(CS_STEPS_FIRST.iter().flatten()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()).chain(BIND_STEPS_BY.iter().flatten()).chain(PRE_STEPS_BY.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
     for c in CS_PHASES.iter().chain(DRAW_PHASES.iter()).chain(PLACE_PHASES.iter().flatten().flatten()) {
@@ -14493,7 +14499,7 @@ impl Exec {
         }
         if laps() {
             if first {
-                CS_STEPS_FIRST[CS_STEP_COUNT].fetch_add(1, Ordering::Relaxed);
+                CS_STEPS_FIRST[kind][CS_STEP_COUNT].fetch_add(1, Ordering::Relaxed);
             } else {
                 CS_STEPS[kind][CS_STEP_COUNT].fetch_add(1, Ordering::Relaxed);
             }
