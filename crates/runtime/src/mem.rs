@@ -606,6 +606,9 @@ pub fn reserve_guest_range_early() {
     if !env_is("DS_MIXED", "0") && !env_is("DS_WRITE_WATCH", "0") {
         let p = unsafe { VirtualAlloc2(std::ptr::null_mut(), GUEST_BASE as _, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0) };
         if !p.is_null() {
+            if let Some(s) = env_u32("DS_MIXED_SHIFT").filter(|s| (MIXED_MIN_SHIFT..=30).contains(s)) {
+                MIXED_SHIFT.store(s, std::sync::atomic::Ordering::Relaxed);
+            }
             MIXED.store(true, std::sync::atomic::Ordering::Release);
             WRITE_WATCH.store(true, std::sync::atomic::Ordering::Release);
             RESERVED_EARLY.store(true, std::sync::atomic::Ordering::Release);
@@ -636,7 +639,7 @@ const WRITE_WATCH_FLAG_RESET: u32 = 1;
 /// The mixed guest range (default; `DS_MIXED=0`, boot: one write-watched
 /// reservation as before), first stage (FRONTEND2.md "GPU-quiet mappings on
 /// sections"): the guest range is one placeholder,
-/// and each 64 MiB window of it (`MIXED_SHIFT`: front end 2's chunks, the
+/// and each 64 MiB window of it (`mixed_shift`: front end 2's chunks, the
 /// import windows) is replaced at its first commit by a reserve-only private
 /// allocation with write watching, in which pages are committed, decommitted
 /// and protected as in the one reservation otherwise. No host call or
@@ -650,11 +653,13 @@ const WRITE_WATCH_FLAG_RESET: u32 = 1;
 /// for front end 2 at the vista, +5.0% for the default (FINDINGS.md
 /// 2026-10-29).
 static MIXED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-const MIXED_SHIFT: u32 = 26;
-const MIXED_WINDOW: u64 = 1 << MIXED_SHIFT;
-const MIXED_WINDOWS: usize = ((GUEST_END - GUEST_BASE) >> MIXED_SHIFT) as usize;
+/// The window size as a power of two (`DS_MIXED_SHIFT=<21..30>`, boot; 26:
+/// 64 MiB).
+static MIXED_SHIFT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(26);
+const MIXED_MIN_SHIFT: u32 = 21;
+const MIXED_MAX_WINDOWS: usize = ((GUEST_END - GUEST_BASE) >> MIXED_MIN_SHIFT) as usize;
 /// The windows made (their allocation in place), a bit each.
-static MIXED_MADE: [std::sync::atomic::AtomicU64; MIXED_WINDOWS.div_ceil(64)] = [const { std::sync::atomic::AtomicU64::new(0) }; MIXED_WINDOWS.div_ceil(64)];
+static MIXED_MADE: [std::sync::atomic::AtomicU64; MIXED_MAX_WINDOWS.div_ceil(64)] = [const { std::sync::atomic::AtomicU64::new(0) }; MIXED_MAX_WINDOWS.div_ceil(64)];
 /// Serializes the making of windows.
 static MIXED_LOCK: Mutex<()> = Mutex::new(());
 /// [windows made, failures to make one, host calls split at a window
@@ -662,7 +667,43 @@ static MIXED_LOCK: Mutex<()> = Mutex::new(());
 static MIXED_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 /// Takes split at window boundaries by caller (`WW_WHO_NAMES`).
 static MIXED_SPLIT_WHO: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
-const _: () = assert!(GUEST_BASE % MIXED_WINDOW == 0 && GUEST_END % MIXED_WINDOW == 0);
+const _: () = assert!(GUEST_BASE % (1 << 30) == 0 && GUEST_END % (1 << 30) == 0);
+
+/// The windows' size as a power of two (`MIXED_SHIFT`).
+#[inline]
+fn mixed_shift() -> u32 {
+    MIXED_SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The windows' size.
+#[inline]
+fn mixed_window() -> u64 {
+    1 << mixed_shift()
+}
+
+/// Environment variable `name` (ASCII) as a decimal number, read without
+/// allocating (`env_is`).
+fn env_u32(name: &str) -> Option<u32> {
+    use windows_sys::Win32::System::Environment::GetEnvironmentVariableW;
+    let mut n = [0u16; 64];
+    if name.len() >= n.len() {
+        return None;
+    }
+    for (d, c) in n.iter_mut().zip(name.bytes()) {
+        *d = c as u16;
+    }
+    let mut buf = [0u16; 16];
+    let len = unsafe { GetEnvironmentVariableW(n.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if len == 0 || len >= buf.len() {
+        return None;
+    }
+    let mut v = 0u32;
+    for &c in &buf[..len] {
+        let d = (c as u32).checked_sub('0' as u32).filter(|d| *d < 10)?;
+        v = v.checked_mul(10)?.checked_add(d)?;
+    }
+    Some(v)
+}
 
 /// The mixed guest range is on (unless `DS_MIXED=0`; set at the reservation).
 pub fn mixed() -> bool {
@@ -674,7 +715,7 @@ fn mixed_made(a: u64) -> bool {
     if !(GUEST_BASE..GUEST_END).contains(&a) {
         return false;
     }
-    let w = ((a - GUEST_BASE) >> MIXED_SHIFT) as usize;
+    let w = ((a - GUEST_BASE) >> mixed_shift()) as usize;
     MIXED_MADE[w / 64].load(std::sync::atomic::Ordering::Acquire) >> (w % 64) & 1 != 0
 }
 
@@ -682,29 +723,30 @@ fn mixed_made(a: u64) -> bool {
 /// none (their placeholders split off and replaced); the Win32 error.
 fn mixed_make(a: u64, e: u64) -> Result<(), u32> {
     use std::sync::atomic::Ordering;
-    let mut w = a & !(MIXED_WINDOW - 1);
+    let win = mixed_window();
+    let mut w = a & !(win - 1);
     while w < e {
         if !mixed_made(w) {
             let _g = MIXED_LOCK.lock();
             if !mixed_made(w) {
-                if let Err(err) = crate::sections::isolate(w, MIXED_WINDOW) {
+                if let Err(err) = crate::sections::isolate(w, win) {
                     MIXED_STATS[1].fetch_add(1, Ordering::Relaxed);
                     crate::warn!("mem: making the mixed range's window {w:#x}: {err}");
                     return Err(0);
                 }
-                let p = unsafe { VirtualAlloc2(std::ptr::null_mut(), w as _, MIXED_WINDOW as usize, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | MEM_WRITE_WATCH, PAGE_NOACCESS, std::ptr::null_mut(), 0) };
+                let p = unsafe { VirtualAlloc2(std::ptr::null_mut(), w as _, win as usize, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | MEM_WRITE_WATCH, PAGE_NOACCESS, std::ptr::null_mut(), 0) };
                 if p.is_null() {
                     let err = last_error();
                     MIXED_STATS[1].fetch_add(1, Ordering::Relaxed);
                     crate::warn!("mem: making the mixed range's window {w:#x}: error {err}");
                     return Err(err);
                 }
-                let i = ((w - GUEST_BASE) >> MIXED_SHIFT) as usize;
+                let i = ((w - GUEST_BASE) >> mixed_shift()) as usize;
                 MIXED_MADE[i / 64].fetch_or(1 << (i % 64), Ordering::AcqRel);
                 MIXED_STATS[0].fetch_add(1, Ordering::Relaxed);
             }
         }
-        w += MIXED_WINDOW;
+        w += win;
     }
     Ok(())
 }
@@ -712,7 +754,7 @@ fn mixed_make(a: u64, e: u64) -> Result<(), u32> {
 /// The pieces of guest [a, e) one host memory call may take: all of it, or
 /// with the mixed range (`mixed`) its part in each window.
 pub(crate) fn host_pieces(a: u64, e: u64) -> impl Iterator<Item = (u64, u64)> {
-    if mixed() && e > a && a >> MIXED_SHIFT != (e - 1) >> MIXED_SHIFT {
+    if mixed() && e > a && a >> mixed_shift() != (e - 1) >> mixed_shift() {
         MIXED_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     window_pieces(a, e)
@@ -721,12 +763,13 @@ pub(crate) fn host_pieces(a: u64, e: u64) -> impl Iterator<Item = (u64, u64)> {
 /// `host_pieces` without its count (takes count their own).
 fn window_pieces(a: u64, e: u64) -> impl Iterator<Item = (u64, u64)> {
     let split = mixed();
+    let win = mixed_window();
     let mut p = a;
     std::iter::from_fn(move || {
         if p >= e {
             return None;
         }
-        let q = if split { ((p | (MIXED_WINDOW - 1)) + 1).min(e) } else { e };
+        let q = if split { ((p | (win - 1)) + 1).min(e) } else { e };
         let r = (p, q);
         p = q;
         Some(r)
@@ -737,7 +780,7 @@ fn window_pieces(a: u64, e: u64) -> impl Iterator<Item = (u64, u64)> {
 fn mixed_state() -> String {
     let v: Vec<u64> = MIXED_STATS.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
     let who: Vec<String> = WW_WHO_NAMES.iter().zip(MIXED_SPLIT_WHO.iter()).map(|(n, c)| (n, c.load(std::sync::atomic::Ordering::Relaxed))).filter(|(_, c)| *c > 0).map(|(n, c)| format!("{n} {c}")).collect();
-    format!("mixed range: {} windows of 64 MiB made ({} failed), {} host calls and {} takes split at window boundaries (takes by caller: {})", v[0], v[1], v[2], v[3], who.join(", "))
+    format!("mixed range: {} windows of {} MiB made ({} failed), {} host calls and {} takes split at window boundaries (takes by caller: {})", v[0], mixed_window() >> 20, v[1], v[2], v[3], who.join(", "))
 }
 
 /// Whether CPU writes to the guest range are tracked (`take_written`):
@@ -917,7 +960,7 @@ fn take_written_inner(lo: u64, hi: u64, out: &mut Vec<u64>, who: usize) -> Optio
         if lo < GUEST_BASE || hi > GUEST_END {
             return None;
         }
-        if lo >> MIXED_SHIFT != (hi - 1) >> MIXED_SHIFT {
+        if lo >> mixed_shift() != (hi - 1) >> mixed_shift() {
             MIXED_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             MIXED_SPLIT_WHO[who.min(9)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             for (a, e) in window_pieces(lo, hi) {
