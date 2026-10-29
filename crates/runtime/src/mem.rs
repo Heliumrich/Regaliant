@@ -726,7 +726,7 @@ fn mixed_make(a: u64, e: u64) -> Result<(), u32> {
     let win = mixed_window();
     let mut w = a & !(win - 1);
     while w < e {
-        if !mixed_made(w) {
+        if !mixed_made(w) && !view_window(w) {
             let _g = MIXED_LOCK.lock();
             if !mixed_made(w) {
                 if let Err(err) = crate::sections::isolate(w, win) {
@@ -776,11 +776,264 @@ fn window_pieces(a: u64, e: u64) -> impl Iterator<Item = (u64, u64)> {
     })
 }
 
+/// `DS_MIXED_VIEWS=<name>:<hex size>,...` (boot; the mixed range): direct
+/// mappings of that name and size map their whole windows that are still
+/// placeholders as views of the direct-memory section at their physical
+/// offset, each with an alias view that GPU imports are made of (FRONTEND2.md
+/// "GPU-quiet mappings on sections", step 2); their other parts stay private.
+/// Takes in view windows are the residency's protection tracking through the
+/// host (`gpu::resident::take_written`), and front end 2 may arm the
+/// GPU-written pages there (`fe2::try_arm`): the pages the GPU writes through
+/// its imports are never the ones protected.
+fn view_rules() -> &'static [(String, u64)] {
+    static R: std::sync::OnceLock<Vec<(String, u64)>> = std::sync::OnceLock::new();
+    R.get_or_init(|| {
+        let Ok(v) = std::env::var("DS_MIXED_VIEWS") else { return Vec::new() };
+        v.split(',')
+            .filter_map(|r| {
+                let (name, size) = r.split_once(':')?;
+                Some((name.trim().to_string(), u64::from_str_radix(size.trim().trim_start_matches("0x"), 16).ok()?))
+            })
+            .collect()
+    })
+}
+
+/// The view windows (`view_rules`), a bit each.
+static MIXED_VIEW: [std::sync::atomic::AtomicU64; MIXED_MAX_WINDOWS.div_ceil(64)] = [const { std::sync::atomic::AtomicU64::new(0) }; MIXED_MAX_WINDOWS.div_ceil(64)];
+/// A window was made a view: the per-window checks run from then on.
+static VIEWS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Each view window's alias slot.
+static VIEW_SLOTS: Mutex<BTreeMap<u64, u8>> = Mutex::new(BTreeMap::new());
+/// [windows made views, released, made private again, windows of chosen
+/// mappings left private (made already), takes of view windows, pages they
+/// reported, their ns].
+static VIEW_STATS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// Some window of the mixed range is (or was) a view (`view_rules`).
+#[inline]
+pub fn views_on() -> bool {
+    VIEWS_ON.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether guest address `a` lies in a view window.
+#[inline]
+pub fn view_window(a: u64) -> bool {
+    if !views_on() || !(GUEST_BASE..GUEST_END).contains(&a) {
+        return false;
+    }
+    let w = ((a - GUEST_BASE) >> mixed_shift()) as usize;
+    MIXED_VIEW[w / 64].load(std::sync::atomic::Ordering::Acquire) >> (w % 64) & 1 != 0
+}
+
+/// Whether every window of [a, e) is a view window.
+pub fn view_span(a: u64, e: u64) -> bool {
+    if !views_on() || e <= a {
+        return false;
+    }
+    let win = mixed_window();
+    let mut w = a & !(win - 1);
+    while w < e {
+        if !view_window(w) {
+            return false;
+        }
+        w += win;
+    }
+    true
+}
+
+/// [lo, hi) clipped to the windows around `a` backed as its own is (views or
+/// private memory): one GPU import cannot be of both.
+pub fn same_backing(a: u64, lo: u64, hi: u64) -> (u64, u64) {
+    if !views_on() {
+        return (lo, hi);
+    }
+    let win = mixed_window();
+    let v = view_window(a);
+    let mut s = a & !(win - 1);
+    while s > lo && s > GUEST_BASE && view_window(s - win) == v {
+        s -= win;
+    }
+    let mut e = (a & !(win - 1)) + win;
+    while e < hi && e < GUEST_END && view_window(e) == v {
+        e += win;
+    }
+    (lo.max(s), hi.min(e))
+}
+
+fn set_view(w: u64, on: bool) {
+    use std::sync::atomic::Ordering;
+    let i = ((w - GUEST_BASE) >> mixed_shift()) as usize;
+    if on {
+        MIXED_VIEW[i / 64].fetch_or(1 << (i % 64), Ordering::AcqRel);
+    } else {
+        MIXED_VIEW[i / 64].fetch_and(!(1 << (i % 64)), Ordering::AcqRel);
+    }
+}
+
+/// The parts of guest [a, e) outside view windows.
+fn private_parts(a: u64, e: u64) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (p, q) in window_pieces(a, e) {
+        if view_window(p) {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if last.1 == p => last.1 = q,
+            _ => out.push((p, q)),
+        }
+    }
+    out
+}
+
+/// Maps the whole windows of the chosen direct mapping [addr, addr+size)
+/// (physical `phys`) that are still placeholders as views with aliases
+/// (`view_rules`); returns how many.
+fn mixed_views_make(addr: u64, size: u64, phys: u64, prot: u32) -> u64 {
+    use crate::sections::{self as sec, Sec};
+    use std::sync::atomic::Ordering;
+    let win = mixed_window();
+    let (mut w, end) = (addr.next_multiple_of(win), (addr + size) & !(win - 1));
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 16 {
+        crate::info!("mem: chosen mapping {addr:#x}+{size:#x}: whole windows {w:#x}..{end:#x} (sections made: {})", sec::ready());
+    }
+    if w >= end {
+        return 0;
+    }
+    if !sec::ready() {
+        if let Err(e) = sec::reserve_aliases(GUEST_BASE, GUEST_END - GUEST_BASE, DMEM_SIZE, ANON_SIZE) {
+            crate::warn!("mem: the mixed range's views need the sections and alias ranges: error {e} (mappings stay private)");
+            return 0;
+        }
+    }
+    let mut made = 0;
+    while w < end {
+        if mixed_made(w) || view_window(w) {
+            VIEW_STATS[3].fetch_add(1, Ordering::Relaxed);
+            w += win;
+            continue;
+        }
+        let off = phys + (w - addr);
+        mapped_over_gpu_writes(w, win, true, off);
+        let _arm = crate::gpu::resident::remap_guard();
+        match sec::map_new_view(w, win, Sec::Dmem, off, win_prot(prot)) {
+            Ok(()) => match sec::map_alias(w, win, Sec::Dmem, off) {
+                Ok(slot) => {
+                    VIEW_SLOTS.lock().insert(w, slot);
+                    VIEWS_ON.store(true, Ordering::Release);
+                    set_view(w, true);
+                    crate::gpu::resident::settled(w, win);
+                    VIEW_STATS[0].fetch_add(1, Ordering::Relaxed);
+                    made += 1;
+                }
+                Err(e) => {
+                    crate::warn!("mem: the mixed range's view at {w:#x}: {e} (the window stays private)");
+                    let _ = sec::unmap_view(w);
+                }
+            },
+            Err(e) => crate::warn!("mem: the mixed range's view at {w:#x}: {e} (the window stays private)"),
+        }
+        w += win;
+    }
+    made
+}
+
+/// Unmaps view window `w`: its guest view now (a placeholder again), its
+/// alias once no GPU import may use it (`sections::alias_unref`).
+fn mixed_view_release(w: u64) {
+    let win = mixed_window();
+    {
+        let _readers_out = GUEST_READERS.write();
+        let _arm = crate::gpu::resident::remap_guard();
+        if let Err(e) = crate::sections::unmap_view(w) {
+            crate::warn!("mem: {e}");
+        }
+        set_view(w, false);
+        crate::gpu::resident::settled(w, win);
+    }
+    if let Some(slot) = VIEW_SLOTS.lock().remove(&w) {
+        crate::sections::alias_unref(w, win, slot, crate::gpu::imports_may_cover);
+    }
+    VIEW_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// View window `w` becomes private memory with the same contents (its
+/// mapping is split inside it: views cannot be unmapped in part): GPU work
+/// writing it through its alias is waited for, its pages copied out, the
+/// view released, the window made private and its pages committed with the
+/// copy and the mapping's protection `prot`.
+fn mixed_view_privatize(w: u64, prot: u32) {
+    use std::sync::atomic::Ordering;
+    let win = mixed_window();
+    if let Some(seq) = crate::gpu::exec::pending_writes(w, win) {
+        if !crate::gpu::exec::wait_done_for(seq, std::time::Duration::from_secs(2)) {
+            crate::warn!("mem: view window {w:#x} made private while batch {seq} may still write it");
+        }
+    }
+    let mut copy = vec![0u8; win as usize];
+    {
+        let _readers_out = GUEST_READERS.write();
+        let _arm = crate::gpu::resident::remap_guard();
+        // (Readable first: the guest's protection may forbid our reads.)
+        let mut old = 0u32;
+        unsafe {
+            VirtualProtect(w as _, win as usize, PAGE_READONLY, &mut old);
+            std::ptr::copy_nonoverlapping(w as *const u8, copy.as_mut_ptr(), win as usize);
+        }
+        if let Err(e) = crate::sections::unmap_view(w) {
+            crate::warn!("mem: {e}");
+        }
+        set_view(w, false);
+        crate::gpu::resident::settled(w, win);
+    }
+    if let Some(slot) = VIEW_SLOTS.lock().remove(&w) {
+        crate::sections::alias_unref(w, win, slot, crate::gpu::imports_may_cover);
+    }
+    let ok = mixed_make(w, w + win).is_ok() && {
+        let _readers_out = GUEST_READERS.write();
+        let _arm = crate::gpu::resident::remap_guard();
+        let p = unsafe { VirtualAlloc(w as _, win as usize, MEM_COMMIT, PAGE_READWRITE) };
+        if !p.is_null() {
+            let mut old = 0u32;
+            unsafe {
+                std::ptr::copy_nonoverlapping(copy.as_ptr(), w as *mut u8, win as usize);
+                VirtualProtect(w as _, win as usize, win_prot(prot), &mut old);
+            }
+        }
+        crate::gpu::resident::settled(w, win);
+        !p.is_null()
+    };
+    let n = VIEW_STATS[2].fetch_add(1, Ordering::Relaxed);
+    if !ok {
+        crate::error!("mem: view window {w:#x} could not be made private: its contents are lost");
+    } else if n < 8 {
+        crate::info!("mem: view window {w:#x} made private (its mapping split inside it)");
+    }
+}
+
+/// The views' part of the mixed range's state.
+fn views_state() -> String {
+    let v: Vec<u64> = VIEW_STATS.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
+    format!(
+        "; views ({}): {} windows made ({} MiB live), {} released, {} made private again, {} windows of chosen mappings left private; {} takes of view windows ({:.2} us each) reported {} pages",
+        view_rules().iter().map(|(n, s)| format!("'{n}' of {} MiB", s >> 20)).collect::<Vec<_>>().join(", "),
+        v[0],
+        VIEW_SLOTS.lock().len() as u64 * (mixed_window() >> 20),
+        v[1],
+        v[2],
+        v[3],
+        v[4],
+        v[6] as f64 / v[4].max(1) as f64 / 1000.0,
+        v[5]
+    )
+}
+
 /// The mixed range's state, for the start-up log and the status.
 fn mixed_state() -> String {
     let v: Vec<u64> = MIXED_STATS.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
     let who: Vec<String> = WW_WHO_NAMES.iter().zip(MIXED_SPLIT_WHO.iter()).map(|(n, c)| (n, c.load(std::sync::atomic::Ordering::Relaxed))).filter(|(_, c)| *c > 0).map(|(n, c)| format!("{n} {c}")).collect();
-    format!("mixed range: {} windows of {} MiB made ({} failed), {} host calls and {} takes split at window boundaries (takes by caller: {})", v[0], mixed_window() >> 20, v[1], v[2], v[3], who.join(", "))
+    let views = if view_rules().is_empty() { String::new() } else { views_state() };
+    format!("mixed range: {} windows of {} MiB made ({} failed), {} host calls and {} takes split at window boundaries (takes by caller: {}){views}", v[0], mixed_window() >> 20, v[1], v[2], v[3], who.join(", "))
 }
 
 /// Whether CPU writes to the guest range are tracked (`take_written`):
@@ -960,11 +1213,22 @@ fn take_written_inner(lo: u64, hi: u64, out: &mut Vec<u64>, who: usize) -> Optio
         if lo < GUEST_BASE || hi > GUEST_END {
             return None;
         }
-        if lo >> mixed_shift() != (hi - 1) >> mixed_shift() {
+        let split = lo >> mixed_shift() != (hi - 1) >> mixed_shift();
+        if split {
             MIXED_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             MIXED_SPLIT_WHO[who.min(9)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if split || views_on() {
             for (a, e) in window_pieces(lo, hi) {
-                if mixed_made(a) {
+                if view_window(a) {
+                    // (Views have no write watching: their pages are armed
+                    // through the host and faults tell their writes.)
+                    let (first, t) = (out.len(), std::time::Instant::now());
+                    crate::gpu::resident::take_written(a, e - a, out)?;
+                    VIEW_STATS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    VIEW_STATS[5].fetch_add((out.len() - first) as u64, std::sync::atomic::Ordering::Relaxed);
+                    VIEW_STATS[6].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                } else if mixed_made(a) {
                     take_written_query(a, e, out, who)?;
                 }
             }
@@ -1122,7 +1386,7 @@ fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
         note_since(Mirror, t, || format!("a commit of {addr:#x}+{size:#x} waiting for the guest memory's readers"));
         let t = std::time::Instant::now();
         for &(a, e) in &stale {
-            for (a, e) in host_pieces(a, e) {
+            for (a, e) in host_pieces(a, e).filter(|&(a, _)| !view_window(a)) {
                 let p = unsafe { VirtualAlloc(a as _, (e - a) as usize, MEM_COMMIT, PAGE_READWRITE) };
                 if !p.is_null() {
                     unsafe { std::ptr::write_bytes(a as *mut u8, 0, (e - a) as usize) };
@@ -1141,10 +1405,11 @@ fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     crate::hosted::disarm(addr, size);
     note_since(Mirror, t, || format!("a commit of {addr:#x}+{size:#x}: its disarm"));
     let t = std::time::Instant::now();
-    let mut p = std::ptr::null_mut();
-    for (a, e) in host_pieces(addr, addr + size) {
-        p = unsafe { VirtualAlloc(a as _, (e - a) as usize, MEM_COMMIT, win_prot(prot)) };
-        if p.is_null() {
+    let mut ok = true;
+    // (View windows are committed with their views.)
+    for (a, e) in host_pieces(addr, addr + size).filter(|&(a, _)| !view_window(a)) {
+        if unsafe { VirtualAlloc(a as _, (e - a) as usize, MEM_COMMIT, win_prot(prot)) }.is_null() {
+            ok = false;
             break;
         }
     }
@@ -1153,7 +1418,7 @@ fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     crate::gpu::resident::settled(addr, size);
     note_since(Mirror, t, || format!("a commit of {addr:#x}+{size:#x}: its pages' states reset"));
     note_host_call(0, t0);
-    if p.is_null() { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
+    if !ok { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
 }
 
 /// Guest ranges [start, end) unmapped while a GPU import covered them: their
@@ -1210,6 +1475,9 @@ pub fn retry_deferred() {
     if crate::sections::on() {
         crate::sections::retry_deferred(crate::gpu::imports_may_cover);
         return;
+    }
+    if views_on() {
+        crate::sections::retry_deferred(crate::gpu::imports_may_cover);
     }
     if DEFERRED_LEN.load(std::sync::atomic::Ordering::Acquire) == 0 {
         return;
@@ -1400,22 +1668,45 @@ fn host_decommit(addr: u64, size: u64) {
     let t0 = std::time::Instant::now();
     crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_DECOMMIT);
     repaged(addr, size);
-    if defer_decommits() && crate::gpu::imports_may_cover(addr, size) {
-        let mut d = DEFERRED.lock();
-        d.push((addr, addr + size));
-        DEFERRED_LEN.store(d.len(), std::sync::atomic::Ordering::Release);
-        DEFERRED_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        DEFERRED_STATS[3].fetch_add(size, std::sync::atomic::Ordering::Relaxed);
-        HOST_CALLS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return;
+    // View windows go now (their guest views: imports are of their aliases),
+    // the private parts as below.
+    let parts = if views_on() {
+        let win = mixed_window();
+        let mut w = addr & !(win - 1);
+        while w < addr + size {
+            if view_window(w) {
+                mixed_view_release(w);
+            }
+            w += win;
+        }
+        private_parts(addr, addr + size)
+    } else {
+        vec![(addr, addr + size)]
+    };
+    let mut decommitted = false;
+    for (addr, end) in parts {
+        let size = end - addr;
+        if defer_decommits() && crate::gpu::imports_may_cover(addr, size) {
+            let mut d = DEFERRED.lock();
+            d.push((addr, addr + size));
+            DEFERRED_LEN.store(d.len(), std::sync::atomic::Ordering::Release);
+            DEFERRED_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            DEFERRED_STATS[3].fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+            HOST_CALLS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        let _readers_out = GUEST_READERS.write();
+        let _arm = crate::gpu::resident::remap_guard();
+        for (a, e) in host_pieces(addr, addr + size) {
+            unsafe { VirtualFree(a as _, (e - a) as usize, MEM_DECOMMIT) };
+        }
+        crate::gpu::resident::settled(addr, size);
+        decommitted = true;
     }
-    let _readers_out = GUEST_READERS.write();
-    let _arm = crate::gpu::resident::remap_guard();
-    for (a, e) in host_pieces(addr, addr + size) {
-        unsafe { VirtualFree(a as _, (e - a) as usize, MEM_DECOMMIT) };
+    // (Counted as before: deferred decommits are counted apart.)
+    if decommitted {
+        note_host_call(2, t0);
     }
-    crate::gpu::resident::settled(addr, size);
-    note_host_call(2, t0);
 }
 
 pub fn host_protect(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
@@ -1759,6 +2050,9 @@ impl MemState {
     fn split_at(&mut self, addr: u64, why: usize) {
         let Some(v) = self.vmas.range(..addr).next_back().map(|(_, v)| v.clone()) else { return };
         if addr > v.start && addr < v.end() {
+            if view_window(addr) && addr & (mixed_window() - 1) != 0 {
+                mixed_view_privatize(addr & !(mixed_window() - 1), v.prot);
+            }
             if crate::sections::on() && v.kind != VmaKind::Reserved {
                 section_split(&v, addr, why);
             }
@@ -1885,11 +2179,31 @@ impl MemState {
             self.unmap_range_for(addr, addr + size, crate::sections::SPLIT_MAP_OVER);
         }
         let (mut slots, mut off) = (0u8, 0);
+        if kind == VmaKind::Direct && size >= 64 << 20 {
+            // (What `DS_MIXED_VIEWS` rules name.)
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
+                crate::info!("mem: direct mapping '{name}' {addr:#x}+{size:#x} (phys {phys:#x}, prot {prot:#x})");
+            }
+        }
+        if kind == VmaKind::Direct && mixed() && !crate::sections::on() && view_rules().iter().any(|(n, s)| n == name && *s == size) {
+            mixed_views_make(addr, size, phys, prot);
+        }
         if kind != VmaKind::Reserved {
             if crate::sections::on() {
                 (slots, off) = section_commit(addr, size, kind, prot, phys)?;
-            } else {
-                host_commit(addr, size, prot)?;
+            } else if let Err(e) = host_commit(addr, size, prot) {
+                if views_on() {
+                    let win = mixed_window();
+                    let mut w = addr & !(win - 1);
+                    while w < addr + size {
+                        if view_window(w) {
+                            mixed_view_release(w);
+                        }
+                        w += win;
+                    }
+                }
+                return Err(e);
             }
         }
         if kind == VmaKind::Direct && phys_carry() && !crate::sections::on() {
@@ -1992,7 +2306,7 @@ impl MemState {
             return None;
         }
         self.dmem.insert(cand, DmemBlock { size: len, mtype });
-        if crate::sections::on() {
+        if crate::sections::on() || (mixed() && crate::sections::ready()) {
             crate::sections::dmem_allocated(cand, len);
         }
         Some(cand)

@@ -704,6 +704,8 @@ fn mapping(addr: u64) -> Option<(u64, u64)> {
 /// Returns [start, end) and the number of mappings.
 fn mapping_run(addr: u64, lo: u64, hi: u64) -> Option<(u64, u64, usize)> {
     use crate::mem::VmaKind;
+    // (The mixed range's view windows and private memory apart.)
+    let (lo, hi) = crate::mem::same_backing(addr, lo, hi);
     let st = crate::mem::MEM.lock();
     let v = st.find(addr)?;
     if v.kind == VmaKind::Reserved {
@@ -1299,10 +1301,10 @@ fn import_once(base: u64, size: u64) -> Option<Option<(vk::Buffer, u64, u64)>> {
     // Section-backed memory: the import is of the alias views (contiguous in
     // one slot), the window narrowed to the binding when the run is not.
     let mut alias = 0u64;
-    if crate::sections::on() {
+    if crate::sections::on() || crate::mem::view_window(start) {
         let slot = crate::sections::alias_slot_for(start, end - start).or_else(|| {
             (start, end) = ((base & !(a - 1)).max(vs), (base + size).next_multiple_of(a).min(ve));
-            crate::sections::alias_slot_for(start, end - start).or_else(|| crate::mem::bridge_aliases(start, end))
+            crate::sections::alias_slot_for(start, end - start).or_else(|| if crate::sections::on() { crate::mem::bridge_aliases(start, end) } else { None })
         });
         let Some(slot) = slot else {
             ALIAS_MISSES.fetch_add(1, Ordering::Relaxed);

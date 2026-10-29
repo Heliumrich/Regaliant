@@ -934,7 +934,9 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
     // `DS_FE2_ARM_GPU=1`; a range found fine with its marks set passes the
     // cache like a read one (marking every word on every use, ~430 words
     // for a pool of ~113 MB, made queue 0x50's dispatches slow).
-    let gpu_writes = gpu_writes && !arm_gpu();
+    // (Pages of the mixed range's view windows too: their imports are of
+    // the aliases, `mem::view_rules`.)
+    let gpu_writes = gpu_writes && !arm_gpu() && !crate::mem::view_span(lo, hi);
     if range_fine(lo, hi, want, gpu_writes) {
         local_add(L_HITS, 1);
         local_add(L_FAST, 1);
@@ -1760,7 +1762,7 @@ fn try_arm(a: u64, b: u64, frame: u64, armable: &Armable) {
             not[R_HELD] += cand.count_ones() as u64;
             cand = 0;
         }
-        if cand != 0 && !arm_gpu {
+        if cand != 0 && !arm_gpu && !crate::mem::view_window(x) {
             let g = c.gpu[w].load(Ordering::Acquire) & cand;
             not[R_GPU] += g.count_ones() as u64;
             cand &= !g;

@@ -149,6 +149,22 @@ fn err<T>(what: &str) -> Result<T, String> {
 /// the first heap allocation, `mem::reserve_guest_range_early`); the error is
 /// the Win32 error.
 pub fn reserve(base: u64, size: u64, dmem_size: u64, anon_size: u64) -> Result<(), u32> {
+    reserve_with(base, size, dmem_size, anon_size, true)
+}
+
+/// `reserve` without the guest range (a placeholder of the mixed range's
+/// already: its views, `mem::view_rules`) and without turning section-backed
+/// memory on.
+pub fn reserve_aliases(base: u64, size: u64, dmem_size: u64, anon_size: u64) -> Result<(), u32> {
+    reserve_with(base, size, dmem_size, anon_size, false)
+}
+
+/// The sections are made (`reserve`, `reserve_aliases`).
+pub fn ready() -> bool {
+    STATE.lock().is_some()
+}
+
+fn reserve_with(base: u64, size: u64, dmem_size: u64, anon_size: u64, guest: bool) -> Result<(), u32> {
     unsafe {
         let dmem = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_EXECUTE_READWRITE | SEC_RESERVE, (dmem_size >> 32) as u32, dmem_size as u32, std::ptr::null());
         if dmem.is_null() {
@@ -158,7 +174,7 @@ pub fn reserve(base: u64, size: u64, dmem_size: u64, anon_size: u64) -> Result<(
         if anon.is_null() {
             return Err(GetLastError());
         }
-        for slot in 0..=ALIAS_SLOTS as u64 {
+        for slot in (if guest { 0 } else { 1 })..=ALIAS_SLOTS as u64 {
             let at = if slot == 0 { base } else { alias_of(base, (slot - 1) as u8) };
             let p = VirtualAlloc2(std::ptr::null_mut(), at as _, size as usize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0);
             if p.is_null() {
@@ -176,7 +192,9 @@ pub fn reserve(base: u64, size: u64, dmem_size: u64, anon_size: u64) -> Result<(
             zero_next: BTreeMap::new(),
         });
     }
-    ON.store(true, Ordering::Release);
+    if guest {
+        ON.store(true, Ordering::Release);
+    }
     Ok(())
 }
 

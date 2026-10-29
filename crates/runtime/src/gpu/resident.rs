@@ -278,7 +278,34 @@ pub fn enabled() -> bool {
 /// The page table, arming and write faults run: residency, or section-backed
 /// guest memory (its CPU-write tracking, `take_written`).
 pub fn tracking() -> bool {
-    ON.load(Ordering::Acquire) || crate::sections::on()
+    ON.load(Ordering::Acquire) || crate::sections::on() || crate::mem::views_on()
+}
+
+/// The parts of [lo, hi) the write tracking covers: all guest memory with
+/// section-backed memory, the mirror's span with residency alone, else the
+/// mixed range's view windows (`mem::view_window`).
+fn tracked_parts(lo: u64, hi: u64) -> Vec<(u64, u64)> {
+    if crate::sections::on() {
+        return vec![(lo, hi)];
+    }
+    if enabled() {
+        let (a, e) = (lo.max(MIRROR_BASE), hi.min(MIRROR_END));
+        return if a < e { vec![(a, e)] } else { Vec::new() };
+    }
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    let mut p = lo;
+    while p < hi {
+        // (2 MiB steps: no window of the mixed range is smaller.)
+        let e = (((p >> 21) + 1) << 21).min(hi);
+        if crate::mem::view_window(p) {
+            match out.last_mut() {
+                Some(l) if l.1 == p => l.1 = e,
+                _ => out.push((p, e)),
+            }
+        }
+        p = e;
+    }
+    out
 }
 
 fn chunk(addr: u64, create: bool) -> Option<&'static Chunk> {
@@ -510,7 +537,7 @@ const H_FAILED: usize = 5;
 /// intact (`hosted`).
 #[inline]
 fn via_host() -> bool {
-    crate::hosted::on() && crate::sections::on()
+    crate::hosted::on() && (crate::sections::on() || crate::mem::views_on())
 }
 
 /// Whether the host's bit of page `q` is set (armed through the host).
@@ -1227,12 +1254,13 @@ pub fn host_write_begin(base: u64, len: u64) {
         return;
     }
     // Residency alone arms only the mirror's span; section-backed memory's
-    // write tracking arms all guest memory.
-    let (lo, hi) = if enabled() && !crate::sections::on() {
-        ((base & !(PAGE - 1)).max(MIRROR_BASE), base.saturating_add(len).next_multiple_of(PAGE).min(MIRROR_END))
-    } else {
-        (base & !(PAGE - 1), base.saturating_add(len).next_multiple_of(PAGE))
-    };
+    // write tracking arms all guest memory, the mixed range's its views.
+    for (lo, hi) in tracked_parts(base & !(PAGE - 1), base.saturating_add(len).next_multiple_of(PAGE)) {
+        host_write_begin_in(lo, hi);
+    }
+}
+
+fn host_write_begin_in(lo: u64, hi: u64) {
     if lo >= hi {
         return;
     }
@@ -1259,7 +1287,9 @@ pub fn disarm_for_host(base: u64, len: u64) {
     if !tracking() || len == 0 {
         return;
     }
-    disarm_range(base & !(PAGE - 1), base.saturating_add(len).next_multiple_of(PAGE));
+    for (lo, hi) in tracked_parts(base & !(PAGE - 1), base.saturating_add(len).next_multiple_of(PAGE)) {
+        disarm_range(lo, hi);
+    }
 }
 
 /// The tracking states of [base, base+len)'s pages (diagnostics).
@@ -1306,13 +1336,12 @@ pub fn host_write_end(base: u64, len: u64) {
     if !tracking() || len == 0 {
         return;
     }
-    // Residency alone arms only the mirror's span; section-backed memory's
-    // write tracking arms all guest memory.
-    let (lo, hi) = if enabled() && !crate::sections::on() {
-        ((base & !(PAGE - 1)).max(MIRROR_BASE), base.saturating_add(len).next_multiple_of(PAGE).min(MIRROR_END))
-    } else {
-        (base & !(PAGE - 1), base.saturating_add(len).next_multiple_of(PAGE))
-    };
+    for (lo, hi) in tracked_parts(base & !(PAGE - 1), base.saturating_add(len).next_multiple_of(PAGE)) {
+        host_write_end_in(lo, hi);
+    }
+}
+
+fn host_write_end_in(lo: u64, hi: u64) {
     let mut p = lo;
     while p < hi {
         if let Some(c) = chunk(p, false) {
