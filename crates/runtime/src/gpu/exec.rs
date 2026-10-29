@@ -8800,7 +8800,7 @@ impl Exec {
     /// reads 0). None: nothing of it is mapped, or no video memory.
     fn fe2_place(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
         if !super::fe2::callers_on() {
-            if super::fe2census::on() {
+            if super::fe2census::on() || super::fe2::quiet_census_on() {
                 super::fe2::set_caller(&self.name);
             }
             return self.fe2_place_inner(base, size, written);

@@ -467,9 +467,43 @@ pub fn note_place_parts(map: u64, begin: u64, after: u64) {
 
 /// Clears the checks by caller (`profile reset`).
 pub fn reset_callers() {
-    for c in BY_CALLER.iter().flatten() {
+    for c in BY_CALLER.iter().flatten().chain(QUIET_TAKES.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
+}
+
+/// `DS_FE2_QUIET_CENSUS=1` (diagnosis): each take classed by whether every
+/// page of its range is GPU-written with no CPU write found for QUIET_FLIPS
+/// flips (what view-backed GPU-quiet mappings would spare: FRONTEND2.md
+/// "GPU-quiet mappings on sections"), by caller (`set_caller`).
+pub fn quiet_census_on() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_FE2_QUIET_CENSUS").ok().as_deref() == Some("1"))
+}
+
+/// Flips without a CPU write found (`Chunk::wrote`; a page's first sight
+/// counts as one) that make a GPU-written page quiet (`quiet_census_on`).
+const QUIET_FLIPS: u64 = 300;
+
+/// Per caller: [takes, ns, quiet takes, their ns] (`quiet_census_on`).
+static QUIET_TAKES: [[AtomicU64; 4]; 4] = [const { [const { AtomicU64::new(0) }; 4] }; 4];
+
+/// Whether every page of [a, b) is GPU-written and quiet (`QUIET_FLIPS`).
+fn quiet_range(a: u64, b: u64, frame: u64) -> bool {
+    let mut x = a;
+    while x < b {
+        let Some(c) = chunk(x, false) else { return false };
+        let i = idx(x);
+        if c.gpu[i / 64].load(Ordering::Relaxed) >> (i % 64) & 1 == 0 {
+            return false;
+        }
+        let w = c.wrote[i].load(Ordering::Relaxed) as u64;
+        if w != 0 && frame.saturating_sub(w - 1) < QUIET_FLIPS {
+            return false;
+        }
+        x += PAGE;
+    }
+    true
 }
 
 /// A placement took `cycles` (TSC; `DS_FE2_CALLERS`).
@@ -1148,6 +1182,7 @@ fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &A
     // The take: pages written since their last take lose their valid bit
     // (`marks_taken`, for any take's pages).
     written.clear();
+    let quiet = quiet_census_on().then(|| quiet_range(ta, tb, frame));
     hole_snapshot(ta, tb);
     let tt = std::time::Instant::now();
     let t = tsc();
@@ -1165,6 +1200,15 @@ fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &A
     }
     class[2].fetch_add(1, Ordering::Relaxed);
     class[3].fetch_add(tns, Ordering::Relaxed);
+    if let Some(q) = quiet {
+        let s = &QUIET_TAKES[CALLER.with(|c| c.get())];
+        s[0].fetch_add(1, Ordering::Relaxed);
+        s[1].fetch_add(tns, Ordering::Relaxed);
+        if q {
+            s[2].fetch_add(1, Ordering::Relaxed);
+            s[3].fetch_add(tns, Ordering::Relaxed);
+        }
+    }
     STATS[S_TAKE_WRITTEN].fetch_add(written.len() as u64, Ordering::Relaxed);
     if super::fe2census::on() {
         super::fe2census::note_take(ta, tb, written, CALLER.with(|c| c.get()));
@@ -2833,8 +2877,20 @@ fn census_line() -> String {
 
 /// The placement checks by caller (`DS_FE2_CALLERS=1`; "" otherwise).
 pub fn callers_line() -> String {
+    let mut quiet = String::new();
+    if quiet_census_on() {
+        let parts: Vec<String> = CALLER_NAMES
+            .iter()
+            .zip(QUIET_TAKES.iter())
+            .map(|(n, c)| {
+                let v: Vec<u64> = c.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+                format!("{n} {} of {} ({:.1} of {:.1} ms)", v[2], v[0], v[3] as f64 / 1e6, v[1] as f64 / 1e6)
+            })
+            .collect();
+        quiet = format!("    front end 2's takes of ranges all GPU-written with no CPU write found for {QUIET_FLIPS} flips (what view-backed mappings would spare), by caller: {}\n", parts.join("; "));
+    }
     if !callers_on() {
-        return String::new();
+        return quiet;
     }
     let hz = super::threadcpu::tsc_hz();
     let parts: Vec<String> = CALLER_NAMES
@@ -2865,5 +2921,5 @@ pub fn callers_line() -> String {
             )
         })
         .collect();
-    format!("    front end 2's checks by caller: {}\n", parts.join("; "))
+    format!("    front end 2's checks by caller: {}\n{quiet}", parts.join("; "))
 }
