@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 210] = [
+    static ALL: [Tunable; 211] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -243,6 +243,7 @@ pub mod tune {
         Tunable { name: "fe2_cpw_close", env: "DS_FE2_CPW_CLOSE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_cpw_waited", env: "DS_FE2_CPW_WAITED", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_precheck", env: "DS_FE2_PRECHECK", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe2_taken_upload", env: "DS_FE2_TAKEN_UPLOAD", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2281,6 +2282,13 @@ pub mod tune {
     /// posted, 2 before it (the CP then waits for a running slot's checks).
     pub fn fe2_precheck_mode() -> u64 {
         get(209)
+    }
+
+    /// Front end 2: a run of pages M lacks that a take of this epoch already
+    /// looked at (`fe2::taken_lacking`: found written then, or uploaded by a
+    /// batch not queued yet) is uploaded without another take.
+    pub fn fe2_taken_upload() -> bool {
+        get(210) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
