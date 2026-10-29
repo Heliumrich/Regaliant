@@ -364,6 +364,9 @@ pub struct Cp {
     par_skip: (u64, u64),
     /// Its commands (`tune cp_classes`: serial commands by run length).
     par_skip_n: usize,
+    /// The serial run being watched (`RUN_EPOCHS`): its end, its epoch when
+    /// planned, when.
+    run_watch: Option<(u64, u32, Instant)>,
     /// This command processor's chunk workers.
     par_pool: super::par::Pool,
     /// A worker's per-command recording cost in its chunk (`tune par_cost`).
@@ -1587,6 +1590,10 @@ static CP_CLASSES: [[AtomicU64; 3]; 10] = [const { [const { AtomicU64::new(0) };
 /// The graphics command processor's serial commands by why they were not in
 /// a parallel run (`tune cp_classes`): `SERIAL_WHY_NAMES`.
 static SERIAL_WHY: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+/// The graphics CP's serial runs (`tune cp_classes`): [runs planned and left
+/// serial, commands executed in them, of those with the epoch unchanged since
+/// the run was planned, ns from planning to each command summed].
+static RUN_EPOCHS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 const SERIAL_WHY_NAMES: [&str; 14] = ["small fetched buffers", "streamed", "runs of 1", "runs of 2-7", "runs of 8-31", "runs of 32-127", "runs of 128 or more", "other", "small fetched buffers' count", "past a run", "past a label wait", "predicated", "held otherwise", "no plan made"];
 /// FRAMES when the classes were last cleared.
 static CP_CLASSES_FROM: AtomicU64 = AtomicU64::new(0);
@@ -1673,7 +1680,7 @@ fn class_end(k: usize, t: Option<(Instant, u64)>) {
 
 /// Clears the packet classes (`profile reset`).
 pub fn reset_classes() {
-    for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()).chain(SERIAL_WHY.iter()).chain(PLAN_PHASES.iter()).chain(PLAN_MAIN_WRITES.iter()) {
+    for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()).chain(SERIAL_WHY.iter()).chain(PLAN_PHASES.iter()).chain(PLAN_MAIN_WRITES.iter()).chain(RUN_EPOCHS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     CP_CLASSES_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -1697,6 +1704,14 @@ pub fn classes_line() -> String {
     let mut s = format!("    graphics command processor per flip by packet class (waits apart; {:.2} ms in all): {}\n", total as f64 / flips / 1e6, parts.join("; "));
     let why: Vec<String> = SERIAL_WHY.iter().zip(SERIAL_WHY_NAMES).map(|(c, name)| format!("{name} {:.1}", c.load(Ordering::Relaxed) as f64 / flips)).collect();
     s.push_str(&format!("    its serial commands per flip by why they were not in a parallel run: {}\n", why.join(", ")));
+    let re: Vec<u64> = RUN_EPOCHS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    s.push_str(&format!(
+        "    its serial runs planned: {:.1} a flip, {:.1} commands a flip run in them, {:.1}% of those at the epoch their run was planned in, {:.0} us after planning on average\n",
+        re[0] as f64 / flips,
+        re[1] as f64 / flips,
+        100.0 * re[2] as f64 / re[1].max(1) as f64,
+        re[3] as f64 / re[1].max(1) as f64 / 1e3
+    ));
     let ph: Vec<u64> = PLAN_PHASES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let us = |ns: u64, n: u64| ns as f64 / n.max(1) as f64 / 1e3;
     s.push_str(&format!(
@@ -1927,6 +1942,7 @@ impl Cp {
             par: None,
             par_skip: (0, 0),
             par_skip_n: 0,
+            run_watch: None,
             par_pool: super::par::Pool::new(),
             chunk_costs: None,
             run_costs: HashMap::new(),
@@ -2976,6 +2992,10 @@ impl Cp {
             // Not again before execution passes this run's end.
             self.par_skip = (end, run_end);
             self.par_skip_n = n;
+            if self.main_gfx && super::tune::cp_classes() {
+                self.run_watch = Some((run_end, super::precache::epoch() as u32, Instant::now()));
+                RUN_EPOCHS[0].fetch_add(1, Ordering::Relaxed);
+            }
             lap.mark(0);
             PLAN_PHASES[1].fetch_add(1, Ordering::Relaxed);
             return;
@@ -5066,6 +5086,7 @@ impl Cp {
         if super::frameprobe::on() && self.name == "gpu-gfx" {
             super::frameprobe::command();
         }
+        self.note_run_epoch();
         if !super::exec::enabled() || self.exec_failed {
             self.note("dispatches are decoded but not executed (set DS_GPU=1 to run them)");
             return;
@@ -5236,10 +5257,26 @@ impl Cp {
     }
 
     /// Executes a draw (when GPU execution is enabled).
+    /// A command of the serial run being watched (`RUN_EPOCHS`).
+    fn note_run_epoch(&mut self) {
+        if let Some((end, ep, t)) = self.run_watch {
+            if self.cur_packet < end {
+                RUN_EPOCHS[1].fetch_add(1, Ordering::Relaxed);
+                if super::precache::epoch() as u32 == ep {
+                    RUN_EPOCHS[2].fetch_add(1, Ordering::Relaxed);
+                }
+                RUN_EPOCHS[3].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            } else {
+                self.run_watch = None;
+            }
+        }
+    }
+
     fn draw(&mut self, args: super::exec::DrawArgs) {
         if super::frameprobe::on() && self.name == "gpu-gfx" {
             super::frameprobe::command();
         }
+        self.note_run_epoch();
         if !super::exec::enabled() || self.exec_failed {
             self.note("draws are decoded but not rendered (set DS_GPU=1 to render them)");
             return;
