@@ -253,11 +253,18 @@ fn arm_as(base: u64, len: u64, prot: u32) -> Result<(), String> {
             };
             w.fetch_or(m, Ordering::AcqRel);
         }
+        // (One call per allocation of the mixed range: `mem::host_pieces`;
+        // a failed one puts the pieces before it back.)
         let mut old = 0u32;
-        if unsafe { VirtualProtect(lo as _, (hi - lo) as usize, prot, &mut old) } == 0 {
-            let e = unsafe { GetLastError() };
-            disarm_bits(s, lo, hi);
-            return Err(format!("VirtualProtect {lo:#x}+{:#x}: error {e}", hi - lo));
+        for (a, e) in crate::mem::host_pieces(lo, hi) {
+            if unsafe { VirtualProtect(a as _, (e - a) as usize, prot, &mut old) } == 0 {
+                let err = unsafe { GetLastError() };
+                for (b, f) in crate::mem::host_pieces(lo, a) {
+                    unsafe { VirtualProtect(b as _, (f - b) as usize, PAGE_READWRITE, &mut old) };
+                }
+                disarm_bits(s, lo, hi);
+                return Err(format!("VirtualProtect {a:#x}+{:#x}: error {err}", e - a));
+            }
         }
         Ok(())
     })();

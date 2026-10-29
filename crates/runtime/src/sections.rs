@@ -615,6 +615,78 @@ mod tests {
         }
     }
 
+    /// The mixed range's private part (`mem`, `DS_MIXED=1`): a placeholder
+    /// whose windows are replaced at first use by reserve-only private
+    /// write-watched allocations, pages committed, written, decommitted and
+    /// protected inside them; which calls may span two such allocations; a
+    /// partly committed allocation released back to a placeholder (a window
+    /// given to a view later).
+    #[test]
+    fn windowed_private_allocations() {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_DECOMMIT, PAGE_READONLY};
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let base = 0x6300_0000_0000u64;
+        let w = 1u64 << 20;
+        unsafe {
+            let p = VirtualAlloc2(std::ptr::null_mut(), base as _, (3 * w) as usize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0);
+            assert!(!p.is_null(), "placeholder: error {}", GetLastError());
+            for k in 0..2 {
+                isolate(base + k * w, w).expect("isolating a window");
+                let q = VirtualAlloc2(std::ptr::null_mut(), (base + k * w) as _, w as usize, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | MEM_WRITE_WATCH, PAGE_NOACCESS, std::ptr::null_mut(), 0);
+                assert!(!q.is_null(), "a reserve-only write-watched allocation in window {k}: error {}", GetLastError());
+            }
+            let (a, n) = (base + w - 0x4000, 0x8000usize);
+            // Calls across the two allocations.
+            let commit = !VirtualAlloc(a as _, n, MEM_COMMIT, PAGE_READWRITE).is_null();
+            let commit_err = if commit { 0 } else { GetLastError() };
+            for k in 0..2 {
+                let (s, e) = (a.max(base + k * w), (a + n as u64).min(base + (k + 1) * w));
+                assert!(!VirtualAlloc(s as _, (e - s) as usize, MEM_COMMIT, PAGE_READWRITE).is_null(), "commit inside window {k}: error {}", GetLastError());
+            }
+            let mut old = 0u32;
+            let protect = VirtualProtect(a as _, n, PAGE_READONLY, &mut old) != 0;
+            let protect_err = if protect { 0 } else { GetLastError() };
+            for k in 0..2 {
+                let (s, e) = (a.max(base + k * w), (a + n as u64).min(base + (k + 1) * w));
+                assert!(VirtualProtect(s as _, (e - s) as usize, PAGE_READWRITE, &mut old) != 0, "protect inside window {k}: error {}", GetLastError());
+            }
+            // Committing reads as no write; writes are reported per window.
+            let take = |at: u64| -> Vec<u64> {
+                let mut addrs = [std::ptr::null_mut::<std::ffi::c_void>(); 64];
+                let (mut count, mut gran) = (addrs.len(), 0u32);
+                assert_eq!(GetWriteWatch(1, at as _, w as usize, addrs.as_mut_ptr(), &mut count, &mut gran), 0, "query at {at:#x}: error {}", GetLastError());
+                addrs[..count].iter().map(|&x| x as u64 - at).collect()
+            };
+            assert_eq!((take(base), take(base + w)), (vec![], vec![]), "marks after committing");
+            std::ptr::write_volatile((a + 0x1000) as *mut u32, 1);
+            std::ptr::write_volatile((a + 0x5000) as *mut u32, 2);
+            assert_eq!((take(base), take(base + w)), (vec![w - 0x3000], vec![0x1000]), "pages written");
+            let decommit = VirtualFree(a as _, n, MEM_DECOMMIT) != 0;
+            let decommit_err = if decommit { 0 } else { GetLastError() };
+            eprintln!("windowed_private_allocations: across two allocations commit {commit} (error {commit_err}), protect {protect} (error {protect_err}), decommit {decommit} (error {decommit_err})");
+            for k in 0..2 {
+                let (s, e) = (a.max(base + k * w), (a + n as u64).min(base + (k + 1) * w));
+                assert!(VirtualFree(s as _, (e - s) as usize, MEM_DECOMMIT) != 0, "decommit inside window {k}: error {}", GetLastError());
+            }
+            // Committed again: zeros, and no marks.
+            assert!(!VirtualAlloc((a + 0x4000) as _, 0x4000, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert_eq!(std::ptr::read_volatile((a + 0x5000) as *const u32), 0, "a decommitted page committed again");
+            let again = take(base + w);
+            eprintln!("windowed_private_allocations: marks after decommitting and committing again {again:x?}");
+            // A partly committed allocation back to a placeholder, coalesced
+            // with the untouched third window; a view could go there.
+            assert!(VirtualFree((base + w) as _, w as usize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0, "releasing a partly committed allocation to a placeholder: error {}", GetLastError());
+            assert!(VirtualFree((base + w) as _, (2 * w) as usize, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0, "coalescing: error {}", GetLastError());
+            let sec = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, (2 * w) as u32, std::ptr::null());
+            let v = MapViewOfFile3(sec, GetCurrentProcess(), (base + w) as _, 0, (2 * w) as usize, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
+            assert!(!v.Value.is_null(), "a view where the allocation was: error {}", GetLastError());
+            UnmapViewOfFile2(GetCurrentProcess(), v, 0);
+            windows_sys::Win32::Foundation::CloseHandle(sec);
+            VirtualFree(base as _, 0, MEM_RELEASE);
+            VirtualFree((base + w) as _, 0, MEM_RELEASE);
+        }
+    }
+
     /// Views, splits, aliases and contents that follow the section pages,
     /// in a private test range.
     #[test]

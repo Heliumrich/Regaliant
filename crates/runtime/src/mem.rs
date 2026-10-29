@@ -3,7 +3,11 @@
 //! The PS4 address range used by the guest is reserved once in the host process
 //! and pages are committed/decommitted at 4 KiB granularity inside it, so guest
 //! pointers are host pointers. A VMA map mirrors what the guest has mapped, and a
-//! separate allocator models PS4 "direct memory" (physical) ranges.
+//! separate allocator models PS4 "direct memory" (physical) ranges. The range is
+//! one placeholder whose 64 MiB windows become write-watched allocations of
+//! their own at first use (`mixed`; `DS_MIXED=0`: one write-watched
+//! reservation): the kernel serializes write-watch queries within one
+//! allocation.
 //!
 //! Limitation (reported, never silent): mapping the same direct-memory range at
 //! two virtual addresses (aliasing) is not shared; it is detected and logged.
@@ -172,7 +176,9 @@ fn unpark(va: u64, phys: u64, size: u64, prot: u32) {
     let writable = matches!(win_prot(prot), PAGE_READWRITE | PAGE_EXECUTE_READWRITE);
     let mut old = 0u32;
     if !writable {
-        unsafe { VirtualProtect(va as _, size as usize, PAGE_READWRITE, &mut old) };
+        for (a, e) in host_pieces(va, va + size) {
+            unsafe { VirtualProtect(a as _, (e - a) as usize, PAGE_READWRITE, &mut old) };
+        }
     }
     for k in keys {
         if let Some(b) = g.remove(&k) {
@@ -182,7 +188,9 @@ fn unpark(va: u64, phys: u64, size: u64, prot: u32) {
         }
     }
     if !writable {
-        unsafe { VirtualProtect(va as _, size as usize, win_prot(prot), &mut old) };
+        for (a, e) in host_pieces(va, va + size) {
+            unsafe { VirtualProtect(a as _, (e - a) as usize, win_prot(prot), &mut old) };
+        }
     }
 }
 
@@ -289,13 +297,14 @@ pub fn remap_status() -> String {
     .replace(
         " waiting)\n",
         &format!(
-            " waiting){carry}; direct mappings aligned to 64 KiB {}, to 16 KiB {}, less {}; other mappings {}, {}, {}\n",
+            " waiting){carry}; direct mappings aligned to 64 KiB {}, to 16 KiB {}, less {}; other mappings {}, {}, {}{}\n",
             MAP_ALIGN[0].load(o),
             MAP_ALIGN[1].load(o),
             MAP_ALIGN[2].load(o),
             MAP_ALIGN[3].load(o),
             MAP_ALIGN[4].load(o),
-            MAP_ALIGN[5].load(o)
+            MAP_ALIGN[5].load(o),
+            if mixed() { format!("; {}", mixed_state()) } else { String::new() }
         ),
     )
 }
@@ -581,7 +590,8 @@ pub fn env_is(name: &str, value: &str) -> bool {
 /// `reserve_guest_range` at the start of `main` and by the first heap
 /// allocation should one come earlier (`heap`). With write watching (the
 /// system notes which pages the CPU writes; `take_written`) unless
-/// `DS_WRITE_WATCH=0`.
+/// `DS_WRITE_WATCH=0`, in 64 MiB windows made at first use unless
+/// `DS_MIXED=0` (`mixed`).
 pub fn reserve_guest_range_early() {
     if RESERVED_EARLY.load(std::sync::atomic::Ordering::Acquire) {
         return;
@@ -591,6 +601,17 @@ pub fn reserve_guest_range_early() {
     if env_is("DS_SECTIONS", "1") && crate::sections::reserve(GUEST_BASE, size as u64, DMEM_SIZE, ANON_SIZE).is_ok() {
         RESERVED_EARLY.store(true, std::sync::atomic::Ordering::Release);
         return;
+    }
+    // The mixed range (`mixed`): one placeholder, windows made at first use.
+    if !env_is("DS_MIXED", "0") && !env_is("DS_WRITE_WATCH", "0") {
+        let p = unsafe { VirtualAlloc2(std::ptr::null_mut(), GUEST_BASE as _, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0) };
+        if !p.is_null() {
+            MIXED.store(true, std::sync::atomic::Ordering::Release);
+            WRITE_WATCH.store(true, std::sync::atomic::Ordering::Release);
+            RESERVED_EARLY.store(true, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        WRITE_WATCH_ERROR.store(last_error(), std::sync::atomic::Ordering::Release);
     }
     if !env_is("DS_WRITE_WATCH", "0") {
         let p = unsafe { VirtualAlloc(GUEST_BASE as _, size, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS) };
@@ -612,6 +633,113 @@ pub fn reserve_guest_range_early() {
 const MEM_WRITE_WATCH: u32 = 0x0020_0000;
 const WRITE_WATCH_FLAG_RESET: u32 = 1;
 
+/// The mixed guest range (default; `DS_MIXED=0`, boot: one write-watched
+/// reservation as before), first stage (FRONTEND2.md "GPU-quiet mappings on
+/// sections"): the guest range is one placeholder,
+/// and each 64 MiB window of it (`MIXED_SHIFT`: front end 2's chunks, the
+/// import windows) is replaced at its first commit by a reserve-only private
+/// allocation with write watching, in which pages are committed, decommitted
+/// and protected as in the one reservation otherwise. No host call or
+/// write-watch query may span two allocations (commits and protection
+/// changes fail with error 487, decommits with 87:
+/// `sections::tests::windowed_private_allocations`): they split at window
+/// boundaries (`host_pieces`), and a take skips windows never made. Every
+/// mapping is private so far (views for GPU-quiet mappings come next).
+/// Write-watch queries in different allocations do not wait for each other
+/// (in one they queue in the kernel, ~10 us more for each in flight): +5.3%
+/// for front end 2 at the vista, +5.0% for the default (FINDINGS.md
+/// 2026-10-29).
+static MIXED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const MIXED_SHIFT: u32 = 26;
+const MIXED_WINDOW: u64 = 1 << MIXED_SHIFT;
+const MIXED_WINDOWS: usize = ((GUEST_END - GUEST_BASE) >> MIXED_SHIFT) as usize;
+/// The windows made (their allocation in place), a bit each.
+static MIXED_MADE: [std::sync::atomic::AtomicU64; MIXED_WINDOWS.div_ceil(64)] = [const { std::sync::atomic::AtomicU64::new(0) }; MIXED_WINDOWS.div_ceil(64)];
+/// Serializes the making of windows.
+static MIXED_LOCK: Mutex<()> = Mutex::new(());
+/// [windows made, failures to make one, host calls split at a window
+/// boundary, takes split].
+static MIXED_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// Takes split at window boundaries by caller (`WW_WHO_NAMES`).
+static MIXED_SPLIT_WHO: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+const _: () = assert!(GUEST_BASE % MIXED_WINDOW == 0 && GUEST_END % MIXED_WINDOW == 0);
+
+/// The mixed guest range is on (unless `DS_MIXED=0`; set at the reservation).
+pub fn mixed() -> bool {
+    MIXED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether the window holding guest address `a` has its allocation.
+fn mixed_made(a: u64) -> bool {
+    if !(GUEST_BASE..GUEST_END).contains(&a) {
+        return false;
+    }
+    let w = ((a - GUEST_BASE) >> MIXED_SHIFT) as usize;
+    MIXED_MADE[w / 64].load(std::sync::atomic::Ordering::Acquire) >> (w % 64) & 1 != 0
+}
+
+/// Makes the allocations of the windows overlapping guest [a, e) that have
+/// none (their placeholders split off and replaced); the Win32 error.
+fn mixed_make(a: u64, e: u64) -> Result<(), u32> {
+    use std::sync::atomic::Ordering;
+    let mut w = a & !(MIXED_WINDOW - 1);
+    while w < e {
+        if !mixed_made(w) {
+            let _g = MIXED_LOCK.lock();
+            if !mixed_made(w) {
+                if let Err(err) = crate::sections::isolate(w, MIXED_WINDOW) {
+                    MIXED_STATS[1].fetch_add(1, Ordering::Relaxed);
+                    crate::warn!("mem: making the mixed range's window {w:#x}: {err}");
+                    return Err(0);
+                }
+                let p = unsafe { VirtualAlloc2(std::ptr::null_mut(), w as _, MIXED_WINDOW as usize, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | MEM_WRITE_WATCH, PAGE_NOACCESS, std::ptr::null_mut(), 0) };
+                if p.is_null() {
+                    let err = last_error();
+                    MIXED_STATS[1].fetch_add(1, Ordering::Relaxed);
+                    crate::warn!("mem: making the mixed range's window {w:#x}: error {err}");
+                    return Err(err);
+                }
+                let i = ((w - GUEST_BASE) >> MIXED_SHIFT) as usize;
+                MIXED_MADE[i / 64].fetch_or(1 << (i % 64), Ordering::AcqRel);
+                MIXED_STATS[0].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        w += MIXED_WINDOW;
+    }
+    Ok(())
+}
+
+/// The pieces of guest [a, e) one host memory call may take: all of it, or
+/// with the mixed range (`mixed`) its part in each window.
+pub(crate) fn host_pieces(a: u64, e: u64) -> impl Iterator<Item = (u64, u64)> {
+    if mixed() && e > a && a >> MIXED_SHIFT != (e - 1) >> MIXED_SHIFT {
+        MIXED_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    window_pieces(a, e)
+}
+
+/// `host_pieces` without its count (takes count their own).
+fn window_pieces(a: u64, e: u64) -> impl Iterator<Item = (u64, u64)> {
+    let split = mixed();
+    let mut p = a;
+    std::iter::from_fn(move || {
+        if p >= e {
+            return None;
+        }
+        let q = if split { ((p | (MIXED_WINDOW - 1)) + 1).min(e) } else { e };
+        let r = (p, q);
+        p = q;
+        Some(r)
+    })
+}
+
+/// The mixed range's state, for the start-up log and the status.
+fn mixed_state() -> String {
+    let v: Vec<u64> = MIXED_STATS.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
+    let who: Vec<String> = WW_WHO_NAMES.iter().zip(MIXED_SPLIT_WHO.iter()).map(|(n, c)| (n, c.load(std::sync::atomic::Ordering::Relaxed))).filter(|(_, c)| *c > 0).map(|(n, c)| format!("{n} {c}")).collect();
+    format!("mixed range: {} windows of 64 MiB made ({} failed), {} host calls and {} takes split at window boundaries (takes by caller: {})", v[0], v[1], v[2], v[3], who.join(", "))
+}
+
 /// Whether CPU writes to the guest range are tracked (`take_written`):
 /// write watching, or page protection for section-backed memory.
 pub fn write_watched() -> bool {
@@ -621,6 +749,7 @@ pub fn write_watched() -> bool {
 /// Write watching of the guest range, for the start-up log.
 pub fn write_watch_state() -> String {
     match (write_watched(), WRITE_WATCH_ERROR.load(std::sync::atomic::Ordering::Acquire)) {
+        (true, _) if mixed() => format!("on ({})", mixed_state()),
         (true, _) => "on".into(),
         (false, 0) => "off".into(),
         (false, e) => format!("off (reserving with write watch failed: error {e})"),
@@ -782,6 +911,31 @@ pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>, who: usize) -> Opt
 }
 
 fn take_written_inner(lo: u64, hi: u64, out: &mut Vec<u64>, who: usize) -> Option<()> {
+    if mixed() {
+        // One query per window's allocation (none may span two); a window
+        // never made holds no written page.
+        if lo < GUEST_BASE || hi > GUEST_END {
+            return None;
+        }
+        if lo >> MIXED_SHIFT != (hi - 1) >> MIXED_SHIFT {
+            MIXED_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            MIXED_SPLIT_WHO[who.min(9)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for (a, e) in window_pieces(lo, hi) {
+                if mixed_made(a) {
+                    take_written_query(a, e, out, who)?;
+                }
+            }
+            return Some(());
+        }
+        if !mixed_made(lo) {
+            return Some(());
+        }
+    }
+    take_written_query(lo, hi, out, who)
+}
+
+/// One write-watch take of [lo, hi) (inside one allocation).
+fn take_written_query(lo: u64, hi: u64, out: &mut Vec<u64>, who: usize) -> Option<()> {
     use std::sync::atomic::Ordering::Relaxed;
     let _turn = ww_turn();
     let inflight = InFlight::new();
@@ -911,6 +1065,9 @@ fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     let t0 = std::time::Instant::now();
     crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_COMMIT);
     repaged(addr, size);
+    if mixed() {
+        mixed_make(addr, addr + size).map_err(MemError::HostFailure)?;
+    }
     // Parts whose decommit was deferred are still committed with their old
     // contents: a new mapping starts zeroed, as after a decommit.
     let stale = cancel_deferred(addr, addr + size);
@@ -922,9 +1079,11 @@ fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
         note_since(Mirror, t, || format!("a commit of {addr:#x}+{size:#x} waiting for the guest memory's readers"));
         let t = std::time::Instant::now();
         for &(a, e) in &stale {
-            let p = unsafe { VirtualAlloc(a as _, (e - a) as usize, MEM_COMMIT, PAGE_READWRITE) };
-            if !p.is_null() {
-                unsafe { std::ptr::write_bytes(a as *mut u8, 0, (e - a) as usize) };
+            for (a, e) in host_pieces(a, e) {
+                let p = unsafe { VirtualAlloc(a as _, (e - a) as usize, MEM_COMMIT, PAGE_READWRITE) };
+                if !p.is_null() {
+                    unsafe { std::ptr::write_bytes(a as *mut u8, 0, (e - a) as usize) };
+                }
             }
         }
         note_since(Mirror, t, || format!("a commit of {addr:#x}+{size:#x} zeroing {} bytes left by deferred decommits", stale.iter().map(|r| r.1 - r.0).sum::<u64>()));
@@ -939,7 +1098,13 @@ fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     crate::hosted::disarm(addr, size);
     note_since(Mirror, t, || format!("a commit of {addr:#x}+{size:#x}: its disarm"));
     let t = std::time::Instant::now();
-    let p = unsafe { VirtualAlloc(addr as _, size as usize, MEM_COMMIT, win_prot(prot)) };
+    let mut p = std::ptr::null_mut();
+    for (a, e) in host_pieces(addr, addr + size) {
+        p = unsafe { VirtualAlloc(a as _, (e - a) as usize, MEM_COMMIT, win_prot(prot)) };
+        if p.is_null() {
+            break;
+        }
+    }
     note_since(Mirror, t, || format!("a commit of {addr:#x}+{size:#x}: VirtualAlloc"));
     let t = std::time::Instant::now();
     crate::gpu::resident::settled(addr, size);
@@ -1017,8 +1182,8 @@ pub fn retry_deferred() {
         }
         let _readers_out = GUEST_READERS.write();
         let _arm = crate::gpu::resident::remap_guard();
-        unsafe {
-            VirtualFree(a as _, (e - a) as usize, MEM_DECOMMIT);
+        for (a, e) in host_pieces(a, e) {
+            unsafe { VirtualFree(a as _, (e - a) as usize, MEM_DECOMMIT) };
         }
         // Their page states go with them, armed bits too: decommitted pages
         // still marked armed made a disarm over them and their armed
@@ -1203,8 +1368,8 @@ fn host_decommit(addr: u64, size: u64) {
     }
     let _readers_out = GUEST_READERS.write();
     let _arm = crate::gpu::resident::remap_guard();
-    unsafe {
-        VirtualFree(addr as _, size as usize, MEM_DECOMMIT);
+    for (a, e) in host_pieces(addr, addr + size) {
+        unsafe { VirtualFree(a as _, (e - a) as usize, MEM_DECOMMIT) };
     }
     crate::gpu::resident::settled(addr, size);
     note_host_call(2, t0);
@@ -1219,10 +1384,17 @@ pub fn host_protect(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     let mut old = 0u32;
     let _readers_out = GUEST_READERS.write();
     let _arm = crate::gpu::resident::remap_guard();
-    let ok = unsafe { VirtualProtect(addr as _, size as usize, win_prot(prot), &mut old) };
+    let (mut ok, mut done) = (1, addr);
+    for (a, e) in host_pieces(addr, addr + size) {
+        ok = unsafe { VirtualProtect(a as _, (e - a) as usize, win_prot(prot), &mut old) };
+        if ok == 0 {
+            break;
+        }
+        done = e;
+    }
     // After the change (a failed one left armed pages armed).
-    if ok != 0 {
-        crate::gpu::resident::settled(addr, size);
+    if done > addr {
+        crate::gpu::resident::settled(addr, done - addr);
     }
     note_host_call(5, t0);
     if ok == 0 { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
