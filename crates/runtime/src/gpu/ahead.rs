@@ -243,8 +243,19 @@ fn run_slot(slot: &Slot) {
         } else {
             r
         };
-        // (Its bindings, for the checks made after the result is posted.)
-        let found = r.as_ref().ok().filter(|_| slot.precheck).map(|p| p.found.clone());
+        // (Its bindings, for the checks made after the result is posted;
+        // `tune fe2_precheck` 2: before, so the CP finds them made or waits
+        // for this slot while it runs.)
+        let before = super::tune::fe2_precheck_mode() == 2;
+        if before && slot.precheck {
+            if let Ok(p) = &r {
+                let t = std::time::Instant::now();
+                super::exec::fe2_precheck_stage(&p.found);
+                STATS[PRECHECKS].fetch_add(1, Ordering::Relaxed);
+                STATS[PRECHECK_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+        }
+        let found = r.as_ref().ok().filter(|_| slot.precheck && !before).map(|p| p.found.clone());
         *slot.result.lock() = Some(r);
         slot.state.store(DONE, Ordering::Release);
         slot.cv.notify_all();

@@ -2277,6 +2277,12 @@ pub mod tune {
         get(209) != 0
     }
 
+    /// `fe2_precheck`'s mode: 1 the checks made after a stage's result is
+    /// posted, 2 before it (the CP then waits for a running slot's checks).
+    pub fn fe2_precheck_mode() -> u64 {
+        get(209)
+    }
+
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
     /// without appends).
     #[inline]
