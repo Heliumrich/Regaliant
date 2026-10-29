@@ -4639,7 +4639,8 @@ impl Cp {
                     run_first = cmds.len();
                 }
                 run_len += 1;
-                let stages = stages.map(|r| r.map(|r| super::ahead::Slot::new(r, wave64)));
+                let checked = self.fe2_prechecks();
+                let stages = stages.map(|r| r.map(|r| super::ahead::Slot::new_checked(r, wave64, checked)));
                 cmds.push(AheadCmd { at, stages, gfx });
             }
             cur = next;
@@ -4864,7 +4865,8 @@ impl Cp {
                 }
             }
             if let Some(stages) = command {
-                let stages = stages.map(|r| r.map(|r| super::ahead::Slot::new(r, wave64)));
+                let checked = self.fe2_prechecks();
+                let stages = stages.map(|r| r.map(|r| super::ahead::Slot::new_checked(r, wave64, checked)));
                 slots.extend(stages.iter().flatten().cloned());
                 self.ahead.push_back(AheadCmd { at, stages, gfx: None });
             }
@@ -4873,6 +4875,13 @@ impl Cp {
         *self.scan_regs.borrow_mut() = (sh, ctx);
         super::ahead::submit(&slots);
         super::ahead::note_scan(why, t0.elapsed().as_nanos() as u64);
+    }
+
+    /// Whether this command processor's stages prepared ahead get their
+    /// placement checks where they are prepared (`tune fe2_precheck`: the
+    /// graphics CP under front end 2, whose view is the epoch now).
+    fn fe2_prechecks(&self) -> bool {
+        self.main_gfx && !self.compute && super::fe2::on() && super::tune::fe2_precheck()
     }
 
     /// Completes recorded GPU work (at synchronization points: the CP waits

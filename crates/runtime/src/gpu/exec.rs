@@ -688,6 +688,32 @@ fn fixed() -> &'static Fixed {
     })
 }
 
+/// Front end 2 (`tune fe2_precheck`): the placement checks of a stage
+/// prepared ahead, made by the thread that prepared it (`gpu::ahead`): its
+/// sized buffer bindings in the mirror's span checked in the epoch now
+/// (`fe2::precheck`: takes and clean stamps; uploads stay the command
+/// processor's). Bindings resolved by the shader and unsized pointers are
+/// left to the command processor.
+pub(super) fn fe2_precheck_stage(found: &super::shaders::Found) {
+    let gpu_res = found.tr.spec.gpu_res;
+    for b in &found.tr.out.bindings {
+        let i = match b.kind {
+            BindingKind::Address(i) if i < 64 && gpu_res & (1u64 << i) != 0 => continue,
+            BindingKind::Buffer(i) | BindingKind::Address(i) => i,
+            _ => continue,
+        };
+        let (base, size) = match found.resources.get(i) {
+            Some(Resolved::Buffer(v)) => (v.base, v.byte_size()),
+            Some(Resolved::Global(a, n)) => (*a, *n),
+            _ => continue,
+        };
+        let Some(size) = size.filter(|&n| n > 0) else { continue };
+        if super::fe2::in_span(base, size) {
+            super::fe2::precheck(base, size, &fe2_armable);
+        }
+    }
+}
+
 /// Guest mapping containing `addr`: [start, end) of its VMA.
 fn mapping(addr: u64) -> Option<(u64, u64)> {
     let st = crate::mem::MEM.lock();

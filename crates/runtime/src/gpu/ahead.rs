@@ -31,6 +31,9 @@ const CANCELLED: u32 = 3;
 pub struct Slot {
     regs: StageRegs,
     wave64: bool,
+    /// Its bindings' placement checks are made where it is prepared, after
+    /// its result is posted (`tune fe2_precheck`).
+    precheck: bool,
     state: AtomicU32,
     result: Mutex<Option<Result<Prepared, String>>>,
     cv: Condvar,
@@ -38,7 +41,13 @@ pub struct Slot {
 
 impl Slot {
     pub fn new(regs: StageRegs, wave64: bool) -> Arc<Slot> {
-        Arc::new(Slot { regs, wave64, state: AtomicU32::new(QUEUED), result: Mutex::new(None), cv: Condvar::new() })
+        Self::new_checked(regs, wave64, false)
+    }
+
+    /// `new`, its placement checks made where it is prepared when
+    /// `precheck` (the graphics CP's stages under front end 2).
+    pub fn new_checked(regs: StageRegs, wave64: bool, precheck: bool) -> Arc<Slot> {
+        Arc::new(Slot { regs, wave64, precheck, state: AtomicU32::new(QUEUED), result: Mutex::new(None), cv: Condvar::new() })
     }
 
     /// The registers its preparation reads (`gpu::compile`).
@@ -87,7 +96,11 @@ const HERE: usize = 13;
 const HERE_NS: usize = 14;
 const WAIT_SCANS: usize = 15;
 const WAIT_CMDS: usize = 16;
-static STATS: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
+/// Stages whose placement checks were made where they were prepared, and
+/// those checks' ns (`tune fe2_precheck`).
+const PRECHECKS: usize = 17;
+const PRECHECK_NS: usize = 18;
+static STATS: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
 
 /// Failed preparations by stage kind and reason (the error's words, numbers
 /// and addresses left out).
@@ -230,9 +243,17 @@ fn run_slot(slot: &Slot) {
         } else {
             r
         };
+        // (Its bindings, for the checks made after the result is posted.)
+        let found = r.as_ref().ok().filter(|_| slot.precheck).map(|p| p.found.clone());
         *slot.result.lock() = Some(r);
         slot.state.store(DONE, Ordering::Release);
         slot.cv.notify_all();
+        if let Some(found) = found {
+            let t = std::time::Instant::now();
+            super::exec::fe2_precheck_stage(&found);
+            STATS[PRECHECKS].fetch_add(1, Ordering::Relaxed);
+            STATS[PRECHECK_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
     }
 }
 
@@ -330,7 +351,7 @@ pub fn status() -> String {
     why.sort_by(|a, b| b.1.cmp(&a.1));
     let why: Vec<String> = why.iter().take(6).map(|(k, n)| format!("{n} {k}")).collect();
     format!(
-        "    preparations ahead: {} scans ({} ms; ended by {}), {} stages handed to {} workers, {} scans at label waits found {} commands, {} stages prepared while waiting ({} ms), {} used, {} prepared here instead (not started), stale: {} registers, {} program, {} GPU images, {} words; {} failed ({}), {} dropped; {} waits for a worker ({} ms)\n",
+        "    preparations ahead: {} scans ({} ms; ended by {}), {} stages handed to {} workers, {} scans at label waits found {} commands, {} stages prepared while waiting ({} ms), {} used, {} prepared here instead (not started), stale: {} registers, {} program, {} GPU images, {} words; {} failed ({}), {} dropped; {} waits for a worker ({} ms); placement checks made where prepared {} ({} ms)\n",
         s[SCANS],
         s[SCAN_NS] / 1_000_000,
         stops.join(", "),
@@ -350,6 +371,8 @@ pub fn status() -> String {
         why.join("; "),
         s[DROPPED],
         s[WAITS],
-        s[WAITED_NS] / 1_000_000
+        s[WAITED_NS] / 1_000_000,
+        s[PRECHECKS],
+        s[PRECHECK_NS] / 1_000_000
     )
 }

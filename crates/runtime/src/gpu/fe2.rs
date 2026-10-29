@@ -925,6 +925,33 @@ pub fn ensure(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn
     r
 }
 
+thread_local! {
+    /// This thread's check is a placement check made ahead (`precheck`):
+    /// its uploads are left to the command processor, not counted.
+    static PRECHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The placement check of guest [base, base+size) for a stage prepared
+/// ahead of the graphics CP (`tune fe2_precheck`; `gpu::ahead`): its pages
+/// are taken and stamped clean in the epoch now, pages M lacks left invalid
+/// (the command processor's own check uploads them in order, into its
+/// batch). A run has no synchronization in it, so the CP's view at the
+/// command's turn is at most this epoch unless one ended meanwhile (then it
+/// takes again, as without this).
+pub fn precheck(base: u64, size: u64, armable: &Armable) {
+    let lo = base & !(PAGE - 1);
+    let Some((_, mapped_end)) = crate::mem::readable_span(base) else { return };
+    let hi = base.saturating_add(size).next_multiple_of(PAGE).min(mapped_end.next_multiple_of(PAGE));
+    if hi <= lo {
+        return;
+    }
+    let ep = super::precache::epoch() as u32;
+    set_caller("ahead");
+    PRECHECK.with(|p| p.set(true));
+    let _ = ensure_inner(lo, hi, ep, ep, false, &|_| false, &mut |_, _| true, armable, None);
+    PRECHECK.with(|p| p.set(false));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, mut defer: Option<&mut Vec<(u64, u64)>>) -> Result<(), &'static str> {
     let sc = size_class((hi - lo) / PAGE);
@@ -1055,7 +1082,11 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
         let frame = super::FRAMES.load(Ordering::Relaxed);
         for &(a, b) in bad.iter() {
             note_arming_ended(a, b);
-            // Every page written lately: uploaded as it is, without a take.
+            // Every page written lately: uploaded as it is, without a take
+            // (by the command processor: a check made ahead leaves it).
+            if PRECHECK.with(|p| p.get()) && hot_run(a, b, frame) {
+                continue;
+            }
             if hot_run(a, b, frame) {
                 STATS[S_HOT_RUNS].fetch_add(1, Ordering::Relaxed);
                 let mut x = a;
@@ -1332,8 +1363,13 @@ fn upload_lacking(a: u64, b: u64, mine: &dyn Fn(u64) -> bool, upload: &mut dyn F
     let mut failed = false;
     let mut pages = 0u64;
     let mut run: Option<(u64, u64)> = None;
+    // (A check made ahead uploads nothing: `precheck`.)
+    let pre = PRECHECK.with(|p| p.get());
     let mut flush = |run: &mut Option<(u64, u64)>, failed: &mut bool, pages: &mut u64| {
         if let Some((x, y)) = run.take() {
+            if pre {
+                return;
+            }
             if !upload(x, y) {
                 STATS[S_UPLOAD_FAILED].fetch_add(1, Ordering::Relaxed);
                 *failed = true;

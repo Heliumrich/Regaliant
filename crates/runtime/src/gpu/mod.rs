@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 209] = [
+    static ALL: [Tunable; 210] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -242,6 +242,7 @@ pub mod tune {
         Tunable { name: "fe2_label_track", env: "DS_FE2_LABEL_TRACK", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_cpw_close", env: "DS_FE2_CPW_CLOSE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_cpw_waited", env: "DS_FE2_CPW_WAITED", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe2_precheck", env: "DS_FE2_PRECHECK", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2265,6 +2266,15 @@ pub mod tune {
     /// our CPs wait on too, and reading data before the batch completes.
     pub fn fe2_cpw_waited() -> bool {
         get(208) != 0
+    }
+
+    /// Front end 2: the placement checks of the graphics CP's stages
+    /// prepared ahead (`gpu::ahead`), made where they are prepared (the
+    /// workers, or the CP at its label waits): takes stamp clean pages with
+    /// the epoch now, which holds to the commands' turns within a run;
+    /// uploads stay the CP's (`fe2::precheck`).
+    pub fn fe2_precheck() -> bool {
+        get(209) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
