@@ -3316,8 +3316,10 @@ static SHADOWS_REUSED: AtomicU64 = AtomicU64::new(0);
 /// shared: written in place meanwhile, CPU-written meanwhile, no entry].
 static SHADOWS_SHARED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// End-of-pipe writes without a full barrier (`tune eop_light`): [labels,
-/// timestamps, waits that ordered the work after them].
-static EOP_LIGHT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// timestamps, waits that ordered the work after them, CP writes right after
+/// front end 2's write-back with no barrier before them (`tune
+/// fe2_cpw_light`)].
+static EOP_LIGHT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// Dispatches storing deferred timestamps (`Exec::resolve_timestamps`), and
 /// deferred timestamps a later one of the same resolve overwrote.
 static TS_DISPATCHES: AtomicU64 = AtomicU64::new(0);
@@ -7900,8 +7902,11 @@ impl Exec {
                 ctx().device.cmd_reset_query_pool(self.cmd(), bq, BQ_BATCH, 2);
             }
             // Mirror mode: the batch's touched-page list starts empty (the
-            // full barrier below orders it before the batch's work).
-            if let Some(m) = super::resident::marks() {
+            // full barrier below orders it before the batch's work). (Front
+            // end 2's write-back that empties it itself leaves it so: every
+            // batch whose work marks ends with one, and all batches run in
+            // order; entries left over would only be written back again.)
+            if let Some(m) = super::resident::marks().filter(|_| !super::fe2::scatter_resets()) {
                 ctx().device.cmd_fill_buffer(self.cmd(), m, rdna::kernels::MARK_LIST_AT as u64 * 4, 4, 0);
             }
         }
@@ -8851,7 +8856,10 @@ impl Exec {
         let (first, first_pend) = (up.len(), deferred.len());
         // (Asked per page of the runs a check needs: empty sets are not
         // hashed into.)
-        let r = super::fe2::ensure(lo, hi, want, ep, written, &|p| (!mine.is_empty() && mine.contains(&p)) || (!pend.is_empty() && pend.contains(&p)), &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable, super::fe2::defer_checks().then_some(&mut deferred));
+        // (`tune fe2_defer_gfx`: the graphics queue's alone, not the compute
+        // queues' many small batches with their label writes.)
+        let defer = super::fe2::defer_checks() || (super::tune::fe2_defer_gfx() && self.name.starts_with("gpu-gfx"));
+        let r = super::fe2::ensure(lo, hi, want, ep, written, &|p| (!mine.is_empty() && mine.contains(&p)) || (!pend.is_empty() && pend.contains(&p)), &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable, defer.then_some(&mut deferred));
         // Past a label wait the CPU may write the pages it rewrites every
         // frame again before the label (FINDINGS.md 2026-10-29): a small
         // binding's such pages are uploaded as they are when the stretch
@@ -9155,8 +9163,9 @@ impl Exec {
     }
 
     /// Front end 2's write-back, recorded now (outside a render pass): the
-    /// dwords GPU work marked go from the mirror to guest memory.
-    fn fe2_scatter(&mut self) {
+    /// dwords GPU work marked go from the mirror to guest memory. Whether
+    /// it was recorded (with its barriers).
+    fn fe2_scatter(&mut self) -> bool {
         // (`DS_PROFILE_GPU_STAMPS=seg`: a segment of its own, `front end 2
         // write-backs`; its own barriers write no segment stamps, and its
         // time went to the commands before it.)
@@ -9165,15 +9174,24 @@ impl Exec {
             self.barrier();
         }
         let cmd = self.cmd();
-        if let Some(pipe) = super::fe2::record_scatter(cmd) {
+        let recorded = if let Some(pipe) = super::fe2::record_scatter(cmd) {
             // The next dispatch binds its own pipeline and descriptors.
             self.dyncache.cs_pipeline = pipe;
+            true
+        } else {
+            false
+        };
+        // (Its first barrier holds it after all earlier work and its last
+        // all later work after it: a full one for what follows.)
+        if recorded && super::tune::fe2_cpw_light() {
+            self.barrier_noted();
         }
         self.ops[OP_FE2_SCATTERS] += 1;
         if seg {
             self.barrier();
         }
         self.fe2_marked = false;
+        recorded
     }
 
     fn mirror_place(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
@@ -11053,9 +11071,10 @@ impl Exec {
         // memory before this write does (a title thread that sees it reads
         // that there), and the write goes into the mirror too (later work
         // reads it there).
+        let mut after_scatter = false;
         if self.fe2_marked {
             SCATTER_SITES[0].fetch_add(1, Ordering::Relaxed);
-            self.fe2_scatter();
+            after_scatter = self.fe2_scatter();
         }
         let fe2_mirror = if super::fe2::on() && super::fe2::in_span(a, bytes) && super::resident::back(a & !4095, (a + bytes).next_multiple_of(4096) - (a & !4095)).is_ok() {
             super::fe2::note_cp_mirror();
@@ -11079,8 +11098,12 @@ impl Exec {
             // the work after it (`order_after_open_writes`).
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
             unsafe {
-                if super::tune::skip_barriers() & 256 == 0 {
+                // (Right after front end 2's write-back none: its last
+                // barrier holds all later work, its first all earlier work.)
+                if super::tune::skip_barriers() & 256 == 0 && !(after_scatter && super::tune::fe2_cpw_light()) {
                     ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+                } else if after_scatter {
+                    EOP_LIGHT[3].fetch_add(1, Ordering::Relaxed);
                 }
                 ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw);
                 to_mirror(cmd);
@@ -11098,7 +11121,12 @@ impl Exec {
             unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
             to_mirror(cmd);
         } else {
-            self.barrier();
+            // (Right after front end 2's write-back none: see above.)
+            if after_scatter && super::tune::fe2_cpw_light() && !seg_stamps() {
+                EOP_LIGHT[3].fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.barrier();
+            }
             // Counted between its barriers (`seg_stamps` names the segment
             // by it).
             self.ops[OP_CP_WRITES] += 1;
@@ -11917,6 +11945,14 @@ impl Exec {
                 self.segs.push(SegMark { query, cmds: self.batch_shaders.len() as u32, ops: self.ops, site: std::panic::Location::caller() });
             }
         }
+        self.barrier_noted();
+    }
+
+    /// What a full barrier resets in this executor's tracking (the work
+    /// since the last one), without recording one: for barriers recorded
+    /// otherwise that order all earlier work before all later work (front
+    /// end 2's write-back, `tune fe2_cpw_light`).
+    fn barrier_noted(&mut self) {
         self.barrier_wanted = false;
         self.dispatched = false;
         self.args_read = false;
@@ -14587,12 +14623,13 @@ pub fn status() -> String {
             COALESCED[1].load(Ordering::Relaxed)
         )
         + &format!(
-            "    end-of-pipe writes without a full barrier: {} labels, {} timestamps (stored by {} dispatches, {} overwritten in their batch); {} waits ordered the work after them\n",
+            "    end-of-pipe writes without a full barrier: {} labels, {} timestamps (stored by {} dispatches, {} overwritten in their batch); {} waits ordered the work after them; {} CP writes right after front end 2's write-back with no barrier before them\n",
             EOP_LIGHT[0].load(Ordering::Relaxed),
             EOP_LIGHT[1].load(Ordering::Relaxed),
             TS_DISPATCHES.load(Ordering::Relaxed),
             TS_REPEATS.load(Ordering::Relaxed),
-            EOP_LIGHT[2].load(Ordering::Relaxed)
+            EOP_LIGHT[2].load(Ordering::Relaxed),
+            EOP_LIGHT[3].load(Ordering::Relaxed)
         )
         + &format!(
             "    shadows shared after their merge: {}, copies in from them {}; not shared: {} written in place meanwhile, {} CPU-written, {} no entry\n",

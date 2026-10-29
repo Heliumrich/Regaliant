@@ -1113,10 +1113,15 @@ fn widen(a: u64, b: u64) -> (u64, u64) {
     if (b - a) / PAGE > WIDE_TAKE || !wide_takes() {
         return (a, b);
     }
-    let (wa, wb) = (a & !(64 * PAGE - 1), b.next_multiple_of(64 * PAGE));
+    // (`tune fe2_wide_pages`: the window in pages, whole words.)
+    let w = super::tune::fe2_wide_pages().max(64).next_multiple_of(64) * PAGE;
+    let (wa, wb) = (a - a % w, b.next_multiple_of(w));
     let Some((s, e)) = crate::mem::readable_span(a).filter(|&(s, e)| s <= a && b <= e) else { return (a, b) };
     let (lo, hi) = (wa.max(s.next_multiple_of(PAGE)), wb.min(e & !(PAGE - 1)));
-    let gpu = |p: u64| chunk(p, false).is_some_and(|c| c.gpu[idx(p) / 64].load(Ordering::Relaxed) >> (idx(p) % 64) & 1 != 0);
+    // (Past one word only pages a take saw before: a first look at a page
+    // counts as a write, `set_clean`, and its next checks would upload it.)
+    let seen_only = w > 64 * PAGE;
+    let gpu = |p: u64| chunk(p, false).is_some_and(|c| (c.gpu[idx(p) / 64].load(Ordering::Relaxed) & if seen_only { c.seen[idx(p) / 64].load(Ordering::Relaxed) } else { u64::MAX }) >> (idx(p) % 64) & 1 != 0);
     let (mut ta, mut tb) = (a, b);
     while ta > lo && gpu(ta - PAGE) {
         ta -= PAGE;
@@ -2197,13 +2202,27 @@ pub fn invalidate(base: u64, len: u64) {
 }
 
 /// The write-back's pipeline, its one descriptor set (the written-bit map
-/// and the counters never change) and the counters (host visible).
+/// and the counters never change), the counters (host visible), whether
+/// its kernel empties the touched-page list itself (`tune
+/// fe2_scatter_reset`) and the counters it adds to in video memory (`tune
+/// fe2_scatter_dev`: copied into the host-visible ones every
+/// COUNTER_COPY_EVERY write-backs).
 struct Scatter {
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
     set: vk::DescriptorSet,
     counters: *mut u32,
+    reset: bool,
+    host: vk::Buffer,
+    dev: Option<vk::Buffer>,
 }
+
+/// Write-backs between copies of the video-memory counters into the
+/// host-visible ones (`tune fe2_scatter_dev`; the status line's counts lag
+/// by at most that many).
+const COUNTER_COPY_EVERY: u64 = 64;
+
+static SCATTERS_RECORDED: AtomicU64 = AtomicU64::new(0);
 
 unsafe impl Send for Scatter {}
 unsafe impl Sync for Scatter {}
@@ -2220,7 +2239,8 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
         let layouts = [set_layout];
         let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 16 }];
         let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("scatter layout: {e}"))?;
-        let code = rdna::kernels::mirror_scatter();
+        let reset = super::tune::fe2_scatter_reset();
+        let code = if reset { rdna::kernels::mirror_scatter_reset() } else { rdna::kernels::mirror_scatter() };
         let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("scatter module: {e}"))?;
         let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
         let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
@@ -2231,22 +2251,30 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
         let pool = c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).map_err(|e| format!("scatter pool: {e}"))?;
         let set = c.device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts)).map_err(|e| format!("scatter set: {e}"))?[0];
         let bytes = 4 * rdna::kernels::SCATTER_COUNTERS as u64;
-        let (cbuf, _cmem, cptr) = c.host_buffer(bytes, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+        let (cbuf, _cmem, cptr) = c.host_buffer(bytes, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)?;
         std::ptr::write_bytes(cptr, 0, bytes as usize);
-        let infos = [vk::DescriptorBufferInfo { buffer: marks, offset: 0, range: super::resident::MARK_BYTES }, vk::DescriptorBufferInfo { buffer: cbuf, offset: 0, range: bytes }];
+        let dev = if super::tune::fe2_scatter_dev() {
+            let (d, _dmem) = c.device_buffer(bytes, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)?;
+            super::resident::one_off_now(|cmd| c.device.cmd_fill_buffer(cmd, d, 0, bytes, 0))?;
+            Some(d)
+        } else {
+            None
+        };
+        let infos = [vk::DescriptorBufferInfo { buffer: marks, offset: 0, range: super::resident::MARK_BYTES }, vk::DescriptorBufferInfo { buffer: dev.unwrap_or(cbuf), offset: 0, range: bytes }];
         let writes: Vec<vk::WriteDescriptorSet> = infos
             .iter()
             .enumerate()
             .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
             .collect();
         c.device.update_descriptor_sets(&writes, &[]);
-        Ok(Scatter { pipeline, layout, set, counters: cptr as *mut u32 })
+        Ok(Scatter { pipeline, layout, set, counters: cptr as *mut u32, reset, host: cbuf, dev })
     }
 }
 
 /// Records the write-back into `cmd` (outside a render pass): a barrier
 /// after all earlier work, the scatter over the touched-page list, the
-/// list emptied, a barrier before all later work. Returns the pipeline it
+/// list emptied (by the kernel itself under `tune fe2_scatter_reset`), a
+/// barrier before all later work. Returns the pipeline it
 /// bound (the caller's bound compute state is gone).
 pub fn record_scatter(cmd: vk::CommandBuffer) -> Option<vk::Pipeline> {
     let s = SCATTER.get()?;
@@ -2263,18 +2291,52 @@ pub fn record_scatter(cmd: vk::CommandBuffer) -> Option<vk::Pipeline> {
         c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
         c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
         c.device.cmd_dispatch_indirect(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4);
-        let to_fill = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[to_fill], &[], &[]);
-        c.device.cmd_fill_buffer(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4, 4, 0);
-        let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_READ);
-        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[after], &[], &[]);
+        if s.dev.is_some() && SCATTERS_RECORDED.fetch_add(1, Ordering::Relaxed) % COUNTER_COPY_EVERY == COUNTER_COPY_EVERY - 1 {
+            record_counter_copy(s, cmd);
+        }
+        if s.reset {
+            // (The kernel emptied the list; the barrier's first scope holds
+            // the dispatch's read of its arguments, a logically earlier
+            // stage.)
+            let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[after], &[], &[]);
+        } else {
+            let to_fill = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[to_fill], &[], &[]);
+            c.device.cmd_fill_buffer(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4, 4, 0);
+            let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[after], &[], &[]);
+        }
     }
     note_scatter();
     Some(s.pipeline)
 }
 
+/// Records a copy of the write-back's video-memory counters into the
+/// host-visible ones (after the write-backs before it; the barrier after
+/// the write-back that follows makes it visible to the host).
+unsafe fn record_counter_copy(s: &Scatter, cmd: vk::CommandBuffer) {
+    let Some(d) = s.dev else { return };
+    let c = ctx();
+    let to_copy = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+    let bytes = 4 * rdna::kernels::SCATTER_COUNTERS as u64;
+    let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+    unsafe {
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[to_copy], &[], &[]);
+        c.device.cmd_copy_buffer(cmd, d, s.host, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[after], &[], &[]);
+    }
+}
+
+/// Whether front end 2 is on with the write-back kernel that empties the
+/// touched-page list itself (`tune fe2_scatter_reset` when it was made).
+pub fn scatter_resets() -> bool {
+    on() && SCATTER.get().is_some_and(|s| s.reset)
+}
+
 /// The write-back's counters (pages, dwords, pages without a mapping,
-/// overflowed lists), as the GPU left them so far.
+/// overflowed lists), as the GPU left them so far (under `tune
+/// fe2_scatter_dev` as of the last copy).
 fn counters() -> [u32; 4] {
     let Some(s) = SCATTER.get() else { return [0; 4] };
     // SAFETY: host-visible words the kernel adds to atomically.
@@ -2320,8 +2382,14 @@ pub fn init() {
     // epoch (+3.6% at the vista with stretches checked at their labels,
     // FINDINGS.md 2026-10-29), and waits that release nothing new (gone
     // past, a counter's value passed on again) end none (epoch ends -38%,
-    // takes -10%, level), unless set explicitly.
-    const PAR: [(&str, u64); 5] = [("par_compute", 4), ("par_events", 1), ("par_min_compute", 64), ("fe2_gpu_waits", 1), ("fe2_quiet_waits", 1)];
+    // takes -10%, level), and the write-back's kernel empties its
+    // touched-page list itself (no fill and no barrier before one per
+    // write-back; level to +1%), counts into video memory (two host-memory
+    // atomics a page written back, ~28,000 a frame at the vista: GPU busy
+    // -2.3 ms a frame, +2-3%) and counts as a full barrier, CP writes right
+    // after it recording none before them (level to +0.3%; FINDINGS.md
+    // 2026-10-29 morning), unless set explicitly.
+    const PAR: [(&str, u64); 8] = [("par_compute", 4), ("par_events", 1), ("par_min_compute", 64), ("fe2_gpu_waits", 1), ("fe2_quiet_waits", 1), ("fe2_scatter_reset", 1), ("fe2_scatter_dev", 1), ("fe2_cpw_light", 1)];
     for (name, v) in PAR {
         if !super::tune::set_default(name, v) {
             crate::warn!("fe2: no switch {name}");
@@ -2353,6 +2421,12 @@ pub fn init() {
     }
     match self_test() {
         Ok(s) => {
+            if std::env::var("DS_FE2_SCATTER_BENCH").ok().as_deref() == Some("1") {
+                match scatter_bench() {
+                    Ok(l) => crate::info!("fe2: {l}"),
+                    Err(e) => crate::warn!("fe2: write-back bench: {e}"),
+                }
+            }
             ON.store(true, Ordering::Release);
             if crate::hosted::on() {
                 // (`DS_FE2_WORD=0`, diagnosis: the host answers a fault for
@@ -2421,6 +2495,9 @@ fn self_test() -> Result<String, String> {
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
             record_scatter(cmd);
+            if let Some(s) = SCATTER.get() {
+                record_counter_copy(s, cmd);
+            }
             // What the kernel left in the map, then the table entry cleared.
             c.device.cmd_copy_buffer(cmd, marks, rb, &[vk::BufferCopy { src_offset: page * 128, dst_offset: 0, size: 128 }, vk::BufferCopy { src_offset: pbit_at, dst_offset: 128, size: 4 }, vk::BufferCopy { src_offset: rdna::kernels::MARK_LIST_AT as u64 * 4, dst_offset: 132, size: 4 }]);
             c.device.cmd_update_buffer(cmd, table, page * 8, &0u64.to_le_bytes());
@@ -2454,6 +2531,114 @@ fn self_test() -> Result<String, String> {
             return Err(format!("counters {before:?} -> {after:?}"));
         }
         Ok(format!("write-back self-test passed: 5 marked dwords of an imported page written back, 1019 left"))
+    })();
+    unsafe { VirtualFree(h as _, 0, MEM_RELEASE) };
+    r
+}
+
+/// `DS_FE2_SCATTER_BENCH=1` (diagnosis, at front end 2's start): the
+/// write-back's GPU time on synthetic inputs as the segment profile counts
+/// it (from after the barrier behind its inputs to after its last barrier;
+/// the median of BENCH_REPS): an empty list, then BENCH_PAGES private pages
+/// imported and mapped at the span's end (as the self-test's page) listed
+/// without marks and with 1, 32 consecutive, 32 spread (one in 32) and all
+/// 1024 dwords of each marked. Its pages and marks are cleared again after.
+fn scatter_bench() -> Result<String, String> {
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+    const BENCH_PAGES: u64 = 64;
+    const BENCH_REPS: usize = 15;
+    let c = ctx();
+    let marks = super::resident::marks().ok_or("no written-bit map")?;
+    let table = super::pagetable::buffer().ok_or("no page table")?;
+    let guest = MIRROR_END - BENCH_PAGES * PAGE;
+    let p0 = (guest - MIRROR_BASE) / PAGE;
+    if p0 % 32 != 0 {
+        return Err("its pages do not start a word of touched bits".into());
+    }
+    super::resident::back(guest, BENCH_PAGES * PAGE)?;
+    let h = unsafe { VirtualAlloc(std::ptr::null(), (BENCH_PAGES * PAGE) as usize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as u64;
+    if h == 0 {
+        return Err("VirtualAlloc".into());
+    }
+    let r = (|| {
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+        let (hb, hm, hva) = c.import_host(h, BENCH_PAGES * PAGE, usage)?;
+        let entries: Vec<u8> = (0..BENCH_PAGES).flat_map(|i| (hva + i * PAGE).to_le_bytes()).collect();
+        let n = 2 * BENCH_REPS as u32;
+        let qp = match unsafe { c.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(n), None) } {
+            Ok(q) => q,
+            Err(e) => {
+                unsafe {
+                    c.device.destroy_buffer(hb, None);
+                    c.device.free_memory(hm, None);
+                }
+                return Err(format!("query pool: {e}"));
+            }
+        };
+        let period = c.limits.timestamp_period as f64;
+        let bits_at = 4 * (rdna::kernels::MARK_PAGE_BITS_AT as u64 + p0 / 32);
+        let names = ["an empty list", "pages without marks", "1 dword a page", "32 consecutive dwords a page", "32 dwords a page one in 32", "every dword"];
+        let pattern = |k: usize| -> [u32; 32] {
+            let mut m = [0u32; 32];
+            match k {
+                2 => m[0] = 1,
+                3 => m[0] = u32::MAX,
+                4 => m = [1; 32],
+                5 => m = [u32::MAX; 32],
+                _ => {}
+            }
+            m
+        };
+        let mut lines = Vec::new();
+        let res = (|| {
+            for (k, name) in names.iter().enumerate() {
+                let listed = if k == 0 { 0 } else { BENCH_PAGES };
+                let mask: Vec<u8> = pattern(k).iter().flat_map(|x| x.to_le_bytes()).collect();
+                let masks: Vec<u8> = (0..BENCH_PAGES).flat_map(|_| mask.iter().copied()).collect();
+                let touched: Vec<u8> = (0..2).flat_map(|_| (if listed > 0 { u32::MAX } else { 0u32 }).to_le_bytes()).collect();
+                let list: Vec<u8> = [listed as u32, 1, 1, 0].into_iter().chain((0..listed).map(|i| (p0 + i) as u32)).flat_map(|x| x.to_le_bytes()).collect();
+                super::resident::one_off_now(|cmd| unsafe {
+                    c.device.cmd_reset_query_pool(cmd, qp, 0, n);
+                    c.device.cmd_update_buffer(cmd, table, p0 * 8, &entries);
+                    for r in 0..BENCH_REPS as u32 {
+                        c.device.cmd_update_buffer(cmd, marks, p0 * 128, &masks);
+                        c.device.cmd_update_buffer(cmd, marks, bits_at, &touched);
+                        c.device.cmd_update_buffer(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4, &list);
+                        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+                        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+                        c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, 2 * r);
+                        record_scatter(cmd);
+                        c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, 2 * r + 1);
+                        // (The next round's inputs after it.)
+                        let next = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+                        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[next], &[], &[]);
+                    }
+                })?;
+                let mut t = vec![0u64; n as usize];
+                unsafe { c.device.get_query_pool_results(qp, 0, &mut t, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT) }.map_err(|e| format!("query: {e}"))?;
+                let mut us: Vec<f64> = (0..BENCH_REPS).map(|r| t[2 * r + 1].wrapping_sub(t[2 * r]) as f64 * period / 1000.0).collect();
+                us.sort_by(|a, b| a.total_cmp(b));
+                lines.push(format!("{name} {:.1} us", us[BENCH_REPS / 2]));
+            }
+            Ok::<(), String>(())
+        })();
+        // Its pages unmapped and their marks cleared again, whatever happened.
+        let zeros_t = vec![0u8; entries.len()];
+        let zeros_m = vec![0u8; (BENCH_PAGES * 128) as usize];
+        let cleared = super::resident::one_off_now(|cmd| unsafe {
+            c.device.cmd_update_buffer(cmd, table, p0 * 8, &zeros_t);
+            c.device.cmd_update_buffer(cmd, marks, p0 * 128, &zeros_m);
+            c.device.cmd_update_buffer(cmd, marks, bits_at, &[0u8; 8]);
+            c.device.cmd_update_buffer(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4, &[0u8; 4]);
+        });
+        unsafe {
+            c.device.destroy_query_pool(qp, None);
+            c.device.destroy_buffer(hb, None);
+            c.device.free_memory(hm, None);
+        }
+        res?;
+        cleared?;
+        Ok(format!("write-back bench ({BENCH_PAGES} pages, median of {BENCH_REPS}, `tune fe2_scatter_reset` {}, `fe2_scatter_dev` {}): {}", super::tune::fe2_scatter_reset() as u8, super::tune::fe2_scatter_dev() as u8, lines.join(", ")))
     })();
     unsafe { VirtualFree(h as _, 0, MEM_RELEASE) };
     r

@@ -733,10 +733,20 @@ pub const SCATTER_LOCAL_SIZE: u32 = 256;
 /// map, binding 1 the SCATTER_COUNTERS counters. Push constants `{mirror
 /// (low, high), table (low, high)}`.
 pub fn mirror_scatter() -> Vec<u32> {
-    build_scatter().expect("mirror scatter kernel")
+    build_scatter(false).expect("mirror scatter kernel")
 }
 
-fn build_scatter() -> Result<Vec<u32>, rspirv::dr::Error> {
+/// `mirror_scatter` emptying the touched-page list itself: workgroup 0's
+/// first invocation takes the list's count and stores 0 there (an atomic
+/// exchange; the indirect dispatch read the count already), and the other
+/// workgroups never read it (they are bounded by MARK_LIST_CAP alone: the
+/// dispatch made as many as the count), so the write-back needs no fill of
+/// the count and no barrier before one.
+pub fn mirror_scatter_reset() -> Vec<u32> {
+    build_scatter(true).expect("mirror scatter kernel (emptying the list)")
+}
+
+fn build_scatter(reset: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     let lit = Operand::LiteralBit32;
     let mut b = Builder::new();
     b.set_version(1, 3);
@@ -820,24 +830,49 @@ fn build_scatter() -> Result<Vec<u32>, rspirv::dr::Error> {
     let table = addr64(&mut b, tlo, thi)?;
     let is0 = b.i_equal(bool_, None, lid, c0)?;
     let pcount = b.access_chain(p_u, None, marks, [c0, list_at])?;
-    let lcount = b.load(u32t, None, pcount, None, [])?;
-    // Workgroup 0 counts a list past its capacity.
-    let g0 = b.i_equal(bool_, None, g, c0)?;
-    let over = b.u_greater_than(bool_, None, lcount, list_cap)?;
-    let note_over = b.logical_and(bool_, None, g0, is0)?;
-    let note_over = b.logical_and(bool_, None, note_over, over)?;
-    let (l_ov, l_ovd) = (b.id(), b.id());
-    b.selection_merge(l_ovd, SelectionControl::NONE)?;
-    b.branch_conditional(note_over, l_ov, l_ovd, [])?;
-    b.begin_block(Some(l_ov))?;
-    let pov = b.access_chain(p_u, None, counters, [c0, c3])?;
-    b.atomic_i_add(u32t, None, pov, scope_dev, sem_none, c1)?;
-    b.branch(l_ovd)?;
-    b.begin_block(Some(l_ovd))?;
-    let under = b.u_less_than(bool_, None, lcount, list_cap)?;
-    let limit = b.select(u32t, None, under, lcount, list_cap)?;
-    // (Uniform in the workgroup: the barrier below is inside it.)
-    let inside = b.u_less_than(bool_, None, g, limit)?;
+    let inside = if reset {
+        // Workgroup 0's first invocation takes the count, empties the list
+        // and counts a list past its capacity.
+        let g0 = b.i_equal(bool_, None, g, c0)?;
+        let first = b.logical_and(bool_, None, g0, is0)?;
+        let (l_rs, l_rsd) = (b.id(), b.id());
+        b.selection_merge(l_rsd, SelectionControl::NONE)?;
+        b.branch_conditional(first, l_rs, l_rsd, [])?;
+        b.begin_block(Some(l_rs))?;
+        let lcount = b.atomic_exchange(u32t, None, pcount, scope_dev, sem_none, c0)?;
+        let over = b.u_greater_than(bool_, None, lcount, list_cap)?;
+        let (l_ov, l_ovd) = (b.id(), b.id());
+        b.selection_merge(l_ovd, SelectionControl::NONE)?;
+        b.branch_conditional(over, l_ov, l_ovd, [])?;
+        b.begin_block(Some(l_ov))?;
+        let pov = b.access_chain(p_u, None, counters, [c0, c3])?;
+        b.atomic_i_add(u32t, None, pov, scope_dev, sem_none, c1)?;
+        b.branch(l_ovd)?;
+        b.begin_block(Some(l_ovd))?;
+        b.branch(l_rsd)?;
+        b.begin_block(Some(l_rsd))?;
+        // (Uniform in the workgroup: the barrier below is inside it.)
+        b.u_less_than(bool_, None, g, list_cap)?
+    } else {
+        let lcount = b.load(u32t, None, pcount, None, [])?;
+        // Workgroup 0 counts a list past its capacity.
+        let g0 = b.i_equal(bool_, None, g, c0)?;
+        let over = b.u_greater_than(bool_, None, lcount, list_cap)?;
+        let note_over = b.logical_and(bool_, None, g0, is0)?;
+        let note_over = b.logical_and(bool_, None, note_over, over)?;
+        let (l_ov, l_ovd) = (b.id(), b.id());
+        b.selection_merge(l_ovd, SelectionControl::NONE)?;
+        b.branch_conditional(note_over, l_ov, l_ovd, [])?;
+        b.begin_block(Some(l_ov))?;
+        let pov = b.access_chain(p_u, None, counters, [c0, c3])?;
+        b.atomic_i_add(u32t, None, pov, scope_dev, sem_none, c1)?;
+        b.branch(l_ovd)?;
+        b.begin_block(Some(l_ovd))?;
+        let under = b.u_less_than(bool_, None, lcount, list_cap)?;
+        let limit = b.select(u32t, None, under, lcount, list_cap)?;
+        // (Uniform in the workgroup: the barrier below is inside it.)
+        b.u_less_than(bool_, None, g, limit)?
+    };
     let (l_in, l_end) = (b.id(), b.id());
     b.selection_merge(l_end, SelectionControl::NONE)?;
     b.branch_conditional(inside, l_in, l_end, [])?;
@@ -1174,6 +1209,17 @@ mod tests {
         if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
             let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("mirror_scatter.spv"), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn scatter_reset_kernel_assembles() {
+        let w = super::mirror_scatter_reset();
+        assert_eq!(w[0], 0x0723_0203);
+        assert_ne!(w, super::mirror_scatter());
+        if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("mirror_scatter_reset.spv"), bytes).unwrap();
         }
     }
 

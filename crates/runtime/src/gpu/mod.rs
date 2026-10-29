@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 199] = [
+    static ALL: [Tunable; 204] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -232,6 +232,11 @@ pub mod tune {
         Tunable { name: "fe2_quiet_waits", env: "DS_FE2_QUIET_WAITS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_conflict_hold", env: "DS_PAST_CONFLICT_HOLD", default: 600, value: AtomicU64::new(UNSET) },
         Tunable { name: "wait_runs", env: "DS_WAIT_RUNS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe2_scatter_reset", env: "DS_FE2_SCATTER_RESET", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe2_scatter_dev", env: "DS_FE2_SCATTER_DEV", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe2_cpw_light", env: "DS_FE2_CPW_LIGHT", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe2_defer_gfx", env: "DS_FE2_DEFER_GFX", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe2_wide_pages", env: "DS_FE2_WIDE_PAGES", default: 64, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2167,6 +2172,45 @@ pub mod tune {
     /// recorded serially by the CP).
     pub fn wait_runs() -> bool {
         get(198) != 0
+    }
+
+    /// Front end 2's write-back kernel empties the touched-page list itself
+    /// (`rdna::kernels::mirror_scatter_reset`): no fill of the list's count
+    /// and no barrier before it in each write-back (~234 a frame at the
+    /// vista). Read when the kernel is made.
+    pub fn fe2_scatter_reset() -> bool {
+        get(199) != 0
+    }
+
+    /// Front end 2's write-back counts pages and dwords into video memory
+    /// (two atomics a page written back that crossed PCIe into host memory
+    /// before), copied into the host-visible counters every 64th
+    /// write-back. Read when the kernel is made.
+    pub fn fe2_scatter_dev() -> bool {
+        get(200) != 0
+    }
+
+    /// Front end 2's write-back counts as a full barrier for the
+    /// executor's tracking of the work since one, and a CP write the GPU
+    /// performs right after it records no barrier before it (the
+    /// write-back's barriers order it after all earlier work; ~180 a frame
+    /// at the vista).
+    pub fn fe2_cpw_light() -> bool {
+        get(201) != 0
+    }
+
+    /// Front end 2's checks on the graphics queue (its command processor
+    /// and parallel workers) wait for their batch's close, merged there into
+    /// few takes (`fe2::resolve`; `DS_FE2_DEFER=1`: every queue's).
+    pub fn fe2_defer_gfx() -> bool {
+        get(202) != 0
+    }
+
+    /// The window (pages, whole 64-page words) a front end 2 take of at
+    /// most 16 pages widens over the GPU-written pages around it
+    /// (`fe2::widen`; 64: its word, as before 2026-10-29).
+    pub fn fe2_wide_pages() -> u64 {
+        get(203)
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
