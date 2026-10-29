@@ -350,6 +350,7 @@ pub fn enabled() -> bool {
                 super::resident::init();
                 super::fe2::init();
                 super::resident::section_test_maybe();
+                super::resident::mixed_test_maybe();
                 super::resident::protect_test_maybe();
                 true
             }

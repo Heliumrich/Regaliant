@@ -1676,6 +1676,102 @@ pub fn section_test_maybe() {
     }
 }
 
+/// `DS_MIXED_TEST=1` (boot test): one GPU import over two adjacent private
+/// write-watched allocations made in placeholders (the mixed guest range,
+/// FRONTEND2.md "GPU-quiet mappings on sections"): the import, GPU fills of
+/// both parts as the CPU sees them, and write watching reporting the CPU's
+/// writes but none of the GPU's (front end 2's write-backs must not read as
+/// CPU writes).
+pub fn mixed_test_maybe() {
+    if std::env::var("DS_MIXED_TEST").ok().as_deref() != Some("1") {
+        return;
+    }
+    match mixed_test() {
+        Ok(s) => crate::info!("mixed-range test passed: {s}"),
+        Err(e) => crate::error!("mixed-range test failed: {e}"),
+    }
+}
+
+fn mixed_test() -> Result<String, String> {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::System::Memory::{GetWriteWatch, VirtualAlloc2, VirtualFree, MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_READWRITE};
+    const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+    let m: usize = 4 << 20;
+    let c = ctx();
+    unsafe {
+        let base = VirtualAlloc2(std::ptr::null_mut(), std::ptr::null(), 2 * m, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0);
+        if base.is_null() {
+            return Err(format!("placeholder: error {}", GetLastError()));
+        }
+        let b0 = base as u64;
+        if VirtualFree(base, m, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0 {
+            return Err(format!("splitting the placeholder: error {}", GetLastError()));
+        }
+        for k in 0..2u64 {
+            let q = VirtualAlloc2(std::ptr::null_mut(), (b0 + k * m as u64) as _, m, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | MEM_WRITE_WATCH, PAGE_READWRITE, std::ptr::null_mut(), 0);
+            if q.is_null() {
+                return Err(format!("private write-watched allocation {k}: error {}", GetLastError()));
+            }
+        }
+        let r = (|| -> Result<String, String> {
+            let mut out = Vec::new();
+            let take = |at: u64| -> Result<Vec<u64>, String> {
+                let mut addrs = vec![std::ptr::null_mut::<std::ffi::c_void>(); 2048];
+                let (mut count, mut gran) = (addrs.len(), 0u32);
+                if GetWriteWatch(1, at as _, m, addrs.as_mut_ptr(), &mut count, &mut gran) != 0 {
+                    return Err(format!("GetWriteWatch at {at:#x}: error {}", GetLastError()));
+                }
+                Ok(addrs[..count].iter().map(|&a| a as u64 - at).collect())
+            };
+            // (Committing reads as no write; the marks start clear.)
+            take(b0)?;
+            take(b0 + m as u64)?;
+            let (buf, mem, _) = c.import_host(b0, 2 * m as u64, vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            out.push("one import over two allocations");
+            // (What the import itself leaves in the marks: the driver locks
+            // the pages for writing.)
+            let (i0, i1) = (take(b0)?.len(), take(b0 + m as u64)?.len());
+            let at_import = format!("the import left {i0} and {i1} (of up to 64 each) pages marked written");
+            out.push(&at_import);
+            let r = (|| -> Result<(), String> {
+                // GPU fills across the boundary.
+                one_off(|cmd| c.device.cmd_fill_buffer(cmd, buf, m as u64 - (1 << 20), 2 << 20, 0x5A5A_5A5A))?;
+                let p = b0 as *const u32;
+                let seen = (0..(1 << 19)).step_by(997).all(|i| std::ptr::read_volatile(p.add((m - (1 << 20)) / 4 + i)) == 0x5A5A_5A5A);
+                if !seen {
+                    return Err("the CPU does not see the GPU's fill across the allocations".into());
+                }
+                out.push("GPU fills across the boundary seen by the CPU");
+                let (g0, g1) = (take(b0)?, take(b0 + m as u64)?);
+                // Once more, the import resident since the first fill: what
+                // the GPU's writes alone leave in the marks.
+                one_off(|cmd| c.device.cmd_fill_buffer(cmd, buf, m as u64 - (1 << 20), 2 << 20, 0x6B6B_6B6B))?;
+                let (h0, h1) = (take(b0)?, take(b0 + m as u64)?);
+                if !h0.is_empty() || !h1.is_empty() {
+                    return Err(format!("write watching reported the GPU's writes: after the first fill (the import's first use) {} and {} pages, after the second {} and {} (of 1024 each; the import itself left {i0} and {i1})", g0.len(), g1.len(), h0.len(), h1.len()));
+                }
+                crate::info!("mixed-range test: write watching after the first GPU fill (the import's first use) {} and {} pages, after the second none (the import itself left {i0} and {i1})", g0.len(), g1.len());
+                out.push("write watching reports no GPU write once the import is in use");
+                // A CPU write in each part is reported in its own.
+                std::ptr::write_volatile((b0 + 0x3000) as *mut u32, 1);
+                std::ptr::write_volatile((b0 + m as u64 + 0x7000) as *mut u32, 2);
+                let (g0, g1) = (take(b0)?, take(b0 + m as u64)?);
+                if g0 != vec![0x3000] || g1 != vec![0x7000] {
+                    return Err(format!("CPU writes reported as {g0:x?} and {g1:x?}"));
+                }
+                out.push("CPU writes reported per allocation");
+                Ok(())
+            })();
+            c.device.destroy_buffer(buf, None);
+            c.device.free_memory(mem, None);
+            r.map(|_| out.join("; "))
+        })();
+        VirtualFree(base, 0, MEM_RELEASE);
+        VirtualFree((b0 + m as u64) as _, 0, MEM_RELEASE);
+        r
+    }
+}
+
 fn section_test() -> Result<String, String> {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Memory::{
