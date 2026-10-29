@@ -1,6 +1,7 @@
 //! Hosted mode: dsport under a host process that takes the write faults on
-//! guest pages dsport armed (`--host`; RENDERER.md "Resident front end",
-//! stage H1).
+//! guest pages dsport armed (by default under front end 2, the default front
+//! end since 2026-10-30, and with `--host`: `wants_host`; RENDERER.md
+//! "Resident front end", stage H1).
 //!
 //! A fault handled inside the process overwrites the 128 bytes below the
 //! faulting thread's stack pointer with the state Windows saves for the
@@ -10,8 +11,9 @@
 //! one stops the whole process for 15-50 us, so this is for writes that are
 //! rare.
 //!
-//! `dsport --host <args>` starts dsport again with the same arguments as its
-//! debuggee and shares a mapping with it (named in `DS_HOSTED`): a bitmap of
+//! The host (`dsport <args>` where `wants_host`) starts dsport again with the
+//! same arguments as its debuggee and shares a mapping with it (named in
+//! `DS_HOSTED`, which keeps the debuggee from hosting again): a bitmap of
 //! armed guest pages (two levels: an index of 128 MiB leaves over the guest
 //! range, leaves allocated by dsport) and a ring of the pages the host made
 //! accessible again. A fault on an armed page (read-only or no-access) is
@@ -499,8 +501,9 @@ pub fn status() -> String {
     )
 }
 
-/// `dsport --host ...`: runs dsport with the other arguments as its debuggee
-/// and answers write faults on armed pages; exits with its exit code.
+/// The host (`wants_host`): runs dsport with the other arguments as its
+/// debuggee and answers write faults on armed pages; exits with its exit
+/// code.
 pub fn run_host() -> ! {
     let size = std::mem::size_of::<Shared>();
     let name = format!("Local\\dsport-host-{}", std::process::id());
@@ -521,7 +524,7 @@ pub fn run_host() -> ! {
     };
     let exe = std::env::current_exe().expect("own path");
     let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--host").collect();
-    let cmdline = std::iter::once(format!("\"{}\"", exe.display())).chain(args.iter().map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() })).collect::<Vec<_>>().join(" ");
+    let cmdline = std::iter::once(format!("\"{}\"", exe.display())).chain(args.iter().map(|a| quote_arg(a))).collect::<Vec<_>>().join(" ");
     // SAFETY: before any other thread of the host exists.
     unsafe {
         std::env::set_var("DS_HOSTED", &name);
@@ -835,7 +838,68 @@ fn tracking_test() -> Result<String, String> {
     Ok("write tracking on sections through the host: writes to taken pages answered there (the values below the stack pointer intact, nothing passed on) and reported by the next take only".into())
 }
 
-/// The host process's command line flag.
+/// Arguments of a mode that runs no game: never hosted by default.
+const NO_GAME: [&str; 4] = ["--pipeline-test", "--dispatch-bench", "--compile-bench", "--record-bench"];
+
+/// Whether this process hosts dsport instead of running it: with `--host`,
+/// and by default when front end 2 is wanted (it arms quiet guest pages, and
+/// a write fault answered inside the process would overwrite the 128 bytes
+/// below the faulting thread's stack pointer), except with `--no-host`, in
+/// the debuggee (`DS_HOSTED`), under another debugger (`dsdbg`) or in a mode
+/// that runs no game.
 pub fn wants_host() -> bool {
-    std::env::args().skip(1).any(|a| a == "--host")
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--host") {
+        return true;
+    }
+    if std::env::var_os("DS_HOSTED").is_some() || args.iter().any(|a| a == "--no-host" || NO_GAME.contains(&a.as_str())) {
+        return false;
+    }
+    // SAFETY: no arguments.
+    if unsafe { IsDebuggerPresent() } != 0 {
+        return false;
+    }
+    crate::gpu::fe2::wanted()
+}
+
+/// `a` as one argument of a Windows command line, the way the C runtime's
+/// parser reads it back: quoted when it holds blanks or quotes (or is empty),
+/// the backslashes before a quote, its own or the closing one, doubled.
+fn quote_arg(a: &str) -> String {
+    if !a.is_empty() && !a.contains([' ', '\t', '\n', '\x0b', '"']) {
+        return a.to_string();
+    }
+    let mut s = String::with_capacity(a.len() + 2);
+    s.push('"');
+    let mut slashes = 0usize;
+    for c in a.chars() {
+        if c == '\\' {
+            slashes += 1;
+            continue;
+        }
+        let n = if c == '"' { 2 * slashes + 1 } else { slashes };
+        s.extend(std::iter::repeat('\\').take(n));
+        s.push(c);
+        slashes = 0;
+    }
+    s.extend(std::iter::repeat('\\').take(2 * slashes));
+    s.push('"');
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quote_arg;
+
+    #[test]
+    fn arguments_quoted_as_the_runtime_reads_them() {
+        assert_eq!(quote_arg("--seconds"), "--seconds");
+        assert_eq!(quote_arg(r"local-data\control.txt"), r"local-data\control.txt");
+        assert_eq!(quote_arg(""), r#""""#);
+        assert_eq!(quote_arg(r"C:\Games\My Game\PPSA01341-app0"), r#""C:\Games\My Game\PPSA01341-app0""#);
+        // A trailing backslash would escape the closing quote.
+        assert_eq!(quote_arg(r"D:\My Games\"), r#""D:\My Games\\""#);
+        assert_eq!(quote_arg(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(quote_arg(r#"a\"b c"#), r#""a\\\"b c""#);
+    }
 }

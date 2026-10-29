@@ -1,5 +1,6 @@
-//! Front end 2 (docs/FRONTEND2.md; `DS_FE2=1`): the GPU front end on one
-//! GPU address space. Every buffer GPU work uses inside the mirror's span
+//! Front end 2 (docs/FRONTEND2.md; the default since 2026-10-30, `DS_FE2=0`
+//! the old front end as a fallback): the GPU front end on one GPU address
+//! space. Every buffer GPU work uses inside the mirror's span
 //! ([MIRROR_BASE, MIRROR_END)) is bound from the mirror M, the sparse buffer
 //! `resident` makes (backed on use); this module keeps which pages M holds
 //! current and runs the write-back's kernel.
@@ -20,7 +21,7 @@
 //!   one protocol), clears the valid bit of the pages it reports
 //!   (`marks_taken`), as do file reads, CP writes the CPU performs and
 //!   mapping changes (`invalidate`).
-//! - Hosted (`--host`): pages quiet for ARM_QUIET flips (doubled each time an
+//! - Hosted (the default, `hosted::wants_host`): pages quiet for ARM_QUIET flips (doubled each time an
 //!   arming ended in a write, up to ARM_MAX_LEVEL) and found clean by takes
 //!   in ARM_USES epochs since, inside import windows at least SETTLE flips
 //!   old (protecting a new import's pages lost the device: FINDINGS.md
@@ -561,11 +562,13 @@ fn note_range_fine(lo: u64, hi: u64, gens: [u32; FINE_CHUNKS], host: [u64; FINE_
 static TABLE: [AtomicPtr<Chunk>; CHUNKS] = [const { AtomicPtr::new(std::ptr::null_mut()) }; CHUNKS];
 static ON: AtomicBool = AtomicBool::new(false);
 
-/// `DS_FE2=1` (read once: shader specs follow it, so the pipelines
-/// precompiled at a session's start match).
+/// Front end 2 wanted: the default since 2026-10-30 (the user's direction);
+/// `DS_FE2=0` runs the old front end, kept as a fallback only. Read once:
+/// shader specs follow it, so the pipelines precompiled at a session's start
+/// match.
 pub fn wanted() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *W.get_or_init(|| std::env::var("DS_FE2").ok().as_deref() == Some("1"))
+    *W.get_or_init(|| std::env::var("DS_FE2").ok().as_deref() != Some("0"))
 }
 
 /// `DS_FE2_DEFER=1`: checks wait for the batch's close (`resolve`); off by
@@ -2708,7 +2711,7 @@ pub fn init() {
     let made = match super::resident::make_for_fe2() {
         Ok(s) => s,
         Err(e) => {
-            crate::error!("fe2: DS_FE2=1 but no mirror: {e}; front end 2 off");
+            crate::error!("fe2: no mirror: {e}; front end 2 off");
             return;
         }
     };

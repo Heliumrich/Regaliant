@@ -154,6 +154,8 @@ fn parse_args() -> Config {
             "--lenient" => lenient = true,
             "--debug" => debug = true,
             "--headless" => headless = true,
+            // (Read by `hosted::wants_host`: front end 2 unhosted, its arming off.)
+            "--no-host" => {}
             "--root" => root = PathBuf::from(args.next().expect("--root needs a path")),
             "--control" => control = Some(PathBuf::from(args.next().expect("--control needs a path"))),
             "--cache" => cache = Some(PathBuf::from(args.next().expect("--cache needs a directory"))),
@@ -1116,7 +1118,8 @@ fn read_proc_param(m: &loader::LoadedModule) -> (u64, String, i32) {
 }
 
 fn main() {
-    // `--host`: this process only hosts dsport (its debugger; `hosted`).
+    // Under front end 2 (the default) and with `--host` this process only
+    // hosts dsport (its debugger; `hosted::wants_host`).
     if hosted::wants_host() {
         hosted::run_host();
     }

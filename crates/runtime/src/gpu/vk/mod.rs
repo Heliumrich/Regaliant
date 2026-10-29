@@ -364,7 +364,7 @@ fn init_inner() -> Result<(), String> {
             f.sparse_binding != 0 && f.sparse_residency_buffer != 0 && fam.contains(vk::QueueFlags::SPARSE_BINDING)
         };
         if (super::resident::wanted() || super::rgm::wanted() || super::fe2::wanted()) && !sparse_buffers {
-            crate::warn!("DS_RESIDENT, DS_RGM or DS_FE2 set but the device or the main queue family has no sparse buffers");
+            crate::warn!("front end 2 (the default), DS_RESIDENT or DS_RGM wanted but the device or the main queue family has no sparse buffers");
         }
         // Storage images bound one view per mip level are indexed per
         // invocation (image_store_mip / image_load_mip).
