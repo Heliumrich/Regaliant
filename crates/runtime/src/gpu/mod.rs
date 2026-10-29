@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 208] = [
+    static ALL: [Tunable; 209] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -241,6 +241,7 @@ pub mod tune {
         Tunable { name: "fe2_scatter_nostore", env: "DS_FE2_SCATTER_NOSTORE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_label_track", env: "DS_FE2_LABEL_TRACK", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_cpw_close", env: "DS_FE2_CPW_CLOSE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe2_cpw_waited", env: "DS_FE2_CPW_WAITED", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2251,6 +2252,19 @@ pub mod tune {
     /// close (the upper bound of write-backs only where the CPU reads).
     pub fn fe2_cpw_close() -> bool {
         get(207) != 0
+    }
+
+    /// Front end 2 (default since 2026-10-29: +2.5% at the vista over four
+    /// rounds, queue 0x50's GPU time -0.7 to -1.0 ms a frame; tour clean):
+    /// no write-back before a CP
+    /// write the GPU performs to a label one of our command processors waits
+    /// on (`cp::cp_waited`: GPU-to-GPU synchronization; those threads read
+    /// GPU-written data on the CPU only once the writer's batch is done, its
+    /// close's write-back included); labels no CP waits on keep theirs (a
+    /// title thread may poll them). Left open: a title thread polling a label
+    /// our CPs wait on too, and reading data before the batch completes.
+    pub fn fe2_cpw_waited() -> bool {
+        get(208) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

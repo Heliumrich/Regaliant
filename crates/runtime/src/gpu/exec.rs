@@ -3674,8 +3674,9 @@ const OP_FAST_CLEARS: usize = 10;
 pub(super) const OP_PASS_ENDS: usize = 11;
 /// Front end 2's write-backs by site (diagnostics): [before a CP write the
 /// GPU performs, at a batch's close, of those with no label write promised
-/// and no completion action].
-pub static SCATTER_SITES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// and no completion action, before CP writes of labels a CP of ours waits
+/// on, left to the batch's close (`tune fe2_cpw_close`, `fe2_cpw_waited`)].
+pub static SCATTER_SITES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// Front end 2's write-backs (`Exec::fe2_scatter`).
 const OP_FE2_SCATTERS: usize = 12;
 const OPS: usize = 13;
@@ -11093,9 +11094,19 @@ impl Exec {
         // that there), and the write goes into the mirror too (later work
         // reads it there).
         let mut after_scatter = false;
-        if self.fe2_marked && !super::tune::fe2_cpw_close() {
-            SCATTER_SITES[0].fetch_add(1, Ordering::Relaxed);
-            after_scatter = self.fe2_scatter();
+        if self.fe2_marked {
+            // (A label our command processors wait on: GPU-to-GPU
+            // synchronization, `tune fe2_cpw_waited`.)
+            let waited = super::cp::cp_waited(a);
+            if waited {
+                SCATTER_SITES[3].fetch_add(1, Ordering::Relaxed);
+            }
+            if super::tune::fe2_cpw_close() || (waited && super::tune::fe2_cpw_waited()) {
+                SCATTER_SITES[4].fetch_add(1, Ordering::Relaxed);
+            } else {
+                SCATTER_SITES[0].fetch_add(1, Ordering::Relaxed);
+                after_scatter = self.fe2_scatter();
+            }
         }
         let fe2_mirror = if super::fe2::on() && super::fe2::in_span(a, bytes) && super::resident::back(a & !4095, (a + bytes).next_multiple_of(4096) - (a & !4095)).is_ok() {
             super::fe2::note_cp_mirror();

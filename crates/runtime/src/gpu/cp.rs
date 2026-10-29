@@ -1389,6 +1389,12 @@ struct LabelEvent {
 static LABEL_LOG: parking_lot::Mutex<std::collections::VecDeque<LabelEvent>> = parking_lot::Mutex::new(std::collections::VecDeque::new());
 static WAITED: parking_lot::Mutex<Option<HashSet<u64>>> = parking_lot::Mutex::new(None);
 
+/// Whether a command processor of ours has waited on the label at `a`
+/// (WAIT_REG_MEM on memory: `tune fe2_cpw_waited`).
+pub(super) fn cp_waited(a: u64) -> bool {
+    WAITED.lock().as_ref().is_some_and(|w| w.contains(&(a & !7)))
+}
+
 /// Label values deferred CP writes will store: address -> (batch sequence,
 /// value, bytes, whether the CPU stores it after the batch completed rather
 /// than the GPU within it, when it was made, its writer's view then: the
