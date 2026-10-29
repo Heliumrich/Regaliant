@@ -5819,6 +5819,10 @@ pub(super) static CS_STEPS: [[AtomicU64; CS_STEP_COUNT + 1]; 8] = [const { [cons
 /// Steps of draws and dispatches that were their batch's first command
 /// (`place_lines`), by kind (`DRAW_KINDS`, `CS_KINDS`), the count last.
 pub(super) static DRAW_STEPS_FIRST: [[AtomicU64; 19]; 3] = [const { [const { AtomicU64::new(0) }; 19] }; 3];
+/// The same for draws that opened a GPU-resolved run (a GPU-resolved pair's
+/// draw recorded in full, first commands of batches included), by kind:
+/// they are in `DRAW_STEPS` and `DRAW_STEPS_FIRST` too.
+pub(super) static DRAW_STEPS_GPU: [[AtomicU64; 19]; 3] = [const { [const { AtomicU64::new(0) }; 19] }; 3];
 pub(super) static CS_STEPS_FIRST: [[AtomicU64; CS_STEP_COUNT + 1]; 8] = [const { [const { AtomicU64::new(0) }; CS_STEP_COUNT + 1] }; 8];
 const CS_STEP_COUNT: usize = 20;
 pub(super) const CS_STEP_NAMES: [&str; CS_STEP_COUNT] = [
@@ -6275,6 +6279,15 @@ fn draw_steps_line() -> String {
         let parts: Vec<String> = DRAW_STEP_NAMES.iter().zip(steps.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
         s.push_str(&format!("    command processor per draw by step, {kind} ({n} draws, {:.2} us each): {}\n", total as f64 / n as f64 / 1000.0, parts.join(", ")));
     }
+    for (kind, steps) in DRAW_KINDS.iter().zip(DRAW_STEPS_GPU.iter()) {
+        let n = steps[18].load(Ordering::Relaxed);
+        if n == 0 {
+            continue;
+        }
+        let total: u64 = steps[..18].iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        let parts: Vec<String> = DRAW_STEP_NAMES.iter().zip(steps.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
+        s.push_str(&format!("    command processor per draw by step, {kind}, opening a GPU-resolved run ({n} draws, {:.2} us each; in the lines above too): {}\n", total as f64 / n as f64 / 1000.0, parts.join(", ")));
+    }
     for (kind, h) in DRAW_KINDS.iter().zip(HAZARD_STEPS.iter()) {
         let v: Vec<u64> = h.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         if v[0] == 0 {
@@ -6542,7 +6555,7 @@ pub fn reset_shader_profile() {
     *PROG_CENSUS.lock() = None;
     PROG_GEN.fetch_add(1, Ordering::Relaxed);
     PROG_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
-    for c in DRAW_STEPS.iter().flatten().chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(DRAW_STEPS_FIRST.iter().flatten()).chain(CS_STEPS_FIRST.iter().flatten()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()).chain(BIND_STEPS_BY.iter().flatten()).chain(PRE_STEPS_BY.iter().flatten()) {
+    for c in DRAW_STEPS.iter().flatten().chain(DRAW_STEPS_GPU.iter().flatten()).chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(DRAW_STEPS_FIRST.iter().flatten()).chain(CS_STEPS_FIRST.iter().flatten()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()).chain(BIND_STEPS_BY.iter().flatten()).chain(PRE_STEPS_BY.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
     for c in CS_PHASES.iter().chain(DRAW_PHASES.iter()).chain(PLACE_PHASES.iter().flatten().flatten()) {

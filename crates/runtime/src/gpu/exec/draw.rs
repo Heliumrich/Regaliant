@@ -1237,6 +1237,8 @@ impl Exec {
         drop(batched_guard);
         drop(masks_guard);
         lap.mark(2);
+        // (A GPU-resolved run's first draw: its steps apart, `DS_STEP_LAPS`.)
+        let gpu_open = batched && gpu_pair.is_some();
         // Pairs not decided yet: learned from the draws the CPU resolves.
         if direct && gpu_pair.is_none() && super::super::tune::gpu_chains() == 1 {
             if let Some(p) = &ps {
@@ -2154,6 +2156,13 @@ impl Exec {
                 super::DRAW_STEPS_FIRST[kind][18].fetch_add(1, Ordering::Relaxed);
             } else {
                 super::DRAW_STEPS[kind][18].fetch_add(1, Ordering::Relaxed);
+            }
+            if gpu_open {
+                let g = &super::DRAW_STEPS_GPU[kind];
+                for (c, &ns) in g.iter().zip(lap.local.iter().take(18)) {
+                    c.fetch_add(ns, Ordering::Relaxed);
+                }
+                g[18].fetch_add(1, Ordering::Relaxed);
             }
             lap.slow(&self.name, || format!("vs {vs_addr:#x} ps {ps_addr:#x}{}", if first { ", first of its batch" } else { "" }));
         }
