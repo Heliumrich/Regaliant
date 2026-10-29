@@ -2520,4 +2520,39 @@ mod tests {
         let g2 = MAP_GEN.load(std::sync::atomic::Ordering::SeqCst);
         assert!(!revalidate(&mut runs, g1, g2), "changes no longer all known");
     }
+
+    /// `vma_bounds` answers as the mapping table does, and a mapping change
+    /// empties its per-thread cache.
+    #[test]
+    fn vma_bounds_follows_the_table() {
+        let (a, n) = (0x7F12_0000_0000u64, 0x30_0000u64);
+        let vma = |start: u64, size: u64, kind: VmaKind| Vma { start, size, kind, prot: 3, phys: 0, mtype: 0, name: "test".into(), slots: 0, off: 0 };
+        {
+            let mut st = MEM.lock();
+            st.vmas.insert(a, vma(a, n, VmaKind::Flexible));
+            st.vmas.insert(a + n, vma(a + n, 0x1_0000, VmaKind::Reserved));
+            bump_gen(a, a + n + 0x1_0000);
+        }
+        assert_eq!(vma_bounds(a + 0x123), Some((a, a + n)));
+        assert_eq!(vma_bounds(a + n - 1), Some((a, a + n)), "cached");
+        assert_eq!(vma_bounds(a + n), None, "a reservation");
+        assert_eq!(vma_bounds(a + n + 0x1_0000), None, "a gap");
+        // The mapping split in two: the cached bounds go with the change.
+        {
+            let mut st = MEM.lock();
+            st.vmas.insert(a, vma(a, 0x10_0000, VmaKind::Flexible));
+            st.vmas.insert(a + 0x10_0000, vma(a + 0x10_0000, n - 0x10_0000, VmaKind::Flexible));
+            bump_gen(a, a + n);
+        }
+        assert_eq!(vma_bounds(a + 0x123), Some((a, a + 0x10_0000)));
+        assert_eq!(vma_bounds(a + 0x20_0000), Some((a + 0x10_0000, a + n)));
+        {
+            let mut st = MEM.lock();
+            st.vmas.remove(&a);
+            st.vmas.remove(&(a + 0x10_0000));
+            st.vmas.remove(&(a + n));
+            bump_gen(a, a + n + 0x1_0000);
+        }
+        assert_eq!(vma_bounds(a + 0x123), None, "unmapped");
+    }
 }

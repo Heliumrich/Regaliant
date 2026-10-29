@@ -3962,6 +3962,51 @@ impl RangeLog {
     }
 }
 
+#[cfg(test)]
+mod range_log_tests {
+    use super::*;
+
+    static LOG: RangeLog = RangeLog::new();
+
+    /// The write log's buckets never pass a read that overlaps a pending
+    /// write, small or large (`tune log_big`: small reads go by their pages
+    /// and the large writes' 4 MiB buckets), and large reads go by every
+    /// write's 4 MiB buckets.
+    #[test]
+    fn buckets_find_every_overlapping_write() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let base = 0x10_0000_0000u64;
+        for round in 0..300u64 {
+            // This round's writes are the pending ones (earlier rounds' are
+            // done).
+            let done = round * 100 + 99;
+            let mut writes = Vec::new();
+            for k in 0..6 {
+                let a = (base + next() % (1 << 31)) & !3;
+                let n = if next() % 4 == 0 { next() % (96 << 20) + 1 } else { next() % (512 << 10) + 1 };
+                LOG.mark_pages(done + 1 + k, a, n);
+                writes.push((a, n));
+            }
+            for _ in 0..300 {
+                // Reads near a write as often as not.
+                let (wa, wn) = writes[(next() % writes.len() as u64) as usize];
+                let a = if next() % 2 == 0 { (wa + next() % (wn + (8 << 20))).saturating_sub(4 << 20) & !3 } else { (base + next() % (1 << 31)) & !3 };
+                let n = if next() % 8 == 0 { next() % (96 << 20) + 1 } else { next() % (128 << 10) + 1 };
+                let overlaps = writes.iter().any(|&(wa, wn)| wa < a + n && a < wa + wn);
+                if overlaps {
+                    assert!(LOG.may_overlap(&[(a, n)], done), "round {round}: read {a:#x}+{n:#x} passed a pending write");
+                }
+            }
+        }
+    }
+}
+
 /// `DS_LOG_STATS=1` (diagnosis): the write logs' lookups counted by how
 /// they were answered.
 fn log_stats_on() -> bool {
