@@ -918,14 +918,14 @@ thread_local! {
 /// began (the caller's view, `views_on`); `ep`: the epoch now, read before
 /// any take (what takes stamp their pages with).
 #[allow(clippy::too_many_arguments)]
-pub fn ensure(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, defer: Option<&mut Vec<(u64, u64)>>) -> Result<(), &'static str> {
+pub fn ensure(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, mine_any: bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, defer: Option<&mut Vec<(u64, u64)>>) -> Result<(), &'static str> {
     if !callers_on() {
-        return ensure_inner(lo, hi, want, ep, gpu_writes, mine, upload, armable, defer);
+        return ensure_inner(lo, hi, want, ep, gpu_writes, mine, mine_any, upload, armable, defer);
     }
     let t0 = unsafe { core::arch::x86_64::_rdtsc() };
     caller_count(C_CHECKS, 1);
     source_count(B_CHECKS, 1);
-    let r = ensure_inner(lo, hi, want, ep, gpu_writes, mine, upload, armable, defer);
+    let r = ensure_inner(lo, hi, want, ep, gpu_writes, mine, mine_any, upload, armable, defer);
     let cycles = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
     caller_count(C_CYCLES, cycles);
     source_count(B_CYCLES, cycles);
@@ -1080,13 +1080,15 @@ pub fn precheck(base: u64, size: u64, armable: &Armable) {
     let caller = CALLER.with(|c| c.get());
     set_caller("ahead");
     PRECHECK.with(|p| p.set(true));
-    let _ = ensure_inner(lo, hi, ep, ep, false, &|_| false, &mut |_, _| true, armable, None);
+    let _ = ensure_inner(lo, hi, ep, ep, false, &|_| false, false, &mut |_, _| true, armable, None);
     PRECHECK.with(|p| p.set(false));
     CALLER.with(|c| c.set(caller));
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, mut defer: Option<&mut Vec<(u64, u64)>>) -> Result<(), &'static str> {
+fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, mine_any: bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, mut defer: Option<&mut Vec<(u64, u64)>>) -> Result<(), &'static str> {
+    // (No page of the caller's batch to pass over: runs go in whole.)
+    let mine_fast = !mine_any && super::tune::fe2_mine_fast();
     let sc = size_class((hi - lo) / PAGE);
     local_check(sc, (hi - lo) / PAGE);
     let class = &BY_SIZE[sc];
@@ -1167,6 +1169,13 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
                 let pa = (a & !(64 * PAGE - 1)) + b * PAGE;
                 let pe = pa + run * PAGE;
                 r &= !(if run >= 64 { u64::MAX } else { ((1u64 << run) - 1) << b });
+                if mine_fast {
+                    match bad.last_mut() {
+                        Some(l) if l.1 + TAKE_GAP * PAGE >= pa => l.1 = pe,
+                        _ => bad.push((pa, pe)),
+                    }
+                    continue;
+                }
                 // Pages the caller's batch uploaded need nothing.
                 let mut x = pa;
                 while x < pe {

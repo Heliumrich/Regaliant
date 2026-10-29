@@ -3801,6 +3801,12 @@ struct RangeLog {
     /// here instead of page by page: the culls' 112 MB home took ~1,800
     /// atomic updates per batch that wrote it).
     coarse: [AtomicU64; COARSE_BUCKETS],
+    /// The same for those large writes alone (`tune log_big`: what a small
+    /// read needs beside its page buckets).
+    big: [AtomicU64; COARSE_BUCKETS],
+    /// Lookups (`latest`): [all, nothing unfinished, no bucket overlapping,
+    /// answered under the lock, of those with a batch found].
+    stats: [AtomicU64; 5],
 }
 
 const PAGE_BUCKETS: usize = 1 << 16;
@@ -3826,6 +3832,8 @@ impl RangeLog {
             notes: AtomicU64::new(0),
             pages: [const { AtomicU64::new(0) }; PAGE_BUCKETS],
             coarse: [const { AtomicU64::new(0) }; COARSE_BUCKETS],
+            big: [const { AtomicU64::new(0) }; COARSE_BUCKETS],
+            stats: [const { AtomicU64::new(0) }; 5],
         }
     }
 
@@ -3838,13 +3846,15 @@ impl RangeLog {
         if last - first >= COARSE_FROM {
             let (first, last) = (a >> COARSE_SHIFT, (a + n - 1) >> COARSE_SHIFT);
             if last - first >= COARSE_BUCKETS as u64 {
-                for b in self.coarse.iter() {
+                for (b, g) in self.coarse.iter().zip(self.big.iter()) {
                     b.fetch_max(seq, Ordering::SeqCst);
+                    g.fetch_max(seq, Ordering::SeqCst);
                 }
                 return;
             }
             for p in first..=last {
                 self.coarse[coarse_bucket(p)].fetch_max(seq, Ordering::SeqCst);
+                self.big[coarse_bucket(p)].fetch_max(seq, Ordering::SeqCst);
             }
             return;
         }
@@ -3860,22 +3870,25 @@ impl RangeLog {
     /// Whether some unfinished batch may write into one of `reads` (false:
     /// certainly none).
     fn may_overlap(&self, reads: &[(u64, u64)], done: u64) -> bool {
+        let big = super::tune::log_big();
         reads.iter().any(|&(a, n)| {
             if n == 0 {
                 return false;
             }
             let (first, last) = (a >> PAGE_SHIFT, (a + n - 1) >> PAGE_SHIFT);
-            let coarse = || {
+            let coarse = |b: &[AtomicU64; COARSE_BUCKETS]| {
                 let (c0, c1) = (a >> COARSE_SHIFT, (a + n - 1) >> COARSE_SHIFT);
-                c1 - c0 >= COARSE_BUCKETS as u64 || (c0..=c1).any(|p| self.coarse[coarse_bucket(p)].load(Ordering::SeqCst) > done)
+                c1 - c0 >= COARSE_BUCKETS as u64 || (c0..=c1).any(|p| b[coarse_bucket(p)].load(Ordering::SeqCst) > done)
             };
             // Large reads go by the coarse buckets alone (every write marks
             // its own: until 2026-10-28 reads of 4 MiB or more always took
             // the log's lock, front end 2's ~113 MB pools at every binding).
             if last - first >= 64 {
-                return coarse();
+                return coarse(&self.coarse);
             }
-            (first..=last).any(|p| self.pages[page_bucket(p)].load(Ordering::SeqCst) > done) || coarse()
+            // Small ones by their pages and the large writes' 4 MiB
+            // buckets (a small write marks its pages: `tune log_big`).
+            (first..=last).any(|p| self.pages[page_bucket(p)].load(Ordering::SeqCst) > done) || coarse(if big { &self.big } else { &self.coarse })
         })
     }
 
@@ -3913,15 +3926,53 @@ impl RangeLog {
     /// The latest unfinished batch that writes into `reads`.
     fn latest(&self, reads: &[(u64, u64)]) -> Option<u64> {
         let done = done_seq();
-        if self.latest_seq.load(Ordering::SeqCst) <= done || !self.may_overlap(reads, done) {
+        // (Counted with `DS_LOG_STATS=1`: shared counters cost the lookups.)
+        let count = |k: usize| {
+            if log_stats_on() {
+                self.stats[k].fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        count(0);
+        if self.latest_seq.load(Ordering::SeqCst) <= done {
+            count(1);
             return None;
         }
-        if super::tune::shared_log_reads() {
+        if !self.may_overlap(reads, done) {
+            count(2);
+            return None;
+        }
+        count(3);
+        let r = if super::tune::shared_log_reads() {
             super::lockstat::WRITE_LOGS.read(&self.log).latest(reads, done)
         } else {
             super::lockstat::WRITE_LOGS.write(&self.log).latest(reads, done)
+        };
+        if r.is_some() {
+            count(4);
         }
+        r
     }
+
+    fn stats_text(&self) -> String {
+        let v: Vec<u64> = self.stats.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        format!("{} lookups ({} with nothing unfinished, {} with no bucket overlapping, {} under the lock, {} of them finding a batch)", v[0], v[1], v[2], v[3], v[4])
+    }
+}
+
+/// `DS_LOG_STATS=1` (diagnosis): the write logs' lookups counted by how
+/// they were answered.
+fn log_stats_on() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_LOG_STATS").ok().as_deref() == Some("1"))
+}
+
+/// The write logs' lookups by how they were answered (`profile report`;
+/// counted since the start with `DS_LOG_STATS=1`).
+pub fn write_logs_line() -> String {
+    if !log_stats_on() {
+        return String::new();
+    }
+    format!("    write logs: in-flight batches' writes {}; deferred CP writes {}\n", INFLIGHT.stats_text(), CP_WRITES.stats_text())
 }
 
 /// What submitted, unfinished batches of every queue write (shader buffer
@@ -8900,7 +8951,8 @@ impl Exec {
         // (`tune fe2_defer_gfx`: the graphics queue's alone, not the compute
         // queues' many small batches with their label writes.)
         let defer = super::fe2::defer_checks() || (super::tune::fe2_defer_gfx() && self.name.starts_with("gpu-gfx"));
-        let r = super::fe2::ensure(lo, hi, want, ep, written, &|p| (!mine.is_empty() && mine.contains(&p)) || (!pend.is_empty() && pend.contains(&p)), &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable, defer.then_some(&mut deferred));
+        let mine_any = !mine.is_empty() || !pend.is_empty();
+        let r = super::fe2::ensure(lo, hi, want, ep, written, &|p| (!mine.is_empty() && mine.contains(&p)) || (!pend.is_empty() && pend.contains(&p)), mine_any, &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable, defer.then_some(&mut deferred));
         // Past a label wait the CPU may write the pages it rewrites every
         // frame again before the label (FINDINGS.md 2026-10-29): a small
         // binding's such pages are uploaded as they are when the stretch
@@ -12271,7 +12323,7 @@ impl Exec {
                 i += 1;
             }
             checked += 1;
-            let r = super::fe2::ensure(lo, hi, need, ep, false, &|p| up.contains(&p), &mut |a, b| {
+            let r = super::fe2::ensure(lo, hi, need, ep, false, &|p| up.contains(&p), !up.is_empty(), &mut |a, b| {
                 stale = true;
                 if PAST_STALE_LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
                     // (try_lock: the caller may hold the memory map.)

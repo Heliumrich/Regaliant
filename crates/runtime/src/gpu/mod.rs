@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 212] = [
+    static ALL: [Tunable; 215] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -245,6 +245,9 @@ pub mod tune {
         Tunable { name: "fe2_precheck", env: "DS_FE2_PRECHECK", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_taken_upload", env: "DS_FE2_TAKEN_UPLOAD", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ahead_far", env: "DS_AHEAD_FAR", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "span_runs", env: "DS_SPAN_RUNS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "log_big", env: "DS_LOG_BIG", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe2_mine_fast", env: "DS_FE2_MINE_FAST", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2300,6 +2303,33 @@ pub mod tune {
         get(211) != 0
     }
 
+    /// `mem::readable_span`'s per-thread cache: up to 512 runs, one evicted
+    /// when full, behind a last-hit check (0: 64 runs, all cleared when
+    /// full). Level in replay A/Bs (2026-10-29 night): off.
+    #[inline]
+    pub fn span_runs() -> bool {
+        get(212) != 0
+    }
+
+    /// The write logs (`exec::RangeLog`) answer a small read from their
+    /// page buckets and the 4 MiB buckets of large writes alone (0: from the
+    /// 4 MiB buckets every write marks too, so a small read beside a small
+    /// pending write takes the log's lock). Default since 2026-10-29 night
+    /// (replay A/Bs: CPU per command 0.996-0.998).
+    #[inline]
+    pub fn log_big() -> bool {
+        get(213) != 0
+    }
+
+    /// Front end 2's word scan merges the runs of pages that need a check
+    /// whole when the caller's batch uploaded no pages of its own yet (0:
+    /// each page asked, the same runs). Default since 2026-10-29 night
+    /// (replay A/Bs: CPU per command 0.994-0.996).
+    #[inline]
+    pub fn fe2_mine_fast() -> bool {
+        get(214) != 0
+    }
+
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
     /// without appends).
     #[inline]
@@ -3222,6 +3252,7 @@ pub fn profile_report() -> String {
     s.push_str(&cp::wait_stats());
     s.push_str(&cp::classes_line());
     s.push_str(&cp::cb_census_line());
+    s.push_str(&exec::write_logs_line());
     s.push_str(&exec::race_line());
     s.push_str(&forward::status_line());
     s.push_str(&fe2::callers_line());
