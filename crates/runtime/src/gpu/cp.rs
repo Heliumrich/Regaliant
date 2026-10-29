@@ -340,6 +340,12 @@ pub struct Cp {
     last_wait_gpu: bool,
     /// How the last WAIT_REG_MEM passed (its `label_event` kind; diagnostics).
     last_wait_kind: u8,
+    /// Its comparison function (diagnostics: `EPOCH_REPEATS`).
+    last_wait_func: u32,
+    /// Front end 2 (`tune fe2_quiet_waits`): per label this queue's waits
+    /// passed on as released by the CPU, the value then, the distinct
+    /// values seen, and whether each was greater than the one before.
+    passed: HashMap<u64, (u64, u32, bool)>,
     /// The view of the writer of the promise the last WAIT_REG_MEM passed on
     /// (0: this queue's own open promise; `tune fe2_gpu_waits`).
     last_wait_epoch: u32,
@@ -722,18 +728,34 @@ fn past_backoff_note(a: u64, dropped: bool) {
 /// its label). A later stretch past a wait on that label stops before such
 /// a read and settles once the label passes, keeping what it recorded, where
 /// reading it would drop the stretch (FINDINGS.md 2026-10-27 late night).
-static PAST_CONFLICTS: parking_lot::Mutex<Option<HashMap<u64, Vec<(u64, u64)>>>> = parking_lot::Mutex::new(None);
+/// Each with the flip it was learned at and its hold's doublings: past its
+/// hold (`tune past_conflict_hold` flips, doubled each time the same read
+/// drops a stretch again, up to 32x) a stretch goes past it again (a
+/// conflict learned once, e.g. during a load, stopped every later stretch:
+/// 0-271 stops a window by boot, ~1 ms each, FINDINGS.md 2026-10-29).
+static PAST_CONFLICTS: parking_lot::Mutex<Option<HashMap<u64, Vec<PastConflict>>>> = parking_lot::Mutex::new(None);
 const PAST_CONFLICTS_MAX: usize = 16;
+
+#[derive(Clone, Copy)]
+struct PastConflict {
+    read: (u64, u64),
+    learned: u64,
+    level: u32,
+}
 
 fn past_conflicts_note(a: u64, reads: &[(u64, u64)]) {
     if reads.is_empty() {
         return;
     }
+    let frame = super::FRAMES.load(Ordering::Relaxed);
     let mut g = PAST_CONFLICTS.lock();
     let v = g.get_or_insert_with(HashMap::new).entry(a & !7).or_default();
     for &r in reads {
-        v.retain(|&x| x != r);
-        v.push(r);
+        let level = match v.iter().position(|c| c.read == r) {
+            Some(i) => (v.remove(i).level + 1).min(5),
+            None => 0,
+        };
+        v.push(PastConflict { read: r, learned: frame, level });
     }
     if v.len() > PAST_CONFLICTS_MAX {
         let n = v.len() - PAST_CONFLICTS_MAX;
@@ -742,11 +764,12 @@ fn past_conflicts_note(a: u64, reads: &[(u64, u64)]) {
 }
 
 /// Whether `reads` overlap a read that dropped a stretch past a wait on
-/// label `a` before.
+/// label `a` within its hold.
 fn past_conflicts_hit(a: u64, reads: &[(u64, u64)]) -> bool {
     let g = PAST_CONFLICTS.lock();
     let Some(v) = g.as_ref().and_then(|m| m.get(&(a & !7))) else { return false };
-    reads.iter().any(|&(x, n)| v.iter().any(|&(y, m)| x < y + m && y < x + n))
+    let (hold, frame) = (super::tune::past_conflict_hold(), super::FRAMES.load(Ordering::Relaxed));
+    reads.iter().any(|&(x, n)| v.iter().any(|c| x < c.read.0 + c.read.1 && c.read.0 < x + n && (hold == 0 || frame < c.learned + (hold << c.level))))
 }
 
 /// The counters at the frame window's start (`past_wait_window_clause`).
@@ -1357,6 +1380,9 @@ pub static CPU_ARG_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// Waits passed on a GPU queue's write that ended no copy-cache epoch
 /// (`Cp::last_wait_gpu`).
 pub static EPOCH_GPU_WAITS: AtomicU64 = AtomicU64::new(0);
+/// Waits that ended no epoch under `tune fe2_quiet_waits`: [passed again on
+/// a counter's value, gone past].
+pub static QUIET_WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Indexed indirect draws with arguments in a video-memory home read on the
 /// CPU, by why: a base-vertex SGPR, no start-instance SGPR of the vertex
 /// stage, 8-bit indices, indices outside homes, a vertex program needing the
@@ -1459,6 +1485,7 @@ pub fn reset_wait_stats() {
     *WAIT_STATS.lock() = None;
     *EPOCH_WAITS.lock() = None;
     *EPOCH_CLASSES.lock() = None;
+    *EPOCH_REPEATS.lock() = None;
     *LONG_WAITS.lock() = None;
     LONG_WAITS_LOGGED.store(0, Ordering::Relaxed);
 }
@@ -1469,6 +1496,9 @@ static EPOCH_WAITS: parking_lot::Mutex<Option<HashMap<(String, u64, String), u64
 /// The same by (queue, how the wait passed (`Cp::last_wait_kind`), what the
 /// label held) -> (count, labels).
 static EPOCH_CLASSES: parking_lot::Mutex<Option<HashMap<(String, u8, &'static str), (u64, std::collections::HashSet<u64>)>>> = parking_lot::Mutex::new(None);
+/// The same by (queue, label) -> (the value at the last such pass, passes
+/// on that same value again, passes on a new one, the comparison).
+static EPOCH_REPEATS: parking_lot::Mutex<Option<HashMap<(String, u64), (u64, u64, u64, u32)>>> = parking_lot::Mutex::new(None);
 
 fn epoch_wait_lines() -> String {
     let g = EPOCH_WAITS.lock();
@@ -1488,6 +1518,17 @@ fn epoch_wait_lines() -> String {
         s.push_str("    the same by queue, how the wait passed (I at once, M a write seen since or a counter past it, E after polling, P/L on a GPU write) and what the label held:\n");
         for ((q, k, what), (n, labels)) in v.iter().take(24) {
             s.push_str(&format!("      {q} {} {what}: {n} ({} labels)\n", *k as char, labels.len()));
+        }
+    }
+    drop(g);
+    let g = EPOCH_REPEATS.lock();
+    if let Some(m) = g.as_ref() {
+        let mut v: Vec<_> = m.iter().collect();
+        v.sort_by(|a, b| (b.1 .1 + b.1 .2).cmp(&(a.1 .1 + a.1 .2)));
+        let (same, new) = m.values().fold((0u64, 0u64), |(s, n), r| (s + r.1, n + r.2));
+        s.push_str(&format!("    the same by label: {same} passed on the value the queue's last such pass there saw, {new} on a new one; by label (same / new, comparison):\n"));
+        for ((q, a), (_, same, new, func)) in v.iter().take(16) {
+            s.push_str(&format!("      {q} label {a:#x}: {same} / {new} (func {func})\n"));
         }
     }
     s
@@ -1849,6 +1890,8 @@ impl Cp {
             run_costs_pruned: u64::MAX,
             last_wait_gpu: false,
             last_wait_kind: b'-',
+            last_wait_func: 0,
+            passed: HashMap::new(),
             last_wait_epoch: 0,
             held: None,
             main_gfx: name == "gpu-gfx",
@@ -2331,7 +2374,7 @@ impl Cp {
     /// data before releasing it, so shared batch-start copies are dropped
     /// (`gpu::precache`), unless the label holds what a GPU queue's CP wrote
     /// last (the queues synchronize this way ~250 times per frame).
-    fn end_copy_scope_after_wait(&self, a: u64, wide: bool) {
+    fn end_copy_scope_after_wait(&mut self, a: u64, wide: bool) {
         if !valid(a, if wide { 8 } else { 4 }) || (self.held.is_some() && self.past.is_none() && self.past_wait.is_none()) {
             // (A compute queue's view: the epoch now, whatever the label.)
             self.fe2_sync(None);
@@ -2342,6 +2385,9 @@ impl Cp {
         // ordered before it came before the writer's synchronization, which
         // the promise's epoch (or the epoch now) covers; no epoch ends.
         if self.last_wait_gpu && super::fe2::on() && super::tune::fe2_gpu_waits() {
+            // (A value not seen here as the CPU's: the counter's history
+            // starts again, `passed_again`.)
+            self.passed.remove(&(a & !7));
             EPOCH_GPU_WAITS.fetch_add(1, Ordering::Relaxed);
             self.fe2_adopt_epoch(if self.last_wait_kind == b'P' { self.last_wait_epoch } else { super::precache::epoch() as u32 });
             return;
@@ -2351,11 +2397,26 @@ impl Cp {
             self.fe2_adopt(last_write(a).map(|w| w.0).as_deref());
             return;
         }
+        let quiet = super::fe2::on() && super::tune::fe2_quiet_waits();
+        // Front end 2: gone past, the wait released nothing yet; the
+        // stretch checks as of the epoch at each check and is checked again
+        // at its label, where its view is taken.
+        if quiet && self.last_wait_kind == b'G' && self.past_wait.is_some() && super::tune::past_check() {
+            QUIET_WAITS[1].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let now = unsafe { if wide { rd64(a) } else { rd32(a) as u64 } };
         let last = last_write(a);
         let by_gpu = last.as_ref().is_some_and(|(q, v, _)| q.starts_with("gpu-") && if wide { *v == now } else { *v as u32 == now as u32 });
         if by_gpu {
+            self.passed.remove(&(a & !7));
             self.fe2_adopt(last.as_ref().map(|w| w.0.as_str()));
+        } else if quiet && self.passed_again(a, now) {
+            // The value this queue passed on last time at this counter
+            // label: the CPU writes the title ordered before that write are
+            // older than its view then (no wait can have been released by a
+            // later write of the same value).
+            QUIET_WAITS[0].fetch_add(1, Ordering::Relaxed);
         } else {
             super::precache::end_scope(1);
             self.fe2_sync(None);
@@ -2370,6 +2431,15 @@ impl Cp {
                 let e = g.get_or_insert_with(HashMap::new).entry((self.name.clone(), self.last_wait_kind, what)).or_default();
                 e.0 += 1;
                 e.1.insert(a);
+                drop(g);
+                let mut g = EPOCH_REPEATS.lock();
+                let r = g.get_or_insert_with(HashMap::new).entry((self.name.clone(), a)).or_insert((u64::MAX, 0, 0, self.last_wait_func));
+                if r.0 == now {
+                    r.1 += 1;
+                } else {
+                    r.2 += 1;
+                    r.0 = now;
+                }
                 drop(g);
                 let by = match last {
                     Some((q, v, _)) if (if wide { v == now } else { v as u32 == now as u32 }) => format!("written by {q}"),
@@ -2440,6 +2510,25 @@ impl Cp {
         if self.fe2_view.is_some() {
             self.fe2_sync(Some(writer.and_then(super::fe2::view_of).unwrap_or_else(|| super::precache::epoch() as u32)));
         }
+    }
+
+    /// A wait that passed at once on `now` at label `a` as released by the
+    /// CPU: whether this queue passed on that same value last time there and
+    /// the label is a counter (at least three values seen, each greater than
+    /// the one before); notes the value either way (`tune fe2_quiet_waits`).
+    fn passed_again(&mut self, a: u64, now: u64) -> bool {
+        let at_once = self.last_wait_kind == b'I';
+        if self.passed.len() > 4096 {
+            self.passed.clear();
+        }
+        let e = self.passed.entry(a & !7).or_insert((now, 1, true));
+        if e.0 == now {
+            return at_once && e.2 && e.1 >= 3;
+        }
+        e.2 &= now > e.0;
+        e.1 = e.1.saturating_add(1);
+        e.0 = now;
+        false
     }
 
     /// The view a label write recorded now is promised with (`promise`):
@@ -6410,6 +6499,7 @@ impl Cp {
         WAITED.lock().get_or_insert_with(HashSet::new).insert(a & !7);
         self.last_wait_gpu = false;
         self.last_wait_kind = b'-';
+        self.last_wait_func = func;
         let v0 = read();
         if compare(func, v0 & mask, reference & mask) {
             self.last_wait_kind = b'I';
@@ -6494,6 +6584,7 @@ impl Cp {
         }
         // Recording goes on past it, held (`tune past_waits`).
         if self.past_wait_ok(a) {
+            self.last_wait_kind = b'G';
             return self.past_wait_start(control, a, wide, reference, mask, at);
         }
         label_event(&self.name, b'S', a, v0, reference, at);

@@ -2318,8 +2318,10 @@ pub fn init() {
     // default front end, FINDINGS.md 2026-10-28 night), and waits passed on
     // another queue's promise adopt its writer's view instead of ending an
     // epoch (+3.6% at the vista with stretches checked at their labels,
-    // FINDINGS.md 2026-10-29), unless set explicitly.
-    const PAR: [(&str, u64); 4] = [("par_compute", 4), ("par_events", 1), ("par_min_compute", 64), ("fe2_gpu_waits", 1)];
+    // FINDINGS.md 2026-10-29), and waits that release nothing new (gone
+    // past, a counter's value passed on again) end none (epoch ends -38%,
+    // takes -10%, level), unless set explicitly.
+    const PAR: [(&str, u64); 5] = [("par_compute", 4), ("par_events", 1), ("par_min_compute", 64), ("fe2_gpu_waits", 1), ("fe2_quiet_waits", 1)];
     for (name, v) in PAR {
         if !super::tune::set_default(name, v) {
             crate::warn!("fe2: no switch {name}");
@@ -2476,7 +2478,7 @@ pub fn status() -> String {
         })
         .collect();
     format!(
-        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity; CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
+        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity; CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value and {} gone past ended none); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
         s[S_ENSURES],
         s[S_ENSURE_PAGES],
         s[S_FAST],
@@ -2534,6 +2536,8 @@ pub fn status() -> String {
         ends[1],
         ends[2],
         super::cp::EPOCH_GPU_WAITS.load(Ordering::Relaxed),
+        super::cp::QUIET_WAITS[0].load(Ordering::Relaxed),
+        super::cp::QUIET_WAITS[1].load(Ordering::Relaxed),
         super::resident::backed_mib(),
         sizes.join(", "),
         ["armed already", "GPU-written", "written lately", "too few clean epochs", "no settled window", "not plain read-write", "chunk held", "import list busy"]

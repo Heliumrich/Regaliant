@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 196] = [
+    static ALL: [Tunable; 198] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -229,6 +229,8 @@ pub mod tune {
         Tunable { name: "fe2_gpu_waits", env: "DS_FE2_GPU_WAITS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_check", env: "DS_PAST_CHECK", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_hot", env: "DS_PAST_HOT", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe2_quiet_waits", env: "DS_FE2_QUIET_WAITS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "past_conflict_hold", env: "DS_PAST_CONFLICT_HOLD", default: 600, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2137,6 +2139,24 @@ pub mod tune {
     /// runs, whatever its checks found (`fe2::hot_pages`; 0: as checked).
     pub fn past_hot() -> bool {
         get(195) != 0
+    }
+
+    /// Front end 2: waits that release nothing new end no epoch: one that
+    /// passed at once on the value this queue passed on last time at a
+    /// label whose values it has only seen grow (a counter: the title's
+    /// frame fences, waited on ~20 times a frame each), and one the
+    /// graphics CP goes past (its stretch is checked at its label, `tune
+    /// past_check`). Off, each counted as released by the CPU and ended
+    /// an epoch (~85% of those left at the vista, 2026-10-29).
+    pub fn fe2_quiet_waits() -> bool {
+        get(196) != 0
+    }
+
+    /// Flips a read that dropped a stretch past a label wait stops later
+    /// stretches before it (doubled each time it drops one again, up to
+    /// 32x); 0: for the rest of the session, as before 2026-10-29.
+    pub fn past_conflict_hold() -> u64 {
+        get(197)
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
