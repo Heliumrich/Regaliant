@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 194] = [
+    static ALL: [Tunable; 196] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -227,6 +227,8 @@ pub mod tune {
         Tunable { name: "par_park", env: "DS_PAR_PARK", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_seal", env: "DS_PAST_SEAL", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_gpu_waits", env: "DS_FE2_GPU_WAITS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "past_check", env: "DS_PAST_CHECK", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "past_hot", env: "DS_PAST_HOT", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2118,6 +2120,23 @@ pub mod tune {
     /// GPU-written ranges again.
     pub fn fe2_gpu_waits() -> bool {
         get(193) != 0
+    }
+
+    /// Front end 2: at its label a stretch past a label wait whose checks
+    /// needed an older epoch than its label does (the label's writer
+    /// synchronized after them) is checked again as of that epoch, and
+    /// dropped and recorded again when a page it bound was written since
+    /// (`Exec::past_current_for`; 0: kept unchecked, as before 2026-10-29,
+    /// when 59% of the vista's stretches bound such pages).
+    pub fn past_check() -> bool {
+        get(194) != 0
+    }
+
+    /// Front end 2: a stretch past a label wait uploads the pages of its
+    /// small bindings written within their hot window as they are when it
+    /// runs, whatever its checks found (`fe2::hot_pages`; 0: as checked).
+    pub fn past_hot() -> bool {
+        get(195) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

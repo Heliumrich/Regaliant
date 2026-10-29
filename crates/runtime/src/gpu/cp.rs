@@ -340,8 +340,8 @@ pub struct Cp {
     last_wait_gpu: bool,
     /// How the last WAIT_REG_MEM passed (its `label_event` kind; diagnostics).
     last_wait_kind: u8,
-    /// The epoch the promise the last WAIT_REG_MEM passed on was made in (0:
-    /// this queue's own open promise; `tune fe2_gpu_waits`).
+    /// The view of the writer of the promise the last WAIT_REG_MEM passed on
+    /// (0: this queue's own open promise; `tune fe2_gpu_waits`).
     last_wait_epoch: u32,
     /// The end of the last run the planner found too short (no new plan
     /// until execution passes it: each command would scan the rest again).
@@ -786,7 +786,7 @@ pub fn past_wait_status() -> String {
     };
     let n = p(0).max(1) as f64;
     format!(
-        "    recording past label waits: {} stretches, {} committed, {} dropped ({}; {} waits not gone past after drops), {} commands recorded past the waits ({:.1} each), {:.0} us from a wait to its settling; settled once promised {}, at a stop {} ({}; {:.0} us waited for the label there on average)\n",
+        "    recording past label waits: {} stretches, {} committed, {} dropped ({}; {} waits not gone past after drops), {} commands recorded past the waits ({:.1} each), {:.0} us from a wait to its settling; settled once promised {}, at a stop {} ({}; {:.0} us waited for the label there on average); checked again at their label for a later epoch {} ({} ranges, {} stale, {:.0} us each); hot pages of small bindings uploaded as they are when the stretch runs: {} runs, {} pages\n",
         p(0),
         p(1),
         p(2),
@@ -798,7 +798,13 @@ pub fn past_wait_status() -> String {
         p(5),
         p(6),
         list(&PAST_WAIT_STOPS),
-        p(7) as f64 / 1e3 / p(6).max(1) as f64
+        p(7) as f64 / 1e3 / p(6).max(1) as f64,
+        super::exec::PAST_CHECKS[0].load(Ordering::Relaxed),
+        super::exec::PAST_CHECKS[1].load(Ordering::Relaxed),
+        super::exec::PAST_CHECKS[2].load(Ordering::Relaxed),
+        super::exec::PAST_CHECKS[3].load(Ordering::Relaxed) as f64 / 1e3 / super::exec::PAST_CHECKS[0].load(Ordering::Relaxed).max(1) as f64,
+        super::exec::PAST_HOT[0].load(Ordering::Relaxed),
+        super::exec::PAST_HOT[1].load(Ordering::Relaxed)
     )
 }
 
@@ -1325,8 +1331,9 @@ static WAITED: parking_lot::Mutex<Option<HashSet<u64>>> = parking_lot::Mutex::ne
 
 /// Label values deferred CP writes will store: address -> (batch sequence,
 /// value, bytes, whether the CPU stores it after the batch completed rather
-/// than the GPU within it, when it was made, the epoch it was made in: its
-/// writer's waits before the write had all passed then). A WAIT_REG_MEM that a promised value satisfies passes at
+/// than the GPU within it, when it was made, its writer's view then: the
+/// epoch the CPU writes the title ordered before the write are older than,
+/// every earlier wait of the writer having passed). A WAIT_REG_MEM that a promised value satisfies passes at
 /// once and orders its queue after that batch (`Exec::depend_on`): its later
 /// GPU work follows the batch on the device queue, its CP writes wait for
 /// it, its CP reads wait for unfinished writers (`Exec::sync_for_reads`), so
@@ -1362,7 +1369,7 @@ fn promises_on() -> bool {
     super::tune::promises()
 }
 
-pub(super) fn promise(seq: u64, addr: u64, value: u64, bytes: u8, by_cpu: bool) {
+pub(super) fn promise(seq: u64, addr: u64, value: u64, bytes: u8, by_cpu: bool, view: u32) {
     if !promises_on() {
         return;
     }
@@ -1374,16 +1381,15 @@ pub(super) fn promise(seq: u64, addr: u64, value: u64, bytes: u8, by_cpu: bool) 
     }
     // (Made where its writer's batch was submitted, or for a CP effect
     // recorded by a command processor holding nothing: every wait before
-    // the write had passed, so the CPU writes the title ordered before it
-    // are older than this epoch.)
-    m.insert(addr, (seq, value, bytes, by_cpu, Instant::now(), super::precache::epoch() as u32));
+    // the write had passed and its view took them in.)
+    m.insert(addr, (seq, value, bytes, by_cpu, Instant::now(), view));
     drop(g);
     PROMISE_GEN.fetch_add(1, Ordering::Release);
     wake_label(addr, bytes);
 }
 
 /// The batch whose promised write to `addr` satisfies the comparison,
-/// whether the CPU performs that write, and the epoch it was promised in.
+/// whether the CPU performs that write, and its writer's view then.
 fn promised(addr: u64, wide: bool, func: u32, mask: u64, reference: u64) -> Option<(u64, bool, u32)> {
     let g = PROMISES.lock();
     let &(seq, value, bytes, by_cpu, _, epoch) = g.as_ref()?.get(&addr)?;
@@ -2375,6 +2381,27 @@ impl Cp {
         }
     }
 
+    /// The epoch the label at `a` that the last wait passed on orders before
+    /// the work after it (front end 2, `tune fe2_gpu_waits`), and what wrote
+    /// it: a promise (its writer's view then), a latched CP write (the epoch
+    /// now), a GPU queue's CP write in memory (that queue's view, the epoch
+    /// now without one), else the CPU (later than any check made so far).
+    fn label_needs(&self, a: u64, wide: bool) -> (u32, &'static str) {
+        let now = super::precache::epoch() as u32;
+        match self.last_wait_kind {
+            b'P' => (self.last_wait_epoch, "checks older than its label's promise"),
+            b'L' => (now, "checks older than its label's latched write"),
+            _ if !valid(a, if wide { 8 } else { 4 }) => (now.saturating_add(1), "checks older than its label's CPU write"),
+            _ => {
+                let v = unsafe { if wide { rd64(a) } else { rd32(a) as u64 } };
+                match last_write(a) {
+                    Some((q, w, _)) if q.starts_with("gpu-") && (if wide { w == v } else { w as u32 == v as u32 }) => (super::fe2::view_of(&q).unwrap_or(now), "checks older than its label's GPU write"),
+                    _ => (now.saturating_add(1), "checks older than its label's CPU write"),
+                }
+            }
+        }
+    }
+
     /// A title submission starts (its command buffers follow): CPU writes
     /// come between submissions, so shared batch-start copies of the
     /// graphics queue are dropped (`gpu::precache`).
@@ -2412,6 +2439,15 @@ impl Cp {
     fn fe2_adopt(&self, writer: Option<&str>) {
         if self.fe2_view.is_some() {
             self.fe2_sync(Some(writer.and_then(super::fe2::view_of).unwrap_or_else(|| super::precache::epoch() as u32)));
+        }
+    }
+
+    /// The view a label write recorded now is promised with (`promise`):
+    /// this queue's, the epoch now without one.
+    fn fe2_promise_view(&self) -> u32 {
+        match self.fe2_view.as_ref().map(|c| c.load(Ordering::Acquire)) {
+            Some(v) if v != super::fe2::NO_VIEW => v,
+            _ => super::precache::epoch() as u32,
         }
     }
 
@@ -3231,6 +3267,16 @@ impl Cp {
         let flow = self.wait(w.control, w.a, w.wide, w.reference, w.mask, w.at);
         self.settling = false;
         let waited = t.elapsed();
+        // Front end 2: the stretch was checked before its label's writer
+        // synchronized for the last time ahead of the label, and the CPU may
+        // have written pages it bound in between (the title's per-frame
+        // blocks, written after the graphics queue's submission and before
+        // the compute queue's whose label it waits on): then it is checked
+        // again as of the epoch its label needs (`tune past_check`), and
+        // recorded again when a page was written since (`DS_FE2_STRETCH_AUDIT=1`:
+        // counted, kept).
+        let needs = (super::fe2::on() && (super::tune::past_check() || super::fe2::stretch_audit())).then(|| self.label_needs(w.a, w.wide));
+        let audit = super::fe2::stretch_audit();
         let writes = super::exec::journal_end();
         PAST_WAITS[3].fetch_add(commands, Ordering::Relaxed);
         PAST_WAITS[4].fetch_add(w.began.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -3271,6 +3317,8 @@ impl Cp {
             super::images::with(|im| im.clears_pending(&keys) || im.overwrites_pending(&keys))
         } {
             Some("images with pending clears or reloads")
+        } else if let Some((_, why)) = needs.filter(|&(n, _)| e.past_checks_want() < n && !e.past_current_for(n) && !audit) {
+            Some(why)
         } else if super::tune::past_drop() {
             Some("dropped (past_drop)")
         } else {
@@ -3319,15 +3367,17 @@ impl Cp {
             }
             return Some(w.at);
         }
-        e.past_commit();
-        PAST_WAITS[1].fetch_add(1, Ordering::Relaxed);
-        past_backoff_note(w.a, false);
         // The label passed: front end 2's view as after any wait (the
         // writer's, or the epoch now; the stretch checked as of the epoch
-        // at each check). (The default front end's scopes stay as before.)
+        // at each check), taken before its held batches go to the GPU: the
+        // label writes among them are promised with it. (The default front
+        // end's scopes stay as before.)
         if super::fe2::on() {
             self.end_copy_scope_after_wait(w.a, w.wide);
         }
+        self.exec.as_mut().unwrap().past_commit();
+        PAST_WAITS[1].fetch_add(1, Ordering::Relaxed);
+        past_backoff_note(w.a, false);
         if why == "label" {
             self.submit_gpu("label");
         }
@@ -6083,7 +6133,7 @@ impl Cp {
                     }),
                 );
                 if let (Some(s), Some((v, bytes))) = (seq, label) {
-                    promise(s, a, v, bytes, true);
+                    promise(s, a, v, bytes, true, self.fe2_promise_view());
                 }
             }
             0 => {
@@ -6327,8 +6377,8 @@ impl Cp {
         );
         if let Some(s) = seq {
             match data_sel {
-                1 => promise(s, a, data & 0xFFFF_FFFF, 4, true),
-                2 => promise(s, a, data, 8, true),
+                1 => promise(s, a, data & 0xFFFF_FFFF, 4, true, self.fe2_promise_view()),
+                2 => promise(s, a, data, 8, true, self.fe2_promise_view()),
                 _ => {}
             }
         }

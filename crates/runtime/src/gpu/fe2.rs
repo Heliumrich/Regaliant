@@ -558,6 +558,16 @@ pub fn check_copies() -> bool {
     *W.get_or_init(|| std::env::var("DS_FE2_CHECK_COPIES").ok().as_deref() == Some("1"))
 }
 
+/// `DS_FE2_STRETCH_AUDIT=1` (diagnosis): at its label every stretch past a
+/// label wait whose checks needed an older epoch than its label does is
+/// checked again (`Exec::past_current_for`) and counted stale or not, as
+/// `tune fe2_gpu_waits` checks them, but kept either way (without the
+/// switch).
+pub fn stretch_audit() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_FE2_STRETCH_AUDIT").ok().as_deref() == Some("1"))
+}
+
 /// Held past a label wait, the graphics command processor's checks need the
 /// epoch now, not its view (`DS_FE2_STRETCH_VIEW=1`: the view, as before
 /// 2026-10-28 night's fix; `Exec::fe2_place_inner`).
@@ -1458,6 +1468,39 @@ pub fn resolve(runs: &mut Vec<(u64, u64)>, mine: &dyn Fn(u64) -> bool, upload: &
     r
 }
 
+/// The runs of pages of [lo, hi) (page-aligned) each found written within
+/// its hot window (`hot_run`'s): a stretch past a label wait uploads them
+/// as they are when it runs, whatever its checks found, since the CPU may
+/// write them again before its label (`Exec::fe2_place_inner`; the
+/// title's per-frame blocks, rewritten after the graphics queue's
+/// submission and before the compute queue's whose label it waits on).
+pub fn hot_pages(lo: u64, hi: u64, out: &mut Vec<(u64, u64)>) {
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    let quiet = hot_quiet();
+    let mut start: Option<u64> = None;
+    let mut x = lo;
+    while x < hi {
+        let hot = chunk(x, false).is_some_and(|c| {
+            let i = idx(x);
+            let wrote = c.wrote[i].load(Ordering::Relaxed) as u64;
+            let window = if quiet { HOT_FLIPS.max(ARM_QUIET << c.level[i].load(Ordering::Relaxed)) } else { HOT_FLIPS };
+            wrote != 0 && frame.saturating_sub(wrote - 1) < window
+        });
+        match (hot, start) {
+            (true, None) => start = Some(x),
+            (false, Some(s)) => {
+                out.push((s, x));
+                start = None;
+            }
+            _ => {}
+        }
+        x += PAGE;
+    }
+    if let Some(s) = start {
+        out.push((s, hi));
+    }
+}
+
 /// Whether [a, b) is at most HOT_PAGES pages, every one found written
 /// within HOT_FLIPS flips.
 fn hot_run(a: u64, b: u64, frame: u64) -> bool {
@@ -2272,9 +2315,11 @@ pub fn init() {
     // Compute queues' synchronization-free runs are recorded in parallel
     // (four workers, flushes kept inside runs, runs from 64 commands: +6-10%
     // at the vista once checks follow each other's takes; a loss in the
-    // default front end, FINDINGS.md 2026-10-28 night), unless set
-    // explicitly.
-    const PAR: [(&str, u64); 3] = [("par_compute", 4), ("par_events", 1), ("par_min_compute", 64)];
+    // default front end, FINDINGS.md 2026-10-28 night), and waits passed on
+    // another queue's promise adopt its writer's view instead of ending an
+    // epoch (+3.6% at the vista with stretches checked at their labels,
+    // FINDINGS.md 2026-10-29), unless set explicitly.
+    const PAR: [(&str, u64); 4] = [("par_compute", 4), ("par_events", 1), ("par_min_compute", 64), ("fe2_gpu_waits", 1)];
     for (name, v) in PAR {
         if !super::tune::set_default(name, v) {
             crate::warn!("fe2: no switch {name}");

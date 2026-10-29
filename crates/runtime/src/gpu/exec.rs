@@ -5079,6 +5079,16 @@ fn profiling() -> bool {
     *ON.get_or_init(|| std::env::var("DS_PROFILE_GPU").ok().as_deref() == Some("1"))
 }
 
+/// Stretches past label waits checked again at their label
+/// (`Exec::past_current_for`): [stretches, ranges, found stale, ns].
+pub static PAST_CHECKS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Hot pages of small bindings a stretch past a label wait uploaded as
+/// they are when it runs (`fe2::hot_pages`): [runs, pages].
+pub static PAST_HOT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Bindings of at most this many pages get those uploads.
+const STRETCH_HOT_PAGES: u64 = 64;
+static PAST_STALE_LOGGED: AtomicU64 = AtomicU64::new(0);
+
 /// The per-step timers of dispatches, their bindings' parts and their
 /// batch-start copy lookups: with the profiler, or alone with
 /// `DS_STEP_LAPS=1` (light enough not to change what it measures: the
@@ -6833,6 +6843,13 @@ pub struct Exec {
     /// a held batch is passed over for a free or new one (up to
     /// HELD_SLOTS) instead of stopping.
     past_grow: bool,
+    /// The oldest epoch front end 2's checks needed since the stretch past
+    /// a label wait began (u32::MAX: none; `past_checks_want`).
+    past_want_min: u32,
+    /// The ranges its checks placed and the pages its batches upload
+    /// (`past_current_for`).
+    past_ranges: Vec<(u64, u64)>,
+    past_up: HashSet<u64>,
     /// Its own image-cache notes (`Images::notes_for`), never in the image
     /// cache before a hand-over: fast clears pending (metadata address,
     /// value when known) and GPU-owned images overwritten by its work.
@@ -7525,6 +7542,9 @@ impl Exec {
                 held_kinds: Vec::new(),
                 cp_written: Vec::new(),
                 past_grow: false,
+                past_want_min: u32::MAX,
+                past_ranges: Vec::new(),
+                past_up: HashSet::new(),
                 held_clears: HashMap::new(),
                 held_over: HashSet::new(),
                 held_keys: HashSet::new(),
@@ -8226,7 +8246,7 @@ impl Exec {
         }
         st.mark(8);
         for (a, v, n) in std::mem::take(&mut self.pending_promises) {
-            super::cp::promise(seq, a, v, n, false);
+            super::cp::promise(seq, a, v, n, false, self.promise_view());
         }
         if let Some(m) = UNSUBMITTED_LABELS.lock().as_mut() {
             m.retain(|_, f| !std::sync::Arc::ptr_eq(f, &self.submit_request));
@@ -8806,6 +8826,10 @@ impl Exec {
         let ep = super::precache::epoch() as u32;
         let want = self.fe2_want(ep);
         self.fe2_min_want = self.fe2_min_want.min(want);
+        if self.past_grow {
+            self.past_want_min = self.past_want_min.min(want);
+            self.past_ranges.push((lo, hi));
+        }
         let mine = std::mem::take(&mut self.fe2_mine);
         let pend = std::mem::take(&mut self.fe2_pend_set);
         let mut up = std::mem::take(&mut self.fe2_up);
@@ -8814,12 +8838,43 @@ impl Exec {
         // (Asked per page of the runs a check needs: empty sets are not
         // hashed into.)
         let r = super::fe2::ensure(lo, hi, want, ep, written, &|p| (!mine.is_empty() && mine.contains(&p)) || (!pend.is_empty() && pend.contains(&p)), &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable, super::fe2::defer_checks().then_some(&mut deferred));
+        // Past a label wait the CPU may write the pages it rewrites every
+        // frame again before the label (FINDINGS.md 2026-10-29): a small
+        // binding's such pages are uploaded as they are when the stretch
+        // runs, whatever the check found.
+        if self.past_grow && r.is_ok() && (hi - lo) / PAGE <= STRETCH_HOT_PAGES && super::tune::past_hot() {
+            let mut hot = Vec::new();
+            super::fe2::hot_pages(lo, hi, &mut hot);
+            let own = |p: u64, up: &[(u64, u64)]| mine.contains(&p) || pend.contains(&p) || up[first..].iter().any(|&(s, e)| s <= p && p < e);
+            'runs: for (a, b) in hot {
+                let mut x = a;
+                while x < b {
+                    if own(x, &up) {
+                        x += PAGE;
+                        continue;
+                    }
+                    let mut y = x + PAGE;
+                    while y < b && !own(y, &up) {
+                        y += PAGE;
+                    }
+                    if !self.fe2_upload(mbuf, x, y, &mut up) {
+                        break 'runs;
+                    }
+                    PAST_HOT[0].fetch_add(1, Ordering::Relaxed);
+                    PAST_HOT[1].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+                    x = y;
+                }
+            }
+        }
         let t3 = tsc();
         let (mut mine, mut pend) = (mine, pend);
         for &(a, b) in &up[first..] {
             let mut p = a;
             while p < b {
                 mine.insert(p);
+                if self.past_grow {
+                    self.past_up.insert(p);
+                }
                 p += PAGE;
             }
         }
@@ -8952,6 +9007,9 @@ impl Exec {
         // runs on the same or adjacent pages placed as one.
         ranges.sort_unstable();
         let want = self.fe2_want(super::precache::epoch() as u32);
+        if self.past_grow {
+            self.past_want_min = self.past_want_min.min(want);
+        }
         let mut run: Option<(u64, u64)> = None;
         let (mut placed, mut bytes, mut mine) = (0u64, 0u64, 0u64);
         for i in 0..=ranges.len() {
@@ -12068,6 +12126,74 @@ impl Exec {
         // its copies forward globally as before.
         super::forward::hold_drop();
         self.past_grow = true;
+        self.past_want_min = u32::MAX;
+        self.past_ranges.clear();
+        self.past_up.clear();
+    }
+
+    /// Whether what the stretch past a label wait placed is current as of
+    /// epoch `need` (`tune past_check`: its label orders the CPU writes
+    /// before that epoch ahead of its work, and its checks needed older
+    /// ones): each range is checked again as of `need` (ranges taken since
+    /// pass as they are, others are taken), the pages its own batches
+    /// upload counting as its own; a page that would need an upload was
+    /// written since the stretch checked it.
+    pub fn past_current_for(&mut self, need: u32) -> bool {
+        let mut ranges = std::mem::take(&mut self.past_ranges);
+        ranges.sort_unstable();
+        let up = std::mem::take(&mut self.past_up);
+        // A label the CPU released needs every page taken after it: a new
+        // epoch, so that the takes below are stamped with it (and no range
+        // is noted fine for an epoch that has not begun).
+        if need > super::precache::epoch() as u32 {
+            super::precache::end_scope(1);
+        }
+        let ep = super::precache::epoch() as u32;
+        let need = need.min(ep);
+        let t = std::time::Instant::now();
+        let (mut stale, mut checked) = (false, 0u64);
+        let mut i = 0;
+        while i < ranges.len() && !stale {
+            // (Overlapping and adjacent ranges as one.)
+            let (lo, mut hi) = ranges[i];
+            i += 1;
+            while i < ranges.len() && ranges[i].0 <= hi {
+                hi = hi.max(ranges[i].1);
+                i += 1;
+            }
+            checked += 1;
+            let r = super::fe2::ensure(lo, hi, need, ep, false, &|p| up.contains(&p), &mut |a, b| {
+                stale = true;
+                if PAST_STALE_LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
+                    // (try_lock: the caller may hold the memory map.)
+                    let map = crate::mem::MEM.try_lock().map_or_else(|| "busy".into(), |m| m.find(a).map_or_else(|| "none".into(), |v| format!("{:#x}+{:#x} {:?} '{}'", v.start, v.size, v.kind, v.name)));
+                    crate::info!("gpu[{}]: a stretch past a label wait read {a:#x}..{b:#x} ({} pages) of {lo:#x}..{hi:#x}, written since its check (needs epoch {need}, its checks {}; flip {}; mapping {map})", self.name, (b - a) / super::resident::PAGE, self.past_want_min, super::FRAMES.load(Ordering::Relaxed));
+                }
+                true
+            }, &fe2_armable, None);
+            stale |= r.is_err();
+        }
+        PAST_CHECKS[0].fetch_add(1, Ordering::Relaxed);
+        PAST_CHECKS[1].fetch_add(checked, Ordering::Relaxed);
+        PAST_CHECKS[2].fetch_add(stale as u64, Ordering::Relaxed);
+        PAST_CHECKS[3].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        !stale
+    }
+
+    /// The view this queue's label writes submitted now are promised with
+    /// (`cp::promise`): its view, the epoch now without one.
+    fn promise_view(&self) -> u32 {
+        match self.fe2_view.load(Ordering::Acquire) {
+            super::fe2::NO_VIEW => super::precache::epoch() as u32,
+            v => v,
+        }
+    }
+
+    /// The oldest epoch the checks of the stretch past a label wait needed
+    /// (u32::MAX: it made none): one older than its label needs may have
+    /// missed a CPU write the title ordered before the label (`Cp::past_wait_settle`).
+    pub fn past_checks_want(&self) -> u32 {
+        self.past_want_min
     }
 
     /// What it recorded past the run holds (`Cp::past_settle`): its closed
@@ -12399,7 +12525,7 @@ impl Exec {
             self.inflight.insert_all(seq, &b.writes);
             // (After its writes are noted, as `submit_for` does.)
             for (a, v, n) in b.promises {
-                super::cp::promise(seq, a, v, n, false);
+                super::cp::promise(seq, a, v, n, false, self.promise_view());
             }
             self.own_gen += 1;
             self.last_seq = seq;
