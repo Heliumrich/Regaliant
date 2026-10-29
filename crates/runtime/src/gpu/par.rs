@@ -49,6 +49,12 @@ pub fn workers() -> usize {
 /// 64 against 128 gave +1.6% flips/s at +5.4% CPU per command (more, smaller
 /// chunks; FINDINGS.md 2026-10-16): worth it while CPUs are spare, a loss
 /// once they are not.
+/// The shortest run split into parallel chunks whatever `par_min` and
+/// `par_min_compute` say (`tune par_floor`, default 48).
+pub fn floor() -> usize {
+    super::tune::par_floor().max(2) as usize
+}
+
 pub fn min_run() -> usize {
     match super::tune::par_min() {
         0 => {
@@ -217,7 +223,7 @@ struct Long {
     /// submitted chunk's and what the main command processor records of the
     /// run (`add_writes`); in the second, those writes but for the planner's
     /// copies (`forward::plan`).
-    writes: Arc<Mutex<(super::ranges::Ranges, super::ranges::Ranges)>>,
+    writes: Arc<Mutex<(super::ranges::Ranges, super::ranges::Ranges, super::ranges::Ranges)>>,
     /// Each worker chunk's copies forwarded before it (`forward::inherited`)
     /// and all the run's planned copies (packet -> words).
     inherited: Vec<Vec<super::forward::Planned>>,
@@ -339,13 +345,13 @@ impl Run {
 
     /// The write log its chunks are checked against (a long run's; a run
     /// chained after it shares it, `set_long`).
-    pub fn long_writes(&self) -> Option<Arc<Mutex<(super::ranges::Ranges, super::ranges::Ranges)>>> {
+    pub fn long_writes(&self) -> Option<Arc<Mutex<(super::ranges::Ranges, super::ranges::Ranges, super::ranges::Ranges)>>> {
         self.long.as_ref().map(|l| l.writes.clone())
     }
 
     /// Makes it a long run: each worker chunk's predicted labels, and what
     /// the main command processor's batch writes when it was planned.
-    pub fn set_long(&mut self, labels: Vec<std::collections::HashMap<u64, (u64, u8)>>, writes: super::ranges::Ranges, inherited: Vec<Vec<super::forward::Planned>>, planned: Arc<std::collections::HashMap<u64, Arc<[u32]>>>, shared: Option<Arc<Mutex<(super::ranges::Ranges, super::ranges::Ranges)>>>) {
+    pub fn set_long(&mut self, labels: Vec<std::collections::HashMap<u64, (u64, u8)>>, writes: super::ranges::Ranges, inherited: Vec<Vec<super::forward::Planned>>, planned: Arc<std::collections::HashMap<u64, Arc<[u32]>>>, shared: Option<Arc<Mutex<(super::ranges::Ranges, super::ranges::Ranges, super::ranges::Ranges)>>>) {
         // A chained run shares its predecessor's log (its chunks come after
         // all of that run's).
         let writes = match shared {
@@ -353,7 +359,9 @@ impl Run {
                 s.lock().0.extend(&writes);
                 s
             }
-            None => Arc::new(Mutex::new((writes, Default::default()))),
+            // (What came before an unchained run: its third log too, for
+            // reads of forwarded copies made before the run.)
+            None => Arc::new(Mutex::new((writes.clone(), Default::default(), writes))),
         };
         self.long = Some(Long { labels, writes, inherited, planned, bad: AtomicBool::new(false) });
     }
@@ -888,13 +896,20 @@ fn commit(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, from: u6
     let dropped = match long {
         Some(l) if granted && !failed => {
             let earlier = l.writes.lock();
-            let d = if l.bad.load(Ordering::Acquire) { Some("an earlier chunk computed a planned copy otherwise") } else { cp.long_check(&earlier.0, &earlier.1) };
+            let d = if l.bad.load(Ordering::Acquire) { Some("an earlier chunk computed a planned copy otherwise") } else { cp.long_check(&earlier.0, &earlier.1, &earlier.2) };
             if d.is_some() && trace_long_drops() {
                 static N: AtomicU64 = AtomicU64::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < 60 {
-                    let r = cp.long_read_of(&earlier.0);
+                    // (A forwarded read's conflict is with the earlier chunks'
+                    // writes other than the planner's copies.)
+                    let (r, w) = match cp.long_fwd_read_of(&earlier.1, &earlier.2) {
+                        Some(r) if earlier.1.overlaps(r.0, r.1) => (Some(r), &earlier.1),
+                        Some(r) => (Some(r), &earlier.2),
+                        None => (cp.long_read_of(&earlier.0), &earlier.0),
+                    };
                     let (a, n) = r.unwrap_or((0, 0));
-                    crate::info!("gpu[{}]: long run chunk {i} at {from:#x}..{to:#x} dropped: {} (read {a:#x}+{n:#x}; {}; earlier writes there {:?})", cp.name, d.unwrap_or(""), super::forward::describe(a, n), earlier.0.intersect(a, n));
+                    let inh = l.inherited.get(i).map_or(0, |v| v.iter().filter(|q| q.base < a + n && a < q.base + 4 * q.words.len() as u64).count());
+                    crate::info!("gpu[{}]: long run chunk {i} at {from:#x}..{to:#x} dropped: {} (read {a:#x}+{n:#x}; {}; earlier writes there {:?}; run past a label wait: {}; the run's planned copies {}, this chunk's inherited over the read {inh})", cp.name, d.unwrap_or(""), super::forward::describe(a, n), w.intersect(a, n), run.stretch, l.planned.len());
                 }
             }
             drop(earlier);

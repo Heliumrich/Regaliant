@@ -380,7 +380,7 @@ pub struct Cp {
     /// What the next run planned starts with when chained after the last
     /// one past which this command processor records (`chain_next`): its
     /// label writes, planned copies and write log.
-    chain_seed: Option<(Vec<RunLabel>, Vec<super::forward::Planned>, Option<Arc<parking_lot::Mutex<(super::ranges::Ranges, super::ranges::Ranges)>>>)>,
+    chain_seed: Option<(Vec<RunLabel>, Vec<super::forward::Planned>, Option<Arc<parking_lot::Mutex<(super::ranges::Ranges, super::ranges::Ranges, super::ranges::Ranges)>>>)>,
     /// Recording past a label wait (`tune past_waits`), and whether such a
     /// stretch is settling (its wait is waited for normally then).
     past_wait: Option<Box<PastWait>>,
@@ -2262,13 +2262,20 @@ impl Cp {
 
     /// Whether the long run's chunk it recorded must be recorded again
     /// (`Exec::long_conflict`): why.
-    pub fn long_check(&self, earlier: &super::ranges::Ranges, chunks: &super::ranges::Ranges) -> Option<&'static str> {
-        self.exec.as_ref().and_then(|e| e.long_conflict(earlier, chunks))
+    pub fn long_check(&self, earlier: &super::ranges::Ranges, chunks: &super::ranges::Ranges, before: &super::ranges::Ranges) -> Option<&'static str> {
+        self.exec.as_ref().and_then(|e| e.long_conflict(earlier, chunks, before))
     }
 
     /// The first CPU read of its chunk that `earlier` writes (traces).
     pub fn long_read_of(&self, earlier: &super::ranges::Ranges) -> Option<(u64, u64)> {
         self.exec.as_ref().and_then(|e| e.long_conflict_read(earlier))
+    }
+
+    /// The first read of its chunk served by a forwarded copy that `chunks`
+    /// (the earlier chunks' writes other than the planner's copies) writes
+    /// (traces).
+    pub fn long_fwd_read_of(&self, chunks: &super::ranges::Ranges, before: &super::ranges::Ranges) -> Option<(u64, u64)> {
+        self.exec.as_ref().and_then(|e| e.long_conflict_fwd_read(chunks, before))
     }
 
     /// The long run's chunk it recorded keeps its held view of the forwarded
@@ -2881,7 +2888,7 @@ impl Cp {
                 // the CPU, are mostly what the stretch's label's writer or
                 // the per-view copies before them write: its chunks were
                 // dropped at their turn, 87% of them; the run ends before it.)
-                if self.plan_wait_run && matches!(opc, op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT) {
+                if self.plan_wait_run && !super::tune::wait_runs_draws() && matches!(opc, op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT) {
                     break c;
                 }
                 ends.push(next);
@@ -2930,7 +2937,7 @@ impl Cp {
         };
         let n = ends.len();
         super::par::note_run(n, why, self.compute);
-        let par_min = (if self.compute { super::tune::par_min_compute() as usize } else { super::par::min_run() }).max(48);
+        let par_min = (if self.compute { super::tune::par_min_compute() as usize } else { super::par::min_run() }).max(super::par::floor());
         let chunk_min = (par_min / 3).clamp(16, PAR_CHUNK_MIN);
         let chunks = ((k + 1) * super::par::split()).min(n / chunk_min);
         if n < par_min || chunks < 2 {
@@ -3684,12 +3691,13 @@ impl Cp {
             }
             let (seal0, first) = parts.remove(0);
             if let Some(s) = seal0 {
-                // (Its chunks are checked against what it wrote, as a chained
-                // run's against the seal before it.)
+                // (Its chunks are checked against what it wrote: it comes
+                // before the run, all of whose planned copies are its own,
+                // so reads those copies served pass it.)
                 if let Some(log) = first.pr.run.long_writes() {
                     let mut g = log.lock();
                     g.0.extend(&s.check.writes);
-                    g.1.extend(&s.check.writes);
+                    g.2.extend(&s.check.writes);
                 }
                 if let Some(e) = self.exec.as_mut() {
                     e.past_commit_sealed(s.check.fwd);
@@ -4186,7 +4194,7 @@ impl Cp {
                 // the CPU, are mostly what the stretch's label's writer or
                 // the per-view copies before them write: its chunks were
                 // dropped at their turn, 87% of them; the run ends before it.)
-                if self.plan_wait_run && matches!(opc, op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT) {
+                if self.plan_wait_run && !super::tune::wait_runs_draws() && matches!(opc, op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT) {
                     break c;
                 }
                 n += 1;
@@ -4205,7 +4213,7 @@ impl Cp {
             }
             c = next;
         };
-        let par_min = super::par::min_run().max(48);
+        let par_min = super::par::min_run().max(super::par::floor());
         let chunk_min = (par_min / 3).clamp(16, PAR_CHUNK_MIN);
         let chunks = ((super::par::workers() + 1) * super::par::split()).min(n / chunk_min);
         if n < par_min || chunks < 2 {
@@ -4410,7 +4418,7 @@ impl Cp {
         let t0 = Instant::now();
         // Runs this command processor would split among parallel workers.
         let par_min = if !whole && f.words.is_empty() && !super::capture::capturing() && (if self.compute { super::tune::par_compute() > 0 } else { super::par::workers() > 0 }) {
-            (if self.compute { super::tune::par_min_compute() as usize } else { super::par::min_run() }).max(48)
+            (if self.compute { super::tune::par_min_compute() as usize } else { super::par::min_run() }).max(super::par::floor())
         } else {
             usize::MAX
         };

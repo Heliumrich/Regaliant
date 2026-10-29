@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 204] = [
+    static ALL: [Tunable; 205] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -237,6 +237,7 @@ pub mod tune {
         Tunable { name: "fe2_cpw_light", env: "DS_FE2_CPW_LIGHT", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_defer_gfx", env: "DS_FE2_DEFER_GFX", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_wide_pages", env: "DS_FE2_WIDE_PAGES", default: 64, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par_floor", env: "DS_PAR_FLOOR", default: 48, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2174,6 +2175,13 @@ pub mod tune {
         get(198) != 0
     }
 
+    /// `tune wait_runs 2` (diagnosis): such runs go through indirect draws
+    /// (their chunks read the arguments when they record; -8% at the vista,
+    /// most chunks dropped for reads of the run's earlier writes).
+    pub fn wait_runs_draws() -> bool {
+        get(198) >= 2
+    }
+
     /// Front end 2's write-back kernel empties the touched-page list itself
     /// (`rdna::kernels::mirror_scatter_reset`): no fill of the list's count
     /// and no barrier before it in each write-back (~234 a frame at the
@@ -2211,6 +2219,12 @@ pub mod tune {
     /// (`fe2::widen`; 64: its word, as before 2026-10-29).
     pub fn fe2_wide_pages() -> u64 {
         get(203)
+    }
+
+    /// The shortest run the parallel planner splits whatever `par_min` and
+    /// `par_min_compute` say (`par::floor`; 48 as before 2026-10-29).
+    pub fn par_floor() -> u64 {
+        get(204)
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

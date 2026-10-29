@@ -338,8 +338,8 @@ fn outside(s: u64, e: u64, cover: &[(u64, u64)]) -> Vec<(u64, u64)> {
 /// than by those copies: the planner forwarded every copy of the run it
 /// could, the global entries were current when the run began), the rest to
 /// the first.
-pub fn split_long_reads(reads: &[(u64, u64)]) -> (Vec<(u64, u64)>, Vec<(u64, u64)>) {
-    let (own, mut global, hidden): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<u64>) = HELD.with(|h| match h.borrow().as_ref() {
+pub fn split_long_reads(reads: &[(u64, u64)]) -> (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) {
+    let (own, planned, hidden): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<u64>) = HELD.with(|h| match h.borrow().as_ref() {
         Some(x) => (
             x.entries.iter().filter(|e| e.how != PLANNED).map(|e| (e.base, e.base + 4 * e.words.len() as u64)).collect(),
             x.entries.iter().filter(|e| e.how == PLANNED).map(|e| (e.base, e.base + 4 * e.words.len() as u64)).collect(),
@@ -347,30 +347,44 @@ pub fn split_long_reads(reads: &[(u64, u64)]) -> (Vec<(u64, u64)>, Vec<(u64, u64
         ),
         None => (Vec::new(), Vec::new(), Vec::new()),
     });
+    let mut global: Vec<(u64, u64)> = Vec::new();
     if COUNT.load(Ordering::Acquire) != 0 {
         global.extend(ENTRIES.read().iter().filter(|e| !hidden.contains(&e.id)).map(|e| (e.base, e.base + 4 * e.words.len() as u64)));
     }
-    if own.is_empty() && global.is_empty() {
-        return (reads.to_vec(), Vec::new());
+    if own.is_empty() && planned.is_empty() && global.is_empty() {
+        return (reads.to_vec(), Vec::new(), Vec::new());
     }
-    let (mut plain, mut fwd) = (Vec::new(), Vec::new());
+    // (The planner's copies come after the global entries: a word both
+    // cover is the planned copy's.)
+    let (mut plain, mut fwd_planned, mut fwd) = (Vec::new(), Vec::new(), Vec::new());
     for &(a, n) in reads {
         for (s, e) in outside(a, a + n, &own) {
-            let rest = outside(s, e, &global);
+            let rest = outside(s, e, &planned);
             let mut at = s;
             for &(rs, re) in &rest {
                 if at < rs {
-                    fwd.push((at, rs - at));
+                    fwd_planned.push((at, rs - at));
                 }
-                plain.push((rs, re - rs));
+                let rest2 = outside(rs, re, &global);
+                let mut at2 = rs;
+                for &(gs, ge) in &rest2 {
+                    if at2 < gs {
+                        fwd.push((at2, gs - at2));
+                    }
+                    plain.push((gs, ge - gs));
+                    at2 = ge;
+                }
+                if at2 < re {
+                    fwd.push((at2, re - at2));
+                }
                 at = re;
             }
             if at < e {
-                fwd.push((at, e - at));
+                fwd_planned.push((at, e - at));
             }
         }
     }
-    (plain, fwd)
+    (plain, fwd_planned, fwd)
 }
 
 /// `Entry::how` of the copies a long run's planner forwarded (`plan`).

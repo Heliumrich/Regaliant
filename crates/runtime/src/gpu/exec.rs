@@ -6872,8 +6872,12 @@ pub struct Exec {
     long: bool,
     /// A long chunk's CPU reads served by forwarded copies the run did not
     /// make (`forward::split_long_reads`): checked against what the run's
-    /// chunks write otherwise than by the planner's copies.
+    /// chunks write otherwise than by the planner's copies and what came
+    /// before the run; and those its planner's copies served: against the
+    /// chunks' only (such a copy rewrote its range after everything before
+    /// the run).
     held_fwd_reads: Vec<(u64, u64)>,
+    held_fwd_planned: Vec<(u64, u64)>,
     /// The copies its run's planner forwarded (packet -> words), whether the
     /// dispatch being recorded is one of them (`Cp::dispatch`), what its
     /// chunk writes otherwise, and whether it computed one of them otherwise
@@ -7562,6 +7566,7 @@ impl Exec {
                 held_keys: HashSet::new(),
                 long: false,
                 held_fwd_reads: Vec::new(),
+                held_fwd_planned: Vec::new(),
                 long_planned: Default::default(),
                 noting_planned: false,
                 long_nonfwd: Default::default(),
@@ -10920,6 +10925,7 @@ impl Exec {
         self.held_keys.clear();
         self.cp_written.clear();
         self.held_fwd_reads.clear();
+        self.held_fwd_planned.clear();
         self.long_planned = Default::default();
         self.noting_planned = false;
     }
@@ -10946,8 +10952,8 @@ impl Exec {
     /// reads served by forwarded copies: what its earlier chunks write,
     /// `chunks`), or it used an image that has a fast clear or an overwrite
     /// pending (noted by an earlier chunk, or by the work before the run).
-    pub fn long_conflict(&self, earlier: &super::ranges::Ranges, chunks: &super::ranges::Ranges) -> Option<&'static str> {
-        if chunks.overlaps_any(&self.held_fwd_reads) {
+    pub fn long_conflict(&self, earlier: &super::ranges::Ranges, chunks: &super::ranges::Ranges, before: &super::ranges::Ranges) -> Option<&'static str> {
+        if chunks.overlaps_any(&self.held_fwd_reads) || chunks.overlaps_any(&self.held_fwd_planned) || before.overlaps_any(&self.held_fwd_reads) {
             return Some("read the run's earlier writes (forwarded copy)");
         }
         if let Some(i) = self.held_reads.iter().position(|r| earlier.overlaps(r.0, r.1)) {
@@ -10973,6 +10979,12 @@ impl Exec {
     /// The first CPU read that `earlier` writes (`DS_TRACE_LONG_DROPS`).
     pub fn long_conflict_read(&self, earlier: &super::ranges::Ranges) -> Option<(u64, u64)> {
         self.held_reads.iter().copied().find(|r| earlier.overlaps(r.0, r.1))
+    }
+
+    /// The first read served by a forwarded copy that `chunks` writes
+    /// (`DS_TRACE_LONG_DROPS`).
+    pub fn long_conflict_fwd_read(&self, chunks: &super::ranges::Ranges, before: &super::ranges::Ranges) -> Option<(u64, u64)> {
+        self.held_fwd_reads.iter().copied().find(|r| chunks.overlaps(r.0, r.1) || before.overlaps(r.0, r.1)).or_else(|| self.held_fwd_planned.iter().copied().find(|r| chunks.overlaps(r.0, r.1)))
     }
 
     /// `overlaps_pending` without pruning (a shared borrow).
@@ -12646,10 +12658,11 @@ impl Exec {
         let found = p.found.clone();
         if self.held {
             if self.long && super::forward::active() {
-                let (plain, fwd) = super::forward::split_long_reads(&found.reads);
+                let (plain, fwd_planned, fwd) = super::forward::split_long_reads(&found.reads);
                 self.held_reads.extend_from_slice(&plain);
                 self.note_kinds(2, plain.len());
                 self.held_fwd_reads.extend_from_slice(&fwd);
+                self.held_fwd_planned.extend_from_slice(&fwd_planned);
             } else {
                 self.held_reads.extend_from_slice(&found.reads);
                 self.note_kinds(2, found.reads.len());
