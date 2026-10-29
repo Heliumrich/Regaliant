@@ -133,6 +133,9 @@ struct Chunk {
     clean: Box<[AtomicU32]>,
     /// The flip, plus one, a CPU write to the page was last found.
     wrote: Box<[AtomicU32]>,
+    /// Bumped by every CPU write to the page found (and every invalidation
+    /// of it): `label_page_gen`.
+    pgen: Box<[AtomicU32]>,
     /// Armings of the page that ended in a write (each doubles the quiet
     /// time before the next).
     level: Box<[AtomicU8]>,
@@ -632,6 +635,7 @@ fn make_chunk(slot: &'static AtomicPtr<Chunk>) -> &'static Chunk {
         wgen: std::array::from_fn(|_| AtomicU32::new(0)),
         clean: (0..CHUNK_PAGES).map(|_| AtomicU32::new(0)).collect(),
         wrote: (0..CHUNK_PAGES).map(|_| AtomicU32::new(0)).collect(),
+        pgen: (0..CHUNK_PAGES).map(|_| AtomicU32::new(0)).collect(),
         level: (0..CHUNK_PAGES).map(|_| AtomicU8::new(0)).collect(),
         uses: std::array::from_fn(|_| AtomicU8::new(0)),
         use_ep: std::array::from_fn(|_| AtomicU32::new(0)),
@@ -2138,6 +2142,18 @@ pub fn marks_taken(r: Option<()>, base: u64, size: u64, pages: &[u64]) {
     }
 }
 
+/// The generation of the page at `page` after a take of it (`Chunk::pgen`:
+/// every CPU write to it any take found, every invalidation), None when the
+/// take failed or the page lies outside the span (`tune fe2_label_track`).
+pub fn label_page_gen(page: u64) -> Option<u32> {
+    let page = page & !(PAGE - 1);
+    // (A page without a chunk would keep no generation.)
+    let c = chunk(page, true)?;
+    let mut v = Vec::new();
+    super::precache::take_written_for(page, PAGE, &mut v, None, crate::mem::WW_WHO_FE2)?;
+    Some(c.pgen[idx(page)].load(Ordering::Acquire))
+}
+
 /// CPU writes to these pages were found (by a take).
 pub fn cpu_written(pages: &[u64]) {
     if !on() || pages.is_empty() {
@@ -2157,6 +2173,7 @@ pub fn cpu_written(pages: &[u64]) {
         }
         c.wgen[w].fetch_add(1, Ordering::AcqRel);
         c.wrote[i].store(f, Ordering::Release);
+        c.pgen[i].fetch_add(1, Ordering::AcqRel);
         c.uses[w].store(0, Ordering::Relaxed);
         n += 1;
     }
@@ -2191,6 +2208,7 @@ pub fn invalidate(base: u64, len: u64) {
             c.wgen[w].fetch_add(1, Ordering::AcqRel);
             for k in idx(x)..idx(x) + ((e - x) / PAGE) as usize {
                 c.wrote[k].store(f, Ordering::Release);
+                c.pgen[k].fetch_add(1, Ordering::AcqRel);
             }
             c.uses[w].store(0, Ordering::Relaxed);
             x = e;
@@ -2240,7 +2258,15 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
         let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 16 }];
         let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("scatter layout: {e}"))?;
         let reset = super::tune::fe2_scatter_reset();
-        let code = if reset { rdna::kernels::mirror_scatter_reset() } else { rdna::kernels::mirror_scatter() };
+        // (`tune fe2_scatter_nostore`: timing only, guest memory left as it was.)
+        let code = if super::tune::fe2_scatter_nostore() {
+            crate::warn!("fe2: the write-back stores nothing into guest memory (`tune fe2_scatter_nostore`, timing only: wrong results)");
+            rdna::kernels::mirror_scatter_nostore()
+        } else if reset {
+            rdna::kernels::mirror_scatter_reset()
+        } else {
+            rdna::kernels::mirror_scatter()
+        };
         let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("scatter module: {e}"))?;
         let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
         let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
@@ -2511,7 +2537,9 @@ fn self_test() -> Result<String, String> {
             c.device.free_memory(hm, None);
         }
         r?;
-        for i in 0..1024u32 {
+        // (`tune fe2_scatter_nostore`: nothing lands, by design.)
+        let stores = !super::tune::fe2_scatter_nostore();
+        for i in (0..1024u32).filter(|_| stores) {
             let got = unsafe { words.add(i as usize).read_volatile() };
             let want = if dwords.contains(&i) { 0x5000_0000 + i } else { 0xAAAA_AAAA };
             if got != want {
@@ -2663,7 +2691,7 @@ pub fn status() -> String {
         })
         .collect();
     format!(
-        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value and {} gone past ended none); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
+        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value, {} again with the label's page unwritten and {} gone past ended none); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
         s[S_ENSURES],
         s[S_ENSURE_PAGES],
         s[S_FAST],
@@ -2725,6 +2753,7 @@ pub fn status() -> String {
         ends[2],
         super::cp::EPOCH_GPU_WAITS.load(Ordering::Relaxed),
         super::cp::QUIET_WAITS[0].load(Ordering::Relaxed),
+        super::cp::QUIET_WAITS[2].load(Ordering::Relaxed),
         super::cp::QUIET_WAITS[1].load(Ordering::Relaxed),
         super::resident::backed_mib(),
         sizes.join(", "),

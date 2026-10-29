@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 205] = [
+    static ALL: [Tunable; 207] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -238,6 +238,8 @@ pub mod tune {
         Tunable { name: "fe2_defer_gfx", env: "DS_FE2_DEFER_GFX", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_wide_pages", env: "DS_FE2_WIDE_PAGES", default: 64, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_floor", env: "DS_PAR_FLOOR", default: 48, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe2_scatter_nostore", env: "DS_FE2_SCATTER_NOSTORE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe2_label_track", env: "DS_FE2_LABEL_TRACK", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2225,6 +2227,21 @@ pub mod tune {
     /// `par_min_compute` say (`par::floor`; 48 as before 2026-10-29).
     pub fn par_floor() -> u64 {
         get(204)
+    }
+
+    /// Timing only (wrong results): front end 2's write-back stores nothing
+    /// into guest memory (its marks cleared as before): the upper bound of
+    /// a lazy write-back (stage F5). Read when the kernel is made.
+    pub fn fe2_scatter_nostore() -> bool {
+        get(205) != 0
+    }
+
+    /// Front end 2 (with `fe2_quiet_waits`): a wait the CPU released that
+    /// passed again on the value this queue passed on last time there ends
+    /// no epoch when no CPU write to the label's page was found since (each
+    /// such pass takes the page: `fe2::label_page_gen`).
+    pub fn fe2_label_track() -> bool {
+        get(206) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

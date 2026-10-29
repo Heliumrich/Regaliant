@@ -733,7 +733,7 @@ pub const SCATTER_LOCAL_SIZE: u32 = 256;
 /// map, binding 1 the SCATTER_COUNTERS counters. Push constants `{mirror
 /// (low, high), table (low, high)}`.
 pub fn mirror_scatter() -> Vec<u32> {
-    build_scatter(false).expect("mirror scatter kernel")
+    build_scatter(false, true).expect("mirror scatter kernel")
 }
 
 /// `mirror_scatter` emptying the touched-page list itself: workgroup 0's
@@ -743,10 +743,17 @@ pub fn mirror_scatter() -> Vec<u32> {
 /// dispatch made as many as the count), so the write-back needs no fill of
 /// the count and no barrier before one.
 pub fn mirror_scatter_reset() -> Vec<u32> {
-    build_scatter(true).expect("mirror scatter kernel (emptying the list)")
+    build_scatter(true, true).expect("mirror scatter kernel (emptying the list)")
 }
 
-fn build_scatter(reset: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
+/// `mirror_scatter_reset` storing nothing into guest memory (its marks
+/// cleared and counted as before): timing only, the upper bound of a lazy
+/// write-back.
+pub fn mirror_scatter_nostore() -> Vec<u32> {
+    build_scatter(true, false).expect("mirror scatter kernel (no stores)")
+}
+
+fn build_scatter(reset: bool, stores: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     let lit = Operand::LiteralBit32;
     let mut b = Builder::new();
     b.set_version(1, 3);
@@ -902,7 +909,7 @@ fn build_scatter(reset: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
         let sh = b.shift_right_logical(u32t, None, mw, bit_of)?;
         let bit = b.bitwise_and(u32t, None, sh, c1)?;
         let set = b.i_not_equal(bool_, None, bit, c0)?;
-        let go = b.logical_and(bool_, None, set, mapped)?;
+        let go = if stores { b.logical_and(bool_, None, set, mapped)? } else { b.constant_false(bool_) };
         let (l_cp, l_cpd) = (b.id(), b.id());
         b.selection_merge(l_cpd, SelectionControl::NONE)?;
         b.branch_conditional(go, l_cp, l_cpd, [])?;
