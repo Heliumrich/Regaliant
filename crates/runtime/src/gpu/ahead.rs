@@ -34,6 +34,8 @@ pub struct Slot {
     /// Its bindings' placement checks are made where it is prepared, after
     /// its result is posted (`tune fe2_precheck`).
     precheck: bool,
+    /// The epoch its placement checks were made in (u32::MAX: none yet).
+    checked_ep: AtomicU32,
     state: AtomicU32,
     result: Mutex<Option<Result<Prepared, String>>>,
     cv: Condvar,
@@ -47,7 +49,7 @@ impl Slot {
     /// `new`, its placement checks made where it is prepared when
     /// `precheck` (the graphics CP's stages under front end 2).
     pub fn new_checked(regs: StageRegs, wave64: bool, precheck: bool) -> Arc<Slot> {
-        Arc::new(Slot { regs, wave64, precheck, state: AtomicU32::new(QUEUED), result: Mutex::new(None), cv: Condvar::new() })
+        Arc::new(Slot { regs, wave64, precheck, checked_ep: AtomicU32::new(u32::MAX), state: AtomicU32::new(QUEUED), result: Mutex::new(None), cv: Condvar::new() })
     }
 
     /// The registers its preparation reads (`gpu::compile`).
@@ -250,6 +252,7 @@ fn run_slot(slot: &Slot) {
         if before && slot.precheck {
             if let Ok(p) = &r {
                 let t = std::time::Instant::now();
+                slot.checked_ep.store(super::precache::epoch() as u32, Ordering::Release);
                 super::exec::fe2_precheck_stage(&p.found);
                 STATS[PRECHECKS].fetch_add(1, Ordering::Relaxed);
                 STATS[PRECHECK_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -261,6 +264,7 @@ fn run_slot(slot: &Slot) {
         slot.cv.notify_all();
         if let Some(found) = found {
             let t = std::time::Instant::now();
+            slot.checked_ep.store(super::precache::epoch() as u32, Ordering::Release);
             super::exec::fe2_precheck_stage(&found);
             STATS[PRECHECKS].fetch_add(1, Ordering::Relaxed);
             STATS[PRECHECK_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -313,7 +317,7 @@ pub fn take<R: RegRead + ?Sized>(slot: &Slot, live: &R, wave64: bool) -> Option<
         }
         g.take()?
     };
-    let p = match r {
+    let mut p = match r {
         Ok(p) => p,
         Err(e) => {
             STATS[ERRORS].fetch_add(1, Ordering::Relaxed);
@@ -336,6 +340,9 @@ pub fn take<R: RegRead + ?Sized>(slot: &Slot, live: &R, wave64: bool) -> Option<
         return None;
     }
     STATS[USED].fetch_add(1, Ordering::Relaxed);
+    // (Made by a worker; with its placement checks if they were made by now.)
+    let ep = slot.checked_ep.load(Ordering::Acquire);
+    (p.ahead, p.checked_ep) = if ep != u32::MAX { (3, ep) } else { (2, 0) };
     Some(p)
 }
 

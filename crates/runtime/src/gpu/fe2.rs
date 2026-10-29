@@ -467,7 +467,7 @@ pub fn note_place_parts(map: u64, begin: u64, after: u64) {
 
 /// Clears the checks by caller (`profile reset`).
 pub fn reset_callers() {
-    for c in BY_CALLER.iter().flatten().chain(QUIET_TAKES.iter().flatten()) {
+    for c in BY_CALLER.iter().flatten().chain(QUIET_TAKES.iter().flatten()).chain(BY_SOURCE.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
 }
@@ -924,9 +924,134 @@ pub fn ensure(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn
     }
     let t0 = unsafe { core::arch::x86_64::_rdtsc() };
     caller_count(C_CHECKS, 1);
+    source_count(B_CHECKS, 1);
     let r = ensure_inner(lo, hi, want, ep, gpu_writes, mine, upload, armable, defer);
-    caller_count(C_CYCLES, unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0));
+    let cycles = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
+    caller_count(C_CYCLES, cycles);
+    source_count(B_CYCLES, cycles);
     r
+}
+
+thread_local! {
+    /// The stage whose bindings this thread places (`StageSource`; for
+    /// `DS_FE2_CALLERS`): 0 none, else `Prepared::ahead`, with the epoch of
+    /// a worker's placement checks.
+    static SOURCE: std::cell::Cell<(u8, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+const SOURCE_NAMES: [&str; 4] = ["placements of no stage", "stages it prepared", "stages a worker prepared", "stages a worker prepared and checked"];
+/// The graphics CP's checks by the stage they bind (`SOURCE`;
+/// `DS_FE2_CALLERS`): [stage bindings, checks, range-cache hits, TSC cycles,
+/// runs taken, their pages, runs only of pages a take of the epoch wanted
+/// had looked at and found lacking, runs with a valid page not looked at
+/// since that epoch began (and no lacking one), runs with a page M lacks not
+/// looked at since; pages not looked at since: stamped one epoch before,
+/// older; for stages a worker checked: runs taken in the epoch of its
+/// checks, runs wanting a later epoch than that].
+static BY_SOURCE: [[AtomicU64; 13]; 4] = [const { [const { AtomicU64::new(0) }; 13] }; 4];
+const B_BINDINGS: usize = 0;
+const B_CHECKS: usize = 1;
+const B_HITS: usize = 2;
+const B_CYCLES: usize = 3;
+const B_TAKES: usize = 4;
+const B_PAGES: usize = 5;
+const B_LACKING: usize = 6;
+const B_VALID_STALE: usize = 7;
+const B_INVALID_STALE: usize = 8;
+const B_ONE_BEHIND: usize = 9;
+const B_OLDER: usize = 10;
+const B_SAME_EPOCH: usize = 11;
+const B_LATER_WANT: usize = 12;
+
+/// The stage whose bindings this thread places, until dropped (`SOURCE`).
+pub struct StageSource;
+
+impl StageSource {
+    pub fn set(ahead: u8, checked_ep: u32) -> StageSource {
+        if callers_on() {
+            SOURCE.with(|s| s.set((ahead.min(3), checked_ep)));
+            source_count(B_BINDINGS, 1);
+        }
+        StageSource
+    }
+}
+
+impl Drop for StageSource {
+    fn drop(&mut self) {
+        if callers_on() {
+            SOURCE.with(|s| s.set((0, 0)));
+        }
+    }
+}
+
+/// Counts `n` for the graphics CP's checks of the stage being bound.
+fn source_count(what: usize, n: u64) {
+    if CALLER.with(|c| c.get()) == 0 {
+        BY_SOURCE[SOURCE.with(|s| s.get().0) as usize][what].fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Why the pages of a run about to be taken need it, for a check wanting
+/// epoch `want`: [pages M lacks that a take of that epoch looked at, valid
+/// pages not looked at since, pages M lacks not looked at since, of those
+/// two stamped one epoch before `want`] (pages in the run that need nothing,
+/// merged by `TAKE_GAP`, are not counted).
+fn take_reasons(a: u64, b: u64, want: u32) -> [u64; 4] {
+    let mut k = [0u64; 4];
+    let mut x = a;
+    while x < b {
+        let e = word_end(x, b);
+        let Some(c) = chunk(x, false) else { break };
+        let w = idx(x) / 64;
+        let need = word_mask(x, e) & !word_ok(c, x, e, want);
+        let valid = c.valid[w].load(Ordering::Acquire);
+        let wclean = c.wclean[w].load(Ordering::Acquire);
+        let mut r = need;
+        while r != 0 {
+            let bit = r.trailing_zeros() as usize;
+            r &= r - 1;
+            let stamp = wclean.max(c.clean[w * 64 + bit].load(Ordering::Acquire));
+            if valid >> bit & 1 != 0 {
+                k[1] += 1;
+            } else if stamp >= want {
+                k[0] += 1;
+                continue;
+            } else {
+                k[2] += 1;
+            }
+            if stamp.wrapping_add(1) == want {
+                k[3] += 1;
+            }
+        }
+        x = e;
+    }
+    k
+}
+
+/// A run the graphics CP took, with `take_reasons`' counts.
+fn note_source_take(a: u64, b: u64, want: u32, k: [u64; 4]) {
+    let (s, checked) = SOURCE.with(|s| s.get());
+    let c = &BY_SOURCE[s as usize];
+    c[B_TAKES].fetch_add(1, Ordering::Relaxed);
+    c[B_PAGES].fetch_add((b - a) / PAGE, Ordering::Relaxed);
+    let class = if k[2] != 0 {
+        B_INVALID_STALE
+    } else if k[1] != 0 {
+        B_VALID_STALE
+    } else {
+        B_LACKING
+    };
+    c[class].fetch_add(1, Ordering::Relaxed);
+    c[B_ONE_BEHIND].fetch_add(k[3], Ordering::Relaxed);
+    c[B_OLDER].fetch_add(k[1] + k[2] - k[3], Ordering::Relaxed);
+    if s == 3 {
+        if super::precache::epoch() as u32 == checked {
+            c[B_SAME_EPOCH].fetch_add(1, Ordering::Relaxed);
+        }
+        if want > checked {
+            c[B_LATER_WANT].fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 thread_local! {
@@ -950,10 +1075,14 @@ pub fn precheck(base: u64, size: u64, armable: &Armable) {
         return;
     }
     let ep = super::precache::epoch() as u32;
+    // (Counted as "ahead": a command processor at a label wait is its own
+    // caller again after, `ahead::prepare_here`.)
+    let caller = CALLER.with(|c| c.get());
     set_caller("ahead");
     PRECHECK.with(|p| p.set(true));
     let _ = ensure_inner(lo, hi, ep, ep, false, &|_| false, &mut |_, _| true, armable, None);
     PRECHECK.with(|p| p.set(false));
+    CALLER.with(|c| c.set(caller));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -973,6 +1102,7 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
         local_add(L_FAST, 1);
         if callers_on() {
             caller_count(C_HITS, 1);
+            source_count(B_HITS, 1);
         }
         return Ok(());
     }
@@ -1158,9 +1288,14 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
                     }
                 }
             }
+            // (Why the graphics CP takes it, for `DS_FE2_CALLERS`.)
+            let reasons = (callers_on() && CALLER.with(|c| c.get()) == 0).then(|| take_reasons(a, b, want));
             if let Err(e) = check_run(a, b, ep, frame, !gpu_writes, mine, upload, armable, written, class) {
                 STATS[S_SLOW_NS].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 return Err(e);
+            }
+            if let Some(k) = reasons {
+                note_source_take(a, b, want, k);
             }
         }
         STATS[S_SLOW_NS].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -3021,5 +3156,31 @@ pub fn callers_line() -> String {
             )
         })
         .collect();
-    format!("    front end 2's checks by caller: {}\n{quiet}", parts.join("; "))
+    let sources: Vec<String> = SOURCE_NAMES
+        .iter()
+        .zip(BY_SOURCE.iter())
+        .map(|(n, c)| {
+            let v: Vec<u64> = c.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+            let worker = if v[B_SAME_EPOCH] + v[B_LATER_WANT] > 0 || n.ends_with("checked") {
+                format!("; in the epoch of the worker's checks {}, wanting a later one {}", v[B_SAME_EPOCH], v[B_LATER_WANT])
+            } else {
+                String::new()
+            };
+            format!(
+                "{n}: {} bindings, {} checks ({} by the range cache), {:.1} ms, {} runs taken ({} pages; only pages found lacking by a take of the epoch wanted {}, with a valid page not looked at since {}, with a page M lacks not looked at since {}; pages not looked at since: one epoch before {}, older {}{worker})",
+                v[B_BINDINGS],
+                v[B_CHECKS],
+                v[B_HITS],
+                v[B_CYCLES] as f64 * 1e3 / hz,
+                v[B_TAKES],
+                v[B_PAGES],
+                v[B_LACKING],
+                v[B_VALID_STALE],
+                v[B_INVALID_STALE],
+                v[B_ONE_BEHIND],
+                v[B_OLDER]
+            )
+        })
+        .collect();
+    format!("    front end 2's checks by caller: {}\n    the graphics CP's checks by the stage they bind: {}\n{quiet}", parts.join("; "), sources.join("; "))
 }

@@ -713,6 +713,11 @@ pub struct Prepared {
     pub cmp_depth: u64,
     /// The program code's hash (`program_checked`).
     pub code_hash: u64,
+    /// Where it was made, for `DS_FE2_CALLERS` (`fe2::StageSource`): 1 by
+    /// the thread binding it, 2 ahead by a worker (`gpu::ahead`), 3 that
+    /// and its placement checks made there in epoch `checked_ep`.
+    pub ahead: u8,
+    pub checked_ep: u32,
 }
 
 impl Clone for Prepared {
@@ -730,6 +735,8 @@ impl Clone for Prepared {
             cmp_images: self.cmp_images,
             cmp_depth: self.cmp_depth,
             code_hash: self.code_hash,
+            ahead: self.ahead,
+            checked_ep: self.checked_ep,
         }
     }
 }
@@ -2666,6 +2673,8 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         cmp_images,
         cmp_depth,
         code_hash,
+        ahead: 1,
+        checked_ep: 0,
     };
     if let Some(h) = &checked_hit {
         prep_compare(h, &prepared);

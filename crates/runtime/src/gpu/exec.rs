@@ -12699,6 +12699,9 @@ impl Exec {
     /// Buffer, image and sampler bindings of a stage; fills the resource
     /// info blocks of its SGPR data.
     fn bind_stage(&mut self, p: &mut Prepared, allow_shadow: bool) -> Result<Bound, String> {
+        // (Its placements counted by where the stage was made, for
+        // `DS_FE2_CALLERS`.)
+        let _source = super::fe2::StageSource::set(p.ahead, p.checked_ep);
         // What the preparation found (its own block, shared with its cache
         // entry), apart from the SGPR data written below.
         let found = p.found.clone();

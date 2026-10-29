@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 211] = [
+    static ALL: [Tunable; 212] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -244,6 +244,7 @@ pub mod tune {
         Tunable { name: "fe2_cpw_waited", env: "DS_FE2_CPW_WAITED", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_precheck", env: "DS_FE2_PRECHECK", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_taken_upload", env: "DS_FE2_TAKEN_UPLOAD", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "ahead_far", env: "DS_AHEAD_FAR", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2289,6 +2290,14 @@ pub mod tune {
     /// batch not queued yet) is uploaded without another take.
     pub fn fe2_taken_upload() -> bool {
         get(210) != 0
+    }
+
+    /// The graphics CP's scans for the `ahead` workers pass synchronization
+    /// as its scans at label waits do (`Cp::scan_far`): the stages of its
+    /// serial stretch up to a run the parallel workers will record are
+    /// handed out at once, not one synchronization-free run at a time.
+    pub fn ahead_far() -> bool {
+        get(211) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
