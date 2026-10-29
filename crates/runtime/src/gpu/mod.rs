@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 207] = [
+    static ALL: [Tunable; 208] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -240,6 +240,7 @@ pub mod tune {
         Tunable { name: "par_floor", env: "DS_PAR_FLOOR", default: 48, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_scatter_nostore", env: "DS_FE2_SCATTER_NOSTORE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_label_track", env: "DS_FE2_LABEL_TRACK", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe2_cpw_close", env: "DS_FE2_CPW_CLOSE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2242,6 +2243,14 @@ pub mod tune {
     /// such pass takes the page: `fe2::label_page_gen`).
     pub fn fe2_label_track() -> bool {
         get(206) != 0
+    }
+
+    /// Timing only (a title thread that sees a label may read data older
+    /// than it): front end 2 records no write-back before the CP writes the
+    /// GPU performs; what the batch's work wrote reaches guest memory at its
+    /// close (the upper bound of write-backs only where the CPU reads).
+    pub fn fe2_cpw_close() -> bool {
+        get(207) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

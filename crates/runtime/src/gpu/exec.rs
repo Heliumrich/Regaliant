@@ -11093,7 +11093,7 @@ impl Exec {
         // that there), and the write goes into the mirror too (later work
         // reads it there).
         let mut after_scatter = false;
-        if self.fe2_marked {
+        if self.fe2_marked && !super::tune::fe2_cpw_close() {
             SCATTER_SITES[0].fetch_add(1, Ordering::Relaxed);
             after_scatter = self.fe2_scatter();
         }
