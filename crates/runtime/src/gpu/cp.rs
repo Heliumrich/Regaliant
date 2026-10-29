@@ -346,6 +346,12 @@ pub struct Cp {
     /// passed on as released by the CPU, the value then, the distinct
     /// values seen, and whether each was greater than the one before.
     passed: HashMap<u64, (u64, u32, bool)>,
+    /// `par_plan` plans a run where this command processor went past a
+    /// label wait (`wait_run_start`): a long one, all its chunks the
+    /// workers'.
+    plan_wait_run: bool,
+    /// The end of the run `par_would_split` last found splittable.
+    par_scan_end: u64,
     /// The view of the writer of the promise the last WAIT_REG_MEM passed on
     /// (0: this queue's own open promise; `tune fe2_gpu_waits`).
     last_wait_epoch: u32,
@@ -659,7 +665,29 @@ struct PastWait {
     began: Instant,
     /// Packets since the label was last looked at.
     ticks: u32,
+    /// Runs planned past the wait (`tune wait_runs`), each with this
+    /// command processor's held work before it sealed (None: none), in
+    /// order.
+    parts: Vec<(Option<Box<Sealed>>, WaitRun)>,
 }
+
+/// A run planned past a label wait (`Cp::wait_run_start`): its chunks
+/// parked until the label passes, its end state as walked (this command
+/// processor records on from it) and the command buffer it lies in.
+struct WaitRun {
+    pr: ParRun,
+    end_state: ChunkState,
+    end_unknown: Vec<u32>,
+    buf: usize,
+}
+
+/// Runs planned past label waits (`tune wait_runs`): [planned, settled as a
+/// stretch past them, dropped with their stretch, refused (indirect
+/// arguments read on the CPU, fast clears pending, no walked end), their
+/// commands].
+pub static WAIT_RUNS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Runs planned past one label wait at most.
+const WAIT_RUNS_MAX: usize = 4;
 
 /// Recording past label waits (`tune past_waits`): [stretches begun,
 /// committed, dropped, commands recorded past the waits, ns from a wait to
@@ -809,7 +837,7 @@ pub fn past_wait_status() -> String {
     };
     let n = p(0).max(1) as f64;
     format!(
-        "    recording past label waits: {} stretches, {} committed, {} dropped ({}; {} waits not gone past after drops), {} commands recorded past the waits ({:.1} each), {:.0} us from a wait to its settling; settled once promised {}, at a stop {} ({}; {:.0} us waited for the label there on average); checked again at their label for a later epoch {} ({} ranges, {} stale, {:.0} us each); hot pages of small bindings uploaded as they are when the stretch runs: {} runs, {} pages\n",
+        "    recording past label waits: {} stretches, {} committed, {} dropped ({}; {} waits not gone past after drops), {} commands recorded past the waits ({:.1} each), {:.0} us from a wait to its settling; settled once promised {}, at a stop {} ({}; {:.0} us waited for the label there on average); checked again at their label for a later epoch {} ({} ranges, {} stale, {:.0} us each); hot pages of small bindings uploaded as they are when the stretch runs: {} runs, {} pages; runs planned where it went past {} ({} commands; settled as stretches past them {}, dropped with their stretch {}, refused {})\n",
         p(0),
         p(1),
         p(2),
@@ -827,7 +855,12 @@ pub fn past_wait_status() -> String {
         super::exec::PAST_CHECKS[2].load(Ordering::Relaxed),
         super::exec::PAST_CHECKS[3].load(Ordering::Relaxed) as f64 / 1e3 / super::exec::PAST_CHECKS[0].load(Ordering::Relaxed).max(1) as f64,
         super::exec::PAST_HOT[0].load(Ordering::Relaxed),
-        super::exec::PAST_HOT[1].load(Ordering::Relaxed)
+        super::exec::PAST_HOT[1].load(Ordering::Relaxed),
+        WAIT_RUNS[0].load(Ordering::Relaxed),
+        WAIT_RUNS[4].load(Ordering::Relaxed),
+        WAIT_RUNS[1].load(Ordering::Relaxed),
+        WAIT_RUNS[2].load(Ordering::Relaxed),
+        WAIT_RUNS[3].load(Ordering::Relaxed)
     )
 }
 
@@ -1892,6 +1925,8 @@ impl Cp {
             last_wait_kind: b'-',
             last_wait_func: 0,
             passed: HashMap::new(),
+            plan_wait_run: false,
+            par_scan_end: 0,
             last_wait_epoch: 0,
             held: None,
             main_gfx: name == "gpu-gfx",
@@ -2796,13 +2831,15 @@ impl Cp {
         // it passed any such packet, and whether a wait passed on a value the
         // CPU wrote (the copy cache's scope ends when the run is planned).
         // Its chunks' indirect dispatches read their arguments on the GPU.
-        let long = super::tune::long_runs() && self.main_gfx && !self.compute;
+        let long = (super::tune::long_runs() || self.plan_wait_run) && self.main_gfx && !self.compute;
         let gpu_dispatch_args = (self.compute || long) && super::tune::gpu_indirect() && !super::capture::capturing() && !super::verify::enabled() && !(super::exec::enabled() && super::emucheck::wanted(self));
         // A run chained after another (`chain_next`): that run's label writes
         // and copies come before all of this one (at packet 0).
         let seed = self.chain_seed.take();
         let mut labels: Vec<RunLabel> = seed.as_ref().map(|s| s.0.iter().map(|l| RunLabel { at: 0, ..*l }).collect()).unwrap_or_default();
-        let mut soft = false;
+        // (A run past a label wait is a long one whatever it passes: all its
+        // chunks the workers', checked at their turn.)
+        let mut soft = self.plan_wait_run;
         let mut cpu_wait = false;
         let mut writers: Vec<u32> = Vec::new();
         // The run's signature: its packet headers (opcode and size), the
@@ -2840,6 +2877,13 @@ impl Cp {
             let at = c;
             let p = |i: u64| f.rd(at + 4 * (1 + i));
             if is_command(opc) {
+                // (Past a label wait an indirect draw's arguments, read on
+                // the CPU, are mostly what the stretch's label's writer or
+                // the per-view copies before them write: its chunks were
+                // dropped at their turn, 87% of them; the run ends before it.)
+                if self.plan_wait_run && matches!(opc, op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT) {
+                    break c;
+                }
                 ends.push(next);
                 match opc {
                     op::DRAW_INDIRECT => args.push((draw_base + p(0) as u64, 16)),
@@ -2903,6 +2947,20 @@ impl Cp {
         // ~4 times per frame in the courtyard). The run's start is a
         // synchronization point; the clear lands before every use in it.
         let clears = super::images::with(|im| im.pending_clear_keys());
+        // Past a label wait: fast clears to apply (they would go into this
+        // command processor's held work, after the run's chunks) refuse the
+        // run; its chunks read their indirect arguments when they record
+        // (checked at their turn against what other queues wrote meanwhile
+        // and the run's write log), so none are waited for here.
+        if self.plan_wait_run {
+            args.clear();
+        }
+        if self.plan_wait_run && !clears.is_empty() {
+            WAIT_RUNS[3].fetch_add(1, Ordering::Relaxed);
+            self.par_skip = (end, run_end);
+            self.par_skip_n = n;
+            return;
+        }
         if !clears.is_empty() {
             if let Some(e) = self.exec.as_mut() {
                 e.resolve_fast_clears(&clears);
@@ -3171,11 +3229,17 @@ impl Cp {
         let long_writes = soft.then(|| main_writes.clone());
         let mut run = super::par::Run::new(queue, Arc::new(main_writes), submitted.clone());
         run.timed = timed;
-        // (Its workers check as of this command processor's view now.)
+        // (Its workers check as of this command processor's view now; past a
+        // label wait as of the epoch at each check, as the stretch does.)
         run.fe2_view = self.fe2_view.as_ref().map_or(super::fe2::NO_VIEW, |c| c.load(Ordering::Acquire));
+        if self.plan_wait_run {
+            run.stretch = true;
+            run.fe2_view = super::precache::epoch() as u32;
+        }
         if let Some(w) = long_writes {
-            // (A chained run has no part of this command processor's.)
-            if shared.is_none() {
+            // (A chained run, or one past a label wait, has no part of this
+            // command processor's.)
+            if shared.is_none() && !self.plan_wait_run {
                 if let Some(e) = self.exec.as_mut() {
                     e.rec_begin(&Default::default());
                 }
@@ -3319,6 +3383,7 @@ impl Cp {
             fence_pending: self.fence_pending,
             began: Instant::now(),
             ticks: 0,
+            parts: Vec::new(),
         }));
         self.held = Some(Box::new(super::frameahead::HeldCp { frames: u64::MAX, labels: HashMap::new(), stop: None, commands: 0, waits: [0; 5], poll: false }));
         super::exec::journal_begin();
@@ -3327,6 +3392,121 @@ impl Cp {
         }
         PAST_WAITS[0].fetch_add(1, Ordering::Relaxed);
         Flow::Next
+    }
+
+    /// Past a label wait (`tune wait_runs`): this command processor's held
+    /// work since the wait or the last such run is sealed (to commit before
+    /// the run's chunks), and the long run starting at `cur` is planned
+    /// (unheld, all its chunks the workers'; they record and park them as
+    /// the stretch's work; after an earlier run, seeded with its label
+    /// writes, copies and write log, and the sealed work's label writes, as
+    /// a chained run is); this command processor goes on from its end with
+    /// its walked end state, still held past the wait. Returns where (None:
+    /// no run; the seal is given back).
+    fn wait_run_start(&mut self, f: &Fetched, cur: u64, end: u64) -> Option<u64> {
+        // (Fast clears to apply would go into the held work after the
+        // run's chunks: refused before anything is sealed.)
+        if super::images::with(|im| !im.pending_clear_keys().is_empty()) {
+            WAIT_RUNS[3].fetch_add(1, Ordering::Relaxed);
+            self.par_skip = (end, self.par_scan_end);
+            return None;
+        }
+        let walked = self.past_wait.as_ref()?.parts.last().map(|p| (p.1.end_state.clone(), p.1.end_unknown.clone()));
+        let mut seal: Option<Box<Sealed>> = None;
+        if self.exec.as_ref().is_some_and(|e| e.has_held_work()) {
+            match self.exec.as_mut().and_then(|e| e.past_seal()) {
+                Some(check) => {
+                    let (walked, unknown) = walked.clone().unwrap_or_else(|| (self.chunk_state(), Vec::new()));
+                    seal = Some(Box::new(Sealed { check, walked, unknown }));
+                }
+                None => {
+                    WAIT_RUNS[3].fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            }
+        }
+        if let Some(last) = self.past_wait.as_ref().and_then(|w| w.parts.last()) {
+            let mut labels = last.1.pr.labels.clone();
+            if seal.is_some() {
+                if let Some(e) = self.exec.as_ref() {
+                    labels.extend(e.held_promise_labels().into_iter().map(|(a, v, bytes)| RunLabel { a, v, bytes, at: 0 }));
+                }
+            }
+            self.chain_seed = Some((labels, last.1.pr.planned.clone(), last.1.pr.run.long_writes()));
+        }
+        let held = self.held.take();
+        let pw = self.past_wait.take();
+        self.plan_wait_run = true;
+        self.par_plan(f, cur, end);
+        self.plan_wait_run = false;
+        self.chain_seed = None;
+        self.past_wait = pw;
+        self.held = held;
+        let unseal = |cp: &mut Self, seal: Option<Box<Sealed>>| {
+            if let (Some(s), Some(e)) = (seal, cp.exec.as_mut()) {
+                e.past_unseal(s.check);
+            }
+        };
+        let Some(mut pr) = self.par.take() else {
+            unseal(self, seal);
+            return None;
+        };
+        let Some(end_state) = pr.end_state.take() else {
+            pr.run.cancel();
+            unseal(self, seal);
+            WAIT_RUNS[3].fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        if pr.sync {
+            self.fence_pending = true;
+        }
+        let end_unknown = std::mem::take(&mut pr.end_unknown);
+        self.set_chunk_state(&end_state);
+        let to = pr.end;
+        WAIT_RUNS[0].fetch_add(1, Ordering::Relaxed);
+        WAIT_RUNS[4].fetch_add(pr.n as u64, Ordering::Relaxed);
+        let buf = self.cur_buf;
+        let mut first = false;
+        if let Some(w) = self.past_wait.as_mut() {
+            first = w.parts.is_empty();
+            w.parts.push((seal, WaitRun { pr, end_state, end_unknown, buf }));
+        }
+        // Its forwarded copies stay its own from the first run on until they
+        // commit, after the runs' chunks before them (as past a run:
+        // `Exec::past_begin`; sealed parts take a snapshot).
+        if first && super::tune::forward_held() {
+            super::forward::hold_begin();
+        }
+        Some(to)
+    }
+
+    /// A chunk of a run planned past a label wait at its turn (`tune
+    /// wait_runs`): why it is recorded again (it read on the CPU what other
+    /// queues wrote while the stretch recorded, used an image with a clear
+    /// or reload pending, or bound pages written since its checks), else
+    /// None.
+    pub fn stretch_check(&mut self, writes: &super::ranges::Ranges, need: u32) -> Option<&'static str> {
+        let e = self.exec.as_mut()?;
+        if writes.overlaps_any(e.held_reads()) {
+            return Some("read what other queues wrote past the wait");
+        }
+        if !e.held_keys().is_empty() && super::images::any_pending() && {
+            let keys: Vec<super::images::ImageKey> = e.held_keys().iter().copied().collect();
+            super::images::with(|im| im.clears_pending(&keys) || im.overwrites_pending(&keys))
+        } {
+            return Some("images with pending clears or reloads past the wait");
+        }
+        if super::tune::past_check() && e.past_checks_want() < need && !e.past_current_for(need) {
+            return Some("checks older than its label needs past the wait");
+        }
+        None
+    }
+
+    /// A worker begins a chunk (`on`: of a run planned past a label wait).
+    pub fn stretch_set(&mut self, on: bool) {
+        if let Some(e) = self.exec.as_mut() {
+            e.stretch_set(on);
+        }
     }
 
     /// Whether the label gone past passes now (in memory or promised).
@@ -3367,6 +3547,20 @@ impl Cp {
         let needs = (super::fe2::on() && (super::tune::past_check() || super::fe2::stretch_audit())).then(|| self.label_needs(w.a, w.wide));
         let audit = super::fe2::stretch_audit();
         let writes = super::exec::journal_end();
+        // (The held work sealed before runs planned past the wait took its
+        // CPU reads and used images with it.)
+        let seal_why = w.parts.iter().filter_map(|p| p.0.as_ref()).find_map(|s| {
+            if writes.overlaps_any(&s.check.reads) {
+                Some("read what other queues wrote (sealed before a run)")
+            } else if !s.check.keys.is_empty() && super::images::any_pending() && {
+                let keys: Vec<super::images::ImageKey> = s.check.keys.iter().copied().collect();
+                super::images::with(|im| im.clears_pending(&keys) || im.overwrites_pending(&keys))
+            } {
+                Some("images with pending clears or reloads (sealed before a run)")
+            } else {
+                None
+            }
+        });
         PAST_WAITS[3].fetch_add(commands, Ordering::Relaxed);
         PAST_WAITS[4].fetch_add(w.began.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if promised_first {
@@ -3401,6 +3595,8 @@ impl Cp {
             Some("shutdown")
         } else if writes.overlaps_any(e.held_reads()) {
             Some("read what other queues wrote")
+        } else if seal_why.is_some() {
+            seal_why
         } else if !e.held_keys().is_empty() && super::images::any_pending() && {
             let keys: Vec<super::images::ImageKey> = e.held_keys().iter().copied().collect();
             super::images::with(|im| im.clears_pending(&keys) || im.overwrites_pending(&keys))
@@ -3415,6 +3611,13 @@ impl Cp {
         };
         if let Some(d) = dropped {
             note_why(&PAST_WAIT_DROPS, d);
+            // (The runs planned past the wait go with the stretch.)
+            if !w.parts.is_empty() {
+                WAIT_RUNS[2].fetch_add(1, Ordering::Relaxed);
+            }
+            for (_, r) in w.parts.drain(..) {
+                r.pr.run.cancel();
+            }
             if d == "read what other queues wrote" {
                 // The next stretch on this label stops before these reads.
                 let hits: Vec<(u64, u64)> = e.held_reads().iter().copied().filter(|r| writes.overlaps(r.0, r.1)).take(PAST_CONFLICTS_MAX).collect();
@@ -3463,6 +3666,44 @@ impl Cp {
         // end's scopes stay as before.)
         if super::fe2::on() {
             self.end_copy_scope_after_wait(w.a, w.wide);
+        }
+        // A run planned where it went past the wait (`tune wait_runs`): the
+        // stretch settles as one past that run: its chunks get their turns
+        // and commit in order, each checked against what other queues wrote
+        // while it recorded and the epoch the label needs, then the work
+        // recorded past the run (`past_settle`).
+        if !w.parts.is_empty() {
+            PAST_WAITS[1].fetch_add(1, Ordering::Relaxed);
+            past_backoff_note(w.a, false);
+            WAIT_RUNS[1].fetch_add(1, Ordering::Relaxed);
+            let need = self.label_needs(w.a, w.wide).0;
+            let writes = Arc::new(writes);
+            let mut parts = std::mem::take(&mut w.parts);
+            for p in &parts {
+                p.1.pr.run.set_stretch(writes.clone(), need);
+            }
+            let (seal0, first) = parts.remove(0);
+            if let Some(s) = seal0 {
+                // (Its chunks are checked against what it wrote, as a chained
+                // run's against the seal before it.)
+                if let Some(log) = first.pr.run.long_writes() {
+                    let mut g = log.lock();
+                    g.0.extend(&s.check.writes);
+                    g.1.extend(&s.check.writes);
+                }
+                if let Some(e) = self.exec.as_mut() {
+                    e.past_commit_sealed(s.check.fwd);
+                }
+            }
+            let (end_state, end_unknown) = parts.last().map_or((first.end_state, first.end_unknown), |p| (p.1.end_state.clone(), p.1.end_unknown.clone()));
+            let (mut chained, mut seals) = (Vec::new(), Vec::new());
+            for (s, r) in parts {
+                seals.push(s);
+                chained.push(r.pr);
+            }
+            self.past = Some(Box::new(Past { pr: first.pr, chained, seals, writes: Default::default(), posted: None, failed: None, end_state, end_unknown, buf: first.buf, across: false, stack: std::mem::take(&mut w.stack), markers: std::mem::take(&mut w.markers), pred: w.pred.take(), fence_pending: w.fence_pending, began: w.began }));
+            self.held = held;
+            return self.past_settle();
         }
         self.exec.as_mut().unwrap().past_commit();
         PAST_WAITS[1].fetch_add(1, Ordering::Relaxed);
@@ -3909,7 +4150,7 @@ impl Cp {
         let mut c = from;
         let mut n = 0usize;
         // A long run (`tune long_runs`) goes on as `par_plan`'s scan does.
-        let long = super::tune::long_runs() && self.main_gfx && !self.compute;
+        let long = (super::tune::long_runs() || self.plan_wait_run) && self.main_gfx && !self.compute;
         let mut labels: Vec<RunLabel> = Vec::new();
         let mut cpu_wait = false;
         let mut writers = Vec::new();
@@ -3941,6 +4182,13 @@ impl Cp {
                 break c;
             }
             if is_command(opc) {
+                // (Past a label wait an indirect draw's arguments, read on
+                // the CPU, are mostly what the stretch's label's writer or
+                // the per-view copies before them write: its chunks were
+                // dropped at their turn, 87% of them; the run ends before it.)
+                if self.plan_wait_run && matches!(opc, op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT) {
+                    break c;
+                }
                 n += 1;
                 if n >= PAR_MAX {
                     break next;
@@ -3965,6 +4213,7 @@ impl Cp {
             self.par_skip_n = n;
             return false;
         }
+        self.par_scan_end = run_end;
         true
     }
 
@@ -5489,6 +5738,21 @@ impl Cp {
                 break;
             }
             let skip = self.par_skip.0 == end && cur < self.par_skip.1;
+            // Past a label wait: the run starting here is planned now (the
+            // held work before it sealed), its chunks held until the label
+            // passes, and this command processor records on past it (`tune
+            // wait_runs`).
+            if super::tune::wait_runs() && self.past_wait.as_ref().is_some_and(|w| w.parts.len() < WAIT_RUNS_MAX) && self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && self.held.as_ref().is_some_and(|hc| hc.stop.is_none()) && super::fe2::on() && self.main_gfx && super::par::workers() > 0 && !super::capture::capturing() && {
+                self.plan_wait_run = true;
+                let split = self.par_would_split(&f, cur, end);
+                self.plan_wait_run = false;
+                split
+            } {
+                if let Some(c) = self.wait_run_start(&f, cur, end) {
+                    cur = c;
+                    continue;
+                }
+            }
             if self.past.is_some() && self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && super::par::workers() > 0 && self.par_would_split(&f, cur, end) {
                 // A long run right after the one(s) gone past, nothing recorded
                 // between: planned now, chained after them (`chain_next`).

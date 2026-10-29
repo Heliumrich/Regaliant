@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 198] = [
+    static ALL: [Tunable; 199] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -231,6 +231,7 @@ pub mod tune {
         Tunable { name: "past_hot", env: "DS_PAST_HOT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_quiet_waits", env: "DS_FE2_QUIET_WAITS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_conflict_hold", env: "DS_PAST_CONFLICT_HOLD", default: 600, value: AtomicU64::new(UNSET) },
+        Tunable { name: "wait_runs", env: "DS_WAIT_RUNS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2157,6 +2158,15 @@ pub mod tune {
     /// 32x); 0: for the rest of the session, as before 2026-10-29.
     pub fn past_conflict_hold() -> u64 {
         get(197)
+    }
+
+    /// Front end 2: where the graphics CP goes past a label wait, the long
+    /// run starting there is planned at once, its chunks recorded by the
+    /// workers and held until the label passes, while the CP records on past
+    /// it (`Cp::wait_run_start`; the stretch's ~1,000 commands a flip were
+    /// recorded serially by the CP).
+    pub fn wait_runs() -> bool {
+        get(198) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

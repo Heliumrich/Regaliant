@@ -6854,6 +6854,11 @@ pub struct Exec {
     /// (`past_current_for`).
     past_ranges: Vec<(u64, u64)>,
     past_up: HashSet<u64>,
+    /// A worker records a chunk of a run planned past a label wait
+    /// (`tune wait_runs`): its checks as the stretch's (the epoch now, hot
+    /// pages uploaded when it runs, its placements kept for the check at
+    /// its turn).
+    stretch: bool,
     /// Its own image-cache notes (`Images::notes_for`), never in the image
     /// cache before a hand-over: fast clears pending (metadata address,
     /// value when known) and GPU-owned images overwritten by its work.
@@ -7549,6 +7554,7 @@ impl Exec {
                 past_want_min: u32::MAX,
                 past_ranges: Vec::new(),
                 past_up: HashSet::new(),
+                stretch: false,
                 held_clears: HashMap::new(),
                 held_over: HashSet::new(),
                 held_keys: HashSet::new(),
@@ -8834,7 +8840,7 @@ impl Exec {
         let ep = super::precache::epoch() as u32;
         let want = self.fe2_want(ep);
         self.fe2_min_want = self.fe2_min_want.min(want);
-        if self.past_grow {
+        if self.past_grow || self.stretch {
             self.past_want_min = self.past_want_min.min(want);
             self.past_ranges.push((lo, hi));
         }
@@ -8850,7 +8856,7 @@ impl Exec {
         // frame again before the label (FINDINGS.md 2026-10-29): a small
         // binding's such pages are uploaded as they are when the stretch
         // runs, whatever the check found.
-        if self.past_grow && r.is_ok() && (hi - lo) / PAGE <= STRETCH_HOT_PAGES && super::tune::past_hot() {
+        if (self.past_grow || self.stretch) && r.is_ok() && (hi - lo) / PAGE <= STRETCH_HOT_PAGES && super::tune::past_hot() {
             let mut hot = Vec::new();
             super::fe2::hot_pages(lo, hi, &mut hot);
             let own = |p: u64, up: &[(u64, u64)]| mine.contains(&p) || pend.contains(&p) || up[first..].iter().any(|&(s, e)| s <= p && p < e);
@@ -8880,7 +8886,7 @@ impl Exec {
             let mut p = a;
             while p < b {
                 mine.insert(p);
-                if self.past_grow {
+                if self.past_grow || self.stretch {
                     self.past_up.insert(p);
                 }
                 p += PAGE;
@@ -8924,7 +8930,7 @@ impl Exec {
         // reading it stopped the stretch and waited for the label (~9 ms
         // each, 732 times in one window; 2 of ~20 boots, 2026-10-28 night).
         match self.fe2_view.load(Ordering::Acquire) {
-            _ if self.past_grow && super::fe2::stretch_epoch() => ep,
+            _ if (self.past_grow || self.stretch) && super::fe2::stretch_epoch() => ep,
             super::fe2::NO_VIEW => ep,
             v => v.min(ep),
         }
@@ -9015,7 +9021,7 @@ impl Exec {
         // runs on the same or adjacent pages placed as one.
         ranges.sort_unstable();
         let want = self.fe2_want(super::precache::epoch() as u32);
-        if self.past_grow {
+        if self.past_grow || self.stretch {
             self.past_want_min = self.past_want_min.min(want);
         }
         let mut run: Option<(u64, u64)> = None;
@@ -12189,6 +12195,17 @@ impl Exec {
         !stale
     }
 
+    /// A worker begins a chunk (`on`: of a run planned past a label wait,
+    /// recorded as the stretch's work; `tune wait_runs`).
+    pub fn stretch_set(&mut self, on: bool) {
+        self.stretch = on;
+        if on {
+            self.past_want_min = u32::MAX;
+            self.past_ranges.clear();
+            self.past_up.clear();
+        }
+    }
+
     /// The view this queue's label writes submitted now are promised with
     /// (`cp::promise`): its view, the epoch now without one.
     fn promise_view(&self) -> u32 {
@@ -12245,7 +12262,7 @@ impl Exec {
     /// (not sealed) when it holds image notes (fast clears or overwrites:
     /// they are not split) or its batch cannot be closed.
     pub fn past_seal(&mut self) -> Option<SealCheck> {
-        if !self.past || self.past_grow || self.stopped || !self.held_clears.is_empty() || !self.held_over.is_empty() {
+        if !self.past || self.stopped || !self.held_clears.is_empty() || !self.held_over.is_empty() {
             return None;
         }
         if self.recording {

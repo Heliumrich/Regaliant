@@ -154,6 +154,13 @@ pub struct Run {
     pub fe2_view: u32,
     /// Chunks recorded before their turn (`tune par_park`), by index.
     parked: Mutex<Vec<Option<Parked>>>,
+    /// Planned where the graphics CP went past a label wait (`tune
+    /// wait_runs`): its chunks are recorded as the stretch's work and
+    /// parked until the label passes; then what other queues wrote
+    /// meanwhile and the epoch the label needs (`set_stretch`), which each
+    /// chunk is checked against at its turn.
+    pub stretch: bool,
+    stretch_check: Mutex<Option<(Arc<super::ranges::Ranges>, u32)>>,
 }
 
 /// A recorder of chunks: a command processor with its own executor. A
@@ -314,6 +321,8 @@ impl Run {
             chained: Mutex::new(None),
             fe2_view: super::fe2::NO_VIEW,
             parked: Mutex::new((0..n).map(|_| None).collect()),
+            stretch: false,
+            stretch_check: Mutex::new(None),
         }
     }
 
@@ -350,6 +359,13 @@ impl Run {
     }
 
     /// A long run (`set_long`).
+    /// The label a run planned past it waits for passed (`tune wait_runs`):
+    /// what other queues wrote while the stretch recorded and the epoch the
+    /// label needs, for its chunks' checks at their turn.
+    pub fn set_stretch(&self, writes: Arc<super::ranges::Ranges>, need: u32) {
+        *self.stretch_check.lock() = Some((writes, need));
+    }
+
     pub fn is_long(&self) -> bool {
         self.long.is_some()
     }
@@ -790,7 +806,8 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         *t = now;
     };
     let long = run.long.as_ref();
-    let park = long.is_some() && super::tune::par_park();
+    // (A run planned past a label wait waits for the label: parked.)
+    let park = long.is_some() && (super::tune::par_park() || run.stretch);
     loop {
         if run.cancelled.load(Ordering::SeqCst) {
             return;
@@ -813,6 +830,7 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         let mut cp = rec.cp.lock();
         cp.set_chunk_state(&state);
         cp.fe2_set_view(run.fe2_view);
+        cp.stretch_set(run.stretch);
         cp.chunk_start(&run.main_writes, &run.main_submitted);
         cp.chunk_costs = run.timed.then(|| Vec::with_capacity(512));
         if let Some(l) = long {
@@ -880,6 +898,17 @@ fn commit(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, from: u6
                 }
             }
             drop(earlier);
+            // A run planned past a label wait: its chunk read on the CPU what
+            // other queues wrote while the stretch recorded, used an image
+            // with a clear or reload pending, or bound pages the CPU wrote
+            // since its checks (it is recorded again).
+            let d = match (d, run.stretch) {
+                (None, true) => {
+                    let sc = run.stretch_check.lock().clone();
+                    sc.and_then(|(w, need)| cp.stretch_check(&w, need))
+                }
+                (d, _) => d,
+            };
             if d.is_none() {
                 let writes = cp.worker_writes();
                 let (nonfwd, mismatch) = cp.long_take();
@@ -924,6 +953,13 @@ fn commit(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, from: u6
         Done { stopped: Some(from), state: *state, last: None, why, costs: Vec::new(), writes: Default::default() }
     } else {
         let writes = if super::runprobe::on() || super::tune::past_runs() { cp.worker_writes() } else { Default::default() };
+        if run.stretch {
+            // (Its label writes are promised with the view the label needs.)
+            let need = run.stretch_check.lock().as_ref().map(|s| s.1);
+            if let Some(v) = need {
+                cp.fe2_set_view(v);
+            }
+        }
         let last = cp.worker_submit();
         let why = if stopped.is_some() { cp.worker_stop_why() } else { "" };
         let state = if long.is_some() { cp.chunk_state_stacked() } else { cp.chunk_state() };
