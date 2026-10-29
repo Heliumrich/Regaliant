@@ -3221,6 +3221,7 @@ pub fn profile_report() -> String {
     s.push_str(&exec::laps_report());
     s.push_str(&cp::wait_stats());
     s.push_str(&cp::classes_line());
+    s.push_str(&cp::cb_census_line());
     s.push_str(&exec::race_line());
     s.push_str(&forward::status_line());
     s.push_str(&fe2::callers_line());

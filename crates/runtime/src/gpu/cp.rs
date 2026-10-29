@@ -1680,10 +1680,73 @@ fn class_end(k: usize, t: Option<(Instant, u64)>) {
 
 /// Clears the packet classes (`profile reset`).
 pub fn reset_classes() {
-    for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()).chain(SERIAL_WHY.iter()).chain(PLAN_PHASES.iter()).chain(PLAN_MAIN_WRITES.iter()).chain(RUN_EPOCHS.iter()) {
+    for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()).chain(SERIAL_WHY.iter()).chain(PLAN_PHASES.iter()).chain(PLAN_MAIN_WRITES.iter()).chain(RUN_EPOCHS.iter()).chain(CB_CENSUS.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
     CP_CLASSES_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+/// `DS_CB_CENSUS=1` (diagnosis): every command buffer a command processor
+/// runs (as `Cp::run` enters or chains to it) hashed by its contents, with
+/// the registers at its start, and with its address too, against those its
+/// command processor ran in the last CB_FLIPS flips: how much of a frame's
+/// recording repeats a recent frame's (the reach of reusing recordings
+/// across frames, before the memory their commands read).
+fn cb_census_on() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_CB_CENSUS").ok().as_deref() == Some("1"))
+}
+
+const CB_FLIPS: u64 = 8;
+
+/// Per kind (the graphics queue's command processor, the compute queues'):
+/// [buffers, dwords, buffers with contents one of the last CB_FLIPS flips
+/// ran, their dwords, those with the same registers at their start too,
+/// their dwords, those at the same address as well, their dwords].
+static CB_CENSUS: [[AtomicU64; 8]; 2] = [const { [const { AtomicU64::new(0) }; 8] }; 2];
+
+thread_local! {
+    /// This command processor's buffers by hash: the last flip each ran in.
+    static CB_SEEN: std::cell::RefCell<HashMap<u64, u64>> = std::cell::RefCell::new(HashMap::new());
+}
+
+fn hash_words(h: &mut super::fx::FxHasher, w: &[u32]) {
+    use std::hash::Hasher;
+    let mut it = w.chunks_exact(2);
+    for p in &mut it {
+        h.write_u64(p[0] as u64 | (p[1] as u64) << 32);
+    }
+    for &x in it.remainder() {
+        h.write_u32(x);
+    }
+}
+
+/// The command buffers' census (`DS_CB_CENSUS=1`; "" otherwise).
+pub fn cb_census_line() -> String {
+    if !cb_census_on() {
+        return String::new();
+    }
+    let flips = super::FRAMES.load(Ordering::Relaxed).saturating_sub(CP_CLASSES_FROM.load(Ordering::Relaxed)).max(1) as f64;
+    let parts: Vec<String> = ["the graphics queue's", "the compute queues'"]
+        .iter()
+        .zip(CB_CENSUS.iter())
+        .map(|(name, c)| {
+            let v: Vec<u64> = c.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+            let pct = |a: u64, b: u64| 100.0 * a as f64 / b.max(1) as f64;
+            format!(
+                "{name} {:.1} buffers a flip ({:.0} dwords): with contents one its CP ran in the last {CB_FLIPS} flips {:.1}% ({:.1}% of the dwords), with its registers at their start too {:.1}% ({:.1}%), at the same address as well {:.1}% ({:.1}%)",
+                v[0] as f64 / flips,
+                v[1] as f64 / flips,
+                pct(v[2], v[0]),
+                pct(v[3], v[1]),
+                pct(v[4], v[0]),
+                pct(v[5], v[1]),
+                pct(v[6], v[0]),
+                pct(v[7], v[1])
+            )
+        })
+        .collect();
+    format!("    command buffers run (`DS_CB_CENSUS`): {}\n", parts.join("; "))
 }
 
 /// The packet classes per flip since they were cleared ("" when none).
@@ -4911,6 +4974,44 @@ impl Cp {
         super::ahead::note_scan(why, ns);
     }
 
+    /// A command buffer of `size` dwords at `addr` this command processor
+    /// runs (`cb_census_on`).
+    fn cb_note(&self, addr: u64, size: u32) {
+        use std::hash::Hasher;
+        if size == 0 || !valid(addr, 4 * size as u64) {
+            return;
+        }
+        let words = unsafe { std::slice::from_raw_parts(addr as *const u32, size as usize) };
+        let mut h = super::fx::FxHasher::default();
+        hash_words(&mut h, words);
+        let contents = h.finish();
+        hash_words(&mut h, &self.regs.sh);
+        hash_words(&mut h, &self.regs.ctx);
+        hash_words(&mut h, &self.regs.uc);
+        let with_regs = h.finish();
+        h.write_u64(addr);
+        let at = h.finish();
+        let flip = super::FRAMES.load(Ordering::Relaxed);
+        let (c, r, a) = CB_SEEN.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.len() > 1 << 20 {
+                m.clear();
+            }
+            let mut recent = |k: u64| m.insert(k, flip).is_some_and(|f| f < flip && flip - f <= CB_FLIPS);
+            (recent(contents ^ 1), recent(with_regs ^ 2), recent(at ^ 3))
+        });
+        let s = &CB_CENSUS[self.compute as usize];
+        let n = size as u64;
+        s[0].fetch_add(1, Ordering::Relaxed);
+        s[1].fetch_add(n, Ordering::Relaxed);
+        for (k, hit) in [(2, c), (4, r), (6, a)] {
+            if hit {
+                s[k].fetch_add(1, Ordering::Relaxed);
+                s[k + 1].fetch_add(n, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Whether this command processor's stages prepared ahead get their
     /// placement checks where they are prepared (`tune fe2_precheck`: the
     /// graphics CP under front end 2, whose view is the epoch now).
@@ -5728,6 +5829,9 @@ impl Cp {
         let mut end = addr + 4 * size as u64;
         self.before_fetch(addr, 4 * size as u64);
         let mut f = Fetched::new(addr, size);
+        if cb_census_on() {
+            self.cb_note(addr, size);
+        }
         // Time by packet class (the graphics queue; `tune cp_classes`).
         let classes = !self.compute && super::tune::cp_classes();
         if classes && !f.words.is_empty() {
@@ -6101,6 +6205,9 @@ impl Cp {
                     end = a + 4 * s as u64;
                     self.before_fetch(a, 4 * s as u64);
                     f = Fetched::new(a, s);
+                    if cb_census_on() {
+                        self.cb_note(a, s);
+                    }
                 }
                 Flow::Stop => break,
             }
