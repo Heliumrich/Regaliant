@@ -1287,6 +1287,12 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
             spec.pt_linear = super::fe2::on();
         }
     }
+    // Diagnosis (`tune lod_late 0`): no LOD statistics where the depth
+    // tests stay after the shader.
+    if !super::tune::lod_late() && !spec.early_tests && !spec.early_ok {
+        spec.lod_stats = false;
+        spec.lod_lean = false;
+    }
     // Profile (`DS_PROFILE_GPU=1`): when the draw's depth tests run.
     if super::exec::profiling_on() {
         let class = if spec.early_tests {

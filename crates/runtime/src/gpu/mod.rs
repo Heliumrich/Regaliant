@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 220] = [
+    static ALL: [Tunable; 221] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -253,6 +253,7 @@ pub mod tune {
         Tunable { name: "early_auto", env: "DS_EARLY_AUTO", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "write_marks", env: "DS_WRITE_MARKS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_cpw_defer", env: "DS_FE2_CPW_DEFER", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "lod_late", env: "DS_LOD_LATE", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2387,6 +2388,15 @@ pub mod tune {
     /// guest memory, as if the GPU were slower.
     pub fn fe2_cpw_defer() -> bool {
         get(219) != 0
+    }
+
+    /// Diagnosis at 0 (the title's texture streaming then lacks those
+    /// textures' statistics): pixel programs whose depth tests stay after
+    /// the shader (a kill, coverage or export with depth or stencil
+    /// writes) leave the LOD statistics out, so the driver can test early
+    /// and write late as it does for any program without side effects.
+    pub fn lod_late() -> bool {
+        get(220) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
