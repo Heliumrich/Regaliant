@@ -1050,8 +1050,12 @@ const CS_USER_DATA: u32 = 0x240;
 /// batch_cs`, `Exec::note_cs_streak`): translated batched (`Spec::batched`).
 static BATCHABLE: [std::sync::atomic::AtomicU64; 64] = [const { std::sync::atomic::AtomicU64::new(0) }; 64];
 
+/// Whether program `addr` is batched (never address 0: the free slots hold 0,
+/// and the precompile's specs from kept code have no address; until
+/// 2026-10-30 every one of them came out batched, so no non-batched dispatch
+/// found its translation made ahead).
 pub fn batchable(addr: u64) -> bool {
-    BATCHABLE.iter().any(|a| a.load(std::sync::atomic::Ordering::Relaxed) == addr)
+    addr != 0 && BATCHABLE.iter().any(|a| a.load(std::sync::atomic::Ordering::Relaxed) == addr)
 }
 
 /// Marks program `addr` batchable (at most 64 programs).
@@ -2199,7 +2203,7 @@ pub(crate) fn guess_compute_spec(addr: u64, insts: &[rdna::Inst], plan: &Plan, c
             }
         })
         .collect();
-    (compute_spec(addr, code_hash, rsrc2, local, wave64, resources), known)
+    (compute_spec(addr, code_hash, rsrc2, local, wave64, resources, batchable(addr)), known)
 }
 
 /// The key spec (code base left out) `prepare_ngg` makes for the vertex
@@ -2298,7 +2302,9 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
 /// The key spec (code base left out) `prepare_compute` makes for the
 /// compute program at `addr` (code hash `code_hash`) dispatched with these
 /// registers and descriptors, under the current switches.
-pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3], wave64: bool, resources: Vec<ResSpec>) -> Spec {
+/// (`batched`: translated for runs of consecutive dispatches, as a program
+/// `batchable` is: learned with its spec, or the program's state now.)
+pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3], wave64: bool, resources: Vec<ResSpec>, batched: bool) -> Spec {
     let mut spec = Spec {
         stage: Stage::Compute,
         user_sgprs: ((rsrc2 >> 1) & 0x1F).min(16) as u16,
@@ -2328,8 +2334,8 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         lane_votes: false,
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Compute)),
-        addresses: super::tune::addresses() || (super::tune::batch_cs() && batchable(addr)),
-        batched: super::tune::batch_cs() && batchable(addr),
+        addresses: super::tune::addresses() || (super::tune::batch_cs() && batched),
+        batched: super::tune::batch_cs() && batched,
         write_marks: marks_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,

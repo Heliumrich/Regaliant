@@ -59,13 +59,15 @@ static CREATED: Mutex<Option<HashMap<u64, Created>>> = Mutex::new(None);
 static COMPARED: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
 
 /// What a dispatch adds to a program's spec: RSRC2, the thread-group size,
-/// wave64 and the resources' specs.
+/// wave64, the resources' specs and whether it ran batched (runs of
+/// consecutive dispatches, `shaders::batchable`: its translation differs).
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Seen {
     rsrc2: u32,
     local: [u32; 3],
     wave64: bool,
     resources: Vec<ResSpec>,
+    batched: bool,
 }
 
 /// The specs dispatches used, by code hash, with the program's rank (the
@@ -156,6 +158,49 @@ const EARLY: usize = 20;
 /// Dispatch modifier bit 15 against the wave64 of first translations:
 /// [set and wave64, set and wave32] (the rest: clear).
 static MODIFIER: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Translations the dispatch path made itself for programs with learned
+/// specs (`first_translation`): [any, one of whose learned specs gives the
+/// same key spec (precompile not done with it yet, or it failed), none
+/// does (the key spec differs)].
+static MISSES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The fields in which two specs' Debug forms differ (diagnostics).
+fn spec_diff(a: &Spec, b: &Spec) -> String {
+    let (fa, fb) = (format!("{a:?}"), format!("{b:?}"));
+    // Fields at top level: split on ", " outside brackets.
+    let split = |s: &str| -> Vec<String> {
+        let (mut out, mut cur, mut depth) = (Vec::new(), String::new(), 0i32);
+        let body = s.trim_start_matches("Spec {").trim_end_matches('}');
+        let chars: Vec<char> = body.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                _ => {}
+            }
+            if c == ',' && depth == 0 {
+                out.push(cur.trim().to_string());
+                cur.clear();
+            } else {
+                cur.push(c);
+            }
+            i += 1;
+        }
+        if !cur.trim().is_empty() {
+            out.push(cur.trim().to_string());
+        }
+        out
+    };
+    let (xa, xb) = (split(&fa), split(&fb));
+    let diffs: Vec<String> = xa.iter().zip(xb.iter()).filter(|(x, y)| x != y).map(|(x, y)| format!("{x} | {}", y.split_once(':').map_or(y.as_str(), |(_, v)| v.trim()))).collect();
+    if xa.len() != xb.len() {
+        return format!("field counts {} and {}", xa.len(), xb.len());
+    }
+    diffs.join("; ")
+}
 
 /// Where learned specs are kept (`main`: DS_SPECS, else under local-data).
 pub fn set_store(path: std::path::PathBuf) {
@@ -256,7 +301,7 @@ pub(crate) fn learned_compute() -> Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<Spec>
         m.iter()
             .filter_map(|(h, (_, seen))| {
                 let code = codes.get(h)?.clone();
-                let specs = seen.iter().map(|s| super::shaders::compute_spec(0, *h, s.rsrc2, s.local, s.wave64, s.resources.clone())).collect();
+                let specs = seen.iter().map(|s| super::shaders::compute_spec(0, *h, s.rsrc2, s.local, s.wave64, s.resources.clone(), s.batched)).collect();
                 Some((*h, code, specs))
             })
             .collect()
@@ -671,7 +716,7 @@ fn run(addr: u64) {
         return;
     };
     let seen = learned(|m| m.get(&code_hash).map(|e| e.1.clone())).unwrap_or_default();
-    let mut specs: Vec<Spec> = seen.into_iter().map(|s| super::shaders::compute_spec(addr, code_hash, s.rsrc2, s.local, s.wave64, s.resources)).collect();
+    let mut specs: Vec<Spec> = seen.into_iter().map(|s| super::shaders::compute_spec(addr, code_hash, s.rsrc2, s.local, s.wave64, s.resources, s.batched)).collect();
     if super::tune::precompile() >= 3 {
         let user_sgprs = ((c.rsrc2 >> 1) & 0x1F).min(16) as u16;
         if let Ok((insts, plan, _)) = super::shaders::stage_plan(addr, user_sgprs, 0) {
@@ -711,7 +756,7 @@ fn run_code(h: u64) {
     let seen = learned(|m| m.get(&h).map(|e| e.1.clone())).unwrap_or_default();
     for s in seen {
         let t = std::time::Instant::now();
-        let spec = super::shaders::compute_spec(0, h, s.rsrc2, s.local, s.wave64, s.resources);
+        let spec = super::shaders::compute_spec(0, h, s.rsrc2, s.local, s.wave64, s.resources, s.batched);
         let r = super::shaders::translate_code_for_spec(&code, h, spec).and_then(|tr| super::exec::precompile_translation(&tr, 0).ok_or_else(|| "pipeline creation failed".to_string()));
         match r {
             Ok(true) => {
@@ -738,6 +783,23 @@ static FORMATS: Mutex<Option<HashMap<(u8, u16), u64>>> = Mutex::new(None);
 /// and the first time per program it is compared with the guess from its
 /// shader object.
 pub fn first_translation(addr: u64, insts: &[rdna::Inst], plan: &rdna::analysis::Plan, code_hash: u64, actual: &Spec) {
+    // A program whose specs were learned: why its translation was not made
+    // ahead (the same key spec from a learned one, or none).
+    if let Some(seen) = learned(|m| m.get(&code_hash).map(|e| e.1.clone())) {
+        MISSES[0].fetch_add(1, Ordering::Relaxed);
+        let mut key = actual.clone();
+        key.code_base = 0;
+        let made: Vec<Spec> = seen.into_iter().map(|s| super::shaders::compute_spec(0, code_hash, s.rsrc2, s.local, s.wave64, s.resources, s.batched)).collect();
+        if made.iter().any(|m| *m == key) {
+            MISSES[1].fetch_add(1, Ordering::Relaxed);
+        } else {
+            let n = MISSES[2].fetch_add(1, Ordering::Relaxed);
+            if n < 12 {
+                let best = made.iter().map(|m| spec_diff(m, &key)).min_by_key(|d| d.len()).unwrap_or_default();
+                crate::info!("gpu: cs {addr:#x} (code hash {code_hash:#018x}) translated at its dispatch: none of its {} learned specs gives its key spec (closest differs in: {best})", made.len());
+            }
+        }
+    }
     LEARN_ADDR.with(|c| c.set(Some(addr)));
     learn(code_hash, actual);
     LEARN_ADDR.with(|c| c.set(None));
@@ -774,7 +836,7 @@ pub fn first_translation(addr: u64, insts: &[rdna::Inst], plan: &rdna::analysis:
 /// Records the spec a dispatch of the program `code_hash` used (once per
 /// distinct spec; appended to the store).
 fn learn(code_hash: u64, spec: &Spec) {
-    let s = Seen { rsrc2: spec.cs_rsrc2, local: spec.cs_local_size, wave64: spec.wave64, resources: spec.resources.clone() };
+    let s = Seen { rsrc2: spec.cs_rsrc2, local: spec.cs_local_size, wave64: spec.wave64, resources: spec.resources.clone(), batched: spec.batched };
     let new = learned(|m| {
         let rank = LINES.load(Ordering::Relaxed) as u32;
         let v = &mut m.entry(code_hash).or_insert_with(|| (rank, Vec::new())).1;
@@ -816,7 +878,8 @@ fn format_line(code_hash: u64, s: &Seen) -> String {
             ResSpec::Image { dim, class, depth } => format!("i{}/{}/{}", DIMS.iter().position(|d| d == dim).unwrap_or(1), CLASSES.iter().position(|c| c == class).unwrap_or(0), *depth as u8),
         })
         .collect();
-    format!("{code_hash:016x} {:x} {} {} {} {} {}\n", s.rsrc2, s.local[0], s.local[1], s.local[2], s.wave64 as u8, res.join(" "))
+    // (A final `B`: batched.)
+    format!("{code_hash:016x} {:x} {} {} {} {} {}{}\n", s.rsrc2, s.local[0], s.local[1], s.local[2], s.wave64 as u8, res.join(" "), if s.batched { " B" } else { "" })
 }
 
 fn parse(line: &str) -> Option<(u64, Seen)> {
@@ -830,7 +893,12 @@ fn parse(line: &str) -> Option<(u64, Seen)> {
         _ => return None,
     };
     let mut resources = Vec::new();
+    let mut batched = false;
     for t in it {
+        if t == "B" {
+            batched = true;
+            continue;
+        }
         let (k, rest) = t.split_at(1);
         let nums = rest.split('/').filter(|x| !x.is_empty()).map(|x| x.parse::<u32>().ok()).collect::<Option<Vec<u32>>>()?;
         resources.push(match (k, nums.as_slice()) {
@@ -841,7 +909,7 @@ fn parse(line: &str) -> Option<(u64, Seen)> {
             _ => return None,
         });
     }
-    Some((h, Seen { rsrc2, local, wave64, resources }))
+    Some((h, Seen { rsrc2, local, wave64, resources, batched }))
 }
 
 fn res_tokens(res: &[ResSpec]) -> Vec<String> {
@@ -1041,10 +1109,13 @@ pub fn status() -> String {
     f.sort_by(|a, b| b.1.cmp(&a.1));
     let f: Vec<String> = f.iter().take(12).map(|((fm, ds), n)| format!("{fm}/{ds:#x} {n}")).collect();
     format!(
-        "    compute shader objects (`precompile`): {} created; specs {} loaded, {} learned; programs' code {} loaded, {} kept; {} jobs queued at the start; {} programs translated first ({} later translations with another spec), {} of them from an object: guess equal {}, equal but for format-accessed buffers {} ({}), different {} ({}); dispatch modifier bit 15 set: wave64 {}, wave32 {}; clear: wave64 {}, wave32 {}{made}\n",
+        "    compute shader objects (`precompile`): {} created; specs {} loaded, {} learned; translated at their dispatch with specs learned {} ({} of them with a learned spec giving the same key spec, {} with none); programs' code {} loaded, {} kept; {} jobs queued at the start; {} programs translated first ({} later translations with another spec), {} of them from an object: guess equal {}, equal but for format-accessed buffers {} ({}), different {} ({}); dispatch modifier bit 15 set: wave64 {}, wave32 {}; clear: wave64 {}, wave32 {}{made}\n",
         s[OBJECTS],
         s[LOADED],
         s[LEARNT],
+        MISSES[0].load(Ordering::Relaxed),
+        MISSES[1].load(Ordering::Relaxed),
+        MISSES[2].load(Ordering::Relaxed),
         s[CODES_LOADED],
         s[CODES_KEPT],
         s[EARLY],
@@ -1080,6 +1151,7 @@ mod tests {
                 ResSpec::Sampler,
                 ResSpec::Image { dim: ImageDim::CubeArray, class: NumClass::Float, depth: true },
             ],
+            batched: true,
         };
         let line = format_line(0x1234_5678_9abc_def0, &s);
         let (h, t) = parse(line.trim_end()).unwrap();
