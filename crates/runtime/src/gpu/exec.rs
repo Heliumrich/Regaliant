@@ -3732,8 +3732,10 @@ pub(super) const OP_PASS_ENDS: usize = 11;
 /// Front end 2's write-backs by site (diagnostics): [before a CP write the
 /// GPU performs, at a batch's close, of those with no label write promised
 /// and no completion action, before CP writes of labels a CP of ours waits
-/// on, left to the batch's close (`tune fe2_cpw_close`, `fe2_cpw_waited`)].
-pub static SCATTER_SITES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// on, left to the batch's close (`tune fe2_cpw_close`, `fe2_cpw_waited`),
+/// CP writes whose guest-memory copy waited for the close (`tune
+/// fe2_cpw_defer`)].
+pub static SCATTER_SITES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// Front end 2's write-backs (`Exec::fe2_scatter`).
 const OP_FE2_SCATTERS: usize = 12;
 const OPS: usize = 13;
@@ -6855,6 +6857,9 @@ pub struct Exec {
     fe2_spans: Vec<(u64, vk::Buffer)>,
     fe2_mine: super::fx::Set<u64>,
     fe2_marked: bool,
+    /// Guest-memory copies of GPU-performed CP writes left for the batch's
+    /// close, in order (`tune fe2_cpw_defer`): import, offset, bytes.
+    fe2_host_later: Vec<(vk::Buffer, u64, Vec<u8>)>,
     fe2_gens: Vec<u32>,
     /// Runs the batch's bindings left to check at its close
     /// (`fe2::resolve`), and their pages (the batch's own meanwhile).
@@ -7768,6 +7773,7 @@ impl Exec {
                 fe2_spans: Vec::new(),
                 fe2_mine: Default::default(),
                 fe2_marked: false,
+                fe2_host_later: Vec::new(),
                 fe2_gens: Vec::new(),
                 fe2_pend: Vec::new(),
                 fe2_pend_set: Default::default(),
@@ -8342,6 +8348,11 @@ impl Exec {
             }
             self.fe2_scatter();
         }
+        // The guest-memory copies of CP writes left for the close (`tune
+        // fe2_cpw_defer`): after the write-back and the timestamps, in order.
+        if !self.fe2_host_later.is_empty() {
+            self.record_host_later();
+        }
         if !self.fe2_pend.is_empty() {
             self.fe2_resolve();
         }
@@ -8612,6 +8623,7 @@ impl Exec {
         unsafe { ctx().device.end_command_buffer(self.cmd()).ok() };
         self.actions.clear();
         self.gpu_writes_open = false;
+        self.fe2_host_later.clear();
         self.checks.clear();
         self.race_pending.clear();
         if super::tune::race_checks() {
@@ -9454,6 +9466,20 @@ impl Exec {
         self.fe2_pend = runs;
         if let Err(e) = r {
             self.report_error(&format!("front end 2: {e} at a batch's close (its work reads the mirror as it is)"), String::new);
+        }
+    }
+
+    /// Records the guest-memory copies of CP writes left for the batch's
+    /// close (`tune fe2_cpw_defer`), after all its work.
+    fn record_host_later(&mut self) {
+        let later = std::mem::take(&mut self.fe2_host_later);
+        let cmd = self.cmd();
+        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        unsafe {
+            ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            for (buf, off, raw) in &later {
+                ctx().device.cmd_update_buffer(cmd, *buf, *off, raw);
+            }
         }
     }
 
@@ -11372,7 +11398,23 @@ impl Exec {
         // label a CP of ours waits on: at the batch's close, `tune
         // ts_cpw_waited`.)
         let waited = super::cp::cp_waited(a);
-        if !(waited && super::tune::ts_cpw_waited()) {
+        // Front end 2 (`tune fe2_cpw_defer`): a write that would need a
+        // write-back first (a label no CP of ours waits on, after GPU work
+        // that wrote the mirror) goes into the mirror here and into guest
+        // memory at the batch's close, after its write-back, and so do the
+        // batch's later ones (title threads see labels in order): a title
+        // thread sees it once all the batch's work is back in guest memory,
+        // as if the GPU were slower, and GPU work reads it in the mirror
+        // (only with that copy).
+        let fe2_mirror = if super::fe2::on() && super::fe2::in_span(a, bytes) && super::resident::back(a & !4095, (a + bytes).next_multiple_of(4096) - (a & !4095)).is_ok() {
+            super::fe2::note_cp_mirror();
+            super::resident::mirror_buffer().map(|(m, _)| (m, a - super::resident::MIRROR_BASE))
+        } else {
+            None
+        };
+        let would_scatter = self.fe2_marked && !(super::tune::fe2_cpw_close() || (waited && super::tune::fe2_cpw_waited()));
+        let host_later = super::tune::fe2_cpw_defer() && fe2_mirror.is_some() && (would_scatter || !self.fe2_host_later.is_empty());
+        if !(waited && super::tune::ts_cpw_waited()) && !host_later {
             self.resolve_timestamps();
         }
         // Front end 2: what earlier work wrote into the mirror reaches guest
@@ -11388,19 +11430,17 @@ impl Exec {
             }
             if super::tune::fe2_cpw_close() || (waited && super::tune::fe2_cpw_waited()) {
                 SCATTER_SITES[4].fetch_add(1, Ordering::Relaxed);
-            } else {
+            } else if !host_later {
                 SCATTER_SITES[0].fetch_add(1, Ordering::Relaxed);
                 after_scatter = self.fe2_scatter();
             }
         }
-        let fe2_mirror = if super::fe2::on() && super::fe2::in_span(a, bytes) && super::resident::back(a & !4095, (a + bytes).next_multiple_of(4096) - (a & !4095)).is_ok() {
-            super::fe2::note_cp_mirror();
-            super::resident::mirror_buffer().map(|(m, _)| (m, a - super::resident::MIRROR_BASE))
-        } else {
-            None
-        };
         let cmd = self.cmd();
         let raw: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
+        if host_later {
+            SCATTER_SITES[5].fetch_add(1, Ordering::Relaxed);
+            self.fe2_host_later.push((buffer, a - start, raw.clone()));
+        }
         let to_mirror = |cmd: vk::CommandBuffer| {
             if let Some((m, off)) = fe2_mirror {
                 unsafe { ctx().device.cmd_update_buffer(cmd, m, off, &raw) };
@@ -11422,11 +11462,13 @@ impl Exec {
                 } else if after_scatter {
                     EOP_LIGHT[3].fetch_add(1, Ordering::Relaxed);
                 }
-                ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw);
+                if !host_later {
+                    ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw);
+                }
                 to_mirror(cmd);
                 // Diagnosis (`tune skip_copies` 1024, timing only): written
                 // twice, with a barrier between (what one more costs).
-                if super::tune::skip_copies() & 1024 != 0 {
+                if super::tune::skip_copies() & 1024 != 0 && !host_later {
                     ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
                     ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw);
                 }
@@ -11435,7 +11477,9 @@ impl Exec {
             EOP_LIGHT[0].fetch_add(1, Ordering::Relaxed);
         } else if super::tune::skip_barriers() & 4 != 0 {
             self.ops[OP_CP_WRITES] += 1;
-            unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
+            if !host_later {
+                unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
+            }
             to_mirror(cmd);
         } else {
             // (Right after front end 2's write-back none: see above.)
@@ -11447,7 +11491,9 @@ impl Exec {
             // Counted between its barriers (`seg_stamps` names the segment
             // by it).
             self.ops[OP_CP_WRITES] += 1;
-            unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
+            if !host_later {
+                unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
+            }
             to_mirror(cmd);
             self.barrier();
             self.barrier_wanted = false;

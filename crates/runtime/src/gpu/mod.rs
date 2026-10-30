@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 218] = [
+    static ALL: [Tunable; 220] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -251,6 +251,8 @@ pub mod tune {
         Tunable { name: "vma_cache", env: "DS_VMA_CACHE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ts_cpw_waited", env: "DS_TS_CPW_WAITED", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "early_auto", env: "DS_EARLY_AUTO", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "write_marks", env: "DS_WRITE_MARKS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe2_cpw_defer", env: "DS_FE2_CPW_DEFER", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2363,6 +2365,26 @@ pub mod tune {
     /// Read when a pixel program is prepared.
     pub fn early_auto() -> bool {
         get(217) != 0
+    }
+
+    /// Timing only at 0 (GPU writes then never reach guest memory: the
+    /// upper bound, in replays, of what the stores' write marks cost the
+    /// translations, with the write-backs they feed): translations leave
+    /// front end 2's write marks out. Read when a stage is prepared.
+    pub fn write_marks() -> bool {
+        get(218) != 0
+    }
+
+    /// Front end 2 (default since 2026-10-30: +1.2% at the vista, tour
+    /// clean): a CP write the GPU performs that would need a
+    /// write-back first (a label no CP of ours waits on, after GPU work
+    /// that wrote the mirror) goes into the mirror in place and into guest
+    /// memory at the batch's close, after its one write-back, with the
+    /// batch's later CP writes in order (`Exec::gpu_cp_write`): title
+    /// threads see such labels when the batch's work is done and back in
+    /// guest memory, as if the GPU were slower.
+    pub fn fe2_cpw_defer() -> bool {
+        get(219) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

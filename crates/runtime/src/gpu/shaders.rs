@@ -1063,7 +1063,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Compute)),
         addresses: super::tune::addresses() || (super::tune::batch_cs() && batchable(addr)),
         batched: super::tune::batch_cs() && batchable(addr),
-        write_marks: super::resident::mirror_wanted() || super::fe2::wanted(),
+        write_marks: marks_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -1209,6 +1209,13 @@ fn early_ok(ctx: &dyn Fn(u32) -> u32) -> bool {
     super::tune::early_auto() && !exports && (!may_kill || !(z_write || s_write))
 }
 
+/// Translations mark the dwords their stores write for front end 2's
+/// write-back (and the mirror's); `tune write_marks 0` (timing only):
+/// unmarked, so GPU writes never reach guest memory.
+fn marks_wanted() -> bool {
+    (super::resident::mirror_wanted() || super::fe2::wanted()) && super::tune::write_marks()
+}
+
 /// Resolves and translates the pixel shader bound on `cp`.
 pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
     let sh = |i: u32| cp.sh(i);
@@ -1267,7 +1274,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Fragment)),
         addresses: super::tune::addresses() || batched_draw_now(),
         batched: batched_draw_now(),
-        write_marks: super::resident::mirror_wanted() || super::fe2::wanted(),
+        write_marks: marks_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -1446,7 +1453,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Vertex)),
         addresses: super::tune::addresses() || batched_draw_now(),
         batched: batched_draw_now(),
-        write_marks: super::resident::mirror_wanted() || super::fe2::wanted(),
+        write_marks: marks_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2180,7 +2187,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Vertex)),
         addresses: super::tune::addresses(),
         batched: false,
-        write_marks: super::resident::mirror_wanted() || super::fe2::wanted(),
+        write_marks: marks_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2223,7 +2230,7 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Fragment)),
         addresses: super::tune::addresses(),
         batched: false,
-        write_marks: super::resident::mirror_wanted() || super::fe2::wanted(),
+        write_marks: marks_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2266,7 +2273,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Compute)),
         addresses: super::tune::addresses() || (super::tune::batch_cs() && batchable(addr)),
         batched: super::tune::batch_cs() && batchable(addr),
-        write_marks: super::resident::mirror_wanted() || super::fe2::wanted(),
+        write_marks: marks_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
