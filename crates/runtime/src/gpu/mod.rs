@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 222] = [
+    static ALL: [Tunable; 223] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -255,6 +255,7 @@ pub mod tune {
         Tunable { name: "fe2_cpw_defer", env: "DS_FE2_CPW_DEFER", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "lod_late", env: "DS_LOD_LATE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lod_skip", env: "DS_LOD_SKIP", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "gpu_detile", env: "DS_GPU_DETILE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2412,6 +2413,20 @@ pub mod tune {
     /// 2026-10-30 midday); 0: every draw keeps them (the reference).
     pub fn lod_skip() -> bool {
         get(221) != 0
+    }
+
+    /// Front end 2 stage F4's first step: uploads of 2D and array textures
+    /// of at least N MiB detiled on the GPU (`images::Images::upload_gpu`):
+    /// the tiled bytes copied from the guest-memory import windows into
+    /// video memory, a kernel (`rdna::kernels::detile`) writing them as
+    /// packed rows, then copied into the image, submitted without waiting
+    /// (`images::Held`). No CPU detiling, staging or transfer waits; parts
+    /// are hashed as on the CPU path. Smaller textures stay on the CPU: the
+    /// title maps each texture apart, and importing them all (4,098 live
+    /// imports against 605 at Castlewall) slowed every span lookup. 0: all
+    /// detiled on the CPU.
+    pub fn gpu_detile() -> u64 {
+        get(222)
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

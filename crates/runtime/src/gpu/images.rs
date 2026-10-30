@@ -897,6 +897,22 @@ struct Staging {
     cap: u64,
 }
 
+/// What an upload in flight holds until the GPU is done with it: its host
+/// staging buffer, or the video-memory buffers its GPU detiling used.
+enum Held {
+    Staging(Staging),
+    Detile(Vec<(vk::Buffer, vk::DeviceMemory, u64)>),
+}
+
+impl Held {
+    fn bytes(&self) -> u64 {
+        match self {
+            Held::Staging(s) => s.cap,
+            Held::Detile(v) => v.iter().map(|b| b.2).sum(),
+        }
+    }
+}
+
 /// Staging buffers kept for reuse: up to this many bytes, each of at most
 /// STAGING_POOLED bytes (larger ones are made for their upload alone).
 /// None: a host-visible staging buffer kept after its upload made the
@@ -956,6 +972,63 @@ static UPLOAD_SPLIT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::ato
 /// mapping change before the reader lock), and those checked again with the
 /// operating system (`mem::table_view_held`).
 static UPLOAD_TABLE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// 2D uploads detiled on the GPU (`tune gpu_detile`): [uploads, (mip,
+/// layer)s, bytes copied from guest memory, bytes detiled, uploads left to
+/// the CPU (no import window), ns recording and waiting, (mip, layer)s
+/// compared with the CPU's detiling (`DS_GPU_DETILE_CHECK=1`), of them
+/// differing, of them whose guest bytes changed during the upload, video-
+/// memory buffers made].
+static GPU_DETILE: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// `DS_GPU_DETILE_CHECK=1`: every upload detiled on the GPU reads back the
+/// tiled bytes it copied and the rows it made; the CPU's detiling of that
+/// copy must give the same rows, (mip, layer) by (mip, layer), and guest
+/// bytes that differ from the copy changed during the upload.
+fn gpu_detile_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_GPU_DETILE_CHECK").ok().as_deref() == Some("1"))
+}
+
+/// Video-memory buffers kept for GPU detiling (tiled bytes, packed rows) up
+/// to this size each and DETILE_POOL in all; larger uploads make and free
+/// their own. Uploads detiled on the GPU are in flight (not waited for) with
+/// up to DETILE_INFLIGHT bytes of such buffers.
+const DETILE_KEEP: u64 = 128 << 20;
+const DETILE_POOL: u64 = 256 << 20;
+const DETILE_INFLIGHT: u64 = 512 << 20;
+
+struct DetilePipe {
+    pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+}
+
+/// The detiling kernel's pipeline (`rdna::kernels::detile`; push
+/// descriptors: binding 0 the tiled bytes, 1 the packed rows).
+fn detile_pipe() -> Result<&'static DetilePipe, String> {
+    static PIPE: std::sync::OnceLock<Result<DetilePipe, String>> = std::sync::OnceLock::new();
+    PIPE.get_or_init(|| unsafe {
+        let c = ctx();
+        let d = &c.device;
+        let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..2)
+            .map(|b| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
+            .collect();
+        let set_layout = d
+            .create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR).bindings(&bindings), None)
+            .map_err(|e| format!("detile set layout: {e}"))?;
+        let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 4 * rdna::kernels::DETILE_PC_WORDS as u32 }];
+        let layout = d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]).push_constant_ranges(&ranges), None).map_err(|e| format!("detile layout: {e}"))?;
+        let code = rdna::kernels::detile();
+        let module = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("detile module: {e}"))?;
+        let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+        let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
+        let pipeline = d.create_compute_pipelines(vk::PipelineCache::null(), &[ci], None).map_err(|(_, e)| format!("detile pipeline: {e}"));
+        d.destroy_shader_module(module, None);
+        Ok(DetilePipe { pipeline: pipeline?[0], layout })
+    })
+    .as_ref()
+    .map_err(|e| e.clone())
+}
 
 /// Hashes of (index, guest address, bytes) parts, `threads` groups at a
 /// time on the helper pool (`pool`).
@@ -1066,8 +1139,11 @@ pub struct Images {
     /// reads; oldest first) and the command buffers, fences and timestamps
     /// of completed ones.
     staging_free: Vec<Staging>,
-    inflight: std::collections::VecDeque<(vk::CommandBuffer, vk::Fence, vk::QueryPool, Staging)>,
+    inflight: std::collections::VecDeque<(vk::CommandBuffer, vk::Fence, vk::QueryPool, Held)>,
     spare_cmds: Vec<(vk::CommandBuffer, vk::Fence, vk::QueryPool)>,
+    /// GPU detiling's video-memory buffers not in use: (buffer, memory,
+    /// capacity).
+    detile_free: Vec<(vk::Buffer, vk::DeviceMemory, u64)>,
     reported: HashMap<String, u64>,
     pub uploads: u64,
     pub reuploads: u64,
@@ -1264,7 +1340,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
             let qp = upload_stamps();
-            *g = Some(Images { qp, map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), inflight: Default::default(), spare_cmds: Vec::new(), reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default() });
+            *g = Some(Images { qp, map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), inflight: Default::default(), spare_cmds: Vec::new(), detile_free: Vec::new(), reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default() });
         }
     }
     let im = g.as_mut().unwrap();
@@ -1379,7 +1455,7 @@ impl Images {
         while let Some(&(_, fence, _, _)) = self.inflight.front() {
             let done = unsafe { c.device.get_fence_status(fence) }.unwrap_or(true);
             if !done {
-                let bytes: u64 = self.inflight.iter().map(|x| x.3.cap).sum();
+                let bytes: u64 = self.inflight.iter().map(|x| x.3.bytes()).sum();
                 if self.inflight.len() <= max && bytes <= max_bytes {
                     break;
                 }
@@ -1393,14 +1469,20 @@ impl Images {
                     }
                 }
             }
-            let (cmd, fence, qp, s) = self.inflight.pop_front().unwrap();
-            note_upload_span(qp, || format!(": texture upload from a {} KiB staging buffer", s.cap >> 10));
+            let (cmd, fence, qp, held) = self.inflight.pop_front().unwrap();
+            note_upload_span(qp, || match &held {
+                Held::Staging(s) => format!(": texture upload from a {} KiB staging buffer", s.cap >> 10),
+                Held::Detile(v) => format!(": texture upload detiled on the GPU ({} KiB of buffers)", v.iter().map(|b| b.2).sum::<u64>() >> 10),
+            });
             unsafe {
                 c.device.reset_fences(&[fence]).ok();
                 c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
             }
             self.spare_cmds.push((cmd, fence, qp));
-            self.release_staging(s);
+            match held {
+                Held::Staging(s) => self.release_staging(s),
+                Held::Detile(v) => self.release_detile(v),
+            }
         }
     }
 
@@ -1409,7 +1491,13 @@ impl Images {
     /// before it and before batches submitted later, and its barriers order
     /// it against the image's other uses; `reap` recycles it.
     fn submit_upload(&mut self, s: Staging, f: impl FnOnce(vk::CommandBuffer)) {
-        self.reap(MAX_INFLIGHT - 1, MAX_INFLIGHT_BYTES.saturating_sub(s.cap));
+        self.submit_held(Held::Staging(s), MAX_INFLIGHT_BYTES, f);
+    }
+
+    /// `submit_upload` for what `s` holds, with up to `max_bytes` of such
+    /// buffers in flight.
+    fn submit_held(&mut self, s: Held, max_bytes: u64, f: impl FnOnce(vk::CommandBuffer)) {
+        self.reap(MAX_INFLIGHT - 1, max_bytes.saturating_sub(s.bytes()));
         let c = ctx();
         let (cmd, fence, qp) = match self.spare_cmds.pop() {
             Some(x) => x,
@@ -1432,7 +1520,10 @@ impl Images {
                     }
                     c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
                     self.spare_cmds.push((cmd, fence, qp));
-                    self.release_staging(s);
+                    match s {
+                        Held::Staging(s) => self.release_staging(s),
+                        Held::Detile(v) => self.release_detile(v),
+                    }
                 }
             }
         }
@@ -1676,6 +1767,287 @@ impl Images {
     }
 
     /// Uploads all mips/layers of a guest texture (detiled) into `image`.
+    /// A video-memory buffer of at least `size` bytes for GPU detiling: the
+    /// smallest free one large enough, else a new one (sizes rounded up to
+    /// powers of two up to DETILE_KEEP; larger ones exact and not kept).
+    fn detile_take(&mut self, size: u64) -> Result<(vk::Buffer, vk::DeviceMemory, u64), String> {
+        if let Some(i) = self.detile_free.iter().enumerate().filter(|(_, b)| b.2 >= size).min_by_key(|(_, b)| b.2).map(|(i, _)| i) {
+            return Ok(self.detile_free.swap_remove(i));
+        }
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+        let cap = if size > DETILE_KEEP { size } else { size.next_power_of_two().clamp(1 << 20, DETILE_KEEP) };
+        let t0 = std::time::Instant::now();
+        let (b, m) = ctx().device_buffer(cap, usage)?;
+        super::hitch::note_since(super::hitch::Kind::Upload, t0, || format!("a new GPU detiling buffer of {} MiB", cap >> 20));
+        GPU_DETILE[9].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok((b, m, cap))
+    }
+
+    /// GPU detiling buffers the GPU is done with: kept for reuse (up to
+    /// DETILE_POOL in all) or freed.
+    fn release_detile(&mut self, v: Vec<(vk::Buffer, vk::DeviceMemory, u64)>) {
+        for b in v {
+            let kept: u64 = self.detile_free.iter().map(|b| b.2).sum();
+            if b.2 <= DETILE_KEEP && kept + b.2 <= DETILE_POOL {
+                self.detile_free.push(b);
+                continue;
+            }
+            unsafe {
+                ctx().device.destroy_buffer(b.0, None);
+                ctx().device.free_memory(b.1, None);
+            }
+        }
+    }
+
+    /// The wanted, mapped (mip, layer)s `parts` of a 2D (array) texture
+    /// detiled on the GPU (`tune gpu_detile`): their tiled bytes copied from
+    /// the guest-memory import windows into video memory, detiled there into
+    /// packed rows (`rdna::kernels::detile`, the CPU detiler's addresses)
+    /// and copied into `image` with `part_regions` (one per part, in order;
+    /// their buffer offsets are replaced), the unmapped parts of a first
+    /// upload (`zeroed`) from a zero-filled area, the bytes read through the
+    /// import `windows` (start, end, buffer) made before the guest-reader
+    /// lock, which the caller holds (nothing here may take the mapping
+    /// table's lock). Submitted without waiting (`submit_held`; the GPU
+    /// reads guest memory later, through imports that outlive a remap until
+    /// settled, as front end 2's uploads do), or waited for with
+    /// `DS_GPU_DETILE_CHECK=1`. Err: nothing was recorded (the caller
+    /// detiles on the CPU). Returns the bytes detiled.
+    #[allow(clippy::too_many_arguments)]
+    fn upload_gpu(&mut self, image: vk::Image, first: bool, lay: &tiling::Layout, t: &Tsharp, block: bool, parts: &[(usize, u32, usize, usize)], zeroed: &[(usize, u32, usize)], part_regions: &[vk::BufferImageCopy], range: &dyn Fn(usize, u32) -> (u64, u64), windows: &[(u64, u64, vk::Buffer)]) -> Result<u64, String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        use rdna::kernels::{DETILE_LOCAL_SIZE, DETILE_PC_WORDS};
+        let t0 = std::time::Instant::now();
+        let pipe = detile_pipe()?;
+        let pat = tiling::pattern(lay.sw, lay.elem_log2).ok_or("no swizzle pattern")?;
+        let mut masks = [0u32; 16];
+        for (i, m) in masks.iter_mut().enumerate().take(lay.block_log2 as usize) {
+            *m = (pat[i] & 0xFFFF) as u32 | (((pat[i] >> 16) & 0xFFFF) as u32) << 16;
+        }
+        // The parts' tiled bytes, packed (a layer's mip-tail mips share its
+        // tail block).
+        let mut tiled: Vec<(u64, u64, u64)> = Vec::new();
+        let mut t_of: HashMap<u64, u64> = HashMap::default();
+        let mut t_total = 0u64;
+        let mut src_at = Vec::with_capacity(parts.len());
+        for &(mip, layer, _, _) in parts {
+            let (s, n) = range(mip, layer);
+            let at = match t_of.get(&s) {
+                Some(&at) => at,
+                None => {
+                    let at = t_total;
+                    tiled.push((t.base + s, n, at));
+                    t_of.insert(s, at);
+                    t_total = (t_total + n).next_multiple_of(256);
+                    at
+                }
+            };
+            src_at.push(at);
+        }
+        if t_total > u32::MAX as u64 {
+            return Err(format!("{t_total} tiled bytes"));
+        }
+        // Their copies from the import windows, split at window boundaries.
+        let mut copies: Vec<(vk::Buffer, vk::BufferCopy)> = Vec::new();
+        for &(g, n, at) in &tiled {
+            let end = g + n;
+            let mut x = g;
+            while x < end {
+                let &(start, wend, buf) = windows.iter().find(|&&(ws, we, _)| ws <= x && x < we).ok_or_else(|| format!("no import window over {x:#x}"))?;
+                let e = end.min(wend);
+                copies.push((buf, vk::BufferCopy { src_offset: x - start, dst_offset: at + (x - g), size: e - x }));
+                x = e;
+            }
+        }
+        // Packed rows at 16-byte offsets (whole dwords per part whatever the
+        // element size), then the zero area.
+        let mut l_at = Vec::with_capacity(parts.len());
+        let mut l_total = 0u64;
+        for &(_, _, _, len) in parts {
+            l_at.push(l_total);
+            l_total = (l_total + len as u64).next_multiple_of(16);
+        }
+        let zero_len = zeroed.iter().map(|z| z.2 as u64).max().unwrap_or(0).next_multiple_of(16);
+        let zero_at = l_total;
+        l_total += zero_len;
+        let mut regions: Vec<vk::BufferImageCopy> = part_regions.iter().zip(&l_at).map(|(r, &o)| r.buffer_offset(o)).collect();
+        for &(mip, layer, _) in zeroed {
+            let m = &lay.mips[mip];
+            regions.push(
+                vk::BufferImageCopy::default()
+                    .buffer_offset(zero_at)
+                    .buffer_row_length(if block { m.width * 4 } else { m.width })
+                    .buffer_image_height(if block { m.height * 4 } else { m.height })
+                    .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: mip as u32, base_array_layer: layer, layer_count: 1 })
+                    .image_extent(vk::Extent3D { width: m.texel_w, height: m.texel_h, depth: 1 }),
+            );
+        }
+        // Each part's dispatch: its push constants and grid.
+        let (lw, lh) = (lay.block_w.trailing_zeros(), lay.block_h.trailing_zeros());
+        let mut dispatches: Vec<(Vec<u8>, u32, u32)> = Vec::with_capacity(parts.len());
+        let mut detiled = 0u64;
+        for (i, &(mip, _, _, len)) in parts.iter().enumerate() {
+            let m = &lay.mips[mip];
+            let (tx, ty) = m.tail.unwrap_or((0, 0));
+            let count = (len as u64).div_ceil(4);
+            let groups = count.div_ceil(DETILE_LOCAL_SIZE as u64).max(1);
+            let gx = groups.min(65535);
+            let gy = groups.div_ceil(gx);
+            let mut pc = [0u32; DETILE_PC_WORDS];
+            pc[0] = src_at[i] as u32;
+            pc[1] = (l_at[i] / 4) as u32;
+            pc[2] = m.width;
+            pc[3] = m.height;
+            pc[4] = tx;
+            pc[5] = ty;
+            pc[6] = (m.pitch / lay.block_w).max(1);
+            pc[7] = lay.block_log2 | lw << 8 | lh << 16 | lay.elem_log2 << 24;
+            pc[8] = count as u32;
+            pc[9] = (gx * DETILE_LOCAL_SIZE as u64) as u32;
+            pc[10] = t_total as u32;
+            pc[12..28].copy_from_slice(&masks);
+            dispatches.push((pc.iter().flat_map(|w| w.to_le_bytes()).collect(), gx as u32, gy as u32));
+            detiled += len as u64;
+        }
+        let c = ctx();
+        let tbuf = self.detile_take(t_total.max(256))?;
+        let lbuf = match self.detile_take(l_total.max(16)) {
+            Ok(b) => b,
+            Err(e) => {
+                self.release_detile(vec![tbuf]);
+                return Err(e);
+            }
+        };
+        let (tb, lb) = (tbuf.0, lbuf.0);
+        // (Rows, then the tiled bytes.)
+        let readback = if gpu_detile_check() {
+            match c.host_buffer(l_total.max(16) + t_total.max(256), vk::BufferUsageFlags::TRANSFER_DST) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    self.release_detile(vec![tbuf, lbuf]);
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+        let rb = readback.as_ref().map(|r| r.0);
+        let rows_bytes = l_total.max(16);
+        let base = t.base;
+        let record = |cmd: vk::CommandBuffer| unsafe {
+            super::vk::checkpoint(cmd, super::vk::mark::UPLOAD, base);
+            let b = vk::ImageMemoryBarrier::default()
+                .old_layout(if first { vk::ImageLayout::UNDEFINED } else { vk::ImageLayout::GENERAL })
+                .new_layout(vk::ImageLayout::GENERAL)
+                .image(image)
+                .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS })
+                .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[b]);
+            let mut k = 0;
+            while k < copies.len() {
+                let src = copies[k].0;
+                let mut regs = Vec::new();
+                while k < copies.len() && copies[k].0 == src {
+                    regs.push(copies[k].1);
+                    k += 1;
+                }
+                c.device.cmd_copy_buffer(cmd, src, tb, &regs);
+            }
+            if zero_len > 0 {
+                c.device.cmd_fill_buffer(cmd, lb, zero_at, zero_len, 0);
+            }
+            let m = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[m], &[], &[]);
+            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe.pipeline);
+            let ti = [vk::DescriptorBufferInfo { buffer: tb, offset: 0, range: vk::WHOLE_SIZE }];
+            let li = [vk::DescriptorBufferInfo { buffer: lb, offset: 0, range: vk::WHOLE_SIZE }];
+            let w = [
+                vk::WriteDescriptorSet::default().dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&ti),
+                vk::WriteDescriptorSet::default().dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&li),
+            ];
+            c.push_desc.cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::COMPUTE, pipe.layout, 0, &w);
+            for (pc, gx, gy) in &dispatches {
+                c.device.cmd_push_constants(cmd, pipe.layout, vk::ShaderStageFlags::COMPUTE, 0, pc);
+                c.device.cmd_dispatch(cmd, *gx, *gy, 1);
+            }
+            let m = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[m], &[], &[]);
+            if let Some(rb) = rb {
+                c.device.cmd_copy_buffer(cmd, lb, rb, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: l_total.max(16) }]);
+                c.device.cmd_copy_buffer(cmd, tb, rb, &[vk::BufferCopy { src_offset: 0, dst_offset: rows_bytes, size: t_total.max(256) }]);
+                let h = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+                c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[h], &[], &[]);
+            }
+            c.device.cmd_copy_buffer_to_image(cmd, lb, image, vk::ImageLayout::GENERAL, &regions);
+            let a = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[a], &[], &[]);
+        };
+        // Submitted without waiting (the one queue runs it after the work
+        // submitted before and before batches submitted later; its barriers
+        // order it against the image's other uses), unless checked.
+        if readback.is_some() {
+            self.one_shot(record);
+            self.release_detile(vec![tbuf, lbuf]);
+        } else {
+            self.submit_held(Held::Detile(vec![tbuf, lbuf]), DETILE_INFLIGHT, record);
+        }
+        // DS_GPU_DETILE_CHECK=1: each part against the CPU's detiling of the
+        // tiled bytes the GPU copied (laid out at their texture offsets).
+        if let Some((rbuf, rmem, rptr)) = readback {
+            let got = unsafe { std::slice::from_raw_parts(rptr, l_total as usize) };
+            let copied = unsafe { std::slice::from_raw_parts(rptr.add(rows_bytes as usize), t_total as usize) };
+            let end = tiled.iter().map(|&(g, n, _)| g + n - t.base).max().unwrap_or(0);
+            let mut src = vec![0u8; end as usize];
+            let mut changed = 0u64;
+            for &(g, n, at) in &tiled {
+                let (s, n) = ((g - t.base) as usize, n as usize);
+                let mine = &copied[at as usize..at as usize + n];
+                src[s..s + n].copy_from_slice(mine);
+                if unsafe { std::slice::from_raw_parts(g as *const u8, n) } != mine {
+                    changed += 1;
+                }
+            }
+            GPU_DETILE[8].fetch_add(changed, Relaxed);
+            let mut differ = 0u64;
+            for (i, &(mip, layer, _, len)) in parts.iter().enumerate() {
+                let mut want = vec![0u8; len];
+                lay.detile_into(&src, mip, layer, &mut want);
+                let have = &got[l_at[i] as usize..l_at[i] as usize + len];
+                if want != have {
+                    differ += 1;
+                    if GPU_DETILE[7].load(Relaxed) + differ <= 8 {
+                        let at = want.iter().zip(have).position(|(a, b)| a != b).unwrap_or(0);
+                        let m = &lay.mips[mip];
+                        crate::warn!(
+                            "images: GPU detiling of {:#x} {:?} mip {mip} layer {layer} ({}x{} elements of {} bytes, swizzle {}, tail {:?}) differs from the CPU's at byte {at} of {len}",
+                            t.base,
+                            t.format,
+                            m.width,
+                            m.height,
+                            1u32 << lay.elem_log2,
+                            lay.sw,
+                            m.tail
+                        );
+                    }
+                }
+            }
+            GPU_DETILE[6].fetch_add(parts.len() as u64, Relaxed);
+            GPU_DETILE[7].fetch_add(differ, Relaxed);
+            unsafe {
+                c.device.destroy_buffer(rbuf, None);
+                c.device.unmap_memory(rmem);
+                c.device.free_memory(rmem, None);
+            }
+        }
+        GPU_DETILE[0].fetch_add(1, Relaxed);
+        GPU_DETILE[1].fetch_add(parts.len() as u64, Relaxed);
+        GPU_DETILE[2].fetch_add(tiled.iter().map(|x| x.1).sum::<u64>(), Relaxed);
+        GPU_DETILE[3].fetch_add(detiled, Relaxed);
+        GPU_DETILE[5].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+        Ok(detiled)
+    }
+
     fn upload(&mut self, image: vk::Image, key: ImageKey, t: &Tsharp) -> Result<(u64, u64), String> {
         self.upload_parts(image, key, t, None, true)
     }
@@ -1711,6 +2083,11 @@ impl Images {
             self.report(format!("texture with XOR swizzle mode {} uploaded with an assumed pipe count (2^{})", t.sw_mode, tiling::pipes_log2()));
         }
         let size = lay.size(layers);
+        // GPU detiling for textures of at least `tune gpu_detile` MiB.
+        let gpu = match super::tune::gpu_detile() {
+            0 => false,
+            n => size >= n << 20,
+        };
         // Guest memory where a video-memory home holds newer GPU-written data
         // (`homes`): this upload reads the older bytes (diagnostics).
         if super::homes::any() && super::homes::any_stale(&[(t.base, size)]) {
@@ -1781,6 +2158,34 @@ impl Images {
                 })
                 .collect()
         };
+        // GPU detiling: the import windows over the mapped parts, made now
+        // (making one takes the mapping table's lock, which the guest-reader
+        // lock's holders must not: decommits hold it while they wait for
+        // them).
+        let mut windows: Vec<(u64, u64, vk::Buffer)> = Vec::new();
+        if gpu {
+            for i in 0..n_parts {
+                if !(table_whole || table_parts[i]) {
+                    continue;
+                }
+                let (s, n) = range(i / layers as usize, (i % layers as usize) as u32);
+                let (mut x, end) = (t.base + s, t.base + s + n);
+                while x < end {
+                    if let Some(&(_, we, _)) = windows.iter().find(|&&(ws, we, _)| ws <= x && x < we) {
+                        x = we.min(end);
+                        continue;
+                    }
+                    let e = ((x & !(super::exec::WINDOW - 1)) + super::exec::WINDOW).min(end);
+                    match super::exec::import_window(x, e - x) {
+                        Some((b, ws, we)) if ws <= x && e <= we => {
+                            windows.push((ws, we, b));
+                            x = we.min(end);
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
         let t_table = std::time::Instant::now();
         let readers = crate::mem::GUEST_READERS.read();
         let t_locked = std::time::Instant::now();
@@ -1983,6 +2388,51 @@ impl Images {
         let zero_len = zeroed.iter().map(|z| z.2).max().unwrap_or(0);
         let (detiled, zero_off) = (total, total);
         total += zero_len;
+        // (Only while no mapping changed since the windows were made.)
+        if gpu && held {
+            match self.upload_gpu(image, first, &lay, t, block, &parts, &zeroed, &regions, &range, &windows) {
+                Ok(bytes) => {
+                    // A first upload's sums, as the CPU path makes them (a
+                    // part rewritten with the same bytes is left out later).
+                    if sums_on && first {
+                        let todo: Vec<(usize, u64, u64)> = parts
+                            .iter()
+                            .map(|&(mip, layer, _, _)| {
+                                let (s, n) = range(mip, layer);
+                                (mip * layers as usize + layer as usize, t.base + s, n)
+                            })
+                            .collect();
+                        let threads = if bytes >= 1 << 20 { super::pool::threads() } else { 1 };
+                        for (i, h) in hash_parts(&todo, threads) {
+                            sums[i] = h;
+                        }
+                    }
+                    drop(readers);
+                    if sums_on {
+                        SUB_SUMS.lock().get_or_insert_with(HashMap::default).insert(key, sums);
+                    }
+                    UPLOAD_SPLIT[0].fetch_add(t_detile.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    DETILED.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+                    if precise {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        PART_UPLOADS[0].fetch_add(1, Relaxed);
+                        PART_UPLOADS[1].fetch_add(parts_done, Relaxed);
+                        PART_UPLOADS[2].fetch_add(parts_left, Relaxed);
+                        PART_UPLOADS[3].fetch_add(bytes, Relaxed);
+                    }
+                    if skipped > 0 {
+                        self.report(format!("partially resident texture: {skipped} (mip, layer) not mapped, {}", if first { "zero-filled" } else { "left as they were" }));
+                    }
+                    self.uploads += 1;
+                    return Ok((t.base, size));
+                }
+                Err(e) => {
+                    if GPU_DETILE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                        crate::warn!("images: texture {:#x} {}x{}x{} {:?} detiled on the CPU: {e}", t.base, key.width, key.height, layers, t.format);
+                    }
+                }
+            }
+        }
         let asynchronous = super::tune::upload_async();
         let st = if asynchronous {
             self.staging(total.max(4) as u64)?
@@ -3927,8 +4377,15 @@ impl Images {
         } else {
             String::new()
         };
+        let g: Vec<u64> = GPU_DETILE.iter().map(|c| c.load(Relaxed)).collect();
+        let gpu = if g[0] + g[4] > 0 {
+            let checked = if gpu_detile_check() { format!(", {} (mip, layer)s compared with the CPU's detiling of the bytes copied, {} differing, {} tiled ranges changed in guest memory during their upload", g[6], g[7], g[8]) } else { String::new() };
+            format!("; detiled on the GPU: {} uploads ({} (mip, layer)s, {} MiB copied, {} MiB detiled, {} ms recording and submitting them; video-memory buffers made {}), {} left to the CPU{checked}", g[0], g[1], g[2] >> 20, g[3] >> 20, g[5] / 1_000_000, g[9], g[4])
+        } else {
+            String::new()
+        };
         format!(
-            "    images: {} cached ({} MiB; GPU-written {} ({} MiB), kept for the session; {} textures evicted, {} MiB, in {} rounds), {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; staging buffers made {}, waits for uploads in flight {}; pages checked in the mapping table {}, again with the operating system {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages, {} found clean by a probe); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}\n",
+            "    images: {} cached ({} MiB; GPU-written {} ({} MiB), kept for the session; {} textures evicted, {} MiB, in {} rounds), {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; staging buffers made {}, waits for uploads in flight {}; pages checked in the mapping table {}, again with the operating system {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages, {} found clean by a probe); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}{gpu}\n",
             self.map.len(),
             IMAGE_BYTES.load(Relaxed) >> 20,
             self.map.values().filter(|i| i.gpu_written).count(),

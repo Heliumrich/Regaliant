@@ -1180,6 +1180,16 @@ fn build_timestamp_many() -> Result<Vec<u32>, rspirv::dr::Error> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn detile_kernel_assembles() {
+        let w = super::detile();
+        assert_eq!(w[0], 0x0723_0203);
+        if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("detile.spv"), bytes).unwrap();
+        }
+    }
+
+    #[test]
     fn timestamp_many_kernel_assembles() {
         let w = super::timestamp_store_many();
         assert_eq!(w[0], 0x0723_0203);
@@ -1257,6 +1267,198 @@ mod tests {
             std::fs::write(std::path::Path::new(&dir).join("resident_merge.spv"), bytes).unwrap();
         }
     }
+}
+
+/// Workgroup size of `detile`.
+pub const DETILE_LOCAL_SIZE: u32 = 64;
+/// Push-constant words of `detile` (112 bytes, under the guaranteed 128).
+pub const DETILE_PC_WORDS: usize = 28;
+
+/// Texture detiling on the GPU (front end 2 stage F4): one (mip, layer) of a
+/// gfx10 thin surface, tiled in binding 0 (u32 words from the part's start
+/// at byte `src_off`), written to binding 1 as tightly packed rows of
+/// elements from dword `dst_off`. Invocation o (row `gid.y` of `stride`
+/// invocations) writes output dword o < `count`. An element's byte offset
+/// is `src_off` + its block's ((y >> lh) * pitch_blocks + (x >> lw)) <<
+/// block_log2 + the XOR over address bits i of the parities of x mask_i &
+/// (x % bw) and y mask_i & (y % bh) (the CPU detiler's `xs[x] ^ ys[y]`),
+/// with (x, y) the element's coordinates plus the mip-tail offsets (tx,
+/// ty); bytes from `src_len` (a multiple of 4) on read as zero. Push constants: {src_off,
+/// dst_off, w, h, tx, ty, pitch_blocks, block_log2 | lw << 8 | lh << 16 |
+/// elem_log2 << 24, count, stride, src_len, 0, then per address bit i < 16
+/// x mask | y mask << 16}.
+pub fn detile() -> Vec<u32> {
+    build_detile().expect("detile kernel")
+}
+
+fn build_detile() -> Result<Vec<u32>, rspirv::dr::Error> {
+    let lit = Operand::LiteralBit32;
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.extension("SPV_KHR_storage_buffer_storage_class");
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+    let void = b.type_void();
+    let bool_ = b.type_bool();
+    let u32t = b.type_int(32, 0);
+    let v3 = b.type_vector(u32t, 3);
+    let rta = b.type_runtime_array(u32t);
+    b.decorate(rta, Decoration::ArrayStride, [lit(4)]);
+    let st = b.type_struct([rta]);
+    b.decorate(st, Decoration::Block, []);
+    b.member_decorate(st, 0, Decoration::Offset, [lit(0)]);
+    let p_st = b.type_pointer(None, StorageClass::StorageBuffer, st);
+    let p_u = b.type_pointer(None, StorageClass::StorageBuffer, u32t);
+    let pc = b.type_struct(vec![u32t; DETILE_PC_WORDS]);
+    b.decorate(pc, Decoration::Block, []);
+    for i in 0..DETILE_PC_WORDS as u32 {
+        b.member_decorate(pc, i, Decoration::Offset, [lit(4 * i)]);
+    }
+    let p_pc = b.type_pointer(None, StorageClass::PushConstant, pc);
+    let p_pcu = b.type_pointer(None, StorageClass::PushConstant, u32t);
+    let p_in = b.type_pointer(None, StorageClass::Input, v3);
+    let gid = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(gid, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let src = global(&mut b, p_st, StorageClass::StorageBuffer);
+    b.decorate(src, Decoration::DescriptorSet, [lit(0)]);
+    b.decorate(src, Decoration::Binding, [lit(0)]);
+    b.decorate(src, Decoration::NonWritable, []);
+    let dst = global(&mut b, p_st, StorageClass::StorageBuffer);
+    b.decorate(dst, Decoration::DescriptorSet, [lit(0)]);
+    b.decorate(dst, Decoration::Binding, [lit(1)]);
+    let pcv = global(&mut b, p_pc, StorageClass::PushConstant);
+    let k: Vec<Word> = (0..=32).map(|i| b.constant_bit32(u32t, i)).collect();
+    let kff = b.constant_bit32(u32t, 0xFF);
+    let kffff = b.constant_bit32(u32t, 0xFFFF);
+    let fty = b.type_function(void, []);
+    let f = b.begin_function(void, None, FunctionControl::NONE, fty)?;
+    b.begin_block(None)?;
+    let mut pcw = Vec::with_capacity(DETILE_PC_WORDS);
+    for i in 0..DETILE_PC_WORDS {
+        let p = b.access_chain(p_pcu, None, pcv, [k[i]])?;
+        pcw.push(b.load(u32t, None, p, None, [])?);
+    }
+    let (src_off, dst_off, w, h, tx, ty, pitch, shifts, count, stride, src_len) = (pcw[0], pcw[1], pcw[2], pcw[3], pcw[4], pcw[5], pcw[6], pcw[7], pcw[8], pcw[9], pcw[10]);
+    let g = b.load(v3, None, gid, None, [])?;
+    let gx = b.composite_extract(u32t, None, g, [0])?;
+    let gy = b.composite_extract(u32t, None, g, [1])?;
+    let row = b.i_mul(u32t, None, gy, stride)?;
+    let o = b.i_add(u32t, None, row, gx)?;
+    let inside = b.u_less_than(bool_, None, o, count)?;
+    let (l_body, l_end) = (b.id(), b.id());
+    b.selection_merge(l_end, SelectionControl::NONE)?;
+    b.branch_conditional(inside, l_body, l_end, [])?;
+    b.begin_block(Some(l_body))?;
+    let bl = b.bitwise_and(u32t, None, shifts, kff)?;
+    let s8 = b.shift_right_logical(u32t, None, shifts, k[8])?;
+    let lw = b.bitwise_and(u32t, None, s8, kff)?;
+    let s16 = b.shift_right_logical(u32t, None, shifts, k[16])?;
+    let lh = b.bitwise_and(u32t, None, s16, kff)?;
+    let e = b.shift_right_logical(u32t, None, shifts, k[24])?;
+    let bw = b.shift_left_logical(u32t, None, k[1], lw)?;
+    let mw = b.i_sub(u32t, None, bw, k[1])?;
+    let bh = b.shift_left_logical(u32t, None, k[1], lh)?;
+    let mh = b.i_sub(u32t, None, bh, k[1])?;
+    let total = b.i_mul(u32t, None, w, h)?;
+    // Byte offset of element `el` in binding 0.
+    let offset = |b: &mut Builder, el: Word| -> Result<Word, rspirv::dr::Error> {
+        let x = b.u_mod(u32t, None, el, w)?;
+        let y = b.u_div(u32t, None, el, w)?;
+        let x = b.i_add(u32t, None, x, tx)?;
+        let y = b.i_add(u32t, None, y, ty)?;
+        let by = b.shift_right_logical(u32t, None, y, lh)?;
+        let bx = b.shift_right_logical(u32t, None, x, lw)?;
+        let r = b.i_mul(u32t, None, by, pitch)?;
+        let blk = b.i_add(u32t, None, r, bx)?;
+        let blk = b.shift_left_logical(u32t, None, blk, bl)?;
+        let xm = b.bitwise_and(u32t, None, x, mw)?;
+        let ym = b.bitwise_and(u32t, None, y, mh)?;
+        let mut inner = k[0];
+        for i in 0..16 {
+            let m = pcw[12 + i];
+            let mx = b.bitwise_and(u32t, None, m, kffff)?;
+            let my = b.shift_right_logical(u32t, None, m, k[16])?;
+            let ax = b.bitwise_and(u32t, None, mx, xm)?;
+            let ay = b.bitwise_and(u32t, None, my, ym)?;
+            let cx = b.bit_count(u32t, None, ax)?;
+            let cy = b.bit_count(u32t, None, ay)?;
+            let c = b.i_add(u32t, None, cx, cy)?;
+            let p = b.bitwise_and(u32t, None, c, k[1])?;
+            let p = b.shift_left_logical(u32t, None, p, k[i])?;
+            inner = b.bitwise_or(u32t, None, inner, p)?;
+        }
+        let off = b.i_add(u32t, None, src_off, blk)?;
+        b.i_add(u32t, None, off, inner)
+    };
+    // The dword holding byte `off` (0 when that dword is not below
+    // `src_len`, a multiple of 4, or when `ok` is false).
+    let src_words = b.shift_right_logical(u32t, None, src_len, k[2])?;
+    let word_at = |b: &mut Builder, off: Word, ok: Word| -> Result<Word, rspirv::dr::Error> {
+        let idx = b.shift_right_logical(u32t, None, off, k[2])?;
+        let inb = b.u_less_than(bool_, None, idx, src_words)?;
+        let inb = b.logical_and(bool_, None, inb, ok)?;
+        let idx = b.select(u32t, None, inb, idx, k[0])?;
+        let p = b.access_chain(p_u, None, src, [k[0], idx])?;
+        let v = b.load(u32t, None, p, None, [])?;
+        b.select(u32t, None, inb, v, k[0])
+    };
+    let wide = b.u_greater_than_equal(bool_, None, e, k[2])?;
+    let (l_wide, l_narrow, l_join) = (b.id(), b.id(), b.id());
+    b.selection_merge(l_join, SelectionControl::NONE)?;
+    b.branch_conditional(wide, l_wide, l_narrow, [])?;
+    // Elements of 4, 8 or 16 bytes: dword (o mod n) of element o / n, n
+    // their dwords.
+    b.begin_block(Some(l_wide))?;
+    let q = b.i_sub(u32t, None, e, k[2])?;
+    let el = b.shift_right_logical(u32t, None, o, q)?;
+    let n = b.shift_left_logical(u32t, None, k[1], q)?;
+    let nm = b.i_sub(u32t, None, n, k[1])?;
+    let kd = b.bitwise_and(u32t, None, o, nm)?;
+    let kb = b.shift_left_logical(u32t, None, kd, k[2])?;
+    let base = offset(&mut b, el)?;
+    let off = b.i_add(u32t, None, base, kb)?;
+    let ok = b.u_less_than(bool_, None, el, total)?;
+    let v_wide = word_at(&mut b, off, ok)?;
+    b.branch(l_join)?;
+    // Elements of 1 or 2 bytes: the 4 >> e elements from o << (2 - e).
+    b.begin_block(Some(l_narrow))?;
+    let per = b.shift_right_logical(u32t, None, k[4], e)?;
+    let sh = b.i_sub(u32t, None, k[2], e)?;
+    let first = b.shift_left_logical(u32t, None, o, sh)?;
+    let bits = b.shift_left_logical(u32t, None, k[8], e)?;
+    let one_bits = b.shift_left_logical(u32t, None, k[1], bits)?;
+    let emask = b.i_sub(u32t, None, one_bits, k[1])?;
+    let e3 = b.i_add(u32t, None, e, k[3])?;
+    let mut acc = k[0];
+    for j in 0..4 {
+        let el = b.i_add(u32t, None, first, k[j])?;
+        let in_word = b.u_less_than(bool_, None, k[j], per)?;
+        let in_part = b.u_less_than(bool_, None, el, total)?;
+        let ok = b.logical_and(bool_, None, in_word, in_part)?;
+        let off = offset(&mut b, el)?;
+        let wd = word_at(&mut b, off, ok)?;
+        let lo = b.bitwise_and(u32t, None, off, k[3])?;
+        let lo = b.shift_left_logical(u32t, None, lo, k[3])?;
+        let v = b.shift_right_logical(u32t, None, wd, lo)?;
+        let v = b.bitwise_and(u32t, None, v, emask)?;
+        let at = b.shift_left_logical(u32t, None, k[j], e3)?;
+        let v = b.shift_left_logical(u32t, None, v, at)?;
+        acc = b.bitwise_or(u32t, None, acc, v)?;
+    }
+    let v_narrow = acc;
+    b.branch(l_join)?;
+    b.begin_block(Some(l_join))?;
+    let v = b.phi(u32t, None, [(v_wide, l_wide), (v_narrow, l_narrow)])?;
+    let di = b.i_add(u32t, None, dst_off, o)?;
+    let pd = b.access_chain(p_u, None, dst, [k[0], di])?;
+    b.store(pd, v, None, [])?;
+    b.branch(l_end)?;
+    b.begin_block(Some(l_end))?;
+    b.ret()?;
+    b.end_function()?;
+    b.entry_point(ExecutionModel::GLCompute, f, "main", [gid]);
+    b.execution_mode(f, ExecutionMode::LocalSize, [DETILE_LOCAL_SIZE, 1, 1]);
+    Ok(b.module().assemble())
 }
 
 /// Workgroup size of `latency_test`.

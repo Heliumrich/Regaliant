@@ -1038,6 +1038,13 @@ pub(super) fn mm_place_line() -> String {
 /// that asked for them.
 static MM_IMPORT_REFUSED: Mutex<Option<HashMap<(&'static str, u32), u64>>> = Mutex::new(None);
 
+/// The import window over guest [base, base+size) for a texture upload read
+/// on the GPU (`images`, `tune gpu_detile`): (buffer, window start, window
+/// end), None when it cannot be imported.
+pub(super) fn import_window(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
+    span(base, size)
+}
+
 /// Imported buffer covering guest [base, base+size): (buffer, window start, window end).
 #[track_caller]
 fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
