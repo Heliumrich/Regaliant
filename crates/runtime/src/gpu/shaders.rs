@@ -1868,6 +1868,23 @@ fn translate_kept(addr: u64, insts: &[rdna::Inst], plan: &Arc<Plan>, plan_key: u
     if ms >= 100 {
         crate::info!("{:?} shader {addr:#x}: translated in {ms} ms ({} instructions, {} SPIR-V words)", spec.stage, insts.len(), out.spirv.len());
     }
+    // Diagnosis (`DS_TRANSLATE_STATS=1`): every translation's size and the
+    // spec's lane model, for a census of the costliest programs.
+    static STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *STATS.get_or_init(|| std::env::var("DS_TRANSLATE_STATS").ok().as_deref() == Some("1")) {
+        crate::info!(
+            "translate stats: {:?} shader {addr:#x}: {} instructions -> {} SPIR-V words ({:.1} per instruction; wave64 {}, per lane {}, lane votes {}, local size {:?}, {} resources)",
+            spec.stage,
+            insts.len(),
+            out.spirv.len(),
+            out.spirv.len() as f64 / insts.len().max(1) as f64,
+            spec.wave64,
+            spec.per_lane,
+            spec.lane_votes,
+            spec.cs_local_size,
+            plan.resources.len()
+        );
+    }
     // Large translations compile for seconds on first use (play stalled
     // 0.5-3.4 s per effect shader, FINDINGS.md 2026-10-14): each logged
     // once, its program saved.
