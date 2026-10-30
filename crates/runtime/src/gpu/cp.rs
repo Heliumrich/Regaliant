@@ -7231,7 +7231,13 @@ impl Cp {
                 } else {
                     String::new()
                 };
-                let history = if a != 0 { format!("; recorded writes {}; label history:{}", label_writes(a), label_history(a, 16)) } else { String::new() };
+                let mut history = if a != 0 { format!("; recorded writes {}; label history:{}", label_writes(a), label_history(a, 16)) } else { String::new() };
+                // (Every queue's state, and this queue's batch: a cycle
+                // through CP writes' guest copies held for batch closes,
+                // `tune fe2_cpw_defer`.)
+                let states: Vec<String> = STATE.lock().iter().map(|(n, s)| format!("{n}: {s}")).collect();
+                let own = self.exec.as_ref().map(|e| e.wait_report()).unwrap_or_default();
+                history.push_str(&format!("; completed through {}; this queue: {own}; queues: {}", super::exec::completed_seq(), states.join(" | ")));
                 crate::warn!("gpu[{}]: waiting > 3 s: {what}{}{detail}{history}", self.name, if marker.is_empty() { String::new() } else { format!(" (marker '{marker}')") });
             }
         }

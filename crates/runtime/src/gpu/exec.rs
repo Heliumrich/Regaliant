@@ -6859,7 +6859,7 @@ pub struct Exec {
     fe2_marked: bool,
     /// Guest-memory copies of GPU-performed CP writes left for the batch's
     /// close, in order (`tune fe2_cpw_defer`): import, offset, bytes.
-    fe2_host_later: Vec<(vk::Buffer, u64, Vec<u8>)>,
+    fe2_host_later: Vec<(vk::Buffer, u64, Vec<u8>, u64)>,
     fe2_gens: Vec<u32>,
     /// Runs the batch's bindings left to check at its close
     /// (`fe2::resolve`), and their pages (the batch's own meanwhile).
@@ -8623,6 +8623,9 @@ impl Exec {
         unsafe { ctx().device.end_command_buffer(self.cmd()).ok() };
         self.actions.clear();
         self.gpu_writes_open = false;
+        if !self.fe2_host_later.is_empty() && !super::shutting_down() {
+            crate::warn!("gpu[{}]: batch discarded with {} CP writes' guest copies left for its close", self.name, self.fe2_host_later.len());
+        }
         self.fe2_host_later.clear();
         self.checks.clear();
         self.race_pending.clear();
@@ -9469,6 +9472,22 @@ impl Exec {
         }
     }
 
+    /// A long wait's report (`Cp::poll_until_wake`): the recording batch
+    /// and what it holds for its close.
+    pub fn wait_report(&self) -> String {
+        format!(
+            "recording {}, held {}, past {}, guest copies for the close {}, promises {}, held promises {}, submit after #{}, last #{}",
+            self.recording,
+            self.held,
+            self.past,
+            self.fe2_host_later.len(),
+            self.pending_promises.len(),
+            self.held_promises.len(),
+            self.submit_after,
+            self.last_seq
+        )
+    }
+
     /// Records the guest-memory copies of CP writes left for the batch's
     /// close (`tune fe2_cpw_defer`), after all its work.
     fn record_host_later(&mut self) {
@@ -9477,8 +9496,20 @@ impl Exec {
         let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
         unsafe {
             ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
-            for (buf, off, raw) in &later {
-                ctx().device.cmd_update_buffer(cmd, *buf, *off, raw);
+            for (buf, off, raw, a) in &later {
+                // Through the import over the address now: the one the write
+                // saw can be replaced before the close (20 times in a boot
+                // on the label pages at 0x1016fff000, FINDINGS.md
+                // 2026-10-30 morning), and a copy into it never reaches the
+                // guest's pages.
+                let (b, o) = match span(*a, raw.len() as u64) {
+                    Some((nb, st, _)) => (nb, a - st),
+                    None => {
+                        crate::warn!("gpu[{}]: a CP write's guest copy at {a:#x}: no import at the batch's close (written through the one it saw)", self.name);
+                        (*buf, *off)
+                    }
+                };
+                ctx().device.cmd_update_buffer(cmd, b, o, raw);
             }
         }
     }
@@ -11413,9 +11444,10 @@ impl Exec {
             None
         };
         // (Every one with a mirror copy deferred, so that the batch's
-        // end-of-pipe timestamps are stored once, deadlocked a boot: every
-        // queue waited on labels the graphics queue's batch held for its
-        // close, FINDINGS.md 2026-10-30 morning.)
+        // end-of-pipe timestamps are stored once, deadlocked two of five
+        // boots: the graphics CP's self-drain waits, after their batch had
+        // completed and its promise was gone, found the label rewritten,
+        // FINDINGS.md 2026-10-30 morning.)
         let would_scatter = self.fe2_marked && !(super::tune::fe2_cpw_close() || (waited && super::tune::fe2_cpw_waited()));
         let host_later = super::tune::fe2_cpw_defer() && fe2_mirror.is_some() && (would_scatter || !self.fe2_host_later.is_empty());
         if !(waited && super::tune::ts_cpw_waited()) && !host_later {
@@ -11443,7 +11475,7 @@ impl Exec {
         let raw: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
         if host_later {
             SCATTER_SITES[5].fetch_add(1, Ordering::Relaxed);
-            self.fe2_host_later.push((buffer, a - start, raw.clone()));
+            self.fe2_host_later.push((buffer, a - start, raw.clone(), a));
         }
         let to_mirror = |cmd: vk::CommandBuffer| {
             if let Some((m, off)) = fe2_mirror {
