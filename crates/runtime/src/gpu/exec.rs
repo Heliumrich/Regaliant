@@ -1608,7 +1608,7 @@ fn spec_diff(a: &rdna::translate::Spec, b: &rdna::translate::Spec) -> String {
             })*
         };
     }
-    fields!(stage, user_sgprs, user_base, wave64, ps_input_addr, ps_inputs, barycentric, mrt, cs_local_size, cs_rsrc2, binding_base, probe, dump, force_dispatcher, dispatcher_for_loops, reg_vars, lane_guards, mip_views, lod_stats, early_tests, per_lane, lane_votes, base_instance_sgpr, sgpr_pc, addresses, batched, write_marks, sgpr_ubo);
+    fields!(stage, user_sgprs, user_base, wave64, ps_input_addr, ps_inputs, barycentric, mrt, cs_local_size, cs_rsrc2, binding_base, probe, dump, force_dispatcher, dispatcher_for_loops, reg_vars, lane_guards, mip_views, lod_stats, early_tests, early_ok, per_lane, lane_votes, base_instance_sgpr, sgpr_pc, addresses, batched, write_marks, sgpr_ubo);
     if a.resources.len() != b.resources.len() {
         d.push(format!("resources {:?} -> {:?}", a.resources, b.resources));
     } else {
@@ -2996,6 +2996,34 @@ struct ShaderPlacements {
 }
 
 static SHADER_PLACEMENTS: Mutex<Option<HashMap<u64, ShaderPlacements>>> = Mutex::new(None);
+
+/// Per pixel program (`DS_PROFILE_GPU=1`): its draws' depth and stencil
+/// tests before the shader as the title asks (DEPTH_BEFORE_SHADER), before
+/// it as the draw's state allows (`Spec::early_ok`), after it (a kill,
+/// alpha to coverage or an export with depth or stencil writes), after it
+/// as the program writes memory.
+static PS_TESTS: Mutex<Option<HashMap<u64, [u64; 4]>>> = Mutex::new(None);
+
+/// Counts a draw's depth-test class for its pixel program (`PS_TESTS`).
+pub(crate) fn note_ps_tests(addr: u64, class: usize) {
+    PS_TESTS.lock().get_or_insert_with(HashMap::new).entry(addr).or_default()[class.min(3)] += 1;
+}
+
+/// Totals of `PS_TESTS` (the profile report).
+fn ps_tests_line() -> Option<String> {
+    let g = PS_TESTS.lock();
+    let m = g.as_ref()?;
+    let mut t = [0u64; 4];
+    for x in m.values() {
+        for k in 0..4 {
+            t[k] += x[k];
+        }
+    }
+    Some(format!(
+        "    pixel programs' depth tests by draw: before the shader as asked {}, as allowed {}, after it (kill, coverage or exports with writes) {}, after it (memory writes) {}\n",
+        t[0], t[1], t[2], t[3]
+    ))
+}
 
 pub(crate) fn note_placements(addr: u64, groups: [u32; 3], indirect: bool, placements: &[(Placement, u64, bool)]) {
     let mut g = SHADER_PLACEMENTS.lock();
@@ -6567,6 +6595,7 @@ pub fn reset_shader_profile() {
     *BARRIER_QUEUE_SITES.lock() = None;
     *CS_CPU.lock() = None;
     *SHADER_PLACEMENTS.lock() = None;
+    *PS_TESTS.lock() = None;
     *SEG_TIME.lock() = None;
     *MERGE_BY.lock() = None;
     *FILL_BY.lock() = None;
@@ -6750,11 +6779,15 @@ pub fn shader_profile() -> String {
         let list: Vec<String> = v.iter().map(|(q, x)| format!("{q} {} submissions, idle {} ms, recorded in {} ms", x[0], x[1] / 1_000_000, x[2] / 1_000_000)).collect();
         s.push_str(&format!("    submissions to an idle GPU: {}\n", list.join(", ")));
     }
+    if let Some(l) = ps_tests_line() {
+        s.push_str(&l);
+    }
     let top = std::env::var("DS_PROFILE_TOP").ok().and_then(|x| x.parse().ok()).unwrap_or(15);
     for (a, x) in v.iter().take(top) {
         let n = x[0].max(1);
         if **a & DRAW_KEY != 0 {
-            s.push_str(&format!("      draws with shader {:#x}: {} draws, {} us each\n", **a & !DRAW_KEY, x[0], x[1] / 1000 / n));
+            let tests = PS_TESTS.lock().as_ref().and_then(|m| m.get(&(**a & !DRAW_KEY)).copied()).map(|t| format!(" (depth tests before as asked {}, as allowed {}, after {} / {})", t[0], t[1], t[2], t[3])).unwrap_or_default();
+            s.push_str(&format!("      draws with shader {:#x}: {} draws, {} us each{tests}\n", **a & !DRAW_KEY, x[0], x[1] / 1000 / n));
             if let Some(l) = placement_line(**a) {
                 // Buffers of the vertex stage, then of the pixel stage.
                 let rest = l.split_once("; buffers:").map(|(_, r)| r).unwrap_or("");

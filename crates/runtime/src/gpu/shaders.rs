@@ -1056,6 +1056,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
         lod_lean: super::tune::lod_stats() == 4,
         early_tests: false,
+        early_ok: false,
         per_lane: false,
         lane_votes: false,
         base_instance_sgpr: None,
@@ -1177,10 +1178,36 @@ const PS_USER_DATA: u32 = 0x0C;
 const SPI_PS_INPUT_CNTL_0: u32 = 0x28644;
 const SPI_PS_INPUT_ADDR: u32 = 0x286D0;
 const SPI_PS_IN_CONTROL: u32 = 0x286D8;
-/// DB_SHADER_CONTROL (bit 12 DEPTH_BEFORE_SHADER: `Spec::early_tests`).
+/// DB_SHADER_CONTROL (bit 12 DEPTH_BEFORE_SHADER: `Spec::early_tests`;
+/// bits 0-2 depth and stencil exports, 6 KILL_ENABLE, 7-8 coverage
+/// exports: `Spec::early_ok`).
 const DB_SHADER_CONTROL: u32 = 0x2880C;
+/// Depth and stencil state (`Spec::early_ok`): DB_DEPTH_CONTROL (bit 0
+/// stencil test, 1 depth test, 2 depth writes), DB_STENCIL_CONTROL (the
+/// stencil operations), DB_STENCILREFMASK and its back-face twin (bits
+/// 16-23 the write mask), DB_ALPHA_TO_MASK (bit 0 enable).
+const DB_DEPTH_CONTROL: u32 = 0x28800;
+const DB_STENCIL_CONTROL: u32 = 0x2842C;
+const DB_STENCILREFMASK: u32 = 0x28430;
+const DB_STENCILREFMASK_BF: u32 = 0x28434;
+const DB_ALPHA_TO_MASK: u32 = 0x28B70;
 const SPI_SHADER_COL_FORMAT: u32 = 0x28714;
 const CB_COLOR0_INFO: u32 = 0x28C70;
+
+/// Whether the draw's state lets the depth and stencil tests run before a
+/// pixel program that writes no memory (`Spec::early_ok`): it exports no
+/// depth, stencil or coverage, and it cannot kill (KILL_ENABLE clear, no
+/// alpha to coverage) or the draw writes neither depth nor stencil (the
+/// tests as the draw sets them up: `exec::draw`).
+fn early_ok(ctx: &dyn Fn(u32) -> u32) -> bool {
+    let dsc = ctx(DB_SHADER_CONTROL);
+    let dctl = ctx(DB_DEPTH_CONTROL);
+    let z_write = dctl & 6 == 6;
+    let s_write = dctl & 1 != 0 && (ctx(DB_STENCILREFMASK) | ctx(DB_STENCILREFMASK_BF)) & 0x00FF_0000 != 0 && ctx(DB_STENCIL_CONTROL) & 0xFF_FFFF != 0;
+    let exports = dsc & (0x7 | 0x3 << 7) != 0;
+    let may_kill = dsc & (1 << 6) != 0 || ctx(DB_ALPHA_TO_MASK) & 1 != 0;
+    super::tune::early_auto() && !exports && (!may_kill || !(z_write || s_write))
+}
 
 /// Resolves and translates the pixel shader bound on `cp`.
 pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
@@ -1233,6 +1260,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
         lod_lean: super::tune::lod_stats() == 4,
         early_tests: ctx(DB_SHADER_CONTROL) & (1 << 12) != 0,
+        early_ok: early_ok(&ctx),
         per_lane: false,
         lane_votes: false,
         base_instance_sgpr: None,
@@ -1251,6 +1279,19 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
             spec.gpu_res = r;
             spec.pt_linear = super::fe2::on();
         }
+    }
+    // Profile (`DS_PROFILE_GPU=1`): when the draw's depth tests run.
+    if super::exec::profiling_on() {
+        let class = if spec.early_tests {
+            0
+        } else if translate::writes_memory(&insts) {
+            3
+        } else if spec.early_ok {
+            1
+        } else {
+            2
+        };
+        super::exec::note_ps_tests(addr, class);
     }
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
@@ -1398,6 +1439,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
         lod_lean: super::tune::lod_stats() == 4,
         early_tests: false,
+        early_ok: false,
         per_lane: false,
         lane_votes: false,
         base_instance_sgpr: BASE_INSTANCE.with(|c| c.get()).map(|k| 8 + k),
@@ -2131,6 +2173,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
         lod_lean: super::tune::lod_stats() == 4,
         early_tests: false,
+        early_ok: false,
         per_lane: false,
         lane_votes: false,
         base_instance_sgpr,
@@ -2148,7 +2191,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
 /// The key spec `prepare_ps` makes for the pixel program at `addr` drawn
 /// with these registers and descriptors, under the current switches.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr: u32, ps_inputs: Vec<PsInput>, mrt: [MrtSpec; 8], early_tests: bool, resources: Vec<ResSpec>) -> Spec {
+pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr: u32, ps_inputs: Vec<PsInput>, mrt: [MrtSpec; 8], early_tests: bool, early_ok: bool, resources: Vec<ResSpec>) -> Spec {
     Spec {
         stage: Stage::Fragment,
         user_sgprs,
@@ -2173,6 +2216,7 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
         lod_lean: super::tune::lod_stats() == 4,
         early_tests,
+        early_ok,
         per_lane: false,
         lane_votes: false,
         base_instance_sgpr: None,
@@ -2215,6 +2259,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
         lod_lean: super::tune::lod_stats() == 4,
         early_tests: false,
+        early_ok: false,
         per_lane: false,
         lane_votes: false,
         base_instance_sgpr: None,

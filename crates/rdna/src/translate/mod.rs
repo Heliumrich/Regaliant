@@ -227,6 +227,20 @@ pub struct Spec {
     /// shader rewrites the G-buffer through image stores) darkened the whole
     /// screen rectangle of a box instead of the ground inside it.
     pub early_tests: bool,
+    /// Pixel stage: the title's state lets the depth and stencil tests run
+    /// before a program that writes no memory and exports no depth without
+    /// changing what it draws (the hardware tests early there): the program
+    /// cannot kill (DB_SHADER_CONTROL.KILL_ENABLE clear, no coverage or
+    /// depth export) or the draw writes neither depth nor stencil (a kill then
+    /// undoes nothing a test wrote), and no alpha to coverage while it does.
+    /// Such programs declare EarlyFragmentTests when they write no memory
+    /// themselves (`writes_memory`): the LOD statistics' atomics (and any
+    /// side effect of ours) otherwise make the driver run them for every
+    /// rasterized fragment, hidden ones too (the Arcade's G-buffer passes
+    /// through its ivy: 1.2 ms a draw, FINDINGS.md 2026-10-30). A kill at a
+    /// valid-mask export then drops the fragment's colors only, as the
+    /// hardware's export without KILL_ENABLE does.
+    pub early_ok: bool,
     /// Compute: translate per lane, each invocation a wave of one, even when
     /// the program would run in lockstep or wave-mask mode: for programs
     /// whose cross-lane operations only scalarize per-lane work (their
@@ -385,6 +399,9 @@ impl std::hash::Hash for Spec {
         self.lod_stats.hash(state);
         self.lod_lean.hash(state);
         self.early_tests.hash(state);
+        if self.early_ok {
+            0x4541_524Cu32.hash(state);
+        }
         self.per_lane.hash(state);
         self.lane_votes.hash(state);
         if let Some(s) = self.base_instance_sgpr {
@@ -2539,7 +2556,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
             tr.b.execution_mode(func, ExecutionMode::OriginUpperLeft, []);
             if tr.out_depth.is_some() {
                 tr.b.execution_mode(func, ExecutionMode::DepthReplacing, []);
-            } else if spec.early_tests {
+            } else if spec.early_tests || (spec.early_ok && !writes_memory(code)) {
                 tr.b.execution_mode(func, ExecutionMode::EarlyFragmentTests, []);
             }
         }
@@ -2747,6 +2764,22 @@ const LANE_GUARD_MIN: usize = 3;
 
 /// Whether `ins` has no effect in a lane EXEC masks off: a lane-local VALU
 /// op, a vector memory or LDS access (not GDS) or a wait (`masked_skip`).
+/// Whether a program writes memory (buffer, image, flat and global stores
+/// and atomics; LDS and scratch stay private): side effects that depth and
+/// stencil tests before the shader would leave out for hidden fragments
+/// (`Spec::early_ok`).
+pub fn writes_memory(code: &[Inst]) -> bool {
+    code.iter().any(|ins| {
+        let Some(n) = ins.name() else { return false };
+        match ins.enc {
+            Enc::Mubuf | Enc::Mtbuf | Enc::Flat | Enc::Global => n.contains("_store") || n.contains("_atomic"),
+            Enc::Mimg => n.starts_with("image_store") || n.starts_with("image_atomic"),
+            Enc::Ds => ins.ds_gds(),
+            _ => false,
+        }
+    })
+}
+
 fn exec_masked(ins: &Inst) -> bool {
     match ins.enc {
         Enc::Mubuf | Enc::Mtbuf | Enc::Mimg | Enc::Flat | Enc::Global | Enc::Scratch => true,
@@ -3294,6 +3327,7 @@ mod tests {
             lod_stats: false,
             lod_lean: false,
             early_tests: false,
+            early_ok: false,
             per_lane: false,
             lane_votes: false,
             base_instance_sgpr: None,
@@ -3494,6 +3528,16 @@ mod tests {
         spec.early_tests = true;
         let early = translate(&code, &plan, &spec).unwrap();
         assert!(execution_modes(&early.spirv).contains(&9));
+        // Allowed by the draw's state (`early_ok`): a program that writes no
+        // memory tests early; one with a store does not.
+        spec.early_tests = false;
+        spec.early_ok = true;
+        let allowed = translate(&code, &plan, &spec).unwrap();
+        assert!(execution_modes(&allowed.spirv).contains(&9));
+        assert!(!writes_memory(&code));
+        // buffer_store_dword v1, v0, s[0:3], 0 idxen; s_endpgm
+        let store = crate::decode_program(&[0xE0702000, 0x80000100, 0xbf810000]).unwrap();
+        assert!(writes_memory(&store));
     }
 
     /// 16-bit instructions of the title's compute shaders (cs 0x100898d500's

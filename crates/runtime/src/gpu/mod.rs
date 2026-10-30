@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 217] = [
+    static ALL: [Tunable; 218] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -250,6 +250,7 @@ pub mod tune {
         Tunable { name: "fe2_mine_fast", env: "DS_FE2_MINE_FAST", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "vma_cache", env: "DS_VMA_CACHE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ts_cpw_waited", env: "DS_TS_CPW_WAITED", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "early_auto", env: "DS_EARLY_AUTO", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2351,6 +2352,17 @@ pub mod tune {
     /// the timestamps before it; left open as there.
     pub fn ts_cpw_waited() -> bool {
         get(216) != 0
+    }
+
+    /// Pixel programs that write no memory run their depth and stencil
+    /// tests before the shader where the draw's state lets them (no kill,
+    /// coverage or depth export, or no depth and stencil writes:
+    /// `rdna::translate::Spec::early_ok`), as the hardware does; 0: only
+    /// where the title asks (DEPTH_BEFORE_SHADER), as before 2026-10-30,
+    /// so the LOD statistics' atomics had every rasterized fragment shaded.
+    /// Read when a pixel program is prepared.
+    pub fn early_auto() -> bool {
+        get(217) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

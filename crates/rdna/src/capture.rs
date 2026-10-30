@@ -129,6 +129,7 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         lod_stats: std::env::var_os("RDNA_LOD_STATS").is_some(),
         lod_lean: std::env::var_os("RDNA_LOD_LEAN").is_some(),
         early_tests: false,
+        early_ok: false,
         per_lane: false,
         lane_votes: false,
         base_instance_sgpr: None,
