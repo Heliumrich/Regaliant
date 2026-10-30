@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 223] = [
+    static ALL: [Tunable; 224] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -256,6 +256,7 @@ pub mod tune {
         Tunable { name: "lod_late", env: "DS_LOD_LATE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lod_skip", env: "DS_LOD_SKIP", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "gpu_detile", env: "DS_GPU_DETILE", default: 8, value: AtomicU64::new(UNSET) },
+        Tunable { name: "upload_copy", env: "DS_UPLOAD_COPY", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2430,6 +2431,15 @@ pub mod tune {
     /// 2026-10-30 evening); 0: all detiled on the CPU.
     pub fn gpu_detile() -> u64 {
         get(222)
+    }
+
+    /// Texture uploads detiled on the CPU (those under `gpu_detile`'s size)
+    /// not waited for: their staging buffer is copied on the copy queue
+    /// into video memory, and the main queue copies that into the image
+    /// once the copy is done (`images`; staging freed at its fence). 0: each
+    /// waits for its transfer on the main queue (`upload_async` aside).
+    pub fn upload_copy() -> bool {
+        get(223) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

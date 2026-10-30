@@ -898,19 +898,22 @@ struct Staging {
 }
 
 /// What an upload in flight holds until the GPU is done with it: its host
-/// staging buffer, or the video-memory buffers its GPU detiling used and the
-/// copy queue's command buffer that filled them.
-enum Held {
-    Staging(Staging),
-    Detile(Vec<(vk::Buffer, vk::DeviceMemory, u64)>, Option<vk::CommandBuffer>),
+/// staging buffer, the video-memory buffers it used (GPU detiling, or the
+/// copy queue's destination), and the copy queue's command buffer that
+/// filled them.
+struct Held {
+    staging: Option<Staging>,
+    dev: Vec<(vk::Buffer, vk::DeviceMemory, u64)>,
+    copy_cmd: Option<vk::CommandBuffer>,
 }
 
 impl Held {
+    fn staging(s: Staging) -> Held {
+        Held { staging: Some(s), dev: Vec::new(), copy_cmd: None }
+    }
+
     fn bytes(&self) -> u64 {
-        match self {
-            Held::Staging(s) => s.cap,
-            Held::Detile(v, _) => v.iter().map(|b| b.2).sum(),
-        }
+        self.staging.as_ref().map_or(0, |s| s.cap) + self.dev.iter().map(|b| b.2).sum::<u64>()
     }
 }
 
@@ -927,6 +930,10 @@ const STAGING_POOLED: u64 = 32 << 20;
 /// only at a later upload) made guest-memory imports fail by the ten
 /// thousand and preceded device losses (runs 20261013-083710, -084645).
 const MAX_INFLIGHT: usize = 32;
+/// The same for uploads with a copy-queue part (`tune upload_copy`, GPU
+/// detiling): their bytes are bounded by DETILE_INFLIGHT; an arrival's
+/// hundreds of small textures waited for the oldest at 32.
+const MAX_INFLIGHT_COPY: usize = 256;
 const MAX_INFLIGHT_BYTES: u64 = 128 << 20;
 /// Uploads that waited for an earlier one (`MAX_INFLIGHT`), and staging
 /// buffers made.
@@ -981,6 +988,10 @@ static UPLOAD_TABLE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::ato
 /// differing, of them whose guest bytes changed during the upload, video-
 /// memory buffers made, uploads whose transfer ran on the copy queue].
 static GPU_DETILE: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+
+/// CPU-detiled uploads whose staging buffer the copy queue copied into
+/// video memory (`tune upload_copy`).
+static COPY_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `DS_GPU_DETILE_CHECK=1`: every upload detiled on the GPU reads back the
 /// tiled bytes it copied and the rows it made; the CPU's detiling of that
@@ -1478,9 +1489,10 @@ impl Images {
                 }
             }
             let (cmd, fence, qp, held) = self.inflight.pop_front().unwrap();
-            note_upload_span(qp, || match &held {
-                Held::Staging(s) => format!(": texture upload from a {} KiB staging buffer", s.cap >> 10),
-                Held::Detile(v, _) => format!(": texture upload detiled on the GPU ({} KiB of buffers)", v.iter().map(|b| b.2).sum::<u64>() >> 10),
+            note_upload_span(qp, || match (&held.staging, held.dev.is_empty()) {
+                (Some(s), true) => format!(": texture upload from a {} KiB staging buffer", s.cap >> 10),
+                (Some(s), false) => format!(": texture upload from a {} KiB staging buffer through the copy queue", s.cap >> 10),
+                (None, _) => format!(": texture upload detiled on the GPU ({} KiB of buffers)", held.dev.iter().map(|b| b.2).sum::<u64>() >> 10),
             });
             unsafe {
                 c.device.reset_fences(&[fence]).ok();
@@ -1496,21 +1508,43 @@ impl Images {
     /// before it and before batches submitted later, and its barriers order
     /// it against the image's other uses; `reap` recycles it.
     fn submit_upload(&mut self, s: Staging, f: impl FnOnce(vk::CommandBuffer)) {
-        self.submit_held(Held::Staging(s), MAX_INFLIGHT_BYTES, None, f);
+        self.submit_held(Held::staging(s), MAX_INFLIGHT_BYTES, None, f);
     }
 
     /// What an upload the GPU is done with (or that was not submitted) held.
     fn release_held(&mut self, held: Held) {
-        match held {
-            Held::Staging(s) => self.release_staging(s),
-            Held::Detile(v, x) => {
-                self.release_detile(v);
-                if let Some(x) = x {
-                    unsafe { ctx().device.reset_command_buffer(x, vk::CommandBufferResetFlags::empty()).ok() };
-                    self.copy_spare.push(x);
-                }
-            }
+        if let Some(s) = held.staging {
+            self.release_staging(s);
         }
+        self.release_detile(held.dev);
+        if let Some(x) = held.copy_cmd {
+            unsafe { ctx().device.reset_command_buffer(x, vk::CommandBufferResetFlags::empty()).ok() };
+            self.copy_spare.push(x);
+        }
+    }
+
+    /// The copy queue's part of an upload: `record` on one of its command
+    /// buffers, submitted to signal the timeline's next value. Returns the
+    /// command buffer and that value (None: nothing was submitted).
+    fn submit_copy_part(&mut self, pool: vk::CommandPool, sem: vk::Semaphore, record: impl FnOnce(vk::CommandBuffer)) -> Option<(vk::CommandBuffer, u64)> {
+        let c = ctx();
+        let x = match self.copy_spare.pop() {
+            Some(x) => x,
+            None => unsafe { c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).ok()?[0] },
+        };
+        let ok = unsafe {
+            c.device.begin_command_buffer(x, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
+            record(x);
+            c.device.end_command_buffer(x).ok();
+            c.submit_timeline(true, &[x], &[], &[(sem, self.copy_value + 1)], vk::Fence::null()).is_ok()
+        };
+        if !ok {
+            unsafe { c.device.reset_command_buffer(x, vk::CommandBufferResetFlags::empty()).ok() };
+            self.copy_spare.push(x);
+            return None;
+        }
+        self.copy_value += 1;
+        Some((x, self.copy_value))
     }
 
     /// The copy queue's part of GPU detiling: its command pool and timeline,
@@ -1537,7 +1571,8 @@ impl Images {
     /// buffers in flight, after the copy queue's timeline reaches `wait`
     /// (semaphore, value) when given.
     fn submit_held(&mut self, s: Held, max_bytes: u64, wait: Option<(vk::Semaphore, u64)>, f: impl FnOnce(vk::CommandBuffer)) {
-        self.reap(MAX_INFLIGHT - 1, max_bytes.saturating_sub(s.bytes()));
+        let max = if s.copy_cmd.is_some() || !s.dev.is_empty() { MAX_INFLIGHT_COPY } else { MAX_INFLIGHT };
+        self.reap(max - 1, max_bytes.saturating_sub(s.bytes()));
         let c = ctx();
         let (cmd, fence, qp) = match self.spare_cmds.pop() {
             Some(x) => x,
@@ -2051,39 +2086,24 @@ impl Images {
             self.one_shot(record);
             self.release_detile(vec![tbuf, lbuf]);
         } else if let Some((pool, sem)) = on_copy {
-            let x = match self.copy_spare.pop() {
-                Some(x) => Some(x),
-                None => unsafe { c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).ok().map(|v| v[0]) },
-            };
-            let submitted = x.filter(|&x| unsafe {
-                c.device.begin_command_buffer(x, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
-                record_copies(x);
-                c.device.end_command_buffer(x).ok();
-                c.submit_timeline(true, &[x], &[], &[(sem, self.copy_value + 1)], vk::Fence::null()).is_ok()
-            });
-            match submitted {
-                Some(x) => {
-                    self.copy_value += 1;
+            match self.submit_copy_part(pool, sem, record_copies) {
+                Some((x, v)) => {
                     GPU_DETILE[10].fetch_add(1, Relaxed);
+                    let held = Held { staging: None, dev: vec![tbuf, lbuf], copy_cmd: Some(x) };
                     if readback.is_some() {
-                        self.one_shot_after(Some((sem, self.copy_value)), record);
-                        self.release_held(Held::Detile(vec![tbuf, lbuf], Some(x)));
+                        self.one_shot_after(Some((sem, v)), record);
+                        self.release_held(held);
                     } else {
-                        self.submit_held(Held::Detile(vec![tbuf, lbuf], Some(x)), DETILE_INFLIGHT, Some((sem, self.copy_value)), record);
+                        self.submit_held(held, DETILE_INFLIGHT, Some((sem, v)), record);
                     }
                 }
                 None => {
-                    // (Its command buffer, if any, goes back unused.)
-                    if let Some(x) = x {
-                        unsafe { c.device.reset_command_buffer(x, vk::CommandBufferResetFlags::empty()).ok() };
-                        self.copy_spare.push(x);
-                    }
                     self.release_detile(vec![tbuf, lbuf]);
                     return Err("the copy queue refused the transfer".into());
                 }
             }
         } else {
-            self.submit_held(Held::Detile(vec![tbuf, lbuf], None), DETILE_INFLIGHT, None, record);
+            self.submit_held(Held { staging: None, dev: vec![tbuf, lbuf], copy_cmd: None }, DETILE_INFLIGHT, None, record);
         }
         // DS_GPU_DETILE_CHECK=1: each part against the CPU's detiling of the
         // tiled bytes the GPU copied (laid out at their texture offsets).
@@ -2526,7 +2546,10 @@ impl Images {
                 }
             }
         }
-        let asynchronous = super::tune::upload_async();
+        // (`tune upload_copy`: the staging buffer's copy on the copy queue,
+        // not waited for.)
+        let via_copy = if super::tune::upload_copy() { self.copy_parts() } else { None };
+        let asynchronous = super::tune::upload_async() || via_copy.is_some();
         let st = if asynchronous {
             self.staging(total.max(4) as u64)?
         } else {
@@ -2647,6 +2670,38 @@ impl Images {
             let a = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[a], &[], &[]);
         };
+        // Through the copy queue: the staging buffer copied there into video
+        // memory, from which the main queue copies it into the image once
+        // that is done (the same regions).
+        if let Some((pool, sem)) = via_copy {
+            let bytes = (total.max(4) as u64).next_multiple_of(4);
+            if let Ok(dev) = self.detile_take(bytes) {
+                let lb = dev.0;
+                let to_dev = |x: vk::CommandBuffer| unsafe { c.device.cmd_copy_buffer(x, buf, lb, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: total.max(4) as u64 }]) };
+                if let Some((x, v)) = self.submit_copy_part(pool, sem, to_dev) {
+                    let record_dev = |cmd: vk::CommandBuffer| unsafe {
+                        super::vk::checkpoint(cmd, super::vk::mark::UPLOAD, base);
+                        let b = vk::ImageMemoryBarrier::default()
+                            .old_layout(if first { vk::ImageLayout::UNDEFINED } else { vk::ImageLayout::GENERAL })
+                            .new_layout(vk::ImageLayout::GENERAL)
+                            .image(image)
+                            .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS })
+                            .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+                        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[b]);
+                        c.device.cmd_copy_buffer_to_image(cmd, lb, image, vk::ImageLayout::GENERAL, &regions);
+                        let a = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+                        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[a], &[], &[]);
+                    };
+                    self.submit_held(Held { staging: Some(st), dev: vec![dev], copy_cmd: Some(x) }, DETILE_INFLIGHT, Some((sem, v)), record_dev);
+                    COPY_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    UPLOAD_SPLIT[2].fetch_add(t_copy.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    self.uploads += 1;
+                    return Ok((t.base, size));
+                }
+                self.release_detile(vec![dev]);
+            }
+        }
         if asynchronous {
             self.submit_upload(st, record);
             UPLOAD_SPLIT[2].fetch_add(t_copy.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -4477,6 +4532,7 @@ impl Images {
         } else {
             String::new()
         };
+        let gpu = if COPY_UPLOADS.load(Relaxed) > 0 { format!("{gpu}; CPU-detiled uploads through the copy queue {}", COPY_UPLOADS.load(Relaxed)) } else { gpu };
         format!(
             "    images: {} cached ({} MiB; GPU-written {} ({} MiB), kept for the session; {} textures evicted, {} MiB, in {} rounds), {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; staging buffers made {}, waits for uploads in flight {}; pages checked in the mapping table {}, again with the operating system {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages, {} found clean by a probe); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}{gpu}\n",
             self.map.len(),
