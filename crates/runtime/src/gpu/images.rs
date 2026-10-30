@@ -898,17 +898,18 @@ struct Staging {
 }
 
 /// What an upload in flight holds until the GPU is done with it: its host
-/// staging buffer, or the video-memory buffers its GPU detiling used.
+/// staging buffer, or the video-memory buffers its GPU detiling used and the
+/// copy queue's command buffer that filled them.
 enum Held {
     Staging(Staging),
-    Detile(Vec<(vk::Buffer, vk::DeviceMemory, u64)>),
+    Detile(Vec<(vk::Buffer, vk::DeviceMemory, u64)>, Option<vk::CommandBuffer>),
 }
 
 impl Held {
     fn bytes(&self) -> u64 {
         match self {
             Held::Staging(s) => s.cap,
-            Held::Detile(v) => v.iter().map(|b| b.2).sum(),
+            Held::Detile(v, _) => v.iter().map(|b| b.2).sum(),
         }
     }
 }
@@ -978,8 +979,8 @@ static UPLOAD_TABLE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::ato
 /// the CPU (no import window), ns recording and waiting, (mip, layer)s
 /// compared with the CPU's detiling (`DS_GPU_DETILE_CHECK=1`), of them
 /// differing, of them whose guest bytes changed during the upload, video-
-/// memory buffers made].
-static GPU_DETILE: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+/// memory buffers made, uploads whose transfer ran on the copy queue].
+static GPU_DETILE: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
 /// `DS_GPU_DETILE_CHECK=1`: every upload detiled on the GPU reads back the
 /// tiled bytes it copied and the rows it made; the CPU's detiling of that
@@ -1144,6 +1145,13 @@ pub struct Images {
     /// GPU detiling's video-memory buffers not in use: (buffer, memory,
     /// capacity).
     detile_free: Vec<(vk::Buffer, vk::DeviceMemory, u64)>,
+    /// GPU detiling's transfers on the copy queue: its command pool (made
+    /// on first use), spare command buffers, and the timeline its copies
+    /// signal with `copy_value` (the main queue's part waits on it).
+    copy_pool: vk::CommandPool,
+    copy_spare: Vec<vk::CommandBuffer>,
+    copy_timeline: vk::Semaphore,
+    copy_value: u64,
     reported: HashMap<String, u64>,
     pub uploads: u64,
     pub reuploads: u64,
@@ -1340,7 +1348,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
             let qp = upload_stamps();
-            *g = Some(Images { qp, map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), inflight: Default::default(), spare_cmds: Vec::new(), detile_free: Vec::new(), reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default() });
+            *g = Some(Images { qp, map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), inflight: Default::default(), spare_cmds: Vec::new(), detile_free: Vec::new(), copy_pool: vk::CommandPool::null(), copy_spare: Vec::new(), copy_timeline: vk::Semaphore::null(), copy_value: 0, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default() });
         }
     }
     let im = g.as_mut().unwrap();
@@ -1472,17 +1480,14 @@ impl Images {
             let (cmd, fence, qp, held) = self.inflight.pop_front().unwrap();
             note_upload_span(qp, || match &held {
                 Held::Staging(s) => format!(": texture upload from a {} KiB staging buffer", s.cap >> 10),
-                Held::Detile(v) => format!(": texture upload detiled on the GPU ({} KiB of buffers)", v.iter().map(|b| b.2).sum::<u64>() >> 10),
+                Held::Detile(v, _) => format!(": texture upload detiled on the GPU ({} KiB of buffers)", v.iter().map(|b| b.2).sum::<u64>() >> 10),
             });
             unsafe {
                 c.device.reset_fences(&[fence]).ok();
                 c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
             }
             self.spare_cmds.push((cmd, fence, qp));
-            match held {
-                Held::Staging(s) => self.release_staging(s),
-                Held::Detile(v) => self.release_detile(v),
-            }
+            self.release_held(held);
         }
     }
 
@@ -1491,12 +1496,47 @@ impl Images {
     /// before it and before batches submitted later, and its barriers order
     /// it against the image's other uses; `reap` recycles it.
     fn submit_upload(&mut self, s: Staging, f: impl FnOnce(vk::CommandBuffer)) {
-        self.submit_held(Held::Staging(s), MAX_INFLIGHT_BYTES, f);
+        self.submit_held(Held::Staging(s), MAX_INFLIGHT_BYTES, None, f);
+    }
+
+    /// What an upload the GPU is done with (or that was not submitted) held.
+    fn release_held(&mut self, held: Held) {
+        match held {
+            Held::Staging(s) => self.release_staging(s),
+            Held::Detile(v, x) => {
+                self.release_detile(v);
+                if let Some(x) = x {
+                    unsafe { ctx().device.reset_command_buffer(x, vk::CommandBufferResetFlags::empty()).ok() };
+                    self.copy_spare.push(x);
+                }
+            }
+        }
+    }
+
+    /// The copy queue's part of GPU detiling: its command pool and timeline,
+    /// made on first use (None: no copy queue, or `tune copy_queue` 0).
+    fn copy_parts(&mut self) -> Option<(vk::CommandPool, vk::Semaphore)> {
+        let c = ctx();
+        let q = c.copy.as_ref().filter(|_| super::tune::copy_queue())?;
+        if self.copy_pool == vk::CommandPool::null() {
+            unsafe {
+                let pool = c.device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(q.family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).ok()?;
+                let mut tci = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
+                let Ok(sem) = c.device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tci), None) else {
+                    c.device.destroy_command_pool(pool, None);
+                    return None;
+                };
+                self.copy_pool = pool;
+                self.copy_timeline = sem;
+            }
+        }
+        Some((self.copy_pool, self.copy_timeline))
     }
 
     /// `submit_upload` for what `s` holds, with up to `max_bytes` of such
-    /// buffers in flight.
-    fn submit_held(&mut self, s: Held, max_bytes: u64, f: impl FnOnce(vk::CommandBuffer)) {
+    /// buffers in flight, after the copy queue's timeline reaches `wait`
+    /// (semaphore, value) when given.
+    fn submit_held(&mut self, s: Held, max_bytes: u64, wait: Option<(vk::Semaphore, u64)>, f: impl FnOnce(vk::CommandBuffer)) {
         self.reap(MAX_INFLIGHT - 1, max_bytes.saturating_sub(s.bytes()));
         let c = ctx();
         let (cmd, fence, qp) = match self.spare_cmds.pop() {
@@ -1512,7 +1552,11 @@ impl Images {
             f(cmd);
             stamp(cmd, qp, 1);
             c.device.end_command_buffer(cmd).ok();
-            match c.submit(cmd, &[], &[], fence) {
+            let r = match wait {
+                Some((sem, v)) => c.submit_timeline(false, &[cmd], &[(sem, v, vk::PipelineStageFlags2::ALL_COMMANDS)], &[], fence),
+                None => c.submit(cmd, &[], &[], fence),
+            };
+            match r {
                 Ok(()) => self.inflight.push_back((cmd, fence, qp, s)),
                 Err(e) => {
                     if !super::exec::DEVICE_LOST.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -1520,16 +1564,19 @@ impl Images {
                     }
                     c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
                     self.spare_cmds.push((cmd, fence, qp));
-                    match s {
-                        Held::Staging(s) => self.release_staging(s),
-                        Held::Detile(v) => self.release_detile(v),
-                    }
+                    self.release_held(s);
                 }
             }
         }
     }
 
     fn one_shot(&mut self, f: impl FnOnce(vk::CommandBuffer)) {
+        self.one_shot_after(None, f)
+    }
+
+    /// `one_shot` after the copy queue's timeline reaches `wait` (semaphore,
+    /// value) when given.
+    fn one_shot_after(&mut self, wait: Option<(vk::Semaphore, u64)>, f: impl FnOnce(vk::CommandBuffer)) {
         // (Its timestamps: `stamp`, `note_upload_span`.)
         let c = ctx();
         unsafe {
@@ -1538,7 +1585,11 @@ impl Images {
             f(self.cmd);
             stamp(self.cmd, self.qp, 1);
             c.device.end_command_buffer(self.cmd).ok();
-            match c.submit(self.cmd, &[], &[], self.fence) {
+            let r = match wait {
+                Some((sem, v)) => c.submit_timeline(false, &[self.cmd], &[(sem, v, vk::PipelineStageFlags2::ALL_COMMANDS)], &[], self.fence),
+                None => c.submit(self.cmd, &[], &[], self.fence),
+            };
+            match r {
                 Ok(()) => {
                     let t0 = std::time::Instant::now();
                     let r = c.device.wait_for_fences(&[self.fence], true, 10_000_000_000);
@@ -1934,6 +1985,23 @@ impl Images {
         let rb = readback.as_ref().map(|r| r.0);
         let rows_bytes = l_total.max(16);
         let base = t.base;
+        // The transfer from guest memory on the copy queue (beside the
+        // frames' work on the main queue), the rest on the main queue once
+        // it is done (checked runs wait for that part); all on the main queue
+        // without a copy queue.
+        let on_copy = self.copy_parts();
+        let record_copies = |cmd: vk::CommandBuffer| unsafe {
+            let mut k = 0;
+            while k < copies.len() {
+                let src = copies[k].0;
+                let mut regs = Vec::new();
+                while k < copies.len() && copies[k].0 == src {
+                    regs.push(copies[k].1);
+                    k += 1;
+                }
+                c.device.cmd_copy_buffer(cmd, src, tb, &regs);
+            }
+        };
         let record = |cmd: vk::CommandBuffer| unsafe {
             super::vk::checkpoint(cmd, super::vk::mark::UPLOAD, base);
             let b = vk::ImageMemoryBarrier::default()
@@ -1944,15 +2012,8 @@ impl Images {
                 .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[b]);
-            let mut k = 0;
-            while k < copies.len() {
-                let src = copies[k].0;
-                let mut regs = Vec::new();
-                while k < copies.len() && copies[k].0 == src {
-                    regs.push(copies[k].1);
-                    k += 1;
-                }
-                c.device.cmd_copy_buffer(cmd, src, tb, &regs);
+            if on_copy.is_none() {
+                record_copies(cmd);
             }
             if zero_len > 0 {
                 c.device.cmd_fill_buffer(cmd, lb, zero_at, zero_len, 0);
@@ -1986,11 +2047,43 @@ impl Images {
         // Submitted without waiting (the one queue runs it after the work
         // submitted before and before batches submitted later; its barriers
         // order it against the image's other uses), unless checked.
-        if readback.is_some() {
+        if readback.is_some() && on_copy.is_none() {
             self.one_shot(record);
             self.release_detile(vec![tbuf, lbuf]);
+        } else if let Some((pool, sem)) = on_copy {
+            let x = match self.copy_spare.pop() {
+                Some(x) => Some(x),
+                None => unsafe { c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).ok().map(|v| v[0]) },
+            };
+            let submitted = x.filter(|&x| unsafe {
+                c.device.begin_command_buffer(x, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
+                record_copies(x);
+                c.device.end_command_buffer(x).ok();
+                c.submit_timeline(true, &[x], &[], &[(sem, self.copy_value + 1)], vk::Fence::null()).is_ok()
+            });
+            match submitted {
+                Some(x) => {
+                    self.copy_value += 1;
+                    GPU_DETILE[10].fetch_add(1, Relaxed);
+                    if readback.is_some() {
+                        self.one_shot_after(Some((sem, self.copy_value)), record);
+                        self.release_held(Held::Detile(vec![tbuf, lbuf], Some(x)));
+                    } else {
+                        self.submit_held(Held::Detile(vec![tbuf, lbuf], Some(x)), DETILE_INFLIGHT, Some((sem, self.copy_value)), record);
+                    }
+                }
+                None => {
+                    // (Its command buffer, if any, goes back unused.)
+                    if let Some(x) = x {
+                        unsafe { c.device.reset_command_buffer(x, vk::CommandBufferResetFlags::empty()).ok() };
+                        self.copy_spare.push(x);
+                    }
+                    self.release_detile(vec![tbuf, lbuf]);
+                    return Err("the copy queue refused the transfer".into());
+                }
+            }
         } else {
-            self.submit_held(Held::Detile(vec![tbuf, lbuf]), DETILE_INFLIGHT, record);
+            self.submit_held(Held::Detile(vec![tbuf, lbuf], None), DETILE_INFLIGHT, None, record);
         }
         // DS_GPU_DETILE_CHECK=1: each part against the CPU's detiling of the
         // tiled bytes the GPU copied (laid out at their texture offsets).
@@ -4380,7 +4473,7 @@ impl Images {
         let g: Vec<u64> = GPU_DETILE.iter().map(|c| c.load(Relaxed)).collect();
         let gpu = if g[0] + g[4] > 0 {
             let checked = if gpu_detile_check() { format!(", {} (mip, layer)s compared with the CPU's detiling of the bytes copied, {} differing, {} tiled ranges changed in guest memory during their upload", g[6], g[7], g[8]) } else { String::new() };
-            format!("; detiled on the GPU: {} uploads ({} (mip, layer)s, {} MiB copied, {} MiB detiled, {} ms recording and submitting them; video-memory buffers made {}), {} left to the CPU{checked}", g[0], g[1], g[2] >> 20, g[3] >> 20, g[5] / 1_000_000, g[9], g[4])
+            format!("; detiled on the GPU: {} uploads ({} (mip, layer)s, {} MiB copied, {} MiB detiled, {} ms recording and submitting them; video-memory buffers made {}; transfers on the copy queue {}), {} left to the CPU{checked}", g[0], g[1], g[2] >> 20, g[3] >> 20, g[5] / 1_000_000, g[9], g[10], g[4])
         } else {
             String::new()
         };

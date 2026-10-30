@@ -255,7 +255,7 @@ pub mod tune {
         Tunable { name: "fe2_cpw_defer", env: "DS_FE2_CPW_DEFER", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "lod_late", env: "DS_LOD_LATE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lod_skip", env: "DS_LOD_SKIP", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "gpu_detile", env: "DS_GPU_DETILE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "gpu_detile", env: "DS_GPU_DETILE", default: 8, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2420,11 +2420,14 @@ pub mod tune {
     /// the tiled bytes copied from the guest-memory import windows into
     /// video memory, a kernel (`rdna::kernels::detile`) writing them as
     /// packed rows, then copied into the image, submitted without waiting
-    /// (`images::Held`). No CPU detiling, staging or transfer waits; parts
-    /// are hashed as on the CPU path. Smaller textures stay on the CPU: the
+    /// (`images::Held`): the transfer on the copy queue when there is one
+    /// (the main queue's part waits on its timeline), so it runs beside the
+    /// frames' work. No CPU detiling, staging or transfer waits; parts are
+    /// hashed as on the CPU path. Smaller textures stay on the CPU: the
     /// title maps each texture apart, and importing them all (4,098 live
-    /// imports against 605 at Castlewall) slowed every span lookup. 0: all
-    /// detiled on the CPU.
+    /// imports against 605 at Castlewall) slowed every span lookup. Default
+    /// 8 since 2026-10-30 (Castlewall's arrival and the 1-1 walks, FINDINGS.md
+    /// 2026-10-30 evening); 0: all detiled on the CPU.
     pub fn gpu_detile() -> u64 {
         get(222)
     }
