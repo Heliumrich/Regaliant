@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 224] = [
+    static ALL: [Tunable; 227] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -257,6 +257,9 @@ pub mod tune {
         Tunable { name: "lod_skip", env: "DS_LOD_SKIP", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "gpu_detile", env: "DS_GPU_DETILE", default: 8, value: AtomicU64::new(UNSET) },
         Tunable { name: "upload_copy", env: "DS_UPLOAD_COPY", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "import_keep", env: "DS_IMPORT_KEEP", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "import_defer", env: "DS_IMPORT_DEFER", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "import_grow", env: "DS_IMPORT_GROW", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2440,6 +2443,44 @@ pub mod tune {
     /// waits for its transfer on the main queue (`upload_async` aside).
     pub fn upload_copy() -> bool {
         get(223) != 0
+    }
+
+    /// Imports met by a remap of their pages stay listed and are replaced
+    /// off the recording threads (`exec::keep_remapped`): decommits under an
+    /// import wait for it, so the pages it pins stay the guest's. 0 (default):
+    /// dropped at once and imported again on the thread that met the remap.
+    /// Opt-in: with `import_grow` the 1-1 walks' arrivals were even and their
+    /// area windows' hitch time 20-30% higher (GPU waits; more imports in
+    /// all), FINDINGS.md 2026-10-30 night.
+    pub fn import_keep() -> bool {
+        get(224) != 0
+    }
+
+    /// Front end 2's uploads into the mirror of at most 1 MiB whose window
+    /// is not imported yet (opt-in): 1, their own pages imported (`exec::
+    /// import_exact`: pinning a few pages costs a fraction of the window's
+    /// 5-20 ms; copies stay in the GPU's order) and the window imported off
+    /// the recording threads (`exec::queue_import`), the small import
+    /// dropped once the window covers it; 2, copied by the CPU into the
+    /// batch's staging instead (current for that batch only, refused where
+    /// GPU work writes the pages). 0 (default): the window imported on the
+    /// recording thread first. Off by default: geometry was torn at 8-2 or
+    /// 8-3 in 3 of 7 full tours with it, `import_keep` and `import_grow` on
+    /// (both modes), in none of 8 with one of the three off nor 2 with all
+    /// off; cause not found; at Castlewall's arrival no gain
+    /// (FINDINGS.md 2026-10-30 night).
+    pub fn import_defer() -> u64 {
+        get(225)
+    }
+
+    /// An import of pages the guest mapped after live imports of the same
+    /// run begins at their end (`exec::grown_from`) instead of the run's
+    /// start: the title's streamed texture arrays grow a window a few MiB at
+    /// a time, and each import of the whole run pinned its 50-64 MiB again
+    /// (8-16 ms). 0 (default): the whole run each time. Opt-in (with
+    /// `import_keep`: measured no gain, FINDINGS.md 2026-10-30 night).
+    pub fn import_grow() -> bool {
+        get(226) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

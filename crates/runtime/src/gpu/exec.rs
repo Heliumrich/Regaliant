@@ -267,7 +267,7 @@ static IMPORTS_MULTI: AtomicU64 = AtomicU64::new(0);
 static IMPORTS_STALE: AtomicU64 = AtomicU64::new(0);
 /// The profile window's imports (`import_window_line`): [imports, bytes,
 /// ns, longest ns, span-list lock acquisitions that waited, ns waited].
-static IMPORT_WIN: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static IMPORT_WIN: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 static CACHE_GEN_AT_RESET: AtomicU64 = AtomicU64::new(0);
 
 /// Clears the window's import counts (`profile reset`).
@@ -284,11 +284,15 @@ pub(super) fn reset_import_window() {
 pub(super) fn import_window_line() -> String {
     let v: Vec<u64> = IMPORT_WIN.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    guest-memory imports in the window: {} ({} MiB, {} ms, longest {} ms); span-list lock waits {} ({} ms); span caches cleared {} times; imports dropped for a mapping change while in progress {}\n",
+        "    guest-memory imports in the window: {} ({} MiB, {} ms, longest {} ms); off the recording threads: kept windows replaced {}, imports asked ahead {} ({} ms), short uploads into the mirror served meanwhile (their own pages imported, or copied by the CPU) {}; span-list lock waits {} ({} ms); span caches cleared {} times; imports dropped for a mapping change while in progress {}\n",
         v[0],
         v[1] >> 20,
         v[2] / 1_000_000,
         v[3] / 1_000_000,
+        v[6],
+        v[8],
+        v[7] / 1_000_000,
+        v[9],
         v[4],
         v[5] / 1_000_000,
         CACHE_GEN.load(Ordering::Relaxed).saturating_sub(CACHE_GEN_AT_RESET.load(Ordering::Relaxed)),
@@ -382,6 +386,12 @@ struct Span {
     /// batch dropped past a label wait) was settled by age alone.
     first_use: AtomicU64,
     used_at: AtomicU64,
+    /// Met by a remap of its pages and kept, queued for its replacement
+    /// (`keep_remapped`): lookups use it, imports look past it.
+    replacing: std::sync::atomic::AtomicBool,
+    /// An upload's own pages (`import_exact`): dropped once a window import
+    /// covers it (`retire_exact`).
+    exact: bool,
 }
 
 /// Imports whose guest pages were remapped (`revalidate_spans`), freed once
@@ -607,6 +617,8 @@ thread_local! {
     /// Recently used imports of this thread (start, end, buffer), valid for
     /// one `CACHE_GEN`, most recent first.
     static SPAN_CACHE: std::cell::RefCell<(u64, Vec<(u64, u64, vk::Buffer)>)> = const { std::cell::RefCell::new((0, Vec::new())) };
+    /// The code whose `span` lookup is importing now (hitch notes).
+    static IMPORT_SITE: std::cell::Cell<Option<&'static std::panic::Location<'static>>> = const { std::cell::Cell::new(None) };
 }
 
 /// Compute pipelines by translation key; graphics pipelines by state hash.
@@ -878,6 +890,11 @@ fn revalidate_spans() {
     if !spans_read().iter().any(|s| s.valid && changed.iter().any(|&(a, b)| a < s.end && s.start < b)) {
         return;
     }
+    // Kept, and replaced off the recording threads (`tune import_keep`).
+    if keep_over_remaps() {
+        keep_remapped(&changed);
+        return;
+    }
     let mut g = SPANS.write();
     let mut dead = Vec::new();
     let mut i = 0;
@@ -924,25 +941,541 @@ fn revalidate_spans() {
     // drop and submitted after it read them through the table (commands bind
     // windows themselves, and keep the dropped one until they complete).
     for (s, e) in reimport {
-        let mut a = s;
-        while a < e {
-            // The next usable mapping from `a` on.
-            let next = {
-                let st = crate::mem::MEM.lock();
-                let usable = |p: &crate::mem::Vma| p.kind != crate::mem::VmaKind::Reserved && p.prot != 0;
-                match st.find(a) {
-                    Some(v) if usable(v) => Some(a),
-                    _ => st.vmas.range(a..e).map(|(_, p)| p).find(|p| usable(p)).map(|p| p.start),
+        let (made, failed) = import_mappings(s, e);
+        REIMPORTS.fetch_add(made + failed, Ordering::Relaxed);
+    }
+}
+
+/// Imports the usable mappings of guest [s, e) (a dropped or replaced
+/// window's), window by window from each one's start: (imports made or
+/// found, those that failed).
+fn import_mappings(s: u64, e: u64) -> (u64, u64) {
+    let (mut made, mut failed) = (0, 0);
+    let mut a = s;
+    while a < e {
+        // The next usable mapping from `a` on.
+        let next = {
+            let st = crate::mem::MEM.lock();
+            let usable = |p: &crate::mem::Vma| p.kind != crate::mem::VmaKind::Reserved && p.prot != 0;
+            match st.find(a) {
+                Some(v) if usable(v) => Some(a),
+                _ => st.vmas.range(a..e).map(|(_, p)| p).find(|p| usable(p)).map(|p| p.start),
+            }
+        };
+        let Some(b) = next else { break };
+        a = match import_span(b, 4) {
+            Some((_, _, end)) if end > b => {
+                made += 1;
+                end
+            }
+            _ => {
+                failed += 1;
+                (b & !(WINDOW - 1)) + WINDOW
+            }
+        };
+    }
+    (made, failed)
+}
+
+/// Whether imports met by a remap of their pages are kept (`tune
+/// import_keep`): decommits under an import wait for it
+/// (`mem::defer_decommits`) and a commit of committed pages keeps them, so
+/// the pages an import pins stay the guest's at their addresses (those the
+/// guest unmapped are read by nothing; mapped again, they start zeroed in
+/// place). Dropped at once instead, each was imported again by the thread
+/// that met the remap: 2,479 of the 2,958 imports of a 1-1 walk, 5-20 ms
+/// each on the recording threads (FINDINGS.md 2026-10-30 night).
+/// (Section-backed memory, view windows and residency keep the old way.)
+fn keep_over_remaps() -> bool {
+    super::tune::import_keep() && crate::mem::defer_decommits() && !crate::sections::on() && !crate::mem::views_on() && !super::resident::enabled()
+}
+
+/// Work of the imports' thread: a kept import's replacement
+/// (`keep_remapped`: the import, and when a remap last met it; it waits for
+/// its pages to be quiet: the title remaps a streaming window several times
+/// within milliseconds), or an import asked ahead (`queue_import`: no
+/// buffer; made first).
+struct Replace {
+    start: u64,
+    end: u64,
+    buffer: Option<vk::Buffer>,
+    last: std::time::Instant,
+}
+
+static REPLACE: Mutex<Vec<Replace>> = Mutex::new(Vec::new());
+static REPLACE_CV: parking_lot::Condvar = parking_lot::Condvar::new();
+/// How long a kept import's pages are quiet before its replacement.
+const REPLACE_QUIET: std::time::Duration = std::time::Duration::from_millis(8);
+/// Kept imports: [kept, remaps met while kept, replaced, new imports made
+/// by replacements (or found), failed, the replacements' ns].
+static REPLACE_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// Deferred imports (`tune import_defer`): [runs copied by the CPU, their
+/// pages, window imports asked, made (or found), failed, their ns, runs
+/// imported on the recording thread instead of copied because GPU work
+/// writes them, exact imports (`import_exact`), their ns, exact imports
+/// dropped under a window].
+static DEFER_STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// The longest upload into the mirror copied by the CPU while its window's
+/// import is made off the recording threads.
+const DEFER_COPY_MAX: u64 = 1 << 20;
+
+thread_local! {
+    /// The replacements' thread (its imports are counted apart).
+    static REPLACER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// An exact import is being made on this thread (`import_exact`).
+    static EXACT_IMPORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// An import of exactly the pages of guest [base, base+size) (`fe2_upload`'s
+/// short runs whose window is not imported yet, `tune import_defer` 1):
+/// pinning a few pages costs a fraction of the 64 MiB window's 5-20 ms, and
+/// it does not wait for the window's import, made off the recording threads
+/// meanwhile (`queue_import`), which drops it once listed (`retire_exact`).
+fn import_exact(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
+    let t = std::time::Instant::now();
+    EXACT_IMPORT.with(|c| c.set(true));
+    let r = import_span(base, size);
+    EXACT_IMPORT.with(|c| c.set(false));
+    DEFER_STATS[7].fetch_add(1, Ordering::Relaxed);
+    DEFER_STATS[8].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    IMPORT_WIN[9].fetch_add(1, Ordering::Relaxed);
+    r
+}
+
+/// `DS_IMPORT_AUDIT=<ms>` (diagnosis): every that many milliseconds a page
+/// of each of up to AUDIT_SPANS live imports (in turn), read through the
+/// import on the GPU, is compared with the CPU's view of the same guest page;
+/// a page that differs is read again by the CPU, the GPU and the CPU, and
+/// logged (`import audit:`, the first 64) when a byte the GPU read is neither
+/// what the CPU read before nor after (a page the CPU writes meanwhile shows
+/// one or the other): the import no longer aliases the guest's pages, the
+/// premise of `import_keep` and of every import's use. Dropped imports are
+/// held meanwhile (the graveyard's lock).
+fn audit_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("DS_IMPORT_AUDIT").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+const AUDIT_SPANS: usize = 64;
+/// The import audit: [pages compared, differing at the first read, differing
+/// again (logged), pages left out (not readable now), rounds, front end 2's
+/// mirror pages compared, differing at the first read, differing again while
+/// still current and armed (logged)].
+static AUDIT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+fn audit_start() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let name = "gpu-async-audit";
+        let r = crate::thread::spawn_host(
+            name,
+            1 << 20,
+            Box::new(move || {
+                crate::log::set_thread_name(name);
+                crate::exception::arm_watch_current_thread(false);
+                let Ok((buf, _mem, ptr)) = ctx().host_buffer(2 * AUDIT_SPANS as u64 * 4096, vk::BufferUsageFlags::TRANSFER_DST) else {
+                    crate::warn!("gpu: import audit: no read-back buffer");
+                    return;
+                };
+                crate::info!("gpu: import audit every {} ms ({} imports a round)", audit_ms(), AUDIT_SPANS);
+                let mut next = 0usize;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(audit_ms()));
+                    next = audit_round(buf, ptr, next);
                 }
-            };
-            let Some(b) = next else { break };
-            REIMPORTS.fetch_add(1, Ordering::Relaxed);
-            a = match import_span(b, 4) {
-                Some((_, _, end)) if end > b => end,
-                _ => (b & !(WINDOW - 1)) + WINDOW,
-            };
+            }),
+        );
+        if let Err(e) = r {
+            crate::warn!("gpu: import audit thread: {e}");
+        }
+    });
+}
+
+/// One audit round from span index `next` on (`audit_ms`); the next round's
+/// start.
+fn audit_round(buf: vk::Buffer, ptr: *mut u8, next: usize) -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    if DEVICE_LOST.load(Relaxed) {
+        return next;
+    }
+    AUDIT[4].fetch_add(1, Relaxed);
+    let round = AUDIT[4].load(Relaxed);
+    // (No dropped import freed while its page is read.)
+    let _gy = GRAVEYARD.lock();
+    // (start, end, buffer, page, born, replacing, exact)
+    let picks: Vec<(u64, u64, vk::Buffer, u64, u64, bool, bool)> = {
+        let g = spans_read();
+        let n = g.len();
+        if n == 0 {
+            return 0;
+        }
+        (0..n.min(AUDIT_SPANS))
+            .map(|k| {
+                let s = &g[(next + k) % n];
+                let pages = ((s.end - s.start) / 4096).max(1);
+                let h = (round.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (k as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)) >> 17;
+                (s.start, s.end, s.buffer, s.start + (h % pages) * 4096, s.born, s.replacing.load(Ordering::Acquire), s.exact)
+            })
+            .filter(|p| p.0 & 4095 == 0 && p.3 + 4096 <= p.1)
+            .collect()
+    };
+    let read = |which: &[usize], half: usize| -> bool {
+        let r = super::resident::one_off_now(|cmd| unsafe {
+            let regions: Vec<vk::BufferCopy> = which.iter().enumerate().map(|(j, &i)| vk::BufferCopy { src_offset: picks[i].3 - picks[i].0, dst_offset: ((half * AUDIT_SPANS + j) * 4096) as u64, size: 4096 }).collect();
+            for (j, &i) in which.iter().enumerate() {
+                ctx().device.cmd_copy_buffer(cmd, picks[i].2, buf, &regions[j..j + 1]);
+            }
+        });
+        r.is_ok()
+    };
+    // The CPU's view of page `p` (None: not readable now).
+    let cpu = |p: u64| -> Option<Vec<u8>> {
+        let _readers = crate::mem::GUEST_READERS.read_recursive();
+        if !crate::mem::os_readable(p, 4096) {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(p as *const u8, 4096) }.to_vec())
+    };
+    let all: Vec<usize> = (0..picks.len()).collect();
+    if !read(&all, 0) {
+        return next + picks.len();
+    }
+    let mut again = Vec::new();
+    for (j, &i) in all.iter().enumerate() {
+        let gpu = unsafe { std::slice::from_raw_parts(ptr.add(j * 4096), 4096) };
+        match cpu(picks[i].3) {
+            None => {
+                AUDIT[3].fetch_add(1, Relaxed);
+            }
+            Some(c) => {
+                AUDIT[0].fetch_add(1, Relaxed);
+                if c != gpu {
+                    AUDIT[1].fetch_add(1, Relaxed);
+                    again.push(i);
+                }
+            }
         }
     }
+    // Before and after the second read: the GPU's bytes must be one of them.
+    let before: Vec<Option<Vec<u8>>> = again.iter().map(|&i| cpu(picks[i].3)).collect();
+    if !again.is_empty() && read(&again, 1) {
+        for (j, &i) in again.iter().enumerate() {
+            let gpu = unsafe { std::slice::from_raw_parts(ptr.add((AUDIT_SPANS + j) * 4096), 4096) };
+            let (Some(c0), Some(c)) = (before[j].as_ref(), cpu(picks[i].3)) else { continue };
+            let diff: Vec<usize> = (0..4096).filter(|&b| gpu[b] != c0[b] && gpu[b] != c[b]).collect();
+            if diff.is_empty() {
+                continue;
+            }
+            let k = AUDIT[2].fetch_add(1, Relaxed);
+            if k < 64 {
+                let (s, e, _, pg, born, replacing, exact) = picks[i];
+                let at = diff[0];
+                crate::warn!(
+                    "gpu: import audit: import {s:#x}..{e:#x} (born at flip {born}, now {}{}{}) reads page {pg:#x} other than the CPU does: {} bytes the CPU had neither before nor after, the first at +{at:#x} (GPU {:02x?}, CPU after {:02x?})",
+                    super::FRAMES.load(Relaxed),
+                    if replacing { "; kept over a remap" } else { "" },
+                    if exact { "; an upload's own pages" } else { "" },
+                    diff.len(),
+                    &gpu[at..(at + 8).min(4096)],
+                    &c[at..(at + 8).min(4096)]
+                );
+            }
+        }
+    }
+    drop(_gy);
+    audit_mirror(buf, ptr, round, &cpu);
+    next + picks.len()
+}
+
+/// The import audit's part for front end 2's mirror: pages it holds as
+/// current, armed now and never GPU-written (`fe2::audit_sample`), read from
+/// the mirror and compared with the CPU's view; one that differs is read
+/// again 50 ms later (an upload queued before the read lands meanwhile) and
+/// logged when it still differs while still current and armed: the mirror
+/// holds what the guest no longer does, and its readers draw that.
+fn audit_mirror(buf: vk::Buffer, ptr: *mut u8, round: u64, cpu: &dyn Fn(u64) -> Option<Vec<u8>>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some((mbuf, _)) = super::resident::mirror_buffer() else { return };
+    let base = super::resident::MIRROR_BASE;
+    let read = |pages: &[u64]| -> bool {
+        super::resident::one_off_now(|cmd| unsafe {
+            let regions: Vec<vk::BufferCopy> = pages.iter().enumerate().map(|(j, &p)| vk::BufferCopy { src_offset: p - base, dst_offset: (j * 4096) as u64, size: 4096 }).collect();
+            ctx().device.cmd_copy_buffer(cmd, mbuf, buf, &regions);
+        })
+        .is_ok()
+    };
+    let pages = super::fe2::audit_sample(AUDIT_SPANS, round.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+    if pages.is_empty() || !read(&pages) {
+        return;
+    }
+    let mut again = Vec::new();
+    for (j, &p) in pages.iter().enumerate() {
+        let m = unsafe { std::slice::from_raw_parts(ptr.add(j * 4096), 4096) };
+        let Some(c) = cpu(p) else { continue };
+        AUDIT[5].fetch_add(1, Relaxed);
+        if m != c.as_slice() && super::fe2::audit_still(p) {
+            AUDIT[6].fetch_add(1, Relaxed);
+            again.push(p);
+        }
+    }
+    if again.is_empty() {
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    if !read(&again) {
+        return;
+    }
+    for (j, &p) in again.iter().enumerate() {
+        let m = unsafe { std::slice::from_raw_parts(ptr.add(j * 4096), 4096) };
+        let Some(c) = cpu(p) else { continue };
+        if !super::fe2::audit_still(p) {
+            continue;
+        }
+        let diff: Vec<usize> = (0..4096).filter(|&b| m[b] != c[b]).collect();
+        if diff.is_empty() {
+            continue;
+        }
+        let k = AUDIT[7].fetch_add(1, Relaxed);
+        if k < 64 {
+            let at = diff[0];
+            crate::warn!(
+                "gpu: import audit: front end 2's mirror holds page {p:#x} as current and armed but other than guest memory (flip {}): {} bytes differ, the first at +{at:#x} (mirror {:02x?}, guest {:02x?}); imports over it: {}",
+                super::FRAMES.load(Relaxed),
+                diff.len(),
+                &m[at..(at + 8).min(4096)],
+                &c[at..(at + 8).min(4096)],
+                spans_read().iter().filter(|s| s.start <= p && p < s.end).map(|s| format!("{:#x}..{:#x} born {}{}{}", s.start, s.end, s.born, if s.replacing.load(Ordering::Acquire) { " kept" } else { "" }, if s.exact { " exact" } else { "" })).collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
+}
+
+/// Status part: the import audit's counts (`DS_IMPORT_AUDIT`).
+fn audit_line() -> String {
+    if audit_ms() == 0 {
+        return String::new();
+    }
+    let v: Vec<u64> = AUDIT.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    format!(
+        "    import audit (`DS_IMPORT_AUDIT`): {} rounds, {} pages compared, {} differing at the first read, {} read by the GPU as the CPU had them neither before nor after (logged), {} not readable; front end 2's mirror: {} current armed pages compared, {} differing at the first read, {} again 50 ms later while still current and armed (logged)\n",
+        v[4], v[0], v[1], v[2], v[3], v[5], v[6], v[7]
+    )
+}
+
+/// Drops the exact imports (`import_exact`) over guest [lo, hi) that a
+/// listed window import covers, as a kept one is dropped (`replace_one`):
+/// out of the list, their pages in the guest page table mapped by the
+/// windows still over them (one update), freed once no batch can use them.
+fn retire_exact(lo: u64, hi: u64) {
+    let mut g = spans_write();
+    let covered = |e: &Span, g: &[Span]| g.iter().any(|s| s.valid && !s.exact && !s.replacing.load(Ordering::Acquire) && s.start <= e.start && e.end <= s.end);
+    let idx: Vec<usize> = (0..g.len()).filter(|&i| g[i].exact && g[i].start < hi && lo < g[i].end && covered(&g[i], &g)).collect();
+    if idx.is_empty() {
+        return;
+    }
+    // (Highest first: each swap_remove moves the last one, never one still
+    // to be removed.)
+    let mut dead = Vec::with_capacity(idx.len());
+    for &i in idx.iter().rev() {
+        dead.push(g.swap_remove(i));
+    }
+    for d in &dead {
+        let maps: Vec<(u64, u64, u64)> = g.iter().filter(|v| v.valid && v.start < d.end && d.start < v.end).map(|v| (v.start, v.end - v.start, ctx().buffer_address(v.buffer))).collect();
+        super::pagetable::unmap_then_map(d.start, d.end - d.start, &maps);
+    }
+    DROP_GEN.fetch_add(1, Ordering::AcqRel);
+    CACHE_GEN.fetch_add(1, Ordering::AcqRel);
+    let generation = SPAN_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+    drop(g);
+    DEFER_STATS[9].fetch_add(dead.len() as u64, Ordering::Relaxed);
+    let mut gy = GRAVEYARD.lock();
+    for mut span in dead {
+        span.valid = false;
+        super::vk::note_gpu_dropped(span.buffer);
+        gy.push(Dead { span, generation, seq: None });
+    }
+    GRAVEYARD_LEN.store(gy.len() as u64, Ordering::Release);
+}
+
+/// Imports met by the remapped ranges `changed`: kept listed, each queued
+/// once for its replacement (met again while queued, it waits longer).
+fn keep_remapped(changed: &[(u64, u64)]) {
+    let now = std::time::Instant::now();
+    let g = spans_read();
+    let mut q = REPLACE.lock();
+    let mut queued = false;
+    for s in g.iter().filter(|s| s.valid && changed.iter().any(|&(a, b)| a < s.end && s.start < b)) {
+        if s.replacing.swap(true, Ordering::AcqRel) {
+            REPLACE_STATS[1].fetch_add(1, Ordering::Relaxed);
+            if let Some(r) = q.iter_mut().find(|r| r.buffer == Some(s.buffer)) {
+                r.last = now;
+            }
+            continue;
+        }
+        if REPLACE_STATS[0].fetch_add(1, Ordering::Relaxed) < 20 {
+            crate::info!("gpu: guest range {:#x}..{:#x} imported for the GPU was remapped (kept until its replacement off the recording threads)", s.start, s.end);
+        }
+        q.push(Replace { start: s.start, end: s.end, buffer: Some(s.buffer), last: now });
+        queued = true;
+    }
+    drop(q);
+    drop(g);
+    if queued {
+        importer_wake();
+    }
+}
+
+/// Asks for the import of guest [base, base+size)'s window off the
+/// recording threads (`fe2_upload` copies the run by the CPU meanwhile):
+/// not again while a request covering it waits (one made meanwhile finds
+/// the import listed).
+fn queue_import(base: u64, size: u64) {
+    let end = base + size;
+    {
+        let mut q = REPLACE.lock();
+        if q.len() >= 4096 || q.iter().any(|r| r.buffer.is_none() && r.start <= base && end <= r.end) {
+            return;
+        }
+        q.push(Replace { start: base, end, buffer: None, last: std::time::Instant::now() });
+    }
+    DEFER_STATS[2].fetch_add(1, Ordering::Relaxed);
+    importer_wake();
+}
+
+/// Wakes the imports' thread (made at its first use).
+fn importer_wake() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let name = "gpu-async-imports";
+        if let Err(e) = crate::thread::spawn_host(
+            name,
+            1 << 20,
+            Box::new(move || {
+                crate::log::set_thread_name(name);
+                crate::exception::arm_watch_current_thread(false);
+                REPLACER.with(|c| c.set(true));
+                replacer();
+            }),
+        ) {
+            crate::warn!("gpu: the imports' thread: {e} (kept imports stay, imports asked ahead are not made)");
+        }
+    });
+    REPLACE_CV.notify_one();
+}
+
+/// The imports' thread: imports asked ahead first (wanted now), then each
+/// kept import whose pages were quiet for REPLACE_QUIET, oldest first
+/// (`replace_one`).
+fn replacer() {
+    loop {
+        let r = {
+            let mut q = REPLACE.lock();
+            loop {
+                let now = std::time::Instant::now();
+                if let Some(i) = q.iter().position(|r| r.buffer.is_none()).or_else(|| q.iter().position(|r| now.duration_since(r.last) >= REPLACE_QUIET)) {
+                    break q.remove(i);
+                }
+                match q.iter().map(|r| REPLACE_QUIET.saturating_sub(now.duration_since(r.last))).min() {
+                    Some(w) => {
+                        REPLACE_CV.wait_for(&mut q, w);
+                    }
+                    None => REPLACE_CV.wait(&mut q),
+                }
+            }
+        };
+        match r.buffer {
+            Some(b) => replace_one(&r, b),
+            None => {
+                let t = std::time::Instant::now();
+                let ok = import_span(r.start, r.end - r.start).is_some();
+                if ok {
+                    let w = r.start & !(WINDOW - 1);
+                    retire_exact(w, w + WINDOW);
+                }
+                DEFER_STATS[if ok { 3 } else { 4 }].fetch_add(1, Ordering::Relaxed);
+                let ns = t.elapsed().as_nanos() as u64;
+                DEFER_STATS[5].fetch_add(ns, Ordering::Relaxed);
+                IMPORT_WIN[7].fetch_add(ns, Ordering::Relaxed);
+                IMPORT_WIN[8].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Imports the kept window's mappings now, then drops it: out of the list,
+/// its pages in the guest page table mapped by the windows still over them
+/// (one update), freed once no batch can use it (its deferred decommits
+/// done then). Still mapped whole, its range is imported as one window
+/// (a binding over several 64 MiB windows needs one import over them all);
+/// else its mappings window by window. A remap meeting a new import while
+/// it is made drops that one (`import_once`); a later remap queues the new
+/// one again.
+fn replace_one(r: &Replace, buffer: vk::Buffer) {
+    let t = std::time::Instant::now();
+    let (made, failed) = if crate::mem::mapped(r.start, r.end - r.start) {
+        match import_span(r.start, r.end - r.start) {
+            Some(_) => (1, 0),
+            None => (0, 1),
+        }
+    } else {
+        import_mappings(r.start, r.end)
+    };
+    let mut g = spans_write();
+    if let Some(i) = g.iter().position(|s| s.buffer == buffer) {
+        let d = g.swap_remove(i);
+        let maps: Vec<(u64, u64, u64)> = g.iter().filter(|v| v.valid && v.start < d.end && d.start < v.end).map(|v| (v.start, v.end - v.start, ctx().buffer_address(v.buffer))).collect();
+        super::pagetable::unmap_then_map(d.start, d.end - d.start, &maps);
+        DROP_GEN.fetch_add(1, Ordering::AcqRel);
+        CACHE_GEN.fetch_add(1, Ordering::AcqRel);
+        let generation = SPAN_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+        drop(g);
+        IMPORTS_STALE.fetch_add(1, Ordering::Relaxed);
+        let mut span = d;
+        span.valid = false;
+        super::vk::note_gpu_dropped(span.buffer);
+        let mut gy = GRAVEYARD.lock();
+        gy.push(Dead { span, generation, seq: None });
+        GRAVEYARD_LEN.store(gy.len() as u64, Ordering::Release);
+    }
+    REPLACE_STATS[2].fetch_add(1, Ordering::Relaxed);
+    REPLACE_STATS[3].fetch_add(made, Ordering::Relaxed);
+    REPLACE_STATS[4].fetch_add(failed, Ordering::Relaxed);
+    let ns = t.elapsed().as_nanos() as u64;
+    REPLACE_STATS[5].fetch_add(ns, Ordering::Relaxed);
+    IMPORT_WIN[6].fetch_add(1, Ordering::Relaxed);
+    IMPORT_WIN[7].fetch_add(ns, Ordering::Relaxed);
+}
+
+/// Status part: imports kept over remaps and their replacements, imports
+/// asked ahead and the copies by the CPU meanwhile.
+fn kept_imports_line() -> String {
+    let v: Vec<u64> = REPLACE_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let d: Vec<u64> = DEFER_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if v[0] == 0 && d[0] == 0 && d[7] == 0 && IMPORTS_GROWN[0].load(Ordering::Relaxed) == 0 {
+        return String::new();
+    }
+    format!(
+        "    imports off the recording threads: windows kept over a remap (`tune import_keep`) {} ({} remaps met while kept), replaced {} ({} imports made or found, {} failed; {} ms); short uploads into the mirror whose window was not imported (`tune import_defer`): their own pages imported {} ({} ms; {} dropped under a window since), copied by the CPU {} ({} pages; {} imported here instead: GPU work writes them), window imports asked {} ({} made or found, {} failed; {} ms); {} waiting; imports begun past live imports of their run (`tune import_grow`) {} ({} MiB not pinned again)\n",
+        v[0],
+        v[1],
+        v[2],
+        v[3],
+        v[4],
+        v[5] / 1_000_000,
+        d[7],
+        d[8] / 1_000_000,
+        d[9],
+        d[0],
+        d[1],
+        d[6],
+        d[2],
+        d[3],
+        d[4],
+        d[5] / 1_000_000,
+        REPLACE.lock().len(),
+        IMPORTS_GROWN[0].load(Ordering::Relaxed),
+        IMPORTS_GROWN[1].load(Ordering::Relaxed) >> 20
+    )
 }
 
 /// Import windows made again right after their window was dropped
@@ -1045,13 +1578,9 @@ pub(super) fn import_window(base: u64, size: u64) -> Option<(vk::Buffer, u64, u6
     span(base, size)
 }
 
-/// Imported buffer covering guest [base, base+size): (buffer, window start, window end).
-#[track_caller]
-fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
-    revalidate_spans();
-    let generation = CACHE_GEN.load(Ordering::Acquire);
-    let end = base.saturating_add(size);
-    let hit = SPAN_CACHE.with(|c| {
+/// This thread's cached import over guest [base, end) at `generation`.
+fn span_cached(generation: u64, base: u64, end: u64) -> Option<(vk::Buffer, u64, u64)> {
+    SPAN_CACHE.with(|c| {
         let mut c = c.borrow_mut();
         if c.0 != generation {
             c.0 = generation;
@@ -1062,7 +1591,47 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
         let x = c.1.remove(i);
         c.1.insert(0, x);
         Some((x.2, x.0, x.1))
+    })
+}
+
+/// Caches import (start, end, buffer) for this thread, found at `generation`.
+fn span_cache_put(generation: u64, st: u64, e: u64, b: vk::Buffer) {
+    SPAN_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if CACHE_GEN.load(Ordering::Acquire) == generation {
+            if c.0 != generation {
+                c.0 = generation;
+                c.1.clear();
+            }
+            c.1.insert(0, (st, e, b));
+            c.1.truncate(SPAN_CACHE_LEN);
+        }
     });
+}
+
+/// The listed import over guest [base, base+size), without importing one
+/// (`fe2_upload`'s deferred imports), looked up as `span` does.
+fn listed_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
+    revalidate_spans();
+    let generation = CACHE_GEN.load(Ordering::Acquire);
+    let end = base.saturating_add(size);
+    if let Some(h) = span_cached(generation, base, end) {
+        return Some(h);
+    }
+    let found = spans_read().iter().find(|s| s.valid && s.start <= base && end <= s.end).map(|s| (s.buffer, s.start, s.end));
+    if let Some((b, st, e)) = found {
+        span_cache_put(generation, st, e, b);
+    }
+    found
+}
+
+/// Imported buffer covering guest [base, base+size): (buffer, window start, window end).
+#[track_caller]
+fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
+    revalidate_spans();
+    let generation = CACHE_GEN.load(Ordering::Acquire);
+    let end = base.saturating_add(size);
+    let hit = span_cached(generation, base, end);
     if hit.is_some() {
         return hit;
     }
@@ -1077,7 +1646,9 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
         return None;
     }
     let r = found.or_else(|| {
+        IMPORT_SITE.with(|c| c.set(Some(site)));
         let r = import_span(base, size);
+        IMPORT_SITE.with(|c| c.set(None));
         if let (Some((_, st, e)), true) = (r, super::resident::enabled()) {
             let mut g = IMPORT_SITES.lock();
             let x = g.get_or_insert_with(HashMap::new).entry((site.file(), site.line())).or_default();
@@ -1087,17 +1658,7 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
         r
     });
     if let Some((b, st, e)) = r {
-        SPAN_CACHE.with(|c| {
-            let mut c = c.borrow_mut();
-            if CACHE_GEN.load(Ordering::Acquire) == generation {
-                if c.0 != generation {
-                    c.0 = generation;
-                    c.1.clear();
-                }
-                c.1.insert(0, (st, e, b));
-                c.1.truncate(SPAN_CACHE_LEN);
-            }
-        });
+        span_cache_put(generation, st, e, b);
     }
     r
 }
@@ -1287,22 +1848,49 @@ fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     None
 }
 
+/// Imports that began past live imports of their run (`tune import_grow`):
+/// [imports, bytes not pinned again].
+static IMPORTS_GROWN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Where an import of the mapping run from `vs` for guest address `base`
+/// begins (`tune import_grow`): the end of the chain of live imports from
+/// `vs` on (each starting inside the last, none being replaced) when it
+/// ends at or before `base`; `vs` when there is none. A range across a
+/// chain's end is imported from the run's start (one window must hold it).
+fn grown_from(vs: u64, base: u64) -> u64 {
+    let g = spans_read();
+    let mut c = vs;
+    loop {
+        let next = g.iter().filter(|s| s.valid && !s.replacing.load(Ordering::Acquire) && s.start <= c && c < s.end && s.end <= base).map(|s| s.end).max();
+        match next {
+            Some(e) if e > c => c = e,
+            _ => return c,
+        }
+    }
+}
+
 /// One `import_span`: None when a mapping change met the import.
 fn import_once(base: u64, size: u64) -> Option<Option<(vk::Buffer, u64, u64)>> {
     // Residency: smaller windows (their pages become host class).
     // Mirror mode: exact pages (imports are only for what the mirror cannot
     // hold: CP writes, host-class pages), so they cover no mirror page.
-    let window = if super::resident::mirror_mode() { 4096 } else if super::resident::enabled() { RES_WINDOW } else { WINDOW };
+    // An exact import (`import_exact`): the pages asked for.
+    let exact = EXACT_IMPORT.with(|c| c.get());
+    let window = if exact || super::resident::mirror_mode() { 4096 } else if super::resident::enabled() { RES_WINDOW } else { WINDOW };
     let (lo, hi) = (base & !(window - 1), (base + size).next_multiple_of(window));
     let me = loop {
-        if let Some(s) = spans_read().iter().find(|s| s.valid && s.start <= base && base + size <= s.end) {
+        // (Not a kept one: its replacement is being made; nor an exact one
+        // for a window import: the window is what is asked for.)
+        if let Some(s) = spans_read().iter().find(|s| s.valid && !s.replacing.load(Ordering::Acquire) && (exact || !s.exact) && s.start <= base && base + size <= s.end) {
             return Some(Some((s.buffer, s.start, s.end)));
         }
         // Registered over the windows it may take, unless an import there is
         // in progress: then its end is waited for and the list looked at
         // again.
         let mut g = IMPORTING.lock();
-        if g.iter().any(|m| m.start < hi && lo < m.end) {
+        // (An exact import does not wait for one in progress over its pages:
+        // the window's, made off the recording threads.)
+        if !exact && g.iter().any(|m| m.start < hi && lo < m.end) {
             let t = std::time::Instant::now();
             IMPORTING_DONE.wait_for(&mut g, std::time::Duration::from_millis(50));
             drop(g);
@@ -1330,7 +1918,15 @@ fn import_once(base: u64, size: u64) -> Option<Option<(vk::Buffer, u64, u64)>> {
         }
     }
     let a = fixed().import_align;
-    let (mut start, mut end) = (vs & !(a - 1), ve.next_multiple_of(a).min(ve));
+    // Pages the guest mapped after live imports of this run: from their end
+    // on (`tune import_grow`; their pages are pinned already).
+    let from = if !exact && super::tune::import_grow() && !crate::sections::on() && !crate::mem::views_on() { grown_from(vs, base) } else { vs };
+    let first = if from > vs && from & !(a - 1) >= vs { from & !(a - 1) } else { vs & !(a - 1) };
+    if first > vs {
+        IMPORTS_GROWN[0].fetch_add(1, Ordering::Relaxed);
+        IMPORTS_GROWN[1].fetch_add(first - vs, Ordering::Relaxed);
+    }
+    let (mut start, mut end) = (first, ve.next_multiple_of(a).min(ve));
     if start < vs || end <= start {
         return Some(None);
     }
@@ -1363,7 +1959,17 @@ fn import_once(base: u64, size: u64) -> Option<Option<(vk::Buffer, u64, u64)>> {
     crate::hosted::disarm_if_armed(start, end - start);
     let t0 = std::time::Instant::now();
     let imported = ctx().import_host(start + alias, end - start, usage);
-    super::hitch::note_since(super::hitch::Kind::Mirror, tw, || format!("an import of {start:#x}..{end:#x} ({} MiB; the driver's part {} ms)", (end - start) >> 20, t0.elapsed().as_millis()));
+    super::hitch::note_since(super::hitch::Kind::Mirror, tw, || {
+        // (Who asked: the imports' thread, or the code whose lookup missed.)
+        let by = if REPLACER.with(|c| c.get()) {
+            ", off the recording threads".to_string()
+        } else if exact {
+            ", an upload's own pages".to_string()
+        } else {
+            IMPORT_SITE.with(|c| c.get()).map_or(String::new(), |l| format!(", for {}:{}", l.file().rsplit(['/', '\\']).next().unwrap_or(l.file()), l.line()))
+        };
+        format!("an import of {start:#x}..{end:#x} ({} MiB; the driver's part {} ms{by})", (end - start) >> 20, t0.elapsed().as_millis())
+    });
     match imported {
         Ok((buffer, mem, va)) => {
             let ns = t0.elapsed().as_nanos() as u64;
@@ -1383,15 +1989,32 @@ fn import_once(base: u64, size: u64) -> Option<Option<(vk::Buffer, u64, u64)>> {
             if ms >= 50 {
                 crate::info!("gpu: importing guest {start:#x}..{end:#x} ({} MiB) took {ms} ms", (end - start) >> 20);
             }
-            IMPORT_WIN[0].fetch_add(1, Ordering::Relaxed);
-            IMPORT_WIN[1].fetch_add(end - start, Ordering::Relaxed);
-            IMPORT_WIN[2].fetch_add(ns, Ordering::Relaxed);
-            IMPORT_WIN[3].fetch_max(ns, Ordering::Relaxed);
-            g.push(Span { start, end, buffer, mem, valid: true, born: super::FRAMES.load(Ordering::Relaxed), first_use: AtomicU64::new(u64::MAX), used_at: AtomicU64::new(u64::MAX) });
+            // (The replacements' imports are counted with them.)
+            if !REPLACER.with(|c| c.get()) {
+                IMPORT_WIN[0].fetch_add(1, Ordering::Relaxed);
+                IMPORT_WIN[1].fetch_add(end - start, Ordering::Relaxed);
+                IMPORT_WIN[2].fetch_add(ns, Ordering::Relaxed);
+                IMPORT_WIN[3].fetch_max(ns, Ordering::Relaxed);
+            }
+            g.push(Span {
+                start,
+                end,
+                buffer,
+                mem,
+                valid: true,
+                born: super::FRAMES.load(Ordering::Relaxed),
+                first_use: AtomicU64::new(u64::MAX),
+                used_at: AtomicU64::new(u64::MAX),
+                replacing: std::sync::atomic::AtomicBool::new(false),
+                exact,
+            });
             super::pagetable::map(start, end - start, va);
             drop(g);
             IMPORTS.fetch_add(1, Ordering::Relaxed);
             IMPORT_BYTES.fetch_add(end - start, Ordering::Relaxed);
+            if audit_ms() != 0 {
+                audit_start();
+            }
             if pieces > 1 {
                 IMPORTS_MULTI.fetch_add(1, Ordering::Relaxed);
             }
@@ -6863,6 +7486,10 @@ pub struct Exec {
     /// The imports (start, buffer) its uploads read (`Span::first_use`).
     fe2_spans: Vec<(u64, vk::Buffer)>,
     fe2_mine: super::fx::Set<u64>,
+    /// Runs of its uploads copied by the CPU while their window's import is
+    /// made off the recording threads (`mirror_copy_now`): its pages for the
+    /// batch's work (`fe2_mine`), not the mirror's after it.
+    fe2_copied: Vec<(u64, u64)>,
     fe2_marked: bool,
     /// Guest-memory copies of GPU-performed CP writes left for the batch's
     /// close, in order (`tune fe2_cpw_defer`): import, offset, bytes.
@@ -7779,6 +8406,7 @@ impl Exec {
                 fe2_up: Vec::new(),
                 fe2_spans: Vec::new(),
                 fe2_mine: Default::default(),
+                fe2_copied: Vec::new(),
                 fe2_marked: false,
                 fe2_host_later: Vec::new(),
                 fe2_gens: Vec::new(),
@@ -9214,6 +9842,14 @@ impl Exec {
                 p += PAGE;
             }
         }
+        // (Copied by the CPU meanwhile: the batch's, not the mirror's.)
+        for (a, b) in std::mem::take(&mut self.fe2_copied) {
+            let mut p = a;
+            while p < b {
+                mine.insert(p);
+                p += PAGE;
+            }
+        }
         for &(a, b) in &deferred[first_pend..] {
             let mut p = a;
             while p < b {
@@ -9421,7 +10057,28 @@ impl Exec {
         let mut x = a;
         while x < b {
             let e = ((x & !(WINDOW - 1)) + WINDOW).min(b);
-            match span(x, e - x) {
+            // A short run whose window is not imported yet (`tune
+            // import_defer`): its own pages imported now (1), or copied by the
+            // CPU (2: current for this batch only, as below; not for work held
+            // past a label wait or a stretch's, which reads the pages as they
+            // are when it runs), the window imported off the recording
+            // threads.
+            let mode = super::tune::import_defer();
+            let defer = mode != 0 && e - x <= DEFER_COPY_MAX && !super::resident::mirror_mode();
+            let copy = mode == 2 && !(self.held || self.past || self.past_grow || self.stretch);
+            let found = match if defer { listed_span(x, e - x) } else { span(x, e - x) } {
+                None if copy && self.cpu_copy_safe(x, e) && self.mirror_copy_now(mbuf, x, e) => {
+                    queue_import(x, e - x);
+                    x = e;
+                    continue;
+                }
+                None if defer => {
+                    queue_import(x, e - x);
+                    if mode == 1 { import_exact(x, e - x).or_else(|| span(x, e - x)) } else { span(x, e - x) }
+                }
+                f => f,
+            };
+            match found {
                 Some((buf, start, wend)) => {
                     let e = e.min(wend);
                     if !self.fe2_spans.iter().any(|&(s, b)| s == start && b == buf) {
@@ -9464,7 +10121,7 @@ impl Exec {
         let first = up.len();
         let r = super::fe2::resolve(&mut runs, &|p| mine.contains(&p), &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable);
         let mut mine = mine;
-        for &(a, b) in &up[first..] {
+        for &(a, b) in up[first..].iter().chain(std::mem::take(&mut self.fe2_copied).iter()) {
             let mut p = a;
             while p < b {
                 mine.insert(p);
@@ -9855,6 +10512,79 @@ impl Exec {
             self.pre_copies.push((sbuf, mbuf, vk::BufferCopy { src_offset: at, dst_offset: pg - res::MIRROR_BASE + 4 * d as u64, size: len }));
             at += len;
         }
+        true
+    }
+
+    /// Whether guest [x, e) may be read on the CPU now for an upload into the
+    /// mirror (`mirror_copy_now`): no GPU work recorded or in flight writes
+    /// it (this executor's batches not submitted yet, any queue's unfinished
+    /// ones, deferred CP writes, resident homes; an import's copy runs in
+    /// the GPU's order, after them), and front end 2 never marked a page of
+    /// it GPU-written (its dwords may live in the mirror until their
+    /// write-back: a copy read ahead of that overwrote them, 8-3's geometry
+    /// torn apart in the tour, FINDINGS.md 2026-10-30 night).
+    fn cpu_copy_safe(&mut self, x: u64, e: u64) -> bool {
+        let r = [(x, e - x)];
+        let safe = !(super::homes::overlaps(x, e - x) || self.overlaps_pending(&r) || CP_WRITES.latest(&r).is_some() || INFLIGHT.latest(&r).is_some() || super::fe2::any_gpu_written(x, e));
+        if !safe {
+            DEFER_STATS[6].fetch_add(1, Ordering::Relaxed);
+        }
+        safe
+    }
+
+    /// Copies guest [x, e) (whole pages) into the batch's staging now and
+    /// records its copy into the mirror (`fe2_upload`, while the window's
+    /// import is made off the recording threads): its pages are the batch's
+    /// (`fe2_copied`), current for its work only (CPU writes after the copy
+    /// are not in it), as `mirror_stage`'s. False: not all readable, or no
+    /// staging.
+    fn mirror_copy_now(&mut self, mbuf: vk::Buffer, x: u64, e: u64) -> bool {
+        use super::resident as res;
+        let bytes = e - x;
+        let (sbuf, sptr, at, extra) = if self.stage_used + bytes <= STAGE_SEG {
+            let Some((sbuf, sptr)) = self.stage_buffer() else { return false };
+            (sbuf, sptr, self.stage_used, false)
+        } else {
+            if self.slots[self.cur].stage_extra.is_empty() || self.extra_used + bytes > EXTRA_SEG {
+                match ctx().host_buffer(EXTRA_SEG, vk::BufferUsageFlags::TRANSFER_SRC) {
+                    Ok(s) => {
+                        self.slots[self.cur].stage_extra.push(s);
+                        self.extra_used = 0;
+                    }
+                    Err(err) => {
+                        crate::warn!("gpu[{}]: no extra staging for mirror uploads ({err})", self.name);
+                        return false;
+                    }
+                }
+            }
+            let (sbuf, _, sptr) = *self.slots[self.cur].stage_extra.last().expect("extra staging");
+            (sbuf, sptr, self.extra_used, true)
+        };
+        {
+            // No mapping change meanwhile (no import pins these pages).
+            let _readers = crate::mem::GUEST_READERS.read_recursive();
+            if !crate::mem::os_readable(x, bytes) {
+                return false;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(x as *const u8, sptr.add(at as usize), bytes as usize) };
+        }
+        if extra {
+            self.extra_used += bytes;
+        } else {
+            self.stage_used += bytes;
+        }
+        self.pre_copies.push((sbuf, mbuf, vk::BufferCopy { src_offset: at, dst_offset: x - res::MIRROR_BASE, size: bytes }));
+        let pages = bytes / res::PAGE;
+        super::fe2::note_memcpy(pages);
+        if self.held {
+            // (Read now: checked when held work settles.)
+            self.held_reads.push((x, bytes));
+            self.note_kinds(2, pages as usize);
+        }
+        self.fe2_copied.push((x, e));
+        DEFER_STATS[0].fetch_add(1, Ordering::Relaxed);
+        DEFER_STATS[1].fetch_add(pages, Ordering::Relaxed);
+        IMPORT_WIN[9].fetch_add(1, Ordering::Relaxed);
         true
     }
 
@@ -15097,5 +15827,7 @@ pub fn status() -> String {
             super::vk::ctx_heaps()
         )
         + &remaps_over_imports_line()
+        + &kept_imports_line()
+        + &audit_line()
         + &format!("    gpu completion: {} ms waiting for fences, {} ms in actions\n", FENCE_NS.load(Ordering::Relaxed) / 1_000_000, ACTION_NS.load(Ordering::Relaxed) / 1_000_000)
 }

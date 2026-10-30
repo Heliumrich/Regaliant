@@ -1514,7 +1514,7 @@ pub static DEFERRED_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::syn
 
 /// Decommits under GPU imports wait for them (`DS_DEFER_DECOMMIT=0`: at
 /// once, as before; for A/B).
-fn defer_decommits() -> bool {
+pub fn defer_decommits() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("DS_DEFER_DECOMMIT").ok().as_deref() != Some("0"))
 }

@@ -165,6 +165,29 @@ pub fn unmap(guest: u64, len: u64) {
     STATS[1].fetch_add(n, Ordering::Relaxed);
 }
 
+/// Clears guest [guest, guest+len) and maps `maps` (guest, bytes, device
+/// address) over it as one update: a batch submitted between a clear and
+/// its maps would read nothing there.
+pub fn unmap_then_map(guest: u64, len: u64, maps: &[(u64, u64, u64)]) {
+    if !made() {
+        return;
+    }
+    let mut p = PENDING.lock();
+    if let Some((first, n, _)) = pages(guest, len) {
+        p.push((first, n, 0));
+        STATS[1].fetch_add(n, Ordering::Relaxed);
+    }
+    for &(g, l, dev) in maps {
+        if dev == 0 {
+            continue;
+        }
+        if let Some((first, n, lo)) = pages(g, l) {
+            p.push((first, n, dev.wrapping_add(lo.wrapping_sub(g))));
+            STATS[0].fetch_add(n, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Copies the queued updates into the table on the main queue, before the
 /// batch about to be submitted (called in sequence order, `submit_batch`).
 pub(super) fn submit_pending(c: &Ctx) -> Result<(), String> {

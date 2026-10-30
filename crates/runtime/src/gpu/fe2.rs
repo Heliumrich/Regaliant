@@ -1559,6 +1559,73 @@ fn fix_run(a: u64, b: u64, ep: u32, mine: &dyn Fn(u64) -> bool, upload: &mut dyn
     Ok(())
 }
 
+/// Diagnosis (`exec`'s import audit, `DS_IMPORT_AUDIT`): up to `n` pages M
+/// holds as current that are armed now (a CPU write faults, which ends the
+/// arming) and were never written by GPU work: such a page reads in M as in
+/// guest memory. `seed` varies the sample.
+pub fn audit_sample(n: usize, seed: u64) -> Vec<u64> {
+    let mut out = Vec::with_capacity(n);
+    let mut h = seed | 1;
+    let mut next = || {
+        h ^= h << 13;
+        h ^= h >> 7;
+        h ^= h << 17;
+        h
+    };
+    for _ in 0..n * 256 {
+        if out.len() >= n {
+            break;
+        }
+        let r = next();
+        let ci = (r % CHUNKS as u64) as usize;
+        let p = TABLE[ci].load(Ordering::Acquire);
+        if p.is_null() {
+            continue;
+        }
+        let c = unsafe { &*p };
+        let w = ((r >> 40) % WORDS as u64) as usize;
+        let wa = MIRROR_BASE + ((ci as u64) << CHUNK_SHIFT) + w as u64 * 64 * PAGE;
+        let bits = audit_bits(c, w, wa);
+        if bits == 0 {
+            continue;
+        }
+        let mut b = bits;
+        for _ in 0..next() % bits.count_ones() as u64 {
+            b &= b - 1;
+        }
+        out.push(wa + b.trailing_zeros() as u64 * PAGE);
+    }
+    out
+}
+
+fn audit_bits(c: &Chunk, w: usize, wa: u64) -> u64 {
+    c.valid[w].load(Ordering::Acquire) & c.armed[w].load(Ordering::Acquire) & crate::hosted::armed_word(wa) & !c.gpu[w].load(Ordering::Acquire)
+}
+
+/// Whether page `p` (`audit_sample`) is still current in M, armed and never
+/// GPU-written.
+pub fn audit_still(p: u64) -> bool {
+    let Some(c) = chunk(p, false) else { return false };
+    audit_bits(c, idx(p) / 64, p & !(64 * PAGE - 1)) & (1u64 << (idx(p) % 64)) != 0
+}
+
+/// Whether a page of [a, b) was ever marked written by GPU work (or has no
+/// chunk): its dwords may live in M until their write-back lands, and an
+/// upload of the page read on the CPU ahead of that would overwrite them
+/// (`exec`'s copies by the CPU while an import is made).
+pub fn any_gpu_written(a: u64, b: u64) -> bool {
+    let mut x = a;
+    while x < b {
+        let e = word_end(x, b);
+        let Some(c) = chunk(x, false) else { return true };
+        if word_mask(x, e) & c.gpu[idx(x) / 64].load(Ordering::Acquire) != 0 {
+            return true;
+        }
+        x = e;
+    }
+    false
+}
+
 /// Uploads the pages of [a, b) M lacks (not `mine`), as runs of consecutive
 /// ones (word by word: only the invalid pages are looked at one by one):
 /// (pages, whether an upload failed; the rest of the range is still made
