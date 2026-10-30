@@ -253,6 +253,18 @@ fn run_draw(vs: &Slot, ps: Option<&Slot>, g: &super::exec::GfxRegs) {
             STATS[GFX_FAILED].fetch_add(1, Ordering::Relaxed);
         }
     }
+    // LOD statistics in rotation (`tune lod_late` >= 2): the variant this
+    // draw's pixel program measures with, made ahead too.
+    if let (Some(s), Some(p)) = (ps, p.as_ref()) {
+        if shaders::lod_rotated(p) && super::lodstats::counted(&p.resources) {
+            let r = s.regs();
+            if let Ok(m) = shaders::with_lod_stats(|| shaders::prepare_ps(r)) {
+                if !r.missed.load(Ordering::Relaxed) && super::exec::precompile_gfx(g, &v, Some(&m)) == Some(true) {
+                    STATS[GFX_COMPILED].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
 }
 
 fn compile(p: &Prepared) {

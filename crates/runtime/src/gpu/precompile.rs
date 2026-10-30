@@ -86,12 +86,17 @@ struct StageSeen {
     mrt: [MrtSpec; 8],
     early_tests: bool,
     early_ok: bool,
+    /// A pixel stage of a draw measuring LOD statistics where they are
+    /// decided per draw (`shaders::lod_per_draw`: its depth tests stay after
+    /// the shader and it keeps them; the other draws' variant has none).
+    lod_measure: bool,
     resources: Vec<ResSpec>,
 }
 
 impl StageSeen {
     fn of(s: &Spec) -> StageSeen {
-        StageSeen { user_sgprs: s.user_sgprs, wave64: s.wave64, base_instance: s.base_instance_sgpr, ps_input_addr: s.ps_input_addr, ps_inputs: s.ps_inputs.clone(), mrt: s.mrt, early_tests: s.early_tests, early_ok: s.early_ok, resources: s.resources.clone() }
+        let lod_measure = s.stage == rdna::translate::Stage::Fragment && s.lod_stats && !s.batched && !s.early_tests && !s.early_ok && super::shaders::lod_per_draw();
+        StageSeen { user_sgprs: s.user_sgprs, wave64: s.wave64, base_instance: s.base_instance_sgpr, ps_input_addr: s.ps_input_addr, ps_inputs: s.ps_inputs.clone(), mrt: s.mrt, early_tests: s.early_tests, early_ok: s.early_ok, lod_measure, resources: s.resources.clone() }
     }
 }
 
@@ -580,11 +585,16 @@ fn run_gfx(i: usize) {
         let v = &r.vs_seen;
         let Some(vs_spec) = super::shaders::vertex_spec(vs_addr, v.user_sgprs, v.wave64, v.base_instance, v.resources.clone()) else { return Ok(None) };
         let vs_tr = stage(r.vs, vs_addr, vs_spec)?;
+        let ps_spec = |p: &StageSeen, measure: bool| super::shaders::pixel_spec(ps_addr, p.user_sgprs, p.wave64, p.ps_input_addr, p.ps_inputs.clone(), p.mrt, p.early_tests, p.early_ok, p.resources.clone(), measure);
         let ps_tr = match &r.ps_seen {
-            Some(p) if r.ps != 0 => Some((stage(r.ps, ps_addr, super::shaders::pixel_spec(ps_addr, p.user_sgprs, p.wave64, p.ps_input_addr, p.ps_inputs.clone(), p.mrt, p.early_tests, p.early_ok, p.resources.clone()))?, ps_addr)),
+            Some(p) if r.ps != 0 => Some((stage(r.ps, ps_addr, ps_spec(p, p.lod_measure))?, ps_addr)),
             _ => None,
         };
-        Ok(super::exec::precompile_gfx_translations((&vs_tr, vs_addr), ps_tr.as_ref().map(|(t, a)| (&**t, *a)), &r.state))
+        let made = super::exec::precompile_gfx_translations((&vs_tr, vs_addr), ps_tr.as_ref().map(|(t, a)| (&**t, *a)), &r.state);
+        if made == Some(true) && r.ps_seen.as_ref().is_some_and(|p| p.lod_measure) {
+            GFX_DONE[4].fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(made)
     })();
     match made {
         Ok(Some(true)) => {
@@ -603,8 +613,9 @@ fn run_gfx(i: usize) {
 }
 
 /// Graphics pipelines made from objects: [created, their ns, present
-/// already, failed].
-static GFX_DONE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// already, failed, of the created those of draws measuring LOD statistics
+/// in rotation].
+static GFX_DONE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// A graphics pipeline was created on a draw's path (`exec::draw`): its
 /// stages' specs and state are learned (once).
@@ -857,12 +868,13 @@ fn res_token(t: &str) -> Option<ResSpec> {
 }
 
 /// A stage: user data, wave64, base-instance SGPR (- none), PS_INPUT_ADDR,
-/// early tests (bit 0 asked for, bit 1 allowed: `Spec::early_ok`), `m` the targets' (export format, class) pairs, then `p`
+/// early tests (bit 0 asked for, bit 1 allowed: `Spec::early_ok`; bit 2 a
+/// draw measuring LOD statistics in rotation), `m` the targets' (export format, class) pairs, then `p`
 /// pixel inputs (param/flat/default, 9 none) and the resources.
 fn format_stage(s: &StageSeen) -> String {
     let mrt: Vec<String> = s.mrt.iter().flat_map(|m| [m.export_format.to_string(), m.class.to_string()]).collect();
     let inputs = s.ps_inputs.iter().map(|i| format!("p{}/{}/{}", i.param, i.flat as u8, i.default.unwrap_or(9)));
-    let mut t = vec![s.user_sgprs.to_string(), (s.wave64 as u8).to_string(), s.base_instance.map_or("-".to_string(), |b| b.to_string()), format!("{:x}", s.ps_input_addr), (s.early_tests as u8 | (s.early_ok as u8) << 1).to_string(), format!("m{}", mrt.join("/"))];
+    let mut t = vec![s.user_sgprs.to_string(), (s.wave64 as u8).to_string(), s.base_instance.map_or("-".to_string(), |b| b.to_string()), format!("{:x}", s.ps_input_addr), (s.early_tests as u8 | (s.early_ok as u8) << 1 | (s.lod_measure as u8) << 2).to_string(), format!("m{}", mrt.join("/"))];
     t.extend(inputs);
     t.extend(res_tokens(&s.resources));
     t.join(" ")
@@ -878,7 +890,7 @@ fn parse_stage(text: &str) -> Option<StageSeen> {
     };
     let ps_input_addr = u32::from_str_radix(it.next()?, 16).ok()?;
     let early: u8 = it.next()?.parse().ok()?;
-    let (early_tests, early_ok) = (early & 1 != 0, early & 2 != 0);
+    let (early_tests, early_ok, lod_measure) = (early & 1 != 0, early & 2 != 0, early & 4 != 0);
     let m: Vec<u8> = it.next()?.strip_prefix('m')?.split('/').map(|x| x.parse().ok()).collect::<Option<Vec<u8>>>()?;
     if m.len() != 16 {
         return None;
@@ -894,7 +906,7 @@ fn parse_stage(text: &str) -> Option<StageSeen> {
             resources.push(res_token(t)?);
         }
     }
-    Some(StageSeen { user_sgprs, wave64, base_instance, ps_input_addr, ps_inputs, mrt, early_tests, early_ok, resources })
+    Some(StageSeen { user_sgprs, wave64, base_instance, ps_input_addr, ps_inputs, mrt, early_tests, early_ok, lod_measure, resources })
 }
 
 /// `G <vs hash> <ps hash> ; <vertex stage> ; <pixel stage | -> ; <state>`;
@@ -1021,7 +1033,7 @@ pub fn status() -> String {
     };
     let made = if super::tune::precompile() >= 2 {
         let g: Vec<u64> = GFX_DONE.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-        format!("{made}; graphics pipelines made from objects: {} ({:.1} s), {} present already, {} failed", g[0], g[1] as f64 / 1e9, g[2], g[3])
+        format!("{made}; graphics pipelines made from objects: {} ({:.1} s), {} present already, {} failed ({} created for draws measuring LOD statistics in rotation)", g[0], g[1] as f64 / 1e9, g[2], g[3], g[4])
     } else {
         made
     };
@@ -1088,6 +1100,7 @@ mod tests {
             mrt: std::array::from_fn(|k| MrtSpec { export_format: if ps && k < 2 { 9 } else { 0 }, class: if k == 1 { 2 } else { 0 } }),
             early_tests: ps,
             early_ok: ps,
+            lod_measure: ps,
             resources: vec![ResSpec::Buffer { format: 0, dst_sel: 0 }, ResSpec::Image { dim: ImageDim::D2, class: NumClass::Float, depth: false }, ResSpec::Sampler],
         };
         let r = GfxRecipe {

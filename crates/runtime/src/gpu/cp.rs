@@ -7344,12 +7344,15 @@ impl Cp {
                         // writes behind it).
                         let e = self.exec.as_mut().unwrap();
                         let slot = super::lodstats::take_slot();
-                        e.lod_stats_copy(slot, (flags >> 19) & 1 != 0);
+                        let reset = (flags >> 19) & 1 != 0;
+                        e.lod_stats_copy(slot, reset);
+                        // (The rotated draws' banks so far: `tune lod_late`.)
+                        let carry = if self.name == "gpu-gfx" { super::lodstats::end_report(reset) } else { None };
                         let name = self.name.clone();
                         let log = n < 2 || n.is_power_of_two() || n % 1000 == 0;
                         let f: Box<dyn FnOnce() + Send> = Box::new(move || {
                             let words = super::exec::lod_stats_words(slot);
-                            let (sampled, by_mip) = unsafe { super::lodstats::write_measured(buf, &words, slot) };
+                            let (sampled, by_mip) = unsafe { super::lodstats::write_measured(buf, &words, slot, carry.as_ref()) };
                             if log {
                                 let mips: Vec<String> = by_mip.iter().enumerate().filter(|&(_, &c)| c > 0).map(|(m, c)| format!("{m}:{c}")).collect();
                                 crate::info!("gpu[{name}]: GetLodStats #{n} (buffer {buf:#x}, flags {flags:#x}): {sampled} of 256 counter banks sampled (finest mip:banks {}; measured on the GPU)", mips.join(" "));

@@ -180,6 +180,54 @@ pub fn without_gpu_chains<T>(f: impl FnOnce() -> T) -> T {
     r
 }
 
+thread_local! {
+    /// Set while `with_lod_stats` runs.
+    static LOD_MEASURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the pixel stages it prepares keeping their LOD statistics
+/// where the depth tests stay after the shader (a draw measuring in
+/// rotation, `tune lod_late` >= 2: `lodstats::rotate`).
+pub fn with_lod_stats<T>(f: impl FnOnce() -> T) -> T {
+    LOD_MEASURE.with(|c| c.set(true));
+    let r = f();
+    LOD_MEASURE.with(|c| c.set(false));
+    r
+}
+
+/// Whether the LOD statistics of pixel programs whose depth tests stay
+/// after the shader are decided per draw (`tune lod_late` N >= 2, or 1 with
+/// `lod_skip`): their stages are prepared without them, and a draw that
+/// measures prepares its pixel stage again with them (`lodstats::rotate`).
+pub fn lod_per_draw() -> bool {
+    matches!(super::tune::lod_stats(), 3 | 4) && match super::tune::lod_late() {
+        0 => false,
+        1 => super::tune::lod_skip(),
+        _ => true,
+    }
+}
+
+/// Whether a pixel program whose depth tests stay after the shader keeps
+/// its LOD statistics (`tune lod_late`; `measure`: batched, or a draw
+/// measuring, `lod_per_draw`).
+fn late_stats(measure: bool) -> bool {
+    match super::tune::lod_late() {
+        0 => false,
+        _ if lod_per_draw() => measure,
+        _ => true,
+    }
+}
+
+/// Whether `p` is a pixel stage prepared without the LOD statistics its
+/// draws measure when they bind counted textures (`lod_per_draw`): a
+/// program whose depth tests stay after the shader, not batched (a batched
+/// run's draws' textures are not all known to the CPU: its stages keep
+/// them).
+pub fn lod_rotated(p: &Prepared) -> bool {
+    let s = &p.tr.spec;
+    s.stage == Stage::Fragment && !s.lod_stats && !s.batched && !s.early_tests && !s.early_ok && lod_per_draw()
+}
+
 /// Programs whose data-only loads GPU work was found writing when they were
 /// prepared (`tune gpu_loads 3`): prepared with GPU-side loads from then on
 /// (no second preparation per command); a generation for the threads'
@@ -1287,9 +1335,10 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
             spec.pt_linear = super::fe2::on();
         }
     }
-    // Diagnosis (`tune lod_late 0`): no LOD statistics where the depth
-    // tests stay after the shader.
-    if !super::tune::lod_late() && !spec.early_tests && !spec.early_ok {
+    // LOD statistics where the depth tests stay after the shader (`tune
+    // lod_late`): in rotation only for a draw measuring (`with_lod_stats`)
+    // or batched; none at 0 (diagnosis).
+    if spec.lod_stats && !spec.early_tests && !spec.early_ok && !late_stats(spec.batched || LOD_MEASURE.with(|c| c.get())) {
         spec.lod_stats = false;
         spec.lod_lean = false;
     }
@@ -2202,9 +2251,11 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
 }
 
 /// The key spec `prepare_ps` makes for the pixel program at `addr` drawn
-/// with these registers and descriptors, under the current switches.
+/// with these registers and descriptors, under the current switches
+/// (`measure`: a draw measuring LOD statistics in rotation).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr: u32, ps_inputs: Vec<PsInput>, mrt: [MrtSpec; 8], early_tests: bool, early_ok: bool, resources: Vec<ResSpec>) -> Spec {
+pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr: u32, ps_inputs: Vec<PsInput>, mrt: [MrtSpec; 8], early_tests: bool, early_ok: bool, resources: Vec<ResSpec>, measure: bool) -> Spec {
+    let lod = matches!(super::tune::lod_stats(), 3 | 4) && (early_tests || early_ok || late_stats(measure));
     Spec {
         stage: Stage::Fragment,
         user_sgprs,
@@ -2226,8 +2277,8 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         reg_vars: super::tune::reg_vars(),
         lane_guards: super::tune::lane_guards(),
         mip_views: super::tune::mip_views(),
-        lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
-        lod_lean: super::tune::lod_stats() == 4,
+        lod_stats: lod,
+        lod_lean: lod && super::tune::lod_stats() == 4,
         early_tests,
         early_ok,
         per_lane: false,

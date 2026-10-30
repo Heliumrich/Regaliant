@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 221] = [
+    static ALL: [Tunable; 222] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -254,6 +254,7 @@ pub mod tune {
         Tunable { name: "write_marks", env: "DS_WRITE_MARKS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_cpw_defer", env: "DS_FE2_CPW_DEFER", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "lod_late", env: "DS_LOD_LATE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "lod_skip", env: "DS_LOD_SKIP", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2390,13 +2391,27 @@ pub mod tune {
         get(219) != 0
     }
 
-    /// Diagnosis at 0 (the title's texture streaming then lacks those
-    /// textures' statistics): pixel programs whose depth tests stay after
-    /// the shader (a kill, coverage or export with depth or stencil
-    /// writes) leave the LOD statistics out, so the driver can test early
-    /// and write late as it does for any program without side effects.
-    pub fn lod_late() -> bool {
-        get(220) != 0
+    /// LOD statistics of pixel programs whose depth tests stay after the
+    /// shader (a kill, coverage or export with depth or stencil writes):
+    /// their atomics are side effects, so the driver shades every fragment
+    /// of such draws before testing depth, hidden ones too. 1: every draw
+    /// binding a counted texture measures (with `lod_skip` 0 every draw);
+    /// N >= 2: in rotation, one such draw in N (`lodstats`), the others
+    /// prepared without them (tested early and written late, as for any
+    /// program without side effects) carrying their textures' recent
+    /// measurements; 0 (diagnosis): none measures, so the title's texture
+    /// streaming lacks those textures' statistics.
+    pub fn lod_late() -> u64 {
+        get(220)
+    }
+
+    /// With `lod_late` 1: draws binding no texture whose T# enables
+    /// counting are prepared without LOD statistics (their atomics never
+    /// ran: the same reports, without the side effects; ~96% of such draws
+    /// at 1-3, -2.1% of a replayed frame's GPU time, FINDINGS.md
+    /// 2026-10-30 midday); 0: every draw keeps them (the reference).
+    pub fn lod_skip() -> bool {
+        get(221) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

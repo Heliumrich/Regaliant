@@ -1210,6 +1210,17 @@ impl Exec {
                 ps = Some(shaders::prepare_ps(cp)?);
             }
         }
+        // LOD statistics in rotation (`tune lod_late` >= 2): a pixel program
+        // whose depth tests stay after the shader, prepared without them,
+        // measures in one of its draws in N (prepared again with them); the
+        // others carry their textures' recent measurements (`lodstats`).
+        let lod_rotated = ps.as_ref().is_some_and(shaders::lod_rotated);
+        let lod_measure = lod_rotated && super::super::lodstats::rotate(&ps.as_ref().unwrap().resources);
+        if lod_measure {
+            let p = shaders::with_lod_stats(|| shaders::prepare_ps(cp))?;
+            super::super::lodstats::bound(&p.resources);
+            ps = Some(p);
+        }
         self.sync_readers = [vs.addr, ps.as_ref().map_or(0, |p| p.addr)];
         // Each stage's reads in place (no combined copy per draw), unless the
         // stages are used as prepared (`speculate`).
@@ -1232,7 +1243,17 @@ impl Exec {
             let same = shaders::words_unchanged(&vs) && ps.as_ref().is_none_or(shaders::words_unchanged);
             super::READ_WAIT_WORDS[if same { 0 } else { 1 }].fetch_add(1, Ordering::Relaxed);
             vs = prep_vs(cp)?;
-            ps = if ps_addr != 0 { Some(shaders::prepare_ps(cp)?) } else { None };
+            ps = match ps_addr {
+                0 => None,
+                _ if lod_measure => Some(shaders::with_lod_stats(|| shaders::prepare_ps(cp))?),
+                _ => Some(shaders::prepare_ps(cp)?),
+            };
+            if let Some(p) = ps.as_ref().filter(|_| lod_rotated) {
+                match lod_measure {
+                    true => super::super::lodstats::bound(&p.resources),
+                    false => super::super::lodstats::carry(&p.resources),
+                }
+            }
         }
         drop(batched_guard);
         drop(masks_guard);
