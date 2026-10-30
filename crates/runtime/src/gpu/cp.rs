@@ -7332,7 +7332,7 @@ impl Cp {
                     static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     let n = SEEN.fetch_add(1, Ordering::Relaxed);
                     let writable = size >= super::lodstats::BUFFER_BYTES && guest_readable(buf, super::lodstats::BUFFER_BYTES);
-                    if mode == 3 && writable && self.exec.is_some() {
+                    if matches!(mode, 3 | 4) && writable && self.exec.is_some() {
                         // Copied after the work recorded so far, written to the
                         // title's buffer once that completed (before the label
                         // writes behind it).

@@ -127,6 +127,7 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         mip_views: true,
         // RDNA_LOD_STATS=1: with the LOD-statistics instrumentation (validation).
         lod_stats: std::env::var_os("RDNA_LOD_STATS").is_some(),
+        lod_lean: std::env::var_os("RDNA_LOD_LEAN").is_some(),
         early_tests: false,
         per_lane: false,
         lane_votes: false,

@@ -1053,7 +1053,8 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         reg_vars: super::tune::reg_vars(),
         lane_guards: super::tune::lane_guards(),
         mip_views: super::tune::mip_views(),
-        lod_stats: super::tune::lod_stats() == 3,
+        lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
+        lod_lean: super::tune::lod_stats() == 4,
         early_tests: false,
         per_lane: false,
         lane_votes: false,
@@ -1229,7 +1230,8 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         reg_vars: super::tune::reg_vars(),
         lane_guards: super::tune::lane_guards(),
         mip_views: super::tune::mip_views(),
-        lod_stats: super::tune::lod_stats() == 3,
+        lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
+        lod_lean: super::tune::lod_stats() == 4,
         early_tests: ctx(DB_SHADER_CONTROL) & (1 << 12) != 0,
         per_lane: false,
         lane_votes: false,
@@ -1393,7 +1395,8 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         reg_vars: super::tune::reg_vars(),
         lane_guards: super::tune::lane_guards(),
         mip_views: super::tune::mip_views(),
-        lod_stats: super::tune::lod_stats() == 3,
+        lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
+        lod_lean: super::tune::lod_stats() == 4,
         early_tests: false,
         per_lane: false,
         lane_votes: false,
@@ -1869,11 +1872,21 @@ fn translate_kept(addr: u64, insts: &[rdna::Inst], plan: &Arc<Plan>, plan_key: u
         crate::info!("{:?} shader {addr:#x}: translated in {ms} ms ({} instructions, {} SPIR-V words)", spec.stage, insts.len(), out.spirv.len());
     }
     // Diagnosis (`DS_TRANSLATE_STATS=1`): every translation's size and the
-    // spec's lane model, for a census of the costliest programs.
-    static STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *STATS.get_or_init(|| std::env::var("DS_TRANSLATE_STATS").ok().as_deref() == Some("1")) {
+    // spec's lane model, for a census of the costliest programs; 2 also
+    // saves each program and its SPIR-V into the run directory's shaders/.
+    static STATS: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let stats = *STATS.get_or_init(|| std::env::var("DS_TRANSLATE_STATS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    if stats >= 2 {
+        if super::capture::save_program(addr).is_some() {
+            if let Some(dir) = crate::run_dir() {
+                let bytes: Vec<u8> = out.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+                let _ = std::fs::write(dir.join("shaders").join(format!("{addr:012x}-{spec_hash:016x}.spv")), bytes);
+            }
+        }
+    }
+    if stats >= 1 {
         crate::info!(
-            "translate stats: {:?} shader {addr:#x}: {} instructions -> {} SPIR-V words ({:.1} per instruction; wave64 {}, per lane {}, lane votes {}, local size {:?}, {} resources)",
+            "translate stats: {:?} shader {addr:#x}: {} instructions -> {} SPIR-V words ({:.1} per instruction; wave64 {}, per lane {}, lane votes {}, local size {:?}, {} resources, {} branches decided without a vote)",
             spec.stage,
             insts.len(),
             out.spirv.len(),
@@ -1882,7 +1895,8 @@ fn translate_kept(addr: u64, insts: &[rdna::Inst], plan: &Arc<Plan>, plan_key: u
             spec.per_lane,
             spec.lane_votes,
             spec.cs_local_size,
-            plan.resources.len()
+            plan.resources.len(),
+            out.masked_skips
         );
     }
     // Large translations compile for seconds on first use (play stalled
@@ -2114,7 +2128,8 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         reg_vars: super::tune::reg_vars(),
         lane_guards: super::tune::lane_guards(),
         mip_views: super::tune::mip_views(),
-        lod_stats: super::tune::lod_stats() == 3,
+        lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
+        lod_lean: super::tune::lod_stats() == 4,
         early_tests: false,
         per_lane: false,
         lane_votes: false,
@@ -2155,7 +2170,8 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         reg_vars: super::tune::reg_vars(),
         lane_guards: super::tune::lane_guards(),
         mip_views: super::tune::mip_views(),
-        lod_stats: super::tune::lod_stats() == 3,
+        lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
+        lod_lean: super::tune::lod_stats() == 4,
         early_tests,
         per_lane: false,
         lane_votes: false,
@@ -2196,7 +2212,8 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         reg_vars: super::tune::reg_vars(),
         lane_guards: super::tune::lane_guards(),
         mip_views: super::tune::mip_views(),
-        lod_stats: super::tune::lod_stats() == 3,
+        lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
+        lod_lean: super::tune::lod_stats() == 4,
         early_tests: false,
         per_lane: false,
         lane_votes: false,

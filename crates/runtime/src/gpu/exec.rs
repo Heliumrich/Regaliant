@@ -675,8 +675,8 @@ fn fixed() -> &'static Fixed {
             c.device.cmd_fill_buffer(cmd, dummy, 0, vk::WHOLE_SIZE, 0);
             c.device.cmd_fill_buffer(cmd, zero, 0, vk::WHOLE_SIZE, 0);
             // Every bank: no mip sampled (15), count 0.
-            c.device.cmd_fill_buffer(cmd, lodstats, 0, super::lodstats::SLOT_BYTES / 2, 15);
-            c.device.cmd_fill_buffer(cmd, lodstats, super::lodstats::SLOT_BYTES / 2, super::lodstats::SLOT_BYTES / 2, 0);
+            c.device.cmd_fill_buffer(cmd, lodstats, 0, super::lodstats::MIN_BYTES, 15);
+            c.device.cmd_fill_buffer(cmd, lodstats, super::lodstats::MIN_BYTES, super::lodstats::SLOT_BYTES - super::lodstats::MIN_BYTES, 0);
             c.device.end_command_buffer(cmd).ok();
             if c.submit(cmd, &[], &[], fence).is_ok() {
                 c.device.wait_for_fences(&[fence], true, u64::MAX).ok();
@@ -10463,8 +10463,9 @@ impl Exec {
         unsafe {
             d.cmd_copy_buffer(cmd, fx.lodstats, fx.lod_readback, &[vk::BufferCopy { src_offset: 0, dst_offset: slot as u64 * bytes, size: bytes }]);
             if reset {
-                d.cmd_fill_buffer(cmd, fx.lodstats, 0, bytes / 2, 15);
-                d.cmd_fill_buffer(cmd, fx.lodstats, bytes / 2, bytes / 2, 0);
+                let m = super::lodstats::MIN_BYTES;
+                d.cmd_fill_buffer(cmd, fx.lodstats, 0, m, 15);
+                d.cmd_fill_buffer(cmd, fx.lodstats, m, bytes - m, 0);
             }
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
             d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[mb], &[], &[]);

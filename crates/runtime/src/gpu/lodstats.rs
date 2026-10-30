@@ -7,7 +7,10 @@
 //! as written (zero) the streamer never loaded the high mips (chunk files) of
 //! most textures: they stayed at a quarter or an eighth of their resolution.
 //!
-//! The GPU here has no such counters. Mode 3 (`tune lod_stats`, default)
+//! The GPU here has no such counters. Mode 3 (`tune lod_stats`; mode 4
+//! the same with `Spec::lod_lean`: a bank's
+//! mip stored only when finer than the one it holds, the counts spread over
+//! `rdna::translate::LOD_COUNT_SLOTS` slots per bank and summed here)
 //! measures them: the translated sampling instructions of textures whose T#
 //! enables counting add to the T#'s bank the finest mip they sample (their
 //! level of detail relative to the texture's mip 0, from the implicit
@@ -25,6 +28,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 /// Bytes of the measured statistics (mip per bank, then count per bank).
 pub const SLOT_BYTES: u64 = rdna::translate::LOD_STATS_DWORDS as u64 * 4;
+/// The finest mip per bank, before the count slots.
+pub const MIN_BYTES: u64 = 256 * 4;
 /// Readback slots for measured statistics (GetLodStats packets in flight).
 pub const RING: usize = 16;
 static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
@@ -81,7 +86,11 @@ pub unsafe fn write_measured(buf: u64, words: &[u32], slot: usize) -> (u32, [u32
     let mut sampled = 0;
     let mut by_mip = [0u32; 16];
     for bank in 0..256 {
-        let (mip, count) = (words.get(bank).copied().unwrap_or(15), words.get(256 + bank).copied().unwrap_or(0));
+        // (Counts in LOD_COUNT_SLOTS slots per bank under mode 4; slot 0
+        // alone under mode 3.)
+        let count = (0..rdna::translate::LOD_COUNT_SLOTS as usize).map(|k| words.get(256 + 256 * k + bank).copied().unwrap_or(0) as u64).sum::<u64>();
+        let count = count.min(u32::MAX as u64) as u32;
+        let mip = words.get(bank).copied().unwrap_or(15);
         let entry = if count > 0 && mip < 15 {
             sampled += 1;
             by_mip[mip as usize] += 1;

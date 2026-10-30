@@ -211,6 +211,13 @@ pub struct Spec {
     /// enables counting record the finest mip they sample and a count in
     /// the T#'s counter bank (`BindingKind::LodStats`, [`LOD_INFO_ENABLED`]).
     pub lod_stats: bool,
+    /// With `lod_stats`: a bank's mip is stored only when it is finer than
+    /// the one the bank holds (read first: banks only get finer between
+    /// resets, so a stale read costs an atomic at most), and counts go to
+    /// the count slot the subgroup's position selects (`LOD_COUNT_SLOTS`):
+    /// the statistics cost the vista 4% of its GPU time as one min and one
+    /// add on one address per bank and subgroup (FINDINGS.md 2026-10-30).
+    pub lod_lean: bool,
     /// Pixel stage: the depth and stencil tests run before the shader
     /// (DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER, D3D's [earlydepthstencil]), so
     /// fragments that fail them do not run it and its image and buffer stores
@@ -376,6 +383,7 @@ impl std::hash::Hash for Spec {
         self.lane_guards.hash(state);
         self.mip_views.hash(state);
         self.lod_stats.hash(state);
+        self.lod_lean.hash(state);
         self.early_tests.hash(state);
         self.per_lane.hash(state);
         self.lane_votes.hash(state);
@@ -422,10 +430,16 @@ pub const IMAGE_TABLE_LEN: u32 = 64;
 /// (`BindingKind::StorageImageMips`).
 pub const MIP_VIEWS: u32 = 16;
 
+/// Count slots per counter bank of the LOD-statistics binding: with
+/// `Spec::lod_lean` a subgroup adds its lanes to the slot its position
+/// selects (one address per bank held every subgroup's atomic in turn), the
+/// CPU sums them.
+pub const LOD_COUNT_SLOTS: u32 = 8;
 /// The LOD-statistics binding (`Spec::lod_stats`): per counter bank the
-/// finest mip sampled (dwords 0..256; 15: none) and a count of sampling
-/// lanes (dwords 256..512).
-pub const LOD_STATS_DWORDS: u32 = 512;
+/// finest mip sampled (dwords 0..256; 15: none), then LOD_COUNT_SLOTS
+/// counts of sampling lanes (dwords 256 + 256 * slot + bank; slot 0 alone
+/// without `Spec::lod_lean`).
+pub const LOD_STATS_DWORDS: u32 = 256 + 256 * LOD_COUNT_SLOTS;
 /// LOD information of a sampled image, filled from its T# when binding
 /// (resource info dword 0 of an image; one dword per entry of an image
 /// table from [`lod_info_offset`]): counting enabled (T# word 5 bit 25,
@@ -551,6 +565,9 @@ pub struct Output {
     /// `Spec::batched`: the SGPR data binding is the whole ring and the push
     /// constant at byte 0 the dword offset of the workgroups' table.
     pub batched: bool,
+    /// Lane-dependent branches lockstep mode decided without a vote
+    /// (`masked_skip`).
+    pub masked_skips: u32,
 }
 
 /// Dwords of user data at the start of the SGPR data buffer.
@@ -742,6 +759,8 @@ pub(crate) struct T<'a> {
     /// Inside a lane guard (`emit_block_body`): this lane is active, so
     /// register writes need no select and `active` is true.
     pub lane_guard: bool,
+    /// Lane-dependent branches decided without a vote (`masked_skip`).
+    pub masked_skips: u32,
     /// Inside a lane guard, for the current block only (values made in a
     /// nested construct do not dominate the code after it): VGPR values
     /// written or loaded there, and bitcast pairs (f32 <-> u32) made there,
@@ -2068,6 +2087,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         sync_steps: None,
         lds_state: 0,
         lane_guard: false,
+        masked_skips: 0,
         vcache: HashMap::default(),
         bitcasts: HashMap::default(),
         vcache_block: None,
@@ -2530,7 +2550,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     // offsets come from a table): the runtime takes that from `sgpr_pc`.
     let batched = spec.batched;
     let sgpr_pc = if batched { Some(sgpr_pc_offset(spec.stage)) } else { spec.sgpr_pc };
-    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched })
+    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched, masked_skips: tr.masked_skips })
 }
 
 /// Wave-mask mode for the shader at `addr` (diagnosis: `DS_WAVEMASK=0`
@@ -2713,6 +2733,47 @@ fn lane_local(ins: &Inst) -> bool {
 /// (the guard's branch and labels cost about one select's words).
 const LANE_GUARD_MIN: usize = 3;
 
+/// Whether `ins` has no effect in a lane EXEC masks off: a lane-local VALU
+/// op, a vector memory or LDS access (not GDS) or a wait (`masked_skip`).
+fn exec_masked(ins: &Inst) -> bool {
+    match ins.enc {
+        Enc::Mubuf | Enc::Mtbuf | Enc::Mimg | Enc::Flat | Enc::Global | Enc::Scratch => true,
+        Enc::Ds => !ins.ds_gds(),
+        Enc::Sopp => matches!(ins.name(), Some("s_waitcnt" | "s_nop" | "s_inst_prefetch")),
+        _ => lane_local(ins),
+    }
+}
+
+/// A forward s_cbranch_execz over (or s_cbranch_execnz past) instructions
+/// that all have no effect in lanes EXEC masks off: whether a wave takes it
+/// changes nothing when it has no active lane, so lockstep mode need not
+/// decide it for the workgroup (a vote: a workgroup barrier each time).
+/// Some(false): execz never taken (the region runs, each lane by its EXEC
+/// bit, as it does already for a wave with no active lane beside an active
+/// one); Some(true): execnz always taken (the region it skips runs only
+/// with no lane active). The bitonic sort steps of the title's particle
+/// sorting cast two such votes per step (FINDINGS.md 2026-10-30).
+/// `DS_MASKED_SKIP=0` (diagnosis): every lane-dependent branch of lockstep
+/// mode decided by a vote, as before 2026-10-30.
+fn masked_skip_on() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_MASKED_SKIP").ok().as_deref() != Some("0"))
+}
+
+fn masked_skip(code: &[Inst], k: usize) -> Option<bool> {
+    let ins = &code[k];
+    let taken = match ins.name()? {
+        "s_cbranch_execz" => false,
+        "s_cbranch_execnz" => true,
+        _ => return None,
+    };
+    let target = ins.branch_target()?;
+    if target <= ins.pc {
+        return None;
+    }
+    code[k + 1..].iter().take_while(|i| i.pc < target).all(exec_masked).then_some(taken)
+}
+
 fn emit_block_body(tr: &mut T, code: &[Inst], start: u32, end: u32) -> R<()> {
     // LDS accesses of other blocks are unknown here.
     tr.lds_state = 3;
@@ -2758,7 +2819,16 @@ fn emit_block_body(tr: &mut T, code: &[Inst], start: u32, end: u32) -> R<()> {
             break;
         }
         if let Some(target) = ins.branch_target() {
-            let cond = branch_cond(tr, ins, &code[first..k])?;
+            // (Lockstep mode, `masked_skip`: no vote. `DS_MASKED_SKIP=0`:
+            // every lane-dependent branch voted on, as before 2026-10-30.)
+            let skip = (tr.lockstep && !tr.wave_masks && tr.uniformity.divergent_branches.contains(&ins.pc) && masked_skip_on()).then(|| masked_skip(code, k)).flatten();
+            let cond = match skip {
+                Some(taken) => {
+                    tr.masked_skips += 1;
+                    Some(tr.bool_c(taken))
+                }
+                None => branch_cond(tr, ins, &code[first..k])?,
+            };
             let tv = tr.u(target);
             let val = match cond {
                 None => tv,
@@ -3207,6 +3277,7 @@ mod tests {
             lane_guards: true,
             mip_views: true,
             lod_stats: false,
+            lod_lean: false,
             early_tests: false,
             per_lane: false,
             lane_votes: false,

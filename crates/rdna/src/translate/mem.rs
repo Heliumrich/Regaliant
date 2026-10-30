@@ -2211,6 +2211,8 @@ fn record_lod(tr: &mut T, ins: &Inst, image: Word, simg: Word, coord: Word, rdim
         let nh = e(tr.b.logical_not(bt, None, h))?;
         cond = e(tr.b.logical_and(bt, None, cond, nh))?;
     }
+    // `Spec::lod_lean`: this invocation's count slot, by its position.
+    let slot = if tr.spec.lod_lean { Some(lod_count_slot(tr)?) } else { None };
     tr.guarded(cond, &mut |tr| {
         tr.b.capability(spirv::Capability::GroupNonUniform);
         tr.b.capability(spirv::Capability::GroupNonUniformBallot);
@@ -2223,6 +2225,27 @@ fn record_lod(tr: &mut T, ins: &Inst, image: Word, simg: Word, coord: Word, rdim
         let first = e(tr.b.group_non_uniform_broadcast_first(u, None, sg, bank))?;
         let same = e(tr.b.i_equal(bt, None, bank, first))?;
         let count_at = e(tr.b.i_add(u, None, bank, k256))?;
+        let count_at = match slot {
+            Some(s) => {
+                let off = e(tr.b.i_mul(u, None, s, k256))?;
+                e(tr.b.i_add(u, None, count_at, off))?
+            }
+            None => count_at,
+        };
+        // The bank's finest mip; under `lod_lean` only when finer than the
+        // one it holds.
+        let store_min = |tr: &mut T, p: Word, m: Word| -> R<()> {
+            if slot.is_none() {
+                e(tr.b.atomic_u_min(u, None, p, scope, sem, m))?;
+                return Ok(());
+            }
+            let held = e(tr.b.load(u, None, p, None, []))?;
+            let finer = e(tr.b.u_greater_than(bt, None, held, m))?;
+            tr.guarded(finer, &mut |tr| {
+                e(tr.b.atomic_u_min(u, None, p, scope, sem, m))?;
+                Ok(())
+            })
+        };
         // Lanes sampling the subgroup's first bank (usually all): one lane
         // adds for them.
         tr.guarded(same, &mut |tr| {
@@ -2232,7 +2255,7 @@ fn record_lod(tr: &mut T, ins: &Inst, image: Word, simg: Word, coord: Word, rdim
             let el = e(tr.b.group_non_uniform_elect(bt, None, sg))?;
             tr.guarded(el, &mut |tr| {
                 let p = e(tr.b.access_chain(tr.t.sb_u32, None, stats, [zero, bank]))?;
-                e(tr.b.atomic_u_min(u, None, p, scope, sem, mm))?;
+                store_min(tr, p, mm)?;
                 let p = e(tr.b.access_chain(tr.t.sb_u32, None, stats, [zero, count_at]))?;
                 e(tr.b.atomic_i_add(u, None, p, scope, sem, n))?;
                 Ok(())
@@ -2242,12 +2265,55 @@ fn record_lod(tr: &mut T, ins: &Inst, image: Word, simg: Word, coord: Word, rdim
         tr.guarded(other, &mut |tr| {
             let one = tr.u(1);
             let p = e(tr.b.access_chain(tr.t.sb_u32, None, stats, [zero, bank]))?;
-            e(tr.b.atomic_u_min(u, None, p, scope, sem, mip))?;
+            store_min(tr, p, mip)?;
             let p = e(tr.b.access_chain(tr.t.sb_u32, None, stats, [zero, count_at]))?;
             e(tr.b.atomic_i_add(u, None, p, scope, sem, one))?;
             Ok(())
         })
     })
+}
+
+/// The LOD-statistics count slot of this invocation (`Spec::lod_lean`):
+/// from its position, 8-pixel tiles (pixel stage), its workgroup and wave
+/// (compute), its vertex (vertex stage), so that neighbouring subgroups add
+/// to different slots.
+fn lod_count_slot(tr: &mut T) -> R<Word> {
+    let u = tr.t.u32;
+    let k3 = tr.u(3);
+    let k5 = tr.u(5);
+    let km = tr.u(super::LOD_COUNT_SLOTS - 1);
+    let h = match tr.spec.stage {
+        Stage::Fragment if tr.frag_coord.is_some() => {
+            let fc = e(tr.b.load(tr.t.v4f, None, tr.frag_coord.unwrap(), None, []))?;
+            let x = e(tr.b.composite_extract(tr.t.f32, None, fc, [0]))?;
+            let y = e(tr.b.composite_extract(tr.t.f32, None, fc, [1]))?;
+            let x = e(tr.b.convert_f_to_u(u, None, x))?;
+            let y = e(tr.b.convert_f_to_u(u, None, y))?;
+            let x = e(tr.b.shift_right_logical(u, None, x, k3))?;
+            let y = e(tr.b.shift_right_logical(u, None, y, k3))?;
+            let y = e(tr.b.shift_left_logical(u, None, y, k3))?;
+            e(tr.b.bitwise_xor(u, None, x, y))?
+        }
+        Stage::Compute if tr.wg_id.is_some() => {
+            let w = tr.wg_id.unwrap();
+            let x = e(tr.b.composite_extract(u, None, w, [0]))?;
+            let y = e(tr.b.composite_extract(u, None, w, [1]))?;
+            let y = e(tr.b.shift_left_logical(u, None, y, k3))?;
+            let h = e(tr.b.bitwise_xor(u, None, x, y))?;
+            match tr.local_index {
+                Some(li) => {
+                    let wave = e(tr.b.shift_right_logical(u, None, li, k5))?;
+                    e(tr.b.i_add(u, None, h, wave))?
+                }
+                None => h,
+            }
+        }
+        _ => match tr.vertex_ids {
+            Some((v, _)) => e(tr.b.shift_right_logical(u, None, v, k5))?,
+            None => tr.u(0),
+        },
+    };
+    e(tr.b.bitwise_and(u, None, h, km))
 }
 
 #[allow(clippy::too_many_arguments)]
