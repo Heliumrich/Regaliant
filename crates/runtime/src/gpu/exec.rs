@@ -11412,6 +11412,10 @@ impl Exec {
         } else {
             None
         };
+        // (Every one with a mirror copy deferred, so that the batch's
+        // end-of-pipe timestamps are stored once, deadlocked a boot: every
+        // queue waited on labels the graphics queue's batch held for its
+        // close, FINDINGS.md 2026-10-30 morning.)
         let would_scatter = self.fe2_marked && !(super::tune::fe2_cpw_close() || (waited && super::tune::fe2_cpw_waited()));
         let host_later = super::tune::fe2_cpw_defer() && fe2_mirror.is_some() && (would_scatter || !self.fe2_host_later.is_empty());
         if !(waited && super::tune::ts_cpw_waited()) && !host_later {

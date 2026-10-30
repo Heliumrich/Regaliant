@@ -252,7 +252,7 @@ pub mod tune {
         Tunable { name: "ts_cpw_waited", env: "DS_TS_CPW_WAITED", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "early_auto", env: "DS_EARLY_AUTO", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "write_marks", env: "DS_WRITE_MARKS", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "fe2_cpw_defer", env: "DS_FE2_CPW_DEFER", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe2_cpw_defer", env: "DS_FE2_CPW_DEFER", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2375,8 +2375,10 @@ pub mod tune {
         get(218) != 0
     }
 
-    /// Front end 2 (default since 2026-10-30: +1.2% at the vista, tour
-    /// clean): a CP write the GPU performs that would need a
+    /// Front end 2 (opt-in: +1.2% at the vista, tour, walks and ten forced
+    /// reloads clean, but the same deferral of every CP write the GPU
+    /// performs deadlocked a boot, FINDINGS.md 2026-10-30 morning, and why
+    /// is not known): a CP write the GPU performs that would need a
     /// write-back first (a label no CP of ours waits on, after GPU work
     /// that wrote the mirror) goes into the mirror in place and into guest
     /// memory at the batch's close, after its one write-back, with the
