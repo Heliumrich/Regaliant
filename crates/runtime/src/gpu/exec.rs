@@ -11335,8 +11335,13 @@ impl Exec {
             self.end_rendering();
         }
         // End-of-pipe events are written in order on the console: a title
-        // that sees this value may read the timestamps taken before it.
-        self.resolve_timestamps();
+        // that sees this value may read the timestamps taken before it. (A
+        // label a CP of ours waits on: at the batch's close, `tune
+        // ts_cpw_waited`.)
+        let waited = super::cp::cp_waited(a);
+        if !(waited && super::tune::ts_cpw_waited()) {
+            self.resolve_timestamps();
+        }
         // Front end 2: what earlier work wrote into the mirror reaches guest
         // memory before this write does (a title thread that sees it reads
         // that there), and the write goes into the mirror too (later work
@@ -11345,7 +11350,6 @@ impl Exec {
         if self.fe2_marked {
             // (A label our command processors wait on: GPU-to-GPU
             // synchronization, `tune fe2_cpw_waited`.)
-            let waited = super::cp::cp_waited(a);
             if waited {
                 SCATTER_SITES[3].fetch_add(1, Ordering::Relaxed);
             }

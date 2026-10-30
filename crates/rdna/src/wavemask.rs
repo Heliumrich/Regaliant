@@ -109,7 +109,20 @@ fn width(name: &str) -> u16 {
     }
 }
 
+/// `DS_EXEC_PARTIAL=1`: EXEC complete only where something reads it whole
+/// (before 2026-10-30, and without the switch, always: each compare writing
+/// EXEC took a ballot, a workgroup barrier; six in a row before one branch
+/// in the title's screen-space passes).
+pub(crate) fn exec_partial() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_EXEC_PARTIAL").ok().as_deref() == Some("1"))
+}
+
 fn effects(ins: &Inst, wave64: bool) -> Fx {
+    effects_opts(ins, wave64, exec_partial())
+}
+
+fn effects_opts(ins: &Inst, wave64: bool, partial: bool) -> Fx {
     let mut fx = Fx::default();
     let name = ins.base_name().unwrap_or("");
     let mw = if wave64 { 2 } else { 1 };
@@ -146,7 +159,18 @@ fn effects(ins: &Inst, wave64: bool) -> Fx {
         Enc::Sop1 => {
             let (d, s) = (ins.sdst(), ins.ssrc0());
             let w = width(name);
-            if name.contains("saveexec") || name.contains("wrexec") {
+            if (name.contains("saveexec") || name.contains("wrexec")) && partial {
+                // Bitwise in EXEC and the source, lane by lane: the saved
+                // copy is the old EXEC; SCC tests the new one.
+                fx.prop(OP_EXEC_LO, d, w);
+                fx.prop(s, OP_EXEC_LO, w);
+                fx.prop(OP_EXEC_LO, OP_EXEC_LO, w);
+                fx.prop_scc(s, w);
+                fx.prop_scc(OP_EXEC_LO, w);
+                fx.def(d, w);
+                fx.def(OP_EXEC_LO, w);
+                fx.defs.push(SCC);
+            } else if name.contains("saveexec") || name.contains("wrexec") {
                 // EXEC is always complete: its sources are read whole.
                 fx.read(s, w);
                 fx.read(OP_EXEC_LO, w);
@@ -347,7 +371,7 @@ fn step(l: &mut Live, fx: &Fx, exec_live: bool) {
 /// Pcs of the VALU mask writes (compares, v_cmpx, carry-outs) whose result
 /// must be the complete wave mask.
 pub fn complete_masks(code: &[Inst], wave64: bool) -> HashSet<u32> {
-    analyze(code, wave64, false)
+    analyze(code, wave64, false, exec_partial())
 }
 
 /// Whether a VALU mask write may be read as a value: copied into a VGPR or
@@ -362,16 +386,26 @@ pub fn reads_mask_values(code: &[Inst], wave64: bool) -> bool {
 /// Pcs of the VALU mask writes whose value may be read (see
 /// [`reads_mask_values`]).
 pub fn mask_value_writes(code: &[Inst], wave64: bool) -> HashSet<u32> {
-    analyze(code, wave64, true)
+    analyze(code, wave64, true, exec_partial())
 }
 
-fn analyze(code: &[Inst], wave64: bool, values_only: bool) -> HashSet<u32> {
+fn analyze(code: &[Inst], wave64: bool, values_only: bool, partial: bool) -> HashSet<u32> {
     let mut out = HashSet::default();
     if code.is_empty() {
         return out;
     }
     let cfg = Cfg::new(code);
-    let fx: Vec<Fx> = code.iter().map(|i| if values_only { value_effects(i, wave64) } else { effects(i, wave64) }).collect();
+    let mut fx: Vec<Fx> = code.iter().map(|i| if values_only { value_effects(i, wave64) } else { effects_opts(i, wave64, partial) }).collect();
+    // (Partial EXEC: a forward EXEC branch over EXEC-masked instructions is
+    // decided without the mask, `translate::masked_skip`.)
+    if partial && !values_only && crate::translate::masked_skip_on() {
+        for (k, f) in fx.iter_mut().enumerate() {
+            if crate::translate::masked_skip(code, k).is_some() {
+                f.whole.clear();
+            }
+        }
+    }
+    let exec_live = !values_only && !partial;
     let nb = cfg.starts.len();
     let exit = cfg.exit();
     let mut live_in: Vec<Live> = vec![[false; N]; nb];
@@ -391,7 +425,7 @@ fn analyze(code: &[Inst], wave64: bool, values_only: bool) -> HashSet<u32> {
         for b in (0..nb).rev() {
             let mut l = live_out(&live_in, b);
             for i in (cfg.starts[b]..cfg.end(b)).rev() {
-                step(&mut l, &fx[i], !values_only);
+                step(&mut l, &fx[i], exec_live);
             }
             for k in 0..N {
                 if l[k] && !live_in[b][k] {
@@ -410,7 +444,7 @@ fn analyze(code: &[Inst], wave64: bool, values_only: bool) -> HashSet<u32> {
             if fx[i].mask && fx[i].defs.iter().any(|&d| l[d]) {
                 out.insert(code[i].pc);
             }
-            step(&mut l, &fx[i], !values_only);
+            step(&mut l, &fx[i], exec_live);
         }
     }
     out
@@ -445,6 +479,34 @@ mod tests {
 
     fn program(words: &[u32]) -> Vec<Inst> {
         crate::decode_program(words).unwrap()
+    }
+
+    /// Partial EXEC (`DS_EXEC_PARTIAL`): compares that only narrow EXEC for a
+    /// branch over EXEC-masked instructions need no complete mask; with EXEC
+    /// kept complete everywhere each of them does.
+    #[test]
+    fn exec_chain_before_a_masked_skip() {
+        use crate::tables::*;
+        let gt = opcode(VOPC, "v_cmpx_gt_u32");
+        let lt = opcode(VOPC, "v_cmpx_lt_u32");
+        let add = opcode(VOP2, "v_add_u32");
+        let execz = opcode(SOPP, "s_cbranch_execz");
+        let ds = opcode(DS, "ds_write_b32");
+        // v_cmpx_gt_u32 v0, v1 ; v_cmpx_lt_u32 v0, v2 ; s_cbranch_execz end ;
+        // v_add_u32 v3, v0, v1 ; ds_write_b32 v0, v3 ; end: s_endpgm
+        let code = program(&[
+            enc_vopc(gt, 256, 1),
+            enc_vopc(lt, 256, 2),
+            enc_sopp(execz, 3),
+            enc_vop2(add, 3, 256, 1),
+            (0x36 << 26) | (ds << 18),
+            3 << 8,
+            enc_sopp(1, 0),
+        ]);
+        assert_eq!(crate::translate::masked_skip(&code, 2), Some(false));
+        let whole = analyze(&code, true, false, false);
+        assert!(whole.contains(&code[0].pc) && whole.contains(&code[1].pc));
+        assert!(analyze(&code, true, false, true).is_empty());
     }
 
     #[test]

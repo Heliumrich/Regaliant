@@ -2033,7 +2033,12 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     };
     let sampler_ty = b.type_sampler();
     let (lockstep, one_wave) = lockstep_mode(spec, code);
-    let wave_masks = lockstep && one_wave && wave_masks_wanted(spec.code_base);
+    // (`DS_WAVEMASK_VOTES=1`: a single wave with LDS that reads no lane mask
+    // as a value runs on votes instead, as several waves do: each vote one
+    // workgroup barrier at a lane-dependent branch, `masked_skip` sparing
+    // most, against a ballot at every compare whose mask reaches EXEC or a
+    // branch.)
+    let wave_masks = lockstep && one_wave && wave_masks_wanted(spec.code_base) && !(wavemask_votes() && !crate::wavemask::reads_mask_values(code, spec.wave64));
     let mut tr = T {
         b,
         t,
@@ -2556,6 +2561,13 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
 /// Wave-mask mode for the shader at `addr` (diagnosis: `DS_WAVEMASK=0`
 /// disables it, `DS_WAVEMASK=<hex address>[,...]` keeps it for those
 /// shaders only).
+/// `DS_WAVEMASK_VOTES=1`: single-wave lockstep programs that read no lane
+/// mask as a value decide their branches by votes, not wave-mask mode.
+fn wavemask_votes() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_WAVEMASK_VOTES").ok().as_deref() == Some("1"))
+}
+
 fn wave_masks_wanted(addr: u64) -> bool {
     match std::env::var("DS_WAVEMASK") {
         Err(_) => true,
@@ -2755,12 +2767,12 @@ fn exec_masked(ins: &Inst) -> bool {
 /// sorting cast two such votes per step (FINDINGS.md 2026-10-30).
 /// `DS_MASKED_SKIP=0` (diagnosis): every lane-dependent branch of lockstep
 /// mode decided by a vote, as before 2026-10-30.
-fn masked_skip_on() -> bool {
+pub(crate) fn masked_skip_on() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *W.get_or_init(|| std::env::var("DS_MASKED_SKIP").ok().as_deref() != Some("0"))
 }
 
-fn masked_skip(code: &[Inst], k: usize) -> Option<bool> {
+pub(crate) fn masked_skip(code: &[Inst], k: usize) -> Option<bool> {
     let ins = &code[k];
     let taken = match ins.name()? {
         "s_cbranch_execz" => false,
@@ -2821,7 +2833,10 @@ fn emit_block_body(tr: &mut T, code: &[Inst], start: u32, end: u32) -> R<()> {
         if let Some(target) = ins.branch_target() {
             // (Lockstep mode, `masked_skip`: no vote. `DS_MASKED_SKIP=0`:
             // every lane-dependent branch voted on, as before 2026-10-30.)
-            let skip = (tr.lockstep && !tr.wave_masks && tr.uniformity.divergent_branches.contains(&ins.pc) && masked_skip_on()).then(|| masked_skip(code, k)).flatten();
+            // (Wave-mask mode with `DS_EXEC_PARTIAL=1` too: EXEC may then be
+            // partial there.)
+            let decide = masked_skip_on() && tr.lockstep && if tr.wave_masks { crate::wavemask::exec_partial() } else { tr.uniformity.divergent_branches.contains(&ins.pc) };
+            let skip = decide.then(|| masked_skip(code, k)).flatten();
             let cond = match skip {
                 Some(taken) => {
                     tr.masked_skips += 1;

@@ -42,6 +42,8 @@ static COUNTS: [Counts; SLOTS] = [ZERO; SLOTS];
 /// sorted; slot = index (SLOTS - 1: none of them or past the table).
 struct Window {
     maps: Vec<(u64, u64, crate::mem::VmaKind, u32, String)>,
+    /// The console's memory type of each (`Vma::mtype`).
+    mtypes: Vec<i32>,
     flip0: u64,
 }
 
@@ -59,9 +61,9 @@ pub fn reset() {
     if !on() {
         return;
     }
-    let maps: Vec<_> = {
+    let (maps, mtypes): (Vec<_>, Vec<i32>) = {
         let st = crate::mem::MEM.lock();
-        st.vmas.values().filter(|v| v.start < MIRROR_END && v.end() > MIRROR_BASE && v.kind != crate::mem::VmaKind::Reserved).map(|v| (v.start, v.end(), v.kind, v.prot, v.name.clone())).collect()
+        st.vmas.values().filter(|v| v.start < MIRROR_END && v.end() > MIRROR_BASE && v.kind != crate::mem::VmaKind::Reserved).map(|v| ((v.start, v.end(), v.kind, v.prot, v.name.clone()), v.mtype)).unzip()
     };
     let mut w = WINDOW.write();
     for c in &COUNTS {
@@ -78,7 +80,7 @@ pub fn reset() {
     }
     *PAGES.lock() = Some(HashMap::new());
     *RAISES.lock() = Some(HashMap::new());
-    *w = Some(Window { maps, flip0: super::FRAMES.load(Ordering::Relaxed) });
+    *w = Some(Window { maps, mtypes, flip0: super::FRAMES.load(Ordering::Relaxed) });
 }
 
 fn slot_of(w: &Window, a: u64) -> Option<usize> {
@@ -223,6 +225,36 @@ pub fn report() -> String {
     };
     by("GPU-writable mappings", &|m| m.3 & crate::mem::PROT_GPU_WRITE != 0);
     by("other mappings", &|m| m.3 & crate::mem::PROT_GPU_WRITE == 0);
+    // By the console's memory type: where GPU-written pages lie and whether
+    // the CPU writes the same mappings (a write-back left out for memory
+    // the CPU reads slowly on the console, if no CPU writes meet it).
+    let mut types: std::collections::BTreeMap<i32, [u64; 7]> = std::collections::BTreeMap::new();
+    for r in &rows {
+        let t = types.entry(w.mtypes.get(r.s).copied().unwrap_or(-1)).or_default();
+        t[0] += 1;
+        t[1] += w.maps[r.s].1 - w.maps[r.s].0;
+        t[2] += r.gpu;
+        t[3] += wr[r.s][0];
+        if r.gpu > 0 {
+            t[4] += 1;
+            if wr[r.s][0] > 0 {
+                t[5] += 1;
+                t[6] += r.gpu;
+            }
+        }
+    }
+    for (mt, t) in &types {
+        out.push_str(&format!(
+            "    fe2 census, memory type {mt}: {} mappings of {} MiB; {} pages GPU work wrote, {} distinct pages the CPU wrote; {} mappings with GPU-written pages, {} of them also written by the CPU ({} of their GPU-written pages)\n",
+            t[0],
+            t[1] >> 20,
+            t[2],
+            t[3],
+            t[4],
+            t[5],
+            t[6]
+        ));
+    }
     // The mappings with the most takes, then the most pages written.
     let line = |r: &Row, wr: &[u64; 3]| {
         let m = &w.maps[r.s];

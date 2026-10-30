@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 216] = [
+    static ALL: [Tunable; 217] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -249,6 +249,7 @@ pub mod tune {
         Tunable { name: "log_big", env: "DS_LOG_BIG", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_mine_fast", env: "DS_FE2_MINE_FAST", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "vma_cache", env: "DS_VMA_CACHE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "ts_cpw_waited", env: "DS_TS_CPW_WAITED", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2340,6 +2341,16 @@ pub mod tune {
     #[inline]
     pub fn vma_cache() -> bool {
         get(215) != 0
+    }
+
+    /// Before a GPU-performed CP write of a label our command processors
+    /// wait on (`cp::cp_waited`: GPU-to-GPU synchronization), the batch's
+    /// end-of-pipe timestamps are not stored to guest memory yet (they are
+    /// at its close), as `fe2_cpw_waited` leaves its write-back: the console
+    /// writes them in order, so a title thread that sees a label may read
+    /// the timestamps before it; left open as there.
+    pub fn ts_cpw_waited() -> bool {
+        get(216) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
