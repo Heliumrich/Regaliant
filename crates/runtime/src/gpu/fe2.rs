@@ -2845,6 +2845,9 @@ static PROBES: AtomicU64 = AtomicU64::new(0);
 /// Write-backs handed over through the region (`tune wb_region`).
 static HANDOFFS: AtomicU64 = AtomicU64::new(0);
 
+/// Region scatters recorded after their batches (`tune wb_stream`).
+static REGION_SCATTERS: AtomicU64 = AtomicU64::new(0);
+
 pub fn note_touch_bits() {
     if !TOUCH_BITS_EVER.load(Ordering::Relaxed) {
         TOUCH_BITS_EVER.store(true, Ordering::Relaxed);
@@ -3000,6 +3003,103 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
     }
     note_scatter();
     Some(pipeline)
+}
+
+/// Whether write-backs can be handed over (`tune wb_region` made the region
+/// and its kernels at front end 2's start, with the list-emptying kernel).
+pub fn region_ready() -> bool {
+    SCATTER.get().is_some_and(|s| s.reset && s.region.is_some() && s.handoff != vk::Pipeline::null())
+}
+
+/// The write-back's first half for `tune wb_stream` (step 2 of STATUS item
+/// 1): the touched-page list and its pages' marks handed over into the
+/// region and cleared (`rdna::kernels::mirror_handoff`), between barriers
+/// that order it after all earlier work and all later work after it; the
+/// region's scatter follows in a command buffer of its own after the batch
+/// (`record_region_scatter`). None when nothing can be handed over.
+pub fn record_handoff(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Option<vk::Pipeline> {
+    let s = SCATTER.get()?;
+    if !region_ready() {
+        return None;
+    }
+    let marks = super::resident::marks()?;
+    let pc = scatter_push(s)?;
+    let c = ctx();
+    unsafe {
+        let all = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT, vk::DependencyFlags::empty(), &[all], &[], &[]);
+        record_compact(s, cmd, written);
+        c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, s.handoff);
+        c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
+        c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
+        c.device.cmd_dispatch_indirect(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4);
+        let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[after], &[], &[]);
+    }
+    HANDOFFS.fetch_add(1, Ordering::Relaxed);
+    note_scatter();
+    Some(s.handoff)
+}
+
+/// The write-back's second half (`tune wb_stream`): the region's scatter,
+/// recorded into a command buffer that runs after the batch whose handoff
+/// filled the region: the mirror's marked dwords as they are then go to
+/// guest memory, made visible to the host before what follows.
+pub fn record_region_scatter(cmd: vk::CommandBuffer) -> bool {
+    let Some(s) = SCATTER.get() else { return false };
+    let (Some((rbuf, _)), Some(pc)) = (s.region, scatter_push(s)) else { return false };
+    let c = ctx();
+    unsafe {
+        let all = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT, vk::DependencyFlags::empty(), &[all], &[], &[]);
+        c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, s.region_scatter);
+        c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
+        c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
+        c.device.cmd_dispatch_indirect(cmd, rbuf, 0);
+        if s.dev.is_some() && SCATTERS_RECORDED.fetch_add(1, Ordering::Relaxed) % COUNTER_COPY_EVERY == COUNTER_COPY_EVERY - 1 {
+            record_counter_copy(s, cmd);
+        }
+        let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_READ);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[after], &[], &[]);
+    }
+    REGION_SCATTERS.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// The write-back kernels' push constants: the mirror's, the guest page
+/// table's, the image's and the handoff region's device addresses.
+fn scatter_push(s: &Scatter) -> Option<Vec<u8>> {
+    let (mbuf, _) = super::resident::mirror_buffer()?;
+    let c = ctx();
+    let m = c.buffer_address(mbuf);
+    let t = super::pagetable::address();
+    let i = super::resident::image_buffer().map_or(0, |b| c.buffer_address(b));
+    let r = s.region.map_or(0, |(_, a)| a);
+    Some([m as u32, (m >> 32) as u32, t as u32, (t >> 32) as u32, i as u32, (i >> 32) as u32, r as u32, (r >> 32) as u32].iter().flat_map(|x| x.to_le_bytes()).collect())
+}
+
+/// `tune touch_bits`: the touched-page list made from the touched bits of
+/// the written range first (`rdna::kernels::mirror_compact`).
+unsafe fn record_compact(s: &Scatter, cmd: vk::CommandBuffer, written: Option<(u64, u64)>) {
+    let Some((lo, hi)) = written.filter(|&(lo, hi)| lo < hi && TOUCH_BITS_EVER.load(Ordering::Relaxed)) else { return };
+    let c = ctx();
+    let span_words = (MIRROR_END - MIRROR_BASE) / PAGE / 32;
+    let w0 = (lo.max(MIRROR_BASE) - MIRROR_BASE) / PAGE / 32;
+    let w1 = ((hi.min(MIRROR_END) - MIRROR_BASE).div_ceil(PAGE)).div_ceil(32).min(span_words);
+    if w0 >= w1 {
+        return;
+    }
+    let cpc: Vec<u8> = [w0 as u32, w1 as u32, 0, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
+    unsafe {
+        c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, s.compact);
+        c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
+        c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &cpc);
+        c.device.cmd_dispatch(cmd, ((w1 - w0) as u32).div_ceil(rdna::kernels::COMPACT_LOCAL_SIZE), 1, 1);
+        let listed = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::INDIRECT_COMMAND_READ);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT, vk::DependencyFlags::empty(), &[listed], &[], &[]);
+    }
+    COMPACTS[0].fetch_add(1, Ordering::Relaxed);
+    COMPACTS[1].fetch_add(w1 - w0, Ordering::Relaxed);
 }
 
 /// `tune wb_probe`'s ballast: `rdna::kernels::latency_test` storing into a
@@ -3961,7 +4061,7 @@ pub fn status() -> String {
     let w: Vec<u64> = WB64.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let (cn, cs) = (w[2], w[3]);
     let compacts = if COMPACTS[0].load(Ordering::Relaxed) > 0 { format!("    front end 2's touched-page lists made from touched bits (`tune touch_bits`): {} write-backs, {} words of bits scanned\n", COMPACTS[0].load(Ordering::Relaxed), COMPACTS[1].load(Ordering::Relaxed)) } else { String::new() };
-    let handoffs = if HANDOFFS.load(Ordering::Relaxed) > 0 { format!("    front end 2's write-backs handed over through the region (`tune wb_region`): {}\n", HANDOFFS.load(Ordering::Relaxed)) } else { String::new() };
+    let handoffs = if HANDOFFS.load(Ordering::Relaxed) > 0 { format!("    front end 2's write-backs handed over through the region (`tune wb_region`): {}, {} of them scattered after their batch (`tune wb_stream`)\n", HANDOFFS.load(Ordering::Relaxed), REGION_SCATTERS.load(Ordering::Relaxed)) } else { String::new() };
     let probes = if PROBES.load(Ordering::Relaxed) > 0 { format!("    front end 2's write-backs followed by `tune wb_probe`'s barriers: {}\n", PROBES.load(Ordering::Relaxed)) } else { String::new() };
     let census = if cn > 0 { format!("    front end 2's write-back census (`tune fe2_scatter_read`): {cn} dwords marked, {cs} of them ({:.1}%) held by guest memory already; in pages draws read indices from (`DS_INDEX_CENSUS`): {} dwords ({:.1}%), {} pages\n", 100.0 * cs as f64 / cn as f64, w[4], 100.0 * w[4] as f64 / cn as f64, w[5]) } else { String::new() };
     format!(

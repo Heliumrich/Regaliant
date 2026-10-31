@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 237] = [
+    static ALL: [Tunable; 238] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -270,6 +270,7 @@ pub mod tune {
         Tunable { name: "record_defer", env: "DS_RECORD_DEFER", default: 5, value: AtomicU64::new(UNSET) },
         Tunable { name: "wb_probe", env: "DS_WB_PROBE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "wb_region", env: "DS_WB_REGION", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "wb_stream", env: "DS_WB_STREAM", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2590,6 +2591,17 @@ pub mod tune {
     /// are made when it is on at front end 2's start; live after that.
     pub fn wb_region() -> u64 {
         get(236)
+    }
+
+    /// Step 2 of STATUS item 1 (with `wb_region`'s region): a batch's
+    /// write-back is handed over at its close and the region's scatter, then
+    /// the guest copies of its CP writes, run after it in a command buffer of
+    /// their own on the same queue, which signals the batch timeline; its CP
+    /// writes after work that marked keep their guest copies for that part
+    /// (as `fe2_cpw_defer`). Chunks of parallel runs and the second queue's
+    /// batches write back within themselves. Read at each batch's begin.
+    pub fn wb_stream() -> u64 {
+        get(237)
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

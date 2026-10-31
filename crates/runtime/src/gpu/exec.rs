@@ -3238,7 +3238,7 @@ fn note_copy_waits(own: bool, wait: u64) {
 /// queue once its own copies there and those it binds that earlier batches
 /// made there (`wait`) are done. Called in sequence order (`push_batch`):
 /// the timeline's signals increase.
-fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, fence: vk::Fence, alt: bool) -> Result<(), String> {
+fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, fence: vk::Fence, alt: bool, wb: Option<vk::CommandBuffer>) -> Result<(), String> {
     let c = ctx();
     // Guest page table updates queued before this batch, ahead of it, and
     // texture uploads recorded batched (`tune upload_batch`).
@@ -3262,16 +3262,21 @@ fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::Comma
     // On the main queue every batch signals the batch timeline with its
     // sequence (the completion thread waits for that value).
     let tl = [(c.batches, seq)];
-    let signals: &[(vk::Semaphore, u64)] = if alt { &[] } else { &tl };
+    let signals: &[(vk::Semaphore, u64)] = if alt || wb.is_some() { &[] } else { &tl };
     // The slot's fence only on the second queue, whose batches the timeline
     // leaves out: the completion thread resets it once the timeline passed
     // the batch, which need not order after the fence's own signal (the
     // validation layer reported resets of fences still in use).
     let fence = if alt { fence } else { vk::Fence::null() };
     match (&c.copy, wait) {
-        (Some(q), w) if w > 0 => c.submit_timeline_on(false, alt, cmds, &[(q.copied, w, vk::PipelineStageFlags2::ALL_COMMANDS)], signals, fence),
-        _ => c.submit_timeline_on(false, alt, cmds, &[], signals, fence),
+        (Some(q), w) if w > 0 => c.submit_timeline_on(false, alt, cmds, &[(q.copied, w, vk::PipelineStageFlags2::ALL_COMMANDS)], signals, fence)?,
+        _ => c.submit_timeline_on(false, alt, cmds, &[], signals, fence)?,
     }
+    // Its part after it (`tune wb_stream`), in order on the same queue.
+    if let Some(w) = wb {
+        c.submit_timeline_on(false, false, &[w], &[], &tl, vk::Fence::null())?;
+    }
+    Ok(())
 }
 
 /// A batch's submission as the submission thread hands it to Vulkan
@@ -3286,7 +3291,76 @@ pub(super) struct SubmitSpec {
     fence: vk::Fence,
     alt: bool,
     name: String,
+    /// What runs after the batch in a command buffer of its own (`tune
+    /// wb_stream`); it then signals the batch timeline instead of the batch.
+    wb: Option<WbPart>,
 }
+
+/// A batch's stores into guest memory that run after it (`tune wb_stream`,
+/// step 2 of STATUS item 1): the scatter of the region its handoff filled,
+/// then the guest copies of its CP writes left for its close (buffer, offset,
+/// bytes), in order.
+pub(super) struct WbPart {
+    scatter: bool,
+    later: Vec<(vk::Buffer, u64, Vec<u8>)>,
+}
+
+/// Command buffers for the batches' parts after them (`tune wb_stream`): the
+/// submission thread's pool, and each buffer with the batch it last ran.
+struct WbRing {
+    pool: vk::CommandPool,
+    bufs: Vec<(vk::CommandBuffer, u64)>,
+}
+
+static WB_RING: Mutex<Option<WbRing>> = Mutex::new(None);
+
+/// Records batch `seq`'s part after it (`WbPart`) into a command buffer whose
+/// last batch is done (a new one when none is).
+fn record_wb_part(seq: u64, part: &WbPart) -> Result<vk::CommandBuffer, String> {
+    let c = ctx();
+    let mut g = WB_RING.lock();
+    if g.is_none() {
+        let pool = unsafe { c.device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(c.queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None) }.map_err(|e| format!("write-back pool: {e}"))?;
+        *g = Some(WbRing { pool, bufs: Vec::new() });
+    }
+    let ring = g.as_mut().expect("ring");
+    let done = done_seq();
+    let cmd = match ring.bufs.iter_mut().find(|b| b.1 <= done) {
+        Some(b) => {
+            b.1 = seq;
+            unsafe { c.device.reset_command_buffer(b.0, vk::CommandBufferResetFlags::empty()) }.map_err(|e| format!("write-back cmd reset: {e}"))?;
+            b.0
+        }
+        None => {
+            let cb = unsafe { c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(ring.pool).command_buffer_count(1)) }.map_err(|e| format!("write-back cmd: {e}"))?[0];
+            ring.bufs.push((cb, seq));
+            cb
+        }
+    };
+    unsafe {
+        c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(|e| format!("write-back begin: {e}"))?;
+        if part.scatter {
+            super::fe2::record_region_scatter(cmd);
+        }
+        if !part.later.is_empty() {
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            for (b, o, raw) in &part.later {
+                c.device.cmd_update_buffer(cmd, *b, *o, raw);
+            }
+            let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::HOST_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[after], &[], &[]);
+        }
+        c.device.end_command_buffer(cmd).map_err(|e| format!("write-back end: {e}"))?;
+    }
+    WB_PARTS[0].fetch_add(1, Ordering::Relaxed);
+    WB_PARTS[1].fetch_add(part.later.len() as u64, Ordering::Relaxed);
+    Ok(cmd)
+}
+
+/// Batch parts after their batches (`tune wb_stream`): [parts, CP writes'
+/// guest copies in them].
+pub static WB_PARTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Batches submitted in one vkQueueSubmit2 with others (`tune
 /// submit_coalesce`): [calls, batches in them].
@@ -3306,7 +3380,7 @@ fn submit_specs(specs: Vec<(u64, SubmitSpec)>) {
             crate::error!("gpu[{name}]: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
         }
     };
-    let plain = |s: &SubmitSpec| s.xpre.is_none() && !s.alt;
+    let plain = |s: &SubmitSpec| s.xpre.is_none() && !s.alt && s.wb.is_none();
     let max = (super::tune::submit_coalesce() as usize).max(1);
     let mut i = 0;
     while i < specs.len() {
@@ -3321,7 +3395,18 @@ fn submit_specs(specs: Vec<(u64, SubmitSpec)>) {
         }
         if j - i == 1 {
             let (seq, s) = &specs[i];
-            if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.fence, s.alt) {
+            // (`tune wb_stream`: the part after it signals the batch timeline.)
+            let wb = match &s.wb {
+                Some(part) => match record_wb_part(*seq, part) {
+                    Ok(cb) => Some(cb),
+                    Err(e) => {
+                        fail(e, &s.name);
+                        return;
+                    }
+                },
+                None => None,
+            };
+            if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.fence, s.alt, wb) {
                 fail(e, &s.name);
             }
             i = j;
@@ -8090,6 +8175,12 @@ pub struct Exec {
     /// and the records the batch has used in its slot's `wb_counts`.
     seg_wb: usize,
     wb_counted: u32,
+    /// `tune wb_stream` for this batch (latched at its begin), whether its
+    /// close handed a write-back over, and its CP writes' guest copies for
+    /// the part after it.
+    wb_on: bool,
+    wb_scatter: bool,
+    wb_later: Vec<(vk::Buffer, u64, Vec<u8>)>,
     /// The last draw, when another like it can be recorded on the state it
     /// left (`draw_repeat`, `tune draw_repeat`).
     repeat: Option<draw::Repeat>,
@@ -8841,6 +8932,9 @@ impl Exec {
                 segs: Vec::new(),
                 seg_wb: 0,
                 wb_counted: 0,
+                wb_on: false,
+                wb_scatter: false,
+                wb_later: Vec::new(),
                 repeat: None,
                 cmd_uses: std::cell::Cell::new(0),
                 last_cmd_line: std::cell::Cell::new(0),
@@ -9172,6 +9266,8 @@ impl Exec {
         self.segs.clear();
         self.seg_wb = 0;
         self.wb_counted = 0;
+        self.wb_scatter = false;
+        self.wb_later.clear();
         if super::tune::skip_barriers() & 64 == 0 {
             self.barrier();
         }
@@ -9185,6 +9281,9 @@ impl Exec {
         let aq = super::tune::alt_queue();
         self.batch_alt = self.on_compute || (self.alt_id != 0 && aq & 0xFFFF == self.alt_id && ctx().queue2.is_some());
         self.batch_alt_share = aq & 0x10000 != 0;
+        // (`tune wb_stream`; chunks of parallel runs and the second queue's
+        // batches write back within themselves.)
+        self.wb_on = super::tune::wb_stream() != 0 && super::fe2::region_ready() && !self.deferred && !self.batch_alt;
         self.dyncache = Default::default();
         self.begun_at = std::time::Instant::now();
         self.begun_mark = super::timeline::mark();
@@ -9460,6 +9559,7 @@ impl Exec {
             self.fe2_gens = gens;
         }
         let lists = std::mem::take(&mut self.batch_lists).then(super::vk::defer::release);
+        let wb = (self.wb_on && (self.wb_scatter || !self.wb_later.is_empty())).then(|| WbPart { scatter: std::mem::take(&mut self.wb_scatter), later: std::mem::take(&mut self.wb_later) });
         let seq = push_batch(fence, self.slots[i].queries, bq, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, std::mem::take(&mut self.segs), reset, alt, move |seq| {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return None;
@@ -9481,7 +9581,7 @@ impl Exec {
                 finish_main(cmd, bq, pre.is_some());
             }
             let _ = seq;
-            Some(SubmitSpec { xpre, pre, cmd, wait: copy_wait, fence, alt, name })
+            Some(SubmitSpec { xpre, pre, cmd, wait: copy_wait, fence, alt, name, wb })
         });
         super::timeline::end(&self.name, self.begun_mark.take(), || format!("batch #{seq}, {commands} commands ({why})"));
         st.mark(5);
@@ -9601,6 +9701,8 @@ impl Exec {
         unsafe { ctx().device.end_command_buffer(self.cmd()).ok() };
         self.actions.clear();
         self.gpu_writes_open = false;
+        self.wb_scatter = false;
+        self.wb_later.clear();
         if !self.fe2_host_later.is_empty() && !super::shutting_down() {
             crate::warn!("gpu[{}]: batch discarded with {} CP writes' guest copies left for its close", self.name, self.fe2_host_later.len());
         }
@@ -10521,6 +10623,18 @@ impl Exec {
     /// close (`tune fe2_cpw_defer`), after all its work.
     fn record_host_later(&mut self) {
         let later = std::mem::take(&mut self.fe2_host_later);
+        if self.wb_on {
+            // (`tune wb_stream`: after the region's scatter, in the part
+            // after the batch; through the import over the address now.)
+            for (buf, off, raw, a) in later {
+                let (b, o) = match span(a, raw.len() as u64) {
+                    Some((nb, st, _)) => (nb, a - st),
+                    None => (buf, off),
+                };
+                self.wb_later.push((b, o, raw));
+            }
+            return;
+        }
         let cmd = self.cmd();
         let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
         unsafe {
@@ -10556,10 +10670,15 @@ impl Exec {
         }
         // (`seg_stamps`: its counters before and after it, named by the
         // segment's end mark.)
-        let rec = if seg { self.wb_count_copy(0) } else { 0 };
+        let rec = if seg && !self.wb_on { self.wb_count_copy(0) } else { 0 };
         let cmd = self.cmd();
         let written = std::mem::replace(&mut self.fe2_written, (u64::MAX, 0));
-        let recorded = if let Some(pipe) = super::fe2::record_scatter(cmd, Some(written)) {
+        // (`tune wb_stream`: handed over here, its scatter after the batch.)
+        let handed = if self.wb_on { super::fe2::record_handoff(cmd, Some(written)) } else { None };
+        if handed.is_some() {
+            self.wb_scatter = true;
+        }
+        let recorded = if let Some(pipe) = handed.or_else(|| super::fe2::record_scatter(cmd, Some(written))) {
             // The next dispatch binds its own pipeline and descriptors.
             self.dyncache.cs_pipeline = pipe;
             true
@@ -12615,7 +12734,7 @@ impl Exec {
         // completed and its promise was gone, found the label rewritten,
         // FINDINGS.md 2026-10-30 morning.)
         let would_scatter = self.fe2_marked && !(super::tune::fe2_cpw_close() || (waited && super::tune::fe2_cpw_waited()));
-        let host_later = super::tune::fe2_cpw_defer() && fe2_mirror.is_some() && (would_scatter || !self.fe2_host_later.is_empty());
+        let host_later = (super::tune::fe2_cpw_defer() || self.wb_on) && fe2_mirror.is_some() && (would_scatter || !self.fe2_host_later.is_empty());
         if !(waited && super::tune::ts_cpw_waited()) && !host_later {
             self.resolve_timestamps();
         }
@@ -14129,7 +14248,7 @@ impl Exec {
                 if let Some(l) = lists {
                     l.replay();
                 }
-                Some(SubmitSpec { xpre: None, pre, cmd, wait: copy_wait, fence, alt: false, name })
+                Some(SubmitSpec { xpre: None, pre, cmd, wait: copy_wait, fence, alt: false, name, wb: None })
             });
             self.slots[b.slot].seq = seq;
             if !b.fe2_up.is_empty() {
