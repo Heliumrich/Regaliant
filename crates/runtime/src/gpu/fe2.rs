@@ -476,12 +476,12 @@ const CALLER_NAMES: [&str; 4] = ["graphics CP", "its parallel workers", "queue 0
 /// misses on another epoch, misses on chunk generations, misses on host
 /// events, words scanned, takes, TSC cycles in all, placements (the
 /// executor's `fe2_place`), their TSC cycles].
-static BY_CALLER: [[AtomicU64; 19]; 4] = [const { [const { AtomicU64::new(0) }; 19] }; 4];
+static BY_CALLER: [[AtomicU64; 22]; 4] = [const { [const { AtomicU64::new(0) }; 22] }; 4];
 /// The same for placements made while a batch's (or parallel chunk's) first
 /// command is bound (`set_first_command`): first commands cost 100-216 us
 /// against ~20 us for later ones at Castlewall's arrival, most of it
 /// binding (FINDINGS.md 2026-10-31).
-static BY_CALLER_FIRST: [[AtomicU64; 19]; 4] = [const { [const { AtomicU64::new(0) }; 19] }; 4];
+static BY_CALLER_FIRST: [[AtomicU64; 22]; 4] = [const { [const { AtomicU64::new(0) }; 22] }; 4];
 
 thread_local! {
     /// The command being bound opens its batch (`set_first_command`).
@@ -514,6 +514,12 @@ const C_SCAN: usize = 14;
 const C_ARM: usize = 15;
 const C_TAKE: usize = 16;
 const C_FIX: usize = 17;
+/// More of the checks' parts: the range caches' lookup, following another
+/// thread's take (`follow_take`, `followed`), uploads made without a take
+/// (pages written lately, pages a take of the epoch found lacking).
+const C_CACHE: usize = 19;
+const C_FOLLOW: usize = 20;
+const C_UPLOAD: usize = 21;
 
 /// The TSC when `DS_FE2_CALLERS` is on, else 0.
 #[inline]
@@ -1185,7 +1191,10 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
     // (Pages of the mixed range's view windows too: their imports are of
     // the aliases, `mem::view_rules`.)
     let gpu_writes = gpu_writes && !arm_gpu() && !crate::mem::view_span(lo, hi);
-    if range_fine(lo, hi, want, gpu_writes) {
+    let tc = tsc();
+    let fine = range_fine(lo, hi, want, gpu_writes);
+    caller_since(C_CACHE, tc);
+    if fine {
         local_add(L_HITS, 1);
         local_add(L_FAST, 1);
         if callers_on() {
@@ -1318,6 +1327,7 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
             }
             if hot_run(a, b, frame) {
                 STATS[S_HOT_RUNS].fetch_add(1, Ordering::Relaxed);
+                let tu = tsc();
                 let mut x = a;
                 while x < b {
                     if mine(x) {
@@ -1338,11 +1348,13 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
                     STATS[S_HOT_PAGES].fetch_add((y - x) / PAGE, Ordering::Relaxed);
                     x = y;
                 }
+                caller_since(C_UPLOAD, tu);
                 continue;
             }
             // Pages M lacks that a take of this epoch looked at already:
             // uploaded without another take (`tune fe2_taken_upload`).
             if super::tune::fe2_taken_upload() && !PRECHECK.with(|p| p.get()) && taken_lacking(a, b, want) {
+                let tu = tsc();
                 let mut x = a;
                 while x < b {
                     if mine(x) {
@@ -1364,6 +1376,7 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
                     x = y;
                 }
                 STATS[S_TAKEN_RUNS].fetch_add(1, Ordering::Relaxed);
+                caller_since(C_UPLOAD, tu);
                 continue;
             }
             if let Some(d) = defer.as_deref_mut() {
@@ -1373,8 +1386,11 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
             }
             // Another thread's take around this run, for a requirement at
             // least ours, instead of one of our own (`follow_take`).
+            let tf = tsc();
             if follow_take(a, b, want) {
-                match followed(a, b, want, mine, upload) {
+                let r = followed(a, b, want, mine, upload);
+                caller_since(C_FOLLOW, tf);
+                match r {
                     Ok(true) => continue,
                     Ok(false) => {}
                     Err(e) => {
@@ -1382,6 +1398,8 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
                         return Err(e);
                     }
                 }
+            } else {
+                caller_since(C_FOLLOW, tf);
             }
             // (Why the graphics CP takes it, for `DS_FE2_CALLERS`.)
             let reasons = (callers_on() && CALLER.with(|c| c.get()) == 0).then(|| take_reasons(a, b, want));
@@ -3892,14 +3910,14 @@ pub fn callers_line() -> String {
         return quiet;
     }
     let hz = super::threadcpu::tsc_hz();
-    let line = |rows: &[[AtomicU64; 19]; 4]| -> Vec<String> {
+    let line = |rows: &[[AtomicU64; 22]; 4]| -> Vec<String> {
         CALLER_NAMES
         .iter()
         .zip(rows.iter())
         .map(|(n, c)| {
             let v: Vec<u64> = c.iter().map(|x| x.load(Ordering::Relaxed)).collect();
             format!(
-                "{n}: {} placements ({:.1} ms; outside the checks: mapping and backing {:.1}, batch and import {:.1} (the batch's begin {:.1}), after {:.1}), {} checks ({} by the range cache; missed: no range {}, another epoch {}, chunk generations {}, host events {}), {} words scanned, {} takes, {:.1} ms (scans {:.1}, arming {:.1}, takes {:.1}, runs made current {:.1})",
+                "{n}: {} placements ({:.1} ms; outside the checks: mapping and backing {:.1}, batch and import {:.1} (the batch's begin {:.1}), after {:.1}), {} checks ({} by the range cache; missed: no range {}, another epoch {}, chunk generations {}, host events {}), {} words scanned, {} takes, {:.1} ms (range caches {:.1}, scans {:.1}, arming {:.1}, takes {:.1}, runs made current {:.1}, following other takes {:.1}, uploads without a take {:.1}, the rest {:.1})",
                 v[C_PLACES],
                 v[C_PLACE_CYCLES] as f64 * 1e3 / hz,
                 v[C_PART_MAP] as f64 * 1e3 / hz,
@@ -3915,10 +3933,14 @@ pub fn callers_line() -> String {
                 v[C_WORDS],
                 v[C_TAKES],
                 v[C_CYCLES] as f64 * 1e3 / hz,
+                v[C_CACHE] as f64 * 1e3 / hz,
                 v[C_SCAN] as f64 * 1e3 / hz,
                 v[C_ARM] as f64 * 1e3 / hz,
                 v[C_TAKE] as f64 * 1e3 / hz,
-                v[C_FIX] as f64 * 1e3 / hz
+                v[C_FIX] as f64 * 1e3 / hz,
+                v[C_FOLLOW] as f64 * 1e3 / hz,
+                v[C_UPLOAD] as f64 * 1e3 / hz,
+                v[C_CYCLES].saturating_sub(v[C_CACHE] + v[C_SCAN] + v[C_ARM] + v[C_TAKE] + v[C_FIX] + v[C_FOLLOW] + v[C_UPLOAD]) as f64 * 1e3 / hz
             )
         })
         .collect()
