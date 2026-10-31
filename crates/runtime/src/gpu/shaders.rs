@@ -841,6 +841,23 @@ pub struct DataLoad {
     pub word: u32,
 }
 
+/// Per-plan instruction scans (`compare_images`, `format_resources`) shared
+/// by every thread behind their per-thread caches: a new plan is scanned
+/// once, not on each recording thread (FINDINGS.md 2026-10-31: 4.9% of the
+/// graphics CP's busy samples over Castlewall's arrival went to the scans'
+/// instruction names). Keyed by (plan key, scan).
+static SCANS: [parking_lot::Mutex<Option<super::fx::Map<(u64, u8), u64>>>; 16] = [const { parking_lot::Mutex::new(None) }; 16];
+
+fn shared_scan(kind: u8, key: u64, f: impl FnOnce() -> u64) -> u64 {
+    let shard = &SCANS[((key ^ (key >> 29)) % 16) as usize];
+    if let Some(v) = shard.lock().as_ref().and_then(|m| m.get(&(key, kind)).copied()) {
+        return v;
+    }
+    let v = f();
+    shard.lock().get_or_insert_with(Default::default).insert((key, kind), v);
+    v
+}
+
 /// Image resources (bit per index) that depth-comparison sampling
 /// instructions (`image_sample_c*`, `image_gather4_c*`) use: only for them
 /// does the translation depend on whether the image is a depth view.
@@ -849,7 +866,7 @@ fn compare_images(plan_key: u64, insts: &[rdna::Inst], plan: &Plan) -> u64 {
         static MASKS: std::cell::RefCell<super::fx::Map<u64, u64>> = std::cell::RefCell::new(super::fx::Map::default());
     }
     MASKS.with(|m| {
-        *m.borrow_mut().entry(plan_key).or_insert_with(|| {
+        *m.borrow_mut().entry(plan_key).or_insert_with(|| shared_scan(0, plan_key, || {
             let mut mask = 0u64;
             for i in insts {
                 let Some(name) = i.name() else { continue };
@@ -864,7 +881,7 @@ fn compare_images(plan_key: u64, insts: &[rdna::Inst], plan: &Plan) -> u64 {
                 }
             }
             mask
-        })
+        }))
     })
 }
 
@@ -2610,7 +2627,7 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     let mut res_addrs = pool::addrs(plan.resources.len());
     spec.resources.clear();
     spec.resources.reserve(plan.resources.len());
-    let fmt_mask = if plan.resources.iter().any(|r| r.kind == ResKind::Buffer) { LOCAL_FORMATS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| format_resources(&insts, &plan))) } else { 0 };
+    let fmt_mask = if plan.resources.iter().any(|r| r.kind == ResKind::Buffer) { LOCAL_FORMATS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| shared_scan(1, plan_key, || format_resources(&insts, &plan)))) } else { 0 };
     for (i, res) in plan.resources.iter().enumerate() {
         let mut w = [0u32; 8];
         let src = match res.dwords.first() {
