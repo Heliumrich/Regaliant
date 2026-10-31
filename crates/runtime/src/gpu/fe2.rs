@@ -2739,6 +2739,12 @@ struct Scatter {
     reset: bool,
     host: vk::Buffer,
     dev: Option<vk::Buffer>,
+    /// The write-back handed over (`tune wb_region`, made when it is on at
+    /// front end 2's start; null otherwise): the handoff kernel, the region
+    /// scatter and the handoff region with its device address.
+    handoff: vk::Pipeline,
+    region_scatter: vk::Pipeline,
+    region: Option<(vk::Buffer, u64)>,
 }
 
 /// Write-backs between copies of the video-memory counters into the
@@ -2761,9 +2767,9 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
             .collect();
         let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("scatter set layout: {e}"))?;
         let layouts = [set_layout];
-        // (24 bytes: the image's address after the mirror's and the table's,
-        // `DS_WB_IMAGE`.)
-        let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 24 }];
+        // (32 bytes: the image's address after the mirror's and the table's,
+        // `DS_WB_IMAGE`, then the handoff region's, `tune wb_region`.)
+        let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 32 }];
         let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("scatter layout: {e}"))?;
         let reset = super::tune::fe2_scatter_reset();
         let code = if reset { rdna::kernels::mirror_scatter_reset() } else { rdna::kernels::mirror_scatter() };
@@ -2789,6 +2795,18 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
             _ => vk::Pipeline::null(),
         };
         let compact = make(&rdna::kernels::mirror_compact(), 24)?;
+        // (`tune wb_region`: the handoff region, sized to the list's full
+        // capacity, ~132 MiB.)
+        let (handoff, region_scatter, region) = if reset && super::tune::wb_region() != 0 {
+            let (rb, _rmem, raddr) = c.device_buffer_addressed(4 * rdna::kernels::REGION_WORDS, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)?;
+            if raddr == 0 {
+                return Err("the handoff region has no device address".into());
+            }
+            crate::info!("fe2: write-backs handed over through a region of {} MiB (`tune wb_region`)", 4 * rdna::kernels::REGION_WORDS >> 20);
+            (make(&rdna::kernels::mirror_handoff(), 29)?, make(&rdna::kernels::mirror_scatter_region(), 30)?, Some((rb, raddr)))
+        } else {
+            (vk::Pipeline::null(), vk::Pipeline::null(), None)
+        };
         let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 }];
         let pool = c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).map_err(|e| format!("scatter pool: {e}"))?;
         let set = c.device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts)).map_err(|e| format!("scatter set: {e}"))?[0];
@@ -2809,7 +2827,7 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
             .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
             .collect();
         c.device.update_descriptor_sets(&writes, &[]);
-        Ok(Scatter { pipeline, nostore, census, changed, lazy, note, image, compact, layout, set, counters: cptr as *mut u32, reset, host: cbuf, dev })
+        Ok(Scatter { pipeline, nostore, census, changed, lazy, note, image, compact, layout, set, counters: cptr as *mut u32, reset, host: cbuf, dev, handoff, region_scatter, region })
     }
 }
 
@@ -2823,6 +2841,9 @@ static COMPACTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Write-backs followed by `tune wb_probe`'s added barriers.
 static PROBES: AtomicU64 = AtomicU64::new(0);
+
+/// Write-backs handed over through the region (`tune wb_region`).
+static HANDOFFS: AtomicU64 = AtomicU64::new(0);
 
 pub fn note_touch_bits() {
     if !TOUCH_BITS_EVER.load(Ordering::Relaxed) {
@@ -2846,7 +2867,8 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
     let m = c.buffer_address(mbuf);
     let t = super::pagetable::address();
     let i = super::resident::image_buffer().map_or(0, |b| c.buffer_address(b));
-    let pc: Vec<u8> = [m as u32, (m >> 32) as u32, t as u32, (t >> 32) as u32, i as u32, (i >> 32) as u32].iter().flat_map(|x| x.to_le_bytes()).collect();
+    let r = s.region.map_or(0, |(_, a)| a);
+    let pc: Vec<u8> = [m as u32, (m >> 32) as u32, t as u32, (t >> 32) as u32, i as u32, (i >> 32) as u32, r as u32, (r >> 32) as u32].iter().flat_map(|x| x.to_le_bytes()).collect();
     let pipeline = if s.nostore != vk::Pipeline::null() && super::tune::fe2_scatter_nostore() {
         s.nostore
     } else if s.census != vk::Pipeline::null() && super::tune::fe2_scatter_read() == 1 {
@@ -2910,10 +2932,25 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
                 COMPACTS[1].fetch_add(w1 - w0, Ordering::Relaxed);
             }
         }
-        c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-        c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
-        c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
-        c.device.cmd_dispatch_indirect(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4);
+        // (`tune wb_region`: the plain kernel's work as a handoff into the
+        // region, then the region's scatter.)
+        let region = s.region.filter(|_| s.reset && pipeline == s.pipeline && s.handoff != vk::Pipeline::null() && super::tune::wb_region() != 0);
+        if let Some((rbuf, _)) = region {
+            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, s.handoff);
+            c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
+            c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
+            c.device.cmd_dispatch_indirect(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4);
+            let handed = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::INDIRECT_COMMAND_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT, vk::DependencyFlags::empty(), &[handed], &[], &[]);
+            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, s.region_scatter);
+            c.device.cmd_dispatch_indirect(cmd, rbuf, 0);
+            HANDOFFS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
+            c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
+            c.device.cmd_dispatch_indirect(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4);
+        }
         if s.dev.is_some() && SCATTERS_RECORDED.fetch_add(1, Ordering::Relaxed) % COUNTER_COPY_EVERY == COUNTER_COPY_EVERY - 1 {
             record_counter_copy(s, cmd);
         }
@@ -2955,6 +2992,10 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
                 note_scatter();
                 return Some(b.pipeline);
             }
+        }
+        if region.is_some() {
+            note_scatter();
+            return Some(s.region_scatter);
         }
     }
     note_scatter();
@@ -3920,6 +3961,7 @@ pub fn status() -> String {
     let w: Vec<u64> = WB64.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let (cn, cs) = (w[2], w[3]);
     let compacts = if COMPACTS[0].load(Ordering::Relaxed) > 0 { format!("    front end 2's touched-page lists made from touched bits (`tune touch_bits`): {} write-backs, {} words of bits scanned\n", COMPACTS[0].load(Ordering::Relaxed), COMPACTS[1].load(Ordering::Relaxed)) } else { String::new() };
+    let handoffs = if HANDOFFS.load(Ordering::Relaxed) > 0 { format!("    front end 2's write-backs handed over through the region (`tune wb_region`): {}\n", HANDOFFS.load(Ordering::Relaxed)) } else { String::new() };
     let probes = if PROBES.load(Ordering::Relaxed) > 0 { format!("    front end 2's write-backs followed by `tune wb_probe`'s barriers: {}\n", PROBES.load(Ordering::Relaxed)) } else { String::new() };
     let census = if cn > 0 { format!("    front end 2's write-back census (`tune fe2_scatter_read`): {cn} dwords marked, {cs} of them ({:.1}%) held by guest memory already; in pages draws read indices from (`DS_INDEX_CENSUS`): {} dwords ({:.1}%), {} pages\n", 100.0 * cs as f64 / cn as f64, w[4], 100.0 * w[4] as f64 / cn as f64, w[5]) } else { String::new() };
     format!(
@@ -4005,6 +4047,7 @@ pub fn status() -> String {
         + &callers_line()
         + &census
         + &compacts
+        + &handoffs
         + &probes
         + &index_census_line()
         + &lazy2_line(&w)

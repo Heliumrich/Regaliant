@@ -889,7 +889,7 @@ pub fn mirror_scatter_nostore() -> Vec<u32> {
 /// those guest memory held already (counters 4 and 5): what a write-back
 /// of changed dwords alone would store.
 pub fn mirror_scatter_census() -> Vec<u32> {
-    build_scatter_ex(true, true, 1, false, false, 0).expect("mirror scatter kernel (census)")
+    build_scatter_ex(true, true, 1, false, false, 0, false).expect("mirror scatter kernel (census)")
 }
 
 /// `mirror_scatter_census` storing only the dwords whose guest-memory value
@@ -897,18 +897,18 @@ pub fn mirror_scatter_census() -> Vec<u32> {
 /// the value guest memory held when it was read; a CPU write racing it
 /// lands as if after the GPU's).
 pub fn mirror_scatter_changed() -> Vec<u32> {
-    build_scatter_ex(true, true, 2, false, false, 0).expect("mirror scatter kernel (changed dwords)")
+    build_scatter_ex(true, true, 2, false, false, 0, false).expect("mirror scatter kernel (changed dwords)")
 }
 
 fn build_scatter(reset: bool, stores: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
-    build_scatter_ex(reset, stores, 0, false, false, 0)
+    build_scatter_ex(reset, stores, 0, false, false, 0, false)
 }
 
 /// `mirror_scatter_reset` that also sets, for each page it writes back
 /// dwords of, the page's bit in the map's aux region (diagnosis, the
 /// runtime's `DS_WB_PAGES`: which pages GPU work really wrote).
 pub fn mirror_scatter_note() -> Vec<u32> {
-    build_scatter_ex(true, true, 0, false, true, 0).expect("mirror scatter kernel (noting pages)")
+    build_scatter_ex(true, true, 0, false, true, 0, false).expect("mirror scatter kernel (noting pages)")
 }
 
 /// `mirror_scatter_reset` storing only the marked dwords of sectors (8
@@ -926,7 +926,7 @@ pub fn mirror_scatter_note() -> Vec<u32> {
 /// the page keeps the image current (uploads into the mirror, CP writes,
 /// fills: the runtime).
 pub fn mirror_scatter_image() -> Vec<u32> {
-    build_scatter_ex(true, true, 0, false, false, 1).expect("mirror scatter kernel (image)")
+    build_scatter_ex(true, true, 0, false, false, 1, false).expect("mirror scatter kernel (image)")
 }
 
 /// `mirror_scatter_image` that stores every marked dword as
@@ -935,7 +935,7 @@ pub fn mirror_scatter_image() -> Vec<u32> {
 /// differ there (counters 4 and 5; the latter must stay 0): the image's
 /// exactness checked without leaving anything out.
 pub fn mirror_scatter_image_check() -> Vec<u32> {
-    build_scatter_ex(true, true, 0, false, false, 2).expect("mirror scatter kernel (image, checked)")
+    build_scatter_ex(true, true, 0, false, false, 2, false).expect("mirror scatter kernel (image, checked)")
 }
 
 /// `mirror_scatter_reset` leaving pages whose bit is set in the map's aux
@@ -943,7 +943,186 @@ pub fn mirror_scatter_image_check() -> Vec<u32> {
 /// their marks and touched bits are cleared as after a write-back, their
 /// dwords and pages counted in counters 6 and 7 instead of 1 and 0).
 pub fn mirror_scatter_lazy() -> Vec<u32> {
-    build_scatter_ex(true, true, 0, true, false, 0).expect("mirror scatter kernel (lazy pages)")
+    build_scatter_ex(true, true, 0, true, false, 0, false).expect("mirror scatter kernel (lazy pages)")
+}
+
+/// Dwords of a handoff region (`mirror_handoff`, `mirror_scatter_region`):
+/// a header `[count, 1, 1, 0]` (the region scatter's indirect dispatch), then
+/// MARK_LIST_CAP page indices from REGION_PAGES_AT, then 32 mask words for
+/// each from REGION_MASKS_AT.
+pub const REGION_PAGES_AT: u32 = 4;
+pub const REGION_MASKS_AT: u32 = REGION_PAGES_AT + MARK_LIST_CAP;
+pub const REGION_WORDS: u64 = REGION_MASKS_AT as u64 + 32 * MARK_LIST_CAP as u64;
+
+/// Workgroup size of `mirror_handoff`: an invocation a mask word of its page.
+pub const HANDOFF_LOCAL_SIZE: u32 = 32;
+
+/// Front end 2's write-back handed over (the runtime's `tune wb_region`):
+/// workgroup g takes the g-th page of the touched-page list as
+/// `mirror_scatter_reset` does, copies its 32 mask words and the page's
+/// index into entry g of the handoff region at device address `region`
+/// (push constants 6 and 7; bindings and the other push constants as the
+/// write-back's) and clears them and the page's touched bit; workgroup 0's
+/// first invocation empties the list and stores its count (at most
+/// MARK_LIST_CAP; a list past it counted in counter 3) into the region's
+/// header. `mirror_scatter_region` then stores the marked dwords.
+pub fn mirror_handoff() -> Vec<u32> {
+    build_handoff().expect("mirror handoff kernel")
+}
+
+/// `mirror_scatter_reset` taking its pages and mask words from a handoff
+/// region (`mirror_handoff`; indirect dispatch on the region's header) and
+/// clearing nothing: the mirror's marked dwords as they are when it runs go
+/// to guest memory.
+pub fn mirror_scatter_region() -> Vec<u32> {
+    build_scatter_ex(true, true, 0, false, false, 0, true).expect("mirror scatter kernel (handoff region)")
+}
+
+fn build_handoff() -> Result<Vec<u32>, rspirv::dr::Error> {
+    let lit = Operand::LiteralBit32;
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.capability(Capability::Int64);
+    b.capability(Capability::PhysicalStorageBufferAddresses);
+    b.extension("SPV_KHR_storage_buffer_storage_class");
+    b.extension("SPV_KHR_physical_storage_buffer");
+    b.memory_model(spirv::AddressingModel::PhysicalStorageBuffer64, spirv::MemoryModel::GLSL450);
+    let void = b.type_void();
+    let bool_ = b.type_bool();
+    let u32t = b.type_int(32, 0);
+    let u64t = b.type_int(64, 0);
+    let v3 = b.type_vector(u32t, 3);
+    let rta = b.type_runtime_array(u32t);
+    b.decorate(rta, Decoration::ArrayStride, [lit(4)]);
+    let st = b.type_struct([rta]);
+    b.decorate(st, Decoration::Block, []);
+    b.member_decorate(st, 0, Decoration::Offset, [lit(0)]);
+    let p_st = b.type_pointer(None, StorageClass::StorageBuffer, st);
+    let p_u = b.type_pointer(None, StorageClass::StorageBuffer, u32t);
+    let p_dev = b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u32t);
+    let pc = b.type_struct(vec![u32t; 8]);
+    b.decorate(pc, Decoration::Block, []);
+    for k in 0..8u32 {
+        b.member_decorate(pc, k, Decoration::Offset, [lit(4 * k)]);
+    }
+    let p_pc = b.type_pointer(None, StorageClass::PushConstant, pc);
+    let p_pcu = b.type_pointer(None, StorageClass::PushConstant, u32t);
+    let p_in = b.type_pointer(None, StorageClass::Input, v3);
+    let lid_v = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(lid_v, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::LocalInvocationId)]);
+    let wid_v = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(wid_v, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::WorkgroupId)]);
+    let mut bufs = [0; 2];
+    for (i, v) in bufs.iter_mut().enumerate() {
+        *v = global(&mut b, p_st, StorageClass::StorageBuffer);
+        b.decorate(*v, Decoration::DescriptorSet, [lit(0)]);
+        b.decorate(*v, Decoration::Binding, [lit(i as u32)]);
+    }
+    let (marks, counters) = (bufs[0], bufs[1]);
+    let pcv = global(&mut b, p_pc, StorageClass::PushConstant);
+    let c = |b: &mut Builder, v: u32| b.constant_bit32(u32t, v);
+    let (c0, c1, c3, c5, c6, c7, c31, c32) = (c(&mut b, 0), c(&mut b, 1), c(&mut b, 3), c(&mut b, 5), c(&mut b, 6), c(&mut b, 7), c(&mut b, 31), c(&mut b, 32));
+    let c2_64 = b.constant_bit64(u64t, 2);
+    let c32_64 = b.constant_bit64(u64t, 32);
+    let list_at = c(&mut b, MARK_LIST_AT);
+    let list_first = c(&mut b, MARK_LIST_AT + 4);
+    let list_cap = c(&mut b, MARK_LIST_CAP);
+    let bits_at = c(&mut b, MARK_PAGE_BITS_AT);
+    let pages_at = c(&mut b, REGION_PAGES_AT);
+    let masks_at = c(&mut b, REGION_MASKS_AT);
+    let scope_dev = c1;
+    let sem_none = c0;
+    let fty = b.type_function(void, []);
+    let f = b.begin_function(void, None, FunctionControl::NONE, fty)?;
+    b.begin_block(None)?;
+    let l = b.load(v3, None, lid_v, None, [])?;
+    let lid = b.composite_extract(u32t, None, l, [0])?;
+    let w = b.load(v3, None, wid_v, None, [])?;
+    let g = b.composite_extract(u32t, None, w, [0])?;
+    let p6 = b.access_chain(p_pcu, None, pcv, [c6])?;
+    let rlo = b.load(u32t, None, p6, None, [])?;
+    let p7 = b.access_chain(p_pcu, None, pcv, [c7])?;
+    let rhi = b.load(u32t, None, p7, None, [])?;
+    let rlo64 = b.u_convert(u64t, None, rlo)?;
+    let rhi64 = b.u_convert(u64t, None, rhi)?;
+    let rhi64 = b.shift_left_logical(u64t, None, rhi64, c32_64)?;
+    let region = b.bitwise_or(u64t, None, rlo64, rhi64)?;
+    let region_word = |b: &mut Builder, at: Word| -> Result<Word, rspirv::dr::Error> {
+        let at64 = b.u_convert(u64t, None, at)?;
+        let off = b.shift_left_logical(u64t, None, at64, c2_64)?;
+        let a = b.i_add(u64t, None, region, off)?;
+        b.convert_u_to_ptr(p_dev, None, a)
+    };
+    let is0 = b.i_equal(bool_, None, lid, c0)?;
+    // Workgroup 0's first invocation: the list's count taken (the indirect
+    // dispatch read it already), the list emptied, the region's header.
+    let g0 = b.i_equal(bool_, None, g, c0)?;
+    let first = b.logical_and(bool_, None, g0, is0)?;
+    let (l_h, l_hd) = (b.id(), b.id());
+    b.selection_merge(l_hd, SelectionControl::NONE)?;
+    b.branch_conditional(first, l_h, l_hd, [])?;
+    b.begin_block(Some(l_h))?;
+    let pcount = b.access_chain(p_u, None, marks, [c0, list_at])?;
+    let lcount = b.atomic_exchange(u32t, None, pcount, scope_dev, sem_none, c0)?;
+    let over = b.u_greater_than(bool_, None, lcount, list_cap)?;
+    let (l_ov, l_ovd) = (b.id(), b.id());
+    b.selection_merge(l_ovd, SelectionControl::NONE)?;
+    b.branch_conditional(over, l_ov, l_ovd, [])?;
+    b.begin_block(Some(l_ov))?;
+    let pov = b.access_chain(p_u, None, counters, [c0, c3])?;
+    b.atomic_i_add(u32t, None, pov, scope_dev, sem_none, c1)?;
+    b.branch(l_ovd)?;
+    b.begin_block(Some(l_ovd))?;
+    let n = b.select(u32t, None, over, list_cap, lcount)?;
+    for (k, v) in [n, c1, c1, c0].into_iter().enumerate() {
+        let ck = c(&mut b, k as u32);
+        let hp = region_word(&mut b, ck)?;
+        b.store(hp, v, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+    }
+    b.branch(l_hd)?;
+    b.begin_block(Some(l_hd))?;
+    let inside = b.u_less_than(bool_, None, g, list_cap)?;
+    let (l_in, l_end) = (b.id(), b.id());
+    b.selection_merge(l_end, SelectionControl::NONE)?;
+    b.branch_conditional(inside, l_in, l_end, [])?;
+    b.begin_block(Some(l_in))?;
+    let li = b.i_add(u32t, None, list_first, g)?;
+    let pli = b.access_chain(p_u, None, marks, [c0, li])?;
+    let page = b.load(u32t, None, pli, None, [])?;
+    let first_word = b.i_mul(u32t, None, page, c32)?;
+    let wi = b.i_add(u32t, None, first_word, lid)?;
+    let pm = b.access_chain(p_u, None, marks, [c0, wi])?;
+    let mw = b.load(u32t, None, pm, None, [])?;
+    let g32 = b.i_mul(u32t, None, g, c32)?;
+    let ri = b.i_add(u32t, None, masks_at, g32)?;
+    let ri = b.i_add(u32t, None, ri, lid)?;
+    let rp = region_word(&mut b, ri)?;
+    b.store(rp, mw, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+    b.store(pm, c0, None, [])?;
+    let (l_p, l_pd) = (b.id(), b.id());
+    b.selection_merge(l_pd, SelectionControl::NONE)?;
+    b.branch_conditional(is0, l_p, l_pd, [])?;
+    b.begin_block(Some(l_p))?;
+    let pi = b.i_add(u32t, None, pages_at, g)?;
+    let pp = region_word(&mut b, pi)?;
+    b.store(pp, page, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+    let pw = b.shift_right_logical(u32t, None, page, c5)?;
+    let pwi = b.i_add(u32t, None, bits_at, pw)?;
+    let pbit = b.bitwise_and(u32t, None, page, c31)?;
+    let pmask = b.shift_left_logical(u32t, None, c1, pbit)?;
+    let pinv = b.not(u32t, None, pmask)?;
+    let ppb = b.access_chain(p_u, None, marks, [c0, pwi])?;
+    b.atomic_and(u32t, None, ppb, scope_dev, sem_none, pinv)?;
+    b.branch(l_pd)?;
+    b.begin_block(Some(l_pd))?;
+    b.branch(l_end)?;
+    b.begin_block(Some(l_end))?;
+    b.ret()?;
+    b.end_function()?;
+    b.entry_point(ExecutionModel::GLCompute, f, "main", [lid_v, wid_v]);
+    b.execution_mode(f, ExecutionMode::LocalSize, [HANDOFF_LOCAL_SIZE, 1, 1]);
+    Ok(b.module().assemble())
 }
 
 /// `read`: 0 stores every marked dword; 1 reads its guest-memory value first
@@ -951,7 +1130,9 @@ pub fn mirror_scatter_lazy() -> Vec<u32> {
 /// `lazy`: pages with their aux bit set store nothing (`mirror_scatter_lazy`).
 /// `note`: pages written back get their aux bit set (`mirror_scatter_note`).
 /// `image`: 1 `mirror_scatter_image`, 2 `mirror_scatter_image_check`.
-fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool, image: u8) -> Result<Vec<u32>, rspirv::dr::Error> {
+/// `region`: pages and mask words from a handoff region, nothing cleared
+/// (`mirror_scatter_region`; with `reset` and none of the others).
+fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool, image: u8, region: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     let census = read != 0;
     let lit = Operand::LiteralBit32;
     let mut b = Builder::new();
@@ -976,7 +1157,7 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool,
     let p_u = b.type_pointer(None, StorageClass::StorageBuffer, u32t);
     let p_dev = b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u32t);
     let p_dev64 = b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u64t);
-    let pc_members = if image != 0 { 6 } else { 4 };
+    let pc_members = if region { 8 } else if image != 0 { 6 } else { 4 };
     let pc = b.type_struct(vec![u32t; pc_members]);
     b.decorate(pc, Decoration::Block, []);
     for k in 0..pc_members as u32 {
@@ -1072,9 +1253,31 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool,
     } else {
         None
     };
+    // (`region`: the handoff region's device address, push constants 6 and 7.)
+    let region_base = if region {
+        let c6 = c(&mut b, 6);
+        let c7 = c(&mut b, 7);
+        let rlo = pc_at(&mut b, c6)?;
+        let rhi = pc_at(&mut b, c7)?;
+        Some(addr64(&mut b, rlo, rhi)?)
+    } else {
+        None
+    };
+    // (Only in `region` mode: the other kernels' code stays as it was.)
+    let c2_64 = if region { b.constant_bit64(u64t, 2) } else { 0 };
+    // A region dword's pointer (`region`).
+    let region_word = |b: &mut Builder, rb: Word, at: Word| -> Result<Word, rspirv::dr::Error> {
+        let at64 = b.u_convert(u64t, None, at)?;
+        let off = b.shift_left_logical(u64t, None, at64, c2_64)?;
+        let a = b.i_add(u64t, None, rb, off)?;
+        b.convert_u_to_ptr(p_dev, None, a)
+    };
     let is0 = b.i_equal(bool_, None, lid, c0)?;
     let pcount = b.access_chain(p_u, None, marks, [c0, list_at])?;
-    let inside = if reset {
+    let inside = if region {
+        // (The handoff emptied the list; the dispatch is the region's count.)
+        b.u_less_than(bool_, None, g, list_cap)?
+    } else if reset {
         // Workgroup 0's first invocation takes the count, empties the list
         // and counts a list past its capacity.
         let g0 = b.i_equal(bool_, None, g, c0)?;
@@ -1139,10 +1342,43 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool,
         b.begin_block(Some(l_zd))?;
         b.control_barrier(scope_wg, scope_wg, sem_wg)?;
     }
-    let li = b.i_add(u32t, None, list_first, g)?;
-    let pli = b.access_chain(p_u, None, marks, [c0, li])?;
-    let page = b.load(u32t, None, pli, None, [])?;
+    let page = match region_base {
+        Some(rb) => {
+            let pages_at = c(&mut b, REGION_PAGES_AT);
+            let at = b.i_add(u32t, None, pages_at, g)?;
+            let pp = region_word(&mut b, rb, at)?;
+            b.load(u32t, None, pp, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?
+        }
+        None => {
+            let li = b.i_add(u32t, None, list_first, g)?;
+            let pli = b.access_chain(p_u, None, marks, [c0, li])?;
+            b.load(u32t, None, pli, None, [])?
+        }
+    };
     let first_word = b.i_mul(u32t, None, page, c32)?;
+    // The page's k-th mask word: the map's, or (`region`) entry g's.
+    let region_first = match region_base {
+        Some(_) => {
+            let masks_at = c(&mut b, REGION_MASKS_AT);
+            let g32 = b.i_mul(u32t, None, g, c32)?;
+            Some(b.i_add(u32t, None, masks_at, g32)?)
+        }
+        None => None,
+    };
+    let mask_word = |b: &mut Builder, k: Word| -> Result<Word, rspirv::dr::Error> {
+        match (region_base, region_first) {
+            (Some(rb), Some(rf)) => {
+                let at = b.i_add(u32t, None, rf, k)?;
+                let pp = region_word(b, rb, at)?;
+                b.load(u32t, None, pp, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])
+            }
+            _ => {
+                let wi = b.i_add(u32t, None, first_word, k)?;
+                let pm = b.access_chain(p_u, None, marks, [c0, wi])?;
+                b.load(u32t, None, pm, None, [])
+            }
+        }
+    };
     // The page's entry in the guest page table, its first byte in the mirror.
     let page64 = b.u_convert(u64t, None, page)?;
     let toff = b.i_mul(u64t, None, page64, c8_64)?;
@@ -1309,9 +1545,7 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool,
             let cr = b.constant_bit32(u32t, r * SCATTER_LOCAL_SIZE);
             let d = b.i_add(u32t, None, lid, cr)?;
             let wd = b.shift_right_logical(u32t, None, d, c5)?;
-            let wi = b.i_add(u32t, None, first_word, wd)?;
-            let pm = b.access_chain(p_u, None, marks, [c0, wi])?;
-            let mw = b.load(u32t, None, pm, None, [])?;
+            let mw = mask_word(&mut b, wd)?;
             let sh = b.shift_right_logical(u32t, None, mw, bit_of)?;
             let bit = b.bitwise_and(u32t, None, sh, c1)?;
             let set = b.i_not_equal(bool_, None, bit, c0)?;
@@ -1420,9 +1654,7 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool,
     let mut total = c0;
     for k in 0..32u32 {
         let ck = b.constant_bit32(u32t, k);
-        let wi = b.i_add(u32t, None, first_word, ck)?;
-        let pm = b.access_chain(p_u, None, marks, [c0, wi])?;
-        let mw = b.load(u32t, None, pm, None, [])?;
+        let mw = mask_word(&mut b, ck)?;
         let n = b.bit_count(u32t, None, mw)?;
         total = b.i_add(u32t, None, total, n)?;
     }
@@ -1488,9 +1720,10 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool,
     }
     b.branch(l_cntd)?;
     b.begin_block(Some(l_cntd))?;
-    // Every mask word read before any is cleared.
+    // Every mask word read before any is cleared (`region`: the handoff
+    // cleared them).
     b.control_barrier(scope_wg, scope_wg, sem_wg)?;
-    let first32 = b.u_less_than(bool_, None, lid, c32)?;
+    let first32 = if region { b.constant_false(bool_) } else { b.u_less_than(bool_, None, lid, c32)? };
     let (l_clr, l_clrd) = (b.id(), b.id());
     b.selection_merge(l_clrd, SelectionControl::NONE)?;
     b.branch_conditional(first32, l_clr, l_clrd, [])?;
@@ -1505,13 +1738,15 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool,
     b.selection_merge(l_pbd, SelectionControl::NONE)?;
     b.branch_conditional(is0, l_pb, l_pbd, [])?;
     b.begin_block(Some(l_pb))?;
-    let pw = b.shift_right_logical(u32t, None, page, c5)?;
-    let pwi = b.i_add(u32t, None, bits_at, pw)?;
-    let pbit = b.bitwise_and(u32t, None, page, c31)?;
-    let pmask = b.shift_left_logical(u32t, None, c1, pbit)?;
-    let pinv = b.not(u32t, None, pmask)?;
-    let ppb = b.access_chain(p_u, None, marks, [c0, pwi])?;
-    b.atomic_and(u32t, None, ppb, scope_dev, sem_none, pinv)?;
+    if !region {
+        let pw = b.shift_right_logical(u32t, None, page, c5)?;
+        let pwi = b.i_add(u32t, None, bits_at, pw)?;
+        let pbit = b.bitwise_and(u32t, None, page, c31)?;
+        let pmask = b.shift_left_logical(u32t, None, c1, pbit)?;
+        let pinv = b.not(u32t, None, pmask)?;
+        let ppb = b.access_chain(p_u, None, marks, [c0, pwi])?;
+        b.atomic_and(u32t, None, ppb, scope_dev, sem_none, pinv)?;
+    }
     let which = b.select(u32t, None, mapped, c0, c2)?;
     let pcnt = b.access_chain(p_u, None, counters, [c0, which])?;
     let one_unless_lazy = match lazy_page {
@@ -1820,6 +2055,19 @@ mod tests {
                 std::fs::write(std::path::Path::new(&dir).join(name), bytes).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn handoff_kernels_assemble() {
+        let reset = super::mirror_scatter_reset();
+        for (w, name) in [(super::mirror_handoff(), "mirror_handoff.spv"), (super::mirror_scatter_region(), "mirror_scatter_region.spv"), (reset.clone(), "mirror_scatter_reset.spv")] {
+            assert_eq!(w[0], 0x0723_0203);
+            if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+                let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(std::path::Path::new(&dir).join(name), bytes).unwrap();
+            }
+        }
+        assert_ne!(super::mirror_scatter_region(), reset);
     }
 
     #[test]

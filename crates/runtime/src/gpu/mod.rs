@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 236] = [
+    static ALL: [Tunable; 237] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -269,6 +269,7 @@ pub mod tune {
         Tunable { name: "upload_predetile", env: "DS_UPLOAD_PREDETILE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "record_defer", env: "DS_RECORD_DEFER", default: 5, value: AtomicU64::new(UNSET) },
         Tunable { name: "wb_probe", env: "DS_WB_PROBE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "wb_region", env: "DS_WB_REGION", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2579,6 +2580,16 @@ pub mod tune {
     /// the write-backs' places costs the frame.
     pub fn wb_probe() -> u64 {
         get(235)
+    }
+
+    /// Front end 2's write-backs handed over (step 1 of STATUS item 1): the
+    /// list and the listed pages' marks copied into a handoff region and
+    /// cleared (`rdna::kernels::mirror_handoff`), then the region's scatter
+    /// storing the marked dwords from the mirror (`mirror_scatter_region`),
+    /// back to back where the write-back was. The region and its kernels
+    /// are made when it is on at front end 2's start; live after that.
+    pub fn wb_region() -> u64 {
+        get(236)
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
