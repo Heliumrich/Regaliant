@@ -1033,6 +1033,7 @@ impl Exec {
         let since = |t0: Option<std::time::Instant>| t0.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         let kind = if self.deferred { 2 } else if cp.in_parallel_run() { 1 } else { 0 };
         let first = self.batch_shaders.is_empty();
+        super::super::fe2::set_first_command(first);
         let mut lap = super::Laps::for_draw(kind, first);
         let reg = |r: u32| ctx_reg(cp, r);
         // CB_COLOR_CONTROL.MODE: 0 color disabled, 1 normal; others are

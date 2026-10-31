@@ -476,7 +476,26 @@ const CALLER_NAMES: [&str; 4] = ["graphics CP", "its parallel workers", "queue 0
 /// misses on another epoch, misses on chunk generations, misses on host
 /// events, words scanned, takes, TSC cycles in all, placements (the
 /// executor's `fe2_place`), their TSC cycles].
-static BY_CALLER: [[AtomicU64; 18]; 4] = [const { [const { AtomicU64::new(0) }; 18] }; 4];
+static BY_CALLER: [[AtomicU64; 19]; 4] = [const { [const { AtomicU64::new(0) }; 19] }; 4];
+/// The same for placements made while a batch's (or parallel chunk's) first
+/// command is bound (`set_first_command`): first commands cost 100-216 us
+/// against ~20 us for later ones at Castlewall's arrival, most of it
+/// binding (FINDINGS.md 2026-10-31).
+static BY_CALLER_FIRST: [[AtomicU64; 19]; 4] = [const { [const { AtomicU64::new(0) }; 19] }; 4];
+
+thread_local! {
+    /// The command being bound opens its batch (`set_first_command`).
+    static FIRST_COMMAND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the command this thread binds now opens its batch (the
+/// executor's draws and dispatches; `DS_FE2_CALLERS`).
+#[inline]
+pub fn set_first_command(first: bool) {
+    if callers_on() {
+        FIRST_COMMAND.with(|f| f.set(first));
+    }
+}
 const C_PLACES: usize = 9;
 const C_PLACE_CYCLES: usize = 10;
 /// A placement's parts outside `ensure` (TSC cycles): finding its mapping
@@ -486,6 +505,9 @@ const C_PLACE_CYCLES: usize = 10;
 const C_PART_MAP: usize = 11;
 const C_PART_BEGIN: usize = 12;
 const C_PART_AFTER: usize = 13;
+/// Of C_PART_BEGIN, the batch's begin alone (the rest: the written range's
+/// import, `exec::span`).
+const C_PART_BATCH: usize = 18;
 /// The checks' parts (TSC cycles): scanning words, arming (`try_arm`),
 /// takes, making runs current (`fix_run`).
 const C_SCAN: usize = 14;
@@ -511,16 +533,18 @@ fn caller_since(what: usize, t0: u64) {
     }
 }
 
-/// Cycles of a placement's parts (`DS_FE2_CALLERS`): map, begin, after.
-pub fn note_place_parts(map: u64, begin: u64, after: u64) {
+/// Cycles of a placement's parts (`DS_FE2_CALLERS`): map, begin (of it
+/// the batch's begin alone), after.
+pub fn note_place_parts(map: u64, begin: u64, batch: u64, after: u64) {
     caller_count(C_PART_MAP, map);
     caller_count(C_PART_BEGIN, begin);
+    caller_count(C_PART_BATCH, batch);
     caller_count(C_PART_AFTER, after);
 }
 
 /// Clears the checks by caller (`profile reset`).
 pub fn reset_callers() {
-    for c in BY_CALLER.iter().flatten().chain(QUIET_TAKES.iter().flatten()).chain(BY_SOURCE.iter().flatten()).chain(SHARED_HITS.iter()) {
+    for c in BY_CALLER.iter().flatten().chain(BY_CALLER_FIRST.iter().flatten()).chain(QUIET_TAKES.iter().flatten()).chain(BY_SOURCE.iter().flatten()).chain(SHARED_HITS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
 }
@@ -590,7 +614,11 @@ pub fn set_caller(name: &str) {
 }
 
 fn caller_count(what: usize, n: u64) {
-    BY_CALLER[CALLER.with(|c| c.get())][what].fetch_add(n, Ordering::Relaxed);
+    let k = CALLER.with(|c| c.get());
+    BY_CALLER[k][what].fetch_add(n, Ordering::Relaxed);
+    if FIRST_COMMAND.with(|f| f.get()) {
+        BY_CALLER_FIRST[k][what].fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 fn note_range_fine(lo: u64, hi: u64, gens: [u32; FINE_CHUNKS], host: [u64; FINE_LEAVES], ep: u32, marked: bool) {
@@ -3864,17 +3892,19 @@ pub fn callers_line() -> String {
         return quiet;
     }
     let hz = super::threadcpu::tsc_hz();
-    let parts: Vec<String> = CALLER_NAMES
+    let line = |rows: &[[AtomicU64; 19]; 4]| -> Vec<String> {
+        CALLER_NAMES
         .iter()
-        .zip(BY_CALLER.iter())
+        .zip(rows.iter())
         .map(|(n, c)| {
             let v: Vec<u64> = c.iter().map(|x| x.load(Ordering::Relaxed)).collect();
             format!(
-                "{n}: {} placements ({:.1} ms; outside the checks: mapping and backing {:.1}, batch and import {:.1}, after {:.1}), {} checks ({} by the range cache; missed: no range {}, another epoch {}, chunk generations {}, host events {}), {} words scanned, {} takes, {:.1} ms (scans {:.1}, arming {:.1}, takes {:.1}, runs made current {:.1})",
+                "{n}: {} placements ({:.1} ms; outside the checks: mapping and backing {:.1}, batch and import {:.1} (the batch's begin {:.1}), after {:.1}), {} checks ({} by the range cache; missed: no range {}, another epoch {}, chunk generations {}, host events {}), {} words scanned, {} takes, {:.1} ms (scans {:.1}, arming {:.1}, takes {:.1}, runs made current {:.1})",
                 v[C_PLACES],
                 v[C_PLACE_CYCLES] as f64 * 1e3 / hz,
                 v[C_PART_MAP] as f64 * 1e3 / hz,
                 v[C_PART_BEGIN] as f64 * 1e3 / hz,
+                v[C_PART_BATCH] as f64 * 1e3 / hz,
                 v[C_PART_AFTER] as f64 * 1e3 / hz,
                 v[C_CHECKS],
                 v[C_HITS],
@@ -3891,7 +3921,10 @@ pub fn callers_line() -> String {
                 v[C_FIX] as f64 * 1e3 / hz
             )
         })
-        .collect();
+        .collect()
+    };
+    let parts = line(&BY_CALLER);
+    let firsts = line(&BY_CALLER_FIRST);
     let sources: Vec<String> = SOURCE_NAMES
         .iter()
         .zip(BY_SOURCE.iter())
@@ -3924,5 +3957,10 @@ pub fn callers_line() -> String {
     } else {
         String::new()
     };
-    format!("    front end 2's checks by caller: {}{shared}\n    the graphics CP's checks by the stage they bind: {}\n{quiet}", parts.join("; "), sources.join("; "))
+    format!(
+        "    front end 2's checks by caller: {}{shared}\n    of them at batches' and chunks' first commands: {}\n    the graphics CP's checks by the stage they bind: {}\n{quiet}",
+        parts.join("; "),
+        firsts.join("; "),
+        sources.join("; ")
+    )
 }

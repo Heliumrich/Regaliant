@@ -9949,12 +9949,14 @@ impl Exec {
         // command: one is begun first (a binding before this one may have
         // closed the batch, and a deferred executor's next batch may take
         // another slot, whose prologue an earlier open would not have begun).
+        let tb = tsc();
         if !self.recording {
             self.begin();
             if !self.recording || self.stopped {
                 return None;
             }
         }
+        let tb = tsc().wrapping_sub(tb);
         if written {
             if span(lo, hi - lo).is_none() {
                 super::fe2::note_unscatterable();
@@ -10061,7 +10063,7 @@ impl Exec {
             self.submit_after = self.submit_after.max(s);
         }
         if t0 != 0 {
-            super::fe2::note_place_parts(t1.wrapping_sub(t0), t2.wrapping_sub(t1), tsc().wrapping_sub(t3));
+            super::fe2::note_place_parts(t1.wrapping_sub(t0), t2.wrapping_sub(t1), tb, tsc().wrapping_sub(t3));
         }
         Some((mbuf, base - MIRROR_BASE, hi - base))
     }
@@ -14977,6 +14979,7 @@ impl Exec {
         }
         let kind = self.cs_kind(indirect.is_some());
         let first = self.batch_shaders.is_empty();
+        super::fe2::set_first_command(first);
         let mut lap = Laps::for_dispatch(kind, first);
         // Runs of direct dispatches of one program make it batchable.
         if super::tune::batch_cs() && indirect.is_none() && groups.iter().map(|&g| g as u64).product::<u64>() <= BATCH_SMALL {
