@@ -4203,6 +4203,72 @@ impl Images {
     /// (which made their next user wait for the GPU, scan their guest bytes
     /// for zeros and clear them: ~6,300 per gate run, ~0.4 ms each on the
     /// graphics command processor). Compressed formats keep that path.
+    /// The parts of guest [base, base+len) under GPU-written uncompressed
+    /// images used in the last FILL_FRESH frames and under no image uploaded
+    /// from guest memory (merged, clipped to the range): bytes nothing reads
+    /// from guest memory (such images are never written back there), which a
+    /// zero fill need not store (`tune fill_partial`; an image not used
+    /// lately may be memory the title uses otherwise now, so its bytes are
+    /// stored). Empty when an image over the range has no known span. Every
+    /// image is looked at, as `fill_covered` does.
+    pub fn gpu_written_spans(&self, base: u64, len: u64) -> Vec<(u64, u64)> {
+        const FILL_FRESH: u64 = 8;
+        let mut plus: Vec<(u64, u64)> = Vec::new();
+        let mut minus: Vec<(u64, u64)> = Vec::new();
+        if len == 0 || self.owned.is_empty() {
+            return plus;
+        }
+        let end = base.saturating_add(len);
+        let frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+        for (k, img) in self.map.iter() {
+            if k.base >= end || k.base.saturating_add(img.span.max(1)) <= base {
+                continue;
+            }
+            if img.span == 0 {
+                return Vec::new();
+            }
+            let part = (k.base.max(base), k.base.saturating_add(img.span).min(end));
+            if !img.gpu_written || is_compressed(k.format) {
+                minus.push(part);
+            } else if frame.saturating_sub(img.used.get()) <= FILL_FRESH {
+                plus.push(part);
+            }
+        }
+        let merge = |mut v: Vec<(u64, u64)>| -> Vec<(u64, u64)> {
+            v.sort_unstable();
+            let mut m: Vec<(u64, u64)> = Vec::with_capacity(v.len());
+            for (a, b) in v {
+                match m.last_mut() {
+                    Some(x) if a <= x.1 => x.1 = x.1.max(b),
+                    _ => m.push((a, b)),
+                }
+            }
+            m
+        };
+        let (plus, minus) = (merge(plus), merge(minus));
+        // plus minus minus: the parts no other image shares.
+        let mut out = Vec::with_capacity(plus.len());
+        for (a, b) in plus {
+            let mut at = a;
+            for &(x, y) in &minus {
+                if y <= at || x >= b {
+                    continue;
+                }
+                if x > at {
+                    out.push((at, x));
+                }
+                at = at.max(y);
+                if at >= b {
+                    break;
+                }
+            }
+            if at < b {
+                out.push((at, b));
+            }
+        }
+        out
+    }
+
     pub fn zero_filled(&mut self, base: u64, len: u64) -> Vec<(vk::Image, vk::Format)> {
         let mut out = Vec::new();
         if len == 0 || self.owned.is_empty() {

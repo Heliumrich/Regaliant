@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 239] = [
+    static ALL: [Tunable; 240] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -272,6 +272,7 @@ pub mod tune {
         Tunable { name: "wb_region", env: "DS_WB_REGION", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "wb_stream", env: "DS_WB_STREAM", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "wb_probe_site", env: "DS_WB_PROBE_SITE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fill_partial", env: "DS_FILL_PARTIAL", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2610,6 +2611,17 @@ pub mod tune {
     /// before CP writes the GPU performs (whose labels wait for them).
     pub fn wb_probe_site() -> u64 {
         get(238)
+    }
+
+    /// A large zero fill under front end 2 stores into guest memory only
+    /// where no GPU-written uncompressed image lies (`images::
+    /// gpu_written_spans`; the mirror is filled over all of it): the bytes
+    /// `fill_skip` already leaves out when such images cover a fill whole,
+    /// left out of the render-target pools' clears too (an 18 MiB one a
+    /// vista frame, in front of a label). Live; default 1 since 2026-10-31
+    /// (the vista +3%, GPU busy -1.8 ms a frame; tour clean: FINDINGS.md).
+    pub fn fill_partial() -> bool {
+        get(239) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

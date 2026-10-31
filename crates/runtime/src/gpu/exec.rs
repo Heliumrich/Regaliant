@@ -6215,6 +6215,25 @@ pub(super) fn stamp_worth(work: Option<u64>, big: u64) -> bool {
     }
 }
 
+/// Zero fills stored into guest memory in part (`tune fill_partial`):
+/// [fills, bytes left out under GPU-written images, bytes stored].
+pub static FILL_PARTIAL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The status line of `tune fill_partial` ("" before any).
+fn fill_partial_line() -> String {
+    let v: Vec<u64> = FILL_PARTIAL.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if v[0] == 0 {
+        return String::new();
+    }
+    format!("    zero fills stored into guest memory in part (`tune fill_partial`): {}, {} MiB left out under GPU-written images, {} MiB stored\n", v[0], v[1] >> 20, v[2] >> 20)
+}
+
+/// `DS_FILL_LABELS=1` (diagnosis): CP writes right after large fills named.
+fn fill_labels() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_FILL_LABELS").ok().as_deref() == Some("1"))
+}
+
 /// A full barrier a batch recorded with a timestamp after it (`seg_stamps`):
 /// its query, and the batch's command count and operation counts then.
 #[derive(Clone, Copy)]
@@ -8181,6 +8200,9 @@ pub struct Exec {
     wb_on: bool,
     wb_scatter: bool,
     wb_later: Vec<(vk::Buffer, u64, Vec<u8>)>,
+    /// The batch's last in-place fill (base, bytes, commands recorded before
+    /// it), for `DS_FILL_LABELS`.
+    last_fill: Option<(u64, u64, usize)>,
     /// The last draw, when another like it can be recorded on the state it
     /// left (`draw_repeat`, `tune draw_repeat`).
     repeat: Option<draw::Repeat>,
@@ -8935,6 +8957,7 @@ impl Exec {
                 wb_on: false,
                 wb_scatter: false,
                 wb_later: Vec::new(),
+                last_fill: None,
                 repeat: None,
                 cmd_uses: std::cell::Cell::new(0),
                 last_cmd_line: std::cell::Cell::new(0),
@@ -9268,6 +9291,7 @@ impl Exec {
         self.wb_counted = 0;
         self.wb_scatter = false;
         self.wb_later.clear();
+        self.last_fill = None;
         if super::tune::skip_barriers() & 64 == 0 {
             self.barrier();
         }
@@ -11390,6 +11414,13 @@ impl Exec {
     /// False: a video-memory home covers part of it or it is not one mapping
     /// (the kernel runs instead).
     fn fill_in_place(&mut self, base: u64, len: u64, v: u32) -> Result<bool, String> {
+        self.fill_in_place_parts(base, len, v, None)
+    }
+
+    /// `fill_in_place`, storing into guest memory only over `guest` (parts
+    /// of the range; None: all of it): the mirror is filled over the whole
+    /// range (`tune fill_partial`).
+    fn fill_in_place_parts(&mut self, base: u64, len: u64, v: u32, guest: Option<&[(u64, u64)]>) -> Result<bool, String> {
         if len == 0 || base % 4 != 0 || len % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(base, len) {
             return Ok(false);
         }
@@ -11420,7 +11451,18 @@ impl Exec {
             self.barrier_wanted = false;
             self.dispatched = false;
         }
-        unsafe { ctx().device.cmd_fill_buffer(cmd, buffer, base - start, len, v) };
+        match guest {
+            Some(parts) => {
+                for &(x, e) in parts {
+                    // (Stored bytes rounded outward to dwords, within the fill.)
+                    let (x, e) = (x.max(base) & !3, e.min(base + len).next_multiple_of(4).min(base + len));
+                    if x < e {
+                        unsafe { ctx().device.cmd_fill_buffer(cmd, buffer, x - start, e - x, v) };
+                    }
+                }
+            }
+            None => unsafe { ctx().device.cmd_fill_buffer(cmd, buffer, base - start, len, v) },
+        }
         // Front end 2: the mirror too (its later write-back of dwords marked
         // before the fill copies the filled values).
         if super::fe2::on() && super::fe2::in_span(base, len) {
@@ -11447,6 +11489,7 @@ impl Exec {
         }
         self.ops[OP_FILLS] += 1;
         self.ops[OP_FILL_BYTES] += len;
+        self.last_fill = Some((base, len, self.batch_shaders.len()));
         if !lazy_barriers() {
             self.barrier();
         }
@@ -12715,6 +12758,14 @@ impl Exec {
         // label a CP of ours waits on: at the batch's close, `tune
         // ts_cpw_waited`.)
         let waited = super::cp::cp_waited(a);
+        // `DS_FILL_LABELS=1` (diagnosis): CP writes the GPU performs right
+        // after a fill of 256 KiB or more with no command between, named.
+        if let Some((fb, fl, at)) = self.last_fill.take().filter(|&(_, fl, at)| fl >= 256 << 10 && at == self.batch_shaders.len() && fill_labels()) {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 40 {
+                crate::info!("gpu[{}]: a CP write at {a:#x} ({} bytes, value {:#x}; {}, {}) right after a fill of {fb:#x}+{fl:#x}, {} commands into its batch", self.name, bytes, data.first().copied().unwrap_or(0), if end_of_pipe { "end of pipe" } else { "write data" }, if waited { "a label our CPs wait on" } else { "no CP of ours waits on it" }, at);
+            }
+        }
         // Front end 2 (`tune fe2_cpw_defer`): a write that would need a
         // write-back first (a label no CP of ours waits on, after GPU work
         // that wrote the mirror) goes into the mirror here and into guest
@@ -15539,7 +15590,33 @@ impl Exec {
                         crate::info!("gpu: zero fill {base:#x}+{len:#x} (#{n}) stores into guest memory (home {homed}, mapping {access}): {report}");
                     }
                 }
-                if skip || self.fill_in_place(base, len, v)? {
+                // (`tune fill_partial`: a zero fill stores into guest memory
+                // only where no GPU-written uncompressed image lies, the bytes
+                // `tune fill_skip` leaves out of a fill over images alone.)
+                let parts = if !skip && v == 0 && len >= FILL_SKIP_MIN && super::tune::zero_fill_clears() && super::tune::fill_partial() && super::fe2::on() {
+                    let covered = super::images::with(|im| im.gpu_written_spans(base, len));
+                    (!covered.is_empty()).then(|| {
+                        let mut out = Vec::with_capacity(covered.len() + 1);
+                        let mut at = base;
+                        for &(a, b) in &covered {
+                            if a > at {
+                                out.push((at, a));
+                            }
+                            at = at.max(b);
+                        }
+                        if at < base + len {
+                            out.push((at, base + len));
+                        }
+                        let kept: u64 = out.iter().map(|&(a, b)| b - a).sum();
+                        FILL_PARTIAL[0].fetch_add(1, Ordering::Relaxed);
+                        FILL_PARTIAL[1].fetch_add(len - kept, Ordering::Relaxed);
+                        FILL_PARTIAL[2].fetch_add(kept, Ordering::Relaxed);
+                        out
+                    })
+                } else {
+                    None
+                };
+                if skip || self.fill_in_place_parts(base, len, v, parts.as_deref())? {
                     let zeroed = if self.held {
                         self.held_fill(base, len, v)
                     } else {
@@ -16313,6 +16390,7 @@ pub fn status() -> String {
         super::cp::sync_summary()
     ) + &super::images::IMAGES.try_lock().and_then(|g| g.as_ref().map(|i| i.status())).unwrap_or_default()
         + &slot_mem_line()
+        + &fill_partial_line()
         + &super::track::status()
         + &crate::mem::remap_status()
         + &crate::mem::prot_census()
