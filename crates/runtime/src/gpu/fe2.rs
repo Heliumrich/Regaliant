@@ -1429,6 +1429,9 @@ fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &A
     if r.is_some() {
         hole_check(written);
     }
+    if wb_pages() {
+        note_cpu_written(written);
+    }
     if index_census() {
         INDEX_CPU_WRITES[0].fetch_add(written.len() as u64, Ordering::Relaxed);
         let n = written.iter().filter(|&&pg| index_any(pg, PAGE)).count() as u64;
@@ -2596,6 +2599,8 @@ struct Scatter {
     changed: vk::Pipeline,
     /// The kernel leaving lazy pages out (`DS_FE2_LAZY2`).
     lazy: vk::Pipeline,
+    /// The kernel noting the pages it writes back (`DS_WB_PAGES`).
+    note: vk::Pipeline,
     /// The touched-page list made from the touched bits
     /// (`rdna::kernels::mirror_compact`, `tune touch_bits`).
     compact: vk::Pipeline,
@@ -2646,6 +2651,7 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
         let census = if reset { make(&rdna::kernels::mirror_scatter_census(), 22)? } else { vk::Pipeline::null() };
         let changed = if reset { make(&rdna::kernels::mirror_scatter_changed(), 23)? } else { vk::Pipeline::null() };
         let lazy = if reset && lazy2_on() { make(&rdna::kernels::mirror_scatter_lazy(), 25)? } else { vk::Pipeline::null() };
+        let note = if reset && wb_pages() { make(&rdna::kernels::mirror_scatter_note(), 26)? } else { vk::Pipeline::null() };
         let compact = make(&rdna::kernels::mirror_compact(), 24)?;
         let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 }];
         let pool = c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).map_err(|e| format!("scatter pool: {e}"))?;
@@ -2667,7 +2673,7 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
             .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
             .collect();
         c.device.update_descriptor_sets(&writes, &[]);
-        Ok(Scatter { pipeline, nostore, census, changed, lazy, compact, layout, set, counters: cptr as *mut u32, reset, host: cbuf, dev })
+        Ok(Scatter { pipeline, nostore, census, changed, lazy, note, compact, layout, set, counters: cptr as *mut u32, reset, host: cbuf, dev })
     }
 }
 
@@ -2709,6 +2715,8 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
         s.changed
     } else if s.lazy != vk::Pipeline::null() {
         s.lazy
+    } else if s.note != vk::Pipeline::null() {
+        s.note
     } else {
         s.pipeline
     };
@@ -2887,6 +2895,72 @@ fn index_census_line() -> String {
         INDEX_CPU_WRITES[1].load(Ordering::Relaxed),
         INDEX_CPU_WRITES[0].load(Ordering::Relaxed)
     )
+}
+
+/// `DS_WB_PAGES=1` (diagnosis): which pages GPU work really wrote (the
+/// write-back notes them in the map's aux region, `rdna::kernels::
+/// mirror_scatter_note`) against the pages takes found CPU-written, between
+/// status reports: pages both wrote are the ones a lazy write-back would
+/// have to merge when it uploads them (FINDINGS.md 2026-10-31).
+pub fn wb_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_WB_PAGES").ok().as_deref() == Some("1"))
+}
+
+/// `DS_WB_PAGES`: pages takes found CPU-written since the last report.
+fn cpu_written_pages() -> &'static [AtomicU64] {
+    static BITS: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
+    BITS.get_or_init(|| (0..(MIRROR_END - MIRROR_BASE) / PAGE / 64).map(|_| AtomicU64::new(0)).collect())
+}
+
+fn note_cpu_written(pages: &[u64]) {
+    let bits = cpu_written_pages();
+    for &pg in pages {
+        if in_span(pg, PAGE) {
+            let p = (pg - MIRROR_BASE) / PAGE;
+            bits[(p / 64) as usize].fetch_or(1 << (p % 64), Ordering::Relaxed);
+        }
+    }
+}
+
+/// Status part (`DS_WB_PAGES`): the window's GPU-written pages (read back
+/// from the aux region, which is cleared), CPU-written pages and both.
+fn wb_pages_line() -> String {
+    if !wb_pages() {
+        return String::new();
+    }
+    let Some(marks) = super::resident::marks() else { return String::new() };
+    let c = ctx();
+    let words = rdna::kernels::MARK_AUX_WORDS as u64;
+    let Ok((hbuf, hmem, hptr)) = c.host_buffer(words * 4, vk::BufferUsageFlags::TRANSFER_DST) else { return String::new() };
+    let at = rdna::kernels::MARK_AUX_AT as u64 * 4;
+    let r = super::resident::one_off_now(|cmd| unsafe {
+        c.device.cmd_copy_buffer(cmd, marks, hbuf, &[vk::BufferCopy { src_offset: at, dst_offset: 0, size: words * 4 }]);
+        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_READ).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        c.device.cmd_fill_buffer(cmd, marks, at, words * 4, 0);
+    });
+    let gpu: Vec<u32> = (0..words as usize).map(|i| unsafe { std::ptr::read_volatile((hptr as *const u32).add(i)) }).collect();
+    unsafe {
+        c.device.destroy_buffer(hbuf, None);
+        c.device.free_memory(hmem, None);
+    }
+    if let Err(e) = r {
+        return format!("    pages GPU work wrote (`DS_WB_PAGES`): read-back failed: {e}\n");
+    }
+    let cpu = cpu_written_pages();
+    let (mut g, mut cw, mut both) = (0u64, 0u64, 0u64);
+    for (w, &gw) in gpu.iter().enumerate() {
+        let cv = cpu[w / 2].load(Ordering::Relaxed);
+        let cpart = if w % 2 == 0 { cv as u32 } else { (cv >> 32) as u32 };
+        g += gw.count_ones() as u64;
+        cw += cpart.count_ones() as u64;
+        both += (gw & cpart).count_ones() as u64;
+    }
+    for x in cpu.iter() {
+        x.store(0, Ordering::Relaxed);
+    }
+    format!("    pages GPU work wrote (`DS_WB_PAGES`, since the last report): {g}; pages takes found CPU-written: {cw}; both: {both}\n")
 }
 
 /// `DS_FE2_LAZY2=<name>:<hex size>,...` (diagnosis, wrong results where the
@@ -3519,6 +3593,7 @@ pub fn status() -> String {
         + &compacts
         + &index_census_line()
         + &lazy2_line(&w)
+        + &wb_pages_line()
 }
 
 /// One status line: the mirror's pages by state now (a scan of every

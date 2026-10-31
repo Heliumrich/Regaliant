@@ -889,7 +889,7 @@ pub fn mirror_scatter_nostore() -> Vec<u32> {
 /// those guest memory held already (counters 4 and 5): what a write-back
 /// of changed dwords alone would store.
 pub fn mirror_scatter_census() -> Vec<u32> {
-    build_scatter_ex(true, true, 1, false).expect("mirror scatter kernel (census)")
+    build_scatter_ex(true, true, 1, false, false).expect("mirror scatter kernel (census)")
 }
 
 /// `mirror_scatter_census` storing only the dwords whose guest-memory value
@@ -897,11 +897,18 @@ pub fn mirror_scatter_census() -> Vec<u32> {
 /// the value guest memory held when it was read; a CPU write racing it
 /// lands as if after the GPU's).
 pub fn mirror_scatter_changed() -> Vec<u32> {
-    build_scatter_ex(true, true, 2, false).expect("mirror scatter kernel (changed dwords)")
+    build_scatter_ex(true, true, 2, false, false).expect("mirror scatter kernel (changed dwords)")
 }
 
 fn build_scatter(reset: bool, stores: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
-    build_scatter_ex(reset, stores, 0, false)
+    build_scatter_ex(reset, stores, 0, false, false)
+}
+
+/// `mirror_scatter_reset` that also sets, for each page it writes back
+/// dwords of, the page's bit in the map's aux region (diagnosis, the
+/// runtime's `DS_WB_PAGES`: which pages GPU work really wrote).
+pub fn mirror_scatter_note() -> Vec<u32> {
+    build_scatter_ex(true, true, 0, false, true).expect("mirror scatter kernel (noting pages)")
 }
 
 /// `mirror_scatter_reset` leaving pages whose bit is set in the map's aux
@@ -909,13 +916,14 @@ fn build_scatter(reset: bool, stores: bool) -> Result<Vec<u32>, rspirv::dr::Erro
 /// their marks and touched bits are cleared as after a write-back, their
 /// dwords and pages counted in counters 6 and 7 instead of 1 and 0).
 pub fn mirror_scatter_lazy() -> Vec<u32> {
-    build_scatter_ex(true, true, 0, true).expect("mirror scatter kernel (lazy pages)")
+    build_scatter_ex(true, true, 0, true, false).expect("mirror scatter kernel (lazy pages)")
 }
 
 /// `read`: 0 stores every marked dword; 1 reads its guest-memory value first
 /// and counts (counters 4 and 5); 2 as 1, storing only changed dwords.
 /// `lazy`: pages with their aux bit set store nothing (`mirror_scatter_lazy`).
-fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
+/// `note`: pages written back get their aux bit set (`mirror_scatter_note`).
+fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     let census = read != 0;
     let lit = Operand::LiteralBit32;
     let mut b = Builder::new();
@@ -1174,6 +1182,23 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool) -> Result<V
     let pdw = b.access_chain(p_u, None, counters, [c0, c1])?;
     let add = b.i_mul(u32t, None, total, which_dw)?;
     b.atomic_i_add(u32t, None, pdw, scope_dev, sem_none, add)?;
+    if note {
+        // (A page with dwords written back: its aux bit.)
+        let any = b.u_greater_than(bool_, None, add, c0)?;
+        let (l_nt, l_ntd) = (b.id(), b.id());
+        b.selection_merge(l_ntd, SelectionControl::NONE)?;
+        b.branch_conditional(any, l_nt, l_ntd, [])?;
+        b.begin_block(Some(l_nt))?;
+        let aux_at = c(&mut b, MARK_AUX_AT);
+        let aw = b.shift_right_logical(u32t, None, page, c5)?;
+        let awi = b.i_add(u32t, None, aux_at, aw)?;
+        let pa = b.access_chain(p_u, None, marks, [c0, awi])?;
+        let abit = b.bitwise_and(u32t, None, page, c31)?;
+        let amask = b.shift_left_logical(u32t, None, c1, abit)?;
+        b.atomic_or(u32t, None, pa, scope_dev, sem_none, amask)?;
+        b.branch(l_ntd)?;
+        b.begin_block(Some(l_ntd))?;
+    }
     if let Some(l) = lazy_page {
         // (A lazy page's dwords and the page in counters 6 and 7.)
         let (l_lz, l_lzd) = (b.id(), b.id());
@@ -1500,6 +1525,17 @@ mod tests {
         if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
             let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("mirror_scatter.spv"), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn scatter_note_kernel_assembles() {
+        let w = super::mirror_scatter_note();
+        assert_eq!(w[0], 0x0723_0203);
+        assert_ne!(w, super::mirror_scatter_reset());
+        if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("mirror_scatter_note.spv"), bytes).unwrap();
         }
     }
 
