@@ -4112,6 +4112,10 @@ impl StepTimer {
     }
 }
 
+/// Batch-slot waits whose batch the GPU had completed when they began (the
+/// wait then the completion thread's processing up to it): [waits, ns].
+static SLOT_LAG: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 fn begin_stats_line() -> String {
     let s: Vec<u64> = BEGIN_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let slot_wait = WAIT_NS[2].load(Ordering::Relaxed);
@@ -5857,7 +5861,7 @@ fn slot_mem_line() -> String {
         .map(|(k, n)| format!("{n} {}/{} KiB", SEG_MAX[k][0].load(Ordering::Relaxed) >> 10, SEG_MAX[k][1].load(Ordering::Relaxed) >> 10))
         .collect();
     format!(
-        "    batch slots: {} ({} MiB of video memory: shadows {}, batch-start copy segments {}, snapshots {}, SGPR rings {}; {} MiB of host rings and staging); most a batch used of its shadow/copy segment: {}
+        "    batch slots: {} ({} MiB of video memory: shadows {}, batch-start copy segments {}, snapshots {}, SGPR rings {}; {} MiB of host rings and staging); most a batch used of its shadow/copy segment: {}; slot waits {} ({:.0} ms), {} of them ({:.0} ms) with the GPU done with their batch at their start
 ",
         v[0],
         device >> 20,
@@ -5866,7 +5870,11 @@ fn slot_mem_line() -> String {
         v[3] >> 20,
         v[4] >> 20,
         v[5] >> 20,
-        m.join(", ")
+        m.join(", "),
+        WAIT_NS[3].load(Ordering::Relaxed),
+        WAIT_NS[2].load(Ordering::Relaxed) as f64 / 1e6,
+        SLOT_LAG[0].load(Ordering::Relaxed),
+        SLOT_LAG[1].load(Ordering::Relaxed) as f64 / 1e6
     )
 }
 
@@ -8949,6 +8957,9 @@ impl Exec {
         if slot.seq != 0 {
             if slot.seq > done_seq() {
                 let t = std::time::Instant::now();
+                // (Whether the GPU had completed the batch already: the wait
+                // is then the completion thread's bookkeeping, `SLOT_LAG`.)
+                let gpu_done = !self.batch_alt && ctx().batch_value() >= slot.seq;
                 let tw = super::timeline::wait_start();
                 if !wait_done_for(slot.seq, std::time::Duration::from_secs(3)) {
                     crate::warn!("gpu[{}]: waiting > 3 s for a free batch slot (batch {}, done {}; held {}, past {})", self.name, slot.seq, done_seq(), self.held, self.past);
@@ -8958,6 +8969,10 @@ impl Exec {
                 super::hitch::note_since(super::hitch::Kind::GpuWait, t, || format!("a free batch slot: the GPU behind (batch {})", slot.seq));
                 WAIT_NS[2].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 WAIT_NS[3].fetch_add(1, Ordering::Relaxed);
+                if gpu_done {
+                    SLOT_LAG[0].fetch_add(1, Ordering::Relaxed);
+                    SLOT_LAG[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
                 note_queue_wait(&self.name, 1, t.elapsed());
             }
             wait_done(slot.seq);

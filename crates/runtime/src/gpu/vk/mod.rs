@@ -1111,6 +1111,12 @@ impl Ctx {
 
     /// Waits until the main queue's batch `seq` completed (`batches`);
     /// false on a timeout or error.
+    /// The batch timeline's value now: the highest batch sequence the main
+    /// queue has completed (every earlier one of its batches too).
+    pub fn batch_value(&self) -> u64 {
+        unsafe { self.device.get_semaphore_counter_value(self.batches) }.unwrap_or(0)
+    }
+
     pub fn wait_batch(&self, seq: u64, timeout_ns: u64) -> bool {
         let s = [self.batches];
         let v = [seq];
