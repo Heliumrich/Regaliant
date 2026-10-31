@@ -1429,6 +1429,11 @@ fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &A
     if r.is_some() {
         hole_check(written);
     }
+    if index_census() {
+        INDEX_CPU_WRITES[0].fetch_add(written.len() as u64, Ordering::Relaxed);
+        let n = written.iter().filter(|&&pg| index_any(pg, PAGE)).count() as u64;
+        INDEX_CPU_WRITES[1].fetch_add(n, Ordering::Relaxed);
+    }
     super::hitch::note_since(super::hitch::Kind::Mirror, tt, || format!("take of {ta:#x}..{tb:#x} ({} pages)", (tb - ta) / PAGE));
     let tns = tt.elapsed().as_nanos() as u64;
     STATS[S_TAKE_NS].fetch_add(tns, Ordering::Relaxed);
@@ -2705,6 +2710,18 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
     unsafe {
         let all = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT, vk::DependencyFlags::empty(), &[all], &[], &[]);
+        // (`DS_INDEX_CENSUS` with the census kernel: the index-page bits into
+        // the map's aux region, once.)
+        if index_census() && pipeline == s.census && !AUX_SENT.swap(true, Ordering::Relaxed) {
+            let bytes: Vec<u8> = index_pages().iter().flat_map(|w| w.load(Ordering::Relaxed).to_le_bytes()).collect();
+            let at = rdna::kernels::MARK_AUX_AT as u64 * 4;
+            for (k, part) in bytes.chunks(65536).enumerate() {
+                c.device.cmd_update_buffer(cmd, marks, at + 65536 * k as u64, part);
+            }
+            let up = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[up], &[], &[]);
+            crate::info!("fe2: the index-page bits ({} pages) copied for the write-back census", index_pages().iter().map(|w| w.load(Ordering::Relaxed).count_ones()).sum::<u32>());
+        }
         if let Some((lo, hi)) = written.filter(|&(lo, hi)| lo < hi && TOUCH_BITS_EVER.load(Ordering::Relaxed)) {
             // The touched-bit words of the pages in [lo, hi), 32 pages a word.
             let span_words = (MIRROR_END - MIRROR_BASE) / PAGE / 32;
@@ -2769,12 +2786,108 @@ pub fn scatter_resets() -> bool {
     on() && SCATTER.get().is_some_and(|s| s.reset)
 }
 
+/// `DS_INDEX_CENSUS=1` (diagnosis): the span's pages draws have read
+/// indices from (a bit per 4 KiB page, set at the draws' placements), and
+/// what reaches them on the CPU side: [the command processors' reads by
+/// reason (`exec::SYNC_*`, 6), pages takes found CPU-written]. Whether GPU
+/// work's index outputs could stay in the mirror (a lazy write-back of
+/// them, as the old front end's index homes did; FINDINGS.md 2026-10-31).
+pub fn index_census() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_INDEX_CENSUS").ok().as_deref() == Some("1"))
+}
+
+fn index_pages() -> &'static [AtomicU64] {
+    static BITS: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
+    BITS.get_or_init(|| (0..(MIRROR_END - MIRROR_BASE) / PAGE / 64).map(|_| AtomicU64::new(0)).collect())
+}
+
+static INDEX_READS: [[AtomicU64; 3]; 6] = [const { [const { AtomicU64::new(0) }; 3] }; 6];
+/// The index-page bits were copied into the map's aux region.
+static AUX_SENT: AtomicBool = AtomicBool::new(false);
+static INDEX_CPU_WRITES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Notes that a draw reads indices from [a, a+n) (`index_census`).
+pub fn note_index(a: u64, n: u64) {
+    if !index_census() || n == 0 || !in_span(a, n) {
+        return;
+    }
+    let bits = index_pages();
+    let (p0, p1) = ((a - MIRROR_BASE) / PAGE, (a + n - MIRROR_BASE).div_ceil(PAGE));
+    let mut p = p0;
+    while p < p1 {
+        let w = (p / 64) as usize;
+        let e = ((p / 64 + 1) * 64).min(p1);
+        let mask = if e - p == 64 { u64::MAX } else { ((1u64 << (e - p)) - 1) << (p % 64) };
+        if bits[w].load(Ordering::Relaxed) & mask != mask {
+            bits[w].fetch_or(mask, Ordering::Relaxed);
+        }
+        p = e;
+    }
+}
+
+fn index_any(a: u64, n: u64) -> bool {
+    if n == 0 || !in_span(a, n) {
+        return false;
+    }
+    let bits = index_pages();
+    let (p0, p1) = ((a - MIRROR_BASE) / PAGE, (a + n - MIRROR_BASE).div_ceil(PAGE));
+    let mut p = p0;
+    while p < p1 {
+        let w = (p / 64) as usize;
+        let e = ((p / 64 + 1) * 64).min(p1);
+        let mask = if e - p == 64 { u64::MAX } else { ((1u64 << (e - p)) - 1) << (p % 64) };
+        if bits[w].load(Ordering::Relaxed) & mask != 0 {
+            return true;
+        }
+        p = e;
+    }
+    false
+}
+
+/// Counts the command processors' reads of index pages (`index_census`).
+pub fn index_census_reads(reads: &[(u64, u64)], why: usize) {
+    if !index_census() {
+        return;
+    }
+    let c = &INDEX_READS[why.min(5)];
+    for &(a, n) in reads {
+        c[0].fetch_add(1, Ordering::Relaxed);
+        if index_any(a, n) {
+            c[1].fetch_add(1, Ordering::Relaxed);
+            c[2].fetch_add(n, Ordering::Relaxed);
+        }
+    }
+}
+
+fn index_census_line() -> String {
+    if !index_census() {
+        return String::new();
+    }
+    let pages: u64 = index_pages().iter().map(|w| w.load(Ordering::Relaxed).count_ones() as u64).sum();
+    const WHY: [&str; 6] = ["CP reads", "dispatch shader reads", "dispatch textures", "draw shader reads", "draw textures", "draw indices"];
+    let reads: Vec<String> = (0..6)
+        .map(|k| {
+            let v: Vec<u64> = INDEX_READS[k].iter().map(|x| x.load(Ordering::Relaxed)).collect();
+            format!("{} {} ({} of index pages, {} KiB)", WHY[k], v[0], v[1], v[2] >> 10)
+        })
+        .collect();
+    format!(
+        "    index pages (`DS_INDEX_CENSUS`): {pages} pages ({} MiB) drawn from; the command processors' reads: {}; pages takes found CPU-written: {} of {}\n",
+        (pages * PAGE) >> 20,
+        reads.join(", "),
+        INDEX_CPU_WRITES[1].load(Ordering::Relaxed),
+        INDEX_CPU_WRITES[0].load(Ordering::Relaxed)
+    )
+}
+
 /// The write-back's counters summed in 64 bits (the kernel's are 32-bit
-/// and wrap within seconds at an arrival's volume: ~4 million dwords a
-/// flip at Castlewall), sampled at every flip (`census_sample`): pages,
-/// dwords, the census's dwords and those guest memory held already
-/// (`tune fe2_scatter_read`), then the last values seen of the four.
-static WB64: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// and wrap within seconds at an arrival's volume: ~10 million dwords a
+/// flip), sampled at every flip (`census_sample`): pages, dwords, the
+/// census's dwords and those guest memory held already (`tune
+/// fe2_scatter_read`), its dwords and pages in index pages
+/// (`DS_INDEX_CENSUS`), then the last values seen of the six.
+static WB64: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 
 /// Adds the counters' growth since the last sample (at each flip, from one
 /// thread; the status line reads the sums alone, two samplers could race
@@ -2784,8 +2897,8 @@ pub fn census_sample() {
         return;
     }
     let k = counters();
-    for (i, now) in [k[0], k[1], k[4], k[5]].into_iter().enumerate() {
-        let prev = WB64[4 + i].swap(now as u64, Ordering::Relaxed) as u32;
+    for (i, now) in [k[0], k[1], k[4], k[5], k[6], k[7]].into_iter().enumerate() {
+        let prev = WB64[6 + i].swap(now as u64, Ordering::Relaxed) as u32;
         WB64[i].fetch_add(now.wrapping_sub(prev) as u64, Ordering::Relaxed);
     }
 }
@@ -3123,7 +3236,7 @@ pub fn status() -> String {
     let w: Vec<u64> = WB64.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let (cn, cs) = (w[2], w[3]);
     let compacts = if COMPACTS[0].load(Ordering::Relaxed) > 0 { format!("    front end 2's touched-page lists made from touched bits (`tune touch_bits`): {} write-backs, {} words of bits scanned\n", COMPACTS[0].load(Ordering::Relaxed), COMPACTS[1].load(Ordering::Relaxed)) } else { String::new() };
-    let census = if cn > 0 { format!("    front end 2's write-back census (`tune fe2_scatter_read`): {cn} dwords marked, {cs} of them ({:.1}%) held by guest memory already\n", 100.0 * cs as f64 / cn as f64) } else { String::new() };
+    let census = if cn > 0 { format!("    front end 2's write-back census (`tune fe2_scatter_read`): {cn} dwords marked, {cs} of them ({:.1}%) held by guest memory already; in pages draws read indices from (`DS_INDEX_CENSUS`): {} dwords ({:.1}%), {} pages\n", 100.0 * cs as f64 / cn as f64, w[4], 100.0 * w[4] as f64 / cn as f64, w[5]) } else { String::new() };
     format!(
         "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages; runs a take of their epoch had looked at, without another: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action; CP writes with work to write back {} of labels a CP of ours waits on, {} left to the batch's close, {} with their guest-memory copy at the close); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value, {} again with the label's page unwritten and {} gone past ended none); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
         s[S_ENSURES],
@@ -3206,6 +3319,7 @@ pub fn status() -> String {
         + &callers_line()
         + &census
         + &compacts
+        + &index_census_line()
 }
 
 /// One status line: the mirror's pages by state now (a scan of every

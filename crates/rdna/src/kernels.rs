@@ -517,7 +517,12 @@ pub const MARK_WORDS: u32 = (MARK_SPAN_BYTES / 128) as u32;
 pub const MARK_PAGE_BITS_AT: u32 = MARK_WORDS;
 pub const MARK_LIST_AT: u32 = MARK_PAGE_BITS_AT + (MARK_SPAN_BYTES / 4096 / 32) as u32;
 pub const MARK_LIST_CAP: u32 = 1 << 20;
-pub const MARK_TOTAL_WORDS: u32 = MARK_LIST_AT + 4 + MARK_LIST_CAP;
+/// Then one bit per page set by the CPU for diagnosis (the runtime's
+/// `DS_INDEX_CENSUS`: pages draws read indices from), read by
+/// `mirror_scatter_census`.
+pub const MARK_AUX_AT: u32 = MARK_LIST_AT + 4 + MARK_LIST_CAP;
+pub const MARK_AUX_WORDS: u32 = (MARK_SPAN_BYTES / 4096 / 32) as u32;
+pub const MARK_TOTAL_WORDS: u32 = MARK_AUX_AT + MARK_AUX_WORDS;
 
 /// Workgroup size of `mirror_gather`: one invocation per mark word of a
 /// page.
@@ -839,8 +844,9 @@ fn build_compact() -> Result<Vec<u32>, rspirv::dr::Error> {
 /// pages with marks but no guest page-table entry (their dwords are lost to
 /// guest memory), scatters that found the touched-page list past
 /// MARK_LIST_CAP; then `mirror_scatter_census`'s dwords written back and
-/// those of them guest memory held already.
-pub const SCATTER_COUNTERS: u32 = 6;
+/// those of them guest memory held already, and the dwords and pages it
+/// wrote back in pages whose bit is set in the map's MARK_AUX_AT region.
+pub const SCATTER_COUNTERS: u32 = 8;
 
 /// Workgroup size of `mirror_scatter`: invocation t copies dwords t, t +
 /// 256, t + 512 and t + 768 of its page, so that a subgroup's stores are
@@ -1138,6 +1144,30 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8) -> Result<Vec<u32>, rsp
     let pdw = b.access_chain(p_u, None, counters, [c0, c1])?;
     let add = b.i_mul(u32t, None, total, which_dw)?;
     b.atomic_i_add(u32t, None, pdw, scope_dev, sem_none, add)?;
+    if census {
+        // (The page's bit in the aux region: dwords and pages counted.)
+        let aux_at = c(&mut b, MARK_AUX_AT);
+        let aw = b.shift_right_logical(u32t, None, page, c5)?;
+        let awi = b.i_add(u32t, None, aux_at, aw)?;
+        let pa = b.access_chain(p_u, None, marks, [c0, awi])?;
+        let av = b.load(u32t, None, pa, None, [])?;
+        let abit = b.bitwise_and(u32t, None, page, c31)?;
+        let ash = b.shift_right_logical(u32t, None, av, abit)?;
+        let aone = b.bitwise_and(u32t, None, ash, c1)?;
+        let aset = b.i_not_equal(bool_, None, aone, c0)?;
+        let (l_ax, l_axd) = (b.id(), b.id());
+        b.selection_merge(l_axd, SelectionControl::NONE)?;
+        b.branch_conditional(aset, l_ax, l_axd, [])?;
+        b.begin_block(Some(l_ax))?;
+        let c6 = c(&mut b, 6);
+        let c7 = c(&mut b, 7);
+        let p6 = b.access_chain(p_u, None, counters, [c0, c6])?;
+        b.atomic_i_add(u32t, None, p6, scope_dev, sem_none, add)?;
+        let p7 = b.access_chain(p_u, None, counters, [c0, c7])?;
+        b.atomic_i_add(u32t, None, p7, scope_dev, sem_none, c1)?;
+        b.branch(l_axd)?;
+        b.begin_block(Some(l_axd))?;
+    }
     b.branch(l_cntd)?;
     b.begin_block(Some(l_cntd))?;
     // Every mask word read before any is cleared.

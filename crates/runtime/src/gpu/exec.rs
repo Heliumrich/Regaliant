@@ -1508,17 +1508,74 @@ fn wb_census_line() -> String {
 fn lazy_rules() -> &'static [(String, u64)] {
     static RULES: std::sync::OnceLock<Vec<(String, u64)>> = std::sync::OnceLock::new();
     RULES.get_or_init(|| {
-        let Ok(v) = std::env::var("DS_FE2_LAZY") else { return Vec::new() };
-        let rules: Vec<(String, u64)> = v
-            .split(',')
-            .filter_map(|r| {
-                let (n, s) = r.rsplit_once(':')?;
-                Some((n.to_string(), u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()?))
-            })
-            .collect();
-        crate::warn!("gpu: front end 2 leaves GPU writes into mappings {rules:?} in the mirror (`DS_FE2_LAZY`, diagnosis: guest memory never gets them)");
+        let rules = mapping_rules("DS_FE2_LAZY");
+        if !rules.is_empty() {
+            crate::warn!("gpu: front end 2 leaves GPU writes into mappings {rules:?} in the mirror (`DS_FE2_LAZY`, diagnosis: guest memory never gets them)");
+        }
         rules
     })
+}
+
+/// `<name>:<hex size>,...` from the environment variable `var`.
+fn mapping_rules(var: &str) -> Vec<(String, u64)> {
+    let Ok(v) = std::env::var(var) else { return Vec::new() };
+    v.split(',')
+        .filter_map(|r| {
+            let (n, s) = r.rsplit_once(':')?;
+            Some((n.to_string(), u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()?))
+        })
+        .collect()
+}
+
+/// `DS_READ_CENSUS=<name>:<hex size>,...` (diagnosis): the command
+/// processors' CPU-side reads of guest memory that pass `sync_for`, by
+/// reason (`SYNC_*`): [reads, bytes, reads inside a mapping the rules name,
+/// their bytes] (which of our reads need GPU results there in guest
+/// memory: FINDINGS.md 2026-10-31).
+static READ_CENSUS: [[AtomicU64; 4]; 6] = [const { [const { AtomicU64::new(0) }; 4] }; 6];
+
+fn read_census_rules() -> &'static [(String, u64)] {
+    static RULES: std::sync::OnceLock<Vec<(String, u64)>> = std::sync::OnceLock::new();
+    RULES.get_or_init(|| mapping_rules("DS_READ_CENSUS"))
+}
+
+thread_local! {
+    /// Mappings looked up for `read_census_rules`: (start, end) -> matches.
+    static CENSUS_SEEN: std::cell::RefCell<HashMap<(u64, u64), bool>> = std::cell::RefCell::new(HashMap::new());
+}
+
+fn note_read_census(reads: &[(u64, u64)], why: usize) {
+    let rules = read_census_rules();
+    if rules.is_empty() {
+        return;
+    }
+    let c = &READ_CENSUS[why.min(5)];
+    for &(a, n) in reads {
+        c[0].fetch_add(1, Ordering::Relaxed);
+        c[1].fetch_add(n, Ordering::Relaxed);
+        let inside = crate::mem::vma_bounds(a).is_some_and(|b| {
+            CENSUS_SEEN.with(|s| *s.borrow_mut().entry(b).or_insert_with(|| crate::mem::vma_label(a).is_some_and(|(_, size, name)| rules.iter().any(|(r, z)| *r == name && *z == size))))
+        });
+        if inside {
+            c[2].fetch_add(1, Ordering::Relaxed);
+            c[3].fetch_add(n, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Status part: `READ_CENSUS` ("" when off).
+fn read_census_line() -> String {
+    if read_census_rules().is_empty() {
+        return String::new();
+    }
+    const WHY: [&str; 6] = ["CP reads", "dispatch shader reads", "dispatch textures", "draw shader reads", "draw textures", "draw indices"];
+    let parts: Vec<String> = (0..6)
+        .map(|k| {
+            let v: Vec<u64> = READ_CENSUS[k].iter().map(|x| x.load(Ordering::Relaxed)).collect();
+            format!("{} {} ({} KiB; inside {} ({} KiB))", WHY[k], v[0], v[1] >> 10, v[2], v[3] >> 10)
+        })
+        .collect();
+    format!("    CPU-side reads by reason (`DS_READ_CENSUS` {:?}): {}\n", read_census_rules(), parts.join(", "))
 }
 
 static LAZY_SKIPS: AtomicU64 = AtomicU64::new(0);
@@ -11596,6 +11653,8 @@ impl Exec {
     }
 
     pub fn sync_for(&mut self, reads: &[(u64, u64)], why: usize) -> bool {
+        note_read_census(reads, why);
+        super::fe2::index_census_reads(reads, why);
         if super::runprobe::on() && self.name == "gpu-gfx" {
             super::runprobe::reads(reads);
         }
@@ -15956,6 +16015,7 @@ pub fn status() -> String {
         + &remaps_over_imports_line()
         + &kept_imports_line()
         + &wb_census_line()
+        + &read_census_line()
         + &audit_line()
         + &{
             let v: Vec<u64> = F5_CENSUS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
