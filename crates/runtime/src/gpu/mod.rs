@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 231] = [
+    static ALL: [Tunable; 232] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -264,6 +264,7 @@ pub mod tune {
         Tunable { name: "fe2_scatter_read", env: "DS_FE2_SCATTER_READ", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "touch_bits", env: "DS_TOUCH_BITS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "wb_image", env: "DS_WB_IMAGE_TUNE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "upload_batch", env: "DS_UPLOAD_BATCH", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2525,6 +2526,15 @@ pub mod tune {
     /// split its cost this way).
     pub fn wb_image() -> u64 {
         get(230)
+    }
+
+    /// Texture uploads detiled on the CPU that waited for their transfer on
+    /// the main queue are recorded into one command buffer they share,
+    /// submitted ahead of the next batch (`images::flush_uploads`) and not
+    /// waited for (`images`; their staging freed once it completes). Read
+    /// at each upload.
+    pub fn upload_batch() -> bool {
+        get(231) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

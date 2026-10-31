@@ -3222,8 +3222,10 @@ fn note_copy_waits(own: bool, wait: u64) {
 /// the timeline's signals increase.
 fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, fence: vk::Fence, alt: bool) -> Result<(), String> {
     let c = ctx();
-    // Guest page table updates queued before this batch, ahead of it.
+    // Guest page table updates queued before this batch, ahead of it, and
+    // texture uploads recorded batched (`tune upload_batch`).
     super::pagetable::submit_pending(c)?;
+    super::images::flush_uploads();
     SUBMIT_KIND.with(|k| k.set(if xpre.is_some() { 1 } else if wait > 0 { 2 } else { 0 }));
     let mut wait = wait;
     if let Some(x) = xpre {

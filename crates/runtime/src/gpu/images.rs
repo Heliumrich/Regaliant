@@ -940,6 +940,146 @@ const MAX_INFLIGHT_BYTES: u64 = 128 << 20;
 static UPLOAD_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static STAGING_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `tune upload_batch`: uploads detiled on the CPU that would wait for their
+/// transfer on the main queue are recorded into one command buffer they all
+/// share, submitted ahead of the next batch (`flush_uploads`, from
+/// `exec::submit_batch`) or of the cache's own next submission, and not
+/// waited for; their staging buffers are freed once it completes. Every
+/// batch goes to the one main queue (`tune alt_queue` aside), so a batch
+/// that binds such a texture runs after its upload (the upload's last
+/// barrier holds all later work), as does any batch an image buried after
+/// it waits for.
+struct Batched {
+    pool: vk::CommandPool,
+    /// The open command buffer, its fence, the staging it reads, its bytes.
+    open: Option<(vk::CommandBuffer, vk::Fence, Vec<(vk::Buffer, vk::DeviceMemory)>, u64)>,
+    inflight: std::collections::VecDeque<(vk::CommandBuffer, vk::Fence, Vec<(vk::Buffer, vk::DeviceMemory)>, u64)>,
+    spare: Vec<(vk::CommandBuffer, vk::Fence)>,
+}
+
+static BATCHED: Mutex<Option<Batched>> = Mutex::new(None);
+/// The open command buffer and those in flight (`flush_uploads` returns at
+/// once at 0).
+static BATCHED_LIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Uploads recorded batched, command buffers submitted, waits for one in
+/// flight (`BATCHED_MAX_BYTES`).
+static BATCHED_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Staging bytes recorded or in flight at most before an upload waits for
+/// the oldest command buffer.
+const BATCHED_MAX_BYTES: u64 = 256 << 20;
+/// Staging bytes the open command buffer reads at most before it is
+/// submitted at once (no batch submitted meanwhile: level loads).
+const BATCHED_OPEN_BYTES: u64 = 64 << 20;
+
+fn free_batched(held: Vec<(vk::Buffer, vk::DeviceMemory)>) {
+    let c = ctx();
+    for (buf, mem) in held {
+        unsafe {
+            c.device.destroy_buffer(buf, None);
+            c.device.unmap_memory(mem);
+            c.device.free_memory(mem, None);
+        }
+    }
+}
+
+impl Batched {
+    /// Submits the open command buffer, if any, to the main queue.
+    fn submit_open(&mut self) {
+        let Some((cmd, fence, held, bytes)) = self.open.take() else { return };
+        let c = ctx();
+        unsafe { c.device.end_command_buffer(cmd).ok() };
+        match c.submit(cmd, &[], &[], fence) {
+            Ok(()) => {
+                self.inflight.push_back((cmd, fence, held, bytes));
+                BATCHED_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => {
+                if !super::exec::DEVICE_LOST.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    crate::error!("images: batched uploads' submit failed: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
+                }
+                free_batched(held);
+                unsafe { c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok() };
+                self.spare.push((cmd, fence));
+                BATCHED_LIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Frees what completed command buffers held, waiting for the oldest
+    /// while more than `max_bytes` are recorded or in flight.
+    fn reap(&mut self, max_bytes: u64) {
+        let c = ctx();
+        while let Some(&(_, fence, _, _)) = self.inflight.front() {
+            let done = unsafe { c.device.get_fence_status(fence) }.unwrap_or(true);
+            if !done {
+                let bytes: u64 = self.inflight.iter().map(|x| x.3).sum::<u64>() + self.open.as_ref().map_or(0, |o| o.3);
+                if bytes <= max_bytes {
+                    break;
+                }
+                BATCHED_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let t0 = std::time::Instant::now();
+                unsafe { c.device.wait_for_fences(&[fence], true, 10_000_000_000).ok() };
+                super::hitch::note_since(super::hitch::Kind::GpuWait, t0, || format!("batched texture uploads in flight ({} MiB)", bytes >> 20));
+            }
+            let Some((cmd, fence, held, _)) = self.inflight.pop_front() else { break };
+            free_batched(held);
+            unsafe {
+                c.device.reset_fences(&[fence]).ok();
+                c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
+            }
+            self.spare.push((cmd, fence));
+            BATCHED_LIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Records an upload (`f`) into the shared open command buffer; its staging
+/// (buffer, memory) is freed once that completes.
+fn record_batched(staging: (vk::Buffer, vk::DeviceMemory), bytes: u64, f: &dyn Fn(vk::CommandBuffer)) -> Result<(), String> {
+    let c = ctx();
+    let mut g = BATCHED.lock();
+    if g.is_none() {
+        let pool = unsafe { c.device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(c.queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None) }.map_err(|e| format!("batched uploads' pool: {e}"))?;
+        *g = Some(Batched { pool, open: None, inflight: Default::default(), spare: Vec::new() });
+    }
+    let Some(b) = g.as_mut() else { return Err("no batched uploads".into()) };
+    b.reap(BATCHED_MAX_BYTES.saturating_sub(bytes));
+    if b.open.is_none() {
+        let (cmd, fence) = match b.spare.pop() {
+            Some(x) => x,
+            None => unsafe {
+                let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(b.pool).command_buffer_count(1)).map_err(|e| format!("batched uploads' command buffer: {e}"))?[0];
+                (cmd, c.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| format!("batched uploads' fence: {e}"))?)
+            },
+        };
+        unsafe { c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok() };
+        b.open = Some((cmd, fence, Vec::new(), 0));
+        BATCHED_LIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let Some(o) = b.open.as_mut() else { return Err("no open command buffer".into()) };
+    f(o.0);
+    o.2.push(staging);
+    o.3 += bytes;
+    BATCHED_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if o.3 >= BATCHED_OPEN_BYTES {
+        b.submit_open();
+    }
+    Ok(())
+}
+
+/// Submits the shared upload command buffer to the main queue if one is
+/// open (`tune upload_batch`: ahead of every batch, `exec::submit_batch`,
+/// and of the cache's own submissions), and frees what completed ones held.
+pub fn flush_uploads() {
+    if BATCHED_LIVE.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut g = BATCHED.lock();
+    let Some(b) = g.as_mut() else { return };
+    b.submit_open();
+    b.reap(u64::MAX);
+}
+
 /// Pages of a texture are checked for CPU writes in SLICES interleaved
 /// slices, one slice per frame (a change is seen within SLICES frames).
 const SLICES: usize = 8;
@@ -1604,6 +1744,8 @@ impl Images {
     /// buffers in flight, after the copy queue's timeline reaches `wait`
     /// (semaphore, value) when given.
     fn submit_held(&mut self, s: Held, max_bytes: u64, wait: Option<(vk::Semaphore, u64)>, f: impl FnOnce(vk::CommandBuffer)) {
+        // (After the batched uploads recorded before it, `tune upload_batch`.)
+        flush_uploads();
         let max = if s.copy_cmd.is_some() || !s.dev.is_empty() { MAX_INFLIGHT_COPY } else { MAX_INFLIGHT };
         self.reap(max - 1, max_bytes.saturating_sub(s.bytes()));
         let c = ctx();
@@ -1645,7 +1787,9 @@ impl Images {
     /// `one_shot` after the copy queue's timeline reaches `wait` (semaphore,
     /// value) when given.
     fn one_shot_after(&mut self, wait: Option<(vk::Semaphore, u64)>, f: impl FnOnce(vk::CommandBuffer)) {
-        // (Its timestamps: `stamp`, `note_upload_span`.)
+        // (Its timestamps: `stamp`, `note_upload_span`. After the batched
+        // uploads recorded before it, `tune upload_batch`.)
+        flush_uploads();
         let c = ctx();
         unsafe {
             c.device.begin_command_buffer(self.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
@@ -2758,6 +2902,23 @@ impl Images {
             UPLOAD_SPLIT[2].fetch_add(t_copy.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             self.uploads += 1;
             return Ok((t.base, size));
+        }
+        // (`tune upload_batch`: into the command buffer the uploads share,
+        // not waited for; its own staging freed once that completes.)
+        if super::tune::upload_batch() {
+            match record_batched((st.buf, st.mem), total.max(4) as u64, &record) {
+                Ok(()) => {
+                    UPLOAD_SPLIT[2].fetch_add(t_copy.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    self.uploads += 1;
+                    return Ok((t.base, size));
+                }
+                Err(e) => {
+                    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        crate::warn!("images: upload not batched: {e}");
+                    }
+                }
+            }
         }
         self.one_shot(record);
         let t_free = std::time::Instant::now();
@@ -4603,7 +4764,7 @@ impl Images {
         };
         let gpu = if COPY_UPLOADS.load(Relaxed) > 0 { format!("{gpu}; CPU-detiled uploads through the copy queue {}", COPY_UPLOADS.load(Relaxed)) } else { gpu };
         format!(
-            "    images: {} cached ({} MiB; GPU-written {} ({} MiB), kept for the session; {} textures evicted, {} MiB, in {} rounds), {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; staging buffers made {}, waits for uploads in flight {}; pages checked in the mapping table {}, again with the operating system {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages, {} found clean by a probe); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}{gpu}\n",
+            "    images: {} cached ({} MiB; GPU-written {} ({} MiB), kept for the session; {} textures evicted, {} MiB, in {} rounds), {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; staging buffers made {}, waits for uploads in flight {}; batched (`tune upload_batch`) {} in {} command buffers, {} waits; pages checked in the mapping table {}, again with the operating system {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages, {} found clean by a probe); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}{gpu}\n",
             self.map.len(),
             IMAGE_BYTES.load(Relaxed) >> 20,
             self.map.values().filter(|i| i.gpu_written).count(),
@@ -4622,6 +4783,9 @@ impl Images {
             UPLOAD_SPLIT[2].load(Relaxed) / 1_000_000,
             STAGING_MADE.load(Relaxed),
             UPLOAD_WAITS.load(Relaxed),
+            BATCHED_STATS[0].load(Relaxed),
+            BATCHED_STATS[1].load(Relaxed),
+            BATCHED_STATS[2].load(Relaxed),
             UPLOAD_TABLE[0].load(Relaxed),
             UPLOAD_TABLE[1].load(Relaxed),
             p[0].load(Relaxed),
