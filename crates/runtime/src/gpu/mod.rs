@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 233] = [
+    static ALL: [Tunable; 234] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -266,6 +266,7 @@ pub mod tune {
         Tunable { name: "wb_image", env: "DS_WB_IMAGE_TUNE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "upload_batch", env: "DS_UPLOAD_BATCH", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_shared_ranges", env: "DS_FE2_SHARED_RANGES", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "upload_predetile", env: "DS_UPLOAD_PREDETILE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2546,6 +2547,13 @@ pub mod tune {
     /// 2026-10-31).
     pub fn fe2_shared_ranges() -> bool {
         get(232) != 0
+    }
+
+    /// First uploads of textures detiled on the CPU are detiled before the
+    /// image cache's lock by the thread binding them (`images::predetile`;
+    /// under the lock only their copy is recorded). Live.
+    pub fn upload_predetile() -> bool {
+        get(233) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

@@ -1177,8 +1177,22 @@ impl Drop for InFlight {
     }
 }
 
+/// The slow ones by caller: [of 1 ms or more, of 5 ms or more, their ns,
+/// the longest's ns] (stutters' takes of a few pages took 12-16 ms at
+/// Castlewall's arrival, FINDINGS.md 2026-10-31).
+pub static WW_TAIL: [[std::sync::atomic::AtomicU64; 4]; 10] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 10];
+
 fn ww_note(who: usize, pages: u64, ns: u64, clean: bool, others: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    if ns >= 1_000_000 {
+        let t = &WW_TAIL[who.min(9)];
+        t[0].fetch_add(1, Relaxed);
+        if ns >= 5_000_000 {
+            t[1].fetch_add(1, Relaxed);
+        }
+        t[2].fetch_add(ns, Relaxed);
+        t[3].fetch_max(ns, Relaxed);
+    }
     let b = (64 - pages.max(1).leading_zeros() as usize - 1).min(20);
     for s in [&WW_BY_WHO[who.min(9)], &WW_BY_SIZE[b], &WW_BY_CONC[(others as usize).min(8)]] {
         s[0].fetch_add(1, Relaxed);
@@ -1197,12 +1211,18 @@ pub fn ww_lines() -> String {
     let who: Vec<String> = WW_WHO_NAMES.iter().zip(WW_BY_WHO.iter()).filter(|(_, s)| s[0].load(Relaxed) > 0).map(|(n, s)| format!("{n} {}", f(s))).collect();
     let size: Vec<String> = WW_BY_SIZE.iter().enumerate().filter(|(_, s)| s[0].load(Relaxed) > 0).map(|(k, s)| format!("{}+ {}", 1u64 << k, f(s))).collect();
     let conc: Vec<String> = WW_BY_CONC.iter().enumerate().filter(|(_, s)| s[0].load(Relaxed) > 0).map(|(k, s)| format!("{k}{} {}", if k == 8 { "+" } else { "" }, f(s))).collect();
-    format!("    write-watch queries by caller: {}\n    by pages: {}\n    by other queries in flight when one began: {}\n", who.join(", "), size.join(", "), conc.join(", "))
+    let tail: Vec<String> = WW_WHO_NAMES
+        .iter()
+        .zip(WW_TAIL.iter())
+        .filter(|(_, t)| t[0].load(Relaxed) > 0)
+        .map(|(n, t)| format!("{n} {} (5 ms or more {}; {} ms, longest {:.1} ms)", t[0].load(Relaxed), t[1].load(Relaxed), t[2].load(Relaxed) / 1_000_000, t[3].load(Relaxed) as f64 / 1e6))
+        .collect();
+    format!("    write-watch queries by caller: {}\n    by pages: {}\n    by other queries in flight when one began: {}\n    of 1 ms or more by caller: {}\n", who.join(", "), size.join(", "), conc.join(", "), tail.join(", "))
 }
 
 pub fn ww_reset() {
     use std::sync::atomic::Ordering::Relaxed;
-    for c in WW_BY_WHO.iter().chain(WW_BY_SIZE.iter()).chain(WW_BY_CONC.iter()).flatten() {
+    for c in WW_BY_WHO.iter().chain(WW_BY_SIZE.iter()).chain(WW_BY_CONC.iter()).flatten().chain(WW_TAIL.iter().flatten()) {
         c.store(0, Relaxed);
     }
 }

@@ -75,18 +75,22 @@ pub static HOMES: LockStat = LockStat::new("homes");
 /// The logs of unfinished batches' and deferred CP writes
 /// (`exec::RangeLog`: reads by every read check, writes by every note).
 pub static WRITE_LOGS: LockStat = LockStat::new("write logs");
+/// The image cache (`images::with`: texture lookups, hazards, targets and
+/// the uploads made under it).
+pub static IMAGE_CACHE: LockStat = LockStat::new("image cache");
 
-const ALL: [&LockStat; 4] = [&COPY_CACHE, &MIRRORS, &HOMES, &WRITE_LOGS];
+const ALL: [&LockStat; 5] = [&COPY_CACHE, &MIRRORS, &HOMES, &WRITE_LOGS, &IMAGE_CACHE];
 
 /// Clears the counts (`profile reset`).
 pub fn reset_stats() {
     for s in ALL {
         s.reset();
     }
+    super::images::reset_holds();
 }
 
 /// One status line.
 pub fn status() -> String {
     let parts: Vec<String> = ALL.iter().map(|s| s.part()).collect();
-    format!("    contended global locks (waits, time waited): {}\n", parts.join(", "))
+    format!("    contended global locks (waits, time waited): {}{}\n", parts.join(", "), super::images::holds_part())
 }
