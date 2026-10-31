@@ -5775,6 +5775,10 @@ struct Slot {
     /// The SGPR data rings (RING_SEG each): system memory and video memory
     /// (allocated when `tune ring_vram` first chooses it).
     rings: [Option<(vk::Buffer, *mut u8)>; 2],
+    /// Front end 2's write-back counters copied before and after each of
+    /// the batch's write-backs (`seg_stamps`; WB_COUNTS records, made on
+    /// first use).
+    wb_counts: Option<(vk::Buffer, *mut u8)>,
     /// Read-only buffer snapshots in video memory (SNAP_SEG, allocated on
     /// first use).
     snap: Option<(vk::Buffer, *mut u8)>,
@@ -5917,6 +5921,7 @@ impl Slot {
                     vk::QueryPool::null()
                 },
                 rings: [Some((ring, ring_ptr)), None],
+                wb_counts: None,
                 snap: None,
                 shadow: vk::Buffer::null(),
                 shadow_mem: vk::DeviceMemory::null(),
@@ -6134,6 +6139,10 @@ struct SegMark {
     ops: [u64; OPS],
     /// Where the barrier was recorded.
     site: &'static std::panic::Location<'static>,
+    /// Ending a front end 2 write-back's segment: its record of the
+    /// write-back's counters before and after it (`Exec::wb_count_copy`;
+    /// the address of four u32s in its slot's `wb_counts`), else 0.
+    wb: usize,
 }
 
 /// GPU time by barrier segment (`seg_stamps`): per command key (a compute
@@ -6150,6 +6159,15 @@ static SEG_PAIRS: Mutex<Option<HashMap<SitePair, [u64; 2]>>> = Mutex::new(None);
 /// Segments with commands by queue and the barrier site that ended them:
 /// [ns, segments, commands].
 static SEG_ENDS: Mutex<Option<HashMap<(String, &'static str, u32), [u64; 3]>>> = Mutex::new(None);
+
+/// Records of front end 2 write-backs' counters a batch slot holds
+/// (`Exec::wb_count_copy`; later ones in a batch go unrecorded).
+const WB_COUNTS: u32 = 1024;
+/// Front end 2's write-backs with recorded counters (`seg_stamps`), by
+/// pages written back (0, 1-7, 8-31, 32-127, 128-511, 512-2047, more):
+/// [write-backs, ns, pages, dwords]; then the sums of a least-squares fit
+/// of ns on pages and dwords (n, p, d, t, pp, dd, pd, pt, dt).
+static WB_SIZES: Mutex<([[u64; 4]; 7], [f64; 9])> = Mutex::new(([[0; 4]; 7], [0.0; 9]));
 
 /// What a segment without commands recorded (its operation counts' change).
 fn seg_kind(a: &[u64; OPS], b: &[u64; OPS]) -> &'static str {
@@ -6179,15 +6197,15 @@ fn collect_segments(pool: vk::QueryPool, shaders: &[u64], segs: &[SegMark], ops_
     // (kept monotonic: the start stamp follows the leading barrier's).
     let start: (&'static str, u32) = ("batch start", 0);
     let end: (&'static str, u32) = ("batch end", 0);
-    let mut bounds: Vec<(u64, usize, [u64; OPS], (&'static str, u32))> = Vec::with_capacity(segs.len() + 2);
-    bounds.push((be[0], 0, [0; OPS], start));
+    let mut bounds: Vec<(u64, usize, [u64; OPS], (&'static str, u32), usize)> = Vec::with_capacity(segs.len() + 2);
+    bounds.push((be[0], 0, [0; OPS], start, 0));
     for (m, &v) in segs.iter().zip(&t) {
         let last = bounds.last().map_or(0, |b| b.0);
         let file = m.site.file().rsplit(['/', '\\']).next().unwrap_or("");
-        bounds.push((v.max(last), (m.cmds as usize).min(shaders.len()), m.ops, (file, m.site.line())));
+        bounds.push((v.max(last), (m.cmds as usize).min(shaders.len()), m.ops, (file, m.site.line()), m.wb));
     }
     let last = bounds.last().map_or(0, |b| b.0);
-    bounds.push((be[1].max(last), shaders.len(), *ops_end, end));
+    bounds.push((be[1].max(last), shaders.len(), *ops_end, end, 0));
     let mut gp = SEG_PAIRS.lock();
     let mp = gp.get_or_insert_with(HashMap::new);
     let mut g = SEG_TIME.lock();
@@ -6200,11 +6218,42 @@ fn collect_segments(pool: vk::QueryPool, shaders: &[u64], segs: &[SegMark], ops_
         let d = ((w[1].0 - w[0].0) as f64 * period) as u64;
         let (from, to) = (w[0].1, w[1].1.max(w[0].1));
         let cmds = &shaders[from..to];
+        // A write-back's counters before and after it: its pages and dwords.
+        let wb = (w[1].4 != 0).then(|| {
+            // SAFETY: four u32s of the slot's host-visible record, written
+            // by the batch's copies (completed) and kept until its reset.
+            let r: [u32; 4] = std::array::from_fn(|k| unsafe { std::ptr::read_volatile((w[1].4 as *const u32).add(k)) });
+            (r[2].wrapping_sub(r[0]) as u64, r[3].wrapping_sub(r[1]) as u64)
+        });
+        if let Some((p, dw)) = wb {
+            let bucket = match p {
+                0 => 0,
+                1..=7 => 1,
+                8..=31 => 2,
+                32..=127 => 3,
+                128..=511 => 4,
+                512..=2047 => 5,
+                _ => 6,
+            };
+            let mut g = WB_SIZES.lock();
+            let e = &mut g.0[bucket];
+            e[0] += 1;
+            e[1] += d;
+            e[2] += p;
+            e[3] += dw;
+            let (pf, df, tf) = (p as f64, dw as f64, d as f64);
+            for (k, v) in [1.0, pf, df, tf, pf * pf, df * df, pf * df, pf * tf, df * tf].into_iter().enumerate() {
+                g.1[k] += v;
+            }
+        }
         // On the timeline: the queue and the segment's programs, or what it
         // held instead of commands.
         if super::timeline::on() {
             super::timeline::gpu_segment(w[0].0, w[1].0, || {
                 if cmds.is_empty() {
+                    if let Some((p, dw)) = wb {
+                        return format!("{queue}: {} ({p} pages, {dw} dwords)", seg_kind(&w[0].2, &w[1].2));
+                    }
                     return format!("{queue}: {}", seg_kind(&w[0].2, &w[1].2));
                 }
                 let mut names: Vec<String> = Vec::new();
@@ -6267,6 +6316,42 @@ fn seg_lines() -> String {
         v.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
         let parts: Vec<String> = v.iter().map(|(k, x)| format!("{k} {} ms ({} segments, {:.1} us each)", x[0] / 1_000_000, x[1], x[0] as f64 / x[1].max(1) as f64 / 1000.0)).collect();
         s.push_str(&format!("      segments without commands: {}\n", parts.join(", ")));
+    }
+    {
+        let g = WB_SIZES.lock();
+        if g.0.iter().any(|e| e[0] > 0) {
+            const NAMES: [&str; 7] = ["0", "1-7", "8-31", "32-127", "128-511", "512-2047", "2048+"];
+            let parts: Vec<String> = g
+                .0
+                .iter()
+                .zip(NAMES)
+                .filter(|(e, _)| e[0] > 0)
+                .map(|(e, n)| {
+                    let us = e[1] as f64 / e[0] as f64 / 1000.0;
+                    let gbs = if e[1] > 0 { 4.0 * e[3] as f64 / e[1] as f64 } else { 0.0 };
+                    format!("{n} pages {} at {us:.1} us ({:.0} pages, {:.0} dwords each; {} ms; {gbs:.1} GB/s)", e[0], e[2] as f64 / e[0] as f64, e[3] as f64 / e[0] as f64, e[1] / 1_000_000)
+                })
+                .collect();
+            // ns = a + b pages + c dwords, least squares (Cramer's rule).
+            let [n, sp, sd, st, spp, sdd, spd, spt, sdt] = g.1;
+            let det3 = |m: [[f64; 3]; 3]| m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+            let a = [[n, sp, sd], [sp, spp, spd], [sd, spd, sdd]];
+            let y = [st, spt, sdt];
+            let det = det3(a);
+            let fit = if det.abs() > 1e-9 {
+                let col = |k: usize| {
+                    let mut m = a;
+                    for (r, row) in m.iter_mut().enumerate() {
+                        row[k] = y[r];
+                    }
+                    det3(m) / det
+                };
+                format!("; fit: {:.2} us + {:.1} ns a page + {:.3} ns a dword", col(0) / 1000.0, col(1), col(2))
+            } else {
+                String::new()
+            };
+            s.push_str(&format!("      front end 2's write-backs by pages written back: {}{fit}\n", parts.join(", ")));
+        }
     }
     if let Some(m) = SEG_PAIRS.lock().as_ref() {
         let mut v: Vec<(&SitePair, &[u64; 2])> = m.iter().collect();
@@ -7429,6 +7514,7 @@ pub fn reset_shader_profile() {
     *SEG_EMPTY.lock() = None;
     *SEG_PAIRS.lock() = None;
     *SEG_ENDS.lock() = None;
+    *WB_SIZES.lock() = ([[0; 4]; 7], [0.0; 9]);
     for c in &SEG_TOTAL {
         c.store(0, Ordering::Relaxed);
     }
@@ -8000,6 +8086,10 @@ pub struct Exec {
     since_draws: bool,
     /// The batch's barrier segments so far (`seg_stamps`).
     segs: Vec<SegMark>,
+    /// The record the next segment mark ends (a write-back's: `SegMark::wb`)
+    /// and the records the batch has used in its slot's `wb_counts`.
+    seg_wb: usize,
+    wb_counted: u32,
     /// The last draw, when another like it can be recorded on the state it
     /// left (`draw_repeat`, `tune draw_repeat`).
     repeat: Option<draw::Repeat>,
@@ -8749,6 +8839,8 @@ impl Exec {
                 since_gds: false,
                 since_draws: false,
                 segs: Vec::new(),
+                seg_wb: 0,
+                wb_counted: 0,
                 repeat: None,
                 cmd_uses: std::cell::Cell::new(0),
                 last_cmd_line: std::cell::Cell::new(0),
@@ -9078,6 +9170,8 @@ impl Exec {
         // left out, timing only.)
         self.ops = [0; OPS];
         self.segs.clear();
+        self.seg_wb = 0;
+        self.wb_counted = 0;
         if super::tune::skip_barriers() & 64 == 0 {
             self.barrier();
         }
@@ -10460,6 +10554,9 @@ impl Exec {
         if seg {
             self.barrier();
         }
+        // (`seg_stamps`: its counters before and after it, named by the
+        // segment's end mark.)
+        let rec = if seg { self.wb_count_copy(0) } else { 0 };
         let cmd = self.cmd();
         let written = std::mem::replace(&mut self.fe2_written, (u64::MAX, 0));
         let recorded = if let Some(pipe) = super::fe2::record_scatter(cmd, Some(written)) {
@@ -10476,10 +10573,50 @@ impl Exec {
         }
         self.ops[OP_FE2_SCATTERS] += 1;
         if seg {
+            if rec != 0 {
+                self.wb_count_copy(rec);
+            }
+            self.seg_wb = rec;
             self.barrier();
         }
         self.fe2_marked = false;
         recorded
+    }
+
+    /// `seg_stamps`: copies the write-back's page and dword counters into
+    /// a record of the slot's `wb_counts`, before the write-back (`rec` 0:
+    /// a new record, its address returned; 0 when there is none) or after it
+    /// (`rec`'s second half, made visible to the host).
+    fn wb_count_copy(&mut self, rec: usize) -> usize {
+        let Some(counters) = super::fe2::counter_buffer() else { return 0 };
+        let c = ctx();
+        let i = self.cur;
+        if self.slots[i].wb_counts.is_none() {
+            match c.host_buffer(16 * WB_COUNTS as u64, vk::BufferUsageFlags::TRANSFER_DST) {
+                Ok((b, _, p)) => self.slots[i].wb_counts = Some((b, p)),
+                Err(_) => return 0,
+            }
+        }
+        let Some((buf, ptr)) = self.slots[i].wb_counts else { return 0 };
+        let (at, out) = if rec == 0 {
+            if self.wb_counted >= WB_COUNTS {
+                return 0;
+            }
+            let k = self.wb_counted;
+            self.wb_counted += 1;
+            (16 * k as u64, ptr as usize + 16 * k as usize)
+        } else {
+            (rec as u64 - ptr as u64 + 8, rec)
+        };
+        let cmd = self.cmd();
+        unsafe {
+            c.device.cmd_copy_buffer(cmd, counters, buf, &[vk::BufferCopy { src_offset: 0, dst_offset: at, size: 8 }]);
+            if rec != 0 {
+                let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+                c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            }
+        }
+        out
     }
 
     fn mirror_place(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
@@ -13382,7 +13519,7 @@ impl Exec {
             let query = self.segs.len() as u32;
             if qp != vk::QueryPool::null() && query < STAMPS * MAX_TIMED {
                 unsafe { ctx().device.cmd_write_timestamp(self.cmd(), vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, query) };
-                self.segs.push(SegMark { query, cmds: self.batch_shaders.len() as u32, ops: self.ops, site: std::panic::Location::caller() });
+                self.segs.push(SegMark { query, cmds: self.batch_shaders.len() as u32, ops: self.ops, site: std::panic::Location::caller(), wb: std::mem::take(&mut self.seg_wb) });
             }
         }
         self.barrier_noted();

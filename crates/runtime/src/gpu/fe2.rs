@@ -3024,6 +3024,13 @@ unsafe fn record_counter_copy(s: &Scatter, cmd: vk::CommandBuffer) {
     }
 }
 
+/// The buffer the write-back kernel counts into (its pages and dwords
+/// first: `rdna::kernels::SCATTER_COUNTERS`), in video memory under `tune
+/// fe2_scatter_dev`.
+pub fn counter_buffer() -> Option<vk::Buffer> {
+    SCATTER.get().map(|s| s.dev.unwrap_or(s.host))
+}
+
 /// Whether front end 2 is on with the write-back kernel that empties the
 /// touched-page list itself (`tune fe2_scatter_reset` when it was made).
 pub fn scatter_resets() -> bool {
@@ -3585,7 +3592,7 @@ pub fn init() {
     }
     match self_test() {
         Ok(s) => {
-            if std::env::var("DS_FE2_SCATTER_BENCH").ok().as_deref() == Some("1") {
+            if std::env::var("DS_FE2_SCATTER_BENCH").ok().is_some_and(|v| !v.is_empty() && v != "0") {
                 match scatter_bench() {
                     Ok(l) => crate::info!("fe2: {l}"),
                     Err(e) => crate::warn!("fe2: write-back bench: {e}"),
@@ -3714,31 +3721,42 @@ fn self_test() -> Result<String, String> {
 /// `DS_FE2_SCATTER_BENCH=1` (diagnosis, at front end 2's start): the
 /// write-back's GPU time on synthetic inputs as the segment profile counts
 /// it (from after the barrier behind its inputs to after its last barrier;
-/// the median of BENCH_REPS): an empty list, then BENCH_PAGES private pages
-/// imported and mapped at the span's end (as the self-test's page) listed
-/// without marks and with 1, 32 consecutive, 32 spread (one in 32) and all
-/// 1024 dwords of each marked. Its pages and marks are cleared again after.
+/// the median of BENCH_REPS): an empty list, then 64 private pages (`=<n>`:
+/// n, 64-16384 in words of 32) imported and mapped at the span's end (as
+/// the self-test's page) listed without marks and with 1, 32 consecutive,
+/// 32 spread (one in 32) and all 1024 dwords of each marked; then, for the
+/// rate of stores into host memory by other means, the same pages copied
+/// from the mirror into the import and the import filled (each between the
+/// same barriers). Its pages and marks are cleared again after.
 fn scatter_bench() -> Result<String, String> {
     use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
-    const BENCH_PAGES: u64 = 64;
+    let want: u64 = std::env::var("DS_FE2_SCATTER_BENCH").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let bench_pages: u64 = if want <= 1 { 64 } else { want.clamp(64, 16384).next_multiple_of(32) };
     const BENCH_REPS: usize = 15;
+    // (`cmd_update_buffer` takes at most 64 KiB.)
+    let update = |cmd: vk::CommandBuffer, buf: vk::Buffer, at: u64, data: &[u8]| {
+        for (k, part) in data.chunks(65536).enumerate() {
+            unsafe { ctx().device.cmd_update_buffer(cmd, buf, at + 65536 * k as u64, part) };
+        }
+    };
     let c = ctx();
     let marks = super::resident::marks().ok_or("no written-bit map")?;
     let table = super::pagetable::buffer().ok_or("no page table")?;
-    let guest = MIRROR_END - BENCH_PAGES * PAGE;
+    let guest = MIRROR_END - bench_pages * PAGE;
     let p0 = (guest - MIRROR_BASE) / PAGE;
     if p0 % 32 != 0 {
         return Err("its pages do not start a word of touched bits".into());
     }
-    super::resident::back(guest, BENCH_PAGES * PAGE)?;
-    let h = unsafe { VirtualAlloc(std::ptr::null(), (BENCH_PAGES * PAGE) as usize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as u64;
+    super::resident::back(guest, bench_pages * PAGE)?;
+    let mirror = super::resident::mirror_buffer().ok_or("no mirror")?.0;
+    let h = unsafe { VirtualAlloc(std::ptr::null(), (bench_pages * PAGE) as usize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as u64;
     if h == 0 {
         return Err("VirtualAlloc".into());
     }
     let r = (|| {
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
-        let (hb, hm, hva) = c.import_host(h, BENCH_PAGES * PAGE, usage)?;
-        let entries: Vec<u8> = (0..BENCH_PAGES).flat_map(|i| (hva + i * PAGE).to_le_bytes()).collect();
+        let (hb, hm, hva) = c.import_host(h, bench_pages * PAGE, usage)?;
+        let entries: Vec<u8> = (0..bench_pages).flat_map(|i| (hva + i * PAGE).to_le_bytes()).collect();
         let n = 2 * BENCH_REPS as u32;
         let qp = match unsafe { c.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(n), None) } {
             Ok(q) => q,
@@ -3752,7 +3770,9 @@ fn scatter_bench() -> Result<String, String> {
         };
         let period = c.limits.timestamp_period as f64;
         let bits_at = 4 * (rdna::kernels::MARK_PAGE_BITS_AT as u64 + p0 / 32);
-        let names = ["an empty list", "pages without marks", "1 dword a page", "32 consecutive dwords a page", "32 dwords a page one in 32", "every dword"];
+        let names = ["an empty list", "pages without marks", "1 dword a page", "32 consecutive dwords a page", "32 dwords a page one in 32", "every dword", "copied whole", "filled", "driver memory filled"];
+        // (Host memory the driver allocated, for case 8.)
+        let (drv, drv_mem, _) = c.host_buffer(bench_pages * PAGE, vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC)?;
         let pattern = |k: usize| -> [u32; 32] {
             let mut m = [0u32; 32];
             match k {
@@ -3767,22 +3787,36 @@ fn scatter_bench() -> Result<String, String> {
         let mut lines = Vec::new();
         let res = (|| {
             for (k, name) in names.iter().enumerate() {
-                let listed = if k == 0 { 0 } else { BENCH_PAGES };
+                // (6 and 7: no write-back; the list stays empty.)
+                let listed = if k == 0 || k >= 6 { 0 } else { bench_pages };
                 let mask: Vec<u8> = pattern(k).iter().flat_map(|x| x.to_le_bytes()).collect();
-                let masks: Vec<u8> = (0..BENCH_PAGES).flat_map(|_| mask.iter().copied()).collect();
-                let touched: Vec<u8> = (0..2).flat_map(|_| (if listed > 0 { u32::MAX } else { 0u32 }).to_le_bytes()).collect();
+                let masks: Vec<u8> = (0..bench_pages).flat_map(|_| mask.iter().copied()).collect();
+                let touched: Vec<u8> = (0..bench_pages / 32).flat_map(|_| (if listed > 0 { u32::MAX } else { 0u32 }).to_le_bytes()).collect();
                 let list: Vec<u8> = [listed as u32, 1, 1, 0].into_iter().chain((0..listed).map(|i| (p0 + i) as u32)).flat_map(|x| x.to_le_bytes()).collect();
+                let bytes = bench_pages * PAGE;
                 super::resident::one_off_now(|cmd| unsafe {
                     c.device.cmd_reset_query_pool(cmd, qp, 0, n);
-                    c.device.cmd_update_buffer(cmd, table, p0 * 8, &entries);
+                    update(cmd, table, p0 * 8, &entries);
                     for r in 0..BENCH_REPS as u32 {
-                        c.device.cmd_update_buffer(cmd, marks, p0 * 128, &masks);
-                        c.device.cmd_update_buffer(cmd, marks, bits_at, &touched);
-                        c.device.cmd_update_buffer(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4, &list);
+                        update(cmd, marks, p0 * 128, &masks);
+                        update(cmd, marks, bits_at, &touched);
+                        update(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4, &list);
                         let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
                         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
                         c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, 2 * r);
-                        record_scatter(cmd, None);
+                        if k < 6 {
+                            record_scatter(cmd, None);
+                        } else {
+                            let all = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+                            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[all], &[], &[]);
+                            if k == 6 {
+                                c.device.cmd_copy_buffer(cmd, mirror, hb, &[vk::BufferCopy { src_offset: guest - MIRROR_BASE, dst_offset: 0, size: bytes }]);
+                            } else {
+                                c.device.cmd_fill_buffer(cmd, if k == 8 { drv } else { hb }, 0, bytes, 0);
+                            }
+                            let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_READ);
+                            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[after], &[], &[]);
+                        }
                         c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, 2 * r + 1);
                         // (The next round's inputs after it.)
                         let next = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
@@ -3793,17 +3827,63 @@ fn scatter_bench() -> Result<String, String> {
                 unsafe { c.device.get_query_pool_results(qp, 0, &mut t, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT) }.map_err(|e| format!("query: {e}"))?;
                 let mut us: Vec<f64> = (0..BENCH_REPS).map(|r| t[2 * r + 1].wrapping_sub(t[2 * r]) as f64 * period / 1000.0).collect();
                 us.sort_by(|a, b| a.total_cmp(b));
-                lines.push(format!("{name} {:.1} us", us[BENCH_REPS / 2]));
+                let m = us[BENCH_REPS / 2];
+                // Bytes stored into host memory: the marked dwords, or all of it.
+                let stored = match k {
+                    2 => bench_pages * 4,
+                    3 | 4 => bench_pages * 128,
+                    5..=8 => bytes,
+                    _ => 0,
+                };
+                if stored >= 1 << 20 {
+                    lines.push(format!("{name} {m:.1} us ({:.1} GB/s)", stored as f64 / (m * 1000.0)));
+                } else {
+                    lines.push(format!("{name} {m:.1} us"));
+                }
+            }
+            // The copy queue's engine storing the pages into the import:
+            // BENCH_REPS copies in one submission, timed on the CPU.
+            if let Some(q) = c.copy.as_ref() {
+                let bytes = bench_pages * PAGE;
+                unsafe {
+                    let pool = c.device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(q.family), None).map_err(|e| format!("copy pool: {e}"))?;
+                    let r = (|| {
+                        let cb = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).map_err(|e| format!("copy cmd: {e}"))?[0];
+                        c.device.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(|e| format!("begin: {e}"))?;
+                        for _ in 0..BENCH_REPS {
+                            c.device.cmd_copy_buffer(cb, mirror, hb, &[vk::BufferCopy { src_offset: guest - MIRROR_BASE, dst_offset: 0, size: bytes }]);
+                            let ww = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::HOST_READ);
+                            c.device.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[ww], &[], &[]);
+                        }
+                        c.device.end_command_buffer(cb).map_err(|e| format!("end: {e}"))?;
+                        let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| format!("fence: {e}"))?;
+                        let t0 = std::time::Instant::now();
+                        let sent = c.submit_timeline(true, &[cb], &[], &[], fence);
+                        let waited = sent.and_then(|_| c.device.wait_for_fences(&[fence], true, 10_000_000_000).map_err(|e| format!("wait: {e}")));
+                        let us = t0.elapsed().as_secs_f64() * 1e6 / BENCH_REPS as f64;
+                        c.device.destroy_fence(fence, None);
+                        waited?;
+                        lines.push(format!("copied whole on the copy queue {us:.1} us ({:.1} GB/s, CPU-timed)", bytes as f64 / (us * 1000.0)));
+                        Ok::<(), String>(())
+                    })();
+                    c.device.destroy_command_pool(pool, None);
+                    r?;
+                }
             }
             Ok::<(), String>(())
         })();
+        unsafe {
+            c.device.destroy_buffer(drv, None);
+            c.device.free_memory(drv_mem, None);
+        }
         // Its pages unmapped and their marks cleared again, whatever happened.
         let zeros_t = vec![0u8; entries.len()];
-        let zeros_m = vec![0u8; (BENCH_PAGES * 128) as usize];
+        let zeros_m = vec![0u8; (bench_pages * 128) as usize];
+        let zeros_b = vec![0u8; (bench_pages / 32 * 4) as usize];
         let cleared = super::resident::one_off_now(|cmd| unsafe {
-            c.device.cmd_update_buffer(cmd, table, p0 * 8, &zeros_t);
-            c.device.cmd_update_buffer(cmd, marks, p0 * 128, &zeros_m);
-            c.device.cmd_update_buffer(cmd, marks, bits_at, &[0u8; 8]);
+            update(cmd, table, p0 * 8, &zeros_t);
+            update(cmd, marks, p0 * 128, &zeros_m);
+            update(cmd, marks, bits_at, &zeros_b);
             c.device.cmd_update_buffer(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4, &[0u8; 4]);
         });
         unsafe {
@@ -3813,7 +3893,7 @@ fn scatter_bench() -> Result<String, String> {
         }
         res?;
         cleared?;
-        Ok(format!("write-back bench ({BENCH_PAGES} pages, median of {BENCH_REPS}, `tune fe2_scatter_reset` {}, `fe2_scatter_dev` {}): {}", super::tune::fe2_scatter_reset() as u8, super::tune::fe2_scatter_dev() as u8, lines.join(", ")))
+        Ok(format!("write-back bench ({bench_pages} pages, median of {BENCH_REPS}, `tune fe2_scatter_reset` {}, `fe2_scatter_dev` {}): {}", super::tune::fe2_scatter_reset() as u8, super::tune::fe2_scatter_dev() as u8, lines.join(", ")))
     })();
     unsafe { VirtualFree(h as _, 0, MEM_RELEASE) };
     r
