@@ -267,7 +267,7 @@ pub mod tune {
         Tunable { name: "upload_batch", env: "DS_UPLOAD_BATCH", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_shared_ranges", env: "DS_FE2_SHARED_RANGES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "upload_predetile", env: "DS_UPLOAD_PREDETILE", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "record_defer", env: "DS_RECORD_DEFER", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "record_defer", env: "DS_RECORD_DEFER", default: 5, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2559,9 +2559,11 @@ pub mod tune {
 
     /// Batches recorded into lists that the submission thread replays into
     /// their command buffers just before submitting them (`vk::defer`): 1
-    /// the graphics command processor's, 2 the compute ones'. Read at each
-    /// batch's begin. Default 1 since 2026-10-31 (the graphics CP's CPU
-    /// -5.6% at the vista, its critical path -3.8%; 2 lost 1.2% in replays:
+    /// the graphics command processor's, 2 the compute ones', 4 the graphics
+    /// queue's parallel workers', 8 the compute queues' workers'. Read at
+    /// each batch's begin. Default 5 since 2026-10-31 (1: the graphics CP's
+    /// CPU -5.6% at the vista, its critical path -3.8%; 4: the workers' CPU
+    /// -6.6%, +1% at the vista, Castlewall +2%; 2 lost 1.2% in replays:
     /// FINDINGS.md).
     pub fn record_defer() -> u64 {
         get(234)

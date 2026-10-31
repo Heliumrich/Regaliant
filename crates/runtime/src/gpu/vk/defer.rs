@@ -181,7 +181,7 @@ static INSTALLED: AtomicBool = AtomicBool::new(false);
 /// `DS_RECORD_CHECK=1`: claims of every thread (`ANY`) checked against
 /// the commands sent to the driver.
 static CHECK: AtomicBool = AtomicBool::new(false);
-static ANY: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+static ANY: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
 
 static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 /// Batches replayed, their commands, arena words, replay ns, most commands
@@ -321,9 +321,10 @@ pub fn install(device: ash::Device) -> ash::Device {
 }
 
 /// Whether an executor's batch beginning now is recorded into lists (`tune
-/// record_defer`: 1 the graphics command processor's, 2 the compute ones').
-pub fn wanted(compute: bool) -> bool {
-    let bit = if compute { 2 } else { 1 };
+/// record_defer`): `bit` its class's (1 the graphics command processor, 2
+/// the compute ones, 4 the graphics queue's parallel workers, 8 the compute
+/// queues').
+pub fn wanted(bit: u64) -> bool {
     INSTALLED.load(Ordering::Relaxed) && crate::gpu::tune::record_defer() & bit != 0
 }
 

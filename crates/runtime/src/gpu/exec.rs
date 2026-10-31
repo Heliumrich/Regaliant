@@ -8487,6 +8487,9 @@ struct Closed {
     /// (`Exec::fe2_spans`).
     fe2_up: Vec<(u64, u64)>,
     fe2_spans: Vec<(u64, vk::Buffer)>,
+    /// Its commands as lists (`vk::defer`, a worker's batch with `tune
+    /// record_defer` 4 or 8): replayed when it is submitted.
+    lists: Option<super::vk::defer::Lists>,
 }
 
 /// A seal of the graphics CP's held work past a run (`Exec::past_seal`):
@@ -9003,7 +9006,15 @@ impl Exec {
         self.extra_used = 0;
         // Deferred recording: this thread's commands for the batch's command
         // buffers (from their begin on) go to lists until the batch closes.
-        self.batch_lists = !self.deferred && super::vk::defer::wanted(self.compute_cp);
+        // (Parallel workers' batches too; never held ones: the frame-ahead
+        // recorder's, the graphics CP's past a run or a label wait.)
+        let class = match (self.deferred, self.compute_cp) {
+            (false, false) => 1,
+            (false, true) => 2,
+            (true, false) => 4,
+            (true, true) => 8,
+        };
+        self.batch_lists = !self.held && super::vk::defer::wanted(class);
         if self.batch_lists {
             super::vk::defer::claim([self.slots[self.cur].cmd, self.slots[self.cur].pre]);
         }
@@ -9285,7 +9296,8 @@ impl Exec {
             };
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
             self.keep_submitted(0);
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), rgm_claims: std::mem::take(&mut self.rgm_claims), rgm_written: std::mem::take(&mut self.rgm_written), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new() });
+            let lists = std::mem::take(&mut self.batch_lists).then(super::vk::defer::release);
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), rgm_claims: std::mem::take(&mut self.rgm_claims), rgm_written: std::mem::take(&mut self.rgm_written), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists });
             self.res_mine.clear();
             if let Some(b) = self.closed.last_mut() {
                 b.fe2_up = std::mem::take(&mut self.fe2_up);
@@ -13932,9 +13944,14 @@ impl Exec {
                 super::fe2::generations(&b.fe2_up, &mut gens);
                 self.fe2_gens = gens;
             }
+            let lists = b.lists;
             let seq = push_batch(fence, queries, bq, b.eager_action.into_iter().collect(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, reset, false, move |_| {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
                     return None;
+                }
+                // Deferred recording: the driver records the batch now.
+                if let Some(l) = lists {
+                    l.replay();
                 }
                 Some(SubmitSpec { xpre: None, pre, cmd, wait: copy_wait, fence, alt: false, name })
             });
