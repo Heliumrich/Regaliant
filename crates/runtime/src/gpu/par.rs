@@ -158,6 +158,10 @@ pub struct Run {
     /// Front end 2: the command processor's view when it planned the run
     /// (`fe2::gfx_views`; NO_VIEW: the epoch now).
     pub fe2_view: u32,
+    /// Front end 2: the run's id for uploads its parts share (`Exec::
+    /// fe2_share`): the main command processor's own part before the
+    /// workers' chunks is part 0, chunk i part i + 1.
+    pub id: u64,
     /// Chunks recorded before their turn (`tune par_park`), by index.
     parked: Mutex<Vec<Option<Parked>>>,
     /// Planned where the graphics CP went past a label wait (`tune
@@ -305,6 +309,9 @@ pub fn long_reset() {
     LONG_STOPS.lock().clear();
 }
 
+/// Run ids (`Run::id`; 0: none).
+static RUN_IDS: AtomicU64 = AtomicU64::new(1);
+
 impl Run {
     /// The run of `chunks` ([start state, first packet, end]).
     pub fn new(chunks: Vec<(Box<ChunkState>, u64, u64)>, main_writes: Arc<super::ranges::Ranges>, main_submitted: Arc<AtomicBool>) -> Run {
@@ -326,6 +333,7 @@ impl Run {
             long: None,
             chained: Mutex::new(None),
             fe2_view: super::fe2::NO_VIEW,
+            id: RUN_IDS.fetch_add(1, Ordering::Relaxed),
             parked: Mutex::new((0..n).map(|_| None).collect()),
             stretch: false,
             stretch_check: Mutex::new(None),
@@ -838,6 +846,7 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         let mut cp = rec.cp.lock();
         cp.set_chunk_state(&state);
         cp.fe2_set_view(run.fe2_view);
+        cp.fe2_set_run(run.id, i + 1);
         cp.stretch_set(run.stretch);
         cp.chunk_start(&run.main_writes, &run.main_submitted);
         cp.chunk_costs = run.timed.then(|| Vec::with_capacity(512));
@@ -850,6 +859,7 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         let stopped = r.unwrap_or(Some(from));
         lap(2, &mut t);
         cp.chunk_finish();
+        cp.fe2_set_run(0, 0);
         if long.is_some() {
             // (Its held view of the forwarded copies goes with the recorder.)
             cp.long_park();

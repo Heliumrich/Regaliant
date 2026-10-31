@@ -550,6 +550,7 @@ pub fn note_place_parts(map: u64, begin: u64, batch: u64, after: u64) {
 
 /// Clears the checks by caller (`profile reset`).
 pub fn reset_callers() {
+    reset_up_census();
     for c in BY_CALLER.iter().flatten().chain(BY_CALLER_FIRST.iter().flatten()).chain(QUIET_TAKES.iter().flatten()).chain(BY_SOURCE.iter().flatten()).chain(SHARED_HITS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
@@ -562,6 +563,313 @@ pub fn reset_callers() {
 pub fn quiet_census_on() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *W.get_or_init(|| std::env::var("DS_FE2_QUIET_CENSUS").ok().as_deref() == Some("1"))
+}
+
+/// `DS_FE2_UPCENSUS=1` (diagnosis): every page uploaded into the mirror
+/// with the flip and its generation (`Chunk::pgen`: CPU writes takes found,
+/// invalidations) at its last upload, so an upload of a page unchanged since
+/// an upload of it in the same flip shows: a copy of what another batch's
+/// prologue holds already (pages become valid only when their batch is
+/// queued, and a parallel run's chunks check the same ranges together), by
+/// caller and by the path that uploaded it (`UP_KINDS`). Pages written lately
+/// are uploaded without a take, so their generation misses writes since the
+/// last take: theirs may be new contents.
+pub fn up_census_on() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_FE2_UPCENSUS").ok().as_deref() == Some("1"))
+}
+
+/// The paths that upload pages into the mirror (`up_census_on`).
+const UP_KINDS: [&str; 5] = ["other", "written lately", "a take of the epoch looked at", "after another's take", "after a take"];
+
+thread_local! {
+    /// The path uploading now (`UP_KINDS`).
+    static UP_KIND: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Sets this thread's upload path until dropped (`up_census_on`).
+struct UpKind(usize);
+
+impl UpKind {
+    #[inline]
+    fn new(k: usize) -> UpKind {
+        if !up_census_on() {
+            return UpKind(usize::MAX);
+        }
+        UpKind(UP_KIND.with(|c| c.replace(k)))
+    }
+}
+
+impl Drop for UpKind {
+    #[inline]
+    fn drop(&mut self) {
+        if self.0 != usize::MAX {
+            UP_KIND.with(|c| c.set(self.0));
+        }
+    }
+}
+
+/// Per page of the span: (flip + 1) << 32 | its generation at its last
+/// upload; 0: never uploaded.
+static UP_LAST: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
+/// By caller and path: [pages uploaded, of them unchanged since an upload
+/// in the same flip, unchanged since their last upload in an earlier flip].
+static UP_COUNTS: [[[AtomicU64; 3]; 5]; 4] = [const { [const { [const { AtomicU64::new(0) }; 3] }; 5] }; 4];
+/// The flip being counted and the flips with the most pages uploaded again
+/// (`up_census_on`).
+struct UpFlips {
+    flip: u64,
+    pages: u64,
+    again: u64,
+    /// This flip's pages uploaded again by caller and path.
+    by: [[u64; 5]; 4],
+    /// (again, pages, flip, its largest callers and paths), most first.
+    worst: Vec<(u64, u64, u64, String)>,
+    flips: u64,
+}
+
+static UP_FLIPS: Mutex<UpFlips> = Mutex::new(UpFlips { flip: 0, pages: 0, again: 0, by: [[0; 5]; 4], worst: Vec::new(), flips: 0 });
+
+/// Pages [a, b) are uploaded into the mirror by this thread's batch
+/// (`up_census_on`).
+pub fn upload_census(a: u64, b: u64) {
+    if !up_census_on() {
+        return;
+    }
+    // (Zeroed pages: only those of pages uploaded become resident.)
+    let last = UP_LAST.get_or_init(|| unsafe { Box::<[AtomicU64]>::new_zeroed_slice(((MIRROR_END - MIRROR_BASE) / PAGE) as usize).assume_init() });
+    let flip = super::FRAMES.load(Ordering::Relaxed) + 1;
+    let (mut n, mut again, mut later) = (0u64, 0u64, 0u64);
+    let mut p = (a & !(PAGE - 1)).max(MIRROR_BASE);
+    let hi = b.min(MIRROR_END);
+    while p < hi {
+        let pg = chunk(p, false).map_or(0, |c| c.pgen[idx(p)].load(Ordering::Acquire));
+        let old = last[((p - MIRROR_BASE) / PAGE) as usize].swap(flip << 32 | pg as u64, Ordering::AcqRel);
+        n += 1;
+        if old != 0 && old as u32 == pg {
+            if old >> 32 == flip {
+                again += 1;
+            } else {
+                later += 1;
+            }
+        }
+        p += PAGE;
+    }
+    let (caller, kind) = (CALLER.with(|c| c.get()), UP_KIND.with(|c| c.get()));
+    let c = &UP_COUNTS[caller][kind];
+    c[0].fetch_add(n, Ordering::Relaxed);
+    c[1].fetch_add(again, Ordering::Relaxed);
+    c[2].fetch_add(later, Ordering::Relaxed);
+    let mut g = UP_FLIPS.lock();
+    if g.flip != flip {
+        if g.flip != 0 {
+            // (Its three largest callers and paths of pages uploaded again.)
+            let mut by: Vec<(u64, usize, usize)> = (0..4).flat_map(|i| (0..5).map(move |k| (i, k))).map(|(i, k)| (g.by[i][k], i, k)).filter(|x| x.0 != 0).collect();
+            by.sort_unstable_by(|x, y| y.cmp(x));
+            let top: Vec<String> = by.iter().take(3).map(|&(v, i, k)| format!("{} {} {}", CALLER_NAMES[i], UP_KINDS[k], v)).collect();
+            let row = (g.again, g.pages, g.flip, top.join(", "));
+            g.worst.push(row);
+            g.worst.sort_unstable_by(|x, y| (y.0, y.1, y.2).cmp(&(x.0, x.1, x.2)));
+            g.worst.truncate(8);
+            g.flips += 1;
+        }
+        (g.flip, g.pages, g.again, g.by) = (flip, 0, 0, [[0; 5]; 4]);
+    }
+    g.pages += n;
+    g.again += again;
+    g.by[caller][kind] += again;
+}
+
+/// Run-shared uploads (`Exec::fe2_share`): per page of the span, the
+/// parallel run and part whose batch claimed it for its copy and the page's
+/// generation then (`Chunk::pgen`, low 16 bits): run << 24 | part << 16 |
+/// generation; 0: none. Of a run, the earliest part's claim is kept.
+static RUN_UP: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
+/// Per 64-page word of the span, the run that last claimed a page there
+/// (`run_claim`): a lookup for another run needs no page entry (every page a
+/// check needs is looked up, and at an arrival the page entries' loads cost
+/// the workers ~6% more CPU a flip; 2026-10-31). Runs of other queues
+/// claiming in the same word take it from each other: their lookups then
+/// miss, and those pages are copied again, as without sharing.
+static RUN_WORD: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
+/// Runs that claimed a page, by their low bits (`run_any`): a check by a
+/// part of a run without claims passes its pages by whole runs as a batch
+/// without uploads does (`ensure`'s `mine_any`).
+static RUN_ANY: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+/// [page lookups that found a page claimed by an earlier part or batch of
+/// the run, pages claimed, pages left to an earlier part's claim].
+static RUN_SHARED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Parts past this share nothing (the entry's field is 8 bits).
+pub const RUN_CHUNKS: u32 = 254;
+
+fn run_up() -> &'static [AtomicU64] {
+    // (Zeroed pages: only those of pages a run uploads become resident.)
+    RUN_UP.get_or_init(|| unsafe { Box::<[AtomicU64]>::new_zeroed_slice(((MIRROR_END - MIRROR_BASE) / PAGE) as usize).assume_init() })
+}
+
+fn run_word() -> &'static [AtomicU64] {
+    RUN_WORD.get_or_init(|| unsafe { Box::<[AtomicU64]>::new_zeroed_slice(((MIRROR_END - MIRROR_BASE) / PAGE / 64) as usize).assume_init() })
+}
+
+#[inline]
+fn page_gen16(p: u64) -> u64 {
+    chunk(p, false).map_or(0, |c| c.pgen[idx(p)].load(Ordering::Acquire) as u64 & 0xffff)
+}
+
+/// Claims pages [a, b) (page-aligned) for the batch of part `chunk` of
+/// parallel run `run` (`Exec::fe2_share`; `chunk` at most RUN_CHUNKS;
+/// part 0 the main command processor's own, before the workers' chunks): a
+/// page an earlier part or batch of the run claimed, unchanged since, is
+/// left to that claim; the others are claimed and pushed onto `out` as runs,
+/// for copies into this batch's prologue. One atomic step per page: the
+/// workers that followed one take wake together, and looked up before any of
+/// them had claimed, each would copy every page. Pages outside the span are
+/// pushed as they are.
+pub fn run_claim(a: u64, b: u64, run: u64, chunk: u32, out: &mut Vec<(u64, u64)>) {
+    let mut push = |x: u64, y: u64| match out.last_mut() {
+        Some(l) if l.1 == x => l.1 = y,
+        _ => out.push((x, y)),
+    };
+    if a < MIRROR_BASE || b > MIRROR_END {
+        push(a, b);
+        return;
+    }
+    let t = run_up();
+    let words = run_word();
+    let r = run & 0xff_ffff_ffff;
+    let any = &RUN_ANY[(r & 255) as usize];
+    if any.load(Ordering::Relaxed) != r {
+        any.store(r, Ordering::Release);
+    }
+    let (mut claimed, mut left) = (0u64, 0u64);
+    let mut p = a;
+    while p < b {
+        // (The word's tag before the page's claim: a lookup that sees the
+        // claim sees the tag.)
+        let w = &words[((p - MIRROR_BASE) / PAGE / 64) as usize];
+        if w.load(Ordering::Relaxed) != r {
+            w.store(r, Ordering::Release);
+        }
+        let g = page_gen16(p);
+        let new = r << 24 | (chunk as u64) << 16 | g;
+        let e = &t[((p - MIRROR_BASE) / PAGE) as usize];
+        let won = e
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                let earlier = old >> 24 == r && (old >> 16 & 0xff) as u32 <= chunk && old & 0xffff == g;
+                (!earlier).then_some(new)
+            })
+            .is_ok();
+        if won {
+            claimed += 1;
+            push(p, p + PAGE);
+        } else {
+            left += 1;
+        }
+        p += PAGE;
+    }
+    RUN_SHARED[1].fetch_add(claimed, Ordering::Relaxed);
+    RUN_SHARED[2].fetch_add(left, Ordering::Relaxed);
+}
+
+/// Whether a part of parallel run `run` claimed a page (`run_claim`; false
+/// as well once a run 256 ids later claimed one).
+#[inline]
+pub fn run_any(run: u64) -> bool {
+    RUN_ANY[(run & 255) as usize].load(Ordering::Acquire) == run & 0xff_ffff_ffff
+}
+
+/// Whether page `p` is claimed by a batch of part `chunk` or an earlier part
+/// of parallel run `run`, unchanged since (`run_claim`):
+/// that batch is queued before the asking one, its copies landing first.
+#[inline]
+pub fn run_shared(p: u64, run: u64, chunk: u32) -> bool {
+    let (Some(t), Some(words)) = (RUN_UP.get(), RUN_WORD.get()) else { return false };
+    if !(MIRROR_BASE..MIRROR_END).contains(&p) {
+        return false;
+    }
+    let i = ((p - MIRROR_BASE) / PAGE) as usize;
+    if words[i / 64].load(Ordering::Acquire) != run & 0xff_ffff_ffff {
+        return false;
+    }
+    let v = t[i].load(Ordering::Acquire);
+    let hit = v >> 24 == run & 0xff_ffff_ffff && (v >> 16 & 0xff) as u32 <= chunk && v & 0xffff == page_gen16(p);
+    if hit {
+        // (Counted per thread: every worker adding to one word made the
+        // lookups slow.)
+        RUN_HITS.with(|c| {
+            let n = c.get() + 1;
+            if n >= 4096 {
+                RUN_SHARED[0].fetch_add(n, Ordering::Relaxed);
+                c.set(0);
+            } else {
+                c.set(n);
+            }
+        });
+    }
+    hit
+}
+
+thread_local! {
+    /// This thread's lookups served not yet added to RUN_SHARED.
+    static RUN_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Status part: run-shared uploads (`Exec::fe2_share`).
+fn run_share_line() -> String {
+    let [hits, claimed, left] = [0, 1, 2].map(|k| RUN_SHARED[k].load(Ordering::Relaxed));
+    if hits == 0 && claimed == 0 {
+        return String::new();
+    }
+    format!("    front end 2's run-shared uploads (`Exec::fe2_share`): {claimed} pages claimed by parallel runs' parts for their copies, {left} left to an earlier part's claim at the copy; {hits} page lookups found a page claimed by an earlier part or batch of the run\n")
+}
+
+/// Clears the upload census's counts (`profile reset`; the pages' last
+/// uploads stay).
+fn reset_up_census() {
+    for c in UP_COUNTS.iter().flatten().flatten() {
+        c.store(0, Ordering::Relaxed);
+    }
+    *UP_FLIPS.lock() = UpFlips { flip: 0, pages: 0, again: 0, by: [[0; 5]; 4], worst: Vec::new(), flips: 0 };
+}
+
+/// The upload census (`DS_FE2_UPCENSUS=1`; "" otherwise).
+fn up_census_line() -> String {
+    if !up_census_on() {
+        return String::new();
+    }
+    let mib = |pages: u64| pages as f64 * PAGE as f64 / (1u64 << 20) as f64;
+    let mut parts = Vec::new();
+    let mut all = [0u64; 3];
+    for (name, rows) in CALLER_NAMES.iter().zip(UP_COUNTS.iter()) {
+        let mut kinds = Vec::new();
+        for (kind, c) in UP_KINDS.iter().zip(rows.iter()) {
+            let v: Vec<u64> = c.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+            if v[0] == 0 {
+                continue;
+            }
+            for k in 0..3 {
+                all[k] += v[k];
+            }
+            kinds.push(format!("{kind} {} pages ({:.0} MiB; unchanged since an upload in the flip {}, since one before it {})", v[0], mib(v[0]), v[1], v[2]));
+        }
+        if !kinds.is_empty() {
+            parts.push(format!("{name}: {}", kinds.join(", ")));
+        }
+    }
+    let g = UP_FLIPS.lock();
+    let flips = g.flips.max(1);
+    let worst: Vec<String> = g.worst.iter().map(|(again, pages, flip, top)| format!("flip {} {} of {} pages ({:.0} of {:.0} MiB; {top})", flip - 1, again, pages, mib(*again), mib(*pages))).collect();
+    format!(
+        "    front end 2's uploads into the mirror (`DS_FE2_UPCENSUS`): {} pages ({:.1} MiB a flip over {} flips), {} unchanged since an upload in the same flip ({:.1} MiB a flip), {} since one in an earlier flip; by caller and path: {}; most uploaded again in a flip: {}\n",
+        all[0],
+        mib(all[0]) / flips as f64,
+        flips,
+        all[1],
+        mib(all[1]) / flips as f64,
+        all[2],
+        parts.join("; "),
+        worst.join(", ")
+    )
 }
 
 /// Flips without a CPU write found (`Chunk::wrote`; a page's first sight
@@ -1347,6 +1655,7 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
             }
             if hot_run(a, b, frame) {
                 STATS[S_HOT_RUNS].fetch_add(1, Ordering::Relaxed);
+                let _k = UpKind::new(1);
                 let tu = tsc();
                 let mut x = a;
                 while x < b {
@@ -1374,6 +1683,7 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
             // Pages M lacks that a take of this epoch looked at already:
             // uploaded without another take (`tune fe2_taken_upload`).
             if super::tune::fe2_taken_upload() && !PRECHECK.with(|p| p.get()) && taken_lacking(a, b, want) {
+                let _k = UpKind::new(2);
                 let tu = tsc();
                 let mut x = a;
                 while x < b {
@@ -1408,7 +1718,10 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
             // least ours, instead of one of our own (`follow_take`).
             let tf = tsc();
             if follow_take(a, b, want) {
-                let r = followed(a, b, want, mine, upload);
+                let r = {
+                    let _k = UpKind::new(3);
+                    followed(a, b, want, mine, upload)
+                };
                 caller_since(C_FOLLOW, tf);
                 match r {
                     Ok(true) => continue,
@@ -1676,7 +1989,10 @@ fn take_all() -> bool {
 /// Uploads the pages of [a, b) M lacks (not `mine`) and marks its valid
 /// pages clean in epoch `ep` (after its take).
 fn fix_run(a: u64, b: u64, ep: u32, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool) -> Result<(), &'static str> {
-    let (_, failed) = upload_lacking(a, b, mine, upload);
+    let (_, failed) = {
+        let _k = UpKind::new(4);
+        upload_lacking(a, b, mine, upload)
+    };
     // Valid pages are clean in this epoch (uploaded ones become valid when
     // the caller's batch is queued: `uploaded`).
     let tc = std::time::Instant::now();
@@ -4161,6 +4477,7 @@ pub fn status() -> String {
             .collect::<Vec<_>>()
             .join(", "),
     ) + &census_line()
+        + &run_share_line()
         + &callers_line()
         + &census
         + &compacts
@@ -4238,7 +4555,7 @@ fn census_line() -> String {
 
 /// The placement checks by caller (`DS_FE2_CALLERS=1`; "" otherwise).
 pub fn callers_line() -> String {
-    let mut quiet = String::new();
+    let mut quiet = up_census_line();
     if quiet_census_on() {
         let parts: Vec<String> = CALLER_NAMES
             .iter()
@@ -4248,7 +4565,7 @@ pub fn callers_line() -> String {
                 format!("{n} {} of {} ({:.1} of {:.1} ms)", v[2], v[0], v[3] as f64 / 1e6, v[1] as f64 / 1e6)
             })
             .collect();
-        quiet = format!("    front end 2's takes of ranges all GPU-written with no CPU write found for {QUIET_FLIPS} flips (what view-backed mappings would spare), by caller: {}\n", parts.join("; "));
+        quiet += &format!("    front end 2's takes of ranges all GPU-written with no CPU write found for {QUIET_FLIPS} flips (what view-backed mappings would spare), by caller: {}\n", parts.join("; "));
     }
     if !callers_on() {
         return quiet;

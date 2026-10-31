@@ -7866,6 +7866,11 @@ pub struct Exec {
     /// work recorded since the last write-back marks dwords, and the word
     /// generations taken when the batch is queued (scratch).
     fe2_up: Vec<(u64, u64)>,
+    /// Front end 2: the parallel run and part this executor records (`par::
+    /// Run::id`, 0: none; part 0 the main command processor's own, parts
+    /// past `fe2::RUN_CHUNKS` share nothing): its pages an earlier part or
+    /// batch of the run uploads need no upload (`fe2_share`).
+    pub(super) fe2_run: (u64, u32),
     /// The imports (start, buffer) its uploads read (`Span::first_use`).
     fe2_spans: Vec<(u64, vk::Buffer)>,
     fe2_mine: super::fx::Set<u64>,
@@ -7873,6 +7878,8 @@ pub struct Exec {
     /// made off the recording threads (`mirror_copy_now`): its pages for the
     /// batch's work (`fe2_mine`), not the mirror's after it.
     fe2_copied: Vec<(u64, u64)>,
+    /// Scratch: the runs of an upload this batch claimed (`fe2::run_claim`).
+    fe2_claimed: Vec<(u64, u64)>,
     fe2_marked: bool,
     /// The guest range its written bindings span since its last write-back
     /// (`fe2::record_scatter`, `tune touch_bits`): start, end (start above
@@ -8811,9 +8818,11 @@ impl Exec {
                 res_need: Vec::new(),
                 stage_used: 0,
                 fe2_up: Vec::new(),
+                fe2_run: (0, 0),
                 fe2_spans: Vec::new(),
                 fe2_mine: Default::default(),
                 fe2_copied: Vec::new(),
+                fe2_claimed: Vec::new(),
                 fe2_marked: false,
                 fe2_written: (u64::MAX, 0),
                 fe2_host_later: Vec::new(),
@@ -10202,7 +10211,7 @@ impl Exec {
     /// reads 0). None: nothing of it is mapped, or no video memory.
     fn fe2_place(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
         if !super::fe2::callers_on() {
-            if super::fe2census::on() || super::fe2::quiet_census_on() {
+            if super::fe2census::on() || super::fe2::quiet_census_on() || super::fe2::up_census_on() {
                 super::fe2::set_caller(&self.name);
             }
             return self.fe2_place_inner(base, size, written);
@@ -10284,8 +10293,12 @@ impl Exec {
         // (`tune fe2_defer_gfx`: the graphics queue's alone, not the compute
         // queues' many small batches with their label writes.)
         let defer = super::fe2::defer_checks() || (super::tune::fe2_defer_gfx() && self.name.starts_with("gpu-gfx"));
-        let mine_any = !mine.is_empty() || !pend.is_empty();
-        let r = super::fe2::ensure(lo, hi, want, ep, written, &|p| (!mine.is_empty() && mine.contains(&p)) || (!pend.is_empty() && pend.contains(&p)), mine_any, &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable, defer.then_some(&mut deferred));
+        // (Pages an earlier part or batch of this executor's parallel run
+        // claimed for their copies, `fe2_share`; none to look up while the
+        // run has no claims.)
+        let run = Some(self.fe2_share()).filter(|r| r.0 != 0 && super::fe2::run_any(r.0)).unwrap_or((0, 0));
+        let mine_any = !mine.is_empty() || !pend.is_empty() || run.0 != 0;
+        let r = super::fe2::ensure(lo, hi, want, ep, written, &|p| (!mine.is_empty() && mine.contains(&p)) || (!pend.is_empty() && pend.contains(&p)) || (run.0 != 0 && super::fe2::run_shared(p, run.0, run.1)), mine_any, &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable, defer.then_some(&mut deferred));
         // Past a label wait the CPU may write the pages it rewrites every
         // frame again before the label (FINDINGS.md 2026-10-29): a small
         // binding's such pages are uploaded as they are when the stretch
@@ -10526,11 +10539,33 @@ impl Exec {
         Ok(())
     }
 
+    /// The parallel run and part whose uploads this executor's placements
+    /// share (run 0: none). A part of a parallel run (the main command
+    /// processor's own before the workers' chunks, then each chunk) needs no
+    /// upload of a page an earlier part (or an earlier batch of its own)
+    /// claimed for its copy with the page unchanged since (`fe2::run_claim`,
+    /// `fe2::run_shared`): the run's batches are queued in that order on one
+    /// Vulkan queue, each prologue's copies ending in a barrier, so the
+    /// earlier copy lands before the later part's commands run. Pages are
+    /// valid only once their batch is queued, and a run's parts check the
+    /// same ranges together: at Castlewall's arrival 54% of the pages
+    /// uploaded (20 MiB a flip, up to 1.5 GiB in a flip) were copies again
+    /// (FINDINGS.md 2026-10-31 late night).
+    fn fe2_share(&self) -> (u64, u32) {
+        // (A batch for the second queue is not in the first one's order.)
+        if self.fe2_run.0 != 0 && self.fe2_run.1 <= super::fe2::RUN_CHUNKS && !self.batch_alt {
+            self.fe2_run
+        } else {
+            (0, 0)
+        }
+    }
+
     /// Records the copy of guest [a, b) into the mirror at its offset, in
     /// the batch's prologue: from the import windows over it (those runs
     /// appended to `up`: current once the batch is queued), else, for
     /// memory the driver cannot import, from the CPU's copy now (current
-    /// for this batch only: CPU writes after it are not in it).
+    /// for this batch only: CPU writes after it are not in it; nor shared with
+    /// the run's later parts, `fe2_share`).
     fn fe2_upload(&mut self, mbuf: vk::Buffer, a: u64, b: u64, up: &mut Vec<(u64, u64)>) -> bool {
         use super::resident::{MIRROR_BASE, PAGE};
         // (Only into a batch being recorded: `fe2_place` begins one.)
@@ -10538,6 +10573,7 @@ impl Exec {
             return false;
         }
         let _ = self.open_pre();
+        let run = self.fe2_share();
         let mut x = a;
         while x < b {
             let e = ((x & !(WINDOW - 1)) + WINDOW).min(b);
@@ -10568,15 +10604,29 @@ impl Exec {
                     if !self.fe2_spans.iter().any(|&(s, b)| s == start && b == buf) {
                         self.fe2_spans.push((start, buf));
                     }
-                    self.pre_copies.push((buf, mbuf, vk::BufferCopy { src_offset: x - start, dst_offset: x - MIRROR_BASE, size: e - x }));
-                    super::fe2::lazy2_upload(x, e);
-                    if super::fe2::image_upkeep() {
-                        super::fe2::image_refreshes(x, e, &mut self.pre_after);
+                    // (Pages an earlier part or batch of this executor's
+                    // parallel run claimed, unchanged since, are left to its
+                    // copy; the others are claimed for this one: `fe2_share`.)
+                    let mut runs = std::mem::take(&mut self.fe2_claimed);
+                    runs.clear();
+                    if run.0 != 0 {
+                        super::fe2::run_claim(x, e, run.0, run.1, &mut runs);
+                    } else {
+                        runs.push((x, e));
                     }
-                    match up.last_mut() {
-                        Some(l) if l.1 == x => l.1 = e,
-                        _ => up.push((x, e)),
+                    for &(cx, ce) in &runs {
+                        self.pre_copies.push((buf, mbuf, vk::BufferCopy { src_offset: cx - start, dst_offset: cx - MIRROR_BASE, size: ce - cx }));
+                        super::fe2::upload_census(cx, ce);
+                        super::fe2::lazy2_upload(cx, ce);
+                        if super::fe2::image_upkeep() {
+                            super::fe2::image_refreshes(cx, ce, &mut self.pre_after);
+                        }
+                        match up.last_mut() {
+                            Some(l) if l.1 == cx => l.1 = ce,
+                            _ => up.push((cx, ce)),
+                        }
                     }
+                    self.fe2_claimed = runs;
                     x = e;
                 }
                 None => {
@@ -10586,6 +10636,7 @@ impl Exec {
                         return false;
                     }
                     super::fe2::note_memcpy(1);
+                    super::fe2::upload_census(x, x + PAGE);
                     if super::fe2::image_upkeep() {
                         super::fe2::image_refreshes(x, x + PAGE, &mut self.pre_after);
                     }

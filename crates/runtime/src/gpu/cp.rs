@@ -2633,6 +2633,15 @@ impl Cp {
         }
     }
 
+    /// This command processor records part `chunk` of run `run` (`par::
+    /// Run::id`; 0: none): uploads the run's parts share (`Exec::
+    /// fe2_share`).
+    pub fn fe2_set_run(&mut self, run: u64, chunk: usize) {
+        if let Some(e) = self.exec.as_mut() {
+            e.fe2_run = (run, chunk.min(super::fe2::RUN_CHUNKS as usize + 1) as u32);
+        }
+    }
+
     /// A parallel worker records a chunk of a run planned at view `v`
     /// (`par::Run::fe2_view`).
     pub fn fe2_set_view(&self, v: u32) {
@@ -3373,6 +3382,12 @@ impl Cp {
             super::par::LONG[1].fetch_add(n as u64, Ordering::Relaxed);
         }
         let run = Arc::new(run);
+        // Its own part, queued before the workers' chunks: part 0 of the run
+        // (not past a run, held or past a label wait: then it has none
+        // before them).
+        if self.past.is_none() && self.held.is_none() && !self.plan_wait_run {
+            self.fe2_set_run(run.id, 0);
+        }
         lap.mark(9);
         for w in &workers {
             w.give(run.clone());
@@ -3398,6 +3413,8 @@ impl Cp {
     /// state from its end, or from the packet where the worker stopped.
     /// Returns where to continue.
     fn par_collect(&mut self) -> u64 {
+        // (Its own part of the run ends here.)
+        self.fe2_set_run(0, 0);
         if self.past_ok() {
             return self.past_start();
         }
