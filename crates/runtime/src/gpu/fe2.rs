@@ -2601,6 +2601,9 @@ struct Scatter {
     lazy: vk::Pipeline,
     /// The kernel noting the pages it writes back (`DS_WB_PAGES`).
     note: vk::Pipeline,
+    /// The kernel storing only dwords that differ from the image
+    /// (`DS_WB_IMAGE`; 2: the checking one).
+    image: vk::Pipeline,
     /// The touched-page list made from the touched bits
     /// (`rdna::kernels::mirror_compact`, `tune touch_bits`).
     compact: vk::Pipeline,
@@ -2632,7 +2635,9 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
             .collect();
         let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("scatter set layout: {e}"))?;
         let layouts = [set_layout];
-        let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 16 }];
+        // (24 bytes: the image's address after the mirror's and the table's,
+        // `DS_WB_IMAGE`.)
+        let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 24 }];
         let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("scatter layout: {e}"))?;
         let reset = super::tune::fe2_scatter_reset();
         let code = if reset { rdna::kernels::mirror_scatter_reset() } else { rdna::kernels::mirror_scatter() };
@@ -2652,6 +2657,11 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
         let changed = if reset { make(&rdna::kernels::mirror_scatter_changed(), 23)? } else { vk::Pipeline::null() };
         let lazy = if reset && lazy2_on() { make(&rdna::kernels::mirror_scatter_lazy(), 25)? } else { vk::Pipeline::null() };
         let note = if reset && wb_pages() { make(&rdna::kernels::mirror_scatter_note(), 26)? } else { vk::Pipeline::null() };
+        let image = match (reset, image_mode()) {
+            (true, 1) => make(&rdna::kernels::mirror_scatter_image(), 27)?,
+            (true, 2) => make(&rdna::kernels::mirror_scatter_image_check(), 28)?,
+            _ => vk::Pipeline::null(),
+        };
         let compact = make(&rdna::kernels::mirror_compact(), 24)?;
         let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 }];
         let pool = c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).map_err(|e| format!("scatter pool: {e}"))?;
@@ -2673,7 +2683,7 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
             .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
             .collect();
         c.device.update_descriptor_sets(&writes, &[]);
-        Ok(Scatter { pipeline, nostore, census, changed, lazy, note, compact, layout, set, counters: cptr as *mut u32, reset, host: cbuf, dev })
+        Ok(Scatter { pipeline, nostore, census, changed, lazy, note, image, compact, layout, set, counters: cptr as *mut u32, reset, host: cbuf, dev })
     }
 }
 
@@ -2706,7 +2716,8 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
     let c = ctx();
     let m = c.buffer_address(mbuf);
     let t = super::pagetable::address();
-    let pc: Vec<u8> = [m as u32, (m >> 32) as u32, t as u32, (t >> 32) as u32].iter().flat_map(|x| x.to_le_bytes()).collect();
+    let i = super::resident::image_buffer().map_or(0, |b| c.buffer_address(b));
+    let pc: Vec<u8> = [m as u32, (m >> 32) as u32, t as u32, (t >> 32) as u32, i as u32, (i >> 32) as u32].iter().flat_map(|x| x.to_le_bytes()).collect();
     let pipeline = if s.nostore != vk::Pipeline::null() && super::tune::fe2_scatter_nostore() {
         s.nostore
     } else if s.census != vk::Pipeline::null() && super::tune::fe2_scatter_read() == 1 {
@@ -2717,6 +2728,8 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
         s.lazy
     } else if s.note != vk::Pipeline::null() {
         s.note
+    } else if s.image != vk::Pipeline::null() && image_on() {
+        s.image
     } else {
         s.pipeline
     };
@@ -2894,6 +2907,71 @@ fn index_census_line() -> String {
         reads.join(", "),
         INDEX_CPU_WRITES[1].load(Ordering::Relaxed),
         INDEX_CPU_WRITES[0].load(Ordering::Relaxed)
+    )
+}
+
+/// `DS_WB_IMAGE=<1|2>` (boot): front end 2's write-back stores only the
+/// marked dwords that differ from a video-memory image of guest memory
+/// (`rdna::kernels::mirror_scatter_image`; 2: also reads each dword it
+/// leaves out from guest memory and counts those that differ there, which
+/// must stay 0). The image is backed over written bindings' ranges, a page
+/// of it valid while its bit in the map's aux region is set; uploads into
+/// the mirror, CP writes and fills clear the bits of the pages they write
+/// (exec.rs). FINDINGS.md 2026-10-31: a third (moving) to three fifths
+/// (still) of the dwords written back were unchanged.
+pub fn image_mode() -> u64 {
+    static M: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *M.get_or_init(|| std::env::var("DS_WB_IMAGE").ok().and_then(|v| v.parse().ok()).filter(|&v: &u64| v <= 2).unwrap_or(0))
+}
+
+static IMAGE_ON: AtomicBool = AtomicBool::new(false);
+
+/// The image is in use (made at start; off after a backing failure).
+pub fn image_on() -> bool {
+    IMAGE_ON.load(Ordering::Relaxed)
+}
+
+/// Switches the image off for good (its backing failed: pages it cannot
+/// hold would be compared with garbage).
+pub fn image_failed(why: &str) {
+    if IMAGE_ON.swap(false, Ordering::Relaxed) {
+        crate::warn!("fe2: the write-back image is off from now on: {why}");
+    }
+}
+
+/// Copies of zeros over the validity bits (aux words) of the pages in
+/// [a, b): every page sharing a word with them loses its bit too.
+pub fn image_invalidations(a: u64, b: u64, out: &mut Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>) {
+    let (Some(z), Some(marks)) = (super::resident::zeros(), super::resident::marks()) else { return };
+    if b <= a || !in_span(a, b - a) {
+        return;
+    }
+    let w0 = (a - MIRROR_BASE) / PAGE / 32;
+    let w1 = (b - MIRROR_BASE).div_ceil(PAGE).div_ceil(32);
+    let mut w = w0;
+    while w < w1 {
+        let n = (w1 - w).min((64 << 10) / 4);
+        out.push((z, marks, vk::BufferCopy { src_offset: 0, dst_offset: (rdna::kernels::MARK_AUX_AT as u64 + w) * 4, size: n * 4 }));
+        IMAGE_INVALIDATED.fetch_add(n, Ordering::Relaxed);
+        w += n;
+    }
+}
+
+/// Validity words cleared (`image_invalidations`).
+static IMAGE_INVALIDATED: AtomicU64 = AtomicU64::new(0);
+
+fn image_line(w: &[u64]) -> String {
+    if image_mode() == 0 {
+        return String::new();
+    }
+    let check = if image_mode() == 2 { format!("; checked against guest memory: {} dwords left out, {} of them differing there", w[2], w[3]) } else { String::new() };
+    format!(
+        "    write-back image (`DS_WB_IMAGE`{}): {} dwords left out as unchanged, {} pages copied into it, {} validity words cleared; its video memory {} MiB{check}\n",
+        if image_on() { "" } else { ", off" },
+        w[4],
+        w[5],
+        IMAGE_INVALIDATED.load(Ordering::Relaxed),
+        super::resident::image_mib()
     )
 }
 
@@ -3269,6 +3347,15 @@ pub fn init() {
                 }
             }
             ON.store(true, Ordering::Release);
+            if image_mode() > 0 {
+                match super::resident::make_image() {
+                    Ok(()) => {
+                        IMAGE_ON.store(true, Ordering::Relaxed);
+                        crate::info!("fe2: the write-back stores only dwords that differ from its image of guest memory (`DS_WB_IMAGE` {})", image_mode());
+                    }
+                    Err(e) => crate::warn!("fe2: no write-back image: {e}"),
+                }
+            }
             if crate::hosted::on() {
                 // (`DS_FE2_WORD=0`, diagnosis: the host answers a fault for
                 // its page only.)
@@ -3594,6 +3681,7 @@ pub fn status() -> String {
         + &index_census_line()
         + &lazy2_line(&w)
         + &wb_pages_line()
+        + &image_line(&w)
 }
 
 /// One status line: the mirror's pages by state now (a scan of every

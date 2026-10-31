@@ -889,7 +889,7 @@ pub fn mirror_scatter_nostore() -> Vec<u32> {
 /// those guest memory held already (counters 4 and 5): what a write-back
 /// of changed dwords alone would store.
 pub fn mirror_scatter_census() -> Vec<u32> {
-    build_scatter_ex(true, true, 1, false, false).expect("mirror scatter kernel (census)")
+    build_scatter_ex(true, true, 1, false, false, 0).expect("mirror scatter kernel (census)")
 }
 
 /// `mirror_scatter_census` storing only the dwords whose guest-memory value
@@ -897,18 +897,42 @@ pub fn mirror_scatter_census() -> Vec<u32> {
 /// the value guest memory held when it was read; a CPU write racing it
 /// lands as if after the GPU's).
 pub fn mirror_scatter_changed() -> Vec<u32> {
-    build_scatter_ex(true, true, 2, false, false).expect("mirror scatter kernel (changed dwords)")
+    build_scatter_ex(true, true, 2, false, false, 0).expect("mirror scatter kernel (changed dwords)")
 }
 
 fn build_scatter(reset: bool, stores: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
-    build_scatter_ex(reset, stores, 0, false, false)
+    build_scatter_ex(reset, stores, 0, false, false, 0)
 }
 
 /// `mirror_scatter_reset` that also sets, for each page it writes back
 /// dwords of, the page's bit in the map's aux region (diagnosis, the
 /// runtime's `DS_WB_PAGES`: which pages GPU work really wrote).
 pub fn mirror_scatter_note() -> Vec<u32> {
-    build_scatter_ex(true, true, 0, false, true).expect("mirror scatter kernel (noting pages)")
+    build_scatter_ex(true, true, 0, false, true, 0).expect("mirror scatter kernel (noting pages)")
+}
+
+/// `mirror_scatter_reset` storing only the marked dwords that differ from a
+/// video-memory image of guest memory (the runtime's `DS_WB_IMAGE`): the
+/// image is a second buffer over the mirror's span at device address
+/// `image` (push constants 4 and 5), valid for a page while its bit in the
+/// map's aux region is set. A valid page's marked dwords are compared with
+/// the image and only those that differ go to guest memory and the image;
+/// an invalid page's go to guest memory, then the whole page is copied from
+/// the mirror into the image and its bit set. Counters 6 and 7: dwords
+/// left out as unchanged, pages copied into the image. Guest memory holds
+/// what the image holds as long as every other writer of the page clears
+/// its bit (uploads into the mirror, CP writes, fills: the runtime).
+pub fn mirror_scatter_image() -> Vec<u32> {
+    build_scatter_ex(true, true, 0, false, false, 1).expect("mirror scatter kernel (image)")
+}
+
+/// `mirror_scatter_image` that stores every marked dword as
+/// `mirror_scatter_reset` does, and for each it would leave out reads guest
+/// memory first (across PCIe: diagnosis) and counts them and those that
+/// differ there (counters 4 and 5; the latter must stay 0): the image's
+/// exactness checked without leaving anything out.
+pub fn mirror_scatter_image_check() -> Vec<u32> {
+    build_scatter_ex(true, true, 0, false, false, 2).expect("mirror scatter kernel (image, checked)")
 }
 
 /// `mirror_scatter_reset` leaving pages whose bit is set in the map's aux
@@ -916,14 +940,15 @@ pub fn mirror_scatter_note() -> Vec<u32> {
 /// their marks and touched bits are cleared as after a write-back, their
 /// dwords and pages counted in counters 6 and 7 instead of 1 and 0).
 pub fn mirror_scatter_lazy() -> Vec<u32> {
-    build_scatter_ex(true, true, 0, true, false).expect("mirror scatter kernel (lazy pages)")
+    build_scatter_ex(true, true, 0, true, false, 0).expect("mirror scatter kernel (lazy pages)")
 }
 
 /// `read`: 0 stores every marked dword; 1 reads its guest-memory value first
 /// and counts (counters 4 and 5); 2 as 1, storing only changed dwords.
 /// `lazy`: pages with their aux bit set store nothing (`mirror_scatter_lazy`).
 /// `note`: pages written back get their aux bit set (`mirror_scatter_note`).
-fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
+/// `image`: 1 `mirror_scatter_image`, 2 `mirror_scatter_image_check`.
+fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool, image: u8) -> Result<Vec<u32>, rspirv::dr::Error> {
     let census = read != 0;
     let lit = Operand::LiteralBit32;
     let mut b = Builder::new();
@@ -948,9 +973,10 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool)
     let p_u = b.type_pointer(None, StorageClass::StorageBuffer, u32t);
     let p_dev = b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u32t);
     let p_dev64 = b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u64t);
-    let pc = b.type_struct([u32t, u32t, u32t, u32t]);
+    let pc_members = if image != 0 { 6 } else { 4 };
+    let pc = b.type_struct(vec![u32t; pc_members]);
     b.decorate(pc, Decoration::Block, []);
-    for k in 0..4 {
+    for k in 0..pc_members as u32 {
         b.member_decorate(pc, k, Decoration::Offset, [lit(4 * k)]);
     }
     let p_pc = b.type_pointer(None, StorageClass::PushConstant, pc);
@@ -1011,6 +1037,14 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool)
     let thi = pc_at(&mut b, c3)?;
     let mirror = addr64(&mut b, mlo, mhi)?;
     let table = addr64(&mut b, tlo, thi)?;
+    let image_base = if image != 0 {
+        let c4 = c(&mut b, 4);
+        let ilo = pc_at(&mut b, c4)?;
+        let ihi = pc_at(&mut b, c5)?;
+        Some(addr64(&mut b, ilo, ihi)?)
+    } else {
+        None
+    };
     let is0 = b.i_equal(bool_, None, lid, c0)?;
     let pcount = b.access_chain(p_u, None, marks, [c0, list_at])?;
     let inside = if reset {
@@ -1093,6 +1127,24 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool)
         None => mapped,
     };
     let moff = b.i_mul(u64t, None, page64, c4096_64)?;
+    // (`image`: the page's validity bit in the aux region and its address
+    // in the image.)
+    let image_page = match image_base {
+        Some(base) => {
+            let aux_at = c(&mut b, MARK_AUX_AT);
+            let aw = b.shift_right_logical(u32t, None, page, c5)?;
+            let awi = b.i_add(u32t, None, aux_at, aw)?;
+            let pa = b.access_chain(p_u, None, marks, [c0, awi])?;
+            let av = b.load(u32t, None, pa, None, [])?;
+            let abit = b.bitwise_and(u32t, None, page, c31)?;
+            let ash = b.shift_right_logical(u32t, None, av, abit)?;
+            let aone = b.bitwise_and(u32t, None, ash, c1)?;
+            let valid = b.i_not_equal(bool_, None, aone, c0)?;
+            let isrc = b.i_add(u64t, None, base, moff)?;
+            Some((valid, isrc))
+        }
+        None => None,
+    };
     let msrc = b.i_add(u64t, None, mirror, moff)?;
     let bit_of = b.bitwise_and(u32t, None, lid, c31)?;
     // Dwords lid + 256 r, r = 0..3: marked ones copied.
@@ -1133,20 +1185,98 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool)
                 changed = Some(b.logical_not(bool_, None, eq)?);
             }
         }
-        match changed {
-            Some(ch) => {
-                let (l_st, l_std) = (b.id(), b.id());
-                b.selection_merge(l_std, SelectionControl::NONE)?;
-                b.branch_conditional(ch, l_st, l_std, [])?;
-                b.begin_block(Some(l_st))?;
+        if let Some((valid, isrc)) = image_page {
+            // Compared with the image (a valid page's): only a dword that
+            // differs goes to guest memory and the image.
+            let ia = b.i_add(u64t, None, isrc, d64)?;
+            let ip = b.convert_u_to_ptr(p_dev, None, ia)?;
+            let gv = b.load(u32t, None, ip, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+            let differs = b.i_not_equal(bool_, None, gv, v)?;
+            let invalid = b.logical_not(bool_, None, valid)?;
+            let store_it = b.logical_or(bool_, None, invalid, differs)?;
+            let (l_st, l_skip, l_std) = (b.id(), b.id(), b.id());
+            b.selection_merge(l_std, SelectionControl::NONE)?;
+            b.branch_conditional(store_it, l_st, l_skip, [])?;
+            b.begin_block(Some(l_st))?;
+            b.store(dp, v, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+            b.store(ip, v, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+            b.branch(l_std)?;
+            b.begin_block(Some(l_skip))?;
+            let s0 = b.load(u32t, None, n_var, None, [])?;
+            let s1 = b.i_add(u32t, None, s0, c1)?;
+            b.store(n_var, s1, None, [])?;
+            if image == 2 {
+                // (Checking: guest memory read before the store it would
+                // leave out, which is made anyway.)
+                let old = b.load(u32t, None, dp, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+                let bad = b.i_not_equal(bool_, None, old, v)?;
+                let one_if = b.select(u32t, None, bad, c1, c0)?;
+                let m0 = b.load(u32t, None, same_var, None, [])?;
+                let m1 = b.i_add(u32t, None, m0, one_if)?;
+                b.store(same_var, m1, None, [])?;
                 b.store(dp, v, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
-                b.branch(l_std)?;
-                b.begin_block(Some(l_std))?;
             }
-            None => b.store(dp, v, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?,
+            b.branch(l_std)?;
+            b.begin_block(Some(l_std))?;
+        } else {
+            match changed {
+                Some(ch) => {
+                    let (l_st, l_std) = (b.id(), b.id());
+                    b.selection_merge(l_std, SelectionControl::NONE)?;
+                    b.branch_conditional(ch, l_st, l_std, [])?;
+                    b.begin_block(Some(l_st))?;
+                    b.store(dp, v, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+                    b.branch(l_std)?;
+                    b.begin_block(Some(l_std))?;
+                }
+                None => b.store(dp, v, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?,
+            }
         }
         b.branch(l_cpd)?;
         b.begin_block(Some(l_cpd))?;
+    }
+    if let Some((valid, isrc)) = image_page {
+        // An invalid page: copied whole from the mirror into the image.
+        let invalid = b.logical_not(bool_, None, valid)?;
+        let (l_cp2, l_cp2d) = (b.id(), b.id());
+        b.selection_merge(l_cp2d, SelectionControl::NONE)?;
+        b.branch_conditional(invalid, l_cp2, l_cp2d, [])?;
+        b.begin_block(Some(l_cp2))?;
+        for r in 0..4u32 {
+            let cr = b.constant_bit32(u32t, r * SCATTER_LOCAL_SIZE);
+            let d = b.i_add(u32t, None, lid, cr)?;
+            let d4 = b.shift_left_logical(u32t, None, d, c2)?;
+            let d64 = b.u_convert(u64t, None, d4)?;
+            let sa = b.i_add(u64t, None, msrc, d64)?;
+            let sp = b.convert_u_to_ptr(p_dev, None, sa)?;
+            let v = b.load(u32t, None, sp, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+            let ia = b.i_add(u64t, None, isrc, d64)?;
+            let ip = b.convert_u_to_ptr(p_dev, None, ia)?;
+            b.store(ip, v, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+        }
+        b.branch(l_cp2d)?;
+        b.begin_block(Some(l_cp2d))?;
+        // The dwords left out (counter 6) and, checked, those that differ in
+        // guest memory (counters 4 and 5).
+        let n = b.load(u32t, None, n_var, None, [])?;
+        let any = b.i_not_equal(bool_, None, n, c0)?;
+        let (l_ic, l_icd) = (b.id(), b.id());
+        b.selection_merge(l_icd, SelectionControl::NONE)?;
+        b.branch_conditional(any, l_ic, l_icd, [])?;
+        b.begin_block(Some(l_ic))?;
+        let c6 = c(&mut b, 6);
+        let p6 = b.access_chain(p_u, None, counters, [c0, c6])?;
+        b.atomic_i_add(u32t, None, p6, scope_dev, sem_none, n)?;
+        if image == 2 {
+            let c4 = c(&mut b, 4);
+            let p4 = b.access_chain(p_u, None, counters, [c0, c4])?;
+            b.atomic_i_add(u32t, None, p4, scope_dev, sem_none, n)?;
+            let bad = b.load(u32t, None, same_var, None, [])?;
+            let p5 = b.access_chain(p_u, None, counters, [c0, c5])?;
+            b.atomic_i_add(u32t, None, p5, scope_dev, sem_none, bad)?;
+        }
+        b.branch(l_icd)?;
+        b.begin_block(Some(l_icd))?;
     }
     if census {
         let n = b.load(u32t, None, n_var, None, [])?;
@@ -1271,6 +1401,25 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool)
         None => c1,
     };
     b.atomic_i_add(u32t, None, pcnt, scope_dev, sem_none, one_unless_lazy)?;
+    if let Some((valid, _)) = image_page {
+        let invalid = b.logical_not(bool_, None, valid)?;
+        let (l_iv, l_ivd) = (b.id(), b.id());
+        b.selection_merge(l_ivd, SelectionControl::NONE)?;
+        b.branch_conditional(invalid, l_iv, l_ivd, [])?;
+        b.begin_block(Some(l_iv))?;
+        let aux_at = c(&mut b, MARK_AUX_AT);
+        let aw = b.shift_right_logical(u32t, None, page, c5)?;
+        let awi = b.i_add(u32t, None, aux_at, aw)?;
+        let pa = b.access_chain(p_u, None, marks, [c0, awi])?;
+        let abit = b.bitwise_and(u32t, None, page, c31)?;
+        let amask = b.shift_left_logical(u32t, None, c1, abit)?;
+        b.atomic_or(u32t, None, pa, scope_dev, sem_none, amask)?;
+        let c7 = c(&mut b, 7);
+        let p7 = b.access_chain(p_u, None, counters, [c0, c7])?;
+        b.atomic_i_add(u32t, None, p7, scope_dev, sem_none, c1)?;
+        b.branch(l_ivd)?;
+        b.begin_block(Some(l_ivd))?;
+    }
     b.branch(l_pbd)?;
     b.begin_block(Some(l_pbd))?;
     b.branch(l_end)?;
@@ -1525,6 +1674,17 @@ mod tests {
         if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
             let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("mirror_scatter.spv"), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn scatter_image_kernels_assemble() {
+        for (w, name) in [(super::mirror_scatter_image(), "mirror_scatter_image.spv"), (super::mirror_scatter_image_check(), "mirror_scatter_image_check.spv")] {
+            assert_eq!(w[0], 0x0723_0203);
+            if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+                let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(std::path::Path::new(&dir).join(name), bytes).unwrap();
+            }
         }
     }
 

@@ -1441,6 +1441,50 @@ struct Mirror {
 
 static MIRROR: std::sync::OnceLock<Mirror> = std::sync::OnceLock::new();
 
+/// Front end 2's image of guest memory (`DS_WB_IMAGE`, `fe2::image_on`): a
+/// second sparse buffer over the mirror's span, backed over the ranges GPU
+/// work writes (`back_image`), and its video memory in pages.
+static IMAGE: std::sync::OnceLock<Mirror> = std::sync::OnceLock::new();
+static IMAGE_BACKED: AtomicU64 = AtomicU64::new(0);
+/// 64 KiB of zeros in video memory (copied over the image's validity bits).
+static ZEROS: std::sync::OnceLock<vk::Buffer> = std::sync::OnceLock::new();
+
+/// Makes the image buffer and the zeros (`fe2::init` with `DS_WB_IMAGE`).
+pub fn make_image() -> Result<(), String> {
+    if IMAGE.get().is_none() {
+        let m = make_mirror()?;
+        let _ = IMAGE.set(m);
+    }
+    if ZEROS.get().is_none() {
+        let c = ctx();
+        let (buf, _mem) = c.device_buffer(64 << 10, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)?;
+        one_off(|cmd| unsafe { c.device.cmd_fill_buffer(cmd, buf, 0, 64 << 10, 0) })?;
+        let _ = ZEROS.set(buf);
+    }
+    Ok(())
+}
+
+/// The image buffer (`make_image`).
+pub fn image_buffer() -> Option<vk::Buffer> {
+    IMAGE.get().map(|m| m.buf)
+}
+
+/// The 64 KiB of zeros (`make_image`).
+pub fn zeros() -> Option<vk::Buffer> {
+    ZEROS.get().copied()
+}
+
+/// Binds video memory to the image's pages over guest [base, base+len).
+pub fn back_image(base: u64, len: u64) -> Result<(), String> {
+    back_in(IMAGE.get().ok_or("no image")?, base, len, &IMAGE_BACKED)
+}
+
+/// The image's video memory so far, in MiB.
+pub fn image_mib() -> u64 {
+    let page = IMAGE.get().map_or(64 << 10, |m| m.page);
+    (IMAGE_BACKED.load(Ordering::Relaxed) * page) >> 20
+}
+
 fn make_mirror() -> Result<Mirror, String> {
     let c = ctx();
     if !c.sparse_buffers {
@@ -1475,7 +1519,10 @@ fn make_mirror() -> Result<Mirror, String> {
 /// Binds device memory to the mirror's pages over guest [base, base+len)
 /// that have none yet (synchronously: the bind completes before return).
 pub fn back(base: u64, len: u64) -> Result<(), String> {
-    let m = MIRROR.get().ok_or("no mirror")?;
+    back_in(MIRROR.get().ok_or("no mirror")?, base, len, &STATS[S_BACKED])
+}
+
+fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), String> {
     if base < MIRROR_BASE || base + len > MIRROR_END {
         return Err(format!("{base:#x}+{len:#x} is outside the mirror"));
     }
@@ -1541,7 +1588,7 @@ pub fn back(base: u64, len: u64) -> Result<(), String> {
         let p = b.resource_offset / m.page;
         m.backed[(p / 64) as usize].fetch_or(1u64 << (p % 64), Ordering::AcqRel);
     }
-    STATS[S_BACKED].fetch_add(binds.len() as u64, Ordering::Relaxed);
+    count.fetch_add(binds.len() as u64, Ordering::Relaxed);
     Ok(())
 }
 

@@ -9961,6 +9961,11 @@ impl Exec {
             self.fe2_marked = true;
             self.fe2_written = (self.fe2_written.0.min(lo), self.fe2_written.1.max(hi));
             super::fe2::lazy2_written(lo, hi);
+            if super::fe2::image_on() {
+                if let Err(e) = super::resident::back_image(lo, hi - lo) {
+                    super::fe2::image_failed(&format!("no video memory for its pages {lo:#x}..{hi:#x}: {e}"));
+                }
+            }
             if wb_census() {
                 note_written_binding(base, hi - lo);
             }
@@ -10270,6 +10275,9 @@ impl Exec {
                     }
                     self.pre_copies.push((buf, mbuf, vk::BufferCopy { src_offset: x - start, dst_offset: x - MIRROR_BASE, size: e - x }));
                     super::fe2::lazy2_upload(x, e);
+                    if super::fe2::image_on() {
+                        super::fe2::image_invalidations(x, e, &mut self.pre_copies);
+                    }
                     match up.last_mut() {
                         Some(l) if l.1 == x => l.1 = e,
                         _ => up.push((x, e)),
@@ -10283,6 +10291,9 @@ impl Exec {
                         return false;
                     }
                     super::fe2::note_memcpy(1);
+                    if super::fe2::image_on() {
+                        super::fe2::image_invalidations(x, x + PAGE, &mut self.pre_copies);
+                    }
                     if self.held {
                         // (Read now: checked when held work settles.)
                         self.held_reads.push((x, PAGE));
@@ -11083,6 +11094,14 @@ impl Exec {
         if super::fe2::on() && super::fe2::in_span(base, len) {
             if let (Some((m, _)), Ok(())) = (super::resident::mirror_buffer(), super::resident::back(base & !4095, (base + len).next_multiple_of(4096) - (base & !4095))) {
                 unsafe { ctx().device.cmd_fill_buffer(cmd, m, base - super::resident::MIRROR_BASE, len, v) };
+            }
+            // (`DS_WB_IMAGE`: the filled pages' validity cleared.)
+            if super::fe2::image_on() {
+                let mut inv = Vec::new();
+                super::fe2::image_invalidations(base, base + len, &mut inv);
+                for (src, dst, region) in inv {
+                    unsafe { ctx().device.cmd_copy_buffer(cmd, src, dst, &[region]) };
+                }
             }
         }
         if profiling() {
@@ -12460,6 +12479,13 @@ impl Exec {
             self.barrier();
             self.barrier_wanted = false;
             self.dispatched = false;
+        }
+        if super::fe2::image_on() && fe2_mirror.is_some() {
+            let mut inv = Vec::new();
+            super::fe2::image_invalidations(a, a + bytes, &mut inv);
+            for (src, dst, region) in inv {
+                unsafe { ctx().device.cmd_copy_buffer(cmd, src, dst, &[region]) };
+            }
         }
         self.note_write(a, bytes);
         if self.held && self.cp_written.len() < 4096 {
