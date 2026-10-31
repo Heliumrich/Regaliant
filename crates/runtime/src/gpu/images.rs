@@ -993,6 +993,39 @@ static GPU_DETILE: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atom
 /// video memory (`tune upload_copy`).
 static COPY_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `DS_ZERO_CENSUS=1` (diagnosis): re-uploaded (mip, layer)s by cause (0 none,
+/// 1 a commit, 2 another mapping change, 3 a file read, 4 a CPU write, 5 a GPU
+/// write, 6 other): [parts, parts all zero in guest memory, bytes, zero
+/// bytes, upload ns].
+static ZERO_CENSUS: [[std::sync::atomic::AtomicU64; 5]; 7] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 5] }; 7];
+
+fn zero_census() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_ZERO_CENSUS").ok().as_deref() == Some("1"))
+}
+
+thread_local! {
+    /// The cause of the re-upload in progress (`ZERO_CENSUS`).
+    static REUPLOAD_CAUSE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Status part: `ZERO_CENSUS` ("" when off).
+pub fn zero_census_line() -> String {
+    if !zero_census() {
+        return String::new();
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    const NAMES: [&str; 7] = ["first", "commit", "other mapping change", "file read", "CPU write", "GPU write", "other"];
+    let parts: Vec<String> = (1..7)
+        .filter(|&k| ZERO_CENSUS[k][0].load(Relaxed) > 0)
+        .map(|k| {
+            let v: Vec<u64> = ZERO_CENSUS[k].iter().map(|c| c.load(Relaxed)).collect();
+            format!("{} {} parts ({} all zero; {} MiB, {} MiB zero; {} ms)", NAMES[k], v[0], v[1], v[2] >> 20, v[3] >> 20, v[4] / 1_000_000)
+        })
+        .collect();
+    format!("    re-uploaded parts by cause (`DS_ZERO_CENSUS`): {}\n", parts.join("; "))
+}
+
 /// `DS_GPU_DETILE_CHECK=1`: every upload detiled on the GPU reads back the
 /// tiled bytes it copied and the rows it made; the CPU's detiling of that
 /// copy must give the same rows, (mip, layer) by (mip, layer), and guest
@@ -2173,6 +2206,10 @@ impl Images {
     fn upload_parts(&mut self, image: vk::Image, key: ImageKey, t: &Tsharp, only: Option<&[(u64, u64)]>, all: bool) -> Result<(u64, u64), String> {
         let t0 = std::time::Instant::now();
         let r = self.upload_inner(image, key, t, only, all);
+        if zero_census() {
+            let cause = REUPLOAD_CAUSE.with(|c| c.get()) as usize;
+            ZERO_CENSUS[cause.min(6)][4].fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Ok((_, n)) = &r {
             self.upload_bytes += n;
             super::hitch::note_since(super::hitch::Kind::Upload, t0, || format!("{}x{}x{}{} {:?} {} KiB", key.width, key.height, key.layers, if key.ty3d { " 3D" } else { "" }, key.format, n >> 10));
@@ -2497,6 +2534,20 @@ impl Images {
         }
         if regions.is_empty() && zeroed.is_empty() {
             return Err(format!("texture {:#x}+{size:#x}: no mip mapped", t.base));
+        }
+        if zero_census() && !first {
+            use std::sync::atomic::Ordering::Relaxed;
+            let cause = (REUPLOAD_CAUSE.with(|c| c.get()) as usize).min(6);
+            for &(mip, layer, _, len) in &parts {
+                let (s, n) = range(mip, layer);
+                let zero = ((s + n) as usize) <= src.len() && src[s as usize..(s + n) as usize].chunks(8).all(|c| c.iter().all(|&b| b == 0));
+                ZERO_CENSUS[cause][0].fetch_add(1, Relaxed);
+                ZERO_CENSUS[cause][2].fetch_add(len as u64, Relaxed);
+                if zero {
+                    ZERO_CENSUS[cause][1].fetch_add(1, Relaxed);
+                    ZERO_CENSUS[cause][3].fetch_add(len as u64, Relaxed);
+                }
+            }
         }
         let zero_len = zeroed.iter().map(|z| z.2).max().unwrap_or(0);
         let (detiled, zero_off) = (total, total);
@@ -3715,7 +3766,10 @@ impl Images {
             if h != self.map[&key].hashes {
                 self.reuploads += 1;
                 self.report(format!("texture {:#x} {}x{} re-uploaded (GPU write)", t.base, t.width, t.height));
-                self.upload_parts(image, key, t, None, false)?;
+                REUPLOAD_CAUSE.with(|c| c.set(5));
+                let r = self.upload_parts(image, key, t, None, false);
+                REUPLOAD_CAUSE.with(|c| c.set(0));
+                r?;
                 self.map.get_mut(&key).unwrap().hashes = h;
             }
         }
@@ -3727,7 +3781,10 @@ impl Images {
             if slice_hash(b, n, s) != img.hashes[s] {
                 self.reuploads += 1;
                 self.report(format!("texture {:#x} {}x{} re-uploaded (CPU write)", t.base, t.width, t.height));
-                self.upload_parts(image, key, t, Some(&[]), false)?;
+                REUPLOAD_CAUSE.with(|c| c.set(4));
+                let r = self.upload_parts(image, key, t, Some(&[]), false);
+                REUPLOAD_CAUSE.with(|c| c.set(0));
+                r?;
                 self.map.get_mut(&key).unwrap().hashes = all_hashes(b, n);
             }
         }
@@ -3754,7 +3811,19 @@ impl Images {
             });
             self.report(msg);
             let t0 = std::time::Instant::now();
-            self.upload_parts(image, key, t, parts.as_deref(), matches!(why, super::track::Why::Forced))?;
+            REUPLOAD_CAUSE.with(|c| {
+                c.set(match why {
+                    super::track::Why::Remap(_, _, 0) => 1,
+                    super::track::Why::Remap(..) => 2,
+                    super::track::Why::HostWrite(_) => 3,
+                    super::track::Why::Fault(_) | super::track::Why::Written(_) | super::track::Why::Sampled => 4,
+                    super::track::Why::GpuWrite(..) => 5,
+                    _ => 6,
+                })
+            });
+            let r = self.upload_parts(image, key, t, parts.as_deref(), matches!(why, super::track::Why::Forced));
+            REUPLOAD_CAUSE.with(|c| c.set(0));
+            r?;
             let h = all_hashes(b, n);
             if let super::track::Why::Remap(rb, rl, op) = why {
                 use std::sync::atomic::Ordering::Relaxed;
@@ -4568,6 +4637,6 @@ impl Images {
             ZERO_FILL_CLEARS.load(std::sync::atomic::Ordering::Relaxed),
             self.overwrite_uploads,
             remaps.join(", ")
-        )
+        ) + &zero_census_line()
     }
 }
