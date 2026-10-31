@@ -2581,6 +2581,17 @@ pub fn invalidate(base: u64, len: u64) {
 /// COUNTER_COPY_EVERY write-backs).
 struct Scatter {
     pipeline: vk::Pipeline,
+    /// The kernel storing nothing (`tune fe2_scatter_nostore`, with
+    /// `fe2_scatter_reset`; null otherwise).
+    nostore: vk::Pipeline,
+    /// The kernels reading guest memory first (`tune fe2_scatter_read` 1:
+    /// counting dwords it held already; 2: also storing only the others),
+    /// with `fe2_scatter_reset` (null otherwise).
+    census: vk::Pipeline,
+    changed: vk::Pipeline,
+    /// The touched-page list made from the touched bits
+    /// (`rdna::kernels::mirror_compact`, `tune touch_bits`).
+    compact: vk::Pipeline,
     layout: vk::PipelineLayout,
     set: vk::DescriptorSet,
     counters: *mut u32,
@@ -2612,21 +2623,22 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
         let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 16 }];
         let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("scatter layout: {e}"))?;
         let reset = super::tune::fe2_scatter_reset();
-        // (`tune fe2_scatter_nostore`: timing only, guest memory left as it was.)
-        let code = if super::tune::fe2_scatter_nostore() {
-            crate::warn!("fe2: the write-back stores nothing into guest memory (`tune fe2_scatter_nostore`, timing only: wrong results)");
-            rdna::kernels::mirror_scatter_nostore()
-        } else if reset {
-            rdna::kernels::mirror_scatter_reset()
-        } else {
-            rdna::kernels::mirror_scatter()
+        let code = if reset { rdna::kernels::mirror_scatter_reset() } else { rdna::kernels::mirror_scatter() };
+        let make = |code: &[u32], key: u64| -> Result<vk::Pipeline, String> {
+            let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None).map_err(|e| format!("scatter module: {e}"))?;
+            let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+            let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
+            let pipeline = super::pcache::with_cache('i', key, |cache| c.device.create_compute_pipelines(cache, &[ci], None)).map_err(|(_, e)| format!("scatter pipeline: {e}"));
+            c.device.destroy_shader_module(module, None);
+            Ok(pipeline?[0])
         };
-        let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("scatter module: {e}"))?;
-        let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
-        let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
-        let pipeline = super::pcache::with_cache('i', 20, |cache| c.device.create_compute_pipelines(cache, &[ci], None)).map_err(|(_, e)| format!("scatter pipeline: {e}"));
-        c.device.destroy_shader_module(module, None);
-        let pipeline = pipeline?[0];
+        let pipeline = make(&code, 20)?;
+        // (`tune fe2_scatter_nostore`: timing only, guest memory left as it was.)
+        let nostore = if reset { make(&rdna::kernels::mirror_scatter_nostore(), 21)? } else { vk::Pipeline::null() };
+        // (`tune fe2_scatter_read`.)
+        let census = if reset { make(&rdna::kernels::mirror_scatter_census(), 22)? } else { vk::Pipeline::null() };
+        let changed = if reset { make(&rdna::kernels::mirror_scatter_changed(), 23)? } else { vk::Pipeline::null() };
+        let compact = make(&rdna::kernels::mirror_compact(), 24)?;
         let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 }];
         let pool = c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).map_err(|e| format!("scatter pool: {e}"))?;
         let set = c.device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts)).map_err(|e| format!("scatter set: {e}"))?[0];
@@ -2647,16 +2659,33 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
             .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
             .collect();
         c.device.update_descriptor_sets(&writes, &[]);
-        Ok(Scatter { pipeline, layout, set, counters: cptr as *mut u32, reset, host: cbuf, dev })
+        Ok(Scatter { pipeline, nostore, census, changed, compact, layout, set, counters: cptr as *mut u32, reset, host: cbuf, dev })
+    }
+}
+
+/// Some translation set touched bits alone (`tune touch_bits`): from then
+/// on write-backs make the touched-page list from the bits first.
+static TOUCH_BITS_EVER: AtomicBool = AtomicBool::new(false);
+
+/// Write-backs that made the list from the touched bits: [write-backs,
+/// words of touched bits scanned].
+static COMPACTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+pub fn note_touch_bits() {
+    if !TOUCH_BITS_EVER.load(Ordering::Relaxed) {
+        TOUCH_BITS_EVER.store(true, Ordering::Relaxed);
+        crate::info!("fe2: translations set touched bits alone from now on (`tune touch_bits`): write-backs make the touched-page list from them");
     }
 }
 
 /// Records the write-back into `cmd` (outside a render pass): a barrier
-/// after all earlier work, the scatter over the touched-page list, the
-/// list emptied (by the kernel itself under `tune fe2_scatter_reset`), a
-/// barrier before all later work. Returns the pipeline it
-/// bound (the caller's bound compute state is gone).
-pub fn record_scatter(cmd: vk::CommandBuffer) -> Option<vk::Pipeline> {
+/// after all earlier work, (`tune touch_bits`) the touched-page list made
+/// from the touched bits of `written` (the guest range the executor's
+/// written bindings since its last write-back span) and a barrier, the
+/// scatter over the touched-page list, the list emptied (by the kernel
+/// itself under `tune fe2_scatter_reset`), a barrier before all later work.
+/// Returns the pipeline it bound (the caller's bound compute state is gone).
+pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Option<vk::Pipeline> {
     let s = SCATTER.get()?;
     let marks = super::resident::marks()?;
     let (mbuf, _) = super::resident::mirror_buffer()?;
@@ -2664,10 +2693,36 @@ pub fn record_scatter(cmd: vk::CommandBuffer) -> Option<vk::Pipeline> {
     let m = c.buffer_address(mbuf);
     let t = super::pagetable::address();
     let pc: Vec<u8> = [m as u32, (m >> 32) as u32, t as u32, (t >> 32) as u32].iter().flat_map(|x| x.to_le_bytes()).collect();
+    let pipeline = if s.nostore != vk::Pipeline::null() && super::tune::fe2_scatter_nostore() {
+        s.nostore
+    } else if s.census != vk::Pipeline::null() && super::tune::fe2_scatter_read() == 1 {
+        s.census
+    } else if s.changed != vk::Pipeline::null() && super::tune::fe2_scatter_read() == 2 {
+        s.changed
+    } else {
+        s.pipeline
+    };
     unsafe {
         let all = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT, vk::DependencyFlags::empty(), &[all], &[], &[]);
-        c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, s.pipeline);
+        if let Some((lo, hi)) = written.filter(|&(lo, hi)| lo < hi && TOUCH_BITS_EVER.load(Ordering::Relaxed)) {
+            // The touched-bit words of the pages in [lo, hi), 32 pages a word.
+            let span_words = (MIRROR_END - MIRROR_BASE) / PAGE / 32;
+            let w0 = (lo.max(MIRROR_BASE) - MIRROR_BASE) / PAGE / 32;
+            let w1 = ((hi.min(MIRROR_END) - MIRROR_BASE).div_ceil(PAGE)).div_ceil(32).min(span_words);
+            if w0 < w1 {
+                let cpc: Vec<u8> = [w0 as u32, w1 as u32, 0, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
+                c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, s.compact);
+                c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
+                c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &cpc);
+                c.device.cmd_dispatch(cmd, ((w1 - w0) as u32).div_ceil(rdna::kernels::COMPACT_LOCAL_SIZE), 1, 1);
+                let listed = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::INDIRECT_COMMAND_READ);
+                c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT, vk::DependencyFlags::empty(), &[listed], &[], &[]);
+                COMPACTS[0].fetch_add(1, Ordering::Relaxed);
+                COMPACTS[1].fetch_add(w1 - w0, Ordering::Relaxed);
+            }
+        }
+        c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
         c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
         c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
         c.device.cmd_dispatch_indirect(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4);
@@ -2689,7 +2744,7 @@ pub fn record_scatter(cmd: vk::CommandBuffer) -> Option<vk::Pipeline> {
         }
     }
     note_scatter();
-    Some(s.pipeline)
+    Some(pipeline)
 }
 
 /// Records a copy of the write-back's video-memory counters into the
@@ -2714,11 +2769,32 @@ pub fn scatter_resets() -> bool {
     on() && SCATTER.get().is_some_and(|s| s.reset)
 }
 
+/// The write-back's counters summed in 64 bits (the kernel's are 32-bit
+/// and wrap within seconds at an arrival's volume: ~4 million dwords a
+/// flip at Castlewall), sampled at every flip (`census_sample`): pages,
+/// dwords, the census's dwords and those guest memory held already
+/// (`tune fe2_scatter_read`), then the last values seen of the four.
+static WB64: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Adds the counters' growth since the last sample (at each flip, from one
+/// thread; the status line reads the sums alone, two samplers could race
+/// on the last values).
+pub fn census_sample() {
+    if !on() || SCATTER.get().is_none() {
+        return;
+    }
+    let k = counters();
+    for (i, now) in [k[0], k[1], k[4], k[5]].into_iter().enumerate() {
+        let prev = WB64[4 + i].swap(now as u64, Ordering::Relaxed) as u32;
+        WB64[i].fetch_add(now.wrapping_sub(prev) as u64, Ordering::Relaxed);
+    }
+}
+
 /// The write-back's counters (pages, dwords, pages without a mapping,
-/// overflowed lists), as the GPU left them so far (under `tune
+/// overflowed lists, the census's dwords and unchanged ones), as the GPU left them so far (under `tune
 /// fe2_scatter_dev` as of the last copy).
-fn counters() -> [u32; 4] {
-    let Some(s) = SCATTER.get() else { return [0; 4] };
+fn counters() -> [u32; rdna::kernels::SCATTER_COUNTERS as usize] {
+    let Some(s) = SCATTER.get() else { return [0; rdna::kernels::SCATTER_COUNTERS as usize] };
     // SAFETY: host-visible words the kernel adds to atomically.
     std::array::from_fn(|k| unsafe { std::ptr::read_volatile(s.counters.add(k)) })
 }
@@ -2874,7 +2950,7 @@ fn self_test() -> Result<String, String> {
             c.device.cmd_update_buffer(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4, &list);
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
-            record_scatter(cmd);
+            record_scatter(cmd, None);
             if let Some(s) = SCATTER.get() {
                 record_counter_copy(s, cmd);
             }
@@ -2989,7 +3065,7 @@ fn scatter_bench() -> Result<String, String> {
                         let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
                         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
                         c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, 2 * r);
-                        record_scatter(cmd);
+                        record_scatter(cmd, None);
                         c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, 2 * r + 1);
                         // (The next round's inputs after it.)
                         let next = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
@@ -3044,6 +3120,10 @@ pub fn status() -> String {
             format!("{n} {} ({} MiB; {} takes, {:.1} ms)", v[0], (v[1] * PAGE) >> 20, v[2], ms(v[3]))
         })
         .collect();
+    let w: Vec<u64> = WB64.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let (cn, cs) = (w[2], w[3]);
+    let compacts = if COMPACTS[0].load(Ordering::Relaxed) > 0 { format!("    front end 2's touched-page lists made from touched bits (`tune touch_bits`): {} write-backs, {} words of bits scanned\n", COMPACTS[0].load(Ordering::Relaxed), COMPACTS[1].load(Ordering::Relaxed)) } else { String::new() };
+    let census = if cn > 0 { format!("    front end 2's write-back census (`tune fe2_scatter_read`): {cn} dwords marked, {cs} of them ({:.1}%) held by guest memory already\n", 100.0 * cs as f64 / cn as f64) } else { String::new() };
     format!(
         "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages; runs a take of their epoch had looked at, without another: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action; CP writes with work to write back {} of labels a CP of ours waits on, {} left to the batch's close, {} with their guest-memory copy at the close); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value, {} again with the label's page unwritten and {} gone past ended none); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
         s[S_ENSURES],
@@ -3087,8 +3167,8 @@ pub fn status() -> String {
         s[S_INVAL_CALLS],
         s[S_INVAL_TAKEN],
         s[S_SCATTERS],
-        k[0],
-        k[1],
+        w[0],
+        w[1],
         k[2],
         k[3],
         super::exec::SCATTER_SITES[0].load(Ordering::Relaxed),
@@ -3124,6 +3204,8 @@ pub fn status() -> String {
             .join(", "),
     ) + &census_line()
         + &callers_line()
+        + &census
+        + &compacts
 }
 
 /// One status line: the mirror's pages by state now (a scan of every

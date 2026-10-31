@@ -294,6 +294,16 @@ pub struct Spec {
     /// entry (u32::MAX: not marked; a marked binding starts at a multiple of
     /// 128 bytes of the mirror). Only dwords inside the bound range count.
     pub write_marks: bool,
+    /// With `write_marks`, timing only (the runtime's `tune mark_touch 0`):
+    /// stores set their dwords' bits but do not enter their pages in the
+    /// touched-page list (`touch_page`), so write-backs find nothing to
+    /// write and GPU writes never reach guest memory.
+    pub marks_untouched: bool,
+    /// With `write_marks` (the runtime's `tune touch_bits`): stores set their
+    /// pages' touched bits without reading them back and enter nothing in
+    /// the touched-page list; the write-back makes the list from the bits
+    /// (`kernels::mirror_compact`), so no store waits on an atomic's result.
+    pub touch_bits: bool,
     /// How the SGPR data binding is declared: 0 a storage buffer (u32
     /// array), 1 a uniform buffer (`BindingKind::SgprUniform`: a std140
     /// array of uvec4 sized to the plan's SGPR data) where the binding is the
@@ -419,6 +429,12 @@ impl std::hash::Hash for Spec {
         }
         if self.write_marks {
             0x4D41_524Bu32.hash(state);
+        }
+        if self.marks_untouched {
+            0x4D55_4E54u32.hash(state);
+        }
+        if self.touch_bits {
+            0x5442_4954u32.hash(state);
         }
         if self.sgpr_ubo != 0 {
             (0x5542_4F00u32 | self.sgpr_ubo as u32).hash(state);
@@ -3335,6 +3351,8 @@ mod tests {
             addresses: false,
             batched: false,
             write_marks: false,
+            marks_untouched: false,
+            touch_bits: false,
             sgpr_ubo: 0,
             gpu_loads: 0,
             gpu_res: 0,

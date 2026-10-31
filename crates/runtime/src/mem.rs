@@ -364,6 +364,12 @@ thread_local! {
 /// Mappings cached per thread (`vma_bounds`).
 const VMA_CACHED: usize = 256;
 
+/// The guest mapping holding `a`: start, size, name (diagnostics: takes the
+/// mapping table's lock).
+pub fn vma_label(a: u64) -> Option<(u64, u64, String)> {
+    MEM.lock().find(a).map(|v| (v.start, v.size, v.name.clone()))
+}
+
 /// [start, end) of the guest mapping holding `a` as the mapping table has
 /// it (None in a gap or a reservation), from a per-thread cache while the
 /// table has not changed since (`tune vma_cache`: the GPU executors look up

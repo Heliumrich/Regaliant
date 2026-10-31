@@ -1116,6 +1116,8 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         addresses: super::tune::addresses() || (super::tune::batch_cs() && batchable(addr)),
         batched: super::tune::batch_cs() && batchable(addr),
         write_marks: marks_wanted(),
+        marks_untouched: !super::tune::mark_touch(),
+        touch_bits: touch_bits_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -1267,6 +1269,18 @@ fn early_ok(ctx: &dyn Fn(u32) -> u32) -> bool {
 fn marks_wanted() -> bool {
     (super::resident::mirror_wanted() || super::fe2::wanted()) && super::tune::write_marks()
 }
+// (`tune mark_touch 0`, timing only: `Spec::marks_untouched`.)
+
+/// Front end 2's stores set their pages' touched bits alone (`tune
+/// touch_bits`, `Spec::touch_bits`); from the first such translation on,
+/// write-backs make the touched-page list from the bits.
+fn touch_bits_wanted() -> bool {
+    let on = marks_wanted() && super::fe2::wanted() && super::tune::touch_bits();
+    if on {
+        super::fe2::note_touch_bits();
+    }
+    on
+}
 
 /// Resolves and translates the pixel shader bound on `cp`.
 pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
@@ -1327,6 +1341,8 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         addresses: super::tune::addresses() || batched_draw_now(),
         batched: batched_draw_now(),
         write_marks: marks_wanted(),
+        marks_untouched: !super::tune::mark_touch(),
+        touch_bits: touch_bits_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -1513,6 +1529,8 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         addresses: super::tune::addresses() || batched_draw_now(),
         batched: batched_draw_now(),
         write_marks: marks_wanted(),
+        marks_untouched: !super::tune::mark_touch(),
+        touch_bits: touch_bits_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2247,6 +2265,8 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         addresses: super::tune::addresses(),
         batched: false,
         write_marks: marks_wanted(),
+        marks_untouched: !super::tune::mark_touch(),
+        touch_bits: touch_bits_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2292,6 +2312,8 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         addresses: super::tune::addresses(),
         batched: false,
         write_marks: marks_wanted(),
+        marks_untouched: !super::tune::mark_touch(),
+        touch_bits: touch_bits_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2337,6 +2359,8 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         addresses: super::tune::addresses() || (super::tune::batch_cs() && batched),
         batched: super::tune::batch_cs() && batched,
         write_marks: marks_wanted(),
+        marks_untouched: !super::tune::mark_touch(),
+        touch_bits: touch_bits_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,

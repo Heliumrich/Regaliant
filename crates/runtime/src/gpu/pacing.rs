@@ -30,6 +30,7 @@ pub fn note_flip(n: u64, us: u64) {
     s.last = Some((us, n));
     drop(s);
     super::hitch::flip(n, us);
+    super::fe2::census_sample();
 }
 
 /// The window's statistics (one line), and a new window.

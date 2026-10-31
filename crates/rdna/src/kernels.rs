@@ -711,11 +711,136 @@ fn build_gather() -> Result<Vec<u32>, rspirv::dr::Error> {
     Ok(b.module().assemble())
 }
 
+/// Workgroup size of `mirror_compact`: one invocation per word of touched
+/// bits (32 pages).
+pub const COMPACT_LOCAL_SIZE: u32 = 256;
+
+/// Front end 2's touched-page list made from the touched bits
+/// (`Spec::touch_bits`: stores set their pages' bits without reading them
+/// back, so no store waits on an atomic's result): invocation i of the
+/// dispatch takes touched-bit word `w0 + i` (below `w1`; push constants
+/// `{w0, w1}`), and when any of its 32 pages is touched it reserves room in
+/// the list with one atomic and enters them (past MARK_LIST_CAP they are
+/// counted only: the scatter counts the overflow, and their bits stay set
+/// for the next write-back). The bits are left for the scatter, which
+/// clears each page's as it writes the page back. Binding 0 is the whole
+/// written-bit map (binding 1 of the scatter's set is not used).
+pub fn mirror_compact() -> Vec<u32> {
+    build_compact().expect("mirror compact kernel")
+}
+
+fn build_compact() -> Result<Vec<u32>, rspirv::dr::Error> {
+    let lit = Operand::LiteralBit32;
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.extension("SPV_KHR_storage_buffer_storage_class");
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+    let void = b.type_void();
+    let bool_ = b.type_bool();
+    let u32t = b.type_int(32, 0);
+    let v3 = b.type_vector(u32t, 3);
+    let rta = b.type_runtime_array(u32t);
+    b.decorate(rta, Decoration::ArrayStride, [lit(4)]);
+    let st = b.type_struct([rta]);
+    b.decorate(st, Decoration::Block, []);
+    b.member_decorate(st, 0, Decoration::Offset, [lit(0)]);
+    let p_st = b.type_pointer(None, StorageClass::StorageBuffer, st);
+    let p_u = b.type_pointer(None, StorageClass::StorageBuffer, u32t);
+    let pc = b.type_struct([u32t, u32t, u32t, u32t]);
+    b.decorate(pc, Decoration::Block, []);
+    for k in 0..4 {
+        b.member_decorate(pc, k, Decoration::Offset, [lit(4 * k)]);
+    }
+    let p_pc = b.type_pointer(None, StorageClass::PushConstant, pc);
+    let p_pcu = b.type_pointer(None, StorageClass::PushConstant, u32t);
+    let p_in = b.type_pointer(None, StorageClass::Input, v3);
+    let gid_v = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(gid_v, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let mut bufs = [0; 2];
+    for (i, v) in bufs.iter_mut().enumerate() {
+        *v = global(&mut b, p_st, StorageClass::StorageBuffer);
+        b.decorate(*v, Decoration::DescriptorSet, [lit(0)]);
+        b.decorate(*v, Decoration::Binding, [lit(i as u32)]);
+    }
+    let marks = bufs[0];
+    let pcv = global(&mut b, p_pc, StorageClass::PushConstant);
+    let c = |b: &mut Builder, v: u32| b.constant_bit32(u32t, v);
+    let (c0, c1, c32) = (c(&mut b, 0), c(&mut b, 1), c(&mut b, 32));
+    let list_at = c(&mut b, MARK_LIST_AT);
+    let list_first = c(&mut b, MARK_LIST_AT + 4);
+    let list_cap = c(&mut b, MARK_LIST_CAP);
+    let bits_at = c(&mut b, MARK_PAGE_BITS_AT);
+    let scope_dev = c(&mut b, 1);
+    let sem_none = c0;
+    let fty = b.type_function(void, []);
+    let f = b.begin_function(void, None, FunctionControl::NONE, fty)?;
+    b.begin_block(None)?;
+    let gv = b.load(v3, None, gid_v, None, [])?;
+    let gid = b.composite_extract(u32t, None, gv, [0])?;
+    let pc_at = |b: &mut Builder, k: Word| -> Result<Word, rspirv::dr::Error> {
+        let p = b.access_chain(p_pcu, None, pcv, [k])?;
+        b.load(u32t, None, p, None, [])
+    };
+    let w0 = pc_at(&mut b, c0)?;
+    let w1 = pc_at(&mut b, c1)?;
+    let wi = b.i_add(u32t, None, w0, gid)?;
+    let inside = b.u_less_than(bool_, None, wi, w1)?;
+    let (l_in, l_end) = (b.id(), b.id());
+    b.selection_merge(l_end, SelectionControl::NONE)?;
+    b.branch_conditional(inside, l_in, l_end, [])?;
+    b.begin_block(Some(l_in))?;
+    let bw = b.i_add(u32t, None, bits_at, wi)?;
+    let pb = b.access_chain(p_u, None, marks, [c0, bw])?;
+    let bits = b.load(u32t, None, pb, None, [])?;
+    let any = b.i_not_equal(bool_, None, bits, c0)?;
+    let (l_any, l_anyd) = (b.id(), b.id());
+    b.selection_merge(l_anyd, SelectionControl::NONE)?;
+    b.branch_conditional(any, l_any, l_anyd, [])?;
+    b.begin_block(Some(l_any))?;
+    let n = b.bit_count(u32t, None, bits)?;
+    let pcount = b.access_chain(p_u, None, marks, [c0, list_at])?;
+    let base = b.atomic_i_add(u32t, None, pcount, scope_dev, sem_none, n)?;
+    let page0 = b.i_mul(u32t, None, wi, c32)?;
+    for k in 0..32u32 {
+        let ck = c(&mut b, k);
+        let sh = b.shift_right_logical(u32t, None, bits, ck)?;
+        let bk = b.bitwise_and(u32t, None, sh, c1)?;
+        let set = b.i_not_equal(bool_, None, bk, c0)?;
+        let below_mask = c(&mut b, if k == 0 { 0 } else { u32::MAX >> (32 - k) });
+        let below_bits = b.bitwise_and(u32t, None, bits, below_mask)?;
+        let below = b.bit_count(u32t, None, below_bits)?;
+        let idx = b.i_add(u32t, None, base, below)?;
+        let room = b.u_less_than(bool_, None, idx, list_cap)?;
+        let go = b.logical_and(bool_, None, set, room)?;
+        let (l_st, l_std) = (b.id(), b.id());
+        b.selection_merge(l_std, SelectionControl::NONE)?;
+        b.branch_conditional(go, l_st, l_std, [])?;
+        b.begin_block(Some(l_st))?;
+        let li = b.i_add(u32t, None, list_first, idx)?;
+        let pl = b.access_chain(p_u, None, marks, [c0, li])?;
+        let page = b.i_add(u32t, None, page0, ck)?;
+        b.store(pl, page, None, [])?;
+        b.branch(l_std)?;
+        b.begin_block(Some(l_std))?;
+    }
+    b.branch(l_anyd)?;
+    b.begin_block(Some(l_anyd))?;
+    b.branch(l_end)?;
+    b.begin_block(Some(l_end))?;
+    b.ret()?;
+    b.end_function()?;
+    b.entry_point(ExecutionModel::GLCompute, f, "main", [gid_v]);
+    b.execution_mode(f, ExecutionMode::LocalSize, [COMPACT_LOCAL_SIZE, 1, 1]);
+    Ok(b.module().assemble())
+}
+
 /// Counters of `mirror_scatter` (binding 1): pages written back, dwords,
 /// pages with marks but no guest page-table entry (their dwords are lost to
 /// guest memory), scatters that found the touched-page list past
-/// MARK_LIST_CAP.
-pub const SCATTER_COUNTERS: u32 = 4;
+/// MARK_LIST_CAP; then `mirror_scatter_census`'s dwords written back and
+/// those of them guest memory held already.
+pub const SCATTER_COUNTERS: u32 = 6;
 
 /// Workgroup size of `mirror_scatter`: invocation t copies dwords t, t +
 /// 256, t + 512 and t + 768 of its page, so that a subgroup's stores are
@@ -753,7 +878,30 @@ pub fn mirror_scatter_nostore() -> Vec<u32> {
     build_scatter(true, false).expect("mirror scatter kernel (no stores)")
 }
 
+/// `mirror_scatter_reset` that reads each marked dword's guest-memory value
+/// before storing it (across PCIe: diagnosis) and counts the dwords and
+/// those guest memory held already (counters 4 and 5): what a write-back
+/// of changed dwords alone would store.
+pub fn mirror_scatter_census() -> Vec<u32> {
+    build_scatter_ex(true, true, 1).expect("mirror scatter kernel (census)")
+}
+
+/// `mirror_scatter_census` storing only the dwords whose guest-memory value
+/// differs from the mirror's (exact: a store left out would have written
+/// the value guest memory held when it was read; a CPU write racing it
+/// lands as if after the GPU's).
+pub fn mirror_scatter_changed() -> Vec<u32> {
+    build_scatter_ex(true, true, 2).expect("mirror scatter kernel (changed dwords)")
+}
+
 fn build_scatter(reset: bool, stores: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
+    build_scatter_ex(reset, stores, 0)
+}
+
+/// `read`: 0 stores every marked dword; 1 reads its guest-memory value first
+/// and counts (counters 4 and 5); 2 as 1, storing only changed dwords.
+fn build_scatter_ex(reset: bool, stores: bool, read: u8) -> Result<Vec<u32>, rspirv::dr::Error> {
+    let census = read != 0;
     let lit = Operand::LiteralBit32;
     let mut b = Builder::new();
     b.set_version(1, 3);
@@ -812,9 +960,14 @@ fn build_scatter(reset: bool, stores: bool) -> Result<Vec<u32>, rspirv::dr::Erro
     // AcquireRelease | UniformMemory: the mask words read before any is cleared.
     let sem_wg = c(&mut b, 0x8 | 0x40);
     let sem_none = c0;
+    let p_fn = b.type_pointer(None, StorageClass::Function, u32t);
     let fty = b.type_function(void, []);
     let f = b.begin_function(void, None, FunctionControl::NONE, fty)?;
     b.begin_block(None)?;
+    // (`census`: this invocation's dwords written back and those guest
+    // memory held already.)
+    let n_var = b.variable(p_fn, None, StorageClass::Function, Some(c0));
+    let same_var = b.variable(p_fn, None, StorageClass::Function, Some(c0));
     let l = b.load(v3, None, lid_v, None, [])?;
     let lid = b.composite_extract(u32t, None, l, [0])?;
     let w = b.load(v3, None, wid_v, None, [])?;
@@ -921,9 +1074,51 @@ fn build_scatter(reset: bool, stores: bool) -> Result<Vec<u32>, rspirv::dr::Erro
         let v = b.load(u32t, None, sp, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
         let da = b.i_add(u64t, None, dest, d64)?;
         let dp = b.convert_u_to_ptr(p_dev, None, da)?;
-        b.store(dp, v, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+        let mut changed = None;
+        if census {
+            let old = b.load(u32t, None, dp, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+            let eq = b.i_equal(bool_, None, old, v)?;
+            let one_if = b.select(u32t, None, eq, c1, c0)?;
+            let s0 = b.load(u32t, None, same_var, None, [])?;
+            let s1 = b.i_add(u32t, None, s0, one_if)?;
+            b.store(same_var, s1, None, [])?;
+            let n0 = b.load(u32t, None, n_var, None, [])?;
+            let n1 = b.i_add(u32t, None, n0, c1)?;
+            b.store(n_var, n1, None, [])?;
+            if read == 2 {
+                changed = Some(b.logical_not(bool_, None, eq)?);
+            }
+        }
+        match changed {
+            Some(ch) => {
+                let (l_st, l_std) = (b.id(), b.id());
+                b.selection_merge(l_std, SelectionControl::NONE)?;
+                b.branch_conditional(ch, l_st, l_std, [])?;
+                b.begin_block(Some(l_st))?;
+                b.store(dp, v, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+                b.branch(l_std)?;
+                b.begin_block(Some(l_std))?;
+            }
+            None => b.store(dp, v, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?,
+        }
         b.branch(l_cpd)?;
         b.begin_block(Some(l_cpd))?;
+    }
+    if census {
+        let n = b.load(u32t, None, n_var, None, [])?;
+        let any = b.i_not_equal(bool_, None, n, c0)?;
+        let (l_cn, l_cnd) = (b.id(), b.id());
+        b.selection_merge(l_cnd, SelectionControl::NONE)?;
+        b.branch_conditional(any, l_cn, l_cnd, [])?;
+        b.begin_block(Some(l_cn))?;
+        let c4 = b.constant_bit32(u32t, 4);
+        let pn = b.access_chain(p_u, None, counters, [c0, c4])?;
+        b.atomic_i_add(u32t, None, pn, scope_dev, sem_none, n)?;
+        let same = b.load(u32t, None, same_var, None, [])?;
+        let pse = b.access_chain(p_u, None, counters, [c0, c5])?;
+        b.atomic_i_add(u32t, None, pse, scope_dev, sem_none, same)?;
+        b.branch(l_cnd)?;
+        b.begin_block(Some(l_cnd))?;
     }
     // Invocation 0 counts the page's marked dwords (before they are cleared).
     let (l_cnt, l_cntd) = (b.id(), b.id());
@@ -1226,6 +1421,28 @@ mod tests {
         if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
             let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("mirror_scatter.spv"), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn compact_kernel_assembles() {
+        let w = super::mirror_compact();
+        assert_eq!(w[0], 0x0723_0203);
+        if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("mirror_compact.spv"), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn scatter_census_kernel_assembles() {
+        for (w, name) in [(super::mirror_scatter_census(), "mirror_scatter_census.spv"), (super::mirror_scatter_changed(), "mirror_scatter_changed.spv")] {
+            assert_eq!(w[0], 0x0723_0203);
+            assert_ne!(w, super::mirror_scatter_reset());
+            if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+                let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(std::path::Path::new(&dir).join(name), bytes).unwrap();
+            }
         }
     }
 

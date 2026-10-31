@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 227] = [
+    static ALL: [Tunable; 230] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -260,6 +260,9 @@ pub mod tune {
         Tunable { name: "import_keep", env: "DS_IMPORT_KEEP", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "import_defer", env: "DS_IMPORT_DEFER", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "import_grow", env: "DS_IMPORT_GROW", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "mark_touch", env: "DS_MARK_TOUCH", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe2_scatter_read", env: "DS_FE2_SCATTER_READ", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "touch_bits", env: "DS_TOUCH_BITS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2251,7 +2254,8 @@ pub mod tune {
 
     /// Timing only (wrong results): front end 2's write-back stores nothing
     /// into guest memory (its marks cleared as before): the upper bound of
-    /// a lazy write-back (stage F5). Read when the kernel is made.
+    /// a lazy write-back (stage F5). Read at each write-back (live, with
+    /// `fe2_scatter_reset`; replays only).
     pub fn fe2_scatter_nostore() -> bool {
         get(205) != 0
     }
@@ -2481,6 +2485,35 @@ pub mod tune {
     /// `import_keep`: measured no gain, FINDINGS.md 2026-10-30 night).
     pub fn import_grow() -> bool {
         get(226) != 0
+    }
+
+    /// Timing only at 0 (GPU writes then never reach guest memory; replays
+    /// only, as `write_marks 0`): translations mark their stores' dwords
+    /// but leave out the touched-page list (`Spec::marks_untouched`), so
+    /// write-backs find nothing to write: with `write_marks 0` and
+    /// `fe2_scatter_nostore` it splits what the marks cost (diagnosis,
+    /// 2026-10-31). Read when a stage is prepared.
+    pub fn mark_touch() -> bool {
+        get(227) != 0
+    }
+
+    /// Front end 2's write-back reads each marked dword's guest-memory value
+    /// before storing it (across PCIe) and counts those guest memory held
+    /// already (status line `front end 2's write-back census`): 1 stores
+    /// every marked dword (`rdna::kernels::mirror_scatter_census`,
+    /// diagnosis), 2 only those that differ (`mirror_scatter_changed`). Read
+    /// at each write-back (with `fe2_scatter_reset`).
+    pub fn fe2_scatter_read() -> u64 {
+        get(228)
+    }
+
+    /// Front end 2: translations set their stores' pages' touched bits
+    /// without reading them back and enter nothing in the touched-page
+    /// list (`Spec::touch_bits`); each write-back makes the list from the
+    /// bits of its executor's written ranges first (`kernels::mirror_compact`,
+    /// from the first such translation on). Read when a stage is prepared.
+    pub fn touch_bits() -> bool {
+        get(229) != 0
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

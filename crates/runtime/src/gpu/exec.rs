@@ -1448,6 +1448,102 @@ fn replace_one(r: &Replace, buffer: vk::Buffer) {
 
 /// Status part: imports kept over remaps and their replacements, imports
 /// asked ahead and the copies by the CPU meanwhile.
+/// `DS_WB_CENSUS=1` (diagnosis): front end 2's written bindings by the
+/// program binding them (`images::BINDING_SHADER`; 0: none named, e.g.
+/// indirect arguments): [bindings, bound bytes (page-rounded)], what the
+/// write-backs carry at most (FINDINGS.md 2026-10-31: ~44 MB a flip).
+static WB_CENSUS: Mutex<Option<HashMap<u64, [u64; 2]>>> = Mutex::new(None);
+
+/// `DS_WB_CENSUS=1`: the same by the guest mapping holding the binding's
+/// start: (start, size, name) -> [bindings, bound bytes].
+static WB_CENSUS_MAPS: Mutex<Option<HashMap<(u64, u64, String), [u64; 2]>>> = Mutex::new(None);
+
+fn wb_census() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_WB_CENSUS").ok().as_deref() == Some("1"))
+}
+
+fn note_written_binding(base: u64, bytes: u64) {
+    let addr = super::images::BINDING_SHADER.with(|s| s.get());
+    {
+        let mut g = WB_CENSUS.lock();
+        let e = g.get_or_insert_with(HashMap::new).entry(addr).or_default();
+        e[0] += 1;
+        e[1] += bytes;
+    }
+    let key = crate::mem::vma_label(base).unwrap_or((0, 0, String::new()));
+    let mut g = WB_CENSUS_MAPS.lock();
+    let e = g.get_or_insert_with(HashMap::new).entry(key).or_default();
+    e[0] += 1;
+    e[1] += bytes;
+}
+
+/// Status part: the census's 24 programs with the most bound bytes ("" when
+/// off).
+fn wb_census_line() -> String {
+    if !wb_census() {
+        return String::new();
+    }
+    let g = WB_CENSUS.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(u64, [u64; 2])> = m.iter().map(|(&a, &c)| (a, c)).collect();
+    v.sort_by_key(|&(_, c)| std::cmp::Reverse(c[1]));
+    let total: u64 = v.iter().map(|(_, c)| c[1]).sum();
+    let top: Vec<String> = v.iter().take(24).map(|(a, c)| format!("{a:#x} {} ({} MiB)", c[0], c[1] >> 20)).collect();
+    let maps = {
+        let g = WB_CENSUS_MAPS.lock();
+        let mut m: Vec<((u64, u64, String), [u64; 2])> = g.as_ref().map(|m| m.iter().map(|(k, c)| (k.clone(), *c)).collect()).unwrap_or_default();
+        m.sort_by_key(|(_, c)| std::cmp::Reverse(c[1]));
+        m.iter().take(16).map(|((s, n, name), c)| format!("{s:#x}+{n:#x} '{name}' {} ({} MiB)", c[0], c[1] >> 20)).collect::<Vec<_>>()
+    };
+    format!("    written bindings by program (`DS_WB_CENSUS`): {} programs, {} MiB bound in all; {}\n    written bindings by mapping (`DS_WB_CENSUS`): {}; left unmarked (`DS_FE2_LAZY`): {}\n", v.len(), total >> 20, top.join(", "), maps.join(", "), LAZY_SKIPS.load(Ordering::Relaxed))
+}
+
+/// `DS_FE2_LAZY=<name>:<hex size>,...` (diagnosis, wrong results where the
+/// CPU reads them): written bindings inside a guest mapping of that name
+/// and size get no write marks, so their GPU writes stay in the mirror and
+/// never reach guest memory (what leaving them to a lazy write-back would
+/// spare; FINDINGS.md 2026-10-31). Rules from the census by mapping
+/// (`DS_WB_CENSUS`).
+fn lazy_rules() -> &'static [(String, u64)] {
+    static RULES: std::sync::OnceLock<Vec<(String, u64)>> = std::sync::OnceLock::new();
+    RULES.get_or_init(|| {
+        let Ok(v) = std::env::var("DS_FE2_LAZY") else { return Vec::new() };
+        let rules: Vec<(String, u64)> = v
+            .split(',')
+            .filter_map(|r| {
+                let (n, s) = r.rsplit_once(':')?;
+                Some((n.to_string(), u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()?))
+            })
+            .collect();
+        crate::warn!("gpu: front end 2 leaves GPU writes into mappings {rules:?} in the mirror (`DS_FE2_LAZY`, diagnosis: guest memory never gets them)");
+        rules
+    })
+}
+
+static LAZY_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// Mappings looked up for `lazy_rules`: (start, end) -> matches.
+    static LAZY_SEEN: std::cell::RefCell<HashMap<(u64, u64), bool>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Whether a written binding at `base` is left unmarked (`lazy_rules`).
+fn lazy_binding(base: u64) -> bool {
+    let rules = lazy_rules();
+    if rules.is_empty() {
+        return false;
+    }
+    let Some(b) = crate::mem::vma_bounds(base) else { return false };
+    let hit = LAZY_SEEN.with(|c| {
+        *c.borrow_mut().entry(b).or_insert_with(|| crate::mem::vma_label(base).is_some_and(|(_, size, name)| rules.iter().any(|(n, s)| *n == name && *s == size)))
+    });
+    if hit {
+        LAZY_SKIPS.fetch_add(1, Ordering::Relaxed);
+    }
+    hit
+}
+
 fn kept_imports_line() -> String {
     let v: Vec<u64> = REPLACE_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let d: Vec<u64> = DEFER_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
@@ -2238,7 +2334,7 @@ fn spec_diff(a: &rdna::translate::Spec, b: &rdna::translate::Spec) -> String {
             })*
         };
     }
-    fields!(stage, user_sgprs, user_base, wave64, ps_input_addr, ps_inputs, barycentric, mrt, cs_local_size, cs_rsrc2, binding_base, probe, dump, force_dispatcher, dispatcher_for_loops, reg_vars, lane_guards, mip_views, lod_stats, early_tests, early_ok, per_lane, lane_votes, base_instance_sgpr, sgpr_pc, addresses, batched, write_marks, sgpr_ubo);
+    fields!(stage, user_sgprs, user_base, wave64, ps_input_addr, ps_inputs, barycentric, mrt, cs_local_size, cs_rsrc2, binding_base, probe, dump, force_dispatcher, dispatcher_for_loops, reg_vars, lane_guards, mip_views, lod_stats, early_tests, early_ok, per_lane, lane_votes, base_instance_sgpr, sgpr_pc, addresses, batched, write_marks, marks_untouched, sgpr_ubo);
     if a.resources.len() != b.resources.len() {
         d.push(format!("resources {:?} -> {:?}", a.resources, b.resources));
     } else {
@@ -7497,6 +7593,10 @@ pub struct Exec {
     /// batch's work (`fe2_mine`), not the mirror's after it.
     fe2_copied: Vec<(u64, u64)>,
     fe2_marked: bool,
+    /// The guest range its written bindings span since its last write-back
+    /// (`fe2::record_scatter`, `tune touch_bits`): start, end (start above
+    /// end: none).
+    fe2_written: (u64, u64),
     /// Guest-memory copies of GPU-performed CP writes left for the batch's
     /// close, in order (`tune fe2_cpw_defer`): import, offset, bytes.
     fe2_host_later: Vec<(vk::Buffer, u64, Vec<u8>, u64)>,
@@ -8414,6 +8514,7 @@ impl Exec {
                 fe2_mine: Default::default(),
                 fe2_copied: Vec::new(),
                 fe2_marked: false,
+                fe2_written: (u64::MAX, 0),
                 fe2_host_later: Vec::new(),
                 fe2_gens: Vec::new(),
                 fe2_pend: Vec::new(),
@@ -9801,6 +9902,10 @@ impl Exec {
                 self.report_error("front end 2: a written range cannot be imported (its GPU writes do not reach guest memory)", || format!("{lo:#x}..{hi:#x}"));
             }
             self.fe2_marked = true;
+            self.fe2_written = (self.fe2_written.0.min(lo), self.fe2_written.1.max(hi));
+            if wb_census() {
+                note_written_binding(base, hi - lo);
+            }
         }
         let t2 = tsc();
         // (Read before any take: what its pages are stamped with.)
@@ -10211,7 +10316,8 @@ impl Exec {
             self.barrier();
         }
         let cmd = self.cmd();
-        let recorded = if let Some(pipe) = super::fe2::record_scatter(cmd) {
+        let written = std::mem::replace(&mut self.fe2_written, (u64::MAX, 0));
+        let recorded = if let Some(pipe) = super::fe2::record_scatter(cmd, Some(written)) {
             // The next dispatch binds its own pipeline and descriptors.
             self.dyncache.cs_pipeline = pipe;
             true
@@ -14240,7 +14346,7 @@ impl Exec {
                         // map (its stores mark the dwords they write), or none.
                         if has_marks {
                             let ai = addr_at + (rdna::translate::ADDR_HEADER_DWORDS + rdna::translate::ADDR_INFO_DWORDS * i as u32) as usize;
-                            p.sgpr_data[ai + 3] = if placement == Placement::Mirrored && found.tr.plan.resources[i].written { (info.offset / 128) as u32 } else { u32::MAX };
+                            p.sgpr_data[ai + 3] = if placement == Placement::Mirrored && found.tr.plan.resources[i].written && !lazy_binding(base) { (info.offset / 128) as u32 } else { u32::MAX };
                         }
                         if matches!(b.kind, BindingKind::Address(_)) {
                             // The descriptor's range as an address and size.
@@ -15849,6 +15955,7 @@ pub fn status() -> String {
         )
         + &remaps_over_imports_line()
         + &kept_imports_line()
+        + &wb_census_line()
         + &audit_line()
         + &{
             let v: Vec<u64> = F5_CENSUS.iter().map(|c| c.load(Ordering::Relaxed)).collect();

@@ -1395,6 +1395,9 @@ fn mark_dwords(tr: &mut T, r: usize, d0: Word, n: u32) -> R<()> {
 /// range gather takes the rest).
 fn touch_page(tr: &mut T, marks: Word, w: Word) -> R<()> {
     use crate::kernels::{MARK_LIST_AT, MARK_LIST_CAP, MARK_PAGE_BITS_AT};
+    if tr.spec.marks_untouched {
+        return Ok(());
+    }
     let (u, b) = (tr.t.u32, tr.t.bool_);
     let (five, k31, one, z) = (tr.u(5), tr.u(31), tr.u(1), tr.u(0));
     let page = e(tr.b.shift_right_logical(u, None, w, five))?;
@@ -1407,6 +1410,11 @@ fn touch_page(tr: &mut T, marks: Word, w: Word) -> R<()> {
     let sem = tr.u(0);
     let pp = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, pw]))?;
     let old = e(tr.b.atomic_or(u, None, pp, scope, sem, pb))?;
+    if tr.spec.touch_bits {
+        // (The bit alone: the write-back lists the page, `mirror_compact`.)
+        let _ = (old, b, MARK_LIST_AT, MARK_LIST_CAP);
+        return Ok(());
+    }
     let had = e(tr.b.bitwise_and(u, None, old, pb))?;
     let first = e(tr.b.i_equal(b, None, had, z))?;
     tr.guarded(first, &mut |tr| {
