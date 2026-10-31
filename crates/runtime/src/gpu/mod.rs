@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 238] = [
+    static ALL: [Tunable; 239] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -271,6 +271,7 @@ pub mod tune {
         Tunable { name: "wb_probe", env: "DS_WB_PROBE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "wb_region", env: "DS_WB_REGION", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "wb_stream", env: "DS_WB_STREAM", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "wb_probe_site", env: "DS_WB_PROBE_SITE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2602,6 +2603,13 @@ pub mod tune {
     /// batches write back within themselves. Read at each batch's begin.
     pub fn wb_stream() -> u64 {
         get(237)
+    }
+
+    /// Where `wb_probe` adds its work (diagnosis, live): 0 after every
+    /// write-back, 1 only after those at batch closes, 2 only after those
+    /// before CP writes the GPU performs (whose labels wait for them).
+    pub fn wb_probe_site() -> u64 {
+        get(238)
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

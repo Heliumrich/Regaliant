@@ -9417,7 +9417,7 @@ impl Exec {
             if self.pending_promises.is_empty() && self.actions.is_empty() {
                 SCATTER_SITES[2].fetch_add(1, Ordering::Relaxed);
             }
-            self.fe2_scatter();
+            self.fe2_scatter(1);
         }
         // The guest-memory copies of CP writes left for the close (`tune
         // fe2_cpw_defer`): after the write-back and the timestamps, in order.
@@ -10660,7 +10660,7 @@ impl Exec {
     /// Front end 2's write-back, recorded now (outside a render pass): the
     /// dwords GPU work marked go from the mirror to guest memory. Whether
     /// it was recorded (with its barriers).
-    fn fe2_scatter(&mut self) -> bool {
+    fn fe2_scatter(&mut self, site: u8) -> bool {
         // (`DS_PROFILE_GPU_STAMPS=seg`: a segment of its own, `front end 2
         // write-backs`; its own barriers write no segment stamps, and its
         // time went to the commands before it.)
@@ -10678,6 +10678,7 @@ impl Exec {
         if handed.is_some() {
             self.wb_scatter = true;
         }
+        super::fe2::set_probe_site(site);
         let recorded = if let Some(pipe) = handed.or_else(|| super::fe2::record_scatter(cmd, Some(written))) {
             // The next dispatch binds its own pipeline and descriptors.
             self.dyncache.cs_pipeline = pipe;
@@ -12753,7 +12754,7 @@ impl Exec {
                 SCATTER_SITES[4].fetch_add(1, Ordering::Relaxed);
             } else if !host_later {
                 SCATTER_SITES[0].fetch_add(1, Ordering::Relaxed);
-                after_scatter = self.fe2_scatter();
+                after_scatter = self.fe2_scatter(2);
             }
         }
         let cmd = self.cmd();

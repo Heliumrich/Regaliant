@@ -2977,7 +2977,13 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
         // of its own; only added order and GPU time, no work removed.)
         let probe = super::tune::wb_probe();
         let ballast = if probe >= 100 { ballast() } else { None };
-        if probe != 0 && s.reset && (probe < 100 || ballast.is_some()) {
+        // (`tune wb_probe_site`: only at batch closes, or only before CP
+        // writes the GPU performs.)
+        let site_ok = match super::tune::wb_probe_site() {
+            0 => true,
+            w => PROBE_SITE.with(|x| x.get()) as u64 == w,
+        };
+        if probe != 0 && s.reset && site_ok && (probe < 100 || ballast.is_some()) {
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT, vk::DependencyFlags::empty(), &[all], &[], &[]);
             if probe == 1 {
                 c.device.cmd_dispatch_indirect(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4);
@@ -3100,6 +3106,17 @@ unsafe fn record_compact(s: &Scatter, cmd: vk::CommandBuffer, written: Option<(u
     }
     COMPACTS[0].fetch_add(1, Ordering::Relaxed);
     COMPACTS[1].fetch_add(w1 - w0, Ordering::Relaxed);
+}
+
+thread_local! {
+    /// Where the write-back being recorded stands (`tune wb_probe_site`): 1 a
+    /// batch's close, 2 before a CP write the GPU performs, 0 elsewhere.
+    static PROBE_SITE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// The site of the write-back this thread records next (`PROBE_SITE`).
+pub fn set_probe_site(site: u8) {
+    PROBE_SITE.with(|x| x.set(site));
 }
 
 /// `tune wb_probe`'s ballast: `rdna::kernels::latency_test` storing into a
