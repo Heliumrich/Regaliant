@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 235] = [
+    static ALL: [Tunable; 236] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -268,6 +268,7 @@ pub mod tune {
         Tunable { name: "fe2_shared_ranges", env: "DS_FE2_SHARED_RANGES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "upload_predetile", env: "DS_UPLOAD_PREDETILE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "record_defer", env: "DS_RECORD_DEFER", default: 5, value: AtomicU64::new(UNSET) },
+        Tunable { name: "wb_probe", env: "DS_WB_PROBE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2567,6 +2568,17 @@ pub mod tune {
     /// FINDINGS.md).
     pub fn record_defer() -> u64 {
         get(234)
+    }
+
+    /// Diagnosis, work added after each front end 2 write-back and nothing
+    /// removed (`fe2::record_scatter`): 1 a second write-back of the list
+    /// the first left empty (its two barriers and an indirect dispatch of no
+    /// workgroups), 2 its two barriers alone, from 100 its barriers around a
+    /// ballast of that many steps of `rdna::kernels::latency_test` (one
+    /// workgroup, into a buffer of its own). Live: what serial GPU time at
+    /// the write-backs' places costs the frame.
+    pub fn wb_probe() -> u64 {
+        get(235)
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

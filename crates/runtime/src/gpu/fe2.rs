@@ -2821,6 +2821,9 @@ static TOUCH_BITS_EVER: AtomicBool = AtomicBool::new(false);
 /// words of touched bits scanned].
 static COMPACTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Write-backs followed by `tune wb_probe`'s added barriers.
+static PROBES: AtomicU64 = AtomicU64::new(0);
+
 pub fn note_touch_bits() {
     if !TOUCH_BITS_EVER.load(Ordering::Relaxed) {
         TOUCH_BITS_EVER.store(true, Ordering::Relaxed);
@@ -2927,9 +2930,82 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
             let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_READ);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[after], &[], &[]);
         }
+        // (`tune wb_probe`, diagnosis: the same barriers again, with an
+        // indirect dispatch of the list the kernel just emptied between them
+        // at 1 (no workgroups run), or from 100 one workgroup of a ballast
+        // kernel running that many steps of a dependent chain into a buffer
+        // of its own; only added order and GPU time, no work removed.)
+        let probe = super::tune::wb_probe();
+        let ballast = if probe >= 100 { ballast() } else { None };
+        if probe != 0 && s.reset && (probe < 100 || ballast.is_some()) {
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT, vk::DependencyFlags::empty(), &[all], &[], &[]);
+            if probe == 1 {
+                c.device.cmd_dispatch_indirect(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4);
+            } else if let Some(b) = ballast {
+                c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, b.pipeline);
+                c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, b.layout, 0, &[b.set], &[]);
+                let pcs: Vec<u8> = [probe.min(u32::MAX as u64) as u32, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
+                c.device.cmd_push_constants(cmd, b.layout, vk::ShaderStageFlags::COMPUTE, 0, &pcs);
+                c.device.cmd_dispatch(cmd, 1, 1, 1);
+            }
+            let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[after], &[], &[]);
+            PROBES.fetch_add(1, Ordering::Relaxed);
+            if let Some(b) = ballast {
+                note_scatter();
+                return Some(b.pipeline);
+            }
+        }
     }
     note_scatter();
     Some(pipeline)
+}
+
+/// `tune wb_probe`'s ballast: `rdna::kernels::latency_test` storing into a
+/// buffer of its own (one workgroup's dwords), made at first use.
+struct Ballast {
+    pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+    set: vk::DescriptorSet,
+}
+
+fn ballast() -> Option<&'static Ballast> {
+    static B: std::sync::OnceLock<Option<Ballast>> = std::sync::OnceLock::new();
+    B.get_or_init(|| {
+        let r = (|| -> Result<Ballast, String> {
+            let c = ctx();
+            let d = &c.device;
+            let (buf, _mem) = c.device_buffer(4 * rdna::kernels::LATENCY_LOCAL_SIZE as u64, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            unsafe {
+                let binding = [vk::DescriptorSetLayoutBinding::default().binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE)];
+                let set_layout = d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&binding), None).map_err(|e| format!("set layout: {e}"))?;
+                let range = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(8)];
+                let layout = d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]).push_constant_ranges(&range), None).map_err(|e| format!("layout: {e}"))?;
+                let code = rdna::kernels::latency_test(0xba11);
+                let module = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("module: {e}"))?;
+                let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+                let pipeline = d.create_compute_pipelines(vk::PipelineCache::null(), &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)], None).map_err(|(_, e)| format!("pipeline: {e}"))?[0];
+                d.destroy_shader_module(module, None);
+                let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 1 }];
+                let pool = d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).map_err(|e| format!("pool: {e}"))?;
+                let set = d.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[set_layout])).map_err(|e| format!("set: {e}"))?[0];
+                let bi = [vk::DescriptorBufferInfo::default().buffer(buf).offset(0).range(vk::WHOLE_SIZE)];
+                d.update_descriptor_sets(&[vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&bi)], &[]);
+                Ok(Ballast { pipeline, layout, set })
+            }
+        })();
+        match r {
+            Ok(b) => {
+                crate::info!("fe2: `tune wb_probe`'s ballast kernel made");
+                Some(b)
+            }
+            Err(e) => {
+                crate::warn!("fe2: `tune wb_probe`'s ballast kernel: {e}");
+                None
+            }
+        }
+    })
+    .as_ref()
 }
 
 /// Records a copy of the write-back's video-memory counters into the
@@ -3764,6 +3840,7 @@ pub fn status() -> String {
     let w: Vec<u64> = WB64.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let (cn, cs) = (w[2], w[3]);
     let compacts = if COMPACTS[0].load(Ordering::Relaxed) > 0 { format!("    front end 2's touched-page lists made from touched bits (`tune touch_bits`): {} write-backs, {} words of bits scanned\n", COMPACTS[0].load(Ordering::Relaxed), COMPACTS[1].load(Ordering::Relaxed)) } else { String::new() };
+    let probes = if PROBES.load(Ordering::Relaxed) > 0 { format!("    front end 2's write-backs followed by `tune wb_probe`'s barriers: {}\n", PROBES.load(Ordering::Relaxed)) } else { String::new() };
     let census = if cn > 0 { format!("    front end 2's write-back census (`tune fe2_scatter_read`): {cn} dwords marked, {cs} of them ({:.1}%) held by guest memory already; in pages draws read indices from (`DS_INDEX_CENSUS`): {} dwords ({:.1}%), {} pages\n", 100.0 * cs as f64 / cn as f64, w[4], 100.0 * w[4] as f64 / cn as f64, w[5]) } else { String::new() };
     format!(
         "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages; runs a take of their epoch had looked at, without another: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed; {} view pages armed at the residency's takes adopted), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action; CP writes with work to write back {} of labels a CP of ours waits on, {} left to the batch's close, {} with their guest-memory copy at the close); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value, {} again with the label's page unwritten and {} gone past ended none); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
@@ -3848,6 +3925,7 @@ pub fn status() -> String {
         + &callers_line()
         + &census
         + &compacts
+        + &probes
         + &index_census_line()
         + &lazy2_line(&w)
         + &wb_pages_line()
