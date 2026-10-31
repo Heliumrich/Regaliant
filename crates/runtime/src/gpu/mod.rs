@@ -264,7 +264,7 @@ pub mod tune {
         Tunable { name: "fe2_scatter_read", env: "DS_FE2_SCATTER_READ", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "touch_bits", env: "DS_TOUCH_BITS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "wb_image", env: "DS_WB_IMAGE_TUNE", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "upload_batch", env: "DS_UPLOAD_BATCH", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "upload_batch", env: "DS_UPLOAD_BATCH", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2532,7 +2532,9 @@ pub mod tune {
     /// the main queue are recorded into one command buffer they share,
     /// submitted ahead of the next batch (`images::flush_uploads`) and not
     /// waited for (`images`; their staging freed once it completes). Read
-    /// at each upload.
+    /// at each upload. Default 1 since 2026-10-31 (the 1-1 walk's arrivals
+    /// 24% less hitch time, level loads' hitches lower, content drawn
+    /// sooner; FINDINGS.md); 0 waits for each transfer as before.
     pub fn upload_batch() -> bool {
         get(231) != 0
     }
