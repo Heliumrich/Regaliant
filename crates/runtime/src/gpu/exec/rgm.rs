@@ -319,7 +319,7 @@ impl Exec {
                     }
                 };
                 let writes = [vk::WriteDescriptorSet::default().dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&info)];
-                c.push_desc.cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
+                c.push_descriptors(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
                 let pc: Vec<u8> = [0u32, chunk.len() as u32, r.w_addr as u32, (r.w_addr >> 32) as u32, r.r_addr as u32, (r.r_addr >> 32) as u32].iter().flat_map(|x| x.to_le_bytes()).collect();
                 c.device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
                 c.device.cmd_dispatch(cmd, wg.max(1), 1, 1);

@@ -98,7 +98,7 @@ fn bench() -> Result<(), String> {
                     }
                     if push {
                         let w = [vk::WriteDescriptorSet::default().dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&bi)];
-                        c.push_desc.cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::COMPUTE, playout, 0, &w);
+                        c.push_descriptors(cmd, vk::PipelineBindPoint::COMPUTE, playout, 0, &w);
                     }
                     let pcs = [iters, (k as u32) * local * groups];
                     let bytes: Vec<u8> = pcs.iter().flat_map(|x| x.to_le_bytes()).collect();

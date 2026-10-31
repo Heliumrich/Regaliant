@@ -2842,7 +2842,7 @@ pub fn record_bench(capture: &str, shader: Option<u64>) -> i32 {
                 let all: Vec<vk::DescriptorBufferInfo> = (0..n as u32).map(info).collect();
                 if variant != "set bound" {
                     let w: Vec<vk::WriteDescriptorSet> = out.bindings.iter().zip(&all).map(|(b, i)| vk::WriteDescriptorSet::default().dst_binding(b.binding).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(i))).collect();
-                    c.push_desc.cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::COMPUTE, p.layout, 0, &w);
+                    c.push_descriptors(cmd, vk::PipelineBindPoint::COMPUTE, p.layout, 0, &w);
                 }
                 let k = match variant {
                     "all pushed" => n,
@@ -2860,7 +2860,7 @@ pub fn record_bench(capture: &str, shader: Option<u64>) -> i32 {
                                 buf[j].write(vk::WriteDescriptorSet::default().dst_binding(b.binding).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(&vals[j])));
                             }
                             let w = std::slice::from_raw_parts(buf.as_ptr() as *const vk::WriteDescriptorSet, k.min(32));
-                            c.push_desc.cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::COMPUTE, p.layout, 0, w);
+                            c.push_descriptors(cmd, vk::PipelineBindPoint::COMPUTE, p.layout, 0, w);
                         }
                         _ => {}
                     }
@@ -3072,7 +3072,7 @@ fn bind_descriptors(cmd: vk::CommandBuffer, at: vk::PipelineBindPoint, layout: v
             }
             if n > STACK_WRITES {
                 let writes = descriptor_writes(vk::DescriptorSet::null(), bounds);
-                unsafe { c.push_desc.cmd_push_descriptor_set(cmd, at, layout, 0, &writes) };
+                unsafe { c.push_descriptors(cmd, at, layout, 0, &writes) };
                 state.layout = vk::PipelineLayout::null();
                 state.descs.clear();
                 note_push(false, n, 0);
@@ -3118,7 +3118,7 @@ fn bind_descriptors(cmd: vk::CommandBuffer, at: vk::PipelineBindPoint, layout: v
             }
             // The first k entries are initialized.
             let writes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const vk::WriteDescriptorSet, k) };
-            unsafe { c.push_desc.cmd_push_descriptor_set(cmd, at, layout, 0, writes) };
+            unsafe { c.push_descriptors(cmd, at, layout, 0, writes) };
         }
     }
 }
@@ -3245,6 +3245,11 @@ fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::Comma
     // sequence (the completion thread waits for that value).
     let tl = [(c.batches, seq)];
     let signals: &[(vk::Semaphore, u64)] = if alt { &[] } else { &tl };
+    // The slot's fence only on the second queue, whose batches the timeline
+    // leaves out: the completion thread resets it once the timeline passed
+    // the batch, which need not order after the fence's own signal (the
+    // validation layer reported resets of fences still in use).
+    let fence = if alt { fence } else { vk::Fence::null() };
     match (&c.copy, wait) {
         (Some(q), w) if w > 0 => c.submit_timeline_on(false, alt, cmds, &[(q.copied, w, vk::PipelineStageFlags2::ALL_COMMANDS)], signals, fence),
         _ => c.submit_timeline_on(false, alt, cmds, &[], signals, fence),
@@ -3313,7 +3318,8 @@ fn submit_specs(specs: Vec<(u64, SubmitSpec)>) {
         let list: Vec<(&[vk::CommandBuffer], u64, u64)> = specs[i..j].iter().zip(&cmds).map(|((seq, s), c)| (c.as_slice(), s.wait, *seq)).collect();
         COALESCED[0].fetch_add(1, Ordering::Relaxed);
         COALESCED[1].fetch_add((j - i) as u64, Ordering::Relaxed);
-        if let Err(e) = c.submit_batches(&list, specs[j - 1].1.fence) {
+        // (No fence: these signal the batch timeline, `submit_batch`.)
+        if let Err(e) = c.submit_batches(&list, vk::Fence::null()) {
             fail(e, &specs[i].1.name);
             return;
         }
@@ -7811,6 +7817,10 @@ pub struct Exec {
     /// would need that stops the chunk (`stopped`) before the command
     /// records its own work.
     deferred: bool,
+    /// The open batch's command buffers are claimed (`vk::defer`): its
+    /// commands go to lists the submission thread replays into them just
+    /// before submitting it (`tune record_defer`).
+    batch_lists: bool,
     /// The frame-ahead recorder's executor (`gpu::frameahead`, `set_held`):
     /// a deferred one whose closed batches keep their label writes (its
     /// later waits pass on them) and which stops before anything the
@@ -8643,6 +8653,7 @@ impl Exec {
                 sync_readers: [0; 2],
                 sync_culprit: None,
                 deferred: false,
+                batch_lists: false,
                 held: false,
                 past: false,
                 held_promises: Vec::new(),
@@ -8964,9 +8975,10 @@ impl Exec {
                 }
             }
             if !reset_done {
-                if done_seq() < slot.seq {
+                if done_seq() < slot.seq && !c.wait_batch(slot.seq, 2_000_000_000) {
                     // Shutdown released the wait: the command buffer may still
-                    // execute (resetting it would lose the device).
+                    // execute (resetting it would lose the device). (A batch of
+                    // the second queue signals its fence, not the timeline.)
                     unsafe { c.device.wait_for_fences(&[slot.fence], true, 2_000_000_000).ok() };
                 }
                 unsafe {
@@ -8989,6 +9001,12 @@ impl Exec {
             }
         }
         self.extra_used = 0;
+        // Deferred recording: this thread's commands for the batch's command
+        // buffers (from their begin on) go to lists until the batch closes.
+        self.batch_lists = !self.deferred && super::vk::defer::wanted(self.compute_cp);
+        if self.batch_lists {
+            super::vk::defer::claim([self.slots[self.cur].cmd, self.slots[self.cur].pre]);
+        }
         unsafe {
             ctx().device.begin_command_buffer(self.cmd(), &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
             let qp = self.slots[self.cur].queries;
@@ -9302,9 +9320,14 @@ impl Exec {
             super::fe2::generations(&self.fe2_up, &mut gens);
             self.fe2_gens = gens;
         }
+        let lists = std::mem::take(&mut self.batch_lists).then(super::vk::defer::release);
         let seq = push_batch(fence, self.slots[i].queries, bq, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, std::mem::take(&mut self.segs), reset, alt, move |seq| {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return None;
+            }
+            // Deferred recording: the driver records the batch now.
+            if let Some(l) = lists {
+                l.replay();
             }
             let (mut pre, mut xpre) = (pre, xpre);
             if finish {
@@ -9475,6 +9498,9 @@ impl Exec {
         self.snap_used = 0;
         self.snaps.clear();
         let _ = self.end_pre();
+        if std::mem::take(&mut self.batch_lists) {
+            super::vk::defer::abandon();
+        }
         self.own_checks.clear();
         self.xcopies.clear();
         self.copy_wait = 0;
@@ -13516,6 +13542,10 @@ impl Exec {
     /// collecting its chunks (`Cp::past_start`): held from here (its own
     /// slots; its batch before the run was submitted).
     pub fn past_begin(&mut self) {
+        // (A batch open here would be held: recorded through the driver.)
+        if std::mem::take(&mut self.batch_lists) {
+            super::vk::defer::flush();
+        }
         self.deferred = true;
         self.held = true;
         self.past = true;
@@ -16031,6 +16061,7 @@ pub fn status() -> String {
         + &super::precache::status()
         + &super::precompile::status()
         + &super::lockstat::status()
+        + &super::vk::defer::status()
         + &super::pcache::status()
         + &super::images::scrub_status()
         + &super::mirror::status()

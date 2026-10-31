@@ -68,7 +68,7 @@ fn record_sync(cmd: vk::CommandBuffer, k: &Kept, give: bool) -> Result<(), Strin
     let pc: Vec<u8> = [0u32, n, give as u32].iter().flat_map(|x| x.to_le_bytes()).collect();
     unsafe {
         c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, sp.pipeline);
-        c.push_desc.cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::COMPUTE, sp.layout, 0, &writes);
+        c.push_descriptors(cmd, vk::PipelineBindPoint::COMPUTE, sp.layout, 0, &writes);
         c.device.cmd_push_constants(cmd, sp.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
         c.device.cmd_dispatch(cmd, n.div_ceil(rdna::kernels::MERGE_LOCAL_SIZE).max(1), 1, 1);
     }

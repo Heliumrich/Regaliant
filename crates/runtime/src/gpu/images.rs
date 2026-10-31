@@ -2666,7 +2666,7 @@ impl Images {
                 vk::WriteDescriptorSet::default().dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&ti),
                 vk::WriteDescriptorSet::default().dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&li),
             ];
-            c.push_desc.cmd_push_descriptor_set(cmd, vk::PipelineBindPoint::COMPUTE, pipe.layout, 0, &w);
+            c.push_descriptors(cmd, vk::PipelineBindPoint::COMPUTE, pipe.layout, 0, &w);
             for (pc, gx, gy) in &dispatches {
                 c.device.cmd_push_constants(cmd, pipe.layout, vk::ShaderStageFlags::COMPUTE, 0, pc);
                 c.device.cmd_dispatch(cmd, *gx, *gy, 1);

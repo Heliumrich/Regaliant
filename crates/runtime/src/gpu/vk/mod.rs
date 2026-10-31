@@ -1,5 +1,6 @@
 //! Vulkan device context shared by the renderer and the presenter.
 
+pub mod defer;
 pub mod present;
 pub mod window;
 
@@ -161,9 +162,28 @@ pub fn init() -> Result<(), String> {
     r
 }
 
+/// The validation layer of a Vulkan SDK copied into the project
+/// (local-data/research/vulkan-sdk/<version>/Bin: the LunarG installer's
+/// `copy_only=1`, nothing registered with the system), the newest version.
+fn local_layer_dir() -> Option<std::path::PathBuf> {
+    let data = crate::run_dir()?.parent()?.parent()?.to_path_buf();
+    let mut dirs: Vec<_> = std::fs::read_dir(data.join("research").join("vulkan-sdk")).ok()?.flatten().map(|e| e.path().join("Bin")).filter(|p| p.join("VkLayer_khronos_validation.json").is_file()).collect();
+    dirs.sort();
+    dirs.pop()
+}
+
 fn init_inner() -> Result<(), String> {
     unsafe {
         init_stage(0);
+        // DS_VK_VALIDATION without a layer path of its own: the project's
+        // SDK copy (`local_layer_dir`), for the loader to find (set before it
+        // loads; this diagnosis only).
+        if std::env::var_os("DS_VK_VALIDATION").is_some() && std::env::var_os("VK_ADD_LAYER_PATH").is_none() {
+            if let Some(dir) = local_layer_dir() {
+                crate::info!("Vulkan validation layer from {}", dir.display());
+                std::env::set_var("VK_ADD_LAYER_PATH", &dir);
+            }
+        }
         let entry = ash::Entry::load().map_err(|e| format!("loading Vulkan: {e}"))?;
         init_stage(1);
         let app_name = c"dsport";
@@ -368,9 +388,13 @@ fn init_inner() -> Result<(), String> {
         }
         // Storage images bound one view per mip level are indexed per
         // invocation (image_store_mip / image_load_mip).
-        let storage_dyn = instance.get_physical_device_features(pdev).shader_storage_image_array_dynamic_indexing != 0;
+        let core = instance.get_physical_device_features(pdev);
+        let storage_dyn = core.shader_storage_image_array_dynamic_indexing != 0;
+        // Gathers with offsets declare ImageGatherExtended (the validation
+        // layer reported every such module without it).
         let features = vk::PhysicalDeviceFeatures::default()
             .shader_storage_image_array_dynamic_indexing(storage_dyn)
+            .shader_image_gather_extended(core.shader_image_gather_extended != 0)
             .draw_indirect_first_instance(first_instance)
             .robust_buffer_access(true)
             .geometry_shader(true)
@@ -444,6 +468,8 @@ fn init_inner() -> Result<(), String> {
         }
         init_stage(3);
         let device = instance.create_device(pdev, &dci, None).map_err(|e| format!("vkCreateDevice: {e}"))?;
+        // Its command functions go through deferred recording's (`defer`).
+        let device = defer::install(device);
         init_stage(4);
         crate::info!(
             "Vulkan robustness: robustBufferAccess, robustness2 {} (buffer {}, image {}, null descriptors {})",
@@ -555,6 +581,15 @@ fn init_inner() -> Result<(), String> {
 }
 
 impl Ctx {
+    /// vkCmdPushDescriptorSetKHR, into `cmd`'s list when this thread
+    /// claimed it (`defer`).
+    pub unsafe fn push_descriptors(&self, cmd: vk::CommandBuffer, bp: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: u32, writes: &[vk::WriteDescriptorSet]) {
+        if !defer::push_descriptors(cmd, bp, layout, set, writes) {
+            defer::direct(cmd);
+            unsafe { self.push_desc.cmd_push_descriptor_set(cmd, bp, layout, set, writes) }
+        }
+    }
+
     /// Each memory heap: size, flags and (VK_EXT_memory_budget) this
     /// process's usage against its budget, MiB.
     pub fn heap_report(&self) -> String {
@@ -638,6 +673,10 @@ pub fn labels_on() -> bool {
 /// Begins a named label range in `cmd` (DS_GPU_LABELS=1).
 pub fn label_begin(cmd: vk::CommandBuffer, name: &str) {
     if let Some(l) = try_ctx().and_then(|c| c.labels.as_ref()) {
+        if defer::label_begin(cmd, name) {
+            return;
+        }
+        defer::direct(cmd);
         let s = std::ffi::CString::new(name).unwrap_or_default();
         unsafe { l.cmd_begin_debug_utils_label(cmd, &vk::DebugUtilsLabelEXT::default().label_name(&s)) };
     }
@@ -646,6 +685,10 @@ pub fn label_begin(cmd: vk::CommandBuffer, name: &str) {
 /// Ends the innermost label range begun in `cmd`.
 pub fn label_end(cmd: vk::CommandBuffer) {
     if let Some(l) = try_ctx().and_then(|c| c.labels.as_ref()) {
+        if defer::label_end(cmd) {
+            return;
+        }
+        defer::direct(cmd);
         unsafe { l.cmd_end_debug_utils_label(cmd) };
     }
 }
@@ -660,7 +703,12 @@ pub fn checkpoints_on() -> bool {
 pub fn checkpoint(cmd: vk::CommandBuffer, kind: u64, value: u64) {
     if let Some(c) = try_ctx() {
         if let Some(cp) = &c.checkpoints {
-            unsafe { cp.cmd_set_checkpoint(cmd, ((kind << 56) | (value & ((1 << 56) - 1))) as *const std::ffi::c_void) };
+            let marker = (kind << 56) | (value & ((1 << 56) - 1));
+            if defer::checkpoint(cmd, marker) {
+                return;
+            }
+            defer::direct(cmd);
+            unsafe { cp.cmd_set_checkpoint(cmd, marker as *const std::ffi::c_void) };
         }
     }
 }

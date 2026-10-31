@@ -110,8 +110,10 @@ pub fn frames_window_clause(flips: u64) -> String {
     let d: Vec<u64> = (0..KINDS.len()).map(|i| now.0[i].saturating_sub(c0[i])).collect();
     let all: u64 = d.iter().sum();
     let cmds = now.1.saturating_sub(k0).max(1);
-    let main: Vec<String> = ["gfx", "acb", "par"].iter().map(|k| format!("{k} {:.1}", ms(d[KINDS.iter().position(|x| x == k).unwrap()]) / flips)).collect();
-    format!("; front-end CPU ms per flip: {} (all {:.1}; {:.2} us per command)", main.join(", "), ms(all) / flips, ms(all) * 1000.0 / cmds as f64)
+    let kind = |k: &str| ms(d[KINDS.iter().position(|x| *x == k).unwrap()]) / flips;
+    let main: Vec<String> = ["gfx", "acb", "par"].iter().map(|k| format!("{k} {:.1}", kind(k))).collect();
+    // (The submission thread replays deferred batches, `tune record_defer`.)
+    format!("; front-end CPU ms per flip: {} (all {:.1}; {:.2} us per command), submission {:.1}", main.join(", "), ms(all) / flips, ms(all) * 1000.0 / cmds as f64, kind("submit"))
 }
 
 /// Cycles at the frame window's start of each compute queue's command

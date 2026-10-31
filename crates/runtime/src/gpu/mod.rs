@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 234] = [
+    static ALL: [Tunable; 235] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -267,6 +267,7 @@ pub mod tune {
         Tunable { name: "upload_batch", env: "DS_UPLOAD_BATCH", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_shared_ranges", env: "DS_FE2_SHARED_RANGES", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "upload_predetile", env: "DS_UPLOAD_PREDETILE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "record_defer", env: "DS_RECORD_DEFER", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2554,6 +2555,16 @@ pub mod tune {
     /// under the lock only their copy is recorded). Live.
     pub fn upload_predetile() -> bool {
         get(233) != 0
+    }
+
+    /// Batches recorded into lists that the submission thread replays into
+    /// their command buffers just before submitting them (`vk::defer`): 1
+    /// the graphics command processor's, 2 the compute ones'. Read at each
+    /// batch's begin. Default 1 since 2026-10-31 (the graphics CP's CPU
+    /// -5.6% at the vista, its critical path -3.8%; 2 lost 1.2% in replays:
+    /// FINDINGS.md).
+    pub fn record_defer() -> u64 {
+        get(234)
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
