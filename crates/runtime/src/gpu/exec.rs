@@ -11688,6 +11688,12 @@ impl Exec {
         if by_cpu {
             self.cpu_dep_seq = self.cpu_dep_seq.max(seq);
         }
+        // (The timeline: what a schedule over several device queues would
+        // have to wait for, `tools/schedmodel.py`.)
+        if super::timeline::on() {
+            let t = super::timeline::mark();
+            super::timeline::end(&self.name, t, || format!("after #{seq}{}", if by_cpu { " (CPU)" } else { "" }));
+        }
     }
 
     /// Before the CP reads guest memory (shader inputs, uploads, indirect
