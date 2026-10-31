@@ -10275,8 +10275,8 @@ impl Exec {
                     }
                     self.pre_copies.push((buf, mbuf, vk::BufferCopy { src_offset: x - start, dst_offset: x - MIRROR_BASE, size: e - x }));
                     super::fe2::lazy2_upload(x, e);
-                    if super::fe2::image_on() {
-                        super::fe2::image_invalidations(x, e, &mut self.pre_copies);
+                    if super::fe2::image_upkeep() {
+                        super::fe2::image_refreshes(x, e, &mut self.pre_after);
                     }
                     match up.last_mut() {
                         Some(l) if l.1 == x => l.1 = e,
@@ -10291,8 +10291,8 @@ impl Exec {
                         return false;
                     }
                     super::fe2::note_memcpy(1);
-                    if super::fe2::image_on() {
-                        super::fe2::image_invalidations(x, x + PAGE, &mut self.pre_copies);
+                    if super::fe2::image_upkeep() {
+                        super::fe2::image_refreshes(x, x + PAGE, &mut self.pre_after);
                     }
                     if self.held {
                         // (Read now: checked when held work settles.)
@@ -11095,12 +11095,15 @@ impl Exec {
             if let (Some((m, _)), Ok(())) = (super::resident::mirror_buffer(), super::resident::back(base & !4095, (base + len).next_multiple_of(4096) - (base & !4095))) {
                 unsafe { ctx().device.cmd_fill_buffer(cmd, m, base - super::resident::MIRROR_BASE, len, v) };
             }
-            // (`DS_WB_IMAGE`: the filled pages' validity cleared.)
-            if super::fe2::image_on() {
-                let mut inv = Vec::new();
-                super::fe2::image_invalidations(base, base + len, &mut inv);
-                for (src, dst, region) in inv {
-                    unsafe { ctx().device.cmd_copy_buffer(cmd, src, dst, &[region]) };
+            // (`DS_WB_IMAGE`: the image filled too where it is backed.)
+            if super::fe2::image_upkeep() {
+                if let Some(img) = super::resident::image_buffer() {
+                    let mut runs = Vec::new();
+                    super::resident::image_backed_runs(base, base + len, &mut runs);
+                    for (x, y) in runs {
+                        unsafe { ctx().device.cmd_fill_buffer(cmd, img, x - super::resident::MIRROR_BASE, y - x, v) };
+                        super::fe2::IMAGE_WRITES[1].fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -12480,11 +12483,16 @@ impl Exec {
             self.barrier_wanted = false;
             self.dispatched = false;
         }
-        if super::fe2::image_on() && fe2_mirror.is_some() {
-            let mut inv = Vec::new();
-            super::fe2::image_invalidations(a, a + bytes, &mut inv);
-            for (src, dst, region) in inv {
-                unsafe { ctx().device.cmd_copy_buffer(cmd, src, dst, &[region]) };
+        // (`DS_WB_IMAGE`: the image written too where it is backed.)
+        if super::fe2::image_upkeep() && fe2_mirror.is_some() {
+            if let Some(img) = super::resident::image_buffer() {
+                let mut runs = Vec::new();
+                super::resident::image_backed_runs(a, a + bytes, &mut runs);
+                for (x, y) in runs {
+                    let off = (x - a) as usize;
+                    unsafe { ctx().device.cmd_update_buffer(cmd, img, x - super::resident::MIRROR_BASE, &raw[off..off + (y - x) as usize]) };
+                    super::fe2::IMAGE_WRITES[0].fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         self.note_write(a, bytes);

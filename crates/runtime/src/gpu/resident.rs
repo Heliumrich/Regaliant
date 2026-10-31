@@ -1446,20 +1446,12 @@ static MIRROR: std::sync::OnceLock<Mirror> = std::sync::OnceLock::new();
 /// work writes (`back_image`), and its video memory in pages.
 static IMAGE: std::sync::OnceLock<Mirror> = std::sync::OnceLock::new();
 static IMAGE_BACKED: AtomicU64 = AtomicU64::new(0);
-/// 64 KiB of zeros in video memory (copied over the image's validity bits).
-static ZEROS: std::sync::OnceLock<vk::Buffer> = std::sync::OnceLock::new();
 
-/// Makes the image buffer and the zeros (`fe2::init` with `DS_WB_IMAGE`).
+/// Makes the image buffer (`fe2::init` with `DS_WB_IMAGE`).
 pub fn make_image() -> Result<(), String> {
     if IMAGE.get().is_none() {
         let m = make_mirror()?;
         let _ = IMAGE.set(m);
-    }
-    if ZEROS.get().is_none() {
-        let c = ctx();
-        let (buf, _mem) = c.device_buffer(64 << 10, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)?;
-        one_off(|cmd| unsafe { c.device.cmd_fill_buffer(cmd, buf, 0, 64 << 10, 0) })?;
-        let _ = ZEROS.set(buf);
     }
     Ok(())
 }
@@ -1469,14 +1461,34 @@ pub fn image_buffer() -> Option<vk::Buffer> {
     IMAGE.get().map(|m| m.buf)
 }
 
-/// The 64 KiB of zeros (`make_image`).
-pub fn zeros() -> Option<vk::Buffer> {
-    ZEROS.get().copied()
-}
-
 /// Binds video memory to the image's pages over guest [base, base+len).
 pub fn back_image(base: u64, len: u64) -> Result<(), String> {
     back_in(IMAGE.get().ok_or("no image")?, base, len, &IMAGE_BACKED)
+}
+
+/// The runs of guest [a, b) whose image pages are backed (only those can be
+/// valid, so only those need keeping current).
+pub fn image_backed_runs(a: u64, b: u64, out: &mut Vec<(u64, u64)>) {
+    let Some(m) = IMAGE.get() else { return };
+    if b <= a || a < MIRROR_BASE || b > MIRROR_END {
+        return;
+    }
+    let backed = |p: u64| m.backed[(p / 64) as usize].load(Ordering::Acquire) & (1u64 << (p % 64)) != 0;
+    let (p0, p1) = ((a - MIRROR_BASE) / m.page, (b - 1 - MIRROR_BASE) / m.page);
+    let mut p = p0;
+    while p <= p1 {
+        if !backed(p) {
+            p += 1;
+            continue;
+        }
+        let q0 = p;
+        while p <= p1 && backed(p) {
+            p += 1;
+        }
+        let lo = (MIRROR_BASE + q0 * m.page).max(a);
+        let hi = (MIRROR_BASE + p * m.page).min(b);
+        out.push((lo, hi));
+    }
 }
 
 /// The image's video memory so far, in MiB.

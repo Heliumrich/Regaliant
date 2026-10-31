@@ -911,17 +911,20 @@ pub fn mirror_scatter_note() -> Vec<u32> {
     build_scatter_ex(true, true, 0, false, true, 0).expect("mirror scatter kernel (noting pages)")
 }
 
-/// `mirror_scatter_reset` storing only the marked dwords that differ from a
-/// video-memory image of guest memory (the runtime's `DS_WB_IMAGE`): the
-/// image is a second buffer over the mirror's span at device address
-/// `image` (push constants 4 and 5), valid for a page while its bit in the
-/// map's aux region is set. A valid page's marked dwords are compared with
-/// the image and only those that differ go to guest memory and the image;
-/// an invalid page's go to guest memory, then the whole page is copied from
-/// the mirror into the image and its bit set. Counters 6 and 7: dwords
-/// left out as unchanged, pages copied into the image. Guest memory holds
-/// what the image holds as long as every other writer of the page clears
-/// its bit (uploads into the mirror, CP writes, fills: the runtime).
+/// `mirror_scatter_reset` storing only the marked dwords of sectors (8
+/// dwords) that differ from a video-memory image of guest memory (the
+/// runtime's `DS_WB_IMAGE`): the image is a second buffer over the mirror's
+/// span at device address `image` (push constants 4 and 5), valid for a
+/// page while its bit in the map's aux region is set. A valid page's marked
+/// dwords are compared with the image, and the marked dwords of every
+/// sector holding one that differs go to guest memory and the image, those
+/// of the other sectors nowhere (whole sectors: stores into host memory
+/// keep their runs); an invalid page's go to guest memory, then the whole
+/// page is copied from the mirror into the image and its bit set. Counters
+/// 6 and 7: dwords left out as unchanged, pages copied into the image.
+/// Guest memory holds what the image holds as long as every other writer of
+/// the page keeps the image current (uploads into the mirror, CP writes,
+/// fills: the runtime).
 pub fn mirror_scatter_image() -> Vec<u32> {
     build_scatter_ex(true, true, 0, false, false, 1).expect("mirror scatter kernel (image)")
 }
@@ -1006,9 +1009,24 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool,
     let bits_at = c(&mut b, MARK_PAGE_BITS_AT);
     let scope_dev = c(&mut b, 1);
     let scope_wg = c(&mut b, 2);
-    // AcquireRelease | UniformMemory: the mask words read before any is cleared.
-    let sem_wg = c(&mut b, 0x8 | 0x40);
+    // AcquireRelease | UniformMemory: the mask words read before any is cleared
+    // (`image`: | WorkgroupMemory, the sums below added before they are read).
+    let sem_wg = c(&mut b, 0x8 | 0x40 | if image != 0 { 0x100 } else { 0 });
     let sem_none = c0;
+    // (`image`: the workgroup's dwords left out and, checked, those that
+    // differ in guest memory, summed in workgroup memory and added to the
+    // counters once a page: an atomic a page instead of one an invocation;
+    // and the page's 128 sectors of 8 dwords holding a dword that differs
+    // from the image, a bit each.)
+    let wg_sums = if image != 0 {
+        let p_wg = b.type_pointer(None, StorageClass::Workgroup, u32t);
+        let n4 = c(&mut b, 4);
+        let arr = b.type_array(u32t, n4);
+        let p_arr = b.type_pointer(None, StorageClass::Workgroup, arr);
+        Some((global(&mut b, p_wg, StorageClass::Workgroup), global(&mut b, p_wg, StorageClass::Workgroup), global(&mut b, p_arr, StorageClass::Workgroup), p_wg))
+    } else {
+        None
+    };
     let p_fn = b.type_pointer(None, StorageClass::Function, u32t);
     let fty = b.type_function(void, []);
     let f = b.begin_function(void, None, FunctionControl::NONE, fty)?;
@@ -1017,6 +1035,15 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool,
     // memory held already.)
     let n_var = b.variable(p_fn, None, StorageClass::Function, Some(c0));
     let same_var = b.variable(p_fn, None, StorageClass::Function, Some(c0));
+    // (`image`: each round's dword and whether it is copied, kept from the
+    // comparison to the stores.)
+    let (mut vvars, mut govars) = (Vec::new(), Vec::new());
+    if image != 0 {
+        for _ in 0..4 {
+            vvars.push(b.variable(p_fn, None, StorageClass::Function, Some(c0)));
+            govars.push(b.variable(p_fn, None, StorageClass::Function, Some(c0)));
+        }
+    }
     let l = b.load(v3, None, lid_v, None, [])?;
     let lid = b.composite_extract(u32t, None, l, [0])?;
     let w = b.load(v3, None, wid_v, None, [])?;
@@ -1094,6 +1121,24 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool,
     b.selection_merge(l_end, SelectionControl::NONE)?;
     b.branch_conditional(inside, l_in, l_end, [])?;
     b.begin_block(Some(l_in))?;
+    if let Some((wl, wb, wsec, p_wg)) = wg_sums {
+        // Invocation 0 zeroes the sums and the sector bits before any
+        // invocation adds to them.
+        let (l_z, l_zd) = (b.id(), b.id());
+        b.selection_merge(l_zd, SelectionControl::NONE)?;
+        b.branch_conditional(is0, l_z, l_zd, [])?;
+        b.begin_block(Some(l_z))?;
+        b.store(wl, c0, None, [])?;
+        b.store(wb, c0, None, [])?;
+        for k in 0..4u32 {
+            let ck = c(&mut b, k);
+            let pk = b.access_chain(p_wg, None, wsec, [ck])?;
+            b.store(pk, c0, None, [])?;
+        }
+        b.branch(l_zd)?;
+        b.begin_block(Some(l_zd))?;
+        b.control_barrier(scope_wg, scope_wg, sem_wg)?;
+    }
     let li = b.i_add(u32t, None, list_first, g)?;
     let pli = b.access_chain(p_u, None, marks, [c0, li])?;
     let page = b.load(u32t, None, pli, None, [])?;
@@ -1147,53 +1192,90 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool,
     };
     let msrc = b.i_add(u64t, None, mirror, moff)?;
     let bit_of = b.bitwise_and(u32t, None, lid, c31)?;
-    // Dwords lid + 256 r, r = 0..3: marked ones copied.
-    for r in 0..4u32 {
-        let cr = b.constant_bit32(u32t, r * SCATTER_LOCAL_SIZE);
-        let d = b.i_add(u32t, None, lid, cr)?;
-        let wd = b.shift_right_logical(u32t, None, d, c5)?;
-        let wi = b.i_add(u32t, None, first_word, wd)?;
-        let pm = b.access_chain(p_u, None, marks, [c0, wi])?;
-        let mw = b.load(u32t, None, pm, None, [])?;
-        let sh = b.shift_right_logical(u32t, None, mw, bit_of)?;
-        let bit = b.bitwise_and(u32t, None, sh, c1)?;
-        let set = b.i_not_equal(bool_, None, bit, c0)?;
-        let go = if stores { b.logical_and(bool_, None, set, stored)? } else { b.constant_false(bool_) };
-        let (l_cp, l_cpd) = (b.id(), b.id());
-        b.selection_merge(l_cpd, SelectionControl::NONE)?;
-        b.branch_conditional(go, l_cp, l_cpd, [])?;
-        b.begin_block(Some(l_cp))?;
-        let d4 = b.shift_left_logical(u32t, None, d, c2)?;
-        let d64 = b.u_convert(u64t, None, d4)?;
-        let sa = b.i_add(u64t, None, msrc, d64)?;
-        let sp = b.convert_u_to_ptr(p_dev, None, sa)?;
-        let v = b.load(u32t, None, sp, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
-        let da = b.i_add(u64t, None, dest, d64)?;
-        let dp = b.convert_u_to_ptr(p_dev, None, da)?;
-        let mut changed = None;
-        if census {
-            let old = b.load(u32t, None, dp, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
-            let eq = b.i_equal(bool_, None, old, v)?;
-            let one_if = b.select(u32t, None, eq, c1, c0)?;
-            let s0 = b.load(u32t, None, same_var, None, [])?;
-            let s1 = b.i_add(u32t, None, s0, one_if)?;
-            b.store(same_var, s1, None, [])?;
-            let n0 = b.load(u32t, None, n_var, None, [])?;
-            let n1 = b.i_add(u32t, None, n0, c1)?;
-            b.store(n_var, n1, None, [])?;
-            if read == 2 {
-                changed = Some(b.logical_not(bool_, None, eq)?);
-            }
-        }
-        if let Some((valid, isrc)) = image_page {
-            // Compared with the image (a valid page's): only a dword that
-            // differs goes to guest memory and the image.
+    if let Some((valid, isrc)) = image_page {
+        // Compared with the image (a valid page's) by sectors of 8 dwords
+        // (32 bytes): a sector any of whose marked dwords differs has all
+        // of them stored to guest memory and the image, the others none,
+        // so the stores to guest memory keep the plain kernel's runs.
+        // (Dwords left out one by one cut them into PCIe writes of a few
+        // dwords: ~13.7 ms of a vista frame's GPU time, FINDINGS.md
+        // 2026-10-31 night.) First the comparison, each round's dword and
+        // whether it is copied kept, the sectors' bits set.
+        let (_, _, wsec, p_wg) = wg_sums.expect("image sums");
+        let c8 = c(&mut b, 8);
+        let invalid = b.logical_not(bool_, None, valid)?;
+        // The sector bit word of dword d (d >> 8) and its bit ((d >> 3) & 31).
+        let sector_at = |b: &mut Builder, d: Word| -> Result<(Word, Word), rspirv::dr::Error> {
+            let sw = b.shift_right_logical(u32t, None, d, c8)?;
+            let sp = b.access_chain(p_wg, None, wsec, [sw])?;
+            let sd = b.shift_right_logical(u32t, None, d, c3)?;
+            let sb = b.bitwise_and(u32t, None, sd, c31)?;
+            Ok((sp, sb))
+        };
+        for r in 0..4u32 {
+            let cr = b.constant_bit32(u32t, r * SCATTER_LOCAL_SIZE);
+            let d = b.i_add(u32t, None, lid, cr)?;
+            let wd = b.shift_right_logical(u32t, None, d, c5)?;
+            let wi = b.i_add(u32t, None, first_word, wd)?;
+            let pm = b.access_chain(p_u, None, marks, [c0, wi])?;
+            let mw = b.load(u32t, None, pm, None, [])?;
+            let sh = b.shift_right_logical(u32t, None, mw, bit_of)?;
+            let bit = b.bitwise_and(u32t, None, sh, c1)?;
+            let set = b.i_not_equal(bool_, None, bit, c0)?;
+            let go = b.logical_and(bool_, None, set, stored)?;
+            let go_u = b.select(u32t, None, go, c1, c0)?;
+            b.store(govars[r as usize], go_u, None, [])?;
+            let (l_a, l_ad) = (b.id(), b.id());
+            b.selection_merge(l_ad, SelectionControl::NONE)?;
+            b.branch_conditional(go, l_a, l_ad, [])?;
+            b.begin_block(Some(l_a))?;
+            let d4 = b.shift_left_logical(u32t, None, d, c2)?;
+            let d64 = b.u_convert(u64t, None, d4)?;
+            let sa = b.i_add(u64t, None, msrc, d64)?;
+            let sp = b.convert_u_to_ptr(p_dev, None, sa)?;
+            let v = b.load(u32t, None, sp, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+            b.store(vvars[r as usize], v, None, [])?;
             let ia = b.i_add(u64t, None, isrc, d64)?;
             let ip = b.convert_u_to_ptr(p_dev, None, ia)?;
             let gv = b.load(u32t, None, ip, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
             let differs = b.i_not_equal(bool_, None, gv, v)?;
-            let invalid = b.logical_not(bool_, None, valid)?;
-            let store_it = b.logical_or(bool_, None, invalid, differs)?;
+            let flag = b.logical_and(bool_, None, differs, valid)?;
+            let (l_f, l_fd) = (b.id(), b.id());
+            b.selection_merge(l_fd, SelectionControl::NONE)?;
+            b.branch_conditional(flag, l_f, l_fd, [])?;
+            b.begin_block(Some(l_f))?;
+            let (ps, sb) = sector_at(&mut b, d)?;
+            let sm = b.shift_left_logical(u32t, None, c1, sb)?;
+            b.atomic_or(u32t, None, ps, scope_wg, sem_none, sm)?;
+            b.branch(l_fd)?;
+            b.begin_block(Some(l_fd))?;
+            b.branch(l_ad)?;
+            b.begin_block(Some(l_ad))?;
+        }
+        // Every sector's bit set before any is read; then the stores.
+        b.control_barrier(scope_wg, scope_wg, sem_wg)?;
+        for r in 0..4u32 {
+            let cr = b.constant_bit32(u32t, r * SCATTER_LOCAL_SIZE);
+            let d = b.i_add(u32t, None, lid, cr)?;
+            let go_u = b.load(u32t, None, govars[r as usize], None, [])?;
+            let go = b.i_not_equal(bool_, None, go_u, c0)?;
+            let (l_b, l_bd) = (b.id(), b.id());
+            b.selection_merge(l_bd, SelectionControl::NONE)?;
+            b.branch_conditional(go, l_b, l_bd, [])?;
+            b.begin_block(Some(l_b))?;
+            let v = b.load(u32t, None, vvars[r as usize], None, [])?;
+            let d4 = b.shift_left_logical(u32t, None, d, c2)?;
+            let d64 = b.u_convert(u64t, None, d4)?;
+            let da = b.i_add(u64t, None, dest, d64)?;
+            let dp = b.convert_u_to_ptr(p_dev, None, da)?;
+            let ia = b.i_add(u64t, None, isrc, d64)?;
+            let ip = b.convert_u_to_ptr(p_dev, None, ia)?;
+            let (ps, sb) = sector_at(&mut b, d)?;
+            let sw = b.load(u32t, None, ps, None, [])?;
+            let ssh = b.shift_right_logical(u32t, None, sw, sb)?;
+            let sone = b.bitwise_and(u32t, None, ssh, c1)?;
+            let hit = b.i_not_equal(bool_, None, sone, c0)?;
+            let store_it = b.logical_or(bool_, None, invalid, hit)?;
             let (l_st, l_skip, l_std) = (b.id(), b.id(), b.id());
             b.selection_merge(l_std, SelectionControl::NONE)?;
             b.branch_conditional(store_it, l_st, l_skip, [])?;
@@ -1218,7 +1300,48 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool,
             }
             b.branch(l_std)?;
             b.begin_block(Some(l_std))?;
-        } else {
+            b.branch(l_bd)?;
+            b.begin_block(Some(l_bd))?;
+        }
+    } else {
+        // Dwords lid + 256 r, r = 0..3: marked ones copied.
+        for r in 0..4u32 {
+            let cr = b.constant_bit32(u32t, r * SCATTER_LOCAL_SIZE);
+            let d = b.i_add(u32t, None, lid, cr)?;
+            let wd = b.shift_right_logical(u32t, None, d, c5)?;
+            let wi = b.i_add(u32t, None, first_word, wd)?;
+            let pm = b.access_chain(p_u, None, marks, [c0, wi])?;
+            let mw = b.load(u32t, None, pm, None, [])?;
+            let sh = b.shift_right_logical(u32t, None, mw, bit_of)?;
+            let bit = b.bitwise_and(u32t, None, sh, c1)?;
+            let set = b.i_not_equal(bool_, None, bit, c0)?;
+            let go = if stores { b.logical_and(bool_, None, set, stored)? } else { b.constant_false(bool_) };
+            let (l_cp, l_cpd) = (b.id(), b.id());
+            b.selection_merge(l_cpd, SelectionControl::NONE)?;
+            b.branch_conditional(go, l_cp, l_cpd, [])?;
+            b.begin_block(Some(l_cp))?;
+            let d4 = b.shift_left_logical(u32t, None, d, c2)?;
+            let d64 = b.u_convert(u64t, None, d4)?;
+            let sa = b.i_add(u64t, None, msrc, d64)?;
+            let sp = b.convert_u_to_ptr(p_dev, None, sa)?;
+            let v = b.load(u32t, None, sp, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+            let da = b.i_add(u64t, None, dest, d64)?;
+            let dp = b.convert_u_to_ptr(p_dev, None, da)?;
+            let mut changed = None;
+            if census {
+                let old = b.load(u32t, None, dp, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+                let eq = b.i_equal(bool_, None, old, v)?;
+                let one_if = b.select(u32t, None, eq, c1, c0)?;
+                let s0 = b.load(u32t, None, same_var, None, [])?;
+                let s1 = b.i_add(u32t, None, s0, one_if)?;
+                b.store(same_var, s1, None, [])?;
+                let n0 = b.load(u32t, None, n_var, None, [])?;
+                let n1 = b.i_add(u32t, None, n0, c1)?;
+                b.store(n_var, n1, None, [])?;
+                if read == 2 {
+                    changed = Some(b.logical_not(bool_, None, eq)?);
+                }
+            }
             match changed {
                 Some(ch) => {
                     let (l_st, l_std) = (b.id(), b.id());
@@ -1231,9 +1354,9 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool,
                 }
                 None => b.store(dp, v, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?,
             }
+            b.branch(l_cpd)?;
+            b.begin_block(Some(l_cpd))?;
         }
-        b.branch(l_cpd)?;
-        b.begin_block(Some(l_cpd))?;
     }
     if let Some((valid, isrc)) = image_page {
         // An invalid page: copied whole from the mirror into the image.
@@ -1256,24 +1379,19 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool,
         }
         b.branch(l_cp2d)?;
         b.begin_block(Some(l_cp2d))?;
-        // The dwords left out (counter 6) and, checked, those that differ in
-        // guest memory (counters 4 and 5).
+        // The dwords left out and, checked, those that differ in guest
+        // memory, summed for the workgroup (counters 6, 4 and 5: below).
         let n = b.load(u32t, None, n_var, None, [])?;
         let any = b.i_not_equal(bool_, None, n, c0)?;
         let (l_ic, l_icd) = (b.id(), b.id());
         b.selection_merge(l_icd, SelectionControl::NONE)?;
         b.branch_conditional(any, l_ic, l_icd, [])?;
         b.begin_block(Some(l_ic))?;
-        let c6 = c(&mut b, 6);
-        let p6 = b.access_chain(p_u, None, counters, [c0, c6])?;
-        b.atomic_i_add(u32t, None, p6, scope_dev, sem_none, n)?;
+        let (wl, wb, _, _) = wg_sums.expect("image sums");
+        b.atomic_i_add(u32t, None, wl, scope_wg, sem_none, n)?;
         if image == 2 {
-            let c4 = c(&mut b, 4);
-            let p4 = b.access_chain(p_u, None, counters, [c0, c4])?;
-            b.atomic_i_add(u32t, None, p4, scope_dev, sem_none, n)?;
             let bad = b.load(u32t, None, same_var, None, [])?;
-            let p5 = b.access_chain(p_u, None, counters, [c0, c5])?;
-            b.atomic_i_add(u32t, None, p5, scope_dev, sem_none, bad)?;
+            b.atomic_i_add(u32t, None, wb, scope_wg, sem_none, bad)?;
         }
         b.branch(l_icd)?;
         b.begin_block(Some(l_icd))?;
@@ -1419,6 +1537,22 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool, note: bool,
         b.atomic_i_add(u32t, None, p7, scope_dev, sem_none, c1)?;
         b.branch(l_ivd)?;
         b.begin_block(Some(l_ivd))?;
+        // The workgroup's sums (after the barrier): dwords left out into
+        // counter 6 and, checked, into 4, those differing in guest memory
+        // into 5.
+        let (wl, wb, _, _) = wg_sums.expect("image sums");
+        let n = b.load(u32t, None, wl, None, [])?;
+        let c6 = c(&mut b, 6);
+        let p6 = b.access_chain(p_u, None, counters, [c0, c6])?;
+        b.atomic_i_add(u32t, None, p6, scope_dev, sem_none, n)?;
+        if image == 2 {
+            let c4 = c(&mut b, 4);
+            let p4 = b.access_chain(p_u, None, counters, [c0, c4])?;
+            b.atomic_i_add(u32t, None, p4, scope_dev, sem_none, n)?;
+            let bad = b.load(u32t, None, wb, None, [])?;
+            let p5 = b.access_chain(p_u, None, counters, [c0, c5])?;
+            b.atomic_i_add(u32t, None, p5, scope_dev, sem_none, bad)?;
+        }
     }
     b.branch(l_pbd)?;
     b.begin_block(Some(l_pbd))?;

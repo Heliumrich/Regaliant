@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 230] = [
+    static ALL: [Tunable; 231] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -263,6 +263,7 @@ pub mod tune {
         Tunable { name: "mark_touch", env: "DS_MARK_TOUCH", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_scatter_read", env: "DS_FE2_SCATTER_READ", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "touch_bits", env: "DS_TOUCH_BITS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "wb_image", env: "DS_WB_IMAGE_TUNE", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2514,6 +2515,16 @@ pub mod tune {
     /// from the first such translation on). Read when a stage is prepared.
     pub fn touch_bits() -> bool {
         get(229) != 0
+    }
+
+    /// With the write-back image made (`DS_WB_IMAGE`, boot): 1 the image in
+    /// full (kept current, the write-back comparing with it), 2 kept
+    /// current only (the plain write-back kernel), 0 neither. Live: the
+    /// comparing kernel clears every page's validity first when another
+    /// kernel ran since its last use (exact across switches; replay A/Bs
+    /// split its cost this way).
+    pub fn wb_image() -> u64 {
+        get(230)
     }
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages

@@ -2728,7 +2728,7 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
         s.lazy
     } else if s.note != vk::Pipeline::null() {
         s.note
-    } else if s.image != vk::Pipeline::null() && image_on() {
+    } else if s.image != vk::Pipeline::null() && image_kernel() {
         s.image
     } else {
         s.pipeline
@@ -2750,6 +2750,19 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
         }
         if pipeline == s.lazy && s.lazy != vk::Pipeline::null() {
             lazy_upload(cmd, marks);
+        }
+        // (`tune wb_image`: validity cleared when the comparing kernel
+        // resumes after another ran.)
+        if s.image != vk::Pipeline::null() && image_on() {
+            if pipeline == s.image {
+                if IMAGE_STALE.swap(false, Ordering::Relaxed) {
+                    c.device.cmd_fill_buffer(cmd, marks, rdna::kernels::MARK_AUX_AT as u64 * 4, rdna::kernels::MARK_AUX_WORDS as u64 * 4, 0);
+                    let up = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                    c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[up], &[], &[]);
+                }
+            } else {
+                IMAGE_STALE.store(true, Ordering::Relaxed);
+            }
         }
         if let Some((lo, hi)) = written.filter(|&(lo, hi)| lo < hi && TOUCH_BITS_EVER.load(Ordering::Relaxed)) {
             // The touched-bit words of the pages in [lo, hi), 32 pages a word.
@@ -2911,14 +2924,19 @@ fn index_census_line() -> String {
 }
 
 /// `DS_WB_IMAGE=<1|2>` (boot): front end 2's write-back stores only the
-/// marked dwords that differ from a video-memory image of guest memory
-/// (`rdna::kernels::mirror_scatter_image`; 2: also reads each dword it
+/// marked dwords of 32-byte sectors that differ from a video-memory image
+/// of guest memory (`rdna::kernels::mirror_scatter_image`: level with no
+/// image at the vista, FINDINGS.md 2026-10-31 night; dword by dword it cost
+/// ~13.7 ms a frame, its stores into host memory cut into short runs; 2:
+/// also reads each dword it
 /// leaves out from guest memory and counts those that differ there, which
 /// must stay 0). The image is backed over written bindings' ranges, a page
-/// of it valid while its bit in the map's aux region is set; uploads into
-/// the mirror, CP writes and fills clear the bits of the pages they write
-/// (exec.rs). FINDINGS.md 2026-10-31: a third (moving) to three fifths
-/// (still) of the dwords written back were unchanged.
+/// of it valid while its bit in the map's aux region is set (the write-back
+/// copies an invalid page whole into it); uploads into the mirror are
+/// copied into it too, and CP writes and fills write it as they write the
+/// mirror (exec.rs), where it is backed. FINDINGS.md 2026-10-31: a third
+/// (moving) to three fifths (still) of the dwords written back were
+/// unchanged.
 pub fn image_mode() -> u64 {
     static M: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *M.get_or_init(|| std::env::var("DS_WB_IMAGE").ok().and_then(|v| v.parse().ok()).filter(|&v: &u64| v <= 2).unwrap_or(0))
@@ -2931,6 +2949,29 @@ pub fn image_on() -> bool {
     IMAGE_ON.load(Ordering::Relaxed)
 }
 
+/// The image kept current by uploads, CP writes and fills (`tune wb_image`
+/// 1 or 2). A use with it off marks the image stale (`IMAGE_STALE`).
+pub fn image_upkeep() -> bool {
+    if !image_on() {
+        return false;
+    }
+    let on = super::tune::wb_image() != 0;
+    if !on {
+        IMAGE_STALE.store(true, Ordering::Relaxed);
+    }
+    on
+}
+
+/// The write-back compares with the image (`tune wb_image` 1).
+fn image_kernel() -> bool {
+    image_on() && super::tune::wb_image() == 1
+}
+
+/// Another write-back kernel ran since the comparing one last did: the
+/// image may lack what it wrote, so the next comparing write-back clears
+/// every page's validity first.
+static IMAGE_STALE: AtomicBool = AtomicBool::new(true);
+
 /// Switches the image off for good (its backing failed: pages it cannot
 /// hold would be compared with garbage).
 pub fn image_failed(why: &str) {
@@ -2939,26 +2980,26 @@ pub fn image_failed(why: &str) {
     }
 }
 
-/// Copies of zeros over the validity bits (aux words) of the pages in
-/// [a, b): every page sharing a word with them loses its bit too.
-pub fn image_invalidations(a: u64, b: u64, out: &mut Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>) {
-    let (Some(z), Some(marks)) = (super::resident::zeros(), super::resident::marks()) else { return };
+/// The image kept current where its pages are backed: the copies of the
+/// mirror's [a, b) into it, made after an upload of that range into the
+/// mirror (behind the prologue's barrier: `Exec::pre_after`).
+pub fn image_refreshes(a: u64, b: u64, out: &mut Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>) {
+    let (Some(img), Some((mbuf, _))) = (super::resident::image_buffer(), super::resident::mirror_buffer()) else { return };
     if b <= a || !in_span(a, b - a) {
         return;
     }
-    let w0 = (a - MIRROR_BASE) / PAGE / 32;
-    let w1 = (b - MIRROR_BASE).div_ceil(PAGE).div_ceil(32);
-    let mut w = w0;
-    while w < w1 {
-        let n = (w1 - w).min((64 << 10) / 4);
-        out.push((z, marks, vk::BufferCopy { src_offset: 0, dst_offset: (rdna::kernels::MARK_AUX_AT as u64 + w) * 4, size: n * 4 }));
-        IMAGE_INVALIDATED.fetch_add(n, Ordering::Relaxed);
-        w += n;
+    let mut runs = Vec::new();
+    super::resident::image_backed_runs(a, b, &mut runs);
+    for (x, y) in runs {
+        out.push((mbuf, img, vk::BufferCopy { src_offset: x - MIRROR_BASE, dst_offset: x - MIRROR_BASE, size: y - x }));
+        IMAGE_REFRESHED.fetch_add(y - x, Ordering::Relaxed);
     }
 }
 
-/// Validity words cleared (`image_invalidations`).
-static IMAGE_INVALIDATED: AtomicU64 = AtomicU64::new(0);
+/// Bytes copied into the image after uploads (`image_refreshes`), and CP
+/// writes and fills made into it too.
+static IMAGE_REFRESHED: AtomicU64 = AtomicU64::new(0);
+pub static IMAGE_WRITES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 fn image_line(w: &[u64]) -> String {
     if image_mode() == 0 {
@@ -2966,11 +3007,13 @@ fn image_line(w: &[u64]) -> String {
     }
     let check = if image_mode() == 2 { format!("; checked against guest memory: {} dwords left out, {} of them differing there", w[2], w[3]) } else { String::new() };
     format!(
-        "    write-back image (`DS_WB_IMAGE`{}): {} dwords left out as unchanged, {} pages copied into it, {} validity words cleared; its video memory {} MiB{check}\n",
+        "    write-back image (`DS_WB_IMAGE`{}): {} dwords left out as unchanged, {} pages copied into it whole; kept current: {} MiB after uploads, {} CP writes, {} fills; its video memory {} MiB{check}\n",
         if image_on() { "" } else { ", off" },
         w[4],
         w[5],
-        IMAGE_INVALIDATED.load(Ordering::Relaxed),
+        IMAGE_REFRESHED.load(Ordering::Relaxed) >> 20,
+        IMAGE_WRITES[0].load(Ordering::Relaxed),
+        IMAGE_WRITES[1].load(Ordering::Relaxed),
         super::resident::image_mib()
     )
 }
