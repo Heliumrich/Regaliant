@@ -287,6 +287,42 @@ fn exact_on() -> bool {
     *W.get_or_init(|| std::env::var("DS_FE2_EXACT").ok().as_deref() != Some("0"))
 }
 
+/// Slots of the table of exact ranges found fine that every thread shares
+/// (`tune fe2_shared_ranges`), behind each thread's own caches. A range is
+/// noted fine only with no page of its checker's own batch's uploads in it
+/// (those are fine for that batch alone until it is queued), and what makes
+/// it hold again (its chunks' generations, its host leaves' events, the
+/// requirement met) is global: one thread's finding holds for every thread.
+/// (Each graphics worker's own caches missed with no covering range ~4
+/// million times over Castlewall's arrival: FINDINGS.md 2026-10-31.)
+const SHARED_SLOTS: usize = 16384;
+
+static SHARED: std::sync::OnceLock<Vec<Mutex<Fine>>> = std::sync::OnceLock::new();
+
+/// Checks met by another thread's finding (`SHARED`), by caller class.
+static SHARED_HITS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn shared_table() -> &'static [Mutex<Fine>] {
+    SHARED.get_or_init(|| (0..SHARED_SLOTS).map(|_| Mutex::new(Fine { lo: 0, hi: 0, gens: [0; FINE_CHUNKS], host: [0; FINE_LEAVES], ep: 0, marked: false })).collect())
+}
+
+#[inline]
+fn shared_slot(lo: u64, hi: u64) -> usize {
+    let h = (lo >> 12).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (hi >> 12).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    (h >> (64 - SHARED_SLOTS.trailing_zeros())) as usize
+}
+
+/// Another thread's finding that [lo, hi) is fine as `want` and `marked`
+/// ask, if it still holds (`SHARED`).
+fn shared_fine(lo: u64, hi: u64, want: u32, marked: bool) -> Option<Fine> {
+    let f = *shared_table()[shared_slot(lo, hi)].lock();
+    if f.hi == 0 || f.lo != lo || f.hi != hi || (marked && !f.marked) || f.ep < want || changed(&f).is_some() {
+        return None;
+    }
+    SHARED_HITS[CALLER.with(|c| c.get())].fetch_add(1, Ordering::Relaxed);
+    Some(f)
+}
+
 /// The slot of page-aligned [lo, hi) in `EXACT`.
 #[inline]
 fn exact_slot(lo: u64, hi: u64) -> usize {
@@ -381,6 +417,22 @@ fn range_fine(lo: u64, hi: u64, want: u32, marked: bool) -> bool {
             }
             i += 1;
         }
+        // (`tune fe2_shared_ranges`: another thread's finding, kept as this
+        // thread's too.)
+        if super::tune::fe2_shared_ranges() {
+            if let Some(f) = shared_fine(lo, hi, want, marked) {
+                if exact_on() {
+                    EXACT.with(|t| {
+                        let mut t = t.borrow_mut();
+                        if t.is_empty() {
+                            t.resize(EXACT_SLOTS, Fine { lo: 0, hi: 0, gens: [0; FINE_CHUNKS], host: [0; FINE_LEAVES], ep: 0, marked: false });
+                        }
+                        t[exact_slot(lo, hi)] = f;
+                    });
+                }
+                return true;
+            }
+        }
         if callers_on() {
             caller_count(why, 1);
         }
@@ -468,7 +520,7 @@ pub fn note_place_parts(map: u64, begin: u64, after: u64) {
 
 /// Clears the checks by caller (`profile reset`).
 pub fn reset_callers() {
-    for c in BY_CALLER.iter().flatten().chain(QUIET_TAKES.iter().flatten()).chain(BY_SOURCE.iter().flatten()) {
+    for c in BY_CALLER.iter().flatten().chain(QUIET_TAKES.iter().flatten()).chain(BY_SOURCE.iter().flatten()).chain(SHARED_HITS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
 }
@@ -556,7 +608,10 @@ fn note_range_fine(lo: u64, hi: u64, gens: [u32; FINE_CHUNKS], host: [u64; FINE_
         r.retain(|f| !(lo <= f.lo && f.hi <= hi && (marked || !f.marked)));
         r.insert(0, Fine { lo, hi, gens, host, ep, marked });
         r.truncate(RANGE_CACHE);
-    })
+    });
+    if super::tune::fe2_shared_ranges() {
+        *shared_table()[shared_slot(lo, hi)].lock() = Fine { lo, hi, gens, host, ep, marked };
+    }
 }
 
 static TABLE: [AtomicPtr<Chunk>; CHUNKS] = [const { AtomicPtr::new(std::ptr::null_mut()) }; CHUNKS];
@@ -3863,5 +3918,11 @@ pub fn callers_line() -> String {
             )
         })
         .collect();
-    format!("    front end 2's checks by caller: {}\n    the graphics CP's checks by the stage they bind: {}\n{quiet}", parts.join("; "), sources.join("; "))
+    let shared = if SHARED.get().is_some() {
+        let h: Vec<String> = CALLER_NAMES.iter().zip(SHARED_HITS.iter()).map(|(n, c)| format!("{n} {}", c.load(Ordering::Relaxed))).collect();
+        format!("; checks met by another thread's finding (`tune fe2_shared_ranges`): {}", h.join(", "))
+    } else {
+        String::new()
+    };
+    format!("    front end 2's checks by caller: {}{shared}\n    the graphics CP's checks by the stage they bind: {}\n{quiet}", parts.join("; "), sources.join("; "))
 }
