@@ -889,7 +889,7 @@ pub fn mirror_scatter_nostore() -> Vec<u32> {
 /// those guest memory held already (counters 4 and 5): what a write-back
 /// of changed dwords alone would store.
 pub fn mirror_scatter_census() -> Vec<u32> {
-    build_scatter_ex(true, true, 1).expect("mirror scatter kernel (census)")
+    build_scatter_ex(true, true, 1, false).expect("mirror scatter kernel (census)")
 }
 
 /// `mirror_scatter_census` storing only the dwords whose guest-memory value
@@ -897,16 +897,25 @@ pub fn mirror_scatter_census() -> Vec<u32> {
 /// the value guest memory held when it was read; a CPU write racing it
 /// lands as if after the GPU's).
 pub fn mirror_scatter_changed() -> Vec<u32> {
-    build_scatter_ex(true, true, 2).expect("mirror scatter kernel (changed dwords)")
+    build_scatter_ex(true, true, 2, false).expect("mirror scatter kernel (changed dwords)")
 }
 
 fn build_scatter(reset: bool, stores: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
-    build_scatter_ex(reset, stores, 0)
+    build_scatter_ex(reset, stores, 0, false)
+}
+
+/// `mirror_scatter_reset` leaving pages whose bit is set in the map's aux
+/// region out of guest memory (diagnosis, the runtime's `DS_FE2_LAZY2`:
+/// their marks and touched bits are cleared as after a write-back, their
+/// dwords and pages counted in counters 6 and 7 instead of 1 and 0).
+pub fn mirror_scatter_lazy() -> Vec<u32> {
+    build_scatter_ex(true, true, 0, true).expect("mirror scatter kernel (lazy pages)")
 }
 
 /// `read`: 0 stores every marked dword; 1 reads its guest-memory value first
 /// and counts (counters 4 and 5); 2 as 1, storing only changed dwords.
-fn build_scatter_ex(reset: bool, stores: bool, read: u8) -> Result<Vec<u32>, rspirv::dr::Error> {
+/// `lazy`: pages with their aux bit set store nothing (`mirror_scatter_lazy`).
+fn build_scatter_ex(reset: bool, stores: bool, read: u8, lazy: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     let census = read != 0;
     let lit = Operand::LiteralBit32;
     let mut b = Builder::new();
@@ -1054,6 +1063,27 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8) -> Result<Vec<u32>, rsp
     let tp = b.convert_u_to_ptr(p_dev64, None, ta)?;
     let dest = b.load(u64t, None, tp, Some(spirv::MemoryAccess::ALIGNED), [lit(8)])?;
     let mapped = b.i_not_equal(bool_, None, dest, c0_64)?;
+    // (`lazy`: the page's aux bit; such a page stores nothing.)
+    let lazy_page = if lazy {
+        let aux_at = c(&mut b, MARK_AUX_AT);
+        let aw = b.shift_right_logical(u32t, None, page, c5)?;
+        let awi = b.i_add(u32t, None, aux_at, aw)?;
+        let pa = b.access_chain(p_u, None, marks, [c0, awi])?;
+        let av = b.load(u32t, None, pa, None, [])?;
+        let abit = b.bitwise_and(u32t, None, page, c31)?;
+        let ash = b.shift_right_logical(u32t, None, av, abit)?;
+        let aone = b.bitwise_and(u32t, None, ash, c1)?;
+        Some(b.i_not_equal(bool_, None, aone, c0)?)
+    } else {
+        None
+    };
+    let stored = match lazy_page {
+        Some(l) => {
+            let eager = b.logical_not(bool_, None, l)?;
+            b.logical_and(bool_, None, mapped, eager)?
+        }
+        None => mapped,
+    };
     let moff = b.i_mul(u64t, None, page64, c4096_64)?;
     let msrc = b.i_add(u64t, None, mirror, moff)?;
     let bit_of = b.bitwise_and(u32t, None, lid, c31)?;
@@ -1068,7 +1098,7 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8) -> Result<Vec<u32>, rsp
         let sh = b.shift_right_logical(u32t, None, mw, bit_of)?;
         let bit = b.bitwise_and(u32t, None, sh, c1)?;
         let set = b.i_not_equal(bool_, None, bit, c0)?;
-        let go = if stores { b.logical_and(bool_, None, set, mapped)? } else { b.constant_false(bool_) };
+        let go = if stores { b.logical_and(bool_, None, set, stored)? } else { b.constant_false(bool_) };
         let (l_cp, l_cpd) = (b.id(), b.id());
         b.selection_merge(l_cpd, SelectionControl::NONE)?;
         b.branch_conditional(go, l_cp, l_cpd, [])?;
@@ -1140,10 +1170,25 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8) -> Result<Vec<u32>, rsp
         let n = b.bit_count(u32t, None, mw)?;
         total = b.i_add(u32t, None, total, n)?;
     }
-    let which_dw = b.select(u32t, None, mapped, c1, c0)?;
+    let which_dw = b.select(u32t, None, stored, c1, c0)?;
     let pdw = b.access_chain(p_u, None, counters, [c0, c1])?;
     let add = b.i_mul(u32t, None, total, which_dw)?;
     b.atomic_i_add(u32t, None, pdw, scope_dev, sem_none, add)?;
+    if let Some(l) = lazy_page {
+        // (A lazy page's dwords and the page in counters 6 and 7.)
+        let (l_lz, l_lzd) = (b.id(), b.id());
+        b.selection_merge(l_lzd, SelectionControl::NONE)?;
+        b.branch_conditional(l, l_lz, l_lzd, [])?;
+        b.begin_block(Some(l_lz))?;
+        let c6 = c(&mut b, 6);
+        let c7 = c(&mut b, 7);
+        let p6 = b.access_chain(p_u, None, counters, [c0, c6])?;
+        b.atomic_i_add(u32t, None, p6, scope_dev, sem_none, total)?;
+        let p7 = b.access_chain(p_u, None, counters, [c0, c7])?;
+        b.atomic_i_add(u32t, None, p7, scope_dev, sem_none, c1)?;
+        b.branch(l_lzd)?;
+        b.begin_block(Some(l_lzd))?;
+    }
     if census {
         // (The page's bit in the aux region: dwords and pages counted.)
         let aux_at = c(&mut b, MARK_AUX_AT);
@@ -1196,7 +1241,11 @@ fn build_scatter_ex(reset: bool, stores: bool, read: u8) -> Result<Vec<u32>, rsp
     b.atomic_and(u32t, None, ppb, scope_dev, sem_none, pinv)?;
     let which = b.select(u32t, None, mapped, c0, c2)?;
     let pcnt = b.access_chain(p_u, None, counters, [c0, which])?;
-    b.atomic_i_add(u32t, None, pcnt, scope_dev, sem_none, c1)?;
+    let one_unless_lazy = match lazy_page {
+        Some(l) => b.select(u32t, None, l, c0, c1)?,
+        None => c1,
+    };
+    b.atomic_i_add(u32t, None, pcnt, scope_dev, sem_none, one_unless_lazy)?;
     b.branch(l_pbd)?;
     b.begin_block(Some(l_pbd))?;
     b.branch(l_end)?;
@@ -1451,6 +1500,17 @@ mod tests {
         if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
             let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("mirror_scatter.spv"), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn scatter_lazy_kernel_assembles() {
+        let w = super::mirror_scatter_lazy();
+        assert_eq!(w[0], 0x0723_0203);
+        assert_ne!(w, super::mirror_scatter_reset());
+        if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("mirror_scatter_lazy.spv"), bytes).unwrap();
         }
     }
 

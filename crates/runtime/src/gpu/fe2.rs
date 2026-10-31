@@ -2594,6 +2594,8 @@ struct Scatter {
     /// with `fe2_scatter_reset` (null otherwise).
     census: vk::Pipeline,
     changed: vk::Pipeline,
+    /// The kernel leaving lazy pages out (`DS_FE2_LAZY2`).
+    lazy: vk::Pipeline,
     /// The touched-page list made from the touched bits
     /// (`rdna::kernels::mirror_compact`, `tune touch_bits`).
     compact: vk::Pipeline,
@@ -2643,6 +2645,7 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
         // (`tune fe2_scatter_read`.)
         let census = if reset { make(&rdna::kernels::mirror_scatter_census(), 22)? } else { vk::Pipeline::null() };
         let changed = if reset { make(&rdna::kernels::mirror_scatter_changed(), 23)? } else { vk::Pipeline::null() };
+        let lazy = if reset && lazy2_on() { make(&rdna::kernels::mirror_scatter_lazy(), 25)? } else { vk::Pipeline::null() };
         let compact = make(&rdna::kernels::mirror_compact(), 24)?;
         let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 }];
         let pool = c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).map_err(|e| format!("scatter pool: {e}"))?;
@@ -2664,7 +2667,7 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
             .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
             .collect();
         c.device.update_descriptor_sets(&writes, &[]);
-        Ok(Scatter { pipeline, nostore, census, changed, compact, layout, set, counters: cptr as *mut u32, reset, host: cbuf, dev })
+        Ok(Scatter { pipeline, nostore, census, changed, lazy, compact, layout, set, counters: cptr as *mut u32, reset, host: cbuf, dev })
     }
 }
 
@@ -2704,6 +2707,8 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
         s.census
     } else if s.changed != vk::Pipeline::null() && super::tune::fe2_scatter_read() == 2 {
         s.changed
+    } else if s.lazy != vk::Pipeline::null() {
+        s.lazy
     } else {
         s.pipeline
     };
@@ -2721,6 +2726,9 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
             let up = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[up], &[], &[]);
             crate::info!("fe2: the index-page bits ({} pages) copied for the write-back census", index_pages().iter().map(|w| w.load(Ordering::Relaxed).count_ones()).sum::<u32>());
+        }
+        if pipeline == s.lazy && s.lazy != vk::Pipeline::null() {
+            lazy_upload(cmd, marks);
         }
         if let Some((lo, hi)) = written.filter(|&(lo, hi)| lo < hi && TOUCH_BITS_EVER.load(Ordering::Relaxed)) {
             // The touched-bit words of the pages in [lo, hi), 32 pages a word.
@@ -2878,6 +2886,196 @@ fn index_census_line() -> String {
         reads.join(", "),
         INDEX_CPU_WRITES[1].load(Ordering::Relaxed),
         INDEX_CPU_WRITES[0].load(Ordering::Relaxed)
+    )
+}
+
+/// `DS_FE2_LAZY2=<name>:<hex size>,...` (diagnosis, wrong results where the
+/// title's code reads them): pages of written bindings inside such a
+/// mapping are left out of the write-backs (`rdna::kernels::
+/// mirror_scatter_lazy`, the written-bit map's aux region holding a bit per
+/// page) until one of the command processors' CPU-side reads (`sync_for`)
+/// touches them; from then on they are written back as before (that read
+/// itself may see stale data). What a lazy write-back of what our own
+/// reads never touch would spare (FINDINGS.md 2026-10-31).
+pub fn lazy2_on() -> bool {
+    !lazy2_rules().is_empty()
+}
+
+fn lazy2_rules() -> &'static [(String, u64)] {
+    static RULES: std::sync::OnceLock<Vec<(String, u64)>> = std::sync::OnceLock::new();
+    RULES.get_or_init(|| {
+        let Ok(v) = std::env::var("DS_FE2_LAZY2") else { return Vec::new() };
+        let rules: Vec<(String, u64)> = v
+            .split(',')
+            .filter_map(|r| {
+                let (n, s) = r.rsplit_once(':')?;
+                Some((n.to_string(), u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()?))
+            })
+            .collect();
+        if !rules.is_empty() {
+            crate::warn!("fe2: written pages of mappings {rules:?} stay out of guest memory until a command processor reads them (`DS_FE2_LAZY2`, diagnosis)");
+        }
+        rules
+    })
+}
+
+/// `DS_FE2_LAZY2`: per page, lazy (left out of write-backs) and eager (read
+/// by a command processor: never lazy again), and the aux words to upload.
+struct Lazy2 {
+    lazy: Box<[AtomicU64]>,
+    eager: Box<[AtomicU64]>,
+    dirty: parking_lot::Mutex<std::collections::BTreeSet<u32>>,
+}
+
+fn lazy2() -> &'static Lazy2 {
+    static L: std::sync::OnceLock<Lazy2> = std::sync::OnceLock::new();
+    L.get_or_init(|| {
+        let n = ((MIRROR_END - MIRROR_BASE) / PAGE / 64) as usize;
+        Lazy2 { lazy: (0..n).map(|_| AtomicU64::new(0)).collect(), eager: (0..n).map(|_| AtomicU64::new(0)).collect(), dirty: parking_lot::Mutex::new(Default::default()) }
+    })
+}
+
+/// [pages turned eager by reads, aux upload runs, aux words, uploads into
+/// the mirror over lazy pages, their lazy pages].
+static LAZY2_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// An upload of [a, b) into the mirror from guest memory (`DS_FE2_LAZY2`):
+/// counted when it covers lazy pages (it overwrites what GPU work left
+/// there with guest memory's older copy).
+pub fn lazy2_upload(a: u64, b: u64) {
+    if !lazy2_on() || b <= a || !in_span(a, b - a) {
+        return;
+    }
+    let l = lazy2();
+    let (p0, p1) = ((a - MIRROR_BASE) / PAGE, (b - MIRROR_BASE).div_ceil(PAGE));
+    let mut n = 0u64;
+    let mut p = p0;
+    while p < p1 {
+        let w = (p / 64) as usize;
+        let e = ((p / 64 + 1) * 64).min(p1);
+        let mask = if e - p == 64 { u64::MAX } else { ((1u64 << (e - p)) - 1) << (p % 64) };
+        n += (l.lazy[w].load(Ordering::Relaxed) & mask).count_ones() as u64;
+        p = e;
+    }
+    if n > 0 {
+        LAZY2_STATS[3].fetch_add(1, Ordering::Relaxed);
+        LAZY2_STATS[4].fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+thread_local! {
+    /// Mappings looked up for `lazy2_rules`: (start, end) -> matches.
+    static LAZY2_SEEN: std::cell::RefCell<std::collections::HashMap<(u64, u64), bool>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// A written binding's pages [lo, hi): lazy when its mapping matches a rule
+/// and no command processor read them.
+pub fn lazy2_written(lo: u64, hi: u64) {
+    if !lazy2_on() || !in_span(lo, hi - lo) {
+        return;
+    }
+    let Some(bounds) = crate::mem::vma_bounds(lo) else { return };
+    let hit = LAZY2_SEEN.with(|c| *c.borrow_mut().entry(bounds).or_insert_with(|| crate::mem::vma_label(lo).is_some_and(|(_, size, name)| lazy2_rules().iter().any(|(n, s)| *n == name && *s == size))));
+    if !hit {
+        return;
+    }
+    let l = lazy2();
+    let (p0, p1) = ((lo - MIRROR_BASE) / PAGE, (hi.min(bounds.1) - MIRROR_BASE).div_ceil(PAGE));
+    let mut p = p0;
+    while p < p1 {
+        let w = (p / 64) as usize;
+        let e = ((p / 64 + 1) * 64).min(p1);
+        let mask = if e - p == 64 { u64::MAX } else { ((1u64 << (e - p)) - 1) << (p % 64) };
+        let want = mask & !l.eager[w].load(Ordering::Relaxed);
+        if want != 0 && l.lazy[w].fetch_or(want, Ordering::Relaxed) & want != want {
+            let mut d = l.dirty.lock();
+            d.insert(2 * w as u32);
+            d.insert(2 * w as u32 + 1);
+        }
+        p = e;
+    }
+}
+
+/// A command processor reads [a, a+n): its pages become eager.
+pub fn lazy2_read(reads: &[(u64, u64)]) {
+    if !lazy2_on() {
+        return;
+    }
+    let l = lazy2();
+    for &(a, n) in reads {
+        if n == 0 || !in_span(a, n) {
+            continue;
+        }
+        let (p0, p1) = ((a - MIRROR_BASE) / PAGE, (a + n - MIRROR_BASE).div_ceil(PAGE));
+        let mut p = p0;
+        while p < p1 {
+            let w = (p / 64) as usize;
+            let e = ((p / 64 + 1) * 64).min(p1);
+            let mask = if e - p == 64 { u64::MAX } else { ((1u64 << (e - p)) - 1) << (p % 64) };
+            if l.eager[w].load(Ordering::Relaxed) & mask != mask {
+                l.eager[w].fetch_or(mask, Ordering::Relaxed);
+            }
+            let was = l.lazy[w].fetch_and(!mask, Ordering::Relaxed) & mask;
+            if was != 0 {
+                LAZY2_STATS[0].fetch_add(was.count_ones() as u64, Ordering::Relaxed);
+                let mut d = l.dirty.lock();
+                d.insert(2 * w as u32);
+                d.insert(2 * w as u32 + 1);
+            }
+            p = e;
+        }
+    }
+}
+
+/// Records the lazy bits that changed into the aux region (before a
+/// write-back; outside a render pass).
+unsafe fn lazy_upload(cmd: vk::CommandBuffer, marks: vk::Buffer) {
+    let l = lazy2();
+    let words: Vec<u32> = std::mem::take(&mut *l.dirty.lock()).into_iter().collect();
+    if words.is_empty() {
+        return;
+    }
+    let c = ctx();
+    let mut i = 0;
+    let mut runs = 0u64;
+    while i < words.len() {
+        let mut j = i + 1;
+        while j < words.len() && words[j] == words[j - 1] + 1 && j - i < 16384 {
+            j += 1;
+        }
+        let bytes: Vec<u8> = words[i..j]
+            .iter()
+            .flat_map(|&w32| {
+                let v = l.lazy[(w32 / 2) as usize].load(Ordering::Relaxed);
+                (if w32 % 2 == 0 { v as u32 } else { (v >> 32) as u32 }).to_le_bytes()
+            })
+            .collect();
+        unsafe { c.device.cmd_update_buffer(cmd, marks, (rdna::kernels::MARK_AUX_AT as u64 + words[i] as u64) * 4, &bytes) };
+        runs += 1;
+        i = j;
+    }
+    let up = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+    unsafe { c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[up], &[], &[]) };
+    LAZY2_STATS[1].fetch_add(runs, Ordering::Relaxed);
+    LAZY2_STATS[2].fetch_add(words.len() as u64, Ordering::Relaxed);
+}
+
+fn lazy2_line(w: &[u64]) -> String {
+    if !lazy2_on() {
+        return String::new();
+    }
+    let l = lazy2();
+    let lazy: u64 = l.lazy.iter().map(|x| x.load(Ordering::Relaxed).count_ones() as u64).sum();
+    let eager: u64 = l.eager.iter().map(|x| x.load(Ordering::Relaxed).count_ones() as u64).sum();
+    format!(
+        "    lazy pages (`DS_FE2_LAZY2`): {lazy} pages now, {eager} read by the command processors ({} turned eager); uploads into the mirror over lazy pages {} ({} pages); write-backs left out {} dwords in {} pages; aux uploads {} runs, {} words\n",
+        LAZY2_STATS[0].load(Ordering::Relaxed),
+        LAZY2_STATS[3].load(Ordering::Relaxed),
+        LAZY2_STATS[4].load(Ordering::Relaxed),
+        w[4],
+        w[5],
+        LAZY2_STATS[1].load(Ordering::Relaxed),
+        LAZY2_STATS[2].load(Ordering::Relaxed)
     )
 }
 
@@ -3320,6 +3518,7 @@ pub fn status() -> String {
         + &census
         + &compacts
         + &index_census_line()
+        + &lazy2_line(&w)
 }
 
 /// One status line: the mirror's pages by state now (a scan of every

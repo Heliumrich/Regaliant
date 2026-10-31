@@ -9960,6 +9960,7 @@ impl Exec {
             }
             self.fe2_marked = true;
             self.fe2_written = (self.fe2_written.0.min(lo), self.fe2_written.1.max(hi));
+            super::fe2::lazy2_written(lo, hi);
             if wb_census() {
                 note_written_binding(base, hi - lo);
             }
@@ -10268,6 +10269,7 @@ impl Exec {
                         self.fe2_spans.push((start, buf));
                     }
                     self.pre_copies.push((buf, mbuf, vk::BufferCopy { src_offset: x - start, dst_offset: x - MIRROR_BASE, size: e - x }));
+                    super::fe2::lazy2_upload(x, e);
                     match up.last_mut() {
                         Some(l) if l.1 == x => l.1 = e,
                         _ => up.push((x, e)),
@@ -11655,6 +11657,7 @@ impl Exec {
     pub fn sync_for(&mut self, reads: &[(u64, u64)], why: usize) -> bool {
         note_read_census(reads, why);
         super::fe2::index_census_reads(reads, why);
+        super::fe2::lazy2_read(reads);
         if super::runprobe::on() && self.name == "gpu-gfx" {
             super::runprobe::reads(reads);
         }
