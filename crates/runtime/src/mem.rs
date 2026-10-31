@@ -1102,7 +1102,7 @@ fn mixed_view_privatize(w: u64, prot: u32) {
 fn views_state() -> String {
     let v: Vec<u64> = VIEW_STATS.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
     format!(
-        "; views ({}): {} windows made ({} MiB live), {} released, {} made private again, {} windows of chosen mappings left private; {} takes of view windows ({:.2} us each) reported {} pages",
+        "; views ({}): {} windows made ({} MiB live), {} released, {} made private again, {} windows of chosen mappings left private; {} takes of view windows ({:.2} us each) reported {} pages{}",
         view_rules().iter().map(|(n, s)| format!("'{n}' of {} MiB", s >> 20)).collect::<Vec<_>>().join(", "),
         v[0],
         VIEW_SLOTS.lock().len() as u64 * (mixed_window() >> 20),
@@ -1111,7 +1111,8 @@ fn views_state() -> String {
         v[3],
         v[4],
         v[6] as f64 / v[4].max(1) as f64 / 1000.0,
-        v[5]
+        v[5],
+        crate::gpu::resident::view_census()
     )
 }
 

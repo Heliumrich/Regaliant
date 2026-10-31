@@ -1816,6 +1816,24 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     r
 }
 
+/// Front end 2: whether written guest [lo, hi) is imported, one import per
+/// run of windows backed alike (views or private memory: one import cannot be
+/// of both, `mem::same_backing`). Its write-back stores through the guest
+/// page table, which every import fills, so a range across such a boundary
+/// needs no one import of it all.
+#[track_caller]
+fn import_written(lo: u64, hi: u64) -> bool {
+    let mut a = lo;
+    while a < hi {
+        let (_, e) = crate::mem::same_backing(a, a, hi);
+        if e <= a || span(a, e - a).is_none() {
+            return false;
+        }
+        a = e;
+    }
+    true
+}
+
 /// Front end 2 (`fe2::Armable`): calls `arm` with the parts of guest [a, b)
 /// that live imports cover and over which every import, live or dropped
 /// and not freed yet, is settled (`fe2::SETTLE` flips past its first
@@ -9996,7 +10014,7 @@ impl Exec {
         }
         let tb = tsc().wrapping_sub(tb);
         if written {
-            if span(lo, hi - lo).is_none() {
+            if !import_written(lo, hi) {
                 super::fe2::note_unscatterable();
                 self.report_error("front end 2: a written range cannot be imported (its GPU writes do not reach guest memory)", || format!("{lo:#x}..{hi:#x}"));
             }

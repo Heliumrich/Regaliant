@@ -820,7 +820,7 @@ fn word_end(a: u64, hi: u64) -> u64 {
 }
 
 /// Counters (`status`).
-static STATS: [AtomicU64; 33] = [const { AtomicU64::new(0) }; 33];
+static STATS: [AtomicU64; 34] = [const { AtomicU64::new(0) }; 34];
 const S_ENSURES: usize = 0;
 const S_ENSURE_PAGES: usize = 1;
 const S_FAST: usize = 2;
@@ -860,6 +860,8 @@ const S_RESOLVED_RUNS: usize = 30;
 /// them (`taken_lacking`), and their pages.
 const S_TAKEN_RUNS: usize = 31;
 const S_TAKEN_PAGES: usize = 32;
+/// View pages the residency armed at its takes, armed here too (`adopt_armed`).
+const S_ADOPTED: usize = 33;
 
 /// Placement checks by size (pages: <16, <256, <4096, more): [checks,
 /// pages, takes, take ns].
@@ -902,6 +904,24 @@ pub fn gpu_pages(lo: u64, hi: u64) -> u64 {
 /// Counts pages copied into the mirror by the CPU (no import window).
 pub fn note_memcpy(pages: u64) {
     STATS[S_MEMCPY].fetch_add(pages, Ordering::Relaxed);
+}
+
+/// A page of a view window the residency armed through the host at a take
+/// (`resident::take_written`): armed for front end 2 as if armed here. Its
+/// own arming refuses such pages (read-only already), so without this they
+/// were taken again after every view raise (2026-10-31, views boot
+/// -135103). A take arms a page only after reporting it or finding it clean
+/// and armed, and every take's written pages reach `marks_taken`, so the
+/// host's bit set at a take leaves no write unseen; a fault clears it, and
+/// `watch` ends the arming here as for pages armed here.
+pub fn adopt_armed(page: u64) {
+    if !on() {
+        return;
+    }
+    let Some(c) = chunk(page, false) else { return };
+    let i = idx(page);
+    c.armed[i / 64].fetch_or(1u64 << (i % 64), Ordering::AcqRel);
+    STATS[S_ADOPTED].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Counts written bindings whose pages no import window covers (their GPU
@@ -2323,7 +2343,12 @@ fn watch() {
             }
             let _ = f.flush();
         }
-        for &(page, _, rip) in &got {
+        for &(page, write, rip) in &got {
+            // (Pages of view windows: the residency tracks their writes, and
+            // only the page written turns volatile.)
+            if write && crate::mem::view_window(page) {
+                super::resident::host_fault(page);
+            }
             let Some(c) = chunk(page, false) else {
                 FAULTS[F_OUTSIDE].fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -3741,7 +3766,7 @@ pub fn status() -> String {
     let compacts = if COMPACTS[0].load(Ordering::Relaxed) > 0 { format!("    front end 2's touched-page lists made from touched bits (`tune touch_bits`): {} write-backs, {} words of bits scanned\n", COMPACTS[0].load(Ordering::Relaxed), COMPACTS[1].load(Ordering::Relaxed)) } else { String::new() };
     let census = if cn > 0 { format!("    front end 2's write-back census (`tune fe2_scatter_read`): {cn} dwords marked, {cs} of them ({:.1}%) held by guest memory already; in pages draws read indices from (`DS_INDEX_CENSUS`): {} dwords ({:.1}%), {} pages\n", 100.0 * cs as f64 / cn as f64, w[4], 100.0 * w[4] as f64 / cn as f64, w[5]) } else { String::new() };
     format!(
-        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages; runs a take of their epoch had looked at, without another: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action; CP writes with work to write back {} of labels a CP of ours waits on, {} left to the batch's close, {} with their guest-memory copy at the close); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value, {} again with the label's page unwritten and {} gone past ended none); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
+        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages; runs a take of their epoch had looked at, without another: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed; {} view pages armed at the residency's takes adopted), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action; CP writes with work to write back {} of labels a CP of ours waits on, {} left to the batch's close, {} with their guest-memory copy at the close); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value, {} again with the label's page unwritten and {} gone past ended none); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
         s[S_ENSURES],
         s[S_ENSURE_PAGES],
         s[S_FAST],
@@ -3768,6 +3793,7 @@ pub fn status() -> String {
         s[S_ARMED],
         s[S_ARM_RUNS],
         s[S_ARM_FAILED],
+        s[S_ADOPTED],
         s[S_ARM_ENDED],
         HOLES.load(Ordering::Relaxed),
         FOLLOW[0].load(Ordering::Relaxed),

@@ -97,6 +97,10 @@ const VOLATILE_FRAMES: u32 = 8;
 /// turns volatile (n up to VOL_MAX_LEVEL: 32 frames, then 64, .. 1024).
 const VOL_BASE: u32 = 16;
 const VOL_MAX_LEVEL: u8 = 6;
+/// A page whose next write fault comes this many frames after its stay
+/// unarmed ended loses its level (a burst of writes, a load's, is over; a
+/// page written all the time faults right after its stay).
+const QUIET_FRAMES: u32 = 64;
 
 struct Chunk {
     pages: Box<[AtomicU8]>,
@@ -207,7 +211,11 @@ static ON: AtomicBool = AtomicBool::new(false);
 /// protection calls and ns, mirror pages backed, uploads, readbacks, resets,
 /// fault races, pages claimed for upload, pages made volatile, pages made
 /// host class, bindings served from the mirror, and refusals by REFUSE_NAMES.
-static STATS: [AtomicU64; 21] = [const { AtomicU64::new(0) }; 21];
+static STATS: [AtomicU64; 23] = [const { AtomicU64::new(0) }; 23];
+/// Levels reset by a write fault long after the page's stay (`QUIET_FRAMES`).
+const S_VOL_DECAYED: usize = 21;
+/// Write faults the host answered, read from its ring (`host_fault`).
+const S_HOST_FAULTS: usize = 22;
 /// Mirror pages made stale by GPU writes in guest memory (`gpu_wrote`).
 const S_GPU_INVAL: usize = 20;
 /// Volatile pages armed again after their stay (`take_written`).
@@ -603,6 +611,11 @@ fn reconcile(c: &Chunk, base: u64) {
 
 /// Page `i` of `c` lost its host bit while armed through the host: no
 /// longer armed or clean, volatile when written again soon (as `on_fault`).
+/// With the faults read from the host's ring (`faults_from_ring`) only the
+/// page written counts toward volatility (`host_fault`): the host's answer
+/// for a 64-page word (`hosted::set_word_mode`) ends the arming of the rest
+/// with no write of theirs, and counting them made a hot page's whole word
+/// volatile, reported in every epoch.
 fn host_answered(c: &Chunk, i: usize, frame: u32) {
     let s = &c.pages[i];
     loop {
@@ -617,19 +630,56 @@ fn host_answered(c: &Chunk, i: usize, frame: u32) {
             return;
         }
         if s.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            let last = c.faulted[i].swap(frame, Ordering::AcqRel);
-            let volatile = last != 0 && frame.wrapping_sub(last) <= VOLATILE_FRAMES;
-            if volatile {
-                let level = c.vol_level[i].load(Ordering::Acquire).saturating_add(1).min(VOL_MAX_LEVEL);
-                c.vol_level[i].store(level, Ordering::Release);
-                c.vol_until[i].store(frame.wrapping_add(VOL_BASE << level), Ordering::Release);
-                STATS[S_VOLATILE].fetch_add(1, Ordering::Relaxed);
-            }
+            let volatile = !faults_from_ring() && note_write_fault(c, i, frame);
             s.store((cur & !(ST_ARMED | ST_VALID | ST_BUSY | ST_CLEAN)) | if volatile { ST_VOLATILE } else { 0 }, Ordering::Release);
             flag(c, i);
             HOST_STATS[H_ANSWERED].fetch_add(1, Ordering::Relaxed);
             return;
         }
+    }
+}
+
+/// A write fault on page `i` of `c` in `frame`: whether the page turns
+/// volatile (written again within VOLATILE_FRAMES of its last fault: it
+/// stays unarmed VOL_BASE << level frames, its level one up). A fault more
+/// than QUIET_FRAMES after the page's last stay ended resets its level.
+fn note_write_fault(c: &Chunk, i: usize, frame: u32) -> bool {
+    let last = c.faulted[i].swap(frame, Ordering::AcqRel);
+    let volatile = last != 0 && frame.wrapping_sub(last) <= VOLATILE_FRAMES;
+    if volatile {
+        let level = c.vol_level[i].load(Ordering::Acquire).saturating_add(1).min(VOL_MAX_LEVEL);
+        c.vol_level[i].store(level, Ordering::Release);
+        c.vol_until[i].store(frame.wrapping_add(VOL_BASE << level), Ordering::Release);
+        STATS[S_VOLATILE].fetch_add(1, Ordering::Relaxed);
+    } else if c.vol_level[i].load(Ordering::Acquire) != 0 && frame.wrapping_sub(c.vol_until[i].load(Ordering::Acquire)) as i32 > QUIET_FRAMES as i32 {
+        c.vol_level[i].store(0, Ordering::Release);
+        STATS[S_VOL_DECAYED].fetch_add(1, Ordering::Relaxed);
+    }
+    volatile
+}
+
+/// Whether the host's answered faults reach `host_fault` from its ring
+/// (front end 2's fault reader, `fe2::watch`, runs: hosted with front end 2
+/// on), so that `host_answered` leaves volatility to them.
+fn faults_from_ring() -> bool {
+    crate::hosted::on() && super::fe2::on() && !crate::sections::on()
+}
+
+/// A write fault the host answered on guest `page` (front end 2's reader of
+/// the host's ring, for view windows): the page written, so its volatility
+/// (`note_write_fault`); its arming ends when a take finds its host bit gone
+/// (`reconcile`), before or after this.
+pub fn host_fault(page: u64) {
+    if !via_host() || !faults_from_ring() {
+        return;
+    }
+    let Some(c) = chunk(page, false) else { return };
+    let i = idx(page);
+    STATS[S_HOST_FAULTS].fetch_add(1, Ordering::Relaxed);
+    let frame = super::FRAMES.load(Ordering::Relaxed) as u32 + 1;
+    if note_write_fault(c, i, frame) {
+        c.pages[i].fetch_or(ST_VOLATILE, Ordering::AcqRel);
+        flag(c, i);
     }
 }
 
@@ -724,6 +774,11 @@ fn arm_with(base: u64, len: u64, extra: u8) -> u64 {
                         }
                         if m & ST_ARMED != 0 {
                             *armed += 1;
+                            // (A view page armed at a take: front end 2's
+                            // arming too, `fe2::adopt_armed`.)
+                            if host && crate::mem::view_window(q) {
+                                super::fe2::adopt_armed(q);
+                            }
                         }
                     }
                     q += PAGE;
@@ -969,20 +1024,10 @@ pub fn on_fault(addr: u64, write: bool) -> bool {
             protect(page, PAGE, PAGE_READWRITE);
             // Written again soon after the last write: volatile from now on.
             let frame = super::FRAMES.load(Ordering::Relaxed) as u32 + 1;
-            let last = c.faulted[idx(page)].swap(frame, Ordering::AcqRel);
-            let volatile = last != 0 && frame.wrapping_sub(last) <= VOLATILE_FRAMES;
-            if volatile {
-                let i = idx(page);
-                let level = c.vol_level[i].load(Ordering::Acquire).saturating_add(1).min(VOL_MAX_LEVEL);
-                c.vol_level[i].store(level, Ordering::Release);
-                c.vol_until[i].store(frame.wrapping_add(VOL_BASE << level), Ordering::Release);
-            }
+            let volatile = note_write_fault(c, idx(page), frame);
             s.store((cur & !(ST_ARMED | ST_VALID | ST_BUSY | ST_CLEAN)) | if volatile { ST_VOLATILE } else { 0 }, Ordering::Release);
             flag(c, idx(page));
             STATS[S_FAULTS].fetch_add(1, Ordering::Relaxed);
-            if volatile {
-                STATS[S_VOLATILE].fetch_add(1, Ordering::Relaxed);
-            }
             return true;
         }
     }
@@ -2137,6 +2182,28 @@ fn protect_test() -> Result<String, String> {
 }
 
 /// Status line.
+/// The write tracking of the mixed range's view windows (`mem::views_state`):
+/// its takes, reports, arming, faults and volatility.
+pub fn view_census() -> String {
+    let v: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let t: Vec<u64> = TAKE_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let h: Vec<u64> = HOST_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    format!(
+        " (pages visited {}, {} of the reports for pages left unarmed (volatile, or a file read writing them: once per epoch), {} pages armed in {} calls ({:.1} us each); write faults {} here, {} answered by the host ({} of them read from its ring); {} turned volatile, {} armed again after their stay, {} levels reset after a quiet stay)",
+        t[3],
+        t[5],
+        t[2],
+        v[S_PROTECTS],
+        v[S_PROTECT_NS] as f64 / v[S_PROTECTS].max(1) as f64 / 1000.0,
+        v[S_FAULTS],
+        h[H_ANSWERED],
+        v[S_HOST_FAULTS],
+        v[S_VOLATILE],
+        v[S_VOL_REARMED],
+        v[S_VOL_DECAYED]
+    )
+}
+
 pub fn status() -> String {
     let v: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     // Section-backed memory's write tracking (with residency too), then
