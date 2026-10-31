@@ -101,33 +101,79 @@ fn lookup(t: tables::Table, op: u16) -> Option<&'static str> {
     t.binary_search_by_key(&op, |(o, _)| *o).ok().map(|i| t[i].1)
 }
 
+/// Every encoding, in `Enc`'s order (`NAMES`).
+const ENCS: [Enc; 20] = [
+    Enc::Sop2,
+    Enc::Sopk,
+    Enc::Sop1,
+    Enc::Sopc,
+    Enc::Sopp,
+    Enc::Smem,
+    Enc::Vop2,
+    Enc::Vop1,
+    Enc::Vopc,
+    Enc::Vop3,
+    Enc::Vop3p,
+    Enc::Vintrp,
+    Enc::Ds,
+    Enc::Mubuf,
+    Enc::Mtbuf,
+    Enc::Mimg,
+    Enc::Exp,
+    Enc::Flat,
+    Enc::Global,
+    Enc::Scratch,
+];
+
+/// Opcodes below this have their names in `NAMES` (VOP3's are 10 bits).
+const NAME_OPS: usize = 1024;
+
+/// `Inst::name` by encoding and opcode, made once from the tables (a binary
+/// search and an alias split per call cost the recording threads ~4% of
+/// their busy samples at an arrival, in decoding and per-program scans:
+/// FINDINGS.md 2026-10-31).
+static NAMES: std::sync::OnceLock<Vec<[Option<&'static str>; NAME_OPS]>> = std::sync::OnceLock::new();
+
+fn names() -> &'static Vec<[Option<&'static str>; NAME_OPS]> {
+    NAMES.get_or_init(|| ENCS.iter().map(|&enc| std::array::from_fn(|op| name_searched(enc, op as u16))).collect())
+}
+
+/// An instruction's name (first alias) from the tables themselves.
+fn name_searched(enc: Enc, op: u16) -> Option<&'static str> {
+    use tables::*;
+    let n = match enc {
+        Enc::Sop2 => lookup(SOP2, op),
+        Enc::Sopk => lookup(SOPK, op),
+        Enc::Sop1 => lookup(SOP1, op),
+        Enc::Sopc => lookup(SOPC, op),
+        Enc::Sopp => lookup(SOPP, op),
+        Enc::Smem => lookup(SMEM, op),
+        Enc::Vop2 => lookup(VOP2, op),
+        Enc::Vop1 => lookup(VOP1, op),
+        Enc::Vopc => lookup(VOPC, op),
+        Enc::Vop3 => vop3_name(op),
+        Enc::Vop3p => lookup(VOP3P, op),
+        Enc::Vintrp => lookup(VINTRP, op),
+        Enc::Ds => lookup(DS, op),
+        Enc::Mubuf => lookup(MUBUF, op),
+        Enc::Mtbuf => lookup(MTBUF, op),
+        Enc::Mimg => lookup(MIMG, op),
+        Enc::Exp => Some("exp"),
+        Enc::Flat => lookup(FLAT, op),
+        Enc::Global => lookup(GLOBAL, op),
+        Enc::Scratch => lookup(SCRATCH, op),
+    }?;
+    Some(n.split('/').next().unwrap_or(n))
+}
+
 impl Inst {
     /// Instruction name (first alias), or None if the opcode is unknown.
+    #[inline]
     pub fn name(&self) -> Option<&'static str> {
-        use tables::*;
-        let n = match self.enc {
-            Enc::Sop2 => lookup(SOP2, self.op),
-            Enc::Sopk => lookup(SOPK, self.op),
-            Enc::Sop1 => lookup(SOP1, self.op),
-            Enc::Sopc => lookup(SOPC, self.op),
-            Enc::Sopp => lookup(SOPP, self.op),
-            Enc::Smem => lookup(SMEM, self.op),
-            Enc::Vop2 => lookup(VOP2, self.op),
-            Enc::Vop1 => lookup(VOP1, self.op),
-            Enc::Vopc => lookup(VOPC, self.op),
-            Enc::Vop3 => vop3_name(self.op),
-            Enc::Vop3p => lookup(VOP3P, self.op),
-            Enc::Vintrp => lookup(VINTRP, self.op),
-            Enc::Ds => lookup(DS, self.op),
-            Enc::Mubuf => lookup(MUBUF, self.op),
-            Enc::Mtbuf => lookup(MTBUF, self.op),
-            Enc::Mimg => lookup(MIMG, self.op),
-            Enc::Exp => Some("exp"),
-            Enc::Flat => lookup(FLAT, self.op),
-            Enc::Global => lookup(GLOBAL, self.op),
-            Enc::Scratch => lookup(SCRATCH, self.op),
-        }?;
-        Some(n.split('/').next().unwrap_or(n))
+        match names()[self.enc as usize].get(self.op as usize) {
+            Some(n) => *n,
+            None => name_searched(self.enc, self.op),
+        }
     }
 
     /// Name without ACO's `_e64` suffix (VOP3-only variants of VOP1/VOP2 ops):
@@ -847,4 +893,22 @@ pub fn disasm(inst: &Inst) -> String {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    /// `NAMES` is indexed by `Enc`'s discriminants and agrees with the
+    /// tables for every opcode it holds.
+    #[test]
+    fn names_follow_the_tables() {
+        for (i, &enc) in ENCS.iter().enumerate() {
+            assert_eq!(enc as usize, i, "{enc:?}");
+            for op in 0..NAME_OPS as u16 {
+                assert_eq!(names()[i][op as usize], name_searched(enc, op), "{enc:?} {op:#x}");
+            }
+        }
+        assert_eq!(names()[Enc::Sopp as usize][1], name_searched(Enc::Sopp, 1));
+    }
 }
