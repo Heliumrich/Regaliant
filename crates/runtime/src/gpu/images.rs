@@ -2041,7 +2041,7 @@ fn record_upload(cmd: vk::CommandBuffer, image: vk::Image, first: bool, buf: vk:
 }
 
 /// A texture's re-upload left by `refresh` for after the image cache's lock
-/// (`tune reupload_out`): its write marks taken and re-armed under the lock,
+/// (since 2026-11-01): its write marks taken and re-armed under the lock,
 /// its parts chosen and detiled outside it by the thread that took them, its
 /// copy recorded and its hashes stored under the lock again
 /// (`finish_refreshes`).
@@ -2079,7 +2079,7 @@ struct Prepared {
 
 thread_local! {
     /// This thread's refreshes may leave their re-uploads to
-    /// `finish_refreshes` (`Exec::bind_stage`, `tune reupload_out`).
+    /// `finish_refreshes` (`Exec::bind_stage`).
     static REFRESH_DEFER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Re-uploads this thread left for after the lock.
     static REFRESH_JOBS: std::cell::RefCell<Vec<RefreshJob>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -2088,7 +2088,7 @@ thread_local! {
     static REFRESH_WAITS: std::cell::RefCell<Vec<std::sync::Arc<RefreshWait>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Deferred re-uploads (`tune reupload_out`): [left for after the lock,
+/// Deferred re-uploads (`RefreshJob`): [left for after the lock,
 /// recorded, dropped (the image gone or GPU-written meanwhile), bindings
 /// that waited for one, ns outside the lock, ns of those waits].
 static REFRESH_OUT: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
@@ -2110,12 +2110,10 @@ fn reupload_on_cpu(key: &ImageKey, t: &Tsharp) -> bool {
 }
 
 /// Lets this thread's texture refreshes leave their re-uploads to
-/// `finish_refreshes` (`tune reupload_out`; `Exec::bind_stage`, around its
-/// lock for a stage's images).
+/// `finish_refreshes` (`Exec::bind_stage`, around its lock for a stage's
+/// images).
 pub fn defer_refreshes() {
-    if super::tune::reupload_out() {
-        REFRESH_DEFER.with(|d| d.set(true));
-    }
+    REFRESH_DEFER.with(|d| d.set(true));
 }
 
 /// After the lock: this thread's deferred re-uploads (chosen and detiled
@@ -4423,8 +4421,8 @@ impl Images {
                     _ => 6,
                 })
             });
-            // Detiled after the lock (`tune reupload_out`, CPU-detiled
-            // re-uploads), the copy recorded under it again.
+            // Detiled after the lock (CPU-detiled re-uploads), the copy
+            // recorded under it again.
             if REFRESH_DEFER.with(|d| d.get()) && reupload_on_cpu(&key, t) {
                 let cause = REUPLOAD_CAUSE.with(|c| c.replace(0));
                 let wait = std::sync::Arc::new(RefreshWait::default());
@@ -5275,7 +5273,7 @@ impl Images {
         let gpu = if COPY_UPLOADS.load(Relaxed) > 0 { format!("{gpu}; CPU-detiled uploads through the copy queue {}", COPY_UPLOADS.load(Relaxed)) } else { gpu };
         let o: Vec<u64> = REFRESH_OUT.iter().map(|c| c.load(Relaxed)).collect();
         let gpu = if o[0] + o[3] > 0 {
-            format!("{gpu}; re-uploads detiled after the lock (`tune reupload_out`): {} ({} recorded, {} dropped: their image gone or GPU-written meanwhile; {} ms outside the lock), bindings that waited for one {} ({} ms)", o[0], o[1], o[2], o[4] / 1_000_000, o[3], o[5] / 1_000_000)
+            format!("{gpu}; re-uploads detiled after the lock: {} ({} recorded, {} dropped: their image gone or GPU-written meanwhile; {} ms outside the lock), bindings that waited for one {} ({} ms)", o[0], o[1], o[2], o[4] / 1_000_000, o[3], o[5] / 1_000_000)
         } else {
             gpu
         };

@@ -14082,8 +14082,7 @@ impl Exec {
         bound.stored.clear();
         bound.stencil_views.clear();
         // One image-cache lock for all the stage's images and samplers (the
-        // re-uploads of textures the title rewrote detiled after it, `tune
-        // reupload_out`).
+        // re-uploads of textures the title rewrote detiled after it).
         let mut failed: Vec<String> = Vec::new();
         super::images::defer_refreshes();
         let r: Result<(), String> = super::images::with(|im| {
