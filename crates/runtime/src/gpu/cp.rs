@@ -5654,7 +5654,6 @@ impl Cp {
                 let vals: Vec<u32> = (0..count).map(|i| p(3 + i)).collect();
                 let (name, at) = (self.name.clone(), self.cur_packet);
                 let len = if no_incr { 4 } else { 4 * count };
-                super::mirror::invalidate(&[(a, len)]);
                 let label = match (count, no_incr) {
                     (1, _) => Some((vals[0] as u64, 4u8)),
                     (2, false) => Some((vals[0] as u64 | (vals[1] as u64) << 32, 8u8)),
@@ -5741,7 +5740,6 @@ impl Cp {
                     return;
                 }
                 let (name, at) = (self.name.clone(), self.cur_packet);
-                super::mirror::invalidate(&[(dst_a, if wide { 8 } else { 4 })]);
                 let seq = self.effect(
                     false,
                     Some((dst_a, if wide { 8 } else { 4 })),
@@ -5792,7 +5790,6 @@ impl Cp {
         }
         let (name, at) = (self.name.clone(), self.cur_packet);
         let range = Some((dst, if daic { 4 } else { bytes }));
-        super::mirror::invalidate(&[(dst, if daic { 4 } else { bytes })]);
         super::precache::invalidate(dst, if daic { 4 } else { bytes });
         super::exec::trace_writes(|| format!("{} DMA_DATA (src_sel {src_sel}, from {src:#x})", self.name), dst, bytes);
         if super::exec::enabled() {

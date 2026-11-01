@@ -68,8 +68,6 @@ impl LockStat {
 
 /// The batch-start copy cache (`precache`).
 pub static COPY_CACHE: LockStat = LockStat::new("copy cache");
-/// VRAM mirrors of GPU-written buffers (`mirror`).
-pub static MIRRORS: LockStat = LockStat::new("mirrors");
 /// Video-memory homes (`homes`).
 pub static HOMES: LockStat = LockStat::new("homes");
 /// The logs of unfinished batches' and deferred CP writes
@@ -79,7 +77,7 @@ pub static WRITE_LOGS: LockStat = LockStat::new("write logs");
 /// the uploads made under it).
 pub static IMAGE_CACHE: LockStat = LockStat::new("image cache");
 
-const ALL: [&LockStat; 5] = [&COPY_CACHE, &MIRRORS, &HOMES, &WRITE_LOGS, &IMAGE_CACHE];
+const ALL: [&LockStat; 4] = [&COPY_CACHE, &HOMES, &WRITE_LOGS, &IMAGE_CACHE];
 
 /// Clears the counts (`profile reset`).
 pub fn reset_stats() {

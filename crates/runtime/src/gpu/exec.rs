@@ -871,7 +871,6 @@ fn revalidate_spans() {
         return;
     }
     let ranges: Vec<(u64, u64)> = changed.iter().map(|&(a, b)| (a, b - a)).collect();
-    super::mirror::invalidate(&ranges);
     for &(a, n) in &ranges {
         super::fe2::invalidate(a, n);
     }
@@ -1658,6 +1657,12 @@ impl Drop for Registered {
     }
 }
 
+/// `DS_IMPORT_LOG=1` (diagnosis): every guest import logged (`import_once`).
+fn import_log() -> bool {
+    static L: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *L.get_or_init(|| std::env::var("DS_IMPORT_LOG").ok().as_deref() == Some("1"))
+}
+
 /// Imports the guest window around [base, base+size) (another queue may
 /// have done so meanwhile). The driver's import (it pins the pages: up to
 /// tens of milliseconds) runs outside the import list's lock: held for
@@ -1710,10 +1715,17 @@ fn import_once(base: u64, size: u64) -> Option<Option<(vk::Buffer, u64, u64)>> {
         super::resident::mark_host(vs, ve - vs);
     }
     {
-        // Diagnostics: how the title mapped memory the GPU uses.
+        // Diagnostics: how the title mapped memory the GPU uses
+        // (`DS_IMPORT_LOG=1`: every import at info level, for a census of
+        // the order of first uses).
         let st = crate::mem::MEM.lock();
         if let Some(v) = st.find(base) {
-            crate::debug!("gpu: importing for {base:#x}+{size:#x}: mapping {:#x}+{:#x} {:?} prot {:#x} '{}'", v.start, v.size, v.kind, v.prot, v.name);
+            if import_log() {
+                let by = IMPORT_SITE.with(|c| c.get()).map_or(String::new(), |l| format!(" for {}:{}", l.file().rsplit(['/', '\\']).next().unwrap_or(l.file()), l.line()));
+                crate::info!("gpu: import at flip {}: window {lo:#x}..{hi:#x} for {base:#x}+{size:#x} in mapping {:#x}+{:#x} {:?} '{}'{by}", super::FRAMES.load(Ordering::Relaxed), v.start, v.size, v.kind, v.name);
+            } else {
+                crate::debug!("gpu: importing for {base:#x}+{size:#x}: mapping {:#x}+{:#x} {:?} prot {:#x} '{}'", v.start, v.size, v.kind, v.prot, v.name);
+            }
         }
     }
     let a = fixed().import_align;
@@ -3186,9 +3198,6 @@ struct Bound {
     stencil_views: Vec<vk::Image>,
     /// Buffers bound through a VRAM shadow (copied in before, out after).
     shadows: Vec<Shadow>,
-    /// Written buffer resources and where their result is after the stage:
-    /// (guest base, size, buffer, offset of the base) - mirror refreshes.
-    write_src: Vec<(u64, u64, vk::Buffer, u64)>,
     /// Where each buffer binding was placed (DS_PROFILE_GPU): (Placement,
     /// bound bytes, written).
     placements: Vec<(Placement, u64, bool)>,
@@ -6776,6 +6785,33 @@ fn prog_census_lines() -> String {
     out
 }
 
+/// An executor's kind for `tune ballast_at` (`Exec::ballast_kind`).
+fn ballast_kind(name: &str) -> u8 {
+    match name {
+        "gpu-gfx" => 0,
+        "gpu-acb0x50" => 2,
+        n if n.starts_with("gpu-gfx-par") => 1,
+        n if n.starts_with("gpu-acb0x50-par") => 3,
+        _ => 4,
+    }
+}
+
+/// Diagnosis (`tune ballast_ns`, `ballast_at`; live): a spin of that many
+/// ns at each draw and dispatch of the executor kinds `ballast_at` names (bit
+/// k: `Exec::ballast_kind` k), so an in-boot A/B prices a recording chain in
+/// ms of frame per ms of its work.
+#[inline]
+pub(super) fn ballast(kind: u8) {
+    let ns = super::tune::ballast_ns();
+    if ns == 0 || super::tune::ballast_at() & (1 << kind) == 0 {
+        return;
+    }
+    let t = std::time::Instant::now();
+    while (t.elapsed().as_nanos() as u64) < ns {
+        std::hint::spin_loop();
+    }
+}
+
 /// Lap timer of a command's steps (profiling only).
 pub(super) struct Laps {
     last: Option<std::time::Instant>,
@@ -7290,7 +7326,6 @@ pub fn shader_profile() -> String {
     s.push_str(&draw_steps_line());
     s.push_str(&super::cp::draw_state_line());
     s.push_str(&draw::draw_diff_line());
-    s.push_str(&draw::again_line());
     s.push_str(&draw::prep_repeat_line());
     s.push_str(&bind_steps_line());
     s.push_str(&pre_steps_line());
@@ -7528,6 +7563,10 @@ pub struct Exec {
     dispatched: bool,
     reported: HashMap<String, u64>,
     name: String,
+    /// This executor's kind for `tune ballast_at` (`ballast`): 0 the
+    /// graphics CP, 1 its workers, 2 queue 0x50, 3 its workers, 4 the other
+    /// compute queues and their workers.
+    ballast_kind: u8,
     /// Shaders recorded in the current batch (slow-batch reports).
     batch_shaders: Vec<u64>,
     /// Active dynamic-rendering instance (draws).
@@ -7652,11 +7691,6 @@ pub struct Exec {
     last_draw_end: (u64, u64),
     /// The last draw's GPU-read arguments and index base (`DS_DRAW_STATS`).
     last_draw_where: (Option<u64>, Option<u64>),
-    /// The last full draw, when a draw right after it can be recorded on the
-    /// state it left (`draw_again`), and the stages of the full draw in
-    /// progress as prepared (before binding filled their SGPR data).
-    again: Option<draw::Again>,
-    again_next: Option<[Option<draw::StageSig>; 2]>,
     /// The open batched draw run (`tune batch_draws`) and the program pair
     /// of the last draws with the same context state and how many in a row.
     draw_run: Option<draw::DrawRun>,
@@ -8347,6 +8381,7 @@ impl Exec {
                 dispatched: false,
                 reported: HashMap::new(),
                 name: name.to_string(),
+                ballast_kind: ballast_kind(name),
                 batch_shaders: Vec::new(),
                 rendering: None,
                 dyncache: Default::default(),
@@ -8398,8 +8433,6 @@ impl Exec {
                 draw_same: false,
                 last_draw_end: (u64::MAX, 0),
                 last_draw_where: (None, None),
-                again: None,
-                again_next: None,
                 draw_run: None,
                 draw_streak: ((0, 0), 0),
                 own_checks: Vec::new(),
@@ -10657,7 +10690,6 @@ impl Exec {
         b.stored.clear();
         b.stencil_views.clear();
         b.shadows.clear();
-        b.write_src.clear();
         b.placements.clear();
         b.in_place.clear();
         b.sgpr_base = None;
@@ -13401,7 +13433,7 @@ impl Exec {
                         };
                         BindClock::mark(&mut clk, 3);
                         // Read-only bindings of buffers GPU work wrote: VRAM mirrors.
-                        let mirrored = if read_only && snap.is_none() && home.is_none() { resident.or_else(|| super::mirror::lookup(base, size)) } else { None };
+                        let mirrored = if read_only && snap.is_none() && home.is_none() { resident } else { None };
                         BindClock::mark(&mut clk, 4);
                         // Other read-only buffers: a copy made at the batch's start
                         // (dispatches only with `tune pre_cs`).
@@ -13565,10 +13597,6 @@ impl Exec {
                                             placement = Placement::Scratch;
                                             info = vk::DescriptorBufferInfo { buffer: sb, offset: 0, range };
                                         }
-                                    }
-                                    if res.written && matches!(found.resources[i], Resolved::Buffer(_)) {
-                                        // Within the bound range (clamped to the mapping).
-                                        bound.write_src.push((base, size.min(range - bias), info.buffer, info.offset + bias));
                                     }
                                     BindClock::mark(&mut clk, 8);
                                 }
@@ -14125,6 +14153,7 @@ impl Exec {
     /// `indirect`: the arguments' guest address (the GPU reads the group
     /// counts; `groups` is unused).
     fn dispatch_inner(&mut self, cp: &Cp, mut groups: [u32; 3], initiator: u32, indirect: Option<u64>) -> Result<(), String> {
+        ballast(self.ballast_kind);
         // Phase times only when profiling (a clock read costs ~20 ns); the
         // total always (slow dispatches are reported).
         let t_start = std::time::Instant::now();
@@ -14374,7 +14403,6 @@ impl Exec {
                     if !zeroed.is_empty() {
                         self.clear_images_zero(&zeroed);
                     }
-                    super::mirror::invalidate(&[(base, len)]);
                     super::track::gpu_write(base, len);
                     self.note_write(base, len);
                     if lazy_barriers() {
@@ -14907,39 +14935,6 @@ impl Exec {
         }
         stamp(3);
         lap.mark(13);
-        // VRAM mirrors of what this dispatch wrote (later read bindings use them).
-        let mut mirrored: Vec<(u64, u64)> = Vec::new();
-        let mut copies: Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)> = Vec::new();
-        for &(base, size, src, src_off) in &bound.write_src {
-            if let Some((mbuf, moff)) = super::mirror::for_write(base, size) {
-                copies.push((src, mbuf, vk::BufferCopy { src_offset: src_off, dst_offset: moff, size }));
-                mirrored.push((base, size));
-            }
-        }
-        if mirrored.is_empty() {
-            if !writes_here.is_empty() {
-                super::mirror::invalidate(&writes_here);
-            }
-        } else {
-            let unmirrored: Vec<(u64, u64)> = writes_here.iter().copied().filter(|w| !mirrored.contains(w)).collect();
-            if !unmirrored.is_empty() {
-                super::mirror::invalidate(&unmirrored);
-            }
-        }
-        if !copies.is_empty() {
-            unsafe {
-                let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
-                c.device.cmd_pipeline_barrier(self.cmd(), vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
-                for (src, dst, r) in &copies {
-                    c.device.cmd_copy_buffer(self.cmd(), *src, *dst, &[*r]);
-                }
-            }
-            // Readers later in this batch wait for the copies.
-            self.barrier_wanted = true;
-            for &(b, n) in &mirrored {
-                super::mirror::refreshed(b, n);
-            }
-        }
         lap.mark(14);
         if repeat {
             // This batch's own record of them still: it may have begun since.
@@ -15122,7 +15117,6 @@ pub fn status() -> String {
         + &super::cp::draw_state_line()
         + &draw::draw_diff_line()
         + &draw::prep_repeat_line()
-        + &draw::again_line()
         + &draw::batch_line()
         + &super::xwait::status()
         + &super::resident::owned_line()
@@ -15174,7 +15168,6 @@ pub fn status() -> String {
         + &super::vk::defer::status()
         + &super::pcache::status()
         + &super::images::scrub_status()
-        + &super::mirror::status()
         + &super::homes::status()
         + &super::resident::status()
         + &super::fe2::status()

@@ -217,7 +217,6 @@ fn write_back(list: &[(u64, Vec<u8>)]) {
         super::precache::invalidate(*a, n);
         unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), *a as *mut u8, b.len()) };
         super::homes::cpu_written(*a, n);
-        super::mirror::invalidate(&[(*a, n)]);
     }
 }
 
