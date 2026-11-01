@@ -14081,8 +14081,11 @@ impl Exec {
         bound.images.clear();
         bound.stored.clear();
         bound.stencil_views.clear();
-        // One image-cache lock for all the stage's images and samplers.
+        // One image-cache lock for all the stage's images and samplers (the
+        // re-uploads of textures the title rewrote detiled after it, `tune
+        // reupload_out`).
         let mut failed: Vec<String> = Vec::new();
+        super::images::defer_refreshes();
         let r: Result<(), String> = super::images::with(|im| {
             for b in &found.tr.out.bindings {
                 match (b.kind, b.kind_resource().and_then(|i| found.resources.get(i))) {
@@ -14163,10 +14166,12 @@ impl Exec {
             }
             Ok(())
         });
+        let refreshed = super::images::finish_refreshes();
         for f in failed {
             self.report(f);
         }
         r?;
+        refreshed?;
         Ok(bound)
     }
 

@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 223] = [
+    static ALL: [Tunable; 224] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -255,6 +255,7 @@ pub mod tune {
         Tunable { name: "record_defer", env: "DS_RECORD_DEFER", default: 5, value: AtomicU64::new(UNSET) },
         Tunable { name: "fill_partial", env: "DS_FILL_PARTIAL", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_back_granule", env: "DS_FE2_BACK_GRANULE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "reupload_out", env: "DS_REUPLOAD_OUT", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -2325,6 +2326,14 @@ pub mod tune {
     /// (`resident::back_in`).
     pub fn fe2_back_granule() -> u64 {
         get(222)
+    }
+
+    /// Re-uploads of textures the title rewrote (CPU-detiled ones) are
+    /// chosen and detiled after the image cache's lock by the thread that
+    /// bound them, their copies recorded under it again
+    /// (`images::finish_refreshes`; live).
+    pub fn reupload_out() -> bool {
+        get(223) != 0
     }
 
     /// LOD statistics of pixel programs whose depth tests stay after the

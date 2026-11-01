@@ -1372,6 +1372,9 @@ pub struct Images {
     /// Bases of R32 float / R16 unorm images bound as storage: compute
     /// views of a depth plane (`depth_copies`).
     depth_feeds: super::fx::Set<u64>,
+    /// Images whose re-upload a thread left for after the lock
+    /// (`RefreshJob`).
+    refreshing: HashMap<ImageKey, std::sync::Arc<RefreshWait>>,
 }
 
 unsafe impl Send for Images {}
@@ -1595,6 +1598,632 @@ pub fn holds_part() -> String {
     format!("; image cache held 200 us or more (`DS_IMAGE_HOLDS`): {}; waited for by: {}; long holds by site: {}; image_for's steps: {}", parts.join(", "), waits.join(", "), sites.join(", "), steps.join(", "))
 }
 
+/// A 2D texture upload's (mip, layer)s to upload, read from guest memory
+/// under the guest-reader lock (`readers`, held until they are detiled), and
+/// where each goes in the staging buffer (`choose_2d`).
+struct Chosen {
+    lay: tiling::Layout,
+    layers: u32,
+    elem: u64,
+    block: bool,
+    size: u64,
+    precise: bool,
+    held: bool,
+    gpu: bool,
+    windows: Vec<(u64, u64, vk::Buffer)>,
+    readers: parking_lot::RwLockReadGuard<'static, ()>,
+    sums_on: bool,
+    sums: Vec<u64>,
+    end: u64,
+    regions: Vec<vk::BufferImageCopy>,
+    zeroed: Vec<(usize, u32, usize)>,
+    parts: Vec<(usize, u32, usize, usize)>,
+    total: usize,
+    zero_len: usize,
+    zero_off: usize,
+    detiled: usize,
+    skipped: usize,
+    parts_done: u64,
+    parts_left: u64,
+    t_detile: std::time::Instant,
+    t_table: std::time::Instant,
+    t_locked: std::time::Instant,
+    t_chosen: std::time::Instant,
+    take_ms: f64,
+}
+
+enum Chose {
+    /// Nothing to upload: (base, size).
+    Done((u64, u64)),
+    Parts(Chosen),
+}
+
+/// The guest range of a (mip, layer) of a 2D texture's layout, relative to
+/// its base (the mip tail: its first block).
+fn part_range(lay: &tiling::Layout, elem: u64, mip: usize, layer: u32) -> (u64, u64) {
+    let m = &lay.mips[mip];
+    let start = layer as u64 * lay.slice_size + if m.tail.is_some() { 0 } else { m.offset };
+    (start, if m.tail.is_some() { 1u64 << lay.block_log2 } else { m.pitch as u64 * m.padded_height as u64 * elem })
+}
+
+/// Chooses what an upload of a 2D texture reads (`Images::upload_parts`'
+/// first half, without the cache: under its lock for its own uploads, after
+/// it for re-uploads left by `refresh`): `first` (no image yet), `region`
+/// (its write tracking), GPU detiling allowed (`allow_gpu`); the cache's
+/// messages go to `notes`.
+#[allow(clippy::too_many_arguments)]
+fn choose_2d(key: ImageKey, t: &Tsharp, only: Option<&[(u64, u64)]>, all: bool, first: bool, region: Option<u32>, allow_gpu: bool, notes: &mut Vec<String>) -> Result<Chose, String> {
+    let precise = super::tune::upload_parts() && !first && !all && only.is_some();
+    let el = elem_log2(t.format).ok_or("unknown element size")?;
+    let block = is_block(t.format);
+    let layers = if key.ty3d { 1 } else { key.layers };
+    let lay = tiling::layout(t.sw_mode, el, key.width, key.height, key.levels, block).ok_or_else(|| format!("swizzle mode {} not supported", t.sw_mode))?;
+    if tiling::is_xor(t.sw_mode) {
+        notes.push(format!("texture with XOR swizzle mode {} uploaded with an assumed pipe count (2^{})", t.sw_mode, tiling::pipes_log2()));
+    }
+    let size = lay.size(layers);
+    // GPU detiling for textures of at least `tune gpu_detile` MiB.
+    let gpu = allow_gpu
+        && match super::tune::gpu_detile() {
+            0 => false,
+            n => size >= n << 20,
+        };
+    // Guest memory where a video-memory home holds newer GPU-written data
+    // (`homes`): this upload reads the older bytes (diagnostics).
+    if super::homes::any() && super::homes::any_stale(&[(t.base, size)]) {
+        let n = super::homes::IMAGE_STALE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 20 {
+            crate::warn!(
+                "images: {} {:#x} {}x{}x{} {:?} uploaded from guest memory where home {} holds GPU-written data not written back",
+                if first { "new image" } else { "image" },
+                t.base,
+                key.width,
+                key.height,
+                layers,
+                t.format,
+                super::homes::describe(t.base, size)
+            );
+        }
+    }
+    // Streamed textures are partially resident: the title maps single
+    // layers of texture arrays (light cookies), and within a layer the
+    // mip tail and the smaller mips (at the start of the chain). Every
+    // mapped (mip, layer) is uploaded; on the first upload the others
+    // are zero-filled, never left as undefined image memory (which holds
+    // whatever the device memory held before). Later mappings or writes
+    // re-upload (write tracking).
+    let elem = 1u64 << el;
+    let range = |mip: usize, layer: u32| part_range(&lay, elem, mip, layer);
+    // A partial re-upload (`precise`): the (mip, layer)s the written
+    // ranges (mappings, file reads) or the CPU's writes since the last
+    // take overlap. The title maps a layer of a streamed array at a time
+    // and fills mapped layers and small mips with CPU writes later. The
+    // marks are taken before the bytes are read (later writes are seen
+    // next time); taking resets them, so the copy cache and other
+    // textures on those pages are told (`precache::take_written_for`).
+    let mut written: Vec<(u64, u64)> = Vec::new();
+    let t_take = std::time::Instant::now();
+    let precise = precise && {
+        let mut pages = Vec::new();
+        let ok = super::precache::take_written_for(t.base, size, &mut pages, region, 4).is_some();
+        for p in pages {
+            match written.last_mut() {
+                Some(r) if r.0 + r.1 == p => r.1 += 4096,
+                _ => written.push((p, 4096)),
+            }
+        }
+        ok
+    };
+    let take_ms = t_take.elapsed().as_secs_f64() * 1e3;
+    // Pages checked and read under the guest-reader lock: the title may
+    // unmap layers of a streamed array meanwhile (`mem::GUEST_READERS`).
+    // Checked in the mapping table first, before the lock (which must
+    // not take the table's), and again with the operating system only
+    // when a mapping changed in between (`mem::table_view_held`).
+    let t_detile = std::time::Instant::now();
+    let g0 = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::SeqCst);
+    let table_whole = super::cp::valid(t.base, size) && crate::mem::host_readable(t.base, size);
+    let n_parts = key.levels as usize * layers as usize;
+    let table_parts: Vec<bool> = if table_whole {
+        Vec::new()
+    } else {
+        (0..n_parts)
+            .map(|i| {
+                let (s, n) = range(i / layers as usize, (i % layers as usize) as u32);
+                super::cp::valid(t.base + s, n) && crate::mem::host_readable(t.base + s, n)
+            })
+            .collect()
+    };
+    // GPU detiling: the import windows over the mapped parts, made now
+    // (making one takes the mapping table's lock, which the guest-reader
+    // lock's holders must not: decommits hold it while they wait for
+    // them).
+    let mut windows: Vec<(u64, u64, vk::Buffer)> = Vec::new();
+    if gpu {
+        for i in 0..n_parts {
+            if !(table_whole || table_parts[i]) {
+                continue;
+            }
+            let (s, n) = range(i / layers as usize, (i % layers as usize) as u32);
+            let (mut x, end) = (t.base + s, t.base + s + n);
+            while x < end {
+                if let Some(&(_, we, _)) = windows.iter().find(|&&(ws, we, _)| ws <= x && x < we) {
+                    x = we.min(end);
+                    continue;
+                }
+                let e = ((x & !(super::exec::window_bytes() - 1)) + super::exec::window_bytes()).min(end);
+                match super::exec::import_window(x, e - x) {
+                    Some((b, ws, we)) if ws <= x && e <= we => {
+                        windows.push((ws, we, b));
+                        x = we.min(end);
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+    let t_table = std::time::Instant::now();
+    let readers = crate::mem::GUEST_READERS.read();
+    let t_locked = std::time::Instant::now();
+    let held = crate::mem::table_view_held(g0);
+    UPLOAD_TABLE[usize::from(!held)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let whole = if held { table_whole } else { super::cp::valid(t.base, size) && crate::mem::os_readable(t.base, size) };
+    let mapped = |mip: usize, layer: u32| -> bool {
+        if whole {
+            return true;
+        }
+        if held {
+            return table_parts[mip * layers as usize + layer as usize];
+        }
+        let (s, n) = range(mip, layer);
+        super::cp::valid(t.base + s, n) && crate::mem::os_readable(t.base + s, n)
+    };
+    let candidate = |mip: usize, layer: u32| -> bool {
+        if !precise {
+            return true;
+        }
+        let (s, n) = range(mip, layer);
+        let (a, e) = (t.base + s, t.base + s + n);
+        // `written` is ascending and disjoint.
+        let i = written.partition_point(|&(pb, pl)| pb + pl <= a);
+        written.get(i).is_some_and(|&(pb, _)| pb < e) || only.is_some_and(|parts| parts.iter().any(|&(pb, pl)| pb < e && a < pb.saturating_add(pl)))
+    };
+    // Of the candidates, those whose bytes changed since their last
+    // upload (hashes kept per (mip, layer)): the title rewrites texture
+    // memory with the same data (16,143 of 16,146 parts re-uploaded after
+    // CPU writes were unchanged, run 20261013-082344). Mapping is checked
+    // for candidates only (one memory query each; a streamed array has
+    // thousands of (mip, layer)s, most of them not candidates).
+    let sums_on = super::tune::upload_parts();
+    let n_sub = key.levels as usize * layers as usize;
+    let mut sums: Vec<u64> = if sums_on {
+        SUB_SUMS.lock().as_ref().and_then(|m| m.get(&key).cloned()).filter(|v| v.len() == n_sub).unwrap_or_else(|| vec![SUB_NONE; n_sub])
+    } else {
+        Vec::new()
+    };
+    let t_query = std::time::Instant::now();
+    // A re-upload's candidates are hashed first, on several threads when
+    // they are large (one by one, a 1,200-part array's re-upload spent
+    // 50 ms here).
+    let mut pre_hash: Vec<u64> = Vec::new();
+    if sums_on && !first {
+        let todo: Vec<(usize, u64, u64)> = (0..n_sub)
+            .filter_map(|i| {
+                let (mip, layer) = (i / layers as usize, (i % layers as usize) as u32);
+                if !candidate(mip, layer) || !mapped(mip, layer) {
+                    return None;
+                }
+                let (s, n) = range(mip, layer);
+                Some((i, t.base + s, n))
+            })
+            .collect();
+        let bytes: u64 = todo.iter().map(|x| x.2).sum();
+        pre_hash = vec![SUB_NONE; n_sub];
+        let threads = if bytes >= 1 << 20 { super::pool::threads() } else { 1 };
+        for (i, h) in hash_parts(&todo, threads) {
+            pre_hash[i] = h;
+        }
+    }
+    let mut want = vec![false; n_sub];
+    let mut use_mapped = vec![false; n_sub];
+    let mut end = 0u64;
+    for mip in 0..key.levels as usize {
+        for layer in 0..layers {
+            let i = mip * layers as usize + layer as usize;
+            if !candidate(mip, layer) {
+                continue;
+            }
+            if !mapped(mip, layer) {
+                want[i] = true;
+                if sums_on {
+                    sums[i] = SUB_UNMAPPED;
+                }
+                continue;
+            }
+            let (s, n) = range(mip, layer);
+            // (A first upload hashes its parts after the detiling, on
+            // several threads: one by one here it cost as long as
+            // detiling a large array.)
+            if sums_on && !first {
+                let h = pre_hash[i];
+                if precise && sums[i] == h {
+                    SUB_SAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                sums[i] = h;
+            }
+            want[i] = true;
+            use_mapped[i] = true;
+            end = end.max(s + n);
+        }
+    }
+    UPLOAD_SPLIT[3].fetch_add(t_query.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    let t_chosen = std::time::Instant::now();
+    let wanted = |mip: usize, layer: u32| want[mip * layers as usize + layer as usize];
+    if upload_check() {
+        let now: Vec<u64> = (0..key.levels as usize)
+            .flat_map(|mip| (0..layers).map(move |layer| (mip, layer)))
+            .map(|(mip, layer)| {
+                let (s, n) = range(mip, layer);
+                if mapped(mip, layer) { hash_bytes(t.base + s, n as usize) } else { SUB_UNMAPPED }
+            })
+            .collect();
+        let mut g = SUB_HASHES.lock();
+        let map = g.get_or_insert_with(HashMap::default);
+        if let (true, Some((at, prev))) = (precise, map.get(&key)) {
+            for (i, (&a, &b)) in prev.iter().zip(&now).enumerate() {
+                let (mip, layer) = (i / layers as usize, (i % layers as usize) as u32);
+                if wanted(mip, layer) && a != SUB_UNMAPPED && b != SUB_UNMAPPED {
+                    // Uploaded again: did its bytes change?
+                    SUB_CHECKS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if a == b {
+                        SUB_CHECKS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                if wanted(mip, layer) || b == SUB_UNMAPPED {
+                    continue;
+                }
+                // Written since this upload's take: uploaded next time.
+                let (s, n) = range(mip, layer);
+                if region.is_some_and(|r| super::track::pending_overlaps(r, t.base + s, n)) {
+                    continue;
+                }
+                SUB_CHECKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if a != b && SUB_CHECKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+                    let ev = super::track::events_since(t.base + s, n, *at);
+                    let takes = region.map(|r| super::track::takes_since(r, *at)).unwrap_or_default();
+                    crate::warn!(
+                        "upload check: texture {:#x} {}x{}x{} mip {mip} layer {layer} ({:#x}+{n:#x}): changed although no written range overlaps it (ranges {only:x?}); last upload {} ms ago; writes noted on it since: {}; region {region:?} taken since: {}",
+                        t.base, key.width, key.height, layers, t.base + s, at.elapsed().as_millis(), if ev.is_empty() { "none".to_string() } else { ev.join("; ") }, takes.join(" | ")
+                    );
+                }
+            }
+        }
+        map.insert(key, (std::time::Instant::now(), now));
+    }
+    if end == 0 && precise {
+        // Nothing mapped changed.
+        if sums_on {
+            SUB_SUMS.lock().get_or_insert_with(HashMap::default).insert(key, sums);
+        }
+        PART_UPLOADS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        PART_UPLOADS[2].fetch_add(key.levels as u64 * layers as u64, std::sync::atomic::Ordering::Relaxed);
+        return Ok(Chose::Done((t.base, size)));
+    }
+    if end == 0 && !first {
+        return Err(format!("texture {:#x}+{size:#x} not mapped", t.base));
+    }
+    // Detiling reads only mapped regions (holes between them are not read).
+    let src = unsafe { std::slice::from_raw_parts(t.base as *const u8, end as usize) };
+    let mut skipped = 0;
+    // Every wanted, mapped (mip, layer) is detiled straight into the
+    // staging buffer at its offset (sizes first: no intermediate copies,
+    // which took as long as the detiling, FINDINGS.md 2026-10-23);
+    // unmapped ones of a first upload copy from one shared zero area at
+    // the end.
+    let mut regions = Vec::new();
+    let mut zeroed: Vec<(usize, u32, usize)> = Vec::new();
+    let mut parts: Vec<(usize, u32, usize, usize)> = Vec::new();
+    let mut total = 0usize;
+    let (mut parts_done, mut parts_left) = (0u64, 0u64);
+    for mip in 0..key.levels as usize {
+        for layer in 0..layers {
+            if !wanted(mip, layer) {
+                parts_left += 1;
+                continue;
+            }
+            parts_done += 1;
+            if !use_mapped[mip * layers as usize + layer as usize] {
+                skipped += 1;
+                if first {
+                    let m = &lay.mips[mip];
+                    let bytes = m.width as usize * m.height as usize * elem as usize;
+                    zeroed.push((mip, layer, bytes));
+                }
+                continue;
+            }
+            let m = &lay.mips[mip];
+            let len = m.width as usize * m.height as usize * elem as usize;
+            let off = total as u64;
+            parts.push((mip, layer, total, len));
+            total += len;
+            let (w, h) = (m.texel_w, m.texel_h);
+            regions.push(
+                vk::BufferImageCopy::default()
+                    .buffer_offset(off)
+                    .buffer_row_length(if block { m.width * 4 } else { m.width })
+                    .buffer_image_height(if block { m.height * 4 } else { m.height })
+                    .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: mip as u32, base_array_layer: layer, layer_count: 1 })
+                    .image_extent(vk::Extent3D { width: w, height: h, depth: 1 }),
+            );
+        }
+    }
+    if regions.is_empty() && zeroed.is_empty() {
+        return Err(format!("texture {:#x}+{size:#x}: no mip mapped", t.base));
+    }
+    if zero_census() && !first {
+        use std::sync::atomic::Ordering::Relaxed;
+        let cause = (REUPLOAD_CAUSE.with(|c| c.get()) as usize).min(6);
+        for &(mip, layer, _, len) in &parts {
+            let (s, n) = range(mip, layer);
+            let zero = ((s + n) as usize) <= src.len() && src[s as usize..(s + n) as usize].chunks(8).all(|c| c.iter().all(|&b| b == 0));
+            ZERO_CENSUS[cause][0].fetch_add(1, Relaxed);
+            ZERO_CENSUS[cause][2].fetch_add(len as u64, Relaxed);
+            if zero {
+                ZERO_CENSUS[cause][1].fetch_add(1, Relaxed);
+                ZERO_CENSUS[cause][3].fetch_add(len as u64, Relaxed);
+            }
+        }
+    }
+    let zero_len = zeroed.iter().map(|z| z.2).max().unwrap_or(0);
+    let (detiled, zero_off) = (total, total);
+    total += zero_len;
+    Ok(Chose::Parts(Chosen { lay, layers, elem, block, size, precise, held, gpu, windows, readers, sums_on, sums, end, regions, zeroed, parts, total, zero_len, zero_off, detiled, skipped, parts_done, parts_left, t_detile, t_table, t_locked, t_chosen, take_ms }))
+}
+
+/// Detiles the chosen (mip, layer)s of `src` straight into `dst` at their
+/// offsets (`Chosen::parts`).
+fn detile_parts(lay: &tiling::Layout, src: &[u8], parts: &[(usize, u32, usize, usize)], dst: &mut [u8]) {
+    // Parts of under 1 MiB (array layers, small mips) are detiled on
+    // several threads at once (`detile_into` splits larger ones itself):
+    // a 360-layer array of 288 KiB layers took 91 ms one part at a time.
+    let small: Vec<(usize, u32, usize, usize)> = parts.iter().copied().filter(|p| p.3 < 1 << 20).collect();
+    let small_bytes: usize = small.iter().map(|p| p.3).sum();
+    for &(mip, layer, off, len) in parts {
+        if len >= 1 << 20 || small_bytes < 1 << 20 {
+            lay.detile_into(src, mip, layer, &mut dst[off..off + len]);
+        }
+    }
+    if small_bytes >= 1 << 20 {
+        let threads = super::pool::threads();
+        // Disjoint destination slices, handed out in order of offset.
+        let mut rest: &mut [u8] = &mut dst[..];
+        let mut base = 0usize;
+        let mut jobs: Vec<Vec<(usize, u32, &mut [u8])>> = (0..threads).map(|_| Vec::new()).collect();
+        let mut sorted = small;
+        sorted.sort_by_key(|p| p.2);
+        for (k, &(mip, layer, off, len)) in sorted.iter().enumerate() {
+            let (_, tail) = std::mem::take(&mut rest).split_at_mut(off - base);
+            let (mine, after) = tail.split_at_mut(len);
+            rest = after;
+            base = off + len;
+            jobs[k % threads].push((mip, layer, mine));
+        }
+        let jobs: Vec<parking_lot::Mutex<Vec<(usize, u32, &mut [u8])>>> = jobs.into_iter().map(parking_lot::Mutex::new).collect();
+        super::pool::for_each(jobs.len(), &|k| {
+            for (mip, layer, out) in jobs[k].lock().iter_mut() {
+                lay.detile_into(src, *mip, *layer, out);
+            }
+        });
+    }
+}
+
+/// Records an upload's copy of `buf` into `image` (`regions`), with the
+/// barriers around it.
+fn record_upload(cmd: vk::CommandBuffer, image: vk::Image, first: bool, buf: vk::Buffer, regions: &[vk::BufferImageCopy], base: u64) {
+    let c = ctx();
+    unsafe {
+        super::vk::checkpoint(cmd, super::vk::mark::UPLOAD, base);
+        // A first upload starts from UNDEFINED; a re-upload keeps the
+        // layout and waits for earlier work using the image.
+        let b = vk::ImageMemoryBarrier::default()
+            .old_layout(if first { vk::ImageLayout::UNDEFINED } else { vk::ImageLayout::GENERAL })
+            .new_layout(vk::ImageLayout::GENERAL)
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS })
+            .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[b]);
+        c.device.cmd_copy_buffer_to_image(cmd, buf, image, vk::ImageLayout::GENERAL, regions);
+        let a = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[a], &[], &[]);
+    }
+}
+
+/// A texture's re-upload left by `refresh` for after the image cache's lock
+/// (`tune reupload_out`): its write marks taken and re-armed under the lock,
+/// its parts chosen and detiled outside it by the thread that took them, its
+/// copy recorded and its hashes stored under the lock again
+/// (`finish_refreshes`).
+struct RefreshJob {
+    key: ImageKey,
+    image: vk::Image,
+    t: Tsharp,
+    region: u32,
+    /// The tracked guest range (the hashes').
+    range: (u64, u64),
+    parts: Option<Vec<(u64, u64)>>,
+    all: bool,
+    cause: u8,
+    remap: Option<(u64, u64, u8)>,
+    wait: std::sync::Arc<RefreshWait>,
+}
+
+/// Set once a deferred re-upload is recorded or dropped: threads that bound
+/// its texture meanwhile wait for it after their lock, before their work
+/// can be submitted.
+#[derive(Default)]
+struct RefreshWait {
+    done: Mutex<bool>,
+    cv: parking_lot::Condvar,
+}
+
+/// A deferred re-upload detiled into a staging buffer of its own: the copy
+/// its commit records (None: nothing mapped changed), the texture's size,
+/// the cache's messages.
+struct Prepared {
+    copy: Option<(Staging, Vec<vk::BufferImageCopy>, usize)>,
+    size: u64,
+    notes: Vec<String>,
+}
+
+thread_local! {
+    /// This thread's refreshes may leave their re-uploads to
+    /// `finish_refreshes` (`Exec::bind_stage`, `tune reupload_out`).
+    static REFRESH_DEFER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Re-uploads this thread left for after the lock.
+    static REFRESH_JOBS: std::cell::RefCell<Vec<RefreshJob>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Deferred re-uploads (another thread's, or its own) of textures this
+    /// thread bound meanwhile.
+    static REFRESH_WAITS: std::cell::RefCell<Vec<std::sync::Arc<RefreshWait>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Deferred re-uploads (`tune reupload_out`): [left for after the lock,
+/// recorded, dropped (the image gone or GPU-written meanwhile), bindings
+/// that waited for one, ns outside the lock, ns of those waits].
+static REFRESH_OUT: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Whether a re-upload of `key` detiles on the CPU into the upload command
+/// buffer the uploads share, as one left for after the lock does: 2D,
+/// smaller than `tune gpu_detile` MiB, `tune upload_batch` without
+/// `upload_async` or `upload_copy`.
+fn reupload_on_cpu(key: &ImageKey, t: &Tsharp) -> bool {
+    if key.ty3d || !super::tune::upload_batch() || super::tune::upload_async() || super::tune::upload_copy() {
+        return false;
+    }
+    let Some(el) = elem_log2(t.format) else { return false };
+    let Some(lay) = tiling::layout(t.sw_mode, el, key.width, key.height, key.levels, is_block(t.format)) else { return false };
+    match super::tune::gpu_detile() {
+        0 => true,
+        n => lay.size(key.layers) < n << 20,
+    }
+}
+
+/// Lets this thread's texture refreshes leave their re-uploads to
+/// `finish_refreshes` (`tune reupload_out`; `Exec::bind_stage`, around its
+/// lock for a stage's images).
+pub fn defer_refreshes() {
+    if super::tune::reupload_out() {
+        REFRESH_DEFER.with(|d| d.set(true));
+    }
+}
+
+/// After the lock: this thread's deferred re-uploads (chosen and detiled
+/// outside it, recorded under it), then its waits for those of other
+/// threads whose textures it bound meanwhile; its own come first, so no two
+/// threads wait for each other. The first error, as `refresh` returned it.
+pub fn finish_refreshes() -> Result<(), String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    REFRESH_DEFER.with(|d| d.set(false));
+    let jobs = REFRESH_JOBS.with(|j| std::mem::take(&mut *j.borrow_mut()));
+    let mut err = None;
+    for job in jobs {
+        if let Err(e) = run_refresh(job) {
+            err.get_or_insert(e);
+        }
+    }
+    let waits = REFRESH_WAITS.with(|w| std::mem::take(&mut *w.borrow_mut()));
+    for w in waits {
+        let t0 = std::time::Instant::now();
+        let mut g = w.done.lock();
+        while !*g {
+            if w.cv.wait_for(&mut g, std::time::Duration::from_secs(5)).timed_out() && !*g {
+                crate::warn!("images: waited 5 s for another thread's re-upload of a texture this one bound; going on");
+                break;
+            }
+        }
+        REFRESH_OUT[5].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    }
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// One deferred re-upload: prepared outside the lock, committed under it.
+fn run_refresh(job: RefreshJob) -> Result<(), String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let t0 = std::time::Instant::now();
+    REUPLOAD_CAUSE.with(|c| c.set(job.cause));
+    let prepared = prepare_reupload(&job);
+    REUPLOAD_CAUSE.with(|c| c.set(0));
+    // Hashed once the bytes were read, outside the guest-reader lock (their
+    // page checks take the mapping table's).
+    let hashes = prepared.is_ok().then(|| all_hashes(job.range.0, job.range.1));
+    if let Ok(p) = &prepared {
+        let (key, n) = (job.key, p.copy.as_ref().map_or(0, |c| c.2));
+        super::hitch::note_since(super::hitch::Kind::Upload, t0, || format!("{}x{}x{}{} {:?} {} KiB", key.width, key.height, key.layers, if key.ty3d { " 3D" } else { "" }, key.format, n >> 10));
+    }
+    if zero_census() {
+        ZERO_CENSUS[(job.cause as usize).min(6)][4].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    }
+    REFRESH_OUT[4].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    let r = with(|im| im.commit_refresh(&job, prepared, hashes, t0));
+    *job.wait.done.lock() = true;
+    job.wait.cv.notify_all();
+    r
+}
+
+/// A deferred re-upload's parts chosen and detiled, without the cache.
+fn prepare_reupload(job: &RefreshJob) -> Result<Prepared, String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut notes = Vec::new();
+    let Chosen { lay, size, precise, sums_on, sums, end, mut regions, zeroed, parts, total, zero_off, detiled, skipped, parts_done, parts_left, t_detile, readers, block, .. } = match choose_2d(job.key, &job.t, job.parts.as_deref(), job.all, false, Some(job.region), false, &mut notes)? {
+        Chose::Done((_, size)) => return Ok(Prepared { copy: None, size, notes }),
+        Chose::Parts(c) => c,
+    };
+    let (buf, mem, ptr) = ctx().host_buffer(total.max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
+    let st = Staging { buf, mem, ptr, cap: total.max(4) as u64 };
+    let src = unsafe { std::slice::from_raw_parts(job.t.base as *const u8, end as usize) };
+    let dst = unsafe { std::slice::from_raw_parts_mut(st.ptr, total) };
+    detile_parts(&lay, src, &parts, dst);
+    dst[zero_off..].fill(0);
+    // Guest memory is no longer read.
+    drop(readers);
+    UPLOAD_SPLIT[0].fetch_add(t_detile.elapsed().as_nanos() as u64, Relaxed);
+    DETILED.fetch_add(detiled as u64, Relaxed);
+    if sums_on {
+        SUB_SUMS.lock().get_or_insert_with(HashMap::default).insert(job.key, sums);
+    }
+    if precise {
+        PART_UPLOADS[0].fetch_add(1, Relaxed);
+        PART_UPLOADS[1].fetch_add(parts_done, Relaxed);
+        PART_UPLOADS[2].fetch_add(parts_left, Relaxed);
+        PART_UPLOADS[3].fetch_add(detiled as u64, Relaxed);
+    }
+    push_zero_regions(&lay, block, zero_off as u64, &zeroed, &mut regions);
+    if skipped > 0 {
+        notes.push(format!("partially resident texture: {skipped} (mip, layer) not mapped, left as they were"));
+    }
+    Ok(Prepared { copy: Some((st, regions, total)), size, notes })
+}
+
+/// The copies of a first upload's unmapped (mip, layer)s from the zero area
+/// at `off` in its staging buffer.
+fn push_zero_regions(lay: &tiling::Layout, block: bool, off: u64, zeroed: &[(usize, u32, usize)], regions: &mut Vec<vk::BufferImageCopy>) {
+    for &(mip, layer, _) in zeroed {
+        let m = &lay.mips[mip];
+        regions.push(
+            vk::BufferImageCopy::default()
+                .buffer_offset(off)
+                .buffer_row_length(if block { m.width * 4 } else { m.width })
+                .buffer_image_height(if block { m.height * 4 } else { m.height })
+                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: mip as u32, base_array_layer: layer, layer_count: 1 })
+                .image_extent(vk::Extent3D { width: m.texel_w, height: m.texel_h, depth: 1 }),
+        );
+    }
+}
+
 #[track_caller]
 pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
     static SCRUBBER: std::sync::Once = std::sync::Once::new();
@@ -1624,7 +2253,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
             let qp = upload_stamps();
-            *g = Some(Images { qp, map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), inflight: Default::default(), spare_cmds: Vec::new(), detile_free: Vec::new(), copy_pool: vk::CommandPool::null(), copy_spare: Vec::new(), copy_timeline: vk::Semaphore::null(), copy_value: 0, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default() });
+            *g = Some(Images { qp, map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), inflight: Default::default(), spare_cmds: Vec::new(), detile_free: Vec::new(), copy_pool: vk::CommandPool::null(), copy_spare: Vec::new(), copy_timeline: vk::Semaphore::null(), copy_value: 0, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default(), refreshing: HashMap::default() });
         }
     }
     let im = g.as_mut().unwrap();
@@ -2472,337 +3101,20 @@ impl Images {
     fn upload_inner(&mut self, image: vk::Image, key: ImageKey, t: &Tsharp, only: Option<&[(u64, u64)]>, all: bool) -> Result<(u64, u64), String> {
         let first = !self.map.contains_key(&key);
         let region = self.map.get(&key).and_then(|i| i.source);
-        let precise = super::tune::upload_parts() && !first && !all && only.is_some();
         if key.ty3d {
             return self.upload_3d(image, key, t, first);
         }
-        let el = elem_log2(t.format).ok_or("unknown element size")?;
-        let block = is_block(t.format);
-        let layers = if key.ty3d { 1 } else { key.layers };
-        let lay = tiling::layout(t.sw_mode, el, key.width, key.height, key.levels, block).ok_or_else(|| format!("swizzle mode {} not supported", t.sw_mode))?;
-        if tiling::is_xor(t.sw_mode) {
-            self.report(format!("texture with XOR swizzle mode {} uploaded with an assumed pipe count (2^{})", t.sw_mode, tiling::pipes_log2()));
+        let mut notes = Vec::new();
+        let chose = choose_2d(key, t, only, all, first, region, true, &mut notes);
+        for n in notes {
+            self.report(n);
         }
-        let size = lay.size(layers);
-        // GPU detiling for textures of at least `tune gpu_detile` MiB.
-        let gpu = match super::tune::gpu_detile() {
-            0 => false,
-            n => size >= n << 20,
+        let Chosen { lay, layers, elem, block, size, precise, held, gpu, windows, readers, sums_on, mut sums, end, mut regions, zeroed, parts, total, zero_len, zero_off, detiled, skipped, parts_done, parts_left, t_detile, t_table, t_locked, t_chosen, take_ms } = match chose? {
+            Chose::Done(r) => return Ok(r),
+            Chose::Parts(c) => c,
         };
-        // Guest memory where a video-memory home holds newer GPU-written data
-        // (`homes`): this upload reads the older bytes (diagnostics).
-        if super::homes::any() && super::homes::any_stale(&[(t.base, size)]) {
-            let n = super::homes::IMAGE_STALE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 20 {
-                crate::warn!(
-                    "images: {} {:#x} {}x{}x{} {:?} uploaded from guest memory where home {} holds GPU-written data not written back",
-                    if first { "new image" } else { "image" },
-                    t.base,
-                    key.width,
-                    key.height,
-                    layers,
-                    t.format,
-                    super::homes::describe(t.base, size)
-                );
-            }
-        }
-        // Streamed textures are partially resident: the title maps single
-        // layers of texture arrays (light cookies), and within a layer the
-        // mip tail and the smaller mips (at the start of the chain). Every
-        // mapped (mip, layer) is uploaded; on the first upload the others
-        // are zero-filled, never left as undefined image memory (which holds
-        // whatever the device memory held before). Later mappings or writes
-        // re-upload (write tracking).
-        let elem = 1u64 << el;
-        let range = |mip: usize, layer: u32| -> (u64, u64) {
-            let m = &lay.mips[mip];
-            let start = layer as u64 * lay.slice_size + if m.tail.is_some() { 0 } else { m.offset };
-            (start, if m.tail.is_some() { 1u64 << lay.block_log2 } else { m.pitch as u64 * m.padded_height as u64 * elem })
-        };
-        // A partial re-upload (`precise`): the (mip, layer)s the written
-        // ranges (mappings, file reads) or the CPU's writes since the last
-        // take overlap. The title maps a layer of a streamed array at a time
-        // and fills mapped layers and small mips with CPU writes later. The
-        // marks are taken before the bytes are read (later writes are seen
-        // next time); taking resets them, so the copy cache and other
-        // textures on those pages are told (`precache::take_written_for`).
-        let mut written: Vec<(u64, u64)> = Vec::new();
-        let t_take = std::time::Instant::now();
-        let precise = precise && {
-            let mut pages = Vec::new();
-            let ok = super::precache::take_written_for(t.base, size, &mut pages, region, 4).is_some();
-            for p in pages {
-                match written.last_mut() {
-                    Some(r) if r.0 + r.1 == p => r.1 += 4096,
-                    _ => written.push((p, 4096)),
-                }
-            }
-            ok
-        };
-        let take_ms = t_take.elapsed().as_secs_f64() * 1e3;
-        // Pages checked and read under the guest-reader lock: the title may
-        // unmap layers of a streamed array meanwhile (`mem::GUEST_READERS`).
-        // Checked in the mapping table first, before the lock (which must
-        // not take the table's), and again with the operating system only
-        // when a mapping changed in between (`mem::table_view_held`).
-        let t_detile = std::time::Instant::now();
-        let g0 = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::SeqCst);
-        let table_whole = super::cp::valid(t.base, size) && crate::mem::host_readable(t.base, size);
-        let n_parts = key.levels as usize * layers as usize;
-        let table_parts: Vec<bool> = if table_whole {
-            Vec::new()
-        } else {
-            (0..n_parts)
-                .map(|i| {
-                    let (s, n) = range(i / layers as usize, (i % layers as usize) as u32);
-                    super::cp::valid(t.base + s, n) && crate::mem::host_readable(t.base + s, n)
-                })
-                .collect()
-        };
-        // GPU detiling: the import windows over the mapped parts, made now
-        // (making one takes the mapping table's lock, which the guest-reader
-        // lock's holders must not: decommits hold it while they wait for
-        // them).
-        let mut windows: Vec<(u64, u64, vk::Buffer)> = Vec::new();
-        if gpu {
-            for i in 0..n_parts {
-                if !(table_whole || table_parts[i]) {
-                    continue;
-                }
-                let (s, n) = range(i / layers as usize, (i % layers as usize) as u32);
-                let (mut x, end) = (t.base + s, t.base + s + n);
-                while x < end {
-                    if let Some(&(_, we, _)) = windows.iter().find(|&&(ws, we, _)| ws <= x && x < we) {
-                        x = we.min(end);
-                        continue;
-                    }
-                    let e = ((x & !(super::exec::window_bytes() - 1)) + super::exec::window_bytes()).min(end);
-                    match super::exec::import_window(x, e - x) {
-                        Some((b, ws, we)) if ws <= x && e <= we => {
-                            windows.push((ws, we, b));
-                            x = we.min(end);
-                        }
-                        _ => break,
-                    }
-                }
-            }
-        }
-        let t_table = std::time::Instant::now();
-        let readers = crate::mem::GUEST_READERS.read();
-        let t_locked = std::time::Instant::now();
-        let held = crate::mem::table_view_held(g0);
-        UPLOAD_TABLE[usize::from(!held)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let whole = if held { table_whole } else { super::cp::valid(t.base, size) && crate::mem::os_readable(t.base, size) };
-        let mapped = |mip: usize, layer: u32| -> bool {
-            if whole {
-                return true;
-            }
-            if held {
-                return table_parts[mip * layers as usize + layer as usize];
-            }
-            let (s, n) = range(mip, layer);
-            super::cp::valid(t.base + s, n) && crate::mem::os_readable(t.base + s, n)
-        };
-        let candidate = |mip: usize, layer: u32| -> bool {
-            if !precise {
-                return true;
-            }
-            let (s, n) = range(mip, layer);
-            let (a, e) = (t.base + s, t.base + s + n);
-            // `written` is ascending and disjoint.
-            let i = written.partition_point(|&(pb, pl)| pb + pl <= a);
-            written.get(i).is_some_and(|&(pb, _)| pb < e) || only.is_some_and(|parts| parts.iter().any(|&(pb, pl)| pb < e && a < pb.saturating_add(pl)))
-        };
-        // Of the candidates, those whose bytes changed since their last
-        // upload (hashes kept per (mip, layer)): the title rewrites texture
-        // memory with the same data (16,143 of 16,146 parts re-uploaded after
-        // CPU writes were unchanged, run 20261013-082344). Mapping is checked
-        // for candidates only (one memory query each; a streamed array has
-        // thousands of (mip, layer)s, most of them not candidates).
-        let sums_on = super::tune::upload_parts();
-        let n_sub = key.levels as usize * layers as usize;
-        let mut sums: Vec<u64> = if sums_on {
-            SUB_SUMS.lock().as_ref().and_then(|m| m.get(&key).cloned()).filter(|v| v.len() == n_sub).unwrap_or_else(|| vec![SUB_NONE; n_sub])
-        } else {
-            Vec::new()
-        };
-        let t_query = std::time::Instant::now();
-        // A re-upload's candidates are hashed first, on several threads when
-        // they are large (one by one, a 1,200-part array's re-upload spent
-        // 50 ms here).
-        let mut pre_hash: Vec<u64> = Vec::new();
-        if sums_on && !first {
-            let todo: Vec<(usize, u64, u64)> = (0..n_sub)
-                .filter_map(|i| {
-                    let (mip, layer) = (i / layers as usize, (i % layers as usize) as u32);
-                    if !candidate(mip, layer) || !mapped(mip, layer) {
-                        return None;
-                    }
-                    let (s, n) = range(mip, layer);
-                    Some((i, t.base + s, n))
-                })
-                .collect();
-            let bytes: u64 = todo.iter().map(|x| x.2).sum();
-            pre_hash = vec![SUB_NONE; n_sub];
-            let threads = if bytes >= 1 << 20 { super::pool::threads() } else { 1 };
-            for (i, h) in hash_parts(&todo, threads) {
-                pre_hash[i] = h;
-            }
-        }
-        let mut want = vec![false; n_sub];
-        let mut use_mapped = vec![false; n_sub];
-        let mut end = 0u64;
-        for mip in 0..key.levels as usize {
-            for layer in 0..layers {
-                let i = mip * layers as usize + layer as usize;
-                if !candidate(mip, layer) {
-                    continue;
-                }
-                if !mapped(mip, layer) {
-                    want[i] = true;
-                    if sums_on {
-                        sums[i] = SUB_UNMAPPED;
-                    }
-                    continue;
-                }
-                let (s, n) = range(mip, layer);
-                // (A first upload hashes its parts after the detiling, on
-                // several threads: one by one here it cost as long as
-                // detiling a large array.)
-                if sums_on && !first {
-                    let h = pre_hash[i];
-                    if precise && sums[i] == h {
-                        SUB_SAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        continue;
-                    }
-                    sums[i] = h;
-                }
-                want[i] = true;
-                use_mapped[i] = true;
-                end = end.max(s + n);
-            }
-        }
-        UPLOAD_SPLIT[3].fetch_add(t_query.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        let t_chosen = std::time::Instant::now();
-        let wanted = |mip: usize, layer: u32| want[mip * layers as usize + layer as usize];
-        if upload_check() {
-            let now: Vec<u64> = (0..key.levels as usize)
-                .flat_map(|mip| (0..layers).map(move |layer| (mip, layer)))
-                .map(|(mip, layer)| {
-                    let (s, n) = range(mip, layer);
-                    if mapped(mip, layer) { hash_bytes(t.base + s, n as usize) } else { SUB_UNMAPPED }
-                })
-                .collect();
-            let mut g = SUB_HASHES.lock();
-            let map = g.get_or_insert_with(HashMap::default);
-            if let (true, Some((at, prev))) = (precise, map.get(&key)) {
-                for (i, (&a, &b)) in prev.iter().zip(&now).enumerate() {
-                    let (mip, layer) = (i / layers as usize, (i % layers as usize) as u32);
-                    if wanted(mip, layer) && a != SUB_UNMAPPED && b != SUB_UNMAPPED {
-                        // Uploaded again: did its bytes change?
-                        SUB_CHECKS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if a == b {
-                            SUB_CHECKS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-                    if wanted(mip, layer) || b == SUB_UNMAPPED {
-                        continue;
-                    }
-                    // Written since this upload's take: uploaded next time.
-                    let (s, n) = range(mip, layer);
-                    if region.is_some_and(|r| super::track::pending_overlaps(r, t.base + s, n)) {
-                        continue;
-                    }
-                    SUB_CHECKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if a != b && SUB_CHECKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
-                        let ev = super::track::events_since(t.base + s, n, *at);
-                        let takes = region.map(|r| super::track::takes_since(r, *at)).unwrap_or_default();
-                        crate::warn!(
-                            "upload check: texture {:#x} {}x{}x{} mip {mip} layer {layer} ({:#x}+{n:#x}): changed although no written range overlaps it (ranges {only:x?}); last upload {} ms ago; writes noted on it since: {}; region {region:?} taken since: {}",
-                            t.base, key.width, key.height, layers, t.base + s, at.elapsed().as_millis(), if ev.is_empty() { "none".to_string() } else { ev.join("; ") }, takes.join(" | ")
-                        );
-                    }
-                }
-            }
-            map.insert(key, (std::time::Instant::now(), now));
-        }
-        if end == 0 && precise {
-            // Nothing mapped changed.
-            if sums_on {
-                SUB_SUMS.lock().get_or_insert_with(HashMap::default).insert(key, sums);
-            }
-            PART_UPLOADS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            PART_UPLOADS[2].fetch_add(key.levels as u64 * layers as u64, std::sync::atomic::Ordering::Relaxed);
-            return Ok((t.base, size));
-        }
-        if end == 0 && !first {
-            return Err(format!("texture {:#x}+{size:#x} not mapped", t.base));
-        }
-        // Detiling reads only mapped regions (holes between them are not read).
+        let range = |mip: usize, layer: u32| part_range(&lay, elem, mip, layer);
         let src = unsafe { std::slice::from_raw_parts(t.base as *const u8, end as usize) };
-        let mut skipped = 0;
-        // Every wanted, mapped (mip, layer) is detiled straight into the
-        // staging buffer at its offset (sizes first: no intermediate copies,
-        // which took as long as the detiling, FINDINGS.md 2026-10-23);
-        // unmapped ones of a first upload copy from one shared zero area at
-        // the end.
-        let mut regions = Vec::new();
-        let mut zeroed: Vec<(usize, u32, usize)> = Vec::new();
-        let mut parts: Vec<(usize, u32, usize, usize)> = Vec::new();
-        let mut total = 0usize;
-        let (mut parts_done, mut parts_left) = (0u64, 0u64);
-        for mip in 0..key.levels as usize {
-            for layer in 0..layers {
-                if !wanted(mip, layer) {
-                    parts_left += 1;
-                    continue;
-                }
-                parts_done += 1;
-                if !use_mapped[mip * layers as usize + layer as usize] {
-                    skipped += 1;
-                    if first {
-                        let m = &lay.mips[mip];
-                        let bytes = m.width as usize * m.height as usize * elem as usize;
-                        zeroed.push((mip, layer, bytes));
-                    }
-                    continue;
-                }
-                let m = &lay.mips[mip];
-                let len = m.width as usize * m.height as usize * elem as usize;
-                let off = total as u64;
-                parts.push((mip, layer, total, len));
-                total += len;
-                let (w, h) = (m.texel_w, m.texel_h);
-                regions.push(
-                    vk::BufferImageCopy::default()
-                        .buffer_offset(off)
-                        .buffer_row_length(if block { m.width * 4 } else { m.width })
-                        .buffer_image_height(if block { m.height * 4 } else { m.height })
-                        .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: mip as u32, base_array_layer: layer, layer_count: 1 })
-                        .image_extent(vk::Extent3D { width: w, height: h, depth: 1 }),
-                );
-            }
-        }
-        if regions.is_empty() && zeroed.is_empty() {
-            return Err(format!("texture {:#x}+{size:#x}: no mip mapped", t.base));
-        }
-        if zero_census() && !first {
-            use std::sync::atomic::Ordering::Relaxed;
-            let cause = (REUPLOAD_CAUSE.with(|c| c.get()) as usize).min(6);
-            for &(mip, layer, _, len) in &parts {
-                let (s, n) = range(mip, layer);
-                let zero = ((s + n) as usize) <= src.len() && src[s as usize..(s + n) as usize].chunks(8).all(|c| c.iter().all(|&b| b == 0));
-                ZERO_CENSUS[cause][0].fetch_add(1, Relaxed);
-                ZERO_CENSUS[cause][2].fetch_add(len as u64, Relaxed);
-                if zero {
-                    ZERO_CENSUS[cause][1].fetch_add(1, Relaxed);
-                    ZERO_CENSUS[cause][3].fetch_add(len as u64, Relaxed);
-                }
-            }
-        }
-        let zero_len = zeroed.iter().map(|z| z.2).max().unwrap_or(0);
-        let (detiled, zero_off) = (total, total);
-        total += zero_len;
         // (Only while no mapping changed since the windows were made.)
         if gpu && held {
             match self.upload_gpu(image, first, &lay, t, block, &parts, &zeroed, &regions, &range, &windows) {
@@ -2866,39 +3178,7 @@ impl Images {
         };
         let t_alloc = std::time::Instant::now();
         let dst = unsafe { std::slice::from_raw_parts_mut(st.ptr, total) };
-        // Parts of under 1 MiB (array layers, small mips) are detiled on
-        // several threads at once (`detile_into` splits larger ones itself):
-        // a 360-layer array of 288 KiB layers took 91 ms one part at a time.
-        let small: Vec<(usize, u32, usize, usize)> = parts.iter().copied().filter(|p| p.3 < 1 << 20).collect();
-        let small_bytes: usize = small.iter().map(|p| p.3).sum();
-        for &(mip, layer, off, len) in &parts {
-            if len >= 1 << 20 || small_bytes < 1 << 20 {
-                lay.detile_into(src, mip, layer, &mut dst[off..off + len]);
-            }
-        }
-        if small_bytes >= 1 << 20 {
-            let threads = super::pool::threads();
-            // Disjoint destination slices, handed out in order of offset.
-            let mut rest: &mut [u8] = &mut dst[..];
-            let mut base = 0usize;
-            let mut jobs: Vec<Vec<(usize, u32, &mut [u8])>> = (0..threads).map(|_| Vec::new()).collect();
-            let mut sorted = small;
-            sorted.sort_by_key(|p| p.2);
-            for (k, &(mip, layer, off, len)) in sorted.iter().enumerate() {
-                let (_, tail) = std::mem::take(&mut rest).split_at_mut(off - base);
-                let (mine, after) = tail.split_at_mut(len);
-                rest = after;
-                base = off + len;
-                jobs[k % threads].push((mip, layer, mine));
-            }
-            let lay = &lay;
-            let jobs: Vec<parking_lot::Mutex<Vec<(usize, u32, &mut [u8])>>> = jobs.into_iter().map(parking_lot::Mutex::new).collect();
-            super::pool::for_each(jobs.len(), &|k| {
-                for (mip, layer, out) in jobs[k].lock().iter_mut() {
-                    lay.detile_into(src, *mip, *layer, out);
-                }
-            });
-        }
+        detile_parts(&lay, src, &parts, dst);
         let t_detiled = std::time::Instant::now();
         dst[zero_off..].fill(0);
         // A first upload's sums (for later partial re-uploads), hashed here
@@ -2931,18 +3211,7 @@ impl Images {
             PART_UPLOADS[3].fetch_add(detiled as u64, Relaxed);
         }
         if zero_len > 0 {
-            let off = zero_off as u64;
-            for &(mip, layer, _) in &zeroed {
-                let m = &lay.mips[mip];
-                regions.push(
-                    vk::BufferImageCopy::default()
-                        .buffer_offset(off)
-                        .buffer_row_length(if block { m.width * 4 } else { m.width })
-                        .buffer_image_height(if block { m.height * 4 } else { m.height })
-                        .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: mip as u32, base_array_layer: layer, layer_count: 1 })
-                        .image_extent(vk::Extent3D { width: m.texel_w, height: m.texel_h, depth: 1 }),
-                );
-            }
+            push_zero_regions(&lay, block, zero_off as u64, &zeroed, &mut regions);
         }
         if skipped > 0 {
             self.report(format!(
@@ -2956,22 +3225,7 @@ impl Images {
         let base = t.base;
         let t_copy = std::time::Instant::now();
         UPLOAD_SPLIT[1].fetch_add((t_copy - t_stage).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        let record = |cmd: vk::CommandBuffer| unsafe {
-            super::vk::checkpoint(cmd, super::vk::mark::UPLOAD, base);
-            // A first upload starts from UNDEFINED; a re-upload keeps the
-            // layout and waits for earlier work using the image.
-            let b = vk::ImageMemoryBarrier::default()
-                .old_layout(if first { vk::ImageLayout::UNDEFINED } else { vk::ImageLayout::GENERAL })
-                .new_layout(vk::ImageLayout::GENERAL)
-                .image(image)
-                .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS })
-                .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[b]);
-            c.device.cmd_copy_buffer_to_image(cmd, buf, image, vk::ImageLayout::GENERAL, &regions);
-            let a = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
-            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[a], &[], &[]);
-        };
+        let record = |cmd: vk::CommandBuffer| record_upload(cmd, image, first, buf, &regions, base);
         // Through the copy queue: the staging buffer copied there into video
         // memory, from which the main queue copies it into the image once
         // that is done (the same regions).
@@ -2981,20 +3235,7 @@ impl Images {
                 let lb = dev.0;
                 let to_dev = |x: vk::CommandBuffer| unsafe { c.device.cmd_copy_buffer(x, buf, lb, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: total.max(4) as u64 }]) };
                 if let Some((x, v)) = self.submit_copy_part(pool, sem, to_dev) {
-                    let record_dev = |cmd: vk::CommandBuffer| unsafe {
-                        super::vk::checkpoint(cmd, super::vk::mark::UPLOAD, base);
-                        let b = vk::ImageMemoryBarrier::default()
-                            .old_layout(if first { vk::ImageLayout::UNDEFINED } else { vk::ImageLayout::GENERAL })
-                            .new_layout(vk::ImageLayout::GENERAL)
-                            .image(image)
-                            .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS })
-                            .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-                            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-                        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[b]);
-                        c.device.cmd_copy_buffer_to_image(cmd, lb, image, vk::ImageLayout::GENERAL, &regions);
-                        let a = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
-                        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[a], &[], &[]);
-                    };
+                    let record_dev = |cmd: vk::CommandBuffer| record_upload(cmd, image, first, lb, &regions, base);
                     self.submit_held(Held { staging: Some(st), dev: vec![dev], copy_cmd: Some(x) }, DETILE_INFLIGHT, Some((sem, v)), record_dev);
                     COPY_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     UPLOAD_SPLIT[2].fetch_add(t_copy.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -4108,6 +4349,16 @@ impl Images {
         }
         let (image, Some(region)) = (img.image, img.source) else { return Ok(()) };
         let (b, n) = super::track::range(region).unwrap_or((0, 0));
+        // A re-upload of it left for after the lock (`RefreshJob`): waited
+        // for there; its marks are not taken again meanwhile.
+        if let Some(w) = self.refreshing.get(&key) {
+            if REFRESH_DEFER.with(|d| d.get()) {
+                REFRESH_OUT[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let w = w.clone();
+                REFRESH_WAITS.with(|v| v.borrow_mut().push(w));
+            }
+            return Ok(());
+        }
         if super::track::take_gpu_written(region) {
             // GPU buffer writes (e.g. per-frame clears): re-upload only if
             // the contents changed.
@@ -4172,6 +4423,21 @@ impl Images {
                     _ => 6,
                 })
             });
+            // Detiled after the lock (`tune reupload_out`, CPU-detiled
+            // re-uploads), the copy recorded under it again.
+            if REFRESH_DEFER.with(|d| d.get()) && reupload_on_cpu(&key, t) {
+                let cause = REUPLOAD_CAUSE.with(|c| c.replace(0));
+                let wait = std::sync::Arc::new(RefreshWait::default());
+                self.refreshing.insert(key, wait.clone());
+                REFRESH_OUT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let remap = match why {
+                    super::track::Why::Remap(rb, rl, op) => Some((rb, rl, op)),
+                    _ => None,
+                };
+                let all = matches!(why, super::track::Why::Forced);
+                REFRESH_JOBS.with(|j| j.borrow_mut().push(RefreshJob { key, image, t: *t, region, range: (b, n), parts, all, cause, remap, wait }));
+                return Ok(());
+            }
             // (`DS_SKIP_REUPLOADS`: timing only, the image keeps its contents.)
             let r = self.upload_parts(image, key, t, parts.as_deref(), matches!(why, super::track::Why::Forced));
             REUPLOAD_CAUSE.with(|c| c.set(0));
@@ -4190,6 +4456,59 @@ impl Images {
                 s[3].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
             }
             self.map.get_mut(&key).unwrap().hashes = h;
+        }
+        Ok(())
+    }
+
+    /// A deferred re-upload's commit (`run_refresh`): its copy recorded into
+    /// the uploads' shared command buffer and its hashes stored, unless its
+    /// image was replaced, dropped or written by the GPU meanwhile.
+    fn commit_refresh(&mut self, job: &RefreshJob, prepared: Result<Prepared, String>, hashes: Option<[u64; SLICES]>, t0: std::time::Instant) -> Result<(), String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.refreshing.remove(&job.key);
+        let p = prepared?;
+        for n in p.notes {
+            self.report(n);
+        }
+        let live = self.map.get(&job.key).is_some_and(|i| i.image == job.image && !i.gpu_written);
+        if let Some((st, regions, total)) = p.copy {
+            if !live {
+                REFRESH_OUT[2].fetch_add(1, Relaxed);
+                free_batched(vec![(st.buf, st.mem)]);
+                return Ok(());
+            }
+            let (image, buf, base) = (job.image, st.buf, job.t.base);
+            let record = |cmd: vk::CommandBuffer| record_upload(cmd, image, false, buf, &regions, base);
+            if let Err(e) = record_batched((st.buf, st.mem), total.max(4) as u64, &record) {
+                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, Relaxed) {
+                    crate::warn!("images: upload not batched: {e}");
+                }
+                self.one_shot(record);
+                free_batched(vec![(st.buf, st.mem)]);
+            }
+            REFRESH_OUT[1].fetch_add(1, Relaxed);
+            self.uploads += 1;
+        } else if !live {
+            REFRESH_OUT[2].fetch_add(1, Relaxed);
+            return Ok(());
+        }
+        self.upload_bytes += p.size;
+        self.upload_ns += t0.elapsed().as_nanos() as u64;
+        if let Some(h) = hashes {
+            if let Some((rb, rl, op)) = job.remap {
+                let s = &REMAP_UPLOADS[(op as usize).min(2)];
+                s[0].fetch_add(1, Relaxed);
+                if h == self.map[&job.key].hashes {
+                    s[1].fetch_add(1, Relaxed);
+                }
+                let (b, n) = job.range;
+                if rb > b || rb.saturating_add(rl) < b + n {
+                    s[2].fetch_add(1, Relaxed);
+                }
+                s[3].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+            }
+            self.map.get_mut(&job.key).unwrap().hashes = h;
         }
         Ok(())
     }
@@ -4954,6 +5273,12 @@ impl Images {
             String::new()
         };
         let gpu = if COPY_UPLOADS.load(Relaxed) > 0 { format!("{gpu}; CPU-detiled uploads through the copy queue {}", COPY_UPLOADS.load(Relaxed)) } else { gpu };
+        let o: Vec<u64> = REFRESH_OUT.iter().map(|c| c.load(Relaxed)).collect();
+        let gpu = if o[0] + o[3] > 0 {
+            format!("{gpu}; re-uploads detiled after the lock (`tune reupload_out`): {} ({} recorded, {} dropped: their image gone or GPU-written meanwhile; {} ms outside the lock), bindings that waited for one {} ({} ms)", o[0], o[1], o[2], o[4] / 1_000_000, o[3], o[5] / 1_000_000)
+        } else {
+            gpu
+        };
         format!(
             "    images: {} cached ({} MiB; GPU-written {} ({} MiB), kept for the session; {} textures evicted, {} MiB, in {} rounds), {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; staging buffers made {}, waits for uploads in flight {}; batched (`tune upload_batch`) {} in {} command buffers, {} waits; pages checked in the mapping table {}, again with the operating system {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages, {} found clean by a probe); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}{gpu}\n",
             self.map.len(),
