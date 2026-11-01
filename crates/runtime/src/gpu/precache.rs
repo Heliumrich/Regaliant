@@ -140,10 +140,6 @@ struct Cache {
     lo: u64,
     hi: u64,
     chunks: Vec<Slot>,
-    /// Ranges GPU work wrote while they had an entry, and the frame: copied
-    /// per batch for `tune pre_share_volatile` frames (their copies die
-    /// within a frame and would fill the chunks).
-    volatile: Map<(u64, u64), u64>,
     /// The chunk being filled and its use.
     current: Option<(usize, u64)>,
     fills: u64,
@@ -373,7 +369,7 @@ impl Cache {
     }
 
     /// Drops the entries overlapping [base, end); how many. `gpu`: GPU work
-    /// writes the range (the entries' keys turn volatile).
+    /// writes the range.
     fn drop_range(&mut self, base: u64, end: u64, gpu: bool) -> u64 {
         if self.entries.is_empty() || end <= self.lo || self.hi <= base {
             return 0;
@@ -389,9 +385,6 @@ impl Cache {
         let frame = super::FRAMES.load(Ordering::Relaxed);
         for &k in &hit {
             self.remove(k);
-            if gpu {
-                self.volatile.insert(k, frame);
-            }
             // (A copy's bytes run from the 16-byte aligned start.)
             if k.1 + 16 > CHUNK {
                 self.big_changed.insert(k, frame);
@@ -399,10 +392,6 @@ impl Cache {
                     crate::info!("gpu: shared copy of {:#x}+{:#x} ({} MiB) dropped: {} wrote [{base:#x}, {end:#x})", k.0, k.1, k.1 >> 20, if gpu { "GPU work" } else { "the CPU, a CP or host write or a mapping change" });
                 }
             }
-        }
-        if self.volatile.len() > 1 << 16 {
-            let keep = super::tune::pre_share_volatile();
-            self.volatile.retain(|_, f| f.saturating_add(keep) >= frame);
         }
         hit.len() as u64
     }
@@ -931,11 +920,6 @@ pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
             STATS[12].fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let keep = super::tune::pre_share_volatile();
-        if keep > 0 && c.volatile.get(&(base, size)).is_some_and(|&f| f.saturating_add(keep) >= super::FRAMES.load(Ordering::Relaxed)) {
-            STATS[8].fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
     }
     // The range's write marks so far: the copy sees those writes (it runs
     // later), other entries on those pages are stale. (A take in flight
@@ -1047,8 +1031,7 @@ pub fn invalidate(base: u64, len: u64) {
     drop_overlapping(base, len, false);
 }
 
-/// GPU work writes guest [base, base+len): copies overlapping it go, and
-/// their ranges are not kept for a while (`tune pre_share_volatile`).
+/// GPU work writes guest [base, base+len): copies overlapping it go.
 pub fn invalidate_gpu(base: u64, len: u64) {
     drop_overlapping(base, len, true);
 }

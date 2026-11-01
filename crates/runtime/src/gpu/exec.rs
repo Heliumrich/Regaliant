@@ -6787,8 +6787,16 @@ pub(super) struct Laps {
     names: &'static [&'static str],
 }
 
-/// Commands slower than this are logged with their steps (`Laps::slow`).
-const SLOW_NS: u64 = 150_000;
+/// Commands slower than this are logged with their steps (`Laps::slow`;
+/// `DS_SLOW_US=<us>` instead, diagnosis), at most `DS_SLOW_MAX` of them
+/// (default 400).
+fn slow_limits() -> (u64, u64) {
+    static L: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *L.get_or_init(|| {
+        let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d);
+        (env("DS_SLOW_US", 150) * 1000, env("DS_SLOW_MAX", 400))
+    })
+}
 /// Slow commands logged.
 static SLOW_LOGGED: AtomicU64 = AtomicU64::new(0);
 
@@ -6811,15 +6819,16 @@ impl Laps {
             self.last = Some(now);
         }
     }
-    /// A command that took SLOW_NS or more in its steps, after the first
-    /// `profile reset` (`DS_STEP_LAPS`): logged with its steps of 5 us or
-    /// more (the first 400).
+    /// A command that took 150 us (`slow_limits`) or more in its steps,
+    /// after the first `profile reset` (`DS_STEP_LAPS`): logged with its
+    /// steps of 5 us or more (the first 400).
     pub(super) fn slow(&self, queue: &str, what: impl FnOnce() -> String) {
         if self.last.is_none() || MERGE_FROM.load(Ordering::Relaxed) == 0 {
             return;
         }
         let total: u64 = self.local.iter().sum();
-        if total < SLOW_NS || SLOW_LOGGED.fetch_add(1, Ordering::Relaxed) >= 400 {
+        let (min, max) = slow_limits();
+        if total < min || SLOW_LOGGED.fetch_add(1, Ordering::Relaxed) >= max {
             return;
         }
         let parts: Vec<String> = self.names.iter().zip(self.local.iter()).filter(|&(_, &ns)| ns >= 5_000).map(|(n, &ns)| format!("{n} {:.0}", ns as f64 / 1000.0)).collect();
@@ -9259,10 +9268,7 @@ impl Exec {
                 // An unbounded pointer's window (up to UNBOUNDED_MAX) that
                 // passes over a home: assumed not to read it (writing the
                 // home's GPU-written parts back for every such binding cost
-                // more than the home saved), except within `tune
-                // unbounded_near` bytes of its base, where those parts are
-                // written back first (guest memory, which the pointer reads,
-                // is stale there).
+                // more than the home saved).
                 if super::homes::overlaps(base, size) {
                     super::homes::UNBOUNDED_OVERLAPS.fetch_add(1, Ordering::Relaxed);
                     let inside = super::homes::overlaps(base, 4);
@@ -9273,21 +9279,12 @@ impl Exec {
                         let n = super::homes::UNBOUNDED_STALE[1].fetch_add(1, Ordering::Relaxed);
                         if n < 20 {
                             crate::info!(
-                                "gpu[{}]: unbounded pointer {base:#x} ({}) of shader {:#x} reads guest memory where home {} holds GPU-written data not written back{}",
+                                "gpu[{}]: unbounded pointer {base:#x} ({}) of shader {:#x} reads guest memory where home {} holds GPU-written data not written back",
                                 self.name,
                                 if inside { "inside the home" } else { "before it" },
                                 super::images::BINDING_SHADER.with(|s| s.get()),
-                                super::homes::describe(base, 4096),
-                                if super::tune::unbounded_near() > 0 { " (written back first: `unbounded_near`)" } else { "" }
+                                super::homes::describe(base, 4096)
                             );
-                        }
-                    }
-                    let near = super::tune::unbounded_near();
-                    if near > 0 {
-                        let w = [(base, size.min(near))];
-                        if super::homes::any_stale(&w) {
-                            super::homes::UNBOUNDED_STALE[2].fetch_add(1, Ordering::Relaxed);
-                            self.home_write_back(&w);
                         }
                     }
                 }

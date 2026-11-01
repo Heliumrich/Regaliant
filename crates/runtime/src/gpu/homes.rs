@@ -243,9 +243,8 @@ static VOTE_GEN: AtomicU64 = AtomicU64::new(1);
 static WATCHED_ANY: AtomicBool = AtomicBool::new(false);
 pub static UNBOUNDED_OVERLAPS: AtomicU64 = AtomicU64::new(0);
 /// Of those: [based inside a home, with GPU-written parts of a home not yet
-/// in guest memory within 4 KiB of their base, written back first (`tune
-/// unbounded_near`)].
-pub static UNBOUNDED_STALE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// in guest memory within 4 KiB of their base].
+pub static UNBOUNDED_STALE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Image uploads from guest memory (new textures, re-uploads, reloads of
 /// overwritten images) over GPU-written parts of a home not yet in guest
 /// memory: [uploads, of them reloads of overwritten images whose parts were
@@ -1132,7 +1131,7 @@ pub fn take_all() -> Vec<(u64, u64, Arc<HomeBuf>, u64)> {
 
 pub fn status() -> String {
     format!(
-        "    video-memory homes: {} created, {} dropped, {} MiB; {} bindings, {} bytes copied in, {} write-backs ({} KiB), {} partial overlaps ({} of them written: copied in again), {} refused for reads over command buffers or labels, {} unbounded pointer bindings over homes ({} based inside one, {} with GPU-written parts not yet in guest memory within 4 KiB of their base, {} written back first), {} image uploads over GPU-written home data not in guest memory ({} reloads of overwritten images written back first); write-watched: {} checks ({} ms, {} MiB queried; {} of them with the query outside the lock, {} bindings waited for another thread's check), {} bytes the CPU changed ({} of them by guest code in homes watched for `homes_watch`), {} written pages covered in part, {} pages other takes found written handed over\n",
+        "    video-memory homes: {} created, {} dropped, {} MiB; {} bindings, {} bytes copied in, {} write-backs ({} KiB), {} partial overlaps ({} of them written: copied in again), {} refused for reads over command buffers or labels, {} unbounded pointer bindings over homes ({} based inside one, {} with GPU-written parts not yet in guest memory within 4 KiB of their base), {} image uploads over GPU-written home data not in guest memory ({} reloads of overwritten images written back first); write-watched: {} checks ({} ms, {} MiB queried; {} of them with the query outside the lock, {} bindings waited for another thread's check), {} bytes the CPU changed ({} of them by guest code in homes watched for `homes_watch`), {} written pages covered in part, {} pages other takes found written handed over\n",
         CREATED.load(Ordering::Relaxed),
         DROPPED.load(Ordering::Relaxed),
         USED.load(Ordering::Relaxed) >> 20,
@@ -1146,7 +1145,6 @@ pub fn status() -> String {
         UNBOUNDED_OVERLAPS.load(Ordering::Relaxed),
         UNBOUNDED_STALE[0].load(Ordering::Relaxed),
         UNBOUNDED_STALE[1].load(Ordering::Relaxed),
-        UNBOUNDED_STALE[2].load(Ordering::Relaxed),
         IMAGE_STALE[0].load(Ordering::Relaxed),
         IMAGE_STALE[1].load(Ordering::Relaxed),
         WATCH_CHECKS.load(Ordering::Relaxed),

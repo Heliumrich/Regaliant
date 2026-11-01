@@ -1091,10 +1091,8 @@ const S_HOT_RUNS: usize = 26;
 const S_HOT_PAGES: usize = 27;
 // (28-30: the checks deferred to batch closes, `DS_FE2_DEFER`, removed on
 // 2026-11-01.)
-/// Runs uploaded without a take because a take of their epoch had looked at
-/// them (`taken_lacking`), and their pages.
-const S_TAKEN_RUNS: usize = 31;
-const S_TAKEN_PAGES: usize = 32;
+// (31, 32: runs uploaded after another take of their epoch, `tune
+// fe2_taken_upload`, removed on 2026-11-01.)
 /// View pages the residency armed at its takes, armed here too (`adopt_armed`).
 const S_ADOPTED: usize = 33;
 
@@ -1605,35 +1603,6 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
                 caller_since(C_UPLOAD, tu);
                 continue;
             }
-            // Pages M lacks that a take of this epoch looked at already:
-            // uploaded without another take (`tune fe2_taken_upload`).
-            if super::tune::fe2_taken_upload() && !PRECHECK.with(|p| p.get()) && taken_lacking(a, b, want) {
-                let _k = UpKind::new(2);
-                let tu = tsc();
-                let mut x = a;
-                while x < b {
-                    if mine(x) {
-                        x += PAGE;
-                        continue;
-                    }
-                    let mut y = x + PAGE;
-                    while y < b && !mine(y) {
-                        y += PAGE;
-                    }
-                    if !upload(x, y) {
-                        STATS[S_UPLOAD_FAILED].fetch_add(1, Ordering::Relaxed);
-                        STATS[S_SLOW_NS].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                        return Err("an upload into the mirror failed");
-                    }
-                    STATS[S_UPLOADS].fetch_add(1, Ordering::Relaxed);
-                    STATS[S_UPLOAD_PAGES].fetch_add((y - x) / PAGE, Ordering::Relaxed);
-                    STATS[S_TAKEN_PAGES].fetch_add((y - x) / PAGE, Ordering::Relaxed);
-                    x = y;
-                }
-                STATS[S_TAKEN_RUNS].fetch_add(1, Ordering::Relaxed);
-                caller_since(C_UPLOAD, tu);
-                continue;
-            }
             // Another thread's take around this run, for a requirement at
             // least ours, instead of one of our own (`follow_take`).
             let tf = tsc();
@@ -1669,34 +1638,6 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
         super::hitch::note_since(super::hitch::Kind::Mirror, t0, || format!("check of {lo:#x}..{hi:#x}: {} runs, {} pages", bad.len(), bad.iter().map(|r| (r.1 - r.0) / PAGE).sum::<u64>()));
         Ok(())
     })
-}
-
-/// Whether every page of [a, b) is one M lacks that a take of an epoch at
-/// least `want` looked at (its clean stamp, set by every take's run whatever
-/// it found: `fix_run`): found written then, or uploaded by a batch not
-/// queued yet. Such a page needs an upload, and another take would only
-/// reset write marks the last one reset (a write since leaves its mark: a
-/// later take finds it, at worst one more upload).
-fn taken_lacking(a: u64, b: u64, want: u32) -> bool {
-    let mut x = a;
-    while x < b {
-        let e = word_end(x, b);
-        let Some(c) = chunk(x, false) else { return false };
-        let w = idx(x) / 64;
-        if c.valid[w].load(Ordering::Acquire) & word_mask(x, e) != 0 {
-            return false;
-        }
-        if c.wclean[w].load(Ordering::Acquire) < want {
-            let i = idx(x);
-            for k in i..i + ((e - x) / PAGE) as usize {
-                if c.clean[k].load(Ordering::Acquire) < want {
-                    return false;
-                }
-            }
-        }
-        x = e;
-    }
-    true
 }
 
 /// Arms (`arm`: hosted, where allowed) and takes [a, b), uploads its pages
@@ -3465,7 +3406,7 @@ pub fn status() -> String {
     let w: Vec<u64> = WB64.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let compacts = if COMPACTS[0].load(Ordering::Relaxed) > 0 { format!("    front end 2's touched-page lists made from touched bits (`tune touch_bits`): {} write-backs, {} words of bits scanned\n", COMPACTS[0].load(Ordering::Relaxed), COMPACTS[1].load(Ordering::Relaxed)) } else { String::new() };
     format!(
-        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages; runs a take of their epoch had looked at, without another: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed; {} view pages armed at the residency's takes adopted), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action; CP writes with work to write back {} of labels a CP of ours waits on, {} left to the batch's close, {} with their guest-memory copy at the close); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value, {} gone past ended none); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
+        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed; {} view pages armed at the residency's takes adopted), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action; CP writes with work to write back {} of labels a CP of ours waits on, {} left to the batch's close, {} with their guest-memory copy at the close); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value, {} gone past ended none); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
         s[S_ENSURES],
         s[S_ENSURE_PAGES],
         s[S_FAST],
@@ -3481,8 +3422,6 @@ pub fn status() -> String {
         (s[S_UPLOAD_PAGES] * PAGE) >> 20,
         s[S_HOT_RUNS],
         s[S_HOT_PAGES],
-        s[S_TAKEN_RUNS],
-        s[S_TAKEN_PAGES],
         s[S_UPLOAD_FAILED],
         s[S_VALIDATED],
         s[S_RACED],
