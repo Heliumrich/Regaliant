@@ -1478,69 +1478,33 @@ struct Mirror {
     /// Sparse block size (the alignment of its memory requirements).
     page: u64,
     mem_type: u32,
-    /// Device memory blocks and the next free offset in the last one.
-    blocks: Mutex<(Vec<vk::DeviceMemory>, u64)>,
+    /// Device memory blocks, the pages claimed and the binds waiting
+    /// (`back_in`).
+    blocks: Mutex<Backing>,
+    /// Woken when a bind completes or fails.
+    bound: parking_lot::Condvar,
     /// One bit per mirror page: bound to memory.
     backed: Box<[AtomicU64]>,
 }
 
+/// A mirror's backing state (`Mirror::blocks`): one thread at a time binds
+/// every page claimed so far in one `vkQueueBindSparse` and waits for it;
+/// threads needing pages meanwhile claim theirs and wait for that bind or
+/// make the next one (a bind and its wait cost ~0.4-0.9 ms whatever its
+/// size, FINDINGS.md 2026-11-01).
+struct Backing {
+    /// Device memory blocks and the next free offset in the last one.
+    mems: Vec<vk::DeviceMemory>,
+    next: u64,
+    /// One bit per page: claimed for a bind (waiting, in flight or done).
+    claimed: Vec<u64>,
+    /// Binds of claimed pages no bind has taken yet.
+    pending: Vec<vk::SparseMemoryBind>,
+    /// A thread is binding.
+    binding: bool,
+}
+
 static MIRROR: std::sync::OnceLock<Mirror> = std::sync::OnceLock::new();
-
-/// Front end 2's image of guest memory (`DS_WB_IMAGE`, `fe2::image_on`): a
-/// second sparse buffer over the mirror's span, backed over the ranges GPU
-/// work writes (`back_image`), and its video memory in pages.
-static IMAGE: std::sync::OnceLock<Mirror> = std::sync::OnceLock::new();
-static IMAGE_BACKED: AtomicU64 = AtomicU64::new(0);
-
-/// Makes the image buffer (`fe2::init` with `DS_WB_IMAGE`).
-pub fn make_image() -> Result<(), String> {
-    if IMAGE.get().is_none() {
-        let m = make_mirror()?;
-        let _ = IMAGE.set(m);
-    }
-    Ok(())
-}
-
-/// The image buffer (`make_image`).
-pub fn image_buffer() -> Option<vk::Buffer> {
-    IMAGE.get().map(|m| m.buf)
-}
-
-/// Binds video memory to the image's pages over guest [base, base+len).
-pub fn back_image(base: u64, len: u64) -> Result<(), String> {
-    back_in(IMAGE.get().ok_or("no image")?, base, len, &IMAGE_BACKED)
-}
-
-/// The runs of guest [a, b) whose image pages are backed (only those can be
-/// valid, so only those need keeping current).
-pub fn image_backed_runs(a: u64, b: u64, out: &mut Vec<(u64, u64)>) {
-    let Some(m) = IMAGE.get() else { return };
-    if b <= a || a < MIRROR_BASE || b > MIRROR_END {
-        return;
-    }
-    let backed = |p: u64| m.backed[(p / 64) as usize].load(Ordering::Acquire) & (1u64 << (p % 64)) != 0;
-    let (p0, p1) = ((a - MIRROR_BASE) / m.page, (b - 1 - MIRROR_BASE) / m.page);
-    let mut p = p0;
-    while p <= p1 {
-        if !backed(p) {
-            p += 1;
-            continue;
-        }
-        let q0 = p;
-        while p <= p1 && backed(p) {
-            p += 1;
-        }
-        let lo = (MIRROR_BASE + q0 * m.page).max(a);
-        let hi = (MIRROR_BASE + p * m.page).min(b);
-        out.push((lo, hi));
-    }
-}
-
-/// The image's video memory so far, in MiB.
-pub fn image_mib() -> u64 {
-    let page = IMAGE.get().map_or(64 << 10, |m| m.page);
-    (IMAGE_BACKED.load(Ordering::Relaxed) * page) >> 20
-}
 
 fn make_mirror() -> Result<Mirror, String> {
     let c = ctx();
@@ -1570,7 +1534,9 @@ fn make_mirror() -> Result<Mirror, String> {
         req.alignment >> 10,
         c.limits.sparse_address_space_size >> 30
     );
-    Ok(Mirror { buf, page: req.alignment, mem_type, blocks: Mutex::new((Vec::new(), BLOCK)), backed: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect() })
+    let words = pages.div_ceil(64);
+    let blocks = Mutex::new(Backing { mems: Vec::new(), next: BLOCK, claimed: vec![0; words], pending: Vec::new(), binding: false });
+    Ok(Mirror { buf, page: req.alignment, mem_type, blocks, bound: parking_lot::Condvar::new(), backed: (0..words).map(|_| AtomicU64::new(0)).collect() })
 }
 
 /// Binds device memory to the mirror's pages over guest [base, base+len)
@@ -1610,64 +1576,121 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
         return Ok(());
     }
     let t0 = std::time::Instant::now();
+    // The aligned granule around the range is claimed with it (`tune
+    // fe2_back_granule` pages): the binds a range's neighbours would make.
+    let gran = back_granule();
+    let pages = (MIRROR_END - MIRROR_BASE) / m.page;
+    let (g0, g1) = (first & !(gran - 1), (last | (gran - 1)).min(pages - 1));
     let mut g = m.blocks.lock();
-    let mut binds = Vec::new();
-    let mut alloc_ns = 0u64;
-    for p in first..=last {
-        let (w, bit) = ((p / 64) as usize, 1u64 << (p % 64));
-        if m.backed[w].load(Ordering::Acquire) & bit != 0 {
+    let (mut alloc_ns, mut binds_here, mut pages_here, mut bind_ns) = (0u64, 0u64, 0u64, 0u64);
+    let mut claim = |g: &mut Backing, a: u64, b: u64| -> Result<(), String> {
+        for p in a..=b {
+            let (w, bit) = ((p / 64) as usize, 1u64 << (p % 64));
+            if g.claimed[w] & bit != 0 {
+                continue;
+            }
+            if g.next + m.page > BLOCK {
+                let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+                let ai = vk::MemoryAllocateInfo::default().allocation_size(BLOCK).memory_type_index(m.mem_type);
+                let ai = if c.device_addresses { ai.push_next(&mut fl) } else { ai };
+                let ta = std::time::Instant::now();
+                let mem = unsafe { c.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory (mirror block): {e}"))?;
+                alloc_ns += ta.elapsed().as_nanos() as u64;
+                g.mems.push(mem);
+                g.next = 0;
+            }
+            let mem = *g.mems.last().expect("block");
+            g.pending.push(vk::SparseMemoryBind::default().resource_offset(p * m.page).size(m.page).memory(mem).memory_offset(g.next));
+            g.next += m.page;
+            g.claimed[w] |= bit;
+        }
+        Ok(())
+    };
+    claim(&mut *g, g0, g1)?;
+    loop {
+        if (first..=last).all(backed) {
+            break;
+        }
+        if !g.binding && g.pending.is_empty() {
+            // (Pages a failed bind gave up: claimed again.)
+            claim(&mut *g, first, last)?;
+        }
+        if g.binding || g.pending.is_empty() {
+            m.bound.wait(&mut g);
             continue;
         }
-        if g.1 + m.page > BLOCK {
-            let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-            let ai = vk::MemoryAllocateInfo::default().allocation_size(BLOCK).memory_type_index(m.mem_type);
-            let ai = if c.device_addresses { ai.push_next(&mut fl) } else { ai };
-            let ta = std::time::Instant::now();
-            let mem = unsafe { c.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory (mirror block): {e}"))?;
-            alloc_ns += ta.elapsed().as_nanos() as u64;
-            g.0.push(mem);
-            g.1 = 0;
+        let binds = std::mem::take(&mut g.pending);
+        g.binding = true;
+        // (Waited for: binds not waited for, every later submission waiting
+        // for a timeline value instead, cost the arrival no less and stalled
+        // the queues for seconds at times: FINDINGS.md 2026-11-01.)
+        let tb = std::time::Instant::now();
+        let r = parking_lot::MutexGuard::unlocked(&mut g, || {
+            let bufs = [vk::SparseBufferMemoryBindInfo::default().buffer(m.buf).binds(&binds)];
+            let info = vk::BindSparseInfo::default().buffer_binds(&bufs);
+            let fence = unsafe { c.device.create_fence(&vk::FenceCreateInfo::default(), None) }.map_err(|e| format!("vkCreateFence: {e}"))?;
+            let r = {
+                // (On the main family's second queue it cost the same:
+                // FINDINGS.md 2026-11-01.)
+                let q = c.queue.lock();
+                unsafe { c.device.queue_bind_sparse(*q, &[info], fence) }
+            };
+            let r = r.map_err(|e| format!("vkQueueBindSparse: {e}")).and_then(|_| unsafe { c.device.wait_for_fences(&[fence], true, u64::MAX) }.map_err(|e| format!("bind fence: {e}")));
+            unsafe { c.device.destroy_fence(fence, None) };
+            r
+        });
+        bind_ns += tb.elapsed().as_nanos() as u64;
+        g.binding = false;
+        for b in &binds {
+            let p = b.resource_offset / m.page;
+            let (w, bit) = ((p / 64) as usize, 1u64 << (p % 64));
+            if r.is_ok() {
+                m.backed[w].fetch_or(bit, Ordering::AcqRel);
+            } else {
+                g.claimed[w] &= !bit;
+            }
         }
-        let mem = *g.0.last().expect("block");
-        binds.push(vk::SparseMemoryBind::default().resource_offset(p * m.page).size(m.page).memory(mem).memory_offset(g.1));
-        g.1 += m.page;
+        m.bound.notify_all();
+        r?;
+        count.fetch_add(binds.len() as u64, Ordering::Relaxed);
+        binds_here += 1;
+        pages_here += binds.len() as u64;
     }
-    if binds.is_empty() {
-        return Ok(());
-    }
-    // (Waited for: binds not waited for, every later submission waiting for
-    // a timeline value instead, cost the arrival no less and stalled the
-    // queues for seconds at times: FINDINGS.md 2026-11-01.)
-    let tb = std::time::Instant::now();
-    let bufs = [vk::SparseBufferMemoryBindInfo::default().buffer(m.buf).binds(&binds)];
-    let info = vk::BindSparseInfo::default().buffer_binds(&bufs);
-    let fence = unsafe { c.device.create_fence(&vk::FenceCreateInfo::default(), None) }.map_err(|e| format!("vkCreateFence: {e}"))?;
-    let r = {
-        let q = c.queue.lock();
-        unsafe { c.device.queue_bind_sparse(*q, &[info], fence) }
-    };
-    let r = r.map_err(|e| format!("vkQueueBindSparse: {e}")).and_then(|_| unsafe { c.device.wait_for_fences(&[fence], true, u64::MAX) }.map_err(|e| format!("bind fence: {e}")));
-    unsafe { c.device.destroy_fence(fence, None) };
-    r?;
-    for b in &binds {
-        let p = b.resource_offset / m.page;
-        m.backed[(p / 64) as usize].fetch_or(1u64 << (p % 64), Ordering::AcqRel);
-    }
-    count.fetch_add(binds.len() as u64, Ordering::Relaxed);
-    let (bind_ns, all_ns) = (tb.elapsed().as_nanos() as u64, t0.elapsed().as_nanos() as u64);
-    for (k, v) in [1, binds.len() as u64, alloc_ns, bind_ns, all_ns].into_iter().enumerate() {
+    drop(g);
+    let all_ns = t0.elapsed().as_nanos() as u64;
+    for (k, v) in [binds_here, pages_here, alloc_ns, bind_ns, all_ns, 0, 1].into_iter().enumerate() {
         BACKING[k].fetch_add(v, Ordering::Relaxed);
     }
     BACKING[5].fetch_max(all_ns, Ordering::Relaxed);
     // (A long one is a hitch cause: `gpu::hitch`.)
-    super::hitch::note_since(super::hitch::Kind::Mirror, t0, || format!("backing {} pages of the mirror at {base:#x} (the bind and its wait {} ms)", binds.len(), bind_ns / 1_000_000));
+    super::hitch::note_since(super::hitch::Kind::Mirror, t0, || {
+        format!("backing {} pages of the mirror at {base:#x} ({binds_here} binds here, {pages_here} pages, {} ms)", last + 1 - first, bind_ns / 1_000_000)
+    });
     Ok(())
 }
 
-/// The mirror's backings that bound pages (`back_in`): [calls, pages,
-/// allocation ns, bind and wait ns, all ns, longest ns]; `profile reset`
-/// clears them.
-static BACKING: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// The backing granule in pages (`tune fe2_back_granule`; 0, the default:
+/// 16 pages (1 MiB) with a device-local heap of 16 GiB or more, else 1: at
+/// Castlewall's arrival 1 MiB granules cut the backings' thread time 55%
+/// for 30% more video memory in the mirror, FINDINGS.md 2026-11-01).
+fn back_granule() -> u64 {
+    match super::tune::fe2_back_granule() {
+        0 => {
+            static AUTO: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            *AUTO.get_or_init(|| {
+                let p = &ctx().mem_props;
+                let big = (0..p.memory_heap_count as usize).filter(|&i| p.memory_heaps[i].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).map(|i| p.memory_heaps[i].size).max().unwrap_or(0);
+                if big >= 16 << 30 { 16 } else { 1 }
+            })
+        }
+        g => g.clamp(1, 4096).next_power_of_two(),
+    }
+}
+
+/// The mirror's backings (`back_in`): [binds, pages bound, allocation ns,
+/// bind and wait ns, ns in calls that bound or waited, the longest such
+/// call, such calls]; `profile reset` clears them.
+static BACKING: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// Clears the backing counts (`profile reset`).
 pub fn reset_backing() {
@@ -1677,22 +1700,39 @@ pub fn reset_backing() {
 }
 
 /// Profile line: the mirror's backings in the window (each binds video
-/// memory with `vkQueueBindSparse` on the main queue and waits for it).
+/// memory with `vkQueueBindSparse` on the main queue and waits for it), and
+/// what aligned granules of 1, 2 and 4 MiB over the pages backed now would
+/// hold (`tune fe2_back_granule`).
 pub fn backing_line() -> String {
     let v: Vec<u64> = BACKING.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    if v[0] == 0 {
+    let Some(m) = MIRROR.get() else { return String::new() };
+    if v[6] == 0 {
         return String::new();
     }
-    let page = MIRROR.get().map_or(64 << 10, |m| m.page);
+    let page = m.page;
+    let (mut now, mut g) = (0u64, [0u64; 3]);
+    for w in m.backed.iter() {
+        let w = w.load(Ordering::Relaxed);
+        now += w.count_ones() as u64;
+        for (k, n) in [16u32, 32, 64].into_iter().enumerate() {
+            let mask = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+            g[k] += (0..64 / n).filter(|i| (w >> (i * n)) & mask != 0).count() as u64 * n as u64;
+        }
+    }
     format!(
-        "    mirror backings in the window: {} ({} pages, {} MiB; {:.1} ms, of it allocations {:.1} ms and binds with their waits {:.1} ms; longest {:.1} ms)\n",
+        "    mirror backings in the window: {} binds ({} pages, {} MiB; {:.1} ms with their waits, allocations {:.1} ms) for {} calls that bound or waited ({:.1} ms in all, longest {:.1} ms); backed now {} MiB, in whole granules of 1 / 2 / 4 MiB {} / {} / {} MiB\n",
         v[0],
         v[1],
         (v[1] * page) >> 20,
-        v[4] as f64 / 1e6,
-        v[2] as f64 / 1e6,
         v[3] as f64 / 1e6,
-        v[5] as f64 / 1e6
+        v[2] as f64 / 1e6,
+        v[6],
+        v[4] as f64 / 1e6,
+        v[5] as f64 / 1e6,
+        (now * page) >> 20,
+        (g[0] * page) >> 20,
+        (g[1] * page) >> 20,
+        (g[2] * page) >> 20
     )
 }
 

@@ -287,42 +287,6 @@ fn exact_on() -> bool {
     *W.get_or_init(|| std::env::var("DS_FE2_EXACT").ok().as_deref() != Some("0"))
 }
 
-/// Slots of the table of exact ranges found fine that every thread shares
-/// (`tune fe2_shared_ranges`), behind each thread's own caches. A range is
-/// noted fine only with no page of its checker's own batch's uploads in it
-/// (those are fine for that batch alone until it is queued), and what makes
-/// it hold again (its chunks' generations, its host leaves' events, the
-/// requirement met) is global: one thread's finding holds for every thread.
-/// (Each graphics worker's own caches missed with no covering range ~4
-/// million times over Castlewall's arrival: FINDINGS.md 2026-10-31.)
-const SHARED_SLOTS: usize = 16384;
-
-static SHARED: std::sync::OnceLock<Vec<Mutex<Fine>>> = std::sync::OnceLock::new();
-
-/// Checks met by another thread's finding (`SHARED`), by caller class.
-static SHARED_HITS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-
-fn shared_table() -> &'static [Mutex<Fine>] {
-    SHARED.get_or_init(|| (0..SHARED_SLOTS).map(|_| Mutex::new(Fine { lo: 0, hi: 0, gens: [0; FINE_CHUNKS], host: [0; FINE_LEAVES], ep: 0, marked: false })).collect())
-}
-
-#[inline]
-fn shared_slot(lo: u64, hi: u64) -> usize {
-    let h = (lo >> 12).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (hi >> 12).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-    (h >> (64 - SHARED_SLOTS.trailing_zeros())) as usize
-}
-
-/// Another thread's finding that [lo, hi) is fine as `want` and `marked`
-/// ask, if it still holds (`SHARED`).
-fn shared_fine(lo: u64, hi: u64, want: u32, marked: bool) -> Option<Fine> {
-    let f = *shared_table()[shared_slot(lo, hi)].lock();
-    if f.hi == 0 || f.lo != lo || f.hi != hi || (marked && !f.marked) || f.ep < want || changed(&f).is_some() {
-        return None;
-    }
-    SHARED_HITS[CALLER.with(|c| c.get())].fetch_add(1, Ordering::Relaxed);
-    Some(f)
-}
-
 /// The slot of page-aligned [lo, hi) in `EXACT`.
 #[inline]
 fn exact_slot(lo: u64, hi: u64) -> usize {
@@ -416,22 +380,6 @@ fn range_fine(lo: u64, hi: u64, want: u32, marked: bool) -> bool {
                 }
             }
             i += 1;
-        }
-        // (`tune fe2_shared_ranges`: another thread's finding, kept as this
-        // thread's too.)
-        if super::tune::fe2_shared_ranges() {
-            if let Some(f) = shared_fine(lo, hi, want, marked) {
-                if exact_on() {
-                    EXACT.with(|t| {
-                        let mut t = t.borrow_mut();
-                        if t.is_empty() {
-                            t.resize(EXACT_SLOTS, Fine { lo: 0, hi: 0, gens: [0; FINE_CHUNKS], host: [0; FINE_LEAVES], ep: 0, marked: false });
-                        }
-                        t[exact_slot(lo, hi)] = f;
-                    });
-                }
-                return true;
-            }
         }
         if callers_on() {
             caller_count(why, 1);
@@ -551,7 +499,7 @@ pub fn note_place_parts(map: u64, begin: u64, batch: u64, after: u64) {
 /// Clears the checks by caller (`profile reset`).
 pub fn reset_callers() {
     reset_up_census();
-    for c in BY_CALLER.iter().flatten().chain(BY_CALLER_FIRST.iter().flatten()).chain(QUIET_TAKES.iter().flatten()).chain(BY_SOURCE.iter().flatten()).chain(SHARED_HITS.iter()) {
+    for c in BY_CALLER.iter().flatten().chain(BY_CALLER_FIRST.iter().flatten()).chain(QUIET_TAKES.iter().flatten()).chain(BY_SOURCE.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
 }
@@ -951,9 +899,6 @@ fn note_range_fine(lo: u64, hi: u64, gens: [u32; FINE_CHUNKS], host: [u64; FINE_
         r.insert(0, Fine { lo, hi, gens, host, ep, marked });
         r.truncate(RANGE_CACHE);
     });
-    if super::tune::fe2_shared_ranges() {
-        *shared_table()[shared_slot(lo, hi)].lock() = Fine { lo, hi, gens, host, ep, marked };
-    }
 }
 
 static TABLE: [AtomicPtr<Chunk>; CHUNKS] = [const { AtomicPtr::new(std::ptr::null_mut()) }; CHUNKS];
@@ -1863,14 +1808,6 @@ fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &A
     if r.is_some() {
         hole_check(written);
     }
-    if wb_pages() {
-        note_cpu_written(written);
-    }
-    if index_census() {
-        INDEX_CPU_WRITES[0].fetch_add(written.len() as u64, Ordering::Relaxed);
-        let n = written.iter().filter(|&&pg| index_any(pg, PAGE)).count() as u64;
-        INDEX_CPU_WRITES[1].fetch_add(n, Ordering::Relaxed);
-    }
     super::hitch::note_since(super::hitch::Kind::Mirror, tt, || format!("take of {ta:#x}..{tb:#x} ({} pages)", (tb - ta) / PAGE));
     let tns = tt.elapsed().as_nanos() as u64;
     STATS[S_TAKE_NS].fetch_add(tns, Ordering::Relaxed);
@@ -2052,23 +1989,6 @@ fn audit_bits(c: &Chunk, w: usize, wa: u64) -> u64 {
 pub fn audit_still(p: u64) -> bool {
     let Some(c) = chunk(p, false) else { return false };
     audit_bits(c, idx(p) / 64, p & !(64 * PAGE - 1)) & (1u64 << (idx(p) % 64)) != 0
-}
-
-/// Whether a page of [a, b) was ever marked written by GPU work (or has no
-/// chunk): its dwords may live in M until their write-back lands, and an
-/// upload of the page read on the CPU ahead of that would overwrite them
-/// (`exec`'s copies by the CPU while an import is made).
-pub fn any_gpu_written(a: u64, b: u64) -> bool {
-    let mut x = a;
-    while x < b {
-        let e = word_end(x, b);
-        let Some(c) = chunk(x, false) else { return true };
-        if word_mask(x, e) & c.gpu[idx(x) / 64].load(Ordering::Acquire) != 0 {
-            return true;
-        }
-        x = e;
-    }
-    false
 }
 
 /// Uploads the pages of [a, b) M lacks (not `mine`), as runs of consecutive
@@ -3031,21 +2951,6 @@ pub fn invalidate(base: u64, len: u64) {
 /// COUNTER_COPY_EVERY write-backs).
 struct Scatter {
     pipeline: vk::Pipeline,
-    /// The kernel storing nothing (`tune fe2_scatter_nostore`, with
-    /// `fe2_scatter_reset`; null otherwise).
-    nostore: vk::Pipeline,
-    /// The kernels reading guest memory first (`tune fe2_scatter_read` 1:
-    /// counting dwords it held already; 2: also storing only the others),
-    /// with `fe2_scatter_reset` (null otherwise).
-    census: vk::Pipeline,
-    changed: vk::Pipeline,
-    /// The kernel leaving lazy pages out (`DS_FE2_LAZY2`).
-    lazy: vk::Pipeline,
-    /// The kernel noting the pages it writes back (`DS_WB_PAGES`).
-    note: vk::Pipeline,
-    /// The kernel storing only dwords that differ from the image
-    /// (`DS_WB_IMAGE`; 2: the checking one).
-    image: vk::Pipeline,
     /// The touched-page list made from the touched bits
     /// (`rdna::kernels::mirror_compact`, `tune touch_bits`).
     compact: vk::Pipeline,
@@ -3055,12 +2960,6 @@ struct Scatter {
     reset: bool,
     host: vk::Buffer,
     dev: Option<vk::Buffer>,
-    /// The write-back handed over (`tune wb_region`, made when it is on at
-    /// front end 2's start; null otherwise): the handoff kernel, the region
-    /// scatter and the handoff region with its device address.
-    handoff: vk::Pipeline,
-    region_scatter: vk::Pipeline,
-    region: Option<(vk::Buffer, u64)>,
 }
 
 /// Write-backs between copies of the video-memory counters into the
@@ -3083,8 +2982,8 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
             .collect();
         let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("scatter set layout: {e}"))?;
         let layouts = [set_layout];
-        // (32 bytes: the image's address after the mirror's and the table's,
-        // `DS_WB_IMAGE`, then the handoff region's, `tune wb_region`.)
+        // (32 bytes: the mirror's and the table's addresses; the rest
+        // unused.)
         let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 32 }];
         let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("scatter layout: {e}"))?;
         let reset = super::tune::fe2_scatter_reset();
@@ -3098,31 +2997,7 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
             Ok(pipeline?[0])
         };
         let pipeline = make(&code, 20)?;
-        // (`tune fe2_scatter_nostore`: timing only, guest memory left as it was.)
-        let nostore = if reset { make(&rdna::kernels::mirror_scatter_nostore(), 21)? } else { vk::Pipeline::null() };
-        // (`tune fe2_scatter_read`.)
-        let census = if reset { make(&rdna::kernels::mirror_scatter_census(), 22)? } else { vk::Pipeline::null() };
-        let changed = if reset { make(&rdna::kernels::mirror_scatter_changed(), 23)? } else { vk::Pipeline::null() };
-        let lazy = if reset && lazy2_on() { make(&rdna::kernels::mirror_scatter_lazy(), 25)? } else { vk::Pipeline::null() };
-        let note = if reset && wb_pages() { make(&rdna::kernels::mirror_scatter_note(), 26)? } else { vk::Pipeline::null() };
-        let image = match (reset, image_mode()) {
-            (true, 1) => make(&rdna::kernels::mirror_scatter_image(), 27)?,
-            (true, 2) => make(&rdna::kernels::mirror_scatter_image_check(), 28)?,
-            _ => vk::Pipeline::null(),
-        };
         let compact = make(&rdna::kernels::mirror_compact(), 24)?;
-        // (`tune wb_region`: the handoff region, sized to the list's full
-        // capacity, ~132 MiB.)
-        let (handoff, region_scatter, region) = if reset && super::tune::wb_region() != 0 {
-            let (rb, _rmem, raddr) = c.device_buffer_addressed(4 * rdna::kernels::REGION_WORDS, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)?;
-            if raddr == 0 {
-                return Err("the handoff region has no device address".into());
-            }
-            crate::info!("fe2: write-backs handed over through a region of {} MiB (`tune wb_region`)", 4 * rdna::kernels::REGION_WORDS >> 20);
-            (make(&rdna::kernels::mirror_handoff(), 29)?, make(&rdna::kernels::mirror_scatter_region(), 30)?, Some((rb, raddr)))
-        } else {
-            (vk::Pipeline::null(), vk::Pipeline::null(), None)
-        };
         let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 }];
         let pool = c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).map_err(|e| format!("scatter pool: {e}"))?;
         let set = c.device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts)).map_err(|e| format!("scatter set: {e}"))?[0];
@@ -3143,7 +3018,7 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
             .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
             .collect();
         c.device.update_descriptor_sets(&writes, &[]);
-        Ok(Scatter { pipeline, nostore, census, changed, lazy, note, image, compact, layout, set, counters: cptr as *mut u32, reset, host: cbuf, dev, handoff, region_scatter, region })
+        Ok(Scatter { pipeline, compact, layout, set, counters: cptr as *mut u32, reset, host: cbuf, dev })
     }
 }
 
@@ -3154,15 +3029,6 @@ static TOUCH_BITS_EVER: AtomicBool = AtomicBool::new(false);
 /// Write-backs that made the list from the touched bits: [write-backs,
 /// words of touched bits scanned].
 static COMPACTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-
-/// Write-backs followed by `tune wb_probe`'s added barriers.
-static PROBES: AtomicU64 = AtomicU64::new(0);
-
-/// Write-backs handed over through the region (`tune wb_region`).
-static HANDOFFS: AtomicU64 = AtomicU64::new(0);
-
-/// Region scatters recorded after their batches (`tune wb_stream`).
-static REGION_SCATTERS: AtomicU64 = AtomicU64::new(0);
 
 pub fn note_touch_bits() {
     if !TOUCH_BITS_EVER.load(Ordering::Relaxed) {
@@ -3185,55 +3051,11 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
     let c = ctx();
     let m = c.buffer_address(mbuf);
     let t = super::pagetable::address();
-    let i = super::resident::image_buffer().map_or(0, |b| c.buffer_address(b));
-    let r = s.region.map_or(0, |(_, a)| a);
-    let pc: Vec<u8> = [m as u32, (m >> 32) as u32, t as u32, (t >> 32) as u32, i as u32, (i >> 32) as u32, r as u32, (r >> 32) as u32].iter().flat_map(|x| x.to_le_bytes()).collect();
-    let pipeline = if s.nostore != vk::Pipeline::null() && super::tune::fe2_scatter_nostore() {
-        s.nostore
-    } else if s.census != vk::Pipeline::null() && super::tune::fe2_scatter_read() == 1 {
-        s.census
-    } else if s.changed != vk::Pipeline::null() && super::tune::fe2_scatter_read() == 2 {
-        s.changed
-    } else if s.lazy != vk::Pipeline::null() {
-        s.lazy
-    } else if s.note != vk::Pipeline::null() {
-        s.note
-    } else if s.image != vk::Pipeline::null() && image_kernel() {
-        s.image
-    } else {
-        s.pipeline
-    };
+    let pc: Vec<u8> = [m as u32, (m >> 32) as u32, t as u32, (t >> 32) as u32, 0, 0, 0, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
+    let pipeline = s.pipeline;
     unsafe {
         let all = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT, vk::DependencyFlags::empty(), &[all], &[], &[]);
-        // (`DS_INDEX_CENSUS` with the census kernel: the index-page bits into
-        // the map's aux region, once.)
-        if index_census() && pipeline == s.census && !AUX_SENT.swap(true, Ordering::Relaxed) {
-            let bytes: Vec<u8> = index_pages().iter().flat_map(|w| w.load(Ordering::Relaxed).to_le_bytes()).collect();
-            let at = rdna::kernels::MARK_AUX_AT as u64 * 4;
-            for (k, part) in bytes.chunks(65536).enumerate() {
-                c.device.cmd_update_buffer(cmd, marks, at + 65536 * k as u64, part);
-            }
-            let up = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
-            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[up], &[], &[]);
-            crate::info!("fe2: the index-page bits ({} pages) copied for the write-back census", index_pages().iter().map(|w| w.load(Ordering::Relaxed).count_ones()).sum::<u32>());
-        }
-        if pipeline == s.lazy && s.lazy != vk::Pipeline::null() {
-            lazy_upload(cmd, marks);
-        }
-        // (`tune wb_image`: validity cleared when the comparing kernel
-        // resumes after another ran.)
-        if s.image != vk::Pipeline::null() && image_on() {
-            if pipeline == s.image {
-                if IMAGE_STALE.swap(false, Ordering::Relaxed) {
-                    c.device.cmd_fill_buffer(cmd, marks, rdna::kernels::MARK_AUX_AT as u64 * 4, rdna::kernels::MARK_AUX_WORDS as u64 * 4, 0);
-                    let up = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
-                    c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[up], &[], &[]);
-                }
-            } else {
-                IMAGE_STALE.store(true, Ordering::Relaxed);
-            }
-        }
         if let Some((lo, hi)) = written.filter(|&(lo, hi)| lo < hi && TOUCH_BITS_EVER.load(Ordering::Relaxed)) {
             // The touched-bit words of the pages in [lo, hi), 32 pages a word.
             let span_words = (MIRROR_END - MIRROR_BASE) / PAGE / 32;
@@ -3251,25 +3073,10 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
                 COMPACTS[1].fetch_add(w1 - w0, Ordering::Relaxed);
             }
         }
-        // (`tune wb_region`: the plain kernel's work as a handoff into the
-        // region, then the region's scatter.)
-        let region = s.region.filter(|_| s.reset && pipeline == s.pipeline && s.handoff != vk::Pipeline::null() && super::tune::wb_region() != 0);
-        if let Some((rbuf, _)) = region {
-            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, s.handoff);
-            c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
-            c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
-            c.device.cmd_dispatch_indirect(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4);
-            let handed = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::INDIRECT_COMMAND_READ);
-            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT, vk::DependencyFlags::empty(), &[handed], &[], &[]);
-            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, s.region_scatter);
-            c.device.cmd_dispatch_indirect(cmd, rbuf, 0);
-            HANDOFFS.fetch_add(1, Ordering::Relaxed);
-        } else {
-            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-            c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
-            c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
-            c.device.cmd_dispatch_indirect(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4);
-        }
+        c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+        c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
+        c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
+        c.device.cmd_dispatch_indirect(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4);
         if s.dev.is_some() && SCATTERS_RECORDED.fetch_add(1, Ordering::Relaxed) % COUNTER_COPY_EVERY == COUNTER_COPY_EVERY - 1 {
             record_counter_copy(s, cmd);
         }
@@ -3286,200 +3093,9 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
             let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_READ);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[after], &[], &[]);
         }
-        // (`tune wb_probe`, diagnosis: the same barriers again, with an
-        // indirect dispatch of the list the kernel just emptied between them
-        // at 1 (no workgroups run), or from 100 one workgroup of a ballast
-        // kernel running that many steps of a dependent chain into a buffer
-        // of its own; only added order and GPU time, no work removed.)
-        let probe = super::tune::wb_probe();
-        let ballast = if probe >= 100 { ballast() } else { None };
-        // (`tune wb_probe_site`: only at batch closes, or only before CP
-        // writes the GPU performs.)
-        let site_ok = match super::tune::wb_probe_site() {
-            0 => true,
-            w => PROBE_SITE.with(|x| x.get()) as u64 == w,
-        };
-        if probe != 0 && s.reset && site_ok && (probe < 100 || ballast.is_some()) {
-            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT, vk::DependencyFlags::empty(), &[all], &[], &[]);
-            if probe == 1 {
-                c.device.cmd_dispatch_indirect(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4);
-            } else if let Some(b) = ballast {
-                c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, b.pipeline);
-                c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, b.layout, 0, &[b.set], &[]);
-                let pcs: Vec<u8> = [probe.min(u32::MAX as u64) as u32, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
-                c.device.cmd_push_constants(cmd, b.layout, vk::ShaderStageFlags::COMPUTE, 0, &pcs);
-                c.device.cmd_dispatch(cmd, 1, 1, 1);
-            }
-            let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_READ);
-            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[after], &[], &[]);
-            PROBES.fetch_add(1, Ordering::Relaxed);
-            if let Some(b) = ballast {
-                note_scatter();
-                return Some(b.pipeline);
-            }
-        }
-        if region.is_some() {
-            note_scatter();
-            return Some(s.region_scatter);
-        }
     }
     note_scatter();
     Some(pipeline)
-}
-
-/// Whether write-backs can be handed over (`tune wb_region` made the region
-/// and its kernels at front end 2's start, with the list-emptying kernel).
-pub fn region_ready() -> bool {
-    SCATTER.get().is_some_and(|s| s.reset && s.region.is_some() && s.handoff != vk::Pipeline::null())
-}
-
-/// The write-back's first half for `tune wb_stream` (step 2 of STATUS item
-/// 1): the touched-page list and its pages' marks handed over into the
-/// region and cleared (`rdna::kernels::mirror_handoff`), between barriers
-/// that order it after all earlier work and all later work after it; the
-/// region's scatter follows in a command buffer of its own after the batch
-/// (`record_region_scatter`). None when nothing can be handed over.
-pub fn record_handoff(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Option<vk::Pipeline> {
-    let s = SCATTER.get()?;
-    if !region_ready() {
-        return None;
-    }
-    let marks = super::resident::marks()?;
-    let pc = scatter_push(s)?;
-    let c = ctx();
-    unsafe {
-        let all = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
-        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT, vk::DependencyFlags::empty(), &[all], &[], &[]);
-        record_compact(s, cmd, written);
-        c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, s.handoff);
-        c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
-        c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
-        c.device.cmd_dispatch_indirect(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4);
-        let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
-        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[after], &[], &[]);
-    }
-    HANDOFFS.fetch_add(1, Ordering::Relaxed);
-    note_scatter();
-    Some(s.handoff)
-}
-
-/// The write-back's second half (`tune wb_stream`): the region's scatter,
-/// recorded into a command buffer that runs after the batch whose handoff
-/// filled the region: the mirror's marked dwords as they are then go to
-/// guest memory, made visible to the host before what follows.
-pub fn record_region_scatter(cmd: vk::CommandBuffer) -> bool {
-    let Some(s) = SCATTER.get() else { return false };
-    let (Some((rbuf, _)), Some(pc)) = (s.region, scatter_push(s)) else { return false };
-    let c = ctx();
-    unsafe {
-        let all = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
-        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT, vk::DependencyFlags::empty(), &[all], &[], &[]);
-        c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, s.region_scatter);
-        c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
-        c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
-        c.device.cmd_dispatch_indirect(cmd, rbuf, 0);
-        if s.dev.is_some() && SCATTERS_RECORDED.fetch_add(1, Ordering::Relaxed) % COUNTER_COPY_EVERY == COUNTER_COPY_EVERY - 1 {
-            record_counter_copy(s, cmd);
-        }
-        let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_READ);
-        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[after], &[], &[]);
-    }
-    REGION_SCATTERS.fetch_add(1, Ordering::Relaxed);
-    true
-}
-
-/// The write-back kernels' push constants: the mirror's, the guest page
-/// table's, the image's and the handoff region's device addresses.
-fn scatter_push(s: &Scatter) -> Option<Vec<u8>> {
-    let (mbuf, _) = super::resident::mirror_buffer()?;
-    let c = ctx();
-    let m = c.buffer_address(mbuf);
-    let t = super::pagetable::address();
-    let i = super::resident::image_buffer().map_or(0, |b| c.buffer_address(b));
-    let r = s.region.map_or(0, |(_, a)| a);
-    Some([m as u32, (m >> 32) as u32, t as u32, (t >> 32) as u32, i as u32, (i >> 32) as u32, r as u32, (r >> 32) as u32].iter().flat_map(|x| x.to_le_bytes()).collect())
-}
-
-/// `tune touch_bits`: the touched-page list made from the touched bits of
-/// the written range first (`rdna::kernels::mirror_compact`).
-unsafe fn record_compact(s: &Scatter, cmd: vk::CommandBuffer, written: Option<(u64, u64)>) {
-    let Some((lo, hi)) = written.filter(|&(lo, hi)| lo < hi && TOUCH_BITS_EVER.load(Ordering::Relaxed)) else { return };
-    let c = ctx();
-    let span_words = (MIRROR_END - MIRROR_BASE) / PAGE / 32;
-    let w0 = (lo.max(MIRROR_BASE) - MIRROR_BASE) / PAGE / 32;
-    let w1 = ((hi.min(MIRROR_END) - MIRROR_BASE).div_ceil(PAGE)).div_ceil(32).min(span_words);
-    if w0 >= w1 {
-        return;
-    }
-    let cpc: Vec<u8> = [w0 as u32, w1 as u32, 0, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
-    unsafe {
-        c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, s.compact);
-        c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
-        c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &cpc);
-        c.device.cmd_dispatch(cmd, ((w1 - w0) as u32).div_ceil(rdna::kernels::COMPACT_LOCAL_SIZE), 1, 1);
-        let listed = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::INDIRECT_COMMAND_READ);
-        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT, vk::DependencyFlags::empty(), &[listed], &[], &[]);
-    }
-    COMPACTS[0].fetch_add(1, Ordering::Relaxed);
-    COMPACTS[1].fetch_add(w1 - w0, Ordering::Relaxed);
-}
-
-thread_local! {
-    /// Where the write-back being recorded stands (`tune wb_probe_site`): 1 a
-    /// batch's close, 2 before a CP write the GPU performs, 0 elsewhere.
-    static PROBE_SITE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-}
-
-/// The site of the write-back this thread records next (`PROBE_SITE`).
-pub fn set_probe_site(site: u8) {
-    PROBE_SITE.with(|x| x.set(site));
-}
-
-/// `tune wb_probe`'s ballast: `rdna::kernels::latency_test` storing into a
-/// buffer of its own (one workgroup's dwords), made at first use.
-struct Ballast {
-    pipeline: vk::Pipeline,
-    layout: vk::PipelineLayout,
-    set: vk::DescriptorSet,
-}
-
-fn ballast() -> Option<&'static Ballast> {
-    static B: std::sync::OnceLock<Option<Ballast>> = std::sync::OnceLock::new();
-    B.get_or_init(|| {
-        let r = (|| -> Result<Ballast, String> {
-            let c = ctx();
-            let d = &c.device;
-            let (buf, _mem) = c.device_buffer(4 * rdna::kernels::LATENCY_LOCAL_SIZE as u64, vk::BufferUsageFlags::STORAGE_BUFFER)?;
-            unsafe {
-                let binding = [vk::DescriptorSetLayoutBinding::default().binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE)];
-                let set_layout = d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&binding), None).map_err(|e| format!("set layout: {e}"))?;
-                let range = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(8)];
-                let layout = d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]).push_constant_ranges(&range), None).map_err(|e| format!("layout: {e}"))?;
-                let code = rdna::kernels::latency_test(0xba11);
-                let module = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("module: {e}"))?;
-                let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
-                let pipeline = d.create_compute_pipelines(vk::PipelineCache::null(), &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)], None).map_err(|(_, e)| format!("pipeline: {e}"))?[0];
-                d.destroy_shader_module(module, None);
-                let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 1 }];
-                let pool = d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).map_err(|e| format!("pool: {e}"))?;
-                let set = d.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[set_layout])).map_err(|e| format!("set: {e}"))?[0];
-                let bi = [vk::DescriptorBufferInfo::default().buffer(buf).offset(0).range(vk::WHOLE_SIZE)];
-                d.update_descriptor_sets(&[vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&bi)], &[]);
-                Ok(Ballast { pipeline, layout, set })
-            }
-        })();
-        match r {
-            Ok(b) => {
-                crate::info!("fe2: `tune wb_probe`'s ballast kernel made");
-                Some(b)
-            }
-            Err(e) => {
-                crate::warn!("fe2: `tune wb_probe`'s ballast kernel: {e}");
-                None
-            }
-        }
-    })
-    .as_ref()
 }
 
 /// Records a copy of the write-back's video-memory counters into the
@@ -3511,458 +3127,11 @@ pub fn scatter_resets() -> bool {
     on() && SCATTER.get().is_some_and(|s| s.reset)
 }
 
-/// `DS_INDEX_CENSUS=1` (diagnosis): the span's pages draws have read
-/// indices from (a bit per 4 KiB page, set at the draws' placements), and
-/// what reaches them on the CPU side: [the command processors' reads by
-/// reason (`exec::SYNC_*`, 6), pages takes found CPU-written]. Whether GPU
-/// work's index outputs could stay in the mirror (a lazy write-back of
-/// them, as the old front end's index homes did; FINDINGS.md 2026-10-31).
-pub fn index_census() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_INDEX_CENSUS").ok().as_deref() == Some("1"))
-}
-
-fn index_pages() -> &'static [AtomicU64] {
-    static BITS: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
-    BITS.get_or_init(|| (0..(MIRROR_END - MIRROR_BASE) / PAGE / 64).map(|_| AtomicU64::new(0)).collect())
-}
-
-static INDEX_READS: [[AtomicU64; 3]; 6] = [const { [const { AtomicU64::new(0) }; 3] }; 6];
-/// The index-page bits were copied into the map's aux region.
-static AUX_SENT: AtomicBool = AtomicBool::new(false);
-static INDEX_CPU_WRITES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-
-/// Notes that a draw reads indices from [a, a+n) (`index_census`).
-pub fn note_index(a: u64, n: u64) {
-    if !index_census() || n == 0 || !in_span(a, n) {
-        return;
-    }
-    let bits = index_pages();
-    let (p0, p1) = ((a - MIRROR_BASE) / PAGE, (a + n - MIRROR_BASE).div_ceil(PAGE));
-    let mut p = p0;
-    while p < p1 {
-        let w = (p / 64) as usize;
-        let e = ((p / 64 + 1) * 64).min(p1);
-        let mask = if e - p == 64 { u64::MAX } else { ((1u64 << (e - p)) - 1) << (p % 64) };
-        if bits[w].load(Ordering::Relaxed) & mask != mask {
-            bits[w].fetch_or(mask, Ordering::Relaxed);
-        }
-        p = e;
-    }
-}
-
-fn index_any(a: u64, n: u64) -> bool {
-    if n == 0 || !in_span(a, n) {
-        return false;
-    }
-    let bits = index_pages();
-    let (p0, p1) = ((a - MIRROR_BASE) / PAGE, (a + n - MIRROR_BASE).div_ceil(PAGE));
-    let mut p = p0;
-    while p < p1 {
-        let w = (p / 64) as usize;
-        let e = ((p / 64 + 1) * 64).min(p1);
-        let mask = if e - p == 64 { u64::MAX } else { ((1u64 << (e - p)) - 1) << (p % 64) };
-        if bits[w].load(Ordering::Relaxed) & mask != 0 {
-            return true;
-        }
-        p = e;
-    }
-    false
-}
-
-/// Counts the command processors' reads of index pages (`index_census`).
-pub fn index_census_reads(reads: &[(u64, u64)], why: usize) {
-    if !index_census() {
-        return;
-    }
-    let c = &INDEX_READS[why.min(5)];
-    for &(a, n) in reads {
-        c[0].fetch_add(1, Ordering::Relaxed);
-        if index_any(a, n) {
-            c[1].fetch_add(1, Ordering::Relaxed);
-            c[2].fetch_add(n, Ordering::Relaxed);
-        }
-    }
-}
-
-fn index_census_line() -> String {
-    if !index_census() {
-        return String::new();
-    }
-    let pages: u64 = index_pages().iter().map(|w| w.load(Ordering::Relaxed).count_ones() as u64).sum();
-    const WHY: [&str; 6] = ["CP reads", "dispatch shader reads", "dispatch textures", "draw shader reads", "draw textures", "draw indices"];
-    let reads: Vec<String> = (0..6)
-        .map(|k| {
-            let v: Vec<u64> = INDEX_READS[k].iter().map(|x| x.load(Ordering::Relaxed)).collect();
-            format!("{} {} ({} of index pages, {} KiB)", WHY[k], v[0], v[1], v[2] >> 10)
-        })
-        .collect();
-    format!(
-        "    index pages (`DS_INDEX_CENSUS`): {pages} pages ({} MiB) drawn from; the command processors' reads: {}; pages takes found CPU-written: {} of {}\n",
-        (pages * PAGE) >> 20,
-        reads.join(", "),
-        INDEX_CPU_WRITES[1].load(Ordering::Relaxed),
-        INDEX_CPU_WRITES[0].load(Ordering::Relaxed)
-    )
-}
-
-/// `DS_WB_IMAGE=<1|2>` (boot): front end 2's write-back stores only the
-/// marked dwords of 32-byte sectors that differ from a video-memory image
-/// of guest memory (`rdna::kernels::mirror_scatter_image`: level with no
-/// image at the vista, FINDINGS.md 2026-10-31 night; dword by dword it cost
-/// ~13.7 ms a frame, its stores into host memory cut into short runs; 2:
-/// also reads each dword it
-/// leaves out from guest memory and counts those that differ there, which
-/// must stay 0). The image is backed over written bindings' ranges, a page
-/// of it valid while its bit in the map's aux region is set (the write-back
-/// copies an invalid page whole into it); uploads into the mirror are
-/// copied into it too, and CP writes and fills write it as they write the
-/// mirror (exec.rs), where it is backed. FINDINGS.md 2026-10-31: a third
-/// (moving) to three fifths (still) of the dwords written back were
-/// unchanged.
-pub fn image_mode() -> u64 {
-    static M: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *M.get_or_init(|| std::env::var("DS_WB_IMAGE").ok().and_then(|v| v.parse().ok()).filter(|&v: &u64| v <= 2).unwrap_or(0))
-}
-
-static IMAGE_ON: AtomicBool = AtomicBool::new(false);
-
-/// The image is in use (made at start; off after a backing failure).
-pub fn image_on() -> bool {
-    IMAGE_ON.load(Ordering::Relaxed)
-}
-
-/// The image kept current by uploads, CP writes and fills (`tune wb_image`
-/// 1 or 2). A use with it off marks the image stale (`IMAGE_STALE`).
-pub fn image_upkeep() -> bool {
-    if !image_on() {
-        return false;
-    }
-    let on = super::tune::wb_image() != 0;
-    if !on {
-        IMAGE_STALE.store(true, Ordering::Relaxed);
-    }
-    on
-}
-
-/// The write-back compares with the image (`tune wb_image` 1).
-fn image_kernel() -> bool {
-    image_on() && super::tune::wb_image() == 1
-}
-
-/// Another write-back kernel ran since the comparing one last did: the
-/// image may lack what it wrote, so the next comparing write-back clears
-/// every page's validity first.
-static IMAGE_STALE: AtomicBool = AtomicBool::new(true);
-
-/// Switches the image off for good (its backing failed: pages it cannot
-/// hold would be compared with garbage).
-pub fn image_failed(why: &str) {
-    if IMAGE_ON.swap(false, Ordering::Relaxed) {
-        crate::warn!("fe2: the write-back image is off from now on: {why}");
-    }
-}
-
-/// The image kept current where its pages are backed: the copies of the
-/// mirror's [a, b) into it, made after an upload of that range into the
-/// mirror (behind the prologue's barrier: `Exec::pre_after`).
-pub fn image_refreshes(a: u64, b: u64, out: &mut Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>) {
-    let (Some(img), Some((mbuf, _))) = (super::resident::image_buffer(), super::resident::mirror_buffer()) else { return };
-    if b <= a || !in_span(a, b - a) {
-        return;
-    }
-    let mut runs = Vec::new();
-    super::resident::image_backed_runs(a, b, &mut runs);
-    for (x, y) in runs {
-        out.push((mbuf, img, vk::BufferCopy { src_offset: x - MIRROR_BASE, dst_offset: x - MIRROR_BASE, size: y - x }));
-        IMAGE_REFRESHED.fetch_add(y - x, Ordering::Relaxed);
-    }
-}
-
-/// Bytes copied into the image after uploads (`image_refreshes`), and CP
-/// writes and fills made into it too.
-static IMAGE_REFRESHED: AtomicU64 = AtomicU64::new(0);
-pub static IMAGE_WRITES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-
-fn image_line(w: &[u64]) -> String {
-    if image_mode() == 0 {
-        return String::new();
-    }
-    let check = if image_mode() == 2 { format!("; checked against guest memory: {} dwords left out, {} of them differing there", w[2], w[3]) } else { String::new() };
-    format!(
-        "    write-back image (`DS_WB_IMAGE`{}): {} dwords left out as unchanged, {} pages copied into it whole; kept current: {} MiB after uploads, {} CP writes, {} fills; its video memory {} MiB{check}\n",
-        if image_on() { "" } else { ", off" },
-        w[4],
-        w[5],
-        IMAGE_REFRESHED.load(Ordering::Relaxed) >> 20,
-        IMAGE_WRITES[0].load(Ordering::Relaxed),
-        IMAGE_WRITES[1].load(Ordering::Relaxed),
-        super::resident::image_mib()
-    )
-}
-
-/// `DS_WB_PAGES=1` (diagnosis): which pages GPU work really wrote (the
-/// write-back notes them in the map's aux region, `rdna::kernels::
-/// mirror_scatter_note`) against the pages takes found CPU-written, between
-/// status reports: pages both wrote are the ones a lazy write-back would
-/// have to merge when it uploads them (FINDINGS.md 2026-10-31).
-pub fn wb_pages() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_WB_PAGES").ok().as_deref() == Some("1"))
-}
-
-/// `DS_WB_PAGES`: pages takes found CPU-written since the last report.
-fn cpu_written_pages() -> &'static [AtomicU64] {
-    static BITS: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
-    BITS.get_or_init(|| (0..(MIRROR_END - MIRROR_BASE) / PAGE / 64).map(|_| AtomicU64::new(0)).collect())
-}
-
-fn note_cpu_written(pages: &[u64]) {
-    let bits = cpu_written_pages();
-    for &pg in pages {
-        if in_span(pg, PAGE) {
-            let p = (pg - MIRROR_BASE) / PAGE;
-            bits[(p / 64) as usize].fetch_or(1 << (p % 64), Ordering::Relaxed);
-        }
-    }
-}
-
-/// Status part (`DS_WB_PAGES`): the window's GPU-written pages (read back
-/// from the aux region, which is cleared), CPU-written pages and both.
-fn wb_pages_line() -> String {
-    if !wb_pages() {
-        return String::new();
-    }
-    let Some(marks) = super::resident::marks() else { return String::new() };
-    let c = ctx();
-    let words = rdna::kernels::MARK_AUX_WORDS as u64;
-    let Ok((hbuf, hmem, hptr)) = c.host_buffer(words * 4, vk::BufferUsageFlags::TRANSFER_DST) else { return String::new() };
-    let at = rdna::kernels::MARK_AUX_AT as u64 * 4;
-    let r = super::resident::one_off_now(|cmd| unsafe {
-        c.device.cmd_copy_buffer(cmd, marks, hbuf, &[vk::BufferCopy { src_offset: at, dst_offset: 0, size: words * 4 }]);
-        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_READ).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
-        c.device.cmd_fill_buffer(cmd, marks, at, words * 4, 0);
-    });
-    let gpu: Vec<u32> = (0..words as usize).map(|i| unsafe { std::ptr::read_volatile((hptr as *const u32).add(i)) }).collect();
-    unsafe {
-        c.device.destroy_buffer(hbuf, None);
-        c.device.free_memory(hmem, None);
-    }
-    if let Err(e) = r {
-        return format!("    pages GPU work wrote (`DS_WB_PAGES`): read-back failed: {e}\n");
-    }
-    let cpu = cpu_written_pages();
-    let (mut g, mut cw, mut both) = (0u64, 0u64, 0u64);
-    for (w, &gw) in gpu.iter().enumerate() {
-        let cv = cpu[w / 2].load(Ordering::Relaxed);
-        let cpart = if w % 2 == 0 { cv as u32 } else { (cv >> 32) as u32 };
-        g += gw.count_ones() as u64;
-        cw += cpart.count_ones() as u64;
-        both += (gw & cpart).count_ones() as u64;
-    }
-    for x in cpu.iter() {
-        x.store(0, Ordering::Relaxed);
-    }
-    format!("    pages GPU work wrote (`DS_WB_PAGES`, since the last report): {g}; pages takes found CPU-written: {cw}; both: {both}\n")
-}
-
-/// `DS_FE2_LAZY2=<name>:<hex size>,...` (diagnosis, wrong results where the
-/// title's code reads them): pages of written bindings inside such a
-/// mapping are left out of the write-backs (`rdna::kernels::
-/// mirror_scatter_lazy`, the written-bit map's aux region holding a bit per
-/// page) until one of the command processors' CPU-side reads (`sync_for`)
-/// touches them; from then on they are written back as before (that read
-/// itself may see stale data). What a lazy write-back of what our own
-/// reads never touch would spare (FINDINGS.md 2026-10-31).
-pub fn lazy2_on() -> bool {
-    !lazy2_rules().is_empty()
-}
-
-fn lazy2_rules() -> &'static [(String, u64)] {
-    static RULES: std::sync::OnceLock<Vec<(String, u64)>> = std::sync::OnceLock::new();
-    RULES.get_or_init(|| {
-        let Ok(v) = std::env::var("DS_FE2_LAZY2") else { return Vec::new() };
-        let rules: Vec<(String, u64)> = v
-            .split(',')
-            .filter_map(|r| {
-                let (n, s) = r.rsplit_once(':')?;
-                Some((n.to_string(), u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()?))
-            })
-            .collect();
-        if !rules.is_empty() {
-            crate::warn!("fe2: written pages of mappings {rules:?} stay out of guest memory until a command processor reads them (`DS_FE2_LAZY2`, diagnosis)");
-        }
-        rules
-    })
-}
-
-/// `DS_FE2_LAZY2`: per page, lazy (left out of write-backs) and eager (read
-/// by a command processor: never lazy again), and the aux words to upload.
-struct Lazy2 {
-    lazy: Box<[AtomicU64]>,
-    eager: Box<[AtomicU64]>,
-    dirty: parking_lot::Mutex<std::collections::BTreeSet<u32>>,
-}
-
-fn lazy2() -> &'static Lazy2 {
-    static L: std::sync::OnceLock<Lazy2> = std::sync::OnceLock::new();
-    L.get_or_init(|| {
-        let n = ((MIRROR_END - MIRROR_BASE) / PAGE / 64) as usize;
-        Lazy2 { lazy: (0..n).map(|_| AtomicU64::new(0)).collect(), eager: (0..n).map(|_| AtomicU64::new(0)).collect(), dirty: parking_lot::Mutex::new(Default::default()) }
-    })
-}
-
-/// [pages turned eager by reads, aux upload runs, aux words, uploads into
-/// the mirror over lazy pages, their lazy pages].
-static LAZY2_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
-
-/// An upload of [a, b) into the mirror from guest memory (`DS_FE2_LAZY2`):
-/// counted when it covers lazy pages (it overwrites what GPU work left
-/// there with guest memory's older copy).
-pub fn lazy2_upload(a: u64, b: u64) {
-    if !lazy2_on() || b <= a || !in_span(a, b - a) {
-        return;
-    }
-    let l = lazy2();
-    let (p0, p1) = ((a - MIRROR_BASE) / PAGE, (b - MIRROR_BASE).div_ceil(PAGE));
-    let mut n = 0u64;
-    let mut p = p0;
-    while p < p1 {
-        let w = (p / 64) as usize;
-        let e = ((p / 64 + 1) * 64).min(p1);
-        let mask = if e - p == 64 { u64::MAX } else { ((1u64 << (e - p)) - 1) << (p % 64) };
-        n += (l.lazy[w].load(Ordering::Relaxed) & mask).count_ones() as u64;
-        p = e;
-    }
-    if n > 0 {
-        LAZY2_STATS[3].fetch_add(1, Ordering::Relaxed);
-        LAZY2_STATS[4].fetch_add(n, Ordering::Relaxed);
-    }
-}
-
-thread_local! {
-    /// Mappings looked up for `lazy2_rules`: (start, end) -> matches.
-    static LAZY2_SEEN: std::cell::RefCell<std::collections::HashMap<(u64, u64), bool>> = std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-/// A written binding's pages [lo, hi): lazy when its mapping matches a rule
-/// and no command processor read them.
-pub fn lazy2_written(lo: u64, hi: u64) {
-    if !lazy2_on() || !in_span(lo, hi - lo) {
-        return;
-    }
-    let Some(bounds) = crate::mem::vma_bounds(lo) else { return };
-    let hit = LAZY2_SEEN.with(|c| *c.borrow_mut().entry(bounds).or_insert_with(|| crate::mem::vma_label(lo).is_some_and(|(_, size, name)| lazy2_rules().iter().any(|(n, s)| *n == name && *s == size))));
-    if !hit {
-        return;
-    }
-    let l = lazy2();
-    let (p0, p1) = ((lo - MIRROR_BASE) / PAGE, (hi.min(bounds.1) - MIRROR_BASE).div_ceil(PAGE));
-    let mut p = p0;
-    while p < p1 {
-        let w = (p / 64) as usize;
-        let e = ((p / 64 + 1) * 64).min(p1);
-        let mask = if e - p == 64 { u64::MAX } else { ((1u64 << (e - p)) - 1) << (p % 64) };
-        let want = mask & !l.eager[w].load(Ordering::Relaxed);
-        if want != 0 && l.lazy[w].fetch_or(want, Ordering::Relaxed) & want != want {
-            let mut d = l.dirty.lock();
-            d.insert(2 * w as u32);
-            d.insert(2 * w as u32 + 1);
-        }
-        p = e;
-    }
-}
-
-/// A command processor reads [a, a+n): its pages become eager.
-pub fn lazy2_read(reads: &[(u64, u64)]) {
-    if !lazy2_on() {
-        return;
-    }
-    let l = lazy2();
-    for &(a, n) in reads {
-        if n == 0 || !in_span(a, n) {
-            continue;
-        }
-        let (p0, p1) = ((a - MIRROR_BASE) / PAGE, (a + n - MIRROR_BASE).div_ceil(PAGE));
-        let mut p = p0;
-        while p < p1 {
-            let w = (p / 64) as usize;
-            let e = ((p / 64 + 1) * 64).min(p1);
-            let mask = if e - p == 64 { u64::MAX } else { ((1u64 << (e - p)) - 1) << (p % 64) };
-            if l.eager[w].load(Ordering::Relaxed) & mask != mask {
-                l.eager[w].fetch_or(mask, Ordering::Relaxed);
-            }
-            let was = l.lazy[w].fetch_and(!mask, Ordering::Relaxed) & mask;
-            if was != 0 {
-                LAZY2_STATS[0].fetch_add(was.count_ones() as u64, Ordering::Relaxed);
-                let mut d = l.dirty.lock();
-                d.insert(2 * w as u32);
-                d.insert(2 * w as u32 + 1);
-            }
-            p = e;
-        }
-    }
-}
-
-/// Records the lazy bits that changed into the aux region (before a
-/// write-back; outside a render pass).
-unsafe fn lazy_upload(cmd: vk::CommandBuffer, marks: vk::Buffer) {
-    let l = lazy2();
-    let words: Vec<u32> = std::mem::take(&mut *l.dirty.lock()).into_iter().collect();
-    if words.is_empty() {
-        return;
-    }
-    let c = ctx();
-    let mut i = 0;
-    let mut runs = 0u64;
-    while i < words.len() {
-        let mut j = i + 1;
-        while j < words.len() && words[j] == words[j - 1] + 1 && j - i < 16384 {
-            j += 1;
-        }
-        let bytes: Vec<u8> = words[i..j]
-            .iter()
-            .flat_map(|&w32| {
-                let v = l.lazy[(w32 / 2) as usize].load(Ordering::Relaxed);
-                (if w32 % 2 == 0 { v as u32 } else { (v >> 32) as u32 }).to_le_bytes()
-            })
-            .collect();
-        unsafe { c.device.cmd_update_buffer(cmd, marks, (rdna::kernels::MARK_AUX_AT as u64 + words[i] as u64) * 4, &bytes) };
-        runs += 1;
-        i = j;
-    }
-    let up = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
-    unsafe { c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[up], &[], &[]) };
-    LAZY2_STATS[1].fetch_add(runs, Ordering::Relaxed);
-    LAZY2_STATS[2].fetch_add(words.len() as u64, Ordering::Relaxed);
-}
-
-fn lazy2_line(w: &[u64]) -> String {
-    if !lazy2_on() {
-        return String::new();
-    }
-    let l = lazy2();
-    let lazy: u64 = l.lazy.iter().map(|x| x.load(Ordering::Relaxed).count_ones() as u64).sum();
-    let eager: u64 = l.eager.iter().map(|x| x.load(Ordering::Relaxed).count_ones() as u64).sum();
-    format!(
-        "    lazy pages (`DS_FE2_LAZY2`): {lazy} pages now, {eager} read by the command processors ({} turned eager); uploads into the mirror over lazy pages {} ({} pages); write-backs left out {} dwords in {} pages; aux uploads {} runs, {} words\n",
-        LAZY2_STATS[0].load(Ordering::Relaxed),
-        LAZY2_STATS[3].load(Ordering::Relaxed),
-        LAZY2_STATS[4].load(Ordering::Relaxed),
-        w[4],
-        w[5],
-        LAZY2_STATS[1].load(Ordering::Relaxed),
-        LAZY2_STATS[2].load(Ordering::Relaxed)
-    )
-}
-
 /// The write-back's counters summed in 64 bits (the kernel's are 32-bit
 /// and wrap within seconds at an arrival's volume: ~10 million dwords a
-/// flip), sampled at every flip (`census_sample`): pages, dwords, the
-/// census's dwords and those guest memory held already (`tune
-/// fe2_scatter_read`), its dwords and pages in index pages
-/// (`DS_INDEX_CENSUS`), then the last values seen of the six.
+/// flip), sampled at every flip (`census_sample`): pages, dwords and four
+/// counters the lazy write-back study used (FINDINGS.md 2026-10-31 night),
+/// then the last values seen of the six.
 static WB64: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 
 /// Adds the counters' growth since the last sample (at each flip, from one
@@ -4073,15 +3242,6 @@ pub fn init() {
                 }
             }
             ON.store(true, Ordering::Release);
-            if image_mode() > 0 {
-                match super::resident::make_image() {
-                    Ok(()) => {
-                        IMAGE_ON.store(true, Ordering::Relaxed);
-                        crate::info!("fe2: the write-back stores only dwords that differ from its image of guest memory (`DS_WB_IMAGE` {})", image_mode());
-                    }
-                    Err(e) => crate::warn!("fe2: no write-back image: {e}"),
-                }
-            }
             if crate::hosted::on() {
                 // (`DS_FE2_WORD=0`, diagnosis: the host answers a fault for
                 // its page only.)
@@ -4165,9 +3325,7 @@ fn self_test() -> Result<String, String> {
             c.device.free_memory(hm, None);
         }
         r?;
-        // (`tune fe2_scatter_nostore`: nothing lands, by design.)
-        let stores = !super::tune::fe2_scatter_nostore();
-        for i in (0..1024u32).filter(|_| stores) {
+        for i in 0..1024u32 {
             let got = unsafe { words.add(i as usize).read_volatile() };
             let want = if dwords.contains(&i) { 0x5000_0000 + i } else { 0xAAAA_AAAA };
             if got != want {
@@ -4392,11 +3550,7 @@ pub fn status() -> String {
         })
         .collect();
     let w: Vec<u64> = WB64.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    let (cn, cs) = (w[2], w[3]);
     let compacts = if COMPACTS[0].load(Ordering::Relaxed) > 0 { format!("    front end 2's touched-page lists made from touched bits (`tune touch_bits`): {} write-backs, {} words of bits scanned\n", COMPACTS[0].load(Ordering::Relaxed), COMPACTS[1].load(Ordering::Relaxed)) } else { String::new() };
-    let handoffs = if HANDOFFS.load(Ordering::Relaxed) > 0 { format!("    front end 2's write-backs handed over through the region (`tune wb_region`): {}, {} of them scattered after their batch (`tune wb_stream`)\n", HANDOFFS.load(Ordering::Relaxed), REGION_SCATTERS.load(Ordering::Relaxed)) } else { String::new() };
-    let probes = if PROBES.load(Ordering::Relaxed) > 0 { format!("    front end 2's write-backs followed by `tune wb_probe`'s barriers: {}\n", PROBES.load(Ordering::Relaxed)) } else { String::new() };
-    let census = if cn > 0 { format!("    front end 2's write-back census (`tune fe2_scatter_read`): {cn} dwords marked, {cs} of them ({:.1}%) held by guest memory already; in pages draws read indices from (`DS_INDEX_CENSUS`): {} dwords ({:.1}%), {} pages\n", 100.0 * cs as f64 / cn as f64, w[4], 100.0 * w[4] as f64 / cn as f64, w[5]) } else { String::new() };
     format!(
         "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages; runs a take of their epoch had looked at, without another: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed; {} view pages armed at the residency's takes adopted), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action; CP writes with work to write back {} of labels a CP of ours waits on, {} left to the batch's close, {} with their guest-memory copy at the close); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value, {} again with the label's page unwritten and {} gone past ended none); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
         s[S_ENSURES],
@@ -4479,14 +3633,7 @@ pub fn status() -> String {
     ) + &census_line()
         + &run_share_line()
         + &callers_line()
-        + &census
         + &compacts
-        + &handoffs
-        + &probes
-        + &index_census_line()
-        + &lazy2_line(&w)
-        + &wb_pages_line()
-        + &image_line(&w)
 }
 
 /// One status line: the mirror's pages by state now (a scan of every
@@ -4634,14 +3781,8 @@ pub fn callers_line() -> String {
             )
         })
         .collect();
-    let shared = if SHARED.get().is_some() {
-        let h: Vec<String> = CALLER_NAMES.iter().zip(SHARED_HITS.iter()).map(|(n, c)| format!("{n} {}", c.load(Ordering::Relaxed))).collect();
-        format!("; checks met by another thread's finding (`tune fe2_shared_ranges`): {}", h.join(", "))
-    } else {
-        String::new()
-    };
     format!(
-        "    front end 2's checks by caller: {}{shared}\n    of them at batches' and chunks' first commands: {}\n    the graphics CP's checks by the stage they bind: {}\n{quiet}",
+        "    front end 2's checks by caller: {}\n    of them at batches' and chunks' first commands: {}\n    the graphics CP's checks by the stage they bind: {}\n{quiet}",
         parts.join("; "),
         firsts.join("; "),
         sources.join("; ")

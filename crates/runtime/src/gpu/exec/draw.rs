@@ -1378,7 +1378,6 @@ impl Exec {
             Some((addr, size)) => {
                 let bytes = index_bytes(size);
                 let h = self.home_bind(addr, bytes, false, super::HomeUse::Index);
-                super::super::fe2::note_index(addr, bytes);
                 if h.is_none() {
                     if gpu.is_some() {
                         return Err(format!("index buffer {addr:#x}+{bytes:#x} of a draw reading its arguments on the GPU is not in a video-memory home (draw skipped)"));
