@@ -493,32 +493,62 @@ fn present_buffer(b: &DisplayBuffer) {
 /// Screenshot requested through the control channel (file name stem).
 pub static SHOT_REQUEST: Mutex<Option<String>> = Mutex::new(None);
 
+/// Screenshots being converted, encoded and written on threads of their own
+/// (`maybe_screenshot`); `wait_shots` waits for them at shutdown.
+static SHOTS_PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Waits (at most 10 s) for the screenshots still being written.
+pub fn wait_shots() {
+    let t = std::time::Instant::now();
+    while SHOTS_PENDING.load(std::sync::atomic::Ordering::Acquire) > 0 && t.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
     let requested = SHOT_REQUEST.lock().take();
     let listed = std::env::var("DS_SCREENSHOT").is_ok_and(|list| list.split(',').any(|s| s.trim().parse::<u64>().ok() == Some(flip)));
     if requested.is_none() && !listed {
         return;
     }
-    let shot = || -> Result<std::path::PathBuf, String> {
+    // The buffer is read back here (as flipped); its conversion, PNG encoding
+    // and write run on a thread of their own: on this thread they held the
+    // flips ~0.5 s per 4K shot (the boss fights' worst frames, 2026-11-01
+    // night).
+    let read = || -> Result<(Vec<u8>, ash::vk::Format, u32, u32, std::path::PathBuf), String> {
         if crate::gpu::vk::try_ctx().is_none() || !crate::gpu::exec::enabled() {
             return Err("GPU execution is off (DS_GPU=1 renders frames)".into());
         }
-        let (rgba, w, h) = crate::gpu::images::with(|im| -> Result<(Vec<u8>, u32, u32), String> {
+        let (raw, format, w, h) = crate::gpu::images::with(|im| -> Result<(Vec<u8>, ash::vk::Format, u32, u32), String> {
             let (image, format, w, h) = im.rendered_at(b.addr, registered_size(b)).ok_or("nothing was rendered to the buffer")?;
-            let raw = im.read_back(image, format, w, h)?;
-            Ok((crate::gpu::images::to_rgba8(format, &raw).ok_or_else(|| format!("no RGBA8 conversion for {format:?}"))?, w, h))
+            Ok((im.read_back(image, format, w, h)?, format, w, h))
         })?;
         let dir = crate::run_dir().ok_or("no run directory")?;
         let name = match &requested {
             Some(n) if !n.is_empty() => format!("{n}.png"),
             _ => format!("screenshot-{flip}.png"),
         };
-        let path = dir.join(name);
-        std::fs::write(&path, crate::gpu::png::encode(w, h, &rgba)).map_err(|e| e.to_string())?;
-        Ok(path)
+        Ok((raw, format, w, h, dir.join(name)))
     };
-    match shot() {
-        Ok(p) => crate::info!("screenshot of flip {flip} (buffer {:#x}): {}", b.addr, p.display()),
-        Err(e) => crate::warn!("screenshot of flip {flip} (buffer {:#x}) unavailable: {e}", b.addr),
+    let addr = b.addr;
+    match read() {
+        Ok((raw, format, w, h, path)) => {
+            SHOTS_PENDING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let write = move || {
+                let r = crate::gpu::images::to_rgba8(format, &raw)
+                    .ok_or_else(|| format!("no RGBA8 conversion for {format:?}"))
+                    .and_then(|rgba| std::fs::write(&path, crate::gpu::png::encode(w, h, &rgba)).map_err(|e| e.to_string()));
+                match r {
+                    Ok(()) => crate::info!("screenshot of flip {flip} (buffer {addr:#x}): {}", path.display()),
+                    Err(e) => crate::warn!("screenshot of flip {flip} (buffer {addr:#x}) unavailable: {e}"),
+                }
+                SHOTS_PENDING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            };
+            if let Err(e) = std::thread::Builder::new().name("shot-write".into()).spawn(write) {
+                SHOTS_PENDING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                crate::warn!("screenshot of flip {flip} (buffer {addr:#x}) unavailable: no writer thread ({e})");
+            }
+        }
+        Err(e) => crate::warn!("screenshot of flip {flip} (buffer {addr:#x}) unavailable: {e}"),
     }
 }

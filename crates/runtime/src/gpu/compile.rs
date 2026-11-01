@@ -28,10 +28,12 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// A stage to prepare from scanned registers, or one prepared already.
+/// A stage to prepare from scanned registers, one prepared already, or a
+/// program's batched form to prepare and make (`submit_batched`).
 enum Job {
     Regs(Arc<Slot>),
     Prepared(Box<Prepared>),
+    Batched(Arc<Slot>),
 }
 
 struct Pool {
@@ -60,7 +62,10 @@ const AT_WAITS: usize = 9;
 /// Programs with a pipeline already handed over again (another spec of
 /// them is a first use too).
 const AGAIN: usize = 10;
-static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// Batched forms handed over (`submit_batched`), and those made.
+const BATCHED: usize = 11;
+const BATCHED_MADE: usize = 12;
+static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
 /// Compute programs whose pipeline was created or found present: scans skip
 /// them before their per-scan limit (it filled with programs compiled
@@ -70,6 +75,11 @@ static KNOWN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
 /// A compute program has a pipeline now (`exec`).
 pub fn note_program(addr: u64) {
     KNOWN.lock().get_or_insert_with(Default::default).insert(addr);
+}
+
+/// Whether compute program `addr` has a pipeline (made or found present).
+pub fn has_pipeline(addr: u64) -> bool {
+    KNOWN.lock().as_ref().is_some_and(|k| k.contains(&addr))
 }
 
 /// Most compute programs one scan hands over (16 lost the gain: a level's
@@ -146,8 +156,47 @@ fn worker() {
                 compile(&p);
                 QUEUED.lock().retain(|&k| k != p.tr.key);
             }
+            Job::Batched(slot) => run_batched(&slot),
         }));
     }
+}
+
+/// Prepares a program's batched form from `slot`'s registers and makes its
+/// pipeline; the program is batched from then on (`shaders::batched_ready`).
+fn run_batched(slot: &Slot) {
+    let regs = slot.regs();
+    let addr = ((regs.sh(0x20C) as u64) | ((regs.sh(0x20D) as u64 & 0xFF) << 32)) << 8;
+    let made = match shaders::with_batched(addr, || shaders::prepare_compute(regs, slot.wave64())) {
+        Ok(p) if !regs.missed.load(Ordering::Relaxed) && p.tr.spec.batched => {
+            STATS[PREPARED].fetch_add(1, Ordering::Relaxed);
+            let t = std::time::Instant::now();
+            let r = super::exec::precompile(&p);
+            if r == Some(true) {
+                STATS[COMPILED].fetch_add(1, Ordering::Relaxed);
+                STATS[COMPILE_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            } else if r == Some(false) {
+                STATS[PRESENT].fetch_add(1, Ordering::Relaxed);
+            }
+            r.is_some()
+        }
+        _ => false,
+    };
+    if made {
+        STATS[BATCHED_MADE].fetch_add(1, Ordering::Relaxed);
+    } else {
+        STATS[FAILED].fetch_add(1, Ordering::Relaxed);
+    }
+    shaders::batched_ready(addr, made);
+}
+
+/// Hands the stage of a program marked batchable while it had a pipeline
+/// (`shaders::mark_batchable`) to the workers: its batched pipeline is made
+/// there, its dispatches stay unbatched meanwhile.
+pub fn submit_batched(regs: shaders::StageRegs, wave64: bool) {
+    ensure_workers();
+    STATS[BATCHED].fetch_add(1, Ordering::Relaxed);
+    POOL.jobs.lock().push_front(Job::Batched(Slot::new(regs, wave64)));
+    POOL.cv.notify_one();
 }
 
 fn run(slot: &Slot) {
@@ -301,7 +350,7 @@ pub fn status() -> String {
     let stops: Vec<String> = stops.iter().take(6).map(|(k, n)| format!("{k:#x} {n}")).collect();
     let stops = if stops.is_empty() { String::new() } else { format!(" (by {})", stops.join(", ")) };
     format!(
-        "    pipelines compiled ahead: {} scans at first uses ({} ms; ended by their buffer's end {}, the command limit {}, another packet {}{stops}; {} commands found), {} programs handed to {} workers ({} of them with a pipeline already, for other specs; {} over the per-scan limit) and {} stages prepared at label waits, {} prepared, {} pipelines created ({} ms of compiles), {} present already, {} failed or not prepared; command processors waited {} times for a pipeline in flight ({} ms), {} compiles of one pipeline avoided, {} programs batchable from a run's first dispatch\n",
+        "    pipelines compiled ahead: {} scans at first uses ({} ms; ended by their buffer's end {}, the command limit {}, another packet {}{stops}; {} commands found), {} programs handed to {} workers ({} of them with a pipeline already, for other specs; {} over the per-scan limit) and {} stages prepared at label waits, {} prepared, {} pipelines created ({} ms of compiles), {} present already, {} failed or not prepared; command processors waited {} times for a pipeline in flight ({} ms), {} compiles of one pipeline avoided, {} programs batchable from a run's first dispatch, {} batched forms made in the background ({} handed over)\n",
         s[SCANS],
         s[SCAN_NS] / 1_000_000,
         SCAN_ENDS[0].load(Ordering::Relaxed),
@@ -321,6 +370,8 @@ pub fn status() -> String {
         waits,
         wait_ns / 1_000_000,
         dups,
-        super::exec::BATCHABLE_AHEAD.load(Ordering::Relaxed)
+        super::exec::BATCHABLE_AHEAD.load(Ordering::Relaxed),
+        s[BATCHED_MADE],
+        s[BATCHED]
     )
 }

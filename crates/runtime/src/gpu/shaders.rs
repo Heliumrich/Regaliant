@@ -971,20 +971,77 @@ const CS_USER_DATA: u32 = 0x240;
 /// batch_cs`, `Exec::note_cs_streak`): translated batched (`Spec::batched`).
 static BATCHABLE: [std::sync::atomic::AtomicU64; 64] = [const { std::sync::atomic::AtomicU64::new(0) }; 64];
 
+/// Programs marked batchable while they had a pipeline already: batched
+/// once their batched pipeline exists, made by the compile workers
+/// (`compile::submit_batched`). Batched at once, the form was translated and
+/// compiled at its next dispatch: 1-2's Gatehouse froze 684 ms on 2026-11-01
+/// night (cs 0x138a5ab900, 661 ms on queue 0x28, the graphics CP waiting on
+/// its label).
+static PENDING_BATCHED: [std::sync::atomic::AtomicU64; 64] = [const { std::sync::atomic::AtomicU64::new(0) }; 64];
+
+thread_local! {
+    /// The program a compile worker prepares batched (`compile::submit_batched`).
+    static FORCE_BATCHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Whether program `addr` is batched (never address 0: the free slots hold 0,
 /// and the precompile's specs from kept code have no address; until
 /// 2026-10-30 every one of them came out batched, so no non-batched dispatch
 /// found its translation made ahead).
 pub fn batchable(addr: u64) -> bool {
-    addr != 0 && BATCHABLE.iter().any(|a| a.load(std::sync::atomic::Ordering::Relaxed) == addr)
+    addr != 0 && (BATCHABLE.iter().any(|a| a.load(std::sync::atomic::Ordering::Relaxed) == addr) || FORCE_BATCHED.with(|f| f.get()) == addr)
 }
 
-/// Marks program `addr` batchable (at most 64 programs).
-pub fn mark_batchable(addr: u64) {
+/// Runs `f` on this thread with program `addr` prepared batched.
+pub fn with_batched<T>(addr: u64, f: impl FnOnce() -> T) -> T {
+    FORCE_BATCHED.with(|c| c.set(addr));
+    let r = f();
+    FORCE_BATCHED.with(|c| c.set(0));
+    r
+}
+
+/// Whether program `addr` was marked batchable (batched, or waiting for its
+/// batched pipeline).
+pub fn batch_marked(addr: u64) -> bool {
+    batchable(addr) || PENDING_BATCHED.iter().any(|a| a.load(std::sync::atomic::Ordering::Relaxed) == addr)
+}
+
+/// Marks program `addr` batchable (at most 64 programs). A program with a
+/// pipeline already (`compile::has_pipeline`) stays unbatched until its
+/// batched pipeline is made: true when the caller is to hand its stage to
+/// `compile::submit_batched` (once per program).
+pub fn mark_batchable(addr: u64) -> bool {
     use std::sync::atomic::Ordering;
-    if batchable(addr) {
-        return;
+    if batch_marked(addr) {
+        return false;
     }
+    if super::compile::enabled() && super::compile::has_pipeline(addr) {
+        for a in &PENDING_BATCHED {
+            if a.compare_exchange(0, addr, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                crate::info!("gpu: cs {addr:#x} batched once its batched pipeline is made (runs of consecutive dispatches)");
+                return true;
+            }
+            if a.load(Ordering::Acquire) == addr {
+                return false;
+            }
+        }
+    }
+    mark_now(addr);
+    false
+}
+
+/// The batched pipeline of a program `mark_batchable` left pending is made
+/// (`ok`), or could not be (the program stays unbatched).
+pub fn batched_ready(addr: u64, ok: bool) {
+    if ok {
+        mark_now(addr);
+    } else {
+        crate::info!("gpu: cs {addr:#x} stays unbatched (its batched pipeline was not made)");
+    }
+}
+
+fn mark_now(addr: u64) {
+    use std::sync::atomic::Ordering;
     for a in &BATCHABLE {
         if a.compare_exchange(0, addr, Ordering::AcqRel, Ordering::Acquire).is_ok() {
             crate::info!("gpu: cs {addr:#x} batched from now on (runs of consecutive dispatches)");

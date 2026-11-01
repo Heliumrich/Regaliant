@@ -3565,8 +3565,11 @@ impl Cp {
                     if super::tune::batch_cs() && groups > 0 && groups <= super::exec::BATCH_SMALL {
                         let a = ((sh.get(0x20C).copied().unwrap_or(0) as u64) | ((sh.get(0x20D).copied().unwrap_or(0) as u64 & 0xFF) << 32)) << 8;
                         streak = if streak.0 == a { (a, streak.1 + 1) } else { (a, 1) };
-                        if streak.1 == super::exec::BATCH_STREAK && !super::shaders::batchable(a) {
-                            super::shaders::mark_batchable(a);
+                        if streak.1 == super::exec::BATCH_STREAK && !super::shaders::batch_marked(a) {
+                            if super::shaders::mark_batchable(a) {
+                                let view = ScanRegs { sh: &sh, ctx: &ctx };
+                                super::compile::submit_batched(super::shaders::StageRegs::capture(super::shaders::StageKind::Compute, &view), wave64);
+                            }
                             super::exec::BATCHABLE_AHEAD.fetch_add(1, Ordering::Relaxed);
                         }
                     }

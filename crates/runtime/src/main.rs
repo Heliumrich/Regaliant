@@ -1076,6 +1076,7 @@ fn pgo_write() {
 }
 
 pub fn shutdown(code: i32) -> ! {
+    hle::libs::videoout::wait_shots();
     gpu::shutdown();
     info!("shutdown with status {code}\n{}", thread_summary());
     crate::log::flush();

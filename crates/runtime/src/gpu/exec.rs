@@ -13558,21 +13558,26 @@ impl Exec {
         let first = self.batch_shaders.is_empty();
         super::fe2::set_first_command(first);
         let mut lap = Laps::for_dispatch(kind, first);
-        // Runs of direct dispatches of one program make it batchable.
+        // Runs of direct dispatches of one program make it batchable (one
+        // with a pipeline already once its batched one is made:
+        // `shaders::mark_batchable`).
         if super::tune::batch_cs() && indirect.is_none() && groups.iter().map(|&g| g as u64).product::<u64>() <= BATCH_SMALL {
             let a = cs_addr(cp);
+            let pend = |cp: &Cp| super::compile::submit_batched(super::shaders::StageRegs::capture(super::shaders::StageKind::Compute, cp), initiator & (1 << 15) == 0);
             if self.cs_streak.0 == a {
                 self.cs_streak.1 += 1;
-                if self.cs_streak.1 == BATCH_STREAK {
-                    super::shaders::mark_batchable(a);
+                if self.cs_streak.1 == BATCH_STREAK && super::shaders::mark_batchable(a) {
+                    pend(cp);
                 }
             } else {
                 self.cs_streak = (a, 1);
                 // A run starting here makes the program batchable now: before
                 // its first pipeline is made (else made twice, the second
                 // time batched when the run's fourth dispatch comes).
-                if !super::shaders::batchable(a) && self.cs_peeked.insert(a) && cp.streak_after(a, BATCH_SMALL, BATCH_STREAK - 1) + 1 >= BATCH_STREAK {
-                    super::shaders::mark_batchable(a);
+                if !super::shaders::batch_marked(a) && self.cs_peeked.insert(a) && cp.streak_after(a, BATCH_SMALL, BATCH_STREAK - 1) + 1 >= BATCH_STREAK {
+                    if super::shaders::mark_batchable(a) {
+                        pend(cp);
+                    }
                     BATCHABLE_AHEAD.fetch_add(1, Ordering::Relaxed);
                 }
             }
