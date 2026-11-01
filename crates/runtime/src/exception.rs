@@ -1500,6 +1500,10 @@ mod tests {
     use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE};
 
     static PAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Held by each test that faults on `PAGE`: run side by side, one test's
+    /// page replaced the other's and its fault went unhandled (a crashed
+    /// test binary, FINDINGS.md 2026-11-01).
+    static PAGE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     unsafe extern "system" fn unprotect(info: *mut EXCEPTION_POINTERS) -> i32 {
         let rec = unsafe { &*(*info).ExceptionRecord };
@@ -1516,6 +1520,7 @@ mod tests {
     /// vector code faults on write-tracked pages mid-computation).
     #[test]
     fn handled_fault_keeps_ymm() {
+        let _serial = PAGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let page = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY) } as u64;
         assert_ne!(page, 0);
         PAGE.store(page, std::sync::atomic::Ordering::Release);
@@ -1549,6 +1554,7 @@ mod tests {
     /// whose marker changed.
     #[test]
     fn handled_fault_below_the_stack_pointer() {
+        let _serial = PAGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let page = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY) } as u64;
         assert_ne!(page, 0);
         PAGE.store(page, std::sync::atomic::Ordering::Release);

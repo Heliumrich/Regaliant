@@ -12241,100 +12241,6 @@ impl Exec {
         true
     }
 
-    /// The per-view copy kernel recorded as a buffer update of the words
-    /// `forward::compute` found for it (`tune copy_update`): at the
-    /// dispatch's place in the stream behind the same lazy barrier, later
-    /// draws and dispatches ordered after it as after a dispatch, only the
-    /// words it writes noted as written, and its forwarding entry started
-    /// (checked against memory once the batch completed). None: recorded.
-    /// Some: left to the dispatch (the computation given back) when the
-    /// destination lies in a video-memory home, overlaps a resident shadow
-    /// or the copy's inputs, or is not mapped for the GPU.
-    /// `check_only`: a parallel worker's (its words checked after its batch
-    /// completed, not forwarded).
-    fn copy_as_update(&mut self, p: &Prepared, c: (u64, Vec<u32>, super::forward::Inputs), check_only: bool) -> Option<(u64, Vec<u32>, super::forward::Inputs)> {
-        let (base, bytes) = (c.0, 4 * c.1.len() as u64);
-        let refuse = |c| {
-            super::forward::UPDATES[2].fetch_add(1, Ordering::Relaxed);
-            Some(c)
-        };
-        if bytes == 0 || base % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(base, bytes) || c.2.overlaps(base, bytes) {
-            return refuse(c);
-        }
-        if self.resident.iter().any(|r| r.guest < base + bytes && base < r.guest + r.range) {
-            return refuse(c);
-        }
-        let Some((buffer, start, end)) = span(base, bytes) else { return refuse(c) };
-        if base + bytes > end {
-            return refuse(c);
-        }
-        // Front end 2: the words go into the mirror too (later work reads
-        // them there); without its memory the copy stays a dispatch.
-        let fe2_mirror = if super::fe2::on() && super::fe2::in_span(base, bytes) {
-            let lo = base & !4095;
-            match (super::resident::mirror_buffer(), super::resident::back(lo, (base + bytes).next_multiple_of(4096) - lo)) {
-                (Some((m, _)), Ok(())) => Some(m),
-                _ => return refuse(c),
-            }
-        } else {
-            None
-        };
-        self.begin();
-        if !self.recording {
-            return refuse(c);
-        }
-        // A CP write still pending into the destination is performed before
-        // this batch is submitted (as for a binding of it in place).
-        if let Some(s) = CP_WRITES.latest(&[(base, bytes)]) {
-            self.submit_after = self.submit_after.max(s);
-        }
-        self.end_rendering_lazy();
-        if lazy_barriers() && self.barrier_wanted {
-            if super::tune::skip_barriers() & 16 == 0 {
-                self.barrier();
-            }
-            self.barrier_wanted = false;
-            self.dispatched = false;
-        }
-        let (base, words, from) = c;
-        let raw: &[u8] = unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, bytes as usize) };
-        let cmd = self.cmd();
-        for (k, part) in raw.chunks(65536).enumerate() {
-            unsafe { ctx().device.cmd_update_buffer(cmd, buffer, base - start + 65536 * k as u64, part) };
-        }
-        if let Some(m) = fe2_mirror {
-            for (k, part) in raw.chunks(65536).enumerate() {
-                unsafe { ctx().device.cmd_update_buffer(cmd, m, base - super::resident::MIRROR_BASE + 65536 * k as u64, part) };
-            }
-        }
-        if lazy_barriers() {
-            // Later draws and dispatches wait for it as for a dispatch.
-            self.dispatched = true;
-        } else {
-            self.barrier();
-        }
-        let w = [(base, bytes)];
-        if super::images::may_note(&w) {
-            super::images::with(|im| im.note_writes(&w, &w));
-        }
-        super::mirror::invalidate(&w);
-        super::track::gpu_write(base, bytes);
-        self.note_write(base, bytes);
-        // The next dispatch notes its writes again (these changed the record).
-        self.last_notes.2 = [u64::MAX; 4];
-        let id = if check_only {
-            super::forward::add_check(base, words, "a worker's buffer update", &self.name)
-        } else {
-            super::forward::UPDATES[0].fetch_add(1, Ordering::Relaxed);
-            super::forward::UPDATES[1].fetch_add(words.len() as u64, Ordering::Relaxed);
-            super::forward::add(base, words, p.addr, p.code_hash, from, "as a buffer update", &self.name)
-        };
-        self.forward_ids.push(id);
-        EXECUTED.fetch_add(1, Ordering::Relaxed);
-        self.batch_shaders.push(p.addr);
-        None
-    }
-
     /// An end-of-pipe timestamp write (RELEASE_MEM DATA_SEL 3/4) performed by
     /// the GPU in order with this queue's work: the GPU clock when the work
     /// before it completed (vkCmdWriteTimestamp at the bottom of the pipe),
@@ -14801,45 +14707,18 @@ impl Exec {
         }
         let t_prep = since(t0);
         trace_loads(&self.name, &p, groups);
-        // The per-view copy kernel as a buffer update of the words it leaves
-        // (`tune copy_update`); its computation is reused for forwarding when
-        // it stays a dispatch (None: not tried, Some(None): refused).
         // (Held past a label wait the graphics command processor records in
-        // program order still: its copies forward as before.)
+        // program order still: its copies forward as before. As buffer
+        // updates, `tune copy_update`, they were level under front end 2 and
+        // had corrupted meshes during loads: removed on 2026-11-01.)
         // (A long run's chunk forwards into its own view: `Cp::long_begin`.)
         let forward_here = super::tune::forward_copies() && (!self.deferred || self.past_grow || ((self.past || self.long) && super::forward::held())) && indirect.is_none() && (self.name == "gpu-gfx" || (self.long && self.name.starts_with("gpu-gfx-par"))) && !super::resident::mirror_mode();
-        // The graphics queue's parallel workers (`copy_update 2`): updates
-        // checked once their batches completed, never forwarded.
-        let worker_here = super::tune::forward_copies() && self.deferred && !self.held && indirect.is_none() && self.name.starts_with("gpu-gfx") && super::tune::copy_update_workers() && !super::resident::mirror_mode();
-        let mut forwarded: Option<Option<(u64, Vec<u32>, super::forward::Inputs)>> = None;
-        if (forward_here || worker_here)
-            && super::tune::copy_update()
-            && patches.is_none()
-            && initiator & (1 << 5) == 0
-            && (0x204..0x207).all(|r| cp.reg(Space::Sh, r) == 0)
-            && !verify::enabled()
-            && !super::tune::race_checks()
-            && !super::capture::capturing()
-        {
-            // A worker also cannot see what the main command processor's batch,
-            // unsubmitted when the run was planned, writes.
-            let busy = |r: &[(u64, u64)]| {
-                self.overlaps_pending_ro(r) || INFLIGHT.latest(r).is_some() || CP_WRITES.latest(r).is_some() || self.main_writes.as_ref().is_some_and(|m| m.overlaps_any(r))
-            };
-            match super::forward::compute(&p, groups, local, busy) {
-                Some(c) => match self.copy_as_update(&p, c, worker_here) {
-                    None => return Ok(()),
-                    Some(c) => forwarded = Some(Some(c)),
-                },
-                None => forwarded = Some(None),
-            }
-        }
         // Diagnosis (`DS_FE2_CHECK_COPIES=1`): a copy kernel's dispatch on a
         // queue whose copies are not forwarded (compute queues, the graphics
         // queue's workers) is checked once its batch completed against the
         // words its inputs give now: a stale source in the mirror shows as
         // words still as before (forwarding checks only the graphics CP's).
-        if super::fe2::check_copies() && !forward_here && forwarded.is_none() && indirect.is_none() && patches.is_none() {
+        if super::fe2::check_copies() && !forward_here && indirect.is_none() && patches.is_none() {
             let busy = |r: &[(u64, u64)]| self.overlaps_pending_ro(r) || INFLIGHT.latest(r).is_some() || CP_WRITES.latest(r).is_some() || self.main_writes.as_ref().is_some_and(|m| m.overlaps_any(r));
             if let Some((base, words, _)) = super::forward::compute(&p, groups, local, busy) {
                 let id = super::forward::add_check(base, words, "a copy kernel's dispatch", &self.name);
@@ -15560,10 +15439,7 @@ impl Exec {
         lap.mark(15);
         if forward_here {
             let busy = |r: &[(u64, u64)]| self.overlaps_pending_ro(r) || INFLIGHT.latest(r).is_some() || CP_WRITES.latest(r).is_some();
-            let computed = match forwarded {
-                Some(c) => c,
-                None => super::forward::compute(&p, groups, local, busy),
-            };
+            let computed = super::forward::compute(&p, groups, local, busy);
             if let Some((base, words, from)) = computed {
                 // A copy the run's planner forwarded: computed alike?
                 if self.long {
