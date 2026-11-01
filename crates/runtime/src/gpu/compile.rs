@@ -6,7 +6,8 @@
 //! 27 s in four minutes), and such uses come in bursts: the programs of an
 //! effect or an area appear together in one command stream, each compiled
 //! only when execution reaches it. When a dispatch's pipeline is missing,
-//! its command processor scans the commands after it
+//! its command processor (or a parallel run's chunk worker, over its chunk)
+//! scans the commands after it
 //! (`Cp::prefetch_compiles`) and hands their compute stages to these
 //! workers, which prepare each with the registers the scan saw (as
 //! `gpu::ahead` does) and create its pipeline if it is missing

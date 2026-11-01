@@ -2105,7 +2105,16 @@ impl Cp {
                     self.drop_ahead();
                 }
             }
+            // A dispatch whose pipeline turns out missing scans the chunk's
+            // commands after it for more first uses, as `run` does: without
+            // it a chunk compiled its new programs one after another (a 5-3
+            // first visit froze 11.1 s, ~15 particle programs of ~0.7 s on
+            // one of queue 0x50's workers, 2026-11-01 night).
+            if command && matches!(opcode, op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT) && super::compile::at_first_uses() {
+                self.compile_ctx.set(Some((f.base, next, to)));
+            }
             let flow = self.packet(opcode, h, cur, n, &p);
+            self.compile_ctx.set(None);
             if command {
                 for s in self.take_ahead().iter().flatten() {
                     s.cancel();
