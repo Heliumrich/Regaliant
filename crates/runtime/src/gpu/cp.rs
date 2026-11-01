@@ -337,10 +337,6 @@ pub struct Cp {
     /// passed on as released by the CPU, the value then, the distinct
     /// values seen, and whether each was greater than the one before.
     passed: HashMap<u64, (u64, u32, bool)>,
-    /// Front end 2 (`tune fe2_label_track`): per label this queue's waits
-    /// passed on as released by the CPU, the value then and the label's
-    /// page's generation (`fe2::label_page_gen`) taken then.
-    label_gens: HashMap<u64, (u64, u32)>,
     /// The view of the writer of the promise the last WAIT_REG_MEM passed on
     /// (0: this queue's own open promise; `tune fe2_gpu_waits`).
     last_wait_epoch: u32,
@@ -1294,7 +1290,7 @@ pub static CPU_ARG_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 pub static EPOCH_GPU_WAITS: AtomicU64 = AtomicU64::new(0);
 /// Waits that ended no epoch under `tune fe2_quiet_waits`: [passed again on
 /// a counter's value, gone past].
-pub static QUIET_WAITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+pub static QUIET_WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Indexed indirect draws with arguments in a video-memory home read on the
 /// CPU, by why: a base-vertex SGPR, no start-instance SGPR of the vertex
 /// stage, 8-bit indices, indices outside homes, a vertex program needing the
@@ -1878,7 +1874,6 @@ impl Cp {
             last_wait_kind: b'-',
             last_wait_func: 0,
             passed: HashMap::new(),
-            label_gens: HashMap::new(),
             last_wait_epoch: 0,
             held: None,
             main_gfx: name == "gpu-gfx",
@@ -2286,11 +2281,6 @@ impl Cp {
             self.fe2_adopt_epoch(if self.last_wait_kind == b'P' { self.last_wait_epoch } else { super::precache::epoch() as u32 });
             return;
         }
-        if self.last_wait_gpu && super::tune::epoch_gpu_waits() {
-            EPOCH_GPU_WAITS.fetch_add(1, Ordering::Relaxed);
-            self.fe2_adopt(last_write(a).map(|w| w.0).as_deref());
-            return;
-        }
         let quiet = super::fe2::on() && super::tune::fe2_quiet_waits();
         // Front end 2: gone past, the wait released nothing yet; the
         // stretch checks as of the epoch at each check and is checked again
@@ -2311,11 +2301,6 @@ impl Cp {
             // older than its view then (no wait can have been released by a
             // later write of the same value).
             QUIET_WAITS[0].fetch_add(1, Ordering::Relaxed);
-        } else if quiet && super::tune::fe2_label_track() && self.label_unwritten(a, now) {
-            // The value this queue passed on last time here, and no CPU
-            // write to the label's page since: the CPU writes before it are
-            // older than that pass's take, which its view covers.
-            QUIET_WAITS[2].fetch_add(1, Ordering::Relaxed);
         } else {
             super::precache::end_scope(1);
             self.fe2_sync(None);
@@ -2418,22 +2403,6 @@ impl Cp {
         if self.fe2_view.is_some() {
             self.fe2_sync(Some(writer.and_then(super::fe2::view_of).unwrap_or_else(|| super::precache::epoch() as u32)));
         }
-    }
-
-    /// A wait passed on `now` at label `a` as released by the CPU: the
-    /// label's page is taken (before the caller ends an epoch, else this is
-    /// the baseline its view covers) and whether this queue passed on that
-    /// same value last time there with no CPU write to the page found since
-    /// (`tune fe2_label_track`).
-    fn label_unwritten(&mut self, a: u64, now: u64) -> bool {
-        if self.label_gens.len() > 4096 {
-            self.label_gens.clear();
-        }
-        let Some(g) = super::fe2::label_page_gen(a) else {
-            self.label_gens.remove(&(a & !7));
-            return false;
-        };
-        matches!(self.label_gens.insert(a & !7, (now, g)), Some((v, g0)) if v == now && g0 == g)
     }
 
     /// A wait that passed at once on `now` at label `a` as released by the

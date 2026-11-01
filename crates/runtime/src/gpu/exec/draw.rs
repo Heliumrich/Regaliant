@@ -867,7 +867,6 @@ impl Exec {
                 crate::error!("gpu[{}]: device lost by a draw (vs {vs:#x}, ps {ps:#x})", self.name);
             }
         }
-        self.split_if_gpu_idle();
         outcome
     }
 
@@ -976,21 +975,6 @@ impl Exec {
     pub(super) fn end_rendering_then_barrier(&mut self) {
         self.end_rendering_before_barrier();
         self.barrier();
-    }
-
-    /// Ends the active rendering instance for a dispatch or for draws to
-    /// other attachments: with `tune lazy_passes` without a barrier of its
-    /// own (the title flushes and waits before work that uses what the
-    /// instance drew, which arms the lazy barrier; draws after dispatches
-    /// wait for them), else as `end_rendering`.
-    #[track_caller]
-    pub(super) fn end_rendering_lazy(&mut self) {
-        if !super::super::tune::lazy_passes() {
-            self.end_rendering();
-        } else if self.rendering.take().is_some() {
-            unsafe { ctx().device.cmd_end_rendering(self.cmd()) };
-            self.ops[super::OP_PASS_ENDS] += 1;
-        }
     }
 
     fn begin_rendering(&mut self, colors: [Option<Target>; MAX_RT], depth: Option<Target>, area: (u32, u32)) {
@@ -1787,7 +1771,7 @@ impl Exec {
             if feedback {
                 self.end_rendering();
             } else {
-                self.end_rendering_lazy();
+                self.end_rendering();
             }
             self.barrier_if_wanted(true);
             self.begin_rendering(colors, depth, area);

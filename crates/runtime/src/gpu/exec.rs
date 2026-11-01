@@ -3881,7 +3881,6 @@ pub(super) fn reset_pre_window() {
     for (s, v) in XCOPY_SNAP.iter().zip(&XCOPY) {
         s.store(v.load(Ordering::Relaxed), Ordering::Relaxed);
     }
-    XDRY_SNAP.store(XDRY.load(Ordering::Relaxed), Ordering::Relaxed);
     super::precache::reset_window();
 }
 
@@ -3893,12 +3892,11 @@ pub(super) fn pre_window_line() -> String {
     let x: Vec<u64> = XCOPY.iter().zip(&XCOPY_SNAP).map(|(v, s)| v.load(Ordering::Relaxed).saturating_sub(s.load(Ordering::Relaxed))).collect();
     let xq = if ctx().copy.is_some() {
         format!(
-            "    on the copy queue: {} copies ({} MiB) in {} batches; {} batches waited only for shared copies made there; {} batches put theirs into the prologue as the GPU had run dry (`xpre_dry`)\n",
+            "    on the copy queue: {} copies ({} MiB) in {} batches; {} batches waited only for shared copies made there\n",
             x[0],
             x[1] >> 20,
             x[2],
-            x[3],
-            XDRY.load(Ordering::Relaxed).saturating_sub(XDRY_SNAP.load(Ordering::Relaxed))
+            x[3]
         )
     } else {
         String::new()
@@ -3911,10 +3909,6 @@ static PRE_FULL: AtomicU64 = AtomicU64::new(0);
 /// batches with such copies, batches that waited only for such copies
 /// earlier batches made], and their values at the last `profile reset`.
 static XCOPY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-/// Batches whose copy-queue copies went into their prologue as the GPU had
-/// run dry (`tune xpre_dry`), and the count at the last `profile reset`.
-static XDRY: AtomicU64 = AtomicU64::new(0);
-static XDRY_SNAP: AtomicU64 = AtomicU64::new(0);
 /// Why `speculate` left a command to wait (diagnostics, since boot): stale
 /// home, a data load this batch writes or not one mapping, a parallel
 /// chunk's own writes, a stage that writes memory or images, a shader that
@@ -3977,36 +3971,6 @@ fn merge_pipe() -> Result<&'static MergePipe, String> {
     .as_ref()
     .map_err(|e| e.clone())
 }
-
-/// The many-shadow write-back kernel (`rdna::kernels::shadow_merge_many`):
-/// binding 0 the shadows, binding 1 its table; push constants {at, n}.
-fn merge_many_pipe() -> Result<&'static MergePipe, String> {
-    static PIPE: std::sync::OnceLock<Result<MergePipe, String>> = std::sync::OnceLock::new();
-    PIPE.get_or_init(|| {
-        let c = ctx();
-        unsafe {
-            let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..2)
-                .map(|b| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
-                .collect();
-            let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("merge-many set layout: {e}"))?;
-            let layouts = [set_layout];
-            let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 8 }];
-            let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("merge-many layout: {e}"))?;
-            let code = rdna::kernels::shadow_merge_many();
-            let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("merge-many module: {e}"))?;
-            let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
-            let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
-            let pipeline = super::pcache::with_cache('i', 2, |cache| c.device.create_compute_pipelines(cache, &[ci], None)).map_err(|(_, e)| format!("merge-many pipeline: {e}"));
-            c.device.destroy_shader_module(module, None);
-            Ok(MergePipe { pipeline: pipeline?[0], layout, set_layout })
-        }
-    })
-    .as_ref()
-    .map_err(|e| e.clone())
-}
-
-/// Write-backs merged by one dispatch (`tune merge_many`): [dispatches, shadows].
-static MERGE_MANY: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Mirror mode's write-back kernel (`rdna::kernels::mirror_gather`).
 fn gather_pipe() -> Result<&'static MergePipe, String> {
@@ -4226,12 +4190,6 @@ static SUBMIT_WHY: Mutex<Option<HashMap<(String, &'static str), u64>>> = Mutex::
 /// queue: [submissions, idle ns before them, ns spent recording them].
 static STARVED: Mutex<Option<HashMap<String, [u64; 3]>>> = Mutex::new(None);
 static DONE_CV: parking_lot::Condvar = parking_lot::Condvar::new();
-
-/// Whether every batch handed over so far completed: the GPU ran out of our
-/// work (`tune xpre_dry`).
-fn gpu_ran_dry() -> bool {
-    done_seq() + 1 >= NEXT_SEQ.load(Ordering::Acquire)
-}
 
 fn done_seq() -> u64 {
     DONE_ATOMIC.load(Ordering::Acquire)
@@ -8297,9 +8255,6 @@ pub static DATA_SNAPS: AtomicU64 = AtomicU64::new(0);
 /// Render passes ended without a barrier of their own because a full one
 /// followed at once (`end_rendering_before_barrier`).
 pub static MERGED_PASS_BARRIERS: AtomicU64 = AtomicU64::new(0);
-/// GPU-performed CP writes with resident shadows in the batch: [shadows
-/// merged first, written with shadows unmerged (`tune label_merge 0`)].
-pub static LABEL_MERGES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// Batch slots deferred executors made beyond their first two (statistics).
 pub static WORKER_SLOTS: AtomicU64 = AtomicU64::new(0);
 
@@ -8959,16 +8914,6 @@ impl Exec {
             if let Err(e) = self.record_mirror_writeback() {
                 self.report(format!("mirror write-back: {e}"));
             }
-        }
-        if !self.deferred && !self.xcopies.is_empty() && super::tune::xpre_dry() && gpu_ran_dry() {
-            // The GPU waits for this batch: its copies go into its prologue
-            // (`tune xpre_dry`).
-            let pre = self.open_pre();
-            record_copies(pre, &mut self.xcopies);
-            for e in self.shared_pending.iter_mut() {
-                e.3 = false;
-            }
-            XDRY.fetch_add(1, Ordering::Relaxed);
         }
         // Labels opened by the batch's last work (merges, timestamp stores)
         // end with its command buffer (`DS_GPU_LABELS`).
@@ -10578,10 +10523,8 @@ impl Exec {
             return None;
         }
         let r = [(base, size)];
-        // Writes of this batch come after the prologue; those of submitted
-        // batches (this queue's too) before it (`tune pre_inflight`; 0: also
-        // refused while this queue's submitted batches still run).
-        let pending = if super::tune::pre_inflight() { self.pending.overlaps_any(&r) || self.main_pending(&r) } else { self.overlaps_pending(&r) };
+        // Refused while this queue's batches, open or submitted, write it.
+        let pending = self.overlaps_pending(&r);
         if pending || CP_WRITES.latest(&r).is_some() {
             if big {
                 note_big_refusal(base, size, if pending { "GPU work of this queue writes it" } else { "a deferred CP write" });
@@ -11266,22 +11209,6 @@ impl Exec {
         }
     }
 
-    /// Submits the batch being recorded when the GPU has run out of work
-    /// (every batch of every queue completed) and the batch has been
-    /// recording for `tune idle_split` us: the main command processor's own
-    /// chunk of a parallel run (~670-820 commands) took 7-12 ms to record
-    /// while the GPU sat idle (timeline run 20261012-032934).
-    pub(super) fn split_if_gpu_idle(&mut self) {
-        if !self.recording || self.deferred {
-            return;
-        }
-        let us = super::tune::idle_split();
-        if us == 0 || done_seq() + 1 < NEXT_SEQ.load(Ordering::Relaxed) || self.begun_at.elapsed() < std::time::Duration::from_micros(us) {
-            return;
-        }
-        self.submit_for("idle");
-    }
-
     /// The title synchronized its GPU work (CS/PS partial flush, cache
     /// action, end-of-pipe event): the next dispatch or draw waits for
     /// earlier work.
@@ -11913,20 +11840,6 @@ impl Exec {
         if !self.recording {
             return false;
         }
-        // What earlier work of this batch wrote into resident shadows reaches
-        // guest memory before this write does: a title thread that sees the
-        // label reads it there (the shadows were merged only when the batch
-        // was submitted, after the label: `tune label_merge`).
-        if !self.resident.is_empty() {
-            if super::tune::label_merge() {
-                LABEL_MERGES[0].fetch_add(1, Ordering::Relaxed);
-                if self.flush_resident(None).is_err() {
-                    return false;
-                }
-            } else {
-                LABEL_MERGES[1].fetch_add(1, Ordering::Relaxed);
-            }
-        }
         self.gpu_writes_open = true;
         if super::vk::labels_on() {
             let l = format!("{} cp write", self.name);
@@ -11960,9 +11873,7 @@ impl Exec {
         // (Their guest-memory copies left for the batch's close, `tune
         // fe2_cpw_defer`, were level at the vista and in a wider form
         // deadlocked boots: FINDINGS.md 2026-10-30 morning and 2026-10-31.)
-        if !(waited && super::tune::ts_cpw_waited()) {
-            self.resolve_timestamps();
-        }
+        self.resolve_timestamps();
         // Front end 2: what earlier work wrote into the mirror reaches guest
         // memory before this write does (a title thread that sees it reads
         // that there), and the write goes into the mirror too (later work
@@ -12394,8 +12305,7 @@ impl Exec {
         } else {
             &flush
         };
-        let many = merge.is_some() && flushing.len() > 1 && super::tune::merge_many() && c.device_addresses && self.merge_many(flushing)?;
-        for sh in flushing.iter().filter(|_| !many) {
+        for sh in flushing.iter() {
             let own = sh.size.min(sh.range - sh.bias);
             // Diagnosis (`tune skip_copies`, timing only): windows under 256
             // KiB written back by a whole copy (128) or merged into video
@@ -12484,65 +12394,6 @@ impl Exec {
         self.dispatched = false;
         MERGES.fetch_add(flush.len() as u64, Ordering::Relaxed);
         Ok(())
-    }
-
-    /// The write-back of `flushing` by one dispatch per MERGE_MANY_MAX
-    /// shadows (`tune merge_many`): a table in the ring, destinations by
-    /// device address. False when that is not possible here (no ring room,
-    /// an import without an address): the per-shadow merges run instead.
-    fn merge_many(&mut self, flushing: &[Shadow]) -> Result<bool, String> {
-        use rdna::kernels::{MERGE_ENTRY_DWORDS, MERGE_LOCAL_SIZE, MERGE_MANY_MAX};
-        let c = ctx();
-        let Ok(m) = merge_many_pipe() else { return Ok(false) };
-        let Some((ring, ring_ptr)) = self.slots[self.cur].rings[0] else { return Ok(false) };
-        let mut entries: Vec<[u32; MERGE_ENTRY_DWORDS as usize]> = Vec::with_capacity(flushing.len());
-        for sh in flushing {
-            let va = c.buffer_address(sh.host);
-            if va == 0 {
-                return Ok(false);
-            }
-            let own = sh.size.min(sh.range - sh.bias);
-            let first = (sh.bias / 4) as u32;
-            let end = ((sh.bias + own).div_ceil(4)).min(sh.range / 4) as u32;
-            let dst = va + sh.host_off;
-            entries.push([0, (sh.shadow_off / 4) as u32, (sh.pristine_off / 4) as u32, first, end, dst as u32, (dst >> 32) as u32, 0]);
-        }
-        let bytes = 4 * MERGE_ENTRY_DWORDS as u64 * entries.len() as u64;
-        let Some(off) = self.ring_alloc(0, bytes) else { return Ok(false) };
-        // Chunks of MERGE_MANY_MAX entries, each a dispatch whose first
-        // workgroup is 0: (first entry, entries, workgroups).
-        let mut chunks: Vec<(u32, u32, u32)> = Vec::new();
-        for (k, chunk) in entries.chunks_mut(MERGE_MANY_MAX as usize).enumerate() {
-            let mut wg = 0u32;
-            for e in chunk.iter_mut() {
-                e[0] = wg;
-                wg += e[4].saturating_sub(e[3]).div_ceil(MERGE_LOCAL_SIZE).max(1);
-            }
-            chunks.push((k as u32 * MERGE_MANY_MAX, chunk.len() as u32, wg));
-        }
-        unsafe { std::ptr::copy_nonoverlapping(entries.as_ptr() as *const u8, ring_ptr.add(off as usize), bytes as usize) };
-        let set = self.alloc_set(m.set_layout)?;
-        let infos = [vk::DescriptorBufferInfo { buffer: self.shadow(), offset: 0, range: vk::WHOLE_SIZE }, vk::DescriptorBufferInfo { buffer: ring, offset: off, range: bytes }];
-        let writes: Vec<vk::WriteDescriptorSet> = infos
-            .iter()
-            .enumerate()
-            .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
-            .collect();
-        unsafe {
-            let cmd = self.cmd();
-            c.device.update_descriptor_sets(&writes, &[]);
-            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, m.pipeline);
-            c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, m.layout, 0, &[set], &[]);
-            for &(first, n, wg) in &chunks {
-                let pc: Vec<u8> = [first * MERGE_ENTRY_DWORDS, n].iter().flat_map(|x| x.to_le_bytes()).collect();
-                c.device.cmd_push_constants(cmd, m.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
-                c.device.cmd_dispatch(cmd, wg.max(1), 1, 1);
-            }
-        }
-        self.dyncache.cs_pipeline = m.pipeline;
-        MERGE_MANY[0].fetch_add(chunks.len() as u64, Ordering::Relaxed);
-        MERGE_MANY[1].fetch_add(flushing.len() as u64, Ordering::Relaxed);
-        Ok(true)
     }
 
     /// After the merge of `flush` (recorded): the working copies of the
@@ -13455,10 +13306,7 @@ impl Exec {
                         // Sized: buffers, and bases whose loads all read known
                         // bytes (data loads read by the shader).
                         let sized = matches!(found.resources[i], Resolved::Buffer(_) | Resolved::Global(_, Some(_)));
-                        // Unbounded pointers whose mapping ends within `tune
-                        // pre_unsized` bytes are read-only bindings of that much
-                        // (a VRAM copy instead of reads across PCIe).
-                        let read_only = size > 0 && !found.tr.plan.resources[i].written && (sized || size <= super::tune::pre_unsized());
+                        let read_only = size > 0 && !found.tr.plan.resources[i].written && sized;
                         if size > 0 && super::census::on() {
                             use super::census::{RO, RO_UNSIZED, WRITTEN};
                             super::census::note(base, size, if found.tr.plan.resources[i].written { WRITTEN } else if sized { RO } else { RO_UNSIZED });
@@ -14097,7 +13945,6 @@ impl Exec {
                 crate::error!("gpu[{}]: device lost by the dispatch of cs {cs:#x} ({}x{}x{} groups)", self.name, groups[0], groups[1], groups[2]);
             }
         }
-        self.split_if_gpu_idle();
     }
 
     /// Diagnosis: the reads of a GPU-resolved command's shader-resolved
@@ -14662,7 +14509,7 @@ impl Exec {
             self.write_set(set, std::slice::from_ref(&bound));
         }
         lap.mark(10);
-        self.end_rendering_lazy();
+        self.end_rendering();
         let c = ctx();
         let qp = self.slots[self.cur].queries;
         let ti = self.batch_shaders.len() as u32;
@@ -15044,7 +14891,7 @@ impl Exec {
         }
         stamp(2);
         lap.mark(12);
-        if !lazy_barriers() || (!bound.shadows.is_empty() && super::tune::shadow_barrier()) {
+        if !lazy_barriers() {
             self.barrier();
         }
         // Written shadows stay resident for the rest of the batch (see Shadow);
@@ -15231,7 +15078,7 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; stages prepared again with GPU-side data loads {:?} ({} programs since with them); {} render passes ended into the next full barrier; GPU-performed CP writes after merging resident shadows {} (written before the merge {}); draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges ({} of them by {} dispatches of `merge_many`), {} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; stages prepared again with GPU-side data loads {:?} ({} programs since with them); {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges ({} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         SHADOW_ARGS.load(Ordering::Relaxed),
@@ -15239,8 +15086,6 @@ pub fn status() -> String {
         HYBRID_LOADS.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),
         shaders::gpu_loads_programs(),
         MERGED_PASS_BARRIERS.load(Ordering::Relaxed),
-        LABEL_MERGES[0].load(Ordering::Relaxed),
-        LABEL_MERGES[1].load(Ordering::Relaxed),
         FEEDBACK[0].load(Ordering::Relaxed),
         FEEDBACK[1].load(Ordering::Relaxed),
         FEEDBACK_KINDS.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),
@@ -15257,8 +15102,6 @@ pub fn status() -> String {
         SHADOWS_REUSED.load(Ordering::Relaxed),
         RESIDENT_READS.load(Ordering::Relaxed),
         MERGES.load(Ordering::Relaxed),
-        MERGE_MANY[1].load(Ordering::Relaxed),
-        MERGE_MANY[0].load(Ordering::Relaxed),
         EARLY_MERGES.load(Ordering::Relaxed),
         SKIPPED.load(Ordering::Relaxed),
         draw::DRAWN.load(Ordering::Relaxed),

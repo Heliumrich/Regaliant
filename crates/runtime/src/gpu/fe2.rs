@@ -128,7 +128,7 @@ struct Chunk {
     /// The flip, plus one, a CPU write to the page was last found.
     wrote: Box<[AtomicU32]>,
     /// Bumped by every CPU write to the page found (and every invalidation
-    /// of it): `label_page_gen`.
+    /// of it): run-shared uploads hold while it stays (`run_shared`).
     pgen: Box<[AtomicU32]>,
     /// Armings of the page that ended in a write (each doubles the quiet
     /// time before the next).
@@ -2791,18 +2791,6 @@ pub fn marks_taken(r: Option<()>, base: u64, size: u64, pages: &[u64]) {
     }
 }
 
-/// The generation of the page at `page` after a take of it (`Chunk::pgen`:
-/// every CPU write to it any take found, every invalidation), None when the
-/// take failed or the page lies outside the span (`tune fe2_label_track`).
-pub fn label_page_gen(page: u64) -> Option<u32> {
-    let page = page & !(PAGE - 1);
-    // (A page without a chunk would keep no generation.)
-    let c = chunk(page, true)?;
-    let mut v = Vec::new();
-    super::precache::take_written_for(page, PAGE, &mut v, None, crate::mem::WW_WHO_FE2)?;
-    Some(c.pgen[idx(page)].load(Ordering::Acquire))
-}
-
 /// CPU writes to these pages were found (by a take).
 pub fn cpu_written(pages: &[u64]) {
     if !on() || pages.is_empty() {
@@ -3477,7 +3465,7 @@ pub fn status() -> String {
     let w: Vec<u64> = WB64.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let compacts = if COMPACTS[0].load(Ordering::Relaxed) > 0 { format!("    front end 2's touched-page lists made from touched bits (`tune touch_bits`): {} write-backs, {} words of bits scanned\n", COMPACTS[0].load(Ordering::Relaxed), COMPACTS[1].load(Ordering::Relaxed)) } else { String::new() };
     format!(
-        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages; runs a take of their epoch had looked at, without another: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed; {} view pages armed at the residency's takes adopted), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action; CP writes with work to write back {} of labels a CP of ours waits on, {} left to the batch's close, {} with their guest-memory copy at the close); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value, {} again with the label's page unwritten and {} gone past ended none); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
+        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages; runs a take of their epoch had looked at, without another: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed; {} view pages armed at the residency's takes adopted), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action; CP writes with work to write back {} of labels a CP of ours waits on, {} left to the batch's close, {} with their guest-memory copy at the close); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value, {} gone past ended none); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
         s[S_ENSURES],
         s[S_ENSURE_PAGES],
         s[S_FAST],
@@ -3542,7 +3530,6 @@ pub fn status() -> String {
         ends[2],
         super::cp::EPOCH_GPU_WAITS.load(Ordering::Relaxed),
         super::cp::QUIET_WAITS[0].load(Ordering::Relaxed),
-        super::cp::QUIET_WAITS[2].load(Ordering::Relaxed),
         super::cp::QUIET_WAITS[1].load(Ordering::Relaxed),
         super::resident::backed_mib(),
         sizes.join(", "),

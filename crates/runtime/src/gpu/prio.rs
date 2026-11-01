@@ -91,9 +91,6 @@ pub fn apply() {
             cpus = own;
         }
     }
-    if super::tune::gfx_core() {
-        cpus = own_core(cpus, MAIN.with(|m| m.get()));
-    }
     let want = (level, cpus);
     let had = APPLIED.with(|a| a.replace(want));
     if had != want {
@@ -179,32 +176,6 @@ fn guest_from(front: u64, process: u64) -> u64 {
     } else {
         rest
     }
-}
-
-/// `tune gfx_core`: the graphics command processor (`main`) on the first
-/// physical core of the front end's CPUs (`cpus`, 0 = the process's), the
-/// other front-end threads on the rest (the critical path's thread then
-/// shares its core with no other front-end thread; another port's
-/// graphics CP has a core of its own). Unchanged when the front end has a
-/// single core.
-fn own_core(cpus: u64, main: bool) -> u64 {
-    static CORES: std::sync::OnceLock<(u64, Vec<u64>)> = std::sync::OnceLock::new();
-    let (process, cores) = CORES.get_or_init(|| (process_mask(), core_groups()));
-    split_core(if cpus == 0 { *process } else { cpus }, cores, main).unwrap_or(cpus)
-}
-
-/// `front` split into its first physical core (for `main`) and the rest;
-/// None when it has a single core.
-fn split_core(front: u64, cores: &[u64], main: bool) -> Option<u64> {
-    if front == 0 {
-        return None;
-    }
-    let first = 1u64 << front.trailing_zeros();
-    let core = cores.iter().find(|&&c| c & first != 0).map_or(first, |&c| c & front);
-    if front & !core == 0 {
-        return None;
-    }
-    Some(if main { core } else { front & !core })
 }
 
 /// The CPU masks of the physical cores in processor group 0
@@ -313,20 +284,7 @@ fn choose(groups: &[u64], process: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{choose, guest_from, split_core};
-
-    #[test]
-    fn graphics_cp_core() {
-        // 5900X: SMT pairs; the front end on the first CCD (CPUs 0-11).
-        let cores: Vec<u64> = (0..12).map(|i| 0b11u64 << (2 * i)).collect();
-        assert_eq!(split_core(0xfff, &cores, true), Some(0b11));
-        assert_eq!(split_core(0xfff, &cores, false), Some(0xffc));
-        // One core only: unchanged.
-        assert_eq!(split_core(0b11, &cores, true), None);
-        // No core information: the lowest CPU alone.
-        assert_eq!(split_core(0xf0, &[], true), Some(0x10));
-        assert_eq!(split_core(0xf0, &[], false), Some(0xe0));
-    }
+    use super::{choose, guest_from};
 
     #[test]
     fn guest_cpus_beside_the_front_end() {
