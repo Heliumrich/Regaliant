@@ -928,8 +928,7 @@ pub fn check_copies() -> bool {
 /// `DS_FE2_STRETCH_AUDIT=1` (diagnosis): at its label every stretch past a
 /// label wait whose checks needed an older epoch than its label does is
 /// checked again (`Exec::past_current_for`) and counted stale or not, as
-/// `tune fe2_gpu_waits` checks them, but kept either way (without the
-/// switch).
+/// waits passed on GPU writes check them, but kept either way.
 pub fn stretch_audit() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *W.get_or_init(|| std::env::var("DS_FE2_STRETCH_AUDIT").ok().as_deref() == Some("1"))
@@ -2799,9 +2798,8 @@ pub fn invalidate(base: u64, len: u64) {
 
 /// The write-back's pipeline, its one descriptor set (the written-bit map
 /// and the counters never change), the counters (host visible), whether
-/// its kernel empties the touched-page list itself (`tune
-/// fe2_scatter_reset`) and the counters it adds to in video memory (`tune
-/// fe2_scatter_dev`: copied into the host-visible ones every
+/// its kernel empties the touched-page list itself and the counters it
+/// adds to in video memory (copied into the host-visible ones every
 /// COUNTER_COPY_EVERY write-backs).
 struct Scatter {
     pipeline: vk::Pipeline,
@@ -2811,14 +2809,15 @@ struct Scatter {
     layout: vk::PipelineLayout,
     set: vk::DescriptorSet,
     counters: *mut u32,
-    reset: bool,
     host: vk::Buffer,
-    dev: Option<vk::Buffer>,
+    /// The counters in video memory (two host-memory atomics a page written
+    /// back cost ~2.3 ms of GPU a vista frame), copied into `host` now and
+    /// then.
+    dev: vk::Buffer,
 }
 
 /// Write-backs between copies of the video-memory counters into the
-/// host-visible ones (`tune fe2_scatter_dev`; the status line's counts lag
-/// by at most that many).
+/// host-visible ones (the status line's counts lag by at most that many).
 const COUNTER_COPY_EVERY: u64 = 64;
 
 static SCATTERS_RECORDED: AtomicU64 = AtomicU64::new(0);
@@ -2840,8 +2839,8 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
         // unused.)
         let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 32 }];
         let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("scatter layout: {e}"))?;
-        let reset = super::tune::fe2_scatter_reset();
-        let code = if reset { rdna::kernels::mirror_scatter_reset() } else { rdna::kernels::mirror_scatter() };
+        // (The kernel empties the touched-page list itself.)
+        let code = rdna::kernels::mirror_scatter_reset();
         let make = |code: &[u32], key: u64| -> Result<vk::Pipeline, String> {
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None).map_err(|e| format!("scatter module: {e}"))?;
             let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
@@ -2858,21 +2857,16 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
         let bytes = 4 * rdna::kernels::SCATTER_COUNTERS as u64;
         let (cbuf, _cmem, cptr) = c.host_buffer(bytes, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)?;
         std::ptr::write_bytes(cptr, 0, bytes as usize);
-        let dev = if super::tune::fe2_scatter_dev() {
-            let (d, _dmem) = c.device_buffer(bytes, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)?;
-            super::resident::one_off_now(|cmd| c.device.cmd_fill_buffer(cmd, d, 0, bytes, 0))?;
-            Some(d)
-        } else {
-            None
-        };
-        let infos = [vk::DescriptorBufferInfo { buffer: marks, offset: 0, range: super::resident::MARK_BYTES }, vk::DescriptorBufferInfo { buffer: dev.unwrap_or(cbuf), offset: 0, range: bytes }];
+        let (dev, _dmem) = c.device_buffer(bytes, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)?;
+        super::resident::one_off_now(|cmd| c.device.cmd_fill_buffer(cmd, dev, 0, bytes, 0))?;
+        let infos = [vk::DescriptorBufferInfo { buffer: marks, offset: 0, range: super::resident::MARK_BYTES }, vk::DescriptorBufferInfo { buffer: dev, offset: 0, range: bytes }];
         let writes: Vec<vk::WriteDescriptorSet> = infos
             .iter()
             .enumerate()
             .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
             .collect();
         c.device.update_descriptor_sets(&writes, &[]);
-        Ok(Scatter { pipeline, compact, layout, set, counters: cptr as *mut u32, reset, host: cbuf, dev })
+        Ok(Scatter { pipeline, compact, layout, set, counters: cptr as *mut u32, host: cbuf, dev })
     }
 }
 
@@ -2896,7 +2890,7 @@ pub fn note_touch_bits() {
 /// from the touched bits of `written` (the guest range the executor's
 /// written bindings since its last write-back span) and a barrier, the
 /// scatter over the touched-page list, the list emptied (by the kernel
-/// itself under `tune fe2_scatter_reset`), a barrier before all later work.
+/// itself), a barrier before all later work.
 /// Returns the pipeline it bound (the caller's bound compute state is gone).
 pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Option<vk::Pipeline> {
     let s = SCATTER.get()?;
@@ -2931,22 +2925,13 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
         c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
         c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
         c.device.cmd_dispatch_indirect(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4);
-        if s.dev.is_some() && SCATTERS_RECORDED.fetch_add(1, Ordering::Relaxed) % COUNTER_COPY_EVERY == COUNTER_COPY_EVERY - 1 {
+        if SCATTERS_RECORDED.fetch_add(1, Ordering::Relaxed) % COUNTER_COPY_EVERY == COUNTER_COPY_EVERY - 1 {
             record_counter_copy(s, cmd);
         }
-        if s.reset {
-            // (The kernel emptied the list; the barrier's first scope holds
-            // the dispatch's read of its arguments, a logically earlier
-            // stage.)
-            let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_READ);
-            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[after], &[], &[]);
-        } else {
-            let to_fill = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[to_fill], &[], &[]);
-            c.device.cmd_fill_buffer(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4, 4, 0);
-            let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_READ);
-            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[after], &[], &[]);
-        }
+        // (The kernel emptied the list; the barrier's first scope holds the
+        // dispatch's read of its arguments, a logically earlier stage.)
+        let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_READ);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[after], &[], &[]);
     }
     note_scatter();
     Some(pipeline)
@@ -2956,7 +2941,7 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
 /// host-visible ones (after the write-backs before it; the barrier after
 /// the write-back that follows makes it visible to the host).
 unsafe fn record_counter_copy(s: &Scatter, cmd: vk::CommandBuffer) {
-    let Some(d) = s.dev else { return };
+    let d = s.dev;
     let c = ctx();
     let to_copy = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
     let bytes = 4 * rdna::kernels::SCATTER_COUNTERS as u64;
@@ -2969,16 +2954,15 @@ unsafe fn record_counter_copy(s: &Scatter, cmd: vk::CommandBuffer) {
 }
 
 /// The buffer the write-back kernel counts into (its pages and dwords
-/// first: `rdna::kernels::SCATTER_COUNTERS`), in video memory under `tune
-/// fe2_scatter_dev`.
+/// first: `rdna::kernels::SCATTER_COUNTERS`), in video memory.
 pub fn counter_buffer() -> Option<vk::Buffer> {
-    SCATTER.get().map(|s| s.dev.unwrap_or(s.host))
+    SCATTER.get().map(|s| s.dev)
 }
 
-/// Whether front end 2 is on with the write-back kernel that empties the
-/// touched-page list itself (`tune fe2_scatter_reset` when it was made).
+/// Whether front end 2 is on with its write-back kernel (which empties the
+/// touched-page list itself).
 pub fn scatter_resets() -> bool {
-    on() && SCATTER.get().is_some_and(|s| s.reset)
+    on() && SCATTER.get().is_some()
 }
 
 /// The write-back's counters summed in 64 bits (the kernel's are 32-bit
@@ -3003,8 +2987,8 @@ pub fn census_sample() {
 }
 
 /// The write-back's counters (pages, dwords, pages without a mapping,
-/// overflowed lists, the census's dwords and unchanged ones), as the GPU left them so far (under `tune
-/// fe2_scatter_dev` as of the last copy).
+/// overflowed lists, the census's dwords and unchanged ones), as the GPU left them so far (as of the last
+/// copy).
 fn counters() -> [u32; rdna::kernels::SCATTER_COUNTERS as usize] {
     let Some(s) = SCATTER.get() else { return [0; rdna::kernels::SCATTER_COUNTERS as usize] };
     // SAFETY: host-visible words the kernel adds to atomically.
@@ -3051,13 +3035,12 @@ pub fn init() {
     // FINDINGS.md 2026-10-29), and waits that release nothing new (gone
     // past, a counter's value passed on again) end none (epoch ends -38%,
     // takes -10%, level), and the write-back's kernel empties its
-    // touched-page list itself (no fill and no barrier before one per
-    // write-back; level to +1%), counts into video memory (two host-memory
-    // atomics a page written back, ~28,000 a frame at the vista: GPU busy
-    // -2.3 ms a frame, +2-3%) and counts as a full barrier, CP writes right
-    // after it recording none before them (level to +0.3%; FINDINGS.md
-    // 2026-10-29 morning), unless set explicitly.
-    const PAR: [(&str, u64); 8] = [("par_compute", 4), ("par_events", 1), ("par_min_compute", 64), ("fe2_gpu_waits", 1), ("fe2_quiet_waits", 1), ("fe2_scatter_reset", 1), ("fe2_scatter_dev", 1), ("fe2_cpw_light", 1)];
+    // touched-page list itself (level to +1%), counts into video memory
+    // (GPU busy -2.3 ms a frame, +2-3%) and counts as a full barrier, CP
+    // writes right after it recording none before them (level to +0.3%;
+    // FINDINGS.md 2026-10-29 morning): those five without switches since
+    // 2026-11-01; the parallel runs' settings unless set explicitly.
+    const PAR: [(&str, u64); 3] = [("par_compute", 4), ("par_events", 1), ("par_min_compute", 64)];
     for (name, v) in PAR {
         if !super::tune::set_default(name, v) {
             crate::warn!("fe2: no switch {name}");
@@ -3379,7 +3362,7 @@ fn scatter_bench() -> Result<String, String> {
         }
         res?;
         cleared?;
-        Ok(format!("write-back bench ({bench_pages} pages, median of {BENCH_REPS}, `tune fe2_scatter_reset` {}, `fe2_scatter_dev` {}): {}", super::tune::fe2_scatter_reset() as u8, super::tune::fe2_scatter_dev() as u8, lines.join(", ")))
+        Ok(format!("write-back bench ({bench_pages} pages, median of {BENCH_REPS}): {}", lines.join(", ")))
     })();
     unsafe { VirtualFree(h as _, 0, MEM_RELEASE) };
     r

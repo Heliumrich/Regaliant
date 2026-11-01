@@ -3800,8 +3800,7 @@ static SHADOWS_REUSED: AtomicU64 = AtomicU64::new(0);
 static SHADOWS_SHARED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// End-of-pipe writes without a full barrier (`tune eop_light`): [labels,
 /// timestamps, waits that ordered the work after them, CP writes right after
-/// front end 2's write-back with no barrier before them (`tune
-/// fe2_cpw_light`)].
+/// front end 2's write-back with no barrier before them].
 static EOP_LIGHT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// Dispatches storing deferred timestamps (`Exec::resolve_timestamps`), and
 /// deferred timestamps a later one of the same resolve overwrote.
@@ -10045,7 +10044,7 @@ impl Exec {
         };
         // (Its first barrier holds it after all earlier work and its last
         // all later work after it: a full one for what follows.)
-        if recorded && super::tune::fe2_cpw_light() {
+        if recorded {
             self.barrier_noted();
         }
         self.ops[OP_FE2_SCATTERS] += 1;
@@ -11898,7 +11897,7 @@ impl Exec {
             unsafe {
                 // (Right after front end 2's write-back none: its last
                 // barrier holds all later work, its first all earlier work.)
-                if super::tune::skip_barriers() & 256 == 0 && !(after_scatter && super::tune::fe2_cpw_light()) {
+                if super::tune::skip_barriers() & 256 == 0 && !after_scatter {
                     ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
                 } else if after_scatter {
                     EOP_LIGHT[3].fetch_add(1, Ordering::Relaxed);
@@ -11920,7 +11919,7 @@ impl Exec {
             to_mirror(cmd);
         } else {
             // (Right after front end 2's write-back none: see above.)
-            if after_scatter && super::tune::fe2_cpw_light() && !seg_stamps() {
+            if after_scatter && !seg_stamps() {
                 EOP_LIGHT[3].fetch_add(1, Ordering::Relaxed);
             } else {
                 self.barrier();
@@ -12590,7 +12589,7 @@ impl Exec {
     /// What a full barrier resets in this executor's tracking (the work
     /// since the last one), without recording one: for barriers recorded
     /// otherwise that order all earlier work before all later work (front
-    /// end 2's write-back, `tune fe2_cpw_light`).
+    /// end 2's write-back).
     fn barrier_noted(&mut self) {
         self.barrier_wanted = false;
         self.dispatched = false;

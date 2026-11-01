@@ -333,12 +333,12 @@ pub struct Cp {
     last_wait_kind: u8,
     /// Its comparison function (diagnostics: `EPOCH_REPEATS`).
     last_wait_func: u32,
-    /// Front end 2 (`tune fe2_quiet_waits`): per label this queue's waits
+    /// Front end 2: per label this queue's waits
     /// passed on as released by the CPU, the value then, the distinct
     /// values seen, and whether each was greater than the one before.
     passed: HashMap<u64, (u64, u32, bool)>,
     /// The view of the writer of the promise the last WAIT_REG_MEM passed on
-    /// (0: this queue's own open promise; `tune fe2_gpu_waits`).
+    /// (0: this queue's own open promise; front end 2).
     last_wait_epoch: u32,
     /// The end of the last run the planner found too short (no new plan
     /// until execution passes it: each command would scan the rest again).
@@ -1288,7 +1288,7 @@ pub static CPU_ARG_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// Waits passed on a GPU queue's write that ended no copy-cache epoch
 /// (`Cp::last_wait_gpu`).
 pub static EPOCH_GPU_WAITS: AtomicU64 = AtomicU64::new(0);
-/// Waits that ended no epoch under `tune fe2_quiet_waits`: [passed again on
+/// Waits that ended no epoch under front end 2: [passed again on
 /// a counter's value, gone past].
 pub static QUIET_WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Indexed indirect draws with arguments in a video-memory home read on the
@@ -2273,7 +2273,7 @@ impl Cp {
         // write, no CPU write released the wait: the CPU writes the title
         // ordered before it came before the writer's synchronization, which
         // the promise's epoch (or the epoch now) covers; no epoch ends.
-        if self.last_wait_gpu && super::fe2::on() && super::tune::fe2_gpu_waits() {
+        if self.last_wait_gpu && super::fe2::on() {
             // (A value not seen here as the CPU's: the counter's history
             // starts again, `passed_again`.)
             self.passed.remove(&(a & !7));
@@ -2281,7 +2281,7 @@ impl Cp {
             self.fe2_adopt_epoch(if self.last_wait_kind == b'P' { self.last_wait_epoch } else { super::precache::epoch() as u32 });
             return;
         }
-        let quiet = super::fe2::on() && super::tune::fe2_quiet_waits();
+        let quiet = super::fe2::on();
         // Front end 2: gone past, the wait released nothing yet; the
         // stretch checks as of the epoch at each check and is checked again
         // at its label, where its view is taken.
@@ -2336,7 +2336,7 @@ impl Cp {
     }
 
     /// The epoch the label at `a` that the last wait passed on orders before
-    /// the work after it (front end 2, `tune fe2_gpu_waits`), and what wrote
+    /// the work after it (front end 2), and what wrote
     /// it: a promise (its writer's view then), a latched CP write (the epoch
     /// now), a GPU queue's CP write in memory (that queue's view, the epoch
     /// now without one), else the CPU (later than any check made so far).
@@ -2408,7 +2408,7 @@ impl Cp {
     /// A wait that passed at once on `now` at label `a` as released by the
     /// CPU: whether this queue passed on that same value last time there and
     /// the label is a counter (at least three values seen, each greater than
-    /// the one before); notes the value either way (`tune fe2_quiet_waits`).
+    /// the one before); notes the value either way (front end 2).
     fn passed_again(&mut self, a: u64, now: u64) -> bool {
         let at_once = self.last_wait_kind == b'I';
         if self.passed.len() > 4096 {
@@ -2433,8 +2433,8 @@ impl Cp {
         }
     }
 
-    /// This queue's checks need at least epoch `v` from here on (`tune
-    /// fe2_gpu_waits`); one without a view yet takes the epoch now.
+    /// This queue's checks need at least epoch `v` from here on (front
+    /// end 2); one without a view yet takes the epoch now.
     fn fe2_adopt_epoch(&self, v: u32) {
         if let Some(c) = self.fe2_view.as_ref() {
             let v = if c.load(Ordering::Acquire) == super::fe2::NO_VIEW { super::precache::epoch() as u32 } else { v };
