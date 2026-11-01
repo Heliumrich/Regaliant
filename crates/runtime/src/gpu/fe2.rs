@@ -42,13 +42,6 @@
 //! - A take only spares uploads of pages that did not change: small runs of
 //!   pages found written within HOT_FLIPS flips (the title's rings of
 //!   per-draw data, rewritten every frame) are uploaded without one.
-//! - With `DS_FE2_DEFER=1` checks wait for the batch's close (`ensure` with
-//!   a list, `resolve`; off by default):
-//!   the runs a batch's bindings need checked count as its own meanwhile,
-//!   and at its close they are merged into few takes (write-watch queries
-//!   queue behind each other in the kernel: ~13 us each with the parallel
-//!   workers taking too) whose uploads go into its prologue, which runs
-//!   before all of its work.
 //! - Uploads are GPU copies from the import windows in the batch's
 //!   prologue, on the main queue after every earlier batch, so after their
 //!   write-backs (a copy the CPU made now could predate GPU writes of
@@ -913,14 +906,6 @@ pub fn wanted() -> bool {
     *W.get_or_init(|| std::env::var("DS_FE2").ok().as_deref() != Some("0"))
 }
 
-/// `DS_FE2_DEFER=1`: checks wait for the batch's close (`resolve`); off by
-/// default: at the gate it made queue 0x50's many small batches late with
-/// their label writes (FINDINGS.md 2026-10-27 night).
-pub fn defer_checks() -> bool {
-    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *W.get_or_init(|| std::env::var("DS_FE2_DEFER").ok().as_deref() == Some("1"))
-}
-
 /// `DS_FE2_ARM_GPU=1`: pages GPU work writes are armed like others (GPU
 /// writes reach guest memory by the write-back, which does not fault, and M
 /// holds them already). Off by default: they are the pages the GPU writes
@@ -1104,11 +1089,8 @@ const S_RANGE_HITS: usize = 25;
 /// Runs uploaded without a take (written lately) and their pages.
 const S_HOT_RUNS: usize = 26;
 const S_HOT_PAGES: usize = 27;
-/// Runs deferred to their batch's close, closes that resolved some, and the
-/// merged runs they took.
-const S_DEFERRED: usize = 28;
-const S_RESOLVES: usize = 29;
-const S_RESOLVED_RUNS: usize = 30;
+// (28-30: the checks deferred to batch closes, `DS_FE2_DEFER`, removed on
+// 2026-11-01.)
 /// Runs uploaded without a take because a take of their epoch had looked at
 /// them (`taken_lacking`), and their pages.
 const S_TAKEN_RUNS: usize = 31;
@@ -1277,20 +1259,18 @@ thread_local! {
 /// `gpu_writes`: GPU work will write the range (its pages are marked so,
 /// and never armed; with `DS_FE2_ARM_GPU=1` it is checked like any).
 /// Err: an upload failed (M lacks some of the range).
-/// With `defer`, runs that need a take are appended there instead (the
-/// caller counts their pages as its batch's own until `resolve` at its
-/// close). `want`: pages must reflect every CPU write before epoch `want`
+/// `want`: pages must reflect every CPU write before epoch `want`
 /// began (the caller's view, `views_on`); `ep`: the epoch now, read before
 /// any take (what takes stamp their pages with).
 #[allow(clippy::too_many_arguments)]
-pub fn ensure(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, mine_any: bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, defer: Option<&mut Vec<(u64, u64)>>) -> Result<(), &'static str> {
+pub fn ensure(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, mine_any: bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable) -> Result<(), &'static str> {
     if !callers_on() {
-        return ensure_inner(lo, hi, want, ep, gpu_writes, mine, mine_any, upload, armable, defer);
+        return ensure_inner(lo, hi, want, ep, gpu_writes, mine, mine_any, upload, armable);
     }
     let t0 = unsafe { core::arch::x86_64::_rdtsc() };
     caller_count(C_CHECKS, 1);
     source_count(B_CHECKS, 1);
-    let r = ensure_inner(lo, hi, want, ep, gpu_writes, mine, mine_any, upload, armable, defer);
+    let r = ensure_inner(lo, hi, want, ep, gpu_writes, mine, mine_any, upload, armable);
     let cycles = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
     caller_count(C_CYCLES, cycles);
     source_count(B_CYCLES, cycles);
@@ -1445,13 +1425,13 @@ pub fn precheck(base: u64, size: u64, armable: &Armable) {
     let caller = CALLER.with(|c| c.get());
     set_caller("ahead");
     PRECHECK.with(|p| p.set(true));
-    let _ = ensure_inner(lo, hi, ep, ep, false, &|_| false, false, &mut |_, _| true, armable, None);
+    let _ = ensure_inner(lo, hi, ep, ep, false, &|_| false, false, &mut |_, _| true, armable);
     PRECHECK.with(|p| p.set(false));
     CALLER.with(|c| c.set(caller));
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, mine_any: bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable, mut defer: Option<&mut Vec<(u64, u64)>>) -> Result<(), &'static str> {
+fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, mine_any: bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable) -> Result<(), &'static str> {
     // (No page of the caller's batch to pass over: runs go in whole.)
     let mine_fast = !mine_any && super::tune::fe2_mine_fast();
     let sc = size_class((hi - lo) / PAGE);
@@ -1652,11 +1632,6 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
                 }
                 STATS[S_TAKEN_RUNS].fetch_add(1, Ordering::Relaxed);
                 caller_since(C_UPLOAD, tu);
-                continue;
-            }
-            if let Some(d) = defer.as_deref_mut() {
-                d.push((a, b));
-                STATS[S_DEFERRED].fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             // Another thread's take around this run, for a requirement at
@@ -2144,56 +2119,6 @@ fn followed(a: u64, b: u64, want: u32, mine: &dyn Fn(u64) -> bool, upload: &mut 
         return Err("an upload into the mirror failed");
     }
     Ok(true)
-}
-
-/// The checks a batch's bindings deferred (`ensure` with a list), at its
-/// close: `runs` merged where less than TAKE_GAP pages apart, each armed
-/// where allowed, taken, its pages M lacks and not `mine` (uploaded by the
-/// batch already) uploaded into its prologue (`upload`), its valid pages
-/// marked clean in the epoch now. `runs` is left empty.
-pub fn resolve(runs: &mut Vec<(u64, u64)>, mine: &dyn Fn(u64) -> bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable) -> Result<(), &'static str> {
-    if runs.is_empty() {
-        return Ok(());
-    }
-    let t0 = std::time::Instant::now();
-    runs.sort_unstable();
-    // Envelopes for the takes: runs less than TAKE_GAP pages apart with
-    // mapped memory between them (a take over a hole fails); each
-    // envelope's index range into `runs`.
-    let mut merged: Vec<(u64, u64, usize, usize)> = Vec::with_capacity(runs.len());
-    for (k, &(a, b)) in runs.iter().enumerate() {
-        match merged.last_mut() {
-            Some(l) if a <= l.1 || (l.1 + TAKE_GAP * PAGE >= a && crate::mem::readable_span(l.1).is_some_and(|(_, e)| e >= a)) => {
-                l.1 = l.1.max(b);
-                l.3 = k + 1;
-            }
-            _ => merged.push((a, b, k, k + 1)),
-        }
-    }
-    STATS[S_RESOLVES].fetch_add(1, Ordering::Relaxed);
-    STATS[S_RESOLVED_RUNS].fetch_add(merged.len() as u64, Ordering::Relaxed);
-    let ep = super::precache::epoch() as u32;
-    let frame = super::FRAMES.load(Ordering::Relaxed);
-    let r = SCRATCH.with(|s| {
-        let mut s = s.borrow_mut();
-        let written = &mut s.1;
-        // (A run that fails leaves the others to be made current still.)
-        let mut r = Ok(());
-        for &(a, b, i, j) in &merged {
-            note_arming_ended(a, b);
-            take_run(a, b, a, b, frame, true, armable, written, &BY_SIZE[size_class((b - a) / PAGE)]);
-            // Only the pages the batch bound need M current.
-            for &(x, y) in &runs[i..j] {
-                if let Err(e) = fix_run(x, y, ep, mine, upload) {
-                    r = Err(e);
-                }
-            }
-        }
-        r
-    });
-    runs.clear();
-    STATS[S_SLOW_NS].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    r
 }
 
 /// The runs of pages of [lo, hi) (page-aligned) each found written within
@@ -3552,15 +3477,12 @@ pub fn status() -> String {
     let w: Vec<u64> = WB64.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let compacts = if COMPACTS[0].load(Ordering::Relaxed) > 0 { format!("    front end 2's touched-page lists made from touched bits (`tune touch_bits`): {} write-backs, {} words of bits scanned\n", COMPACTS[0].load(Ordering::Relaxed), COMPACTS[1].load(Ordering::Relaxed)) } else { String::new() };
     format!(
-        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache; {} runs deferred to {} batch closes, taken as {} runs), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages; runs a take of their epoch had looked at, without another: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed; {} view pages armed at the residency's takes adopted), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action; CP writes with work to write back {} of labels a CP of ours waits on, {} left to the batch's close, {} with their guest-memory copy at the close); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value, {} again with the label's page unwritten and {} gone past ended none); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
+        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages; runs a take of their epoch had looked at, without another: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed; {} view pages armed at the residency's takes adopted), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action; CP writes with work to write back {} of labels a CP of ours waits on, {} left to the batch's close, {} with their guest-memory copy at the close); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value, {} again with the label's page unwritten and {} gone past ended none); the mirror's video memory {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
         s[S_ENSURES],
         s[S_ENSURE_PAGES],
         s[S_FAST],
         s[S_SUMMARY],
         s[S_RANGE_HITS],
-        s[S_DEFERRED],
-        s[S_RESOLVES],
-        s[S_RESOLVED_RUNS],
         s[S_TAKES],
         s[S_TAKE_WRITTEN],
         s[S_TAKE_FAILED],

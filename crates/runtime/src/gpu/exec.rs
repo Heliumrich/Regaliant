@@ -7440,10 +7440,6 @@ pub struct Exec {
     /// end: none).
     fe2_written: (u64, u64),
     fe2_gens: Vec<u32>,
-    /// Runs the batch's bindings left to check at its close
-    /// (`fe2::resolve`), and their pages (the batch's own meanwhile).
-    fe2_pend: Vec<(u64, u64)>,
-    fe2_pend_set: super::fx::Set<u64>,
     /// This queue's view (`fe2::view_cell`): what its checks need.
     fe2_view: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// GPU-resolved chains under front end 2 (`fe2_gpu_ranges`, scratch):
@@ -8370,8 +8366,6 @@ impl Exec {
                 fe2_marked: false,
                 fe2_written: (u64::MAX, 0),
                 fe2_gens: Vec::new(),
-                fe2_pend: Vec::new(),
-                fe2_pend_set: Default::default(),
                 fe2_view: super::fe2::view_cell(name),
                 f3_ranges: Vec::new(),
                 f3_loads: Vec::new(),
@@ -8987,9 +8981,6 @@ impl Exec {
             }
             self.fe2_scatter();
         }
-        if !self.fe2_pend.is_empty() {
-            self.fe2_resolve();
-        }
         // Mirror mode: pages deferred CP writes changed are copied into the
         // mirror again (those writes were waited for above), and the dwords
         // the batch's work changes in its written ranges go to guest memory
@@ -9281,8 +9272,6 @@ impl Exec {
         self.fe2_mine.clear();
         self.f3_placed.clear();
         self.fe2_marked = false;
-        self.fe2_pend.clear();
-        self.fe2_pend_set.clear();
         self.rgm_batch_done(false);
         self.owned.clear();
         self.eager_action = None;
@@ -9801,21 +9790,16 @@ impl Exec {
             self.past_ranges.push((lo, hi));
         }
         let mine = std::mem::take(&mut self.fe2_mine);
-        let pend = std::mem::take(&mut self.fe2_pend_set);
         let mut up = std::mem::take(&mut self.fe2_up);
-        let mut deferred = std::mem::take(&mut self.fe2_pend);
-        let (first, first_pend) = (up.len(), deferred.len());
+        let first = up.len();
         // (Asked per page of the runs a check needs: empty sets are not
         // hashed into.)
-        // (`tune fe2_defer_gfx`: the graphics queue's alone, not the compute
-        // queues' many small batches with their label writes.)
-        let defer = super::fe2::defer_checks() || (super::tune::fe2_defer_gfx() && self.name.starts_with("gpu-gfx"));
         // (Pages an earlier part or batch of this executor's parallel run
         // claimed for their copies, `fe2_share`; none to look up while the
         // run has no claims.)
         let run = Some(self.fe2_share()).filter(|r| r.0 != 0 && super::fe2::run_any(r.0)).unwrap_or((0, 0));
-        let mine_any = !mine.is_empty() || !pend.is_empty() || run.0 != 0;
-        let r = super::fe2::ensure(lo, hi, want, ep, written, &|p| (!mine.is_empty() && mine.contains(&p)) || (!pend.is_empty() && pend.contains(&p)) || (run.0 != 0 && super::fe2::run_shared(p, run.0, run.1)), mine_any, &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable, defer.then_some(&mut deferred));
+        let mine_any = !mine.is_empty() || run.0 != 0;
+        let r = super::fe2::ensure(lo, hi, want, ep, written, &|p| (!mine.is_empty() && mine.contains(&p)) || (run.0 != 0 && super::fe2::run_shared(p, run.0, run.1)), mine_any, &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable);
         // Past a label wait the CPU may write the pages it rewrites every
         // frame again before the label (FINDINGS.md 2026-10-29): a small
         // binding's such pages are uploaded as they are when the stretch
@@ -9823,7 +9807,7 @@ impl Exec {
         if (self.past_grow || self.stretch) && r.is_ok() && (hi - lo) / PAGE <= STRETCH_HOT_PAGES && super::tune::past_hot() {
             let mut hot = Vec::new();
             super::fe2::hot_pages(lo, hi, &mut hot);
-            let own = |p: u64, up: &[(u64, u64)]| mine.contains(&p) || pend.contains(&p) || up[first..].iter().any(|&(s, e)| s <= p && p < e);
+            let own = |p: u64, up: &[(u64, u64)]| mine.contains(&p) || up[first..].iter().any(|&(s, e)| s <= p && p < e);
             'runs: for (a, b) in hot {
                 let mut x = a;
                 while x < b {
@@ -9845,7 +9829,7 @@ impl Exec {
             }
         }
         let t3 = tsc();
-        let (mut mine, mut pend) = (mine, pend);
+        let mut mine = mine;
         for &(a, b) in &up[first..] {
             let mut p = a;
             while p < b {
@@ -9856,16 +9840,7 @@ impl Exec {
                 p += PAGE;
             }
         }
-        for &(a, b) in &deferred[first_pend..] {
-            let mut p = a;
-            while p < b {
-                pend.insert(p);
-                p += PAGE;
-            }
-        }
         self.fe2_mine = mine;
-        self.fe2_pend_set = pend;
-        self.fe2_pend = deferred;
         self.fe2_up = up;
         if let Err(e) = r {
             self.report_error(&format!("front end 2: {e} (bound as the mirror holds it)"), || format!("{lo:#x}..{hi:#x}"));
@@ -10132,32 +10107,6 @@ impl Exec {
             }
         }
         true
-    }
-
-    /// Front end 2's checks the batch's bindings deferred, at its close
-    /// (`fe2::resolve`): their uploads go into its prologue.
-    fn fe2_resolve(&mut self) {
-        let Some((mbuf, _)) = super::resident::mirror_buffer() else { return };
-        let mut runs = std::mem::take(&mut self.fe2_pend);
-        self.fe2_pend_set.clear();
-        let mine = std::mem::take(&mut self.fe2_mine);
-        let mut up = std::mem::take(&mut self.fe2_up);
-        let first = up.len();
-        let r = super::fe2::resolve(&mut runs, &|p| mine.contains(&p), &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable);
-        let mut mine = mine;
-        for &(a, b) in up[first..].iter() {
-            let mut p = a;
-            while p < b {
-                mine.insert(p);
-                p += super::resident::PAGE;
-            }
-        }
-        self.fe2_mine = mine;
-        self.fe2_up = up;
-        self.fe2_pend = runs;
-        if let Err(e) = r {
-            self.report_error(&format!("front end 2: {e} at a batch's close (its work reads the mirror as it is)"), String::new);
-        }
     }
 
     /// A long wait's report (`Cp::poll_until_wake`): the recording batch
@@ -13341,7 +13290,7 @@ impl Exec {
                     crate::info!("gpu[{}]: a stretch past a label wait read {a:#x}..{b:#x} ({} pages) of {lo:#x}..{hi:#x}, written since its check (needs epoch {need}, its checks {}; flip {}; mapping {map})", self.name, (b - a) / super::resident::PAGE, self.past_want_min, super::FRAMES.load(Ordering::Relaxed));
                 }
                 true
-            }, &fe2_armable, None);
+            }, &fe2_armable);
             stale |= r.is_err();
         }
         PAST_CHECKS[0].fetch_add(1, Ordering::Relaxed);
