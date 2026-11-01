@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 240] = [
+    static ALL: [Tunable; 237] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -257,9 +257,6 @@ pub mod tune {
         Tunable { name: "lod_skip", env: "DS_LOD_SKIP", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "gpu_detile", env: "DS_GPU_DETILE", default: 8, value: AtomicU64::new(UNSET) },
         Tunable { name: "upload_copy", env: "DS_UPLOAD_COPY", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "import_keep", env: "DS_IMPORT_KEEP", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "import_defer", env: "DS_IMPORT_DEFER", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "import_grow", env: "DS_IMPORT_GROW", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "mark_touch", env: "DS_MARK_TOUCH", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_scatter_read", env: "DS_FE2_SCATTER_READ", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "touch_bits", env: "DS_TOUCH_BITS", default: 0, value: AtomicU64::new(UNSET) },
@@ -2459,44 +2456,6 @@ pub mod tune {
         get(223) != 0
     }
 
-    /// Imports met by a remap of their pages stay listed and are replaced
-    /// off the recording threads (`exec::keep_remapped`): decommits under an
-    /// import wait for it, so the pages it pins stay the guest's. 0 (default):
-    /// dropped at once and imported again on the thread that met the remap.
-    /// Opt-in: with `import_grow` the 1-1 walks' arrivals were even and their
-    /// area windows' hitch time 20-30% higher (GPU waits; more imports in
-    /// all), FINDINGS.md 2026-10-30 night.
-    pub fn import_keep() -> bool {
-        get(224) != 0
-    }
-
-    /// Front end 2's uploads into the mirror of at most 1 MiB whose window
-    /// is not imported yet (opt-in): 1, their own pages imported (`exec::
-    /// import_exact`: pinning a few pages costs a fraction of the window's
-    /// 5-20 ms; copies stay in the GPU's order) and the window imported off
-    /// the recording threads (`exec::queue_import`), the small import
-    /// dropped once the window covers it; 2, copied by the CPU into the
-    /// batch's staging instead (current for that batch only, refused where
-    /// GPU work writes the pages). 0 (default): the window imported on the
-    /// recording thread first. Off by default: geometry was torn at 8-2 or
-    /// 8-3 in 3 of 7 full tours with it, `import_keep` and `import_grow` on
-    /// (both modes), in none of 8 with one of the three off nor 2 with all
-    /// off; cause not found; at Castlewall's arrival no gain
-    /// (FINDINGS.md 2026-10-30 night).
-    pub fn import_defer() -> u64 {
-        get(225)
-    }
-
-    /// An import of pages the guest mapped after live imports of the same
-    /// run begins at their end (`exec::grown_from`) instead of the run's
-    /// start: the title's streamed texture arrays grow a window a few MiB at
-    /// a time, and each import of the whole run pinned its 50-64 MiB again
-    /// (8-16 ms). 0 (default): the whole run each time. Opt-in (with
-    /// `import_keep`: measured no gain, FINDINGS.md 2026-10-30 night).
-    pub fn import_grow() -> bool {
-        get(226) != 0
-    }
-
     /// Timing only at 0 (GPU writes then never reach guest memory; replays
     /// only, as `write_marks 0`): translations mark their stores' dwords
     /// but leave out the touched-page list (`Spec::marks_untouched`), so
@@ -2504,7 +2463,7 @@ pub mod tune {
     /// `fe2_scatter_nostore` it splits what the marks cost (diagnosis,
     /// 2026-10-31). Read when a stage is prepared.
     pub fn mark_touch() -> bool {
-        get(227) != 0
+        get(224) != 0
     }
 
     /// Front end 2's write-back reads each marked dword's guest-memory value
@@ -2514,7 +2473,7 @@ pub mod tune {
     /// diagnosis), 2 only those that differ (`mirror_scatter_changed`). Read
     /// at each write-back (with `fe2_scatter_reset`).
     pub fn fe2_scatter_read() -> u64 {
-        get(228)
+        get(225)
     }
 
     /// Front end 2: translations set their stores' pages' touched bits
@@ -2523,7 +2482,7 @@ pub mod tune {
     /// bits of its executor's written ranges first (`kernels::mirror_compact`,
     /// from the first such translation on). Read when a stage is prepared.
     pub fn touch_bits() -> bool {
-        get(229) != 0
+        get(226) != 0
     }
 
     /// With the write-back image made (`DS_WB_IMAGE`, boot): 1 the image in
@@ -2533,7 +2492,7 @@ pub mod tune {
     /// kernel ran since its last use (exact across switches; replay A/Bs
     /// split its cost this way).
     pub fn wb_image() -> u64 {
-        get(230)
+        get(227)
     }
 
     /// Texture uploads detiled on the CPU that waited for their transfer on
@@ -2544,7 +2503,7 @@ pub mod tune {
     /// 24% less hitch time, level loads' hitches lower, content drawn
     /// sooner; FINDINGS.md); 0 waits for each transfer as before.
     pub fn upload_batch() -> bool {
-        get(231) != 0
+        get(228) != 0
     }
 
     /// FE2's ranges found fine shared by every thread (`fe2::SHARED`): a
@@ -2552,14 +2511,14 @@ pub mod tune {
     /// Live; off by default (no gain at Castlewall's arrival, FINDINGS.md
     /// 2026-10-31).
     pub fn fe2_shared_ranges() -> bool {
-        get(232) != 0
+        get(229) != 0
     }
 
     /// First uploads of textures detiled on the CPU are detiled before the
     /// image cache's lock by the thread binding them (`images::predetile`;
     /// under the lock only their copy is recorded). Live.
     pub fn upload_predetile() -> bool {
-        get(233) != 0
+        get(230) != 0
     }
 
     /// Batches recorded into lists that the submission thread replays into
@@ -2571,7 +2530,7 @@ pub mod tune {
     /// -6.6%, +1% at the vista, Castlewall +2%; 2 lost 1.2% in replays:
     /// FINDINGS.md).
     pub fn record_defer() -> u64 {
-        get(234)
+        get(231)
     }
 
     /// Diagnosis, work added after each front end 2 write-back and nothing
@@ -2582,7 +2541,7 @@ pub mod tune {
     /// workgroup, into a buffer of its own). Live: what serial GPU time at
     /// the write-backs' places costs the frame.
     pub fn wb_probe() -> u64 {
-        get(235)
+        get(232)
     }
 
     /// Front end 2's write-backs handed over (step 1 of STATUS item 1): the
@@ -2592,7 +2551,7 @@ pub mod tune {
     /// back to back where the write-back was. The region and its kernels
     /// are made when it is on at front end 2's start; live after that.
     pub fn wb_region() -> u64 {
-        get(236)
+        get(233)
     }
 
     /// Step 2 of STATUS item 1 (with `wb_region`'s region): a batch's
@@ -2603,14 +2562,14 @@ pub mod tune {
     /// (as `fe2_cpw_defer`). Chunks of parallel runs and the second queue's
     /// batches write back within themselves. Read at each batch's begin.
     pub fn wb_stream() -> u64 {
-        get(237)
+        get(234)
     }
 
     /// Where `wb_probe` adds its work (diagnosis, live): 0 after every
     /// write-back, 1 only after those at batch closes, 2 only after those
     /// before CP writes the GPU performs (whose labels wait for them).
     pub fn wb_probe_site() -> u64 {
-        get(238)
+        get(235)
     }
 
     /// A large zero fill under front end 2 stores into guest memory only
@@ -2621,8 +2580,9 @@ pub mod tune {
     /// vista frame, in front of a label). Live; default 1 since 2026-10-31
     /// (the vista +3%, GPU busy -1.8 ms a frame; tour clean: FINDINGS.md).
     pub fn fill_partial() -> bool {
-        get(239) != 0
+        get(236) != 0
     }
+
 
     /// `batch_draws` 2: runs of one draw each (diagnosis: the batched stages
     /// without appends).
@@ -3534,6 +3494,7 @@ pub fn reset_profile() {
     crate::audio::reset_window();
     crate::guestprof::reset();
     fe2::reset_callers();
+    resident::reset_backing();
     fe2census::reset();
     exec::reset_f3_regions();
 }
@@ -3552,6 +3513,7 @@ pub fn profile_report() -> String {
     s.push_str(&exec::race_line());
     s.push_str(&forward::status_line());
     s.push_str(&fe2::callers_line());
+    s.push_str(&resident::backing_line());
     s.push_str(&fe2census::report());
     s.push_str(&crate::hle::kernel::timeouts_line());
     s.push_str(&cp::long_waits_line());

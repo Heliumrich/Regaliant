@@ -1609,8 +1609,10 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
     if all {
         return Ok(());
     }
+    let t0 = std::time::Instant::now();
     let mut g = m.blocks.lock();
     let mut binds = Vec::new();
+    let mut alloc_ns = 0u64;
     for p in first..=last {
         let (w, bit) = ((p / 64) as usize, 1u64 << (p % 64));
         if m.backed[w].load(Ordering::Acquire) & bit != 0 {
@@ -1620,7 +1622,9 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
             let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
             let ai = vk::MemoryAllocateInfo::default().allocation_size(BLOCK).memory_type_index(m.mem_type);
             let ai = if c.device_addresses { ai.push_next(&mut fl) } else { ai };
+            let ta = std::time::Instant::now();
             let mem = unsafe { c.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory (mirror block): {e}"))?;
+            alloc_ns += ta.elapsed().as_nanos() as u64;
             g.0.push(mem);
             g.1 = 0;
         }
@@ -1631,6 +1635,10 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
     if binds.is_empty() {
         return Ok(());
     }
+    // (Waited for: binds not waited for, every later submission waiting for
+    // a timeline value instead, cost the arrival no less and stalled the
+    // queues for seconds at times: FINDINGS.md 2026-11-01.)
+    let tb = std::time::Instant::now();
     let bufs = [vk::SparseBufferMemoryBindInfo::default().buffer(m.buf).binds(&binds)];
     let info = vk::BindSparseInfo::default().buffer_binds(&bufs);
     let fence = unsafe { c.device.create_fence(&vk::FenceCreateInfo::default(), None) }.map_err(|e| format!("vkCreateFence: {e}"))?;
@@ -1646,7 +1654,46 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
         m.backed[(p / 64) as usize].fetch_or(1u64 << (p % 64), Ordering::AcqRel);
     }
     count.fetch_add(binds.len() as u64, Ordering::Relaxed);
+    let (bind_ns, all_ns) = (tb.elapsed().as_nanos() as u64, t0.elapsed().as_nanos() as u64);
+    for (k, v) in [1, binds.len() as u64, alloc_ns, bind_ns, all_ns].into_iter().enumerate() {
+        BACKING[k].fetch_add(v, Ordering::Relaxed);
+    }
+    BACKING[5].fetch_max(all_ns, Ordering::Relaxed);
+    // (A long one is a hitch cause: `gpu::hitch`.)
+    super::hitch::note_since(super::hitch::Kind::Mirror, t0, || format!("backing {} pages of the mirror at {base:#x} (the bind and its wait {} ms)", binds.len(), bind_ns / 1_000_000));
     Ok(())
+}
+
+/// The mirror's backings that bound pages (`back_in`): [calls, pages,
+/// allocation ns, bind and wait ns, all ns, longest ns]; `profile reset`
+/// clears them.
+static BACKING: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Clears the backing counts (`profile reset`).
+pub fn reset_backing() {
+    for c in &BACKING {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Profile line: the mirror's backings in the window (each binds video
+/// memory with `vkQueueBindSparse` on the main queue and waits for it).
+pub fn backing_line() -> String {
+    let v: Vec<u64> = BACKING.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if v[0] == 0 {
+        return String::new();
+    }
+    let page = MIRROR.get().map_or(64 << 10, |m| m.page);
+    format!(
+        "    mirror backings in the window: {} ({} pages, {} MiB; {:.1} ms, of it allocations {:.1} ms and binds with their waits {:.1} ms; longest {:.1} ms)\n",
+        v[0],
+        v[1],
+        (v[1] * page) >> 20,
+        v[4] as f64 / 1e6,
+        v[2] as f64 / 1e6,
+        v[3] as f64 / 1e6,
+        v[5] as f64 / 1e6
+    )
 }
 
 /// Video memory backing the mirror so far, in MiB (pages are never
