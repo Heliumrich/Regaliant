@@ -4258,8 +4258,8 @@ struct RangeLog {
     /// Bumped after every note (`Exec`'s cache of clean pages holds while it
     /// stays the same; a reader takes it before looking).
     notes: AtomicU64,
-    /// Per bucket of 64 KiB guest pages (hashed), the latest batch that
-    /// writes into one of them: a lookup whose pages' buckets all hold
+    /// Per bucket of 64 KiB guest pages outside the guest span (hashed;
+    /// inside it `span`), the latest batch that writes into one of them: a lookup whose pages' buckets all hold
     /// completed batches is answered without the log's lock (the command
     /// processors check every draw's descriptor reads; ~1.75 us per draw
     /// with the lock, run 20261011-133502). Never lowered: completion
@@ -4272,6 +4272,11 @@ struct RangeLog {
     /// The same for those large writes alone (`tune log_big`: what a small
     /// read needs beside its page buckets).
     big: [AtomicU64; COARSE_BUCKETS],
+    /// `pages`, `coarse` and `big` inside the guest span, exact: one entry
+    /// per page and per 4 MiB block. (Hashed, a third of a lookup's trips
+    /// under the lock at the vista found a marked bucket and no batch, ~6
+    /// million a boot; FINDINGS.md 2026-11-01.)
+    span: &'static SpanMarks,
     /// Lookups (`latest`): [all, nothing unfinished, no bucket overlapping,
     /// answered under the lock, of those with a batch found].
     stats: [AtomicU64; 5],
@@ -4281,6 +4286,43 @@ const PAGE_BUCKETS: usize = 1 << 16;
 const PAGE_SHIFT: u32 = 16;
 const COARSE_BUCKETS: usize = 1 << 12;
 const COARSE_SHIFT: u32 = 22;
+/// A write log's entries per 64 KiB page and per 4 MiB block of the guest
+/// span (`RangeLog::span`; zeroed statics of their own, 4.3 MB each).
+struct SpanMarks {
+    pages: [AtomicU64; SPAN_PAGES],
+    coarse: [AtomicU64; SPAN_BLOCKS],
+    big: [AtomicU64; SPAN_BLOCKS],
+}
+
+impl SpanMarks {
+    const fn new() -> SpanMarks {
+        SpanMarks {
+            pages: [const { AtomicU64::new(0) }; SPAN_PAGES],
+            coarse: [const { AtomicU64::new(0) }; SPAN_BLOCKS],
+            big: [const { AtomicU64::new(0) }; SPAN_BLOCKS],
+        }
+    }
+}
+
+/// The guest span's 64 KiB pages and 4 MiB blocks (`SpanMarks`).
+const SPAN_PAGES: usize = ((super::resident::MIRROR_END - super::resident::MIRROR_BASE) >> PAGE_SHIFT) as usize;
+const SPAN_BLOCKS: usize = ((super::resident::MIRROR_END - super::resident::MIRROR_BASE) >> COARSE_SHIFT) as usize;
+
+/// A page's (`PAGE_SHIFT`) or block's (`COARSE_SHIFT`) index inside the
+/// guest span.
+fn span_index(unit: u64, shift: u32, count: usize) -> Option<usize> {
+    let i = unit.wrapping_sub(super::resident::MIRROR_BASE >> shift);
+    (i < count as u64).then_some(i as usize)
+}
+/// 4 MiB block `p`'s entry: exact inside the guest span, else its bucket.
+#[inline]
+fn block<'a>(hashed: &'a [AtomicU64; COARSE_BUCKETS], exact: &'a [AtomicU64; SPAN_BLOCKS], p: u64) -> &'a AtomicU64 {
+    match span_index(p, COARSE_SHIFT, SPAN_BLOCKS) {
+        Some(i) => &exact[i],
+        None => &hashed[coarse_bucket(p)],
+    }
+}
+
 /// Ranges of this many 64 KiB pages or more are marked per 4 MiB.
 const COARSE_FROM: u64 = 64;
 
@@ -4293,7 +4335,7 @@ fn coarse_bucket(page: u64) -> usize {
 }
 
 impl RangeLog {
-    const fn new() -> RangeLog {
+    const fn new(span: &'static SpanMarks) -> RangeLog {
         RangeLog {
             log: parking_lot::RwLock::new(super::ranges::SeqRanges::new()),
             latest_seq: AtomicU64::new(0),
@@ -4301,11 +4343,22 @@ impl RangeLog {
             pages: [const { AtomicU64::new(0) }; PAGE_BUCKETS],
             coarse: [const { AtomicU64::new(0) }; COARSE_BUCKETS],
             big: [const { AtomicU64::new(0) }; COARSE_BUCKETS],
+            span,
             stats: [const { AtomicU64::new(0) }; 5],
         }
     }
 
-    /// Marks the page buckets of [a, a+n) as written by batch `seq`.
+    /// Page `p`'s entry: exact inside the guest span, else its bucket.
+    #[inline]
+    fn page(&self, p: u64) -> &AtomicU64 {
+        match span_index(p, PAGE_SHIFT, SPAN_PAGES) {
+            Some(i) => &self.span.pages[i],
+            None => &self.pages[page_bucket(p)],
+        }
+    }
+
+    /// Marks the pages (or 4 MiB blocks) of [a, a+n) as written by batch
+    /// `seq`.
     fn mark_pages(&self, seq: u64, a: u64, n: u64) {
         if n == 0 {
             return;
@@ -4314,49 +4367,53 @@ impl RangeLog {
         if last - first >= COARSE_FROM {
             let (first, last) = (a >> COARSE_SHIFT, (a + n - 1) >> COARSE_SHIFT);
             if last - first >= COARSE_BUCKETS as u64 {
-                for (b, g) in self.coarse.iter().zip(self.big.iter()) {
+                for (b, g) in self.coarse.iter().zip(self.big.iter()).chain(self.span.coarse.iter().zip(self.span.big.iter())) {
                     b.fetch_max(seq, Ordering::SeqCst);
                     g.fetch_max(seq, Ordering::SeqCst);
                 }
                 return;
             }
             for p in first..=last {
-                self.coarse[coarse_bucket(p)].fetch_max(seq, Ordering::SeqCst);
-                self.big[coarse_bucket(p)].fetch_max(seq, Ordering::SeqCst);
+                block(&self.coarse, &self.span.coarse, p).fetch_max(seq, Ordering::SeqCst);
+                block(&self.big, &self.span.big, p).fetch_max(seq, Ordering::SeqCst);
             }
             return;
         }
         for p in first..=last {
-            self.pages[page_bucket(p)].fetch_max(seq, Ordering::SeqCst);
+            self.page(p).fetch_max(seq, Ordering::SeqCst);
         }
         // Its 4 MiB blocks too (at most two): what large reads look at.
         for p in (a >> COARSE_SHIFT)..=((a + n - 1) >> COARSE_SHIFT) {
-            self.coarse[coarse_bucket(p)].fetch_max(seq, Ordering::SeqCst);
+            block(&self.coarse, &self.span.coarse, p).fetch_max(seq, Ordering::SeqCst);
         }
     }
 
     /// Whether some unfinished batch may write into one of `reads` (false:
     /// certainly none).
     fn may_overlap(&self, reads: &[(u64, u64)], done: u64) -> bool {
-        let big = super::tune::log_big();
+        self.may_overlap_as(reads, done, super::tune::log_big())
+    }
+
+    /// `may_overlap` with `tune log_big` given (tests).
+    fn may_overlap_as(&self, reads: &[(u64, u64)], done: u64, big: bool) -> bool {
         reads.iter().any(|&(a, n)| {
             if n == 0 {
                 return false;
             }
             let (first, last) = (a >> PAGE_SHIFT, (a + n - 1) >> PAGE_SHIFT);
-            let coarse = |b: &[AtomicU64; COARSE_BUCKETS]| {
+            let coarse = |b: &[AtomicU64; COARSE_BUCKETS], e: &[AtomicU64; SPAN_BLOCKS]| {
                 let (c0, c1) = (a >> COARSE_SHIFT, (a + n - 1) >> COARSE_SHIFT);
-                c1 - c0 >= COARSE_BUCKETS as u64 || (c0..=c1).any(|p| b[coarse_bucket(p)].load(Ordering::SeqCst) > done)
+                c1 - c0 >= COARSE_BUCKETS as u64 || (c0..=c1).any(|p| block(b, e, p).load(Ordering::SeqCst) > done)
             };
             // Large reads go by the coarse buckets alone (every write marks
             // its own: until 2026-10-28 reads of 4 MiB or more always took
             // the log's lock, front end 2's ~113 MB pools at every binding).
             if last - first >= 64 {
-                return coarse(&self.coarse);
+                return coarse(&self.coarse, &self.span.coarse);
             }
             // Small ones by their pages and the large writes' 4 MiB
             // buckets (a small write marks its pages: `tune log_big`).
-            (first..=last).any(|p| self.pages[page_bucket(p)].load(Ordering::SeqCst) > done) || coarse(if big { &self.big } else { &self.coarse })
+            (first..=last).any(|p| self.page(p).load(Ordering::SeqCst) > done) || if big { coarse(&self.big, &self.span.big) } else { coarse(&self.coarse, &self.span.coarse) }
         })
     }
 
@@ -4431,12 +4488,13 @@ impl RangeLog {
 mod range_log_tests {
     use super::*;
 
-    static LOG: RangeLog = RangeLog::new();
+    static SPAN: SpanMarks = SpanMarks::new();
+    static LOG: RangeLog = RangeLog::new(&SPAN);
 
-    /// The write log's buckets never pass a read that overlaps a pending
+    /// The write log's entries never pass a read that overlaps a pending
     /// write, small or large (`tune log_big`: small reads go by their pages
-    /// and the large writes' 4 MiB buckets), and large reads go by every
-    /// write's 4 MiB buckets.
+    /// and the large writes' 4 MiB blocks), and large reads go by every
+    /// write's 4 MiB blocks; exact inside the guest span, hashed beyond it.
     #[test]
     fn buckets_find_every_overlapping_write() {
         let mut x = 0x9E37_79B9_7F4A_7C15u64;
@@ -4446,7 +4504,9 @@ mod range_log_tests {
             x ^= x << 17;
             x
         };
-        let base = 0x10_0000_0000u64;
+        // (Reads and writes reach past the guest span's end: the exact
+        // entries inside it, the buckets beyond.)
+        let base = super::super::resident::MIRROR_END - (1 << 30);
         for round in 0..300u64 {
             // This round's writes are the pending ones (earlier rounds' are
             // done).
@@ -4465,7 +4525,9 @@ mod range_log_tests {
                 let n = if next() % 8 == 0 { next() % (96 << 20) + 1 } else { next() % (128 << 10) + 1 };
                 let overlaps = writes.iter().any(|&(wa, wn)| wa < a + n && a < wa + wn);
                 if overlaps {
-                    assert!(LOG.may_overlap(&[(a, n)], done), "round {round}: read {a:#x}+{n:#x} passed a pending write");
+                    for big in [false, true] {
+                        assert!(LOG.may_overlap_as(&[(a, n)], done, big), "round {round} (log_big {big}): read {a:#x}+{n:#x} passed a pending write");
+                    }
                 }
             }
         }
@@ -4492,11 +4554,13 @@ pub fn write_logs_line() -> String {
 /// writes and deferred CP writes): a queue that passed a label wait on a
 /// promise (`Cp::wait`) runs ahead of the batch writing the label and must
 /// not read on the CPU what such batches write.
-static INFLIGHT: RangeLog = RangeLog::new();
+static INFLIGHT: RangeLog = RangeLog::new(&INFLIGHT_SPAN);
+static INFLIGHT_SPAN: SpanMarks = SpanMarks::new();
 /// Deferred CP writes that later GPU work may read (performed by the
 /// completion thread once their batch finished): a batch binding such a
 /// range is submitted only after that.
-static CP_WRITES: RangeLog = RangeLog::new();
+static CP_WRITES: RangeLog = RangeLog::new(&CP_WRITES_SPAN);
+static CP_WRITES_SPAN: SpanMarks = SpanMarks::new();
 
 /// Held executors' reads of their own held writes logged (diagnostics).
 static HELD_OWN_LOGGED: AtomicU64 = AtomicU64::new(0);
