@@ -137,8 +137,6 @@ pub fn without_gpu_chains<T>(f: impl FnOnce() -> T) -> T {
 thread_local! {
     /// Set while `with_lod_stats` runs.
     static LOD_MEASURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Set while `with_lod_pass` runs.
-    static LOD_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Runs `f` with the pixel stages it prepares keeping their LOD statistics
@@ -147,20 +145,6 @@ thread_local! {
 pub fn with_lod_stats<T>(f: impl FnOnce() -> T) -> T {
     LOD_MEASURE.with(|c| c.set(true));
     let r = f();
-    LOD_MEASURE.with(|c| c.set(false));
-    r
-}
-
-/// Runs `f` with the pixel stage it prepares made for a measuring draw's
-/// pass of its own (`tune lod_pass`): with the LOD statistics and its depth
-/// tests before the shader (the pass tests EQUAL against the depth the draw
-/// wrote and writes nothing else, so only the draw's visible fragments run
-/// it).
-pub fn with_lod_pass<T>(f: impl FnOnce() -> T) -> T {
-    LOD_MEASURE.with(|c| c.set(true));
-    LOD_PASS.with(|c| c.set(true));
-    let r = f();
-    LOD_PASS.with(|c| c.set(false));
     LOD_MEASURE.with(|c| c.set(false));
     r
 }
@@ -1466,7 +1450,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         mip_views: super::tune::mip_views(),
         lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
         lod_lean: super::tune::lod_stats() == 4,
-        early_tests: ctx(DB_SHADER_CONTROL) & (1 << 12) != 0 || LOD_PASS.with(|c| c.get()),
+        early_tests: ctx(DB_SHADER_CONTROL) & (1 << 12) != 0,
         early_ok: early_ok(&ctx),
         per_lane: false,
         lane_votes: false,

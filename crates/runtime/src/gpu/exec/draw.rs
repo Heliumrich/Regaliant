@@ -962,21 +962,10 @@ impl Exec {
         // others carry their textures' recent measurements (`lodstats`).
         let lod_rotated = ps.as_ref().is_some_and(shaders::lod_rotated);
         let lod_measure = lod_rotated && super::super::lodstats::rotate(&ps.as_ref().unwrap().resources);
-        // With `tune lod_pass` such a draw runs as rotated (no atomics: its
-        // hidden fragments can be rejected before the shader) and measures
-        // in a pass of its own after it (`lod_pass`, recorded after the
-        // draw): not batched, depth tested and written, no depth, stencil or
-        // coverage export, no alpha to coverage.
-        let pass_ok = lod_measure && super::super::tune::lod_pass() && !batched && gpu_pair.is_none() && reg(0x28800) & 6 == 6 && reg(0x2880C) & (0x7 | 0x3 << 7) == 0 && reg(0x28B70) & 1 == 0;
-        let mut lod_pass: Option<Prepared> = None;
         if lod_measure {
-            let p = if pass_ok { shaders::with_lod_pass(|| shaders::prepare_ps(cp))? } else { shaders::with_lod_stats(|| shaders::prepare_ps(cp))? };
+            let p = shaders::with_lod_stats(|| shaders::prepare_ps(cp))?;
             super::super::lodstats::bound(&p.resources);
-            if pass_ok {
-                lod_pass = Some(p);
-            } else {
-                ps = Some(p);
-            }
+            ps = Some(p);
         }
         self.sync_readers = [vs.addr, ps.as_ref().map_or(0, |p| p.addr)];
         // Each stage's reads in place (no combined copy per draw).
@@ -997,13 +986,10 @@ impl Exec {
             vs = prep_vs(cp)?;
             ps = match ps_addr {
                 0 => None,
-                _ if lod_measure && lod_pass.is_none() => Some(shaders::with_lod_stats(|| shaders::prepare_ps(cp))?),
+                _ if lod_measure => Some(shaders::with_lod_stats(|| shaders::prepare_ps(cp))?),
                 _ => Some(shaders::prepare_ps(cp)?),
             };
-            if lod_pass.is_some() {
-                lod_pass = Some(shaders::with_lod_pass(|| shaders::prepare_ps(cp))?);
-            }
-            if let Some(p) = lod_pass.as_ref().or(ps.as_ref()).filter(|_| lod_rotated) {
+            if let Some(p) = ps.as_ref().filter(|_| lod_rotated) {
                 match lod_measure {
                     true => super::super::lodstats::bound(&p.resources),
                     false => super::super::lodstats::carry(&p.resources),
@@ -1306,12 +1292,10 @@ impl Exec {
         }
         self.keys_scratch = used;
         lap.mark(8);
-        // Resources (with room for a measuring pass's SGPR data: its
-        // reservation must not end the batch inside the draw's rendering).
-        match (&ps, &lod_pass) {
-            (Some(p), Some(m)) => self.reserve(&[&vs, p, m], push),
-            (Some(p), None) => self.reserve(&[&vs, p], push),
-            (None, _) => self.reserve(&[&vs], push),
+        // Resources.
+        match &ps {
+            Some(p) => self.reserve(&[&vs, p], push),
+            None => self.reserve(&[&vs], push),
         }
         if self.stopped {
             return Err(super::STOPPED.into());
@@ -1761,63 +1745,6 @@ impl Exec {
             }
         }
         lap.mark(16);
-        // A measuring draw's pass of its own (`tune lod_pass`): the pixel
-        // stage with the LOD statistics and its depth tests before the
-        // shader, depth EQUAL against what the draw just wrote, no depth,
-        // stencil or color writes: only the draw's visible fragments count
-        // (the console counts those its early test passes), and the draw
-        // itself, without atomics, lets the driver reject hidden fragments.
-        let mut pass_done = false;
-        if let Some(mut pm) = lod_pass.take() {
-            let key2 = GfxKey { ps: pm.tr.key, masks: [0; MAX_RT], ..key };
-            let push2 = super::push_fits(&[&vs, &pm]);
-            let fits = z_test && z_write && push2 && ps.is_some() && bounds.len() == 2 && self.rendering.is_some();
-            let done = fits && {
-                let hkey2 = super::push_key(hash_gfx_key(&key2), push2);
-                let p2 = match gfx_pipe(hkey2) {
-                    Some(x) => x,
-                    None => gfx_pipe_with(&key2, hkey2, (&**vs.tr, vs.addr), Some((&**pm.tr, pm.addr)), push2, &std::cell::Cell::new(false))?,
-                };
-                let mut b2 = self.bind_stage(&mut pm, false)?;
-                self.bind_sgpr(&pm, &mut b2)?;
-                if self.stopped {
-                    return Err(super::STOPPED.into());
-                }
-                let ok = p2.push && self.rendering.is_some();
-                let main_ps = std::mem::replace(&mut bounds[1], b2);
-                if ok {
-                    let c = ctx();
-                    let cmd = self.cmd();
-                    let dc = &mut self.dyncache;
-                    unsafe {
-                        super::note_vk(super::VK_GFX_PIPELINES);
-                        c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, p2.pipeline);
-                        dc.pipeline = p2.pipeline;
-                        super::bind_descriptors(cmd, vk::PipelineBindPoint::GRAPHICS, p2.layout, None, &bounds, &mut dc.pushed[0], true);
-                        super::push_sgpr_bases(cmd, p2.layout, false, &bounds);
-                        if dc.set(6, 0) {
-                            c.device.cmd_set_depth_write_enable(cmd, false);
-                        }
-                        if dc.set(7, vk::CompareOp::EQUAL.as_raw() as u64) {
-                            c.device.cmd_set_depth_compare_op(cmd, vk::CompareOp::EQUAL);
-                        }
-                        if dc.set(9, 0) {
-                            c.device.cmd_set_stencil_test_enable(cmd, false);
-                        }
-                        let base_vertex = a.base_vertex.unwrap_or(reg(0x28408) as i32);
-                        match a.index {
-                            Some(_) => c.device.cmd_draw_indexed(cmd, a.count, a.instances, 0, base_vertex, a.first_instance),
-                            None => c.device.cmd_draw(cmd, a.count, a.instances, base_vertex as u32, a.first_instance),
-                        }
-                    }
-                }
-                let b2 = std::mem::replace(&mut bounds[1], main_ps);
-                self.recycle(b2);
-                ok
-            };
-            super::super::lodstats::PASSES[if done { 0 } else { 1 }].fetch_add(1, Ordering::Relaxed);
-            pass_done = done;
-        }
         // Another draw like it can be recorded on the state this one left
         // (`draw_repeat`): GPU-read arguments, indices and arguments in
         // homes, no buffer writes, no timestamps around it.
@@ -1825,8 +1752,7 @@ impl Exec {
         // (Not after a batched draw: its pipeline's vertex stage reads its
         // SGPR data from the run's table by draw index.)
         let repeat = match (&index_home, a.index) {
-            // (Nor after a measuring pass: its pipeline and depth state.)
-            _ if batched || pass_done => None,
+            _ if batched => None,
             (Some(ih), Some((_, size))) if a.base_inst.is_some() && untimed && no_writes && self.recording && super::super::tune::draw_repeat() && !sync_mode() => {
                 Some(Repeat { batch: self.batch_count, uses: 0, index: (0, size, 0), index_buf: ih.0, index_off: ih.1 })
             }
