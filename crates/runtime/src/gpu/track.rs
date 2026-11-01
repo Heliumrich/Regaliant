@@ -644,7 +644,6 @@ pub fn remapped(base: u64, len: u64, op: u8) {
     super::exec::note_remap_over_imports(base, len, op);
     super::precache::invalidate(base, len);
     super::homes::remapped(base, len);
-    super::keep::remapped(base, len);
     // Page states are reset by `resident::settled` after the change, under
     // `resident::remap_guard`: reset here, before it, armed pages stayed
     // read-only without being marked ours until the change landed, and a

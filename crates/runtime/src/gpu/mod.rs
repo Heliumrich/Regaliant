@@ -14,7 +14,6 @@ pub mod emucheck;
 pub mod frameahead;
 pub mod frameprobe;
 pub mod hitch;
-pub mod keep;
 pub mod runprobe;
 pub mod smalltrack;
 /// Run-time switches for A/B measurements within one run (`tune <name>
@@ -32,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 224] = [
+    static ALL: [Tunable; 223] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -192,7 +191,6 @@ pub mod tune {
         Tunable { name: "skip_steps", env: "DS_SKIP_STEPS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "stencil_export", env: "DS_STENCIL_EXPORT", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_share_min", env: "DS_SHADOW_SHARE_MIN", default: 16384, value: AtomicU64::new(UNSET) },
-        Tunable { name: "keep_small", env: "DS_KEEP_SMALL", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "frame_ahead", env: "DS_FRAME_AHEAD", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_runs", env: "DS_PAST_RUNS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_drop", env: "DS_PAST_DROP", default: 0, value: AtomicU64::new(UNSET) },
@@ -1812,22 +1810,13 @@ pub mod tune {
         get(158)
     }
 
-    /// Small written windows (under 256 KiB, where dispatches got per-batch
-    /// shadows) kept in video memory across batches, written back to guest
-    /// memory only for readers there (`gpu::keep`); 0 off (windows kept so
-    /// far are written back and dropped by their queues).
-    #[inline]
-    pub fn keep_small() -> bool {
-        get(159) != 0
-    }
-
     /// Frame-ahead recording (`gpu::frameahead`): a second graphics
     /// recorder takes the next frame while the graphics command processor
     /// finishes the current one; 1: what it records is dropped at the flip
     /// (stage 1, a measurement); 0 off.
     #[inline]
     pub fn frame_ahead() -> u64 {
-        get(160)
+        get(159)
     }
 
     /// The graphics command processor records past its parallel runs
@@ -1837,14 +1826,14 @@ pub mod tune {
     /// +0.8% at the gate, FINDINGS.md 2026-10-23); 0 off.
     #[inline]
     pub fn past_runs() -> bool {
-        get(161) != 0
+        get(160) != 0
     }
 
     /// Diagnosis: what it recorded past a run is always dropped (the path
     /// that records it again, tested).
     #[inline]
     pub fn past_drop() -> bool {
-        get(162) != 0
+        get(161) != 0
     }
 
     /// The title's convolution reverb computed (`hle::libs::acm_conv`,
@@ -1852,14 +1841,14 @@ pub mod tune {
     /// 2026-10-23).
     #[inline]
     pub fn acm_reverb() -> bool {
-        get(163) != 0
+        get(162) != 0
     }
 
     /// The graphics CP's label waits of 1 ms or more still to be logged in
     /// detail (`tune trace_waits <n>`: the next n, wherever they happen;
     /// `DS_TRACE_WAITS=<queue>` logs a queue's first 200 from the start).
     pub fn take_trace_waits() -> bool {
-        get(164) > 0 && ALL[165].value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| if v != UNSET && v > 0 { Some(v - 1) } else { None }).is_ok()
+        get(163) > 0 && ALL[165].value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| if v != UNSET && v > 0 { Some(v - 1) } else { None }).is_ok()
     }
 
     /// The graphics CP's planning of parallel runs without its costliest
@@ -1868,7 +1857,7 @@ pub mod tune {
     /// the instance-offset slot's last answer reused; 0: as before (A/B).
     #[inline]
     pub fn plan_fast() -> bool {
-        get(165) != 0
+        get(164) != 0
     }
 
     /// Programs compiled in the background at their first use, their
@@ -1883,7 +1872,7 @@ pub mod tune {
     /// ms a frame for minutes; FINDINGS.md 2026-10-24).
     #[inline]
     pub fn async_particles() -> u64 {
-        get(166)
+        get(165)
     }
 
     /// A dispatch's new VRAM shadows get the guest data in the batch's
@@ -1896,7 +1885,7 @@ pub mod tune {
     /// a barrier between). 0: as before.
     #[inline]
     pub fn shadow_pre() -> bool {
-        get(167) != 0
+        get(166) != 0
     }
 
     /// The fewest bytes a read-only binding inside a range GPU work writes
@@ -1906,7 +1895,7 @@ pub mod tune {
     /// copied back for every reading batch (a vista: ~54 MB a frame).
     #[inline]
     pub fn home_read_min() -> u64 {
-        match get(168) {
+        match get(167) {
             0 => pre_max() + 1,
             v => v,
         }
@@ -1920,7 +1909,7 @@ pub mod tune {
     /// most 12 MiB: both copies fit a segment of `SHADOW_BYTES`).
     #[inline]
     pub fn shadow_max() -> u64 {
-        get(169).min(12 << 20)
+        get(168).min(12 << 20)
     }
 
     /// Logical CPUs the compute queues' command processors run on (`prio`):
@@ -1931,7 +1920,7 @@ pub mod tune {
     /// changes where there is one such group), else a decimal mask.
     #[inline]
     pub fn acb_cpus() -> u64 {
-        get(170)
+        get(169)
     }
 
     /// Diagnostics, hosted runs (`hostcensus`): bit 1 arms shared copies
@@ -1940,7 +1929,7 @@ pub mod tune {
     /// counted (observation only).
     #[inline]
     pub fn host_census() -> u64 {
-        get(171)
+        get(170)
     }
 
     /// Hosted runs (`precache`, stage H4): shared batch-start copies clean
@@ -1948,35 +1937,35 @@ pub mod tune {
     /// write-watch take while all their pages stay armed.
     #[inline]
     pub fn pre_protect() -> bool {
-        get(172) != 0
+        get(171) != 0
     }
 
     /// Homes (`homes::create`) only over ranges the CPU did not write while
     /// they were watched for 30 frames; refused ones wait 600 frames.
     #[inline]
     pub fn home_cpu_check() -> bool {
-        get(173) != 0
+        get(172) != 0
     }
 
     /// Diagnostics (`placement`): sampled logical CPUs of the command
     /// processors and the title's job workers, by physical core.
     #[inline]
     pub fn placement() -> bool {
-        get(174) != 0
+        get(173) != 0
     }
 
     /// Logical CPUs (a decimal mask) of queue 0x50's command processor
     /// alone; 0: as the other compute queues (`acb_cpus`).
     #[inline]
     pub fn acb50_cpus() -> u64 {
-        get(175)
+        get(174)
     }
 
     /// Texture syncs test the exact guest range of each texture (default;
     /// 0: up to 16 bytes per texel, the old bound: `exec::texture_bytes`).
     #[inline]
     pub fn tex_exact() -> bool {
-        get(176) != 0
+        get(175) != 0
     }
 
     /// A write-watched home's check for CPU writes queries its pages with
@@ -1984,7 +1973,7 @@ pub mod tune {
     /// lock, as before).
     #[inline]
     pub fn home_check_unlocked() -> bool {
-        get(177) != 0
+        get(176) != 0
     }
 
     /// Read-only unbounded pointer bindings whose mapping ends within this
@@ -1993,7 +1982,7 @@ pub mod tune {
     /// across PCIe (0: never, the default).
     #[inline]
     pub fn pre_unsized() -> u64 {
-        get(178)
+        get(177)
     }
 
     /// A write-watched home's check for CPU writes covers the 2 MiB windows
@@ -2001,7 +1990,7 @@ pub mod tune {
     /// at once, as before).
     #[inline]
     pub fn home_check_win() -> bool {
-        get(179) != 0
+        get(178) != 0
     }
 
     /// GPU-resolved chains (RENDERER.md "GPU-resolved item passes"): 0 off,
@@ -2010,7 +1999,7 @@ pub mod tune {
     /// pairs), 2 compute programs only (front end 2's stage F3: the draws'
     /// runs cost more than they save, FINDINGS.md 2026-10-28).
     pub fn gpu_chains() -> u64 {
-        get(180)
+        get(179)
     }
 
     /// GPU-resolved chains' static ranges in a video-memory mirror armed
@@ -2020,7 +2009,7 @@ pub mod tune {
     /// diagnosis modes: 2 armed and copied, not read; 3 copied and read, not
     /// armed; 4 armed only; 5 copied only.
     pub fn gpu_mirror() -> u64 {
-        get(181)
+        get(180)
     }
 
     /// The graphics command processor records past a wait on a label a
@@ -2032,7 +2021,7 @@ pub mod tune {
     /// off.
     #[inline]
     pub fn past_waits() -> u64 {
-        get(182)
+        get(181)
     }
 
     /// A forwarded copy's entry also accepts, as words memory holds before
@@ -2042,7 +2031,7 @@ pub mod tune {
     /// the entry as the title's rewrite).
     #[inline]
     pub fn forward_earlier() -> bool {
-        get(183) != 0
+        get(182) != 0
     }
 
     /// The graphics CP forwards the per-view copies it records past a
@@ -2051,7 +2040,7 @@ pub mod tune {
     /// waited for the GPU).
     #[inline]
     pub fn forward_held() -> bool {
-        get(184) != 0
+        get(183) != 0
     }
 
     /// While most of a label's recent stretches past its waits were
@@ -2059,7 +2048,7 @@ pub mod tune {
     /// wait on it is gone past (a probe); 0: every one.
     #[inline]
     pub fn past_backoff() -> u64 {
-        get(185)
+        get(184)
     }
 
     /// Resident GPU-written data (`gpu::rgm`, RENDERER.md "Resident
@@ -2070,7 +2059,7 @@ pub mod tune {
     /// device's sparse buffers); 0 (default) off.
     #[inline]
     pub fn rgm() -> u64 {
-        get(186)
+        get(185)
     }
 
     /// Long parallel runs (RENDERER.md "Long parallel runs"): the graphics
@@ -2081,7 +2070,7 @@ pub mod tune {
     /// run's earlier writes before it is submitted. 0 (default) off.
     #[inline]
     pub fn long_runs() -> bool {
-        get(187) != 0
+        get(186) != 0
     }
 
     /// Batches the submission thread hands to Vulkan in one call when that
@@ -2089,7 +2078,7 @@ pub mod tune {
     /// each).
     #[inline]
     pub fn submit_coalesce() -> u64 {
-        get(188)
+        get(187)
     }
 
     /// Recording past a parallel run goes on at its submission's end into
@@ -2099,7 +2088,7 @@ pub mod tune {
     /// after the runs gone past (`Cp::chain_next`). Off by default: in the
     /// old front end it lost 2.8% (FINDINGS.md 2026-10-23).
     pub fn past_subs() -> bool {
-        get(189) != 0
+        get(188) != 0
     }
 
     /// A worker whose long-run chunk is recorded before its turn parks it
@@ -2107,7 +2096,7 @@ pub mod tune {
     /// of waiting for the turn; the thread that gives the parked chunk its
     /// turn commits it (`par::take_chunks`, `Run::grant`).
     pub fn par_park() -> bool {
-        get(190) != 0
+        get(189) != 0
     }
 
     /// A long run is chained after the graphics CP's own held work past the
@@ -2116,7 +2105,7 @@ pub mod tune {
     /// their checks, while the CP records on (`Cp::past_roll`); then the run's
     /// chunks get their turn.
     pub fn past_seal() -> bool {
-        get(191) != 0
+        get(190) != 0
     }
 
     /// Front end 2: a label wait that passed on a GPU queue's write (a
@@ -2127,7 +2116,7 @@ pub mod tune {
     /// (~340 times a flip at the gate) and the queue's checks take its
     /// GPU-written ranges again.
     pub fn fe2_gpu_waits() -> bool {
-        get(192) != 0
+        get(191) != 0
     }
 
     /// Front end 2: at its label a stretch past a label wait whose checks
@@ -2137,14 +2126,14 @@ pub mod tune {
     /// (`Exec::past_current_for`; 0: kept unchecked, as before 2026-10-29,
     /// when 59% of the vista's stretches bound such pages).
     pub fn past_check() -> bool {
-        get(193) != 0
+        get(192) != 0
     }
 
     /// Front end 2: a stretch past a label wait uploads the pages of its
     /// small bindings written within their hot window as they are when it
     /// runs, whatever its checks found (`fe2::hot_pages`; 0: as checked).
     pub fn past_hot() -> bool {
-        get(194) != 0
+        get(193) != 0
     }
 
     /// Front end 2: waits that release nothing new end no epoch: one that
@@ -2155,14 +2144,14 @@ pub mod tune {
     /// past_check`). Off, each counted as released by the CPU and ended
     /// an epoch (~85% of those left at the vista, 2026-10-29).
     pub fn fe2_quiet_waits() -> bool {
-        get(195) != 0
+        get(194) != 0
     }
 
     /// Flips a read that dropped a stretch past a label wait stops later
     /// stretches before it (doubled each time it drops one again, up to
     /// 32x); 0: for the rest of the session, as before 2026-10-29.
     pub fn past_conflict_hold() -> u64 {
-        get(196)
+        get(195)
     }
 
     /// Front end 2: where the graphics CP goes past a label wait, the long
@@ -2171,14 +2160,14 @@ pub mod tune {
     /// it (`Cp::wait_run_start`; the stretch's ~1,000 commands a flip were
     /// recorded serially by the CP).
     pub fn wait_runs() -> bool {
-        get(197) != 0
+        get(196) != 0
     }
 
     /// `tune wait_runs 2` (diagnosis): such runs go through indirect draws
     /// (their chunks read the arguments when they record; -8% at the vista,
     /// most chunks dropped for reads of the run's earlier writes).
     pub fn wait_runs_draws() -> bool {
-        get(197) >= 2
+        get(196) >= 2
     }
 
     /// Front end 2's write-back kernel empties the touched-page list itself
@@ -2186,7 +2175,7 @@ pub mod tune {
     /// and no barrier before it in each write-back (~234 a frame at the
     /// vista). Read when the kernel is made.
     pub fn fe2_scatter_reset() -> bool {
-        get(198) != 0
+        get(197) != 0
     }
 
     /// Front end 2's write-back counts pages and dwords into video memory
@@ -2194,7 +2183,7 @@ pub mod tune {
     /// before), copied into the host-visible counters every 64th
     /// write-back. Read when the kernel is made.
     pub fn fe2_scatter_dev() -> bool {
-        get(199) != 0
+        get(198) != 0
     }
 
     /// Front end 2's write-back counts as a full barrier for the
@@ -2203,20 +2192,20 @@ pub mod tune {
     /// write-back's barriers order it after all earlier work; ~180 a frame
     /// at the vista).
     pub fn fe2_cpw_light() -> bool {
-        get(200) != 0
+        get(199) != 0
     }
 
     /// The window (pages, whole 64-page words) a front end 2 take of at
     /// most 16 pages widens over the GPU-written pages around it
     /// (`fe2::widen`; 64: its word, as before 2026-10-29).
     pub fn fe2_wide_pages() -> u64 {
-        get(201)
+        get(200)
     }
 
     /// The shortest run the parallel planner splits whatever `par_min` and
     /// `par_min_compute` say (`par::floor`; 48 as before 2026-10-29).
     pub fn par_floor() -> u64 {
-        get(202)
+        get(201)
     }
 
     /// Front end 2 (with `fe2_quiet_waits`): a wait the CPU released that
@@ -2224,7 +2213,7 @@ pub mod tune {
     /// no epoch when no CPU write to the label's page was found since (each
     /// such pass takes the page: `fe2::label_page_gen`).
     pub fn fe2_label_track() -> bool {
-        get(203) != 0
+        get(202) != 0
     }
 
     /// Timing only (a title thread that sees a label may read data older
@@ -2232,7 +2221,7 @@ pub mod tune {
     /// GPU performs; what the batch's work wrote reaches guest memory at its
     /// close (the upper bound of write-backs only where the CPU reads).
     pub fn fe2_cpw_close() -> bool {
-        get(204) != 0
+        get(203) != 0
     }
 
     /// Front end 2 (default since 2026-10-29: +2.5% at the vista over four
@@ -2245,7 +2234,7 @@ pub mod tune {
     /// title thread may poll them). Left open: a title thread polling a label
     /// our CPs wait on too, and reading data before the batch completes.
     pub fn fe2_cpw_waited() -> bool {
-        get(205) != 0
+        get(204) != 0
     }
 
     /// Front end 2: the placement checks of the graphics CP's stages
@@ -2254,20 +2243,20 @@ pub mod tune {
     /// the epoch now, which holds to the commands' turns within a run;
     /// uploads stay the CP's (`fe2::precheck`).
     pub fn fe2_precheck() -> bool {
-        get(206) != 0
+        get(205) != 0
     }
 
     /// `fe2_precheck`'s mode: 1 the checks made after a stage's result is
     /// posted, 2 before it (the CP then waits for a running slot's checks).
     pub fn fe2_precheck_mode() -> u64 {
-        get(206)
+        get(205)
     }
 
     /// Front end 2: a run of pages M lacks that a take of this epoch already
     /// looked at (`fe2::taken_lacking`: found written then, or uploaded by a
     /// batch not queued yet) is uploaded without another take.
     pub fn fe2_taken_upload() -> bool {
-        get(207) != 0
+        get(206) != 0
     }
 
     /// The write logs (`exec::RangeLog`) answer a small read from their
@@ -2277,7 +2266,7 @@ pub mod tune {
     /// (replay A/Bs: CPU per command 0.996-0.998).
     #[inline]
     pub fn log_big() -> bool {
-        get(208) != 0
+        get(207) != 0
     }
 
     /// Front end 2's word scan merges the runs of pages that need a check
@@ -2286,7 +2275,7 @@ pub mod tune {
     /// (replay A/Bs: CPU per command 0.994-0.996).
     #[inline]
     pub fn fe2_mine_fast() -> bool {
-        get(209) != 0
+        get(208) != 0
     }
 
     /// The GPU executors' lookups of a guest mapping's bounds (every range
@@ -2297,7 +2286,7 @@ pub mod tune {
     /// 0.998 without).
     #[inline]
     pub fn vma_cache() -> bool {
-        get(210) != 0
+        get(209) != 0
     }
 
     /// Before a GPU-performed CP write of a label our command processors
@@ -2307,7 +2296,7 @@ pub mod tune {
     /// writes them in order, so a title thread that sees a label may read
     /// the timestamps before it; left open as there.
     pub fn ts_cpw_waited() -> bool {
-        get(211) != 0
+        get(210) != 0
     }
 
     /// Pixel programs that write no memory run their depth and stencil
@@ -2318,7 +2307,7 @@ pub mod tune {
     /// so the LOD statistics' atomics had every rasterized fragment shaded.
     /// Read when a pixel program is prepared.
     pub fn early_auto() -> bool {
-        get(212) != 0
+        get(211) != 0
     }
 
     /// Timing only at 0 (GPU writes then never reach guest memory: the
@@ -2326,7 +2315,7 @@ pub mod tune {
     /// translations, with the write-backs they feed): translations leave
     /// front end 2's write marks out. Read when a stage is prepared.
     pub fn write_marks() -> bool {
-        get(213) != 0
+        get(212) != 0
     }
 
     /// The mirror's backing granule in pages of 64 KiB (a power of two; 0,
@@ -2335,7 +2324,7 @@ pub mod tune {
     /// bind with whatever other threads claimed meanwhile
     /// (`resident::back_in`).
     pub fn fe2_back_granule() -> u64 {
-        get(223)
+        get(222)
     }
 
     /// LOD statistics of pixel programs whose depth tests stay after the
@@ -2349,7 +2338,7 @@ pub mod tune {
     /// measurements; 0 (diagnosis): none measures, so the title's texture
     /// streaming lacks those textures' statistics.
     pub fn lod_late() -> u64 {
-        get(214)
+        get(213)
     }
 
     /// With `lod_late` 1: draws binding no texture whose T# enables
@@ -2358,7 +2347,7 @@ pub mod tune {
     /// at 1-3, -2.1% of a replayed frame's GPU time, FINDINGS.md
     /// 2026-10-30 midday); 0: every draw keeps them (the reference).
     pub fn lod_skip() -> bool {
-        get(215) != 0
+        get(214) != 0
     }
 
     /// Front end 2 stage F4's first step: uploads of 2D and array textures
@@ -2375,7 +2364,7 @@ pub mod tune {
     /// 8 since 2026-10-30 (Castlewall's arrival and the 1-1 walks, FINDINGS.md
     /// 2026-10-30 evening); 0: all detiled on the CPU.
     pub fn gpu_detile() -> u64 {
-        get(216)
+        get(215)
     }
 
     /// Texture uploads detiled on the CPU (those under `gpu_detile`'s size)
@@ -2384,7 +2373,7 @@ pub mod tune {
     /// once the copy is done (`images`; staging freed at its fence). 0: each
     /// waits for its transfer on the main queue (`upload_async` aside).
     pub fn upload_copy() -> bool {
-        get(217) != 0
+        get(216) != 0
     }
 
     /// Timing only at 0 (GPU writes then never reach guest memory; replays
@@ -2394,7 +2383,7 @@ pub mod tune {
     /// what the marks cost (diagnosis, 2026-10-31). Read when a stage is
     /// prepared.
     pub fn mark_touch() -> bool {
-        get(218) != 0
+        get(217) != 0
     }
 
     /// Front end 2: translations set their stores' pages' touched bits
@@ -2403,7 +2392,7 @@ pub mod tune {
     /// bits of its executor's written ranges first (`kernels::mirror_compact`,
     /// from the first such translation on). Read when a stage is prepared.
     pub fn touch_bits() -> bool {
-        get(219) != 0
+        get(218) != 0
     }
 
     /// Texture uploads detiled on the CPU that waited for their transfer on
@@ -2414,7 +2403,7 @@ pub mod tune {
     /// 24% less hitch time, level loads' hitches lower, content drawn
     /// sooner; FINDINGS.md); 0 waits for each transfer as before.
     pub fn upload_batch() -> bool {
-        get(220) != 0
+        get(219) != 0
     }
 
     /// Batches recorded into lists that the submission thread replays into
@@ -2426,7 +2415,7 @@ pub mod tune {
     /// -6.6%, +1% at the vista, Castlewall +2%; 2 lost 1.2% in replays:
     /// FINDINGS.md).
     pub fn record_defer() -> u64 {
-        get(221)
+        get(220)
     }
 
     /// A large zero fill under front end 2 stores into guest memory only
@@ -2437,7 +2426,7 @@ pub mod tune {
     /// vista frame, in front of a label). Live; default 1 since 2026-10-31
     /// (the vista +3%, GPU busy -1.8 ms a frame; tour clean: FINDINGS.md).
     pub fn fill_partial() -> bool {
-        get(222) != 0
+        get(221) != 0
     }
 
 

@@ -23,7 +23,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod draw;
-pub mod kept;
 pub mod rgm;
 pub(crate) use draw::{color_surface, depth_surface, set_equal_bias, toggle_skip_vs};
 
@@ -5457,8 +5456,6 @@ struct Slot {
     homes: Vec<std::sync::Arc<super::homes::HomeBuf>>,
     /// Shared copy chunks the slot's batch binds (kept until it completes).
     keep: Vec<std::sync::Arc<super::precache::Chunk>>,
-    /// Kept windows' video memory the slot's batch binds (`gpu::keep`).
-    kept: Vec<std::sync::Arc<super::keep::Slot>>,
     /// Timestamp queries and their copied results for CP timestamp writes
     /// the GPU performs (`Exec::gpu_timestamp`; made on first use).
     ts: Option<(vk::QueryPool, vk::Buffer)>,
@@ -5593,7 +5590,6 @@ impl Slot {
                 xpre,
                 homes: Vec::new(),
                 keep: Vec::new(),
-                kept: Vec::new(),
                 ts: None,
                 cpool: pool,
                 xcpool: xpool,
@@ -7521,11 +7517,6 @@ pub struct Exec {
     /// End-of-pipe timestamps of the batch whose readback and store wait for
     /// its end (`tune eop_light`).
     ts_deferred: Vec<TsEntry>,
-    /// Kept windows (`gpu::keep`) the recording batch took in (ids), wrote
-    /// and wrote back.
-    kept_taken: Vec<u64>,
-    kept_written: Vec<std::sync::Arc<super::keep::Kept>>,
-    kept_given: Vec<std::sync::Arc<super::keep::Kept>>,
     /// An end-of-pipe label write in the batch that later work is not
     /// ordered after (`tune eop_light`): a wait passing on it orders it
     /// (`order_after_open_writes`).
@@ -7572,7 +7563,7 @@ pub struct Exec {
     /// overlapped when last checked (direct-mapped by page), valid while the
     /// write generations are `clean_tag` (`sync_for_reads`).
     clean_pages: Vec<u64>,
-    clean_tag: [u64; 4],
+    clean_tag: [u64; 3],
     /// The reads `sync_for_reads` still checks (the vector reused).
     dirty_reads: Vec<(u64, u64)>,
     /// The written ranges (all, sized) this executor's last dispatch noted in
@@ -8413,9 +8404,6 @@ impl Exec {
                 ts_used: 0,
                 ts_pool_reset: false,
                 ts_deferred: Vec::new(),
-                kept_taken: Vec::new(),
-                kept_written: Vec::new(),
-                kept_given: Vec::new(),
                 eop_unordered: false,
                 ts_check: Vec::new(),
                 gpu_writes_open: false,
@@ -8435,7 +8423,7 @@ impl Exec {
                 own_gen: 0,
                 ops: [0; OPS],
                 clean_pages: vec![u64::MAX; CLEAN_SLOTS],
-                clean_tag: [u64::MAX; 4],
+                clean_tag: [u64::MAX; 3],
                 dirty_reads: Vec::new(),
                 last_notes: (Vec::new(), Vec::new(), [u64::MAX; 4]),
                 draw_bounds: Vec::new(),
@@ -8794,7 +8782,6 @@ impl Exec {
             self.slots[self.cur].seq = 0;
             self.slots[self.cur].homes.clear();
             self.slots[self.cur].keep.clear();
-            self.slots[self.cur].kept.clear();
             for (b, m, _) in std::mem::take(&mut self.slots[self.cur].stage_extra) {
                 unsafe {
                     ctx().device.destroy_buffer(b, None);
@@ -8950,9 +8937,6 @@ impl Exec {
         if let Err(e) = self.flush_resident(None) {
             self.report(format!("shadow write-back: {e}"));
         }
-        if let Err(e) = self.keep_end_batch() {
-            self.report(format!("kept window write-back: {e}"));
-        }
         if let Err(e) = self.rgm_merge(None) {
             self.report(format!("rgm merge: {e}"));
         }
@@ -9089,7 +9073,6 @@ impl Exec {
                 Vec::new()
             };
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
-            self.keep_submitted(0);
             let lists = std::mem::take(&mut self.batch_lists).then(super::vk::defer::release);
             self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), rgm_claims: std::mem::take(&mut self.rgm_claims), rgm_written: std::mem::take(&mut self.rgm_written), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists });
             self.res_mine.clear();
@@ -9232,7 +9215,6 @@ impl Exec {
         }
         self.rgm_batch_done(true);
         st.mark(10);
-        self.keep_submitted(seq);
         self.own_gen += 1;
         self.last_seq = seq;
         if has_actions {
@@ -9263,7 +9245,6 @@ impl Exec {
         if self.closed.is_empty() {
             self.open_gen.store(u64::MAX, Ordering::SeqCst);
         }
-        self.keep_submitted(0);
         self.end_rendering();
         unsafe { ctx().device.end_command_buffer(self.cmd()).ok() };
         self.actions.clear();
@@ -10809,7 +10790,6 @@ impl Exec {
             super::smalltrack::cp_write(base, len, true);
         }
         let Some((buffer, start, _)) = span(base, len) else { return Ok(false) };
-        self.keep_cp_write(base, len);
         // Resident shadows holding newer data of the range go back first:
         // their merge would undo the fill (and so would this batch's W writes').
         self.flush_resident(Some(&[(base, len)]))?;
@@ -11513,7 +11493,7 @@ impl Exec {
         if !super::tune::spec_reads() {
             return None;
         }
-        if stages.iter().any(|p| super::homes::any_stale(&p.reads) || super::keep::any_dirty(&p.reads)) {
+        if stages.iter().any(|p| super::homes::any_stale(&p.reads)) {
             SPEC_REFUSED[0].fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -11733,7 +11713,7 @@ impl Exec {
         let mut dirty = std::mem::take(&mut self.dirty_reads);
         dirty.clear();
         let reads: &[(u64, u64)] = if super::tune::clean_pages() {
-            let tag = [self.own_gen, INFLIGHT.notes.load(Ordering::Acquire), super::homes::STALE_ADDED.load(Ordering::Acquire), super::keep::DIRTY_GEN.load(Ordering::Acquire)];
+            let tag = [self.own_gen, INFLIGHT.notes.load(Ordering::Acquire), super::homes::STALE_ADDED.load(Ordering::Acquire)];
             if tag != self.clean_tag {
                 self.clean_pages.fill(u64::MAX);
                 self.clean_tag = tag;
@@ -11750,7 +11730,7 @@ impl Exec {
                         continue;
                     }
                     let whole = [(page << CLEAN_SHIFT, 1u64 << CLEAN_SHIFT)];
-                    if super::homes::any_stale(&whole) || super::keep::any_dirty(&whole) || self.overlaps_pending(&whole) || INFLIGHT.latest(&whole).is_some() {
+                    if super::homes::any_stale(&whole) || self.overlaps_pending(&whole) || INFLIGHT.latest(&whole).is_some() {
                         clean = false;
                         break;
                     }
@@ -11778,15 +11758,6 @@ impl Exec {
             waited.get_or_insert_with(std::time::Instant::now);
             self.home_write_back(reads);
             self.flush();
-        }
-        // So do kept windows GPU work wrote (`gpu::keep`).
-        match self.keep_reads(reads) {
-            Ok(true) => {
-                waited.get_or_insert_with(std::time::Instant::now);
-                self.flush();
-            }
-            Ok(false) => {}
-            Err(e) => self.report(format!("kept window write-back: {e}")),
         }
         lap(0, &mut t);
         if self.overlaps_pending(reads) {
@@ -12075,7 +12046,6 @@ impl Exec {
         // exactly, written in place: `resident::host_for_cp`).
         super::resident::host_for_cp(a, bytes);
         let Some((buffer, start, _)) = span(a, bytes) else { return false };
-        self.keep_cp_write(a, bytes);
         if self.recording && self.rgm_before_in_place(&[(a, bytes)]).is_err() {
             return false;
         }
@@ -12642,11 +12612,6 @@ impl Exec {
         if super::smalltrack::on() {
             for sh in &flush {
                 super::smalltrack::merged(sh.guest, sh.range, &self.name);
-            }
-        }
-        if super::tune::keep_small() {
-            for sh in &flush {
-                super::keep::note_merged(sh.guest, sh.range);
             }
         }
         if profiling() {
@@ -13354,7 +13319,6 @@ impl Exec {
             }
             s.homes.clear();
             s.keep.clear();
-            s.kept.clear();
             s.seq = 0;
         }
         self.deferred = false;
@@ -13623,7 +13587,6 @@ impl Exec {
             }
             s.homes.clear();
             s.keep.clear();
-            s.kept.clear();
             s.seq = 0;
         }
         self.held_promises.clear();
@@ -13789,21 +13752,6 @@ impl Exec {
                             self.home_bind(base, size, found.tr.plan.resources[i].written, if sized { HomeUse::Sized } else { HomeUse::Unbounded })
                                 .map(|h| (h.0, h.1, h.2))
                         });
-                        // A small window GPU work writes, kept in video memory
-                        // (`gpu::keep`): bound like a home.
-                        let home = match home {
-                            Some(h) => Some(h),
-                            None if super::keep::any() || super::tune::keep_small() => {
-                                let res = &found.tr.plan.resources[i];
-                                let create = allow_shadow && shadow_writes() && res.written && (res.atomic || size >= shadow_min());
-                                let k = self.keep_bind(base, size, res.written, !sized, create)?;
-                                if self.stopped {
-                                    return Err(STOPPED.into());
-                                }
-                                k
-                            }
-                            None => None,
-                        };
                         // Resident GPU-written data (`gpu::rgm`): sized bindings
                         // on the working copy W.
                         let mut from_rgm = false;
@@ -14549,7 +14497,7 @@ impl Exec {
         // run's planning does not wait for the arguments: the GPU reads
         // them, in order.
         // (So for a long parallel run's chunk, `long`.)
-        if !(self.deferred && (self.compute_cp || self.long)) && !(self.overlaps_pending(&r) || INFLIGHT.latest(&r).is_some() || CP_WRITES.latest(&r).is_some() || super::keep::holds(args, 12)) {
+        if !(self.deferred && (self.compute_cp || self.long)) && !(self.overlaps_pending(&r) || INFLIGHT.latest(&r).is_some() || CP_WRITES.latest(&r).is_some()) {
             return false;
         }
         // Arguments in a video-memory home: read by the CP after the home's
@@ -15149,16 +15097,13 @@ impl Exec {
                 }
                 Some((buffer, off))
             }
-            Some(a) => match self.keep_args(a)? {
-                Some(k) => Some(k),
-                None => {
-                    let (buffer, base, _) = span(a, 12).ok_or_else(|| format!("cs {:#x}: indirect arguments {a:#x} are not mapped GPU memory (dispatch skipped)", p.addr))?;
-                    if let Some(s) = CP_WRITES.latest(&[(a, 12)]) {
-                        self.submit_after = self.submit_after.max(s);
-                    }
-                    Some((buffer, a - base))
+            Some(a) => {
+                let (buffer, base, _) = span(a, 12).ok_or_else(|| format!("cs {:#x}: indirect arguments {a:#x} are not mapped GPU memory (dispatch skipped)", p.addr))?;
+                if let Some(s) = CP_WRITES.latest(&[(a, 12)]) {
+                    self.submit_after = self.submit_after.max(s);
                 }
-            },
+                Some((buffer, a - base))
+            }
             None => None,
         };
         // A batched program (`Spec::batched`): appended to the open batched
@@ -15610,7 +15555,6 @@ pub fn status() -> String {
         + &super::forward::status_line()
         + &super::rgm::status_line(super::FRAMES.load(Ordering::Relaxed))
         + &super::par::status()
-        + &super::keep::status()
         + &format!(
             "    batches submitted together (`tune submit_coalesce` {}): {} calls with {} batches
 ",

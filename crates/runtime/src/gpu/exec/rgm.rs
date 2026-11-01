@@ -59,7 +59,7 @@ impl Exec {
             rgm::refused(10);
             return None;
         }
-        if super::super::homes::overlaps(base, size) || super::super::tune::keep_small() {
+        if super::super::homes::overlaps(base, size) {
             rgm::refused(5);
             return None;
         }

@@ -904,7 +904,7 @@ pub fn compute(p: &Prepared, groups: [u32; 3], local: [u32; 3], busy: impl Fn(&[
     }
     let src_bytes = (in_src - 1) * src.stride as u64 + 4;
     let inputs = [(cb.base, 8), (src.base, src_bytes)];
-    if busy(&inputs) || super::homes::any_stale(&inputs) || super::keep::any_dirty(&inputs) || !super::cp::guest_readable(src.base, src_bytes) {
+    if busy(&inputs) || super::homes::any_stale(&inputs) || !super::cp::guest_readable(src.base, src_bytes) {
         trace_refusal(dst.base, 4 * count, &inputs, &busy);
         return refuse();
     }
@@ -950,9 +950,6 @@ fn trace_refusal(dst: u64, bytes: u64, inputs: &[(u64, u64); 2], busy: &impl Fn(
         }
         if super::homes::any_stale(&[r]) {
             v.push("a home's newer data");
-        }
-        if super::keep::any_dirty(&[r]) {
-            v.push("a kept window's newer data");
         }
         if v.is_empty() { "free".to_string() } else { v.join(", ") }
     };
