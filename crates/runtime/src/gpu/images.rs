@@ -889,56 +889,34 @@ fn note_upload_span(qp: vk::QueryPool, what: impl FnOnce() -> String) {
     }
 }
 
-/// A host-visible buffer texture data is uploaded from (`Images::staging`).
+/// A host-visible buffer texture data is uploaded from (one an upload
+/// makes for itself).
 struct Staging {
     buf: vk::Buffer,
     mem: vk::DeviceMemory,
     ptr: *mut u8,
-    cap: u64,
 }
 
-/// What an upload in flight holds until the GPU is done with it: its host
-/// staging buffer, the video-memory buffers it used (GPU detiling, or the
-/// copy queue's destination), and the copy queue's command buffer that
-/// filled them.
+/// What a GPU-detiled upload in flight holds until the GPU is done with it:
+/// the video-memory buffers it used and the copy queue's command buffer
+/// that filled them.
 struct Held {
-    staging: Option<Staging>,
     dev: Vec<(vk::Buffer, vk::DeviceMemory, u64)>,
     copy_cmd: Option<vk::CommandBuffer>,
 }
 
 impl Held {
-    fn staging(s: Staging) -> Held {
-        Held { staging: Some(s), dev: Vec::new(), copy_cmd: None }
-    }
-
     fn bytes(&self) -> u64 {
-        self.staging.as_ref().map_or(0, |s| s.cap) + self.dev.iter().map(|b| b.2).sum::<u64>()
+        self.dev.iter().map(|b| b.2).sum::<u64>()
     }
 }
 
-/// Staging buffers kept for reuse: up to this many bytes, each of at most
-/// STAGING_POOLED bytes (larger ones are made for their upload alone).
-/// None: a host-visible staging buffer kept after its upload made the
-/// driver refuse guest-memory imports thousands of times a session
-/// (FINDINGS.md 2026-10-24; with 128 MiB kept, `upload_async` failed 53,832
-/// imports in a tour, none kept 48 like the baseline).
-const STAGING_KEEP: u64 = 0;
-const STAGING_POOLED: u64 = 32 << 20;
-/// Uploads in flight, and their staging bytes, before the next one waits
-/// for the oldest. Unbounded bytes (up to 32 uploads of ~85 MB arrays, freed
-/// only at a later upload) made guest-memory imports fail by the ten
-/// thousand and preceded device losses (runs 20261013-083710, -084645).
-const MAX_INFLIGHT: usize = 32;
-/// The same for uploads with a copy-queue part (`tune upload_copy`, GPU
-/// detiling): their bytes are bounded by DETILE_INFLIGHT; an arrival's
-/// hundreds of small textures waited for the oldest at 32.
-const MAX_INFLIGHT_COPY: usize = 256;
-const MAX_INFLIGHT_BYTES: u64 = 128 << 20;
-/// Uploads that waited for an earlier one (`MAX_INFLIGHT`), and staging
-/// buffers made.
+/// GPU-detiled uploads in flight before the next one waits for the oldest
+/// (their bytes are bounded by DETILE_INFLIGHT; an arrival's hundreds of
+/// small textures waited for the oldest at 32).
+const MAX_INFLIGHT: usize = 256;
+/// Uploads that waited for an earlier one (`MAX_INFLIGHT`).
 static UPLOAD_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static STAGING_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `tune upload_batch`: uploads detiled on the CPU that would wait for their
 /// transfer on the main queue are recorded into one command buffer they all
@@ -1128,10 +1106,6 @@ static UPLOAD_TABLE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::ato
 /// differing, of them whose guest bytes changed during the upload, video-
 /// memory buffers made, uploads whose transfer ran on the copy queue].
 static GPU_DETILE: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
-
-/// CPU-detiled uploads whose staging buffer the copy queue copied into
-/// video memory (`tune upload_copy`).
-static COPY_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `DS_ZERO_CENSUS=1` (diagnosis): re-uploaded (mip, layer)s by cause (0 none,
 /// 1 a commit, 2 another mapping change, 3 a file read, 4 a CPU write, 5 a GPU
@@ -1323,7 +1297,6 @@ pub struct Images {
     /// waiting (command buffer, fence, its timestamps, the staging buffer it
     /// reads; oldest first) and the command buffers, fences and timestamps
     /// of completed ones.
-    staging_free: Vec<Staging>,
     inflight: std::collections::VecDeque<(vk::CommandBuffer, vk::Fence, vk::QueryPool, Held)>,
     spare_cmds: Vec<(vk::CommandBuffer, vk::Fence, vk::QueryPool)>,
     /// GPU detiling's video-memory buffers not in use: (buffer, memory,
@@ -2095,10 +2068,9 @@ static REFRESH_OUT: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atom
 
 /// Whether a re-upload of `key` detiles on the CPU into the upload command
 /// buffer the uploads share, as one left for after the lock does: 2D,
-/// smaller than `tune gpu_detile` MiB, `tune upload_batch` without
-/// `upload_async` or `upload_copy`.
+/// smaller than `tune gpu_detile` MiB, `tune upload_batch`.
 fn reupload_on_cpu(key: &ImageKey, t: &Tsharp) -> bool {
-    if key.ty3d || !super::tune::upload_batch() || super::tune::upload_async() || super::tune::upload_copy() {
+    if key.ty3d || !super::tune::upload_batch() {
         return false;
     }
     let Some(el) = elem_log2(t.format) else { return false };
@@ -2181,7 +2153,7 @@ fn prepare_reupload(job: &RefreshJob) -> Result<Prepared, String> {
         Chose::Parts(c) => c,
     };
     let (buf, mem, ptr) = ctx().host_buffer(total.max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
-    let st = Staging { buf, mem, ptr, cap: total.max(4) as u64 };
+    let st = Staging { buf, mem, ptr };
     let src = unsafe { std::slice::from_raw_parts(job.t.base as *const u8, end as usize) };
     let dst = unsafe { std::slice::from_raw_parts_mut(st.ptr, total) };
     detile_parts(&lay, src, &parts, dst);
@@ -2251,7 +2223,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
             let qp = upload_stamps();
-            *g = Some(Images { qp, map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, staging_free: Vec::new(), inflight: Default::default(), spare_cmds: Vec::new(), detile_free: Vec::new(), copy_pool: vk::CommandPool::null(), copy_spare: Vec::new(), copy_timeline: vk::Semaphore::null(), copy_value: 0, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default(), refreshing: HashMap::default() });
+            *g = Some(Images { qp, map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, inflight: Default::default(), spare_cmds: Vec::new(), detile_free: Vec::new(), copy_pool: vk::CommandPool::null(), copy_spare: Vec::new(), copy_timeline: vk::Semaphore::null(), copy_value: 0, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default(), refreshing: HashMap::default() });
         }
     }
     let im = g.as_mut().unwrap();
@@ -2342,37 +2314,6 @@ impl Images {
         }
     }
 
-    /// Records commands into the cache's command buffer and waits for them.
-    /// A staging buffer of at least `n` bytes: the smallest free one that
-    /// fits, else a new one (rounded up to a power of two from 1 MiB, so
-    /// they are reused, up to STAGING_POOLED).
-    fn staging(&mut self, n: u64) -> Result<Staging, String> {
-        if let Some(i) = self.staging_free.iter().enumerate().filter(|(_, s)| s.cap >= n).min_by_key(|(_, s)| s.cap).map(|(i, _)| i) {
-            return Ok(self.staging_free.swap_remove(i));
-        }
-        let cap = if n > STAGING_POOLED { n } else { n.max(1 << 20).next_power_of_two() };
-        let t0 = std::time::Instant::now();
-        let (buf, mem, ptr) = ctx().host_buffer(cap, vk::BufferUsageFlags::TRANSFER_SRC)?;
-        super::hitch::note_since(super::hitch::Kind::Upload, t0, || format!("a new staging buffer of {} MiB", cap >> 20));
-        STAGING_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Staging { buf, mem, ptr, cap })
-    }
-
-    /// A staging buffer the GPU is done with: kept for reuse or freed.
-    fn release_staging(&mut self, s: Staging) {
-        let kept: u64 = self.staging_free.iter().map(|s| s.cap).sum();
-        if s.cap <= STAGING_POOLED && kept + s.cap <= STAGING_KEEP {
-            self.staging_free.push(s);
-            return;
-        }
-        let d = &ctx().device;
-        unsafe {
-            d.destroy_buffer(s.buf, None);
-            d.unmap_memory(s.mem);
-            d.free_memory(s.mem, None);
-        }
-    }
-
     /// Recycles the uploads the GPU completed (in submission order); with
     /// more than `max` in flight or more than `max_bytes` of their staging
     /// buffers, waits for the oldest.
@@ -2396,11 +2337,7 @@ impl Images {
                 }
             }
             let (cmd, fence, qp, held) = self.inflight.pop_front().unwrap();
-            note_upload_span(qp, || match (&held.staging, held.dev.is_empty()) {
-                (Some(s), true) => format!(": texture upload from a {} KiB staging buffer", s.cap >> 10),
-                (Some(s), false) => format!(": texture upload from a {} KiB staging buffer through the copy queue", s.cap >> 10),
-                (None, _) => format!(": texture upload detiled on the GPU ({} KiB of buffers)", held.dev.iter().map(|b| b.2).sum::<u64>() >> 10),
-            });
+            note_upload_span(qp, || format!(": texture upload detiled on the GPU ({} KiB of buffers)", held.dev.iter().map(|b| b.2).sum::<u64>() >> 10));
             unsafe {
                 c.device.reset_fences(&[fence]).ok();
                 c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
@@ -2410,19 +2347,8 @@ impl Images {
         }
     }
 
-    /// Records and submits a transfer reading staging buffer `s` without
-    /// waiting for it: on the one queue it runs after the work submitted
-    /// before it and before batches submitted later, and its barriers order
-    /// it against the image's other uses; `reap` recycles it.
-    fn submit_upload(&mut self, s: Staging, f: impl FnOnce(vk::CommandBuffer)) {
-        self.submit_held(Held::staging(s), MAX_INFLIGHT_BYTES, None, f);
-    }
-
     /// What an upload the GPU is done with (or that was not submitted) held.
     fn release_held(&mut self, held: Held) {
-        if let Some(s) = held.staging {
-            self.release_staging(s);
-        }
         self.release_detile(held.dev);
         if let Some(x) = held.copy_cmd {
             unsafe { ctx().device.reset_command_buffer(x, vk::CommandBufferResetFlags::empty()).ok() };
@@ -2474,14 +2400,16 @@ impl Images {
         Some((self.copy_pool, self.copy_timeline))
     }
 
-    /// `submit_upload` for what `s` holds, with up to `max_bytes` of such
-    /// buffers in flight, after the copy queue's timeline reaches `wait`
+    /// Records and submits a transfer reading what `s` holds without waiting
+    /// for it (on the one queue it runs after the work submitted before it
+    /// and before batches submitted later, and its barriers order it against
+    /// the image's other uses; `reap` recycles it), with up to `max_bytes` of
+    /// such buffers in flight, after the copy queue's timeline reaches `wait`
     /// (semaphore, value) when given.
     fn submit_held(&mut self, s: Held, max_bytes: u64, wait: Option<(vk::Semaphore, u64)>, f: impl FnOnce(vk::CommandBuffer)) {
         // (After the batched uploads recorded before it, `tune upload_batch`.)
         flush_uploads();
-        let max = if s.copy_cmd.is_some() || !s.dev.is_empty() { MAX_INFLIGHT_COPY } else { MAX_INFLIGHT };
-        self.reap(max - 1, max_bytes.saturating_sub(s.bytes()));
+        self.reap(MAX_INFLIGHT - 1, max_bytes.saturating_sub(s.bytes()));
         let c = ctx();
         let (cmd, fence, qp) = match self.spare_cmds.pop() {
             Some(x) => x,
@@ -3000,7 +2928,7 @@ impl Images {
             match self.submit_copy_part(pool, sem, record_copies) {
                 Some((x, v)) => {
                     GPU_DETILE[10].fetch_add(1, Relaxed);
-                    let held = Held { staging: None, dev: vec![tbuf, lbuf], copy_cmd: Some(x) };
+                    let held = Held { dev: vec![tbuf, lbuf], copy_cmd: Some(x) };
                     if readback.is_some() {
                         self.one_shot_after(Some((sem, v)), record);
                         self.release_held(held);
@@ -3014,7 +2942,7 @@ impl Images {
                 }
             }
         } else {
-            self.submit_held(Held { staging: None, dev: vec![tbuf, lbuf], copy_cmd: None }, DETILE_INFLIGHT, None, record);
+            self.submit_held(Held { dev: vec![tbuf, lbuf], copy_cmd: None }, DETILE_INFLIGHT, None, record);
         }
         // DS_GPU_DETILE_CHECK=1: each part against the CPU's detiling of the
         // tiled bytes the GPU copied (laid out at their texture offsets).
@@ -3158,21 +3086,15 @@ impl Images {
                 }
             }
         }
-        // (`tune upload_copy`: the staging buffer's copy on the copy queue,
-        // not waited for.)
-        let via_copy = if super::tune::upload_copy() { self.copy_parts() } else { None };
-        let asynchronous = super::tune::upload_async() || via_copy.is_some();
-        let st = if asynchronous {
-            self.staging(total.max(4) as u64)?
-        } else {
-            // Uploads waited for get a staging buffer of their own, freed
-            // after them: one kept across uploads made the driver refuse to
-            // import guest memory windows thousands of times a session
-            // (2026-10-24: 3,000-75,000 failed imports against 48, then
-            // unmapped textures and device losses at cold boots; the pooled
-            // buffers of `tune upload_async` likewise).
+        // A staging buffer of its own, freed after the upload: one kept
+        // across uploads made the driver refuse to import guest memory
+        // windows thousands of times a session (2026-10-24: 3,000-75,000
+        // failed imports against 48, then unmapped textures and device losses
+        // at cold boots; the pooled buffers of the removed `tune
+        // upload_async` likewise).
+        let st = {
             let (buf, mem, ptr) = ctx().host_buffer(total.max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
-            Staging { buf, mem, ptr, cap: total.max(4) as u64 }
+            Staging { buf, mem, ptr }
         };
         let t_alloc = std::time::Instant::now();
         let dst = unsafe { std::slice::from_raw_parts_mut(st.ptr, total) };
@@ -3224,31 +3146,6 @@ impl Images {
         let t_copy = std::time::Instant::now();
         UPLOAD_SPLIT[1].fetch_add((t_copy - t_stage).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let record = |cmd: vk::CommandBuffer| record_upload(cmd, image, first, buf, &regions, base);
-        // Through the copy queue: the staging buffer copied there into video
-        // memory, from which the main queue copies it into the image once
-        // that is done (the same regions).
-        if let Some((pool, sem)) = via_copy {
-            let bytes = (total.max(4) as u64).next_multiple_of(4);
-            if let Ok(dev) = self.detile_take(bytes) {
-                let lb = dev.0;
-                let to_dev = |x: vk::CommandBuffer| unsafe { c.device.cmd_copy_buffer(x, buf, lb, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: total.max(4) as u64 }]) };
-                if let Some((x, v)) = self.submit_copy_part(pool, sem, to_dev) {
-                    let record_dev = |cmd: vk::CommandBuffer| record_upload(cmd, image, first, lb, &regions, base);
-                    self.submit_held(Held { staging: Some(st), dev: vec![dev], copy_cmd: Some(x) }, DETILE_INFLIGHT, Some((sem, v)), record_dev);
-                    COPY_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    UPLOAD_SPLIT[2].fetch_add(t_copy.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-                    self.uploads += 1;
-                    return Ok((t.base, size));
-                }
-                self.release_detile(vec![dev]);
-            }
-        }
-        if asynchronous {
-            self.submit_upload(st, record);
-            UPLOAD_SPLIT[2].fetch_add(t_copy.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            self.uploads += 1;
-            return Ok((t.base, size));
-        }
         // (`tune upload_batch`: into the command buffer the uploads share,
         // not waited for; its own staging freed once that completes.)
         if super::tune::upload_batch() {
@@ -5262,7 +5159,6 @@ impl Images {
         } else {
             String::new()
         };
-        let gpu = if COPY_UPLOADS.load(Relaxed) > 0 { format!("{gpu}; CPU-detiled uploads through the copy queue {}", COPY_UPLOADS.load(Relaxed)) } else { gpu };
         let o: Vec<u64> = REFRESH_OUT.iter().map(|c| c.load(Relaxed)).collect();
         let gpu = if o[0] + o[3] > 0 {
             format!("{gpu}; re-uploads detiled after the lock: {} ({} recorded, {} dropped: their image gone or GPU-written meanwhile; {} ms outside the lock), bindings that waited for one {} ({} ms)", o[0], o[1], o[2], o[4] / 1_000_000, o[3], o[5] / 1_000_000)
@@ -5270,7 +5166,7 @@ impl Images {
             gpu
         };
         format!(
-            "    images: {} cached ({} MiB; GPU-written {} ({} MiB), kept for the session; {} textures evicted, {} MiB, in {} rounds), {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; staging buffers made {}, waits for uploads in flight {}; batched (`tune upload_batch`) {} in {} command buffers, {} waits; pages checked in the mapping table {}, again with the operating system {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages, {} found clean by a probe); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}{gpu}\n",
+            "    images: {} cached ({} MiB; GPU-written {} ({} MiB), kept for the session; {} textures evicted, {} MiB, in {} rounds), {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; waits for uploads in flight {}; batched (`tune upload_batch`) {} in {} command buffers, {} waits; pages checked in the mapping table {}, again with the operating system {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages, {} found clean by a probe); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}{gpu}\n",
             self.map.len(),
             IMAGE_BYTES.load(Relaxed) >> 20,
             self.map.values().filter(|i| i.gpu_written).count(),
@@ -5287,7 +5183,6 @@ impl Images {
             UPLOAD_SPLIT[3].load(Relaxed) / 1_000_000,
             UPLOAD_SPLIT[1].load(Relaxed) / 1_000_000,
             UPLOAD_SPLIT[2].load(Relaxed) / 1_000_000,
-            STAGING_MADE.load(Relaxed),
             UPLOAD_WAITS.load(Relaxed),
             BATCHED_STATS[0].load(Relaxed),
             BATCHED_STATS[1].load(Relaxed),
