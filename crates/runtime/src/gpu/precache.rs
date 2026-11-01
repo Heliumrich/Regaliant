@@ -317,20 +317,15 @@ pub fn reset_window() {
     for (s, v) in SNAP.iter().zip(STATS.iter()).chain(ENDS_SNAP.iter().zip(ENDS.iter())) {
         s.store(v.load(Ordering::Relaxed), Ordering::Relaxed);
     }
-    WINDOW_SNAP.store(WINDOW_CHECKED.load(Ordering::Relaxed), Ordering::Relaxed);
 }
-
-/// WINDOW_CHECKED at the last `profile reset`.
-static WINDOW_SNAP: AtomicU64 = AtomicU64::new(0);
 
 /// The shared copies since the last `profile reset`.
 pub fn window_line() -> String {
     let d: Vec<u64> = STATS.iter().zip(SNAP.iter()).map(|(v, s)| v.load(Ordering::Relaxed).saturating_sub(s.load(Ordering::Relaxed))).collect();
     let e: Vec<u64> = ENDS.iter().zip(ENDS_SNAP.iter()).map(|(v, s)| v.load(Ordering::Relaxed).saturating_sub(s.load(Ordering::Relaxed))).collect();
     format!(
-        "shared: {} copies, {} reused ({} checked for CPU writes in a new epoch, {} of them waited for another thread's take; entries dropped by CPU writes {}), {} without space, {} left to a batch not submitted yet, entries dropped by eviction {}; big copies {}, dropped by writes {}, declined {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND; {} used without a take since boot (`tune pre_trust`); window takes (`tune pre_window`) checked {} entries",
-        d[1], d[0], d[2], d[13], d[3], d[6], d[9], d[5], d[10], d[11], d[12], e[0], e[1], e[2], TRUSTED.load(Ordering::Relaxed),
-        WINDOW_CHECKED.load(Ordering::Relaxed).saturating_sub(WINDOW_SNAP.load(Ordering::Relaxed))
+        "shared: {} copies, {} reused ({} checked for CPU writes in a new epoch, {} of them waited for another thread's take; entries dropped by CPU writes {}), {} without space, {} left to a batch not submitted yet, entries dropped by eviction {}; big copies {}, dropped by writes {}, declined {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND; {} used without a take since boot (`tune pre_trust`)",
+        d[1], d[0], d[2], d[13], d[3], d[6], d[9], d[5], d[10], d[11], d[12], e[0], e[1], e[2], TRUSTED.load(Ordering::Relaxed)
     )
 }
 
@@ -786,12 +781,7 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64, u64)> {
         e.id
     };
     STATS[2].fetch_add(1, Ordering::Relaxed);
-    // `tune pre_window`: the take covers the aligned window around the
-    // range, and checks every entry inside it for this epoch (copies of
-    // neighboring ranges, such as one mesh's buffers, then need no take of
-    // their own).
-    let win = super::tune::pre_window();
-    let (tb, te) = if win > 0 { (base & !(win - 1), (base + size).next_multiple_of(win)) } else { (base, base + size) };
+    let (tb, te) = (base, base + size);
     let mut pages = Vec::new();
     // `tune host_census`: takes of copies armed as static data are what
     // write tracking by protection would leave out.
@@ -807,10 +797,7 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64, u64)> {
             None => {
                 STATS[7].fetch_add(1, Ordering::Relaxed);
                 c.why = 2;
-                // A failed take may have reset marks anywhere in its range.
-                if win > 0 {
-                    c.drop_range(tb, te, false);
-                } else if c.entries.get(&(base, size)).is_some_and(|e| e.id == id) {
+                if c.entries.get(&(base, size)).is_some_and(|e| e.id == id) {
                     c.remove((base, size));
                 }
                 c.bounds_changed();
@@ -832,24 +819,6 @@ pub fn lookup(base: u64, size: u64) -> Option<(Arc<Chunk>, u64, u64)> {
     let mut g = wait_takes(g, tb, te - tb, upto);
     let flip = super::FRAMES.load(Ordering::Relaxed);
     let c = g.as_mut()?;
-    if win > 0 {
-        let mut n = 0;
-        for (&b, sizes) in c.by_base.range(tb..te) {
-            for &s in sizes {
-                if b + s > te {
-                    continue;
-                }
-                if let Some(e) = c.entries.get_mut(&(b, s)) {
-                    if e.checked != epoch {
-                        e.checked = epoch;
-                        e.clean_flip = flip;
-                        n += 1;
-                    }
-                }
-            }
-        }
-        WINDOW_CHECKED.fetch_add(n, Ordering::Relaxed);
-    }
     let e = c.entries.get_mut(&(base, size)).filter(|e| e.id == id)?;
     e.checked = epoch;
     e.clean_flip = flip;
@@ -932,9 +901,6 @@ pub fn protect_line() -> String {
     )
 }
 
-/// Entries a window take (`tune pre_window`) checked for its epoch, the
-/// looked-up one included.
-pub static WINDOW_CHECKED: AtomicU64 = AtomicU64::new(0);
 
 /// Why the range has no usable copy (`GONE_NAMES` index; diagnostics).
 pub fn miss_reason(base: u64, size: u64) -> u8 {

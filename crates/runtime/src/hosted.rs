@@ -364,8 +364,6 @@ pub fn disarm(base: u64, len: u64) {
         }
         a = e;
     }
-    // Mirrored pages no longer protected leave the mirror.
-    crate::gpu::gmirror::disarmed(lo, hi.saturating_sub(lo));
 }
 
 /// The armed bits of the 64 pages from `a` (a multiple of 64 pages from the
@@ -409,7 +407,6 @@ pub fn forget(base: u64, len: u64) {
     let (lo, hi) = (base & !(PAGE - 1), base.saturating_add(len).next_multiple_of(PAGE));
     disarm_bits(s, lo, hi.min(crate::mem::GUEST_END));
     crate::hostcensus::forget(base, len);
-    crate::gpu::gmirror::disarmed(lo, hi.saturating_sub(lo));
 }
 
 /// The faults the host answered since the last call: (page, a write, the

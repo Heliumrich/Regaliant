@@ -1204,59 +1204,6 @@ pub fn ww_reset() {
     }
 }
 
-thread_local! {
-    /// This thread's write-watch queries take turns with `tune ww_gate` 1
-    /// (the parallel recording workers and the texture scrubber).
-    static WW_GATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Marks this thread's write-watch queries as taking turns (`tune ww_gate`).
-pub fn set_ww_gated(on: bool) {
-    WW_GATED.with(|g| g.set(on));
-}
-
-/// Held by the thread whose turn it is (`ww_turn`).
-static WW_GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// A write-watch query's turn; released when dropped.
-struct WwTurn(bool);
-
-impl Drop for WwTurn {
-    fn drop(&mut self) {
-        if self.0 {
-            WW_GATE.store(false, std::sync::atomic::Ordering::Release);
-        }
-    }
-}
-
-/// Write-watch queries wait on each other in the kernel (3.4 us alone,
-/// 10-120 us with others in flight; FINDINGS.md 2026-10-17): with `tune
-/// ww_gate` 1 the parallel recording workers and the texture scrubber query
-/// one at a time (spinning for the turn), so that a command processor's
-/// query, on the frame's critical path, meets at most one of theirs; with
-/// 2 every thread takes turns.
-fn ww_turn() -> WwTurn {
-    use std::sync::atomic::Ordering;
-    let gated = match crate::gpu::tune::ww_gate() {
-        1 => WW_GATED.with(|g| g.get()),
-        2 => true,
-        _ => false,
-    };
-    if !gated {
-        return WwTurn(false);
-    }
-    let mut spins = 0u32;
-    while WW_GATE.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        spins += 1;
-        if spins < 4096 {
-            std::hint::spin_loop();
-        } else {
-            std::thread::yield_now();
-        }
-    }
-    WwTurn(true)
-}
-
 /// The 4 KiB pages of guest [base, base+size) the CPU wrote since they were
 /// last taken (their write marks are reset), into `out` (page addresses);
 /// None without write watching or when the query fails (treat as written).
@@ -1328,7 +1275,6 @@ fn take_written_inner(lo: u64, hi: u64, out: &mut Vec<u64>, who: usize) -> Optio
 /// One write-watch take of [lo, hi) (inside one allocation).
 fn take_written_query(lo: u64, hi: u64, out: &mut Vec<u64>, who: usize) -> Option<()> {
     use std::sync::atomic::Ordering::Relaxed;
-    let _turn = ww_turn();
     let inflight = InFlight::new();
     let t = std::time::Instant::now();
     let mut addrs = [std::ptr::null_mut::<std::ffi::c_void>(); 256];

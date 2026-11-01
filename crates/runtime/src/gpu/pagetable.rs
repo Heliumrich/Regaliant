@@ -194,35 +194,8 @@ pub(super) fn submit_pending(c: &Ctx) -> Result<(), String> {
     if !made() {
         return Ok(());
     }
-    let mut runs = std::mem::take(&mut *PENDING.lock());
-    // The mirror's copies and runs (`gmirror`): after the import windows'
-    // runs, and putting back the mirrored ranges those runs rewrite.
-    let over: Vec<(u64, u64)> = runs.iter().map(|&(first, n, _)| (PT_BASE + (first << PT_PAGE_SHIFT), PT_BASE + ((first + n) << PT_PAGE_SHIFT))).collect();
-    let (copies, mruns) = super::gmirror::take(&over);
-    for (a, b, dev) in mruns {
-        let first = (a - PT_BASE) >> PT_PAGE_SHIFT;
-        let n = (b - a) >> PT_PAGE_SHIFT;
-        if dev != 0 {
-            runs.push((first, n, dev));
-            continue;
-        }
-        // Back to the import windows over [a, b) (none: unmapped).
-        let mut x = a;
-        while x < b {
-            match super::exec::window_buffer_of(x) {
-                Some((ws, we, va, _, _)) => {
-                    let e = we.min(b);
-                    runs.push(((x - PT_BASE) >> PT_PAGE_SHIFT, (e - x) >> PT_PAGE_SHIFT, va + (x - ws)));
-                    x = e;
-                }
-                None => {
-                    runs.push(((x - PT_BASE) >> PT_PAGE_SHIFT, 1, 0));
-                    x += PAGE;
-                }
-            }
-        }
-    }
-    if runs.is_empty() && copies.is_empty() {
+    let runs = std::mem::take(&mut *PENDING.lock());
+    if runs.is_empty() {
         return Ok(());
     }
     let t = table().ok_or("no page table")?;
@@ -266,15 +239,6 @@ pub(super) fn submit_pending(c: &Ctx) -> Result<(), String> {
     let fence = unsafe { c.device.create_fence(&vk::FenceCreateInfo::default(), None) }.map_err(|e| format!("page table fence: {e}"))?;
     unsafe {
         c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
-        // The mirror's copies from the import windows (their sources as the
-        // CPU left them before this batch).
-        if !copies.is_empty() {
-            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
-            for k in &copies {
-                c.device.cmd_copy_buffer(cmd, k.src, k.dst, &[vk::BufferCopy { src_offset: k.src_off, dst_offset: k.dst_off, size: k.bytes }]);
-            }
-        }
         // Later runs of the same pages win: copies in order, each behind
         // the last when they overlap (rare: a window dropped and imported
         // again before a batch).

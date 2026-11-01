@@ -850,12 +850,6 @@ pub(super) fn window_of(a: u64) -> Option<(u64, u64, u64)> {
     window_buffer_of(a).map(|(s, e, va, _, _)| (s, e, va))
 }
 
-/// Whether `buf` is still the valid import window starting at guest
-/// `start` and at least `bytes` long (not dropped, its handle not reused).
-pub(super) fn window_valid(buf: vk::Buffer, start: u64, bytes: u64) -> bool {
-    spans_read().iter().any(|s| s.valid && s.buffer == buf && s.start == start && s.end - s.start >= bytes)
-}
-
 /// The valid import window over guest address `a`: (start, end, device
 /// address, buffer, the flip it was imported at), without importing.
 pub(super) fn window_buffer_of(a: u64) -> Option<(u64, u64, u64, vk::Buffer, u64)> {
@@ -8054,8 +8048,6 @@ fn gpu_res_imported(found: &shaders::Found, addr: u64, mask: u64, user: &[u32]) 
             if span(v.base, n).is_none() {
                 return false;
             }
-            // Static data the shader reads: into the mirror (`gmirror`).
-            super::gmirror::want(v.base, n);
             GPU_APPENDS[3].fetch_add(1, Ordering::Relaxed);
         }
         GPU_IMPORTED.with(|c| {
@@ -11764,7 +11756,6 @@ impl Exec {
                 }
             }
         }
-        super::gmirror::gpu_write(a, n, self.batch_shaders.last().copied().unwrap_or(0), &self.name);
         super::forward::written(a, n);
         if super::tune::race_checks() {
             self.note_open_write(a, n);

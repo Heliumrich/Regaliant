@@ -2737,12 +2737,6 @@ impl Cp {
         }
         let firsts: Vec<usize> = costed.unwrap_or_else(|| (0..m).map(|i| main_n + i * per).collect());
         let starts: Vec<u64> = firsts.iter().map(|&i| if i == 0 { from } else { ends[i - 1] }).collect();
-        // The workers are woken now to spin for the run (`tune
-        // par_prewake`): the chunk start states and the submission before
-        // the run take ~120-150 us more.
-        if super::tune::par_prewake() > 0 {
-            self.par_pool.prewake();
-        }
         // The state at each chunk's start.
         let mut st = self.chunk_state();
         let mut states: Vec<Box<ChunkState>> = Vec::new();
@@ -2925,7 +2919,6 @@ impl Cp {
         let cost_key = self.par.as_ref().filter(|p| p.sig != 0 && !done.costs.is_empty()).and_then(|p| Some((p.sig, p.n, *p.firsts.get(i)?)));
         match self.par.as_mut() {
             Some(pr) if last => {
-                super::par::note_main_wait(pr.waited_ns + waited);
                 if self.main_gfx && super::runprobe::on() {
                     pr.writes.extend(&done.writes);
                     super::runprobe::run_end(pr.waited_ns + waited, std::mem::take(&mut pr.writes));
@@ -3247,7 +3240,6 @@ impl Cp {
             }
             end_state = Some(done.state);
         }
-        super::par::note_main_wait(pr.waited_ns);
         super::par::PAST[3].fetch_add(held.as_ref().map_or(0, |h| h.commands), Ordering::Relaxed);
         super::par::PAST[4].fetch_add(past.began.elapsed().saturating_sub(t.elapsed()).as_nanos() as u64, Ordering::Relaxed);
         super::par::PAST[5].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);

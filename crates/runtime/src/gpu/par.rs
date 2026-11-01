@@ -74,35 +74,14 @@ pub fn split() -> usize {
     (super::tune::par_split() as usize).clamp(1, 16)
 }
 
-/// The main command processor's chunk relative to a worker's, in 1/1000
-/// (`tune par_balance`): raised after a split run in which it waited for
-/// the workers when collecting their batches, lowered after one in which it
-/// did not (the workers start after the planning and with cold per-thread
-/// caches; it waited ~6.6% of its time with equal chunks, profile run
-/// 20261012-001629).
-static MAIN_WEIGHT: AtomicU64 = AtomicU64::new(1000);
-
 /// The main command processor's chunk relative to a worker's.
 pub fn main_weight() -> f64 {
     let fixed = super::tune::par_weight();
     if fixed > 0 {
         fixed.min(4000) as f64 / 1000.0
-    } else if super::tune::par_balance() {
-        MAIN_WEIGHT.load(Ordering::Relaxed) as f64 / 1000.0
     } else {
         1.0
     }
-}
-
-/// A split run was collected; the main command processor waited `ns` for
-/// its workers in all.
-pub fn note_main_wait(ns: u64) {
-    if !super::tune::par_balance() {
-        return;
-    }
-    let w = MAIN_WEIGHT.load(Ordering::Relaxed);
-    let next = if ns > 20_000 { (w + 25).min(4000) } else { w.saturating_sub(25).max(500) };
-    MAIN_WEIGHT.store(next, Ordering::Relaxed);
 }
 
 /// A chunk as its worker left it.
@@ -293,25 +272,7 @@ pub struct Worker {
     has_job: AtomicBool,
     /// Its pool's wake word (`Pool::wake`): an idle worker sleeps on it.
     wake: Arc<AtomicU64>,
-    /// Its pool's pre-wake state (`Pool::prewake`).
-    pre: Arc<Prewake>,
 }
-
-/// A planner about to hand over a run wakes one idle worker early (`tune
-/// par_prewake`): that worker wakes the others, and each spins for the run
-/// up to the budget instead of being readied by the kernel after the run is
-/// given (the planner's call readied eight threads in ~20 us, and workers
-/// started ~120 us after the hand-over on average, FINDINGS.md 2026-10-16).
-struct Prewake {
-    /// Bumped by each pre-wake.
-    generation: AtomicU64,
-    /// Whether a worker passed the latest pre-wake on to the others.
-    relayed: AtomicBool,
-}
-
-/// Pre-wakes: [given, relayed by a worker, spins that saw their run, spins
-/// that ran out of budget].
-pub static PREWAKES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Statistics: runs split, chunks handed to workers, chunks that stopped,
 /// commands per chunk..., main command processor's waits for workers (ns),
@@ -414,30 +375,17 @@ pub struct Pool {
     /// (a condition variable each took ~21 us of the planner per run,
     /// FINDINGS.md 2026-10-16).
     wake: Arc<AtomicU64>,
-    pre: Arc<Prewake>,
 }
 
 impl Pool {
     pub fn new() -> Pool {
-        Pool { workers: Vec::new(), wake: Arc::new(AtomicU64::new(0)), pre: Arc::new(Prewake { generation: AtomicU64::new(0), relayed: AtomicBool::new(false) }) }
+        Pool { workers: Vec::new(), wake: Arc::new(AtomicU64::new(0)) }
     }
 
     /// Wakes the idle workers to the runs given them (`Worker::give`).
     pub fn wake(&self) {
         self.wake.fetch_add(1, Ordering::AcqRel);
         unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll(Arc::as_ptr(&self.wake) as *const core::ffi::c_void) };
-    }
-
-    /// A run is about to be handed over (`tune par_prewake`): one idle
-    /// worker is woken now; it wakes the others, and they spin for the run.
-    pub fn prewake(&self) {
-        if self.workers.is_empty() {
-            return;
-        }
-        self.pre.relayed.store(false, Ordering::Release);
-        self.pre.generation.fetch_add(1, Ordering::AcqRel);
-        PREWAKES[0].fetch_add(1, Ordering::Relaxed);
-        unsafe { windows_sys::Win32::System::Threading::WakeByAddressSingle(Arc::as_ptr(&self.wake) as *const core::ffi::c_void) };
     }
 
     /// Worker `i` of the command processor `name` (started on first use);
@@ -451,7 +399,7 @@ impl Pool {
                 crate::warn!("gpu[{wname}]: no executor for a parallel worker ({e})");
                 return None;
             }
-            let w = Arc::new(Worker { cp: Mutex::new(cp), job: Mutex::new(Default::default()), has_job: AtomicBool::new(false), wake: self.wake.clone(), pre: self.pre.clone() });
+            let w = Arc::new(Worker { cp: Mutex::new(cp), job: Mutex::new(Default::default()), has_job: AtomicBool::new(false), wake: self.wake.clone() });
             let w2 = w.clone();
             let tname = wname.clone();
             let r = crate::thread::spawn_host(
@@ -484,7 +432,6 @@ impl Default for Pool {
 }
 
 fn run_worker(w: &Worker, name: &str) {
-    let mut pre_seen = w.pre.generation.load(Ordering::Acquire);
     loop {
         super::prio::apply();
         let run = loop {
@@ -497,28 +444,6 @@ fn run_worker(w: &Worker, name: &str) {
                     w.has_job.store(!job.is_empty(), Ordering::Release);
                     break r;
                 }
-            }
-            // Pre-woken (`Pool::prewake`): the first worker up wakes the
-            // others; each spins for its run up to the budget.
-            let g = w.pre.generation.load(Ordering::Acquire);
-            if g != pre_seen {
-                pre_seen = g;
-                if !w.pre.relayed.swap(true, Ordering::AcqRel) {
-                    PREWAKES[1].fetch_add(1, Ordering::Relaxed);
-                    unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll(Arc::as_ptr(&w.wake) as *const core::ffi::c_void) };
-                }
-                let budget = std::time::Duration::from_micros(super::tune::par_prewake());
-                let t = std::time::Instant::now();
-                let mut k = 0u32;
-                while !w.has_job.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
-                    k += 1;
-                    if k % 64 == 0 && t.elapsed() >= budget {
-                        break;
-                    }
-                }
-                PREWAKES[if w.has_job.load(Ordering::Acquire) { 2 } else { 3 }].fetch_add(1, Ordering::Relaxed);
-                continue;
             }
             unsafe {
                 windows_sys::Win32::System::Threading::WaitOnAddress(
@@ -639,9 +564,6 @@ pub fn reset_stats() {
     for c in [&RUNS, &CHUNKS, &STOPS, &COMMANDS, &WAIT_NS, &TURN_NS, &CANCELLED, &STARTS, &super::cp::PAR_COSTED] {
         c.store(0, Ordering::Relaxed);
     }
-    for c in &PREWAKES {
-        c.store(0, Ordering::Relaxed);
-    }
     for c in &PHASE_NS {
         c.store(0, Ordering::Relaxed);
     }
@@ -711,12 +633,8 @@ pub fn status() -> String {
         String::new()
     };
     past + &format!(
-        "    parallel runs: {runs} runs ({} split at equal recording cost; {} pre-wakes, {} relayed, spins {} saw their run, {} ran out), {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled, {} worker reads of the main command processor's unsubmitted writes ({} waited {:.0} us on average for its submission); main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}; runs under 32 commands by end {}; compute queues' runs by length {}; by end {}\n",
+        "    parallel runs: {runs} runs ({} split at equal recording cost), {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled, {} worker reads of the main command processor's unsubmitted writes ({} waited {:.0} us on average for its submission); main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}; runs under 32 commands by end {}; compute queues' runs by length {}; by end {}\n",
         super::cp::PAR_COSTED.load(Ordering::Relaxed),
-        PREWAKES[0].load(Ordering::Relaxed),
-        PREWAKES[1].load(Ordering::Relaxed),
-        PREWAKES[2].load(Ordering::Relaxed),
-        PREWAKES[3].load(Ordering::Relaxed),
         CHUNKS.load(Ordering::Relaxed),
         COMMANDS.load(Ordering::Relaxed),
         split(),
