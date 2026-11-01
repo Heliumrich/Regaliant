@@ -1458,11 +1458,29 @@ fn note_bucket(page: u64) -> usize {
     (page.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize
 }
 
+/// The same marks inside the guest span, one bit a page (exact; the buckets
+/// above serve pages outside it): once ~1.7 GiB of GPU-owned images were
+/// indexed the buckets marked about a third of their pages, so most writes
+/// passed `may_note` and took the lock (exact: +1.35% at the vista,
+/// FINDINGS.md 2026-11-01 morning).
+const SPAN_PAGES: usize = ((super::resident::MIRROR_END - super::resident::MIRROR_BASE) >> 16) as usize;
+static NOTE_SPAN: [std::sync::atomic::AtomicU64; SPAN_PAGES / 64] = [const { std::sync::atomic::AtomicU64::new(0) }; SPAN_PAGES / 64];
+
+fn span_page(page: u64) -> Option<usize> {
+    let i = page.wrapping_sub(super::resident::MIRROR_BASE >> 16);
+    (i < SPAN_PAGES as u64).then_some(i as usize)
+}
+
 fn mark_note_pages(base: u64, len: u64) {
     if len == 0 {
         return;
     }
     let (first, last) = (base >> 16, (base + len - 1) >> 16);
+    for page in first..=last.min(first + SPAN_PAGES as u64) {
+        if let Some(i) = span_page(page) {
+            NOTE_SPAN[i / 64].fetch_or(1 << (i % 64), std::sync::atomic::Ordering::Release);
+        }
+    }
     if last - first >= NOTE_BUCKETS as u64 {
         for b in NOTE_PAGES.iter() {
             b.store(true, std::sync::atomic::Ordering::Release);
@@ -1486,7 +1504,11 @@ pub fn may_note(writes: &[(u64, u64)]) -> bool {
             return false;
         }
         let (first, last) = (b >> 16, (b + n - 1) >> 16);
-        last - first >= 1024 || (first..=last).any(|p| NOTE_PAGES[note_bucket(p)].load(std::sync::atomic::Ordering::Acquire))
+        last - first >= 1024
+            || (first..=last).any(|p| match span_page(p) {
+                Some(i) => NOTE_SPAN[i / 64].load(std::sync::atomic::Ordering::Acquire) & (1 << (i % 64)) != 0,
+                None => NOTE_PAGES[note_bucket(p)].load(std::sync::atomic::Ordering::Acquire),
+            })
     })
 }
 
@@ -1516,6 +1538,8 @@ fn note_step(k: usize, t: Option<std::time::Instant>) {
 
 /// The long holds (HOLDS) by the call site of `with`: count, ns.
 static HOLD_SITES: Mutex<Option<HashMap<(&'static str, u32), (u64, u64)>>> = Mutex::new(None);
+/// The waits (WAITS) by the call site of `with`: count, ns.
+static WAIT_SITES: Mutex<Option<HashMap<(&'static str, u32), (u64, u64)>>> = Mutex::new(None);
 
 thread_local! {
     /// This thread's class for HOLDS and WAITS (255: not looked up yet).
@@ -1548,6 +1572,7 @@ pub fn reset_holds() {
         c.store(0, std::sync::atomic::Ordering::Relaxed);
     }
     *HOLD_SITES.lock() = None;
+    *WAIT_SITES.lock() = None;
 }
 
 /// The hold census for the contended-locks status line ("" when off).
@@ -1566,9 +1591,12 @@ pub fn holds_part() -> String {
     let mut sites: Vec<((&'static str, u32), (u64, u64))> = HOLD_SITES.lock().as_ref().map(|m| m.iter().map(|(k, v)| (*k, *v)).collect()).unwrap_or_default();
     sites.sort_by_key(|s| std::cmp::Reverse(s.1 .1));
     let sites: Vec<String> = sites.iter().take(8).map(|((f, l), (n, ns))| format!("{f}:{l} {n} ({} ms)", ns / 1_000_000)).collect();
+    let mut wsites: Vec<((&'static str, u32), (u64, u64))> = WAIT_SITES.lock().as_ref().map(|m| m.iter().map(|(k, v)| (*k, *v)).collect()).unwrap_or_default();
+    wsites.sort_by_key(|s| std::cmp::Reverse(s.1 .1));
+    let wsites: Vec<String> = wsites.iter().take(10).map(|((f, l), (n, ns))| format!("{f}:{l} {n} ({} ms)", ns / 1_000_000)).collect();
     let step_names = ["refresh", "create", "prepared upload", "own upload", "write watch", "hashes"];
     let steps: Vec<String> = step_names.iter().zip(STEPS.iter()).map(|(n, s)| format!("{n} {} ({} ms, {} of 200 us or more)", s[0].load(Relaxed), s[1].load(Relaxed) / 1_000_000, s[2].load(Relaxed))).collect();
-    format!("; image cache held 200 us or more (`DS_IMAGE_HOLDS`): {}; waited for by: {}; long holds by site: {}; image_for's steps: {}", parts.join(", "), waits.join(", "), sites.join(", "), steps.join(", "))
+    format!("; image cache held 200 us or more (`DS_IMAGE_HOLDS`): {}; waited for by: {}; waits by site: {}; long holds by site: {}; image_for's steps: {}", parts.join(", "), waits.join(", "), wsites.join(", "), sites.join(", "), steps.join(", "))
 }
 
 /// A 2D texture upload's (mip, layer)s to upload, read from guest memory
@@ -2211,6 +2239,11 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
             let w = &WAITS[hold_class()];
             w[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             w[1].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+            let l = std::panic::Location::caller();
+            let mut s = WAIT_SITES.lock();
+            let e = s.get_or_insert_with(HashMap::default).entry((l.file(), l.line())).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += ns;
         }
     }
     if g.is_none() {
