@@ -996,14 +996,150 @@ pub fn mark_batchable(addr: u64) {
     }
 }
 
+/// Stage preparation by part (`DS_STEP_LAPS=1` or the profiler): TSC
+/// cycles of each part of `PREP_PART_NAMES` per stage kind (vertex, pixel,
+/// compute), then preparations, those the stage cache served, and the words,
+/// read ranges and loaded pointers of the others (`prep_lap_volume`).
+static PREP_PARTS: [[std::sync::atomic::AtomicU64; PREP_PARTS_N + 5]; 3] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; PREP_PARTS_N + 5] }; 3];
+const PREP_PARTS_N: usize = 10;
+const PREP_PART_NAMES: [&str; PREP_PARTS_N] = ["registers", "program", "spec", "plan", "cache check", "descriptors", "depth views", "translation", "scalar loads", "result and cache"];
+
+/// A thread's preparation laps: the preparation being timed (its kind, the
+/// last lap's TSC) and its sums not yet added to `PREP_PARTS`.
+struct PrepLaps {
+    on: bool,
+    kind: usize,
+    last: u64,
+    acc: [[u64; PREP_PARTS_N + 5]; 3],
+    n: u32,
+}
+
+thread_local! {
+    static PREP_LAPS: std::cell::RefCell<PrepLaps> = const { std::cell::RefCell::new(PrepLaps { on: false, kind: 0, last: 0, acc: [[0; PREP_PARTS_N + 5]; 3], n: 0 }) };
+}
+
+fn prep_laps_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| super::exec::profiling_on() || std::env::var("DS_STEP_LAPS").ok().as_deref() == Some("1"))
+}
+
+/// Starts timing a preparation of stage kind `kind` (0 vertex, 1 pixel,
+/// 2 compute).
+#[inline]
+fn prep_lap_begin(kind: usize) {
+    if prep_laps_on() {
+        PREP_LAPS.with(|l| {
+            let mut l = l.borrow_mut();
+            l.on = true;
+            l.kind = kind;
+            l.last = unsafe { core::arch::x86_64::_rdtsc() };
+        });
+    }
+}
+
+/// Adds the cycles since the last lap to part `part`.
+#[inline]
+fn prep_lap(part: usize) {
+    if prep_laps_on() {
+        PREP_LAPS.with(|l| {
+            let mut l = l.borrow_mut();
+            if l.on {
+                let now = unsafe { core::arch::x86_64::_rdtsc() };
+                let (k, d) = (l.kind, now.wrapping_sub(l.last));
+                l.acc[k][part] += d;
+                l.last = now;
+            }
+        });
+    }
+}
+
+/// Ends a timed preparation (`hit`: the stage cache served it); the sums go
+/// to `PREP_PARTS` every 512.
+fn prep_lap_end(hit: bool) {
+    if prep_laps_on() {
+        PREP_LAPS.with(|l| {
+            let mut l = l.borrow_mut();
+            if !l.on {
+                return;
+            }
+            l.on = false;
+            let k = l.kind;
+            l.acc[k][PREP_PARTS_N] += 1;
+            l.acc[k][PREP_PARTS_N + 1] += hit as u64;
+            l.n += 1;
+            if l.n >= 512 {
+                l.n = 0;
+                let acc = std::mem::replace(&mut l.acc, [[0; PREP_PARTS_N + 5]; 3]);
+                for (g, a) in PREP_PARTS.iter().zip(acc.iter()) {
+                    for (c, &x) in g.iter().zip(a.iter()) {
+                        c.fetch_add(x, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// What a full preparation read: words, read ranges, pointers loaded.
+#[inline]
+fn prep_lap_volume(words: usize, ranges: usize, ptrs: usize) {
+    if prep_laps_on() {
+        PREP_LAPS.with(|l| {
+            let mut l = l.borrow_mut();
+            if l.on {
+                let k = l.kind;
+                l.acc[k][PREP_PARTS_N + 2] += words as u64;
+                l.acc[k][PREP_PARTS_N + 3] += ranges as u64;
+                l.acc[k][PREP_PARTS_N + 4] += ptrs as u64;
+            }
+        });
+    }
+}
+
+/// `PREP_PARTS` emptied (`profile reset`).
+pub fn reset_prep_parts() {
+    for c in PREP_PARTS.iter().flatten() {
+        c.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The profile lines of `PREP_PARTS` ("" before any).
+pub fn prep_parts_line() -> String {
+    let hz = super::threadcpu::tsc_hz();
+    let mut s = String::new();
+    for (k, name) in ["vertex", "pixel", "compute"].iter().enumerate() {
+        let v: Vec<u64> = PREP_PARTS[k].iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
+        let (n, hits) = (v[PREP_PARTS_N], v[PREP_PARTS_N + 1]);
+        if n == 0 {
+            continue;
+        }
+        let ns = |c: u64| c as f64 * 1e9 / hz / n as f64;
+        let total: u64 = v[..PREP_PARTS_N].iter().sum();
+        let parts: Vec<String> = PREP_PART_NAMES.iter().zip(v.iter()).map(|(p, &c)| format!("{p} {:.0}", ns(c))).collect();
+        let full = (n - hits).max(1) as f64;
+        s.push_str(&format!(
+            "    stage preparation by part, {name} ({n} preparations, {hits} from the stage cache; {:.0} ns each): {}; a full one read {:.1} words in {:.1} ranges, {:.1} pointers\n",
+            ns(total),
+            parts.join(", "),
+            v[PREP_PARTS_N + 2] as f64 / full,
+            v[PREP_PARTS_N + 3] as f64 / full,
+            v[PREP_PARTS_N + 4] as f64 / full
+        ));
+    }
+    s
+}
+
 pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prepared, String> {
+    prep_lap_begin(2);
     let sh = |i: u32| cp.sh(i);
     let addr = ((sh(CS_PGM_LO) as u64) | ((sh(CS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
     let rsrc2 = sh(CS_RSRC2);
     let user_sgprs = ((rsrc2 >> 1) & 0x1F).min(16) as u16;
     let user: [u32; 16] = std::array::from_fn(|i| sh(CS_USER_DATA + i as u32));
     let local = [sh(CS_NUM_THREAD) & 0xFFFF, sh(CS_NUM_THREAD + 1) & 0xFFFF, sh(CS_NUM_THREAD + 2) & 0xFFFF];
+    prep_lap(0);
     let (insts, code_hash) = program_local(addr)?;
+    prep_lap(1);
     let (ps_inputs, resources) = spec_vecs();
     let mut spec = Spec {
         stage: Stage::Compute,
@@ -1059,6 +1195,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
             spec.pt_linear = super::fe2::on();
         }
     }
+    prep_lap(2);
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
     r
@@ -1205,13 +1342,16 @@ fn touch_bits_wanted() -> bool {
 
 /// Resolves and translates the pixel shader bound on `cp`.
 pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
+    prep_lap_begin(1);
     let sh = |i: u32| cp.sh(i);
     let ctx = |a: u32| cp.ctx(a);
     let addr = ((sh(PS_PGM_LO) as u64) | ((sh(PS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
     let rsrc2 = sh(PS_RSRC2);
     let user_sgprs = user_count(rsrc2);
     let user: [u32; 32] = std::array::from_fn(|i| sh(PS_USER_DATA + i as u32));
+    prep_lap(0);
     let (insts, code_hash) = program_local(addr)?;
+    prep_lap(1);
     let in_control = ctx(SPI_PS_IN_CONTROL);
     let (mut ps_inputs, resources) = spec_vecs();
     for n in 0..(in_control & 0x3F).min(32) {
@@ -1296,6 +1436,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         };
         super::exec::note_ps_tests(addr, class);
     }
+    prep_lap(2);
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
     r
@@ -1407,13 +1548,16 @@ const VGT_SHADER_STAGES_EN: u32 = 0x28B54;
 
 /// Resolves and translates the NGG (vertex) shader bound on `cp`.
 pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
+    prep_lap_begin(0);
     let sh = |i: u32| cp.sh(i);
     let stages = cp.ctx(VGT_SHADER_STAGES_EN);
     let addr = ((sh(ES_PGM_LO) as u64) | ((sh(ES_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
     let rsrc2 = sh(GS_RSRC2);
     let user_sgprs = user_count(rsrc2);
     let user: [u32; 32] = std::array::from_fn(|i| sh(GS_USER_DATA + i as u32));
+    prep_lap(0);
     let (insts, code_hash) = program_local(addr)?;
+    prep_lap(1);
     let (ps_inputs, resources) = spec_vecs();
     let mut spec = Spec {
         stage: Stage::Vertex,
@@ -1464,6 +1608,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
             spec.pt_linear = super::fe2::on();
         }
     }
+    prep_lap(2);
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
     r
@@ -2443,6 +2588,7 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     if !plan.errors.is_empty() {
         return Err(format!("{:?} shader {addr:#x}: {}", spec.stage, plan.errors.join("; ")));
     }
+    prep_lap(3);
     // The cached preparation of this stage, if its inputs and the words it
     // read are the same.
     let slot = stage_slot(spec.stage);
@@ -2485,7 +2631,9 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         }
         Some(p)
     });
+    prep_lap(4);
     if let Some(p) = hit {
+        prep_lap_end(true);
         // Texture-streaming statistics as a full preparation notes them.
         for r in p.resources.iter() {
             match r {
@@ -2596,6 +2744,7 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
             }
         }
     }
+    prep_lap(5);
     // Depth views keep the hardware comparison, color views emulate it: the
     // image cache decides, for the images comparison instructions sample
     // (the others' translation does not depend on it).
@@ -2623,6 +2772,7 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
             });
         }
     }
+    prep_lap(6);
     // Translations do not depend on the program's address (see
     // translate::code_base_offset): copies of a program share one, and its
     // pipeline (the Vulkan pipeline cache finds it again in the next run).
@@ -2686,6 +2836,7 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     if !from_last {
         LAST_TRANSLATIONS.with(|c| c.borrow_mut().insert(plan_key, tr.clone()));
     }
+    prep_lap(7);
     // Scalar-load data, resolved now.
     let mut sgpr_data = pool::words((translate::sgpr_data_dwords(&tr.plan) as usize).max(translate::SGPR_DATA_USER as usize));
     sgpr_data.extend_from_slice(user);
@@ -2729,6 +2880,8 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
             _ => {}
         }
     }
+    prep_lap(8);
+    prep_lap_volume(rd.words.len(), rd.reads.len(), rd.ptrs.len());
     // The reader's references into the translation's plan end here.
     let used = [rd.reads.len() as u32, rd.words.len() as u32, rd.ptrs.len() as u32];
     if used != sizes {
@@ -2782,5 +2935,7 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         spec.hash(&mut h);
         note_repeat_deps(spec.stage, h.finish(), bytes);
     }
+    prep_lap(9);
+    prep_lap_end(false);
     Ok(prepared)
 }

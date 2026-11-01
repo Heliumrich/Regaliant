@@ -45,11 +45,8 @@
 //! the shadow (`Exec`), and the batch's own submission-time invalidation
 //! spares the copies it made after its writes (`invalidate_ranges_except`).
 //!
-//! Copies over a chunk (read-only bindings of up to `tune pre_big_max`
-//! bytes; off by default, no measured gain) get a video-memory slot of their
-//! own within `tune pre_big_mib`. A big range that CPU or GPU writes changed
-//! is not copied again for BIG_QUIET frames (a copy per change would cost
-//! more than reading it in place). Without
+//! (Copies over a chunk in slots of their own, `tune pre_big_max`, no
+//! measured gain, were removed on 2026-11-01.) Without
 //! write watching (`DS_WRITE_WATCH=0`, or the reservation failed) nothing is
 //! shared.
 
@@ -78,9 +75,6 @@ impl Drop for Chunk {
         }
     }
 }
-
-/// Frames a big range that writes changed is not copied again for.
-const BIG_QUIET: u64 = 120;
 
 const CHUNK: u64 = 32 << 20;
 
@@ -121,7 +115,7 @@ struct Slot {
     /// Entries in it now: beyond them and the slot's own reference, the
     /// chunk's references are batches binding it (`Cache::unbound`).
     live: usize,
-    /// Its buffer's size: CHUNK, or more for one big copy (`alloc_big`).
+    /// Its buffer's size (CHUNK).
     cap: u64,
 }
 
@@ -139,11 +133,6 @@ struct Cache {
     current: Option<(usize, u64)>,
     fills: u64,
     failed: bool,
-    /// Big ranges a write changed while they had an entry, and the frame
-    /// (`BIG_QUIET`).
-    big_changed: Map<(u64, u64), u64>,
-    /// A big slot could not be allocated (warned once).
-    big_failed: bool,
     /// Takes of write marks that reported pages, counted (`Watched`).
     marks: u64,
     /// Shadow windows whose CPU writes are followed (`watch`), oldest first.
@@ -293,9 +282,8 @@ fn trace_take(kind: char, epoch: u64, base: u64, size: u64, found: Option<usize>
 /// Statistics: [hits, copies, checks (epoch changed), dropped by CPU writes,
 /// dropped by GPU/CP/host writes and mapping changes, dropped by eviction,
 /// no space, failed checks, not kept (GPU-written lately), left to a batch
-/// not submitted yet (`tune pre_keep`), big copies, big entries dropped by
-/// writes, big copies declined (changed lately), checks that waited for
-/// another thread's take].
+/// not submitted yet (`tune pre_keep`), three unused (the big copies'
+/// until 2026-11-01), checks that waited for another thread's take].
 static STATS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
 /// Bumped (under the lock) whenever a take made without it ends
 /// (`wait_takes` waits for one).
@@ -363,9 +351,8 @@ impl Cache {
         true
     }
 
-    /// Drops the entries overlapping [base, end); how many. `gpu`: GPU work
-    /// writes the range.
-    fn drop_range(&mut self, base: u64, end: u64, gpu: bool) -> u64 {
+    /// Drops the entries overlapping [base, end); how many.
+    fn drop_range(&mut self, base: u64, end: u64) -> u64 {
         if self.entries.is_empty() || end <= self.lo || self.hi <= base {
             return 0;
         }
@@ -377,16 +364,8 @@ impl Cache {
                 }
             }
         }
-        let frame = super::FRAMES.load(Ordering::Relaxed);
         for &k in &hit {
             self.remove(k);
-            // (A copy's bytes run from the 16-byte aligned start.)
-            if k.1 + 16 > CHUNK {
-                self.big_changed.insert(k, frame);
-                if STATS[11].fetch_add(1, Ordering::Relaxed) < 32 {
-                    crate::info!("gpu: shared copy of {:#x}+{:#x} ({} MiB) dropped: {} wrote [{base:#x}, {end:#x})", k.0, k.1, k.1 >> 20, if gpu { "GPU work" } else { "the CPU, a CP or host write or a mapping change" });
-                }
-            }
         }
         hit.len() as u64
     }
@@ -403,7 +382,7 @@ impl Cache {
                 end += 4096;
                 i += 1;
             }
-            n += self.drop_range(start, end, false);
+            n += self.drop_range(start, end);
         }
         n
     }
@@ -489,7 +468,7 @@ impl Cache {
             None => {
                 STATS[7].fetch_add(1, Ordering::Relaxed);
                 self.why = 2;
-                self.drop_range(base, base.saturating_add(size), false);
+                self.drop_range(base, base.saturating_add(size));
                 self.bounds_changed();
             }
             Some(()) if !pages.is_empty() => {
@@ -524,80 +503,13 @@ impl Cache {
         Arc::strong_count(&self.chunks[k].chunk) == 1
     }
 
-    /// A slot of its own for a copy of `n` bytes over CHUNK: an idle big
-    /// slot it fits in, a new one within `tune pre_big_mib`, or a big slot
-    /// no batch binds (filled longest ago) evicted, and replaced by one of
-    /// the size needed unless it fits.
-    fn alloc_big(&mut self, n: u64) -> Option<(usize, Arc<Chunk>, u64)> {
-        let size = n.next_multiple_of(1 << 20);
-        let budget = super::tune::pre_big_mib() << 20;
-        let big: u64 = self.chunks.iter().filter(|s| s.cap > CHUNK).map(|s| s.cap).sum();
-        let idle_fit = (0..self.chunks.len()).filter(|&k| self.chunks[k].cap >= size && self.chunks[k].cap > CHUNK && Arc::strong_count(&self.chunks[k].chunk) == 1).min_by_key(|&k| self.chunks[k].cap);
-        let k = match idle_fit {
-            Some(k) => k,
-            None => {
-                // Room for a new one, or a big slot to evict: one it fits in,
-                // or one whose size freed makes room.
-                let k = if big + size <= budget {
-                    None
-                } else {
-                    let old = (0..self.chunks.len())
-                        .filter(|&k| self.chunks[k].cap > CHUNK && (self.chunks[k].cap >= size || big - self.chunks[k].cap + size <= budget) && self.unbound(k))
-                        .min_by_key(|&k| self.chunks[k].filled)?;
-                    if !self.evict(old) {
-                        return None;
-                    }
-                    Some(old)
-                };
-                match k {
-                    Some(k) if self.chunks[k].cap >= size => k,
-                    _ => {
-                        if self.big_failed {
-                            return None;
-                        }
-                        let (buf, mem) = match ctx().device_buffer(size, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER) {
-                            Ok(x) => x,
-                            Err(e) => {
-                                crate::warn!("gpu: no video memory for a {} MiB shared copy ({e}); big copies stop", size >> 20);
-                                self.big_failed = true;
-                                return None;
-                            }
-                        };
-                        let chunk = Arc::new(Chunk { buf, _mem: mem });
-                        match k {
-                            // The evicted slot's buffer goes with its last reference.
-                            Some(k) => {
-                                self.chunks[k].chunk = chunk;
-                                self.chunks[k].cap = size;
-                                k
-                            }
-                            None => {
-                                self.chunks.push(Slot { chunk, filled: 0, keys: Vec::new(), live: 0, cap: size });
-                                self.chunks.len() - 1
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        self.fills += 1;
-        let s = &mut self.chunks[k];
-        s.filled = self.fills;
-        s.keys.clear();
-        s.live = 0;
-        if STATS[10].fetch_add(1, Ordering::Relaxed) < 32 {
-            crate::info!("gpu: big shared copy slot {k} of {} MiB for {} bytes", s.cap >> 20, n);
-        }
-        Some((k, s.chunk.clone(), 0))
-    }
-
     /// Space for `n` bytes (256-byte aligned) in the chunk being filled, a
     /// free one, a new one, or (all in use) the chunk filled longest ago once
-    /// nothing binds it (its entries go now). Over CHUNK: `alloc_big`.
+    /// nothing binds it (its entries go now). None over CHUNK.
     fn alloc(&mut self, n: u64) -> Option<(usize, Arc<Chunk>, u64)> {
         let n = n.next_multiple_of(256);
         if n > CHUNK {
-            return self.alloc_big(n);
+            return None;
         }
         if let Some((k, used)) = &mut self.current {
             if *used + n <= CHUNK {
@@ -821,10 +733,6 @@ pub fn insert(base: u64, size: u64, n: u64) -> Option<(Arc<Chunk>, u64, u64)> {
             STATS[9].fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        if n > CHUNK && c.big_changed.get(&(base, size)).is_some_and(|&f| f.saturating_add(BIG_QUIET) >= super::FRAMES.load(Ordering::Relaxed)) {
-            STATS[12].fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
     }
     // The range's write marks so far: the copy sees those writes (it runs
     // later), other entries on those pages are stale. (A take in flight
@@ -947,7 +855,7 @@ fn drop_overlapping(base: u64, len: u64, gpu: bool) {
     let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);
     let Some(c) = g.as_mut() else { return };
     c.why = if gpu { 3 } else { 4 };
-    let n = c.drop_range(base, base.saturating_add(len), gpu);
+    let n = c.drop_range(base, base.saturating_add(len));
     if n > 0 {
         STATS[4].fetch_add(n, Ordering::Relaxed);
         c.bounds_changed();
@@ -973,7 +881,7 @@ pub fn invalidate_ranges_except(writes: &super::ranges::Ranges, keep: &[u64]) {
     c.spare = keep.to_vec();
     c.why = 3;
     for (a, n) in writes.iter() {
-        c.drop_range(a, a.saturating_add(n), true);
+        c.drop_range(a, a.saturating_add(n));
     }
     c.spare.clear();
     c.bounds_changed();
@@ -1048,12 +956,9 @@ pub fn status() -> String {
     if s[1] == 0 {
         return String::new();
     }
-    let (chunks, entries, bigs, big_mib) = super::lockstat::COPY_CACHE.lock(&CACHE).as_ref().map_or((0, 0, 0, 0), |c| {
-        let big: Vec<u64> = c.chunks.iter().filter(|s| s.cap > CHUNK).map(|s| s.cap).collect();
-        (c.chunks.len() - big.len(), c.entries.len(), big.len(), big.iter().sum::<u64>() >> 20)
-    });
+    let (chunks, entries) = super::lockstat::COPY_CACHE.lock(&CACHE).as_ref().map_or((0, 0), |c| (c.chunks.len(), c.entries.len()));
     format!(
-        "    shared batch-start copies: {} copies, {} reused, {} not kept (GPU-written lately); {} checks for CPU writes ({} failed, {} waited for another thread's take), entries dropped by CPU writes {}, by GPU/CP/host writes and mapping changes {}, by eviction {}; {} without space, {} left to a batch not submitted yet; {} entries in {} chunks of {} MiB and {} big slots ({} MiB; {} big copies, {} dropped by writes, {} declined as changed lately); epochs: {} submissions, {} waits the CPU released, {} REWIND ({} waits passed on GPU writes ended none)\n",
+        "    shared batch-start copies: {} copies, {} reused, {} not kept (GPU-written lately); {} checks for CPU writes ({} failed, {} waited for another thread's take), entries dropped by CPU writes {}, by GPU/CP/host writes and mapping changes {}, by eviction {}; {} without space, {} left to a batch not submitted yet; {} entries in {} chunks of {} MiB; epochs: {} submissions, {} waits the CPU released, {} REWIND ({} waits passed on GPU writes ended none)\n",
         s[1],
         s[0],
         s[8],
@@ -1068,11 +973,6 @@ pub fn status() -> String {
         entries,
         chunks,
         CHUNK >> 20,
-        bigs,
-        big_mib,
-        s[10],
-        s[11],
-        s[12],
         ENDS[0].load(Ordering::Relaxed),
         ENDS[1].load(Ordering::Relaxed),
         ENDS[2].load(Ordering::Relaxed),

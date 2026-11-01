@@ -19,12 +19,10 @@ pub static GPU_ARG_DRAWS: AtomicU64 = AtomicU64::new(0);
 /// Of them, those recorded as a repeat of the draw before (`draw_repeat`).
 pub static REPEAT_DRAWS: AtomicU64 = AtomicU64::new(0);
 
-/// A draw with GPU-read arguments that another can repeat (`draw_repeat`):
-/// the batch and `cmd_uses` right after it was recorded, its index binding
-/// (base, index size, bytes; the home's buffer and offset bound) and the
-/// arguments' home buffer; or (`cpu`) a draw whose arguments the CPU read,
-/// drawn in `cpu_args_base` mode with its indices in a home (`index_off`:
-/// the offset bound last).
+/// An indexed indirect draw whose arguments the CPU read, drawn in
+/// `cpu_args_base` mode with its indices in a home, that the next can
+/// repeat (`draw_repeat_cpu`): the batch and `cmd_uses` right after it was
+/// recorded, its index size and the home's buffer and offset bound last.
 #[derive(Clone, Copy)]
 pub(crate) struct Repeat {
     batch: u64,
@@ -32,8 +30,6 @@ pub(crate) struct Repeat {
     index: (u64, u32, u64),
     index_buf: vk::Buffer,
     index_off: u64,
-    args_buf: vk::Buffer,
-    cpu: bool,
 }
 
 const MAX_RT: usize = 8;
@@ -101,11 +97,6 @@ pub struct DrawArgs {
     /// Added to the instance id VGPR (indirect draws whose packet names no
     /// start-instance SGPR; see the CP).
     pub first_instance: u32,
-    /// An indexed indirect draw whose arguments the GPU reads (`tune
-    /// draw_args_gpu`); `count`, `instances`, `base_vertex` and
-    /// `first_instance` are then unused and `index` is the index buffer's
-    /// start.
-    pub gpu_args: Option<GpuArgs>,
     /// The vertex stage's user-data word that takes the start instance from
     /// `gl_BaseInstance`: an indexed indirect draw whose arguments the CPU
     /// read, drawn with `first_instance` as Vulkan's first instance (`tune
@@ -113,16 +104,6 @@ pub struct DrawArgs {
     pub base_inst: Option<u16>,
 }
 
-/// Arguments read by the GPU (`DrawArgs::gpu_args`).
-#[derive(Clone, Copy, Debug)]
-pub struct GpuArgs {
-    /// Guest address of the DrawIndexIndirect record (in a video-memory home).
-    pub addr: u64,
-    /// The vertex stage's user-data word that receives the start instance.
-    pub inst_slot: u16,
-    /// The index buffer's size in bytes (VGT_INDEX_BUFFER_SIZE), in a home.
-    pub index_bytes: u64,
-}
 
 /// `draw` outcome when the vertex stage needs the start instance on the CPU
 /// (`shaders::uses_user_word`): the command processor reads the arguments
@@ -708,42 +689,13 @@ impl Exec {
         outcome
     }
 
-    /// Records an indexed indirect draw whose arguments the GPU reads at
-    /// `args` as one more `vkCmdDrawIndexedIndirect` on the state the draw
-    /// before left (pipeline, push descriptors, dynamic state, index buffer,
-    /// rendering instance; `tune draw_repeat`): only when that draw was
-    /// repeatable, nothing was recorded into the batch since, the index
-    /// binding is the same and both homes still hold their ranges without a
-    /// copy in (one would be recorded first: the draw is then recorded in
-    /// full). The command processor calls it only when no packet but such
-    /// draws came between them, so the registers are the same. False: not
-    /// taken.
-    pub fn draw_repeat(&mut self, args: u64, index: (u64, u32), index_bytes: u64) -> bool {
-        let Some(r) = self.repeat.take() else { return false };
-        if r.cpu || DEVICE_LOST.load(Ordering::Relaxed) || !self.recording || self.stopped || self.batch_count != r.batch || self.cmd_uses.get() != r.uses || self.rendering.is_none() || (index.0, index.1, index_bytes) != r.index || sync_mode() {
-            return false;
-        }
-        let Some(ah) = self.home_bind(args, 20, false, HomeUse::Sized) else { return false };
-        let Some(ih) = self.home_bind(index.0, index_bytes, false, HomeUse::Index) else { return false };
-        if self.stopped || self.batch_count != r.batch || self.cmd_uses.get() != r.uses || ah.0 != r.args_buf || (ih.0, ih.1) != (r.index_buf, r.index_off) {
-            return false;
-        }
-        unsafe { ctx().device.cmd_draw_indexed_indirect(self.slots[self.cur].cmd, ah.0, ah.1, 1, 20) };
-        GPU_ARG_DRAWS.fetch_add(1, Ordering::Relaxed);
-        REPEAT_DRAWS.fetch_add(1, Ordering::Relaxed);
-        DRAWN.fetch_add(1, Ordering::Relaxed);
-        self.args_read = true;
-        self.repeat = Some(r);
-        true
-    }
-
     /// The same for an indexed indirect draw whose arguments the CPU read
     /// (`tune cpu_args_base`): `index` is its first index's address and the
     /// index size, the others its arguments. Its indices must lie in the
     /// home the draw before bound (bound again at their offset).
     pub fn draw_repeat_cpu(&mut self, index: (u64, u32), count: u32, instances: u32, base_vertex: i32, first_instance: u32) -> bool {
         let Some(mut r) = self.repeat.take() else { return false };
-        if !r.cpu || DEVICE_LOST.load(Ordering::Relaxed) || !self.recording || self.stopped || self.batch_count != r.batch || self.cmd_uses.get() != r.uses || self.rendering.is_none() || index.1 != r.index.1 || sync_mode() {
+        if DEVICE_LOST.load(Ordering::Relaxed) || !self.recording || self.stopped || self.batch_count != r.batch || self.cmd_uses.get() != r.uses || self.rendering.is_none() || index.1 != r.index.1 || sync_mode() {
             return false;
         }
         if count == 0 || instances == 0 {
@@ -846,8 +798,7 @@ impl Exec {
     /// Records the draw; Ok(false) when it has no effect here.
     fn draw_inner(&mut self, cp: &Cp, a: &DrawArgs) -> Result<bool, String> {
         self.fe2_min_want = u32::MAX;
-        let gpu = a.gpu_args;
-        if gpu.is_none() && (a.count == 0 || a.instances == 0) {
+        if a.count == 0 || a.instances == 0 {
             return Ok(false);
         }
         // Phase times (DS_PROFILE_GPU only: a clock read costs ~20 ns).
@@ -898,7 +849,7 @@ impl Exec {
         // start instance on the GPU (prepared here).
         // The start instance from gl_BaseInstance: arguments the GPU reads,
         // or CPU-read ones drawn with it as Vulkan's first instance.
-        let base_slot = gpu.map(|g| g.inst_slot).or(a.base_inst);
+        let base_slot = a.base_inst;
         // Batched draws: a GPU-resolved pair's stages are translated batched
         // and its draws recorded as runs of a multi-draw (`DrawRun`). Rect
         // lists (a geometry stage) and draws whose arguments the GPU reads
@@ -907,7 +858,7 @@ impl Exec {
         // GPU-resolved draws (`gpures`, stage G4): a pair whose per-item
         // chains the shaders resolve runs batched, its draws after a run's
         // first appended with their user data alone (no preparation).
-        let direct = ps_addr != 0 && gpu.is_none() && !rect && self.recording && !sync_mode();
+        let direct = ps_addr != 0 && !rect && self.recording && !sync_mode();
         let mut gpu_pair = if direct && super::super::tune::gpu_chains() == 1 && ctx().draw_indirect_count && ctx().device_addresses { super::super::gpures::draw_decided(vs_addr, ps_addr) } else { None };
         if gpu_pair.is_some() && self.draw_same {
             if let Some(drawn) = self.draw_gpu_append(cp, a, vs_addr, ps_addr)? {
@@ -1066,7 +1017,7 @@ impl Exec {
             if let Some(p) = &ps {
                 stages.push((&p.tr.plan, &p.user[..]));
             }
-            if let Some(check) = super::super::drawcensus::observe(pair, &stages, consecutive, gpu.is_some()) {
+            if let Some(check) = super::super::drawcensus::observe(pair, &stages, consecutive, false) {
                 let mut hit = false;
                 for (st, idx) in [Some(&vs), ps.as_ref()].into_iter().flatten().zip(check) {
                     for i in idx {
@@ -1089,7 +1040,7 @@ impl Exec {
             let k = note_draw_diff(&mut self.last_draw_sig, sig, consecutive);
             // Batched-draw candidates (buffers differ): where their arguments
             // and indices are against the draw before.
-            let here = (gpu.map(|g| g.addr), a.index.map(|i| i.0));
+            let here: (Option<u64>, Option<u64>) = (None, a.index.map(|i| i.0));
             if consecutive && k == 2 {
                 let (args, index) = self.last_draw_where;
                 let c = &BATCH_CANDS;
@@ -1126,35 +1077,18 @@ impl Exec {
         // that GPU work wrote through a large binding) are bound from it and
         // read in order on the GPU; others are waited for if GPU work writes
         // them.
-        let index_bytes = |size: u32| gpu.map_or(a.count as u64 * size as u64, |g| g.index_bytes);
+        let index_bytes = |size: u32| a.count as u64 * size as u64;
         let index_home = match a.index {
             Some((addr, size)) => {
                 let bytes = index_bytes(size);
                 let h = self.home_bind(addr, bytes, false, super::HomeUse::Index);
                 if h.is_none() {
-                    if gpu.is_some() {
-                        return Err(format!("index buffer {addr:#x}+{bytes:#x} of a draw reading its arguments on the GPU is not in a video-memory home (draw skipped)"));
-                    }
                     self.sync_for(&[(addr, bytes)], SYNC_DRAW_INDICES);
                 }
                 if self.stopped {
                     return Err(super::STOPPED.into());
                 }
                 h
-            }
-            None => None,
-        };
-        // Arguments the GPU reads: from their video-memory home.
-        let args_home = match gpu {
-            Some(g) => {
-                let h = self.home_bind(g.addr, 20, false, super::HomeUse::Sized);
-                if self.stopped {
-                    return Err(super::STOPPED.into());
-                }
-                match h {
-                    Some(h) => Some(h),
-                    None => return Err(format!("indirect arguments {:#x} are no longer in a video-memory home (draw skipped)", g.addr)),
-                }
             }
             None => None,
         };
@@ -1374,11 +1308,6 @@ impl Exec {
             // Kept until the batch that draws completes (once per batch).
             if !self.keep_home(h.0, h.3.as_ref()) {
                 return Err("the index buffer's video-memory home was dropped during the draw (draw skipped)".into());
-            }
-        }
-        if let Some(h) = &args_home {
-            if !self.keep_home(h.0, h.3.as_ref()) {
-                return Err("the indirect arguments' video-memory home was dropped during the draw (draw skipped)".into());
             }
         }
         // Indices in guest memory that a resident shadow holds newer data for.
@@ -1721,9 +1650,7 @@ impl Exec {
             let ti = self.batch_shaders.len() as u32;
             // Full-screen passes (a triangle or quad, one instance) count as
             // large: their cost is the pixels they shade.
-            let work = if gpu.is_some() {
-                0
-            } else if a.count <= 4 && a.instances == 1 {
+            let work = if a.count <= 4 && a.instances == 1 {
                 u64::MAX
             } else {
                 a.count as u64 * a.instances as u64
@@ -1788,14 +1715,7 @@ impl Exec {
                     super::INDEX_SNAP_BYTES.fetch_add(a.count as u64 * size as u64, Ordering::Relaxed);
                     let ty = if size == 4 { vk::IndexType::UINT32 } else { vk::IndexType::UINT16 };
                     c.device.cmd_bind_index_buffer(cmd, sbuf, soff + sbias, ty);
-                    match &args_home {
-                        Some(h) => {
-                            GPU_ARG_DRAWS.fetch_add(1, Ordering::Relaxed);
-                            c.device.cmd_draw_indexed_indirect(cmd, h.0, h.1, 1, 20);
-                            self.args_read = true;
-                        }
-                        None => c.device.cmd_draw_indexed(cmd, a.count, a.instances, 0, base_vertex, a.first_instance),
-                    }
+                    c.device.cmd_draw_indexed(cmd, a.count, a.instances, 0, base_vertex, a.first_instance);
                 }
                 Some((addr, size)) => {
                     let bytes = a.count as u64 * size as u64;
@@ -1831,13 +1751,10 @@ impl Exec {
         let no_writes = bounds.iter().all(|b| b.writes.is_empty());
         // (Not after a batched draw: its pipeline's vertex stage reads its
         // SGPR data from the run's table by draw index.)
-        let repeat = match (gpu, &args_home, &index_home, a.index) {
+        let repeat = match (&index_home, a.index) {
             _ if batched => None,
-            (Some(g), Some(ah), Some(ih), Some((addr, size))) if untimed && no_writes && self.recording && super::super::tune::draw_repeat() && !sync_mode() => {
-                Some(Repeat { batch: self.batch_count, uses: 0, index: (addr, size, g.index_bytes), index_buf: ih.0, index_off: ih.1, args_buf: ah.0, cpu: false })
-            }
-            (None, None, Some(ih), Some((_, size))) if a.base_inst.is_some() && untimed && no_writes && self.recording && super::super::tune::draw_repeat() && !sync_mode() => {
-                Some(Repeat { batch: self.batch_count, uses: 0, index: (0, size, 0), index_buf: ih.0, index_off: ih.1, args_buf: vk::Buffer::null(), cpu: true })
+            (Some(ih), Some((_, size))) if a.base_inst.is_some() && untimed && no_writes && self.recording && super::super::tune::draw_repeat() && !sync_mode() => {
+                Some(Repeat { batch: self.batch_count, uses: 0, index: (0, size, 0), index_buf: ih.0, index_off: ih.1 })
             }
             _ => None,
         };
@@ -2138,7 +2055,7 @@ impl Exec {
         };
         let at = (self.batch_count, self.cmd_uses.get());
         let Some(g) = r.gpu.as_ref() else { return Ok(None) };
-        if g.pair != (vs_addr, ps_addr) || !r.appendable || r.fresh || (r.batch, r.uses) != at || r.n >= r.max || r.index.is_some() != a.index.is_some() || a.gpu_args.is_some() || a.base_inst != g.base_inst || self.rendering.is_none() || self.stopped || [cp.reg(Space::Sh, 0x8B), cp.reg(Space::Sh, 0x0B)] != g.rsrc2 {
+        if g.pair != (vs_addr, ps_addr) || !r.appendable || r.fresh || (r.batch, r.uses) != at || r.n >= r.max || r.index.is_some() != a.index.is_some() || a.base_inst != g.base_inst || self.rendering.is_none() || self.stopped || [cp.reg(Space::Sh, 0x8B), cp.reg(Space::Sh, 0x0B)] != g.rsrc2 {
             stats[3].fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }

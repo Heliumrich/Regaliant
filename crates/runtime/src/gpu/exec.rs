@@ -54,7 +54,7 @@ fn skip_cs(cp: &Cp) -> bool {
 fn cs_addr(cp: &Cp) -> u64 {
     ((cp.reg(Space::Sh, 0x20C) as u64) | ((cp.reg(Space::Sh, 0x20D) as u64 & 0xFF) << 32)) << 8
 }
-pub use draw::{DrawArgs, GpuArgs, NEEDS_CPU_ARGS};
+pub use draw::{DrawArgs, NEEDS_CPU_ARGS};
 
 pub static EXECUTED: AtomicU64 = AtomicU64::new(0);
 /// The Vulkan device was lost: GPU execution stops (reported once).
@@ -216,17 +216,6 @@ pub static FILLS_IN_PLACE: AtomicU64 = AtomicU64::new(0);
 pub static FILL_SKIPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Fills `tune fill_skip` considers (smaller ones store as before).
 const FILL_SKIP_MIN: u64 = 256 << 10;
-/// Logs why a big read-only binding stays in place, once per range and
-/// reason (the first 48).
-fn note_big_refusal(base: u64, size: u64, why: &'static str) {
-    static SEEN: Mutex<Option<std::collections::HashSet<(u64, u64, &'static str)>>> = Mutex::new(None);
-    let mut g = SEEN.lock();
-    let seen = g.get_or_insert_with(Default::default);
-    if seen.len() < 48 && seen.insert((base, size, why)) {
-        crate::info!("gpu: read-only binding {base:#x}+{size:#x} ({} MiB) read in place: {why}", size >> 20);
-    }
-}
-
 /// Dispatches whose global write notes were skipped (`Exec::last_notes`).
 pub static NOTES_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
@@ -4147,8 +4136,8 @@ struct RangeLog {
     /// here instead of page by page: the culls' 112 MB home took ~1,800
     /// atomic updates per batch that wrote it).
     coarse: [AtomicU64; COARSE_BUCKETS],
-    /// The same for those large writes alone (`tune log_big`: what a small
-    /// read needs beside its page buckets).
+    /// The same for those large writes alone (what a small read needs
+    /// beside its page buckets).
     big: [AtomicU64; COARSE_BUCKETS],
     /// `pages`, `coarse` and `big` inside the guest span, exact: one entry
     /// per page and per 4 MiB block. (Hashed, a third of a lookup's trips
@@ -4269,11 +4258,6 @@ impl RangeLog {
     /// Whether some unfinished batch may write into one of `reads` (false:
     /// certainly none).
     fn may_overlap(&self, reads: &[(u64, u64)], done: u64) -> bool {
-        self.may_overlap_as(reads, done, super::tune::log_big())
-    }
-
-    /// `may_overlap` with `tune log_big` given (tests).
-    fn may_overlap_as(&self, reads: &[(u64, u64)], done: u64, big: bool) -> bool {
         reads.iter().any(|&(a, n)| {
             if n == 0 {
                 return false;
@@ -4290,8 +4274,8 @@ impl RangeLog {
                 return coarse(&self.coarse, &self.span.coarse);
             }
             // Small ones by their pages and the large writes' 4 MiB
-            // buckets (a small write marks its pages: `tune log_big`).
-            (first..=last).any(|p| self.page(p).load(Ordering::SeqCst) > done) || if big { coarse(&self.big, &self.span.big) } else { coarse(&self.coarse, &self.span.coarse) }
+            // buckets (a small write marks its pages).
+            (first..=last).any(|p| self.page(p).load(Ordering::SeqCst) > done) || coarse(&self.big, &self.span.big)
         })
     }
 
@@ -4370,8 +4354,8 @@ mod range_log_tests {
     static LOG: RangeLog = RangeLog::new(&SPAN);
 
     /// The write log's entries never pass a read that overlaps a pending
-    /// write, small or large (`tune log_big`: small reads go by their pages
-    /// and the large writes' 4 MiB blocks), and large reads go by every
+    /// write, small or large (small reads go by their pages and the large
+    /// writes' 4 MiB blocks), and large reads go by every
     /// write's 4 MiB blocks; exact inside the guest span, hashed beyond it.
     #[test]
     fn buckets_find_every_overlapping_write() {
@@ -4403,9 +4387,7 @@ mod range_log_tests {
                 let n = if next() % 8 == 0 { next() % (96 << 20) + 1 } else { next() % (128 << 10) + 1 };
                 let overlaps = writes.iter().any(|&(wa, wn)| wa < a + n && a < wa + wn);
                 if overlaps {
-                    for big in [false, true] {
-                        assert!(LOG.may_overlap_as(&[(a, n)], done, big), "round {round} (log_big {big}): read {a:#x}+{n:#x} passed a pending write");
-                    }
+                    assert!(LOG.may_overlap(&[(a, n)], done), "round {round}: read {a:#x}+{n:#x} passed a pending write");
                 }
             }
         }
@@ -7028,6 +7010,7 @@ pub fn reset_shader_profile() {
     *PROG_CENSUS.lock() = None;
     PROG_GEN.fetch_add(1, Ordering::Relaxed);
     PROG_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
+    shaders::reset_prep_parts();
     for c in DRAW_STEPS.iter().flatten().chain(DRAW_STEPS_GPU.iter().flatten()).chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(DRAW_STEPS_FIRST.iter().flatten()).chain(CS_STEPS_FIRST.iter().flatten()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()).chain(BIND_STEPS_BY.iter().flatten()).chain(PRE_STEPS_BY.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
@@ -7051,7 +7034,7 @@ pub fn laps_report() -> String {
     if !laps() || profiling() {
         return String::new();
     }
-    draw_steps_line() + &bind_steps_line() + &pre_steps_line() + &prog_census_lines()
+    draw_steps_line() + &shaders::prep_parts_line() + &bind_steps_line() + &pre_steps_line() + &prog_census_lines()
 }
 
 /// Shaders by total GPU time.
@@ -7117,6 +7100,7 @@ pub fn shader_profile() -> String {
     }
     s.push_str(&phases_line("draw", &DRAW_PHASES, ["prepare and shader-read waits", "textures, targets, pipeline", "bindings"]));
     s.push_str(&draw_steps_line());
+    s.push_str(&shaders::prep_parts_line());
     s.push_str(&super::cp::draw_state_line());
     s.push_str(&draw::draw_diff_line());
     s.push_str(&draw::prep_repeat_line());
@@ -7327,7 +7311,7 @@ pub struct Exec {
     /// since the last full barrier: the next dispatch or draw waits.
     barrier_wanted: bool,
     /// A draw read its arguments on the GPU since the last full barrier
-    /// (`tune draw_args_gpu`): a dispatch writing an argument home waits for
+    /// (argument homes): a dispatch writing an argument home waits for
     /// it (the console's command processor read them when it reached the
     /// draw, so the title rewrites them without synchronizing).
     args_read: bool,
@@ -9153,9 +9137,9 @@ impl Exec {
         }
     }
 
-    /// Writes the write-watched (argument) homes' GPU-written parts back and
-    /// drops the homes (`tune draw_args_gpu 0` while they exist; the main
-    /// command processor when it plans a parallel run: no worker records).
+    /// Writes the write-watched argument homes' GPU-written parts back and
+    /// drops the homes (the main command processor when it plans a parallel
+    /// run: no worker records).
     /// Later readers of those parts wait for this batch.
     pub fn evict_watched_homes(&mut self) {
         if self.deferred {
@@ -10224,25 +10208,18 @@ impl Exec {
 
     pub(super) fn pre_copy(&mut self, base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
         let mut clk = PreClock::start();
-        // Over `pre_max`: only as a shared copy (`tune pre_big_max`).
-        let big = size > super::tune::pre_max();
+        // Over `pre_max`: read in place.
         let shares = self.shares_pre && (!self.batch_alt || self.batch_alt_share);
-        if size == 0 || (big && !(size <= super::tune::pre_big_max() && shares && super::precache::enabled())) || self.pre_failed {
+        if size == 0 || size > super::tune::pre_max() || self.pre_failed {
             return None;
         }
         if super::homes::overlaps(base, size) {
-            if big {
-                note_big_refusal(base, size, "a video-memory home overlaps it");
-            }
             return None;
         }
         let r = [(base, size)];
         // Refused while this queue's batches, open or submitted, write it.
         let pending = self.overlaps_pending(&r);
         if pending || CP_WRITES.latest(&r).is_some() {
-            if big {
-                note_big_refusal(base, size, if pending { "GPU work of this queue writes it" } else { "a deferred CP write" });
-            }
             return None;
         }
         let al = base & !15;
@@ -10273,12 +10250,7 @@ impl Exec {
         }
         PreClock::set(&mut clk, 5);
         let off = self.pre_used.next_multiple_of(self.ring_align);
-        let Some((src, start, _)) = span(al, n) else {
-            if big {
-                note_big_refusal(base, size, "not one mapping");
-            }
-            return None;
-        };
+        let Some((src, start, _)) = span(al, n) else { return None };
         // (Profiling: why no shared copy served it; left out of the clock.)
         let t_why = clk.as_ref().map(|_| unsafe { core::arch::x86_64::_rdtsc() });
         let why = if !profiling() {
@@ -10292,12 +10264,7 @@ impl Exec {
             c.t0 = c.t0.wrapping_add(unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t));
         }
         let shared = if share { super::precache::insert(base, size, n) } else { None };
-        // The batch's own segment for copies not shared (big ones are read
-        // in place then).
-        if shared.is_none() && big {
-            note_big_refusal(base, size, "the shared copies declined it");
-            return None;
-        }
+        // The batch's own segment for copies not shared.
         if shared.is_none() && !self.pre_room(off + n) {
             PRE_FULL.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -12769,12 +12736,6 @@ impl Exec {
                         BindClock::mark(&mut clk, 0);
                         if size > 0 && !found.tr.plan.resources[i].written {
                             bound.reads.push((base, size));
-                        }
-                        // Written records of indirect draw arguments (16 or 20
-                        // bytes): where draws may read them on the GPU (`tune
-                        // draw_args_gpu`, `homes::vote_args`).
-                        if matches!(stride, 16 | 20) && size <= super::tune::shadow_max() && found.tr.plan.resources[i].written && super::tune::draw_args_gpu() {
-                            super::homes::note_shadow_write(base, size);
                         }
                         let mut info = vk::DescriptorBufferInfo { buffer: fx.dummy, offset: 0, range: DUMMY_BYTES };
                         let mut bias = 0u64;

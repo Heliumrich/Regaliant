@@ -2967,7 +2967,7 @@ pub fn init() {
     // when they execute, after the earlier chunks' write-backs, and its pages
     // are valid only once it is queued, in program order; its CPU reads are
     // checked at its turn against the run's earlier writes as before.)
-    const OFF: [&str; 5] = ["homes", "draw_args_gpu", "shadow_args", "pre_share", "host_census"];
+    const OFF: [&str; 4] = ["homes", "shadow_args", "pre_share", "host_census"];
     for name in OFF {
         if !super::tune::set(name, 0) {
             crate::warn!("fe2: no switch {name}");

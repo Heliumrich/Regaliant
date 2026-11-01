@@ -26,19 +26,9 @@
 //! home suits buffers only the GPU writes. A remap drops the home; batches
 //! that bound it hold it until they complete.
 //!
-//! Indirect draw arguments (`tune draw_args_gpu`): the culls write the
-//! frame's DrawIndexIndirect records (a 300 KB buffer, 0x1008a9ea10 at the
-//! courtyard) through VRAM shadows, which were copied in at each batch's
-//! first use and merged back at its end (~5 ms of GPU time per frame) so
-//! that the command processor could read them. Draws that read their
-//! arguments on the GPU need neither: such a buffer (an exact written
-//! binding of 16- or 20-byte records, `note_shadow_write`) named by draws
-//! that could read their arguments on the GPU (`vote_args`) gets a home of
-//! its own (`ready_args_candidates`, `create_args`) once the CPU was seen
-//! writing none of its pages for OBSERVE_FRAMES frames (the CPU writes some
-//! such buffers whole: dword merges kept both sides' writes, a home could
-//! not). The home stays
-//! write-watched: once per synchronization epoch, as for the batch-start
+//! Write-watched homes (`tune homes_watch`; argument homes, made for draws
+//! reading their arguments on the GPU, `tune draw_args_gpu`, until that was
+//! removed on 2026-11-01): once per synchronization epoch, as for the batch-start
 //! copies (`precache`), the pages the CPU wrote are compared word by word
 //! with the guest memory the home last took in (`Home::snap`), and only the
 //! words that changed are copied in before its next GPU use: the GPU-written
@@ -211,12 +201,6 @@ fn with_ranges<R>(f: impl FnOnce(&[(u64, u64)]) -> R) -> R {
 /// Guest ranges GPU work wrote through bindings too large for a shadow
 /// (home candidates).
 static LARGE_WRITES: Mutex<Ranges> = Mutex::new(Ranges::new());
-/// Exact written bindings small enough for a VRAM shadow whose records are
-/// the size of indirect draw arguments (16 or 20 bytes), most recent last
-/// (`tune draw_args_gpu`: where those arguments may live; all written
-/// bindings were too many: the culls' buffer fell out within a frame).
-static SHADOW_WRITES: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
-const SHADOW_WRITES_MAX: usize = 256;
 /// Write-watched homes: bytes the CPU changed (copied in), written pages
 /// the home covers only in part, checks.
 pub static CPU_WRITTEN_PAGES: AtomicU64 = AtomicU64::new(0);
@@ -226,16 +210,7 @@ pub static WATCH_CHECKS: AtomicU64 = AtomicU64::new(0);
 /// write-watch query: a watcher thread starting them when epochs end saved
 /// nothing, 2026-10-17).
 pub static WATCH_NS: AtomicU64 = AtomicU64::new(0);
-/// Frames an argument buffer is watched for CPU writes before its home.
-const OBSERVE_FRAMES: u64 = 120;
-/// Argument buffers watched before their home: (base, size, first frame);
-/// buffers the CPU wrote (never given a home).
-static OBSERVED: Mutex<Vec<(u64, u64, u64)>> = Mutex::new(Vec::new());
-static CPU_SIDE: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
-/// Argument buffers named by draws that could read them on the GPU.
-static VOTED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
-/// Argument buffers whose home `tune draw_args_gpu 0` dropped: watched
-/// before, made again without waiting OBSERVE_FRAMES.
+/// Argument buffers whose home was dropped (`take_watched`).
 static KNOWN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 /// Bumped when argument homes come or go (threads name a buffer again).
 static VOTE_GEN: AtomicU64 = AtomicU64::new(1);
@@ -699,155 +674,6 @@ fn apply_cpu_writes(h: &mut Home, (taken, pages, handed): Found) {
     h.shared.stale_gen.fetch_add(1, Ordering::AcqRel);
 }
 
-/// GPU work writes [base, base+size) through a binding small enough for a
-/// VRAM shadow, of 16- or 20-byte records (`tune draw_args_gpu`: noted for
-/// `vote_args`).
-pub fn note_shadow_write(base: u64, size: u64) {
-    let frame = super::FRAMES.load(Ordering::Relaxed);
-    if LAST_SHADOW.with(|c| c.get()) == (base, size, frame) {
-        return;
-    }
-    LAST_SHADOW.with(|c| c.set((base, size, frame)));
-    let mut g = SHADOW_WRITES.lock();
-    if let Some(i) = g.iter().rposition(|&r| r == (base, size)) {
-        let r = g.remove(i);
-        g.push(r);
-    } else {
-        if g.len() >= SHADOW_WRITES_MAX {
-            g.remove(0);
-        }
-        g.push((base, size));
-    }
-}
-
-/// DS_TRACE_ARGS_HOMES=1: the argument homes' decisions (`vote_args`,
-/// `ready_args_candidates`), the first 400.
-fn trace_args(f: impl FnOnce() -> String) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    static N: AtomicU64 = AtomicU64::new(0);
-    if *ON.get_or_init(|| std::env::var("DS_TRACE_ARGS_HOMES").ok().as_deref() == Some("1")) && N.fetch_add(1, Ordering::Relaxed) < 400 {
-        crate::info!("args homes: {}", f());
-    }
-}
-
-/// An indexed indirect draw that could read its arguments [a, a+n) on the
-/// GPU but for their home: the buffer GPU work writes them through (a
-/// shadow-sized binding, `note_shadow_write`; the smallest that holds them)
-/// becomes a candidate (`ready_args_candidates`). Cheap when repeated: each
-/// thread remembers the last buffer it named and the last page it found
-/// none on (for the frame).
-pub fn vote_args(a: u64, n: u64) {
-    let (lb, lm, lg) = LAST_VOTE.with(|c| c.get());
-    let vgen = VOTE_GEN.load(Ordering::Acquire);
-    if lg == vgen && lb <= a && a + n <= lb + lm {
-        return;
-    }
-    let frame = super::FRAMES.load(Ordering::Relaxed);
-    if LAST_MISS.with(|c| c.get()) == (a >> 12, frame) {
-        return;
-    }
-    let found = SHADOW_WRITES.lock().iter().filter(|&&(b, m)| b <= a && a + n <= b + m).min_by_key(|r| r.1).copied();
-    match found {
-        Some(r) => {
-            LAST_VOTE.with(|c| c.set((r.0, r.1, vgen)));
-            let mut v = VOTED.lock();
-            if !v.contains(&r) {
-                if v.len() >= 32 {
-                    v.remove(0);
-                }
-                v.push(r);
-                trace_args(|| format!("{a:#x} names {:#x}+{:#x} (frame {frame})", r.0, r.1));
-            }
-        }
-        None => {
-            trace_args(|| format!("{a:#x}: no shadow-written binding holds it (frame {frame}, {} noted)", SHADOW_WRITES.lock().len()));
-            LAST_MISS.with(|c| c.set((a >> 12, frame)));
-        }
-    }
-}
-
-/// The candidates (`vote_args`) ready for a home: watched for CPU writes
-/// for OBSERVE_FRAMES frames first, given up for good once the CPU wrote one
-/// of the pages a candidate covers whole. Called when parallel runs are
-/// planned (a few times per frame).
-pub fn ready_args_candidates() -> Vec<(u64, u64)> {
-    let voted: Vec<(u64, u64)> = {
-        let v = VOTED.lock();
-        if v.is_empty() {
-            return Vec::new();
-        }
-        v.clone()
-    };
-    let mut ready = Vec::new();
-    for (b, m) in voted {
-        let give_up = || {
-            VOTED.lock().retain(|&r| r != (b, m));
-            OBSERVED.lock().retain(|o| (o.0, o.1) != (b, m));
-        };
-        if !crate::mem::write_watched() || b % 4 != 0 || m % 4 != 0 || overlaps(b, m) || CPU_SIDE.lock().iter().any(|&r| r == (b, m)) {
-            trace_args(|| format!("{b:#x}+{m:#x} given up (overlaps a home {})", overlaps(b, m)));
-            give_up();
-            continue;
-        }
-        let frame = super::FRAMES.load(Ordering::Relaxed);
-        let mut pages = Vec::new();
-        if super::precache::take_written_for(b, m, &mut pages, None, 5).is_none() {
-            give_up();
-            continue;
-        }
-        let interior = pages.iter().filter(|&&p| p >= b && p + 4096 <= b + m).count();
-        trace_args(|| format!("{b:#x}+{m:#x}: {} pages written ({interior} inside), known {}", pages.len(), KNOWN.lock().contains(&(b, m))));
-        if interior == 0 && KNOWN.lock().contains(&(b, m)) {
-            VOTED.lock().retain(|&r| r != (b, m));
-            ready.push((b, m));
-            continue;
-        }
-        let mut obs = OBSERVED.lock();
-        let Some(i) = obs.iter().position(|o| (o.0, o.1) == (b, m)) else {
-            // The first take: writes from before the watch started.
-            if obs.len() >= 32 {
-                obs.remove(0);
-            }
-            obs.push((b, m, frame));
-            continue;
-        };
-        if interior > 0 {
-            std::mem::drop(obs);
-            drop_cpu_side(b, m, interior);
-            continue;
-        }
-        if frame >= obs[i].2 + OBSERVE_FRAMES {
-            obs.remove(i);
-            std::mem::drop(obs);
-            VOTED.lock().retain(|&r| r != (b, m));
-            ready.push((b, m));
-        }
-    }
-    ready
-}
-
-/// A candidate the CPU writes: never given a home.
-fn drop_cpu_side(b: u64, m: u64, interior: usize) {
-    VOTED.lock().retain(|&r| r != (b, m));
-    OBSERVED.lock().retain(|o| (o.0, o.1) != (b, m));
-    CPU_SIDE.lock().push((b, m));
-    crate::info!("gpu: indirect draw arguments in {b:#x}+{m:#x}: the CPU writes {interior} of its pages, no video-memory home (read on the CPU)");
-}
-
-/// A write-watched home of exactly [b, b+n) for indirect draw arguments
-/// (`ready_args_candidates`). The caller makes sure no batch holds a shadow of the
-/// range any more: all GPU work writing it completed (merged into guest
-/// memory, which the home copies in at its first use) and no other thread
-/// records work that writes it.
-pub fn create_args(b: u64, n: u64) -> bool {
-    let made = create_with(b, n, true, true, "indirect draw arguments, write-watched");
-    if made {
-        WATCHED_ANY.store(true, Ordering::Release);
-        VOTE_GEN.fetch_add(1, Ordering::AcqRel);
-    }
-    made
-}
-
 /// Whether any write-watched (argument) home exists.
 pub fn any_watched() -> bool {
     WATCHED_ANY.load(Ordering::Acquire)
@@ -858,10 +684,9 @@ pub fn watched_overlaps(base: u64, size: u64) -> bool {
     any_watched() && with_snap(|r, s| r.iter().zip(s).any(|(&(b, n), (_, sh))| sh.args && b < base + size && base < b + n))
 }
 
-/// The write-watched (argument) homes' GPU-written parts (taken), then the
-/// homes are dropped (`tune draw_args_gpu 0` while they exist: the caller
-/// writes those parts back first; no other thread may record work that
-/// binds them).
+/// The write-watched argument homes' GPU-written parts (taken), then the
+/// homes are dropped (the caller writes those parts back first; no other
+/// thread may record work that binds them).
 pub fn take_watched() -> Vec<(u64, u64, Arc<HomeBuf>, u64)> {
     let mut g = super::lockstat::HOMES.lock(&HOMES);
     let mut v = Vec::new();
@@ -873,7 +698,7 @@ pub fn take_watched() -> Vec<(u64, u64, Arc<HomeBuf>, u64)> {
         if !known.contains(&(h.base, h.size)) {
             known.push((h.base, h.size));
         }
-        crate::info!("gpu: home {:#x}+{:#x} written back and dropped (tune draw_args_gpu 0)", h.base, h.size);
+        crate::info!("gpu: argument home {:#x}+{:#x} written back and dropped", h.base, h.size);
     }
     let before = g.len();
     g.retain(|h| !h.shared.args);
@@ -945,11 +770,6 @@ fn holds_cp_code(a: u64, n: u64) -> bool {
     let g = CP_CODE_PAGES.read();
     let Some(s) = g.as_ref() else { return false };
     (a >> 16..=(a + n - 1) >> 16).any(|p| s.contains(&p))
-}
-
-/// Whether a home holds all of [base, base+size).
-pub fn contains(base: u64, size: u64) -> bool {
-    any() && with_ranges(|r| r.iter().any(|&(b, n)| b <= base && base + size <= b + n))
 }
 
 /// Whether [base, base+size) overlaps a home.
@@ -1088,7 +908,6 @@ pub fn cpu_written(base: u64, size: u64) {
 /// (their contents with it).
 pub fn remapped(base: u64, size: u64) {
     LARGE_WRITES.lock().remove(base, size);
-    SHADOW_WRITES.lock().retain(|&(b, m)| !(b < base.saturating_add(size) && base < b + m));
     KNOWN.lock().retain(|&(b, m)| !(b < base.saturating_add(size) && base < b + m));
     VOTE_GEN.fetch_add(1, Ordering::AcqRel);
     if !any() {

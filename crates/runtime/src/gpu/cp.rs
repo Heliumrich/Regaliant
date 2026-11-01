@@ -58,12 +58,10 @@ pub fn sync_summary() -> String {
     let deferred = d.iter().take(6).map(|(_, op, x)| format!("{op:#x}: {} end of pipe / {} after sync / {} behind deferred", x[0], x[1], x[2])).collect::<Vec<_>>().join(", ");
     let kinds: Vec<String> = RELEASE_KINDS.iter().enumerate().filter(|(_, c)| c.load(Ordering::Relaxed) > 0).map(|(i, c)| format!("data {} int {}: {}", i / 8, i % 8, c.load(Ordering::Relaxed))).collect();
     format!(
-        "{waits}; deferred CP effects {deferred}; RELEASE_MEM by kind {}; waits passed on the own batch's GPU writes {}; label writes recorded while another queue waited (submitted at once) {}; indirect draws with arguments in homes read on the CPU {:?} (base vertex, no start-instance SGPR, 8-bit indices, indices outside homes, CPU-side start instance), {} of them after trying the GPU",
+        "{waits}; deferred CP effects {deferred}; RELEASE_MEM by kind {}; waits passed on the own batch's GPU writes {}; label writes recorded while another queue waited (submitted at once) {}",
         kinds.join(", "),
         OPEN_PROMISED.load(Ordering::Relaxed),
-        super::exec::LABEL_EARLY.load(Ordering::Relaxed),
-        CPU_ARG_REFUSED.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),
-        CPU_ARG_FALLBACKS.load(Ordering::Relaxed)
+        super::exec::LABEL_EARLY.load(Ordering::Relaxed)
     )
 }
 
@@ -1285,20 +1283,12 @@ pub static PROMISED: AtomicU64 = AtomicU64::new(0);
 /// draws they expanded to, and those packets whose count GPU work wrote
 /// (diagnostics: how much of the per-draw work they cause).
 pub static MDI_PACKETS: AtomicU64 = AtomicU64::new(0);
-/// Indexed indirect draws tried with the GPU reading their arguments whose
-/// vertex program needed them on the CPU (`draw_gpu_args`).
-pub static CPU_ARG_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// Waits passed on a GPU queue's write that ended no copy-cache epoch
 /// (`Cp::last_wait_gpu`).
 pub static EPOCH_GPU_WAITS: AtomicU64 = AtomicU64::new(0);
 /// Waits that ended no epoch under front end 2: [passed again on
 /// a counter's value, gone past].
 pub static QUIET_WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-/// Indexed indirect draws with arguments in a video-memory home read on the
-/// CPU, by why: a base-vertex SGPR, no start-instance SGPR of the vertex
-/// stage, 8-bit indices, indices outside homes, a vertex program needing the
-/// start instance on the CPU.
-pub static CPU_ARG_REFUSED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 pub static MDI_DRAWS: AtomicU64 = AtomicU64::new(0);
 pub static MDI_COUNT_FROM_MEMORY: AtomicU64 = AtomicU64::new(0);
 
@@ -2536,28 +2526,11 @@ impl Cp {
             }
         }
         // Indirect arguments are read when the chunks run: GPU work still
-        // writing them completes first. Draw arguments (20-byte records)
-        // that GPU work writes through VRAM shadows get a video-memory home
-        // now, before any worker records (`tune draw_args_gpu`): read by the
-        // GPU, they need no wait (a draw that cannot read them there reads
-        // them after a write-back: its chunk stops).
-        if !super::tune::draw_args_gpu() && super::homes::any_watched() {
+        // writing them completes first.
+        if super::homes::any_watched() {
             if let Some(e) = self.exec.as_mut() {
                 e.evict_watched_homes();
             }
-        }
-        if !args.is_empty() && super::tune::draw_args_gpu() {
-            let cands = super::homes::ready_args_candidates();
-            if !cands.is_empty() {
-                // Every writer completes first (merged into guest memory,
-                // which a home copies in at its first use); no worker
-                // records yet.
-                self.sync_reads(&cands);
-                for &(b, m) in &cands {
-                    super::homes::create_args(b, m);
-                }
-            }
-            args.retain(|&(a, n)| !(n == 20 && super::homes::contains(a, n)));
         }
         if !args.is_empty() && !super::tune::plan_fast() {
             args.sort_unstable();
@@ -4073,76 +4046,6 @@ impl Cp {
         self.split_if_due();
     }
 
-    /// An indexed indirect draw with the GPU reading its arguments (`tune
-    /// draw_args_gpu`): arguments and indices in video-memory homes, the
-    /// start instance handed to a user SGPR (none for the base vertex), a
-    /// vertex program that needs neither on the CPU. False: not taken (the
-    /// arguments are read here). Homes for arguments that GPU work writes
-    /// through VRAM shadows are made when parallel runs are planned
-    /// (`par_plan`).
-    fn draw_gpu_args(&mut self, opcode: u32, p: &dyn Fn(u64) -> u32) -> bool {
-        const GS_USER_DATA: u32 = 0x8C;
-        if opcode != op::DRAW_INDEX_INDIRECT || !super::tune::draw_args_gpu() || !super::exec::enabled() || self.exec_failed || super::capture::capturing() || !super::vk::try_ctx().is_some_and(|c| c.draw_parameters) {
-            return false;
-        }
-        let a = self.draw_indirect_base + p(0) as u64;
-        let in_home = super::homes::contains(a, 20);
-        // Arguments in a home read on the CPU instead (after a write-back of
-        // their record), counted by why.
-        let refuse = |k: usize| {
-            if in_home {
-                CPU_ARG_REFUSED[k].fetch_add(1, Ordering::Relaxed);
-            }
-            false
-        };
-        let (vtx_loc, inst_loc) = (p(1) & 0xFFFF, p(1) >> 16);
-        let inst_loc = if inst_loc != 0 { inst_loc } else { self.instance_offset_loc() };
-        if vtx_loc != 0 {
-            return refuse(0);
-        }
-        if !(GS_USER_DATA..GS_USER_DATA + 32).contains(&inst_loc) {
-            return refuse(1);
-        }
-        let Some(sz) = self.index_size() else { return refuse(2) };
-        let index_bytes = self.index_count as u64 * sz as u64;
-        if index_bytes == 0 || !super::homes::contains(self.index_base, index_bytes) {
-            return refuse(3);
-        }
-        if super::shaders::cpu_args_program(super::shaders::ngg_addr(self)) {
-            return refuse(4);
-        }
-        if !in_home {
-            // Read here this time; their buffer may get a home (`par_plan`).
-            if valid(a, 20) {
-                super::homes::vote_args(a, 20);
-            }
-            return false;
-        }
-        // The draw before was like this one, nothing came between them: one
-        // more indirect draw on the state it left (`tune draw_repeat`).
-        if std::mem::take(&mut self.repeat_ok) && super::tune::draw_repeat() {
-            let index_base = self.index_base;
-            if let Some(e) = self.exec.as_mut() {
-                if e.draw_repeat(a, (index_base, sz), index_bytes) {
-                    // (Stage preparations made ahead for it are not used.)
-                    let _ = self.take_ahead();
-                    self.last_draw = std::borrow::Cow::Borrowed("drawn (repeating the draw before)");
-                    self.repeat_ok = true;
-                    self.split_if_due();
-                    return true;
-                }
-            }
-        }
-        let g = super::exec::GpuArgs { addr: a, inst_slot: (inst_loc - GS_USER_DATA) as u16, index_bytes };
-        self.draw(super::exec::DrawArgs { count: 0, instances: 0, index: Some((self.index_base, sz)), base_vertex: None, first_instance: 0, gpu_args: Some(g), base_inst: None });
-        if self.last_draw == super::exec::NEEDS_CPU_ARGS {
-            CPU_ARG_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-        self.repeat_ok = super::tune::draw_repeat() && self.exec.as_ref().is_some_and(|e| e.repeat_ready());
-        true
-    }
-
     /// Whether a packet leaves the draw state as the last draw had it (a
     /// repeat of that draw stays possible, `tune draw_repeat`): indexed
     /// indirect draws, plain NOPs, and register writes and loads and index
@@ -4211,11 +4114,11 @@ impl Cp {
                 }
             }
         }
-        self.draw(super::exec::DrawArgs { count: w[0], instances: w[1], index: Some(index), base_vertex: Some(w[3] as i32), first_instance: w[4], gpu_args: None, base_inst: Some((inst_loc - GS_USER_DATA) as u16) });
+        self.draw(super::exec::DrawArgs { count: w[0], instances: w[1], index: Some(index), base_vertex: Some(w[3] as i32), first_instance: w[4], base_inst: Some((inst_loc - GS_USER_DATA) as u16) });
         if self.last_draw == super::exec::NEEDS_CPU_ARGS {
             // The start instance in its register, as before.
             self.set_reg(Space::Sh, inst_loc, w[4]);
-            self.draw(super::exec::DrawArgs { count: w[0], instances: w[1], index: Some(index), base_vertex: Some(w[3] as i32), first_instance: 0, gpu_args: None, base_inst: None });
+            self.draw(super::exec::DrawArgs { count: w[0], instances: w[1], index: Some(index), base_vertex: Some(w[3] as i32), first_instance: 0, base_inst: None });
             return std::mem::take(&mut self.last_draw).into_owned();
         }
         self.repeat_ok = super::tune::draw_repeat() && self.exec.as_ref().is_some_and(|e| e.repeat_ready());
@@ -4286,9 +4189,9 @@ impl Cp {
                 subs.push(format!("{:?}", &w[..rec as usize / 4]));
             }
             let (args, bv, si) = if indexed {
-                (super::exec::DrawArgs { count: w[0], instances: w[1], index: Some((self.index_base + w[2] as u64 * sz as u64, sz)), base_vertex: Some(w[3] as i32), first_instance: w[4], gpu_args: None, base_inst: None }, w[3], w[4])
+                (super::exec::DrawArgs { count: w[0], instances: w[1], index: Some((self.index_base + w[2] as u64 * sz as u64, sz)), base_vertex: Some(w[3] as i32), first_instance: w[4], base_inst: None }, w[3], w[4])
             } else {
-                (super::exec::DrawArgs { count: w[0], instances: w[1], index: None, base_vertex: Some(w[2] as i32), first_instance: w[3], gpu_args: None, base_inst: None }, w[2], w[3])
+                (super::exec::DrawArgs { count: w[0], instances: w[1], index: None, base_vertex: Some(w[2] as i32), first_instance: w[3], base_inst: None }, w[2], w[3])
             };
             if vtx_loc != 0 {
                 self.set_reg(Space::Sh, vtx_loc, bv);
@@ -4897,16 +4800,9 @@ impl Cp {
                 let mut multi: Option<String> = None;
                 let mut indirect: Option<String> = None;
                 let args = match opcode {
-                    op::DRAW_INDEX_AUTO => Some(super::exec::DrawArgs { count: p(0), instances, index: None, base_vertex: None, first_instance: 0, gpu_args: None, base_inst: None }),
-                    op::DRAW_INDEX_2 => self.index_size().map(|sz| super::exec::DrawArgs { count: p(3), instances, index: Some((addr64(p(1), p(2)), sz)), base_vertex: None, first_instance: 0, gpu_args: None, base_inst: None }),
-                    op::DRAW_INDEX_OFFSET_2 => self.index_size().map(|sz| super::exec::DrawArgs { count: p(2), instances, index: Some((self.index_base + p(1) as u64 * sz as u64, sz)), base_vertex: None, first_instance: 0, gpu_args: None, base_inst: None }),
-                    op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT if self.draw_gpu_args(opcode, p) => {
-                        multi = Some(std::mem::take(&mut self.last_draw).into_owned());
-                        if super::capture::capturing() {
-                            indirect = Some("args read by the GPU".into());
-                        }
-                        None
-                    }
+                    op::DRAW_INDEX_AUTO => Some(super::exec::DrawArgs { count: p(0), instances, index: None, base_vertex: None, first_instance: 0, base_inst: None }),
+                    op::DRAW_INDEX_2 => self.index_size().map(|sz| super::exec::DrawArgs { count: p(3), instances, index: Some((addr64(p(1), p(2)), sz)), base_vertex: None, first_instance: 0, base_inst: None }),
+                    op::DRAW_INDEX_OFFSET_2 => self.index_size().map(|sz| super::exec::DrawArgs { count: p(2), instances, index: Some((self.index_base + p(1) as u64 * sz as u64, sz)), base_vertex: None, first_instance: 0, base_inst: None }),
                     op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT => {
                         // Arguments may have been written by earlier GPU work.
                         let a = self.draw_indirect_base + p(0) as u64;
@@ -4925,7 +4821,7 @@ impl Cp {
                             if super::capture::capturing() {
                                 indirect = Some(format!("args {w:?} locs {vtx_loc:#x}/{inst_loc:#x}"));
                             }
-                            Some((super::exec::DrawArgs { count: w[0], instances: w[1], index: None, base_vertex: Some(w[2] as i32), first_instance: w[3], gpu_args: None, base_inst: None }, w[2], w[3]))
+                            Some((super::exec::DrawArgs { count: w[0], instances: w[1], index: None, base_vertex: Some(w[2] as i32), first_instance: w[3], base_inst: None }, w[2], w[3]))
                         } else if opcode == op::DRAW_INDEX_INDIRECT && valid(a, 20) {
                             let w = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), rd32(a + 16)] };
                             if super::capture::capturing() {
@@ -4939,7 +4835,7 @@ impl Cp {
                                     multi = Some(self.draw_cpu_args_base(w, sz, inst_loc));
                                     None
                                 }
-                                sz => sz.map(|sz| (super::exec::DrawArgs { count: w[0], instances: w[1], index: Some((self.index_base + w[2] as u64 * sz as u64, sz)), base_vertex: Some(w[3] as i32), first_instance: w[4], gpu_args: None, base_inst: None }, w[3], w[4])),
+                                sz => sz.map(|sz| (super::exec::DrawArgs { count: w[0], instances: w[1], index: Some((self.index_base + w[2] as u64 * sz as u64, sz)), base_vertex: Some(w[3] as i32), first_instance: w[4], base_inst: None }, w[3], w[4])),
                             }
                         } else {
                             None

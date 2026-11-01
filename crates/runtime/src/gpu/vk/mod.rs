@@ -57,8 +57,8 @@ pub struct Ctx {
     /// the residency mirror, `gpu::resident`).
     pub sparse_buffers: bool,
     /// shaderDrawParameters and drawIndirectFirstInstance enabled: vertex
-    /// shaders of draws whose arguments the GPU reads take the start
-    /// instance from gl_BaseInstance (`tune draw_args_gpu`).
+    /// shaders of indirect draws take the start instance from
+    /// gl_BaseInstance (`tune cpu_args_base`).
     pub draw_parameters: bool,
     /// The copy queue (a transfer-only queue family; `DS_COPY_QUEUE=0`:
     /// none): batch-start copies run on it beside the main queue (`exec`).
