@@ -130,7 +130,7 @@ pub fn want(base: u64, len: u64) {
         return;
     }
     // A range must lie in one import window.
-    if hi - lo > super::exec::WINDOW {
+    if hi - lo > super::exec::window_bytes() {
         STATS[2].fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -335,7 +335,7 @@ pub fn gpu_write(a: u64, n: u64, shader: u64, queue: &str) {
         let mut st = STATE.lock();
         if !st.young.is_empty() {
             // Candidates are not larger than an import window.
-            let from = lo.saturating_sub(super::exec::WINDOW);
+            let from = lo.saturating_sub(super::exec::window_bytes());
             let drop: Vec<u64> = st.young.range(from..hi).filter(|&(_, &(e, _))| e > lo).map(|(&k, _)| k).collect();
             if !drop.is_empty() {
                 STATS[6].fetch_add(drop.len() as u64, Ordering::Relaxed);

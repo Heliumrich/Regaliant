@@ -4977,20 +4977,6 @@ impl Cp {
         super::ahead::note_scan(why, t0.elapsed().as_nanos() as u64);
     }
 
-    /// `tune ahead_far`: the commands from `from` scanned as at a label wait
-    /// (`scan_commands`: through synchronization, up to a run the parallel
-    /// workers will record, another control packet or its limit), their
-    /// stages handed to the workers. What a stage reads is checked again
-    /// when it is used (`ahead::take`), its placement checks by the command
-    /// processor's own (an epoch or view that moved past them takes again).
-    fn scan_far(&mut self, f: &Fetched, from: u64, end: u64) {
-        let (cmds, why, ns) = self.scan_commands(f, from, end, false);
-        let slots: Vec<Arc<super::ahead::Slot>> = cmds.iter().flat_map(|c| c.stages.iter().flatten().cloned()).collect();
-        self.ahead.extend(cmds);
-        super::ahead::submit(&slots);
-        super::ahead::note_scan(why, ns);
-    }
-
     /// A command buffer of `size` dwords at `addr` this command processor
     /// runs (`cb_census_on`).
     fn cb_note(&self, addr: u64, size: u32) {
@@ -6183,11 +6169,10 @@ impl Cp {
                 if self.ahead.is_empty() && matches!(flow, Flow::Next) && !f.live && self.exec.is_some() && self.held.is_none() && super::ahead::enabled_for(self.compute) {
                     // Within a parallel run's first chunk, only to its end.
                     let until = self.par.as_ref().map_or(end, |p| p.starts[p.next].min(end));
-                    if self.main_gfx && super::tune::ahead_far() {
-                        self.scan_far(&f, next, until);
-                    } else {
-                        self.scan_ahead(&f, next, until);
-                    }
+                    // (Scans through synchronization, `tune ahead_far`, raised
+                    // the workers' share 32 -> 36% and slowed the graphics CP:
+                    // removed, FINDINGS-ARCHIVE.md 2026-10-29 night.)
+                    self.scan_ahead(&f, next, until);
                 }
             }
             // (Past a label wait, the queue asking waits for what follows the

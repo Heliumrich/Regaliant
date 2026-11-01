@@ -2576,7 +2576,7 @@ impl Images {
                         x = we.min(end);
                         continue;
                     }
-                    let e = ((x & !(super::exec::WINDOW - 1)) + super::exec::WINDOW).min(end);
+                    let e = ((x & !(super::exec::window_bytes() - 1)) + super::exec::window_bytes()).min(end);
                     match super::exec::import_window(x, e - x) {
                         Some((b, ws, we)) if ws <= x && e <= we => {
                             windows.push((ws, we, b));

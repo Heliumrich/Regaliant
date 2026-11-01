@@ -636,8 +636,22 @@ pub fn debug_dump(clear: bool) -> Vec<u32> {
     v
 }
 
-/// Import windows are aligned to this size within a guest mapping.
-pub(super) const WINDOW: u64 = 64 << 20;
+/// Import windows are aligned to this size within a guest mapping
+/// (`DS_IMPORT_WINDOW_MIB`, boot: a power of two of 4-64 MiB; 16 by
+/// default since 2026-11-01: at Castlewall's arrival half the bytes
+/// imported and the "memory" hitch time 280 -> 38 ms against 64 MiB, each
+/// import's pinning in the driver on the recording thread that needs it,
+/// FINDINGS.md).
+pub(super) fn window_bytes() -> u64 {
+    static W: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        let mib = std::env::var("DS_IMPORT_WINDOW_MIB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|m| m.is_power_of_two() && (4..=64).contains(m)).unwrap_or(16);
+        if mib != 16 {
+            crate::info!("gpu: import windows of {mib} MiB (`DS_IMPORT_WINDOW_MIB`)");
+        }
+        mib << 20
+    })
+}
 /// Bindings without a bounds check extend at most this far.
 const UNBOUNDED_MAX: u64 = 256 << 20;
 const DUMMY_BYTES: u64 = 64 << 10;
@@ -955,7 +969,7 @@ fn import_mappings(s: u64, e: u64) -> (u64, u64) {
             }
             _ => {
                 failed += 1;
-                (b & !(WINDOW - 1)) + WINDOW
+                (b & !(window_bytes() - 1)) + window_bytes()
             }
         };
     }
@@ -1655,7 +1669,7 @@ fn guest_pieces(a: u64, n: u64) -> Vec<(vk::Buffer, u64, u64, u64)> {
     let end = a + n;
     let mut c = a;
     while c < end {
-        let e = ((c & !(WINDOW - 1)) + WINDOW).min(end);
+        let e = ((c & !(window_bytes() - 1)) + window_bytes()).min(end);
         if let Some((buf, start, _)) = span(c, e - c) {
             v.push((buf, c - start, c, e - c));
         }
@@ -1712,7 +1726,7 @@ fn import_once(base: u64, size: u64) -> Option<Option<(vk::Buffer, u64, u64)>> {
     // Residency: smaller windows (their pages become host class).
     // Mirror mode: exact pages (imports are only for what the mirror cannot
     // hold: CP writes, host-class pages), so they cover no mirror page.
-    let window = if super::resident::mirror_mode() { 4096 } else if super::resident::enabled() { RES_WINDOW } else { WINDOW };
+    let window = if super::resident::mirror_mode() { 4096 } else if super::resident::enabled() { RES_WINDOW } else { window_bytes() };
     let (lo, hi) = (base & !(window - 1), (base + size).next_multiple_of(window));
     let me = loop {
         if let Some(s) = spans_read().iter().find(|s| s.valid && s.start <= base && base + size <= s.end) {
@@ -3349,7 +3363,7 @@ pub fn alias_misses() -> u64 {
 /// Largest read-only binding served from the residency mirror, and a
 /// batch's staging for its uploads (`Exec::resident_bind`).
 const RES_MAX: u64 = 256 << 20;
-/// Import windows with residency on (`WINDOW` otherwise).
+/// Import windows with residency on (`window_bytes` otherwise).
 const RES_WINDOW: u64 = 4 << 20;
 const STAGE_SEG: u64 = 16 << 20;
 
@@ -10060,7 +10074,7 @@ impl Exec {
         let run = self.fe2_share();
         let mut x = a;
         while x < b {
-            let e = ((x & !(WINDOW - 1)) + WINDOW).min(b);
+            let e = ((x & !(window_bytes() - 1)) + window_bytes()).min(b);
             let found = span(x, e - x);
             match found {
                 Some((buf, start, wend)) => {
@@ -13959,7 +13973,7 @@ impl Exec {
                             // A descriptor reaching past the end of its mappings
                             // (generic sizes on ring allocations): the mapped part
                             // is bound, the rest reads 0.
-                            if let Some((_, end, _)) = mapping_run(base, base & !(WINDOW - 1), (base + size).next_multiple_of(WINDOW)) {
+                            if let Some((_, end, _)) = mapping_run(base, base & !(window_bytes() - 1), (base + size).next_multiple_of(window_bytes())) {
                                 if end > base && end < base + size {
                                     size = end - base;
                                     span = self::span(base, size);
