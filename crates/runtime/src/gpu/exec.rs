@@ -3997,28 +3997,135 @@ pub type Action = Box<dyn FnOnce() + Send>;
 
 /// A submitted batch (or action-only entry) awaiting completion.
 struct Batch {
-    queries: vk::QueryPool,
-    /// Its batch and prologue timestamps (`Slot::bq`).
-    bq: vk::QueryPool,
     seq: u64,
     /// Null for action-only entries.
     fence: vk::Fence,
-    /// On the compute family's queue (its timeline is waited for).
+    /// On the compute family's queue (its releaser is waited for).
     on_c: bool,
     actions: Vec<Action>,
     checks: Vec<verify::Check>,
-    shaders: Vec<u64>,
-    submitted: std::time::Instant,
     name: String,
     /// Label writes the GPU performs within it: (address, value, bytes),
     /// made known to waits when it completes (`cp::gpu_label_written`).
     gpu_labels: Vec<(u64, u64, u8)>,
+}
+
+/// What releasing a batch with GPU work takes once that work completed
+/// (`releaser_thread`): its timestamps collected, its slot reset. Per
+/// device queue in that queue's order, so a slot is free again once its own
+/// batch completed, not once every earlier batch's CP effects ran (with
+/// ordered async compute a main-queue slot waited for earlier compute
+/// batches: 10.7 of 23.0 s of slot waits in a swamp boot began with the GPU
+/// done with the slot's batch, FINDINGS.md 2026-11-01 late night).
+struct Release {
+    seq: u64,
+    queries: vk::QueryPool,
+    /// Its batch and prologue timestamps (`Slot::bq`).
+    bq: vk::QueryPool,
+    shaders: Vec<u64>,
+    submitted: std::time::Instant,
+    name: String,
     /// Its other GPU operations (`ops_line`), named with a slow or lost batch.
     ops: [u64; OPS],
     /// Its barrier segments' marks (`seg_stamps`).
     segs: Vec<SegMark>,
     /// Its slot, reset here once it completed (`Exec::slot_reset`).
     reset: Option<SlotReset>,
+}
+
+/// Per device queue (the main queue, the compute family's): the batches
+/// to release, in sequence order, and the highest released (every earlier
+/// one of that queue too).
+static RELEASES: [Mutex<std::collections::VecDeque<Release>>; 2] = [const { Mutex::new(std::collections::VecDeque::new()) }; 2];
+static RELEASE_CV: [parking_lot::Condvar; 2] = [const { parking_lot::Condvar::new() }; 2];
+static RELEASED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Waits for a release (slots, the completion thread).
+static RELEASED_LOCK: Mutex<()> = Mutex::new(());
+static RELEASED_CV: parking_lot::Condvar = parking_lot::Condvar::new();
+
+/// Releases device queue `q`'s batches (0 the main queue, 1 the compute
+/// family's) as their GPU work completes, in that queue's order.
+fn releaser_thread(q: usize) {
+    crate::log::set_thread_name(if q == 0 { "gpu-release" } else { "gpu-release-c" });
+    super::profile_this_thread("complete");
+    loop {
+        super::prio::apply();
+        let mut r = {
+            let mut g = RELEASES[q].lock();
+            loop {
+                if let Some(r) = g.pop_front() {
+                    break r;
+                }
+                RELEASE_CV[q].wait(&mut g);
+            }
+        };
+        if !DEVICE_LOST.load(Ordering::Relaxed) {
+            wait_submitted(r.seq);
+            let tf = std::time::Instant::now();
+            let ok = if q == 1 { ctx().wait_batch_c(r.seq, 10_000_000_000) } else { ctx().wait_batch(r.seq, 10_000_000_000) };
+            FENCE_NS.fetch_add(tf.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if !ok && !DEVICE_LOST.swap(true, Ordering::SeqCst) {
+                let list: Vec<String> = r.shaders.iter().map(|a| format!("{a:#x}")).collect();
+                crate::error!("gpu[{}]: waiting for GPU work: {}; GPU execution stops (batch #{}: shaders {}; {}); checkpoints: {}", r.name, vk::Result::TIMEOUT, r.seq, list.join(" "), ops_line(&r.ops), super::vk::checkpoint_report());
+            }
+            FLUSHES.fetch_add(1, Ordering::Relaxed);
+            collect_timestamps(r.bq, r.queries, &r.shaders, &r.name, r.seq, &r.segs, &r.ops);
+            check_watchdog(&r.name, &r.shaders);
+            let ms = r.submitted.elapsed().as_millis();
+            if ms >= 250 {
+                let list: Vec<String> = r.shaders.iter().map(|a| format!("{a:#x}")).collect();
+                crate::info!("gpu[{}]: batch #{} of {} command(s) took {ms} ms (shaders {}; {})", r.name, r.seq, r.shaders.len(), list.join(" "), ops_line(&r.ops));
+            }
+        }
+        // Its slot for the next batch there, unless the recording thread took
+        // the reset back (`Exec::begin_batch`).
+        if let Some(x) = r.reset.take() {
+            if !DEVICE_LOST.load(Ordering::Relaxed) && x.state.compare_exchange(r.seq, u64::MAX, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                let c = ctx();
+                unsafe {
+                    c.device.reset_fences(&[x.fence]).ok();
+                    for p in x.pools {
+                        if p != vk::CommandPool::null() {
+                            c.device.reset_command_pool(p, vk::CommandPoolResetFlags::empty()).ok();
+                        }
+                    }
+                    c.device.reset_descriptor_pool(x.desc_pool, vk::DescriptorPoolResetFlags::empty()).ok();
+                }
+                x.state.store(0, Ordering::Release);
+            }
+        }
+        RELEASED[q].store(r.seq, Ordering::Release);
+        drop(RELEASED_LOCK.lock());
+        RELEASED_CV.notify_all();
+    }
+}
+
+/// The slot's last batch was released (its GPU work completed, the slot
+/// reset), or nothing is pending on it.
+fn slot_free(s: &Slot) -> bool {
+    !s.reset_pending || s.reset_state.load(Ordering::Acquire) == 0
+}
+
+/// Waits until `s` is free (`slot_free`), at most `max` (None: no limit);
+/// false on a timeout, at shutdown or after a device loss.
+fn wait_released(s: &Slot, max: Option<std::time::Duration>) -> bool {
+    let until = max.and_then(|m| std::time::Instant::now().checked_add(m));
+    let mut g = RELEASED_LOCK.lock();
+    loop {
+        if slot_free(s) {
+            return true;
+        }
+        if super::shutting_down() || DEVICE_LOST.load(Ordering::Relaxed) {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let left = match until {
+            Some(u) if now >= u => return false,
+            Some(u) => (u - now).min(std::time::Duration::from_millis(100)),
+            None => std::time::Duration::from_millis(100),
+        };
+        RELEASED_CV.wait_for(&mut g, left);
+    }
 }
 
 unsafe impl Send for Batch {}
@@ -5009,6 +5116,8 @@ fn push_batch(fence: vk::Fence, queries: vk::QueryPool, bq: vk::QueryPool, actio
     STARTED.call_once(|| {
         crate::thread::spawn_host("gpu-complete", 1 << 20, Box::new(completion_thread)).expect("gpu completion thread");
         crate::thread::spawn_host("gpu-submit", 1 << 20, Box::new(submitter_thread)).expect("gpu submission thread");
+        crate::thread::spawn_host("gpu-release", 1 << 20, Box::new(|| releaser_thread(0))).expect("gpu release thread");
+        crate::thread::spawn_host("gpu-release-c", 1 << 20, Box::new(|| releaser_thread(1))).expect("gpu release thread");
     });
     let mut q = BATCHES.lock();
     let seq = NEXT_SEQ.fetch_add(1, Ordering::SeqCst);
@@ -5036,7 +5145,12 @@ fn push_batch(fence: vk::Fence, queries: vk::QueryPool, bq: vk::QueryPool, actio
         }
         note_submitted(seq);
     }
-    q.push_back(Batch { queries, bq, seq, fence, on_c, actions, checks, shaders, submitted: std::time::Instant::now(), name: name.to_string(), gpu_labels, ops, segs, reset });
+    if fence != vk::Fence::null() {
+        let k = on_c as usize;
+        RELEASES[k].lock().push_back(Release { seq, queries, bq, shaders, submitted: std::time::Instant::now(), name: name.to_string(), ops, segs, reset });
+        RELEASE_CV[k].notify_one();
+    }
+    q.push_back(Batch { seq, fence, on_c, actions, checks, name: name.to_string(), gpu_labels });
     BATCHES_CV.notify_one();
     seq
 }
@@ -5128,26 +5242,13 @@ fn completion_thread() {
                 BATCHES_CV.wait(&mut q);
             }
         };
-        if b.fence != vk::Fence::null() && !DEVICE_LOST.load(Ordering::Relaxed) {
-            wait_submitted(b.seq);
-            let tf = std::time::Instant::now();
-            // (Batches submitted together carry one fence, the last's.)
-            let ok = if b.on_c { ctx().wait_batch_c(b.seq, 10_000_000_000) } else { ctx().wait_batch(b.seq, 10_000_000_000) };
-            let r = if ok { Ok(()) } else { Err(vk::Result::TIMEOUT) };
-            FENCE_NS.fetch_add(tf.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            if let Err(e) = r {
-                if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
-                    let list: Vec<String> = b.shaders.iter().map(|a| format!("{a:#x}")).collect();
-                    crate::error!("gpu[{}]: waiting for GPU work: {e}; GPU execution stops (batch #{}: shaders {}; {}); checkpoints: {}", b.name, b.seq, list.join(" "), ops_line(&b.ops), super::vk::checkpoint_report());
-                }
-            }
-            FLUSHES.fetch_add(1, Ordering::Relaxed);
-            collect_timestamps(b.bq, b.queries, &b.shaders, &b.name, b.seq, &b.segs, &b.ops);
-            check_watchdog(&b.name, &b.shaders);
-            let ms = b.submitted.elapsed().as_millis();
-            if ms >= 250 {
-                let list: Vec<String> = b.shaders.iter().map(|a| format!("{a:#x}")).collect();
-                crate::info!("gpu[{}]: batch #{} of {} command(s) took {ms} ms (shaders {}; {})", b.name, b.seq, b.shaders.len(), list.join(" "), ops_line(&b.ops));
+        if b.fence != vk::Fence::null() {
+            // Its GPU work completed and its slot released (`releaser_thread`,
+            // which marks it released after a device loss too).
+            let k = b.on_c as usize;
+            let mut g = RELEASED_LOCK.lock();
+            while RELEASED[k].load(Ordering::Acquire) < b.seq {
+                RELEASED_CV.wait_for(&mut g, std::time::Duration::from_millis(100));
             }
         }
         // `tune host_census`: its written windows are armed before its CP
@@ -5182,23 +5283,6 @@ fn completion_thread() {
         }
         *LAST_DONE_AT.lock() = Some(std::time::Instant::now());
         DONE_CV.notify_all();
-        // Its slot for the next batch there, unless the recording thread took
-        // the reset back (`Exec::begin_batch`).
-        if let Some(r) = b.reset.take() {
-            if !DEVICE_LOST.load(Ordering::Relaxed) && r.state.compare_exchange(b.seq, u64::MAX, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                let c = ctx();
-                unsafe {
-                    c.device.reset_fences(&[r.fence]).ok();
-                    for p in r.pools {
-                        if p != vk::CommandPool::null() {
-                            c.device.reset_command_pool(p, vk::CommandPoolResetFlags::empty()).ok();
-                        }
-                    }
-                    c.device.reset_descriptor_pool(r.desc_pool, vk::DescriptorPoolResetFlags::empty()).ok();
-                }
-                r.state.store(0, Ordering::Release);
-            }
-        }
         reap_spans();
         check_races(b.seq);
         super::forward::completed(b.seq);
@@ -8586,8 +8670,7 @@ impl Exec {
             // one, or a new one, else one still executing, else the chunk
             // stops.
             let n = self.slots.len();
-            let done = done_seq();
-            let free = |s: &Slot| s.seq != PENDING && s.seq <= done;
+            let free = |s: &Slot| s.seq != PENDING && (s.seq == 0 || slot_free(s));
             // (A slot not made yet is free: `ensure_slot` makes it. A queue
             // that goes past a wait before using all its slots meets one.)
             if self.cur < n && !free(&self.slots[self.cur]) {
@@ -8615,19 +8698,21 @@ impl Exec {
             }
         }
         self.ensure_slot();
-        // The slot's previous batch must have completed before reuse.
+        // The slot's previous batch must have been released before reuse: its
+        // GPU work completed and the slot reset by its queue's releaser
+        // (`releaser_thread`; not every earlier batch's CP effects).
         let slot = &self.slots[self.cur];
         if slot.seq != 0 {
-            if slot.seq > done_seq() {
+            if !slot_free(slot) {
                 let t = std::time::Instant::now();
                 // (Whether the GPU had completed the batch already: the wait
-                // is then the completion thread's bookkeeping, `SLOT_LAG`.)
+                // is then the releaser's bookkeeping, `SLOT_LAG`.)
                 let gpu_done = (if slot.on_c { ctx().batch_value_c() } else { ctx().batch_value() }) >= slot.seq;
                 let tw = super::timeline::wait_start();
-                if !wait_done_for(slot.seq, std::time::Duration::from_secs(3)) {
+                if !wait_released(slot, Some(std::time::Duration::from_secs(3))) && !super::shutting_down() && !DEVICE_LOST.load(Ordering::Relaxed) {
                     crate::warn!("gpu[{}]: waiting > 3 s for a free batch slot (batch {}, done {}; held {}, past {})", self.name, slot.seq, done_seq(), self.held, self.past);
+                    wait_released(slot, None);
                 }
-                wait_done(slot.seq);
                 tw.end(&self.name, || format!("wait: batch slot (#{})", slot.seq));
                 super::hitch::note_since(super::hitch::Kind::GpuWait, t, || format!("a free batch slot: the GPU behind (batch {})", slot.seq));
                 WAIT_NS[2].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -8638,11 +8723,10 @@ impl Exec {
                 }
                 note_queue_wait(&self.name, 1, t.elapsed());
             }
-            wait_done(slot.seq);
             let c = ctx();
-            // The completion thread resets the slot right after the batch
-            // completed (`slot_reset`): waited for, or taken back when it
-            // cannot come (shutdown released the wait, device lost).
+            // The releaser resets the slot right after the batch completed
+            // (`slot_reset`): done, or taken back when it cannot come
+            // (shutdown released the wait, device lost).
             let mut reset_done = false;
             if slot.reset_pending {
                 let mut spins = 0u32;
@@ -8652,7 +8736,7 @@ impl Exec {
                         reset_done = true;
                         break;
                     }
-                    if v != u64::MAX && (done_seq() < slot.seq || DEVICE_LOST.load(Ordering::Relaxed)) {
+                    if v != u64::MAX && (super::shutting_down() || DEVICE_LOST.load(Ordering::Relaxed)) {
                         if slot.reset_state.compare_exchange(v, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                             break;
                         }
@@ -8676,7 +8760,7 @@ impl Exec {
             if !reset_done {
                 // (Shutdown released the wait: the command buffer may still
                 // execute, and resetting it would lose the device.)
-                if done_seq() < slot.seq {
+                if (if slot.on_c { c.batch_value_c() } else { c.batch_value() }) < slot.seq {
                     if slot.on_c {
                         c.wait_batch_c(slot.seq, 4_000_000_000);
                     } else {
