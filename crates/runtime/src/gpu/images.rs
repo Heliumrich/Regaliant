@@ -3660,7 +3660,7 @@ impl Images {
     }
 
     /// What `note_writes` (then `note_meta_fill` for a fill of `fill`)
-    /// would note, without noting it (the frame-ahead recorder keeps its
+    /// would note, without noting it (held executors keep their
     /// own: `Exec::held_note`): the fast clears made pending (image,
     /// metadata address, the value when the fill gives it; later entries
     /// win) and the GPU-owned images overwritten.
@@ -3703,7 +3703,7 @@ impl Images {
     }
 
     /// The GPU-owned images a zero fill of [base, base+len) clears as
-    /// `zero_filled` chooses them, nothing noted (the frame-ahead recorder).
+    /// `zero_filled` chooses them, nothing noted (held executors).
     pub fn zero_fill_targets(&self, base: u64, len: u64) -> Vec<(ImageKey, vk::Image, vk::Format)> {
         let mut out = Vec::new();
         if len == 0 || self.owned.is_empty() {
@@ -3747,7 +3747,7 @@ impl Images {
     }
 
     /// The fast clear of image `k` with metadata at `meta` (`take_clears`'s
-    /// entry for a clear the frame-ahead recorder noted itself).
+    /// entry for a clear a held executor noted itself).
     pub fn fast_clear_of(&self, k: ImageKey, meta: u64, known: Option<u32>) -> Option<FastClear> {
         let (Some(img), Some(&(_, clear))) = (self.map.get(&k), self.meta_of.get(&meta)) else { return None };
         Some(FastClear { key: k, image: img.image, meta, clear, known })
@@ -3780,11 +3780,6 @@ impl Images {
     /// The images with a fast clear pending.
     pub fn pending_clear_keys(&self) -> Vec<ImageKey> {
         self.pending_clears.keys().copied().collect()
-    }
-
-    /// The images with a fast clear or an overwrite reload pending.
-    pub fn pending_keys(&self) -> Vec<ImageKey> {
-        self.pending_clears.keys().chain(self.overwritten_keys.iter()).copied().collect()
     }
 
     /// Whether any of `keys` has a fast clear pending.

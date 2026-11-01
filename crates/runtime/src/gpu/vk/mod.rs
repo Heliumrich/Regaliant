@@ -378,12 +378,12 @@ fn init_inner() -> Result<(), String> {
         let first_instance = instance.get_physical_device_features(pdev).draw_indirect_first_instance != 0;
         // Sparse buffers for the residency mirror (`DS_RESIDENT=1`): the
         // device and the main queue's family must support them.
-        let sparse_buffers = (super::resident::wanted() || super::rgm::wanted() || super::fe2::wanted()) && {
+        let sparse_buffers = (super::resident::wanted() || super::fe2::wanted()) && {
             let f = instance.get_physical_device_features(pdev);
             let fam = instance.get_physical_device_queue_family_properties(pdev)[qf as usize].queue_flags;
             f.sparse_binding != 0 && f.sparse_residency_buffer != 0 && fam.contains(vk::QueueFlags::SPARSE_BINDING)
         };
-        if (super::resident::wanted() || super::rgm::wanted() || super::fe2::wanted()) && !sparse_buffers {
+        if (super::resident::wanted() || super::fe2::wanted()) && !sparse_buffers {
             crate::warn!("front end 2 (the default), DS_RESIDENT or DS_RGM wanted but the device or the main queue family has no sparse buffers");
         }
         // Storage images bound one view per mip level are indexed per
@@ -896,7 +896,7 @@ impl Ctx {
         unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory({}): {e}", req.size))
     }
 
-    /// Usage flags for a buffer that shaders may address (`tune addresses`).
+    /// Usage flags for a buffer that shaders may address (`Spec::addresses`).
     pub fn addressable(&self, usage: vk::BufferUsageFlags) -> vk::BufferUsageFlags {
         if self.device_addresses { usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS } else { usage }
     }

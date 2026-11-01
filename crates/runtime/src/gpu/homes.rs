@@ -286,7 +286,7 @@ pub static STALE_ADDED: AtomicU64 = AtomicU64::new(0);
 /// lock that every cull's binding waits for); the CPU writes these homes
 /// see come at level loads, before the submissions that use them.
 fn check_epoch() -> u64 {
-    if super::tune::home_submit_epochs() { super::precache::submit_epoch() } else { super::precache::epoch() }
+    super::precache::submit_epoch()
 }
 
 /// Whether any home exists (fast path for every binding).

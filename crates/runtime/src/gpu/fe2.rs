@@ -1276,21 +1276,19 @@ pub fn ensure(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn
 
 thread_local! {
     /// The stage whose bindings this thread places (`StageSource`; for
-    /// `DS_FE2_CALLERS`): 0 none, else `Prepared::ahead`, with the epoch of
-    /// a worker's placement checks.
-    static SOURCE: std::cell::Cell<(u8, u32)> = const { std::cell::Cell::new((0, 0)) };
+    /// `DS_FE2_CALLERS`): 0 none, else `Prepared::ahead`.
+    static SOURCE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
-const SOURCE_NAMES: [&str; 4] = ["placements of no stage", "stages it prepared", "stages a worker prepared", "stages a worker prepared and checked"];
+const SOURCE_NAMES: [&str; 3] = ["placements of no stage", "stages it prepared", "stages a worker prepared"];
 /// The graphics CP's checks by the stage they bind (`SOURCE`;
 /// `DS_FE2_CALLERS`): [stage bindings, checks, range-cache hits, TSC cycles,
 /// runs taken, their pages, runs only of pages a take of the epoch wanted
 /// had looked at and found lacking, runs with a valid page not looked at
 /// since that epoch began (and no lacking one), runs with a page M lacks not
 /// looked at since; pages not looked at since: stamped one epoch before,
-/// older; for stages a worker checked: runs taken in the epoch of its
-/// checks, runs wanting a later epoch than that].
-static BY_SOURCE: [[AtomicU64; 13]; 4] = [const { [const { AtomicU64::new(0) }; 13] }; 4];
+/// older].
+static BY_SOURCE: [[AtomicU64; 11]; 3] = [const { [const { AtomicU64::new(0) }; 11] }; 3];
 const B_BINDINGS: usize = 0;
 const B_CHECKS: usize = 1;
 const B_HITS: usize = 2;
@@ -1302,16 +1300,14 @@ const B_VALID_STALE: usize = 7;
 const B_INVALID_STALE: usize = 8;
 const B_ONE_BEHIND: usize = 9;
 const B_OLDER: usize = 10;
-const B_SAME_EPOCH: usize = 11;
-const B_LATER_WANT: usize = 12;
 
 /// The stage whose bindings this thread places, until dropped (`SOURCE`).
 pub struct StageSource;
 
 impl StageSource {
-    pub fn set(ahead: u8, checked_ep: u32) -> StageSource {
+    pub fn set(ahead: u8) -> StageSource {
         if callers_on() {
-            SOURCE.with(|s| s.set((ahead.min(3), checked_ep)));
+            SOURCE.with(|s| s.set(ahead.min(2)));
             source_count(B_BINDINGS, 1);
         }
         StageSource
@@ -1321,7 +1317,7 @@ impl StageSource {
 impl Drop for StageSource {
     fn drop(&mut self) {
         if callers_on() {
-            SOURCE.with(|s| s.set((0, 0)));
+            SOURCE.with(|s| s.set(0));
         }
     }
 }
@@ -1329,7 +1325,7 @@ impl Drop for StageSource {
 /// Counts `n` for the graphics CP's checks of the stage being bound.
 fn source_count(what: usize, n: u64) {
     if CALLER.with(|c| c.get()) == 0 {
-        BY_SOURCE[SOURCE.with(|s| s.get().0) as usize][what].fetch_add(n, Ordering::Relaxed);
+        BY_SOURCE[SOURCE.with(|s| s.get()) as usize][what].fetch_add(n, Ordering::Relaxed);
     }
 }
 
@@ -1371,9 +1367,8 @@ fn take_reasons(a: u64, b: u64, want: u32) -> [u64; 4] {
 }
 
 /// A run the graphics CP took, with `take_reasons`' counts.
-fn note_source_take(a: u64, b: u64, want: u32, k: [u64; 4]) {
-    let (s, checked) = SOURCE.with(|s| s.get());
-    let c = &BY_SOURCE[s as usize];
+fn note_source_take(a: u64, b: u64, k: [u64; 4]) {
+    let c = &BY_SOURCE[SOURCE.with(|s| s.get()) as usize];
     c[B_TAKES].fetch_add(1, Ordering::Relaxed);
     c[B_PAGES].fetch_add((b - a) / PAGE, Ordering::Relaxed);
     let class = if k[2] != 0 {
@@ -1386,51 +1381,12 @@ fn note_source_take(a: u64, b: u64, want: u32, k: [u64; 4]) {
     c[class].fetch_add(1, Ordering::Relaxed);
     c[B_ONE_BEHIND].fetch_add(k[3], Ordering::Relaxed);
     c[B_OLDER].fetch_add(k[1] + k[2] - k[3], Ordering::Relaxed);
-    if s == 3 {
-        if super::precache::epoch() as u32 == checked {
-            c[B_SAME_EPOCH].fetch_add(1, Ordering::Relaxed);
-        }
-        if want > checked {
-            c[B_LATER_WANT].fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
-thread_local! {
-    /// This thread's check is a placement check made ahead (`precheck`):
-    /// its uploads are left to the command processor, not counted.
-    static PRECHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// The placement check of guest [base, base+size) for a stage prepared
-/// ahead of the graphics CP (`tune fe2_precheck`; `gpu::ahead`): its pages
-/// are taken and stamped clean in the epoch now, pages M lacks left invalid
-/// (the command processor's own check uploads them in order, into its
-/// batch). A run has no synchronization in it, so the CP's view at the
-/// command's turn is at most this epoch unless one ended meanwhile (then it
-/// takes again, as without this).
-pub fn precheck(base: u64, size: u64, armable: &Armable) {
-    let lo = base & !(PAGE - 1);
-    let Some((_, mapped_end)) = crate::mem::readable_span(base) else { return };
-    let hi = base.saturating_add(size).next_multiple_of(PAGE).min(mapped_end.next_multiple_of(PAGE));
-    if hi <= lo {
-        return;
-    }
-    let ep = super::precache::epoch() as u32;
-    // (Counted as "ahead": a command processor at a label wait is its own
-    // caller again after, `ahead::prepare_here`.)
-    let caller = CALLER.with(|c| c.get());
-    set_caller("ahead");
-    PRECHECK.with(|p| p.set(true));
-    let _ = ensure_inner(lo, hi, ep, ep, false, &|_| false, false, &mut |_, _| true, armable);
-    PRECHECK.with(|p| p.set(false));
-    CALLER.with(|c| c.set(caller));
 }
 
 #[allow(clippy::too_many_arguments)]
 fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, mine_any: bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable) -> Result<(), &'static str> {
     // (No page of the caller's batch to pass over: runs go in whole.)
-    let mine_fast = !mine_any && super::tune::fe2_mine_fast();
+    let mine_fast = !mine_any;
     let sc = size_class((hi - lo) / PAGE);
     local_check(sc, (hi - lo) / PAGE);
     let class = &BY_SIZE[sc];
@@ -1570,11 +1526,7 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
         let frame = super::FRAMES.load(Ordering::Relaxed);
         for &(a, b) in bad.iter() {
             note_arming_ended(a, b);
-            // Every page written lately: uploaded as it is, without a take
-            // (by the command processor: a check made ahead leaves it).
-            if PRECHECK.with(|p| p.get()) && hot_run(a, b, frame) {
-                continue;
-            }
+            // Every page written lately: uploaded as it is, without a take.
             if hot_run(a, b, frame) {
                 STATS[S_HOT_RUNS].fetch_add(1, Ordering::Relaxed);
                 let _k = UpKind::new(1);
@@ -1629,7 +1581,7 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
                 return Err(e);
             }
             if let Some(k) = reasons {
-                note_source_take(a, b, want, k);
+                note_source_take(a, b, k);
             }
         }
         STATS[S_SLOW_NS].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1915,13 +1867,8 @@ fn upload_lacking(a: u64, b: u64, mine: &dyn Fn(u64) -> bool, upload: &mut dyn F
     let mut failed = false;
     let mut pages = 0u64;
     let mut run: Option<(u64, u64)> = None;
-    // (A check made ahead uploads nothing: `precheck`.)
-    let pre = PRECHECK.with(|p| p.get());
     let mut flush = |run: &mut Option<(u64, u64)>, failed: &mut bool, pages: &mut u64| {
         if let Some((x, y)) = run.take() {
-            if pre {
-                return;
-            }
             if !upload(x, y) {
                 STATS[S_UPLOAD_FAILED].fetch_add(1, Ordering::Relaxed);
                 *failed = true;
@@ -3020,7 +2967,7 @@ pub fn init() {
     // when they execute, after the earlier chunks' write-backs, and its pages
     // are valid only once it is queued, in program order; its CPU reads are
     // checked at its turn against the run's earlier writes as before.)
-    const OFF: [&str; 7] = ["frame_ahead", "homes", "draw_args_gpu", "gpu_loads", "shadow_args", "pre_share", "host_census"];
+    const OFF: [&str; 5] = ["homes", "draw_args_gpu", "shadow_args", "pre_share", "host_census"];
     for name in OFF {
         if !super::tune::set(name, 0) {
             crate::warn!("fe2: no switch {name}");
@@ -3029,7 +2976,8 @@ pub fn init() {
     // Compute queues' synchronization-free runs are recorded in parallel
     // (four workers, flushes kept inside runs, runs from 64 commands: +6-10%
     // at the vista once checks follow each other's takes; a loss in the
-    // default front end, FINDINGS.md 2026-10-28 night), and waits passed on
+    // default front end, FINDINGS.md 2026-10-28 night; `cp::compute_workers`,
+    // without switches since 2026-11-01 but the run length), and waits passed on
     // another queue's promise adopt its writer's view instead of ending an
     // epoch (+3.6% at the vista with stretches checked at their labels,
     // FINDINGS.md 2026-10-29), and waits that release nothing new (gone
@@ -3039,8 +2987,8 @@ pub fn init() {
     // (GPU busy -2.3 ms a frame, +2-3%) and counts as a full barrier, CP
     // writes right after it recording none before them (level to +0.3%;
     // FINDINGS.md 2026-10-29 morning): those five without switches since
-    // 2026-11-01; the parallel runs' settings unless set explicitly.
-    const PAR: [(&str, u64); 3] = [("par_compute", 4), ("par_events", 1), ("par_min_compute", 64)];
+    // 2026-11-01; the parallel runs' length unless set explicitly.
+    const PAR: [(&str, u64); 1] = [("par_min_compute", 64)];
     for (name, v) in PAR {
         if !super::tune::set_default(name, v) {
             crate::warn!("fe2: no switch {name}");
@@ -3088,12 +3036,10 @@ pub fn init() {
                 let _ = std::thread::Builder::new().name("fe2-faults".into()).spawn(watch);
             }
             crate::info!(
-                "fe2: front end 2 on ({made}; {s}; hosted arming {}{}; switched off: {}; compute runs recorded in parallel on {} workers (par_events {}, from {} commands))",
+                "fe2: front end 2 on ({made}; {s}; hosted arming {}{}; switched off: {}; compute runs recorded in parallel on 4 workers, from {} commands)",
                 if crate::hosted::on() { "on" } else { "off (not under the host)" },
                 if arm_gpu() { "" } else { ", GPU-written pages never armed" },
                 OFF.join(", "),
-                super::tune::par_compute(),
-                super::tune::par_events(),
                 super::tune::par_min_compute()
             );
         }
@@ -3591,13 +3537,8 @@ pub fn callers_line() -> String {
         .zip(BY_SOURCE.iter())
         .map(|(n, c)| {
             let v: Vec<u64> = c.iter().map(|x| x.load(Ordering::Relaxed)).collect();
-            let worker = if v[B_SAME_EPOCH] + v[B_LATER_WANT] > 0 || n.ends_with("checked") {
-                format!("; in the epoch of the worker's checks {}, wanting a later one {}", v[B_SAME_EPOCH], v[B_LATER_WANT])
-            } else {
-                String::new()
-            };
             format!(
-                "{n}: {} bindings, {} checks ({} by the range cache), {:.1} ms, {} runs taken ({} pages; only pages found lacking by a take of the epoch wanted {}, with a valid page not looked at since {}, with a page M lacks not looked at since {}; pages not looked at since: one epoch before {}, older {}{worker})",
+                "{n}: {} bindings, {} checks ({} by the range cache), {:.1} ms, {} runs taken ({} pages; only pages found lacking by a take of the epoch wanted {}, with a valid page not looked at since {}, with a page M lacks not looked at since {}; pages not looked at since: one epoch before {}, older {})",
                 v[B_BINDINGS],
                 v[B_CHECKS],
                 v[B_HITS],

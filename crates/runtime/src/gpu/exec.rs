@@ -23,7 +23,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod draw;
-pub mod rgm;
 pub(crate) use draw::{color_surface, depth_surface, set_equal_bias, toggle_skip_vs};
 
 /// Dispatches of compute shaders on this list are skipped (`skipcs` control
@@ -166,17 +165,11 @@ fn sync_why_status() -> String {
     let n: Vec<u64> = SYNC_WHY.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let w: Vec<u64> = READ_WAIT_WORDS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    shader-read waits whose words were unchanged after the wait: draws {} of {}, dispatches {} of {}; commands that did not wait {} ({} data loads copied by batch prologues), stages used as prepared {} (checks held {}, failed {}, {} shaders wait again)\n",
+        "    shader-read waits whose words were unchanged after the wait: draws {} of {}, dispatches {} of {}\n",
         w[0],
         w[0] + w[1],
         w[2],
-        w[2] + w[3],
-        SPEC_STATS[3].load(Ordering::Relaxed),
-        SPEC_STATS[4].load(Ordering::Relaxed),
-        SPEC_STATS[0].load(Ordering::Relaxed),
-        SPEC_STATS[1].load(Ordering::Relaxed),
-        SPEC_STATS[2].load(Ordering::Relaxed),
-        NO_SPEC.lock().as_ref().map_or(0, |n| n.len())
+        w[2] + w[3]
     ) + &format!(
         "    CP read waits: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices; pipelines created: {} compute ({} ms, {} with pushed descriptors), {} graphics ({} ms, {} pushed); commands with pushed descriptors {}, with sets {}\n",
         n[0],
@@ -703,43 +696,9 @@ fn fixed() -> &'static Fixed {
     })
 }
 
-/// Front end 2 (`tune fe2_precheck`): the placement checks of a stage
-/// prepared ahead, made by the thread that prepared it (`gpu::ahead`): its
-/// sized buffer bindings in the mirror's span checked in the epoch now
-/// (`fe2::precheck`: takes and clean stamps; uploads stay the command
-/// processor's). Bindings resolved by the shader and unsized pointers are
-/// left to the command processor.
-pub(super) fn fe2_precheck_stage(found: &super::shaders::Found) {
-    let gpu_res = found.tr.spec.gpu_res;
-    for b in &found.tr.out.bindings {
-        let i = match b.kind {
-            BindingKind::Address(i) if i < 64 && gpu_res & (1u64 << i) != 0 => continue,
-            BindingKind::Buffer(i) | BindingKind::Address(i) => i,
-            _ => continue,
-        };
-        let (base, size) = match found.resources.get(i) {
-            Some(Resolved::Buffer(v)) => (v.base, v.byte_size()),
-            Some(Resolved::Global(a, n)) => (*a, *n),
-            _ => continue,
-        };
-        let Some(size) = size.filter(|&n| n > 0) else { continue };
-        if super::fe2::in_span(base, size) {
-            super::fe2::precheck(base, size, &fe2_armable);
-        }
-    }
-}
-
 /// Guest mapping containing `addr`: [start, end) of its VMA.
 fn mapping(addr: u64) -> Option<(u64, u64)> {
-    if super::tune::vma_cache() {
-        return crate::mem::vma_bounds(addr);
-    }
-    let st = crate::mem::MEM.lock();
-    let v = st.find(addr)?;
-    if v.kind == crate::mem::VmaKind::Reserved {
-        return None;
-    }
-    Some((v.start, v.end()))
+    crate::mem::vma_bounds(addr)
 }
 
 /// Adjacent guest mappings around `addr` that one import may cover,
@@ -1361,12 +1320,6 @@ pub(super) fn import_sites_line() -> String {
     }
     s
 }
-
-/// Bindings placed on resident GPU-written data (`gpu::rgm`; counted as
-/// homes in the placement statistics), and indirect dispatches whose
-/// arguments were read there.
-static RGM_PLACED: AtomicU64 = AtomicU64::new(0);
-pub(super) static RGM_ARGS: AtomicU64 = AtomicU64::new(0);
 
 /// Mirror mode's placements by [written][unbounded pointer][pages: <16,
 /// <256, <4096, more]: [placements, pages].
@@ -1990,7 +1943,7 @@ pub(crate) fn compute_pipe_known(p: &Prepared) -> bool {
 }
 
 /// The graphics pipeline of a draw scanned ahead of its use (`draw`).
-pub(crate) use draw::{precompile_gfx, precompile_gfx_translations, GfxRegs, GfxState};
+pub(crate) use draw::{precompile_gfx_translations, GfxState};
 
 /// Creates the compute pipeline of a stage prepared ahead of its use
 /// (`gpu::compile` workers): Some(true) when it was created here,
@@ -2796,35 +2749,6 @@ fn record_copies(cmd: vk::CommandBuffer, copies: &mut Vec<(vk::Buffer, vk::Buffe
         unsafe { ctx().device.cmd_copy_buffer(cmd, src, dst, &regions) };
     }
     copies.clear();
-}
-
-/// Records a prologue's remaining copies and ends it (`Exec::end_pre`; on
-/// the submission thread with `tune submit_finish`).
-fn finish_pre(pre: vk::CommandBuffer, copies: &mut Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>, after: &mut Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>, bq: vk::QueryPool) {
-    record_copies(pre, copies);
-    if !after.is_empty() {
-        global_barrier(pre);
-        record_copies(pre, after);
-    }
-    unsafe {
-        global_barrier(pre);
-        if bq != vk::QueryPool::null() {
-            ctx().device.cmd_write_timestamp(pre, vk::PipelineStageFlags::BOTTOM_OF_PIPE, bq, BQ_PRE + 1);
-        }
-        if super::vk::labels_on() {
-            super::vk::label_end(pre);
-        }
-        ctx().device.end_command_buffer(pre).ok();
-    }
-}
-
-/// Records a batch's copies for the copy queue into its `xpre` (`Exec::end_xpre`).
-fn finish_xpre(x: vk::CommandBuffer, copies: &mut Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>) {
-    unsafe {
-        ctx().device.begin_command_buffer(x, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
-        record_copies(x, copies);
-        ctx().device.end_command_buffer(x).ok();
-    }
 }
 
 /// Ends a batch's command buffer: its end timestamp (`Slot::bq`; the
@@ -3683,8 +3607,8 @@ static GPU_TIMESTAMPS: AtomicU64 = AtomicU64::new(0);
 /// Batch begins (DS_PROFILE_GPU): [count, ns including slot waits, of them
 /// draws' resident-shadow checks of their indices: count, ns].
 static BEGIN_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-/// Batch begins in a slot the completion thread was to reset (`tune
-/// offthread_reset`): [found reset, waited for the reset, taken back].
+/// Batch begins in a slot the completion thread was to reset
+/// (`Exec::slot_reset`): [found reset, waited for the reset, taken back].
 static OFFTHREAD_RESETS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Batch submissions (DS_PROFILE_GPU): [count, ns in `submit_for` without
 /// its wait for deferred CP writes].
@@ -3807,7 +3731,7 @@ static SHADOWS_REUSED: AtomicU64 = AtomicU64::new(0);
 /// [working copies shared after the merge, copies in from a shared copy, not
 /// shared: written in place meanwhile, CPU-written meanwhile, no entry].
 static SHADOWS_SHARED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
-/// End-of-pipe writes without a full barrier (`tune eop_light`): [labels,
+/// End-of-pipe writes without a full barrier (`Exec::gpu_cp_write`): [labels,
 /// timestamps, waits that ordered the work after them, CP writes right after
 /// front end 2's write-back with no barrier before them].
 static EOP_LIGHT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
@@ -3911,11 +3835,6 @@ static PRE_FULL: AtomicU64 = AtomicU64::new(0);
 /// batches with such copies, batches that waited only for such copies
 /// earlier batches made], and their values at the last `profile reset`.
 static XCOPY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-/// Why `speculate` left a command to wait (diagnostics, since boot): stale
-/// home, a data load this batch writes or not one mapping, a parallel
-/// chunk's own writes, a stage that writes memory or images, a shader that
-/// mispredicted, descriptor words GPU work writes (`tune spec_reads 2`).
-static SPEC_REFUSED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 static XCOPY_SNAP: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// GPU time of the batches' copy prologues (DS_PROFILE_GPU), ns.
 static PRE_NS: AtomicU64 = AtomicU64::new(0);
@@ -4022,16 +3941,15 @@ fn texture_ranges_into(p: &Prepared, out: &mut Vec<((u64, u64), super::desc::Tsh
 /// lay there, every particle dispatch reading such a texture took the slow
 /// path (the image cache's lock, exact ranges) and queue 0x50 recorded its
 /// indirect dispatches in 27.5 instead of 21.8 us (FINDINGS.md 2026-10-26).
-/// The slow path's syncs use the exact size either way.
+/// The slow path's syncs use the exact size either way. (The memo hashes
+/// with `fx`: SipHash over its nine fields was 1.1-1.7% of the graphics
+/// CP's busy samples at the vista, FINDINGS.md 2026-11-01 evening.)
 fn texture_bytes(t: &super::desc::Tsharp) -> u64 {
     type Key = (u16, u32, u32, u32, u32, u32, u32, u32, u32);
     thread_local! {
-        static MEMO: std::cell::RefCell<HashMap<Key, u64>> = std::cell::RefCell::new(HashMap::new());
+        static MEMO: std::cell::RefCell<super::fx::Map<Key, u64>> = std::cell::RefCell::new(super::fx::Map::default());
     }
     let rough = (t.width as u64 * t.height as u64 * t.depth.max(1) as u64 * 16).min(1 << 30);
-    if !super::tune::tex_exact() {
-        return rough;
-    }
     let key = (t.format, t.width, t.height, t.depth, t.sw_mode, t.ty, t.max_mip, t.base_level, t.last_level);
     MEMO.with(|m| {
         if let Some(&n) = m.borrow().get(&key) {
@@ -4085,7 +4003,7 @@ struct Batch {
     ops: [u64; OPS],
     /// Its barrier segments' marks (`seg_stamps`).
     segs: Vec<SegMark>,
-    /// Its slot, reset here once it completed (`tune offthread_reset`).
+    /// Its slot, reset here once it completed (`Exec::slot_reset`).
     reset: Option<SlotReset>,
 }
 
@@ -4642,87 +4560,6 @@ pub fn note_cp_source(seq: u64, src: (u64, u64)) {
     CP_WRITES.note(seq, src);
 }
 
-/// A stage used as prepared although submitted GPU work (batch `seq`) was
-/// still writing what its preparation read (`Exec::speculate`): the words
-/// it read are compared with memory once that batch completed.
-struct SpecCheck {
-    seq: u64,
-    shader: u64,
-    reads: Vec<(u64, u64)>,
-    words: Vec<u32>,
-}
-
-static SPEC_CHECKS: Mutex<Vec<SpecCheck>> = Mutex::new(Vec::new());
-static SPEC_PENDING: AtomicU64 = AtomicU64::new(0);
-/// Shaders whose speculation was wrong, and the frame: they wait again for
-/// NO_SPEC_FRAMES frames (mispredictions came at level loads, when the
-/// words change; the same shaders' words held in every wait since).
-static NO_SPEC: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
-const NO_SPEC_FRAMES: u64 = 600;
-
-/// Whether shader `addr` mispredicted lately (`NO_SPEC`).
-fn no_spec(addr: u64) -> bool {
-    let mut g = NO_SPEC.lock();
-    let Some(m) = g.as_mut() else { return false };
-    match m.get(&addr) {
-        Some(&f) if f + NO_SPEC_FRAMES > super::FRAMES.load(Ordering::Relaxed) => true,
-        Some(_) => {
-            m.remove(&addr);
-            false
-        }
-        None => false,
-    }
-}
-/// [stages used as prepared (checked), checks that held, checks that
-/// failed, commands that did not wait, data loads copied by the prologue].
-static SPEC_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
-
-/// A data-only load the batch prologue copies from guest memory into a
-/// stage's SGPR data, after the submitted work writing it (`Exec::
-/// speculate`): stage index, dword index in the SGPR data, the imported
-/// guest buffer and offset, bytes.
-pub(super) struct SgprPatch {
-    stage: usize,
-    sgpr: u32,
-    src: vk::Buffer,
-    src_off: u64,
-    bytes: u64,
-}
-
-/// Speculations on words the batch being recorded writes (`Exec::
-/// speculate`; checked once it completed).
-static SPEC_OWN: AtomicU64 = AtomicU64::new(0);
-
-/// Whether every dword of `reads` lies in the descriptor (read from memory)
-/// of a resource stage `p` only reads: a wrong one of those reads wrong data
-/// at worst; pointer words and the descriptors of what it writes are not.
-fn read_only_descriptors(p: &Prepared, reads: &[(u64, u64)]) -> bool {
-    use rdna::analysis::ResKind;
-    let res = &p.tr.plan.resources;
-    let mut ro: Vec<(u64, u64)> = Vec::new();
-    for (r, a) in res.iter().zip(p.res_addrs.iter()) {
-        let Some(a) = *a else { continue };
-        let n = 4 * r.dwords.len() as u64;
-        if r.written || matches!(r.kind, ResKind::ImageTable | ResKind::Global) {
-            if reads.iter().any(|&(b, m)| b < a + n && a < b + m) {
-                return false;
-            }
-        } else {
-            ro.push((a, n));
-        }
-    }
-    reads.iter().all(|&(b, m)| {
-        let mut d = b;
-        while d < b + m {
-            if !ro.iter().any(|&(a, n)| d >= a && d + 4 <= a + n) {
-                return false;
-            }
-            d += 4;
-        }
-        true
-    })
-}
-
 /// Read-only data a command's shaders read on the GPU, as guest memory held
 /// it when the command was recorded (`tune race_checks`): compared once the
 /// batch completed; a difference means the data changed while the batch was
@@ -4971,48 +4808,6 @@ pub fn race_line() -> String {
     out
 }
 
-/// Checks the speculations whose batch completed (completion thread).
-fn check_speculations(done: u64) {
-    if SPEC_PENDING.load(Ordering::Acquire) == 0 {
-        return;
-    }
-    let due: Vec<SpecCheck> = {
-        let mut g = SPEC_CHECKS.lock();
-        let (due, keep): (Vec<SpecCheck>, Vec<SpecCheck>) = std::mem::take(&mut *g).into_iter().partition(|c| c.seq <= done);
-        *g = keep;
-        SPEC_PENDING.store(g.len() as u64, Ordering::Release);
-        due
-    };
-    for c in due {
-        let mut k = 0usize;
-        let mut held = true;
-        'reads: for &(a, n) in &c.reads {
-            let m = (n / 4) as usize;
-            if !super::cp::guest_readable(a, n) {
-                held = false;
-                break;
-            }
-            for j in 0..m {
-                let now = unsafe { std::ptr::read_volatile((a + 4 * j as u64) as *const u32) };
-                if c.words.get(k + j) != Some(&now) {
-                    held = false;
-                    break 'reads;
-                }
-            }
-            k += m;
-        }
-        if held {
-            SPEC_STATS[1].fetch_add(1, Ordering::Relaxed);
-        } else {
-            let n = SPEC_STATS[2].fetch_add(1, Ordering::Relaxed);
-            NO_SPEC.lock().get_or_insert_with(HashMap::new).insert(c.shader, super::FRAMES.load(Ordering::Relaxed));
-            if n < 20 {
-                crate::info!("gpu: a stage used as prepared read words GPU work then changed (shader {:#x}, reads {:x?}); it waits for {NO_SPEC_FRAMES} frames", c.shader, c.reads);
-            }
-        }
-    }
-}
-
 /// The latest unfinished batch that writes guest [base, base+size) (shader
 /// writes and deferred CP writes), if any.
 pub fn pending_writes(base: u64, size: u64) -> Option<u64> {
@@ -5198,8 +4993,6 @@ fn completion_thread() {
         // `tune host_census`: its written windows are armed before its CP
         // effects release anyone who reads them.
         crate::hostcensus::completed(b.seq);
-        // `tune pre_protect`: shared copies due for arming.
-        super::precache::arm_pending();
         // Label writes the GPU performed within the batch (before its CP
         // effects, which come after its work).
         for &(a, v, n) in &b.gpu_labels {
@@ -5247,7 +5040,6 @@ fn completion_thread() {
             }
         }
         reap_spans();
-        check_speculations(b.seq);
         check_races(b.seq);
         super::forward::completed(b.seq);
         check_timestamps(b.seq);
@@ -5464,8 +5256,8 @@ struct Slot {
     reset_pending: bool,
 }
 
-/// What the completion thread resets once a batch completed (`tune
-/// offthread_reset`): its slot's command pools, descriptor pool and fence,
+/// What the completion thread resets once a batch completed
+/// (`Exec::slot_reset`): its slot's command pools, descriptor pool and fence,
 /// then `state` goes to 0. Resetting them took ~18 us of each batch begin
 /// on the recording threads (profile, 2026-10-15 late night).
 struct SlotReset {
@@ -6489,7 +6281,8 @@ pub fn set_cpu_indirect(on: bool) {
     CPU_INDIRECT.with(|c| c.set(on));
 }
 
-/// Buffer bindings made as device addresses (`tune addresses`).
+/// Buffer bindings made as device addresses (batched dispatches and draws:
+/// `Spec::addresses`).
 pub static ADDRESSED: AtomicU64 = AtomicU64::new(0);
 
 /// Dispatches with no groups (left out before their preparation): [direct,
@@ -7340,33 +7133,21 @@ pub fn shader_profile() -> String {
     {
         let n: Vec<u64> = SYNC_WHY.iter().zip(SYNC_WHY_AT_RESET.iter()).map(|(c, r)| c.load(Ordering::Relaxed).saturating_sub(r.load(Ordering::Relaxed))).collect();
         s.push_str(&format!(
-            "    command-processor waits for GPU work: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices; speculation (since boot): on words the recording batch writes {}; refused: stale home {}, data this batch writes or not one mapping {}, a parallel chunk's own writes {}, a stage writing memory or images {}, mispredicting shader {}, descriptor words (`spec_reads 2`) {}\n",
+            "    command-processor waits for GPU work: {} CP reads, {} dispatch shader reads, {} dispatch textures, {} draw shader reads, {} draw textures, {} draw indices\n",
             n[0],
             n[1],
             n[2],
             n[3],
             n[4],
-            n[5],
-            SPEC_OWN.load(Ordering::Relaxed),
-            SPEC_REFUSED[0].load(Ordering::Relaxed),
-            SPEC_REFUSED[1].load(Ordering::Relaxed),
-            SPEC_REFUSED[2].load(Ordering::Relaxed),
-            SPEC_REFUSED[3].load(Ordering::Relaxed),
-            SPEC_REFUSED[4].load(Ordering::Relaxed),
-            SPEC_REFUSED[5].load(Ordering::Relaxed)
+            n[5]
         ));
         let w: Vec<u64> = READ_WAIT_WORDS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         s.push_str(&format!(
-            "    shader-read waits whose words were unchanged after the wait: draws {} of {}, dispatches {} of {}; commands that did not wait {} ({} data loads copied by batch prologues), stages used as prepared {} (checks held {}, failed {})\n",
+            "    shader-read waits whose words were unchanged after the wait: draws {} of {}, dispatches {} of {}\n",
             w[0],
             w[0] + w[1],
             w[2],
-            w[2] + w[3],
-            SPEC_STATS[3].load(Ordering::Relaxed),
-            SPEC_STATS[4].load(Ordering::Relaxed),
-            SPEC_STATS[0].load(Ordering::Relaxed),
-            SPEC_STATS[1].load(Ordering::Relaxed),
-            SPEC_STATS[2].load(Ordering::Relaxed)
+            w[2] + w[3]
         ));
     }
     if let Some(w) = SUBMIT_WHY.lock().as_ref() {
@@ -7484,15 +7265,6 @@ pub struct Exec {
     /// being recorded began (u32::MAX: none): what a GPU-resolved run its
     /// first command opens was checked for (`fe2_run_want`).
     fe2_min_want: u32,
-    /// Resident GPU-written data (`gpu::rgm`, `exec/rgm.rs`): the open
-    /// batch's claims and their granules, its W writes (all, and those not
-    /// merged into guest memory yet), the merge table, a page list reused.
-    rgm_claims: Vec<super::rgm::Claim>,
-    rgm_mine: super::fx::Map<usize, (u16, u64)>,
-    rgm_written: super::ranges::Ranges,
-    rgm_unmerged: super::ranges::Ranges,
-    rgm_table: Option<rgm::RgmTable>,
-    rgm_pages: Vec<u64>,
     /// Prologue copies not recorded yet (`tune pre_merge`): (source,
     /// destination, region), recorded grouped by buffers by `end_pre`.
     pre_copies: Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>,
@@ -7534,10 +7306,10 @@ pub struct Exec {
     /// The recording batch reset its timestamp pool whole (`gpu_timestamp`).
     ts_pool_reset: bool,
     /// End-of-pipe timestamps of the batch whose readback and store wait for
-    /// its end (`tune eop_light`).
+    /// its end (light end-of-pipe writes, `Exec::gpu_cp_write`).
     ts_deferred: Vec<TsEntry>,
     /// An end-of-pipe label write in the batch that later work is not
-    /// ordered after (`tune eop_light`): a wait passing on it orders it
+    /// ordered after (light end-of-pipe writes, `Exec::gpu_cp_write`): a wait passing on it orders it
     /// (`order_after_open_writes`).
     eop_unordered: bool,
     /// Of them, those to compare with the clock once the batch completed.
@@ -7619,7 +7391,7 @@ pub struct Exec {
     /// commands go to lists the submission thread replays into them just
     /// before submitting it (`tune record_defer`).
     batch_lists: bool,
-    /// The frame-ahead recorder's executor (`gpu::frameahead`, `set_held`):
+    /// Recording past a run or a label wait (`past_begin`, with `past`):
     /// a deferred one whose closed batches keep their label writes (its
     /// later waits pass on them) and which stops before anything the
     /// current frame's work would see (CPU-side effects, image-cache notes,
@@ -7691,13 +7463,8 @@ pub struct Exec {
     last_draw_end: (u64, u64),
     /// The last draw's GPU-read arguments and index base (`DS_DRAW_STATS`).
     last_draw_where: (Option<u64>, Option<u64>),
-    /// The open batched draw run (`tune batch_draws`) and the program pair
-    /// of the last draws with the same context state and how many in a row.
+    /// The open batched draw run (a GPU-resolved pair's).
     draw_run: Option<draw::DrawRun>,
-    draw_streak: ((u64, u64), u32),
-    /// Speculations on words this batch writes (`speculate`): checked once
-    /// it completed, its sequence set at submission.
-    own_checks: Vec<SpecCheck>,
     /// Race checks of the batch being recorded (`tune race_checks`).
     race_pending: Vec<RaceCheck>,
     race_id: u64,
@@ -8241,9 +8008,6 @@ struct Closed {
     segs: Vec<SegMark>,
     /// Pages it uploads into the residency mirror (`Exec::res_pages`).
     res_pages: Vec<u64>,
-    /// Granules whose copies in it records, and its W writes (`gpu::rgm`).
-    rgm_claims: Vec<super::rgm::Claim>,
-    rgm_written: super::ranges::Ranges,
     /// Mirror mode: its write-back (`Exec::eager_action`) and its ownership
     /// (`Exec::mm_own`).
     eager_action: Option<Action>,
@@ -8265,8 +8029,7 @@ struct Closed {
 const PENDING: u64 = u64::MAX;
 /// Batch slots a deferred executor may create.
 const DEFERRED_SLOTS: usize = 6;
-/// The frame-ahead recorder's (`Exec::set_held`): it holds a frame's
-/// prefix of batches.
+/// A held executor's (`Exec::past_begin`): it holds a stretch's batches.
 const HELD_SLOTS: usize = 12;
 /// Writes `Exec::since_barrier` lists (more: any range counts as written).
 const SINCE_MAX: usize = 128;
@@ -8281,9 +8044,6 @@ pub static FEEDBACK: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// draw path), and their pixel shaders (profiling).
 pub static FEEDBACK_KINDS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 pub static FEEDBACK_PS: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
-/// Stages prepared again with GPU-side data loads because GPU work still
-/// wrote their data (`tune gpu_loads 3`): [vertex, pixel, compute].
-pub static HYBRID_LOADS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Snapshots of data-only loads read on the GPU (`tune data_snapshots`).
 pub static DATA_SNAPS: AtomicU64 = AtomicU64::new(0);
 /// Render passes ended without a barrier of their own because a full one
@@ -8343,12 +8103,6 @@ impl Exec {
                 f3_reads: Vec::new(),
                 f3_placed: Default::default(),
                 fe2_min_want: u32::MAX,
-                rgm_claims: Vec::new(),
-                rgm_mine: Default::default(),
-                rgm_written: Default::default(),
-                rgm_unmerged: Default::default(),
-                rgm_table: None,
-                rgm_pages: Vec::new(),
                 pre_copies: Vec::new(),
                 xcopies: Vec::new(),
                 copy_wait: 0,
@@ -8434,8 +8188,6 @@ impl Exec {
                 last_draw_end: (u64::MAX, 0),
                 last_draw_where: (None, None),
                 draw_run: None,
-                draw_streak: ((0, 0), 0),
-                own_checks: Vec::new(),
                 race_pending: Vec::new(),
                 race_id: RACE_IDS.fetch_add(1, Ordering::Relaxed),
                 race_name: name.into(),
@@ -8687,8 +8439,8 @@ impl Exec {
             wait_done(slot.seq);
             let c = ctx();
             // The completion thread resets the slot right after the batch
-            // completed (`tune offthread_reset`): waited for, or taken back
-            // when it cannot come (shutdown released the wait, device lost).
+            // completed (`slot_reset`): waited for, or taken back when it
+            // cannot come (shutdown released the wait, device lost).
             let mut reset_done = false;
             if slot.reset_pending {
                 let mut spins = 0u32;
@@ -8747,8 +8499,8 @@ impl Exec {
         self.extra_used = 0;
         // Deferred recording: this thread's commands for the batch's command
         // buffers (from their begin on) go to lists until the batch closes.
-        // (Parallel workers' batches too; never held ones: the frame-ahead
-        // recorder's, the graphics CP's past a run or a label wait.)
+        // (Parallel workers' batches too; never held ones: the graphics CP's
+        // past a run or a label wait.)
         let class = match (self.deferred, self.compute_cp) {
             (false, false) => 1,
             (false, true) => 2,
@@ -8837,12 +8589,9 @@ impl Exec {
     }
 
     /// Slot `i`'s batch is being submitted: the completion thread resets the
-    /// slot once it completed (`tune offthread_reset`; `push_batch` notes
+    /// slot once it completed (`Exec::slot_reset`; `push_batch` notes
     /// the batch in `reset_state`).
     fn slot_reset(&mut self, i: usize) -> Option<SlotReset> {
-        if !super::tune::offthread_reset() {
-            return None;
-        }
         let s = &mut self.slots[i];
         s.reset_pending = true;
         Some(SlotReset { pools: [s.cpool, s.xcpool], desc_pool: s.desc_pool, fence: s.fence, state: s.reset_state.clone() })
@@ -8891,9 +8640,6 @@ impl Exec {
         }
         if let Err(e) = self.flush_resident(None) {
             self.report(format!("shadow write-back: {e}"));
-        }
-        if let Err(e) = self.rgm_merge(None) {
-            self.report(format!("rgm merge: {e}"));
         }
         st.mark(0);
         if self.submit_after > done_seq() {
@@ -8968,20 +8714,9 @@ impl Exec {
         }
         let (cmd, fence) = (self.slots[i].cmd, self.slots[i].fence);
         let bq = self.slots[i].bq;
-        // Finished by the submission thread (`tune submit_finish`): the
-        // prologue left open with its copies, the copy-queue copies, the
-        // command buffer's end.
-        let finish = !self.deferred && super::tune::submit_finish() && super::tune::submit_thread();
-        let (pre, xpre, pre_job, xpre_job) = if finish {
-            let pre_job = self.take_pre();
-            let xpre_job = (!self.xcopies.is_empty()).then(|| (self.slots[i].xpre, std::mem::take(&mut self.xcopies)));
-            (None, None, pre_job, xpre_job)
-        } else {
-            let pre = self.end_pre();
-            let xpre = self.end_xpre();
-            finish_main(cmd, bq, pre.is_some());
-            (pre, xpre, None, None)
-        };
+        let pre = self.end_pre();
+        let xpre = self.end_xpre();
+        finish_main(cmd, bq, pre.is_some());
         let copy_wait = std::mem::take(&mut self.copy_wait);
         st.mark(3);
         st.mark(4);
@@ -9019,7 +8754,7 @@ impl Exec {
             };
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
             let lists = std::mem::take(&mut self.batch_lists).then(super::vk::defer::release);
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), rgm_claims: std::mem::take(&mut self.rgm_claims), rgm_written: std::mem::take(&mut self.rgm_written), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists });
             self.res_mine.clear();
             if let Some(b) = self.closed.last_mut() {
                 b.fe2_up = std::mem::take(&mut self.fe2_up);
@@ -9027,7 +8762,6 @@ impl Exec {
             }
             self.fe2_mine.clear();
             self.f3_placed.clear();
-            self.rgm_batch_done(true);
             self.stage_used = 0;
             self.slots[i].seq = PENDING;
             self.pending_promises.clear();
@@ -9044,7 +8778,7 @@ impl Exec {
         }
         let commands = self.batch_shaders.len();
         let gpu_labels = self.pending_promises.clone();
-        note_copy_waits(xpre.is_some() || xpre_job.is_some(), copy_wait);
+        note_copy_waits(xpre.is_some(), copy_wait);
         let alt = self.batch_alt;
         let reset = self.slot_reset(i);
         // Front end 2: the words its uploads touch, before it can run.
@@ -9062,18 +8796,6 @@ impl Exec {
             // Deferred recording: the driver records the batch now.
             if let Some(l) = lists {
                 l.replay();
-            }
-            let (mut pre, mut xpre) = (pre, xpre);
-            if finish {
-                pre = pre_job.map(|(p, mut copies, mut after)| {
-                    finish_pre(p, &mut copies, &mut after, bq);
-                    p
-                });
-                xpre = xpre_job.map(|(x, mut copies)| {
-                    finish_xpre(x, &mut copies);
-                    x
-                });
-                finish_main(cmd, bq, pre.is_some());
             }
             let _ = seq;
             Some(SubmitSpec { xpre, pre, cmd, wait: copy_wait, fence, alt, name })
@@ -9104,11 +8826,6 @@ impl Exec {
         self.res_mine.clear();
         self.owned.clear();
         self.stage_used = 0;
-        if !self.own_checks.is_empty() {
-            let mut g = SPEC_CHECKS.lock();
-            g.extend(self.own_checks.drain(..).map(|c| SpecCheck { seq, ..c }));
-            SPEC_PENDING.store(g.len() as u64, Ordering::Release);
-        }
         if !self.race_pending.is_empty() {
             let cpw_submit = super::cp::CPW_SEQ.load(Ordering::Acquire);
             RACE_CHECKS.lock().extend(self.race_pending.drain(..).map(|c| RaceCheck { seq, cpw_submit, ..c }));
@@ -9128,9 +8845,6 @@ impl Exec {
         INFLIGHT.note_ranges(seq, &writes);
         journal_note(&writes, &self.name);
         crate::hostcensus::gpu_wrote(seq, &writes);
-        if self.name == "gpu-gfx" {
-            super::frameahead::a_wrote_ranges(&writes);
-        }
         if !super::resident::mirror_mode() {
             super::resident::gpu_wrote(&writes);
         }
@@ -9152,13 +8866,6 @@ impl Exec {
         super::precache::invalidate_ranges_except(&writes, &std::mem::take(&mut self.shared_kept));
         st.mark(9);
         self.inflight.insert_all(seq, &writes);
-        // Writes by other paths dirty resident pages again now that they
-        // precede later batches (a copy in by a batch submitted before this
-        // one ran before them).
-        if super::rgm::get().is_some() {
-            super::rgm::invalidate_except(&writes, &self.rgm_written);
-        }
-        self.rgm_batch_done(true);
         st.mark(10);
         self.own_gen += 1;
         self.last_seq = seq;
@@ -9212,7 +8919,6 @@ impl Exec {
         self.fe2_mine.clear();
         self.f3_placed.clear();
         self.fe2_marked = false;
-        self.rgm_batch_done(false);
         self.owned.clear();
         self.eager_action = None;
         self.pre_after.clear();
@@ -9227,7 +8933,6 @@ impl Exec {
         if std::mem::take(&mut self.batch_lists) {
             super::vk::defer::abandon();
         }
-        self.own_checks.clear();
         self.xcopies.clear();
         self.copy_wait = 0;
         note_seg_use(self.deferred, self.compute_cp, 0, self.pre_used);
@@ -9266,7 +8971,7 @@ impl Exec {
         // A large read that may create a home (`tune home_reads`; only when
         // recording in order: a parallel chunk's later neighbours may have
         // bound the range in place already).
-        let read_use = kind == HomeUse::Sized && !written && size >= super::tune::home_read_min() && !self.deferred && super::tune::homes() && super::tune::home_reads();
+        let read_use = kind == HomeUse::Sized && !written && size >= super::tune::home_read_min() && !self.deferred && super::tune::homes();
         if !super::homes::any() && !(kind == HomeUse::Index && super::tune::homes()) && !read_use {
             return None;
         }
@@ -9516,18 +9221,6 @@ impl Exec {
         super::homes::WRITE_BACKS.fetch_add(1, Ordering::Relaxed);
         self.barrier_wanted = false;
         self.dispatched = false;
-    }
-
-    /// The batch's copy prologue, if it was begun, left open with the copies
-    /// still to record into it (`tune submit_finish`: `finish_pre` on the
-    /// submission thread).
-    fn take_pre(&mut self) -> Option<(vk::CommandBuffer, Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>, Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>)> {
-        if !std::mem::take(&mut self.pre_open) {
-            self.pre_copies.clear();
-            self.pre_after.clear();
-            return None;
-        }
-        Some((self.slots[self.cur].pre, std::mem::take(&mut self.pre_copies), std::mem::take(&mut self.pre_after)))
     }
 
     /// Ends the batch's copy prologue, if it was begun: the copies complete
@@ -10625,13 +10318,8 @@ impl Exec {
             XCOPY[0].fetch_add(1, Ordering::Relaxed);
             XCOPY[1].fetch_add(n, Ordering::Relaxed);
         } else {
-            let pre = self.open_pre();
-            if super::tune::pre_merge() {
-                self.pre_copies.push((src, buf, region));
-            } else {
-                PRE_CALLS.fetch_add(1, Ordering::Relaxed);
-                unsafe { ctx().device.cmd_copy_buffer(pre, src, buf, &[region]) };
-            }
+            let _ = self.open_pre();
+            self.pre_copies.push((src, buf, region));
         }
         let was_shared = shared.is_some();
         match shared {
@@ -10721,9 +10409,8 @@ impl Exec {
         }
         let Some((buffer, start, _)) = span(base, len) else { return Ok(false) };
         // Resident shadows holding newer data of the range go back first:
-        // their merge would undo the fill (and so would this batch's W writes').
+        // their merge would undo the fill.
         self.flush_resident(Some(&[(base, len)]))?;
-        self.rgm_before_in_place(&[(base, len)])?;
         self.begin();
         if !self.recording {
             return Ok(false);
@@ -10780,9 +10467,9 @@ impl Exec {
     /// Runs before a draw or dispatch reserves its slot (it flushes).
     pub(crate) fn resolve_fast_clears(&mut self, keys: &[super::images::ImageKey]) {
         if self.held && !keys.is_empty() {
-            // The current frame's clears are not the frame-ahead recorder's
-            // to take; its own are, once their values are known (else they
-            // wait for its own unsubmitted work).
+            // Clears of the work before the stretch are not its to take; its
+            // own are, once their values are known (else they wait for its
+            // own unsubmitted work).
             if pending_for(keys) && super::images::with(|im| im.clears_pending(keys)) {
                 self.stop("fast clear (the current frame's)");
                 return;
@@ -11174,14 +10861,11 @@ impl Exec {
     /// sequence it runs after (None: performed now).
     pub fn after_gpu(&mut self, f: Action, write: Option<(u64, u64)>, ordered: bool) -> Option<u64> {
         if self.held {
-            // Never before the current frame's work (`Cp::effect` stops
-            // the frame-ahead recorder first).
+            // Never before the work the stretch follows (`Cp::effect` stops
+            // it first).
             drop(f);
             self.stop("CP effect");
             return None;
-        }
-        if let (Some(w), true) = (write, self.name == "gpu-gfx") {
-            super::frameahead::a_wrote(&[w]);
         }
         if super::runprobe::on() && self.name == "gpu-gfx" {
             super::runprobe::stop("CP effect");
@@ -11391,142 +11075,6 @@ impl Exec {
             }
         }
         w
-    }
-
-    /// Instead of waiting for GPU work that writes what the stages'
-    /// preparations read (`tune spec_reads`), when that work is all
-    /// submitted (not this batch's) and no home holds newer data: the
-    /// data-only loads it writes (`Prepared::data_loads`) are copied from
-    /// guest memory into the stages' SGPR data by the batch prologue, on the
-    /// GPU after that work (`SgprPatch`); the other words it writes
-    /// (descriptors, pointers) are used as read and checked once the work
-    /// completed (`check_speculations`; a shader that mispredicted waits
-    /// from then on). Some: no wait, with the copies to make once the
-    /// stages' SGPR data is placed; None: wait.
-    pub(super) fn speculate(&mut self, stages: &[&Prepared]) -> Option<Vec<SgprPatch>> {
-        if !super::tune::spec_reads() {
-            return None;
-        }
-        if stages.iter().any(|p| super::homes::any_stale(&p.reads)) {
-            SPEC_REFUSED[0].fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-        let done = done_seq();
-        self.inflight.prune(done);
-        let writer = |s: &Self, r: &[(u64, u64)]| s.inflight.latest(r, done).max(INFLIGHT.latest(r)).filter(|&x| x > done);
-        let mut patches = Vec::new();
-        let mut checks: Vec<SpecCheck> = Vec::new();
-        let mut own: Vec<SpecCheck> = Vec::new();
-        let mut any = false;
-        for (k, p) in stages.iter().enumerate() {
-            if p.reads.is_empty() {
-                continue;
-            }
-            let pending = self.pending.overlaps_any(&p.reads);
-            if !pending && writer(self, &p.reads).is_none() {
-                continue;
-            }
-            // A parallel chunk's batch gets its sequence later (its main
-            // command processor submits it): such reads wait there.
-            if pending && self.deferred {
-                SPEC_REFUSED[2].fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-            any = true;
-            let mut data = vec![false; p.words.len()];
-            for d in p.data_loads.iter() {
-                let bytes = 4 * d.dwords as u64;
-                if self.pending.overlaps(d.addr, bytes) {
-                    // Data this batch writes: no copy point before the stage
-                    // outside rendering (`tune gpu_loads` reads it on the GPU).
-                    SPEC_REFUSED[1].fetch_add(1, Ordering::Relaxed);
-                    return None;
-                }
-                if writer(self, &[(d.addr, bytes)]).is_some() {
-                    let Some((src, start, _)) = span(d.addr, bytes) else {
-                        SPEC_REFUSED[1].fetch_add(1, Ordering::Relaxed);
-                        return None;
-                    };
-                    patches.push(SgprPatch { stage: k, sgpr: d.sgpr, src, src_off: d.addr - start, bytes });
-                }
-                for w in d.word as usize..(d.word + d.dwords) as usize {
-                    if let Some(x) = data.get_mut(w) {
-                        *x = true;
-                    }
-                }
-            }
-            // The other words, where that work writes: used as read, checked
-            // once it completed; not for a stage that writes memory or images
-            // (a wrong descriptor there would corrupt them).
-            let (mut reads, mut words): (Vec<(u64, u64)>, Vec<u32>) = (Vec::new(), Vec::new());
-            let mut i = 0usize;
-            for &(a, n) in p.reads.iter() {
-                for j in 0..n / 4 {
-                    if !data.get(i).copied().unwrap_or(true) {
-                        let at = a + 4 * j;
-                        match reads.last_mut() {
-                            Some(r) if r.0 + r.1 == at => r.1 += 4,
-                            _ => reads.push((at, 4)),
-                        }
-                        words.push(p.words[i]);
-                    }
-                    i += 1;
-                }
-            }
-            let own_writes = self.pending.overlaps_any(&reads);
-            let submitted = writer(self, &reads);
-            if own_writes || submitted.is_some() {
-                // Data-only patches alone (`tune spec_reads 2`): descriptor
-                // words GPU work writes are waited for as before.
-                if super::tune::spec_reads_mode() == 2 {
-                    SPEC_REFUSED[5].fetch_add(1, Ordering::Relaxed);
-                    return None;
-                }
-                if p.tr.plan.resources.iter().any(|r| r.written) && !read_only_descriptors(p, &reads) {
-                    SPEC_REFUSED[3].fetch_add(1, Ordering::Relaxed);
-                    return None;
-                }
-                if no_spec(p.addr) {
-                    SPEC_REFUSED[4].fetch_add(1, Ordering::Relaxed);
-                    return None;
-                }
-                match submitted.filter(|_| !own_writes) {
-                    Some(s) => checks.push(SpecCheck { seq: s, shader: p.addr, reads, words }),
-                    // This batch writes them: checked once it completed (its
-                    // sequence comes with its submission).
-                    None => own.push(SpecCheck { seq: 0, shader: p.addr, reads, words }),
-                }
-            }
-        }
-        if !any {
-            return None;
-        }
-        SPEC_STATS[0].fetch_add((checks.len() + own.len()) as u64, Ordering::Relaxed);
-        SPEC_STATS[3].fetch_add(1, Ordering::Relaxed);
-        SPEC_STATS[4].fetch_add(patches.len() as u64, Ordering::Relaxed);
-        if !own.is_empty() {
-            SPEC_OWN.fetch_add(own.len() as u64, Ordering::Relaxed);
-            self.own_checks.extend(own);
-        }
-        if !checks.is_empty() {
-            let mut g = SPEC_CHECKS.lock();
-            g.extend(checks);
-            SPEC_PENDING.store(g.len() as u64, Ordering::Release);
-        }
-        Some(patches)
-    }
-
-    /// Records the prologue copies of `patches` for stage `stage`, whose SGPR
-    /// data is at `ring` + `at` (`speculate`).
-    pub(super) fn patch_sgpr(&mut self, patches: &[SgprPatch], stage: usize, ring: vk::Buffer, at: u64) {
-        let mine: Vec<&SgprPatch> = patches.iter().filter(|p| p.stage == stage).collect();
-        if mine.is_empty() {
-            return;
-        }
-        let pre = self.open_pre();
-        for p in mine {
-            unsafe { ctx().device.cmd_copy_buffer(pre, p.src, ring, &[vk::BufferCopy { src_offset: p.src_off, dst_offset: at + 4 * p.sgpr as u64, size: p.bytes }]) };
-        }
     }
 
     /// The batch prologue (`Slot::pre`), begun if it was not yet: it runs
@@ -11767,23 +11315,6 @@ impl Exec {
             }
         }
         super::precache::invalidate_gpu(a, n);
-        if !self.rgm_written.contains(a, n) {
-            // (By the caller's site: `note_write` is the common path.)
-            if let Some(r) = super::rgm::get() {
-                let d = r.invalidate(a, n);
-                if d > 0 {
-                    super::rgm::note_site_at(std::panic::Location::caller(), 1, d);
-                    if d >= 64 {
-                        super::rgm::note_big_writer(self.noting, &self.name, a, n, d);
-                    }
-                    // Large writes by other paths (unbounded pointers) into
-                    // resident data recur: those granules take the old paths.
-                    if d >= 16 {
-                        r.demote(a, n);
-                    }
-                }
-            }
-        }
         super::forward::written(a, n);
         if super::tune::race_checks() {
             self.note_open_write(a, n);
@@ -11842,9 +11373,6 @@ impl Exec {
         // exactly, written in place: `resident::host_for_cp`).
         super::resident::host_for_cp(a, bytes);
         let Some((buffer, start, _)) = span(a, bytes) else { return false };
-        if self.recording && self.rgm_before_in_place(&[(a, bytes)]).is_err() {
-            return false;
-        }
         // CPU-side writes deferred into the recording batch run after it
         // completes: this one would pass them. Earlier batches' run before
         // the batch holding this one is submitted.
@@ -11864,7 +11392,7 @@ impl Exec {
             let l = format!("{} cp write", self.name);
             self.label(&l);
         }
-        let full = !(end_of_pipe && super::tune::eop_light()) && super::tune::skip_barriers() & 4 == 0;
+        let full = !end_of_pipe && super::tune::skip_barriers() & 4 == 0;
         if full && self.ts_deferred.is_empty() {
             self.end_rendering_before_barrier();
         } else {
@@ -11919,7 +11447,7 @@ impl Exec {
             }
         };
         self.taint_resident(a, bytes);
-        if end_of_pipe && super::tune::eop_light() {
+        if end_of_pipe {
             self.ops[OP_CP_WRITES] += 1;
             // An end-of-pipe write (RELEASE_MEM): after the work before it,
             // which it does not hold later work back for (as on the console);
@@ -11975,10 +11503,9 @@ impl Exec {
         }
         if let Some((v, n)) = label {
             self.pending_promises.push((a, v, n));
-            // (The frame-ahead recorder's come after the current frame's
-            // work: nothing it holds is submitted on request. Past a run, a
-            // request ends the stretch: `Cp::run` settles it and submits.)
-            if !self.held || self.past {
+            // (Past a run, a request ends the stretch: `Cp::run` settles it
+            // and submits.)
+            {
                 UNSUBMITTED_LABELS.lock().get_or_insert_with(HashMap::new).insert(a & !7, self.submit_request.clone());
                 // Another queue already blocks on it: submit at the next packet.
                 if super::tune::label_early() && super::cp::waited_now(a) {
@@ -12003,7 +11530,10 @@ impl Exec {
             return false;
         }
         let Some(k) = title_clock_k() else { return false };
-        let Ok(tp) = ts_pipe() else { return false };
+        // (Their stores to guest memory: `resolve_timestamps`.)
+        if ts_pipe().is_err() {
+            return false;
+        }
         let Some((buffer, start, _)) = span(a, 8) else { return false };
         if !self.actions.is_empty() {
             self.submit_for("effect order");
@@ -12030,97 +11560,47 @@ impl Exec {
                 _ => return false,
             }
         }
-        let Some((pool, tbuf)) = self.slots[self.cur].ts else { return false };
-        // The deferred ones get their sets when resolved (`resolve_timestamps`;
-        // the space stays reserved here).
-        let eop = super::tune::eop_light();
-        let set = if eop {
-            vk::DescriptorSet::null()
-        } else {
-            let Ok(set) = self.alloc_set(tp.set_layout) else { return false };
-            set
-        };
+        let Some((pool, _)) = self.slots[self.cur].ts else { return false };
+        // Their descriptor sets come when they are resolved
+        // (`resolve_timestamps`; the space stays reserved here).
         self.pool_use[0] += 1;
         self.pool_use[1] += 2;
         self.gpu_writes_open = true;
-        // (A light one inside a rendering instance once the batch's pool is
-        // reset: a timestamp write may come there, a query reset may not.)
-        if !super::tune::eop_light() && super::tune::ts_nowait() && super::tune::skip_barriers() & 8 == 0 {
-            self.end_rendering_before_barrier();
-        } else if !(eop && self.ts_pool_reset) {
+        // (Inside a rendering instance once the batch's pool is reset: a
+        // timestamp write may come there, a query reset may not.)
+        if !self.ts_pool_reset {
             self.end_rendering();
         }
         let q = self.ts_used;
         self.ts_used += 1;
-        let align = c.limits.min_storage_buffer_offset_alignment.max(4);
         let off = a - start;
-        let base = off / align * align;
         let cmd = self.cmd();
-        if eop {
-            // Taken when the work before it completed, without holding later
-            // work back; read and stored to guest memory at the batch's end
-            // (`resolve_timestamps`; the CPU reads it after completion, and a
-            // command-processor read of it waits for the batch). The batch's
-            // first resets every query of the pool, so the later ones need
-            // not end the rendering instance they come in (~400 a frame at
-            // the courtyard, each a restart of rendering for the next draw).
-            unsafe {
-                if !self.ts_pool_reset {
-                    c.device.cmd_reset_query_pool(cmd, pool, 0, TS_PER_BATCH);
-                    self.ts_pool_reset = true;
-                }
-                c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, q);
-            }
-            self.ts_deferred.push(TsEntry { q, buffer, off, k });
-            EOP_LIGHT[1].fetch_add(1, Ordering::Relaxed);
-            self.taint_resident(a, 8);
-            self.note_write(a, 8);
-            self.ops[OP_TIMESTAMPS] += 1;
-            if GPU_TIMESTAMPS.fetch_add(1, Ordering::Relaxed) < 8 {
-                self.ts_check.push(a);
-            }
-            return true;
-        }
-        let infos = [vk::DescriptorBufferInfo { buffer: tbuf, offset: 0, range: TS_PER_BATCH as u64 * 8 }, vk::DescriptorBufferInfo { buffer, offset: base, range: off - base + 8 }];
-        let writes: Vec<vk::WriteDescriptorSet> = infos
-            .iter()
-            .enumerate()
-            .map(|(i, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
-            .collect();
-        let pc: Vec<u8> = [q, ((off - base) / 4) as u32, k as u32, (k >> 32) as u32].iter().flat_map(|x| x.to_le_bytes()).collect();
+        // Taken when the work before it completed, without holding later
+        // work back; read and stored to guest memory at the batch's end
+        // (`resolve_timestamps`; the CPU reads it after completion, and a
+        // command-processor read of it waits for the batch). The batch's
+        // first resets every query of the pool, so the later ones need not
+        // end the rendering instance they come in (~400 a frame at the
+        // courtyard, each a restart of rendering for the next draw).
         unsafe {
-            c.device.cmd_reset_query_pool(cmd, pool, q, 1);
+            if !self.ts_pool_reset {
+                c.device.cmd_reset_query_pool(cmd, pool, 0, TS_PER_BATCH);
+                self.ts_pool_reset = true;
+            }
             c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, q);
-            copy_timestamps(cmd, pool, q, 1, tbuf, q as u64 * 8);
-            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
-            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
-            c.device.update_descriptor_sets(&writes, &[]);
-            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, tp.pipeline);
-            self.dyncache.cs_pipeline = tp.pipeline;
-            c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, tp.layout, 0, &[set], &[]);
-            c.device.cmd_push_constants(cmd, tp.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
-            c.device.cmd_dispatch(cmd, 1, 1, 1);
         }
-        // Counted before its barrier (`seg_stamps` names the segment by it).
-        self.ops[OP_TIMESTAMPS] += 1;
-        let ordered = super::tune::skip_barriers() & 8 == 0;
-        if ordered {
-            self.barrier();
-        }
-        self.barrier_wanted = false;
-        self.dispatched = false;
+        self.ts_deferred.push(TsEntry { q, buffer, off, k });
+        EOP_LIGHT[1].fetch_add(1, Ordering::Relaxed);
         self.taint_resident(a, 8);
         self.note_write(a, 8);
-        if ordered {
-            self.ordered_since(a, 8);
-        }
+        self.ops[OP_TIMESTAMPS] += 1;
         if GPU_TIMESTAMPS.fetch_add(1, Ordering::Relaxed) < 8 {
             self.ts_check.push(a);
         }
         true
     }
 
-    /// The batch's deferred end-of-pipe timestamps (`tune eop_light`): their
+    /// The batch's deferred end-of-pipe timestamps (`gpu_timestamp`): their
     /// queries read at once and each stored to guest memory, at the batch's
     /// end or before a later CP write of the batch (each query holds when the
     /// work before it completed).
@@ -12385,7 +11865,7 @@ impl Exec {
         if let Some(m) = merge {
             self.dyncache.cs_pipeline = m.pipeline;
         }
-        if merge.is_some() && super::tune::shadow_share() && super::precache::enabled() {
+        if merge.is_some() && super::precache::enabled() {
             self.share_shadows(&flush);
         }
         if super::smalltrack::on() {
@@ -12474,8 +11954,8 @@ impl Exec {
     }
 
     fn snapshot_as(&mut self, base: u64, size: u64, limit: u64, reuse: bool) -> Option<(vk::Buffer, u64, u64)> {
-        // The frame-ahead recorder copies at its batch's start instead: on
-        // the GPU, after the current frame's work (`set_held`).
+        // Held batches copy at their start instead: on the GPU, after the
+        // work they follow.
         if size == 0 || size > limit || self.snap_failed || self.held || super::homes::overlaps(base, size) {
             return None;
         }
@@ -12813,12 +12293,6 @@ impl Exec {
         self.deferred
     }
 
-    /// Makes this the frame-ahead recorder's executor (`held`).
-    pub fn set_held(&mut self) {
-        self.deferred = true;
-        self.held = true;
-    }
-
     /// The graphics command processor goes on past a parallel run before
     /// collecting its chunks (`Cp::past_start`): held from here (its own
     /// slots; its batch before the run was submitted).
@@ -12988,8 +12462,8 @@ impl Exec {
         self.held_keys.clear();
     }
 
-    /// The frame-ahead recorder starts a frame: not stopped, nothing read
-    /// or noted.
+    /// A stretch into held batches begins: not stopped, nothing read or
+    /// noted.
     pub fn held_reset(&mut self) {
         self.stopped = false;
         self.stop_why = "";
@@ -13007,7 +12481,7 @@ impl Exec {
         &self.held_keys
     }
 
-    /// The frame-ahead recorder's own notes of writes `writes` (`sized`:
+    /// A held executor's own notes of writes `writes` (`sized`:
     /// the bounded ones) and of a fill (`Images::notes_for`).
     fn held_note(&mut self, writes: &[(u64, u64)], sized: &[(u64, u64)], fill: Option<((u64, u64), u32)>) {
         let (clears, over) = super::images::with(|im| im.notes_for(writes, sized, fill));
@@ -13036,7 +12510,7 @@ impl Exec {
         zeroed.into_iter().map(|(_, i, f)| (i, f)).collect()
     }
 
-    /// Notes the images a frame-ahead recorder's command uses; whether one
+    /// Notes the images a held executor's command uses; whether one
     /// has a fast clear or an overwrite of its own pending.
     pub(crate) fn held_hit(&mut self, keys: &[super::images::ImageKey]) -> bool {
         if !self.held {
@@ -13046,12 +12520,12 @@ impl Exec {
         keys.iter().any(|k| self.held_clears.contains_key(k) || self.held_over.contains(k))
     }
 
-    /// Stops the frame-ahead recorder (`Cp::held_stop`).
+    /// Stops recording into held batches (`Cp::held_stop`).
     pub fn stop_held(&mut self, why: &'static str) {
         self.stop(why);
     }
 
-    /// Guest ranges the frame-ahead recorder read on the CPU (`kind`: an
+    /// Guest ranges a held executor read on the CPU (`kind`: an
     /// index into `HELD_READ_KINDS`).
     pub fn note_held_reads(&mut self, reads: &[(u64, u64)], kind: u8) {
         if self.held {
@@ -13168,20 +12642,9 @@ impl Exec {
             }
             super::precache::submitted(&b.shared, seq);
             super::resident::submitted(&b.res_pages, seq);
-            if !b.rgm_claims.is_empty() {
-                if let Some(r) = super::rgm::get() {
-                    r.submitted(&b.rgm_claims);
-                }
-            }
             INFLIGHT.note_ranges(seq, &b.writes);
-            if super::rgm::get().is_some() {
-                super::rgm::invalidate_except(&b.writes, &b.rgm_written);
-            }
             journal_note(&b.writes, &self.name);
             crate::hostcensus::gpu_wrote(seq, &b.writes);
-            if self.name.starts_with("gpu-gfx-par") {
-                super::frameahead::a_wrote_ranges(&b.writes);
-            }
             if !super::resident::mirror_mode() {
                 super::resident::gpu_wrote(&b.writes);
             }
@@ -13222,11 +12685,6 @@ impl Exec {
             super::forward::drop_checks(&b.forward_ids);
             super::forward::drop_entries(&b.forward_ids);
             super::resident::dropped(&b.res_pages);
-            if !b.rgm_claims.is_empty() {
-                if let Some(r) = super::rgm::get() {
-                    r.dropped(&b.rgm_claims);
-                }
-            }
             let s = &mut self.slots[b.slot];
             unsafe {
                 c.device.reset_command_buffer(s.cmd, vk::CommandBufferResetFlags::empty()).ok();
@@ -13248,7 +12706,7 @@ impl Exec {
     fn bind_stage(&mut self, p: &mut Prepared, allow_shadow: bool) -> Result<Bound, String> {
         // (Its placements counted by where the stage was made, for
         // `DS_FE2_CALLERS`.)
-        let _source = super::fe2::StageSource::set(p.ahead, p.checked_ep);
+        let _source = super::fe2::StageSource::set(p.ahead);
         // What the preparation found (its own block, shared with its cache
         // entry), apart from the SGPR data written below.
         let found = p.found.clone();
@@ -13389,48 +12847,19 @@ impl Exec {
                             self.home_bind(base, size, found.tr.plan.resources[i].written, if sized { HomeUse::Sized } else { HomeUse::Unbounded })
                                 .map(|h| (h.0, h.1, h.2))
                         });
-                        // Resident GPU-written data (`gpu::rgm`): sized bindings
-                        // on the working copy W.
-                        let mut from_rgm = false;
-                        let home = match home {
-                            Some(h) => Some(h),
-                            None if sized && from_mirror.is_none() && super::rgm::get().is_some() => {
-                                let h = self.rgm_bind(base, size, found.tr.plan.resources[i].written);
-                                from_rgm = h.is_some();
-                                h
-                            }
-                            None => None,
-                        };
-                        // Otherwise guest memory is used where this batch's W
-                        // writes may be: they go back to it first.
-                        if home.is_none() && !self.rgm_unmerged.is_empty() {
-                            if !sized {
-                                self.rgm_before_in_place(&[(base, size)])?;
-                            } else if found.tr.plan.resources[i].written {
-                                self.rgm_before_in_place(&[(base, size)])?;
-                            } else {
-                                self.rgm_before_in_place(&[(base, size)])?;
-                            }
-                        }
                         BindClock::mark(&mut clk, 1);
                         // Inside a resident shadow: its working copy is newer.
                         let resident = if read_only && home.is_none() { self.resident_read(base, size)? } else { None };
                         BindClock::mark(&mut clk, 2);
                         // Small read-only buffers: a snapshot in video memory.
-                        // Data-only loads read on the GPU (`gpu_loads`) of data
+                        // Data-only loads read on the GPU (`Spec::gpu_loads`) of data
                         // no GPU work still writes: as memory holds it now, as
                         // the CPU-resolved loads read it (the shader would read
                         // it when the batch executes, after CP and title writes
                         // that came later: `tune race_checks`, FINDINGS.md
                         // 2026-10-14); data GPU work writes is read where it is.
                         let data_load = read_only && matches!(found.resources[i], Resolved::Global(_, Some(_)));
-                        let snap = if !(read_only && resident.is_none() && home.is_none()) {
-                            None
-                        } else if data_load && super::tune::data_snapshots() {
-                            self.snapshot_exact(base, size)
-                        } else {
-                            self.snapshot(base, size, super::tune::snap_max())
-                        };
+                        let snap = if read_only && resident.is_none() && home.is_none() && data_load && super::tune::data_snapshots() { self.snapshot_exact(base, size) } else { None };
                         BindClock::mark(&mut clk, 3);
                         // Read-only bindings of buffers GPU work wrote: VRAM mirrors.
                         let mirrored = if read_only && snap.is_none() && home.is_none() { resident } else { None };
@@ -13479,9 +12908,6 @@ impl Exec {
                         }
                         if let Some((hbuf, hoff, avail)) = home {
                             placement = if from_mirror.is_some() { Placement::Mirrored } else { Placement::Home };
-                            if from_rgm {
-                                RGM_PLACED.fetch_add(1, Ordering::Relaxed);
-                            }
                             // Mirror placements start at a mark word (`Spec::write_marks`).
                             let align = if from_mirror.is_some() { 128 } else { ctx().limits.min_storage_buffer_offset_alignment.max(4) };
                             let off = hoff & !(align - 1);
@@ -13732,8 +13158,8 @@ impl Exec {
         if memo {
             return Ok(bound);
         }
-        // Frame-ahead recording: a storage image's binding marks it written
-        // in the image cache, which the current frame's work would see.
+        // Held batches: a storage image's binding marks it written in the
+        // image cache, which the work before them would see.
         if self.held && found.tr.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_))) {
             self.stop("storage image");
             return Err(STOPPED.into());
@@ -14117,7 +13543,7 @@ impl Exec {
         let r = [(args, 12)];
         // A compute queue's parallel worker cannot see writes of the run's
         // earlier chunks (not submitted yet, recorded by other threads;
-        // flushes inside a run, `tune par_events`, order them), and the
+        // flushes inside a run, `cp::par_event`, order them), and the
         // run's planning does not wait for the arguments: the GPU reads
         // them, in order.
         if !(self.deferred && self.compute_cp) && !(self.overlaps_pending(&r) || INFLIGHT.latest(&r).is_some() || CP_WRITES.latest(&r).is_some()) {
@@ -14233,16 +13659,8 @@ impl Exec {
             }
         }
         lap.mark(0);
-        // Data GPU work still writes: read by the shader itself (`tune
-        // gpu_loads 3`; data the title writes stays captured when recorded).
-        if super::tune::gpu_loads_mode() == 3 && !p.data_loads.is_empty() && self.would_wait(&shaders::data_load_ranges(&p)) {
-            shaders::note_gpu_loads_program(p.addr);
-            p = shaders::with_gpu_loads(|| shaders::prepare_compute(cp, wave64))?;
-            HYBRID_LOADS[2].fetch_add(1, Ordering::Relaxed);
-        }
         self.sync_readers = [p.addr, 0];
-        let patches = self.speculate(&[&p]);
-        if patches.is_none() && self.sync_for_stage(&p.reads, SYNC_CS_READS) {
+        if self.sync_for_stage(&p.reads, SYNC_CS_READS) {
             if self.stopped {
                 return Err(STOPPED.into());
             }
@@ -14289,7 +13707,7 @@ impl Exec {
         // queue's workers) is checked once its batch completed against the
         // words its inputs give now: a stale source in the mirror shows as
         // words still as before (forwarding checks only the graphics CP's).
-        if super::fe2::check_copies() && !forward_here && indirect.is_none() && patches.is_none() {
+        if super::fe2::check_copies() && !forward_here && indirect.is_none() {
             let busy = |r: &[(u64, u64)]| self.overlaps_pending_ro(r) || INFLIGHT.latest(r).is_some() || CP_WRITES.latest(r).is_some() || self.main_writes.as_ref().is_some_and(|m| m.overlaps_any(r));
             if let Some((base, words, _)) = super::forward::compute(&p, groups, local, busy) {
                 let id = super::forward::add_check(base, words, "a copy kernel's dispatch", &self.name);
@@ -14484,9 +13902,6 @@ impl Exec {
         }
         lap.mark(6);
         let (ring, at) = self.bind_sgpr(&p, &mut bound)?;
-        if let Some(pt) = &patches {
-            self.patch_sgpr(pt, 0, ring, at);
-        }
         if profiling() {
             note_placements(p.addr, groups, indirect.is_some(), &bound.placements);
         }
@@ -14504,9 +13919,9 @@ impl Exec {
         let gens = note_gens();
         let repeat = super::tune::lean_notes() && fill.is_none() && !writes_here.is_empty() && self.last_notes.2 == gens && self.last_notes.0 == writes_here && self.last_notes.1 == sized_here;
         // Writes on no page of a GPU-owned image or fast-clear metadata have
-        // nothing to note there (`images::may_note`). The frame-ahead
-        // recorder notes them for itself (the image cache must not see
-        // writes the current frame's work comes before).
+        // nothing to note there (`images::may_note`). A held executor notes
+        // them for itself (the image cache must not see writes that work
+        // not yet recorded comes before).
         if self.held {
             if super::images::may_note(&writes_here) {
                 self.held_note(&writes_here, &sized_here, fill);
@@ -14574,7 +13989,7 @@ impl Exec {
             // (`tune shadow_share`): copied in from video memory. Its CPU
             // writes are followed from now on (its marks so far: the copy
             // runs after them).
-            let share = shadow_merge() && super::tune::shadow_share() && super::precache::enabled();
+            let share = shadow_merge() && super::precache::enabled();
             let mut kept: Vec<Option<(vk::Buffer, u64)>> = Vec::with_capacity(fresh.len());
             for sh in &fresh {
                 if !share || sh.range < super::tune::shadow_share_min() {
@@ -14687,18 +14102,7 @@ impl Exec {
             super::vk::checkpoint(self.cmd(), super::vk::mark::DISPATCH, p.addr);
         }
         let start = [cp.reg(Space::Sh, 0x204), cp.reg(Space::Sh, 0x205), cp.reg(Space::Sh, 0x206)];
-        // Arguments on resident GPU-written data (`gpu::rgm`) are read from
-        // its working copy (the dispatch before typically wrote them there);
-        // else this batch's W writes there go to guest memory first.
-        let rgm_args = indirect.filter(|_| !self.rgm_unmerged.is_empty() || super::rgm::get().is_some()).and_then(|a| self.rgm_bind(a, 12, false)).map(|(b, off, _)| (b, off));
-        if let (Some(a), None) = (indirect, rgm_args) {
-            self.rgm_before_in_place(&[(a, 12)])?;
-        }
         let args = match indirect {
-            Some(_) if rgm_args.is_some() => {
-                RGM_ARGS.fetch_add(1, Ordering::Relaxed);
-                rgm_args
-            }
             // Still held by a resident shadow (binding and batch changes since
             // the check above may have merged it): its working copy.
             Some(a) if self.shadow_args() && self.resident_args(a).is_some() => {
@@ -14732,7 +14136,7 @@ impl Exec {
         // dispatch when nothing was recorded since it and its descriptors
         // match, else recorded as a new one (a direct 1-D dispatch) or on
         // its own.
-        let simple = batched && indirect.is_none() && start == [0, 0, 0] && patches.is_none() && set.is_none() && groups[1] == 1 && groups[2] == 1 && groups[0] <= BATCH_MAX_GROUPS;
+        let simple = batched && indirect.is_none() && start == [0, 0, 0] && set.is_none() && groups[1] == 1 && groups[2] == 1 && groups[0] <= BATCH_MAX_GROUPS;
         // SGPR data offsets are relative to the uniform window, if any.
         let mut item = ((at - bound.window.unwrap_or(0)) / 4) as u32;
         let appended = simple
@@ -15060,13 +14464,11 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; stages prepared again with GPU-side data loads {:?} ({} programs since with them); {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges ({} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges ({} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         SHADOW_ARGS.load(Ordering::Relaxed),
         INDIRECT_BARRIERS[0].load(Ordering::Relaxed),
-        HYBRID_LOADS.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),
-        shaders::gpu_loads_programs(),
         MERGED_PASS_BARRIERS.load(Ordering::Relaxed),
         FEEDBACK[0].load(Ordering::Relaxed),
         FEEDBACK[1].load(Ordering::Relaxed),
@@ -15110,7 +14512,6 @@ pub fn status() -> String {
         + &crate::mem::remap_status()
         + &crate::mem::prot_census()
         + &crate::hosted::status()
-        + &super::precache::protect_line()
         + &crate::placement::status()
         + &crate::titlemem::status()
         + &crate::titlefix::status()
@@ -15128,7 +14529,6 @@ pub fn status() -> String {
         + &super::cp::past_wait_status()
         + &held_own_line()
         + &super::forward::status_line()
-        + &super::rgm::status_line(super::FRAMES.load(Ordering::Relaxed))
         + &super::par::status()
         + &format!(
             "    batches submitted together (`tune submit_coalesce` {}): {} calls with {} batches

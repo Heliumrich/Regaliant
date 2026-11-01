@@ -1,23 +1,20 @@
-//! Stage preparations made ahead of execution by worker threads.
+//! Stage preparations made ahead of execution.
 //!
-//! Within a run of commands without synchronization packets between them
-//! (97% of the graphics queue's commands in the courtyard; STATUS: where the
-//! graphics command processor's time goes) the title orders nothing, so the
-//! shader inputs a command reads cannot depend on GPU writes of the same run.
-//! After a run's first command the command processor scans the rest of the
-//! run (`Cp::scan_ahead`: register writes and draw/dispatch packets only) and
-//! hands each later command's stages to worker threads with a snapshot of
-//! the registers they read (`StageRegs`). At execution a preparation is used
+//! While a command processor waits on a label it scans the commands after
+//! the wait (`Cp::scan_through`: register writes and draw/dispatch packets)
+//! and prepares their stages from a snapshot of the registers they read
+//! (`StageRegs`, `prepare_here`); compile-ahead prepares scanned compute
+//! stages the same way (`gpu::compile`). At execution a preparation is used
 //! when the registers, the program, the image cache's lookup generation and
-//! the guest words it read are unchanged (`take`); otherwise, or when no
-//! worker has started it yet, the stage is prepared on the command processor
-//! as before. The result is the same either way: a preparation is a function
-//! of exactly those inputs.
+//! the guest words it read are unchanged (`take`); otherwise the stage is
+//! prepared again. The result is the same either way: a preparation is a
+//! function of exactly those inputs. (Worker threads preparing the runs
+//! after each run's first command, `tune ahead`, cost CPU for no frame time
+//! and were removed on 2026-11-01.)
 
 use super::shaders::{self, Prepared, RegRead, StageKind, StageRegs};
 use parking_lot::{Condvar, Mutex};
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Slot states.
@@ -27,15 +24,10 @@ const DONE: u32 = 2;
 /// Not wanted any more (taken over by the command processor or dropped).
 const CANCELLED: u32 = 3;
 
-/// One stage preparation handed to the workers.
+/// One stage preparation made ahead.
 pub struct Slot {
     regs: StageRegs,
     wave64: bool,
-    /// Its bindings' placement checks are made where it is prepared, after
-    /// its result is posted (`tune fe2_precheck`).
-    precheck: bool,
-    /// The epoch its placement checks were made in (u32::MAX: none yet).
-    checked_ep: AtomicU32,
     state: AtomicU32,
     result: Mutex<Option<Result<Prepared, String>>>,
     cv: Condvar,
@@ -43,13 +35,7 @@ pub struct Slot {
 
 impl Slot {
     pub fn new(regs: StageRegs, wave64: bool) -> Arc<Slot> {
-        Self::new_checked(regs, wave64, false)
-    }
-
-    /// `new`, its placement checks made where it is prepared when
-    /// `precheck` (the graphics CP's stages under front end 2).
-    pub fn new_checked(regs: StageRegs, wave64: bool, precheck: bool) -> Arc<Slot> {
-        Arc::new(Slot { regs, wave64, precheck, checked_ep: AtomicU32::new(u32::MAX), state: AtomicU32::new(QUEUED), result: Mutex::new(None), cv: Condvar::new() })
+        Arc::new(Slot { regs, wave64, state: AtomicU32::new(QUEUED), result: Mutex::new(None), cv: Condvar::new() })
     }
 
     /// The registers its preparation reads (`gpu::compile`).
@@ -69,17 +55,7 @@ impl Slot {
     }
 }
 
-struct Pool {
-    jobs: Mutex<VecDeque<Arc<Slot>>>,
-    cv: Condvar,
-}
-
-static POOL: Pool = Pool { jobs: Mutex::new(VecDeque::new()), cv: Condvar::new() };
-static WORKERS: AtomicUsize = AtomicUsize::new(0);
-
 /// Statistics: indices into STATS.
-const SCANS: usize = 0;
-const JOBS: usize = 1;
 const USED: usize = 2;
 const TAKEN_OVER: usize = 3;
 const STALE_REGS: usize = 4;
@@ -98,11 +74,7 @@ const HERE: usize = 13;
 const HERE_NS: usize = 14;
 const WAIT_SCANS: usize = 15;
 const WAIT_CMDS: usize = 16;
-/// Stages whose placement checks were made where they were prepared, and
-/// those checks' ns (`tune fe2_precheck`).
-const PRECHECKS: usize = 17;
-const PRECHECK_NS: usize = 18;
-static STATS: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
+static STATS: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
 
 /// Failed preparations by stage kind and reason (the error's words, numbers
 /// and addresses left out).
@@ -123,73 +95,6 @@ pub const END_INVALID: usize = 0x132;
 pub const END_PREDICATED: usize = 0x133;
 pub const END_HEADER: usize = 0x134;
 pub const END_ARGS: usize = 0x135;
-
-/// A scan ended for `why` after `ns` on the command processor.
-pub fn note_scan(why: usize, ns: u64) {
-    STOPS[why.min(STOPS.len() - 1)].fetch_add(1, Ordering::Relaxed);
-    STATS[SCAN_NS].fetch_add(ns, Ordering::Relaxed);
-}
-
-/// Worker threads wanted (`tune ahead`; 0: preparations are not made ahead).
-pub fn enabled() -> bool {
-    super::tune::ahead() > 0
-}
-
-/// Whether a command processor (a compute queue's: `compute`) hands its
-/// stages to the workers (`tune ahead_queues`).
-pub fn enabled_for(compute: bool) -> bool {
-    enabled()
-        && match super::tune::ahead_queues() {
-            1 => compute,
-            2 => !compute,
-            _ => true,
-        }
-}
-
-fn ensure_workers() {
-    let want = super::tune::ahead().min(16) as usize;
-    while WORKERS.load(Ordering::Acquire) < want {
-        let n = WORKERS.fetch_add(1, Ordering::AcqRel);
-        if n >= want {
-            WORKERS.fetch_sub(1, Ordering::AcqRel);
-            break;
-        }
-        let name = format!("gpu-prep{n}");
-        let r = crate::thread::spawn_host(
-            &name.clone(),
-            8 << 20,
-            Box::new(move || {
-                crate::log::set_thread_name(&name);
-                crate::exception::arm_watch_current_thread(false);
-                super::profile_this_thread("prep");
-                worker();
-            }),
-        );
-        if let Err(e) = r {
-            crate::warn!("gpu: no preparation worker ({e})");
-            WORKERS.fetch_sub(1, Ordering::AcqRel);
-            break;
-        }
-    }
-}
-
-fn worker() {
-    loop {
-        let slot = {
-            let mut q = POOL.jobs.lock();
-            loop {
-                if let Some(s) = q.pop_front() {
-                    break s;
-                }
-                POOL.cv.wait(&mut q);
-            }
-        };
-        if slot.state.compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            continue;
-        }
-        run_slot(&slot);
-    }
-}
 
 /// The compute stage a finished slot prepared, if it succeeded (a copy;
 /// `gpu::compile` creates its pipeline ahead of use).
@@ -245,43 +150,10 @@ fn run_slot(slot: &Slot) {
         } else {
             r
         };
-        // (Its bindings, for the checks made after the result is posted;
-        // `tune fe2_precheck` 2: before, so the CP finds them made or waits
-        // for this slot while it runs.)
-        let before = super::tune::fe2_precheck_mode() == 2;
-        if before && slot.precheck {
-            if let Ok(p) = &r {
-                let t = std::time::Instant::now();
-                slot.checked_ep.store(super::precache::epoch() as u32, Ordering::Release);
-                super::exec::fe2_precheck_stage(&p.found);
-                STATS[PRECHECKS].fetch_add(1, Ordering::Relaxed);
-                STATS[PRECHECK_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            }
-        }
-        let found = r.as_ref().ok().filter(|_| slot.precheck && !before).map(|p| p.found.clone());
         *slot.result.lock() = Some(r);
         slot.state.store(DONE, Ordering::Release);
         slot.cv.notify_all();
-        if let Some(found) = found {
-            let t = std::time::Instant::now();
-            slot.checked_ep.store(super::precache::epoch() as u32, Ordering::Release);
-            super::exec::fe2_precheck_stage(&found);
-            STATS[PRECHECKS].fetch_add(1, Ordering::Relaxed);
-            STATS[PRECHECK_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        }
     }
-}
-
-/// Hands `slots` to the workers.
-pub fn submit(slots: &[Arc<Slot>]) {
-    if slots.is_empty() {
-        return;
-    }
-    ensure_workers();
-    STATS[SCANS].fetch_add(1, Ordering::Relaxed);
-    STATS[JOBS].fetch_add(slots.len() as u64, Ordering::Relaxed);
-    POOL.jobs.lock().extend(slots.iter().cloned());
-    POOL.cv.notify_all();
 }
 
 /// The preparation made ahead in `slot` if it holds for the live registers
@@ -340,16 +212,15 @@ pub fn take<R: RegRead + ?Sized>(slot: &Slot, live: &R, wave64: bool) -> Option<
         return None;
     }
     STATS[USED].fetch_add(1, Ordering::Relaxed);
-    // (Made by a worker; with its placement checks if they were made by now.)
-    let ep = slot.checked_ep.load(Ordering::Acquire);
-    (p.ahead, p.checked_ep) = if ep != u32::MAX { (3, ep) } else { (2, 0) };
+    // (Made ahead.)
+    p.ahead = 2;
     Some(p)
 }
 
 /// One status line ("" before any scan).
 pub fn status() -> String {
     let s: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    if s[SCANS] == 0 && s[WAIT_SCANS] == 0 {
+    if s[WAIT_SCANS] == 0 {
         return String::new();
     }
     let mut stops: Vec<(u64, usize)> = STOPS.iter().enumerate().map(|(i, c)| (c.load(Ordering::Relaxed), i)).filter(|x| x.0 > 0).collect();
@@ -369,13 +240,10 @@ pub fn status() -> String {
     why.sort_by(|a, b| b.1.cmp(&a.1));
     let why: Vec<String> = why.iter().take(6).map(|(k, n)| format!("{n} {k}")).collect();
     format!(
-        "    preparations ahead: {} scans ({} ms; ended by {}), {} stages handed to {} workers, {} scans at label waits found {} commands, {} stages prepared while waiting ({} ms), {} used, {} prepared here instead (not started), stale: {} registers, {} program, {} GPU images, {} words; {} failed ({}), {} dropped; {} waits for a worker ({} ms); placement checks made where prepared {} ({} ms)\n",
-        s[SCANS],
+        "    preparations ahead: {} scans at label waits ({} ms; ended by {}) found {} commands, {} stages prepared while waiting ({} ms), {} used, {} prepared again instead (not started), stale: {} registers, {} program, {} GPU images, {} words; {} failed ({}), {} dropped; {} waits for one in progress ({} ms)\n",
+        s[WAIT_SCANS],
         s[SCAN_NS] / 1_000_000,
         stops.join(", "),
-        s[JOBS],
-        WORKERS.load(Ordering::Relaxed),
-        s[WAIT_SCANS],
         s[WAIT_CMDS],
         s[HERE],
         s[HERE_NS] / 1_000_000,
@@ -389,8 +257,6 @@ pub fn status() -> String {
         why.join("; "),
         s[DROPPED],
         s[WAITS],
-        s[WAITED_NS] / 1_000_000,
-        s[PRECHECKS],
-        s[PRECHECK_NS] / 1_000_000
+        s[WAITED_NS] / 1_000_000
     )
 }

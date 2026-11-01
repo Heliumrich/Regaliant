@@ -25,9 +25,6 @@ static TRANSLATIONS: Mutex<Option<HashMap<(u64, u64), Arc<Translated>>>> = Mutex
 const BIG_SPIRV_WORDS: usize = 40_000;
 static BIG_SPIRV_SEEN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
 thread_local! {
-    /// Preparations made inside `with_gpu_loads` read their data-only loads
-    /// on the GPU whatever `tune gpu_loads` says.
-    static FORCE_GPU_LOADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Vertex stages prepared inside `with_base_instance`: the user-data
     /// word that receives the draw's start instance on the GPU.
     static BASE_INSTANCE: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
@@ -89,39 +86,6 @@ fn batched_draw_now() -> bool {
     BATCHED_DRAW.with(|c| c.get())
 }
 
-/// Program pairs (vertex, pixel) whose consecutive draws with the same
-/// context state run batched (`mark_draw_batchable`), and pairs refused
-/// (their stages write memory or use the varying's location).
-static DRAW_PAIRS: parking_lot::RwLock<Option<(std::collections::HashSet<(u64, u64)>, std::collections::HashSet<(u64, u64)>)>> = parking_lot::RwLock::new(None);
-static DRAW_PAIRS_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn draw_batchable(vs: u64, ps: u64) -> bool {
-    DRAW_PAIRS_ANY.load(std::sync::atomic::Ordering::Relaxed) && DRAW_PAIRS.read().as_ref().is_some_and(|(on, _)| on.contains(&(vs, ps)))
-}
-
-/// Pair (vs, ps) is batched from now on (unless refused before).
-pub fn mark_draw_batchable(vs: u64, ps: u64) {
-    let mut g = DRAW_PAIRS.write();
-    let (on, refused) = g.get_or_insert_with(Default::default);
-    if refused.contains(&(vs, ps)) || !on.insert((vs, ps)) {
-        return;
-    }
-    DRAW_PAIRS_ANY.store(true, std::sync::atomic::Ordering::Relaxed);
-    if on.len() <= 64 || on.len() % 64 == 0 {
-        crate::info!("gpu: draws of vs {vs:#x} ps {ps:#x} batched from now on ({} pairs)", on.len());
-    }
-}
-
-/// Pair (vs, ps) cannot run batched: never again.
-pub fn refuse_draw_batchable(vs: u64, ps: u64, why: &str) {
-    let mut g = DRAW_PAIRS.write();
-    let (on, refused) = g.get_or_insert_with(Default::default);
-    on.remove(&(vs, ps));
-    if refused.insert((vs, ps)) && refused.len() <= 40 {
-        crate::info!("gpu: draws of vs {vs:#x} ps {ps:#x} not batched: {why}");
-    }
-}
-
 /// Runs `f` with the vertex stages it prepares taking user-data word `slot`
 /// from the draw's start instance on the GPU (`Spec::base_instance_sgpr`:
 /// indexed indirect draws whose arguments the GPU reads).
@@ -153,16 +117,6 @@ pub fn note_cpu_args_program(addr: u64) {
 
 pub fn cpu_args_program(addr: u64) -> bool {
     CPU_ARGS_ANY.load(std::sync::atomic::Ordering::Acquire) && CPU_ARGS_PROGRAMS.lock().as_ref().is_some_and(|s| s.contains(&addr))
-}
-
-/// Runs `f` with the stage preparations it makes reading their data-only
-/// scalar loads on the GPU (`tune gpu_loads 3`: for stages whose data the
-/// command processor would otherwise wait for).
-pub fn with_gpu_loads<T>(f: impl FnOnce() -> T) -> T {
-    FORCE_GPU_LOADS.with(|c| c.set(true));
-    let r = f();
-    FORCE_GPU_LOADS.with(|c| c.set(false));
-    r
 }
 
 thread_local! {
@@ -227,53 +181,6 @@ pub fn lod_rotated(p: &Prepared) -> bool {
     let s = &p.tr.spec;
     s.stage == Stage::Fragment && !s.lod_stats && !s.batched && !s.early_tests && !s.early_ok && lod_per_draw()
 }
-
-/// Programs whose data-only loads GPU work was found writing when they were
-/// prepared (`tune gpu_loads 3`): prepared with GPU-side loads from then on
-/// (no second preparation per command); a generation for the threads'
-/// copies.
-static GPU_LOADS_PROGRAMS: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
-static GPU_LOADS_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-thread_local! {
-    static LOCAL_GPU_LOADS: std::cell::RefCell<(u64, std::collections::HashSet<u64>)> = std::cell::RefCell::new((0, std::collections::HashSet::new()));
-}
-
-/// Program `addr` reads data GPU work writes: GPU-side loads from now on.
-pub fn note_gpu_loads_program(addr: u64) {
-    if GPU_LOADS_PROGRAMS.lock().get_or_insert_with(std::collections::HashSet::new).insert(addr) {
-        GPU_LOADS_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
-    }
-}
-
-/// Whether program `addr` was noted (this thread's copy of the set).
-fn gpu_loads_program(addr: u64) -> bool {
-    let generation = GPU_LOADS_GEN.load(std::sync::atomic::Ordering::Acquire);
-    if generation == 0 {
-        return false;
-    }
-    LOCAL_GPU_LOADS.with(|l| {
-        let mut l = l.borrow_mut();
-        if l.0 != generation {
-            l.1 = GPU_LOADS_PROGRAMS.lock().clone().unwrap_or_default();
-            l.0 = generation;
-        }
-        l.1.contains(&addr)
-    })
-}
-
-/// Programs prepared with GPU-side loads because they were noted.
-pub fn gpu_loads_programs() -> usize {
-    GPU_LOADS_PROGRAMS.lock().as_ref().map_or(0, |s| s.len())
-}
-
-/// The data-only loads' ranges of a preparation made with CPU-resolved loads.
-pub fn data_load_ranges(p: &Prepared) -> Vec<(u64, u64)> {
-    p.data_loads.iter().map(|d| (d.addr, 4 * d.dwords as u64)).collect()
-}
-
-/// Programs logged under a `gpu_loads_sel` selection (bisection).
-static GPU_LOADS_SELECTED: Mutex<Option<std::collections::HashSet<(u64, u64)>>> = Mutex::new(None);
 
 thread_local! {
     /// This thread's view of the shared caches (entries never change once
@@ -762,10 +669,8 @@ pub struct Prepared {
     /// The program code's hash (`program_checked`).
     pub code_hash: u64,
     /// Where it was made, for `DS_FE2_CALLERS` (`fe2::StageSource`): 1 by
-    /// the thread binding it, 2 ahead by a worker (`gpu::ahead`), 3 that
-    /// and its placement checks made there in epoch `checked_ep`.
+    /// the thread binding it, 2 ahead by a worker (`gpu::ahead`).
     pub ahead: u8,
-    pub checked_ep: u32,
 }
 
 impl Clone for Prepared {
@@ -784,7 +689,6 @@ impl Clone for Prepared {
             cmp_depth: self.cmp_depth,
             code_hash: self.code_hash,
             ahead: self.ahead,
-            checked_ep: self.checked_ep,
         }
     }
 }
@@ -1120,7 +1024,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         force_dispatcher: super::tune::block_chain() == 0,
         dispatcher_for_loops: super::tune::block_chain() == 2,
         reg_vars: super::tune::reg_vars(),
-        lane_guards: super::tune::lane_guards(),
+        lane_guards: true,
         mip_views: super::tune::mip_views(),
         lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
         lod_lean: super::tune::lod_stats() == 4,
@@ -1130,7 +1034,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         lane_votes: false,
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Compute)),
-        addresses: super::tune::addresses() || (super::tune::batch_cs() && batchable(addr)),
+        addresses: super::tune::batch_cs() && batchable(addr),
         batched: super::tune::batch_cs() && batchable(addr),
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
@@ -1345,7 +1249,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         force_dispatcher: super::tune::block_chain() == 0,
         dispatcher_for_loops: super::tune::block_chain() == 2,
         reg_vars: super::tune::reg_vars(),
-        lane_guards: super::tune::lane_guards(),
+        lane_guards: true,
         mip_views: super::tune::mip_views(),
         lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
         lod_lean: super::tune::lod_stats() == 4,
@@ -1355,7 +1259,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         lane_votes: false,
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Fragment)),
-        addresses: super::tune::addresses() || batched_draw_now(),
+        addresses: batched_draw_now(),
         batched: batched_draw_now(),
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
@@ -1533,7 +1437,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         force_dispatcher: super::tune::block_chain() == 0,
         dispatcher_for_loops: super::tune::block_chain() == 2,
         reg_vars: super::tune::reg_vars(),
-        lane_guards: super::tune::lane_guards(),
+        lane_guards: true,
         mip_views: super::tune::mip_views(),
         lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
         lod_lean: super::tune::lod_stats() == 4,
@@ -1543,7 +1447,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         lane_votes: false,
         base_instance_sgpr: BASE_INSTANCE.with(|c| c.get()).map(|k| 8 + k),
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Vertex)),
-        addresses: super::tune::addresses() || batched_draw_now(),
+        addresses: batched_draw_now(),
         batched: batched_draw_now(),
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
@@ -2094,9 +1998,6 @@ pub(crate) fn program_code(addr: u64) -> Result<(Vec<u32>, u64), String> {
 /// title has loaded the program) for `key_spec`, kept where `prepare`
 /// looks for it (translations do not depend on the program's address).
 pub(crate) fn translate_code_for_spec(code: &[u32], code_hash: u64, key_spec: Spec) -> Result<Arc<Translated>, String> {
-    if super::tune::gpu_loads_mode() != 0 {
-        return Err("gpu_loads".into());
-    }
     if hash_words(code) != code_hash {
         return Err("stored code does not match its hash".into());
     }
@@ -2168,10 +2069,6 @@ pub(crate) fn stage_plan(addr: u64, user_sgprs: u16, user_base: u16) -> Result<(
 /// `compute_spec`, `vertex_spec` or `pixel_spec` make it; `gpu::precompile`),
 /// kept where `prepare` looks for it.
 pub(crate) fn translate_for_spec(addr: u64, key_spec: Spec) -> Result<Arc<Translated>, String> {
-    // Only the default form (data loads resolved by the CPU) is made ahead.
-    if super::tune::gpu_loads_mode() != 0 {
-        return Err("gpu_loads".into());
-    }
     let (insts, plan, code_hash) = stage_plan(addr, key_spec.user_sgprs, key_spec.user_base)?;
     let plan_key = code_hash ^ (key_spec.user_sgprs as u64) << 48 ^ (key_spec.user_base as u64) << 56;
     let spec_hash = {
@@ -2269,7 +2166,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         force_dispatcher: super::tune::block_chain() == 0,
         dispatcher_for_loops: super::tune::block_chain() == 2,
         reg_vars: super::tune::reg_vars(),
-        lane_guards: super::tune::lane_guards(),
+        lane_guards: true,
         mip_views: super::tune::mip_views(),
         lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
         lod_lean: super::tune::lod_stats() == 4,
@@ -2279,7 +2176,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         lane_votes: false,
         base_instance_sgpr,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Vertex)),
-        addresses: super::tune::addresses(),
+        addresses: false,
         batched: false,
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
@@ -2316,7 +2213,7 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         force_dispatcher: super::tune::block_chain() == 0,
         dispatcher_for_loops: super::tune::block_chain() == 2,
         reg_vars: super::tune::reg_vars(),
-        lane_guards: super::tune::lane_guards(),
+        lane_guards: true,
         mip_views: super::tune::mip_views(),
         lod_stats: lod,
         lod_lean: lod && super::tune::lod_stats() == 4,
@@ -2326,7 +2223,7 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         lane_votes: false,
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Fragment)),
-        addresses: super::tune::addresses(),
+        addresses: false,
         batched: false,
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
@@ -2363,7 +2260,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         force_dispatcher: super::tune::block_chain() == 0,
         dispatcher_for_loops: super::tune::block_chain() == 2,
         reg_vars: super::tune::reg_vars(),
-        lane_guards: super::tune::lane_guards(),
+        lane_guards: true,
         mip_views: super::tune::mip_views(),
         lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
         lod_lean: super::tune::lod_stats() == 4,
@@ -2373,7 +2270,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         lane_votes: false,
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Compute)),
-        addresses: super::tune::addresses() || (super::tune::batch_cs() && batched),
+        addresses: super::tune::batch_cs() && batched,
         batched: super::tune::batch_cs() && batched,
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
@@ -2520,22 +2417,9 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         spec.hash(&mut h);
         h.finish()
     });
-    // The plan depends only on the program, the user-data layout and where
-    // data loads are read.
-    let sel = super::tune::gpu_loads_sel();
-    let selected = sel == 0 || code_hash & ((1u64 << (sel >> 32).min(63)) - 1) == sel & 0xFFFF_FFFF;
-    let gpu_loads = FORCE_GPU_LOADS.with(|c| c.get())
-        || match super::tune::gpu_loads_mode() {
-            0 => false,
-            2 => !spec.per_lane && selected,
-            3 => gpu_loads_program(addr),
-            _ => selected,
-        };
-    if gpu_loads && sel >> 32 >= 8 && GPU_LOADS_SELECTED.lock().get_or_insert_with(std::collections::HashSet::new).insert((sel, addr)) {
-        let saved = super::capture::save_program(addr).map(|f| format!("; program saved to {}", f.display())).unwrap_or_default();
-        crate::info!("gpu_loads selection {sel:#x}: {:?} shader {addr:#x} (code hash {code_hash:#018x}){saved}", spec.stage);
-    }
-    let plan_key = code_hash ^ (spec.user_sgprs as u64) << 48 ^ (spec.user_base as u64) << 56 ^ (gpu_loads as u64) << 40;
+    // The plan depends only on the program and the user-data layout (data
+    // loads read by the CPU).
+    let plan_key = code_hash ^ (spec.user_sgprs as u64) << 48 ^ (spec.user_base as u64) << 56;
     let cached = LOCAL_PLANS.with(|c| c.borrow().get(&plan_key).cloned()).or_else(|| {
         let p = std::rc::Rc::new(PLANS.lock().as_ref().and_then(|m| m.get(&plan_key).cloned())?);
         LOCAL_PLANS.with(|c| c.borrow_mut().insert(plan_key, p.clone()));
@@ -2545,7 +2429,7 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         Some(p) => p,
         None => {
             let t0 = std::time::Instant::now();
-            let p = Arc::new(rdna::analysis::analyze_opts(&insts, spec.user_sgprs, spec.user_base, gpu_loads));
+            let p = Arc::new(rdna::analysis::analyze_opts(&insts, spec.user_sgprs, spec.user_base, false));
             let ms = t0.elapsed().as_millis();
             if ms >= 100 {
                 crate::info!("{:?} shader {addr:#x}: analysis took {ms} ms ({} instructions)", spec.stage, insts.len());
@@ -2864,7 +2748,6 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         cmp_depth,
         code_hash,
         ahead: 1,
-        checked_ep: 0,
     };
     if let Some(h) = &checked_hit {
         prep_compare(h, &prepared);

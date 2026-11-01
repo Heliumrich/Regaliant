@@ -321,7 +321,7 @@ pub fn note_past(why: &'static str, dropped: Option<&'static str>) {
 /// predicated) x [runs, commands].
 static LENGTHS: Mutex<[[u64; 2]; 6]> = Mutex::new([[0; 2]; 6]);
 static ENDS: Mutex<Vec<(usize, u64, u64)>> = Mutex::new(Vec::new());
-/// The same for the compute queues' runs (`tune par_compute`).
+/// The same for the compute queues' runs (`cp::compute_workers`).
 static LENGTHS_C: Mutex<[[u64; 2]; 6]> = Mutex::new([[0; 2]; 6]);
 static ENDS_C: Mutex<Vec<(usize, u64, u64)>> = Mutex::new(Vec::new());
 /// The graphics queue's runs of fewer than 32 commands by what ended them.

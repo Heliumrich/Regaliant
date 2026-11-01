@@ -1126,8 +1126,6 @@ pub static PROBE_CLEAN: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub static WW_BY_WHO: [[std::sync::atomic::AtomicU64; 3]; 10] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 10];
 pub static WW_BY_SIZE: [[std::sync::atomic::AtomicU64; 3]; 21] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 21];
 pub const WW_WHO_NAMES: [&str; 10] = ["copy-cache checks", "copy-cache inserts", "homes watch", "texture scrubbing", "texture re-uploads", "homes candidates", "shadow windows", "other", "resident data", "front end 2"];
-/// `take_written` for resident GPU-written data (`gpu::rgm`).
-pub const WW_WHO_RGM: usize = 8;
 /// `take_written` for front end 2's placements (`gpu::fe2`).
 pub const WW_WHO_FE2: usize = 9;
 
@@ -1225,16 +1223,7 @@ pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>, who: usize) -> Opt
         return None;
     }
     let (lo, hi) = (base & !4095, (base + size).next_multiple_of(4096));
-    // Every take resets the marks it reads: resident GPU-written data
-    // (`gpu::rgm`) learns of the pages written, whoever took them.
-    let first = out.len();
-    let r = take_written_inner(lo, hi, out, who);
-    match r {
-        Some(()) if out.len() > first => crate::gpu::rgm::cpu_written(&out[first..]),
-        Some(()) => {}
-        None => crate::gpu::rgm::invalidate(lo, hi - lo),
-    }
-    r
+    take_written_inner(lo, hi, out, who)
 }
 
 fn take_written_inner(lo: u64, hi: u64, out: &mut Vec<u64>, who: usize) -> Option<()> {

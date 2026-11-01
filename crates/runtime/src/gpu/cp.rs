@@ -307,8 +307,8 @@ pub struct Cp {
     /// stretch runs through).
     pub sub_index: u64,
     rewind_sub: Option<(u64, usize, u64)>,
-    /// Stage preparations started ahead for the next commands of the
-    /// current synchronization-free run (`scan_ahead`), in packet order.
+    /// Stage preparations made ahead for the commands after a label wait
+    /// (`scan_through`), in packet order.
     ahead: std::collections::VecDeque<AheadCmd>,
     /// The executing command's preparations made ahead (taken by the
     /// executor through `take_ahead`; [vertex, pixel] or [compute, -]).
@@ -358,14 +358,14 @@ pub struct Cp {
     /// The frame `run_costs` was last pruned in (at most once a frame: a
     /// vista's runs keep it above its bound).
     run_costs_pruned: u64,
-    /// The frame-ahead recorder's state while it records a frame ahead
-    /// (`gpu::frameahead`; None: an ordinary command processor).
-    pub(super) held: Option<Box<super::frameahead::HeldCp>>,
+    /// Its state while it records past a run or a label wait into held
+    /// batches (`past_start`; None: recording as usual).
+    pub(super) held: Option<Box<HeldCp>>,
     /// The graphics queue's command processor (`gpu-gfx`).
     main_gfx: bool,
     /// Recording past a parallel run (`tune past_runs`).
     past: Option<Box<Past>>,
-    /// Recording past a label wait (`tune past_waits`), and whether such a
+    /// Recording past a label wait (`Cp::past_wait_ok`), and whether such a
     /// stretch is settling (its wait is waited for normally then).
     past_wait: Option<Box<PastWait>>,
     settling: bool,
@@ -506,7 +506,7 @@ struct ParRun {
     run: Arc<super::par::Run>,
     /// How long the main command processor waited for the workers so far.
     waited_ns: u64,
-    /// The run holds flushes or cache actions (`tune par_events`): later CP
+    /// The run holds flushes or cache actions (`par_event`): later CP
     /// writes follow the GPU work before them.
     sync: bool,
     /// Its signature and command count, and each worker chunk's first
@@ -567,7 +567,7 @@ struct PastWait {
     ticks: u32,
 }
 
-/// Recording past label waits (`tune past_waits`): [stretches begun,
+/// Recording past label waits (`Cp::past_wait_ok`): [stretches begun,
 /// committed, dropped, commands recorded past the waits, ns from a wait to
 /// its settling, settled once the label was promised, settled at a stop,
 /// ns the stops waited for the label].
@@ -773,11 +773,19 @@ fn is_command(op: u32) -> bool {
     matches!(op, op::DRAW_INDEX_2 | op::DRAW_INDEX_AUTO | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT | op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT)
 }
 
-/// Packets that leave a run open (state only; see `Cp::scan_ahead`).
-/// Flushes and cache actions that parallel runs of this kind of queue keep
-/// inside them (`tune par_events`).
+/// Packets that leave a run open (state only; see `Cp::scan_commands`).
+/// Flushes and cache actions that compute queues' parallel runs keep inside
+/// them (front end 2: their chunks keep a barrier in the batch and order
+/// later CP writes after the GPU work; the graphics queue's end its runs).
 fn par_event(op: u32, compute: bool) -> bool {
-    matches!(op, op::EVENT_WRITE | op::ACQUIRE_MEM) && super::tune::par_events() & if compute { 1 } else { 2 } != 0
+    compute && matches!(op, op::EVENT_WRITE | op::ACQUIRE_MEM) && super::fe2::on()
+}
+
+/// Parallel workers of a compute queue's command processor for its
+/// synchronization-free runs: four under front end 2 (+6-10% at the vista,
+/// FINDINGS.md 2026-10-28 night), none in the old front end (a loss there).
+fn compute_workers() -> usize {
+    if super::fe2::on() { 4 } else { 0 }
 }
 
 fn is_state(op: u32) -> bool {
@@ -806,13 +814,8 @@ fn is_state(op: u32) -> bool {
 struct AheadCmd {
     at: u64,
     stages: [Option<Arc<super::ahead::Slot>>; 2],
-    /// A draw's baked pipeline state registers (scans for compiles ahead).
-    gfx: Option<Box<super::exec::GfxRegs>>,
 }
 
-/// Commands per scan ahead (a bound on work wasted when execution takes
-/// another path).
-const AHEAD_MAX: usize = 256;
 
 /// Register view of a scan ahead: the command processor's register files
 /// with the writes of the packets scanned so far.
@@ -1804,14 +1807,13 @@ fn label_wrote(addr: u64, wide: bool, v: u64) -> bool {
 /// What the queue thread is doing (diagnostics).
 pub static STATE: parking_lot::Mutex<Vec<(String, String)>> = parking_lot::Mutex::new(Vec::new());
 
-/// What the queue that last wrote label `a` is doing now, and who last
-/// wrote the label it waits on (frame-ahead recording's poll statistics).
-fn held_writer_state(a: u64) -> String {
-    let Some((q, _, _)) = last_write(a) else { return "cpu".into() };
-    let st = STATE.lock().iter().find(|(n, _)| *n == q).map(|(_, s)| s.clone()).unwrap_or_default();
-    let on = st.split('[').nth(1).and_then(|r| r.split(']').next()).and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok());
-    let by = on.and_then(last_write).map(|w| format!(" (that label last written by {})", w.0)).unwrap_or_default();
-    format!("{q}: {st}{by}")
+/// A command processor's state while it records past a run or a label
+/// wait into held batches (`Cp::held`, `Cp::past_start`).
+pub struct HeldCp {
+    /// Why and where (packet address) it stopped.
+    pub stop: Option<(&'static str, u64)>,
+    /// Draws and dispatches recorded.
+    pub commands: u64,
 }
 
 fn set_state(name: &str, s: String) {
@@ -1955,46 +1957,6 @@ impl Cp {
         Ok(())
     }
 
-    /// Gives this (frame-ahead) command processor an executor that holds
-    /// its batches (`Exec::set_held`).
-    pub fn make_held_exec(&mut self) -> Result<(), String> {
-        let mut e = super::exec::Exec::new(&self.name)?;
-        e.set_held();
-        self.exec = Some(Box::new(e));
-        Ok(())
-    }
-
-    /// Starts recording ahead from the walked state `w` (`gpu::frameahead`).
-    pub fn held_begin(&mut self, w: &WalkState, h: Box<super::frameahead::HeldCp>) {
-        self.set_chunk_state(&w.st);
-        self.ctx_stack.clone_from(&w.stack);
-        self.last_draw_progs = (0, 0, 0);
-        self.same_run = 0;
-        self.markers.clear();
-        self.pred = None;
-        self.fence_pending = false;
-        self.drop_ahead();
-        self.par_skip = (0, 0);
-        self.held = Some(h);
-        if let Some(e) = self.exec.as_mut() {
-            e.held_reset();
-        }
-    }
-
-    /// Ends recording ahead: the open batch closed (held with the others);
-    /// the recorder's state.
-    pub fn held_end(&mut self) -> Option<Box<super::frameahead::HeldCp>> {
-        if let Some(e) = self.exec.as_mut() {
-            e.close();
-        }
-        self.held.take()
-    }
-
-    /// The executor holding the frame-ahead recorder's batches.
-    pub fn held_exec(&mut self) -> Option<&mut super::exec::Exec> {
-        self.exec.as_deref_mut()
-    }
-
     /// Stops recording ahead at the packet at `at` (it and what follows are
     /// left to the main command processor).
     fn held_stop(&mut self, why: &'static str, at: u64) {
@@ -2008,10 +1970,9 @@ impl Cp {
         }
     }
 
-    /// Whether the frame-ahead recorder stops after the packet at `cur`
-    /// (`next`: the packet after it): it stopped in it (at `cur`), or the
-    /// main command processor finished the frame (at `next`).
-    fn held_halted(&mut self, cur: u64, next: u64) -> bool {
+    /// Whether recording into held batches stops after the packet at `cur`:
+    /// it stopped in it (at `cur`).
+    fn held_halted(&mut self, cur: u64) -> bool {
         let stopped = self.exec.as_ref().filter(|e| e.stopped).map(|e| e.stop_why);
         let Some(h) = self.held.as_mut() else { return false };
         if h.stop.is_some() {
@@ -2021,15 +1982,11 @@ impl Cp {
             h.stop = Some((if why.is_empty() { "stopped" } else { why }, cur));
             return true;
         }
-        if super::frameahead::frame_finished(h.frames) {
-            self.held_stop("frame done", next);
-            return true;
-        }
         false
     }
 
-    /// Packets the frame-ahead recorder does not execute: what it cannot
-    /// do before the current frame's work is done (a flip, a display buffer
+    /// Packets recording into held batches does not execute: what it cannot
+    /// do before the work it comes after is done (a flip, a display buffer
     /// still shown, CP effects other than label writes, branches on memory).
     fn held_refuses(&self, opcode: u32, n: u64, p: &dyn Fn(u64) -> u32) -> Option<&'static str> {
         match opcode {
@@ -2049,12 +2006,9 @@ impl Cp {
         }
     }
 
-    /// WAIT_REG_MEM of the frame-ahead recorder. Its work follows the
-    /// current frame's, which follows what other queues wrote before: a wait
-    /// passes on its own label writes, else on what the current frame's
-    /// rest writes last (`HeldCp::labels`), else on memory or another
-    /// queue's promise, else once one of those passes while the frame is
-    /// not done (polled); otherwise it stops.
+    /// WAIT_REG_MEM recorded into held batches (`Cp::past_start`): a wait
+    /// passes on its own label writes, else on memory or another queue's
+    /// promise; otherwise the stretch stops there.
     fn held_wait(&mut self, control: u32, a: u64, wide: bool, reference: u64, mask: u64) -> Flow {
         let func = control & 7;
         if (control >> 4) & 3 != 1 || !valid(a, 8) {
@@ -2063,7 +2017,7 @@ impl Cp {
         // Past a label wait, a wait for the same value passes when that one
         // does (the stretch settles on it).
         if self.past_wait.as_deref().is_some_and(|w| w.a == a && w.wide == wide && w.control & 7 == func && w.reference == reference && w.mask == mask) {
-            return self.held_passed(1);
+            return Flow::Next;
         }
         let pass = |v: u64| compare(func, v & mask, reference & mask);
         let read = move || if wide { unsafe { rd64(a) } } else { (unsafe { rd32(a) }) as u64 };
@@ -2075,87 +2029,27 @@ impl Cp {
                 if let Some(e) = self.exec.as_mut() {
                     e.order_after_open_writes();
                 }
-                return self.held_passed(0);
+                return Flow::Next;
             }
             self.held_stop("label wait (its own value)", at);
             return Flow::Next;
         }
-        let predicted = self.held.as_ref().and_then(|h| h.labels.get(&a).copied());
-        if let Some((v, bytes)) = predicted {
-            let v = if wide { v } else { v & 0xFFFF_FFFF };
-            if bytes == 0 || (wide && bytes < 8) {
-                self.held_stop("label wait (the frame's timestamp)", at);
-                return Flow::Next;
+        if pass(read()) {
+            if let Some(e) = self.exec.as_mut() {
+                e.note_held_reads(&[(a, if wide { 8 } else { 4 })], 3);
             }
-            if pass(v) {
-                return self.held_passed(1);
-            }
-            self.held_stop("label wait (the frame's value)", at);
             return Flow::Next;
         }
-        let t0 = Instant::now();
-        let mut spins = 0u32;
-        let mut writer_state = String::new();
-        loop {
-            if spins == 1 {
-                writer_state = held_writer_state(a);
+        if let Some((seq, by_cpu, _)) = promised(a, wide, func, mask, reference) {
+            if let Some(e) = self.exec.as_mut() {
+                e.depend_on(seq, by_cpu);
             }
-            if pass(read()) {
-                if let Some(e) = self.exec.as_mut() {
-                    e.note_held_reads(&[(a, if wide { 8 } else { 4 })], 3);
-                }
-                if spins > 0 {
-                    self.held_polled(a, reference, t0, true, std::mem::take(&mut writer_state));
-                }
-                return self.held_passed(if spins == 0 { 2 } else { 4 });
-            }
-            if let Some((seq, by_cpu, _)) = promised(a, wide, func, mask, reference) {
-                if let Some(e) = self.exec.as_mut() {
-                    e.depend_on(seq, by_cpu);
-                }
-                if spins > 0 {
-                    self.held_polled(a, reference, t0, true, std::mem::take(&mut writer_state));
-                }
-                return self.held_passed(if spins == 0 { 3 } else { 4 });
-            }
-            if spins == 0 && (self.submitted_at.is_some_and(|since| missed_write(a, wide, func, mask, reference, since)) || counter_passed(a, wide, func, mask, reference)) {
-                return self.held_passed(2);
-            }
-            if !self.held.as_ref().is_some_and(|h| h.poll) {
-                self.held_stop("label wait", at);
-                return Flow::Next;
-            }
-            if super::shutting_down() {
-                return Flow::Stop;
-            }
-            let frames = self.held.as_ref().map_or(0, |h| h.frames);
-            if super::frameahead::frame_finished(frames) || t0.elapsed() > Duration::from_millis(100) {
-                self.held_polled(a, reference, t0, false, std::mem::take(&mut writer_state));
-                self.held_stop("label wait", at);
-                return Flow::Next;
-            }
-            spins += 1;
-            if spins < 64 {
-                std::hint::spin_loop();
-            } else {
-                crate::thread::short_sleep(Duration::from_micros(50));
-            }
+            return Flow::Next;
         }
-    }
-
-    /// A held wait on label `a` (for `reference`) polled since `t0`
-    /// (statistics: `frameahead::note_poll`).
-    fn held_polled(&self, a: u64, reference: u64, t0: Instant, passed: bool, writer_state: String) {
-        let writer = last_write(a).map(|w| w.0).unwrap_or_else(|| "cpu".into());
-        let commands = self.held.as_ref().map_or(0, |h| h.commands);
-        super::frameahead::note_poll(a, reference, writer, t0.elapsed(), passed, commands, writer_state);
-    }
-
-    /// A held wait passed (`HeldCp::waits` kind).
-    fn held_passed(&mut self, kind: usize) -> Flow {
-        if let Some(h) = self.held.as_mut() {
-            h.waits[kind] += 1;
+        if self.submitted_at.is_some_and(|since| missed_write(a, wide, func, mask, reference, since)) || counter_passed(a, wide, func, mask, reference) {
+            return Flow::Next;
         }
+        self.held_stop("label wait", at);
         Flow::Next
     }
 
@@ -2243,9 +2137,6 @@ impl Cp {
                     v.push(now.wrapping_sub(last).min(u32::MAX as u64) as u32);
                     last = now;
                 }
-            }
-            if command && self.ahead.is_empty() && super::ahead::enabled_for(self.compute) {
-                self.scan_ahead(&f, next, to);
             }
             cur = next;
         }
@@ -2531,7 +2422,7 @@ impl Cp {
     fn par_plan(&mut self, f: &Fetched, from: u64, end: u64) {
         // (Profile: `tune cp_classes`, `PLAN_PHASES`.)
         let mut lap = PlanLaps(super::tune::cp_classes().then(Instant::now));
-        let k = if self.compute { (super::tune::par_compute() as usize).min(8) } else { super::par::workers() };
+        let k = if self.compute { compute_workers() } else { super::par::workers() };
         // The run's commands, its end and the indirect arguments read in it.
         let mut ends: Vec<u64> = Vec::new();
         let mut args: Vec<(u64, u64)> = Vec::new();
@@ -2541,7 +2432,7 @@ impl Cp {
         let mut sync = false;
         // Whether the chunks' indirect dispatches read their arguments on
         // the GPU (`Exec::dispatch_gpu_indirect`; compute queues' runs,
-        // `tune par_compute`; captures and interpreter checks read them
+        // `compute_workers`; captures and interpreter checks read them
         // here).
         let gpu_dispatch_args = self.compute && super::tune::gpu_indirect() && !super::capture::capturing() && !super::verify::enabled() && !(super::exec::enabled() && super::emucheck::wanted(self));
         // The run's signature: its packet headers (opcode and size), the
@@ -2586,7 +2477,7 @@ impl Cp {
                     // Dispatch arguments the chunks let the GPU read
                     // (`Exec::dispatch_gpu_indirect`) need no wait here
                     // (one per run start cost queue 0x50's runs a GPU round
-                    // trip of ~2.5 ms, twice per flip with `par_compute`).
+                    // trip of ~2.5 ms, twice per flip with parallel runs).
                     op::DISPATCH_INDIRECT if gpu_dispatch_args => {}
                     op::DISPATCH_INDIRECT => args.push((if n >= 3 { addr64(p(0), p(1)) } else { disp_base + p(0) as u64 }, 12)),
                     _ => {}
@@ -2712,12 +2603,11 @@ impl Cp {
         let w = super::par::main_weight();
         let main_n = ((n as f64 * w / (w + m as f64)).round() as usize).clamp(chunk_min, n - m * chunk_min);
         let per = (n - main_n) / m;
-        // At equal recording cost when the run was measured before (`tune
-        // par_cost`), else at equal command counts.
-        let timed = super::tune::par_cost();
-        let sig = if timed { (sig ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1 } else { 0 };
+        // At equal recording cost when the run was measured before, else at
+        // equal command counts.
+        let sig = (sig ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         let frame = super::FRAMES.load(Ordering::Relaxed);
-        let costed = if timed {
+        let costed = {
             if self.run_costs.len() > 512 && (self.run_costs_pruned != frame || !super::tune::plan_fast()) {
                 self.run_costs_pruned = frame;
                 self.run_costs.retain(|_, r| r.seen + 120 >= frame);
@@ -2729,8 +2619,6 @@ impl Cp {
             } else {
                 None
             }
-        } else {
-            None
         };
         if costed.is_some() {
             PAR_COSTED.fetch_add(1, Ordering::Relaxed);
@@ -2862,7 +2750,7 @@ impl Cp {
         let queue = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
         let submitted = Arc::new(std::sync::atomic::AtomicBool::new(!submit_after));
         let mut run = super::par::Run::new(queue, Arc::new(main_writes), submitted.clone());
-        run.timed = timed;
+        run.timed = true;
         // (Its workers check as of this command processor's view now.)
         run.fe2_view = self.fe2_view.as_ref().map_or(super::fe2::NO_VIEW, |c| c.load(Ordering::Acquire));
         let run = Arc::new(run);
@@ -2954,13 +2842,13 @@ impl Cp {
         }
     }
 
-    /// Whether a wait on `a` that does not pass at once is gone past (`tune
-    /// past_waits`): the graphics command processor at command-buffer depth
-    /// 1 with nothing held, the label last written by a compute queue.
+    /// Whether a wait on `a` that does not pass at once is gone past: the
+    /// graphics command processor at command-buffer depth 1 with nothing
+    /// held, the label last written by queue 0x50 (since 2026-10-27; any
+    /// compute queue's, or none, were the switch `past_waits` removed on
+    /// 2026-11-01).
     fn past_wait_ok(&self, a: u64) -> bool {
-        let mode = super::tune::past_waits();
-        mode != 0
-            && self.main_gfx
+        self.main_gfx
             && !self.settling
             && self.held.is_none()
             && self.past.is_none()
@@ -2969,11 +2857,11 @@ impl Cp {
             && self.depth == 1
             && self.exec.is_some()
             && !super::capture::capturing()
-            && last_write(a).is_some_and(|(q, _, _)| if mode == 1 { q == "gpu-acb0x50" } else { q.starts_with("gpu-acb") })
+            && last_write(a).is_some_and(|(q, _, _)| q == "gpu-acb0x50")
             && past_backoff_pass(a)
     }
 
-    /// Goes past a label wait (`tune past_waits`): this command processor's
+    /// Goes past a label wait (`past_wait_ok`): this command processor's
     /// work so far to the GPU, its state noted, then on from the packet after
     /// the wait with its executor held (`Exec::past_begin`) until the label
     /// is promised or a stop (`past_wait_settle`).
@@ -2996,7 +2884,7 @@ impl Cp {
             began: Instant::now(),
             ticks: 0,
         }));
-        self.held = Some(Box::new(super::frameahead::HeldCp { frames: u64::MAX, labels: HashMap::new(), stop: None, commands: 0, waits: [0; 5], poll: false }));
+        self.held = Some(Box::new(HeldCp { stop: None, commands: 0 }));
         super::exec::journal_begin();
         if let Some(e) = self.exec.as_mut() {
             e.past_begin_growing();
@@ -3187,7 +3075,7 @@ impl Cp {
         self.set_chunk_state(&end_state);
         let across = self.depth == 1;
         self.past = Some(Box::new(Past { pr, end_state, end_unknown, across, stack: self.ctx_stack.clone(), markers: self.markers.clone(), pred: self.pred.clone(), fence_pending: self.fence_pending, began: Instant::now() }));
-        self.held = Some(Box::new(super::frameahead::HeldCp { frames: u64::MAX, labels: HashMap::new(), stop: None, commands: 0, waits: [0; 5], poll: false }));
+        self.held = Some(Box::new(HeldCp { stop: None, commands: 0 }));
         if let Some(e) = self.exec.as_mut() {
             e.past_begin();
         }
@@ -3447,17 +3335,8 @@ impl Cp {
         let f = Fetched { base, words: Vec::new(), live: false };
         let (cmds, why, ns) = self.scan_commands(&f, from, end, true);
         super::compile::note_scan_end(why, cmds.len());
-        let mut slots: Vec<Arc<super::ahead::Slot>> = Vec::new();
-        let mut draws = Vec::new();
-        for c in cmds {
-            let [a, b] = c.stages;
-            match (c.gfx, a) {
-                (Some(g), Some(vs)) => draws.push((vs, b, *g)),
-                (None, Some(s)) => slots.push(s),
-                _ => {}
-            }
-        }
-        super::compile::submit(slots, draws, ns);
+        let slots: Vec<Arc<super::ahead::Slot>> = cmds.into_iter().filter_map(|c| c.stages[0].clone()).collect();
+        super::compile::submit(slots, ns);
     }
 
     /// Direct dispatches of program `addr` of 1 to `small` workgroups right
@@ -3562,7 +3441,7 @@ impl Cp {
         const WAIT_SCAN_MAX: usize = 1024;
         let t0 = Instant::now();
         // Runs this command processor would split among parallel workers.
-        let par_min = if !whole && f.words.is_empty() && !super::capture::capturing() && (if self.compute { super::tune::par_compute() > 0 } else { super::par::workers() > 0 }) {
+        let par_min = if !whole && f.words.is_empty() && !super::capture::capturing() && (if self.compute { compute_workers() > 0 } else { super::par::workers() > 0 }) {
             (if self.compute { super::tune::par_min_compute() as usize } else { super::par::min_run() }).max(super::par::floor())
         } else {
             usize::MAX
@@ -3575,10 +3454,6 @@ impl Cp {
         ctx.extend_from_slice(&self.regs.ctx);
         let mut draw_base = self.draw_indirect_base;
         let mut cmds: Vec<AheadCmd> = Vec::new();
-        // Draws' baked pipeline state for compiles ahead (`whole` scans), and
-        // VGT_PRIMITIVE_TYPE as the scanned writes leave it.
-        let gfx_state = whole && super::compile::gfx_at_first_uses();
-        let mut prim = self.reg(Space::Uc, 0x242);
         // The synchronization-free run being scanned: its first command's
         // index and its commands.
         let (mut run_first, mut run_len) = (0usize, 0usize);
@@ -3637,7 +3512,6 @@ impl Cp {
                 }
             };
             let mut command: Option<[Option<super::shaders::StageRegs>; 2]> = None;
-            let mut gfx: Option<Box<super::exec::GfxRegs>> = None;
             let mut wave64 = true;
             let mut sync = false;
             match opcode {
@@ -3652,261 +3526,6 @@ impl Cp {
                 // GPU-side synchronization, CP writes and label waits:
                 // passed (they end synchronization-free runs).
                 op::EVENT_WRITE | op::ACQUIRE_MEM | op::RELEASE_MEM | op::WRITE_DATA | op::WAIT_REG_MEM | op::WAIT_REG_MEM64 => sync = true,
-                op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX => {
-                    let first = p(0) & 0xFFFF;
-                    if first <= 0x242 && 0x242 < first + (n - 1) as u32 {
-                        prim = p(1 + (0x242 - first) as u64);
-                    }
-                }
-                op::LOAD_UCONFIG_REG | op::INDEX_TYPE | op::INDEX_BASE | op::INDEX_BUFFER_SIZE | op::NUM_INSTANCES | op::CONTEXT_CONTROL => {}
-                op::SET_CONTEXT_REG | op::SET_CONTEXT_REG_INDEX => set(&mut ctx, p(0) & 0xFFFF),
-                op::SET_SH_REG | op::SET_SH_REG_INDEX => set(&mut sh, p(0) & 0xFFFF),
-                op::LOAD_CONTEXT_REG_INDEX | op::LOAD_SH_REG_INDEX => {
-                    // As `load_pairs`: memory holds {offset, value} pairs.
-                    let (a, count) = (addr64(p(0), p(1)), p(2) as u64);
-                    if count > 0 && !valid(a, 8 * count) {
-                        why = END_ARGS;
-                        break;
-                    }
-                    let v = if opcode == op::LOAD_CONTEXT_REG_INDEX { &mut ctx } else { &mut sh };
-                    for i in 0..count {
-                        let (o, val) = unsafe { (rd32(a + 8 * i), rd32(a + 8 * i + 4)) };
-                        if let Some(r) = v.get_mut((o & 0xFFFF) as usize) {
-                            *r = val;
-                        }
-                    }
-                }
-                op::SET_BASE => {
-                    if p(0) != 2 {
-                        draw_base = addr64(p(1), p(2));
-                    }
-                }
-                op::DRAW_INDEX_2 | op::DRAW_INDEX_AUTO | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT => {
-                    if matches!(opcode, op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT) {
-                        // As `packet` does: the base vertex and start instance
-                        // go to the user SGPRs the packet names.
-                        let a = draw_base + p(0) as u64;
-                        let (bytes, k) = if opcode == op::DRAW_INDEX_INDIRECT { (20, 3) } else { (16, 2) };
-                        if !valid(a, bytes) {
-                            why = END_ARGS;
-                            break;
-                        }
-                        let (bv, si) = unsafe { (rd32(a + 4 * k), rd32(a + 4 * (k + 1))) };
-                        let (vtx_loc, inst_loc) = (p(1) & 0xFFFF, p(1) >> 16);
-                        let inst_loc = if inst_loc != 0 {
-                            inst_loc
-                        } else {
-                            let ngg = super::shaders::ngg_addr_of(&ScanRegs { sh: &sh, ctx: &ctx });
-                            crate::hle::libs::agc::instance_offset_slot(ngg).map_or(0, |s| 0x8C + s)
-                        };
-                        if vtx_loc != 0 {
-                            if let Some(r) = sh.get_mut(vtx_loc as usize) {
-                                *r = bv;
-                            }
-                        }
-                        if inst_loc != 0 {
-                            if let Some(r) = sh.get_mut(inst_loc as usize) {
-                                *r = si;
-                            }
-                        }
-                    }
-                    let view = ScanRegs { sh: &sh, ctx: &ctx };
-                    let ps = super::shaders::ps_addr_of(&view);
-                    if gfx_state {
-                        let c = &ctx;
-                        gfx = Some(Box::new(super::exec::GfxRegs::capture(&|r: u32| c.get(((r - 0x28000) / 4) as usize).copied().unwrap_or(0), prim)));
-                    }
-                    command = Some([
-                        Some(super::shaders::StageRegs::capture(super::shaders::StageKind::Vertex, &view)),
-                        (ps != 0).then(|| super::shaders::StageRegs::capture(super::shaders::StageKind::Pixel, &view)),
-                    ]);
-                }
-                op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT => {
-                    let initiator = if opcode == op::DISPATCH_DIRECT { p(3) } else if n >= 3 { p(2) } else { p(1) };
-                    wave64 = initiator & (1 << 15) == 0;
-                    let groups = if opcode == op::DISPATCH_DIRECT { p(0) as u64 * p(1) as u64 * p(2) as u64 } else { 0 };
-                    if super::tune::batch_cs() && groups > 0 && groups <= super::exec::BATCH_SMALL {
-                        let a = ((sh.get(0x20C).copied().unwrap_or(0) as u64) | ((sh.get(0x20D).copied().unwrap_or(0) as u64 & 0xFF) << 32)) << 8;
-                        streak = if streak.0 == a { (a, streak.1 + 1) } else { (a, 1) };
-                        if streak.1 == super::exec::BATCH_STREAK && !super::shaders::batchable(a) {
-                            super::shaders::mark_batchable(a);
-                            super::exec::BATCHABLE_AHEAD.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    let view = ScanRegs { sh: &sh, ctx: &ctx };
-                    command = Some([Some(super::shaders::StageRegs::capture(super::shaders::StageKind::Compute, &view)), None]);
-                }
-                _ => {
-                    why = opcode as usize;
-                    break;
-                }
-            }
-            if sync {
-                if run_len >= par_min {
-                    break;
-                }
-                run_len = 0;
-            }
-            if let Some(stages) = command {
-                if run_len == 0 {
-                    run_first = cmds.len();
-                }
-                run_len += 1;
-                let checked = self.fe2_prechecks();
-                let stages = stages.map(|r| r.map(|r| super::ahead::Slot::new_checked(r, wave64, checked)));
-                cmds.push(AheadCmd { at, stages, gfx });
-            }
-            cur = next;
-        }
-        // A run the workers will record: its commands are theirs.
-        if run_len >= par_min {
-            cmds.truncate(run_first);
-        }
-        *self.scan_regs.borrow_mut() = (sh, ctx);
-        (cmds, why, t0.elapsed().as_nanos() as u64)
-    }
-
-    /// Scans the packets from `from` to the end of the synchronization-free
-    /// run (register writes, draws and dispatches only; any other packet
-    /// ends it) and hands the stages of its draws and dispatches to the
-    /// preparation workers with the registers they will read. Registers
-    /// are taken from a copy of this command processor's files with the
-    /// scanned writes applied, indirect draw arguments as memory holds them
-    /// now: whatever differs at execution is caught there (`ahead::take`).
-    fn scan_ahead(&mut self, f: &Fetched, from: u64, end: u64) {
-        use super::ahead::{END_ARGS, END_BUFFER, END_HEADER, END_INVALID, END_MAX, END_PREDICATED};
-        let t0 = Instant::now();
-        // Most scans find a synchronization packet before any command: a
-        // look at the packet headers first spares them the copies of the
-        // register files below (~3 us each).
-        {
-            let mut c = from;
-            let found = loop {
-                if c >= end || !valid(c, 4) {
-                    break false;
-                }
-                let h = f.rd(c);
-                match h >> 30 {
-                    3 => {}
-                    2 => {
-                        c += 4;
-                        continue;
-                    }
-                    _ => break false,
-                }
-                let count = (h >> 16) & 0x3FFF;
-                if count == 0x3FFF {
-                    c += 4;
-                    continue;
-                }
-                let op = (h >> 8) & 0xFF;
-                if h & 1 != 0 {
-                    break false;
-                }
-                match op {
-                    op::DRAW_INDEX_2 | op::DRAW_INDEX_AUTO | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT | op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT => break true,
-                    op::NOP => {
-                        if count >= 1 && valid(c + 4, 8) && f.rd(c + 4) == DS_MAGIC && !matches!(f.rd(c + 8), pop::PUSH_MARKER | pop::SET_MARKER | pop::POP_MARKER) {
-                            super::ahead::note_scan(0x100 + (f.rd(c + 8) as usize).min(0x2F), t0.elapsed().as_nanos() as u64);
-                            return;
-                        }
-                    }
-                    op::SET_CONTEXT_REG
-                    | op::SET_CONTEXT_REG_INDEX
-                    | op::SET_SH_REG
-                    | op::SET_SH_REG_INDEX
-                    | op::SET_UCONFIG_REG
-                    | op::SET_UCONFIG_REG_INDEX
-                    | op::LOAD_CONTEXT_REG_INDEX
-                    | op::LOAD_SH_REG_INDEX
-                    | op::LOAD_UCONFIG_REG
-                    | op::INDEX_TYPE
-                    | op::INDEX_BASE
-                    | op::INDEX_BUFFER_SIZE
-                    | op::NUM_INSTANCES
-                    | op::CONTEXT_CONTROL
-                    | op::SET_BASE => {}
-                    _ => {
-                        super::ahead::note_scan(op as usize, t0.elapsed().as_nanos() as u64);
-                        return;
-                    }
-                }
-                c += 4 * (count as u64 + 2);
-            };
-            if !found {
-                super::ahead::note_scan(END_BUFFER, t0.elapsed().as_nanos() as u64);
-                return;
-            }
-        }
-        let mut why = END_BUFFER;
-        let (mut sh, mut ctx) = std::mem::take(&mut *self.scan_regs.borrow_mut());
-        sh.clear();
-        sh.extend_from_slice(&self.regs.sh);
-        ctx.clear();
-        ctx.extend_from_slice(&self.regs.ctx);
-        let mut draw_base = self.draw_indirect_base;
-        let mut cur = from;
-        let mut slots: Vec<Arc<super::ahead::Slot>> = Vec::new();
-        while cur < end {
-            if self.ahead.len() >= AHEAD_MAX {
-                why = END_MAX;
-                break;
-            }
-            if !valid(cur, 4) {
-                why = END_INVALID;
-                break;
-            }
-            let h = f.rd(cur);
-            match h >> 30 {
-                3 => {}
-                2 => {
-                    cur += 4;
-                    continue;
-                }
-                _ => {
-                    why = END_HEADER;
-                    break;
-                }
-            }
-            let count = (h >> 16) & 0x3FFF;
-            if count == 0x3FFF {
-                cur += 4;
-                continue;
-            }
-            // Predicated packets may be skipped at execution.
-            if h & 1 != 0 {
-                why = END_PREDICATED;
-                break;
-            }
-            let opcode = (h >> 8) & 0xFF;
-            let n = count as u64 + 1;
-            let next = cur + 4 * (n + 1);
-            if next > end || !valid(cur, 4 * (n + 1)) {
-                why = END_BUFFER;
-                break;
-            }
-            let at = cur;
-            let p = |i: u64| f.rd(at + 4 * (1 + i));
-            let set = |v: &mut Vec<u32>, first: u32| {
-                for i in 1..n {
-                    if let Some(r) = v.get_mut((first + (i - 1) as u32) as usize) {
-                        *r = p(i);
-                    }
-                }
-            };
-            let mut command: Option<[Option<super::shaders::StageRegs>; 2]> = None;
-            let mut wave64 = true;
-            match opcode {
-                op::NOP => {
-                    // Private packets (flips, branches, draws, state) end
-                    // the run; debug markers do not.
-                    if n >= 2 && p(0) == DS_MAGIC && !matches!(p(1), pop::PUSH_MARKER | pop::SET_MARKER | pop::POP_MARKER) {
-                        why = 0x100 + (p(1) as usize).min(0x2F);
-                        break;
-                    }
-                }
-                // Uconfig registers (primitive and index type, ...) are not
-                // read by stage preparations.
                 op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX | op::LOAD_UCONFIG_REG | op::INDEX_TYPE | op::INDEX_BASE | op::INDEX_BUFFER_SIZE | op::NUM_INSTANCES | op::CONTEXT_CONTROL => {}
                 op::SET_CONTEXT_REG | op::SET_CONTEXT_REG_INDEX => set(&mut ctx, p(0) & 0xFFFF),
                 op::SET_SH_REG | op::SET_SH_REG_INDEX => set(&mut sh, p(0) & 0xFFFF),
@@ -3969,6 +3588,15 @@ impl Cp {
                 op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT => {
                     let initiator = if opcode == op::DISPATCH_DIRECT { p(3) } else if n >= 3 { p(2) } else { p(1) };
                     wave64 = initiator & (1 << 15) == 0;
+                    let groups = if opcode == op::DISPATCH_DIRECT { p(0) as u64 * p(1) as u64 * p(2) as u64 } else { 0 };
+                    if super::tune::batch_cs() && groups > 0 && groups <= super::exec::BATCH_SMALL {
+                        let a = ((sh.get(0x20C).copied().unwrap_or(0) as u64) | ((sh.get(0x20D).copied().unwrap_or(0) as u64 & 0xFF) << 32)) << 8;
+                        streak = if streak.0 == a { (a, streak.1 + 1) } else { (a, 1) };
+                        if streak.1 == super::exec::BATCH_STREAK && !super::shaders::batchable(a) {
+                            super::shaders::mark_batchable(a);
+                            super::exec::BATCHABLE_AHEAD.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     let view = ScanRegs { sh: &sh, ctx: &ctx };
                     command = Some([Some(super::shaders::StageRegs::capture(super::shaders::StageKind::Compute, &view)), None]);
                 }
@@ -3977,17 +3605,28 @@ impl Cp {
                     break;
                 }
             }
+            if sync {
+                if run_len >= par_min {
+                    break;
+                }
+                run_len = 0;
+            }
             if let Some(stages) = command {
-                let checked = self.fe2_prechecks();
-                let stages = stages.map(|r| r.map(|r| super::ahead::Slot::new_checked(r, wave64, checked)));
-                slots.extend(stages.iter().flatten().cloned());
-                self.ahead.push_back(AheadCmd { at, stages, gfx: None });
+                if run_len == 0 {
+                    run_first = cmds.len();
+                }
+                run_len += 1;
+                let stages = stages.map(|r| r.map(|r| super::ahead::Slot::new(r, wave64)));
+                cmds.push(AheadCmd { at, stages });
             }
             cur = next;
         }
+        // A run the workers will record: its commands are theirs.
+        if run_len >= par_min {
+            cmds.truncate(run_first);
+        }
         *self.scan_regs.borrow_mut() = (sh, ctx);
-        super::ahead::submit(&slots);
-        super::ahead::note_scan(why, t0.elapsed().as_nanos() as u64);
+        (cmds, why, t0.elapsed().as_nanos() as u64)
     }
 
     /// A command buffer of `size` dwords at `addr` this command processor
@@ -4028,13 +3667,6 @@ impl Cp {
         }
     }
 
-    /// Whether this command processor's stages prepared ahead get their
-    /// placement checks where they are prepared (`tune fe2_precheck`: the
-    /// graphics CP under front end 2, whose view is the epoch now).
-    fn fe2_prechecks(&self) -> bool {
-        self.main_gfx && !self.compute && super::fe2::on() && super::tune::fe2_precheck()
-    }
-
     /// Completes recorded GPU work (at synchronization points: the CP waits
     /// for shader work only where the packet stream asks it to).
     fn sync(&mut self) {
@@ -4059,11 +3691,8 @@ impl Cp {
     /// path (switch off, nothing outstanding, or earlier CPU-side effects
     /// still pending, which it must not overtake).
     fn gpu_cp_write(&mut self, a: u64, data: &[u32], label: Option<(u64, u8)>, end_of_pipe: bool) -> bool {
-        if !super::tune::gpu_cp_writes() {
-            return false;
-        }
-        // The frame-ahead recorder's writes follow the current frame's work
-        // (its batches are held): always recorded into its batch.
+        // Writes recorded into held batches follow the work before them:
+        // always recorded into its batch.
         let held = self.held.is_some();
         if !held {
             super::replay::note_cp_write(a, 4 * data.len() as u64);
@@ -4100,8 +3729,8 @@ impl Cp {
 
     fn effect(&mut self, end_of_pipe: bool, write: Option<(u64, u64)>, f: Box<dyn FnOnce() + Send>) -> Option<u64> {
         if self.held.is_some() {
-            // Frame-ahead recording: nothing it does may happen before the
-            // current frame's work (CPU-side effects are not held).
+            // Held batches: nothing they do may happen before the work they
+            // follow (CPU-side effects are not held).
             drop(f);
             self.held_stop("CP effect", self.cur_packet);
             return None;
@@ -4153,9 +3782,6 @@ impl Cp {
                 f();
                 if let Some((a, n)) = write {
                     cpw_note(&self.name, a, n, self.cur_packet, self.cur_opcode);
-                    if self.name == "gpu-gfx" {
-                        super::frameahead::a_wrote(&[(a, n)]);
-                    }
                 }
                 None
             }
@@ -4252,8 +3878,7 @@ impl Cp {
         }
     }
 
-    /// The whole state now, as `walk_state` follows it (frame-ahead
-    /// recording's start-state prediction).
+    /// The whole state now, as `walk_state` follows it (`gpu::frameprobe`).
     pub fn walk_start(&self) -> WalkState {
         WalkState { st: self.chunk_state(), stack: self.ctx_stack.clone(), unknown: Vec::new(), labels: Vec::new(), flip: None }
     }
@@ -4815,9 +4440,7 @@ impl Cp {
         if bytes == 0 {
             return;
         }
-        if super::tune::home_reads() {
-            super::homes::note_cp_code(a, bytes);
-        }
+        super::homes::note_cp_code(a, bytes);
         if super::homes::any_stale(&[(a, bytes)]) {
             if let Some(e) = self.exec.as_mut() {
                 e.flush_if_writes(&[(a, bytes)]);
@@ -4886,7 +4509,7 @@ impl Cp {
                 // them would run without its inputs. Nothing more runs.
                 break;
             }
-            if self.held.is_some() && self.held_halted(cur, cur) {
+            if self.held.is_some() && self.held_halted(cur) {
                 if self.past.is_some() || self.past_wait.is_some() {
                     match self.settle_held() {
                         Some(c) => {
@@ -4910,9 +4533,6 @@ impl Cp {
                         None => break,
                     }
                 }
-            }
-            if self.main_gfx && cur == super::frameahead::TARGET.load(Ordering::Relaxed) {
-                super::frameahead::a_reached();
             }
             if !valid(cur, 4) {
                 crate::error!("gpu[{}]: command pointer {cur:#x} outside guest memory", self.name);
@@ -4961,7 +4581,7 @@ impl Cp {
                     None => break,
                 }
             }
-            if self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && self.exec.is_some() && self.held.is_none() && (if self.compute { super::tune::par_compute() > 0 } else { super::par::workers() > 0 }) && !super::capture::capturing() {
+            if self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && self.exec.is_some() && self.held.is_none() && (if self.compute { compute_workers() > 0 } else { super::par::workers() > 0 }) && !super::capture::capturing() {
                 let t = class_start(classes);
                 self.par_plan(&f, cur, end);
                 class_end(7, t);
@@ -5091,10 +4711,9 @@ impl Cp {
             if matches!(opcode, op::WAIT_REG_MEM | op::WAIT_REG_MEM64) && !f.live && self.exec.is_some() && self.held.is_none() && super::tune::wait_ahead_for(self.compute) {
                 self.wait_ctx = Some((f.clone(), next, end));
             }
-            // A dispatch or draw whose pipeline turns out missing scans the
-            // commands after it for more first uses (`tune compile_ahead`,
-            // `compile_gfx`).
-            if command && !f.live && (if dispatch { super::compile::at_first_uses() } else { super::compile::gfx_at_first_uses() }) {
+            // A dispatch whose pipeline turns out missing scans the commands
+            // after it for more first uses (`tune compile_ahead`).
+            if command && !f.live && dispatch && super::compile::at_first_uses() {
                 self.compile_ctx.set(Some((f.base, next, end)));
             }
             if self.held.is_some() {
@@ -5128,7 +4747,7 @@ impl Cp {
                         h.commands += 1;
                     }
                 }
-                if self.held_halted(cur, next) {
+                if self.held_halted(cur) {
                     if self.past.is_some() || self.past_wait.is_some() {
                         match self.settle_held() {
                             Some(c) => {
@@ -5145,14 +4764,6 @@ impl Cp {
                 // Preparations of this command that it did not take.
                 for s in self.take_ahead().iter().flatten() {
                     s.cancel();
-                }
-                if self.ahead.is_empty() && matches!(flow, Flow::Next) && !f.live && self.exec.is_some() && self.held.is_none() && super::ahead::enabled_for(self.compute) {
-                    // Within a parallel run's first chunk, only to its end.
-                    let until = self.par.as_ref().map_or(end, |p| p.starts[p.next].min(end));
-                    // (Scans through synchronization, `tune ahead_far`, raised
-                    // the workers' share 32 -> 36% and slowed the graphics CP:
-                    // removed, FINDINGS-ARCHIVE.md 2026-10-29 night.)
-                    self.scan_ahead(&f, next, until);
                 }
             }
             // (Past a label wait, the queue asking waits for what follows the
@@ -5890,7 +5501,7 @@ impl Cp {
         if !write && (int_sel == 0 || int_sel == 3) {
             return;
         }
-        if matches!(data_sel, 3 | 4) && (int_sel == 0 || int_sel == 3) && super::tune::gpu_cp_writes() {
+        if matches!(data_sel, 3 | 4) && (int_sel == 0 || int_sel == 3) {
             let held = self.held.is_some();
             if let Some(e) = self.exec.as_mut() {
                 if (e.busy() || held) && e.gpu_timestamp(a) {
@@ -5990,7 +5601,7 @@ impl Cp {
             if !(wide && bytes < 8) && compare(func, v & mask, reference & mask) {
                 OPEN_PROMISED.fetch_add(1, Ordering::Relaxed);
                 // Later work follows that write (end-of-pipe writes do not
-                // order it by themselves: `tune eop_light`).
+                // order it by themselves: light end-of-pipe writes, `Exec::gpu_cp_write`).
                 if let Some(e) = self.exec.as_mut() {
                     e.order_after_open_writes();
                 }
@@ -6036,7 +5647,7 @@ impl Cp {
             self.note("`tune xwait_skip 2`: gpu-acb0x50's waits for other queues' labels skipped (measurement; pictures may be wrong)");
             return Flow::Next;
         }
-        // Recording goes on past it, held (`tune past_waits`).
+        // Recording goes on past it, held (`Cp::past_wait_ok`).
         if self.past_wait_ok(a) {
             self.last_wait_kind = b'G';
             return self.past_wait_start(control, a, wide, reference, mask, at);
@@ -6112,7 +5723,7 @@ impl Cp {
             &what,
             || hit.load(Ordering::SeqCst) || compare(func, read() & mask, reference & mask) || (use_promise && promises_moved() && promised(a, wide, func, mask, reference).is_some()),
             &mut work,
-            (gpu_label && super::tune::label_wake() && a % if wide { 8 } else { 4 } == 0).then_some((a, wide)),
+            (gpu_label && a % if wide { 8 } else { 4 } == 0).then_some((a, wide)),
         );
         if probe {
             super::xwait::wait_end();
@@ -6262,11 +5873,8 @@ impl Cp {
                         super::frameprobe::flip([&self.regs.ctx, &self.regs.sh, &self.regs.uc]);
                         super::frameprobe::flip_walk(self.walk_start(), at, len);
                     }
-                    if self.name == "gpu-gfx" {
-                        super::frameahead::flipped(self);
-                        if super::runprobe::on() {
-                            super::runprobe::flip();
-                        }
+                    if self.name == "gpu-gfx" && super::runprobe::on() {
+                        super::runprobe::flip();
                     }
                 }
             }
@@ -6295,9 +5903,6 @@ impl Cp {
                 }
                 let n = crate::gpu::FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
                 super::capture::on_flip(n);
-                if self.name == "gpu-gfx" {
-                    super::frameahead::flipped(self);
-                }
             }
             pop::WAIT_SAFE_FOR_RENDERING => {
                 let (handle, index) = (a(0) as i32, a(1) as i32);
