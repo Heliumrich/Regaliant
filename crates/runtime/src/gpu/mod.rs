@@ -261,6 +261,15 @@ pub mod tune {
         first_get(i)
     }
 
+    /// One step of a countdown switch (`tune trace_waits <n>` and the
+    /// like): true while it was above 0. Found by name: removing a switch
+    /// renumbers the positions `get` reads (a literal position here once
+    /// counted down `shadow_pre` instead of `trace_waits`).
+    #[cold]
+    fn count_down(name: &str) -> bool {
+        ALL.iter().find(|t| t.name == name).is_some_and(|t| t.value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| if v != UNSET && v > 0 { Some(v - 1) } else { None }).is_ok())
+    }
+
     /// The first read of a switch: its environment variable or default.
     #[cold]
     #[inline(never)]
@@ -659,7 +668,7 @@ pub mod tune {
     /// Takes one of the waits still to be traced.
     #[inline]
     pub fn take_trace_sync() -> bool {
-        get(21) > 0 && ALL[21].value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| if v != UNSET && v > 0 { Some(v - 1) } else { None }).is_ok()
+        get(21) > 0 && count_down("trace_sync")
     }
 
     /// Register-state snapshots of parallel chunks (and replays) hold only
@@ -1829,7 +1838,7 @@ pub mod tune {
     /// detail (`tune trace_waits <n>`: the next n, wherever they happen;
     /// `DS_TRACE_WAITS=<queue>` logs a queue's first 200 from the start).
     pub fn take_trace_waits() -> bool {
-        get(162) > 0 && ALL[165].value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| if v != UNSET && v > 0 { Some(v - 1) } else { None }).is_ok()
+        get(162) > 0 && count_down("trace_waits")
     }
 
     /// The graphics CP's planning of parallel runs without its costliest
