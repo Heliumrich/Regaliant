@@ -14366,16 +14366,6 @@ impl Exec {
         bound.images.clear();
         bound.stored.clear();
         bound.stencil_views.clear();
-        // (`tune upload_predetile`: the textures this binding would upload
-        // first, detiled before the cache's lock.)
-        let predetiled = super::tune::upload_predetile();
-        if predetiled {
-            for b in &found.tr.out.bindings {
-                if let (BindingKind::Image(_), Some(Resolved::Image(t))) = (b.kind, b.kind_resource().and_then(|i| found.resources.get(i))) {
-                    super::images::predetile_for(t);
-                }
-            }
-        }
         // One image-cache lock for all the stage's images and samplers.
         let mut failed: Vec<String> = Vec::new();
         let r: Result<(), String> = super::images::with(|im| {
@@ -14458,9 +14448,6 @@ impl Exec {
             }
             Ok(())
         });
-        if predetiled {
-            super::images::discard_prepared();
-        }
         for f in failed {
             self.report(f);
         }

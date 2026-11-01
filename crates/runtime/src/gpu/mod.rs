@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 230] = [
+    static ALL: [Tunable; 228] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -244,7 +244,6 @@ pub mod tune {
         Tunable { name: "fe2_precheck", env: "DS_FE2_PRECHECK", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_taken_upload", env: "DS_FE2_TAKEN_UPLOAD", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ahead_far", env: "DS_AHEAD_FAR", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "span_runs", env: "DS_SPAN_RUNS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "log_big", env: "DS_LOG_BIG", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_mine_fast", env: "DS_FE2_MINE_FAST", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "vma_cache", env: "DS_VMA_CACHE", default: 1, value: AtomicU64::new(UNSET) },
@@ -259,7 +258,6 @@ pub mod tune {
         Tunable { name: "mark_touch", env: "DS_MARK_TOUCH", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "touch_bits", env: "DS_TOUCH_BITS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "upload_batch", env: "DS_UPLOAD_BATCH", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "upload_predetile", env: "DS_UPLOAD_PREDETILE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "record_defer", env: "DS_RECORD_DEFER", default: 5, value: AtomicU64::new(UNSET) },
         Tunable { name: "fill_partial", env: "DS_FILL_PARTIAL", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe2_back_granule", env: "DS_FE2_BACK_GRANULE", default: 0, value: AtomicU64::new(UNSET) },
@@ -2311,14 +2309,6 @@ pub mod tune {
         get(210) != 0
     }
 
-    /// `mem::readable_span`'s per-thread cache: up to 512 runs, one evicted
-    /// when full, behind a last-hit check (0: 64 runs, all cleared when
-    /// full). Level in replay A/Bs (2026-10-29 night): off.
-    #[inline]
-    pub fn span_runs() -> bool {
-        get(211) != 0
-    }
-
     /// The write logs (`exec::RangeLog`) answer a small read from their
     /// page buckets and the 4 MiB buckets of large writes alone (0: from the
     /// 4 MiB buckets every write marks too, so a small read beside a small
@@ -2326,7 +2316,7 @@ pub mod tune {
     /// (replay A/Bs: CPU per command 0.996-0.998).
     #[inline]
     pub fn log_big() -> bool {
-        get(212) != 0
+        get(211) != 0
     }
 
     /// Front end 2's word scan merges the runs of pages that need a check
@@ -2335,7 +2325,7 @@ pub mod tune {
     /// (replay A/Bs: CPU per command 0.994-0.996).
     #[inline]
     pub fn fe2_mine_fast() -> bool {
-        get(213) != 0
+        get(212) != 0
     }
 
     /// The GPU executors' lookups of a guest mapping's bounds (every range
@@ -2346,7 +2336,7 @@ pub mod tune {
     /// 0.998 without).
     #[inline]
     pub fn vma_cache() -> bool {
-        get(214) != 0
+        get(213) != 0
     }
 
     /// Before a GPU-performed CP write of a label our command processors
@@ -2356,7 +2346,7 @@ pub mod tune {
     /// writes them in order, so a title thread that sees a label may read
     /// the timestamps before it; left open as there.
     pub fn ts_cpw_waited() -> bool {
-        get(215) != 0
+        get(214) != 0
     }
 
     /// Pixel programs that write no memory run their depth and stencil
@@ -2367,7 +2357,7 @@ pub mod tune {
     /// so the LOD statistics' atomics had every rasterized fragment shaded.
     /// Read when a pixel program is prepared.
     pub fn early_auto() -> bool {
-        get(216) != 0
+        get(215) != 0
     }
 
     /// Timing only at 0 (GPU writes then never reach guest memory: the
@@ -2375,7 +2365,7 @@ pub mod tune {
     /// translations, with the write-backs they feed): translations leave
     /// front end 2's write marks out. Read when a stage is prepared.
     pub fn write_marks() -> bool {
-        get(217) != 0
+        get(216) != 0
     }
 
     /// Front end 2 (opt-in: +1.2% at the vista, tour, walks and ten forced
@@ -2389,7 +2379,7 @@ pub mod tune {
     /// threads see such labels when the batch's work is done and back in
     /// guest memory, as if the GPU were slower.
     pub fn fe2_cpw_defer() -> bool {
-        get(218) != 0
+        get(217) != 0
     }
 
     /// The mirror's backing granule in pages of 64 KiB (a power of two; 0,
@@ -2398,7 +2388,7 @@ pub mod tune {
     /// bind with whatever other threads claimed meanwhile
     /// (`resident::back_in`).
     pub fn fe2_back_granule() -> u64 {
-        get(229)
+        get(227)
     }
 
     /// LOD statistics of pixel programs whose depth tests stay after the
@@ -2412,7 +2402,7 @@ pub mod tune {
     /// measurements; 0 (diagnosis): none measures, so the title's texture
     /// streaming lacks those textures' statistics.
     pub fn lod_late() -> u64 {
-        get(219)
+        get(218)
     }
 
     /// With `lod_late` 1: draws binding no texture whose T# enables
@@ -2421,7 +2411,7 @@ pub mod tune {
     /// at 1-3, -2.1% of a replayed frame's GPU time, FINDINGS.md
     /// 2026-10-30 midday); 0: every draw keeps them (the reference).
     pub fn lod_skip() -> bool {
-        get(220) != 0
+        get(219) != 0
     }
 
     /// Front end 2 stage F4's first step: uploads of 2D and array textures
@@ -2438,7 +2428,7 @@ pub mod tune {
     /// 8 since 2026-10-30 (Castlewall's arrival and the 1-1 walks, FINDINGS.md
     /// 2026-10-30 evening); 0: all detiled on the CPU.
     pub fn gpu_detile() -> u64 {
-        get(221)
+        get(220)
     }
 
     /// Texture uploads detiled on the CPU (those under `gpu_detile`'s size)
@@ -2447,7 +2437,7 @@ pub mod tune {
     /// once the copy is done (`images`; staging freed at its fence). 0: each
     /// waits for its transfer on the main queue (`upload_async` aside).
     pub fn upload_copy() -> bool {
-        get(222) != 0
+        get(221) != 0
     }
 
     /// Timing only at 0 (GPU writes then never reach guest memory; replays
@@ -2457,7 +2447,7 @@ pub mod tune {
     /// what the marks cost (diagnosis, 2026-10-31). Read when a stage is
     /// prepared.
     pub fn mark_touch() -> bool {
-        get(223) != 0
+        get(222) != 0
     }
 
     /// Front end 2: translations set their stores' pages' touched bits
@@ -2466,7 +2456,7 @@ pub mod tune {
     /// bits of its executor's written ranges first (`kernels::mirror_compact`,
     /// from the first such translation on). Read when a stage is prepared.
     pub fn touch_bits() -> bool {
-        get(224) != 0
+        get(223) != 0
     }
 
     /// Texture uploads detiled on the CPU that waited for their transfer on
@@ -2477,14 +2467,7 @@ pub mod tune {
     /// 24% less hitch time, level loads' hitches lower, content drawn
     /// sooner; FINDINGS.md); 0 waits for each transfer as before.
     pub fn upload_batch() -> bool {
-        get(225) != 0
-    }
-
-    /// First uploads of textures detiled on the CPU are detiled before the
-    /// image cache's lock by the thread binding them (`images::predetile`;
-    /// under the lock only their copy is recorded). Live.
-    pub fn upload_predetile() -> bool {
-        get(226) != 0
+        get(224) != 0
     }
 
     /// Batches recorded into lists that the submission thread replays into
@@ -2496,7 +2479,7 @@ pub mod tune {
     /// -6.6%, +1% at the vista, Castlewall +2%; 2 lost 1.2% in replays:
     /// FINDINGS.md).
     pub fn record_defer() -> u64 {
-        get(227)
+        get(225)
     }
 
     /// A large zero fill under front end 2 stores into guest memory only
@@ -2507,7 +2490,7 @@ pub mod tune {
     /// vista frame, in front of a label). Live; default 1 since 2026-10-31
     /// (the vista +3%, GPU busy -1.8 ms a frame; tour clean: FINDINGS.md).
     pub fn fill_partial() -> bool {
-        get(228) != 0
+        get(226) != 0
     }
 
 

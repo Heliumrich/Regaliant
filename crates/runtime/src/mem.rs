@@ -412,9 +412,9 @@ pub fn vma_bounds(a: u64) -> Option<(u64, u64)> {
     found
 }
 
-/// Cached runs per thread (`tune span_runs`: READABLE_RUNS_WIDE).
+/// Cached runs per thread, all cleared when full (512 with one evicted at a
+/// time and a last-hit check were level in replay A/Bs: FINDINGS.md 2026-10-29).
 const READABLE_RUNS: usize = 64;
-const READABLE_RUNS_WIDE: usize = 512;
 
 thread_local! {
     /// This thread's recently confirmed runs: [start, end) and whether they
@@ -425,8 +425,6 @@ thread_local! {
     static READABLE: std::cell::RefCell<(u64, Vec<(u64, u64, bool)>)> = const { std::cell::RefCell::new((u64::MAX, Vec::new())) };
     /// This thread's `readable_span` calls not yet added to SPAN_CALLS.
     static SPAN_CALLS_LOCAL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    /// Its last hit (`tune span_runs`): MAP_GEN then, [start, end), readable.
-    static SPAN_LAST: std::cell::Cell<(u64, u64, u64, bool)> = const { std::cell::Cell::new((u64::MAX, 0, 0, false)) };
 }
 
 /// The run of adjacent accessible mappings containing `a` as [start, end)
@@ -445,13 +443,6 @@ pub fn readable_span(a: u64) -> Option<(u64, u64)> {
         }
     });
     let generation = MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
-    let wide = crate::gpu::tune::span_runs();
-    if wide {
-        let (g, s, e, ok) = SPAN_LAST.with(|l| l.get());
-        if g == generation && s <= a && a < e {
-            return ok.then_some((s, e));
-        }
-    }
     let hit = READABLE.with(|c| {
         let mut c = c.borrow_mut();
         if c.0 != generation {
@@ -465,9 +456,6 @@ pub fn readable_span(a: u64) -> Option<(u64, u64)> {
         i.checked_sub(1).map(|i| c.1[i]).filter(|r| a < r.1)
     });
     if let Some((s, e, ok)) = hit {
-        if wide {
-            SPAN_LAST.with(|l| l.set((generation, s, e, ok)));
-        }
         return ok.then_some((s, e));
     }
     SPAN_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -510,25 +498,13 @@ pub fn readable_span(a: u64) -> Option<(u64, u64)> {
         // Newer runs replace the ones they overlap.
         c.1.retain(|r| r.1 <= start || end <= r.0);
         let mut i = c.1.partition_point(|r| r.0 < start);
-        if c.1.len() >= if wide { READABLE_RUNS_WIDE } else { READABLE_RUNS } {
+        if c.1.len() >= READABLE_RUNS {
             SPAN_FULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if wide {
-                // One run away from the new one (by order) makes room.
-                let j = (i + c.1.len() / 2) % c.1.len();
-                c.1.remove(j);
-                if j < i {
-                    i -= 1;
-                }
-            } else {
-                c.1.clear();
-                i = 0;
-            }
+            c.1.clear();
+            i = 0;
         }
         c.1.insert(i, (start, end, ok));
     });
-    if wide {
-        SPAN_LAST.with(|l| l.set((generation, start, end, ok)));
-    }
     ok.then_some((start, end))
 }
 
