@@ -189,8 +189,10 @@ pub fn unmap_then_map(guest: u64, len: u64, maps: &[(u64, u64, u64)]) {
 }
 
 /// Copies the queued updates into the table on the main queue, before the
-/// batch about to be submitted (called in sequence order, `submit_batch`).
-pub(super) fn submit_pending(c: &Ctx) -> Result<(), String> {
+/// batch about to be submitted (called in sequence order, `submit_batch`),
+/// after batch `cwait` of the compute family's queue (ordered async
+/// compute: its shaders read the old entries; 0: none).
+pub(super) fn submit_pending(c: &Ctx, cwait: u64) -> Result<(), String> {
     if !made() {
         return Ok(());
     }
@@ -257,7 +259,10 @@ pub(super) fn submit_pending(c: &Ctx) -> Result<(), String> {
         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
         c.device.end_command_buffer(cmd).ok();
     }
-    c.submit(cmd, &[], &[], fence)?;
+    match &c.compute {
+        Some(q) if cwait > c.batch_value_c() => c.submit_timeline(false, &[cmd], &[(q.batches, cwait, vk::PipelineStageFlags2::ALL_COMMANDS)], &[], fence)?,
+        _ => c.submit(cmd, &[], &[], fence)?,
+    }
     up.flights.push(Flight { cmd, fence, staging, mem });
     STATS[2].fetch_add(1, Ordering::Relaxed);
     STATS[3].fetch_add(bytes, Ordering::Relaxed);

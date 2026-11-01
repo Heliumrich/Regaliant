@@ -2395,12 +2395,23 @@ pub fn mirror_mode() -> bool {
 /// per dword of the mirror's span, one per page, the touched-page list).
 pub const MARK_BYTES: u64 = 4 * rdna::kernels::MARK_TOTAL_WORDS as u64;
 const _: () = assert!(MIRROR_END - MIRROR_BASE == rdna::kernels::MARK_SPAN_BYTES);
-/// The written-bit map (video memory, zeroed by mirror mode's self-test).
+/// The written-bit map (video memory, zeroed by mirror mode's self-test),
+/// and the compute family's queue's own (ordered async compute: batches
+/// there mark and write back from it; one map for both queues would let one
+/// queue's write-back clear marks and empty the touched-page list under the
+/// other's stores).
 static MARKS: std::sync::OnceLock<vk::Buffer> = std::sync::OnceLock::new();
+static MARKS_C: std::sync::OnceLock<vk::Buffer> = std::sync::OnceLock::new();
 
 /// The written-bit map (mirror mode).
 pub fn marks() -> Option<vk::Buffer> {
     MARKS.get().copied()
+}
+
+/// The written-bit map of a batch on the compute family's queue (`on_c`)
+/// or on the main queue.
+pub fn marks_for(on_c: bool) -> Option<vk::Buffer> {
+    if on_c { MARKS_C.get().copied() } else { MARKS.get().copied() }
 }
 
 /// Mirror mode's statistics (`owned_line`).
@@ -3652,20 +3663,27 @@ fn owned_self_test() -> Result<String, String> {
     Ok(format!("read-back context on the {queue}, written-bit map of {} MiB", MARK_BYTES >> 20))
 }
 
-/// The written-bit map, made zeroed (`marks`).
+/// The written-bit maps, made zeroed (`marks`; the compute family's queue's
+/// only when it exists).
 fn make_marks() -> Result<(), String> {
     let c = ctx();
-    let (buf, _mem) = c.device_buffer(MARK_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::INDIRECT_BUFFER)?;
-    // Zeroed; the touched-page list's header [count, 1, 1, 0] is the list
-    // gather's indirect dispatch.
-    let header: Vec<u8> = [0u32, 1, 1, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
-    one_off(|cmd| unsafe {
-        c.device.cmd_fill_buffer(cmd, buf, 0, vk::WHOLE_SIZE, 0);
-        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
-        c.device.cmd_update_buffer(cmd, buf, rdna::kernels::MARK_LIST_AT as u64 * 4, &header);
-    })?;
-    let _ = MARKS.set(buf);
+    let make = || -> Result<vk::Buffer, String> {
+        let (buf, _mem) = c.device_buffer(MARK_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::INDIRECT_BUFFER)?;
+        // Zeroed; the touched-page list's header [count, 1, 1, 0] is the list
+        // gather's indirect dispatch.
+        let header: Vec<u8> = [0u32, 1, 1, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
+        one_off(|cmd| unsafe {
+            c.device.cmd_fill_buffer(cmd, buf, 0, vk::WHOLE_SIZE, 0);
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            c.device.cmd_update_buffer(cmd, buf, rdna::kernels::MARK_LIST_AT as u64 * 4, &header);
+        })?;
+        Ok(buf)
+    };
+    let _ = MARKS.set(make()?);
+    if c.compute.is_some() {
+        let _ = MARKS_C.set(make()?);
+    }
     Ok(())
 }
 

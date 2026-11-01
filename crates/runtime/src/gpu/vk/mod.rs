@@ -8,6 +8,7 @@ use ash::vk;
 use parking_lot::Mutex;
 use std::ffi::{CStr, c_char};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct Ctx {
     pub entry: ash::Entry,
@@ -15,8 +16,6 @@ pub struct Ctx {
     pub pdev: vk::PhysicalDevice,
     pub device: ash::Device,
     pub queue: Mutex<vk::Queue>,
-    /// A second queue of the main family (`tune alt_queue`), if it has one.
-    pub queue2: Option<Mutex<vk::Queue>>,
     pub queue_family: u32,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
     pub limits: vk::PhysicalDeviceLimits,
@@ -63,9 +62,16 @@ pub struct Ctx {
     /// The copy queue (a transfer-only queue family; `DS_COPY_QUEUE=0`:
     /// none): batch-start copies run on it beside the main queue (`exec`).
     pub copy: Option<CopyQueue>,
-    /// A queue of a compute-only family (diagnosis, `alt_compute_id`): one
-    /// compute queue's batches run on it beside the main queue.
+    /// Ordered async compute (RENDERER.md; `DS_ASYNC_COMPUTE` 2 or more at
+    /// boot, `async_compute_boot`): a queue of a compute-only family that the
+    /// compute queues' batches run on beside the main queue.
     pub compute: Option<ComputeQueue>,
+    /// With `compute`: a timeline every submission to the main queue
+    /// signals with the next value of `g_count` (`progress_signal`); a batch
+    /// on the compute queue waits for the value current when it is
+    /// submitted, after all earlier work of the main queue.
+    pub g_progress: vk::Semaphore,
+    g_count: AtomicU64,
     /// The distinct queue families buffers are used by (the main queue's,
     /// the copy queue's, the compute queue's).
     pub families: Vec<u32>,
@@ -75,24 +81,20 @@ pub struct Ctx {
     pub batches: vk::Semaphore,
 }
 
-/// A queue of a compute-only family (`Ctx::compute`).
+/// A queue of a compute-only family (`Ctx::compute`) and the timeline its
+/// batches signal with their sequence.
 pub struct ComputeQueue {
     pub family: u32,
     pub queue: Mutex<vk::Queue>,
+    pub batches: vk::Semaphore,
 }
 
-/// The compute queue (its id, e.g. 0x50) whose batches go to a queue of a
-/// compute-only family: `DS_ALT_QUEUE` at boot with 0x20000 added (timing
-/// only, as `tune alt_queue`: no ordering between the queues; buffers are
-/// shared with that family, images are not).
-pub fn alt_compute_id() -> Option<u64> {
-    static ID: OnceLock<Option<u64>> = OnceLock::new();
-    *ID.get_or_init(|| {
-        let v = std::env::var("DS_ALT_QUEUE").ok()?;
-        let v = v.trim();
-        let n = if let Some(h) = v.strip_prefix("0x") { u64::from_str_radix(h, 16).ok()? } else { v.parse::<u64>().ok()? };
-        (n & 0x20000 != 0 && n & 0xFFFF != 0).then_some(n & 0xFFFF)
-    })
+/// Ordered async compute is set up at boot (`DS_ASYNC_COMPUTE` 2 or more
+/// when the device is made): the compute family's queue, the second
+/// written-bit map, images shared between the families.
+pub fn async_compute_boot() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| super::tune::async_compute() >= 2)
 }
 
 /// A transfer-only queue for batch-start copies, and its timeline.
@@ -238,9 +240,6 @@ fn init_inner() -> Result<(), String> {
         let (pdev, qf, props) = chosen.ok_or("no Vulkan device with graphics+compute")?;
         let device_name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy().into_owned();
         let prio = [1.0f32];
-        // Two queues of the main family when it has them (`tune alt_queue`).
-        let prio2 = [1.0f32, 1.0];
-        let main_queues = if instance.get_physical_device_queue_family_properties(pdev)[qf as usize].queue_count >= 2 { 2 } else { 1 };
         // A transfer-only family for the copy queue (`DS_COPY_QUEUE=0`: none).
         let copy_family = if std::env::var("DS_COPY_QUEUE").ok().as_deref() != Some("0") {
             instance
@@ -251,8 +250,8 @@ fn init_inner() -> Result<(), String> {
         } else {
             None
         };
-        // A compute-only family (diagnosis: `alt_compute_id`).
-        let compute_family = if alt_compute_id().is_some() {
+        // A compute-only family (ordered async compute).
+        let compute_family = if async_compute_boot() {
             instance
                 .get_physical_device_queue_family_properties(pdev)
                 .iter()
@@ -261,7 +260,7 @@ fn init_inner() -> Result<(), String> {
         } else {
             None
         };
-        let mut qci = vec![vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio2[..main_queues])];
+        let mut qci = vec![vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio)];
         if let Some(f) = copy_family {
             qci.push(vk::DeviceQueueCreateInfo::default().queue_family_index(f).queue_priorities(&prio));
         }
@@ -479,10 +478,19 @@ fn init_inner() -> Result<(), String> {
             r2_supported.null_descriptor != 0
         );
         let queue = device.get_device_queue(qf, 0);
-        let queue2 = (main_queues == 2).then(|| Mutex::new(device.get_device_queue(qf, 1)));
-        let compute = compute_family.map(|f| ComputeQueue { family: f, queue: Mutex::new(device.get_device_queue(f, 0)) });
+        let timeline = || {
+            let mut tci = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
+            device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tci), None).map_err(|e| format!("timeline semaphore: {e}"))
+        };
+        let compute = match compute_family {
+            Some(f) => Some(ComputeQueue { family: f, queue: Mutex::new(device.get_device_queue(f, 0)), batches: timeline()? }),
+            None => None,
+        };
+        let g_progress = if compute.is_some() { timeline()? } else { vk::Semaphore::null() };
         if let Some(c) = &compute {
-            crate::info!("Vulkan: compute queue in family {} (queue {:#x}'s batches beside the main queue; diagnosis)", c.family, alt_compute_id().unwrap_or(0));
+            crate::info!("Vulkan: compute queue in family {} (ordered async compute: the compute queues' batches beside the main queue)", c.family);
+        } else if async_compute_boot() {
+            crate::warn!("Vulkan: no compute-only queue family: ordered async compute off");
         }
         let mut families = vec![qf];
         for f in [copy_family, compute_family].into_iter().flatten() {
@@ -542,12 +550,13 @@ fn init_inner() -> Result<(), String> {
             families,
             copy,
             compute,
+            g_progress,
+            g_count: AtomicU64::new(0),
             entry,
             instance,
             pdev,
             device,
             queue: Mutex::new(queue),
-            queue2,
             queue_family: qf,
             mem_props,
             limits: props.limits,
@@ -1073,39 +1082,79 @@ impl Ctx {
         self.submit_timeline_on(on_copy, false, cmds, waits, signals, fence)
     }
 
-    /// `submit_timeline`, on the main family's second queue when `alt` and
-    /// there is one (`tune alt_queue`).
-    pub fn submit_timeline_on(&self, on_copy: bool, alt: bool, cmds: &[vk::CommandBuffer], waits: &[(vk::Semaphore, u64, vk::PipelineStageFlags2)], signals: &[(vk::Semaphore, u64)], fence: vk::Fence) -> Result<(), String> {
+    /// `submit_timeline`, on the compute family's queue when `on_compute`
+    /// (ordered async compute).
+    pub fn submit_timeline_on(&self, on_copy: bool, on_compute: bool, cmds: &[vk::CommandBuffer], waits: &[(vk::Semaphore, u64, vk::PipelineStageFlags2)], signals: &[(vk::Semaphore, u64)], fence: vk::Fence) -> Result<(), String> {
         let cbs: Vec<vk::CommandBufferSubmitInfo> = cmds.iter().map(|&c| vk::CommandBufferSubmitInfo::default().command_buffer(c)).collect();
         let ws: Vec<vk::SemaphoreSubmitInfo> = waits.iter().map(|&(s, v, st)| vk::SemaphoreSubmitInfo::default().semaphore(s).value(v).stage_mask(st)).collect();
-        let ss: Vec<vk::SemaphoreSubmitInfo> = signals.iter().map(|&(s, v)| vk::SemaphoreSubmitInfo::default().semaphore(s).value(v).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)).collect();
+        let mut ss: Vec<vk::SemaphoreSubmitInfo> = signals.iter().map(|&(s, v)| vk::SemaphoreSubmitInfo::default().semaphore(s).value(v).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)).collect();
+        if on_copy {
+            let q = self.copy.as_ref().ok_or("no copy queue")?.queue.lock();
+            let si = vk::SubmitInfo2::default().command_buffer_infos(&cbs).wait_semaphore_infos(&ws).signal_semaphore_infos(&ss);
+            return unsafe { self.device.queue_submit2(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit2: {e}"));
+        }
+        if on_compute {
+            let q = self.compute.as_ref().ok_or("no compute queue")?.queue.lock();
+            let si = vk::SubmitInfo2::default().command_buffer_infos(&cbs).wait_semaphore_infos(&ws).signal_semaphore_infos(&ss);
+            return unsafe { self.device.queue_submit2(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit2 (compute queue): {e}"));
+        }
+        let q = self.queue.lock();
+        ss.extend(self.progress_signal());
         let si = vk::SubmitInfo2::default().command_buffer_infos(&cbs).wait_semaphore_infos(&ws).signal_semaphore_infos(&ss);
-        let q = match (&self.queue2, on_copy) {
-            (_, true) => self.copy.as_ref().ok_or("no copy queue")?.queue.lock(),
-            (_, false) if alt && self.compute.is_some() => self.compute.as_ref().map(|c| c.queue.lock()).ok_or("no compute queue")?,
-            (Some(q2), false) if alt => q2.lock(),
-            _ => self.queue.lock(),
-        };
         unsafe { self.device.queue_submit2(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit2: {e}"))
+    }
+
+    /// With the compute family's queue: the main queue's progress signal
+    /// for a submission to it, made under its lock (values in submission
+    /// order).
+    fn progress_signal(&self) -> Option<vk::SemaphoreSubmitInfo<'static>> {
+        self.compute.as_ref()?;
+        let v = self.g_count.fetch_add(1, Ordering::AcqRel) + 1;
+        Some(vk::SemaphoreSubmitInfo::default().semaphore(self.g_progress).value(v).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS))
+    }
+
+    /// The main queue's progress value of its latest submission (a batch
+    /// on the compute family's queue waits for it).
+    pub fn g_progress_value(&self) -> u64 {
+        self.g_count.load(Ordering::Acquire)
     }
 
     /// Submits batches to the main queue in one call, in order: each its
     /// command buffers, an optional wait for the copy queue's timeline value,
-    /// and a signal of `batches` with its sequence; `fence` on the call (the
-    /// last batch's).
-    pub fn submit_batches(&self, batches: &[(&[vk::CommandBuffer], u64, u64)], fence: vk::Fence) -> Result<(), String> {
+    /// an optional wait for the compute family's queue's timeline value
+    /// (ordered async compute: the compute batch it depends on), and a
+    /// signal of `batches` with its sequence; `fence` on the call (the last
+    /// batch's).
+    pub fn submit_batches(&self, batches: &[(&[vk::CommandBuffer], u64, u64, u64)], fence: vk::Fence) -> Result<(), String> {
         let cbs: Vec<Vec<vk::CommandBufferSubmitInfo>> = batches.iter().map(|b| b.0.iter().map(|&c| vk::CommandBufferSubmitInfo::default().command_buffer(c)).collect()).collect();
         let copied = self.copy.as_ref().map(|q| q.copied);
+        let cq = self.compute.as_ref().map(|q| q.batches);
         let ws: Vec<Vec<vk::SemaphoreSubmitInfo>> = batches
             .iter()
-            .map(|b| match (copied, b.1) {
-                (Some(s), w) if w > 0 => vec![vk::SemaphoreSubmitInfo::default().semaphore(s).value(w).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)],
-                _ => Vec::new(),
+            .map(|b| {
+                let mut w = Vec::new();
+                if let (Some(s), true) = (copied, b.1 > 0) {
+                    w.push(vk::SemaphoreSubmitInfo::default().semaphore(s).value(b.1).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS));
+                }
+                if let (Some(s), true) = (cq, b.3 > 0) {
+                    w.push(vk::SemaphoreSubmitInfo::default().semaphore(s).value(b.3).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS));
+                }
+                w
             })
             .collect();
-        let ss: Vec<[vk::SemaphoreSubmitInfo; 1]> = batches.iter().map(|b| [vk::SemaphoreSubmitInfo::default().semaphore(self.batches).value(b.2).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)]).collect();
-        let infos: Vec<vk::SubmitInfo2> = (0..batches.len()).map(|k| vk::SubmitInfo2::default().command_buffer_infos(&cbs[k]).wait_semaphore_infos(&ws[k]).signal_semaphore_infos(&ss[k])).collect();
         let q = self.queue.lock();
+        let ss: Vec<Vec<vk::SemaphoreSubmitInfo>> = (0..batches.len())
+            .map(|k| {
+                let mut v = vec![vk::SemaphoreSubmitInfo::default().semaphore(self.batches).value(batches[k].2).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+                // (The progress signal on the last: its scope holds all
+                // earlier submissions.)
+                if k + 1 == batches.len() {
+                    v.extend(self.progress_signal());
+                }
+                v
+            })
+            .collect();
+        let infos: Vec<vk::SubmitInfo2> = (0..batches.len()).map(|k| vk::SubmitInfo2::default().command_buffer_infos(&cbs[k]).wait_semaphore_infos(&ws[k]).signal_semaphore_infos(&ss[k])).collect();
         unsafe { self.device.queue_submit2(*q, &infos, fence) }.map_err(|e| format!("vkQueueSubmit2 ({} batches): {e}", batches.len()))
     }
 
@@ -1123,12 +1172,28 @@ impl Ctx {
         unsafe { self.device.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&s).values(&v), timeout_ns) }.is_ok()
     }
 
-    /// Submits command buffers that execute in order.
+    /// The compute family's queue's batch timeline now (the highest batch
+    /// sequence it completed, every earlier one of its batches too).
+    pub fn batch_value_c(&self) -> u64 {
+        self.compute.as_ref().map_or(0, |q| unsafe { self.device.get_semaphore_counter_value(q.batches) }.unwrap_or(0))
+    }
+
+    /// `wait_batch` for a batch on the compute family's queue.
+    pub fn wait_batch_c(&self, seq: u64, timeout_ns: u64) -> bool {
+        let Some(q) = self.compute.as_ref() else { return false };
+        let s = [q.batches];
+        let v = [seq];
+        unsafe { self.device.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&s).values(&v), timeout_ns) }.is_ok()
+    }
+
+    /// Submits command buffers that execute in order (binary semaphores).
     pub fn submit_cmds(&self, cmds: &[vk::CommandBuffer], wait: &[(vk::Semaphore, vk::PipelineStageFlags)], signal: &[vk::Semaphore], fence: vk::Fence) -> Result<(), String> {
-        let ws: Vec<vk::Semaphore> = wait.iter().map(|w| w.0).collect();
-        let wst: Vec<vk::PipelineStageFlags> = wait.iter().map(|w| w.1).collect();
-        let si = vk::SubmitInfo::default().command_buffers(cmds).wait_semaphores(&ws).wait_dst_stage_mask(&wst).signal_semaphores(signal);
+        let cbs: Vec<vk::CommandBufferSubmitInfo> = cmds.iter().map(|&c| vk::CommandBufferSubmitInfo::default().command_buffer(c)).collect();
+        let ws: Vec<vk::SemaphoreSubmitInfo> = wait.iter().map(|&(s, st)| vk::SemaphoreSubmitInfo::default().semaphore(s).stage_mask(vk::PipelineStageFlags2::from_raw(st.as_raw() as u64))).collect();
+        let mut ss: Vec<vk::SemaphoreSubmitInfo> = signal.iter().map(|&s| vk::SemaphoreSubmitInfo::default().semaphore(s).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)).collect();
         let q = self.queue.lock();
-        unsafe { self.device.queue_submit(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit: {e}"))
+        ss.extend(self.progress_signal());
+        let si = vk::SubmitInfo2::default().command_buffer_infos(&cbs).wait_semaphore_infos(&ws).signal_semaphore_infos(&ss);
+        unsafe { self.device.queue_submit2(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit2: {e}"))
     }
 }

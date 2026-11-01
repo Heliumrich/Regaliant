@@ -922,11 +922,12 @@ static UPLOAD_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// transfer on the main queue are recorded into one command buffer they all
 /// share, submitted ahead of the next batch (`flush_uploads`, from
 /// `exec::submit_batch`) or of the cache's own next submission, and not
-/// waited for; their staging buffers are freed once it completes. Every
-/// batch goes to the one main queue (`tune alt_queue` aside), so a batch
-/// that binds such a texture runs after its upload (the upload's last
-/// barrier holds all later work), as does any batch an image buried after
-/// it waits for.
+/// waited for; their staging buffers are freed once it completes. A batch
+/// that binds such a texture runs after its upload: on the main queue in
+/// its order (the upload's last barrier holds all later work), on the
+/// compute family's queue after all the main queue's work submitted before
+/// it (ordered async compute); so does any batch an image buried after it
+/// waits for.
 struct Batched {
     pool: vk::CommandPool,
     /// The open command buffer, its fence, the staging it reads, its bytes.
@@ -2336,6 +2337,11 @@ impl Images {
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(usage)
             .initial_layout(vk::ImageLayout::UNDEFINED);
+        // Shared with the compute family's queue when it exists (ordered
+        // async compute: its batches sample and store images in GENERAL
+        // layout as the main queue's do).
+        let fams = [c.queue_family, c.compute.as_ref().map_or(c.queue_family, |q| q.family)];
+        let ci = if c.compute.is_some() { ci.sharing_mode(vk::SharingMode::CONCURRENT).queue_family_indices(&fams) } else { ci };
         unsafe {
             let t0 = std::time::Instant::now();
             let image = c.device.create_image(&ci, None).map_err(|e| format!("vkCreateImage {key:?}: {e}"))?;

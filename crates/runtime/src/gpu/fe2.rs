@@ -2754,7 +2754,10 @@ struct Scatter {
     /// (`rdna::kernels::mirror_compact`, `tune touch_bits`).
     compact: vk::Pipeline,
     layout: vk::PipelineLayout,
+    /// Its descriptor sets: the main queue's written-bit map, the compute
+    /// family's queue's (null without it).
     set: vk::DescriptorSet,
+    set_c: vk::DescriptorSet,
     counters: *mut u32,
     host: vk::Buffer,
     /// The counters in video memory (two host-memory atomics a page written
@@ -2774,7 +2777,7 @@ unsafe impl Sync for Scatter {}
 
 static SCATTER: std::sync::OnceLock<Scatter> = std::sync::OnceLock::new();
 
-fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
+fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatter, String> {
     let c = ctx();
     unsafe {
         let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..2)
@@ -2798,22 +2801,31 @@ fn make_scatter(marks: vk::Buffer) -> Result<Scatter, String> {
         };
         let pipeline = make(&code, 20)?;
         let compact = make(&rdna::kernels::mirror_compact(), 24)?;
-        let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 }];
-        let pool = c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).map_err(|e| format!("scatter pool: {e}"))?;
-        let set = c.device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts)).map_err(|e| format!("scatter set: {e}"))?[0];
+        let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 4 }];
+        let pool = c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(2).pool_sizes(&sizes), None).map_err(|e| format!("scatter pool: {e}"))?;
         let bytes = 4 * rdna::kernels::SCATTER_COUNTERS as u64;
         let (cbuf, _cmem, cptr) = c.host_buffer(bytes, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)?;
         std::ptr::write_bytes(cptr, 0, bytes as usize);
         let (dev, _dmem) = c.device_buffer(bytes, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)?;
         super::resident::one_off_now(|cmd| c.device.cmd_fill_buffer(cmd, dev, 0, bytes, 0))?;
-        let infos = [vk::DescriptorBufferInfo { buffer: marks, offset: 0, range: super::resident::MARK_BYTES }, vk::DescriptorBufferInfo { buffer: dev, offset: 0, range: bytes }];
-        let writes: Vec<vk::WriteDescriptorSet> = infos
-            .iter()
-            .enumerate()
-            .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
-            .collect();
-        c.device.update_descriptor_sets(&writes, &[]);
-        Ok(Scatter { pipeline, compact, layout, set, counters: cptr as *mut u32, host: cbuf, dev })
+        // One set per map; the counters are shared (atomics).
+        let make_set = |m: vk::Buffer| -> Result<vk::DescriptorSet, String> {
+            let set = c.device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts)).map_err(|e| format!("scatter set: {e}"))?[0];
+            let infos = [vk::DescriptorBufferInfo { buffer: m, offset: 0, range: super::resident::MARK_BYTES }, vk::DescriptorBufferInfo { buffer: dev, offset: 0, range: bytes }];
+            let writes: Vec<vk::WriteDescriptorSet> = infos
+                .iter()
+                .enumerate()
+                .map(|(k, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(k as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
+                .collect();
+            c.device.update_descriptor_sets(&writes, &[]);
+            Ok(set)
+        };
+        let set = make_set(marks)?;
+        let set_c = match marks_c {
+            Some(m) => make_set(m)?,
+            None => vk::DescriptorSet::null(),
+        };
+        Ok(Scatter { pipeline, compact, layout, set, set_c, counters: cptr as *mut u32, host: cbuf, dev })
     }
 }
 
@@ -2837,11 +2849,13 @@ pub fn note_touch_bits() {
 /// from the touched bits of `written` (the guest range the executor's
 /// written bindings since its last write-back span) and a barrier, the
 /// scatter over the touched-page list, the list emptied (by the kernel
-/// itself), a barrier before all later work.
+/// itself), a barrier before all later work. `on_c`: a batch on the compute
+/// family's queue, with its written-bit map (ordered async compute).
 /// Returns the pipeline it bound (the caller's bound compute state is gone).
-pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Option<vk::Pipeline> {
+pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>, on_c: bool) -> Option<vk::Pipeline> {
     let s = SCATTER.get()?;
-    let marks = super::resident::marks()?;
+    let marks = super::resident::marks_for(on_c)?;
+    let set = if on_c { s.set_c } else { s.set };
     let (mbuf, _) = super::resident::mirror_buffer()?;
     let c = ctx();
     let m = c.buffer_address(mbuf);
@@ -2859,7 +2873,7 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
             if w0 < w1 {
                 let cpc: Vec<u8> = [w0 as u32, w1 as u32, 0, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
                 c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, s.compact);
-                c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
+                c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[set], &[]);
                 c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &cpc);
                 c.device.cmd_dispatch(cmd, ((w1 - w0) as u32).div_ceil(rdna::kernels::COMPACT_LOCAL_SIZE), 1, 1);
                 let listed = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::INDIRECT_COMMAND_READ);
@@ -2869,7 +2883,7 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>) -> Op
             }
         }
         c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-        c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[s.set], &[]);
+        c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[set], &[]);
         c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
         c.device.cmd_dispatch_indirect(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4);
         if SCATTERS_RECORDED.fetch_add(1, Ordering::Relaxed) % COUNTER_COPY_EVERY == COUNTER_COPY_EVERY - 1 {
@@ -3009,7 +3023,7 @@ pub fn init() {
         crate::error!("fe2: no written-bit map; front end 2 off");
         return;
     };
-    match make_scatter(marks) {
+    match make_scatter(marks, super::resident::marks_for(true)) {
         Ok(s) => {
             let _ = SCATTER.set(s);
         }
@@ -3091,7 +3105,7 @@ fn self_test() -> Result<String, String> {
             c.device.cmd_update_buffer(cmd, marks, rdna::kernels::MARK_LIST_AT as u64 * 4, &list);
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
-            record_scatter(cmd, None);
+            record_scatter(cmd, None, false);
             if let Some(s) = SCATTER.get() {
                 record_counter_copy(s, cmd);
             }
@@ -3220,7 +3234,7 @@ fn scatter_bench() -> Result<String, String> {
                         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
                         c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, 2 * r);
                         if k < 6 {
-                            record_scatter(cmd, None);
+                            record_scatter(cmd, None, false);
                         } else {
                             let all = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
                             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[all], &[], &[]);

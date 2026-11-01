@@ -76,7 +76,7 @@ fn bench() -> Result<(), String> {
             props.limits.timestamp_period as f64
         };
         // A case: n dispatches; distinct pipelines; a barrier between; pushed descriptors.
-        let mut time_case = |n: usize, distinct: bool, barriers: bool, push: bool| -> Result<f64, String> {
+        let time_case = |n: usize, distinct: bool, barriers: bool, push: bool| -> Result<f64, String> {
             let mut ts = Vec::new();
             for _ in 0..7 {
                 d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
@@ -120,6 +120,74 @@ fn bench() -> Result<(), String> {
             ts.sort_by(|a, b| a.total_cmp(b));
             Ok(ts[ts.len() / 2])
         };
+        // Two queues (with `DS_ASYNC_COMPUTE=2` at boot the device has a
+        // compute-only family's queue, `Ctx::compute`): the chain with a
+        // full barrier between dispatches split in halves, one on the main
+        // queue and one there, submitted together, against the whole chain
+        // on the main queue; wall time until both fences signal. Whether the
+        // GPU overlaps two barrier-bound streams (front end 2's frames are
+        // chains of small dispatches and drains on one queue: the schedule
+        // model's two-queue bound assumes it does, FINDINGS.md 2026-11-01).
+        if let Some(cq) = c.compute.as_ref() {
+            let cpool2 = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(cq.family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).map_err(|e| format!("command pool 2: {e}"))?;
+            let cmd2 = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cpool2).command_buffer_count(1)).map_err(|e| format!("cmd 2: {e}"))?[0];
+            let fence2 = d.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| format!("fence 2: {e}"))?;
+            let full = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            let record = |cmd: vk::CommandBuffer, from: usize, n: usize| -> Result<(), String> {
+                d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
+                d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(|e| format!("begin: {e}"))?;
+                d.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipes[0]);
+                for k in from..from + n {
+                    let pcs = [iters, (k as u32) * local * groups];
+                    let bytes: Vec<u8> = pcs.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
+                    d.cmd_dispatch(cmd, groups, 1, 1);
+                    if k + 1 < from + n {
+                        d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[full], &[], &[]);
+                    }
+                }
+                d.end_command_buffer(cmd).map_err(|e| format!("end: {e}"))
+            };
+            // On the main queue (`main`), the compute family's (`alt`) or both.
+            let wall = |main: usize, alt: usize| -> Result<f64, String> {
+                let mut ts = Vec::new();
+                for _ in 0..7 {
+                    if main > 0 {
+                        record(cmd, 0, main)?;
+                    }
+                    if alt > 0 {
+                        record(cmd2, main, alt)?;
+                    }
+                    let t = std::time::Instant::now();
+                    if main > 0 {
+                        c.submit(cmd, &[], &[], fence)?;
+                    }
+                    if alt > 0 {
+                        let q = cq.queue.lock();
+                        d.queue_submit(*q, &[vk::SubmitInfo::default().command_buffers(&[cmd2])], fence2).map_err(|e| format!("submit 2: {e}"))?;
+                    }
+                    if main > 0 {
+                        d.wait_for_fences(&[fence], true, 10_000_000_000).map_err(|e| format!("wait: {e}"))?;
+                    }
+                    if alt > 0 {
+                        d.wait_for_fences(&[fence2], true, 10_000_000_000).map_err(|e| format!("wait 2: {e}"))?;
+                    }
+                    ts.push(t.elapsed().as_secs_f64() * 1e6);
+                    d.reset_fences(&[fence, fence2]).ok();
+                }
+                ts.sort_by(|a, b| a.total_cmp(b));
+                Ok(ts[ts.len() / 2])
+            };
+            let one_q = wall(N, 0)?;
+            let alt_q = wall(0, N)?;
+            let two_q = wall(N / 2, N / 2)?;
+            crate::info!(
+                "dispatch bench: {N} dispatches with a full barrier between, wall time: main queue {one_q:.0} us, compute family {}'s queue {alt_q:.0} us, halves on both {two_q:.0} us ({:.2}x the main queue's)",
+                cq.family,
+                two_q / one_q
+            );
+        }
         let one = time_case(1, false, false, false)?;
         crate::info!("dispatch bench: one dispatch alone {one:.1} us");
         for (distinct, barriers, push) in [(false, false, false), (true, false, false), (false, true, false), (true, true, false), (false, false, true), (true, false, true)] {

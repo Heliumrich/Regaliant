@@ -2770,13 +2770,19 @@ fn note_copy_waits(own: bool, wait: u64) {
 /// Submits batch `seq`: its copies on the copy queue (`xpre`; they signal
 /// the copy timeline with `seq`), then its prologue and commands on the main
 /// queue once its own copies there and those it binds that earlier batches
-/// made there (`wait`) are done. Called in sequence order (`push_batch`):
-/// the timeline's signals increase.
-fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, fence: vk::Fence, alt: bool) -> Result<(), String> {
+/// made there (`wait`) are done, and the compute batch it depends on
+/// (`xwait`, ordered async compute). A batch for the compute family's queue
+/// (`on_c`): its prologue (uploads into the mirror) on the main queue, after
+/// the compute batch whose writes it would undo (`xwait`), then its commands
+/// there after all the main queue's work so far. Called in sequence order
+/// (`push_batch`): the timelines' signals increase.
+#[allow(clippy::too_many_arguments)]
+fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, on_c: bool, xwait: u64) -> Result<(), String> {
     let c = ctx();
-    // Guest page table updates queued before this batch, ahead of it, and
-    // texture uploads recorded batched (`tune upload_batch`).
-    super::pagetable::submit_pending(c)?;
+    // Guest page table updates queued before this batch, ahead of it (after
+    // the compute family's queue's batches, which read the old entries),
+    // and texture uploads recorded batched (`tune upload_batch`).
+    super::pagetable::submit_pending(c, XQ_SUBMITTED.load(Ordering::Acquire))?;
     super::images::flush_uploads();
     SUBMIT_KIND.with(|k| k.set(if xpre.is_some() { 1 } else if wait > 0 { 2 } else { 0 }));
     let mut wait = wait;
@@ -2784,6 +2790,31 @@ fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::Comma
         let q = c.copy.as_ref().ok_or("no copy queue")?;
         c.submit_timeline(true, &[x], &[], &[(q.copied, seq)], vk::Fence::null())?;
         wait = seq;
+    }
+    let all = vk::PipelineStageFlags2::ALL_COMMANDS;
+    let mut waits: Vec<(vk::Semaphore, u64, vk::PipelineStageFlags2)> = Vec::new();
+    if let (Some(q), true) = (&c.copy, wait > 0) {
+        waits.push((q.copied, wait, all));
+    }
+    if on_c {
+        let cq = c.compute.as_ref().ok_or("no compute queue")?;
+        if let Some(p) = pre {
+            let mut pw = waits.clone();
+            if xwait > c.batch_value_c() {
+                pw.push((cq.batches, xwait, all));
+            }
+            c.submit_timeline_on(false, false, &[p], &pw, &[], vk::Fence::null())?;
+        }
+        waits.push((c.g_progress, c.g_progress_value(), all));
+        // (Its timeline signal is what the completion thread waits for.)
+        c.submit_timeline_on(false, true, &[cmd], &waits, &[(cq.batches, seq)], vk::Fence::null())?;
+        XQ_SUBMITTED.store(seq, Ordering::Release);
+        return Ok(());
+    }
+    if let (Some(cq), true) = (&c.compute, xwait > 0) {
+        if xwait > c.batch_value_c() {
+            waits.push((cq.batches, xwait, all));
+        }
     }
     let both;
     let cmds: &[vk::CommandBuffer] = match pre {
@@ -2795,31 +2826,23 @@ fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::Comma
     };
     // On the main queue every batch signals the batch timeline with its
     // sequence (the completion thread waits for that value).
-    let tl = [(c.batches, seq)];
-    let signals: &[(vk::Semaphore, u64)] = if alt { &[] } else { &tl };
-    // The slot's fence only on the second queue, whose batches the timeline
-    // leaves out: the completion thread resets it once the timeline passed
-    // the batch, which need not order after the fence's own signal (the
-    // validation layer reported resets of fences still in use).
-    let fence = if alt { fence } else { vk::Fence::null() };
-    match (&c.copy, wait) {
-        (Some(q), w) if w > 0 => c.submit_timeline_on(false, alt, cmds, &[(q.copied, w, vk::PipelineStageFlags2::ALL_COMMANDS)], signals, fence)?,
-        _ => c.submit_timeline_on(false, alt, cmds, &[], signals, fence)?,
-    }
+    c.submit_timeline_on(false, false, cmds, &waits, &[(c.batches, seq)], vk::Fence::null())?;
     Ok(())
 }
 
 /// A batch's submission as the submission thread hands it to Vulkan
 /// (`submit_specs`): its command buffers (the copy queue's part, the
-/// prologue, the batch), the copy queue's timeline value it waits for, its
-/// fence, whether it runs on the second queue, its executor's name.
+/// prologue, the batch), the copy queue's timeline value it waits for,
+/// whether it runs on the compute family's queue, the compute batch it (or,
+/// on that queue, its prologue) waits for (`push_batch`), its executor's
+/// name.
 pub(super) struct SubmitSpec {
     xpre: Option<vk::CommandBuffer>,
     pre: Option<vk::CommandBuffer>,
     cmd: vk::CommandBuffer,
     wait: u64,
-    fence: vk::Fence,
-    alt: bool,
+    on_c: bool,
+    xwait: u64,
     name: String,
 }
 
@@ -2841,7 +2864,7 @@ fn submit_specs(specs: Vec<(u64, SubmitSpec)>) {
             crate::error!("gpu[{name}]: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
         }
     };
-    let plain = |s: &SubmitSpec| s.xpre.is_none() && !s.alt;
+    let plain = |s: &SubmitSpec| s.xpre.is_none() && !s.on_c;
     let max = (super::tune::submit_coalesce() as usize).max(1);
     let mut i = 0;
     while i < specs.len() {
@@ -2856,19 +2879,20 @@ fn submit_specs(specs: Vec<(u64, SubmitSpec)>) {
         }
         if j - i == 1 {
             let (seq, s) = &specs[i];
-            if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.fence, s.alt) {
+            if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.on_c, s.xwait) {
                 fail(e, &s.name);
             }
             i = j;
             continue;
         }
         let c = ctx();
-        if let Err(e) = super::pagetable::submit_pending(c) {
+        if let Err(e) = super::pagetable::submit_pending(c, XQ_SUBMITTED.load(Ordering::Acquire)) {
             fail(e, &specs[i].1.name);
             return;
         }
         let cmds: Vec<Vec<vk::CommandBuffer>> = specs[i..j].iter().map(|(_, s)| s.pre.into_iter().chain([s.cmd]).collect()).collect();
-        let list: Vec<(&[vk::CommandBuffer], u64, u64)> = specs[i..j].iter().zip(&cmds).map(|((seq, s), c)| (c.as_slice(), s.wait, *seq)).collect();
+        let cdone = if c.compute.is_some() { c.batch_value_c() } else { 0 };
+        let list: Vec<(&[vk::CommandBuffer], u64, u64, u64)> = specs[i..j].iter().zip(&cmds).map(|((seq, s), c)| (c.as_slice(), s.wait, *seq, if s.xwait > cdone { s.xwait } else { 0 })).collect();
         COALESCED[0].fetch_add(1, Ordering::Relaxed);
         COALESCED[1].fetch_add((j - i) as u64, Ordering::Relaxed);
         // (No fence: these signal the batch timeline, `submit_batch`.)
@@ -3979,9 +4003,8 @@ struct Batch {
     seq: u64,
     /// Null for action-only entries.
     fence: vk::Fence,
-    /// On the second queue (its fence is waited for, not the batch
-    /// timeline).
-    alt: bool,
+    /// On the compute family's queue (its timeline is waited for).
+    on_c: bool,
     actions: Vec<Action>,
     checks: Vec<verify::Check>,
     shaders: Vec<u64>,
@@ -4424,6 +4447,151 @@ static INFLIGHT_SPAN: SpanMarks = SpanMarks::new();
 static CP_WRITES: RangeLog = RangeLog::new(&CP_WRITES_SPAN);
 static CP_WRITES_SPAN: SpanMarks = SpanMarks::new();
 
+/// Ordered async compute (`tune async_compute`; RENDERER.md "Ordered async
+/// compute"): the compute queues' batches (their executors `gpu-acb*`,
+/// parallel workers too) on the compute family's queue run after all
+/// earlier work of the main queue (their prologues, the uploads into the
+/// mirror, run there), and the main queue's batches after theirs only where
+/// they depend on them. What unfinished compute batches write, noted when
+/// they are queued.
+static XC_WRITES: RangeLog = RangeLog::new(&XC_WRITES_SPAN);
+static XC_WRITES_SPAN: SpanMarks = SpanMarks::new();
+/// Per batch sequence (modulo its size): the sequence, with bit 63 set when
+/// a compute queue's executor queued it (on the compute family's queue
+/// with the switch at 2; with 1, where it would run).
+static XQ_SEQ: [AtomicU64; 1 << 16] = [const { AtomicU64::new(0) }; 1 << 16];
+const XQ_COMPUTE: u64 = 1 << 63;
+/// Per compute queue (its id), the latest of its batches queued for the
+/// compute family's queue: its next batch on the main queue (the switch
+/// off, image-cache work) waits for it.
+static XQ_LAST: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+/// The latest batch submitted to the compute family's queue (page-table
+/// updates wait for it: its shaders read the old entries).
+static XQ_SUBMITTED: AtomicU64 = AtomicU64::new(0);
+/// Why a main-queue batch waits for a compute batch: a label wait passed
+/// on its promise, a label read from memory it promised or writes, uploads
+/// into pages it writes, indirect arguments the GPU reads that it writes,
+/// its compute queue's previous batch ran there.
+const XR_PROMISE: usize = 0;
+const XR_LABEL: usize = 1;
+const XR_UPLOAD: usize = 2;
+const XR_INDIRECT: usize = 3;
+const XR_OWN: usize = 4;
+const XR_N: usize = 5;
+/// The census (`xq_line`): [compute batches, their uploaded pages, of them
+/// with image-cache work, main-queue batches, of them with a dependency,
+/// dependencies by reason (XR_*), compute prologues that waited for a
+/// compute batch, compute batches closed for image-cache work].
+static XQ_STATS: [AtomicU64; 7 + XR_N] = [const { AtomicU64::new(0) }; 7 + XR_N];
+const XS_PRE_WAITS: usize = 5 + XR_N;
+const XS_IMAGE_CLOSES: usize = 6 + XR_N;
+
+/// Ordered async compute's dependencies are tracked: its census, or the
+/// compute family's queue set up (its batches may still run after the
+/// switch went to 0).
+fn xq_tracking() -> bool {
+    super::tune::async_compute() != 0 || ctx().compute.is_some()
+}
+
+/// The compute queue id in an executor's name (`gpu-acb<id>`, a parallel
+/// worker's `gpu-acb<id>-par<n>` too; 0: none).
+fn acb_id(name: &str) -> u64 {
+    let h = name.strip_prefix("gpu-acb").map(|h| h.split('-').next().unwrap_or(""));
+    h.and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).unwrap_or(0)
+}
+
+/// Whether batch `seq` is a compute queue's (as far as `XQ_SEQ` still
+/// holds it).
+fn xq_compute_batch(seq: u64) -> bool {
+    XQ_SEQ[(seq as usize) & (XQ_SEQ.len() - 1)].load(Ordering::Acquire) == seq | XQ_COMPUTE
+}
+
+/// What `push_batch` notes or checks for ordered async compute under the
+/// queue lock (every batch with a lower sequence was noted before): a
+/// compute batch's writes are noted (`compute`: it is one, `on_c`: on the
+/// compute family's queue); a main-queue batch's uploads (`[a, b)` runs)
+/// are checked against unfinished compute batches' writes, beside the
+/// dependency its recording found (`dep`, the reasons `why`); a compute
+/// batch's uploads too (its prologue runs on the main queue).
+pub(super) struct XqBatch<'a> {
+    compute: bool,
+    on_c: bool,
+    acb: u64,
+    writes: &'a super::ranges::Ranges,
+    ups: &'a [(u64, u64)],
+    dep: u64,
+    why: u32,
+    images: bool,
+}
+
+/// `XqBatch` for batch `seq` (see there): the compute batch a main-queue
+/// batch waits for, or the one a compute batch's prologue (on the main
+/// queue) waits for (0: none). A main-queue batch's dependency is marked in
+/// the timeline (`after #<seq> (xq ...)`, read by `tools/schedmodel.py`).
+fn xq_queued(seq: u64, x: XqBatch, name: &str) -> u64 {
+    let slot = &XQ_SEQ[(seq as usize) & (XQ_SEQ.len() - 1)];
+    let ups: Vec<(u64, u64)> = x.ups.iter().map(|&(a, b)| (a, b - a)).collect();
+    let done = done_seq();
+    // (Uploads copy guest memory, which lacks an unfinished compute
+    // batch's writes until its write-back.)
+    let undo = if ups.is_empty() { None } else { XC_WRITES.latest(&ups).filter(|&s| s > done) };
+    if x.compute && (x.on_c || super::tune::async_compute() == 1) {
+        slot.store(seq | XQ_COMPUTE, Ordering::Release);
+        XC_WRITES.note_ranges(seq, x.writes);
+        XQ_LAST[(x.acb & 0xFF) as usize].fetch_max(seq, Ordering::AcqRel);
+        XQ_STATS[0].fetch_add(1, Ordering::Relaxed);
+        XQ_STATS[1].fetch_add(ups.iter().map(|u| u.1 / 4096).sum(), Ordering::Relaxed);
+        if x.images {
+            XQ_STATS[2].fetch_add(1, Ordering::Relaxed);
+        }
+        if undo.is_some() {
+            XQ_STATS[XS_PRE_WAITS].fetch_add(1, Ordering::Relaxed);
+        }
+        return undo.unwrap_or(0);
+    }
+    slot.store(seq, Ordering::Release);
+    let (mut dep, mut why) = if x.dep > done { (x.dep, x.why) } else { (0, 0) };
+    if let Some(s) = undo {
+        dep = dep.max(s);
+        why |= 1 << XR_UPLOAD;
+    }
+    if x.compute {
+        let last = XQ_LAST[(x.acb & 0xFF) as usize].load(Ordering::Acquire);
+        if last > done {
+            dep = dep.max(last);
+            why |= 1 << XR_OWN;
+        }
+    }
+    XQ_STATS[3].fetch_add(1, Ordering::Relaxed);
+    if dep == 0 {
+        return 0;
+    }
+    XQ_STATS[4].fetch_add(1, Ordering::Relaxed);
+    for (k, c) in XQ_STATS[5..5 + XR_N].iter().enumerate() {
+        if why & 1 << k != 0 {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if super::timeline::on() {
+        let t = super::timeline::mark();
+        super::timeline::end(name, t, || format!("after #{dep} (xq {why:#x})"));
+    }
+    dep
+}
+
+/// Ordered async compute's status line ("" while it never ran).
+pub fn xq_line() -> String {
+    let v: Vec<u64> = XQ_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if v[0] + v[3] == 0 {
+        return String::new();
+    }
+    format!(
+        "    ordered async compute{}: {} compute batches ({} pages uploaded, {} with image-cache work, {} closed for it; {} prologues after an unfinished compute batch), {} main-queue batches, {} of them after an unfinished compute batch (label waits passed on its promise {}, labels read from memory it writes {}, uploads into pages it writes {}, indirect arguments it writes {}, its compute queue's batch before {})\n",
+        if super::tune::async_compute() == 1 { "'s census" } else { "" },
+        v[0], v[1], v[2], v[XS_IMAGE_CLOSES], v[XS_PRE_WAITS], v[3], v[4], v[5], v[6], v[7], v[8], v[9]
+    )
+}
+
 /// Held executors' reads of their own held writes logged (diagnostics).
 static HELD_OWN_LOGGED: AtomicU64 = AtomicU64::new(0);
 /// Stretches past label waits stopped because a preparation read what the
@@ -4836,7 +5004,7 @@ pub fn wait_done(seq: u64) {
 /// Queues a batch: `submit` runs (the vkQueueSubmit) under the queue lock so
 /// sequence order is submission order.
 #[allow(clippy::too_many_arguments)]
-fn push_batch(fence: vk::Fence, queries: vk::QueryPool, bq: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, gpu_labels: Vec<(u64, u64, u8)>, ops: [u64; OPS], segs: Vec<SegMark>, reset: Option<SlotReset>, alt: bool, submit: impl FnOnce(u64) -> Option<SubmitSpec> + Send + 'static) -> u64 {
+fn push_batch(fence: vk::Fence, queries: vk::QueryPool, bq: vk::QueryPool, actions: Vec<Action>, checks: Vec<verify::Check>, shaders: Vec<u64>, name: &str, gpu_labels: Vec<(u64, u64, u8)>, ops: [u64; OPS], segs: Vec<SegMark>, reset: Option<SlotReset>, on_c: bool, xq: Option<XqBatch>, submit: impl FnOnce(u64) -> Option<SubmitSpec> + Send + 'static) -> u64 {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         crate::thread::spawn_host("gpu-complete", 1 << 20, Box::new(completion_thread)).expect("gpu completion thread");
@@ -4847,6 +5015,13 @@ fn push_batch(fence: vk::Fence, queries: vk::QueryPool, bq: vk::QueryPool, actio
     if let Some(r) = &reset {
         r.state.store(seq, Ordering::Release);
     }
+    let xwait = xq.map_or(0, |x| xq_queued(seq, x, name));
+    let submit = move |seq| {
+        submit(seq).map(|mut s| {
+            s.xwait = xwait;
+            s
+        })
+    };
     // The submission thread submits in sequence order; inline only while
     // nothing is queued for it (the order holds when the switch changes).
     let mut sq = SUBMIT_Q.lock();
@@ -4861,7 +5036,7 @@ fn push_batch(fence: vk::Fence, queries: vk::QueryPool, bq: vk::QueryPool, actio
         }
         note_submitted(seq);
     }
-    q.push_back(Batch { queries, bq, seq, fence, alt, actions, checks, shaders, submitted: std::time::Instant::now(), name: name.to_string(), gpu_labels, ops, segs, reset });
+    q.push_back(Batch { queries, bq, seq, fence, on_c, actions, checks, shaders, submitted: std::time::Instant::now(), name: name.to_string(), gpu_labels, ops, segs, reset });
     BATCHES_CV.notify_one();
     seq
 }
@@ -4957,7 +5132,8 @@ fn completion_thread() {
             wait_submitted(b.seq);
             let tf = std::time::Instant::now();
             // (Batches submitted together carry one fence, the last's.)
-            let r = if b.alt { unsafe { ctx().device.wait_for_fences(&[b.fence], true, 10_000_000_000) } } else if ctx().wait_batch(b.seq, 10_000_000_000) { Ok(()) } else { Err(vk::Result::TIMEOUT) };
+            let ok = if b.on_c { ctx().wait_batch_c(b.seq, 10_000_000_000) } else { ctx().wait_batch(b.seq, 10_000_000_000) };
+            let r = if ok { Ok(()) } else { Err(vk::Result::TIMEOUT) };
             FENCE_NS.fetch_add(tf.elapsed().as_nanos() as u64, Ordering::Relaxed);
             if let Err(e) = r {
                 if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
@@ -5178,7 +5354,13 @@ fn check_watchdog(queue: &str, shaders: &[u64]) {
 }
 
 struct Slot {
+    /// The command buffer the slot's batch records into: `gcmd` (the main
+    /// family's) or `ccmd` (the compute family's: ordered async compute;
+    /// null without it), and on which the last batch ran.
     cmd: vk::CommandBuffer,
+    gcmd: vk::CommandBuffer,
+    ccmd: vk::CommandBuffer,
+    on_c: bool,
     fence: vk::Fence,
     desc_pool: vk::DescriptorPool,
     /// Sequence number of the slot's last batch (0: none).
@@ -5229,10 +5411,12 @@ struct Slot {
     /// records with the dwords, records of masks) and their sizes (grown
     /// when a batch needs more).
     mm_out: [(vk::Buffer, vk::DeviceMemory, *mut u8, u64); 2],
-    /// The slot's own command pools (its queue's family; the copy queue's,
-    /// null without one), so that a whole slot can be reset at once.
+    /// The slot's own command pools (the main family's; the copy queue's
+    /// and the compute family's, null without them), so that a whole slot
+    /// can be reset at once.
     cpool: vk::CommandPool,
     xcpool: vk::CommandPool,
+    ccpool: vk::CommandPool,
     /// The batch whose completion the completion thread resets the slot
     /// after (`SlotReset`; 0: none or done, u64::MAX: resetting).
     reset_state: std::sync::Arc<AtomicU64>,
@@ -5245,7 +5429,7 @@ struct Slot {
 /// then `state` goes to 0. Resetting them took ~18 us of each batch begin
 /// on the recording threads (profile, 2026-10-15 late night).
 struct SlotReset {
-    pools: [vk::CommandPool; 2],
+    pools: [vk::CommandPool; 3],
     desc_pool: vk::DescriptorPool,
     fence: vk::Fence,
     state: std::sync::Arc<AtomicU64>,
@@ -5297,12 +5481,16 @@ fn slot_mem_line() -> String {
 }
 
 impl Slot {
-    fn new(family: u32, xfamily: Option<u32>) -> Result<Slot, String> {
+    fn new(family: u32, xfamily: Option<u32>, cfamily: Option<u32>) -> Result<Slot, String> {
         let c = ctx();
         let sizes: Vec<vk::DescriptorPoolSize> = POOL_TYPES.iter().zip(&POOL_LIMITS[1..]).map(|(&ty, &n)| vk::DescriptorPoolSize { ty, descriptor_count: n }).collect();
         let make_pool = |f: u32| unsafe { c.device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(f).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).map_err(|e| e.to_string()) };
         let pool = make_pool(family)?;
         let xpool = match xfamily {
+            Some(f) => make_pool(f)?,
+            None => vk::CommandPool::null(),
+        };
+        let cpool = match cfamily {
             Some(f) => make_pool(f)?,
             None => vk::CommandPool::null(),
         };
@@ -5314,6 +5502,11 @@ impl Slot {
             } else {
                 c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(xpool).command_buffer_count(1)).map_err(|e| e.to_string())?[0]
             };
+            let ccmd = if cpool == vk::CommandPool::null() {
+                vk::CommandBuffer::null()
+            } else {
+                c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cpool).command_buffer_count(1)).map_err(|e| e.to_string())?[0]
+            };
             // SGPR data in system memory: a copy in video memory, read by
             // every invocation, made no measurable difference (`tune ring_vram`).
             let (ring, _mem, ring_ptr) = c.host_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER)?;
@@ -5321,6 +5514,9 @@ impl Slot {
             SLOT_MEM[5].fetch_add(RING_SEG, Ordering::Relaxed);
             Ok(Slot {
                 cmd,
+                gcmd: cmd,
+                ccmd,
+                on_c: false,
                 fence: c.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| e.to_string())?,
                 desc_pool: c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(POOL_LIMITS[0]).pool_sizes(&sizes), None).map_err(|e| e.to_string())?,
                 seq: 0,
@@ -5353,6 +5549,7 @@ impl Slot {
                 ts: None,
                 cpool: pool,
                 xcpool: xpool,
+                ccpool: cpool,
                 reset_state: std::sync::Arc::new(AtomicU64::new(0)),
                 reset_pending: false,
             })
@@ -7457,14 +7654,23 @@ pub struct Exec {
     race_name: std::sync::Arc<str>,
     /// Forwarded copies recorded into the batch being recorded (`gpu::forward`).
     forward_ids: Vec<u64>,
-    /// The compute queue id in this executor's name (`gpu-acb<id>`; 0: none)
-    /// and whether the batch being recorded goes to the main family's second
-    /// Vulkan queue (`tune alt_queue`: a timing diagnosis, no ordering
-    /// against the other queue; its batches share no batch-start copies
-    /// unless bit 16 of the switch is set).
+    /// The compute queue id in this executor's name (`gpu-acb<id>`; 0: none,
+    /// a parallel worker's too).
     alt_id: u64,
-    /// Every batch goes to the compute-only family's queue (`vk::alt_compute_id`).
-    on_compute: bool,
+    /// Ordered async compute (`tune async_compute`): a compute queue's
+    /// executor (its parallel workers' too: `gpu-acb*`), whose batches run
+    /// on the compute family's queue (`cfamily`, set up at boot) while the
+    /// switch is at 2; for batches on the main queue, the latest unfinished
+    /// compute batch the one being recorded depends on and why (bits of
+    /// XR_*); whether the batch being recorded holds image-cache work (fast
+    /// clears, block and depth copies), and that the next batch goes to the
+    /// main queue (it records such work).
+    xq_c: bool,
+    cfamily: Option<u32>,
+    xq_dep: u64,
+    xq_why: u32,
+    xq_img: bool,
+    xq_main_once: bool,
     /// A compute queue's command processor records into it (profile
     /// classes).
     compute_cp: bool,
@@ -7474,8 +7680,9 @@ pub struct Exec {
     noting: u64,
     /// A command label is open in the batch's command buffer (`label`).
     label_open: bool,
-    batch_alt: bool,
-    batch_alt_share: bool,
+    /// The batch being recorded goes to the compute family's queue
+    /// (ordered async compute).
+    batch_c: bool,
     /// GPU writes this batch recorded since its last full barrier through
     /// `barrier` (None: more than `SINCE_MAX`): an indirect dispatch whose
     /// arguments none of them writes needs no barrier of its own.
@@ -8009,6 +8216,11 @@ struct Closed {
     /// Its commands as lists (`vk::defer`, a worker's batch with `tune
     /// record_defer` 4 or 8): replayed when it is submitted.
     lists: Option<super::vk::defer::Lists>,
+    /// Ordered async compute: what its recording found (`Exec::xq_dep`,
+    /// `xq_why`, `xq_img`), and whether it runs on the compute family's
+    /// queue (`Exec::batch_c`).
+    xq: (u64, u32, bool),
+    on_c: bool,
 }
 
 /// Slot sequence of a batch closed but not yet submitted.
@@ -8045,14 +8257,20 @@ impl Exec {
     pub fn new(name: &str) -> Result<Exec, String> {
         let c = ctx();
         let alt_id = name.strip_prefix("gpu-acb").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
-        // This queue's batches all go to the compute-only family's queue
-        // (`vk::alt_compute_id`): its command buffers come from that family.
-        let on_compute = alt_id != 0 && super::vk::alt_compute_id() == Some(alt_id) && c.compute.is_some();
-        let family = if on_compute { c.compute.as_ref().map_or(c.queue_family, |q| q.family) } else { c.queue_family };
+        let family = c.queue_family;
+        // A compute queue's executor records from pools of both families
+        // when the compute family's queue exists (ordered async compute).
+        let cfamily = if name.starts_with("gpu-acb") { c.compute.as_ref().map(|q| q.family) } else { None };
         {
             let xfamily = c.copy.as_ref().map(|q| q.family);
-            let slots = vec![Slot::new(family, xfamily)?, Slot::new(family, xfamily)?];
+            let slots = vec![Slot::new(family, xfamily, cfamily)?, Slot::new(family, xfamily, cfamily)?];
             Ok(Exec {
+                xq_c: name.starts_with("gpu-acb"),
+                cfamily,
+                xq_dep: 0,
+                xq_why: 0,
+                xq_img: false,
+                xq_main_once: false,
                 family,
                 xfamily,
                 slots,
@@ -8179,13 +8397,11 @@ impl Exec {
                 race_name: name.into(),
                 forward_ids: Vec::new(),
                 alt_id,
-                on_compute,
                 compute_cp: name.starts_with("gpu-acb"),
                 acb50: name == "gpu-acb0x50",
                 noting: 0,
                 label_open: false,
-                batch_alt: false,
-                batch_alt_share: false,
+                batch_c: false,
                 since_barrier: Some(Vec::new()),
                 since_reads: Some(Vec::new()),
                 since_img_r: Vec::new(),
@@ -8379,7 +8595,7 @@ impl Exec {
                 match next(&free) {
                     Some(k) => self.cur = k,
                     None => {
-                        let made = if n < if self.held { HELD_SLOTS } else { DEFERRED_SLOTS } { Slot::new(self.family, self.xfamily).ok() } else { None };
+                        let made = if n < if self.held { HELD_SLOTS } else { DEFERRED_SLOTS } { Slot::new(self.family, self.xfamily, self.cfamily).ok() } else { None };
                         match made {
                             Some(s) => {
                                 self.slots.push(s);
@@ -8406,7 +8622,7 @@ impl Exec {
                 let t = std::time::Instant::now();
                 // (Whether the GPU had completed the batch already: the wait
                 // is then the completion thread's bookkeeping, `SLOT_LAG`.)
-                let gpu_done = !self.batch_alt && ctx().batch_value() >= slot.seq;
+                let gpu_done = (if slot.on_c { ctx().batch_value_c() } else { ctx().batch_value() }) >= slot.seq;
                 let tw = super::timeline::wait_start();
                 if !wait_done_for(slot.seq, std::time::Duration::from_secs(3)) {
                     crate::warn!("gpu[{}]: waiting > 3 s for a free batch slot (batch {}, done {}; held {}, past {})", self.name, slot.seq, done_seq(), self.held, self.past);
@@ -8458,11 +8674,14 @@ impl Exec {
                 }
             }
             if !reset_done {
-                if done_seq() < slot.seq && !c.wait_batch(slot.seq, 2_000_000_000) {
-                    // Shutdown released the wait: the command buffer may still
-                    // execute (resetting it would lose the device). (A batch of
-                    // the second queue signals its fence, not the timeline.)
-                    unsafe { c.device.wait_for_fences(&[slot.fence], true, 2_000_000_000).ok() };
+                // (Shutdown released the wait: the command buffer may still
+                // execute, and resetting it would lose the device.)
+                if done_seq() < slot.seq {
+                    if slot.on_c {
+                        c.wait_batch_c(slot.seq, 4_000_000_000);
+                    } else {
+                        c.wait_batch(slot.seq, 4_000_000_000);
+                    }
                 }
                 unsafe {
                     c.device.reset_fences(&[slot.fence]).ok();
@@ -8483,6 +8702,19 @@ impl Exec {
             }
         }
         self.extra_used = 0;
+        // Ordered async compute: a compute queue's batch goes to the compute
+        // family's queue while the switch is at 2, unless it records
+        // image-cache work (`xq_image_work`), with the slot's command buffer
+        // of that family.
+        // (Front end 2 only: the old one's shadows, homes and shared copies
+        // assume one queue.)
+        let to_c = self.cfamily.is_some() && super::tune::async_compute() >= 2 && super::fe2::on();
+        self.batch_c = to_c && !std::mem::take(&mut self.xq_main_once);
+        {
+            let s = &mut self.slots[self.cur];
+            s.cmd = if self.batch_c { s.ccmd } else { s.gcmd };
+            s.on_c = self.batch_c;
+        }
         // Deferred recording: this thread's commands for the batch's command
         // buffers (from their begin on) go to lists until the batch closes.
         // (Parallel workers' batches too; never held ones: the graphics CP's
@@ -8537,9 +8769,6 @@ impl Exec {
             unsafe { ctx().device.cmd_write_timestamp(self.cmd(), vk::PipelineStageFlags::BOTTOM_OF_PIPE, bq, BQ_BATCH) };
         }
         self.recording = true;
-        let aq = super::tune::alt_queue();
-        self.batch_alt = self.on_compute || (self.alt_id != 0 && aq & 0xFFFF == self.alt_id && ctx().queue2.is_some());
-        self.batch_alt_share = aq & 0x10000 != 0;
         self.dyncache = Default::default();
         self.begun_at = std::time::Instant::now();
         self.begun_mark = super::timeline::mark();
@@ -8580,7 +8809,7 @@ impl Exec {
     fn slot_reset(&mut self, i: usize) -> Option<SlotReset> {
         let s = &mut self.slots[i];
         s.reset_pending = true;
-        Some(SlotReset { pools: [s.cpool, s.xcpool], desc_pool: s.desc_pool, fence: s.fence, state: s.reset_state.clone() })
+        Some(SlotReset { pools: [s.cpool, s.xcpool, s.ccpool], desc_pool: s.desc_pool, fence: s.fence, state: s.reset_state.clone() })
     }
 
     /// Creates the current slot when the rotation reached one not made yet
@@ -8588,7 +8817,7 @@ impl Exec {
     /// index buffers are kept by the slot their draw records into).
     fn ensure_slot(&mut self) {
         if self.cur == self.slots.len() {
-            match Slot::new(self.family, self.xfamily) {
+            match Slot::new(self.family, self.xfamily, self.cfamily) {
                 Ok(slot) => self.slots.push(slot),
                 Err(e) => {
                     crate::warn!("gpu[{}]: no batch slot {} ({e}); using {}", self.name, self.cur + 1, self.cur);
@@ -8740,7 +8969,8 @@ impl Exec {
             };
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
             let lists = std::mem::take(&mut self.batch_lists).then(super::vk::defer::release);
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists, xq: (self.xq_dep, self.xq_why, self.xq_img), on_c: self.batch_c });
+            (self.xq_dep, self.xq_why, self.xq_img) = (0, 0, false);
             self.res_mine.clear();
             if let Some(b) = self.closed.last_mut() {
                 b.fe2_up = std::mem::take(&mut self.fe2_up);
@@ -8765,7 +8995,7 @@ impl Exec {
         let commands = self.batch_shaders.len();
         let gpu_labels = self.pending_promises.clone();
         note_copy_waits(xpre.is_some(), copy_wait);
-        let alt = self.batch_alt;
+        let on_c = self.batch_c;
         let reset = self.slot_reset(i);
         // Front end 2: the words its uploads touch, before it can run.
         let fe2_ep = super::precache::epoch() as u32;
@@ -8775,7 +9005,8 @@ impl Exec {
             self.fe2_gens = gens;
         }
         let lists = std::mem::take(&mut self.batch_lists).then(super::vk::defer::release);
-        let seq = push_batch(fence, self.slots[i].queries, bq, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, std::mem::take(&mut self.segs), reset, alt, move |seq| {
+        let xq = xq_tracking().then_some(XqBatch { compute: self.xq_c, on_c, acb: acb_id(&self.name), writes: &self.pending, ups: &self.fe2_up, dep: self.xq_dep, why: self.xq_why, images: self.xq_img });
+        let seq = push_batch(fence, self.slots[i].queries, bq, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, std::mem::take(&mut self.segs), reset, on_c, xq, move |seq| {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return None;
             }
@@ -8784,7 +9015,7 @@ impl Exec {
                 l.replay();
             }
             let _ = seq;
-            Some(SubmitSpec { xpre, pre, cmd, wait: copy_wait, fence, alt, name })
+            Some(SubmitSpec { xpre, pre, cmd, wait: copy_wait, on_c, xwait: 0, name })
         });
         super::timeline::end(&self.name, self.begun_mark.take(), || format!("batch #{seq}, {commands} commands ({why})"));
         st.mark(5);
@@ -8794,6 +9025,7 @@ impl Exec {
         if !self.ts_check.is_empty() {
             TS_CHECKS.lock().extend(self.ts_check.drain(..).map(|a| (seq, a)));
         }
+        (self.xq_dep, self.xq_why, self.xq_img) = (0, 0, false);
         self.slots[i].seq = seq;
         self.open_gen.store(u64::MAX, Ordering::SeqCst);
         if !self.fe2_up.is_empty() {
@@ -9644,7 +9876,7 @@ impl Exec {
     /// (FINDINGS.md 2026-10-31 late night).
     fn fe2_share(&self) -> (u64, u32) {
         // (A batch for the second queue is not in the first one's order.)
-        if self.fe2_run.0 != 0 && self.fe2_run.1 <= super::fe2::RUN_CHUNKS && !self.batch_alt {
+        if self.fe2_run.0 != 0 && self.fe2_run.1 <= super::fe2::RUN_CHUNKS {
             self.fe2_run
         } else {
             (0, 0)
@@ -9747,7 +9979,7 @@ impl Exec {
         let rec = if seg { self.wb_count_copy(0) } else { 0 };
         let cmd = self.cmd();
         let written = std::mem::replace(&mut self.fe2_written, (u64::MAX, 0));
-        let recorded = if let Some(pipe) = super::fe2::record_scatter(cmd, Some(written)) {
+        let recorded = if let Some(pipe) = super::fe2::record_scatter(cmd, Some(written), self.batch_c) {
             // The next dispatch binds its own pipeline and descriptors.
             self.dyncache.cs_pipeline = pipe;
             true
@@ -10211,7 +10443,7 @@ impl Exec {
     pub(super) fn pre_copy(&mut self, base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
         let mut clk = PreClock::start();
         // Over `pre_max`: read in place.
-        let shares = self.shares_pre && (!self.batch_alt || self.batch_alt_share);
+        let shares = self.shares_pre && !self.batch_c;
         if size == 0 || size > super::tune::pre_max() || self.pre_failed {
             return None;
         }
@@ -10482,6 +10714,9 @@ impl Exec {
     /// value its metadata gives (known, else read now); `check`: known
     /// values compared with the metadata (`DS_GPU_VERIFY`).
     fn record_fast_clears(&mut self, clears: Vec<super::images::FastClear>, check: bool) {
+        if !clears.is_empty() {
+            self.xq_image_work();
+        }
         for c in clears {
             let v = match c.known {
                 Some(v) => {
@@ -10620,6 +10855,9 @@ impl Exec {
             return;
         }
         let copies = super::images::with(|im| im.take_block_copies(keys));
+        if !copies.is_empty() {
+            self.xq_image_work();
+        }
         if copies.is_empty() {
             return;
         }
@@ -10688,6 +10926,9 @@ impl Exec {
             return;
         }
         let copies = super::images::with(|im| im.take_depth_copies(keys));
+        if !copies.is_empty() {
+            self.xq_image_work();
+        }
         if copies.is_empty() {
             return;
         }
@@ -10859,7 +11100,7 @@ impl Exec {
             }
             Some(self.last_seq)
         } else if self.last_seq > done_seq() {
-            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), [0; OPS], Vec::new(), None, false, |_| None);
+            let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), [0; OPS], Vec::new(), None, false, None, |_| None);
             self.last_seq = seq;
             self.last_action_seq = seq;
             self.cpu_action_seq = seq;
@@ -10917,11 +11158,60 @@ impl Exec {
         if by_cpu {
             self.cpu_dep_seq = self.cpu_dep_seq.max(seq);
         }
+        if xq_tracking() {
+            self.xq_need(seq, XR_PROMISE);
+        }
         // (The timeline: what a schedule over several device queues would
         // have to wait for, `tools/schedmodel.py`.)
         if super::timeline::on() {
             let t = super::timeline::mark();
             super::timeline::end(&self.name, t, || format!("after #{seq}{}", if by_cpu { " (CPU)" } else { "" }));
+        }
+    }
+
+    /// Ordered async compute: the batch being recorded depends on batch
+    /// `seq` for reason `why` (XR_*) when that is an unfinished compute
+    /// batch (on the main queue it waits for it; a batch on the compute
+    /// family's queue follows it there anyway).
+    fn xq_need(&mut self, seq: u64, why: usize) {
+        if seq <= done_seq() || !xq_compute_batch(seq) {
+            return;
+        }
+        self.xq_dep = self.xq_dep.max(seq);
+        self.xq_why |= 1 << why;
+    }
+
+    /// Ordered async compute: a label wait passed on the value `v` in memory
+    /// at `a` (`wide`: 8 bytes), which an unfinished compute batch may have
+    /// stored (it promised that value, or its shaders write the label).
+    pub fn xq_label(&mut self, a: u64, wide: bool, v: u64) {
+        if !xq_tracking() {
+            return;
+        }
+        if let Some(s) = super::cp::promised_writer(a, v, wide) {
+            self.xq_need(s, XR_LABEL);
+        }
+        if let Some(s) = XC_WRITES.latest(&[(a & !3, if wide { 8 } else { 4 })]) {
+            self.xq_need(s, XR_LABEL);
+        }
+    }
+
+    /// Ordered async compute: a compute executor's batch is about to record
+    /// image-cache work (fast clears, block or depth copies; depth clears
+    /// need a graphics queue): on the compute family's queue the batch
+    /// closes, and the one that records it goes to the main queue (after
+    /// that one: `xq_queued`, its compute queue's latest batch there).
+    fn xq_image_work(&mut self) {
+        if !self.xq_c {
+            return;
+        }
+        self.xq_img = true;
+        if self.batch_c && self.recording {
+            XQ_STATS[XS_IMAGE_CLOSES].fetch_add(1, Ordering::Relaxed);
+            self.xq_main_once = true;
+            self.submit_for("image-cache work");
+        } else if !self.recording && self.cfamily.is_some() && super::tune::async_compute() >= 2 {
+            self.xq_main_once = true;
         }
     }
 
@@ -12584,7 +12874,9 @@ impl Exec {
                 self.fe2_gens = gens;
             }
             let lists = b.lists;
-            let seq = push_batch(fence, queries, bq, b.eager_action.into_iter().collect(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, reset, false, move |_| {
+            let on_c = b.on_c;
+            let xq = xq_tracking().then_some(XqBatch { compute: self.xq_c, on_c, acb: acb_id(&self.name), writes: &b.writes, ups: &b.fe2_up, dep: b.xq.0, why: b.xq.1, images: b.xq.2 });
+            let seq = push_batch(fence, queries, bq, b.eager_action.into_iter().collect(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, reset, on_c, xq, move |_| {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
                     return None;
                 }
@@ -12592,7 +12884,7 @@ impl Exec {
                 if let Some(l) = lists {
                     l.replay();
                 }
-                Some(SubmitSpec { xpre: None, pre, cmd, wait: copy_wait, fence, alt: false, name })
+                Some(SubmitSpec { xpre: None, pre, cmd, wait: copy_wait, on_c, xwait: 0, name })
             });
             self.slots[b.slot].seq = seq;
             if !b.fe2_up.is_empty() {
@@ -13072,7 +13364,7 @@ impl Exec {
                     BindingKind::LodStats => bound.bufs.push((b.binding, vk::DescriptorBufferInfo { buffer: fx.lodstats, offset: 0, range: super::lodstats::SLOT_BYTES })),
                     BindingKind::Marks => bound.bufs.push((
                         b.binding,
-                        match super::resident::marks() {
+                        match super::resident::marks_for(self.batch_c) {
                             Some(m) => vk::DescriptorBufferInfo { buffer: m, offset: 0, range: super::resident::MARK_BYTES },
                             None => vk::DescriptorBufferInfo { buffer: fx.dummy, offset: 0, range: DUMMY_BYTES },
                         },
@@ -13523,6 +13815,11 @@ impl Exec {
         }
         lap.mark(17);
         GPU_INDIRECT.fetch_add(1, Ordering::Relaxed);
+        if xq_tracking() {
+            if let Some(s) = XC_WRITES.latest(&r) {
+                self.xq_need(s, XR_INDIRECT);
+            }
+        }
         let t_prog = laps().then(std::time::Instant::now);
         let r = self.dispatch_inner(cp, [1, 1, 1], initiator, Some(args));
         if let Some(t) = t_prog {
@@ -13974,7 +14271,7 @@ impl Exec {
                 // shared copy only when recorded; this chunk's copy in runs
                 // after theirs and must see them (stale counters hung the GPU
                 // at a World 5-1 load, runs 20261013-035334 .. -041906).
-                let shared = if self.deferred || (self.batch_alt && !self.batch_alt_share) { None } else { super::precache::lookup(sh.guest, sh.range) };
+                let shared = if self.deferred || self.batch_c { None } else { super::precache::lookup(sh.guest, sh.range) };
                 match shared {
                     Some((chunk, at, made)) => {
                         self.copy_wait = self.copy_wait.max(made);
@@ -14421,8 +14718,10 @@ impl Drop for Exec {
                     }
                 }
                 c.device.destroy_command_pool(s.cpool, None);
-                if s.xcpool != vk::CommandPool::null() {
-                    c.device.destroy_command_pool(s.xcpool, None);
+                for p in [s.xcpool, s.ccpool] {
+                    if p != vk::CommandPool::null() {
+                        c.device.destroy_command_pool(p, None);
+                    }
                 }
             }
         }
@@ -14494,6 +14793,7 @@ pub fn status() -> String {
         + &super::ahead::status()
         + &super::compile::status()
         + &async_line()
+        + &xq_line()
         + &super::cp::past_wait_status()
         + &held_own_line()
         + &super::forward::status_line()

@@ -1326,6 +1326,16 @@ fn promised(addr: u64, wide: bool, func: u32, mask: u64, reference: u64) -> Opti
     let v = if wide { value } else { value & 0xFFFF_FFFF };
     compare(func, v & mask, reference & mask).then_some((seq, by_cpu, epoch))
 }
+
+/// The unfinished batch whose promised write to `addr` is `v` (the value a
+/// wait read there: the GPU may have stored it already), for ordered async
+/// compute (`Exec::xq_label`).
+pub(super) fn promised_writer(addr: u64, v: u64, wide: bool) -> Option<u64> {
+    let g = PROMISES.lock();
+    let &(seq, value, bytes, _, _, _) = g.as_ref()?.get(&addr)?;
+    let same = if wide { bytes >= 8 && value == v } else { value & 0xFFFF_FFFF == v & 0xFFFF_FFFF };
+    (same && seq > super::exec::completed_seq()).then_some(seq)
+}
 const LABEL_LOG_CAP: usize = 1 << 15;
 
 fn label_event(queue: &str, kind: u8, addr: u64, value: u64, reference: u64, packet: u64) {
@@ -5477,6 +5487,9 @@ impl Cp {
         if compare(func, v0 & mask, reference & mask) {
             self.last_wait_kind = b'I';
             label_event(&self.name, b'I', a, v0, reference, at);
+            if let Some(e) = self.exec.as_mut() {
+                e.xq_label(a, wide, v0);
+            }
             return Flow::Next;
         }
         if let Some((seq, by_cpu, epoch)) = promised(a, wide, func, mask, reference) {
@@ -5500,6 +5513,9 @@ impl Cp {
             MISSED.fetch_add(1, Ordering::Relaxed);
             self.last_wait_kind = b'M';
             label_event(&self.name, b'M', a, v0, reference, at);
+            if let Some(e) = self.exec.as_mut() {
+                e.xq_label(a, wide, v0);
+            }
             return Flow::Next;
         }
         // A value this queue's recording batch writes on the GPU: its later
@@ -5529,6 +5545,9 @@ impl Cp {
             }
             self.last_wait_kind = b'M';
             label_event(&self.name, b'M', a, v0, reference, at);
+            if let Some(e) = self.exec.as_mut() {
+                e.xq_label(a, wide, v0);
+            }
             return Flow::Next;
         }
         // In a replayed frame, a wait the title's CPU released when the frame
@@ -5666,6 +5685,11 @@ impl Cp {
         }
         self.last_wait_kind = kind;
         label_event(&self.name, kind, a, read(), reference, at);
+        if kind != b'P' {
+            if let Some(e) = self.exec.as_mut() {
+                e.xq_label(a, wide, read());
+            }
+        }
         self.last_wait_gpu = kind == b'P' || kind == b'L';
         long_wait(&self.name, a, wide, func, mask, reference, at, t0, kind);
         match r {
