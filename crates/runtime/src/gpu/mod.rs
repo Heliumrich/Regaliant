@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 228] = [
+    static ALL: [Tunable; 227] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -250,7 +250,6 @@ pub mod tune {
         Tunable { name: "ts_cpw_waited", env: "DS_TS_CPW_WAITED", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "early_auto", env: "DS_EARLY_AUTO", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "write_marks", env: "DS_WRITE_MARKS", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "fe2_cpw_defer", env: "DS_FE2_CPW_DEFER", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "lod_late", env: "DS_LOD_LATE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lod_skip", env: "DS_LOD_SKIP", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "gpu_detile", env: "DS_GPU_DETILE", default: 8, value: AtomicU64::new(UNSET) },
@@ -2368,27 +2367,13 @@ pub mod tune {
         get(216) != 0
     }
 
-    /// Front end 2 (opt-in: +1.2% at the vista, tour, walks and ten forced
-    /// reloads clean, but the same deferral of every CP write the GPU
-    /// performs deadlocked a boot, FINDINGS.md 2026-10-30 morning, and why
-    /// is not known): a CP write the GPU performs that would need a
-    /// write-back first (a label no CP of ours waits on, after GPU work
-    /// that wrote the mirror) goes into the mirror in place and into guest
-    /// memory at the batch's close, after its one write-back, with the
-    /// batch's later CP writes in order (`Exec::gpu_cp_write`): title
-    /// threads see such labels when the batch's work is done and back in
-    /// guest memory, as if the GPU were slower.
-    pub fn fe2_cpw_defer() -> bool {
-        get(217) != 0
-    }
-
     /// The mirror's backing granule in pages of 64 KiB (a power of two; 0,
     /// the default: 16 with a device-local heap of 16 GiB or more, else 1):
     /// a binding's first use backs the aligned granule around it, in one
     /// bind with whatever other threads claimed meanwhile
     /// (`resident::back_in`).
     pub fn fe2_back_granule() -> u64 {
-        get(227)
+        get(226)
     }
 
     /// LOD statistics of pixel programs whose depth tests stay after the
@@ -2402,7 +2387,7 @@ pub mod tune {
     /// measurements; 0 (diagnosis): none measures, so the title's texture
     /// streaming lacks those textures' statistics.
     pub fn lod_late() -> u64 {
-        get(218)
+        get(217)
     }
 
     /// With `lod_late` 1: draws binding no texture whose T# enables
@@ -2411,7 +2396,7 @@ pub mod tune {
     /// at 1-3, -2.1% of a replayed frame's GPU time, FINDINGS.md
     /// 2026-10-30 midday); 0: every draw keeps them (the reference).
     pub fn lod_skip() -> bool {
-        get(219) != 0
+        get(218) != 0
     }
 
     /// Front end 2 stage F4's first step: uploads of 2D and array textures
@@ -2428,7 +2413,7 @@ pub mod tune {
     /// 8 since 2026-10-30 (Castlewall's arrival and the 1-1 walks, FINDINGS.md
     /// 2026-10-30 evening); 0: all detiled on the CPU.
     pub fn gpu_detile() -> u64 {
-        get(220)
+        get(219)
     }
 
     /// Texture uploads detiled on the CPU (those under `gpu_detile`'s size)
@@ -2437,7 +2422,7 @@ pub mod tune {
     /// once the copy is done (`images`; staging freed at its fence). 0: each
     /// waits for its transfer on the main queue (`upload_async` aside).
     pub fn upload_copy() -> bool {
-        get(221) != 0
+        get(220) != 0
     }
 
     /// Timing only at 0 (GPU writes then never reach guest memory; replays
@@ -2447,7 +2432,7 @@ pub mod tune {
     /// what the marks cost (diagnosis, 2026-10-31). Read when a stage is
     /// prepared.
     pub fn mark_touch() -> bool {
-        get(222) != 0
+        get(221) != 0
     }
 
     /// Front end 2: translations set their stores' pages' touched bits
@@ -2456,7 +2441,7 @@ pub mod tune {
     /// bits of its executor's written ranges first (`kernels::mirror_compact`,
     /// from the first such translation on). Read when a stage is prepared.
     pub fn touch_bits() -> bool {
-        get(223) != 0
+        get(222) != 0
     }
 
     /// Texture uploads detiled on the CPU that waited for their transfer on
@@ -2467,7 +2452,7 @@ pub mod tune {
     /// 24% less hitch time, level loads' hitches lower, content drawn
     /// sooner; FINDINGS.md); 0 waits for each transfer as before.
     pub fn upload_batch() -> bool {
-        get(224) != 0
+        get(223) != 0
     }
 
     /// Batches recorded into lists that the submission thread replays into
@@ -2479,7 +2464,7 @@ pub mod tune {
     /// -6.6%, +1% at the vista, Castlewall +2%; 2 lost 1.2% in replays:
     /// FINDINGS.md).
     pub fn record_defer() -> u64 {
-        get(225)
+        get(224)
     }
 
     /// A large zero fill under front end 2 stores into guest memory only
@@ -2490,7 +2475,7 @@ pub mod tune {
     /// vista frame, in front of a label). Live; default 1 since 2026-10-31
     /// (the vista +3%, GPU busy -1.8 ms a frame; tour clean: FINDINGS.md).
     pub fn fill_partial() -> bool {
-        get(226) != 0
+        get(225) != 0
     }
 
 

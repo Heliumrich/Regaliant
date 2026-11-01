@@ -4189,8 +4189,8 @@ pub(super) const OP_PASS_ENDS: usize = 11;
 /// GPU performs, at a batch's close, of those with no label write promised
 /// and no completion action, before CP writes of labels a CP of ours waits
 /// on, left to the batch's close (`tune fe2_cpw_close`, `fe2_cpw_waited`),
-/// CP writes whose guest-memory copy waited for the close (`tune
-/// fe2_cpw_defer`)].
+/// unused (CP writes whose guest-memory copy waited for the close, `tune
+/// fe2_cpw_defer`, removed on 2026-11-01)].
 pub static SCATTER_SITES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// Batch closes by their uploads into the mirror (stage F5's census: a lazy
 /// write-back must come before an upload of a page with GPU-written words
@@ -7439,9 +7439,6 @@ pub struct Exec {
     /// (`fe2::record_scatter`, `tune touch_bits`): start, end (start above
     /// end: none).
     fe2_written: (u64, u64),
-    /// Guest-memory copies of GPU-performed CP writes left for the batch's
-    /// close, in order (`tune fe2_cpw_defer`): import, offset, bytes.
-    fe2_host_later: Vec<(vk::Buffer, u64, Vec<u8>, u64)>,
     fe2_gens: Vec<u32>,
     /// Runs the batch's bindings left to check at its close
     /// (`fe2::resolve`), and their pages (the batch's own meanwhile).
@@ -8372,7 +8369,6 @@ impl Exec {
                 fe2_claimed: Vec::new(),
                 fe2_marked: false,
                 fe2_written: (u64::MAX, 0),
-                fe2_host_later: Vec::new(),
                 fe2_gens: Vec::new(),
                 fe2_pend: Vec::new(),
                 fe2_pend_set: Default::default(),
@@ -8991,11 +8987,6 @@ impl Exec {
             }
             self.fe2_scatter();
         }
-        // The guest-memory copies of CP writes left for the close (`tune
-        // fe2_cpw_defer`): after the write-back and the timestamps, in order.
-        if !self.fe2_host_later.is_empty() {
-            self.record_host_later();
-        }
         if !self.fe2_pend.is_empty() {
             self.fe2_resolve();
         }
@@ -9272,10 +9263,6 @@ impl Exec {
         unsafe { ctx().device.end_command_buffer(self.cmd()).ok() };
         self.actions.clear();
         self.gpu_writes_open = false;
-        if !self.fe2_host_later.is_empty() && !super::shutting_down() {
-            crate::warn!("gpu[{}]: batch discarded with {} CP writes' guest copies left for its close", self.name, self.fe2_host_later.len());
-        }
-        self.fe2_host_later.clear();
         self.checks.clear();
         self.race_pending.clear();
         if super::tune::race_checks() {
@@ -10177,42 +10164,15 @@ impl Exec {
     /// and what it holds for its close.
     pub fn wait_report(&self) -> String {
         format!(
-            "recording {}, held {}, past {}, guest copies for the close {}, promises {}, held promises {}, submit after #{}, last #{}",
+            "recording {}, held {}, past {}, promises {}, held promises {}, submit after #{}, last #{}",
             self.recording,
             self.held,
             self.past,
-            self.fe2_host_later.len(),
             self.pending_promises.len(),
             self.held_promises.len(),
             self.submit_after,
             self.last_seq
         )
-    }
-
-    /// Records the guest-memory copies of CP writes left for the batch's
-    /// close (`tune fe2_cpw_defer`), after all its work.
-    fn record_host_later(&mut self) {
-        let later = std::mem::take(&mut self.fe2_host_later);
-        let cmd = self.cmd();
-        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-        unsafe {
-            ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
-            for (buf, off, raw, a) in &later {
-                // Through the import over the address now: the one the write
-                // saw can be replaced before the close (20 times in a boot
-                // on the label pages at 0x1016fff000, FINDINGS.md
-                // 2026-10-30 morning), and a copy into it never reaches the
-                // guest's pages.
-                let (b, o) = match span(*a, raw.len() as u64) {
-                    Some((nb, st, _)) => (nb, a - st),
-                    None => {
-                        crate::warn!("gpu[{}]: a CP write's guest copy at {a:#x}: no import at the batch's close (written through the one it saw)", self.name);
-                        (*buf, *off)
-                    }
-                };
-                ctx().device.cmd_update_buffer(cmd, b, o, raw);
-            }
-        }
     }
 
     /// Front end 2's write-back, recorded now (outside a render pass): the
@@ -12208,28 +12168,16 @@ impl Exec {
                 crate::info!("gpu[{}]: a CP write at {a:#x} ({} bytes, value {:#x}; {}, {}) right after a fill of {fb:#x}+{fl:#x}, {} commands into its batch", self.name, bytes, data.first().copied().unwrap_or(0), if end_of_pipe { "end of pipe" } else { "write data" }, if waited { "a label our CPs wait on" } else { "no CP of ours waits on it" }, at);
             }
         }
-        // Front end 2 (`tune fe2_cpw_defer`): a write that would need a
-        // write-back first (a label no CP of ours waits on, after GPU work
-        // that wrote the mirror) goes into the mirror here and into guest
-        // memory at the batch's close, after its write-back, and so do the
-        // batch's later ones (title threads see labels in order): a title
-        // thread sees it once all the batch's work is back in guest memory,
-        // as if the GPU were slower, and GPU work reads it in the mirror
-        // (only with that copy).
         let fe2_mirror = if super::fe2::on() && super::fe2::in_span(a, bytes) && super::resident::back(a & !4095, (a + bytes).next_multiple_of(4096) - (a & !4095)).is_ok() {
             super::fe2::note_cp_mirror();
             super::resident::mirror_buffer().map(|(m, _)| (m, a - super::resident::MIRROR_BASE))
         } else {
             None
         };
-        // (Every one with a mirror copy deferred, so that the batch's
-        // end-of-pipe timestamps are stored once, deadlocked two of five
-        // boots: the graphics CP's self-drain waits, after their batch had
-        // completed and its promise was gone, found the label rewritten,
-        // FINDINGS.md 2026-10-30 morning.)
-        let would_scatter = self.fe2_marked && !(super::tune::fe2_cpw_close() || (waited && super::tune::fe2_cpw_waited()));
-        let host_later = super::tune::fe2_cpw_defer() && fe2_mirror.is_some() && (would_scatter || !self.fe2_host_later.is_empty());
-        if !(waited && super::tune::ts_cpw_waited()) && !host_later {
+        // (Their guest-memory copies left for the batch's close, `tune
+        // fe2_cpw_defer`, were level at the vista and in a wider form
+        // deadlocked boots: FINDINGS.md 2026-10-30 morning and 2026-10-31.)
+        if !(waited && super::tune::ts_cpw_waited()) {
             self.resolve_timestamps();
         }
         // Front end 2: what earlier work wrote into the mirror reaches guest
@@ -12245,17 +12193,13 @@ impl Exec {
             }
             if super::tune::fe2_cpw_close() || (waited && super::tune::fe2_cpw_waited()) {
                 SCATTER_SITES[4].fetch_add(1, Ordering::Relaxed);
-            } else if !host_later {
+            } else {
                 SCATTER_SITES[0].fetch_add(1, Ordering::Relaxed);
                 after_scatter = self.fe2_scatter();
             }
         }
         let cmd = self.cmd();
         let raw: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
-        if host_later {
-            SCATTER_SITES[5].fetch_add(1, Ordering::Relaxed);
-            self.fe2_host_later.push((buffer, a - start, raw.clone(), a));
-        }
         let to_mirror = |cmd: vk::CommandBuffer| {
             if let Some((m, off)) = fe2_mirror {
                 unsafe { ctx().device.cmd_update_buffer(cmd, m, off, &raw) };
@@ -12277,13 +12221,11 @@ impl Exec {
                 } else if after_scatter {
                     EOP_LIGHT[3].fetch_add(1, Ordering::Relaxed);
                 }
-                if !host_later {
-                    ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw);
-                }
+                ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw);
                 to_mirror(cmd);
                 // Diagnosis (`tune skip_copies` 1024, timing only): written
                 // twice, with a barrier between (what one more costs).
-                if super::tune::skip_copies() & 1024 != 0 && !host_later {
+                if super::tune::skip_copies() & 1024 != 0 {
                     ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
                     ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw);
                 }
@@ -12292,9 +12234,7 @@ impl Exec {
             EOP_LIGHT[0].fetch_add(1, Ordering::Relaxed);
         } else if super::tune::skip_barriers() & 4 != 0 {
             self.ops[OP_CP_WRITES] += 1;
-            if !host_later {
-                unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
-            }
+            unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
             to_mirror(cmd);
         } else {
             // (Right after front end 2's write-back none: see above.)
@@ -12306,9 +12246,7 @@ impl Exec {
             // Counted between its barriers (`seg_stamps` names the segment
             // by it).
             self.ops[OP_CP_WRITES] += 1;
-            if !host_later {
-                unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
-            }
+            unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
             to_mirror(cmd);
             self.barrier();
             self.barrier_wanted = false;
