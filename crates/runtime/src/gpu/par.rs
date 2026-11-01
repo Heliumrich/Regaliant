@@ -17,11 +17,10 @@
 //! par_split`: chunks per recorder). A command the worker cannot record
 //! without flushing or waiting for its own unsubmitted work stops the chunk
 //! there; the main command processor executes the rest of that chunk itself
-//! and then gives the next chunk its turn. With `tune par_park` a worker
-//! whose long-run chunk is recorded before its turn parks it in its recorder
-//! (a command processor with its own executor, `Recorder`) and records the
-//! next chunk into a spare one; the thread that gives the parked chunk its
-//! turn commits it (`commit_parked`).
+//! and then gives the next chunk its turn. (Long runs through the title's
+//! GPU-side synchronization, `tune long_runs`, chained, parked and sealed
+//! work and runs past label waits were level and are removed: FINDINGS.md
+//! 2026-11-01.)
 
 use super::cp::{ChunkState, Cp};
 use parking_lot::{Condvar, Mutex};
@@ -150,11 +149,6 @@ pub struct Run {
     main_submitted: Arc<AtomicBool>,
     /// The workers time each command (`tune par_cost`).
     pub timed: bool,
-    /// A long run's own state (`tune long_runs`; None: an ordinary run).
-    long: Option<Long>,
-    /// A long run planned right after this one (`chain`): its first chunk's
-    /// turn comes when this run's last chunk is posted.
-    chained: Mutex<Option<Arc<Run>>>,
     /// Front end 2: the command processor's view when it planned the run
     /// (`fe2::gfx_views`; NO_VIEW: the epoch now).
     pub fe2_view: u32,
@@ -162,151 +156,6 @@ pub struct Run {
     /// fe2_share`): the main command processor's own part before the
     /// workers' chunks is part 0, chunk i part i + 1.
     pub id: u64,
-    /// Chunks recorded before their turn (`tune par_park`), by index.
-    parked: Mutex<Vec<Option<Parked>>>,
-    /// Planned where the graphics CP went past a label wait (`tune
-    /// wait_runs`): its chunks are recorded as the stretch's work and
-    /// parked until the label passes; then what other queues wrote
-    /// meanwhile and the epoch the label needs (`set_stretch`), which each
-    /// chunk is checked against at its turn.
-    pub stretch: bool,
-    stretch_check: Mutex<Option<(Arc<super::ranges::Ranges>, u32)>>,
-}
-
-/// A recorder of chunks: a command processor with its own executor. A
-/// worker records into its own one, and with `tune par_park` into a spare
-/// while the other holds a parked chunk.
-struct Recorder {
-    cp: Mutex<Cp>,
-    /// It holds a chunk recorded before its turn (`Parked`).
-    parked: AtomicBool,
-}
-
-/// Recorders a worker has at most (its own and spares).
-const RECORDERS: usize = 2;
-
-/// A long run's chunk recorded before its turn (`tune par_park`): its
-/// recorder keeps its batches and notes until the thread that gives it its
-/// turn commits it (`commit_parked`).
-struct Parked {
-    rec: Arc<Recorder>,
-    /// Its worker's word bumped when one of its recorders is free again.
-    freed: Arc<AtomicU64>,
-    from: u64,
-    to: u64,
-    stopped: Option<u64>,
-    failed: bool,
-    /// Its start state.
-    state: Box<ChunkState>,
-}
-
-/// A parked chunk's recorder is free again (its chunk committed or
-/// discarded): its worker may record into it.
-fn release(rec: &Recorder, freed: &Arc<AtomicU64>) {
-    rec.parked.store(false, Ordering::Release);
-    freed.fetch_add(1, Ordering::AcqRel);
-    unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll(Arc::as_ptr(freed) as *const core::ffi::c_void) };
-}
-
-/// Parked chunks (`tune par_park`): [parked, committed by the thread that
-/// gave them their turn, waits of a worker for a free recorder, spare
-/// recorders made].
-pub static PARKS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-
-/// A long parallel run (`tune long_runs`, RENDERER.md "Long parallel
-/// runs"): its chunks pass the title's GPU-side synchronization, so each is
-/// recorded held (`Cp::long_begin`) and checked at its turn against what the
-/// run's part before it writes.
-struct Long {
-    /// Each worker chunk's predicted labels: the run's last write to each
-    /// label before the chunk (address -> value, bytes; 0 bytes: a
-    /// timestamp).
-    labels: Vec<std::collections::HashMap<u64, (u64, u8)>>,
-    /// What the run before the chunk whose turn it is writes: the main
-    /// command processor's batch when the run was planned, then each
-    /// submitted chunk's and what the main command processor records of the
-    /// run (`add_writes`); in the second, those writes but for the planner's
-    /// copies (`forward::plan`).
-    writes: Arc<Mutex<(super::ranges::Ranges, super::ranges::Ranges, super::ranges::Ranges)>>,
-    /// Each worker chunk's copies forwarded before it (`forward::inherited`)
-    /// and all the run's planned copies (packet -> words).
-    inherited: Vec<Vec<super::forward::Planned>>,
-    planned: Arc<std::collections::HashMap<u64, Arc<[u32]>>>,
-    /// A chunk computed a planned copy otherwise: the later chunks were given
-    /// wrong words (each is recorded again).
-    bad: AtomicBool,
-}
-
-/// Long runs (`tune long_runs`): [runs, commands in them, chunks
-/// committed, dropped at their turn, stopped early, chained after another].
-pub static LONG: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
-static LONG_DROPS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
-static LONG_STOPS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
-
-fn bump(l: &Mutex<Vec<(&'static str, u64)>>, w: &'static str) {
-    let mut g = l.lock();
-    match g.iter_mut().find(|e| e.0 == w) {
-        Some(e) => e.1 += 1,
-        None => g.push((w, 1)),
-    }
-}
-
-/// `DS_TRACE_LONG_DROPS=<flip>`: the first 60 chunks of long runs dropped at
-/// their turn from that flip on, with the read that conflicted.
-fn trace_long_drops() -> bool {
-    static FROM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    FROM.get_or_init(|| std::env::var("DS_TRACE_LONG_DROPS").ok().and_then(|v| v.parse().ok())).is_some_and(|f| super::FRAMES.load(Ordering::Relaxed) >= f)
-}
-
-/// Status line of long runs ("" before any).
-pub fn long_line() -> String {
-    let v: Vec<u64> = LONG.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    if v[0] == 0 {
-        return String::new();
-    }
-    let list = |l: &Mutex<Vec<(&'static str, u64)>>| {
-        let mut g = l.lock().clone();
-        g.sort_by(|a, b| b.1.cmp(&a.1));
-        g.iter().map(|(w, n)| format!("{w} {n}")).collect::<Vec<_>>().join(", ")
-    };
-    let cw: Vec<u64> = super::cp::CHAIN_WHY.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    format!(
-        "    long parallel runs (chain_next: not long {}, recorded past {}, held work {}, clears pending {}, planned {}, no run {}, not workers' alone {}): {} runs ({} commands, {:.0} each), chunks committed {}, dropped at their turn {} ({}), stopped early {} ({}); {} chained after the run before; parked before their turn {} ({} committed by the thread giving it, waits for a free recorder {}, spare recorders {}); chained across the planner's sealed work {} (not sealed {}), sealed work committed while recording {}, at settling {}, dropped {}\n",
-        cw[0],
-        cw[1],
-        cw[2],
-        cw[3],
-        cw[4],
-        cw[5],
-        cw[6],
-        v[0],
-        v[1],
-        v[1] as f64 / v[0] as f64,
-        v[2],
-        v[3],
-        list(&LONG_DROPS),
-        v[4],
-        list(&LONG_STOPS),
-        v[5],
-        PARKS[0].load(Ordering::Relaxed),
-        PARKS[1].load(Ordering::Relaxed),
-        PARKS[2].load(Ordering::Relaxed),
-        PARKS[3].load(Ordering::Relaxed),
-        super::cp::SEALS[0].load(Ordering::Relaxed),
-        super::cp::SEALS[1].load(Ordering::Relaxed),
-        super::cp::SEALS[2].load(Ordering::Relaxed),
-        super::cp::SEALS[3].load(Ordering::Relaxed),
-        super::cp::SEALS[4].load(Ordering::Relaxed)
-    )
-}
-
-/// Clears the long runs' statistics (`profile reset`).
-pub fn long_reset() {
-    for c in LONG.iter().chain(PARKS[..3].iter()).chain(super::cp::SEALS.iter()) {
-        c.store(0, Ordering::Relaxed);
-    }
-    LONG_DROPS.lock().clear();
-    LONG_STOPS.lock().clear();
 }
 
 /// Run ids (`Run::id`; 0: none).
@@ -330,69 +179,8 @@ impl Run {
             main_writes,
             main_submitted,
             timed: false,
-            long: None,
-            chained: Mutex::new(None),
             fe2_view: super::fe2::NO_VIEW,
             id: RUN_IDS.fetch_add(1, Ordering::Relaxed),
-            parked: Mutex::new((0..n).map(|_| None).collect()),
-            stretch: false,
-            stretch_check: Mutex::new(None),
-        }
-    }
-
-    /// `next` follows this run directly (nothing recorded between them):
-    /// its first chunk's turn comes after this run's last chunk, from that
-    /// chunk's worker, or now when it is posted already.
-    pub fn chain(&self, next: &Arc<Run>) {
-        let mut g = self.chained.lock();
-        *g = Some(next.clone());
-        if self.turn.load(Ordering::Acquire) > self.chunks.len() {
-            next.grant(0);
-        }
-    }
-
-    /// The write log its chunks are checked against (a long run's; a run
-    /// chained after it shares it, `set_long`).
-    pub fn long_writes(&self) -> Option<Arc<Mutex<(super::ranges::Ranges, super::ranges::Ranges, super::ranges::Ranges)>>> {
-        self.long.as_ref().map(|l| l.writes.clone())
-    }
-
-    /// Makes it a long run: each worker chunk's predicted labels, and what
-    /// the main command processor's batch writes when it was planned.
-    pub fn set_long(&mut self, labels: Vec<std::collections::HashMap<u64, (u64, u8)>>, writes: super::ranges::Ranges, inherited: Vec<Vec<super::forward::Planned>>, planned: Arc<std::collections::HashMap<u64, Arc<[u32]>>>, shared: Option<Arc<Mutex<(super::ranges::Ranges, super::ranges::Ranges, super::ranges::Ranges)>>>) {
-        // A chained run shares its predecessor's log (its chunks come after
-        // all of that run's).
-        let writes = match shared {
-            Some(s) => {
-                s.lock().0.extend(&writes);
-                s
-            }
-            // (What came before an unchained run: its third log too, for
-            // reads of forwarded copies made before the run.)
-            None => Arc::new(Mutex::new((writes.clone(), Default::default(), writes))),
-        };
-        self.long = Some(Long { labels, writes, inherited, planned, bad: AtomicBool::new(false) });
-    }
-
-    /// A long run (`set_long`).
-    /// The label a run planned past it waits for passed (`tune wait_runs`):
-    /// what other queues wrote while the stretch recorded and the epoch the
-    /// label needs, for its chunks' checks at their turn.
-    pub fn set_stretch(&self, writes: Arc<super::ranges::Ranges>, need: u32) {
-        *self.stretch_check.lock() = Some((writes, need));
-    }
-
-    pub fn is_long(&self) -> bool {
-        self.long.is_some()
-    }
-
-    /// The main command processor's part of a long run writes `w` (before
-    /// it gives the first chunk its turn).
-    pub fn add_writes(&self, w: &super::ranges::Ranges) {
-        if let Some(l) = &self.long {
-            let mut g = l.writes.lock();
-            g.0.extend(w);
-            g.1.extend(w);
         }
     }
 
@@ -424,46 +212,11 @@ impl Run {
     }
 
     /// Chunk `i` may submit (the main command processor's work before it went
-    /// to the GPU); parked, it is committed here.
+    /// to the GPU).
     pub fn grant(&self, i: usize) {
         if self.turn.fetch_max(i + 1, Ordering::AcqRel) <= i {
             self.notify();
         }
-        commit_parked(self, i);
-    }
-
-    /// Parks chunk `i`, recorded before its turn, unless the turn came or the
-    /// run was cancelled meanwhile: then it is given back to be committed by
-    /// its worker. (Checked under the lock the thread giving the turn takes
-    /// it out under, after giving it: one of them commits it.)
-    fn park(&self, i: usize, p: Parked) -> Option<Parked> {
-        let mut g = self.parked.lock();
-        if self.turn.load(Ordering::Acquire) > i || self.cancelled.load(Ordering::Acquire) {
-            return Some(p);
-        }
-        p.rec.parked.store(true, Ordering::Release);
-        g[i] = Some(p);
-        PARKS[0].fetch_add(1, Ordering::Relaxed);
-        None
-    }
-
-    /// Whether every chunk was posted.
-    pub fn all_posted(&self) -> bool {
-        self.posted.load(Ordering::Acquire) >= self.chunks.len()
-    }
-
-    /// Every chunk posted, none collected yet: whether one stopped early
-    /// (None: not all posted).
-    pub fn posted_stop(&self) -> Option<bool> {
-        if !self.all_posted() {
-            return None;
-        }
-        Some(self.results.lock().iter().any(|d| d.as_ref().is_some_and(|d| d.stopped.is_some())))
-    }
-
-    /// The parked chunk `i`, taken out to be committed (None: not parked).
-    fn take_parked(&self, i: usize) -> Option<Parked> {
-        self.parked.lock().get_mut(i).and_then(|p| p.take())
     }
 
     /// Waits for chunk `i` to be posted: it and how long the wait took (ns).
@@ -486,18 +239,14 @@ impl Run {
             while !ready() {
                 if self.cv.wait_for(&mut g, std::time::Duration::from_secs(3)).timed_out() && !logged && !ready() {
                     logged = true;
-                    let parked: Vec<usize> = self.parked.lock().iter().enumerate().filter(|(_, p)| p.is_some()).map(|(k, _)| k).collect();
                     crate::warn!(
-                        "gpu: waiting > 3 s for chunk {i} of a {} run of {} chunks: posted {}, turn {}, taken {}, workers on it {}, cancelled {}, parked {:?}, chained after it {}",
-                        if self.long.is_some() { "long" } else { "parallel" },
+                        "gpu: waiting > 3 s for chunk {i} of a parallel run of {} chunks: posted {}, turn {}, taken {}, workers on it {}, cancelled {}",
                         self.chunks.len(),
                         self.posted.load(Ordering::Acquire),
                         self.turn.load(Ordering::Acquire),
                         self.next.load(Ordering::Acquire),
                         self.active.load(Ordering::Acquire),
-                        self.cancelled.load(Ordering::Acquire),
-                        parked,
-                        self.chained.lock().is_some()
+                        self.cancelled.load(Ordering::Acquire)
                     );
                 }
             }
@@ -513,16 +262,6 @@ impl Run {
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
         self.notify();
-        // Chunks parked before their turn: discarded (none of them gets one
-        // now; one whose turn came before the cancel is committed), before
-        // the wait for the workers, which may wait for their recorders. (No
-        // chunk is parked once the run is cancelled: `park`.)
-        let parked: Vec<(usize, Parked)> = self.parked.lock().iter_mut().enumerate().filter_map(|(i, p)| p.take().map(|p| (i, p))).collect();
-        for (i, p) in parked {
-            let Parked { rec, freed, from, to, stopped, failed, state } = p;
-            commit(self, i, rec.cp.lock(), from, to, stopped, failed, state);
-            release(&rec, &freed);
-        }
         let t = std::time::Instant::now();
         let mut logged = false;
         while self.active.load(Ordering::SeqCst) != 0 {
@@ -546,19 +285,10 @@ impl Run {
 }
 
 pub struct Worker {
-    /// The worker's recorders (each locked by the thread recording or
-    /// committing a chunk in it): its own first, spares after it (`tune
-    /// par_park`).
-    recs: Mutex<Vec<Arc<Recorder>>>,
-    /// Bumped when one of its recorders is free again (a parked chunk
-    /// committed): a worker without a free one waits on it.
-    freed: Arc<AtomicU64>,
-    /// Its name and kind (a spare recorder is made like its own).
-    name: String,
-    compute: bool,
-    /// The run to take chunks of, and whether there is one (what a spinning
-    /// worker looks at).
-    /// Runs given it, taken in order (chained runs follow each other).
+    /// The command processor it records chunks with (its own executor).
+    cp: Mutex<Cp>,
+    /// Runs given it, taken in order, and whether there is one (what a
+    /// spinning worker looks at).
     job: Mutex<std::collections::VecDeque<Arc<Run>>>,
     has_job: AtomicBool,
     /// Its pool's wake word (`Pool::wake`): an idle worker sleeps on it.
@@ -721,8 +451,7 @@ impl Pool {
                 crate::warn!("gpu[{wname}]: no executor for a parallel worker ({e})");
                 return None;
             }
-            let rec = Arc::new(Recorder { cp: Mutex::new(cp), parked: AtomicBool::new(false) });
-            let w = Arc::new(Worker { recs: Mutex::new(vec![rec]), freed: Arc::new(AtomicU64::new(0)), name: wname.clone(), compute, job: Mutex::new(Default::default()), has_job: AtomicBool::new(false), wake: self.wake.clone(), pre: self.pre.clone() });
+            let w = Arc::new(Worker { cp: Mutex::new(cp), job: Mutex::new(Default::default()), has_job: AtomicBool::new(false), wake: self.wake.clone(), pre: self.pre.clone() });
             let w2 = w.clone();
             let tname = wname.clone();
             let r = crate::thread::spawn_host(
@@ -802,8 +531,7 @@ fn run_worker(w: &Worker, name: &str) {
         };
         // (Counted on the run from here: a cancel waits for the workers
         // recording or committing its chunks, not for those given it that
-        // are still busy with earlier runs, which may wait for recorders
-        // only the canceller's later work frees.)
+        // are still busy with earlier runs.)
         run.active.fetch_add(1, Ordering::SeqCst);
         take_chunks(w, &run, name);
         run.leave();
@@ -811,9 +539,7 @@ fn run_worker(w: &Worker, name: &str) {
 }
 
 /// Records, submits and posts chunks of `run` until none is left or the run
-/// is cancelled. With `tune par_park` a long run's chunk recorded before its
-/// turn is parked in its recorder (`Run::park`) and the worker goes on into
-/// another; the thread that gives it its turn commits it.
+/// is cancelled.
 fn take_chunks(w: &Worker, run: &Run, name: &str) {
     let mut first = true;
     let lap = |k: usize, t: &mut std::time::Instant| {
@@ -821,17 +547,8 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         PHASE_NS[k].fetch_add((now - *t).as_nanos() as u64, Ordering::Relaxed);
         *t = now;
     };
-    let long = run.long.as_ref();
-    // (A run planned past a label wait waits for the label: parked.)
-    let park = long.is_some() && (super::tune::par_park() || run.stretch);
     loop {
         if run.cancelled.load(Ordering::SeqCst) {
-            return;
-        }
-        // (A recorder before a chunk: a worker waiting for one holds none,
-        // so the earliest chunk not committed is always being recorded.)
-        let Some(rec) = w.recorder(run) else { return };
-        if run.cancelled.load(Ordering::Acquire) {
             return;
         }
         let i = run.next.fetch_add(1, Ordering::AcqRel);
@@ -843,16 +560,12 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
             PHASE_NS[0].fetch_add((t - run.born).as_nanos() as u64, Ordering::Relaxed);
             STARTS.fetch_add(1, Ordering::Relaxed);
         }
-        let mut cp = rec.cp.lock();
+        let mut cp = w.cp.lock();
         cp.set_chunk_state(&state);
         cp.fe2_set_view(run.fe2_view);
         cp.fe2_set_run(run.id, i + 1);
-        cp.stretch_set(run.stretch);
         cp.chunk_start(&run.main_writes, &run.main_submitted);
         cp.chunk_costs = run.timed.then(|| Vec::with_capacity(512));
-        if let Some(l) = long {
-            cp.long_begin(l.labels.get(i).cloned().unwrap_or_default(), l.inherited.get(i).map_or(&[][..], |v| &v[..]), l.planned.clone());
-        }
         lap(1, &mut t);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cp.run_chunk(from, to)));
         let failed = r.is_err();
@@ -860,222 +573,57 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         lap(2, &mut t);
         cp.chunk_finish();
         cp.fe2_set_run(0, 0);
-        if long.is_some() {
-            // (Its held view of the forwarded copies goes with the recorder.)
-            cp.long_park();
-        }
         lap(3, &mut t);
         let ready = || run.turn.load(Ordering::Acquire) > i || run.cancelled.load(Ordering::Acquire);
-        let mut state = state;
-        if park && !ready() {
-            drop(cp);
-            match run.park(i, Parked { rec: rec.clone(), freed: w.freed.clone(), from, to, stopped, failed, state }) {
-                None => continue,
-                Some(p) => {
-                    // Its turn came meanwhile.
-                    state = p.state;
-                    cp = rec.cp.lock();
-                }
-            }
-        }
         if !ready() {
             let tl = super::timeline::mark();
             TURN_NS.fetch_add(run.wait_until(ready), Ordering::Relaxed);
             super::timeline::end(name, tl, || "wait: chunk turn".into());
         }
-        if commit(run, i, cp, from, to, stopped, failed, state) {
-            commit_parked(run, i + 1);
-        }
+        commit(run, i, cp, stopped, failed, state);
     }
 }
 
 /// Chunk `i` of `run` at its turn, recorded in `cp` (or the run cancelled
-/// before its turn: discarded, not posted): a long run's is checked against
-/// what the run before it writes; then it is submitted and posted, or
-/// discarded and posted for the main command processor to record again.
-/// Returns whether it ran to its end and gave the next chunk its turn.
-#[allow(clippy::too_many_arguments)]
-fn commit(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, from: u64, to: u64, stopped: Option<u64>, failed: bool, state: Box<ChunkState>) -> bool {
+/// before its turn: discarded, not posted): submitted and posted, or
+/// discarded and posted for the main command processor to record again;
+/// one that ran to its end gives the next chunk its turn.
+fn commit(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, stopped: Option<u64>, failed: bool, state: Box<ChunkState>) {
     let mut t = std::time::Instant::now();
-    let long = run.long.as_ref();
     let granted = run.turn.load(Ordering::Acquire) > i;
-    // A long run's chunk at its turn: recorded again by the main command
-    // processor if it read on the CPU what the run before it writes (or
-    // used an image with a clear or reload pending), else its notes go to
-    // the image cache and its writes to the run's before it submits.
-    let dropped = match long {
-        Some(l) if granted && !failed => {
-            let earlier = l.writes.lock();
-            let d = if l.bad.load(Ordering::Acquire) { Some("an earlier chunk computed a planned copy otherwise") } else { cp.long_check(&earlier.0, &earlier.1, &earlier.2) };
-            if d.is_some() && trace_long_drops() {
-                static N: AtomicU64 = AtomicU64::new(0);
-                if N.fetch_add(1, Ordering::Relaxed) < 60 {
-                    // (A forwarded read's conflict is with the earlier chunks'
-                    // writes other than the planner's copies.)
-                    let (r, w) = match cp.long_fwd_read_of(&earlier.1, &earlier.2) {
-                        Some(r) if earlier.1.overlaps(r.0, r.1) => (Some(r), &earlier.1),
-                        Some(r) => (Some(r), &earlier.2),
-                        None => (cp.long_read_of(&earlier.0), &earlier.0),
-                    };
-                    let (a, n) = r.unwrap_or((0, 0));
-                    let inh = l.inherited.get(i).map_or(0, |v| v.iter().filter(|q| q.base < a + n && a < q.base + 4 * q.words.len() as u64).count());
-                    crate::info!("gpu[{}]: long run chunk {i} at {from:#x}..{to:#x} dropped: {} (read {a:#x}+{n:#x}; {}; earlier writes there {:?}; run past a label wait: {}; the run's planned copies {}, this chunk's inherited over the read {inh})", cp.name, d.unwrap_or(""), super::forward::describe(a, n), w.intersect(a, n), run.stretch, l.planned.len());
-                }
-            }
-            drop(earlier);
-            // A run planned past a label wait: its chunk read on the CPU what
-            // other queues wrote while the stretch recorded, used an image
-            // with a clear or reload pending, or bound pages the CPU wrote
-            // since its checks (it is recorded again).
-            let d = match (d, run.stretch) {
-                (None, true) => {
-                    let sc = run.stretch_check.lock().clone();
-                    sc.and_then(|(w, need)| cp.stretch_check(&w, need))
-                }
-                (d, _) => d,
-            };
-            if d.is_none() {
-                let writes = cp.worker_writes();
-                let (nonfwd, mismatch) = cp.long_take();
-                let mut g = l.writes.lock();
-                g.0.extend(&writes);
-                g.1.extend(&nonfwd);
-                if mismatch {
-                    l.bad.store(true, Ordering::Release);
-                }
-            }
-            d
-        }
-        _ => None,
-    };
-    if let Some(why) = dropped {
-        LONG[3].fetch_add(1, Ordering::Relaxed);
-        bump(&LONG_DROPS, why);
-    }
-    if !granted || failed || dropped.is_some() {
-        // Cancelled before its turn, failed or dropped (the main command
-        // processor executes it from its start): never submitted.
+    if !granted || failed {
+        // Cancelled before its turn or failed (the main command processor
+        // executes it from its start): never submitted.
         cp.worker_discard();
     }
-    if long.is_some() {
-        if granted && !failed && dropped.is_none() {
-            LONG[2].fetch_add(1, Ordering::Relaxed);
-            if stopped.is_some() {
-                LONG[4].fetch_add(1, Ordering::Relaxed);
-                bump(&LONG_STOPS, cp.worker_stop_why());
-            }
-            cp.long_commit();
-        } else {
-            cp.long_end();
-        }
-    }
     if !granted {
-        return false;
+        return;
     }
     let done = if failed {
         Done { stopped, state: *state, last: None, why: "failed", costs: Vec::new(), writes: Default::default() }
-    } else if let Some(why) = dropped {
-        Done { stopped: Some(from), state: *state, last: None, why, costs: Vec::new(), writes: Default::default() }
     } else {
         let writes = if super::runprobe::on() || super::tune::past_runs() { cp.worker_writes() } else { Default::default() };
-        if run.stretch {
-            // (Its label writes are promised with the view the label needs.)
-            let need = run.stretch_check.lock().as_ref().map(|s| s.1);
-            if let Some(v) = need {
-                cp.fe2_set_view(v);
-            }
-        }
         let last = cp.worker_submit();
         let why = if stopped.is_some() { cp.worker_stop_why() } else { "" };
-        let state = if long.is_some() { cp.chunk_state_stacked() } else { cp.chunk_state() };
+        let state = cp.chunk_state();
         Done { stopped, state, last, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes }
     };
     drop(cp);
     run.results.lock()[i] = Some(done);
     run.posted.store(i + 1, Ordering::Release);
-    let next = stopped.is_none() && dropped.is_none();
-    if next {
-        // The next chunk follows this one's end directly (the last one's:
-        // a run chained after this one).
+    if stopped.is_none() {
+        // The next chunk follows this one's end directly.
         run.turn.fetch_max(i + 2, Ordering::AcqRel);
-        if i + 1 == run.chunks.len() {
-            let chained = run.chained.lock().clone();
-            if let Some(n) = chained {
-                n.grant(0);
-            }
-        }
     }
     run.notify();
     lap4(&mut t);
-    next
 }
 
 fn lap4(t: &mut std::time::Instant) {
     PHASE_NS[4].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
-/// Commits the chunks parked from `i` on, in order, while their turn has
-/// come (each that runs to its end gives the next its turn).
-fn commit_parked(run: &Run, mut i: usize) {
-    loop {
-        if run.turn.load(Ordering::Acquire) <= i {
-            return;
-        }
-        let Some(p) = run.take_parked(i) else { return };
-        let Parked { rec, freed, from, to, stopped, failed, state } = p;
-        let next = commit(run, i, rec.cp.lock(), from, to, stopped, failed, state);
-        PARKS[1].fetch_add(1, Ordering::Relaxed);
-        release(&rec, &freed);
-        if !next {
-            return;
-        }
-        i += 1;
-    }
-}
-
 impl Worker {
-    /// A recorder of its own not holding a parked chunk: its own, else a
-    /// spare (made on first need, `RECORDERS` at most), else it waits for
-    /// one to be committed; None once `run` is cancelled meanwhile (its
-    /// canceller waits for this worker to leave it, and the parked chunks
-    /// may belong to an earlier run that stopped, whose next turn comes
-    /// from that same command processor).
-    fn recorder(&self, run: &Run) -> Option<Arc<Recorder>> {
-        let t = std::time::Instant::now();
-        let mut logged = false;
-        loop {
-            if !logged && t.elapsed() > std::time::Duration::from_secs(3) {
-                logged = true;
-                crate::warn!("gpu[{}]: waiting > 3 s for a free recorder ({} recorders, all holding parked chunks)", self.name, self.recs.lock().len());
-            }
-            let seen = self.freed.load(Ordering::Acquire);
-            {
-                let mut g = self.recs.lock();
-                if let Some(r) = g.iter().find(|r| !r.parked.load(Ordering::Acquire)) {
-                    return Some(r.clone());
-                }
-                if g.len() < RECORDERS {
-                    let mut cp = Cp::new(&self.name, self.compute);
-                    match cp.make_worker_exec() {
-                        Ok(()) => {
-                            let r = Arc::new(Recorder { cp: Mutex::new(cp), parked: AtomicBool::new(false) });
-                            g.push(r.clone());
-                            PARKS[3].fetch_add(1, Ordering::Relaxed);
-                            return Some(r);
-                        }
-                        Err(e) => crate::warn!("gpu[{}]: no executor for a spare recorder ({e})", self.name),
-                    }
-                }
-            }
-            if run.cancelled.load(Ordering::Acquire) {
-                return None;
-            }
-            PARKS[2].fetch_add(1, Ordering::Relaxed);
-            // (Woken by a release; a millisecond at most, for a cancel.)
-            unsafe { windows_sys::Win32::System::Threading::WaitOnAddress(Arc::as_ptr(&self.freed) as *const core::ffi::c_void, &seen as *const u64 as *const core::ffi::c_void, 8, 1) };
-        }
-    }
-
     /// Gives it `run` to take chunks of; it starts once its pool wakes
     /// (`Pool::wake`; `Run::active` counts it from then on).
     pub fn give(&self, run: Arc<Run>) {
@@ -1108,7 +656,6 @@ pub fn reset_stats() {
     *LENGTHS_C.lock() = [[0; 2]; 6];
     ENDS_C.lock().clear();
     ENDS_SHORT.lock().clear();
-    long_reset();
 }
 
 /// One status line ("" before any parallel run).
@@ -1163,7 +710,7 @@ pub fn status() -> String {
     } else {
         String::new()
     };
-    past + &long_line() + &format!(
+    past + &format!(
         "    parallel runs: {runs} runs ({} split at equal recording cost; {} pre-wakes, {} relayed, spins {} saw their run, {} ran out), {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled, {} worker reads of the main command processor's unsubmitted writes ({} waited {:.0} us on average for its submission); main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}; runs under 32 commands by end {}; compute queues' runs by length {}; by end {}\n",
         super::cp::PAR_COSTED.load(Ordering::Relaxed),
         PREWAKES[0].load(Ordering::Relaxed),

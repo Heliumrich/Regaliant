@@ -147,14 +147,6 @@ struct Roles {
 
 /// Recognition per program code hash (Some: the copy kernel).
 static PROGRAMS: Mutex<Option<HashMap<u64, Option<Roles>>>> = Mutex::new(None);
-/// The addresses the copy kernel was met at (a long run's planner forwards
-/// their dispatches ahead: `plan`).
-static COPY_ADDRS: RwLock<Option<HashSet<u64>>> = RwLock::new(None);
-
-/// Whether the program at `addr` was recognized as the copy kernel.
-pub fn is_copy_program(addr: u64) -> bool {
-    COPY_ADDRS.read().as_ref().is_some_and(|s| s.contains(&addr))
-}
 /// (program hash, destination) pairs whose forwarded words once differed
 /// from memory: not forwarded again.
 static DISTRUSTED: Mutex<Option<HashSet<(u64, u64)>>> = Mutex::new(None);
@@ -206,60 +198,10 @@ pub fn hold_begin() {
 
 /// The held stretch is committed: its entries become global (submitted with
 /// its batches next, `submitted`) and the global entries its writes ended go.
-/// (A long run's chunk publishes its own copies; the planner's it was given
-/// are the run's earlier chunks' to publish.)
 pub fn hold_commit() {
     if let Some(held) = HELD.with(|h| h.borrow_mut().take()) {
         publish(held);
     }
-}
-
-/// A held view taken off its thread (`hold_take`): a long run's chunk
-/// recorded before its turn, which the thread that gives it its turn
-/// commits (`par::Run::grant`).
-pub struct HeldView(Held);
-
-/// This thread's held view, taken off it (None: it has none).
-pub fn hold_take() -> Option<HeldView> {
-    HELD.with(|h| h.borrow_mut().take()).map(HeldView)
-}
-
-/// A held view taken off its thread is committed (as `hold_commit`).
-pub fn commit_held(v: HeldView) {
-    publish(v.0);
-}
-
-/// A copy of this thread's held view (a seal of the graphics CP's held
-/// work: what it forwarded up to there, `commit_snapshot`).
-pub fn hold_snapshot() -> Option<HeldView> {
-    HELD.with(|h| h.borrow().as_ref().map(|x| HeldView(Held { entries: x.entries.clone(), hidden: x.hidden.clone(), version: 0 })))
-}
-
-/// A sealed part of this thread's held work commits: what its view held at
-/// the seal becomes global, and the entries the work after the seal has
-/// ended since stay hidden from this thread's view (they are global now).
-pub fn commit_snapshot(v: HeldView) {
-    let ids: Vec<u64> = v.0.entries.iter().map(|e| e.id).collect();
-    publish(v.0);
-    HELD.with(|h| {
-        if let Some(x) = h.borrow_mut().as_mut() {
-            let mut changed = false;
-            for id in ids {
-                if !x.entries.iter().any(|e| e.id == id) && !x.hidden.contains(&id) {
-                    x.hidden.push(id);
-                    changed = true;
-                }
-            }
-            if changed {
-                x.version += 1;
-            }
-        }
-    });
-}
-
-/// A held view taken off its thread is dropped (as `hold_drop`).
-pub fn drop_held(v: HeldView) {
-    HELD_STATS[2].fetch_add(v.0.entries.len() as u64, Ordering::Relaxed);
 }
 
 /// A held stretch's entries become global and the global entries its
@@ -270,7 +212,7 @@ fn publish(held: Held) {
     }
     let mut g = ENTRIES.write();
     g.retain(|e| !held.hidden.contains(&e.id));
-    for e in held.entries.into_iter().filter(|e| e.how != PLANNED) {
+    for e in held.entries {
         let end = e.base + 4 * e.words.len() as u64;
         g.retain(|x| !(x.base < end && e.base < x.base + 4 * x.words.len() as u64));
         if g.len() >= MAX_ENTRIES {
@@ -290,178 +232,6 @@ pub fn hold_drop() {
     if let Some(held) = HELD.with(|h| h.borrow_mut().take()) {
         HELD_STATS[2].fetch_add(held.entries.len() as u64, Ordering::Relaxed);
     }
-}
-
-/// The pieces of [s, e) outside every range of `cover` ([start, end)).
-fn outside(s: u64, e: u64, cover: &[(u64, u64)]) -> Vec<(u64, u64)> {
-    let mut pieces = vec![(s, e)];
-    for &(lo, hi) in cover {
-        let mut next = Vec::with_capacity(pieces.len() + 1);
-        for (a, b) in pieces {
-            if b <= lo || hi <= a {
-                next.push((a, b));
-                continue;
-            }
-            if a < lo {
-                next.push((a, lo));
-            }
-            if hi < b {
-                next.push((hi, b));
-            }
-        }
-        pieces = next;
-    }
-    pieces
-}
-
-/// The CPU reads of a long parallel run's chunk (`Exec::long`, a held view
-/// on this thread) by how they were served: parts this thread's own copies
-/// cover are left out (its chunk's, earlier in program order), parts the
-/// planner's copies it was given or the global entries cover go to the
-/// second list (right unless the run's earlier chunks wrote there otherwise
-/// than by those copies: the planner forwarded every copy of the run it
-/// could, the global entries were current when the run began), the rest to
-/// the first.
-pub fn split_long_reads(reads: &[(u64, u64)]) -> (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) {
-    let (own, planned, hidden): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<u64>) = HELD.with(|h| match h.borrow().as_ref() {
-        Some(x) => (
-            x.entries.iter().filter(|e| e.how != PLANNED).map(|e| (e.base, e.base + 4 * e.words.len() as u64)).collect(),
-            x.entries.iter().filter(|e| e.how == PLANNED).map(|e| (e.base, e.base + 4 * e.words.len() as u64)).collect(),
-            x.hidden.clone(),
-        ),
-        None => (Vec::new(), Vec::new(), Vec::new()),
-    });
-    let mut global: Vec<(u64, u64)> = Vec::new();
-    if COUNT.load(Ordering::Acquire) != 0 {
-        global.extend(ENTRIES.read().iter().filter(|e| !hidden.contains(&e.id)).map(|e| (e.base, e.base + 4 * e.words.len() as u64)));
-    }
-    if own.is_empty() && planned.is_empty() && global.is_empty() {
-        return (reads.to_vec(), Vec::new(), Vec::new());
-    }
-    // (The planner's copies come after the global entries: a word both
-    // cover is the planned copy's.)
-    let (mut plain, mut fwd_planned, mut fwd) = (Vec::new(), Vec::new(), Vec::new());
-    for &(a, n) in reads {
-        for (s, e) in outside(a, a + n, &own) {
-            let rest = outside(s, e, &planned);
-            let mut at = s;
-            for &(rs, re) in &rest {
-                if at < rs {
-                    fwd_planned.push((at, rs - at));
-                }
-                let rest2 = outside(rs, re, &global);
-                let mut at2 = rs;
-                for &(gs, ge) in &rest2 {
-                    if at2 < gs {
-                        fwd.push((at2, gs - at2));
-                    }
-                    plain.push((gs, ge - gs));
-                    at2 = ge;
-                }
-                if at2 < re {
-                    fwd.push((at2, re - at2));
-                }
-                at = re;
-            }
-            if at < e {
-                fwd_planned.push((at, e - at));
-            }
-        }
-    }
-    (plain, fwd_planned, fwd)
-}
-
-/// `Entry::how` of the copies a long run's planner forwarded (`plan`).
-const PLANNED: &str = "planned";
-
-/// A copy a long parallel run's planner forwarded ahead (`Cp::par_plan`):
-/// its packet, destination and words, and what an entry of it holds.
-#[derive(Clone)]
-pub struct Planned {
-    pub at: u64,
-    pub base: u64,
-    pub words: Arc<[u32]>,
-    program: u64,
-    hash: u64,
-    from: Inputs,
-    old: Arc<[u32]>,
-    earlier: Arc<[Arc<[u32]>]>,
-}
-
-/// Forwards the copy `p` dispatched at packet `at` with `groups` ahead of
-/// recording (a long run's planner; `busy` as `compute`'s). `prior`: the
-/// run's copies planned before it: theirs (and the global entry's) are the
-/// words memory may hold at the destination before this one runs.
-pub fn plan(p: &Prepared, at: u64, groups: [u32; 3], local: [u32; 3], busy: impl Fn(&[(u64, u64)]) -> bool, prior: &[Planned]) -> Option<Planned> {
-    let (base, words, from) = compute(p, groups, local, busy)?;
-    let n = words.len() as u64;
-    let old: Arc<[u32]> = if super::cp::guest_readable(base, 4 * n) {
-        (0..n).map(|k| unsafe { std::ptr::read_volatile((base + 4 * k) as *const u32) }).collect()
-    } else {
-        Arc::from(Vec::new())
-    };
-    let mut v: Vec<Arc<[u32]>> = match ENTRIES.read().iter().find(|e| e.base == base && e.words.len() as u64 == n) {
-        Some(e) => {
-            let mut v: Vec<Arc<[u32]>> = e.earlier.iter().cloned().collect();
-            v.push(e.words.clone());
-            v
-        }
-        None => Vec::new(),
-    };
-    v.extend(prior.iter().filter(|q| q.base == base && q.words.len() as u64 == n).map(|q| q.words.clone()));
-    if v.len() > EARLIER_MAX {
-        v.drain(..v.len() - EARLIER_MAX);
-    }
-    PLANNED_STATS[0].fetch_add(1, Ordering::Relaxed);
-    Some(Planned { at, base, words: words.into(), program: p.addr, hash: p.code_hash, from, old, earlier: v.into() })
-}
-
-impl Planned {
-    /// The same copy as one before all of a run chained after its own
-    /// (`Cp::chain_next`): at packet 0.
-    pub fn before_all(&self) -> Planned {
-        Planned { at: 0, ..self.clone() }
-    }
-}
-
-/// [copies a long run's planner forwarded, copies a worker computed
-/// otherwise than planned].
-pub static PLANNED_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-
-/// The planned copies before packet `start` (latest per destination): what
-/// a long run's chunk starting there inherits.
-pub fn inherited(planned: &[Planned], start: u64) -> Vec<Planned> {
-    let mut v: Vec<Planned> = Vec::new();
-    for q in planned.iter().filter(|q| q.at < start) {
-        let end = q.base + 4 * q.words.len() as u64;
-        v.retain(|x| !(x.base < end && q.base < x.base + 4 * x.words.len() as u64));
-        v.push(q.clone());
-    }
-    v
-}
-
-/// A held view on this thread that starts with `inherited` (a long run's
-/// chunk: the copies its planner forwarded before the chunk).
-pub fn hold_begin_with(inherited: &[Planned]) {
-    let entries: Vec<Entry> = inherited
-        .iter()
-        .map(|q| Entry {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            base: q.base,
-            words: q.words.clone(),
-            seq: 0,
-            program: q.program,
-            hash: q.hash,
-            from: q.from.clone(),
-            old: q.old.clone(),
-            earlier: q.earlier.clone(),
-            how: PLANNED,
-            queue: Arc::from("planner"),
-            write_backs: super::homes::WRITE_BACKS.load(Ordering::Relaxed),
-        })
-        .collect();
-    let version = (!entries.is_empty()) as u64;
-    HELD.with(|h| *h.borrow_mut() = Some(Held { entries, hidden: Vec::new(), version }));
 }
 
 /// [copies forwarded in held stretches, published at their commit, dropped].
@@ -803,15 +573,9 @@ fn roles(p: &Prepared) -> Option<Roles> {
     let key = p.code_hash;
     let known = PROGRAMS.lock().get_or_insert_with(HashMap::new).get(&key).copied();
     if let Some(r) = known {
-        if r.is_some() && !is_copy_program(p.addr) {
-            COPY_ADDRS.write().get_or_insert_with(HashSet::new).insert(p.addr);
-        }
         return r;
     }
     let r = recognize(insts, &p.found.tr.plan);
-    if r.is_some() {
-        COPY_ADDRS.write().get_or_insert_with(HashSet::new).insert(p.addr);
-    }
     if r.is_some() {
         crate::info!("gpu: cs {:#x} (code hash {key:#018x}) is a guarded modulo copy: its results are forwarded to later reads (`tune forward_copies`)", p.addr);
     }
