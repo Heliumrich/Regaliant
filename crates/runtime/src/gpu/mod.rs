@@ -30,7 +30,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 156] = [
+    static ALL: [Tunable; 157] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -187,6 +187,7 @@ pub mod tune {
         Tunable { name: "fe2_back_granule", env: "DS_FE2_BACK_GRANULE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ballast_ns", env: "DS_BALLAST_NS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ballast_at", env: "DS_BALLAST_AT", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "lod_pass", env: "DS_LOD_PASS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1585,6 +1586,20 @@ pub mod tune {
     #[inline]
     pub fn ballast_at() -> u64 {
         get(155)
+    }
+
+    /// A draw measuring LOD statistics whose depth tests stay after the
+    /// shader (`lod_per_draw`) measures in a pass of its own after it: the
+    /// draw runs without the statistics' atomics (their side effects kept
+    /// the driver from rejecting its hidden fragments before the shader:
+    /// the camera inside foliage, one batch 30-56 ms), the pass with them,
+    /// its depth tests before the shader, EQUAL against the depth the draw
+    /// wrote, writing nothing else (`shaders::with_lod_pass`). Not for
+    /// batched draws, depth or coverage exports, draws without depth tests
+    /// and writes. 0 (default): the draw measures itself.
+    #[inline]
+    pub fn lod_pass() -> bool {
+        get(156) != 0
     }
 
     /// Pixel programs that write no memory run their depth and stencil

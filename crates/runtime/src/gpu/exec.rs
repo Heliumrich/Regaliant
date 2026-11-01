@@ -3343,26 +3343,28 @@ static SHADER_PLACEMENTS: Mutex<Option<HashMap<u64, ShaderPlacements>>> = Mutex:
 /// it as the draw's state allows (`Spec::early_ok`), after it (a kill,
 /// alpha to coverage or an export with depth or stencil writes), after it
 /// as the program writes memory.
-static PS_TESTS: Mutex<Option<HashMap<u64, [u64; 4]>>> = Mutex::new(None);
+static PS_TESTS: Mutex<Option<HashMap<u64, [u64; 5]>>> = Mutex::new(None);
 
-/// Counts a draw's depth-test class for its pixel program (`PS_TESTS`).
+/// Counts a draw's depth-test class for its pixel program (`PS_TESTS`): 0
+/// before the shader as asked, 1 as allowed, 2 after it, 3 after it as the
+/// program writes memory, 4 after it with the LOD statistics' atomics.
 pub(crate) fn note_ps_tests(addr: u64, class: usize) {
-    PS_TESTS.lock().get_or_insert_with(HashMap::new).entry(addr).or_default()[class.min(3)] += 1;
+    PS_TESTS.lock().get_or_insert_with(HashMap::new).entry(addr).or_default()[class.min(4)] += 1;
 }
 
 /// Totals of `PS_TESTS` (the profile report).
 fn ps_tests_line() -> Option<String> {
     let g = PS_TESTS.lock();
     let m = g.as_ref()?;
-    let mut t = [0u64; 4];
+    let mut t = [0u64; 5];
     for x in m.values() {
-        for k in 0..4 {
+        for k in 0..5 {
             t[k] += x[k];
         }
     }
     Some(format!(
-        "    pixel programs' depth tests by draw: before the shader as asked {}, as allowed {}, after it (kill, coverage or exports with writes) {}, after it (memory writes) {}\n",
-        t[0], t[1], t[2], t[3]
+        "    pixel programs' depth tests by draw: before the shader as asked {}, as allowed {}, after it (kill, coverage or exports with writes) {} and with the LOD statistics too {}, after it (memory writes) {}\n",
+        t[0], t[1], t[2], t[4], t[3]
     ))
 }
 
@@ -7153,7 +7155,7 @@ pub fn shader_profile() -> String {
     for (a, x) in v.iter().take(top) {
         let n = x[0].max(1);
         if **a & DRAW_KEY != 0 {
-            let tests = PS_TESTS.lock().as_ref().and_then(|m| m.get(&(**a & !DRAW_KEY)).copied()).map(|t| format!(" (depth tests before as asked {}, as allowed {}, after {} / {})", t[0], t[1], t[2], t[3])).unwrap_or_default();
+            let tests = PS_TESTS.lock().as_ref().and_then(|m| m.get(&(**a & !DRAW_KEY)).copied()).map(|t| format!(" (depth tests before as asked {}, as allowed {}, after {} / with the LOD statistics {} / as it writes memory {})", t[0], t[1], t[2], t[4], t[3])).unwrap_or_default();
             s.push_str(&format!("      draws with shader {:#x}: {} draws, {} us each{tests}\n", **a & !DRAW_KEY, x[0], x[1] / 1000 / n));
             if let Some(l) = placement_line(**a) {
                 // Buffers of the vertex stage, then of the pixel stage.

@@ -70,6 +70,11 @@ static TOTALS: [AtomicU64; 22] = [const { AtomicU64::new(0) }; 22];
 /// Draws of pixel programs deciding their statistics per draw: [without a
 /// counted texture (never measure), measuring, carrying].
 static LATE_DRAWS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Measuring draws that measured in a pass of their own (`tune lod_pass`),
+/// and those whose pass was left out (the draw kept no depth test and
+/// write, its pipeline did not push its descriptors, or its rendering
+/// instance ended).
+pub static PASSES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// One status line on the measured statistics ("" before any).
 pub fn status() -> String {
@@ -80,7 +85,9 @@ pub fn status() -> String {
     let mips: Vec<String> = (0..16).filter(|&m| t[3 + m] > 0).map(|m| format!("{m}:{}", t[3 + m])).collect();
     let l: Vec<u64> = LATE_DRAWS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let rotated = if l.iter().sum::<u64>() > 0 {
-        format!("; late-test draws deciding per draw: {} without counted textures, {} measuring, {} carrying; banks carried: {} from earlier reports, {} with this one's, {} with nothing measured", l[0], l[1], l[2], t[19], t[20], t[21])
+        let pass = PASSES[0].load(Ordering::Relaxed) + PASSES[1].load(Ordering::Relaxed);
+        let pass = if pass > 0 { format!(" ({} of them in a pass of their own, {} left without)", PASSES[0].load(Ordering::Relaxed), PASSES[1].load(Ordering::Relaxed)) } else { String::new() };
+        format!("; late-test draws deciding per draw: {} without counted textures, {} measuring{pass}, {} carrying; banks carried: {} from earlier reports, {} with this one's, {} with nothing measured", l[0], l[1], l[2], t[19], t[20], t[21])
     } else {
         String::new()
     };
