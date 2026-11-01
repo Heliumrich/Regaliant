@@ -1243,24 +1243,7 @@ fn wb_census_line() -> String {
         m.sort_by_key(|(_, c)| std::cmp::Reverse(c[1]));
         m.iter().take(16).map(|((s, n, name), c)| format!("{s:#x}+{n:#x} '{name}' {} ({} MiB)", c[0], c[1] >> 20)).collect::<Vec<_>>()
     };
-    format!("    written bindings by program (`DS_WB_CENSUS`): {} programs, {} MiB bound in all; {}\n    written bindings by mapping (`DS_WB_CENSUS`): {}; left unmarked (`DS_FE2_LAZY`): {}\n", v.len(), total >> 20, top.join(", "), maps.join(", "), LAZY_SKIPS.load(Ordering::Relaxed))
-}
-
-/// `DS_FE2_LAZY=<name>:<hex size>,...` (diagnosis, wrong results where the
-/// CPU reads them): written bindings inside a guest mapping of that name
-/// and size get no write marks, so their GPU writes stay in the mirror and
-/// never reach guest memory (what leaving them to a lazy write-back would
-/// spare; FINDINGS.md 2026-10-31). Rules from the census by mapping
-/// (`DS_WB_CENSUS`).
-fn lazy_rules() -> &'static [(String, u64)] {
-    static RULES: std::sync::OnceLock<Vec<(String, u64)>> = std::sync::OnceLock::new();
-    RULES.get_or_init(|| {
-        let rules = mapping_rules("DS_FE2_LAZY");
-        if !rules.is_empty() {
-            crate::warn!("gpu: front end 2 leaves GPU writes into mappings {rules:?} in the mirror (`DS_FE2_LAZY`, diagnosis: guest memory never gets them)");
-        }
-        rules
-    })
+    format!("    written bindings by program (`DS_WB_CENSUS`): {} programs, {} MiB bound in all; {}\n    written bindings by mapping (`DS_WB_CENSUS`): {}\n", v.len(), total >> 20, top.join(", "), maps.join(", "))
 }
 
 /// `<name>:<hex size>,...` from the environment variable `var`.
@@ -1323,29 +1306,6 @@ fn read_census_line() -> String {
         })
         .collect();
     format!("    CPU-side reads by reason (`DS_READ_CENSUS` {:?}): {}\n", read_census_rules(), parts.join(", "))
-}
-
-static LAZY_SKIPS: AtomicU64 = AtomicU64::new(0);
-
-thread_local! {
-    /// Mappings looked up for `lazy_rules`: (start, end) -> matches.
-    static LAZY_SEEN: std::cell::RefCell<HashMap<(u64, u64), bool>> = std::cell::RefCell::new(HashMap::new());
-}
-
-/// Whether a written binding at `base` is left unmarked (`lazy_rules`).
-fn lazy_binding(base: u64) -> bool {
-    let rules = lazy_rules();
-    if rules.is_empty() {
-        return false;
-    }
-    let Some(b) = crate::mem::vma_bounds(base) else { return false };
-    let hit = LAZY_SEEN.with(|c| {
-        *c.borrow_mut().entry(b).or_insert_with(|| crate::mem::vma_label(base).is_some_and(|(_, size, name)| rules.iter().any(|(n, s)| *n == name && *s == size)))
-    });
-    if hit {
-        LAZY_SKIPS.fetch_add(1, Ordering::Relaxed);
-    }
-    hit
 }
 
 /// Import windows made again right after their window was dropped
@@ -14025,7 +13985,7 @@ impl Exec {
                         // map (its stores mark the dwords they write), or none.
                         if has_marks {
                             let ai = addr_at + (rdna::translate::ADDR_HEADER_DWORDS + rdna::translate::ADDR_INFO_DWORDS * i as u32) as usize;
-                            p.sgpr_data[ai + 3] = if placement == Placement::Mirrored && found.tr.plan.resources[i].written && !lazy_binding(base) { (info.offset / 128) as u32 } else { u32::MAX };
+                            p.sgpr_data[ai + 3] = if placement == Placement::Mirrored && found.tr.plan.resources[i].written { (info.offset / 128) as u32 } else { u32::MAX };
                         }
                         if matches!(b.kind, BindingKind::Address(_)) {
                             // The descriptor's range as an address and size.
