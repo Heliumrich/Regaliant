@@ -188,6 +188,93 @@ fn bench() -> Result<(), String> {
                 two_q / one_q
             );
         }
+        // Submission boundaries: K command buffers of one dispatch each
+        // after a full barrier (front end 2's batches end in a write-back's
+        // barriers), submitted as K calls each signaling a timeline value
+        // (the batches' way, through `submit_timeline_on`: with the compute
+        // family's queue each also signals the main queue's progress), as
+        // one call of K submissions each signaling, and as one submission of
+        // the K command buffers with one signal; the GPU time from the first
+        // one's start to the last one's end against one command buffer with
+        // the K dispatches and the barriers between: what a boundary costs.
+        {
+            const K: usize = 64;
+            let mut tci = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
+            let sem = d.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tci), None).map_err(|e| format!("timeline semaphore: {e}"))?;
+            let cmds = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cpool).command_buffer_count(K as u32)).map_err(|e| format!("cmds: {e}"))?;
+            let full = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            for (k, &cb) in cmds.iter().enumerate() {
+                d.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default()).map_err(|e| format!("begin: {e}"))?;
+                if k == 0 {
+                    d.cmd_reset_query_pool(cb, qp, 0, 2);
+                    d.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, qp, 0);
+                }
+                d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[full], &[], &[]);
+                d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+                d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipes[0]);
+                let pcs = [iters, (k as u32) * local * groups];
+                let bytes: Vec<u8> = pcs.iter().flat_map(|x| x.to_le_bytes()).collect();
+                d.cmd_push_constants(cb, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
+                d.cmd_dispatch(cb, groups, 1, 1);
+                if k == K - 1 {
+                    d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, 1);
+                }
+                d.end_command_buffer(cb).map_err(|e| format!("end: {e}"))?;
+            }
+            let value = std::cell::Cell::new(0u64);
+            // 0: K calls; 1: one call of K submissions; 2: one submission.
+            let span = |how: u32| -> Result<(f64, f64), String> {
+                let mut ts = Vec::new();
+                let mut walls = Vec::new();
+                for _ in 0..7 {
+                    let t = std::time::Instant::now();
+                    match how {
+                        0 => {
+                            for (k, &cb) in cmds.iter().enumerate() {
+                                value.set(value.get() + 1);
+                                c.submit_timeline_on(false, false, &[cb], &[], &[(sem, value.get())], if k == K - 1 { fence } else { vk::Fence::null() })?;
+                            }
+                        }
+                        1 => {
+                            let infos: Vec<(vk::CommandBufferSubmitInfo, vk::SemaphoreSubmitInfo)> = cmds
+                                .iter()
+                                .map(|&cb| {
+                                    value.set(value.get() + 1);
+                                    (vk::CommandBufferSubmitInfo::default().command_buffer(cb), vk::SemaphoreSubmitInfo::default().semaphore(sem).value(value.get()).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS))
+                                })
+                                .collect();
+                            let sis: Vec<vk::SubmitInfo2> = infos.iter().map(|(cbi, ssi)| vk::SubmitInfo2::default().command_buffer_infos(std::slice::from_ref(cbi)).signal_semaphore_infos(std::slice::from_ref(ssi))).collect();
+                            let q = c.queue.lock();
+                            d.queue_submit2(*q, &sis, fence).map_err(|e| format!("vkQueueSubmit2: {e}"))?;
+                        }
+                        _ => {
+                            value.set(value.get() + 1);
+                            c.submit_timeline_on(false, false, &cmds, &[], &[(sem, value.get())], fence)?;
+                        }
+                    }
+                    d.wait_for_fences(&[fence], true, 10_000_000_000).map_err(|e| format!("wait: {e}"))?;
+                    walls.push(t.elapsed().as_secs_f64() * 1e6);
+                    d.reset_fences(&[fence]).ok();
+                    let mut q = [0u64; 2];
+                    d.get_query_pool_results(qp, 0, &mut q, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT).map_err(|e| format!("query: {e}"))?;
+                    ts.push((q[1].wrapping_sub(q[0])) as f64 * period / 1000.0);
+                }
+                ts.sort_by(|a, b| a.total_cmp(b));
+                walls.sort_by(|a, b| a.total_cmp(b));
+                Ok((ts[ts.len() / 2], walls[walls.len() / 2]))
+            };
+            let (calls, calls_w) = span(0)?;
+            let (subs, subs_w) = span(1)?;
+            let (one_sub, one_w) = span(2)?;
+            let reference = time_case(K, false, true, false)?;
+            let per = |t: f64| (t - reference) / (K - 1) as f64;
+            crate::info!(
+                "dispatch bench: {K} one-dispatch command buffers behind full barriers, GPU time first to last (wall): {K} calls each signaling {calls:.0} us ({calls_w:.0}; {:.1} us a boundary), one call of {K} signaling submissions {subs:.0} us ({subs_w:.0}; {:.1}), one submission {one_sub:.0} us ({one_w:.0}; {:.1}); one command buffer with barriers between {reference:.0} us",
+                per(calls),
+                per(subs),
+                per(one_sub)
+            );
+        }
         let one = time_case(1, false, false, false)?;
         crate::info!("dispatch bench: one dispatch alone {one:.1} us");
         for (distinct, barriers, push) in [(false, false, false), (true, false, false), (false, true, false), (true, true, false), (false, false, true), (true, false, true)] {

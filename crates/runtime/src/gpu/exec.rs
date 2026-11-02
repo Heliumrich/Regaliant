@@ -2927,6 +2927,9 @@ fn submit_specs(specs: Vec<(u64, SubmitSpec)>) {
             fail(e, &specs[i].1.name);
             return;
         }
+        // (Texture uploads recorded batched ahead of them, as `submit_batch`
+        // has them: the batches may use those images.)
+        super::images::flush_uploads();
         let cmds: Vec<Vec<vk::CommandBuffer>> = specs[i..j].iter().map(|(_, s)| s.pre.into_iter().chain([s.cmd]).collect()).collect();
         let cdone = if c.compute.is_some() { c.batch_value_c() } else { 0 };
         let list: Vec<(&[vk::CommandBuffer], u64, u64, u64)> = specs[i..j].iter().zip(&cmds).map(|((seq, s), c)| (c.as_slice(), s.wait, *seq, if s.xwait > cdone { s.xwait } else { 0 })).collect();
