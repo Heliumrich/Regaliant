@@ -1502,6 +1502,96 @@ struct Backing {
     pending: Vec<vk::SparseMemoryBind>,
     /// A thread is binding.
     binding: bool,
+    /// The sparse written-bit maps (`SparseMarks`): one bit per bit page
+    /// claimed (in every map); the binds no bind has taken yet (map, bind)
+    /// and their bit pages, zeroed once bound.
+    mark_claimed: Vec<u64>,
+    mark_pending: Vec<(usize, vk::SparseMemoryBind)>,
+    mark_new: Vec<u64>,
+}
+
+/// The written-bit maps as sparse buffers (`make_marks`): the bit words of
+/// mirror pages are bound when those pages are (`back_in`, in the same
+/// bind) and zeroed before the pages count as backed; the page bits and
+/// touched-page lists when the maps are made. Maps over the mirror's whole
+/// span took 1 GiB of video memory each, where the 4.8 GB the swamp's
+/// mirror held needs ~150-300 MB (FINDINGS.md 2026-11-02).
+struct SparseMarks {
+    /// Every map (`MARKS`, then `MARKS_C`), their sparse page size.
+    bufs: Vec<vk::Buffer>,
+    page: u64,
+}
+
+static SPARSE_MARKS: std::sync::OnceLock<SparseMarks> = std::sync::OnceLock::new();
+/// The maps' bit and tail pages bound (all maps together).
+static MARK_PAGES: AtomicU64 = AtomicU64::new(0);
+
+/// A page of device memory for a sparse bind (the mirror's blocks).
+fn take_page(g: &mut Backing, m: &Mirror, alloc_ns: &mut u64) -> Result<(vk::DeviceMemory, u64), String> {
+    let c = ctx();
+    if g.next + m.page > BLOCK {
+        let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let ai = vk::MemoryAllocateInfo::default().allocation_size(BLOCK).memory_type_index(m.mem_type);
+        let ai = if c.device_addresses { ai.push_next(&mut fl) } else { ai };
+        let ta = std::time::Instant::now();
+        let mem = unsafe { c.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory (mirror block): {e}"))?;
+        *alloc_ns += ta.elapsed().as_nanos() as u64;
+        g.mems.push(mem);
+        g.next = 0;
+    }
+    let mem = *g.mems.last().expect("block");
+    let off = g.next;
+    g.next += m.page;
+    Ok((mem, off))
+}
+
+/// Claims the written-bit maps' bit page covering mirror page `p` (in
+/// every map) for the next bind, when it has none yet.
+fn claim_mark_page(g: &mut Backing, m: &Mirror, p: u64, alloc_ns: &mut u64) -> Result<(), String> {
+    let Some(sm) = SPARSE_MARKS.get() else { return Ok(()) };
+    // (A dword's bit: a page's bits are page / 32 bytes at page_index * page / 32.)
+    let k = p * m.page / 32 / sm.page;
+    let (w, bit) = ((k / 64) as usize, 1u64 << (k % 64));
+    if g.mark_claimed[w] & bit != 0 {
+        return Ok(());
+    }
+    for i in 0..sm.bufs.len() {
+        let (mem, off) = take_page(g, m, alloc_ns)?;
+        g.mark_pending.push((i, vk::SparseMemoryBind::default().resource_offset(k * sm.page).size(sm.page).memory(mem).memory_offset(off)));
+    }
+    g.mark_claimed[w] |= bit;
+    g.mark_new.push(k);
+    Ok(())
+}
+
+/// Zeroes the maps' bit pages `pages` (just bound), on the copy queue when
+/// there is one (the main queue would wait for the batches queued there),
+/// and waits.
+fn zero_mark_pages(sm: &SparseMarks, pages: &[u64]) -> Result<(), String> {
+    let record = |cmd: vk::CommandBuffer| unsafe {
+        for &b in &sm.bufs {
+            for &k in pages {
+                ctx().device.cmd_fill_buffer(cmd, b, k * sm.page, sm.page.min(MARK_BYTES - k * sm.page), 0);
+            }
+        }
+    };
+    let c = ctx();
+    let Some(q) = c.copy.as_ref() else { return one_off(record) };
+    unsafe {
+        let pool = c.device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(q.family), None).map_err(|e| format!("pool: {e}"))?;
+        let r = (|| {
+            let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).map_err(|e| format!("cmd: {e}"))?[0];
+            c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(|e| format!("begin: {e}"))?;
+            record(cmd);
+            c.device.end_command_buffer(cmd).map_err(|e| format!("end: {e}"))?;
+            let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| format!("fence: {e}"))?;
+            let r = c.submit_timeline(true, &[cmd], &[], &[], fence).and_then(|_| c.device.wait_for_fences(&[fence], true, u64::MAX).map_err(|e| format!("wait: {e}")));
+            c.device.destroy_fence(fence, None);
+            r
+        })();
+        c.device.destroy_command_pool(pool, None);
+        r
+    }
 }
 
 static MIRROR: std::sync::OnceLock<Mirror> = std::sync::OnceLock::new();
@@ -1535,7 +1625,7 @@ fn make_mirror() -> Result<Mirror, String> {
         c.limits.sparse_address_space_size >> 30
     );
     let words = pages.div_ceil(64);
-    let blocks = Mutex::new(Backing { mems: Vec::new(), next: BLOCK, claimed: vec![0; words], pending: Vec::new(), binding: false });
+    let blocks = Mutex::new(Backing { mems: Vec::new(), next: BLOCK, claimed: vec![0; words], pending: Vec::new(), binding: false, mark_claimed: Vec::new(), mark_pending: Vec::new(), mark_new: Vec::new() });
     Ok(Mirror { buf, page: req.alignment, mem_type, blocks, bound: parking_lot::Condvar::new(), backed: (0..words).map(|_| AtomicU64::new(0)).collect() })
 }
 
@@ -1589,20 +1679,11 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
             if g.claimed[w] & bit != 0 {
                 continue;
             }
-            if g.next + m.page > BLOCK {
-                let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-                let ai = vk::MemoryAllocateInfo::default().allocation_size(BLOCK).memory_type_index(m.mem_type);
-                let ai = if c.device_addresses { ai.push_next(&mut fl) } else { ai };
-                let ta = std::time::Instant::now();
-                let mem = unsafe { c.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory (mirror block): {e}"))?;
-                alloc_ns += ta.elapsed().as_nanos() as u64;
-                g.mems.push(mem);
-                g.next = 0;
-            }
-            let mem = *g.mems.last().expect("block");
-            g.pending.push(vk::SparseMemoryBind::default().resource_offset(p * m.page).size(m.page).memory(mem).memory_offset(g.next));
-            g.next += m.page;
+            let (mem, off) = take_page(g, m, &mut alloc_ns)?;
+            g.pending.push(vk::SparseMemoryBind::default().resource_offset(p * m.page).size(m.page).memory(mem).memory_offset(off));
             g.claimed[w] |= bit;
+            // (The written-bit maps' bits of the page, in the same bind.)
+            claim_mark_page(g, m, p, &mut alloc_ns)?;
         }
         Ok(())
     };
@@ -1620,13 +1701,22 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
             continue;
         }
         let binds = std::mem::take(&mut g.pending);
+        let mbinds = std::mem::take(&mut g.mark_pending);
+        let mnew = std::mem::take(&mut g.mark_new);
         g.binding = true;
         // (Waited for: binds not waited for, every later submission waiting
         // for a timeline value instead, cost the arrival no less and stalled
         // the queues for seconds at times: FINDINGS.md 2026-11-01.)
         let tb = std::time::Instant::now();
         let r = parking_lot::MutexGuard::unlocked(&mut g, || {
-            let bufs = [vk::SparseBufferMemoryBindInfo::default().buffer(m.buf).binds(&binds)];
+            let sm = SPARSE_MARKS.get();
+            let per_map: Vec<Vec<vk::SparseMemoryBind>> = (0..sm.map_or(0, |s| s.bufs.len())).map(|i| mbinds.iter().filter(|b| b.0 == i).map(|b| b.1).collect()).collect();
+            let mut bufs = vec![vk::SparseBufferMemoryBindInfo::default().buffer(m.buf).binds(&binds)];
+            if let Some(sm) = sm {
+                for (i, v) in per_map.iter().enumerate().filter(|(_, v)| !v.is_empty()) {
+                    bufs.push(vk::SparseBufferMemoryBindInfo::default().buffer(sm.bufs[i]).binds(v));
+                }
+            }
             let info = vk::BindSparseInfo::default().buffer_binds(&bufs);
             let fence = unsafe { c.device.create_fence(&vk::FenceCreateInfo::default(), None) }.map_err(|e| format!("vkCreateFence: {e}"))?;
             let r = {
@@ -1637,7 +1727,12 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
             };
             let r = r.map_err(|e| format!("vkQueueBindSparse: {e}")).and_then(|_| unsafe { c.device.wait_for_fences(&[fence], true, u64::MAX) }.map_err(|e| format!("bind fence: {e}")));
             unsafe { c.device.destroy_fence(fence, None) };
-            r
+            // The maps' new bit pages zeroed before their mirror pages count
+            // as backed (no shader marks them before that).
+            match (r, sm) {
+                (Ok(()), Some(sm)) if !mnew.is_empty() => zero_mark_pages(sm, &mnew),
+                (r, _) => r,
+            }
         });
         bind_ns += tb.elapsed().as_nanos() as u64;
         g.binding = false;
@@ -1648,6 +1743,13 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
                 m.backed[w].fetch_or(bit, Ordering::AcqRel);
             } else {
                 g.claimed[w] &= !bit;
+            }
+        }
+        if r.is_ok() {
+            MARK_PAGES.fetch_add(mbinds.len() as u64, Ordering::Relaxed);
+        } else {
+            for &k in &mnew {
+                g.mark_claimed[(k / 64) as usize] &= !(1u64 << (k % 64));
             }
         }
         m.bound.notify_all();
@@ -1741,6 +1843,15 @@ pub fn backing_line() -> String {
 pub fn backed_mib() -> u64 {
     let page = MIRROR.get().map_or(64 << 10, |m| m.page);
     (STATS[S_BACKED].load(Ordering::Relaxed) * page) >> 20
+}
+
+/// Video memory of the written-bit maps, in MiB (sparse: their bound
+/// pages; dense: their whole size).
+pub fn marks_mib() -> u64 {
+    match SPARSE_MARKS.get() {
+        Some(sm) => (MARK_PAGES.load(Ordering::Relaxed) * sm.page) >> 20,
+        None => (MARKS.get().is_some() as u64 + MARKS_C.get().is_some() as u64) * (MARK_BYTES >> 20),
+    }
 }
 
 /// Runs `record` in a one-off command buffer on the main queue and waits.
@@ -3664,9 +3775,19 @@ fn owned_self_test() -> Result<String, String> {
 }
 
 /// The written-bit maps, made zeroed (`marks`; the compute family's queue's
-/// only when it exists).
+/// only when it exists): sparse beside the mirror (`SparseMarks`), else
+/// dense.
 fn make_marks() -> Result<(), String> {
+    if MARKS.get().is_some() {
+        return Ok(());
+    }
     let c = ctx();
+    if let (true, Some(m)) = (c.sparse_buffers, MIRROR.get()) {
+        match make_sparse_marks(m) {
+            Ok(()) => return Ok(()),
+            Err(e) => crate::warn!("resident: sparse written-bit maps: {e}; dense ones of {} MiB each instead", MARK_BYTES >> 20),
+        }
+    }
     let make = || -> Result<vk::Buffer, String> {
         let (buf, _mem) = c.device_buffer(MARK_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::INDIRECT_BUFFER)?;
         // Zeroed; the touched-page list's header [count, 1, 1, 0] is the list
@@ -3686,6 +3807,101 @@ fn make_marks() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// The written-bit maps as sparse buffers (`SparseMarks`): made, their
+/// tails (page bits, touched-page lists) and the bit pages of the mirror's
+/// pages backed so far bound, zeroed, the lists' headers written; then
+/// published, under the mirror's backing lock (no bind meanwhile).
+fn make_sparse_marks(m: &Mirror) -> Result<(), String> {
+    let c = ctx();
+    let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::INDIRECT_BUFFER;
+    let n = 1 + c.compute.is_some() as usize;
+    let mut bufs = Vec::new();
+    for _ in 0..n {
+        let mut bi = vk::BufferCreateInfo::default().size(MARK_BYTES).usage(usage).flags(vk::BufferCreateFlags::SPARSE_BINDING | vk::BufferCreateFlags::SPARSE_RESIDENCY);
+        if c.families.len() > 1 {
+            bi = bi.sharing_mode(vk::SharingMode::CONCURRENT).queue_family_indices(&c.families);
+        }
+        bufs.push(unsafe { c.device.create_buffer(&bi, None) }.map_err(|e| format!("vkCreateBuffer (sparse, {} MiB): {e}", MARK_BYTES >> 20))?);
+    }
+    let drop_all = |bufs: &[vk::Buffer]| unsafe {
+        for &b in bufs {
+            c.device.destroy_buffer(b, None);
+        }
+    };
+    let req = unsafe { c.device.get_buffer_memory_requirements(bufs[0]) };
+    if req.alignment != m.page || req.memory_type_bits & (1 << m.mem_type) == 0 || (MARK_WORDS_BYTES % req.alignment) != 0 {
+        drop_all(&bufs);
+        return Err(format!("sparse page {} KiB, memory types {:#x} (the mirror's: {} KiB, type {})", req.alignment >> 10, req.memory_type_bits, m.page >> 10, m.mem_type));
+    }
+    let page = req.alignment;
+    let pages = MARK_BYTES.div_ceil(page);
+    let mut g = m.blocks.lock();
+    g.mark_claimed = vec![0; (pages as usize).div_ceil(64)];
+    let mut alloc_ns = 0u64;
+    let mut list: Vec<u64> = ((MARK_WORDS_BYTES / page)..pages).collect();
+    let sm = SparseMarks { bufs: bufs.clone(), page };
+    for p in 0..(MIRROR_END - MIRROR_BASE) / m.page {
+        if m.backed[(p / 64) as usize].load(Ordering::Acquire) & (1u64 << (p % 64)) != 0 {
+            let k = p * m.page / 32 / page;
+            if !list.contains(&k) {
+                list.push(k);
+            }
+        }
+    }
+    let mut binds: Vec<Vec<vk::SparseMemoryBind>> = vec![Vec::new(); n];
+    for &k in &list {
+        for b in binds.iter_mut() {
+            let (mem, off) = take_page(&mut g, m, &mut alloc_ns)?;
+            b.push(vk::SparseMemoryBind::default().resource_offset(k * page).size(page).memory(mem).memory_offset(off));
+        }
+        g.mark_claimed[(k / 64) as usize] |= 1u64 << (k % 64);
+    }
+    let infos: Vec<vk::SparseBufferMemoryBindInfo> = bufs.iter().zip(&binds).map(|(&b, v)| vk::SparseBufferMemoryBindInfo::default().buffer(b).binds(v)).collect();
+    let info = vk::BindSparseInfo::default().buffer_binds(&infos);
+    let fence = unsafe { c.device.create_fence(&vk::FenceCreateInfo::default(), None) }.map_err(|e| format!("vkCreateFence: {e}"))?;
+    let r = {
+        let q = c.queue.lock();
+        unsafe { c.device.queue_bind_sparse(*q, &[info], fence) }
+    };
+    let r = r.map_err(|e| format!("vkQueueBindSparse: {e}")).and_then(|_| unsafe { c.device.wait_for_fences(&[fence], true, u64::MAX) }.map_err(|e| format!("bind fence: {e}")));
+    unsafe { c.device.destroy_fence(fence, None) };
+    if let Err(e) = r {
+        g.mark_claimed.clear();
+        drop_all(&bufs);
+        return Err(e);
+    }
+    // Zeroed; the touched-page list's header [count, 1, 1, 0] is the list
+    // gather's indirect dispatch.
+    let header: Vec<u8> = [0u32, 1, 1, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
+    one_off(|cmd| unsafe {
+        // (The last page reaches past the map's end: MARK_BYTES is not a
+        // whole number of pages.)
+        for &b in &bufs {
+            for &k in &list {
+                c.device.cmd_fill_buffer(cmd, b, k * page, page.min(MARK_BYTES - k * page), 0);
+            }
+        }
+        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        for &b in &bufs {
+            c.device.cmd_update_buffer(cmd, b, rdna::kernels::MARK_LIST_AT as u64 * 4, &header);
+        }
+    })?;
+    MARK_PAGES.fetch_add((list.len() * n) as u64, Ordering::Relaxed);
+    let _ = MARKS.set(bufs[0]);
+    if n > 1 {
+        let _ = MARKS_C.set(bufs[1]);
+    }
+    let _ = SPARSE_MARKS.set(sm);
+    drop(g);
+    crate::info!("resident: written-bit maps sparse ({n} of {} MiB each, pages of {} KiB; {} MiB bound now)", MARK_BYTES >> 20, page >> 10, (list.len() as u64 * n as u64 * page) >> 20);
+    Ok(())
+}
+
+/// The written-bit map's bytes of dword bits (`rdna::kernels::MARK_WORDS`):
+/// the part a sparse map binds with the mirror's pages.
+const MARK_WORDS_BYTES: u64 = 4 * rdna::kernels::MARK_WORDS as u64;
 
 /// Runs `record` in a one-off command buffer on the main queue and waits
 /// (front end 2's self-test).
