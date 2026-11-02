@@ -2142,7 +2142,14 @@ fn keep_pipe(map: &Mutex<Option<HashMap<u64, Pipe>>>, key: u64, pipe: Pipe) -> P
 pub(super) fn module_code(spirv: &[u32]) -> std::borrow::Cow<'_, [u32]> {
     static NONCE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     let nonce = *NONCE.get_or_init(|| {
-        (FORCE_NONCE.load(Ordering::Relaxed) || std::env::var("DS_SPIRV_NONCE").ok().as_deref() == Some("1")).then(|| {
+        // (`DS_SPIRV_NONCE=<hex>`: that nonce, so two sessions share one no
+        // earlier session used: `--precompile-all` and the run after it.)
+        let set = std::env::var("DS_SPIRV_NONCE").ok();
+        if let Some(n) = set.as_deref().filter(|v| v.starts_with("0x")).and_then(|v| u32::from_str_radix(&v[2..], 16).ok()) {
+            crate::warn!("gpu: DS_SPIRV_NONCE={n:#x}: shader modules carry that nonce (the driver's shader cache serves only sessions with it)");
+            return Some(n | 1);
+        }
+        (FORCE_NONCE.load(Ordering::Relaxed) || set.as_deref() == Some("1")).then(|| {
             let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
             crate::warn!("gpu: DS_SPIRV_NONCE=1: shader modules carry a session nonce (the driver's shader cache misses)");
             (t ^ (t >> 32)) as u32 | 1
@@ -2169,6 +2176,24 @@ pub(super) fn bench_compute_pipeline(tr: &super::shaders::Translated) -> Result<
     let pipe = compute_pipeline(&tr.out, push_fits_tr(tr), None)?;
     let d = t.elapsed();
     super::pstats::report(pipe.pipeline, &format!("compile bench {:#018x}", tr.key));
+    unsafe {
+        let dev = &ctx().device;
+        dev.destroy_pipeline(pipe.pipeline, None);
+        dev.destroy_pipeline_layout(pipe.layout, None);
+        dev.destroy_descriptor_set_layout(pipe.set_layout, None);
+    }
+    Ok(d)
+}
+
+/// Makes the compute pipeline of a translation through the pipeline store
+/// under the key its dispatches look up, then lets it go
+/// (`--precompile-all`: the store and the driver's cache keep it for the
+/// sessions after). Its creation time.
+pub(super) fn store_compute_pipeline(tr: &super::shaders::Translated) -> Result<std::time::Duration, String> {
+    let push_mode = push_fits_tr(tr);
+    let t = std::time::Instant::now();
+    let pipe = compute_pipeline(&tr.out, push_mode, Some(push_key(tr.key, push_mode)))?;
+    let d = t.elapsed();
     unsafe {
         let dev = &ctx().device;
         dev.destroy_pipeline(pipe.pipeline, None);

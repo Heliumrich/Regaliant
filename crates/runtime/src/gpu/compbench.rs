@@ -182,6 +182,153 @@ fn guess_report(app: &std::path::Path) -> i32 {
     0
 }
 
+/// RSRC2 and the thread-group size a compute shader object holds, as a
+/// shader file stores it (its SH register pairs; pointers self-relative
+/// until `sceAgcCreateShader` relocates them: `hle::libs::agc::shader`).
+fn object_regs(o: &[u8]) -> Option<(u32, [u32; 3])> {
+    let rd32 = |at: usize| o.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let rd64 = |at: usize| o.get(at..at + 8).map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]));
+    // (Magic "1234", version 0x18; SH registers at 0x20, their count at 0x5C.)
+    if rd32(0)? != 0x3433_3231 || rd32(4)? != 0x18 {
+        return None;
+    }
+    let rel = rd64(0x20)?;
+    if rel == 0 {
+        return None;
+    }
+    let regs = 0x20usize.checked_add(usize::try_from(rel).ok()?)?;
+    let n = *o.get(0x5C)? as usize;
+    let (mut rsrc2, mut t) = (None, [1u32; 3]);
+    for k in 0..n {
+        let e = regs + 8 * k;
+        let (r, v) = (rd32(e)?, rd32(e + 4)?);
+        match r {
+            0x213 => rsrc2 = Some(v),
+            0x207..=0x209 => t[(r - 0x207) as usize] = (v & 0xFFFF).max(1),
+            _ => {}
+        }
+    }
+    Some((rsrc2?, t))
+}
+
+/// The compute programs of the game's shader files (`DS_CB_BUNDLES`), each
+/// with the spec guessed from its shader object (complete guesses only),
+/// once per code hash.
+fn bundle_compute(app: &std::path::Path) -> Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<rdna::translate::Spec>)> {
+    let sample: u64 = std::env::var("DS_CB_SAMPLE").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(1);
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let pdir = app.join("particles").join("!cookedparticleshaders").join("version01").join("_ps5");
+    files.extend(std::fs::read_dir(&pdir).into_iter().flatten().flatten().map(|e| e.path()));
+    let mut stack = vec![app.join("coredata").join("enginesupport").join("shaders").join("_ps5")];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                files.push(p);
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let (mut programs, mut no_object, mut unknown) = (0u64, 0u64, 0u64);
+    let mut out = Vec::new();
+    for f in files.iter().filter(|p| p.extension().is_some_and(|x| x == "csdr")) {
+        let Some(v) = std::fs::read(f).ok().and_then(|b| super::particles::bundle_programs(&b)) else { continue };
+        for p in v.into_iter().filter(|p| p.stage == 0) {
+            if !seen.insert(p.hash) || p.hash % sample != 0 {
+                continue;
+            }
+            programs += 1;
+            let Some((rsrc2, local)) = object_regs(&p.object) else {
+                no_object += 1;
+                continue;
+            };
+            let Ok(insts) = rdna::decode_program(&p.code) else { continue };
+            let user_sgprs = ((rsrc2 >> 1) & 0x1F).min(16) as u16;
+            let plan = rdna::analysis::analyze_opts(&insts, user_sgprs, 0, false);
+            let (spec, known) = super::shaders::guess_compute_spec(0, &insts, &plan, p.hash, rsrc2, local);
+            if !known {
+                unknown += 1;
+                continue;
+            }
+            out.push((p.hash, std::sync::Arc::new(p.code), vec![spec]));
+        }
+    }
+    crate::info!("compile bench: {programs} compute programs in the game's shader files (every {sample}th by code hash): {} with a complete guess, {unknown} incomplete, {no_object} without an object read", out.len());
+    out
+}
+
+/// `--precompile-all [threads]`: every compute program of the game's shader
+/// files whose shader object gives its spec completely (`bundle_compute`)
+/// is translated and its pipeline made through the pipeline store under the
+/// key its dispatches look up, the largest first, on `threads` threads
+/// (default 8): later sessions then find it instead of compiling it at the
+/// program's first dispatch, wherever the dispatch binds what the guess
+/// says (86% of the particle programs' learned specs, FINDINGS.md
+/// 2026-11-02 evening). Pipelines already in the store take moments.
+/// Progress every 10 s.
+pub fn precompile_all(app: &std::path::Path, threads: usize) -> i32 {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+    if let Err(e) = super::vk::init() {
+        crate::error!("precompile all: Vulkan: {e}");
+        return 2;
+    }
+    let t_all = Instant::now();
+    let mut progs: Vec<(u64, std::sync::Arc<Vec<u32>>, rdna::translate::Spec, usize)> = bundle_compute(app).into_iter().filter_map(|(h, code, mut specs)| Some((h, code.clone(), specs.pop()?, code.len()))).collect();
+    // (The largest first: they set the end.)
+    progs.sort_by(|a, b| b.3.cmp(&a.3));
+    let total_words: usize = progs.iter().map(|p| p.3).sum();
+    crate::info!("precompile all: {} compute programs ({} code words) on {threads} threads", progs.len(), total_words);
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let code_done = AtomicU64::new(0);
+    let failed = AtomicUsize::new(0);
+    let compile_ns = AtomicU64::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..threads.max(1) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Relaxed);
+                let Some((h, code, spec, n)) = progs.get(i) else { break };
+                let r = super::shaders::translate_code_for_spec(code, *h, spec.clone()).and_then(|tr| super::exec::store_compute_pipeline(&tr));
+                match r {
+                    Ok(d) => {
+                        compile_ns.fetch_add(d.as_nanos() as u64, Relaxed);
+                    }
+                    Err(e) => {
+                        if failed.fetch_add(1, Relaxed) < 8 {
+                            crate::warn!("precompile all: {h:#018x}: {e}");
+                        }
+                    }
+                }
+                code_done.fetch_add(*n as u64, Relaxed);
+                done.fetch_add(1, Relaxed);
+            });
+        }
+        // Progress: programs and code words done, and the time left at
+        // the rate of the words so far.
+        let mut last = Instant::now();
+        while done.load(Relaxed) < progs.len() {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if last.elapsed().as_secs() >= 10 {
+                last = Instant::now();
+                let w = code_done.load(Relaxed) as f64;
+                let el = t_all.elapsed().as_secs_f64();
+                let left = if w > 0.0 { el * (total_words as f64 - w) / w } else { 0.0 };
+                crate::info!("precompile all: {} of {} programs, {:.0}% of the code, {:.0} s, about {:.0} s left", done.load(Relaxed), progs.len(), 100.0 * w / total_words.max(1) as f64, el, left);
+            }
+        }
+    });
+    crate::info!(
+        "precompile all: {} programs in {:.1} s ({:.1} s of pipeline creation over the threads; {} failed)",
+        progs.len(),
+        t_all.elapsed().as_secs_f64(),
+        compile_ns.load(Relaxed) as f64 / 1e9,
+        failed.load(Relaxed)
+    );
+    0
+}
+
 pub fn run(args: &[String], app: &std::path::Path) -> i32 {
     if std::env::var("DS_CB_GUESS").ok().as_deref() == Some("1") {
         return guess_report(app);
@@ -212,7 +359,13 @@ pub fn run(args: &[String], app: &std::path::Path) -> i32 {
         crate::error!("compile bench: Vulkan: {e}");
         return 2;
     }
-    let mut progs: Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<rdna::translate::Spec>, usize)> = super::precompile::learned_compute()
+    // DS_CB_BUNDLES=1: the game's own compute programs (the particle
+    // bundles' and the engine's shader files) instead of the learned ones,
+    // each with the spec guessed from its shader object, complete guesses
+    // only: what compiling them all ahead would take (DS_CB_SAMPLE=<n>:
+    // every n-th by code hash).
+    let source = if std::env::var("DS_CB_BUNDLES").ok().as_deref() == Some("1") { bundle_compute(app) } else { super::precompile::learned_compute() };
+    let mut progs: Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<rdna::translate::Spec>, usize)> = source
         .into_iter()
         .filter(|(h, _, specs)| !specs.is_empty() && (only.is_empty() || only.contains(h)))
         .filter_map(|(h, code, specs)| {
@@ -282,6 +435,14 @@ pub fn run(args: &[String], app: &std::path::Path) -> i32 {
     crate::info!("compile bench: {} pipelines in {:.1} s ({:.1} s of compiles, {:.1} us per SPIR-V word); slowest:", rows.len(), t_all.elapsed().as_secs_f64(), total / 1e3, total * 1e3 / words.max(1) as f64);
     for (h, n, w, t, c) in rows.iter().take(15) {
         crate::info!("    {h:#018x}: {c:.0} ms ({n} instructions, {w} words, {:.1} us per word; translated in {t:.0} ms)", c * 1e3 / *w as f64);
+    }
+    // DS_CB_ROWS=<file>: every program's row (code hash, instructions,
+    // SPIR-V words, translation and compile ms) as CSV.
+    if let Some(f) = std::env::var("DS_CB_ROWS").ok().filter(|f| !f.is_empty()) {
+        let csv: String = rows.iter().map(|(h, n, w, t, c)| format!("{h:016x},{n},{w},{t:.1},{c:.1}\n")).collect();
+        if let Err(e) = std::fs::write(&f, csv) {
+            crate::warn!("compile bench: cannot write {f}: {e}");
+        }
     }
     0
 }

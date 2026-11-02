@@ -51,6 +51,8 @@ pub struct Config {
     pub record_bench: Option<(String, Option<u64>)>,
     /// `--compile-bench [min instructions] [max programs]` (`gpu::compbench`).
     pub compile_bench: Option<Vec<String>>,
+    /// `--precompile-all [threads]` (`gpu::compbench::precompile_all`).
+    pub precompile_all: Option<usize>,
     /// `--dispatch-bench` (`gpu::dispbench`).
     pub dispatch_bench: bool,
     pub trace: bool,
@@ -144,9 +146,10 @@ fn parse_args() -> Config {
     let mut app = None;
     let mut pipeline_test = None;
     let mut compile_bench: Option<Vec<String>> = None;
+    let mut precompile_all: Option<usize> = None;
     let mut dispatch_bench = false;
     let mut record_bench = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--seconds" => seconds = args.next().and_then(|s| s.parse().ok()),
@@ -166,6 +169,14 @@ fn parse_args() -> Config {
                 let min = args.next().expect("--compile-bench needs <min instructions> <max programs>");
                 let max = args.next().expect("--compile-bench needs <min instructions> <max programs>");
                 compile_bench = Some(vec![min, max]);
+            }
+            "--precompile-all" => {
+                // (An optional thread count.)
+                let n = args.peek().and_then(|a| a.parse::<usize>().ok());
+                if n.is_some() {
+                    args.next();
+                }
+                precompile_all = Some(n.unwrap_or(8));
             }
             "--record-bench" => {
                 let file = args.next().expect("--record-bench needs a capture file");
@@ -195,6 +206,7 @@ fn parse_args() -> Config {
         pipeline_test,
         record_bench,
         compile_bench,
+        precompile_all,
         dispatch_bench,
     }
 }
@@ -1233,6 +1245,11 @@ fn main() {
     });
     if let Some(a) = &cfg.compile_bench {
         let code = gpu::compbench::run(a, &cfg.app);
+        log::flush();
+        std::process::exit(code);
+    }
+    if let Some(n) = cfg.precompile_all {
+        let code = gpu::compbench::precompile_all(&cfg.app, n);
         log::flush();
         std::process::exit(code);
     }
