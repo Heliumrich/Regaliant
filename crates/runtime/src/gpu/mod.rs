@@ -175,7 +175,7 @@ pub mod tune {
         Tunable { name: "fe2_cpw_waited", env: "DS_FE2_CPW_WAITED", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "early_auto", env: "DS_EARLY_AUTO", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "write_marks", env: "DS_WRITE_MARKS", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "lod_late", env: "DS_LOD_LATE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "lod_late", env: "DS_LOD_LATE", default: 8, value: AtomicU64::new(UNSET) },
         Tunable { name: "lod_skip", env: "DS_LOD_SKIP", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "gpu_detile", env: "DS_GPU_DETILE", default: 8, value: AtomicU64::new(UNSET) },
         Tunable { name: "mark_touch", env: "DS_MARK_TOUCH", default: 1, value: AtomicU64::new(UNSET) },
@@ -1633,13 +1633,17 @@ pub mod tune {
     /// LOD statistics of pixel programs whose depth tests stay after the
     /// shader (a kill, coverage or export with depth or stencil writes):
     /// their atomics are side effects, so the driver shades every fragment
-    /// of such draws before testing depth, hidden ones too. 1: every draw
-    /// binding a counted texture measures (with `lod_skip` 0 every draw);
-    /// N >= 2: in rotation, one such draw in N (`lodstats`), the others
-    /// prepared without them (tested early and written late, as for any
-    /// program without side effects) carrying their textures' recent
-    /// measurements; 0 (diagnosis): none measures, so the title's texture
-    /// streaming lacks those textures' statistics.
+    /// of such draws before testing depth, hidden ones too. N >= 2 (default
+    /// 8 since 2026-11-02): in rotation, one such draw in N (`lodstats`),
+    /// the others prepared without them (tested early and written late, as
+    /// for any program without side effects) carrying their textures'
+    /// recent measurements (the same banks and finest-mip mix as every draw
+    /// measuring, FINDINGS.md 2026-10-30); 1: every draw binding a counted
+    /// texture measures (with `lod_skip` 0 every draw): with the camera
+    /// inside 1-1's ivy one batch of alpha-tested draws then took ~30 ms
+    /// instead of ~3 (frames of 67-88 ms; FINDINGS.md 2026-11-02); 0
+    /// (diagnosis): none measures, so the title's texture streaming lacks
+    /// those textures' statistics.
     pub fn lod_late() -> u64 {
         get(144)
     }
