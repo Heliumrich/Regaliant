@@ -2139,7 +2139,7 @@ fn translate_kept(addr: u64, insts: &[rdna::Inst], plan: &Arc<Plan>, plan_key: u
     }
     if stats >= 1 {
         crate::info!(
-            "translate stats: {:?} shader {addr:#x}: {} instructions -> {} SPIR-V words ({:.1} per instruction; wave64 {}, per lane {}, lane votes {}, local size {:?}, {} resources, {} branches decided without a vote)",
+            "translate stats: {:?} shader {addr:#x}: {} instructions -> {} SPIR-V words ({:.1} per instruction; wave64 {}, per lane {}, lane votes {}, lockstep {}, wave masks {}, local size {:?}, {} resources, {} branches decided without a vote)",
             spec.stage,
             insts.len(),
             out.spirv.len(),
@@ -2147,6 +2147,8 @@ fn translate_kept(addr: u64, insts: &[rdna::Inst], plan: &Arc<Plan>, plan_key: u
             spec.wave64,
             spec.per_lane,
             spec.lane_votes,
+            out.lockstep,
+            out.wave_masks,
             spec.cs_local_size,
             plan.resources.len(),
             out.masked_skips

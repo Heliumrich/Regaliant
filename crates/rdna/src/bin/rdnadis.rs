@@ -69,6 +69,21 @@ fn main() {
             pcs.sort();
             let pcs: Vec<String> = pcs.iter().map(|p| format!("{p:#x}")).collect();
             println!("{f}: lds {lds} mask values {} / {} [{}]", rdna::wavemask::reads_mask_values(&insts, true), rdna::wavemask::reads_mask_values(&insts, false), pcs.join(" "));
+            // Lane reads (v_readlane, v_readfirstlane) in blocks whose
+            // invocations may diverge: outside lockstep a wave64 reads only its
+            // 32-lane subgroup there.
+            let u = rdna::uniform::analyze(&insts);
+            let div: Vec<String> = insts.iter().filter(|i| matches!(i.base_name(), Some("v_readlane_b32" | "v_readfirstlane_b32")) && !u.is_uniform(i.pc)).map(|i| format!("{:#x}", i.pc)).collect();
+            println!("    divergent lane reads {} [{}]", div.len(), div.join(" "));
+            let xl: Vec<String> = insts.iter().filter(|i| rdna::cross_lane(i) && !u.is_uniform(i.pc)).map(|i| format!("{:#x}", i.pc)).collect();
+            println!("    divergent cross-lane operations {} [{}]", xl.len(), xl.iter().take(8).cloned().collect::<Vec<_>>().join(" "));
+            let kept: Vec<String> = rdna::translate::divergent_lane_ops(&insts).iter().map(|p| format!("{p:#x}")).collect();
+            println!("    of them keeping a single wave in lockstep {} [{}]", kept.len(), kept.iter().take(8).cloned().collect::<Vec<_>>().join(" "));
+            // Where each such mask is read whole (the first read in address order).
+            for (w, r) in rdna::wavemask::mask_value_reads(&insts, true) {
+                let show = |pc: u32| insts.iter().find(|i| i.pc == pc).map(|i| format!("{pc:#x} {}", rdna::disasm(i))).unwrap_or_default();
+                println!("    {} -> {}", show(w), r.map(show).unwrap_or_else(|| "(not found in address order)".into()));
+            }
         }
         return;
     }

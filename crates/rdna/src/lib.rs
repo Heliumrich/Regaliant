@@ -470,6 +470,14 @@ pub enum Vop3Kind {
     FromVop1,
 }
 
+/// Whether an instruction reads other lanes' values: lane reads
+/// (v_readlane, v_readfirstlane), DPP-modified VALU, permlanes, and the
+/// lane-exchange LDS instructions (ds_swizzle, ds_permute, ds_bpermute).
+pub fn cross_lane(i: &Inst) -> bool {
+    matches!(i.ext, Ext::Dpp16(_) | Ext::Dpp8(..))
+        || matches!(i.base_name(), Some("v_readlane_b32" | "v_readfirstlane_b32" | "v_permlane16_b32" | "v_permlanex16_b32" | "ds_swizzle_b32" | "ds_permute_b32" | "ds_bpermute_b32"))
+}
+
 pub fn vop3_kind(op: u16) -> Vop3Kind {
     if lookup(tables::VOP3, op).is_some() {
         return Vop3Kind::Native;

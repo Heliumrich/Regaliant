@@ -305,7 +305,18 @@ fn effects_opts(ins: &Inst, wave64: bool, partial: bool) -> Fx {
                 fx.def(ins.vop3_sdst(), mw);
                 fx.mask = true;
             } else {
-                let n = if name == "v_cndmask_b32" { 2 } else { 3 };
+                // Promoted VOP1 and VOP2 instructions read one and two
+                // sources: their unused source fields hold whatever the
+                // encoder left (0, s0, in the title's VOP3 v_mac_f32: read as
+                // a third source until 2026-11-02, it put ~300 programs in
+                // wave-mask mode), and v_cndmask_b32's third is its mask,
+                // read lane by lane.
+                let n = match crate::vop3_kind(ins.op) {
+                    crate::Vop3Kind::FromVop1 => 1,
+                    crate::Vop3Kind::FromVop2 => 2,
+                    _ if matches!(name, "v_cndmask_b32" | "v_readlane_b32" | "v_writelane_b32") => 2,
+                    _ => 3,
+                };
                 for &x in &s[..n] {
                     fx.read(x, w);
                 }
@@ -450,6 +461,46 @@ fn analyze(code: &[Inst], wave64: bool, values_only: bool, partial: bool) -> Has
     out
 }
 
+/// Diagnosis (`rdnadis --masks`): for each mask write
+/// [`mask_value_writes`] finds, the first later instruction in address
+/// order that reads its registers (or registers bitwise derived from them)
+/// as a whole value before they are written again: (write pc, read pc), the
+/// read pc None when none is found in address order (a read reached through
+/// a branch back).
+pub fn mask_value_reads(code: &[Inst], wave64: bool) -> Vec<(u32, Option<u32>)> {
+    let flagged = mask_value_writes(code, wave64);
+    let fx: Vec<Fx> = code.iter().map(|i| value_effects(i, wave64)).collect();
+    let mut out = Vec::new();
+    for (k, ins) in code.iter().enumerate() {
+        if !flagged.contains(&ins.pc) {
+            continue;
+        }
+        let mut live = [false; N];
+        for &d in &fx[k].defs {
+            live[d] = true;
+        }
+        let mut found = None;
+        for (j, f) in fx.iter().enumerate().skip(k + 1) {
+            if f.whole.iter().any(|&r| live[r]) {
+                found = Some(code[j].pc);
+                break;
+            }
+            let props: Vec<usize> = f.prop.iter().filter(|&&(s, _)| live[s]).map(|&(_, d)| d).collect();
+            for &d in &f.defs {
+                live[d] = false;
+            }
+            for d in props {
+                live[d] = true;
+            }
+            if !live.iter().any(|&x| x) {
+                break;
+            }
+        }
+        out.push((ins.pc, found));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,6 +558,33 @@ mod tests {
         let whole = analyze(&code, true, false, false);
         assert!(whole.contains(&code[0].pc) && whole.contains(&code[1].pc));
         assert!(analyze(&code, true, false, true).is_empty());
+    }
+
+    /// A promoted VOP2 instruction (VOP3 v_mac_f32) reads two sources: its
+    /// unused third field naming the SGPRs a compare wrote reads no mask
+    /// value; a native VOP3 instruction's third source (v_mad_f32) does.
+    #[test]
+    fn promoted_vop2_reads_two_sources() {
+        use crate::tables::*;
+        let cmp = opcode(VOPC, "v_cmp_lt_f32");
+        let cnd = opcode(VOP2, "v_cndmask_b32");
+        let mac = 0x100 + opcode(VOP2, "v_mac_f32");
+        let vop3 = |op: u32, vdst: u32| (0x35 << 26) | (op << 16) | vdst;
+        // v_cmp_lt_f32 s[0:1], v0, v1 (VOP3) ; v_cndmask_b32 v2, v0, v1, s[0:1] ;
+        // v_mac_f32 v3, v0, v1 (VOP3, src2 field 0 = s0) ; s_endpgm
+        let code = program(&[
+            vop3(cmp, 0),
+            256 | 257 << 9,
+            vop3(0x100 + cnd, 2),
+            256 | 257 << 9,
+            vop3(mac, 3),
+            256 | 257 << 9,
+            enc_sopp(1, 0),
+        ]);
+        assert!(!reads_mask_values(&code, true));
+        let mad = opcode(VOP3, "v_mad_f32");
+        let code = program(&[vop3(cmp, 0), 256 | 257 << 9, vop3(mad, 3), 256 | 257 << 9, enc_sopp(1, 0)]);
+        assert!(reads_mask_values(&code, true));
     }
 
     #[test]

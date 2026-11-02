@@ -601,6 +601,10 @@ pub struct Output {
     /// Lane-dependent branches lockstep mode decided without a vote
     /// (`masked_skip`).
     pub masked_skips: u32,
+    /// The lane model translated (statistics): lockstep, and wave-mask mode
+    /// within it.
+    pub lockstep: bool,
+    pub wave_masks: bool,
 }
 
 /// Dwords of user data at the start of the SGPR data buffer.
@@ -2588,7 +2592,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     // offsets come from a table): the runtime takes that from `sgpr_pc`.
     let batched = spec.batched;
     let sgpr_pc = if batched { Some(sgpr_pc_offset(spec.stage)) } else { spec.sgpr_pc };
-    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched, masked_skips: tr.masked_skips })
+    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched, masked_skips: tr.masked_skips, lockstep: tr.lockstep, wave_masks: tr.wave_masks })
 }
 
 /// Wave-mask mode for the shader at `addr` (diagnosis: `DS_WAVEMASK=0`
@@ -2624,13 +2628,135 @@ fn lockstep_mode(spec: &Spec, code: &[Inst]) -> (bool, bool) {
         && !uses_lds
         && std::env::var("DS_MASK_VALUES").ok().as_deref() != Some("0")
         && crate::wavemask::reads_mask_values(code, spec.wave64);
+    // A single wave whose cross-lane operations sit in code its invocations
+    // may not all run (since 2026-11-02, when the mask analysis stopped
+    // reading unused source fields: such programs left lockstep then).
+    let divergent_lanes = spec.stage == Stage::Compute && one_wave && !uses_lds && !mask_values && !divergent_lane_ops(code).is_empty();
     let lockstep = spec.stage == Stage::Compute
-        && (uses_lds || mask_values)
+        && (uses_lds || mask_values || divergent_lanes)
         && (one_wave || !wave_scalars)
         && std::env::var("DS_LOCKSTEP").ok().as_deref() != Some("0")
         && !spec.per_lane
         && !lockstep_off(spec.code_base);
     (lockstep, one_wave)
+}
+
+/// Pcs of the cross-lane operations ([`crate::cross_lane`]) in blocks a
+/// program's invocations may not all run, lane reads of values every lane
+/// holds alike left out: outside lockstep a wave64 reads only its 32-lane
+/// subgroup there, and other lanes' values from invocations that may be
+/// elsewhere (such single waves run in lockstep).
+pub fn divergent_lane_ops(code: &[Inst]) -> Vec<u32> {
+    if code.is_empty() {
+        return Vec::new();
+    }
+    let u = crate::uniform::analyze(code);
+    let starts = block_starts(code);
+    code.iter().enumerate().filter(|(k, i)| crate::cross_lane(i) && !u.is_uniform(i.pc) && !uniform_lane_read(code, &starts, *k)).map(|(_, i)| i.pc).collect()
+}
+
+/// Whether the lane read at `code[k]` (v_readlane_b32, v_readfirstlane_b32)
+/// reads a VGPR whose value every lane holds alike, so that any lane's copy
+/// is the one the hardware reads ([`uniform_vgpr`]).
+fn uniform_lane_read(code: &[Inst], starts: &BTreeSet<u32>, k: usize) -> bool {
+    let i = &code[k];
+    if !matches!(i.base_name(), Some("v_readlane_b32" | "v_readfirstlane_b32")) || !matches!(i.ext, crate::Ext::None) {
+        return false;
+    }
+    let src = i.src(0);
+    src >= crate::OP_VGPR0 && uniform_vgpr(code, starts, k, src - crate::OP_VGPR0, 12)
+}
+
+/// Whether VGPR `v` holds the same value in every lane where `code[k]`
+/// reads it: its last write before `k` within the block computes it from
+/// SGPRs, constants and such VGPRs only (a lane-local VALU instruction), or
+/// loads it with a buffer load whose address VGPRs are such. Conservative:
+/// a write outside the block, any other writer, a 64-bit write whose
+/// extent is unclear, or `depth` used up count as lane-dependent.
+fn uniform_vgpr(code: &[Inst], starts: &BTreeSet<u32>, k: usize, v: u16, depth: u8) -> bool {
+    if depth == 0 {
+        return false;
+    }
+    // Scalar operands are one value for the wave, but lane masks (VCC,
+    // EXEC, SCC and their tests) are each invocation's own outside wave-mask
+    // mode: SGPRs s0-s105, M0, inline constants and literals count.
+    let src_ok = |op: u16, at: usize| match op {
+        0..=105 | crate::OP_M0 | 128..=248 | 255 => true,
+        _ if op >= crate::OP_VGPR0 => uniform_vgpr(code, starts, at, op - crate::OP_VGPR0, depth - 1),
+        _ => false,
+    };
+    let mut j = k;
+    while j > 0 && !starts.contains(&code[j].pc) {
+        j -= 1;
+        let w = &code[j];
+        let Some(name) = w.base_name() else { return false };
+        let valu = matches!(w.enc, Enc::Vop1 | Enc::Vop2 | Enc::Vop3);
+        let load = matches!(w.enc, Enc::Mubuf) && name.starts_with("buffer_load_") && !name.contains("lds");
+        if !valu && !load {
+            // Scalar instructions, compares, exports and waits write no
+            // VGPR; other vector writes (and returning atomics) are not
+            // followed: lane-dependent where they may write `v`.
+            let writes = matches!(w.enc, Enc::Mtbuf | Enc::Mimg | Enc::Ds | Enc::Flat | Enc::Global | Enc::Scratch | Enc::Vintrp | Enc::Vop3p) || w.enc == Enc::Mubuf && name.contains("atomic");
+            if writes && w.vdst() <= v && v < w.vdst().saturating_add(4) {
+                return false;
+            }
+            continue;
+        }
+        if valu && w.enc == Enc::Vop3 && crate::vop3_kind(w.op) == crate::Vop3Kind::FromVopc {
+            continue;
+        }
+        // (Lane reads write an SGPR.)
+        if name.starts_with("v_readlane") || name.starts_with("v_readfirstlane") {
+            continue;
+        }
+        let d = w.vdst();
+        let n: u16 = if load {
+            match ["x4", "xyzw", "x3", "xyz", "x2", "xy"].iter().position(|x| name.ends_with(x)) {
+                Some(0 | 1) => 4,
+                Some(2 | 3) => 3,
+                Some(_) => 2,
+                None => 1,
+            }
+        } else {
+            1
+        };
+        let wide = valu && name.contains("64");
+        if wide && (v == d + 1 || v == d) {
+            return false;
+        }
+        if !(d <= v && v < d + n) {
+            continue;
+        }
+        if load {
+            let a = crate::OP_VGPR0 + w.buf_vaddr();
+            return !(w.buf_idxen() || bits_offen(w)) || src_ok(a, j) && (!(w.buf_idxen() && bits_offen(w)) || src_ok(a + 1, j));
+        }
+        // A lane-local VALU instruction: its result depends on its sources.
+        if !matches!(w.ext, crate::Ext::None) || (w.enc == Enc::Vop3 && w.is_vop3b()) {
+            return false;
+        }
+        if name.starts_with("v_cmp") || name.starts_with("v_writelane") || name.starts_with("v_permlane") || name.starts_with("v_movrel") || name.starts_with("v_swap") || name.starts_with("v_mbcnt") || name.starts_with("v_cndmask") || name.starts_with("v_interp") || name.contains("_co_") || name.contains("_ci_") {
+            return false;
+        }
+        let n_src = match w.enc {
+            Enc::Vop1 => 1,
+            Enc::Vop2 => 2,
+            _ => match crate::vop3_kind(w.op) {
+                crate::Vop3Kind::FromVop1 => 1,
+                crate::Vop3Kind::FromVop2 => 2,
+                _ => 3,
+            },
+        };
+        // VOP2's mac/fma forms also read their destination.
+        let acc = name.starts_with("v_mac_") || name.starts_with("v_fmac_");
+        return (0..n_src).all(|s| src_ok(w.src(s), j)) && (!acc || uniform_vgpr(code, starts, j, d, depth - 1));
+    }
+    false
+}
+
+/// MUBUF OFFEN (word 0 bit 12).
+fn bits_offen(i: &Inst) -> bool {
+    (i.w0 >> 12) & 1 != 0
 }
 
 /// Diagnosis: `DS_LOCKSTEP_OFF=<hex address>[,...]` translates those

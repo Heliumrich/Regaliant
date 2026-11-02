@@ -403,6 +403,11 @@ fn store_line(line: &str) {
 /// The title created a compute shader object for the program at `addr`.
 pub fn created(addr: u64, rsrc2: u32, local: [u32; 3], modifier: u32) {
     STATS[OBJECTS].fetch_add(1, Ordering::Relaxed);
+    // (`DS_COMPILE_TRACE=1`: when, against the program's first dispatch,
+    // the lead a pipeline made from the object would have.)
+    if super::exec::compile_trace_on() {
+        crate::info!("compile trace: compute object created for cs {addr:#x} at flip {}", super::FRAMES.load(Ordering::Relaxed));
+    }
     CREATED.lock().get_or_insert_with(HashMap::new).insert(addr, Created { rsrc2, local, modifier });
     if super::tune::precompile() >= 2 {
         QUEUE.lock().fresh.push_back(addr);

@@ -65,6 +65,9 @@ fn guess_report(app: &std::path::Path) -> i32 {
     // for particle programs.
     let mut n = [[0u64; 4]; 3];
     let mut other_why: HashMap<&'static str, u64> = HashMap::new();
+    // The differences in detail: (guess -> learned) image dimensions and
+    // classes, and the resource kinds when their counts differ.
+    let mut pairs: HashMap<String, u64> = HashMap::new();
     // Format-accessed buffers: access pattern -> (format, dst_sel) -> count.
     let mut by_access: HashMap<String, HashMap<(u8, u16), u64>> = HashMap::new();
     let mut engine_learned = 0;
@@ -98,8 +101,10 @@ fn guess_report(app: &std::path::Path) -> i32 {
                             (ResSpec::Image { dim: d1, class: c1, depth: z1 }, ResSpec::Image { dim: d2, class: c2, depth: z2 }) => {
                                 if d1 != d2 {
                                     *other_why.entry("an image's dimension").or_default() += 1;
+                                    *pairs.entry(format!("dim {d1:?} -> {d2:?}")).or_default() += 1;
                                 } else if c1 != c2 {
                                     *other_why.entry("an image's class").or_default() += 1;
+                                    *pairs.entry(format!("class {c1:?} -> {c2:?}")).or_default() += 1;
                                 } else if z1 != z2 {
                                     *other_why.entry("an image's depth view").or_default() += 1;
                                 }
@@ -114,6 +119,8 @@ fn guess_report(app: &std::path::Path) -> i32 {
                 } else {
                     if g2.resources.len() != actual.resources.len() {
                         *other_why.entry("resource count").or_default() += 1;
+                        let kinds = |v: &[ResSpec]| v.iter().map(|r| match r { ResSpec::Buffer { .. } => 'b', ResSpec::Image { .. } => 'i', ResSpec::Sampler => 's', ResSpec::Global => 'g' }).collect::<String>();
+                        *pairs.entry(format!("resources {} -> {}", kinds(&g2.resources), kinds(&actual.resources))).or_default() += 1;
                     } else if g2.wave64 != actual.wave64 {
                         *other_why.entry("wave64").or_default() += 1;
                     }
@@ -146,6 +153,9 @@ fn guess_report(app: &std::path::Path) -> i32 {
         crate::info!("guess report ({what}): {} specs: guess equal {}, equal but for typed buffers' formats {}, different {}", n[k][0], n[k][1], n[k][2], n[k][3]);
     }
     crate::info!("guess report: {engine_learned} of the learned programs are the engine's; other differences: {other_why:?}");
+    let mut pv: Vec<(&String, &u64)> = pairs.iter().collect();
+    pv.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    crate::info!("guess report: differences in detail (guess -> learned): {}", pv.iter().take(24).map(|(k, c)| format!("{k} {c}")).collect::<Vec<_>>().join(", "));
     crate::info!("guess report (engine programs binding no image and no typed buffer): {} specs: equal {}, format-only {}, different {}", plain[0], plain[1], plain[2], plain[3]);
     let mut dirs: Vec<(&String, &[u64; 4])> = by_dir.iter().collect();
     dirs.sort_by(|a, b| b.1[0].cmp(&a.1[0]).then(a.0.cmp(b.0)));
@@ -210,9 +220,18 @@ pub fn run(args: &[String], app: &std::path::Path) -> i32 {
     crate::info!("compile bench: {} programs of {min_insts} instructions or more (the largest first)", progs.len());
     let mut rows: Vec<(u64, usize, usize, f64, f64)> = Vec::new();
     let t_all = Instant::now();
+    // DS_CB_PER_LANE=1: translated per lane (`Spec::per_lane`) whatever the
+    // learned spec says; 2 with subgroup-decided EXEC branches too (timing:
+    // whether the program is right that way is not checked).
+    let per_lane = std::env::var("DS_CB_PER_LANE").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
     for (h, code, specs, n) in &progs {
         let t0 = Instant::now();
-        let tr = match super::shaders::translate_code_for_spec(code, *h, specs[0].clone()) {
+        let mut spec = specs[0].clone();
+        if per_lane != 0 {
+            spec.per_lane = true;
+            spec.lane_votes = per_lane == 2;
+        }
+        let tr = match super::shaders::translate_code_for_spec(code, *h, spec) {
             Ok(t) => t,
             Err(e) => {
                 crate::warn!("compile bench: {h:#018x}: translation failed: {e}");
@@ -232,6 +251,12 @@ pub fn run(args: &[String], app: &std::path::Path) -> i32 {
             t
         });
         let tr = replaced.as_ref().unwrap_or(&tr);
+        // DS_CB_NOCOMPILE=1: translations only (with DS_CB_SPV: the modules
+        // for `spvval`).
+        if std::env::var("DS_CB_NOCOMPILE").ok().as_deref() == Some("1") {
+            rows.push((*h, *n, tr.out.spirv.len(), translate_ms, 0.0));
+            continue;
+        }
         match super::exec::bench_compute_pipeline(tr) {
             Ok(d) => {
                 let ms = d.as_secs_f64() * 1e3;
