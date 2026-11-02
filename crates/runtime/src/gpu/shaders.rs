@@ -2089,8 +2089,10 @@ thread_local! {
     static LOCAL_DEPS: std::cell::RefCell<super::fx::Map<u64, u32>> = std::cell::RefCell::new(super::fx::Map::default());
     /// `format_resources` per plan.
     static LOCAL_FORMATS: std::cell::RefCell<super::fx::Map<u64, u64>> = std::cell::RefCell::new(super::fx::Map::default());
-    /// `format_store_resources` per plan (`tune rt_formats`).
+    /// `format_store_resources` per plan.
     static LOCAL_STORE_FORMATS: std::cell::RefCell<super::fx::Map<u64, u64>> = std::cell::RefCell::new(super::fx::Map::default());
+    /// `d3_resources` per plan.
+    static LOCAL_DIM3: std::cell::RefCell<super::fx::Map<u64, u64>> = std::cell::RefCell::new(super::fx::Map::default());
 }
 
 /// The resources of `plan` whose V# format and swizzle the translation
@@ -2133,6 +2135,23 @@ pub(crate) fn format_store_resources(insts: &[rdna::Inst], plan: &Plan) -> u64 {
     m
 }
 
+/// The resources of `plan` its image instructions address as 3D (their DIM
+/// field; a bit per resource, none past 64): sampled ones bound with a 2D or
+/// 3D texture are `ImageDim::D3OrD2`.
+pub(crate) fn d3_resources(insts: &[rdna::Inst], plan: &Plan) -> u64 {
+    let mut m = 0u64;
+    for i in insts {
+        if i.enc == rdna::Enc::Mimg && i.mimg_dim() == 2 {
+            if let Some(&(r, _)) = plan.inst_res.get(&i.pc) {
+                if r < 64 {
+                    m |= 1 << r;
+                }
+            }
+        }
+    }
+    m
+}
+
 /// Translates `insts` (planned as `plan`) for `spec` and keeps the
 /// translation under (plan_key, spec_hash) for `key_spec` (the spec it is
 /// kept for: the code base left out).
@@ -2156,6 +2175,16 @@ fn translate_kept(addr: u64, insts: &[rdna::Inst], plan: &Arc<Plan>, plan_key: u
                 let _ = std::fs::write(dir.join("shaders").join(format!("{addr:012x}-{spec_hash:016x}.spv")), bytes);
             }
         }
+    }
+    // (A program's further specs: which fields split its pipelines.)
+    if stats >= 1 && spec.stage == Stage::Compute {
+        static LAST: Mutex<Option<HashMap<u64, Spec>>> = Mutex::new(None);
+        let mut g = LAST.lock();
+        let m = g.get_or_insert_with(HashMap::new);
+        if let Some(prev) = m.get(&plan_key) {
+            crate::info!("translate stats: Compute shader {addr:#x}: another spec ({})", super::exec::spec_diff(prev, &key_spec));
+        }
+        m.insert(plan_key, key_spec.clone());
     }
     if stats >= 1 {
         crate::info!(
@@ -2346,6 +2375,7 @@ pub(crate) fn guess_compute_spec(addr: u64, insts: &[rdna::Inst], plan: &Plan, c
                     .map(|i| match i.mimg_dim() {
                         0 => ImageDim::D1,
                         1 => ImageDim::D2,
+                        2 if !res.written && res.kind == ResKind::Image => ImageDim::D3OrD2,
                         2 => ImageDim::D3,
                         3 => ImageDim::Cube,
                         4 => ImageDim::D1Array,
@@ -2786,6 +2816,14 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
             ResKind::Image => {
                 let t = Tsharp::decode(&w);
                 let dim = ImageDim::from_type(t.ty, t.depth).ok_or_else(|| format!("{:?} shader {addr:#x}: image resource {i} has type {}", spec.stage, t.ty))?;
+                // (Compute: addressed as 3D by its instructions, sampled, a
+                // 2D or 3D texture: one translation for both, FINDINGS.md
+                // 2026-11-02 evening.)
+                let dim = if spec.stage == Stage::Compute && matches!(t.ty, 9 | 10) && !res.written && LOCAL_DIM3.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| d3_resources(&insts, &plan))) & (1 << i.min(63)) != 0 {
+                    ImageDim::D3OrD2
+                } else {
+                    dim
+                };
                 super::lodstats::note(&t.raw);
                 // `depth` is decided below for all images at once.
                 spec.resources.push(ResSpec::Image { dim, class: num_class(t.format), depth: true });

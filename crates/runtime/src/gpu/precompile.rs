@@ -867,7 +867,7 @@ thread_local! {
     static LEARN_ADDR: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
-const DIMS: [ImageDim; 9] = [ImageDim::D1, ImageDim::D2, ImageDim::D3, ImageDim::Cube, ImageDim::D1Array, ImageDim::D2Array, ImageDim::D2Msaa, ImageDim::D2MsaaArray, ImageDim::CubeArray];
+const DIMS: [ImageDim; 10] = [ImageDim::D1, ImageDim::D2, ImageDim::D3, ImageDim::Cube, ImageDim::D1Array, ImageDim::D2Array, ImageDim::D2Msaa, ImageDim::D2MsaaArray, ImageDim::CubeArray, ImageDim::D3OrD2];
 const CLASSES: [NumClass; 3] = [NumClass::Float, NumClass::Sint, NumClass::Uint];
 
 /// One store line: code hash, RSRC2, thread-group size, wave64, then the

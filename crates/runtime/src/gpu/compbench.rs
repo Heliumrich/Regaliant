@@ -80,6 +80,23 @@ fn guess_report(app: &std::path::Path) -> i32 {
             let (guess, _) = super::shaders::guess_compute_spec(0, &insts, &plan, h, spec.cs_rsrc2, spec.cs_local_size);
             let mut actual = spec.clone();
             actual.code_base = guess.code_base;
+            // (Keyed as a preparation keys it now: formats read at run time,
+            // 3D-addressed sampled images bound 2D or 3D.)
+            let stored = super::shaders::format_store_resources(&insts, &plan);
+            let d3 = super::shaders::d3_resources(&insts, &plan);
+            for (i, r) in actual.resources.iter_mut().enumerate() {
+                if let ResSpec::Buffer { format, .. } = *r {
+                    if format != 0 && stored & (1 << i.min(63)) == 0 && rdna::translate::rt_format_entry(format as u16) != 0 {
+                        *r = ResSpec::Buffer { format: rdna::translate::FORMAT_RT, dst_sel: 0 };
+                    }
+                }
+                if let ResSpec::Image { dim: rdna::translate::ImageDim::D2 | rdna::translate::ImageDim::D3, class, depth } = *r {
+                    let plain = plan.resources.get(i).is_some_and(|x| x.kind == rdna::analysis::ResKind::Image && !x.written);
+                    if plain && i < 64 && d3 & (1 << i) != 0 {
+                        *r = ResSpec::Image { dim: rdna::translate::ImageDim::D3OrD2, class, depth };
+                    }
+                }
+            }
             let class = if guess == actual {
                 1
             } else {
@@ -239,10 +256,18 @@ pub fn run(args: &[String], app: &std::path::Path) -> i32 {
             if let Ok(insts) = rdna::decode_program(code) {
                 let plan = rdna::analysis::analyze_opts(&insts, spec.user_sgprs, spec.user_base, false);
                 let stored = super::shaders::format_store_resources(&insts, &plan);
+                let d3 = super::shaders::d3_resources(&insts, &plan);
                 for (i, r) in spec.resources.iter_mut().enumerate() {
                     if let rdna::translate::ResSpec::Buffer { format, .. } = *r {
                         if format != 0 && stored & (1 << i.min(63)) == 0 && rdna::translate::rt_format_entry(format as u16) != 0 {
                             *r = rdna::translate::ResSpec::Buffer { format: rdna::translate::FORMAT_RT, dst_sel: 0 };
+                        }
+                    }
+                    // (3D-addressed sampled images bound 2D or 3D.)
+                    if let rdna::translate::ResSpec::Image { dim: rdna::translate::ImageDim::D2 | rdna::translate::ImageDim::D3, class, depth } = *r {
+                        let plain = plan.resources.get(i).is_some_and(|x| x.kind == rdna::analysis::ResKind::Image && !x.written);
+                        if plain && i < 64 && d3 & (1 << i) != 0 {
+                            *r = rdna::translate::ResSpec::Image { dim: rdna::translate::ImageDim::D3OrD2, class, depth };
                         }
                     }
                 }

@@ -87,6 +87,14 @@ pub enum ImageDim {
     D2Msaa,
     D2MsaaArray,
     CubeArray,
+    /// Compute: a sampled resource its instructions address as 3D, bound
+    /// with a 3D or a 2D texture (the title binds 2D textures where an
+    /// effect's program samples a 3D one: its dispatches alternated between
+    /// two pipelines). The shader holds a 3D and a 2D variable
+    /// (`BindingKind::Image`, `BindingKind::ImageAlt`) and picks by the T#'s
+    /// TYPE when it runs; a 2D texture is addressed at (x, y), as the
+    /// hardware's address unit does. The runtime binds the other one null.
+    D3OrD2,
 }
 
 impl ImageDim {
@@ -554,6 +562,9 @@ pub enum BindingKind {
     /// Raw u32 storage buffer: a V# range or a global base address.
     Buffer(usize),
     Image(usize),
+    /// The 2D variable of an `ImageDim::D3OrD2` resource (`Image` holds
+    /// its 3D one).
+    ImageAlt(usize),
     StorageImage(usize),
     /// MIP_VIEWS storage images, one view per mip level from the T#'s base
     /// level (views past its last level repeat the last): image_store_mip
@@ -622,7 +633,7 @@ impl Binding {
     /// Plan resource index of a resource binding.
     pub fn kind_resource(&self) -> Option<usize> {
         match self.kind {
-            BindingKind::Buffer(i) | BindingKind::Address(i) | BindingKind::Image(i) | BindingKind::StorageImage(i) | BindingKind::StorageImageMips(i) | BindingKind::ImageArray(i) | BindingKind::Sampler(i) | BindingKind::CompareSampler(i) => Some(i),
+            BindingKind::Buffer(i) | BindingKind::Address(i) | BindingKind::Image(i) | BindingKind::ImageAlt(i) | BindingKind::StorageImage(i) | BindingKind::StorageImageMips(i) | BindingKind::ImageArray(i) | BindingKind::Sampler(i) | BindingKind::CompareSampler(i) => Some(i),
             _ => None,
         }
     }
@@ -738,6 +749,7 @@ pub(crate) struct Types {
     pub sb_u32: Word,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct ImageRes {
     pub var: Word,
     pub img_ty: Word,
@@ -783,6 +795,9 @@ pub(crate) struct T<'a> {
     pub code_base_at: u32,
     pub buffers: HashMap<usize, Word>,
     pub images: HashMap<usize, ImageRes>,
+    /// `ImageDim::D3OrD2` resources' 2D variables (`images` holds the 3D
+    /// one).
+    pub image_alts: HashMap<usize, ImageRes>,
     /// Image tables: resource -> pc of the load that reads its T#, and the
     /// byte offset each such load used (Function variables).
     pub image_tables: HashMap<usize, u32>,
@@ -2151,6 +2166,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         code_base_at: code_base_offset(plan),
         buffers: HashMap::default(),
         images: HashMap::default(),
+        image_alts: HashMap::default(),
         sampler_res: BTreeSet::new(),
         samplers: HashMap::default(),
         compare_sampler_vars: HashMap::default(),
@@ -2299,6 +2315,27 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
                 tr.buffer_binding.insert(v, bnd);
                 tr.buffers.insert(i, v);
             }
+            (ResKind::Image, Some(ResSpec::Image { dim: ImageDim::D3OrD2, class, depth })) if !r.written => {
+                let (class, depth) = (*class, *depth);
+                let sampled_ty = match class {
+                    NumClass::Float => tr.t.f32,
+                    NumClass::Sint => tr.t.i32,
+                    NumClass::Uint => tr.t.u32,
+                };
+                for (alt, sd, dim) in [(false, spirv::Dim::Dim3D, ImageDim::D3), (true, spirv::Dim::Dim2D, ImageDim::D2)] {
+                    let img_ty = tr.b.type_image(sampled_ty, sd, 0, 0, 0, 1, spirv::ImageFormat::Unknown, None);
+                    let pt = tr.b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+                    let v = tr.global_var(pt, StorageClass::UniformConstant);
+                    let bnd = tr.alloc_binding(if alt { BindingKind::ImageAlt(i) } else { BindingKind::Image(i) });
+                    tr.decorate_binding(v, bnd);
+                    let res = ImageRes { var: v, img_ty, dim, class, storage: false, depth, mips: false };
+                    if alt {
+                        tr.image_alts.insert(i, res);
+                    } else {
+                        tr.images.insert(i, res);
+                    }
+                }
+            }
             (ResKind::Image, Some(ResSpec::Image { dim, class, depth })) => {
                 let (dim, class, depth) = (*dim, *class, *depth);
                 let sampled_ty = match class {
@@ -2310,7 +2347,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
                 // alias other images); coordinates get a zero y component.
                 let (sd, arrayed, ms) = match dim {
                     ImageDim::D1 | ImageDim::D2 => (spirv::Dim::Dim2D, 0, 0),
-                    ImageDim::D3 => (spirv::Dim::Dim3D, 0, 0),
+                    ImageDim::D3 | ImageDim::D3OrD2 => (spirv::Dim::Dim3D, 0, 0),
                     ImageDim::Cube => (spirv::Dim::DimCube, 0, 0),
                     ImageDim::CubeArray => (spirv::Dim::DimCube, 1, 0),
                     ImageDim::D1Array | ImageDim::D2Array => (spirv::Dim::Dim2D, 1, 0),
@@ -2358,7 +2395,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
                 };
                 let (sd, arrayed) = match dim {
                     ImageDim::D1 | ImageDim::D2 | ImageDim::D2Msaa => (spirv::Dim::Dim2D, 0),
-                    ImageDim::D3 => (spirv::Dim::Dim3D, 0),
+                    ImageDim::D3 | ImageDim::D3OrD2 => (spirv::Dim::Dim3D, 0),
                     ImageDim::Cube => (spirv::Dim::DimCube, 0),
                     ImageDim::CubeArray => (spirv::Dim::DimCube, 1),
                     ImageDim::D1Array | ImageDim::D2Array | ImageDim::D2MsaaArray => (spirv::Dim::Dim2D, 1),
@@ -3701,6 +3738,45 @@ mod tests {
                 let bytes: Vec<u8> = o.spirv.iter().flat_map(|x| x.to_le_bytes()).collect();
                 std::fs::write(std::path::Path::new(&dir).join(name), bytes).unwrap();
             }
+        }
+    }
+
+    /// `ImageDim::D3OrD2`: an image_load addressed as 3D on a resource that
+    /// may be bound with a 2D texture gets a 3D and a 2D variable (`Image`,
+    /// `ImageAlt`) and no warning. RDNA_D3OR2D_DUMP=<dir> writes the module
+    /// for spvval.
+    #[test]
+    fn three_d_or_two_d_images() {
+        use crate::tables::*;
+        let op = |t: &[(u16, &str)], n: &str| t.iter().find(|(_, x)| x.split('/').next() == Some(n)).unwrap().0 as u32;
+        // image_load v[4:7], v[0:2], s[0:7] dmask 0xf dim 3D ;
+        // buffer_store_dwordx4 v[4:7], v0, s[8:11] idxen ; s_endpgm
+        let words = [
+            (0x3C << 26) | (op(MIMG, "image_load") << 18) | (0xF << 8) | (2 << 3),
+            4 << 8,
+            (0x38 << 26) | (op(MUBUF, "buffer_store_dwordx4") << 18) | (1 << 13),
+            4 << 8 | 2 << 16 | 0x80 << 24,
+            0xBF81_0000,
+        ];
+        let code = crate::decode_program(&words).unwrap();
+        let plan = crate::analysis::analyze(&code, 12, 0);
+        let mut spec = cs_spec([64, 1, 1]);
+        spec.user_sgprs = 12;
+        spec.resources = plan
+            .resources
+            .iter()
+            .map(|r| match r.kind {
+                ResKind::Image => ResSpec::Image { dim: ImageDim::D3OrD2, class: NumClass::Float, depth: false },
+                _ => ResSpec::Buffer { format: 0, dst_sel: 0 },
+            })
+            .collect();
+        let o = translate(&code, &plan, &spec).unwrap();
+        assert!(o.warnings.is_empty(), "{:?}", o.warnings);
+        let kinds: Vec<BindingKind> = o.bindings.iter().map(|b| b.kind).collect();
+        assert!(kinds.iter().any(|k| matches!(k, BindingKind::Image(_))) && kinds.iter().any(|k| matches!(k, BindingKind::ImageAlt(_))), "{kinds:?}");
+        if let Ok(dir) = std::env::var("RDNA_D3OR2D_DUMP") {
+            let bytes: Vec<u8> = o.spirv.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("d3or2d.spv"), bytes).unwrap();
         }
     }
 

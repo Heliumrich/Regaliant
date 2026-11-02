@@ -3347,7 +3347,7 @@ impl Images {
             D::D1Array | D::D2Array | D::D2MsaaArray => (vk::ImageViewType::TYPE_2D_ARRAY, 1, false),
             D::Cube => (vk::ImageViewType::CUBE, 6, false),
             D::CubeArray => (vk::ImageViewType::CUBE_ARRAY, 6, false),
-            D::D3 => (vk::ImageViewType::TYPE_3D, 1, true),
+            D::D3 | D::D3OrD2 => (vk::ImageViewType::TYPE_3D, 1, true),
         };
         if let Some(&v) = self.dummies.get(&vt) {
             return Ok(v);

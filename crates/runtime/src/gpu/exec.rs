@@ -1964,7 +1964,18 @@ static AHEAD_SPECS: Mutex<Option<HashMap<u64, Vec<(u64, u64, rdna::translate::Sp
 
 /// What differs between a spec made ahead and the one of execution
 /// (`DS_COMPILE_TRACE`).
-fn spec_diff(a: &rdna::translate::Spec, b: &rdna::translate::Spec) -> String {
+/// Whether binding `kind` of resource `i` takes the T#'s view: always,
+/// except for an `ImageDim::D3OrD2` resource, whose 3D variable (`Image`)
+/// takes a 3D texture and whose 2D one (`ImageAlt`) any other (the shader
+/// reads only the one the T#'s type names; the other is bound null).
+fn d3or2d_bound(spec: &rdna::translate::Spec, kind: BindingKind, i: usize, t: &super::desc::Tsharp) -> bool {
+    if !matches!(spec.resources.get(i), Some(rdna::translate::ResSpec::Image { dim: rdna::translate::ImageDim::D3OrD2, .. })) {
+        return true;
+    }
+    matches!(kind, BindingKind::Image(_)) == (t.ty == 10)
+}
+
+pub(crate) fn spec_diff(a: &rdna::translate::Spec, b: &rdna::translate::Spec) -> String {
     let mut d: Vec<String> = Vec::new();
     macro_rules! fields {
         ($($f:ident),*) => {
@@ -2488,7 +2499,7 @@ fn descriptor_type(k: BindingKind) -> vk::DescriptorType {
     match k {
         BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Address(_) | BindingKind::Gds | BindingKind::Debug | BindingKind::Watchdog | BindingKind::LodStats | BindingKind::Marks => vk::DescriptorType::STORAGE_BUFFER,
         BindingKind::SgprUniform => vk::DescriptorType::UNIFORM_BUFFER,
-        BindingKind::Image(_) | BindingKind::ImageArray(_) => vk::DescriptorType::SAMPLED_IMAGE,
+        BindingKind::Image(_) | BindingKind::ImageAlt(_) | BindingKind::ImageArray(_) => vk::DescriptorType::SAMPLED_IMAGE,
         BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_) => vk::DescriptorType::STORAGE_IMAGE,
         BindingKind::Sampler(_) | BindingKind::CompareSampler(_) => vk::DescriptorType::SAMPLER,
     }
@@ -13471,7 +13482,10 @@ impl Exec {
             let mut all = true;
             for b in &found.tr.out.bindings {
                 match (b.kind, b.kind_resource().and_then(|i| found.resources.get(i))) {
-                    (BindingKind::Image(_), Some(Resolved::Image(t))) => match super::images::view_hit(t, frame) {
+                    (BindingKind::Image(i) | BindingKind::ImageAlt(i), Some(Resolved::Image(t))) if !d3or2d_bound(&found.tr.spec, b.kind, i, t) => {
+                        bound.imgs.push((b.binding, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: vk::ImageView::null(), image_layout: vk::ImageLayout::GENERAL }));
+                    }
+                    (BindingKind::Image(_) | BindingKind::ImageAlt(_), Some(Resolved::Image(t))) => match super::images::view_hit(t, frame) {
                         Some((view, image)) => {
                             bound.imgs.push((b.binding, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }));
                             bound.images.push(image);
@@ -13520,7 +13534,10 @@ impl Exec {
         let r: Result<(), String> = super::images::with(|im| {
             for b in &found.tr.out.bindings {
                 match (b.kind, b.kind_resource().and_then(|i| found.resources.get(i))) {
-                    (BindingKind::Image(_) | BindingKind::StorageImage(_), Some(Resolved::Image(t))) => {
+                    (BindingKind::Image(i) | BindingKind::ImageAlt(i), Some(Resolved::Image(t))) if !d3or2d_bound(&found.tr.spec, b.kind, i, t) => {
+                        bound.imgs.push((b.binding, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: vk::ImageView::null(), image_layout: vk::ImageLayout::GENERAL }));
+                    }
+                    (BindingKind::Image(_) | BindingKind::ImageAlt(_) | BindingKind::StorageImage(_), Some(Resolved::Image(t))) => {
                         let storage = matches!(b.kind, BindingKind::StorageImage(_));
                         let (view, image) = im.view(t, storage, frame)?;
                         let ty = if storage { vk::DescriptorType::STORAGE_IMAGE } else { vk::DescriptorType::SAMPLED_IMAGE };
@@ -13591,7 +13608,7 @@ impl Exec {
                         bound.stored.push(image);
                         bound.img_arrays.push((b.binding, vk::DescriptorType::STORAGE_IMAGE, infos));
                     }
-                    (BindingKind::Image(_) | BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_) | BindingKind::ImageArray(_) | BindingKind::Sampler(_) | BindingKind::CompareSampler(_), _) => return Err("binding/resource mismatch".into()),
+                    (BindingKind::Image(_) | BindingKind::ImageAlt(_) | BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_) | BindingKind::ImageArray(_) | BindingKind::Sampler(_) | BindingKind::CompareSampler(_), _) => return Err("binding/resource mismatch".into()),
                     _ => {}
                 }
             }

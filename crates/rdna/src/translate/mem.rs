@@ -1816,7 +1816,7 @@ fn coord_count(dim: ImageDim) -> u32 {
     match dim {
         ImageDim::D1 => 1,
         ImageDim::D2 | ImageDim::D1Array => 2,
-        ImageDim::D3 | ImageDim::Cube | ImageDim::D2Array | ImageDim::D2Msaa | ImageDim::CubeArray => 3,
+        ImageDim::D3 | ImageDim::D3OrD2 | ImageDim::Cube | ImageDim::D2Array | ImageDim::D2Msaa | ImageDim::CubeArray => 3,
         ImageDim::D2MsaaArray => 4,
     }
 }
@@ -1959,6 +1959,38 @@ fn cube_dir(tr: &mut T, s: Word, t: Word, face: Word) -> R<Word> {
 }
 
 pub fn image(tr: &mut T, ins: &Inst) -> R<()> {
+    // An `ImageDim::D3OrD2` resource: the 3D variable when the T#'s TYPE
+    // (word 3 bits 28-31) is 3D (10), else its 2D one.
+    if let Some(&(ri, _)) = tr.plan.inst_res.get(&ins.pc) {
+        if let Some(alt) = tr.image_alts.get(&ri).copied() {
+            let main = tr.images[&ri];
+            let (u, bt) = (tr.t.u32, tr.t.bool_);
+            let w3 = tr.sreg(ins.mimg_srsrc() as u32 + 3)?;
+            let k28 = tr.u(28);
+            let ty = e(tr.b.shift_right_logical(u, None, w3, k28))?;
+            let k10 = tr.u(10);
+            let is3d = e(tr.b.i_equal(bt, None, ty, k10))?;
+            let (merge, then_b, else_b) = (tr.b.id(), tr.b.id(), tr.b.id());
+            ok(tr.b.selection_merge(merge, spirv::SelectionControl::NONE))?;
+            ok(tr.b.branch_conditional(is3d, then_b, else_b, []))?;
+            e(tr.b.begin_block(Some(then_b)))?;
+            image_with(tr, ins)?;
+            ok(tr.b.branch(merge))?;
+            e(tr.b.begin_block(Some(else_b)))?;
+            tr.images.insert(ri, alt);
+            let r = image_with(tr, ins);
+            tr.images.insert(ri, main);
+            r?;
+            ok(tr.b.branch(merge))?;
+            e(tr.b.begin_block(Some(merge)))?;
+            return Ok(());
+        }
+    }
+    image_with(tr, ins)
+}
+
+/// An image instruction on the variable `tr.images` holds for its resource.
+fn image_with(tr: &mut T, ins: &Inst) -> R<()> {
     let name = ins.name().unwrap_or("");
     let u = tr.t.u32;
     let f = tr.t.f32;
