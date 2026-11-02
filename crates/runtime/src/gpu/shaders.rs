@@ -1044,7 +1044,10 @@ fn mark_now(addr: u64) {
     use std::sync::atomic::Ordering;
     for a in &BATCHABLE {
         if a.compare_exchange(0, addr, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            crate::info!("gpu: cs {addr:#x} batched from now on (runs of consecutive dispatches)");
+            // (Its code hash: the learned store's and the compile bench's
+            // name for it, `DS_CB_HASHES`.)
+            let code = program_hash(addr).map(|h| format!(", code {h:#x}")).unwrap_or_default();
+            crate::info!("gpu: cs {addr:#x} batched from now on (runs of consecutive dispatches{code})");
             return;
         }
         if a.load(Ordering::Acquire) == addr {
