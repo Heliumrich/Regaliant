@@ -2135,6 +2135,27 @@ pub(crate) fn format_store_resources(insts: &[rdna::Inst], plan: &Plan) -> u64 {
     m
 }
 
+/// Learned resources keyed as a preparation keys them now (the store keeps
+/// what dispatches had: typed buffers' formats, images' 2D or 3D): formats a
+/// program only loads, of the table, read at run time (`FORMAT_RT`), and
+/// 3D-addressed sampled images bound 2D or 3D `ImageDim::D3OrD2`. The
+/// precompile, the compile bench and the guess report key them so.
+pub(crate) fn key_learned(insts: &[rdna::Inst], plan: &Plan, resources: &mut [ResSpec]) {
+    let stored = format_store_resources(insts, plan);
+    let d3 = d3_resources(insts, plan);
+    for (i, r) in resources.iter_mut().enumerate() {
+        match *r {
+            ResSpec::Buffer { format, .. } if format != 0 && format != translate::FORMAT_RT && stored & (1 << i.min(63)) == 0 && translate::rt_format_entry(format as u16) != 0 => {
+                *r = ResSpec::Buffer { format: translate::FORMAT_RT, dst_sel: 0 };
+            }
+            ResSpec::Image { dim: ImageDim::D2 | ImageDim::D3, class, depth } if i < 64 && d3 & (1 << i) != 0 && plan.resources.get(i).is_some_and(|x| x.kind == ResKind::Image && !x.written) => {
+                *r = ResSpec::Image { dim: ImageDim::D3OrD2, class, depth };
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The resources of `plan` its image instructions address as 3D (their DIM
 /// field; a bit per resource, none past 64): sampled ones bound with a 2D or
 /// 3D texture are `ImageDim::D3OrD2`.

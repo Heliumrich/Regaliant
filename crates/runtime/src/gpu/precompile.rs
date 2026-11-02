@@ -721,7 +721,18 @@ fn run(addr: u64) {
         return;
     };
     let seen = learned(|m| m.get(&code_hash).map(|e| e.1.clone())).unwrap_or_default();
-    let mut specs: Vec<Spec> = seen.into_iter().map(|s| super::shaders::compute_spec(addr, code_hash, s.rsrc2, s.local, s.wave64, s.resources, s.batched)).collect();
+    let mut specs: Vec<Spec> = Vec::new();
+    for mut s in seen {
+        // (Keyed as a preparation keys them now.)
+        let user_sgprs = ((s.rsrc2 >> 1) & 0x1F).min(16) as u16;
+        if let Ok((insts, plan, _)) = super::shaders::stage_plan(addr, user_sgprs, 0) {
+            super::shaders::key_learned(&insts, &plan, &mut s.resources);
+        }
+        let spec = super::shaders::compute_spec(addr, code_hash, s.rsrc2, s.local, s.wave64, s.resources, s.batched);
+        if !specs.contains(&spec) {
+            specs.push(spec);
+        }
+    }
     if super::tune::precompile() >= 3 {
         let user_sgprs = ((c.rsrc2 >> 1) & 0x1F).min(16) as u16;
         if let Ok((insts, plan, _)) = super::shaders::stage_plan(addr, user_sgprs, 0) {
@@ -759,9 +770,29 @@ fn run(addr: u64) {
 fn run_code(h: u64) {
     let Some(code) = code_of(h) else { return };
     let seen = learned(|m| m.get(&h).map(|e| e.1.clone())).unwrap_or_default();
-    for s in seen {
+    let insts = rdna::decode_program(&code).ok();
+    let mut plans: Vec<(u16, rdna::analysis::Plan)> = Vec::new();
+    let mut done: Vec<Spec> = Vec::new();
+    for mut s in seen {
         let t = std::time::Instant::now();
+        // (Keyed as a preparation keys them now, a plan per user SGPR count;
+        // equal ones made once.)
+        if let Some(insts) = &insts {
+            let user_sgprs = ((s.rsrc2 >> 1) & 0x1F).min(16) as u16;
+            let k = match plans.iter().position(|(u, _)| *u == user_sgprs) {
+                Some(k) => k,
+                None => {
+                    plans.push((user_sgprs, rdna::analysis::analyze_opts(insts, user_sgprs, 0, false)));
+                    plans.len() - 1
+                }
+            };
+            super::shaders::key_learned(insts, &plans[k].1, &mut s.resources);
+        }
         let spec = super::shaders::compute_spec(0, h, s.rsrc2, s.local, s.wave64, s.resources, s.batched);
+        if done.contains(&spec) {
+            continue;
+        }
+        done.push(spec.clone());
         let r = super::shaders::translate_code_for_spec(&code, h, spec).and_then(|tr| super::exec::precompile_translation(&tr, 0).ok_or_else(|| "pipeline creation failed".to_string()));
         match r {
             Ok(true) => {
