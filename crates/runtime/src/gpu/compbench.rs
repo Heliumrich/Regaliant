@@ -118,7 +118,10 @@ fn guess_report(app: &std::path::Path) -> i32 {
                     2
                 } else {
                     if g2.resources.len() != actual.resources.len() {
-                        *other_why.entry("resource count").or_default() += 1;
+                        // (Another learned spec of the program with the
+                        // plan's count: this one an older build's.)
+                        let stale = specs.iter().any(|o| o.resources.len() == g2.resources.len());
+                        *other_why.entry(if stale { "resource count (another spec of the program has the plan's)" } else { "resource count" }).or_default() += 1;
                         let kinds = |v: &[ResSpec]| v.iter().map(|r| match r { ResSpec::Buffer { .. } => 'b', ResSpec::Image { .. } => 'i', ResSpec::Sampler => 's', ResSpec::Global => 'g' }).collect::<String>();
                         *pairs.entry(format!("resources {} -> {}", kinds(&g2.resources), kinds(&actual.resources))).or_default() += 1;
                     } else if g2.wave64 != actual.wave64 {
@@ -230,6 +233,20 @@ pub fn run(args: &[String], app: &std::path::Path) -> i32 {
         if per_lane != 0 {
             spec.per_lane = true;
             spec.lane_votes = per_lane == 2;
+        }
+        // (Learned formats as a preparation keys them now: `FORMAT_RT`.)
+        {
+            if let Ok(insts) = rdna::decode_program(code) {
+                let plan = rdna::analysis::analyze_opts(&insts, spec.user_sgprs, spec.user_base, false);
+                let stored = super::shaders::format_store_resources(&insts, &plan);
+                for (i, r) in spec.resources.iter_mut().enumerate() {
+                    if let rdna::translate::ResSpec::Buffer { format, .. } = *r {
+                        if format != 0 && stored & (1 << i.min(63)) == 0 && rdna::translate::rt_format_entry(format as u16) != 0 {
+                            *r = rdna::translate::ResSpec::Buffer { format: rdna::translate::FORMAT_RT, dst_sel: 0 };
+                        }
+                    }
+                }
+            }
         }
         let tr = match super::shaders::translate_code_for_spec(code, *h, spec) {
             Ok(t) => t,

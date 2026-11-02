@@ -2089,6 +2089,8 @@ thread_local! {
     static LOCAL_DEPS: std::cell::RefCell<super::fx::Map<u64, u32>> = std::cell::RefCell::new(super::fx::Map::default());
     /// `format_resources` per plan.
     static LOCAL_FORMATS: std::cell::RefCell<super::fx::Map<u64, u64>> = std::cell::RefCell::new(super::fx::Map::default());
+    /// `format_store_resources` per plan (`tune rt_formats`).
+    static LOCAL_STORE_FORMATS: std::cell::RefCell<super::fx::Map<u64, u64>> = std::cell::RefCell::new(super::fx::Map::default());
 }
 
 /// The resources of `plan` whose V# format and swizzle the translation
@@ -2105,6 +2107,24 @@ fn format_resources(insts: &[rdna::Inst], plan: &Plan) -> u64 {
         let Some(n) = i.name() else { continue };
         let n = n.strip_prefix('t').unwrap_or(n);
         if n.starts_with("buffer_load_format_") || n.starts_with("buffer_store_format_") {
+            if let Some(&(r, _)) = plan.inst_res.get(&i.pc) {
+                m |= 1 << r.min(63);
+            }
+        }
+    }
+    m
+}
+
+/// The resources of `plan` the program stores formatted
+/// (`buffer_store_format_*`; a bit per resource, all past 64): their
+/// formats stay in the spec (`rdna::translate::FORMAT_RT` decodes loads).
+pub(crate) fn format_store_resources(insts: &[rdna::Inst], plan: &Plan) -> u64 {
+    if plan.resources.len() > 64 {
+        return u64::MAX;
+    }
+    let mut m = 0u64;
+    for i in insts {
+        if i.enc == rdna::Enc::Mubuf && i.name().is_some_and(|n| n.starts_with("buffer_store_format_")) {
             if let Some(&(r, _)) = plan.inst_res.get(&i.pc) {
                 m |= 1 << r.min(63);
             }
@@ -2301,6 +2321,7 @@ pub(crate) fn translate_for_spec(addr: u64, key_spec: Spec) -> Result<Arc<Transl
 pub(crate) fn guess_compute_spec(addr: u64, insts: &[rdna::Inst], plan: &Plan, code_hash: u64, rsrc2: u32, local: [u32; 3]) -> (Spec, bool) {
     let wave64 = !insts.iter().any(|i| i.name().is_some_and(|n| n.ends_with("_saveexec_b32") || n.ends_with("_wrexec_b32")));
     let fmt = format_resources(insts, plan);
+    let stored = format_store_resources(insts, plan);
     let user_sgprs = ((rsrc2 >> 1) & 0x1F).min(16) as u16;
     let plan_key = code_hash ^ (user_sgprs as u64) << 48;
     let cmp = super::tune::cmp_emulate().then(|| compare_images(plan_key, insts, plan)).unwrap_or(0);
@@ -2310,6 +2331,7 @@ pub(crate) fn guess_compute_spec(addr: u64, insts: &[rdna::Inst], plan: &Plan, c
         .iter()
         .enumerate()
         .map(|(r, res)| match res.kind {
+            ResKind::Buffer if fmt & (1 << r.min(63)) != 0 && stored & (1 << r.min(63)) == 0 => ResSpec::Buffer { format: translate::FORMAT_RT, dst_sel: 0 },
             ResKind::Buffer if fmt & (1 << r.min(63)) != 0 => {
                 known = false;
                 ResSpec::Buffer { format: 0, dst_sel: 0xFAC }
@@ -2743,7 +2765,17 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
                 let v = Vsharp::decode(&w);
                 // Raw accesses do not read the format and swizzle (see
                 // `format_resources`).
-                let (format, dst_sel) = if fmt_mask & (1 << i.min(63)) != 0 { (v.format, v.dst_sel) } else { (0, 0) };
+                // (Compute stages: read from the V# when the program runs
+                // where the decoder can and the program only loads it
+                // formatted; +4.7% at four walk places, FINDINGS.md
+                // 2026-11-02 late afternoon.)
+                let (format, dst_sel) = if fmt_mask & (1 << i.min(63)) == 0 {
+                    (0, 0)
+                } else if spec.stage == Stage::Compute && translate::rt_format_entry(v.format as u16) != 0 && LOCAL_STORE_FORMATS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| format_store_resources(&insts, &plan))) & (1 << i.min(63)) == 0 {
+                    (translate::FORMAT_RT, 0)
+                } else {
+                    (v.format, v.dst_sel)
+                };
                 spec.resources.push(ResSpec::Buffer { format, dst_sel });
                 resources.push(Resolved::Buffer(v));
             }

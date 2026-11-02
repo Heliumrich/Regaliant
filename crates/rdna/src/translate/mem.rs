@@ -1139,6 +1139,134 @@ fn store_formatted(tr: &mut T, var: Word, addr: Word, vals: &[Word], fmt: u16) -
 }
 
 /// Applies V# DST_SEL to formatted-load results.
+/// `FORMAT_RT`: the `n` outputs of a formatted load of the format the V#
+/// names when the program runs, decoded through `rt_format_entry`'s table:
+/// each output takes the component its DST_SEL names (word 3 bits 0-11: 0
+/// zero, 1 one, 4-7 component X-W, else its own), loads the dword holding
+/// it and converts it by the format's class. A format outside the table
+/// reads zero, as FORMAT_INVALID does.
+fn load_formatted_rt(tr: &mut T, var: Word, addr: Word, n: usize) -> R<[Word; 4]> {
+    let (Some(w3), Some(table)) = (tr.rt_word3, tr.fmt_table) else { return Err("a run-time format access without its V# or table".into()) };
+    let (u, f32t, bt) = (tr.t.u32, tr.t.f32, tr.t.bool_);
+    let c = |tr: &mut T, v: u32| tr.u(v);
+    let (k12, k7f) = (c(tr, 12), c(tr, 0x7F));
+    let id = e(tr.b.shift_right_logical(u, None, w3, k12))?;
+    let id = e(tr.b.bitwise_and(u, None, id, k7f))?;
+    let pt = tr.b.type_pointer(None, StorageClass::Private, u);
+    let p = e(tr.b.access_chain(pt, None, table, [id]))?;
+    let ent = e(tr.b.load(u, None, p, None, []))?;
+    let (k63, k7, k24, k31, k5, k3, k4, z) = (c(tr, 63), c(tr, 7), c(tr, 24), c(tr, 31), c(tr, 5), c(tr, 3), c(tr, 4), c(tr, 0));
+    let class = e(tr.b.shift_right_logical(u, None, ent, k24))?;
+    let class = e(tr.b.bitwise_and(u, None, class, k7))?;
+    let valid = e(tr.b.shift_right_logical(u, None, ent, k31))?;
+    let valid = e(tr.b.i_not_equal(bt, None, valid, z))?;
+    let is = |tr: &mut T, k: u32| -> R<Word> {
+        let kk = tr.u(k);
+        e(tr.b.i_equal(bt, None, class, kk))
+    };
+    let (one_f, one_i) = (c(tr, 1.0f32.to_bits()), c(tr, 1));
+    // The class's traits: signed (SNORM, SSCALED, SINT), normalized (UNORM,
+    // SNORM), integer (UINT, SINT), float.
+    let cl: Vec<Word> = (0..7).map(|k| is(tr, k)).collect::<R<_>>()?;
+    let any = |tr: &mut T, ks: &[usize]| -> R<Word> {
+        let mut x = cl[ks[0]];
+        for &k in &ks[1..] {
+            x = e(tr.b.logical_or(bt, None, x, cl[k]))?;
+        }
+        Ok(x)
+    };
+    let signed = any(tr, &[1, 3, 5])?;
+    let norm = any(tr, &[0, 1])?;
+    let int_class = any(tr, &[4, 5])?;
+    let float_class = cl[6];
+    let one = e(tr.b.select(u, None, int_class, one_i, one_f))?;
+    // Widths and their offsets.
+    let mut w = [z; 4];
+    let mut o = [z; 4];
+    for k in 0..4 {
+        let sh = c(tr, 6 * k as u32);
+        let x = e(tr.b.shift_right_logical(u, None, ent, sh))?;
+        w[k] = e(tr.b.bitwise_and(u, None, x, k63))?;
+        if k > 0 {
+            o[k] = e(tr.b.i_add(u, None, o[k - 1], w[k - 1]))?;
+        }
+    }
+    let mut out = [z; 4];
+    for (k, slot) in out.iter_mut().enumerate().take(n) {
+        let sh = c(tr, 3 * k as u32);
+        let sel = e(tr.b.shift_right_logical(u, None, w3, sh))?;
+        let sel = e(tr.b.bitwise_and(u, None, sel, k7))?;
+        // The source component: sel 4-7 names X-W, other values this one.
+        let named = e(tr.b.u_greater_than_equal(bt, None, sel, k4))?;
+        let m4 = e(tr.b.i_sub(u, None, sel, k4))?;
+        let kk = c(tr, k as u32);
+        let comp = e(tr.b.select(u, None, named, m4, kk))?;
+        let (mut wc, mut oc) = (w[0], o[0]);
+        for j in 1..4 {
+            let kj = c(tr, j as u32);
+            let at = e(tr.b.i_equal(bt, None, comp, kj))?;
+            wc = e(tr.b.select(u, None, at, w[j], wc))?;
+            oc = e(tr.b.select(u, None, at, o[j], oc))?;
+        }
+        // Its dword (the table keeps components inside one; the first
+        // from the element's byte address, a 1- or 2-byte element in its
+        // low bits) and bits.
+        let di = e(tr.b.shift_right_logical(u, None, oc, k5))?;
+        let four = c(tr, 4);
+        let dbytes = e(tr.b.i_mul(u, None, di, four))?;
+        let a = e(tr.b.i_add(u, None, addr, dbytes))?;
+        let dw = load_bytes(tr, var, a, 4)?;
+        let bit = e(tr.b.bitwise_and(u, None, oc, k31))?;
+        let raw = e(tr.b.bit_field_u_extract(u, None, dw, bit, wc))?;
+        // (Sign-extended in a u32: the base's type; ConvertSToF reads it
+        // as signed.)
+        let sxu = e(tr.b.bit_field_s_extract(u, None, dw, bit, wc))?;
+        let xi = e(tr.b.select(u, None, signed, sxu, raw))?;
+        let fu = e(tr.b.convert_u_to_f(f32t, None, raw))?;
+        let fs = e(tr.b.convert_s_to_f(f32t, None, sxu))?;
+        let xf = e(tr.b.select(f32t, None, signed, fs, fu))?;
+        // Normalized: over 2^w - 1 (2^(w-1) - 1 signed; w 32 kept in
+        // range), SNORM's -2^(w-1) clamped to -1.
+        let k32 = c(tr, 32);
+        let full = e(tr.b.u_greater_than_equal(bt, None, wc, k32))?;
+        let one_u = c(tr, 1);
+        let p2 = e(tr.b.shift_left_logical(u, None, one_u, wc))?;
+        let maxu = e(tr.b.i_sub(u, None, p2, one_u))?;
+        let all = c(tr, u32::MAX);
+        let maxu = e(tr.b.select(u, None, full, all, maxu))?;
+        let maxs = e(tr.b.shift_right_logical(u, None, maxu, one_u))?;
+        let scale = e(tr.b.select(u, None, signed, maxs, maxu))?;
+        let scale = e(tr.b.convert_u_to_f(f32t, None, scale))?;
+        let nf = e(tr.b.f_div(f32t, None, xf, scale))?;
+        let m1 = tr.f(-1.0);
+        let nf = tr.glsl2(f32t, GLOp::FMax, nf, m1)?;
+        // FLOAT: 16 or 32 bits (the table has no other width).
+        let k16 = c(tr, 16);
+        let half = e(tr.b.i_equal(bt, None, wc, k16))?;
+        let h = tr.glsl1(tr.t.v2f, GLOp::UnpackHalf2x16, raw)?;
+        let h = e(tr.b.composite_extract(f32t, None, h, [0]))?;
+        let hu = tr.to_u(h)?;
+        let flt = e(tr.b.select(u, None, half, hu, raw))?;
+        let nf = tr.to_u(nf)?;
+        let xf = tr.to_u(xf)?;
+        let v = e(tr.b.select(u, None, norm, nf, xf))?;
+        let v = e(tr.b.select(u, None, int_class, xi, v))?;
+        let v = e(tr.b.select(u, None, float_class, flt, v))?;
+        // An absent component: 0, the fourth one.
+        let absent = e(tr.b.i_equal(bt, None, wc, z))?;
+        let w_comp = e(tr.b.i_equal(bt, None, comp, k3))?;
+        let dflt = e(tr.b.select(u, None, w_comp, one, z))?;
+        let v = e(tr.b.select(u, None, absent, dflt, v))?;
+        let v = e(tr.b.select(u, None, valid, v, z))?;
+        // DST_SEL 0 and 1.
+        let is1 = e(tr.b.i_equal(bt, None, sel, one_u))?;
+        let v = e(tr.b.select(u, None, is1, one, v))?;
+        let is0 = e(tr.b.i_equal(bt, None, sel, z))?;
+        *slot = e(tr.b.select(u, None, is0, z, v))?;
+    }
+    Ok(out)
+}
+
 fn apply_dst_sel(tr: &mut T, v: [Word; 4], dst_sel: u16, float: bool) -> [Word; 4] {
     let one = if float { tr.u(1.0f32.to_bits()) } else { tr.u(1) };
     let z = tr.u(0);
@@ -1247,8 +1375,13 @@ pub fn buffer(tr: &mut T, ins: &Inst) -> R<()> {
         _ => (0, 0xFAC), // identity swizzle
     };
     let fmt = if ins.enc == Enc::Mtbuf { ins.mtbuf_format() as u16 } else { vfmt };
+    // (`FORMAT_RT`: the V#'s word 3 names the format when the program runs.)
+    if fmt == super::FORMAT_RT as u16 {
+        tr.rt_word3 = Some(tr.sreg(ins.buf_srsrc() as u32 + 3)?);
+    }
     let res = mem_access(tr, ins, name.trim_start_matches('t'), r, var, addr, fmt, dst_sel);
     tr.rt_vsharp = None;
+    tr.rt_word3 = None;
     res
 }
 
@@ -1491,9 +1624,13 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, r: usize, var: Word, addr: Wor
             return Ok(());
         }
         let n = comps.len();
-        let v = load_formatted(tr, var, addr, fmt)?;
-        let float = format::gfx10(fmt).is_none_or(|f| f.num.is_float());
-        let v = apply_dst_sel(tr, v, dst_sel, float);
+        let v = if fmt == super::FORMAT_RT as u16 {
+            load_formatted_rt(tr, var, addr, n)?
+        } else {
+            let v = load_formatted(tr, var, addr, fmt)?;
+            let float = format::gfx10(fmt).is_none_or(|f| f.num.is_float());
+            apply_dst_sel(tr, v, dst_sel, float)
+        };
         for (k, x) in v.iter().enumerate().take(n) {
             tr.set_vreg(vd + k as u32, *x)?;
         }
@@ -1503,6 +1640,10 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, r: usize, var: Word, addr: Wor
         if comps.starts_with("d16") {
             tr.warn(format!("{:#x}: {name} unsupported", ins.pc));
             return Ok(());
+        }
+        // (The runtime keeps the formats of buffers stored formatted.)
+        if fmt == super::FORMAT_RT as u16 {
+            return Err(format!("{:#x}: {name} to a run-time format buffer", ins.pc));
         }
         let n = comps.len() as u32;
         let mut vals = Vec::new();

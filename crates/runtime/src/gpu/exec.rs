@@ -8119,7 +8119,8 @@ fn gpu_res_imported(found: &shaders::Found, addr: u64, mask: u64, user: &[u32]) 
         let Some(v) = shaders::resource_vsharp(addr, plan, r, user) else { return false };
         if plan.resources[r].formatted {
             if let Some(rdna::translate::ResSpec::Buffer { format, dst_sel }) = found.tr.spec.resources.get(r) {
-                if v.format != *format || v.dst_sel != *dst_sel {
+                let rt_ok = *format == rdna::translate::FORMAT_RT && rdna::translate::rt_format_entry(v.format as u16) != 0;
+                if !rt_ok && (v.format != *format || v.dst_sel != *dst_sel) {
                     GPU_FORMAT_MISSES.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }

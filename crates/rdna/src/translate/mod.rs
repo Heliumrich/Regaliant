@@ -133,6 +133,54 @@ pub struct PsInput {
     pub default: Option<u8>,
 }
 
+/// `ResSpec::Buffer` format: the V#'s FORMAT and DST_SEL are read from its
+/// word 3 when the program runs and decoded through [`rt_format_entry`]'s
+/// table (`dst_sel` unused), so one translation serves every typed buffer
+/// format the title binds there (the runtime's compute stages, buffers the
+/// program only loads formatted).
+pub const FORMAT_RT: u8 = 0xFF;
+
+/// [`FORMAT_RT`]'s table entry of a unified format: the component widths
+/// (6 bits each from bit 0, component X first) and the number class (bits
+/// 24-26: 0 UNORM, 1 SNORM, 2 USCALED, 3 SSCALED, 4 UINT, 5 SINT, 6 FLOAT),
+/// bit 31 set; 0 for a format the decoder does not read (block-compressed,
+/// sRGB, floats other than 16 and 32 bits, components across dwords, sizes
+/// other than 1, 2, 4, 8, 12 and 16 bytes): such a binding keeps its format
+/// in the spec.
+pub fn rt_format_entry(id: u16) -> u32 {
+    use crate::format::Num;
+    let Some(f) = crate::format::gfx10(id) else { return 0 };
+    if f.block || f.components() == 0 {
+        return 0;
+    }
+    let class = match f.num {
+        Num::Unorm => 0,
+        Num::Snorm => 1,
+        Num::Uscaled => 2,
+        Num::Sscaled => 3,
+        Num::Uint => 4,
+        Num::Sint => 5,
+        Num::Float => 6,
+        _ => return 0,
+    };
+    let (mut e, mut off) = (0u32, 0u32);
+    for (c, &w) in f.bits.iter().enumerate() {
+        let w = w as u32;
+        if w == 0 {
+            break;
+        }
+        if class == 6 && w != 16 && w != 32 || off / 32 != (off + w - 1) / 32 {
+            return 0;
+        }
+        e |= w << (6 * c);
+        off += w;
+    }
+    if off % 8 != 0 || !matches!(off / 8, 1 | 2 | 4 | 8 | 12 | 16) {
+        return 0;
+    }
+    e | class << 24 | 1 << 31
+}
+
 /// Per-resource specialization resolved from descriptors at draw time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ResSpec {
@@ -818,6 +866,11 @@ pub(crate) struct T<'a> {
     pub elections: HashMap<u32, usize>,
     /// Wave-mask mode (see the module documentation).
     pub wave_masks: bool,
+    /// [`FORMAT_RT`] buffers: [`rt_format_entry`]'s table (a private array
+    /// of 128 entries, made when the spec has such a buffer), and the
+    /// instruction's V# word 3 while a typed access is translated.
+    pub fmt_table: Option<Word>,
+    pub rt_word3: Option<Word>,
     /// Wave-mask mode: pcs of the mask writes that produce complete masks.
     pub complete: crate::HashSet<u32>,
     /// Wave-mask mode: whether this lane's bit lies in the high dword of a
@@ -2123,6 +2176,8 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         xchg_first: None,
         uniformity: crate::uniform::analyze(code),
         lockstep: false,
+        fmt_table: None,
+        rt_word3: None,
         vote: None,
         vote_ctr: None,
         sync_starts: Vec::new(),
@@ -2377,6 +2432,18 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         let pt = tr.b.type_pointer(None, StorageClass::Workgroup, arr);
         tr.vote = Some(tr.global_var(pt, StorageClass::Workgroup));
         tr.uniformity.set_lockstep();
+    }
+    if tr.spec.resources.iter().any(|r| matches!(r, ResSpec::Buffer { format: FORMAT_RT, .. })) {
+        let n = tr.u(128);
+        let arr = tr.b.type_array(tr.t.u32, n);
+        let entries: Vec<Word> = (0..128u16).map(|id| tr.u(rt_format_entry(id))).collect();
+        let init = tr.b.constant_composite(arr, entries);
+        let pt = tr.b.type_pointer(None, StorageClass::Private, arr);
+        // (Module scope, with its initializer.)
+        let id = tr.b.id();
+        let inst = rspirv::dr::Instruction::new(spirv::Op::Variable, Some(pt), Some(id), vec![Operand::StorageClass(StorageClass::Private), Operand::IdRef(init)]);
+        tr.b.module_mut().types_global_values.push(inst);
+        tr.fmt_table = Some(id);
     }
     for ins in code {
         if let Some((true, vgpr, lane)) = ins.const_lane_op() {
@@ -3562,6 +3629,78 @@ mod tests {
         if let Ok(dir) = std::env::var("RDNA_MARKS_DUMP") {
             let bytes: Vec<u8> = b.spirv.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("write_marks.spv"), bytes).unwrap();
+        }
+    }
+
+    /// `rt_format_entry`: component widths from the least significant
+    /// (2_10_10_10: X, Y and Z 10 bits, W 2) and classes; 0 for what the
+    /// run-time decoder does not read.
+    #[test]
+    fn run_time_format_table() {
+        let w = |e: u32| (0..4).map(|c| (e >> (6 * c)) & 63).collect::<Vec<_>>();
+        let e = rt_format_entry(56);
+        assert_eq!((w(e), (e >> 24) & 7, e >> 31), (vec![8, 8, 8, 8], 0, 1));
+        let e = rt_format_entry(74);
+        assert_eq!((w(e), (e >> 24) & 7), (vec![32, 32, 32, 0], 6));
+        let e = rt_format_entry(50);
+        assert_eq!((w(e), (e >> 24) & 7), (vec![10, 10, 10, 2], 0));
+        // 10_11_11 floats, BC1, an id without a format.
+        assert_eq!((rt_format_entry(36), rt_format_entry(169), rt_format_entry(0)), (0, 0, 0));
+    }
+
+    /// `FORMAT_RT`: a formatted load reads its format from the V# when the
+    /// program runs (the table a private array, no warning, the same
+    /// bindings as with the format in the spec). RDNA_RT_FORMAT_DUMP=<dir>
+    /// writes both modules for spvval.
+    #[test]
+    fn run_time_buffer_formats() {
+        use crate::tables::*;
+        let op = |t: &[(u16, &str)], n: &str| t.iter().find(|(_, x)| x.split('/').next() == Some(n)).unwrap().0 as u32;
+        // MUBUF, IDXEN, SOFFSET 0 (inline constant).
+        let mubuf = |opc: u32, vaddr: u32, vdata: u32, srsrc: u32| [(0x38 << 26) | (opc << 18) | (1 << 13), vaddr | vdata << 8 | (srsrc / 4) << 16 | 0x80 << 24];
+        // buffer_load_format_xyzw v[4:7], v0, s[0:3] ; buffer_store_dwordx4 v[4:7], v0, s[4:7] ; s_endpgm
+        let mut words = Vec::new();
+        words.extend(mubuf(op(MUBUF, "buffer_load_format_xyzw"), 0, 4, 0));
+        words.extend(mubuf(op(MUBUF, "buffer_store_dwordx4"), 0, 4, 4));
+        words.push(0xBF81_0000);
+        let code = crate::decode_program(&words).unwrap();
+        let plan = crate::analysis::analyze(&code, 8, 0);
+        assert_eq!(plan.resources.iter().filter(|r| r.formatted).count(), 1);
+        let mut spec = cs_spec([64, 1, 1]);
+        spec.user_sgprs = 8;
+        let specs = |rt: bool| -> Vec<ResSpec> {
+            plan.resources
+                .iter()
+                .map(|r| match r.kind {
+                    ResKind::Global => ResSpec::Global,
+                    _ if r.formatted && rt => ResSpec::Buffer { format: FORMAT_RT, dst_sel: 0 },
+                    _ if r.formatted => ResSpec::Buffer { format: 56, dst_sel: 0xFAC },
+                    _ => ResSpec::Buffer { format: 0, dst_sel: 0 },
+                })
+                .collect()
+        };
+        spec.resources = specs(false);
+        let a = translate(&code, &plan, &spec).unwrap();
+        spec.resources = specs(true);
+        let b = translate(&code, &plan, &spec).unwrap();
+        assert!(a.warnings.is_empty() && b.warnings.is_empty(), "{:?} {:?}", a.warnings, b.warnings);
+        assert_eq!(a.bindings.len(), b.bindings.len());
+        // OpVariable (59) in Private (6): the table, only with FORMAT_RT.
+        let private = |w: &[u32]| {
+            let mut i = 5;
+            let mut n = 0;
+            while i < w.len() && w[i] >> 16 != 0 {
+                n += (w[i] & 0xFFFF == 59 && w.get(i + 3) == Some(&6)) as usize;
+                i += (w[i] >> 16) as usize;
+            }
+            n
+        };
+        assert_eq!((private(&a.spirv), private(&b.spirv)), (0, 1));
+        if let Ok(dir) = std::env::var("RDNA_RT_FORMAT_DUMP") {
+            for (name, o) in [("rt_formats_static.spv", &a), ("rt_formats.spv", &b)] {
+                let bytes: Vec<u8> = o.spirv.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(std::path::Path::new(&dir).join(name), bytes).unwrap();
+            }
         }
     }
 
