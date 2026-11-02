@@ -2371,23 +2371,39 @@ pub(crate) fn translate_for_spec(addr: u64, key_spec: Spec) -> Result<Arc<Transl
 /// images by their instructions' dimension as float views, those sampled
 /// with a depth comparison as depth views; buffers as `prepare` keys them
 /// (unknown for format accesses).
-pub(crate) fn guess_compute_spec(addr: u64, insts: &[rdna::Inst], plan: &Plan, code_hash: u64, rsrc2: u32, local: [u32; 3]) -> (Spec, bool) {
+pub(crate) fn guess_compute_spec(addr: u64, insts: &[rdna::Inst], plan: &Plan, code_hash: u64, rsrc2: u32, local: [u32; 3]) -> Spec {
     let wave64 = !insts.iter().any(|i| i.name().is_some_and(|n| n.ends_with("_saveexec_b32") || n.ends_with("_wrexec_b32")));
     let fmt = format_resources(insts, plan);
     let stored = format_store_resources(insts, plan);
     let user_sgprs = ((rsrc2 >> 1) & 0x1F).min(16) as u16;
     let plan_key = code_hash ^ (user_sgprs as u64) << 48;
     let cmp = super::tune::cmp_emulate().then(|| compare_images(plan_key, insts, plan)).unwrap_or(0);
-    let mut known = true;
     let resources = plan
         .resources
         .iter()
         .enumerate()
         .map(|(r, res)| match res.kind {
             ResKind::Buffer if fmt & (1 << r.min(63)) != 0 && stored & (1 << r.min(63)) == 0 => ResSpec::Buffer { format: translate::FORMAT_RT, dst_sel: 0 },
+            // A buffer the program stores to formatted: the format the
+            // title's stores of that width used most (the guess report of
+            // 2026-11-02 night: one component 32-bit unsigned X, 310 of 346;
+            // two 62/XY, three 74/XYZ, four 50/XYZW); a dispatch that binds
+            // another makes its own translation.
             ResKind::Buffer if fmt & (1 << r.min(63)) != 0 => {
-                known = false;
-                ResSpec::Buffer { format: 0, dst_sel: 0xFAC }
+                let widest = insts
+                    .iter()
+                    .filter(|i| plan.inst_res.get(&i.pc).is_some_and(|x| x.0 == r))
+                    .filter_map(|i| i.name())
+                    .filter(|n| n.starts_with("buffer_store_format_") || n.starts_with("tbuffer_store_format_"))
+                    .map(|n| n.rsplit('_').next().map_or(1, |c| c.len()))
+                    .max()
+                    .unwrap_or(1);
+                match widest {
+                    1 => ResSpec::Buffer { format: 20, dst_sel: 0x4 },
+                    2 => ResSpec::Buffer { format: 62, dst_sel: 0x2C },
+                    3 => ResSpec::Buffer { format: 74, dst_sel: 0x3AC },
+                    _ => ResSpec::Buffer { format: 50, dst_sel: 0xFAC },
+                }
             }
             ResKind::Buffer => ResSpec::Buffer { format: 0, dst_sel: 0 },
             ResKind::Global => ResSpec::Global,
@@ -2419,7 +2435,7 @@ pub(crate) fn guess_compute_spec(addr: u64, insts: &[rdna::Inst], plan: &Plan, c
             }
         })
         .collect();
-    (compute_spec(addr, code_hash, rsrc2, local, wave64, resources, batchable(addr)), known)
+    compute_spec(addr, code_hash, rsrc2, local, wave64, resources, batchable(addr))
 }
 
 /// The key spec (code base left out) `prepare_ngg` makes for the vertex

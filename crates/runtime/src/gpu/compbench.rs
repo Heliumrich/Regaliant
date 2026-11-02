@@ -77,7 +77,7 @@ fn guess_report(app: &std::path::Path) -> i32 {
         engine_learned += is_engine as u64;
         for spec in &specs {
             let plan = rdna::analysis::analyze_opts(&insts, spec.user_sgprs, spec.user_base, false);
-            let (guess, _) = super::shaders::guess_compute_spec(0, &insts, &plan, h, spec.cs_rsrc2, spec.cs_local_size);
+            let guess = super::shaders::guess_compute_spec(0, &insts, &plan, h, spec.cs_rsrc2, spec.cs_local_size);
             let mut actual = spec.clone();
             actual.code_base = guess.code_base;
             // (Keyed as a preparation keys it now.)
@@ -212,8 +212,7 @@ fn object_regs(o: &[u8]) -> Option<(u32, [u32; 3])> {
 }
 
 /// The compute programs of the game's shader files (`DS_CB_BUNDLES`), each
-/// with the spec guessed from its shader object (complete guesses only),
-/// once per code hash.
+/// with the spec guessed from its shader object, once per code hash.
 fn bundle_compute(app: &std::path::Path) -> Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<rdna::translate::Spec>)> {
     let sample: u64 = std::env::var("DS_CB_SAMPLE").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(1);
     let mut files: Vec<std::path::PathBuf> = Vec::new();
@@ -231,7 +230,7 @@ fn bundle_compute(app: &std::path::Path) -> Vec<(u64, std::sync::Arc<Vec<u32>>, 
         }
     }
     let mut seen = std::collections::HashSet::new();
-    let (mut programs, mut no_object, mut unknown) = (0u64, 0u64, 0u64);
+    let (mut programs, mut no_object) = (0u64, 0u64);
     let mut out = Vec::new();
     for f in files.iter().filter(|p| p.extension().is_some_and(|x| x == "csdr")) {
         let Some(v) = std::fs::read(f).ok().and_then(|b| super::particles::bundle_programs(&b)) else { continue };
@@ -247,21 +246,16 @@ fn bundle_compute(app: &std::path::Path) -> Vec<(u64, std::sync::Arc<Vec<u32>>, 
             let Ok(insts) = rdna::decode_program(&p.code) else { continue };
             let user_sgprs = ((rsrc2 >> 1) & 0x1F).min(16) as u16;
             let plan = rdna::analysis::analyze_opts(&insts, user_sgprs, 0, false);
-            let (spec, known) = super::shaders::guess_compute_spec(0, &insts, &plan, p.hash, rsrc2, local);
-            if !known {
-                unknown += 1;
-                continue;
-            }
+            let spec = super::shaders::guess_compute_spec(0, &insts, &plan, p.hash, rsrc2, local);
             out.push((p.hash, std::sync::Arc::new(p.code), vec![spec]));
         }
     }
-    crate::info!("compile bench: {programs} compute programs in the game's shader files (every {sample}th by code hash): {} with a complete guess, {unknown} incomplete, {no_object} without an object read", out.len());
+    crate::info!("compile bench: {programs} compute programs in the game's shader files (every {sample}th by code hash): {} guessed, {no_object} without an object read", out.len());
     out
 }
 
 /// `--precompile-all [threads]`: every compute program of the game's shader
-/// files whose shader object gives its spec completely (`bundle_compute`)
-/// is translated and its pipeline made through the pipeline store under the
+/// files with a shader object (`bundle_compute`) is translated and its pipeline made through the pipeline store under the
 /// key its dispatches look up, the largest first, on `threads` threads
 /// (default 8): later sessions then find it instead of compiling it at the
 /// program's first dispatch, wherever the dispatch binds what the guess
@@ -361,9 +355,9 @@ pub fn run(args: &[String], app: &std::path::Path) -> i32 {
     }
     // DS_CB_BUNDLES=1: the game's own compute programs (the particle
     // bundles' and the engine's shader files) instead of the learned ones,
-    // each with the spec guessed from its shader object, complete guesses
-    // only: what compiling them all ahead would take (DS_CB_SAMPLE=<n>:
-    // every n-th by code hash).
+    // each with the spec guessed from its shader object: what compiling
+    // them all ahead would take (DS_CB_SAMPLE=<n>: every n-th by code
+    // hash).
     let source = if std::env::var("DS_CB_BUNDLES").ok().as_deref() == Some("1") { bundle_compute(app) } else { super::precompile::learned_compute() };
     let mut progs: Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<rdna::translate::Spec>, usize)> = source
         .into_iter()

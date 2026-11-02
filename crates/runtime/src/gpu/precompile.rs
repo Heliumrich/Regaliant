@@ -21,8 +21,8 @@
 //! `tune precompile_workers` threads at the lowest priority, under the keys
 //! its dispatches look up (`shaders::translate_for_spec`,
 //! `exec::precompile_translation`); 3 also makes the guess from the object
-//! alone (`shaders::guess_compute_spec`; complete for ~40% of the programs a
-//! session dispatches, and most objects never run). With 1, and above, each
+//! alone (`shaders::guess_compute_spec`; equal to 86% of a first session's
+//! first translations, 2026-11-02 night, and most objects never run). With 1, and above, each
 //! first translation is also compared with that guess (status line).
 //!
 //! Graphics pipelines the same way: each one created records both stages'
@@ -736,8 +736,8 @@ fn run(addr: u64) {
     if super::tune::precompile() >= 3 {
         let user_sgprs = ((c.rsrc2 >> 1) & 0x1F).min(16) as u16;
         if let Ok((insts, plan, _)) = super::shaders::stage_plan(addr, user_sgprs, 0) {
-            let (g, known) = super::shaders::guess_compute_spec(addr, &insts, &plan, code_hash, c.rsrc2, c.local);
-            if known && !specs.contains(&g) {
+            let g = super::shaders::guess_compute_spec(addr, &insts, &plan, code_hash, c.rsrc2, c.local);
+            if !specs.contains(&g) {
                 specs.push(g);
             }
         }
@@ -848,7 +848,7 @@ pub fn first_translation(addr: u64, insts: &[rdna::Inst], plan: &rdna::analysis:
     STATS[WITH_OBJECT].fetch_add(1, Ordering::Relaxed);
     let k = if c.modifier & (1 << 15) != 0 { 0 } else { 2 } + if actual.wave64 { 0 } else { 1 };
     MODIFIER[k].fetch_add(1, Ordering::Relaxed);
-    let (guess, _) = super::shaders::guess_compute_spec(addr, insts, plan, code_hash, c.rsrc2, c.local);
+    let guess = super::shaders::guess_compute_spec(addr, insts, plan, code_hash, c.rsrc2, c.local);
     if guess == *actual {
         STATS[EQUAL].fetch_add(1, Ordering::Relaxed);
         return;
