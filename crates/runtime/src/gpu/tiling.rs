@@ -421,9 +421,63 @@ impl Layout {
         }
     }
 
-    /// `offset` per element without divisions (block sizes are powers of
-    /// two) and fixed-size element copies.
+    /// Rows of a mip outside the tail block by blocks: a block row's rows
+    /// block by block, so each block's source bytes (64 KiB at most) stay in
+    /// the core's caches while its rows are written (row by row across the
+    /// whole mip, a 2048-wide BC mip's 8 blocks were read again for each of
+    /// their 64 rows: `detile_speed` 2.2-2.6x faster from the caches, 1.9x
+    /// from memory; in play 13% less detiling time a MiB, FINDINGS.md
+    /// 2026-11-02 night). Tail mips take `rows_any`.
     fn rows_n<const N: usize>(&self, src: &[u8], m: &MipLayout, slice: u32, y0: usize, out: &mut [u8]) {
+        if m.tail.is_some() {
+            return self.rows_any::<N>(src, m, slice, y0, out);
+        }
+        let w = m.width as usize;
+        let rows = out.len() / (w * N).max(1);
+        let base = slice as u64 * self.slice_size + m.offset;
+        let lh = self.block_h.trailing_zeros();
+        let (bw, mh) = (self.block_w as usize, self.block_h as usize - 1);
+        let bsize = 1usize << self.block_log2;
+        let pitch_blocks = (m.pitch / self.block_w).max(1) as u64;
+        let mut r = 0;
+        while r < rows {
+            let gy = y0 + r;
+            let band = (mh + 1 - (gy & mh)).min(rows - r);
+            let brow = base + (((gy >> lh) as u64 * pitch_blocks) << self.block_log2);
+            for (bx, x0) in (0..w).step_by(bw).enumerate() {
+                let xs = &self.xs[..bw.min(w - x0)];
+                let blk = (brow + ((bx as u64) << self.block_log2)) as usize;
+                let whole = src.get(blk..blk + bsize);
+                for k in 0..band {
+                    let ysv = self.ys[(gy + k) & mh] as usize;
+                    let at = (r + k) * w * N + x0 * N;
+                    let orow = &mut out[at..at + xs.len() * N];
+                    match whole {
+                        Some(sb) => {
+                            for (d, &xo) in orow.chunks_exact_mut(N).zip(xs) {
+                                let o = xo as usize ^ ysv;
+                                d.copy_from_slice(&sb[o..o + N]);
+                            }
+                        }
+                        None => {
+                            for (d, &xo) in orow.chunks_exact_mut(N).zip(xs) {
+                                let o = blk + (xo as usize ^ ysv);
+                                match src.get(o..o + N) {
+                                    Some(s) => d.copy_from_slice(s),
+                                    None => d.fill(0),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            r += band;
+        }
+    }
+
+    /// `offset` per element without divisions (block sizes are powers of
+    /// two) and fixed-size element copies, row by row (any mip).
+    fn rows_any<const N: usize>(&self, src: &[u8], m: &MipLayout, slice: u32, y0: usize, out: &mut [u8]) {
         let w = m.width as usize;
         let base = slice as u64 * self.slice_size + m.offset;
         let (tx, ty) = m.tail.map(|(a, b)| (a as usize, b as usize)).unwrap_or((0, 0));
@@ -465,29 +519,69 @@ mod tests {
                 for (tw, th, levels) in [(300u32, 200u32, 9u32), (1024, 512, 11), (64, 64, 7), (2048, 1024, 1)] {
                     let Some(l) = layout(sw, el, tw, th, levels, false) else { continue };
                     let size = l.size(2) as usize;
-                    let src: Vec<u8> = (0..size).map(|i| (i * 2654435761usize >> 7) as u8).collect();
-                    for mip in 0..l.mips.len() {
-                        for slice in 0..2 {
-                            let m = &l.mips[mip];
-                            let e = 1usize << el;
-                            let mut want = vec![0u8; m.width as usize * m.height as usize * e];
-                            for y in 0..m.height {
-                                for x in 0..m.width {
-                                    let o = l.offset(mip, slice, x, y) as usize;
-                                    let d = (y as usize * m.width as usize + x as usize) * e;
-                                    if o + e <= src.len() {
-                                        want[d..d + e].copy_from_slice(&src[o..o + e]);
-                                    }
+                    let full: Vec<u8> = (0..size).map(|i| (i * 2654435761usize >> 7) as u8).collect();
+                    // (And a source that ends inside a block: zeros past it.)
+                    for (mip, slice, cut) in (0..l.mips.len()).flat_map(|m| [(m, 0, size), (m, 1, size), (m, 1, size * 3 / 5 + 7)]) {
+                        let src = &full[..cut];
+                        let m = &l.mips[mip];
+                        let e = 1usize << el;
+                        let mut want = vec![0u8; m.width as usize * m.height as usize * e];
+                        for y in 0..m.height {
+                            for x in 0..m.width {
+                                let o = l.offset(mip, slice, x, y) as usize;
+                                let d = (y as usize * m.width as usize + x as usize) * e;
+                                if o + e <= src.len() {
+                                    want[d..d + e].copy_from_slice(&src[o..o + e]);
                                 }
                             }
-                            let mut got = Vec::new();
-                            l.detile(&src, mip, slice, &mut got);
-                            assert!(got == want, "sw {sw} elem {el} {tw}x{th} mip {mip} slice {slice}");
                         }
+                        let mut got = Vec::new();
+                        l.detile(src, mip, slice, &mut got);
+                        assert!(got == want, "sw {sw} elem {el} {tw}x{th} mip {mip} slice {slice} source {cut} of {size}");
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn detile_speed() {
+        // `cargo test --release -p dsport detile_speed -- --ignored
+        // --nocapture`: a 2048x2048 BC7 texture's mips outside the tail (the
+        // 64 KiB R_X swizzle of the title's streamed textures), on one
+        // thread, by rows against by blocks, sources in the caches (one
+        // texture) and not (12 textures, 65 MB, taken in turn).
+        let l = layout(27, 4, 2048, 2048, 12, true).unwrap();
+        let size = l.size(1) as usize;
+        let srcs: Vec<Vec<u8>> = (0..12).map(|k| (0..size).map(|i| ((i + k) * 2654435761usize >> 7) as u8).collect()).collect();
+        let mips: Vec<usize> = (0..l.mips.len()).filter(|&i| l.mips[i].tail.is_none()).collect();
+        let bytes: usize = mips.iter().map(|&i| l.mips[i].width as usize * l.mips[i].height as usize * 16).sum();
+        let run = |src: &[u8], out: &mut [u8], blocks: bool| {
+            let mut off = 0;
+            for &i in &mips {
+                let m = &l.mips[i];
+                let n = m.width as usize * m.height as usize * 16;
+                if blocks {
+                    l.rows_n::<16>(src, m, 0, 0, &mut out[off..off + n]);
+                } else {
+                    l.rows_any::<16>(src, m, 0, 0, &mut out[off..off + n]);
+                }
+                off += n;
+            }
+        };
+        let (mut a, mut b) = (vec![0u8; bytes], vec![0u8; bytes]);
+        for (blocks, rotate) in [(false, false), (true, false), (false, true), (true, true), (false, false), (true, false)] {
+            let out = if blocks { &mut b } else { &mut a };
+            run(&srcs[0], out, blocks);
+            let t = std::time::Instant::now();
+            for k in 0..24 {
+                run(&srcs[if rotate { k % 12 } else { 0 }], out, blocks);
+            }
+            let s = t.elapsed().as_secs_f64() / 24.0;
+            println!("{} {}: {:.2} ms, {:.2} GB/s", if blocks { "by blocks" } else { "by rows  " }, if rotate { "cold" } else { "warm" }, s * 1e3, bytes as f64 / s / 1e9);
+        }
+        assert!(a == b);
     }
 
     #[test]

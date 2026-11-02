@@ -906,12 +906,13 @@ fn note_upload_span(qp: vk::QueryPool, what: impl FnOnce() -> String) {
     }
 }
 
-/// A host-visible buffer texture data is uploaded from (one an upload
-/// makes for itself).
+/// A host-visible buffer texture data is uploaded from (`staging_take`):
+/// its bytes, which the batched uploads' in-flight limit counts.
 struct Staging {
     buf: vk::Buffer,
     mem: vk::DeviceMemory,
     ptr: *mut u8,
+    cap: u64,
 }
 
 /// What a GPU-detiled upload in flight holds until the GPU is done with it:
@@ -968,13 +969,90 @@ const BATCHED_MAX_BYTES: u64 = 256 << 20;
 const BATCHED_OPEN_BYTES: u64 = 64 << 20;
 
 fn free_batched(held: Vec<(vk::Buffer, vk::DeviceMemory)>) {
-    let c = ctx();
     for (buf, mem) in held {
-        unsafe {
-            c.device.destroy_buffer(buf, None);
-            c.device.unmap_memory(mem);
-            c.device.free_memory(mem, None);
+        staging_free(buf, mem);
+    }
+}
+
+/// Staging buffers of CPU-detiled uploads kept mapped for reuse, by size
+/// class (64 KiB << class, up to 64 MiB): each upload had made a buffer,
+/// allocated, bound and mapped its memory, written fresh pages and freed it
+/// all again once the GPU was done (in play 0.24 ms a MiB uploaded against
+/// 0.05 from the pool, FINDINGS.md 2026-11-02 night).
+struct StagingPool {
+    /// Free buffers per class: buffer, memory, mapped pointer.
+    free: [Vec<(vk::Buffer, vk::DeviceMemory, usize)>; STAGING_CLASSES],
+    /// Bytes on the free lists (at most `STAGING_POOL_MAX`).
+    bytes: u64,
+    /// The pool's allocations, free or in use, by memory: class, pointer.
+    owned: HashMap<vk::DeviceMemory, (usize, usize)>,
+}
+
+const STAGING_CLASSES: usize = 11;
+const STAGING_POOL_MAX: u64 = 128 << 20;
+static STAGING_POOL: Mutex<Option<StagingPool>> = Mutex::new(None);
+/// Staging buffers taken from the pool, made for it, made outside it
+/// (diagnostics).
+static STAGING_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+fn staging_class(size: u64) -> Option<usize> {
+    let k = size.max(64 << 10).next_power_of_two().trailing_zeros().checked_sub(16)? as usize;
+    (k < STAGING_CLASSES).then_some(k)
+}
+
+/// A mapped staging buffer of at least `size` bytes for an upload's copy
+/// source: a free one of its class from the pool, or made (`staging_free`
+/// gives it back).
+fn staging_take(size: u64) -> Result<Staging, String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(k) = staging_class(size) else {
+        STAGING_STATS[2].fetch_add(1, Relaxed);
+        let (buf, mem, ptr) = ctx().host_buffer(size.max(4), vk::BufferUsageFlags::TRANSFER_SRC)?;
+        return Ok(Staging { buf, mem, ptr, cap: size.max(4) });
+    };
+    let hit = {
+        let mut g = STAGING_POOL.lock();
+        let p = g.get_or_insert_with(|| StagingPool { free: Default::default(), bytes: 0, owned: HashMap::default() });
+        let e = p.free[k].pop();
+        if e.is_some() {
+            p.bytes -= 64 << 10 << k;
         }
+        e
+    };
+    if let Some((buf, mem, ptr)) = hit {
+        STAGING_STATS[0].fetch_add(1, Relaxed);
+        return Ok(Staging { buf, mem, ptr: ptr as *mut u8, cap: 64 << 10 << k });
+    }
+    STAGING_STATS[1].fetch_add(1, Relaxed);
+    let (buf, mem, ptr) = ctx().host_buffer(64 << 10 << k, vk::BufferUsageFlags::TRANSFER_SRC)?;
+    if let Some(p) = STAGING_POOL.lock().as_mut() {
+        p.owned.insert(mem, (k, ptr as usize));
+    }
+    Ok(Staging { buf, mem, ptr, cap: 64 << 10 << k })
+}
+
+/// Gives a staging buffer back once the GPU is done with it: to the pool's
+/// free list if it is the pool's and the list has room, else frees it.
+fn staging_free(buf: vk::Buffer, mem: vk::DeviceMemory) {
+    {
+        let mut g = STAGING_POOL.lock();
+        if let Some(p) = g.as_mut() {
+            if let Some(&(k, ptr)) = p.owned.get(&mem) {
+                let n = 64u64 << 10 << k;
+                if p.bytes + n <= STAGING_POOL_MAX {
+                    p.free[k].push((buf, mem, ptr));
+                    p.bytes += n;
+                    return;
+                }
+                p.owned.remove(&mem);
+            }
+        }
+    }
+    let c = ctx();
+    unsafe {
+        c.device.destroy_buffer(buf, None);
+        c.device.unmap_memory(mem);
+        c.device.free_memory(mem, None);
     }
 }
 
@@ -1112,6 +1190,10 @@ const SUB_UNMAPPED: u64 = 0x5555_5555_5555_5555;
 /// filled, freed), the transfer (submitted and waited for: the GPU's queue
 /// drains first).
 static UPLOAD_SPLIT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// The detiling phase of CPU-detiled 2D uploads (diagnostics), ns: the
+/// staging buffer's allocation (made and mapped), the detiling into it, a
+/// first upload's hashes.
+static UPLOAD_PHASES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 /// Uploads whose pages were checked in the mapping table and held (no
 /// mapping change before the reader lock), and those checked again with the
 /// operating system (`mem::table_view_held`).
@@ -2212,12 +2294,14 @@ fn prepare_reupload(job: &RefreshJob) -> Result<Prepared, String> {
         Chose::Done((_, size)) => return Ok(Prepared { copy: None, size, notes }),
         Chose::Parts(c) => c,
     };
-    let (buf, mem, ptr) = ctx().host_buffer(total.max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
-    let st = Staging { buf, mem, ptr };
+    let t_alloc0 = std::time::Instant::now();
+    let st = staging_take(total as u64)?;
     let src = unsafe { std::slice::from_raw_parts(job.t.base as *const u8, end as usize) };
     let dst = unsafe { std::slice::from_raw_parts_mut(st.ptr, total) };
+    let t_alloc = std::time::Instant::now();
     detile_parts(&lay, src, &parts, dst);
     dst[zero_off..].fill(0);
+    let t_detiled = std::time::Instant::now();
     // A first upload's sums (for later partial re-uploads), as `upload_inner`
     // makes them.
     if sums_on && job.first {
@@ -2233,6 +2317,9 @@ fn prepare_reupload(job: &RefreshJob) -> Result<Prepared, String> {
             sums[i] = h;
         }
     }
+    UPLOAD_PHASES[0].fetch_add((t_alloc - t_alloc0).as_nanos() as u64, Relaxed);
+    UPLOAD_PHASES[1].fetch_add((t_detiled - t_alloc).as_nanos() as u64, Relaxed);
+    UPLOAD_PHASES[2].fetch_add(t_detiled.elapsed().as_nanos() as u64, Relaxed);
     // Guest memory is no longer read.
     drop(readers);
     UPLOAD_SPLIT[0].fetch_add(t_detile.elapsed().as_nanos() as u64, Relaxed);
@@ -3177,15 +3264,14 @@ impl Images {
         // failed imports against 48, then unmapped textures and device losses
         // at cold boots; the pooled buffers of the removed `tune
         // upload_async` likewise).
-        let st = {
-            let (buf, mem, ptr) = ctx().host_buffer(total.max(4) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
-            Staging { buf, mem, ptr }
-        };
+        let st = staging_take(total as u64)?;
         let t_alloc = std::time::Instant::now();
         let dst = unsafe { std::slice::from_raw_parts_mut(st.ptr, total) };
         detile_parts(&lay, src, &parts, dst);
         let t_detiled = std::time::Instant::now();
         dst[zero_off..].fill(0);
+        UPLOAD_PHASES[0].fetch_add((t_alloc - t_chosen).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        UPLOAD_PHASES[1].fetch_add(t_alloc.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         // A first upload's sums (for later partial re-uploads), hashed here
         // on several threads rather than one by one before the detiling.
         if sums_on && first {
@@ -3197,9 +3283,11 @@ impl Images {
                 })
                 .collect();
             let threads = if detiled >= 1 << 20 { super::pool::threads() } else { 1 };
+            let t_hash = std::time::Instant::now();
             for (i, h) in hash_parts(&todo, threads) {
                 sums[i] = h;
             }
+            UPLOAD_PHASES[2].fetch_add(t_hash.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         }
         // Guest memory is no longer read.
         drop(readers);
@@ -3224,7 +3312,6 @@ impl Images {
                 if first { "zero-filled" } else { "left as they were" }
             ));
         }
-        let c = ctx();
         let t_stage = std::time::Instant::now();
         let (buf, mem) = (st.buf, st.mem);
         let base = t.base;
@@ -3234,7 +3321,7 @@ impl Images {
         // (`tune upload_batch`: into the command buffer the uploads share,
         // not waited for; its own staging freed once that completes.)
         if super::tune::upload_batch() {
-            match record_batched((st.buf, st.mem), total.max(4) as u64, &record) {
+            match record_batched((st.buf, st.mem), st.cap, &record) {
                 Ok(()) => {
                     UPLOAD_SPLIT[2].fetch_add(t_copy.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                     self.uploads += 1;
@@ -3252,12 +3339,7 @@ impl Images {
         let t_free = std::time::Instant::now();
         UPLOAD_SPLIT[2].fetch_add((t_free - t_copy).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         // The GPU is done with it (one_shot waited).
-        let _ = (buf, mem);
-        unsafe {
-            c.device.destroy_buffer(st.buf, None);
-            c.device.unmap_memory(st.mem);
-            c.device.free_memory(st.mem, None);
-        }
+        staging_free(buf, mem);
         UPLOAD_SPLIT[1].fetch_add(t_free.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         // Uploads of 50 ms or more: where their time went (diagnosis).
         let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
@@ -4479,7 +4561,7 @@ impl Images {
         // writing meanwhile, e.g. as a storage image in the same stage: that
         // work was recorded after it and waits for its copy.)
         let live = self.map.get(&job.key).is_some_and(|i| i.image == job.image && (job.first || !i.gpu_written));
-        if let Some((st, regions, total)) = p.copy {
+        if let Some((st, regions, _)) = p.copy {
             if !live {
                 out[1].fetch_add(1, Relaxed);
                 free_batched(vec![(st.buf, st.mem)]);
@@ -4487,7 +4569,7 @@ impl Images {
             }
             let (image, buf, base, first) = (job.image, st.buf, job.t.base, job.first);
             let record = |cmd: vk::CommandBuffer| record_upload(cmd, image, first, buf, &regions, base);
-            if let Err(e) = record_batched((st.buf, st.mem), total.max(4) as u64, &record) {
+            if let Err(e) = record_batched((st.buf, st.mem), st.cap, &record) {
                 static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, Relaxed) {
                     crate::warn!("images: upload not batched: {e}");
@@ -5301,7 +5383,7 @@ impl Images {
             gpu
         };
         format!(
-            "    images: {} cached ({} MiB; GPU-written {} ({} MiB), kept for the session; {} textures evicted, {} MiB, in {} rounds), {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes)), {} ms staging, {} ms transfers; waits for uploads in flight {}; batched (`tune upload_batch`) {} in {} command buffers, {} waits; pages checked in the mapping table {}, again with the operating system {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages, {} found clean by a probe); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}{gpu}\n",
+            "    images: {} cached ({} MiB; GPU-written {} ({} MiB), kept for the session; {} textures evicted, {} MiB, in {} rounds), {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes); CPU-detiled: staging buffers taken {} ms ({} from the pool, {} made for it, {} outside it: over 64 MiB), detiling into them {} ms, first uploads' hashes {} ms), {} ms staging, {} ms transfers; waits for uploads in flight {}; batched (`tune upload_batch`) {} in {} command buffers, {} waits; pages checked in the mapping table {}, again with the operating system {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages, {} found clean by a probe); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}{gpu}\n",
             self.map.len(),
             IMAGE_BYTES.load(Relaxed) >> 20,
             self.map.values().filter(|i| i.gpu_written).count(),
@@ -5316,6 +5398,12 @@ impl Images {
             DETILED.load(Relaxed) >> 20,
             UPLOAD_SPLIT[0].load(Relaxed) / 1_000_000,
             UPLOAD_SPLIT[3].load(Relaxed) / 1_000_000,
+            UPLOAD_PHASES[0].load(Relaxed) / 1_000_000,
+            STAGING_STATS[0].load(Relaxed),
+            STAGING_STATS[1].load(Relaxed),
+            STAGING_STATS[2].load(Relaxed),
+            UPLOAD_PHASES[1].load(Relaxed) / 1_000_000,
+            UPLOAD_PHASES[2].load(Relaxed) / 1_000_000,
             UPLOAD_SPLIT[1].load(Relaxed) / 1_000_000,
             UPLOAD_SPLIT[2].load(Relaxed) / 1_000_000,
             UPLOAD_WAITS.load(Relaxed),
