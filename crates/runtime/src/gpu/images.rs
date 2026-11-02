@@ -2063,7 +2063,8 @@ fn record_upload(cmd: vk::CommandBuffer, image: vk::Image, first: bool, buf: vk:
 /// (since 2026-11-01): its write marks taken and re-armed under the lock,
 /// its parts chosen and detiled outside it by the thread that took them, its
 /// copy recorded and its hashes stored under the lock again
-/// (`finish_refreshes`).
+/// (`finish_refreshes`); since 2026-11-02 also a new texture's first upload
+/// (`image_for`).
 struct RefreshJob {
     key: ImageKey,
     image: vk::Image,
@@ -2076,6 +2077,9 @@ struct RefreshJob {
     cause: u8,
     remap: Option<(u64, u64, u8)>,
     wait: std::sync::Arc<RefreshWait>,
+    /// A new texture's first upload (`image_for`): unmapped (mip, layer)s
+    /// zero-filled, the image's first layout, its parts' sums.
+    first: bool,
 }
 
 /// Set once a deferred re-upload is recorded or dropped: threads that bound
@@ -2111,6 +2115,11 @@ thread_local! {
 /// recorded, dropped (the image gone or GPU-written meanwhile), bindings
 /// that waited for one, ns outside the lock, ns of those waits].
 static REFRESH_OUT: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// First uploads left for after the lock (`image_for`):
+/// [deferred, recorded, dropped (the image replaced or evicted meanwhile),
+/// failed, ns outside the lock].
+static FIRST_OUT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Whether a re-upload of `key` detiles on the CPU into the upload command
 /// buffer the uploads share, as one left for after the lock does: 2D,
@@ -2183,18 +2192,23 @@ fn run_refresh(job: RefreshJob) -> Result<(), String> {
     if zero_census() {
         ZERO_CENSUS[(job.cause as usize).min(6)][4].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
     }
-    REFRESH_OUT[4].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    if job.first {
+        FIRST_OUT[4].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    } else {
+        REFRESH_OUT[4].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    }
     let r = with(|im| im.commit_refresh(&job, prepared, hashes, t0));
     *job.wait.done.lock() = true;
     job.wait.cv.notify_all();
     r
 }
 
-/// A deferred re-upload's parts chosen and detiled, without the cache.
+/// A deferred upload's parts chosen and detiled, without the cache (a
+/// re-upload's, or a first upload's with its parts' sums).
 fn prepare_reupload(job: &RefreshJob) -> Result<Prepared, String> {
     use std::sync::atomic::Ordering::Relaxed;
     let mut notes = Vec::new();
-    let Chosen { lay, size, precise, sums_on, sums, end, mut regions, zeroed, parts, total, zero_off, detiled, skipped, parts_done, parts_left, t_detile, readers, block, .. } = match choose_2d(job.key, &job.t, job.parts.as_deref(), job.all, false, Some(job.region), false, &mut notes)? {
+    let Chosen { lay, layers, elem, size, precise, sums_on, mut sums, end, mut regions, zeroed, parts, total, zero_off, detiled, skipped, parts_done, parts_left, t_detile, readers, block, .. } = match choose_2d(job.key, &job.t, job.parts.as_deref(), job.all, job.first, Some(job.region), false, &mut notes)? {
         Chose::Done((_, size)) => return Ok(Prepared { copy: None, size, notes }),
         Chose::Parts(c) => c,
     };
@@ -2204,6 +2218,21 @@ fn prepare_reupload(job: &RefreshJob) -> Result<Prepared, String> {
     let dst = unsafe { std::slice::from_raw_parts_mut(st.ptr, total) };
     detile_parts(&lay, src, &parts, dst);
     dst[zero_off..].fill(0);
+    // A first upload's sums (for later partial re-uploads), as `upload_inner`
+    // makes them.
+    if sums_on && job.first {
+        let todo: Vec<(usize, u64, u64)> = parts
+            .iter()
+            .map(|&(mip, layer, _, _)| {
+                let (s, n) = part_range(&lay, elem, mip, layer);
+                (mip * layers as usize + layer as usize, job.t.base + s, n)
+            })
+            .collect();
+        let threads = if detiled >= 1 << 20 { super::pool::threads() } else { 1 };
+        for (i, h) in hash_parts(&todo, threads) {
+            sums[i] = h;
+        }
+    }
     // Guest memory is no longer read.
     drop(readers);
     UPLOAD_SPLIT[0].fetch_add(t_detile.elapsed().as_nanos() as u64, Relaxed);
@@ -2219,7 +2248,7 @@ fn prepare_reupload(job: &RefreshJob) -> Result<Prepared, String> {
     }
     push_zero_regions(&lay, block, zero_off as u64, &zeroed, &mut regions);
     if skipped > 0 {
-        notes.push(format!("partially resident texture: {skipped} (mip, layer) not mapped, left as they were"));
+        notes.push(format!("partially resident texture: {skipped} (mip, layer) not mapped, {}", if job.first { "zero-filled" } else { "left as they were" }));
     }
     Ok(Prepared { copy: Some((st, regions, total)), size, notes })
 }
@@ -3870,6 +3899,12 @@ impl Images {
                 let ts = timed();
                 self.refresh(key, t, frame)?;
                 note_step(0, ts);
+            } else if let Some(w) = self.refreshing.get(&k).filter(|_| REFRESH_DEFER.with(|d| d.get())) {
+                // (Another view of an image whose upload a thread left for
+                // after the lock: waited for as `refresh` does.)
+                REFRESH_OUT[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let w = w.clone();
+                REFRESH_WAITS.with(|v| v.borrow_mut().push(w));
             }
             if how == "exact" {
                 self.note_layout(k, t);
@@ -3879,6 +3914,24 @@ impl Images {
         let ts = timed();
         let (image, mem, bytes) = self.create(key)?;
         note_step(1, ts);
+        // A texture detiled on the CPU: its first upload after the lock, as
+        // its re-uploads are (`RefreshJob`; since 2026-11-02, Castlewall's
+        // cold arrival +6% flips/s and p99 -26%). The image is in the cache
+        // from now on, its write tracking armed before its bytes are read;
+        // threads binding it meanwhile wait for its copy before their work
+        // can be submitted, and its hashes are stored with the copy.
+        let deferred = REFRESH_DEFER.with(|d| d.get()) && reupload_on_cpu(&key, t);
+        let size = deferred.then(|| elem_log2(t.format).and_then(|el| tiling::layout(t.sw_mode, el, key.width, key.height, key.levels, is_block(t.format)))).flatten().map(|lay| lay.size(key.layers));
+        if let Some(region) = size.and_then(|n| super::track::watch(t.base, n)) {
+            let n = size.unwrap_or(0);
+            let wait = std::sync::Arc::new(RefreshWait::default());
+            self.refreshing.insert(key, wait.clone());
+            FIRST_OUT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            REFRESH_JOBS.with(|j| j.borrow_mut().push(RefreshJob { key, image, t: *t, region, range: (t.base, n), parts: None, all: true, cause: 0, remap: None, wait, first: true }));
+            self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: false, source: Some(region), hashes: [0; SLICES], checked_frame: frame, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(frame) });
+            self.note_layout(key, t);
+            return Ok(key);
+        }
         let ts = timed();
         let uploaded = {
             let r = self.upload(image, key, t);
@@ -4373,7 +4426,7 @@ impl Images {
                     _ => None,
                 };
                 let all = matches!(why, super::track::Why::Forced);
-                REFRESH_JOBS.with(|j| j.borrow_mut().push(RefreshJob { key, image, t: *t, region, range: (b, n), parts, all, cause, remap, wait }));
+                REFRESH_JOBS.with(|j| j.borrow_mut().push(RefreshJob { key, image, t: *t, region, range: (b, n), parts, all, cause, remap, wait, first: false }));
                 return Ok(());
             }
             // (`DS_SKIP_REUPLOADS`: timing only, the image keeps its contents.)
@@ -4404,19 +4457,36 @@ impl Images {
     fn commit_refresh(&mut self, job: &RefreshJob, prepared: Result<Prepared, String>, hashes: Option<[u64; SLICES]>, t0: std::time::Instant) -> Result<(), String> {
         use std::sync::atomic::Ordering::Relaxed;
         self.refreshing.remove(&job.key);
-        let p = prepared?;
+        let out = if job.first { &FIRST_OUT[1..4] } else { &REFRESH_OUT[1..3] };
+        let p = match prepared {
+            Ok(p) => p,
+            // A first upload that failed leaves its image as the upload
+            // under the lock would (reported, cleared, in its general layout).
+            Err(e) if job.first => {
+                FIRST_OUT[3].fetch_add(1, Relaxed);
+                if self.map.get(&job.key).is_some_and(|i| i.image == job.image) {
+                    self.report(format!("texture {:#x} ({}x{} format {} sw_mode {}): {e}; contents undefined", job.t.base, job.t.width, job.t.height, job.t.format, job.t.sw_mode));
+                    self.to_general(job.image, job.key.format);
+                }
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         for n in p.notes {
             self.report(n);
         }
-        let live = self.map.get(&job.key).is_some_and(|i| i.image == job.image && !i.gpu_written);
+        // (A first upload lands even when GPU work bound the image for
+        // writing meanwhile, e.g. as a storage image in the same stage: that
+        // work was recorded after it and waits for its copy.)
+        let live = self.map.get(&job.key).is_some_and(|i| i.image == job.image && (job.first || !i.gpu_written));
         if let Some((st, regions, total)) = p.copy {
             if !live {
-                REFRESH_OUT[2].fetch_add(1, Relaxed);
+                out[1].fetch_add(1, Relaxed);
                 free_batched(vec![(st.buf, st.mem)]);
                 return Ok(());
             }
-            let (image, buf, base) = (job.image, st.buf, job.t.base);
-            let record = |cmd: vk::CommandBuffer| record_upload(cmd, image, false, buf, &regions, base);
+            let (image, buf, base, first) = (job.image, st.buf, job.t.base, job.first);
+            let record = |cmd: vk::CommandBuffer| record_upload(cmd, image, first, buf, &regions, base);
             if let Err(e) = record_batched((st.buf, st.mem), total.max(4) as u64, &record) {
                 static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, Relaxed) {
@@ -4425,10 +4495,10 @@ impl Images {
                 self.one_shot(record);
                 free_batched(vec![(st.buf, st.mem)]);
             }
-            REFRESH_OUT[1].fetch_add(1, Relaxed);
+            out[0].fetch_add(1, Relaxed);
             self.uploads += 1;
         } else if !live {
-            REFRESH_OUT[2].fetch_add(1, Relaxed);
+            out[1].fetch_add(1, Relaxed);
             return Ok(());
         }
         self.upload_bytes += p.size;
@@ -4489,6 +4559,10 @@ impl Images {
         for _ in 0..max.min(n) {
             self.scrub_at = (self.scrub_at + 1) % n;
             let k = self.scrub_keys[self.scrub_at];
+            // (An upload left for after the lock stores its hashes later.)
+            if self.refreshing.contains_key(&k) {
+                continue;
+            }
             let Some(img) = self.map.get_mut(&k) else { continue };
             let (false, Some(region)) = (img.gpu_written, img.source) else { continue };
             let s = (img.checked_frame % SLICES as u64) as usize;
@@ -4979,7 +5053,10 @@ impl Images {
         // (a new image) makes the entry stale at its next use.
         let (lookup, track) = (LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire), super::track::GEN.load(std::sync::atomic::Ordering::Acquire));
         if let Some(&(f, g, tg, v, i, u)) = self.view_memo.get(&t.raw) {
-            if (f == frame || scrubbing()) && g == lookup && tg == track {
+            // (An image whose upload a thread left for after the lock goes
+            // the full way, whose `refresh` waits for it: a memo another
+            // waiting thread made would hand it out unrecorded.)
+            if (f == frame || scrubbing()) && g == lookup && tg == track && !self.upload_pending(i) {
                 u.stamp(frame);
                 // This thread's memo too: without it every thread but the one
                 // that made the entry took this lock for each lookup (64% of
@@ -5005,6 +5082,12 @@ impl Images {
             m.views.insert(t.raw, (frame, lookup, track, r.0, r.1, r.2));
         });
         Ok((r.0, r.1))
+    }
+
+    /// Whether `image`'s upload was left for after the lock and is not
+    /// recorded yet (`refreshing`).
+    fn upload_pending(&self, image: vk::Image) -> bool {
+        !self.refreshing.is_empty() && self.refreshing.keys().any(|k| self.map.get(k).is_some_and(|m| m.image == image))
     }
 
     fn view_full(&mut self, t: &Tsharp, storage: bool, frame: u64) -> Result<(vk::ImageView, vk::Image, UseStamp), String> {
@@ -5211,8 +5294,9 @@ impl Images {
             String::new()
         };
         let o: Vec<u64> = REFRESH_OUT.iter().map(|c| c.load(Relaxed)).collect();
-        let gpu = if o[0] + o[3] > 0 {
-            format!("{gpu}; re-uploads detiled after the lock: {} ({} recorded, {} dropped: their image gone or GPU-written meanwhile; {} ms outside the lock), bindings that waited for one {} ({} ms)", o[0], o[1], o[2], o[4] / 1_000_000, o[3], o[5] / 1_000_000)
+        let f: Vec<u64> = FIRST_OUT.iter().map(|c| c.load(Relaxed)).collect();
+        let gpu = if o[0] + o[3] + f[0] > 0 {
+            format!("{gpu}; re-uploads detiled after the lock: {} ({} recorded, {} dropped: their image gone or GPU-written meanwhile; {} ms outside the lock), first uploads detiled after the lock: {} ({} recorded, {} dropped, {} failed; {} ms outside the lock), bindings that waited for one {} ({} ms)", o[0], o[1], o[2], o[4] / 1_000_000, f[0], f[1], f[2], f[3], f[4] / 1_000_000, o[3], o[5] / 1_000_000)
         } else {
             gpu
         };

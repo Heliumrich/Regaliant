@@ -1496,9 +1496,14 @@ struct Mirror {
 /// make the next one (a bind and its wait cost ~0.4-0.9 ms whatever its
 /// size, FINDINGS.md 2026-11-01).
 struct Backing {
-    /// Device memory blocks and the next free offset in the last one.
+    /// Device memory blocks: the mirror's pages come from `cur` (its next
+    /// free offset `next`), the maps' bit pages from blocks of their own
+    /// (`mark_cur`: block and next offset), so that a block of mirror pages
+    /// can be freed whole (`unback_cold`; the maps' pages stay bound).
     mems: Vec<vk::DeviceMemory>,
+    cur: Option<usize>,
     next: u64,
+    mark_cur: Option<(usize, u64)>,
     /// One bit per page: claimed for a bind (waiting, in flight or done).
     claimed: Vec<u64>,
     /// Binds of claimed pages no bind has taken yet.
@@ -1511,6 +1516,16 @@ struct Backing {
     mark_claimed: Vec<u64>,
     mark_pending: Vec<(usize, vk::SparseMemoryBind)>,
     mark_new: Vec<u64>,
+    /// Per block of `mems`: its pages bound now; a block of mirror pages
+    /// left with none is freed (`unback_cold`).
+    block_used: Vec<u32>,
+    /// Pages of blocks the mirror unbound, taken first (`take_page`).
+    free: Vec<(usize, u64)>,
+    /// Each mirror page bound or being bound: its block and offset.
+    page_mem: std::collections::HashMap<u64, (usize, u64)>,
+    /// Cold words whose backed bits a sweep cleared, still bound
+    /// (`unback_cold`): their bits, their stamp then, the flip.
+    draining: std::collections::HashMap<usize, (u64, u32, u32)>,
 }
 
 /// The written-bit maps as sparse buffers (`make_marks`): the bit words of
@@ -1529,23 +1544,39 @@ static SPARSE_MARKS: std::sync::OnceLock<SparseMarks> = std::sync::OnceLock::new
 /// The maps' bit and tail pages bound (all maps together).
 static MARK_PAGES: AtomicU64 = AtomicU64::new(0);
 
-/// A page of device memory for a sparse bind (the mirror's blocks).
-fn take_page(g: &mut Backing, m: &Mirror, alloc_ns: &mut u64) -> Result<(vk::DeviceMemory, u64), String> {
-    let c = ctx();
-    if g.next + m.page > BLOCK {
-        let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-        let ai = vk::MemoryAllocateInfo::default().allocation_size(BLOCK).memory_type_index(m.mem_type);
-        let ai = if c.device_addresses { ai.push_next(&mut fl) } else { ai };
-        let ta = std::time::Instant::now();
-        let mem = unsafe { c.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory (mirror block): {e}"))?;
-        *alloc_ns += ta.elapsed().as_nanos() as u64;
-        g.mems.push(mem);
-        g.next = 0;
+/// A page of device memory for a sparse bind: a mirror page (freed pages
+/// first) or, with `marks`, a bit page of the written-bit maps.
+fn take_page(g: &mut Backing, m: &Mirror, alloc_ns: &mut u64, marks: bool) -> Result<(vk::DeviceMemory, u64, usize), String> {
+    if !marks {
+        if let Some((b, off)) = g.free.pop() {
+            g.block_used[b] += 1;
+            return Ok((g.mems[b], off, b));
+        }
     }
-    let mem = *g.mems.last().expect("block");
-    let off = g.next;
-    g.next += m.page;
-    Ok((mem, off))
+    let open = if marks { g.mark_cur } else { g.cur.map(|b| (b, g.next)) };
+    let (b, off) = match open {
+        Some((b, off)) if off + m.page <= BLOCK => (b, off),
+        _ => {
+            let c = ctx();
+            let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+            let ai = vk::MemoryAllocateInfo::default().allocation_size(BLOCK).memory_type_index(m.mem_type);
+            let ai = if c.device_addresses { ai.push_next(&mut fl) } else { ai };
+            let ta = std::time::Instant::now();
+            let mem = unsafe { c.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory (mirror block): {e}"))?;
+            *alloc_ns += ta.elapsed().as_nanos() as u64;
+            g.mems.push(mem);
+            g.block_used.push(0);
+            (g.mems.len() - 1, 0)
+        }
+    };
+    if marks {
+        g.mark_cur = Some((b, off + m.page));
+    } else {
+        g.cur = Some(b);
+        g.next = off + m.page;
+    }
+    g.block_used[b] += 1;
+    Ok((g.mems[b], off, b))
 }
 
 /// Claims the written-bit maps' bit page covering mirror page `p` (in
@@ -1559,7 +1590,7 @@ fn claim_mark_page(g: &mut Backing, m: &Mirror, p: u64, alloc_ns: &mut u64) -> R
         return Ok(());
     }
     for i in 0..sm.bufs.len() {
-        let (mem, off) = take_page(g, m, alloc_ns)?;
+        let (mem, off, _) = take_page(g, m, alloc_ns, true)?;
         g.mark_pending.push((i, vk::SparseMemoryBind::default().resource_offset(k * sm.page).size(sm.page).memory(mem).memory_offset(off)));
     }
     g.mark_claimed[w] |= bit;
@@ -1628,7 +1659,7 @@ fn make_mirror() -> Result<Mirror, String> {
         c.limits.sparse_address_space_size >> 30
     );
     let words = pages.div_ceil(64);
-    let blocks = Mutex::new(Backing { mems: Vec::new(), next: BLOCK, claimed: vec![0; words], pending: Vec::new(), binding: false, mark_claimed: Vec::new(), mark_pending: Vec::new(), mark_new: Vec::new() });
+    let blocks = Mutex::new(Backing { mems: Vec::new(), cur: None, next: 0, mark_cur: None, claimed: vec![0; words], pending: Vec::new(), binding: false, mark_claimed: Vec::new(), mark_pending: Vec::new(), mark_new: Vec::new(), block_used: Vec::new(), free: Vec::new(), page_mem: std::collections::HashMap::new(), draining: std::collections::HashMap::new() });
     Ok(Mirror { buf, page: req.alignment, mem_type, blocks, bound: parking_lot::Condvar::new(), backed: (0..words).map(|_| AtomicU64::new(0)).collect(), used: (0..words).map(|_| std::sync::atomic::AtomicU32::new(0)).collect() })
 }
 
@@ -1684,6 +1715,7 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
     let pages = (MIRROR_END - MIRROR_BASE) / m.page;
     let (g0, g1) = (first & !(gran - 1), (last | (gran - 1)).min(pages - 1));
     let mut g = m.blocks.lock();
+    restore_draining(&mut g, m, first / 64, last / 64);
     let (mut alloc_ns, mut binds_here, mut pages_here, mut bind_ns) = (0u64, 0u64, 0u64, 0u64);
     let mut claim = |g: &mut Backing, a: u64, b: u64| -> Result<(), String> {
         for p in a..=b {
@@ -1691,8 +1723,9 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
             if g.claimed[w] & bit != 0 {
                 continue;
             }
-            let (mem, off) = take_page(g, m, &mut alloc_ns)?;
+            let (mem, off, blk) = take_page(g, m, &mut alloc_ns, false)?;
             g.pending.push(vk::SparseMemoryBind::default().resource_offset(p * m.page).size(m.page).memory(mem).memory_offset(off));
+            g.page_mem.insert(p, (blk, off));
             g.claimed[w] |= bit;
             // (The written-bit maps' bits of the page, in the same bind.)
             claim_mark_page(g, m, p, &mut alloc_ns)?;
@@ -1755,6 +1788,10 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
                 m.backed[w].fetch_or(bit, Ordering::AcqRel);
             } else {
                 g.claimed[w] &= !bit;
+                if let Some((blk, off)) = g.page_mem.remove(&p) {
+                    g.block_used[blk] -= 1;
+                    g.free.push((blk, off));
+                }
             }
         }
         if r.is_ok() {
@@ -1871,6 +1908,193 @@ pub fn cold_mib(flips: u32) -> u64 {
         }
     }
     (pages * m.page) >> 20
+}
+
+/// The mirror's cold pages given back (`unback_cold`): [words, pages,
+/// blocks freed, words a placement kept while draining].
+static UNBACKED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Front end 2's status: the mirror's video memory unbound since boot
+/// (MiB), its blocks freed, cold words a placement kept.
+pub fn unbacked_status() -> (u64, u64, u64) {
+    let page = MIRROR.get().map_or(64 << 10, |m| m.page);
+    ((UNBACKED[1].load(Ordering::Relaxed) * page) >> 20, UNBACKED[2].load(Ordering::Relaxed), UNBACKED[3].load(Ordering::Relaxed))
+}
+
+/// A cold word drains this many flips before it is unbound
+/// (`unback_cold`): every stamp of a placement made before it began is
+/// seen by then.
+const DRAIN_FLIPS: u32 = 10;
+
+/// `unback_cold` every this many milliseconds (its own thread).
+const UNBACK_EVERY_MS: u64 = 5000;
+
+/// Starts the thread that runs `unback_cold` (front end 2 only; called by
+/// the completion thread, which it keeps clear of the unbinds' waits).
+pub fn maybe_unback() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    if !super::fe2::on() || MIRROR.get().is_none() {
+        return;
+    }
+    STARTED.call_once(|| {
+        let r = std::thread::Builder::new().name("gpu-unback".into()).spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_millis(UNBACK_EVERY_MS));
+            let flips = super::tune::mirror_cold().min(u32::MAX as u64) as u32;
+            if flips == 0 {
+                continue;
+            }
+            if let Err(e) = unback_cold(flips, 256) {
+                crate::warn!("resident: cold mirror pages not unbound: {e}");
+            }
+        });
+        if let Err(e) = r {
+            crate::warn!("resident: no thread for the mirror's cold pages: {e}");
+        }
+    });
+}
+
+/// Gives back the mirror's words of 64 pages that no placement covered in
+/// the last `flips` flips (earlier levels' data, places left behind: after
+/// six level loads 3.5 of the mirror's 6.7 GB, FINDINGS.md 2026-11-02), at
+/// most `max_words` new ones a call, in two phases. A cold word first
+/// drains: its backed bits are cleared, so a placement reaching it takes
+/// `back_in`'s locked path, which sets them again and keeps the word
+/// (`restore_draining`). A sweep at least DRAIN_FLIPS flips later unbinds a
+/// drained word whose stamp has not moved (no placement since: one that
+/// read the bits before they were cleared stamped the word first, and its
+/// stamp is seen by then): its memory goes to later backings first
+/// (`take_page`), a block left with no page bound is freed, and front end 2
+/// holds its guest pages invalid (`fe2::invalidate`), so a later placement
+/// backs and uploads them again. No batch can read it then: every batch
+/// that placed it was recorded `flips` flips before.
+fn unback_cold(flips: u32, max_words: usize) -> Result<(), String> {
+    let m = MIRROR.get().ok_or("no mirror")?;
+    let t0 = std::time::Instant::now();
+    let now = super::FRAMES.load(Ordering::Relaxed) as u32;
+    if now < flips {
+        return Ok(());
+    }
+    let mut g = m.blocks.lock();
+    if g.binding || !g.pending.is_empty() {
+        return Ok(());
+    }
+    // Drained words: unbound unless placed since.
+    let mut words: Vec<(usize, u64)> = Vec::new();
+    let ready: Vec<usize> = g.draining.iter().filter(|&(_, &(_, _, f))| now.wrapping_sub(f) >= DRAIN_FLIPS).map(|(&w, _)| w).collect();
+    for w in ready {
+        let (bits, u, _) = g.draining.remove(&w).unwrap();
+        if m.used[w].load(Ordering::Acquire) != u {
+            m.backed[w].fetch_or(bits, Ordering::AcqRel);
+            UNBACKED[3].fetch_add(1, Ordering::Relaxed);
+        } else {
+            words.push((w, bits));
+        }
+    }
+    // New cold words drain.
+    let mut started = 0;
+    for w in 0..m.backed.len() {
+        if started >= max_words {
+            break;
+        }
+        let bits = m.backed[w].load(Ordering::Acquire);
+        if bits == 0 || g.claimed[w] != bits || g.draining.contains_key(&w) {
+            continue;
+        }
+        let u = m.used[w].load(Ordering::Acquire);
+        if now.wrapping_sub(u) <= flips {
+            continue;
+        }
+        m.backed[w].fetch_and(!bits, Ordering::AcqRel);
+        g.draining.insert(w, (bits, u, now));
+        started += 1;
+    }
+    if words.is_empty() {
+        return Ok(());
+    }
+    let mut unbinds = Vec::new();
+    for &(w, bits) in &words {
+        for i in 0..64u64 {
+            if bits & (1 << i) != 0 {
+                unbinds.push(vk::SparseMemoryBind::default().resource_offset((w as u64 * 64 + i) * m.page).size(m.page));
+            }
+        }
+    }
+    // Other threads' binds go on meanwhile (`binding` stays as it is): the
+    // words' pages stay claimed until the unbind is done, so a placement
+    // reaching them waits for it (`bound`) and binds them again after.
+    let c = ctx();
+    let r = parking_lot::MutexGuard::unlocked(&mut g, || {
+        let bufs = [vk::SparseBufferMemoryBindInfo::default().buffer(m.buf).binds(&unbinds)];
+        let info = vk::BindSparseInfo::default().buffer_binds(&bufs);
+        let fence = unsafe { c.device.create_fence(&vk::FenceCreateInfo::default(), None) }.map_err(|e| format!("vkCreateFence: {e}"))?;
+        let r = {
+            let q = c.queue.lock();
+            unsafe { c.device.queue_bind_sparse(*q, &[info], fence) }
+        };
+        let r = r.map_err(|e| format!("vkQueueBindSparse (unbinding): {e}")).and_then(|_| unsafe { c.device.wait_for_fences(&[fence], true, u64::MAX) }.map_err(|e| format!("unbind fence: {e}")));
+        unsafe { c.device.destroy_fence(fence, None) };
+        r
+    });
+    let (mut pages, mut freed) = (0u64, 0u64);
+    match &r {
+        Ok(()) => {
+            for &(w, bits) in &words {
+                for i in 0..64u64 {
+                    if bits & (1 << i) == 0 {
+                        continue;
+                    }
+                    let p = w as u64 * 64 + i;
+                    g.claimed[w] &= !(1 << i);
+                    if let Some((blk, off)) = g.page_mem.remove(&p) {
+                        g.block_used[blk] -= 1;
+                        g.free.push((blk, off));
+                    }
+                    pages += 1;
+                }
+                super::fe2::invalidate(MIRROR_BASE + w as u64 * 64 * m.page, 64 * m.page);
+            }
+            // Blocks left with no page bound (not the one being filled;
+            // the maps' blocks stay bound).
+            for b in 0..g.mems.len() {
+                if Some(b) != g.cur && g.block_used[b] == 0 && g.mems[b] != vk::DeviceMemory::null() {
+                    g.free.retain(|&(fb, _)| fb != b);
+                    unsafe { c.device.free_memory(g.mems[b], None) };
+                    g.mems[b] = vk::DeviceMemory::null();
+                    freed += 1;
+                }
+            }
+        }
+        Err(_) => {
+            // Still bound: the bits back.
+            for &(w, bits) in &words {
+                m.backed[w].fetch_or(bits, Ordering::AcqRel);
+            }
+        }
+    }
+    m.bound.notify_all();
+    drop(g);
+    STATS[S_BACKED].fetch_sub(pages, Ordering::Relaxed);
+    let first = UNBACKED[0].fetch_add(words.len() as u64, Ordering::Relaxed) == 0;
+    UNBACKED[1].fetch_add(pages, Ordering::Relaxed);
+    UNBACKED[2].fetch_add(freed, Ordering::Relaxed);
+    if first || freed > 0 {
+        crate::info!("resident: {} cold words of the mirror unbound ({} MiB; {} blocks of {} MiB freed) in {} ms", words.len(), (pages * m.page) >> 20, freed, BLOCK >> 20, t0.elapsed().as_millis());
+    }
+    r
+}
+
+/// A placement reaching draining words (`unback_cold`) keeps them: their
+/// backed bits set again (under the backing's lock).
+fn restore_draining(g: &mut Backing, m: &Mirror, w0: u64, w1: u64) {
+    if g.draining.is_empty() {
+        return;
+    }
+    for w in w0..=w1 {
+        if let Some((bits, _, _)) = g.draining.remove(&(w as usize)) {
+            m.backed[w as usize].fetch_or(bits, Ordering::AcqRel);
+            UNBACKED[3].fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Video memory of the written-bit maps, in MiB (sparse: their bound
@@ -3880,7 +4104,7 @@ fn make_sparse_marks(m: &Mirror) -> Result<(), String> {
     let mut binds: Vec<Vec<vk::SparseMemoryBind>> = vec![Vec::new(); n];
     for &k in &list {
         for b in binds.iter_mut() {
-            let (mem, off) = take_page(&mut g, m, &mut alloc_ns)?;
+            let (mem, off, _) = take_page(&mut g, m, &mut alloc_ns, true)?;
             b.push(vk::SparseMemoryBind::default().resource_offset(k * page).size(page).memory(mem).memory_offset(off));
         }
         g.mark_claimed[(k / 64) as usize] |= 1u64 << (k % 64);

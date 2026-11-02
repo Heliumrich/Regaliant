@@ -416,6 +416,7 @@ pub(crate) fn imports_may_cover(base: u64, len: u64) -> bool {
 fn reap_spans() {
     reap_dead_spans();
     reap_dead_images();
+    super::resident::maybe_unback();
     super::images::maybe_evict();
     crate::mem::retry_deferred();
 }

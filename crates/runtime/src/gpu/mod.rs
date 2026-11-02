@@ -30,7 +30,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 157] = [
+    static ALL: [Tunable; 158] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -188,6 +188,7 @@ pub mod tune {
         Tunable { name: "ballast_at", env: "DS_BALLAST_AT", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "async_compute", env: "DS_ASYNC_COMPUTE", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "vram_others", env: "DS_VRAM_OTHERS", default: 512, value: AtomicU64::new(UNSET) },
+        Tunable { name: "mirror_cold", env: "DS_MIRROR_COLD", default: 3600, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1600,6 +1601,14 @@ pub mod tune {
     #[inline]
     pub fn vram_others() -> u64 {
         get(156)
+    }
+
+    /// Front end 2's mirror words no placement covered in this many flips
+    /// are unbound and their memory reused (`resident::unback_cold`, every
+    /// 5 s on the completion thread); 0: never. Live.
+    #[inline]
+    pub fn mirror_cold() -> u64 {
+        get(157)
     }
 
     /// Pixel programs that write no memory run their depth and stencil
