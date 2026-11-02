@@ -37,6 +37,15 @@ pub fn set_compute(id: u32) {
     QUEUE.with(|m| m.set(id));
 }
 
+/// The calling thread is a parallel worker of compute queue `id`'s command
+/// processor: placed as that command processor is. (On the front end's
+/// CPUs, beside the graphics command processor and its eight workers, they
+/// cost 1-3%: 1-1's Castlewall 27.99 against 28.42 fps, InsideL Village
+/// 27.87 against 28.68, the Gatehouse Hall level; FINDINGS.md 2026-11-02.)
+pub fn set_compute_worker(id: u32) {
+    set_compute(id);
+}
+
 /// The physical cores of processor group 0 (`core_groups`, once).
 fn cores() -> &'static [u64] {
     static C: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();

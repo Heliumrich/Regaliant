@@ -12386,8 +12386,12 @@ impl Exec {
         }
         // Shadow space for written buffers (dispatches; see bind_stage): a
         // working and a pristine copy, and a descriptor set for the merge.
+        // Front end 2 binds written buffers in its mirror (a binding outside
+        // its span gets a shadow made when it is bound): its slots kept 488
+        // MiB of video memory for shadows no batch used (2026-11-02).
         let mut shadow = 0u64;
-        for p in stages {
+        let fe2 = super::fe2::on();
+        for p in stages.iter().filter(|_| !fe2) {
             for b in &p.tr.out.bindings {
                 if let BindingKind::Buffer(i) | BindingKind::Address(i) = b.kind {
                     if !p.tr.plan.resources[i].written {

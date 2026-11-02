@@ -639,6 +639,13 @@ impl Ctx {
         drop(p2);
         Some((budget.heap_usage[i], budget.heap_budget[i].min(vram_cap())))
     }
+
+    /// The size of the largest device-local heap, bytes (at most
+    /// `vram_cap`).
+    pub fn device_heap_size(&self) -> u64 {
+        let props = unsafe { self.instance.get_physical_device_memory_properties(self.pdev) };
+        (0..props.memory_heap_count as usize).filter(|&i| props.memory_heaps[i].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).map(|i| props.memory_heaps[i].size).max().unwrap_or(0).min(vram_cap())
+    }
 }
 
 /// `DS_VRAM_CAP_MIB=<MiB>` (boot; simulation of a smaller GPU): the

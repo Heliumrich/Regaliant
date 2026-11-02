@@ -31,6 +31,17 @@ struct Window {
 
 static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
 
+/// Other processes' dedicated video memory at the last sample, bytes
+/// (u64::MAX before the first).
+static OTHERS_VRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Other processes' dedicated video memory at the last sample (once a
+/// second), bytes; None while the sampler is off or has not sampled yet.
+pub fn others_vram() -> Option<u64> {
+    let v = OTHERS_VRAM.load(std::sync::atomic::Ordering::Relaxed);
+    (v != u64::MAX).then_some(v)
+}
+
 /// A process's 3D engine use from which it counts as loading the machine
 /// (percent), and its CPU use (percent of one logical CPU).
 const LOUD_GPU: f64 = 3.0;
@@ -201,6 +212,7 @@ fn sampler() {
                     None => {}
                 }
             }
+            OTHERS_VRAM.store(vram_other as u64, std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(c) = cpu {
             // PDH_FMT_NOCAP100: a process's share over 100% of one CPU.

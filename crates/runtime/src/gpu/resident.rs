@@ -1485,6 +1485,9 @@ struct Mirror {
     bound: parking_lot::Condvar,
     /// One bit per mirror page: bound to memory.
     backed: Box<[AtomicU64]>,
+    /// Per word of `backed` (64 pages): the last flip a placement covered
+    /// any of its pages (`back_in`; `cold_mib`).
+    used: Box<[std::sync::atomic::AtomicU32]>,
 }
 
 /// A mirror's backing state (`Mirror::blocks`): one thread at a time binds
@@ -1626,7 +1629,7 @@ fn make_mirror() -> Result<Mirror, String> {
     );
     let words = pages.div_ceil(64);
     let blocks = Mutex::new(Backing { mems: Vec::new(), next: BLOCK, claimed: vec![0; words], pending: Vec::new(), binding: false, mark_claimed: Vec::new(), mark_pending: Vec::new(), mark_new: Vec::new() });
-    Ok(Mirror { buf, page: req.alignment, mem_type, blocks, bound: parking_lot::Condvar::new(), backed: (0..words).map(|_| AtomicU64::new(0)).collect() })
+    Ok(Mirror { buf, page: req.alignment, mem_type, blocks, bound: parking_lot::Condvar::new(), backed: (0..words).map(|_| AtomicU64::new(0)).collect(), used: (0..words).map(|_| std::sync::atomic::AtomicU32::new(0)).collect() })
 }
 
 /// Binds device memory to the mirror's pages over guest [base, base+len)
@@ -1642,6 +1645,15 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
     let c = ctx();
     let first = (base - MIRROR_BASE) / m.page;
     let last = (base + len - 1 - MIRROR_BASE) / m.page;
+    // (The flip each word was last placed in: stored only when it moves, so
+    // the threads placing the same ranges mostly read the line.)
+    let flip = super::FRAMES.load(Ordering::Relaxed) as u32;
+    for w in (first / 64)..=(last / 64) {
+        let u = &m.used[w as usize];
+        if u.load(Ordering::Relaxed) != flip {
+            u.store(flip, Ordering::Relaxed);
+        }
+    }
     // Backed already (most calls): no lock; whole words of 64 pages (4 MiB
     // with 64 KiB pages) at a time.
     let backed = |p: u64| m.backed[(p / 64) as usize].load(Ordering::Acquire) & (1u64 << (p % 64)) != 0;
@@ -1843,6 +1855,22 @@ pub fn backing_line() -> String {
 pub fn backed_mib() -> u64 {
     let page = MIRROR.get().map_or(64 << 10, |m| m.page);
     (STATS[S_BACKED].load(Ordering::Relaxed) * page) >> 20
+}
+
+/// Video memory backing mirror pages no placement covered in the last
+/// `flips` flips, in MiB (by words of 64 pages: a word placed lately counts
+/// whole as used). What evicting cold mirror pages could give back.
+pub fn cold_mib(flips: u32) -> u64 {
+    let Some(m) = MIRROR.get() else { return 0 };
+    let now = super::FRAMES.load(Ordering::Relaxed) as u32;
+    let mut pages = 0u64;
+    for (w, b) in m.backed.iter().enumerate() {
+        let bits = b.load(Ordering::Relaxed);
+        if bits != 0 && now.wrapping_sub(m.used[w].load(Ordering::Relaxed)) > flips {
+            pages += bits.count_ones() as u64;
+        }
+    }
+    (pages * m.page) >> 20
 }
 
 /// Video memory of the written-bit maps, in MiB (sparse: their bound

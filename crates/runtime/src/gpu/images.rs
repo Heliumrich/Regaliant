@@ -806,7 +806,11 @@ const EVICT_CHECK_MS: u64 = 500;
 /// When this process uses more video memory than `tune vram_high` percent of
 /// the device-local budget, evicts the least recently used images until
 /// about `vram_low` percent (completion thread, at most every
-/// EVICT_CHECK_MS; skipped while the cache is busy).
+/// EVICT_CHECK_MS; skipped while the cache is busy). Other processes'
+/// dedicated video memory counts too (`tune vram_others`): the budget the
+/// driver reports here leaves it out (23.4 of the RTX 4090's 24.1 GB while
+/// others held 7.8 GB: textures of four levels, 11.8 GB, were kept and the
+/// GPU's time per frame rose as ours passed 16 GB, FINDINGS.md 2026-11-02).
 pub fn maybe_evict() {
     use std::sync::atomic::Ordering::Relaxed;
     if !super::tune::image_evict() {
@@ -821,10 +825,21 @@ pub fn maybe_evict() {
     LAST.store(ms, Relaxed);
     let frame = super::FRAMES.load(Relaxed);
     let Some((used, budget)) = ctx().device_budget() else { return };
-    if budget == 0 || used <= budget / 100 * super::tune::vram_high() {
+    let (mut high, mut low) = (budget / 100 * super::tune::vram_high(), budget / 100 * super::tune::vram_low());
+    // What the heap leaves beside other processes' dedicated memory, less
+    // `vram_others` MiB (high) and a GiB more (low).
+    let margin = super::tune::vram_others() << 20;
+    if margin != 0 {
+        if let Some(others) = crate::hostload::others_vram() {
+            let room = ctx().device_heap_size().saturating_sub(others);
+            high = high.min(room.saturating_sub(margin));
+            low = low.min(room.saturating_sub(margin + (1 << 30)));
+        }
+    }
+    if budget == 0 || used <= high {
         return;
     }
-    let want = used.saturating_sub(budget / 100 * super::tune::vram_low());
+    let want = used.saturating_sub(low);
     let Some(mut g) = IMAGES.try_lock() else { return };
     let Some(im) = g.as_mut() else { return };
     let out = im.evict(frame, want);
@@ -837,9 +852,11 @@ pub fn maybe_evict() {
     let rounds = EVICTED[2].fetch_add(1, Relaxed) + 1;
     if rounds <= 20 || rounds % 100 == 0 {
         crate::info!(
-            "images: video memory {} of budget {} MiB at flip {frame}: evicted {} textures ({} MiB), {} images cached ({} MiB){largest}",
+            "images: video memory {} of budget {} MiB (evicting above {} MiB, others' {} MiB) at flip {frame}: evicted {} textures ({} MiB), {} images cached ({} MiB){largest}",
             used >> 20,
             budget >> 20,
+            high >> 20,
+            crate::hostload::others_vram().map_or(0, |o| o >> 20),
             out.0.len(),
             out.1 >> 20,
             out.2,

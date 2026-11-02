@@ -402,6 +402,7 @@ impl Pool {
             let w = Arc::new(Worker { cp: Mutex::new(cp), job: Mutex::new(Default::default()), has_job: AtomicBool::new(false), wake: self.wake.clone() });
             let w2 = w.clone();
             let tname = wname.clone();
+            let qname = name.to_string();
             let r = crate::thread::spawn_host(
                 &wname,
                 8 << 20,
@@ -411,6 +412,8 @@ impl Pool {
                     super::profile_this_thread("par");
                     if !compute {
                         super::forward::enable_here();
+                    } else if let Some(id) = qname.strip_prefix("gpu-acb").and_then(|h| u32::from_str_radix(h.trim_start_matches("0x"), 16).ok()) {
+                        super::prio::set_compute_worker(id);
                     }
                     run_worker(&w2, &tname);
                 }),

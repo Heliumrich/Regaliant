@@ -30,7 +30,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 156] = [
+    static ALL: [Tunable; 157] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -187,6 +187,7 @@ pub mod tune {
         Tunable { name: "ballast_ns", env: "DS_BALLAST_NS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ballast_at", env: "DS_BALLAST_AT", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "async_compute", env: "DS_ASYNC_COMPUTE", default: 2, value: AtomicU64::new(UNSET) },
+        Tunable { name: "vram_others", env: "DS_VRAM_OTHERS", default: 512, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1589,6 +1590,16 @@ pub mod tune {
     #[inline]
     pub fn async_compute() -> u64 {
         get(155)
+    }
+
+    /// Image eviction (`images::maybe_evict`) counts other processes'
+    /// dedicated video memory (`hostload`, sampled once a second): it starts
+    /// once ours passes the heap's size less theirs and this many MiB, and
+    /// goes to a GiB under that (or the budget's `vram_high` / `vram_low`
+    /// shares, if lower); 0: the budget alone, as before 2026-11-02.
+    #[inline]
+    pub fn vram_others() -> u64 {
+        get(156)
     }
 
     /// Pixel programs that write no memory run their depth and stencil
