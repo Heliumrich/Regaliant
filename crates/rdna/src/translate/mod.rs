@@ -369,6 +369,11 @@ pub struct Spec {
     /// the touched-page list; the write-back makes the list from the bits
     /// (`kernels::mirror_compact`), so no store waits on an atomic's result.
     pub touch_bits: bool,
+    /// With `write_marks` (the runtime's front end 2): a store reads its
+    /// page's touched bit first and sets it (the atomic whose result decides
+    /// the list append) only when it finds it clear, and the mark words one
+    /// store sets in one page touch that page once (`touch_page`).
+    pub touch_test: bool,
     /// How the SGPR data binding is declared: 0 a storage buffer (u32
     /// array), 1 a uniform buffer (`BindingKind::SgprUniform`: a std140
     /// array of uvec4 sized to the plan's SGPR data) where the binding is the
@@ -503,6 +508,9 @@ impl std::hash::Hash for Spec {
         }
         if self.touch_bits {
             0x5442_4954u32.hash(state);
+        }
+        if self.touch_test {
+            0x5454_5354u32.hash(state);
         }
         if self.sgpr_ubo != 0 {
             (0x5542_4F00u32 | self.sgpr_ubo as u32).hash(state);
@@ -3592,6 +3600,7 @@ mod tests {
             write_marks: false,
             marks_untouched: false,
             touch_bits: false,
+            touch_test: false,
             sgpr_ubo: 0,
             gpu_loads: 0,
             gpu_res: 0,

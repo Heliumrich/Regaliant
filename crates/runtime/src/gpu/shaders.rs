@@ -1234,6 +1234,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
         touch_bits: touch_bits_wanted(),
+        touch_test: touch_test_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -1433,6 +1434,13 @@ fn touch_bits_wanted() -> bool {
     on
 }
 
+/// Front end 2's stores test their pages' touched bits before setting them
+/// and touch a page once a store (`Spec::touch_test`; in-run A/B: FINDINGS.md
+/// 2026-11-03 morning).
+fn touch_test_wanted() -> bool {
+    marks_wanted() && super::fe2::wanted()
+}
+
 /// Resolves and translates the pixel shader bound on `cp`.
 pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
     prep_lap_begin(1);
@@ -1498,6 +1506,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
         touch_bits: touch_bits_wanted(),
+        touch_test: touch_test_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -1695,6 +1704,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
         touch_bits: touch_bits_wanted(),
+        touch_test: touch_test_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2506,6 +2516,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
         touch_bits: touch_bits_wanted(),
+        touch_test: touch_test_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2554,6 +2565,7 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
         touch_bits: touch_bits_wanted(),
+        touch_test: touch_test_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2602,6 +2614,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
         touch_bits: touch_bits_wanted(),
+        touch_test: touch_test_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,

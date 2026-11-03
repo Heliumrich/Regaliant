@@ -1476,6 +1476,7 @@ fn mark_dwords(tr: &mut T, r: usize, d0: Word, n: u32) -> R<()> {
             ors.push(e(tr.b.group_non_uniform_bitwise_or(u, None, sg, spirv::GroupOperation::Reduce, c, None))?);
         }
         let el = e(tr.b.group_non_uniform_elect(b, None, sg))?;
+        let once = tr.spec.touch_test;
         tr.guarded(el, &mut |tr| {
             let scope = tr.u(spirv::Scope::Device as u32);
             let sem = tr.u(0);
@@ -1490,7 +1491,34 @@ fn mark_dwords(tr: &mut T, r: usize, d0: Word, n: u32) -> R<()> {
                     let scope = tr.u(spirv::Scope::Device as u32);
                     let sem = tr.u(0);
                     e(tr.b.atomic_or(u, None, p, scope, sem, o))?;
+                    if once {
+                        return Ok(());
+                    }
                     touch_page(tr, marks, wk)
+                })?;
+            }
+            if once {
+                // (`Spec::touch_test`: the words lie in the first word's page
+                // or the next; each page with a set word touched once.)
+                let (z, k31, k32) = (tr.u(0), tr.u(31), tr.u(32));
+                let lo = e(tr.b.bitwise_and(u, None, first, k31))?;
+                let (mut in_lo, mut in_hi) = (z, z);
+                for (k, &o) in ors.iter().enumerate() {
+                    let kk = tr.u(k as u32);
+                    let at = e(tr.b.i_add(u, None, lo, kk))?;
+                    let same = e(tr.b.u_less_than(tr.t.bool_, None, at, k32))?;
+                    let a = e(tr.b.select(u, None, same, o, z))?;
+                    let c = e(tr.b.select(u, None, same, z, o))?;
+                    in_lo = e(tr.b.bitwise_or(u, None, in_lo, a))?;
+                    in_hi = e(tr.b.bitwise_or(u, None, in_hi, c))?;
+                }
+                let any_lo = e(tr.b.i_not_equal(tr.t.bool_, None, in_lo, z))?;
+                tr.guarded(any_lo, &mut |tr| touch_page(tr, marks, first))?;
+                let any_hi = e(tr.b.i_not_equal(tr.t.bool_, None, in_hi, z))?;
+                tr.guarded(any_hi, &mut |tr| {
+                    let last = tr.u(ors.len() as u32 - 1);
+                    let wl = e(tr.b.i_add(tr.t.u32, None, first, last))?;
+                    touch_page(tr, marks, wl)
                 })?;
             }
             let _ = (scope, sem);
@@ -1513,7 +1541,14 @@ fn mark_dwords(tr: &mut T, r: usize, d0: Word, n: u32) -> R<()> {
                 let scope = tr.u(spirv::Scope::Device as u32);
                 let sem = tr.u(0);
                 e(tr.b.atomic_or(u, None, p1, scope, sem, m1))?;
-                touch_page(tr, marks, w1)
+                if !tr.spec.touch_test {
+                    return touch_page(tr, marks, w1);
+                }
+                // (`Spec::touch_test`: its page only when it is the next.)
+                let k31 = tr.u(31);
+                let lo = e(tr.b.bitwise_and(u, None, w, k31))?;
+                let next = e(tr.b.i_equal(tr.t.bool_, None, lo, k31))?;
+                tr.guarded(next, &mut |tr| touch_page(tr, marks, w1))
             })?;
         }
         ok(tr.b.branch(merge))?;
@@ -1527,7 +1562,7 @@ fn mark_dwords(tr: &mut T, r: usize, d0: Word, n: u32) -> R<()> {
 /// (`kernels::MARK_LIST_AT`; past MARK_LIST_CAP entries only counted: a
 /// range gather takes the rest).
 fn touch_page(tr: &mut T, marks: Word, w: Word) -> R<()> {
-    use crate::kernels::{MARK_LIST_AT, MARK_LIST_CAP, MARK_PAGE_BITS_AT};
+    use crate::kernels::MARK_PAGE_BITS_AT;
     if tr.spec.marks_untouched {
         return Ok(());
     }
@@ -1542,12 +1577,33 @@ fn touch_page(tr: &mut T, marks: Word, w: Word) -> R<()> {
     let scope = tr.u(spirv::Scope::Device as u32);
     let sem = tr.u(0);
     let pp = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, pw]))?;
-    let old = e(tr.b.atomic_or(u, None, pp, scope, sem, pb))?;
+    if tr.spec.touch_test && !tr.spec.touch_bits {
+        // (`Spec::touch_test`: a bit found set was set in this batch, its
+        // page listed by the store whose atomic found it clear; bits are
+        // cleared only by the write-back, between barriers. A stale clear
+        // read only costs the atomic.)
+        let cur = e(tr.b.load(u, None, pp, None, []))?;
+        let set = e(tr.b.bitwise_and(u, None, cur, pb))?;
+        let clear = e(tr.b.i_equal(b, None, set, z))?;
+        return tr.guarded(clear, &mut |tr| touch_set(tr, marks, pp, page, pb));
+    }
     if tr.spec.touch_bits {
         // (The bit alone: the write-back lists the page, `mirror_compact`.)
-        let _ = (old, b, MARK_LIST_AT, MARK_LIST_CAP);
+        e(tr.b.atomic_or(u, None, pp, scope, sem, pb))?;
         return Ok(());
     }
+    touch_set(tr, marks, pp, page, pb)
+}
+
+/// `touch_page`'s atomic on the page-bits word `pp` setting bit `pb` of page
+/// `page`, and the list append when it found the bit clear.
+fn touch_set(tr: &mut T, marks: Word, pp: Word, page: Word, pb: Word) -> R<()> {
+    use crate::kernels::{MARK_LIST_AT, MARK_LIST_CAP};
+    let (u, b) = (tr.t.u32, tr.t.bool_);
+    let z = tr.u(0);
+    let scope = tr.u(spirv::Scope::Device as u32);
+    let sem = tr.u(0);
+    let old = e(tr.b.atomic_or(u, None, pp, scope, sem, pb))?;
     let had = e(tr.b.bitwise_and(u, None, old, pb))?;
     let first = e(tr.b.i_equal(b, None, had, z))?;
     tr.guarded(first, &mut |tr| {
