@@ -55,6 +55,7 @@
 //! whole (see [`crate::wavemask`]); elsewhere an invocation keeps a partial
 //! mask whose own bit is right.
 
+mod active;
 mod alu;
 pub mod gs;
 mod mem;
@@ -324,6 +325,11 @@ pub struct Spec {
     /// when all of the program's are of that form (the runtime sets it for
     /// programs with one, `has_append`).
     pub sg_appends: bool,
+    /// Per-invocation translations (not lockstep, wave-mask mode or lane
+    /// votes): where this invocation's EXEC bit is known set
+    /// ([`active::known_active`]), register writes are plain (no select, no
+    /// lane guard) and stores unguarded.
+    pub known_active: bool,
     /// Vertex stage of a draw whose arguments the GPU reads (indexed
     /// indirect draws, see the runtime's `DrawArgs::gpu_args`): this SGPR
     /// receives the start instance (`gl_BaseInstance`), as the command
@@ -530,6 +536,9 @@ impl std::hash::Hash for Spec {
         if self.sg_appends {
             0x5347_4150u32.hash(state);
         }
+        if self.known_active {
+            0x4B41_4354u32.hash(state);
+        }
     }
 }
 
@@ -693,6 +702,8 @@ pub struct Output {
     pub wave_masks: bool,
     /// Wave-aggregated appends done per subgroup ([`Appends`]).
     pub sg_appends: u32,
+    /// Instructions known active (`Spec::known_active`).
+    pub known_active: u32,
 }
 
 /// Dwords of user data at the start of the SGPR data buffer.
@@ -912,6 +923,10 @@ pub(crate) struct T<'a> {
     /// subgroup index of the invocation adding the count (`subgroup_leader`).
     pub sg: Appends,
     pub leader: Option<Word>,
+    /// Pcs at whose start this invocation's EXEC bit is known set
+    /// (`Spec::known_active`), and the instruction being translated.
+    pub known_active: crate::HashSet<u32>,
+    pub cur_pc: u32,
     /// Wave-mask mode (see the module documentation).
     pub wave_masks: bool,
     /// [`FORMAT_RT`] buffers: [`rt_format_entry`]'s table (a private array
@@ -1101,12 +1116,15 @@ impl<'a> T<'a> {
             return self.set_vreg_raw(idx, v);
         }
         let act = self.active()?;
+        if act == self.bool_c(true) {
+            return self.set_vreg_raw(idx, v);
+        }
         let old = self.vreg(idx)?;
         let nv = e(self.b.select(self.t.u32, None, act, v, old))?;
         self.set_vreg_raw(idx, nv)
     }
     pub fn active(&mut self) -> R<Word> {
-        if self.lane_guard {
+        if self.lane_guard || self.known_active.contains(&self.cur_pc) {
             return Ok(self.bool_c(true));
         }
         let here = self.b.selected_function().zip(self.b.selected_block());
@@ -2566,6 +2584,8 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         elections: if wave_masks { HashMap::default() } else { lane0_elections(code, spec).into_iter().filter(|(pc, _)| !sg.lane0_compares.contains(pc)).collect() },
         sg,
         leader: None,
+        known_active: crate::HashSet::default(),
+        cur_pc: 0,
         wave_masks,
         complete: if wave_masks { crate::wavemask::complete_masks(code, spec.wave64) } else { Default::default() },
         own_bit: None,
@@ -2819,6 +2839,9 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     }
     // Lockstep mode (see the module documentation).
     tr.lockstep = lockstep;
+    if spec.known_active && !tr.lockstep && !tr.wave_masks && !spec.lane_votes {
+        tr.known_active = active::known_active(code, spec.wave64, &tr.sg);
+    }
     if tr.lockstep {
         let z = tr.u(0);
         tr.vote_ctr = Some(tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, Some(z)));
@@ -3058,7 +3081,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     // offsets come from a table): the runtime takes that from `sgpr_pc`.
     let batched = spec.batched;
     let sgpr_pc = if batched { Some(sgpr_pc_offset(spec.stage)) } else { spec.sgpr_pc };
-    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched, masked_skips: tr.masked_skips, lockstep: tr.lockstep, wave_masks: tr.wave_masks, sg_appends: tr.sg.leaders.len() as u32 })
+    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched, masked_skips: tr.masked_skips, lockstep: tr.lockstep, wave_masks: tr.wave_masks, sg_appends: tr.sg.leaders.len() as u32, known_active: tr.known_active.len() as u32 })
 }
 
 /// Wave-mask mode for the shader at `addr` (diagnosis: `DS_WAVEMASK=0`
@@ -3439,6 +3462,7 @@ fn emit_block_body(tr: &mut T, code: &[Inst], start: u32, end: u32) -> R<()> {
             continue;
         }
         let first = *first.get_or_insert(k);
+        tr.cur_pc = ins.pc;
         if tr.spec.lane_guards && lane_local(ins) {
             let mut j = k;
             while j < code.len() && code[j].pc < end && lane_local(&code[j]) && !code[j].is_endpgm() && code[j].branch_target().is_none() {
@@ -3447,14 +3471,19 @@ fn emit_block_body(tr: &mut T, code: &[Inst], start: u32, end: u32) -> R<()> {
             if j - k >= LANE_GUARD_MIN {
                 let act = tr.active()?;
                 let run = &code[k..j];
-                tr.guarded(act, &mut |tr| {
+                let mut body = |tr: &mut T| {
                     tr.reset_vcache();
                     tr.lane_guard = true;
                     let r = run.iter().try_for_each(|i| translate_inst(tr, i));
                     tr.lane_guard = false;
                     tr.reset_vcache();
                     r
-                })?;
+                };
+                if act == tr.bool_c(true) {
+                    body(tr)?;
+                } else {
+                    tr.guarded(act, &mut body)?;
+                }
                 guarded_until = j;
                 next_pc = code.get(j).map(|n| n.pc).unwrap_or(PC_EXIT);
                 continue;
@@ -3754,6 +3783,7 @@ fn emit_dispatch_loop(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>) -> R<()
 }
 
 fn translate_inst(tr: &mut T, ins: &Inst) -> R<()> {
+    tr.cur_pc = ins.pc;
     translate_one(tr, ins)?;
     if let (Some((pc, reg)), Some(var)) = (tr.spec.probe, tr.probe_var) {
         if ins.pc == pc {
@@ -3936,6 +3966,7 @@ mod tests {
             lane_votes: false,
             lockstep_off: false,
             sg_appends: false,
+            known_active: false,
             base_instance_sgpr: None,
             sgpr_pc: None,
             addresses: false,

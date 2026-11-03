@@ -348,7 +348,9 @@ pub fn run(args: &[String], app: &std::path::Path) -> i32 {
     if let Some(d) = &spv_dir {
         let _ = std::fs::create_dir_all(d);
     }
-    super::exec::FORCE_NONCE.store(true, std::sync::atomic::Ordering::Relaxed);
+    // (DS_CB_NONCE=0: modules as translated, which the driver's shader
+    // cache may serve.)
+    super::exec::FORCE_NONCE.store(std::env::var("DS_CB_NONCE").ok().as_deref() != Some("0"), std::sync::atomic::Ordering::Relaxed);
     if let Err(e) = super::vk::init() {
         crate::error!("compile bench: Vulkan: {e}");
         return 2;
@@ -359,12 +361,14 @@ pub fn run(args: &[String], app: &std::path::Path) -> i32 {
     // them all ahead would take (DS_CB_SAMPLE=<n>: every n-th by code
     // hash).
     let source = if std::env::var("DS_CB_BUNDLES").ok().as_deref() == Some("1") { bundle_compute(app) } else { super::precompile::learned_compute() };
+    // DS_CB_MAX_INSTS=<n>: programs of at most n instructions.
+    let max_insts = std::env::var("DS_CB_MAX_INSTS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(usize::MAX);
     let mut progs: Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<rdna::translate::Spec>, usize)> = source
         .into_iter()
         .filter(|(h, _, specs)| !specs.is_empty() && (only.is_empty() || only.contains(h)))
         .filter_map(|(h, code, specs)| {
             let n = rdna::decode_program(&code).ok()?.len();
-            (n >= min_insts || !only.is_empty()).then_some((h, code, specs, n))
+            ((n >= min_insts || !only.is_empty()) && n <= max_insts).then_some((h, code, specs, n))
         })
         .collect();
     progs.sort_by(|a, b| b.3.cmp(&a.3));
@@ -376,12 +380,19 @@ pub fn run(args: &[String], app: &std::path::Path) -> i32 {
     // learned spec says; 2 with subgroup-decided EXEC branches too (timing:
     // whether the program is right that way is not checked).
     let per_lane = std::env::var("DS_CB_PER_LANE").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+    // DS_CB_SPEC=<n>: the program's n-th learned spec (in store order; the
+    // last if it has fewer) instead of its first.
+    let spec_ix = std::env::var("DS_CB_SPEC").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
     for (h, code, specs, n) in &progs {
         let t0 = Instant::now();
-        let mut spec = specs[0].clone();
+        let mut spec = specs[spec_ix.min(specs.len() - 1)].clone();
         if per_lane != 0 {
             spec.per_lane = true;
             spec.lane_votes = per_lane == 2;
+        }
+        // DS_CB_LOCKSTEP_OFF=1: without lockstep (`Spec::lockstep_off`).
+        if std::env::var("DS_CB_LOCKSTEP_OFF").ok().as_deref() == Some("1") {
+            spec.lockstep_off = true;
         }
         // (Learned specs as a preparation keys them now.)
         if let Ok(insts) = rdna::decode_program(code) {

@@ -136,6 +136,8 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         // RDNA_SG_APPENDS=0: wave-aggregated appends as before (exact in
         // wave-mask mode, each lane its own outside it).
         sg_appends: std::env::var("RDNA_SG_APPENDS").ok().as_deref() != Some("0") && u.stage == Stage::Compute && crate::translate::has_append(&insts),
+        // RDNA_KNOWN_ACTIVE=0: without the known-active analysis.
+        known_active: std::env::var("RDNA_KNOWN_ACTIVE").ok().as_deref() != Some("0"),
         base_instance_sgpr: None,
         // RDNA_SGPR_PC=1: SGPR data at a push-constant offset (validation).
         sgpr_pc: std::env::var_os("RDNA_SGPR_PC").is_some().then(|| crate::translate::sgpr_pc_offset(u.stage)),
