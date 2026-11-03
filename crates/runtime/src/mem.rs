@@ -282,7 +282,7 @@ pub fn remap_status() -> String {
         String::new()
     };
     format!(
-        "    direct memory remaps: {} in place ({} MiB, zeroed here), {} of pages last mapped elsewhere ({} MiB, contents not carried); mapping changes {}; readable-range checks {} ({} cache misses, {} with the cache full); decommits deferred under GPU imports {} ({} MiB; {} done later, {} mapped again first, {} waiting)\n",
+        "    direct memory remaps: {} in place ({} MiB, zeroed here), {} of pages last mapped elsewhere ({} MiB, contents not carried); mapping changes {}; readable-range checks {} ({} cache misses, {} with the cache full, {} served by the shared runs); decommits deferred under GPU imports {} ({} MiB; {} done later, {} mapped again first, {} waiting)\n",
         r.in_place,
         r.in_place_bytes >> 20,
         r.moved,
@@ -291,6 +291,7 @@ pub fn remap_status() -> String {
         SPAN_CALLS.load(o),
         SPAN_MISSES.load(o),
         SPAN_FULL.load(o),
+        SPAN_SHARED_HITS.load(o),
         DEFERRED_STATS[0].load(o),
         DEFERRED_STATS[3].load(o) >> 20,
         DEFERRED_STATS[1].load(o),
@@ -416,6 +417,50 @@ pub fn vma_bounds(a: u64) -> Option<(u64, u64)> {
 /// time and a last-hit check were level in replay A/Bs: FINDINGS.md 2026-10-29).
 const READABLE_RUNS: usize = 64;
 
+/// The runs the threads' misses found (`readable_span`), shared: [start,
+/// end) and readability, sorted and disjoint, for one
+/// MAP_GEN value (carried over changes by `revalidate`, as the threads' own
+/// are). Written under the MEM lock; read without it, as a thread's own
+/// cache is (a change right after the generation was read is seen by the
+/// next call). Every recording thread misses the runs a change dropped, and
+/// each miss took the mapping table's lock for a walk of up to 64 mappings
+/// either side (~3% of the graphics CP, half of it contended: sampler
+/// -055047; in-run A/B: the graphics CP 0.4-0.6 ms a flip less, FINDINGS.md
+/// 2026-11-03 morning).
+static SHARED_RUNS: parking_lot::RwLock<(u64, Vec<(u64, u64, bool)>)> = parking_lot::RwLock::new((u64::MAX, Vec::new()));
+const SHARED_RUNS_MAX: usize = 4096;
+/// Misses `SHARED_RUNS` served (diagnostics).
+static SPAN_SHARED_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The shared run holding `a` if it is current for generation `generation`.
+fn shared_run(a: u64, generation: u64) -> Option<(u64, u64, bool)> {
+    let sh = SHARED_RUNS.read();
+    if sh.0 != generation {
+        return None;
+    }
+    let i = sh.1.partition_point(|r| r.0 <= a);
+    i.checked_sub(1).map(|i| sh.1[i]).filter(|r| a < r.1)
+}
+
+/// Adds a run found under the MEM lock (`generation`: MAP_GEN read there).
+fn share_run(run: (u64, u64, bool), generation: u64) {
+    let mut sh = SHARED_RUNS.write();
+    if sh.0 != generation {
+        let from = sh.0;
+        if !crate::gpu::tune::map_ranges() || !revalidate(&mut sh.1, from, generation) {
+            sh.1.clear();
+        }
+        sh.0 = generation;
+    }
+    let (start, end, _) = run;
+    sh.1.retain(|r| r.1 <= start || end <= r.0);
+    if sh.1.len() >= SHARED_RUNS_MAX {
+        sh.1.clear();
+    }
+    let i = sh.1.partition_point(|r| r.0 < start);
+    sh.1.insert(i, run);
+}
+
 thread_local! {
     /// This thread's recently confirmed runs: [start, end) and whether they
     /// are readable (unmapped gaps are kept too: descriptors of unbound
@@ -459,10 +504,16 @@ pub fn readable_span(a: u64) -> Option<(u64, u64)> {
         return ok.then_some((s, e));
     }
     SPAN_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (start, end, ok) = {
+    let found = shared_run(a, generation);
+    if found.is_some() {
+        SPAN_SHARED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let (start, end, ok) = found.unwrap_or_else(|| {
         let st = MEM.lock();
+        // (Unchanged while the lock is held: changes bump it inside.)
+        let now = MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
         let usable = |v: &Vma| v.kind != VmaKind::Reserved && v.prot != 0;
-        match st.find(a) {
+        let run = match st.find(a) {
             Some(v) if usable(v) => {
                 let (mut start, mut end) = (v.start, v.end());
                 for _ in 0..64 {
@@ -487,8 +538,10 @@ pub fn readable_span(a: u64) -> Option<(u64, u64)> {
                 let hi = st.vmas.range(a..).next().map(|(&k, _)| k).filter(|&k| k > a).unwrap_or(a + 1);
                 (lo, hi, false)
             }
-        }
-    };
+        };
+        share_run(run, now);
+        run
+    });
     READABLE.with(|c| {
         let mut c = c.borrow_mut();
         if c.0 != generation {
