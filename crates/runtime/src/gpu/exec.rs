@@ -6067,7 +6067,9 @@ fn seg_lines() -> String {
     if let Some(m) = SEG_TIME.lock().as_ref() {
         let mut v: Vec<(&u64, &[u64; 2])> = m.iter().collect();
         v.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
-        for (k, x) in v.iter().take(30) {
+        // (`DS_PROFILE_TOP=<n>`: more than the 30 costliest.)
+        let top = std::env::var("DS_PROFILE_TOP").ok().and_then(|x| x.parse().ok()).unwrap_or(30usize).max(30);
+        for (k, x) in v.iter().take(top) {
             let what = if **k & DRAW_KEY != 0 { format!("draws {:#x}", **k & !DRAW_KEY) } else { format!("cs {:#x}", **k) };
             s.push_str(&format!("      {what}: {} ms, {} commands, {:.1} us each\n", x[0] / 1_000_000, x[1], x[0] as f64 / x[1].max(1) as f64 / 1000.0));
         }

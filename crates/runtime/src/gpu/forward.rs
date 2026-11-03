@@ -673,12 +673,15 @@ pub fn compute(p: &Prepared, groups: [u32; 3], local: [u32; 3], busy: impl Fn(&[
         return refuse();
     }
     let src_words: Vec<u32> = (0..in_src).map(|j| unsafe { std::ptr::read_volatile((src.base + j * src.stride as u64) as *const u32) }).collect();
-    let words = (0..count)
-        .map(|i| {
-            let j = i % m;
-            if j < src.num_records as u64 { src_words[j as usize] } else { 0 }
-        })
-        .collect();
+    // dst[i] = src[i % m], zero past the source's records: the source's
+    // words a period at a time (a division per word was most of this).
+    let mut words: Vec<u32> = Vec::with_capacity(count as usize);
+    while (words.len() as u64) < count {
+        let k = (count - words.len() as u64).min(m) as usize;
+        let have = k.min(src_words.len());
+        words.extend_from_slice(&src_words[..have]);
+        words.resize(words.len() + (k - have), 0);
+    }
     Some((dst.base, words, Inputs { src: src.base, stride: src.stride as u64, src_words, cb: cb.base, count: n, modulus: m }))
 }
 
