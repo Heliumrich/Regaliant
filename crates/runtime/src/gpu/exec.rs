@@ -5920,6 +5920,12 @@ static SEG_PAIRS: Mutex<Option<HashMap<SitePair, [u64; 2]>>> = Mutex::new(None);
 /// Segments with commands by queue and the barrier site that ended them:
 /// [ns, segments, commands].
 static SEG_ENDS: Mutex<Option<HashMap<(String, &'static str, u32), [u64; 3]>>> = Mutex::new(None);
+/// Batches' GPU time by kind and segment (`seg_stamps`): per queue and the
+/// batch's most frequent command (`batch_key`) [batches, ns, then ns and
+/// segments of: commands, front end 2 write-backs, CP writes, timestamps,
+/// barriers only, other segments without commands; then the prologues' ns
+/// and count].
+static BATCH_SEGS: Mutex<Option<HashMap<(String, u64), [u64; 16]>>> = Mutex::new(None);
 
 /// Records of front end 2 write-backs' counters a batch slot holds
 /// (`Exec::wb_count_copy`; later ones in a batch go unrecorded).
@@ -5947,7 +5953,7 @@ fn seg_kind(a: &[u64; OPS], b: &[u64; OPS]) -> &'static str {
 }
 
 /// Splits a completed batch's time among its barrier segments (`seg_stamps`).
-fn collect_segments(pool: vk::QueryPool, shaders: &[u64], segs: &[SegMark], ops_end: &[u64; OPS], be: [u64; 2], queue: &str) {
+fn collect_segments(pool: vk::QueryPool, shaders: &[u64], segs: &[SegMark], ops_end: &[u64; OPS], be: [u64; 2], queue: &str, pre_ns: u64) {
     let c = ctx();
     let mut t = vec![0u64; segs.len()];
     if !segs.is_empty() && unsafe { c.device.get_query_pool_results(pool, 0, &mut t, vk::QueryResultFlags::TYPE_64) }.is_err() {
@@ -5975,6 +5981,10 @@ fn collect_segments(pool: vk::QueryPool, shaders: &[u64], segs: &[SegMark], ops_
     let me = ge.get_or_insert_with(HashMap::new);
     let mut gq = SEG_ENDS.lock();
     let mq = gq.get_or_insert_with(HashMap::new);
+    let mut bs = [0u64; 16];
+    bs[0] = 1;
+    bs[14] = pre_ns;
+    bs[15] = (pre_ns != 0) as u64;
     for w in bounds.windows(2) {
         let d = ((w[1].0 - w[0].0) as f64 * period) as u64;
         let (from, to) = (w[0].1, w[1].1.max(w[0].1));
@@ -6027,6 +6037,20 @@ fn collect_segments(pool: vk::QueryPool, shaders: &[u64], segs: &[SegMark], ops_
                 format!("{queue}: {} ({} commands)", names.join(" + "), cmds.len())
             });
         }
+        bs[1] += d;
+        let part = if cmds.is_empty() {
+            match seg_kind(&w[0].2, &w[1].2) {
+                "front end 2 write-backs" => 1,
+                "CP writes" => 2,
+                "timestamps" => 3,
+                "barriers only" => 4,
+                _ => 5,
+            }
+        } else {
+            0
+        };
+        bs[2 + 2 * part] += d;
+        bs[3 + 2 * part] += 1;
         if cmds.is_empty() {
             let kind = seg_kind(&w[0].2, &w[1].2);
             let e = me.entry(kind).or_insert([0; 2]);
@@ -6053,6 +6077,48 @@ fn collect_segments(pool: vk::QueryPool, shaders: &[u64], segs: &[SegMark], ops_
         }
         SEG_TOTAL[2].fetch_add(1, Ordering::Relaxed);
     }
+    let mut gb = BATCH_SEGS.lock();
+    let e = gb.get_or_insert_with(HashMap::new).entry((queue.to_string(), batch_key(shaders))).or_insert([0; 16]);
+    for (x, v) in e.iter_mut().zip(bs) {
+        *x += v;
+    }
+}
+
+/// The batches' split by kind and segment (`BATCH_SEGS`): the 14 kinds
+/// with the most GPU time, the graphics queue's 10 first.
+fn batch_seg_lines() -> String {
+    let g = BATCH_SEGS.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(&(String, u64), &[u64; 16])> = m.iter().collect();
+    v.sort_by(|a, b| b.1[1].cmp(&a.1[1]));
+    let gfx: Vec<_> = v.iter().filter(|x| x.0 .0 == "gpu-gfx").take(10).copied().collect();
+    let others: Vec<_> = v.iter().filter(|x| x.0 .0 != "gpu-gfx").take(4).copied().collect();
+    let mut s = String::from("    batch GPU time by kind and segment (us a batch: commands, then segments without commands, then the prologue):\n");
+    for ((q, k), x) in gfx.into_iter().chain(others) {
+        let n = x[0].max(1) as f64;
+        let us = |i: usize| x[i] as f64 / n / 1000.0;
+        let cnt = |i: usize| x[i] as f64 / n;
+        s.push_str(&format!(
+            "      {q} {}: {} batches, {:.0} us each: commands {:.0} ({:.1} segments), write-backs {:.0} ({:.1}), CP writes {:.0} ({:.1}), timestamps {:.0} ({:.1}), barriers only {:.0} ({:.1}), other {:.0} ({:.1}); prologue {:.0}\n",
+            batch_key_name(*k),
+            x[0],
+            us(1),
+            us(2),
+            cnt(3),
+            us(4),
+            cnt(5),
+            us(6),
+            cnt(7),
+            us(8),
+            cnt(9),
+            us(10),
+            cnt(11),
+            us(12),
+            cnt(13),
+            x[14] as f64 / n / 1000.0
+        ));
+    }
+    s
 }
 
 /// The segment profile's lines (`seg_stamps`).
@@ -7233,7 +7299,8 @@ fn collect_timestamps(bq: vk::QueryPool, pool: vk::QueryPool, shaders: &[u64], q
         g.0 = g.0.max(be[1]);
         drop(g);
         if seg_stamps() {
-            collect_segments(pool, shaders, segs, ops, be, queue);
+            let pre_ns = if got_pre && pre[0] != 0 { (pre[1].saturating_sub(pre[0]) as f64 * period) as u64 } else { 0 };
+            collect_segments(pool, shaders, segs, ops, be, queue, pre_ns);
         }
     }
     if got_pre {
@@ -7314,6 +7381,7 @@ pub fn reset_shader_profile() {
     *SEG_EMPTY.lock() = None;
     *SEG_PAIRS.lock() = None;
     *SEG_ENDS.lock() = None;
+    *BATCH_SEGS.lock() = None;
     *WB_SIZES.lock() = ([[0; 4]; 7], [0.0; 9]);
     for c in &SEG_TOTAL {
         c.store(0, Ordering::Relaxed);
@@ -7396,6 +7464,7 @@ pub fn shader_profile() -> String {
     );
     if seg_stamps() {
         s.push_str(&seg_lines());
+        s.push_str(&batch_seg_lines());
     }
     s.push_str(&merge_by_lines(super::FRAMES.load(Ordering::Relaxed).saturating_sub(MERGE_FROM.load(Ordering::Relaxed))));
     s.push_str(&fill_by_lines(super::FRAMES.load(Ordering::Relaxed).saturating_sub(MERGE_FROM.load(Ordering::Relaxed))));
