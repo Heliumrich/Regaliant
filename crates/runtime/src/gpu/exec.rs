@@ -3790,6 +3790,21 @@ static SHADOWS_SHARED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// timestamps, waits that ordered the work after them, CP writes right after
 /// front end 2's write-back with no barrier before them].
 static EOP_LIGHT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// CP writes without end-of-pipe semantics (WRITE_DATA) the GPU performed
+/// (`Cp::gpu_cp_write`; each a full barrier before and after), on the
+/// graphics CP and its workers / the compute queues, by [neither, after a
+/// partial flush or acquire, held past a label wait, held and after a flush]
+/// (diagnosis: the barrier before one is what a flush asked for; without
+/// one the console's CP does not wait for shaders).
+pub static CPW_KINDS: [[AtomicU64; 4]; 2] = [const { [const { AtomicU64::new(0) }; 4] }; 2];
+/// Those after a flush or acquire by what requested it: its EVENT_WRITE
+/// event type, 64 ACQUIRE_MEM (`Cp::fence_kind`).
+pub static CPW_FENCES: [[AtomicU64; 128]; 2] = [const { [const { AtomicU64::new(0) }; 128] }; 2];
+
+fn cpw_fences(k: usize) -> String {
+    let v: Vec<String> = CPW_FENCES[k].iter().enumerate().filter(|(_, c)| c.load(Ordering::Relaxed) > 0).map(|(i, c)| if i == 64 { format!("ACQUIRE_MEM {}", c.load(Ordering::Relaxed)) } else { format!("event {i:#x} {}", c.load(Ordering::Relaxed)) }).collect();
+    v.join(", ")
+}
 /// Dispatches storing deferred timestamps (`Exec::resolve_timestamps`), and
 /// deferred timestamps a later one of the same resolve overwrote.
 static TS_DISPATCHES: AtomicU64 = AtomicU64::new(0);
@@ -14941,13 +14956,17 @@ pub fn status() -> String {
             COALESCED[1].load(Ordering::Relaxed)
         )
         + &format!(
-            "    end-of-pipe writes without a full barrier: {} labels, {} timestamps (stored by {} dispatches, {} overwritten in their batch); {} waits ordered the work after them; {} CP writes right after front end 2's write-back with no barrier before them\n",
+            "    end-of-pipe writes without a full barrier: {} labels, {} timestamps (stored by {} dispatches, {} overwritten in their batch); {} waits ordered the work after them; {} CP writes right after front end 2's write-back with no barrier before them; CP writes without end of pipe the GPU performed, graphics / compute queues, by (neither, after a flush or acquire, held past a label wait, both): {:?} / {:?}; after a flush by what asked for it: graphics {}; compute queues {}\n",
             EOP_LIGHT[0].load(Ordering::Relaxed),
             EOP_LIGHT[1].load(Ordering::Relaxed),
             TS_DISPATCHES.load(Ordering::Relaxed),
             TS_REPEATS.load(Ordering::Relaxed),
             EOP_LIGHT[2].load(Ordering::Relaxed),
-            EOP_LIGHT[3].load(Ordering::Relaxed)
+            EOP_LIGHT[3].load(Ordering::Relaxed),
+            CPW_KINDS[0].iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),
+            CPW_KINDS[1].iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),
+            cpw_fences(0),
+            cpw_fences(1)
         )
         + &format!(
             "    shadows shared after their merge: {}, copies in from them {}; not shared: {} written in place meanwhile, {} CPU-written, {} no entry\n",

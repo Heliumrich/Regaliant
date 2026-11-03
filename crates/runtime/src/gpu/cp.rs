@@ -289,6 +289,9 @@ pub struct Cp {
     /// A partial flush / acquire was requested: the next CP memory write
     /// must wait for the GPU work before it.
     fence_pending: bool,
+    /// The last such request: its EVENT_WRITE event type, 64 ACQUIRE_MEM
+    /// (diagnosis: `exec::CPW_FENCES`).
+    fence_kind: u8,
     /// SET_PREDICATION state for packets with the predicate bit.
     pred: Option<Pred>,
     /// When the title submitted the command buffer being executed.
@@ -1853,6 +1856,7 @@ impl Cp {
             exec_failed: false,
             fe2_view: (super::fe2::wanted() && super::fe2::views_on() && (compute || super::fe2::gfx_views())).then(|| super::fe2::view_cell(name)),
             fence_pending: false,
+            fence_kind: 0,
             pred: None,
             submitted_at: None,
             sub_index: 0,
@@ -3708,6 +3712,12 @@ impl Cp {
             }
             return false;
         }
+        if !end_of_pipe {
+            super::exec::CPW_KINDS[self.compute as usize][(held as usize) << 1 | self.fence_pending as usize].fetch_add(1, Ordering::Relaxed);
+            if self.fence_pending {
+                super::exec::CPW_FENCES[self.compute as usize][self.fence_kind as usize & 127].fetch_add(1, Ordering::Relaxed);
+            }
+        }
         self.fence_pending = false;
         if held {
             return true;
@@ -4792,6 +4802,7 @@ impl Cp {
             // only a following CP memory write has to wait (see `fence`).
             op::EVENT_WRITE | op::ACQUIRE_MEM => {
                 self.fence_pending = true;
+                self.fence_kind = if opcode == op::ACQUIRE_MEM { 64 } else { (p(0) & 0x3F) as u8 };
                 if let Some(e) = self.exec.as_mut() {
                     e.note_sync();
                 }
