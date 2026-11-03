@@ -116,11 +116,19 @@ struct Chunk {
     /// finds such a page written found a write the protection missed
     /// (`take_run`: a hole).
     varmed: [AtomicU64; WORDS],
-    /// Written by GPU work (never armed, unless `DS_FE2_ARM_GPU=1`).
+    /// Written by GPU work (never armed, unless `DS_FE2_ARM_GPU=1`). Bits
+    /// are only ever set.
     gpu: [AtomicU64; WORDS],
+    /// Every `gpu` bit of the chunk set (a written range's scan covered it
+    /// whole): its scans need set none, so its summary serves them too.
+    gpu_all: AtomicBool,
     /// The epoch every valid page of the word was found clean in (a take
     /// over the whole word), else 0.
     wclean: [AtomicU32; WORDS],
+    /// At least the newest epoch any page of the word has in `clean` (a
+    /// take over part of the word): older than a check's requirement, no
+    /// page of it meets it by its own stamp.
+    wmax: [AtomicU32; WORDS],
     /// Bumped by every invalidation of a page of the word.
     wgen: [AtomicU32; WORDS],
     /// The epoch (low 32 bits) a take found the page clean in.
@@ -143,8 +151,10 @@ struct Chunk {
     /// written then: `set_clean`).
     seen: [AtomicU64; WORDS],
     /// Bumped by every invalidation in the chunk and every arming that
-    /// ended there (the summary below goes with it).
-    cgen: AtomicU32,
+    /// ended there (the summary below goes with it). On a cache line of its
+    /// own: every range-cache hit over the chunk reads it, and it lay beside
+    /// the summary that scans store.
+    cgen: Line<AtomicU32>,
     /// The chunk's summary: every page of it needed no check as of (`cgen`
     /// << 32 | the requirement it met (`ensure`'s `want`: met for any lower
     /// one too), or SUM_ARMED for every page armed: any) and the host's
@@ -155,6 +165,17 @@ struct Chunk {
     /// faults: `burst`), and the doublings of its last hold.
     hold_until: AtomicU64,
     hold_level: AtomicU8,
+}
+
+/// A value on a cache line of its own (`Chunk::cgen`).
+#[repr(align(64))]
+struct Line<T>(T);
+
+impl<T> std::ops::Deref for Line<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
 }
 
 /// `Chunk::sum`'s epoch part when every page of the chunk is armed.
@@ -994,7 +1015,9 @@ fn make_chunk(slot: &'static AtomicPtr<Chunk>) -> &'static Chunk {
         armed: std::array::from_fn(|_| AtomicU64::new(0)),
         varmed: std::array::from_fn(|_| AtomicU64::new(0)),
         gpu: std::array::from_fn(|_| AtomicU64::new(0)),
+        gpu_all: AtomicBool::new(false),
         wclean: std::array::from_fn(|_| AtomicU32::new(0)),
+        wmax: std::array::from_fn(|_| AtomicU32::new(0)),
         wgen: std::array::from_fn(|_| AtomicU32::new(0)),
         clean: (0..CHUNK_PAGES).map(|_| AtomicU32::new(0)).collect(),
         wrote: (0..CHUNK_PAGES).map(|_| AtomicU32::new(0)).collect(),
@@ -1003,7 +1026,7 @@ fn make_chunk(slot: &'static AtomicPtr<Chunk>) -> &'static Chunk {
         uses: std::array::from_fn(|_| AtomicU8::new(0)),
         use_ep: std::array::from_fn(|_| AtomicU32::new(0)),
         seen: std::array::from_fn(|_| AtomicU64::new(0)),
-        cgen: AtomicU32::new(0),
+        cgen: Line(AtomicU32::new(0)),
         sum: AtomicU64::new(0),
         sum_host: AtomicU64::new(0),
         hold_until: AtomicU64::new(0),
@@ -1181,6 +1204,10 @@ fn word_ok(c: &Chunk, a: u64, e: u64, want: u32) -> u64 {
     }
     if c.wclean[w].load(Ordering::Acquire) >= want {
         return v;
+    }
+    // (A stamp stored after this read only makes the check conservative.)
+    if c.wmax[w].load(Ordering::Acquire) < want {
+        return armed;
     }
     let mut ok = armed;
     let base = w * 64;
@@ -1431,7 +1458,7 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
         while a < hi {
             if a & (CHUNK_BYTES - 1) == 0 && a + CHUNK_BYTES <= hi {
                 let c = chunk(a, true).expect("inside the span");
-                if !gpu_writes && summary_ok(c, a, want) {
+                if (!gpu_writes || c.gpu_all.load(Ordering::Acquire)) && summary_ok(c, a, want) {
                     local_add(L_SUMMARY, 1);
                     if c.sum.load(Ordering::Acquire) as u32 != SUM_ARMED {
                         all_armed = false;
@@ -1446,7 +1473,13 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
             let w = idx(a) / 64;
             words += 1;
             if gpu_writes {
-                c.gpu[w].fetch_or(word_mask(a, e), Ordering::AcqRel);
+                // (Set bits stay set: the chunks of a run start together and
+                // scan the same pools, and a write per word made each scan's
+                // words move between their cores.)
+                let m = word_mask(a, e);
+                if c.gpu[w].load(Ordering::Acquire) & m != m {
+                    c.gpu[w].fetch_or(m, Ordering::AcqRel);
+                }
             }
             let need = word_mask(a, e) & !word_ok(c, a, e, want);
             if all_armed && need == 0 {
@@ -1500,10 +1533,16 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
             // A chunk scanned whole without a page to check: its summary.
             if let Some((start, g, h, ok, armed)) = whole {
                 if a == start + CHUNK_BYTES {
-                    if ok {
-                        let c = chunk(start, false).expect("scanned");
+                    let c = chunk(start, false).expect("scanned");
+                    // (Stored only when they change: threads rescanning a
+                    // chunk kept its line moving between their cores.)
+                    let sum = (g as u64) << 32 | if armed { SUM_ARMED } else { want } as u64;
+                    if ok && (c.sum.load(Ordering::Relaxed) != sum || c.sum_host.load(Ordering::Relaxed) != h) {
                         c.sum_host.store(h, Ordering::Release);
-                        c.sum.store((g as u64) << 32 | if armed { SUM_ARMED } else { want } as u64, Ordering::Release);
+                        c.sum.store(sum, Ordering::Release);
+                    }
+                    if gpu_writes && !c.gpu_all.load(Ordering::Relaxed) {
+                        c.gpu_all.store(true, Ordering::Release);
                     }
                     whole = None;
                 }
@@ -2082,6 +2121,7 @@ fn set_clean(a: u64, b: u64, ep: u32, validate: bool) {
             for k in i..i + ((e - x) / PAGE) as usize {
                 c.clean[k].store(ep, Ordering::Release);
             }
+            c.wmax[w].fetch_max(ep, Ordering::AcqRel);
         }
         // A take's first look at the word in this epoch counts as a use.
         if !validate && c.use_ep[w].swap(ep, Ordering::AcqRel) != ep {
