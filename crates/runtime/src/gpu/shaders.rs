@@ -2248,6 +2248,14 @@ fn translate_kept(addr: u64, insts: &[rdna::Inst], plan: &Arc<Plan>, plan_key: u
     for w in &out.warnings {
         crate::warn!("{:?} shader {addr:#x}: {w}", spec.stage);
     }
+    let t = Arc::new(translated(insts, out, plan, plan_key, spec_hash, key_spec));
+    TRANSLATIONS.lock().get_or_insert_with(HashMap::new).insert((plan_key, spec_hash), t.clone());
+    Ok(t)
+}
+
+/// A translation's record: its output, plan, key and the resources its
+/// atomics use.
+fn translated(insts: &[rdna::Inst], out: Output, plan: &Arc<Plan>, plan_key: u64, spec_hash: u64, key_spec: Spec) -> Translated {
     let mut atomic_res: Vec<usize> = insts
         .iter()
         .filter(|i| i.name().is_some_and(|n| n.starts_with("buffer_atomic_") || n.starts_with("global_atomic_")))
@@ -2255,9 +2263,30 @@ fn translate_kept(addr: u64, insts: &[rdna::Inst], plan: &Arc<Plan>, plan_key: u
         .collect();
     atomic_res.sort_unstable();
     atomic_res.dedup();
-    let t = Arc::new(Translated { out, plan: Arc::clone(plan), key: plan_key ^ spec_hash.rotate_left(1), atomic_res, spec: key_spec });
-    TRANSLATIONS.lock().get_or_insert_with(HashMap::new).insert((plan_key, spec_hash), t.clone());
-    Ok(t)
+    Translated { out, plan: Arc::clone(plan), key: plan_key ^ spec_hash.rotate_left(1), atomic_res, spec: key_spec }
+}
+
+/// `translate_code_for_spec` keeping neither the translation nor its plan,
+/// and quiet (no hitch notes or logs): `--precompile-all` makes thousands,
+/// of which only the pipelines are kept (all translations of the game's
+/// files are ~566 million SPIR-V words).
+pub(crate) fn translate_code_unkept(code: &[u32], code_hash: u64, key_spec: Spec) -> Result<Translated, String> {
+    if hash_words(code) != code_hash {
+        return Err("stored code does not match its hash".into());
+    }
+    let plan_key = code_hash ^ (key_spec.user_sgprs as u64) << 48 ^ (key_spec.user_base as u64) << 56;
+    let spec_hash = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key_spec.hash(&mut h);
+        h.finish()
+    };
+    let insts = rdna::decode_program(code).map_err(|e| format!("decode stored code: {}", e.0))?;
+    let plan = Arc::new(rdna::analysis::analyze_opts(&insts, key_spec.user_sgprs, key_spec.user_base, false));
+    if !plan.errors.is_empty() {
+        return Err(plan.errors.join("; "));
+    }
+    let out = translate::translate(&insts, &plan, &key_spec).map_err(|e| format!("{:?} shader {code_hash:#x}: {e}", key_spec.stage))?;
+    Ok(translated(&insts, out, &plan, plan_key, spec_hash, key_spec))
 }
 
 /// The code hash of the program at `addr` (as `prepare` keys it).

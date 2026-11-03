@@ -255,13 +255,13 @@ fn bundle_compute(app: &std::path::Path) -> Vec<(u64, std::sync::Arc<Vec<u32>>, 
 }
 
 /// `--precompile-all [threads]`: every compute program of the game's shader
-/// files with a shader object (`bundle_compute`) is translated and its pipeline made through the pipeline store under the
-/// key its dispatches look up, the largest first, on `threads` threads
-/// (default 8): later sessions then find it instead of compiling it at the
-/// program's first dispatch, wherever the dispatch binds what the guess
-/// says (86% of the particle programs' learned specs, FINDINGS.md
-/// 2026-11-02 evening). Pipelines already in the store take moments.
-/// Progress every 10 s.
+/// files with a shader object (`bundle_compute`) is translated (not kept)
+/// and its pipeline made through the pipeline store under the key its
+/// dispatches look up, the largest first, on `threads` threads (default 8):
+/// later sessions then find it instead of compiling it at the program's
+/// first dispatch, wherever the dispatch binds what the guess says (86% of
+/// the particle programs' learned specs, FINDINGS.md 2026-11-02 evening).
+/// Pipelines already in the store take moments. Progress every 10 s.
 pub fn precompile_all(app: &std::path::Path, threads: usize) -> i32 {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
     if let Err(e) = super::vk::init() {
@@ -284,7 +284,7 @@ pub fn precompile_all(app: &std::path::Path, threads: usize) -> i32 {
             s.spawn(|| loop {
                 let i = next.fetch_add(1, Relaxed);
                 let Some((h, code, spec, n)) = progs.get(i) else { break };
-                let r = super::shaders::translate_code_for_spec(code, *h, spec.clone()).and_then(|tr| super::exec::store_compute_pipeline(&tr));
+                let r = super::shaders::translate_code_unkept(code, *h, spec.clone()).and_then(|tr| super::exec::store_compute_pipeline(&tr));
                 match r {
                     Ok(d) => {
                         compile_ns.fetch_add(d.as_nanos() as u64, Relaxed);
