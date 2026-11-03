@@ -311,6 +311,15 @@ pub struct Spec {
     /// EXEC and enabling all lanes) must find lanes EXEC masked off earlier.
     /// It costs time where lanes would have skipped a region alone.
     pub lane_votes: bool,
+    /// Compute: no lockstep (and wave-mask) mode although cross-lane
+    /// operations sit in code the invocations may not all run, for programs
+    /// whose such reads are waterfall loops (v_readfirstlane: each 32-lane
+    /// subgroup walks its own lanes' values), wave-wide OR reductions of
+    /// per-lane masks walked with s_ff1 under per-lane tests (each subgroup
+    /// walks its own half) and DPP within quads and rows, and that use no
+    /// LDS: each subgroup then gives its lanes the wave's results. The
+    /// runtime decides per program (its list of verified programs).
+    pub lockstep_off: bool,
     /// Vertex stage of a draw whose arguments the GPU reads (indexed
     /// indirect draws, see the runtime's `DrawArgs::gpu_args`): this SGPR
     /// receives the start instance (`gl_BaseInstance`), as the command
@@ -470,6 +479,9 @@ impl std::hash::Hash for Spec {
         }
         self.per_lane.hash(state);
         self.lane_votes.hash(state);
+        if self.lockstep_off {
+            0x4C4F_4646u32.hash(state);
+        }
         if let Some(s) = self.base_instance_sgpr {
             s.hash(state);
         }
@@ -2741,6 +2753,7 @@ fn lockstep_mode(spec: &Spec, code: &[Inst]) -> (bool, bool) {
         && (one_wave || !wave_scalars)
         && std::env::var("DS_LOCKSTEP").ok().as_deref() != Some("0")
         && !spec.per_lane
+        && !spec.lockstep_off
         && !lockstep_off(spec.code_base);
     (lockstep, one_wave)
 }
@@ -2865,11 +2878,12 @@ fn bits_offen(i: &Inst) -> bool {
 
 /// Diagnosis: `DS_LOCKSTEP_OFF=<hex address>[,...]` translates those
 /// shaders without lockstep (and wave-mask) mode, each invocation a wave
-/// of one (translations are then keyed by address, as with DS_WAVEMASK).
+/// of one (translations are then keyed by address, as with DS_WAVEMASK;
+/// `;` separates too, for run drivers that split their variables at commas).
 fn lockstep_off(addr: u64) -> bool {
     match std::env::var("DS_LOCKSTEP_OFF") {
         Err(_) => false,
-        Ok(v) => v.split(',').any(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).is_ok_and(|x| x == addr && x != 0)),
+        Ok(v) => v.split([',', ';']).any(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).is_ok_and(|x| x == addr && x != 0)),
     }
 }
 
@@ -3576,6 +3590,7 @@ mod tests {
             early_ok: false,
             per_lane: false,
             lane_votes: false,
+            lockstep_off: false,
             base_instance_sgpr: None,
             sgpr_pc: None,
             addresses: false,

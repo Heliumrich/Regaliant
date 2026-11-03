@@ -1228,6 +1228,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         early_ok: false,
         per_lane: false,
         lane_votes: false,
+        lockstep_off: false,
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Compute)),
         addresses: super::tune::batch_cs() && batchable(addr),
@@ -1245,6 +1246,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         spec.per_lane = super::tune::per_lane() == 1 || !votes;
         spec.lane_votes = spec.per_lane && votes;
     }
+    spec.lockstep_off = no_lockstep_program(code_hash);
     // GPU-resolved per-item chains (`gpures`, `tune gpu_chains`; batched
     // programs, whose translations use device addresses).
     if spec.batched && super::tune::gpu_chains() != 0 && super::pagetable::address() != 0 && !NO_GPU_CHAINS.with(|c| c.get()) {
@@ -1285,6 +1287,28 @@ const PER_LANE_PROGRAMS: &[(u64, &str, bool)] = &[
     (0xcb83_739f_ea04_1817, "froxel fog cs 0x100892b200", true),
 ];
 
+/// Compute programs translated without lockstep mode (`Spec::lockstep_off`),
+/// by FNV-1a of their words up to the first s_endpgm (as PER_LANE_PROGRAMS),
+/// each checked by reading its code (its divergent cross-lane reads are
+/// waterfall loops and OR-reduced light masks, its DPP within quads and
+/// rows, no LDS) and by shots of one view against lockstep (FINDINGS.md
+/// 2026-11-03 early morning).
+const NO_LOCKSTEP_PROGRAMS: &[(u64, &str)] = &[
+    // The GI probe update (from giupda; one 8x8 workgroup per probe tile):
+    // screen-space differences by DPP (quad_perm, row_ror), a waterfall
+    // loop of v_readfirstlane, the light-mask walk of the tiled passes.
+    // 881 -> 408-448 us a frame at 1-1's vista, on a compute queue beside
+    // the graphics work: frames level on the RTX 4090 (in-run A/B).
+    (0x7761_ec89_6045_ec47, "GI probe update cs 0x1008a05b00"),
+];
+
+/// Program hashes found in NO_LOCKSTEP_PROGRAMS.
+static NO_LOCKSTEP_HASHES: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+fn no_lockstep_program(code_hash: u64) -> bool {
+    code_hash != 0 && NO_LOCKSTEP_HASHES.iter().any(|h| h.load(std::sync::atomic::Ordering::Relaxed) == code_hash)
+}
+
 /// Program hashes (`hash_words`) found in PER_LANE_PROGRAMS (read without a
 /// lock by every compute preparation).
 static PER_LANE_HASHES: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
@@ -1314,9 +1338,20 @@ fn program_id(words: &[u32]) -> u64 {
     h
 }
 
-/// Notes a decoded program found in PER_LANE_PROGRAMS (by its hash).
+/// Notes a decoded program found in PER_LANE_PROGRAMS or
+/// NO_LOCKSTEP_PROGRAMS (by its hash).
 fn note_per_lane(addr: u64, words: &[u32], hash: u64) {
     let id = program_id(words);
+    if let Some(&(_, what)) = NO_LOCKSTEP_PROGRAMS.iter().find(|p| p.0 == id) {
+        if !no_lockstep_program(hash) {
+            for slot in &NO_LOCKSTEP_HASHES {
+                if slot.compare_exchange(0, hash, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).is_ok() {
+                    crate::info!("shader {addr:#x}: translated without lockstep ({what})");
+                    break;
+                }
+            }
+        }
+    }
     let Some(&(_, what, votes)) = PER_LANE_PROGRAMS.iter().find(|p| p.0 == id) else { return };
     if per_lane_program(hash) {
         return;
@@ -1457,6 +1492,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         early_ok: early_ok(&ctx),
         per_lane: false,
         lane_votes: false,
+        lockstep_off: false,
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Fragment)),
         addresses: batched_draw_now(),
@@ -1653,6 +1689,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         early_ok: false,
         per_lane: false,
         lane_votes: false,
+        lockstep_off: false,
         base_instance_sgpr: BASE_INSTANCE.with(|c| c.get()).map(|k| 8 + k),
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Vertex)),
         addresses: batched_draw_now(),
@@ -2503,6 +2540,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         early_ok: false,
         per_lane: false,
         lane_votes: false,
+        lockstep_off: false,
         base_instance_sgpr,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Vertex)),
         addresses: false,
@@ -2550,6 +2588,7 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         early_ok,
         per_lane: false,
         lane_votes: false,
+        lockstep_off: false,
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Fragment)),
         addresses: false,
@@ -2597,6 +2636,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         early_ok: false,
         per_lane: false,
         lane_votes: false,
+        lockstep_off: false,
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Compute)),
         addresses: super::tune::batch_cs() && batched,
@@ -2614,6 +2654,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         spec.per_lane = super::tune::per_lane() == 1 || !votes;
         spec.lane_votes = spec.per_lane && votes;
     }
+    spec.lockstep_off = no_lockstep_program(code_hash);
     spec
 }
 /// Preparations served from / missing PREP_CACHE (diagnostics).

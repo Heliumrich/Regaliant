@@ -1984,7 +1984,7 @@ pub(crate) fn spec_diff(a: &rdna::translate::Spec, b: &rdna::translate::Spec) ->
             })*
         };
     }
-    fields!(stage, user_sgprs, user_base, wave64, ps_input_addr, ps_inputs, barycentric, mrt, cs_local_size, cs_rsrc2, binding_base, probe, dump, force_dispatcher, dispatcher_for_loops, reg_vars, lane_guards, mip_views, lod_stats, early_tests, early_ok, per_lane, lane_votes, base_instance_sgpr, sgpr_pc, addresses, batched, write_marks, marks_untouched, sgpr_ubo);
+    fields!(stage, user_sgprs, user_base, wave64, ps_input_addr, ps_inputs, barycentric, mrt, cs_local_size, cs_rsrc2, binding_base, probe, dump, force_dispatcher, dispatcher_for_loops, reg_vars, lane_guards, mip_views, lod_stats, early_tests, early_ok, per_lane, lane_votes, lockstep_off, base_instance_sgpr, sgpr_pc, addresses, batched, write_marks, marks_untouched, sgpr_ubo);
     if a.resources.len() != b.resources.len() {
         d.push(format!("resources {:?} -> {:?}", a.resources, b.resources));
     } else {

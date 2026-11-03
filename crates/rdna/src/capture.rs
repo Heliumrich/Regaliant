@@ -132,6 +132,7 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         early_ok: false,
         per_lane: false,
         lane_votes: false,
+        lockstep_off: false,
         base_instance_sgpr: None,
         // RDNA_SGPR_PC=1: SGPR data at a push-constant offset (validation).
         sgpr_pc: std::env::var_os("RDNA_SGPR_PC").is_some().then(|| crate::translate::sgpr_pc_offset(u.stage)),
