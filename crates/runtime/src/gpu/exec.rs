@@ -3992,6 +3992,30 @@ fn gather_pipe() -> Result<&'static MergePipe, String> {
 /// (16 per texel).
 /// Appended to `out` (a reused vector: no allocation per command once it
 /// has grown).
+/// Diagnosis (`DS_TRACE_LARGE=1`): buffer bindings of 16 MiB or more,
+/// each shader's resource once (the first 400), with what sized them.
+fn trace_large() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_TRACE_LARGE").ok().as_deref() == Some("1"))
+}
+
+fn note_large_binding(queue: &str, p: &Prepared, i: usize, base: u64, size: u64, sized_by: bool) {
+    static SEEN: Mutex<Option<HashSet<(u64, usize)>>> = Mutex::new(None);
+    let mut g = SEEN.lock();
+    let seen = g.get_or_insert_with(HashSet::new);
+    if seen.len() >= 400 || !seen.insert((p.addr, i)) {
+        return;
+    }
+    drop(g);
+    let what = match &p.found.resources[i] {
+        Resolved::Buffer(v) => format!("V# stride {} records {} (index limit {})", v.stride, v.num_records, v.index_limit()),
+        Resolved::Global(_, n) => format!("pointer ({n:?} bytes)"),
+        _ => String::new(),
+    };
+    let map = crate::mem::readable_span(base).map_or("unmapped".to_string(), |(s, e)| format!("{s:#x}..{e:#x}"));
+    crate::info!("gpu[{queue}]: large binding: {:?} shader {:#x} resource {i} {base:#x}+{size:#x} ({what}; {}), written {}, readable run {map}", p.stage, p.addr, if sized_by { "sized by its descriptor" } else { "to its mapping's end" }, p.tr.plan.resources[i].written);
+}
+
 /// What the binding memos' sampled views hold for (`images::view_hit`):
 /// the image cache's lookups, the write tracker's generation, the frame.
 fn bind_gens() -> [u64; 3] {
@@ -13226,10 +13250,14 @@ impl Exec {
                             Resolved::Global(a, n) => (*a, *n, 0, u32::MAX),
                             _ => return Err("binding/resource mismatch".into()),
                         };
+                        let sized_by = size.is_some();
                         let mut size = match size {
                             Some(n) => n,
                             None => mapping(base).map(|(_, e)| (e - base).min(UNBOUNDED_MAX)).unwrap_or(0),
                         };
+                        if size >= 16 << 20 && trace_large() {
+                            note_large_binding(&self.name, p, i, base, size, sized_by);
+                        }
                         BindClock::mark(&mut clk, 0);
                         if size > 0 && !found.tr.plan.resources[i].written {
                             bound.reads.push((base, size));
