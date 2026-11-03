@@ -370,6 +370,18 @@ fn sop1(tr: &mut T, ins: &Inst, name: &str) -> R<()> {
         let nz = if wide { nonzero64(tr, nlo, nhi)? } else { nonzero(tr, nlo)? };
         return tr.set_scc(nz);
     }
+    if tr.sg.leaders.contains(&ins.pc) {
+        // EXEC for an append's atomic (`Appends`): the subgroup's first
+        // active invocation alone.
+        let lead = tr.subgroup_leader()?;
+        let lo = tr.bool_to_u(lead)?;
+        tr.set_sreg(OP_EXEC_LO as u32, lo)?;
+        if name == "s_mov_b64" {
+            let z = tr.u(0);
+            tr.set_sreg(OP_EXEC_HI as u32, z)?;
+        }
+        return Ok(());
+    }
     match name {
         "s_mov_b32" => {
             let v = tr.operand(ins, s)?;
@@ -624,6 +636,19 @@ fn sop2(tr: &mut T, ins: &Inst, name: &str) -> R<()> {
     let u = tr.t.u32;
     let bt = tr.t.bool_;
     let d = ins.sdst();
+    if tr.sg.lane0.contains(&ins.pc) {
+        // An append's election (`s_and X, exec, 1`, `Appends`): lane 0's
+        // bit alone, for the election's other uses (each invocation is not
+        // lane 0 of a wave of its own here); SCC as before.
+        let act = tr.active()?;
+        let lane = tr.lane()?;
+        let z = tr.u(0);
+        let first = e(tr.b.i_equal(bt, None, lane, z))?;
+        let c = e(tr.b.logical_and(bt, None, act, first))?;
+        let lo = tr.bool_to_u(c)?;
+        tr.set_scc(act)?;
+        return if name.ends_with("_b64") { set_s64(tr, d, lo, z) } else { tr.set_sreg(d as u32, lo) };
+    }
     // 64-bit bitwise ops.
     if let Some(stem) = name.strip_prefix("s_").and_then(|n| n.strip_suffix("_b64")) {
         if matches!(stem, "and" | "or" | "xor" | "andn2" | "orn2" | "nand" | "nor" | "xnor") {
@@ -1605,8 +1630,15 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
             // own wave, so it reads its own value.
             // An atomic's result is the invocation's own (see
             // `atomic_result_reads`).
+            // An append's result done per subgroup: its leader's.
             let a = usrc(tr, ins, &v, 0)?;
-            let r = if tr.uniformity.is_uniform(ins.pc) && !tr.own_lane_reads.contains(&ins.pc) { tr.wave_read_first(ins, a)? } else { a };
+            let r = if tr.sg.results.contains(&ins.pc) {
+                tr.leader_read(a)?
+            } else if tr.uniformity.is_uniform(ins.pc) && !tr.own_lane_reads.contains(&ins.pc) {
+                tr.wave_read_first(ins, a)?
+            } else {
+                a
+            };
             tr.set_sreg(v.dst as u32, r)?;
         }
         "v_readlane_b32" => {
@@ -1616,7 +1648,12 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
             let a = match slot {
                 Some(var) => e(tr.b.load(u, None, var, None, []))?,
                 // An atomic's result: the invocation's own (see
-                // `atomic_result_reads`).
+                // `atomic_result_reads`), or its subgroup leader's
+                // (`Appends`).
+                None if tr.sg.results.contains(&ins.pc) => {
+                    let x = tr.operand(ins, v.src[0])?;
+                    tr.leader_read(x)?
+                }
                 None if tr.own_lane_reads.contains(&ins.pc) => tr.operand(ins, v.src[0])?,
                 None => {
                     let x = tr.operand(ins, v.src[0])?;
@@ -2344,10 +2381,10 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
             // compare results) hold only this lane's bit: in a wave of one no
             // active lane is below, so they count 0. Other masks (-1 for the
             // lane id) use the hardware lane index. Wave-mask mode has the
-            // wave's masks.
+            // wave's masks, an append done per subgroup its subgroup's.
             let m = usrc(tr, ins, &v, 0)?;
             let b = usrc(tr, ins, &v, 1)?;
-            let m = if tr.wave_masks {
+            let m = if tr.wave_masks || tr.sg.ranks.contains(&ins.pc) {
                 m
             } else {
                 let one = tr.u(1);

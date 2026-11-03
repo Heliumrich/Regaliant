@@ -185,7 +185,9 @@ fn translate_capture(capture: &str, out_dir: &str) -> i32 {
                     };
                     *warn_kinds.entry(k).or_default() += 1;
                 }
-                println!("{:#x} {:?}: {} words, {} binding(s), {} warning(s)", it.addr, it.stage, out.spirv.len(), out.bindings.len(), out.warnings.len());
+                let model = if out.wave_masks { ", wave-mask mode" } else if out.lockstep { ", lockstep" } else { "" };
+                let sg = if out.sg_appends > 0 { format!(", {} append(s) per subgroup", out.sg_appends) } else { String::new() };
+                println!("{:#x} {:?}: {} words, {} binding(s), {} warning(s){model}{sg}", it.addr, it.stage, out.spirv.len(), out.bindings.len(), out.warnings.len());
                 for w in &out.warnings {
                     println!("    {w}");
                 }

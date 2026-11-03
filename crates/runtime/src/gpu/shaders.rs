@@ -335,6 +335,7 @@ fn program_checked(addr: u64) -> Result<(Arc<Vec<rdna::Inst>>, u64), String> {
     let words = (last.pc / 4 + last.len as u32) as usize;
     let hash = hash_words(&code[..words.min(code.len())]);
     note_per_lane(addr, &code[..words.min(code.len())], hash);
+    note_append(addr, &insts, hash);
     let insts = Arc::new(insts);
     map.insert(addr, Program { words, hash, insts: insts.clone() });
     Ok((insts, hash))
@@ -1227,6 +1228,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         per_lane: false,
         lane_votes: false,
         lockstep_off: false,
+        sg_appends: false,
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Compute)),
         addresses: super::tune::batch_cs() && batchable(addr),
@@ -1246,6 +1248,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         spec.lane_votes = spec.per_lane && votes;
     }
     spec.lockstep_off = no_lockstep_program(code_hash);
+    spec.sg_appends = append_program(code_hash);
     // GPU-resolved per-item chains (`gpures`, `tune gpu_chains`; batched
     // programs, whose translations use device addresses).
     if spec.batched && super::tune::gpu_chains() != 0 && super::pagetable::address() != 0 && !NO_GPU_CHAINS.with(|c| c.get()) {
@@ -1335,6 +1338,35 @@ fn program_id(words: &[u32]) -> u64 {
         }
     }
     h
+}
+
+/// Hashes of programs with a wave-aggregated append (`translate::has_append`,
+/// noted at decode): their specs ask for appends done per subgroup
+/// (`Spec::sg_appends`; FINDINGS.md 2026-11-03 afternoon), which the
+/// translator takes when all of the program's are of that form. Other
+/// programs' specs and keys stay as they were.
+static APPEND_HASHES: [std::sync::atomic::AtomicU64; 64] = [const { std::sync::atomic::AtomicU64::new(0) }; 64];
+
+fn append_program(code_hash: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    code_hash != 0 && APPEND_HASHES.iter().take_while(|h| h.load(Relaxed) != 0).any(|h| h.load(Relaxed) == code_hash)
+}
+
+fn note_append(addr: u64, insts: &[rdna::Inst], hash: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if hash == 0 || append_program(hash) || !rdna::translate::has_append(insts) {
+        return;
+    }
+    for slot in &APPEND_HASHES {
+        match slot.compare_exchange(0, hash, Relaxed, Relaxed) {
+            Ok(_) => {
+                crate::info!("shader {addr:#x}: a wave-aggregated append (done per subgroup where the translator can)");
+                return;
+            }
+            Err(h) if h == hash => return,
+            Err(_) => {}
+        }
+    }
 }
 
 /// Notes a decoded program found in PER_LANE_PROGRAMS or
@@ -1499,6 +1531,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         per_lane: false,
         lane_votes: false,
         lockstep_off: false,
+        sg_appends: false,
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Fragment)),
         addresses: batched_draw_now(),
@@ -1697,6 +1730,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         per_lane: false,
         lane_votes: false,
         lockstep_off: false,
+        sg_appends: false,
         base_instance_sgpr: BASE_INSTANCE.with(|c| c.get()).map(|k| 8 + k),
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Vertex)),
         addresses: batched_draw_now(),
@@ -2509,6 +2543,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         per_lane: false,
         lane_votes: false,
         lockstep_off: false,
+        sg_appends: false,
         base_instance_sgpr,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Vertex)),
         addresses: false,
@@ -2558,6 +2593,7 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         per_lane: false,
         lane_votes: false,
         lockstep_off: false,
+        sg_appends: false,
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Fragment)),
         addresses: false,
@@ -2607,6 +2643,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         per_lane: false,
         lane_votes: false,
         lockstep_off: false,
+        sg_appends: false,
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Compute)),
         addresses: super::tune::batch_cs() && batched,
@@ -2626,6 +2663,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         spec.lane_votes = spec.per_lane && votes;
     }
     spec.lockstep_off = no_lockstep_program(code_hash);
+    spec.sg_appends = append_program(code_hash);
     spec
 }
 fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: &[u32], spec: &mut Spec) -> Result<Prepared, String> {

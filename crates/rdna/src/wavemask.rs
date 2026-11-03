@@ -101,6 +101,56 @@ fn valu_srcs(ins: &Inst) -> Vec<u16> {
     }
 }
 
+/// Native VOP3 instructions (`tables::VOP3`) with two sources: their third
+/// source field is unused.
+fn vop3_two_sources(name: &str) -> bool {
+    matches!(
+        name,
+        "v_add_f64"
+            | "v_mul_f64"
+            | "v_min_f64"
+            | "v_max_f64"
+            | "v_ldexp_f64"
+            | "v_mul_lo_u32"
+            | "v_mul_hi_u32"
+            | "v_mul_lo_i32"
+            | "v_mul_hi_i32"
+            | "v_trig_preop_f64"
+            | "v_lshlrev_b64"
+            | "v_lshrrev_b64"
+            | "v_ashrrev_i64"
+            | "v_add_u16"
+            | "v_sub_u16"
+            | "v_mul_lo_u16"
+            | "v_lshrrev_b16"
+            | "v_ashrrev_i16"
+            | "v_max_u16"
+            | "v_max_i16"
+            | "v_min_u16"
+            | "v_min_i16"
+            | "v_add_i16"
+            | "v_sub_i16"
+            | "v_add_co_u32"
+            | "v_sub_co_u32"
+            | "v_subrev_co_u32"
+            | "v_pack_b32_f16"
+            | "v_cvt_pknorm_i16_f16"
+            | "v_cvt_pknorm_u16_f16"
+            | "v_lshlrev_b16"
+            | "v_ldexp_f32"
+            | "v_bfm_b32"
+            | "v_bcnt_u32_b32"
+            | "v_mbcnt_lo_u32_b32"
+            | "v_mbcnt_hi_u32_b32"
+            | "v_cvt_pknorm_i16_f32"
+            | "v_cvt_pknorm_u16_f32"
+            | "v_cvt_pk_u16_u32"
+            | "v_cvt_pk_i16_i32"
+            | "v_sub_i32"
+            | "v_add_i32"
+    )
+}
+
 fn width(name: &str) -> u16 {
     if name.contains("64") {
         2
@@ -298,8 +348,9 @@ fn effects_opts(ins: &Inst, wave64: bool, partial: bool) -> Fx {
             } else if ins.is_vop3b() {
                 fx.read(s[0], w);
                 fx.read(s[1], w);
-                if !matches!(name, "v_addc_co_u32" | "v_subb_co_u32" | "v_subbrev_co_u32") {
-                    // (carry-ins are lane reads)
+                // (Carry-ins are lane reads; v_add_co_u32 and the like have
+                // two sources.)
+                if !matches!(name, "v_addc_co_u32" | "v_subb_co_u32" | "v_subbrev_co_u32") && !vop3_two_sources(name) {
                     fx.read(s[2], w);
                 }
                 fx.def(ins.vop3_sdst(), mw);
@@ -309,12 +360,14 @@ fn effects_opts(ins: &Inst, wave64: bool, partial: bool) -> Fx {
                 // sources: their unused source fields hold whatever the
                 // encoder left (0, s0, in the title's VOP3 v_mac_f32: read as
                 // a third source until 2026-11-02, it put ~300 programs in
-                // wave-mask mode), and v_cndmask_b32's third is its mask,
-                // read lane by lane.
+                // wave-mask mode), as do native VOP3 instructions with two
+                // (v_bcnt_u32_b32 counting s8's mask read s0 until
+                // 2026-11-03), and v_cndmask_b32's third is its mask, read
+                // lane by lane.
                 let n = match crate::vop3_kind(ins.op) {
                     crate::Vop3Kind::FromVop1 => 1,
                     crate::Vop3Kind::FromVop2 => 2,
-                    _ if matches!(name, "v_cndmask_b32" | "v_readlane_b32" | "v_writelane_b32") => 2,
+                    _ if matches!(name, "v_cndmask_b32" | "v_readlane_b32" | "v_writelane_b32") || vop3_two_sources(name) => 2,
                     _ => 3,
                 };
                 for &x in &s[..n] {
@@ -406,12 +459,16 @@ pub fn mask_value_writes(code: &[Inst], wave64: bool) -> HashSet<u32> {
     analyze(code, wave64, true, exec_partial())
 }
 
+/// [`reads_mask_values`] but for the compares in `except` (the ballots of
+/// wave-aggregated appends done per subgroup, `translate::Appends`).
+pub fn reads_mask_values_except(code: &[Inst], wave64: bool, except: &HashSet<u32>) -> bool {
+    mask_value_writes(code, wave64).iter().any(|pc| !except.contains(pc))
+}
+
 fn analyze(code: &[Inst], wave64: bool, values_only: bool, partial: bool) -> HashSet<u32> {
-    let mut out = HashSet::default();
     if code.is_empty() {
-        return out;
+        return HashSet::default();
     }
-    let cfg = Cfg::new(code);
     let mut fx: Vec<Fx> = code.iter().map(|i| if values_only { value_effects(i, wave64) } else { effects_opts(i, wave64, partial) }).collect();
     // (Partial EXEC: a forward EXEC branch over EXEC-masked instructions is
     // decided without the mask, `translate::masked_skip`.)
@@ -423,6 +480,20 @@ fn analyze(code: &[Inst], wave64: bool, values_only: bool, partial: bool) -> Has
         }
     }
     let exec_live = !values_only && !partial;
+    live_defs(code, &fx, exec_live, &|f| f.mask).0
+}
+
+/// Backward liveness over the program's blocks: the pcs of the
+/// instructions `cand` picks (by their effects) with a definition whose
+/// value may reach a whole read (`Fx::whole`, through `Fx::prop`; EXEC read
+/// by every instruction when `exec_live`), and whether a register's value
+/// at the program's start may.
+fn live_defs(code: &[Inst], fx: &[Fx], exec_live: bool, cand: &dyn Fn(&Fx) -> bool) -> (HashSet<u32>, bool) {
+    let mut out = HashSet::default();
+    if code.is_empty() {
+        return (out, false);
+    }
+    let cfg = Cfg::new(code);
     let nb = cfg.starts.len();
     let exit = cfg.exit();
     let mut live_in: Vec<Live> = vec![[false; N]; nb];
@@ -458,13 +529,131 @@ fn analyze(code: &[Inst], wave64: bool, values_only: bool, partial: bool) -> Has
     for b in 0..nb {
         let mut l = live_out(&live_in, b);
         for i in (cfg.starts[b]..cfg.end(b)).rev() {
-            if fx[i].mask && fx[i].defs.iter().any(|&d| l[d]) {
+            if cand(&fx[i]) && fx[i].defs.iter().any(|&d| l[d]) {
                 out.insert(code[i].pc);
             }
             step(&mut l, &fx[i], exec_live);
         }
     }
-    out
+    let at_start = live_in[0].iter().any(|&x| x);
+    (out, at_start)
+}
+
+/// A compare writing its mask to SGPRs (VOPC or VOP3; not v_cmpx).
+fn plain_compare(ins: &Inst) -> bool {
+    ins.base_name().is_some_and(|n| n.starts_with("v_cmp_"))
+        && match ins.enc {
+            Enc::Vopc => true,
+            Enc::Vop3 => crate::vop3_kind(ins.op) == crate::Vop3Kind::FromVopc,
+            _ => false,
+        }
+}
+
+/// Scalar instructions whose result keeps a mask within its lanes: copies of
+/// registers, ANDs (with anything), ORs and XORs of registers.
+fn keeps_lanes(ins: &Inst) -> bool {
+    let name = ins.base_name().unwrap_or("");
+    match ins.enc {
+        Enc::Sop1 => matches!(name, "s_mov_b32" | "s_mov_b64") && sgpr(ins.ssrc0()),
+        Enc::Sop2 => match name {
+            "s_and_b32" | "s_and_b64" => true,
+            "s_or_b32" | "s_or_b64" | "s_xor_b32" | "s_xor_b64" => sgpr(ins.ssrc0()) && sgpr(ins.ssrc1()),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// SGPRs a vector instruction reads as a lane mask, lane by lane: VCC of
+/// VOP2 v_cndmask_b32 and carry-ins, the third source of their VOP3 forms,
+/// VCC of v_div_fmas.
+fn lane_mask_reads(ins: &Inst) -> Vec<u16> {
+    let name = ins.base_name().unwrap_or("");
+    let select = name == "v_cndmask_b32" || matches!(name, "v_addc_co_u32" | "v_subb_co_u32" | "v_subbrev_co_u32");
+    match ins.enc {
+        Enc::Vop2 if select => vec![OP_VCC_LO],
+        Enc::Vop3 if select => vec![ins.src(2)],
+        Enc::Vop3 if name.starts_with("v_div_fmas") => vec![OP_VCC_LO],
+        _ => Vec::new(),
+    }
+}
+
+/// The ballots of wave-aggregated appends done per subgroup
+/// (`translate::Appends`): given the appends' reads of their ballots
+/// (`reads`: the v_bcnt counts and v_mbcnt ranks), the compares whose masks
+/// reach them, when every value those reads may see comes from such
+/// compares (VOPC or VOP3, not v_cmpx) through copies, ANDs, ORs and XORs
+/// (no complement, and no constant but an AND's: either would set other
+/// subgroups' lanes) and no mask of those compares reaches any other read:
+/// a whole value (scalar arithmetic and compares, copies, branches, SCC),
+/// EXEC, or a mask read lane by lane (v_cndmask selectors, carry-ins).
+pub fn ballots_for(code: &[Inst], wave64: bool, reads: &HashSet<u32>) -> Option<HashSet<u32>> {
+    let w = if wave64 { 2 } else { 1 };
+    let fa: Vec<Fx> = code
+        .iter()
+        .map(|i| {
+            let mut f = value_effects(i, wave64);
+            if !reads.contains(&i.pc) {
+                f.whole.clear();
+            }
+            f
+        })
+        .collect();
+    let (defs, at_start) = live_defs(code, &fa, false, &|f| !f.defs.is_empty());
+    if at_start {
+        return None;
+    }
+    let mut ballots = HashSet::default();
+    for ins in code.iter().filter(|i| defs.contains(&i.pc)) {
+        if plain_compare(ins) {
+            ballots.insert(ins.pc);
+        } else if !keeps_lanes(ins) {
+            return None;
+        }
+    }
+    if ballots.is_empty() {
+        return None;
+    }
+    let fo: Vec<Fx> = code
+        .iter()
+        .map(|i| {
+            let mut f = effects_opts(i, wave64, false);
+            if reads.contains(&i.pc) {
+                f.whole.clear();
+            } else {
+                for op in lane_mask_reads(i) {
+                    f.read(op, w);
+                }
+            }
+            f
+        })
+        .collect();
+    let (other, _) = live_defs(code, &fo, true, &|f| f.mask);
+    ballots.is_disjoint(&other).then_some(ballots)
+}
+
+/// Whether the SGPRs the instructions at `pcs` write (lane reads of an
+/// append's result) are read only as operands of vector instructions
+/// (each lane's own use) until written again: by no scalar instruction,
+/// branch, memory address, lane read's lane or lane mask read.
+pub fn read_by_lanes_only(code: &[Inst], wave64: bool, pcs: &HashSet<u32>) -> bool {
+    let w = if wave64 { 2 } else { 1 };
+    let fr: Vec<Fx> = code
+        .iter()
+        .map(|i| {
+            let mut f = effects_opts(i, wave64, false);
+            let lane_op = matches!(i.base_name(), Some("v_readlane_b32" | "v_readfirstlane_b32" | "v_writelane_b32"));
+            if matches!(i.enc, Enc::Vop1 | Enc::Vop2 | Enc::Vop3 | Enc::Vop3p | Enc::Vopc) && !lane_op {
+                f.whole.clear();
+                for op in lane_mask_reads(i) {
+                    f.read(op, w);
+                }
+            }
+            f
+        })
+        .collect();
+    let (live, _) = live_defs(code, &fr, false, &|_| true);
+    pcs.is_disjoint(&live)
 }
 
 /// Diagnosis (`rdnadis --masks`): for each mask write

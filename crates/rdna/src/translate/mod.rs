@@ -320,6 +320,10 @@ pub struct Spec {
     /// LDS: each subgroup then gives its lanes the wave's results. The
     /// runtime decides per program (its list of verified programs).
     pub lockstep_off: bool,
+    /// Compute: wave-aggregated appends done per subgroup ([`Appends`]),
+    /// when all of the program's are of that form (the runtime sets it for
+    /// programs with one, `has_append`).
+    pub sg_appends: bool,
     /// Vertex stage of a draw whose arguments the GPU reads (indexed
     /// indirect draws, see the runtime's `DrawArgs::gpu_args`): this SGPR
     /// receives the start instance (`gl_BaseInstance`), as the command
@@ -523,6 +527,9 @@ impl std::hash::Hash for Spec {
                 0x4C49_4E52u32.hash(state);
             }
         }
+        if self.sg_appends {
+            0x5347_4150u32.hash(state);
+        }
     }
 }
 
@@ -684,6 +691,8 @@ pub struct Output {
     /// within it.
     pub lockstep: bool,
     pub wave_masks: bool,
+    /// Wave-aggregated appends done per subgroup ([`Appends`]).
+    pub sg_appends: u32,
 }
 
 /// Dwords of user data at the start of the SGPR data buffer.
@@ -899,6 +908,10 @@ pub(crate) struct T<'a> {
     /// Lane-0 elections: compare pc -> source operand (0/1) holding the lane
     /// index, compared as lane 0 (see [`lane0_elections`]).
     pub elections: HashMap<u32, usize>,
+    /// Wave-aggregated appends done per subgroup ([`Appends`]), and the
+    /// subgroup index of the invocation adding the count (`subgroup_leader`).
+    pub sg: Appends,
+    pub leader: Option<Word>,
     /// Wave-mask mode (see the module documentation).
     pub wave_masks: bool,
     /// [`FORMAT_RT`] buffers: [`rt_format_entry`]'s table (a private array
@@ -1154,8 +1167,71 @@ impl<'a> T<'a> {
                 let hi = e(self.b.select(u, None, in_hi, m, z))?;
                 Ok((lo, hi))
             }
+            None if self.sg.ballots.contains(&pc) => self.subgroup_ballot(c),
             None => Ok((self.bool_to_u(c)?, z)),
         }
+    }
+
+    /// The mask of the subgroup's invocations with `c` in the hardware
+    /// layout (bit i for lane i of the wave; other subgroups' lanes 0): an
+    /// append's ballot done per subgroup ([`Appends`]).
+    pub fn subgroup_ballot(&mut self, c: Word) -> R<(Word, Word)> {
+        let u = self.t.u32;
+        let lane = self.lane()?;
+        let one = self.u(1);
+        let k31 = self.u(31);
+        let pos = e(self.b.bitwise_and(u, None, lane, k31))?;
+        let bit = e(self.b.shift_left_logical(u, None, one, pos))?;
+        let z = self.u(0);
+        let mine = e(self.b.select(u, None, c, bit, z))?;
+        self.b.capability(Capability::GroupNonUniform);
+        self.b.capability(Capability::GroupNonUniformArithmetic);
+        let sg = self.u(spirv::Scope::Subgroup as u32);
+        if !self.spec.wave64 {
+            let lo = e(self.b.group_non_uniform_bitwise_or(u, None, sg, spirv::GroupOperation::Reduce, mine, None))?;
+            return Ok((lo, z));
+        }
+        let k32 = self.u(32);
+        let lower = e(self.b.u_less_than(self.t.bool_, None, lane, k32))?;
+        let lo_part = e(self.b.select(u, None, lower, mine, z))?;
+        let hi_part = e(self.b.select(u, None, lower, z, mine))?;
+        let lo = e(self.b.group_non_uniform_bitwise_or(u, None, sg, spirv::GroupOperation::Reduce, lo_part, None))?;
+        let hi = e(self.b.group_non_uniform_bitwise_or(u, None, sg, spirv::GroupOperation::Reduce, hi_part, None))?;
+        Ok((lo, hi))
+    }
+
+    /// Whether this invocation is the first of its subgroup with its lane
+    /// active (EXEC): the one that adds an append's count ([`Appends`]). Its
+    /// subgroup index is kept for `leader_read`.
+    pub fn subgroup_leader(&mut self) -> R<Word> {
+        let u = self.t.u32;
+        let bt = self.t.bool_;
+        let act = self.active()?;
+        self.b.capability(Capability::GroupNonUniform);
+        self.b.capability(Capability::GroupNonUniformBallot);
+        self.b.capability(Capability::GroupNonUniformVote);
+        let sg = self.u(spirv::Scope::Subgroup as u32);
+        let ballot = e(self.b.group_non_uniform_ballot(self.t.v4u, None, sg, act))?;
+        let first = e(self.b.group_non_uniform_ballot_find_lsb(u, None, sg, ballot))?;
+        let id = self.subgroup_lane()?;
+        let me = e(self.b.i_equal(bt, None, id, first))?;
+        let lead = e(self.b.logical_and(bt, None, act, me))?;
+        // (None active: no leader; reads then take invocation 0's value.)
+        let any = e(self.b.group_non_uniform_any(bt, None, sg, act))?;
+        let z = self.u(0);
+        let first = e(self.b.select(u, None, any, first, z))?;
+        let Some(var) = self.leader else { return Err("append leader without its variable".into()) };
+        ok(self.b.store(var, first, None, []))?;
+        Ok(lead)
+    }
+
+    /// `v`'s value in the invocation `subgroup_leader` chose last: a lane
+    /// read of an append's result ([`Appends`]).
+    pub fn leader_read(&mut self, v: Word) -> R<Word> {
+        let Some(var) = self.leader else { return Err("append result read without a leader".into()) };
+        let id = e(self.b.load(self.t.u32, None, var, None, []))?;
+        let (x, _) = self.lane_fetch(v, id)?;
+        Ok(x)
     }
     pub fn get_scc(&mut self) -> R<Word> {
         e(self.b.load(self.t.bool_, None, self.scc, None, []))
@@ -1913,32 +1989,6 @@ fn lane0_elections(code: &[Inst], spec: &Spec) -> HashMap<u32, usize> {
             _ => None,
         }
     };
-    // Whether `p` may write SGPR `s` (pairs count both halves).
-    let writes_sgpr = |p: &Inst, s: u16| -> bool {
-        let name = p.base_name().unwrap_or("");
-        let pair = |d: u16| s == d || s == d + 1;
-        match p.enc {
-            crate::Enc::Sop1 | crate::Enc::Sop2 | crate::Enc::Sopk => {
-                let d = p.sdst();
-                d == s || (name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64")) && d + 1 == s || name.contains("saveexec") && pair(OP_EXEC_LO)
-            }
-            crate::Enc::Smem => p.sdst() <= s && s < p.sdst() + 16,
-            crate::Enc::Vopc => {
-                if name.starts_with("v_cmpx") {
-                    pair(OP_EXEC_LO)
-                } else {
-                    pair(p.sdwa_sdst().unwrap_or(OP_VCC_LO))
-                }
-            }
-            crate::Enc::Vop3 if name.starts_with("v_cmpx") => pair(OP_EXEC_LO),
-            crate::Enc::Vop3 if name.starts_with("v_cmp") => pair(p.vdst()),
-            crate::Enc::Vop3 if p.is_vop3b() => pair(p.vop3_sdst()),
-            crate::Enc::Vop3 if matches!(name, "v_readlane_b32" | "v_readfirstlane_b32") => p.vdst() == s,
-            crate::Enc::Vop1 if name == "v_readfirstlane_b32" => p.vdst() == s,
-            crate::Enc::Vop2 => (name.contains("_co_") || name.contains("_ci_")) && pair(OP_VCC_LO),
-            _ => false,
-        }
-    };
     for (ia, a) in code.iter().enumerate() {
         let name = a.base_name().unwrap_or("");
         if !(name.starts_with("buffer_atomic_add") || name.starts_with("global_atomic_add")) || !a.glc() {
@@ -1999,6 +2049,262 @@ fn lane0_elections(code: &[Inst], spec: &Spec) -> HashMap<u32, usize> {
         out.insert(code[ix].pc, lane_op);
     }
     out
+}
+
+/// Whether `p` may write SGPR `s` (pairs count both halves).
+fn writes_sgpr(p: &Inst, s: u16) -> bool {
+    use crate::{OP_EXEC_LO, OP_VCC_LO};
+    let name = p.base_name().unwrap_or("");
+    let pair = |d: u16| s == d || s == d + 1;
+    match p.enc {
+        crate::Enc::Sop1 | crate::Enc::Sop2 | crate::Enc::Sopk => {
+            let d = p.sdst();
+            d == s || (name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64")) && d + 1 == s || name.contains("saveexec") && pair(OP_EXEC_LO)
+        }
+        crate::Enc::Smem => p.sdst() <= s && s < p.sdst() + 16,
+        crate::Enc::Vopc => {
+            if name.starts_with("v_cmpx") {
+                pair(OP_EXEC_LO)
+            } else {
+                pair(p.sdwa_sdst().unwrap_or(OP_VCC_LO))
+            }
+        }
+        crate::Enc::Vop3 if name.starts_with("v_cmpx") => pair(OP_EXEC_LO),
+        crate::Enc::Vop3 if name.starts_with("v_cmp") => pair(p.vdst()),
+        crate::Enc::Vop3 if p.is_vop3b() => pair(p.vop3_sdst()),
+        crate::Enc::Vop3 if matches!(name, "v_readlane_b32" | "v_readfirstlane_b32") => p.vdst() == s,
+        crate::Enc::Vop1 if name == "v_readfirstlane_b32" => p.vdst() == s,
+        crate::Enc::Vop2 => (name.contains("_co_") || name.contains("_ci_")) && pair(OP_VCC_LO),
+        _ => false,
+    }
+}
+
+/// Wave-aggregated appends done per subgroup (`Spec::sg_appends`). On the
+/// hardware a ballot of the lanes taking part is counted (v_bcnt), one lane
+/// adds the count to a counter with an atomic returning the old value, every
+/// lane reads that lane's result (v_readlane / v_readfirstlane) and adds its
+/// rank among the lanes taking part (v_mbcnt of the ballot):
+///
+///   v_cmp_lg_u32 s[0:1], 0, v15        ; the lanes taking part
+///   s_and_b64 s16, exec, 1             ; lane 0 (or a compare with the lane index)
+///   s_mov_b64 exec, s16
+///   v_bcnt_u32_b32 v1, s1, 0           ; the count ...
+///   v_bcnt_u32_b32 v1, s0, v1
+///   v_mul_u32_u24 v1, 3, v1            ; (scaled)
+///   buffer_atomic_add v1, ... glc      ; ... added by lane 0
+///   v_readlane_b32 vcc_lo, v1, 0       ; the old value for every lane
+///   s_mov_b64 exec, -1
+///   v_cmpx_lg_u32 0, v15
+///   v_mbcnt_hi_u32_b32 v0, s1, 0       ; plus the lane's rank
+///   v_mbcnt_lo_u32_b32 v0, s0, v0
+///
+/// (the title's triangle culls into index buffers, cs 0x1008994d00 and its
+/// siblings; the deferred lighting's tile classification cs 0x10088ab000).
+/// Exact, such ballots need wave-mask mode: lockstep, with a workgroup
+/// barrier for each. Instead each
+/// subgroup does the same for its own lanes: the ballot is the mask of the
+/// subgroup's lanes in the hardware layout (other subgroups' lanes 0), so
+/// v_bcnt counts the subgroup's lanes and v_mbcnt ranks a lane among them;
+/// the EXEC write before the atomic leaves the subgroup's first active
+/// invocation alone, which adds the subgroup's count; the result's lane
+/// reads take that invocation's value. Every lane gets a slot of its own and
+/// the counter the total; a subgroup's slots are contiguous and the
+/// subgroups' ranges come in the order of their atomics (a wave's on the
+/// hardware, in the order of the waves'). The election itself (s16 above)
+/// stays exact for its other uses (cs 0x1008994d00's lane 0 of group 0
+/// writes the draw's arguments with it).
+///
+/// Found when every append of the program has that form and nothing else
+/// reads the ballots (`wavemask::ballots_for`); each append's ballots, its
+/// election and its EXEC write in one uniform block with no other EXEC
+/// write between them; the result's reads in uniform blocks, read only lane
+/// by lane (`wavemask::read_by_lanes_only`: the subgroups' values differ).
+/// The translation must be structured (no dispatcher), so that a subgroup
+/// runs those blocks together.
+#[derive(Default)]
+pub struct Appends {
+    /// The ballots' compares.
+    pub ballots: crate::HashSet<u32>,
+    /// v_mbcnt of the ballots (the mask taken as it is).
+    pub ranks: crate::HashSet<u32>,
+    /// `s_and_b64 X, exec, 1` elections (made exact: lane 0's bit).
+    pub lane0: crate::HashSet<u32>,
+    /// Compares with the lane index that elect lane 0 (left exact, not
+    /// [`lane0_elections`]).
+    pub lane0_compares: crate::HashSet<u32>,
+    /// The EXEC writes before the atomics.
+    pub leaders: crate::HashSet<u32>,
+    /// Lane reads of the atomics' results.
+    pub results: crate::HashSet<u32>,
+}
+
+/// An atomic of a wave-aggregated append: `buffer_atomic_add` /
+/// `global_atomic_add` returning the old value whose data is a popcount of
+/// SGPR masks (v_bcnt_u32_b32, accumulated, perhaps then scaled in place by
+/// a constant): (the v_bcnt pcs, their SGPRs).
+fn append_count(code: &[Inst], ia: usize) -> Option<(Vec<u32>, Vec<u16>)> {
+    let a = &code[ia];
+    if !matches!(a.base_name(), Some("buffer_atomic_add" | "global_atomic_add")) || !a.glc() {
+        return None;
+    }
+    let d = a.vdst();
+    let def_of = |before: usize| (0..before).rev().take(24).find(|&i| vgpr_def(&code[i], d).is_some());
+    let mut at = def_of(ia)?;
+    let p = &code[at];
+    let constant = |op: u16| (128..=208).contains(&op) || op == crate::OP_LITERAL;
+    if matches!(p.base_name(), Some("v_mul_u32_u24" | "v_mul_lo_u32")) && p.vdst() == d {
+        let (s0, s1) = (p.src(0), p.src(1));
+        if !(constant(s0) && s1 == crate::OP_VGPR0 + d || constant(s1) && s0 == crate::OP_VGPR0 + d) {
+            return None;
+        }
+        at = def_of(at)?;
+    }
+    let (mut pcs, mut masks) = (Vec::new(), Vec::new());
+    loop {
+        let p = &code[at];
+        if p.base_name() != Some("v_bcnt_u32_b32") || p.vdst() != d || vgpr_def(p, d) != Some(false) {
+            return None;
+        }
+        let s = p.src(0);
+        if s > crate::OP_VCC_LO + 1 {
+            return None;
+        }
+        pcs.push(p.pc);
+        masks.push(s);
+        match p.src(1) {
+            128 => break,
+            x if x == crate::OP_VGPR0 + d => at = def_of(at)?,
+            _ => return None,
+        }
+    }
+    Some((pcs, masks))
+}
+
+/// Lane reads (v_readlane of lane 0, v_readfirstlane) of the result of the
+/// atomic `code[ia]` within the next 8 instructions.
+fn append_result_reads(code: &[Inst], ia: usize) -> Vec<usize> {
+    let d = code[ia].vdst();
+    let mut out = Vec::new();
+    for (j, p) in code.iter().enumerate().skip(ia + 1).take(8) {
+        match p.base_name() {
+            Some("v_readlane_b32") if p.src(0) == crate::OP_VGPR0 + d && p.src(1) == 128 => out.push(j),
+            Some("v_readfirstlane_b32") if p.src(0) == crate::OP_VGPR0 + d => out.push(j),
+            _ => {}
+        }
+        if vgpr_def(p, d).is_some() {
+            break;
+        }
+    }
+    out
+}
+
+/// Whether the program has an atomic of a wave-aggregated append whose
+/// result is read back (the runtime's cheap test before `Spec::sg_appends`).
+pub fn has_append(code: &[Inst]) -> bool {
+    (0..code.len()).any(|ia| append_count(code, ia).is_some() && !append_result_reads(code, ia).is_empty())
+}
+
+/// The program's wave-aggregated appends when all of them can be done per
+/// subgroup (see [`Appends`]), or why not.
+pub fn subgroup_appends(code: &[Inst], spec: &Spec) -> Result<Appends, &'static str> {
+    use crate::{OP_EXEC_LO, OP_VCC_LO};
+    if spec.stage != Stage::Compute || code.is_empty() {
+        return Err("not a compute program");
+    }
+    let wave64 = spec.wave64;
+    let u = crate::uniform::analyze(code);
+    let starts = block_starts(code);
+    // Whether code[i..j] lies in one block.
+    let one_block = |i: usize, j: usize| code[i + 1..=j].iter().all(|p| !starts.contains(&p.pc));
+    let writes_exec = |p: &Inst| writes_sgpr(p, OP_EXEC_LO);
+    let targets: crate::HashSet<u32> = code.iter().filter_map(|p| p.branch_target()).collect();
+    let le = lane0_elections(code, spec);
+    let mut out = Appends::default();
+    let mut reads = crate::HashSet::default();
+    // Each append's EXEC write (index), for the ballots' check below.
+    let mut execs = Vec::new();
+    for ia in 0..code.len() {
+        let Some((bcnts, mut masks)) = append_count(code, ia) else { continue };
+        masks.sort();
+        let pair = if wave64 { masks.len() == 2 && masks[0] % 2 == 0 && masks[1] == masks[0] + 1 } else { masks.len() == 1 };
+        let results = append_result_reads(code, ia);
+        if !pair {
+            return Err("a count of other than the ballot's two halves");
+        }
+        if results.is_empty() || results.iter().any(|&j| !u.is_uniform(code[j].pc)) {
+            return Err("its result not read back in a uniform block");
+        }
+        // EXEC at the atomic: s_mov X, from an election in its block.
+        let Some(ie) = (0..ia).rev().take(24).find(|&i| writes_exec(&code[i])) else { return Err("no EXEC write before the atomic") };
+        let e = &code[ie];
+        let x = e.ssrc0();
+        let mov = if wave64 { "s_mov_b64" } else { "s_mov_b32" };
+        // (Reached from it alone: no branch lands between.)
+        if e.base_name() != Some(mov) || e.sdst() != OP_EXEC_LO || x > OP_VCC_LO || !u.is_uniform(e.pc) || code[ie + 1..=ia].iter().any(|p| targets.contains(&p.pc)) {
+            return Err("the atomic's EXEC not a uniform copy reaching it alone");
+        }
+        let Some(ix) = (0..ie).rev().take(24).find(|&i| writes_sgpr(&code[i], x)) else { return Err("no election before the atomic's EXEC") };
+        let xd = &code[ix];
+        let and = if wave64 { "s_and_b64" } else { "s_and_b32" };
+        let (s0, s1) = (xd.ssrc0(), xd.ssrc1());
+        if xd.base_name() == Some(and) && xd.sdst() == x && (s0 == OP_EXEC_LO && s1 == 129 || s1 == OP_EXEC_LO && s0 == 129) {
+            if !one_block(ix, ie) || code[ix + 1..ie].iter().any(writes_exec) {
+                return Err("the election apart from the atomic's EXEC");
+            }
+            out.lane0.insert(xd.pc);
+        } else {
+            // A compare with the lane index, perhaps inverted.
+            let (mut want, mut from, mut found) = (x, ie, None);
+            for _ in 0..3 {
+                let Some(k) = (0..from).rev().take(24).find(|&i| writes_sgpr(&code[i], want)) else { break };
+                let p = &code[k];
+                if matches!(p.base_name(), Some("s_not_b64" | "s_not_b32")) && p.sdst() == want {
+                    want = p.ssrc0();
+                    from = k;
+                    continue;
+                }
+                if le.contains_key(&p.pc) {
+                    found = Some(k);
+                }
+                break;
+            }
+            let Some(k) = found else { return Err("an election of another form") };
+            if !one_block(k, ie) || code[k + 1..ie].iter().any(writes_exec) {
+                return Err("the election apart from the atomic's EXEC");
+            }
+            out.lane0_compares.insert(code[k].pc);
+        }
+        out.leaders.insert(e.pc);
+        out.results.extend(results.iter().map(|&j| code[j].pc));
+        reads.extend(bcnts);
+        // The ranks: v_mbcnt of the ballot's SGPRs after the atomic.
+        for p in code.iter().skip(ia + 1).take(48) {
+            if matches!(p.base_name(), Some("v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32")) && masks.contains(&p.src(0)) {
+                out.ranks.insert(p.pc);
+                reads.insert(p.pc);
+            }
+        }
+        execs.push(ie);
+    }
+    if out.leaders.is_empty() {
+        return Err("no append");
+    }
+    let Some(ballots) = crate::wavemask::ballots_for(code, wave64, &reads) else { return Err("a ballot read otherwise, or a count of other values") };
+    // Each ballot in an append's block before its EXEC write, no other EXEC
+    // write between.
+    for (ib, b) in code.iter().enumerate().filter(|(_, b)| ballots.contains(&b.pc)) {
+        if !execs.iter().any(|&ie| ib < ie && one_block(ib, ie) && !code[ib + 1..ie].iter().any(writes_exec)) {
+            return Err("a ballot apart from its atomic's EXEC");
+        }
+        if !u.is_uniform(b.pc) {
+            return Err("a ballot in a divergent block");
+        }
+    }
+    if !crate::wavemask::read_by_lanes_only(code, wave64, &out.results) {
+        return Err("a result read by scalar code");
+    }
+    out.ballots = ballots;
+    Ok(out)
 }
 
 /// Attributes that v_interp_mov_f32 reads as P10 or P20: the title
@@ -2062,11 +2368,20 @@ fn vgpr_def(p: &Inst, v: u16) -> Option<bool> {
             Some(returns && d == v)
         }
         Enc::Vop1 | Enc::Vop2 | Enc::Vop3 | Enc::Vop3p | Enc::Vintrp => {
-            // Compares and lane reads write SGPRs.
+            // Compares and lane reads write SGPRs; 64-bit results two
+            // registers (v_mqsad_u32_u8 four), others one (a v_mov_b32 v0
+            // counted as a write of v1 hid cs 0x1008994d00's append count).
             if name.starts_with("v_cmp") || matches!(name, "v_readlane_b32" | "v_readfirstlane_b32") {
                 return None;
             }
-            (d == v || d + 1 == v).then_some(false)
+            let n = if name.starts_with("v_mqsad_u32") {
+                4
+            } else if name.contains("64") || name.contains("qsad") {
+                2
+            } else {
+                1
+            };
+            (d <= v && v < d + n).then_some(false)
         }
         _ => None,
     }
@@ -2157,14 +2472,31 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         sb_u32: b.type_pointer(None, StorageClass::StorageBuffer, u32t),
     };
     let sampler_ty = b.type_sampler();
-    let (lockstep, one_wave) = lockstep_mode(spec, code);
+    // Wave-aggregated appends per subgroup: structured translations only
+    // (each subgroup runs the appends' blocks together).
+    let structured = {
+        let starts = block_starts(code);
+        starts.len() == 1 || matches!(loop_ranges(code, &starts), Some(loops) if !spec.force_dispatcher && (loops.is_empty() || !spec.dispatcher_for_loops))
+    };
+    let (sg, sg_why) = match spec.sg_appends {
+        false => (Appends::default(), None),
+        true if !structured => (Appends::default(), Some("a dispatcher translation")),
+        true => match subgroup_appends(code, spec) {
+            Ok(a) => (a, None),
+            Err(why) => (Appends::default(), Some(why)),
+        },
+    };
+    let (lockstep, one_wave) = lockstep_mode(spec, code, &sg.ballots);
     // Wave-mask mode for a single wave that reads a lane mask as a value
     // (a ballot it stores or counts); one that reads none runs on votes, as
     // several waves do: each vote one workgroup barrier at a lane-dependent
     // branch, `masked_skip` sparing most, against a ballot at every compare
     // whose mask reaches EXEC or a branch (single-wave passes 2.2x faster at
     // most, the same shots: FINDINGS.md 2026-11-03 early morning).
-    let wave_masks = lockstep && one_wave && wave_masks_wanted(spec.code_base) && crate::wavemask::reads_mask_values(code, spec.wave64);
+    let wave_masks = lockstep && one_wave && wave_masks_wanted(spec.code_base) && crate::wavemask::reads_mask_values_except(code, spec.wave64, &sg.ballots);
+    // (In wave-mask mode the appends are exact.)
+    let sg_why = if wave_masks && !sg.leaders.is_empty() { Some("other masks read as values") } else { sg_why };
+    let sg = if wave_masks { Appends::default() } else { sg };
     let mut tr = T {
         b,
         t,
@@ -2230,8 +2562,10 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         image_tables: HashMap::default(),
         table_offsets: HashMap::default(),
         // In wave-mask mode lane reads and elections are exact.
-        own_lane_reads: if wave_masks { BTreeSet::new() } else { atomic_result_reads(code) },
-        elections: if wave_masks { HashMap::default() } else { lane0_elections(code, spec) },
+        own_lane_reads: if wave_masks { BTreeSet::new() } else { atomic_result_reads(code).into_iter().filter(|pc| !sg.results.contains(pc)).collect() },
+        elections: if wave_masks { HashMap::default() } else { lane0_elections(code, spec).into_iter().filter(|(pc, _)| !sg.lane0_compares.contains(pc)).collect() },
+        sg,
+        leader: None,
         wave_masks,
         complete: if wave_masks { crate::wavemask::complete_masks(code, spec.wave64) } else { Default::default() },
         own_bit: None,
@@ -2260,6 +2594,9 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         rt_vsharp: None,
         consts64: HashMap::default(),
     };
+    if let Some(why) = sg_why {
+        tr.warn(format!("wave-aggregated appends left as they were ({why})"));
+    }
     let mut elected: Vec<u32> = tr.elections.keys().copied().collect();
     elected.sort();
     for pc in elected {
@@ -2511,6 +2848,10 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
             }
         }
     }
+    if !tr.sg.leaders.is_empty() {
+        let z = tr.u(0);
+        tr.leader = Some(tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, Some(z)));
+    }
     tr.sync_starts = sync_starts(&tr, code);
     if !tr.sync_starts.is_empty() {
         let z = tr.u(0);
@@ -2717,7 +3058,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     // offsets come from a table): the runtime takes that from `sgpr_pc`.
     let batched = spec.batched;
     let sgpr_pc = if batched { Some(sgpr_pc_offset(spec.stage)) } else { spec.sgpr_pc };
-    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched, masked_skips: tr.masked_skips, lockstep: tr.lockstep, wave_masks: tr.wave_masks })
+    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched, masked_skips: tr.masked_skips, lockstep: tr.lockstep, wave_masks: tr.wave_masks, sg_appends: tr.sg.leaders.len() as u32 })
 }
 
 /// Wave-mask mode for the shader at `addr` (diagnosis: `DS_WAVEMASK=0`
@@ -2732,20 +3073,21 @@ fn wave_masks_wanted(addr: u64) -> bool {
 
 /// Lockstep mode, and whether the workgroup is a single wave (see the
 /// module documentation).
-fn lockstep_mode(spec: &Spec, code: &[Inst]) -> (bool, bool) {
+fn lockstep_mode(spec: &Spec, code: &[Inst], sg_ballots: &crate::HashSet<u32>) -> (bool, bool) {
     let threads: u32 = spec.cs_local_size.iter().map(|&x| x.max(1)).product();
     let uses_lds = code.iter().any(|i| i.enc == Enc::Ds && !i.ds_gds() && !matches!(i.name(), Some("ds_swizzle_b32" | "ds_bpermute_b32" | "ds_permute_b32")));
     let one_wave = threads <= if spec.wave64 { 64 } else { 32 };
     let wave_scalars = spec.cs_rsrc2 & (1 << 10) != 0 || code.iter().any(|i| matches!(i.base_name(), Some("v_readlane_b32" | "v_readfirstlane_b32")));
     // A single wave that reads lane masks as values (ballots it stores or
     // counts) needs wave-mask mode, which runs in lockstep, with or without
-    // LDS (the title's batch culling stores one compare ballot per 32 items).
+    // LDS (the title's batch culling stores one compare ballot per 32 items);
+    // the ballots of appends done per subgroup do not count.
     // (`DS_MASK_VALUES=0`: not for such programs, diagnosis.)
     let mask_values = spec.stage == Stage::Compute
         && one_wave
         && !uses_lds
         && std::env::var("DS_MASK_VALUES").ok().as_deref() != Some("0")
-        && crate::wavemask::reads_mask_values(code, spec.wave64);
+        && crate::wavemask::reads_mask_values_except(code, spec.wave64, sg_ballots);
     // A single wave whose cross-lane operations sit in code its invocations
     // may not all run (since 2026-11-02, when the mask analysis stopped
     // reading unused source fields: such programs left lockstep then).
@@ -3593,6 +3935,7 @@ mod tests {
             per_lane: false,
             lane_votes: false,
             lockstep_off: false,
+            sg_appends: false,
             base_instance_sgpr: None,
             sgpr_pc: None,
             addresses: false,
@@ -3620,6 +3963,39 @@ mod tests {
         assert_eq!(e.into_iter().collect::<Vec<_>>(), vec![(0x9c, 1)]);
         // Not for groups of several waves.
         assert!(lane0_elections(&code, &cs_spec([16, 8, 1])).is_empty());
+    }
+
+    /// The append kernel above done per subgroup (`Spec::sg_appends`): its
+    /// two class ballots (ORed) only counted and ranked, lane 0 elected by
+    /// the lane-index compare (left exact), one EXEC write before the
+    /// atomic, one read of its result; translated without wave-mask mode.
+    #[test]
+    fn append_per_subgroup() {
+        let words = [0u32; 83];
+        let code = crate::decode_program(&words).unwrap();
+        let mut spec = cs_spec([8, 8, 1]);
+        assert!(has_append(&code));
+        let a = subgroup_appends(&code, &spec).unwrap();
+        let sorted = |s: &crate::HashSet<u32>| {
+            let mut v: Vec<u32> = s.iter().copied().collect();
+            v.sort();
+            v
+        };
+        assert_eq!(sorted(&a.ballots), vec![0xa0, 0xa8]);
+        assert_eq!(sorted(&a.ranks), vec![0x118, 0x120]);
+        assert_eq!(sorted(&a.lane0_compares), vec![0x9c]);
+        assert!(a.lane0.is_empty());
+        assert_eq!(sorted(&a.leaders), vec![0xc4]);
+        assert_eq!(sorted(&a.results), vec![0xf8]);
+        let plan = crate::analysis::analyze(&code, 2, 0);
+        spec.resources = plan.resources.iter().map(|_| ResSpec::Buffer { format: 0, dst_sel: 0xFAC }).collect();
+        let before = translate(&code, &plan, &spec).unwrap();
+        assert!(before.wave_masks && before.sg_appends == 0);
+        spec.sg_appends = true;
+        let after = translate(&code, &plan, &spec).unwrap();
+        assert!(!after.wave_masks && !after.lockstep && after.sg_appends == 1);
+        // Not for groups of several waves: then the compare elects no lane.
+        assert!(subgroup_appends(&code, &cs_spec([16, 8, 1])).is_err());
     }
 
     /// `Spec::addresses`: the append kernel above without buffer
