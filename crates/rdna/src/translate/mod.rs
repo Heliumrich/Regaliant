@@ -2150,12 +2150,13 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     };
     let sampler_ty = b.type_sampler();
     let (lockstep, one_wave) = lockstep_mode(spec, code);
-    // (`DS_WAVEMASK_VOTES=1`: a single wave with LDS that reads no lane mask
-    // as a value runs on votes instead, as several waves do: each vote one
-    // workgroup barrier at a lane-dependent branch, `masked_skip` sparing
-    // most, against a ballot at every compare whose mask reaches EXEC or a
-    // branch.)
-    let wave_masks = lockstep && one_wave && wave_masks_wanted(spec.code_base) && !(wavemask_votes() && !crate::wavemask::reads_mask_values(code, spec.wave64));
+    // Wave-mask mode for a single wave that reads a lane mask as a value
+    // (a ballot it stores or counts); one that reads none runs on votes, as
+    // several waves do: each vote one workgroup barrier at a lane-dependent
+    // branch, `masked_skip` sparing most, against a ballot at every compare
+    // whose mask reaches EXEC or a branch (single-wave passes 2.2x faster at
+    // most, the same shots: FINDINGS.md 2026-11-03 early morning).
+    let wave_masks = lockstep && one_wave && wave_masks_wanted(spec.code_base) && crate::wavemask::reads_mask_values(code, spec.wave64);
     let mut tr = T {
         b,
         t,
@@ -2714,13 +2715,6 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
 /// Wave-mask mode for the shader at `addr` (diagnosis: `DS_WAVEMASK=0`
 /// disables it, `DS_WAVEMASK=<hex address>[,...]` keeps it for those
 /// shaders only).
-/// `DS_WAVEMASK_VOTES=1`: single-wave lockstep programs that read no lane
-/// mask as a value decide their branches by votes, not wave-mask mode.
-fn wavemask_votes() -> bool {
-    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *W.get_or_init(|| std::env::var("DS_WAVEMASK_VOTES").ok().as_deref() == Some("1"))
-}
-
 fn wave_masks_wanted(addr: u64) -> bool {
     match std::env::var("DS_WAVEMASK") {
         Err(_) => true,

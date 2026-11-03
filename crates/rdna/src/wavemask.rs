@@ -337,7 +337,13 @@ fn effects_opts(ins: &Inst, wave64: bool, partial: bool) -> Fx {
         }
         Enc::Mimg => {
             fx.read(ins.mimg_srsrc(), 8);
-            fx.read(ins.mimg_ssamp(), 4);
+            // (A sampler only where the instruction samples: image_load,
+            // image_store and the atomics leave the field unused, whatever
+            // registers it names; a compare writing its mask there is no
+            // mask read as a value.)
+            if name.starts_with("image_sample") || name.starts_with("image_gather") || name.starts_with("image_get_lod") {
+                fx.read(ins.mimg_ssamp(), 4);
+            }
         }
         Enc::Flat | Enc::Global | Enc::Scratch => fx.read(ins.flat_saddr(), 2),
         Enc::Exp => {}
