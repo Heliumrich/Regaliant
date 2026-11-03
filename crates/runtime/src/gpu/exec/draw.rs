@@ -18,6 +18,194 @@ pub static DRAW_SKIPPED: AtomicU64 = AtomicU64::new(0);
 pub static GPU_ARG_DRAWS: AtomicU64 = AtomicU64::new(0);
 /// Of them, those recorded as a repeat of the draw before (`draw_repeat`).
 pub static REPEAT_DRAWS: AtomicU64 = AtomicU64::new(0);
+/// Buffer-delta draws (`tune buffer_delta`): [candidates (right after a
+/// full draw kept for them, with its programs and context state), taken,
+/// refused: sync or diagnosis modes; other translations or index use;
+/// other images or samplers; image lookups changed; a fast clear or reload
+/// pending for its images (a held executor's own included); textures not
+/// known unwritten; another rendering instance].
+pub static DELTA: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// `tune buffer_delta 2`: [draws verified, differences from the full path:
+/// a texture wait, targets or pipeline, an image hazard, the rendering
+/// instance ended, dynamic state recorded, other bound images or samplers].
+pub static DELTA_VERIFY: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// Buffer-delta draws' stages: [binding the last draw's images and samplers,
+/// looking them up (their memos' generations or the frame moved, or the
+/// last draw's came from the image cache)].
+pub static DELTA_BIND: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// What a full draw's targets, pipeline and hazard check gave, that a
+/// buffer-delta draw right after it takes over (`DrawDelta`).
+#[derive(Clone, Copy)]
+struct Fixed {
+    colors: [Option<Target>; MAX_RT],
+    depth: Option<Target>,
+    area: (u32, u32),
+    scissor: (i32, i32, i32, i32),
+    z_test: bool,
+    z_write: bool,
+    s_test: bool,
+    s_write: bool,
+    clear_z: bool,
+    clear_s: bool,
+    dctl: u32,
+    sctl: u32,
+    refm: u32,
+    refm_bf: u32,
+    pipe: Pipe,
+    /// Its stages write memory.
+    writes: bool,
+    /// Its image hazards were pending.
+    hazard: bool,
+    /// `images::LOOKUP_GEN` before its targets were looked up.
+    lookup_gen: u64,
+}
+
+impl Fixed {
+    /// Whether the full path's results are these (`tune buffer_delta 2`).
+    fn same_as(&self, o: &Fixed) -> bool {
+        let t = |x: &Option<Target>| x.map(|t| (t.image, t.view, t.format, t.width, t.height));
+        self.colors.iter().map(t).eq(o.colors.iter().map(t))
+            && t(&self.depth) == t(&o.depth)
+            && (self.area, self.scissor) == (o.area, o.scissor)
+            && [self.z_test, self.z_write, self.s_test, self.s_write, self.clear_z, self.clear_s, self.writes] == [o.z_test, o.z_write, o.s_test, o.s_write, o.clear_z, o.clear_s, o.writes]
+            && [self.dctl, self.sctl, self.refm, self.refm_bf] == [o.dctl, o.sctl, o.refm, o.refm_bf]
+            && (self.pipe.pipeline, self.pipe.layout, self.pipe.set_layout, self.pipe.push) == (o.pipe.pipeline, o.pipe.layout, o.pipe.set_layout, o.pipe.push)
+    }
+}
+
+/// The last full draw of an executor that a draw right after it can take
+/// over (a buffer-delta draw, `tune buffer_delta`, RENDERER.md): such a
+/// draw records its buffers, SGPR data, indices and the draw; texture sync,
+/// targets, pipeline, image hazards, the rendering instance and dynamic
+/// state are this draw's, and its bound images and samplers while their
+/// memos hold.
+#[derive(Default)]
+pub(super) struct DrawDelta {
+    /// Valid for a draw at this (batch, recorded-command count) only (taken
+    /// by every draw: one that returns early leaves none).
+    pub(super) at: Option<(u64, u64)>,
+    /// The stages' translations.
+    keys: [u64; 2],
+    /// Indexed.
+    index: bool,
+    /// The stages' images and samplers (`image_sig`).
+    images: Vec<(u32, [u32; 8])>,
+    /// The textures' ranges (texture sync's).
+    textures: Vec<(u64, u64)>,
+    /// The attachments' and images' keys (the hazard check's).
+    used: Vec<images::ImageKey>,
+    fixed: Option<Fixed>,
+    /// This executor's counts not yet added to `DELTA` and `DELTA_BIND`
+    /// (every `DELTA_FLUSH` candidates: nine recording threads adding to
+    /// shared counters at every draw contended for their cache lines).
+    counts: [u64; 11],
+    /// The last draw's stages' bound images and samplers, when both came
+    /// from the binding memos, and the generations they hold for
+    /// (`images::LOOKUP_GEN`, `track::GEN`, the frame: `exec::bind_gens`).
+    bind: [BoundImages; 2],
+    bind_gens: Option<[u64; 3]>,
+}
+
+/// A stage's bound images and samplers (`Bound`'s).
+#[derive(Default)]
+struct BoundImages {
+    imgs: Vec<(u32, vk::DescriptorType, vk::DescriptorImageInfo)>,
+    images: Vec<vk::Image>,
+    stencil_views: Vec<vk::Image>,
+}
+
+/// Candidates between additions of an executor's counts to the shared ones.
+const DELTA_FLUSH: u64 = 1024;
+
+impl DrawDelta {
+    /// Counts `k` (`DELTA`'s index; `DELTA_BIND`'s from 9).
+    fn count(&mut self, k: usize) {
+        self.counts[k] += 1;
+        if k == 0 && self.counts[0] >= DELTA_FLUSH {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        for (k, n) in self.counts.iter_mut().enumerate() {
+            if *n != 0 {
+                let c = if k < 9 { &DELTA[k] } else { &DELTA_BIND[k - 9] };
+                c.fetch_add(std::mem::take(n), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The generations the last draw's bound images and samplers hold for.
+    pub(super) fn bind_gens(&self) -> Option<[u64; 3]> {
+        self.bind_gens
+    }
+
+    /// Stage `k`'s images and samplers into `b` (`bind_stage`).
+    pub(super) fn bind_into(&self, k: usize, b: &mut Bound) {
+        let s = &self.bind[k];
+        b.imgs.extend_from_slice(&s.imgs);
+        b.images.extend_from_slice(&s.images);
+        b.stencil_views.extend_from_slice(&s.stencil_views);
+    }
+
+    /// Whether `b` binds stage `k`'s images and samplers (`tune buffer_delta 2`).
+    fn bind_same(&self, k: usize, b: &Bound) -> bool {
+        let s = &self.bind[k];
+        let info = |x: &(u32, vk::DescriptorType, vk::DescriptorImageInfo)| (x.0, x.1, x.2.sampler, x.2.image_view, x.2.image_layout);
+        s.imgs.iter().map(info).eq(b.imgs.iter().map(info)) && s.images == b.images && s.stencil_views == b.stencil_views
+    }
+}
+
+/// The stages' image and sampler resources (stage << 16 | resource, the
+/// descriptor's words), into `out`: false with an image table.
+fn image_sig(stages: [Option<&Prepared>; 2], out: &mut Vec<(u32, [u32; 8])>) -> bool {
+    out.clear();
+    for (k, p) in stages.iter().enumerate() {
+        let Some(p) = p else { continue };
+        for (i, r) in p.resources.iter().enumerate() {
+            let at = (k as u32) << 16 | i as u32;
+            match r {
+                Resolved::Image(t) => out.push((at, t.raw)),
+                Resolved::Sampler(w) => out.push((at | 1 << 31, [w[0], w[1], w[2], w[3], 0, 0, 0, 0])),
+                Resolved::ImageTable(_) => return false,
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
+/// A difference `tune buffer_delta 2` found (kind as `DELTA_VERIFY`'s,
+/// less one), the first ones logged.
+fn delta_mismatch(kind: usize, vs: u64, ps: u64) {
+    let n = DELTA_VERIFY[1 + kind].fetch_add(1, Ordering::Relaxed);
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if n < 4 && LOGGED.fetch_add(1, Ordering::Relaxed) < 24 {
+        const WHAT: [&str; 6] = ["a texture wait", "other targets or pipeline", "an image hazard", "the rendering instance ended", "dynamic state recorded", "other bound images or samplers"];
+        crate::warn!("gpu: buffer-delta verify: {} on the full path (vs {vs:#x} ps {ps:#x})", WHAT[kind]);
+    }
+}
+
+/// Status part: `DELTA`, `DELTA_VERIFY`.
+pub(super) fn delta_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let d: Vec<u64> = DELTA.iter().map(|c| c.load(Relaxed)).collect();
+    if d[0] == 0 {
+        return String::new();
+    }
+    let v: Vec<u64> = DELTA_VERIFY.iter().map(|c| c.load(Relaxed)).collect();
+    let b: Vec<u64> = DELTA_BIND.iter().map(|c| c.load(Relaxed)).collect();
+    let verified = if v[0] > 0 {
+        format!("; verified {} (differences: texture waits {}, targets or pipeline {}, image hazards {}, instance ended {}, dynamic state {}, bound images or samplers {})", v[0], v[1], v[2], v[3], v[4], v[5], v[6])
+    } else {
+        String::new()
+    };
+    format!(
+        "    buffer-delta draws: {} of {} candidates (refused: modes {}, translations or indices {}, images or samplers {}, image lookups {}, clears or reloads pending {}, textures {}, rendering instance {}); stages binding the draw before's images and samplers {}, looking them up {}{verified}\n",
+        d[1], d[0], d[2], d[3], d[4], d[5], d[6], d[7], d[8], b[0], b[1]
+    )
+}
 
 /// An indexed indirect draw whose arguments the CPU read, drawn in
 /// `cpu_args_base` mode with its indices in a home, that the next can
@@ -60,6 +248,11 @@ pub(crate) struct DynCache {
 const DYN_SLOTS: usize = 22;
 
 impl DynCache {
+    /// What it holds apart from the push descriptors (`tune buffer_delta 2`).
+    fn sig(&self) -> ([u64; DYN_SLOTS], vk::Pipeline, Option<[u32; 6]>, Option<[i32; 4]>, Option<[u32; 3]>, Option<[u32; 4]>) {
+        (self.words, self.pipeline, self.viewport, self.scissor, self.bias, self.blend)
+    }
+
     /// Whether state `slot` must be recorded with value `v` (and notes it).
     fn set(&mut self, slot: usize, v: u64) -> bool {
         let w = v.wrapping_add(1);
@@ -795,9 +988,60 @@ impl Exec {
         self.rendering = Some(Rendering { colors, depth, area, written: Vec::new(), sampled: Vec::new(), ds_written: [false; 2], ds_sampled: [false; 2] });
     }
 
+    /// The last full draw's results when this draw can take them over (a
+    /// buffer-delta draw): right after it (nothing recorded between, the
+    /// same batch) with its context state, translations, images and
+    /// samplers, its targets still the rendering instance's, the image
+    /// cache's lookups as then, no fast clear or reload pending for its
+    /// images and its textures known unwritten. Err: why not (0: no such
+    /// draw, `DELTA`'s refusals from 1).
+    fn delta_holds(&self, at: Option<(u64, u64)>, keys: [u64; 2], sig: &[(u32, [u32; 8])], indexed: bool) -> Result<Fixed, usize> {
+        let d = &self.delta;
+        let Some(f) = d.fixed.filter(|_| self.draw_same && at == Some((self.batch_count, self.cmd_uses.get()))) else { return Err(0) };
+        if !self.recording || sync_mode() || super::super::tune::race_checks() || TINY_ANY.load(Ordering::Relaxed) {
+            return Err(1);
+        }
+        if d.keys != keys || d.index != indexed {
+            return Err(2);
+        }
+        if d.images[..] != *sig {
+            return Err(3);
+        }
+        if images::LOOKUP_GEN.load(Ordering::Acquire) != f.lookup_gen {
+            return Err(4);
+        }
+        if images::pending_hit(&d.used) {
+            return Err(5);
+        }
+        if !d.textures.is_empty() {
+            // Texture sync's memo (`sync_textures`) as it would find them.
+            let tag = [self.own_gen, super::INFLIGHT.notes.load(Ordering::Acquire)];
+            if super::super::tune::tex_waits() == 0 || tag != self.tex_clean_tag || !d.textures.iter().all(|r| self.tex_clean.contains(r)) {
+                return Err(6);
+            }
+        }
+        if !self.rendering.as_ref().is_some_and(|r| r.colors == f.colors && r.depth == f.depth) {
+            return Err(7);
+        }
+        Ok(f)
+    }
+
+    /// `delta_holds`, counted (`DELTA`).
+    fn delta_check(&mut self, at: Option<(u64, u64)>, keys: [u64; 2], sig: &[(u32, [u32; 8])], indexed: bool) -> Option<Fixed> {
+        let r = self.delta_holds(at, keys, sig, indexed);
+        match r {
+            Ok(_) => self.delta.count(1),
+            Err(0) => return None,
+            Err(k) => self.delta.count(1 + k),
+        }
+        self.delta.count(0);
+        r.ok()
+    }
+
     /// Records the draw; Ok(false) when it has no effect here.
     fn draw_inner(&mut self, cp: &Cp, a: &DrawArgs) -> Result<bool, String> {
         self.fe2_min_want = u32::MAX;
+        let delta_at = self.delta.at.take();
         if a.count == 0 || a.instances == 0 {
             return Ok(false);
         }
@@ -1061,14 +1305,47 @@ impl Exec {
             note_prep_repeat(&vs, ps.as_ref());
         }
         let t_prep = since(t0);
-        let mut textures = std::mem::take(&mut self.tex_scratch);
-        textures.clear();
-        super::texture_ranges_into(&vs, &mut textures);
-        if let Some(p) = &ps {
-            super::texture_ranges_into(p, &mut textures);
+        // Buffer-delta draws (`tune buffer_delta`, RENDERER.md): a draw right
+        // after a full draw of the same programs, images and samplers with
+        // the same context state takes over that draw's texture sync,
+        // targets, pipeline, image hazards, rendering instance and dynamic
+        // state (`delta_holds`); 2 runs the full path and compares.
+        let delta_mode = super::super::tune::buffer_delta();
+        let mut sig = std::mem::take(&mut self.delta_sig);
+        let keys = [vs.tr.key, ps.as_ref().map_or(0, |p| p.tr.key)];
+        let has_sig = delta_mode != 0 && !batched && gpu_pair.is_none() && image_sig([Some(&vs), ps.as_ref()], &mut sig);
+        let mut delta = if has_sig { self.delta_check(delta_at, keys, &sig, a.index.is_some()) } else { None };
+        if delta.is_some() && self.held {
+            // A held executor's reads and its own clears and reloads, as the
+            // full path notes and checks them (`sync_textures`, `held_hit`).
+            let used = std::mem::take(&mut self.delta.used);
+            let hit = self.held_hit(&used);
+            self.delta.used = used;
+            if hit {
+                delta = None;
+                // (Taken back; a flush since added it: the shared count wraps back.)
+                self.delta.counts[1] = self.delta.counts[1].wrapping_sub(1);
+                self.delta.count(6);
+            } else {
+                let n = self.delta.textures.len();
+                self.held_reads.extend_from_slice(&self.delta.textures);
+                self.note_kinds(1, n);
+            }
         }
-        self.sync_textures(&textures, SYNC_DRAW_TEXTURES);
-        self.tex_scratch = textures;
+        let expect = if delta_mode == 2 { delta.take() } else { None };
+        if delta.is_none() {
+            let mut textures = std::mem::take(&mut self.tex_scratch);
+            textures.clear();
+            super::texture_ranges_into(&vs, &mut textures);
+            if let Some(p) = &ps {
+                super::texture_ranges_into(p, &mut textures);
+            }
+            let waited = self.sync_textures(&textures, SYNC_DRAW_TEXTURES);
+            self.tex_scratch = textures;
+            if waited && expect.is_some() {
+                delta_mismatch(0, vs.addr, ps_addr);
+            }
+        }
         if self.stopped {
             return Err(super::STOPPED.into());
         }
@@ -1093,205 +1370,232 @@ impl Exec {
             None => None,
         };
         lap.mark(4);
-        // Color targets: enabled in CB_TARGET_MASK and CB_SHADER_MASK,
-        // exported by the pixel shader with a non-zero export format.
-        let mrt_mask = ps.as_ref().map(|p| p.tr.out.mrt_mask).unwrap_or(0);
-        let col_format = reg(0x28714);
-        let target_mask = reg(0x28238) & reg(0x2823C);
-        let mut colors: [Option<Target>; MAX_RT] = [None; MAX_RT];
-        let mut blend = [0u32; MAX_RT];
-        let mut masks = [0u8; MAX_RT];
-        if cb_mode == 1 {
-            // The surfaces first: slots that bind slices of one array (the
-            // G-buffer: CB_COLOR_VIEW selects the slice, CB_COLOR_ATTRIB3
-            // gives no depth) need it with all their slices, or an image made
-            // for the first slot alone has one layer and the others clamp to
-            // it (the G-buffer made again after the title changed its display
-            // mode lost three of its four layers, FINDINGS.md 2026-10-21).
-            let mut surfs: [Option<Surface>; MAX_RT] = [None; MAX_RT];
-            for i in 0..MAX_RT as u32 {
-                let m = (target_mask >> (4 * i)) & 0xF;
-                if m == 0 || mrt_mask & (1 << i) == 0 || (col_format >> (4 * i)) & 0xF == 0 {
-                    continue;
+        // A buffer-delta draw takes the last full draw's targets, pipeline
+        // and hazard check (`delta_holds`).
+        let (fixed, t_pipe) = match delta {
+            Some(f) => {
+                // (The targets' use stamps, as their lookups make.)
+                let frame = crate::gpu::FRAMES.load(Ordering::Relaxed);
+                for t in f.colors.iter().flatten().chain(f.depth.iter()) {
+                    t.used.stamp(frame);
                 }
-                surfs[i as usize] = color_surface(cp, i)?;
+                for k in 5..9 {
+                    lap.mark(k);
+                }
+                (f, since(t0))
             }
-            for i in 0..MAX_RT {
-                let Some(s) = surfs[i] else { continue };
-                if s.ty3d {
-                    continue;
+            None => {
+                let lookup_gen = images::LOOKUP_GEN.load(Ordering::Acquire);
+                // Color targets: enabled in CB_TARGET_MASK and CB_SHADER_MASK,
+                // exported by the pixel shader with a non-zero export format.
+                let mrt_mask = ps.as_ref().map(|p| p.tr.out.mrt_mask).unwrap_or(0);
+                let col_format = reg(0x28714);
+                let target_mask = reg(0x28238) & reg(0x2823C);
+                let mut colors: [Option<Target>; MAX_RT] = [None; MAX_RT];
+                let mut blend = [0u32; MAX_RT];
+                let mut masks = [0u8; MAX_RT];
+                if cb_mode == 1 {
+                    // The surfaces first: slots that bind slices of one array (the
+                    // G-buffer: CB_COLOR_VIEW selects the slice, CB_COLOR_ATTRIB3
+                    // gives no depth) need it with all their slices, or an image made
+                    // for the first slot alone has one layer and the others clamp to
+                    // it (the G-buffer made again after the title changed its display
+                    // mode lost three of its four layers, FINDINGS.md 2026-10-21).
+                    let mut surfs: [Option<Surface>; MAX_RT] = [None; MAX_RT];
+                    for i in 0..MAX_RT as u32 {
+                        let m = (target_mask >> (4 * i)) & 0xF;
+                        if m == 0 || mrt_mask & (1 << i) == 0 || (col_format >> (4 * i)) & 0xF == 0 {
+                            continue;
+                        }
+                        surfs[i as usize] = color_surface(cp, i)?;
+                    }
+                    for i in 0..MAX_RT {
+                        let Some(s) = surfs[i] else { continue };
+                        if s.ty3d {
+                            continue;
+                        }
+                        let need = surfs.iter().flatten().filter(|o| o.base == s.base && !o.ty3d && (o.width, o.height) == (s.width, s.height)).map(|o| o.slice + 1).max().unwrap_or(1);
+                        if let Some(x) = surfs[i].as_mut() {
+                            x.layers = x.layers.max(need);
+                        }
+                    }
+                    for i in 0..MAX_RT as u32 {
+                        let m = (target_mask >> (4 * i)) & 0xF;
+                        let Some(s) = surfs[i as usize] else { continue };
+                        let t = images::target(&s)?;
+                        if colors.iter().flatten().any(|c| c.view == t.view) {
+                            self.report(format!("color target {:#x} bound to two MRT slots (second ignored)", s.base));
+                            continue;
+                        }
+                        colors[i as usize] = Some(t);
+                        blend[i as usize] = reg(0x28780 + 4 * i);
+                        masks[i as usize] = m as u8;
+                    }
                 }
-                let need = surfs.iter().flatten().filter(|o| o.base == s.base && !o.ty3d && (o.width, o.height) == (s.width, s.height)).map(|o| o.slice + 1).max().unwrap_or(1);
-                if let Some(x) = surfs[i].as_mut() {
-                    x.layers = x.layers.max(need);
+                lap.mark(5);
+                // Depth/stencil.
+                let dctl = reg(0x28800);
+                let db_render = reg(0x28000);
+                let dsurf = depth_surface(cp);
+                let (has_z, has_s) = match &dsurf {
+                    Some(s) => (images::aspects(s.format).contains(vk::ImageAspectFlags::DEPTH) && reg(0x28040) & 3 != 0, images::has_stencil(s.format)),
+                    None => (false, false),
+                };
+                let z_test = has_z && dctl & 2 != 0;
+                let z_write = z_test && dctl & 4 != 0;
+                let s_test = has_s && dctl & 1 != 0;
+                let sctl = reg(0x2842C);
+                let refm = reg(0x28430);
+                let refm_bf = reg(0x28434);
+                // Diagnosis (`tune stencil_export 1`): draws whose pixel shader exports
+                // the stencil test value (not translated: no stencil export on the
+                // device) replace with 0 instead of the register's test value.
+                let (refm, refm_bf) = if super::super::tune::stencil_export() == 1 && reg(0x2880C) & 2 != 0 { (refm & !0xFF, refm_bf & !0xFF) } else { (refm, refm_bf) };
+                let s_write = s_test && (refm | refm_bf) & 0x00FF_0000 != 0 && sctl & 0xFF_FFFF != 0;
+                if s_test {
+                    note_stencil_gaps(ps.as_ref().map_or(0, |p| p.addr), dctl, sctl, refm, refm_bf, reg(0x2880C));
                 }
-            }
-            for i in 0..MAX_RT as u32 {
-                let m = (target_mask >> (4 * i)) & 0xF;
-                let Some(s) = surfs[i as usize] else { continue };
-                let t = images::target(&s)?;
-                if colors.iter().flatten().any(|c| c.view == t.view) {
-                    self.report(format!("color target {:#x} bound to two MRT slots (second ignored)", s.base));
-                    continue;
+                let clear_z = has_z && db_render & 1 != 0;
+                let clear_s = has_s && db_render & 2 != 0;
+                if z_test || s_test || clear_z || clear_s {
+                    // A view of a later slice than the depth image has: grow it
+                    // (after the work that used it) instead of a separate image.
+                    let s = dsurf.as_ref().unwrap();
+                    if let Some(old) = images::depth_to_grow(s.base, s.width, s.height, s.format, s.layers) {
+                        self.end_rendering();
+                        self.flush_for("depth growth");
+                        if self.stopped {
+                            return Err(super::STOPPED.into());
+                        }
+                        images::with(|im| im.grow_depth(old, s.layers))?;
+                    }
                 }
-                colors[i as usize] = Some(t);
-                blend[i as usize] = reg(0x28780 + 4 * i);
-                masks[i as usize] = m as u8;
-            }
-        }
-        lap.mark(5);
-        // Depth/stencil.
-        let dctl = reg(0x28800);
-        let db_render = reg(0x28000);
-        let dsurf = depth_surface(cp);
-        let (has_z, has_s) = match &dsurf {
-            Some(s) => (images::aspects(s.format).contains(vk::ImageAspectFlags::DEPTH) && reg(0x28040) & 3 != 0, images::has_stencil(s.format)),
-            None => (false, false),
-        };
-        let z_test = has_z && dctl & 2 != 0;
-        let z_write = z_test && dctl & 4 != 0;
-        let s_test = has_s && dctl & 1 != 0;
-        let sctl = reg(0x2842C);
-        let refm = reg(0x28430);
-        let refm_bf = reg(0x28434);
-        // Diagnosis (`tune stencil_export 1`): draws whose pixel shader exports
-        // the stencil test value (not translated: no stencil export on the
-        // device) replace with 0 instead of the register's test value.
-        let (refm, refm_bf) = if super::super::tune::stencil_export() == 1 && reg(0x2880C) & 2 != 0 { (refm & !0xFF, refm_bf & !0xFF) } else { (refm, refm_bf) };
-        let s_write = s_test && (refm | refm_bf) & 0x00FF_0000 != 0 && sctl & 0xFF_FFFF != 0;
-        if s_test {
-            note_stencil_gaps(ps.as_ref().map_or(0, |p| p.addr), dctl, sctl, refm, refm_bf, reg(0x2880C));
-        }
-        let clear_z = has_z && db_render & 1 != 0;
-        let clear_s = has_s && db_render & 2 != 0;
-        if z_test || s_test || clear_z || clear_s {
-            // A view of a later slice than the depth image has: grow it
-            // (after the work that used it) instead of a separate image.
-            let s = dsurf.as_ref().unwrap();
-            if let Some(old) = images::depth_to_grow(s.base, s.width, s.height, s.format, s.layers) {
-                self.end_rendering();
-                self.flush_for("depth growth");
+                let depth = if z_test || s_test || clear_z || clear_s { Some(images::target(dsurf.as_ref().unwrap())?) } else { None };
+                lap.mark(6);
+                let mem_writes = vs.tr.plan.resources.iter().any(|r| r.written) || ps.as_ref().is_some_and(|p| p.tr.plan.resources.iter().any(|r| r.written));
+                if colors.iter().all(Option::is_none) && !z_write && !s_write && !clear_z && !clear_s && !mem_writes {
+                    return Ok(false);
+                }
+                let attachless = colors.iter().all(Option::is_none) && depth.is_none();
+                if attachless && !super::super::tune::attachless_draws() {
+                    return Err("draw with only memory writes (no attachments) not supported yet (skipped)".into());
+                }
+                let mut area = (u32::MAX, u32::MAX);
+                for t in colors.iter().flatten().chain(depth.iter()) {
+                    area = (area.0.min(t.width), area.1.min(t.height));
+                }
+                if attachless {
+                    // Memory side effects only: a rendering instance without
+                    // attachments, shared by such draws; each draw's scissors (from
+                    // its registers) limit what it rasterizes.
+                    area = (ATTACHLESS_AREA, ATTACHLESS_AREA);
+                    ATTACHLESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let (x0, y0, x1, y1) = scissor(cp, area);
+                if x1 <= x0 || y1 <= y0 {
+                    return Ok(false);
+                }
+                // Pipeline.
+                let depth_clamp = clip & (3 << 26) != 0;
+                let key = GfxKey {
+                    vs: vs.tr.key,
+                    ps: ps.as_ref().map(|p| p.tr.key).unwrap_or(0),
+                    rect_gs: rect.then_some(vs.tr.out.param_mask),
+                    colors: colors.map(|c| c.map(|t| t.format.as_raw()).unwrap_or(vk::Format::UNDEFINED.as_raw())),
+                    blend,
+                    masks,
+                    depth: depth.map(|d| d.format.as_raw()).unwrap_or(vk::Format::UNDEFINED.as_raw()),
+                    topology_class: class,
+                    depth_clamp,
+                };
+                let push_mode = match &ps {
+                    Some(p) => super::push_fits(&[&vs, p]),
+                    None => super::push_fits(&[&vs]),
+                };
+                // Consecutive draws mostly share their pipeline state: the key's
+                // hash (also the persistent cache file's name, so its hasher stays)
+                // is computed again only when the key changed on this thread.
+                let hkey = {
+                    let last = LAST_GFX_KEY.with(|c| c.get()).filter(|(k, _)| *k == key).map(|(_, h)| h);
+                    let h = last.unwrap_or_else(|| {
+                        let h = hash_gfx_key(&key);
+                        LAST_GFX_KEY.with(|c| c.set(Some((key, h))));
+                        h
+                    });
+                    super::push_key(h, push_mode)
+                };
+                let cached = gfx_pipe(hkey);
+                let Pipe { pipeline, layout, set_layout, push } = match cached {
+                    Some(x) => x,
+                    None => {
+                        // A first use.
+                        let t = std::time::Instant::now();
+                        let created = std::cell::Cell::new(false);
+                        let p = gfx_pipe_with(&key, hkey, (&**vs.tr, vs.addr), ps.as_ref().map(|p| (&**p.tr, p.addr)), push_mode, &created)?;
+                        if compile_trace() {
+                            crate::info!("first use: vs {:#x} ps {ps_addr:#x} key {hkey:#x} after {} ms{}", vs.addr, t.elapsed().as_millis(), if created.get() { "" } else { " (made by another thread)" });
+                        }
+                        GFX_FIRST_USES[0].fetch_add(1, Ordering::Relaxed);
+                        GFX_FIRST_USES[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        p
+                    }
+                };
+                let t_pipe = since(t0);
+                lap.mark(7);
+                // Profile: the step's parts by draw kind ([draws, grow ns, check
+                // ns, pending, resolve ns]).
+                let hz_t = profiling().then(std::time::Instant::now);
+                // Depth arrays sampled with more layers than rendered so far.
+                match &ps {
+                    Some(p) => self.grow_sampled_depth(&[&vs, p]),
+                    None => self.grow_sampled_depth(&[&vs]),
+                }
+                let hz_t1 = hz_t.map(|_| std::time::Instant::now());
+                // Fast clears (metadata writes), reloads and block copies of the
+                // attachments and textures.
+                let mut used = std::mem::take(&mut self.keys_scratch);
+                used.clear();
+                used.extend(colors.iter().flatten().chain(depth.iter()).map(|t| t.key));
+                let pending = super::super::tune::skip_steps() & 2 == 0
+                    && match &ps {
+                        Some(p) => super::image_hazards(&[&vs, p], &mut used),
+                        None => super::image_hazards(&[&vs], &mut used),
+                    };
+                let pending = self.held_hit(&used) || pending;
+                if pending && expect.is_some() {
+                    delta_mismatch(2, vs.addr, ps_addr);
+                }
+                let hz_t2 = hz_t.map(|_| std::time::Instant::now());
                 if self.stopped {
                     return Err(super::STOPPED.into());
                 }
-                images::with(|im| im.grow_depth(old, s.layers))?;
-            }
-        }
-        let depth = if z_test || s_test || clear_z || clear_s { Some(images::target(dsurf.as_ref().unwrap())?) } else { None };
-        lap.mark(6);
-        let mem_writes = vs.tr.plan.resources.iter().any(|r| r.written) || ps.as_ref().is_some_and(|p| p.tr.plan.resources.iter().any(|r| r.written));
-        if colors.iter().all(Option::is_none) && !z_write && !s_write && !clear_z && !clear_s && !mem_writes {
-            return Ok(false);
-        }
-        let attachless = colors.iter().all(Option::is_none) && depth.is_none();
-        if attachless && !super::super::tune::attachless_draws() {
-            return Err("draw with only memory writes (no attachments) not supported yet (skipped)".into());
-        }
-        let mut area = (u32::MAX, u32::MAX);
-        for t in colors.iter().flatten().chain(depth.iter()) {
-            area = (area.0.min(t.width), area.1.min(t.height));
-        }
-        if attachless {
-            // Memory side effects only: a rendering instance without
-            // attachments, shared by such draws; each draw's scissors (from
-            // its registers) limit what it rasterizes.
-            area = (ATTACHLESS_AREA, ATTACHLESS_AREA);
-            ATTACHLESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        let (x0, y0, x1, y1) = scissor(cp, area);
-        if x1 <= x0 || y1 <= y0 {
-            return Ok(false);
-        }
-        // Pipeline.
-        let depth_clamp = clip & (3 << 26) != 0;
-        let key = GfxKey {
-            vs: vs.tr.key,
-            ps: ps.as_ref().map(|p| p.tr.key).unwrap_or(0),
-            rect_gs: rect.then_some(vs.tr.out.param_mask),
-            colors: colors.map(|c| c.map(|t| t.format.as_raw()).unwrap_or(vk::Format::UNDEFINED.as_raw())),
-            blend,
-            masks,
-            depth: depth.map(|d| d.format.as_raw()).unwrap_or(vk::Format::UNDEFINED.as_raw()),
-            topology_class: class,
-            depth_clamp,
-        };
-        let push_mode = match &ps {
-            Some(p) => super::push_fits(&[&vs, p]),
-            None => super::push_fits(&[&vs]),
-        };
-        // Consecutive draws mostly share their pipeline state: the key's
-        // hash (also the persistent cache file's name, so its hasher stays)
-        // is computed again only when the key changed on this thread.
-        let hkey = {
-            let last = LAST_GFX_KEY.with(|c| c.get()).filter(|(k, _)| *k == key).map(|(_, h)| h);
-            let h = last.unwrap_or_else(|| {
-                let h = hash_gfx_key(&key);
-                LAST_GFX_KEY.with(|c| c.set(Some((key, h))));
-                h
-            });
-            super::push_key(h, push_mode)
-        };
-        let cached = gfx_pipe(hkey);
-        let Pipe { pipeline, layout, set_layout, push } = match cached {
-            Some(x) => x,
-            None => {
-                // A first use.
-                let t = std::time::Instant::now();
-                let created = std::cell::Cell::new(false);
-                let p = gfx_pipe_with(&key, hkey, (&**vs.tr, vs.addr), ps.as_ref().map(|p| (&**p.tr, p.addr)), push_mode, &created)?;
-                if compile_trace() {
-                    crate::info!("first use: vs {:#x} ps {ps_addr:#x} key {hkey:#x} after {} ms{}", vs.addr, t.elapsed().as_millis(), if created.get() { "" } else { " (made by another thread)" });
+                if pending {
+                    self.resolve_fast_clears(&used);
+                    self.resolve_overwrites(&used);
+                    self.sync_block_textures(&used);
+                    self.sync_depth_views(&used);
+                    if self.stopped {
+                        return Err(super::STOPPED.into());
+                    }
                 }
-                GFX_FIRST_USES[0].fetch_add(1, Ordering::Relaxed);
-                GFX_FIRST_USES[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                p
+                if let (Some(t0), Some(t1), Some(t2)) = (hz_t, hz_t1, hz_t2) {
+                    let h = &super::HAZARD_STEPS[kind];
+                    h[0].fetch_add(1, Ordering::Relaxed);
+                    h[1].fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
+                    h[2].fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
+                    h[3].fetch_add(pending as u64, Ordering::Relaxed);
+                    h[4].fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+                self.keys_scratch = used;
+                lap.mark(8);
+                let f = Fixed { colors, depth, area, scissor: (x0, y0, x1, y1), z_test, z_write, s_test, s_write, clear_z, clear_s, dctl, sctl, refm, refm_bf, pipe: Pipe { pipeline, layout, set_layout, push }, writes: mem_writes, hazard: pending, lookup_gen };
+                if expect.is_some_and(|e| !f.same_as(&e)) {
+                    delta_mismatch(1, vs.addr, ps_addr);
+                }
+                (f, t_pipe)
             }
         };
-        let t_pipe = since(t0);
-        lap.mark(7);
-        // Profile: the step's parts by draw kind ([draws, grow ns, check
-        // ns, pending, resolve ns]).
-        let hz_t = profiling().then(std::time::Instant::now);
-        // Depth arrays sampled with more layers than rendered so far.
-        match &ps {
-            Some(p) => self.grow_sampled_depth(&[&vs, p]),
-            None => self.grow_sampled_depth(&[&vs]),
-        }
-        let hz_t1 = hz_t.map(|_| std::time::Instant::now());
-        // Fast clears (metadata writes), reloads and block copies of the
-        // attachments and textures.
-        let mut used = std::mem::take(&mut self.keys_scratch);
-        used.clear();
-        used.extend(colors.iter().flatten().chain(depth.iter()).map(|t| t.key));
-        let pending = super::super::tune::skip_steps() & 2 == 0
-            && match &ps {
-                Some(p) => super::image_hazards(&[&vs, p], &mut used),
-                None => super::image_hazards(&[&vs], &mut used),
-            };
-        let pending = self.held_hit(&used) || pending;
-        let hz_t2 = hz_t.map(|_| std::time::Instant::now());
-        if self.stopped {
-            return Err(super::STOPPED.into());
-        }
-        if pending {
-            self.resolve_fast_clears(&used);
-            self.resolve_overwrites(&used);
-            self.sync_block_textures(&used);
-            self.sync_depth_views(&used);
-            if self.stopped {
-                return Err(super::STOPPED.into());
-            }
-        }
-        if let (Some(t0), Some(t1), Some(t2)) = (hz_t, hz_t1, hz_t2) {
-            let h = &super::HAZARD_STEPS[kind];
-            h[0].fetch_add(1, Ordering::Relaxed);
-            h[1].fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
-            h[2].fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
-            h[3].fetch_add(pending as u64, Ordering::Relaxed);
-            h[4].fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        }
-        self.keys_scratch = used;
-        lap.mark(8);
+        let Fixed { colors, depth, area, scissor: (x0, y0, x1, y1), z_test, z_write, s_test, s_write, clear_z, clear_s, dctl, sctl, refm, refm_bf, pipe: Pipe { pipeline, layout, set_layout, push }, .. } = fixed;
         // Resources.
         match &ps {
             Some(p) => self.reserve(&[&vs, p], push),
@@ -1325,6 +1629,11 @@ impl Exec {
         bounds.clear();
         let mut sgpr_at = [0u64; 2];
         let mut sgpr_ring = vk::Buffer::null();
+        let mut notes: [Option<([u64; 3], bool)>; 2] = [None; 2];
+        // A buffer-delta draw's images and samplers are the last draw's
+        // while their memos' generations and the frame hold.
+        let gens_hold = (delta.is_some() || expect.is_some()) && self.delta.bind_gens.is_some_and(|g| g == super::bind_gens());
+        let mut reused = 0;
         for k in 0..2 {
             let p: &mut Prepared = match k {
                 0 => &mut vs,
@@ -1333,9 +1642,20 @@ impl Exec {
                     None => break,
                 },
             };
+            if delta.is_some() || expect.is_some() {
+                self.delta.count(if gens_hold { 9 } else { 10 });
+            }
+            if delta.is_some() && gens_hold {
+                self.bind_reuse = Some(k);
+                reused += 1;
+            }
             let mut b = self.bind_stage(p, false)?;
+            notes[k] = self.bind_note.take();
             if self.stopped {
                 return Err(super::STOPPED.into());
+            }
+            if gens_hold && expect.is_some() && !self.delta.bind_same(k, &b) {
+                delta_mismatch(5, vs_addr, ps_addr);
             }
             let (ring, at) = self.bind_sgpr(p, &mut b)?;
             sgpr_at[k] = at;
@@ -1356,105 +1676,114 @@ impl Exec {
         }
         lap.mark(13);
         let t_bind = since(t0);
-        // Rendering instance: reuse it while the attachments stay the same
-        // and no attachment is both written and sampled in it (Vulkan's
-        // rule for an image that is an attachment and a descriptor at once;
-        // `tune feedback_exact`, else any sampled attachment ends it: ~266
-        // instances per gate frame, each with a full barrier).
-        let writes_ds = z_write || s_write || clear_z || clear_s;
-        // This draw's writes of the depth attachment's [depth, stencil].
-        let ds_writes = [z_write || clear_z, s_write || clear_s];
-        let draw_writes = |img: vk::Image| colors.iter().flatten().any(|t| t.image == img) || (writes_ds && depth.as_ref().is_some_and(|d| d.image == img));
-        let sampled_now = |img: vk::Image| bounds.iter().any(|b| b.images.contains(&img));
-        let stored_now = |img: vk::Image| bounds.iter().any(|b| b.stored.contains(&img));
-        // Its sampling of the depth attachment's [depth, stencil] (any view
-        // that is not R8_UINT reads depth).
-        let ds_sampled_now = |img: vk::Image| [bounds.iter().any(|b| b.images.contains(&img) && !b.stencil_views.contains(&img)), bounds.iter().any(|b| b.stencil_views.contains(&img))];
-        let exact = super::super::tune::feedback_exact();
-        let mut samples_attachment = false;
-        let feedback = self.rendering.as_ref().is_some_and(|r| {
-            let color = r.colors.iter().flatten().any(|t| {
-                let a = t.image;
-                let sampled = sampled_now(a);
-                samples_attachment |= sampled;
-                if !exact {
-                    return sampled;
-                }
-                stored_now(a) || (sampled && (draw_writes(a) || r.written.contains(&a))) || (draw_writes(a) && r.sampled.contains(&a))
+        // (A buffer-delta draw keeps the instance: the draw before it
+        // neither sampled nor stored an attachment of it.)
+        let mut touches = true;
+        if delta.is_none() {
+            // Rendering instance: reuse it while the attachments stay the same
+            // and no attachment is both written and sampled in it (Vulkan's
+            // rule for an image that is an attachment and a descriptor at once;
+            // `tune feedback_exact`, else any sampled attachment ends it: ~266
+            // instances per gate frame, each with a full barrier).
+            let writes_ds = z_write || s_write || clear_z || clear_s;
+            // This draw's writes of the depth attachment's [depth, stencil].
+            let ds_writes = [z_write || clear_z, s_write || clear_s];
+            let draw_writes = |img: vk::Image| colors.iter().flatten().any(|t| t.image == img) || (writes_ds && depth.as_ref().is_some_and(|d| d.image == img));
+            let sampled_now = |img: vk::Image| bounds.iter().any(|b| b.images.contains(&img));
+            let stored_now = |img: vk::Image| bounds.iter().any(|b| b.stored.contains(&img));
+            // Its sampling of the depth attachment's [depth, stencil] (any view
+            // that is not R8_UINT reads depth).
+            let ds_sampled_now = |img: vk::Image| [bounds.iter().any(|b| b.images.contains(&img) && !b.stencil_views.contains(&img)), bounds.iter().any(|b| b.stencil_views.contains(&img))];
+            let exact = super::super::tune::feedback_exact();
+            let mut samples_attachment = false;
+            let feedback = self.rendering.as_ref().is_some_and(|r| {
+                let color = r.colors.iter().flatten().any(|t| {
+                    let a = t.image;
+                    let sampled = sampled_now(a);
+                    samples_attachment |= sampled;
+                    if !exact {
+                        return sampled;
+                    }
+                    stored_now(a) || (sampled && (draw_writes(a) || r.written.contains(&a))) || (draw_writes(a) && r.sampled.contains(&a))
+                });
+                let ds = r.depth.as_ref().is_some_and(|t| {
+                    let a = t.image;
+                    let sampled = sampled_now(a);
+                    samples_attachment |= sampled;
+                    if !exact {
+                        return sampled;
+                    }
+                    let now = ds_sampled_now(a);
+                    stored_now(a) || (0..2).any(|k| (now[k] && (ds_writes[k] || r.ds_written[k])) || (ds_writes[k] && r.ds_sampled[k]))
+                });
+                color || ds
             });
-            let ds = r.depth.as_ref().is_some_and(|t| {
-                let a = t.image;
-                let sampled = sampled_now(a);
-                samples_attachment |= sampled;
-                if !exact {
-                    return sampled;
-                }
-                let now = ds_sampled_now(a);
-                stored_now(a) || (0..2).any(|k| (now[k] && (ds_writes[k] || r.ds_written[k])) || (ds_writes[k] && r.ds_sampled[k]))
-            });
-            color || ds
-        });
-        let same = self.rendering.as_ref().is_some_and(|r| r.colors == colors && r.depth == depth);
-        if samples_attachment && same {
-            super::FEEDBACK[feedback as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // What the sampled attachment is and how this draw uses it
-            // (statistics): [color written by the draw, color not written,
-            // depth with depth writes, with stencil writes only, with a
-            // clear only, depth not written, stored to].
-            let r = self.rendering.as_ref().unwrap();
-            let mut kinds = [false; 7];
-            for t in r.colors.iter().flatten() {
-                if sampled_now(t.image) {
-                    kinds[if draw_writes(t.image) { 0 } else { 1 }] = true;
-                }
-                if stored_now(t.image) {
-                    kinds[6] = true;
-                }
+            let same = self.rendering.as_ref().is_some_and(|r| r.colors == colors && r.depth == depth);
+            if (!same || feedback) && expect.is_some() {
+                delta_mismatch(3, vs.addr, ps_addr);
             }
-            if r.depth.as_ref().is_some_and(|d| sampled_now(d.image)) {
-                kinds[if z_write { 2 } else if s_write { 3 } else if clear_z || clear_s { 4 } else { 5 }] = true;
-            }
-            for (k, &on) in kinds.iter().enumerate() {
-                if on {
-                    super::FEEDBACK_KINDS[k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if samples_attachment && same {
+                super::FEEDBACK[feedback as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // What the sampled attachment is and how this draw uses it
+                // (statistics): [color written by the draw, color not written,
+                // depth with depth writes, with stencil writes only, with a
+                // clear only, depth not written, stored to].
+                let r = self.rendering.as_ref().unwrap();
+                let mut kinds = [false; 7];
+                for t in r.colors.iter().flatten() {
+                    if sampled_now(t.image) {
+                        kinds[if draw_writes(t.image) { 0 } else { 1 }] = true;
+                    }
+                    if stored_now(t.image) {
+                        kinds[6] = true;
+                    }
+                }
+                if r.depth.as_ref().is_some_and(|d| sampled_now(d.image)) {
+                    kinds[if z_write { 2 } else if s_write { 3 } else if clear_z || clear_s { 4 } else { 5 }] = true;
+                }
+                for (k, &on) in kinds.iter().enumerate() {
+                    if on {
+                        super::FEEDBACK_KINDS[k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                if super::profiling_on() {
+                    let ps_addr = ps.as_ref().map_or(0, |p| p.addr);
+                    *super::FEEDBACK_PS.lock().get_or_insert_with(std::collections::HashMap::new).entry(ps_addr).or_default() += 1;
                 }
             }
-            if super::profiling_on() {
-                let ps_addr = ps.as_ref().map_or(0, |p| p.addr);
-                *super::FEEDBACK_PS.lock().get_or_insert_with(std::collections::HashMap::new).entry(ps_addr).or_default() += 1;
-            }
-        }
-        if !same || feedback {
-            if feedback {
-                self.end_rendering();
-            } else {
-                self.end_rendering();
-            }
-            self.barrier_if_wanted(true);
-            self.begin_rendering(colors, depth, area);
-        } else if super::super::tune::race_checks() && self.barrier_wanted {
-            super::UNORDERED[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        if super::super::tune::race_checks() {
-            self.note_unordered(&bounds, &[vs.addr, ps_addr], true);
-        }
-        if let Some(r) = self.rendering.as_mut() {
-            for t in r.colors.iter().flatten() {
-                let a = t.image;
-                if draw_writes(a) && !r.written.contains(&a) {
-                    r.written.push(a);
+            if !same || feedback {
+                if feedback {
+                    self.end_rendering();
+                } else {
+                    self.end_rendering();
                 }
-                if sampled_now(a) && !r.sampled.contains(&a) {
-                    r.sampled.push(a);
-                }
+                self.barrier_if_wanted(true);
+                self.begin_rendering(colors, depth, area);
+            } else if super::super::tune::race_checks() && self.barrier_wanted {
+                super::UNORDERED[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            if let Some(a) = r.depth.as_ref().map(|t| t.image) {
-                let now = ds_sampled_now(a);
-                for k in 0..2 {
-                    r.ds_written[k] |= ds_writes[k];
-                    r.ds_sampled[k] |= now[k];
+            if super::super::tune::race_checks() {
+                self.note_unordered(&bounds, &[vs.addr, ps_addr], true);
+            }
+            if let Some(r) = self.rendering.as_mut() {
+                for t in r.colors.iter().flatten() {
+                    let a = t.image;
+                    if draw_writes(a) && !r.written.contains(&a) {
+                        r.written.push(a);
+                    }
+                    if sampled_now(a) && !r.sampled.contains(&a) {
+                        r.sampled.push(a);
+                    }
+                }
+                if let Some(a) = r.depth.as_ref().map(|t| t.image) {
+                    let now = ds_sampled_now(a);
+                    for k in 0..2 {
+                        r.ds_written[k] |= ds_writes[k];
+                        r.ds_sampled[k] |= now[k];
+                    }
                 }
             }
+            touches = self.rendering.as_ref().is_none_or(|r| r.colors.iter().flatten().chain(r.depth.iter()).any(|t| sampled_now(t.image) || stored_now(t.image)));
         }
         lap.mark(14);
         let c = ctx();
@@ -1470,6 +1799,7 @@ impl Exec {
             self.report(format!("PA_CL_VTE_CNTL {vte:#x} (viewport transform disabled) approximated"));
             vk::Viewport { x: 0.0, y: 0.0, width: area.0 as f32, height: area.1 as f32, min_depth: 0.0, max_depth: 1.0 }
         };
+        let dyn_before = expect.map(|_| self.dyncache.sig());
         let dc = &mut self.dyncache;
         let untimed;
         unsafe {
@@ -1481,167 +1811,172 @@ impl Exec {
             }
             super::bind_descriptors(cmd, vk::PipelineBindPoint::GRAPHICS, layout, set, &bounds, &mut dc.pushed[0], rebound);
             super::push_sgpr_bases(cmd, layout, false, &bounds);
-            let vpw = [vp.x.to_bits(), vp.y.to_bits(), vp.width.to_bits(), vp.height.to_bits(), vp.min_depth.to_bits(), vp.max_depth.to_bits()];
-            if dc.viewport != Some(vpw) {
-                c.device.cmd_set_viewport(cmd, 0, &[vp]);
-                dc.viewport = Some(vpw);
-            }
-            let mut sc = vk::Rect2D { offset: vk::Offset2D { x: x0, y: y0 }, extent: vk::Extent2D { width: (x1 - x0) as u32, height: (y1 - y0) as u32 } };
-            // Diagnosis (control `tiny <ps>`): those draws cover one pixel
-            // (their vertex work stays, pixel work goes).
-            if TINY_ANY.load(Ordering::Relaxed) && TINY_SCISSOR.lock().contains(&ps_addr) {
-                sc.extent = vk::Extent2D { width: 1, height: 1 };
-            }
-            let scw = [sc.offset.x, sc.offset.y, sc.extent.width as i32, sc.extent.height as i32];
-            if dc.scissor != Some(scw) {
-                c.device.cmd_set_scissor(cmd, 0, &[sc]);
-                dc.scissor = Some(scw);
-            }
-            // Depth/stencil clears requested through DB_RENDER_CONTROL.
-            if clear_z || clear_s {
-                let mut aspect = vk::ImageAspectFlags::empty();
-                if clear_z {
-                    aspect |= vk::ImageAspectFlags::DEPTH;
+            if delta.is_none() {
+                let vpw = [vp.x.to_bits(), vp.y.to_bits(), vp.width.to_bits(), vp.height.to_bits(), vp.min_depth.to_bits(), vp.max_depth.to_bits()];
+                if dc.viewport != Some(vpw) {
+                    c.device.cmd_set_viewport(cmd, 0, &[vp]);
+                    dc.viewport = Some(vpw);
                 }
-                if clear_s {
-                    aspect |= vk::ImageAspectFlags::STENCIL;
+                let mut sc = vk::Rect2D { offset: vk::Offset2D { x: x0, y: y0 }, extent: vk::Extent2D { width: (x1 - x0) as u32, height: (y1 - y0) as u32 } };
+                // Diagnosis (control `tiny <ps>`): those draws cover one pixel
+                // (their vertex work stays, pixel work goes).
+                if TINY_ANY.load(Ordering::Relaxed) && TINY_SCISSOR.lock().contains(&ps_addr) {
+                    sc.extent = vk::Extent2D { width: 1, height: 1 };
                 }
-                let ca = vk::ClearAttachment {
-                    aspect_mask: aspect,
-                    color_attachment: 0,
-                    clear_value: vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: f32r(reg(0x2802C)), stencil: reg(0x28028) & 0xFF } },
-                };
-                c.device.cmd_clear_attachments(cmd, &[ca], &[vk::ClearRect { rect: sc, base_array_layer: 0, layer_count: 1 }]);
-                if colors.iter().all(Option::is_none) {
-                    return Ok(true);
+                let scw = [sc.offset.x, sc.offset.y, sc.extent.width as i32, sc.extent.height as i32];
+                if dc.scissor != Some(scw) {
+                    c.device.cmd_set_scissor(cmd, 0, &[sc]);
+                    dc.scissor = Some(scw);
                 }
-            }
-            let mode = reg(0x28814);
-            let mut cull = vk::CullModeFlags::NONE;
-            if mode & 1 != 0 && !rect {
-                cull |= vk::CullModeFlags::FRONT;
-            }
-            if mode & 2 != 0 && !rect {
-                cull |= vk::CullModeFlags::BACK;
-            }
-            if dc.set(0, cull.as_raw() as u64) {
-                c.device.cmd_set_cull_mode(cmd, cull);
-            }
-            let front = if mode & 4 != 0 { vk::FrontFace::CLOCKWISE } else { vk::FrontFace::COUNTER_CLOCKWISE };
-            if dc.set(1, front.as_raw() as u64) {
-                c.device.cmd_set_front_face(cmd, front);
-            }
-            if dc.set(2, topology.as_raw() as u64) {
-                c.device.cmd_set_primitive_topology(cmd, topology);
-            }
-            let restart = reg(0x28A94) & 1 != 0 && matches!(prim, 3 | 5 | 6) && a.index.is_some();
-            if dc.set(3, restart as u64) {
-                c.device.cmd_set_primitive_restart_enable(cmd, restart);
-            }
-            if dc.set(4, 0) {
-                c.device.cmd_set_rasterizer_discard_enable(cmd, false);
-            }
-            if dc.set(5, z_test as u64) {
-                c.device.cmd_set_depth_test_enable(cmd, z_test);
-            }
-            if dc.set(6, z_write as u64) {
-                c.device.cmd_set_depth_write_enable(cmd, z_write);
-            }
-            // DS_DEPTH_EQUAL_BIAS=<units> (diagnosis): EQUAL tests without
-            // depth writes pass a little in front of the stored depth instead
-            // (reversed Z when the depth clear value is 0); `always`: they
-            // always pass (do the draw's fragments exist at all?).
-            let eq_bias = equal_bias().filter(|_| z_test && !z_write && (dctl >> 4) & 7 == 2);
-            let reversed = f32r(reg(0x2802C)) == 0.0;
-            let zop = match eq_bias {
-                Some(b) if b.is_infinite() => vk::CompareOp::ALWAYS,
-                Some(_) => {
-                    if reversed {
-                        vk::CompareOp::GREATER_OR_EQUAL
-                    } else {
-                        vk::CompareOp::LESS_OR_EQUAL
+                // Depth/stencil clears requested through DB_RENDER_CONTROL.
+                if clear_z || clear_s {
+                    let mut aspect = vk::ImageAspectFlags::empty();
+                    if clear_z {
+                        aspect |= vk::ImageAspectFlags::DEPTH;
+                    }
+                    if clear_s {
+                        aspect |= vk::ImageAspectFlags::STENCIL;
+                    }
+                    let ca = vk::ClearAttachment {
+                        aspect_mask: aspect,
+                        color_attachment: 0,
+                        clear_value: vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: f32r(reg(0x2802C)), stencil: reg(0x28028) & 0xFF } },
+                    };
+                    c.device.cmd_clear_attachments(cmd, &[ca], &[vk::ClearRect { rect: sc, base_array_layer: 0, layer_count: 1 }]);
+                    if colors.iter().all(Option::is_none) {
+                        return Ok(true);
                     }
                 }
-                None => compare_op(dctl >> 4),
-            };
-            if dc.set(7, zop.as_raw() as u64) {
-                c.device.cmd_set_depth_compare_op(cmd, zop);
-            }
-            let eq_bias = eq_bias.filter(|b| b.is_finite());
-            if dc.set(8, 0) {
-                c.device.cmd_set_depth_bounds_test_enable(cmd, false);
-            }
-            if dc.set(9, s_test as u64) {
-                c.device.cmd_set_stencil_test_enable(cmd, s_test);
-            }
-            let back = dctl & (1 << 7) != 0;
-            let ffunc = compare_op(dctl >> 8);
-            let bfunc = if back { compare_op(dctl >> 20) } else { ffunc };
-            let sop = |w: u32, f: vk::CompareOp| (stencil_op(w), stencil_op(w >> 4), stencil_op(w >> 8), f);
-            let pack = |o: (vk::StencilOp, vk::StencilOp, vk::StencilOp, vk::CompareOp)| (o.0.as_raw() as u64) | (o.1.as_raw() as u64) << 16 | (o.2.as_raw() as u64) << 32 | (o.3.as_raw() as u64) << 48;
-            let fo = sop(sctl, ffunc);
-            if dc.set(10, pack(fo)) {
-                c.device.cmd_set_stencil_op(cmd, vk::StencilFaceFlags::FRONT, fo.0, fo.1, fo.2, fo.3);
-            }
-            let bs = if back { sctl >> 12 } else { sctl };
-            let bo = sop(bs, bfunc);
-            if dc.set(11, pack(bo)) {
-                c.device.cmd_set_stencil_op(cmd, vk::StencilFaceFlags::BACK, bo.0, bo.1, bo.2, bo.3);
-            }
-            let rb = if back { refm_bf } else { refm };
-            for (slot, face, v) in [
-                (12, vk::StencilFaceFlags::FRONT, refm & 0xFF),
-                (13, vk::StencilFaceFlags::BACK, rb & 0xFF),
-            ] {
-                if dc.set(slot, v as u64) {
-                    c.device.cmd_set_stencil_reference(cmd, face, v);
+                let mode = reg(0x28814);
+                let mut cull = vk::CullModeFlags::NONE;
+                if mode & 1 != 0 && !rect {
+                    cull |= vk::CullModeFlags::FRONT;
+                }
+                if mode & 2 != 0 && !rect {
+                    cull |= vk::CullModeFlags::BACK;
+                }
+                if dc.set(0, cull.as_raw() as u64) {
+                    c.device.cmd_set_cull_mode(cmd, cull);
+                }
+                let front = if mode & 4 != 0 { vk::FrontFace::CLOCKWISE } else { vk::FrontFace::COUNTER_CLOCKWISE };
+                if dc.set(1, front.as_raw() as u64) {
+                    c.device.cmd_set_front_face(cmd, front);
+                }
+                if dc.set(2, topology.as_raw() as u64) {
+                    c.device.cmd_set_primitive_topology(cmd, topology);
+                }
+                let restart = reg(0x28A94) & 1 != 0 && matches!(prim, 3 | 5 | 6) && a.index.is_some();
+                if dc.set(3, restart as u64) {
+                    c.device.cmd_set_primitive_restart_enable(cmd, restart);
+                }
+                if dc.set(4, 0) {
+                    c.device.cmd_set_rasterizer_discard_enable(cmd, false);
+                }
+                if dc.set(5, z_test as u64) {
+                    c.device.cmd_set_depth_test_enable(cmd, z_test);
+                }
+                if dc.set(6, z_write as u64) {
+                    c.device.cmd_set_depth_write_enable(cmd, z_write);
+                }
+                // DS_DEPTH_EQUAL_BIAS=<units> (diagnosis): EQUAL tests without
+                // depth writes pass a little in front of the stored depth instead
+                // (reversed Z when the depth clear value is 0); `always`: they
+                // always pass (do the draw's fragments exist at all?).
+                let eq_bias = equal_bias().filter(|_| z_test && !z_write && (dctl >> 4) & 7 == 2);
+                let reversed = f32r(reg(0x2802C)) == 0.0;
+                let zop = match eq_bias {
+                    Some(b) if b.is_infinite() => vk::CompareOp::ALWAYS,
+                    Some(_) => {
+                        if reversed {
+                            vk::CompareOp::GREATER_OR_EQUAL
+                        } else {
+                            vk::CompareOp::LESS_OR_EQUAL
+                        }
+                    }
+                    None => compare_op(dctl >> 4),
+                };
+                if dc.set(7, zop.as_raw() as u64) {
+                    c.device.cmd_set_depth_compare_op(cmd, zop);
+                }
+                let eq_bias = eq_bias.filter(|b| b.is_finite());
+                if dc.set(8, 0) {
+                    c.device.cmd_set_depth_bounds_test_enable(cmd, false);
+                }
+                if dc.set(9, s_test as u64) {
+                    c.device.cmd_set_stencil_test_enable(cmd, s_test);
+                }
+                let back = dctl & (1 << 7) != 0;
+                let ffunc = compare_op(dctl >> 8);
+                let bfunc = if back { compare_op(dctl >> 20) } else { ffunc };
+                let sop = |w: u32, f: vk::CompareOp| (stencil_op(w), stencil_op(w >> 4), stencil_op(w >> 8), f);
+                let pack = |o: (vk::StencilOp, vk::StencilOp, vk::StencilOp, vk::CompareOp)| (o.0.as_raw() as u64) | (o.1.as_raw() as u64) << 16 | (o.2.as_raw() as u64) << 32 | (o.3.as_raw() as u64) << 48;
+                let fo = sop(sctl, ffunc);
+                if dc.set(10, pack(fo)) {
+                    c.device.cmd_set_stencil_op(cmd, vk::StencilFaceFlags::FRONT, fo.0, fo.1, fo.2, fo.3);
+                }
+                let bs = if back { sctl >> 12 } else { sctl };
+                let bo = sop(bs, bfunc);
+                if dc.set(11, pack(bo)) {
+                    c.device.cmd_set_stencil_op(cmd, vk::StencilFaceFlags::BACK, bo.0, bo.1, bo.2, bo.3);
+                }
+                let rb = if back { refm_bf } else { refm };
+                for (slot, face, v) in [
+                    (12, vk::StencilFaceFlags::FRONT, refm & 0xFF),
+                    (13, vk::StencilFaceFlags::BACK, rb & 0xFF),
+                ] {
+                    if dc.set(slot, v as u64) {
+                        c.device.cmd_set_stencil_reference(cmd, face, v);
+                    }
+                }
+                for (slot, face, v) in [
+                    (14, vk::StencilFaceFlags::FRONT, (refm >> 8) & 0xFF),
+                    (15, vk::StencilFaceFlags::BACK, (rb >> 8) & 0xFF),
+                ] {
+                    if dc.set(slot, v as u64) {
+                        c.device.cmd_set_stencil_compare_mask(cmd, face, v);
+                    }
+                }
+                for (slot, face, v) in [
+                    (16, vk::StencilFaceFlags::FRONT, (refm >> 16) & 0xFF),
+                    (17, vk::StencilFaceFlags::BACK, (rb >> 16) & 0xFF),
+                ] {
+                    if dc.set(slot, v as u64) {
+                        c.device.cmd_set_stencil_write_mask(cmd, face, v);
+                    }
+                }
+                // PA_SU_SC_MODE_CNTL.POLY_OFFSET_FRONT/BACK_ENABLE with
+                // PA_SU_POLY_OFFSET_* (scale in 1/16 units).
+                let poly_offset = mode & (3 << 11) != 0;
+                let bias_on = poly_offset || eq_bias.is_some();
+                if dc.set(18, bias_on as u64) {
+                    c.device.cmd_set_depth_bias_enable(cmd, bias_on);
+                }
+                let bias = if let (Some(units), false) = (eq_bias, poly_offset) {
+                    Some((if reversed { units } else { -units }, 0.0, 0.0))
+                } else if poly_offset {
+                    let (sr, or) = if mode & (1 << 11) != 0 { (0x28B80, 0x28B84) } else { (0x28B88, 0x28B8C) };
+                    Some((f32r(reg(or)), f32r(reg(0x28B7C)), f32r(reg(sr)) / 16.0))
+                } else {
+                    None
+                };
+                if let Some((k, clamp, slope)) = bias {
+                    let bw = [k.to_bits(), clamp.to_bits(), slope.to_bits()];
+                    if dc.bias != Some(bw) {
+                        c.device.cmd_set_depth_bias(cmd, k, clamp, slope);
+                        dc.bias = Some(bw);
+                    }
+                }
+                if dc.set(20, 1) {
+                    c.device.cmd_set_line_width(cmd, 1.0);
+                }
+                let bc = [reg(0x28414), reg(0x28418), reg(0x2841C), reg(0x28420)];
+                if dc.blend != Some(bc) {
+                    c.device.cmd_set_blend_constants(cmd, &[f32r(bc[0]), f32r(bc[1]), f32r(bc[2]), f32r(bc[3])]);
+                    dc.blend = Some(bc);
                 }
             }
-            for (slot, face, v) in [
-                (14, vk::StencilFaceFlags::FRONT, (refm >> 8) & 0xFF),
-                (15, vk::StencilFaceFlags::BACK, (rb >> 8) & 0xFF),
-            ] {
-                if dc.set(slot, v as u64) {
-                    c.device.cmd_set_stencil_compare_mask(cmd, face, v);
-                }
-            }
-            for (slot, face, v) in [
-                (16, vk::StencilFaceFlags::FRONT, (refm >> 16) & 0xFF),
-                (17, vk::StencilFaceFlags::BACK, (rb >> 16) & 0xFF),
-            ] {
-                if dc.set(slot, v as u64) {
-                    c.device.cmd_set_stencil_write_mask(cmd, face, v);
-                }
-            }
-            // PA_SU_SC_MODE_CNTL.POLY_OFFSET_FRONT/BACK_ENABLE with
-            // PA_SU_POLY_OFFSET_* (scale in 1/16 units).
-            let poly_offset = mode & (3 << 11) != 0;
-            let bias_on = poly_offset || eq_bias.is_some();
-            if dc.set(18, bias_on as u64) {
-                c.device.cmd_set_depth_bias_enable(cmd, bias_on);
-            }
-            let bias = if let (Some(units), false) = (eq_bias, poly_offset) {
-                Some((if reversed { units } else { -units }, 0.0, 0.0))
-            } else if poly_offset {
-                let (sr, or) = if mode & (1 << 11) != 0 { (0x28B80, 0x28B84) } else { (0x28B88, 0x28B8C) };
-                Some((f32r(reg(or)), f32r(reg(0x28B7C)), f32r(reg(sr)) / 16.0))
-            } else {
-                None
-            };
-            if let Some((k, clamp, slope)) = bias {
-                let bw = [k.to_bits(), clamp.to_bits(), slope.to_bits()];
-                if dc.bias != Some(bw) {
-                    c.device.cmd_set_depth_bias(cmd, k, clamp, slope);
-                    dc.bias = Some(bw);
-                }
-            }
-            if dc.set(20, 1) {
-                c.device.cmd_set_line_width(cmd, 1.0);
-            }
-            let bc = [reg(0x28414), reg(0x28418), reg(0x2841C), reg(0x28420)];
-            if dc.blend != Some(bc) {
-                c.device.cmd_set_blend_constants(cmd, &[f32r(bc[0]), f32r(bc[1]), f32r(bc[2]), f32r(bc[3])]);
-                dc.blend = Some(bc);
+            if dyn_before.is_some_and(|b| b != dc.sig()) {
+                delta_mismatch(4, vs.addr, ps_addr);
             }
             let base_vertex = a.base_vertex.unwrap_or(reg(0x28408) as i32);
             lap.mark(15);
@@ -1758,6 +2093,28 @@ impl Exec {
             }
             _ => None,
         };
+        // The stages' images and samplers for a buffer-delta draw after this
+        // one: when both came from the binding memos for the same generations.
+        if has_sig {
+            let g = match notes {
+                [Some((g0, true)), Some((g1, true))] if g0 == g1 => Some(g0),
+                [Some((g0, true)), None] if ps.is_none() => Some(g0),
+                _ => None,
+            };
+            // (Not again when every stage took them over: they are those.)
+            if g.is_some() && reused < bounds.len() {
+                for (k, b) in bounds.iter().enumerate() {
+                    let s = &mut self.delta.bind[k];
+                    s.imgs.clear();
+                    s.imgs.extend_from_slice(&b.imgs);
+                    s.images.clear();
+                    s.images.extend_from_slice(&b.images);
+                    s.stencil_views.clear();
+                    s.stencil_views.extend_from_slice(&b.stencil_views);
+                }
+            }
+            self.delta.bind_gens = g;
+        }
         for b in bounds.drain(..) {
             for &(base, n) in &b.writes {
                 crate::gpu::track::gpu_write(base, n);
@@ -1779,6 +2136,23 @@ impl Exec {
         // (After everything this draw recorded.)
         self.repeat = repeat.map(|r| Repeat { uses: self.cmd_uses.get(), ..r });
         self.last_draw_end = (self.batch_count, self.cmd_uses.get());
+        // What a buffer-delta draw after this one takes over.
+        if expect.is_some() {
+            DELTA_VERIFY[0].fetch_add(1, Ordering::Relaxed);
+        }
+        if delta.is_some() {
+            self.delta.at = Some(self.last_draw_end);
+        } else if has_sig && !fixed.writes && !fixed.hazard && !clear_z && !clear_s && !touches {
+            let d = &mut self.delta;
+            d.textures.clear();
+            d.textures.extend(self.tex_scratch.iter().map(|x| x.0));
+            d.used.clear();
+            d.used.extend_from_slice(&self.keys_scratch);
+            std::mem::swap(&mut d.images, &mut sig);
+            (d.keys, d.index, d.fixed) = (keys, a.index.is_some(), Some(fixed));
+            d.at = Some(self.last_draw_end);
+        }
+        self.delta_sig = sig;
         if let Some(r) = self.draw_run.as_mut().filter(|r| r.batch == self.batch_count && r.fresh) {
             r.uses = self.cmd_uses.get();
             r.fresh = false;
@@ -2341,7 +2715,7 @@ impl Exec {
 
 /// `profile reset`: the draw statistics of this module.
 pub(super) fn reset_draw_stats() {
-    for c in DRAW_DIFFS.iter().chain(CONSEC_DIFFS.iter()).chain(BATCH_CANDS.iter()).chain(PREP_REPEAT.iter()) {
+    for c in DRAW_DIFFS.iter().chain(CONSEC_DIFFS.iter()).chain(BATCH_CANDS.iter()).chain(PREP_REPEAT.iter()).chain(DELTA.iter()).chain(DELTA_VERIFY.iter()).chain(DELTA_BIND.iter()) {
         c.store(0, Ordering::Relaxed);
     }
 }

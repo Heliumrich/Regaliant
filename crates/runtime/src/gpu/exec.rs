@@ -3992,6 +3992,12 @@ fn gather_pipe() -> Result<&'static MergePipe, String> {
 /// (16 per texel).
 /// Appended to `out` (a reused vector: no allocation per command once it
 /// has grown).
+/// What the binding memos' sampled views hold for (`images::view_hit`):
+/// the image cache's lookups, the write tracker's generation, the frame.
+fn bind_gens() -> [u64; 3] {
+    [super::images::LOOKUP_GEN.load(Ordering::Acquire), super::track::GEN.load(Ordering::Acquire), super::FRAMES.load(Ordering::Relaxed)]
+}
+
 fn texture_ranges_into(p: &Prepared, out: &mut Vec<((u64, u64), super::desc::Tsharp)>) {
     let coarse = |t: &super::desc::Tsharp| ((t.base, texture_bytes(t)), *t);
     for r in p.resources.iter() {
@@ -7435,7 +7441,7 @@ pub fn laps_report() -> String {
     if !laps() || profiling() {
         return String::new();
     }
-    draw_steps_line() + &shaders::prep_parts_line() + &bind_steps_line() + &pre_steps_line() + &prog_census_lines()
+    draw_steps_line() + &draw::delta_line() + &shaders::prep_parts_line() + &bind_steps_line() + &pre_steps_line() + &prog_census_lines()
 }
 
 /// Shaders by total GPU time.
@@ -7505,6 +7511,7 @@ pub fn shader_profile() -> String {
     s.push_str(&shaders::prep_parts_line());
     s.push_str(&super::cp::draw_state_line());
     s.push_str(&draw::draw_diff_line());
+    s.push_str(&draw::delta_line());
     s.push_str(&draw::prep_repeat_line());
     s.push_str(&bind_steps_line());
     s.push_str(&pre_steps_line());
@@ -7745,6 +7752,21 @@ pub struct Exec {
     /// write generations are `clean_tag` (`sync_for_reads`).
     clean_pages: Vec<u64>,
     clean_tag: [u64; 3],
+    /// Texture ranges no pending or in-flight write overlapped when last
+    /// checked, valid while the write generations are `tex_clean_tag`
+    /// (`sync_textures`, as `clean_pages` for stage reads).
+    tex_clean: super::fx::Set<(u64, u64)>,
+    tex_clean_tag: [u64; 2],
+    /// The last full draw a buffer-delta draw can take over, and the image
+    /// signature vector reused (`draw::DrawDelta`).
+    delta: draw::DrawDelta,
+    delta_sig: Vec<(u32, [u32; 8])>,
+    /// `bind_stage` binds that stage's images and samplers as the last
+    /// draw did (a buffer-delta draw's, `DrawDelta::bind_into`); and what
+    /// its image part found: the generations it looked up with and whether
+    /// every one came from the binding memos.
+    bind_reuse: Option<usize>,
+    bind_note: Option<([u64; 3], bool)>,
     /// The reads `sync_for_reads` still checks (the vector reused).
     dirty_reads: Vec<(u64, u64)>,
     /// The written ranges (all, sized) this executor's last dispatch noted in
@@ -8548,6 +8570,12 @@ impl Exec {
                 ops: [0; OPS],
                 clean_pages: vec![u64::MAX; CLEAN_SLOTS],
                 clean_tag: [u64::MAX; 3],
+                tex_clean: super::fx::Set::default(),
+                tex_clean_tag: [u64::MAX; 2],
+                delta: Default::default(),
+                delta_sig: Vec::new(),
+                bind_reuse: None,
+                bind_note: None,
                 dirty_reads: Vec::new(),
                 last_notes: (Vec::new(), Vec::new(), [u64::MAX; 4]),
                 draw_bounds: Vec::new(),
@@ -11437,10 +11465,32 @@ impl Exec {
             let coarse: Vec<(u64, u64)> = textures.iter().map(|x| x.0).collect();
             return self.sync_for(&coarse, why);
         }
+        // Ranges found unwritten stay so until this executor's writes or any
+        // queue's in-flight writes grow (`own_gen`, the in-flight notes):
+        // consecutive commands mostly sample the same textures, and each
+        // check of the in-flight writes takes their log's lock.
+        let tag = [self.own_gen, INFLIGHT.notes.load(Ordering::Acquire)];
+        if tag != self.tex_clean_tag {
+            self.tex_clean.clear();
+            self.tex_clean_tag = tag;
+        }
+        if textures.iter().all(|(r, _)| self.tex_clean.contains(r)) {
+            return false;
+        }
         let done = done_seq();
         self.inflight.prune(done);
         let written = |s: &Self, r: (u64, u64)| s.pending.overlaps(r.0, r.1) || s.inflight.latest(&[r], done).is_some() || INFLIGHT.latest(&[r]).is_some();
-        let hit: Vec<&super::desc::Tsharp> = textures.iter().filter(|(r, _)| written(self, *r)).map(|(_, t)| t).collect();
+        let mut hit: Vec<&super::desc::Tsharp> = Vec::new();
+        for (r, t) in textures {
+            if self.tex_clean.contains(r) {
+                continue;
+            }
+            if written(self, *r) {
+                hit.push(t);
+            } else if self.tex_clean.len() < 4096 {
+                self.tex_clean.insert(*r);
+            }
+        }
         if hit.is_empty() {
             return false;
         }
@@ -13119,6 +13169,8 @@ impl Exec {
         // (Its placements counted by where the stage was made, for
         // `DS_FE2_CALLERS`.)
         let _source = super::fe2::StageSource::set(p.ahead);
+        self.bind_note = None;
+        let reuse = self.bind_reuse.take();
         // What the preparation found (its own block, shared with its cache
         // entry), apart from the SGPR data written below.
         let found = p.found.clone();
@@ -13525,6 +13577,13 @@ impl Exec {
             }
         }
         let frame = super::FRAMES.load(Ordering::Relaxed);
+        // A buffer-delta draw's: the last draw's (`draw::DrawDelta`).
+        if let Some(k) = reuse {
+            self.delta.bind_into(k, &mut bound);
+            self.bind_note = self.delta.bind_gens().map(|g| (g, true));
+            return Ok(bound);
+        }
+        let gens = bind_gens();
         // Sampled images and samplers from this thread's memos when every
         // one of them is there (no lock); else one image-cache lock for all.
         // Into the recycled vectors (only images and samplers fill them).
@@ -13564,6 +13623,7 @@ impl Exec {
             }
             all
         };
+        self.bind_note = Some((gens, memo));
         if memo {
             return Ok(bound);
         }
@@ -13767,6 +13827,8 @@ impl Exec {
 
     /// Executes a dispatch of `groups` thread groups with the compute state of `cp`.
     pub fn dispatch(&mut self, cp: &Cp, groups: [u32; 3], initiator: u32) {
+        // (No buffer-delta draw after a dispatch.)
+        self.delta.at = None;
         if DEVICE_LOST.load(Ordering::Relaxed) {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             return;
@@ -14939,6 +15001,7 @@ pub fn status() -> String {
         + &crate::titlefix::status()
         + &super::cp::draw_state_line()
         + &draw::draw_diff_line()
+        + &draw::delta_line()
         + &draw::prep_repeat_line()
         + &draw::batch_line()
         + &super::xwait::status()
