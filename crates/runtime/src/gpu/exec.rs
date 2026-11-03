@@ -4013,7 +4013,9 @@ fn note_large_binding(queue: &str, p: &Prepared, i: usize, base: u64, size: u64,
         _ => String::new(),
     };
     let map = crate::mem::readable_span(base).map_or("unmapped".to_string(), |(s, e)| format!("{s:#x}..{e:#x}"));
-    crate::info!("gpu[{queue}]: large binding: {:?} shader {:#x} resource {i} {base:#x}+{size:#x} ({what}; {}), written {}, readable run {map}", p.stage, p.addr, if sized_by { "sized by its descriptor" } else { "to its mapping's end" }, p.tr.plan.resources[i].written);
+    // (Each program once, into the run's shaders/, for `rdnadis`.)
+    super::capture::save_program(p.addr);
+    crate::info!("gpu[{queue}]: large binding: {:?} shader {:#x} (code {:#x}) resource {i} {base:#x}+{size:#x} ({what}; {}), written {}, readable run {map}", p.stage, p.addr, p.code_hash, if sized_by { "sized by its descriptor" } else { "to its mapping's end" }, p.tr.plan.resources[i].written);
 }
 
 /// What the binding memos' sampled views hold for (`images::view_hit`):
