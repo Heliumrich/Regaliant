@@ -546,8 +546,8 @@ pub enum Resolved {
 }
 
 /// What preparing a stage found in guest memory, shared by the
-/// preparation's copies (one allocation; a repeated preparation from the
-/// cache, `prep_cache`, costs no deep copy). `Prepared` derefs to it.
+/// preparation's copies (one allocation: a copy costs no deep copy).
+/// `Prepared` derefs to it.
 /// The program and its translation are held here too: the recording
 /// threads share their reference counts, so a copy of a preparation
 /// touches only this block's (contended clones cost up to ~100 ns each on
@@ -1113,9 +1113,8 @@ fn prep_lap(part: usize) {
     }
 }
 
-/// Ends a timed preparation (`hit`: the stage cache served it); the sums go
-/// to `PREP_PARTS` every 512.
-fn prep_lap_end(hit: bool) {
+/// Ends a timed preparation; the sums go to `PREP_PARTS` every 512.
+fn prep_lap_end() {
     if prep_laps_on() {
         PREP_LAPS.with(|l| {
             let mut l = l.borrow_mut();
@@ -1125,7 +1124,6 @@ fn prep_lap_end(hit: bool) {
             l.on = false;
             let k = l.kind;
             l.acc[k][PREP_PARTS_N] += 1;
-            l.acc[k][PREP_PARTS_N + 1] += hit as u64;
             l.n += 1;
             if l.n >= 512 {
                 l.n = 0;
@@ -1169,16 +1167,16 @@ pub fn prep_parts_line() -> String {
     let mut s = String::new();
     for (k, name) in ["vertex", "pixel", "compute"].iter().enumerate() {
         let v: Vec<u64> = PREP_PARTS[k].iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
-        let (n, hits) = (v[PREP_PARTS_N], v[PREP_PARTS_N + 1]);
+        let n = v[PREP_PARTS_N];
         if n == 0 {
             continue;
         }
         let ns = |c: u64| c as f64 * 1e9 / hz / n as f64;
         let total: u64 = v[..PREP_PARTS_N].iter().sum();
         let parts: Vec<String> = PREP_PART_NAMES.iter().zip(v.iter()).map(|(p, &c)| format!("{p} {:.0}", ns(c))).collect();
-        let full = (n - hits).max(1) as f64;
+        let full = n.max(1) as f64;
         s.push_str(&format!(
-            "    stage preparation by part, {name} ({n} preparations, {hits} from the stage cache; {:.0} ns each): {}; a full one read {:.1} words in {:.1} ranges, {:.1} pointers\n",
+            "    stage preparation by part, {name} ({n} preparations; {:.0} ns each): {}; one read {:.1} words in {:.1} ranges, {:.1} pointers\n",
             ns(total),
             parts.join(", "),
             v[PREP_PARTS_N + 2] as f64 / full,
@@ -2054,7 +2052,6 @@ pub fn repeats_line() -> String {
             )
         })
         .collect();
-    let (h, m) = (PREP_HITS.load(Ordering::Relaxed), PREP_MISSES.load(Ordering::Relaxed));
     let cross: Vec<String> = (0..4)
         .map(|s| {
             let c = &CROSS_FRAME[s];
@@ -2063,19 +2060,10 @@ pub fn repeats_line() -> String {
         })
         .collect();
     format!(
-        "    preparations repeating the previous one: {}; served from the cache {h} of {}\n    preparations identical to one of the previous frame (inputs and bytes read): {}\n",
+        "    preparations repeating the previous one: {}\n    preparations identical to one of the previous frame (inputs and bytes read): {}\n",
         parts.join(", "),
-        h + m,
         cross.join(", ")
     )
-}
-
-/// Stage preparations served from the cache since `profile reset` (the
-/// sampler-only report, which has no `repeats_line`).
-pub fn prep_cache_line() -> String {
-    use std::sync::atomic::Ordering::Relaxed;
-    let (h, m) = (PREP_HITS.load(Relaxed), PREP_MISSES.load(Relaxed));
-    format!("    stage preparations: served from the cache {h} of {} (prep_cache {})\n", h + m, super::tune::prep_cache_mode())
 }
 
 pub fn reset_repeats() {
@@ -2094,39 +2082,9 @@ pub fn reset_repeats() {
             c.store(0, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    PREP_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
-    PREP_MISSES.store(0, std::sync::atomic::Ordering::Relaxed);
 }
-
-/// A stage's last preparation on this thread: reused for the next one with
-/// the same program, register state and the user-data dwords its descriptors
-/// and loads depend on, when the guest words it read are unchanged. More than
-/// half of the draws' vertex and pixel preparations repeat that way (run
-/// 20261011-091944); dispatches do not.
-struct PrepEntry {
-    /// Its program and plan, besides the key (a hash).
-    addr: u64,
-    plan_key: u64,
-    /// Validated by the words it read (`words_unchanged`).
-    prepared: Prepared,
-}
-
-/// Entries kept per stage and thread with `tune prep_cache 2` (cleared when
-/// full): a frame's distinct preparations on one recording thread.
-const PREP_CACHE_MAX: usize = 2048;
 
 thread_local! {
-    /// Vertex and pixel preparations by key (`prepare`): the latest only
-    /// (`tune prep_cache 1`) or up to PREP_CACHE_MAX (2): most preparations
-    /// that miss the latest repeat one of the previous frame (pixel 57%,
-    /// vertex 24%; run 20261013-104455). Live, 2 serves 59% instead of 43%
-    /// yet costs ~6% more CPU per command (inserts, re-validations after
-    /// mapping changes, a colder working set; run 20261013-115322).
-    static PREP_CACHE: std::cell::RefCell<[super::fx::Map<u64, PrepEntry>; 2]> = std::cell::RefCell::new([super::fx::Map::default(), super::fx::Map::default()]);
-    /// The latest preparation per stage (`tune prep_cache 1`; kept apart so
-    /// that alternating the modes in a replay A/B leaves the map as it was).
-    static PREP_LATEST: std::cell::RefCell<[Option<(u64, PrepEntry)>; 2]> = const { std::cell::RefCell::new([None, None]) };
-    static LOCAL_DEPS: std::cell::RefCell<super::fx::Map<u64, u32>> = std::cell::RefCell::new(super::fx::Map::default());
     /// `format_resources` per plan.
     static LOCAL_FORMATS: std::cell::RefCell<super::fx::Map<u64, u64>> = std::cell::RefCell::new(super::fx::Map::default());
     /// `format_store_resources` per plan.
@@ -2657,120 +2615,6 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
     spec.lockstep_off = no_lockstep_program(code_hash);
     spec
 }
-/// Preparations served from / missing PREP_CACHE (diagnostics).
-pub static PREP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static PREP_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Cache hits compared with a full preparation (DS_PREP_CHECK=1) and those
-/// that differed.
-static PREP_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PREP_DIFFERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Differences explained by guest writes during the check.
-static PREP_RACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// DS_PREP_CHECK=1: every PREP_CACHE hit is prepared in full as well and
-/// the two are compared (a correctness check of the cache's key and
-/// validation; the full preparation is used).
-fn prep_check() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_PREP_CHECK").ok().as_deref() == Some("1"))
-}
-
-/// Compares a cache hit with the full preparation (`prep_check`).
-fn prep_compare(hit: &Prepared, full: &Prepared) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let mut diff = Vec::new();
-    if hit.addr != full.addr {
-        diff.push("address");
-    }
-    if !Arc::ptr_eq(&hit.tr.0, &full.tr.0) && hit.tr.spec != full.tr.spec {
-        diff.push("translation");
-    }
-    if hit.resources != full.resources {
-        diff.push("resources");
-    }
-    if hit.res_addrs != full.res_addrs {
-        diff.push("descriptor addresses");
-    }
-    if hit.sgpr_data != full.sgpr_data {
-        diff.push("SGPR data");
-    }
-    if hit.user != full.user {
-        diff.push("user data");
-    }
-    if hit.reads != full.reads || hit.words != full.words || hit.unread != full.unread {
-        diff.push("reads");
-    }
-    if hit.data_loads != full.data_loads {
-        diff.push("data loads");
-    }
-    if (hit.cmp_images, hit.cmp_depth) != (full.cmp_images, full.cmp_depth) {
-        diff.push("depth views");
-    }
-    let n = PREP_CHECKED.fetch_add(1, Relaxed) + 1;
-    if !diff.is_empty() {
-        if !words_unchanged(hit) {
-            // The title wrote memory the cached preparation read between the
-            // cache's check and the full preparation: a full preparation a
-            // moment earlier would have matched (not a cache error).
-            let r = PREP_RACED.fetch_add(1, Relaxed) + 1;
-            if r <= 5 {
-                crate::info!("prep check: {:?} shader {:#x}: memory it read changed during the check (differs in {}; not counted)", full.stage, full.addr, diff.join(", "));
-            }
-        } else {
-            let d = PREP_DIFFERED.fetch_add(1, Relaxed) + 1;
-            if d <= 20 {
-                let mut detail = Vec::new();
-                if let Some(i) = hit.reads.iter().zip(full.reads.iter()).position(|(a, b)| a != b) {
-                    detail.push(format!("read {i}: cached {:x?}, full {:x?}", hit.reads[i], full.reads[i]));
-                } else if hit.reads.len() != full.reads.len() {
-                    detail.push(format!("reads: cached {}, full {} ranges (full's next {:x?})", hit.reads.len(), full.reads.len(), full.reads.get(hit.reads.len())));
-                }
-                if let Some(i) = hit.words.iter().zip(full.words.iter()).position(|(a, b)| a != b) {
-                    detail.push(format!("word {i}: cached {:#x}, full {:#x}", hit.words[i], full.words[i]));
-                }
-                if hit.unread != full.unread {
-                    detail.push(format!("unread: cached {:x?}, full {:x?}", &hit.unread[..hit.unread.len().min(4)], &full.unread[..full.unread.len().min(4)]));
-                }
-                if let Some(i) = hit.sgpr_data.iter().zip(full.sgpr_data.iter()).position(|(a, b)| a != b) {
-                    detail.push(format!("SGPR data {i}: cached {:#x}, full {:#x}", hit.sgpr_data[i], full.sgpr_data[i]));
-                }
-                crate::warn!("prep check: {:?} shader {:#x}: the cached preparation differs from a full one in {} ({})", full.stage, full.addr, diff.join(", "), detail.join("; "));
-            }
-        }
-    }
-    if n.is_power_of_two() && n >= 1024 {
-        crate::info!("prep check: {n} cache hits compared with full preparations, {} differed, {} changed during the check", PREP_DIFFERED.load(Relaxed), PREP_RACED.load(Relaxed));
-    }
-}
-
-/// A cached preparation for a call with user data `user`, if the guest words
-/// it read and its depth-view decisions (part of its translation) still hold.
-fn reuse(e: &mut PrepEntry, user: &[u32]) -> Option<Prepared> {
-    let map_gen = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
-    let images_gen = super::images::GPU_IMAGES_GEN.load(std::sync::atomic::Ordering::Acquire);
-    if !words_unchanged(&e.prepared) || !depth_views_hold(&e.prepared) {
-        return None;
-    }
-    // Readable at this mapping, the same depth views at these images: later
-    // reuses skip those checks.
-    e.prepared.map_gen = map_gen;
-    e.prepared.images_gen = images_gen;
-    let mut p = e.prepared.clone();
-    for (i, w) in p.sgpr_data.iter_mut().enumerate().take(translate::SGPR_DATA_USER as usize) {
-        *w = user.get(i).copied().unwrap_or(0);
-    }
-    p.user = UserData::new(user);
-    Some(p)
-}
-
-fn stage_slot(s: Stage) -> usize {
-    match s {
-        Stage::Vertex => 0,
-        Stage::Fragment => 1,
-        _ => 2,
-    }
-}
-
 fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: &[u32], spec: &mut Spec) -> Result<Prepared, String> {
     // Diagnostics (DS_PROFILE_GPU with DS_PROFILE_REPEATS=1: hashing every
     // word read and a global set per preparation inflate the prepare times
@@ -2814,68 +2658,7 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         return Err(format!("{:?} shader {addr:#x}: {}", spec.stage, plan.errors.join("; ")));
     }
     prep_lap(3);
-    // The cached preparation of this stage, if its inputs and the words it
-    // read are the same.
-    let slot = stage_slot(spec.stage);
-    // Compute preparations do not repeat (the per-item culls differ in the
-    // user data their descriptors depend on).
-    let cacheable = slot != 2 && super::tune::prep_cache();
-    let prep_key = if !cacheable {
-        0
-    } else {
-        let deps = LOCAL_DEPS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| user_deps(&plan)));
-        let mut h = super::fx::FxHasher::default();
-        h.write_u64(addr);
-        h.write_u64(plan_key);
-        for (i, &w) in user.iter().enumerate().take(32) {
-            if deps & (1 << i) != 0 {
-                h.write_u32(w);
-            }
-        }
-        spec.hash(&mut h);
-        // The depth-view decisions, the one image-cache input, are checked
-        // on reuse (`depth_views_hold`): entries outlive image lookups
-        // changing as textures stream.
-        h.write_u8(super::tune::cmp_emulate() as u8);
-        h.finish()
-    };
-    let same = |e: &PrepEntry| e.addr == addr && e.plan_key == plan_key;
-    let hit = if !cacheable {
-        None
-    } else if super::tune::prep_cache_mode() >= 2 {
-        PREP_CACHE.with(|c| c.borrow_mut()[slot].get_mut(&prep_key).filter(|e| same(e)).and_then(|e| reuse(e, user)))
-    } else {
-        PREP_LATEST.with(|l| l.borrow_mut()[slot].as_mut().filter(|(k, e)| *k == prep_key && same(e)).and_then(|(_, e)| reuse(e, user)))
-    };
-    let mut checked_hit = None;
-    let hit = hit.and_then(|p| {
-        PREP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if prep_check() {
-            checked_hit = Some(p);
-            return None;
-        }
-        Some(p)
-    });
     prep_lap(4);
-    if let Some(p) = hit {
-        prep_lap_end(true);
-        // Texture-streaming statistics as a full preparation notes them.
-        for r in p.resources.iter() {
-            match r {
-                Resolved::Image(t) => super::lodstats::note(&t.raw),
-                Resolved::ImageTable(e) => {
-                    for t in e.iter().flatten() {
-                        super::lodstats::note(&t.raw);
-                    }
-                }
-                _ => {}
-            }
-        }
-        return Ok(p);
-    }
-    if cacheable && checked_hit.is_none() {
-        PREP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
     let map_gen = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
     let images_gen = super::images::GPU_IMAGES_GEN.load(std::sync::atomic::Ordering::Acquire);
     let sizes = READ_HINTS.with(|h| h.borrow().get(&plan_key).copied().unwrap_or([0; 3]));
@@ -3145,24 +2928,6 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         code_hash,
         ahead: 1,
     };
-    if let Some(h) = &checked_hit {
-        prep_compare(h, &prepared);
-    }
-    if cacheable {
-        // The words it read are the cache's check (no second read).
-        let e = PrepEntry { addr, plan_key, prepared: prepared.clone() };
-        if super::tune::prep_cache_mode() >= 2 {
-            PREP_CACHE.with(|c| {
-                let m = &mut c.borrow_mut()[slot];
-                if m.len() >= PREP_CACHE_MAX {
-                    m.clear();
-                }
-                m.insert(prep_key, e);
-            });
-        } else {
-            PREP_LATEST.with(|l| l.borrow_mut()[slot] = Some((prep_key, e)));
-        }
-    }
     if let Some(k) = repeat_key {
         let tr = &prepared.tr;
         let bytes = note_repeat(spec.stage, k, &prepared.reads);
@@ -3179,6 +2944,6 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         note_repeat_deps(spec.stage, h.finish(), bytes);
     }
     prep_lap(9);
-    prep_lap_end(false);
+    prep_lap_end();
     Ok(prepared)
 }
