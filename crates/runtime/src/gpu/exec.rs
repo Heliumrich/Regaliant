@@ -2643,7 +2643,7 @@ fn batch_miss_line() -> String {
     sites.sort_by(|a, b| b.1.cmp(&a.1));
     let sites: Vec<String> = sites.iter().take(6).map(|(l, n)| format!("exec.rs:{l} {n}")).collect();
     format!(
-        "    batched programs' commands not joined to the open dispatch: indirect {}, not a plain 1-D direct dispatch {}, none open {}, another batch {}, commands recorded since {}, another pipeline {}, table full {}, other descriptors {}; by program: {}; recorded since by: {}; dispatches' new shadows filled in the prologue {}, before the dispatch {} (`shadow_pre`; off {}, deferred {}, shared copies {}, written earlier in the batch {}, by the main CP's open batch {}, by a closed batch {})\n",
+        "    batched programs' commands not joined to the open dispatch: indirect {}, not a plain 1-D direct dispatch {}, none open {}, another batch {}, commands recorded since {}, another pipeline {}, table full {}, other descriptors {}; by program: {}; recorded since by: {}; dispatches' new shadows filled in the prologue {}, before the dispatch {} (`shadow_pre`; off {}, deferred {}, shared copies {}, written earlier in the batch {}, by a closed batch {})\n",
         m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
         progs.join(", "),
         sites.join(", "),
@@ -2653,7 +2653,6 @@ fn batch_miss_line() -> String {
         SHADOWS_PRE[3].load(Ordering::Relaxed),
         SHADOWS_PRE[4].load(Ordering::Relaxed),
         SHADOWS_PRE[5].load(Ordering::Relaxed),
-        SHADOWS_PRE[6].load(Ordering::Relaxed),
         SHADOWS_PRE[7].load(Ordering::Relaxed)
     )
 }
@@ -4759,7 +4758,7 @@ static HELD_OWN_LOGGED: AtomicU64 = AtomicU64::new(0);
 /// Stretches past label waits stopped because a preparation read what the
 /// stretch's own held batches write, by (the reading stages, the first range
 /// read that overlaps, which held writes: 0 the recording batch's, 1 a closed
-/// batch's, 2 the main command processor's): count (`held_own_line`).
+/// batch's): count (`held_own_line`).
 static HELD_OWN: Mutex<Option<HashMap<(u64, u64, u64, u64, u8), u64>>> = Mutex::new(None);
 
 /// One status line: the commonest reads of held work's own writes that
@@ -4773,7 +4772,7 @@ fn held_own_line() -> String {
     let top: Vec<String> = v
         .iter()
         .take(10)
-        .map(|((s0, s1, a, n, by), c)| format!("{c}x stages {s0:#x} {s1:#x} read {a:#x}+{n:#x} ({})", ["the recording batch's writes", "a closed batch's", "the main CP's"][*by as usize]))
+        .map(|((s0, s1, a, n, by), c)| format!("{c}x stages {s0:#x} {s1:#x} read {a:#x}+{n:#x} ({})", ["the recording batch's writes", "a closed batch's"][*by as usize]))
         .collect();
     format!("    stretches past label waits stopped by reads of their own held writes: {total} ({} kinds): {}
 ", m.len(), top.join("; "))
@@ -4860,12 +4859,6 @@ pub(super) fn journal_writers(a: u64, n: u64) -> Vec<String> {
 
 /// CP reads that waited for another queue's batch (diagnostics).
 pub static FOREIGN_WAITS: AtomicU64 = AtomicU64::new(0);
-/// Reads by parallel workers of what the main command processor's batch,
-/// unsubmitted when the run was planned, writes (`tune par_main_writes`).
-pub static MAIN_WRITE_READS: AtomicU64 = AtomicU64::new(0);
-/// Of those (`tune par_main_writes 3`): [reads that found the batch not yet
-/// submitted and waited for it, ns waited].
-pub static MAIN_SUBMIT_WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// A deferred CP copy (performed with its batch's actions) reads `src`:
 /// later GPU work binding it (it may overwrite it) is submitted after the
@@ -7750,11 +7743,6 @@ pub struct Exec {
     held_over: HashSet<super::images::ImageKey>,
     /// The images its commands used.
     held_keys: HashSet<super::images::ImageKey>,
-    /// A worker's: what the main command processor's batch, not yet
-    /// submitted when the run was planned, writes (`tune par_main_writes`),
-    /// and (mode 3) whether it has been submitted since.
-    main_writes: Option<std::sync::Arc<super::ranges::Ranges>>,
-    main_submitted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) stopped: bool,
     /// Why (statistics), and the reason a caller gives a flush that follows.
     pub(crate) stop_why: &'static str,
@@ -8257,8 +8245,8 @@ pub static BATCHED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Dispatches' new VRAM shadows filled in the batch's prologue
 /// (`tune shadow_pre`) and before the dispatch itself: [prologue, in place,
 /// then why in place: off (or no merging), a deferred executor's, a shared
-/// copy, a window written earlier in the batch, by the main command
-/// processor's unsubmitted batch, by a closed batch not submitted yet].
+/// copy, a window written earlier in the batch, (unused), by a closed
+/// batch not submitted yet].
 pub static SHADOWS_PRE: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// Why a batched program's command opened a new dispatch instead of joining
@@ -8512,8 +8500,6 @@ impl Exec {
                 held_clears: HashMap::new(),
                 held_over: HashSet::new(),
                 held_keys: HashSet::new(),
-                main_writes: None,
-                main_submitted: None,
                 stopped: false,
                 stop_why: "",
                 flush_why: "",
@@ -11521,39 +11507,6 @@ impl Exec {
         if reads.is_empty() {
             return None;
         }
-        if let Some(m) = &self.main_writes {
-            if !m.is_empty() && m.overlaps_any(reads) {
-                if MAIN_WRITE_READS.fetch_add(1, Ordering::Relaxed) % 20000 == 0 {
-                    let hits: Vec<String> = reads.iter().flat_map(|&(a, n)| m.intersect(a, n).into_iter().take(3).map(move |(b, k)| format!("read {a:#x}+{n:#x} / written {b:#x}+{k:#x}"))).take(4).collect();
-                    crate::info!("gpu[{}]: a worker reads the main command processor's unsubmitted writes ({} ranges): {} (shaders {:#x} {:#x})", self.name, m.len(), hits.join("; "), self.sync_readers[0], self.sync_readers[1]);
-                }
-                if super::tune::par_main_writes() == 1 {
-                    self.stop("reads the main command processor's unsubmitted writes");
-                    return Some(std::time::Instant::now());
-                }
-                // Mode 3: the main command processor submits that batch right
-                // after handing the run over; once it has, its writes are
-                // waited for like any submitted work (below).
-                if let Some(f) = self.main_submitted.clone() {
-                    if !f.load(Ordering::Acquire) {
-                        let t = std::time::Instant::now();
-                        let mut k = 0u32;
-                        while !f.load(Ordering::Acquire) {
-                            k += 1;
-                            if k < 4096 {
-                                std::hint::spin_loop();
-                            } else {
-                                std::thread::yield_now();
-                            }
-                        }
-                        MAIN_SUBMIT_WAITS[0].fetch_add(1, Ordering::Relaxed);
-                        MAIN_SUBMIT_WAITS[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    }
-                    self.main_writes = None;
-                    self.main_submitted = None;
-                }
-            }
-        }
         let mut waited: Option<std::time::Instant> = None;
         let prof = profiling();
         let t0 = prof.then(std::time::Instant::now);
@@ -11623,7 +11576,7 @@ impl Exec {
         lap(0, &mut t);
         if self.overlaps_pending(reads) {
             waited.get_or_insert_with(std::time::Instant::now);
-            if self.past_grow && !(self.pending.overlaps_any(reads) || self.closed_overlap(reads) || self.main_pending(reads)) {
+            if self.past_grow && !(self.pending.overlaps_any(reads) || self.closed_overlap(reads)) {
                 // Held past a label wait, and only batches of its own
                 // submitted before write them: waited for as another queue's
                 // would be.
@@ -11639,8 +11592,6 @@ impl Exec {
                             Some((r, 0u8))
                         } else if self.closed_overlap(&[r]) {
                             Some((r, 1))
-                        } else if self.main_pending(&[r]) {
-                            Some((r, 2))
                         } else {
                             None
                         }
@@ -11728,26 +11679,19 @@ impl Exec {
 
     /// `overlaps_pending` without pruning (a shared borrow).
     fn overlaps_pending_ro(&self, reads: &[(u64, u64)]) -> bool {
-        self.pending.overlaps_any(reads) || self.inflight.latest(reads, done_seq()).is_some() || self.main_pending(reads) || self.closed_overlap(reads)
+        self.pending.overlaps_any(reads) || self.inflight.latest(reads, done_seq()).is_some() || self.closed_overlap(reads)
     }
 
     fn overlaps_pending(&mut self, reads: &[(u64, u64)]) -> bool {
         let done = done_seq();
         self.inflight.prune(done);
-        self.pending.overlaps_any(reads) || self.inflight.latest(reads, done).is_some() || self.main_pending(reads) || self.closed_overlap(reads)
+        self.pending.overlaps_any(reads) || self.inflight.latest(reads, done).is_some() || self.closed_overlap(reads)
     }
 
     /// Whether a closed batch not yet submitted (a deferred executor's)
     /// writes into `reads`.
     fn closed_overlap(&self, reads: &[(u64, u64)]) -> bool {
         !self.closed.is_empty() && self.closed.iter().any(|b| b.writes.overlaps_any(reads))
-    }
-
-    /// A worker's: whether `reads` overlap what the main command processor's
-    /// batch writes while it is not submitted yet (`tune par_main_writes 3`;
-    /// once it is, those writes are in-flight work like any other).
-    fn main_pending(&self, reads: &[(u64, u64)]) -> bool {
-        self.main_submitted.as_ref().is_some_and(|f| !f.load(Ordering::Acquire)) && self.main_writes.as_ref().is_some_and(|m| m.overlaps_any(reads))
     }
 
     /// A CP memory write that follows earlier GPU work, performed by the GPU
@@ -12675,14 +12619,6 @@ impl Exec {
     /// What the batch being recorded writes (a parallel run's planning).
     pub fn unsubmitted_writes(&self) -> super::ranges::Ranges {
         if self.recording { self.pending.clone() } else { Default::default() }
-    }
-
-    /// A worker's chunk follows a main command processor's batch that
-    /// writes `w` and was not yet submitted when the run was planned
-    /// (`submitted`: set once it is, `tune par_main_writes 3`).
-    pub fn set_main_writes(&mut self, w: Option<std::sync::Arc<super::ranges::Ranges>>, submitted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
-        self.main_writes = w;
-        self.main_submitted = submitted;
     }
 
 
@@ -14123,7 +14059,7 @@ impl Exec {
         // words its inputs give now: a stale source in the mirror shows as
         // words still as before (forwarding checks only the graphics CP's).
         if super::fe2::check_copies() && !forward_here && indirect.is_none() {
-            let busy = |r: &[(u64, u64)]| self.overlaps_pending_ro(r) || INFLIGHT.latest(r).is_some() || CP_WRITES.latest(r).is_some() || self.main_writes.as_ref().is_some_and(|m| m.overlaps_any(r));
+            let busy = |r: &[(u64, u64)]| self.overlaps_pending_ro(r) || INFLIGHT.latest(r).is_some() || CP_WRITES.latest(r).is_some();
             if let Some((base, words, _)) = super::forward::compute(&p, groups, local, busy) {
                 let id = super::forward::add_check(base, words, "a copy kernel's dispatch", &self.name);
                 self.forward_ids.push(id);
@@ -14446,8 +14382,6 @@ impl Exec {
                 4
             } else if fresh.iter().any(|sh| self.pending.overlaps(sh.guest, sh.range)) {
                 5
-            } else if fresh.iter().any(|sh| self.main_pending(&[(sh.guest, sh.range)])) {
-                6
             } else if fresh.iter().any(|sh| self.closed_overlap(&[(sh.guest, sh.range)])) {
                 7
             } else {

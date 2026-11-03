@@ -2057,12 +2057,10 @@ impl Cp {
         Flow::Next
     }
 
-    pub fn chunk_start(&mut self, main_writes: &Arc<super::ranges::Ranges>, submitted: &Arc<std::sync::atomic::AtomicBool>) {
+    pub fn chunk_start(&mut self) {
         if let Some(e) = self.exec.as_mut() {
             e.stopped = false;
             e.stop_why = "";
-            let pending = !main_writes.is_empty() && !submitted.load(Ordering::Acquire);
-            e.set_main_writes(Some(main_writes.clone()), pending.then(|| submitted.clone()));
         }
     }
 
@@ -2723,8 +2721,10 @@ impl Cp {
         }
         self.drop_ahead();
         // What this queue's batch being recorded writes: the workers cannot
-        // wait for it (`tune par_main_writes`).
-        let mut main_writes = self.exec.as_ref().map(|e| e.unsubmitted_writes()).unwrap_or_default();
+        // see it unsubmitted, so a batch with writes is submitted before
+        // they start and they wait for it like for any submitted work (the
+        // run handed over first measured level: 2026-10-17, 2026-11-03).
+        let main_writes = self.exec.as_ref().map(|e| e.unsubmitted_writes()).unwrap_or_default();
         if lap.0.is_some() && !main_writes.is_empty() {
             // (Profile: how much of them the forwarded copies cover.)
             let ranges: Vec<(u64, u64)> = main_writes.iter().collect();
@@ -2735,17 +2735,12 @@ impl Cp {
             PLAN_MAIN_WRITES[3].fetch_add(left.map_or(ranges.len(), |v| v.len()) as u64, Ordering::Relaxed);
         }
         lap.mark(7);
-        // Mode 3: the batch is submitted right after the hand-over (a
-        // worker that reads its writes waits for that submission).
-        let submit_after = super::tune::par_main_writes() == 3 && !main_writes.is_empty();
-        if super::tune::par_main_writes() == 2 && !main_writes.is_empty() {
+        if !main_writes.is_empty() {
             self.submit_gpu("parallel run");
-            main_writes = Default::default();
         }
         lap.mark(8);
         let queue = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
-        let submitted = Arc::new(std::sync::atomic::AtomicBool::new(!submit_after));
-        let mut run = super::par::Run::new(queue, Arc::new(main_writes), submitted.clone());
+        let mut run = super::par::Run::new(queue);
         run.timed = true;
         // (Its workers check as of this command processor's view now.)
         run.fe2_view = self.fe2_view.as_ref().map_or(super::fe2::NO_VIEW, |c| c.load(Ordering::Acquire));
@@ -2760,10 +2755,6 @@ impl Cp {
             w.give(run.clone());
         }
         self.par_pool.wake();
-        if submit_after {
-            self.submit_gpu("parallel run");
-            submitted.store(true, Ordering::Release);
-        }
         lap.mark(10);
         super::par::RUNS.fetch_add(1, Ordering::Relaxed);
         super::par::CHUNKS.fetch_add(starts.len() as u64, Ordering::Relaxed);

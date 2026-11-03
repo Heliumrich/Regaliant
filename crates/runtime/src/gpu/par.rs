@@ -121,11 +121,6 @@ pub struct Run {
     cv: Condvar,
     /// When the run was planned (the workers' start latency).
     born: std::time::Instant,
-    /// What the main command processor's batch, not submitted when the run
-    /// was planned, writes (`tune par_main_writes`), and whether it has been
-    /// submitted since (mode 3: right after the hand-over).
-    main_writes: Arc<super::ranges::Ranges>,
-    main_submitted: Arc<AtomicBool>,
     /// The workers time each command (`tune par_cost`).
     pub timed: bool,
     /// Front end 2: the command processor's view when it planned the run
@@ -142,7 +137,7 @@ static RUN_IDS: AtomicU64 = AtomicU64::new(1);
 
 impl Run {
     /// The run of `chunks` ([start state, first packet, end]).
-    pub fn new(chunks: Vec<(Box<ChunkState>, u64, u64)>, main_writes: Arc<super::ranges::Ranges>, main_submitted: Arc<AtomicBool>) -> Run {
+    pub fn new(chunks: Vec<(Box<ChunkState>, u64, u64)>) -> Run {
         let n = chunks.len();
         Run {
             chunks: chunks.into_iter().map(|(s, a, b)| (Mutex::new(Some(s)), a, b)).collect(),
@@ -155,8 +150,6 @@ impl Run {
             lock: Mutex::new(()),
             cv: Condvar::new(),
             born: std::time::Instant::now(),
-            main_writes,
-            main_submitted,
             timed: false,
             fe2_view: super::fe2::NO_VIEW,
             id: RUN_IDS.fetch_add(1, Ordering::Relaxed),
@@ -492,7 +485,7 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         cp.set_chunk_state(&state);
         cp.fe2_set_view(run.fe2_view);
         cp.fe2_set_run(run.id, i + 1);
-        cp.chunk_start(&run.main_writes, &run.main_submitted);
+        cp.chunk_start();
         cp.chunk_costs = run.timed.then(|| Vec::with_capacity(512));
         lap(1, &mut t);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cp.run_chunk(from, to)));
@@ -636,7 +629,7 @@ pub fn status() -> String {
         String::new()
     };
     past + &format!(
-        "    parallel runs: {runs} runs ({} split at equal recording cost), {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled, {} worker reads of the main command processor's unsubmitted writes ({} waited {:.0} us on average for its submission); main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}; runs under 32 commands by end {}; compute queues' runs by length {}; by end {}\n",
+        "    parallel runs: {runs} runs ({} split at equal recording cost), {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled; main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}; runs under 32 commands by end {}; compute queues' runs by length {}; by end {}\n",
         super::cp::PAR_COSTED.load(Ordering::Relaxed),
         CHUNKS.load(Ordering::Relaxed),
         COMMANDS.load(Ordering::Relaxed),
@@ -644,9 +637,6 @@ pub fn status() -> String {
         STOPS.load(Ordering::Relaxed),
         why.join(", "),
         CANCELLED.load(Ordering::Relaxed),
-        super::exec::MAIN_WRITE_READS.load(Ordering::Relaxed),
-        super::exec::MAIN_SUBMIT_WAITS[0].load(Ordering::Relaxed),
-        super::exec::MAIN_SUBMIT_WAITS[1].load(Ordering::Relaxed) as f64 / super::exec::MAIN_SUBMIT_WAITS[0].load(Ordering::Relaxed).max(1) as f64 / 1e3,
         WAIT_NS.load(Ordering::Relaxed) / 1_000_000,
         main_weight(),
         TURN_NS.load(Ordering::Relaxed) / 1_000_000,
