@@ -1,12 +1,15 @@
 //! Translation check against the reference interpreter (`rdna::emu`).
 //!
-//! `DS_EMU_CHECK=<shader>[,<shader>...][:<groups>]` (hex shader addresses):
+//! `DS_EMU_CHECK=<shader>[,<shader>...][:<groups>[:<min bytes>]]` (hex shader addresses):
 //! before the first few direct dispatches of those compute shaders run on the GPU, a sample of
 //! their workgroups (default 32, spread over the grid) is interpreted on the
 //! CPU from the same inputs; after the GPU dispatch, the texels and bytes the
 //! interpreter wrote are compared with what the GPU wrote. The result goes
 //! to the log. Diagnostic only (slow). The `emucheck` control command sets
 //! the list at run time (shaders that load at different addresses per run).
+//! With `<min bytes>`, dispatches whose sample writes fewer buffer bytes (and
+//! no texel) are not compared and do not count: programs that run every frame
+//! with little to do are checked where they do their work.
 
 use super::cp::{Cp, Space};
 use super::desc::Tsharp;
@@ -17,14 +20,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 struct Cfg {
     addrs: Vec<u64>,
     groups: u32,
+    min_bytes: usize,
 }
 
-/// `<shader>[,<shader>...][:<groups>]`.
+/// `<shader>[,<shader>...][:<groups>[:<min bytes>]]`.
 fn parse(v: &str) -> Option<Cfg> {
     let mut it = v.split(':');
     let addrs: Vec<u64> = it.next()?.split(',').filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()).collect();
     let groups = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(32);
-    (!addrs.is_empty()).then_some(Cfg { addrs, groups })
+    let min_bytes = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+    (!addrs.is_empty()).then_some(Cfg { addrs, groups, min_bytes })
 }
 
 /// The active list: `DS_EMU_CHECK` until `arm` replaces it.
@@ -46,12 +51,12 @@ fn cfg() -> Option<Cfg> {
     CFG.read().clone()
 }
 
-/// `emucheck <shader>[,<shader>...][:<groups>]` / `emucheck off` (control
+/// `emucheck <shader>[,<shader>...][:<groups>[:<min bytes>]]` / `emucheck off` (control
 /// command): replaces the list; the next 3 dispatches of each listed shader
 /// are checked.
 pub fn arm(v: &str) -> Result<(), String> {
     cfg();
-    let c = if v.trim() == "off" { None } else { Some(parse(v).ok_or("usage: emucheck <hex shader>[,<hex shader>...][:<groups>] | off")?) };
+    let c = if v.trim() == "off" { None } else { Some(parse(v).ok_or("usage: emucheck <hex shader>[,<hex shader>...][:<groups>[:<min bytes>]] | off")?) };
     if let Some(c) = &c {
         let mut done = DONE.lock().unwrap();
         let d = done.get_or_insert_with(HashMap::new);
@@ -263,6 +268,13 @@ pub fn prepare(cp: &Cp, groups: [u32; 3], initiator: u32) -> Option<Pending> {
             errors.push(format!("group {g:?}: {e}"));
         }
         steps += grp.steps;
+    }
+    if env.writes.len() < c.min_bytes && env.texels.is_empty() {
+        // (Too little written: not compared, not counted.)
+        if let Some(d) = DONE.lock().unwrap().as_mut().and_then(|d| d.get_mut(&addr)) {
+            *d = d.saturating_sub(1);
+        }
+        return None;
     }
     crate::info!("emu check: cs {addr:#x}: interpreted {n} of {total} groups ({steps} instructions, {} ms)", t0.elapsed().as_millis());
     Some(Pending { env, groups: n as usize, errors, steps, addr, dump, resources })

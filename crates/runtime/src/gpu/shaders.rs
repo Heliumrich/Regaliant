@@ -1228,6 +1228,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         per_lane: false,
         lane_votes: false,
         lockstep_off: false,
+        sg_waves: false,
         sg_appends: false,
         known_active: true,
         base_instance_sgpr: None,
@@ -1249,6 +1250,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         spec.lane_votes = spec.per_lane && votes;
     }
     spec.lockstep_off = no_lockstep_program(code_hash);
+    spec.sg_waves = sg_wave_program(code_hash);
     spec.sg_appends = append_program(code_hash);
     // GPU-resolved per-item chains (`gpures`, `tune gpu_chains`; batched
     // programs, whose translations use device addresses).
@@ -1304,6 +1306,35 @@ const NO_LOCKSTEP_PROGRAMS: &[(u64, &str)] = &[
     // the graphics work: frames level on the RTX 4090 (in-run A/B).
     (0x7761_ec89_6045_ec47, "GI probe update cs 0x1008a05b00"),
 ];
+
+/// Compute programs translated as subgroup waves (`Spec::sg_waves`), by
+/// FNV-1a of their words up to the first s_endpgm (as PER_LANE_PROGRAMS),
+/// each checked by reading its code: a wave of 32 lanes gives what one of
+/// 64 gives (its lane-0 elections, appends and reductions per wave, no lane
+/// index as data, no LDS), and by the interpreter check (`emucheck`).
+const SG_WAVE_PROGRAMS: &[(u64, &str)] = &[
+    // The GI sweep (giubertree_sweep; one wave64 per group, 64 entries):
+    // per-entry tests and loads, two OR reductions and an add reduction
+    // (DPP rows, v_permlanex16 and v_readlane of lanes 31 and 63), an
+    // append (a ballot tested by halves, v_bcnt, lane 0 elected by its
+    // compare's bit 0 and its result read from lane 0, v_mbcnt ranks), lane
+    // 0's atomic subtract of the overflow's sum. Its arrival spikes about
+    // halve (wave-mask mode ~6.3 ms an arrival; FINDINGS.md 2026-11-04
+    // morning, later).
+    (0xb406_602d_7ad8_fe58, "GI sweep cs 0x10089f3f00"),
+    // The GI reinsert (one wave64 per group of 64 entries): per-entry tests
+    // and loads, two appends of that form (halves tested by scalar
+    // compares, lane 0's atomic add or subtract of the count, its result
+    // read from lane 0, v_mbcnt ranks), per-lane atomic ands.
+    (0x7f89_1d6a_4856_4598, "GI reinsert cs 0x10089f4d00"),
+];
+
+/// Program hashes found in SG_WAVE_PROGRAMS.
+static SG_WAVE_HASHES: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+fn sg_wave_program(code_hash: u64) -> bool {
+    code_hash != 0 && SG_WAVE_HASHES.iter().any(|h| h.load(std::sync::atomic::Ordering::Relaxed) == code_hash)
+}
 
 /// Program hashes found in NO_LOCKSTEP_PROGRAMS.
 static NO_LOCKSTEP_HASHES: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
@@ -1370,10 +1401,20 @@ fn note_append(addr: u64, insts: &[rdna::Inst], hash: u64) {
     }
 }
 
-/// Notes a decoded program found in PER_LANE_PROGRAMS or
-/// NO_LOCKSTEP_PROGRAMS (by its hash).
+/// Notes a decoded program found in PER_LANE_PROGRAMS, NO_LOCKSTEP_PROGRAMS
+/// or SG_WAVE_PROGRAMS (by its hash).
 fn note_per_lane(addr: u64, words: &[u32], hash: u64) {
     let id = program_id(words);
+    if let Some(&(_, what)) = SG_WAVE_PROGRAMS.iter().find(|p| p.0 == id) {
+        if !sg_wave_program(hash) {
+            for slot in &SG_WAVE_HASHES {
+                if slot.compare_exchange(0, hash, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).is_ok() {
+                    crate::info!("shader {addr:#x}: translated as subgroup waves ({what})");
+                    break;
+                }
+            }
+        }
+    }
     if let Some(&(_, what)) = NO_LOCKSTEP_PROGRAMS.iter().find(|p| p.0 == id) {
         if !no_lockstep_program(hash) {
             for slot in &NO_LOCKSTEP_HASHES {
@@ -1532,6 +1573,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         per_lane: false,
         lane_votes: false,
         lockstep_off: false,
+        sg_waves: false,
         sg_appends: false,
         known_active: true,
         base_instance_sgpr: None,
@@ -1732,6 +1774,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         per_lane: false,
         lane_votes: false,
         lockstep_off: false,
+        sg_waves: false,
         sg_appends: false,
         known_active: true,
         base_instance_sgpr: BASE_INSTANCE.with(|c| c.get()).map(|k| 8 + k),
@@ -2254,7 +2297,7 @@ fn translate_kept(addr: u64, insts: &[rdna::Inst], plan: &Arc<Plan>, plan_key: u
     }
     if stats >= 1 {
         crate::info!(
-            "translate stats: {:?} shader {addr:#x}: {} instructions -> {} SPIR-V words ({:.1} per instruction; wave64 {}, per lane {}, lane votes {}, lockstep {}, wave masks {}, local size {:?}, {} resources, {} branches decided without a vote)",
+            "translate stats: {:?} shader {addr:#x}: {} instructions -> {} SPIR-V words ({:.1} per instruction; wave64 {}, per lane {}, lane votes {}, lockstep {}, wave masks {}, subgroup waves {}, local size {:?}, {} resources, {} branches decided without a vote)",
             spec.stage,
             insts.len(),
             out.spirv.len(),
@@ -2264,6 +2307,7 @@ fn translate_kept(addr: u64, insts: &[rdna::Inst], plan: &Arc<Plan>, plan_key: u
             spec.lane_votes,
             out.lockstep,
             out.wave_masks,
+            out.sg_waves,
             spec.cs_local_size,
             plan.resources.len(),
             out.masked_skips
@@ -2546,6 +2590,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         per_lane: false,
         lane_votes: false,
         lockstep_off: false,
+        sg_waves: false,
         sg_appends: false,
         known_active: true,
         base_instance_sgpr,
@@ -2597,6 +2642,7 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         per_lane: false,
         lane_votes: false,
         lockstep_off: false,
+        sg_waves: false,
         sg_appends: false,
         known_active: true,
         base_instance_sgpr: None,
@@ -2648,6 +2694,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         per_lane: false,
         lane_votes: false,
         lockstep_off: false,
+        sg_waves: false,
         sg_appends: false,
         known_active: true,
         base_instance_sgpr: None,
@@ -2669,6 +2716,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         spec.lane_votes = spec.per_lane && votes;
     }
     spec.lockstep_off = no_lockstep_program(code_hash);
+    spec.sg_waves = sg_wave_program(code_hash);
     spec.sg_appends = append_program(code_hash);
     spec
 }

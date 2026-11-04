@@ -394,6 +394,10 @@ pub fn run(args: &[String], app: &std::path::Path) -> i32 {
         if std::env::var("DS_CB_LOCKSTEP_OFF").ok().as_deref() == Some("1") {
             spec.lockstep_off = true;
         }
+        // DS_CB_SG_WAVES=1: as subgroup waves (`Spec::sg_waves`).
+        if std::env::var("DS_CB_SG_WAVES").ok().as_deref() == Some("1") {
+            spec.sg_waves = true;
+        }
         // (Learned specs as a preparation keys them now.)
         if let Ok(insts) = rdna::decode_program(code) {
             let plan = rdna::analysis::analyze_opts(&insts, spec.user_sgprs, spec.user_base, false);

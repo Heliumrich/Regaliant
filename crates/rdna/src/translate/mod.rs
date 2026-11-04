@@ -54,6 +54,14 @@
 //! through workgroup memory completes the mask wherever it may be read as a
 //! whole (see [`crate::wavemask`]); elsewhere an invocation keeps a partial
 //! mask whose own bit is right.
+//!
+//! *Subgroup waves* (`Spec::sg_waves`) run wave-mask mode per subgroup, for
+//! wave64 programs without LDS whose results do not depend on how many lanes
+//! a wave has (the runtime lists them, each checked by reading its code):
+//! each subgroup is a wave of its own, its invocations lanes 0 to its size
+//! - 1 (`SubgroupLocalInvocationId`), the wave's other lanes absent (their
+//! mask bits 0, lane reads of them 0). Subgroup ballots complete the masks,
+//! and no workgroup barrier is needed.
 
 mod active;
 mod alu;
@@ -321,6 +329,13 @@ pub struct Spec {
     /// LDS: each subgroup then gives its lanes the wave's results. The
     /// runtime decides per program (its list of verified programs).
     pub lockstep_off: bool,
+    /// Compute, wave-mask mode: subgroup waves (see the module
+    /// documentation): each subgroup a wave of its own, no workgroup
+    /// barriers. For wave64 programs without LDS whose lane-0 elections,
+    /// appends and reductions are per wave and that use no lane index as
+    /// data, so that two waves of 32 lanes give what one of 64 gives. The
+    /// runtime decides per program (its list of verified programs).
+    pub sg_waves: bool,
     /// Compute: wave-aggregated appends done per subgroup ([`Appends`]),
     /// when all of the program's are of that form (the runtime sets it for
     /// programs with one, `has_append`).
@@ -496,6 +511,9 @@ impl std::hash::Hash for Spec {
         self.lane_votes.hash(state);
         if self.lockstep_off {
             0x4C4F_4646u32.hash(state);
+        }
+        if self.sg_waves {
+            0x5347_5756u32.hash(state);
         }
         if let Some(s) = self.base_instance_sgpr {
             s.hash(state);
@@ -700,6 +718,8 @@ pub struct Output {
     /// within it.
     pub lockstep: bool,
     pub wave_masks: bool,
+    /// Wave-mask mode per subgroup (`Spec::sg_waves`).
+    pub sg_waves: bool,
     /// Wave-aggregated appends done per subgroup ([`Appends`]).
     pub sg_appends: u32,
     /// Instructions known active (`Spec::known_active`).
@@ -929,6 +949,8 @@ pub(crate) struct T<'a> {
     pub cur_pc: u32,
     /// Wave-mask mode (see the module documentation).
     pub wave_masks: bool,
+    /// Subgroup waves (`Spec::sg_waves`).
+    pub sg_waves: bool,
     /// [`FORMAT_RT`] buffers: [`rt_format_entry`]'s table (a private array
     /// of 128 entries, made when the spec has such a buffer), and the
     /// instruction's V# word 3 while a typed access is translated.
@@ -1176,7 +1198,13 @@ impl<'a> T<'a> {
         let act = self.active()?;
         let c = e(self.b.logical_and(self.t.bool_, None, c, act))?;
         match self.own_bit {
-            Some(_) if self.complete.contains(&pc) => self.wave_ballot(c),
+            Some(_) if self.complete.contains(&pc) => {
+                if self.sg_waves {
+                    self.subgroup_ballot(c)
+                } else {
+                    self.wave_ballot(c)
+                }
+            }
             Some((in_hi, sh)) => {
                 let one = self.u(1);
                 let bit = e(self.b.shift_left_logical(u, None, one, sh))?;
@@ -1192,7 +1220,8 @@ impl<'a> T<'a> {
 
     /// The mask of the subgroup's invocations with `c` in the hardware
     /// layout (bit i for lane i of the wave; other subgroups' lanes 0): an
-    /// append's ballot done per subgroup ([`Appends`]).
+    /// append's ballot done per subgroup ([`Appends`]), or a complete mask
+    /// of subgroup waves.
     pub fn subgroup_ballot(&mut self, c: Word) -> R<(Word, Word)> {
         let u = self.t.u32;
         let lane = self.lane()?;
@@ -1590,16 +1619,17 @@ impl<'a> T<'a> {
     /// (reported).
     pub fn wave_read(&mut self, ins: &Inst, v: Word, lane: Word) -> R<Word> {
         let u = self.t.u32;
-        let exchange = self.spec.wave64 && self.spec.stage == Stage::Compute && self.uniformity.is_uniform(ins.pc) && self.local_index.is_some();
+        let exchange = !self.sg_waves && self.spec.wave64 && self.spec.stage == Stage::Compute && self.uniformity.is_uniform(ins.pc) && self.local_index.is_some();
         if exchange {
             self.lds_state = 0;
         }
         if !exchange {
-            if self.spec.wave64 {
+            if self.spec.wave64 && !self.sg_waves {
                 self.warn(format!("{:#x}: wave64 lane read within the 32-lane subgroup", ins.pc));
             }
-            let k31 = self.u(31);
-            let l = e(self.b.bitwise_and(u, None, lane, k31))?;
+            // (Subgroup waves: lanes past the subgroup are absent, read 0.)
+            let k = self.u(if self.sg_waves { 63 } else { 31 });
+            let l = e(self.b.bitwise_and(u, None, lane, k))?;
             return Ok(self.lane_fetch(v, l)?.0);
         }
         let li = self.local_index.unwrap();
@@ -1645,6 +1675,14 @@ impl<'a> T<'a> {
         let z = self.u(0);
         let act = self.active()?;
         let ballot = e(self.b.group_non_uniform_ballot(self.t.v4u, None, sg, act))?;
+        if self.sg_waves {
+            // Subgroup waves: the subgroup's first active invocation.
+            self.b.capability(Capability::GroupNonUniformVote);
+            let any = e(self.b.group_non_uniform_any(bt, None, sg, act))?;
+            let lsb = e(self.b.group_non_uniform_ballot_find_lsb(u, None, sg, ballot))?;
+            let first = e(self.b.select(u, None, any, lsb, z))?;
+            return Ok(self.lane_fetch(v, first)?.0);
+        }
         let bits = e(self.b.composite_extract(u, None, ballot, [0]))?;
         let any = e(self.b.i_not_equal(bt, None, bits, z))?;
         let lsb = self.glsl1(self.t.i32, spirv::GlslStd450Op::FindILsb, bits)?;
@@ -2515,6 +2553,17 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     // (In wave-mask mode the appends are exact.)
     let sg_why = if wave_masks && !sg.leaders.is_empty() { Some("other masks read as values") } else { sg_why };
     let sg = if wave_masks { Appends::default() } else { sg };
+    // Subgroup waves for the programs the runtime lists (`DS_SGWAVE`: others
+    // too, by address), where the translation allows.
+    let sg_waves_asked = spec.sg_waves || sg_waves_wanted(spec.code_base);
+    let sg_waves_why = if !sg_waves_asked {
+        None
+    } else if !wave_masks {
+        Some("not in wave-mask mode")
+    } else {
+        sg_waves_refusal(spec, code, structured)
+    };
+    let sg_waves = sg_waves_asked && sg_waves_why.is_none();
     let mut tr = T {
         b,
         t,
@@ -2587,6 +2636,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         known_active: crate::HashSet::default(),
         cur_pc: 0,
         wave_masks,
+        sg_waves,
         complete: if wave_masks { crate::wavemask::complete_masks(code, spec.wave64) } else { Default::default() },
         own_bit: None,
         warnings: Vec::new(),
@@ -2616,6 +2666,9 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     };
     if let Some(why) = sg_why {
         tr.warn(format!("wave-aggregated appends left as they were ({why})"));
+    }
+    if let Some(why) = sg_waves_why {
+        tr.warn(format!("subgroup waves left out ({why})"));
     }
     let mut elected: Vec<u32> = tr.elections.keys().copied().collect();
     elected.sort();
@@ -2843,12 +2896,15 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         tr.known_active = active::known_active(code, spec.wave64, &tr.sg);
     }
     if tr.lockstep {
-        let z = tr.u(0);
-        tr.vote_ctr = Some(tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, Some(z)));
-        let len = tr.u(6);
-        let arr = tr.b.type_array(tr.t.u32, len);
-        let pt = tr.b.type_pointer(None, StorageClass::Workgroup, arr);
-        tr.vote = Some(tr.global_var(pt, StorageClass::Workgroup));
+        // (Subgroup waves vote nowhere: no workgroup memory.)
+        if !tr.sg_waves {
+            let z = tr.u(0);
+            tr.vote_ctr = Some(tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, Some(z)));
+            let len = tr.u(6);
+            let arr = tr.b.type_array(tr.t.u32, len);
+            let pt = tr.b.type_pointer(None, StorageClass::Workgroup, arr);
+            tr.vote = Some(tr.global_var(pt, StorageClass::Workgroup));
+        }
         tr.uniformity.set_lockstep();
     }
     if tr.spec.resources.iter().any(|r| matches!(r, ResSpec::Buffer { format: FORMAT_RT, .. })) {
@@ -2975,8 +3031,11 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         ok(tr.b.store(tr.vgpr, zv, None, []))?;
     }
     // EXEC holds this lane's bit (bit 0) only; in wave-mask mode the lanes
-    // of the wave.
-    let (exec_lo, exec_hi) = if tr.wave_masks {
+    // of the wave (subgroup waves: of the subgroup).
+    let (exec_lo, exec_hi) = if tr.sg_waves {
+        let t = tr.bool_c(true);
+        tr.subgroup_ballot(t)?
+    } else if tr.wave_masks {
         let threads: u32 = spec.cs_local_size.iter().map(|&x| x.max(1)).product();
         let lo = if threads >= 32 { u32::MAX } else { (1u32 << threads) - 1 };
         let hi = if !spec.wave64 || threads <= 32 { 0 } else if threads >= 64 { u32::MAX } else { (1u32 << (threads - 32)) - 1 };
@@ -3081,7 +3140,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     // offsets come from a table): the runtime takes that from `sgpr_pc`.
     let batched = spec.batched;
     let sgpr_pc = if batched { Some(sgpr_pc_offset(spec.stage)) } else { spec.sgpr_pc };
-    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched, masked_skips: tr.masked_skips, lockstep: tr.lockstep, wave_masks: tr.wave_masks, sg_appends: tr.sg.leaders.len() as u32, known_active: tr.known_active.len() as u32 })
+    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched, masked_skips: tr.masked_skips, lockstep: tr.lockstep, wave_masks: tr.wave_masks, sg_waves: tr.sg_waves, sg_appends: tr.sg.leaders.len() as u32, known_active: tr.known_active.len() as u32 })
 }
 
 /// Wave-mask mode for the shader at `addr` (diagnosis: `DS_WAVEMASK=0`
@@ -3092,6 +3151,36 @@ fn wave_masks_wanted(addr: u64) -> bool {
         Err(_) => true,
         Ok(v) => v.split(',').any(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).is_ok_and(|x| x == addr && x != 0)),
     }
+}
+
+/// `DS_SGWAVE=<hex,...>`: subgroup waves for these programs too (by code
+/// address; diagnosis, e.g. with `rdnadis --translate`).
+fn sg_waves_wanted(addr: u64) -> bool {
+    match std::env::var("DS_SGWAVE") {
+        Err(_) => false,
+        Ok(v) => v.split([',', ';']).any(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).is_ok_and(|x| x == addr && x != 0)),
+    }
+}
+
+/// Why a wave-mask program cannot run as subgroup waves, if it cannot:
+/// they are wave64 compute programs translated structured (each subgroup's
+/// invocations take its branches together), with no LDS (the waves would
+/// address the workgroup's alike) or lane exchange through it, and no
+/// s_barrier.
+fn sg_waves_refusal(spec: &Spec, code: &[Inst], structured: bool) -> Option<&'static str> {
+    if spec.stage != Stage::Compute || !spec.wave64 {
+        return Some("not a wave64 compute program");
+    }
+    if !structured {
+        return Some("a dispatcher translation");
+    }
+    if code.iter().any(|i| i.enc == Enc::Ds) {
+        return Some("LDS or a lane exchange through it");
+    }
+    if code.iter().any(|i| i.base_name() == Some("s_barrier")) {
+        return Some("s_barrier");
+    }
+    None
 }
 
 /// Lockstep mode, and whether the workgroup is a single wave (see the
@@ -3965,6 +4054,7 @@ mod tests {
             per_lane: false,
             lane_votes: false,
             lockstep_off: false,
+            sg_waves: false,
             sg_appends: false,
             known_active: false,
             base_instance_sgpr: None,
@@ -4027,6 +4117,42 @@ mod tests {
         assert!(!after.wave_masks && !after.lockstep && after.sg_appends == 1);
         // Not for groups of several waves: then the compare elects no lane.
         assert!(subgroup_appends(&code, &cs_spec([16, 8, 1])).is_err());
+    }
+
+    /// Subgroup waves (`Spec::sg_waves`): the append kernel above in
+    /// wave-mask mode per subgroup, its masks completed by subgroup ballots:
+    /// no workgroup memory, no barrier.
+    #[test]
+    fn subgroup_waves() {
+        let words = [0u32; 83];
+        let code = crate::decode_program(&words).unwrap();
+        let mut spec = cs_spec([8, 8, 1]);
+        let plan = crate::analysis::analyze(&code, 2, 0);
+        spec.resources = plan.resources.iter().map(|_| ResSpec::Buffer { format: 0, dst_sel: 0xFAC }).collect();
+        let ops = |w: &[u32]| {
+            let mut v = Vec::new();
+            let mut i = 5;
+            while i < w.len() {
+                v.push(w[i] & 0xFFFF);
+                i += (w[i] >> 16).max(1) as usize;
+            }
+            v
+        };
+        let barrier = rspirv::spirv::Op::ControlBarrier as u32;
+        let before = translate(&code, &plan, &spec).unwrap();
+        assert!(before.wave_masks && !before.sg_waves);
+        assert!(ops(&before.spirv).contains(&barrier));
+        spec.sg_waves = true;
+        let after = translate(&code, &plan, &spec).unwrap();
+        assert!(after.wave_masks && after.sg_waves, "{:?}", after.warnings);
+        assert!(!after.warnings.iter().any(|w| w.contains("subgroup") || w.contains("wave64")), "{:?}", after.warnings);
+        assert!(!ops(&after.spirv).contains(&barrier));
+        // Not for groups of several waves (no wave-mask mode there).
+        let mut spec = cs_spec([16, 8, 1]);
+        spec.resources = plan.resources.iter().map(|_| ResSpec::Buffer { format: 0, dst_sel: 0xFAC }).collect();
+        spec.sg_waves = true;
+        let several = translate(&code, &plan, &spec).unwrap();
+        assert!(!several.sg_waves && several.warnings.iter().any(|w| w.contains("subgroup waves left out")));
     }
 
     /// `Spec::addresses`: the append kernel above without buffer

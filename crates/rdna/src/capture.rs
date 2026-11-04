@@ -133,6 +133,7 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         per_lane: false,
         lane_votes: false,
         lockstep_off: false,
+        sg_waves: false,
         // RDNA_SG_APPENDS=0: wave-aggregated appends as before (exact in
         // wave-mask mode, each lane its own outside it).
         sg_appends: std::env::var("RDNA_SG_APPENDS").ok().as_deref() != Some("0") && u.stage == Stage::Compute && crate::translate::has_append(&insts),

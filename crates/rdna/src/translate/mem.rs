@@ -132,8 +132,11 @@ pub fn stage_inputs(tr: &mut T) -> R<()> {
             }
             let idx = e(tr.b.load(tr.t.u32, None, lidx, None, []))?;
             tr.local_index = Some(idx);
-            let km = tr.u(if tr.spec.wave64 { 63 } else { 31 });
-            tr.lane_id = Some(e(tr.b.bitwise_and(tr.t.u32, None, idx, km))?);
+            // (Subgroup waves: lanes numbered within the subgroup, `T::lane`.)
+            if !tr.sg_waves {
+                let km = tr.u(if tr.spec.wave64 { 63 } else { 31 });
+                tr.lane_id = Some(e(tr.b.bitwise_and(tr.t.u32, None, idx, km))?);
+            }
             let lds_dwords = ((tr.spec.cs_rsrc2 >> 15) & 0x1FF) * 128;
             if lds_dwords > 0 {
                 let n = lds_dwords.min(12288);
