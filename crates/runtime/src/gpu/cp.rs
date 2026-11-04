@@ -338,6 +338,10 @@ pub struct Cp {
     /// passed on as released by the CPU, the value then, the distinct
     /// values seen, and whether each was greater than the one before.
     passed: HashMap<u64, (u64, u32, bool)>,
+    /// Front end 2: per label whose wait the CPU released, the value and
+    /// the label page's watch mark when this queue's pass there last ended
+    /// an epoch (`label_unwritten`).
+    label_marks: HashMap<u64, (u64, u64)>,
     /// The view of the writer of the promise the last WAIT_REG_MEM passed on
     /// (0: this queue's own open promise; front end 2).
     last_wait_epoch: u32,
@@ -1292,6 +1296,10 @@ pub static EPOCH_GPU_WAITS: AtomicU64 = AtomicU64::new(0);
 /// Waits that ended no epoch under front end 2: [passed again on
 /// a counter's value, gone past].
 pub static QUIET_WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Front end 2's lagged views (FRONTEND2.md): [submissions started with the
+/// epoch the title submitted them in, released waits that ended no epoch on
+/// an unwritten label page, label pages watched at an epoch-ending pass].
+pub static SUB_VIEWS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 pub static MDI_DRAWS: AtomicU64 = AtomicU64::new(0);
 pub static MDI_COUNT_FROM_MEMORY: AtomicU64 = AtomicU64::new(0);
 
@@ -1880,6 +1888,7 @@ impl Cp {
             last_wait_kind: b'-',
             last_wait_func: 0,
             passed: HashMap::new(),
+            label_marks: HashMap::new(),
             last_wait_epoch: 0,
             held: None,
             main_gfx: name == "gpu-gfx",
@@ -2203,9 +2212,26 @@ impl Cp {
             // older than its view then (no wait can have been released by a
             // later write of the same value).
             QUIET_WAITS[0].fetch_add(1, Ordering::Relaxed);
+        } else if quiet && self.label_unwritten(a, now) {
+            // The value this queue passed on last time here, and no take
+            // found the label's page written since that pass: the release it
+            // sees is the one it passed then, whose earlier CPU writes its
+            // view covers since (views only rise).
+            SUB_VIEWS[1].fetch_add(1, Ordering::Relaxed);
         } else {
+            // (The page's marks taken before the epoch ends: a write after
+            // that take is seen by the next pass's, one before it is older
+            // than the epoch that ends now.)
+            let mark = quiet.then(|| super::precache::label_watch(a));
             super::precache::end_scope(1);
             self.fe2_sync(None);
+            if let Some(m) = mark {
+                if self.label_marks.len() > 4096 {
+                    self.label_marks.clear();
+                }
+                self.label_marks.insert(a & !7, (now, m));
+                SUB_VIEWS[2].fetch_add(1, Ordering::Relaxed);
+            }
             if super::exec::profiling_on() {
                 let what = match last_write_at(a) {
                     None => "no CP write recorded",
@@ -2260,11 +2286,18 @@ impl Cp {
 
     /// A title submission starts (its command buffers follow): CPU writes
     /// come between submissions, so shared batch-start copies of the
-    /// graphics queue are dropped (`gpu::precache`).
-    pub fn new_submission(&mut self) {
+    /// graphics queue are dropped (`gpu::precache`). `epoch`: the one that
+    /// began when the title submitted it (front end 2: the queue's view
+    /// rises to it; `fe2::NO_VIEW`: none, one ends now).
+    pub fn new_submission(&mut self, epoch: u32) {
         if self.held.is_none() || self.past.is_some() || self.past_wait.is_some() {
-            super::precache::end_scope(0);
-            self.fe2_sync(None);
+            if epoch != super::fe2::NO_VIEW {
+                SUB_VIEWS[0].fetch_add(1, Ordering::Relaxed);
+                self.fe2_sync(Some(epoch));
+            } else {
+                super::precache::end_scope(0);
+                self.fe2_sync(None);
+            }
         }
     }
 
@@ -2304,6 +2337,16 @@ impl Cp {
     fn fe2_adopt(&self, writer: Option<&str>) {
         if self.fe2_view.is_some() {
             self.fe2_sync(Some(writer.and_then(super::fe2::view_of).unwrap_or_else(|| super::precache::epoch() as u32)));
+        }
+    }
+
+    /// Whether the label at `a` holds `now`, the value it held when this
+    /// queue's last pass there ended an epoch, and its page was not written
+    /// since (`precache::label_unwritten_since`: a take now).
+    fn label_unwritten(&mut self, a: u64, now: u64) -> bool {
+        match self.label_marks.get(&(a & !7)) {
+            Some(&(v, m)) if v == now => super::precache::label_unwritten_since(a, m),
+            _ => false,
         }
     }
 

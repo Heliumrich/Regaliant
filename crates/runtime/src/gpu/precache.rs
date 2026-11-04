@@ -137,6 +137,10 @@ struct Cache {
     marks: u64,
     /// Shadow windows whose CPU writes are followed (`watch`), oldest first.
     watched: Vec<Watched>,
+    /// Pages of labels whose waits the CPU released (`label_watch`), oldest
+    /// first: the page and the count of mark takes (`marks`) when one last
+    /// reported it (or a CP, host or mapping change touched it).
+    labels: Vec<(u64, u64)>,
     /// Entry ids `drop_range` leaves (`invalidate_ranges_except`).
     spare: Vec<u64>,
     /// Takes of write marks in flight (`take_unlocked`): their pages [lo, hi)
@@ -166,6 +170,8 @@ struct Watched {
 
 /// Windows followed at most (the oldest go: unknown then, not kept).
 const WATCHED_MAX: usize = 512;
+/// Label pages followed at most (`Cache::labels`).
+const LABELS_MAX: usize = 64;
 /// Bounds of the watched windows, readable without the lock (`invalidate`
 /// dates the windows a CPU-side write overlaps; LO > HI: none).
 static WATCH_LO: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -416,6 +422,16 @@ impl Cache {
                 Some(()) if !new.is_empty() => super::homes::marks_taken(Some(new), base, size),
                 Some(()) => {}
                 None => super::homes::marks_taken(None, base, size),
+            }
+        }
+        if !self.labels.is_empty() && (r.is_none() || !new.is_empty()) {
+            let end = base.saturating_add(size);
+            for i in 0..self.labels.len() {
+                let p = self.labels[i].0;
+                if p + 4096 > base && p < end && (r.is_none() || new.contains(&p)) {
+                    self.marks += 1;
+                    self.labels[i].1 = self.marks;
+                }
             }
         }
         if self.watched.is_empty() {
@@ -828,6 +844,18 @@ pub fn take_written_for(base: u64, size: u64, out: &mut Vec<u64>, except: Option
 pub fn invalidate(base: u64, len: u64) {
     super::fe2::invalidate(base, len);
     let end = base.saturating_add(len);
+    if len != 0 && base < LABEL_HI.load(Ordering::Acquire) && LABEL_LO.load(Ordering::Acquire) < end {
+        let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);
+        if let Some(c) = g.as_mut() {
+            for i in 0..c.labels.len() {
+                let p = c.labels[i].0;
+                if p + 4096 > base && p < end {
+                    c.marks += 1;
+                    c.labels[i].1 = c.marks;
+                }
+            }
+        }
+    }
     if len != 0 && base < WATCH_HI.load(Ordering::Acquire) && WATCH_LO.load(Ordering::Acquire) < end {
         let mut g = super::lockstat::COPY_CACHE.lock(&CACHE);
         if let Some(c) = g.as_mut() {
@@ -906,6 +934,49 @@ pub fn watch(base: u64, size: u64) -> u64 {
         WATCH_HI.fetch_max(hi, Ordering::AcqRel);
     }
     c.marks
+}
+
+/// Bounds of the label pages followed, readable without the lock
+/// (`invalidate`; LO > HI: none; they only grow).
+static LABEL_LO: AtomicU64 = AtomicU64::new(u64::MAX);
+static LABEL_HI: AtomicU64 = AtomicU64::new(0);
+
+/// Front end 2 (lagged views): follows CPU writes of the page holding
+/// the label at `a` from now on: its marks so far are taken (the writes
+/// they report came before the epoch the caller ends next) and the moment
+/// returned (`label_unwritten_since`).
+pub fn label_watch(a: u64) -> u64 {
+    let page = a & !4095;
+    let mut pages = Vec::new();
+    let (mut g, r, _) = take_unlocked(page, 4096, &mut pages, None, 7);
+    let c = g.get_or_insert_with(Cache::default);
+    c.dropped_by_take(page, 4096, r, &pages);
+    if !c.labels.iter().any(|l| l.0 == page) {
+        if c.labels.len() >= LABELS_MAX {
+            c.labels.remove(0);
+        }
+        // (Dated now: a pass that watched it before it was dropped may have
+        // missed writes since, and must not take it as unwritten.)
+        c.marks += 1;
+        let m = c.marks;
+        c.labels.push((page, m));
+        LABEL_LO.fetch_min(page, Ordering::AcqRel);
+        LABEL_HI.fetch_max(page + 4096, Ordering::AcqRel);
+    }
+    c.marks
+}
+
+/// Whether the CPU wrote the page holding the label at `a` since the moment
+/// `since` (`label_watch`): a take now, after any take over it in flight
+/// ends; false when unknown (the page is no longer followed).
+pub fn label_unwritten_since(a: u64, since: u64) -> bool {
+    let page = a & !4095;
+    let mut pages = Vec::new();
+    let (mut g, r, upto) = take_unlocked(page, 4096, &mut pages, None, 7);
+    g.get_or_insert_with(Cache::default).dropped_by_take(page, 4096, r, &pages);
+    let g = wait_takes(g, page, 4096, upto);
+    let Some(c) = g.as_ref() else { return false };
+    c.labels.iter().find(|l| l.0 == page).is_some_and(|l| l.1 <= since)
 }
 
 /// Whether the CPU wrote no page of the window [base, base+size) since the
