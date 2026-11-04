@@ -167,23 +167,60 @@ fn encode(data: &[u8]) -> Vec<u8> {
 }
 
 /// The pipeline cache data of a file (None: a block it names is missing).
+#[cfg(test)]
 fn decode(file: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    decode_into(file, &mut out).then_some(out)
+}
+
+/// `decode` into `out` (emptied first; its capacity kept): false when a
+/// block the file names is missing.
+fn decode_into(file: &[u8], out: &mut Vec<u8>) -> bool {
+    out.clear();
     if file.len() < HEADER || &file[..8] != MAGIC {
-        return Some(file.to_vec());
+        out.extend_from_slice(file);
+        return true;
     }
-    let o = u32::from_le_bytes(file[8..12].try_into().ok()?) as usize;
-    let n = u32::from_le_bytes(file[12..16].try_into().ok()?) as usize;
-    let h = u64::from_le_bytes(file[16..24].try_into().ok()?);
+    let word = |r: std::ops::Range<usize>| file[r].iter().rev().fold(0u64, |a, &b| a << 8 | b as u64);
+    let (o, n, h) = (word(8..12) as usize, word(12..16) as usize, word(16..24));
     let rest = &file[HEADER..];
-    let b = block(h)?;
+    let Some(b) = block(h) else { return false };
     if b.len() != n || o > rest.len() {
-        return None;
+        return false;
     }
-    let mut out = Vec::with_capacity(rest.len() + n);
+    out.reserve(rest.len() + n);
     out.extend_from_slice(&rest[..o]);
     out.extend_from_slice(&b);
     out.extend_from_slice(&rest[o..]);
-    Some(out)
+    true
+}
+
+thread_local! {
+    /// This thread's buffer for a file's decoded data (`with_cache`): ~2 MB
+    /// a pipeline with the driver's shared block, which a fresh allocation
+    /// committed page by page on every creation.
+    static DATA: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Pipeline files used as they were, whose last use the `pcache-touch`
+/// thread records (for pruning; ~0.2 ms a file on the creating thread).
+static TOUCH: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+fn touch_later(p: &Path) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("pcache-touch".into()).spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            // (Taken first: a guard in the loop's head would be held through it.)
+            let due = std::mem::take(&mut *TOUCH.lock());
+            for p in due {
+                if let Ok(f) = std::fs::File::options().write(true).open(&p) {
+                    let _ = f.set_modified(std::time::SystemTime::now());
+                }
+            }
+        });
+    });
+    TOUCH.lock().push(p.to_path_buf());
 }
 
 /// Writes a pipeline file (temporary name first: two threads may make the
@@ -229,6 +266,11 @@ const BUDGET: u64 = 2 << 30;
 /// [pipelines created from their file unchanged, files written (misses),
 /// bytes written, files pruned].
 pub static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Nanoseconds of `with_cache`'s steps, summed: the file read and decode,
+/// the cache object, the pipeline's creation, reading the cache's data back,
+/// writing or touching the file, destroying the cache; then the calls.
+static LAPS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// Where the pipeline files live (set once at startup; none: no persistence).
 /// Prunes the directory in the background.
@@ -278,45 +320,78 @@ fn prune(dir: &Path) {
 /// pass to vkCreate*Pipelines.
 pub fn with_cache<T>(kind: char, key: u64, create: impl FnOnce(vk::PipelineCache) -> T) -> T {
     let d = &ctx().device;
+    let t = std::time::Instant::now();
+    let lap = |k: usize, t: &mut std::time::Instant| {
+        let n = std::time::Instant::now();
+        LAPS[k].fetch_add((n - *t).as_nanos() as u64, Ordering::Relaxed);
+        *t = n;
+    };
+    let mut t = t;
+    LAPS[6].fetch_add(1, Ordering::Relaxed);
     let path = DIR.get().map(|dir| dir.join(format!("{kind}{key:016x}.bin")));
     let file = path.as_ref().and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
     let whole = !file.starts_with(MAGIC);
-    let data = decode(&file).unwrap_or_default();
+    // (Taken out of the thread's slot while in use: `create` may make
+    // another pipeline.)
+    let mut data = DATA.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    if !decode_into(&file, &mut data) {
+        data.clear();
+    }
+    lap(0, &mut t);
     let cache = unsafe { d.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&data), None) }
         .or_else(|_| unsafe { d.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) })
         .unwrap_or(vk::PipelineCache::null());
+    lap(1, &mut t);
     let r = create(cache);
+    lap(2, &mut t);
     if cache == vk::PipelineCache::null() {
+        DATA.with(|b| *b.borrow_mut() = data);
         return r;
     }
     if let Some(p) = &path {
-        match unsafe { d.get_pipeline_cache_data(cache) } {
-            Ok(new) if new.len() != data.len() => {
-                let enc = encode(&new);
-                if write_file(p, &enc) {
-                    STATS[1].fetch_add(1, Ordering::Relaxed);
-                    STATS[2].fetch_add(enc.len() as u64, Ordering::Relaxed);
-                }
-            }
-            Ok(new) if whole && !file.is_empty() => {
-                // A file written whole: store it without its shared block.
+        // The creation added nothing when the cache's size is unchanged
+        // (the data itself, ~2 MB, is read back only when it grew).
+        let mut size = 0usize;
+        let sized = unsafe { (d.fp_v1_0().get_pipeline_cache_data)(d.handle(), cache, &mut size, std::ptr::null_mut()) } == vk::Result::SUCCESS;
+        let got = if sized && size == data.len() && !(whole && !file.is_empty()) {
+            Ok(None)
+        } else {
+            unsafe { d.get_pipeline_cache_data(cache) }.map(Some)
+        };
+        lap(3, &mut t);
+        match got {
+            Ok(None) => {
                 STATS[0].fetch_add(1, Ordering::Relaxed);
-                let enc = encode(&new);
-                if enc.len() < file.len() {
-                    write_file(p, &enc);
-                }
+                touch_later(p);
             }
-            Ok(_) => {
-                STATS[0].fetch_add(1, Ordering::Relaxed);
-                // Last use, for pruning.
-                if let Ok(f) = std::fs::File::options().write(true).open(p) {
-                    let _ = f.set_modified(std::time::SystemTime::now());
+            Ok(Some(new)) => match new {
+                new if new.len() != data.len() => {
+                    let enc = encode(&new);
+                    if write_file(p, &enc) {
+                        STATS[1].fetch_add(1, Ordering::Relaxed);
+                        STATS[2].fetch_add(enc.len() as u64, Ordering::Relaxed);
+                    }
                 }
-            }
+                new if whole && !file.is_empty() => {
+                    // A file written whole: store it without its shared block.
+                    STATS[0].fetch_add(1, Ordering::Relaxed);
+                    let enc = encode(&new);
+                    if enc.len() < file.len() {
+                        write_file(p, &enc);
+                    }
+                }
+                _ => {
+                    STATS[0].fetch_add(1, Ordering::Relaxed);
+                    touch_later(p);
+                }
+            },
             Err(e) => crate::warn!("pipeline cache: reading the data of {kind}{key:016x} failed ({e})"),
         }
+        lap(4, &mut t);
     }
     unsafe { d.destroy_pipeline_cache(cache, None) };
+    lap(5, &mut t);
+    DATA.with(|b| *b.borrow_mut() = data);
     r
 }
 
@@ -329,7 +404,22 @@ pub fn stored(kind: char, key: u64) -> bool {
 /// One status line.
 pub fn status() -> String {
     let s: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    format!("    pipeline cache files: {} pipelines from their file, {} written ({} MiB), {} pruned\n", s[0], s[1], s[2] >> 20, s[3])
+    let l: Vec<u64> = LAPS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let n = l[6].max(1) as f64 * 1000.0;
+    format!(
+        "    pipeline cache files: {} pipelines from their file, {} written ({} MiB), {} pruned; {} creations, us each: file and decode {:.0}, cache object {:.0}, creation {:.0}, data read back {:.0}, touch or write {:.0}, destroy {:.0}\n",
+        s[0],
+        s[1],
+        s[2] >> 20,
+        s[3],
+        l[6],
+        l[0] as f64 / n,
+        l[1] as f64 / n,
+        l[2] as f64 / n,
+        l[3] as f64 / n,
+        l[4] as f64 / n,
+        l[5] as f64 / n
+    )
 }
 
 /// `ThreadId::as_u64` is unstable: a stable number per thread from its debug
