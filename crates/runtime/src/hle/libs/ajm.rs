@@ -170,7 +170,7 @@ static NEXT_INSTANCE: AtomicU32 = AtomicU32::new(1);
 static NEXT_BATCH: AtomicU32 = AtomicU32::new(1);
 
 fn with_instances<R>(f: impl FnOnce(&mut HashMap<u32, Instance>) -> R) -> R {
-    f(INSTANCES.lock().get_or_insert_with(HashMap::new))
+    f(crate::gpu::lockstat::AJM.lock(&INSTANCES).get_or_insert_with(HashMap::new))
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +307,8 @@ unsafe fn new_at9(cfg: [u8; 4]) -> Option<Decoder> {
     Some(Decoder::At9Multi { handles, info, stream_sf })
 }
 
+/// Time decoding under the instances' lock (status reports).
+static DECODE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Decoders set up (multi-stream ones also apart) and contexts cleared
 /// (status reports).
 static INITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -576,7 +578,7 @@ static STATS: Stats = Stats {
 /// Decode statistics for status reports.
 pub fn status() -> String {
     format!(
-        "    ajm: {} run job(s), {} frame(s) decoded, {} PCM bytes, {} with errors (last result {:#x}); {} ATRAC9 decoder(s) set up ({} multi-stream), {} context clear(s)\n",
+        "    ajm: {} run job(s), {} frame(s) decoded, {} PCM bytes, {} with errors (last result {:#x}); {} ATRAC9 decoder(s) set up ({} multi-stream), {} context clear(s); {} ms decoding under the lock\n",
         STATS.jobs.load(Ordering::Relaxed),
         STATS.frames.load(Ordering::Relaxed),
         STATS.bytes.load(Ordering::Relaxed),
@@ -584,7 +586,8 @@ pub fn status() -> String {
         STATS.last_error.load(Ordering::Relaxed),
         INITS.load(Ordering::Relaxed),
         MULTI_INITS.load(Ordering::Relaxed),
-        CLEARS.load(Ordering::Relaxed)
+        CLEARS.load(Ordering::Relaxed),
+        DECODE_NS.load(Ordering::Relaxed) / 1_000_000
     )
 }
 
@@ -626,13 +629,15 @@ unsafe fn run_job(p: u64) -> i32 {
         let out_cap: usize = (0..nout).map(|i| *((outs + 16 * i + 8) as *const u64) as usize).sum();
         let mut pcm = Vec::with_capacity(out_cap);
         let (outcome, fmt) = {
-            let mut g = INSTANCES.lock();
+            let mut g = crate::gpu::lockstat::AJM.lock(&INSTANCES);
             let m = g.get_or_insert_with(HashMap::new);
             let Some(inst) = m.get_mut(&instance) else {
                 write_result(sb, sbsize, RESULT_INVALID_PARAMETER);
                 return 0;
             };
+            let t = std::time::Instant::now();
             let o = decode(inst, &input, out_cap, flags & FLAG_RUN_MULTIPLE_FRAMES != 0, &mut pcm);
+            DECODE_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let fmt = match &inst.decoder {
                 Decoder::At9 { info, .. } | Decoder::At9Multi { info, .. } => (info.channels as u32, info.sampling_rate as u32),
                 _ => (2, 48000),
@@ -922,7 +927,7 @@ sysv! {
         // Decoder setup writes libatrac9's shared tables: under the lock the
         // decoders run under.
         let info = {
-            let _g = INSTANCES.lock();
+            let _g = crate::gpu::lockstat::AJM.lock(&INSTANCES);
             match new_at9(cfg) {
                 Some(Decoder::At9 { info, .. }) | Some(Decoder::At9Multi { info, .. }) => info,
                 _ => return ERR_INVALID_PARAMETER,
@@ -999,7 +1004,9 @@ mod tests {
                     Atrac9GetCodecInfo(h, &mut pi);
                     let mut pcm = vec![0i16; pi.frame_samples as usize * pi.channels.max(1) as usize];
                     let (mut at, mut ok, mut bad) = (data, 0usize, 0usize);
-                    while at + pi.superframe_size as usize <= pre.len() {
+                    // DS_AT9_PRE_SUPERFRAMES: only its first n superframes.
+                    let n: usize = std::env::var("DS_AT9_PRE_SUPERFRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+                    while at + pi.superframe_size as usize <= pre.len().min(data.saturating_add(n.saturating_mul(pi.superframe_size as usize))) {
                         let mut pos = 0usize;
                         for _ in 0..pi.frames_in_superframe {
                             let mut used = 0i32;
@@ -1059,9 +1066,10 @@ mod tests {
         assert_eq!(at9_multi_config([0xfe, 0x72, 0x17, 0xe0]), None);
     }
 
-    /// Survey: every .at9 file under DS_AT9_DIR decoded as the title's jobs
-    /// feed one (the file from its header, then what each job leaves, 1 MiB
-    /// of PCM a job) through decode(); failures by result.
+    /// Survey: every .at9 file under DS_AT9_DIR and every one embedded in a
+    /// sound bank (.bnk) or an .xvag stream (after its header's padding)
+    /// decoded as the title's jobs feed one (from its header, then what each
+    /// job leaves, 1 MiB of PCM a job) through decode(); failures by result.
     /// `DS_AT9_DIR=<dir> dsport-<hash>.exe at9_survey --ignored --nocapture`
     #[test]
     #[ignore]
@@ -1074,7 +1082,7 @@ mod tests {
                 let p = e.path();
                 if p.is_dir() {
                     stack.push(p);
-                } else if p.extension().is_some_and(|x| x == "at9") {
+                } else if p.extension().is_some_and(|x| x == "at9" || x == "bnk" || x == "xvag") {
                     files.push(p);
                 }
             }
@@ -1085,13 +1093,33 @@ mod tests {
         let next = std::sync::atomic::AtomicUsize::new(0);
         let superframes = std::sync::atomic::AtomicU64::new(0);
         let multi = std::sync::atomic::AtomicUsize::new(0);
+        let streams = std::sync::atomic::AtomicUsize::new(0);
         let failed: Mutex<Vec<(u32, String, usize, u64)>> = Mutex::new(Vec::new());
         std::thread::scope(|s| {
             for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()) {
                 s.spawn(|| loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(path) = files.get(i) else { break };
-                    let mut input = std::fs::read(path).expect("read");
+                    let file = std::fs::read(path).expect("read");
+                    let ext = path.extension().and_then(|x| x.to_str()).unwrap_or("");
+                    let le32 = |b: &[u8], at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as usize;
+                    // The .at9 files in it: (start, end).
+                    let mut parts: Vec<(usize, usize)> = Vec::new();
+                    match ext {
+                        "bnk" | "xvag" => {
+                            let mut at = 0usize;
+                            while let Some(k) = file[at..].windows(4).position(|w| w == b"RIFF") {
+                                let r = at + k;
+                                if r + 12 <= file.len() && &file[r + 8..r + 12] == b"WAVE" {
+                                    parts.push((r, (r + 8 + le32(&file, r + 4)).min(file.len())));
+                                }
+                                at = r + 4;
+                            }
+                        }
+                        _ => parts.push((0, file.len())),
+                    }
+                    for (start, end) in parts {
+                    let mut input = file[start..end].to_vec();
                     // Zeroed slack after the input, as run_job leaves it.
                     let len = input.len();
                     input.resize(len + INPUT_SLACK, 0);
@@ -1106,7 +1134,7 @@ mod tests {
                             unsafe { decode(&mut inst, &input[off..], 1 << 20, true, &mut out) }
                         };
                         if o.result & !RESULT_PARTIAL_INPUT != 0 {
-                            failed.lock().push((o.result as u32, path.display().to_string(), off + o.consumed, n + o.frames as u64));
+                            failed.lock().push((o.result as u32, path.display().to_string(), start + off + o.consumed, n + o.frames as u64));
                             break;
                         }
                         n += o.frames as u64;
@@ -1119,12 +1147,14 @@ mod tests {
                         multi.fetch_add(1, Ordering::Relaxed);
                     }
                     superframes.fetch_add(n, Ordering::Relaxed);
+                    streams.fetch_add(1, Ordering::Relaxed);
+                    }
                 });
             }
         });
         let mut failed = failed.into_inner();
         failed.sort();
-        println!("{} files ({} multi-stream), {} superframes decoded, {} failed", files.len(), multi.load(Ordering::Relaxed), superframes.load(Ordering::Relaxed), failed.len());
+        println!("{} files, {} streams ({} multi-stream), {} superframes decoded, {} failed", files.len(), streams.load(Ordering::Relaxed), multi.load(Ordering::Relaxed), superframes.load(Ordering::Relaxed), failed.len());
         let mut codes: Vec<u32> = failed.iter().map(|f| f.0).collect();
         codes.dedup();
         for c in codes {

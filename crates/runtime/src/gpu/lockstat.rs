@@ -76,8 +76,11 @@ pub static WRITE_LOGS: LockStat = LockStat::new("write logs");
 /// The image cache (`images::with`: texture lookups, hazards, targets and
 /// the uploads made under it).
 pub static IMAGE_CACHE: LockStat = LockStat::new("image cache");
+/// Ajm's instances (`hle::libs::ajm`: every decode and control job holds it,
+/// on the title's job workers).
+pub static AJM: LockStat = LockStat::new("ajm instances");
 
-const ALL: [&LockStat; 4] = [&COPY_CACHE, &HOMES, &WRITE_LOGS, &IMAGE_CACHE];
+const ALL: [&LockStat; 5] = [&COPY_CACHE, &HOMES, &WRITE_LOGS, &IMAGE_CACHE, &AJM];
 
 /// Clears the counts (`profile reset`).
 pub fn reset_stats() {
