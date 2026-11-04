@@ -11589,6 +11589,7 @@ impl Exec {
 
     pub fn sync_for(&mut self, reads: &[(u64, u64)], why: usize) -> bool {
         note_read_census(reads, why);
+        super::fe2::note_wb_reads(reads);
         if super::runprobe::on() && self.name == "gpu-gfx" {
             super::runprobe::reads(reads);
         }

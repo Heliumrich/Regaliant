@@ -256,11 +256,19 @@ pub const MARK_WORDS: u32 = (MARK_SPAN_BYTES / 128) as u32;
 pub const MARK_PAGE_BITS_AT: u32 = MARK_WORDS;
 pub const MARK_LIST_AT: u32 = MARK_PAGE_BITS_AT + (MARK_SPAN_BYTES / 4096 / 32) as u32;
 pub const MARK_LIST_CAP: u32 = 1 << 20;
-/// Then one bit per page, unused since the lazy write-back study's census
-/// and image were removed (2026-11-01; the layout kept).
+/// Then one bit per page: the counting write-back's buckets
+/// (`mirror_scatter_counting`: WB_BUCKETS dword counts, then WB_BUCKETS
+/// page counts), else unused.
 pub const MARK_AUX_AT: u32 = MARK_LIST_AT + 4 + MARK_LIST_CAP;
 pub const MARK_AUX_WORDS: u32 = (MARK_SPAN_BYTES / 4096 / 32) as u32;
 pub const MARK_TOTAL_WORDS: u32 = MARK_AUX_AT + MARK_AUX_WORDS;
+/// `mirror_scatter_counting`'s buckets: 2^WB_BUCKET_SHIFT pages (1 MiB).
+pub const WB_BUCKET_SHIFT: u32 = 8;
+pub const WB_BUCKETS: u32 = (MARK_SPAN_BYTES / 4096 >> WB_BUCKET_SHIFT) as u32;
+/// Then a bit per bucket: its pages' dwords are left out of the counting
+/// write-back's stores (diagnosis, the runtime's `wbb lazy`).
+pub const WB_LAZY_AT: u32 = MARK_AUX_AT + 2 * WB_BUCKETS;
+const _: () = assert!(2 * WB_BUCKETS + WB_BUCKETS / 32 <= MARK_AUX_WORDS);
 
 /// Workgroup size of `mirror_gather`: one invocation per mark word of a
 /// page.
@@ -601,7 +609,7 @@ pub const SCATTER_LOCAL_SIZE: u32 = 256;
 /// map, binding 1 the SCATTER_COUNTERS counters. Push constants `{mirror
 /// (low, high), table (low, high)}`.
 pub fn mirror_scatter() -> Vec<u32> {
-    build_scatter(false).expect("mirror scatter kernel")
+    build_scatter(false, false).expect("mirror scatter kernel")
 }
 
 /// `mirror_scatter` emptying the touched-page list itself: workgroup 0's
@@ -611,10 +619,20 @@ pub fn mirror_scatter() -> Vec<u32> {
 /// dispatch made as many as the count), so the write-back needs no fill of
 /// the count and no barrier before one.
 pub fn mirror_scatter_reset() -> Vec<u32> {
-    build_scatter(true).expect("mirror scatter kernel (emptying the list)")
+    build_scatter(true, false).expect("mirror scatter kernel (emptying the list)")
 }
 
-fn build_scatter(reset: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
+/// `mirror_scatter_reset` that also adds, per bucket of 2^WB_BUCKET_SHIFT
+/// pages of the span, the dwords it writes back and the pages with any into
+/// the map's aux region ([dwords by bucket, then pages by bucket];
+/// diagnosis, the runtime's `DS_WB_BUCKETS`), and stores nothing for pages
+/// of buckets whose bit at WB_LAZY_AT is set (their marks cleared, their
+/// dwords counted as if stored).
+pub fn mirror_scatter_counting() -> Vec<u32> {
+    build_scatter(true, true).expect("mirror scatter kernel (counting buckets)")
+}
+
+fn build_scatter(reset: bool, count: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     let lit = Operand::LiteralBit32;
     let mut b = Builder::new();
     b.set_version(1, 3);
@@ -767,6 +785,24 @@ fn build_scatter(reset: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     let mapped = b.i_not_equal(bool_, None, dest, c0_64)?;
     let moff = b.i_mul(u64t, None, page64, c4096_64)?;
     let msrc = b.i_add(u64t, None, mirror, moff)?;
+    // (`count`: a page of a lazy bucket stores nothing; its dwords are
+    // counted as stored.)
+    let store_ok = if count {
+        let shift = c(&mut b, WB_BUCKET_SHIFT);
+        let bucket = b.shift_right_logical(u32t, None, page, shift)?;
+        let lw = b.shift_right_logical(u32t, None, bucket, c5)?;
+        let lazy_at = c(&mut b, WB_LAZY_AT);
+        let lwi = b.i_add(u32t, None, lazy_at, lw)?;
+        let plw = b.access_chain(p_u, None, marks, [c0, lwi])?;
+        let lword = b.load(u32t, None, plw, None, [])?;
+        let lbit = b.bitwise_and(u32t, None, bucket, c31)?;
+        let lsh = b.shift_right_logical(u32t, None, lword, lbit)?;
+        let lone = b.bitwise_and(u32t, None, lsh, c1)?;
+        let eager = b.i_equal(bool_, None, lone, c0)?;
+        b.logical_and(bool_, None, mapped, eager)?
+    } else {
+        mapped
+    };
     let bit_of = b.bitwise_and(u32t, None, lid, c31)?;
     // Dwords lid + 256 r, r = 0..3: marked ones copied.
     for r in 0..4u32 {
@@ -777,7 +813,7 @@ fn build_scatter(reset: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
         let sh = b.shift_right_logical(u32t, None, mw, bit_of)?;
         let bit = b.bitwise_and(u32t, None, sh, c1)?;
         let set = b.i_not_equal(bool_, None, bit, c0)?;
-        let go = b.logical_and(bool_, None, set, mapped)?;
+        let go = b.logical_and(bool_, None, set, store_ok)?;
         let (l_cp, l_cpd) = (b.id(), b.id());
         b.selection_merge(l_cpd, SelectionControl::NONE)?;
         b.branch_conditional(go, l_cp, l_cpd, [])?;
@@ -809,6 +845,21 @@ fn build_scatter(reset: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     let pdw = b.access_chain(p_u, None, counters, [c0, c1])?;
     let add = b.i_mul(u32t, None, total, which_dw)?;
     b.atomic_i_add(u32t, None, pdw, scope_dev, sem_none, add)?;
+    if count {
+        // (The page's bucket: its dwords, and the page once when any.)
+        let shift = c(&mut b, WB_BUCKET_SHIFT);
+        let bucket = b.shift_right_logical(u32t, None, page, shift)?;
+        let dw_at = c(&mut b, MARK_AUX_AT);
+        let bi = b.i_add(u32t, None, dw_at, bucket)?;
+        let pb = b.access_chain(p_u, None, marks, [c0, bi])?;
+        b.atomic_i_add(u32t, None, pb, scope_dev, sem_none, add)?;
+        let any = b.u_greater_than(bool_, None, add, c0)?;
+        let one = b.select(u32t, None, any, c1, c0)?;
+        let pg_at = c(&mut b, MARK_AUX_AT + WB_BUCKETS);
+        let pi = b.i_add(u32t, None, pg_at, bucket)?;
+        let pp = b.access_chain(p_u, None, marks, [c0, pi])?;
+        b.atomic_i_add(u32t, None, pp, scope_dev, sem_none, one)?;
+    }
     b.branch(l_cntd)?;
     b.begin_block(Some(l_cntd))?;
     // Every mask word read before any is cleared.
@@ -1115,6 +1166,17 @@ mod tests {
         if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
             let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("mirror_scatter_reset.spv"), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn scatter_counting_kernel_assembles() {
+        let w = super::mirror_scatter_counting();
+        assert_eq!(w[0], 0x0723_0203);
+        assert_ne!(w, super::mirror_scatter_reset());
+        if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("mirror_scatter_counting.spv"), bytes).unwrap();
         }
     }
 

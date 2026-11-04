@@ -1714,6 +1714,11 @@ fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &A
     if r.is_some() {
         hole_check(written);
     }
+    if wb_buckets() {
+        for &pg in written.iter() {
+            note_wb_pages(&WB_CPU_PAGES, pg, PAGE);
+        }
+    }
     super::hitch::note_since(super::hitch::Kind::Mirror, tt, || format!("take of {ta:#x}..{tb:#x} ({} pages)", (tb - ta) / PAGE));
     let tns = tt.elapsed().as_nanos() as u64;
     STATS[S_TAKE_NS].fetch_add(tns, Ordering::Relaxed);
@@ -2432,6 +2437,10 @@ fn watch() {
             let _ = f.flush();
         }
         for &(page, write, rip) in &got {
+            if write && wb_buckets() {
+                note_wb_pages(&WB_CPU_PAGES, page, PAGE);
+            }
+            note_wb_lazy_fault(page, write, rip);
             // (Pages of view windows: the residency tracks their writes, and
             // only the page written turns volatile.)
             if write && crate::mem::view_window(page) {
@@ -2829,8 +2838,9 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
         // unused.)
         let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 32 }];
         let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("scatter layout: {e}"))?;
-        // (The kernel empties the touched-page list itself.)
-        let code = rdna::kernels::mirror_scatter_reset();
+        // (The kernel empties the touched-page list itself; `DS_WB_BUCKETS`
+        // also counts by bucket.)
+        let code = if wb_buckets() { rdna::kernels::mirror_scatter_counting() } else { rdna::kernels::mirror_scatter_reset() };
         let make = |code: &[u32], key: u64| -> Result<vk::Pipeline, String> {
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None).map_err(|e| format!("scatter module: {e}"))?;
             let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
@@ -2839,7 +2849,7 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
             c.device.destroy_shader_module(module, None);
             Ok(pipeline?[0])
         };
-        let pipeline = make(&code, 20)?;
+        let pipeline = make(&code, if wb_buckets() { 27 } else { 20 })?;
         let compact = make(&rdna::kernels::mirror_compact(), 24)?;
         let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 4 }];
         let pool = c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(2).pool_sizes(&sizes), None).map_err(|e| format!("scatter pool: {e}"))?;
@@ -2882,6 +2892,261 @@ pub fn note_touch_bits() {
         TOUCH_BITS_EVER.store(true, Ordering::Relaxed);
         crate::info!("fe2: translations set touched bits alone from now on (`tune touch_bits`): write-backs make the touched-page list from them");
     }
+}
+
+/// `DS_WB_BUCKETS=1` (diagnosis): the write-back counts the dwords and
+/// pages it writes back per 1 MiB of the span (`rdna::kernels::
+/// mirror_scatter_counting`, the map's aux region), and status reports
+/// class those buckets by the pages the CPU wrote (takes, write faults) and
+/// the command processors read (`sync_for`) since the last report: how much
+/// of the volume lies where neither touches it (pages a write-back could
+/// leave out while their reads are detected).
+pub fn wb_buckets() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_WB_BUCKETS").ok().as_deref() == Some("1"))
+}
+
+/// `DS_WB_BUCKETS`: pages of the span the CPU wrote, and those the command
+/// processors read, since the last report (one bit a page).
+static WB_CPU_PAGES: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
+static WB_READ_PAGES: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
+/// The flip of the last report.
+static WB_FLIP: AtomicU64 = AtomicU64::new(0);
+/// The buckets the last report found untouched (`wbb lazy`).
+static WB_UNTOUCHED: parking_lot::Mutex<Vec<u32>> = parking_lot::Mutex::new(Vec::new());
+/// `wbb lazy`'s buckets (a bit each) and the page runs it armed no-access.
+static WB_LAZY_BITS: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
+static WB_LAZY_RUNS: parking_lot::Mutex<Vec<(u64, u64)>> = parking_lot::Mutex::new(Vec::new());
+/// Faults the host answered on those pages: [title, ours, other] x [read,
+/// write], then pages armed, runs failed.
+static WB_LAZY_FAULTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+fn wb_lazy_bits() -> &'static [AtomicU64] {
+    WB_LAZY_BITS.get_or_init(|| (0..rdna::kernels::WB_BUCKETS as usize / 64).map(|_| AtomicU64::new(0)).collect())
+}
+
+/// A fault the host answered (`watch`): counted when its page lies in a lazy
+/// bucket (`wbb lazy`), the first 30 logged with their code.
+fn note_wb_lazy_fault(page: u64, write: bool, rip: u64) {
+    if !wb_buckets() || !(MIRROR_BASE..MIRROR_END).contains(&page) {
+        return;
+    }
+    let k = ((page - MIRROR_BASE) >> (rdna::kernels::WB_BUCKET_SHIFT as u64 + 12)) as usize;
+    if wb_lazy_bits()[k / 64].load(Ordering::Relaxed) & (1 << (k % 64)) == 0 {
+        return;
+    }
+    let (b, e) = crate::exception::host_image();
+    let origin = if (crate::mem::GUEST_BASE..crate::mem::GUEST_END).contains(&rip) {
+        0
+    } else if (b..e).contains(&rip) {
+        1
+    } else {
+        2
+    };
+    let n = WB_LAZY_FAULTS[2 * origin + write as usize].fetch_add(1, Ordering::Relaxed);
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 30 {
+        crate::info!("fe2: wbb lazy: a {} of {page:#x} by {} ({}; this kind's {} so far)", if write { "write" } else { "read" }, ["the title", "ours", "other code"][origin], describe_code(rip), n + 1);
+    }
+}
+
+/// Control `wbb lazy` (diagnosis, wrong results where the title or a
+/// command processor reads such pages): the counting write-back leaves out
+/// the stores of the pages of the buckets the last report found untouched
+/// (their marks cleared, their dwords counted); `wbb eager`: none again.
+pub fn wbb_control(what: &str) -> Result<String, String> {
+    if !wb_buckets() {
+        return Err("wbb needs DS_WB_BUCKETS=1".into());
+    }
+    let n = (rdna::kernels::WB_BUCKETS / 32) as usize;
+    let mut bits = vec![0u32; n];
+    let count = match what {
+        "lazy" => {
+            let u = WB_UNTOUCHED.lock();
+            for &k in u.iter() {
+                bits[(k / 32) as usize] |= 1 << (k % 32);
+            }
+            u.len()
+        }
+        "eager" => 0,
+        _ => return Err("usage: wbb lazy|eager".into()),
+    };
+    // The bucket bits for the fault count, and their pages armed no-access
+    // (those nothing else armed, in runs) or disarmed again.
+    let lb = wb_lazy_bits();
+    for (i, w) in lb.iter().enumerate() {
+        let v = (bits[2 * i] as u64) | (bits[2 * i + 1] as u64) << 32;
+        w.store(v, Ordering::Relaxed);
+    }
+    let mut runs = WB_LAZY_RUNS.lock();
+    for &(a, n) in runs.iter() {
+        crate::hosted::disarm_if_armed(a, n);
+    }
+    runs.clear();
+    if what == "lazy" && crate::hosted::on() {
+        for &k in WB_UNTOUCHED.lock().iter() {
+            let lo = MIRROR_BASE + ((k as u64) << (rdna::kernels::WB_BUCKET_SHIFT as u64 + 12));
+            let hi = lo + (1u64 << (rdna::kernels::WB_BUCKET_SHIFT as u64 + 12));
+            let mut p = lo;
+            while p < hi {
+                // A run of pages nothing armed, readable and writable now.
+                if crate::hosted::armed(p) || !crate::mem::os_readable(p, PAGE) {
+                    p += PAGE;
+                    continue;
+                }
+                let mut q = p + PAGE;
+                while q < hi && !crate::hosted::armed(q) && crate::mem::os_readable(q, PAGE) {
+                    q += PAGE;
+                }
+                if crate::hosted::arm_noaccess(p, q - p).is_ok() {
+                    runs.push((p, q - p));
+                    WB_LAZY_FAULTS[6].fetch_add((q - p) / PAGE, Ordering::Relaxed);
+                } else {
+                    WB_LAZY_FAULTS[7].fetch_add(1, Ordering::Relaxed);
+                }
+                p = q;
+            }
+        }
+    }
+    let bytes: Vec<u8> = bits.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let at = rdna::kernels::WB_LAZY_AT as u64 * 4;
+    let c = ctx();
+    for on_c in [false, true] {
+        let Some(marks) = super::resident::marks_for(on_c) else { continue };
+        super::resident::one_off_now(|cmd| unsafe {
+            c.device.cmd_update_buffer(cmd, marks, at, &bytes);
+        })?;
+    }
+    Ok(format!("{count} buckets lazy"))
+}
+
+fn wb_bits(b: &std::sync::OnceLock<Box<[AtomicU64]>>) -> &[AtomicU64] {
+    b.get_or_init(|| (0..(MIRROR_END - MIRROR_BASE) / PAGE / 64).map(|_| AtomicU64::new(0)).collect())
+}
+
+fn note_wb_pages(b: &std::sync::OnceLock<Box<[AtomicU64]>>, a: u64, n: u64) {
+    let bits = wb_bits(b);
+    let lo = a.max(MIRROR_BASE);
+    let hi = a.saturating_add(n.max(1)).min(MIRROR_END);
+    let mut p = (lo - MIRROR_BASE) / PAGE;
+    while lo < hi && MIRROR_BASE + p * PAGE < hi {
+        bits[(p / 64) as usize].fetch_or(1 << (p % 64), Ordering::Relaxed);
+        p += 1;
+    }
+}
+
+/// `DS_WB_BUCKETS`: reads the command processors make of guest memory
+/// (`Exec::sync_for`).
+pub fn note_wb_reads(reads: &[(u64, u64)]) {
+    if wb_buckets() {
+        for &(a, n) in reads {
+            note_wb_pages(&WB_READ_PAGES, a, n);
+        }
+    }
+}
+
+/// Status part (`DS_WB_BUCKETS`): the window's write-back volume by bucket
+/// class (the counts read back from both written-bit maps' aux regions,
+/// which are cleared; a write-back racing the read-back may be lost to it),
+/// the largest buckets nothing else touched by mapping.
+fn wb_buckets_line() -> String {
+    if !wb_buckets() {
+        return String::new();
+    }
+    let c = ctx();
+    let nb = rdna::kernels::WB_BUCKETS as usize;
+    let words = 2 * nb as u64;
+    let at = rdna::kernels::MARK_AUX_AT as u64 * 4;
+    let mut gpu = vec![0u64; 2 * nb];
+    for on_c in [false, true] {
+        let Some(marks) = super::resident::marks_for(on_c) else { continue };
+        let Ok((hbuf, hmem, hptr)) = c.host_buffer(words * 4, vk::BufferUsageFlags::TRANSFER_DST) else {
+            return "    write-back buckets (`DS_WB_BUCKETS`): no host buffer\n".into();
+        };
+        let r = super::resident::one_off_now(|cmd| unsafe {
+            c.device.cmd_copy_buffer(cmd, marks, hbuf, &[vk::BufferCopy { src_offset: at, dst_offset: 0, size: words * 4 }]);
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_READ).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            c.device.cmd_fill_buffer(cmd, marks, at, words * 4, 0);
+        });
+        if r.is_ok() {
+            for (i, g) in gpu.iter_mut().enumerate() {
+                *g += unsafe { std::ptr::read_volatile((hptr as *const u32).add(i)) } as u64;
+            }
+        }
+        unsafe {
+            c.device.destroy_buffer(hbuf, None);
+            c.device.free_memory(hmem, None);
+        }
+        if let Err(e) = r {
+            return format!("    write-back buckets (`DS_WB_BUCKETS`): read-back failed: {e}\n");
+        }
+    }
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    let flips = frame.saturating_sub(WB_FLIP.swap(frame, Ordering::Relaxed)).max(1) as f64;
+    let (cpu, rd) = (wb_bits(&WB_CPU_PAGES), wb_bits(&WB_READ_PAGES));
+    let per = (1usize << rdna::kernels::WB_BUCKET_SHIFT) / 64;
+    // Classes: neither, read by a CP, CPU-written, both: [buckets, dwords, pages].
+    let mut cls = [[0u64; 3]; 4];
+    let mut quiet: Vec<(u64, u32)> = Vec::new();
+    let (mut cpu_pages_mixed, mut pages_mixed) = (0u64, 0u64);
+    for k in 0..nb {
+        let (dw, pg) = (gpu[k], gpu[nb + k]);
+        if dw == 0 && pg == 0 {
+            continue;
+        }
+        let cw: u32 = (0..per).map(|j| cpu[k * per + j].load(Ordering::Relaxed).count_ones()).sum();
+        let rw: u32 = (0..per).map(|j| rd[k * per + j].load(Ordering::Relaxed).count_ones()).sum();
+        let ci = (rw > 0) as usize + 2 * (cw > 0) as usize;
+        cls[ci][0] += 1;
+        cls[ci][1] += dw;
+        cls[ci][2] += pg;
+        if ci == 0 {
+            quiet.push((dw, k as u32));
+        } else if cw > 0 {
+            cpu_pages_mixed += cw as u64;
+            pages_mixed += 1 << rdna::kernels::WB_BUCKET_SHIFT;
+        }
+    }
+    for b in [cpu, rd] {
+        for x in b.iter() {
+            x.store(0, Ordering::Relaxed);
+        }
+    }
+    let (dw_all, pg_all): (u64, u64) = (cls.iter().map(|x| x[1]).sum(), cls.iter().map(|x| x[2]).sum());
+    let names = ["untouched", "read by our CPs", "CPU-written", "CPU-written and read"];
+    let parts: Vec<String> = cls
+        .iter()
+        .zip(names)
+        .map(|(x, n)| format!("{n}: {} buckets, {:.0}% of dwords ({:.2} M a flip), {:.0}% of pages ({:.0} a flip)", x[0], 100.0 * x[1] as f64 / dw_all.max(1) as f64, x[1] as f64 / flips / 1e6, 100.0 * x[2] as f64 / pg_all.max(1) as f64, x[2] as f64 / flips))
+        .collect();
+    // The untouched buckets by mapping, the largest first.
+    let mut by_map: std::collections::HashMap<(u64, u64, String), u64> = std::collections::HashMap::new();
+    *WB_UNTOUCHED.lock() = quiet.iter().map(|q| q.1).collect();
+    for &(dw, k) in &quiet {
+        let a = MIRROR_BASE + ((k as u64) << (rdna::kernels::WB_BUCKET_SHIFT + 12));
+        *by_map.entry(crate::mem::vma_label(a).unwrap_or((a, 0, "?".into()))).or_insert(0) += dw;
+    }
+    let mut maps: Vec<_> = by_map.into_iter().collect();
+    maps.sort_by(|a, b| b.1.cmp(&a.1));
+    let top: Vec<String> = maps.iter().take(8).map(|((s, z, n), dw)| format!("{n} {s:#x}+{z:#x} {:.2} M a flip", *dw as f64 / flips / 1e6)).collect();
+    let lf: Vec<u64> = WB_LAZY_FAULTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    format!(
+        "    write-back buckets (`DS_WB_BUCKETS`, 1 MiB, over {flips:.0} flips): {:.2} M dwords and {:.0} pages a flip; {}; the CPU wrote {:.1}% of the pages of the buckets it wrote; untouched by mapping: {}; `wbb lazy` pages armed no-access {} ({} runs failed), faults on them so far: the title {} reads / {} writes, ours {} / {}, other code {} / {}\n",
+        dw_all as f64 / flips / 1e6,
+        pg_all as f64 / flips,
+        parts.join("; "),
+        100.0 * cpu_pages_mixed as f64 / pages_mixed.max(1) as f64,
+        top.join(", "),
+        lf[6],
+        lf[7],
+        lf[0],
+        lf[1],
+        lf[2],
+        lf[3],
+        lf[4],
+        lf[5]
+    )
 }
 
 /// Records the write-back into `cmd` (outside a render pass): a barrier
@@ -3470,6 +3735,7 @@ pub fn status() -> String {
         + &run_share_line()
         + &callers_line()
         + &compacts
+        + &wb_buckets_line()
 }
 
 /// One status line: the mirror's pages by state now (a scan of every

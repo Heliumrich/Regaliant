@@ -400,6 +400,11 @@ pub fn disarm_if_armed(base: u64, len: u64) {
     }
 }
 
+/// Whether guest page `a` is armed now (its bit set).
+pub fn armed(a: u64) -> bool {
+    shared().and_then(|s| bit(s, a, false)).is_some_and(|(w, m)| w.load(Ordering::Acquire) & m != 0)
+}
+
 /// Guest [base, base+len) changed its mapping or protection: its pages are
 /// no longer armed (bits cleared, protection left as the change set it).
 pub fn forget(base: u64, len: u64) {
