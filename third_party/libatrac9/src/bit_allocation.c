@@ -114,7 +114,10 @@ void CalculatePrecisions(Channel* channel)
 		channel->PrecisionsFine[i] = 0;
 		if (channel->Precisions[i] > 15)
 		{
-			channel->PrecisionsFine[i] = channel->Precisions[i] - 15;
+			/* Demon's Souls port: fine precision capped at 15 (QuantizerFineStepSize
+			   has 16 entries). Uncapped, a unit at precision 31 read one bit too
+			   many per coefficient and misplaced the frame's next block. */
+			channel->PrecisionsFine[i] = (channel->Precisions[i] > 30 ? 30 : channel->Precisions[i]) - 15;
 			channel->Precisions[i] = 15;
 		}
 	}

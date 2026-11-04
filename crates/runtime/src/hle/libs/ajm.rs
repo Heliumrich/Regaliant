@@ -122,6 +122,9 @@ const OP_STATISTICS: u32 = 4;
 
 enum Decoder {
     At9 { handle: *mut c_void, info: At9Info },
+    /// Multi-stream ATRAC9 (`at9_multi_config`): a mono decoder per stream,
+    /// each stream's superframe `stream_sf` bytes; `info` describes the whole.
+    At9Multi { handles: Vec<*mut c_void>, info: At9Info, stream_sf: usize },
     Mp3 { handle: *mut c_void },
     None,
 }
@@ -148,12 +151,14 @@ struct Instance {
     reported: bool,
 }
 
-impl Drop for Instance {
+/// A replaced or dropped decoder releases its handle.
+impl Drop for Decoder {
     fn drop(&mut self) {
         unsafe {
-            match self.decoder {
-                Decoder::At9 { handle, .. } => Atrac9ReleaseHandle(handle),
-                Decoder::Mp3 { handle } => ds_mp3_free(handle),
+            match self {
+                Decoder::At9 { handle, .. } => Atrac9ReleaseHandle(*handle),
+                Decoder::At9Multi { handles, .. } => handles.iter().for_each(|&h| Atrac9ReleaseHandle(h)),
+                Decoder::Mp3 { handle } => ds_mp3_free(*handle),
                 Decoder::None => {}
             }
         }
@@ -231,23 +236,82 @@ unsafe fn store_pcm(out: &mut Vec<u8>, encoding: u32, samples: impl Iterator<Ite
     }
 }
 
-/// (Re)initializes an ATRAC9 decoder from 4 config bytes.
+/// (Re)initializes an ATRAC9 decoder from 4 config bytes: a fresh decoder
+/// for each stream. LibAtrac9's initialization sets the configuration but
+/// keeps the decoding state of the stream before (the superframe position,
+/// a mono block's primary channel and stereo units, previous scale factors,
+/// the transform's overlap); a rejected configuration leaves the instance's
+/// decoder as it was.
 unsafe fn init_at9(inst: &mut Instance, cfg: [u8; 4]) -> bool {
-    let mut cfg = cfg;
-    let h = match inst.decoder {
-        Decoder::At9 { handle, .. } => handle,
-        _ => unsafe { Atrac9GetHandle() },
-    };
-    if unsafe { Atrac9InitDecoder(h, cfg.as_mut_ptr()) } != 0 {
-        return false;
+    let Some(decoder) = (unsafe { new_at9(cfg) }) else { return false };
+    if let Decoder::At9Multi { handles, .. } = &decoder {
+        if MULTI_INITS.fetch_add(1, Ordering::Relaxed) < 2 {
+            crate::info!("ajm: multi-stream ATRAC9 decoder set up ({} streams, config {cfg:02x?})", handles.len());
+        }
     }
-    let mut info = At9Info::default();
-    unsafe { Atrac9GetCodecInfo(h, &mut info) };
-    inst.decoder = Decoder::At9 { handle: h, info };
+    inst.decoder = decoder;
     inst.total_decoded = 0;
     inst.skipped = 0;
+    INITS.fetch_add(1, Ordering::Relaxed);
     true
 }
+
+/// Multi-stream ATRAC9, configuration header byte 0x30 (the title's
+/// ambisonic .at9 files: 16, 9 and 4 channels): 4 bits sample rate index,
+/// 6 bits stream count - 1, 1 bit 0, 11 bits frame bytes - 1, 2 bits
+/// superframe index, each stream a mono ATRAC9 stream of that frame size.
+/// A superframe holds every stream's superframe: the streams' frames one
+/// after another, frame by frame, each stream's last frame followed by its
+/// superframe's padding. Read from the title's files (all of them decode
+/// so, FINDINGS.md 2026-11-04). Returns the stream count and the streams'
+/// standard configuration.
+fn at9_multi_config(cfg: [u8; 4]) -> Option<(usize, [u8; 4])> {
+    let v = u32::from_be_bytes(cfg);
+    if cfg[0] != 0x30 || (v >> 13) & 1 != 0 {
+        return None;
+    }
+    let (rate, streams, frame_m1, sf_index) = ((v >> 20) & 0xf, ((v >> 14) & 0x3f) as usize + 1, (v >> 2) & 0x7ff, v & 3);
+    Some((streams, ((0xFE << 24) | (rate << 20) | (frame_m1 << 5) | (sf_index << 3)).to_be_bytes()))
+}
+
+/// A fresh ATRAC9 decoder for 4 config bytes, standard or multi-stream.
+unsafe fn new_at9(cfg: [u8; 4]) -> Option<Decoder> {
+    let open = |c: [u8; 4]| -> Option<(*mut c_void, At9Info)> {
+        let mut c = c;
+        let h = unsafe { Atrac9GetHandle() };
+        if unsafe { Atrac9InitDecoder(h, c.as_mut_ptr()) } != 0 {
+            unsafe { Atrac9ReleaseHandle(h) };
+            return None;
+        }
+        let mut info = At9Info::default();
+        unsafe { Atrac9GetCodecInfo(h, &mut info) };
+        Some((h, info))
+    };
+    let Some((streams, mono)) = at9_multi_config(cfg) else {
+        return open(cfg).map(|(handle, info)| Decoder::At9 { handle, info });
+    };
+    let mut handles = Vec::with_capacity(streams);
+    let mut info = At9Info::default();
+    for _ in 0..streams {
+        let Some((h, i)) = open(mono) else {
+            handles.iter().for_each(|&h| unsafe { Atrac9ReleaseHandle(h) });
+            return None;
+        };
+        handles.push(h);
+        info = i;
+    }
+    let stream_sf = info.superframe_size as usize;
+    info.channels = streams as i32;
+    info.superframe_size *= streams as i32;
+    info.config = cfg;
+    Some(Decoder::At9Multi { handles, info, stream_sf })
+}
+
+/// Decoders set up (multi-stream ones also apart) and contexts cleared
+/// (status reports).
+static INITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MULTI_INITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CLEARS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// .at9 RIFF header: 'fmt ' (WAVE_FORMAT_EXTENSIBLE with the ATRAC9 GUID,
 /// config data at +44), optional 'fact' (total samples, skip samples), then
@@ -295,6 +359,40 @@ struct Outcome {
     frames: u32,
 }
 
+/// This port's error for a multi-stream block past its superframe.
+const ERR_AT9_LAYOUT: i32 = 0x82ff_0000u32 as i32;
+
+/// Logs the first failure of each error and frame (8 at most), the whole
+/// input saved beside the run's log (diagnosis with the at9_offline test).
+fn note_at9_error(r: i32, input: &[u8], at: usize, info: &At9Info) {
+    static REPORTED: Mutex<Vec<(i32, [u8; 16])>> = Mutex::new(Vec::new());
+    let mut key = (r, [0u8; 16]);
+    let hn = input.len().saturating_sub(at).min(16);
+    key.1[..hn].copy_from_slice(&input[at..at + hn]);
+    let k = {
+        let mut seen = REPORTED.lock();
+        if seen.len() >= 8 || seen.contains(&key) {
+            return;
+        }
+        seen.push(key);
+        seen.len() - 1
+    };
+    let head: Vec<String> = key.1[..hn].iter().map(|b| format!("{b:02x}")).collect();
+    let dumped = crate::run_dir().map(|d| d.join(format!("ajm_fail_{k}.bin"))).filter(|f| std::fs::write(f, input).is_ok());
+    crate::warn!(
+        "ajm: ATRAC9 decode error {:#x} at input {at}/{} (superframe {} bytes, {} frame(s) x {} samples, {} ch, config {:02x?}); input {}{}",
+        r as u32,
+        input.len(),
+        info.superframe_size,
+        info.frames_in_superframe,
+        info.frame_samples,
+        info.channels,
+        info.config,
+        head.join(""),
+        dumped.map(|f| format!("; input saved to {}", f.display())).unwrap_or_default()
+    );
+}
+
 /// Decodes from `input` into `out_cap` bytes of PCM (`out`).
 unsafe fn decode(inst: &mut Instance, input: &[u8], out_cap: usize, multiple: bool, out: &mut Vec<u8>) -> Outcome {
     let mut o = Outcome { result: 0, consumed: 0, produced: 0, frames: 0 };
@@ -335,19 +433,53 @@ unsafe fn decode(inst: &mut Instance, input: &[u8], out_cap: usize, multiple: bo
                     let r = unsafe { Atrac9Decode(*handle, input.as_ptr().add(o.consumed + pos), pcm.as_mut_ptr(), &mut u) };
                     if r != 0 {
                         o.result |= RESULT_CODEC_ERROR;
-                        static REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                        if REPORTED.fetch_add(1, Ordering::Relaxed) < 4 {
-                            let at = o.consumed + pos;
-                            let head: Vec<String> = input[at..(at + 16).min(input.len())].iter().map(|b| format!("{b:02x}")).collect();
-                            crate::warn!(
-                                "ajm: ATRAC9 decode error {:#x} at input {at}/{} (superframe {sf} bytes, {n} frame(s) x {fs} samples, {channels} ch); input {}",
-                                r as u32, input.len(), head.join("")
-                            );
-                        }
+                        note_at9_error(r, input, o.consumed + pos, info);
                         return o;
                     }
                     pos += u.max(0) as usize;
                     pcm_f.extend(pcm.iter().map(|&s| s as f32 / 32768.0));
+                }
+                used = sf;
+            }
+            Decoder::At9Multi { handles, info, stream_sf } => {
+                let sf = info.superframe_size as usize;
+                let n = info.frames_in_superframe as usize;
+                let fs = info.frame_samples as usize;
+                channels = handles.len();
+                if input.len() - o.consumed < sf {
+                    if o.frames == 0 {
+                        o.result |= RESULT_PARTIAL_INPUT;
+                    }
+                    break;
+                }
+                if out_cap - o.produced < n * fs * channels * bps {
+                    break;
+                }
+                // Frame by frame, each stream's block after the one before;
+                // a stream's last block takes the rest of its superframe.
+                let mut pcm = vec![0i16; fs];
+                let mut taken = vec![0usize; channels];
+                let mut pos = 0usize;
+                pcm_f.resize(n * fs * channels, 0.0);
+                for f in 0..n {
+                    for (c, &h) in handles.iter().enumerate() {
+                        let mut u = 0i32;
+                        let r = if pos < sf { unsafe { Atrac9Decode(h, input.as_ptr().add(o.consumed + pos), pcm.as_mut_ptr(), &mut u) } } else { ERR_AT9_LAYOUT };
+                        if r != 0 {
+                            o.result |= RESULT_CODEC_ERROR;
+                            note_at9_error(r, input, o.consumed + pos.min(sf), info);
+                            return o;
+                        }
+                        for (s, &v) in pcm.iter().enumerate() {
+                            pcm_f[(f * fs + s) * channels + c] = v as f32 / 32768.0;
+                        }
+                        if f + 1 < n {
+                            pos += u.max(0) as usize;
+                            taken[c] += u.max(0) as usize;
+                        } else {
+                            pos += stream_sf.saturating_sub(taken[c]);
+                        }
+                    }
                 }
                 used = sf;
             }
@@ -444,12 +576,15 @@ static STATS: Stats = Stats {
 /// Decode statistics for status reports.
 pub fn status() -> String {
     format!(
-        "    ajm: {} run job(s), {} frame(s) decoded, {} PCM bytes, {} with errors (last result {:#x})\n",
+        "    ajm: {} run job(s), {} frame(s) decoded, {} PCM bytes, {} with errors (last result {:#x}); {} ATRAC9 decoder(s) set up ({} multi-stream), {} context clear(s)\n",
         STATS.jobs.load(Ordering::Relaxed),
         STATS.frames.load(Ordering::Relaxed),
         STATS.bytes.load(Ordering::Relaxed),
         STATS.failed.load(Ordering::Relaxed),
-        STATS.last_error.load(Ordering::Relaxed)
+        STATS.last_error.load(Ordering::Relaxed),
+        INITS.load(Ordering::Relaxed),
+        MULTI_INITS.load(Ordering::Relaxed),
+        CLEARS.load(Ordering::Relaxed)
     )
 }
 
@@ -499,7 +634,7 @@ unsafe fn run_job(p: u64) -> i32 {
             };
             let o = decode(inst, &input, out_cap, flags & FLAG_RUN_MULTIPLE_FRAMES != 0, &mut pcm);
             let fmt = match &inst.decoder {
-                Decoder::At9 { info, .. } => (info.channels as u32, info.sampling_rate as u32),
+                Decoder::At9 { info, .. } | Decoder::At9Multi { info, .. } => (info.channels as u32, info.sampling_rate as u32),
                 _ => (2, 48000),
             };
             (o, (fmt, inst.encoding, inst.total_decoded, inst.gapless_total, inst.gapless_skip, inst.skipped))
@@ -585,10 +720,11 @@ unsafe fn control_job(p: u64) {
                             0
                         } else if inst.parse_riff && cfg[0] != 0xFE {
                             // RIFF-fed instances get their configuration from
-                            // the .at9 header of the first input; the title
-                            // initializes some with parameters that carry no
-                            // config data ({u32 0x7ec17330, u32 0} in Outpost
-                            // Passage). Reset and wait for the header.
+                            // the .at9 header of the first input: with
+                            // parameters the decoder cannot take, reset and
+                            // wait for the header. (The {u32 0x7ec17330} seen
+                            // in Outpost Passage is a multi-stream
+                            // configuration, `at9_multi_config`.)
                             inst.decoder = Decoder::None;
                             inst.total_decoded = 0;
                             inst.skipped = 0;
@@ -614,11 +750,16 @@ unsafe fn control_job(p: u64) {
                     _ => RESULT_INVALID_PARAMETER,
                 },
                 OP_CLEAR => {
+                    // A fresh decoder with the same configuration.
                     inst.total_decoded = 0;
                     inst.skipped = 0;
-                    if let Decoder::Mp3 { handle } = inst.decoder {
-                        ds_mp3_free(handle);
-                        inst.decoder = Decoder::Mp3 { handle: ds_mp3_new() };
+                    CLEARS.fetch_add(1, Ordering::Relaxed);
+                    match inst.decoder {
+                        Decoder::At9 { info, .. } | Decoder::At9Multi { info, .. } => {
+                            init_at9(inst, info.config);
+                        }
+                        Decoder::Mp3 { .. } => inst.decoder = Decoder::Mp3 { handle: ds_mp3_new() },
+                        Decoder::None => {}
                     }
                     0
                 }
@@ -776,13 +917,18 @@ sysv! {
     /// superframe_samples_per_channel, superframe_size}.
     fn sceAjmDecAt9ParseConfigData(config: *const u8, out: *mut u32) -> i32 {
         if config.is_null() || out.is_null() { return ERR_INVALID_PARAMETER; }
-        let h = Atrac9GetHandle();
         let mut cfg = [0u8; 4];
         std::ptr::copy_nonoverlapping(config, cfg.as_mut_ptr(), 4);
-        let mut info = At9Info::default();
-        let ok = Atrac9InitDecoder(h, cfg.as_mut_ptr()) == 0 && Atrac9GetCodecInfo(h, &mut info) == 0;
-        Atrac9ReleaseHandle(h);
-        if !ok || info.channels <= 0 { return ERR_INVALID_PARAMETER; }
+        // Decoder setup writes libatrac9's shared tables: under the lock the
+        // decoders run under.
+        let info = {
+            let _g = INSTANCES.lock();
+            match new_at9(cfg) {
+                Some(Decoder::At9 { info, .. }) | Some(Decoder::At9Multi { info, .. }) => info,
+                _ => return ERR_INVALID_PARAMETER,
+            }
+        };
+        if info.channels <= 0 { return ERR_INVALID_PARAMETER; }
         *out = info.channels as u32;
         *out.add(1) = info.sampling_rate as u32;
         *out.add(2) = info.frame_samples as u32;
@@ -800,4 +946,193 @@ pub fn register(r: &mut Registry) {
         sceAjmBatchJobGetStatistics, sceAjmBatchJobRunSplit, sceAjmBatchStart, sceAjmBatchWait,
         sceAjmBatchErrorDump, sceAjmDecAt9ParseConfigData,
     ]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Diagnosis: decodes an input an ATRAC9 decode error saved
+    /// (`ajm_fail_<k>.bin`) with the 4 configuration bytes it was decoded
+    /// with, or with the configuration of its own .at9 header when it has one,
+    /// and reports where libatrac9 fails, trying each byte offset of the first
+    /// frames too. `DS_AT9_INPUT=<file> DS_AT9_CONFIG=<8 hex digits> cargo
+    /// test --release -p dsport at9_offline -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn at9_offline() {
+        let path = std::env::var("DS_AT9_INPUT").expect("DS_AT9_INPUT");
+        let input = std::fs::read(&path).expect("input");
+        let hex = std::env::var("DS_AT9_CONFIG").unwrap_or_default();
+        let mut cfg = [0u8; 4];
+        for (k, b) in cfg.iter_mut().enumerate() {
+            *b = u8::from_str_radix(hex.get(2 * k..2 * k + 2).unwrap_or("00"), 16).unwrap_or(0);
+        }
+        let mut start = 0usize;
+        if input.len() > 12 && &input[..4] == b"RIFF" {
+            let mut inst = Instance { codec: CODEC_AT9, parse_riff: true, encoding: 0, max_channels: 2, decoder: Decoder::None, total_decoded: 0, gapless_total: 0, gapless_skip: 0, skipped: 0, ops: Vec::new(), reported: false };
+            match unsafe { parse_at9_riff(&mut inst, &input) } {
+                Ok(data) => {
+                    start = data;
+                    if let Decoder::At9 { info, .. } = &inst.decoder {
+                        println!("RIFF header: data at {data}, config {:02x?}", info.config);
+                        if hex.is_empty() {
+                            cfg = info.config;
+                        }
+                    }
+                }
+                Err(r) => println!("RIFF header not parsed: {r:#x}"),
+            }
+        }
+        unsafe {
+            let h = Atrac9GetHandle();
+            // DS_AT9_PRE: an .at9 file decoded first on the same handle (state
+            // a reused instance carries into the next stream).
+            if let Ok(pre) = std::env::var("DS_AT9_PRE") {
+                let pre = std::fs::read(pre).expect("DS_AT9_PRE");
+                let mut inst = Instance { codec: CODEC_AT9, parse_riff: true, encoding: 0, max_channels: 2, decoder: Decoder::None, total_decoded: 0, gapless_total: 0, gapless_skip: 0, skipped: 0, ops: Vec::new(), reported: false };
+                let data = parse_at9_riff(&mut inst, &pre).expect("DS_AT9_PRE's RIFF header");
+                if let Decoder::At9 { info, .. } = &inst.decoder {
+                    let mut c = info.config;
+                    assert_eq!(Atrac9InitDecoder(h, c.as_mut_ptr()), 0);
+                    let mut pi = At9Info::default();
+                    Atrac9GetCodecInfo(h, &mut pi);
+                    let mut pcm = vec![0i16; pi.frame_samples as usize * pi.channels.max(1) as usize];
+                    let (mut at, mut ok, mut bad) = (data, 0usize, 0usize);
+                    while at + pi.superframe_size as usize <= pre.len() {
+                        let mut pos = 0usize;
+                        for _ in 0..pi.frames_in_superframe {
+                            let mut used = 0i32;
+                            if Atrac9Decode(h, pre.as_ptr().add(at + pos), pcm.as_mut_ptr(), &mut used) == 0 { ok += 1 } else { bad += 1 }
+                            pos += used.max(0) as usize;
+                        }
+                        at += pi.superframe_size as usize;
+                    }
+                    println!("pre-stream config {:02x?}: {ok} frame(s) decoded, {bad} failed", info.config);
+                }
+            }
+            assert_eq!(Atrac9InitDecoder(h, cfg.as_mut_ptr()), 0, "config {cfg:02x?} rejected");
+            let mut info = At9Info::default();
+            Atrac9GetCodecInfo(h, &mut info);
+            println!("config {cfg:02x?}: {} ch, {} Hz, superframe {} bytes, {} frame(s) x {} samples", info.channels, info.sampling_rate, info.superframe_size, info.frames_in_superframe, info.frame_samples);
+            let mut pcm = vec![0i16; info.frame_samples as usize * info.channels.max(1) as usize];
+            // As decode() does: a superframe's frames one after another, the
+            // next superframe at the superframe size.
+            let (mut at, mut frames) = (start, 0usize);
+            'sf: while at + info.superframe_size as usize <= input.len() {
+                let mut pos = 0usize;
+                for _ in 0..info.frames_in_superframe {
+                    let mut used = 0i32;
+                    let r = Atrac9Decode(h, input.as_ptr().add(at + pos), pcm.as_mut_ptr(), &mut used);
+                    if r != 0 {
+                        println!("error {r:#x} at {} (superframe at {at}) after {frames} frame(s)", at + pos);
+                        break 'sf;
+                    }
+                    frames += 1;
+                    pos += used.max(0) as usize;
+                }
+                at += info.superframe_size as usize;
+            }
+            println!("{frames} frame(s) decoded of {}", (input.len() - start) / info.superframe_size.max(1) as usize);
+            // Which byte offsets of the first 256 decode a first frame.
+            let ok: Vec<usize> = (start..(start + 256).min(input.len())).filter(|&o| {
+                let h2 = Atrac9GetHandle();
+                let mut c2 = cfg;
+                Atrac9InitDecoder(h2, c2.as_mut_ptr());
+                let mut used = 0i32;
+                let r = if o + info.superframe_size as usize <= input.len() { Atrac9Decode(h2, input.as_ptr().add(o), pcm.as_mut_ptr(), &mut used) } else { -1 };
+                Atrac9ReleaseHandle(h2);
+                r == 0
+            }).collect();
+            println!("offsets from {start} that decode a first frame: {:?}", &ok[..ok.len().min(24)]);
+            Atrac9ReleaseHandle(h);
+        }
+    }
+
+    /// The title's multi-stream configurations (16-, 9- and 4-channel
+    /// ambisonic files) give mono streams of 96-byte frames, 4 a superframe.
+    #[test]
+    fn at9_multi_configs() {
+        for (cfg, streams) in [([0x30, 0x73, 0xc1, 0x7e], 16), ([0x30, 0x72, 0x01, 0x7e], 9), ([0x30, 0x70, 0xc1, 0x7e], 4)] {
+            assert_eq!(at9_multi_config(cfg), Some((streams, [0xfe, 0x70, 0x0b, 0xf0])));
+        }
+        assert_eq!(at9_multi_config([0xfe, 0x72, 0x17, 0xe0]), None);
+    }
+
+    /// Survey: every .at9 file under DS_AT9_DIR decoded as the title's jobs
+    /// feed one (the file from its header, then what each job leaves, 1 MiB
+    /// of PCM a job) through decode(); failures by result.
+    /// `DS_AT9_DIR=<dir> dsport-<hash>.exe at9_survey --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn at9_survey() {
+        let dir = std::env::var("DS_AT9_DIR").expect("DS_AT9_DIR");
+        let mut files = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from(dir)];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).expect("directory").flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "at9") {
+                    files.push(p);
+                }
+            }
+        }
+        files.sort();
+        // Decoder setup writes libatrac9's shared tables: one at a time.
+        let init = Mutex::new(());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let superframes = std::sync::atomic::AtomicU64::new(0);
+        let multi = std::sync::atomic::AtomicUsize::new(0);
+        let failed: Mutex<Vec<(u32, String, usize, u64)>> = Mutex::new(Vec::new());
+        std::thread::scope(|s| {
+            for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()) {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(path) = files.get(i) else { break };
+                    let mut input = std::fs::read(path).expect("read");
+                    // Zeroed slack after the input, as run_job leaves it.
+                    let len = input.len();
+                    input.resize(len + INPUT_SLACK, 0);
+                    input.truncate(len);
+                    let mut inst = Instance { codec: CODEC_AT9, parse_riff: true, encoding: 0, max_channels: 16, decoder: Decoder::None, total_decoded: 0, gapless_total: 0, gapless_skip: 0, skipped: 0, ops: Vec::new(), reported: false };
+                    let mut out = Vec::with_capacity(1 << 20);
+                    let (mut off, mut n) = (0usize, 0u64);
+                    while off < len {
+                        out.clear();
+                        let o = {
+                            let _g = (off == 0).then(|| init.lock());
+                            unsafe { decode(&mut inst, &input[off..], 1 << 20, true, &mut out) }
+                        };
+                        if o.result & !RESULT_PARTIAL_INPUT != 0 {
+                            failed.lock().push((o.result as u32, path.display().to_string(), off + o.consumed, n + o.frames as u64));
+                            break;
+                        }
+                        n += o.frames as u64;
+                        if o.consumed == 0 {
+                            break;
+                        }
+                        off += o.consumed;
+                    }
+                    if matches!(inst.decoder, Decoder::At9Multi { .. }) {
+                        multi.fetch_add(1, Ordering::Relaxed);
+                    }
+                    superframes.fetch_add(n, Ordering::Relaxed);
+                });
+            }
+        });
+        let mut failed = failed.into_inner();
+        failed.sort();
+        println!("{} files ({} multi-stream), {} superframes decoded, {} failed", files.len(), multi.load(Ordering::Relaxed), superframes.load(Ordering::Relaxed), failed.len());
+        let mut codes: Vec<u32> = failed.iter().map(|f| f.0).collect();
+        codes.dedup();
+        for c in codes {
+            let these: Vec<_> = failed.iter().filter(|f| f.0 == c).collect();
+            println!("result {c:#x}: {} file(s)", these.len());
+            for (_, p, at, n) in these.iter().take(6) {
+                println!("  {p} at {at} after {n} superframe(s)");
+            }
+        }
+    }
 }
