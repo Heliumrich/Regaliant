@@ -178,6 +178,50 @@ fn recover(dir: &Path) {
     }
 }
 
+/// Backups kept per save directory (`backup_once`).
+const BACKUPS: usize = 8;
+/// The save directories backed up this session.
+static BACKED_UP: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Copies `dir` as it is before this session's first change to it (a
+/// writable mount, a transaction, a deletion, a save-data memory write) to
+/// local-data/save-backups/<user>/<title>/<dir>/<UTC time>/, the newest
+/// BACKUPS kept: a session that damages or deletes a save leaves the state
+/// before it, restored by copying that folder back over the save's.
+fn backup_once(dir: &Path) {
+    let Some(root) = ROOT.get() else { return };
+    let Ok(rel) = dir.strip_prefix(root) else { return };
+    if !dir.is_dir() {
+        return;
+    }
+    {
+        let mut done = BACKED_UP.lock();
+        if done.iter().any(|d| d == dir) {
+            return;
+        }
+        done.push(dir.to_path_buf());
+    }
+    let base = root.parent().unwrap_or(root).join("save-backups").join(rel);
+    let to = base.join(crate::utc_stamp());
+    match copy_dir(dir, &to) {
+        Ok(n) => crate::info!("savedata: '{}' backed up before this session's first change ({n} files): {}", dir_label(dir), to.display()),
+        Err(e) => {
+            crate::warn!("savedata: backup of '{}' to {} failed: {e}", dir_label(dir), to.display());
+            let _ = std::fs::remove_dir_all(&to);
+            return;
+        }
+    }
+    // (Folder names are UTC times: oldest first.)
+    if let Ok(rd) = std::fs::read_dir(&base) {
+        let mut old: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        old.sort();
+        let n = old.len().saturating_sub(BACKUPS);
+        for p in &old[..n] {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+}
+
 fn read_blocks(dir: &std::path::Path) -> u64 {
     std::fs::read(dir.join("sce_sys").join("blocks"))
         .ok()
@@ -247,6 +291,7 @@ sysv! {
         } else if mode & MOUNT_CREATE != 0 && mode & MOUNT_CREATE2 == 0 {
             return ERR_EXISTS;
         }
+        if mode & MOUNT_RDONLY == 0 && !created { backup_once(&path); }
         let mp = match mount_at_free_slot(path, mode & MOUNT_RDONLY == 0) { Ok(x) => x, Err(e) => return e };
         std::ptr::write_bytes(result, 0, 64);
         crate::hle::write_cstr(result, 16, &mp);
@@ -350,6 +395,7 @@ sysv! {
         let path = user_root(user, title).join(&name);
         if !path.exists() { return ERR_NOT_FOUND; }
         crate::info!("sceSaveDataDelete '{name}'");
+        backup_once(&path);
         if std::fs::remove_dir_all(&path).is_err() { return ERR_INTERNAL; }
         0
     }
@@ -407,6 +453,7 @@ sysv! {
         } else if mode & MOUNT_CREATE != 0 && mode & MOUNT_CREATE2 == 0 {
             return ERR_EXISTS;
         }
+        if mode & MOUNT_RDONLY == 0 && !created { backup_once(&path); }
         let mp = match mount_at_free_slot(path, mode & MOUNT_RDONLY == 0) { Ok(x) => x, Err(e) => return e };
         std::ptr::write_bytes(result, 0, 64);
         crate::hle::write_cstr(result, 16, &mp);
@@ -436,6 +483,7 @@ sysv! {
         let mut mounts = MOUNTS.lock();
         let Some(m) = mounts[i].as_mut() else { return ERR_NOT_MOUNTED };
         if m.staging.is_none() {
+            backup_once(&m.dir);
             let staging = staging_path(&m.dir);
             let _ = std::fs::remove_dir_all(&staging);
             match copy_dir(&m.dir, &staging) {
@@ -491,7 +539,9 @@ sysv! {
 
     fn sceSaveDataSetSaveDataMemory(user: i32, buf: *const u8, size: u64, offset: i64) -> i32 {
         use std::os::windows::fs::FileExt;
-        let f = match std::fs::OpenOptions::new().write(true).open(memory_file(user)) { Ok(f) => f, Err(_) => return ERR_NOT_FOUND };
+        let path = memory_file(user);
+        if let Some(d) = path.parent() { backup_once(d); }
+        let f = match std::fs::OpenOptions::new().write(true).open(&path) { Ok(f) => f, Err(_) => return ERR_NOT_FOUND };
         let what = || format!("save data memory write [{offset:#x}+{size:#x}] from {:#x}", buf as u64);
         if crate::mem::kernel_io(&what, buf as u64, size, false, || f.seek_write(std::slice::from_raw_parts(buf, size as usize), offset as u64)).is_err() { return ERR_INTERNAL; }
         0
@@ -724,6 +774,32 @@ mod tests {
         recover(&dir);
         assert_eq!(std::fs::read_to_string(dir.join("USR-DATA")).unwrap(), "newer");
         assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A save directory is copied once a session, before its first change,
+    /// and only the newest BACKUPS copies stay.
+    #[test]
+    fn backups_once_a_session() {
+        let base = std::env::temp_dir().join(format!("dsport-savebackup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        ROOT.set(base.join("saves")).ok();
+        let root = ROOT.get().unwrap().clone();
+        let dir = root.join("1").join("PPSA01341").join("SAVEDATA0PlayerProfile0");
+        std::fs::create_dir_all(dir.join("sce_sys")).unwrap();
+        std::fs::write(dir.join("USR-DATA"), "before").unwrap();
+        let backups = root.parent().unwrap().join("save-backups").join("1").join("PPSA01341").join("SAVEDATA0PlayerProfile0");
+        for k in 0..BACKUPS + 2 {
+            std::fs::create_dir_all(backups.join(format!("20000101-0000{k:02}"))).unwrap();
+        }
+        backup_once(&dir);
+        std::fs::write(dir.join("USR-DATA"), "after").unwrap();
+        backup_once(&dir);
+        let mut kept: Vec<String> = std::fs::read_dir(&backups).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        kept.sort();
+        assert_eq!(kept.len(), BACKUPS);
+        assert_eq!(std::fs::read_to_string(backups.join(kept.last().unwrap()).join("USR-DATA")).unwrap(), "before");
+        assert!(backups.join(kept.last().unwrap()).join("sce_sys").is_dir());
         let _ = std::fs::remove_dir_all(&base);
     }
 }

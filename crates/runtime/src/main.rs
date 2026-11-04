@@ -114,7 +114,7 @@ unsafe impl std::alloc::GlobalAlloc for GuardedAlloc {
 #[global_allocator]
 static ALLOCATOR: GuardedAlloc = GuardedAlloc;
 
-fn utc_stamp() -> String {
+pub(crate) fn utc_stamp() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     let days = secs.div_euclid(86400);
     let rem = secs.rem_euclid(86400);
