@@ -1759,10 +1759,17 @@ fn import_once(base: u64, size: u64) -> Option<Option<(vk::Buffer, u64, u64)>> {
             static REPORTED: AtomicU64 = AtomicU64::new(0);
             let k = REPORTED.fetch_add(1, Ordering::Relaxed);
             let heaps = if k < 4 { format!(" (memory: {}; {} imports dropped after remapping not freed yet)", super::vk::ctx_heaps(), GRAVEYARD_LEN.load(Ordering::Relaxed)) } else { String::new() };
-            // What the operating system holds there (the first failures of
-            // each window: uncommitted or protected pages fail an import).
+            // What the operating system holds there (the first failure of
+            // each of the first 64 windows: uncommitted or protected pages
+            // fail an import; a boot's early failures repeat in a few windows
+            // thousands of times, which a count of failures used up).
             static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
-            if SEEN.lock().get_or_insert_with(HashSet::new).insert(start) && k < 64 {
+            let first = {
+                let mut g = SEEN.lock();
+                let seen = g.get_or_insert_with(HashSet::new);
+                seen.len() < 64 && seen.insert(start)
+            };
+            if first {
                 crate::warn!("gpu: import of {start:#x}..{end:#x} failed over: {}", crate::mem::os_regions(start, end - start, 12));
             }
             crate::warn!("gpu: importing guest {start:#x}..{end:#x} failed: {e}{heaps}");
