@@ -1907,9 +1907,6 @@ struct Submission {
     ctl: Option<Ctl>,
     /// The queue's submission count when it was queued (its number).
     index: u64,
-    /// Front end 2: the epoch that began when the title submitted it
-    /// (`fe2::NO_VIEW`: none; it ends one when it starts).
-    epoch: u32,
 }
 
 /// Work for a queue's command processor besides command buffers (frame
@@ -1930,7 +1927,7 @@ pub(crate) fn enqueue(queue_id: u32, bufs: Vec<(u64, u32)>, ctl: Option<Ctl>) {
     let q = queue(queue_id);
     let mut g = q.pending.lock();
     let index = q.submitted.fetch_add(1, Ordering::SeqCst) + 1;
-    g.push_back(Submission { bufs, hashes: Vec::new(), copies: Vec::new(), at: std::time::Instant::now(), ctl, index, epoch: fe2::NO_VIEW });
+    g.push_back(Submission { bufs, hashes: Vec::new(), copies: Vec::new(), at: std::time::Instant::now(), ctl, index });
     drop(g);
     q.cv.notify_one();
 }
@@ -2213,7 +2210,7 @@ fn worker(q: &'static Queue, name: &str) {
         // kept until it settles, to run again from the wait if what was
         // recorded past it is dropped (`Cp::take_rewind_sub`).
         if cp.holds_across() {
-            kept.push(Kept { index: batch.index, bufs: batch.bufs.clone(), at: batch.at, epoch: batch.epoch });
+            kept.push(Kept { index: batch.index, bufs: batch.bufs.clone(), at: batch.at });
         }
         run_submission(&mut cp, &batch, name);
         while let Some((s, buf, addr)) = cp.take_rewind_sub() {
@@ -2238,7 +2235,7 @@ fn worker(q: &'static Queue, name: &str) {
         }
         if cp.holds_across() {
             if !kept.iter().any(|x| x.index == batch.index) {
-                kept.push(Kept { index: batch.index, bufs: batch.bufs.clone(), at: batch.at, epoch: batch.epoch });
+                kept.push(Kept { index: batch.index, bufs: batch.bufs.clone(), at: batch.at });
             }
         } else {
             kept.clear();
@@ -2262,7 +2259,6 @@ struct Kept {
     index: u64,
     bufs: Vec<(u64, u32)>,
     at: std::time::Instant,
-    epoch: u32,
 }
 
 /// Runs a kept submission again, from buffer `from.0` at address `from.1`
@@ -2270,7 +2266,7 @@ struct Kept {
 fn run_kept(cp: &mut cp::Cp, k: &Kept, from: Option<(usize, u64)>, name: &str) {
     cp.submitted_at = Some(k.at);
     cp.sub_index = k.index;
-    cp.new_submission(k.epoch);
+    cp.new_submission();
     let nbufs = k.bufs.len();
     let (mut i, mut at) = match from {
         Some((b, a)) => (b, Some(a)),
@@ -2307,7 +2303,7 @@ fn run_kept(cp: &mut cp::Cp, k: &Kept, from: Option<(usize, u64)>, name: &str) {
 fn run_submission(cp: &mut cp::Cp, batch: &Submission, name: &str) {
     cp.submitted_at = Some(batch.at);
     cp.sub_index = batch.index;
-    cp.new_submission(batch.epoch);
+    cp.new_submission();
     let nbufs = batch.bufs.len();
     // (Recording past a parallel run may go back to an earlier buffer of
     // the submission: `Cp::take_rewind`.)
@@ -2430,16 +2426,6 @@ pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
         }
     }
     let index = q.submitted.fetch_add(1, Ordering::SeqCst) + 1;
-    // Front end 2: the CPU writes this work must see came before now; an
-    // epoch begins here and the queue's checks for it need that one (the
-    // command processors run ~20 ms behind the title: takes made meanwhile
-    // serve their checks; FRONTEND2.md "Lagged views").
-    let epoch = if fe2::on() {
-        precache::end_scope(0);
-        precache::epoch() as u32
-    } else {
-        fe2::NO_VIEW
-    };
     if trace_submit() {
         let (d, w, o) = buffers.iter().map(|&(a, n)| packet_mix(a, n)).fold((0, 0, 0), |x, y| (x.0 + y.0, x.1 + y.1, x.2 + y.2));
         crate::info!("submit trace: queue {queue_id:#x} #{index} {:#x}+{} (done {}) dispatches {d} draws {w} other {o}", buffers[0].0, buffers[0].1, q.done.load(Ordering::SeqCst));
@@ -2455,7 +2441,7 @@ pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
     }
     // In queue order (under the queue's lock): the replay keeps each queue's.
     replay::note_submitted(queue_id, &buffers);
-    g.push_back(Submission { bufs: buffers, hashes, copies, at: std::time::Instant::now(), ctl: None, index, epoch });
+    g.push_back(Submission { bufs: buffers, hashes, copies, at: std::time::Instant::now(), ctl: None, index });
     q.cv.notify_one();
     // DS_SUBMIT_SYNC=small (up to SMALL_SUBMIT dwords) or =1 (all),
     // diagnostic: the submit returns once its work completed (no CPU/GPU
