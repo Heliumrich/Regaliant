@@ -399,6 +399,15 @@ pub struct Spec {
     /// the list append) only when it finds it clear, and the mark words one
     /// store sets in one page touch that page once (`touch_page`).
     pub touch_test: bool,
+    /// With `write_marks` (the runtime's `tune skip_same`): a raw dword store
+    /// into a marked resource (one bound in the mirror) reads the dwords it
+    /// would write first and leaves out the store and its marks when they
+    /// hold its values already: the mirror's words are what guest memory
+    /// holds, or what a pending write-back will store there (a third to
+    /// three fifths of the dwords written back were unchanged, FRONTEND2.md
+    /// F5). Unmarked resources, formatted and sub-dword stores and atomics
+    /// store and mark as before.
+    pub skip_same: bool,
     /// How the SGPR data binding is declared: 0 a storage buffer (u32
     /// array), 1 a uniform buffer (`BindingKind::SgprUniform`: a std140
     /// array of uvec4 sized to the plan's SGPR data) where the binding is the
@@ -539,6 +548,9 @@ impl std::hash::Hash for Spec {
         }
         if self.touch_test {
             0x5454_5354u32.hash(state);
+        }
+        if self.skip_same {
+            0x534B_5053u32.hash(state);
         }
         if self.sgpr_ubo != 0 {
             (0x5542_4F00u32 | self.sgpr_ubo as u32).hash(state);
@@ -4065,6 +4077,7 @@ mod tests {
             marks_untouched: false,
             touch_bits: false,
             touch_test: false,
+            skip_same: false,
             sgpr_ubo: 0,
             gpu_loads: 0,
             gpu_res: 0,
@@ -4217,6 +4230,32 @@ mod tests {
         if let Ok(dir) = std::env::var("RDNA_MARKS_DUMP") {
             let bytes: Vec<u8> = b.spirv.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("write_marks.spv"), bytes).unwrap();
+        }
+    }
+
+    /// `Spec::skip_same`: a raw dword store (`buffer_store_dword v1, v0,
+    /// s[0:3], 0 offen`) goes behind a read of what it would write; the
+    /// bindings stay as with the marks alone. RDNA_MARKS_DUMP=<dir> writes
+    /// skip_same.spv for spvval.
+    #[test]
+    fn skip_same_stores() {
+        let words = [0xE070_1000, 0x8000_0100, 0xBF81_0000];
+        let code = crate::decode_program(&words).unwrap();
+        let plan = crate::analysis::analyze(&code, 4, 0);
+        assert!(plan.resources.iter().any(|r| r.written));
+        let mut spec = cs_spec([64, 1, 1]);
+        spec.resources = plan.resources.iter().map(|_| ResSpec::Buffer { format: 0, dst_sel: 0xFAC }).collect();
+        spec.write_marks = true;
+        spec.touch_test = true;
+        let c = translate(&code, &plan, &spec).unwrap();
+        spec.skip_same = true;
+        let d = translate(&code, &plan, &spec).unwrap();
+        assert_eq!(c.bindings.len(), d.bindings.len());
+        assert_eq!(c.warnings, d.warnings);
+        assert!(d.spirv.len() > c.spirv.len());
+        if let Ok(dir) = std::env::var("RDNA_MARKS_DUMP") {
+            let bytes: Vec<u8> = d.spirv.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("skip_same.spv"), bytes).unwrap();
         }
     }
 

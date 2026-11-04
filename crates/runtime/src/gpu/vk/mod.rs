@@ -1213,9 +1213,14 @@ impl Ctx {
     }
 
     pub fn wait_batch(&self, seq: u64, timeout_ns: u64) -> bool {
+        self.wait_batch_result(seq, timeout_ns).is_ok()
+    }
+
+    /// `wait_batch` telling a timeout (`vk::Result::TIMEOUT`) from an error.
+    pub fn wait_batch_result(&self, seq: u64, timeout_ns: u64) -> Result<(), vk::Result> {
         let s = [self.batches];
         let v = [seq];
-        unsafe { self.device.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&s).values(&v), timeout_ns) }.is_ok()
+        unsafe { self.device.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&s).values(&v), timeout_ns) }
     }
 
     /// The compute family's queue's batch timeline now (the highest batch
@@ -1226,10 +1231,15 @@ impl Ctx {
 
     /// `wait_batch` for a batch on the compute family's queue.
     pub fn wait_batch_c(&self, seq: u64, timeout_ns: u64) -> bool {
-        let Some(q) = self.compute.as_ref() else { return false };
+        self.wait_batch_c_result(seq, timeout_ns).is_ok()
+    }
+
+    /// `wait_batch_c` telling a timeout (`vk::Result::TIMEOUT`) from an error.
+    pub fn wait_batch_c_result(&self, seq: u64, timeout_ns: u64) -> Result<(), vk::Result> {
+        let Some(q) = self.compute.as_ref() else { return Err(vk::Result::ERROR_UNKNOWN) };
         let s = [q.batches];
         let v = [seq];
-        unsafe { self.device.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&s).values(&v), timeout_ns) }.is_ok()
+        unsafe { self.device.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&s).values(&v), timeout_ns) }
     }
 
     /// Submits command buffers that execute in order (binary semaphores).

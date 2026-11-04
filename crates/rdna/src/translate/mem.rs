@@ -1631,6 +1631,43 @@ fn touch_set(tr: &mut T, marks: Word, pp: Word, page: Word, pb: Word) -> R<()> {
     })
 }
 
+/// `Spec::skip_same`: the dwords `vals` at byte `addr` of resource `r`
+/// (dword `d0`) stored and marked only when the binding is marked (in the
+/// mirror) and one of them differs from what it holds; an unmarked binding
+/// stores as before (its words may lie in host memory: no read of them).
+/// The read and the store take the same words (`load_dwords`, `store_dwords`).
+fn store_if_changed(tr: &mut T, r: usize, var: Word, addr: Word, vals: &[Word], d0: Word) -> R<()> {
+    let b = tr.t.bool_;
+    let n = vals.len() as u32;
+    let base = tr.addr_info(r, 3)?;
+    let none = tr.u(u32::MAX);
+    let marked = e(tr.b.i_not_equal(b, None, base, none))?;
+    let (merge, marked_b, plain_b) = (tr.b.id(), tr.b.id(), tr.b.id());
+    ok(tr.b.selection_merge(merge, spirv::SelectionControl::NONE))?;
+    ok(tr.b.branch_conditional(marked, marked_b, plain_b, []))?;
+    e(tr.b.begin_block(Some(marked_b)))?;
+    let old = load_dwords(tr, var, addr, n, false)?;
+    let mut changed = None;
+    for (o, v) in old.iter().zip(vals) {
+        let ne = e(tr.b.i_not_equal(b, None, *o, *v))?;
+        changed = Some(match changed {
+            None => ne,
+            Some(c) => e(tr.b.logical_or(b, None, c, ne))?,
+        });
+    }
+    let changed = changed.ok_or("a store of no dwords")?;
+    tr.guarded(changed, &mut |tr| {
+        store_dwords(tr, var, addr, vals)?;
+        mark_dwords(tr, r, d0, n)
+    })?;
+    ok(tr.b.branch(merge))?;
+    e(tr.b.begin_block(Some(plain_b)))?;
+    store_dwords(tr, var, addr, vals)?;
+    ok(tr.b.branch(merge))?;
+    e(tr.b.begin_block(Some(merge)))?;
+    Ok(())
+}
+
 /// `mark_dwords` for a store of `nbytes` (1 or 2) at byte `addr`: the one or
 /// two dwords holding them.
 fn mark_bytes(tr: &mut T, r: usize, addr: Word, nbytes: u32) -> R<()> {
@@ -1796,10 +1833,14 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, r: usize, var: Word, addr: Wor
                     for k in 0..n {
                         vals.push(tr.store_vreg(vd + k)?);
                     }
-                    store_dwords(tr, var, addr, &vals)?;
                     let two = tr.u(2);
                     let d0 = e(tr.b.shift_right_logical(u, None, addr, two))?;
-                    mark_dwords(tr, r, d0, n)?;
+                    if tr.spec.skip_same && tr.marks.is_some() {
+                        store_if_changed(tr, r, var, addr, &vals, d0)?;
+                    } else {
+                        store_dwords(tr, var, addr, &vals)?;
+                        mark_dwords(tr, r, d0, n)?;
+                    }
                 }
                 "byte" | "short" | "byte_d16_hi" | "short_d16_hi" => {
                     let nb = if kind.starts_with("byte") { 1 } else { 2 };

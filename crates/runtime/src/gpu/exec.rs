@@ -4138,6 +4138,58 @@ static RELEASED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static RELEASED_LOCK: Mutex<()> = Mutex::new(());
 static RELEASED_CV: parking_lot::Condvar = parking_lot::Condvar::new();
 
+/// Waits for release `r`'s batch on device queue `q` (0 the main queue, 1
+/// the compute family's): whether it completed, and else why not. A batch
+/// may wait on the GPU for a value a batch recorded later signals (a
+/// promise: a label of another queue's command processor), and that
+/// processor may be held up for seconds (a pipeline compiled at first use
+/// at a level load): 10 s without completion while other GPU work completed
+/// is that wait, not a lost device (2026-11-03's -082123 and 2026-11-04's
+/// -185054 stopped a GPU that went on completing batches). So the device
+/// stops only on an error (a real fault comes back as device lost, the
+/// driver's own reset included), on 10 s without a completion on either
+/// queue, or after WAIT_CAP_S in all.
+fn wait_release_done(q: usize, r: &Release) -> (bool, String) {
+    const WINDOW_NS: u64 = 10_000_000_000;
+    const WAIT_CAP_S: u64 = 120;
+    let progress = || (ctx().batch_value(), ctx().batch_value_c());
+    let t0 = std::time::Instant::now();
+    loop {
+        let before = progress();
+        let res = if q == 1 { ctx().wait_batch_c_result(r.seq, WINDOW_NS) } else { ctx().wait_batch_result(r.seq, WINDOW_NS) };
+        match res {
+            Ok(()) => return (true, String::new()),
+            Err(vk::Result::TIMEOUT) => {
+                let waited = t0.elapsed().as_secs();
+                let after = progress();
+                if after == before {
+                    return (false, format!("{} (no GPU work completed on either queue in 10 s)", vk::Result::TIMEOUT));
+                }
+                if waited >= WAIT_CAP_S {
+                    return (false, format!("{} (after {waited} s while other GPU work completed)", vk::Result::TIMEOUT));
+                }
+                WAIT_EXTENDED.fetch_add(1, Ordering::Relaxed);
+                let list: Vec<String> = r.shaders.iter().take(8).map(|a| format!("{a:#x}")).collect();
+                crate::warn!(
+                    "gpu[{}]: batch #{} not complete after {waited} s while other GPU work completed (batches {} -> {} and {} -> {}): waiting on (shaders {}; {})",
+                    r.name,
+                    r.seq,
+                    before.0,
+                    after.0,
+                    before.1,
+                    after.1,
+                    list.join(" "),
+                    ops_line(&r.ops)
+                );
+            }
+            Err(e) => return (false, format!("{e}")),
+        }
+    }
+}
+
+/// Batches waited for past 10 s while other GPU work completed (`wait_release_done`).
+pub static WAIT_EXTENDED: AtomicU64 = AtomicU64::new(0);
+
 /// Releases device queue `q`'s batches (0 the main queue, 1 the compute
 /// family's) as their GPU work completes, in that queue's order.
 fn releaser_thread(q: usize) {
@@ -4157,11 +4209,11 @@ fn releaser_thread(q: usize) {
         if !DEVICE_LOST.load(Ordering::Relaxed) {
             wait_submitted(r.seq);
             let tf = std::time::Instant::now();
-            let ok = if q == 1 { ctx().wait_batch_c(r.seq, 10_000_000_000) } else { ctx().wait_batch(r.seq, 10_000_000_000) };
+            let (ok, why) = wait_release_done(q, &r);
             FENCE_NS.fetch_add(tf.elapsed().as_nanos() as u64, Ordering::Relaxed);
             if !ok && !DEVICE_LOST.swap(true, Ordering::SeqCst) {
                 let list: Vec<String> = r.shaders.iter().map(|a| format!("{a:#x}")).collect();
-                crate::error!("gpu[{}]: waiting for GPU work: {}; GPU execution stops (batch #{}: shaders {}; {}); checkpoints: {}", r.name, vk::Result::TIMEOUT, r.seq, list.join(" "), ops_line(&r.ops), super::vk::checkpoint_report());
+                crate::error!("gpu[{}]: waiting for GPU work: {why}; GPU execution stops (batch #{}: shaders {}; {}); checkpoints: {}", r.name, r.seq, list.join(" "), ops_line(&r.ops), super::vk::checkpoint_report());
             }
             FLUSHES.fetch_add(1, Ordering::Relaxed);
             collect_timestamps(r.bq, r.queries, &r.shaders, &r.name, r.seq, &r.segs, &r.ops);
@@ -15114,5 +15166,10 @@ pub fn status() -> String {
         + &wb_census_line()
         + &read_census_line()
         + &audit_line()
-        + &format!("    gpu completion: {} ms waiting for fences, {} ms in actions\n", FENCE_NS.load(Ordering::Relaxed) / 1_000_000, ACTION_NS.load(Ordering::Relaxed) / 1_000_000)
+        + &format!(
+            "    gpu completion: {} ms waiting for fences, {} ms in actions; batches waited for past 10 s while other GPU work completed {}\n",
+            FENCE_NS.load(Ordering::Relaxed) / 1_000_000,
+            ACTION_NS.load(Ordering::Relaxed) / 1_000_000,
+            WAIT_EXTENDED.load(Ordering::Relaxed)
+        )
 }
