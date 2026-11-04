@@ -2689,6 +2689,16 @@ fn sample(tr: &mut T, ins: &Inst, name: &str, image: Word, img_ty: Word, si: Opt
             }
             v.truncate(2);
         }
+        // A 3D resource sampled by a 1D or 2D instruction (ps 0x1008895d00):
+        // the address register after them is its r coordinate, else 0.
+        if rdim == ImageDim::D3 && v.len() < 3 {
+            if let Some(l) = layer.filter(|_| v.len() == 2) {
+                v.push(l);
+            }
+            while v.len() < 3 {
+                v.push(tr.f(0.0));
+            }
+        }
         if is_array(rdim) {
             let l = match layer {
                 Some(l) => l,
