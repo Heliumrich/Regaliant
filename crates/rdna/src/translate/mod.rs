@@ -4331,6 +4331,66 @@ mod tests {
         }
     }
 
+    /// Resources of another kind than the instruction names (learned specs):
+    /// a 2D-array fetch from a 3D resource keeps its slice as the depth, and a
+    /// sample of a multisampled resource becomes a fetch of sample 0 (SPIR-V
+    /// samples no multisampled image).
+    #[test]
+    fn instruction_and_resource_dims_differ() {
+        use crate::tables::*;
+        use rspirv::spirv::Op;
+        let op = |t: &[(u16, &str)], n: &str| t.iter().find(|(_, x)| x.split('/').next() == Some(n)).unwrap().0 as u32;
+        // (MIMG word 0: dmask [11:8], dim [5:3]; word 1: vaddr [7:0], vdata
+        // [15:8], srsrc/4 [20:16], ssamp/4 [25:21].)
+        let translate_one = |name: &str, dim: u32, res: ImageDim| {
+            // <name> v[4:7], v[0:2], s[0:7] (, s[8:11]) dmask 0xf ;
+            // buffer_store_dwordx4 v[4:7], v0, s[12:15] idxen ; s_endpgm
+            let words = [
+                (0x3C << 26) | (op(MIMG, name) << 18) | (0xF << 8) | (dim << 3),
+                4 << 8 | 2 << 21,
+                (0x38 << 26) | (op(MUBUF, "buffer_store_dwordx4") << 18) | (1 << 13),
+                4 << 8 | 3 << 16 | 0x80 << 24,
+                0xBF81_0000,
+            ];
+            let code = crate::decode_program(&words).unwrap();
+            let plan = crate::analysis::analyze(&code, 16, 0);
+            let mut spec = cs_spec([64, 1, 1]);
+            spec.user_sgprs = 16;
+            spec.resources = plan
+                .resources
+                .iter()
+                .map(|r| match r.kind {
+                    ResKind::Image => ResSpec::Image { dim: res, class: NumClass::Float, depth: false },
+                    ResKind::Sampler => ResSpec::Sampler,
+                    _ => ResSpec::Buffer { format: 0, dst_sel: 0 },
+                })
+                .collect();
+            let o = translate(&code, &plan, &spec).unwrap();
+            rspirv::dr::load_words(&o.spirv).unwrap()
+        };
+        // The component count of the coordinate operand of each instruction `of`.
+        let coords = |m: &rspirv::dr::Module, of: Op| -> Vec<u32> {
+            let insts: Vec<&rspirv::dr::Instruction> = m.types_global_values.iter().chain(m.functions.iter().flat_map(|f| f.blocks.iter().flat_map(|b| b.instructions.iter()))).collect();
+            let def = |id: u32| insts.iter().find(|i| i.result_id == Some(id)).copied();
+            insts
+                .iter()
+                .filter(|i| i.class.opcode == of)
+                .map(|i| {
+                    let c = def(i.operands[1].unwrap_id_ref()).unwrap();
+                    let t = def(c.result_type.unwrap()).unwrap();
+                    if t.class.opcode == Op::TypeVector { t.operands[1].unwrap_literal_bit32() } else { 1 }
+                })
+                .collect()
+        };
+        // image_load, dim 2D_ARRAY (5), on a 3D resource: (x, y, slice).
+        let m = translate_one("image_load", 5, ImageDim::D3);
+        assert_eq!(coords(&m, Op::ImageFetch), vec![3]);
+        // image_sample_lz, dim 2D (1), on a multisampled resource.
+        let m = translate_one("image_sample_lz", 1, ImageDim::D2Msaa);
+        assert!(coords(&m, Op::ImageSampleExplicitLod).is_empty() && coords(&m, Op::ImageSampleImplicitLod).is_empty());
+        assert_eq!(coords(&m, Op::ImageFetch), vec![2]);
+    }
+
     /// A program's translation does not depend on its address (s_getpc_b64,
     /// the loop watchdog's record): copies at other addresses share it.
     #[test]
