@@ -1771,6 +1771,7 @@ pub(crate) fn imports_may_cover(base: u64, len: u64) -> bool {
     exec::imports_may_cover(base, len)
 }
 pub mod pcache;
+pub mod trcache;
 pub mod pool;
 pub mod lodstats;
 pub mod pstats;

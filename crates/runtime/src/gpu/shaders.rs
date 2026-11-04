@@ -2266,7 +2266,23 @@ pub(crate) fn d3_resources(insts: &[rdna::Inst], plan: &Plan) -> u64 {
 /// kept for: the code base left out).
 fn translate_kept(addr: u64, insts: &[rdna::Inst], plan: &Arc<Plan>, plan_key: u64, spec_hash: u64, spec: &Spec, key_spec: Spec) -> Result<Arc<Translated>, String> {
     let t0 = std::time::Instant::now();
-    let out = translate::translate(insts, plan, spec).map_err(|e| format!("{:?} shader {addr:#x}: {e}", spec.stage))?;
+    // (Kept across runs: `gpu::trcache`.)
+    let out = match super::trcache::load(plan_key, spec_hash) {
+        Some(o) => {
+            if super::trcache::verify() {
+                match translate::translate(insts, plan, spec) {
+                    Ok(fresh) => super::trcache::note_verify(&o, &fresh, || format!("{:?} shader {addr:#x} (spec {spec_hash:016x})", spec.stage)),
+                    Err(e) => crate::warn!("translation store: {:?} shader {addr:#x} no longer translates ({e})", spec.stage),
+                }
+            }
+            o
+        }
+        None => {
+            let o = translate::translate(insts, plan, spec).map_err(|e| format!("{:?} shader {addr:#x}: {e}", spec.stage))?;
+            super::trcache::store(plan_key, spec_hash, &o);
+            o
+        }
+    };
     super::hitch::note_since(super::hitch::Kind::Translate, t0, || format!("{:?} {addr:#x}", spec.stage));
     let ms = t0.elapsed().as_millis();
     if ms >= 100 {

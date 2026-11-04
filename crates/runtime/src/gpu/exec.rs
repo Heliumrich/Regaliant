@@ -187,7 +187,7 @@ fn sync_why_status() -> String {
         PUSHED[0].load(Ordering::Relaxed),
         PUSHED[1].load(Ordering::Relaxed)
     ) + &format!(
-        "    first uses on the command processors: {} compute pipelines missing at their dispatch ({} ms creating or waiting for them); {} graphics pipelines missing at their draw ({} ms; {} of them waited for one in flight, {} ms), {} created for a shader pair seen before with other render state ({} ms)\n",
+        "    first uses on the command processors: {} compute pipelines missing at their dispatch ({} ms creating or waiting for them); {} graphics pipelines missing at their draw ({} ms; {} of them waited for one in flight, {} ms); on any thread {} graphics pipelines created for a shader pair seen before with other render state ({} ms)\n",
         FIRST_USES[0].load(Ordering::Relaxed),
         FIRST_USES[1].load(Ordering::Relaxed) / 1_000_000,
         draw::GFX_FIRST_USES[0].load(Ordering::Relaxed),
@@ -15087,6 +15087,7 @@ pub fn status() -> String {
         + &super::lockstat::status()
         + &super::vk::defer::status()
         + &super::pcache::status()
+        + &super::trcache::status()
         + &super::images::scrub_status()
         + &super::homes::status()
         + &super::resident::status()

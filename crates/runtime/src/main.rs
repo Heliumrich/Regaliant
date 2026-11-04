@@ -1235,6 +1235,8 @@ fn main() {
     // store (experiments that start without compiled pipelines).
     let pipe_dir = std::env::var("DS_PIPELINE_DIR").ok().filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')).unwrap_or_else(|| "pipelines".into());
     gpu::pcache::set_dir(cache_root.join(pipe_dir));
+    // Translations kept across runs (`gpu::trcache`).
+    gpu::trcache::set_dir(cache_root.join("translations"));
     // DS_SPECS=<file name under the cache, or a path>: where the shader
     // programs' learned specs and code are kept (`gpu::precompile`).
     let specs = std::env::var("DS_SPECS").ok().filter(|v| !v.is_empty()).map(std::path::PathBuf::from);

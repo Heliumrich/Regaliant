@@ -9,6 +9,10 @@
 pub type HashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>>;
 pub type HashSet<T> = std::collections::HashSet<T, std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>>;
 
+/// A hash of this crate's source (`build.rs`): translations kept across
+/// runs are kept under it.
+pub const SOURCE_HASH: &str = env!("RDNA_SOURCE_HASH");
+
 pub mod analysis;
 pub mod capture;
 pub mod emu;

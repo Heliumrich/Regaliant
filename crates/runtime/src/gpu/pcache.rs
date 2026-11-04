@@ -267,10 +267,11 @@ const BUDGET: u64 = 2 << 30;
 /// bytes written, files pruned].
 pub static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
-/// Nanoseconds of `with_cache`'s steps, summed: the file read and decode,
-/// the cache object, the pipeline's creation, reading the cache's data back,
-/// writing or touching the file, destroying the cache; then the calls.
-static LAPS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// Nanoseconds of `with_cache`'s steps, summed: the file's read and its
+/// decode, the cache object, the pipeline's creation, reading the cache's
+/// size (its data when it grew), writing the file or queueing its last-use
+/// mark, destroying the cache; then the calls.
+static LAPS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// Where the pipeline files live (set once at startup; none: no persistence).
 /// Prunes the directory in the background.
@@ -327,9 +328,10 @@ pub fn with_cache<T>(kind: char, key: u64, create: impl FnOnce(vk::PipelineCache
         *t = n;
     };
     let mut t = t;
-    LAPS[6].fetch_add(1, Ordering::Relaxed);
+    LAPS[7].fetch_add(1, Ordering::Relaxed);
     let path = DIR.get().map(|dir| dir.join(format!("{kind}{key:016x}.bin")));
     let file = path.as_ref().and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
+    lap(6, &mut t);
     let whole = !file.starts_with(MAGIC);
     // (Taken out of the thread's slot while in use: `create` may make
     // another pipeline.)
@@ -405,14 +407,15 @@ pub fn stored(kind: char, key: u64) -> bool {
 pub fn status() -> String {
     let s: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let l: Vec<u64> = LAPS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    let n = l[6].max(1) as f64 * 1000.0;
+    let n = l[7].max(1) as f64 * 1000.0;
     format!(
-        "    pipeline cache files: {} pipelines from their file, {} written ({} MiB), {} pruned; {} creations, us each: file and decode {:.0}, cache object {:.0}, creation {:.0}, data read back {:.0}, touch or write {:.0}, destroy {:.0}\n",
+        "    pipeline cache files: {} pipelines from their file, {} written ({} MiB), {} pruned; {} creations, us each: file read {:.0}, decode {:.0}, cache object {:.0}, creation {:.0}, its size or data {:.0}, write or last-use mark {:.0}, destroy {:.0}\n",
         s[0],
         s[1],
         s[2] >> 20,
         s[3],
-        l[6],
+        l[7],
+        l[6] as f64 / n,
         l[0] as f64 / n,
         l[1] as f64 / n,
         l[2] as f64 / n,
