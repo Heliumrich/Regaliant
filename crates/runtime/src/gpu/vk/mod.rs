@@ -37,6 +37,9 @@ pub struct Ctx {
     /// VK_EXT_debug_utils command labels (DS_GPU_LABELS=1): named ranges of
     /// the recorded work for GPU Trace (Nsight Graphics).
     pub labels: Option<ash::ext::debug_utils::Device>,
+    /// VK_EXT_debug_utils object names under the validation layer
+    /// (DS_VK_VALIDATION=1): its messages name the objects (`name_object`).
+    pub names: Option<ash::ext::debug_utils::Device>,
     /// VK_KHR_fragment_shader_barycentric enabled.
     pub barycentric: bool,
     /// VK_EXT_memory_budget enabled (`heap_report`).
@@ -108,6 +111,37 @@ pub struct CopyQueue {
 
 static CTX: OnceLock<Ctx> = OnceLock::new();
 
+thread_local! {
+    /// What this thread is creating (`creating`), for the validation
+    /// layer's messages.
+    static CREATING: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Notes what this thread creates until the guard drops, for the validation
+/// layer's messages (only under it).
+pub fn creating(what: impl FnOnce() -> String) -> Option<CreatingGuard> {
+    try_ctx().filter(|c| c.validation)?;
+    CREATING.with(|c| *c.borrow_mut() = what());
+    Some(CreatingGuard)
+}
+
+pub struct CreatingGuard;
+
+impl Drop for CreatingGuard {
+    fn drop(&mut self) {
+        CREATING.with(|c| c.borrow_mut().clear());
+    }
+}
+
+/// Names an object for the validation layer's messages (only under it).
+pub fn name_object<H: vk::Handle>(handle: H, name: &str) {
+    if let Some(n) = ctx().names.as_ref() {
+        if let Ok(name) = std::ffi::CString::new(name) {
+            let _ = unsafe { n.set_debug_utils_object_name(&vk::DebugUtilsObjectNameInfoEXT::default().object_handle(handle).object_name(&name)) };
+        }
+    }
+}
+
 pub fn ctx() -> &'static Ctx {
     CTX.get().expect("Vulkan not initialized")
 }
@@ -123,6 +157,10 @@ unsafe extern "system" fn debug_cb(
     _user: *mut std::ffi::c_void,
 ) -> vk::Bool32 {
     let msg = unsafe { CStr::from_ptr((*data).p_message) }.to_string_lossy();
+    // (The layer reports a module's SPIR-V while creating it, on the
+    // creating thread: what that thread is creating, `creating`.)
+    let what = CREATING.with(|c| c.borrow().clone());
+    let msg = if what.is_empty() { msg.into_owned() } else { format!("{msg} [while creating {what}]") };
     if sev.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
         crate::error!("vulkan: {msg}");
     } else {
@@ -543,6 +581,7 @@ fn init_inner() -> Result<(), String> {
             calibrated: calibrated.then(|| ash::ext::calibrated_timestamps::Device::new(&instance, &device)),
             fault: has_fault.then(|| ash::ext::device_fault::Device::new(&instance, &device)),
             labels: labels_on.then(|| ash::ext::debug_utils::Device::new(&instance, &device)),
+            names: validation.then(|| ash::ext::debug_utils::Device::new(&instance, &device)),
             device_addresses,
             draw_indirect_count,
             sparse_buffers,

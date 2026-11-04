@@ -773,7 +773,7 @@ fn run_code(h: u64) {
     let insts = rdna::decode_program(&code).ok();
     let mut plans: Vec<(u16, rdna::analysis::Plan)> = Vec::new();
     let mut done: Vec<Spec> = Vec::new();
-    for mut s in seen {
+    for (n, mut s) in seen.into_iter().enumerate() {
         let t = std::time::Instant::now();
         // (Keyed as a preparation keys them now, a plan per user SGPR count;
         // equal ones made once.)
@@ -793,6 +793,9 @@ fn run_code(h: u64) {
             continue;
         }
         done.push(spec.clone());
+        // (Under the validation layer its messages name the program and its
+        // learned spec: `DS_CB_HASHES` / `DS_CB_SPEC` of the compile bench.)
+        let _g = super::vk::creating(|| format!("cs {h:#018x} learned spec {n}"));
         let r = super::shaders::translate_code_for_spec(&code, h, spec).and_then(|tr| super::exec::precompile_translation(&tr, 0).ok_or_else(|| "pipeline creation failed".to_string()));
         match r {
             Ok(true) => {

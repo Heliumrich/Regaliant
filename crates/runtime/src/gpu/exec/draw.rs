@@ -738,12 +738,19 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
         let ranges = super::sgpr_pc_ranges(vk::ShaderStageFlags::VERTEX, vs.0.out.sgpr_pc.is_some() || ps.is_some_and(|p| p.0.out.sgpr_pc.is_some()));
         let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(ranges), None).map_err(|e| format!("pipeline layout: {e}"))?;
         let module = |code: &[u32]| c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&super::module_code(code)), None).map_err(|e| format!("shader module: {e}"));
+        let g = super::super::vk::creating(|| format!("vs {:#x}", vs.1));
         let mut modules = vec![(vk::ShaderStageFlags::VERTEX, module(&vs.0.out.spirv)?)];
+        drop(g);
+        super::super::vk::name_object(modules[0].1, &format!("vs {:#x}", vs.1));
         if let Some(mask) = key.rect_gs {
             modules.push((vk::ShaderStageFlags::GEOMETRY, module(&rdna::translate::gs::rect_list_gs(mask))?));
+            super::super::vk::name_object(modules[modules.len() - 1].1, &format!("rect-list gs {mask:#x}"));
         }
         if let Some(p) = ps {
+            let g = super::super::vk::creating(|| format!("ps {:#x}", p.1));
             modules.push((vk::ShaderStageFlags::FRAGMENT, module(&p.0.out.spirv)?));
+            drop(g);
+            super::super::vk::name_object(modules[modules.len() - 1].1, &format!("ps {:#x}", p.1));
         }
         let stages: Vec<vk::PipelineShaderStageCreateInfo> = modules.iter().map(|(s, m)| vk::PipelineShaderStageCreateInfo::default().stage(*s).module(*m).name(c"main")).collect();
         let vi = vk::PipelineVertexInputStateCreateInfo::default();

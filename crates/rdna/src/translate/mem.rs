@@ -1971,6 +1971,16 @@ fn int_coord(tr: &mut T, idim: ImageDim, rdim: ImageDim, cs: Vec<Word>) -> R<Wor
         }
         xy.truncate(2);
     }
+    // A 3D resource addressed by a 1D or 2D instruction (a 2D-array one in a
+    // learned spec of cs 0xe890e8e2b31bf06f): its slice is the depth, else 0.
+    if rdim == ImageDim::D3 && xy.len() < 3 {
+        if let Some(l) = layer.filter(|_| xy.len() == 2) {
+            xy.push(l);
+        }
+        while xy.len() < 3 {
+            xy.push(tr.i(0));
+        }
+    }
     if is_array(rdim) {
         let l = match layer {
             Some(l) => l,
@@ -1985,6 +1995,34 @@ fn int_coord(tr: &mut T, idim: ImageDim, rdim: ImageDim, cs: Vec<Word>) -> R<Wor
         _ => tr.t.v4i,
     };
     if xy.len() == 1 { Ok(xy[0]) } else { e(tr.b.composite_construct(cty, None, xy)) }
+}
+
+/// Sample 0 of a multisampled image at the texel normalized coordinates
+/// (u, v[, layer]) fall in (clamped to the image), for sampling
+/// instructions on multisampled resources.
+fn ms_fetch(tr: &mut T, image: Word, coord: Word, arrayed: bool, res_ty: Word) -> R<Word> {
+    let (f, i) = (tr.t.f32, tr.t.i32);
+    let sty = if arrayed { tr.t.v3i } else { tr.t.v2i };
+    let size = e(tr.b.image_query_size(sty, None, image))?;
+    let (zero, one) = (tr.i(0), tr.i(1));
+    let mut parts = Vec::new();
+    for k in 0..2 {
+        let n = e(tr.b.composite_extract(i, None, size, [k]))?;
+        let nf = e(tr.b.convert_s_to_f(f, None, n))?;
+        let c = e(tr.b.composite_extract(f, None, coord, [k]))?;
+        let s = e(tr.b.f_mul(f, None, c, nf))?;
+        let fl = tr.glsl1(f, GLOp::Floor, s)?;
+        let v = e(tr.b.convert_f_to_s(i, None, fl))?;
+        let hi = e(tr.b.i_sub(i, None, n, one))?;
+        parts.push(tr.glsl3(i, GLOp::SClamp, v, zero, hi)?);
+    }
+    if arrayed {
+        let c = e(tr.b.composite_extract(f, None, coord, [2]))?;
+        let r = tr.glsl1(f, GLOp::RoundEven, c)?;
+        parts.push(e(tr.b.convert_f_to_s(i, None, r))?);
+    }
+    let ic = e(tr.b.composite_construct(sty, None, parts))?;
+    e(tr.b.image_fetch(res_ty, None, image, ic, Some(ImageOperands::SAMPLE), [Operand::IdRef(zero)]))
 }
 
 /// Cube coordinates (s+1.5, t+1.5, face) -> direction vector.
@@ -2817,6 +2855,11 @@ fn sample(tr: &mut T, ins: &Inst, name: &str, image: Word, img_ty: Word, si: Opt
         let z = tr.f(0.0);
         let one = tr.f(1.0);
         e(tr.b.composite_construct(tr.t.v4f, None, [r, z, z, one]))?
+    } else if matches!(rdim, ImageDim::D2Msaa | ImageDim::D2MsaaArray) {
+        // A sample of a multisampled resource (learned specs of four programs,
+        // e.g. cs 0xffafd65f8762677f): SPIR-V samples none, so sample 0 of
+        // the texel the coordinates fall in is fetched.
+        ms_fetch(tr, image, coord, rdim == ImageDim::D2MsaaArray, res_ty)?
     } else if explicit {
         e(tr.b.image_sample_explicit_lod(res_ty, None, simg, coord, mask, operands))?
     } else {
