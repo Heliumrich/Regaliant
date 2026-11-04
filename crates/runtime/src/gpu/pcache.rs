@@ -280,8 +280,11 @@ fn convert(dir: &Path) {
 }
 
 /// Bytes of pipeline files kept (the least recently used beyond it go at
-/// startup, down to three quarters of it).
-const BUDGET: u64 = 2 << 30;
+/// startup, down to three quarters of it). 4 GiB since 2026-11-04: the
+/// files the 1-1 walk, the fights and the tours use passed 2 GiB with an
+/// experiment's variants, and a prune to 1.5 GiB (4,068 files) left the
+/// next suite compiling an arrival's particle programs anew (a 1.85 s frame).
+const BUDGET: u64 = 4 << 30;
 
 /// [pipelines created from their file unchanged, files written (misses),
 /// bytes written, files pruned].
