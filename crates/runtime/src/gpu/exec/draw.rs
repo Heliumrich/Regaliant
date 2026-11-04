@@ -737,7 +737,12 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
         let layouts = [set_layout];
         let ranges = super::sgpr_pc_ranges(vk::ShaderStageFlags::VERTEX, vs.0.out.sgpr_pc.is_some() || ps.is_some_and(|p| p.0.out.sgpr_pc.is_some()));
         let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(ranges), None).map_err(|e| format!("pipeline layout: {e}"))?;
-        let module = |code: &[u32]| c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&super::module_code(code)), None).map_err(|e| format!("shader module: {e}"));
+        let module = |code: &[u32]| {
+            let t = std::time::Instant::now();
+            let m = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&super::module_code(code)), None).map_err(|e| format!("shader module: {e}"));
+            crate::gpu::pcache::note_module(t.elapsed().as_nanos() as u64);
+            m
+        };
         let g = super::super::vk::creating(|| format!("vs {:#x}", vs.1));
         let mut modules = vec![(vk::ShaderStageFlags::VERTEX, module(&vs.0.out.spirv)?)];
         drop(g);

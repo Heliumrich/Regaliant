@@ -2236,7 +2236,9 @@ fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: O
             let ranges = sgpr_pc_ranges(vk::ShaderStageFlags::COMPUTE, out.sgpr_pc.is_some());
             let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(ranges), None).map_err(|e| format!("pipeline layout: {e}"))?;
             let code = module_code(&out.spirv);
+            let tm = std::time::Instant::now();
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("shader module: {e}"))?;
+            super::pcache::note_module(tm.elapsed().as_nanos() as u64);
             let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
             let extra = vk::PipelineCreateFlags::from_raw(EXTRA_PIPE_FLAGS.load(Ordering::Relaxed) as u32);
             let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout).flags(vk::PipelineCreateFlags::DISPATCH_BASE | super::pstats::flags() | extra);

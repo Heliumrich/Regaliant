@@ -169,16 +169,28 @@ fn encode(data: &[u8]) -> Vec<u8> {
 /// The pipeline cache data of a file (None: a block it names is missing).
 #[cfg(test)]
 fn decode(file: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    decode_into(file, &mut out).then_some(out)
+    let mut out = Decoded::default();
+    decode_into(file, &mut out).then_some(out.data)
 }
 
-/// `decode` into `out` (emptied first; its capacity kept): false when a
-/// block the file names is missing.
-fn decode_into(file: &[u8], out: &mut Vec<u8>) -> bool {
-    out.clear();
+/// A file's decoded data, and where its shared block lies in it (offset and
+/// the block's hash; None: no block, or not known to be in place).
+#[derive(Default)]
+struct Decoded {
+    data: Vec<u8>,
+    block_at: Option<(usize, u64)>,
+}
+
+/// `decode` into `out` (its capacity kept): false when a block the file
+/// names is missing. When `out` holds that block at the same offset already
+/// (the last file of this thread put it there), only the pipeline's own
+/// bytes around it are copied (53% of the files hold the block at offset
+/// 36, after the cache's header).
+fn decode_into(file: &[u8], out: &mut Decoded) -> bool {
     if file.len() < HEADER || &file[..8] != MAGIC {
-        out.extend_from_slice(file);
+        out.data.clear();
+        out.data.extend_from_slice(file);
+        out.block_at = None;
         return true;
     }
     let word = |r: std::ops::Range<usize>| file[r].iter().rev().fold(0u64, |a, &b| a << 8 | b as u64);
@@ -188,10 +200,18 @@ fn decode_into(file: &[u8], out: &mut Vec<u8>) -> bool {
     if b.len() != n || o > rest.len() {
         return false;
     }
-    out.reserve(rest.len() + n);
-    out.extend_from_slice(&rest[..o]);
-    out.extend_from_slice(&b);
-    out.extend_from_slice(&rest[o..]);
+    if out.block_at == Some((o, h)) && out.data.len() >= o + n {
+        out.data[..o].copy_from_slice(&rest[..o]);
+        out.data.truncate(o + n);
+        out.data.extend_from_slice(&rest[o..]);
+        return true;
+    }
+    out.data.clear();
+    out.data.reserve(rest.len() + n);
+    out.data.extend_from_slice(&rest[..o]);
+    out.data.extend_from_slice(&b);
+    out.data.extend_from_slice(&rest[o..]);
+    out.block_at = Some((o, h));
     true
 }
 
@@ -199,7 +219,7 @@ thread_local! {
     /// This thread's buffer for a file's decoded data (`with_cache`): ~2 MB
     /// a pipeline with the driver's shared block, which a fresh allocation
     /// committed page by page on every creation.
-    static DATA: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static DATA: std::cell::RefCell<Decoded> = std::cell::RefCell::new(Decoded::default());
 }
 
 /// Pipeline files used as they were, whose last use the `pcache-touch`
@@ -273,6 +293,17 @@ pub static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// mark, destroying the cache; then the calls.
 static LAPS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
+/// Shader modules made for the title's pipelines (`note_module`): count, ns.
+static MODULES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A shader module for a pipeline of the title took `ns` (graphics and
+/// compute pipelines make theirs before `with_cache`; a cached creation
+/// still hands the driver the module's whole SPIR-V).
+pub fn note_module(ns: u64) {
+    MODULES[0].fetch_add(1, Ordering::Relaxed);
+    MODULES[1].fetch_add(ns, Ordering::Relaxed);
+}
+
 /// Where the pipeline files live (set once at startup; none: no persistence).
 /// Prunes the directory in the background.
 pub fn set_dir(dir: PathBuf) {
@@ -335,19 +366,21 @@ pub fn with_cache<T>(kind: char, key: u64, create: impl FnOnce(vk::PipelineCache
     let whole = !file.starts_with(MAGIC);
     // (Taken out of the thread's slot while in use: `create` may make
     // another pipeline.)
-    let mut data = DATA.with(|b| std::mem::take(&mut *b.borrow_mut()));
-    if !decode_into(&file, &mut data) {
-        data.clear();
+    let mut decoded = DATA.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    if !decode_into(&file, &mut decoded) {
+        decoded.data.clear();
+        decoded.block_at = None;
     }
+    let data = &decoded.data;
     lap(0, &mut t);
-    let cache = unsafe { d.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&data), None) }
+    let cache = unsafe { d.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(data), None) }
         .or_else(|_| unsafe { d.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) })
         .unwrap_or(vk::PipelineCache::null());
     lap(1, &mut t);
     let r = create(cache);
     lap(2, &mut t);
     if cache == vk::PipelineCache::null() {
-        DATA.with(|b| *b.borrow_mut() = data);
+        DATA.with(|b| *b.borrow_mut() = decoded);
         return r;
     }
     if let Some(p) = &path {
@@ -393,7 +426,7 @@ pub fn with_cache<T>(kind: char, key: u64, create: impl FnOnce(vk::PipelineCache
     }
     unsafe { d.destroy_pipeline_cache(cache, None) };
     lap(5, &mut t);
-    DATA.with(|b| *b.borrow_mut() = data);
+    DATA.with(|b| *b.borrow_mut() = decoded);
     r
 }
 
@@ -409,7 +442,7 @@ pub fn status() -> String {
     let l: Vec<u64> = LAPS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let n = l[7].max(1) as f64 * 1000.0;
     format!(
-        "    pipeline cache files: {} pipelines from their file, {} written ({} MiB), {} pruned; {} creations, us each: file read {:.0}, decode {:.0}, cache object {:.0}, creation {:.0}, its size or data {:.0}, write or last-use mark {:.0}, destroy {:.0}\n",
+        "    pipeline cache files: {} pipelines from their file, {} written ({} MiB), {} pruned; {} creations, us each: file read {:.0}, decode {:.0}, cache object {:.0}, creation {:.0}, its size or data {:.0}, write or last-use mark {:.0}, destroy {:.0}; shader modules before them: {} at {:.0} us\n",
         s[0],
         s[1],
         s[2] >> 20,
@@ -421,7 +454,9 @@ pub fn status() -> String {
         l[2] as f64 / n,
         l[3] as f64 / n,
         l[4] as f64 / n,
-        l[5] as f64 / n
+        l[5] as f64 / n,
+        MODULES[0].load(Ordering::Relaxed),
+        MODULES[1].load(Ordering::Relaxed) as f64 / MODULES[0].load(Ordering::Relaxed).max(1) as f64 / 1000.0
     )
 }
 
@@ -440,6 +475,31 @@ impl ThreadIdNumber for std::thread::ThreadId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Files decoded one after another into one buffer (the block kept in
+    /// place when the offset repeats) come back as decoded fresh.
+    #[test]
+    fn decode_reuses_the_block() {
+        let block: Vec<u8> = (0..(MIN_BLOCK + 3000)).map(|i| (i * 7 + i / 300) as u8).collect();
+        let h = hash64(&block);
+        BLOCKS.lock().push((h, std::sync::Arc::new(block.clone())));
+        let file = |pre: &[u8], post: &[u8]| {
+            let mut f = Vec::new();
+            f.extend_from_slice(MAGIC);
+            f.extend_from_slice(&(pre.len() as u32).to_le_bytes());
+            f.extend_from_slice(&(block.len() as u32).to_le_bytes());
+            f.extend_from_slice(&h.to_le_bytes());
+            f.extend_from_slice(pre);
+            f.extend_from_slice(post);
+            f
+        };
+        let whole = |pre: &[u8], post: &[u8]| [pre, &block[..], post].concat();
+        let mut d = Decoded::default();
+        for (pre, post) in [(&[1u8; 36][..], &[2u8; 500][..]), (&[3u8; 36][..], &[4u8; 20][..]), (&[5u8; 40][..], &[6u8; 900][..]), (&[7u8; 36][..], &[8u8; 3000][..])] {
+            assert!(decode_into(&file(pre, post), &mut d));
+            assert_eq!(d.data, whole(pre, post));
+        }
+    }
 
     /// Two pipelines' data sharing a 1.5 MiB block at different offsets:
     /// `discover` finds it, and stored without it the data comes back whole.
