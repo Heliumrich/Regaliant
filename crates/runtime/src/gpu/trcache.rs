@@ -79,6 +79,11 @@ pub fn set_dir(base: PathBuf) {
         let (mut n, mut bytes) = (0u64, 0u64);
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for e in rd.flatten() {
+                // (A write a run did not finish: its temporary file.)
+                if e.path().extension().is_some_and(|x| x == "tmp") {
+                    let _ = std::fs::remove_file(e.path());
+                    continue;
+                }
                 if let Ok(m) = e.metadata() {
                     n += 1;
                     bytes += m.len();
