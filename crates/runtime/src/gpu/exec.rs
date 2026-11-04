@@ -4263,12 +4263,6 @@ pub(super) const OP_PASS_ENDS: usize = 11;
 /// unused (CP writes whose guest-memory copy waited for the close, `tune
 /// fe2_cpw_defer`, removed on 2026-11-01)].
 pub static SCATTER_SITES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
-/// Batch closes by their uploads into the mirror (stage F5's census: a lazy
-/// write-back must come before an upload of a page with GPU-written words
-/// still to write back): [closes, with uploads, with uploads of pages front
-/// end 2 marked GPU-written, closes that could leave their write-back (marked
-/// work, no promise, no completion action), of those with such uploads].
-pub static F5_CENSUS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// Front end 2's write-backs (`Exec::fe2_scatter`).
 const OP_FE2_SCATTERS: usize = 12;
 const OPS: usize = 13;
@@ -9131,21 +9125,6 @@ impl Exec {
         // Front end 2: what the batch's work wrote into the mirror goes to
         // guest memory before the batch completes; the checks its bindings
         // deferred are made now, their uploads into its prologue.
-        if super::fe2::on() {
-            let ups = !self.fe2_up.is_empty();
-            // (Uploads of ranges unfinished GPU work writes: the pages a lazy
-            // write-back would leave stale in guest memory.)
-            let gpu_up = ups && {
-                let r: Vec<(u64, u64)> = self.fe2_up.iter().map(|&(a, b)| (a, b - a)).collect();
-                INFLIGHT.latest(&r).is_some() || self.overlaps_pending(&r)
-            };
-            let lazy = self.fe2_marked && self.pending_promises.is_empty() && self.actions.is_empty();
-            F5_CENSUS[0].fetch_add(1, Ordering::Relaxed);
-            F5_CENSUS[1].fetch_add(ups as u64, Ordering::Relaxed);
-            F5_CENSUS[2].fetch_add(gpu_up as u64, Ordering::Relaxed);
-            F5_CENSUS[3].fetch_add(lazy as u64, Ordering::Relaxed);
-            F5_CENSUS[4].fetch_add((lazy && gpu_up) as u64, Ordering::Relaxed);
-        }
         if self.fe2_marked {
             SCATTER_SITES[1].fetch_add(1, Ordering::Relaxed);
             if self.pending_promises.is_empty() && self.actions.is_empty() {
@@ -15133,13 +15112,5 @@ pub fn status() -> String {
         + &wb_census_line()
         + &read_census_line()
         + &audit_line()
-        + &{
-            let v: Vec<u64> = F5_CENSUS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-            if v[0] == 0 {
-                String::new()
-            } else {
-                format!("    batch closes by their uploads into the mirror (stage F5 census): {} closes, {} with uploads, {} of them uploading ranges unfinished GPU work writes; {} could leave their write-back, {} of those uploading such ranges\n", v[0], v[1], v[2], v[3], v[4])
-            }
-        }
         + &format!("    gpu completion: {} ms waiting for fences, {} ms in actions\n", FENCE_NS.load(Ordering::Relaxed) / 1_000_000, ACTION_NS.load(Ordering::Relaxed) / 1_000_000)
 }
