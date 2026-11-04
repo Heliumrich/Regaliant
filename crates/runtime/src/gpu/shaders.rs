@@ -1239,7 +1239,6 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         marks_untouched: !super::tune::mark_touch(),
         touch_bits: touch_bits_wanted(),
         touch_test: touch_test_wanted(),
-        skip_same: skip_same_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -1516,22 +1515,6 @@ fn touch_test_wanted() -> bool {
     marks_wanted() && super::fe2::wanted()
 }
 
-/// `Spec::skip_same` (`tune skip_same`): stores leaving memory as it was
-/// are left out with their marks.
-fn skip_same_wanted() -> bool {
-    touch_test_wanted() && super::tune::skip_same() != 0
-}
-
-/// `Spec::skip_same` only for a program that writes a resource (`plan`):
-/// the others translate the same without it and keep their keys (their
-/// pipelines' cache files are named by them; set for every program, a
-/// first boot recompiled 6,652 pipelines).
-fn settle_skip_same(spec: &mut Spec, plan: &Plan) {
-    if spec.skip_same && !plan.resources.iter().any(|r| r.written) {
-        spec.skip_same = false;
-    }
-}
-
 /// Resolves and translates the pixel shader bound on `cp`.
 pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
     prep_lap_begin(1);
@@ -1601,7 +1584,6 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         marks_untouched: !super::tune::mark_touch(),
         touch_bits: touch_bits_wanted(),
         touch_test: touch_test_wanted(),
-        skip_same: skip_same_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -1803,7 +1785,6 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         marks_untouched: !super::tune::mark_touch(),
         touch_bits: touch_bits_wanted(),
         touch_test: touch_test_wanted(),
-        skip_same: skip_same_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2401,8 +2382,6 @@ pub(crate) fn translate_code_unkept(code: &[u32], code_hash: u64, key_spec: Spec
     if !plan.errors.is_empty() {
         return Err(plan.errors.join("; "));
     }
-    let mut key_spec = key_spec;
-    settle_skip_same(&mut key_spec, &plan);
     let spec_hash = {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         key_spec.hash(&mut h);
@@ -2430,7 +2409,7 @@ pub(crate) fn program_code(addr: u64) -> Result<(Vec<u32>, u64), String> {
 /// The translation of stored program words (`gpu::precompile`, before the
 /// title has loaded the program) for `key_spec`, kept where `prepare`
 /// looks for it (translations do not depend on the program's address).
-pub(crate) fn translate_code_for_spec(code: &[u32], code_hash: u64, mut key_spec: Spec) -> Result<Arc<Translated>, String> {
+pub(crate) fn translate_code_for_spec(code: &[u32], code_hash: u64, key_spec: Spec) -> Result<Arc<Translated>, String> {
     if hash_words(code) != code_hash {
         return Err("stored code does not match its hash".into());
     }
@@ -2448,7 +2427,6 @@ pub(crate) fn translate_code_for_spec(code: &[u32], code_hash: u64, mut key_spec
             p
         }
     };
-    settle_skip_same(&mut key_spec, &plan);
     let spec_hash = {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         key_spec.hash(&mut h);
@@ -2509,9 +2487,8 @@ pub(crate) fn stage_plan(addr: u64, user_sgprs: u16, user_base: u16) -> Result<(
 /// The translation of the program at `addr` for `key_spec` (a key spec as
 /// `compute_spec`, `vertex_spec` or `pixel_spec` make it; `gpu::precompile`),
 /// kept where `prepare` looks for it.
-pub(crate) fn translate_for_spec(addr: u64, mut key_spec: Spec) -> Result<Arc<Translated>, String> {
+pub(crate) fn translate_for_spec(addr: u64, key_spec: Spec) -> Result<Arc<Translated>, String> {
     let (insts, plan, code_hash) = stage_plan(addr, key_spec.user_sgprs, key_spec.user_base)?;
-    settle_skip_same(&mut key_spec, &plan);
     let plan_key = code_hash ^ (key_spec.user_sgprs as u64) << 48 ^ (key_spec.user_base as u64) << 56;
     let spec_hash = {
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2647,7 +2624,6 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         marks_untouched: !super::tune::mark_touch(),
         touch_bits: touch_bits_wanted(),
         touch_test: touch_test_wanted(),
-        skip_same: skip_same_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2700,7 +2676,6 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         marks_untouched: !super::tune::mark_touch(),
         touch_bits: touch_bits_wanted(),
         touch_test: touch_test_wanted(),
-        skip_same: skip_same_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2753,7 +2728,6 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         marks_untouched: !super::tune::mark_touch(),
         touch_bits: touch_bits_wanted(),
         touch_test: touch_test_wanted(),
-        skip_same: skip_same_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2811,7 +2785,6 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     if !plan.errors.is_empty() {
         return Err(format!("{:?} shader {addr:#x}: {}", spec.stage, plan.errors.join("; ")));
     }
-    settle_skip_same(spec, &plan);
     prep_lap(3);
     prep_lap(4);
     let map_gen = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::Acquire);

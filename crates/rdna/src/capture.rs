@@ -148,7 +148,6 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         marks_untouched: false,
         touch_bits: std::env::var_os("RDNA_TOUCH_BITS").is_some(),
         touch_test: std::env::var_os("RDNA_TOUCH_TEST").is_some(),
-        skip_same: std::env::var_os("RDNA_SKIP_SAME").is_some(),
         // RDNA_SGPR_UBO=<n>: `Spec::sgpr_ubo` (validation).
         sgpr_ubo: std::env::var("RDNA_SGPR_UBO").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         // RDNA_GPU_CHAINS=1 (with RDNA_ADDRESSES): every load and read-only

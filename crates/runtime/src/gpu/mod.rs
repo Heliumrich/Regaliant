@@ -30,7 +30,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 158] = [
+    static ALL: [Tunable; 157] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -188,7 +188,6 @@ pub mod tune {
         Tunable { name: "vram_others", env: "DS_VRAM_OTHERS", default: 512, value: AtomicU64::new(UNSET) },
         Tunable { name: "mirror_cold", env: "DS_MIRROR_COLD", default: 3600, value: AtomicU64::new(UNSET) },
         Tunable { name: "buffer_delta", env: "DS_BUFFER_DELTA", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "skip_same", env: "DS_SKIP_SAME", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1588,15 +1587,6 @@ pub mod tune {
     #[inline]
     pub fn buffer_delta() -> u64 {
         get(156)
-    }
-
-    /// Front end 2: raw dword stores into bindings in the mirror whose words
-    /// hold their values already are left out with their marks
-    /// (`rdna::translate::Spec::skip_same`; A/B, 0 off). Stages prepared
-    /// after a change translate with it.
-    #[inline]
-    pub fn skip_same() -> u64 {
-        get(157)
     }
 
     /// Pixel programs that write no memory run their depth and stencil
