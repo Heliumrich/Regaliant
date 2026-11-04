@@ -568,6 +568,11 @@ fn trace_life(what: std::fmt::Arguments) {
 }
 
 /// The copy kernel's roles, if the program is it (cached by code hash).
+/// `p` is the copy kernel (profiling: its dispatch steps apart).
+pub fn is_copy_kernel(p: &Prepared) -> bool {
+    roles(p).is_some()
+}
+
 fn roles(p: &Prepared) -> Option<Roles> {
     let insts = &p.found.insts;
     let key = p.code_hash;

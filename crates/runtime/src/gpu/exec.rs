@@ -6718,6 +6718,10 @@ pub(super) const DRAW_STEP_NAMES: [&str; 18] = [
 /// The same per dispatch by kind (`CS_KINDS`), steps of `CS_STEP_NAMES`
 /// and then the count of dispatches recorded to the end.
 pub(super) static CS_STEPS: [[AtomicU64; CS_STEP_COUNT + 1]; 8] = [const { [const { AtomicU64::new(0) }; CS_STEP_COUNT + 1] }; 8];
+/// The copy kernel's dispatches (`forward::is_copy_kernel`) recorded by the
+/// graphics command processor itself, by step as `CS_STEPS` (in those too):
+/// [not first of their batch, first], the count last.
+pub(super) static COPY_STEPS: [[AtomicU64; CS_STEP_COUNT + 1]; 2] = [const { [const { AtomicU64::new(0) }; CS_STEP_COUNT + 1] }; 2];
 /// Steps of draws and dispatches that were their batch's first command
 /// (`place_lines`), by kind (`DRAW_KINDS`, `CS_KINDS`), the count last.
 pub(super) static DRAW_STEPS_FIRST: [[AtomicU64; 19]; 3] = [const { [const { AtomicU64::new(0) }; 19] }; 3];
@@ -7250,6 +7254,15 @@ fn draw_steps_line() -> String {
         let cs: Vec<String> = CS_STEP_NAMES.iter().zip(steps.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
         s.push_str(&format!("    command processor per dispatch by step ({kind}: {n}, {:.1} us each): {}\n", total as f64 / n as f64 / 1000.0, cs.join(", ")));
     }
+    for (what, steps) in ["", ", first of its batch"].iter().zip(COPY_STEPS.iter()) {
+        let n = steps[CS_STEP_COUNT].load(Ordering::Relaxed);
+        if n == 0 {
+            continue;
+        }
+        let total: u64 = steps[..CS_STEP_COUNT].iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        let cs: Vec<String> = CS_STEP_NAMES.iter().zip(steps.iter()).map(|(name, c)| format!("{name} {:.2}", c.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)).collect();
+        s.push_str(&format!("    command processor per dispatch by step (the copy kernel on the graphics CP{what}: {n}, {:.1} us each): {}\n", total as f64 / n as f64 / 1000.0, cs.join(", ")));
+    }
     s
 }
 
@@ -7499,7 +7512,7 @@ pub fn reset_shader_profile() {
     PROG_GEN.fetch_add(1, Ordering::Relaxed);
     PROG_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
     shaders::reset_prep_parts();
-    for c in DRAW_STEPS.iter().flatten().chain(DRAW_STEPS_GPU.iter().flatten()).chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(DRAW_STEPS_FIRST.iter().flatten()).chain(CS_STEPS_FIRST.iter().flatten()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()).chain(BIND_STEPS_BY.iter().flatten()).chain(PRE_STEPS_BY.iter().flatten()) {
+    for c in DRAW_STEPS.iter().flatten().chain(DRAW_STEPS_GPU.iter().flatten()).chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(COPY_STEPS.iter().flatten()).chain(DRAW_STEPS_FIRST.iter().flatten()).chain(CS_STEPS_FIRST.iter().flatten()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()).chain(BIND_STEPS_BY.iter().flatten()).chain(PRE_STEPS_BY.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
     for c in CS_PHASES.iter().chain(DRAW_PHASES.iter()).chain(PLACE_PHASES.iter().flatten().flatten()) {
@@ -14959,6 +14972,13 @@ impl Exec {
                 CS_STEPS_FIRST[kind][CS_STEP_COUNT].fetch_add(1, Ordering::Relaxed);
             } else {
                 CS_STEPS[kind][CS_STEP_COUNT].fetch_add(1, Ordering::Relaxed);
+            }
+            if kind == 0 && super::forward::is_copy_kernel(&p) {
+                let a = &COPY_STEPS[first as usize];
+                for (k, c) in a[..CS_STEP_COUNT].iter().enumerate() {
+                    c.fetch_add(lap.local[k], Ordering::Relaxed);
+                }
+                a[CS_STEP_COUNT].fetch_add(1, Ordering::Relaxed);
             }
             lap.slow(&self.name, || format!("cs {:#x}{}{}", p.addr, if indirect.is_some() { " indirect" } else { "" }, if first { ", first of its batch" } else { "" }));
         }
