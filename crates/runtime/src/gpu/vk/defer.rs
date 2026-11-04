@@ -834,6 +834,9 @@ unsafe extern "system" fn clear_attachments(cb: vk::CommandBuffer, n: u32, att: 
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Barriers merged into the barrier before them (`pipeline_barrier`).
+pub static MERGED_BARRIERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 unsafe extern "system" fn pipeline_barrier(
     cb: vk::CommandBuffer,
     src: vk::PipelineStageFlags,
@@ -847,6 +850,37 @@ unsafe extern "system" fn pipeline_barrier(
     ib: *const vk::ImageMemoryBarrier<'_>,
 ) {
     if !record(cb, |l| {
+        // Right after another barrier (nothing recorded between), both of
+        // global memory barriers only and the same dependency flags: one
+        // barrier with both scopes, as strong as the two (+0.3-1.2% at 1-1's
+        // walk places, FINDINGS.md 2026-11-04).
+        if bn == 0 && inn == 0 && mn <= 1 {
+            if let Some(&Op::Barrier(s0, d0, dep0, m0, b0, i0)) = l.ops.last() {
+                if b0.n == 0 && i0.n == 0 && m0.n <= 1 && dep0 == dep {
+                    let (mut sa, mut da) = (vk::AccessFlags::empty(), vk::AccessFlags::empty());
+                    if m0.n == 1 {
+                        let x = &l.items::<vk::MemoryBarrier<'static>>(m0)[0];
+                        (sa, da) = (x.src_access_mask, x.dst_access_mask);
+                    }
+                    if mn == 1 {
+                        let x = unsafe { &*mb };
+                        (sa, da) = (sa | x.src_access_mask, da | x.dst_access_mask);
+                    }
+                    let one = vk::MemoryBarrier::default().src_access_mask(sa).dst_access_mask(da);
+                    let m = if m0.n == 1 {
+                        l.items::<vk::MemoryBarrier<'static>>(m0)[0] = one;
+                        m0
+                    } else {
+                        l.put(&one, 1)
+                    };
+                    if let Some(last) = l.ops.last_mut() {
+                        *last = Op::Barrier(s0 | src, d0 | dst, dep, m, b0, i0);
+                    }
+                    MERGED_BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
         let m = l.put(mb, mn);
         let b = l.put(bb, bn);
         let i = l.put(ib, inn);
@@ -914,7 +948,7 @@ pub fn status() -> String {
     }
     let ops = s(S_OPS);
     format!(
-        "    deferred recording: {b} batches replayed by the submission thread ({ops} commands, {:.0} per batch, at most {}; {:.1} MiB of arrays) in {:.1} ms ({:.1} us per batch, {:.0} ns per command); {} discarded, {} replayed in place ({} commands of forms the lists do not hold), {} claims over unreleased ones, {} commands of other threads for claimed buffers{}\n",
+        "    deferred recording: {b} batches replayed by the submission thread ({ops} commands, {:.0} per batch, at most {}; {:.1} MiB of arrays) in {:.1} ms ({:.1} us per batch, {:.0} ns per command); {} discarded, {} replayed in place ({} commands of forms the lists do not hold), {} claims over unreleased ones, {} commands of other threads for claimed buffers, {} barriers merged into the one before{}\n",
         ops as f64 / b.max(1) as f64,
         s(S_MAX_OPS),
         s(S_WORDS) as f64 * 8.0 / (1 << 20) as f64,
@@ -926,6 +960,7 @@ pub fn status() -> String {
         s(S_UNHELD),
         s(S_STALE),
         s(S_FOREIGN),
+        MERGED_BARRIERS.load(Ordering::Relaxed),
         if CHECK.load(Ordering::Relaxed) { " (checked)" } else { "" }
     )
 }
