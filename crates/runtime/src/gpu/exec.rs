@@ -13770,8 +13770,8 @@ impl Exec {
         let bytes: &[u8] = unsafe { std::slice::from_raw_parts(p.sgpr_data.as_ptr() as *const u8, 4 * p.sgpr_data.len()) };
         let vram = match super::tune::ring_vram() {
             1 => true,
-            2 => self.name == "gfx",
-            3 => self.name != "gfx",
+            2 => !self.compute_cp,
+            3 => self.compute_cp,
             4 => super::tune::ring_range().contains(&p.addr),
             _ => false,
         };
