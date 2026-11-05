@@ -936,8 +936,19 @@ const AUDIT_SPANS: usize = 64;
 /// The import audit: [pages compared, differing at the first read, differing
 /// again (logged), pages left out (not readable now), rounds, front end 2's
 /// mirror pages compared, differing at the first read, differing again while
-/// still current and armed (logged)].
-static AUDIT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// still current and armed (logged), mirror pages left out because a batch
+/// not finished yet writes them].
+static AUDIT: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+/// Whether a batch that has not finished writes guest page `p` (its mirror
+/// copy may then hold dwords its write-back has not stored yet).
+fn audit_written_now(p: u64) -> bool {
+    inflight_writer(p, 4096).is_some_and(|s| s > done_seq())
+        || CP_WRITES.latest(&[(p, 4096)]).is_some_and(|s| s > done_seq())
+        // (An unarmed GPU-written page, `DS_IMPORT_AUDIT_GPU`: the CPU's writes
+        // since its last take are the mirror's to catch up with at the next.)
+        || (super::fe2::audit_gpu_page(p) && crate::mem::written_since_take(p) != Some(false))
+}
 
 fn audit_start() {
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -1078,7 +1089,12 @@ fn audit_mirror(buf: vk::Buffer, ptr: *mut u8, round: u64, cpu: &dyn Fn(u64) -> 
         })
         .is_ok()
     };
-    let pages = super::fe2::audit_sample(AUDIT_SPANS, round.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+    let mut pages = super::fe2::audit_sample(AUDIT_SPANS, round.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+    // (GPU-written pages, which the sample holds when `DS_FE2_ARM_GPU=1`
+    // arms them: compared only while no unfinished batch writes them.)
+    let before = pages.len();
+    pages.retain(|&p| !audit_written_now(p));
+    AUDIT[8].fetch_add((before - pages.len()) as u64, Relaxed);
     if pages.is_empty() || !read(&pages) {
         return;
     }
@@ -1086,6 +1102,10 @@ fn audit_mirror(buf: vk::Buffer, ptr: *mut u8, round: u64, cpu: &dyn Fn(u64) -> 
     for (j, &p) in pages.iter().enumerate() {
         let m = unsafe { std::slice::from_raw_parts(ptr.add(j * 4096), 4096) };
         let Some(c) = cpu(p) else { continue };
+        if audit_written_now(p) {
+            AUDIT[8].fetch_add(1, Relaxed);
+            continue;
+        }
         AUDIT[5].fetch_add(1, Relaxed);
         if m != c.as_slice() && super::fe2::audit_still(p) {
             AUDIT[6].fetch_add(1, Relaxed);
@@ -1096,13 +1116,14 @@ fn audit_mirror(buf: vk::Buffer, ptr: *mut u8, round: u64, cpu: &dyn Fn(u64) -> 
         return;
     }
     std::thread::sleep(std::time::Duration::from_millis(50));
-    if !read(&again) {
+    again.retain(|&p| !audit_written_now(p));
+    if again.is_empty() || !read(&again) {
         return;
     }
     for (j, &p) in again.iter().enumerate() {
         let m = unsafe { std::slice::from_raw_parts(ptr.add(j * 4096), 4096) };
         let Some(c) = cpu(p) else { continue };
-        if !super::fe2::audit_still(p) {
+        if !super::fe2::audit_still(p) || audit_written_now(p) {
             continue;
         }
         let diff: Vec<usize> = (0..4096).filter(|&b| m[b] != c[b]).collect();
@@ -1112,12 +1133,25 @@ fn audit_mirror(buf: vk::Buffer, ptr: *mut u8, round: u64, cpu: &dyn Fn(u64) -> 
         let k = AUDIT[7].fetch_add(1, Relaxed);
         if k < 64 {
             let at = diff[0];
+            let map = crate::mem::MEM.try_lock().map_or_else(|| "busy".into(), |g| g.find(p).map_or_else(|| "none".into(), |v| format!("{:#x}+{:#x} {:?} '{}'", v.start, v.size, v.kind, v.name)));
+            // Where the write-backs store this page (the guest page table's
+            // entry as the GPU sees it) against the live imports over it.
+            let live: Vec<u64> = spans_read().iter().filter(|s| s.start <= p && p < s.end).map(|s| ctx().buffer_address(s.buffer) + (p - s.start)).collect();
+            let pt = match super::pagetable::read_entry(p) {
+                Some(e) if live.contains(&e) => format!("page table entry {e:#x}: a live import's"),
+                Some(0) => "page table entry 0 (nothing mapped)".to_string(),
+                Some(e) => format!("page table entry {e:#x}: NO live import's (live: {:x?})", live),
+                None => "page table entry unread".to_string(),
+            };
+            let map = format!("{map}; {pt}");
             crate::warn!(
-                "gpu: import audit: front end 2's mirror holds page {p:#x} as current and armed but other than guest memory (flip {}): {} bytes differ, the first at +{at:#x} (mirror {:02x?}, guest {:02x?}); imports over it: {}",
+                "gpu: import audit: front end 2's mirror holds page {p:#x} as current and {} but other than guest memory (flip {}): {} bytes differ, the first at +{at:#x} (mirror {:02x?}, guest {:02x?}); mapping {map}; {}; imports over it: {}",
+                if super::fe2::audit_gpu_page(p) { "GPU-written, unarmed" } else { "armed" },
                 super::FRAMES.load(Relaxed),
                 diff.len(),
                 &m[at..(at + 8).min(4096)],
                 &c[at..(at + 8).min(4096)],
+                super::fe2::audit_page_state(p),
                 spans_read().iter().filter(|s| s.start <= p && p < s.end).map(|s| format!("{:#x}..{:#x} born {}", s.start, s.end, s.born)).collect::<Vec<_>>().join(", ")
             );
         }
@@ -1131,8 +1165,8 @@ fn audit_line() -> String {
     }
     let v: Vec<u64> = AUDIT.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    import audit (`DS_IMPORT_AUDIT`): {} rounds, {} pages compared, {} differing at the first read, {} read by the GPU as the CPU had them neither before nor after (logged), {} not readable; front end 2's mirror: {} current armed pages compared, {} differing at the first read, {} again 50 ms later while still current and armed (logged)\n",
-        v[4], v[0], v[1], v[2], v[3], v[5], v[6], v[7]
+        "    import audit (`DS_IMPORT_AUDIT`): {} rounds, {} pages compared, {} differing at the first read, {} read by the GPU as the CPU had them neither before nor after (logged), {} not readable; front end 2's mirror: {} current armed pages compared, {} differing at the first read, {} again 50 ms later while still current and armed (logged), {} left out while an unfinished batch wrote them\n",
+        v[4], v[0], v[1], v[2], v[3], v[5], v[6], v[7], v[8]
     )
 }
 

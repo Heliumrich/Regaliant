@@ -1259,6 +1259,17 @@ pub fn ww_reset() {
 /// last taken (their write marks are reset), into `out` (page addresses);
 /// None without write watching or when the query fails (treat as written).
 /// `who`: the caller (`WW_WHO_NAMES`; statistics).
+/// Whether the CPU wrote guest page `page` (4 KiB) since its last take,
+/// without resetting anything (a diagnosis's look: `DS_IMPORT_AUDIT_GPU`).
+/// None: not write-watched memory or the query failed.
+pub fn written_since_take(page: u64) -> Option<bool> {
+    let mut addrs = [std::ptr::null_mut::<std::ffi::c_void>(); 1];
+    let mut count: usize = 1;
+    let mut gran = 0u32;
+    let r = unsafe { GetWriteWatch(0, (page & !4095) as _, 4096, addrs.as_mut_ptr(), &mut count, &mut gran) };
+    (r == 0).then_some(count != 0)
+}
+
 pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>, who: usize) -> Option<()> {
     use std::sync::atomic::Ordering::Relaxed;
     if crate::sections::on() {

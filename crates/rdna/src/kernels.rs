@@ -692,7 +692,9 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8) -> Result<Vec<u
     let p_u = b.type_pointer(None, StorageClass::StorageBuffer, u32t);
     let p_dev = b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u32t);
     let p_dev64 = b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u64t);
-    let pc_members = if hold || same == 2 { 6 } else { 4 };
+    // (The skipping write-back: 6-7 the other family's table, whose entry
+    // of a page this one stores is cleared.)
+    let pc_members = if same == 2 { 8 } else if hold { 6 } else { 4 };
     let pc = b.type_struct(vec![u32t; pc_members]);
     b.decorate(pc, Decoration::Block, []);
     for k in 0..pc_members as u32 {
@@ -863,7 +865,7 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8) -> Result<Vec<u
     let bit_of = b.bitwise_and(u32t, None, lid, c31)?;
     // (`same` 2: the page's hash over its whole mirror copy against the one
     // stored at its last store; equal and non-zero: left out.)
-    let mut hashed: Option<(Word, Word, Word, Word, Word)> = None;
+    let mut hashed: Option<(Word, Word, Word, Word, Word, Word, Word, Word)> = None;
     let store_ok = if same == 2 {
         let (sh_lo, sh_hi) = shared2.expect("same");
         let k1 = c(&mut b, 0x9E37_79B1);
@@ -931,7 +933,23 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8) -> Result<Vec<u
         let nz = b.i_not_equal(bool_, None, tor, c0)?;
         let eq = b.logical_and(bool_, None, eq_lo, eq_hi)?;
         let unchanged = b.logical_and(bool_, None, eq, nz)?;
-        hashed = Some((unchanged, te_lo, te_hi, h_lo, h_hi));
+        // The other family's entry of the page (push constants 6-7; 0: no
+        // other table): cleared when this family stores the page, so that the
+        // other's next write-back of it cannot be left out on a hash its store
+        // made before this one changed guest memory's copy (a dword both
+        // families write).
+        let c6 = c(&mut b, 6);
+        let c7 = c(&mut b, 7);
+        let olo_ = pc_at(&mut b, c6)?;
+        let ohi_ = pc_at(&mut b, c7)?;
+        let otab = addr64(&mut b, olo_, ohi_)?;
+        let c0_64 = b.constant_bit64(u64t, 0);
+        let has_other = b.i_not_equal(bool_, None, otab, c0_64)?;
+        let oe = b.i_add(u64t, None, otab, toff2)?;
+        let oe_lo = b.convert_u_to_ptr(p_dev, None, oe)?;
+        let oe4 = b.i_add(u64t, None, oe, c4_64)?;
+        let oe_hi = b.convert_u_to_ptr(p_dev, None, oe4)?;
+        hashed = Some((unchanged, te_lo, te_hi, h_lo, h_hi, has_other, oe_lo, oe_hi));
         let changed = b.logical_not(bool_, None, unchanged)?;
         b.logical_and(bool_, None, store_ok, changed)?
     } else {
@@ -990,8 +1008,9 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8) -> Result<Vec<u
     let pdw = b.access_chain(p_u, None, counters, [c0, c1])?;
     let add = b.i_mul(u32t, None, total, which_dw)?;
     let add = match hashed {
-        Some((unchanged, te_lo, te_hi, h_lo, h_hi)) => {
-            // (A page stored keeps its hash for the next time.)
+        Some((unchanged, te_lo, te_hi, h_lo, h_hi, has_other, oe_lo, oe_hi)) => {
+            // (A page stored keeps its hash for the next time, and the other
+            // family's entry of it is cleared.)
             let changed = b.logical_not(bool_, None, unchanged)?;
             let keep = b.logical_and(bool_, None, changed, mapped)?;
             let (l_hk, l_hkd) = (b.id(), b.id());
@@ -1000,6 +1019,14 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8) -> Result<Vec<u
             b.begin_block(Some(l_hk))?;
             b.store(te_lo, h_lo, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
             b.store(te_hi, h_hi, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+            let (l_oc, l_ocd) = (b.id(), b.id());
+            b.selection_merge(l_ocd, SelectionControl::NONE)?;
+            b.branch_conditional(has_other, l_oc, l_ocd, [])?;
+            b.begin_block(Some(l_oc))?;
+            b.store(oe_lo, c0, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+            b.store(oe_hi, c0, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+            b.branch(l_ocd)?;
+            b.begin_block(Some(l_ocd))?;
             b.branch(l_hkd)?;
             b.begin_block(Some(l_hkd))?;
             // (A page left out: its dwords and the page in counters 4 and 5.)

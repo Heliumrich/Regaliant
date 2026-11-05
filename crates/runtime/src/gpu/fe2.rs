@@ -1899,7 +1899,48 @@ pub fn audit_sample(n: usize, seed: u64) -> Vec<u64> {
 }
 
 fn audit_bits(c: &Chunk, w: usize, wa: u64) -> u64 {
-    c.valid[w].load(Ordering::Acquire) & c.armed[w].load(Ordering::Acquire) & crate::hosted::armed_word(wa) & !c.gpu[w].load(Ordering::Acquire)
+    let valid = c.valid[w].load(Ordering::Acquire);
+    let gpu = c.gpu[w].load(Ordering::Acquire);
+    let armed = valid & c.armed[w].load(Ordering::Acquire) & crate::hosted::armed_word(wa) & !gpu;
+    // (`DS_IMPORT_AUDIT_GPU=1`: GPU-written pages current in M too, unarmed;
+    // the caller leaves out those the CPU wrote since their last take.)
+    if audit_gpu() {
+        armed | (valid & gpu)
+    } else {
+        armed
+    }
+}
+
+/// `DS_IMPORT_AUDIT_GPU=1` (diagnosis, with `DS_IMPORT_AUDIT`): the mirror
+/// audit also samples GPU-written pages current in the mirror (never armed
+/// without `DS_FE2_ARM_GPU=1`), compared while no unfinished batch writes
+/// them and the CPU has not written them since their last take: there the
+/// write-backs must have made guest memory equal to the mirror.
+pub fn audit_gpu() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_IMPORT_AUDIT_GPU").ok().as_deref() == Some("1"))
+}
+
+/// Whether page `p` is marked GPU-written (`Chunk::gpu`).
+pub fn audit_gpu_page(p: u64) -> bool {
+    chunk(p, false).is_some_and(|c| c.gpu[idx(p) / 64].load(Ordering::Acquire) >> (idx(p) % 64) & 1 != 0)
+}
+
+/// Page `p`'s arming record for the audit's log (`DS_IMPORT_AUDIT`): the
+/// flip of its last CPU write found, its arming level, the epochs it was
+/// found clean in, whether it was taken since its arming.
+pub fn audit_page_state(p: u64) -> String {
+    let Some(c) = chunk(p, false) else { return "no chunk".into() };
+    let (i, w, bit) = (idx(p), idx(p) / 64, idx(p) % 64);
+    format!(
+        "last CPU write found at flip {}, arming level {}, clean stamp {} (word {}), taken since arming {}, uses {}",
+        c.wrote[i].load(Ordering::Acquire),
+        c.level[i].load(Ordering::Acquire),
+        c.clean[i].load(Ordering::Acquire),
+        c.wclean[w].load(Ordering::Acquire),
+        c.varmed[w].load(Ordering::Acquire) >> bit & 1,
+        c.uses[w].load(Ordering::Relaxed)
+    )
 }
 
 /// Whether page `p` (`audit_sample`) is still current in M, armed and never
@@ -3765,10 +3806,16 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>, on_c:
     let m = c.buffer_address(mbuf);
     let t = super::pagetable::address();
     let mut h = HELD_MAP.get().map_or(0, |m| m.addr);
+    // (The other family's hash table, whose entries of the pages this
+    // write-back stores the kernel clears; 0: none.)
+    let mut other = 0u64;
     // (`DS_WB_SAME=2`: the family's hash table; cleared first when asked.)
     if let Some(ht) = HASHES.get() {
         let k = usize::from(on_c).min(ht.tables.len() - 1);
         h = ht.tables[k].1;
+        if ht.tables.len() > 1 {
+            other = ht.tables[1 - k].1;
+        }
         let bit = 1u32 << k;
         let all = HASH_CLEAR.load(Ordering::Acquire) & bit != 0 && HASH_CLEAR.fetch_and(!bit, Ordering::AcqRel) & bit != 0;
         let ranges = std::mem::take(&mut HASH_CLEAR_RANGES.lock()[k]);
@@ -3786,7 +3833,7 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>, on_c:
             }
         }
     }
-    let pc: Vec<u8> = [m as u32, (m >> 32) as u32, t as u32, (t >> 32) as u32, h as u32, (h >> 32) as u32, 0, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
+    let pc: Vec<u8> = [m as u32, (m >> 32) as u32, t as u32, (t >> 32) as u32, h as u32, (h >> 32) as u32, other as u32, (other >> 32) as u32].iter().flat_map(|x| x.to_le_bytes()).collect();
     let pipeline = s.pipeline;
     unsafe {
         let all = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
