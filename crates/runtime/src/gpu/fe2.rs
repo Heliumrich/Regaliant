@@ -2951,6 +2951,8 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
         }
         let code = if wb_buckets() {
             rdna::kernels::mirror_scatter_counting()
+        } else if wb_same_mode() == 1 {
+            rdna::kernels::mirror_scatter_same_census()
         } else if HELD_MAP.get().is_some() {
             rdna::kernels::mirror_scatter_hold_census()
         } else {
@@ -2964,7 +2966,28 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
             c.device.destroy_shader_module(module, None);
             Ok(pipeline?[0])
         };
-        let pipeline = make(&code, if wb_buckets() { 27 } else if HELD_MAP.get().is_some() { 28 } else { 20 })?;
+        let pipeline = make(&code, if wb_buckets() { 27 } else if wb_same_mode() == 1 { 34 } else if HELD_MAP.get().is_some() { 28 } else { 20 })?;
+        if wb_same_mode() == 2 && SAME_SKIP.get().is_none() {
+            // (The tables first: zeroed, and the buffer of zeros.)
+            let mut tables = Vec::new();
+            for _ in [Some(marks), marks_c].into_iter().flatten() {
+                let (b, _m, a) = c.device_buffer_addressed(HASH_TABLE_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)?;
+                if a == 0 {
+                    return Err("the hash tables need device addresses".into());
+                }
+                tables.push((b, a));
+            }
+            let (zeros, _zm) = c.device_buffer(HASH_ZERO_BYTES, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)?;
+            let tb: Vec<vk::Buffer> = tables.iter().map(|t| t.0).collect();
+            super::resident::one_off_now(|cmd| {
+                for &t in &tb {
+                    c.device.cmd_fill_buffer(cmd, t, 0, vk::WHOLE_SIZE, 0);
+                }
+                c.device.cmd_fill_buffer(cmd, zeros, 0, vk::WHOLE_SIZE, 0);
+            })?;
+            let _ = HASHES.set(HashTables { tables, zeros });
+            let _ = SAME_SKIP.set(make(&rdna::kernels::mirror_scatter_same_skip(), 36)?);
+        }
         let compact = make(&rdna::kernels::mirror_compact(), 24)?;
         let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 4 }];
         let pool = c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(2).pool_sizes(&sizes), None).map_err(|e| format!("scatter pool: {e}"))?;
@@ -3019,6 +3042,165 @@ pub fn note_touch_bits() {
 pub fn wb_buckets() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("DS_WB_BUCKETS").ok().as_deref() == Some("1"))
+}
+
+/// Whether the write-back compares pages with guest memory (`wb_same_mode`
+/// 1 or 2).
+pub fn wb_same() -> bool {
+    wb_same_mode() != 0
+}
+
+/// The write-back's handling of pages it would store unchanged: 2 (the
+/// default since 2026-11-05) leaves them out
+/// (`rdna::kernels::mirror_scatter_same_skip`: a 64-bit hash of the page's
+/// mirror copy against the one kept at its last store; FINDINGS.md 2026-11-05
+/// small hours), the plain write-back's pipeline made too and the control
+/// `wbs on|off` choosing (in-run A/Bs); `DS_WB_SAME=1` (diagnosis) counts
+/// them by reading guest memory's copy (`mirror_scatter_same_census`);
+/// `DS_WB_SAME=0`, and the diagnoses with write-back kernels of their own
+/// (`DS_WB_BUCKETS=1`, `DS_FE2_HOLD=1`), store every page.
+pub fn wb_same_mode() -> u8 {
+    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        if wb_buckets() || std::env::var("DS_FE2_HOLD").ok().as_deref() == Some("1") {
+            return 0;
+        }
+        std::env::var("DS_WB_SAME").ok().and_then(|v| v.parse().ok()).filter(|&v: &u8| v <= 2).unwrap_or(2)
+    })
+}
+
+/// `DS_WB_SAME=2`: the skipping write-back's pipeline, and whether it is used
+/// (`wbs on|off`).
+static SAME_SKIP: std::sync::OnceLock<vk::Pipeline> = std::sync::OnceLock::new();
+static SAME_SKIP_ON: AtomicBool = AtomicBool::new(true);
+
+/// `DS_WB_SAME=2`: the pages' hashes at their last store, a table per
+/// written-bit map (device-local, 8 bytes a page of the span: buffer,
+/// address), and a buffer of zeros the uploads' clears copy from.
+struct HashTables {
+    tables: Vec<(vk::Buffer, u64)>,
+    zeros: vk::Buffer,
+}
+
+static HASHES: std::sync::OnceLock<HashTables> = std::sync::OnceLock::new();
+const HASH_TABLE_BYTES: u64 = (MIRROR_END - MIRROR_BASE) / PAGE * 8;
+const HASH_ZERO_BYTES: u64 = 64 << 10;
+/// Tables to clear before their family's next write-back (mapping changes,
+/// `wbs on`): a bit per table.
+static HASH_CLEAR: AtomicU32 = AtomicU32::new(0);
+
+/// Guest [base, base+len)'s mapping changed: its pages' kept hashes dropped
+/// before each family's next write-back (an upload may not precede GPU work
+/// that only writes there).
+pub fn hash_clear_range(base: u64, len: u64) {
+    if HASHES.get().is_none() || len == 0 {
+        return;
+    }
+    let lo = base.max(MIRROR_BASE) & !(PAGE - 1);
+    let hi = base.saturating_add(len).min(MIRROR_END).next_multiple_of(PAGE);
+    if lo < hi {
+        let mut q = HASH_CLEAR_RANGES.lock();
+        for l in q.iter_mut() {
+            l.push((lo, hi));
+        }
+    }
+}
+
+/// Ranges whose hashes to clear, a list per table.
+static HASH_CLEAR_RANGES: parking_lot::Mutex<[Vec<(u64, u64)>; 2]> = parking_lot::Mutex::new([Vec::new(), Vec::new()]);
+
+/// Every page's kept hash dropped before the next write-backs (`wbs on`: the
+/// tables were not kept meanwhile). (Guest memory changed under a page --
+/// a CPU write, a mapping change -- reaches the mirror only by an upload,
+/// which clears the page's hash: `hash_clear_uploads`.)
+pub fn hash_clear_all() {
+    if HASHES.get().is_some() {
+        HASH_CLEAR.store(u32::MAX, Ordering::Release);
+    }
+}
+
+/// Uploads into the mirror were recorded into `cmd` (`exec::record_copies`):
+/// their pages' kept hashes cleared there too, after them.
+pub fn hash_clear_uploads(cmd: vk::CommandBuffer, copies: &[(vk::Buffer, vk::Buffer, vk::BufferCopy)]) {
+    let Some(h) = HASHES.get() else { return };
+    let Some((mbuf, _)) = super::resident::mirror_buffer() else { return };
+    // (The uploads' pages as disjoint runs: several uploads may cover a page.)
+    let mut runs: Vec<(u64, u64)> = copies.iter().filter(|c| c.1 == mbuf).map(|c| (c.2.dst_offset / PAGE, (c.2.dst_offset + c.2.size).div_ceil(PAGE))).collect();
+    runs.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(runs.len());
+    for (a, b) in runs {
+        match merged.last_mut() {
+            Some(l) if a <= l.1 => l.1 = l.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    let mut regions: Vec<vk::BufferCopy> = Vec::new();
+    for (p0, p1) in merged {
+        let mut p = p0;
+        while p < p1 {
+            let n = (p1 - p).min(HASH_ZERO_BYTES / 8);
+            regions.push(vk::BufferCopy { src_offset: 0, dst_offset: p * 8, size: n * 8 });
+            p += n;
+        }
+    }
+    if regions.is_empty() {
+        return;
+    }
+    let c = ctx();
+    unsafe {
+        // (Transfer stages only: the copy queue records these too.)
+        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        for &(t, _) in &h.tables {
+            c.device.cmd_copy_buffer(cmd, h.zeros, t, &regions);
+        }
+    }
+}
+
+/// Control `wbs on|off` (`DS_WB_SAME=2`).
+pub fn wbs_control(what: &str) -> Result<String, String> {
+    if SAME_SKIP.get().is_none() {
+        return Err("wbs: no skipping write-back (`DS_WB_SAME=2`)".into());
+    }
+    match what {
+        "on" => {
+            // (The tables were not kept while off.)
+            hash_clear_all();
+            SAME_SKIP_ON.store(true, Ordering::Release);
+            Ok("write-backs leave out pages stored unchanged".into())
+        }
+        "off" => {
+            SAME_SKIP_ON.store(false, Ordering::Release);
+            Ok("write-backs store every page".into())
+        }
+        _ => Err("usage: wbs on|off".into()),
+    }
+}
+
+/// Status line of `DS_WB_SAME` (since the last one).
+fn wb_same_line() -> String {
+    if !wb_same() || SCATTER.get().is_none() {
+        return String::new();
+    }
+    static LAST: parking_lot::Mutex<(u64, u64, u64, u64, u64)> = parking_lot::Mutex::new((0, 0, 0, 0, 0));
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    let now = [WB64[0].load(Ordering::Relaxed), WB64[1].load(Ordering::Relaxed), WB64[2].load(Ordering::Relaxed), WB64[3].load(Ordering::Relaxed)];
+    let mut l = LAST.lock();
+    let flips = frame.saturating_sub(l.0).max(1) as f64;
+    let d = [now[0].saturating_sub(l.1), now[1].saturating_sub(l.2), now[2].saturating_sub(l.3), now[3].saturating_sub(l.4)];
+    *l = (frame, now[0], now[1], now[2], now[3]);
+    format!(
+        "    write-backs unchanged (`DS_WB_SAME={}`{}, over {flips:.0} flips): {:.0} of {:.0} pages a flip ({:.1}%) {} every marked dword as guest memory held it, {:.3} of {:.3} M dwords ({:.1}%)\n",
+        wb_same_mode(),
+        if wb_same_mode() == 2 { if SAME_SKIP_ON.load(Ordering::Relaxed) { ", on" } else { ", off" } } else { "" },
+        d[3] as f64 / flips,
+        d[0] as f64 / flips,
+        100.0 * d[3] as f64 / d[0].max(1) as f64,
+        if wb_same_mode() == 2 { "left out, holding" } else { "stored" },
+        d[2] as f64 / 1e6 / flips,
+        if wb_same_mode() == 2 { (d[1] + d[2]) as f64 / 1e6 / flips } else { d[1] as f64 / 1e6 / flips },
+        if wb_same_mode() == 2 { 100.0 * d[2] as f64 / (d[1] + d[2]).max(1) as f64 } else { 100.0 * d[2] as f64 / d[1].max(1) as f64 }
+    )
 }
 
 /// `DS_FE2_HOLD=1` (diagnosis, the hold census; FRONTEND2.md "GPU-held
@@ -3582,7 +3764,28 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>, on_c:
     let c = ctx();
     let m = c.buffer_address(mbuf);
     let t = super::pagetable::address();
-    let h = HELD_MAP.get().map_or(0, |m| m.addr);
+    let mut h = HELD_MAP.get().map_or(0, |m| m.addr);
+    // (`DS_WB_SAME=2`: the family's hash table; cleared first when asked.)
+    if let Some(ht) = HASHES.get() {
+        let k = usize::from(on_c).min(ht.tables.len() - 1);
+        h = ht.tables[k].1;
+        let bit = 1u32 << k;
+        let all = HASH_CLEAR.load(Ordering::Acquire) & bit != 0 && HASH_CLEAR.fetch_and(!bit, Ordering::AcqRel) & bit != 0;
+        let ranges = std::mem::take(&mut HASH_CLEAR_RANGES.lock()[k]);
+        if all || !ranges.is_empty() {
+            unsafe {
+                if all {
+                    ctx().device.cmd_fill_buffer(cmd, ht.tables[k].0, 0, vk::WHOLE_SIZE, 0);
+                } else {
+                    for (lo, hi) in ranges {
+                        ctx().device.cmd_fill_buffer(cmd, ht.tables[k].0, (lo - MIRROR_BASE) / PAGE * 8, (hi - lo) / PAGE * 8, 0);
+                    }
+                }
+                let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            }
+        }
+    }
     let pc: Vec<u8> = [m as u32, (m >> 32) as u32, t as u32, (t >> 32) as u32, h as u32, (h >> 32) as u32, 0, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
     let pipeline = s.pipeline;
     unsafe {
@@ -3605,6 +3808,11 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>, on_c:
                 COMPACTS[1].fetch_add(w1 - w0, Ordering::Relaxed);
             }
         }
+        // (`DS_WB_SAME=2`: the skipping write-back while `wbs on`.)
+        let pipeline = match SAME_SKIP.get() {
+            Some(&p) if SAME_SKIP_ON.load(Ordering::Acquire) => p,
+            _ => pipeline,
+        };
         c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
         c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, s.layout, 0, &[set], &[]);
         c.device.cmd_push_constants(cmd, s.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
@@ -4161,6 +4369,7 @@ pub fn status() -> String {
         + &compacts
         + &wb_buckets_line()
         + &hold_line()
+        + &wb_same_line()
 }
 
 /// One status line: the mirror's pages by state now (a scan of every

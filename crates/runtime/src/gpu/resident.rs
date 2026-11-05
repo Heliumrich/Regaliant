@@ -953,6 +953,7 @@ pub fn remap_guard() -> parking_lot::RwLockWriteGuard<'static, ()> {
 pub fn settled(base: u64, len: u64) {
     remapped(base, len);
     crate::hosted::forget(base, len);
+    super::fe2::hash_clear_range(base, len);
 }
 
 /// An access violation at `addr` (`write`: a write): handled when it is a

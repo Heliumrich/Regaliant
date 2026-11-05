@@ -822,6 +822,7 @@ fn revalidate_spans() {
     let ranges: Vec<(u64, u64)> = changed.iter().map(|&(a, b)| (a, b - a)).collect();
     for &(a, n) in &ranges {
         super::fe2::invalidate(a, n);
+        super::fe2::hash_clear_range(a, n);
     }
     // Imports in progress over the changed pages are dropped when they end
     // (they may pin pages no longer mapped there): before the list is
@@ -2782,6 +2783,8 @@ fn record_copies(cmd: vk::CommandBuffer, copies: &mut Vec<(vk::Buffer, vk::Buffe
         PRE_CALLS.fetch_add(1, Ordering::Relaxed);
         unsafe { ctx().device.cmd_copy_buffer(cmd, src, dst, &regions) };
     }
+    // (`DS_WB_SAME=2`: the uploaded pages' kept hashes cleared.)
+    super::fe2::hash_clear_uploads(cmd, copies);
     copies.clear();
 }
 

@@ -674,6 +674,17 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 info!("file traffic at flip {flip}:\n{}", hle::iostat::status());
                 Ok(())
             }
+            "wbs" => {
+                // `wbs on|off` (`DS_WB_SAME=2`): write-backs leave out the
+                // pages they would store unchanged.
+                match gpu::fe2::wbs_control(parts.next().unwrap_or("")) {
+                    Ok(m) => {
+                        info!("control: wbs: {m} at flip {flip}");
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             "wbb" => {
                 // `wbb lazy|eager` (`DS_WB_BUCKETS=1`, diagnosis): the
                 // write-back leaves out the last census's untouched buckets.
