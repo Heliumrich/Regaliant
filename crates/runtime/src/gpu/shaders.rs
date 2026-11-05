@@ -1074,9 +1074,10 @@ fn mark_now(addr: u64) {
 
 /// Stage preparation by part (`DS_STEP_LAPS=1` or the profiler): TSC
 /// cycles of each part of `PREP_PART_NAMES` per stage kind (vertex, pixel,
-/// compute), then preparations, those the stage cache served, and the words,
-/// read ranges and loaded pointers of the others (`prep_lap_volume`).
-static PREP_PARTS: [[std::sync::atomic::AtomicU64; PREP_PARTS_N + 5]; 3] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; PREP_PARTS_N + 5] }; 3];
+/// compute, compute of indirect dispatches), then preparations, those the
+/// stage cache served, and the words, read ranges, loaded pointers and
+/// resources of the others (`prep_lap_volume`).
+static PREP_PARTS: [[std::sync::atomic::AtomicU64; PREP_PARTS_N + 6]; 4] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; PREP_PARTS_N + 6] }; 4];
 const PREP_PARTS_N: usize = 10;
 const PREP_PART_NAMES: [&str; PREP_PARTS_N] = ["registers", "program", "spec", "plan", "cache check", "descriptors", "depth views", "translation", "scalar loads", "result and cache"];
 
@@ -1086,12 +1087,39 @@ struct PrepLaps {
     on: bool,
     kind: usize,
     last: u64,
-    acc: [[u64; PREP_PARTS_N + 5]; 3],
+    acc: [[u64; PREP_PARTS_N + 6]; 4],
     n: u32,
 }
 
 thread_local! {
-    static PREP_LAPS: std::cell::RefCell<PrepLaps> = const { std::cell::RefCell::new(PrepLaps { on: false, kind: 0, last: 0, acc: [[0; PREP_PARTS_N + 5]; 3], n: 0 }) };
+    static PREP_LAPS: std::cell::RefCell<PrepLaps> = const { std::cell::RefCell::new(PrepLaps { on: false, kind: 0, last: 0, acc: [[0; PREP_PARTS_N + 6]; 4], n: 0 }) };
+}
+
+thread_local! {
+    /// The compute stage being prepared is an indirect dispatch's (its laps
+    /// go to the fourth kind: `IndirectLaps`).
+    static PREP_INDIRECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While it lives, this thread's compute preparations are timed as an
+/// indirect dispatch's (`DS_STEP_LAPS`).
+pub struct IndirectLaps(bool);
+
+impl IndirectLaps {
+    pub fn new(indirect: bool) -> IndirectLaps {
+        if indirect && prep_laps_on() {
+            PREP_INDIRECT.with(|c| c.set(true));
+        }
+        IndirectLaps(indirect)
+    }
+}
+
+impl Drop for IndirectLaps {
+    fn drop(&mut self) {
+        if self.0 {
+            PREP_INDIRECT.with(|c| c.set(false));
+        }
+    }
 }
 
 fn prep_laps_on() -> bool {
@@ -1143,7 +1171,7 @@ fn prep_lap_end() {
             l.n += 1;
             if l.n >= 512 {
                 l.n = 0;
-                let acc = std::mem::replace(&mut l.acc, [[0; PREP_PARTS_N + 5]; 3]);
+                let acc = std::mem::replace(&mut l.acc, [[0; PREP_PARTS_N + 6]; 4]);
                 for (g, a) in PREP_PARTS.iter().zip(acc.iter()) {
                     for (c, &x) in g.iter().zip(a.iter()) {
                         c.fetch_add(x, std::sync::atomic::Ordering::Relaxed);
@@ -1154,9 +1182,10 @@ fn prep_lap_end() {
     }
 }
 
-/// What a full preparation read: words, read ranges, pointers loaded.
+/// What a full preparation read: words, read ranges, pointers loaded, and
+/// its resources.
 #[inline]
-fn prep_lap_volume(words: usize, ranges: usize, ptrs: usize) {
+fn prep_lap_volume(words: usize, ranges: usize, ptrs: usize, resources: usize) {
     if prep_laps_on() {
         PREP_LAPS.with(|l| {
             let mut l = l.borrow_mut();
@@ -1165,6 +1194,7 @@ fn prep_lap_volume(words: usize, ranges: usize, ptrs: usize) {
                 l.acc[k][PREP_PARTS_N + 2] += words as u64;
                 l.acc[k][PREP_PARTS_N + 3] += ranges as u64;
                 l.acc[k][PREP_PARTS_N + 4] += ptrs as u64;
+                l.acc[k][PREP_PARTS_N + 5] += resources as u64;
             }
         });
     }
@@ -1181,7 +1211,7 @@ pub fn reset_prep_parts() {
 pub fn prep_parts_line() -> String {
     let hz = super::threadcpu::tsc_hz();
     let mut s = String::new();
-    for (k, name) in ["vertex", "pixel", "compute"].iter().enumerate() {
+    for (k, name) in ["vertex", "pixel", "compute", "compute, indirect dispatches"].iter().enumerate() {
         let v: Vec<u64> = PREP_PARTS[k].iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
         let n = v[PREP_PARTS_N];
         if n == 0 {
@@ -1192,19 +1222,20 @@ pub fn prep_parts_line() -> String {
         let parts: Vec<String> = PREP_PART_NAMES.iter().zip(v.iter()).map(|(p, &c)| format!("{p} {:.0}", ns(c))).collect();
         let full = n.max(1) as f64;
         s.push_str(&format!(
-            "    stage preparation by part, {name} ({n} preparations; {:.0} ns each): {}; one read {:.1} words in {:.1} ranges, {:.1} pointers\n",
+            "    stage preparation by part, {name} ({n} preparations; {:.0} ns each): {}; one read {:.1} words in {:.1} ranges, {:.1} pointers, {:.1} resources\n",
             ns(total),
             parts.join(", "),
             v[PREP_PARTS_N + 2] as f64 / full,
             v[PREP_PARTS_N + 3] as f64 / full,
-            v[PREP_PARTS_N + 4] as f64 / full
+            v[PREP_PARTS_N + 4] as f64 / full,
+            v[PREP_PARTS_N + 5] as f64 / full
         ));
     }
     s
 }
 
 pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prepared, String> {
-    prep_lap_begin(2);
+    prep_lap_begin(if prep_laps_on() && PREP_INDIRECT.with(|c| c.get()) { 3 } else { 2 });
     let sh = |i: u32| cp.sh(i);
     let addr = ((sh(CS_PGM_LO) as u64) | ((sh(CS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
     let rsrc2 = sh(CS_RSRC2);
@@ -3047,7 +3078,7 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         }
     }
     prep_lap(8);
-    prep_lap_volume(rd.words.len(), rd.reads.len(), rd.ptrs.len());
+    prep_lap_volume(rd.words.len(), rd.reads.len(), rd.ptrs.len(), resources.len());
     // The reader's references into the translation's plan end here.
     let used = [rd.reads.len() as u32, rd.words.len() as u32, rd.ptrs.len() as u32];
     if used != sizes {

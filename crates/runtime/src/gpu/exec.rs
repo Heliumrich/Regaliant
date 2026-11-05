@@ -7192,6 +7192,53 @@ pub(super) fn prog_note(class: u8, a: u64, b: u64, ns: u64) {
     });
 }
 
+/// Slow placements (`DS_SLOW_PLACE`): per (executor, shader, base, size,
+/// written) [count, us, max us, placed bytes, probe sums].
+type SlowKey = (String, u64, u64, u64, bool);
+static SLOW_PLACES: Mutex<Option<HashMap<SlowKey, (u64, u64, u64, u64, [u64; super::fe2::PROBE_N])>>> = Mutex::new(None);
+static SLOW_PLACES_LOGGED: AtomicU64 = AtomicU64::new(0);
+
+fn note_slow_place(name: &str, base: u64, size: u64, written: bool, placed: Option<u64>, us: u64, probe: [u64; super::fe2::PROBE_N]) {
+    let shader = super::images::BINDING_SHADER.with(|s| s.get());
+    if SLOW_PLACES_LOGGED.fetch_add(1, Ordering::Relaxed) < 120 {
+        let parts: Vec<String> = super::fe2::PROBE_NAMES.iter().zip(probe.iter()).filter(|&(_, &v)| v != 0).map(|(n, &v)| if n.ends_with(" us") { format!("{n} {}", v / 1000) } else { format!("{n} {v}") }).collect();
+        crate::info!("gpu[{name}]: slow placement of {base:#x}+{size:#x}{} for shader {shader:#x} at flip {}: {us} us (placed {}); {}", if written { " written" } else { "" }, super::FRAMES.load(Ordering::Relaxed), placed.map_or("nothing".to_string(), |p| format!("{p:#x}")), parts.join(", "));
+    }
+    let mut g = SLOW_PLACES.lock();
+    let e = g.get_or_insert_with(HashMap::new).entry((name.to_string(), shader, base, size, written)).or_insert((0, 0, 0, 0, [0; super::fe2::PROBE_N]));
+    e.0 += 1;
+    e.1 += us;
+    e.2 = e.2.max(us);
+    e.3 += placed.unwrap_or(0);
+    for (a, b) in e.4.iter_mut().zip(probe.iter()) {
+        *a += b;
+    }
+}
+
+/// The slow placements' lines (`laps_report`; `DS_SLOW_PLACE`).
+fn slow_place_lines() -> String {
+    let g = SLOW_PLACES.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let flips = super::FRAMES.load(Ordering::Relaxed).saturating_sub(PROG_FROM.load(Ordering::Relaxed)).max(1) as f64;
+    let mut v: Vec<_> = m.iter().collect();
+    v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    let all: u64 = v.iter().map(|x| x.1 .1).sum();
+    let mut out = format!("    slow placements (`DS_SLOW_PLACE`): {} kinds, {:.2} ms a flip in all; the costliest:\n", v.len(), all as f64 / 1e3 / flips);
+    for ((name, shader, base, size, written), (n, us, max, placed, p)) in v.iter().take(30) {
+        let avg = |k: usize| p[k] as f64 / (*n).max(1) as f64;
+        out.push_str(&format!(
+            "      {name} shader {shader:#x} {base:#x}+{size:#x}{}: {:.2}/flip at {:.0} us (max {max}; placed {:.1} MiB; checks {:.1}, hits {:.1}, words {:.0}, summaries {:.1}, runs {:.1} ({:.0} pages), hot {:.1} ({:.0} pages), after another's take {:.1}, taken {:.1} ({:.0} pages); scan {:.0} us, runs {:.0} us)\n",
+            if *written { " written" } else { "" },
+            *n as f64 / flips,
+            *us as f64 / (*n).max(1) as f64,
+            *placed as f64 / (*n).max(1) as f64 / (1u64 << 20) as f64,
+            avg(0), avg(1), avg(2), avg(3), avg(4), avg(5), avg(6), avg(7), avg(8), avg(9), avg(10),
+            avg(11) / 1e3, avg(12) / 1e3
+        ));
+    }
+    out
+}
+
 /// The census's lines (`laps_report`): the costliest programs per class.
 fn prog_census_lines() -> String {
     let g = PROG_CENSUS.lock();
@@ -7221,6 +7268,13 @@ fn prog_census_lines() -> String {
             v.len(),
             top.join("; ")
         ));
+        // Indirect dispatches apart (their preparations are the dearest).
+        let ind: Vec<&(&(u8, u64, u64), &[u64; 2])> = v.iter().filter(|x| x.0 .2 == 1).collect();
+        if !ind.is_empty() {
+            let (n, ns) = ind.iter().fold((0u64, 0u64), |(n, t), x| (n + x.1[0], t + x.1[1]));
+            let top: Vec<String> = ind.iter().take(16).map(|((_, a, _), x)| format!("cs {a:#x} {:.1}/flip at {:.1} us ({:.2} ms)", x[0] as f64 / flips, x[1] as f64 / x[0].max(1) as f64 / 1e3, x[1] as f64 / flips / 1e6)).collect();
+            out.push_str(&format!("    commands by program, {name}, indirect dispatches: {:.0} a flip, {:.2} ms a flip ({} programs): {}\n", n as f64 / flips, ns as f64 / flips / 1e6, ind.len(), top.join("; ")));
+        }
     }
     out
 }
@@ -7684,6 +7738,7 @@ pub fn reset_shader_profile() {
     }
     crate::mem::ww_reset();
     *PROG_CENSUS.lock() = None;
+    *SLOW_PLACES.lock() = None;
     PROG_GEN.fetch_add(1, Ordering::Relaxed);
     PROG_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
     shaders::reset_prep_parts();
@@ -7710,7 +7765,7 @@ pub fn laps_report() -> String {
     if !laps() || profiling() {
         return String::new();
     }
-    draw_steps_line() + &draw::delta_line() + &shaders::prep_parts_line() + &bind_steps_line() + &pre_steps_line() + &prog_census_lines()
+    draw_steps_line() + &draw::delta_line() + &shaders::prep_parts_line() + &bind_steps_line() + &pre_steps_line() + &prog_census_lines() + &slow_place_lines()
 }
 
 /// Shaders by total GPU time.
@@ -10041,6 +10096,22 @@ impl Exec {
     /// reaching past the end of its mapping is placed up to there (the rest
     /// reads 0). None: nothing of it is mapped, or no video memory.
     fn fe2_place(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
+        let slow = super::fe2::slow_place_us();
+        if slow == 0 {
+            return self.fe2_place_any(base, size, written);
+        }
+        let _ = super::fe2::probe_take();
+        let t = std::time::Instant::now();
+        let r = self.fe2_place_any(base, size, written);
+        let us = t.elapsed().as_micros() as u64;
+        let probe = super::fe2::probe_take();
+        if us >= slow {
+            note_slow_place(&self.name, base, size, written, r.map(|x| x.2), us, probe);
+        }
+        r
+    }
+
+    fn fe2_place_any(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
         if !super::fe2::callers_on() {
             if super::fe2census::on() || super::fe2::quiet_census_on() || super::fe2::up_census_on() {
                 super::fe2::set_caller(&self.name);
@@ -14380,6 +14451,8 @@ impl Exec {
             lap.mark(16);
         }
         let wave64 = initiator & (1 << 15) == 0;
+        // (Its preparations timed as an indirect dispatch's: `DS_STEP_LAPS`.)
+        let _indirect_laps = shaders::IndirectLaps::new(indirect.is_some());
         // Prepared ahead by the workers (`gpu::ahead`) when it still holds.
         let [pre, _] = cp.take_ahead();
         let mut p = match pre.and_then(|s| super::ahead::take(&s, cp, wave64)) {

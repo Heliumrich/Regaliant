@@ -1307,6 +1307,52 @@ fn local_check(class: usize, pages: u64) {
     });
 }
 
+/// `DS_SLOW_PLACE=<us>` (diagnosis; 0 off): placements taking at least that
+/// long are reported with what their checks did (`probe_take`,
+/// `exec::note_slow_place`).
+pub fn slow_place_us() -> u64 {
+    static S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("DS_SLOW_PLACE").ok().and_then(|x| x.trim().parse().ok()).unwrap_or(0))
+}
+
+/// What this thread's checks did since `probe_take` (`DS_SLOW_PLACE`):
+/// `PROBE_NAMES`.
+pub const PROBE_N: usize = 13;
+pub const PROBE_NAMES: [&str; PROBE_N] = ["checks", "range-cache hits", "words scanned", "chunks by summary", "runs to check", "their pages", "hot runs uploaded", "their pages", "runs after another's take", "runs taken", "their pages", "scan us", "runs us"];
+const P_CHECKS: usize = 0;
+const P_HITS: usize = 1;
+const P_WORDS: usize = 2;
+const P_SUMMARY: usize = 3;
+const P_RUNS: usize = 4;
+const P_RUN_PAGES: usize = 5;
+const P_HOT: usize = 6;
+const P_HOT_PAGES: usize = 7;
+const P_FOLLOW: usize = 8;
+const P_TAKES: usize = 9;
+const P_TAKE_PAGES: usize = 10;
+const P_SCAN_NS: usize = 11;
+const P_RUNS_NS: usize = 12;
+
+thread_local! {
+    static PROBE: std::cell::Cell<[u64; PROBE_N]> = const { std::cell::Cell::new([0; PROBE_N]) };
+}
+
+#[inline]
+fn probe_add(k: usize, n: u64) {
+    if slow_place_us() != 0 {
+        PROBE.with(|p| {
+            let mut v = p.get();
+            v[k] += n;
+            p.set(v);
+        });
+    }
+}
+
+/// This thread's probe counts since the last call (`DS_SLOW_PLACE`).
+pub fn probe_take() -> [u64; PROBE_N] {
+    PROBE.with(|p| p.replace([0; PROBE_N]))
+}
+
 thread_local! {
     /// Scratch of `ensure`: runs to check, pages a take reported.
     static SCRATCH: std::cell::RefCell<(Vec<(u64, u64)>, Vec<u64>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
@@ -1466,7 +1512,9 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
     let tc = tsc();
     let fine = range_fine(lo, hi, want, gpu_writes);
     caller_since(C_CACHE, tc);
+    probe_add(P_CHECKS, 1);
     if fine {
+        probe_add(P_HITS, 1);
         local_add(L_HITS, 1);
         local_add(L_FAST, 1);
         if callers_on() {
@@ -1478,6 +1526,7 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
     // (Before the scan: a change during it shows as a new value.)
     let snap = snapshot(lo, hi);
     let ts = tsc();
+    let probe_t = if slow_place_us() != 0 { Some(std::time::Instant::now()) } else { None };
     SCRATCH.with(|s| {
         let mut s = s.borrow_mut();
         let (bad, written) = &mut *s;
@@ -1499,6 +1548,7 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
                 let c = chunk(a, true).expect("inside the span");
                 if (!gpu_writes || c.gpu_all.load(Ordering::Acquire)) && summary_ok(c, a, want) {
                     local_add(L_SUMMARY, 1);
+                    probe_add(P_SUMMARY, 1);
                     if c.sum.load(Ordering::Acquire) as u32 != SUM_ARMED {
                         all_armed = false;
                     }
@@ -1591,6 +1641,14 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
             caller_count(C_WORDS, words);
             caller_since(C_SCAN, ts);
         }
+        if let Some(t) = probe_t {
+            probe_add(P_WORDS, words);
+            probe_add(P_SCAN_NS, t.elapsed().as_nanos() as u64);
+            probe_add(P_RUNS, bad.len() as u64);
+            probe_add(P_RUN_PAGES, bad.iter().map(|r| (r.1 - r.0) / PAGE).sum());
+        }
+        let probe_r = if slow_place_us() != 0 { Some(std::time::Instant::now()) } else { None };
+        let _probe_runs = ProbeRuns(probe_r);
         if bad.is_empty() {
             local_add(L_FAST, 1);
             // (Not for ranges with pages the caller's batch uploaded: they are
@@ -1606,6 +1664,8 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
             note_arming_ended(a, b);
             // Every page written lately: uploaded as it is, without a take.
             if hot_run(a, b, frame) {
+                probe_add(P_HOT, 1);
+                probe_add(P_HOT_PAGES, (b - a) / PAGE);
                 STATS[S_HOT_RUNS].fetch_add(1, Ordering::Relaxed);
                 let _k = UpKind::new(1);
                 let tu = tsc();
@@ -1636,6 +1696,7 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
             // least ours, instead of one of our own (`follow_take`).
             let tf = tsc();
             if follow_take(a, b, want) {
+                probe_add(P_FOLLOW, 1);
                 let r = {
                     let _k = UpKind::new(3);
                     followed(a, b, want, mine, upload)
@@ -1654,6 +1715,8 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
             }
             // (Why the graphics CP takes it, for `DS_FE2_CALLERS`.)
             let reasons = (callers_on() && CALLER.with(|c| c.get()) == 0).then(|| take_reasons(a, b, want));
+            probe_add(P_TAKES, 1);
+            probe_add(P_TAKE_PAGES, (b - a) / PAGE);
             if let Err(e) = check_run(a, b, ep, frame, !gpu_writes, mine, upload, armable, written, class) {
                 STATS[S_SLOW_NS].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 return Err(e);
@@ -1667,6 +1730,18 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
         super::hitch::note_since(super::hitch::Kind::Mirror, t0, || format!("check of {lo:#x}..{hi:#x}: {} runs, {} pages", bad.len(), bad.iter().map(|r| (r.1 - r.0) / PAGE).sum::<u64>()));
         Ok(())
     })
+}
+
+/// Adds the time since its start to the probe's runs part when dropped
+/// (`DS_SLOW_PLACE`).
+struct ProbeRuns(Option<std::time::Instant>);
+
+impl Drop for ProbeRuns {
+    fn drop(&mut self) {
+        if let Some(t) = self.0 {
+            probe_add(P_RUNS_NS, t.elapsed().as_nanos() as u64);
+        }
+    }
 }
 
 /// Arms (`arm`: hosted, where allowed) and takes [a, b), uploads its pages
