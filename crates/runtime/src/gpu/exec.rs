@@ -60,6 +60,16 @@ pub static EXECUTED: AtomicU64 = AtomicU64::new(0);
 /// The Vulkan device was lost: GPU execution stops (reported once).
 pub static DEVICE_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Marks the GPU device lost: true the first time (the caller logs why).
+/// The run's directory is kept from pruning (`crate::keep_run`).
+pub fn lose_device() -> bool {
+    let first = !DEVICE_LOST.swap(true, Ordering::SeqCst);
+    if first {
+        crate::keep_run("the GPU device was lost");
+    }
+    first
+}
+
 /// `DS_GPU_SYNC=1`: complete every dispatch before the next (diagnosis of
 /// device losses: the failing dispatch is named).
 fn sync_mode() -> bool {
@@ -947,7 +957,15 @@ fn audit_written_now(p: u64) -> bool {
         || CP_WRITES.latest(&[(p, 4096)]).is_some_and(|s| s > done_seq())
         // (An unarmed GPU-written page, `DS_IMPORT_AUDIT_GPU`: the CPU's writes
         // since its last take are the mirror's to catch up with at the next.)
-        || (super::fe2::audit_gpu_page(p) && crate::mem::written_since_take(p) != Some(false))
+        || (super::fe2::audit_gpu_page(p) && audit_peek() && crate::mem::written_since_take(p) != Some(false))
+}
+
+/// `DS_AUDIT_PEEK=0` (diagnosis of the diagnosis): the audit of unarmed
+/// GPU-written pages makes no write-watch query (pages the CPU wrote since
+/// their last take are compared too and may be logged).
+fn audit_peek() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_AUDIT_PEEK").ok().as_deref() != Some("0"))
 }
 
 fn audit_start() {
@@ -2942,7 +2960,7 @@ fn submit_specs(specs: Vec<(u64, SubmitSpec)>) {
         return;
     }
     let fail = |e: String, name: &str| {
-        if !DEVICE_LOST.swap(true, Ordering::SeqCst) {
+        if lose_device() {
             crate::error!("gpu[{name}]: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
         }
     };
@@ -4248,7 +4266,7 @@ fn releaser_thread(q: usize) {
             let tf = std::time::Instant::now();
             let (ok, why) = wait_release_done(q, &r);
             FENCE_NS.fetch_add(tf.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            if !ok && !DEVICE_LOST.swap(true, Ordering::SeqCst) {
+            if !ok && lose_device() {
                 let list: Vec<String> = r.shaders.iter().map(|a| format!("{a:#x}")).collect();
                 crate::error!("gpu[{}]: waiting for GPU work: {why}; GPU execution stops (batch #{}: shaders {}; {}); checkpoints: {}", r.name, r.seq, list.join(" "), ops_line(&r.ops), super::vk::checkpoint_report());
             }

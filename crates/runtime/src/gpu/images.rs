@@ -1068,7 +1068,7 @@ impl Batched {
                 BATCHED_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Err(e) => {
-                if !super::exec::DEVICE_LOST.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                if super::exec::lose_device() {
                     crate::error!("images: batched uploads' submit failed: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
                 }
                 free_batched(held);
@@ -2503,7 +2503,7 @@ impl Images {
                 let r = unsafe { c.device.wait_for_fences(&[fence], true, 10_000_000_000) };
                 super::hitch::note_since(super::hitch::Kind::GpuWait, t0, || format!("earlier texture uploads ({} in flight, {} MiB)", self.inflight.len(), bytes >> 20));
                 if let Err(e) = r {
-                    if !super::exec::DEVICE_LOST.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    if super::exec::lose_device() {
                         crate::error!("images: upload failed: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
                     }
                 }
@@ -2603,7 +2603,7 @@ impl Images {
             match r {
                 Ok(()) => self.inflight.push_back((cmd, fence, qp, s)),
                 Err(e) => {
-                    if !super::exec::DEVICE_LOST.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    if super::exec::lose_device() {
                         crate::error!("images: submit failed: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
                     }
                     c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
@@ -2644,13 +2644,13 @@ impl Images {
                         note_upload_span(self.qp, || ": texture cache one-shot (upload or transition)".to_string());
                     }
                     if let Err(e) = r {
-                        if !super::exec::DEVICE_LOST.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        if super::exec::lose_device() {
                             crate::error!("images: upload/transition failed: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
                         }
                     }
                 }
                 Err(e) => {
-                    if !super::exec::DEVICE_LOST.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    if super::exec::lose_device() {
                         crate::error!("images: submit failed: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
                     }
                 }

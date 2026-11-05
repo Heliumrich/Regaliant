@@ -211,18 +211,32 @@ fn parse_args() -> Config {
     }
 }
 
-/// Keeps the newest run directories (and any containing a KEEP marker).
+/// Keeps the newest `keep` run directories without a KEEP marker
+/// (`DS_KEEP_RUNS=<n>` sets the number); those with one are never removed
+/// and take no place among them (until 2026-11-05 they did, and with ~170
+/// marked the unmarked ones lasted ~30 boots). A run marks itself when its
+/// GPU device is lost or it crashes (`keep_run`).
 fn prune_runs(runs: &Path, keep: usize) {
+    let keep = std::env::var("DS_KEEP_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(keep);
     let Ok(rd) = std::fs::read_dir(runs) else { return };
-    let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir() && !p.join("KEEP").exists()).collect();
     dirs.sort();
     if dirs.len() <= keep {
         return;
     }
     let n = dirs.len() - keep;
     for d in dirs.into_iter().take(n) {
-        if !d.join("KEEP").exists() {
-            let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Keeps this run's directory from pruning (`prune_runs`): a line naming
+/// why, appended to its KEEP marker.
+pub fn keep_run(reason: &str) {
+    if let Some(dir) = RUN_DIR.get() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("KEEP")) {
+            let _ = writeln!(f, "{reason}");
         }
     }
 }
@@ -1037,6 +1051,7 @@ pub fn fatal_report(text: &str) {
     if let Some(dir) = RUN_DIR.get() {
         let _ = std::fs::write(dir.join("crash.txt"), text);
     }
+    keep_run("crashed (crash.txt)");
 }
 
 fn thread_summary() -> String {
@@ -1173,7 +1188,7 @@ fn main() {
     };
     let cfg = parse_args();
     let runs = cfg.root.join("local-data").join("runs");
-    prune_runs(&runs, 30);
+    prune_runs(&runs, 100);
     std::fs::create_dir_all(&cfg.run_dir).expect("create run dir");
     RUN_DIR.set(cfg.run_dir.clone()).ok();
     log::init(&cfg.run_dir.join("dsport.log")).expect("open log");

@@ -946,6 +946,17 @@ fn arm_gpu() -> bool {
     *W.get_or_init(|| std::env::var("DS_FE2_ARM_GPU").ok().as_deref() == Some("1"))
 }
 
+/// `DS_FE2_ARM_GPU=2` (diagnosis of the device losses): the pages
+/// `DS_FE2_ARM_GPU=1` would arm are protected through the host as armed pages
+/// are, the GPU-written ones among them kept unarmed in front end 2's own
+/// records (marked GPU-written, taken in every epoch as by default): the
+/// protection of pages the GPU writes through their imports, without
+/// arming's other changes.
+fn arm_gpu_os() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_FE2_ARM_GPU").ok().as_deref() == Some("2"))
+}
+
 /// Diagnosis (`DS_FE2_CHECK_COPIES=1`): copy kernels' dispatches outside the
 /// graphics CP checked after their batches (`Exec::dispatch_inner`).
 pub fn check_copies() -> bool {
@@ -2311,6 +2322,7 @@ fn host_writing(a: u64, b: u64) -> bool {
 /// import windows (`armable`), plain read-write memory only.
 fn try_arm(a: u64, b: u64, frame: u64, armable: &Armable) {
     let arm_gpu = arm_gpu();
+    let arm_gpu_os = arm_gpu_os();
     // A word at a time, the pages not armed counted here and added once
     // (until 2026-10-28 page by page, each such page a shared atomic add:
     // ~170,000 pages of held chunks a flip at the gate). A page's reason is
@@ -2333,14 +2345,18 @@ fn try_arm(a: u64, b: u64, frame: u64, armable: &Armable) {
         };
         let w = idx(x) / 64;
         let mask = word_mask(x, e);
-        let armed = c.armed[w].load(Ordering::Acquire) & mask;
+        let mut armed = c.armed[w].load(Ordering::Acquire) & mask;
+        if arm_gpu_os {
+            // (GPU-written pages protected and kept unarmed: the host's bit.)
+            armed |= c.gpu[w].load(Ordering::Acquire) & crate::hosted::armed_word(x & !(64 * PAGE - 1)) & mask;
+        }
         not[R_ARMED] += armed.count_ones() as u64;
         let mut cand = mask & !armed;
         if cand != 0 && frame < c.hold_until.load(Ordering::Acquire) {
             not[R_HELD] += cand.count_ones() as u64;
             cand = 0;
         }
-        if cand != 0 && !arm_gpu && !hold_census() && !crate::mem::view_window(x) {
+        if cand != 0 && !arm_gpu && !arm_gpu_os && !hold_census() && !crate::mem::view_window(x) {
             let g = c.gpu[w].load(Ordering::Acquire) & cand;
             not[R_GPU] += g.count_ones() as u64;
             cand &= !g;
@@ -2698,9 +2714,11 @@ fn arm_part(x: u64, y: u64, frame: u64) {
     while p < y {
         let e = word_end(p, y);
         if let Some(c) = chunk(p, false) {
+            // (`DS_FE2_ARM_GPU=2`: GPU-written pages protected, not armed.)
+            let m = word_mask(p, e) & if arm_gpu_os() { !c.gpu[idx(p) / 64].load(Ordering::Acquire) } else { u64::MAX };
             // (Not taken since this arming yet: `take_run`.)
-            c.varmed[idx(p) / 64].fetch_and(!word_mask(p, e), Ordering::AcqRel);
-            c.armed[idx(p) / 64].fetch_or(word_mask(p, e), Ordering::AcqRel);
+            c.varmed[idx(p) / 64].fetch_and(!m, Ordering::AcqRel);
+            c.armed[idx(p) / 64].fetch_or(m, Ordering::AcqRel);
         }
         p = e;
     }
@@ -3091,22 +3109,26 @@ pub fn wb_same() -> bool {
     wb_same_mode() != 0
 }
 
-/// The write-back's handling of pages it would store unchanged: 2 (the
-/// default since 2026-11-05) leaves them out
+/// The write-back's handling of pages it would store unchanged: 0 (the
+/// default) stores every page, as do the diagnoses with write-back kernels
+/// of their own (`DS_WB_BUCKETS=1`, `DS_FE2_HOLD=1`); `DS_WB_SAME=2` (the
+/// default from efb0a1d until 2026-11-05 morning) leaves them out
 /// (`rdna::kernels::mirror_scatter_same_skip`: a 64-bit hash of the page's
 /// mirror copy against the one kept at its last store; FINDINGS.md 2026-11-05
 /// small hours), the plain write-back's pipeline made too and the control
 /// `wbs on|off` choosing (in-run A/Bs); `DS_WB_SAME=1` (diagnosis) counts
-/// them by reading guest memory's copy (`mirror_scatter_same_census`);
-/// `DS_WB_SAME=0`, and the diagnoses with write-back kernels of their own
-/// (`DS_WB_BUCKETS=1`, `DS_FE2_HOLD=1`), store every page.
+/// them by reading guest memory's copy (`mirror_scatter_same_census`).
 pub fn wb_same_mode() -> u8 {
     static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *M.get_or_init(|| {
         if wb_buckets() || std::env::var("DS_FE2_HOLD").ok().as_deref() == Some("1") {
             return 0;
         }
-        std::env::var("DS_WB_SAME").ok().and_then(|v| v.parse().ok()).filter(|&v: &u8| v <= 2).unwrap_or(2)
+        // (Off by default since 2026-11-05: a page the CPU rewrote after a
+        // batch's check, which the batch then wrote again with the values it
+        // held, was left out and guest memory kept the CPU's words; FINDINGS.md
+        // 2026-11-05 morning, later.)
+        std::env::var("DS_WB_SAME").ok().and_then(|v| v.parse().ok()).filter(|&v: &u8| v <= 2).unwrap_or(0)
     })
 }
 
@@ -4036,7 +4058,7 @@ pub fn init() {
             crate::info!(
                 "fe2: front end 2 on ({made}; {s}; hosted arming {}{}; switched off: {}; compute runs recorded in parallel on 4 workers, from {} commands)",
                 if crate::hosted::on() { "on" } else { "off (not under the host)" },
-                if arm_gpu() { "" } else { ", GPU-written pages never armed" },
+                if arm_gpu() { "" } else if arm_gpu_os() { ", GPU-written pages protected but kept unarmed (DS_FE2_ARM_GPU=2)" } else { ", GPU-written pages never armed" },
                 OFF.join(", "),
                 super::tune::par_min_compute()
             );
@@ -4427,6 +4449,9 @@ pub fn status() -> String {
 fn census_line() -> String {
     let frame = super::FRAMES.load(Ordering::Relaxed);
     let (mut valid, mut armed, mut gpu) = (0u64, 0u64, 0u64);
+    // (GPU-written pages protected now (the host's bit), and those of them
+    // armed: pages armed before GPU work first wrote them stay so.)
+    let (mut gpu_prot, mut gpu_armed) = (0u64, 0u64);
     let mut lately = [0u64; 3];
     let mut runs = [0u64; 3];
     let windows = [8u64, 60, 600];
@@ -4441,8 +4466,12 @@ fn census_line() -> String {
         for w in 0..WORDS {
             let v = c.valid[w].load(Ordering::Relaxed);
             valid += v.count_ones() as u64;
-            armed += (c.armed[w].load(Ordering::Relaxed) & crate::hosted::armed_word(base + (w as u64) * 64 * PAGE)).count_ones() as u64;
-            gpu += c.gpu[w].load(Ordering::Relaxed).count_ones() as u64;
+            let host = crate::hosted::armed_word(base + (w as u64) * 64 * PAGE);
+            let (a, g) = (c.armed[w].load(Ordering::Relaxed) & host, c.gpu[w].load(Ordering::Relaxed));
+            armed += a.count_ones() as u64;
+            gpu += g.count_ones() as u64;
+            gpu_prot += (g & host).count_ones() as u64;
+            gpu_armed += (g & a).count_ones() as u64;
             if c.seen[w].load(Ordering::Relaxed) == 0 {
                 prev = [false; 3];
                 continue;
@@ -4464,13 +4493,15 @@ fn census_line() -> String {
     }
     let mib = |pages: u64| (pages * PAGE) >> 20;
     format!(
-        "    front end 2's pages now: valid {} ({} MiB), armed {} ({} MiB), GPU-written {}; written or first seen within 8 / 60 / 600 flips: {} / {} / {} pages ({} / {} / {} MiB) in {} / {} / {} runs
+        "    front end 2's pages now: valid {} ({} MiB), armed {} ({} MiB), GPU-written {} ({} protected now, {} of them armed); written or first seen within 8 / 60 / 600 flips: {} / {} / {} pages ({} / {} / {} MiB) in {} / {} / {} runs
 ",
         valid,
         mib(valid),
         armed,
         mib(armed),
         gpu,
+        gpu_prot,
+        gpu_armed,
         lately[0],
         lately[1],
         lately[2],
