@@ -1155,6 +1155,13 @@ fn held_test() -> Result<String, String> {
         }
     };
     let word = move |k: u64, w: u64| unsafe { std::ptr::read_volatile((page(k) + 4 * w) as *const u32) };
+    // (The protection as the system has it: `mem::os_readable` reads armed
+    // pages as readable.)
+    let noaccess = |p: u64| {
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery(p as _, &mut m, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
+        n != 0 && m.Protect & PAGE_NOACCESS != 0
+    };
     for k in 0..PAGES {
         fill(k, OLD);
     }
@@ -1194,7 +1201,7 @@ fn held_test() -> Result<String, String> {
         Ok(())
     };
     let run = || -> Result<String, String> {
-        if let Some(k) = (0..PAGES).find(|&k| !held(page(k)) || crate::mem::os_readable(page(k), PAGE)) {
+        if let Some(k) = (0..PAGES).find(|&k| !held(page(k)) || !noaccess(page(k))) {
             return Err(format!("page {k} not held and no-access after `hold`"));
         }
         // Reads of pages 0-3 by one thread, page by page.
@@ -1277,7 +1284,7 @@ fn held_test() -> Result<String, String> {
         if !had {
             s.flags.fetch_and(!WORD_MODE, Ordering::AcqRel);
         }
-        if same_word && (!held(page(6)) || crate::mem::os_readable(page(6), PAGE)) {
+        if same_word && (!held(page(6)) || !noaccess(page(6))) {
             return Err("a word answer for an armed page made held page 6 of its word accessible".into());
         }
         let mut faults = Vec::new();
