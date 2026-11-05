@@ -29,6 +29,15 @@
 //! and disarms by unprotecting before clearing the bit, one arm or disarm
 //! at a time (`arm_lock`); after a mapping change the bits are only cleared
 //! (`forget`).
+//!
+//! Held pages (`hold`; FRONTEND2.md "GPU-held pages"): armed no-access with
+//! a held bit besides, their newest words elsewhere. A fault on one is not
+//! answered: the host suspends the faulting thread and posts a request
+//! (page, access, instruction, thread) in a second ring, signalling an event;
+//! dsport puts the page's words back, makes it accessible (`release`) and
+//! resumes the thread (`resume_waiter`), which runs the access again. Word
+//! answers leave held pages alone; a disarm or mapping change clears their
+//! held bits too (counted: their words were not put back).
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use windows_sys::Win32::Foundation::*;
@@ -47,6 +56,9 @@ const MAX_LEAVES: usize = 4096;
 const RING: usize = 1 << 16;
 /// Exceptions passed on that are recorded (`Shared::passed_log`).
 const PASSED_LOG: usize = 16;
+/// Held-page requests in flight at most (each one's thread is suspended
+/// until dsport takes it: no more than the threads that exist).
+const HELD_RING: usize = 4096;
 const MAGIC: u64 = 0x6473_706f_7274_4831; // "dsportH1"
 
 /// The shared mapping.
@@ -96,9 +108,23 @@ struct Shared {
     /// the faults inside it the host retried.
     split: [AtomicU64; 2],
     split_retried: AtomicU64,
+    /// Faults on held pages: requests posted, posted for threads that could
+    /// not be suspended (they fault again until the page is released),
+    /// faults not posted for a full ring.
+    held_faults: AtomicU64,
+    held_spun: AtomicU64,
+    held_full: AtomicU64,
+    /// Requests written (by the host) and taken (by dsport).
+    held_head: AtomicU64,
+    held_tail: AtomicU64,
+    /// (page | 1 for a write | 2 when its thread was not suspended, the
+    /// faulting instruction, thread id, QueryPerformanceCounter at the fault).
+    held_ring: [[AtomicU64; 4]; HELD_RING],
     /// (page | 1 for a write, the faulting instruction).
     ring: [[AtomicU64; 2]; RING],
     leaves: [[AtomicU64; (LEAF_PAGES / 64) as usize]; MAX_LEAVES],
+    /// Held bits, by leaf as `leaves` (a held page's armed bit is set too).
+    held: [[AtomicU64; (LEAF_PAGES / 64) as usize]; MAX_LEAVES],
 }
 
 /// dsport's view of the mapping (hosted), or null.
@@ -140,6 +166,24 @@ fn bit(s: &Shared, a: u64, create: bool) -> Option<(&AtomicU64, u64)> {
     Some((&s.leaves[(leaf - 1) as usize][(i / 64) as usize], 1u64 << (i % 64)))
 }
 
+/// The held bit of guest page `a` (its leaf is its armed bit's).
+fn held_bit(s: &Shared, a: u64) -> Option<(&AtomicU64, u64)> {
+    if !(crate::mem::GUEST_BASE..crate::mem::GUEST_END).contains(&a) {
+        return None;
+    }
+    let page = (a - crate::mem::GUEST_BASE) / PAGE;
+    let leaf = s.l1[(page / LEAF_PAGES) as usize].load(Ordering::Acquire);
+    if leaf == 0 {
+        return None;
+    }
+    let i = page % LEAF_PAGES;
+    Some((&s.held[(leaf - 1) as usize][(i / 64) as usize], 1u64 << (i % 64)))
+}
+
+fn is_held(s: &Shared, a: u64) -> bool {
+    held_bit(s, a).is_some_and(|(w, m)| w.load(Ordering::Acquire) & m != 0)
+}
+
 /// Whether dsport runs under its host.
 pub fn on() -> bool {
     !SHARED.load(Ordering::Acquire).is_null()
@@ -166,6 +210,13 @@ pub fn init() {
             return;
         }
         SHARED.store(s, Ordering::Release);
+        // (0x0010_0000: SYNCHRONIZE.)
+        let e = OpenEventW(0x0010_0000, 0, wide(&format!("{name}-held")).as_ptr());
+        if e.is_null() {
+            crate::warn!("hosted: cannot open the host's held-page event: error {} (requests are polled)", GetLastError());
+        } else {
+            HELD_EVENT.store(e as u64, Ordering::Release);
+        }
     }
     crate::info!("hosted: under the host (write faults on armed guest pages answered there; {name})");
     // Every 5 s with debug events or faults since the last look: their
@@ -229,16 +280,16 @@ pub fn arm_lock() -> parking_lot::ReentrantMutexGuard<'static, ()> {
 /// Arms guest [base, base+len) (whole pages) against writes: its bits set,
 /// then read-only.
 pub fn arm(base: u64, len: u64) -> Result<(), String> {
-    arm_as(base, len, PAGE_READONLY)
+    arm_as(base, len, PAGE_READONLY, false)
 }
 
 /// Arms guest [base, base+len) against any access: its bits set, then
 /// no-access.
 pub fn arm_noaccess(base: u64, len: u64) -> Result<(), String> {
-    arm_as(base, len, PAGE_NOACCESS)
+    arm_as(base, len, PAGE_NOACCESS, false)
 }
 
-fn arm_as(base: u64, len: u64, prot: u32) -> Result<(), String> {
+fn arm_as(base: u64, len: u64, prot: u32, hold: bool) -> Result<(), String> {
     let s = shared().ok_or("not hosted")?;
     let _lock = arm_lock();
     let (lo, hi) = (base & !(PAGE - 1), (base + len).next_multiple_of(PAGE));
@@ -250,10 +301,15 @@ fn arm_as(base: u64, len: u64, prot: u32) -> Result<(), String> {
             // (Bits set so far go again: armed bits on writable pages would
             // pass their writes unseen.)
             let Some((w, m)) = bit(s, a, true) else {
-                disarm_bits(s, lo, a);
+                disarm_bits(s, lo, a, Clear::Undo);
                 return Err(format!("{a:#x}: outside the guest range or out of leaves"));
             };
             w.fetch_or(m, Ordering::AcqRel);
+            if hold && let Some((hw, hm)) = held_bit(s, a)
+                && hw.fetch_or(hm, Ordering::AcqRel) & hm == 0
+            {
+                HELD_PAGES.fetch_add(1, Ordering::Relaxed);
+            }
         }
         // (One call per allocation of the mixed range: `mem::host_pieces`;
         // a failed one puts the pieces before it back.)
@@ -264,7 +320,7 @@ fn arm_as(base: u64, len: u64, prot: u32) -> Result<(), String> {
                 for (b, f) in crate::mem::host_pieces(lo, a) {
                     unsafe { VirtualProtect(b as _, (f - b) as usize, PAGE_READWRITE, &mut old) };
                 }
-                disarm_bits(s, lo, hi);
+                disarm_bits(s, lo, hi, Clear::Undo);
                 return Err(format!("VirtualProtect {a:#x}+{:#x}: error {err}", e - a));
             }
         }
@@ -274,10 +330,33 @@ fn arm_as(base: u64, len: u64, prot: u32) -> Result<(), String> {
     r
 }
 
-fn disarm_bits(s: &Shared, lo: u64, hi: u64) {
+/// Why armed (and held) bits are cleared: an arm or hold undone, held pages
+/// released (their words put back), or pages disarmed or changed by a
+/// mapping change (held pages among them dropped: counted).
+#[derive(Clone, Copy, PartialEq)]
+enum Clear {
+    Undo,
+    Released,
+    Dropped,
+}
+
+/// Held pages now, and those dropped without a release (`Clear::Dropped`).
+static HELD_PAGES: AtomicU64 = AtomicU64::new(0);
+static HELD_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+fn disarm_bits(s: &Shared, lo: u64, hi: u64, why: Clear) {
     let mut last_leaf = usize::MAX;
     for a in (lo..hi).step_by(PAGE as usize) {
         if let Some((w, m)) = bit(s, a, false) {
+            // (Held bits first: the host never sees a held page unarmed.)
+            if let Some((hw, hm)) = held_bit(s, a)
+                && hw.fetch_and(!hm, Ordering::AcqRel) & hm != 0
+            {
+                HELD_PAGES.fetch_sub(1, Ordering::Relaxed);
+                if why == Clear::Dropped {
+                    HELD_DROPPED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             w.fetch_and(!m, Ordering::AcqRel);
             let leaf = leaf_of(a);
             if leaf != last_leaf {
@@ -355,7 +434,7 @@ pub fn disarm(base: u64, len: u64) {
         }
         let mut old = 0u32;
         if unsafe { VirtualProtect(a as _, (e - a) as usize, PAGE_READWRITE, &mut old) } != 0 {
-            disarm_bits(s, a, e);
+            disarm_bits(s, a, e, Clear::Dropped);
         } else {
             let err = unsafe { GetLastError() };
             if DISARM_FAILED.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -410,8 +489,162 @@ pub fn armed(a: u64) -> bool {
 pub fn forget(base: u64, len: u64) {
     let Some(s) = shared() else { return };
     let (lo, hi) = (base & !(PAGE - 1), base.saturating_add(len).next_multiple_of(PAGE));
-    disarm_bits(s, lo, hi.min(crate::mem::GUEST_END));
+    disarm_bits(s, lo, hi.min(crate::mem::GUEST_END), Clear::Dropped);
     crate::hostcensus::forget(base, len);
+}
+
+/// Holds guest [base, base+len) (whole pages; the caller has checked under
+/// `arm_lock` that they are readable and writable and not armed, and keeps
+/// their newest words elsewhere): their armed and held bits set, then
+/// no-access. A CPU access to one waits, its thread suspended by the host,
+/// until dsport has put the page's words back and released it (`take_held`,
+/// `release`, `resume_waiter`).
+pub fn hold(base: u64, len: u64) -> Result<(), String> {
+    arm_as(base, len, PAGE_NOACCESS, true)
+}
+
+/// Whether guest page `a` is held now.
+pub fn held(a: u64) -> bool {
+    shared().is_some_and(|s| is_held(s, a))
+}
+
+/// Pages held now (0 when not hosted).
+pub fn held_pages() -> u64 {
+    HELD_PAGES.load(Ordering::Relaxed)
+}
+
+/// A request the host posted: an access to a held page, its thread
+/// suspended (unless `suspended` is false: it faults again until the page
+/// is released) until `resume_waiter`.
+#[derive(Clone, Copy, Debug)]
+pub struct HeldRequest {
+    pub page: u64,
+    pub write: bool,
+    pub suspended: bool,
+    /// The faulting instruction, the thread, QueryPerformanceCounter at the
+    /// fault.
+    pub rip: u64,
+    pub tid: u32,
+    pub stamp: i64,
+}
+
+/// The host's event for posted requests (a HANDLE; 0: none).
+static HELD_EVENT: AtomicU64 = AtomicU64::new(0);
+/// One taker at a time.
+static HELD_TAKE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// The requests posted since the last call.
+pub fn take_held(out: &mut Vec<HeldRequest>) {
+    let Some(s) = shared() else { return };
+    let _one = HELD_TAKE.lock();
+    let head = s.held_head.load(Ordering::Acquire);
+    let mut tail = s.held_tail.load(Ordering::Acquire);
+    while tail < head {
+        let e = &s.held_ring[(tail % HELD_RING as u64) as usize];
+        let w = e[0].load(Ordering::Acquire);
+        out.push(HeldRequest {
+            page: w & !(PAGE - 1),
+            write: w & 1 != 0,
+            suspended: w & 2 == 0,
+            rip: e[1].load(Ordering::Acquire),
+            tid: e[2].load(Ordering::Acquire) as u32,
+            stamp: e[3].load(Ordering::Acquire) as i64,
+        });
+        tail += 1;
+    }
+    s.held_tail.store(tail, Ordering::Release);
+}
+
+/// Waits up to `ms` for the host to post a request (true: signalled).
+pub fn wait_held(ms: u32) -> bool {
+    let e = HELD_EVENT.load(Ordering::Acquire);
+    if e == 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+        return false;
+    }
+    unsafe { WaitForSingleObject(e as HANDLE, ms) == WAIT_OBJECT_0 }
+}
+
+/// The held pages of guest [base, base+len) have their newest words in
+/// guest memory (put there by the caller): made read-write, then their held
+/// and armed bits cleared, run by run within the host's regions. The pages
+/// released; a run whose protection could not be changed stays held.
+pub fn release(base: u64, len: u64) -> Result<u64, String> {
+    let s = shared().ok_or("not hosted")?;
+    let _lock = arm_lock();
+    let lo = (base & !(PAGE - 1)).max(crate::mem::GUEST_BASE);
+    let hi = base.saturating_add(len).next_multiple_of(PAGE).min(crate::mem::GUEST_END);
+    let mut a = lo;
+    let mut n = 0u64;
+    let mut failed = None;
+    while a < hi {
+        if !is_held(s, a) {
+            a += PAGE;
+            continue;
+        }
+        let mut e = a + PAGE;
+        while e < hi && is_held(s, e) {
+            e += PAGE;
+        }
+        let mut old = 0u32;
+        for (p, q) in crate::mem::host_pieces(a, e) {
+            if unsafe { VirtualProtect(p as _, (q - p) as usize, PAGE_READWRITE, &mut old) } != 0 {
+                disarm_bits(s, p, q, Clear::Released);
+                n += (q - p) / PAGE;
+            } else if failed.is_none() {
+                failed = Some(format!("VirtualProtect {p:#x}+{:#x}: error {}", q - p, unsafe { GetLastError() }));
+            }
+        }
+        a = e;
+    }
+    match failed {
+        Some(e) => Err(format!("{e} (those pages stay held; {n} released)")),
+        None => Ok(n),
+    }
+}
+
+/// Waits from a fault on a held page to its thread's resume: count, total
+/// and longest (ns); resumes that failed.
+static HELD_WAITS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn qpc() -> i64 {
+    let mut t = 0i64;
+    unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut t) };
+    t
+}
+
+fn qpc_ns(ticks: i64) -> u64 {
+    static FREQ: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    let f = *FREQ.get_or_init(|| {
+        let mut f = 0i64;
+        unsafe { windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut f) };
+        f.max(1)
+    });
+    (ticks.max(0) as u128 * 1_000_000_000 / f as u128) as u64
+}
+
+/// A request's page is released (or no longer held): its thread resumed
+/// (the host suspended it); the wait from the fault (ns), or an error.
+pub fn resume_waiter(r: &HeldRequest) -> Result<u64, String> {
+    let wait = qpc_ns(qpc() - r.stamp);
+    if r.suspended {
+        let h = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, r.tid) };
+        let n = if h.is_null() {
+            u32::MAX
+        } else {
+            let n = unsafe { ResumeThread(h) };
+            unsafe { CloseHandle(h) };
+            n
+        };
+        if n == u32::MAX || n == 0 {
+            HELD_WAITS[3].fetch_add(1, Ordering::Relaxed);
+            return Err(format!("thread {}: {}", r.tid, if n == 0 { "was not suspended".to_string() } else { format!("cannot resume it (error {})", unsafe { GetLastError() }) }));
+        }
+    }
+    HELD_WAITS[0].fetch_add(1, Ordering::Relaxed);
+    HELD_WAITS[1].fetch_add(wait, Ordering::Relaxed);
+    HELD_WAITS[2].fetch_max(wait, Ordering::Relaxed);
+    Ok(wait)
 }
 
 /// The faults the host answered since the last call: (page, a write, the
@@ -487,8 +720,25 @@ pub fn status() -> String {
         })
         .collect();
     let which = if which.is_empty() { String::new() } else { format!(" ({})", which.join("; ")) };
+    let hf = s.held_faults.load(Ordering::Relaxed);
+    let held = if hf + HELD_PAGES.load(Ordering::Relaxed) + HELD_DROPPED.load(Ordering::Relaxed) == 0 {
+        String::new()
+    } else {
+        let w: Vec<u64> = HELD_WAITS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        format!(
+            "; held pages: {} now, {hf} requests ({} for threads not suspended, {} faults not posted: ring full), waits {:.0} us on average and {:.0} us at most over {}, resumes that failed {}, held pages dropped without a release (disarms, mapping changes) {}",
+            HELD_PAGES.load(Ordering::Relaxed),
+            s.held_spun.load(Ordering::Relaxed),
+            s.held_full.load(Ordering::Relaxed),
+            w[1] as f64 / 1000.0 / w[0].max(1) as f64,
+            w[2] as f64 / 1000.0,
+            w[0],
+            w[3],
+            HELD_DROPPED.load(Ordering::Relaxed)
+        )
+    };
     format!(
-        "    hosted: {} faults on armed pages answered by the host ({:.1} us each there; {} more pages made read-write with their words), {} retried (raced an answered one), {} retried inside a view split, {} exceptions passed on{which}, {} leaves of the armed-page map, ring overflows {}, disarms that failed {}; debug events: {}\n{}",
+        "    hosted: {} faults on armed pages answered by the host ({:.1} us each there; {} more pages made read-write with their words), {} retried (raced an answered one), {} retried inside a view split, {} exceptions passed on{which}, {} leaves of the armed-page map, ring overflows {}, disarms that failed {}{held}; debug events: {}\n{}",
         f,
         s.host_ns.load(Ordering::Relaxed) as f64 / 1000.0 / f.max(1) as f64,
         s.word_pages.load(Ordering::Relaxed),
@@ -524,6 +774,9 @@ pub fn run_host() -> ! {
         (*s).magic = MAGIC;
         &*s
     };
+    // Signalled for each held-page request (dsport's service waits on it;
+    // made before the debuggee, which opens it at start-up).
+    let held_event = unsafe { CreateEventW(std::ptr::null(), 0, 0, wide(&format!("{name}-held")).as_ptr()) };
     let exe = std::env::current_exe().expect("own path");
     let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--host").collect();
     let cmdline = std::iter::once(format!("\"{}\"", exe.display())).chain(args.iter().map(|a| quote_arg(a))).collect::<Vec<_>>().join(" ");
@@ -542,6 +795,9 @@ pub fn run_host() -> ! {
         eprintln!("dsport --host: CreateProcess: error {}", unsafe { GetLastError() });
         std::process::exit(2);
     }
+    // Threads that fault on a held page without being suspended: (thread,
+    // page) posted once until the page is no longer held.
+    let mut spinning: Vec<(u32, u64)> = Vec::new();
     let mut first_bp = true;
     let mut code = 0u32;
     loop {
@@ -571,8 +827,44 @@ pub fn run_host() -> ! {
                 let rec = e.ExceptionRecord;
                 let exc = rec.ExceptionCode as u32;
                 let (write, addr) = (rec.ExceptionInformation[0] == 1, rec.ExceptionInformation[1] as u64);
+                let held = exc == 0xC000_0005 && e.dwFirstChance != 0 && is_held(s, addr);
                 let armed = exc == 0xC000_0005 && e.dwFirstChance != 0 && bit(s, addr, false).is_some_and(|(w, m)| w.load(Ordering::Acquire) & m != 0);
-                if armed {
+                if held {
+                    // Not answered: the thread waits, suspended, for dsport
+                    // to put the page's words back and resume it (it runs
+                    // the access again then).
+                    let page = addr & !(PAGE - 1);
+                    let tid = ev.dwThreadId;
+                    spinning.retain(|&(_, p)| is_held(s, p));
+                    let full = s.held_head.load(Ordering::Acquire).saturating_sub(s.held_tail.load(Ordering::Acquire)) >= HELD_RING as u64;
+                    let mut suspended = false;
+                    if !full {
+                        let h = OpenThread(THREAD_SUSPEND_RESUME, 0, tid);
+                        if !h.is_null() {
+                            suspended = SuspendThread(h) != u32::MAX;
+                            CloseHandle(h);
+                        }
+                    }
+                    if full {
+                        s.held_full.fetch_add(1, Ordering::Relaxed);
+                    } else if suspended || !spinning.contains(&(tid, page)) {
+                        if !suspended {
+                            spinning.push((tid, page));
+                            s.held_spun.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let head = s.held_head.load(Ordering::Acquire);
+                        let slot = &s.held_ring[(head % HELD_RING as u64) as usize];
+                        slot[0].store(page | write as u64 | (!suspended as u64) << 1, Ordering::Release);
+                        slot[1].store(rec.ExceptionAddress as u64, Ordering::Release);
+                        slot[2].store(tid as u64, Ordering::Release);
+                        slot[3].store(qpc() as u64, Ordering::Release);
+                        s.held_head.store(head + 1, Ordering::Release);
+                        s.held_faults.fetch_add(1, Ordering::Relaxed);
+                        if !held_event.is_null() {
+                            SetEvent(held_event);
+                        }
+                    }
+                } else if armed {
                     let page = addr & !(PAGE - 1);
                     let mut old = 0u32;
                     VirtualProtectEx(pi.hProcess, page as _, PAGE as usize, PAGE_READWRITE, &mut old);
@@ -639,6 +931,10 @@ unsafe fn answer_word(s: &Shared, process: HANDLE, page: u64) -> u64 {
     let wa = page & !(64 * PAGE - 1);
     let Some((w, _)) = bit(s, wa, false) else { return 0 };
     let mut bits = w.load(Ordering::Acquire);
+    // (Held pages wait for their words.)
+    if let Some((hw, _)) = held_bit(s, wa) {
+        bits &= !hw.load(Ordering::Acquire);
+    }
     let (alo, ahi) = (s.arming[0].load(Ordering::Acquire), s.arming[1].load(Ordering::Acquire));
     if ahi > wa && alo < wa + 64 * PAGE {
         for k in 0..64 {
@@ -789,7 +1085,195 @@ fn self_test() -> Result<String, String> {
         return Err(format!("{} pages in the ring for {N} faults (wrong: {wrong:x?}, overflow: {})", drained.len(), !ok));
     }
     let tracking = if crate::sections::on() { format!("; {}", tracking_test()?) } else { String::new() };
-    Ok(format!("{N} write faults on armed guest pages answered by the host, {us:.1} us per arm and fault, the values below the stack pointer intact, every page in the ring in order{tracking}"))
+    let held = held_test()?;
+    Ok(format!("{N} write faults on armed guest pages answered by the host, {us:.1} us per arm and fault, the values below the stack pointer intact, every page in the ring in order{tracking}; {held}"))
+}
+
+/// Held pages through the host (`hold`, `take_held`, `release`,
+/// `resume_waiter`), the test in the service's place: reads of held pages
+/// by another thread, a write from code that keeps values below its stack
+/// pointer, and two threads reading one page wait, suspended by the host,
+/// until the test has released the page and put new values there; they see
+/// the new values only, the values below the stack pointer intact, both
+/// waiters resumed by one release; a word answer for an armed page leaves a
+/// held page of its word held; nothing is passed on to dsport. On a failure
+/// the pages are released and waiting threads resumed (threads that never
+/// ran on are left).
+fn held_test() -> Result<String, String> {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    const PAGES: u64 = 8;
+    const OLD: u32 = 0x0bad_0000;
+    const NEW: u32 = 0x600d_0000;
+    let s = shared().ok_or("not hosted")?;
+    let a = crate::mem::MEM
+        .lock()
+        .alloc_internal(1 << 20, crate::mem::PROT_CPU_READ | crate::mem::PROT_CPU_WRITE, "host-held-test")
+        .map_err(|e| format!("no guest memory for the held test: {e:?}"))?;
+    let page = move |k: u64| a + k * PAGE;
+    let fill = move |k: u64, v: u32| {
+        for w in 0..PAGE / 4 {
+            unsafe { std::ptr::write_volatile((page(k) + 4 * w) as *mut u32, v + k as u32) };
+        }
+    };
+    let word = move |k: u64, w: u64| unsafe { std::ptr::read_volatile((page(k) + 4 * w) as *const u32) };
+    for k in 0..PAGES {
+        fill(k, OLD);
+    }
+    let passed = s.passed.load(Ordering::Acquire);
+    let mut stray = Vec::new();
+    take_held(&mut stray);
+    hold(a, PAGES * PAGE)?;
+    let waits = parking_lot::Mutex::new(Vec::<u64>::new());
+    // Requests until `want` (5 s at most).
+    let collect = |want: usize| -> Result<Vec<HeldRequest>, String> {
+        let t = Instant::now();
+        let mut got = Vec::new();
+        while got.len() < want {
+            if t.elapsed() > Duration::from_secs(5) {
+                return Err(format!("{} of {want} requests within 5 s ({got:x?})", got.len()));
+            }
+            wait_held(5);
+            take_held(&mut got);
+        }
+        Ok(got)
+    };
+    // The service's part: the page released with new values, the thread resumed.
+    let serve = |reqs: &[HeldRequest]| -> Result<(), String> {
+        for r in reqs {
+            if !(a..page(PAGES)).contains(&r.page) {
+                return Err(format!("a request for {:#x}, outside the test's pages", r.page));
+            }
+            if held(r.page) {
+                release(r.page, PAGE)?;
+                fill((r.page - a) / PAGE, NEW);
+            }
+            waits.lock().push(resume_waiter(r)?);
+        }
+        Ok(())
+    };
+    let run = || -> Result<String, String> {
+        if let Some(k) = (0..PAGES).find(|&k| !held(page(k)) || crate::mem::os_readable(page(k), PAGE)) {
+            return Err(format!("page {k} not held and no-access after `hold`"));
+        }
+        // Reads of pages 0-3 by one thread, page by page.
+        let seen: Arc<[AtomicU32; 5]> = Arc::new(Default::default());
+        let r2 = seen.clone();
+        let reader = std::thread::Builder::new()
+            .name("held-test-reader".into())
+            .spawn(move || {
+                r2[0].store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+                for k in 0..4u64 {
+                    r2[1 + k as usize].store(word(k, 7), Ordering::Release);
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        let mut tids = Vec::new();
+        for k in 0..4u64 {
+            let r = collect(1)?;
+            if r.len() != 1 || r[0].page != page(k) || r[0].write || !r[0].suspended {
+                return Err(format!("read of page {k}: requests {r:x?}"));
+            }
+            tids.push(r[0].tid);
+            serve(&r)?;
+        }
+        reader.join().map_err(|_| "the reader panicked")?;
+        let tid = seen[0].load(Ordering::Acquire);
+        if let Some(k) = (0..4u64).find(|&k| seen[1 + k as usize].load(Ordering::Acquire) != NEW + k as u32) {
+            return Err(format!("the reader saw {:#x} in page {k}, not the released {:#x}", seen[1 + k as usize].load(Ordering::Acquire), NEW + k as u32));
+        }
+        if tids.iter().any(|&t| t != tid) {
+            return Err(format!("requests named threads {tids:?}, the reader is {tid}"));
+        }
+        // A write to page 4 from code that keeps values below its stack pointer.
+        let mask = Arc::new(AtomicU64::new(u64::MAX));
+        let m2 = mask.clone();
+        let writer = std::thread::Builder::new()
+            .name("held-test-writer".into())
+            .spawn(move || m2.store(unsafe { probe(page(4) as *mut u32) }, Ordering::Release))
+            .map_err(|e| e.to_string())?;
+        let r = collect(1)?;
+        if r.len() != 1 || r[0].page != page(4) || !r[0].write || !r[0].suspended {
+            return Err(format!("write of page 4: requests {r:x?}"));
+        }
+        serve(&r)?;
+        writer.join().map_err(|_| "the writer panicked")?;
+        if mask.load(Ordering::Acquire) != 0 {
+            return Err(format!("the values below the stack pointer changed across the wait (mask {:#x})", mask.load(Ordering::Acquire)));
+        }
+        if word(4, 0) != 1 || word(4, 1) != NEW + 4 {
+            return Err(format!("page 4 holds {:#x} {:#x} after the write, not 1 {:#x}", word(4, 0), word(4, 1), NEW + 4));
+        }
+        // Two threads reading page 5: both wait, one release resumes both.
+        let two: Arc<[AtomicU32; 2]> = Arc::new(Default::default());
+        let mut both = Vec::new();
+        for i in 0..2 {
+            let t2 = two.clone();
+            both.push(std::thread::Builder::new().name("held-test-pair".into()).spawn(move || t2[i].store(word(5, 3), Ordering::Release)).map_err(|e| e.to_string())?);
+        }
+        let r = collect(2)?;
+        if r.len() != 2 || r.iter().any(|q| q.page != page(5) || q.write || !q.suspended) || r[0].tid == r[1].tid {
+            return Err(format!("two readers of page 5: requests {r:x?}"));
+        }
+        serve(&r)?;
+        for t in both {
+            t.join().map_err(|_| "a reader of page 5 panicked")?;
+        }
+        if two.iter().any(|v| v.load(Ordering::Acquire) != NEW + 5) {
+            return Err(format!("the readers of page 5 saw {:#x} and {:#x}, not {:#x}", two[0].load(Ordering::Acquire), two[1].load(Ordering::Acquire), NEW + 5));
+        }
+        // A word answer (page 7 armed against writes, written) leaves held
+        // page 6 of its word held.
+        let same_word = (page(6) - crate::mem::GUEST_BASE) / (64 * PAGE) == (page(7) - crate::mem::GUEST_BASE) / (64 * PAGE);
+        release(page(7), PAGE)?;
+        fill(7, NEW);
+        arm(page(7), PAGE)?;
+        let had = s.flags.load(Ordering::Acquire) & WORD_MODE != 0;
+        if !had {
+            s.flags.fetch_or(WORD_MODE, Ordering::AcqRel);
+        }
+        unsafe { std::ptr::write_volatile(page(7) as *mut u32, 9) };
+        if !had {
+            s.flags.fetch_and(!WORD_MODE, Ordering::AcqRel);
+        }
+        if same_word && (!held(page(6)) || crate::mem::os_readable(page(6), PAGE)) {
+            return Err("a word answer for an armed page made held page 6 of its word accessible".into());
+        }
+        let mut faults = Vec::new();
+        drain_faults(&mut faults);
+        if !faults.iter().any(|f| f.0 == page(7) && f.1) {
+            return Err(format!("the write fault on armed page 7 is not in the ring ({faults:x?})"));
+        }
+        release(page(6), PAGE)?;
+        let mut more = Vec::new();
+        take_held(&mut more);
+        if !more.is_empty() {
+            return Err(format!("requests nobody caused: {more:x?}"));
+        }
+        let p = s.passed.load(Ordering::Acquire) - passed;
+        if p != 0 {
+            return Err(format!("{p} exceptions passed on to dsport during the held test"));
+        }
+        let w = waits.lock();
+        Ok(format!(
+            "held pages: reads by another thread, a write from code that keeps values below its stack pointer and two readers of one page waited, suspended by the host, until released with new values ({} waits from the fault to the resume, {:.0} us on average, {:.0} us at most, the test polling as the service), saw only the new values, the values below the stack pointer intact, one release resumed both readers{}; nothing passed on to dsport",
+            w.len(),
+            w.iter().sum::<u64>() as f64 / 1000.0 / w.len().max(1) as f64,
+            w.iter().copied().max().unwrap_or(0) as f64 / 1000.0,
+            if same_word { ", a word answer left a held page of its word held" } else { " (the word answer not tested: pages 6 and 7 lie in different words)" }
+        ))
+    };
+    let r = run();
+    if r.is_err() {
+        // Every page released, every waiting thread resumed.
+        let _ = release(a, PAGES * PAGE);
+        let mut left = Vec::new();
+        take_held(&mut left);
+        for q in &left {
+            let _ = resume_waiter(q);
+        }
+    }
+    r
 }
 
 /// Section-backed memory's write tracking through the host
