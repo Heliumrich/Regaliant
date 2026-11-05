@@ -1461,25 +1461,42 @@ fn through_or_mark(tr: &mut T, r: usize, d0: Word, vals: &[Word]) -> R<()> {
         Ok(())
     })?;
     tr.guarded(go_pt, &mut |tr| {
+        // The bound range's first and last pages through the page table
+        // (the same two entries for every store of the binding: cached after
+        // the first); when they map it as one run of consecutive pages (one
+        // import holds it as the GPU runs), each dword's address is the first
+        // entry plus its offset; otherwise the dwords are marked.
         let not1 = tr.u64c(!1u64);
         let g0 = e(tr.b.bitwise_and(u64t, None, base, not1))?;
-        let pt = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u);
-        for (k, &v) in vals.iter().enumerate() {
-            let kk = tr.u(k as u32);
-            let i = e(tr.b.i_add(u, None, d0, kk))?;
-            let off = e(tr.b.shift_left_logical(u, None, i, two))?;
-            let o = e(tr.b.u_convert(u64t, None, off))?;
-            let g = e(tr.b.i_add(u64t, None, g0, o))?;
-            let (dev, mapped) = pt_translate(tr, g, None)?;
-            tr.guarded(mapped, &mut |tr| {
-                let p = e(tr.b.convert_u_to_ptr(pt, None, dev))?;
+        let four = tr.u(4);
+        let lastb = e(tr.b.i_mul(u, None, bdw, four))?;
+        let lastb = e(tr.b.i_sub(u, None, lastb, four))?;
+        let lastb = e(tr.b.u_convert(u64t, None, lastb))?;
+        let gl = e(tr.b.i_add(u64t, None, g0, lastb))?;
+        let (e0, m0) = pt_translate(tr, g0, None)?;
+        let (el, ml) = pt_translate(tr, gl, None)?;
+        // Consecutive: entry(last) - entry(first) == g(last) - g(first).
+        let de = e(tr.b.i_sub(u64t, None, el, e0))?;
+        let dg = e(tr.b.i_sub(u64t, None, gl, g0))?;
+        let same = e(tr.b.i_equal(b, None, de, dg))?;
+        let both = e(tr.b.logical_and(b, None, m0, ml))?;
+        let linear = e(tr.b.logical_and(b, None, both, same))?;
+        tr.guarded(linear, &mut |tr| {
+            let pt = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u);
+            for (k, &v) in vals.iter().enumerate() {
+                let kk = tr.u(k as u32);
+                let i = e(tr.b.i_add(u, None, d0, kk))?;
+                let off = e(tr.b.shift_left_logical(u, None, i, two))?;
+                let o = e(tr.b.u_convert(u64t, None, off))?;
+                let a = e(tr.b.i_add(u64t, None, e0, o))?;
+                let p = e(tr.b.convert_u_to_ptr(pt, None, a))?;
                 let (ma, ops) = aligned(4);
-                ok(tr.b.store(p, v, ma, ops))
-            })?;
-            let unmapped = e(tr.b.logical_not(b, None, mapped))?;
-            tr.guarded(unmapped, &mut |tr| mark_dwords(tr, r, i, 1))?;
-        }
-        Ok(())
+                ok(tr.b.store(p, v, ma, ops))?;
+            }
+            Ok(())
+        })?;
+        let split = e(tr.b.logical_not(b, None, linear))?;
+        tr.guarded(split, &mut |tr| mark_dwords(tr, r, d0, n))
     })?;
     let none = e(tr.b.logical_not(b, None, has))?;
     tr.guarded(none, &mut |tr| mark_dwords(tr, r, d0, n))
