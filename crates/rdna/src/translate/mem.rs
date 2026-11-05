@@ -1406,36 +1406,83 @@ pub fn global(tr: &mut T, ins: &Inst) -> R<()> {
     mem_access(tr, ins, &name, r, var, addr, 0, 0xFAC)
 }
 
-/// `Spec::write_through` (timing only): the store's dwords also go to the
-/// scratch buffer in host memory (the address block's header, dwords 4-5),
-/// at the bound range's address over 4 plus the dword index, modulo
-/// WRITE_THROUGH_DWORDS. Run it where the store happens (active lanes).
-fn through_dwords(tr: &mut T, r: usize, d0: Word, vals: &[Word]) -> R<()> {
-    if !tr.spec.write_through || vals.is_empty() {
-        return Ok(());
+/// `Spec::write_through`: the dwords a store of whole dwords writes at
+/// dword `d0` of resource `r`'s binding also go to guest memory when the
+/// resource has a guest-memory base (its address entry, dwords 4-5), and
+/// then are not marked; otherwise (no base, or write-through off) they are
+/// marked (`mark_dwords`). Only dwords inside the bound range are stored.
+/// Run it where the store happens (active lanes).
+fn through_or_mark(tr: &mut T, r: usize, d0: Word, vals: &[Word]) -> R<()> {
+    let n = vals.len() as u32;
+    if !tr.spec.write_through || n == 0 {
+        return mark_dwords(tr, r, d0, n);
     }
-    let (u, u64t) = (tr.t.u32, tr.t.u64);
-    let lo = tr.addr_header(4)?;
-    let hi = tr.addr_header(5)?;
+    let (u, u64t, b) = (tr.t.u32, tr.t.u64, tr.t.bool_);
+    let lo = tr.addr_info(r, 4)?;
+    let hi = tr.addr_info(r, 5)?;
     let base = u64_of(tr, lo, hi)?;
-    let r_lo = tr.addr_info(r, 0)?;
+    let z0 = tr.u(0);
+    let z64 = e(tr.b.u_convert(u64t, None, z0))?;
+    let has = e(tr.b.i_not_equal(b, None, base, z64))?;
+    // The binding's dwords end at bias + bound bytes (as `mark_dwords`).
+    let bias = tr.res_info(r, 0)?;
+    let bound = tr.res_info(r, 2)?;
+    let k3 = tr.u(3);
+    let end = e(tr.b.i_add(u, None, bound, bias))?;
+    let end = e(tr.b.i_add(u, None, end, k3))?;
     let two = tr.u(2);
-    let rb = e(tr.b.shift_right_logical(u, None, r_lo, two))?;
-    let d = e(tr.b.i_add(u, None, rb, d0))?;
-    let mask = tr.u(super::WRITE_THROUGH_DWORDS - 1);
-    let pt = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u);
-    for (k, &v) in vals.iter().enumerate() {
-        let kk = tr.u(k as u32);
-        let i = e(tr.b.i_add(u, None, d, kk))?;
-        let i = e(tr.b.bitwise_and(u, None, i, mask))?;
-        let off = e(tr.b.shift_left_logical(u, None, i, two))?;
-        let o = e(tr.b.u_convert(u64t, None, off))?;
-        let a = e(tr.b.i_add(u64t, None, base, o))?;
-        let p = e(tr.b.convert_u_to_ptr(pt, None, a))?;
-        let (ma, ops) = aligned(4);
-        ok(tr.b.store(p, v, ma, ops))?;
-    }
-    Ok(())
+    let bdw = e(tr.b.shift_right_logical(u, None, end, two))?;
+    let nn = tr.u(n);
+    let fits = e(tr.b.u_greater_than_equal(b, None, bdw, nn))?;
+    let lim = e(tr.b.i_sub(u, None, bdw, nn))?;
+    let le = e(tr.b.u_less_than_equal(b, None, d0, lim))?;
+    let inr = e(tr.b.logical_and(b, None, fits, le))?;
+    let go = e(tr.b.logical_and(b, None, has, inr))?;
+    // (Bit 0 set: the bound range's guest address, each dword's page
+    // through the page table; clear: the address in guest memory itself.)
+    let one64 = tr.u64c(1);
+    let flag = e(tr.b.bitwise_and(u64t, None, base, one64))?;
+    let direct = e(tr.b.i_equal(b, None, flag, z64))?;
+    let go_direct = e(tr.b.logical_and(b, None, go, direct))?;
+    let indirect = e(tr.b.logical_not(b, None, direct))?;
+    let go_pt = e(tr.b.logical_and(b, None, go, indirect))?;
+    tr.guarded(go_direct, &mut |tr| {
+        let pt = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u);
+        for (k, &v) in vals.iter().enumerate() {
+            let kk = tr.u(k as u32);
+            let i = e(tr.b.i_add(u, None, d0, kk))?;
+            let off = e(tr.b.shift_left_logical(u, None, i, two))?;
+            let o = e(tr.b.u_convert(u64t, None, off))?;
+            let a = e(tr.b.i_add(u64t, None, base, o))?;
+            let p = e(tr.b.convert_u_to_ptr(pt, None, a))?;
+            let (ma, ops) = aligned(4);
+            ok(tr.b.store(p, v, ma, ops))?;
+        }
+        Ok(())
+    })?;
+    tr.guarded(go_pt, &mut |tr| {
+        let not1 = tr.u64c(!1u64);
+        let g0 = e(tr.b.bitwise_and(u64t, None, base, not1))?;
+        let pt = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u);
+        for (k, &v) in vals.iter().enumerate() {
+            let kk = tr.u(k as u32);
+            let i = e(tr.b.i_add(u, None, d0, kk))?;
+            let off = e(tr.b.shift_left_logical(u, None, i, two))?;
+            let o = e(tr.b.u_convert(u64t, None, off))?;
+            let g = e(tr.b.i_add(u64t, None, g0, o))?;
+            let (dev, mapped) = pt_translate(tr, g, None)?;
+            tr.guarded(mapped, &mut |tr| {
+                let p = e(tr.b.convert_u_to_ptr(pt, None, dev))?;
+                let (ma, ops) = aligned(4);
+                ok(tr.b.store(p, v, ma, ops))
+            })?;
+            let unmapped = e(tr.b.logical_not(b, None, mapped))?;
+            tr.guarded(unmapped, &mut |tr| mark_dwords(tr, r, i, 1))?;
+        }
+        Ok(())
+    })?;
+    let none = e(tr.b.logical_not(b, None, has))?;
+    tr.guarded(none, &mut |tr| mark_dwords(tr, r, d0, n))
 }
 
 /// `Spec::write_marks`: sets the bits of `n` dwords (1..=4, a constant)
@@ -1749,16 +1796,9 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, r: usize, var: Word, addr: Wor
                 Some(sz) if sz >= 4 => {
                     let two = tr.u(2);
                     let d0 = e(tr.b.shift_right_logical(tr.t.u32, None, addr, two))?;
-                    mark_dwords(tr, r, d0, sz.div_ceil(4))?;
-                    let nd = (sz.div_ceil(4) as usize).min(vals.len());
-                    through_dwords(tr, r, d0, &vals[..nd])
+                    mark_dwords(tr, r, d0, sz.div_ceil(4))
                 }
-                Some(sz) => {
-                    mark_bytes(tr, r, addr, sz)?;
-                    let two = tr.u(2);
-                    let d0 = e(tr.b.shift_right_logical(tr.t.u32, None, addr, two))?;
-                    through_dwords(tr, r, d0, &vals[..1])
-                }
+                Some(sz) => mark_bytes(tr, r, addr, sz),
                 None => Ok(()),
             }
         });
@@ -1840,8 +1880,7 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, r: usize, var: Word, addr: Wor
                     let two = tr.u(2);
                     let d0 = e(tr.b.shift_right_logical(u, None, addr, two))?;
                     store_dwords(tr, var, addr, &vals)?;
-                    mark_dwords(tr, r, d0, n)?;
-                    through_dwords(tr, r, d0, &vals)?;
+                    through_or_mark(tr, r, d0, &vals)?;
                 }
                 "byte" | "short" | "byte_d16_hi" | "short_d16_hi" => {
                     let nb = if kind.starts_with("byte") { 1 } else { 2 };
@@ -1852,9 +1891,6 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, r: usize, var: Word, addr: Wor
                     }
                     store_bytes(tr, var, addr, v, nb)?;
                     mark_bytes(tr, r, addr, nb)?;
-                    let two = tr.u(2);
-                    let d0 = e(tr.b.shift_right_logical(u, None, addr, two))?;
-                    through_dwords(tr, r, d0, &[v])?;
                 }
                 _ => unsupported = true,
             }
@@ -1891,8 +1927,7 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, r: usize, var: Word, addr: Wor
                     tr.set_vreg_raw(ret, old)?;
                 }
             }
-            mark_dwords(tr, r, idx, 1)?;
-            through_dwords(tr, r, idx, &[v])
+            mark_dwords(tr, r, idx, 1)
         })?;
         return Ok(());
     }

@@ -968,45 +968,6 @@ impl Ctx {
 
     /// Device-local buffer with a GPU address (0 without bufferDeviceAddress):
     /// video-memory homes, named in device fault reports.
-    /// A buffer in host memory that is not device-local (stores reach it
-    /// across PCIe) with its device address (`Spec::write_through`'s scratch
-    /// buffer).
-    pub fn host_buffer_addressed(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, u64), String> {
-        if !self.device_addresses {
-            return Err("no device addresses".into());
-        }
-        unsafe {
-            let bi = self.shared(vk::BufferCreateInfo::default().size(size).usage(usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS));
-            let buf = self.device.create_buffer(&bi, None).map_err(|e| format!("vkCreateBuffer: {e}"))?;
-            let req = self.device.get_buffer_memory_requirements(buf);
-            let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            let ty = (0..self.mem_props.memory_type_count).find(|&i| {
-                let f = self.mem_props.memory_types[i as usize].property_flags;
-                req.memory_type_bits & (1 << i) != 0 && f.contains(want) && !f.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-            });
-            let Some(ty) = ty else {
-                self.device.destroy_buffer(buf, None);
-                return Err("no host memory type that is not device-local".into());
-            };
-            let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-            let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty).push_next(&mut fl);
-            let mem = match self.device.allocate_memory(&ai, None) {
-                Ok(m) => m,
-                Err(e) => {
-                    self.device.destroy_buffer(buf, None);
-                    return Err(format!("vkAllocateMemory({}): {e}", req.size));
-                }
-            };
-            if let Err(e) = self.device.bind_buffer_memory(buf, mem, 0) {
-                self.device.destroy_buffer(buf, None);
-                self.device.free_memory(mem, None);
-                return Err(format!("bind buffer: {e}"));
-            }
-            let va = self.device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buf));
-            Ok((buf, mem, va))
-        }
-    }
-
     pub fn device_buffer_addressed(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, u64), String> {
         if !self.device_addresses {
             let (b, m) = self.device_buffer(size, usage)?;

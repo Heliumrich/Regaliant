@@ -1590,11 +1590,11 @@ pub mod tune {
         get(156)
     }
 
-    /// Timing only at 1 (the 60 fps program's GPU ceiling test,
-    /// 2026-11-05; replays only, beside `write_marks 0`): translations also
-    /// store every buffer store's dwords into a scratch buffer in host
-    /// memory (`Spec::write_through`), what stores reaching guest memory from
-    /// the title's own dispatches would cost. Read when a stage is prepared.
+    /// Write-through (2026-11-05, being validated): a written binding's
+    /// stores of whole dwords also go to guest memory through the import
+    /// holding its range (`Spec::write_through`, `exec::through_base`) and
+    /// mark nothing; bytes, formats, atomics and ranges no one import holds
+    /// are marked and written back as before. Read when a stage is prepared.
     pub fn write_through() -> bool {
         get(157) != 0
     }

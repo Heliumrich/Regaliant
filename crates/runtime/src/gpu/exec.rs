@@ -928,27 +928,35 @@ fn import_mappings(s: u64, e: u64) -> (u64, u64) {
     (made, failed)
 }
 
-/// `tune write_through` on and its scratch buffer made (translations store
-/// into it only then: address 0 would lose the device).
-pub fn write_through_wanted() -> bool {
-    super::tune::write_through() && write_through_scratch() != 0
+/// Write-through (`tune write_through`, `Spec::write_through`): for the
+/// bound range at mirror offset `off` of `range` bytes, its device address in
+/// guest memory through the live import holding all of it, or else its guest
+/// address with bit 0 set (the shader finds each page through the page
+/// table); 0 without the page table (its stores are marked and written back).
+fn through_base(off: u64, range: u64) -> u64 {
+    let g0 = super::resident::MIRROR_BASE + off;
+    match span(g0, range) {
+        Some((buf, start, end)) if g0 >= start && g0 + range <= end => ctx().buffer_address(buf) + (g0 - start),
+        _ if super::pagetable::made() => g0 | 1,
+        _ => 0,
+    }
 }
 
-/// The write-through test's scratch buffer in host memory (`tune
-/// write_through`): its device address, made at first use and kept.
-fn write_through_scratch() -> u64 {
-    static S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *S.get_or_init(|| match ctx().host_buffer_addressed(rdna::translate::WRITE_THROUGH_DWORDS as u64 * 4, vk::BufferUsageFlags::STORAGE_BUFFER) {
-        Ok((_b, _m, va)) => {
-            crate::info!("gpu: write-through scratch buffer {} MiB at {va:#x} (timing only)", rdna::translate::WRITE_THROUGH_DWORDS >> 18);
-            va
-        }
-        Err(e) => {
-            crate::warn!("gpu: no write-through scratch buffer: {e}");
-            0
-        }
-    })
+/// Status part: write-through bindings (`tune write_through`; "" when off).
+fn through_line() -> String {
+    let (m, t) = (THROUGH[0].load(Ordering::Relaxed), THROUGH[1].load(Ordering::Relaxed));
+    if m + t == 0 {
+        return String::new();
+    }
+    let (pt, out) = (THROUGH[2].load(Ordering::Relaxed), THROUGH[3].load(Ordering::Relaxed));
+    format!("    write-through: of the written mirrored bindings {t} stored into guest memory by their stores ({pt} of them page by page through the page table), {m} left to marks and write-backs ({out} of them bound short of their resource's size)
+")
 }
+
+/// Write-through bindings (`tune write_through`): [written mirrored bindings
+/// left to marks (no import holds all of their range) and others, with a
+/// guest-memory base].
+static THROUGH: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// `DS_IMPORT_AUDIT=<ms>` (diagnosis): every that many milliseconds a page
 /// of each of up to AUDIT_SPANS live imports (in turn), read through the
@@ -13386,17 +13394,12 @@ impl Exec {
                 p.sgpr_data[addr_at + 1] = (fx.zero_va >> 32) as u32;
             }
             let gpu_res = found.tr.spec.gpu_res;
-            if gpu_res != 0 || found.tr.spec.gpu_loads != 0 {
+            if gpu_res != 0 || found.tr.spec.gpu_loads != 0 || found.tr.spec.write_through {
                 let pt = super::pagetable::address();
                 p.sgpr_data[addr_at + 2] = pt as u32;
                 p.sgpr_data[addr_at + 3] = (pt >> 32) as u32;
             }
-            // (`tune write_through`, timing only: its scratch buffer.)
-            if found.tr.spec.write_through {
-                let s = write_through_scratch();
-                p.sgpr_data[addr_at + 4] = s as u32;
-                p.sgpr_data[addr_at + 5] = (s >> 32) as u32;
-            }
+
             for b in &found.tr.out.bindings {
                 match b.kind {
                     // Resolved by the shader through the page table (front end
@@ -13737,6 +13740,32 @@ impl Exec {
                         if has_marks {
                             let ai = addr_at + (rdna::translate::ADDR_HEADER_DWORDS + rdna::translate::ADDR_INFO_DWORDS * i as u32) as usize;
                             p.sgpr_data[ai + 3] = if placement == Placement::Mirrored && found.tr.plan.resources[i].written { (info.offset / 128) as u32 } else { u32::MAX };
+                        }
+                        // Write-through: the bound range's address in guest
+                        // memory (its whole-dword stores go there too), or 0.
+                        // Only when every dword the shader may store (its
+                        // bound: bias + bound bytes, `Spec::write_through`)
+                        // lies inside the descriptor's range, which
+                        // `through_base` finds inside one import: a placement
+                        // clamped at its mapping's end binds less than its
+                        // resource's size, and the mirror's robustness drops
+                        // the stores past it, which a raw address would not.
+                        if found.tr.spec.write_through {
+                            let ai = addr_at + (rdna::translate::ADDR_HEADER_DWORDS + rdna::translate::ADDR_INFO_DWORDS * i as u32) as usize;
+                            let inside = (bias + bound_size).next_multiple_of(4) <= info.range;
+                            let h = if placement == Placement::Mirrored && found.tr.plan.resources[i].written && inside { through_base(info.offset, info.range) } else { 0 };
+                            p.sgpr_data[ai + 4] = h as u32;
+                            p.sgpr_data[ai + 5] = (h >> 32) as u32;
+                            // (Counted over written mirrored bindings only.)
+                            if placement == Placement::Mirrored && found.tr.plan.resources[i].written {
+                                THROUGH[(h != 0) as usize].fetch_add(1, Ordering::Relaxed);
+                                if h & 1 != 0 {
+                                    THROUGH[2].fetch_add(1, Ordering::Relaxed);
+                                }
+                                if !inside {
+                                    THROUGH[3].fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
                         }
                         if matches!(b.kind, BindingKind::Address(_)) {
                             // The descriptor's range as an address and size.
@@ -15296,6 +15325,7 @@ pub fn status() -> String {
         + &remaps_over_imports_line()
         + &wb_census_line()
         + &read_census_line()
+        + &through_line()
         + &audit_line()
         + &format!(
             "    gpu completion: {} ms waiting for fences, {} ms in actions; batches waited for past 10 s while other GPU work completed {}\n",
