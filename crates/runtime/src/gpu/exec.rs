@@ -935,11 +935,26 @@ fn import_mappings(s: u64, e: u64) -> (u64, u64) {
 /// table); 0 without the page table (its stores are marked and written back).
 fn through_base(off: u64, range: u64) -> u64 {
     let g0 = super::resident::MIRROR_BASE + off;
+    // (By default every page through the page table as the GPU runs, as
+    // the write-back finds it: an address resolved when the command was
+    // recorded misses a remap before the GPU runs it, and 8-2's arrival
+    // drew broken in 2 of 7 boots with it, 0 of 6 without write-through;
+    // `DS_WT_DIRECT=1` keeps the direct address for comparisons.)
+    if !wt_direct() && super::pagetable::made() {
+        return g0 | 1;
+    }
     match span(g0, range) {
         Some((buf, start, end)) if g0 >= start && g0 + range <= end => ctx().buffer_address(buf) + (g0 - start),
         _ if super::pagetable::made() => g0 | 1,
         _ => 0,
     }
+}
+
+/// `DS_WT_DIRECT=1` (diagnosis): write-through bindings inside one import
+/// window store to its address resolved at record time (`through_base`).
+fn wt_direct() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_WT_DIRECT").ok().as_deref() == Some("1"))
 }
 
 /// Status part: write-through bindings (`tune write_through`; "" when off).
