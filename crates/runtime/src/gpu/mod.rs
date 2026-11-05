@@ -30,7 +30,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 157] = [
+    static ALL: [Tunable; 158] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -188,6 +188,7 @@ pub mod tune {
         Tunable { name: "vram_others", env: "DS_VRAM_OTHERS", default: 512, value: AtomicU64::new(UNSET) },
         Tunable { name: "mirror_cold", env: "DS_MIRROR_COLD", default: 3600, value: AtomicU64::new(UNSET) },
         Tunable { name: "buffer_delta", env: "DS_BUFFER_DELTA", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "write_through", env: "DS_WRITE_THROUGH", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1587,6 +1588,15 @@ pub mod tune {
     #[inline]
     pub fn buffer_delta() -> u64 {
         get(156)
+    }
+
+    /// Timing only at 1 (the 60 fps program's GPU ceiling test,
+    /// 2026-11-05; replays only, beside `write_marks 0`): translations also
+    /// store every buffer store's dwords into a scratch buffer in host
+    /// memory (`Spec::write_through`), what stores reaching guest memory from
+    /// the title's own dispatches would cost. Read when a stage is prepared.
+    pub fn write_through() -> bool {
+        get(157) != 0
     }
 
     /// Pixel programs that write no memory run their depth and stencil

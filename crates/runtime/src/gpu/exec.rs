@@ -928,6 +928,28 @@ fn import_mappings(s: u64, e: u64) -> (u64, u64) {
     (made, failed)
 }
 
+/// `tune write_through` on and its scratch buffer made (translations store
+/// into it only then: address 0 would lose the device).
+pub fn write_through_wanted() -> bool {
+    super::tune::write_through() && write_through_scratch() != 0
+}
+
+/// The write-through test's scratch buffer in host memory (`tune
+/// write_through`): its device address, made at first use and kept.
+fn write_through_scratch() -> u64 {
+    static S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *S.get_or_init(|| match ctx().host_buffer_addressed(rdna::translate::WRITE_THROUGH_DWORDS as u64 * 4, vk::BufferUsageFlags::STORAGE_BUFFER) {
+        Ok((_b, _m, va)) => {
+            crate::info!("gpu: write-through scratch buffer {} MiB at {va:#x} (timing only)", rdna::translate::WRITE_THROUGH_DWORDS >> 18);
+            va
+        }
+        Err(e) => {
+            crate::warn!("gpu: no write-through scratch buffer: {e}");
+            0
+        }
+    })
+}
+
 /// `DS_IMPORT_AUDIT=<ms>` (diagnosis): every that many milliseconds a page
 /// of each of up to AUDIT_SPANS live imports (in turn), read through the
 /// import on the GPU, is compared with the CPU's view of the same guest page;
@@ -1108,7 +1130,7 @@ fn audit_mirror(buf: vk::Buffer, ptr: *mut u8, round: u64, cpu: &dyn Fn(u64) -> 
         .is_ok()
     };
     let mut pages = super::fe2::audit_sample(AUDIT_SPANS, round.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
-    // (GPU-written pages, which the sample holds when `DS_FE2_ARM_GPU=1`
+    // (GPU-written pages, which the sample holds while arming arms them, the default:
     // arms them: compared only while no unfinished batch writes them.)
     let before = pages.len();
     pages.retain(|&p| !audit_written_now(p));
@@ -13368,6 +13390,12 @@ impl Exec {
                 let pt = super::pagetable::address();
                 p.sgpr_data[addr_at + 2] = pt as u32;
                 p.sgpr_data[addr_at + 3] = (pt >> 32) as u32;
+            }
+            // (`tune write_through`, timing only: its scratch buffer.)
+            if found.tr.spec.write_through {
+                let s = write_through_scratch();
+                p.sgpr_data[addr_at + 4] = s as u32;
+                p.sgpr_data[addr_at + 5] = (s >> 32) as u32;
             }
             for b in &found.tr.out.bindings {
                 match b.kind {

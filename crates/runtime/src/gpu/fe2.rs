@@ -27,9 +27,9 @@
 //!   old (protecting a new import's pages lost the device: FINDINGS.md
 //!   2026-10-26) are armed read-only through the host; while the host's bit
 //!   stays set (no write fault, disarm or mapping change since) such a page
-//!   needs no take. Pages GPU work writes are not armed (they are the
-//!   pages the GPU writes through their imports; `DS_FE2_ARM_GPU=1`: armed
-//!   too, as GPU writes do not fault and M holds them). Each fault
+//!   needs no take. Pages GPU work writes are armed too (since 2026-11-05:
+//!   GPU writes do not fault and M holds them; `DS_FE2_ARM_GPU=0` leaves
+//!   them unarmed, the pages the GPU writes through their imports). Each fault
 //!   stops the whole process for 15-50 us, and the host answers it for its
 //!   page's whole 64-page word (`hosted::set_word_mode`): a thread reads the
 //!   faults the host answered (`watch`; the word's pages take the faulted
@@ -116,7 +116,7 @@ struct Chunk {
     /// finds such a page written found a write the protection missed
     /// (`take_run`: a hole).
     varmed: [AtomicU64; WORDS],
-    /// Written by GPU work (never armed, unless `DS_FE2_ARM_GPU=1`). Bits
+    /// Written by GPU work (marked only with `DS_FE2_ARM_GPU=0`, unarmed). Bits
     /// are only ever set.
     gpu: [AtomicU64; WORDS],
     /// Every `gpu` bit of the chunk set (a written range's scan covered it
@@ -951,20 +951,24 @@ pub fn wanted() -> bool {
     *W.get_or_init(|| std::env::var("DS_FE2").ok().as_deref() != Some("0"))
 }
 
-/// `DS_FE2_ARM_GPU=1`: pages GPU work writes are armed like others (GPU
-/// writes reach guest memory by the write-back, which does not fault, and M
-/// holds them already). Off by default: they are the pages the GPU writes
-/// through their imports (write-backs, labels, timestamps), and the two GPU
-/// timeouts of 2026-10-27 late night (driver resets, nvlddmkm 153) came in
-/// the builds that armed them; protecting an import's pages before the
-/// driver pinned them lost the device before (FINDINGS.md 2026-10-26).
+/// Pages GPU work writes are armed like others (GPU writes reach guest
+/// memory by the write-back, which does not fault, and M holds them
+/// already): the default since 2026-11-05 afternoon, with the user's
+/// approval, after 16 armed 8-2 boots, three armed 8-level tours and an
+/// armed player suite without a loss or a broken level once the write-back's
+/// hash skip was off (the morning's armed failures all had it on; October's
+/// losses predate it, cause open: FINDINGS.md 2026-11-05). It answers ~70% of
+/// the graphics CP's takes with the host's bit. `DS_FE2_ARM_GPU=0`: never
+/// armed (the fallback; they are the pages the GPU writes through their
+/// imports); `=2`: protected but kept unarmed in front end 2's records
+/// (`arm_gpu_os`, diagnosis).
 fn arm_gpu() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *W.get_or_init(|| std::env::var("DS_FE2_ARM_GPU").ok().as_deref() == Some("1"))
+    *W.get_or_init(|| !matches!(std::env::var("DS_FE2_ARM_GPU").ok().as_deref(), Some("0") | Some("2")))
 }
 
 /// `DS_FE2_ARM_GPU=2` (diagnosis of the device losses): the pages
-/// `DS_FE2_ARM_GPU=1` would arm are protected through the host as armed pages
+/// arming would arm are protected through the host as armed pages
 /// are, the GPU-written ones among them kept unarmed in front end 2's own
 /// records (marked GPU-written, taken in every epoch as by default): the
 /// protection of pages the GPU writes through their imports, without
@@ -1316,7 +1320,7 @@ thread_local! {
 /// those M lacks are uploaded by `upload(a, b)` (the GPU copy of guest
 /// [a, b) into M, recorded into the caller's prologue; false: it could not).
 /// `gpu_writes`: GPU work will write the range (its pages are marked so,
-/// and never armed; with `DS_FE2_ARM_GPU=1` it is checked like any).
+/// and never armed with `DS_FE2_ARM_GPU=0`; by default it is checked like any).
 /// Err: an upload failed (M lacks some of the range).
 /// `want`: pages must reflect every CPU write before epoch `want`
 /// began (the caller's view, `views_on`); `ep`: the epoch now, read before
@@ -1453,7 +1457,7 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
     local_check(sc, (hi - lo) / PAGE);
     let class = &BY_SIZE[sc];
     // Written ranges mark their pages GPU-written (kept unarmed) unless
-    // `DS_FE2_ARM_GPU=1`; a range found fine with its marks set passes the
+    // `DS_FE2_ARM_GPU=0`; a range found fine with its marks set passes the
     // cache like a read one (marking every word on every use, ~430 words
     // for a pool of ~113 MB, made queue 0x50's dispatches slow).
     // (Pages of the mixed range's view windows too: their imports are of
@@ -1941,7 +1945,7 @@ fn audit_bits(c: &Chunk, w: usize, wa: u64) -> u64 {
 
 /// `DS_IMPORT_AUDIT_GPU=1` (diagnosis, with `DS_IMPORT_AUDIT`): the mirror
 /// audit also samples GPU-written pages current in the mirror (never armed
-/// without `DS_FE2_ARM_GPU=1`), compared while no unfinished batch writes
+/// with `DS_FE2_ARM_GPU=0`), compared while no unfinished batch writes
 /// them and the CPU has not written them since their last take: there the
 /// write-backs must have made guest memory equal to the mirror.
 pub fn audit_gpu() -> bool {
@@ -2335,7 +2339,7 @@ fn host_writing(a: u64, b: u64) -> bool {
 }
 
 /// Arms the quiet pages of [a, b) not armed now (nor written by GPU work,
-/// unless `DS_FE2_ARM_GPU=1`) outside held chunks, by runs inside settled
+/// with `DS_FE2_ARM_GPU=0`) outside held chunks, by runs inside settled
 /// import windows (`armable`), plain read-write memory only.
 fn try_arm(a: u64, b: u64, frame: u64, armable: &Armable) {
     let arm_gpu = arm_gpu();

@@ -1406,6 +1406,38 @@ pub fn global(tr: &mut T, ins: &Inst) -> R<()> {
     mem_access(tr, ins, &name, r, var, addr, 0, 0xFAC)
 }
 
+/// `Spec::write_through` (timing only): the store's dwords also go to the
+/// scratch buffer in host memory (the address block's header, dwords 4-5),
+/// at the bound range's address over 4 plus the dword index, modulo
+/// WRITE_THROUGH_DWORDS. Run it where the store happens (active lanes).
+fn through_dwords(tr: &mut T, r: usize, d0: Word, vals: &[Word]) -> R<()> {
+    if !tr.spec.write_through || vals.is_empty() {
+        return Ok(());
+    }
+    let (u, u64t) = (tr.t.u32, tr.t.u64);
+    let lo = tr.addr_header(4)?;
+    let hi = tr.addr_header(5)?;
+    let base = u64_of(tr, lo, hi)?;
+    let r_lo = tr.addr_info(r, 0)?;
+    let two = tr.u(2);
+    let rb = e(tr.b.shift_right_logical(u, None, r_lo, two))?;
+    let d = e(tr.b.i_add(u, None, rb, d0))?;
+    let mask = tr.u(super::WRITE_THROUGH_DWORDS - 1);
+    let pt = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u);
+    for (k, &v) in vals.iter().enumerate() {
+        let kk = tr.u(k as u32);
+        let i = e(tr.b.i_add(u, None, d, kk))?;
+        let i = e(tr.b.bitwise_and(u, None, i, mask))?;
+        let off = e(tr.b.shift_left_logical(u, None, i, two))?;
+        let o = e(tr.b.u_convert(u64t, None, off))?;
+        let a = e(tr.b.i_add(u64t, None, base, o))?;
+        let p = e(tr.b.convert_u_to_ptr(pt, None, a))?;
+        let (ma, ops) = aligned(4);
+        ok(tr.b.store(p, v, ma, ops))?;
+    }
+    Ok(())
+}
+
 /// `Spec::write_marks`: sets the bits of `n` dwords (1..=4, a constant)
 /// from dword `d0` of resource `r`'s binding in the written-bit map, when
 /// the resource is marked and the dwords lie inside its bound bytes. Run it
@@ -1717,9 +1749,16 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, r: usize, var: Word, addr: Wor
                 Some(sz) if sz >= 4 => {
                     let two = tr.u(2);
                     let d0 = e(tr.b.shift_right_logical(tr.t.u32, None, addr, two))?;
-                    mark_dwords(tr, r, d0, sz.div_ceil(4))
+                    mark_dwords(tr, r, d0, sz.div_ceil(4))?;
+                    let nd = (sz.div_ceil(4) as usize).min(vals.len());
+                    through_dwords(tr, r, d0, &vals[..nd])
                 }
-                Some(sz) => mark_bytes(tr, r, addr, sz),
+                Some(sz) => {
+                    mark_bytes(tr, r, addr, sz)?;
+                    let two = tr.u(2);
+                    let d0 = e(tr.b.shift_right_logical(tr.t.u32, None, addr, two))?;
+                    through_dwords(tr, r, d0, &vals[..1])
+                }
                 None => Ok(()),
             }
         });
@@ -1802,6 +1841,7 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, r: usize, var: Word, addr: Wor
                     let d0 = e(tr.b.shift_right_logical(u, None, addr, two))?;
                     store_dwords(tr, var, addr, &vals)?;
                     mark_dwords(tr, r, d0, n)?;
+                    through_dwords(tr, r, d0, &vals)?;
                 }
                 "byte" | "short" | "byte_d16_hi" | "short_d16_hi" => {
                     let nb = if kind.starts_with("byte") { 1 } else { 2 };
@@ -1812,6 +1852,9 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, r: usize, var: Word, addr: Wor
                     }
                     store_bytes(tr, var, addr, v, nb)?;
                     mark_bytes(tr, r, addr, nb)?;
+                    let two = tr.u(2);
+                    let d0 = e(tr.b.shift_right_logical(u, None, addr, two))?;
+                    through_dwords(tr, r, d0, &[v])?;
                 }
                 _ => unsupported = true,
             }
@@ -1848,7 +1891,8 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, r: usize, var: Word, addr: Wor
                     tr.set_vreg_raw(ret, old)?;
                 }
             }
-            mark_dwords(tr, r, idx, 1)
+            mark_dwords(tr, r, idx, 1)?;
+            through_dwords(tr, r, idx, &[v])
         })?;
         return Ok(());
     }

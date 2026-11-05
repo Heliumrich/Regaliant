@@ -384,6 +384,14 @@ pub struct Spec {
     /// entry (u32::MAX: not marked; a marked binding starts at a multiple of
     /// 128 bytes of the mirror). Only dwords inside the bound range count.
     pub write_marks: bool,
+    /// Timing only (the runtime's `tune write_through 1`, the 60 fps
+    /// program's GPU ceiling test, 2026-11-05): every buffer store and atomic
+    /// also stores its dwords into a scratch buffer in host memory (its
+    /// address in dwords 4-5 of the address block's header), at the store's
+    /// bound range address over 4 plus its dword index, modulo
+    /// WRITE_THROUGH_DWORDS: the cost of each store reaching host memory
+    /// across PCIe from the title's own dispatches. Nothing reads it.
+    pub write_through: bool,
     /// With `write_marks`, timing only (the runtime's `tune mark_touch 0`):
     /// stores set their dwords' bits but do not enter their pages in the
     /// touched-page list (`touch_page`), so write-backs find nothing to
@@ -775,8 +783,11 @@ pub fn table_slot(plan: &Plan, r: usize) -> u32 {
 /// first word in the written-bit map (`Spec::write_marks`).
 pub const ADDR_INFO_DWORDS: u32 = 4;
 /// Dwords before the resources' entries in the address block: the zero
-/// page's address (low, high; out-of-range reads load from it), unused.
-pub const ADDR_HEADER_DWORDS: u32 = 4;
+/// page's address (low, high; out-of-range reads load from it), the page
+/// table's, the write-through scratch buffer's (`Spec::write_through`).
+pub const ADDR_HEADER_DWORDS: u32 = 6;
+/// The write-through scratch buffer's size in dwords (`Spec::write_through`).
+pub const WRITE_THROUGH_DWORDS: u32 = 1 << 24;
 
 /// Dword offset of the address block in the SGPR data buffer, after the
 /// image tables' LOD information (the earlier layout ended there).
@@ -2486,12 +2497,12 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     b.capability(Capability::ImageCubeArray);
     b.capability(Capability::ImageGatherExtended);
     b.extension("SPV_KHR_storage_buffer_storage_class");
-    if spec.addresses {
+    if spec.addresses || spec.write_through {
         b.capability(Capability::PhysicalStorageBufferAddresses);
         b.extension("SPV_KHR_physical_storage_buffer");
     }
     let glsl = b.ext_inst_import("GLSL.std.450");
-    let addressing = if spec.addresses { spirv::AddressingModel::PhysicalStorageBuffer64 } else { spirv::AddressingModel::Logical };
+    let addressing = if spec.addresses || spec.write_through { spirv::AddressingModel::PhysicalStorageBuffer64 } else { spirv::AddressingModel::Logical };
     b.memory_model(addressing, spirv::MemoryModel::GLSL450);
     let void = b.type_void();
     let bool_ = b.type_bool();
@@ -4062,6 +4073,7 @@ mod tests {
             addresses: false,
             batched: false,
             write_marks: false,
+            write_through: false,
             marks_untouched: false,
             touch_bits: false,
             touch_test: false,
