@@ -1406,102 +1406,6 @@ pub fn global(tr: &mut T, ins: &Inst) -> R<()> {
     mem_access(tr, ins, &name, r, var, addr, 0, 0xFAC)
 }
 
-/// `Spec::write_through`: the dwords a store of whole dwords writes at
-/// dword `d0` of resource `r`'s binding also go to guest memory when the
-/// resource has a guest-memory base (its address entry, dwords 4-5), and
-/// then are not marked; otherwise (no base, or write-through off) they are
-/// marked (`mark_dwords`). Only dwords inside the bound range are stored.
-/// Run it where the store happens (active lanes).
-fn through_or_mark(tr: &mut T, r: usize, d0: Word, vals: &[Word]) -> R<()> {
-    let n = vals.len() as u32;
-    if !tr.spec.write_through || n == 0 {
-        return mark_dwords(tr, r, d0, n);
-    }
-    let (u, u64t, b) = (tr.t.u32, tr.t.u64, tr.t.bool_);
-    let lo = tr.addr_info(r, 4)?;
-    let hi = tr.addr_info(r, 5)?;
-    let base = u64_of(tr, lo, hi)?;
-    let z0 = tr.u(0);
-    let z64 = e(tr.b.u_convert(u64t, None, z0))?;
-    let has = e(tr.b.i_not_equal(b, None, base, z64))?;
-    // The binding's dwords end at bias + bound bytes (as `mark_dwords`).
-    let bias = tr.res_info(r, 0)?;
-    let bound = tr.res_info(r, 2)?;
-    let k3 = tr.u(3);
-    let end = e(tr.b.i_add(u, None, bound, bias))?;
-    let end = e(tr.b.i_add(u, None, end, k3))?;
-    let two = tr.u(2);
-    let bdw = e(tr.b.shift_right_logical(u, None, end, two))?;
-    let nn = tr.u(n);
-    let fits = e(tr.b.u_greater_than_equal(b, None, bdw, nn))?;
-    let lim = e(tr.b.i_sub(u, None, bdw, nn))?;
-    let le = e(tr.b.u_less_than_equal(b, None, d0, lim))?;
-    let inr = e(tr.b.logical_and(b, None, fits, le))?;
-    let go = e(tr.b.logical_and(b, None, has, inr))?;
-    // (Bit 0 set: the bound range's guest address, each dword's page
-    // through the page table; clear: the address in guest memory itself.)
-    let one64 = tr.u64c(1);
-    let flag = e(tr.b.bitwise_and(u64t, None, base, one64))?;
-    let direct = e(tr.b.i_equal(b, None, flag, z64))?;
-    let go_direct = e(tr.b.logical_and(b, None, go, direct))?;
-    let indirect = e(tr.b.logical_not(b, None, direct))?;
-    let go_pt = e(tr.b.logical_and(b, None, go, indirect))?;
-    tr.guarded(go_direct, &mut |tr| {
-        let pt = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u);
-        for (k, &v) in vals.iter().enumerate() {
-            let kk = tr.u(k as u32);
-            let i = e(tr.b.i_add(u, None, d0, kk))?;
-            let off = e(tr.b.shift_left_logical(u, None, i, two))?;
-            let o = e(tr.b.u_convert(u64t, None, off))?;
-            let a = e(tr.b.i_add(u64t, None, base, o))?;
-            let p = e(tr.b.convert_u_to_ptr(pt, None, a))?;
-            let (ma, ops) = aligned(4);
-            ok(tr.b.store(p, v, ma, ops))?;
-        }
-        Ok(())
-    })?;
-    tr.guarded(go_pt, &mut |tr| {
-        // The bound range's first and last pages through the page table
-        // (the same two entries for every store of the binding: cached after
-        // the first); when they map it as one run of consecutive pages (one
-        // import holds it as the GPU runs), each dword's address is the first
-        // entry plus its offset; otherwise the dwords are marked.
-        let not1 = tr.u64c(!1u64);
-        let g0 = e(tr.b.bitwise_and(u64t, None, base, not1))?;
-        let four = tr.u(4);
-        let lastb = e(tr.b.i_mul(u, None, bdw, four))?;
-        let lastb = e(tr.b.i_sub(u, None, lastb, four))?;
-        let lastb = e(tr.b.u_convert(u64t, None, lastb))?;
-        let gl = e(tr.b.i_add(u64t, None, g0, lastb))?;
-        let (e0, m0) = pt_translate(tr, g0, None)?;
-        let (el, ml) = pt_translate(tr, gl, None)?;
-        // Consecutive: entry(last) - entry(first) == g(last) - g(first).
-        let de = e(tr.b.i_sub(u64t, None, el, e0))?;
-        let dg = e(tr.b.i_sub(u64t, None, gl, g0))?;
-        let same = e(tr.b.i_equal(b, None, de, dg))?;
-        let both = e(tr.b.logical_and(b, None, m0, ml))?;
-        let linear = e(tr.b.logical_and(b, None, both, same))?;
-        tr.guarded(linear, &mut |tr| {
-            let pt = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u);
-            for (k, &v) in vals.iter().enumerate() {
-                let kk = tr.u(k as u32);
-                let i = e(tr.b.i_add(u, None, d0, kk))?;
-                let off = e(tr.b.shift_left_logical(u, None, i, two))?;
-                let o = e(tr.b.u_convert(u64t, None, off))?;
-                let a = e(tr.b.i_add(u64t, None, e0, o))?;
-                let p = e(tr.b.convert_u_to_ptr(pt, None, a))?;
-                let (ma, ops) = aligned(4);
-                ok(tr.b.store(p, v, ma, ops))?;
-            }
-            Ok(())
-        })?;
-        let split = e(tr.b.logical_not(b, None, linear))?;
-        tr.guarded(split, &mut |tr| mark_dwords(tr, r, d0, n))
-    })?;
-    let none = e(tr.b.logical_not(b, None, has))?;
-    tr.guarded(none, &mut |tr| mark_dwords(tr, r, d0, n))
-}
-
 /// `Spec::write_marks`: sets the bits of `n` dwords (1..=4, a constant)
 /// from dword `d0` of resource `r`'s binding in the written-bit map, when
 /// the resource is marked and the dwords lie inside its bound bytes. Run it
@@ -1897,7 +1801,7 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, r: usize, var: Word, addr: Wor
                     let two = tr.u(2);
                     let d0 = e(tr.b.shift_right_logical(u, None, addr, two))?;
                     store_dwords(tr, var, addr, &vals)?;
-                    through_or_mark(tr, r, d0, &vals)?;
+                    mark_dwords(tr, r, d0, n)?;
                 }
                 "byte" | "short" | "byte_d16_hi" | "short_d16_hi" => {
                     let nb = if kind.starts_with("byte") { 1 } else { 2 };

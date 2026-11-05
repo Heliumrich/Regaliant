@@ -384,17 +384,6 @@ pub struct Spec {
     /// entry (u32::MAX: not marked; a marked binding starts at a multiple of
     /// 128 bytes of the mirror). Only dwords inside the bound range count.
     pub write_marks: bool,
-    /// Write-through (the runtime's `tune write_through`, 2026-11-05): a
-    /// buffer store of whole dwords whose resource has a guest-memory base
-    /// (dwords 4-5 of its address-block entry: the device address of its
-    /// bound range's start in guest memory, through the import holding it;
-    /// 0: none) also stores them there, and marks nothing; other stores
-    /// (bytes, formats, atomics) and resources without a base mark as
-    /// `write_marks` does. Only dwords inside the bound range are stored. With
-    /// bit 0 of the base set it is the bound range's guest address instead,
-    /// each dword's page found through the page table (the address block's
-    /// header, dwords 2-3; a page it does not map is marked).
-    pub write_through: bool,
     /// With `write_marks`, timing only (the runtime's `tune mark_touch 0`):
     /// stores set their dwords' bits but do not enter their pages in the
     /// touched-page list (`touch_page`), so write-backs find nothing to
@@ -782,10 +771,9 @@ pub fn table_slot(plan: &Plan, r: usize) -> u32 {
 }
 
 /// Dwords per resource in the address block (`Spec::addresses`): the
-/// address of the bound range (low, high dword), its size in bytes, its
-/// first word in the written-bit map (`Spec::write_marks`), and its bound
-/// range's address in guest memory (low, high; `Spec::write_through`).
-pub const ADDR_INFO_DWORDS: u32 = 6;
+/// address of the bound range (low, high dword), its size in bytes, and its
+/// first word in the written-bit map (`Spec::write_marks`).
+pub const ADDR_INFO_DWORDS: u32 = 4;
 /// Dwords before the resources' entries in the address block: the zero
 /// page's address (low, high; out-of-range reads load from it), the page
 /// table's.
@@ -2499,12 +2487,12 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     b.capability(Capability::ImageCubeArray);
     b.capability(Capability::ImageGatherExtended);
     b.extension("SPV_KHR_storage_buffer_storage_class");
-    if spec.addresses || spec.write_through {
+    if spec.addresses {
         b.capability(Capability::PhysicalStorageBufferAddresses);
         b.extension("SPV_KHR_physical_storage_buffer");
     }
     let glsl = b.ext_inst_import("GLSL.std.450");
-    let addressing = if spec.addresses || spec.write_through { spirv::AddressingModel::PhysicalStorageBuffer64 } else { spirv::AddressingModel::Logical };
+    let addressing = if spec.addresses { spirv::AddressingModel::PhysicalStorageBuffer64 } else { spirv::AddressingModel::Logical };
     b.memory_model(addressing, spirv::MemoryModel::GLSL450);
     let void = b.type_void();
     let bool_ = b.type_bool();
@@ -4075,7 +4063,6 @@ mod tests {
             addresses: false,
             batched: false,
             write_marks: false,
-            write_through: false,
             marks_untouched: false,
             touch_bits: false,
             touch_test: false,

@@ -928,51 +928,6 @@ fn import_mappings(s: u64, e: u64) -> (u64, u64) {
     (made, failed)
 }
 
-/// Write-through (`tune write_through`, `Spec::write_through`): for the
-/// bound range at mirror offset `off` of `range` bytes, its device address in
-/// guest memory through the live import holding all of it, or else its guest
-/// address with bit 0 set (the shader finds each page through the page
-/// table); 0 without the page table (its stores are marked and written back).
-fn through_base(off: u64, range: u64) -> u64 {
-    let g0 = super::resident::MIRROR_BASE + off;
-    // (By default every page through the page table as the GPU runs, as
-    // the write-back finds it: an address resolved when the command was
-    // recorded misses a remap before the GPU runs it, and 8-2's arrival
-    // drew broken in 2 of 7 boots with it, 0 of 6 without write-through;
-    // `DS_WT_DIRECT=1` keeps the direct address for comparisons.)
-    if !wt_direct() && super::pagetable::made() {
-        return g0 | 1;
-    }
-    match span(g0, range) {
-        Some((buf, start, end)) if g0 >= start && g0 + range <= end => ctx().buffer_address(buf) + (g0 - start),
-        _ if super::pagetable::made() => g0 | 1,
-        _ => 0,
-    }
-}
-
-/// `DS_WT_DIRECT=1` (diagnosis): write-through bindings inside one import
-/// window store to its address resolved at record time (`through_base`).
-fn wt_direct() -> bool {
-    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *W.get_or_init(|| std::env::var("DS_WT_DIRECT").ok().as_deref() == Some("1"))
-}
-
-/// Status part: write-through bindings (`tune write_through`; "" when off).
-fn through_line() -> String {
-    let (m, t) = (THROUGH[0].load(Ordering::Relaxed), THROUGH[1].load(Ordering::Relaxed));
-    if m + t == 0 {
-        return String::new();
-    }
-    let (pt, out) = (THROUGH[2].load(Ordering::Relaxed), THROUGH[3].load(Ordering::Relaxed));
-    format!("    write-through: of the written mirrored bindings {t} stored into guest memory by their stores ({pt} of them page by page through the page table), {m} left to marks and write-backs ({out} of them bound short of their resource's size)
-")
-}
-
-/// Write-through bindings (`tune write_through`): [written mirrored bindings
-/// left to marks (no import holds all of their range) and others, with a
-/// guest-memory base].
-static THROUGH: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-
 /// `DS_IMPORT_AUDIT=<ms>` (diagnosis): every that many milliseconds a page
 /// of each of up to AUDIT_SPANS live imports (in turn), read through the
 /// import on the GPU, is compared with the CPU's view of the same guest page;
@@ -13409,7 +13364,7 @@ impl Exec {
                 p.sgpr_data[addr_at + 1] = (fx.zero_va >> 32) as u32;
             }
             let gpu_res = found.tr.spec.gpu_res;
-            if gpu_res != 0 || found.tr.spec.gpu_loads != 0 || found.tr.spec.write_through {
+            if gpu_res != 0 || found.tr.spec.gpu_loads != 0 {
                 let pt = super::pagetable::address();
                 p.sgpr_data[addr_at + 2] = pt as u32;
                 p.sgpr_data[addr_at + 3] = (pt >> 32) as u32;
@@ -13755,32 +13710,6 @@ impl Exec {
                         if has_marks {
                             let ai = addr_at + (rdna::translate::ADDR_HEADER_DWORDS + rdna::translate::ADDR_INFO_DWORDS * i as u32) as usize;
                             p.sgpr_data[ai + 3] = if placement == Placement::Mirrored && found.tr.plan.resources[i].written { (info.offset / 128) as u32 } else { u32::MAX };
-                        }
-                        // Write-through: the bound range's address in guest
-                        // memory (its whole-dword stores go there too), or 0.
-                        // Only when every dword the shader may store (its
-                        // bound: bias + bound bytes, `Spec::write_through`)
-                        // lies inside the descriptor's range, which
-                        // `through_base` finds inside one import: a placement
-                        // clamped at its mapping's end binds less than its
-                        // resource's size, and the mirror's robustness drops
-                        // the stores past it, which a raw address would not.
-                        if found.tr.spec.write_through {
-                            let ai = addr_at + (rdna::translate::ADDR_HEADER_DWORDS + rdna::translate::ADDR_INFO_DWORDS * i as u32) as usize;
-                            let inside = (bias + bound_size).next_multiple_of(4) <= info.range;
-                            let h = if placement == Placement::Mirrored && found.tr.plan.resources[i].written && inside { through_base(info.offset, info.range) } else { 0 };
-                            p.sgpr_data[ai + 4] = h as u32;
-                            p.sgpr_data[ai + 5] = (h >> 32) as u32;
-                            // (Counted over written mirrored bindings only.)
-                            if placement == Placement::Mirrored && found.tr.plan.resources[i].written {
-                                THROUGH[(h != 0) as usize].fetch_add(1, Ordering::Relaxed);
-                                if h & 1 != 0 {
-                                    THROUGH[2].fetch_add(1, Ordering::Relaxed);
-                                }
-                                if !inside {
-                                    THROUGH[3].fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
                         }
                         if matches!(b.kind, BindingKind::Address(_)) {
                             // The descriptor's range as an address and size.
@@ -15340,7 +15269,6 @@ pub fn status() -> String {
         + &remaps_over_imports_line()
         + &wb_census_line()
         + &read_census_line()
-        + &through_line()
         + &audit_line()
         + &format!(
             "    gpu completion: {} ms waiting for fences, {} ms in actions; batches waited for past 10 s while other GPU work completed {}\n",
