@@ -177,7 +177,6 @@ pub mod tune {
         Tunable { name: "lod_skip", env: "DS_LOD_SKIP", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "gpu_detile", env: "DS_GPU_DETILE", default: 8, value: AtomicU64::new(UNSET) },
         Tunable { name: "mark_touch", env: "DS_MARK_TOUCH", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "touch_bits", env: "DS_TOUCH_BITS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "upload_batch", env: "DS_UPLOAD_BATCH", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "record_defer", env: "DS_RECORD_DEFER", default: 5, value: AtomicU64::new(UNSET) },
         Tunable { name: "fill_partial", env: "DS_FILL_PARTIAL", default: 1, value: AtomicU64::new(UNSET) },
@@ -188,6 +187,7 @@ pub mod tune {
         Tunable { name: "vram_others", env: "DS_VRAM_OTHERS", default: 512, value: AtomicU64::new(UNSET) },
         Tunable { name: "mirror_cold", env: "DS_MIRROR_COLD", default: 3600, value: AtomicU64::new(UNSET) },
         Tunable { name: "buffer_delta", env: "DS_BUFFER_DELTA", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "lod_cs", env: "DS_LOD_CS", default: 8, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1537,7 +1537,7 @@ pub mod tune {
     /// `ballast_at` names (`exec::ballast`; live).
     #[inline]
     pub fn ballast_ns() -> u64 {
-        get(151)
+        get(150)
     }
 
     /// Diagnosis: the executor kinds `ballast_ns` spins in (bit 0 the
@@ -1545,7 +1545,7 @@ pub mod tune {
     /// compute queues; live).
     #[inline]
     pub fn ballast_at() -> u64 {
-        get(152)
+        get(151)
     }
 
     /// Ordered async compute (RENDERER.md "Ordered async compute"; the
@@ -1557,7 +1557,7 @@ pub mod tune {
     /// the timeline (`after #seq (xq ...)`, `tools/schedmodel.py`).
     #[inline]
     pub fn async_compute() -> u64 {
-        get(153)
+        get(152)
     }
 
     /// Image eviction (`images::maybe_evict`) counts other processes'
@@ -1567,7 +1567,7 @@ pub mod tune {
     /// shares, if lower); 0: the budget alone, as before 2026-11-02.
     #[inline]
     pub fn vram_others() -> u64 {
-        get(154)
+        get(153)
     }
 
     /// Front end 2's mirror words no placement covered in this many flips
@@ -1575,7 +1575,7 @@ pub mod tune {
     /// 5 s on the completion thread); 0: never. Live.
     #[inline]
     pub fn mirror_cold() -> u64 {
-        get(155)
+        get(154)
     }
 
     /// Buffer-delta draws (`exec::draw`, RENDERER.md): a draw right after a
@@ -1586,6 +1586,20 @@ pub mod tune {
     /// compared (differences counted and logged; a diagnosis). Live.
     #[inline]
     pub fn buffer_delta() -> u64 {
+        get(155)
+    }
+
+    /// LOD statistics of compute programs in rotation (as `lod_late` does
+    /// for pixel programs whose depth tests stay after the shader): N >= 2,
+    /// a dispatch binding a counted texture measures in one of N
+    /// (`lodstats::rotate`, prepared again with them), the others are
+    /// prepared without them and carry their textures' recent measurements;
+    /// 0 or 1: every such dispatch measures (before 2026-11-05). Batched
+    /// dispatches keep them. Default 8 (in-run A/B at the vista: +1.1%
+    /// frames, FINDINGS.md 2026-11-05 night). Read when a compute stage is
+    /// prepared.
+    #[inline]
+    pub fn lod_cs() -> u64 {
         get(156)
     }
 
@@ -1614,7 +1628,7 @@ pub mod tune {
     /// bind with whatever other threads claimed meanwhile
     /// (`resident::back_in`).
     pub fn fe2_back_granule() -> u64 {
-        get(150)
+        get(149)
     }
 
     /// LOD statistics of pixel programs whose depth tests stay after the
@@ -1671,15 +1685,6 @@ pub mod tune {
         get(145) != 0
     }
 
-    /// Front end 2: translations set their stores' pages' touched bits
-    /// without reading them back and enter nothing in the touched-page
-    /// list (`Spec::touch_bits`); each write-back makes the list from the
-    /// bits of its executor's written ranges first (`kernels::mirror_compact`,
-    /// from the first such translation on). Read when a stage is prepared.
-    pub fn touch_bits() -> bool {
-        get(146) != 0
-    }
-
     /// Texture uploads detiled on the CPU that waited for their transfer on
     /// the main queue are recorded into one command buffer they share,
     /// submitted ahead of the next batch (`images::flush_uploads`) and not
@@ -1688,7 +1693,7 @@ pub mod tune {
     /// 24% less hitch time, level loads' hitches lower, content drawn
     /// sooner; FINDINGS.md); 0 waits for each transfer as before.
     pub fn upload_batch() -> bool {
-        get(147) != 0
+        get(146) != 0
     }
 
     /// Batches recorded into lists that the submission thread replays into
@@ -1700,7 +1705,7 @@ pub mod tune {
     /// -6.6%, +1% at the vista, Castlewall +2%; 2 lost 1.2% in replays:
     /// FINDINGS.md).
     pub fn record_defer() -> u64 {
-        get(148)
+        get(147)
     }
 
     /// A large zero fill under front end 2 stores into guest memory only
@@ -1711,7 +1716,7 @@ pub mod tune {
     /// vista frame, in front of a label). Live; default 1 since 2026-10-31
     /// (the vista +3%, GPU busy -1.8 ms a frame; tour clean: FINDINGS.md).
     pub fn fill_partial() -> bool {
-        get(149) != 0
+        get(148) != 0
     }
 
 

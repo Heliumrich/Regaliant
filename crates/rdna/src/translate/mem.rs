@@ -1577,10 +1577,8 @@ fn touch_page(tr: &mut T, marks: Word, w: Word) -> R<()> {
     let pw = e(tr.b.i_add(u, None, at, pw))?;
     let pbit = e(tr.b.bitwise_and(u, None, page, k31))?;
     let pb = e(tr.b.shift_left_logical(u, None, one, pbit))?;
-    let scope = tr.u(spirv::Scope::Device as u32);
-    let sem = tr.u(0);
     let pp = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, pw]))?;
-    if tr.spec.touch_test && !tr.spec.touch_bits {
+    if tr.spec.touch_test {
         // (`Spec::touch_test`: a bit found set was set in this batch, its
         // page listed by the store whose atomic found it clear; bits are
         // cleared only by the write-back, between barriers. A stale clear
@@ -1589,11 +1587,6 @@ fn touch_page(tr: &mut T, marks: Word, w: Word) -> R<()> {
         let set = e(tr.b.bitwise_and(u, None, cur, pb))?;
         let clear = e(tr.b.i_equal(b, None, set, z))?;
         return tr.guarded(clear, &mut |tr| touch_set(tr, marks, pp, page, pb));
-    }
-    if tr.spec.touch_bits {
-        // (The bit alone: the write-back lists the page, `mirror_compact`.)
-        e(tr.b.atomic_or(u, None, pp, scope, sem, pb))?;
-        return Ok(());
     }
     touch_set(tr, marks, pp, page, pb)
 }

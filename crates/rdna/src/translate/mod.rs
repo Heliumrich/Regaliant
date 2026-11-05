@@ -389,11 +389,6 @@ pub struct Spec {
     /// touched-page list (`touch_page`), so write-backs find nothing to
     /// write and GPU writes never reach guest memory.
     pub marks_untouched: bool,
-    /// With `write_marks` (the runtime's `tune touch_bits`): stores set their
-    /// pages' touched bits without reading them back and enter nothing in
-    /// the touched-page list; the write-back makes the list from the bits
-    /// (`kernels::mirror_compact`), so no store waits on an atomic's result.
-    pub touch_bits: bool,
     /// With `write_marks` (the runtime's front end 2): a store reads its
     /// page's touched bit first and sets it (the atomic whose result decides
     /// the list append) only when it finds it clear, and the mark words one
@@ -533,9 +528,6 @@ impl std::hash::Hash for Spec {
         }
         if self.marks_untouched {
             0x4D55_4E54u32.hash(state);
-        }
-        if self.touch_bits {
-            0x5442_4954u32.hash(state);
         }
         if self.touch_test {
             0x5454_5354u32.hash(state);
@@ -4064,7 +4056,6 @@ mod tests {
             batched: false,
             write_marks: false,
             marks_untouched: false,
-            touch_bits: false,
             touch_test: false,
             sgpr_ubo: 0,
             gpu_loads: 0,

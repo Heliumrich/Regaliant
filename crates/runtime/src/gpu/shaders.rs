@@ -182,6 +182,21 @@ pub fn lod_rotated(p: &Prepared) -> bool {
     s.stage == Stage::Fragment && !s.lod_stats && !s.batched && !s.early_tests && !s.early_ok && lod_per_draw()
 }
 
+/// Whether compute programs' LOD statistics are decided per dispatch
+/// (`tune lod_cs` >= 2 with the measured statistics on): their stages are
+/// prepared without them, and a dispatch that measures prepares its stage
+/// again with them (`lodstats::rotate`).
+pub fn cs_lod_rotation() -> bool {
+    matches!(super::tune::lod_stats(), 3 | 4) && super::tune::lod_cs() >= 2
+}
+
+/// Whether `p` is a compute stage prepared without the LOD statistics its
+/// dispatches measure when they bind counted textures (`cs_lod_rotation`).
+pub fn cs_lod_rotated(p: &Prepared) -> bool {
+    let s = &p.tr.spec;
+    s.stage == Stage::Compute && !s.lod_stats && !s.batched && cs_lod_rotation()
+}
+
 thread_local! {
     /// This thread's view of the shared caches (entries never change once
     /// made), so that every command does not take their locks: programs by
@@ -1237,7 +1252,6 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         batched: super::tune::batch_cs() && batchable(addr),
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
-        touch_bits: touch_bits_wanted(),
         touch_test: touch_test_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
@@ -1252,6 +1266,14 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
     spec.lockstep_off = no_lockstep_program(code_hash);
     spec.sg_waves = sg_wave_program(code_hash);
     spec.sg_appends = append_program(code_hash);
+    // LOD statistics in rotation (`tune lod_cs` >= 2): a dispatch measures
+    // only when prepared within `with_lod_stats` (`lodstats::rotate`);
+    // batched dispatches keep them (their textures are not all known to the
+    // CPU).
+    if spec.lod_stats && !spec.batched && cs_lod_rotation() && !LOD_MEASURE.with(|c| c.get()) {
+        spec.lod_stats = false;
+        spec.lod_lean = false;
+    }
     // GPU-resolved per-item chains (`gpures`, `tune gpu_chains`; batched
     // programs, whose translations use device addresses).
     if spec.batched && super::tune::gpu_chains() != 0 && super::pagetable::address() != 0 && !NO_GPU_CHAINS.with(|c| c.get()) {
@@ -1497,17 +1519,6 @@ fn marks_wanted() -> bool {
 }
 // (`tune mark_touch 0`, timing only: `Spec::marks_untouched`.)
 
-/// Front end 2's stores set their pages' touched bits alone (`tune
-/// touch_bits`, `Spec::touch_bits`); from the first such translation on,
-/// write-backs make the touched-page list from the bits.
-fn touch_bits_wanted() -> bool {
-    let on = marks_wanted() && super::fe2::wanted() && super::tune::touch_bits();
-    if on {
-        super::fe2::note_touch_bits();
-    }
-    on
-}
-
 /// Front end 2's stores test their pages' touched bits before setting them
 /// and touch a page once a store (`Spec::touch_test`; in-run A/B: FINDINGS.md
 /// 2026-11-03 morning).
@@ -1582,7 +1593,6 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         batched: batched_draw_now(),
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
-        touch_bits: touch_bits_wanted(),
         touch_test: touch_test_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
@@ -1783,7 +1793,6 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         batched: batched_draw_now(),
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
-        touch_bits: touch_bits_wanted(),
         touch_test: touch_test_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
@@ -2622,7 +2631,6 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         batched: false,
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
-        touch_bits: touch_bits_wanted(),
         touch_test: touch_test_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
@@ -2674,7 +2682,6 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         batched: false,
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
-        touch_bits: touch_bits_wanted(),
         touch_test: touch_test_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
@@ -2726,7 +2733,6 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         batched: super::tune::batch_cs() && batched,
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
-        touch_bits: touch_bits_wanted(),
         touch_test: touch_test_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,

@@ -2044,7 +2044,7 @@ pub(crate) fn spec_diff(a: &rdna::translate::Spec, b: &rdna::translate::Spec) ->
             })*
         };
     }
-    fields!(stage, user_sgprs, user_base, wave64, ps_input_addr, ps_inputs, barycentric, mrt, cs_local_size, cs_rsrc2, binding_base, probe, dump, force_dispatcher, dispatcher_for_loops, reg_vars, lane_guards, mip_views, lod_stats, early_tests, early_ok, per_lane, lane_votes, lockstep_off, sg_waves, sg_appends, base_instance_sgpr, sgpr_pc, addresses, batched, write_marks, marks_untouched, touch_bits, touch_test, sgpr_ubo);
+    fields!(stage, user_sgprs, user_base, wave64, ps_input_addr, ps_inputs, barycentric, mrt, cs_local_size, cs_rsrc2, binding_base, probe, dump, force_dispatcher, dispatcher_for_loops, reg_vars, lane_guards, mip_views, lod_stats, early_tests, early_ok, per_lane, lane_votes, lockstep_off, sg_waves, sg_appends, base_instance_sgpr, sgpr_pc, addresses, batched, write_marks, marks_untouched, touch_test, sgpr_ubo);
     if a.resources.len() != b.resources.len() {
         d.push(format!("resources {:?} -> {:?}", a.resources, b.resources));
     } else {
@@ -3070,6 +3070,115 @@ fn trace_loads(queue: &str, p: &Prepared, groups: [u32; 3]) {
 /// (the item block and its first four buffer descriptors), how often an
 /// item's block and descriptors change, the per-mesh buffers' extent; a
 /// summary line every 300 flips.
+/// `DS_PCOPY_CENSUS=<hex address>` (diagnosis): the title's pattern copy
+/// (`cs_memset32`, cs 0x1008881200: dst[i] = src[i mod n] for i < count,
+/// typed loads and stores; the V#s in user SGPRs 0-3 (src), 4-7 (dst), 8-11
+/// (count at +0, n at +4)) by its formats, strides and n, with its counts,
+/// bytes and whether its count/n words or its pattern are GPU-written (what
+/// a fill recorded by the CPU would need), logged every 300 flips.
+fn pcopy_census(p: &Prepared, groups: [u32; 3], indirect: bool) {
+    static ADDR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let want = *ADDR.get_or_init(|| std::env::var("DS_PCOPY_CENSUS").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(u64::MAX));
+    if p.addr != want {
+        return;
+    }
+    #[derive(Default)]
+    struct Row {
+        dispatches: u64,
+        elements: u64,
+        bytes: u64,
+        groups_short: u64,
+        consts_gpu: u64,
+        src_gpu: u64,
+        indirect: u64,
+        unreadable: u64,
+        same_value: u64,
+        /// count <= n: a plain copy of count elements.
+        plain: u64,
+        max_count: u32,
+        max_n: u32,
+    }
+    #[derive(Default)]
+    struct Census {
+        rows: HashMap<(u8, u32, u8, u32, u32), Row>,
+        start: u64,
+    }
+    static C: Mutex<Option<Census>> = Mutex::new(None);
+    let user = p.user;
+    if user.len() < 12 {
+        return;
+    }
+    let src = super::desc::Vsharp::decode(&user[0..4]);
+    let dst = super::desc::Vsharp::decode(&user[4..8]);
+    let cst = super::desc::Vsharp::decode(&user[8..12]);
+    let rd = |a: u64| -> Option<u32> { super::cp::guest_readable(a, 4).then(|| unsafe { std::ptr::read_volatile(a as *const u32) }) };
+    let (count, n) = (rd(cst.base), rd(cst.base + 4));
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    let mut g = C.lock();
+    let c = g.get_or_insert_with(|| Census { start: frame, ..Default::default() });
+    // (n exact below 64, else its power of two.)
+    let nk = n.map_or(u32::MAX, |n| if n < 64 { n } else { n.next_power_of_two() });
+    let key = (src.format, src.stride, dst.format, dst.stride, nk);
+    let r = c.rows.entry(key).or_default();
+    r.dispatches += 1;
+    r.indirect += indirect as u64;
+    match (count, n) {
+        (Some(count), Some(n)) => {
+            r.plain += (count <= n) as u64;
+            r.max_count = r.max_count.max(count);
+            r.max_n = r.max_n.max(n);
+            r.elements += count as u64;
+            r.bytes += count as u64 * dst.stride.max(4) as u64;
+            if !indirect && (groups[0] as u64) * 64 < count as u64 {
+                r.groups_short += 1;
+            }
+            if super::fe2::gpu_pages(cst.base, cst.base + 8) > 0 {
+                r.consts_gpu += 1;
+            }
+            let src_bytes = (n.max(1) as u64) * src.stride.max(4) as u64;
+            if super::fe2::gpu_pages(src.base, src.base + src_bytes) > 0 {
+                r.src_gpu += 1;
+            }
+            // (A pattern of one value repeated: all of its elements equal.)
+            if n >= 1 && src.stride.max(4) == 4 {
+                let first = rd(src.base);
+                if first.is_some() && (1..n.min(64) as u64).all(|k| rd(src.base + 4 * k) == first) {
+                    r.same_value += 1;
+                }
+            }
+        }
+        _ => r.unreadable += 1,
+    }
+    if frame >= c.start + 300 {
+        let flips = (frame - c.start).max(1) as f64;
+        let mut rows: Vec<(&(u8, u32, u8, u32, u32), &Row)> = c.rows.iter().collect();
+        rows.sort_by_key(|(_, r)| std::cmp::Reverse(r.dispatches));
+        let parts: Vec<String> = rows
+            .iter()
+            .take(8)
+            .map(|((sf, ss, df, ds, n), r)| {
+                format!(
+                    "src fmt {sf} stride {ss}, dst fmt {df} stride {ds}, n {n}: {:.1}/flip ({} plain copies), {:.0} elements and {:.1} KiB each (count up to {}, n up to {}), groups short {}, count/n GPU-written {}, pattern GPU-written {}, one value {}, indirect {}, unreadable {}",
+                    r.dispatches as f64 / flips,
+                    r.plain,
+                    r.elements as f64 / r.dispatches.max(1) as f64,
+                    r.bytes as f64 / r.dispatches.max(1) as f64 / 1024.0,
+                    r.max_count,
+                    r.max_n,
+                    r.groups_short,
+                    r.consts_gpu,
+                    r.src_gpu,
+                    r.same_value,
+                    r.indirect,
+                    r.unreadable
+                )
+            })
+            .collect();
+        crate::info!("pattern copy census {want:#x} over {flips:.0} flips: {}", parts.join("; "));
+        *c = Census { start: frame, ..Default::default() };
+    }
+}
+
 fn cull_census(p: &Prepared) {
     static ADDR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let want = *ADDR.get_or_init(|| std::env::var("DS_CULL_CENSUS").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(u64::MAX));
@@ -7801,10 +7910,6 @@ pub struct Exec {
     /// `DS_FE2_CALLERS`: the ranges (base, size, written) this batch placed
     /// and the epoch of the latest (`fe2::note_place_repeat`).
     fe2_memo: std::collections::HashMap<(u64, u64, bool), u32>,
-    /// The guest range its written bindings span since its last write-back
-    /// (`fe2::record_scatter`, `tune touch_bits`): start, end (start above
-    /// end: none).
-    fe2_written: (u64, u64),
     fe2_gens: Vec<u32>,
     /// This queue's view (`fe2::view_cell`): what its checks need.
     fe2_view: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -8684,7 +8789,6 @@ impl Exec {
                 fe2_claimed: Vec::new(),
                 fe2_marked: false,
                 fe2_memo: Default::default(),
-                fe2_written: (u64::MAX, 0),
                 fe2_gens: Vec::new(),
                 fe2_view: super::fe2::view_cell(name),
                 f3_ranges: Vec::new(),
@@ -10000,7 +10104,6 @@ impl Exec {
                 self.report_error("front end 2: a written range cannot be imported (its GPU writes do not reach guest memory)", || format!("{lo:#x}..{hi:#x}"));
             }
             self.fe2_marked = true;
-            self.fe2_written = (self.fe2_written.0.min(lo), self.fe2_written.1.max(hi));
             if wb_census() {
                 note_written_binding(base, hi - lo);
             }
@@ -10364,8 +10467,7 @@ impl Exec {
         // segment's end mark.)
         let rec = if seg { self.wb_count_copy(0) } else { 0 };
         let cmd = self.cmd();
-        let written = std::mem::replace(&mut self.fe2_written, (u64::MAX, 0));
-        let recorded = if let Some(pipe) = super::fe2::record_scatter(cmd, Some(written), self.batch_c) {
+        let recorded = if let Some(pipe) = super::fe2::record_scatter(cmd, self.batch_c) {
             // The next dispatch binds its own pipeline and descriptors.
             self.dyncache.cs_pipeline = pipe;
             true
@@ -14283,6 +14385,15 @@ impl Exec {
             Some(p) => p,
             None => shaders::prepare_compute(cp, wave64)?,
         };
+        // LOD statistics in rotation (`tune lod_cs` >= 2): a stage prepared
+        // without them measures in one dispatch in N (prepared again with
+        // them); the others carry their textures' recent measurements.
+        let lod_rotated = shaders::cs_lod_rotated(&p);
+        let lod_measure = lod_rotated && super::lodstats::rotate_cs(&p.resources);
+        if lod_measure {
+            p = shaders::with_lod_stats(|| shaders::prepare_compute(cp, wave64))?;
+            super::lodstats::bound(&p.resources);
+        }
         if super::drawcensus::on() {
             super::drawcensus::observe_cs(&self.name, p.addr, &p.tr.plan, indirect.is_some());
         }
@@ -14319,9 +14430,19 @@ impl Exec {
                 explain_wait(&self.name, c, &[&p]);
             }
             READ_WAIT_WORDS[if shaders::words_unchanged(&p) { 2 } else { 3 }].fetch_add(1, Ordering::Relaxed);
-            p = shaders::prepare_compute(cp, wave64)?;
+            p = match lod_measure {
+                true => shaders::with_lod_stats(|| shaders::prepare_compute(cp, wave64))?,
+                false => shaders::prepare_compute(cp, wave64)?,
+            };
+            if lod_rotated {
+                match lod_measure {
+                    true => super::lodstats::bound(&p.resources),
+                    false => super::lodstats::carry(&p.resources),
+                }
+            }
         }
         cull_census(&p);
+        pcopy_census(&p, groups, indirect.is_some());
         lap.mark(1);
         // Textures are uploaded from guest memory: earlier GPU writes first.
         let mut textures = std::mem::take(&mut self.tex_scratch);
