@@ -394,6 +394,12 @@ pub struct Spec {
     /// the list append) only when it finds it clear, and the mark words one
     /// store sets in one page touch that page once (`touch_page`).
     pub touch_test: bool,
+    /// With `write_marks`, an exact ballast (the runtime's `tune tr_ballast`
+    /// bit 0): every store's marking is done twice. The second sets the
+    /// same bits and finds its pages touched, so what reaches guest memory
+    /// is the same and only the marking's cost doubles: what it takes from
+    /// live frames prices a leaner form.
+    pub mark_twice: bool,
     /// How the SGPR data binding is declared: 0 a storage buffer (u32
     /// array), 1 a uniform buffer (`BindingKind::SgprUniform`: a std140
     /// array of uvec4 sized to the plan's SGPR data) where the binding is the
@@ -528,6 +534,9 @@ impl std::hash::Hash for Spec {
         }
         if self.marks_untouched {
             0x4D55_4E54u32.hash(state);
+        }
+        if self.mark_twice {
+            0x4D32_5458u32.hash(state);
         }
         if self.touch_test {
             0x5454_5354u32.hash(state);
@@ -4057,6 +4066,7 @@ mod tests {
             write_marks: false,
             marks_untouched: false,
             touch_test: false,
+            mark_twice: false,
             sgpr_ubo: 0,
             gpu_loads: 0,
             gpu_res: 0,

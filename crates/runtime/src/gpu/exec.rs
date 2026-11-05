@@ -8714,7 +8714,8 @@ struct Closed {
 
 /// Slot sequence of a batch closed but not yet submitted.
 const PENDING: u64 = u64::MAX;
-/// Batch slots a deferred executor may create.
+/// Batch slots a deferred executor may create (16 instead: level at Doran,
+/// FINDINGS.md 2026-11-05 night).
 const DEFERRED_SLOTS: usize = 6;
 /// A held executor's (`Exec::past_begin`): it holds a stretch's batches.
 const HELD_SLOTS: usize = 12;

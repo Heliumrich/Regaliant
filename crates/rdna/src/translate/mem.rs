@@ -1409,8 +1409,16 @@ pub fn global(tr: &mut T, ins: &Inst) -> R<()> {
 /// `Spec::write_marks`: sets the bits of `n` dwords (1..=4, a constant)
 /// from dword `d0` of resource `r`'s binding in the written-bit map, when
 /// the resource is marked and the dwords lie inside its bound bytes. Run it
-/// where the store happens (active lanes).
+/// where the store happens (active lanes). (`Spec::mark_twice`: twice.)
 fn mark_dwords(tr: &mut T, r: usize, d0: Word, n: u32) -> R<()> {
+    mark_dwords_once(tr, r, d0, n)?;
+    if tr.spec.mark_twice {
+        mark_dwords_once(tr, r, d0, n)?;
+    }
+    Ok(())
+}
+
+fn mark_dwords_once(tr: &mut T, r: usize, d0: Word, n: u32) -> R<()> {
     let Some(marks) = tr.marks else { return Ok(()) };
     let (u, b) = (tr.t.u32, tr.t.bool_);
     let base = tr.addr_info(r, 3)?;
