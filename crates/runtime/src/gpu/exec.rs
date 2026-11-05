@@ -2691,6 +2691,8 @@ pub(super) fn push_line() -> String {
         BATCHED[0].load(Ordering::Relaxed),
         BATCHED[2].load(Ordering::Relaxed)
     ) + &batch_miss_line()
+        + &format!("    front end 2's placement memo: {} repeats answered, {} placements made
+", PLACE_MEMO[0].load(Ordering::Relaxed), PLACE_MEMO[1].load(Ordering::Relaxed))
 }
 
 /// Why batched programs' commands did not join the open batched dispatch
@@ -7192,6 +7194,57 @@ pub(super) fn prog_note(class: u8, a: u64, b: u64, ns: u64) {
     });
 }
 
+/// Slots of an executor's placement memo (`Exec::fe2_place`).
+const PLACE_MEMO_SLOTS: usize = 128;
+
+/// A placement of the executor's batch (`Exec::fe2_place`).
+#[derive(Clone, Copy)]
+struct PlaceMemo {
+    base: u64,
+    size: u64,
+    /// `Exec::batch_count` it was made in (0: none).
+    batch: u64,
+    ep: u32,
+    want: u32,
+    written: bool,
+    map_gen: u64,
+    result: (vk::Buffer, u64, u64),
+}
+
+impl Default for PlaceMemo {
+    fn default() -> PlaceMemo {
+        PlaceMemo { base: 0, size: 0, batch: 0, ep: 0, want: 0, written: false, map_gen: 0, result: (vk::Buffer::null(), 0, 0) }
+    }
+}
+
+#[inline]
+fn place_memo_slot(base: u64, size: u64, written: bool) -> usize {
+    let h = (base >> 2).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ size.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) ^ written as u64;
+    (h >> (64 - PLACE_MEMO_SLOTS.trailing_zeros())) as usize
+}
+
+/// The placement memo's [hits, misses] (`Exec::fe2_place`), added per
+/// thread every 4,096.
+pub static PLACE_MEMO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+thread_local! {
+    static PLACE_MEMO_LOCAL: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+#[inline]
+fn place_memo_count(hit: bool) {
+    PLACE_MEMO_LOCAL.with(|c| {
+        let mut v = c.get();
+        v[if hit { 0 } else { 1 }] += 1;
+        if v[0] + v[1] >= 4096 {
+            PLACE_MEMO[0].fetch_add(v[0], Ordering::Relaxed);
+            PLACE_MEMO[1].fetch_add(v[1], Ordering::Relaxed);
+            v = [0; 2];
+        }
+        c.set(v);
+    });
+}
+
 /// Slow placements (`DS_SLOW_PLACE`): per (executor, shader, base, size,
 /// written) [count, us, max us, placed bytes, probe sums].
 type SlowKey = (String, u64, u64, u64, bool);
@@ -7965,6 +8018,10 @@ pub struct Exec {
     /// `DS_FE2_CALLERS`: the ranges (base, size, written) this batch placed
     /// and the epoch of the latest (`fe2::note_place_repeat`).
     fe2_memo: std::collections::HashMap<(u64, u64, bool), u32>,
+    /// Placements of this batch by range: direct-mapped, tagged with the
+    /// batch, epoch, want and mapping generation they were made under
+    /// (`PlaceMemo`, `fe2_place`).
+    place_memo: Box<[PlaceMemo; PLACE_MEMO_SLOTS]>,
     fe2_gens: Vec<u32>,
     /// This queue's view (`fe2::view_cell`): what its checks need.
     fe2_view: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -8845,6 +8902,7 @@ impl Exec {
                 fe2_claimed: Vec::new(),
                 fe2_marked: false,
                 fe2_memo: Default::default(),
+                place_memo: Box::new([PlaceMemo::default(); PLACE_MEMO_SLOTS]),
                 fe2_gens: Vec::new(),
                 fe2_view: super::fe2::view_cell(name),
                 f3_ranges: Vec::new(),
@@ -10096,6 +10154,41 @@ impl Exec {
     /// reaching past the end of its mapping is placed up to there (the rest
     /// reads 0). None: nothing of it is mapped, or no video memory.
     fn fe2_place(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
+        // A repeat of a placement of this batch at the same epoch, view and
+        // mappings: its result. Its checks found the range current for every
+        // CPU write before that epoch began (what the batch's work needs) and
+        // its uploads are in this batch's prologue; only deferred CP writes
+        // into it since still order the batch. (Not past a label wait: those
+        // stretches' placements keep their ranges and hot pages. Half the
+        // placements, CPU per command -1.2% at Doran and -2% at the vista,
+        // frames +1.9% there: FINDINGS.md 2026-11-06 small hours; a hash-map
+        // memo measured level on 2026-10-28, its map's upkeep taking what it
+        // saved.)
+        if self.recording && !self.stopped && !self.past_grow && !super::fe2::callers_on() && super::fe2::slow_place_us() == 0 {
+            let ep = super::precache::epoch() as u32;
+            let want = self.fe2_want(ep);
+            let map_gen = crate::mem::MAP_GEN.load(Ordering::Acquire);
+            let k = place_memo_slot(base, size, written);
+            let m = self.place_memo[k];
+            if m.batch == self.batch_count && m.base == base && m.size == size && m.written == written && m.ep == ep && m.want == want && m.map_gen == map_gen {
+                if let Some(s) = CP_WRITES.latest(&[(base, size)]) {
+                    self.submit_after = self.submit_after.max(s);
+                }
+                self.fe2_min_want = self.fe2_min_want.min(want);
+                place_memo_count(true);
+                return Some(m.result);
+            }
+            place_memo_count(false);
+            let r = self.fe2_place_any(base, size, written);
+            if let Some(result) = r {
+                // (Under the batch it was made in: a placement begins one when
+                // none is being recorded.)
+                if self.recording && !self.stopped && !self.past_grow && crate::mem::MAP_GEN.load(Ordering::Acquire) == map_gen && super::precache::epoch() as u32 == ep {
+                    self.place_memo[k] = PlaceMemo { base, size, batch: self.batch_count, ep, want, written, map_gen, result };
+                }
+            }
+            return r;
+        }
         let slow = super::fe2::slow_place_us();
         if slow == 0 {
             return self.fe2_place_any(base, size, written);
