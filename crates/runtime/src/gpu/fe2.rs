@@ -438,12 +438,12 @@ const CALLER_NAMES: [&str; 4] = ["graphics CP", "its parallel workers", "queue 0
 /// misses on another epoch, misses on chunk generations, misses on host
 /// events, words scanned, takes, TSC cycles in all, placements (the
 /// executor's `fe2_place`), their TSC cycles].
-static BY_CALLER: [[AtomicU64; 22]; 4] = [const { [const { AtomicU64::new(0) }; 22] }; 4];
+static BY_CALLER: [[AtomicU64; 25]; 4] = [const { [const { AtomicU64::new(0) }; 25] }; 4];
 /// The same for placements made while a batch's (or parallel chunk's) first
 /// command is bound (`set_first_command`): first commands cost 100-216 us
 /// against ~20 us for later ones at Castlewall's arrival, most of it
 /// binding (FINDINGS.md 2026-10-31).
-static BY_CALLER_FIRST: [[AtomicU64; 22]; 4] = [const { [const { AtomicU64::new(0) }; 22] }; 4];
+static BY_CALLER_FIRST: [[AtomicU64; 25]; 4] = [const { [const { AtomicU64::new(0) }; 25] }; 4];
 
 thread_local! {
     /// The command being bound opens its batch (`set_first_command`).
@@ -482,6 +482,13 @@ const C_FIX: usize = 17;
 const C_CACHE: usize = 19;
 const C_FOLLOW: usize = 20;
 const C_UPLOAD: usize = 21;
+/// Placements of a range (base, size, written) its batch placed before at
+/// the same epoch, and at an earlier one (`Exec::fe2_memo`, the census of
+/// what a per-batch memo of placements could skip).
+const C_REP_SAME: usize = 22;
+const C_REP_BATCH: usize = 23;
+/// The cycles of the same-epoch repeats (what such a memo would spare, less its lookup).
+const C_REP_CYCLES: usize = 24;
 
 /// The TSC when `DS_FE2_CALLERS` is on, else 0.
 #[inline]
@@ -503,6 +510,16 @@ fn caller_since(what: usize, t0: u64) {
 
 /// Cycles of a placement's parts (`DS_FE2_CALLERS`): map, begin (of it
 /// the batch's begin alone), after.
+/// A placement repeating one of its batch (`C_REP_SAME` / `C_REP_BATCH`).
+pub fn note_place_repeat(same_epoch: bool) {
+    caller_count(if same_epoch { C_REP_SAME } else { C_REP_BATCH }, 1);
+}
+
+/// A same-epoch repeat's cycles (`C_REP_CYCLES`).
+pub fn note_repeat_cycles(cycles: u64) {
+    caller_count(C_REP_CYCLES, cycles);
+}
+
 pub fn note_place_parts(map: u64, begin: u64, batch: u64, after: u64) {
     caller_count(C_PART_MAP, map);
     caller_count(C_PART_BEGIN, begin);
@@ -4532,15 +4549,18 @@ pub fn callers_line() -> String {
         return quiet;
     }
     let hz = super::threadcpu::tsc_hz();
-    let line = |rows: &[[AtomicU64; 22]; 4]| -> Vec<String> {
+    let line = |rows: &[[AtomicU64; 25]; 4]| -> Vec<String> {
         CALLER_NAMES
         .iter()
         .zip(rows.iter())
         .map(|(n, c)| {
             let v: Vec<u64> = c.iter().map(|x| x.load(Ordering::Relaxed)).collect();
             format!(
-                "{n}: {} placements ({:.1} ms; outside the checks: mapping and backing {:.1}, batch and import {:.1} (the batch's begin {:.1}), after {:.1}), {} checks ({} by the range cache; missed: no range {}, another epoch {}, chunk generations {}, host events {}), {} words scanned, {} takes, {:.1} ms (range caches {:.1}, scans {:.1}, arming {:.1}, takes {:.1}, runs made current {:.1}, following other takes {:.1}, uploads without a take {:.1}, the rest {:.1})",
+                "{n}: {} placements ({} repeating one of the batch at the same epoch ({:.1} ms), {} at an earlier one; {:.1} ms; outside the checks: mapping and backing {:.1}, batch and import {:.1} (the batch's begin {:.1}), after {:.1}), {} checks ({} by the range cache; missed: no range {}, another epoch {}, chunk generations {}, host events {}), {} words scanned, {} takes, {:.1} ms (range caches {:.1}, scans {:.1}, arming {:.1}, takes {:.1}, runs made current {:.1}, following other takes {:.1}, uploads without a take {:.1}, the rest {:.1})",
                 v[C_PLACES],
+                v[C_REP_SAME],
+                v[C_REP_CYCLES] as f64 * 1e3 / hz,
+                v[C_REP_BATCH],
                 v[C_PLACE_CYCLES] as f64 * 1e3 / hz,
                 v[C_PART_MAP] as f64 * 1e3 / hz,
                 v[C_PART_BEGIN] as f64 * 1e3 / hz,

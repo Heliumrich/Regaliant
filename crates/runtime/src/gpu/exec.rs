@@ -7798,6 +7798,9 @@ pub struct Exec {
     /// Scratch: the runs of an upload this batch claimed (`fe2::run_claim`).
     fe2_claimed: Vec<(u64, u64)>,
     fe2_marked: bool,
+    /// `DS_FE2_CALLERS`: the ranges (base, size, written) this batch placed
+    /// and the epoch of the latest (`fe2::note_place_repeat`).
+    fe2_memo: std::collections::HashMap<(u64, u64, bool), u32>,
     /// The guest range its written bindings span since its last write-back
     /// (`fe2::record_scatter`, `tune touch_bits`): start, end (start above
     /// end: none).
@@ -8680,6 +8683,7 @@ impl Exec {
                 fe2_mine: Default::default(),
                 fe2_claimed: Vec::new(),
                 fe2_marked: false,
+                fe2_memo: Default::default(),
                 fe2_written: (u64::MAX, 0),
                 fe2_gens: Vec::new(),
                 fe2_view: super::fe2::view_cell(name),
@@ -9134,6 +9138,7 @@ impl Exec {
             }
         }
         self.fe2_marked = false;
+        self.fe2_memo.clear();
         // Every batch follows all earlier ones: also a parallel run's chunks,
         // which the title left unordered, as their shadows of a buffer they
         // all write (the culls' appends) are copied in and merged back per
@@ -9938,8 +9943,19 @@ impl Exec {
             return self.fe2_place_inner(base, size, written);
         }
         super::fe2::set_caller(&self.name);
+        let ep = super::precache::epoch() as u32;
+        let same = match self.fe2_memo.insert((base, size, written), ep) {
+            Some(e) => {
+                super::fe2::note_place_repeat(e == ep);
+                e == ep
+            }
+            None => false,
+        };
         let t0 = unsafe { core::arch::x86_64::_rdtsc() };
         let r = self.fe2_place_inner(base, size, written);
+        if same {
+            super::fe2::note_repeat_cycles(unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0));
+        }
         super::fe2::note_place(unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0));
         r
     }
