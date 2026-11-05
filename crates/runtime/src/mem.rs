@@ -1610,11 +1610,17 @@ pub fn os_readable(a: u64, len: u64) -> bool {
         if unsafe { VirtualQuery(p as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
             return false;
         }
-        if mbi.State != MEM_COMMIT || mbi.Protect == 0 || mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0 {
+        if mbi.State != MEM_COMMIT || mbi.Protect == 0 || mbi.Protect & PAGE_GUARD != 0 {
             return false;
         }
         let next = mbi.BaseAddress as u64 + mbi.RegionSize as u64;
         if next <= p {
+            return false;
+        }
+        // (No-access pages armed through the host read as readable: an
+        // access is answered there, or waits for the page's words when it is
+        // held: `hosted::hold`.)
+        if mbi.Protect & PAGE_NOACCESS != 0 && !(p & !4095..next.min(end)).step_by(4096).all(crate::hosted::armed) {
             return false;
         }
         p = next;

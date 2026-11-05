@@ -114,6 +114,8 @@ struct Shared {
     held_faults: AtomicU64,
     held_spun: AtomicU64,
     held_full: AtomicU64,
+    /// Faults on held pages answered as on armed pages (`HELD_ANSWERED`).
+    held_answered: AtomicU64,
     /// Requests written (by the host) and taken (by dsport).
     held_head: AtomicU64,
     held_tail: AtomicU64,
@@ -257,6 +259,28 @@ pub fn splitting(lo: u64, hi: u64) {
 /// dsport could disarm the rest, FINDINGS.md 2026-10-28). Not for pages
 /// armed against reads (`arm_noaccess`): set by front end 2 only.
 const WORD_MODE: u32 = 1;
+
+/// `Shared::flags`: a fault on a held page is answered as on an armed page
+/// (made read-write, its bits cleared, put in the ring): no thread waits
+/// (the hold census, `gpu::fe2::hold_census`, where the page's words are
+/// written back as ever).
+const HELD_ANSWERED: u32 = 2;
+
+/// Faults on held pages are answered from now on (`HELD_ANSWERED`).
+pub fn set_held_answered() {
+    if let Some(s) = shared() {
+        s.flags.fetch_or(HELD_ANSWERED, Ordering::AcqRel);
+    }
+}
+
+/// Whether held pages may be made: their faults are answered
+/// (`HELD_ANSWERED`) or a release service runs (`set_held_served`).
+static HELD_SERVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A release service takes held-page requests from now on (or no longer).
+pub fn set_held_served(on: bool) {
+    HELD_SERVED.store(on, Ordering::Release);
+}
 
 /// Faults answer for their whole 64-page word from now on (`WORD_MODE`).
 pub fn set_word_mode() {
@@ -500,6 +524,12 @@ pub fn forget(base: u64, len: u64) {
 /// until dsport has put the page's words back and released it (`take_held`,
 /// `release`, `resume_waiter`).
 pub fn hold(base: u64, len: u64) -> Result<(), String> {
+    // (A held page's thread waits for a release: never without a service,
+    // unless the host answers them.)
+    let s = shared().ok_or("not hosted")?;
+    if s.flags.load(Ordering::Acquire) & HELD_ANSWERED == 0 && !HELD_SERVED.load(Ordering::Acquire) {
+        return Err("no release service for held pages".into());
+    }
     arm_as(base, len, PAGE_NOACCESS, true)
 }
 
@@ -721,13 +751,14 @@ pub fn status() -> String {
         .collect();
     let which = if which.is_empty() { String::new() } else { format!(" ({})", which.join("; ")) };
     let hf = s.held_faults.load(Ordering::Relaxed);
-    let held = if hf + HELD_PAGES.load(Ordering::Relaxed) + HELD_DROPPED.load(Ordering::Relaxed) == 0 {
+    let ha = s.held_answered.load(Ordering::Relaxed);
+    let held = if hf + ha + HELD_PAGES.load(Ordering::Relaxed) + HELD_DROPPED.load(Ordering::Relaxed) == 0 {
         String::new()
     } else {
         let w: Vec<u64> = HELD_WAITS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         format!(
-            "; held pages: {} now, {hf} requests ({} for threads not suspended, {} faults not posted: ring full), waits {:.0} us on average and {:.0} us at most over {}, resumes that failed {}, held pages dropped without a release (disarms, mapping changes) {}",
-            HELD_PAGES.load(Ordering::Relaxed),
+            "; held pages: {} now, {ha} faults on them answered at once (`HELD_ANSWERED`), {hf} requests ({} for threads not suspended, {} faults not posted: ring full), waits {:.0} us on average and {:.0} us at most over {}, resumes that failed {}, held pages dropped without a release (disarms, mapping changes) {}",
+            HELD_PAGES.load(Ordering::Relaxed).saturating_sub(ha),
             s.held_spun.load(Ordering::Relaxed),
             s.held_full.load(Ordering::Relaxed),
             w[1] as f64 / 1000.0 / w[0].max(1) as f64,
@@ -829,7 +860,9 @@ pub fn run_host() -> ! {
                 let (write, addr) = (rec.ExceptionInformation[0] == 1, rec.ExceptionInformation[1] as u64);
                 let held = exc == 0xC000_0005 && e.dwFirstChance != 0 && is_held(s, addr);
                 let armed = exc == 0xC000_0005 && e.dwFirstChance != 0 && bit(s, addr, false).is_some_and(|(w, m)| w.load(Ordering::Acquire) & m != 0);
-                if held {
+                // (`HELD_ANSWERED`: held pages answered as armed ones.)
+                let answered = held && s.flags.load(Ordering::Acquire) & HELD_ANSWERED != 0;
+                if held && !answered {
                     // Not answered: the thread waits, suspended, for dsport
                     // to put the page's words back and resume it (it runs
                     // the access again then).
@@ -870,6 +903,11 @@ pub fn run_host() -> ! {
                     VirtualProtectEx(pi.hProcess, page as _, PAGE as usize, PAGE_READWRITE, &mut old);
                     if let Some((w, m)) = bit(s, page, false) {
                         w.fetch_and(!m, Ordering::AcqRel);
+                    }
+                    if let Some((hw, hm)) = held_bit(s, page)
+                        && hw.fetch_and(!hm, Ordering::AcqRel) & hm != 0
+                    {
+                        s.held_answered.fetch_add(1, Ordering::Relaxed);
                     }
                     if s.flags.load(Ordering::Acquire) & WORD_MODE != 0 {
                         let n = answer_word(s, pi.hProcess, page);
@@ -1123,7 +1161,10 @@ fn held_test() -> Result<String, String> {
     let passed = s.passed.load(Ordering::Acquire);
     let mut stray = Vec::new();
     take_held(&mut stray);
-    hold(a, PAGES * PAGE)?;
+    set_held_served(true);
+    let held_now = hold(a, PAGES * PAGE);
+    set_held_served(false);
+    held_now?;
     let waits = parking_lot::Mutex::new(Vec::<u64>::new());
     // Requests until `want` (5 s at most).
     let collect = |want: usize| -> Result<Vec<HeldRequest>, String> {

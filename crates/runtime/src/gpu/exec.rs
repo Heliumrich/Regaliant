@@ -5223,6 +5223,17 @@ pub fn wait_done_for(seq: u64, max: std::time::Duration) -> bool {
     true
 }
 
+/// The latest unfinished batch that writes guest [a, a+n) (its written
+/// ranges as noted at submission), if any.
+pub fn inflight_writer(a: u64, n: u64) -> Option<u64> {
+    INFLIGHT.latest(&[(a, n)])
+}
+
+/// Every batch up to this sequence has completed.
+pub fn done_now() -> u64 {
+    done_seq()
+}
+
 /// Blocks until batch `seq` and all earlier ones completed (with their actions).
 /// (A wait of more than 3 s is logged once, with its caller.)
 #[track_caller]

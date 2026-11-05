@@ -595,6 +595,13 @@ static UP_FLIPS: Mutex<UpFlips> = Mutex::new(UpFlips { flip: 0, pages: 0, again:
 /// Pages [a, b) are uploaded into the mirror by this thread's batch
 /// (`up_census_on`).
 pub fn upload_census(a: u64, b: u64) {
+    if HELD_MAP.get().is_some() {
+        // (The hold census: pages uploaded while held.)
+        let n = (a & !(PAGE - 1)..b).step_by(PAGE as usize).filter(|&p| crate::hosted::held(p)).count() as u64;
+        if n > 0 {
+            HOLD[H_UPLOADED].fetch_add(n, Ordering::Relaxed);
+        }
+    }
     if !up_census_on() {
         return;
     }
@@ -2292,7 +2299,7 @@ fn try_arm(a: u64, b: u64, frame: u64, armable: &Armable) {
             not[R_HELD] += cand.count_ones() as u64;
             cand = 0;
         }
-        if cand != 0 && !arm_gpu && !crate::mem::view_window(x) {
+        if cand != 0 && !arm_gpu && !hold_census() && !crate::mem::view_window(x) {
             let g = c.gpu[w].load(Ordering::Acquire) & cand;
             not[R_GPU] += g.count_ones() as u64;
             cand &= !g;
@@ -2406,8 +2413,12 @@ fn watch() {
     let mut names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
     // (This read's words with an arming a fault ended, and the level.)
     let mut hit: Vec<(u64, u8)> = Vec::new();
+    let mut reconciled = std::time::Instant::now();
     loop {
         std::thread::sleep(std::time::Duration::from_millis(1));
+        if HELD_MAP.get().is_some() {
+            hold_tick(&mut reconciled);
+        }
         if window.elapsed().as_millis() >= BURST_MS {
             for &k in &touched {
                 counts[k] = 0;
@@ -2441,6 +2452,9 @@ fn watch() {
                 note_wb_pages(&WB_CPU_PAGES, page, PAGE);
             }
             note_wb_lazy_fault(page, write, rip);
+            if held_mark(page, false) {
+                note_hold_fault(page, write, rip);
+            }
             // (Pages of view windows: the residency tracks their writes, and
             // only the page written turns volatile.)
             if write && crate::mem::view_window(page) {
@@ -2627,6 +2641,10 @@ fn arm_part(x: u64, y: u64, frame: u64) {
         NOT_ARMED[R_HELD].fetch_add((y - x) / PAGE, Ordering::Relaxed);
         return;
     }
+    if HELD_MAP.get().is_some() {
+        hold_part(x, y);
+        return;
+    }
     STATS[S_ARM_RUNS].fetch_add(1, Ordering::Relaxed);
     let t = std::time::Instant::now();
     let r = crate::hosted::arm(x, y - x);
@@ -2646,6 +2664,80 @@ fn arm_part(x: u64, y: u64, frame: u64) {
         p = e;
     }
     STATS[S_ARMED].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+}
+
+/// `arm_part` under the hold census (its checks passed, the locks held):
+/// the GPU-written pages of [x, y) held (`hosted::hold`, their bits in the
+/// census's map), the others armed against writes, run by run.
+fn hold_part(x: u64, y: u64) {
+    // (0: not GPU-written, armed; 1: GPU-written and written back lately,
+    // held; 2: GPU-written, not written back lately, left alone.)
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    let quiet = hold_quiet();
+    let kind = |p: u64| -> u8 {
+        let Some(c) = chunk(p, false) else { return 0 };
+        if c.gpu[idx(p) / 64].load(Ordering::Acquire) >> (idx(p) % 64) & 1 == 0 {
+            0
+        } else if !wb_recent(p) || never_hold(p) {
+            2
+        } else if quiet > 0 && frame.saturating_sub((c.wrote[idx(p)].load(Ordering::Acquire) as u64).saturating_sub(1)) < quiet {
+            3
+        } else {
+            1
+        }
+    };
+    let mut p = x;
+    while p < y {
+        let k = kind(p);
+        let mut q = p + PAGE;
+        while q < y && kind(q) == k {
+            q += PAGE;
+        }
+        if k == 2 || k == 3 {
+            if k == 2 {
+                HOLD_STALE.fetch_add((q - p) / PAGE, Ordering::Relaxed);
+            } else {
+                HOLD_YOUNG.fetch_add((q - p) / PAGE, Ordering::Relaxed);
+            }
+            p = q;
+            continue;
+        }
+        let g = k == 1;
+        STATS[S_ARM_RUNS].fetch_add(1, Ordering::Relaxed);
+        let t = std::time::Instant::now();
+        let r = if g { crate::hosted::hold(p, q - p) } else { crate::hosted::arm(p, q - p) };
+        super::hitch::note_since(super::hitch::Kind::Mirror, t, || format!("{} {p:#x}+{:#x}", if g { "holding" } else { "arming" }, q - p));
+        if r.is_err() {
+            STATS[S_ARM_FAILED].fetch_add(1, Ordering::Relaxed);
+            if g {
+                HOLD[H_FAILED].fetch_add(1, Ordering::Relaxed);
+            }
+            p = q;
+            continue;
+        }
+        let mut a = p;
+        while a < q {
+            let e = word_end(a, q);
+            if let Some(c) = chunk(a, false) {
+                c.varmed[idx(a) / 64].fetch_and(!word_mask(a, e), Ordering::AcqRel);
+                c.armed[idx(a) / 64].fetch_or(word_mask(a, e), Ordering::AcqRel);
+            }
+            a = e;
+        }
+        if g {
+            let mut n = 0u64;
+            for a in (p..q).step_by(PAGE as usize) {
+                if !held_mark(a, true) {
+                    n += 1;
+                }
+            }
+            HOLD[H_PAGES].fetch_add(n, Ordering::Relaxed);
+            HOLD[H_RUNS].fetch_add(1, Ordering::Relaxed);
+            HOLD[H_HELD_NOW].fetch_add(n, Ordering::Relaxed);
+        }
+        STATS[S_ARMED].fetch_add((q - p) / PAGE, Ordering::Relaxed);
+        p = q;
+    }
 }
 
 /// Whether a chunk of [x, y) holds its arming at `frame` (`burst`).
@@ -2840,7 +2932,30 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
         let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("scatter layout: {e}"))?;
         // (The kernel empties the touched-page list itself; `DS_WB_BUCKETS`
         // also counts by bucket.)
-        let code = if wb_buckets() { rdna::kernels::mirror_scatter_counting() } else { rdna::kernels::mirror_scatter_reset() };
+        // (`DS_FE2_HOLD`: the hold census's kernel with its map in host
+        // memory, read by address.)
+        if hold_census() && HELD_MAP.get().is_none() {
+            let bytes = (HELD_MAP_WORDS * 4) as u64;
+            match c.host_buffer(bytes, vk::BufferUsageFlags::STORAGE_BUFFER) {
+                Ok((buf, _mem, ptr)) => {
+                    std::ptr::write_bytes(ptr, 0, bytes as usize);
+                    let addr = c.buffer_address(buf);
+                    if addr != 0 {
+                        let _ = HELD_MAP.set(HeldMap { _buf: buf, words: ptr as usize, addr });
+                    } else {
+                        crate::warn!("fe2: hold census off: no buffer device addresses");
+                    }
+                }
+                Err(e) => crate::warn!("fe2: hold census off: {e}"),
+            }
+        }
+        let code = if wb_buckets() {
+            rdna::kernels::mirror_scatter_counting()
+        } else if HELD_MAP.get().is_some() {
+            rdna::kernels::mirror_scatter_hold_census()
+        } else {
+            rdna::kernels::mirror_scatter_reset()
+        };
         let make = |code: &[u32], key: u64| -> Result<vk::Pipeline, String> {
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None).map_err(|e| format!("scatter module: {e}"))?;
             let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
@@ -2849,7 +2964,7 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
             c.device.destroy_shader_module(module, None);
             Ok(pipeline?[0])
         };
-        let pipeline = make(&code, if wb_buckets() { 27 } else { 20 })?;
+        let pipeline = make(&code, if wb_buckets() { 27 } else if HELD_MAP.get().is_some() { 28 } else { 20 })?;
         let compact = make(&rdna::kernels::mirror_compact(), 24)?;
         let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 4 }];
         let pool = c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(2).pool_sizes(&sizes), None).map_err(|e| format!("scatter pool: {e}"))?;
@@ -2904,6 +3019,308 @@ pub fn note_touch_bits() {
 pub fn wb_buckets() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("DS_WB_BUCKETS").ok().as_deref() == Some("1"))
+}
+
+/// `DS_FE2_HOLD=1` (diagnosis, the hold census; FRONTEND2.md "GPU-held
+/// pages"; hosted runs): the GPU-written pages the arming picks are held
+/// through the host (no-access, their held bits set) instead of armed
+/// read-only, the host answering their faults at once as for armed pages
+/// (no thread waits; their words are written back as ever); the write-back
+/// counts the dwords holding would leave out (`rdna::kernels::
+/// mirror_scatter_hold_census`, a bitmap of held pages in host memory);
+/// each fault on a held page is counted by origin and access, with the wait
+/// an exact release would have had for GPU work writing the page then.
+pub fn hold_census() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_FE2_HOLD").ok().as_deref() == Some("1") && !wb_buckets())
+}
+
+/// The hold census's bitmap: a bit per page of the span (bit i of word i /
+/// 32), in host memory the write-back reads at `addr`.
+struct HeldMap {
+    _buf: vk::Buffer,
+    words: usize,
+    addr: u64,
+}
+
+static HELD_MAP: std::sync::OnceLock<HeldMap> = std::sync::OnceLock::new();
+const HELD_MAP_WORDS: usize = ((MIRROR_END - MIRROR_BASE) / PAGE / 32) as usize;
+
+/// Sets (or clears) page `page`'s bit in the hold census's map: whether it
+/// was set.
+fn held_mark(page: u64, on: bool) -> bool {
+    let Some(m) = HELD_MAP.get() else { return false };
+    if !(MIRROR_BASE..MIRROR_END).contains(&page) {
+        return false;
+    }
+    let i = ((page - MIRROR_BASE) / PAGE) as usize;
+    // SAFETY: HELD_MAP_WORDS host-memory words, mapped for the process's life.
+    let w = unsafe { &*(m.words as *const AtomicU32).add(i / 32) };
+    let bit = 1u32 << (i % 32);
+    let old = if on { w.fetch_or(bit, Ordering::AcqRel) } else { w.fetch_and(!bit, Ordering::AcqRel) };
+    old & bit != 0
+}
+
+/// The hold census's counts: pages held, runs, runs that failed; faults on
+/// held pages [the title, ours, other code] x [read, write]; of them with
+/// GPU work writing the page in flight, none in flight; waits resolved,
+/// their total and longest (us); holds ended otherwise (disarms, mapping
+/// changes, word answers: the reconcile).
+static HOLD: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
+/// (Pages uploaded into the mirror while held.)
+const H_UPLOADED: usize = 16;
+/// GPU-written pages the census did not hold: not written back lately.
+static HOLD_STALE: AtomicU64 = AtomicU64::new(0);
+/// Pages written back within the last two periods of `hold_thread` (a bit
+/// per page of the span), and how many at its last look.
+static WB_RECENT: std::sync::OnceLock<Box<[AtomicU32]>> = std::sync::OnceLock::new();
+static WB_RECENT_PAGES: AtomicU64 = AtomicU64::new(0);
+
+/// `DS_FE2_HOLD_ONCE=1` (the hold census): a page that faulted while held
+/// is never held again (`NO_HOLD`, a bit per page of the span).
+fn hold_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_FE2_HOLD_ONCE").ok().as_deref() == Some("1"))
+}
+
+static NO_HOLD: std::sync::OnceLock<Box<[AtomicU32]>> = std::sync::OnceLock::new();
+static NO_HOLD_PAGES: AtomicU64 = AtomicU64::new(0);
+
+fn no_hold() -> &'static [AtomicU32] {
+    NO_HOLD.get_or_init(|| (0..HELD_MAP_WORDS).map(|_| AtomicU32::new(0)).collect())
+}
+
+/// `DS_FE2_HOLD_QUIET=<flips>` (the hold census): a GPU-written page is held
+/// only after that many flips without a CPU write seen on it (0: the
+/// arming's own quiet time).
+fn hold_quiet() -> u64 {
+    static Q: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *Q.get_or_init(|| std::env::var("DS_FE2_HOLD_QUIET").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// Pages the census did not hold for want of its own quiet time.
+static HOLD_YOUNG: AtomicU64 = AtomicU64::new(0);
+
+/// Whether page `p` faulted while held before (`hold_once`).
+fn never_hold(p: u64) -> bool {
+    if !hold_once() || !(MIRROR_BASE..MIRROR_END).contains(&p) {
+        return false;
+    }
+    let i = ((p - MIRROR_BASE) / PAGE) as usize;
+    no_hold()[i / 32].load(Ordering::Relaxed) >> (i % 32) & 1 != 0
+}
+
+/// Whether page `p` was written back lately (`WB_RECENT`).
+fn wb_recent(p: u64) -> bool {
+    let Some(r) = WB_RECENT.get() else { return false };
+    if !(MIRROR_BASE..MIRROR_END).contains(&p) {
+        return false;
+    }
+    let i = ((p - MIRROR_BASE) / PAGE) as usize;
+    r[i / 32].load(Ordering::Relaxed) >> (i % 32) & 1 != 0
+}
+
+/// The hold census's thread: every 500 ms the written-back bits of both maps'
+/// aux regions read back and cleared (a write-back racing it may lose its
+/// bit to the clear), `WB_RECENT` made of this period's and the last one's.
+fn hold_thread() {
+    let c = ctx();
+    let words = HELD_MAP_WORDS as u64;
+    let at = rdna::kernels::MARK_AUX_AT as u64 * 4;
+    let recent = WB_RECENT.get_or_init(|| (0..HELD_MAP_WORDS).map(|_| AtomicU32::new(0)).collect());
+    let Ok((hbuf, _hmem, hptr)) = c.host_buffer(2 * words * 4, vk::BufferUsageFlags::TRANSFER_DST) else {
+        crate::warn!("fe2: hold census: no host buffer for the written-back bits");
+        return;
+    };
+    let mut prev = vec![0u32; HELD_MAP_WORDS];
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let maps: Vec<vk::Buffer> = [false, true].iter().filter_map(|&on_c| super::resident::marks_for(on_c)).collect();
+        let r = super::resident::one_off_now(|cmd| unsafe {
+            for (k, &m) in maps.iter().enumerate() {
+                c.device.cmd_copy_buffer(cmd, m, hbuf, &[vk::BufferCopy { src_offset: at, dst_offset: k as u64 * words * 4, size: words * 4 }]);
+            }
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_READ).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            for &m in &maps {
+                c.device.cmd_fill_buffer(cmd, m, at, words * 4, 0);
+            }
+        });
+        if r.is_err() {
+            continue;
+        }
+        let mut n = 0u64;
+        for i in 0..HELD_MAP_WORDS {
+            let mut cur = 0u32;
+            for k in 0..maps.len() {
+                cur |= unsafe { std::ptr::read_volatile((hptr as *const u32).add(k * HELD_MAP_WORDS + i)) };
+            }
+            let v = cur | prev[i];
+            recent[i].store(v, Ordering::Relaxed);
+            n += v.count_ones() as u64;
+            prev[i] = cur;
+        }
+        WB_RECENT_PAGES.store(n, Ordering::Relaxed);
+    }
+}
+const H_PAGES: usize = 0;
+const H_RUNS: usize = 1;
+const H_FAILED: usize = 2;
+const H_FAULTS: usize = 3;
+const H_INFLIGHT: usize = 9;
+const H_NONE: usize = 10;
+const H_WAITS: usize = 11;
+const H_WAIT_US: usize = 12;
+const H_WAIT_MAX: usize = 13;
+const H_OTHER: usize = 14;
+const H_HELD_NOW: usize = 15;
+/// Faults on held pages by their page's quiet time at the fault (flips since
+/// the last CPU write seen on it): < 64, < 128, ... < 8192, more.
+static HOLD_AGES: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+/// Faults on held pages by (instruction, a write) since the last status
+/// line.
+static HOLD_RIPS: parking_lot::Mutex<Option<std::collections::HashMap<(u64, bool), u64>>> = parking_lot::Mutex::new(None);
+/// The waits being timed: (the writer's sequence, the fault's time).
+static HOLD_PENDING: parking_lot::Mutex<Vec<(u64, std::time::Instant)>> = parking_lot::Mutex::new(Vec::new());
+
+/// A fault on a held page (`watch`): counted by origin and access, the
+/// first 40 logged with their code; the GPU work writing the page then.
+fn note_hold_fault(page: u64, write: bool, rip: u64) {
+    let (b, e) = crate::exception::host_image();
+    let origin = if (crate::mem::GUEST_BASE..crate::mem::GUEST_END).contains(&rip) {
+        0
+    } else if (b..e).contains(&rip) {
+        1
+    } else {
+        2
+    };
+    let n = HOLD[H_FAULTS + 2 * origin + write as usize].fetch_add(1, Ordering::Relaxed);
+    HOLD[H_HELD_NOW].fetch_sub(1, Ordering::Relaxed);
+    if hold_once() && (MIRROR_BASE..MIRROR_END).contains(&page) {
+        let i = ((page - MIRROR_BASE) / PAGE) as usize;
+        if no_hold()[i / 32].fetch_or(1 << (i % 32), Ordering::Relaxed) >> (i % 32) & 1 == 0 {
+            NO_HOLD_PAGES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    *HOLD_RIPS.lock().get_or_insert_with(Default::default).entry((rip, write)).or_insert(0) += 1;
+    if let Some(c) = chunk(page, false) {
+        let frame = super::FRAMES.load(Ordering::Relaxed);
+        let age = frame.saturating_sub((c.wrote[idx(page)].load(Ordering::Acquire) as u64).saturating_sub(1));
+        let k = ((64 - age.max(1).leading_zeros()) as usize).saturating_sub(6).min(8);
+        HOLD_AGES[k].fetch_add(1, Ordering::Relaxed);
+    }
+    let writer = super::exec::inflight_writer(page, PAGE);
+    match writer {
+        Some(seq) => {
+            HOLD[H_INFLIGHT].fetch_add(1, Ordering::Relaxed);
+            HOLD_PENDING.lock().push((seq, std::time::Instant::now()));
+        }
+        None => {
+            HOLD[H_NONE].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
+        crate::info!("fe2: hold census: a {} of held page {page:#x} by {} ({}; this kind's {} so far){}", if write { "write" } else { "read" }, ["the title", "ours", "other code"][origin], describe_code(rip), n + 1, if writer.is_some() { "; GPU work writing it in flight" } else { "" });
+    }
+}
+
+/// The hold census's tick (`watch`, every millisecond): the waits whose
+/// writer completed timed; every second, map bits of pages no longer held
+/// (their holds ended without a fault of their own) cleared and counted.
+fn hold_tick(last_reconcile: &mut std::time::Instant) {
+    {
+        let mut p = HOLD_PENDING.lock();
+        if !p.is_empty() {
+            let done = super::exec::done_now();
+            p.retain(|&(seq, t)| {
+                if seq > done {
+                    return true;
+                }
+                let us = t.elapsed().as_micros() as u64;
+                HOLD[H_WAITS].fetch_add(1, Ordering::Relaxed);
+                HOLD[H_WAIT_US].fetch_add(us, Ordering::Relaxed);
+                HOLD[H_WAIT_MAX].fetch_max(us, Ordering::Relaxed);
+                false
+            });
+        }
+    }
+    if last_reconcile.elapsed().as_millis() < 1000 {
+        return;
+    }
+    *last_reconcile = std::time::Instant::now();
+    let Some(m) = HELD_MAP.get() else { return };
+    // SAFETY: as `held_mark`.
+    let words = unsafe { std::slice::from_raw_parts(m.words as *const AtomicU32, HELD_MAP_WORDS) };
+    let mut ended = 0u64;
+    for (i, w) in words.iter().enumerate() {
+        let mut bits = w.load(Ordering::Acquire);
+        while bits != 0 {
+            let k = bits.trailing_zeros();
+            bits &= bits - 1;
+            let page = MIRROR_BASE + (i as u64 * 32 + k as u64) * PAGE;
+            if !crate::hosted::held(page) && w.fetch_and(!(1u32 << k), Ordering::AcqRel) & (1u32 << k) != 0 {
+                ended += 1;
+            }
+        }
+    }
+    if ended > 0 {
+        HOLD[H_OTHER].fetch_add(ended, Ordering::Relaxed);
+        HOLD[H_HELD_NOW].fetch_sub(ended, Ordering::Relaxed);
+    }
+}
+
+/// Status line of the hold census (since the last one: per flip).
+fn hold_line() -> String {
+    if HELD_MAP.get().is_none() {
+        return String::new();
+    }
+    static LAST: parking_lot::Mutex<(u64, [u64; 17], u64, u64, u64)> = parking_lot::Mutex::new((0, [0; 17], 0, 0, 0));
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    let now: [u64; 17] = std::array::from_fn(|k| HOLD[k].load(Ordering::Relaxed));
+    let (dw, pg, all) = (WB64[2].load(Ordering::Relaxed), WB64[3].load(Ordering::Relaxed), WB64[1].load(Ordering::Relaxed));
+    let mut l = LAST.lock();
+    let flips = frame.saturating_sub(l.0).max(1) as f64;
+    let d = |k: usize| now[k].saturating_sub(l.1[k]);
+    let (ddw, dpg, dall) = (dw.saturating_sub(l.2), pg.saturating_sub(l.3), all.saturating_sub(l.4));
+    let waits = d(H_WAITS);
+    let line = format!(
+        "    hold census (`DS_FE2_HOLD`, over {flips:.0} flips): pages held now {} ({} held in {} runs since, {} runs failed); held pages in the write-backs {:.3} M dwords and {:.0} pages a flip ({:.1}% of the dwords written back); faults on held pages {:.3} a flip: the title {} reads / {} writes, ours {} / {}, other code {} / {}; GPU work writing the page in flight at {} of them (until it completed {:.2} ms on average, {:.1} ms at most so far, over {waits}), none at {}; holds ended otherwise (disarms, mapping changes, word answers) {}; pages uploaded into the mirror while held {}; pages written back within the last second {}, GPU-written candidates not held (not written back lately, or faulted before: `DS_FE2_HOLD_ONCE`, {} pages) {}, not quiet for `DS_FE2_HOLD_QUIET` {}\n",
+        now[H_HELD_NOW] as i64,
+        d(H_PAGES),
+        d(H_RUNS),
+        d(H_FAILED),
+        ddw as f64 / 1e6 / flips,
+        dpg as f64 / flips,
+        100.0 * ddw as f64 / dall.max(1) as f64,
+        (H_FAULTS..H_FAULTS + 6).map(d).sum::<u64>() as f64 / flips,
+        d(H_FAULTS),
+        d(H_FAULTS + 1),
+        d(H_FAULTS + 2),
+        d(H_FAULTS + 3),
+        d(H_FAULTS + 4),
+        d(H_FAULTS + 5),
+        d(H_INFLIGHT),
+        d(H_WAIT_US) as f64 / 1000.0 / waits.max(1) as f64,
+        now[H_WAIT_MAX] as f64 / 1000.0,
+        d(H_NONE),
+        d(H_OTHER),
+        d(H_UPLOADED),
+        WB_RECENT_PAGES.load(Ordering::Relaxed),
+        NO_HOLD_PAGES.load(Ordering::Relaxed),
+        HOLD_STALE.load(Ordering::Relaxed),
+        HOLD_YOUNG.load(Ordering::Relaxed)
+    );
+    *l = (frame, now, dw, pg, all);
+    let mut rips: Vec<((u64, bool), u64)> = HOLD_RIPS.lock().take().map(|m| m.into_iter().collect()).unwrap_or_default();
+    rips.sort_by(|a, b| b.1.cmp(&a.1));
+    if rips.is_empty() {
+        return line;
+    }
+    let top: Vec<String> = rips.iter().take(8).map(|&((rip, w), n)| format!("{n} {} at {}", if w { "writes" } else { "reads" }, describe_code(rip))).collect();
+    let ages: Vec<String> = HOLD_AGES.iter().map(|a| a.swap(0, Ordering::Relaxed).to_string()).collect();
+    line + &format!("    hold census: faults by code: {} ({} places); by the page's quiet time (flips; < 64, < 128, ..., < 8192, more): {}\n", top.join(", "), rips.len(), ages.join(" "))
 }
 
 /// `DS_WB_BUCKETS`: pages of the span the CPU wrote, and those the command
@@ -3165,7 +3582,8 @@ pub fn record_scatter(cmd: vk::CommandBuffer, written: Option<(u64, u64)>, on_c:
     let c = ctx();
     let m = c.buffer_address(mbuf);
     let t = super::pagetable::address();
-    let pc: Vec<u8> = [m as u32, (m >> 32) as u32, t as u32, (t >> 32) as u32, 0, 0, 0, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
+    let h = HELD_MAP.get().map_or(0, |m| m.addr);
+    let pc: Vec<u8> = [m as u32, (m >> 32) as u32, t as u32, (t >> 32) as u32, h as u32, (h >> 32) as u32, 0, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
     let pipeline = s.pipeline;
     unsafe {
         let all = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
@@ -3351,6 +3769,12 @@ pub fn init() {
                 // its page only.)
                 if std::env::var("DS_FE2_WORD").ok().as_deref() != Some("0") {
                     crate::hosted::set_word_mode();
+                }
+                if hold_census() {
+                    crate::hosted::set_held_answered();
+                    if HELD_MAP.get().is_some() {
+                        let _ = std::thread::Builder::new().name("fe2-hold".into()).spawn(hold_thread);
+                    }
                 }
                 let _ = std::thread::Builder::new().name("fe2-faults".into()).spawn(watch);
             }
@@ -3736,6 +4160,7 @@ pub fn status() -> String {
         + &callers_line()
         + &compacts
         + &wb_buckets_line()
+        + &hold_line()
 }
 
 /// One status line: the mirror's pages by state now (a scan of every

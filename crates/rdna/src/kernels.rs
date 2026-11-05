@@ -609,7 +609,7 @@ pub const SCATTER_LOCAL_SIZE: u32 = 256;
 /// map, binding 1 the SCATTER_COUNTERS counters. Push constants `{mirror
 /// (low, high), table (low, high)}`.
 pub fn mirror_scatter() -> Vec<u32> {
-    build_scatter(false, false).expect("mirror scatter kernel")
+    build_scatter(false, false, false).expect("mirror scatter kernel")
 }
 
 /// `mirror_scatter` emptying the touched-page list itself: workgroup 0's
@@ -619,7 +619,7 @@ pub fn mirror_scatter() -> Vec<u32> {
 /// dispatch made as many as the count), so the write-back needs no fill of
 /// the count and no barrier before one.
 pub fn mirror_scatter_reset() -> Vec<u32> {
-    build_scatter(true, false).expect("mirror scatter kernel (emptying the list)")
+    build_scatter(true, false, false).expect("mirror scatter kernel (emptying the list)")
 }
 
 /// `mirror_scatter_reset` that also adds, per bucket of 2^WB_BUCKET_SHIFT
@@ -629,10 +629,23 @@ pub fn mirror_scatter_reset() -> Vec<u32> {
 /// of buckets whose bit at WB_LAZY_AT is set (their marks cleared, their
 /// dwords counted as if stored).
 pub fn mirror_scatter_counting() -> Vec<u32> {
-    build_scatter(true, true).expect("mirror scatter kernel (counting buckets)")
+    build_scatter(true, true, false).expect("mirror scatter kernel (counting buckets)")
 }
 
-fn build_scatter(reset: bool, count: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
+/// `mirror_scatter_reset` that also counts what holding pages would leave
+/// out (diagnosis, the runtime's `DS_FE2_HOLD=1`; FRONTEND2.md "GPU-held
+/// pages"): a bitmap of held pages (a bit per page of the span, bit i of
+/// word i / 32) at the device address in push constants 4-5 (non-zero), and
+/// for each listed page whose bit is set its marked dwords are added to
+/// counter 4 and the page to counter 5 (as stored or not); stores unchanged.
+/// A page with marked dwords also gets its bit in the map's aux region (bit
+/// i of word MARK_AUX_AT + i / 32: written back since the runtime last read
+/// and cleared them).
+pub fn mirror_scatter_hold_census() -> Vec<u32> {
+    build_scatter(true, false, true).expect("mirror scatter kernel (hold census)")
+}
+
+fn build_scatter(reset: bool, count: bool, hold: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     let lit = Operand::LiteralBit32;
     let mut b = Builder::new();
     b.set_version(1, 3);
@@ -656,7 +669,7 @@ fn build_scatter(reset: bool, count: bool) -> Result<Vec<u32>, rspirv::dr::Error
     let p_u = b.type_pointer(None, StorageClass::StorageBuffer, u32t);
     let p_dev = b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u32t);
     let p_dev64 = b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u64t);
-    let pc_members = 4;
+    let pc_members = if hold { 6 } else { 4 };
     let pc = b.type_struct(vec![u32t; pc_members]);
     b.decorate(pc, Decoration::Block, []);
     for k in 0..pc_members as u32 {
@@ -845,6 +858,37 @@ fn build_scatter(reset: bool, count: bool) -> Result<Vec<u32>, rspirv::dr::Error
     let pdw = b.access_chain(p_u, None, counters, [c0, c1])?;
     let add = b.i_mul(u32t, None, total, which_dw)?;
     b.atomic_i_add(u32t, None, pdw, scope_dev, sem_none, add)?;
+    if hold {
+        // (The page's bit in the held-page bitmap: its dwords and the page
+        // counted when set.)
+        let c4 = c(&mut b, 4);
+        let hlo = pc_at(&mut b, c4)?;
+        let hhi = pc_at(&mut b, c5)?;
+        let hmap = addr64(&mut b, hlo, hhi)?;
+        let hw = b.shift_right_logical(u32t, None, page, c5)?;
+        let hw64 = b.u_convert(u64t, None, hw)?;
+        let c4_64 = b.constant_bit64(u64t, 4);
+        let hoff = b.i_mul(u64t, None, hw64, c4_64)?;
+        let ha = b.i_add(u64t, None, hmap, hoff)?;
+        let hp = b.convert_u_to_ptr(p_dev, None, ha)?;
+        let hword = b.load(u32t, None, hp, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+        let hbit = b.bitwise_and(u32t, None, page, c31)?;
+        let hsh = b.shift_right_logical(u32t, None, hword, hbit)?;
+        let hone = b.bitwise_and(u32t, None, hsh, c1)?;
+        let held_dw = b.i_mul(u32t, None, total, hone)?;
+        let phd = b.access_chain(p_u, None, counters, [c0, c4])?;
+        b.atomic_i_add(u32t, None, phd, scope_dev, sem_none, held_dw)?;
+        let php = b.access_chain(p_u, None, counters, [c0, c5])?;
+        b.atomic_i_add(u32t, None, php, scope_dev, sem_none, hone)?;
+        // (Written back: the page's bit in the aux region.)
+        let any = b.u_greater_than(bool_, None, total, c0)?;
+        let one_at = b.shift_left_logical(u32t, None, c1, hbit)?;
+        let wbit = b.select(u32t, None, any, one_at, c0)?;
+        let aux_at = c(&mut b, MARK_AUX_AT);
+        let awi = b.i_add(u32t, None, aux_at, hw)?;
+        let paw = b.access_chain(p_u, None, marks, [c0, awi])?;
+        b.atomic_or(u32t, None, paw, scope_dev, sem_none, wbit)?;
+    }
     if count {
         // (The page's bucket: its dwords, and the page once when any.)
         let shift = c(&mut b, WB_BUCKET_SHIFT);
@@ -1155,6 +1199,17 @@ mod tests {
         if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
             let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("mirror_compact.spv"), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn scatter_hold_census_kernel_assembles() {
+        let w = super::mirror_scatter_hold_census();
+        assert_eq!(w[0], 0x0723_0203);
+        assert_ne!(w, super::mirror_scatter_reset());
+        if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("mirror_scatter_hold_census.spv"), bytes).unwrap();
         }
     }
 
