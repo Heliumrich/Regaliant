@@ -1135,15 +1135,6 @@ impl Exec {
         if aa & 7 != 0 {
             self.report(format!("MSAA ({} samples) rendered single-sampled", 1 << (aa & 7)));
         }
-        // Exact ballast on the graphics command processor (`tune cp_spin`,
-        // diagnosis).
-        let spin = super::super::tune::cp_spin();
-        if spin != 0 && !self.deferred && cp.is_main_gfx() {
-            let t = std::time::Instant::now();
-            while (t.elapsed().as_nanos() as u64) < spin {
-                std::hint::spin_loop();
-            }
-        }
         // Shader stages.
         let ps_addr = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
         // Stages prepared ahead by the workers (`gpu::ahead`) when they still
