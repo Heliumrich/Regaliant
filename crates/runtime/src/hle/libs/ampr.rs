@@ -191,6 +191,8 @@ struct AprFile {
     host: PathBuf,
     size: u64,
     handle: Mutex<Option<Arc<File>>>,
+    /// Content the port serves from memory (`crate::pcsettings`: title files it extends).
+    mem: Option<Arc<Vec<u8>>>,
 }
 
 /// Registered files: ids index `files` (id - 1). One lock guards both maps.
@@ -219,13 +221,17 @@ fn resolve_path(guest: &str) -> Result<(u32, u64), i32> {
     if md.is_dir {
         return Err(EISDIR);
     }
+    let mem = crate::pcsettings::generated(guest);
     let mut g = FILES.lock();
     let t = g.get_or_insert_with(Default::default);
     // Another thread may have registered the path meanwhile.
     if let Some(&id) = t.by_path.get(guest) {
         return Ok((id, t.files[id as usize - 1].size));
     }
-    t.files.push(Arc::new(AprFile { path: guest.to_string(), host, size: md.size, handle: Mutex::new(None) }));
+    if let Some(d) = &mem {
+        crate::info!("apr: '{guest}' served from the port's extended copy ({} bytes)", d.len());
+    }
+    t.files.push(Arc::new(AprFile { path: guest.to_string(), host, size: md.size, handle: Mutex::new(None), mem }));
     let id = t.files.len() as u32;
     t.by_path.insert(guest.to_string(), id);
     Ok((id, md.size))
@@ -405,6 +411,19 @@ fn read_into(file_id: u32, dest: u64, size: u64, offset: u64) -> Result<(), i32>
     if offset.checked_add(size).is_none_or(|e| e > f.size) {
         crate::warn!("apr: read of {} [{offset:#x}+{size:#x}] past end of file ({:#x})", f.path, f.size);
         return Err(EINVAL);
+    }
+    if let Some(d) = &f.mem {
+        let _w = crate::gpu::track::host_write(dest, size);
+        let what = || format!("apr: read {} [{offset:#x}] into {dest:#x} (memory)", f.path);
+        let src = &d[offset as usize..(offset + size) as usize];
+        crate::mem::kernel_io(&what, dest, size, true, || {
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dest as *mut u8, src.len()) };
+            Ok(())
+        })
+        .map_err(|_| EIO)?;
+        STATS[1].fetch_add(1, Ordering::Relaxed);
+        STATS[2].fetch_add(size, Ordering::Relaxed);
+        return Ok(());
     }
     let h = open_handle(&f)?;
     if crate::hle::iostat::note("apr", &f.path, crate::hle::iostat::What::Read, size) {

@@ -145,7 +145,12 @@ pub fn ro_meta(host: &Path) -> Option<CachedMeta> {
 pub fn guest_meta(guest: &str) -> Option<(PathBuf, CachedMeta)> {
     let r = resolve(guest)?;
     if !r.writable {
-        return r.candidates.into_iter().find_map(|p| ro_meta(&p).map(|m| (p, m)));
+        let found = r.candidates.into_iter().find_map(|p| ro_meta(&p).map(|m| (p, m)));
+        // A title file the port extends: its extended size.
+        if let (Some((p, m)), Some(d)) = (&found, crate::pcsettings::generated(guest)) {
+            return Some((p.clone(), CachedMeta { size: d.len() as u64, ..*m }));
+        }
+        return found;
     }
     let p = r.candidates.into_iter().find(|p| p.exists())?;
     let md = std::fs::metadata(&p).ok()?;
@@ -163,6 +168,8 @@ pub fn guest_meta(guest: &str) -> Option<(PathBuf, CachedMeta)> {
 
 pub enum Kind {
     File { file: File, writable: bool },
+    /// Content the port serves from memory (`crate::pcsettings`: title files it extends).
+    Mem(Arc<Vec<u8>>),
     Dir { entries: Vec<(String, bool)> },
     Console(i32),
 }
@@ -279,6 +286,12 @@ pub fn vfs_open(path: &str, flags: i32, _mode: u32) -> i32 {
     if path == DEVLOG_ARGS && !wants_write {
         if let Some(fd) = title_args().and_then(|extra| open_merged_args(&r, path, &extra)) {
             return fd;
+        }
+    }
+    if !wants_write && !r.writable {
+        if let Some(d) = crate::pcsettings::generated(path) {
+            crate::info!("open '{path}': the port's extended copy ({} bytes)", d.len());
+            return alloc_fd(Fd { kind: Kind::Mem(d), pos: Mutex::new(0), path: path.to_string() });
         }
     }
     let existing = r.candidates.iter().find(|p| p.exists()).cloned();
@@ -410,6 +423,17 @@ pub fn pread_fd(fd: i32, buf: &mut [u8], off: u64) -> Result<usize, i32> {
             crate::gpu::hitch::note_since(crate::gpu::hitch::Kind::File, t0, || format!("read '{}' {} KiB", f.path, done >> 10));
             Ok(done)
         }
+        Kind::Mem(d) => {
+            let start = (off as usize).min(d.len());
+            let n = buf.len().min(d.len() - start);
+            let what = || format!("read of '{}' [{off:#x}] (memory)", f.path);
+            let _w = crate::gpu::track::host_write(buf.as_ptr() as u64, n as u64);
+            crate::mem::kernel_io(&what, buf.as_ptr() as u64, n as u64, true, || {
+                buf[..n].copy_from_slice(&d[start..start + n]);
+                Ok(n)
+            })
+            .map_err(|e| io_errno(&e))
+        }
         Kind::Dir { .. } => Err(EISDIR),
         Kind::Console(_) => Ok(0),
     }
@@ -418,7 +442,7 @@ pub fn pread_fd(fd: i32, buf: &mut [u8], off: u64) -> Result<usize, i32> {
 pub fn vfs_read(fd: i32, buf: &mut [u8]) -> Result<usize, i32> {
     let f = get_fd(fd).ok_or(EBADF)?;
     match &f.kind {
-        Kind::File { .. } => {
+        Kind::File { .. } | Kind::Mem(_) => {
             let mut pos = f.pos.lock();
             let n = pread_fd(fd, buf, *pos)?;
             *pos += n as u64;
@@ -453,6 +477,7 @@ pub fn pwrite_fd(fd: i32, data: &[u8], off: Option<u64>) -> Result<usize, i32> {
             crate::gpu::hitch::note_since(crate::gpu::hitch::Kind::File, t0, || format!("write '{}' {} KiB", f.path, done >> 10));
             Ok(done)
         }
+        Kind::Mem(_) => Err(EBADF),
         Kind::Dir { .. } => Err(EISDIR),
         Kind::Console(c) => {
             console_write(*c, data);
@@ -465,6 +490,7 @@ pub fn vfs_lseek(fd: i32, off: i64, whence: i32) -> i64 {
     let Some(f) = get_fd(fd) else { return sce(EBADF) as i64 };
     let size = match &f.kind {
         Kind::File { file, .. } => file.metadata().map(|m| m.len()).unwrap_or(0),
+        Kind::Mem(d) => d.len() as u64,
         Kind::Dir { entries } => entries.len() as u64,
         Kind::Console(_) => return sce(ESPIPE) as i64,
     };
@@ -570,6 +596,7 @@ pub fn fstat_fd(fd: i32, out: *mut Stat) -> i32 {
             Ok(md) => fill_stat(&md),
             Err(e) => return sce(io_errno(&e)),
         },
+        Kind::Mem(d) => Stat { mode: S_IFREG | 0o777, nlink: 1, blksize: 0x10000, size: d.len() as i64, blocks: (d.len() as i64 + 511) / 512, ..Default::default() },
         Kind::Dir { .. } => Stat { mode: S_IFDIR | 0o777, nlink: 2, blksize: 0x10000, size: 0x10000, ..Default::default() },
         Kind::Console(_) => Stat { mode: 0o020000 | 0o666, ..Default::default() },
     };

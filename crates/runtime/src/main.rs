@@ -19,6 +19,7 @@ mod loader;
 mod mem;
 mod sections;
 mod patch;
+mod pcsettings;
 mod jobidle;
 mod camhook;
 mod dispmode;

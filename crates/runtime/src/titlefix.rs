@@ -242,6 +242,18 @@ const FIXES: &[Fix] = &[
         why: "the UI is laid out on a 3840x2160 canvas in modes 3-5",
         only_with: Some("DS_OUTPUT_SIZE"),
     },
+    // The title's handler of a changed setting (eboot+0xb4700, an observer of
+    // its settings registry; rsi the setting): `push rbp; mov rbp,rsp; push
+    // rbx; push rax`. The PC settings learn every change there (`pcsettings`).
+    Fix {
+        name: "setting changes (PC settings)",
+        offset: 0xb4700,
+        from: &[0x55, 0x48, 0x89, 0xe5, 0x53, 0x50],
+        change: Change::Hook { at: 0, handler: crate::pcsettings::changed_hook },
+        kind: "PC settings",
+        why: "the port applies its settings when the title's SETTINGS screen changes them",
+        only_with: None,
+    },
 ];
 
 /// `mov dword ptr [rcx+33Ch], -1` after counting the run (rax kept; the
