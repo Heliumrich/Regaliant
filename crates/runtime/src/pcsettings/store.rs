@@ -28,6 +28,17 @@ pub struct Def {
     pub name: String,
     pub kind: Kind,
     pub default: u32,
+    /// A row that shows the achievements (answered live from them, never stored).
+    pub live: Option<Live>,
+}
+
+/// What a live row shows.
+#[derive(Clone, Copy, Debug)]
+pub enum Live {
+    /// A trophy unlocked (1) or not.
+    Trophy(u32),
+    /// The unlocked trophies of a grade (P, G, S, B).
+    Count(char),
 }
 
 struct Store {
@@ -91,6 +102,11 @@ pub fn get(hash: u32) -> Option<u32> {
     let g = STORE.lock();
     let s = g.as_ref()?;
     let d = s.defs.get(&hash)?;
+    match d.live {
+        Some(Live::Trophy(id)) => return Some(crate::achievements::unlocked(id) as u32),
+        Some(Live::Count(g)) => return Some(crate::achievements::count(g).0),
+        None => {}
+    }
     Some(s.values.get(&hash).copied().unwrap_or(d.default))
 }
 
@@ -103,6 +119,10 @@ fn set(hash: u32, bits: u32) -> bool {
     let mut g = STORE.lock();
     let Some(s) = g.as_mut() else { return false };
     let Some(d) = s.defs.get(&hash).cloned() else { return false };
+    if d.live.is_some() {
+        // A row showing the achievements; the menu cannot change it.
+        return true;
+    }
     if s.values.get(&hash) == Some(&bits) {
         return true;
     }

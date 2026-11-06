@@ -27,7 +27,7 @@ pub fn setting_hash(name: &str) -> u32 {
 /// A PC setting in the menu.
 pub struct Item {
     /// `Setting_PC_<id>` is its key; `PC_<ID>`, `PC_<ID>_TIP`, `PC_<ID>_<n>` its text keys.
-    pub id: &'static str,
+    pub id: String,
     pub label: String,
     pub tooltip: String,
     pub kind: ItemKind,
@@ -40,6 +40,10 @@ pub enum ItemKind {
     /// Options and the default's index.
     Choice(Vec<String>, u32),
     Slider { min: f32, max: f32, default: f32 },
+    /// A trophy's state (Locked, Unlocked: the port answers it live, changes are ignored).
+    Status(u32),
+    /// The trophies of a grade unlocked: "k / all" (live, read-only).
+    Count(char, u32),
 }
 
 impl Item {
@@ -55,44 +59,48 @@ impl Item {
             ItemKind::Toggle(_) => vec![("BOOL_OFF".into(), None), ("BOOL_ON".into(), None)],
             ItemKind::Choice(opts, _) => opts.iter().enumerate().map(|(i, o)| (self.text_key(&format!("_{i}")), Some(o.clone()))).collect(),
             ItemKind::Slider { .. } => Vec::new(),
+            ItemKind::Status(_) => vec![("PC_TROPHY_LOCKED".into(), Some("Locked".into())), ("PC_TROPHY_UNLOCKED".into(), Some("Unlocked".into()))],
+            ItemKind::Count(g, all) => (0..=*all).map(|k| (format!("PC_TROPHY_COUNT_{g}_{k}"), Some(format!("{k} / {all}")))).collect(),
         }
     }
     fn def(&self) -> store::Def {
-        let (kind, default) = match &self.kind {
-            ItemKind::Toggle(on) => (store::Kind::Int, *on as u32),
-            ItemKind::Choice(_, d) => (store::Kind::Int, *d),
-            ItemKind::Slider { default, .. } => (store::Kind::Float, default.to_bits()),
+        let (kind, default, live) = match &self.kind {
+            ItemKind::Toggle(on) => (store::Kind::Int, *on as u32, None),
+            ItemKind::Choice(_, d) => (store::Kind::Int, *d, None),
+            ItemKind::Slider { default, .. } => (store::Kind::Float, default.to_bits(), None),
+            ItemKind::Status(id) => (store::Kind::Int, 0, Some(store::Live::Trophy(*id))),
+            ItemKind::Count(g, _) => (store::Kind::Int, 0, Some(store::Live::Count(*g))),
         };
-        store::Def { name: self.key(), kind, default }
+        store::Def { name: self.key(), kind, default, live }
     }
 }
 
 /// The PC tab's items, in order (each one works: what it changes is in `apply`).
 pub fn items() -> Vec<Item> {
     let s = |v: &str| v.to_string();
-    let toggle = |id, label: &str, tooltip: &str, on| Item { id, label: s(label), tooltip: s(tooltip), kind: ItemKind::Toggle(on) };
+    let toggle = |id: &str, label: &str, tooltip: &str, on| Item { id: s(id), label: s(label), tooltip: s(tooltip), kind: ItemKind::Toggle(on) };
     vec![
         Item {
-            id: "WindowMode",
+            id: s("WindowMode"),
             label: s("Window Mode"),
             tooltip: s("Shows the game in a window or fullscreen without borders (Alt+Enter switches too)."),
             kind: ItemKind::Choice(vec![s("Windowed"), s("Borderless Fullscreen")], 0),
         },
         toggle("SkipIntro", "Skip Intro Logos", "Skips the logos shown when the game starts (from the next start).", false),
         Item {
-            id: "Sharpening",
+            id: s("Sharpening"),
             label: s("Sharpening"),
             tooltip: s("Sharpens the image shown (0.00: off, as in the original)."),
             kind: ItemKind::Slider { min: 0.0, max: 1.0, default: 0.0 },
         },
         Item {
-            id: "TextureFiltering",
+            id: s("TextureFiltering"),
             label: s("Texture Filtering"),
             tooltip: s("Sharper textures at an angle: anisotropic filtering above the original's."),
             kind: ItemKind::Choice(vec![s("As Original"), s("8x Anisotropic"), s("16x Anisotropic")], 0),
         },
         Item {
-            id: "MouseSensitivity",
+            id: s("MouseSensitivity"),
             label: s("Mouse Sensitivity"),
             tooltip: s("How far the camera turns per mouse movement (1.00: the controls file's own)."),
             kind: ItemKind::Slider { min: 0.1, max: 3.0, default: 1.0 },
@@ -132,12 +140,83 @@ pub fn window_fullscreen() -> Option<bool> {
     store::value("Setting_PC_WindowMode").map(|m| m == 1)
 }
 
-const TAB_LABEL: (&str, &str) = ("PC_SETTINGS_HEADING", "PC");
-const TAB_TOOLTIP: (&str, &str) = ("PC_SETTINGS_TOOLTIP_TAB", "Settings of the PC version: display, graphics, controls and sound.");
+/// A tab the port adds to the SETTINGS screen (a copy of DISPLAY's tab and page).
+pub struct Tab {
+    /// Its copies' salt and the tab entity's name.
+    pub id: &'static str,
+    /// The page's scene name (DISPLAY's `DisplaySettings` replaced: unique).
+    pub scene: &'static str,
+    pub label: (&'static str, &'static str),
+    pub tooltip: (&'static str, &'static str),
+    pub items: Vec<Item>,
+}
 
-/// The PC settings' values (local-data/pcsettings.txt).
+/// The tabs, in order before EXIT GAME: PC, then the trophies.
+pub fn tabs() -> Vec<Tab> {
+    let mut v = vec![Tab {
+        id: "PCTab",
+        scene: "PCSettings",
+        label: ("PC_SETTINGS_HEADING", "PC"),
+        tooltip: ("PC_SETTINGS_TOOLTIP_TAB", "Settings of the PC version: display, graphics, controls and sound."),
+        items: items(),
+    }];
+    let trophies = trophy_items();
+    if !trophies.is_empty() {
+        v.push(Tab {
+            id: "PCTrophies",
+            scene: "PCTrophies",
+            label: ("PC_TROPHIES_HEADING", "TROPHIES"),
+            tooltip: ("PC_TROPHIES_TOOLTIP_TAB", "The game's trophies: those unlocked and those still to earn."),
+            items: trophies,
+        });
+    }
+    v
+}
+
+fn grade_name(g: char) -> &'static str {
+    match g {
+        'P' => "Platinum",
+        'G' => "Gold",
+        'S' => "Silver",
+        _ => "Bronze",
+    }
+}
+
+/// The TROPHIES tab: how many of each grade are unlocked (live); the opener of the full list
+/// (`trophy_browser`) is placed above them.
+fn trophy_items() -> Vec<Item> {
+    ['P', 'G', 'S', 'B']
+        .into_iter()
+        .filter_map(|g| {
+            let (_, all) = crate::achievements::count(g);
+            (all > 0).then(|| Item {
+                id: format!("TrophyCount{g}"),
+                label: format!("{} Trophies", grade_name(g)),
+                tooltip: format!("The {} trophies unlocked. All Trophies lists every trophy.", grade_name(g).to_lowercase()),
+                kind: ItemKind::Count(g, all),
+            })
+        })
+        .collect()
+}
+
+/// The full list's rows: (text key prefix, name, heading, detail) per trophy, hidden ones masked
+/// until unlocked (as at this start).
+fn trophy_rows() -> Vec<(String, String, String, String)> {
+    crate::achievements::list()
+        .into_iter()
+        .map(|(t, at)| {
+            let shown = !t.hidden || at.is_some();
+            let name = if shown { t.name.clone() } else { "Hidden Trophy".into() };
+            let heading = format!("{} - {}", grade_name(t.grade), if at.is_some() { "Unlocked" } else { "Locked" });
+            let detail = if shown { t.detail.replace(['\n', '\r'], " ") } else { "A hidden trophy: its name shows once it is unlocked.".into() };
+            (format!("PC_TROPHY_{:02}", t.id), name, heading, detail)
+        })
+        .collect()
+}
+
+/// The PC settings' values (local-data/pcsettings.txt); the trophies' rows read their state.
 pub fn init(path: std::path::PathBuf) {
-    store::init(path, items().iter().map(Item::def).collect());
+    store::init(path, tabs().iter().flat_map(|t| t.items.iter().map(Item::def)).collect());
     apply();
 }
 
@@ -164,7 +243,7 @@ fn setting_name(hash: u32) -> Option<String> {
     if let Some(n) = TITLE.iter().find(|n| setting_hash(n) == hash) {
         return Some(n.to_string());
     }
-    items().iter().map(Item::key).find(|k| setting_hash(k) == hash)
+    tabs().iter().flat_map(|t| t.items.iter().map(Item::key)).find(|k| setting_hash(k) == hash)
 }
 
 /// Hook at the entry of the title's handler of a changed setting (eboot+0xb4700, an observer
@@ -278,6 +357,8 @@ fn edit_data_source(p: &mut Payload, item: &Item) -> Result<(), String> {
     }
     let (default, min, max) = match &item.kind {
         ItemKind::Toggle(on) => (raw_u32(*on as u32), Some(raw_u32(0)), Some(raw_u32(1))),
+        ItemKind::Status(_) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(1))),
+        ItemKind::Count(_, all) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(*all))),
         ItemKind::Choice(opts, d) => {
             let n = opts.len().max(1) as u32;
             (raw_u32(*d), Some(raw_u32(0)), Some(raw_u32(n - 1)))
@@ -360,6 +441,108 @@ fn build_item(f: &mut cgpr::File, template: &cgpr::Entity, t: &Template, item: &
     Ok(e)
 }
 
+/// The full trophy list: the title's HELP screen (`HelpMenu`, a scrolling list with a heading
+/// and a description beside it) copied with the GAME page's item that opens it (their one link
+/// remapped), a row per trophy copied from a plain topic row (name, grade and state as the
+/// heading, the detail as the description, no movie). Returns the opener; the screen is added
+/// as a root.
+fn trophy_browser(f: &mut cgpr::File, rows: &[(String, String, String, String)]) -> Result<cgpr::Entity, String> {
+    let help_i = f.roots.iter().position(|r| r.name == b"HelpMenu").ok_or("no HELP screen")?;
+    let pages_ri = f.roots.iter().position(|r| r.path_to("SettingsPages").is_some()).ok_or("no SettingsPages")?;
+    let pages_path = f.roots[pages_ri].path_to("SettingsPages").unwrap();
+    let game_scene = cgpr::lstr("GameSettings");
+    let game_pi = {
+        let pages = f.roots[pages_ri].at(&pages_path);
+        pages
+            .kids
+            .iter()
+            .position(|p| p.comps.iter().any(|(_, idx)| f.comps.get(*idx as usize).is_some_and(|c| cgpr::contains(&c.payload, &game_scene))))
+            .ok_or("no GAME page")?
+    };
+    let mut game_path = pages_path.clone();
+    game_path.push(game_pi);
+    let opener_rel = f.roots[pages_ri].at(&game_path).path_to("HelpMenu").ok_or("no HELP item")?;
+    let mut opener_path = game_path.clone();
+    opener_path.extend(opener_rel);
+    let repl = vec![
+        (b"SETTINGS_ENTRY_HELP_MENU".to_vec(), b"PC_TROPHIES_OPEN".to_vec()),
+        (b"SETTINGS_TOOLTIP_ACCESSIBILITY_HELP_MENU".to_vec(), b"PC_TROPHIES_OPEN_TIP".to_vec()),
+        (b"HelpMenu".to_vec(), b"PCTrophyList".to_vec()),
+        (b"HelpMenuRoot".to_vec(), b"PCTrophyListRoot".to_vec()),
+        (b"HELP_MENU_HEADING_MAIN".to_vec(), b"PC_TROPHIES_HEADING".to_vec()),
+    ];
+    let salt = cgpr::salt("PCTrophyList");
+    let mut copies = cgpr::clone_group(&mut f.comps, &[f.roots[pages_ri].at(&opener_path), &f.roots[help_i]], &repl, &salt);
+    let mut screen = copies.pop().unwrap();
+    let mut opener = copies.pop().unwrap();
+    opener.name = b"PC_TrophiesOpen".to_vec();
+    screen.name = b"PCTrophyList".to_vec();
+    // The rows: copies of a plain topic (a Frame without a section heading in its SettingsValue).
+    let mc_rel = screen.path_to("MenuContents").ok_or("no list")?;
+    let (frame, value) = {
+        let mc = screen.at(&mc_rel);
+        let k = (0..mc.kids.len().saturating_sub(1))
+            .step_by(2)
+            .find(|&k| mc.kids[k].name == b"Frame" && mc.kids[k + 1].name == b"SettingsValue" && mc.kids[k + 1].kids.is_empty())
+            .ok_or("no plain topic row")?;
+        (mc.kids[k].clone(), mc.kids[k + 1].clone())
+    };
+    // The template row's own keys and movie.
+    let mut strings = Vec::new();
+    let mut idx = Vec::new();
+    cgpr::comp_indices(&frame, &mut idx);
+    for i in idx {
+        if let Some(p) = Payload::parse(&f.comps[i as usize].payload) {
+            fn walk(n: &Node, out: &mut Vec<String>) {
+                match n {
+                    Node::Str(b) => out.push(String::from_utf8_lossy(b).into_owned()),
+                    Node::Obj { fields, .. } => fields.iter().for_each(|(_, v)| walk(v, out)),
+                    Node::List(l) => l.iter().for_each(|t| {
+                        if let Body::Fields(fl) = &t.body {
+                            fl.iter().for_each(|(_, v)| walk(v, out))
+                        }
+                    }),
+                    Node::Structs(st) => st.iter().flatten().for_each(|(_, v)| walk(v, out)),
+                    Node::Raw(_) => {}
+                }
+            }
+            if let Body::Fields(fl) = &p.value.body {
+                fl.iter().for_each(|(_, v)| walk(v, &mut strings));
+            }
+        }
+    }
+    let find = |pre: &str| strings.iter().find(|s| s.starts_with(pre)).cloned();
+    let entry = find("HELP_ENTRY_").ok_or("row without its entry key")?;
+    let desc = find("HELP_DESCRIPTION_").ok_or("row without its description key")?;
+    let sub = find("HELP_SUBHEADING_").filter(|s| s.len() > "HELP_SUBHEADING_".len()).ok_or("row without its heading key")?;
+    let movie = strings.iter().find(|s| s.contains("Movies")).cloned();
+    let mut kids = Vec::new();
+    for (key, ..) in rows {
+        let mut r = vec![
+            (entry.as_bytes().to_vec(), key.as_bytes().to_vec()),
+            (desc.as_bytes().to_vec(), format!("{key}_TIP").into_bytes()),
+            (sub.as_bytes().to_vec(), format!("{key}_SUB").into_bytes()),
+        ];
+        if let Some(m) = &movie {
+            r.push((m.as_bytes().to_vec(), Vec::new()));
+        }
+        let mut pair = cgpr::clone_group(&mut f.comps, &[&frame, &value], &r, &cgpr::salt(key));
+        let v = pair.pop().unwrap();
+        let fr = pair.pop().unwrap();
+        kids.push(fr);
+        kids.push(v);
+    }
+    screen.at_mut(&mc_rel).kids = kids;
+    // No movies: the movie's frame goes.
+    if let Some(path) = screen.path_to("HelpItemMovie") {
+        let (last, parent) = path.split_last().unwrap();
+        screen.at_mut(parent).kids.remove(*last);
+    }
+    crate::info!("pc settings: trophy list with {} rows (the HELP screen's layout)", rows.len());
+    f.roots.push(screen);
+    Ok(opener)
+}
+
 fn start_menu(orig: &[u8]) -> Result<Vec<u8>, String> {
     let mut f = cgpr::parse(orig).ok_or("unexpected layout")?;
     if cgpr::serialize(&f) != orig {
@@ -386,41 +569,54 @@ fn start_menu(orig: &[u8]) -> Result<Vec<u8>, String> {
         .unwrap_or(pages.kids.len());
     let mut page_path = pages_path.clone();
     page_path.push(pi);
-    // The tab and page, copied together (the tab's links show and hide the copied page).
-    let tab_salt = cgpr::salt("PCTab");
-    let repl = vec![
-        (b"SETTINGS_HEADING_DISPLAY".to_vec(), TAB_LABEL.0.as_bytes().to_vec()),
-        (b"SETTINGS_TOOLTIP_DISPLAY_TAB".to_vec(), TAB_TOOLTIP.0.as_bytes().to_vec()),
-        (b"DisplaySettings".to_vec(), b"PCSettings".to_vec()),
-    ];
     let (bi, bp) = button_path.clone();
-    let mut copies = cgpr::clone_group(&mut f.comps, &[f.roots[bi].at(&bp), f.roots[ri].at(&page_path)], &repl, &tab_salt);
-    let mut pc_page = copies.pop().unwrap();
-    let mut pc_button = copies.pop().unwrap();
-    pc_button.name = b"PCButton".to_vec();
-    // The page's items: the PC settings, copied from the DISPLAY page's own.
     let contents_rel = f.roots[ri].at(&page_path).path_to("MenuContents").ok_or("no MenuContents")?;
-    let templates = f.roots[ri].at(&page_path).at(&contents_rel);
-    let template = |name: &str| templates.kids.iter().position(|k| k.name == name.as_bytes()).ok_or(format!("no {name} item"));
-    let (ti_choice, ti_slider) = (template(CHOICE.entity)?, template(SLIDER.entity)?);
-    let mut kids = Vec::new();
-    for item in items() {
-        let (ti, t) = match item.kind {
-            ItemKind::Toggle(_) | ItemKind::Choice(..) => (ti_choice, &CHOICE),
-            ItemKind::Slider { .. } => (ti_slider, &SLIDER),
-        };
-        let tpl = f.roots[ri].at(&page_path).at(&contents_rel).kids[ti].clone();
-        kids.push(build_item(&mut f, &tpl, t, &item)?);
-    }
-    pc_page.at_mut(&contents_rel).kids = kids;
+    let (ti_choice, ti_slider) = {
+        let templates = f.roots[ri].at(&page_path).at(&contents_rel);
+        let template = |name: &str| templates.kids.iter().position(|k| k.name == name.as_bytes()).ok_or(format!("no {name} item"));
+        (template(CHOICE.entity)?, template(SLIDER.entity)?)
+    };
     // Links from outside into the DISPLAY page (the Settings scene hides every page on close)
-    // get their copies for the PC page; the DISPLAY tab's own were copied with it.
+    // get copies for each new page; the DISPLAY tab's own are copied with it.
     let mut page_guids = std::collections::HashSet::new();
     cgpr::collect_guids(f.roots[ri].at(&page_path), &mut page_guids);
     let mut skip = Vec::new();
     cgpr::comp_indices(f.roots[bi].at(&bp), &mut skip);
     cgpr::comp_indices(f.roots[ri].at(&page_path), &mut skip);
     let skip: std::collections::HashSet<u32> = skip.into_iter().collect();
+    let tabs = tabs();
+    let salts: Vec<[u8; 16]> = tabs.iter().map(|t| cgpr::salt(t.id)).collect();
+    let mut made = Vec::new();
+    for (tab, salt) in tabs.iter().zip(&salts) {
+        // The tab and page, copied together (the tab's links show and hide its page).
+        let repl = vec![
+            (b"SETTINGS_HEADING_DISPLAY".to_vec(), tab.label.0.as_bytes().to_vec()),
+            (b"SETTINGS_TOOLTIP_DISPLAY_TAB".to_vec(), tab.tooltip.0.as_bytes().to_vec()),
+            (b"DisplaySettings".to_vec(), tab.scene.as_bytes().to_vec()),
+        ];
+        let mut copies = cgpr::clone_group(&mut f.comps, &[f.roots[bi].at(&bp), f.roots[ri].at(&page_path)], &repl, salt);
+        let mut page = copies.pop().unwrap();
+        let mut button = copies.pop().unwrap();
+        button.name = format!("{}Button", tab.id).into_bytes();
+        // The page's items, copied from the DISPLAY page's own.
+        let mut kids = Vec::new();
+        for item in &tab.items {
+            let (ti, t) = match item.kind {
+                ItemKind::Toggle(_) | ItemKind::Choice(..) | ItemKind::Status(_) | ItemKind::Count(..) => (ti_choice, &CHOICE),
+                ItemKind::Slider { .. } => (ti_slider, &SLIDER),
+            };
+            let tpl = f.roots[ri].at(&page_path).at(&contents_rel).kids[ti].clone();
+            kids.push(build_item(&mut f, &tpl, t, item)?);
+        }
+        page.at_mut(&contents_rel).kids = kids;
+        if tab.id == "PCTrophies" {
+            match trophy_browser(&mut f, &trophy_rows()) {
+                Ok(opener) => page.at_mut(&contents_rel).kids.insert(0, opener),
+                Err(e) => crate::warn!("pc settings: no trophy list ({e})"),
+            }
+        }
+        made.push((button, page));
+    }
     let mut added = 0;
     for (i, c) in f.comps.iter_mut().enumerate() {
         if skip.contains(&(i as u32)) {
@@ -429,8 +625,10 @@ fn start_menu(orig: &[u8]) -> Result<Vec<u8>, String> {
         let Some(mut p) = Payload::parse(&c.payload) else { continue };
         let mut n = 0;
         for list in p.links.iter_mut() {
-            let extra: Vec<value::Link> =
-                list.iter().filter(|l| page_guids.contains(&l.target)).map(|l| value::Link { target: cgpr::salted(&l.target, &tab_salt), ..l.clone() }).collect();
+            let mut extra = Vec::new();
+            for salt in &salts {
+                extra.extend(list.iter().filter(|l| page_guids.contains(&l.target)).map(|l| value::Link { target: cgpr::salted(&l.target, salt), ..l.clone() }));
+            }
             n += extra.len();
             list.extend(extra);
         }
@@ -439,12 +637,19 @@ fn start_menu(orig: &[u8]) -> Result<Vec<u8>, String> {
             c.payload = p.ser();
         }
     }
-    crate::info!("pc settings: PC tab with {} items; {added} links into the DISPLAY page copied for it", items().len());
-    // The tab before EXIT GAME, the page beside the others.
-    let tabs = f.roots[bi].at_mut(&bp[..bp.len() - 1]);
-    let at = tabs.kids.iter().position(|k| k.name == b"ExitGameButton").unwrap_or(tabs.kids.len());
-    tabs.kids.insert(at, pc_button);
-    f.roots[ri].at_mut(&pages_path).kids.insert(exit_pi, pc_page);
+    crate::info!(
+        "pc settings: tabs {}; {added} links into the DISPLAY page copied for them",
+        tabs.iter().map(|t| format!("{} ({} items)", t.label.1, t.items.len())).collect::<Vec<_>>().join(", ")
+    );
+    // The tabs before EXIT GAME, the pages beside the others, in order.
+    let mut exit_pi = exit_pi;
+    for (button, page) in made {
+        let tabs_e = f.roots[bi].at_mut(&bp[..bp.len() - 1]);
+        let at = tabs_e.kids.iter().position(|k| k.name == b"ExitGameButton").unwrap_or(tabs_e.kids.len());
+        tabs_e.kids.insert(at, button);
+        f.roots[ri].at_mut(&pages_path).kids.insert(exit_pi, page);
+        exit_pi += 1;
+    }
     let out = cgpr::serialize(&f);
     cgpr::parse(&out).ok_or("the extended file does not parse")?;
     Ok(out)
@@ -457,12 +662,26 @@ fn text(orig: &[u8]) -> Vec<u8> {
     if !out.is_empty() && !out.ends_with(b"\n") {
         out.push(b'\n');
     }
-    let mut lines = vec![(TAB_LABEL.0.to_string(), TAB_LABEL.1.to_string()), (TAB_TOOLTIP.0.to_string(), TAB_TOOLTIP.1.to_string())];
-    for item in items() {
-        lines.push((item.text_key(""), item.label.clone()));
-        lines.push((item.text_key("_TIP"), item.tooltip.clone()));
-        lines.extend(item.options().into_iter().filter_map(|(k, t)| t.map(|t| (k, t))));
+    let mut lines: Vec<(String, String)> = Vec::new();
+    for tab in tabs() {
+        lines.push((tab.label.0.into(), tab.label.1.into()));
+        lines.push((tab.tooltip.0.into(), tab.tooltip.1.into()));
+        for item in &tab.items {
+            lines.push((item.text_key(""), item.label.clone()));
+            lines.push((item.text_key("_TIP"), item.tooltip.clone()));
+            lines.extend(item.options().into_iter().filter_map(|(k, t)| t.map(|t| (k, t))));
+        }
     }
+    lines.push(("PC_TROPHIES_OPEN".into(), "All Trophies".into()));
+    lines.push(("PC_TROPHIES_OPEN_TIP".into(), "Every trophy of the game, with what it asks for.".into()));
+    lines.push(("PC_TROPHIES_HEADING".into(), "TROPHIES".into()));
+    for (key, name, heading, detail) in trophy_rows() {
+        lines.push((key.clone(), name));
+        lines.push((format!("{key}_SUB"), heading));
+        lines.push((format!("{key}_TIP"), detail));
+    }
+    let mut seen = std::collections::HashSet::new();
+    lines.retain(|(k, _)| seen.insert(k.clone()));
     for (k, v) in lines {
         out.extend_from_slice(format!("{k}:{:X}={v}\n", cgpr::fnv1a(k.as_bytes())).as_bytes());
     }

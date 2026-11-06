@@ -266,3 +266,11 @@ pub fn unlocked(id: u32) -> bool {
 pub fn take_news() -> Vec<u32> {
     STATE.lock().as_mut().map(|s| std::mem::take(&mut s.news)).unwrap_or_default()
 }
+
+/// The trophies of a grade (P, G, S, B): (unlocked, all).
+pub fn count(grade: char) -> (u32, u32) {
+    let g = STATE.lock();
+    let Some(s) = g.as_ref() else { return (0, 0) };
+    let of: Vec<&Trophy> = s.trophies.iter().filter(|t| t.grade == grade).collect();
+    (of.iter().filter(|t| s.unlocked.contains_key(&t.id)).count() as u32, of.len() as u32)
+}
