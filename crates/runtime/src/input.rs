@@ -1,6 +1,7 @@
-//! Host input aggregation for the PS5 pad: an XInput controller (its own
-//! fixed mapping), the output window's keyboard and mouse in a Dark Souls
-//! III-style PC layout, and a scripted timeline for reproducible runs.
+//! Host input aggregation for the PS5 pad: an XInput controller (each button
+//! on the PS5 pad's button in its place unless the layout remaps it), the
+//! output window's keyboard and mouse in a Dark Souls III-style PC layout, and
+//! a scripted timeline for reproducible runs.
 //!
 //! Keyboard and mouse (`Layout`, window focused): the layout is read from
 //! local-data/controls.txt, written with the defaults (`DEFAULT_LAYOUT`) on
@@ -41,6 +42,41 @@ pub const BTN_CIRCLE: u32 = 0x2000;
 pub const BTN_CROSS: u32 = 0x4000;
 pub const BTN_SQUARE: u32 = 0x8000;
 pub const BTN_TOUCHPAD: u32 = 0x100000;
+
+/// The pad's buttons as XInput reports them (an Xbox controller's names): the layout file's
+/// name (`PadA = cross`), the menu's, and the XInput button bit (0: a trigger).
+pub const PAD_BUTTONS: &[(&str, &str, u16)] = &[
+    ("PadA", "A", 0x1000),
+    ("PadB", "B", 0x2000),
+    ("PadX", "X", 0x4000),
+    ("PadY", "Y", 0x8000),
+    ("PadLB", "LB", 0x0100),
+    ("PadRB", "RB", 0x0200),
+    ("PadLT", "LT", 0),
+    ("PadRT", "RT", 0),
+    ("PadLS", "LS", 0x0040),
+    ("PadRS", "RS", 0x0080),
+    ("PadView", "View", 0x0020),
+    ("PadMenu", "Menu", 0x0010),
+    ("PadUp", "D-pad Up", 0x0001),
+    ("PadDown", "D-pad Down", 0x0002),
+    ("PadLeft", "D-pad Left", 0x0004),
+    ("PadRight", "D-pad Right", 0x0008),
+];
+pub const PAD_LT: usize = 6;
+pub const PAD_RT: usize = 7;
+/// Each pad button's target unless the layout remaps it: the PS5 pad's button in its place.
+pub const PAD_DEFAULT: [u32; 16] = [BTN_CROSS, BTN_CIRCLE, BTN_SQUARE, BTN_TRIANGLE, BTN_L1, BTN_R1, BTN_L2, BTN_R2, BTN_L3, BTN_R3, BTN_TOUCHPAD, BTN_OPTIONS, BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT];
+
+/// A button target's bit (`cross`, `up`, ...; None for stick directions and unknown names).
+pub fn button_bit(target: &str) -> Option<u32> {
+    parse_name(target)?.ok()
+}
+
+/// A pad button's place in `PAD_BUTTONS` by its layout file name.
+fn pad_index(name: &str) -> Option<usize> {
+    PAD_BUTTONS.iter().position(|(n, _, _)| n.eq_ignore_ascii_case(name.trim()))
+}
 
 /// Pad state in DS4 terms (sticks 0..255, centre 0x80; y grows downwards).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,6 +316,14 @@ fn axis(v: i16, invert: bool) -> u8 {
 
 /// An XInput pad answered the last poll.
 static PAD_CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Pad buttons held back from the game until released (held when a controller binding was
+/// captured: `swallow_pad`).
+static PAD_SWALLOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Holds the pad buttons `bits` (bit i: PAD_BUTTONS[i]) back from the game until each is released.
+pub fn swallow_pad(bits: u32) {
+    PAD_SWALLOW.fetch_or(bits, Relaxed);
+}
 
 pub fn pad_connected() -> bool {
     PAD_CONNECTED.load(Relaxed)
@@ -295,29 +339,39 @@ fn xinput(st: &mut PadState) {
     if g.wButtons != 0 || g.bLeftTrigger > 40 || g.bRightTrigger > 40 || stick(g.sThumbLX) || stick(g.sThumbLY) || stick(g.sThumbRX) || stick(g.sThumbRY) {
         note_device(DEVICE_PAD);
     }
-    let map = [
-        (0x0001, BTN_UP),
-        (0x0002, BTN_DOWN),
-        (0x0004, BTN_LEFT),
-        (0x0008, BTN_RIGHT),
-        (0x0010, BTN_OPTIONS),  // Start
-        (0x0020, BTN_TOUCHPAD), // Back
-        (0x0040, BTN_L3),
-        (0x0080, BTN_R3),
-        (0x0100, BTN_L1),
-        (0x0200, BTN_R1),
-        (0x1000, BTN_CROSS),
-        (0x2000, BTN_CIRCLE),
-        (0x4000, BTN_SQUARE),
-        (0x8000, BTN_TRIANGLE),
-    ];
-    for (x, p) in map {
-        if g.wButtons & x != 0 {
-            st.buttons |= p;
+    // The buttons held (bit i: PAD_BUTTONS[i]; a trigger past 30 of 255).
+    let mut phys = 0u32;
+    for (i, &(_, _, bit)) in PAD_BUTTONS.iter().enumerate() {
+        let down = match i {
+            PAD_LT => g.bLeftTrigger > 30,
+            PAD_RT => g.bRightTrigger > 30,
+            _ => g.wButtons & bit != 0,
+        };
+        if down {
+            phys |= 1 << i;
         }
     }
-    st.l2 = st.l2.max(g.bLeftTrigger);
-    st.r2 = st.r2.max(g.bRightTrigger);
+    // A controller binding being captured: the pad is the menu's alone (`pcsettings::bindings`);
+    // a button held when it ended reaches the game once released and pressed again.
+    if crate::pcsettings::bindings::pad_input(phys) {
+        return;
+    }
+    let swallowed = PAD_SWALLOW.load(Relaxed) & phys;
+    PAD_SWALLOW.store(swallowed, Relaxed);
+    let phys = phys & !swallowed;
+    let l = layout();
+    for (i, &t) in l.pad.iter().enumerate() {
+        // A trigger on its own target keeps its travel (below).
+        if phys & (1 << i) != 0 && !(i == PAD_LT && t == BTN_L2) && !(i == PAD_RT && t == BTN_R2) {
+            st.buttons |= t;
+        }
+    }
+    if l.pad[PAD_LT] == BTN_L2 && swallowed & (1 << PAD_LT) == 0 {
+        st.l2 = st.l2.max(g.bLeftTrigger);
+    }
+    if l.pad[PAD_RT] == BTN_R2 && swallowed & (1 << PAD_RT) == 0 {
+        st.r2 = st.r2.max(g.bRightTrigger);
+    }
     st.lx = axis(g.sThumbLX, false);
     st.ly = axis(g.sThumbLY, true);
     st.rx = axis(g.sThumbRX, false);
@@ -331,8 +385,9 @@ fn xinput(st: &mut PadState) {
 /// first start: Dark Souls III's PC defaults on the PS5 pad's buttons.
 pub const DEFAULT_LAYOUT: &str = "\
 # Keyboard and mouse layout of the Demon's Souls port (Dark Souls III-style PC
-# controls). An Xbox-style controller keeps its own mapping. Edit and restart;
-# delete this file to get the defaults back.
+# controls), and the controller's buttons where remapped. The menu's Key
+# Bindings and Controller Bindings write it; or edit it and restart; delete it
+# to get the defaults back.
 #
 # Lines: <input> = <pad target>. Inputs: key names (A..Z, 0..9, Space, Enter,
 # Esc, Tab, Backspace, Up, Down, Left, Right, Shift, LShift, RShift, Ctrl,
@@ -344,6 +399,9 @@ pub const DEFAULT_LAYOUT: &str = "\
 # options touchpad, up down left right (d-pad), ls_up ls_down ls_left
 # ls_right (left stick), rs_up rs_down rs_left rs_right (right stick, the
 # camera), walk (the left stick at walking tilt).
+# Controller buttons (an Xbox controller's names: PadA PadB PadX PadY PadLB
+# PadRB PadLT PadRT PadLS PadRS PadView PadMenu PadUp PadDown PadLeft
+# PadRight) take a button target each: PadA = cross is the default.
 # F1 releases the mouse cursor or takes it back.
 
 # Mouse look: 1 on, 0 off; raw (1: the mouse turns the camera by its counts,
@@ -436,6 +494,10 @@ struct Layout {
     /// through the stick (`mouse_look_raw`, default 1 since 2026-10-21, also
     /// for files written before; `DS_MOUSE_RAW` overrides).
     mouse_raw: bool,
+    /// Each pad button's target (`PAD_BUTTONS` order; `PAD_DEFAULT` unless remapped).
+    pad: [u32; 16],
+    /// The file has the pad's lines (they are written again; else only once remapped).
+    pad_lines: bool,
 }
 
 /// A key name's virtual-key code.
@@ -525,7 +587,7 @@ fn parse_dst(s: &str) -> Option<Dst> {
 }
 
 fn parse_layout(text: &str) -> Result<Layout, String> {
-    let mut l = Layout { binds: Vec::new(), comments: Vec::new(), mouse_look: true, sensitivity: 1.0, sensitivity_y: None, invert_y: false, mouse_raw: true };
+    let mut l = Layout { binds: Vec::new(), comments: Vec::new(), mouse_look: true, sensitivity: 1.0, sensitivity_y: None, invert_y: false, mouse_raw: true, pad: PAD_DEFAULT, pad_lines: false };
     for (i, full) in text.lines().enumerate() {
         let comment = full.find('#').map(|c| full[c..].trim_end().to_string());
         let line = full.split('#').next().unwrap_or("").trim();
@@ -543,6 +605,11 @@ fn parse_layout(text: &str) -> Result<Layout, String> {
             }
             "mouse_sensitivity_y" => {
                 l.sensitivity_y = Some(b.parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0).ok_or_else(|| format!("line {}: bad sensitivity '{b}'", i + 1))?);
+            }
+            _ if pad_index(a).is_some() => {
+                let Some(Dst::Button(t)) = parse_dst(b) else { return Err(format!("line {}: a controller button takes a button target, not '{b}'", i + 1)) };
+                l.pad[pad_index(a).unwrap()] = t;
+                l.pad_lines = true;
             }
             _ => {
                 let (src, mods) = parse_src(a).ok_or_else(|| format!("line {}: unknown input '{a}'", i + 1))?;
@@ -712,7 +779,7 @@ fn render(l: &Layout, text: &str) -> String {
         let body = line.split('#').next().unwrap_or("").trim();
         let is_binding = body.split_once('=').is_some_and(|(a, _)| {
             let a = a.trim();
-            parse_src(a).is_some() && !matches!(a.to_ascii_lowercase().as_str(), "mouse_look" | "mouse_invert_y" | "mouse_look_raw" | "mouse_sensitivity" | "mouse_sensitivity_y")
+            (parse_src(a).is_some() || pad_index(a).is_some()) && !matches!(a.to_ascii_lowercase().as_str(), "mouse_look" | "mouse_invert_y" | "mouse_look_raw" | "mouse_sensitivity" | "mouse_sensitivity_y")
         });
         if is_binding {
             break;
@@ -740,7 +807,47 @@ fn render(l: &Layout, text: &str) -> String {
             None => out += &format!("{line}\n"),
         }
     }
+    if l.pad_lines || l.pad != PAD_DEFAULT {
+        out += "\n# The controller's buttons (the menu's Controller Bindings).\n";
+        for (i, (name, _, _)) in PAD_BUTTONS.iter().enumerate() {
+            out += &format!("{name} = {}\n", target_name(Dst::Button(l.pad[i])));
+        }
+    }
     out
+}
+
+/// The pad button (`PAD_BUTTONS` index) on target `target` (a `BTN_*` bit), the first of them.
+pub fn pad_button_of(target: u32) -> Option<usize> {
+    layout().pad.iter().position(|&t| t == target)
+}
+
+/// Pad button `button`'s target now.
+pub fn pad_target(button: usize) -> u32 {
+    layout().pad.get(button).copied().unwrap_or(0)
+}
+
+/// Puts target `target` (a button: `cross`, `r1`, `up`, ...) on pad button `button`; that
+/// button's old target goes to the button `target` was on (they swap), so every target keeps a
+/// button. The file is written again.
+pub fn rebind_pad(target: &str, button: usize) -> Result<(), String> {
+    let Some(Dst::Button(t)) = parse_dst(target) else { return Err(format!("{target} is not a button")) };
+    if button >= PAD_BUTTONS.len() {
+        return Err(format!("no pad button {button}"));
+    }
+    let mut l = (*layout()).clone();
+    let prev = l.pad[button];
+    if prev == t {
+        return Ok(());
+    }
+    if let Some(mine) = l.pad.iter().position(|&x| x == t) {
+        l.pad[mine] = prev;
+    }
+    l.pad[button] = t;
+    l.pad_lines = true;
+    *LAYOUT.lock() = Some(std::sync::Arc::new(l.clone()));
+    LAYOUT_GEN.fetch_add(1, Relaxed);
+    crate::info!("input: {target} on the controller's {}", PAD_BUTTONS[button].1);
+    save(&l)
 }
 
 /// Keys and mouse buttons held by the control channel (`inject_hold`):
@@ -1167,6 +1274,22 @@ mod tests {
         assert_eq!(find(Src::Key(0x1B), 0), Some(Dst::Button(BTN_OPTIONS)));
         assert_eq!(find(Src::Key(b'W'), 0), Some(Dst::Stick(Stick::LUp)));
         assert_eq!(find(Src::WheelDown, MOD_SHIFT), Some(Dst::Button(BTN_LEFT)));
+    }
+
+    #[test]
+    fn pad_lines_parse_and_write_back() {
+        let text = format!("{DEFAULT_LAYOUT}\nPadA = circle\nPadB = cross\n");
+        let l = parse_layout(&text).unwrap();
+        assert_eq!(l.pad[0], BTN_CIRCLE);
+        assert_eq!(l.pad[1], BTN_CROSS);
+        assert_eq!(l.pad[2], BTN_SQUARE);
+        assert!(l.pad_lines);
+        let out = render(&l, &text);
+        assert!(out.contains("PadA = circle\nPadB = cross\nPadX = square\n"), "{out}");
+        let again = parse_layout(&out).unwrap();
+        assert_eq!(again.pad, l.pad);
+        assert_eq!(render(&again, &out), out);
+        assert!(parse_layout("PadA = ls_up").is_err());
     }
 
     #[test]

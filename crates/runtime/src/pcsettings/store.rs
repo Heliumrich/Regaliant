@@ -49,6 +49,8 @@ pub enum Live {
     Prompts(u8),
     /// A key binding's row: the option of an action's input (`bindings`); a change rebinds.
     Binding(u16),
+    /// A controller binding's row: the option of the pad button on an action (`bindings`).
+    PadBinding(u16),
 }
 
 struct Store {
@@ -120,6 +122,7 @@ pub fn get(hash: u32) -> Option<u32> {
         Some(Live::PopupTitle) => return Some(super::cgpr::fnv1a(super::popup::TITLE_KEY.as_bytes())),
         Some(Live::Prompts(w)) => return Some(super::prompts::shown_setting(w)),
         Some(Live::Binding(a)) => return Some(super::bindings::index_of(a as usize)),
+        Some(Live::PadBinding(a)) => return Some(super::bindings::pad_index_of(a as usize)),
         None => {}
     }
     Some(s.values.get(&hash).copied().unwrap_or(d.default))
@@ -138,6 +141,11 @@ fn set(hash: u32, bits: u32) -> bool {
         // A key binding: the layout changes (the value is the layout's).
         drop(g);
         super::bindings::set(a as usize, bits);
+        return true;
+    }
+    if let Some(Live::PadBinding(a)) = d.live {
+        drop(g);
+        super::bindings::pad_set(a as usize, bits);
         return true;
     }
     if d.live.is_some() {

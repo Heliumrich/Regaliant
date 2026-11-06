@@ -56,24 +56,37 @@ const PS: &[(&str, &str)] = &[
     ("ButtonIcon_TouchPad_SwipeRight", "touchpad"),
 ];
 
-/// The Xbox glyph of a target (the pad layer's map: A cross, B circle, X square, Y triangle,
-/// Back the touch pad, Start options); None: the title's own glyph (sticks, d-pad, share).
+/// Per pad button (`input::PAD_BUTTONS`): its Xbox glyph (None: the d-pad, drawn with the
+/// title's own) and the title's glyph of the PS5 pad's button in its place.
+const PAD_GLYPHS: [(Option<&str>, &str); 16] = [
+    (Some("xb_a"), "ButtonIcon_X"),
+    (Some("xb_b"), "ButtonIcon_Circle"),
+    (Some("xb_x"), "ButtonIcon_Square"),
+    (Some("xb_y"), "ButtonIcon_Triangle"),
+    (Some("xb_lb"), "ButtonIcon_L1"),
+    (Some("xb_rb"), "ButtonIcon_R1"),
+    (Some("xb_lt"), "ButtonIcon_L2"),
+    (Some("xb_rt"), "ButtonIcon_R2"),
+    (Some("xb_ls"), "ButtonIcon_L3"),
+    (Some("xb_rs"), "ButtonIcon_R3"),
+    (Some("xb_view"), "ButtonIcon_TouchPad"),
+    (Some("xb_menu"), "ButtonIcon_Options"),
+    (None, "ButtonIcon_Dpad_U"),
+    (None, "ButtonIcon_Dpad_D"),
+    (None, "ButtonIcon_Dpad_L"),
+    (None, "ButtonIcon_Dpad_R"),
+];
+
+/// The pad button on a target (the layout's controller map: A on cross, B on circle, ...,
+/// unless remapped); None for sticks, d-pad pairs and share.
+fn pad_button(target: &str) -> Option<usize> {
+    input::pad_button_of(input::button_bit(target)?)
+}
+
+/// The Xbox glyph of a target: the pad button on it (None: the title's own glyph: sticks, a
+/// d-pad button, share).
 fn xbox_id(target: &str) -> Option<&'static str> {
-    Some(match target {
-        "cross" => "xb_a",
-        "circle" => "xb_b",
-        "square" => "xb_x",
-        "triangle" => "xb_y",
-        "l1" => "xb_lb",
-        "r1" => "xb_rb",
-        "l2" => "xb_lt",
-        "r2" => "xb_rt",
-        "l3" => "xb_ls",
-        "r3" => "xb_rs",
-        "options" => "xb_menu",
-        "touchpad" => "xb_view",
-        _ => return None,
-    })
+    PAD_GLYPHS[pad_button(target)?].0
 }
 
 /// What a glyph shows.
@@ -334,10 +347,11 @@ fn shown() -> u8 {
     }
 }
 
-/// Per title glyph hash: the hashes of its keyboard and Xbox stand-ins (0: keep); made again
-/// when the layout changes (a rebinding in the menu).
-fn remaps() -> std::sync::Arc<Vec<(u32, u32, u32)>> {
-    static R: parking_lot::Mutex<Option<(u32, std::sync::Arc<Vec<(u32, u32, u32)>>)>> = parking_lot::Mutex::new(None);
+/// Per title glyph hash: the hashes of its keyboard, Xbox and PlayStation stand-ins (0: keep;
+/// the PlayStation one where the controller's buttons are remapped: the PS5 pad's button in the
+/// place of the one on the target); made again when the layout changes (a rebinding in the menu).
+fn remaps() -> std::sync::Arc<Vec<(u32, u32, u32, u32)>> {
+    static R: parking_lot::Mutex<Option<(u32, std::sync::Arc<Vec<(u32, u32, u32, u32)>>)>> = parking_lot::Mutex::new(None);
     let generation = input::layout_gen();
     let mut g = R.lock();
     if let Some((at, v)) = g.as_ref() {
@@ -347,12 +361,20 @@ fn remaps() -> std::sync::Arc<Vec<(u32, u32, u32)>> {
     }
     let s = set();
     let keyboard = if generation == 0 { s.keyboard.clone() } else { keyboard_map(None) };
-    let v: Vec<(u32, u32, u32)> = PS
+    let v: Vec<(u32, u32, u32, u32)> = PS
         .iter()
         .map(|&(name, target)| {
             let kb = keyboard.get(target).map(|id| name_hash(&entity_name(id))).unwrap_or(0);
-            let xb = xbox_id(target).map(|id| name_hash(&entity_name(id))).unwrap_or(0);
-            (name_hash(name), kb, xb)
+            let (xb, ps) = match pad_button(target) {
+                Some(p) => {
+                    let (xb_id, ps_name) = PAD_GLYPHS[p];
+                    // The title's own glyph where it already is the one (its d-pad, its button).
+                    let own = |n: &str| if n == name || (name.starts_with("ButtonIcon_TouchPad") && n == "ButtonIcon_TouchPad") { 0 } else { name_hash(n) };
+                    (xb_id.map(|id| name_hash(&entity_name(id))).unwrap_or_else(|| own(ps_name)), own(ps_name))
+                }
+                None => (0, 0),
+            };
+            (name_hash(name), kb, xb, ps)
         })
         .collect();
     let v = std::sync::Arc::new(v);
@@ -366,12 +388,13 @@ fn remaps() -> std::sync::Arc<Vec<(u32, u32, u32)>> {
 pub extern "sysv64" fn glyph_hook(regs: *const u64, _arg: u32) {
     let regs = regs as *mut u64;
     let shown = shown();
-    if shown == 1 {
-        return;
-    }
     let h = unsafe { *regs.add(15) } as u32;
-    if let Some(&(_, kb, xb)) = remaps().iter().find(|r| r.0 == h) {
-        let to = if shown == 3 { kb } else { xb };
+    if let Some(&(_, kb, xb, ps)) = remaps().iter().find(|r| r.0 == h) {
+        let to = match shown {
+            1 => ps,
+            3 => kb,
+            _ => xb,
+        };
         if to != 0 {
             unsafe { *regs.add(15) = (*regs.add(15) & !0xFFFF_FFFF) | to as u64 };
         }

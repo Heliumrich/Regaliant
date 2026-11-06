@@ -52,6 +52,8 @@ pub enum ItemKind {
     Count(char, u32),
     /// An action's key binding (`bindings`): every input as an option (live; a change rebinds).
     Binding(u16),
+    /// An action's controller button (`bindings`): the pad buttons as options (live).
+    PadBinding(u16),
 }
 
 impl Item {
@@ -75,6 +77,7 @@ impl Item {
                 .map(|(n, i)| (format!("PC_INPUT_{n}"), Some(bindings::label(*i))))
                 .chain(std::iter::once(("PC_INPUT_PRESS".to_string(), Some("Press a key".to_string()))))
                 .collect(),
+            ItemKind::PadBinding(_) => bindings::pad_options().into_iter().enumerate().map(|(n, label)| (format!("PC_PAD_{n}"), Some(label))).collect(),
         }
     }
     fn def(&self) -> store::Def {
@@ -85,6 +88,7 @@ impl Item {
             ItemKind::Status(id) => (store::Kind::Int, 0, Some(store::Live::Trophy(*id))),
             ItemKind::Count(g, _) => (store::Kind::Int, 0, Some(store::Live::Count(*g))),
             ItemKind::Binding(a) => (store::Kind::Int, 0, Some(store::Live::Binding(*a))),
+            ItemKind::PadBinding(a) => (store::Kind::Int, 0, Some(store::Live::PadBinding(*a))),
         };
         store::Def { name: self.key(), kind, default, live }
     }
@@ -240,6 +244,7 @@ fn trophy_rows() -> Vec<(String, String, String, String)> {
 pub fn init(path: std::path::PathBuf) {
     let mut defs: Vec<store::Def> = tabs().iter().flat_map(|t| t.items.iter().map(Item::def)).collect();
     defs.extend(binding_items().iter().map(Item::def));
+    defs.extend(pad_binding_items().iter().map(Item::def));
     // The achievement pop-up's (`popup`, `hud`).
     defs.push(store::Def { name: popup::SETTING.into(), kind: store::Kind::Int, default: 0, live: Some(store::Live::Popup) });
     defs.push(store::Def { name: popup::NAME_SETTING.into(), kind: store::Kind::Int, default: 0, live: Some(store::Live::PopupName) });
@@ -410,6 +415,7 @@ fn edit_data_source(p: &mut Payload, item: &Item) -> Result<(), String> {
         ItemKind::Status(_) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(1))),
         ItemKind::Count(_, all) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(*all))),
         ItemKind::Binding(_) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(bindings::capture_option()))),
+        ItemKind::PadBinding(_) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(bindings::pad_capture_option()))),
         ItemKind::Choice(opts, d) => {
             let n = opts.len().max(1) as u32;
             (raw_u32(*d), Some(raw_u32(0)), Some(raw_u32(n - 1)))
@@ -622,6 +628,32 @@ fn set_float(p: &mut Payload, field: u32, v: f32) -> Result<(), String> {
     Ok(())
 }
 
+/// The controller binding rows (`bindings::PAD_ACTIONS`).
+fn pad_binding_items() -> Vec<Item> {
+    bindings::PAD_ACTIONS
+        .iter()
+        .enumerate()
+        .map(|(n, (_, name))| Item {
+            id: format!("PadBind{n}"),
+            label: name.to_string(),
+            tooltip: "Press A (or Enter, or click) and then the controller button for this action; Esc cancels. Left and Right go through the buttons one by one. The button's old action goes to this action's old button.".into(),
+            kind: ItemKind::PadBinding(n as u16),
+        })
+        .collect()
+}
+
+/// A bindings list's names: its screen, the PC tab's item that opens it and their text keys.
+struct ListNames {
+    screen: &'static str,
+    opener: &'static str,
+    open_key: &'static str,
+    tip_key: &'static str,
+    heading_key: &'static str,
+}
+
+const KEY_LIST: ListNames = ListNames { screen: "PCKeyBindings", opener: "PC_BindingsOpen", open_key: "PC_BINDINGS_OPEN", tip_key: "PC_BINDINGS_OPEN_TIP", heading_key: "PC_BINDINGS_HEADING" };
+const PAD_LIST: ListNames = ListNames { screen: "PCPadBindings", opener: "PC_PadBindingsOpen", open_key: "PC_PADBIND_OPEN", tip_key: "PC_PADBIND_OPEN_TIP", heading_key: "PC_PADBIND_HEADING" };
+
 /// The key binding rows (`bindings::ACTIONS`).
 fn binding_items() -> Vec<Item> {
     bindings::ACTIONS
@@ -636,9 +668,9 @@ fn binding_items() -> Vec<Item> {
         .collect()
 }
 
-/// The key bindings list: the title's HELP screen copied with the GAME page's item that opens it
-/// (as the trophy list), its rows the binding items built from the PC page's choice template.
-fn bindings_browser(f: &mut cgpr::File, choice: &cgpr::Entity, items: &[Item]) -> Result<cgpr::Entity, String> {
+/// A bindings list: the title's HELP screen copied with the GAME page's item that opens it (as
+/// the trophy list), its rows the binding items built from the PC page's choice template.
+fn bindings_browser(f: &mut cgpr::File, choice: &cgpr::Entity, names: &ListNames, items: &[Item]) -> Result<cgpr::Entity, String> {
     let help_i = f.roots.iter().position(|r| r.name == b"HelpMenu").ok_or("no HELP screen")?;
     let pages_ri = f.roots.iter().position(|r| r.path_to("SettingsPages").is_some()).ok_or("no SettingsPages")?;
     let pages_path = f.roots[pages_ri].path_to("SettingsPages").unwrap();
@@ -657,18 +689,18 @@ fn bindings_browser(f: &mut cgpr::File, choice: &cgpr::Entity, items: &[Item]) -
     let mut opener_path = game_path.clone();
     opener_path.extend(opener_rel);
     let repl = vec![
-        (b"SETTINGS_ENTRY_HELP_MENU".to_vec(), b"PC_BINDINGS_OPEN".to_vec()),
-        (b"SETTINGS_TOOLTIP_ACCESSIBILITY_HELP_MENU".to_vec(), b"PC_BINDINGS_OPEN_TIP".to_vec()),
-        (b"HelpMenu".to_vec(), b"PCKeyBindings".to_vec()),
-        (b"HelpMenuRoot".to_vec(), b"PCKeyBindingsRoot".to_vec()),
-        (b"HELP_MENU_HEADING_MAIN".to_vec(), b"PC_BINDINGS_HEADING".to_vec()),
+        (b"SETTINGS_ENTRY_HELP_MENU".to_vec(), names.open_key.as_bytes().to_vec()),
+        (b"SETTINGS_TOOLTIP_ACCESSIBILITY_HELP_MENU".to_vec(), names.tip_key.as_bytes().to_vec()),
+        (b"HelpMenu".to_vec(), names.screen.as_bytes().to_vec()),
+        (b"HelpMenuRoot".to_vec(), format!("{}Root", names.screen).into_bytes()),
+        (b"HELP_MENU_HEADING_MAIN".to_vec(), names.heading_key.as_bytes().to_vec()),
     ];
-    let salt = cgpr::salt("PCKeyBindings");
+    let salt = cgpr::salt(names.screen);
     let mut copies = cgpr::clone_group(&mut f.comps, &[f.roots[pages_ri].at(&opener_path), &f.roots[help_i]], &repl, &salt);
     let mut screen = copies.pop().unwrap();
     let mut opener = copies.pop().unwrap();
-    opener.name = b"PC_BindingsOpen".to_vec();
-    screen.name = b"PCKeyBindings".to_vec();
+    opener.name = names.opener.as_bytes().to_vec();
+    screen.name = names.screen.as_bytes().to_vec();
     let mc_rel = screen.path_to("MenuContents").ok_or("no list")?;
     // A settings item fits its content, its width given by a settings page (100 alone, its value
     // column then left of the list): the binding rows get the list's width in their Element.
@@ -704,7 +736,7 @@ fn bindings_browser(f: &mut cgpr::File, choice: &cgpr::Entity, items: &[Item]) -
         let (last, parent) = path.split_last().unwrap();
         screen.at_mut(parent).kids.remove(*last);
     }
-    crate::info!("pc settings: key bindings list with {} rows (the HELP screen's layout)", items.len());
+    crate::info!("pc settings: {} list with {} rows (the HELP screen's layout)", names.screen, items.len());
     f.roots.push(screen);
     Ok(opener)
 }
@@ -768,7 +800,7 @@ fn start_menu(orig: &[u8]) -> Result<Vec<u8>, String> {
         let mut kids = Vec::new();
         for item in &tab.items {
             let (ti, t) = match item.kind {
-                ItemKind::Toggle(_) | ItemKind::Choice(..) | ItemKind::Status(_) | ItemKind::Count(..) | ItemKind::Binding(_) => (ti_choice, &CHOICE),
+                ItemKind::Toggle(_) | ItemKind::Choice(..) | ItemKind::Status(_) | ItemKind::Count(..) | ItemKind::Binding(_) | ItemKind::PadBinding(_) => (ti_choice, &CHOICE),
                 ItemKind::Slider { .. } => (ti_slider, &SLIDER),
             };
             let tpl = f.roots[ri].at(&page_path).at(&contents_rel).kids[ti].clone();
@@ -777,9 +809,11 @@ fn start_menu(orig: &[u8]) -> Result<Vec<u8>, String> {
         page.at_mut(&contents_rel).kids = kids;
         if tab.id == "PCTab" {
             let tpl = f.roots[ri].at(&page_path).at(&contents_rel).kids[ti_choice].clone();
-            match bindings_browser(&mut f, &tpl, &binding_items()) {
-                Ok(opener) => page.at_mut(&contents_rel).kids.push(opener),
-                Err(e) => crate::warn!("pc settings: no key bindings list ({e})"),
+            for (names, items) in [(&KEY_LIST, binding_items()), (&PAD_LIST, pad_binding_items())] {
+                match bindings_browser(&mut f, &tpl, names, &items) {
+                    Ok(opener) => page.at_mut(&contents_rel).kids.push(opener),
+                    Err(e) => crate::warn!("pc settings: no {} list ({e})", names.screen),
+                }
             }
         }
         if tab.id == "PCTrophies" {
@@ -861,6 +895,14 @@ fn text(orig: &[u8]) -> Vec<u8> {
         lines.push((format!("PC_INPUT_{n}"), bindings::label(*i)));
     }
     lines.push(("PC_INPUT_PRESS".into(), "Press a key".into()));
+    lines.push((PAD_LIST.open_key.into(), "Controller Bindings".into()));
+    lines.push((PAD_LIST.tip_key.into(), "The controller's buttons for every action.".into()));
+    lines.push((PAD_LIST.heading_key.into(), "CONTROLLER BINDINGS".into()));
+    for item in pad_binding_items() {
+        lines.push((item.text_key(""), item.label.clone()));
+        lines.push((item.text_key("_TIP"), item.tooltip.clone()));
+        lines.extend(item.options().into_iter().filter_map(|(k, t)| t.map(|t| (k, t))));
+    }
     lines.push(("PC_TROPHIES_OPEN".into(), "All Trophies".into()));
     lines.push(("PC_TROPHIES_OPEN_TIP".into(), "Every trophy of the game, with what it asks for.".into()));
     lines.push(("PC_TROPHIES_HEADING".into(), "TROPHIES".into()));
