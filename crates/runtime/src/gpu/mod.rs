@@ -189,7 +189,7 @@ pub mod tune {
         Tunable { name: "buffer_delta", env: "DS_BUFFER_DELTA", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lod_cs", env: "DS_LOD_CS", default: 8, value: AtomicU64::new(UNSET) },
         Tunable { name: "tr_ballast", env: "DS_TR_BALLAST", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "lod_early", env: "DS_LOD_EARLY", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fmt_single", env: "DS_FMT_SINGLE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1614,13 +1614,13 @@ pub mod tune {
         get(157)
     }
 
-    /// Pixel programs whose depth tests run before the shader take their
-    /// LOD statistics in rotation too (N >= 2: one counted draw in N
-    /// measures, `shaders::lod_rotated`; 0 every draw, as before). Read when
-    /// a pixel stage is prepared and at every draw.
+    /// Compute stages specialize a formatted buffer to the one format and
+    /// swizzle its program and resource have seen (`shaders::single_format`)
+    /// instead of decoding it when the program runs (`FORMAT_RT`). Read when
+    /// a compute stage is prepared.
     #[inline]
-    pub fn lod_early() -> u64 {
-        get(158)
+    pub fn fmt_single() -> bool {
+        get(158) != 0
     }
 
     /// Pixel programs that write no memory run their depth and stencil

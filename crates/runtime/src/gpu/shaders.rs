@@ -179,19 +179,7 @@ fn late_stats(measure: bool) -> bool {
 /// them).
 pub fn lod_rotated(p: &Prepared) -> bool {
     let s = &p.tr.spec;
-    s.stage == Stage::Fragment && !s.lod_stats && !s.batched && if s.early_tests || s.early_ok { lod_early_rotation() } else { lod_per_draw() }
-}
-
-/// Whether pixel programs whose depth tests run before the shader take
-/// their LOD statistics in rotation (`tune lod_early` >= 2).
-pub fn lod_early_rotation() -> bool {
-    matches!(super::tune::lod_stats(), 3 | 4) && super::tune::lod_early() >= 2
-}
-
-/// Whether `p` is a pixel stage with early depth tests (its rotation period
-/// is `tune lod_early`'s, `lodstats::rotate_early`).
-pub fn early_stage(p: &Prepared) -> bool {
-    p.tr.spec.early_tests || p.tr.spec.early_ok
+    s.stage == Stage::Fragment && !s.lod_stats && !s.batched && !s.early_tests && !s.early_ok && lod_per_draw()
 }
 
 /// Whether compute programs' LOD statistics are decided per dispatch
@@ -1220,6 +1208,53 @@ pub fn reset_prep_parts() {
 }
 
 /// The profile lines of `PREP_PARTS` ("" before any).
+/// The format and swizzle each (program code, resource) read through the
+/// run-time decode has seen (`tune fmt_single`): `FMT_MULTI` once it saw two.
+static FMT_SEEN: parking_lot::RwLock<Option<HashMap<(u64, usize), u32>>> = parking_lot::RwLock::new(None);
+const FMT_MULTI: u32 = u32::MAX;
+
+thread_local! {
+    /// This thread's view of `FMT_SEEN` (a pair it saw two formats for, or
+    /// one the shared map names so).
+    static FMT_LOCAL: std::cell::RefCell<HashMap<(u64, usize), u32>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Whether resource `res` of the program with code `code` can be specialized
+/// to `format` and `dst_sel`: the first pair seen for it, or the same as
+/// before; a different one makes it run-time from now on (every thread). A
+/// specialized translation is used only for V#s of its own format.
+fn single_format(code: u64, res: usize, format: u8, dst_sel: u16) -> bool {
+    let want = (format as u32) << 16 | dst_sel as u32;
+    let key = (code, res);
+    let local = FMT_LOCAL.with(|l| l.borrow().get(&key).copied());
+    let seen = match local {
+        Some(v) => v,
+        None => {
+            let shared = FMT_SEEN.read().as_ref().and_then(|m| m.get(&key).copied());
+            let v = match shared {
+                Some(v) => v,
+                None => *FMT_SEEN.write().get_or_insert_with(HashMap::new).entry(key).or_insert(want),
+            };
+            FMT_LOCAL.with(|l| l.borrow_mut().insert(key, v));
+            v
+        }
+    };
+    if seen == want {
+        return true;
+    }
+    if seen != FMT_MULTI {
+        // Another format: run-time for every thread from now on.
+        let shared = *FMT_SEEN.write().get_or_insert_with(HashMap::new).entry(key).and_modify(|v| {
+            if *v != want {
+                *v = FMT_MULTI;
+            }
+        }).or_insert(FMT_MULTI);
+        FMT_LOCAL.with(|l| l.borrow_mut().insert(key, shared));
+        return shared == want;
+    }
+    false
+}
+
 /// `DS_FMT_CENSUS=1` (diagnosis): the formats and swizzles compute stages
 /// read through `FORMAT_RT`, per (program code, resource): [(format,
 /// dst_sel) -> preparations], with the program's address.
@@ -1700,12 +1735,6 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
     // lod_late`): in rotation only for a draw measuring (`with_lod_stats`)
     // or batched; none at 0 (diagnosis).
     if spec.lod_stats && !spec.early_tests && !spec.early_ok && !late_stats(spec.batched || LOD_MEASURE.with(|c| c.get())) {
-        spec.lod_stats = false;
-        spec.lod_lean = false;
-    }
-    // Where the tests run before the shader (`tune lod_early`): in rotation
-    // too, for a draw measuring or batched.
-    if spec.lod_stats && (spec.early_tests || spec.early_ok) && lod_early_rotation() && !(spec.batched || LOD_MEASURE.with(|c| c.get())) {
         spec.lod_stats = false;
         spec.lod_lean = false;
     }
@@ -2936,7 +2965,11 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
                     if fmt_census_on() {
                         fmt_census_note(code_hash, addr, i, v.format as u16, v.dst_sel as u16);
                     }
-                    (translate::FORMAT_RT, 0)
+                    if super::tune::fmt_single() && single_format(code_hash, i, v.format as u8, v.dst_sel as u16) {
+                        (v.format, v.dst_sel)
+                    } else {
+                        (translate::FORMAT_RT, 0)
+                    }
                 } else {
                     (v.format, v.dst_sel)
                 };
