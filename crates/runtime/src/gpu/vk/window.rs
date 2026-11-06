@@ -20,6 +20,11 @@
 //! screen's PC tab, Window Mode, which Alt+Enter updates); neither reaches the game
 //! as a key. `DS_WINDOW_BEHIND=1` (test runs on a shared desktop): shown
 //! without activation at the bottom of the z-order, fullscreen too.
+//!
+//! Menu pointer (`pcsettings::pointer`): while a menu is open with the keyboard
+//! and mouse in use, the cursor is free and shows the port's arrow; its client
+//! position, clicks and wheel go to the pointer instead of the layout's mouse
+//! bindings.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
@@ -75,6 +80,116 @@ const WM_DS_MODE: u32 = WM_APP + 1;
 static BEHIND: AtomicBool = AtomicBool::new(false);
 /// Asks the UI thread for a client size (wParam width, lParam height).
 const WM_DS_SIZE: u32 = WM_APP + 2;
+/// The menu pointer turned on or off (`pointer_mode_changed`).
+const WM_DS_POINTER: u32 = WM_APP + 3;
+
+/// The menu pointer's cursor (made on the UI thread when first shown).
+static POINTER_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn pointer_on() -> bool {
+    crate::pcsettings::pointer::ACTIVE.load(Ordering::Relaxed)
+}
+
+/// From any thread: the menu pointer turned on or off (the cursor is freed or taken back).
+pub fn pointer_mode_changed() {
+    if let Some(w) = WINDOW.get() {
+        unsafe { PostMessageW(w.hwnd as HWND, WM_DS_POINTER, 0, 0) };
+    }
+}
+
+/// The pointer's pixels (n x n, premultiplied, grey: any channel order): an arrow in the game's
+/// glyph colours (white, a dark outline), its tip at (n/24, n/24).
+pub fn pointer_pixels(n: usize) -> Vec<u8> {
+    // The arrow on a 16-unit grid, its tip at (1, 1).
+    let pts: [(f32, f32); 7] = [(1.0, 1.0), (1.0, 15.5), (4.6, 12.2), (7.4, 17.8), (9.9, 16.8), (7.2, 11.3), (12.0, 11.3)];
+    let inside = |x: f32, y: f32| {
+        let mut c = false;
+        let mut j = pts.len() - 1;
+        for i in 0..pts.len() {
+            let (xi, yi) = pts[i];
+            let (xj, yj) = pts[j];
+            if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+                c = !c;
+            }
+            j = i;
+        }
+        c
+    };
+    let dist = |x: f32, y: f32| {
+        let mut d = f32::MAX;
+        for i in 0..pts.len() {
+            let (ax, ay) = pts[i];
+            let (bx, by) = pts[(i + 1) % pts.len()];
+            let (dx, dy) = (bx - ax, by - ay);
+            let t = (((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+            d = d.min(((ax + t * dx - x).powi(2) + (ay + t * dy - y).powi(2)).sqrt());
+        }
+        d
+    };
+    let unit = n as f32 / 24.0; // the 16-unit arrow in two thirds of the cursor
+    let mut px = vec![0u8; n * n * 4];
+    for y in 0..n {
+        for x in 0..n {
+            let (mut white, mut dark) = (0u32, 0u32);
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let (u, v) = ((x as f32 + (sx as f32 + 0.5) / 4.0) / unit, (y as f32 + (sy as f32 + 0.5) / 4.0) / unit);
+                    if inside(u, v) && dist(u, v) > 0.9 {
+                        white += 1;
+                    } else if inside(u, v) || dist(u, v) <= 0.7 {
+                        dark += 1;
+                    }
+                }
+            }
+            let a = (white + dark) as f32 / 16.0;
+            let c = if white + dark == 0 { 0.0 } else { white as f32 / (white + dark) as f32 * 0.94 + 0.05 };
+            let o = (y * n + x) * 4;
+            let v = (c * a * 255.0 + 0.5) as u8;
+            px[o..o + 4].copy_from_slice(&[v, v, v, (a * 255.0 + 0.5) as u8]);
+        }
+    }
+    px
+}
+
+/// The pointer's cursor: an arrow in the game's glyph colours (white, a dark outline), its
+/// size the system cursor's at the window's DPI.
+unsafe fn pointer_cursor(hwnd: HWND) -> HCURSOR {
+    let have = POINTER_CURSOR.load(Ordering::Relaxed);
+    if have != 0 {
+        return have as HCURSOR;
+    }
+    use windows_sys::Win32::Graphics::Gdi::*;
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let n = ((32 * dpi + 48) / 96).clamp(32, 128) as usize;
+    let px = pointer_pixels(n);
+    let unit = n as f32 / 24.0;
+    unsafe {
+        let mut bmi: BITMAPINFO = std::mem::zeroed();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = n as i32;
+        bmi.bmiHeader.biHeight = -(n as i32);
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let color = CreateDIBSection(std::ptr::null_mut(), &bmi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+        let mask = CreateBitmap(n as i32, n as i32, 1, 1, std::ptr::null());
+        if color.is_null() || bits.is_null() || mask.is_null() {
+            return LoadCursorW(std::ptr::null_mut(), IDC_ARROW);
+        }
+        std::ptr::copy_nonoverlapping(px.as_ptr(), bits as *mut u8, px.len());
+        let hot = (unit * 1.0) as u32;
+        let ii = ICONINFO { fIcon: 0, xHotspot: hot, yHotspot: hot, hbmMask: mask, hbmColor: color };
+        let cur = CreateIconIndirect(&ii);
+        DeleteObject(color as HGDIOBJ);
+        DeleteObject(mask as HGDIOBJ);
+        if cur.is_null() {
+            return LoadCursorW(std::ptr::null_mut(), IDC_ARROW);
+        }
+        POINTER_CURSOR.store(cur as usize, Ordering::Relaxed);
+        cur as HCURSOR
+    }
+}
 
 pub fn get() -> Option<&'static Window> {
     WINDOW.get()
@@ -114,7 +229,7 @@ fn set_key(wp: WPARAM, lp: LPARAM, down: bool) {
 /// (held at the client area's centre: Raw Input keeps reporting motion),
 /// else releases it.
 unsafe fn update_capture(hwnd: HWND) {
-    if FOCUSED.load(Ordering::Relaxed) && CAPTURE_WANTED.load(Ordering::Relaxed) {
+    if FOCUSED.load(Ordering::Relaxed) && CAPTURE_WANTED.load(Ordering::Relaxed) && !pointer_on() {
         let mut r: RECT = unsafe { std::mem::zeroed() };
         unsafe { GetClientRect(hwnd, &mut r) };
         let mut p = POINT { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 };
@@ -280,6 +395,40 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_SETCURSOR if CAPTURED.load(Ordering::Relaxed) && (lp & 0xFFFF) as u32 == HTCLIENT => {
             unsafe { SetCursor(std::ptr::null_mut()) };
             1
+        }
+        WM_SETCURSOR if pointer_on() && (lp & 0xFFFF) as u32 == HTCLIENT => {
+            unsafe { SetCursor(pointer_cursor(hwnd)) };
+            1
+        }
+        WM_DS_POINTER => {
+            unsafe { update_capture(hwnd) };
+            if pointer_on() {
+                unsafe { SetCursor(pointer_cursor(hwnd)) };
+            }
+            0
+        }
+        WM_MOUSEMOVE => {
+            use crate::pcsettings::pointer::{CLIENT_X, CLIENT_Y, MOVES};
+            let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
+            if !CAPTURED.load(Ordering::Relaxed) && (CLIENT_X.swap(x, Ordering::Relaxed) != x || CLIENT_Y.swap(y, Ordering::Relaxed) != y) {
+                MOVES.fetch_add(1, Ordering::Relaxed);
+                crate::input::note_device(crate::input::DEVICE_KBM);
+            }
+            0
+        }
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN if pointer_on() => {
+            use crate::pcsettings::pointer::{Event, event};
+            crate::input::note_device(crate::input::DEVICE_KBM);
+            event(if msg == WM_LBUTTONDOWN { Event::Left } else { Event::Right });
+            0
+        }
+        WM_MOUSEWHEEL if pointer_on() => {
+            use crate::pcsettings::pointer::{Event, event};
+            let notches = ((wp >> 16) & 0xFFFF) as i16 as i32 / 120;
+            if notches != 0 {
+                event(Event::Wheel(notches));
+            }
+            0
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN if !CAPTURED.load(Ordering::Relaxed) => {
             // A click into the client area takes the cursor again.
@@ -508,4 +657,18 @@ pub fn create(title: &str, width: u32, height: u32) -> Result<&'static Window, S
     let (hwnd, hinstance) = rx.recv().map_err(|e| format!("ui thread died: {e}"))??;
     WINDOW.set(Window { hwnd, hinstance }).ok();
     Ok(WINDOW.get().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pointer_arrow_draws() {
+        let px = super::pointer_pixels(48);
+        let opaque = px.chunks_exact(4).filter(|p| p[3] > 200).count();
+        let white = px.chunks_exact(4).filter(|p| p[3] > 200 && p[0] > 200).count();
+        assert!(opaque > 150 && white > 60, "{opaque} {white}");
+        if let Ok(dir) = std::env::var("DS_DUMP_DIR") {
+            std::fs::write(std::path::Path::new(&dir).join("pointer_cursor.png"), crate::gpu::png::encode(48, 48, &px)).unwrap();
+        }
+    }
 }

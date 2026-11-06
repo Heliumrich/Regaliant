@@ -27,6 +27,7 @@ mod dispmode;
 mod thread;
 mod titlefix;
 mod titlemem;
+mod uistate;
 mod tls;
 
 use std::path::{Path, PathBuf};
@@ -319,6 +320,51 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 let name = parts.next().unwrap_or("");
                 let value = parts.next().unwrap_or("");
                 pcsettings::store::set_by_name(name, value)
+            }
+            "uielems" => {
+                // Diagnosis: `uielems <tag>` writes every UIElement component's first bytes.
+                let tag = parts.next().unwrap_or("x");
+                match RUN_DIR.get() {
+                    Some(dir) => uistate::dump_elements(dir, tag).map(|m| info!("{m}")),
+                    None => Err("no run directory".into()),
+                }
+            }
+            "pointer" => {
+                // Tests: `pointer <x> <y>` moves the menu pointer to canvas coordinates (1920x1080);
+                // `pointer click|right|wheel <n>`.
+                use pcsettings::pointer::{Event, event, test_move};
+                match (parts.next(), parts.next()) {
+                    (Some("click"), _) => {
+                        event(Event::Left);
+                        Ok(())
+                    }
+                    (Some("right"), _) => {
+                        event(Event::Right);
+                        Ok(())
+                    }
+                    (Some("wheel"), Some(n)) => n.parse::<i32>().map(|n| event(Event::Wheel(n))).map_err(|e| e.to_string()),
+                    (Some(x), Some(y)) => match (x.parse::<f32>(), y.parse::<f32>()) {
+                        (Ok(x), Ok(y)) => {
+                            test_move(x, y);
+                            Ok(())
+                        }
+                        _ => Err("usage: pointer <x> <y> | click | right | wheel <n>".into()),
+                    },
+                    _ => Err("usage: pointer <x> <y> | click | right | wheel <n>".into()),
+                }
+            }
+            "uinodes" => {
+                // Diagnosis: `uinodes <tag>` writes every runtime UI node's first bytes.
+                let tag = parts.next().unwrap_or("x");
+                match RUN_DIR.get() {
+                    Some(dir) => uistate::dump_nodes(dir, tag).map(|m| info!("{m}")),
+                    None => Err("no run directory".into()),
+                }
+            }
+            "uistack" => {
+                // Diagnosis: the title's UI manager: the active menu stack and HUD scenes.
+                info!("{}", uistate::report());
+                Ok(())
             }
             "convars" => {
                 crate::pcsettings::convar::report();

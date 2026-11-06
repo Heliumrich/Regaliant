@@ -12,6 +12,7 @@ pub mod cgpr;
 pub mod convar;
 pub mod glyphs;
 mod hud;
+pub mod pointer;
 pub mod popup;
 pub mod prompts;
 pub mod store;

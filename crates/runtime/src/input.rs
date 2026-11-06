@@ -186,6 +186,16 @@ pub fn press_now(names: &str, hold: u64) -> Result<(), String> {
 /// execution, so holds counted in flips do not transfer between them.
 static LIVE_TIMED: parking_lot::Mutex<Vec<(std::time::Instant, Step)>> = parking_lot::Mutex::new(Vec::new());
 
+/// `press_for` without making the pad the device in use (the menu pointer's presses).
+pub fn press_quiet(names: &str, dur: std::time::Duration) -> Result<(), String> {
+    let steps = parse_script(&format!("0:{names}:1"))?;
+    let now = std::time::Instant::now();
+    let mut live = LIVE_TIMED.lock();
+    live.retain(|x| x.0 > now);
+    live.extend(steps.into_iter().map(|s| (now + dur, s)));
+    Ok(())
+}
+
 /// Presses `names` from now for `dur`.
 pub fn press_for(names: &str, dur: std::time::Duration) -> Result<(), String> {
     let steps = parse_script(&format!("0:{names}:1"))?;

@@ -379,7 +379,7 @@ pub fn present(src: Source) -> bool {
 /// Where a `sw`x`sh` frame goes in a `dw`x`dh` window (x, y, width, height):
 /// as large as fits with its aspect kept, centred; the whole window when the
 /// aspects differ by under 1%.
-fn fit(sw: u32, sh: u32, dw: u32, dh: u32) -> (u32, u32, u32, u32) {
+pub fn fit(sw: u32, sh: u32, dw: u32, dh: u32) -> (u32, u32, u32, u32) {
     let (a, b) = (sw as u64 * dh as u64, dw as u64 * sh as u64);
     if sw == 0 || sh == 0 || a.abs_diff(b) * 100 < a.max(b) {
         return (0, 0, dw, dh);
