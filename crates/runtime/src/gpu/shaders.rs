@@ -2864,6 +2864,24 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
 /// registers and descriptors, under the current switches.
 /// (`batched`: translated for runs of consecutive dispatches, as a program
 /// `batchable` is: learned with its spec, or the program's state now.)
+/// The specs a learned compute spec (`compute_spec`) stands for at
+/// dispatch: with compute LOD statistics in rotation (`cs_lod_rotation`)
+/// most dispatches are prepared without them and one in `tune lod_cs` with
+/// them (`lodstats::rotate`), so the precompile makes both, the one without
+/// first (it made only the one with them from 2026-11-05 on: a variant of
+/// most programs compiled at first use unless the pipeline store held it,
+/// FINDINGS.md 2026-11-06); else the spec alone.
+pub(crate) fn dispatch_variants(spec: Spec) -> Vec<Spec> {
+    if spec.stage == Stage::Compute && spec.lod_stats && !spec.batched && cs_lod_rotation() {
+        let mut rotated = spec.clone();
+        rotated.lod_stats = false;
+        rotated.lod_lean = false;
+        vec![rotated, spec]
+    } else {
+        vec![spec]
+    }
+}
+
 pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3], wave64: bool, resources: Vec<ResSpec>, batched: bool) -> Spec {
     let mut spec = Spec {
         stage: Stage::Compute,

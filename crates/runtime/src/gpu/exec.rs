@@ -275,7 +275,7 @@ pub(super) fn reset_import_window() {
 pub(super) fn import_window_line() -> String {
     let v: Vec<u64> = IMPORT_WIN.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    guest-memory imports in the window: {} ({} MiB, {} ms, longest {} ms); span-list lock waits {} ({} ms); span caches cleared {} times; imports dropped for a mapping change while in progress {}\n",
+        "    guest-memory imports in the window: {} ({} MiB, {} ms, longest {} ms); span-list lock waits {} ({} ms); span caches cleared {} times; imports dropped for a mapping change while in progress {}; written ranges imported alone after their window failed {} ({} failed too); imports failed at once after a refusal {}\n",
         v[0],
         v[1] >> 20,
         v[2] / 1_000_000,
@@ -283,7 +283,10 @@ pub(super) fn import_window_line() -> String {
         v[4],
         v[5] / 1_000_000,
         CACHE_GEN.load(Ordering::Relaxed).saturating_sub(CACHE_GEN_AT_RESET.load(Ordering::Relaxed)),
-        IMPORTS_RACED.load(Ordering::Relaxed)
+        IMPORTS_RACED.load(Ordering::Relaxed),
+        NARROW_IMPORTS[0].load(Ordering::Relaxed),
+        NARROW_IMPORTS[1].load(Ordering::Relaxed),
+        REFUSED_FAST.load(Ordering::Relaxed)
     )
 }
 
@@ -1473,15 +1476,80 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
 /// needs no one import of it all.
 #[track_caller]
 fn import_written(lo: u64, hi: u64) -> bool {
+    // (Tried each time, refused windows too: `REFUSED`.)
+    let was = WRITTEN_IMPORT.with(|c| c.replace(true));
+    let mut ok = true;
     let mut a = lo;
     while a < hi {
         let (_, e) = crate::mem::same_backing(a, a, hi);
-        if e <= a || span(a, e - a).is_none() {
-            return false;
+        if e <= a || span(a, e - a).is_none() && !import_narrow(a, e - a) {
+            ok = false;
+            break;
         }
         a = e;
     }
-    true
+    WRITTEN_IMPORT.with(|c| c.set(was));
+    ok
+}
+
+thread_local! {
+    /// This thread imports for a written range (`import_written`).
+    static WRITTEN_IMPORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Import windows the driver refused lately: [start, end) and when. An
+/// import of one fails at once (its callers' fallbacks run) for
+/// `REFUSED_HOLD` after the refusal, written ranges excepted: a refused
+/// window costs 2-14 ms of driver time at each try, and the same ones are
+/// asked for again and again (the executable's window at 0x802000000, with
+/// its read-only pages, 24 times at each of a boot's first two level loads
+/// at 5-14 ms each on the graphics CP; six windows of the compute queues
+/// ~2,500 times in the first seconds while hardly any import succeeds;
+/// FINDINGS.md 2026-11-06).
+static REFUSED: Mutex<Vec<(u64, u64, std::time::Instant)>> = Mutex::new(Vec::new());
+const REFUSED_HOLD: std::time::Duration = std::time::Duration::from_millis(250);
+/// Imports failed at once by `REFUSED`.
+static REFUSED_FAST: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the driver refused an import of a window holding [start, end)
+/// within `REFUSED_HOLD` (expired entries dropped).
+fn refused_lately(start: u64, end: u64) -> bool {
+    let mut g = REFUSED.lock();
+    if g.is_empty() {
+        return false;
+    }
+    let now = std::time::Instant::now();
+    g.retain(|r| now.duration_since(r.2) < REFUSED_HOLD);
+    g.iter().any(|r| r.0 <= start && end <= r.1)
+}
+
+/// The driver refused an import of [start, end) now (`REFUSED`).
+fn note_refused(start: u64, end: u64) {
+    let mut g = REFUSED.lock();
+    let now = std::time::Instant::now();
+    g.retain(|r| now.duration_since(r.2) < REFUSED_HOLD && !(r.0 == start && r.1 == end));
+    if g.len() < 64 {
+        g.push((start, end, now));
+    }
+}
+
+/// Narrow imports of written ranges: [made, failed too].
+static NARROW_IMPORTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Front end 2: written guest [base, base+size) whose window's import failed
+/// (the driver refuses a 16 MiB window now and then at level loads, its GPU
+/// writes then missing guest memory: FINDINGS.md 2026-11-04 afternoon)
+/// imported alone, its pages aligned as the driver needs (the guest page
+/// table its write-back stores through is filled by every import). The
+/// first ones are logged with what they gave.
+fn import_narrow(base: u64, size: u64) -> bool {
+    let r = import_span_win(base, size, fixed().import_align);
+    let n = NARROW_IMPORTS[r.is_none() as usize].fetch_add(1, Ordering::Relaxed);
+    if n < 10 {
+        let got = r.map_or("failed too".to_string(), |(_, s, e)| format!("imported as {s:#x}..{e:#x}"));
+        crate::info!("gpu: written guest {base:#x}+{size:#x}: its window's import failed; alone it {got}");
+    }
+    r.is_some()
 }
 
 /// Front end 2 (`fe2::Armable`): calls `arm` with the parts of guest [a, b)
@@ -1666,21 +1734,71 @@ fn import_log() -> bool {
 /// against 296 ms of imports in a stream-in window, 2026-10-28 night); an
 /// import over the same window waits for the one in progress instead.
 fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
+    import_span_win(base, size, 0)
+}
+
+/// `import_span` in windows of `window` bytes (0: the usual ones).
+fn import_span_win(base: u64, size: u64, window: u64) -> Option<(vk::Buffer, u64, u64)> {
     // (A mapping change met the import: made again, three times at most.)
     for _ in 0..3 {
-        if let Some(r) = import_once(base, size) {
+        if let Some(r) = import_once(base, size, window) {
             return r;
         }
     }
     None
 }
 
+/// The imports listed, dropped and in progress over guest [a, b), and the
+/// live and dropped totals (diagnostics of an import the driver refused).
+fn import_overlaps(a: u64, b: u64) -> String {
+    let mut v = Vec::new();
+    let (mut live, mut live_bytes) = (0u64, 0u64);
+    match SPANS.try_read() {
+        Some(g) => {
+            for s in g.iter() {
+                live += 1;
+                live_bytes += s.end - s.start;
+            }
+            for s in g.iter().filter(|s| s.start < b && a < s.end).take(6) {
+                v.push(format!("{:#x}..{:#x} ({}, flip {})", s.start, s.end, if s.valid { "live" } else { "remapped" }, s.born));
+            }
+        }
+        None => v.push("(the list busy)".into()),
+    }
+    let (mut dead, mut dead_bytes) = (0u64, 0u64);
+    if let Some(g) = GRAVEYARD.try_lock() {
+        for d in g.iter() {
+            dead += 1;
+            dead_bytes += d.span.end - d.span.start;
+        }
+        for d in g.iter().filter(|d| d.span.start < b && a < d.span.end).take(4) {
+            v.push(format!("{:#x}..{:#x} (dropped, flip {})", d.span.start, d.span.end, d.span.born));
+        }
+    }
+    if let Some(m) = IMPORTING.try_lock() {
+        // (This one is listed too.)
+        let n = m.iter().filter(|x| x.start < b && a < x.end).count();
+        if n > 1 {
+            v.push(format!("{} more in progress", n - 1));
+        }
+    }
+    format!("{}; imports {live} live ({} MiB), {dead} dropped not freed ({} MiB)", if v.is_empty() { "no import over it".to_string() } else { v.join(", ") }, live_bytes >> 20, dead_bytes >> 20)
+}
+
 /// One `import_span`: None when a mapping change met the import.
-fn import_once(base: u64, size: u64) -> Option<Option<(vk::Buffer, u64, u64)>> {
+fn import_once(base: u64, size: u64, window: u64) -> Option<Option<(vk::Buffer, u64, u64)>> {
     // Residency: smaller windows (their pages become host class).
     // Mirror mode: exact pages (imports are only for what the mirror cannot
     // hold: CP writes, host-class pages), so they cover no mirror page.
-    let window = if super::resident::mirror_mode() { 4096 } else if super::resident::enabled() { RES_WINDOW } else { window_bytes() };
+    let window = if window != 0 {
+        window
+    } else if super::resident::mirror_mode() {
+        4096
+    } else if super::resident::enabled() {
+        RES_WINDOW
+    } else {
+        window_bytes()
+    };
     let (lo, hi) = (base & !(window - 1), (base + size).next_multiple_of(window));
     let me = loop {
         if let Some(s) = spans_read().iter().find(|s| s.valid && s.start <= base && base + size <= s.end) {
@@ -1742,6 +1860,11 @@ fn import_once(base: u64, size: u64) -> Option<Option<(vk::Buffer, u64, u64)>> {
             return Some(None);
         };
         alias = crate::sections::alias_of(0, slot);
+    }
+    // A window the driver refused lately fails at once (`REFUSED`).
+    if !WRITTEN_IMPORT.with(|c| c.get()) && refused_lately(start, end) {
+        REFUSED_FAST.fetch_add(1, Ordering::Relaxed);
+        return Some(None);
     }
     let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER;
     // The driver pins the pages for writing: write-tracked (read-only)
@@ -1823,9 +1946,10 @@ fn import_once(base: u64, size: u64) -> Option<Option<(vk::Buffer, u64, u64)>> {
                 seen.len() < 64 && seen.insert(start)
             };
             if first {
-                crate::warn!("gpu: import of {start:#x}..{end:#x} failed over: {}", crate::mem::os_regions(start, end - start, 12));
+                crate::warn!("gpu: import of {start:#x}..{end:#x} failed over: {}; {}", crate::mem::os_regions(start, end - start, 12), import_overlaps(start, end));
             }
             crate::warn!("gpu: importing guest {start:#x}..{end:#x} failed: {e}{heaps}");
+            note_refused(start, end);
             Some(None)
         }
     }
@@ -10175,6 +10299,17 @@ impl Exec {
                     self.submit_after = self.submit_after.max(s);
                 }
                 self.fe2_min_want = self.fe2_min_want.min(want);
+                // A written range marks the batch for its write-back again: a
+                // write-back since (before a CP write the GPU performs) cleared
+                // it, and the batch then closed without one, its GPU writes
+                // reaching guest memory only at a later batch's (the title's
+                // per-view block found stale after its copy in every boot since
+                // the memo, its forwarding then refused: the vista's graphics
+                // CP waited ~5 ms a flip for its own batches, FINDINGS.md
+                // 2026-11-06).
+                if written {
+                    self.fe2_marked = true;
+                }
                 place_memo_count(true);
                 return Some(m.result);
             }

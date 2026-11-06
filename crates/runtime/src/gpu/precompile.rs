@@ -730,8 +730,10 @@ fn run(addr: u64) {
             super::shaders::key_learned(code_hash, &insts, &plan, &mut s.resources);
         }
         let spec = super::shaders::compute_spec(addr, code_hash, s.rsrc2, s.local, s.wave64, s.resources, s.batched);
-        if !specs.contains(&spec) {
-            specs.push(spec);
+        for spec in super::shaders::dispatch_variants(spec) {
+            if !specs.contains(&spec) {
+                specs.push(spec);
+            }
         }
     }
     if super::tune::precompile() >= 3 {
@@ -791,25 +793,28 @@ fn run_code(h: u64) {
             super::shaders::key_learned(h, insts, &plans[k].1, &mut s.resources);
         }
         let spec = super::shaders::compute_spec(0, h, s.rsrc2, s.local, s.wave64, s.resources, s.batched);
-        if done.contains(&spec) {
-            continue;
-        }
-        done.push(spec.clone());
-        // (Under the validation layer its messages name the program and its
-        // learned spec: `DS_CB_HASHES` / `DS_CB_SPEC` of the compile bench.)
-        let _g = super::vk::creating(|| format!("cs {h:#018x} learned spec {n}"));
-        let r = super::shaders::translate_code_for_spec(&code, h, spec).and_then(|tr| super::exec::precompile_translation(&tr, 0).ok_or_else(|| "pipeline creation failed".to_string()));
-        match r {
-            Ok(true) => {
-                DONE[0].fetch_add(1, Ordering::Relaxed);
-                DONE[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        for spec in super::shaders::dispatch_variants(spec) {
+            if done.contains(&spec) {
+                continue;
             }
-            Ok(false) => {
-                DONE[2].fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) => {
-                if DONE[4].fetch_add(1, Ordering::Relaxed) < 8 {
-                    crate::info!("gpu: precompile of cs {h:#018x} from its kept code failed: {e}");
+            done.push(spec.clone());
+            // (Under the validation layer its messages name the program and
+            // its learned spec: `DS_CB_HASHES` / `DS_CB_SPEC` of the compile
+            // bench.)
+            let _g = super::vk::creating(|| format!("cs {h:#018x} learned spec {n}"));
+            let r = super::shaders::translate_code_for_spec(&code, h, spec).and_then(|tr| super::exec::precompile_translation(&tr, 0).ok_or_else(|| "pipeline creation failed".to_string()));
+            match r {
+                Ok(true) => {
+                    DONE[0].fetch_add(1, Ordering::Relaxed);
+                    DONE[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+                Ok(false) => {
+                    DONE[2].fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    if DONE[4].fetch_add(1, Ordering::Relaxed) < 8 {
+                        crate::info!("gpu: precompile of cs {h:#018x} from its kept code failed: {e}");
+                    }
                 }
             }
         }
@@ -830,7 +835,7 @@ pub fn first_translation(addr: u64, insts: &[rdna::Inst], plan: &rdna::analysis:
         MISSES[0].fetch_add(1, Ordering::Relaxed);
         let mut key = actual.clone();
         key.code_base = 0;
-        let made: Vec<Spec> = seen.into_iter().map(|s| super::shaders::compute_spec(0, code_hash, s.rsrc2, s.local, s.wave64, s.resources, s.batched)).collect();
+        let made: Vec<Spec> = seen.into_iter().flat_map(|s| super::shaders::dispatch_variants(super::shaders::compute_spec(0, code_hash, s.rsrc2, s.local, s.wave64, s.resources, s.batched))).collect();
         if made.iter().any(|m| *m == key) {
             MISSES[1].fetch_add(1, Ordering::Relaxed);
         } else {
