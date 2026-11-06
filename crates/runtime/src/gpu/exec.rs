@@ -3003,7 +3003,7 @@ fn note_copy_waits(own: bool, wait: u64) {
 /// there after all the main queue's work so far. Called in sequence order
 /// (`push_batch`): the timelines' signals increase.
 #[allow(clippy::too_many_arguments)]
-fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, on_c: bool, xwait: u64) -> Result<(), String> {
+fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, on_c: bool, xwait: u64, cpu_wait: u64) -> Result<(), String> {
     let c = ctx();
     // Guest page table updates queued before this batch, ahead of it (after
     // the compute family's queue's batches, which read the old entries),
@@ -3021,6 +3021,11 @@ fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::Comma
     let mut waits: Vec<(vk::Semaphore, u64, vk::PipelineStageFlags2)> = Vec::new();
     if let (Some(q), true) = (&c.copy, wait > 0) {
         waits.push((q.copied, wait, all));
+    }
+    // CP writes the CPU performs after batch `cpu_wait` (its deferred
+    // effects) before this batch's GPU-performed ones (`Exec::order_after_cpu`).
+    if cpu_wait > 0 {
+        waits.push((c.cpu_done, cpu_wait, all));
     }
     if on_c {
         let cq = c.compute.as_ref().ok_or("no compute queue")?;
@@ -3069,6 +3074,9 @@ pub(super) struct SubmitSpec {
     wait: u64,
     on_c: bool,
     xwait: u64,
+    /// The batch whose deferred effects must have run first (0: none;
+    /// `Exec::order_after_cpu`).
+    cpu_wait: u64,
     name: String,
 }
 
@@ -3090,7 +3098,7 @@ fn submit_specs(specs: Vec<(u64, SubmitSpec)>) {
             crate::error!("gpu[{name}]: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());
         }
     };
-    let plain = |s: &SubmitSpec| s.xpre.is_none() && !s.on_c;
+    let plain = |s: &SubmitSpec| s.xpre.is_none() && !s.on_c && s.cpu_wait == 0;
     let max = (super::tune::submit_coalesce() as usize).max(1);
     let mut i = 0;
     while i < specs.len() {
@@ -3105,7 +3113,7 @@ fn submit_specs(specs: Vec<(u64, SubmitSpec)>) {
         }
         if j - i == 1 {
             let (seq, s) = &specs[i];
-            if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.on_c, s.xwait) {
+            if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.on_c, s.xwait, s.cpu_wait) {
                 fail(e, &s.name);
             }
             i = j;
@@ -4511,7 +4519,8 @@ fn releaser_thread(q: usize) {
             let ms = r.submitted.elapsed().as_millis();
             if ms >= 250 {
                 let list: Vec<String> = r.shaders.iter().map(|a| format!("{a:#x}")).collect();
-                crate::info!("gpu[{}]: batch #{} of {} command(s) took {ms} ms (shaders {}; {})", r.name, r.seq, r.shaders.len(), list.join(" "), ops_line(&r.ops));
+                let effects = cpu_wait_of(r.seq).map(|s| format!("; waited on the GPU for batch {s}'s effects (signalled through {})", CPU_SIGNALED.load(Ordering::Relaxed))).unwrap_or_default();
+                crate::info!("gpu[{}]: batch #{} of {} command(s) took {ms} ms (shaders {}; {}{effects})", r.name, r.seq, r.shaders.len(), list.join(" "), ops_line(&r.ops));
             }
         }
         // Its slot for the next batch there, unless the recording thread took
@@ -4970,7 +4979,7 @@ pub fn write_logs_line() -> String {
     if !log_stats_on() {
         return String::new();
     }
-    format!("    write logs: in-flight batches' writes {}; deferred CP writes {}\n", INFLIGHT.stats_text(), CP_WRITES.stats_text())
+    format!("    write logs: in-flight batches' writes {}; deferred CP writes {}; batches waiting on the GPU for an earlier batch's deferred effects {}\n", INFLIGHT.stats_text(), CP_WRITES.stats_text(), CPU_WAITS_GPU.load(Ordering::Relaxed))
 }
 
 /// What submitted, unfinished batches of every queue write (shader buffer
@@ -5232,6 +5241,22 @@ static PAST_JOURNAL_WHO: Mutex<Vec<(u64, u64, String)>> = Mutex::new(Vec::new())
 pub(super) fn journal_writers(a: u64, n: u64) -> Vec<String> {
     let g = PAST_JOURNAL_WHO.lock();
     g.iter().filter(|w| w.0 < a + n && a < w.0 + w.1).take(4).map(|w| format!("{} [{:#x}+{:#x}]", w.2, w.0, w.1)).collect()
+}
+
+/// Batches that waited on the GPU for an earlier batch's deferred effects
+/// (`Exec::order_after_cpu`).
+pub static CPU_WAITS_GPU: AtomicU64 = AtomicU64::new(0);
+/// The highest effects-timeline value a submitted batch waits for, and the
+/// last value the completion thread signalled (`cpu_done`): while the first
+/// is above the second, every completion signals its sequence.
+static CPU_WAIT_REQ: AtomicU64 = AtomicU64::new(0);
+static CPU_SIGNALED: AtomicU64 = AtomicU64::new(0);
+/// Recent batches that waited for effects: (batch, the effects' batch).
+static CPU_WAIT_LOG: Mutex<std::collections::VecDeque<(u64, u64)>> = Mutex::new(std::collections::VecDeque::new());
+
+/// The effects batch `seq` waited for (`CPU_WAIT_LOG`), for slow-batch logs.
+fn cpu_wait_of(seq: u64) -> Option<u64> {
+    CPU_WAIT_LOG.lock().iter().find(|e| e.0 == seq).map(|e| e.1)
 }
 
 /// CP reads that waited for another queue's batch (diagnostics).
@@ -5698,6 +5723,7 @@ fn completion_thread() {
         let ta = std::time::Instant::now();
         let tl = if b.actions.is_empty() { None } else { super::timeline::mark() };
         let n = b.actions.len();
+
         super::cp::set_after_batch(b.seq);
         for a in b.actions {
             a();
@@ -5715,7 +5741,18 @@ fn completion_thread() {
         {
             let mut d = DONE.lock();
             *d = b.seq;
-            DONE_ATOMIC.store(b.seq, Ordering::Release);
+            DONE_ATOMIC.store(b.seq, Ordering::SeqCst);
+        }
+        // Batches whose GPU-performed CP writes follow earlier batches'
+        // effects wait for this (`Exec::order_after_cpu`): while one waits
+        // for a value not signalled yet, every completion signals its
+        // sequence (its effects ran above).
+        if CPU_WAIT_REQ.load(Ordering::SeqCst) > CPU_SIGNALED.load(Ordering::Relaxed) && b.seq > CPU_SIGNALED.load(Ordering::Relaxed) && !DEVICE_LOST.load(Ordering::Relaxed) {
+            let c = ctx();
+            match unsafe { c.device.signal_semaphore(&vk::SemaphoreSignalInfo::default().semaphore(c.cpu_done).value(b.seq)) } {
+                Ok(()) => CPU_SIGNALED.store(b.seq, Ordering::Relaxed),
+                Err(e) => crate::error!("gpu: signalling the effects timeline at {}: {e}", b.seq),
+            }
         }
         *LAST_DONE_AT.lock() = Some(std::time::Instant::now());
         DONE_CV.notify_all();
@@ -8220,6 +8257,9 @@ pub struct Exec {
     /// passed on. CP writes the GPU performs are submitted after those ran.
     cpu_action_seq: u64,
     cpu_dep_seq: u64,
+    /// The recording batch's GPU-performed CP writes follow the deferred
+    /// effects of this batch: it waits for them on the GPU (`order_after_cpu`).
+    cpu_wait: u64,
     /// The title synchronized (flush, cache action, end-of-pipe event)
     /// since the last full barrier: the next dispatch or draw waits.
     barrier_wanted: bool,
@@ -9061,6 +9101,7 @@ impl Exec {
                 last_gpu_write_seq: 0,
                 cpu_action_seq: 0,
                 cpu_dep_seq: 0,
+                cpu_wait: 0,
                 barrier_wanted: false,
                 args_read: false,
                 dispatched: false,
@@ -9722,6 +9763,19 @@ impl Exec {
             self.fe2_gens = gens;
         }
         let lists = std::mem::take(&mut self.batch_lists).then(super::vk::defer::release);
+        // (Effects of a batch completed meanwhile need no wait. The value is
+        // registered first, then the completed sequence read again: either the
+        // completion thread sees the request and signals, or this sees that
+        // batch completed.)
+        let mut cpu_wait = std::mem::take(&mut self.cpu_wait);
+        if cpu_wait > 0 {
+            CPU_WAIT_REQ.fetch_max(cpu_wait, Ordering::SeqCst);
+            if DONE_ATOMIC.load(Ordering::SeqCst) >= cpu_wait {
+                cpu_wait = 0;
+            } else {
+                CPU_WAITS_GPU.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let xq = xq_tracking().then_some(XqBatch { compute: self.xq_c, on_c, acb: acb_id(&self.name), writes: &self.pending, ups: &self.fe2_up, dep: self.xq_dep, why: self.xq_why, images: self.xq_img });
         let seq = push_batch(fence, self.slots[i].queries, bq, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, std::mem::take(&mut self.segs), reset, on_c, xq, move |seq| {
             if DEVICE_LOST.load(Ordering::Relaxed) {
@@ -9732,9 +9786,16 @@ impl Exec {
                 l.replay();
             }
             let _ = seq;
-            Some(SubmitSpec { xpre, pre, cmd, wait: copy_wait, on_c, xwait: 0, name })
+            Some(SubmitSpec { xpre, pre, cmd, wait: copy_wait, on_c, xwait: 0, cpu_wait, name })
         });
         super::timeline::end(&self.name, self.begun_mark.take(), || format!("batch #{seq}, {commands} commands ({why})"));
+        if cpu_wait > 0 {
+            let mut l = CPU_WAIT_LOG.lock();
+            if l.len() >= 64 {
+                l.pop_front();
+            }
+            l.push_back((seq, cpu_wait));
+        }
         st.mark(5);
         if std::mem::take(&mut self.gpu_writes_open) {
             self.last_gpu_write_seq = seq;
@@ -12409,7 +12470,7 @@ impl Exec {
         }
         let cpu = self.cpu_action_seq.max(self.cpu_dep_seq);
         if cpu > done_seq() {
-            self.submit_after = self.submit_after.max(cpu);
+            self.order_after_cpu(cpu);
         }
         self.begin();
         if !self.recording {
@@ -12553,6 +12614,22 @@ impl Exec {
     /// CPU took the time when the completion thread reached the batch, which
     /// ended every batch at such a write (~400 per courtyard frame). False:
     /// the CPU path (no calibration, memory the GPU cannot write here).
+    /// A CP write the GPU performs in the recording batch follows the CP
+    /// writes the CPU performs after batch `cpu` completed (its deferred
+    /// effects: the graphics CP's GetLodStats once a frame): the batch waits
+    /// for them on the GPU (`cpu_done`, signalled by the completion thread
+    /// once they ran), the command processor going on (it waited ~0.5-0.7
+    /// ms a frame before: +1.0% at Doran, FINDINGS.md 2026-11-06); held and
+    /// deferred executors submit it only after them, waiting on the CPU
+    /// (`submit_after`).
+    fn order_after_cpu(&mut self, cpu: u64) {
+        if !self.held && !self.deferred {
+            self.cpu_wait = self.cpu_wait.max(cpu);
+        } else {
+            self.submit_after = self.submit_after.max(cpu);
+        }
+    }
+
     pub fn gpu_timestamp(&mut self, a: u64) -> bool {
         if (self.deferred && !self.held) || a % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(a, 8) {
             return false;
@@ -12568,7 +12645,7 @@ impl Exec {
         }
         let cpu = self.cpu_action_seq.max(self.cpu_dep_seq);
         if cpu > done_seq() {
-            self.submit_after = self.submit_after.max(cpu);
+            self.order_after_cpu(cpu);
         }
         self.begin();
         // A descriptor set with two buffers per write (see `reserve`).
@@ -13649,7 +13726,7 @@ impl Exec {
                 if let Some(l) = lists {
                     l.replay();
                 }
-                Some(SubmitSpec { xpre: None, pre, cmd, wait: copy_wait, on_c, xwait: 0, name })
+                Some(SubmitSpec { xpre: None, pre, cmd, wait: copy_wait, on_c, xwait: 0, cpu_wait: 0, name })
             });
             self.slots[b.slot].seq = seq;
             if !b.fe2_up.is_empty() {

@@ -1468,6 +1468,59 @@ static CP_CLASSES_FROM: AtomicU64 = AtomicU64::new(0);
 /// The same per PM4 opcode for the compute queue `tune cp_classes_acb`
 /// names: [ns without waits, packets, ns of waits].
 static ACB_OPS: [[AtomicU64; 3]; 256] = [const { [const { AtomicU64::new(0) }; 3] }; 256];
+/// The graphics command processor's packets recorded past label waits
+/// (`tune cp_classes`), per PM4 opcode: [ns without waits, packets, ns of
+/// waits].
+static STRETCH_OPS: [[AtomicU64; 3]; 256] = [const { [const { AtomicU64::new(0) }; 3] }; 256];
+
+/// The graphics CP's indexed indirect draws by part (`tune cp_classes`):
+/// [count, ns] per `IDRAW_PART_NAMES`.
+pub static IDRAW_PARTS: [[AtomicU64; 2]; 18] = [const { [const { AtomicU64::new(0) }; 2] }; 18];
+const IDRAW_PART_NAMES: [&str; 6] = ["argument sync", "location checks", "repeats", "their index bindings", "indirect drawn in full", "every draw in full"];
+const IDRAW_GROUP_NAMES: [&str; 3] = ["the graphics CP outside stretches", "the graphics CP past label waits", "its workers"];
+
+thread_local! {
+    /// This thread's `IDRAW_PARTS` group (0 the graphics CP, 1 the same in
+    /// a stretch past a label wait, 2 its workers).
+    static IDRAW_GROUP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Adds a part's time since `t` (`IDRAW_PARTS`).
+pub fn idraw_part(k: usize, t: Option<Instant>) {
+    if let Some(t) = t {
+        let k = k + 6 * IDRAW_GROUP.with(|g| g.get());
+        IDRAW_PARTS[k][0].fetch_add(1, Ordering::Relaxed);
+        IDRAW_PARTS[k][1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Times every draw recorded in full (`IDRAW_PARTS`) when dropped.
+struct EveryLap(Option<Instant>);
+
+impl Drop for EveryLap {
+    fn drop(&mut self) {
+        idraw_part(5, self.0);
+    }
+}
+
+/// Times a draw recorded in full (`IDRAW_PARTS`) when dropped.
+struct FullLap(Option<Instant>);
+
+impl Drop for FullLap {
+    fn drop(&mut self) {
+        idraw_part(4, self.0);
+    }
+}
+
+fn stretch_op_end(opcode: u32, t: Option<(Instant, u64)>) {
+    let Some((t0, w0)) = t else { return };
+    let waited = super::timeline::waited_ns().saturating_sub(w0);
+    let ns = (t0.elapsed().as_nanos() as u64).saturating_sub(waited);
+    let c = &STRETCH_OPS[(opcode & 0xFF) as usize];
+    c[0].fetch_add(ns, Ordering::Relaxed);
+    c[1].fetch_add(1, Ordering::Relaxed);
+    c[2].fetch_add(waited, Ordering::Relaxed);
+}
 
 fn acb_op_end(opcode: u32, t: Option<(Instant, u64)>) {
     let Some((t0, w0)) = t else { return };
@@ -1499,6 +1552,12 @@ fn op_name(opcode: u32) -> String {
         op::SET_UCONFIG_REG => "SET_UCONFIG_REG",
         op::LOAD_SH_REG_INDEX => "LOAD_SH_REG_INDEX",
         op::WAIT_REG_MEM64 => "WAIT_REG_MEM64",
+        op::DRAW_INDEX_2 => "DRAW_INDEX_2",
+        op::DRAW_INDEX_AUTO => "DRAW_INDEX_AUTO",
+        op::DRAW_INDEX_OFFSET_2 => "DRAW_INDEX_OFFSET_2",
+        op::DRAW_INDIRECT => "DRAW_INDIRECT",
+        op::DRAW_INDEX_INDIRECT => "DRAW_INDEX_INDIRECT",
+        op::SET_CONTEXT_REG => "SET_CONTEXT_REG",
         1 => "label submissions after packets",
         _ => return format!("op {opcode:#04x}"),
     };
@@ -1548,7 +1607,7 @@ fn class_end(k: usize, t: Option<(Instant, u64)>) {
 
 /// Clears the packet classes (`profile reset`).
 pub fn reset_classes() {
-    for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()).chain(SERIAL_WHY.iter()).chain(PLAN_PHASES.iter()).chain(PLAN_MAIN_WRITES.iter()).chain(RUN_EPOCHS.iter()).chain(CB_CENSUS.iter().flatten()) {
+    for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()).chain(STRETCH_OPS.iter().flatten()).chain(IDRAW_PARTS.iter().flatten()).chain(SERIAL_WHY.iter()).chain(PLAN_PHASES.iter()).chain(PLAN_MAIN_WRITES.iter()).chain(RUN_EPOCHS.iter()).chain(CB_CENSUS.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
     CP_CLASSES_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -1683,6 +1742,33 @@ pub fn classes_line() -> String {
             .map(|&(k, ns, n, w)| format!("{} {:.2} ms ({:.0} packets, {:.1} us each; waits {:.2} ms)", op_name(k as u32), ns as f64 / flips / 1e6, n as f64 / flips, ns as f64 / n.max(1) as f64 / 1e3, w as f64 / flips / 1e6))
             .collect();
         s.push_str(&format!("    compute queue {:#x} per flip by packet (waits apart; {:.2} ms in all): {}\n", super::tune::cp_classes_acb(), all as f64 / flips / 1e6, parts.join("; ")));
+    }
+    let mut ops: Vec<(usize, u64, u64, u64)> = STRETCH_OPS
+        .iter()
+        .enumerate()
+        .map(|(k, c)| (k, c[0].load(Ordering::Relaxed), c[1].load(Ordering::Relaxed), c[2].load(Ordering::Relaxed)))
+        .filter(|&(_, ns, _, w)| ns + w > 0)
+        .collect();
+    if !ops.is_empty() {
+        let all: u64 = ops.iter().map(|o| o.1).sum();
+        ops.sort_by_key(|o| std::cmp::Reverse(o.1));
+        let parts: Vec<String> = ops
+            .iter()
+            .take(14)
+            .map(|&(k, ns, n, w)| format!("{} {:.2} ms ({:.0} packets, {:.1} us each; waits {:.2} ms)", op_name(k as u32), ns as f64 / flips / 1e6, n as f64 / flips, ns as f64 / n.max(1) as f64 / 1e3, w as f64 / flips / 1e6))
+            .collect();
+        s.push_str(&format!("    the graphics command processor past label waits per flip by packet (waits apart; {:.2} ms in all): {}\n", all as f64 / flips / 1e6, parts.join("; ")));
+    }
+    for (g, gname) in IDRAW_GROUP_NAMES.iter().enumerate() {
+        let id: Vec<String> = IDRAW_PARTS[6 * g..6 * g + 6]
+            .iter()
+            .zip(IDRAW_PART_NAMES)
+            .map(|(c, name)| {
+                let (n, ns) = (c[0].load(Ordering::Relaxed), c[1].load(Ordering::Relaxed));
+                format!("{name} {:.0} a flip at {:.2} us ({:.2} ms)", n as f64 / flips, ns as f64 / n.max(1) as f64 / 1e3, ns as f64 / flips / 1e6)
+            })
+            .collect();
+        s.push_str(&format!("    draws of {gname} by part: {}\n", id.join("; ")));
     }
     s
 }
@@ -4025,6 +4111,11 @@ impl Cp {
         if super::frameprobe::on() && self.name == "gpu-gfx" {
             super::frameprobe::command();
         }
+        let laps = (!self.compute && super::tune::cp_classes()).then(|| {
+            IDRAW_GROUP.with(|g| g.set(if !self.main_gfx { 2 } else if self.past_wait.is_some() { 1 } else { 0 }));
+            Instant::now()
+        });
+        let _every = EveryLap(laps);
         self.note_run_epoch();
         if !super::exec::enabled() || self.exec_failed {
             self.note("draws are decoded but not rendered (set DS_GPU=1 to render them)");
@@ -4126,6 +4217,7 @@ impl Cp {
     fn draw_cpu_args_base(&mut self, w: [u32; 5], sz: u32, inst_loc: u32) -> String {
         const GS_USER_DATA: u32 = 0x8C;
         let index = (self.index_base + w[2] as u64 * sz as u64, sz);
+        let laps = (!self.compute && super::tune::cp_classes()).then(Instant::now);
         if std::mem::take(&mut self.repeat_ok) && super::tune::draw_repeat() {
             if let Some(e) = self.exec.as_mut() {
                 if e.draw_repeat_cpu(index, w[0], w[1], w[3] as i32, w[4]) {
@@ -4133,10 +4225,12 @@ impl Cp {
                     let _ = self.take_ahead();
                     self.repeat_ok = true;
                     self.split_if_due();
+                    idraw_part(2, laps);
                     return "drawn (repeating the draw before)".into();
                 }
             }
         }
+        let _full = FullLap(laps);
         self.draw(super::exec::DrawArgs { count: w[0], instances: w[1], index: Some(index), base_vertex: Some(w[3] as i32), first_instance: w[4], base_inst: Some((inst_loc - GS_USER_DATA) as u16) });
         if self.last_draw == super::exec::NEEDS_CPU_ARGS {
             // The start instance in its register, as before.
@@ -4632,6 +4726,7 @@ impl Cp {
             };
             let t = class_start(classes && opcode != op::INDIRECT_BUFFER);
             let ta = class_start(acb_ops && opcode != op::INDIRECT_BUFFER);
+            let tw = class_start(classes && self.past_wait.is_some() && opcode != op::INDIRECT_BUFFER);
             // A label wait that blocks prepares the stages after it meanwhile
             // (`tune wait_ahead`).
             if matches!(opcode, op::WAIT_REG_MEM | op::WAIT_REG_MEM64) && !f.live && self.exec.is_some() && self.held.is_none() && super::tune::wait_ahead_for(self.compute) {
@@ -4664,6 +4759,7 @@ impl Cp {
             self.compile_ctx.set(None);
             class_end(class, t);
             acb_op_end(opcode, ta);
+            stretch_op_end(opcode, tw);
             if self.held.is_some() {
                 // Stopped inside it: it and what follows are left to the
                 // main command processor; done: what follows.
@@ -4830,7 +4926,13 @@ impl Cp {
                     op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT => {
                         // Arguments may have been written by earlier GPU work.
                         let a = self.draw_indirect_base + p(0) as u64;
+                        let laps = (!self.compute && super::tune::cp_classes()).then(|| {
+                            IDRAW_GROUP.with(|g| g.set(if !self.main_gfx { 2 } else if self.past_wait.is_some() { 1 } else { 0 }));
+                            Instant::now()
+                        });
                         self.sync_reads(&[(a, if opcode == op::DRAW_INDEX_INDIRECT { 20 } else { 16 })]);
+                        idraw_part(0, laps);
+                        let laps = laps.map(|_| Instant::now());
                         // The CP hands the base vertex and start instance to the
                         // shader through the user SGPRs the packet names
                         // (BASE_VTX_LOC [15:0], START_INST_LOC [31:16]: SH
@@ -4852,10 +4954,13 @@ impl Cp {
                                 let ty = self.reg(Space::Uc, crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE) & 3;
                                 indirect = Some(format!("args {w:?} locs {vtx_loc:#x}/{inst_loc:#x} index {:#x} type {ty} size {}{}", self.index_base, self.index_count, self.index_range(w[2], w[0])));
                             }
-                            match self.index_size() {
+                            let sz = self.index_size();
+                            let ok = sz.is_some() && self.cpu_args_base_ok(vtx_loc, inst_loc);
+                            idraw_part(1, laps);
+                            match sz {
                                 // The start instance as Vulkan's first instance
                                 // (`tune cpu_args_base`): drawn here.
-                                Some(sz) if self.cpu_args_base_ok(vtx_loc, inst_loc) => {
+                                Some(sz) if ok => {
                                     multi = Some(self.draw_cpu_args_base(w, sz, inst_loc));
                                     None
                                 }

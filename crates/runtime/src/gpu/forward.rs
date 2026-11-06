@@ -672,6 +672,28 @@ fn plain32(format: u8) -> bool {
     matches!(format, 20..=22)
 }
 
+/// Reads guest words [a, a + 4 * out.len()) (4-byte aligned, readable) as
+/// the title may be writing them: volatile loads of 16 bytes where they fit
+/// (each 4-byte word whole, as a word-at-a-time read would see it), the
+/// rest a word at a time.
+unsafe fn read_words(a: u64, out: &mut [u32]) {
+    let mut k = 0usize;
+    // (To a 16-byte boundary first: aligned vector loads.)
+    while k < out.len() && (a + 4 * k as u64) % 16 != 0 {
+        out[k] = unsafe { std::ptr::read_volatile((a + 4 * k as u64) as *const u32) };
+        k += 1;
+    }
+    while k + 4 <= out.len() {
+        let q = unsafe { std::ptr::read_volatile((a + 4 * k as u64) as *const [u32; 4]) };
+        out[k..k + 4].copy_from_slice(&q);
+        k += 4;
+    }
+    while k < out.len() {
+        out[k] = unsafe { std::ptr::read_volatile((a + 4 * k as u64) as *const u32) };
+        k += 1;
+    }
+}
+
 /// The words a dispatch of `p` with `groups` (64-lane groups along X) will
 /// leave at its destination, when `p` is the copy kernel and its control
 /// block and source can be read now (`busy`: GPU work or a deferred CP write
@@ -709,7 +731,13 @@ pub fn compute(p: &Prepared, groups: [u32; 3], local: [u32; 3], busy: impl Fn(&[
         trace_refusal(dst.base, 4 * count, &inputs, &busy);
         return refuse();
     }
-    let src_words: Vec<u32> = (0..in_src).map(|j| unsafe { std::ptr::read_volatile((src.base + j * src.stride as u64) as *const u32) }).collect();
+    let src_words: Vec<u32> = if src.stride == 4 {
+        let mut v = vec![0u32; in_src as usize];
+        unsafe { read_words(src.base, &mut v) };
+        v
+    } else {
+        (0..in_src).map(|j| unsafe { std::ptr::read_volatile((src.base + j * src.stride as u64) as *const u32) }).collect()
+    };
     // dst[i] = src[i % m], zero past the source's records: the source's
     // words a period at a time (a division per word was most of this).
     let mut words: Vec<u32> = Vec::with_capacity(count as usize);
@@ -774,7 +802,9 @@ pub fn add(base: u64, words: Vec<u32>, program: u64, hash: u64, from: Inputs, ho
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let n = words.len() as u64;
     let old: Arc<[u32]> = if super::cp::guest_readable(base, 4 * n) {
-        (0..n).map(|k| unsafe { std::ptr::read_volatile((base + 4 * k) as *const u32) }).collect()
+        let mut v = vec![0u32; n as usize];
+        unsafe { read_words(base, &mut v) };
+        v.into()
     } else {
         Arc::from(Vec::new())
     };

@@ -84,6 +84,11 @@ pub struct Ctx {
     /// sequence (`exec`: batches submitted together, completions waited for
     /// by value).
     pub batches: vk::Semaphore,
+    /// A timeline semaphore the host signals with a batch's sequence once
+    /// its deferred effects (CP writes the CPU performs) ran: batches whose
+    /// GPU-performed CP writes follow those wait for it
+    /// (`exec::Exec::order_after_cpu`).
+    pub cpu_done: vk::Semaphore,
 }
 
 /// A queue of a compute-only family (`Ctx::compute`) and the timeline its
@@ -580,8 +585,13 @@ fn init_inner() -> Result<(), String> {
             let mut tci = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
             device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tci), None).map_err(|e| format!("batch timeline semaphore: {e}"))?
         };
+        let cpu_done = {
+            let mut tci = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
+            device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tci), None).map_err(|e| format!("effects timeline semaphore: {e}"))?
+        };
         let ctx = Ctx {
             batches,
+            cpu_done,
             surface_i: ash::khr::surface::Instance::new(&entry, &instance),
             win32_i: ash::khr::win32_surface::Instance::new(&entry, &instance),
             swapchain_d: ash::khr::swapchain::Device::new(&instance, &device),

@@ -910,7 +910,10 @@ impl Exec {
             return true;
         }
         let bytes = count as u64 * index.1 as u64;
-        let Some(ih) = self.home_bind(index.0, bytes, false, HomeUse::Index) else { return false };
+        let laps = (!self.compute_cp && super::super::tune::cp_classes()).then(std::time::Instant::now);
+        let ih = self.home_bind(index.0, bytes, false, HomeUse::Index);
+        super::super::cp::idraw_part(3, laps);
+        let Some(ih) = ih else { return false };
         if self.stopped || self.batch_count != r.batch || self.cmd_uses.get() != r.uses || ih.0 != r.index_buf {
             return false;
         }
