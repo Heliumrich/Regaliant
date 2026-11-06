@@ -30,7 +30,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 159] = [
+    static ALL: [Tunable; 158] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -189,7 +189,6 @@ pub mod tune {
         Tunable { name: "buffer_delta", env: "DS_BUFFER_DELTA", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lod_cs", env: "DS_LOD_CS", default: 8, value: AtomicU64::new(UNSET) },
         Tunable { name: "tr_ballast", env: "DS_TR_BALLAST", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "fmt_single", env: "DS_FMT_SINGLE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1612,15 +1611,6 @@ pub mod tune {
     #[inline]
     pub fn tr_ballast() -> u64 {
         get(157)
-    }
-
-    /// Compute stages specialize a formatted buffer to the one format and
-    /// swizzle its program and resource have seen (`shaders::single_format`)
-    /// instead of decoding it when the program runs (`FORMAT_RT`). Read when
-    /// a compute stage is prepared.
-    #[inline]
-    pub fn fmt_single() -> bool {
-        get(158) != 0
     }
 
     /// Pixel programs that write no memory run their depth and stencil

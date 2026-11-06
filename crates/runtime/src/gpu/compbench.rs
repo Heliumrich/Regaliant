@@ -81,7 +81,7 @@ fn guess_report(app: &std::path::Path) -> i32 {
             let mut actual = spec.clone();
             actual.code_base = guess.code_base;
             // (Keyed as a preparation keys it now.)
-            super::shaders::key_learned(&insts, &plan, &mut actual.resources);
+            super::shaders::key_learned(h, &insts, &plan, &mut actual.resources);
             let class = if guess == actual {
                 1
             } else {
@@ -404,7 +404,7 @@ pub fn run(args: &[String], app: &std::path::Path) -> i32 {
         if let Ok(insts) = rdna::decode_program(code) {
             let plan = rdna::analysis::analyze_opts(&insts, spec.user_sgprs, spec.user_base, false);
             let learned = spec.resources.clone();
-            super::shaders::key_learned(&insts, &plan, &mut spec.resources);
+            super::shaders::key_learned(*h, &insts, &plan, &mut spec.resources);
             if std::env::var("DS_CB_FORMATS").ok().as_deref() == Some("1") {
                 for (r, l) in spec.resources.iter_mut().zip(learned.iter()) {
                     if matches!(r, rdna::translate::ResSpec::Buffer { format, .. } if *format == rdna::translate::FORMAT_RT) {

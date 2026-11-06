@@ -1219,6 +1219,40 @@ thread_local! {
     static FMT_LOCAL: std::cell::RefCell<HashMap<(u64, usize), u32>> = std::cell::RefCell::new(HashMap::new());
 }
 
+/// Seeds the formats a program's learned specs (`specs`, each a resource
+/// list) give its formatted buffers: one format and swizzle in all of them a
+/// single format, two different ones several (run-time); specs keyed with the
+/// run-time decode say nothing. Pairs already seen are left as they are.
+pub(crate) fn seed_formats(code: u64, specs: &[&[ResSpec]]) {
+    let n = specs.iter().map(|s| s.len()).max().unwrap_or(0);
+    for i in 0..n {
+        let mut one: Option<u32> = None;
+        let mut multi = false;
+        for s in specs {
+            if let Some(ResSpec::Buffer { format, dst_sel }) = s.get(i) {
+                if *format != 0 && *format != translate::FORMAT_RT {
+                    let v = (*format as u32) << 16 | *dst_sel as u32;
+                    match one {
+                        None => one = Some(v),
+                        Some(o) if o != v => multi = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let Some(v) = one else { continue };
+        let v = if multi { FMT_MULTI } else { v };
+        FMT_SEEN.write().get_or_insert_with(HashMap::new).entry((code, i)).or_insert(v);
+    }
+}
+
+/// Whether `(code, res)` holds `format` and `dst_sel` as its one format
+/// (`seed_formats`, or the dispatches seen so far).
+fn seeded_single(code: u64, res: usize, format: u8, dst_sel: u16) -> bool {
+    let want = (format as u32) << 16 | dst_sel as u32;
+    FMT_SEEN.read().as_ref().and_then(|m| m.get(&(code, res)).copied()) == Some(want)
+}
+
 /// Whether resource `res` of the program with code `code` can be specialized
 /// to `format` and `dst_sel`: the first pair seen for it, or the same as
 /// before; a different one makes it run-time from now on (every thread). A
@@ -2364,13 +2398,17 @@ pub(crate) fn format_store_resources(insts: &[rdna::Inst], plan: &Plan) -> u64 {
 /// program only loads, of the table, read at run time (`FORMAT_RT`), and
 /// 3D-addressed sampled images bound 2D or 3D `ImageDim::D3OrD2`. The
 /// precompile, the compile bench and the guess report key them so.
-pub(crate) fn key_learned(insts: &[rdna::Inst], plan: &Plan, resources: &mut [ResSpec]) {
+pub(crate) fn key_learned(code: u64, insts: &[rdna::Inst], plan: &Plan, resources: &mut [ResSpec]) {
     let stored = format_store_resources(insts, plan);
     let d3 = d3_resources(insts, plan);
     for (i, r) in resources.iter_mut().enumerate() {
         match *r {
-            ResSpec::Buffer { format, .. } if format != 0 && format != translate::FORMAT_RT && stored & (1 << i.min(63)) == 0 && translate::rt_format_entry(format as u16) != 0 => {
-                *r = ResSpec::Buffer { format: translate::FORMAT_RT, dst_sel: 0 };
+            // (A program's one format kept, as preparations keep it:
+            // `seed_formats` from its learned specs.)
+            ResSpec::Buffer { format, dst_sel } if format != 0 && format != translate::FORMAT_RT && stored & (1 << i.min(63)) == 0 && translate::rt_format_entry(format as u16) != 0 => {
+                if !seeded_single(code, i, format, dst_sel) {
+                    *r = ResSpec::Buffer { format: translate::FORMAT_RT, dst_sel: 0 };
+                }
             }
             ResSpec::Image { dim: ImageDim::D2 | ImageDim::D3, class, depth } if i < 64 && d3 & (1 << i) != 0 && plan.resources.get(i).is_some_and(|x| x.kind == ResKind::Image && !x.written) => {
                 *r = ResSpec::Image { dim: ImageDim::D3OrD2, class, depth };
@@ -2965,7 +3003,10 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
                     if fmt_census_on() {
                         fmt_census_note(code_hash, addr, i, v.format as u16, v.dst_sel as u16);
                     }
-                    if super::tune::fmt_single() && single_format(code_hash, i, v.format as u8, v.dst_sel as u16) {
+                    // (Specialized while its program and resource see one
+                    // format: GPU busy -1.5% at the vista and -1.9% at Doran,
+                    // frames +0.6-0.7%, FINDINGS.md 2026-11-06.)
+                    if single_format(code_hash, i, v.format, v.dst_sel) {
                         (v.format, v.dst_sel)
                     } else {
                         (translate::FORMAT_RT, 0)
