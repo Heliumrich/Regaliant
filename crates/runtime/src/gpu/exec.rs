@@ -7818,7 +7818,7 @@ pub fn laps_report() -> String {
     if !laps() || profiling() {
         return String::new();
     }
-    draw_steps_line() + &draw::delta_line() + &shaders::prep_parts_line() + &bind_steps_line() + &pre_steps_line() + &prog_census_lines() + &slow_place_lines()
+    draw_steps_line() + &draw::delta_line() + &shaders::prep_parts_line() + &bind_steps_line() + &pre_steps_line() + &prog_census_lines() + &slow_place_lines() + &shaders::fmt_census_lines()
 }
 
 /// Shaders by total GPU time.

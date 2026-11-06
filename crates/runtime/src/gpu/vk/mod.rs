@@ -42,6 +42,8 @@ pub struct Ctx {
     pub names: Option<ash::ext::debug_utils::Device>,
     /// VK_KHR_fragment_shader_barycentric enabled.
     pub barycentric: bool,
+    /// VK_NV_shader_subgroup_partitioned enabled (`subgroup_partitioned`).
+    pub partitioned: bool,
     /// VK_EXT_memory_budget enabled (`heap_report`).
     pub memory_budget: bool,
     /// VK_EXT_calibrated_timestamps with the device and performance-counter
@@ -408,6 +410,16 @@ fn init_inner() -> Result<(), String> {
             instance.get_physical_device_features2(pdev, &mut f2);
         }
         let barycentric = has_bary_ext && bary_supported.fragment_shader_barycentric != 0;
+        // Partitioned subgroup operations (write marks ORed per map word:
+        // `rdna::translate::Spec::marks_part`).
+        let partitioned = instance
+            .enumerate_device_extension_properties(pdev)
+            .unwrap_or_default()
+            .iter()
+            .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::nv::shader_subgroup_partitioned::NAME);
+        if partitioned {
+            dexts.push(ash::nv::shader_subgroup_partitioned::NAME.as_ptr());
+        }
         let mut bary = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default().fragment_shader_barycentric(true);
         if barycentric {
             dexts.push(ash::khr::fragment_shader_barycentric::NAME.as_ptr());
@@ -602,6 +614,7 @@ fn init_inner() -> Result<(), String> {
             device_name,
             validation,
             barycentric,
+            partitioned,
             memory_budget,
         };
         crate::info!("Vulkan device: {} (queue family {qf}, validation {})", ctx.device_name, validation);
@@ -718,6 +731,15 @@ pub mod mark {
     pub const SHADOW_OUT: u64 = 4;
     pub const UPLOAD: u64 = 5;
     pub const BATCH: u64 = 6;
+}
+
+/// The device offers partitioned subgroup operations
+/// (VK_NV_shader_subgroup_partitioned, enabled when offered): write marks are
+/// then ORed per map word (`rdna::translate::Spec::marks_part`; the 19
+/// hottest compute programs' code -12.8%, GPU busy -6.2% at the vista and
+/// -2.8% at Doran, frames +1.1-1.2%: FINDINGS.md 2026-11-06).
+pub fn subgroup_partitioned() -> bool {
+    try_ctx().is_some_and(|c| c.partitioned)
 }
 
 /// Command labels are recorded (DS_GPU_LABELS=1, `Exec::label`).

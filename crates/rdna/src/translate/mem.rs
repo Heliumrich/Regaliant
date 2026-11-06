@@ -1457,6 +1457,9 @@ fn mark_dwords_once(tr: &mut T, r: usize, d0: Word, n: u32) -> R<()> {
         } else {
             z
         };
+        if tr.spec.marks_part {
+            return mark_partitioned(tr, marks, w, m0, m1, n);
+        }
         // Lanes whose words lie within four of the first active lane's
         // (consecutive stores: usually all) combine their bits: one lane
         // stores at most five words for them. The others store their own.
@@ -1564,6 +1567,57 @@ fn mark_dwords_once(tr: &mut T, r: usize, d0: Word, n: u32) -> R<()> {
         }
         ok(tr.b.branch(merge))?;
         e(tr.b.begin_block(Some(merge)))?;
+        Ok(())
+    })
+}
+
+/// `Spec::marks_part`: the active lanes marking map word `w` (bits `m0`,
+/// and `m1` in the next word for a store spilling past it; `n` dwords) form
+/// a partition by `w`; its lowest lane ORs the partition's bits into the
+/// word (and the next) and touches their pages as the other paths do.
+fn mark_partitioned(tr: &mut T, marks: Word, w: Word, m0: Word, m1: Word, n: u32) -> R<()> {
+    let (u, b) = (tr.t.u32, tr.t.bool_);
+    tr.b.capability(spirv::Capability::GroupNonUniform);
+    tr.b.capability(spirv::Capability::GroupNonUniformBallot);
+    tr.b.capability(spirv::Capability::GroupNonUniformArithmetic);
+    tr.b.capability(spirv::Capability::GroupNonUniformPartitionedEXT);
+    tr.b.extension("SPV_NV_shader_subgroup_partitioned");
+    let sg = tr.u(spirv::Scope::Subgroup as u32);
+    let part = e(tr.b.group_non_uniform_partition_ext(tr.t.v4u, None, w))?;
+    let or0 = e(tr.b.group_non_uniform_bitwise_or(u, None, sg, spirv::GroupOperation::PartitionedReduceEXT, m0, Some(part)))?;
+    let or1 = if n > 1 { Some(e(tr.b.group_non_uniform_bitwise_or(u, None, sg, spirv::GroupOperation::PartitionedReduceEXT, m1, Some(part)))?) } else { None };
+    let lead = e(tr.b.group_non_uniform_ballot_find_lsb(u, None, sg, part))?;
+    let me = tr.subgroup_lane()?;
+    let is_lead = e(tr.b.i_equal(b, None, me, lead))?;
+    tr.guarded(is_lead, &mut |tr| {
+        let (u, b) = (tr.t.u32, tr.t.bool_);
+        let z = tr.u(0);
+        let scope = tr.u(spirv::Scope::Device as u32);
+        let sem = tr.u(0);
+        let p0 = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, w]))?;
+        e(tr.b.atomic_or(u, None, p0, scope, sem, or0))?;
+        touch_page(tr, marks, w)?;
+        if let Some(o1) = or1 {
+            let any = e(tr.b.i_not_equal(b, None, o1, z))?;
+            tr.guarded(any, &mut |tr| {
+                let u = tr.t.u32;
+                let one = tr.u(1);
+                let w1 = e(tr.b.i_add(u, None, w, one))?;
+                let z = tr.u(0);
+                let p1 = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, w1]))?;
+                let scope = tr.u(spirv::Scope::Device as u32);
+                let sem = tr.u(0);
+                e(tr.b.atomic_or(u, None, p1, scope, sem, o1))?;
+                if !tr.spec.touch_test {
+                    return touch_page(tr, marks, w1);
+                }
+                // (`Spec::touch_test`: its page only when it is the next.)
+                let k31 = tr.u(31);
+                let lo = e(tr.b.bitwise_and(u, None, w, k31))?;
+                let next = e(tr.b.i_equal(tr.t.bool_, None, lo, k31))?;
+                tr.guarded(next, &mut |tr| touch_page(tr, marks, w1))
+            })?;
+        }
         Ok(())
     })
 }

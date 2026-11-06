@@ -179,7 +179,19 @@ fn late_stats(measure: bool) -> bool {
 /// them).
 pub fn lod_rotated(p: &Prepared) -> bool {
     let s = &p.tr.spec;
-    s.stage == Stage::Fragment && !s.lod_stats && !s.batched && !s.early_tests && !s.early_ok && lod_per_draw()
+    s.stage == Stage::Fragment && !s.lod_stats && !s.batched && if s.early_tests || s.early_ok { lod_early_rotation() } else { lod_per_draw() }
+}
+
+/// Whether pixel programs whose depth tests run before the shader take
+/// their LOD statistics in rotation (`tune lod_early` >= 2).
+pub fn lod_early_rotation() -> bool {
+    matches!(super::tune::lod_stats(), 3 | 4) && super::tune::lod_early() >= 2
+}
+
+/// Whether `p` is a pixel stage with early depth tests (its rotation period
+/// is `tune lod_early`'s, `lodstats::rotate_early`).
+pub fn early_stage(p: &Prepared) -> bool {
+    p.tr.spec.early_tests || p.tr.spec.early_ok
 }
 
 /// Whether compute programs' LOD statistics are decided per dispatch
@@ -1208,6 +1220,49 @@ pub fn reset_prep_parts() {
 }
 
 /// The profile lines of `PREP_PARTS` ("" before any).
+/// `DS_FMT_CENSUS=1` (diagnosis): the formats and swizzles compute stages
+/// read through `FORMAT_RT`, per (program code, resource): [(format,
+/// dst_sel) -> preparations], with the program's address.
+static FMT_CENSUS: parking_lot::Mutex<Option<HashMap<(u64, usize), (u64, HashMap<(u16, u16), u64>)>>> = parking_lot::Mutex::new(None);
+
+fn fmt_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_FMT_CENSUS").ok().as_deref() == Some("1"))
+}
+
+fn fmt_census_note(code: u64, addr: u64, res: usize, format: u16, dst_sel: u16) {
+    let mut g = FMT_CENSUS.lock();
+    let e = g.get_or_insert_with(HashMap::new).entry((code, res)).or_insert_with(|| (addr, HashMap::new()));
+    *e.1.entry((format, dst_sel)).or_default() += 1;
+}
+
+/// The census's lines (`DS_FMT_CENSUS=1`; in the step laps' report): per
+/// program, its run-time-format resources by preparations, the formats seen.
+pub fn fmt_census_lines() -> String {
+    let g = FMT_CENSUS.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    // Per program: preparations (the most counted resource's), resources.
+    let mut progs: HashMap<u64, (u64, u64, Vec<(usize, Vec<((u16, u16), u64)>)>)> = HashMap::new();
+    for (&(code, res), (addr, f)) in m.iter() {
+        let n: u64 = f.values().sum();
+        let e = progs.entry(code).or_insert((*addr, 0, Vec::new()));
+        e.1 = e.1.max(n);
+        let mut fs: Vec<((u16, u16), u64)> = f.iter().map(|(k, v)| (*k, *v)).collect();
+        fs.sort_by(|a, b| b.1.cmp(&a.1));
+        e.2.push((res, fs));
+    }
+    let mut v: Vec<_> = progs.into_iter().collect();
+    v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    let (single, multi) = v.iter().fold((0u64, 0u64), |(s, m), (_, (_, n, rs))| if rs.iter().all(|(_, fs)| fs.len() == 1) { (s + n, m) } else { (s, m + n) });
+    let mut out = format!("    run-time formats (`DS_FMT_CENSUS`): {} programs; preparations of programs whose every such resource saw one format {}, of the others {}; the most prepared:\n", v.len(), single, multi);
+    for (code, (addr, n, mut rs)) in v.into_iter().take(40) {
+        rs.sort_by_key(|r| r.0);
+        let parts: Vec<String> = rs.iter().map(|(r, fs)| format!("#{r} {}", fs.iter().map(|((f, d), c)| format!("fmt {f} sel {d:#05x} x{c}")).collect::<Vec<_>>().join(" / "))).collect();
+        out.push_str(&format!("      cs {addr:#x} (code {code:#x}) {n} preparations: {}\n", parts.join("; ")));
+    }
+    out
+}
+
 pub fn prep_parts_line() -> String {
     let hz = super::threadcpu::tsc_hz();
     let mut s = String::new();
@@ -1285,6 +1340,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         marks_untouched: !super::tune::mark_touch(),
         touch_test: touch_test_wanted(),
         mark_twice: marks_wanted() && super::tune::tr_ballast() & 1 != 0,
+        marks_part: marks_wanted() && super::vk::subgroup_partitioned(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -1627,6 +1683,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         marks_untouched: !super::tune::mark_touch(),
         touch_test: touch_test_wanted(),
         mark_twice: marks_wanted() && super::tune::tr_ballast() & 1 != 0,
+        marks_part: marks_wanted() && super::vk::subgroup_partitioned(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -1643,6 +1700,12 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
     // lod_late`): in rotation only for a draw measuring (`with_lod_stats`)
     // or batched; none at 0 (diagnosis).
     if spec.lod_stats && !spec.early_tests && !spec.early_ok && !late_stats(spec.batched || LOD_MEASURE.with(|c| c.get())) {
+        spec.lod_stats = false;
+        spec.lod_lean = false;
+    }
+    // Where the tests run before the shader (`tune lod_early`): in rotation
+    // too, for a draw measuring or batched.
+    if spec.lod_stats && (spec.early_tests || spec.early_ok) && lod_early_rotation() && !(spec.batched || LOD_MEASURE.with(|c| c.get())) {
         spec.lod_stats = false;
         spec.lod_lean = false;
     }
@@ -1828,6 +1891,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         marks_untouched: !super::tune::mark_touch(),
         touch_test: touch_test_wanted(),
         mark_twice: marks_wanted() && super::tune::tr_ballast() & 1 != 0,
+        marks_part: marks_wanted() && super::vk::subgroup_partitioned(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2667,6 +2731,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         marks_untouched: !super::tune::mark_touch(),
         touch_test: touch_test_wanted(),
         mark_twice: marks_wanted() && super::tune::tr_ballast() & 1 != 0,
+        marks_part: marks_wanted() && super::vk::subgroup_partitioned(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2719,6 +2784,7 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         marks_untouched: !super::tune::mark_touch(),
         touch_test: touch_test_wanted(),
         mark_twice: marks_wanted() && super::tune::tr_ballast() & 1 != 0,
+        marks_part: marks_wanted() && super::vk::subgroup_partitioned(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2771,6 +2837,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         marks_untouched: !super::tune::mark_touch(),
         touch_test: touch_test_wanted(),
         mark_twice: marks_wanted() && super::tune::tr_ballast() & 1 != 0,
+        marks_part: marks_wanted() && super::vk::subgroup_partitioned(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2866,6 +2933,9 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
                 let (format, dst_sel) = if fmt_mask & (1 << i.min(63)) == 0 {
                     (0, 0)
                 } else if spec.stage == Stage::Compute && translate::rt_format_entry(v.format as u16) != 0 && LOCAL_STORE_FORMATS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| format_store_resources(&insts, &plan))) & (1 << i.min(63)) == 0 {
+                    if fmt_census_on() {
+                        fmt_census_note(code_hash, addr, i, v.format as u16, v.dst_sel as u16);
+                    }
                     (translate::FORMAT_RT, 0)
                 } else {
                     (v.format, v.dst_sel)

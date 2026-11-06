@@ -1217,7 +1217,10 @@ impl Exec {
         // measures in one of its draws in N (prepared again with them); the
         // others carry their textures' recent measurements (`lodstats`).
         let lod_rotated = ps.as_ref().is_some_and(shaders::lod_rotated);
-        let lod_measure = lod_rotated && super::super::lodstats::rotate(&ps.as_ref().unwrap().resources);
+        let lod_measure = lod_rotated && {
+            let p = ps.as_ref().unwrap();
+            if shaders::early_stage(p) { super::super::lodstats::rotate_early(&p.resources) } else { super::super::lodstats::rotate(&p.resources) }
+        };
         if lod_measure {
             let p = shaders::with_lod_stats(|| shaders::prepare_ps(cp))?;
             super::super::lodstats::bound(&p.resources);

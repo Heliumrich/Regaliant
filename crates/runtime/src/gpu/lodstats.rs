@@ -133,6 +133,12 @@ pub fn rotate(res: &[super::shaders::Resolved]) -> bool {
     rotate_n(res, super::tune::lod_late().max(1))
 }
 
+/// `rotate` for a pixel program whose depth tests run before the shader
+/// (`tune lod_early`).
+pub fn rotate_early(res: &[super::shaders::Resolved]) -> bool {
+    rotate_n(res, super::tune::lod_early().max(1))
+}
+
 /// `rotate` for a compute dispatch prepared without its statistics
 /// (`shaders::cs_lod_rotated`): one in `tune lod_cs` measures.
 pub fn rotate_cs(res: &[super::shaders::Resolved]) -> bool {
@@ -184,7 +190,7 @@ pub struct Carry {
 pub fn end_report(reset: bool) -> Option<Carry> {
     // (The window holds two rotations of the longer of the draws' and the
     // dispatches' periods.)
-    let n = super::tune::lod_late().max(if super::shaders::cs_lod_rotation() { super::tune::lod_cs() } else { 0 });
+    let n = super::tune::lod_late().max(if super::shaders::cs_lod_rotation() { super::tune::lod_cs() } else { 0 }).max(if super::shaders::lod_early_rotation() { super::tune::lod_early() } else { 0 });
     let take = |a: &[AtomicU64; 256]| -> Box<[u64; 256]> { Box::new(std::array::from_fn(|b| if reset { a[b].swap(0, Ordering::Relaxed) } else { a[b].load(Ordering::Relaxed) })) };
     let c = Carry { report: REPORTS.load(Ordering::Relaxed), window: (2 * n).min(HIST as u64), banks: take(&BANK_TEX), carried: take(&CARRIED) };
     if reset {

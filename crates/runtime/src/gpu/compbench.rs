@@ -398,10 +398,20 @@ pub fn run(args: &[String], app: &std::path::Path) -> i32 {
         if std::env::var("DS_CB_SG_WAVES").ok().as_deref() == Some("1") {
             spec.sg_waves = true;
         }
-        // (Learned specs as a preparation keys them now.)
+        // (Learned specs as a preparation keys them now; `DS_CB_FORMATS=1`
+        // keeps the formats the learned dispatches had instead of the
+        // run-time decode, `FORMAT_RT`: what specializing them would save.)
         if let Ok(insts) = rdna::decode_program(code) {
             let plan = rdna::analysis::analyze_opts(&insts, spec.user_sgprs, spec.user_base, false);
+            let learned = spec.resources.clone();
             super::shaders::key_learned(&insts, &plan, &mut spec.resources);
+            if std::env::var("DS_CB_FORMATS").ok().as_deref() == Some("1") {
+                for (r, l) in spec.resources.iter_mut().zip(learned.iter()) {
+                    if matches!(r, rdna::translate::ResSpec::Buffer { format, .. } if *format == rdna::translate::FORMAT_RT) {
+                        *r = l.clone();
+                    }
+                }
+            }
         }
         let tr = match super::shaders::translate_code_for_spec(code, *h, spec) {
             Ok(t) => t,

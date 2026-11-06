@@ -400,6 +400,13 @@ pub struct Spec {
     /// is the same and only the marking's cost doubles: what it takes from
     /// live frames prices a leaner form.
     pub mark_twice: bool,
+    /// With `write_marks`, the lanes of a store that mark one map word OR
+    /// their bits by a partitioned reduction (OpGroupNonUniformPartitionEXT:
+    /// the device offers VK_NV_shader_subgroup_partitioned), the
+    /// partition's lowest lane storing them: the same bits and pages as the
+    /// subgroup ORs over up to five words and the per-lane path, in one
+    /// reduction per word.
+    pub marks_part: bool,
     /// How the SGPR data binding is declared: 0 a storage buffer (u32
     /// array), 1 a uniform buffer (`BindingKind::SgprUniform`: a std140
     /// array of uvec4 sized to the plan's SGPR data) where the binding is the
@@ -537,6 +544,9 @@ impl std::hash::Hash for Spec {
         }
         if self.mark_twice {
             0x4D32_5458u32.hash(state);
+        }
+        if self.marks_part {
+            0x4D50_5254u32.hash(state);
         }
         if self.touch_test {
             0x5454_5354u32.hash(state);
@@ -4067,6 +4077,7 @@ mod tests {
             marks_untouched: false,
             touch_test: false,
             mark_twice: false,
+            marks_part: false,
             sgpr_ubo: 0,
             gpu_loads: 0,
             gpu_res: 0,
