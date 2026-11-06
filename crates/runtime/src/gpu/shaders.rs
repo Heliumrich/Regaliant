@@ -1338,7 +1338,7 @@ struct FmtJob {
 static FMT_JOBS: Mutex<std::collections::VecDeque<FmtJob>> = Mutex::new(std::collections::VecDeque::new());
 static FMT_CV: parking_lot::Condvar = parking_lot::Condvar::new();
 static FMT_WORKERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static FMT_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+static FMT_STATS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
 /// Whether a specialized key is being made in the background.
 fn fmt_pending(plan_key: u64, spec_hash: u64) -> bool {
@@ -1368,7 +1368,20 @@ fn fmt_run_time(key_spec: &Spec, specialized: u64, plan_key: u64) -> Option<Arc<
         h.finish()
     };
     let t = LOCAL_TRANSLATIONS.with(|c| c.borrow().get(&(plan_key, h)).cloned()).or_else(|| TRANSLATIONS.lock().as_ref().and_then(|m| m.get(&(plan_key, h)).cloned()))?;
-    (t.spec == rt && super::exec::compute_pipe_ready(&t)).then_some(t)
+    if t.spec != rt {
+        return None;
+    }
+    if super::exec::compute_pipe_ready(&t) {
+        return Some(t);
+    }
+    // (Its pipeline still compiling ahead of use, as after a level load:
+    // the dispatch waits for that compile, begun earlier, instead of
+    // compiling the specialized one where it stands.)
+    if super::exec::compute_pipe_in_flight(&t) {
+        FMT_STATS[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Some(t);
+    }
+    None
 }
 
 /// Queues a specialized key's translation and pipeline (false when it is
@@ -1443,13 +1456,14 @@ pub fn fmt_line() -> String {
         return String::new();
     }
     format!(
-        "    compute keys specialized to one format, first uses: {} made in the background ({} made, {:.1} s; {} failed; {} pending now), {} preparations ran the run-time variant meanwhile; {} made in place (no run-time variant ready)\n",
+        "    compute keys specialized to one format, first uses: {} made in the background ({} made, {:.1} s; {} failed; {} pending now), {} preparations ran the run-time variant meanwhile ({} of them with its pipeline still compiling ahead); {} made in place (no run-time variant)\n",
         v[1],
         v[2],
         v[3] as f64 / 1e9,
         v[4],
         FMT_PENDING_N.load(std::sync::atomic::Ordering::Relaxed),
         v[0],
+        v[6],
         v[5]
     )
 }

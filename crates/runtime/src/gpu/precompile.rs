@@ -356,12 +356,24 @@ fn early() {
         })
     });
     STATS[EARLY].fetch_add(jobs.len() as u64, Ordering::Relaxed);
+    // (After every job of an object the title created, which a level being
+    // loaded is about to use: FINDINGS.md 2026-11-06 late morning.)
     let mut q = QUEUE.lock();
     for (r, j) in jobs {
-        q.ready.push(std::cmp::Reverse((r, j)));
+        q.ready.push(std::cmp::Reverse((r | STARTUP, j)));
     }
     CV.notify_all();
 }
+
+/// The rank bit of jobs queued at the session's start (`early`): the jobs
+/// of objects the title creates go first.
+const STARTUP: u32 = 1 << 31;
+/// Programs and graphics pipelines queued again for an object the title
+/// created after their start-up job.
+static URGENT_HASHES: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+static URGENT_GFX: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+/// Jobs queued again that way: [compute, graphics].
+static URGENT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 fn add_recipe(g: &mut GfxLearned, rank: u32, r: GfxRecipe) {
     let i = g.recipes.len();
@@ -572,6 +584,13 @@ fn classify(addr: u64) {
                 if QUEUED_HASHES.lock().get_or_insert_with(Default::default).insert(code_hash) || super::tune::precompile() >= 3 {
                     QUEUE.lock().ready.push(std::cmp::Reverse((r, Job::Addr(addr))));
                     CV.notify_one();
+                } else if URGENT_HASHES.lock().get_or_insert_with(Default::default).insert(code_hash) {
+                    // Queued at the start behind the earlier-learned areas:
+                    // queued again ahead of them (the later job finds its
+                    // pipelines made).
+                    URGENT[0].fetch_add(1, Ordering::Relaxed);
+                    QUEUE.lock().ready.push(std::cmp::Reverse((r, Job::Addr(addr))));
+                    CV.notify_one();
                 } else {
                     DONE[5].fetch_add(1, Ordering::Relaxed);
                 }
@@ -594,8 +613,13 @@ fn classify(addr: u64) {
         let has = |h: u64| present.as_ref().is_some_and(|m| m.contains_key(&h));
         for &i in ids {
             let (rank, r) = &g.recipes[i];
-            if has(r.vs) && (r.ps == 0 || has(r.ps)) && !g.queued.contains(&i) {
-                v.push((*rank, i));
+            if has(r.vs) && (r.ps == 0 || has(r.ps)) {
+                if !g.queued.contains(&i) {
+                    v.push((*rank, i));
+                } else if URGENT_GFX.lock().get_or_insert_with(Default::default).insert(i) {
+                    URGENT[1].fetch_add(1, Ordering::Relaxed);
+                    v.push((*rank, i));
+                }
             }
         }
         drop(present);
@@ -1147,7 +1171,16 @@ pub fn status() -> String {
     };
     let made = if super::tune::precompile() >= 2 {
         let g: Vec<u64> = GFX_DONE.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-        format!("{made}; graphics pipelines made from objects: {} ({:.1} s), {} present already, {} failed ({} created for draws measuring LOD statistics in rotation)", g[0], g[1] as f64 / 1e9, g[2], g[3], g[4])
+        format!(
+            "{made}; graphics pipelines made from objects: {} ({:.1} s), {} present already, {} failed ({} created for draws measuring LOD statistics in rotation); objects' jobs queued again ahead of the start-up ones: {} compute, {} graphics",
+            g[0],
+            g[1] as f64 / 1e9,
+            g[2],
+            g[3],
+            g[4],
+            URGENT[0].load(Ordering::Relaxed),
+            URGENT[1].load(Ordering::Relaxed)
+        )
     } else {
         made
     };

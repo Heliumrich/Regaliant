@@ -2123,6 +2123,13 @@ pub(crate) fn compute_pipe_ready(tr: &super::shaders::Translated) -> bool {
     PIPES.lock().as_ref().is_some_and(|m| m.contains_key(&key))
 }
 
+/// Whether the compute pipeline of a translation is being created (a
+/// compile ahead of use, `gpu::precompile`, has it in flight).
+pub(crate) fn compute_pipe_in_flight(tr: &super::shaders::Translated) -> bool {
+    let key = push_key(tr.key, push_fits_tr(tr));
+    PIPE_FLIGHTS.lock().as_ref().is_some_and(|m| m.contains_key(&key))
+}
+
 /// The graphics pipeline of a draw scanned ahead of its use (`draw`).
 pub(crate) use draw::{precompile_gfx_translations, GfxState};
 
