@@ -241,6 +241,15 @@ pub const SELECTED: u32 = 0x1;
 /// that list's item when the focus arrived with the screen or the list.
 pub const FOCUS_PATH: u32 = 0x40;
 
+/// A node's definition (its UIElement) and the definition's design width and height.
+pub fn definition_size(n: u64) -> Option<(f32, f32)> {
+    let d = unsafe { std::ptr::read_volatile((n + 0x110) as *const u64) };
+    if d < 0x1000 || !crate::mem::readable(d + 0xB0, 8) {
+        return None;
+    }
+    Some((rdf(d + 0xB0), rdf(d + 0xB4)))
+}
+
 /// A node's rectangle relative to its parent (x, y, w, h).
 pub fn local(n: u64) -> (f32, f32, f32, f32) {
     (rdf(n + 0x2FC), rdf(n + 0x300), rdf(n + 0x304), rdf(n + 0x308))

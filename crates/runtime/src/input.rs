@@ -424,6 +424,8 @@ struct Bind {
 #[derive(Clone, Debug)]
 struct Layout {
     binds: Vec<Bind>,
+    /// Each binding's comment in the file (`# ...`), kept when the file is written again.
+    comments: Vec<Option<String>>,
     mouse_look: bool,
     sensitivity: f32,
     /// The vertical axis's own sensitivity (`mouse_sensitivity_y`; None: the
@@ -523,9 +525,10 @@ fn parse_dst(s: &str) -> Option<Dst> {
 }
 
 fn parse_layout(text: &str) -> Result<Layout, String> {
-    let mut l = Layout { binds: Vec::new(), mouse_look: true, sensitivity: 1.0, sensitivity_y: None, invert_y: false, mouse_raw: true };
-    for (i, line) in text.lines().enumerate() {
-        let line = line.split('#').next().unwrap_or("").trim();
+    let mut l = Layout { binds: Vec::new(), comments: Vec::new(), mouse_look: true, sensitivity: 1.0, sensitivity_y: None, invert_y: false, mouse_raw: true };
+    for (i, full) in text.lines().enumerate() {
+        let comment = full.find('#').map(|c| full[c..].trim_end().to_string());
+        let line = full.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
         }
@@ -545,16 +548,21 @@ fn parse_layout(text: &str) -> Result<Layout, String> {
                 let (src, mods) = parse_src(a).ok_or_else(|| format!("line {}: unknown input '{a}'", i + 1))?;
                 let dst = parse_dst(b).ok_or_else(|| format!("line {}: unknown target '{b}'", i + 1))?;
                 l.binds.push(Bind { src, mods, dst });
+                l.comments.push(comment);
             }
         }
     }
     Ok(l)
 }
 
-static LAYOUT: OnceLock<Layout> = OnceLock::new();
+/// The layout in use (replaced whole when an action is rebound in the menu, `rebind`) and its file.
+static LAYOUT: Mutex<Option<std::sync::Arc<Layout>>> = Mutex::new(None);
+static LAYOUT_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+/// Counts layout changes (the prompts' glyph map follows).
+pub static LAYOUT_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-fn layout() -> &'static Layout {
-    LAYOUT.get_or_init(|| parse_layout(DEFAULT_LAYOUT).expect("default layout"))
+fn layout() -> std::sync::Arc<Layout> {
+    LAYOUT.lock().get_or_insert_with(|| std::sync::Arc::new(parse_layout(DEFAULT_LAYOUT).expect("default layout"))).clone()
 }
 
 /// Reads the keyboard and mouse layout from `path` (written with the
@@ -582,7 +590,157 @@ pub fn init(path: &std::path::Path) {
         l.mouse_raw = v != "0";
         crate::info!("input: raw mouse look {} (DS_MOUSE_RAW)", if l.mouse_raw { "on" } else { "off" });
     }
-    let _ = LAYOUT.set(l);
+    *LAYOUT.lock() = Some(std::sync::Arc::new(l));
+    *LAYOUT_PATH.lock() = Some(path.to_path_buf());
+}
+
+/// Binds `target`'s first binding to `input` with `mods` (None: removes that binding). An input
+/// another action had as its first binding goes to that action's place in exchange (the two
+/// swap), so no input does two things. The file is written again (its other lines and comments
+/// as they were; the changed bindings' lines replaced).
+pub fn rebind(target: &str, input: Option<(PromptInput, u8)>) -> Result<(), String> {
+    let dst = parse_dst(target).ok_or_else(|| format!("unknown target {target}"))?;
+    let src_of = |i: PromptInput| match i {
+        PromptInput::Key(k) => Src::Key(k),
+        PromptInput::Mouse(m) => Src::Mouse(m),
+        PromptInput::WheelUp => Src::WheelUp,
+        PromptInput::WheelDown => Src::WheelDown,
+    };
+    let old = layout();
+    let mut l = (*old).clone();
+    let mine = l.binds.iter().position(|b| b.dst == dst);
+    match input {
+        Some((i, mods)) => {
+            let (src, mods) = (src_of(i), mods);
+            // Another action's binding of the same input: it takes this action's old input.
+            if let Some(other) = l.binds.iter().position(|b| b.src == src && b.mods == mods && b.dst != dst) {
+                match mine {
+                    Some(m) => {
+                        let (osrc, omods) = (l.binds[m].src, l.binds[m].mods);
+                        l.binds[other].src = osrc;
+                        l.binds[other].mods = omods;
+                    }
+                    None => {
+                        l.binds.remove(other);
+                        if other < l.comments.len() {
+                            l.comments.remove(other);
+                        }
+                    }
+                }
+            }
+            let mine = l.binds.iter().position(|b| b.dst == dst);
+            match mine {
+                Some(m) => {
+                    l.binds[m].src = src;
+                    l.binds[m].mods = mods;
+                }
+                None => {
+                    l.binds.push(Bind { src, mods, dst });
+                    l.comments.push(None);
+                }
+            }
+        }
+        None => {
+            if let Some(m) = mine {
+                l.binds.remove(m);
+                if m < l.comments.len() {
+                    l.comments.remove(m);
+                }
+            }
+        }
+    }
+    *LAYOUT.lock() = Some(std::sync::Arc::new(l.clone()));
+    LAYOUT_GEN.fetch_add(1, Relaxed);
+    crate::info!("input: {target} bound to {}", input.map(|(i, m)| prompt_name(i, m)).unwrap_or_else(|| "nothing".into()));
+    save(&l)
+}
+
+/// An input named as in the layout file (`Shift+Mouse1`, `G`): the prompts' form.
+pub fn parse_prompt_input(name: &str) -> Option<(PromptInput, u8)> {
+    let (src, mods) = parse_src(name)?;
+    let i = match src {
+        Src::Key(k) => PromptInput::Key(k),
+        Src::Mouse(m) => PromptInput::Mouse(m),
+        Src::WheelUp => PromptInput::WheelUp,
+        Src::WheelDown => PromptInput::WheelDown,
+    };
+    Some((i, mods))
+}
+
+/// An input's name as the layout file writes it.
+pub fn prompt_name(i: PromptInput, mods: u8) -> String {
+    let mut s = String::new();
+    for (bit, name) in [(MOD_SHIFT, "Shift+"), (MOD_CTRL, "Ctrl+"), (MOD_ALT, "Alt+")] {
+        if mods & bit != 0 {
+            s += name;
+        }
+    }
+    s += &match i {
+        PromptInput::Key(k) => key_name(k),
+        PromptInput::Mouse(m) => format!("Mouse{}", m + 1),
+        PromptInput::WheelUp => "WheelUp".into(),
+        PromptInput::WheelDown => "WheelDown".into(),
+    };
+    s
+}
+
+/// A virtual-key code's name in the layout file.
+fn key_name(k: u8) -> String {
+    match k {
+        b'A'..=b'Z' | b'0'..=b'9' => (k as char).to_string(),
+        0x70..=0x87 => format!("F{}", k - 0x6F),
+        _ => ["Space", "Enter", "Esc", "Tab", "Backspace", "Up", "Down", "Left", "Right", "Shift", "LShift", "RShift", "Ctrl", "LCtrl", "RCtrl", "Alt", "LAlt", "RAlt", "CapsLock", "Insert", "Delete", "Home", "End", "PageUp", "PageDown"]
+            .into_iter()
+            .find(|n| key_code(n) == Some(k))
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{k:#04x}")),
+    }
+}
+
+/// The layout file written again (`render`).
+fn save(l: &Layout) -> Result<(), String> {
+    let Some(path) = LAYOUT_PATH.lock().clone() else { return Ok(()) };
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| DEFAULT_LAYOUT.to_string());
+    std::fs::write(&path, render(l, &text)).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The layout file's text for `l`: the lines of `text` before its first binding kept (the
+/// settings and the explanation), then the bindings in the layout's order, each with its comment.
+fn render(l: &Layout, text: &str) -> String {
+    let mut head = Vec::new();
+    for line in text.lines() {
+        let body = line.split('#').next().unwrap_or("").trim();
+        let is_binding = body.split_once('=').is_some_and(|(a, _)| {
+            let a = a.trim();
+            parse_src(a).is_some() && !matches!(a.to_ascii_lowercase().as_str(), "mouse_look" | "mouse_invert_y" | "mouse_look_raw" | "mouse_sensitivity" | "mouse_sensitivity_y")
+        });
+        if is_binding {
+            break;
+        }
+        head.push(line.to_string());
+    }
+    let target_name = |d: Dst| -> String {
+        let names = ["cross", "circle", "square", "triangle", "up", "down", "left", "right", "l1", "r1", "l2", "r2", "l3", "r3", "options", "touchpad", "ls_up", "ls_down", "ls_left", "ls_right", "rs_up", "rs_down", "rs_left", "rs_right", "walk"];
+        names.into_iter().find(|n| parse_dst(n) == Some(d)).unwrap_or("?").to_string()
+    };
+    let mut out = head.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    for (i, b) in l.binds.iter().enumerate() {
+        let input = match b.src {
+            Src::Key(k) => PromptInput::Key(k),
+            Src::Mouse(m) => PromptInput::Mouse(m),
+            Src::WheelUp => PromptInput::WheelUp,
+            Src::WheelDown => PromptInput::WheelDown,
+        };
+        let line = format!("{} = {}", prompt_name(input, b.mods), target_name(b.dst));
+        match l.comments.get(i).cloned().flatten() {
+            Some(c) => out += &format!("{line:<24}{c}\n"),
+            None => out += &format!("{line}\n"),
+        }
+    }
+    out
 }
 
 /// Keys and mouse buttons held by the control channel (`inject_hold`):
@@ -793,6 +951,11 @@ pub fn raw_mouse_look() -> bool {
     l.mouse_look && l.mouse_raw
 }
 
+/// The layout's change count (`LAYOUT_GEN`).
+pub fn layout_gen() -> u32 {
+    LAYOUT_GEN.load(Relaxed)
+}
+
 /// Raw mouse look with the mouse captured.
 fn raw_active() -> bool {
     use crate::gpu::vk::window::{CAPTURED, CAPTURE_TEST};
@@ -813,7 +976,7 @@ pub fn take_camera_motion() -> Option<(i64, i64)> {
         return None;
     }
     let (dx, dy) = (MOUSE_DX.swap(0, Relaxed), MOUSE_DY.swap(0, Relaxed));
-    Some((dx, if invert_y(layout()) { -dy } else { dy }))
+    Some((dx, if invert_y(&layout()) { -dy } else { dy }))
 }
 
 /// The PC settings' mouse sensitivity (a factor on controls.txt's, f32 bits) and vertical
@@ -889,13 +1052,17 @@ fn mouse_look(st: &mut PadState, l: &Layout) {
 const WALK_TILT: f32 = 0.4;
 
 fn keyboard_mouse(st: &mut PadState) {
+    // A key binding being captured: the keyboard and mouse are the menu's alone.
+    if crate::pcsettings::bindings::capturing() {
+        return;
+    }
     let l = layout();
     let mods = held_mods();
     // Stick directions held: left x-, x+, y-, y+, right x-, x+, y-, y+.
     let mut dirs = [false; 8];
     let mut walk = false;
     for b in &l.binds {
-        if b.mods & !mods != 0 || !held(b.src) || !applying(l, b.src, mods).any(|x| x == b) {
+        if b.mods & !mods != 0 || !held(b.src) || !applying(&l, b.src, mods).any(|x| x == b) {
             continue;
         }
         match b.dst {
@@ -931,8 +1098,17 @@ fn keyboard_mouse(st: &mut PadState) {
         st.lx = tilt(st.lx);
         st.ly = tilt(st.ly);
     }
-    wheel_taps(st, l, mods);
-    mouse_look(st, l);
+    wheel_taps(st, &l, mods);
+    mouse_look(st, &l);
+}
+
+/// Cross presses (its rising edges in the combined state) since start: the key bindings' capture
+/// starts on one (`pcsettings::bindings`).
+static CROSS_PRESSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CROSS_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn cross_presses() -> u32 {
+    CROSS_PRESSES.load(Relaxed)
 }
 
 /// Current combined pad state.
@@ -952,6 +1128,10 @@ pub fn pad_state() -> PadState {
     }
     if st.buttons & BTN_R2 != 0 {
         st.r2 = st.r2.max(255);
+    }
+    let cross = st.buttons & BTN_CROSS != 0;
+    if CROSS_HELD.swap(cross, Relaxed) != cross && cross {
+        CROSS_PRESSES.fetch_add(1, Relaxed);
     }
     st
 }
@@ -987,6 +1167,23 @@ mod tests {
         assert_eq!(find(Src::Key(0x1B), 0), Some(Dst::Button(BTN_OPTIONS)));
         assert_eq!(find(Src::Key(b'W'), 0), Some(Dst::Stick(Stick::LUp)));
         assert_eq!(find(Src::WheelDown, MOD_SHIFT), Some(Dst::Button(BTN_LEFT)));
+    }
+
+    #[test]
+    fn layout_file_round_trips() {
+        let l = parse_layout(DEFAULT_LAYOUT).unwrap();
+        assert_eq!(render(&l, DEFAULT_LAYOUT), DEFAULT_LAYOUT);
+        // A rebinding keeps the other lines and every comment where it was.
+        let mut m = l.clone();
+        let i = m.binds.iter().position(|b| b.dst == Dst::Button(BTN_R1)).unwrap();
+        m.binds[i].src = Src::Mouse(1);
+        let text = render(&m, DEFAULT_LAYOUT);
+        let again = parse_layout(&text).unwrap();
+        assert_eq!(again.binds.len(), l.binds.len());
+        assert_eq!(again.binds[i].src, Src::Mouse(1));
+        assert_eq!(again.comments, l.comments);
+        assert!(text.contains("Mouse2 = r1             # attack (right hand)"));
+        assert!(text.contains("LAlt = walk"));
     }
 
     #[test]

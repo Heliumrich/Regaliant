@@ -188,11 +188,11 @@ struct Set {
     keyboard: HashMap<&'static str, String>,
 }
 
+static SET: OnceLock<Set> = OnceLock::new();
+
 fn set() -> &'static Set {
-    static SET: OnceLock<Set> = OnceLock::new();
     SET.get_or_init(|| {
         let mut arts = BTreeMap::new();
-        let mut keyboard = HashMap::new();
         // Every key, mouse button and wheel direction a binding may use (a rebound action shows
         // its new input), and the layout's bindings with modifiers.
         for k in input::bindable_keys() {
@@ -204,50 +204,7 @@ fn set() -> &'static Set {
         for (i, mods) in input::bound_inputs() {
             arts.insert(format!("pc_{}", input_id(i, mods)), binding_art(i, mods));
         }
-        let first = |t: &str| input::binding_of(t);
-        for &(_, target) in PS {
-            let id = match target {
-                "ls" | "rs" => {
-                    let side = &target[..1];
-                    let dirs = ["up", "left", "down", "right"].map(|d| first(&format!("{side}s_{d}")));
-                    if target == "rs" && input::raw_mouse_look() {
-                        arts.insert("pc_look".into(), Art::MouseMove);
-                        "pc_look".to_string()
-                    } else if dirs.iter().all(|d| matches!(d, Some((PromptInput::Key(_), 0)))) {
-                        let labels = dirs.map(|d| match d {
-                            Some((PromptInput::Key(k), _)) => key_label(k),
-                            _ => String::new(),
-                        });
-                        let id = format!("pc_mv_{}", dirs.iter().map(|d| input_id(d.unwrap().0, 0)).collect::<Vec<_>>().join("_"));
-                        arts.insert(id.clone(), Art::Cluster(labels));
-                        id
-                    } else {
-                        continue;
-                    }
-                }
-                "updown" | "leftright" => {
-                    let (a, b) = if target == "updown" { ("up", "down") } else { ("left", "right") };
-                    match (first(a), first(b)) {
-                        (Some((PromptInput::Key(x), 0)), Some((PromptInput::Key(y), 0))) => {
-                            let id = format!("pc_p_{}_{}", input_id(PromptInput::Key(x), 0), input_id(PromptInput::Key(y), 0));
-                            let art = match (arrow_of(x), arrow_of(y)) {
-                                (Some(p), Some(q)) => Art::ArrowPair(p, q),
-                                _ => Art::KeyPair(key_label(x), key_label(y)),
-                            };
-                            arts.insert(id.clone(), art);
-                            id
-                        }
-                        (Some((i, m)), _) => format!("pc_{}", input_id(i, m)),
-                        _ => continue,
-                    }
-                }
-                t => match first(t) {
-                    Some((i, m)) => format!("pc_{}", input_id(i, m)),
-                    None => continue,
-                },
-            };
-            keyboard.insert(target, id);
-        }
+        let keyboard = keyboard_map(Some(&mut arts));
         for (id, art) in [
             ("xb_a", Art::XFace('A')),
             ("xb_b", Art::XFace('B')),
@@ -267,6 +224,81 @@ fn set() -> &'static Set {
         crate::info!("prompts: {} glyphs of the port's ({} targets on the keyboard and mouse)", arts.len(), keyboard.len());
         Set { arts, keyboard }
     })
+}
+
+/// Per layout target, the keyboard glyph standing for it (its first binding's; WASD-like
+/// clusters and arrow pairs as one glyph). With `arts` (at start) glyphs the layout needs are
+/// added; without (after a rebinding) only glyphs that exist are named: a cluster or pair the
+/// layout did not have at start falls back to its first key's glyph.
+fn keyboard_map(mut arts: Option<&mut BTreeMap<String, Art>>) -> HashMap<&'static str, String> {
+    let mut keyboard = HashMap::new();
+    let first = |t: &str| input::binding_of(t);
+    let exists = |arts: &Option<&mut BTreeMap<String, Art>>, id: &str| arts.as_ref().is_some_and(|a| a.contains_key(id)) || set_arts_has(id);
+    for &(_, target) in PS {
+        let id = match target {
+            "ls" | "rs" => {
+                let side = &target[..1];
+                let dirs = ["up", "left", "down", "right"].map(|d| first(&format!("{side}s_{d}")));
+                if target == "rs" && input::raw_mouse_look() {
+                    if let Some(a) = arts.as_deref_mut() {
+                        a.insert("pc_look".into(), Art::MouseMove);
+                    }
+                    "pc_look".to_string()
+                } else if dirs.iter().all(|d| matches!(d, Some((PromptInput::Key(_), 0)))) {
+                    let labels = dirs.clone().map(|d| match d {
+                        Some((PromptInput::Key(k), _)) => key_label(k),
+                        _ => String::new(),
+                    });
+                    let id = format!("pc_mv_{}", dirs.iter().map(|d| input_id(d.unwrap().0, 0)).collect::<Vec<_>>().join("_"));
+                    if let Some(a) = arts.as_deref_mut() {
+                        a.insert(id.clone(), Art::Cluster(labels));
+                        id
+                    } else if exists(&arts, &id) {
+                        id
+                    } else {
+                        format!("pc_{}", input_id(dirs[0].unwrap().0, 0))
+                    }
+                } else {
+                    continue;
+                }
+            }
+            "updown" | "leftright" => {
+                let (a, b) = if target == "updown" { ("up", "down") } else { ("left", "right") };
+                match (first(a), first(b)) {
+                    (Some((PromptInput::Key(x), 0)), Some((PromptInput::Key(y), 0))) => {
+                        let id = format!("pc_p_{}_{}", input_id(PromptInput::Key(x), 0), input_id(PromptInput::Key(y), 0));
+                        if let Some(arts) = arts.as_deref_mut() {
+                            let art = match (arrow_of(x), arrow_of(y)) {
+                                (Some(p), Some(q)) => Art::ArrowPair(p, q),
+                                _ => Art::KeyPair(key_label(x), key_label(y)),
+                            };
+                            arts.insert(id.clone(), art);
+                            id
+                        } else if exists(&arts, &id) {
+                            id
+                        } else {
+                            format!("pc_{}", input_id(PromptInput::Key(x), 0))
+                        }
+                    }
+                    (Some((i, m)), _) => format!("pc_{}", input_id(i, m)),
+                    _ => continue,
+                }
+            }
+            t => match first(t) {
+                Some((i, m)) => format!("pc_{}", input_id(i, m)),
+                None => continue,
+            },
+        };
+        if arts.is_some() || exists(&arts, &id) {
+            keyboard.insert(target, id);
+        }
+    }
+    keyboard
+}
+
+/// Whether the port's glyph set (once made) has `id`.
+fn set_arts_has(id: &str) -> bool {
+    SET.get().is_some_and(|s| s.arts.contains_key(id))
 }
 
 /// The entity name of a glyph of the port's.
@@ -302,19 +334,30 @@ fn shown() -> u8 {
     }
 }
 
-/// Per title glyph hash: the hashes of its keyboard and Xbox stand-ins (0: keep).
-fn remaps() -> &'static [(u32, u32, u32)] {
-    static R: OnceLock<Vec<(u32, u32, u32)>> = OnceLock::new();
-    R.get_or_init(|| {
-        let s = set();
-        PS.iter()
-            .map(|&(name, target)| {
-                let kb = s.keyboard.get(target).map(|id| name_hash(&entity_name(id))).unwrap_or(0);
-                let xb = xbox_id(target).map(|id| name_hash(&entity_name(id))).unwrap_or(0);
-                (name_hash(name), kb, xb)
-            })
-            .collect()
-    })
+/// Per title glyph hash: the hashes of its keyboard and Xbox stand-ins (0: keep); made again
+/// when the layout changes (a rebinding in the menu).
+fn remaps() -> std::sync::Arc<Vec<(u32, u32, u32)>> {
+    static R: parking_lot::Mutex<Option<(u32, std::sync::Arc<Vec<(u32, u32, u32)>>)>> = parking_lot::Mutex::new(None);
+    let generation = input::layout_gen();
+    let mut g = R.lock();
+    if let Some((at, v)) = g.as_ref() {
+        if *at == generation {
+            return v.clone();
+        }
+    }
+    let s = set();
+    let keyboard = if generation == 0 { s.keyboard.clone() } else { keyboard_map(None) };
+    let v: Vec<(u32, u32, u32)> = PS
+        .iter()
+        .map(|&(name, target)| {
+            let kb = keyboard.get(target).map(|id| name_hash(&entity_name(id))).unwrap_or(0);
+            let xb = xbox_id(target).map(|id| name_hash(&entity_name(id))).unwrap_or(0);
+            (name_hash(name), kb, xb)
+        })
+        .collect();
+    let v = std::sync::Arc::new(v);
+    *g = Some((generation, v.clone()));
+    v
 }
 
 /// The title's inline-image draw after its map from the text's hash to a glyph entity's

@@ -47,6 +47,8 @@ pub enum Live {
     PopupTitle,
     /// Whether a set of button prompts is shown (`prompts::shown_setting`).
     Prompts(u8),
+    /// A key binding's row: the option of an action's input (`bindings`); a change rebinds.
+    Binding(u16),
 }
 
 struct Store {
@@ -117,6 +119,7 @@ pub fn get(hash: u32) -> Option<u32> {
         Some(Live::PopupName) => return Some(super::popup::name_hash()),
         Some(Live::PopupTitle) => return Some(super::cgpr::fnv1a(super::popup::TITLE_KEY.as_bytes())),
         Some(Live::Prompts(w)) => return Some(super::prompts::shown_setting(w)),
+        Some(Live::Binding(a)) => return Some(super::bindings::index_of(a as usize)),
         None => {}
     }
     Some(s.values.get(&hash).copied().unwrap_or(d.default))
@@ -131,6 +134,12 @@ fn set(hash: u32, bits: u32) -> bool {
     let mut g = STORE.lock();
     let Some(s) = g.as_mut() else { return false };
     let Some(d) = s.defs.get(&hash).cloned() else { return false };
+    if let Some(Live::Binding(a)) = d.live {
+        // A key binding: the layout changes (the value is the layout's).
+        drop(g);
+        super::bindings::set(a as usize, bits);
+        return true;
+    }
     if d.live.is_some() {
         // A row showing the achievements; the menu cannot change it.
         return true;

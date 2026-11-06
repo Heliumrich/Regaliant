@@ -183,6 +183,7 @@ pub fn tick() {
         }
         s.focused = found.clone();
     }
+    super::bindings::tick(&tree, &found);
     // A horizontal press that did not move its list: that list takes L1/R1.
     if let Some((group, before, when)) = s.tried {
         let now_sel = found.iter().copied().find(|&n| uistate::parent(n) == group);

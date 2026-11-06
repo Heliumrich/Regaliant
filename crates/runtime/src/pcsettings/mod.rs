@@ -8,6 +8,7 @@
 //! and the extended copies live in memory only. `DS_PC_MENU=0` serves the title's files as
 //! they are.
 
+pub mod bindings;
 pub mod cgpr;
 pub mod convar;
 pub mod glyphs;
@@ -49,6 +50,8 @@ pub enum ItemKind {
     Status(u32),
     /// The trophies of a grade unlocked: "k / all" (live, read-only).
     Count(char, u32),
+    /// An action's key binding (`bindings`): every input as an option (live; a change rebinds).
+    Binding(u16),
 }
 
 impl Item {
@@ -66,6 +69,12 @@ impl Item {
             ItemKind::Slider { .. } => Vec::new(),
             ItemKind::Status(_) => vec![("PC_TROPHY_LOCKED".into(), Some("Locked".into())), ("PC_TROPHY_UNLOCKED".into(), Some("Unlocked".into()))],
             ItemKind::Count(g, all) => (0..=*all).map(|k| (format!("PC_TROPHY_COUNT_{g}_{k}"), Some(format!("{k} / {all}")))).collect(),
+            ItemKind::Binding(_) => bindings::inputs()
+                .iter()
+                .enumerate()
+                .map(|(n, i)| (format!("PC_INPUT_{n}"), Some(bindings::label(*i))))
+                .chain(std::iter::once(("PC_INPUT_PRESS".to_string(), Some("Press a key".to_string()))))
+                .collect(),
         }
     }
     fn def(&self) -> store::Def {
@@ -75,6 +84,7 @@ impl Item {
             ItemKind::Slider { default, .. } => (store::Kind::Float, default.to_bits(), None),
             ItemKind::Status(id) => (store::Kind::Int, 0, Some(store::Live::Trophy(*id))),
             ItemKind::Count(g, _) => (store::Kind::Int, 0, Some(store::Live::Count(*g))),
+            ItemKind::Binding(a) => (store::Kind::Int, 0, Some(store::Live::Binding(*a))),
         };
         store::Def { name: self.key(), kind, default, live }
     }
@@ -229,6 +239,7 @@ fn trophy_rows() -> Vec<(String, String, String, String)> {
 /// The PC settings' values (local-data/pcsettings.txt); the trophies' rows read their state.
 pub fn init(path: std::path::PathBuf) {
     let mut defs: Vec<store::Def> = tabs().iter().flat_map(|t| t.items.iter().map(Item::def)).collect();
+    defs.extend(binding_items().iter().map(Item::def));
     // The achievement pop-up's (`popup`, `hud`).
     defs.push(store::Def { name: popup::SETTING.into(), kind: store::Kind::Int, default: 0, live: Some(store::Live::Popup) });
     defs.push(store::Def { name: popup::NAME_SETTING.into(), kind: store::Kind::Int, default: 0, live: Some(store::Live::PopupName) });
@@ -398,6 +409,7 @@ fn edit_data_source(p: &mut Payload, item: &Item) -> Result<(), String> {
         ItemKind::Toggle(on) => (raw_u32(*on as u32), Some(raw_u32(0)), Some(raw_u32(1))),
         ItemKind::Status(_) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(1))),
         ItemKind::Count(_, all) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(*all))),
+        ItemKind::Binding(_) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(bindings::capture_option()))),
         ItemKind::Choice(opts, d) => {
             let n = opts.len().max(1) as u32;
             (raw_u32(*d), Some(raw_u32(0)), Some(raw_u32(n - 1)))
@@ -440,11 +452,17 @@ fn edit_data_source(p: &mut Payload, item: &Item) -> Result<(), String> {
 
 /// An item copied from its kind's template, with its own key, text, defaults and options.
 fn build_item(f: &mut cgpr::File, template: &cgpr::Entity, t: &Template, item: &Item) -> Result<cgpr::Entity, String> {
-    let repl = vec![
+    build_item_with(f, template, t, item, &[])
+}
+
+/// `build_item` with more whole-string replacements.
+fn build_item_with(f: &mut cgpr::File, template: &cgpr::Entity, t: &Template, item: &Item, extra: &[(Vec<u8>, Vec<u8>)]) -> Result<cgpr::Entity, String> {
+    let mut repl = vec![
         (t.setting.as_bytes().to_vec(), item.key().into_bytes()),
         (t.label.as_bytes().to_vec(), item.text_key("").into_bytes()),
         (t.tooltip.as_bytes().to_vec(), item.text_key("_TIP").into_bytes()),
     ];
+    repl.extend_from_slice(extra);
     let first_new = f.comps.len();
     let mut e = cgpr::clone_entity(&mut f.comps, template, &repl, &cgpr::salt(&format!("PCItem_{}", item.id)));
     e.name = format!("PC_{}", item.id).into_bytes();
@@ -582,6 +600,115 @@ fn trophy_browser(f: &mut cgpr::File, rows: &[(String, String, String, String)])
     Ok(opener)
 }
 
+/// Edits the component of class `class` of the descendant of `e` named `name` (a new component:
+/// the original's other users keep theirs).
+fn edit_descendant(f: &mut cgpr::File, e: &mut cgpr::Entity, name: &str, class: u32, change: impl FnOnce(&mut Payload) -> Result<(), String>) -> Result<(), String> {
+    let d = e.find_mut(name).ok_or_else(|| format!("no {name}"))?;
+    let slot = d.comps.iter().position(|(_, i)| Payload::parse(&f.comps[*i as usize].payload).is_some_and(|p| p.value.hash == class)).ok_or_else(|| format!("{name} without component {class:#x}"))?;
+    let idx = d.comps[slot].1 as usize;
+    let mut p = Payload::parse(&f.comps[idx].payload).ok_or("component unreadable")?;
+    change(&mut p)?;
+    let cat = f.comps[idx].cat;
+    f.comps.push(cgpr::Component { cat, payload: p.ser() });
+    d.comps[slot].1 = (f.comps.len() - 1) as u32;
+    Ok(())
+}
+
+/// Sets a raw float field (`Width`) or an object's `Value` (`X {Value}`) of a payload.
+fn set_float(p: &mut Payload, field: u32, v: f32) -> Result<(), String> {
+    let Body::Fields(fields) = &mut p.value.body else { return Err("no fields".into()) };
+    let (_, n) = fields.iter_mut().find(|(k, _)| *k == field).ok_or_else(|| format!("no field {field:#x}"))?;
+    set_value(n, raw_u32(v.to_bits()));
+    Ok(())
+}
+
+/// The key binding rows (`bindings::ACTIONS`).
+fn binding_items() -> Vec<Item> {
+    bindings::ACTIONS
+        .iter()
+        .enumerate()
+        .map(|(n, (_, name))| Item {
+            id: format!("Bind{n}"),
+            label: name.to_string(),
+            tooltip: "Press Enter (or click) and then the key, mouse button or wheel turn for this action; Esc cancels. Left and Right go through them one by one. An input another action used goes to that action in exchange.".into(),
+            kind: ItemKind::Binding(n as u16),
+        })
+        .collect()
+}
+
+/// The key bindings list: the title's HELP screen copied with the GAME page's item that opens it
+/// (as the trophy list), its rows the binding items built from the PC page's choice template.
+fn bindings_browser(f: &mut cgpr::File, choice: &cgpr::Entity, items: &[Item]) -> Result<cgpr::Entity, String> {
+    let help_i = f.roots.iter().position(|r| r.name == b"HelpMenu").ok_or("no HELP screen")?;
+    let pages_ri = f.roots.iter().position(|r| r.path_to("SettingsPages").is_some()).ok_or("no SettingsPages")?;
+    let pages_path = f.roots[pages_ri].path_to("SettingsPages").unwrap();
+    let game_scene = cgpr::lstr("GameSettings");
+    let game_pi = {
+        let pages = f.roots[pages_ri].at(&pages_path);
+        pages
+            .kids
+            .iter()
+            .position(|p| p.comps.iter().any(|(_, idx)| f.comps.get(*idx as usize).is_some_and(|c| cgpr::contains(&c.payload, &game_scene))))
+            .ok_or("no GAME page")?
+    };
+    let mut game_path = pages_path.clone();
+    game_path.push(game_pi);
+    let opener_rel = f.roots[pages_ri].at(&game_path).path_to("HelpMenu").ok_or("no HELP item")?;
+    let mut opener_path = game_path.clone();
+    opener_path.extend(opener_rel);
+    let repl = vec![
+        (b"SETTINGS_ENTRY_HELP_MENU".to_vec(), b"PC_BINDINGS_OPEN".to_vec()),
+        (b"SETTINGS_TOOLTIP_ACCESSIBILITY_HELP_MENU".to_vec(), b"PC_BINDINGS_OPEN_TIP".to_vec()),
+        (b"HelpMenu".to_vec(), b"PCKeyBindings".to_vec()),
+        (b"HelpMenuRoot".to_vec(), b"PCKeyBindingsRoot".to_vec()),
+        (b"HELP_MENU_HEADING_MAIN".to_vec(), b"PC_BINDINGS_HEADING".to_vec()),
+    ];
+    let salt = cgpr::salt("PCKeyBindings");
+    let mut copies = cgpr::clone_group(&mut f.comps, &[f.roots[pages_ri].at(&opener_path), &f.roots[help_i]], &repl, &salt);
+    let mut screen = copies.pop().unwrap();
+    let mut opener = copies.pop().unwrap();
+    opener.name = b"PC_BindingsOpen".to_vec();
+    screen.name = b"PCKeyBindings".to_vec();
+    let mc_rel = screen.path_to("MenuContents").ok_or("no list")?;
+    // A settings item fits its content, its width given by a settings page (100 alone, its value
+    // column then left of the list): the binding rows get the list's width in their Element.
+    let element = value::h("Element");
+    let mut kids = Vec::new();
+    for item in items {
+        let extra = vec![(b"HELP_SUBHEADING_".to_vec(), item.text_key("").into_bytes())];
+        let mut e = build_item_with(f, choice, &CHOICE, item, &extra)?;
+        let slot = e.comps.iter().position(|(_, i)| Payload::parse(&f.comps[*i as usize].payload).is_some_and(|p| p.value.hash == element)).ok_or("item without its Element")?;
+        let idx = e.comps[slot].1 as usize;
+        let mut p = Payload::parse(&f.comps[idx].payload).ok_or("Element unreadable")?;
+        let Body::Fields(fields) = &mut p.value.body else { return Err("Element without fields".into()) };
+        match fields.iter_mut().find(|(k, _)| *k == h("Width")) {
+            Some((_, v)) => *v = raw_u32(bindings::ROW_WIDTH.to_bits()),
+            None => fields.push((h("Width"), raw_u32(bindings::ROW_WIDTH.to_bits()))),
+        }
+        let cat = f.comps[idx].cat;
+        f.comps.push(cgpr::Component { cat, payload: p.ser() });
+        e.comps[slot].1 = (f.comps.len() - 1) as u32;
+        // The value column further right and narrower (a settings page's sits at half the row,
+        // its left arrow under the longer names here): the arrows from x 225 to 485 of the 520
+        // (its frame from 63.5% of the row, 34% wide; the text between the arrows 180 wide).
+        edit_descendant(f, &mut e, "ValueFrame", h("FitRelativeToParent"), |p| {
+            set_float(p, h("X"), 0.635)?;
+            set_float(p, h("Width"), 0.34)
+        })?;
+        edit_descendant(f, &mut e, "SizingElement", h("Element"), |p| set_float(p, h("Width"), 180.0))?;
+        edit_descendant(f, &mut e, "Int_Value", h("Element"), |p| set_float(p, h("Width"), 180.0))?;
+        kids.push(e);
+    }
+    screen.at_mut(&mc_rel).kids = kids;
+    if let Some(path) = screen.path_to("HelpItemMovie") {
+        let (last, parent) = path.split_last().unwrap();
+        screen.at_mut(parent).kids.remove(*last);
+    }
+    crate::info!("pc settings: key bindings list with {} rows (the HELP screen's layout)", items.len());
+    f.roots.push(screen);
+    Ok(opener)
+}
+
 fn start_menu(orig: &[u8]) -> Result<Vec<u8>, String> {
     let mut f = cgpr::parse(orig).ok_or("unexpected layout")?;
     if cgpr::serialize(&f) != orig {
@@ -641,13 +768,20 @@ fn start_menu(orig: &[u8]) -> Result<Vec<u8>, String> {
         let mut kids = Vec::new();
         for item in &tab.items {
             let (ti, t) = match item.kind {
-                ItemKind::Toggle(_) | ItemKind::Choice(..) | ItemKind::Status(_) | ItemKind::Count(..) => (ti_choice, &CHOICE),
+                ItemKind::Toggle(_) | ItemKind::Choice(..) | ItemKind::Status(_) | ItemKind::Count(..) | ItemKind::Binding(_) => (ti_choice, &CHOICE),
                 ItemKind::Slider { .. } => (ti_slider, &SLIDER),
             };
             let tpl = f.roots[ri].at(&page_path).at(&contents_rel).kids[ti].clone();
             kids.push(build_item(&mut f, &tpl, t, item)?);
         }
         page.at_mut(&contents_rel).kids = kids;
+        if tab.id == "PCTab" {
+            let tpl = f.roots[ri].at(&page_path).at(&contents_rel).kids[ti_choice].clone();
+            match bindings_browser(&mut f, &tpl, &binding_items()) {
+                Ok(opener) => page.at_mut(&contents_rel).kids.push(opener),
+                Err(e) => crate::warn!("pc settings: no key bindings list ({e})"),
+            }
+        }
         if tab.id == "PCTrophies" {
             match trophy_browser(&mut f, &trophy_rows()) {
                 Ok(opener) => page.at_mut(&contents_rel).kids.insert(0, opener),
@@ -716,6 +850,17 @@ fn text(orig: &[u8]) -> Vec<u8> {
             lines.extend(item.options().into_iter().filter_map(|(k, t)| t.map(|t| (k, t))));
         }
     }
+    lines.push(("PC_BINDINGS_OPEN".into(), "Key Bindings".into()));
+    lines.push(("PC_BINDINGS_OPEN_TIP".into(), "The keys, mouse buttons and wheel turns of every action.".into()));
+    lines.push(("PC_BINDINGS_HEADING".into(), "KEY BINDINGS".into()));
+    for item in binding_items() {
+        lines.push((item.text_key(""), item.label.clone()));
+        lines.push((item.text_key("_TIP"), item.tooltip.clone()));
+    }
+    for (n, i) in bindings::inputs().iter().enumerate() {
+        lines.push((format!("PC_INPUT_{n}"), bindings::label(*i)));
+    }
+    lines.push(("PC_INPUT_PRESS".into(), "Press a key".into()));
     lines.push(("PC_TROPHIES_OPEN".into(), "All Trophies".into()));
     lines.push(("PC_TROPHIES_OPEN_TIP".into(), "Every trophy of the game, with what it asks for.".into()));
     lines.push(("PC_TROPHIES_HEADING".into(), "TROPHIES".into()));

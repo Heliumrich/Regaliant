@@ -416,6 +416,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+            if crate::pcsettings::bindings::mouse_down(
+                Some(match msg {
+                    WM_LBUTTONDOWN => 0,
+                    WM_RBUTTONDOWN => 1,
+                    WM_MBUTTONDOWN => 2,
+                    _ => {
+                        if (wp >> 16) & 0xFFFF == 1 {
+                            3
+                        } else {
+                            4
+                        }
+                    }
+                }),
+                0,
+            ) =>
+        {
+            0
+        }
+        WM_MOUSEWHEEL if crate::pcsettings::bindings::mouse_down(None, ((wp >> 16) & 0xFFFF) as i16 as i32) => 0,
         WM_LBUTTONDOWN | WM_RBUTTONDOWN if pointer_on() => {
             use crate::pcsettings::pointer::{Event, event};
             crate::input::note_device(crate::input::DEVICE_KBM);
@@ -460,12 +480,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 CAPTURE_WANTED.fetch_xor(true, Ordering::Relaxed);
                 unsafe { update_capture(hwnd) };
             }
+            // A key binding waiting for its key takes it (not repeats).
+            if (lp >> 30) & 1 == 0 && crate::pcsettings::bindings::key_down(wp as u8, sided(wp, lp)) {
+                if matches!(wp as u8, 0x10 | 0x11 | 0x12) {
+                    set_key(wp, lp, true);
+                }
+                return 0;
+            }
             set_key(wp, lp, true);
             crate::input::note_device(crate::input::DEVICE_KBM);
             0
         }
         WM_KEYUP | WM_SYSKEYUP => {
             set_key(wp, lp, false);
+            crate::pcsettings::bindings::key_up(wp as u8, sided(wp, lp));
             0
         }
         // Alt with a key (Alt is walk): no menu mnemonic and its beep; Alt+Space

@@ -329,6 +329,10 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     None => Err("no run directory".into()),
                 }
             }
+            "bindinput" => {
+                // Tests: `bindinput <input>` (as in controls.txt) for a key binding waiting for its key.
+                pcsettings::bindings::test_input(parts.next().unwrap_or(""))
+            }
             "pointer" => {
                 // Tests: `pointer <x> <y>` moves the menu pointer to canvas coordinates (1920x1080);
                 // `pointer click|right|wheel <n>`.
