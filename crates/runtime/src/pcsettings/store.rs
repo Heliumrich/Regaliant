@@ -39,6 +39,12 @@ pub enum Live {
     Trophy(u32),
     /// The unlocked trophies of a grade (P, G, S, B).
     Count(char),
+    /// The achievement pop-up shows (bool).
+    Popup,
+    /// The text hash of the pop-up's trophy name.
+    PopupName,
+    /// The text hash of the pop-up's title line.
+    PopupTitle,
 }
 
 struct Store {
@@ -105,6 +111,9 @@ pub fn get(hash: u32) -> Option<u32> {
     match d.live {
         Some(Live::Trophy(id)) => return Some(crate::achievements::unlocked(id) as u32),
         Some(Live::Count(g)) => return Some(crate::achievements::count(g).0),
+        Some(Live::Popup) => return Some(super::popup::visible() as u32),
+        Some(Live::PopupName) => return Some(super::popup::name_hash()),
+        Some(Live::PopupTitle) => return Some(super::cgpr::fnv1a(super::popup::TITLE_KEY.as_bytes())),
         None => {}
     }
     Some(s.values.get(&hash).copied().unwrap_or(d.default))
@@ -183,6 +192,12 @@ fn answer(regs: *const u64, key: u32, sub: u32, store_reg: usize, stat: usize) {
         STATS[stat].fetch_add(1, Ordering::Relaxed);
         set_reg(regs, store_reg, one_entry(key, sub, v));
     }
+}
+
+/// `UISetting_bool::Evaluate` before its scan (eboot+0xc3a8e5: r12d the key, ebx the sub-key,
+/// r13 the store): the achievement pop-up's visibility (`popup`).
+pub extern "sysv64" fn eval_bool_hook(regs: *const u64, _arg: u32) {
+    answer(regs, reg(regs, 12) as u32, reg(regs, 3) as u32, 13, 0);
 }
 
 /// `UISetting_int::Evaluate` before its scan (eboot+0xc24245; the same registers).

@@ -10,6 +10,8 @@
 
 pub mod cgpr;
 pub mod convar;
+mod hud;
+pub mod popup;
 pub mod store;
 pub mod value;
 
@@ -216,7 +218,12 @@ fn trophy_rows() -> Vec<(String, String, String, String)> {
 
 /// The PC settings' values (local-data/pcsettings.txt); the trophies' rows read their state.
 pub fn init(path: std::path::PathBuf) {
-    store::init(path, tabs().iter().flat_map(|t| t.items.iter().map(Item::def)).collect());
+    let mut defs: Vec<store::Def> = tabs().iter().flat_map(|t| t.items.iter().map(Item::def)).collect();
+    // The achievement pop-up's (`popup`, `hud`).
+    defs.push(store::Def { name: popup::SETTING.into(), kind: store::Kind::Int, default: 0, live: Some(store::Live::Popup) });
+    defs.push(store::Def { name: popup::NAME_SETTING.into(), kind: store::Kind::Int, default: 0, live: Some(store::Live::PopupName) });
+    defs.push(store::Def { name: popup::TITLE_SETTING.into(), kind: store::Kind::Int, default: 0, live: Some(store::Live::PopupTitle) });
+    store::init(path, defs);
     apply();
 }
 
@@ -265,6 +272,7 @@ pub extern "sysv64" fn changed_hook(regs: *const u64, _arg: u32) {
 }
 
 const START_MENU: &str = "/app0/ui/scripts/_cmn/uistartmenu.cgpr";
+const HUD: &str = "/app0/ui/scripts/_cmn/uihud.cgpr";
 const TEXT_DIR: &str = "/app0/text/common/_cmn/ui.";
 
 fn enabled() -> bool {
@@ -274,7 +282,7 @@ fn enabled() -> bool {
 
 /// Whether the port extends this guest path (a cheap test: every file lookup asks).
 fn extends(guest: &str) -> bool {
-    guest == START_MENU || (guest.starts_with(TEXT_DIR) && guest.ends_with(".ctxt"))
+    guest == START_MENU || guest == HUD || (guest.starts_with(TEXT_DIR) && guest.ends_with(".ctxt"))
 }
 
 static GENERATED: Mutex<Option<HashMap<String, Option<Arc<Vec<u8>>>>>> = Mutex::new(None);
@@ -294,6 +302,8 @@ pub fn generated(guest: &str) -> Option<Arc<Vec<u8>>> {
         let orig = std::fs::read(&host).map_err(|_| "unreadable")?;
         if guest == START_MENU {
             start_menu(&orig)
+        } else if guest == HUD {
+            hud::build(&orig)
         } else {
             Ok(text(&orig))
         }
@@ -675,6 +685,10 @@ fn text(orig: &[u8]) -> Vec<u8> {
     lines.push(("PC_TROPHIES_OPEN".into(), "All Trophies".into()));
     lines.push(("PC_TROPHIES_OPEN_TIP".into(), "Every trophy of the game, with what it asks for.".into()));
     lines.push(("PC_TROPHIES_HEADING".into(), "TROPHIES".into()));
+    lines.push((popup::TITLE_KEY.into(), "TROPHY UNLOCKED".into()));
+    for (t, _) in crate::achievements::list() {
+        lines.push((popup::name_key(t.id), t.name.clone()));
+    }
     for (key, name, heading, detail) in trophy_rows() {
         lines.push((key.clone(), name));
         lines.push((format!("{key}_SUB"), heading));

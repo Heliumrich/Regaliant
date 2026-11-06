@@ -257,6 +257,15 @@ const FIXES: &[Fix] = &[
     // The PC settings' values at the title's own settings paths (`pcsettings::store`): the
     // menu bindings' scans of the store (`UISetting_<type>::Evaluate`) for the PC keys ...
     Fix {
+        name: "PC settings (bool lookups)",
+        offset: 0xc3a8e5,
+        from: &[0x49, 0x8b, 0x4d, 0x18, 0x49, 0x8b, 0x55, 0x20],
+        change: Change::Hook { at: 0, handler: crate::pcsettings::store::eval_bool_hook },
+        kind: "PC settings",
+        why: "the achievement pop-up is shown by a setting the title's store does not hold",
+        only_with: None,
+    },
+    Fix {
         name: "PC settings (int lookups)",
         offset: 0xc24245,
         from: &[0x49, 0x8b, 0x4d, 0x40, 0x49, 0x8b, 0x55, 0x48],

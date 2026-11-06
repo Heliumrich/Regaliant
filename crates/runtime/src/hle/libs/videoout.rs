@@ -109,6 +109,7 @@ fn vblank_thread() {
     loop {
         // The PC settings' console variables (changed values, objects the title builds later).
         crate::pcsettings::convar::tick();
+        crate::pcsettings::popup::tick();
         let grid = crate::gpu::tune::flip_grid();
         let now = Instant::now();
         let wake = if grid { next } else { next.min(now + FLIP_TICK) };

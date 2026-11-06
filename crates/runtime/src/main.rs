@@ -1281,10 +1281,10 @@ fn main() {
     hle::libs::savedata::init(cfg.root.join("local-data").join("saves"));
     // Keyboard and mouse layout (written with the defaults when missing).
     input::init(&cfg.root.join("local-data").join("controls.txt"));
-    pcsettings::init(cfg.root.join("local-data").join("pcsettings.txt"));
     // `DS_ACHIEVEMENTS_FILE`: another file (test runs: theirs, apart from a player's).
     let achievements_file = std::env::var_os("DS_ACHIEVEMENTS_FILE").map(PathBuf::from).unwrap_or_else(|| cfg.root.join("local-data").join("achievements.txt"));
     achievements::init(&cfg.app, achievements_file, "en-GB");
+    pcsettings::init(cfg.root.join("local-data").join("pcsettings.txt"));
     // Compiled pipelines and learned shader specs: local-data, or the
     // `--cache` directory (Play.bat: one next to the package folder, so a
     // new package starts with what earlier ones learned on this machine).
