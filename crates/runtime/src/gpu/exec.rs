@@ -2116,6 +2116,13 @@ pub(crate) fn compute_pipe_known(p: &Prepared) -> bool {
     PIPES.lock().as_ref().is_some_and(|m| m.contains_key(&key)) || PIPE_FLIGHTS.lock().as_ref().is_some_and(|m| m.contains_key(&key))
 }
 
+/// Whether the compute pipeline of a translation is made (a first use of a
+/// specialized key runs the run-time variant meanwhile, `shaders`).
+pub(crate) fn compute_pipe_ready(tr: &super::shaders::Translated) -> bool {
+    let key = push_key(tr.key, push_fits_tr(tr));
+    PIPES.lock().as_ref().is_some_and(|m| m.contains_key(&key))
+}
+
 /// The graphics pipeline of a draw scanned ahead of its use (`draw`).
 pub(crate) use draw::{precompile_gfx_translations, GfxState};
 
@@ -15690,6 +15697,7 @@ pub fn status() -> String {
         + &super::ahead::status()
         + &super::compile::status()
         + &async_line()
+        + &super::shaders::fmt_line()
         + &xq_line()
         + &super::cp::past_wait_status()
         + &held_own_line()

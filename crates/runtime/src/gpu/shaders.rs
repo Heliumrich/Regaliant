@@ -1224,6 +1224,14 @@ thread_local! {
 /// single format, two different ones several (run-time); specs keyed with the
 /// run-time decode say nothing. Pairs already seen are left as they are.
 pub(crate) fn seed_formats(code: u64, specs: &[&[ResSpec]]) {
+    // `DS_FMT_SEED=0` (diagnosis): nothing seeded, so precompiles key
+    // format-loaded buffers run-time as specs learned before 2026-11-06 do,
+    // and dispatches meet their specialized keys as first uses
+    // (`fmt_run_time`).
+    static SEED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*SEED.get_or_init(|| std::env::var("DS_FMT_SEED").ok().as_deref() != Some("0")) {
+        return;
+    }
     let n = specs.iter().map(|s| s.len()).max().unwrap_or(0);
     for i in 0..n {
         let mut one: Option<u32> = None;
@@ -1287,6 +1295,145 @@ fn single_format(code: u64, res: usize, format: u8, dst_sel: u16) -> bool {
         return shared == want;
     }
     false
+}
+
+/// Specialized compute keys whose translation and pipeline are being made
+/// in the background (`fmt_later`), by (plan key, spec hash); their count.
+/// Until then their preparations take the run-time variant (`fmt_run_time`).
+static FMT_PENDING: Mutex<Option<std::collections::HashSet<(u64, u64)>>> = Mutex::new(None);
+static FMT_PENDING_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Keys whose background making failed: made in place from then on (which
+/// reports the error).
+static FMT_FAILED: Mutex<Option<std::collections::HashSet<(u64, u64)>>> = Mutex::new(None);
+/// The background jobs, their workers, and [preparations given the run-time
+/// variant, specialized keys queued, made, ns making them, failed, first
+/// uses made in place (no run-time variant ready)].
+struct FmtJob {
+    addr: u64,
+    insts: Arc<Vec<rdna::Inst>>,
+    plan: Arc<Plan>,
+    plan_key: u64,
+    spec_hash: u64,
+    spec: Spec,
+    key_spec: Spec,
+}
+static FMT_JOBS: Mutex<std::collections::VecDeque<FmtJob>> = Mutex::new(std::collections::VecDeque::new());
+static FMT_CV: parking_lot::Condvar = parking_lot::Condvar::new();
+static FMT_WORKERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FMT_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Whether a specialized key is being made in the background.
+fn fmt_pending(plan_key: u64, spec_hash: u64) -> bool {
+    FMT_PENDING_N.load(std::sync::atomic::Ordering::Acquire) != 0 && FMT_PENDING.lock().as_ref().is_some_and(|s| s.contains(&(plan_key, spec_hash)))
+}
+
+/// Whether making a specialized key in the background failed.
+fn fmt_failed(plan_key: u64, spec_hash: u64) -> bool {
+    FMT_STATS[4].load(std::sync::atomic::Ordering::Relaxed) != 0 && FMT_FAILED.lock().as_ref().is_some_and(|s| s.contains(&(plan_key, spec_hash)))
+}
+
+/// The run-time variant of a compute stage whose buffers `specialized` (a
+/// bit per resource) were specialized to their one format and whose
+/// specialized translation is missing: its translation when it and its
+/// pipeline are made (else None: the specialized one is made in place).
+/// `key_spec` is the specialized key spec.
+fn fmt_run_time(key_spec: &Spec, specialized: u64, plan_key: u64) -> Option<Arc<Translated>> {
+    let mut rt = key_spec.clone();
+    for (i, r) in rt.resources.iter_mut().enumerate().take(64) {
+        if specialized & (1 << i) != 0 {
+            *r = ResSpec::Buffer { format: translate::FORMAT_RT, dst_sel: 0 };
+        }
+    }
+    let h = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        rt.hash(&mut h);
+        h.finish()
+    };
+    let t = LOCAL_TRANSLATIONS.with(|c| c.borrow().get(&(plan_key, h)).cloned()).or_else(|| TRANSLATIONS.lock().as_ref().and_then(|m| m.get(&(plan_key, h)).cloned()))?;
+    (t.spec == rt && super::exec::compute_pipe_ready(&t)).then_some(t)
+}
+
+/// Queues a specialized key's translation and pipeline (false when it is
+/// already queued); its preparations take the run-time variant until both
+/// are made.
+fn fmt_later(job: FmtJob) -> bool {
+    use std::sync::atomic::Ordering;
+    {
+        let mut g = FMT_PENDING.lock();
+        if !g.get_or_insert_with(std::collections::HashSet::new).insert((job.plan_key, job.spec_hash)) {
+            return false;
+        }
+        FMT_PENDING_N.fetch_add(1, Ordering::AcqRel);
+    }
+    FMT_STATS[1].fetch_add(1, Ordering::Relaxed);
+    FMT_JOBS.lock().push_back(job);
+    // Two workers below normal priority (an area's first uses come
+    // together; the largest programs take seconds).
+    while FMT_WORKERS.load(Ordering::Relaxed) < 2 {
+        let i = FMT_WORKERS.fetch_add(1, Ordering::Relaxed);
+        if i >= 2 {
+            break;
+        }
+        let name = format!("gpu-fmt{i}");
+        let _ = crate::thread::spawn_host(&name.clone(), 8 << 20, Box::new(move || fmt_worker(name)));
+    }
+    FMT_CV.notify_one();
+    true
+}
+
+fn fmt_worker(name: String) {
+    use std::sync::atomic::Ordering;
+    crate::log::set_thread_name(&name);
+    unsafe {
+        windows_sys::Win32::System::Threading::SetThreadPriority(windows_sys::Win32::System::Threading::GetCurrentThread(), windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL);
+    }
+    loop {
+        let j = {
+            let mut g = FMT_JOBS.lock();
+            loop {
+                if let Some(j) = g.pop_front() {
+                    break j;
+                }
+                FMT_CV.wait(&mut g);
+            }
+        };
+        let t = std::time::Instant::now();
+        let r = translate_kept(j.addr, &j.insts, &j.plan, j.plan_key, j.spec_hash, &j.spec, j.key_spec).and_then(|tr| super::exec::precompile_translation(&tr, j.addr).ok_or_else(|| "pipeline creation failed".to_string()));
+        match r {
+            Ok(_) => {
+                FMT_STATS[2].fetch_add(1, Ordering::Relaxed);
+                FMT_STATS[3].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            // (Its next preparation makes it in place and reports why.)
+            Err(e) => {
+                FMT_FAILED.lock().get_or_insert_with(std::collections::HashSet::new).insert((j.plan_key, j.spec_hash));
+                if FMT_STATS[4].fetch_add(1, Ordering::Relaxed) < 8 {
+                    crate::warn!("gpu: making cs {:#x}'s specialized translation in the background failed: {e}", j.addr);
+                }
+            }
+        }
+        if FMT_PENDING.lock().as_mut().is_some_and(|s| s.remove(&(j.plan_key, j.spec_hash))) {
+            FMT_PENDING_N.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Status line: first uses of specialized compute keys.
+pub fn fmt_line() -> String {
+    let v: Vec<u64> = FMT_STATS.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
+    if v.iter().all(|&x| x == 0) {
+        return String::new();
+    }
+    format!(
+        "    compute keys specialized to one format, first uses: {} made in the background ({} made, {:.1} s; {} failed; {} pending now), {} preparations ran the run-time variant meanwhile; {} made in place (no run-time variant ready)\n",
+        v[1],
+        v[2],
+        v[3] as f64 / 1e9,
+        v[4],
+        FMT_PENDING_N.load(std::sync::atomic::Ordering::Relaxed),
+        v[0],
+        v[5]
+    )
 }
 
 /// `DS_FMT_CENSUS=1` (diagnosis): the formats and swizzles compute stages
@@ -2991,6 +3138,9 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     spec.resources.clear();
     spec.resources.reserve(plan.resources.len());
     let fmt_mask = if plan.resources.iter().any(|r| r.kind == ResKind::Buffer) { LOCAL_FORMATS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| shared_scan(1, plan_key, || format_resources(&insts, &plan)))) } else { 0 };
+    // Buffers specialized to their one format (a bit per resource):
+    // `fmt_run_time` while their translation is missing.
+    let mut specialized = 0u64;
     for (i, res) in plan.resources.iter().enumerate() {
         let mut w = [0u32; 8];
         let src = match res.dwords.first() {
@@ -3025,6 +3175,9 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
                     // format: GPU busy -1.5% at the vista and -1.9% at Doran,
                     // frames +0.6-0.7%, FINDINGS.md 2026-11-06.)
                     if single_format(code_hash, i, v.format, v.dst_sel) {
+                        if i < 64 {
+                            specialized |= 1 << i;
+                        }
                         (v.format, v.dst_sel)
                     } else {
                         (translate::FORMAT_RT, 0)
@@ -3167,14 +3320,41 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     let tr = if let Some(t) = fast_hit {
         t
     } else {
-        let cached = LOCAL_TRANSLATIONS.with(|c| c.borrow().get(&(plan_key, spec_hash)).cloned()).or_else(|| {
-            let t = TRANSLATIONS.lock().as_ref().and_then(|m| m.get(&(plan_key, spec_hash)).cloned())?;
-            LOCAL_TRANSLATIONS.with(|c| c.borrow_mut().insert((plan_key, spec_hash), t.clone()));
-            Some(t)
-        });
-        let t = match cached {
-            Some(t) => t,
-            None => {
+        // (A specialized key being made in the background is missing until
+        // its pipeline is made too.)
+        let pending = specialized != 0 && fmt_pending(plan_key, spec_hash);
+        let cached = if pending {
+            None
+        } else {
+            LOCAL_TRANSLATIONS.with(|c| c.borrow().get(&(plan_key, spec_hash)).cloned()).or_else(|| {
+                let t = TRANSLATIONS.lock().as_ref().and_then(|m| m.get(&(plan_key, spec_hash)).cloned())?;
+                LOCAL_TRANSLATIONS.with(|c| c.borrow_mut().insert((plan_key, spec_hash), t.clone()));
+                Some(t)
+            })
+        };
+        // A first use of a specialized key: the run-time variant runs while
+        // the specialized translation and pipeline are made in the
+        // background, when its own pipeline is made (instead of the command
+        // processor stopping for them: 370-570 ms per particle program,
+        // FINDINGS.md 2026-11-06 morning).
+        let run_time = match (&cached, &key_spec) {
+            (None, Some(ks)) if specialized != 0 && spec.stage == Stage::Compute && !fmt_failed(plan_key, spec_hash) => fmt_run_time(ks, specialized, plan_key),
+            _ => None,
+        };
+        if let (Some(_), Some(ks)) = (&run_time, &key_spec) {
+            FMT_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !pending {
+                let queued = fmt_later(FmtJob { addr, insts: insts.0.clone(), plan: (*plan).clone(), plan_key, spec_hash, spec: spec.clone(), key_spec: ks.clone() });
+                if queued && super::tune::precompile() > 0 {
+                    super::precompile::first_translation(addr, &insts, &plan, code_hash, ks);
+                }
+            }
+        } else if cached.is_none() && specialized != 0 && spec.stage == Stage::Compute {
+            FMT_STATS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let t = match (cached, run_time) {
+            (Some(t), _) | (None, Some(t)) => t,
+            (None, None) => {
                 if spec.stage == Stage::Compute && super::tune::precompile() > 0 {
                     if let Some(ks) = &key_spec {
                         super::precompile::first_translation(addr, &insts, &plan, code_hash, ks);
