@@ -16,7 +16,8 @@
 //! scaled by its monitor's DPI, inside the work area and centred
 //! (`DS_WINDOW_SIZE=<w>x<h>`: that client size in pixels). Alt+Enter or F11
 //! switches between it and borderless fullscreen on the window's monitor
-//! (`DS_FULLSCREEN=1`: fullscreen from the start); neither reaches the game
+//! (`DS_FULLSCREEN=1`: fullscreen from the start, `0` windowed; otherwise the SETTINGS
+//! screen's PC tab, Window Mode, which Alt+Enter updates); neither reaches the game
 //! as a key. `DS_WINDOW_BEHIND=1` (test runs on a shared desktop): shown
 //! without activation at the bottom of the z-order, fullscreen too.
 
@@ -295,7 +296,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if (wp as u16 == VK_RETURN_CODE && msg == WM_SYSKEYDOWN) || wp as u16 == VK_F11_CODE {
                 // Alt+Enter, F11: windowed / borderless fullscreen.
                 if (lp >> 30) & 1 == 0 {
-                    unsafe { apply_fullscreen(hwnd, !FULLSCREEN.load(Ordering::Relaxed)) };
+                    let on = !FULLSCREEN.load(Ordering::Relaxed);
+                    unsafe { apply_fullscreen(hwnd, on) };
+                    // The PC tab's Window Mode follows (its menu shows the mode in use).
+                    let _ = crate::pcsettings::store::set_by_name("Setting_PC_WindowMode", if on { "1" } else { "0" });
                 }
                 return 0;
             }
@@ -480,7 +484,12 @@ pub fn create(title: &str, width: u32, height: u32) -> Result<&'static Window, S
             } else {
                 ShowWindow(hwnd, SW_SHOW);
             }
-            if std::env::var("DS_FULLSCREEN").is_ok_and(|v| v.trim() == "1") {
+            // `DS_FULLSCREEN` (1 or 0) over the PC tab's Window Mode.
+            let fullscreen = match std::env::var("DS_FULLSCREEN") {
+                Ok(v) => v.trim() == "1",
+                Err(_) => crate::pcsettings::window_fullscreen().unwrap_or(false),
+            };
+            if fullscreen {
                 apply_fullscreen(hwnd, true);
             }
             let _ = tx.send(Ok((hwnd as isize, hinst as isize)));

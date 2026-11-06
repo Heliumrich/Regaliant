@@ -10,6 +10,7 @@ pub struct Component {
     pub payload: Vec<u8>,
 }
 
+#[derive(Clone)]
 pub struct Entity {
     pub guid: [u8; 16],
     pub name: Vec<u8>,
@@ -216,7 +217,7 @@ impl Entity {
     }
 }
 
-fn salted(g: &[u8; 16], salt: &[u8; 16]) -> [u8; 16] {
+pub fn salted(g: &[u8; 16], salt: &[u8; 16]) -> [u8; 16] {
     let mut n = *g;
     for (a, b) in n.iter_mut().zip(salt) {
         *a ^= b;
@@ -224,7 +225,7 @@ fn salted(g: &[u8; 16], salt: &[u8; 16]) -> [u8; 16] {
     n
 }
 
-fn collect_guids(e: &Entity, out: &mut std::collections::HashSet<[u8; 16]>) {
+pub fn collect_guids(e: &Entity, out: &mut std::collections::HashSet<[u8; 16]>) {
     out.insert(e.guid);
     out.extend(e.comps.iter().map(|(g, _)| *g));
     for k in &e.kids {
@@ -232,38 +233,68 @@ fn collect_guids(e: &Entity, out: &mut std::collections::HashSet<[u8; 16]>) {
     }
 }
 
+type Guids = std::collections::HashSet<[u8; 16]>;
+
 /// A deep copy of `e` with GUIDs derived from the originals and `salt` (stable from boot to
 /// boot, distinct per copy). Components that link to entities or component instances inside
 /// the copied subtree (their trailers hold the GUIDs: a frame's `UseLinked` names its value
 /// widget, a `ValueList` its arrows) are copied with the links pointing at the copy's own;
-/// links outside it stay. Components holding one of `repl`'s strings are copied with it
-/// replaced; the others are shared.
+/// links outside it stay. Components holding one of `repl`'s strings (whole strings, any
+/// length) are copied with it replaced; the others are shared.
 pub fn clone_entity(comps: &mut Vec<Component>, e: &Entity, repl: &[(Vec<u8>, Vec<u8>)], salt: &[u8; 16]) -> Entity {
-    let mut inside = std::collections::HashSet::new();
-    collect_guids(e, &mut inside);
-    clone_inner(comps, e, repl, salt, &inside)
+    clone_group(comps, &[e], repl, salt).pop().unwrap()
 }
 
-fn clone_inner(comps: &mut Vec<Component>, e: &Entity, repl: &[(Vec<u8>, Vec<u8>)], salt: &[u8; 16], inside: &std::collections::HashSet<[u8; 16]>) -> Entity {
+/// Copies of several subtrees with one salt: links between them point at each other's copies.
+pub fn clone_group(comps: &mut Vec<Component>, roots: &[&Entity], repl: &[(Vec<u8>, Vec<u8>)], salt: &[u8; 16]) -> Vec<Entity> {
+    let mut inside = Guids::new();
+    for r in roots {
+        collect_guids(r, &mut inside);
+    }
+    roots.iter().map(|r| clone_inner(comps, r, repl, salt, &inside)).collect()
+}
+
+/// A component's payload with `repl`'s strings replaced and the links into `inside` moved to
+/// the copies; the title's bytes when nothing changes. Payloads the value model does not read
+/// (one of the start menu's 4731) take equal-length replacements and GUID windows only.
+fn transform(p: &[u8], repl: &[(Vec<u8>, Vec<u8>)], salt: &[u8; 16], inside: &Guids) -> Vec<u8> {
+    if let Some(mut pl) = super::value::Payload::parse(p) {
+        let mut changed = false;
+        for (from, to) in repl {
+            changed |= pl.value.replace_str(from, to) > 0;
+        }
+        for l in pl.links.iter_mut().flatten() {
+            if inside.contains(&l.target) {
+                l.target = salted(&l.target, salt);
+                changed = true;
+            }
+        }
+        return if changed { pl.ser() } else { p.to_vec() };
+    }
+    let mut p = p.to_vec();
+    for (from, to) in repl {
+        if from.len() == to.len() && contains(&p, from) {
+            p = replace(&p, from, to);
+        }
+    }
+    let mut i = 0;
+    while i + 16 <= p.len() {
+        let w: [u8; 16] = p[i..i + 16].try_into().unwrap();
+        if inside.contains(&w) {
+            p[i..i + 16].copy_from_slice(&salted(&w, salt));
+            i += 16;
+        } else {
+            i += 1;
+        }
+    }
+    p
+}
+
+fn clone_inner(comps: &mut Vec<Component>, e: &Entity, repl: &[(Vec<u8>, Vec<u8>)], salt: &[u8; 16], inside: &Guids) -> Entity {
     let mut out_comps = Vec::with_capacity(e.comps.len());
     for (g, idx) in &e.comps {
         let c = &comps[*idx as usize];
-        let mut p = c.payload.clone();
-        for (from, to) in repl {
-            if contains(&p, from) {
-                p = replace(&p, from, to);
-            }
-        }
-        let mut i = 0;
-        while i + 16 <= p.len() {
-            let w: [u8; 16] = p[i..i + 16].try_into().unwrap();
-            if inside.contains(&w) {
-                p[i..i + 16].copy_from_slice(&salted(&w, salt));
-                i += 16;
-            } else {
-                i += 1;
-            }
-        }
+        let p = transform(&c.payload, repl, salt, inside);
         let idx = if p != c.payload {
             let cat = c.cat;
             comps.push(Component { cat, payload: p });
@@ -275,6 +306,14 @@ fn clone_inner(comps: &mut Vec<Component>, e: &Entity, repl: &[(Vec<u8>, Vec<u8>
     }
     let kids = e.kids.iter().map(|k| clone_inner(comps, k, repl, salt, inside)).collect();
     Entity { guid: salted(&e.guid, salt), name: e.name.clone(), flags: e.flags, comps: out_comps, kids }
+}
+
+/// Every component index an entity subtree uses.
+pub fn comp_indices(e: &Entity, out: &mut Vec<u32>) {
+    out.extend(e.comps.iter().map(|(_, i)| *i));
+    for k in &e.kids {
+        comp_indices(k, out);
+    }
 }
 
 pub fn fnv1a(b: &[u8]) -> u32 {

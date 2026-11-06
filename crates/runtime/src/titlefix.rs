@@ -254,6 +254,45 @@ const FIXES: &[Fix] = &[
         why: "the port applies its settings when the title's SETTINGS screen changes them",
         only_with: None,
     },
+    // The PC settings' values at the title's own settings paths (`pcsettings::store`): the
+    // menu bindings' scans of the store (`UISetting_<type>::Evaluate`) for the PC keys ...
+    Fix {
+        name: "PC settings (int lookups)",
+        offset: 0xc24245,
+        from: &[0x49, 0x8b, 0x4d, 0x40, 0x49, 0x8b, 0x55, 0x48],
+        change: Change::Hook { at: 0, handler: crate::pcsettings::store::eval_int_hook },
+        kind: "PC settings",
+        why: "the title's store holds only the settings it registers",
+        only_with: None,
+    },
+    Fix {
+        name: "PC settings (float lookups)",
+        offset: 0xc24d15,
+        from: &[0x49, 0x8b, 0x85, 0x90, 0x00, 0x00, 0x00],
+        change: Change::Hook { at: 0, handler: crate::pcsettings::store::eval_float_hook },
+        kind: "PC settings",
+        why: "the title's store holds only the settings it registers",
+        only_with: None,
+    },
+    // ... and the menu's setters (`mov qword ptr [rbp-48h],0` after each loads the store).
+    Fix {
+        name: "PC settings (int changes)",
+        offset: 0xfa5cba,
+        from: &[0x48, 0xc7, 0x45, 0xb8, 0x00, 0x00, 0x00, 0x00],
+        change: Change::Hook { at: 0, handler: crate::pcsettings::store::set_int_hook },
+        kind: "PC settings",
+        why: "the port keeps and applies the PC settings the menu changes",
+        only_with: None,
+    },
+    Fix {
+        name: "PC settings (float changes)",
+        offset: 0xfa5ee5,
+        from: &[0x48, 0xc7, 0x45, 0xb8, 0x00, 0x00, 0x00, 0x00],
+        change: Change::Hook { at: 0, handler: crate::pcsettings::store::set_float_hook },
+        kind: "PC settings",
+        why: "the port keeps and applies the PC settings the menu changes",
+        only_with: None,
+    },
 ];
 
 /// `mov dword ptr [rcx+33Ch], -1` after counting the run (rax kept; the
@@ -276,6 +315,7 @@ pub fn apply(p: &mut crate::patch::Patcher, ranges: &[(u64, u64)]) {
         return;
     }
     crate::dispmode::init();
+    crate::pcsettings::convar::init(p.base, p.image);
     for (i, f) in FIXES.iter().enumerate() {
         if f.only_with.is_some_and(|v| v.split('|').all(|n| std::env::var_os(n).is_none())) {
             continue;
@@ -315,5 +355,5 @@ pub fn status() -> String {
         .map(|(i, f)| format!("'{}' ran {} times", f.name, RUNS[i].load(Ordering::Relaxed)))
         .collect();
     let fixes = if runs.is_empty() { String::new() } else { format!("    title fixes: {}\n", runs.join(", ")) };
-    fixes + &crate::jobidle::status() + &crate::camhook::status() + &crate::dispmode::status()
+    fixes + &crate::jobidle::status() + &crate::camhook::status() + &crate::dispmode::status() + &crate::pcsettings::store::status()
 }

@@ -704,7 +704,21 @@ pub fn take_camera_motion() -> Option<(i64, i64)> {
         return None;
     }
     let (dx, dy) = (MOUSE_DX.swap(0, Relaxed), MOUSE_DY.swap(0, Relaxed));
-    Some((dx, if layout().invert_y { -dy } else { dy }))
+    Some((dx, if invert_y(layout()) { -dy } else { dy }))
+}
+
+/// The PC settings' mouse sensitivity (a factor on controls.txt's, f32 bits) and vertical
+/// inversion (flipping controls.txt's), from the SETTINGS screen's PC tab: read at every use.
+pub static PC_SENSITIVITY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f80_0000);
+pub static PC_INVERT_Y: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn pc_sensitivity() -> f32 {
+    let v = f32::from_bits(PC_SENSITIVITY.load(Relaxed));
+    if v.is_finite() && v > 0.0 { v } else { 1.0 }
+}
+
+fn invert_y(l: &Layout) -> bool {
+    l.invert_y ^ PC_INVERT_Y.load(Relaxed)
 }
 
 /// The camera's base yaw speed when the title's is unusable (radians per
@@ -721,7 +735,8 @@ pub fn camera_radians_per_count(yaw_speed: f32) -> (f32, f32) {
     let speed = if yaw_speed.is_finite() && yaw_speed > 0.0 && yaw_speed < 100.0 { yaw_speed } else { RAW_FALLBACK_YAW_SPEED };
     let l = layout();
     let k = speed / FULL_SPEED;
-    (k * l.sensitivity * RAW_YAW_SIGN, k * l.sensitivity_y.unwrap_or(l.sensitivity) * RAW_PITCH_SIGN)
+    let pc = pc_sensitivity();
+    (k * l.sensitivity * pc * RAW_YAW_SIGN, k * l.sensitivity_y.unwrap_or(l.sensitivity) * pc * RAW_PITCH_SIGN)
 }
 
 /// The camera's yaw and pitch rise for rightward and downward motion, as for
@@ -745,9 +760,10 @@ fn mouse_look(st: &mut PadState, l: &Layout) {
     if due {
         let secs = g.0.map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f32()).clamp(1.0 / 240.0, 0.25);
         let (dx, dy) = (MOUSE_DX.swap(0, Relaxed) as f32, MOUSE_DY.swap(0, Relaxed) as f32);
-        let full = FULL_SPEED / l.sensitivity;
-        let full_y = FULL_SPEED / l.sensitivity_y.unwrap_or(l.sensitivity);
-        let dy = if l.invert_y { -dy } else { dy };
+        let pc = pc_sensitivity();
+        let full = FULL_SPEED / (l.sensitivity * pc);
+        let full_y = FULL_SPEED / (l.sensitivity_y.unwrap_or(l.sensitivity) * pc);
+        let dy = if invert_y(l) { -dy } else { dy };
         *g = (Some(now), (dx / secs / full).clamp(-1.0, 1.0), (dy / secs / full_y).clamp(-1.0, 1.0));
     }
     // Radially, as the title removes the dead zone.

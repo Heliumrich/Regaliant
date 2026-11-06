@@ -259,8 +259,16 @@ const TITLE_ARGS: &str = "+physicsMaxUpdateStepsPerFrame=6 +texturePoolLowMemory
 fn title_args() -> Option<String> {
     // (`;` separates settings too: run drivers pass variables without spaces.)
     let v = std::env::var("DS_GAME_ARGS").unwrap_or_else(|_| TITLE_ARGS.to_string()).replace(';', " ");
+    let mut v = v.trim().to_string();
+    if v == "none" {
+        v.clear();
+    }
+    // The PC settings the title takes at boot (the SETTINGS screen's PC tab): the logos.
+    if crate::pcsettings::store::value("Setting_PC_SkipIntro") == Some(1) {
+        v.push_str(" +cp11_debug_skipSplashScreens=1");
+    }
     let v = v.trim();
-    (!v.is_empty() && v != "none").then(|| v.to_string())
+    (!v.is_empty()).then(|| v.to_string())
 }
 
 /// Opens the developer command line with the runtime's title settings

@@ -107,6 +107,8 @@ fn vblank_thread() {
     let mut last_flip = Instant::now();
     let mut last_cap = 0;
     loop {
+        // The PC settings' console variables (changed values, objects the title builds later).
+        crate::pcsettings::convar::tick();
         let grid = crate::gpu::tune::flip_grid();
         let now = Instant::now();
         let wake = if grid { next } else { next.min(now + FLIP_TICK) };

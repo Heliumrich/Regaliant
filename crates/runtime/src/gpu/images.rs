@@ -83,8 +83,12 @@ struct Tls {
     gpu_base: HashMap<u64, bool>,
     depth_feed: HashMap<u64, bool>,
     views: HashMap<[u32; 8], (u64, u64, u64, vk::ImageView, vk::Image, UseStamp)>,
-    samplers: HashMap<([u32; 4], bool), vk::Sampler>,
+    samplers: HashMap<([u32; 4], bool, u8), vk::Sampler>,
 }
+
+/// The PC settings' texture filtering: 0 the title's own, otherwise the anisotropy (8, 16) its
+/// mipmapped surface samplers get (new samplers from the next bind; `pcsettings::apply`).
+pub static ANISO: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 thread_local! {
     static TLS: std::cell::RefCell<Tls> = std::cell::RefCell::new(Tls::default());
@@ -179,7 +183,8 @@ pub fn view_hit(t: &Tsharp, frame: u64) -> Option<(vk::ImageView, vk::Image)> {
 
 /// `Images::sampler` from this thread's memo.
 pub fn sampler_hit(s: [u32; 4], compare: bool) -> Option<vk::Sampler> {
-    tls(|m| m.samplers.get(&(s, compare)).copied())
+    let aniso = ANISO.load(std::sync::atomic::Ordering::Relaxed);
+    tls(|m| m.samplers.get(&(s, compare, aniso)).copied())
 }
 
 /// `Images::resolved_key` from this thread's memo (None: not memoized).
@@ -1387,7 +1392,7 @@ pub struct Images {
     /// Images whose fast-clear metadata was written: (metadata address, its
     /// first word when the writer's value is known: `note_meta_fill`).
     pending_clears: HashMap<ImageKey, (u64, Option<u32>)>,
-    samplers: HashMap<([u32; 4], bool), vk::Sampler>,
+    samplers: HashMap<([u32; 4], bool, u8), vk::Sampler>,
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
@@ -5283,9 +5288,11 @@ impl Images {
     /// Sampler of an S#; `compare`: used by depth-compare instructions (the
     /// S# compare function applies only to those).
     pub fn sampler(&mut self, s: [u32; 4], compare_use: bool) -> Result<vk::Sampler, String> {
-        if let Some(&v) = self.samplers.get(&(s, compare_use)) {
+        let aniso_pc = ANISO.load(std::sync::atomic::Ordering::Relaxed);
+        let key = (s, compare_use, aniso_pc);
+        if let Some(&v) = self.samplers.get(&key) {
             tls(|m| {
-                m.samplers.insert((s, compare_use), v);
+                m.samplers.insert(key, v);
             });
             return Ok(v);
         }
@@ -5310,6 +5317,9 @@ impl Images {
         let lod_bias = ((b(s[2], 0, 14) << 18) as i32 >> 18) as f32 / 256.0;
         let min_lod = b(s[1], 0, 12) as f32 / 256.0;
         let max_lod = b(s[1], 12, 12) as f32 / 256.0;
+        // The PC texture filtering (`ANISO`): anisotropic at that level for the title's
+        // mipmapped, linearly filtered samplers that do not compare (its surface textures).
+        let raise = aniso_pc > 1 && !compare_use && mip == 2 && b(s[2], 22, 2) >= 1 && b(s[2], 20, 2) >= 1;
         let ci = vk::SamplerCreateInfo::default()
             .mag_filter(filt(b(s[2], 20, 2)))
             .min_filter(filt(b(s[2], 22, 2)))
@@ -5318,8 +5328,8 @@ impl Images {
             .address_mode_v(addr(b(s[0], 3, 3)))
             .address_mode_w(addr(b(s[0], 6, 3)))
             .mip_lod_bias(lod_bias.clamp(-15.0, 15.0))
-            .anisotropy_enable(aniso > 0 && b(s[2], 22, 2) >= 2)
-            .max_anisotropy((1u32 << aniso.min(4)) as f32)
+            .anisotropy_enable((aniso > 0 && b(s[2], 22, 2) >= 2) || raise)
+            .max_anisotropy(((1u32 << aniso.min(4)) as f32).max(if raise { aniso_pc as f32 } else { 1.0 }))
             .compare_enable(compare_use)
             .compare_op(match compare {
                 1 => vk::CompareOp::LESS,
@@ -5336,9 +5346,9 @@ impl Images {
             .border_color(border)
             .unnormalized_coordinates(false);
         let v = unsafe { ctx().device.create_sampler(&ci, None) }.map_err(|e| format!("sampler: {e}"))?;
-        self.samplers.insert((s, compare_use), v);
+        self.samplers.insert(key, v);
         tls(|m| {
-            m.samplers.insert((s, compare_use), v);
+            m.samplers.insert(key, v);
         });
         Ok(v)
     }

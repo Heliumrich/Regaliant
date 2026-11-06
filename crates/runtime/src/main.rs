@@ -257,6 +257,8 @@ pub fn keep_run(reason: &str) {
 ///   fmat                     yaw-only rotation matrices in the title's flexible memory (see `fmat`)
 ///   cam                      the gameplay camera's controllers (raw mouse look), with
 ///                            DS_CAMDEBUG=1 also its rigs
+///   pcset <setting> <value>  a PC setting (`Setting_PC_...`) as if changed in the SETTINGS screen
+///   convars                  the PC settings' title console variables and their values
 ///   shot <name>              screenshot of the next presented flip -> shot_<name>.png
 ///   dump                     dump all GPU images at the next flip
 ///   trace                    log every draw/dispatch of an upcoming flip (FRAME lines)
@@ -309,6 +311,16 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     },
                     h => input::press_now(names, h.and_then(|h| h.parse().ok()).unwrap_or(6)),
                 }
+            }
+            "pcset" => {
+                // `pcset <Setting_PC_...> <value>`: a PC setting as if changed in the menu.
+                let name = parts.next().unwrap_or("");
+                let value = parts.next().unwrap_or("");
+                pcsettings::store::set_by_name(name, value)
+            }
+            "convars" => {
+                crate::pcsettings::convar::report();
+                Ok(())
             }
             "shot" => {
                 let name: String = parts.next().unwrap_or("x").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
@@ -1261,6 +1273,7 @@ fn main() {
     hle::libs::savedata::init(cfg.root.join("local-data").join("saves"));
     // Keyboard and mouse layout (written with the defaults when missing).
     input::init(&cfg.root.join("local-data").join("controls.txt"));
+    pcsettings::init(cfg.root.join("local-data").join("pcsettings.txt"));
     // Compiled pipelines and learned shader specs: local-data, or the
     // `--cache` directory (Play.bat: one next to the package folder, so a
     // new package starts with what earlier ones learned on this machine).
