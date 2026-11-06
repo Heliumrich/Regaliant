@@ -30,7 +30,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 160] = [
+    static ALL: [Tunable; 161] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -191,6 +191,7 @@ pub mod tune {
         Tunable { name: "tr_ballast", env: "DS_TR_BALLAST", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "cp_spin", env: "DS_CP_SPIN", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "prep_memo", env: "DS_PREP_MEMO", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "fe3_scan", env: "DS_FE3_SCAN", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1634,6 +1635,15 @@ pub mod tune {
         get(159)
     }
 
+    /// A dry run of a take per title submission (diagnosis,
+    /// docs/FRONTEND3.md phase 1): a helper thread queries every run of the
+    /// mirror's valid pages not armed after each title submission
+    /// (coalesced), without resetting (`fe2::fe3_scan_dry`).
+    #[inline]
+    pub fn fe3_scan() -> u64 {
+        get(160)
+    }
+
     /// Pixel programs that write no memory run their depth and stencil
     /// tests before the shader where the draw's state lets them (no kill,
     /// coverage or depth export, or no depth and stencil writes:
@@ -2433,9 +2443,75 @@ fn run_ahead_line() -> String {
     line
 }
 
+/// The take-per-submission dry run (`tune fe3_scan`): a helper thread scans
+/// after title submissions, those that come meanwhile coalesced; [scans,
+/// submissions, runs, pages queried, pages written, failed queries, ns].
+mod fe3_probe {
+    use parking_lot::{Condvar, Mutex};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PENDING: Mutex<u64> = Mutex::new(0);
+    static CV: Condvar = Condvar::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+    pub fn note_submission() {
+        STARTED.call_once(|| {
+            let _ = crate::thread::spawn_host("gpu-fe3-probe", 1 << 20, Box::new(run));
+        });
+        *PENDING.lock() += 1;
+        CV.notify_one();
+    }
+
+    fn run() {
+        crate::log::set_thread_name("gpu-fe3-probe");
+        loop {
+            let n = {
+                let mut g = PENDING.lock();
+                while *g == 0 {
+                    CV.wait(&mut g);
+                }
+                std::mem::take(&mut *g)
+            };
+            let (runs, queried, written, failed, ns) = super::fe2::fe3_scan_dry();
+            for (k, v) in [1, n, runs, queried, written, failed, ns].into_iter().enumerate() {
+                STATS[k].fetch_add(v, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn reset() {
+        for c in &STATS {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub fn line(flips: u64) -> String {
+        let v: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        if v[0] == 0 {
+            return String::new();
+        }
+        let s = v[0] as f64;
+        format!(
+            "    take-per-submission dry run (`tune fe3_scan`): {} scans for {} title submissions; per scan {:.0} runs of valid pages not armed, {:.1} MiB queried, {:.0} pages written since their last take, {:.1} failed queries, {:.1} us; {:.2} ms of scans a flip
+",
+            v[0],
+            v[1],
+            v[2] as f64 / s,
+            v[3] as f64 * 4096.0 / 1048576.0 / s,
+            v[4] as f64 / s,
+            v[5] as f64 / s,
+            v[6] as f64 / s / 1000.0,
+            v[6] as f64 / 1e6 / flips.max(1) as f64
+        )
+    }
+}
+
 pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
     if buffers.is_empty() {
         return;
+    }
+    if tune::fe3_scan() != 0 && fe2::on() {
+        fe3_probe::note_submission();
     }
     // A frame replay holds the title at the start and end of the frame it
     // records.
@@ -2634,6 +2710,7 @@ pub fn start_profiler() {
 /// Clears the samples and dispatch timings (`profile reset` control command).
 pub fn reset_profile() {
     cp::reset_classes();
+    fe3_probe::reset();
     if let Some(m) = PROFILE.lock().as_mut() {
         m.clear();
     }
@@ -2684,6 +2761,7 @@ pub fn profile_report() -> String {
     s.push_str(&drawcensus::lines(exec::profile_flips()));
     s.push_str(&exec::laps_report());
     s.push_str(&shaders::prep_memo_line());
+    s.push_str(&fe3_probe::line(exec::profile_flips()));
     s.push_str(&cp::wait_stats());
     s.push_str(&cp::classes_line());
     s.push_str(&cp::cb_census_line());

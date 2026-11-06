@@ -1950,6 +1950,71 @@ fn hole_check(written: &[u64]) {
 /// `DS_FE2_TAKE_ALL=1` (diagnosis): every take invalidates its whole range,
 /// so its pages, GPU-written ones included, are uploaded into the mirror
 /// again in every epoch they are checked in.
+/// A dry run of a take per title submission (diagnosis, `tune fe3_scan`;
+/// docs/FRONTEND3.md, phase 1): every run of valid pages not armed is
+/// queried once without resetting (front end 2's own takes reset those
+/// pages, so what it reports was written since their last take).
+/// (runs, pages queried, pages reported written, failed queries, ns.)
+pub fn fe3_scan_dry() -> (u64, u64, u64, u64, u64) {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let t = std::time::Instant::now();
+    let (mut runs, mut queried, mut written, mut failed) = (0u64, 0u64, 0u64, 0u64);
+    let mut addrs = [std::ptr::null_mut::<std::ffi::c_void>(); 512];
+    let mut query = |a: u64, e: u64| {
+        runs += 1;
+        queried += (e - a) / PAGE;
+        let mut at = a;
+        while at < e {
+            let mut count = addrs.len();
+            let mut gran = 0u32;
+            if unsafe { GetWriteWatch(0, at as _, (e - at) as usize, addrs.as_mut_ptr(), &mut count, &mut gran) } != 0 {
+                failed += 1;
+                return;
+            }
+            written += count as u64;
+            if count < addrs.len() {
+                return;
+            }
+            at = addrs[count - 1] as u64 + PAGE;
+        }
+    };
+    for (ci, slot) in TABLE.iter().enumerate() {
+        let p = slot.load(Ordering::Acquire);
+        if p.is_null() {
+            continue;
+        }
+        let c = unsafe { &*p };
+        let base = MIRROR_BASE + ((ci as u64) << CHUNK_SHIFT);
+        let mut start: Option<u64> = None;
+        for w in 0..WORDS {
+            let bits = c.valid[w].load(Ordering::Relaxed) & !c.armed[w].load(Ordering::Relaxed);
+            let wa = base + (w as u64) * 64 * PAGE;
+            if bits == u64::MAX {
+                start.get_or_insert(wa);
+                continue;
+            }
+            let mut k = 0u32;
+            while k < 64 {
+                let set = (bits >> k) & 1 != 0;
+                let a = wa + k as u64 * PAGE;
+                match (set, start) {
+                    (true, None) => start = Some(a),
+                    (false, Some(s)) => {
+                        query(s, a);
+                        start = None;
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+        }
+        if let Some(s) = start {
+            query(s, base + (1u64 << CHUNK_SHIFT));
+        }
+    }
+    (runs, queried, written, failed, t.elapsed().as_nanos() as u64)
+}
+
 fn take_all() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *W.get_or_init(|| std::env::var("DS_FE2_TAKE_ALL").ok().as_deref() == Some("1"))
