@@ -1127,11 +1127,29 @@ fn prep_laps_on() -> bool {
     *ON.get_or_init(|| super::exec::profiling_on() || std::env::var("DS_STEP_LAPS").ok().as_deref() == Some("1"))
 }
 
+thread_local! {
+    /// Set during the untimed first preparation of `DS_PREP_TWICE=1`.
+    static PREP_WARM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `DS_PREP_TWICE=1` (diagnosis, with the step laps): every stage is
+/// prepared once untimed before its timed preparation, whose guest reads
+/// then find the caches the first one warmed (the laps' parts without
+/// cache misses; frames are slower).
+fn prep_warm<T>(f: impl FnOnce() -> T) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("DS_PREP_TWICE").ok().as_deref() == Some("1")) && !PREP_WARM.with(|c| c.get()) {
+        PREP_WARM.with(|c| c.set(true));
+        let _ = f();
+        PREP_WARM.with(|c| c.set(false));
+    }
+}
+
 /// Starts timing a preparation of stage kind `kind` (0 vertex, 1 pixel,
 /// 2 compute).
 #[inline]
 fn prep_lap_begin(kind: usize) {
-    if prep_laps_on() {
+    if prep_laps_on() && !PREP_WARM.with(|c| c.get()) {
         PREP_LAPS.with(|l| {
             let mut l = l.borrow_mut();
             l.on = true;
@@ -1436,6 +1454,59 @@ pub fn fmt_line() -> String {
     )
 }
 
+/// `tune prep_memo` (diagnosis): stage preparations memoized by key during
+/// replay iterations (`prep_memo_key`), in shards; [copies served, kept].
+static PREP_MEMO: [Mutex<Option<super::fx::Map<u64, Prepared>>>; 64] = [const { Mutex::new(None) }; 64];
+static PREP_MEMO_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Empties the memo (a replay starts).
+pub fn prep_memo_clear() {
+    for s in &PREP_MEMO {
+        *s.lock() = None;
+    }
+}
+
+/// The memo key of a stage preparation at `packet`: the registers it reads
+/// and `extra` (how it is prepared).
+pub fn prep_memo_key<R: RegRead + ?Sized>(kind: StageKind, packet: u64, r: &R, extra: u64) -> u64 {
+    let (sh, ctx) = reg_lists(kind);
+    let mut h = super::fx::FxHasher::default();
+    h.write_u64(packet);
+    h.write_u64(kind as u64);
+    h.write_u64(extra);
+    for &i in sh {
+        h.write_u32(r.sh(i));
+    }
+    for &a in ctx {
+        h.write_u32(r.ctx(a));
+    }
+    h.finish()
+}
+
+/// The memoized preparation of `key` (a copy), else `f`'s, kept.
+pub fn prep_memo(key: u64, f: impl FnOnce() -> Result<Prepared, String>) -> Result<Prepared, String> {
+    use std::sync::atomic::Ordering;
+    let shard = &PREP_MEMO[((key ^ (key >> 32)) & 63) as usize];
+    if let Some(p) = shard.lock().as_ref().and_then(|m| m.get(&key).cloned()) {
+        PREP_MEMO_STATS[0].fetch_add(1, Ordering::Relaxed);
+        return Ok(p);
+    }
+    let p = f()?;
+    shard.lock().get_or_insert_with(Default::default).insert(key, p.clone());
+    PREP_MEMO_STATS[1].fetch_add(1, Ordering::Relaxed);
+    Ok(p)
+}
+
+/// Profile line of the memo ("" when unused).
+pub fn prep_memo_line() -> String {
+    let v: Vec<u64> = PREP_MEMO_STATS.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
+    if v[0] == 0 && v[1] == 0 {
+        return String::new();
+    }
+    format!("    replay preparation memo (`tune prep_memo`): {} copies served, {} kept
+", v[0], v[1])
+}
+
 /// `DS_FMT_CENSUS=1` (diagnosis): the formats and swizzles compute stages
 /// read through `FORMAT_RT`, per (program code, resource): [(format,
 /// dst_sel) -> preparations], with the program's address.
@@ -1506,6 +1577,7 @@ pub fn prep_parts_line() -> String {
 }
 
 pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prepared, String> {
+    prep_warm(|| prepare_compute(cp, wave64));
     prep_lap_begin(if prep_laps_on() && PREP_INDIRECT.with(|c| c.get()) { 3 } else { 2 });
     let sh = |i: u32| cp.sh(i);
     let addr = ((sh(CS_PGM_LO) as u64) | ((sh(CS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
@@ -1832,6 +1904,7 @@ fn touch_test_wanted() -> bool {
 
 /// Resolves and translates the pixel shader bound on `cp`.
 pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
+    prep_warm(|| prepare_ps(cp));
     prep_lap_begin(1);
     let sh = |i: u32| cp.sh(i);
     let ctx = |a: u32| cp.ctx(a);
@@ -2048,6 +2121,7 @@ const VGT_SHADER_STAGES_EN: u32 = 0x28B54;
 
 /// Resolves and translates the NGG (vertex) shader bound on `cp`.
 pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
+    prep_warm(|| prepare_ngg(cp));
     prep_lap_begin(0);
     let sh = |i: u32| cp.sh(i);
     let stages = cp.ctx(VGT_SHADER_STAGES_EN);

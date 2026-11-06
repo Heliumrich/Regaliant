@@ -1101,6 +1101,15 @@ impl Exec {
         if aa & 7 != 0 {
             self.report(format!("MSAA ({} samples) rendered single-sampled", 1 << (aa & 7)));
         }
+        // Exact ballast on the graphics command processor (`tune cp_spin`,
+        // diagnosis).
+        let spin = super::super::tune::cp_spin();
+        if spin != 0 && !self.deferred && cp.is_main_gfx() {
+            let t = std::time::Instant::now();
+            while (t.elapsed().as_nanos() as u64) < spin {
+                std::hint::spin_loop();
+            }
+        }
         // Shader stages.
         let ps_addr = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
         // Stages prepared ahead by the workers (`gpu::ahead`) when they still
@@ -1135,8 +1144,13 @@ impl Exec {
         let [pre_vs, pre_ps] = cp.take_ahead();
         let pre_vs = if base_slot.is_some() || batched { None } else { pre_vs };
         let pre_ps = if batched { None } else { pre_ps };
+        // (Diagnosis: the replay memo, `tune prep_memo`.)
+        let memo = super::super::tune::prep_memo();
+        let memo = memo != 0 && super::super::replay::replaying() && (memo == 2 || cp.is_main_gfx());
+        let memo_extra = base_slot.map_or(0, |s| s as u64 + 1) | (batched as u64) << 32;
         let mut vs = match pre_vs.and_then(|s| crate::gpu::ahead::take(&s, cp, true)) {
             Some(p) => p,
+            None if memo => shaders::prep_memo(shaders::prep_memo_key(shaders::StageKind::Vertex, cp.packet_addr(), cp, memo_extra), || prep_vs(cp))?,
             None => prep_vs(cp)?,
         };
         if let Some(slot) = base_slot {
@@ -1149,6 +1163,7 @@ impl Exec {
         let mut ps = if ps_addr != 0 {
             match pre_ps.and_then(|s| crate::gpu::ahead::take(&s, cp, true)) {
                 Some(p) => Some(p),
+                None if memo => Some(shaders::prep_memo(shaders::prep_memo_key(shaders::StageKind::Pixel, cp.packet_addr(), cp, memo_extra), || shaders::prepare_ps(cp))?),
                 None => Some(shaders::prepare_ps(cp)?),
             }
         } else {

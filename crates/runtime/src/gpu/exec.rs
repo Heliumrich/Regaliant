@@ -14767,8 +14767,12 @@ impl Exec {
         let _indirect_laps = shaders::IndirectLaps::new(indirect.is_some());
         // Prepared ahead by the workers (`gpu::ahead`) when it still holds.
         let [pre, _] = cp.take_ahead();
+        // (Diagnosis: the replay memo, `tune prep_memo`.)
+        let memo = super::tune::prep_memo();
+        let memo = memo != 0 && super::replay::replaying() && (memo == 2 || cp.is_main_gfx());
         let mut p = match pre.and_then(|s| super::ahead::take(&s, cp, wave64)) {
             Some(p) => p,
+            None if memo => shaders::prep_memo(shaders::prep_memo_key(shaders::StageKind::Compute, cp.packet_addr(), cp, wave64 as u64 | (indirect.is_some() as u64) << 1), || shaders::prepare_compute(cp, wave64))?,
             None => shaders::prepare_compute(cp, wave64)?,
         };
         // LOD statistics in rotation (`tune lod_cs` >= 2): a stage prepared

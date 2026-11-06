@@ -30,7 +30,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 158] = [
+    static ALL: [Tunable; 160] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -189,6 +189,8 @@ pub mod tune {
         Tunable { name: "buffer_delta", env: "DS_BUFFER_DELTA", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lod_cs", env: "DS_LOD_CS", default: 8, value: AtomicU64::new(UNSET) },
         Tunable { name: "tr_ballast", env: "DS_TR_BALLAST", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "cp_spin", env: "DS_CP_SPIN", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "prep_memo", env: "DS_PREP_MEMO", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1613,6 +1615,23 @@ pub mod tune {
         get(157)
     }
 
+    /// Exact ballast on the graphics command processor (diagnosis: what its
+    /// time is worth in frames live): ns spun in each draw it records in
+    /// full (its own chunks included; not its workers' draws, not repeats).
+    #[inline]
+    pub fn cp_spin() -> u64 {
+        get(158)
+    }
+
+    /// Stage preparations memoized by packet during replay iterations
+    /// (diagnosis: the ceiling of preparation off the recording threads;
+    /// exact there, where the frame's words repeat): 1 the graphics command
+    /// processor's, 2 every recording thread's.
+    #[inline]
+    pub fn prep_memo() -> u64 {
+        get(159)
+    }
+
     /// Pixel programs that write no memory run their depth and stencil
     /// tests before the shader where the draw's state lets them (no kill,
     /// coverage or depth export, or no depth and stencil writes:
@@ -2662,6 +2681,7 @@ pub fn profile_report() -> String {
     s.push_str(&exec::shader_profile());
     s.push_str(&drawcensus::lines(exec::profile_flips()));
     s.push_str(&exec::laps_report());
+    s.push_str(&shaders::prep_memo_line());
     s.push_str(&cp::wait_stats());
     s.push_str(&cp::classes_line());
     s.push_str(&cp::cb_census_line());

@@ -459,6 +459,7 @@ fn drive(iterations: u32, ab: Option<(String, u64, u64)>, timeline: u32) {
     CPU_PASSED.lock().clear();
     *RESTORED.lock() = Some(before.iter().flat_map(|(a, b)| (*a & !7..*a + b.len() as u64).step_by(8)).collect());
     let mut runs: Vec<Run> = Vec::new();
+    super::shaders::prep_memo_clear();
     REPLAYING.store(true, Ordering::SeqCst);
     for i in 0..iterations {
         let value = ab.as_ref().map(|(name, a, b)| {

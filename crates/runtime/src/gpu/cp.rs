@@ -4248,6 +4248,17 @@ impl Cp {
         self.par.is_some()
     }
 
+    /// Whether this is the graphics queue's main command processor (not a
+    /// parallel worker or a compute queue's).
+    pub(super) fn is_main_gfx(&self) -> bool {
+        self.main_gfx
+    }
+
+    /// The packet being executed (its address).
+    pub(super) fn packet_addr(&self) -> u64 {
+        self.cur_packet
+    }
+
     /// START_INST_LOC for an indirect draw packet that names none (our Agc
     /// builders): the SH register of the bound primitive shader's
     /// instance-offset user SGPR (its shader object declares it, see
