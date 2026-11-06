@@ -127,14 +127,20 @@ pub fn output_size() -> (u32, u32) {
     if o == 0 { (3840, 2160) } else { ((o >> 32) as u32, o as u32) }
 }
 
-/// The render size of a headless run for the output's shape (mode 3's 1440 lines).
+/// The render size for the output's shape at the title's own size (no window, or the Render
+/// Scale's Visual Mode): the mode's lines (1440 in mode 3) at the output's shape; 0 (the
+/// title's own) at 16:9.
 fn headless_render() -> u64 {
     let (ow, oh) = output_size();
     if (ow, oh) == (3840, 2160) {
         return 0;
     }
-    let w = ((1440.0 * ow as f32 / oh as f32 / 8.0).round() as u64 * 8).min(7680);
-    w << 32 | 1440
+    let lines = match TITLE_MODE.load(Ordering::Relaxed) {
+        m @ 3..=5 => sizes(m).0 .1,
+        _ => 1440,
+    } as u64;
+    let w = ((lines as f32 * ow as f32 / oh as f32 / 8.0).round() as u64 * 8).min(7680);
+    w << 32 | lines
 }
 
 /// The Aspect Ratio setting at start: Automatic takes the primary screen's shape when the

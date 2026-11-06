@@ -111,7 +111,8 @@ impl Item {
     }
 }
 
-/// The Render Scale choice's percentages (of the window's or screen's resolution).
+/// The Render Scale choice's percentages (of the window's or screen's resolution), its options
+/// 1-9; option 0, the default, is the title's own render size (the Visual Mode's).
 pub const RENDER_SCALES: [u32; 9] = [50, 60, 67, 75, 85, 100, 125, 150, 200];
 
 /// The PC tab's items, in order (each one works: what it changes is in `apply`).
@@ -127,14 +128,14 @@ pub fn items() -> Vec<Item> {
         Item {
             id: s("AspectRatio"),
             label: s("Aspect Ratio"),
-            tooltip: s("The picture's shape, from the next start: Automatic follows the screen in fullscreen. Wider shapes show more to the sides, with the HUD at the screen's edges and movies and dialogs in the middle."),
-            kind: ItemKind::Choice(vec![s("Automatic"), s("16:9"), s("16:10"), s("21:9"), s("32:9")], 0),
+            tooltip: s("The picture's shape, from the next start (16:9: the original's; Automatic follows the screen in fullscreen). Wider shapes show more to the sides, with the HUD at the screen's edges and movies and dialogs in the middle."),
+            kind: ItemKind::Choice(vec![s("Automatic"), s("16:9"), s("16:10"), s("21:9"), s("32:9")], 1),
         },
         Item {
             id: s("RenderScale"),
             label: s("Render Scale"),
-            tooltip: s("The resolution the game renders at, against the window's or screen's (100%: its own resolution; at most 3840x2160). Lower runs faster, higher looks sharper."),
-            kind: ItemKind::Choice(RENDER_SCALES.iter().map(|p| format!("{p}%")).collect(), 5),
+            tooltip: s("The resolution the game renders at: as its Visual Mode sets it (the original's), or a share of the window's or screen's (100%: its own resolution; at most 3840x2160). Lower runs faster, higher looks sharper."),
+            kind: ItemKind::Choice(std::iter::once(s("Visual Mode")).chain(RENDER_SCALES.iter().map(|p| format!("{p}%"))).collect(), 0),
         },
         Item {
             id: s("Sharpening"),
@@ -261,7 +262,8 @@ pub fn apply() {
     convar::want("r_vignetteOverrideEnable", vignette_off.then_some(1));
     convar::want("r_vignetteScale", vignette_off.then(|| convar::float(0.0)));
     crate::hle::libs::audio2::OUTPUT_CHOICE.store(get("AudioOutput").unwrap_or(0).min(5), std::sync::atomic::Ordering::Relaxed);
-    let scale = RENDER_SCALES.get(get("RenderScale").unwrap_or(5) as usize).copied().unwrap_or(100);
+    // Option 0: the title's own render size (0); 1-9 the percentages.
+    let scale = get("RenderScale").unwrap_or(0).checked_sub(1).and_then(|i| RENDER_SCALES.get(i as usize).copied()).unwrap_or(0);
     crate::dispmode::SCALE_PCT.store(scale, std::sync::atomic::Ordering::Relaxed);
     // The window: applied when it changes (the window opens with it, `window_mode`).
     static WINDOW_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
@@ -371,11 +373,7 @@ pub fn init(path: std::path::PathBuf) {
     for (w, name) in [prompts::SHOWN_PS, prompts::SHOWN_NOT_KB, prompts::SHOWN_NOT_XB, prompts::SHOWN_KB, prompts::SHOWN_XB].into_iter().enumerate() {
         defs.push(store::Def { name: name.into(), kind: store::Kind::Int, default: 0, live: Some(store::Live::Prompts(w as u8)) });
     }
-    let first_start = !path.exists();
     store::init(path, defs);
-    if first_start {
-        presets::first_start();
-    }
     apply();
 }
 
