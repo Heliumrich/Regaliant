@@ -35,6 +35,13 @@
 //! mode for two of its calls, so the title runs its set-display-mode twice (as when the player
 //! changes Visual Mode) and makes its targets at the new size each time (`tick`).
 //!
+//! The aspect ratio (the PC tab's Aspect Ratio, from the start; FINDINGS.md 2026-11-06 night):
+//! a shape other than 16:9 makes the output W x 2160 (the UI's canvas with it: its 4K sprites
+//! keep their size, the HUD reaches the screen's edges), the render size the same shape, and the
+//! video-out object's aspect (+4, 16/9 as the title makes it) the output's, which its cameras
+//! hand their projection: the view widens (Hor+). The display targets are made once, at the
+//! video-out constructor: a change applies at the next start.
+//!
 //! `DS_DISPLAY_MODE=<1-5>` holds the mode from the first frame: at all three
 //! the register holding the options' value (+0xD30, which has the last say)
 //! becomes the chosen mode just before its `test`/`cmovne` (`hook_rax` at
@@ -73,6 +80,33 @@ static OUTPUT: AtomicU64 = AtomicU64::new(0);
 /// canvas, size getter.
 static OUTPUT_SET: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
+/// The aspect the title's cameras project with (f32 bits; 0: the title's 16:9): the video-out
+/// object's +4 (eboot+0x2F0A988 holds the object; its constructor stores 16/9 at eboot+0x90ae7f),
+/// which the gameplay camera (eboot+0xcdae49) and another (eboot+0xdeabf5) hand the projection
+/// function eboot+0x8e71c0 with their field of view.
+pub static ASPECT: AtomicU32 = AtomicU32::new(0);
+static ASPECT_SET: AtomicU64 = AtomicU64::new(0);
+
+fn apply_aspect() {
+    let a = ASPECT.load(Ordering::Relaxed);
+    let base = crate::pcsettings::convar::base();
+    if a == 0 || base == 0 {
+        return;
+    }
+    let vo = unsafe { ((base + 0x2F0A988) as *const u64).read_volatile() };
+    if vo == 0 {
+        return;
+    }
+    let p = (vo + 4) as *mut u32;
+    let cur = unsafe { p.read_volatile() };
+    if cur != a {
+        unsafe { p.write_volatile(a) };
+        if ASPECT_SET.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::info!("aspect {:.4} set for the title's cameras (was {:.4})", f32::from_bits(a), f32::from_bits(cur));
+        }
+    }
+}
+
 /// Render and output sizes of a mode (eboot+0x90a600's table).
 pub fn sizes(mode: u32) -> ((u32, u32), (u32, u32)) {
     match mode {
@@ -82,6 +116,65 @@ pub fn sizes(mode: u32) -> ((u32, u32), (u32, u32)) {
         5 => ((2688, 1512), (3840, 2160)),
         _ => ((1920, 1080), (1920, 1080)),
     }
+}
+
+/// The Aspect Ratio setting's shapes (options 1-4): 16:9, 16:10, 21:9 (64:27), 32:9.
+const ASPECTS: [f32; 4] = [16.0 / 9.0, 16.0 / 10.0, 64.0 / 27.0, 32.0 / 9.0];
+
+/// The output size (the title's 3840x2160 unless an aspect or `DS_OUTPUT_SIZE` changed it).
+pub fn output_size() -> (u32, u32) {
+    let o = OUTPUT.load(Ordering::Relaxed);
+    if o == 0 { (3840, 2160) } else { ((o >> 32) as u32, o as u32) }
+}
+
+/// The render size of a headless run for the output's shape (mode 3's 1440 lines).
+fn headless_render() -> u64 {
+    let (ow, oh) = output_size();
+    if (ow, oh) == (3840, 2160) {
+        return 0;
+    }
+    let w = ((1440.0 * ow as f32 / oh as f32 / 8.0).round() as u64 * 8).min(7680);
+    w << 32 | 1440
+}
+
+/// The Aspect Ratio setting at start: Automatic takes the primary screen's shape when the
+/// window opens fullscreen (16:9 in a window and in headless runs); a shape within 1% of 16:9
+/// leaves the title's own output.
+fn start_aspect() {
+    if OUTPUT.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let choice = crate::pcsettings::store::value("Setting_PC_AspectRatio").unwrap_or(0);
+    let a = match choice {
+        1..=4 => ASPECTS[choice as usize - 1],
+        _ => {
+            let fullscreen = match std::env::var("DS_FULLSCREEN").ok().as_deref() {
+                Some("1") => true,
+                Some("0") => false,
+                _ => crate::pcsettings::window_fullscreen().unwrap_or(false),
+            };
+            if !crate::gpu::vk::present::active() || !fullscreen {
+                return;
+            }
+            use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+            let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+            if w <= 0 || h <= 0 {
+                return;
+            }
+            w as f32 / h as f32
+        }
+    };
+    if (a / (16.0 / 9.0) - 1.0).abs() < 0.01 {
+        return;
+    }
+    let a = a.clamp(1.5, 3.6);
+    let ow = (2160.0 * a / 8.0).round() as u32 * 8;
+    OUTPUT.store((ow as u64) << 32 | 2160, Ordering::Relaxed);
+    ASPECT.store((ow as f32 / 2160.0).to_bits(), Ordering::Relaxed);
+    if !RENDER_FROM_ENV.load(Ordering::Relaxed) && !crate::gpu::vk::present::active() {
+        RENDER.store(headless_render(), Ordering::Relaxed);
+    }
+    crate::info!("aspect ratio {a:.3} (Aspect Ratio option {choice}): output {ow}x2160, the cameras' view widened, the UI centred where it is 16:9");
 }
 
 /// Reads `DS_DISPLAY_MODE` and `DS_RENDER_SIZE` (called before the hooks are
@@ -101,13 +194,17 @@ pub fn init() {
     if let Ok(v) = std::env::var("DS_OUTPUT_SIZE") {
         let size = v.trim().split_once(['x', 'X']).and_then(|(w, h)| Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?)));
         match size {
-            Some((w, h)) if (1920..=3840).contains(&w) && (1080..=2160).contains(&h) => {
+            Some((w, h)) if (1920..=7680).contains(&w) && (1080..=2160).contains(&h) => {
                 OUTPUT.store((w as u64) << 32 | h as u64, Ordering::Relaxed);
+                if std::env::var("DS_OUTPUT_ASPECT").ok().as_deref() != Some("0") {
+                    ASPECT.store((w as f32 / h as f32).to_bits(), Ordering::Relaxed);
+                }
                 crate::info!("output size {w}x{h} (DS_OUTPUT_SIZE, experiment): the title's 3840x2160 output, display targets and UI canvas at that size");
             }
-            _ => crate::warn!("DS_OUTPUT_SIZE={v}: not a size (WxH, 1920x1080 to 3840x2160); the title's own is used"),
+            _ => crate::warn!("DS_OUTPUT_SIZE={v}: not a size (WxH, 1920x1080 to 7680x2160); the title's own is used"),
         }
     }
+    start_aspect();
     let Ok(v) = std::env::var("DS_DISPLAY_MODE") else { return };
     match v.trim().parse::<u32>() {
         Ok(m @ 1..=5) => {
@@ -158,15 +255,24 @@ pub extern "sysv64" fn hook_display(regs: *const u64, _arg: u32) {
 /// The render size for a window area of `w`x`h` at `pct` percent: 16:9, the height a multiple
 /// of 4 from 360 to 2160, the width the height's 16:9 rounded to a multiple of 4.
 pub fn scaled_size(w: u32, h: u32, pct: u32) -> (u32, u32) {
-    let fh = (h.min(w * 9 / 16) as u64 * pct as u64 / 100).clamp(360, 2160) as u32;
-    let fh = (fh + 2) / 4 * 4;
-    let fw = ((fh as u64 * 16 / 9 + 2) / 4 * 4).min(3840) as u32;
+    let (ow, oh) = output_size();
+    // The output's shape fitted to the area, scaled; at most 2160 lines and the 3840x2160
+    // frame's pixels (the most the title's targets were made for).
+    let fit_h = (h as u64).min(w as u64 * oh as u64 / ow as u64);
+    let mut fh = (fit_h * pct as u64 / 100).clamp(360, 2160);
+    let max_px = 3840u64 * 2160;
+    while fh > 360 && fh * fh * ow as u64 / oh as u64 > max_px {
+        fh -= 4;
+    }
+    let fh = ((fh + 2) / 4 * 4) as u32;
+    let fw = ((fh as u64 * ow as u64 / oh as u64 + 2) / 4 * 4).min(7680) as u32;
     (fw, fh)
 }
 
 /// Each vblank: the render size the setting and the window ask for; a settled change is applied
 /// by a mode pulse (in the 4K-output modes; none in headless runs, which keep the title's size).
 pub fn tick() {
+    apply_aspect();
     if RENDER_FROM_ENV.load(Ordering::Relaxed) || PULSE_LEFT.load(Ordering::Relaxed) > 0 {
         return;
     }
@@ -176,7 +282,8 @@ pub fn tick() {
             let (rw, rh) = scaled_size(w, h, pct);
             (rw as u64) << 32 | rh as u64
         }
-        _ => 0,
+        // No window: the title's own size, or its shape's for another aspect.
+        _ => headless_render(),
     };
     if WANT.swap(want, Ordering::Relaxed) != want {
         WANT_TICKS.store(0, Ordering::Relaxed);

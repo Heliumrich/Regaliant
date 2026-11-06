@@ -17,6 +17,7 @@ pub mod pointer;
 pub mod popup;
 pub mod presets;
 pub mod saves;
+pub mod wide;
 pub mod prompts;
 pub mod store;
 pub mod value;
@@ -122,6 +123,12 @@ pub fn items() -> Vec<Item> {
             label: s("Window Mode"),
             tooltip: s("Shows the game in a window or fullscreen without borders (Alt+Enter switches too)."),
             kind: ItemKind::Choice(vec![s("Windowed"), s("Borderless Fullscreen")], 0),
+        },
+        Item {
+            id: s("AspectRatio"),
+            label: s("Aspect Ratio"),
+            tooltip: s("The picture's shape, from the next start: Automatic follows the screen in fullscreen. Wider shapes show more to the sides, with the HUD at the screen's edges and movies and dialogs in the middle."),
+            kind: ItemKind::Choice(vec![s("Automatic"), s("16:9"), s("16:10"), s("21:9"), s("32:9")], 0),
         },
         Item {
             id: s("RenderScale"),
@@ -433,9 +440,21 @@ fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var("DS_PC_MENU").ok().as_deref() != Some("0"))
 }
 
+/// How many times as wide as 16:9 the output is, when it is not 16:9 (the UI files then
+/// adapted: wider, or narrower as 16:10).
+fn wide_factor() -> Option<f32> {
+    let (w, h) = crate::dispmode::output_size();
+    let k = w as f32 / h as f32 / (16.0 / 9.0);
+    (!(0.99..=1.01).contains(&k)).then_some(k)
+}
+
+fn ui_file(guest: &str) -> bool {
+    guest.starts_with("/app0/ui/scripts/") && guest.ends_with(".cgpr")
+}
+
 /// Whether the port extends this guest path (a cheap test: every file lookup asks).
 fn extends(guest: &str) -> bool {
-    guest == START_MENU || guest == HUD || guest == GLOBAL || ICON_FILES.contains(&guest) || (guest.starts_with(TEXT_DIR) && guest.ends_with(".ctxt")) || prompts::serves(guest)
+    guest == START_MENU || guest == HUD || guest == GLOBAL || ICON_FILES.contains(&guest) || (guest.starts_with(TEXT_DIR) && guest.ends_with(".ctxt")) || prompts::serves(guest) || (ui_file(guest) && wide_factor().is_some())
 }
 
 static GENERATED: Mutex<Option<HashMap<String, Option<Arc<Vec<u8>>>>>> = Mutex::new(None);
@@ -465,10 +484,26 @@ pub fn generated(guest: &str) -> Option<Arc<Vec<u8>>> {
             prompts::extend_global(&orig)
         } else if ICON_FILES.contains(&guest) {
             prompts::extend_icons(&orig)
+        } else if ui_file(guest) {
+            Ok(orig)
         } else {
             Ok(text(&orig))
         }
     })();
+    // A wide output: the UI's 16:9 elements centred, its full-screen fills widened.
+    let built = match (built, wide_factor()) {
+        (Ok(d), Some(k)) if ui_file(guest) => match wide::adapt(&d, k) {
+            Ok((out, centred, widened)) => {
+                crate::info!("wide screen: {guest}: {centred} 16:9 frames centred, {widened} fills widened");
+                Ok(out)
+            }
+            Err(e) => {
+                crate::warn!("wide screen: {guest} not adapted: {e}");
+                Ok(d)
+            }
+        },
+        (b, _) => b,
+    };
     let v = match built {
         Ok(d) => {
             crate::info!("pc settings: {guest} extended in memory ({} bytes)", d.len());

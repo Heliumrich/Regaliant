@@ -126,6 +126,11 @@ pub fn init(base: u64, image: &[u8]) {
     super::apply();
 }
 
+/// The main executable's load address (0 before it loaded).
+pub fn base() -> u64 {
+    BASE.load(Ordering::Relaxed)
+}
+
 fn index(name: &str) -> Option<usize> {
     VARS.iter().position(|v| v.name == name)
 }

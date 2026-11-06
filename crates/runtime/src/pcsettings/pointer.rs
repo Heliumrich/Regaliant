@@ -7,7 +7,7 @@
 //!
 //! The items: the focused node and its siblings (the children of its parent: a list's rows, a
 //! grid's slots, the SETTINGS tabs), each covering its subtree's placed rectangles on the
-//! title's 1920x1080 canvas (`uistate::bounds`); the pointer is mapped from the window to the
+//! title's canvas (1080 units high; 1920 wide at 16:9, `uistate::bounds`); the pointer is mapped from the window to the
 //! canvas as the presenter fits the frame. Every list keeps a selected item (flag 0x1); the
 //! focused one is the selected item of the list on the input focus's path (0x40).
 
@@ -82,13 +82,17 @@ fn canvas_pos() -> Option<(f32, f32)> {
     }
     let cw = crate::gpu::vk::window::CLIENT_W.load(Relaxed);
     let ch = crate::gpu::vk::window::CLIENT_H.load(Relaxed);
-    let (rx, ry, rw, rh) = crate::gpu::vk::present::fit(3840, 2160, cw, ch);
+    // The frame as the presenter fits it; the canvas 1080 units high, as wide as the output's
+    // shape (wider than 1920 with another Aspect Ratio).
+    let (ow, oh) = crate::dispmode::output_size();
+    let (rx, ry, rw, rh) = crate::gpu::vk::present::fit(ow, oh, cw, ch);
     if rw == 0 || rh == 0 {
         return None;
     }
-    let u = (x as f32 - rx as f32) / rw as f32 * 1920.0;
+    let width = 1080.0 * ow as f32 / oh as f32;
+    let u = (x as f32 - rx as f32) / rw as f32 * width;
     let v = (y as f32 - ry as f32) / rh as f32 * 1080.0;
-    ((0.0..1920.0).contains(&u) && (0.0..1080.0).contains(&v)).then_some((u, v))
+    ((0.0..width).contains(&u) && (0.0..1080.0).contains(&v)).then_some((u, v))
 }
 
 /// The focused items: the selected item (0x1) of each list on the input focus's path (its

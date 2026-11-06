@@ -383,7 +383,12 @@ pub fn present(src: Source) -> bool {
 /// A window shows the frames (`init` succeeded): the render scale follows its area.
 static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The window's area the title's 16:9 frame fills (pixels; None without a window).
+/// A window shows the frames.
+pub fn active() -> bool {
+    ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The window's area the title's frame fills (its output's shape; pixels; None without a window).
 pub fn area() -> Option<(u32, u32)> {
     use std::sync::atomic::Ordering::Relaxed;
     if !ACTIVE.load(Relaxed) {
@@ -393,7 +398,8 @@ pub fn area() -> Option<(u32, u32)> {
     if w < 64 || h < 64 {
         return None;
     }
-    let (_, _, fw, fh) = fit(3840, 2160, w, h);
+    let (ow, oh) = crate::dispmode::output_size();
+    let (_, _, fw, fh) = fit(ow, oh, w, h);
     Some((fw, fh))
 }
 
