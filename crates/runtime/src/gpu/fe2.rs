@@ -1811,7 +1811,11 @@ fn widen(a: u64, b: u64) -> (u64, u64) {
 /// `widen`): pages written since their last take lose their valid bit.
 #[allow(clippy::too_many_arguments)]
 fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &Armable, written: &mut Vec<u64>, class: &[AtomicU64; 4]) {
-    if arm && crate::hosted::on() {
+    // (Queue 0x50's threads take without arming: its particle chain sets
+    // how long the graphics CP records serially past its label, and the
+    // pages stay armable for other threads' checks: +0.5% at the vista,
+    // level at Doran, FINDINGS.md 2026-11-06.)
+    if arm && crate::hosted::on() && super::prio::role() != 2 {
         let t = tsc();
         try_arm(a, b, frame, armable);
         caller_since(C_ARM, t);

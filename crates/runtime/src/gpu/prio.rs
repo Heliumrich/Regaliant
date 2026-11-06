@@ -63,6 +63,21 @@ pub fn core_mask(core: usize) -> u64 {
     cores().get(core).copied().unwrap_or(0)
 }
 
+/// The calling thread's role: 0 the graphics queue's command processor, 1
+/// one of its parallel workers (or any other thread), 2 queue 0x50's
+/// command processor or workers, 3 another compute queue's (`fe2::take_run`:
+/// queue 0x50's takes arm nothing).
+#[inline]
+pub fn role() -> u32 {
+    if MAIN.with(|m| m.get()) {
+        0
+    } else if COMPUTE.with(|c| c.get()) {
+        if QUEUE.with(|q| q.get()) == 0x50 { 2 } else { 3 }
+    } else {
+        1
+    }
+}
+
 /// The calling thread is the graphics queue's command processor.
 pub fn set_main() {
     MAIN.with(|m| m.set(true));
