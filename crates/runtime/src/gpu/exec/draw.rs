@@ -298,6 +298,34 @@ pub struct DrawArgs {
 }
 
 
+/// Vertex invocations (count x instances) from which a draw is logged as
+/// absurd (`Exec::note_huge_draw`).
+const HUGE_DRAW: u64 = 1 << 26;
+static HUGE_DRAWS: AtomicU64 = AtomicU64::new(0);
+
+impl Exec {
+    /// Logs a draw of `HUGE_DRAW` vertex invocations or more (its executor,
+    /// packet, programs and arguments; the first 16 a boot).
+    #[cold]
+    fn note_huge_draw(&self, cp: &Cp, a: &DrawArgs) {
+        if HUGE_DRAWS.fetch_add(1, Ordering::Relaxed) >= 16 {
+            return;
+        }
+        let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
+        crate::warn!(
+            "gpu[{}]: a draw of {} x {} vertex invocations at packet {:#x} (vs {:#x} ps {ps:#x}, index {:?}, base vertex {:?}, first instance {})",
+            self.name,
+            a.count,
+            a.instances,
+            cp.packet_addr(),
+            shaders::ngg_addr(cp),
+            a.index,
+            a.base_vertex,
+            a.first_instance
+        );
+    }
+}
+
 /// `draw` outcome when the vertex stage needs the start instance on the CPU
 /// (`shaders::uses_user_word`): the command processor reads the arguments
 /// and draws again.
@@ -1059,6 +1087,12 @@ impl Exec {
         let delta_at = self.delta.at.take();
         if a.count == 0 || a.instances == 0 {
             return Ok(false);
+        }
+        // A draw of absurd size is logged (the first 16 a boot): 2026-11-06,
+        // a 6 s frame at Phalanx's door had the GPU busy throughout on
+        // ~20-draw worker batches of 385-487 ms each, unexplained.
+        if a.count as u64 * a.instances as u64 >= HUGE_DRAW {
+            self.note_huge_draw(cp, a);
         }
         // Phase times (DS_PROFILE_GPU only: a clock read costs ~20 ns).
         let t0 = super::profiling().then(std::time::Instant::now);
