@@ -118,6 +118,17 @@ const FIXES: &[Fix] = &[
         why: "the mouse turns the camera by its counts, not through the stick",
         only_with: None,
     },
+    // ... and the bow's precision aim (`camhook::aim_hook`): after its stick stage stored the
+    // aim's pitch and yaw (eboot+0x17692e), `vmovss xmm1,[rbx+9Ch]` (rbx the aim controller).
+    Fix {
+        name: "raw mouse look (bow aim)",
+        offset: 0x176936,
+        from: &[0xc5, 0xfa, 0x10, 0x8b, 0x9c, 0x00, 0x00, 0x00],
+        change: Change::Hook { at: 0, handler: crate::camhook::aim_hook },
+        kind: "PC controls, `mouse_look_raw`",
+        why: "the mouse aims the bow by its counts, not through the stick",
+        only_with: None,
+    },
     // Diagnosis (`DS_CAMDEBUG=1`): the camera rig update's entry
     // (eboot+0x181b00: `push rbp; mov rbp,rsp; push r15`), rdi the rig: the
     // rigs seen, for the `cam` control command.
@@ -137,10 +148,10 @@ const FIXES: &[Fix] = &[
         name: "display mode held (render resolution)",
         offset: 0x9fe6a8,
         from: &[0x85, 0xc9, 0x0f, 0x45, 0xf1],
-        change: Change::Hook { at: 0, handler: crate::dispmode::hook_rax },
-        kind: "PC settings, `DS_DISPLAY_MODE`",
+        change: Change::Hook { at: 0, handler: crate::dispmode::hook_display },
+        kind: "PC settings: Render Scale, `DS_DISPLAY_MODE`",
         why: "the title's render resolution follows its options (2560x1440 at the gate) and no PC setting",
-        only_with: Some("DS_DISPLAY_MODE"),
+        only_with: None,
     },
     // ... the same choice kept as the effective mode (eboot+0xb26030, +0xD28),
     // the same instructions ...
@@ -151,7 +162,7 @@ const FIXES: &[Fix] = &[
         change: Change::Hook { at: 0, handler: crate::dispmode::hook_rax },
         kind: "PC settings, `DS_DISPLAY_MODE`",
         why: "the effective mode follows the options",
-        only_with: Some("DS_DISPLAY_MODE"),
+        only_with: None,
     },
     // ... and the UI's 4K output test (eboot+0xde88c0): `test r15d,r15d; mov
     // rcx,[rdx]` before `cmovne eax,r15d` (r15d the options' mode).
@@ -162,7 +173,7 @@ const FIXES: &[Fix] = &[
         change: Change::Hook { at: 0, handler: crate::dispmode::hook_r15 },
         kind: "PC settings, `DS_DISPLAY_MODE`",
         why: "the UI's scale follows the options' mode (4K for modes 3-5)",
-        only_with: Some("DS_DISPLAY_MODE"),
+        only_with: None,
     },
     // ... and the frame's copy of the settings (eboot+0xa4f2dd: memcpy of
     // 0xD8A bytes to r14+0x390), after it: `mov edx,1`.
@@ -173,7 +184,7 @@ const FIXES: &[Fix] = &[
         change: Change::Hook { at: 0, handler: crate::dispmode::hook_snapshot },
         kind: "PC settings, `DS_DISPLAY_MODE`",
         why: "the frame's copy of the settings keeps the options' mode",
-        only_with: Some("DS_DISPLAY_MODE"),
+        only_with: None,
     },
     // The render size within a mode (`dispmode`, `DS_RENDER_SIZE`; and the
     // output size, `DS_OUTPUT_SIZE`): set display mode (eboot+0x90a600)
@@ -186,7 +197,7 @@ const FIXES: &[Fix] = &[
         change: Change::Hook { at: 0, handler: crate::dispmode::hook_render_size },
         kind: "PC settings, `DS_RENDER_SIZE`",
         why: "the title renders at its mode's size (2560x1440 at the gate) and no PC setting",
-        only_with: Some("DS_RENDER_SIZE|DS_OUTPUT_SIZE"),
+        only_with: None,
     },
     // The output size (`dispmode`, `DS_OUTPUT_SIZE`, experiment): the
     // video-out constructor's size block before its use, `mov rsi,r15; mov

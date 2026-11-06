@@ -211,6 +211,66 @@ pub fn status() -> String {
     out
 }
 
+/// `audio split <seconds>` (diagnosis): each port group's own stereo mix as `mix_port` adds it
+/// (groups: port type, channel count and format; the ambisonic objects' decode), written to
+/// `<run dir>/audio-split-<group>.wav` together, aligned to the grain.
+struct Split {
+    dir: std::path::PathBuf,
+    frames_left: usize,
+    frames: usize,
+    mixes: std::collections::BTreeMap<String, Vec<f32>>,
+}
+
+static SPLIT: Mutex<Option<Split>> = Mutex::new(None);
+
+pub fn start_split(seconds: f64) -> Result<(), String> {
+    let dir = crate::run_dir().ok_or("no run directory")?;
+    let mut g = SPLIT.lock();
+    if g.is_some() {
+        return Err("a split capture is in progress".into());
+    }
+    *g = Some(Split { dir: dir.to_path_buf(), frames_left: (seconds * 48000.0) as usize, frames: 0, mixes: Default::default() });
+    crate::info!("AudioOut2: capturing {seconds} s of each port group's mix");
+    Ok(())
+}
+
+fn split_group(p: &Port) -> String {
+    match ambi_channel(p) {
+        Some(_) if ambi_decode() => format!("ambi{}", p.attr9),
+        _ if is_object(p.port_type) => "object-other".into(),
+        _ => format!("type{:x}-{}ch-f{:x}", p.port_type, channels(p.format), p.format),
+    }
+}
+
+/// One grain's groups (`group` -> its stereo mix of `n` frames) into the split capture.
+fn split_add(n: usize, grain: std::collections::BTreeMap<String, Vec<f32>>) {
+    let mut g = SPLIT.lock();
+    let Some(sp) = g.as_mut() else { return };
+    for (k, v) in grain {
+        let e = sp.mixes.entry(k).or_insert_with(|| vec![0.0; 2 * sp.frames]);
+        e.extend_from_slice(&v);
+    }
+    sp.frames += n;
+    for v in sp.mixes.values_mut() {
+        v.resize(2 * sp.frames, 0.0);
+    }
+    sp.frames_left = sp.frames_left.saturating_sub(n);
+    if sp.frames_left > 0 {
+        return;
+    }
+    let sp = g.take().unwrap();
+    drop(g);
+    for (k, v) in &sp.mixes {
+        let path = sp.dir.join(format!("audio-split-{k}.wav"));
+        let peak = v.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let rms = (v.iter().map(|&x| x as f64 * x as f64).sum::<f64>() / v.len().max(1) as f64).sqrt();
+        match crate::audio::write_wav_file(&path, v) {
+            Ok(()) => crate::info!("AudioOut2: split capture {} (rms {rms:.4}, peak {peak:.3})", path.display()),
+            Err(e) => crate::warn!("AudioOut2: split capture {}: {e}", path.display()),
+        }
+    }
+}
+
 /// Mixes one grain of a port into a stereo accumulator.
 unsafe fn mix_port(p: &Port, n: usize, out: &mut [f32]) {
     if p.latched == 0 {
@@ -361,7 +421,13 @@ sysv! {
             let ports = PORTS.lock();
             // (Diagnostics: W and Y of the first ambisonic set.)
             let (mut w, mut y, mut x): (Vec<f32>, Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new(), Vec::new());
+            let splitting = SPLIT.lock().is_some();
+            let mut groups: std::collections::BTreeMap<String, Vec<f32>> = Default::default();
             for p in ports.as_ref().into_iter().flat_map(|m| m.values()).filter(|p| p.ctx == ctx) {
+                if splitting {
+                    let g = groups.entry(split_group(p)).or_insert_with(|| vec![0f32; 2 * n]);
+                    mix_port(p, n, g);
+                }
                 match ambi_channel(p) {
                     Some(acn @ (0 | 1 | 3)) if p.attr9 == 0 && p.latched != 0 && channels(p.format) == 1 && p.format & 0x7F == 0 => {
                         let s: Vec<f32> = (0..n).map(|i| *(p.latched as *const f32).add(i) * p.gains[0]).collect();
@@ -379,6 +445,9 @@ sysv! {
             }
             if !w.is_empty() && w.len() == y.len() && w.len() == x.len() {
                 note_balance(&w, &y, &x);
+            }
+            if splitting {
+                split_add(n, groups);
             }
         }
         // Blocks while `depth` grains are queued (the title's pacing).

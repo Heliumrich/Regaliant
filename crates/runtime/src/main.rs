@@ -461,6 +461,12 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 info!("control: note {}", parts.by_ref().collect::<Vec<_>>().join(" "));
                 Ok(())
             }
+            "camdump" => {
+                // Debug (`DS_CAMDEBUG=1`): the camera rigs' controllers' fields.
+                info!("camdump:
+{}", camhook::dump());
+                Ok(())
+            }
             "cam" => {
                 // Debug: the gameplay camera's controllers (`camhook`) and,
                 // with DS_CAMDEBUG=1, its rigs.
@@ -786,7 +792,9 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 // `<run dir>/audio-<n>.wav`.
                 match (parts.next(), parts.next().and_then(|s| s.parse::<f64>().ok())) {
                     (Some("capture"), Some(s)) if s > 0.0 && s <= 600.0 => audio::start_capture(s),
-                    _ => Err("usage: audio capture <seconds 0-600>".into()),
+                    // `audio split <seconds>`: each AudioOut2 port group's mix to its own file.
+                    (Some("split"), Some(s)) if s > 0.0 && s <= 120.0 => hle::libs::audio2::start_split(s),
+                    _ => Err("usage: audio capture <seconds 0-600> | audio split <seconds 0-120>".into()),
                 }
             }
             "frametimes" => {

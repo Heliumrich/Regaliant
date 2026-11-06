@@ -2430,7 +2430,11 @@ fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: O
             let tm = std::time::Instant::now();
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("shader module: {e}"))?;
             super::pcache::note_module(tm.elapsed().as_nanos() as u64);
-            let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+            let mut req32 = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32);
+            let mut stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+            if c.wants_subgroup32(vk::ShaderStageFlags::COMPUTE) {
+                stage = stage.push_next(&mut req32);
+            }
             let extra = vk::PipelineCreateFlags::from_raw(EXTRA_PIPE_FLAGS.load(Ordering::Relaxed) as u32);
             let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout).flags(vk::PipelineCreateFlags::DISPATCH_BASE | super::pstats::flags() | extra);
             let create = |cache| c.device.create_compute_pipelines(cache, &[ci], None).map_err(|(_, e)| format!("compute pipeline: {e}"));
@@ -4298,7 +4302,11 @@ fn gather_pipe() -> Result<&'static MergePipe, String> {
             let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("gather layout: {e}"))?;
             let code = rdna::kernels::mirror_gather();
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("gather module: {e}"))?;
-            let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+            let mut req32 = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32);
+            let mut stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+            if c.wants_subgroup32(vk::ShaderStageFlags::COMPUTE) {
+                stage = stage.push_next(&mut req32);
+            }
             let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
             let pipeline = super::pcache::with_cache('i', 6, |cache| c.device.create_compute_pipelines(cache, &[ci], None)).map_err(|(_, e)| format!("gather pipeline: {e}"));
             c.device.destroy_shader_module(module, None);

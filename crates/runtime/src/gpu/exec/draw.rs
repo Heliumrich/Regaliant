@@ -785,7 +785,16 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
             drop(g);
             super::super::vk::name_object(modules[modules.len() - 1].1, &format!("ps {:#x}", p.1));
         }
-        let stages: Vec<vk::PipelineShaderStageCreateInfo> = modules.iter().map(|(s, m)| vk::PipelineShaderStageCreateInfo::default().stage(*s).module(*m).name(c"main")).collect();
+        let c32 = ctx();
+        let mut req32: Vec<vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo> = modules.iter().map(|_| vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32)).collect();
+        let stages: Vec<vk::PipelineShaderStageCreateInfo> = modules
+            .iter()
+            .zip(req32.iter_mut())
+            .map(|((s, m), r)| {
+                let st = vk::PipelineShaderStageCreateInfo::default().stage(*s).module(*m).name(c"main");
+                if c32.wants_subgroup32(*s) { st.push_next(r) } else { st }
+            })
+            .collect();
         let vi = vk::PipelineVertexInputStateCreateInfo::default();
         let topo = match key.topology_class {
             0 => vk::PrimitiveTopology::POINT_LIST,

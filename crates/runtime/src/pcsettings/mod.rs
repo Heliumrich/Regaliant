@@ -94,6 +94,9 @@ impl Item {
     }
 }
 
+/// The Render Scale choice's percentages (of the window's or screen's resolution).
+pub const RENDER_SCALES: [u32; 9] = [50, 60, 67, 75, 85, 100, 125, 150, 200];
+
 /// The PC tab's items, in order (each one works: what it changes is in `apply`).
 pub fn items() -> Vec<Item> {
     let s = |v: &str| v.to_string();
@@ -104,6 +107,12 @@ pub fn items() -> Vec<Item> {
             label: s("Window Mode"),
             tooltip: s("Shows the game in a window or fullscreen without borders (Alt+Enter switches too)."),
             kind: ItemKind::Choice(vec![s("Windowed"), s("Borderless Fullscreen")], 0),
+        },
+        Item {
+            id: s("RenderScale"),
+            label: s("Render Scale"),
+            tooltip: s("The resolution the game renders at, against the window's or screen's (100%: its own resolution; at most 3840x2160). Lower runs faster, higher looks sharper."),
+            kind: ItemKind::Choice(RENDER_SCALES.iter().map(|p| format!("{p}%")).collect(), 5),
         },
         toggle("SkipIntro", "Skip Intro Logos", "Skips the logos shown when the game starts (from the next start).", false),
         Item {
@@ -152,6 +161,8 @@ pub fn apply() {
     crate::input::PC_SENSITIVITY.store(sens.to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::input::PC_INVERT_Y.store(get("InvertMouseY") == Some(1), std::sync::atomic::Ordering::Relaxed);
     prompts::MODE.store(get("ButtonPrompts").unwrap_or(0).min(3) as u8, std::sync::atomic::Ordering::Relaxed);
+    let scale = RENDER_SCALES.get(get("RenderScale").unwrap_or(5) as usize).copied().unwrap_or(100);
+    crate::dispmode::SCALE_PCT.store(scale, std::sync::atomic::Ordering::Relaxed);
     // The window: applied when it changes (the window opens with it, `window_mode`).
     static WINDOW_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
     if let Some(m) = get("WindowMode") {

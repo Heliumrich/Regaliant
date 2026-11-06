@@ -107,6 +107,11 @@ fn capture(mix: &[f32]) {
     }
 }
 
+/// A stereo f32 WAV at the output rate (diagnosis captures).
+pub fn write_wav_file(path: &std::path::Path, samples: &[f32]) -> std::io::Result<()> {
+    write_wav(path, samples)
+}
+
 fn write_wav(path: &std::path::Path, samples: &[f32]) -> std::io::Result<()> {
     let data = 4 * samples.len() as u32;
     let mut b = Vec::with_capacity(58 + data as usize);

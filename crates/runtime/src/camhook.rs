@@ -25,6 +25,14 @@
 //! Only while the controller takes stick input freely (it reads a device,
 //! +0x2DC, and the context allows manual control, +0x74 bit 9); otherwise the
 //! mouse moves the stick as before (`live`).
+//!
+//! The bow's precision aim (FINDINGS.md 2026-11-06 night): the rig's mode 3 (2 while it
+//! blends in) runs its other controller (+0x68, update eboot+0x178300), whose stick stage
+//! (eboot+0x176843..0x17692e) adds stick x response x zoom ratio (+0x50 over +0x114) x speed
+//! (+0xDC pitch, +0xE0 yaw) x the frame time to its pitch (+0x124, clamped to +0xD4..+0xD0
+//! degrees) and yaw (+0x128), both wrapped at 2 pi; the camera follows them. `aim_hook`, after
+//! its stores, adds the mouse counts there: 2,000 counts as far as a second of full stick at
+//! the aim's yaw speed and zoom, the same angle per count on both axes.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -53,8 +61,22 @@ const CTX_STICK_MOVED: u64 = 0x118;
 /// (1e-20 of full tilt; a normal float).
 const TINY_TILT: u32 = 0x1E3C_E508;
 /// [camera updates, updates with free stick input, updates given the tiny
-/// tilt, updates that took mouse motion, counts x, counts y (absolute)].
-static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// tilt, updates that took mouse motion, counts x, counts y (absolute), aim
+/// updates, aim updates that took mouse motion].
+static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// The aim controller's last stick stage (ms since start; 0: never).
+static AIM_MS: AtomicU64 = AtomicU64::new(0);
+/// Aim controller fields: pitch and yaw (radians), the field of view and its base (their ratio
+/// scales the stick), the yaw speed (radians per second at full tilt), the pitch limits (degrees).
+const AIM_PITCH: u64 = 0x124;
+const AIM_YAW: u64 = 0x128;
+const AIM_FOV: u64 = 0x50;
+const AIM_FOV_BASE: u64 = 0x114;
+const AIM_YAW_SPEED: u64 = 0xE0;
+const AIM_PITCH_MAX: u64 = 0xD0;
+const AIM_PITCH_MIN: u64 = 0xD4;
+/// The aim's pitch rises for downward motion, as the free camera's.
+const AIM_PITCH_SIGN: f32 = 1.0;
 /// The controllers seen (the first few logged).
 static SEEN: parking_lot::Mutex<Vec<u64>> = parking_lot::Mutex::new(Vec::new());
 
@@ -72,7 +94,8 @@ fn now_ms() -> u64 {
 /// 250 ms): mouse motion goes to `apply_hook` rather than to the stick.
 pub fn live() -> bool {
     let t = LAST_MS.load(Ordering::Relaxed);
-    READY.load(Ordering::Acquire) && FREE.load(Ordering::Relaxed) && t != 0 && now_ms().saturating_sub(t) < 250
+    let aim = AIM_MS.load(Ordering::Relaxed);
+    READY.load(Ordering::Acquire) && ((FREE.load(Ordering::Relaxed) && t != 0 && now_ms().saturating_sub(t) < 250) || (aim != 0 && now_ms().saturating_sub(aim) < 250))
 }
 
 fn rd32(a: u64) -> u32 {
@@ -197,6 +220,43 @@ pub extern "sysv64" fn apply_hook(regs: *const u64, _arg: u32) {
     }
 }
 
+/// After the aim controller's stick stage stored its angles (eboot+0x176936, `vmovss
+/// xmm1,[rbx+9Ch]`; rbx the controller): the mouse counts as angles.
+pub extern "sysv64" fn aim_hook(regs: *const u64, _arg: u32) {
+    let ctl = unsafe { *regs.add(3) };
+    if ctl == 0 {
+        return;
+    }
+    AIM_MS.store(now_ms(), Ordering::Relaxed);
+    STATS[6].fetch_add(1, Ordering::Relaxed);
+    let Some((dx, dy)) = crate::input::take_camera_motion() else { return };
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    STATS[7].fetch_add(1, Ordering::Relaxed);
+    STATS[4].fetch_add(dx.unsigned_abs(), Ordering::Relaxed);
+    STATS[5].fetch_add(dy.unsigned_abs(), Ordering::Relaxed);
+    let zoom = rdf(ctl + AIM_FOV) / rdf(ctl + AIM_FOV_BASE);
+    let zoom = if zoom.is_finite() && zoom > 0.0 && zoom <= 4.0 { zoom } else { 1.0 };
+    let (yaw_per, pitch_per) = crate::input::camera_radians_per_count(rdf(ctl + AIM_YAW_SPEED) * zoom);
+    let pi = std::f32::consts::PI;
+    let mut yaw = rdf(ctl + AIM_YAW) + dx as f32 * yaw_per;
+    yaw -= (yaw / (2.0 * pi)).round() * 2.0 * pi;
+    let mut pitch = rdf(ctl + AIM_PITCH) + AIM_PITCH_SIGN * dy as f32 * pitch_per;
+    let (lo, hi) = (rdf(ctl + AIM_PITCH_MIN).to_radians(), rdf(ctl + AIM_PITCH_MAX).to_radians());
+    if lo.is_finite() && hi.is_finite() && lo <= hi {
+        pitch = pitch.clamp(lo, hi);
+    }
+    pitch -= (pitch / (2.0 * pi)).round() * 2.0 * pi;
+    unsafe {
+        ((ctl + AIM_YAW) as *mut f32).write_volatile(yaw);
+        ((ctl + AIM_PITCH) as *mut f32).write_volatile(pitch);
+    }
+    if debug() {
+        crate::info!("camhook dbg: aim mouse {dx} {dy}: pitch {pitch:.5} yaw {yaw:.5} (zoom {zoom:.3}, yaw speed {:.4}, limits {lo:.4} {hi:.4})", rdf(ctl + AIM_YAW_SPEED));
+    }
+}
+
 /// Camera rigs seen at their update's entry (`DS_CAMDEBUG=1`): (rig, calls).
 static RIGS: parking_lot::Mutex<Vec<(u64, u64)>> = parking_lot::Mutex::new(Vec::new());
 
@@ -228,6 +288,32 @@ pub fn describe() -> String {
     format!("{} (live {}); {}", parts.join(", "), live(), rigs.join("; "))
 }
 
+/// Diagnosis (`camdump`, `DS_CAMDEBUG=1`): each rig's mode and its controllers' (+0x60, +0x68)
+/// floats from +0x40 to +0x280, one line each (diffed between moments to find the fields a mode
+/// turns).
+pub fn dump() -> String {
+    let q = |a: u64| unsafe { (a as *const u64).read_volatile() };
+    let floats = |c: u64| -> String {
+        (0x40..0x280u64).step_by(4).map(|o| format!("{o:x}:{:.4}", rdf(c + o))).collect::<Vec<_>>().join(" ")
+    };
+    RIGS.lock()
+        .iter()
+        .map(|&(r, n)| {
+            let (c60, c68) = (q(r + 0x60), q(r + 0x68));
+            format!(
+                "rig {r:#x} ({n} updates) mode {}
+  ctl60 {c60:#x}: {}
+  ctl68 {c68:#x}: {}",
+                rd32(r + 0x84),
+                if c60 != 0 { floats(c60) } else { String::new() },
+                if c68 != 0 { floats(c68) } else { String::new() }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("
+")
+}
+
 /// Status line.
 pub fn status() -> String {
     if !READY.load(Ordering::Acquire) {
@@ -235,12 +321,14 @@ pub fn status() -> String {
     }
     let v: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    raw mouse look (camera hooks, {}): {} camera updates, {} with free stick input, {} given a tiny tilt, {} took mouse motion ({} / {} counts x / y); controllers {:x?}\n",
+        "    raw mouse look (camera hooks, {}): {} camera updates, {} with free stick input, {} given a tiny tilt, {} took mouse motion; bow aim: {} updates, {} took mouse motion ({} / {} counts x / y); controllers {:x?}\n",
         if crate::input::raw_mouse_look() { "on" } else { "off" },
         v[0],
         v[1],
         v[2],
         v[3],
+        v[6],
+        v[7],
         v[4],
         v[5],
         SEEN.lock().as_slice()

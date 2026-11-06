@@ -47,6 +47,11 @@ pub struct Ctx {
     pub partitioned: bool,
     /// VK_EXT_memory_budget enabled (`heap_report`).
     pub memory_budget: bool,
+    /// The device's default subgroup size (32 on NVIDIA; AMD 64, Intel 8-32).
+    pub subgroup_size: u32,
+    /// Stages given 32-lane subgroups (`VkPipelineShaderStageRequiredSubgroupSizeCreateInfo`):
+    /// the translation's cross-lane code is written for subgroups of 32 (`subgroup32`).
+    pub subgroup32: vk::ShaderStageFlags,
     /// VK_EXT_calibrated_timestamps with the device and performance-counter
     /// time domains (`gpu::timeline`: GPU timestamps on the CPU clock).
     pub calibrated: Option<ash::ext::calibrated_timestamps::Device>,
@@ -415,20 +420,61 @@ fn init_inner() -> Result<(), String> {
             let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut bary_supported);
             instance.get_physical_device_features2(pdev, &mut f2);
         }
-        let barycentric = has_bary_ext && bary_supported.fragment_shader_barycentric != 0;
+        let barycentric = has_bary_ext && bary_supported.fragment_shader_barycentric != 0 && gpu_compat() != Some("intel");
         // Partitioned subgroup operations (write marks ORed per map word:
         // `rdna::translate::Spec::marks_part`).
-        let partitioned = instance
-            .enumerate_device_extension_properties(pdev)
-            .unwrap_or_default()
-            .iter()
-            .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::nv::shader_subgroup_partitioned::NAME);
+        let partitioned = gpu_compat().is_none()
+            && instance
+                .enumerate_device_extension_properties(pdev)
+                .unwrap_or_default()
+                .iter()
+                .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::nv::shader_subgroup_partitioned::NAME);
         if partitioned {
             dexts.push(ash::nv::shader_subgroup_partitioned::NAME.as_ptr());
         }
         let mut bary = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default().fragment_shader_barycentric(true);
         if barycentric {
             dexts.push(ash::khr::fragment_shader_barycentric::NAME.as_ptr());
+        }
+        // Subgroups: the translation's cross-lane code (ballots, lane reads, wave halves) is
+        // written for subgroups of 32 lanes, NVIDIA's only size. Where the device's default
+        // differs (AMD 64, Intel 8 to 32), the stages it lets a pipeline give a size get 32
+        // (subgroupSizeControl, Vulkan 1.3); `DS_SUBGROUP32=1` does so on any device (a test
+        // of the path), `=0` never.
+        let (subgroup_size, subgroup32, sg_note) = {
+            let mut p11 = vk::PhysicalDeviceVulkan11Properties::default();
+            let mut p13 = vk::PhysicalDeviceVulkan13Properties::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut p11).push_next(&mut p13);
+            instance.get_physical_device_properties2(pdev, &mut p2);
+            let mut f13s = vk::PhysicalDeviceVulkan13Features::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut f13s);
+            instance.get_physical_device_features2(pdev, &mut f2);
+            let control = f13s.subgroup_size_control != 0 && p13.min_subgroup_size <= 32 && p13.max_subgroup_size >= 32;
+            let wanted = match std::env::var("DS_SUBGROUP32").ok().as_deref() {
+                Some("0") => false,
+                Some("1") => true,
+                _ => p11.subgroup_size != 32 || gpu_compat().is_some(),
+            };
+            // AMD RDNA2 and Intel let compute alone be given a size (RDNA3 and 4 fragment too).
+            let allowed = if gpu_compat().is_some() { p13.required_subgroup_size_stages & vk::ShaderStageFlags::COMPUTE } else { p13.required_subgroup_size_stages };
+            let stages = if wanted && control { allowed } else { vk::ShaderStageFlags::empty() };
+            let note = format!(
+                "Vulkan subgroups: default {} lanes (sizes {}-{}; a size can be required for {:?}{}); 32 required for {:?}",
+                p11.subgroup_size,
+                p13.min_subgroup_size,
+                p13.max_subgroup_size,
+                p13.required_subgroup_size_stages,
+                if f13s.subgroup_size_control != 0 { "" } else { ", subgroupSizeControl unsupported" },
+                stages
+            );
+            (p11.subgroup_size, stages, note)
+        };
+        crate::info!("{sg_note}");
+        if subgroup_size != 32 {
+            let left = (vk::ShaderStageFlags::COMPUTE | vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::GEOMETRY | vk::ShaderStageFlags::FRAGMENT) & !subgroup32;
+            if !left.is_empty() {
+                crate::warn!("Vulkan subgroups: {left:?} programs run in subgroups of the device's choice ({subgroup_size} by default): cross-lane operations written for 32 lanes there approximate the title's (untested off NVIDIA)");
+            }
         }
         let first_instance = instance.get_physical_device_features(pdev).draw_indirect_first_instance != 0;
         // Sparse buffers for the residency mirror (`DS_RESIDENT=1`): the
@@ -445,6 +491,34 @@ fn init_inner() -> Result<(), String> {
         // invocation (image_store_mip / image_load_mip).
         let core = instance.get_physical_device_features(pdev);
         let storage_dyn = core.shader_storage_image_array_dynamic_indexing != 0;
+        {
+            let missing: Vec<&str> = [
+                (core.geometry_shader, "geometryShader"),
+                (core.independent_blend, "independentBlend"),
+                (core.dual_src_blend, "dualSrcBlend"),
+                (core.logic_op, "logicOp"),
+                (core.fill_mode_non_solid, "fillModeNonSolid"),
+                (core.depth_clamp, "depthClamp"),
+                (core.depth_bias_clamp, "depthBiasClamp"),
+                (core.sampler_anisotropy, "samplerAnisotropy"),
+                (core.texture_compression_bc, "textureCompressionBC"),
+                (core.image_cube_array, "imageCubeArray"),
+                (core.shader_int64, "shaderInt64"),
+                (core.shader_storage_image_write_without_format, "shaderStorageImageWriteWithoutFormat"),
+                (core.shader_storage_image_read_without_format, "shaderStorageImageReadWithoutFormat"),
+                (core.vertex_pipeline_stores_and_atomics, "vertexPipelineStoresAndAtomics"),
+                (core.fragment_stores_and_atomics, "fragmentStoresAndAtomics"),
+                (core.multi_draw_indirect, "multiDrawIndirect"),
+                (core.sample_rate_shading, "sampleRateShading"),
+            ]
+            .into_iter()
+            .filter(|(v, _)| *v == 0)
+            .map(|(_, n)| n)
+            .collect();
+            if !missing.is_empty() {
+                crate::warn!("Vulkan: the device lacks {} (the programs or states that need them fail or draw wrong; untested)", missing.join(", "));
+            }
+        }
         // Gathers with offsets declare ImageGatherExtended (the validation
         // layer reported every such module without it).
         let features = vk::PhysicalDeviceFeatures::default()
@@ -452,23 +526,23 @@ fn init_inner() -> Result<(), String> {
             .shader_image_gather_extended(core.shader_image_gather_extended != 0)
             .draw_indirect_first_instance(first_instance)
             .robust_buffer_access(true)
-            .geometry_shader(true)
-            .independent_blend(true)
-            .dual_src_blend(true)
-            .logic_op(true)
-            .fill_mode_non_solid(true)
-            .depth_clamp(true)
-            .depth_bias_clamp(true)
-            .sampler_anisotropy(true)
-            .texture_compression_bc(true)
-            .image_cube_array(true)
-            .shader_int64(true)
-            .shader_storage_image_write_without_format(true)
-            .shader_storage_image_read_without_format(true)
-            .vertex_pipeline_stores_and_atomics(true)
-            .fragment_stores_and_atomics(true)
-            .multi_draw_indirect(true)
-            .sample_rate_shading(true)
+            .geometry_shader(core.geometry_shader != 0)
+            .independent_blend(core.independent_blend != 0)
+            .dual_src_blend(core.dual_src_blend != 0)
+            .logic_op(core.logic_op != 0)
+            .fill_mode_non_solid(core.fill_mode_non_solid != 0)
+            .depth_clamp(core.depth_clamp != 0)
+            .depth_bias_clamp(core.depth_bias_clamp != 0)
+            .sampler_anisotropy(core.sampler_anisotropy != 0)
+            .texture_compression_bc(core.texture_compression_bc != 0)
+            .image_cube_array(core.image_cube_array != 0)
+            .shader_int64(core.shader_int64 != 0)
+            .shader_storage_image_write_without_format(core.shader_storage_image_write_without_format != 0)
+            .shader_storage_image_read_without_format(core.shader_storage_image_read_without_format != 0)
+            .vertex_pipeline_stores_and_atomics(core.vertex_pipeline_stores_and_atomics != 0)
+            .fragment_stores_and_atomics(core.fragment_stores_and_atomics != 0)
+            .multi_draw_indirect(core.multi_draw_indirect != 0)
+            .sample_rate_shading(core.sample_rate_shading != 0)
             .sparse_binding(sparse_buffers)
             .sparse_residency_buffer(sparse_buffers);
         // Image tables are indexed per invocation (non-uniform indexing).
@@ -501,7 +575,7 @@ fn init_inner() -> Result<(), String> {
             .storage_buffer8_bit_access(true)
             .uniform_and_storage_buffer8_bit_access(true)
             .shader_int8(true);
-        let mut f13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true).maintenance4(true);
+        let mut f13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true).maintenance4(true).subgroup_size_control(!subgroup32.is_empty());
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_extension_names(&dexts)
@@ -627,8 +701,13 @@ fn init_inner() -> Result<(), String> {
             barycentric,
             partitioned,
             memory_budget,
+            subgroup_size,
+            subgroup32,
         };
         crate::info!("Vulkan device: {} (queue family {qf}, validation {})", ctx.device_name, validation);
+        if let Some(v) = gpu_compat() {
+            crate::info!("Vulkan: DS_GPU_COMPAT={v}: partitioned subgroups {}, fragment barycentrics {}, 32-lane subgroups required for {:?}", ctx.partitioned, ctx.barycentric, ctx.subgroup32);
+        }
         {
             let exts = ctx.instance.enumerate_device_extension_properties(pdev).unwrap_or_default();
             let has = |n: &CStr| exts.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == n);
@@ -653,6 +732,12 @@ fn init_inner() -> Result<(), String> {
 }
 
 impl Ctx {
+    /// Whether pipelines give `stage` 32-lane subgroups (`subgroup32`): chain
+    /// `subgroup32_info()` into its stage create info.
+    pub fn wants_subgroup32(&self, stage: vk::ShaderStageFlags) -> bool {
+        self.subgroup32.contains(stage)
+    }
+
     /// vkCmdPushDescriptorSetKHR, into `cmd`'s list when this thread
     /// claimed it (`defer`).
     pub unsafe fn push_descriptors(&self, cmd: vk::CommandBuffer, bp: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: u32, writes: &[vk::WriteDescriptorSet]) {
@@ -709,6 +794,25 @@ impl Ctx {
         let props = unsafe { self.instance.get_physical_device_memory_properties(self.pdev) };
         (0..props.memory_heap_count as usize).filter(|&i| props.memory_heaps[i].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).map(|i| props.memory_heaps[i].size).max().unwrap_or(0).min(vram_cap())
     }
+}
+
+/// `DS_GPU_COMPAT=amd|intel` (boot; a test of the fallbacks for other GPUs on this machine): the
+/// device is used with the feature set current AMD (RDNA2) or Intel (Arc A-series) Windows
+/// drivers have where NVIDIA can reproduce it (vulkan.gpuinfo.org reports of 2025-2026,
+/// FINDINGS.md 2026-11-06 night): no partitioned subgroups (neither vendor has them), no
+/// fragment barycentrics (Intel Arc A, Meteor Lake, Arrow Lake), 32-lane subgroups required in
+/// compute alone. Their own subgroup widths (AMD's 64 in graphics stages) are not reproducible.
+pub fn gpu_compat() -> Option<&'static str> {
+    static C: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *C.get_or_init(|| match std::env::var("DS_GPU_COMPAT").ok().as_deref() {
+        Some("amd") => Some("amd"),
+        Some("intel") => Some("intel"),
+        Some(v) => {
+            crate::warn!("DS_GPU_COMPAT={v}: amd or intel; ignored");
+            None
+        }
+        None => None,
+    })
 }
 
 /// `DS_VRAM_CAP_MIB=<MiB>` (boot; simulation of a smaller GPU): the

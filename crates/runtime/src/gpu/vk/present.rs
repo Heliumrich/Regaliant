@@ -180,6 +180,7 @@ pub fn init(title: &str) -> Result<(), String> {
         create_swapchain(&mut p)?;
         *PRESENTER.lock() = Some(p);
     }
+    ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -379,6 +380,23 @@ pub fn present(src: Source) -> bool {
 /// Where a `sw`x`sh` frame goes in a `dw`x`dh` window (x, y, width, height):
 /// as large as fits with its aspect kept, centred; the whole window when the
 /// aspects differ by under 1%.
+/// A window shows the frames (`init` succeeded): the render scale follows its area.
+static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The window's area the title's 16:9 frame fills (pixels; None without a window).
+pub fn area() -> Option<(u32, u32)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !ACTIVE.load(Relaxed) {
+        return None;
+    }
+    let (w, h) = (window::CLIENT_W.load(Relaxed), window::CLIENT_H.load(Relaxed));
+    if w < 64 || h < 64 {
+        return None;
+    }
+    let (_, _, fw, fh) = fit(3840, 2160, w, h);
+    Some((fw, fh))
+}
+
 pub fn fit(sw: u32, sh: u32, dw: u32, dh: u32) -> (u32, u32, u32, u32) {
     let (a, b) = (sw as u64 * dh as u64, dw as u64 * sh as u64);
     if sw == 0 || sh == 0 || a.abs_diff(b) * 100 < a.max(b) {

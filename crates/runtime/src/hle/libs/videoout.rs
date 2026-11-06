@@ -111,6 +111,7 @@ fn vblank_thread() {
         crate::pcsettings::convar::tick();
         crate::pcsettings::popup::tick();
         crate::pcsettings::pointer::tick();
+        crate::dispmode::tick();
         let grid = crate::gpu::tune::flip_grid();
         let now = Instant::now();
         let wake = if grid { next } else { next.min(now + FLIP_TICK) };

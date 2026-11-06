@@ -28,6 +28,13 @@
 //! canvas (eboot+0xde85a7: 3840x2160 for modes 3-5, else 1920x1080, unless
 //! an override is set). Each is replaced where it is 3840x2160.
 //!
+//! The render scale (the PC tab's Render Scale, FINDINGS.md 2026-11-06 night): the render size
+//! follows the window's 16:9 area times the setting (100%: true resolution), at most the
+//! largest size the title makes targets for (3840x2160), applied in the 4K-output modes 3-5
+//! only. A new size is applied by a mode pulse: the display call is held at another 4K-output
+//! mode for two of its calls, so the title runs its set-display-mode twice (as when the player
+//! changes Visual Mode) and makes its targets at the new size each time (`tick`).
+//!
 //! `DS_DISPLAY_MODE=<1-5>` holds the mode from the first frame: at all three
 //! the register holding the options' value (+0xD30, which has the last say)
 //! becomes the chosen mode just before its `test`/`cmovne` (`hook_rax` at
@@ -44,6 +51,21 @@ static RENDER: AtomicU64 = AtomicU64::new(0);
 static RENDER_SET: AtomicU64 = AtomicU64::new(0);
 /// Frames the mode was held.
 static HELD: AtomicU64 = AtomicU64::new(0);
+/// The PC tab's render scale (percent of the window's 16:9 area; 0: the title's own size).
+pub static SCALE_PCT: AtomicU32 = AtomicU32::new(0);
+/// `DS_RENDER_SIZE` set the render size (the setting then leaves it alone).
+static RENDER_FROM_ENV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The options' mode at the title's display call (the pulse's other mode is chosen from it).
+static TITLE_MODE: AtomicU32 = AtomicU32::new(0);
+/// A mode pulse: display calls left that see PULSE_MODE.
+static PULSE_LEFT: AtomicU32 = AtomicU32::new(0);
+static PULSE_MODE: AtomicU32 = AtomicU32::new(0);
+/// Pulses made (render size changes applied).
+static PULSES: AtomicU64 = AtomicU64::new(0);
+/// The render size the setting asks for, as last seen, and for how many ticks (a resized
+/// window settles before the targets are made again).
+static WANT: AtomicU64 = AtomicU64::new(0);
+static WANT_TICKS: AtomicU32 = AtomicU32::new(0);
 /// The chosen output size for modes 3-5 (width << 32 | height; 0: the
 /// title's 3840x2160).
 static OUTPUT: AtomicU64 = AtomicU64::new(0);
@@ -70,6 +92,7 @@ pub fn init() {
         match size {
             Some((w, h)) if (320..=7680).contains(&w) && (180..=4320).contains(&h) => {
                 RENDER.store((w as u64) << 32 | h as u64, Ordering::Relaxed);
+                RENDER_FROM_ENV.store(true, Ordering::Relaxed);
                 crate::info!("render size {w}x{h} (DS_RENDER_SIZE): the title's render targets at that size, its output as the mode has it");
             }
             _ => crate::warn!("DS_RENDER_SIZE={v}: not a size (WxH, 320x180 to 7680x4320); the mode's own is used"),
@@ -97,10 +120,15 @@ pub fn init() {
     }
 }
 
+/// The mode held now: a pulse's, else `DS_DISPLAY_MODE`'s (0: none).
+fn held_mode() -> u32 {
+    if PULSE_LEFT.load(Ordering::Relaxed) > 0 { PULSE_MODE.load(Ordering::Relaxed) } else { MODE.load(Ordering::Relaxed) }
+}
+
 /// Before a mode choice's last `cmovne`: the register holding the options'
 /// value (`regs` index: rax 0, r15 15) becomes the chosen mode.
 fn hold(regs: *const u64, reg: usize) {
-    let m = MODE.load(Ordering::Relaxed);
+    let m = held_mode();
     if m == 0 {
         return;
     }
@@ -108,9 +136,70 @@ fn hold(regs: *const u64, reg: usize) {
     HELD.fetch_add(1, Ordering::Relaxed);
 }
 
-/// eboot+0x9fe6a8 (the display mode call) and eboot+0xb2606e (+0xD28).
+/// eboot+0xb2606e (the effective mode, +0xD28).
 pub extern "sysv64" fn hook_rax(regs: *const u64, _arg: u32) {
     hold(regs, 0);
+}
+
+/// eboot+0x9fe6a8 (the display mode call; eax the options' mode): the title's mode noted, the
+/// held one given, a pulse counted down.
+pub extern "sysv64" fn hook_display(regs: *const u64, _arg: u32) {
+    let m = unsafe { *regs } as u32;
+    if m != 0 {
+        TITLE_MODE.store(m, Ordering::Relaxed);
+    }
+    hold(regs, 0);
+    let left = PULSE_LEFT.load(Ordering::Relaxed);
+    if left > 0 {
+        PULSE_LEFT.store(left - 1, Ordering::Relaxed);
+    }
+}
+
+/// The render size for a window area of `w`x`h` at `pct` percent: 16:9, the height a multiple
+/// of 4 from 360 to 2160, the width the height's 16:9 rounded to a multiple of 4.
+pub fn scaled_size(w: u32, h: u32, pct: u32) -> (u32, u32) {
+    let fh = (h.min(w * 9 / 16) as u64 * pct as u64 / 100).clamp(360, 2160) as u32;
+    let fh = (fh + 2) / 4 * 4;
+    let fw = ((fh as u64 * 16 / 9 + 2) / 4 * 4).min(3840) as u32;
+    (fw, fh)
+}
+
+/// Each vblank: the render size the setting and the window ask for; a settled change is applied
+/// by a mode pulse (in the 4K-output modes; none in headless runs, which keep the title's size).
+pub fn tick() {
+    if RENDER_FROM_ENV.load(Ordering::Relaxed) || PULSE_LEFT.load(Ordering::Relaxed) > 0 {
+        return;
+    }
+    let pct = SCALE_PCT.load(Ordering::Relaxed);
+    let want = match crate::gpu::vk::present::area() {
+        Some((w, h)) if pct != 0 => {
+            let (rw, rh) = scaled_size(w, h, pct);
+            (rw as u64) << 32 | rh as u64
+        }
+        _ => 0,
+    };
+    if WANT.swap(want, Ordering::Relaxed) != want {
+        WANT_TICKS.store(0, Ordering::Relaxed);
+        return;
+    }
+    if WANT_TICKS.fetch_add(1, Ordering::Relaxed) < 20 || want == RENDER.load(Ordering::Relaxed) {
+        return;
+    }
+    let title = TITLE_MODE.load(Ordering::Relaxed);
+    if !(3..=5).contains(&title) || MODE.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    RENDER.store(want, Ordering::Relaxed);
+    PULSE_MODE.store(if title == 4 { 3 } else { 4 }, Ordering::Relaxed);
+    PULSE_LEFT.store(2, Ordering::Relaxed);
+    let n = PULSES.fetch_add(1, Ordering::Relaxed);
+    if n < 32 {
+        if want == 0 {
+            crate::info!("render size: the title's own again (mode {title})");
+        } else {
+            crate::info!("render size {}x{} ({pct}% of the window's {:?}): applied by a mode pulse ({title} -> {} -> {title})", want >> 32, want as u32, crate::gpu::vk::present::area(), PULSE_MODE.load(Ordering::Relaxed));
+        }
+    }
 }
 
 /// eboot+0xde88c0 (the UI's 4K output test).
@@ -146,6 +235,13 @@ pub extern "sysv64" fn hook_render_size(regs: *const u64, _arg: u32) {
     swap_output(rbp.wrapping_sub(0x3C), 0);
     let r = RENDER.load(Ordering::Relaxed);
     if r == 0 {
+        return;
+    }
+    // Only for the 4K-output modes (the boot's 1080p mode keeps its own).
+    let out = rbp.wrapping_sub(0x3C);
+    let (ow, oh) = unsafe { ((out as *const u32).read_volatile(), ((out + 4) as *const u32).read_volatile()) };
+    let o = OUTPUT.load(Ordering::Relaxed);
+    if (ow, oh) != (3840, 2160) && (o == 0 || (ow as u64, oh as u64) != (o >> 32, o & 0xFFFF_FFFF)) {
         return;
     }
     let (w, h) = ((r >> 32) as u32, r as u32);
@@ -242,7 +338,7 @@ pub fn status() -> String {
         s += &format!("    display mode {m} held ({} choices)\n", HELD.load(Ordering::Relaxed));
     }
     if r != 0 {
-        s += &format!("    render size {}x{} set {} times\n", r >> 32, r as u32, RENDER_SET.load(Ordering::Relaxed));
+        s += &format!("    render size {}x{} set {} times ({}; {} mode pulses)\n", r >> 32, r as u32, RENDER_SET.load(Ordering::Relaxed), if RENDER_FROM_ENV.load(Ordering::Relaxed) { "DS_RENDER_SIZE".to_string() } else { format!("Render Scale {}%", SCALE_PCT.load(Ordering::Relaxed)) }, PULSES.load(Ordering::Relaxed));
     }
     let o = OUTPUT.load(Ordering::Relaxed);
     if o != 0 {
