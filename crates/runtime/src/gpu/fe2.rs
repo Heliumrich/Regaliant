@@ -1811,6 +1811,9 @@ fn widen(a: u64, b: u64) -> (u64, u64) {
 /// `widen`): pages written since their last take lose their valid bit.
 #[allow(clippy::too_many_arguments)]
 fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &Armable, written: &mut Vec<u64>, class: &[AtomicU64; 4]) {
+    if why_unarmed_pages() != 0 && (tb - ta) / PAGE >= why_unarmed_pages() {
+        why_unarmed(ta, tb, frame, armable);
+    }
     // (Queue 0x50's threads take without arming: its particle chain sets
     // how long the graphics CP records serially past its label, and the
     // pages stay armable for other threads' checks: +0.5% at the vista,
@@ -2511,6 +2514,117 @@ fn try_arm(a: u64, b: u64, frame: u64, armable: &Armable) {
             NOT_ARMED[k].fetch_add(n, Ordering::Relaxed);
         }
     }
+}
+
+/// `DS_FE2_WHY_UNARMED=<pages>` (diagnosis): the least pages of a take
+/// `why_unarmed` reports on (0: none).
+fn why_unarmed_pages() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("DS_FE2_WHY_UNARMED").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// Logs (the first 40 takes) why the pages of [a, b) are not armed, as
+/// `try_arm` would decide now (nothing armed): its reasons, the ages of the
+/// pages written lately (flips since their last write against the quiet time
+/// their level needs), and the candidates outside settled import windows.
+fn why_unarmed(a: u64, b: u64, frame: u64, armable: &Armable) {
+    // (`DS_FE2_WHY_FROM=<flip>`: from that flip on.)
+    static FROM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    if frame < *FROM.get_or_init(|| std::env::var("DS_FE2_WHY_FROM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)) {
+        return;
+    }
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) >= 40 {
+        return;
+    }
+    let arm_gpu = arm_gpu();
+    let mut not = [0u64; 8];
+    let (mut cand_pages, mut outside, mut nochunk) = (0u64, 0u64, 0u64);
+    // Written lately: flips since the last write (<8, <30, <120, more) and
+    // the levels seen.
+    let mut ages = [0u64; 4];
+    let mut levels = [0u64; ARM_MAX_LEVEL as usize + 1];
+    let mut never = 0u64;
+    let mut x = a;
+    while x < b {
+        let e = word_end(x, b);
+        let Some(c) = chunk(x, false) else {
+            nochunk += (e - x) / PAGE;
+            x = e;
+            continue;
+        };
+        let w = idx(x) / 64;
+        let mask = word_mask(x, e);
+        let armed = c.armed[w].load(Ordering::Acquire) & mask;
+        not[R_ARMED] += armed.count_ones() as u64;
+        let mut cand = mask & !armed;
+        if cand != 0 && frame < c.hold_until.load(Ordering::Acquire) {
+            not[R_HELD] += cand.count_ones() as u64;
+            cand = 0;
+        }
+        if cand != 0 && !arm_gpu && !crate::mem::view_window(x) {
+            let g = c.gpu[w].load(Ordering::Acquire) & cand;
+            not[R_GPU] += g.count_ones() as u64;
+            cand &= !g;
+        }
+        if cand != 0 && c.uses[w].load(Ordering::Relaxed) < ARM_USES {
+            not[R_USES] += cand.count_ones() as u64;
+            cand = 0;
+        }
+        let base = w * 64;
+        let mut r = cand;
+        while r != 0 {
+            let k = r.trailing_zeros() as usize;
+            r &= r - 1;
+            let wrote = c.wrote[base + k].load(Ordering::Acquire) as u64;
+            let level = c.level[base + k].load(Ordering::Acquire);
+            let need = ARM_QUIET << level;
+            if wrote == 0 || frame.saturating_sub(wrote - 1) < need {
+                not[R_QUIET] += 1;
+                cand &= !(1u64 << k);
+                levels[(level as usize).min(ARM_MAX_LEVEL as usize)] += 1;
+                if wrote == 0 {
+                    never += 1;
+                } else {
+                    let age = frame.saturating_sub(wrote - 1);
+                    ages[if age < 8 { 0 } else if age < 30 { 1 } else if age < 120 { 2 } else { 3 }] += 1;
+                }
+            }
+        }
+        // The candidates' runs inside settled import windows.
+        let wa = x & !(64 * PAGE - 1);
+        let mut r = cand;
+        while r != 0 {
+            let k = r.trailing_zeros() as u64;
+            let ones = (!(r >> k)).trailing_zeros().min(64 - k as u32) as u64;
+            let (p, q) = (wa + k * PAGE, wa + (k + ones) * PAGE);
+            cand_pages += ones;
+            let mut inside = 0u64;
+            if armable(p, q, &mut |s, t| inside += t - s) {
+                outside += (q - p - inside) / PAGE;
+            }
+            r &= !(if k + ones >= 64 { u64::MAX << k } else { ((1u64 << ones) - 1) << k });
+        }
+        x = e;
+    }
+    crate::info!(
+        "fe2: why unarmed: take of {a:#x}..{b:#x} ({} pages): armed already {}, chunk held {}, GPU-written {}, too few clean epochs {}, written lately {} (flips since their write <8 {}, 8-29 {}, 30-119 {}, more {}; never seen {}; levels {:?}), no chunk {}, candidates {} ({} outside settled import windows)",
+        (b - a) / PAGE,
+        not[R_ARMED],
+        not[R_HELD],
+        not[R_GPU],
+        not[R_USES],
+        not[R_QUIET],
+        ages[0],
+        ages[1],
+        ages[2],
+        ages[3],
+        never,
+        levels,
+        nochunk,
+        cand_pages,
+        outside
+    );
 }
 
 /// Pages checked by takes that were not armed, by reason: armed already
