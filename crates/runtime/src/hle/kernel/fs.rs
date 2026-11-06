@@ -145,10 +145,14 @@ pub fn ro_meta(host: &Path) -> Option<CachedMeta> {
 pub fn guest_meta(guest: &str) -> Option<(PathBuf, CachedMeta)> {
     let r = resolve(guest)?;
     if !r.writable {
+        let first = r.candidates.first().cloned();
         let found = r.candidates.into_iter().find_map(|p| ro_meta(&p).map(|m| (p, m)));
-        // A title file the port extends: its extended size.
-        if let (Some((p, m)), Some(d)) = (&found, crate::pcsettings::generated(guest)) {
-            return Some((p.clone(), CachedMeta { size: d.len() as u64, ..*m }));
+        match (&found, crate::pcsettings::generated(guest)) {
+            // A title file the port extends: its extended size.
+            (Some((p, m)), Some(d)) => return Some((p.clone(), CachedMeta { size: d.len() as u64, ..*m })),
+            // A file the port adds (served from memory; its host path is never opened).
+            (None, Some(d)) => return Some((first?, CachedMeta { is_dir: false, size: d.len() as u64, mtime: [0, 0] })),
+            _ => {}
         }
         return found;
     }

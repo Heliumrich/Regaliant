@@ -256,6 +256,18 @@ const FIXES: &[Fix] = &[
     },
     // The PC settings' values at the title's own settings paths (`pcsettings::store`): the
     // menu bindings' scans of the store (`UISetting_<type>::Evaluate`) for the PC keys ...
+    // The button prompts (`pcsettings::prompts`): the text renderer's inline-image draw
+    // (eboot+0x150e380) after its map from a text's button hash to a glyph entity's name hash
+    // (r15d), before the entity's lookup: `lea rcx,[rbp-90h]`.
+    Fix {
+        name: "button prompts (glyphs)",
+        offset: 0x150e645,
+        from: &[0x48, 0x8d, 0x8d, 0x70, 0xff, 0xff, 0xff],
+        change: Change::Hook { at: 0, handler: crate::pcsettings::prompts::glyph_hook },
+        kind: "PC controls",
+        why: "the title's text shows PlayStation buttons only: keyboard, mouse and Xbox glyphs stand in for them",
+        only_with: None,
+    },
     Fix {
         name: "PC settings (bool lookups)",
         offset: 0xc3a8e5,

@@ -172,6 +172,7 @@ static LIVE: parking_lot::Mutex<Vec<Step>> = parking_lot::Mutex::new(Vec::new())
 /// Schedules a press of `names` (joined with '+') for `hold` flips starting
 /// at the next flip.
 pub fn press_now(names: &str, hold: u64) -> Result<(), String> {
+    note_device(DEVICE_PAD);
     let flip = crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed) + 1;
     let mut steps = parse_script(&format!("{flip}:{names}:{}", hold.max(1)))?;
     let mut live = LIVE.lock();
@@ -188,6 +189,7 @@ static LIVE_TIMED: parking_lot::Mutex<Vec<(std::time::Instant, Step)>> = parking
 /// Presses `names` from now for `dur`.
 pub fn press_for(names: &str, dur: std::time::Duration) -> Result<(), String> {
     let steps = parse_script(&format!("0:{names}:1"))?;
+    note_device(DEVICE_PAD);
     let now = std::time::Instant::now();
     let mut live = LIVE_TIMED.lock();
     live.retain(|x| x.0 > now);
@@ -266,9 +268,23 @@ fn axis(v: i16, invert: bool) -> u8 {
     (f * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
+/// An XInput pad answered the last poll.
+static PAD_CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn pad_connected() -> bool {
+    PAD_CONNECTED.load(Relaxed)
+}
+
 fn xinput(st: &mut PadState) {
-    let Some(s) = xinput_state() else { return };
+    let s = xinput_state();
+    PAD_CONNECTED.store(s.is_some(), Relaxed);
+    let Some(s) = s else { return };
     let g = s.Gamepad;
+    // The pad is in use once a button, a trigger or a stick past a dead zone moves.
+    let stick = |v: i16| (v as i32).abs() > 12000;
+    if g.wButtons != 0 || g.bLeftTrigger > 40 || g.bRightTrigger > 40 || stick(g.sThumbLX) || stick(g.sThumbLY) || stick(g.sThumbRX) || stick(g.sThumbRY) {
+        note_device(DEVICE_PAD);
+    }
     let map = [
         (0x0001, BTN_UP),
         (0x0002, BTN_DOWN),
@@ -570,6 +586,7 @@ pub fn inject_hold(name: &str, dur: Duration) -> Result<(), String> {
     if mods != 0 || matches!(src, Src::WheelUp | Src::WheelDown) {
         return Err(format!("'{name}': a key or mouse button without modifiers"));
     }
+    note_device(DEVICE_KBM);
     let now = Instant::now();
     let mut g = INJECTED.lock();
     g.retain(|x| x.0 > now);
@@ -617,6 +634,88 @@ fn held_mods() -> u8 {
 fn applying(l: &Layout, src: Src, held: u8) -> impl Iterator<Item = &Bind> {
     let best = l.binds.iter().filter(|b| b.src == src && b.mods & !held == 0).map(|b| b.mods.count_ones()).max();
     l.binds.iter().filter(move |b| b.src == src && b.mods & !held == 0 && Some(b.mods.count_ones()) == best)
+}
+
+// ---------------------------------------------------------------------------
+// The device in use and what a pad target is bound to (the button prompts, `pcsettings::prompts`)
+
+pub const DEVICE_NONE: u8 = 0;
+pub const DEVICE_KBM: u8 = 1;
+pub const DEVICE_PAD: u8 = 2;
+/// The device the player used last: keyboard and mouse (keys, mouse buttons, the wheel and
+/// motion in the window) or the pad (a button, a trigger, a stick past a dead zone).
+static LAST_DEVICE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(DEVICE_NONE);
+
+pub fn note_device(d: u8) {
+    if LAST_DEVICE.swap(d, Relaxed) != d {
+        crate::info!("input: {} in use", if d == DEVICE_PAD { "the pad" } else { "keyboard and mouse" });
+    }
+}
+
+pub fn last_device() -> u8 {
+    LAST_DEVICE.load(Relaxed)
+}
+
+/// An input a prompt names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PromptInput {
+    /// A key by virtual-key code.
+    Key(u8),
+    /// A mouse button: 0 left, 1 right, 2 middle, 3 and 4 the side buttons.
+    Mouse(u8),
+    WheelUp,
+    WheelDown,
+}
+
+pub const PROMPT_SHIFT: u8 = MOD_SHIFT;
+pub const PROMPT_CTRL: u8 = MOD_CTRL;
+pub const PROMPT_ALT: u8 = MOD_ALT;
+
+/// The first binding of a layout target (`cross`, `l1`, `up`, `ls_up`, ...; file order) as
+/// its input and modifier bits (`PROMPT_*`).
+pub fn binding_of(target: &str) -> Option<(PromptInput, u8)> {
+    let dst = parse_dst(target)?;
+    layout().binds.iter().find(|b| b.dst == dst).map(|b| {
+        let input = match b.src {
+            Src::Key(k) => PromptInput::Key(k),
+            Src::Mouse(m) => PromptInput::Mouse(m),
+            Src::WheelUp => PromptInput::WheelUp,
+            Src::WheelDown => PromptInput::WheelDown,
+        };
+        (input, b.mods)
+    })
+}
+
+/// Every input of the layout's bindings with their modifiers (the prompts' glyph set).
+pub fn bound_inputs() -> Vec<(PromptInput, u8)> {
+    let mut v: Vec<(PromptInput, u8)> = layout()
+        .binds
+        .iter()
+        .map(|b| {
+            let input = match b.src {
+                Src::Key(k) => PromptInput::Key(k),
+                Src::Mouse(m) => PromptInput::Mouse(m),
+                Src::WheelUp => PromptInput::WheelUp,
+                Src::WheelDown => PromptInput::WheelDown,
+            };
+            (input, b.mods)
+        })
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Every key the layout file accepts (virtual-key codes): the prompts' glyphs for any binding.
+pub fn bindable_keys() -> Vec<u8> {
+    let mut v: Vec<u8> = (b'A'..=b'Z').chain(b'0'..=b'9').collect();
+    for f in 1..=12u8 {
+        v.push(0x6F + f);
+    }
+    for name in ["space", "enter", "esc", "tab", "backspace", "up", "down", "left", "right", "shift", "lshift", "rshift", "ctrl", "lctrl", "rctrl", "alt", "lalt", "ralt", "capslock", "insert", "delete", "home", "end", "pageup", "pagedown"] {
+        v.push(key_code(name).expect("key name"));
+    }
+    v
 }
 
 /// Wheel taps not yet given to the title, and the one being given: its

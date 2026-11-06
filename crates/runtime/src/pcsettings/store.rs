@@ -45,6 +45,8 @@ pub enum Live {
     PopupName,
     /// The text hash of the pop-up's title line.
     PopupTitle,
+    /// Whether a set of button prompts is shown (`prompts::shown_setting`).
+    Prompts(u8),
 }
 
 struct Store {
@@ -114,6 +116,7 @@ pub fn get(hash: u32) -> Option<u32> {
         Some(Live::Popup) => return Some(super::popup::visible() as u32),
         Some(Live::PopupName) => return Some(super::popup::name_hash()),
         Some(Live::PopupTitle) => return Some(super::cgpr::fnv1a(super::popup::TITLE_KEY.as_bytes())),
+        Some(Live::Prompts(w)) => return Some(super::prompts::shown_setting(w)),
         None => {}
     }
     Some(s.values.get(&hash).copied().unwrap_or(d.default))

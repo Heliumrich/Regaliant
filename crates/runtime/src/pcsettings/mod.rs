@@ -10,8 +10,10 @@
 
 pub mod cgpr;
 pub mod convar;
+pub mod glyphs;
 mod hud;
 pub mod popup;
+pub mod prompts;
 pub mod store;
 pub mod value;
 
@@ -108,6 +110,12 @@ pub fn items() -> Vec<Item> {
             kind: ItemKind::Slider { min: 0.1, max: 3.0, default: 1.0 },
         },
         toggle("InvertMouseY", "Invert Mouse Vertical", "Moving the mouse forward looks down.", false),
+        Item {
+            id: s("ButtonPrompts"),
+            label: s("Button Prompts"),
+            tooltip: s("The buttons the game shows: those of the device used last, or always one set."),
+            kind: ItemKind::Choice(vec![s("Automatic"), s("PlayStation"), s("Xbox"), s("Keyboard & Mouse")], 0),
+        },
     ]
 }
 
@@ -128,6 +136,7 @@ pub fn apply() {
     let sens = get("MouseSensitivity").map(f32::from_bits).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(1.0);
     crate::input::PC_SENSITIVITY.store(sens.to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::input::PC_INVERT_Y.store(get("InvertMouseY") == Some(1), std::sync::atomic::Ordering::Relaxed);
+    prompts::MODE.store(get("ButtonPrompts").unwrap_or(0).min(3) as u8, std::sync::atomic::Ordering::Relaxed);
     // The window: applied when it changes (the window opens with it, `window_mode`).
     static WINDOW_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
     if let Some(m) = get("WindowMode") {
@@ -223,6 +232,9 @@ pub fn init(path: std::path::PathBuf) {
     defs.push(store::Def { name: popup::SETTING.into(), kind: store::Kind::Int, default: 0, live: Some(store::Live::Popup) });
     defs.push(store::Def { name: popup::NAME_SETTING.into(), kind: store::Kind::Int, default: 0, live: Some(store::Live::PopupName) });
     defs.push(store::Def { name: popup::TITLE_SETTING.into(), kind: store::Kind::Int, default: 0, live: Some(store::Live::PopupTitle) });
+    for (w, name) in [prompts::SHOWN_PS, prompts::SHOWN_NOT_KB, prompts::SHOWN_NOT_XB, prompts::SHOWN_KB, prompts::SHOWN_XB].into_iter().enumerate() {
+        defs.push(store::Def { name: name.into(), kind: store::Kind::Int, default: 0, live: Some(store::Live::Prompts(w as u8)) });
+    }
     store::init(path, defs);
     apply();
 }
@@ -273,6 +285,14 @@ pub extern "sysv64" fn changed_hook(regs: *const u64, _arg: u32) {
 
 const START_MENU: &str = "/app0/ui/scripts/_cmn/uistartmenu.cgpr";
 const HUD: &str = "/app0/ui/scripts/_cmn/uihud.cgpr";
+const GLOBAL: &str = "/app0/ui/scripts/_cmn/uiglobal.cgpr";
+/// UI files whose directly drawn button icons get keyboard and Xbox copies (`prompts::variants`).
+const ICON_FILES: &[&str] = &[
+    "/app0/ui/scripts/_cmn/uimovies.cgpr",
+    "/app0/ui/scripts/_cmn/uicharactercreator.cgpr",
+    "/app0/ui/scripts/_cmn/uishops.cgpr",
+    "/app0/ui/scripts/_cmn/uistorage.cgpr",
+];
 const TEXT_DIR: &str = "/app0/text/common/_cmn/ui.";
 
 fn enabled() -> bool {
@@ -282,7 +302,7 @@ fn enabled() -> bool {
 
 /// Whether the port extends this guest path (a cheap test: every file lookup asks).
 fn extends(guest: &str) -> bool {
-    guest == START_MENU || guest == HUD || (guest.starts_with(TEXT_DIR) && guest.ends_with(".ctxt"))
+    guest == START_MENU || guest == HUD || guest == GLOBAL || ICON_FILES.contains(&guest) || (guest.starts_with(TEXT_DIR) && guest.ends_with(".ctxt")) || prompts::serves(guest)
 }
 
 static GENERATED: Mutex<Option<HashMap<String, Option<Arc<Vec<u8>>>>>> = Mutex::new(None);
@@ -298,12 +318,20 @@ pub fn generated(guest: &str) -> Option<Arc<Vec<u8>>> {
         return v;
     }
     let built = (|| {
+        // Files the port adds (its button prompts' glyph textures): no original.
+        if prompts::serves(guest) {
+            return prompts::texture(guest);
+        }
         let host = crate::hle::kernel::fs::host_path_existing(guest).ok_or("not in the game tree")?;
         let orig = std::fs::read(&host).map_err(|_| "unreadable")?;
         if guest == START_MENU {
             start_menu(&orig)
         } else if guest == HUD {
             hud::build(&orig)
+        } else if guest == GLOBAL {
+            prompts::extend_global(&orig)
+        } else if ICON_FILES.contains(&guest) {
+            prompts::extend_icons(&orig)
         } else {
             Ok(text(&orig))
         }
@@ -659,6 +687,11 @@ fn start_menu(orig: &[u8]) -> Result<Vec<u8>, String> {
         tabs_e.kids.insert(at, button);
         f.roots[ri].at_mut(&pages_path).kids.insert(exit_pi, page);
         exit_pi += 1;
+    }
+    // Button icons the menu draws itself: keyboard and Xbox copies (`prompts`).
+    match prompts::variants(&mut f) {
+        Ok(n) => crate::info!("prompts: {n} directly drawn icons of the start menu with keyboard and Xbox copies"),
+        Err(e) => crate::warn!("prompts: the start menu's icons keep the PlayStation buttons ({e})"),
     }
     let out = cgpr::serialize(&f);
     cgpr::parse(&out).ok_or("the extended file does not parse")?;

@@ -208,6 +208,10 @@ unsafe fn raw_input(lp: LPARAM) {
         return;
     }
     let m = unsafe { raw.data.mouse };
+    // Keyboard and mouse in use (the button prompts): motion past a few counts, a button, the wheel.
+    if m.lLastX.abs() + m.lLastY.abs() > 3 && m.usFlags & MOUSE_MOVE_ABSOLUTE == 0 || unsafe { m.Anonymous.Anonymous.usButtonFlags } != 0 {
+        crate::input::note_device(crate::input::DEVICE_KBM);
+    }
     if m.usFlags & MOUSE_MOVE_ABSOLUTE == 0 {
         MOUSE_DX.fetch_add(m.lLastX as i64, Ordering::Relaxed);
         MOUSE_DY.fetch_add(m.lLastY as i64, Ordering::Relaxed);
@@ -308,6 +312,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 unsafe { update_capture(hwnd) };
             }
             set_key(wp, lp, true);
+            crate::input::note_device(crate::input::DEVICE_KBM);
             0
         }
         WM_KEYUP | WM_SYSKEYUP => {
