@@ -40,6 +40,9 @@ struct Presenter {
     halves: Vec<Half>,
     /// The last (frame size, window size) logged.
     logged: (u32, u32, u32, u32),
+    /// The PC settings' sharpening pass (made on first use; `sharpen_failed` after an error).
+    sharpen: Option<super::sharpen::Sharpen>,
+    sharpen_failed: bool,
 }
 
 unsafe impl Send for Presenter {}
@@ -111,7 +114,14 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
             .old_swapchain(old);
         let sc = c.swapchain_d.create_swapchain(&sci, None).map_err(|e| format!("create swapchain: {e}"))?;
         if old != vk::SwapchainKHR::null() {
-            c.device.device_wait_idle().ok();
+            // The old swapchain's images are only the presenter's: its frames done and the queue
+            // idle under the queue's lock (a device-wide idle wait touches the queue while the
+            // GPU threads submit to it).
+            c.device.wait_for_fences(&p.fences, true, u64::MAX).ok();
+            {
+                let q = c.queue.lock();
+                c.device.queue_wait_idle(*q).ok();
+            }
             c.swapchain_d.destroy_swapchain(old, None);
             for s in p.done.drain(..) {
                 c.device.destroy_semaphore(s, None);
@@ -164,6 +174,8 @@ pub fn init(title: &str) -> Result<(), String> {
             upload: None,
             halves: Vec::new(),
             logged: (0, 0, 0, 0),
+            sharpen: None,
+            sharpen_failed: false,
         };
         create_swapchain(&mut p)?;
         *PRESENTER.lock() = Some(p);
@@ -263,7 +275,42 @@ pub fn present(src: Source) -> bool {
             (from, from_layout, fw, fh) = (half, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, hw, hh);
             level += 1;
         }
-        blit(c, cmd, from, from_layout, (0, 0, fw, fh), dst, (rx, ry, rw, rh));
+        // The PC settings' sharpening: the frame blitted at its shown size, sharpened, blitted
+        // to the window.
+        let amount = super::sharpen::amount();
+        let mut sharpened = false;
+        if amount > 0.0 && !p.sharpen_failed {
+            if p.sharpen.is_none() {
+                match super::sharpen::Sharpen::new() {
+                    Ok(s) => p.sharpen = Some(s),
+                    Err(e) => {
+                        crate::warn!("present: no sharpening ({e})");
+                        p.sharpen_failed = true;
+                    }
+                }
+            }
+            let fences: Vec<vk::Fence> = p.fences.iter().enumerate().filter(|&(i, _)| i != f).map(|(_, &x)| x).collect();
+            if let Some(s) = p.sharpen.as_mut() {
+                match s.ensure(rw, rh, || {
+                    c.device.wait_for_fences(&fences, true, u64::MAX).ok();
+                }) {
+                    Ok((a, b, fresh)) => {
+                        s.begin(cmd, fresh);
+                        blit_to(c, cmd, from, from_layout, (0, 0, fw, fh), a, vk::ImageLayout::GENERAL, (0, 0, rw, rh));
+                        s.record(cmd, amount);
+                        blit(c, cmd, b, vk::ImageLayout::GENERAL, (0, 0, rw, rh), dst, (rx, ry, rw, rh));
+                        sharpened = true;
+                    }
+                    Err(e) => {
+                        crate::warn!("present: no sharpening images ({e})");
+                        p.sharpen_failed = true;
+                    }
+                }
+            }
+        }
+        if !sharpened {
+            blit(c, cmd, from, from_layout, (0, 0, fw, fh), dst, (rx, ry, rw, rh));
+        }
         if p.logged != (sw, sh, p.extent.width, p.extent.height) {
             p.logged = (sw, sh, p.extent.width, p.extent.height);
             crate::info!("present: {sw}x{sh} frame into a {}x{} window at {rw}x{rh}+{rx}+{ry}: {level} halving(s), then {fw}x{fh} -> {rw}x{rh}", p.extent.width, p.extent.height);
@@ -350,10 +397,15 @@ fn fit(sw: u32, sh: u32, dw: u32, dh: u32) -> (u32, u32, u32, u32) {
 /// A linear blit of rectangle `s` (x, y, width, height) of `src` to rectangle
 /// `d` of `dst` (in TRANSFER_DST_OPTIMAL).
 fn blit(c: &super::Ctx, cmd: vk::CommandBuffer, src: vk::Image, src_layout: vk::ImageLayout, s: (u32, u32, u32, u32), dst: vk::Image, d: (u32, u32, u32, u32)) {
+    blit_to(c, cmd, src, src_layout, s, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, d);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn blit_to(c: &super::Ctx, cmd: vk::CommandBuffer, src: vk::Image, src_layout: vk::ImageLayout, s: (u32, u32, u32, u32), dst: vk::Image, dst_layout: vk::ImageLayout, d: (u32, u32, u32, u32)) {
     let layers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
     let corners = |(x, y, w, h): (u32, u32, u32, u32)| [vk::Offset3D { x: x as i32, y: y as i32, z: 0 }, vk::Offset3D { x: (x + w) as i32, y: (y + h) as i32, z: 1 }];
     let region = vk::ImageBlit { src_subresource: layers, src_offsets: corners(s), dst_subresource: layers, dst_offsets: corners(d) };
-    unsafe { c.device.cmd_blit_image(cmd, src, src_layout, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region], vk::Filter::LINEAR) };
+    unsafe { c.device.cmd_blit_image(cmd, src, src_layout, dst, dst_layout, &[region], vk::Filter::LINEAR) };
 }
 
 /// The halving chain's image `level` at `w`x`h`: the frame's format when it

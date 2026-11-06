@@ -2,6 +2,7 @@
 
 pub mod defer;
 pub mod present;
+pub mod sharpen;
 pub mod window;
 
 use ash::vk;

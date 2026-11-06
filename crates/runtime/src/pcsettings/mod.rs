@@ -85,8 +85,8 @@ pub fn items() -> Vec<Item> {
         Item {
             id: "Sharpening",
             label: s("Sharpening"),
-            tooltip: s("How much the anti-aliasing sharpens the image (0.80 as in the original)."),
-            kind: ItemKind::Slider { min: 0.0, max: 1.0, default: 0.8 },
+            tooltip: s("Sharpens the image shown (0.00: off, as in the original)."),
+            kind: ItemKind::Slider { min: 0.0, max: 1.0, default: 0.0 },
         },
         Item {
             id: "TextureFiltering",
@@ -125,8 +125,10 @@ pub fn apply() {
         _ => 0,
     };
     crate::gpu::images::ANISO.store(aniso, std::sync::atomic::Ordering::Relaxed);
-    let sharpen = get("Sharpening").map(f32::from_bits).filter(|v| (v - 0.8).abs() > 0.001);
-    convar::want("r_aaHistorySharpeningStrength", sharpen.map(convar::float));
+    // Sharpening: the presenter's pass (amount x2: 1.00 moves a pixel twice its difference
+    // from its neighbours' mean, within their range).
+    let sharpen = get("Sharpening").map(f32::from_bits).filter(|v| v.is_finite() && *v > 0.001).unwrap_or(0.0);
+    crate::gpu::vk::sharpen::AMOUNT.store((sharpen * 2.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
     let sens = get("MouseSensitivity").map(f32::from_bits).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(1.0);
     crate::input::PC_SENSITIVITY.store(sens.to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::input::PC_INVERT_Y.store(get("InvertMouseY") == Some(1), std::sync::atomic::Ordering::Relaxed);
