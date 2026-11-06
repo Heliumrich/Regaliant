@@ -51,6 +51,12 @@ pub enum Live {
     Binding(u16),
     /// A controller binding's row: the option of the pad button on an action (`bindings`).
     PadBinding(u16),
+    /// The audio device (0: the system's default, k: `audio::output_devices()[k - 1]`; the
+    /// choice kept as its endpoint id in local-data/audio-device.txt).
+    AudioDevice,
+    /// The Quality Preset: the preset the settings match (`presets::current`); a change sets
+    /// the preset's settings.
+    Preset,
 }
 
 struct Store {
@@ -114,6 +120,11 @@ pub fn get(hash: u32) -> Option<u32> {
     let g = STORE.lock();
     let s = g.as_ref()?;
     let d = s.defs.get(&hash)?;
+    if let Some(Live::Preset) = d.live {
+        // Reads other settings (the store's lock released first).
+        drop(g);
+        return Some(super::presets::current());
+    }
     match d.live {
         Some(Live::Trophy(id)) => return Some(crate::achievements::unlocked(id) as u32),
         Some(Live::Count(g)) => return Some(crate::achievements::count(g).0),
@@ -123,6 +134,11 @@ pub fn get(hash: u32) -> Option<u32> {
         Some(Live::Prompts(w)) => return Some(super::prompts::shown_setting(w)),
         Some(Live::Binding(a)) => return Some(super::bindings::index_of(a as usize)),
         Some(Live::PadBinding(a)) => return Some(super::bindings::pad_index_of(a as usize)),
+        Some(Live::Preset) => unreachable!(),
+        Some(Live::AudioDevice) => {
+            let id = crate::audio::output_device();
+            return Some(id.and_then(|id| crate::audio::output_devices().iter().position(|d| d.0 == id)).map(|k| k as u32 + 1).unwrap_or(0));
+        }
         None => {}
     }
     Some(s.values.get(&hash).copied().unwrap_or(d.default))
@@ -131,6 +147,11 @@ pub fn get(hash: u32) -> Option<u32> {
 /// The value of a PC setting by name.
 pub fn value(name: &str) -> Option<u32> {
     get(super::setting_hash(name))
+}
+
+/// Sets a PC setting by name (as the menu does: kept in pcsettings.txt); false when unknown.
+pub fn set_value(name: &str, bits: u32) -> bool {
+    set(super::setting_hash(name), bits)
 }
 
 fn set(hash: u32, bits: u32) -> bool {
@@ -146,6 +167,24 @@ fn set(hash: u32, bits: u32) -> bool {
     if let Some(Live::PadBinding(a)) = d.live {
         drop(g);
         super::bindings::pad_set(a as usize, bits);
+        return true;
+    }
+    if let Some(Live::Preset) = d.live {
+        drop(g);
+        super::presets::apply(bits);
+        return true;
+    }
+    if let Some(Live::AudioDevice) = d.live {
+        let path = s.path.as_ref().map(|p| p.with_file_name("audio-device.txt"));
+        drop(g);
+        let id = if bits == 0 { None } else { crate::audio::output_devices().get(bits as usize - 1).map(|d| d.0.clone()) };
+        if let Some(p) = path {
+            let text = id.clone().unwrap_or_default();
+            if let Err(e) = std::fs::write(&p, format!("{text}\n")) {
+                crate::warn!("pc settings: write {}: {e}", p.display());
+            }
+        }
+        crate::audio::set_output_device(id);
         return true;
     }
     if d.live.is_some() {
@@ -205,9 +244,33 @@ fn one_entry(key: u32, sub: u32, value: u32) -> u64 {
     })
 }
 
+/// The title's settings store as its `Evaluate` hooks last saw it (0: not yet).
+static TITLE_STORE: AtomicU64 = AtomicU64::new(0);
+
+/// A title setting's int value from the title's own store (its first entry of the key; None
+/// before a menu or the HUD evaluated a setting, or when the title has no entry for it).
+#[allow(dead_code)]
+pub fn title_int(name: &str) -> Option<u32> {
+    let store = TITLE_STORE.load(Ordering::Relaxed);
+    if store < 0x10000 {
+        return None;
+    }
+    let key = super::setting_hash(name);
+    let (begin, end) = unsafe { (((store + 0x40) as *const u64).read_volatile(), ((store + 0x48) as *const u64).read_volatile()) };
+    if begin < 0x10000 || end < begin || end - begin > 12 * 4096 || (end - begin) % 12 != 0 {
+        return None;
+    }
+    (begin..end).step_by(12).find(|&e| unsafe { (e as *const u32).read_volatile() } == key).map(|e| unsafe { ((e + 8) as *const u32).read_volatile() })
+}
+
 /// A scan of the store for `key` (with `sub` its sub-key) in register `store_reg`: for a PC key
-/// the register is pointed at a one-entry store with the port's value.
+/// the register is pointed at a one-entry store with the port's value. (Before that, the
+/// register holds the title's own store: noted for `title_int`.)
 fn answer(regs: *const u64, key: u32, sub: u32, store_reg: usize, stat: usize) {
+    let store = reg(regs, store_reg);
+    if store >= 0x10000 {
+        TITLE_STORE.store(store, Ordering::Relaxed);
+    }
     if let Some(v) = get(key) {
         STATS[stat].fetch_add(1, Ordering::Relaxed);
         set_reg(regs, store_reg, one_entry(key, sub, v));

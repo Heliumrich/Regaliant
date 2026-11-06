@@ -705,6 +705,8 @@ fn init_inner() -> Result<(), String> {
             subgroup32,
         };
         crate::info!("Vulkan device: {} (queue family {qf}, validation {})", ctx.device_name, validation);
+        // A first start's quality preset, from the device's kind and video memory.
+        crate::pcsettings::presets::first_start_gpu(&ctx.device_name, props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU, ctx.device_heap_size());
         if let Some(v) = gpu_compat() {
             crate::info!("Vulkan: DS_GPU_COMPAT={v}: partitioned subgroups {}, fragment barycentrics {}, 32-lane subgroups required for {:?}", ctx.partitioned, ctx.barycentric, ctx.subgroup32);
         }

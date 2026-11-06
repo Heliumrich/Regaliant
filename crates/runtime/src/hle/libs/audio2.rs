@@ -10,19 +10,24 @@
 //! Each pushed grain is mixed to stereo f32 here and handed to the host sink
 //! (`crate::audio`).
 //!
+//! Port type 6 carries the DualSense's haptic waveform (two channels, 90% of its energy below
+//! 200 Hz, bursts with hits and rolls: FINDINGS.md 2026-11-06 night): it is not sound, and played
+//! through the speakers it was the loudest part of the mix (a 50 Hz rumble at RMS 0.17 against
+//! the scene's 0.07). It drives an Xbox controller's motors instead (`input::haptics`).
+//!
 //! Object (3D) ports: the title renders its 3D sound to 5th-order ambisonics
 //! and submits each of the 36 channels as an object port whose attribute 0x8
 //! is 0x40 + the channel's ACN index (two such sets, attribute 0x9 = 0 or 1;
 //! no position attribute is ever set). Measured, not documented: per-channel
 //! energies follow ACN order with SN3D normalization (W strongest, the
 //! channels that vanish for sources on the horizon near silent,
-//! X^2 + Y^2 + Z^2 ~ 0.8 W^2; FINDINGS.md 2026-10-16). They are decoded to
-//! stereo with two virtual cardioids at +-90 degrees (AmbiX axes: +Y is
-//! left): left = (W + Y) / sqrt 2, right = (W - Y) / sqrt 2. The orientation
-//! agreed with camera turns while the sources were in front (8 of 8 turns;
-//! `tools/audio_turn.sh`); `DS_AUDIO_AMBI=2` mirrors it, `0` sums every
-//! object port to the center as before. Other object ports (no channel
-//! index) are still mixed to the center (logged once).
+//! X^2 + Y^2 + Z^2 ~ 0.8 W^2; FINDINGS.md 2026-10-16). The field (orders 0-3)
+//! goes to `crate::spatial`, the system renderer's stand-in: binaural for
+//! headphones, panned for speakers (the game's Output Device Type), replacing
+//! the first decode (two cardioids at +-90 degrees, which put a sound to one
+//! side in one ear only). `DS_AUDIO_AMBI=2` mirrors left and right, `0` sums
+//! every object port to the center. Other object ports (no channel index)
+//! are still mixed to the center (logged once).
 
 use crate::hle::Registry;
 use crate::{reg, sysv};
@@ -70,6 +75,28 @@ fn is_object(port_type: u16) -> bool {
     port_type & 0xFF00 == 0x0100
 }
 
+/// The DualSense haptics port type (not mixed: `haptics`).
+const PORT_HAPTICS: u16 = 6;
+
+/// One grain of the haptics port: its RMS per side to the controller's motors.
+unsafe fn haptics(p: &Port, n: usize) {
+    if p.latched == 0 {
+        return;
+    }
+    let ch = channels(p.format);
+    let float = p.format & 0x7F == 0;
+    let sample = |i: usize| -> f32 { unsafe { if float { *((p.latched as *const f32).add(i)) } else { *((p.latched as *const i16).add(i)) as f32 / 32768.0 } } };
+    let (mut l, mut r) = (0f64, 0f64);
+    for f in 0..n {
+        let a = sample(f * ch) * p.gains[0];
+        let b = if ch > 1 { sample(f * ch + 1) * p.gains[1] } else { a };
+        l += (a * a) as f64;
+        r += (b * b) as f64;
+    }
+    let k = 1.0 / n.max(1) as f64;
+    crate::input::haptics((l * k).sqrt() as f32, (r * k).sqrt() as f32);
+}
+
 /// The ambisonic channel (ACN index 0..35) an object port carries (its
 /// attribute 0x8 is 0x40 + the index).
 fn ambi_channel(p: &Port) -> Option<u32> {
@@ -92,15 +119,39 @@ fn ambi_decode() -> bool {
     ambi_mode() != 0
 }
 
-/// Stereo weights of an ambisonic channel (first-order cardioid decode;
-/// higher orders and X, Z do not reach a +-90 degree stereo pair).
-fn ambi_weights(acn: u32) -> (f32, f32) {
-    const H: f32 = std::f32::consts::FRAC_1_SQRT_2;
-    let y = if ambi_mode() == 2 { -H } else { H };
-    match acn {
-        0 => (H, H),
-        1 => (y, -y),
-        _ => (0.0, 0.0),
+/// The renderer of the ambisonic field (its delay lines and filters persist across grains),
+/// made again when the output layout changes.
+static RENDERER: Mutex<Option<crate::spatial::Renderer>> = Mutex::new(None);
+
+/// The PC tab's Audio Output: 0 automatic, 1 headphones, 2 stereo speakers, 3 5.1, 4 7.1, 5
+/// Windows' spatial sound (Windows Sonic, Dolby Atmos; headphones where it is off). (The
+/// game's own Output Device Type is the console's system output, shown, not chosen: FINDINGS.md
+/// 2026-11-06 night.)
+pub static OUTPUT_CHOICE: AtomicU32 = AtomicU32::new(0);
+
+/// The layout the field is rendered for: the PC tab's Audio Output; automatic: Windows' spatial
+/// sound when it is on for the device (its own head model), else headphones when Windows names
+/// the device headphones or a headset, else the device's surround (7.1 or 5.1 by its mix
+/// format's channels), else stereo speakers.
+pub fn render_layout() -> crate::spatial::Layout {
+    use crate::spatial::Layout;
+    let dev = crate::audio::DEVICE_CHANNELS.load(Ordering::Relaxed);
+    let spatial = crate::audio::spatial_allowed() && crate::audio::SPATIAL.load(Ordering::Relaxed) != 0;
+    match OUTPUT_CHOICE.load(Ordering::Relaxed) {
+        1 => Layout::Headphones,
+        2 => Layout::Stereo,
+        3 => Layout::Surround51,
+        4 => Layout::Surround71,
+        5 if spatial => Layout::Spatial714,
+        // Windows Sonic / Atmos: a 7.1 bed the device's spatial sound renders for headphones.
+        5 => Layout::Surround71,
+        _ if spatial => Layout::Spatial714,
+        _ => match crate::audio::DEVICE_FORM.load(Ordering::Relaxed) {
+            3 | 5 => Layout::Headphones,
+            _ if dev >= 8 => Layout::Surround71,
+            _ if dev >= 6 => Layout::Surround51,
+            _ => Layout::Stereo,
+        },
     }
 }
 
@@ -216,6 +267,8 @@ pub fn status() -> String {
 /// `<run dir>/audio-split-<group>.wav` together, aligned to the grain.
 struct Split {
     dir: std::path::PathBuf,
+    /// The capture's number in the run (file names `audio-split<n>-<group>.wav`).
+    n: u32,
     frames_left: usize,
     frames: usize,
     mixes: std::collections::BTreeMap<String, Vec<f32>>,
@@ -229,7 +282,8 @@ pub fn start_split(seconds: f64) -> Result<(), String> {
     if g.is_some() {
         return Err("a split capture is in progress".into());
     }
-    *g = Some(Split { dir: dir.to_path_buf(), frames_left: (seconds * 48000.0) as usize, frames: 0, mixes: Default::default() });
+    static N: AtomicU32 = AtomicU32::new(0);
+    *g = Some(Split { dir: dir.to_path_buf(), n: N.fetch_add(1, Ordering::Relaxed), frames_left: (seconds * 48000.0) as usize, frames: 0, mixes: Default::default() });
     crate::info!("AudioOut2: capturing {seconds} s of each port group's mix");
     Ok(())
 }
@@ -260,19 +314,88 @@ fn split_add(n: usize, grain: std::collections::BTreeMap<String, Vec<f32>>) {
     }
     let sp = g.take().unwrap();
     drop(g);
-    for (k, v) in &sp.mixes {
-        let path = sp.dir.join(format!("audio-split-{k}.wav"));
-        let peak = v.iter().fold(0f32, |m, x| m.max(x.abs()));
-        let rms = (v.iter().map(|&x| x as f64 * x as f64).sum::<f64>() / v.len().max(1) as f64).sqrt();
-        match crate::audio::write_wav_file(&path, v) {
-            Ok(()) => crate::info!("AudioOut2: split capture {} (rms {rms:.4}, peak {peak:.3})", path.display()),
-            Err(e) => crate::warn!("AudioOut2: split capture {}: {e}", path.display()),
+    // Written on a thread of its own (the title's audio job must not wait for the files).
+    let _ = std::thread::Builder::new().name("audio-split".into()).spawn(move || {
+        for (k, v) in &sp.mixes {
+            let path = sp.dir.join(format!("audio-split{}-{k}.wav", sp.n));
+            let peak = v.iter().fold(0f32, |m, x| m.max(x.abs()));
+            let rms = (v.iter().map(|&x| x as f64 * x as f64).sum::<f64>() / v.len().max(1) as f64).sqrt();
+            match crate::audio::write_wav_file(&path, v) {
+                Ok(()) => crate::info!("AudioOut2: split capture {} (rms {rms:.4}, peak {peak:.3})", path.display()),
+                Err(e) => crate::warn!("AudioOut2: split capture {}: {e}", path.display()),
+            }
         }
+    });
+}
+
+/// Adds an ambisonic channel's grain (ACN 0-15, mono ports) to the field being gathered.
+unsafe fn add_field(p: &Port, n: usize, field: &mut [Vec<f32>]) {
+    let Some(acn) = ambi_channel(p) else { return };
+    if p.latched == 0 || channels(p.format) != 1 || acn as usize >= field.len() {
+        return;
+    }
+    let float = p.format & 0x7F == 0;
+    let f = &mut field[acn as usize];
+    if f.is_empty() {
+        f.resize(n, 0.0);
+    }
+    let g = p.gains[0];
+    for (i, v) in f.iter_mut().enumerate().take(n) {
+        let x = unsafe { if float { *((p.latched as *const f32).add(i)) } else { *((p.latched as *const i16).add(i)) as f32 / 32768.0 } };
+        *v += x * g;
     }
 }
 
-/// Mixes one grain of a port into a stereo accumulator.
+/// Renders the gathered field into the stereo mix.
+fn render_field(field: &[Vec<f32>], n: usize, mix: &mut [f32]) {
+    use crate::spatial::{CHANNELS, Renderer};
+    if field.iter().all(|f| f.is_empty()) {
+        return;
+    }
+    let layout = render_layout();
+    let mut g = RENDERER.lock();
+    if g.as_ref().is_none_or(|r| r.layout() != layout) {
+        crate::info!("AudioOut2: the 3D sound field rendered for {layout:?}");
+        *g = Some(Renderer::new(layout));
+    }
+    // Mirrored (`DS_AUDIO_AMBI=2`): the left-right channels (odd in y) negated.
+    let mirror = ambi_mode() == 2;
+    let flipped: Vec<Vec<f32>> = if mirror {
+        field.iter().enumerate().map(|(k, f)| if matches!(k, 1 | 4 | 5 | 9 | 10 | 11) { f.iter().map(|v| -v).collect() } else { f.clone() }).collect()
+    } else {
+        Vec::new()
+    };
+    let src = if mirror { &flipped } else { field };
+    let acn: [Option<&[f32]>; CHANNELS] = std::array::from_fn(|k| src.get(k).filter(|f| f.len() >= n).map(|f| &f[..n]));
+    g.as_mut().unwrap().render(&acn, n, mix);
+}
+
+/// The split capture's copy of the field's rendering: the mix minus everything else would need
+/// a second renderer; this renders through a renderer of its own (its own delay state).
+fn render_field_copy(field: &[Vec<f32>], n: usize, out: &mut [f32]) {
+    use crate::spatial::{CHANNELS, Renderer};
+    static COPY: Mutex<Option<Renderer>> = Mutex::new(None);
+    // (Split captures are stereo: a surround layout's copy renders for stereo speakers.)
+    let layout = match render_layout() {
+        l @ (crate::spatial::Layout::Headphones | crate::spatial::Layout::Stereo) => l,
+        _ => crate::spatial::Layout::Stereo,
+    };
+    let mut g = COPY.lock();
+    if g.as_ref().is_none_or(|r| r.layout() != layout) {
+        *g = Some(Renderer::new(layout));
+    }
+    let acn: [Option<&[f32]>; CHANNELS] = std::array::from_fn(|k| field.get(k).filter(|f| f.len() >= n).map(|f| &f[..n]));
+    g.as_mut().unwrap().render(&acn, n, out);
+}
+
+/// Mixes one grain of a port into an accumulator of `och` channels (2, 6 or 8; FL FR FC LFE BL
+/// BR SL SR): stereo ports into FL and FR, mono ones to the centre (both sides in stereo),
+/// 8-channel beds (the title's L R C LFE Ls Rs Lb Rb) to the layout's speakers.
 unsafe fn mix_port(p: &Port, n: usize, out: &mut [f32]) {
+    unsafe { mix_port_ch(p, n, out, 2) }
+}
+
+unsafe fn mix_port_ch(p: &Port, n: usize, out: &mut [f32], och: usize) {
     if p.latched == 0 {
         return;
     }
@@ -311,27 +434,44 @@ unsafe fn mix_port(p: &Port, n: usize, out: &mut [f32]) {
             }
         }
     };
-    // An ambisonic channel: decoded to the stereo pair.
-    if let (Some(acn), true, 1) = (ambi_channel(p), ambi_decode(), ch) {
-        let (wl, wr) = ambi_weights(acn);
-        if wl != 0.0 || wr != 0.0 {
-            for f in 0..n {
-                let v = sample(f) * p.gains[0];
-                out[2 * f] += v * wl;
-                out[2 * f + 1] += v * wr;
-            }
-        }
+    // An ambisonic channel: rendered with the field (`add_field`, `crate::spatial`).
+    if let (Some(_), true, 1) = (ambi_channel(p), ambi_decode(), ch) {
         return;
     }
     for f in 0..n {
         let base = f * ch;
-        let (l, r) = match ch {
+        let o = &mut out[f * och..(f + 1) * och];
+        match ch {
             1 => {
                 let v = sample(base) * p.gains[0];
-                (v * 0.7071, v * 0.7071)
+                if och == 2 {
+                    o[0] += v * 0.7071;
+                    o[1] += v * 0.7071;
+                } else {
+                    o[2] += v;
+                }
+            }
+            c if c >= 8 && och >= 6 => {
+                // (7.1.4: the bed as in 7.1, nothing in the heights.)
+                // The bed to its speakers: L R C LFE, Ls Rs to the sides (7.1) or surrounds
+                // (5.1), Lb Rb to the backs (or the 5.1 surrounds at 0.707).
+                let g = |k: usize| sample(base + k) * p.gains[k];
+                for k in 0..4 {
+                    o[k] += g(k);
+                }
+                if och == 8 {
+                    o[6] += g(4);
+                    o[7] += g(5);
+                    o[4] += g(6);
+                    o[5] += g(7);
+                } else {
+                    o[4] += g(4) + 0.7071 * g(6);
+                    o[5] += g(5) + 0.7071 * g(7);
+                }
             }
             _ => {
-                // Front left/right; other channels (center, LFE, surrounds) fold down.
+                // Front left/right; in stereo the other channels (center, surrounds) fold down
+                // (LFE left out).
                 let mut l = sample(base) * p.gains[0];
                 let mut r = sample(base + 1) * p.gains[1];
                 if ch >= 8 {
@@ -341,11 +481,10 @@ unsafe fn mix_port(p: &Port, n: usize, out: &mut [f32]) {
                     l += c + 0.7071 * (sl + bl);
                     r += c + 0.7071 * (sr + br);
                 }
-                (l, r)
+                o[0] += l;
+                o[1] += r;
             }
-        };
-        out[2 * f] += l;
-        out[2 * f + 1] += r;
+        }
     }
 }
 
@@ -412,7 +551,10 @@ sysv! {
         if blocking == 0 && crate::audio::queued_grains() >= depth as usize {
             return ERR_NOT_READY;
         }
-        let mut mix = vec![0f32; 2 * n];
+        // The output's layout: the renderer's (the output thread opens its client to match).
+        let och = render_layout().channels();
+        crate::audio::OUT_CHANNELS.store(och as u32, Ordering::Relaxed);
+        let mut mix = vec![0f32; och * n];
         static PUSHES: AtomicU32 = AtomicU32::new(0);
         if PUSHES.fetch_add(1, Ordering::Relaxed) == 2000 {
             dump_ports(ctx, n);
@@ -423,10 +565,23 @@ sysv! {
             let (mut w, mut y, mut x): (Vec<f32>, Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new(), Vec::new());
             let splitting = SPLIT.lock().is_some();
             let mut groups: std::collections::BTreeMap<String, Vec<f32>> = Default::default();
+            // The ambisonic field of this grain (both sets summed: the second has been silent).
+            let mut field: Vec<Vec<f32>> = vec![Vec::new(); crate::spatial::CHANNELS];
             for p in ports.as_ref().into_iter().flat_map(|m| m.values()).filter(|p| p.ctx == ctx) {
+                if ambi_decode() {
+                    add_field(p, n, &mut field);
+                }
                 if splitting {
                     let g = groups.entry(split_group(p)).or_insert_with(|| vec![0f32; 2 * n]);
                     mix_port(p, n, g);
+                }
+                if p.port_type == PORT_HAPTICS {
+                    haptics(p, n);
+                    continue;
+                }
+                if !(ambi_decode() && ambi_channel(p).is_some()) {
+                    mix_port_ch(p, n, &mut mix, och);
+                    continue;
                 }
                 match ambi_channel(p) {
                     Some(acn @ (0 | 1 | 3)) if p.attr9 == 0 && p.latched != 0 && channels(p.format) == 1 && p.format & 0x7F == 0 => {
@@ -446,12 +601,17 @@ sysv! {
             if !w.is_empty() && w.len() == y.len() && w.len() == x.len() {
                 note_balance(&w, &y, &x);
             }
+            render_field(&field, n, &mut mix);
             if splitting {
+                // The field's rendering as its own group (`ambi`).
+                let mut r = vec![0f32; 2 * n];
+                render_field_copy(&field, n, &mut r);
+                groups.insert("ambi-rendered".into(), r);
                 split_add(n, groups);
             }
         }
         // Blocks while `depth` grains are queued (the title's pacing).
-        crate::audio::push_grain(mix, depth as usize);
+        crate::audio::push_grain(mix, och, depth as usize);
         0
     }
     fn sceAudioOut2ContextGetQueueLevel(ctx: u32, level: *mut u32, available: *mut u32) -> i32 {

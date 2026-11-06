@@ -28,6 +28,8 @@ windows = { version = "0.61", features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Threading",
     "Win32_System_Variant",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
 ] }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "instr_info", "fast_fmt", "code_asm"] }
 windows-sys = { version = "0.61", features = [

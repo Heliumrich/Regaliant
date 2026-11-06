@@ -19,6 +19,7 @@ mod input;
 mod loader;
 mod mem;
 mod sections;
+mod spatial;
 mod patch;
 mod pcsettings;
 mod jobidle;
@@ -1336,13 +1337,14 @@ fn main() {
     // The title writes its own log files to /devlog/app when it can (useful diagnostics).
     hle::kernel::fs::ensure_dir(&rt.join("devlog").join("logs"));
     hle::kernel::fs::mount("/devlog/app", vec![rt.join("devlog")], true);
-    hle::libs::savedata::init(cfg.root.join("local-data").join("saves"));
     // Keyboard and mouse layout (written with the defaults when missing).
     input::init(&cfg.root.join("local-data").join("controls.txt"));
     // `DS_ACHIEVEMENTS_FILE`: another file (test runs: theirs, apart from a player's).
     let achievements_file = std::env::var_os("DS_ACHIEVEMENTS_FILE").map(PathBuf::from).unwrap_or_else(|| cfg.root.join("local-data").join("achievements.txt"));
     achievements::init(&cfg.app, achievements_file, "en-GB");
     pcsettings::init(cfg.root.join("local-data").join("pcsettings.txt"));
+    // The saves: the PC tab's Save Folder (local-data/saves by default), a PS5 import asked for.
+    hle::libs::savedata::init(pcsettings::saves::start(&cfg.root, &hle::libs::savedata::title_id()));
     // Compiled pipelines and learned shader specs: local-data, or the
     // `--cache` directory (Play.bat: one next to the package folder, so a
     // new package starts with what earlier ones learned on this machine).

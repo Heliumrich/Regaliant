@@ -15,6 +15,8 @@ pub mod glyphs;
 mod hud;
 pub mod pointer;
 pub mod popup;
+pub mod presets;
+pub mod saves;
 pub mod prompts;
 pub mod store;
 pub mod value;
@@ -54,6 +56,11 @@ pub enum ItemKind {
     Binding(u16),
     /// An action's controller button (`bindings`): the pad buttons as options (live).
     PadBinding(u16),
+    /// The audio output device: the system's default, then Windows' active devices (live).
+    AudioDevice,
+    /// The Quality Preset (`presets`): Custom and the presets as options (live: the preset the
+    /// settings match; a change sets its settings).
+    Preset(Vec<String>),
 }
 
 impl Item {
@@ -67,7 +74,7 @@ impl Item {
     fn options(&self) -> Vec<(String, Option<String>)> {
         match &self.kind {
             ItemKind::Toggle(_) => vec![("BOOL_OFF".into(), None), ("BOOL_ON".into(), None)],
-            ItemKind::Choice(opts, _) => opts.iter().enumerate().map(|(i, o)| (self.text_key(&format!("_{i}")), Some(o.clone()))).collect(),
+            ItemKind::Choice(opts, _) | ItemKind::Preset(opts) => opts.iter().enumerate().map(|(i, o)| (self.text_key(&format!("_{i}")), Some(o.clone()))).collect(),
             ItemKind::Slider { .. } => Vec::new(),
             ItemKind::Status(_) => vec![("PC_TROPHY_LOCKED".into(), Some("Locked".into())), ("PC_TROPHY_UNLOCKED".into(), Some("Unlocked".into()))],
             ItemKind::Count(g, all) => (0..=*all).map(|k| (format!("PC_TROPHY_COUNT_{g}_{k}"), Some(format!("{k} / {all}")))).collect(),
@@ -78,6 +85,13 @@ impl Item {
                 .chain(std::iter::once(("PC_INPUT_PRESS".to_string(), Some("Press a key".to_string()))))
                 .collect(),
             ItemKind::PadBinding(_) => bindings::pad_options().into_iter().enumerate().map(|(n, label)| (format!("PC_PAD_{n}"), Some(label))).collect(),
+            ItemKind::AudioDevice => std::iter::once(("PC_AUDIODEVICE_0".to_string(), Some("System Default".to_string())))
+                .chain(crate::audio::output_devices().iter().enumerate().map(|(k, (_, name))| {
+                    // Long device names shortened for the value column.
+                    let short: String = if name.chars().count() > 26 { name.chars().take(23).collect::<String>() + "..." } else { name.clone() };
+                    (format!("PC_AUDIODEVICE_{}", k + 1), Some(short))
+                }))
+                .collect(),
         }
     }
     fn def(&self) -> store::Def {
@@ -89,6 +103,8 @@ impl Item {
             ItemKind::Count(g, _) => (store::Kind::Int, 0, Some(store::Live::Count(*g))),
             ItemKind::Binding(a) => (store::Kind::Int, 0, Some(store::Live::Binding(*a))),
             ItemKind::PadBinding(a) => (store::Kind::Int, 0, Some(store::Live::PadBinding(*a))),
+            ItemKind::AudioDevice => (store::Kind::Int, 0, Some(store::Live::AudioDevice)),
+            ItemKind::Preset(_) => (store::Kind::Int, 0, Some(store::Live::Preset)),
         };
         store::Def { name: self.key(), kind, default, live }
     }
@@ -100,7 +116,6 @@ pub const RENDER_SCALES: [u32; 9] = [50, 60, 67, 75, 85, 100, 125, 150, 200];
 /// The PC tab's items, in order (each one works: what it changes is in `apply`).
 pub fn items() -> Vec<Item> {
     let s = |v: &str| v.to_string();
-    let toggle = |id: &str, label: &str, tooltip: &str, on| Item { id: s(id), label: s(label), tooltip: s(tooltip), kind: ItemKind::Toggle(on) };
     vec![
         Item {
             id: s("WindowMode"),
@@ -114,12 +129,49 @@ pub fn items() -> Vec<Item> {
             tooltip: s("The resolution the game renders at, against the window's or screen's (100%: its own resolution; at most 3840x2160). Lower runs faster, higher looks sharper."),
             kind: ItemKind::Choice(RENDER_SCALES.iter().map(|p| format!("{p}%")).collect(), 5),
         },
-        toggle("SkipIntro", "Skip Intro Logos", "Skips the logos shown when the game starts (from the next start).", false),
         Item {
             id: s("Sharpening"),
             label: s("Sharpening"),
             tooltip: s("Sharpens the image shown (0.00: off, as in the original)."),
             kind: ItemKind::Slider { min: 0.0, max: 1.0, default: 0.0 },
+        },
+        Item {
+            id: s("MouseSensitivity"),
+            label: s("Mouse Sensitivity"),
+            tooltip: s("How far the camera turns per mouse movement (1.00: the controls file's own)."),
+            kind: ItemKind::Slider { min: 0.1, max: 3.0, default: 1.0 },
+        },
+        Item {
+            id: s("AudioOutput"),
+            label: s("Audio Output"),
+            tooltip: s("How the game's 3D sound is played: for headphones (both ears hear every sound, as around a head), stereo speakers, 5.1 or 7.1 surround speakers, or as 7.1 for Windows Sonic or Dolby Atmos to render for headphones (turn it on in Windows' sound settings). Automatic follows the device Windows plays on."),
+            kind: ItemKind::Choice(vec![s("Automatic"), s("Headphones"), s("Stereo Speakers"), s("5.1 Surround"), s("7.1 Surround"), s("Windows Sonic / Atmos")], 0),
+        },
+        Item {
+            id: s("AudioDevice"),
+            label: s("Audio Device"),
+            tooltip: s("The device the game's sound plays on (the system's default follows Windows)."),
+            kind: ItemKind::AudioDevice,
+        },
+    ]
+}
+
+/// The Graphics list's items (a scrolling list opened from the PC tab: `GRAPHICS_LIST`).
+pub fn graphics_items() -> Vec<Item> {
+    let s = |v: &str| v.to_string();
+    let toggle = |id: &str, label: &str, tooltip: &str, on| Item { id: s(id), label: s(label), tooltip: s(tooltip), kind: ItemKind::Toggle(on) };
+    vec![
+        Item {
+            id: s("QualityPreset"),
+            label: s("Quality Preset"),
+            tooltip: s("Sets the render scale and the graphics settings together: Low and Medium for modest graphics cards, High as on the PS5, Ultra beyond it. Custom: settings changed one by one."),
+            kind: ItemKind::Preset(presets::NAMES.iter().map(|n| s(n)).collect()),
+        },
+        Item {
+            id: s("GeometryDetail"),
+            label: s("Geometry Detail"),
+            tooltip: s("How finely stone, earth and walls are shaped (tessellation): as the Visual Mode sets it (Performance: Standard; Cinematic: Very High), or Low, Standard, High (the PS5 Pro's), Very High and Ultra (beyond the PS5's). Higher costs the graphics card more."),
+            kind: ItemKind::Choice(vec![s("Visual Mode"), s("Low"), s("Standard"), s("High"), s("Very High"), s("Ultra")], 0),
         },
         Item {
             id: s("TextureFiltering"),
@@ -128,20 +180,50 @@ pub fn items() -> Vec<Item> {
             kind: ItemKind::Choice(vec![s("As Original"), s("8x Anisotropic"), s("16x Anisotropic")], 0),
         },
         Item {
-            id: s("MouseSensitivity"),
-            label: s("Mouse Sensitivity"),
-            tooltip: s("How far the camera turns per mouse movement (1.00: the controls file's own)."),
-            kind: ItemKind::Slider { min: 0.1, max: 3.0, default: 1.0 },
+            id: s("AntiAliasing"),
+            label: s("Anti-Aliasing"),
+            tooltip: s("The game's temporal anti-aliasing (TAA), or none: jagged, shimmering edges, and a softer image when the render scale is below the screen's (the TAA also upscales)."),
+            kind: ItemKind::Choice(vec![s("TAA"), s("Off")], 0),
         },
-        toggle("InvertMouseY", "Invert Mouse Vertical", "Moving the mouse forward looks down.", false),
+        toggle("Bloom", "Bloom", "The glow around bright lights.", true),
+        toggle("Vignette", "Vignette", "The darkening toward the image's edges.", true),
+    ]
+}
+
+/// Geometry Detail's tessellation per option (density, fade-out start, smallest edge): None for
+/// the Visual Mode's own; Low as the title's PS4 Pro config (misc/renderconfig_ps4_neo.txt),
+/// Standard to Very High as its PS5 modes', Ultra beyond them.
+pub const GEOMETRY_DETAIL: [Option<(f32, f32, f32)>; 6] =
+    [None, Some((5.0, 9.0, 0.05)), Some((8.0, 12.0, 0.04)), Some((13.0, 13.0, 0.04)), Some((18.0, 15.0, 0.02)), Some((24.0, 18.0, 0.015))];
+
+/// The Game & Controls list's items (`GAME_LIST`).
+pub fn game_items() -> Vec<Item> {
+    let s = |v: &str| v.to_string();
+    let toggle = |id: &str, label: &str, tooltip: &str, on| Item { id: s(id), label: s(label), tooltip: s(tooltip), kind: ItemKind::Toggle(on) };
+    vec![
+        toggle("InvertMouseY", "Invert Mouse Y", "Inverts the mouse's vertical axis: moving it forward looks down.", false),
         Item {
             id: s("ButtonPrompts"),
             label: s("Button Prompts"),
             tooltip: s("The buttons the game shows: those of the device used last, or always one set."),
             kind: ItemKind::Choice(vec![s("Automatic"), s("PlayStation"), s("Xbox"), s("Keyboard & Mouse")], 0),
         },
+        toggle("SkipIntro", "Skip Intro Logos", "Skips the logos shown when the game starts (from the next start).", false),
+        Item {
+            id: s("SaveFolder"),
+            label: s("Save Folder"),
+            tooltip: s("Where the game keeps its saves, from the next start: in the game's own folder (local-data), or a Demon's Souls folder in Documents (under My Games) or in Saved Games. A folder without saves gets a copy of the current ones."),
+            kind: ItemKind::Choice(saves::FOLDERS.iter().map(|f| s(f)).collect(), 0),
+        },
+        Item {
+            id: s("ImportSaves"),
+            label: s("Import PS5 Saves"),
+            tooltip: s("Imports a decrypted PS5 save of this game at the next start: put its SAVEDATA0PlayerProfile0 (and SAVEDATA0OptionsProfile0) folders in the folder PS5 Saves next to the game. The saves it replaces are kept in save-backups."),
+            kind: ItemKind::Choice(vec![s("No"), s("At Next Start")], 0),
+        },
     ]
 }
+
 
 /// Applies the PC settings to the title (its console variables, while the game runs) and to
 /// the port; at start and after every change. Settings at their defaults leave the title's own.
@@ -161,6 +243,17 @@ pub fn apply() {
     crate::input::PC_SENSITIVITY.store(sens.to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::input::PC_INVERT_Y.store(get("InvertMouseY") == Some(1), std::sync::atomic::Ordering::Relaxed);
     prompts::MODE.store(get("ButtonPrompts").unwrap_or(0).min(3) as u8, std::sync::atomic::Ordering::Relaxed);
+    let geo = GEOMETRY_DETAIL.get(get("GeometryDetail").unwrap_or(0) as usize).copied().flatten();
+    convar::want("r_tessellationDensity", geo.map(|g| convar::float(g.0)));
+    convar::want("r_tessellationFadeOutStart", geo.map(|g| convar::float(g.1)));
+    convar::want("r_tessellationSmallestEdgeLength", geo.map(|g| convar::float(g.2)));
+    // r_aaMethod: EAAMethods::Off 0, TAA 1 (the title's).
+    convar::want("r_aaMethod", (get("AntiAliasing") == Some(1)).then_some(0));
+    convar::want("r_bloomEnable", (get("Bloom") == Some(0)).then_some(0));
+    let vignette_off = get("Vignette") == Some(0);
+    convar::want("r_vignetteOverrideEnable", vignette_off.then_some(1));
+    convar::want("r_vignetteScale", vignette_off.then(|| convar::float(0.0)));
+    crate::hle::libs::audio2::OUTPUT_CHOICE.store(get("AudioOutput").unwrap_or(0).min(5), std::sync::atomic::Ordering::Relaxed);
     let scale = RENDER_SCALES.get(get("RenderScale").unwrap_or(5) as usize).copied().unwrap_or(100);
     crate::dispmode::SCALE_PCT.store(scale, std::sync::atomic::Ordering::Relaxed);
     // The window: applied when it changes (the window opens with it, `window_mode`).
@@ -253,7 +346,15 @@ fn trophy_rows() -> Vec<(String, String, String, String)> {
 
 /// The PC settings' values (local-data/pcsettings.txt); the trophies' rows read their state.
 pub fn init(path: std::path::PathBuf) {
+    // The audio device chosen before (its endpoint id), when Windows still lists it.
+    if let Ok(id) = std::fs::read_to_string(path.with_file_name("audio-device.txt")) {
+        let id = id.trim().to_string();
+        if !id.is_empty() && crate::audio::output_devices().iter().any(|d| d.0 == id) {
+            crate::audio::set_output_device(Some(id));
+        }
+    }
     let mut defs: Vec<store::Def> = tabs().iter().flat_map(|t| t.items.iter().map(Item::def)).collect();
+    defs.extend(graphics_items().iter().chain(game_items().iter()).map(Item::def));
     defs.extend(binding_items().iter().map(Item::def));
     defs.extend(pad_binding_items().iter().map(Item::def));
     // The achievement pop-up's (`popup`, `hud`).
@@ -263,7 +364,11 @@ pub fn init(path: std::path::PathBuf) {
     for (w, name) in [prompts::SHOWN_PS, prompts::SHOWN_NOT_KB, prompts::SHOWN_NOT_XB, prompts::SHOWN_KB, prompts::SHOWN_XB].into_iter().enumerate() {
         defs.push(store::Def { name: name.into(), kind: store::Kind::Int, default: 0, live: Some(store::Live::Prompts(w as u8)) });
     }
+    let first_start = !path.exists();
     store::init(path, defs);
+    if first_start {
+        presets::first_start();
+    }
     apply();
 }
 
@@ -427,6 +532,8 @@ fn edit_data_source(p: &mut Payload, item: &Item) -> Result<(), String> {
         ItemKind::Count(_, all) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(*all))),
         ItemKind::Binding(_) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(bindings::capture_option()))),
         ItemKind::PadBinding(_) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(bindings::pad_capture_option()))),
+        ItemKind::AudioDevice => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(crate::audio::output_devices().len() as u32))),
+        ItemKind::Preset(opts) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(opts.len().max(1) as u32 - 1))),
         ItemKind::Choice(opts, d) => {
             let n = opts.len().max(1) as u32;
             (raw_u32(*d), Some(raw_u32(0)), Some(raw_u32(n - 1)))
@@ -653,17 +760,27 @@ fn pad_binding_items() -> Vec<Item> {
         .collect()
 }
 
-/// A bindings list's names: its screen, the PC tab's item that opens it and their text keys.
+/// A list's names: its screen, the PC tab's item that opens it and their text keys; and where
+/// its rows' value column sits (its frame's start and width as shares of the row, the text's
+/// width between the arrows).
 struct ListNames {
     screen: &'static str,
     opener: &'static str,
     open_key: &'static str,
     tip_key: &'static str,
     heading_key: &'static str,
+    value: (f32, f32, f32),
 }
 
-const KEY_LIST: ListNames = ListNames { screen: "PCKeyBindings", opener: "PC_BindingsOpen", open_key: "PC_BINDINGS_OPEN", tip_key: "PC_BINDINGS_OPEN_TIP", heading_key: "PC_BINDINGS_HEADING" };
-const PAD_LIST: ListNames = ListNames { screen: "PCPadBindings", opener: "PC_PadBindingsOpen", open_key: "PC_PADBIND_OPEN", tip_key: "PC_PADBIND_OPEN_TIP", heading_key: "PC_PADBIND_HEADING" };
+/// The bindings lists' value column (short action names: the arrows from x 225 to 485 of 520).
+const BINDING_VALUE: (f32, f32, f32) = (0.635, 0.34, 180.0);
+/// The settings lists' (longer names such as "Texture Filtering": the column ~20 further right).
+const SETTING_VALUE: (f32, f32, f32) = (0.672, 0.31, 165.0);
+
+const KEY_LIST: ListNames = ListNames { screen: "PCKeyBindings", opener: "PC_BindingsOpen", open_key: "PC_BINDINGS_OPEN", tip_key: "PC_BINDINGS_OPEN_TIP", heading_key: "PC_BINDINGS_HEADING", value: BINDING_VALUE };
+const PAD_LIST: ListNames = ListNames { screen: "PCPadBindings", opener: "PC_PadBindingsOpen", open_key: "PC_PADBIND_OPEN", tip_key: "PC_PADBIND_OPEN_TIP", heading_key: "PC_PADBIND_HEADING", value: BINDING_VALUE };
+const GRAPHICS_LIST: ListNames = ListNames { screen: "PCGraphics", opener: "PC_GraphicsOpen", open_key: "PC_GRAPHICS_OPEN", tip_key: "PC_GRAPHICS_OPEN_TIP", heading_key: "PC_GRAPHICS_HEADING", value: SETTING_VALUE };
+const GAME_LIST: ListNames = ListNames { screen: "PCGame", opener: "PC_GameOpen", open_key: "PC_GAME_OPEN", tip_key: "PC_GAME_OPEN_TIP", heading_key: "PC_GAME_HEADING", value: SETTING_VALUE };
 
 /// The key binding rows (`bindings::ACTIONS`).
 fn binding_items() -> Vec<Item> {
@@ -734,12 +851,13 @@ fn bindings_browser(f: &mut cgpr::File, choice: &cgpr::Entity, names: &ListNames
         // The value column further right and narrower (a settings page's sits at half the row,
         // its left arrow under the longer names here): the arrows from x 225 to 485 of the 520
         // (its frame from 63.5% of the row, 34% wide; the text between the arrows 180 wide).
+        let (vx, vw, tw) = names.value;
         edit_descendant(f, &mut e, "ValueFrame", h("FitRelativeToParent"), |p| {
-            set_float(p, h("X"), 0.635)?;
-            set_float(p, h("Width"), 0.34)
+            set_float(p, h("X"), vx)?;
+            set_float(p, h("Width"), vw)
         })?;
-        edit_descendant(f, &mut e, "SizingElement", h("Element"), |p| set_float(p, h("Width"), 180.0))?;
-        edit_descendant(f, &mut e, "Int_Value", h("Element"), |p| set_float(p, h("Width"), 180.0))?;
+        edit_descendant(f, &mut e, "SizingElement", h("Element"), |p| set_float(p, h("Width"), tw))?;
+        edit_descendant(f, &mut e, "Int_Value", h("Element"), |p| set_float(p, h("Width"), tw))?;
         kids.push(e);
     }
     screen.at_mut(&mc_rel).kids = kids;
@@ -811,7 +929,7 @@ fn start_menu(orig: &[u8]) -> Result<Vec<u8>, String> {
         let mut kids = Vec::new();
         for item in &tab.items {
             let (ti, t) = match item.kind {
-                ItemKind::Toggle(_) | ItemKind::Choice(..) | ItemKind::Status(_) | ItemKind::Count(..) | ItemKind::Binding(_) | ItemKind::PadBinding(_) => (ti_choice, &CHOICE),
+                ItemKind::Toggle(_) | ItemKind::Choice(..) | ItemKind::Status(_) | ItemKind::Count(..) | ItemKind::Binding(_) | ItemKind::PadBinding(_) | ItemKind::AudioDevice | ItemKind::Preset(_) => (ti_choice, &CHOICE),
                 ItemKind::Slider { .. } => (ti_slider, &SLIDER),
             };
             let tpl = f.roots[ri].at(&page_path).at(&contents_rel).kids[ti].clone();
@@ -820,7 +938,7 @@ fn start_menu(orig: &[u8]) -> Result<Vec<u8>, String> {
         page.at_mut(&contents_rel).kids = kids;
         if tab.id == "PCTab" {
             let tpl = f.roots[ri].at(&page_path).at(&contents_rel).kids[ti_choice].clone();
-            for (names, items) in [(&KEY_LIST, binding_items()), (&PAD_LIST, pad_binding_items())] {
+            for (names, items) in [(&GRAPHICS_LIST, graphics_items()), (&GAME_LIST, game_items()), (&KEY_LIST, binding_items()), (&PAD_LIST, pad_binding_items())] {
                 match bindings_browser(&mut f, &tpl, names, &items) {
                     Ok(opener) => page.at_mut(&contents_rel).kids.push(opener),
                     Err(e) => crate::warn!("pc settings: no {} list ({e})", names.screen),
@@ -890,6 +1008,19 @@ fn text(orig: &[u8]) -> Vec<u8> {
         lines.push((tab.label.0.into(), tab.label.1.into()));
         lines.push((tab.tooltip.0.into(), tab.tooltip.1.into()));
         for item in &tab.items {
+            lines.push((item.text_key(""), item.label.clone()));
+            lines.push((item.text_key("_TIP"), item.tooltip.clone()));
+            lines.extend(item.options().into_iter().filter_map(|(k, t)| t.map(|t| (k, t))));
+        }
+    }
+    for (names, open, tip, heading, items) in [
+        (&GRAPHICS_LIST, "Graphics", "Texture filtering and the image's quality.", "GRAPHICS", graphics_items()),
+        (&GAME_LIST, "Game & Controls", "Mouse direction, the buttons shown and the start.", "GAME & CONTROLS", game_items()),
+    ] {
+        lines.push((names.open_key.into(), open.into()));
+        lines.push((names.tip_key.into(), tip.into()));
+        lines.push((names.heading_key.into(), heading.into()));
+        for item in &items {
             lines.push((item.text_key(""), item.label.clone()));
             lines.push((item.text_key("_TIP"), item.tooltip.clone()));
             lines.extend(item.options().into_iter().filter_map(|(k, t)| t.map(|t| (k, t))));

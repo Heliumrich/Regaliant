@@ -49,7 +49,7 @@ pub fn init(root: PathBuf) {
     ROOT.set(root).ok();
 }
 
-fn title_id() -> String {
+pub fn title_id() -> String {
     if let Some(t) = super::app::param_json().get("titleId").and_then(|v| v.as_str()) {
         return t.to_string();
     }

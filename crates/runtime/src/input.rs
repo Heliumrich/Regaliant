@@ -302,10 +302,38 @@ pub fn xinput_state() -> Option<XINPUT_STATE> {
     for i in 0..4 {
         let mut s: XINPUT_STATE = unsafe { std::mem::zeroed() };
         if unsafe { XInputGetState(i, &mut s) } == 0 {
+            PAD_INDEX.store(i, Relaxed);
             return Some(s);
         }
     }
     None
+}
+
+/// The XInput user index the pad answered at (the rumble goes there).
+static PAD_INDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The motor speeds set last (left << 16 | right).
+static RUMBLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The title's haptic waveform (the DualSense actuators' audio port, `audio2`), one grain's RMS per
+/// side (0 to 1 full scale): an Xbox controller's motors at that strength (left the heavy
+/// motor), so the game's Vibration Mode and Intensity settings carry over. Without a pad nothing
+/// is sent.
+pub fn haptics(left: f32, right: f32) {
+    if !pad_connected() {
+        return;
+    }
+    // A strong hit reaches ~0.18 RMS: about 85% of the motor; weak textures stay light.
+    let speed = |rms: f32| -> u16 {
+        let x = (rms * 4.5).clamp(0.0, 1.0).powf(0.8);
+        if x < 0.06 { 0 } else { (x * 65535.0) as u16 }
+    };
+    let (l, r) = (speed(left), speed(right));
+    let packed = (l as u32) << 16 | r as u32;
+    if RUMBLE.swap(packed, Relaxed) == packed {
+        return;
+    }
+    let mut v = windows_sys::Win32::UI::Input::XboxController::XINPUT_VIBRATION { wLeftMotorSpeed: l, wRightMotorSpeed: r };
+    unsafe { windows_sys::Win32::UI::Input::XboxController::XInputSetState(PAD_INDEX.load(Relaxed), &mut v) };
 }
 
 fn axis(v: i16, invert: bool) -> u8 {

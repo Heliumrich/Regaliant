@@ -1,10 +1,13 @@
 //! The title's console variables the PC settings set while the game runs (PPSA01341
-//! 01.007.000; FINDINGS.md 2026-11-06 afternoon). Each is an object in the main executable's
-//! data, built the first time code uses it (`ConVar` constructors: bool eboot+0x450a20, int
-//! +0x431500, float +0x9260b0; each stores its vtable at +0 and its value at +0x68), so the port
-//! writes the value once the object exists (its vtable set) and keeps the title's own value to
+//! 01.007.000; FINDINGS.md 2026-11-06 afternoon and night). Each is an object in the main
+//! executable's data, built the first time code uses it (`ConVar` constructors: bool
+//! eboot+0x450a20, int +0x431500, float +0x9260b0; each stores its vtable at +0, a pointer to
+//! its storage at +0x60 and its value at +0x68). The storage of the render variables is a field
+//! of the render settings block (eboot+0x2f13b40, 0xD8A bytes), which the renderer copies for
+//! each view (memcpy at eboot+0xa22e45, +0xa4f2dd) and reads from the copy: the port writes the
+//! value into both, once the object exists (its vtable set), and keeps the title's own value to
 //! put back. Each object is checked by its name string first (another title version is left
-//! alone and logged). The renderer reads the values each frame.
+//! alone and logged).
 
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -45,9 +48,47 @@ pub const VARS: &[Var] = &[
     v("r_aaHistorySharpeningStrength", 0x2424018, 0x2f0e0b8, Kind::Float),
     v("r_motionBlurAmount", 0x2451804, 0x2f0d0d8, Kind::Float),
     v("r_forceLod", 0x23ebbb8, 0x2f2fb30, Kind::Int),
+    // The tessellation the title's render configs set per Visual Mode (misc/renderconfig_ps5_*.txt:
+    // density 8 Performance, 13 PS5 Pro, 18 Cinematic; fade-out start 12, 13, 15; smallest edge
+    // 0.04, 0.04, 0.02): float ConVars built at eboot+0x961bd0, +0x961da7, +0x961d0a.
+    v("r_tessellationDensity", 0x2482e48, 0x2f2bb88, Kind::Float),
+    v("r_tessellationFadeOutStart", 0x23cff49, 0x2f2be88, Kind::Float),
+    v("r_tessellationSmallestEdgeLength", 0x24bc7b7, 0x2f2bd88, Kind::Float),
+    // An enum (an int in the render settings): EAAMethods::Off 0, TAA 1 (the title's).
+    v("r_aaMethod", 0x246708e, 0x2f0d5d8, Kind::Int),
 ];
 
 const VALUE: u64 = 0x68;
+const STORAGE: u64 = 0x60;
+/// The main executable's writable data (its PT_LOAD at 0x26dc000, 0xc957c1 bytes in memory):
+/// a storage pointer elsewhere is not followed.
+const DATA: std::ops::Range<u64> = 0x26dc000..0x33717c1;
+
+/// The variable's value fields: its own (+0x68) and, when it has one in the executable's
+/// data, its storage (what the renderer reads).
+fn fields(base: u64, obj: u64) -> (u64, Option<u64>) {
+    let storage = unsafe { ((obj + STORAGE) as *const u64).read_volatile() };
+    let valid = storage >= base + DATA.start && storage + 4 <= base + DATA.end;
+    (obj + VALUE, valid.then_some(storage))
+}
+
+unsafe fn read(kind: Kind, at: u64) -> u32 {
+    unsafe {
+        match kind {
+            Kind::Bool => (at as *const u8).read_volatile() as u32,
+            _ => (at as *const u32).read_volatile(),
+        }
+    }
+}
+
+unsafe fn write(kind: Kind, at: u64, bits: u32) {
+    unsafe {
+        match kind {
+            Kind::Bool => (at as *mut u8).write_volatile((bits & 0xff) as u8),
+            _ => (at as *mut u32).write_volatile(bits),
+        }
+    }
+}
 
 struct State {
     /// Wanted value (bits) per var; `None`: the title's own.
@@ -116,7 +157,13 @@ fn fmt(kind: Kind, bits: u32) -> String {
 }
 
 /// Writes the wanted values into the objects that exist (each flip, cheap when nothing waits).
+/// Every ~2 s the wanted values are checked again: the title writes some of them itself when its
+/// display mode changes (its render configs: the tessellation), as the render scale's pulses do.
 pub fn tick() {
+    static TICKS: AtomicU64 = AtomicU64::new(0);
+    if TICKS.fetch_add(1, Ordering::Relaxed) % 120 == 119 && STATE.lock().as_ref().is_some_and(|s| s.want.iter().any(Option::is_some)) {
+        DIRTY.store(true, Ordering::Relaxed);
+    }
     if !DIRTY.load(Ordering::Relaxed) {
         return;
     }
@@ -139,21 +186,21 @@ pub fn tick() {
             waiting = true;
             continue;
         }
-        let at = (obj + VALUE) as *mut u8;
-        let cur = unsafe {
-            match var.kind {
-                Kind::Bool => at.read_volatile() as u32,
-                _ => (at as *const u32).read_volatile(),
-            }
-        };
+        let (own, storage) = fields(base, obj);
+        // What the renderer reads: the storage when the variable has one.
+        let cur = unsafe { read(var.kind, storage.unwrap_or(own)) };
+        let own_cur = unsafe { read(var.kind, own) };
         if s.orig[i].is_none() {
             s.orig[i] = Some(cur);
+            if storage.is_none() {
+                crate::info!("pc settings: {} has no storage in the render settings (its own value only)", var.name);
+            }
         }
-        if cur != target || s.wrote[i] != Some(target) {
+        if cur != target || own_cur != target || s.wrote[i] != Some(target) {
             unsafe {
-                match var.kind {
-                    Kind::Bool => at.write_volatile((target & 0xff) as u8),
-                    _ => (at as *mut u32).write_volatile(target),
+                write(var.kind, own, target);
+                if let Some(st) = storage {
+                    write(var.kind, st, target);
                 }
             }
             crate::info!(
@@ -188,12 +235,9 @@ pub fn report() {
             let obj = base + var.obj;
             let ok = OK[i].load(Ordering::Relaxed);
             let built = ok && base != 0 && unsafe { (obj as *const u64).read_volatile() } != 0;
-            let cur = built.then(|| unsafe {
-                let at = (obj + VALUE) as *const u8;
-                match var.kind {
-                    Kind::Bool => at.read_volatile() as u32,
-                    _ => (at as *const u32).read_volatile(),
-                }
+            let cur = built.then(|| {
+                let (own, storage) = fields(base, obj);
+                unsafe { read(var.kind, storage.unwrap_or(own)) }
             });
             format!(
                 "{} {}",
