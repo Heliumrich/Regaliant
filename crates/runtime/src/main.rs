@@ -4,6 +4,7 @@
 #[macro_use]
 mod log;
 mod ehframe;
+mod achievements;
 mod audio;
 mod exception;
 mod gpu;
@@ -259,6 +260,7 @@ pub fn keep_run(reason: &str) {
 ///                            DS_CAMDEBUG=1 also its rigs
 ///   pcset <setting> <value>  a PC setting (`Setting_PC_...`) as if changed in the SETTINGS screen
 ///   convars                  the PC settings' title console variables and their values
+///   convar <name> <value>    one of them set (`title`: the title's own again; tests)
 ///   shot <name>              screenshot of the next presented flip -> shot_<name>.png
 ///   dump                     dump all GPU images at the next flip
 ///   trace                    log every draw/dispatch of an upcoming flip (FRAME lines)
@@ -321,6 +323,12 @@ fn poll_control(path: &Path, offset: &mut u64) {
             "convars" => {
                 crate::pcsettings::convar::report();
                 Ok(())
+            }
+            "convar" => {
+                // `convar <name> <value|title>`: one of the PC settings' title console variables.
+                let name = parts.next().unwrap_or("");
+                let value = parts.next().unwrap_or("");
+                crate::pcsettings::convar::set_for_test(name, value)
             }
             "shot" => {
                 let name: String = parts.next().unwrap_or("x").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
@@ -1274,6 +1282,9 @@ fn main() {
     // Keyboard and mouse layout (written with the defaults when missing).
     input::init(&cfg.root.join("local-data").join("controls.txt"));
     pcsettings::init(cfg.root.join("local-data").join("pcsettings.txt"));
+    // `DS_ACHIEVEMENTS_FILE`: another file (test runs: theirs, apart from a player's).
+    let achievements_file = std::env::var_os("DS_ACHIEVEMENTS_FILE").map(PathBuf::from).unwrap_or_else(|| cfg.root.join("local-data").join("achievements.txt"));
+    achievements::init(&cfg.app, achievements_file, "en-GB");
     // Compiled pipelines and learned shader specs: local-data, or the
     // `--cache` directory (Play.bat: one next to the package folder, so a
     // new package starts with what earlier ones learned on this machine).

@@ -79,9 +79,6 @@ pub fn items() -> Vec<Item> {
             kind: ItemKind::Choice(vec![s("Windowed"), s("Borderless Fullscreen")], 0),
         },
         toggle("SkipIntro", "Skip Intro Logos", "Skips the logos shown when the game starts (from the next start).", false),
-        toggle("DepthOfField", "Depth of Field", "Blurs what is far from the focus, as in the original.", true),
-        toggle("Bloom", "Bloom", "The glow around bright light.", true),
-        toggle("Vignette", "Vignette", "Darkens the corners of the image.", true),
         Item {
             id: "Sharpening",
             label: s("Sharpening"),
@@ -108,17 +105,6 @@ pub fn items() -> Vec<Item> {
 /// the port; at start and after every change. Settings at their defaults leave the title's own.
 pub fn apply() {
     let get = |id: &str| store::value(&format!("Setting_PC_{id}"));
-    let off = |id: &str| get(id) == Some(0);
-    let dof = off("DepthOfField");
-    convar::want("r_dofOverrideEnable", dof.then_some(1));
-    convar::want("r_dofFarAmount", dof.then_some(convar::float(0.0)));
-    convar::want("r_dofNearAmount", dof.then_some(convar::float(0.0)));
-    let bloom = off("Bloom");
-    convar::want("r_bloomOverrideEnable", bloom.then_some(1));
-    convar::want("r_bloomEnable", bloom.then_some(0));
-    let vignette = off("Vignette");
-    convar::want("r_vignetteOverrideEnable", vignette.then_some(1));
-    convar::want("r_vignetteScale", vignette.then_some(convar::float(0.0)));
     let aniso = match get("TextureFiltering") {
         Some(1) => 8,
         Some(2) => 16,

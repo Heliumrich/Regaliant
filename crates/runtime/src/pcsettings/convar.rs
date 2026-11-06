@@ -208,3 +208,24 @@ pub fn report() {
         .collect();
     crate::info!("pc settings: console variables: {}", lines.join("; "));
 }
+
+/// A variable set by name for a test (`convar <name> <value|title>`): the value parsed by the
+/// variable's kind; `title` puts the title's own back.
+pub fn set_for_test(name: &str, value: &str) -> Result<(), String> {
+    let i = index(name).ok_or_else(|| format!("no console variable {name} (known: {})", VARS.iter().map(|v| v.name).collect::<Vec<_>>().join(", ")))?;
+    let bits = if value == "title" {
+        None
+    } else {
+        Some(match VARS[i].kind {
+            Kind::Bool => match value {
+                "1" | "true" | "on" => 1,
+                "0" | "false" | "off" => 0,
+                _ => return Err(format!("bad bool '{value}'")),
+            },
+            Kind::Int => value.parse::<i32>().map_err(|_| format!("bad int '{value}'"))? as u32,
+            Kind::Float => value.parse::<f32>().map_err(|_| format!("bad float '{value}'"))?.to_bits(),
+        })
+    };
+    want(name, bits);
+    Ok(())
+}

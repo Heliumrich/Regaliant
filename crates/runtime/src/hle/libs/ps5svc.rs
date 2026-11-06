@@ -38,6 +38,25 @@ fn uds_free(p: u64) {
     if p != 0 && UDS_LIVE.lock().remove(&p) {
         drop(unsafe { Box::from_raw(p as *mut [u64; 8]) });
     }
+    if p != 0 {
+        let mut g = UDS_DATA.lock();
+        g.0.remove(&p);
+        g.1.remove(&p);
+    }
+}
+/// What the port keeps of the events (`achievements`): event handle -> (name, its property
+/// object), property object -> its top-level values.
+type UdsData = (std::collections::BTreeMap<u64, (String, u64)>, std::collections::BTreeMap<u64, Vec<(String, crate::achievements::Value)>>);
+static UDS_DATA: parking_lot::Mutex<UdsData> = parking_lot::Mutex::new((std::collections::BTreeMap::new(), std::collections::BTreeMap::new()));
+fn uds_set(obj: u64, key: *const u8, v: crate::achievements::Value) -> i32 {
+    if obj != 0 && !key.is_null() {
+        let k = cstr_or(key);
+        let mut g = UDS_DATA.lock();
+        let props = g.1.entry(obj).or_default();
+        props.retain(|(x, _)| *x != k);
+        props.push((k, v));
+    }
+    uds_check(obj)
 }
 fn uds_check(p: u64) -> i32 {
     if p == 0 { UDS_ERROR_INVALID_ARGUMENT } else { 0 }
@@ -181,7 +200,9 @@ sysv! {
     fn sceNpUniversalDataSystemCreateEvent(name: *const u8, props: u64, out: *mut u64, props_out: *mut u64) -> i32 {
         if name.is_null() || out.is_null() { return UDS_ERROR_INVALID_ARGUMENT; }
         *out = uds_alloc();
-        if !props_out.is_null() { *props_out = if props != 0 { props } else { uds_alloc() }; }
+        let p = if props != 0 { props } else { uds_alloc() };
+        if !props_out.is_null() { *props_out = p; }
+        UDS_DATA.lock().0.insert(*out, (cstr_or(name), p));
         0
     }
     fn sceNpUniversalDataSystemDestroyEvent(ev: u64) -> i32 { uds_free(ev); 0 }
@@ -197,10 +218,10 @@ sysv! {
         0
     }
     fn sceNpUniversalDataSystemDestroyEventPropertyArray(arr: u64) -> i32 { uds_free(arr); 0 }
-    fn sceNpUniversalDataSystemEventPropertyObjectSetString(obj: u64, key: *const u8, v: *const u8) -> i32 { uds_check(obj) }
-    fn sceNpUniversalDataSystemEventPropertyObjectSetInt32(obj: u64, key: *const u8, v: i32) -> i32 { uds_check(obj) }
-    fn sceNpUniversalDataSystemEventPropertyObjectSetUInt32(obj: u64, key: *const u8, v: u32) -> i32 { uds_check(obj) }
-    fn sceNpUniversalDataSystemEventPropertyObjectSetUInt64(obj: u64, key: *const u8, v: u64) -> i32 { uds_check(obj) }
+    fn sceNpUniversalDataSystemEventPropertyObjectSetString(obj: u64, key: *const u8, v: *const u8) -> i32 { uds_set(obj, key, crate::achievements::Value::Str(cstr_or(v))) }
+    fn sceNpUniversalDataSystemEventPropertyObjectSetInt32(obj: u64, key: *const u8, v: i32) -> i32 { uds_set(obj, key, crate::achievements::Value::Int(v as i64)) }
+    fn sceNpUniversalDataSystemEventPropertyObjectSetUInt32(obj: u64, key: *const u8, v: u32) -> i32 { uds_set(obj, key, crate::achievements::Value::Int(v as i64)) }
+    fn sceNpUniversalDataSystemEventPropertyObjectSetUInt64(obj: u64, key: *const u8, v: u64) -> i32 { uds_set(obj, key, crate::achievements::Value::Int(v as i64)) }
     /// (object, key, array or NULL, *array used)
     fn sceNpUniversalDataSystemEventPropertyObjectSetArray(obj: u64, key: *const u8, v: u64, out: *mut u64) -> i32 {
         if !out.is_null() { *out = if v != 0 { v } else { uds_alloc() }; }
@@ -214,7 +235,15 @@ sysv! {
         uds_check(arr)
     }
     fn sceNpUniversalDataSystemPostEvent(ctx: i32, h: i32, ev: u64, options: u64) -> i32 {
-        stub_log("sceNpUniversalDataSystemPostEvent (offline: event discarded)", 0);
+        // The trophies' events reach the port's achievements; nothing goes to a network.
+        let e = {
+            let g = UDS_DATA.lock();
+            g.0.get(&ev).map(|(name, p)| (name.clone(), g.1.get(p).cloned().unwrap_or_default()))
+        };
+        if let Some((name, props)) = e {
+            crate::achievements::event(&name, &props);
+        }
+        stub_log("sceNpUniversalDataSystemPostEvent (offline: events reach the port's achievements, nothing else)", 0);
         0
     }
 
