@@ -400,6 +400,11 @@ pub struct Spec {
     /// is the same and only the marking's cost doubles: what it takes from
     /// live frames prices a leaner form.
     pub mark_twice: bool,
+    /// Exact ballast (diagnosis): two dependent loads of the SGPR data
+    /// before the user SGPRs, whose loads then depend on them (zero offsets
+    /// at run time): what fetching a stage's descriptors from memory at its
+    /// start would cost the GPU.
+    pub dep_loads: bool,
     /// With `write_marks`, the lanes of a store that mark one map word OR
     /// their bits by a partitioned reduction (OpGroupNonUniformPartitionEXT:
     /// the device offers VK_NV_shader_subgroup_partitioned), the
@@ -544,6 +549,9 @@ impl std::hash::Hash for Spec {
         }
         if self.mark_twice {
             0x4D32_5458u32.hash(state);
+        }
+        if self.dep_loads {
+            0x4445_504Cu32.hash(state);
         }
         if self.marks_part {
             0x4D50_5254u32.hash(state);
@@ -3057,8 +3065,34 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     };
     tr.set_sreg(crate::OP_EXEC_LO as u32, exec_lo)?;
     tr.set_sreg(crate::OP_EXEC_HI as u32, exec_hi)?;
+    // (`Spec::dep_loads`: the program address's high dword shifted right
+    // by 16, zero for every user-space address (below 2^47), read twice, the
+    // second at an index the first gives, offsets every user SGPR's index.)
+    let dep = if spec.dep_loads {
+        let hi = tr.code_base_at + 1;
+        let eight = tr.u(16);
+        let k1 = tr.u(hi);
+        let k1 = tr.sgpr_index(k1)?;
+        let w1 = tr.sgpr_raw(k1)?;
+        let d1 = e(tr.b.shift_right_logical(tr.t.u32, None, w1, eight))?;
+        let k2 = tr.u(hi);
+        let k2 = e(tr.b.i_add(tr.t.u32, None, k2, d1))?;
+        let k2 = tr.sgpr_index(k2)?;
+        let w2 = tr.sgpr_raw(k2)?;
+        Some(e(tr.b.shift_right_logical(tr.t.u32, None, w2, eight))?)
+    } else {
+        None
+    };
     for i in 0..spec.user_sgprs.min(SGPR_DATA_USER as u16) as u32 {
-        let v = tr.sgpr_data(i)?;
+        let v = match dep {
+            Some(d) => {
+                let k = tr.u(i);
+                let k = e(tr.b.i_add(tr.t.u32, None, k, d))?;
+                let k = tr.sgpr_index(k)?;
+                tr.sgpr_raw(k)?
+            }
+            None => tr.sgpr_data(i)?,
+        };
         tr.set_sreg(spec.user_base as u32 + i, v)?;
     }
     if spec.addresses {
@@ -4077,6 +4111,7 @@ mod tests {
             marks_untouched: false,
             touch_test: false,
             mark_twice: false,
+            dep_loads: false,
             marks_part: false,
             sgpr_ubo: 0,
             gpu_loads: 0,
