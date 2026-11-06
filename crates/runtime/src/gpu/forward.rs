@@ -145,6 +145,37 @@ struct Roles {
     cb: usize,
 }
 
+/// The copy kernel's code hash once recognized (0: not yet).
+static COPY_HASH: AtomicU64 = AtomicU64::new(0);
+
+/// Recent copy-kernel dispatches of every queue (diagnostics of copies that
+/// did not land): (queue, destination, bytes, flip), the newest last.
+static RECENT_COPIES: Mutex<std::collections::VecDeque<(Arc<str>, u64, u64, u64)>> = Mutex::new(std::collections::VecDeque::new());
+
+/// A dispatch of `p` on queue `queue` (`exec`, every queue): a copy
+/// kernel's goes into `RECENT_COPIES` with its destination.
+pub fn note_dispatch(p: &Prepared, groups: [u32; 3], queue: &str) {
+    let h = COPY_HASH.load(Ordering::Acquire);
+    if h == 0 || p.code_hash != h {
+        return;
+    }
+    let Some(r) = roles(p) else { return };
+    let Some(Resolved::Buffer(dst)) = p.found.resources.get(r.dst) else { return };
+    let bytes = (groups[0] as u64 * 64).min(dst.num_records as u64) * 4;
+    let mut g = RECENT_COPIES.lock();
+    if g.len() >= 512 {
+        g.pop_front();
+    }
+    g.push_back((Arc::from(queue), dst.base, bytes, super::FRAMES.load(Ordering::Relaxed)));
+}
+
+/// The recent copies over [a, a+n) (`RECENT_COPIES`), newest first.
+fn copies_over(a: u64, n: u64) -> String {
+    let g = RECENT_COPIES.lock();
+    let v: Vec<String> = g.iter().rev().filter(|c| c.1 < a + n && a < c.1 + c.2).take(8).map(|c| format!("{} {:#x}+{:#x} at flip {}", c.0, c.1, c.2, c.3)).collect();
+    if v.is_empty() { "none in the ring".into() } else { v.join("; ") }
+}
+
 /// Recognition per program code hash (Some: the copy kernel).
 static PROGRAMS: Mutex<Option<HashMap<u64, Option<Roles>>>> = Mutex::new(None);
 /// (program hash, destination) pairs whose forwarded words once differed
@@ -582,6 +613,7 @@ fn roles(p: &Prepared) -> Option<Roles> {
     }
     let r = recognize(insts, &p.found.tr.plan);
     if r.is_some() {
+        COPY_HASH.store(key, Ordering::Release);
         crate::info!("gpu: cs {:#x} (code hash {key:#018x}) is a guarded modulo copy: its results are forwarded to later reads (`tune forward_copies`)", p.addr);
     }
     PROGRAMS.lock().get_or_insert_with(HashMap::new).insert(key, r);
@@ -973,6 +1005,18 @@ pub fn completed(done: u64) {
         STATS[5].fetch_add(e.words.len() as u64 - differ - rewritten, Ordering::Relaxed);
         if let Some((k, w, now)) = first {
             STATS[6].fetch_add(differ, Ordering::Relaxed);
+            // A few words (at most 2, or 1 in 512) as before: memory missed
+            // them, not the forwarded result (the rest landed as computed; a
+            // write of the previous frame's block over the copy's in the two
+            // Doran boots of 2026-11-06, the source unchanged): the
+            // destination stays forwarded, its readers taking the words the
+            // copy computes rather than memory's (refusing it slowed those
+            // boots 5-10% for good). Logged and counted (`TOLERATED`).
+            let few = differ <= 2.max(e.words.len() as u64 / 512);
+            if few {
+                TOLERATED[0].fetch_add(1, Ordering::Relaxed);
+                TOLERATED[1].fetch_add(differ, Ordering::Relaxed);
+            }
             static LOGGED: AtomicU64 = AtomicU64::new(0);
             if LOGGED.fetch_add(1, Ordering::Relaxed) < 20 {
                 // What changed since the copy was recorded: its source, its
@@ -987,7 +1031,7 @@ pub fn completed(done: u64) {
                 let src_changed = src_now.iter().zip(&f.src_words).filter(|(a, b)| a != b).count();
                 let cb_now = if super::cp::guest_readable(f.cb, 8) { unsafe { [std::ptr::read_volatile(f.cb as *const u32), std::ptr::read_volatile((f.cb + 4) as *const u32)] } } else { [0, 0] };
                 crate::warn!(
-                    "gpu: forwarded copy to {:#x} (cs {:#x}, batch {}): {differ} of {} words still as before the copy after it ran, first dword {k}: forwarded {w:#x}, memory {now:#x}; source {:#x} ({} words, stride {}): {src_changed} words changed since recorded{}; control block {:#x}: count {} modulus {} when recorded, {} {} now; last CP write to the source: {}; destination bound {} by {}, in a home now: {}, home write-backs since: {}; this destination is no longer forwarded",
+                    "gpu: forwarded copy to {:#x} (cs {:#x}, batch {}): {differ} of {} words still as before the copy after it ran, first dword {k}: forwarded {w:#x}, memory {now:#x}; source {:#x} ({} words, stride {}): {src_changed} words changed since recorded{}; control block {:#x}: count {} modulus {} when recorded, {} {} now; last CP write to the source: {}; destination bound {} by {}, in a home now: {}, home write-backs since: {}; {}",
                     e.base,
                     e.program,
                     e.seq,
@@ -1005,13 +1049,21 @@ pub fn completed(done: u64) {
                     e.how,
                     e.queue,
                     super::homes::overlaps(e.base, 4 * e.words.len() as u64),
-                    super::homes::WRITE_BACKS.load(Ordering::Relaxed).saturating_sub(e.write_backs)
+                    super::homes::WRITE_BACKS.load(Ordering::Relaxed).saturating_sub(e.write_backs),
+                    if few { "the destination stays forwarded (a few words)" } else { "this destination is no longer forwarded" }
                 );
+                crate::warn!("gpu: the recent copies over {:#x} (now flip {}): {}", e.base, super::FRAMES.load(Ordering::Relaxed), copies_over(e.base, 4 * e.words.len() as u64));
             }
-            DISTRUSTED.lock().get_or_insert_with(HashSet::new).insert((e.hash, e.base));
+            if !few {
+                DISTRUSTED.lock().get_or_insert_with(HashSet::new).insert((e.hash, e.base));
+            }
         }
     }
 }
+
+/// Copies whose few words still as before after they ran kept their
+/// destination forwarded: [copies, words].
+static TOLERATED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Batches up to `done` completed: their workers' buffer updates are
 /// compared with memory.
@@ -1064,8 +1116,11 @@ pub fn status_line() -> String {
     }
     let k: Vec<u64> = CHECK_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    forwarded copies: {} made ({} not: inputs still written or odd shapes), {} ended by later writes, {} by the title's rewrites, {} retired after their batch ({} into a video-memory home, not compared); {} words served, {} stage reads with no wait for the copy; after the copies ran {} words equal, {} as before the copy (it did not land), {} rewritten since; checked after their batches {} ({} words; {} words equal, {} as before, {} rewritten; {} checks ended by later writes); past parallel runs {} (published {}, dropped {})\n",
-        s[0], s[7], s[1], s[8], s[2], s[10], s[3], s[4], s[5], s[6], s[9], k[0], k[1], k[2], k[3], k[4], k[5],
+        "    forwarded copies: {} made ({} not: inputs still written or odd shapes), {} ended by later writes, {} by the title's rewrites, {} retired after their batch ({} into a video-memory home, not compared); {} words served, {} stage reads with no wait for the copy; after the copies ran {} words equal, {} as before the copy (it did not land; {} copies of a few such words kept forwarded, {} words), {} rewritten since; checked after their batches {} ({} words; {} words equal, {} as before, {} rewritten; {} checks ended by later writes); past parallel runs {} (published {}, dropped {})\n",
+        s[0], s[7], s[1], s[8], s[2], s[10], s[3], s[4], s[5], s[6],
+        TOLERATED[0].load(Ordering::Relaxed),
+        TOLERATED[1].load(Ordering::Relaxed),
+        s[9], k[0], k[1], k[2], k[3], k[4], k[5],
         HELD_STATS[0].load(Ordering::Relaxed),
         HELD_STATS[1].load(Ordering::Relaxed),
         HELD_STATS[2].load(Ordering::Relaxed)

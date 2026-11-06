@@ -15447,6 +15447,11 @@ impl Exec {
             }
         }
         lap.mark(15);
+        // (Diagnostics of copies that did not land: every queue's copy
+        // kernel dispatches, `forward::note_dispatch`.)
+        if indirect.is_none() {
+            super::forward::note_dispatch(&p, groups, &self.name);
+        }
         if forward_here {
             let busy = |r: &[(u64, u64)]| self.overlaps_pending_ro(r) || INFLIGHT.latest(r).is_some() || CP_WRITES.latest(r).is_some();
             let computed = super::forward::compute(&p, groups, local, busy);
