@@ -1564,6 +1564,7 @@ fn take_page(g: &mut Backing, m: &Mirror, alloc_ns: &mut u64, marks: bool) -> Re
             let ai = if c.device_addresses { ai.push_next(&mut fl) } else { ai };
             let ta = std::time::Instant::now();
             let mem = unsafe { c.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory (mirror block): {e}"))?;
+            super::vk::note_alloc("a mirror block", BLOCK, ta);
             *alloc_ns += ta.elapsed().as_nanos() as u64;
             g.mems.push(mem);
             g.block_used.push(0);
@@ -1776,8 +1777,14 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
                 super::vk::note_submit("vkQueueBindSparse", t0, t1);
                 r
             };
+            let tw = std::time::Instant::now();
             let r = r.map_err(|e| format!("vkQueueBindSparse: {e}")).and_then(|_| unsafe { c.device.wait_for_fences(&[fence], true, u64::MAX) }.map_err(|e| format!("bind fence: {e}")));
             unsafe { c.device.destroy_fence(fence, None) };
+            // (`DS_IMPORT_LOG=1`: each bind with its wait, beside the imports and submissions.)
+            static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *LOG.get_or_init(|| std::env::var("DS_IMPORT_LOG").ok().as_deref() == Some("1")) {
+                crate::info!("gpu: sparse bind of {} pages: call and wait {} us (wait {} us)", binds.len(), tb.elapsed().as_micros(), tw.elapsed().as_micros());
+            }
             // The maps' new bit pages zeroed before their mirror pages count
             // as backed (no shader marks them before that).
             match (r, sm) {

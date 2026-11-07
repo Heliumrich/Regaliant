@@ -1113,6 +1113,28 @@ pub fn completed(done: u64) {
                 // memory mapped there now.)
                 let unmaps = crate::mem::unmaps_covering(e.base);
                 crate::warn!("gpu: unmaps covering {:#x}: {}", e.base, if unmaps.is_empty() { "none noted".to_string() } else { unmaps.join("; ") });
+                // The same words in the mirror (where the GPU's copy wrote
+                // them): the copy's there means the write-back lost them,
+                // the old ones that the copy never wrote there (later copies
+                // into the block may have written it since). Read on a thread
+                // of its own: the completion thread must not wait for the GPU
+                // (batches may wait for its signals).
+                let a = (e.base + 4 * k as u64) & !15;
+                let first = ((a - e.base) / 4) as usize;
+                let copied: Vec<u32> = e.words.iter().skip(first).take(4).copied().collect();
+                let before: Vec<u32> = e.old.iter().skip(first).take(4).copied().collect();
+                if (super::resident::MIRROR_BASE..super::resident::MIRROR_END).contains(&a) {
+                    let _ = std::thread::Builder::new().name("forward-check".into()).spawn(move || {
+                        let hex = |v: &[u32]| v.iter().map(|w| format!("{w:#x}")).collect::<Vec<_>>().join(" ");
+                        match super::resident::readback_now(a, 16) {
+                            Ok(b) => {
+                                let m: Vec<u32> = b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                crate::warn!("gpu: the mirror at {a:#x} after the copy that did not land: {} (the copy's {}, before it {})", hex(&m), hex(&copied), hex(&before));
+                            }
+                            Err(err) => crate::warn!("gpu: the mirror at {a:#x} not read back: {err}"),
+                        }
+                    });
+                }
             }
             if !keep {
                 DISTRUSTED.lock().get_or_insert_with(HashSet::new).insert((e.hash, e.base));

@@ -110,7 +110,10 @@ fn slab_size() -> u64 {
 
 fn allocate(ty: u32, size: u64) -> Result<vk::DeviceMemory, vk::Result> {
     let ai = vk::MemoryAllocateInfo::default().allocation_size(size).memory_type_index(ty);
-    unsafe { ctx().device.allocate_memory(&ai, None) }
+    let t0 = std::time::Instant::now();
+    let r = unsafe { ctx().device.allocate_memory(&ai, None) };
+    super::vk::note_alloc("an image slab", size, t0);
+    r
 }
 
 /// Memory of its own, as images had before slabs.

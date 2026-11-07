@@ -424,8 +424,17 @@ pub(crate) fn imports_may_cover(base: u64, len: u64) -> bool {
     }
     drop(g);
     let Some(gy) = GRAVEYARD.try_lock() else { return true };
-    gy.iter().any(|d| d.span.start < end && base < d.span.end)
+    if gy.iter().any(|d| d.span.start < end && base < d.span.end) {
+        return true;
+    }
+    drop(gy);
+    let Some(f) = FREEING.try_lock() else { return true };
+    f.iter().any(|&(s, e)| s < end && base < e)
 }
+
+/// Dropped imports being freed outside the graveyard's lock (`reap_dead_spans`):
+/// their guest ranges, pinned until then.
+static FREEING: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 /// Frees dropped imports and images no batch can use any more (completion
 /// thread), evicts images when video memory runs short, then decommits the
@@ -546,30 +555,52 @@ fn reap_dead_spans() {
     let oldest_open = EXEC_GENS.lock().iter().map(|g| g.load(Ordering::SeqCst)).min().unwrap_or(u64::MAX);
     let next = NEXT_SEQ.load(Ordering::SeqCst);
     let done = done_seq();
-    let mut g = GRAVEYARD.lock();
-    g.retain_mut(|d| {
-        if d.held {
-            return true;
-        }
-        if d.seq.is_none() && oldest_open >= d.generation {
-            // Every batch that may use it was submitted by now.
-            d.seq = Some(next - 1);
-        }
-        match d.seq {
-            Some(s) if done >= s && !DEVICE_LOST.load(Ordering::Relaxed) => {
-                super::vk::note_gpu_freed(d.span.buffer);
-                unsafe {
-                    ctx().device.destroy_buffer(d.span.buffer, None);
-                    ctx().device.free_memory(d.span.mem, None);
-                }
-                SPANS_FREED[0].fetch_add(1, Ordering::Relaxed);
-                SPANS_FREED[1].fetch_add(d.span.end - d.span.start, Ordering::Relaxed);
-                false
+    // Taken out under the graveyard's lock and freed outside it (the
+    // driver's unpinning took up to tens of milliseconds a batch of them,
+    // and a recording thread meeting a remap waits for that lock to bury
+    // its windows); listed in FREEING meanwhile (`imports_may_cover`).
+    let free: Vec<Span> = {
+        let mut g = GRAVEYARD.lock();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < g.len() {
+            let d = &mut g[i];
+            if !d.held && d.seq.is_none() && oldest_open >= d.generation {
+                // Every batch that may use it was submitted by now.
+                d.seq = Some(next - 1);
             }
-            _ => true,
+            if !d.held && d.seq.is_some_and(|s| done >= s) && !DEVICE_LOST.load(Ordering::Relaxed) {
+                out.push(g.swap_remove(i).span);
+            } else {
+                i += 1;
+            }
         }
-    });
-    GRAVEYARD_LEN.store(g.len() as u64, Ordering::Release);
+        GRAVEYARD_LEN.store(g.len() as u64, Ordering::Release);
+        if !out.is_empty() {
+            FREEING.lock().extend(out.iter().map(|s| (s.start, s.end)));
+        }
+        out
+    };
+    if free.is_empty() {
+        return;
+    }
+    for span in &free {
+        super::vk::note_gpu_freed(span.buffer);
+        let t = std::time::Instant::now();
+        unsafe {
+            ctx().device.destroy_buffer(span.buffer, None);
+            ctx().device.free_memory(span.mem, None);
+        }
+        if import_log() {
+            crate::info!("gpu: freed import {:#x}..{:#x} ({} MiB) in {} us", span.start, span.end, (span.end - span.start) >> 20, t.elapsed().as_micros());
+        }
+        SPANS_FREED[0].fetch_add(1, Ordering::Relaxed);
+        SPANS_FREED[1].fetch_add(span.end - span.start, Ordering::Relaxed);
+        let mut f = FREEING.lock();
+        if let Some(k) = f.iter().position(|&r| r == (span.start, span.end)) {
+            f.swap_remove(k);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

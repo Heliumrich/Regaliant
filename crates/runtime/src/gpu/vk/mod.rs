@@ -796,6 +796,15 @@ impl Ctx {
     }
 }
 
+/// `DS_IMPORT_LOG=1` (diagnosis): a memory allocation logged with its time, to line the
+/// driver's submission stalls up with the allocations beside them.
+pub fn note_alloc(what: &str, size: u64, t0: std::time::Instant) {
+    static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *LOG.get_or_init(|| std::env::var("DS_IMPORT_LOG").ok().as_deref() == Some("1")) {
+        crate::info!("gpu: allocated {what} ({} KiB) in {} us", size >> 10, t0.elapsed().as_micros());
+    }
+}
+
 /// A main-queue call that took 2 ms or more (the queue's lock from `t0` to `t1`, the call after
 /// it) as a hitch cause, with the pipeline creations running meanwhile (diagnosis: submissions
 /// stalled while the driver compiles).
@@ -805,6 +814,11 @@ pub fn note_submit(what: &'static str, t0: std::time::Instant, t1: std::time::In
         return;
     }
     let lock = t1 - t0;
+    // (`DS_IMPORT_LOG=1`: each such call logged, to line up with the imports logged beside it.)
+    static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *LOG.get_or_init(|| std::env::var("DS_IMPORT_LOG").ok().as_deref() == Some("1")) {
+        crate::info!("gpu: {what} took {} us (queue lock {} us)", all.as_micros(), lock.as_micros());
+    }
     crate::gpu::hitch::note_since(crate::gpu::hitch::Kind::GpuWait, t0, || {
         format!(
             "{what} held up: queue lock {:.1} ms, call {:.1} ms; pipeline creations running {}",
@@ -1092,7 +1106,10 @@ impl Ctx {
     pub fn alloc(&self, req: vk::MemoryRequirements, want: vk::MemoryPropertyFlags) -> Result<vk::DeviceMemory, String> {
         let ty = self.memory_type(req.memory_type_bits, want).ok_or("no suitable memory type")?;
         let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty);
-        unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory({}): {e}", req.size))
+        let t0 = std::time::Instant::now();
+        let r = unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory({}): {e}", req.size));
+        note_alloc("memory", req.size, t0);
+        r
     }
 
     /// `alloc` for buffer memory: with bufferDeviceAddress the buffers bound
@@ -1104,7 +1121,10 @@ impl Ctx {
         let ty = self.memory_type(req.memory_type_bits, want).ok_or("no suitable memory type")?;
         let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
         let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty).push_next(&mut fl);
-        unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory({}): {e}", req.size))
+        let t0 = std::time::Instant::now();
+        let r = unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory({}): {e}", req.size));
+        note_alloc("buffer memory", req.size, t0);
+        r
     }
 
     /// Usage flags for a buffer that shaders may address (`Spec::addresses`).
@@ -1291,15 +1311,42 @@ impl Ctx {
         let ws: Vec<vk::SemaphoreSubmitInfo> = waits.iter().map(|&(s, v, st)| vk::SemaphoreSubmitInfo::default().semaphore(s).value(v).stage_mask(st)).collect();
         let mut ss: Vec<vk::SemaphoreSubmitInfo> = signals.iter().map(|&(s, v)| vk::SemaphoreSubmitInfo::default().semaphore(s).value(v).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)).collect();
         if on_copy {
+            let t0 = std::time::Instant::now();
             let q = self.copy.as_ref().ok_or("no copy queue")?.queue.lock();
+            let t1 = std::time::Instant::now();
             let si = vk::SubmitInfo2::default().command_buffer_infos(&cbs).wait_semaphore_infos(&ws).signal_semaphore_infos(&ss);
-            return unsafe { self.device.queue_submit2(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit2: {e}"));
+            let r = unsafe { self.device.queue_submit2(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit2: {e}"));
+            drop(q);
+            note_submit("vkQueueSubmit2 (copy queue)", t0, t1);
+            return r;
         }
         if on_compute {
+            let t0 = std::time::Instant::now();
             let q = self.compute.as_ref().ok_or("no compute queue")?.queue.lock();
+            let t1 = std::time::Instant::now();
             let si = vk::SubmitInfo2::default().command_buffer_infos(&cbs).wait_semaphore_infos(&ws).signal_semaphore_infos(&ss);
-            return unsafe { self.device.queue_submit2(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit2 (compute queue): {e}"));
+            let r = unsafe { self.device.queue_submit2(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit2 (compute queue): {e}"));
+            drop(q);
+            note_submit("vkQueueSubmit2 (compute queue)", t0, t1);
+            return r;
         }
+        // (`DS_IMPORT_LOG=1`, diagnosis: the waits not yet signalled when
+        // the submission is made, logged with a slow one: a wait before its
+        // signal may hold the driver's submission up.)
+        static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let log = *LOG.get_or_init(|| std::env::var("DS_IMPORT_LOG").ok().as_deref() == Some("1"));
+        let unsignalled: Vec<String> = if log {
+            waits
+                .iter()
+                .filter_map(|&(s, v, _)| {
+                    let now = unsafe { self.device.get_semaphore_counter_value(s) }.unwrap_or(u64::MAX);
+                    let name = if s == self.cpu_done { "cpu effects" } else if s == self.batches { "main batches" } else if self.compute.as_ref().is_some_and(|c| c.batches == s) { "compute queue" } else { "other" };
+                    (now < v).then(|| format!("{name} {v} (at {now})"))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let t0 = std::time::Instant::now();
         let q = self.queue.lock();
         let t1 = std::time::Instant::now();
@@ -1308,6 +1355,9 @@ impl Ctx {
         let r = unsafe { self.device.queue_submit2(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit2: {e}"));
         drop(q);
         note_submit("vkQueueSubmit2", t0, t1);
+        if log && t0.elapsed().as_micros() >= 2000 {
+            crate::info!("gpu: the slow submission had {} command buffers, {} waits ({} not signalled when made: {})", cmds.len(), waits.len(), unsignalled.len(), unsignalled.join(", "));
+        }
         r
     }
 
