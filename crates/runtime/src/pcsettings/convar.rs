@@ -97,6 +97,9 @@ unsafe fn write(kind: Kind, at: u64, bits: u32) {
 struct State {
     /// Wanted value (bits) per var; `None`: the title's own.
     want: Vec<Option<u32>>,
+    /// A float variable wanted as the title's own value times this factor (`want_scaled`),
+    /// where no fixed value is wanted.
+    scale: Vec<Option<f32>>,
     /// The title's own value, read before the first write.
     orig: Vec<Option<u32>>,
     /// What the port wrote last.
@@ -125,7 +128,7 @@ pub fn init(base: u64, image: &[u8]) {
     } else {
         crate::warn!("pc settings: console variables not where expected (another title version?), left alone: {}", bad.join(", "));
     }
-    *STATE.lock() = Some(State { want: vec![None; VARS.len()], orig: vec![None; VARS.len()], wrote: vec![None; VARS.len()] });
+    *STATE.lock() = Some(State { want: vec![None; VARS.len()], scale: vec![None; VARS.len()], orig: vec![None; VARS.len()], wrote: vec![None; VARS.len()] });
     // The stored PC settings (read before the executable loaded).
     super::apply();
 }
@@ -157,6 +160,28 @@ pub fn want(name: &str, bits: Option<u32>) {
     }
 }
 
+/// Wants a float variable at the title's own value times `factor` (`None`: no scaling), applied at
+/// the next `tick`; the title's own value follows the title's later writes (its setting changed).
+pub fn want_scaled(name: &str, factor: Option<f32>) {
+    let Some(i) = index(name) else {
+        crate::warn!("pc settings: no console variable {name}");
+        return;
+    };
+    if let Some(s) = STATE.lock().as_mut() {
+        if s.scale[i] != factor {
+            s.scale[i] = factor;
+            DIRTY.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A scaled value as the port writes it: one bit off the plain value, -0.0 for zero. The title's
+/// own later write of the plain value (its setting moved there, as the Motion Blur slider to 0
+/// while the mouse blur is Off) then differs from the port's and is taken as its new own value.
+fn marked(v: f32) -> u32 {
+    if v == 0.0 { (-0.0f32).to_bits() } else { v.to_bits() ^ 1 }
+}
+
 fn fmt(kind: Kind, bits: u32) -> String {
     match kind {
         Kind::Bool => ((bits & 0xff) != 0).to_string(),
@@ -170,7 +195,7 @@ fn fmt(kind: Kind, bits: u32) -> String {
 /// display mode changes (its render configs: the tessellation), as the render scale's pulses do.
 pub fn tick() {
     static TICKS: AtomicU64 = AtomicU64::new(0);
-    if TICKS.fetch_add(1, Ordering::Relaxed) % 120 == 119 && STATE.lock().as_ref().is_some_and(|s| s.want.iter().any(Option::is_some)) {
+    if TICKS.fetch_add(1, Ordering::Relaxed) % 120 == 119 && STATE.lock().as_ref().is_some_and(|s| s.want.iter().any(Option::is_some) || s.scale.iter().any(Option::is_some)) {
         DIRTY.store(true, Ordering::Relaxed);
     }
     if !DIRTY.load(Ordering::Relaxed) {
@@ -189,8 +214,10 @@ pub fn tick() {
         }
         let obj = base + var.obj;
         let built = unsafe { (obj as *const u64).read_volatile() } != 0;
-        let target = s.want[i].or(if s.wrote[i].is_some() { s.orig[i] } else { None });
-        let Some(target) = target else { continue };
+        let scaled = var.kind == Kind::Float && s.want[i].is_none() && s.scale[i].is_some();
+        if s.want[i].is_none() && !scaled && s.wrote[i].is_none() {
+            continue;
+        }
         if !built {
             waiting = true;
             continue;
@@ -204,7 +231,19 @@ pub fn tick() {
             if storage.is_none() {
                 crate::info!("pc settings: {} has no storage in the render settings (its own value only)", var.name);
             }
+        } else if s.wrote[i].is_none() {
+            // No write of the port's outstanding: the value now is the title's own (its setting
+            // may have changed meanwhile).
+            s.orig[i] = Some(cur);
+        } else if s.wrote[i].is_some_and(|w| cur != w) {
+            // The title wrote it since the port did (its own setting changed): its new own value.
+            s.orig[i] = Some(cur);
+            crate::info!("pc settings: {} set by the title to {}", var.name, fmt(var.kind, cur));
         }
+        let target = s.want[i]
+            .or_else(|| if scaled { s.orig[i].map(|o| marked(f32::from_bits(o) * s.scale[i].unwrap_or(1.0))) } else { None })
+            .or(if s.wrote[i].is_some() { s.orig[i] } else { None });
+        let Some(target) = target else { continue };
         if cur != target || own_cur != target || s.wrote[i] != Some(target) {
             unsafe {
                 write(var.kind, own, target);
@@ -218,7 +257,7 @@ pub fn tick() {
                 fmt(var.kind, target),
                 s.orig[i].map(|o| fmt(var.kind, o)).unwrap_or_default()
             );
-            s.wrote[i] = if s.want[i].is_some() { Some(target) } else { None };
+            s.wrote[i] = if s.want[i].is_some() || scaled { Some(target) } else { None };
         }
     }
     if !waiting {

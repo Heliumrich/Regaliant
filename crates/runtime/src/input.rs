@@ -250,6 +250,10 @@ static STICKS: parking_lot::Mutex<Vec<(std::time::Instant, bool, i32, i32)>> = p
 /// Diagnosis (control channel `stick`): holds the left or right stick at
 /// (x, y) from the centre (-128..127, y down) for `dur`.
 pub fn hold_stick(right: bool, x: i32, y: i32, dur: std::time::Duration) {
+    // (A stick tilted past its dead zone makes the pad the device in use, as the pad's own does.)
+    if x.abs() > 24 || y.abs() > 24 {
+        note_device(DEVICE_PAD);
+    }
     let now = std::time::Instant::now();
     let mut g = STICKS.lock();
     g.retain(|s| s.0 > now);
@@ -901,9 +905,37 @@ pub fn inject_hold(name: &str, dur: Duration) -> Result<(), String> {
 /// wheel notches (up positive), as if reported by the window.
 pub fn inject_motion(dx: i64, dy: i64, wheel: i32) {
     use crate::gpu::vk::window::{MOUSE_DX, MOUSE_DY, MOUSE_WHEEL};
+    note_device(DEVICE_KBM);
     MOUSE_DX.fetch_add(dx, Relaxed);
     MOUSE_DY.fetch_add(dy, Relaxed);
     MOUSE_WHEEL.fetch_add(wheel * 120, Relaxed);
+}
+
+/// Diagnosis (control channel `mousemove`): steady mouse motion, counts a second, for a while,
+/// fed at every vblank (`motion_tick`) as a polled mouse delivers it.
+static MOTION: Mutex<Option<(f64, f64, Instant, Instant, f64, f64)>> = Mutex::new(None);
+
+pub fn inject_motion_for(dx_per_s: f64, dy_per_s: f64, dur: Duration) {
+    let now = Instant::now();
+    note_device(DEVICE_KBM);
+    *MOTION.lock() = Some((dx_per_s, dy_per_s, now + dur, now, 0.0, 0.0));
+}
+
+/// The vblank thread's tick: the steady motion's counts since the last tick.
+pub fn motion_tick() {
+    use crate::gpu::vk::window::{MOUSE_DX, MOUSE_DY};
+    let mut g = MOTION.lock();
+    let Some((vx, vy, until, last, fx, fy)) = *g else { return };
+    let now = Instant::now().min(until);
+    let dt = now.duration_since(last).as_secs_f64();
+    let (ax, ay) = (fx + vx * dt, fy + vy * dt);
+    let (ix, iy) = (ax.trunc(), ay.trunc());
+    MOUSE_DX.fetch_add(ix as i64, Relaxed);
+    MOUSE_DY.fetch_add(iy as i64, Relaxed);
+    if ix != 0.0 || iy != 0.0 {
+        note_device(DEVICE_KBM);
+    }
+    *g = if now >= until { None } else { Some((vx, vy, until, now, ax - ix, ay - iy)) };
 }
 
 /// Whether `src` is held: in the window or by the control channel (a sided

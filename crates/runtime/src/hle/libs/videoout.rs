@@ -119,6 +119,8 @@ fn vblank_thread() {
     let mut last_cap = 0;
     loop {
         // The PC settings' console variables (changed values, objects the title builds later).
+        crate::input::motion_tick();
+        crate::pcsettings::mouse_blur_tick();
         crate::pcsettings::convar::tick();
         crate::pcsettings::popup::tick();
         crate::pcsettings::pointer::tick();

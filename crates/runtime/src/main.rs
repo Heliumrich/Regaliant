@@ -618,6 +618,20 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 let ms = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(200);
                 input::inject_hold(name, Duration::from_millis(ms))
             }
+            "mousemove" => {
+                // Diagnosis: `mousemove <dx/s> <dy/s> <ms>` steady mouse motion (counts a second)
+                // fed at every vblank, as a polled mouse delivers it.
+                let dx = parts.next().and_then(|v| v.parse::<f64>().ok());
+                let dy = parts.next().and_then(|v| v.parse::<f64>().ok());
+                let ms = parts.next().and_then(|v| v.parse::<u64>().ok());
+                match (dx, dy, ms) {
+                    (Some(dx), Some(dy), Some(ms)) => {
+                        input::inject_motion_for(dx, dy, std::time::Duration::from_millis(ms));
+                        Ok(())
+                    }
+                    _ => Err("usage: mousemove <dx/s> <dy/s> <ms>".into()),
+                }
+            }
             "mouse" => {
                 // Diagnosis: `mouse <dx> <dy>` mouse motion in counts.
                 let dx = parts.next().and_then(|v| v.parse::<i64>().ok());

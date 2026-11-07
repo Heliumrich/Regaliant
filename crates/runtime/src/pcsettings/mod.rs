@@ -122,43 +122,43 @@ pub fn items() -> Vec<Item> {
         Item {
             id: s("WindowMode"),
             label: s("Window Mode"),
-            tooltip: s("Shows the game in a window or fullscreen without borders (Alt+Enter switches too)."),
+            tooltip: s("A window or borderless fullscreen. Alt+Enter switches too."),
             kind: ItemKind::Choice(vec![s("Windowed"), s("Borderless Fullscreen")], 0),
         },
         Item {
             id: s("AspectRatio"),
             label: s("Aspect Ratio"),
-            tooltip: s("The picture's shape, from the next start (16:9: the original's; Automatic follows the screen in fullscreen). Wider shapes show more to the sides, with the HUD at the screen's edges and movies and dialogs in the middle."),
+            tooltip: s("The picture's shape, from the next start."),
             kind: ItemKind::Choice(vec![s("Automatic"), s("16:9"), s("16:10"), s("21:9"), s("32:9")], 1),
         },
         Item {
             id: s("RenderScale"),
             label: s("Render Scale"),
-            tooltip: s("The resolution the game renders at: as its Visual Mode sets it (the original's), or a share of the window's or screen's (100%: its own resolution; at most 3840x2160). Lower runs faster, higher looks sharper."),
+            tooltip: s("Lower runs faster, higher looks sharper."),
             kind: ItemKind::Choice(std::iter::once(s("Visual Mode")).chain(RENDER_SCALES.iter().map(|p| format!("{p}%"))).collect(), 0),
         },
         Item {
             id: s("Sharpening"),
             label: s("Sharpening"),
-            tooltip: s("Sharpens the image shown (0.00: off, as in the original)."),
+            tooltip: s("Sharpens the image. 0 is off, as in the original."),
             kind: ItemKind::Slider { min: 0.0, max: 1.0, default: 0.0 },
         },
         Item {
             id: s("MouseSensitivity"),
             label: s("Mouse Sensitivity"),
-            tooltip: s("How far the camera turns per mouse movement (1.00: the controls file's own)."),
+            tooltip: s("How far the camera turns per mouse movement."),
             kind: ItemKind::Slider { min: 0.1, max: 3.0, default: 1.0 },
         },
         Item {
             id: s("AudioOutput"),
             label: s("Audio Output"),
-            tooltip: s("How the game's 3D sound is played: for headphones (both ears hear every sound, as around a head), stereo speakers, 5.1 or 7.1 surround speakers, or as 7.1 for Windows Sonic or Dolby Atmos to render for headphones (turn it on in Windows' sound settings). Automatic follows the device Windows plays on."),
+            tooltip: s("Headphones, speakers, surround or spatial sound."),
             kind: ItemKind::Choice(vec![s("Automatic"), s("Headphones"), s("Stereo Speakers"), s("5.1 Surround"), s("7.1 Surround"), s("Windows Sonic / Atmos")], 0),
         },
         Item {
             id: s("AudioDevice"),
             label: s("Audio Device"),
-            tooltip: s("The device the game's sound plays on (the system's default follows Windows)."),
+            tooltip: s("The device the sound plays on."),
             kind: ItemKind::AudioDevice,
         },
     ]
@@ -172,25 +172,25 @@ pub fn graphics_items() -> Vec<Item> {
         Item {
             id: s("QualityPreset"),
             label: s("Quality Preset"),
-            tooltip: s("Sets the render scale and the graphics settings together: Low and Medium for modest graphics cards, High as on the PS5, Ultra beyond it. Custom: settings changed one by one."),
+            tooltip: s("Sets all graphics settings. High matches the PS5."),
             kind: ItemKind::Preset(presets::NAMES.iter().map(|n| s(n)).collect()),
         },
         Item {
             id: s("GeometryDetail"),
             label: s("Geometry Detail"),
-            tooltip: s("How finely stone, earth and walls are shaped (tessellation): as the Visual Mode sets it (Performance: Standard; Cinematic: Very High), or Low, Standard, High (the PS5 Pro's), Very High and Ultra (beyond the PS5's). Higher costs the graphics card more."),
+            tooltip: s("How finely stone and walls are shaped. Higher costs more."),
             kind: ItemKind::Choice(vec![s("Visual Mode"), s("Low"), s("Standard"), s("High"), s("Very High"), s("Ultra")], 0),
         },
         Item {
             id: s("TextureFiltering"),
             label: s("Texture Filtering"),
-            tooltip: s("Sharper textures at an angle: anisotropic filtering above the original's."),
+            tooltip: s("Sharper textures at an angle."),
             kind: ItemKind::Choice(vec![s("As Original"), s("8x Anisotropic"), s("16x Anisotropic")], 0),
         },
         Item {
             id: s("AntiAliasing"),
             label: s("Anti-Aliasing"),
-            tooltip: s("The game's temporal anti-aliasing (TAA), or none: jagged, shimmering edges, and a softer image when the render scale is below the screen's (the TAA also upscales)."),
+            tooltip: s("Smooths jagged edges. Off makes edges shimmer."),
             kind: ItemKind::Choice(vec![s("TAA"), s("Off")], 0),
         },
         toggle("Bloom", "Bloom", "The glow around bright lights.", true),
@@ -198,7 +198,7 @@ pub fn graphics_items() -> Vec<Item> {
         Item {
             id: s("FrameRateLimit"),
             label: s("Frame Rate Limit"),
-            tooltip: s("60 FPS, as the original: a new frame at most at every refresh of a 60 Hz display (between 30 and 60, frames last one or two refreshes). 30 FPS: every frame two refreshes, for even motion. Uncapped: each frame shown as soon as it is done, as fast as the display refreshes (high-refresh and variable-refresh displays). The game's speed stays the same in all three."),
+            tooltip: s("60 FPS is the original. Uncapped shows frames as soon as they are ready."),
             kind: ItemKind::Choice(vec![s("30 FPS"), s("60 FPS"), s("Uncapped")], 1),
         },
     ]
@@ -215,24 +215,30 @@ pub fn game_items() -> Vec<Item> {
     let s = |v: &str| v.to_string();
     let toggle = |id: &str, label: &str, tooltip: &str, on| Item { id: s(id), label: s(label), tooltip: s(tooltip), kind: ItemKind::Toggle(on) };
     vec![
-        toggle("InvertMouseY", "Invert Mouse Y", "Inverts the mouse's vertical axis: moving it forward looks down.", false),
+        toggle("InvertMouseY", "Invert Mouse Y", "Moving the mouse forward looks down.", false),
+        Item {
+            id: s("MouseMotionBlur"),
+            label: s("Mouse Look Blur"),
+            tooltip: s("Motion blur with mouse and keyboard. A controller uses the game's own."),
+            kind: ItemKind::Choice(vec![s("As Game Setting"), s("Reduced"), s("Off")], 2),
+        },
         Item {
             id: s("ButtonPrompts"),
             label: s("Button Prompts"),
-            tooltip: s("The buttons the game shows: those of the device used last, or always one set."),
+            tooltip: s("Which buttons the game shows. Automatic follows the device you use."),
             kind: ItemKind::Choice(vec![s("Automatic"), s("PlayStation"), s("Xbox"), s("Keyboard & Mouse")], 0),
         },
-        toggle("SkipIntro", "Skip Intro Logos", "Skips the logos shown when the game starts (from the next start).", false),
+        toggle("SkipIntro", "Skip Intro Logos", "Skips the logos when the game starts.", false),
         Item {
             id: s("SaveFolder"),
             label: s("Save Folder"),
-            tooltip: s("Where the game keeps its saves, from the next start: in the game's own folder (local-data), or a Demon's Souls folder in Documents (under My Games) or in Saved Games. A folder without saves gets a copy of the current ones."),
+            tooltip: s("Where the game keeps its saves, from the next start."),
             kind: ItemKind::Choice(saves::FOLDERS.iter().map(|f| s(f)).collect(), 0),
         },
         Item {
             id: s("ImportSaves"),
             label: s("Import PS5 Saves"),
-            tooltip: s("Imports a decrypted PS5 save of this game at the next start: put its SAVEDATA0PlayerProfile0 (and SAVEDATA0OptionsProfile0) folders in the folder PS5 Saves next to the game. The saves it replaces are kept in save-backups."),
+            tooltip: s("Imports a decrypted PS5 save from the PS5 Saves folder at the next start."),
             kind: ItemKind::Choice(vec![s("No"), s("At Next Start")], 0),
         },
     ]
@@ -257,6 +263,7 @@ pub fn apply() {
     crate::input::PC_SENSITIVITY.store(sens.to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::input::PC_INVERT_Y.store(get("InvertMouseY") == Some(1), std::sync::atomic::Ordering::Relaxed);
     prompts::MODE.store(get("ButtonPrompts").unwrap_or(0).min(3) as u8, std::sync::atomic::Ordering::Relaxed);
+    MOUSE_BLUR.store(get("MouseMotionBlur").unwrap_or(2).min(2) as u8, std::sync::atomic::Ordering::Relaxed);
     let geo = GEOMETRY_DETAIL.get(get("GeometryDetail").unwrap_or(0) as usize).copied().flatten();
     convar::want("r_tessellationDensity", geo.map(|g| convar::float(g.0)));
     convar::want("r_tessellationFadeOutStart", geo.map(|g| convar::float(g.1)));
@@ -292,6 +299,41 @@ pub fn apply() {
     }
 }
 
+/// Mouse Look Blur: 0 the game's setting, 1 Reduced (MOUSE_BLUR_REDUCED of it), 2 Off (the
+/// default: at the default a mouse turn of 1,500 counts a second kept 10% of a still frame's
+/// detail, a tenth of the blur 49%, none 54%; at 4,000 a second 9%, 16% and 63%: FINDINGS.md 2026-11-07).
+pub static MOUSE_BLUR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+/// Reduced: the share of the game's Motion Blur kept while mouse and keyboard are in use.
+pub const MOUSE_BLUR_REDUCED: f32 = 0.1;
+
+/// Each flip (the vblank thread, before `convar::tick`): the game's motion blur scaled while
+/// mouse and keyboard are the device in use (`input::last_device`), the game's own otherwise.
+pub fn mouse_blur_tick() {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    static LAST: AtomicU8 = AtomicU8::new(u8::MAX);
+    let kbm = crate::input::last_device() == crate::input::DEVICE_KBM;
+    let choice = MOUSE_BLUR.load(Relaxed);
+    let state = if kbm { choice } else { 0 };
+    if LAST.swap(state, Relaxed) == state {
+        return;
+    }
+    let factor = match state {
+        1 => Some(MOUSE_BLUR_REDUCED),
+        2 => Some(0.0),
+        _ => None,
+    };
+    convar::want_scaled("r_motionBlurAmount", factor);
+    crate::info!(
+        "pc settings: motion blur {} ({})",
+        match state {
+            1 => "reduced",
+            2 => "off",
+            _ => "as the game's setting",
+        },
+        if kbm { "mouse and keyboard in use" } else { "the pad or nothing in use" }
+    );
+}
+
 /// The window mode the window opens with (the PC tab's; `None`: the window's own default).
 pub fn window_fullscreen() -> Option<bool> {
     store::value("Setting_PC_WindowMode").map(|m| m == 1)
@@ -314,7 +356,7 @@ pub fn tabs() -> Vec<Tab> {
         id: "PCTab",
         scene: "PCSettings",
         label: ("PC_SETTINGS_HEADING", "PC"),
-        tooltip: ("PC_SETTINGS_TOOLTIP_TAB", "Settings of the PC version: display, graphics, controls and sound."),
+        tooltip: ("PC_SETTINGS_TOOLTIP_TAB", "Settings of the PC version."),
         items: items(),
     }];
     let trophies = trophy_items();
@@ -323,7 +365,7 @@ pub fn tabs() -> Vec<Tab> {
             id: "PCTrophies",
             scene: "PCTrophies",
             label: ("PC_TROPHIES_HEADING", "TROPHIES"),
-            tooltip: ("PC_TROPHIES_TOOLTIP_TAB", "The game's trophies: those unlocked and those still to earn."),
+            tooltip: ("PC_TROPHIES_TOOLTIP_TAB", "The game's trophies."),
             items: trophies,
         });
     }
@@ -349,7 +391,7 @@ fn trophy_items() -> Vec<Item> {
             (all > 0).then(|| Item {
                 id: format!("TrophyCount{g}"),
                 label: format!("{} Trophies", grade_name(g)),
-                tooltip: format!("The {} trophies unlocked. All Trophies lists every trophy.", grade_name(g).to_lowercase()),
+                tooltip: format!("The {} trophies unlocked.", grade_name(g).to_lowercase()),
                 kind: ItemKind::Count(g, all),
             })
         })
@@ -805,7 +847,7 @@ fn pad_binding_items() -> Vec<Item> {
         .map(|(n, (_, name))| Item {
             id: format!("PadBind{n}"),
             label: name.to_string(),
-            tooltip: "Press A (or Enter, or click) and then the controller button for this action; Esc cancels. Left and Right go through the buttons one by one. The button's old action goes to this action's old button.".into(),
+            tooltip: "Press A, then the new button. Esc cancels.".into(),
             kind: ItemKind::PadBinding(n as u16),
         })
         .collect()
@@ -841,7 +883,7 @@ fn binding_items() -> Vec<Item> {
         .map(|(n, (_, name))| Item {
             id: format!("Bind{n}"),
             label: name.to_string(),
-            tooltip: "Press Enter (or click) and then the key, mouse button or wheel turn for this action; Esc cancels. Left and Right go through them one by one. An input another action used goes to that action in exchange.".into(),
+            tooltip: "Press Enter, then the new key or mouse button. Esc cancels.".into(),
             kind: ItemKind::Binding(n as u16),
         })
         .collect()
@@ -1065,8 +1107,8 @@ fn text(orig: &[u8]) -> Vec<u8> {
         }
     }
     for (names, open, tip, heading, items) in [
-        (&GRAPHICS_LIST, "Graphics", "Texture filtering and the image's quality.", "GRAPHICS", graphics_items()),
-        (&GAME_LIST, "Game & Controls", "Mouse direction, the buttons shown and the start.", "GAME & CONTROLS", game_items()),
+        (&GRAPHICS_LIST, "Graphics", "Graphics quality and frame rate.", "GRAPHICS", graphics_items()),
+        (&GAME_LIST, "Game & Controls", "Mouse, buttons and saves.", "GAME & CONTROLS", game_items()),
     ] {
         lines.push((names.open_key.into(), open.into()));
         lines.push((names.tip_key.into(), tip.into()));
@@ -1078,7 +1120,7 @@ fn text(orig: &[u8]) -> Vec<u8> {
         }
     }
     lines.push(("PC_BINDINGS_OPEN".into(), "Key Bindings".into()));
-    lines.push(("PC_BINDINGS_OPEN_TIP".into(), "The keys, mouse buttons and wheel turns of every action.".into()));
+    lines.push(("PC_BINDINGS_OPEN_TIP".into(), "The keys and mouse buttons for every action.".into()));
     lines.push(("PC_BINDINGS_HEADING".into(), "KEY BINDINGS".into()));
     for item in binding_items() {
         lines.push((item.text_key(""), item.label.clone()));
@@ -1089,7 +1131,7 @@ fn text(orig: &[u8]) -> Vec<u8> {
     }
     lines.push(("PC_INPUT_PRESS".into(), "Press a key".into()));
     lines.push((PAD_LIST.open_key.into(), "Controller Bindings".into()));
-    lines.push((PAD_LIST.tip_key.into(), "The controller's buttons for every action.".into()));
+    lines.push((PAD_LIST.tip_key.into(), "The controller buttons for every action.".into()));
     lines.push((PAD_LIST.heading_key.into(), "CONTROLLER BINDINGS".into()));
     for item in pad_binding_items() {
         lines.push((item.text_key(""), item.label.clone()));
@@ -1097,7 +1139,7 @@ fn text(orig: &[u8]) -> Vec<u8> {
         lines.extend(item.options().into_iter().filter_map(|(k, t)| t.map(|t| (k, t))));
     }
     lines.push(("PC_TROPHIES_OPEN".into(), "All Trophies".into()));
-    lines.push(("PC_TROPHIES_OPEN_TIP".into(), "Every trophy of the game, with what it asks for.".into()));
+    lines.push(("PC_TROPHIES_OPEN_TIP".into(), "Every trophy and what it asks for.".into()));
     lines.push(("PC_TROPHIES_HEADING".into(), "TROPHIES".into()));
     lines.push((popup::TITLE_KEY.into(), "TROPHY UNLOCKED".into()));
     for (t, _) in crate::achievements::list() {
