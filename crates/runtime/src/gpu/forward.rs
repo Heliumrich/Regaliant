@@ -16,7 +16,8 @@
 //! word that is neither the destination's old word (the copy has not run)
 //! nor the copied one (it has): the title's CPU rewrote it, or once its
 //! batch completed: memory then holds the words, which are compared
-//! (`STATS`); a destination whose copy did not land is not forwarded again.
+//! (`STATS`); a destination whose copy did not land is not forwarded again
+//! (unless a few words missed, or its inputs were unchanged: `completed`).
 
 use parking_lot::{Mutex, RwLock};
 use std::cell::{Cell, RefCell};
@@ -52,6 +53,8 @@ struct Entry {
     how: &'static str,
     queue: Arc<str>,
     write_backs: u64,
+    /// The flip it was recorded at (diagnostics).
+    flip: u64,
 }
 
 /// A copy's inputs as read when it was recorded.
@@ -842,7 +845,7 @@ pub fn add(base: u64, words: Vec<u32>, program: u64, hash: u64, from: Inputs, ho
     if trace_on(base, 4 * n) {
         trace_life(format_args!("entry {id} {base:#x}+{:#x} made by {queue}", 4 * n));
     }
-    g.push(Entry { id, base, words: words.into(), seq: 0, program, hash, from, old, earlier, how, queue: queue.into(), write_backs: super::homes::WRITE_BACKS.load(Ordering::Relaxed) });
+    g.push(Entry { id, base, words: words.into(), seq: 0, program, hash, from, old, earlier, how, queue: queue.into(), write_backs: super::homes::WRITE_BACKS.load(Ordering::Relaxed), flip: super::FRAMES.load(Ordering::Relaxed) });
     COUNT.store(g.len(), Ordering::Release);
     note_span(&g);
     GEN.fetch_add(1, Ordering::AcqRel);
@@ -888,7 +891,7 @@ fn add_held(id: u64, base: u64, words: Vec<u32>, program: u64, hash: u64, from: 
         if trace_on(base, 4 * n) {
             trace_life(format_args!("entry {id} {base:#x}+{:#x} made by {queue} (held)", 4 * n));
         }
-        x.entries.push(Entry { id, base, words: words.into(), seq: 0, program, hash, from, old, earlier, how, queue: queue.into(), write_backs: super::homes::WRITE_BACKS.load(Ordering::Relaxed) });
+        x.entries.push(Entry { id, base, words: words.into(), seq: 0, program, hash, from, old, earlier, how, queue: queue.into(), write_backs: super::homes::WRITE_BACKS.load(Ordering::Relaxed), flip: super::FRAMES.load(Ordering::Relaxed) });
         x.version += 1;
     });
     STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -1035,31 +1038,47 @@ pub fn completed(done: u64) {
         STATS[5].fetch_add(e.words.len() as u64 - differ - rewritten, Ordering::Relaxed);
         if let Some((k, w, now)) = first {
             STATS[6].fetch_add(differ, Ordering::Relaxed);
-            // A few words (at most 2, or 1 in 512) as before: memory missed
-            // them, not the forwarded result (the rest landed as computed; a
-            // write of the previous frame's block over the copy's in the two
-            // Doran boots of 2026-11-06, the source unchanged): the
-            // destination stays forwarded, its readers taking the words the
-            // copy computes rather than memory's (refusing it slowed those
-            // boots 5-10% for good). Logged and counted (`TOLERATED`).
+            // What changed since the copy was recorded: its source, its
+            // control block, or neither (then something else wrote the
+            // destination, or the GPU copied other words).
+            let f = &e.from;
+            let src_now: Vec<u32> = if super::cp::guest_readable(f.src, (f.src_words.len() as u64).saturating_sub(1) * f.stride + 4) {
+                (0..f.src_words.len() as u64).map(|j| unsafe { std::ptr::read_volatile((f.src + j * f.stride) as *const u32) }).collect()
+            } else {
+                Vec::new()
+            };
+            let src_changed = src_now.iter().zip(&f.src_words).filter(|(a, b)| a != b).count();
+            let cb_now = if super::cp::guest_readable(f.cb, 8) { unsafe { [std::ptr::read_volatile(f.cb as *const u32), std::ptr::read_volatile((f.cb + 4) as *const u32)] } } else { [0, 0] };
+            // A few words (at most 2, or 1 in 512) as before, or any number
+            // with the copy's source and control block as when it was
+            // recorded: memory missed them, not the forwarded result (the GPU
+            // copied what the readers were given; a write of the previous
+            // frame's block over the copy's in the two Doran boots of
+            // 2026-11-06, 4 words of the per-view block and a whole 110-word
+            // copy in three boots of 2026-11-07): the destination stays
+            // forwarded, its readers taking the words the copy computes
+            // rather than memory's (refusing it never mended memory and
+            // slowed those boots 5-20% for good). A destination missing words
+            // with unchanged inputs a fourth time is refused (a copy the
+            // forwarding computed wrongly would miss every time). Logged and
+            // counted (`TOLERATED`).
             let few = differ <= 2.max(e.words.len() as u64 / 512);
-            if few {
+            let same_inputs = !src_now.is_empty() && src_changed == 0 && cb_now[0] as u64 == f.count && cb_now[1] as u64 == f.modulus;
+            let misses = if few || !same_inputs {
+                0
+            } else {
+                let mut g = MISSES.lock();
+                let c = g.get_or_insert_with(HashMap::new).entry((e.hash, e.base)).or_insert(0);
+                *c += 1;
+                *c
+            };
+            let keep = few || (same_inputs && misses <= 3);
+            if keep {
                 TOLERATED[0].fetch_add(1, Ordering::Relaxed);
                 TOLERATED[1].fetch_add(differ, Ordering::Relaxed);
             }
             static LOGGED: AtomicU64 = AtomicU64::new(0);
             if LOGGED.fetch_add(1, Ordering::Relaxed) < 20 {
-                // What changed since the copy was recorded: its source, its
-                // control block, or neither (then something else wrote the
-                // destination, or the GPU copied other words).
-                let f = &e.from;
-                let src_now: Vec<u32> = if super::cp::guest_readable(f.src, (f.src_words.len() as u64).saturating_sub(1) * f.stride + 4) {
-                    (0..f.src_words.len() as u64).map(|j| unsafe { std::ptr::read_volatile((f.src + j * f.stride) as *const u32) }).collect()
-                } else {
-                    Vec::new()
-                };
-                let src_changed = src_now.iter().zip(&f.src_words).filter(|(a, b)| a != b).count();
-                let cb_now = if super::cp::guest_readable(f.cb, 8) { unsafe { [std::ptr::read_volatile(f.cb as *const u32), std::ptr::read_volatile((f.cb + 4) as *const u32)] } } else { [0, 0] };
                 crate::warn!(
                     "gpu: forwarded copy to {:#x} (cs {:#x}, batch {}): {differ} of {} words still as before the copy after it ran, first dword {k}: forwarded {w:#x}, memory {now:#x}; source {:#x} ({} words, stride {}): {src_changed} words changed since recorded{}; control block {:#x}: count {} modulus {} when recorded, {} {} now; last CP write to the source: {}; destination bound {} by {}, in a home now: {}, home write-backs since: {}; {}",
                     e.base,
@@ -1080,20 +1099,34 @@ pub fn completed(done: u64) {
                     e.queue,
                     super::homes::overlaps(e.base, 4 * e.words.len() as u64),
                     super::homes::WRITE_BACKS.load(Ordering::Relaxed).saturating_sub(e.write_backs),
-                    if few { "the destination stays forwarded (a few words)" } else { "this destination is no longer forwarded" }
+                    if few {
+                        "the destination stays forwarded (a few words)".to_string()
+                    } else if keep {
+                        format!("the destination stays forwarded (its inputs as recorded: memory missed the copy's words; {misses} of 3 such tolerated)")
+                    } else {
+                        "this destination is no longer forwarded".to_string()
+                    }
                 );
-                crate::warn!("gpu: the recent copies over {:#x} (now flip {}): {}", e.base, super::FRAMES.load(Ordering::Relaxed), copies_over(e.base, 4 * e.words.len() as u64));
+                crate::warn!("gpu: the recent copies over {:#x} (recorded at flip {}, now {}): {}", e.base, e.flip, super::FRAMES.load(Ordering::Relaxed), copies_over(e.base, 4 * e.words.len() as u64));
+                // (Whether the title unmapped the destination since: GPU
+                // writes into a window imported before would not reach the
+                // memory mapped there now.)
+                let unmaps = crate::mem::unmaps_covering(e.base);
+                crate::warn!("gpu: unmaps covering {:#x}: {}", e.base, if unmaps.is_empty() { "none noted".to_string() } else { unmaps.join("; ") });
             }
-            if !few {
+            if !keep {
                 DISTRUSTED.lock().get_or_insert_with(HashSet::new).insert((e.hash, e.base));
             }
         }
     }
 }
 
-/// Copies whose few words still as before after they ran kept their
-/// destination forwarded: [copies, words].
+/// Copies whose words still as before after they ran (a few, or with their
+/// inputs unchanged) kept their destination forwarded: [copies, words].
 static TOLERATED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// (program hash, destination) pairs: copies whose words memory missed with
+/// their inputs unchanged (the fourth refuses the destination).
+static MISSES: Mutex<Option<HashMap<(u64, u64), u32>>> = Mutex::new(None);
 
 /// Batches up to `done` completed: their workers' buffer updates are
 /// compared with memory.
@@ -1146,7 +1179,7 @@ pub fn status_line() -> String {
     }
     let k: Vec<u64> = CHECK_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    forwarded copies: {} made ({} not: inputs still written or odd shapes), {} ended by later writes, {} by the title's rewrites, {} retired after their batch ({} into a video-memory home, not compared); {} words served, {} stage reads with no wait for the copy; after the copies ran {} words equal, {} as before the copy (it did not land; {} copies of a few such words kept forwarded, {} words), {} rewritten since; checked after their batches {} ({} words; {} words equal, {} as before, {} rewritten; {} checks ended by later writes); past parallel runs {} (published {}, dropped {})\n",
+        "    forwarded copies: {} made ({} not: inputs still written or odd shapes), {} ended by later writes, {} by the title's rewrites, {} retired after their batch ({} into a video-memory home, not compared); {} words served, {} stage reads with no wait for the copy; after the copies ran {} words equal, {} as before the copy (it did not land; {} copies of a few such words or unchanged inputs kept forwarded, {} words), {} rewritten since; checked after their batches {} ({} words; {} words equal, {} as before, {} rewritten; {} checks ended by later writes); past parallel runs {} (published {}, dropped {})\n",
         s[0], s[7], s[1], s[8], s[2], s[10], s[3], s[4], s[5], s[6],
         TOLERATED[0].load(Ordering::Relaxed),
         TOLERATED[1].load(Ordering::Relaxed),

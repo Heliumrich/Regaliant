@@ -60,6 +60,8 @@ pub struct Vma {
     /// than direct, its offset in the anonymous section.
     pub slots: u8,
     pub off: u64,
+    /// The flip it was mapped at (diagnostics; its pieces keep it).
+    pub born: u64,
 }
 /// The anonymous section's size (`sections`): flexible memory, modules and
 /// runtime-owned guest memory.
@@ -2338,7 +2340,7 @@ impl MemState {
         if kind == VmaKind::Flexible {
             self.flexible_used += size;
         }
-        self.vmas.insert(addr, Vma { start: addr, size, kind, prot, phys, mtype, name: name.to_string(), slots, off });
+        self.vmas.insert(addr, Vma { start: addr, size, kind, prot, phys, mtype, name: name.to_string(), slots, off, born: crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed) });
         bump_gen(addr, addr + size);
         trace_map("map", addr, addr + size, format_args!("{kind:?} prot {prot:#x} phys {phys:#x} '{name}'"));
         Ok(addr)
@@ -2539,7 +2541,7 @@ mod tests {
     #[test]
     fn vma_bounds_follows_the_table() {
         let (a, n) = (0x7F12_0000_0000u64, 0x30_0000u64);
-        let vma = |start: u64, size: u64, kind: VmaKind| Vma { start, size, kind, prot: 3, phys: 0, mtype: 0, name: "test".into(), slots: 0, off: 0 };
+        let vma = |start: u64, size: u64, kind: VmaKind| Vma { start, size, kind, prot: 3, phys: 0, mtype: 0, name: "test".into(), slots: 0, off: 0, born: 0 };
         {
             let mut st = MEM.lock();
             st.vmas.insert(a, vma(a, n, VmaKind::Flexible));

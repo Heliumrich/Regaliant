@@ -388,6 +388,10 @@ struct Dead {
     span: Span,
     generation: u64,
     seq: Option<u64>,
+    /// The guest page table may still lead to it (its pages' entries until
+    /// the windows imported again replace them: `revalidate_spans`): not
+    /// freed, its generation not set yet.
+    held: bool,
 }
 
 static GRAVEYARD: Mutex<Vec<Dead>> = Mutex::new(Vec::new());
@@ -427,11 +431,59 @@ pub(crate) fn imports_may_cover(base: u64, len: u64) -> bool {
 /// thread), evicts images when video memory runs short, then decommits the
 /// guest ranges that waited for imports (`mem::retry_deferred`).
 fn reap_spans() {
+    // (Timed: a long one is a hitch cause, `gpu::hitch`.)
+    let t = std::time::Instant::now();
     reap_dead_spans();
+    let t_spans = t.elapsed();
     reap_dead_images();
+    let t_images = t.elapsed();
     super::resident::maybe_unback();
     super::images::maybe_evict();
     crate::mem::retry_deferred();
+    let ns = t.elapsed().as_nanos() as u64;
+    REAP_NS[0].fetch_add(ns, Ordering::Relaxed);
+    REAP_NS[1].fetch_max(ns, Ordering::Relaxed);
+    REAP_NS[2].fetch_add(t_spans.as_nanos() as u64, Ordering::Relaxed);
+    super::hitch::note_since(super::hitch::Kind::Mirror, t, || {
+        format!("freeing dropped imports {} ms, images {} ms, then unbacking, eviction and deferred decommits", t_spans.as_millis(), (t_images - t_spans).as_millis())
+    });
+}
+
+/// `reap_spans`: [ns, longest ns, ns freeing dropped imports].
+static REAP_NS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Batches completed since the reaper last ran (`reaper_thread`).
+static REAP_KICK: Mutex<bool> = Mutex::new(false);
+static REAP_CV: parking_lot::Condvar = parking_lot::Condvar::new();
+
+/// Runs `reap_spans` after batches complete, off the completion thread:
+/// freeing dropped imports (the driver unpins their pages), images,
+/// eviction and deferred decommits took 6-23 ms at a time there at loads
+/// and arrivals, and the next batches' CP effects, the labels the title
+/// waits for, waited behind them (in-run A/B at the City Vista's arrival:
+/// hitch time -19%, flips/s +1.8%, FINDINGS.md 2026-11-07). Runs coalesce.
+fn reaper_thread() {
+    crate::log::set_thread_name("gpu-reaper");
+    loop {
+        {
+            let mut k = REAP_KICK.lock();
+            while !*k {
+                REAP_CV.wait(&mut k);
+            }
+            *k = false;
+        }
+        reap_spans();
+    }
+}
+
+/// After a batch's completion: the reaper runs `reap_spans`.
+fn after_completion() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        crate::thread::spawn_host("gpu-reaper", 1 << 20, Box::new(reaper_thread)).expect("gpu reaper thread");
+    });
+    *REAP_KICK.lock() = true;
+    REAP_CV.notify_one();
 }
 
 /// Images the cache dropped (`images::Evicted`), destroyed once no batch can
@@ -496,6 +548,9 @@ fn reap_dead_spans() {
     let done = done_seq();
     let mut g = GRAVEYARD.lock();
     g.retain_mut(|d| {
+        if d.held {
+            return true;
+        }
         if d.seq.is_none() && oldest_open >= d.generation {
             // Every batch that may use it was submitted by now.
             d.seq = Some(next - 1);
@@ -836,6 +891,11 @@ fn revalidate_spans() {
     for &(a, n) in &ranges {
         super::fe2::invalidate(a, n);
         super::fe2::hash_clear_range(a, n);
+        // The changed pages leave the guest page table (whichever window,
+        // listed or dropped and held for its re-import, led there): the
+        // other pages of dropped windows keep their entries until the
+        // windows imported again replace them (`reimport_dropped`).
+        super::pagetable::unmap(a, n);
     }
     // Imports in progress over the changed pages are dropped when they end
     // (they may pin pages no longer mapped there): before the list is
@@ -858,54 +918,112 @@ fn revalidate_spans() {
             if IMPORTS_STALE.fetch_add(1, Ordering::Relaxed) < 20 {
                 crate::info!("gpu: guest range {:#x}..{:#x} imported for the GPU was remapped (imported again on its next use)", s.start, s.end);
             }
-            // Freed once no batch can use it (recorded work may).
-            super::pagetable::unmap(s.start, s.end - s.start);
+            // Freed once no batch can use it (recorded work may). Only its
+            // changed pages left the guest page table (above): its other
+            // pages keep this window's entries until the windows imported
+            // again replace them. Cleared whole first, a batch submitted
+            // before those imports were listed found no entry for pages still
+            // mapped, and its write-back stored nothing there (GPU writes that
+            // never reached guest memory: FINDINGS.md 2026-11-07).
             dead.push(g.swap_remove(i));
         } else {
             i += 1;
         }
     }
-    // Windows still valid over the pages just cleared map them again (two
-    // windows may cover the same pages).
+    // Windows still valid over a dropped one's pages map them again (two
+    // windows may cover the same pages); they cover those pages from now on.
+    let mut covers: Vec<Vec<(u64, u64)>> = Vec::with_capacity(dead.len());
     for d in &dead {
+        let mut c = Vec::new();
         for v in g.iter().filter(|v| v.valid && v.start < d.end && d.start < v.end) {
             super::pagetable::map(v.start, v.end - v.start, ctx().buffer_address(v.buffer));
+            c.push((v.start, v.end));
         }
+        covers.push(c);
     }
     if !dead.is_empty() {
         DROP_GEN.fetch_add(1, Ordering::AcqRel);
         CACHE_GEN.fetch_add(1, Ordering::AcqRel);
     }
-    let generation = SPAN_GEN.fetch_add(1, Ordering::AcqRel) + 1;
     drop(g);
-    let reimport: Vec<(u64, u64)> = if super::pagetable::made() { dead.iter().map(|d| (d.start, d.end)).collect() } else { Vec::new() };
+    let ranges_dead: Vec<Reimport> = dead.iter().zip(covers).map(|(d, covered)| Reimport { start: d.start, end: d.end, buffer: d.buffer, covered }).collect();
     if !dead.is_empty() {
+        // (Listed at once, held: `imports_may_cover` sees their pages pinned.)
         let mut gy = GRAVEYARD.lock();
         gy.extend(dead.into_iter().map(|mut span| {
             span.valid = false;
             super::vk::note_gpu_dropped(span.buffer);
-            Dead { span, generation, seq: None }
+            Dead { span, generation: u64::MAX, seq: None, held: true }
         }));
         GRAVEYARD_LEN.store(gy.len() as u64, Ordering::Release);
     }
-    // GPU-resolved chains read through the guest page table: a dropped
-    // window's pages still mapped are imported again at once, so that the
-    // table goes from the old window to a new one over the same pages before
-    // the next batch, without clearing them. Batches recorded before the
-    // drop and submitted after it read them through the table (commands bind
-    // windows themselves, and keep the dropped one until they complete).
-    for (s, e) in reimport {
-        let t0 = std::time::Instant::now();
-        let (made, failed) = import_mappings(s, e);
-        REIMPORTS.fetch_add(made + failed, Ordering::Relaxed);
-        REIMPORT_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if ranges_dead.is_empty() {
+        SPAN_GEN.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+    reimport_dropped(ranges_dead);
+}
+
+/// A dropped window to import again (`reimport_dropped`): its range, its
+/// buffer, and the ranges listed windows cover in it (found at the drop or
+/// by its re-import): its other pages leave the table before it is buried.
+struct Reimport {
+    start: u64,
+    end: u64,
+    buffer: vk::Buffer,
+    covered: Vec<(u64, u64)>,
+}
+
+/// The write-back stores through the guest page table (and GPU-resolved
+/// chains read through it): a dropped window's pages still mapped are
+/// imported again, so that the table goes from the old window to a new one
+/// over the same pages without clearing them; then the dropped windows are
+/// buried. Batches recorded before the drop and submitted after it read
+/// them through the table (commands bind windows themselves, and keep the
+/// dropped one until they complete).
+fn reimport_dropped(mut ranges_dead: Vec<Reimport>) {
+    if super::pagetable::made() && !DEVICE_LOST.load(Ordering::Relaxed) {
+        for r in ranges_dead.iter_mut() {
+            let t0 = std::time::Instant::now();
+            let (made, failed) = import_mappings(r.start, r.end, &mut r.covered);
+            REIMPORTS.fetch_add(made + failed, Ordering::Relaxed);
+            REIMPORT_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        // Pages of the dropped windows that neither a window listed over them
+        // at the drop nor their re-import covers leave the table (an import
+        // that failed, mappings gone meanwhile): their entries led into the
+        // dropped windows. (What covers them is known here, not looked up
+        // again: a window listed now may have been dropped since, its pages'
+        // entries held for its own re-import.)
+        for r in &ranges_dead {
+            let mut x = r.start;
+            while x < r.end {
+                match r.covered.iter().filter(|c| c.0 <= x && x < c.1).map(|c| c.1).max() {
+                    Some(end) => x = end,
+                    None => {
+                        let next = r.covered.iter().filter(|c| x < c.0 && c.0 < r.end).map(|c| c.0).min().unwrap_or(r.end);
+                        super::pagetable::unmap(x, next - x);
+                        x = next;
+                    }
+                }
+            }
+        }
+    }
+    // Buried now the table no longer leads to them (the maps and clears
+    // above apply before the next batch): batches begun until now may still
+    // reach them through it.
+    let generation = SPAN_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+    let mut gy = GRAVEYARD.lock();
+    for d in gy.iter_mut().filter(|d| d.held && ranges_dead.iter().any(|r| r.buffer == d.span.buffer)) {
+        d.held = false;
+        d.generation = generation;
     }
 }
 
 /// Imports the usable mappings of guest [s, e) (a dropped or replaced
 /// window's), window by window from each one's start: (imports made or
 /// found, those that failed).
-fn import_mappings(s: u64, e: u64) -> (u64, u64) {
+fn import_mappings(s: u64, e: u64, covered: &mut Vec<(u64, u64)>) -> (u64, u64) {
     let (mut made, mut failed) = (0, 0);
     let mut a = s;
     while a < e {
@@ -920,8 +1038,9 @@ fn import_mappings(s: u64, e: u64) -> (u64, u64) {
         };
         let Some(b) = next else { break };
         a = match import_span(b, 4) {
-            Some((_, _, end)) if end > b => {
+            Some((_, start, end)) if end > b => {
                 made += 1;
+                covered.push((start, end));
                 end
             }
             _ => {
@@ -1840,7 +1959,7 @@ fn import_once(base: u64, size: u64, window: u64) -> Option<Option<(vk::Buffer, 
         if let Some(v) = st.find(base) {
             if import_log() {
                 let by = IMPORT_SITE.with(|c| c.get()).map_or(String::new(), |l| format!(" for {}:{}", l.file().rsplit(['/', '\\']).next().unwrap_or(l.file()), l.line()));
-                crate::info!("gpu: import at flip {}: window {lo:#x}..{hi:#x} for {base:#x}+{size:#x} in mapping {:#x}+{:#x} {:?} '{}'{by}", super::FRAMES.load(Ordering::Relaxed), v.start, v.size, v.kind, v.name);
+                crate::info!("gpu: import at flip {}: window {lo:#x}..{hi:#x} for {base:#x}+{size:#x} in mapping {:#x}+{:#x} {:?} prot {:#x} '{}' (mapped at flip {}) phys {:#x} off {:#x}{by}", super::FRAMES.load(Ordering::Relaxed), v.start, v.size, v.kind, v.prot, v.name, v.born, v.phys, v.off);
             } else {
                 crate::debug!("gpu: importing for {base:#x}+{size:#x}: mapping {:#x}+{:#x} {:?} prot {:#x} '{}'", v.start, v.size, v.kind, v.prot, v.name);
             }
@@ -1906,6 +2025,9 @@ fn import_once(base: u64, size: u64, window: u64) -> Option<Option<(vk::Buffer, 
             }
             super::vk::note_gpu_range(buffer, va, end - start, || format!("guest import {start:#x}..{end:#x}"));
             let ms = ns / 1_000_000;
+            if import_log() {
+                crate::info!("gpu: imported {start:#x}..{end:#x} ({} MiB) in {} us", (end - start) >> 20, ns / 1000);
+            }
             if ms >= 50 {
                 crate::info!("gpu: importing guest {start:#x}..{end:#x} ({} MiB) took {ms} ms", (end - start) >> 20);
             }
@@ -5782,7 +5904,7 @@ fn completion_thread() {
         }
         *LAST_DONE_AT.lock() = Some(std::time::Instant::now());
         DONE_CV.notify_all();
-        reap_spans();
+        after_completion();
         check_races(b.seq);
         super::forward::completed(b.seq);
         check_timestamps(b.seq);
@@ -15807,9 +15929,12 @@ pub fn status() -> String {
         + &read_census_line()
         + &audit_line()
         + &format!(
-            "    gpu completion: {} ms waiting for fences, {} ms in actions; batches waited for past 10 s while other GPU work completed {}\n",
+            "    gpu completion: {} ms waiting for fences, {} ms in actions, {} ms freeing and evicting after them (longest {} ms; dropped imports {} ms); batches waited for past 10 s while other GPU work completed {}\n",
             FENCE_NS.load(Ordering::Relaxed) / 1_000_000,
             ACTION_NS.load(Ordering::Relaxed) / 1_000_000,
+            REAP_NS[0].load(Ordering::Relaxed) / 1_000_000,
+            REAP_NS[1].load(Ordering::Relaxed) / 1_000_000,
+            REAP_NS[2].load(Ordering::Relaxed) / 1_000_000,
             WAIT_EXTENDED.load(Ordering::Relaxed)
         )
 }
