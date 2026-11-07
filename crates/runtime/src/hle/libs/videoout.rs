@@ -505,6 +505,33 @@ pub struct Burst {
     pub left: u32,
     pub index: u32,
     pub crop: Option<(u32, u32, u32, u32)>,
+    /// Saved at half the size (2x2 pixels averaged).
+    pub half: bool,
+}
+
+/// F10 (the window): the next 60 presented frames saved at half size as `f10_<time>_NNN.png` in
+/// the run directory, to show a glitch as it happens.
+pub fn burst_hotkey() {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let name = format!("f10_{secs}");
+    crate::info!("F10: the next 60 frames saved at half size as {name}_NNN.png in the run directory");
+    *BURST.lock() = Some(Burst { name, left: 60, index: 0, crop: None, half: true });
+}
+
+/// An RGBA8 frame at half its size (each 2x2 block averaged; an odd last row or column dropped).
+fn half_rgba(rgba: &[u8], w: u32, h: u32) -> (Vec<u8>, u32, u32) {
+    let (hw, hh) = (w / 2, h / 2);
+    let mut out = Vec::with_capacity((hw * hh * 4) as usize);
+    for y in 0..hh {
+        let (r0, r1) = (((2 * y) * w * 4) as usize, ((2 * y + 1) * w * 4) as usize);
+        for x in 0..hw as usize {
+            for c in 0..4 {
+                let s = rgba[r0 + 8 * x + c] as u32 + rgba[r0 + 8 * x + 4 + c] as u32 + rgba[r1 + 8 * x + c] as u32 + rgba[r1 + 8 * x + 4 + c] as u32;
+                out.push(((s + 2) / 4) as u8);
+            }
+        }
+    }
+    (out, hw, hh)
 }
 pub static BURST: Mutex<Option<Burst>> = Mutex::new(None);
 
@@ -535,11 +562,13 @@ pub fn wait_shots() {
 fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
     let mut requested = SHOT_REQUEST.lock().take();
     let mut crop = None;
+    let mut half = false;
     if requested.is_none() {
         let mut g = BURST.lock();
         if let Some(b) = g.as_mut() {
             requested = Some(format!("{}_{:03}", b.name, b.index));
             crop = b.crop;
+            half = b.half;
             b.index += 1;
             b.left = b.left.saturating_sub(1);
             if b.left == 0 {
@@ -580,6 +609,7 @@ fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
                         Some(c) => crop_rgba(&rgba, w, h, c),
                         None => (rgba, w, h),
                     };
+                    let (rgba, w, h) = if half { half_rgba(&rgba, w, h) } else { (rgba, w, h) };
                     std::fs::write(&path, crate::gpu::png::encode(w, h, &rgba)).map_err(|e| e.to_string())
                 });
                 match r {

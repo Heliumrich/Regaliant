@@ -324,12 +324,12 @@ pub static MAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// 64 KiB pieces many times per second, and every change used to empty
 /// every command processor's cache (`readable_span` was ~12% of the
 /// graphics thread's busy samples, run 20261011-111123).
-static CHANGES: Mutex<std::collections::VecDeque<(u64, u64, u64)>> = Mutex::new(std::collections::VecDeque::new());
+static CHANGES: parking_lot::RwLock<std::collections::VecDeque<(u64, u64, u64)>> = parking_lot::RwLock::new(std::collections::VecDeque::new());
 const CHANGES_KEEP: usize = 256;
 
 /// Notes a mapping change of [start, end) (inside the MEM lock).
 fn bump_gen(start: u64, end: u64) {
-    let mut c = CHANGES.lock();
+    let mut c = CHANGES.write();
     let generation = MAP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     if c.len() >= CHANGES_KEEP {
         c.pop_front();
@@ -344,12 +344,17 @@ fn revalidate(runs: &mut Vec<(u64, u64, bool)>, from: u64, to: u64) -> bool {
     if from == u64::MAX {
         return false;
     }
-    let c = CHANGES.lock();
+    // (Read by every recording thread after each change: shared, and only
+    // the entries after `from`, newest first: generations rise along it.)
+    let c = CHANGES.read();
     if c.front().is_none_or(|&(g, _, _)| g > from + 1) {
         return false;
     }
-    for &(g, s, e) in c.iter() {
-        if g > from && g <= to {
+    for &(g, s, e) in c.iter().rev() {
+        if g <= from {
+            break;
+        }
+        if g <= to {
             runs.retain(|&(rs, re, _)| e <= rs || re <= s);
         }
     }

@@ -476,6 +476,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 return 0;
             }
+            if wp as u16 == VK_F10_CODE {
+                // F10: the next 60 frames saved (a glitch as it happens). (As a
+                // system key it would open the window's menu.)
+                if (lp >> 30) & 1 == 0 {
+                    crate::hle::libs::videoout::burst_hotkey();
+                }
+                return 0;
+            }
             if wp as u16 == VK_F1_CODE && (lp >> 30) & 1 == 0 {
                 CAPTURE_WANTED.fetch_xor(true, Ordering::Relaxed);
                 unsafe { update_capture(hwnd) };
@@ -541,6 +549,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 const VK_F1_CODE: u16 = 0x70;
 const VK_F4_CODE: u16 = 0x73;
 const VK_F11_CODE: u16 = 0x7A;
+const VK_F10_CODE: u16 = 0x79;
 const VK_RETURN_CODE: u16 = 0x0D;
 
 /// `DS_WINDOW_SIZE=<w>x<h>`: the client size asked for (pixels).
