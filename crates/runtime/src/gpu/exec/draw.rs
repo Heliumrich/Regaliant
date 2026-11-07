@@ -887,7 +887,7 @@ impl Exec {
     /// Executes a draw with the graphics state of `cp`; returns what
     /// happened (frame captures).
     pub fn draw(&mut self, cp: &Cp, args: DrawArgs) -> std::borrow::Cow<'static, str> {
-        super::ballast(self.ballast_kind);
+        super::ballast_cp(self.ballast_kind, cp.ballast_part());
         if DEVICE_LOST.load(Ordering::Relaxed) {
             DRAW_SKIPPED.fetch_add(1, Ordering::Relaxed);
             return "skipped (device lost)".into();

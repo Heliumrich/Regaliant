@@ -4248,6 +4248,23 @@ impl Cp {
         self.par.is_some()
     }
 
+    /// The graphics CP's part of its stream for `tune ballast_at` bits 5-8
+    /// (`exec::ballast_cp`): 5 past a label wait, 6 past a parallel run, 7
+    /// its own chunk of a run, 8 the rest (serial); other executors none.
+    pub(super) fn ballast_part(&self) -> u8 {
+        if !self.main_gfx {
+            0
+        } else if self.past_wait.is_some() {
+            5
+        } else if self.past.is_some() {
+            6
+        } else if self.par.is_some() {
+            7
+        } else {
+            8
+        }
+    }
+
     /// Whether this is the graphics queue's main command processor (not a
     /// parallel worker or a compute queue's).
     pub(super) fn is_main_gfx(&self) -> bool {

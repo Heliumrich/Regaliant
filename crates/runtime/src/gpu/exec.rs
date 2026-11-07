@@ -7699,6 +7699,16 @@ pub(super) fn ballast(kind: u8) {
     }
 }
 
+/// `ballast` with the graphics CP's part of its stream (`Cp::ballast_part`:
+/// `ballast_at` bits 5-8 price one part of its recording alone).
+#[inline]
+pub(super) fn ballast_cp(kind: u8, part: u8) {
+    ballast(kind);
+    if part != 0 {
+        ballast(part);
+    }
+}
+
 /// Lap timer of a command's steps (profiling only).
 pub(super) struct Laps {
     last: Option<std::time::Instant>,
@@ -14883,7 +14893,7 @@ impl Exec {
     /// `indirect`: the arguments' guest address (the GPU reads the group
     /// counts; `groups` is unused).
     fn dispatch_inner(&mut self, cp: &Cp, mut groups: [u32; 3], initiator: u32, indirect: Option<u64>) -> Result<(), String> {
-        ballast(self.ballast_kind);
+        ballast_cp(self.ballast_kind, cp.ballast_part());
         // Phase times only when profiling (a clock read costs ~20 ns); the
         // total always (slow dispatches are reported).
         let t_start = std::time::Instant::now();

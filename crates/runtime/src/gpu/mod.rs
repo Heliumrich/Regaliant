@@ -1546,7 +1546,9 @@ pub mod tune {
 
     /// Diagnosis: the executor kinds `ballast_ns` spins in (bit 0 the
     /// graphics CP, 1 its workers, 2 queue 0x50, 3 its workers, 4 the other
-    /// compute queues; live).
+    /// compute queues; the graphics CP's parts of its stream alone: 5 past
+    /// a label wait, 6 past a parallel run, 7 its own chunk of a run, 8 the
+    /// rest; live).
     #[inline]
     pub fn ballast_at() -> u64 {
         get(151)
