@@ -30,7 +30,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 160] = [
+    static ALL: [Tunable; 161] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -191,6 +191,7 @@ pub mod tune {
         Tunable { name: "tr_ballast", env: "DS_TR_BALLAST", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "prep_memo", env: "DS_PREP_MEMO", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe3_scan", env: "DS_FE3_SCAN", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "uncapped", env: "DS_UNCAPPED", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1633,6 +1634,16 @@ pub mod tune {
     #[inline]
     pub fn fe3_scan() -> u64 {
         get(159)
+    }
+
+    /// The uncapped frame rate (the PC tab's Frame Rate Limit, Uncapped): the vblank thread
+    /// ticks at `videoout::UNCAPPED_HZ` instead of 59.94 Hz, so the title, which flips at
+    /// every vblank, shows each frame as soon as it is done (the display's refresh still
+    /// paces presentation: the presenter's FIFO swapchain). `DS_VBLANK_HZ`, when set, stays
+    /// the rate. Live (scripts switch it in-run).
+    #[inline]
+    pub fn uncapped() -> bool {
+        get(160) != 0
     }
 
     /// Pixel programs that write no memory run their depth and stencil

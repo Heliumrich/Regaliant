@@ -29,6 +29,9 @@ pub const ERR_FLIP_QUEUE_FULL: i32 = 0x8029_0012u32 as i32;
 /// 2 = 2160p; dynamic range 1 = SDR). A lower output keeps GPU emulation cost
 /// down during bring-up; it is a choice of this port, not a console default.
 const OUTPUT_RESOLUTION: u32 = 1;
+/// The vblank rate while the frame rate is uncapped (`tune uncapped`, the PC tab's Frame Rate
+/// Limit): well above what the title renders at, so a frame is shown as soon as it is done.
+pub const UNCAPPED_HZ: f64 = 240.0;
 const OUTPUT_DYNAMIC_RANGE: u32 = 1;
 const REFRESH_59_94HZ: u64 = 3;
 
@@ -91,13 +94,21 @@ fn vblank_thread() {
     // a vblank (the title flips at every vblank, `sceVideoOutSetFlipRate(0)`;
     // it may pace or time its frames by them: not for behavior checks).
     let hz = std::env::var("DS_VBLANK_HZ").ok().and_then(|v| v.parse::<f64>().ok()).filter(|h| (30.0..=1000.0).contains(h));
-    let period = match hz {
+    let base = match hz {
         Some(h) => {
             crate::info!("vblank at {h} Hz (DS_VBLANK_HZ, diagnosis)");
             Duration::from_nanos((1e9 / h) as u64)
         }
         None => Duration::from_nanos(16_683_333), // 59.94 Hz
     };
+    // The uncapped frame rate (`tune uncapped`): vblanks at UNCAPPED_HZ while it is on (an
+    // explicit DS_VBLANK_HZ stays the rate).
+    let uncapped_period = Duration::from_nanos((1e9 / UNCAPPED_HZ) as u64);
+    let period_now = || if hz.is_none() && crate::gpu::tune::uncapped() { uncapped_period } else { base };
+    let mut period = period_now();
+    if period != base {
+        crate::info!("vblank at {:.2} Hz (the frame rate uncapped)", 1.0 / period.as_secs_f64());
+    }
     // Flips off the vblank grid (`tune flip_grid` 0): the thread also wakes
     // every FLIP_TICK to show a ready flip as soon as the title's flip rate
     // allows (time since the last flip), while the title's vblanks (count,
@@ -113,6 +124,13 @@ fn vblank_thread() {
         crate::pcsettings::pointer::tick();
         crate::dispmode::tick();
         let grid = crate::gpu::tune::flip_grid();
+        // The rate changed (`tune uncapped`): the next vblank one new period from now.
+        let p_now = period_now();
+        if p_now != period {
+            period = p_now;
+            next = Instant::now() + period;
+            crate::info!("vblank at {:.2} Hz ({})", 1.0 / period.as_secs_f64(), if period == uncapped_period { "the frame rate uncapped" } else { "the frame rate capped at the vblanks" });
+        }
         let now = Instant::now();
         let wake = if grid { next } else { next.min(now + FLIP_TICK) };
         if wake > now {
@@ -122,6 +140,11 @@ fn vblank_thread() {
         let tick = now >= next;
         if tick {
             next += period;
+            // Uncapped, a vblank thread held up (the presenter waiting for the display) skips
+            // the vblanks it missed instead of ticking them in a burst.
+            if period == uncapped_period && next < now {
+                next = now + period;
+            }
         }
         let mut show: Option<DisplayBuffer> = None;
         let mut flipped = None;

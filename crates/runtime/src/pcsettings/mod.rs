@@ -195,6 +195,12 @@ pub fn graphics_items() -> Vec<Item> {
         },
         toggle("Bloom", "Bloom", "The glow around bright lights.", true),
         toggle("Vignette", "Vignette", "The darkening toward the image's edges.", true),
+        Item {
+            id: s("FrameRateLimit"),
+            label: s("Frame Rate Limit"),
+            tooltip: s("60 FPS, as the original: a new frame at most at every refresh of a 60 Hz display (between 30 and 60, frames last one or two refreshes). 30 FPS: every frame two refreshes, for even motion. Uncapped: each frame shown as soon as it is done, as fast as the display refreshes (high-refresh and variable-refresh displays). The game's speed stays the same in all three."),
+            kind: ItemKind::Choice(vec![s("30 FPS"), s("60 FPS"), s("Uncapped")], 1),
+        },
     ]
 }
 
@@ -262,6 +268,18 @@ pub fn apply() {
     convar::want("r_vignetteOverrideEnable", vignette_off.then_some(1));
     convar::want("r_vignetteScale", vignette_off.then(|| convar::float(0.0)));
     crate::hle::libs::audio2::OUTPUT_CHOICE.store(get("AudioOutput").unwrap_or(0).min(5), std::sync::atomic::Ordering::Relaxed);
+    // Frame Rate Limit: 0 30 FPS (`tune frame_cap` 30), 1 60 FPS (the original's: the title
+    // flips at every 59.94 Hz vblank), 2 Uncapped (`tune uncapped`). Set when it changes (at
+    // start only away from the default), and as defaults: DS_FRAME_CAP and DS_UNCAPPED, and
+    // scripts' `tune` lines, still decide where they are given.
+    static FRAME_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+    let limit = get("FrameRateLimit").unwrap_or(1).min(2);
+    let was = FRAME_LIMIT.swap(limit, std::sync::atomic::Ordering::Relaxed);
+    if was != limit && !(was == u32::MAX && limit == 1) {
+        crate::gpu::tune::set_default("frame_cap", if limit == 0 { 30 } else { 0 });
+        crate::gpu::tune::set_default("uncapped", (limit == 2) as u64);
+        crate::info!("pc settings: Frame Rate Limit {}", ["30 FPS", "60 FPS", "Uncapped"][limit as usize]);
+    }
     // Option 0: the title's own render size (0); 1-9 the percentages.
     let scale = get("RenderScale").unwrap_or(0).checked_sub(1).and_then(|i| RENDER_SCALES.get(i as usize).copied()).unwrap_or(0);
     crate::dispmode::SCALE_PCT.store(scale, std::sync::atomic::Ordering::Relaxed);
