@@ -353,6 +353,9 @@ pub struct Cp {
     par_pool: super::par::Pool,
     /// A worker's per-command recording cost in its chunk (`tune par_cost`).
     pub chunk_costs: Option<Vec<u32>>,
+    /// A parallel worker: the label waits its run holds (`par::Run::
+    /// passed_waits`).
+    pub chunk_waits: std::sync::Arc<[u64]>,
     /// Per-command recording costs of the parallel runs seen, by run
     /// signature (`tune par_cost`).
     run_costs: HashMap<u64, RunCost>,
@@ -766,6 +769,23 @@ fn chunk_states_equal(a: &ChunkState, b: &ChunkState, sh_skip: &[u32]) -> bool {
 /// parallel run.
 const PAR_CHUNK_MIN: usize = 64;
 const PAR_MAX: usize = 8192;
+
+/// `Cp::run_pass`: a timestamp, a label wait.
+const RUN_PASS_TS: u8 = 1;
+const RUN_PASS_WAIT: u8 = 2;
+/// Runs' held packets (`Cp::run_pass`): -, label waits passed by split
+/// runs (their effect applied when planned), timestamps and label waits
+/// workers recorded in their chunks.
+pub static RUN_PASSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The status line's part for `RUN_PASSED` (empty while it counted nothing).
+pub fn run_passed_line() -> String {
+    let v: Vec<u64> = RUN_PASSED.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if v.iter().all(|&x| x == 0) {
+        return String::new();
+    }
+    format!("; runs' held packets: label waits passed when planned {}, timestamps recorded by workers {}, label waits passed by workers {}", v[1], v[2], v[3])
+}
 
 /// Command-buffer ends that left the batch open (`tune cmdbuf_merge`).
 pub static CMDBUF_MERGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1960,6 +1980,7 @@ impl Cp {
             run_watch: None,
             par_pool: super::par::Pool::new(),
             chunk_costs: None,
+            chunk_waits: std::sync::Arc::from(Vec::new()),
             run_costs: HashMap::new(),
             run_costs_pruned: u64::MAX,
             last_wait_gpu: false,
@@ -2043,6 +2064,9 @@ impl Cp {
     pub fn make_worker_exec(&mut self) -> Result<(), String> {
         let mut e = super::exec::Exec::new(&self.name)?;
         e.set_deferred();
+        if !self.compute {
+            e.set_par_worker();
+        }
         self.exec = Some(Box::new(e));
         Ok(())
     }
@@ -2186,16 +2210,30 @@ impl Cp {
             }
             let n = count as u64 + 1;
             let next = cur + 4 * (n + 1);
-            if next > to || !valid(cur, 4 * (n + 1)) || !(is_command(opcode) || is_state(opcode) || opcode == op::NOP || par_event(opcode, self.compute)) {
+            let kept = matches!(opcode, op::RELEASE_MEM | op::WAIT_REG_MEM | op::WAIT_REG_MEM64) && !self.compute;
+            // (Multi-draws: in a run only where it holds them, `run_multi`.)
+            let multi = matches!(opcode, op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI) && !self.compute;
+            if next > to || !valid(cur, 4 * (n + 1)) || !(is_command(opcode) || is_state(opcode) || opcode == op::NOP || par_event(opcode, self.compute) || kept || multi) {
                 return Some(cur);
             }
             PACKETS.fetch_add(1, Ordering::Relaxed);
             self.cur_packet = cur;
             self.cur_opcode = opcode;
             let p = |i: u64| f.rd(cur + 4 * (1 + i));
+            // A timestamp or label wait the run holds (`run_pass`); else it
+            // and the rest go to the main command processor.
+            if kept {
+                if !self.chunk_pass(opcode, cur, &p) {
+                    super::par::COMMANDS.fetch_add(commands, Ordering::Relaxed);
+                    self.drop_ahead();
+                    return Some(cur);
+                }
+                cur = next;
+                continue;
+            }
             // Stages prepared ahead within the chunk, as in `run`.
-            let command = is_command(opcode);
-            if command && !self.ahead.is_empty() {
+            let command = is_command(opcode) || multi;
+            if is_command(opcode) && !self.ahead.is_empty() {
                 if self.ahead.front().is_some_and(|c| c.at == cur) {
                     let c = self.ahead.pop_front().unwrap();
                     *self.cur_ahead.borrow_mut() = c.stages;
@@ -2240,6 +2278,94 @@ impl Cp {
         super::par::COMMANDS.fetch_add(commands, Ordering::Relaxed);
         self.drop_ahead();
         None
+    }
+
+    /// A packet the graphics queue's runs hold although it is neither state
+    /// nor a command (this queue's main command processor, planning; since
+    /// 2026-11-07 evening: the vista +3.7%): `RUN_PASS_TS` the title's GPU
+    /// timestamp (RELEASE_MEM of the GPU clock without an interrupt: a chunk
+    /// records it in its own batch, `Exec::gpu_timestamp`), `RUN_PASS_WAIT` a
+    /// label wait that holds in guest memory now (the work that wrote the
+    /// label is done; the planner gives the run the view the wait would, a
+    /// worker orders its batch after the label's writer, `Exec::xq_label`).
+    /// Neither orders the run's later commands after its earlier ones on the
+    /// hardware, so no dependency inside the run comes with them. A census of
+    /// a vista frame: these ended a third of its serial runs.
+    fn run_pass(&mut self, opc: u32, p: &dyn Fn(u64) -> u32) -> Option<u8> {
+        if matches!(opc, op::WAIT_REG_MEM | op::WAIT_REG_MEM64) && !self.compute && self.main_gfx {
+            // (Read as `wait` reads it.)
+            let a = addr64(p(1), p(2));
+            if valid(a, 8) {
+                self.before_fetch(a, 8);
+            }
+        }
+        self.run_pass_here(opc, p)
+    }
+
+    /// Whether a graphics run holds a multi-draw packet (since 2026-11-07
+    /// evening: the vista +6.4%, Doran +0.6%): a chunk's worker reads its
+    /// count and records as the main command processor would; the planner
+    /// waits for GPU work still writing them first, as for indirect draws'
+    /// arguments. Inside a synchronization-free run no earlier command can
+    /// have written them (the hardware's fetch needs a sync packet after
+    /// such writes).
+    fn run_multi(&self, opc: u32) -> bool {
+        !self.compute && self.main_gfx && matches!(opc, op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI)
+    }
+
+    /// `run_pass` without preparing the label's read (the scan ahead).
+    fn run_pass_here(&self, opc: u32, p: &dyn Fn(u64) -> u32) -> Option<u8> {
+        if self.compute || !self.main_gfx {
+            return None;
+        }
+        match opc {
+            op::RELEASE_MEM => {
+                let c = p(1);
+                ((c >> 29) & 7 == 3 && matches!((c >> 24) & 7, 0 | 3)).then_some(RUN_PASS_TS)
+            }
+            op::WAIT_REG_MEM | op::WAIT_REG_MEM64 => {
+                let (c, a, wide) = (p(0), addr64(p(1), p(2)), opc == op::WAIT_REG_MEM64);
+                if (c >> 4) & 3 != 1 || !valid(a, 8) {
+                    return None;
+                }
+                let (reference, mask) = if wide { (addr64(p(3), p(4)), addr64(p(5), p(6))) } else { (p(3) as u64, p(4) as u64) };
+                let v = if wide { unsafe { rd64(a) } } else { (unsafe { rd32(a) }) as u64 };
+                compare(c & 7, v & mask, reference & mask).then_some(RUN_PASS_WAIT)
+            }
+            _ => None,
+        }
+    }
+
+    /// A parallel worker meets a packet `run_pass` let into its run: records
+    /// a timestamp in its batch, or orders its batch after a passed label's
+    /// writer. False: the chunk stops there (the main command processor goes
+    /// on from it).
+    fn chunk_pass(&mut self, opcode: u32, at: u64, p: &dyn Fn(u64) -> u32) -> bool {
+        if opcode == op::RELEASE_MEM {
+            let c = p(1);
+            if (c >> 29) & 7 != 3 || !matches!((c >> 24) & 7, 0 | 3) {
+                return false;
+            }
+            let a = addr64(p(2) & !3, p(3));
+            let Some(e) = self.exec.as_mut() else { return false };
+            e.note_sync();
+            if !e.gpu_timestamp(a) {
+                return false;
+            }
+            self.fence_pending = false;
+            RUN_PASSED[2].fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if self.chunk_waits.binary_search(&at).is_err() {
+            return false;
+        }
+        let (a, wide) = (addr64(p(1), p(2)), opcode == op::WAIT_REG_MEM64);
+        let v = if wide { unsafe { rd64(a) } } else { (unsafe { rd32(a) }) as u64 };
+        if let Some(e) = self.exec.as_mut() {
+            e.xq_label(a, wide, v);
+        }
+        RUN_PASSED[3].fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Why this worker's chunk stopped.
@@ -2509,6 +2635,50 @@ impl Cp {
                     put_reg(&mut st.regs.sh, Space::Sh, SH_DWORDS, inst_loc as usize, si);
                 }
             }
+            op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI => {
+                // As `draw_indirect_multi` leaves them: each record of the
+                // count (from memory) sets the user SGPRs the packet names in
+                // turn, up to the first unreadable one; 8-bit indices none.
+                let indexed = opcode == op::DRAW_INDEX_INDIRECT_MULTI;
+                if indexed && !matches!(st.regs.uc.get(crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE as usize).map(|t| t & 3), Some(0 | 1)) {
+                    return;
+                }
+                let (vtx_loc, inst_loc, id_loc) = (p(1) & 0xFFFF, p(2) & 0xFFFF, p(3) & 0xFFFF);
+                let id_enable = p(3) & (1 << 31) != 0;
+                let mut count = p(4);
+                if p(3) & (1 << 30) != 0 {
+                    let ca = addr64(p(5), p(6));
+                    count = if valid(ca, 4) { count.min(unsafe { rd32(ca) }) } else { 0 };
+                }
+                let rec: u64 = if indexed { 20 } else { 16 };
+                let stride = if p(7) != 0 { p(7) as u64 } else { rec };
+                let first = st.draw_indirect_base + p(0) as u64;
+                let mut last = None;
+                for i in 0..count.min(1 << 16) {
+                    if !valid(first + i as u64 * stride, rec) {
+                        break;
+                    }
+                    last = Some(i);
+                }
+                let Some(i) = last else { return };
+                let a = first + i as u64 * stride;
+                let (bv, si) = unsafe { if indexed { (rd32(a + 12), rd32(a + 16)) } else { (rd32(a + 8), rd32(a + 12)) } };
+                let inst_loc = if inst_loc != 0 {
+                    inst_loc
+                } else {
+                    let r = ScanRegs { sh: &st.regs.sh, ctx: &st.regs.ctx };
+                    crate::hle::libs::agc::instance_offset_slot(super::shaders::ngg_addr_of(&r)).map_or(0, |s| 0x8C + s)
+                };
+                if vtx_loc != 0 {
+                    put_reg(&mut st.regs.sh, Space::Sh, SH_DWORDS, vtx_loc as usize, bv);
+                }
+                if inst_loc != 0 {
+                    put_reg(&mut st.regs.sh, Space::Sh, SH_DWORDS, inst_loc as usize, si);
+                }
+                if id_enable && id_loc != 0 {
+                    put_reg(&mut st.regs.sh, Space::Sh, SH_DWORDS, id_loc as usize, i);
+                }
+            }
             _ => {}
         }
     }
@@ -2535,6 +2705,8 @@ impl Cp {
         // The run's signature: its packet headers (opcode and size), the
         // same when the title records the same pass again.
         let mut sig = 0xcbf2_9ce4_8422_2325u64;
+        // The label waits it holds (`run_pass`): packet, label, 64-bit.
+        let mut passed: Vec<(u64, u64, bool)> = Vec::new();
         let run_end = loop {
             if c >= end || !valid(c, 4) {
                 break c;
@@ -2566,11 +2738,24 @@ impl Cp {
             }
             let at = c;
             let p = |i: u64| f.rd(at + 4 * (1 + i));
-            if is_command(opc) {
+            if is_command(opc) || self.run_multi(opc) {
                 ends.push(next);
                 match opc {
                     op::DRAW_INDIRECT => args.push((draw_base + p(0) as u64, 16)),
                     op::DRAW_INDEX_INDIRECT => args.push((draw_base + p(0) as u64, 20)),
+                    op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI => {
+                        // Its count (from memory) and its records at their
+                        // largest count.
+                        if p(3) & (1 << 30) != 0 {
+                            args.push((addr64(p(5), p(6)), 4));
+                        }
+                        let rec = if opc == op::DRAW_INDEX_INDIRECT_MULTI { 20 } else { 16 };
+                        let stride = if p(7) != 0 { p(7) as u64 } else { rec };
+                        let most = p(4).min(1 << 16) as u64;
+                        if most > 0 {
+                            args.push((draw_base + p(0) as u64, (most - 1) * stride + rec));
+                        }
+                    }
                     // Dispatch arguments the chunks let the GPU read
                     // (`Exec::dispatch_gpu_indirect`) need no wait here
                     // (one per run start cost queue 0x50's runs a GPU round
@@ -2596,6 +2781,10 @@ impl Cp {
                 }
             } else if par_event(opc, self.compute) {
                 sync = true;
+            } else if let Some(k) = self.run_pass(opc, &p) {
+                if k == RUN_PASS_WAIT {
+                    passed.push((at, addr64(p(1), p(2)), opc == op::WAIT_REG_MEM64));
+                }
             } else if !is_state(opc) {
                 // EVENT_WRITE by event type (statistics: partial flushes
                 // and cache events order only GPU work).
@@ -2622,6 +2811,17 @@ impl Cp {
             return;
         }
         lap.mark(2);
+        // The label waits the run holds take their effect on this queue's
+        // view now, as each would when reached (`end_copy_scope_after_wait`):
+        // the run's commands before one are checked as of a view no older
+        // than theirs, and those after it see what the CPU wrote before the
+        // label. In the main command processor's own chunk it passes again.
+        for &(_, a, wide) in &passed {
+            self.last_wait_kind = b'I';
+            self.last_wait_gpu = false;
+            self.end_copy_scope_after_wait(a, wide);
+            RUN_PASSED[1].fetch_add(1, Ordering::Relaxed);
+        }
         // Pending fast clears are applied now (a worker cannot apply one at
         // the image's first use in program order, so each stopped its chunk:
         // ~4 times per frame in the courtyard). The run's start is a
@@ -2789,6 +2989,20 @@ impl Cp {
                         }
                     }
                 }
+                if matches!(opc, op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI) {
+                    let (vtx_loc, inst_loc, id_loc) = (p(1) & 0xFFFF, p(2) & 0xFFFF, p(3) & 0xFFFF);
+                    let inst_loc = if inst_loc != 0 {
+                        inst_loc
+                    } else {
+                        let r = ScanRegs { sh: &st.regs.sh, ctx: &st.regs.ctx };
+                        crate::hle::libs::agc::instance_offset_slot(super::shaders::ngg_addr_of(&r)).map_or(0, |s| 0x8C + s)
+                    };
+                    for r in [vtx_loc, inst_loc, if p(3) & (1 << 31) != 0 { id_loc } else { 0 }] {
+                        if r != 0 && !end_unknown.contains(&r) {
+                            end_unknown.push(r);
+                        }
+                    }
+                }
                 Self::apply_state(&mut st, opc, n, &p);
                 c += 4 * (n + 1);
             }
@@ -2828,6 +3042,7 @@ impl Cp {
         let queue = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
         let mut run = super::par::Run::new(queue);
         run.timed = true;
+        run.passed_waits = std::sync::Arc::from(passed.iter().map(|w| w.0).collect::<Vec<u64>>());
         // (Its workers check as of this command processor's view now.)
         run.fe2_view = self.fe2_view.as_ref().map_or(super::fe2::NO_VIEW, |c| c.load(Ordering::Acquire));
         let run = Arc::new(run);
@@ -3310,7 +3525,7 @@ impl Cp {
             if next > end || !valid(c, 4 * (len + 1)) {
                 break c;
             }
-            if is_command(opc) {
+            if is_command(opc) || self.run_multi(opc) {
                 n += 1;
                 if n >= PAR_MAX {
                     break next;
@@ -3320,7 +3535,10 @@ impl Cp {
                     break c;
                 }
             } else if !(opc == op::SET_BASE || par_event(opc, self.compute) || is_state(opc)) {
-                break c;
+                let at = c;
+                if self.run_pass(opc, &|i: u64| f.rd(at + 4 * (1 + i))).is_none() {
+                    break c;
+                }
             }
             c = next;
         };
@@ -3598,6 +3816,9 @@ impl Cp {
                 }
                 // GPU-side synchronization, CP writes and label waits:
                 // passed (they end synchronization-free runs).
+                // (Those a run holds, `run_pass`, `run_multi`, leave it open.)
+                op::RELEASE_MEM | op::WAIT_REG_MEM | op::WAIT_REG_MEM64 if self.run_pass_here(opcode, &p).is_some() => {}
+                op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI if self.run_multi(opcode) => {}
                 op::EVENT_WRITE | op::ACQUIRE_MEM | op::RELEASE_MEM | op::WRITE_DATA | op::WAIT_REG_MEM | op::WAIT_REG_MEM64 => sync = true,
                 op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX | op::LOAD_UCONFIG_REG | op::INDEX_TYPE | op::INDEX_BASE | op::INDEX_BUFFER_SIZE | op::NUM_INSTANCES | op::CONTEXT_CONTROL => {}
                 op::SET_CONTEXT_REG | op::SET_CONTEXT_REG_INDEX => set(&mut ctx, p(0) & 0xFFFF),

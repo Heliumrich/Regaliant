@@ -8528,6 +8528,9 @@ pub struct Exec {
     /// would need that stops the chunk (`stopped`) before the command
     /// records its own work.
     deferred: bool,
+    /// A graphics parallel worker's executor (`Cp::make_worker_exec`): its
+    /// chunks may record the title's GPU timestamps (`Cp::run_pass`).
+    par_worker: bool,
     /// The open batch's command buffers are claimed (`vk::defer`): its
     /// commands go to lists the submission thread replays into them just
     /// before submitting it (`tune record_defer`).
@@ -9321,6 +9324,7 @@ impl Exec {
                 sync_readers: [0; 2],
                 sync_culprit: None,
                 deferred: false,
+                par_worker: false,
                 batch_lists: false,
                 held: false,
                 past: false,
@@ -12820,7 +12824,7 @@ impl Exec {
     }
 
     pub fn gpu_timestamp(&mut self, a: u64) -> bool {
-        if (self.deferred && !self.held) || a % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(a, 8) {
+        if (self.deferred && !self.held && !self.par_worker) || a % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(a, 8) {
             return false;
         }
         let Some(k) = title_clock_k() else { return false };
@@ -13576,6 +13580,11 @@ impl Exec {
     /// Makes this a deferred executor (`gpu::par` workers).
     pub fn set_deferred(&mut self) {
         self.deferred = true;
+    }
+
+    /// A graphics parallel worker's executor (`par_worker`).
+    pub fn set_par_worker(&mut self) {
+        self.par_worker = true;
     }
 
     /// A deferred executor (`gpu::par` workers record with one).

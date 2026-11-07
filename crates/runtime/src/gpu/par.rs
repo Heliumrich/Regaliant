@@ -2,7 +2,10 @@
 //! parallel recording).
 //!
 //! A long run of commands without synchronization packets between them is
-//! split at command boundaries into chunks. The main command processor
+//! split at command boundaries into chunks. (The graphics queue's runs also
+//! hold the title's GPU timestamps, label waits that held when the run was
+//! planned and multi-draws, `Cp::run_pass`, `Cp::run_multi`: none of them
+//! orders later commands after earlier ones on the hardware.) The main command processor
 //! executes the first chunk itself; the others form a queue (`Run`) that the
 //! workers take in program order: a worker is a command processor of its own
 //! (`Cp`, started from a copy of the register state at the chunk's start)
@@ -130,6 +133,9 @@ pub struct Run {
     /// fe2_share`): the main command processor's own part before the
     /// workers' chunks is part 0, chunk i part i + 1.
     pub id: u64,
+    /// The label waits the run holds (their packets' addresses, ascending):
+    /// they held in guest memory when it was planned (`Cp::run_pass`).
+    pub passed_waits: std::sync::Arc<[u64]>,
 }
 
 /// Run ids (`Run::id`; 0: none).
@@ -153,6 +159,7 @@ impl Run {
             timed: false,
             fe2_view: super::fe2::NO_VIEW,
             id: RUN_IDS.fetch_add(1, Ordering::Relaxed),
+            passed_waits: std::sync::Arc::from(Vec::new()),
         }
     }
 
@@ -483,6 +490,7 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         }
         let mut cp = w.cp.lock();
         cp.set_chunk_state(&state);
+        cp.chunk_waits = run.passed_waits.clone();
         cp.fe2_set_view(run.fe2_view);
         cp.fe2_set_run(run.id, i + 1);
         cp.chunk_start();
@@ -629,7 +637,7 @@ pub fn status() -> String {
         String::new()
     };
     past + &format!(
-        "    parallel runs: {runs} runs ({} split at equal recording cost), {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled; main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}; runs under 32 commands by end {}; compute queues' runs by length {}; by end {}\n",
+        "    parallel runs: {runs} runs ({} split at equal recording cost), {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled; main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}; runs under 32 commands by end {}; compute queues' runs by length {}; by end {}{}\n",
         super::cp::PAR_COSTED.load(Ordering::Relaxed),
         CHUNKS.load(Ordering::Relaxed),
         COMMANDS.load(Ordering::Relaxed),
@@ -651,6 +659,7 @@ pub fn status() -> String {
         ends.join(", "),
         ends_s.join(", "),
         lens_c.join(", "),
-        ends_c.join(", ")
+        ends_c.join(", "),
+        super::cp::run_passed_line()
     )
 }
