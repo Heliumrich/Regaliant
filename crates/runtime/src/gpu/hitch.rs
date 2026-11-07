@@ -465,6 +465,16 @@ pub fn flip(n: u64, us: u64) {
         if kinds.is_empty() { "no long work noted meanwhile".to_string() } else { kinds.join(", ") },
         if longest.is_empty() { String::new() } else { format!("longest: {}", longest.join("; ")) }
     );
+    // The title's main thread meanwhile (`DS_HITCH_TRACE=1`).
+    if let Some(t) = crate::guestprof::explain(prev, us) {
+        crate::info!("hitch title: flip {n}: {t}");
+    }
+    if let Some(t) = crate::guestprof::explain_cp(prev, us) {
+        crate::info!("hitch CP: flip {n}: {t}");
+    }
+    if let Some(t) = crate::guestprof::explain_par(prev, us) {
+        crate::info!("hitch par: flip {n}: {t}");
+    }
     s.hitches += 1;
     s.excess += excess;
     s.by_kind[top] += excess;

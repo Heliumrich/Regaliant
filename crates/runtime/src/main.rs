@@ -264,6 +264,7 @@ pub fn keep_run(reason: &str) {
 ///   convars                  the PC settings' title console variables and their values
 ///   convar <name> <value>    one of them set (`title`: the title's own again; tests)
 ///   shot <name>              screenshot of the next presented flip -> shot_<name>.png
+///   burst <name> <n> [x y w h]  shots of the next n flips, each one (cropped) -> <name>_NNN.png
 ///   dump                     dump all GPU images at the next flip
 ///   trace                    log every draw/dispatch of an upcoming flip (FRAME lines)
 ///   loglevel trace|debug|info  change logging at run time (trace = every HLE call)
@@ -384,6 +385,14 @@ fn poll_control(path: &Path, offset: &mut u64) {
             "shot" => {
                 let name: String = parts.next().unwrap_or("x").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
                 *hle::libs::videoout::SHOT_REQUEST.lock() = Some(name);
+                Ok(())
+            }
+            "burst" => {
+                let name: String = parts.next().unwrap_or("burst").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
+                let count = parts.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(30).clamp(1, 600);
+                let nums: Vec<u32> = parts.filter_map(|v| v.parse().ok()).collect();
+                let crop = (nums.len() == 4).then(|| (nums[0], nums[1], nums[2], nums[3]));
+                *hle::libs::videoout::BURST.lock() = Some(hle::libs::videoout::Burst { name, left: count, index: 0, crop });
                 Ok(())
             }
             "dump" => {
@@ -1315,6 +1324,8 @@ fn main() {
     }
     thread::apply_power_optout(gpu::tune::power_optout());
     hle::kernel::time::init();
+    // (Its samples are timed by the process clock.)
+    guestprof::start_trace();
     if !cfg.headless {
         if let Err(e) = gpu::vk::present::init("dsport - Demon's Souls (PPSA01341)") {
             warn!("no presentation window: {e}");

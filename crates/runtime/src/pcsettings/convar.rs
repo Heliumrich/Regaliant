@@ -56,6 +56,10 @@ pub const VARS: &[Var] = &[
     v("r_tessellationSmallestEdgeLength", 0x24bc7b7, 0x2f2bd88, Kind::Float),
     // An enum (an int in the render settings): EAAMethods::Off 0, TAA 1 (the title's).
     v("r_aaMethod", 0x246708e, 0x2f0d5d8, Kind::Int),
+    // The wind simulation the grass and plants sway by (diagnosis: the grass glitch).
+    v("r_windSimEnable", 0x2482de5, 0x2f24508, Kind::Bool),
+    v("r_windSimAsync", 0x2407e6d, 0x2f245f8, Kind::Bool),
+    v("r_virtualGeometryDisplacement_Enable", 0x24a087d, 0x2f2e1b8, Kind::Bool),
 ];
 
 const VALUE: u64 = 0x68;

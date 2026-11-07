@@ -477,7 +477,7 @@ fn reap_dead_images() {
                         ctx().device.destroy_image_view(v, None);
                     }
                     ctx().device.destroy_image(d.img.image, None);
-                    ctx().device.free_memory(d.img.mem, None);
+                    super::slab::free(d.img.mem);
                 }
                 false
             }

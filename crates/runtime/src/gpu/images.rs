@@ -741,7 +741,7 @@ pub struct Image {
     /// `fillimg cs=`).
     writer: u64,
     /// Its device memory and bytes, and the frame of its last use.
-    mem: vk::DeviceMemory,
+    mem: super::slab::Mem,
     bytes: u64,
     used: UseStamp,
 }
@@ -789,7 +789,7 @@ impl std::fmt::Debug for UseStamp {
 /// once no batch can use it any more (`exec::bury_images`).
 pub struct Evicted {
     pub image: vk::Image,
-    pub mem: vk::DeviceMemory,
+    pub mem: super::slab::Mem,
     pub views: Vec<vk::ImageView>,
 }
 
@@ -830,6 +830,8 @@ pub fn maybe_evict() {
     LAST.store(ms, Relaxed);
     let frame = super::FRAMES.load(Relaxed);
     let Some((used, budget)) = ctx().device_budget() else { return };
+    // (Slab memory no image uses is free for new images.)
+    let used = used.saturating_sub(super::slab::idle_bytes());
     let (mut high, mut low) = (budget / 100 * super::tune::vram_high(), budget / 100 * super::tune::vram_low());
     // What the heap leaves beside other processes' dedicated memory, less
     // `vram_others` MiB (high) and a GiB more (low).
@@ -2435,7 +2437,7 @@ impl Images {
     }
 
     /// Creates the VkImage for `key` (GENERAL layout, contents undefined).
-    fn create(&mut self, key: ImageKey) -> Result<(vk::Image, vk::DeviceMemory, u64), String> {
+    fn create(&mut self, key: ImageKey) -> Result<(vk::Image, super::slab::Mem, u64), String> {
         let c = ctx();
         let props = unsafe { c.instance.get_physical_device_format_properties(c.pdev, key.format) };
         let f = props.optimal_tiling_features;
@@ -2484,9 +2486,15 @@ impl Images {
             let t0 = std::time::Instant::now();
             let image = c.device.create_image(&ci, None).map_err(|e| format!("vkCreateImage {key:?}: {e}"))?;
             let req = c.device.get_image_memory_requirements(image);
-            let mem = c.alloc(req, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-            c.device.bind_image_memory(image, mem, 0).map_err(|e| format!("bind image: {e}"))?;
-            super::hitch::note_since(super::hitch::Kind::Upload, t0, || format!("image creation {}x{} ({} MiB)", key.width, key.height, req.size >> 20));
+            let t1 = std::time::Instant::now();
+            let mem = super::slab::alloc(req)?;
+            let t2 = std::time::Instant::now();
+            c.device.bind_image_memory(image, mem.memory, mem.offset).map_err(|e| format!("bind image: {e}"))?;
+            // (Its parts: the image, the memory's allocation, the bind.)
+            super::hitch::note_since(super::hitch::Kind::Upload, t0, || {
+                let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+                format!("image creation {}x{} ({} MiB; create {:.1}, allocate {:.1}, bind {:.1} ms)", key.width, key.height, req.size >> 20, ms(t1 - t0), ms(t2 - t1), ms(t2.elapsed()))
+            });
             Ok((image, mem, req.size))
         }
     }
@@ -5393,7 +5401,7 @@ impl Images {
             gpu
         };
         format!(
-            "    images: {} cached ({} MiB; GPU-written {} ({} MiB), kept for the session; {} textures evicted, {} MiB, in {} rounds), {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes); CPU-detiled: staging buffers taken {} ms ({} from the pool, {} made for it, {} outside it: over 64 MiB), detiling into them {} ms, first uploads' hashes {} ms), {} ms staging, {} ms transfers; waits for uploads in flight {}; batched (`tune upload_batch`) {} in {} command buffers, {} waits; pages checked in the mapping table {}, again with the operating system {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages, {} found clean by a probe); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}{gpu}\n",
+            "    images: {} cached ({} MiB; GPU-written {} ({} MiB), kept for the session; {} textures evicted, {} MiB, in {} rounds), {} uploads ({} re-uploads; {} MiB, {} ms detiling and copying: 2D {} MiB, {} ms detiling ({} ms choosing (mapping queries, hashes); CPU-detiled: staging buffers taken {} ms ({} from the pool, {} made for it, {} outside it: over 64 MiB), detiling into them {} ms, first uploads' hashes {} ms), {} ms staging, {} ms transfers; waits for uploads in flight {}; batched (`tune upload_batch`) {} in {} command buffers, {} waits; pages checked in the mapping table {}, again with the operating system {}); partial re-uploads {} ({} (mip, layer)s uploaded, {} left out, {} of them unchanged written ones, {} MiB){check}; write-watch takes (all) {} ({:.1} us each, {} pages, {} found clean by a probe); GPU-owned images overwritten through buffers: {} cleared ({} right after a zero fill, no wait), {} uploaded; re-uploads after mapping changes: {}{gpu}; {}\n",
             self.map.len(),
             IMAGE_BYTES.load(Relaxed) >> 20,
             self.map.values().filter(|i| i.gpu_written).count(),
@@ -5434,7 +5442,8 @@ impl Images {
             self.overwrite_clears,
             ZERO_FILL_CLEARS.load(std::sync::atomic::Ordering::Relaxed),
             self.overwrite_uploads,
-            remaps.join(", ")
+            remaps.join(", "),
+            super::slab::status()
         ) + &zero_census_line()
     }
 }

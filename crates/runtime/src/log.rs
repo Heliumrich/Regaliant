@@ -35,8 +35,18 @@ pub fn init(path: &Path) -> std::io::Result<()> {
     START.get_or_init(Instant::now);
     let f = File::create(path)?;
     *SINK.lock() = Some(BufWriter::with_capacity(1 << 20, f));
+    // Buffered lines reach the file within a quarter second (warnings are not flushed where they
+    // are logged: one arrivals boot logs ~9,000 of them, many on the command processors).
+    let _ = std::thread::Builder::new().name("log-flush".into()).spawn(|| loop {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        try_flush();
+    });
     Ok(())
 }
+
+/// Warnings copied to stderr: the first ones only (each copy is a write on the thread that logs).
+const STDERR_WARNINGS: u32 = 100;
+static WARNINGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 pub fn set_thread_name(name: &str) {
     THREAD_NAME.with(|n| *n.borrow_mut() = name.to_string());
@@ -71,16 +81,19 @@ pub fn write(level: Level, args: fmt::Arguments) {
         Level::Trace => "T",
     };
     let line = format!("[{:>10.3}][{}] {}: {}\n", elapsed_ms(), thread_name(), tag, args);
-    if level <= Level::Warn {
+    // Errors go to stderr and the file at once; warnings to stderr only the first ones, and to
+    // the file through its buffer (flushed every 250 ms, and by the crash handlers).
+    let echo = level == Level::Error || (level == Level::Warn && WARNINGS.fetch_add(1, Ordering::Relaxed) < STDERR_WARNINGS);
+    if echo {
         let _ = std::io::stderr().write_all(line.as_bytes());
     }
     let mut sink = SINK.lock();
     if let Some(w) = sink.as_mut() {
         let _ = w.write_all(line.as_bytes());
-        if level <= Level::Warn {
+        if level == Level::Error {
             let _ = w.flush();
         }
-    } else if level > Level::Warn {
+    } else if !echo {
         let _ = std::io::stderr().write_all(line.as_bytes());
     }
 }

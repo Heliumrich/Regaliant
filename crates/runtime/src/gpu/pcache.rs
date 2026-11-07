@@ -353,6 +353,9 @@ fn prune(dir: &Path) {
 /// Creates a pipeline through the cache file of `key` (`kind`: 'c' compute,
 /// 'g' graphics, 'i' the runtime's own): `create` gets the pipeline cache to
 /// pass to vkCreate*Pipelines.
+/// Pipeline creations running now (any thread; diagnosis of stalled submissions).
+pub static CREATING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub fn with_cache<T>(kind: char, key: u64, create: impl FnOnce(vk::PipelineCache) -> T) -> T {
     let d = &ctx().device;
     let t = std::time::Instant::now();
@@ -380,7 +383,9 @@ pub fn with_cache<T>(kind: char, key: u64, create: impl FnOnce(vk::PipelineCache
         .or_else(|_| unsafe { d.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) })
         .unwrap_or(vk::PipelineCache::null());
     lap(1, &mut t);
+    CREATING.fetch_add(1, Ordering::Relaxed);
     let r = create(cache);
+    CREATING.fetch_sub(1, Ordering::Relaxed);
     lap(2, &mut t);
     if cache == vk::PipelineCache::null() {
         DATA.with(|b| *b.borrow_mut() = decoded);

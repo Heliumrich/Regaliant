@@ -796,6 +796,25 @@ impl Ctx {
     }
 }
 
+/// A main-queue call that took 2 ms or more (the queue's lock from `t0` to `t1`, the call after
+/// it) as a hitch cause, with the pipeline creations running meanwhile (diagnosis: submissions
+/// stalled while the driver compiles).
+pub fn note_submit(what: &'static str, t0: std::time::Instant, t1: std::time::Instant) {
+    let all = t0.elapsed();
+    if all.as_micros() < 2000 {
+        return;
+    }
+    let lock = t1 - t0;
+    crate::gpu::hitch::note_since(crate::gpu::hitch::Kind::GpuWait, t0, || {
+        format!(
+            "{what} held up: queue lock {:.1} ms, call {:.1} ms; pipeline creations running {}",
+            lock.as_secs_f64() * 1e3,
+            (all - lock).as_secs_f64() * 1e3,
+            crate::gpu::pcache::CREATING.load(Ordering::Relaxed)
+        )
+    });
+}
+
 /// `DS_GPU_COMPAT=amd|intel` (boot; a test of the fallbacks for other GPUs on this machine): the
 /// device is used with the feature set current AMD (RDNA2) or Intel (Arc A-series) Windows
 /// drivers have where NVIDIA can reproduce it (vulkan.gpuinfo.org reports of 2025-2026,
@@ -1281,10 +1300,15 @@ impl Ctx {
             let si = vk::SubmitInfo2::default().command_buffer_infos(&cbs).wait_semaphore_infos(&ws).signal_semaphore_infos(&ss);
             return unsafe { self.device.queue_submit2(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit2 (compute queue): {e}"));
         }
+        let t0 = std::time::Instant::now();
         let q = self.queue.lock();
+        let t1 = std::time::Instant::now();
         ss.extend(self.progress_signal());
         let si = vk::SubmitInfo2::default().command_buffer_infos(&cbs).wait_semaphore_infos(&ws).signal_semaphore_infos(&ss);
-        unsafe { self.device.queue_submit2(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit2: {e}"))
+        let r = unsafe { self.device.queue_submit2(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit2: {e}"));
+        drop(q);
+        note_submit("vkQueueSubmit2", t0, t1);
+        r
     }
 
     /// With the compute family's queue: the main queue's progress signal
@@ -1325,7 +1349,9 @@ impl Ctx {
                 w
             })
             .collect();
+        let t0 = std::time::Instant::now();
         let q = self.queue.lock();
+        let t1 = std::time::Instant::now();
         let ss: Vec<Vec<vk::SemaphoreSubmitInfo>> = (0..batches.len())
             .map(|k| {
                 let mut v = vec![vk::SemaphoreSubmitInfo::default().semaphore(self.batches).value(batches[k].2).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
@@ -1338,7 +1364,10 @@ impl Ctx {
             })
             .collect();
         let infos: Vec<vk::SubmitInfo2> = (0..batches.len()).map(|k| vk::SubmitInfo2::default().command_buffer_infos(&cbs[k]).wait_semaphore_infos(&ws[k]).signal_semaphore_infos(&ss[k])).collect();
-        unsafe { self.device.queue_submit2(*q, &infos, fence) }.map_err(|e| format!("vkQueueSubmit2 ({} batches): {e}", batches.len()))
+        let r = unsafe { self.device.queue_submit2(*q, &infos, fence) }.map_err(|e| format!("vkQueueSubmit2 ({} batches): {e}", batches.len()));
+        drop(q);
+        note_submit("vkQueueSubmit2 (batches)", t0, t1);
+        r
     }
 
     /// Waits until the main queue's batch `seq` completed (`batches`);

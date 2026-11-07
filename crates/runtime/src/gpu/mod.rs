@@ -1815,6 +1815,7 @@ pub mod pstats;
 pub mod ranges;
 pub mod homes;
 pub mod resident;
+pub mod slab;
 pub mod timeline;
 pub mod replay;
 pub mod threadcpu;

@@ -1768,8 +1768,13 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
             let r = {
                 // (On the main family's second queue it cost the same:
                 // FINDINGS.md 2026-11-01.)
+                let t0 = std::time::Instant::now();
                 let q = c.queue.lock();
-                unsafe { c.device.queue_bind_sparse(*q, &[info], fence) }
+                let t1 = std::time::Instant::now();
+                let r = unsafe { c.device.queue_bind_sparse(*q, &[info], fence) };
+                drop(q);
+                super::vk::note_submit("vkQueueBindSparse", t0, t1);
+                r
             };
             let r = r.map_err(|e| format!("vkQueueBindSparse: {e}")).and_then(|_| unsafe { c.device.wait_for_fences(&[fence], true, u64::MAX) }.map_err(|e| format!("bind fence: {e}")));
             unsafe { c.device.destroy_fence(fence, None) };

@@ -106,6 +106,68 @@ fn module_offset(addr: u64) -> Option<(String, u64)> {
     }
 }
 
+/// Another module's address by the export it lies in: "module!Export" within 0x40 bytes of an
+/// export's start (the system call stubs are 0x20 bytes, so a thread in a system call is named by
+/// it), else "module+offset" (the offset's 4 KiB page). Cached per address (the hitch flight recorder's samples).
+pub fn export_label(addr: u64) -> String {
+    use windows_sys::Win32::System::LibraryLoader::{GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleHandleExW};
+    type Exports = std::collections::HashMap<u64, std::sync::Arc<Vec<(u32, String)>>>;
+    static CACHE: parking_lot::Mutex<Option<(std::collections::HashMap<u64, String>, Exports)>> = parking_lot::Mutex::new(None);
+    if let Some(s) = CACHE.lock().as_ref().and_then(|c| c.0.get(&addr)) {
+        return s.clone();
+    }
+    let mut m = std::ptr::null_mut();
+    if unsafe { GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, addr as *const u16, &mut m) } == 0 {
+        return format!("{addr:#x}");
+    }
+    let base = m as u64;
+    let module = host_module(addr);
+    let exports = {
+        let mut g = CACHE.lock();
+        let c = g.get_or_insert_with(Default::default);
+        c.1.entry(base).or_insert_with(|| std::sync::Arc::new(unsafe { export_table(base) })).clone()
+    };
+    let rva = (addr - base) as u32;
+    let i = exports.partition_point(|e| e.0 <= rva);
+    let label = match i.checked_sub(1).map(|i| &exports[i]) {
+        Some((at, name)) if rva - at < 0x40 => format!("{module}!{name}"),
+        // (Inside a function of no export: by its 4 KiB page, so samples group.)
+        _ => format!("{module}+{:#x}", rva & !0xFFF),
+    };
+    CACHE.lock().get_or_insert_with(Default::default).0.insert(addr, label.clone());
+    label
+}
+
+/// A loaded module's named exports by RVA (code and data alike; forwarders left out).
+unsafe fn export_table(base: u64) -> Vec<(u32, String)> {
+    unsafe {
+        let nt = base + *((base + 0x3C) as *const u32) as u64;
+        // (IMAGE_OPTIONAL_HEADER64's data directories start at +0x70; the export one first.)
+        let dir_rva = *((nt + 0x18 + 0x70) as *const u32) as u64;
+        let dir_size = *((nt + 0x18 + 0x74) as *const u32) as u64;
+        if dir_rva == 0 {
+            return Vec::new();
+        }
+        let d = base + dir_rva;
+        let names = *((d + 0x18) as *const u32) as usize;
+        let funcs = base + *((d + 0x1C) as *const u32) as u64;
+        let name_rvas = base + *((d + 0x20) as *const u32) as u64;
+        let ords = base + *((d + 0x24) as *const u32) as u64;
+        let mut v = Vec::with_capacity(names);
+        for k in 0..names {
+            let ord = *((ords + 2 * k as u64) as *const u16) as u64;
+            let f = *((funcs + 4 * ord) as *const u32);
+            if (f as u64) >= dir_rva && (f as u64) < dir_rva + dir_size {
+                continue;
+            }
+            let np = (base + *((name_rvas + 4 * k as u64) as *const u32) as u64) as *const std::ffi::c_char;
+            v.push((f, std::ffi::CStr::from_ptr(np).to_string_lossy().into_owned()));
+        }
+        v.sort_unstable();
+        v
+    }
+}
+
 /// The file name of the module containing `addr` ("?" if none).
 fn host_module(addr: u64) -> String {
     use windows_sys::Win32::System::LibraryLoader::{GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW, GetModuleHandleExW};

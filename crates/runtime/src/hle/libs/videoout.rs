@@ -498,6 +498,28 @@ fn present_buffer(b: &DisplayBuffer) {
 /// Screenshot requested through the control channel (file name stem).
 pub static SHOT_REQUEST: Mutex<Option<String>> = Mutex::new(None);
 
+/// A burst of shots of consecutive flips (`burst`: diagnosis of one-frame glitches): the name
+/// stem, the shots left, the next index and a crop (x, y, width, height) of the frame.
+pub struct Burst {
+    pub name: String,
+    pub left: u32,
+    pub index: u32,
+    pub crop: Option<(u32, u32, u32, u32)>,
+}
+pub static BURST: Mutex<Option<Burst>> = Mutex::new(None);
+
+/// A crop of an RGBA8 frame (clamped to it).
+fn crop_rgba(rgba: &[u8], w: u32, h: u32, c: (u32, u32, u32, u32)) -> (Vec<u8>, u32, u32) {
+    let (x, y) = (c.0.min(w), c.1.min(h));
+    let (cw, ch) = (c.2.min(w - x), c.3.min(h - y));
+    let mut out = Vec::with_capacity((cw * ch * 4) as usize);
+    for row in y..y + ch {
+        let a = ((row * w + x) * 4) as usize;
+        out.extend_from_slice(&rgba[a..a + (cw * 4) as usize]);
+    }
+    (out, cw, ch)
+}
+
 /// Screenshots being converted, encoded and written on threads of their own
 /// (`maybe_screenshot`); `wait_shots` waits for them at shutdown.
 static SHOTS_PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -511,7 +533,20 @@ pub fn wait_shots() {
 }
 
 fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
-    let requested = SHOT_REQUEST.lock().take();
+    let mut requested = SHOT_REQUEST.lock().take();
+    let mut crop = None;
+    if requested.is_none() {
+        let mut g = BURST.lock();
+        if let Some(b) = g.as_mut() {
+            requested = Some(format!("{}_{:03}", b.name, b.index));
+            crop = b.crop;
+            b.index += 1;
+            b.left = b.left.saturating_sub(1);
+            if b.left == 0 {
+                *g = None;
+            }
+        }
+    }
     let listed = std::env::var("DS_SCREENSHOT").is_ok_and(|list| list.split(',').any(|s| s.trim().parse::<u64>().ok() == Some(flip)));
     if requested.is_none() && !listed {
         return;
@@ -540,9 +575,13 @@ fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
         Ok((raw, format, w, h, path)) => {
             SHOTS_PENDING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let write = move || {
-                let r = crate::gpu::images::to_rgba8(format, &raw)
-                    .ok_or_else(|| format!("no RGBA8 conversion for {format:?}"))
-                    .and_then(|rgba| std::fs::write(&path, crate::gpu::png::encode(w, h, &rgba)).map_err(|e| e.to_string()));
+                let r = crate::gpu::images::to_rgba8(format, &raw).ok_or_else(|| format!("no RGBA8 conversion for {format:?}")).and_then(|rgba| {
+                    let (rgba, w, h) = match crop {
+                        Some(c) => crop_rgba(&rgba, w, h, c),
+                        None => (rgba, w, h),
+                    };
+                    std::fs::write(&path, crate::gpu::png::encode(w, h, &rgba)).map_err(|e| e.to_string())
+                });
                 match r {
                     Ok(()) => crate::info!("screenshot of flip {flip} (buffer {addr:#x}): {}", path.display()),
                     Err(e) => crate::warn!("screenshot of flip {flip} (buffer {addr:#x}) unavailable: {e}"),
