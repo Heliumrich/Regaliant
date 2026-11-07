@@ -8544,6 +8544,9 @@ pub struct Exec {
     /// The graphics queue's handshake census (`gpu::hscensus`): the segment
     /// the commands this executor records belong to (0: not counted).
     pub(super) hs_seg: u64,
+    /// What the batch being recorded wrote by GPU-performed CP writes and
+    /// the title's GPU timestamps (`only_effect_writes`).
+    effect_writes: super::ranges::Ranges,
     /// The open batch's command buffers are claimed (`vk::defer`): its
     /// commands go to lists the submission thread replays into them just
     /// before submitting it (`tune record_defer`).
@@ -9340,6 +9343,7 @@ impl Exec {
                 par_worker: false,
                 run_writes: Vec::new(),
                 hs_seg: 0,
+                effect_writes: Default::default(),
                 batch_lists: false,
                 held: false,
                 past: false,
@@ -9758,6 +9762,7 @@ impl Exec {
         self.ts_pool_reset = false;
         self.ops = [0; OPS];
         self.ts_deferred.clear();
+        self.effect_writes = Default::default();
         self.eop_unordered = false;
         note_seg_use(self.deferred, self.compute_cp, self.shadow_used, 0);
         self.shadow_used = 0;
@@ -12749,6 +12754,7 @@ impl Exec {
         }
         let cmd = self.cmd();
         let raw: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
+        self.effect_writes.insert(a, bytes);
         let to_mirror = |cmd: vk::CommandBuffer| {
             if let Some((m, off)) = fe2_mirror {
                 unsafe { ctx().device.cmd_update_buffer(cmd, m, off, &raw) };
@@ -12916,6 +12922,7 @@ impl Exec {
         self.ts_deferred.push(TsEntry { q, buffer, off, k });
         EOP_LIGHT[1].fetch_add(1, Ordering::Relaxed);
         self.taint_resident(a, 8);
+        self.effect_writes.insert(a, 8);
         self.note_write(a, 8);
         self.ops[OP_TIMESTAMPS] += 1;
         if GPU_TIMESTAMPS.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -13600,6 +13607,13 @@ impl Exec {
     /// What the batch being recorded writes (a parallel run's planning).
     pub fn unsubmitted_writes(&self) -> super::ranges::Ranges {
         if self.recording { self.pending.clone() } else { Default::default() }
+    }
+
+    /// Whether the batch being recorded holds no command and writes only
+    /// what its GPU-performed CP writes and the title's timestamps write
+    /// (labels and stamps, which no worker's preparation reads).
+    pub fn only_effect_writes(&self) -> bool {
+        self.recording && self.batch_shaders.is_empty() && self.pending.iter().all(|(a, n)| self.effect_writes.contains(a, n))
     }
 
 

@@ -791,8 +791,12 @@ pub fn run_passed_line() -> String {
     if v.iter().all(|&x| x == 0) {
         return String::new();
     }
-    format!("; runs' held packets: label waits passed when planned {}, timestamps recorded by workers {}, label waits passed by workers {}, CP writes performed by workers {} (chunks stopped reading an earlier chunk's {})", v[1], v[2], v[3], v[0], super::exec::RUN_WRITE_STOPS.load(Ordering::Relaxed))
+    format!("; runs' held packets: label waits passed when planned {}, timestamps recorded by workers {}, label waits passed by workers {}, CP writes performed by workers {} (chunks stopped reading an earlier chunk's {}); batches of labels and stamps kept open into a run {}", v[1], v[2], v[3], v[0], super::exec::RUN_WRITE_STOPS.load(Ordering::Relaxed), PRE_RUN_KEPT.load(Ordering::Relaxed))
 }
+
+/// Batches with no command, writing labels and stamps only, that went on as
+/// the graphics command processor's own part of a run (`Cp::par_plan`).
+pub static PRE_RUN_KEPT: AtomicU64 = AtomicU64::new(0);
 
 /// Command-buffer ends that left the batch open (`tune cmdbuf_merge`).
 pub static CMDBUF_MERGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3259,7 +3263,15 @@ impl Cp {
         }
         lap.mark(7);
         if !main_writes.is_empty() {
-            self.submit_gpu("parallel run");
+            // (A batch with no command that writes only labels and stamps goes
+            // on as this command processor's own part of the run: a batch,
+            // its submission and a batch start less; since 2026-11-07 night:
+            // the vista x1.006, Doran x1.008, FINDINGS.md.)
+            if self.main_gfx && !self.compute && self.exec.as_ref().is_some_and(|e| e.only_effect_writes()) {
+                PRE_RUN_KEPT.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.submit_gpu("parallel run");
+            }
         }
         lap.mark(8);
         let queue = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
