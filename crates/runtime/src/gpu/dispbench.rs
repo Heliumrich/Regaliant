@@ -56,8 +56,61 @@ fn submit_bench(secs: u64) -> Result<(), String> {
         let fences: Vec<vk::Fence> = (0..K).map(|_| d.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)).collect::<Result<_, _>>().map_err(|e| format!("fence: {e}"))?;
         (cmds, fences)
     };
+    // `DS_SUBMIT_BENCH_ALLOCS=<n>`: n allocations of 1 MiB held meanwhile, half device-local and
+    // half host-visible (the game holds thousands: imports, slabs, the mirror's blocks): whether
+    // the driver's work per submission or its periodic passes grow with them.
+    let n_allocs = std::env::var("DS_SUBMIT_BENCH_ALLOCS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+    let mut held = Vec::with_capacity(n_allocs);
+    for i in 0..n_allocs {
+        let r = if i % 2 == 0 { c.device_buffer(1 << 20, vk::BufferUsageFlags::TRANSFER_DST).map(|(b, m)| (b, m)) } else { c.host_buffer(1 << 20, vk::BufferUsageFlags::TRANSFER_SRC).map(|(b, m, _)| (b, m)) };
+        match r {
+            Ok(x) => held.push(x),
+            Err(e) => {
+                crate::warn!("submit bench: allocation {i} failed: {e}");
+                break;
+            }
+        }
+    }
+    if n_allocs > 0 {
+        crate::info!("submit bench: {} allocations of 1 MiB held", held.len());
+    }
     let start = std::time::Instant::now();
     let end = start + std::time::Duration::from_secs(secs);
+    // `DS_SUBMIT_BENCH_LOAD=1`: a second thread keeps the GPU busy in bursts of varying length
+    // (fills of a 512 MiB buffer, 0-30 ms apart), as a game's load varies: whether the driver's
+    // clock and power changes under it stall submissions.
+    let load = std::env::var("DS_SUBMIT_BENCH_LOAD").ok().as_deref() == Some("1");
+    let loader = load.then(|| {
+        std::thread::spawn(move || -> Result<u64, String> {
+            let c = ctx();
+            let d = &c.device;
+            let size = 512u64 << 20;
+            let (big, _bmem) = c.device_buffer(size, vk::BufferUsageFlags::TRANSFER_DST)?;
+            let (cmd, fence) = unsafe {
+                let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(c.queue_family), None).map_err(|e| format!("pool: {e}"))?;
+                let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).map_err(|e| format!("cmd: {e}"))?[0];
+                d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).map_err(|e| format!("begin: {e}"))?;
+                for _ in 0..8 {
+                    d.cmd_fill_buffer(cmd, big, 0, size, 0x5a5a_5a5a);
+                }
+                d.end_command_buffer(cmd).map_err(|e| format!("end: {e}"))?;
+                (cmd, d.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| format!("fence: {e}"))?)
+            };
+            let mut bursts = 0u64;
+            let mut x = 0x9E37_79B9u32;
+            while std::time::Instant::now() < end {
+                unsafe { d.reset_fences(&[fence]).map_err(|e| format!("reset: {e}"))? };
+                c.submit(cmd, &[], &[], fence)?;
+                unsafe { d.wait_for_fences(&[fence], true, u64::MAX).map_err(|e| format!("wait: {e}"))? };
+                bursts += 1;
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                std::thread::sleep(std::time::Duration::from_millis((x % 31) as u64));
+            }
+            Ok(bursts)
+        })
+    });
     let (mut n, mut slow) = (0u64, Vec::new());
     let mut worst = 0u128;
     while std::time::Instant::now() < end {
@@ -75,6 +128,13 @@ fn submit_bench(secs: u64) -> Result<(), String> {
         }
         n += 1;
         std::thread::sleep(std::time::Duration::from_micros(900));
+    }
+    if let Some(h) = loader {
+        match h.join() {
+            Ok(Ok(b)) => crate::info!("submit bench: the load thread ran {b} bursts"),
+            Ok(Err(e)) => crate::warn!("submit bench: the load thread failed: {e}"),
+            Err(_) => crate::warn!("submit bench: the load thread panicked"),
+        }
     }
     unsafe { d.queue_wait_idle(*c.queue.lock()).ok() };
     let gaps: Vec<f64> = slow.windows(2).map(|w| w[1].0 - w[0].0).collect();
