@@ -5,6 +5,11 @@
 //! of a slab keep an allocation of their own. Only images go into slabs (all optimally tiled,
 //! so bufferImageGranularity does not apply). In the 23 arrivals of 1-1 the time over the median
 //! went from 6.1 to 5.8 s and the worst frame from 267 to 217 ms, the GPU's time per frame level.
+//!
+//! Only with a device-local heap of 16 GiB or more (`on`): under a small budget the image cache
+//! evicts, and an evicted image's range stays a hole in its slab until the slab empties (an 8 GB
+//! budget left 29 slabs half used after evicting 1.9 GB), video memory that eviction exists to
+//! give back. Smaller cards keep an allocation per image, as before.
 
 use super::vk::ctx;
 use ash::vk;
@@ -90,6 +95,12 @@ static WAKE: Condvar = Condvar::new();
 static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 /// A slab's size: a 64th of the video memory, 64-256 MiB.
+/// Slabs in use: a device-local heap of 16 GiB or more (at most `vram_cap`).
+pub fn on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| ctx().device_heap_size() >= 16 << 30)
+}
+
 fn slab_size() -> u64 {
     static SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| (ctx().device_heap_size() / 64).clamp(64 << 20, 256 << 20) & !((1 << 20) - 1))
@@ -113,6 +124,9 @@ fn own(req: vk::MemoryRequirements) -> Result<Mem, String> {
 
 /// Memory for an image with requirements `req` (bound at `offset` of `memory`).
 pub fn alloc(req: vk::MemoryRequirements) -> Result<Mem, String> {
+    if !on() {
+        return own(req);
+    }
     let size = slab_size();
     if req.size > size / 8 {
         return own(req);
@@ -253,6 +267,9 @@ pub fn free(m: Mem) {
 /// Video memory the slabs hold but no image uses (free ranges and spares), bytes: memory that
 /// new images take without an allocation (`images::maybe_evict` counts it as free).
 pub fn idle_bytes() -> u64 {
+    if !on() {
+        return 0;
+    }
     let g = STATE.lock();
     let holes: u64 = g.slabs.iter().flatten().map(|s| s.size - s.used).sum();
     holes + g.spare.len() as u64 * slab_size()
@@ -261,6 +278,9 @@ pub fn idle_bytes() -> u64 {
 /// Status line part.
 pub fn status() -> String {
     let st: Vec<u64> = STATS.iter().map(|c| c.load(Relaxed)).collect();
+    if !on() {
+        return format!("image memory: no slabs (a device-local heap under 16 GiB), {} images with their own ({} MiB; {} allocations, {} ms)", st[2], st[3] >> 20, st[9], st[10] / 1_000_000);
+    }
     let g = STATE.lock();
     let slabs: Vec<&Slab> = g.slabs.iter().flatten().collect();
     let bytes: u64 = slabs.iter().map(|s| s.size).sum();
