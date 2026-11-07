@@ -475,6 +475,9 @@ pub fn flip(n: u64, us: u64) {
     if let Some(t) = crate::guestprof::explain_par(prev, us) {
         crate::info!("hitch par: flip {n}: {t}");
     }
+    if let Some(t) = crate::guestprof::explain_submit(prev, us) {
+        crate::info!("hitch submit: flip {n}: {t}");
+    }
     s.hitches += 1;
     s.excess += excess;
     s.by_kind[top] += excess;

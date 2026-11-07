@@ -153,6 +153,9 @@ struct Trace {
     cp: std::collections::VecDeque<(u64, Vec<u32>, u64)>,
     /// Its parallel recording workers (gpu-gfx-par*) that ran since the last tick, alike.
     par: std::collections::VecDeque<(u64, Vec<u32>, u64)>,
+    /// The submission thread (`gpu-submit`), alike: where its calls into the driver wait
+    /// (FINDINGS.md 2026-11-07: vkQueueSubmit2 blocking 2-34 ms ~6 times a second).
+    sub: std::collections::VecDeque<(u64, Vec<u32>, u64)>,
     labels: Vec<String>,
     index: HashMap<String, u32>,
 }
@@ -177,7 +180,7 @@ pub fn start_trace() {
     if std::env::var("DS_HITCH_TRACE").ok().as_deref() != Some("1") {
         return;
     }
-    *TRACE.lock() = Some(Trace { main: Default::default(), workers: Default::default(), cp: Default::default(), par: Default::default(), labels: Vec::new(), index: HashMap::new() });
+    *TRACE.lock() = Some(Trace { main: Default::default(), workers: Default::default(), cp: Default::default(), par: Default::default(), sub: Default::default(), labels: Vec::new(), index: HashMap::new() });
     let _ = crate::thread::spawn_host("hitch-trace", 1 << 20, Box::new(tracer));
     crate::info!("hitch trace: the title's main thread, the graphics command processor and its parallel workers sampled every 2 ms, explained after each hitch");
 }
@@ -193,6 +196,7 @@ fn tracer() {
     let mut main_tid = 0u32;
     let mut cp_tid = 0u32;
     let mut par_tids: Vec<u32> = Vec::new();
+    let mut sub_tid = 0u32;
     let mut worker_tids: Vec<u32> = Vec::new();
     loop {
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -212,6 +216,7 @@ fn tracer() {
             let fe = crate::gpu::cpu_threads();
             cp_tid = fe.iter().find(|t| t.0 == "gfx").map_or(0, |t| t.1);
             par_tids = fe.iter().filter(|t| t.0 == "par" && thread_description(t.1).starts_with("gpu-gfx-par")).map(|t| t.1).collect();
+            sub_tid = fe.iter().find(|t| t.0 == "submit").map_or(0, |t| t.1);
         }
         let now = crate::hle::kernel::time::process_time_us();
         let mut cycles_of = |tid: u32| -> Option<u64> {
@@ -246,6 +251,8 @@ fn tracer() {
         // (Other modules' frames by their exports: the system call a frame is in.)
         let name = |a: u64| if a >= ours_lo && a < ours_hi { crate::exception::frame_label(a) } else { crate::exception::export_label(a) };
         let cp_labels: Option<(u64, Vec<String>)> = cp.map(|(used, host)| (used, host.iter().map(|&a| name(a)).collect()));
+        let sub = if sub_tid != 0 { cycles_of(sub_tid).and_then(|used| crate::exception::sample_frames(sub_tid, 0).map(|(host, _)| (used, host))) } else { None };
+        let sub_labels: Option<(u64, Vec<String>)> = sub.map(|(used, host)| (used, host.iter().map(|&a| name(a)).collect()));
         // (The workers that ran since the last tick only: idle ones cost no suspension.)
         let par_labels: Vec<(u64, Vec<String>)> = par_tids
             .iter()
@@ -272,6 +279,10 @@ fn tracer() {
             let ks: Vec<u32> = labels.into_iter().map(|l| t.label(l)).collect();
             t.par.push_back((now, ks, used));
         }
+        if let Some((used, labels)) = sub_labels {
+            let ks: Vec<u32> = labels.into_iter().map(|l| t.label(l)).collect();
+            t.sub.push_back((now, ks, used));
+        }
         t.workers.push_back((now, workers));
         let old = now.saturating_sub(4_000_000);
         while t.main.front().is_some_and(|x| x.0 < old) {
@@ -282,6 +293,9 @@ fn tracer() {
         }
         while t.par.front().is_some_and(|x| x.0 < old) {
             t.par.pop_front();
+        }
+        while t.sub.front().is_some_and(|x| x.0 < old) {
+            t.sub.pop_front();
         }
         while t.workers.front().is_some_and(|x| x.0 < old) {
             t.workers.pop_front();
@@ -346,6 +360,13 @@ pub fn explain_par(lo: u64, hi: u64) -> Option<String> {
     let g = TRACE.lock();
     let t = g.as_ref()?;
     explain_samples(t, &t.par, lo, hi, "parallel workers")
+}
+
+/// The submission thread from `lo` to `hi` (us), as `explain_cp`.
+pub fn explain_submit(lo: u64, hi: u64) -> Option<String> {
+    let g = TRACE.lock();
+    let t = g.as_ref()?;
+    explain_samples(t, &t.sub, lo, hi, "submission thread")
 }
 
 /// A thread's description (its name as `thread::spawn_host` set it), or "".
