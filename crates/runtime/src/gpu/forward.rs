@@ -1059,18 +1059,26 @@ pub fn completed(done: u64) {
             // forwarded, its readers taking the words the copy computes
             // rather than memory's (refusing it never mended memory and
             // slowed those boots 5-20% for good). A destination missing words
-            // with unchanged inputs a fourth time is refused (a copy the
-            // forwarding computed wrongly would miss every time). Logged and
-            // counted (`TOLERATED`).
+            // with unchanged inputs a fourth time within MISS_WINDOW flips is
+            // refused (a copy the forwarding computed wrongly would miss at
+            // every frame; such misses came about once a boot-hour, the
+            // mirror then holding the title's later words, 2026-11-07, so a
+            // count for the whole session would refuse a long session's block
+            // in the end). Logged and counted (`TOLERATED`).
             let few = differ <= 2.max(e.words.len() as u64 / 512);
             let same_inputs = !src_now.is_empty() && src_changed == 0 && cb_now[0] as u64 == f.count && cb_now[1] as u64 == f.modulus;
             let misses = if few || !same_inputs {
                 0
             } else {
+                let flip = super::FRAMES.load(Ordering::Relaxed);
                 let mut g = MISSES.lock();
-                let c = g.get_or_insert_with(HashMap::new).entry((e.hash, e.base)).or_insert(0);
-                *c += 1;
-                *c
+                let c = g.get_or_insert_with(HashMap::new).entry((e.hash, e.base)).or_insert((0, flip));
+                // (A window of MISS_WINDOW flips from its first miss.)
+                if flip.saturating_sub(c.1) > MISS_WINDOW {
+                    *c = (0, flip);
+                }
+                c.0 += 1;
+                c.0
             };
             let keep = few || (same_inputs && misses <= 3);
             if keep {
@@ -1102,7 +1110,7 @@ pub fn completed(done: u64) {
                     if few {
                         "the destination stays forwarded (a few words)".to_string()
                     } else if keep {
-                        format!("the destination stays forwarded (its inputs as recorded: memory missed the copy's words; {misses} of 3 such tolerated)")
+                        format!("the destination stays forwarded (its inputs as recorded: memory missed the copy's words; {misses} of 3 such within {MISS_WINDOW} flips tolerated)")
                     } else {
                         "this destination is no longer forwarded".to_string()
                     }
@@ -1147,8 +1155,13 @@ pub fn completed(done: u64) {
 /// inputs unchanged) kept their destination forwarded: [copies, words].
 static TOLERATED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// (program hash, destination) pairs: copies whose words memory missed with
-/// their inputs unchanged (the fourth refuses the destination).
-static MISSES: Mutex<Option<HashMap<(u64, u64), u32>>> = Mutex::new(None);
+/// their inputs unchanged, and the flip their window began (the fourth within
+/// MISS_WINDOW flips refuses the destination).
+static MISSES: Mutex<Option<HashMap<(u64, u64), (u32, u64)>>> = Mutex::new(None);
+
+/// Flips over which a destination's misses with unchanged inputs are counted
+/// (~1-2 minutes of play).
+const MISS_WINDOW: u64 = 3600;
 
 /// Batches up to `done` completed: their workers' buffer updates are
 /// compared with memory.
