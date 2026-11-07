@@ -1252,7 +1252,7 @@ pub fn ww_lines() -> String {
         .filter(|(_, t)| t[0].load(Relaxed) > 0)
         .map(|(n, t)| format!("{n} {} (5 ms or more {}; {} ms, longest {:.1} ms)", t[0].load(Relaxed), t[1].load(Relaxed), t[2].load(Relaxed) / 1_000_000, t[3].load(Relaxed) as f64 / 1e6))
         .collect();
-    format!("    write-watch queries by caller: {}\n    by pages: {}\n    by other queries in flight when one began: {}\n    of 1 ms or more by caller: {}\n", who.join(", "), size.join(", "), conc.join(", "), tail.join(", "))
+    format!("    write-watch queries by caller: {}\n    by pages: {}\n    by other queries in flight when one began: {}\n    of 1 ms or more by caller: {}\n", who.join(", "), size.join(", "), conc.join(", "), tail.join(", ")) + &ww_census_lines()
 }
 
 pub fn ww_reset() {
@@ -1278,6 +1278,121 @@ pub fn written_since_take(page: u64) -> Option<bool> {
 }
 
 pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>, who: usize) -> Option<()> {
+    let first = out.len();
+    let r = take_written_census(base, size, out, who);
+    if ww_census_on() && out.len() > first {
+        ww_census(&out[first..]);
+    }
+    r
+}
+
+/// `DS_WW_CENSUS=1` (diagnosis; docs/FRONTEND3.md, sizing a take per title
+/// submission): where front end 2's per-binding takes find the CPU's writes,
+/// by 64 MiB window, and how many windows each epoch's writes touch (epochs
+/// end at title submissions and CPU-released waits, `precache::epoch`).
+fn ww_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_WW_CENSUS").ok().as_deref() == Some("1"))
+}
+
+/// window -> pages found written; the current epoch, its windows and pages;
+/// closed epochs with writes: [count, windows summed, pages summed] and a
+/// histogram of their windows (1, 2, 3, 4-7, 8+); pages each closed epoch.
+struct WwCensus {
+    by_window: std::collections::HashMap<u64, u64>,
+    /// 1 MiB granule -> pages found written.
+    by_mib: std::collections::HashMap<u64, u64>,
+    epoch: u64,
+    epoch_windows: std::collections::HashSet<u64>,
+    epoch_pages: u64,
+    closed: [u64; 3],
+    hist: [u64; 5],
+    pages_in_epochs: Vec<u64>,
+}
+
+static WW_CENSUS: Mutex<Option<WwCensus>> = Mutex::new(None);
+
+fn ww_census(pages: &[u64]) {
+    let ep = crate::gpu::precache::epoch();
+    let mut g = WW_CENSUS.lock();
+    let c = g.get_or_insert_with(|| WwCensus { by_window: Default::default(), by_mib: Default::default(), epoch: ep, epoch_windows: Default::default(), epoch_pages: 0, closed: [0; 3], hist: [0; 5], pages_in_epochs: Vec::new() });
+    if c.epoch != ep {
+        if !c.epoch_windows.is_empty() {
+            let n = c.epoch_windows.len() as u64;
+            c.closed[0] += 1;
+            c.closed[1] += n;
+            c.closed[2] += c.epoch_pages;
+            c.hist[match n {
+                1 => 0,
+                2 => 1,
+                3 => 2,
+                4..=7 => 3,
+                _ => 4,
+            }] += 1;
+            if c.pages_in_epochs.len() < 1 << 16 {
+                c.pages_in_epochs.push(c.epoch_pages);
+            }
+        }
+        c.epoch = ep;
+        c.epoch_windows.clear();
+        c.epoch_pages = 0;
+    }
+    for &p in pages {
+        *c.by_window.entry(p >> 26).or_insert(0) += 1;
+        *c.by_mib.entry(p >> 20).or_insert(0) += 1;
+        c.epoch_windows.insert(p >> 26);
+    }
+    c.epoch_pages += pages.len() as u64;
+}
+
+/// The census as a status line (`DS_WW_CENSUS=1`).
+pub fn ww_census_lines() -> String {
+    if !ww_census_on() {
+        return String::new();
+    }
+    let g = WW_CENSUS.lock();
+    let Some(c) = g.as_ref() else { return String::new() };
+    let flips = crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed).max(1) as f64;
+    let mut w: Vec<(u64, u64)> = c.by_window.iter().map(|(&k, &v)| (k, v)).collect();
+    w.sort_by(|a, b| b.1.cmp(&a.1));
+    let total: u64 = w.iter().map(|x| x.1).sum();
+    let top: Vec<String> = w.iter().take(12).map(|(k, v)| format!("{:#x} {:.1}", k << 26, *v as f64 / flips)).collect();
+    let mut m: Vec<u64> = c.by_mib.values().copied().collect();
+    m.sort_unstable_by(|a, b| b.cmp(a));
+    let cover = |share: f64| {
+        let (mut acc, mut k) = (0u64, 0usize);
+        while k < m.len() && (acc as f64) < share * total as f64 {
+            acc += m[k];
+            k += 1;
+        }
+        k
+    };
+    let mib = format!("; 1 MiB granules written: {}, holding half the pages {}, 90% {}, 99% {}", m.len(), cover(0.5), cover(0.9), cover(0.99));
+    let mut pe = c.pages_in_epochs.clone();
+    pe.sort_unstable();
+    let pct = |q: f64| pe.get(((pe.len().max(1) as f64 - 1.0) * q).round() as usize).copied().unwrap_or(0);
+    format!(
+        "    write-watch census (since boot, {flips:.0} flips): pages found written {:.1} a flip in {} windows of 64 MiB, a flip by window: {}; epochs with writes {:.1} a flip, windows each {:.2} on average (1: {}, 2: {}, 3: {}, 4-7: {}, 8+: {}), pages each p50 {} p90 {} max {}\n",
+        total as f64 / flips,
+        w.len(),
+        top.join(", "),
+        c.closed[0] as f64 / flips,
+        c.closed[1] as f64 / c.closed[0].max(1) as f64,
+        c.hist[0],
+        c.hist[1],
+        c.hist[2],
+        c.hist[3],
+        c.hist[4],
+        pct(0.5),
+        pct(0.9),
+        pe.last().copied().unwrap_or(0)
+    )
+    .replace("
+", &(mib + "
+"))
+}
+
+fn take_written_census(base: u64, size: u64, out: &mut Vec<u64>, who: usize) -> Option<()> {
     use std::sync::atomic::Ordering::Relaxed;
     if crate::sections::on() {
         let inflight = InFlight::new();
