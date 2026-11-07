@@ -134,8 +134,12 @@ pub struct Run {
     /// workers' chunks is part 0, chunk i part i + 1.
     pub id: u64,
     /// The label waits the run holds (their packets' addresses, ascending):
-    /// they held in guest memory when it was planned (`Cp::run_pass`).
+    /// they held in guest memory when it was planned (`Cp::run_pass`), or
+    /// on a label write earlier in the run (`Cp::compute_pass`).
     pub passed_waits: std::sync::Arc<[u64]>,
+    /// The CP writes the run holds (`Cp::compute_pass`): packet address,
+    /// guest address, bytes.
+    pub cp_writes: std::sync::Arc<[(u64, u64, u64)]>,
 }
 
 /// Run ids (`Run::id`; 0: none).
@@ -160,6 +164,7 @@ impl Run {
             fe2_view: super::fe2::NO_VIEW,
             id: RUN_IDS.fetch_add(1, Ordering::Relaxed),
             passed_waits: std::sync::Arc::from(Vec::new()),
+            cp_writes: std::sync::Arc::from(Vec::new()),
         }
     }
 
@@ -491,6 +496,7 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         let mut cp = w.cp.lock();
         cp.set_chunk_state(&state);
         cp.chunk_waits = run.passed_waits.clone();
+        cp.set_run_writes(run.cp_writes.iter().filter(|w| w.0 < from).map(|w| (w.1, w.2)).collect());
         cp.fe2_set_view(run.fe2_view);
         cp.fe2_set_run(run.id, i + 1);
         cp.chunk_start();

@@ -7672,6 +7672,10 @@ fn prog_census_lines() -> String {
     out
 }
 
+/// Parallel workers' chunks stopped for reading a CP write of their run's
+/// earlier chunks (`Exec::run_writes`).
+pub static RUN_WRITE_STOPS: AtomicU64 = AtomicU64::new(0);
+
 /// An executor's kind for `tune ballast_at` (`Exec::ballast_kind`).
 fn ballast_kind(name: &str) -> u8 {
     match name {
@@ -8528,9 +8532,15 @@ pub struct Exec {
     /// would need that stops the chunk (`stopped`) before the command
     /// records its own work.
     deferred: bool,
-    /// A graphics parallel worker's executor (`Cp::make_worker_exec`): its
-    /// chunks may record the title's GPU timestamps (`Cp::run_pass`).
+    /// A parallel worker's executor (`Cp::make_worker_exec`): its chunks
+    /// may record the title's GPU timestamps (`Cp::run_pass`) and label
+    /// writes (`Cp::compute_pass`), whose promises its closed batches keep
+    /// to their submission.
     par_worker: bool,
+    /// A parallel worker's chunk: the guest ranges CP writes of its run's
+    /// earlier chunks write (`par::Run::cp_writes`); a CPU read of one stops
+    /// the chunk (those batches are not submitted yet).
+    pub(super) run_writes: Vec<(u64, u64)>,
     /// The open batch's command buffers are claimed (`vk::defer`): its
     /// commands go to lists the submission thread replays into them just
     /// before submitting it (`tune record_defer`).
@@ -9325,6 +9335,7 @@ impl Exec {
                 sync_culprit: None,
                 deferred: false,
                 par_worker: false,
+                run_writes: Vec::new(),
                 batch_lists: false,
                 held: false,
                 past: false,
@@ -9907,7 +9918,7 @@ impl Exec {
             ch.overwritten = self.pending_log.get(ch.writes_mark..).unwrap_or(&[]).iter().any(|&(w, m)| w < a + n && a < w + m);
         }
         if self.deferred {
-            let promises = if self.held && !has_actions {
+            let promises = if (self.held || self.par_worker) && !has_actions {
                 // Its later waits pass on them (`open_promise`); promised
                 // when the batch is submitted (`submit_closed`).
                 self.held_promises.extend_from_slice(&self.pending_promises);
@@ -12326,6 +12337,11 @@ impl Exec {
     }
 
     pub fn sync_for(&mut self, reads: &[(u64, u64)], why: usize) -> bool {
+        if !self.run_writes.is_empty() && reads.iter().any(|&(a, n)| self.run_writes.iter().any(|&(w, m)| a < w + m && w < a + n)) {
+            RUN_WRITE_STOPS.fetch_add(1, Ordering::Relaxed);
+            self.stop("reads a CP write of its run's earlier chunks");
+            return true;
+        }
         note_read_census(reads, why);
         super::fe2::note_wb_reads(reads);
         if super::runprobe::on() && self.name == "gpu-gfx" {
@@ -12786,8 +12802,8 @@ impl Exec {
         if let Some((v, n)) = label {
             self.pending_promises.push((a, v, n));
             // (Past a run, a request ends the stretch: `Cp::run` settles it
-            // and submits.)
-            {
+            // and submits. A parallel worker's batch goes at its turn.)
+            if !(self.deferred && !self.held) {
                 UNSUBMITTED_LABELS.lock().get_or_insert_with(HashMap::new).insert(a & !7, self.submit_request.clone());
                 // Another queue already blocks on it: submit at the next packet.
                 if super::tune::label_early() && super::cp::waited_now(a) {
@@ -13582,7 +13598,7 @@ impl Exec {
         self.deferred = true;
     }
 
-    /// A graphics parallel worker's executor (`par_worker`).
+    /// A parallel worker's executor (`par_worker`).
     pub fn set_par_worker(&mut self) {
         self.par_worker = true;
     }
@@ -13962,6 +13978,10 @@ impl Exec {
             self.own_gen += 1;
             self.last_seq = seq;
             last = Some(seq);
+        }
+        // (A worker's: its next chunks find none of these open.)
+        if self.par_worker && !self.held {
+            self.held_promises.clear();
         }
         if !self.recording {
             self.open_gen.store(u64::MAX, Ordering::SeqCst);

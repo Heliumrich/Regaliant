@@ -356,6 +356,9 @@ pub struct Cp {
     /// A parallel worker: the label waits its run holds (`par::Run::
     /// passed_waits`).
     pub chunk_waits: std::sync::Arc<[u64]>,
+    /// The stretch `handshake_census` scanned last: its buffer's end and
+    /// its end.
+    hs_until: (u64, u64),
     /// Per-command recording costs of the parallel runs seen, by run
     /// signature (`tune par_cost`).
     run_costs: HashMap<u64, RunCost>,
@@ -770,12 +773,16 @@ fn chunk_states_equal(a: &ChunkState, b: &ChunkState, sh_skip: &[u32]) -> bool {
 const PAR_CHUNK_MIN: usize = 64;
 const PAR_MAX: usize = 8192;
 
-/// `Cp::run_pass`: a timestamp, a label wait.
+/// `Cp::run_pass`, `Cp::compute_pass`: a timestamp, a label wait (met in
+/// memory), a CP write, a label wait met by a write earlier in the run.
 const RUN_PASS_TS: u8 = 1;
 const RUN_PASS_WAIT: u8 = 2;
-/// Runs' held packets (`Cp::run_pass`): -, label waits passed by split
-/// runs (their effect applied when planned), timestamps and label waits
-/// workers recorded in their chunks.
+const COMPUTE_PASS_WRITE: u8 = 3;
+const RUN_PASS_WAIT_OWN: u8 = 4;
+/// Runs' held packets (`Cp::run_pass`, `Cp::compute_pass`): CP writes
+/// workers performed, label waits passed by split runs (their effect
+/// applied when planned), timestamps and label waits workers recorded in
+/// their chunks.
 pub static RUN_PASSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// The status line's part for `RUN_PASSED` (empty while it counted nothing).
@@ -784,7 +791,7 @@ pub fn run_passed_line() -> String {
     if v.iter().all(|&x| x == 0) {
         return String::new();
     }
-    format!("; runs' held packets: label waits passed when planned {}, timestamps recorded by workers {}, label waits passed by workers {}", v[1], v[2], v[3])
+    format!("; runs' held packets: label waits passed when planned {}, timestamps recorded by workers {}, label waits passed by workers {}, CP writes performed by workers {} (chunks stopped reading an earlier chunk's {})", v[1], v[2], v[3], v[0], super::exec::RUN_WRITE_STOPS.load(Ordering::Relaxed))
 }
 
 /// Command-buffer ends that left the batch open (`tune cmdbuf_merge`).
@@ -1478,6 +1485,14 @@ static CP_CLASSES: [[AtomicU64; 3]; 10] = [const { [const { AtomicU64::new(0) };
 /// The graphics command processor's serial commands by why they were not in
 /// a parallel run (`tune cp_classes`): `SERIAL_WHY_NAMES`.
 static SERIAL_WHY: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+/// The same for the compute queue `tune cp_classes_acb` names, and its
+/// commands recorded in its own chunks of runs (index 14).
+static SERIAL_WHY_ACB: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
+/// Census (`tune cp_classes`, the queue `cp_classes_acb` names): its runs as
+/// they would be if label writes, label waits and flushes did not end them
+/// (`Cp::handshake_census`): stretches scanned, their commands, commands in
+/// stretches long enough to split, the ends met (other packets, buffer ends).
+static HS_CENSUS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// The graphics CP's serial runs (`tune cp_classes`): [runs planned and left
 /// serial, commands executed in them, of those with the epoch unchanged since
 /// the run was planned, ns from planning to each command summed].
@@ -1627,7 +1642,7 @@ fn class_end(k: usize, t: Option<(Instant, u64)>) {
 
 /// Clears the packet classes (`profile reset`).
 pub fn reset_classes() {
-    for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()).chain(STRETCH_OPS.iter().flatten()).chain(IDRAW_PARTS.iter().flatten()).chain(SERIAL_WHY.iter()).chain(PLAN_PHASES.iter()).chain(PLAN_MAIN_WRITES.iter()).chain(RUN_EPOCHS.iter()).chain(CB_CENSUS.iter().flatten()) {
+    for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()).chain(STRETCH_OPS.iter().flatten()).chain(IDRAW_PARTS.iter().flatten()).chain(SERIAL_WHY.iter()).chain(SERIAL_WHY_ACB.iter()).chain(HS_CENSUS.iter()).chain(PLAN_PHASES.iter()).chain(PLAN_MAIN_WRITES.iter()).chain(RUN_EPOCHS.iter()).chain(CB_CENSUS.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
     CP_CLASSES_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -1762,6 +1777,10 @@ pub fn classes_line() -> String {
             .map(|&(k, ns, n, w)| format!("{} {:.2} ms ({:.0} packets, {:.1} us each; waits {:.2} ms)", op_name(k as u32), ns as f64 / flips / 1e6, n as f64 / flips, ns as f64 / n.max(1) as f64 / 1e3, w as f64 / flips / 1e6))
             .collect();
         s.push_str(&format!("    compute queue {:#x} per flip by packet (waits apart; {:.2} ms in all): {}\n", super::tune::cp_classes_acb(), all as f64 / flips / 1e6, parts.join("; ")));
+        let why: Vec<String> = SERIAL_WHY_ACB.iter().zip(SERIAL_WHY_NAMES.iter().copied().chain(["in its own chunks of runs"])).map(|(c, name)| format!("{name} {:.1}", c.load(Ordering::Relaxed) as f64 / flips)).collect();
+        s.push_str(&format!("    its commands per flip by why they were not in a parallel run: {}\n", why.join(", ")));
+        let h: Vec<u64> = HS_CENSUS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        s.push_str(&format!("    its stretches through label writes, label waits and flushes (census): {:.1} a flip, {:.1} commands a flip in them, {:.1} of those in stretches long enough to split\n", h[0] as f64 / flips, h[1] as f64 / flips, h[2] as f64 / flips));
     }
     let mut ops: Vec<(usize, u64, u64, u64)> = STRETCH_OPS
         .iter()
@@ -1981,6 +2000,7 @@ impl Cp {
             par_pool: super::par::Pool::new(),
             chunk_costs: None,
             chunk_waits: std::sync::Arc::from(Vec::new()),
+            hs_until: (0, 0),
             run_costs: HashMap::new(),
             run_costs_pruned: u64::MAX,
             last_wait_gpu: false,
@@ -2064,9 +2084,7 @@ impl Cp {
     pub fn make_worker_exec(&mut self) -> Result<(), String> {
         let mut e = super::exec::Exec::new(&self.name)?;
         e.set_deferred();
-        if !self.compute {
-            e.set_par_worker();
-        }
+        e.set_par_worker();
         self.exec = Some(Box::new(e));
         Ok(())
     }
@@ -2210,7 +2228,7 @@ impl Cp {
             }
             let n = count as u64 + 1;
             let next = cur + 4 * (n + 1);
-            let kept = matches!(opcode, op::RELEASE_MEM | op::WAIT_REG_MEM | op::WAIT_REG_MEM64) && !self.compute;
+            let kept = if self.compute { matches!(opcode, op::WRITE_DATA | op::WAIT_REG_MEM | op::WAIT_REG_MEM64) } else { matches!(opcode, op::RELEASE_MEM | op::WAIT_REG_MEM | op::WAIT_REG_MEM64) };
             // (Multi-draws: in a run only where it holds them, `run_multi`.)
             let multi = matches!(opcode, op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI) && !self.compute;
             if next > to || !valid(cur, 4 * (n + 1)) || !(is_command(opcode) || is_state(opcode) || opcode == op::NOP || par_event(opcode, self.compute) || kept || multi) {
@@ -2223,7 +2241,8 @@ impl Cp {
             // A timestamp or label wait the run holds (`run_pass`); else it
             // and the rest go to the main command processor.
             if kept {
-                if !self.chunk_pass(opcode, cur, &p) {
+                let ok = if opcode == op::WRITE_DATA { self.chunk_write_data(n, &p) } else { self.chunk_pass(opcode, cur, &p) };
+                if !ok {
                     super::par::COMMANDS.fetch_add(commands, Ordering::Relaxed);
                     self.drop_ahead();
                     return Some(cur);
@@ -2365,6 +2384,89 @@ impl Cp {
             e.xq_label(a, wide, v);
         }
         RUN_PASSED[3].fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// A worker's chunk: the guest ranges CP writes of its run's earlier
+    /// chunks write (`Exec::run_writes`).
+    pub fn set_run_writes(&mut self, w: Vec<(u64, u64)>) {
+        if let Some(e) = self.exec.as_mut() {
+            e.run_writes = w;
+        }
+    }
+
+    /// A compute queue's packet its run holds through a label handshake
+    /// (planning; since 2026-11-07 night: queue 0x50's own work 6.7 -> 3.4
+    /// ms a flip, the vista +6.5%, Doran +8.6%): `COMPUTE_PASS_WRITE` a WRITE_DATA
+    /// to memory of 1-16 dwords (a worker performs it on the GPU, as this
+    /// command processor does after work: `Exec::gpu_cp_write`, its label
+    /// promised when its batch is submitted), `RUN_PASS_WAIT` a label wait
+    /// that holds in guest memory now or on a value a WRITE_DATA earlier in
+    /// the run writes (`writes`: label, value, bytes).
+    fn compute_pass(&mut self, opc: u32, n: u64, p: &dyn Fn(u64) -> u32, writes: &[(u64, u64, u8)]) -> Option<u8> {
+        if !self.compute || !super::fe2::on() {
+            return None;
+        }
+        match opc {
+            op::WRITE_DATA => {
+                let c = p(0);
+                let (dst, count) = ((c >> 8) & 0xF, n.saturating_sub(3));
+                let a = addr64(p(1), p(2));
+                (matches!(dst, 1 | 2 | 5) && (1..=16).contains(&count) && a % 4 == 0 && valid(a, 4 * count)).then_some(COMPUTE_PASS_WRITE)
+            }
+            op::WAIT_REG_MEM | op::WAIT_REG_MEM64 => {
+                let (c, a, wide) = (p(0), addr64(p(1), p(2)), opc == op::WAIT_REG_MEM64);
+                if (c >> 4) & 3 != 1 || !valid(a, 8) {
+                    return None;
+                }
+                let (reference, mask) = if wide { (addr64(p(3), p(4)), addr64(p(5), p(6))) } else { (p(3) as u64, p(4) as u64) };
+                let func = c & 7;
+                // A write earlier in the run decides it (the last one there).
+                if let Some(&(_, v, bytes)) = writes.iter().rev().find(|w| w.0 == a) {
+                    let v = if wide && bytes < 8 { return None } else if wide { v } else { v & 0xFFFF_FFFF };
+                    return compare(func, v & mask, reference & mask).then_some(RUN_PASS_WAIT_OWN);
+                }
+                self.before_fetch(a, 8);
+                let v = if wide { unsafe { rd64(a) } } else { (unsafe { rd32(a) }) as u64 };
+                compare(func, v & mask, reference & mask).then_some(RUN_PASS_WAIT)
+            }
+            _ => None,
+        }
+    }
+
+    /// A compute queue's worker performs a WRITE_DATA its run holds
+    /// (`compute_pass`) on the GPU in its batch; false: the chunk stops
+    /// there.
+    fn chunk_write_data(&mut self, n: u64, p: &dyn Fn(u64) -> u32) -> bool {
+        let c = p(0);
+        let (dst, no_incr, count) = ((c >> 8) & 0xF, (c >> 16) & 1 != 0, n.saturating_sub(3));
+        let a = addr64(p(1), p(2));
+        if !matches!(dst, 1 | 2 | 5) || count == 0 || !valid(a, 4 * count) {
+            return false;
+        }
+        let vals: Vec<u32> = (0..count).map(|i| p(3 + i)).collect();
+        let label = match (count, no_incr) {
+            (1, _) => Some((vals[0] as u64, 4u8)),
+            (2, false) => Some((vals[0] as u64 | (vals[1] as u64) << 32, 8u8)),
+            _ => None,
+        };
+        let gpu_vals = if no_incr { vec![*vals.last().unwrap()] } else { vals.clone() };
+        let Some(e) = self.exec.as_mut() else { return false };
+        if !e.gpu_cp_write(a, &gpu_vals, label, false) {
+            return false;
+        }
+        super::replay::note_cp_write(a, 4 * gpu_vals.len() as u64);
+        self.fence_pending = false;
+        // (Its queue's write, as `gpu_cp_write` notes the main command
+        // processor's.)
+        let queue = self.name.rsplit_once("-par").map_or(self.name.as_str(), |x| x.0).to_string();
+        let mut g = LAST_WRITE.lock();
+        let m = g.get_or_insert_with(Default::default);
+        if m.len() > 1 << 16 {
+            m.clear();
+        }
+        m.insert(a & !7, (queue, label.map(|l| l.0).unwrap_or(gpu_vals[0] as u64), self.cur_packet, a));
+        RUN_PASSED[0].fetch_add(1, Ordering::Relaxed);
         true
     }
 
@@ -2683,10 +2785,66 @@ impl Cp {
         }
     }
 
+    /// Census (`HS_CENSUS`): from `from`, the stretch a compute queue's run
+    /// would be if WRITE_DATA, label waits and flushes left it open; counted
+    /// once per stretch (`hs_until`).
+    fn handshake_census(&mut self, f: &Fetched, from: u64, end: u64) {
+        if self.hs_until.0 == end && from < self.hs_until.1 {
+            return;
+        }
+        let mut c = from;
+        let mut n = 0u64;
+        while c < end && valid(c, 4) {
+            let h = f.rd(c);
+            match h >> 30 {
+                3 => {}
+                2 => {
+                    c += 4;
+                    continue;
+                }
+                _ => break,
+            }
+            let count = (h >> 16) & 0x3FFF;
+            if count == 0x3FFF {
+                c += 4;
+                continue;
+            }
+            if h & 1 != 0 {
+                break;
+            }
+            let opc = (h >> 8) & 0xFF;
+            let len = count as u64 + 1;
+            let next = c + 4 * (len + 1);
+            if next > end || !valid(c, 4 * (len + 1)) {
+                break;
+            }
+            if is_command(opc) {
+                n += 1;
+            } else if opc == op::NOP {
+                if len >= 2 && f.rd(c + 4) == DS_MAGIC && !matches!(f.rd(c + 8), pop::PUSH_MARKER | pop::SET_MARKER | pop::POP_MARKER) {
+                    break;
+                }
+            } else if !(opc == op::SET_BASE || is_state(opc) || matches!(opc, op::EVENT_WRITE | op::ACQUIRE_MEM | op::WAIT_REG_MEM | op::WAIT_REG_MEM64) || (opc == op::WRITE_DATA && len <= 4)) {
+                break;
+            }
+            c = next;
+        }
+        self.hs_until = (end, c);
+        let par_min = (super::tune::par_min_compute() as usize).max(super::par::floor()) as u64;
+        HS_CENSUS[0].fetch_add(1, Ordering::Relaxed);
+        HS_CENSUS[1].fetch_add(n, Ordering::Relaxed);
+        if n >= par_min {
+            HS_CENSUS[2].fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
     /// Splits the synchronization-free run that starts with the command at
     /// `from` into chunks when it is long enough: the first stays here, the
     /// others go to the workers' queue now (`gpu::par`).
     fn par_plan(&mut self, f: &Fetched, from: u64, end: u64) {
+        if self.compute && super::tune::cp_classes() && self.name.strip_prefix("gpu-acb").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()) == Some(super::tune::cp_classes_acb()) {
+            self.handshake_census(f, from, end);
+        }
         // (Profile: `tune cp_classes`, `PLAN_PHASES`.)
         let mut lap = PlanLaps(super::tune::cp_classes().then(Instant::now));
         let k = if self.compute { compute_workers() } else { super::par::workers() };
@@ -2705,8 +2863,13 @@ impl Cp {
         // The run's signature: its packet headers (opcode and size), the
         // same when the title records the same pass again.
         let mut sig = 0xcbf2_9ce4_8422_2325u64;
-        // The label waits it holds (`run_pass`): packet, label, 64-bit.
+        // The label waits it holds (`run_pass`): packet, label, 64-bit; those
+        // a write earlier in the run meets (`compute_pass`): packets; its
+        // CP writes: label, value, bytes (labels) and packet, address, bytes.
         let mut passed: Vec<(u64, u64, bool)> = Vec::new();
+        let mut own_waits: Vec<u64> = Vec::new();
+        let mut cwrites: Vec<(u64, u64, u8)> = Vec::new();
+        let mut cp_writes: Vec<(u64, u64, u64)> = Vec::new();
         let run_end = loop {
             if c >= end || !valid(c, 4) {
                 break c;
@@ -2784,6 +2947,21 @@ impl Cp {
             } else if let Some(k) = self.run_pass(opc, &p) {
                 if k == RUN_PASS_WAIT {
                     passed.push((at, addr64(p(1), p(2)), opc == op::WAIT_REG_MEM64));
+                }
+            } else if let Some(k) = self.compute_pass(opc, n, &p, &cwrites) {
+                match k {
+                    COMPUTE_PASS_WRITE => {
+                        let (c0, a) = (p(0), addr64(p(1), p(2)));
+                        let (no_incr, count) = ((c0 >> 16) & 1 != 0, n - 3);
+                        match (count, no_incr) {
+                            (1, _) => cwrites.push((a, p(3) as u64, 4)),
+                            (2, false) => cwrites.push((a, p(3) as u64 | (p(4) as u64) << 32, 8)),
+                            _ => {}
+                        }
+                        cp_writes.push((at, a, if no_incr { 4 } else { 4 * count }));
+                    }
+                    RUN_PASS_WAIT => passed.push((at, addr64(p(1), p(2)), opc == op::WAIT_REG_MEM64)),
+                    _ => own_waits.push(at),
                 }
             } else if !is_state(opc) {
                 // EVENT_WRITE by event type (statistics: partial flushes
@@ -3042,7 +3220,10 @@ impl Cp {
         let queue = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
         let mut run = super::par::Run::new(queue);
         run.timed = true;
-        run.passed_waits = std::sync::Arc::from(passed.iter().map(|w| w.0).collect::<Vec<u64>>());
+        let mut approved: Vec<u64> = passed.iter().map(|w| w.0).chain(own_waits.iter().copied()).collect();
+        approved.sort_unstable();
+        run.passed_waits = std::sync::Arc::from(approved);
+        run.cp_writes = std::sync::Arc::from(cp_writes);
         // (Its workers check as of this command processor's view now.)
         run.fe2_view = self.fe2_view.as_ref().map_or(super::fe2::NO_VIEW, |c| c.load(Ordering::Acquire));
         let run = Arc::new(run);
@@ -4934,6 +5115,30 @@ impl Cp {
                     let args: Vec<String> = (0..n.min(8)).map(|i| format!("{:08x}", p(i))).collect();
                     super::capture::packet(self, &format!("{name} {opcode:#x} @{cur:#x} [{}]", args.join(" ")));
                 }
+            }
+            if acb_ops && command {
+                let k = if self.par.is_some() {
+                    14
+                } else if !f.words.is_empty() {
+                    0
+                } else if f.live {
+                    1
+                } else if self.par_skip.0 == end && cur < self.par_skip.1 {
+                    match self.par_skip_n {
+                        0 | 1 => 2,
+                        2..=7 => 3,
+                        8..=31 => 4,
+                        32..=127 => 5,
+                        _ => 6,
+                    }
+                } else if self.held.is_some() {
+                    12
+                } else if !super::capture::capturing() && self.exec.is_some() {
+                    13
+                } else {
+                    7
+                };
+                SERIAL_WHY_ACB[k].fetch_add(1, Ordering::Relaxed);
             }
             if classes && command && self.par.is_none() {
                 let k = if !f.words.is_empty() {
