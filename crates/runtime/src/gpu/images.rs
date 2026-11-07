@@ -28,6 +28,51 @@ fn gpu_images_changed() {
     GPU_IMAGES_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// Generations of the images by address (4,096 buckets): a bucket moves when an image at an
+/// address in it is added or removed (`map_insert`, `map_remove`). With GPU_IMAGES_GEN they hold
+/// what a T#'s lookup finds (`Images::lookup` looks at its own address, and at another only
+/// through the GPU-written images' stencil aliases).
+static BASE_GENS: [std::sync::atomic::AtomicU32; 4096] = [const { std::sync::atomic::AtomicU32::new(0) }; 4096];
+
+fn base_gen(base: u64) -> &'static std::sync::atomic::AtomicU32 {
+    &BASE_GENS[((base >> 8).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 52) as usize]
+}
+
+/// A sampled view's memo (`view_hit`, `Images::view`): it holds while the images at the T#'s
+/// address (`base_gen`), the GPU-written images (`gpu_gen`) and the image's own tracked region
+/// (`region`, None for images without one: GPU-written) keep their generations, and in its frame
+/// unless textures are scrubbed. `stale`: made when the image's region was not known before its
+/// lookup (a new image): good for that call only.
+#[derive(Clone, Copy)]
+struct ViewMemo {
+    frame: u64,
+    gpu_gen: u64,
+    base_gen: u32,
+    region: Option<&'static std::sync::atomic::AtomicU32>,
+    region_gen: u32,
+    stale: bool,
+    view: vk::ImageView,
+    image: vk::Image,
+    used: UseStamp,
+}
+
+impl ViewMemo {
+    /// 0 when it holds for `t` in `frame`, else why not (`memo_note`'s kinds: 2 another frame,
+    /// 3 the images changed, 4 its region changed).
+    fn miss(&self, t: &Tsharp, frame: u64, any_frame: bool) -> usize {
+        use std::sync::atomic::Ordering::Acquire;
+        if !(any_frame || self.frame == frame) {
+            2
+        } else if self.stale || self.gpu_gen != GPU_IMAGES_GEN.load(Acquire) || self.base_gen != base_gen(t.base).load(Acquire) {
+            3
+        } else if self.region.is_some_and(|g| g.load(Acquire) != self.region_gen) {
+            4
+        } else {
+            0
+        }
+    }
+}
+
 /// Fast clears and overwritten images pending (published at the end of
 /// every `with`): draws check them without the lock while both are 0.
 static PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -77,12 +122,13 @@ fn surface_key(s: &Surface) -> SurfaceKey {
 #[derive(Default)]
 struct Tls {
     lookup_gen: u64,
-    keys: HashMap<([u32; 8], bool), Option<ImageKey>>,
+    /// Resolved keys with the generations they hold for (GPU_IMAGES_GEN, the T#'s `base_gen`).
+    keys: HashMap<([u32; 8], bool), (Option<ImageKey>, u64, u32)>,
     targets: HashMap<SurfaceKey, Target>,
     grows: HashMap<(u64, u32, u32, i32, u32), Option<ImageKey>>,
     gpu_base: HashMap<u64, bool>,
     depth_feed: HashMap<u64, bool>,
-    views: HashMap<[u32; 8], (u64, u64, u64, vk::ImageView, vk::Image, UseStamp)>,
+    views: HashMap<[u32; 8], ViewMemo>,
     samplers: HashMap<([u32; 4], bool, u8), vk::Sampler>,
 }
 
@@ -102,7 +148,6 @@ fn tls<R>(f: impl FnOnce(&mut Tls) -> R) -> R {
         let g = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
         if t.lookup_gen != g {
             t.lookup_gen = g;
-            t.keys.clear();
             t.targets.clear();
             t.grows.clear();
             t.gpu_base.clear();
@@ -159,22 +204,14 @@ pub fn memo_stats_line() -> String {
 
 /// `Images::view` from this thread's memo (sampled views only).
 pub fn view_hit(t: &Tsharp, frame: u64) -> Option<(vk::ImageView, vk::Image)> {
-    let track = super::track::GEN.load(std::sync::atomic::Ordering::Acquire);
-    let lookup = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
     let any_frame = scrubbing();
     let e = tls(|m| m.views.get(&t.raw).copied());
-    let k = match e {
-        None => 1,
-        Some(e) if !(any_frame || e.0 == frame) => 2,
-        Some(e) if e.1 != lookup => 3,
-        Some(e) if e.2 != track => 4,
-        Some(_) => 0,
-    };
+    let k = e.map_or(1, |e| e.miss(t, frame, any_frame));
     memo_note(k);
     if k == 0 {
         e.map(|e| {
-            e.5.stamp(frame);
-            (e.3, e.4)
+            e.used.stamp(frame);
+            (e.view, e.image)
         })
     } else {
         None
@@ -189,7 +226,8 @@ pub fn sampler_hit(s: [u32; 4], compare: bool) -> Option<vk::Sampler> {
 
 /// `Images::resolved_key` from this thread's memo (None: not memoized).
 pub fn key_hit(t: &Tsharp, storage: bool) -> Option<Option<ImageKey>> {
-    let r = tls(|m| m.keys.get(&(t.raw, storage)).copied());
+    use std::sync::atomic::Ordering::Acquire;
+    let r = tls(|m| m.keys.get(&(t.raw, storage)).copied()).filter(|e| e.1 == GPU_IMAGES_GEN.load(Acquire) && e.2 == base_gen(t.base).load(Acquire)).map(|e| e.0);
     memo_note(if r.is_some() { 5 } else { 6 });
     r
 }
@@ -740,6 +778,8 @@ pub struct Image {
     /// The shader that last bound it as a storage image (diagnosis:
     /// `fillimg cs=`).
     writer: u64,
+    /// Its tracked region's generation (`track::gen_of`; with `source`).
+    source_gen: Option<&'static std::sync::atomic::AtomicU32>,
     /// Its device memory and bytes, and the frame of its last use.
     mem: super::slab::Mem,
     bytes: u64,
@@ -1387,9 +1427,9 @@ pub struct Images {
     /// no tracked texture source was written, `view` would do nothing but
     /// return the same view (draws bind the same textures thousands of times
     /// per frame; each full lookup took the tracker's lock three times).
-    view_memo: HashMap<[u32; 8], (u64, u64, u64, vk::ImageView, vk::Image, UseStamp)>,
+    view_memo: HashMap<[u32; 8], ViewMemo>,
     /// `resolved_key` by (T#, storage): (LOOKUP_GEN, key).
-    key_memo: HashMap<([u32; 8], bool), (u64, Option<ImageKey>)>,
+    key_memo: HashMap<([u32; 8], bool), (Option<ImageKey>, u64, u32)>,
     /// Images whose metadata a GPU or CP write covered since (fast clears).
     /// Images whose fast-clear metadata was written: (metadata address, its
     /// first word when the writer's value is known: `note_meta_fill`).
@@ -2485,9 +2525,14 @@ impl Images {
         unsafe {
             let t0 = std::time::Instant::now();
             let image = c.device.create_image(&ci, None).map_err(|e| format!("vkCreateImage {key:?}: {e}"))?;
-            let req = c.device.get_image_memory_requirements(image);
+            // (Whether the driver requires or prefers the image in an allocation of its own.)
+            let mut ded = vk::MemoryDedicatedRequirements::default();
+            let mut req2 = vk::MemoryRequirements2::default().push_next(&mut ded);
+            c.device.get_image_memory_requirements2(&vk::ImageMemoryRequirementsInfo2::default().image(image), &mut req2);
+            let req = req2.memory_requirements;
+            let (requires, prefers) = (ded.requires_dedicated_allocation != 0, ded.prefers_dedicated_allocation != 0);
             let t1 = std::time::Instant::now();
-            let mem = super::slab::alloc(req)?;
+            let mem = super::slab::alloc(req, requires, prefers)?;
             let t2 = std::time::Instant::now();
             c.device.bind_image_memory(image, mem.memory, mem.offset).map_err(|e| format!("bind image: {e}"))?;
             // (Its parts: the image, the memory's allocation, the bind.)
@@ -3528,7 +3573,7 @@ impl Images {
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
         });
-        self.map_insert(new_key, Image { image, key: new_key, views: HashMap::default(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: prev.write_gen, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed)) });
+        self.map_insert(new_key, Image { image, key: new_key, views: HashMap::default(), gpu_written: true, source: None, source_gen: None, hashes: [0; SLICES], checked_frame: 0, write_gen: prev.write_gen, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed)) });
         for v in self.stencil_of.values_mut() {
             if *v == old {
                 *v = new_key;
@@ -3960,13 +4005,16 @@ impl Images {
     }
 
     pub fn resolved_key(&mut self, t: &Tsharp, storage: bool) -> Option<ImageKey> {
-        let lookup = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
-        if let Some(&(g, k)) = self.key_memo.get(&(t.raw, storage)) {
-            if g == lookup {
+        // (Generations read before the lookup; it holds while they do.)
+        use std::sync::atomic::Ordering::Acquire;
+        let (gpu_gen, bgen) = (GPU_IMAGES_GEN.load(Acquire), base_gen(t.base).load(Acquire));
+        if let Some(&(k, g, b)) = self.key_memo.get(&(t.raw, storage)) {
+            if g == gpu_gen && b == bgen {
                 tls(|m| {
-                    if m.lookup_gen == lookup {
-                        m.keys.insert((t.raw, storage), k);
+                    if m.keys.len() >= 1 << 16 {
+                        m.keys.clear();
                     }
+                    m.keys.insert((t.raw, storage), (k, g, b));
                 });
                 return k;
             }
@@ -3975,11 +4023,12 @@ impl Images {
         if self.key_memo.len() >= 1 << 16 {
             self.key_memo.clear();
         }
-        self.key_memo.insert((t.raw, storage), (lookup, k));
+        self.key_memo.insert((t.raw, storage), (k, gpu_gen, bgen));
         tls(|m| {
-            if m.lookup_gen == lookup {
-                m.keys.insert((t.raw, storage), k);
+            if m.keys.len() >= 1 << 16 {
+                m.keys.clear();
             }
+            m.keys.insert((t.raw, storage), (k, gpu_gen, bgen));
         });
         k
     }
@@ -4023,7 +4072,7 @@ impl Images {
             self.refreshing.insert(key, wait.clone());
             FIRST_OUT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             REFRESH_JOBS.with(|j| j.borrow_mut().push(RefreshJob { key, image, t: *t, region, range: (t.base, n), parts: None, all: true, cause: 0, remap: None, wait, first: true }));
-            self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: false, source: Some(region), hashes: [0; SLICES], checked_frame: frame, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(frame) });
+            self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: false, source: Some(region), source_gen: super::track::gen_of(region), hashes: [0; SLICES], checked_frame: frame, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(frame) });
             self.note_layout(key, t);
             return Ok(key);
         }
@@ -4052,7 +4101,7 @@ impl Images {
         let ts = timed();
         let hashes = source.map(|(b, n)| all_hashes(b, n)).unwrap_or([0; SLICES]);
         note_step(5, ts);
-        self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: false, source: region, hashes, checked_frame: frame, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(frame) });
+        self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: false, source: region, source_gen: region.and_then(super::track::gen_of), hashes, checked_frame: frame, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(frame) });
         self.note_layout(key, t);
         Ok(key)
     }
@@ -4681,6 +4730,7 @@ impl Images {
             gpu_images_changed();
         }
         IMAGE_BYTES.fetch_add(img.bytes, std::sync::atomic::Ordering::Relaxed);
+        base_gen(key.base).fetch_add(1, std::sync::atomic::Ordering::Release);
         match self.map.insert(key, img) {
             None => self.by_base.entry(key.base).or_default().push(key),
             Some(old) => {
@@ -4694,6 +4744,7 @@ impl Images {
 
     fn map_remove(&mut self, key: &ImageKey) -> Option<Image> {
         let img = self.map.remove(key)?;
+        base_gen(key.base).fetch_add(1, std::sync::atomic::Ordering::Release);
         IMAGE_BYTES.fetch_sub(img.bytes, std::sync::atomic::Ordering::Relaxed);
         LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         if img.gpu_written || self.gpu_bases.contains(&key.base) {
@@ -4739,7 +4790,7 @@ impl Images {
         } else {
             let (image, mem, bytes) = self.create(key)?;
             self.to_general(image, key.format);
-            self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: true, source: None, hashes: [0; SLICES], checked_frame: 0, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed)) });
+            self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: true, source: None, source_gen: None, hashes: [0; SLICES], checked_frame: 0, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed)) });
             self.gpu_bases.insert(key.base);
             crate::info!("images: new render target {:#x} {}x{} {:?} at flip {}", key.base, key.width, key.height, key.format, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
             // DS_CAPTURE_NEW_RT=<hex base>: capture the frame after a render
@@ -4778,6 +4829,7 @@ impl Images {
             NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         img.source = None;
+        img.source_gen = None;
         self.index_owned(k);
         Ok(k)
     }
@@ -5144,37 +5196,49 @@ impl Images {
         if storage {
             return self.view_full(t, storage, frame).map(|r| (r.0, r.1));
         }
-        // Generations read first: a change made by the full lookup itself
-        // (a new image) makes the entry stale at its next use.
-        let (lookup, track) = (LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire), super::track::GEN.load(std::sync::atomic::Ordering::Acquire));
-        if let Some(&(f, g, tg, v, i, u)) = self.view_memo.get(&t.raw) {
+        // Generations read first, the image's region's too when the image
+        // exists: a change during the full lookup (its refresh) makes the
+        // entry stale at its next use.
+        use std::sync::atomic::Ordering::Acquire;
+        let (gpu_gen, bgen) = (GPU_IMAGES_GEN.load(Acquire), base_gen(t.base).load(Acquire));
+        let key = Self::key_of(t);
+        let region_before = key.and_then(|k| self.map.get(&k)).and_then(|i| i.source_gen);
+        let rgen = region_before.map_or(0, |g| g.load(Acquire));
+        if let Some(m) = self.view_memo.get(&t.raw).copied() {
             // (An image whose upload a thread left for after the lock goes
             // the full way, whose `refresh` waits for it: a memo another
             // waiting thread made would hand it out unrecorded.)
-            if (f == frame || scrubbing()) && g == lookup && tg == track && !self.upload_pending(i) {
-                u.stamp(frame);
+            if m.miss(t, frame, scrubbing()) == 0 && !self.upload_pending(m.image) {
+                m.used.stamp(frame);
                 // This thread's memo too: without it every thread but the one
                 // that made the entry took this lock for each lookup (64% of
                 // view lookups missed their memo, run 20261012-073715).
-                tls(|m| {
-                    if m.views.len() >= 1 << 16 {
-                        m.views.clear();
+                tls(|tm| {
+                    if tm.views.len() >= 1 << 16 {
+                        tm.views.clear();
                     }
-                    m.views.insert(t.raw, (frame, lookup, track, v, i, u));
+                    tm.views.insert(t.raw, ViewMemo { frame, ..m });
                 });
-                return Ok((v, i));
+                return Ok((m.view, m.image));
             }
         }
         let r = self.view_full(t, storage, frame)?;
+        // The region of the image found (an alias of another format, or a
+        // GPU-written image, has none): known before the lookup, or the
+        // entry is good for this call only.
+        let found = key.and_then(|k| self.lookup(&k, false)).and_then(|(k, _)| self.map.get(&k)).filter(|i| i.image == r.1);
+        let region = found.and_then(|i| i.source_gen);
+        let stale = found.is_none() || region.is_some() && !region.zip(region_before).is_some_and(|(a, b)| std::ptr::eq(a, b));
+        let m = ViewMemo { frame, gpu_gen, base_gen: bgen, region, region_gen: rgen, stale, view: r.0, image: r.1, used: r.2 };
         if self.view_memo.len() >= 1 << 16 {
             self.view_memo.clear();
         }
-        self.view_memo.insert(t.raw, (frame, lookup, track, r.0, r.1, r.2));
-        tls(|m| {
-            if m.views.len() >= 1 << 16 {
-                m.views.clear();
+        self.view_memo.insert(t.raw, m);
+        tls(|tm| {
+            if tm.views.len() >= 1 << 16 {
+                tm.views.clear();
             }
-            m.views.insert(t.raw, (frame, lookup, track, r.0, r.1, r.2));
+            tm.views.insert(t.raw, m);
         });
         Ok((r.0, r.1))
     }
@@ -5256,6 +5320,7 @@ impl Images {
             }
             img.gpu_written = true;
             img.source = None;
+            img.source_gen = None;
             self.gpu_bases.insert(key.base);
             self.index_owned(key);
         }

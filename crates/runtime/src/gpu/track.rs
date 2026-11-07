@@ -27,6 +27,10 @@ const PAGE: u64 = 4096;
 struct Region {
     base: u64,
     size: u64,
+    /// Moves whenever the region turns dirty or GPU-written (`gen_of`): a
+    /// consumer's check of it holds while it stays (the image cache's view
+    /// memos).
+    generation: &'static std::sync::atomic::AtomicU32,
     /// Written by the CPU (or mapping changes) since armed.
     dirty: bool,
     /// Written by GPU work since last checked (contents may be unchanged).
@@ -45,6 +49,7 @@ const MAX_PARTS: usize = 64;
 impl Region {
     /// Marks the region dirty: `part` written (None: unknown parts).
     fn mark(&mut self, part: Option<(u64, u64)>, why: Why) {
+        self.generation.fetch_add(1, Ordering::Release);
         self.dirty = true;
         self.why = why;
         match part {
@@ -158,7 +163,9 @@ impl Tracker {
         note_region(base, size);
         RESET_GEN.fetch_add(1, Ordering::Release);
         let id = self.regions.len() as u32;
-        self.regions.push(Some(Region { base, size, dirty: false, gpu: false, why: Why::None, parts: Vec::new(), whole: false }));
+        // (Its generation's counter is leaked: 4 bytes per region ever made, read without the lock.)
+        let generation = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0)));
+        self.regions.push(Some(Region { base, size, generation, dirty: false, gpu: false, why: Why::None, parts: Vec::new(), whole: false }));
         self.by_base.entry(base).or_default().push(id);
         self.max_size = self.max_size.max(size);
         id
@@ -432,6 +439,11 @@ pub fn is_dirty(id: u32) -> bool {
 }
 
 /// A region's guest range.
+/// Region `id`'s generation (it moves whenever the region turns dirty or GPU-written).
+pub fn gen_of(id: u32) -> Option<&'static std::sync::atomic::AtomicU32> {
+    TRACK.lock().as_ref().and_then(|t| t.regions.get(id as usize)).and_then(|r| r.as_ref()).map(|r| r.generation)
+}
+
 pub fn range(id: u32) -> Option<(u64, u64)> {
     let g = TRACK.lock();
     g.as_ref()?.regions.get(id as usize)?.as_ref().map(|r| (r.base, r.size))
@@ -587,6 +599,7 @@ pub fn gpu_write(base: u64, len: u64) {
     t.each_overlapping(base, len, |r| {
         if !r.gpu {
             changed(4);
+            r.generation.fetch_add(1, Ordering::Release);
         }
         r.gpu = true;
         r.why = Why::GpuWrite(base, len);

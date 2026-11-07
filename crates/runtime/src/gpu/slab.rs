@@ -93,6 +93,8 @@ static WAKE: Condvar = Condvar::new();
 /// made, slabs made by the thread that needed one (no spare), its ns, the helper's ns, slabs
 /// freed, allocations of their own made, their ns].
 static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// Images the driver required / preferred an allocation of their own for.
+static DEDICATED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// A slab's size: a 64th of the video memory, 64-256 MiB.
 /// Slabs in use: a device-local heap of 16 GiB or more (at most `vram_cap`).
@@ -123,8 +125,14 @@ fn own(req: vk::MemoryRequirements) -> Result<Mem, String> {
 }
 
 /// Memory for an image with requirements `req` (bound at `offset` of `memory`).
-pub fn alloc(req: vk::MemoryRequirements) -> Result<Mem, String> {
-    if !on() {
+pub fn alloc(req: vk::MemoryRequirements, requires_own: bool, prefers_own: bool) -> Result<Mem, String> {
+    if requires_own {
+        DEDICATED[0].fetch_add(1, Relaxed);
+    }
+    if prefers_own {
+        DEDICATED[1].fetch_add(1, Relaxed);
+    }
+    if !on() || requires_own {
         return own(req);
     }
     let size = slab_size();
@@ -287,7 +295,7 @@ pub fn status() -> String {
     let used: u64 = slabs.iter().map(|s| s.used).sum();
     let hole = slabs.iter().flat_map(|s| s.free.iter().map(|f| f.1)).max().unwrap_or(0);
     format!(
-        "image memory: {} images in {} slabs of {} MiB ({} MiB, {} MiB of it used, largest hole {} MiB; {} spare), {} with their own ({} MiB); slabs made {} ({} on the thread that needed one, {} ms; the helper's {} ms), freed {}; allocations of their own {} ({} ms)",
+        "image memory: {} images in {} slabs of {} MiB ({} MiB, {} MiB of it used, largest hole {} MiB; {} spare), {} with their own ({} MiB); slabs made {} ({} on the thread that needed one, {} ms; the helper's {} ms), freed {}; allocations of their own {} ({} ms); the driver required one of their own for {} images, preferred it for {}",
         st[0],
         slabs.len(),
         slab_size() >> 20,
@@ -303,7 +311,9 @@ pub fn status() -> String {
         st[7] / 1_000_000,
         st[8],
         st[9],
-        st[10] / 1_000_000
+        st[10] / 1_000_000,
+        DEDICATED[0].load(Relaxed),
+        DEDICATED[1].load(Relaxed)
     )
 }
 

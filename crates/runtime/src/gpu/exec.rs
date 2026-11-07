@@ -895,8 +895,10 @@ fn revalidate_spans() {
     // drop and submitted after it read them through the table (commands bind
     // windows themselves, and keep the dropped one until they complete).
     for (s, e) in reimport {
+        let t0 = std::time::Instant::now();
         let (made, failed) = import_mappings(s, e);
         REIMPORTS.fetch_add(made + failed, Ordering::Relaxed);
+        REIMPORT_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 }
 
@@ -1309,6 +1311,8 @@ fn read_census_line() -> String {
 /// Import windows made again right after their window was dropped
 /// (`revalidate_spans`, with the guest page table).
 pub static REIMPORTS: AtomicU64 = AtomicU64::new(0);
+/// Their time, on the threads that met the drop (`revalidate_spans`).
+pub static REIMPORT_NS: AtomicU64 = AtomicU64::new(0);
 
 /// In-place bindings with residency on (they import their pages): by
 /// [written, unsized] and size bucket (<64K, <1M, <16M, more): [bindings,

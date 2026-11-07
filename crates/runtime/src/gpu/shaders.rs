@@ -1930,6 +1930,25 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
     prep_lap(0);
     let (insts, code_hash) = program_local(addr)?;
     prep_lap(1);
+    // `DS_MRTZ_CENSUS=1` (diagnosis): pixel programs exporting stencil, a sample mask or alpha
+    // through MRTZ, channels the translator leaves out, each logged once with the draw's state.
+    static MRTZ_CENSUS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *MRTZ_CENSUS.get_or_init(|| std::env::var("DS_MRTZ_CENSUS").ok().as_deref() == Some("1")) {
+        let mz = insts.iter().filter(|i| i.enc == rdna::Enc::Exp && i.exp_target() == 8).fold(0, |m, i| m | i.exp_en());
+        static SEEN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+        if mz & 0xE != 0 && SEEN.lock().get_or_insert_with(Default::default).insert(addr) {
+            crate::info!(
+                "mrtz census: ps {addr:#x} exports channels {mz:#x} (1 depth, 2 stencil, 4 sample mask, 8 alpha); DB_SHADER_CONTROL {:#x}, DB_ALPHA_TO_MASK {:#x}, DB_DEPTH_CONTROL {:#x}, SPI_SHADER_Z_FORMAT {:#x}, PA_SC_AA_CONFIG {:#x}, color formats {:#x}",
+                ctx(DB_SHADER_CONTROL),
+                ctx(DB_ALPHA_TO_MASK),
+                ctx(DB_DEPTH_CONTROL),
+                ctx(0x28710),
+                ctx(0x28BE0),
+                ctx(SPI_SHADER_COL_FORMAT)
+            );
+            let _ = super::capture::save_program(addr);
+        }
+    }
     let in_control = ctx(SPI_PS_IN_CONTROL);
     let (mut ps_inputs, resources) = spec_vecs();
     for n in 0..(in_control & 0x3F).min(32) {
