@@ -140,6 +140,9 @@ pub struct Run {
     /// The CP writes the run holds (`Cp::compute_pass`): packet address,
     /// guest address, bytes.
     pub cp_writes: std::sync::Arc<[(u64, u64, u64)]>,
+    /// The graphics queue's handshake census: the run's segment
+    /// (`gpu::hscensus`; 0: not counted).
+    pub hs_seg: u64,
 }
 
 /// Run ids (`Run::id`; 0: none).
@@ -165,6 +168,7 @@ impl Run {
             id: RUN_IDS.fetch_add(1, Ordering::Relaxed),
             passed_waits: std::sync::Arc::from(Vec::new()),
             cp_writes: std::sync::Arc::from(Vec::new()),
+            hs_seg: 0,
         }
     }
 
@@ -495,6 +499,7 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         }
         let mut cp = w.cp.lock();
         cp.set_chunk_state(&state);
+        cp.set_hs_seg(run.hs_seg);
         cp.chunk_waits = run.passed_waits.clone();
         cp.set_run_writes(run.cp_writes.iter().filter(|w| w.0 < from).map(|w| (w.1, w.2)).collect());
         cp.fe2_set_view(run.fe2_view);
@@ -667,5 +672,5 @@ pub fn status() -> String {
         lens_c.join(", "),
         ends_c.join(", "),
         super::cp::run_passed_line()
-    )
+    ) + &super::hscensus::line()
 }

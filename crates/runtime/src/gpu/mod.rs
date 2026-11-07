@@ -1807,6 +1807,7 @@ pub mod gpures;
 pub mod drawcensus;
 pub mod particles;
 pub mod forward;
+pub mod hscensus;
 pub mod par;
 pub mod prio;
 pub mod precache;

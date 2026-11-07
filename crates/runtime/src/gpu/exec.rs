@@ -8541,6 +8541,9 @@ pub struct Exec {
     /// earlier chunks write (`par::Run::cp_writes`); a CPU read of one stops
     /// the chunk (those batches are not submitted yet).
     pub(super) run_writes: Vec<(u64, u64)>,
+    /// The graphics queue's handshake census (`gpu::hscensus`): the segment
+    /// the commands this executor records belong to (0: not counted).
+    pub(super) hs_seg: u64,
     /// The open batch's command buffers are claimed (`vk::defer`): its
     /// commands go to lists the submission thread replays into them just
     /// before submitting it (`tune record_defer`).
@@ -9336,6 +9339,7 @@ impl Exec {
                 deferred: false,
                 par_worker: false,
                 run_writes: Vec::new(),
+                hs_seg: 0,
                 batch_lists: false,
                 held: false,
                 past: false,
@@ -12342,6 +12346,9 @@ impl Exec {
             self.stop("reads a CP write of its run's earlier chunks");
             return true;
         }
+        if self.hs_seg != 0 && super::hscensus::on() {
+            super::hscensus::reads(reads, self.hs_seg, why, self.sync_readers[0]);
+        }
         note_read_census(reads, why);
         super::fe2::note_wb_reads(reads);
         if super::runprobe::on() && self.name == "gpu-gfx" {
@@ -12625,6 +12632,9 @@ impl Exec {
             self.note_open_write(a, n);
         }
         self.pending.insert(a, n);
+        if self.hs_seg != 0 && super::hscensus::on() {
+            super::hscensus::wrote(a, n, self.hs_seg, self.noting);
+        }
         self.note_since(a, n);
         self.own_gen += 1;
         if verify::enabled() {

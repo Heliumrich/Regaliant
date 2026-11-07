@@ -2387,6 +2387,51 @@ impl Cp {
         true
     }
 
+    /// A worker's chunk: its run's segment in the graphics queue's
+    /// handshake census (`gpu::hscensus`).
+    pub fn set_hs_seg(&mut self, seg: u64) {
+        if let Some(e) = self.exec.as_mut() {
+            e.hs_seg = seg;
+        }
+    }
+
+    /// The graphics queue's handshake census (`gpu::hscensus`; the main
+    /// command processor at each packet): a packet a run through cache
+    /// actions, partial flushes and label handshakes would still end at ends
+    /// the stretch; a serial command is a segment of its own.
+    fn hs_census_packet(&mut self, opcode: u32, p: &dyn Fn(u64) -> u32, n: u64) {
+        let multi = matches!(opcode, op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI);
+        let pass = is_state(opcode)
+            || is_command(opcode)
+            || multi
+            || matches!(
+                opcode,
+                op::SET_BASE
+                    | op::INDEX_TYPE
+                    | op::INDEX_BASE
+                    | op::INDEX_BUFFER_SIZE
+                    | op::NUM_INSTANCES
+                    | op::CONTEXT_CONTROL
+                    | op::INDIRECT_BUFFER
+                    | op::ACQUIRE_MEM
+                    | op::WRITE_DATA
+                    | op::RELEASE_MEM
+                    | op::WAIT_REG_MEM
+                    | op::WAIT_REG_MEM64
+            )
+            || (opcode == op::EVENT_WRITE && matches!(p(0) & 0x3F, 7 | 0x10))
+            || (opcode == op::NOP && !(n >= 2 && p(0) == DS_MAGIC && !matches!(p(1), pop::PUSH_MARKER | pop::SET_MARKER | pop::POP_MARKER)));
+        if !pass {
+            super::hscensus::boundary();
+        }
+        if (is_command(opcode) || multi) && self.par.is_none() {
+            let seg = super::hscensus::next_segment();
+            if let Some(e) = self.exec.as_mut() {
+                e.hs_seg = seg;
+            }
+        }
+    }
+
     /// A worker's chunk: the guest ranges CP writes of its run's earlier
     /// chunks write (`Exec::run_writes`).
     pub fn set_run_writes(&mut self, w: Vec<(u64, u64)>) {
@@ -3224,6 +3269,12 @@ impl Cp {
         approved.sort_unstable();
         run.passed_waits = std::sync::Arc::from(approved);
         run.cp_writes = std::sync::Arc::from(cp_writes);
+        if self.main_gfx && !self.compute && super::hscensus::on() {
+            run.hs_seg = super::hscensus::next_segment();
+            if let Some(e) = self.exec.as_mut() {
+                e.hs_seg = run.hs_seg;
+            }
+        }
         // (Its workers check as of this command processor's view now.)
         run.fe2_view = self.fe2_view.as_ref().map_or(super::fe2::NO_VIEW, |c| c.load(Ordering::Acquire));
         let run = Arc::new(run);
@@ -5039,6 +5090,10 @@ impl Cp {
             PACKETS.fetch_add(1, Ordering::Relaxed);
             self.cur_packet = cur;
             self.cur_opcode = opcode;
+            if self.main_gfx && !self.compute && super::hscensus::on() {
+                let q = |i: u64| f.rd(cur + 4 * (1 + i));
+                self.hs_census_packet(opcode, &q, n);
+            }
             // The packet as the CP fetches it on reaching it, before it
             // executes: handlers that wait (for GPU work, a label, a display
             // buffer) read their arguments as fetched. Read after the wait,
