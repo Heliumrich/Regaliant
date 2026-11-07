@@ -16,6 +16,15 @@ pub fn run() -> i32 {
         crate::error!("dispatch bench: Vulkan: {e}");
         return 2;
     }
+    if let Some(secs) = std::env::var("DS_SUBMIT_BENCH").ok().and_then(|v| v.parse::<u64>().ok()) {
+        return match submit_bench(secs) {
+            Ok(()) => 0,
+            Err(e) => {
+                crate::error!("submit bench: {e}");
+                2
+            }
+        };
+    }
     match bench() {
         Ok(()) => 0,
         Err(e) => {
@@ -26,6 +35,67 @@ pub fn run() -> i32 {
 }
 
 const N: usize = 256;
+
+/// `DS_SUBMIT_BENCH=<seconds>` (with `--dispatch-bench`): ~1,000 one-command submissions a second
+/// to the main queue for that long, no title running, each call timed: whether the driver's
+/// submissions of 2 ms or more (in game, ~5 a second ~170 ms apart, FINDINGS.md 2026-11-07) come
+/// without the title and front end 2 around them, and their spacing.
+fn submit_bench(secs: u64) -> Result<(), String> {
+    let c = ctx();
+    let d = &c.device;
+    let (buf, _mem) = c.device_buffer(4096, vk::BufferUsageFlags::TRANSFER_DST)?;
+    const K: usize = 64;
+    let (cmds, fences) = unsafe {
+        let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(c.queue_family), None).map_err(|e| format!("pool: {e}"))?;
+        let cmds = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(K as u32)).map_err(|e| format!("cmds: {e}"))?;
+        for &cb in &cmds {
+            d.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default()).map_err(|e| format!("begin: {e}"))?;
+            d.cmd_fill_buffer(cb, buf, 0, 4, 0);
+            d.end_command_buffer(cb).map_err(|e| format!("end: {e}"))?;
+        }
+        let fences: Vec<vk::Fence> = (0..K).map(|_| d.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)).collect::<Result<_, _>>().map_err(|e| format!("fence: {e}"))?;
+        (cmds, fences)
+    };
+    let start = std::time::Instant::now();
+    let end = start + std::time::Duration::from_secs(secs);
+    let (mut n, mut slow) = (0u64, Vec::new());
+    let mut worst = 0u128;
+    while std::time::Instant::now() < end {
+        let k = (n as usize) % K;
+        unsafe {
+            d.wait_for_fences(&[fences[k]], true, u64::MAX).map_err(|e| format!("wait: {e}"))?;
+            d.reset_fences(&[fences[k]]).map_err(|e| format!("reset: {e}"))?;
+        }
+        let t0 = std::time::Instant::now();
+        c.submit(cmds[k], &[], &[], fences[k])?;
+        let us = t0.elapsed().as_micros();
+        worst = worst.max(us);
+        if us >= 2000 {
+            slow.push((start.elapsed().as_secs_f64() * 1000.0, us));
+        }
+        n += 1;
+        std::thread::sleep(std::time::Duration::from_micros(900));
+    }
+    unsafe { d.queue_wait_idle(*c.queue.lock()).ok() };
+    let gaps: Vec<f64> = slow.windows(2).map(|w| w[1].0 - w[0].0).collect();
+    let mut sorted = gaps.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let q = |f: f64| sorted.get(((sorted.len() as f64 - 1.0) * f) as usize).copied().unwrap_or(0.0);
+    crate::info!(
+        "submit bench: {n} submissions in {:.1} s ({:.0} a second), {} took 2 ms or more (worst {} us); gaps between them ms: p10 {:.0}, p50 {:.0}, p90 {:.0}",
+        start.elapsed().as_secs_f64(),
+        n as f64 / start.elapsed().as_secs_f64(),
+        slow.len(),
+        worst,
+        q(0.1),
+        q(0.5),
+        q(0.9)
+    );
+    for (t, us) in slow.iter().take(40) {
+        crate::info!("submit bench: slow submission at {t:.0} ms: {us} us");
+    }
+    Ok(())
+}
 
 fn bench() -> Result<(), String> {
     let c = ctx();
