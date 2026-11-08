@@ -1663,6 +1663,17 @@ fn cb_census_on() -> bool {
     *W.get_or_init(|| std::env::var("DS_CB_CENSUS").ok().as_deref() == Some("1"))
 }
 
+/// Diagnosis (`DS_CB_SHAPE=<flip>`): the graphics command processor's
+/// stream during that flip, logged as `cb shape:` lines (buffers entered
+/// and left with their depth, top-level packets, runs gone past and the
+/// stops of recording past them; at most 1,500 lines).
+fn cb_shape_flip() -> u64 {
+    static F: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DS_CB_SHAPE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(u64::MAX))
+}
+
+static CB_SHAPE_LINES: AtomicU64 = AtomicU64::new(0);
+
 const CB_FLIPS: u64 = 8;
 
 /// Per kind (the graphics queue's command processor, the compute queues'):
@@ -2093,9 +2104,27 @@ impl Cp {
         Ok(())
     }
 
+    /// Whether the shape trace logs now (`DS_CB_SHAPE`).
+    fn shape(&self) -> bool {
+        self.main_gfx && super::FRAMES.load(Ordering::Relaxed) == cb_shape_flip() && CB_SHAPE_LINES.fetch_add(1, Ordering::Relaxed) < 1500
+    }
+
+    fn held_tag(&self) -> &'static str {
+        if self.past.is_some() {
+            " (past a run)"
+        } else if self.past_wait.is_some() {
+            " (past a label wait)"
+        } else {
+            ""
+        }
+    }
+
     /// Stops recording ahead at the packet at `at` (it and what follows are
     /// left to the main command processor).
     fn held_stop(&mut self, why: &'static str, at: u64) {
+        if self.shape() {
+            crate::info!("cb shape: stop {why} at {at:#x}, depth {}{}", self.depth, self.held_tag());
+        }
         if let Some(e) = self.exec.as_mut() {
             e.stop_held(why);
         }
@@ -3599,6 +3628,9 @@ impl Cp {
         if pr.sync {
             self.fence_pending = true;
         }
+        if self.shape() {
+            crate::info!("cb shape: past a run of {} chunks from {:#x} to {:#x}, depth {}", pr.starts.len(), pr.starts.first().copied().unwrap_or(0), pr.end, self.depth);
+        }
         self.submit_gpu("par");
         pr.run.grant(0);
         let end_state = pr.end_state.take().unwrap();
@@ -4976,6 +5008,9 @@ impl Cp {
         self.depth += 1;
         let mut cur = addr;
         let mut end = addr + 4 * size as u64;
+        if self.shape() {
+            crate::info!("cb shape: enter {addr:#x} ({size} dwords), depth {}, next in submission {}{}", self.depth, self.next_in_submission, self.held_tag());
+        }
         self.before_fetch(addr, 4 * size as u64);
         let mut f = Fetched::new(addr, size);
         if cb_census_on() {
@@ -5100,6 +5135,9 @@ impl Cp {
                 class_end(7, t);
             }
             PACKETS.fetch_add(1, Ordering::Relaxed);
+            if self.depth == 1 && self.shape() {
+                crate::info!("cb shape: packet {} at {cur:#x}{}", op_name(opcode), self.held_tag());
+            }
             self.cur_packet = cur;
             self.cur_opcode = opcode;
             if self.main_gfx && !self.compute && super::hscensus::on() {
@@ -5366,6 +5404,9 @@ impl Cp {
         // again at the stop and its chunk stopped there again, endlessly).
         if self.par.is_some() && self.rewind.is_none() && self.rewind_sub.is_none() {
             self.par_cancel();
+        }
+        if self.shape() {
+            crate::info!("cb shape: leave at {cur:#x}, depth {}{}", self.depth, self.held_tag());
         }
         self.depth -= 1;
         if self.depth == 0 {

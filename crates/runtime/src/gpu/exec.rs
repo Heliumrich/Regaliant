@@ -7593,7 +7593,11 @@ static SLOW_PLACES_LOGGED: AtomicU64 = AtomicU64::new(0);
 
 fn note_slow_place(name: &str, base: u64, size: u64, written: bool, placed: Option<u64>, us: u64, probe: [u64; super::fe2::PROBE_N]) {
     let shader = super::images::BINDING_SHADER.with(|s| s.get());
-    if SLOW_PLACES_LOGGED.fetch_add(1, Ordering::Relaxed) < 120 {
+    // (`DS_SLOW_PLACE_FROM=<flip>`: the first 120 logged from that flip on,
+    // past a boot's loads.)
+    static FROM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let from = *FROM.get_or_init(|| std::env::var("DS_SLOW_PLACE_FROM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    if super::FRAMES.load(Ordering::Relaxed) >= from && SLOW_PLACES_LOGGED.fetch_add(1, Ordering::Relaxed) < 120 {
         let parts: Vec<String> = super::fe2::PROBE_NAMES.iter().zip(probe.iter()).filter(|&(_, &v)| v != 0).map(|(n, &v)| if n.ends_with(" us") { format!("{n} {}", v / 1000) } else { format!("{n} {v}") }).collect();
         crate::info!("gpu[{name}]: slow placement of {base:#x}+{size:#x}{} for shader {shader:#x} at flip {}: {us} us (placed {}); {}", if written { " written" } else { "" }, super::FRAMES.load(Ordering::Relaxed), placed.map_or("nothing".to_string(), |p| format!("{p:#x}")), parts.join(", "));
     }

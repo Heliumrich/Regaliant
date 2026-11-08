@@ -1317,8 +1317,8 @@ pub fn slow_place_us() -> u64 {
 
 /// What this thread's checks did since `probe_take` (`DS_SLOW_PLACE`):
 /// `PROBE_NAMES`.
-pub const PROBE_N: usize = 13;
-pub const PROBE_NAMES: [&str; PROBE_N] = ["checks", "range-cache hits", "words scanned", "chunks by summary", "runs to check", "their pages", "hot runs uploaded", "their pages", "runs after another's take", "runs taken", "their pages", "scan us", "runs us"];
+pub const PROBE_N: usize = 16;
+pub const PROBE_NAMES: [&str; PROBE_N] = ["checks", "range-cache hits", "words scanned", "chunks by summary", "runs to check", "their pages", "hot runs uploaded", "their pages", "runs after another's take", "runs taken", "their pages", "scan us", "runs us", "arming us", "takes us", "uploads and clean marks us"];
 const P_CHECKS: usize = 0;
 const P_HITS: usize = 1;
 const P_WORDS: usize = 2;
@@ -1332,6 +1332,9 @@ const P_TAKES: usize = 9;
 const P_TAKE_PAGES: usize = 10;
 const P_SCAN_NS: usize = 11;
 const P_RUNS_NS: usize = 12;
+const P_ARM_NS: usize = 13;
+const P_TAKE_NS: usize = 14;
+const P_FIX_NS: usize = 15;
 
 thread_local! {
     static PROBE: std::cell::Cell<[u64; PROBE_N]> = const { std::cell::Cell::new([0; PROBE_N]) };
@@ -1753,7 +1756,11 @@ fn check_run(a: u64, b: u64, ep: u32, frame: u64, arm: bool, mine: &dyn Fn(u64) 
     let _taking = Taking::new(ta, tb, ep);
     take_run(a, b, ta, tb, frame, arm, armable, written, class);
     let t = tsc();
+    let tp = (slow_place_us() != 0).then(std::time::Instant::now);
     let r = fix_run(a, b, ep, mine, upload);
+    if let Some(tp) = tp {
+        probe_add(P_FIX_NS, tp.elapsed().as_nanos() as u64);
+    }
     // The words around a small run were taken too: clean in this epoch.
     if ta < a {
         set_clean(ta, a, ep, false);
@@ -1814,13 +1821,19 @@ fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &A
     if why_unarmed_pages() != 0 && (tb - ta) / PAGE >= why_unarmed_pages() {
         why_unarmed(ta, tb, frame, armable);
     }
-    // (Queue 0x50's threads take without arming: its particle chain sets
-    // how long the graphics CP records serially past its label, and the
-    // pages stay armable for other threads' checks: +0.5% at the vista,
-    // level at Doran, FINDINGS.md 2026-11-06.)
-    if arm && crate::hosted::on() && super::prio::role() != 2 {
+    // (Queue 0x50's threads and the graphics CP take without arming: their
+    // chains set the frame, and the pages stay armable for other threads'
+    // checks: queue 0x50 +0.5% at the vista, level at Doran, FINDINGS.md
+    // 2026-11-06; the graphics CP, whose large checks of the title's ring
+    // spent most of their time arming, x1.007 at the vista in four of four
+    // cycles and level at Doran, 2026-11-08 evening.)
+    if arm && crate::hosted::on() && !matches!(super::prio::role(), 0 | 2) {
         let t = tsc();
+        let tp = (slow_place_us() != 0).then(std::time::Instant::now);
         try_arm(a, b, frame, armable);
+        if let Some(tp) = tp {
+            probe_add(P_ARM_NS, tp.elapsed().as_nanos() as u64);
+        }
         caller_since(C_ARM, t);
     }
     // The take: pages written since their last take lose their valid bit
@@ -1831,6 +1844,9 @@ fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &A
     let tt = std::time::Instant::now();
     let t = tsc();
     let r = super::precache::take_written_for(ta, tb - ta, written, None, crate::mem::WW_WHO_FE2);
+    if slow_place_us() != 0 {
+        probe_add(P_TAKE_NS, tt.elapsed().as_nanos() as u64);
+    }
     caller_since(C_TAKE, t);
     if r.is_some() {
         hole_check(written);
