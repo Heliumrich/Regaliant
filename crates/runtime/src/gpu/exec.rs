@@ -2594,13 +2594,27 @@ fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: O
             }
             let extra = vk::PipelineCreateFlags::from_raw(EXTRA_PIPE_FLAGS.load(Ordering::Relaxed) as u32);
             let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout).flags(vk::PipelineCreateFlags::DISPATCH_BASE | super::pstats::flags() | extra);
-            let create = |cache| c.device.create_compute_pipelines(cache, &[ci], None).map_err(|(_, e)| format!("compute pipeline: {e}"));
+            // (Through the pipeline store: its cache file, or its binaries,
+            // `pcache::create_with`.)
+            let make = |via: super::pcache::Via| -> Result<vk::Pipeline, String> {
+                let mut ci = ci;
+                let mut f2 = vk::PipelineCreateFlags2CreateInfoKHR::default().flags(vk::PipelineCreateFlags2KHR::from_raw(ci.flags.as_raw() as u64 | super::vk::pbin::CAPTURE_DATA));
+                if via.capture {
+                    ci = ci.push_next(&mut f2);
+                }
+                let bi;
+                if let Some(b) = via.binaries {
+                    bi = super::vk::pbin::BinaryInfo { s_type: super::vk::pbin::ST_BINARY_INFO, p_next: ci.p_next, binary_count: b.len() as u32, p_binaries: b.as_ptr() };
+                    ci.p_next = &bi as *const super::vk::pbin::BinaryInfo as *const std::ffi::c_void;
+                }
+                c.device.create_compute_pipelines(via.cache, &[ci], None).map(|v| v[0]).map_err(|(_, e)| format!("compute pipeline: {e}"))
+            };
             let pipeline = match cache_key {
-                Some(k) => super::pcache::with_cache('c', k, create),
-                None => create(vk::PipelineCache::null()),
+                Some(k) => super::pcache::create_with('c', k, super::pcache::fingerprint(&[&out.spirv]), make),
+                None => make(super::pcache::Via { cache: vk::PipelineCache::null(), capture: false, binaries: None }),
             };
             c.device.destroy_shader_module(module, None);
-            Ok(Pipe { pipeline: pipeline?[0], layout, set_layout, push })
+            Ok(Pipe { pipeline: pipeline?, layout, set_layout, push })
         }
     }
 }

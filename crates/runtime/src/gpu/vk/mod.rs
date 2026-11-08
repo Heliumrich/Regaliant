@@ -1,6 +1,7 @@
 //! Vulkan device context shared by the renderer and the presenter.
 
 pub mod defer;
+pub mod pbin;
 pub mod present;
 pub mod sharpen;
 pub mod window;
@@ -95,7 +96,27 @@ pub struct Ctx {
     /// GPU-performed CP writes follow those wait for it
     /// (`exec::Exec::order_after_cpu`).
     pub cpu_done: vk::Semaphore,
+    /// VK_KHR_pipeline_binary where the device has it (`pipeline_binaries`):
+    /// the pipeline store keeps the driver's binaries (`gpu::pcache`).
+    pub pbin: Option<pbin::Fns>,
 }
+
+/// The pipeline store keeps the driver's pipeline binaries
+/// (VK_KHR_pipeline_binary, `gpu::pcache`) where the device has them (since
+/// 2026-11-08; `DS_PIPELINE_BINARIES=0`: cache data only, as before); read
+/// when the device is made. With them the driver's own cache is off for this
+/// device (`DS_PB_NO_INTERNAL=0` keeps it): the store holds what it would,
+/// and the driver's cache budget, shared with the player's games, is left to
+/// them. (So the store's older cache files, which need the driver's cache on
+/// this driver, no longer help: the first boot with binaries compiles what it
+/// has no binaries for; `DS_PB_NO_INTERNAL=0` once captures them through a
+/// warm driver cache.)
+pub fn pipeline_binaries() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_PIPELINE_BINARIES").ok().as_deref() != Some("0"))
+}
+
+
 
 /// A queue of a compute-only family (`Ctx::compute`) and the timeline its
 /// batches signal with their sequence.
@@ -576,6 +597,20 @@ fn init_inner() -> Result<(), String> {
             .uniform_and_storage_buffer8_bit_access(true)
             .shader_int8(true);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true).maintenance4(true).subgroup_size_control(!subgroup32.is_empty());
+        // Pipeline binaries (`pipeline_binaries`): VK_KHR_maintenance5 (for
+        // the capture flag) and VK_KHR_pipeline_binary with its feature.
+        let has_m5 = instance.enumerate_device_extension_properties(pdev).unwrap_or_default().iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::maintenance5::NAME);
+        let pbins = pipeline_binaries() && has_m5 && pbin::supported(&instance, pdev);
+        if pipeline_binaries() && !pbins {
+            crate::warn!("Vulkan: pipeline binaries asked for but not available (maintenance5 {has_m5}): the pipeline store keeps cache data only");
+        }
+        if pbins {
+            dexts.push(ash::khr::maintenance5::NAME.as_ptr());
+            dexts.push(pbin::NAME.as_ptr());
+        }
+        let mut m5 = vk::PhysicalDeviceMaintenance5FeaturesKHR::default().maintenance5(true);
+        let mut pb_feat = pbin::Features { s_type: pbin::ST_FEATURES, p_next: std::ptr::null_mut(), pipeline_binaries: 1 };
+        let mut pb_cache = pbin::CacheControl { s_type: pbin::ST_CACHE_CONTROL, p_next: std::ptr::null(), disable_internal_cache: 1 };
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_extension_names(&dexts)
@@ -594,6 +629,18 @@ fn init_inner() -> Result<(), String> {
         }
         if has_stats {
             dci = dci.push_next(&mut stats_f);
+        }
+        if pbins {
+            dci = dci.push_next(&mut m5);
+            pb_feat.p_next = dci.p_next as *mut std::ffi::c_void;
+            dci.p_next = &pb_feat as *const pbin::Features as *const std::ffi::c_void;
+            // (The driver's own cache off for this device; `DS_PB_NO_INTERNAL=0`
+            // keeps it.)
+            if std::env::var("DS_PB_NO_INTERNAL").ok().as_deref() != Some("0") {
+                pb_cache.p_next = dci.p_next;
+                dci.p_next = &pb_cache as *const pbin::CacheControl as *const std::ffi::c_void;
+                crate::info!("Vulkan pipeline binaries: the driver's own cache is off for this device (the store keeps the binaries)");
+            }
         }
         init_stage(3);
         let device = instance.create_device(pdev, &dci, None).map_err(|e| format!("vkCreateDevice: {e}"))?;
@@ -664,7 +711,15 @@ fn init_inner() -> Result<(), String> {
             let mut tci = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
             device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tci), None).map_err(|e| format!("effects timeline semaphore: {e}"))?
         };
+        let pbin = if pbins { pbin::Fns::load(&instance, pdev, device.handle()) } else { None };
+        if pbins {
+            match &pbin {
+                Some(_) => crate::info!("Vulkan pipeline binaries: on"),
+                None => crate::warn!("Vulkan pipeline binaries: the commands are missing (off)"),
+            }
+        }
         let ctx = Ctx {
+            pbin,
             batches,
             cpu_done,
             surface_i: ash::khr::surface::Instance::new(&entry, &instance),

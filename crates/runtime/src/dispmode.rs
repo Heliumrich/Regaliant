@@ -73,6 +73,24 @@ static PULSES: AtomicU64 = AtomicU64::new(0);
 /// window settles before the targets are made again).
 static WANT: AtomicU64 = AtomicU64::new(0);
 static WANT_TICKS: AtomicU32 = AtomicU32::new(0);
+/// A render size asked for in a run without a window by the control command
+/// `rsize` (width << 32 | height; 0: the title's own), for in-run
+/// comparisons: applied by a mode pulse as the Render Scale is.
+static HEADLESS_WANT: AtomicU64 = AtomicU64::new(0);
+
+/// `rsize <w>x<h>` (0x0: the title's own size again; no window only).
+pub fn set_headless_size(w: u32, h: u32) -> Result<(), String> {
+    if crate::gpu::vk::present::area().is_some() {
+        return Err("rsize: a window's size follows the Render Scale".into());
+    }
+    if (w, h) != (0, 0) && !((320..=3840).contains(&w) && (180..=2160).contains(&h)) {
+        return Err(format!("rsize: {w}x{h} is not a size (320x180 to 3840x2160, or 0x0)"));
+    }
+    HEADLESS_WANT.store((w as u64) << 32 | h as u64, Ordering::Relaxed);
+    crate::info!("rsize: render size {w}x{h} asked for (applied by a mode pulse)");
+    Ok(())
+}
+
 /// The chosen output size for modes 3-5 (width << 32 | height; 0: the
 /// title's 3840x2160).
 static OUTPUT: AtomicU64 = AtomicU64::new(0);
@@ -288,8 +306,12 @@ pub fn tick() {
             let (rw, rh) = scaled_size(w, h, pct);
             (rw as u64) << 32 | rh as u64
         }
-        // No window: the title's own size, or its shape's for another aspect.
-        _ => headless_render(),
+        // No window: the title's own size, or its shape's for another aspect
+        // (`rsize`: the size asked for).
+        _ => match HEADLESS_WANT.load(Ordering::Relaxed) {
+            0 => headless_render(),
+            v => v,
+        },
     };
     if WANT.swap(want, Ordering::Relaxed) != want {
         WANT_TICKS.store(0, Ordering::Relaxed);

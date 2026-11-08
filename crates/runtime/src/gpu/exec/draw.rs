@@ -883,11 +883,32 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
             .layout(layout)
             .flags(crate::gpu::pstats::flags())
             .push_next(&mut rinfo);
-        let r = crate::gpu::pcache::with_cache('g', hkey, |cache| c.device.create_graphics_pipelines(cache, &[gpci], None));
+        // (Through the pipeline store: its cache file, or its binaries,
+        // `pcache::create_with`.)
+        // (The code the binaries were made from: the stages' SPIR-V and what
+        // the rect-list geometry shader is made from.)
+        let fp = {
+            let gs = [key.rect_gs.unwrap_or(u32::MAX), vs.0.out.param_mask];
+            let ps_code: &[u32] = ps.map_or(&[], |p| p.0.out.spirv.as_slice());
+            crate::gpu::pcache::fingerprint(&[&vs.0.out.spirv, &gs, ps_code])
+        };
+        let r = crate::gpu::pcache::create_with('g', hkey, fp, |via| {
+            let mut gpci = gpci;
+            let mut f2 = vk::PipelineCreateFlags2CreateInfoKHR::default().flags(vk::PipelineCreateFlags2KHR::from_raw(gpci.flags.as_raw() as u64 | crate::gpu::vk::pbin::CAPTURE_DATA));
+            if via.capture {
+                gpci = gpci.push_next(&mut f2);
+            }
+            let bi;
+            if let Some(b) = via.binaries {
+                bi = crate::gpu::vk::pbin::BinaryInfo { s_type: crate::gpu::vk::pbin::ST_BINARY_INFO, p_next: gpci.p_next, binary_count: b.len() as u32, p_binaries: b.as_ptr() };
+                gpci.p_next = &bi as *const crate::gpu::vk::pbin::BinaryInfo as *const std::ffi::c_void;
+            }
+            c.device.create_graphics_pipelines(via.cache, &[gpci], None).map(|v| v[0]).map_err(|(_, e)| format!("graphics pipeline: {e}"))
+        });
         for (_, m) in modules {
             c.device.destroy_shader_module(m, None);
         }
-        let pipeline = r.map_err(|(_, e)| format!("graphics pipeline: {e}"))?[0];
+        let pipeline = r?;
         crate::gpu::pstats::report(pipeline, &format!("vs {:#x} ps {:#x}", vs.1, ps.map_or(0, |p| p.1)));
         Ok(Pipe { pipeline, layout, set_layout, push })
     }

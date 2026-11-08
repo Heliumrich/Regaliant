@@ -21,6 +21,13 @@
 //! bytes and a reference to the block, which is kept once (`<hash>.blk`;
 //! found by comparing two pipelines' data, `discover`). Files written whole
 //! are converted when read.
+//!
+//! Pipeline binaries (VK_KHR_pipeline_binary, `vk::pipeline_binaries`):
+//! the driver's binaries of a pipeline kept in `binaries/<kind><key>.pb`
+//! (`create_with`), which later sessions make the pipeline from without a
+//! cache object or the driver's own cache. On this driver the cache data
+//! alone did not spare a compile once the driver's cache was reset
+//! (FINDINGS.md 2026-11-08 evening).
 
 use super::vk::ctx;
 use ash::vk;
@@ -30,6 +37,24 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
+/// The pipeline binaries' directory (`create_with`).
+static BIN_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// The binaries' own budget (pruned as the cache files are).
+const BIN_BUDGET: u64 = 4 << 30;
+/// Pipeline binary files: magic, the global key, the fingerprint of the
+/// pipeline's SPIR-V (`fingerprint`: the store's keys name translations, not
+/// their code, and binaries of other code must never be used), the binaries
+/// (key, data; data of SHARED_MIN bytes or more kept once, in `<key>.shared`,
+/// and marked u64::MAX here), an FNV-1a hash of all before it.
+const PB_MAGIC: &[u8; 8] = b"DSPBIN03";
+const SHARED_MIN: usize = 1 << 20;
+/// [pipelines made from binaries, their ns, binaries refused or failed,
+/// pipelines whose binaries were captured, their bytes, capture ns, captures
+/// failed, ns reading and decoding the files, making the binary objects,
+/// making the pipelines, destroying the binary objects].
+static PB: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// Binary files of other code under a pipeline's key (made again).
+static PB_STALE: AtomicU64 = AtomicU64::new(0);
 
 /// File header of data stored without its shared block: the magic, the
 /// block's offset and length (u32 each) and its hash (u64), then the data
@@ -325,32 +350,38 @@ pub fn set_dir(dir: PathBuf) {
     if std::fs::create_dir_all(&dir).is_err() || DIR.set(dir.clone()).is_err() {
         return;
     }
+    let bin = dir.join("binaries");
+    let bins = std::fs::create_dir_all(&bin).is_ok() && BIN_DIR.set(bin.clone()).is_ok();
     let _ = std::thread::Builder::new().name("pcache-prune".into()).spawn(move || {
         convert(&dir);
-        prune(&dir);
+        prune(&dir, "bin", BUDGET);
+        if bins {
+            prune(&bin, "pb", BIN_BUDGET);
+        }
     });
 }
 
-/// Removes the files used longest ago while the directory is over `BUDGET`.
-fn prune(dir: &Path) {
+/// Removes the files (extension `ext`) used longest ago while the directory
+/// is over `budget`.
+fn prune(dir: &Path, ext: &str, budget: u64) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = rd
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
+        .filter(|e| e.path().extension().is_some_and(|x| x == ext))
         .filter_map(|e| {
             let m = e.metadata().ok()?;
             Some((m.modified().ok()?, m.len(), e.path()))
         })
         .collect();
     let mut total: u64 = files.iter().map(|f| f.1).sum();
-    crate::info!("pipeline cache: {} pipeline files, {} MiB", files.len(), total >> 20);
-    if total <= BUDGET {
+    crate::info!("pipeline cache: {} pipeline .{ext} files, {} MiB", files.len(), total >> 20);
+    if total <= budget {
         return;
     }
     files.sort_by_key(|f| f.0);
     let mut removed = 0u64;
     for (_, len, path) in files {
-        if total <= BUDGET / 4 * 3 {
+        if total <= budget / 4 * 3 {
             break;
         }
         if std::fs::remove_file(&path).is_ok() {
@@ -466,7 +497,227 @@ pub fn with_cache<T>(kind: char, key: u64, create: impl FnOnce(vk::PipelineCache
 /// Whether the store holds the pipeline of `key` (its creation then takes
 /// milliseconds, not the seconds of a first compile).
 pub fn stored(kind: char, key: u64) -> bool {
-    DIR.get().is_some_and(|dir| dir.join(format!("{kind}{key:016x}.bin")).exists())
+    DIR.get().is_some_and(|dir| dir.join(format!("{kind}{key:016x}.bin")).exists()) || BIN_DIR.get().is_some_and(|dir| dir.join(format!("{kind}{key:016x}.pb")).exists())
+}
+
+/// How `create_with` has a pipeline made: through `cache`, with its
+/// binaries captured (VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR in a
+/// VkPipelineCreateFlags2CreateInfoKHR with the create info's own flags),
+/// or from `binaries` (a VkPipelineBinaryInfoKHR in its chain, no cache).
+pub struct Via<'a> {
+    pub cache: vk::PipelineCache,
+    pub capture: bool,
+    pub binaries: Option<&'a [super::vk::pbin::Binary]>,
+}
+
+/// Creates the pipeline of `key` (`kind` 'c' compute, 'g' graphics) through
+/// the store: with pipeline binaries on (`vk::pipeline_binaries`), from its
+/// stored binaries when it has them (and they were made from the same code,
+/// `fp`), else made anew with its binaries captured into the store; without
+/// them through its cache file (`with_cache`).
+pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result<vk::Pipeline, String>) -> Result<vk::Pipeline, String> {
+    let Some(pb) = ctx().pbin.as_ref() else {
+        return with_cache(kind, key, |cache| create(Via { cache, capture: false, binaries: None }));
+    };
+    let path = BIN_DIR.get().map(|dir| dir.join(format!("{kind}{key:016x}.pb")));
+    // (Under the validation layer the driver refuses some graphics
+    // pipelines' binaries that it takes without the layer (2026-11-08
+    // night): such a boot keeps the files as they are.)
+    let keep = ctx().validation;
+    if let Some(p) = &path {
+        let t = std::time::Instant::now();
+        let stored = std::fs::read(p).ok().and_then(|b| decode_pb(&b, &pb.global, fp));
+        PB[7].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if let Some(stored) = stored {
+            let tb = std::time::Instant::now();
+            let shared_ok = stored.iter().all(|part| match part {
+                super::vk::pbin::Part::Shared(k) => pb.has_shared(k) || load_shared(k).is_some_and(|d| pb.share(k, &d).is_ok()),
+                super::vk::pbin::Part::Own(..) => true,
+            });
+            let r = match shared_ok.then(|| pb.from_parts(&stored)) {
+                Some(Ok((handles, own))) => {
+                    PB[8].fetch_add(tb.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    let tc = std::time::Instant::now();
+                    CREATING.fetch_add(1, Ordering::Relaxed);
+                    let r = create(Via { cache: vk::PipelineCache::null(), capture: false, binaries: Some(&handles) });
+                    CREATING.fetch_sub(1, Ordering::Relaxed);
+                    PB[9].fetch_add(tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    let td = std::time::Instant::now();
+                    pb.destroy(&own);
+                    PB[10].fetch_add(td.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    r
+                }
+                Some(Err(e)) => Err(format!("binaries from their data: {e}")),
+                None => Err("a shared binary is missing".to_string()),
+            };
+            match r {
+                Ok(pipe) => {
+                    PB[0].fetch_add(1, Ordering::Relaxed);
+                    PB[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    touch_later(p);
+                    return Ok(pipe);
+                }
+                Err(e) => {
+                    if PB[2].fetch_add(1, Ordering::Relaxed) < 8 {
+                        crate::warn!("pipeline cache: the binaries of {kind}{key:016x} were not used ({e}); made anew");
+                    }
+                    if keep {
+                        CREATING.fetch_add(1, Ordering::Relaxed);
+                        let r = create(Via { cache: vk::PipelineCache::null(), capture: false, binaries: None });
+                        CREATING.fetch_sub(1, Ordering::Relaxed);
+                        return r;
+                    }
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+    }
+    // (Made with CAPTURE_DATA, without a cache object (VUID 09617), its
+    // binaries then captured from it: what the driver's internal cache holds,
+    // when it holds it, `pbin::Fns::probe`, gives the same.)
+    CREATING.fetch_add(1, Ordering::Relaxed);
+    let r = create(Via { cache: vk::PipelineCache::null(), capture: true, binaries: None });
+    CREATING.fetch_sub(1, Ordering::Relaxed);
+    if let (Ok(pipe), Some(p)) = (&r, &path) {
+        let t = std::time::Instant::now();
+        match pb.capture(*pipe, &|k| shared_path(k).is_some_and(|p| p.exists())) {
+            Ok(bins) => {
+                let enc = encode_pb(&pb.global, fp, &bins);
+                if write_file(p, &enc) {
+                    PB[3].fetch_add(1, Ordering::Relaxed);
+                    PB[4].fetch_add(enc.len() as u64, Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                if PB[6].fetch_add(1, Ordering::Relaxed) < 8 {
+                    crate::warn!("pipeline cache: capturing the binaries of {kind}{key:016x} failed ({e})");
+                }
+            }
+        }
+        PB[5].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    r
+}
+
+/// A pipeline's code fingerprint (`create_with`): its stages' SPIR-V words
+/// and any other words that shape it.
+pub fn fingerprint(parts: &[&[u32]]) -> u64 {
+    let mut h = 0x9E37_79B9_7F4A_7C15u64;
+    for p in parts {
+        h = (h.rotate_left(5) ^ p.len() as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
+        for &w in p.iter() {
+            h = (h.rotate_left(5) ^ w as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
+        }
+    }
+    h
+}
+
+fn fnv64(b: &[u8]) -> u64 {
+    b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x100_0000_01b3))
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// A shared binary's file (`<key>.shared`): its data and an FNV-1a hash.
+fn shared_path(key: &[u8]) -> Option<PathBuf> {
+    BIN_DIR.get().map(|d| d.join(format!("{}.shared", hex(key))))
+}
+
+/// Stores a shared binary's data once (`SHARED_MIN`).
+fn store_shared(key: &[u8], data: &[u8]) {
+    let Some(p) = shared_path(key) else { return };
+    if p.exists() {
+        return;
+    }
+    let mut w = data.to_vec();
+    w.extend_from_slice(&fnv64(data).to_le_bytes());
+    write_file(&p, &w);
+}
+
+fn load_shared(key: &[u8]) -> Option<Vec<u8>> {
+    let mut b = std::fs::read(shared_path(key)?).ok()?;
+    if b.len() < 8 {
+        return None;
+    }
+    let tail = b.split_off(b.len() - 8);
+    if fnv64(&b) != u64::from_le_bytes(tail.try_into().ok()?) {
+        // (Damaged: removed, so the next capture stores it again.)
+        let _ = std::fs::remove_file(shared_path(key)?);
+        return None;
+    }
+    Some(b)
+}
+
+/// A pipeline binary file (`PB_MAGIC`); shared data stored once apart.
+fn encode_pb(global: &[u8], fp: u64, bins: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let mut w = Vec::with_capacity(64 + bins.iter().map(|b| b.0.len() + b.1.len().min(SHARED_MIN) + 12).sum::<usize>());
+    w.extend_from_slice(PB_MAGIC);
+    w.extend_from_slice(&(global.len() as u32).to_le_bytes());
+    w.extend_from_slice(global);
+    w.extend_from_slice(&fp.to_le_bytes());
+    w.extend_from_slice(&(bins.len() as u32).to_le_bytes());
+    for (k, d) in bins {
+        w.extend_from_slice(&(k.len() as u32).to_le_bytes());
+        w.extend_from_slice(k);
+        if d.is_empty() || d.len() >= SHARED_MIN {
+            // (Empty: a shared binary stored before, `pbin::Fns::capture`.)
+            if !d.is_empty() {
+                store_shared(k, d);
+            }
+            w.extend_from_slice(&u64::MAX.to_le_bytes());
+        } else {
+            w.extend_from_slice(&(d.len() as u64).to_le_bytes());
+            w.extend_from_slice(d);
+        }
+    }
+    let h = fnv64(&w);
+    w.extend_from_slice(&h.to_le_bytes());
+    w
+}
+
+/// `encode_pb`'s inverse; None for another global key, other code (`fp`)
+/// or a damaged file.
+fn decode_pb(b: &[u8], global: &[u8], fp: u64) -> Option<Vec<super::vk::pbin::Part>> {
+    if b.len() < 8 + 4 + 4 + 8 || &b[..8] != PB_MAGIC {
+        return None;
+    }
+    let (body, tail) = b.split_at(b.len() - 8);
+    if fnv64(body) != u64::from_le_bytes(tail.try_into().ok()?) {
+        return None;
+    }
+    let mut at = 8usize;
+    let mut take = |n: usize| -> Option<&[u8]> {
+        let s = body.get(at..at.checked_add(n)?)?;
+        at += n;
+        Some(s)
+    };
+    let gl = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+    if take(gl)? != global {
+        return None;
+    }
+    if u64::from_le_bytes(take(8)?.try_into().ok()?) != fp {
+        PB_STALE.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let n = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+    if n == 0 || n > 64 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let kl = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+        let k = take(kl)?.to_vec();
+        let dl = u64::from_le_bytes(take(8)?.try_into().ok()?);
+        if dl == u64::MAX {
+            out.push(super::vk::pbin::Part::Shared(k));
+        } else {
+            let d = take(dl as usize)?.to_vec();
+            out.push(super::vk::pbin::Part::Own(k, d));
+        }
+    }
+    Some(out)
 }
 
 /// One status line.
@@ -491,7 +742,28 @@ pub fn status() -> String {
         l[5] as f64 / n,
         MODULES[0].load(Ordering::Relaxed),
         MODULES[1].load(Ordering::Relaxed) as f64 / MODULES[0].load(Ordering::Relaxed).max(1) as f64 / 1000.0
-    )
+    ) + &{
+        let b: Vec<u64> = PB.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        if super::vk::try_ctx().is_none_or(|c| c.pbin.is_none()) {
+            String::new()
+        } else {
+            format!(
+                "    pipeline binaries: {} pipelines made from them ({:.0} us each: file {:.0}, binary objects {:.0}, pipeline {:.0}, destroy {:.0}), {} refused or failed, {} of other code; {} captured ({} MiB, {:.0} us each), {} captures failed\n",
+                b[0],
+                b[1] as f64 / b[0].max(1) as f64 / 1000.0,
+                b[7] as f64 / b[0].max(1) as f64 / 1000.0,
+                b[8] as f64 / b[0].max(1) as f64 / 1000.0,
+                b[9] as f64 / b[0].max(1) as f64 / 1000.0,
+                b[10] as f64 / b[0].max(1) as f64 / 1000.0,
+                b[2],
+                PB_STALE.load(Ordering::Relaxed),
+                b[3],
+                b[4] >> 20,
+                b[5] as f64 / (b[3] + b[6]).max(1) as f64 / 1000.0,
+                b[6]
+            )
+        }
+    }
 }
 
 /// `ThreadId::as_u64` is unstable: a stable number per thread from its debug
@@ -567,4 +839,55 @@ mod tests {
         let c = b"short pipeline data".to_vec();
         assert_eq!(decode(&encode(&c)).as_deref(), Some(&c[..]));
     }
+}
+
+/// `dsport --pb-test` (diagnosis): pipeline binaries on one small compute
+/// pipeline with no title running: made, its binaries probed from the
+/// driver's internal cache, then made with CAPTURE_DATA and its binaries
+/// captured, each step logged before its call (the driver faulted in both
+/// in runs, never under the validation layer).
+pub fn pb_test() -> i32 {
+    if let Err(e) = super::vk::init() {
+        crate::error!("pb-test: Vulkan: {e}");
+        return 1;
+    }
+    let c = ctx();
+    let Some(pb) = c.pbin.as_ref() else {
+        crate::error!("pb-test: pipeline binaries are off (DS_PIPELINE_BINARIES=1)");
+        return 1;
+    };
+    unsafe {
+        let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..2)
+            .map(|b| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
+            .collect();
+        let Ok(set_layout) = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None) else { return 1 };
+        let layouts = [set_layout];
+        let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 4 * (4 + 2 * rdna::kernels::TS_MANY) }];
+        let Ok(layout) = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None) else { return 1 };
+        let code = rdna::kernels::timestamp_store_many();
+        let Ok(module) = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None) else { return 1 };
+        let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+        let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
+        crate::info!("pb-test: making the pipeline");
+        let p1 = c.device.create_compute_pipelines(vk::PipelineCache::null(), &[ci], None);
+        crate::info!("pb-test: made: {:?}", p1.as_ref().map(|v| v[0]).map_err(|e| e.1));
+        if std::env::var("DS_PB_TEST").ok().as_deref() != Some("capture") {
+            crate::info!("pb-test: probing its binaries by its create info");
+            let r = pb.probe(&ci as *const vk::ComputePipelineCreateInfo as *const std::ffi::c_void);
+            crate::info!("pb-test: probed: {:?}", r.as_ref().map(|v| v.iter().map(|b| (b.0.len(), b.1.len())).collect::<Vec<_>>()));
+        }
+        let mut f2 = vk::PipelineCreateFlags2CreateInfoKHR::default().flags(vk::PipelineCreateFlags2KHR::from_raw(super::vk::pbin::CAPTURE_DATA));
+        let ci2 = ci.push_next(&mut f2);
+        crate::info!("pb-test: making it with CAPTURE_DATA");
+        let p2 = c.device.create_compute_pipelines(vk::PipelineCache::null(), &[ci2], None);
+        crate::info!("pb-test: made: {:?}", p2.as_ref().map(|v| v[0]).map_err(|e| e.1));
+        if let Ok(v) = &p2 {
+            crate::info!("pb-test: capturing its binaries");
+            let r = pb.capture(v[0], &|_| false);
+            crate::info!("pb-test: captured: {:?}", r.as_ref().map(|v| v.iter().map(|b| (b.0.len(), b.1.len())).collect::<Vec<_>>()));
+        }
+        c.device.destroy_shader_module(module, None);
+    }
+    crate::info!("pb-test: done");
+    0
 }

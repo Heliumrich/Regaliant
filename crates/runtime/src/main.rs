@@ -169,6 +169,7 @@ fn parse_args() -> Config {
             "--app" => app = Some(PathBuf::from(args.next().expect("--app needs a path"))),
             "--pipeline-test" => pipeline_test = Some(args.next().expect("--pipeline-test needs a capture file")),
             "--dispatch-bench" => dispatch_bench = true,
+            "--pb-test" => std::process::exit(gpu::pcache::pb_test()),
             "--compile-bench" => {
                 let min = args.next().expect("--compile-bench needs <min instructions> <max programs>");
                 let max = args.next().expect("--compile-bench needs <min instructions> <max programs>");
@@ -322,6 +323,14 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 let name = parts.next().unwrap_or("");
                 let value = parts.next().unwrap_or("");
                 pcsettings::store::set_by_name(name, value)
+            }
+            "rsize" => {
+                // Diagnosis: `rsize <w>x<h>` (0x0: the title's own) in a run without a window.
+                let v = parts.next().unwrap_or("");
+                match v.split_once(['x', 'X']).and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))) {
+                    Some((w, h)) => dispmode::set_headless_size(w, h),
+                    None => Err(format!("rsize: '{v}' is not <w>x<h>")),
+                }
             }
             "uielems" => {
                 // Diagnosis: `uielems <tag>` writes every UIElement component's first bytes.
