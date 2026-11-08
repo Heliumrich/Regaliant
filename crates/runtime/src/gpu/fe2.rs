@@ -1840,7 +1840,7 @@ fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &A
             note_wb_pages(&WB_CPU_PAGES, pg, PAGE);
         }
     }
-    super::hitch::note_since(super::hitch::Kind::Mirror, tt, || format!("take of {ta:#x}..{tb:#x} ({} pages)", (tb - ta) / PAGE));
+    super::hitch::note_since(super::hitch::Kind::Mirror, tt, || format!("take of {ta:#x}..{tb:#x} ({} pages, {} written)", (tb - ta) / PAGE, written.len()));
     let tns = tt.elapsed().as_nanos() as u64;
     STATS[S_TAKE_NS].fetch_add(tns, Ordering::Relaxed);
     STATS[S_TAKES].fetch_add(1, Ordering::Relaxed);
@@ -2235,10 +2235,12 @@ fn follow_take(a: u64, b: u64, want: u32) -> bool {
         }
     };
     let mut k = 0u32;
+    let tl = super::timeline::mark();
     loop {
         // (Read before the list: an end after it shows as a change.)
         let seen = TAKING_ENDED.load(Ordering::Acquire);
         if !TAKING.lock().iter().any(|e| e.3 == id) {
+            super::timeline::end_min(tl, 100, || format!("wait: another thread's take around {a:#x}..{b:#x} ({} pages)", (b - a) / PAGE));
             return true;
         }
         while TAKING_ENDED.load(Ordering::Acquire) == seen {

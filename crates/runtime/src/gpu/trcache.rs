@@ -383,10 +383,12 @@ mod tests {
             sg_waves: true,
             sg_appends: 2,
             known_active: 99,
+            in_mask: 0b1011,
         };
         let b = encode(&o, 0x1234, 0x5678);
         let d = decode(&b, 0x1234, 0x5678).expect("decodes");
         assert_eq!(encode(&d, 0x1234, 0x5678), b);
+        assert_eq!(d.in_mask, 0b1011);
         assert!(decode(&b, 0x1234, 0x5679).is_none());
         let mut bad = b.clone();
         bad[20] ^= 1;

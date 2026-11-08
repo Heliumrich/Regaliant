@@ -290,6 +290,18 @@ const BUDGET: u64 = 4 << 30;
 /// bytes written, files pruned].
 pub static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
+/// Files rewritten after a slow creation from them (`SLOW_CREATION`): the
+/// driver refused their data, and its new data had the same size.
+static REFRESHED: AtomicU64 = AtomicU64::new(0);
+
+/// A creation from a file that took this long compiled (one from data the
+/// driver accepts takes ~1-2 ms): its data is read back and compared even
+/// when its size did not change. (On 2026-11-08, after a reboot, the
+/// driver's ~2 MB shared block changed while its size did not: 6,021
+/// creations took 776 ms each and only 37 files were rewritten, so every
+/// boot compiled them again.)
+const SLOW_CREATION: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Nanoseconds of `with_cache`'s steps, summed: the file's read and its
 /// decode, the cache object, the pipeline's creation, reading the cache's
 /// size (its data when it grew), writing the file or queueing its last-use
@@ -384,7 +396,9 @@ pub fn with_cache<T>(kind: char, key: u64, create: impl FnOnce(vk::PipelineCache
         .unwrap_or(vk::PipelineCache::null());
     lap(1, &mut t);
     CREATING.fetch_add(1, Ordering::Relaxed);
+    let tc = std::time::Instant::now();
     let r = create(cache);
+    let slow = !file.is_empty() && tc.elapsed() >= SLOW_CREATION;
     CREATING.fetch_sub(1, Ordering::Relaxed);
     lap(2, &mut t);
     if cache == vk::PipelineCache::null() {
@@ -396,7 +410,7 @@ pub fn with_cache<T>(kind: char, key: u64, create: impl FnOnce(vk::PipelineCache
         // (the data itself, ~2 MB, is read back only when it grew).
         let mut size = 0usize;
         let sized = unsafe { (d.fp_v1_0().get_pipeline_cache_data)(d.handle(), cache, &mut size, std::ptr::null_mut()) } == vk::Result::SUCCESS;
-        let got = if sized && size == data.len() && !(whole && !file.is_empty()) {
+        let got = if sized && size == data.len() && !(whole && !file.is_empty()) && !slow {
             Ok(None)
         } else {
             unsafe { d.get_pipeline_cache_data(cache) }.map(Some)
@@ -415,12 +429,23 @@ pub fn with_cache<T>(kind: char, key: u64, create: impl FnOnce(vk::PipelineCache
                         STATS[2].fetch_add(enc.len() as u64, Ordering::Relaxed);
                     }
                 }
-                new if whole && !file.is_empty() => {
+                new if whole && !file.is_empty() && !(slow && new != *data) => {
                     // A file written whole: store it without its shared block.
                     STATS[0].fetch_add(1, Ordering::Relaxed);
                     let enc = encode(&new);
                     if enc.len() < file.len() {
                         write_file(p, &enc);
+                    }
+                }
+                new if slow && new != *data => {
+                    // Refused data compiled again (`SLOW_CREATION`).
+                    let enc = encode(&new);
+                    if write_file(p, &enc) {
+                        STATS[1].fetch_add(1, Ordering::Relaxed);
+                        STATS[2].fetch_add(enc.len() as u64, Ordering::Relaxed);
+                        if REFRESHED.fetch_add(1, Ordering::Relaxed) == 0 {
+                            crate::info!("pipeline cache: the driver refused {kind}{key:016x}'s stored data (its creation compiled for {} ms): rewritten, as are later ones", tc.elapsed().as_millis());
+                        }
                     }
                 }
                 _ => {
@@ -450,10 +475,11 @@ pub fn status() -> String {
     let l: Vec<u64> = LAPS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let n = l[7].max(1) as f64 * 1000.0;
     format!(
-        "    pipeline cache files: {} pipelines from their file, {} written ({} MiB), {} pruned; {} creations, us each: file read {:.0}, decode {:.0}, cache object {:.0}, creation {:.0}, its size or data {:.0}, write or last-use mark {:.0}, destroy {:.0}; shader modules before them: {} at {:.0} us\n",
+        "    pipeline cache files: {} pipelines from their file, {} written ({} MiB; {} of them after the driver refused their data), {} pruned; {} creations, us each: file read {:.0}, decode {:.0}, cache object {:.0}, creation {:.0}, its size or data {:.0}, write or last-use mark {:.0}, destroy {:.0}; shader modules before them: {} at {:.0} us\n",
         s[0],
         s[1],
         s[2] >> 20,
+        REFRESHED.load(Ordering::Relaxed),
         s[3],
         l[7],
         l[6] as f64 / n,

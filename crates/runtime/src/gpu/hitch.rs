@@ -388,11 +388,21 @@ pub fn note(kind: Kind, start: u64, end: u64, what: impl FnOnce() -> String) {
 /// `note` for work that started at `t0` and ends now.
 pub fn note_since(kind: Kind, t0: std::time::Instant, what: impl FnOnce() -> String) {
     let us = t0.elapsed().as_micros() as u64;
+    // (While the timeline records, parts of 100 us or more show on the
+    // thread's track: what a recording thread was doing inside a command.)
+    let tl = us >= 100 && super::timeline::on();
+    if us < MIN_US && !tl {
+        return;
+    }
+    let text = what();
+    if tl {
+        super::timeline::span_ago(us, || format!("{}: {text}", NAMES[kind as usize]));
+    }
     if us < MIN_US {
         return;
     }
     let end = now_us();
-    note(kind, end.saturating_sub(us), end, what);
+    note(kind, end.saturating_sub(us), end, || text);
 }
 
 /// A presented flip (`pacing::note_flip`): flip `n` shown at `us`. A frame

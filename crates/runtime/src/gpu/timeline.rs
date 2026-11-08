@@ -105,6 +105,30 @@ pub fn end(track: &str, t0: Option<i64>, name: impl FnOnce() -> String) {
     }
 }
 
+/// A span of `us` microseconds ending now on the calling thread's track
+/// (`gpu::hitch`'s long operations while recording).
+pub fn span_ago(us: u64, name: impl FnOnce() -> String) {
+    if !on() {
+        return;
+    }
+    let t1 = now();
+    let t0 = t1 - (us as i64).saturating_mul(freq()) / 1_000_000;
+    if let Some(s) = STATE.lock().as_mut() {
+        if s.spans.len() < MAX_SPANS {
+            s.spans.push(Span { track: crate::log::thread_name(), name: name(), t0, t1 });
+        }
+    }
+}
+
+/// Ends a span begun with `mark` on the calling thread's track when it
+/// lasted at least `min_us` (parts too small to list otherwise).
+pub fn end_min(t0: Option<i64>, min_us: i64, name: impl FnOnce() -> String) {
+    let Some(t) = t0 else { return };
+    if (now() - t) * 1_000_000 >= min_us * freq() {
+        end(&crate::log::thread_name(), t0, name);
+    }
+}
+
 /// Starts recording for the next `flips` flips.
 pub fn start(flips: u32) -> Result<(), String> {
     let c = super::vk::try_ctx().ok_or("no Vulkan device")?;

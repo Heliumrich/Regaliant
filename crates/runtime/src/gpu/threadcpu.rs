@@ -40,6 +40,16 @@ fn thread_cycles(tid: u32) -> Option<u64> {
     (unsafe { QueryThreadCycleTime(h as _, &mut c) } != 0).then_some(c)
 }
 
+/// The calling thread's cycles so far (the timeline's recording spans: CPU
+/// time beside wall time).
+pub fn own_cycles() -> u64 {
+    use windows_sys::Win32::System::Threading::GetCurrentThread;
+    use windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime;
+    let mut c = 0u64;
+    unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut c) };
+    c
+}
+
 /// Time-stamp counter cycles per second (measured over 20 ms at first use).
 pub fn tsc_hz() -> f64 {
     static HZ: std::sync::OnceLock<f64> = std::sync::OnceLock::new();

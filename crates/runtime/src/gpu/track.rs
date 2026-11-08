@@ -89,6 +89,18 @@ struct Tracker {
     /// write, two per dispatch (the per-item culls, ~4,300 per frame).
     by_base: BTreeMap<u64, Vec<u32>>,
     max_size: u64,
+    /// Region ids by 1 MiB bucket of the guest memory they cover (every
+    /// bucket each region touches): overlap queries of ranges under 1 GiB
+    /// look at the buckets of the queried range only. (Since 2026-11-08: the
+    /// bases from start - max_size alone, with ~350 MiB textures tracked,
+    /// looked at ~18 ids a query under this lock the recording threads share;
+    /// the buckets ~0.1, the vista x1.006 and its stalled runs of the graphics
+    /// workers halved, FINDINGS.md.)
+    buckets: HashMap<u64, Vec<u32>>,
+    /// Overlap queries and the region ids they looked at, by path (0: the
+    /// bases, ranges of 1 GiB or more; 1: buckets), since boot (`status`).
+    queries: [u64; 2],
+    looked: [u64; 2],
     /// Watched page -> (regions on it, protection to restore, protected now).
     pages: HashMap<u64, (Vec<u32>, u32, bool)>,
     /// Ranges being written by code that cannot fault (kernel reads, driver
@@ -168,6 +180,9 @@ impl Tracker {
         self.regions.push(Some(Region { base, size, generation, dirty: false, gpu: false, why: Why::None, parts: Vec::new(), whole: false }));
         self.by_base.entry(base).or_default().push(id);
         self.max_size = self.max_size.max(size);
+        for b in bucket_span(base, size) {
+            self.buckets.entry(b).or_default().push(id);
+        }
         id
     }
 
@@ -179,8 +194,30 @@ impl Tracker {
     /// `each_overlapping` with the region ids.
     fn each_overlapping_id(&mut self, base: u64, len: u64, mut f: impl FnMut(u32, &mut Region)) {
         let end = base.saturating_add(len);
-        let Tracker { regions, by_base, max_size, .. } = self;
+        // (Ranges of 1 GiB or more go through the bases: a bucket walk is
+        // per MiB of the range, the bases' per region.)
+        let mode = (len >> BUCKET_SHIFT < 1024) as usize;
+        let Tracker { regions, by_base, max_size, buckets, queries, looked, .. } = self;
+        queries[mode] += 1;
+        if mode == 1 {
+            // A region is visited in the first bucket it shares with the
+            // range: once, however many buckets both cover.
+            let first = base >> BUCKET_SHIFT;
+            for b in bucket_span(base, len) {
+                let Some(ids) = buckets.get(&b) else { continue };
+                looked[1] += ids.len() as u64;
+                for &id in ids {
+                    if let Some(Some(r)) = regions.get_mut(id as usize) {
+                        if r.base < end && base < r.base + r.size && b == first.max(r.base >> BUCKET_SHIFT) {
+                            f(id, r);
+                        }
+                    }
+                }
+            }
+            return;
+        }
         for (_, ids) in by_base.range(base.saturating_sub(*max_size)..end) {
+            looked[0] += ids.len() as u64;
             for &id in ids {
                 if let Some(Some(r)) = regions.get_mut(id as usize) {
                     if r.base < end && base < r.base + r.size {
@@ -190,6 +227,14 @@ impl Tracker {
             }
         }
     }
+}
+
+/// `Tracker::buckets`' granule: 1 MiB.
+const BUCKET_SHIFT: u32 = 20;
+
+/// The buckets [base, base+len) touches (at least one).
+fn bucket_span(base: u64, len: u64) -> std::ops::RangeInclusive<u64> {
+    (base >> BUCKET_SHIFT)..=(base.saturating_add(len.max(1) - 1) >> BUCKET_SHIFT)
 }
 
 fn set_prot(page: u64, n: u64, prot: u32) -> bool {
@@ -241,6 +286,14 @@ pub fn unwatch(id: u32) {
         v.retain(|&x| x != id);
         if v.is_empty() {
             t.by_base.remove(&r.base);
+        }
+    }
+    for b in bucket_span(r.base, r.size) {
+        if let Some(v) = t.buckets.get_mut(&b) {
+            v.retain(|&x| x != id);
+            if v.is_empty() {
+                t.buckets.remove(&b);
+            }
         }
     }
     if !t.pages.is_empty() {
@@ -689,7 +742,17 @@ pub fn remapped(base: u64, len: u64, op: u8) {
 pub fn status() -> String {
     let g = TRACK.lock();
     let (regions, pages) = g.as_ref().map(|t| (t.regions.iter().flatten().count(), t.pages.len())).unwrap_or((0, 0));
-    format!("    write tracking: {regions} regions, {pages} pages, {} write faults\n", FAULTS.load(Ordering::Relaxed))
+    let (q, l, mx) = g.as_ref().map(|t| (t.queries, t.looked, t.max_size)).unwrap_or(([0; 2], [0; 2], 0));
+    let per = |k: usize| l[k] as f64 / q[k].max(1) as f64;
+    format!(
+        "    write tracking: {regions} regions, {pages} pages, {} write faults; overlap queries since boot by 1 MiB buckets {} ({:.1} ids looked at each), of 1 GiB or more by bases from start - the largest region ({} MiB) {} ({:.1} each)\n",
+        FAULTS.load(Ordering::Relaxed),
+        q[1],
+        per(1),
+        mx >> 20,
+        q[0],
+        per(0)
+    )
 }
 
 #[cfg(test)]
@@ -701,6 +764,19 @@ mod tests {
         t.each_overlapping(base, len, |r| v.push(r.base));
         v.sort_unstable();
         v
+    }
+
+    #[test]
+    fn bucket_index_visits_each_overlapping_region_once() {
+        let mut t = Tracker::default();
+        t.add(0x10_0000_0000, 360 << 20);
+        t.add(0x10_0010_0000, 0x1000);
+        t.add(0x10_2000_0000, 0x10_0000);
+        // Five buckets queried, the large region in all of them: once each.
+        assert_eq!(hits(&mut t, 0x10_0008_0000, 5 << 20), vec![0x10_0000_0000, 0x10_0010_0000]);
+        assert_eq!(hits(&mut t, 0x10_2000_0800, 16), vec![0x10_2000_0000]);
+        assert_eq!(hits(&mut t, 0x10_1670_0000, 0x20_0000), vec![0x10_0000_0000]);
+        assert_eq!(hits(&mut t, 0x10_3000_0000, 16), Vec::<u64>::new());
     }
 
     #[test]

@@ -8408,6 +8408,9 @@ pub struct Exec {
     begun_at: std::time::Instant,
     /// Its start on the timeline (`timeline::mark`).
     begun_mark: Option<i64>,
+    /// The recording thread's cycles then (while the timeline records:
+    /// a span's CPU time beside its wall time).
+    begun_cycles: u64,
     /// Label values the recording batch writes GPU-side (address, value,
     /// bytes): promised when it is submitted.
     pending_promises: Vec<(u64, u64, u8)>,
@@ -9290,6 +9293,7 @@ impl Exec {
                 recording: false,
                 begun_at: std::time::Instant::now(),
                 begun_mark: None,
+                begun_cycles: 0,
                 pending_promises: Vec::new(),
                 submit_request: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 pending: Default::default(),
@@ -9757,6 +9761,7 @@ impl Exec {
         self.dyncache = Default::default();
         self.begun_at = std::time::Instant::now();
         self.begun_mark = super::timeline::mark();
+        self.begun_cycles = if self.begun_mark.is_some() { super::threadcpu::own_cycles() } else { 0 };
         self.pool_use = [0; 6];
         self.ts_used = 0;
         self.ts_pool_reset = false;
@@ -9938,7 +9943,8 @@ impl Exec {
                 }
                 Vec::new()
             };
-            super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why})", self.batch_shaders.len()));
+            let cpu = self.span_cpu();
+            super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why}{cpu})", self.batch_shaders.len()));
             let lists = std::mem::take(&mut self.batch_lists).then(super::vk::defer::release);
             self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists, xq: (self.xq_dep, self.xq_why, self.xq_img), on_c: self.batch_c });
             (self.xq_dep, self.xq_why, self.xq_img) = (0, 0, false);
@@ -10001,7 +10007,8 @@ impl Exec {
             let _ = seq;
             Some(SubmitSpec { xpre, pre, cmd, wait: copy_wait, on_c, xwait: 0, cpu_wait, name })
         });
-        super::timeline::end(&self.name, self.begun_mark.take(), || format!("batch #{seq}, {commands} commands ({why})"));
+        let cpu = self.span_cpu();
+        super::timeline::end(&self.name, self.begun_mark.take(), || format!("batch #{seq}, {commands} commands ({why}{cpu})"));
         if cpu_wait > 0 {
             let mut l = CPU_WAIT_LOG.lock();
             if l.len() >= 64 {
@@ -12183,6 +12190,15 @@ impl Exec {
             f();
             None
         }
+    }
+
+    /// The recording span's CPU time on this thread for its timeline name
+    /// (`; cpu <ms>`; empty when the timeline does not record).
+    fn span_cpu(&self) -> String {
+        if self.begun_mark.is_none() || self.begun_cycles == 0 {
+            return String::new();
+        }
+        format!("; cpu {:.2} ms", super::threadcpu::ms(super::threadcpu::own_cycles().saturating_sub(self.begun_cycles)))
     }
 
     /// The title synchronized its GPU work (CS/PS partial flush, cache
