@@ -743,6 +743,9 @@ pub struct Output {
     pub sg_appends: u32,
     /// Instructions known active (`Spec::known_active`).
     pub known_active: u32,
+    /// The input Locations the stage declares (bit n = Location n; a pixel
+    /// stage's: a rect-list draw's geometry shader outputs each of them).
+    pub in_mask: u32,
 }
 
 /// Dwords of user data at the start of the SGPR data buffer.
@@ -967,6 +970,8 @@ pub(crate) struct T<'a> {
     /// (`Spec::known_active`), and the instruction being translated.
     pub known_active: crate::HashSet<u32>,
     pub cur_pc: u32,
+    /// Input Locations declared (`Output::in_mask`).
+    pub in_locs: u32,
     /// Wave-mask mode (see the module documentation).
     pub wave_masks: bool,
     /// Subgroup waves (`Spec::sg_waves`).
@@ -1778,6 +1783,9 @@ impl<'a> T<'a> {
         }
         if let Some(l) = location {
             self.b.decorate(v, Decoration::Location, [Operand::LiteralBit32(l)]);
+            if l < 32 {
+                self.in_locs |= 1 << l;
+            }
         }
         self.interface.push(v);
         v
@@ -2655,6 +2663,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         leader: None,
         known_active: crate::HashSet::default(),
         cur_pc: 0,
+        in_locs: 0,
         wave_masks,
         sg_waves,
         complete: if wave_masks { crate::wavemask::complete_masks(code, spec.wave64) } else { Default::default() },
@@ -3186,7 +3195,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     // offsets come from a table): the runtime takes that from `sgpr_pc`.
     let batched = spec.batched;
     let sgpr_pc = if batched { Some(sgpr_pc_offset(spec.stage)) } else { spec.sgpr_pc };
-    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched, masked_skips: tr.masked_skips, lockstep: tr.lockstep, wave_masks: tr.wave_masks, sg_waves: tr.sg_waves, sg_appends: tr.sg.leaders.len() as u32, known_active: tr.known_active.len() as u32 })
+    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched, masked_skips: tr.masked_skips, lockstep: tr.lockstep, wave_masks: tr.wave_masks, sg_waves: tr.sg_waves, sg_appends: tr.sg.leaders.len() as u32, known_active: tr.known_active.len() as u32, in_mask: tr.in_locs })
 }
 
 /// Wave-mask mode for the shader at `addr` (diagnosis: `DS_WAVEMASK=0`

@@ -606,7 +606,7 @@ pub(crate) fn precompile_gfx_translations(vs: StageTr, ps: Option<StageTr>, stat
     let key = GfxKey {
         vs: vs.0.key,
         ps: ps.map_or(0, |p| p.0.key),
-        rect_gs: state.rect.then_some(vs.0.out.param_mask),
+        rect_gs: state.rect.then(|| rect_gs_mask(vs.0.out.param_mask, ps.map_or(0, |p| p.0.out.in_mask))),
         colors: state.colors,
         blend: state.blend,
         masks: state.masks,
@@ -649,6 +649,14 @@ fn gfx_known(hkey: u64) -> bool {
 /// another thread is waited for).
 /// A stage of a graphics pipeline: its translation and program address.
 type StageTr<'a> = (&'a super::super::shaders::Translated, u64);
+
+/// A rect-list draw's geometry shader key: the vertex stage's outputs and
+/// the pixel stage's inputs (`rdna::translate::gs::rect_list_gs` passes the
+/// first through and writes zeros at the rest of the second: a pixel input
+/// the vertex stage does not write had no output before it).
+fn rect_gs_mask(vs_mask: u32, ps_inputs: u32) -> u32 {
+    vs_mask | ps_inputs
+}
 
 fn gfx_pipe_with(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, push_mode: bool, created: &std::cell::Cell<bool>) -> Result<Pipe, String> {
     if let Some(x) = gfx_pipe(hkey) {
@@ -776,10 +784,17 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
         drop(g);
         super::super::vk::name_object(modules[0].1, &format!("vs {:#x}", vs.1));
         if let Some(mask) = key.rect_gs {
-            modules.push((vk::ShaderStageFlags::GEOMETRY, module(&rdna::translate::gs::rect_list_gs(mask))?));
+            modules.push((vk::ShaderStageFlags::GEOMETRY, module(&rdna::translate::gs::rect_list_gs(vs.0.out.param_mask, mask))?));
             super::super::vk::name_object(modules[modules.len() - 1].1, &format!("rect-list gs {mask:#x}"));
         }
         if let Some(p) = ps {
+            let missing = p.0.out.in_mask & !vs.0.out.param_mask;
+            if key.rect_gs.is_none() && missing != 0 {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                    crate::info!("gfx pipeline: ps {:#x} reads locations {missing:#x} vs {:#x} does not write (vs writes {:#x}, ps reads {:#x})", p.1, vs.1, vs.0.out.param_mask, p.0.out.in_mask);
+                }
+            }
             let g = super::super::vk::creating(|| format!("ps {:#x}", p.1));
             modules.push((vk::ShaderStageFlags::FRAGMENT, module(&p.0.out.spirv)?));
             drop(g);
@@ -1564,7 +1579,7 @@ impl Exec {
                 let key = GfxKey {
                     vs: vs.tr.key,
                     ps: ps.as_ref().map(|p| p.tr.key).unwrap_or(0),
-                    rect_gs: rect.then_some(vs.tr.out.param_mask),
+                    rect_gs: rect.then(|| rect_gs_mask(vs.tr.out.param_mask, ps.as_ref().map_or(0, |p| p.tr.out.in_mask))),
                     colors: colors.map(|c| c.map(|t| t.format.as_raw()).unwrap_or(vk::Format::UNDEFINED.as_raw())),
                     blend,
                     masks,

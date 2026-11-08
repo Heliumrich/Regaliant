@@ -174,7 +174,7 @@ fn translate_capture(capture: &str, out_dir: &str) -> i32 {
                 let _ = std::fs::write(std::path::Path::new(out_dir).join(format!("{:012x}.spv", it.addr)), bytes);
                 if it.stage == rdna::translate::Stage::Vertex {
                     // The rect-list expansion stage for this vertex shader's outputs.
-                    let gs: Vec<u8> = rdna::translate::gs::rect_list_gs(out.param_mask).iter().flat_map(|w| w.to_le_bytes()).collect();
+                    let gs: Vec<u8> = rdna::translate::gs::rect_list_gs(out.param_mask, out.param_mask).iter().flat_map(|w| w.to_le_bytes()).collect();
                     let _ = std::fs::write(std::path::Path::new(out_dir).join(format!("{:012x}-rect-gs.spv", it.addr)), gs);
                 }
                 for w in &out.warnings {

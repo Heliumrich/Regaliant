@@ -9,8 +9,10 @@ use rspirv::dr::{Builder, Operand};
 use rspirv::spirv::{self, BuiltIn, Decoration, ExecutionMode, ExecutionModel, StorageClass};
 
 /// Geometry shader passing through the vec4 parameters at the locations set
-/// in `param_mask` (bit n = Location n).
-pub fn rect_list_gs(param_mask: u32) -> Vec<u32> {
+/// in `param_mask` (bit n = Location n: the vertex stage's outputs) and
+/// writing zeros at the other locations of `out_mask` (a pixel stage's inputs
+/// the vertex stage does not write: every input needs an output before it).
+pub fn rect_list_gs(param_mask: u32, out_mask: u32) -> Vec<u32> {
     let mut b = Builder::new();
     b.set_version(1, 3);
     b.capability(spirv::Capability::Geometry);
@@ -37,8 +39,14 @@ pub fn rect_list_gs(param_mask: u32) -> Vec<u32> {
     let p_in_v4 = b.type_pointer(None, StorageClass::Input, v4);
     let mut ins = Vec::new();
     let mut outs = Vec::new();
+    let mut zeros = Vec::new();
     for i in 0..32 {
         if param_mask & (1 << i) == 0 {
+            if out_mask & (1 << i) != 0 {
+                let ov = global(&mut b, p_out_v4, StorageClass::Output);
+                b.decorate(ov, Decoration::Location, [Operand::LiteralBit32(i)]);
+                zeros.push(ov);
+            }
             continue;
         }
         let iv = global(&mut b, p_in_arr, StorageClass::Input);
@@ -73,6 +81,8 @@ pub fn rect_list_gs(param_mask: u32) -> Vec<u32> {
         b.f_sub(v4, None, s, v[0]).unwrap()
     };
     let pos3 = fourth(&mut b, &pos);
+    let f0 = b.constant_bit32(f32t, 0);
+    let zero4 = b.constant_composite(v4, [f0, f0, f0, f0]);
     let p3: Vec<u32> = params.iter().map(|vs| fourth(&mut b, vs)).collect();
     let out_pos = b.access_chain(p_out_v4, None, gl_out, [k0]).unwrap();
     for v in 0..4 {
@@ -82,6 +92,9 @@ pub fn rect_list_gs(param_mask: u32) -> Vec<u32> {
             let val = if v < 3 { params[k][v] } else { p3[k] };
             b.store(*o, val, None, []).unwrap();
         }
+        for o in &zeros {
+            b.store(*o, zero4, None, []).unwrap();
+        }
         b.emit_vertex().unwrap();
     }
     b.end_primitive().unwrap();
@@ -90,6 +103,7 @@ pub fn rect_list_gs(param_mask: u32) -> Vec<u32> {
     let mut iface = vec![gl_in, gl_out];
     iface.extend(&ins);
     iface.extend(&outs);
+    iface.extend(&zeros);
     b.entry_point(ExecutionModel::Geometry, func, "main", iface);
     b.execution_mode(func, ExecutionMode::Triangles, []);
     b.execution_mode(func, ExecutionMode::OutputTriangleStrip, []);
@@ -109,7 +123,11 @@ fn global(b: &mut Builder, ptr: u32, sc: StorageClass) -> u32 {
 mod tests {
     #[test]
     fn rect_gs_assembles() {
-        let w = super::rect_list_gs(0b1011);
+        let w = super::rect_list_gs(0b1011, 0b1011);
         assert_eq!(w[0], 0x0723_0203);
+        // A pixel input at location 0 the vertex stage does not write.
+        let z = super::rect_list_gs(0b1010, 0b1011);
+        assert_eq!(z[0], 0x0723_0203);
+        assert_ne!(z, super::rect_list_gs(0b1010, 0b1010));
     }
 }

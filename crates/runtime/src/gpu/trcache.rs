@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-const MAGIC: &[u8; 8] = b"DSTRANS1";
+const MAGIC: &[u8; 8] = b"DSTRANS2";
 
 /// Environment switches the translator reads (`rdna`; the dumps write files
 /// while translating): any of them set keeps the store off.
@@ -267,6 +267,7 @@ fn encode(o: &Output, plan_key: u64, spec_hash: u64) -> Vec<u8> {
     w.push(o.sg_waves as u8);
     u32s(&mut w, o.sg_appends);
     u32s(&mut w, o.known_active);
+    u32s(&mut w, o.in_mask);
     let h = fnv(&w);
     w.extend_from_slice(&h.to_le_bytes());
     w
@@ -336,6 +337,7 @@ fn decode(b: &[u8], plan_key: u64, spec_hash: u64) -> Option<Output> {
     let sg_waves = r.u8()? != 0;
     let sg_appends = r.u32()?;
     let known_active = r.u32()?;
+    let in_mask = r.u32()?;
     if !r.0.is_empty() {
         return None;
     }
@@ -355,6 +357,7 @@ fn decode(b: &[u8], plan_key: u64, spec_hash: u64) -> Option<Output> {
         sg_waves,
         sg_appends,
         known_active,
+        in_mask,
     })
 }
 
