@@ -308,6 +308,14 @@ pub(crate) fn learned_compute() -> Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<Spec>
     })
 }
 
+/// Whether program `code_hash` has learned specs, none of them batched, and
+/// its code kept: the session's start makes those pipelines ahead (`early`),
+/// so a run of its dispatches keeps it unbatched while its batched pipeline
+/// is made (`shaders::mark_batchable`).
+pub(crate) fn learned_unbatched_only(code_hash: u64) -> bool {
+    learned(|m| m.get(&code_hash).is_some_and(|(_, v)| !v.is_empty() && v.iter().all(|s| !s.batched))) && code_of(code_hash).is_some()
+}
+
 fn code_of(h: u64) -> Option<std::sync::Arc<Vec<u32>>> {
     load();
     CODES.lock().as_ref().and_then(|m| m.get(&h).cloned())

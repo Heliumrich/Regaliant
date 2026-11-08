@@ -1023,15 +1023,18 @@ pub fn batch_marked(addr: u64) -> bool {
 }
 
 /// Marks program `addr` batchable (at most 64 programs). A program with a
-/// pipeline already (`compile::has_pipeline`) stays unbatched until its
-/// batched pipeline is made: true when the caller is to hand its stage to
-/// `compile::submit_batched` (once per program).
+/// pipeline already (`compile::has_pipeline`), or whose learned specs are all
+/// unbatched (made ahead from its kept code, `precompile::learned_unbatched_only`),
+/// stays unbatched until its batched pipeline is made: true when the caller
+/// is to hand its stage to `compile::submit_batched` (once per program).
+/// (Before 2026-11-08 a program first dispatched in a run went batched at
+/// once and compiled that form at its dispatch: the suite's 284 ms frame.)
 pub fn mark_batchable(addr: u64) -> bool {
     use std::sync::atomic::Ordering;
     if batch_marked(addr) {
         return false;
     }
-    if super::compile::enabled() && super::compile::has_pipeline(addr) {
+    if super::compile::enabled() && (super::compile::has_pipeline(addr) || program_hash(addr).is_ok_and(super::precompile::learned_unbatched_only)) {
         for a in &PENDING_BATCHED {
             if a.compare_exchange(0, addr, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                 crate::info!("gpu: cs {addr:#x} batched once its batched pipeline is made (runs of consecutive dispatches)");
