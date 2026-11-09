@@ -338,6 +338,92 @@ pub fn allocators() -> Vec<Allocator> {
     v
 }
 
+/// The GPU per-frame arena's allocated units (start, length), merged into
+/// runs: its object (the `Default TaggedArena` of GPU memory) keeps groups
+/// of block descriptors in a list at +0x518 (each group's used blocks in a
+/// list at +0x10), a descriptor the block's base at +0x10 and a 120-unit
+/// occupancy bitmap at +0x18 and +0x20; the unit size at the arena's +0x88
+/// (1 MiB). (eboot+0x7fe350 allocates a chunk, +0x7fea60 the units in a
+/// block, +0x7fefc0 makes a block.)
+pub fn arena_units() -> Vec<(u64, u64)> {
+    let Some(arena) = allocators().into_iter().find(|a| a.pool == 1 && a.mtype == 2 && a.name == "Default TaggedArena").map(|a| a.ptr) else { return Vec::new() };
+    let Some(unit) = rd64(arena + 0x88).filter(|&u| u.is_power_of_two() && u <= 1 << 26) else { return Vec::new() };
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let head = arena + 0x518;
+    let Some(mut g) = rd64(head) else { return Vec::new() };
+    let mut groups = 0;
+    while g != head && g != 0 && groups < 64 {
+        groups += 1;
+        let used = g + 0x10;
+        let Some(mut d) = rd64(used) else { break };
+        let mut blocks = 0;
+        while d != used && d != 0 && blocks < 64 {
+            blocks += 1;
+            let (Some(base), Some(b0), Some(b1)) = (rd64(d + 0x10), rd64(d + 0x18), rd64(d + 0x20)) else { break };
+            for u in 0..120u64 {
+                let set = if u < 64 { b0 >> u & 1 } else { b1 >> (u - 64) & 1 } != 0;
+                if set {
+                    let s = base + u * unit;
+                    match runs.last_mut() {
+                        Some(r) if r.0 + r.1 == s => r.1 += unit,
+                        _ => runs.push((s, unit)),
+                    }
+                }
+            }
+            let Some(next) = rd64(d) else { break };
+            d = next;
+        }
+        let Some(next) = rd64(g) else { break };
+        g = next;
+    }
+    runs
+}
+
+/// The GPU arena's live tags: (tag index, tag value, units, MiB runs).
+/// The tag table holds 64 values at the arena's +0x528 with an occupancy
+/// mask at +0x728; each block descriptor has a 128-bit unit bitmap per tag
+/// at +0x28 + 16 x index (eboot+0x7fe540 frees a tag's chunks).
+pub fn arena_tags() -> Vec<(u32, u64, u64, Vec<(u64, u64)>)> {
+    let Some(arena) = allocators().into_iter().find(|a| a.pool == 1 && a.mtype == 2 && a.name == "Default TaggedArena").map(|a| a.ptr) else { return Vec::new() };
+    let (Some(unit), Some(mask)) = (rd64(arena + 0x88), rd64(arena + 0x728)) else { return Vec::new() };
+    let mut out = Vec::new();
+    for i in 0..64u32 {
+        if mask >> i & 1 == 0 {
+            continue;
+        }
+        let tag = rd64(arena + 0x528 + 8 * i as u64).unwrap_or(0);
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        let mut units = 0u64;
+        let head = arena + 0x518;
+        let mut g = rd64(head).unwrap_or(0);
+        let mut gn = 0;
+        while g != head && g != 0 && gn < 64 {
+            gn += 1;
+            let used = g + 0x10;
+            let mut d = rd64(used).unwrap_or(0);
+            let mut dn = 0;
+            while d != used && d != 0 && dn < 64 {
+                dn += 1;
+                let (Some(base), Some(b0), Some(b1)) = (rd64(d + 0x10), rd64(d + 0x28 + 16 * i as u64), rd64(d + 0x30 + 16 * i as u64)) else { break };
+                for u in 0..120u64 {
+                    if (if u < 64 { b0 >> u & 1 } else { b1 >> (u - 64) & 1 }) != 0 {
+                        units += 1;
+                        let st = base + u * unit;
+                        match runs.last_mut() {
+                            Some(r) if r.0 + r.1 == st => r.1 += unit,
+                            _ => runs.push((st, unit)),
+                        }
+                    }
+                }
+                d = rd64(d).unwrap_or(0);
+            }
+            g = rd64(g).unwrap_or(0);
+        }
+        out.push((i, tag, units, runs));
+    }
+    out
+}
+
 /// For the status report.
 pub fn status() -> String {
     if BASE.load(Ordering::Relaxed) == 0 {
@@ -364,5 +450,13 @@ pub fn status() -> String {
         })
         .collect();
     s += &format!("    engine allocators ({}): {}\n", a.len(), parts.join("; "));
+    let units = arena_units();
+    let total: u64 = units.iter().map(|r| r.1).sum();
+    let parts: Vec<String> = units.iter().take(24).map(|r| format!("{:#x}+{:#x}", r.0, r.1)).collect();
+    s += &format!("    engine GPU arena: {} MiB allocated in {} runs: {}
+", total >> 20, units.len(), parts.join(", "));
+    let tags: Vec<String> = arena_tags().iter().map(|(i, tag, n, runs)| format!("[{i}] tag {tag:#x}: {n} units in {} runs", runs.len())).collect();
+    s += &format!("    engine GPU arena tags: {}
+", tags.join(", "));
     s + &census_line()
 }
