@@ -10379,7 +10379,7 @@ impl Exec {
             if self.pending_promises.is_empty() && self.actions.is_empty() {
                 SCATTER_SITES[2].fetch_add(1, Ordering::Relaxed);
             }
-            self.fe2_scatter();
+            self.fe2_scatter_at(1);
         }
         // Mirror mode: pages deferred CP writes changed are copied into the
         // mirror again (those writes were waited for above), and the dwords
@@ -11607,6 +11607,12 @@ impl Exec {
     /// dwords GPU work marked go from the mirror to guest memory. Whether
     /// it was recorded (with its barriers).
     fn fe2_scatter(&mut self) -> bool {
+        self.fe2_scatter_at(0)
+    }
+
+    /// `fe2_scatter` at site `site` (`tune wb_probe_site`; 1 a close, 2
+    /// before a CP write the GPU performs).
+    fn fe2_scatter_at(&mut self, site: u8) -> bool {
         // (`DS_PROFILE_GPU_STAMPS=seg`: a segment of its own, `front end 2
         // write-backs`; its own barriers write no segment stamps, and its
         // time went to the commands before it.)
@@ -11618,7 +11624,16 @@ impl Exec {
         // segment's end mark.)
         let rec = if seg { self.wb_count_copy(0) } else { 0 };
         let cmd = self.cmd();
-        let recorded = if let Some(pipe) = super::fe2::record_scatter(cmd, self.batch_c) {
+        // (`tune wb_probe_site` prices the graphics queue's places: the
+        // graphics command processor's and its workers' batches only; a
+        // worker's chunk batch closing is site 3.)
+        let gfx = !self.batch_c && self.name.starts_with("gpu-gfx");
+        let site = match (gfx, site) {
+            (false, _) => 0,
+            (true, 1) if self.par_worker => 3,
+            (true, k) => k,
+        };
+        let recorded = if let Some(pipe) = super::fe2::record_scatter_at(cmd, self.batch_c, site) {
             // The next dispatch binds its own pipeline and descriptors.
             self.dyncache.cs_pipeline = pipe;
             true
@@ -13337,7 +13352,7 @@ impl Exec {
                 SCATTER_SITES[4].fetch_add(1, Ordering::Relaxed);
             } else {
                 SCATTER_SITES[0].fetch_add(1, Ordering::Relaxed);
-                after_scatter = self.fe2_scatter();
+                after_scatter = self.fe2_scatter_at(2);
             }
         }
         let cmd = self.cmd();

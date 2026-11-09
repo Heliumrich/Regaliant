@@ -4465,6 +4465,13 @@ fn wb_buckets_line() -> String {
 /// async compute). Returns the pipeline it bound (the caller's bound
 /// compute state is gone).
 pub fn record_scatter(cmd: vk::CommandBuffer, on_c: bool) -> Option<vk::Pipeline> {
+    record_scatter_at(cmd, on_c, 0)
+}
+
+/// `record_scatter` at site `site` (`tune wb_probe_site`: 1 a batch's
+/// close, 2 before a CP write the GPU performs, 3 a workers' chunk batch's
+/// close; 0 elsewhere).
+pub fn record_scatter_at(cmd: vk::CommandBuffer, on_c: bool, site: u8) -> Option<vk::Pipeline> {
     let s = SCATTER.get()?;
     let marks = super::resident::marks_for(on_c)?;
     let set = if on_c { s.set_c } else { s.set };
@@ -4521,9 +4528,97 @@ pub fn record_scatter(cmd: vk::CommandBuffer, on_c: bool) -> Option<vk::Pipeline
         // dispatch's read of its arguments, a logically earlier stage.)
         let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_READ);
         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[after], &[], &[]);
+        // (`tune wb_probe`, diagnosis: one workgroup of a ballast kernel
+        // running that many steps of a dependent chain into a buffer of its
+        // own, between full barriers: only GPU time and order added.)
+        let probe = super::tune::wb_probe();
+        let want = match super::tune::wb_probe_site() {
+            0 => true,
+            1 => site == 1 || site == 3,
+            k => site as u64 == k,
+        };
+        if probe != 0 && want {
+            if let Some(b) = ballast() {
+                c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[all], &[], &[]);
+                c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, b.pipeline);
+                c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, b.layout, 0, &[b.set], &[]);
+                let pcs: Vec<u8> = [probe.min(u32::MAX as u64) as u32, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
+                c.device.cmd_push_constants(cmd, b.layout, vk::ShaderStageFlags::COMPUTE, 0, &pcs);
+                c.device.cmd_dispatch(cmd, 1, 1, 1);
+                c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[after], &[], &[]);
+                PROBES.fetch_add(1, Ordering::Relaxed);
+                note_scatter();
+                return Some(b.pipeline);
+            }
+        }
     }
     note_scatter();
     Some(pipeline)
+}
+
+/// Write-backs followed by `tune wb_probe`'s ballast.
+static PROBES: AtomicU64 = AtomicU64::new(0);
+
+/// `tune wb_probe`'s ballast: `rdna::kernels::latency_test` storing into a
+/// buffer of its own (one workgroup's dwords), made at first use.
+struct Ballast {
+    pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+    set: vk::DescriptorSet,
+}
+
+// SAFETY: Vulkan handles, used from recording threads under the API's
+// external synchronization rules (the set is never updated after it is made).
+unsafe impl Send for Ballast {}
+unsafe impl Sync for Ballast {}
+
+fn ballast() -> Option<&'static Ballast> {
+    static B: std::sync::OnceLock<Option<Ballast>> = std::sync::OnceLock::new();
+    B.get_or_init(|| {
+        let r = (|| -> Result<Ballast, String> {
+            let c = ctx();
+            let d = &c.device;
+            let (buf, mem) = c.device_buffer(4 * rdna::kernels::LATENCY_LOCAL_SIZE as u64, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            std::mem::forget(mem);
+            unsafe {
+                let binding = [vk::DescriptorSetLayoutBinding::default().binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE)];
+                let set_layout = d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&binding), None).map_err(|e| format!("set layout: {e}"))?;
+                let range = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(8)];
+                let layout = d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]).push_constant_ranges(&range), None).map_err(|e| format!("layout: {e}"))?;
+                let code = rdna::kernels::latency_test(0xba11);
+                let module = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("module: {e}"))?;
+                let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+                let pipeline = d.create_compute_pipelines(vk::PipelineCache::null(), &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)], None).map_err(|(_, e)| format!("pipeline: {e}"))?[0];
+                d.destroy_shader_module(module, None);
+                let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 1 }];
+                let pool = d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).map_err(|e| format!("pool: {e}"))?;
+                let set = d.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[set_layout])).map_err(|e| format!("set: {e}"))?[0];
+                let bi = [vk::DescriptorBufferInfo::default().buffer(buf).offset(0).range(vk::WHOLE_SIZE)];
+                d.update_descriptor_sets(&[vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&bi)], &[]);
+                Ok(Ballast { pipeline, layout, set })
+            }
+        })();
+        match r {
+            Ok(b) => {
+                crate::info!("fe2: `tune wb_probe`'s ballast kernel made");
+                Some(b)
+            }
+            Err(e) => {
+                crate::warn!("fe2: `tune wb_probe`'s ballast kernel: {e}");
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// The probe's line ("" before any).
+pub fn wb_probe_line() -> String {
+    let n = PROBES.load(Ordering::Relaxed);
+    if n == 0 {
+        return String::new();
+    }
+    format!("    front end 2's write-backs followed by `tune wb_probe`'s ballast: {n}\n")
 }
 
 /// Records a copy of the write-back's video-memory counters into the
@@ -5065,6 +5160,7 @@ pub fn status() -> String {
         + &wb_buckets_line()
         + &hold_line()
         + &wb_same_line()
+        + &wb_probe_line()
 }
 
 /// One status line: the mirror's pages by state now (a scan of every
