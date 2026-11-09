@@ -2917,7 +2917,7 @@ pub fn status_ex(with_stacks: bool) -> String {
         }
     }
     s.push_str(&format!(
-        "    gpu totals: {} submits, {} packets, {} draws ({} from {} multi-draw packets, {} of them with a GPU-written count; {} indexed indirect draws dropped, their arguments past the index buffer, {} drawn as they read later), {} dispatches, {} EOP interrupts, {} flips, {} label waits latched, {} passed on writes made after their submission, {} on counters past their value, {} passed on promises, {} CP reads waited for another queue\n",
+        "    gpu totals: {} submits, {} packets, {} draws ({} from {} multi-draw packets, {} of them with a GPU-written count; {} indexed indirect draws dropped, their arguments past the index buffer, {} drawn as they read later), {} dispatches, {} EOP interrupts, {} flips, {} label waits latched, {} passed on writes made after their submission, {} on counters past their value, {} passed on promises, {} CP reads waited for another queue{}\n",
         SUBMITS.load(Ordering::Relaxed),
         cp::PACKETS.load(Ordering::Relaxed),
         cp::DRAWS.load(Ordering::Relaxed),
@@ -2933,7 +2933,20 @@ pub fn status_ex(with_stacks: bool) -> String {
         cp::MISSED.load(Ordering::Relaxed),
         cp::COUNTER_PASSED.load(Ordering::Relaxed),
         cp::PROMISED.load(Ordering::Relaxed),
-        exec::FOREIGN_WAITS.load(Ordering::Relaxed)
+        exec::FOREIGN_WAITS.load(Ordering::Relaxed),
+        format!(
+            "; {} tiny read-only buffers bound as snapshots of guest memory{}",
+            exec::TINY_SNAPS.load(Ordering::Relaxed),
+            if exec::UPLOAD_HAZARDS[2].load(Ordering::Relaxed) > 0 {
+                format!(
+                    "; {} uploads into the mirror over pages an unfinished batch writes ({} of them the other device queue's)",
+                    exec::UPLOAD_HAZARDS[2].load(Ordering::Relaxed),
+                    exec::UPLOAD_HAZARDS[0].load(Ordering::Relaxed)
+                )
+            } else {
+                String::new()
+            }
+        )
     ));
     s.push_str(&format!("    {}\n", throttle_status()));
     s.push_str(&exec::status());

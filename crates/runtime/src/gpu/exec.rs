@@ -412,25 +412,26 @@ thread_local! {
     /// (`DS_WATCH_WRITES`) This thread's latest front end 2 placements:
     /// (base, size, bytes its check uploaded into the batch's prologue, from
     /// the batch's placement memo).
-    static WATCH_PLACES: std::cell::RefCell<Vec<(u64, u64, u64, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static WATCH_PLACES: std::cell::RefCell<Vec<(u64, u64, u64, bool, String)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// A placement for `watch_resources` (only with `DS_WATCH_WRITES`).
-fn watch_place(base: u64, size: u64, uploaded: u64, memo: bool) {
+/// A placement for `watch_resources` (only with `DS_WATCH_WRITES`), with
+/// its first page's state for small read-only ranges.
+fn watch_place(base: u64, size: u64, uploaded: u64, memo: bool, state: String) {
     WATCH_PLACES.with(|v| {
         let mut v = v.borrow_mut();
         if v.len() >= 64 {
             v.drain(..32);
         }
-        v.push((base, size, uploaded, memo));
+        v.push((base, size, uploaded, memo, state));
     });
 }
 
 fn watch_placed(base: u64) -> String {
     WATCH_PLACES.with(|v| match v.borrow().iter().rev().find(|e| e.0 == base) {
-        Some(&(_, _, _, true)) => " placed from the memo".to_string(),
-        Some(&(_, _, 0, false)) => " placed current".to_string(),
-        Some(&(_, _, n, false)) => format!(" placed with {n:#x} bytes uploaded"),
+        Some((_, _, _, true, st)) => format!(" placed from the memo{st}"),
+        Some((_, _, 0, false, st)) => format!(" placed current{st}"),
+        Some((_, _, n, false, st)) => format!(" placed with {n:#x} bytes uploaded{st}"),
         None => " not placed".to_string(),
     })
 }
@@ -850,6 +851,30 @@ struct PipeEntry {
 fn flip_now() -> u32 {
     super::FRAMES.load(Ordering::Relaxed) as u32
 }
+
+/// `DS_UPLOAD_HAZARD=1` (diagnosis, `Exec::note_upload_hazard`).
+fn upload_hazard_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_UPLOAD_HAZARD").ok().as_deref() == Some("1"))
+}
+
+/// Uploads into the mirror over pages an unfinished batch writes: [the
+/// writer on the other device queue, on the same one, all].
+pub(crate) static UPLOAD_HAZARDS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Front end 2: read-only buffer bindings of at most this many bytes that
+/// no unfinished GPU work or pending CP write writes are copied from guest
+/// memory when the command is recorded (a batch snapshot) instead of
+/// placed in the mirror. The title's pattern copy read a 20-byte pattern
+/// from a ring page the mirror held stale while front end 2 took it as
+/// current (armed): the culls' indirect records got float counts, the
+/// device losses' class since 2026-11-07 (FINDINGS.md 2026-11-09). In-run
+/// A/B at the vista: x1.001 (level).
+const TINY_SNAP_BYTES: u64 = 256;
+
+/// Tiny read-only buffers bound as snapshots of guest memory
+/// (`TINY_SNAP_BYTES`).
+pub(crate) static TINY_SNAPS: AtomicU64 = AtomicU64::new(0);
 
 /// Pipelines unused for this many flips may be evicted (~1-2 minutes).
 const PIPE_IDLE_FLIPS: u32 = 3600;
@@ -10999,7 +11024,7 @@ impl Exec {
                 }
                 place_memo_count(true);
                 if watch_range().is_some() {
-                    watch_place(base, size, 0, true);
+                    watch_place(base, size, 0, true, String::new());
                 }
                 return Some(m.result);
             }
@@ -11148,7 +11173,21 @@ impl Exec {
         }
         let t3 = tsc();
         if watch_range().is_some() {
-            watch_place(base, size, up[first..].iter().map(|&(a, b)| b - a).sum(), false);
+            // (A small read-only range's first page: valid in the mirror,
+            // uploaded by this batch, claimed by an earlier chunk of this
+            // executor's run, and its stamps; the epochs wanted and now.)
+            let st = if !written && hi - lo <= PAGE {
+                format!(
+                    " (page {lo:#x}: valid {}, this batch's {}, the run's {}, want {want}, epoch {ep}; {})",
+                    super::fe2::page_valid(lo),
+                    mine.contains(&lo),
+                    run.0 != 0 && super::fe2::run_shared(lo, run.0, run.1),
+                    super::fe2::audit_page_state(lo)
+                )
+            } else {
+                String::new()
+            };
+            watch_place(base, size, up[first..].iter().map(|&(a, b)| b - a).sum(), false, st);
         }
         let mut mine = mine;
         for &(a, b) in &up[first..] {
@@ -11387,6 +11426,9 @@ impl Exec {
         if !self.recording {
             return false;
         }
+        if upload_hazard_on() {
+            self.note_upload_hazard(a, b);
+        }
         let _ = self.open_pre();
         let run = self.fe2_share();
         let mut x = a;
@@ -11438,6 +11480,33 @@ impl Exec {
             }
         }
         true
+    }
+
+    /// `DS_UPLOAD_HAZARD=1` (diagnosis): an upload into the mirror of pages
+    /// that a submitted, unfinished batch of the other device queue (or of
+    /// another executor) writes: the batch-start copy reads guest memory,
+    /// which lacks that batch's writes until its write-back, so it may land
+    /// over them in the mirror (a copy of whole pages, also of words the
+    /// title never wrote on the CPU). Counted by the writer's device queue;
+    /// the first 40 logged.
+    fn note_upload_hazard(&self, a: u64, b: u64) {
+        let Some(s) = INFLIGHT.latest(&[(a, b - a)]) else { return };
+        let done = done_seq();
+        if s <= done {
+            return;
+        }
+        let (wname, w_c) = BATCHES.lock().iter().find(|x| x.seq == s).map(|x| (x.name.clone(), x.on_c)).unwrap_or_default();
+        let same_queue = w_c == self.batch_c;
+        UPLOAD_HAZARDS[same_queue as usize].fetch_add(1, Ordering::Relaxed);
+        if UPLOAD_HAZARDS[2].fetch_add(1, Ordering::Relaxed) < 40 {
+            crate::info!(
+                "gpu: upload hazard: {} (on the {} queue) uploads {a:#x}..{b:#x} into the mirror while batch {s} of {wname} (the {} queue) writing it is unfinished (done {done}), flip {}",
+                self.name,
+                if self.batch_c { "compute" } else { "main" },
+                if w_c { "compute" } else { "main" },
+                super::FRAMES.load(Ordering::Relaxed)
+            );
+        }
     }
 
     /// A long wait's report (`Cp::poll_until_wake`): the recording batch
@@ -14613,7 +14682,18 @@ impl Exec {
                         }
                         // The residency mirror (read-only bindings, `gpu::resident`), or
                         // a video-memory home holding the range (see `homes`).
-                        let from_mirror = if super::resident::mirror_mode() {
+                        // Front end 2: a tiny read-only buffer no GPU work writes,
+                        // as guest memory holds it now (`TINY_SNAP_BYTES`).
+                        let tiny = if read_only && super::fe2::on() && size <= TINY_SNAP_BYTES && matches!(found.resources[i], Resolved::Buffer(_)) && !super::resident::mirror_mode() {
+                            self.snapshot_as(base, size, 4096, false).inspect(|_| {
+                                TINY_SNAPS.fetch_add(1, Ordering::Relaxed);
+                            })
+                        } else {
+                            None
+                        };
+                        let from_mirror = if tiny.is_some() {
+                            None
+                        } else if super::resident::mirror_mode() {
                             self.mm_unsized = matches!(found.resources[i], Resolved::Global(_, None));
                             // Diagnostics: large written bindings, the first of each shader.
                             if found.tr.plan.resources[i].written && size >= 16 << 20 {
@@ -14682,7 +14762,13 @@ impl Exec {
                         // that came later: `tune race_checks`, FINDINGS.md
                         // 2026-10-14); data GPU work writes is read where it is.
                         let data_load = read_only && matches!(found.resources[i], Resolved::Global(_, Some(_)));
-                        let snap = if read_only && resident.is_none() && home.is_none() && data_load && super::tune::data_snapshots() { self.snapshot_exact(base, size) } else { None };
+                        let snap = if tiny.is_some() {
+                            tiny
+                        } else if read_only && resident.is_none() && home.is_none() && data_load && super::tune::data_snapshots() {
+                            self.snapshot_exact(base, size)
+                        } else {
+                            None
+                        };
                         BindClock::mark(&mut clk, 3);
                         // Read-only bindings of buffers GPU work wrote: VRAM mirrors.
                         let mirrored = if read_only && snap.is_none() && home.is_none() { resident } else { None };

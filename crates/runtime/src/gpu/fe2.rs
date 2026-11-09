@@ -2124,6 +2124,11 @@ pub fn audit_gpu_page(p: u64) -> bool {
 /// Page `p`'s arming record for the audit's log (`DS_IMPORT_AUDIT`): the
 /// flip of its last CPU write found, its arming level, the epochs it was
 /// found clean in, whether it was taken since its arming.
+/// Whether page `p` is valid in the mirror (diagnosis: `DS_WATCH_WRITES`).
+pub fn page_valid(p: u64) -> bool {
+    chunk(p, false).is_some_and(|c| c.valid[idx(p) / 64].load(Ordering::Acquire) >> (idx(p) % 64) & 1 != 0)
+}
+
 pub fn audit_page_state(p: u64) -> String {
     let Some(c) = chunk(p, false) else { return "no chunk".into() };
     let (i, w, bit) = (idx(p), idx(p) / 64, idx(p) % 64);
