@@ -15567,12 +15567,11 @@ impl Exec {
         }
         let mut lap = Laps::for_dispatch(self.cs_kind(true), false);
         let r = [(args, 12)];
-        // A compute queue's parallel worker cannot see writes of the run's
-        // earlier chunks (not submitted yet, recorded by other threads;
-        // flushes inside a run, `cp::par_event`, order them), and the
-        // run's planning does not wait for the arguments: the GPU reads
-        // them, in order.
-        if !(self.deferred && self.compute_cp) && !(self.overlaps_pending(&r) || INFLIGHT.latest(&r).is_some() || CP_WRITES.latest(&r).is_some()) {
+        // A parallel worker cannot see writes of the run's earlier chunks
+        // (not submitted yet, recorded by other threads; flushes inside a
+        // run, `cp::par_event`, order them), and the run's planning does
+        // not wait for the arguments: the GPU reads them, in order.
+        if !self.deferred && !(self.overlaps_pending(&r) || INFLIGHT.latest(&r).is_some() || CP_WRITES.latest(&r).is_some()) {
             return false;
         }
         // Arguments in a video-memory home: read by the CP after the home's

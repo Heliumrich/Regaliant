@@ -2937,10 +2937,12 @@ impl Cp {
         let mut why = 0x130usize;
         let mut sync = false;
         // Whether the chunks' indirect dispatches read their arguments on
-        // the GPU (`Exec::dispatch_gpu_indirect`; compute queues' runs,
-        // `compute_workers`; captures and interpreter checks read them
-        // here).
-        let gpu_dispatch_args = self.compute && super::tune::gpu_indirect() && !super::capture::capturing() && !super::verify::enabled() && !(super::exec::enabled() && super::emucheck::wanted(self));
+        // the GPU (`Exec::dispatch_gpu_indirect`; every queue's runs since
+        // 2026-11-09, the compute queues' since 2026-10-19: the graphics
+        // queue's planning waited ~1-3 ms twice a frame at the swamp for
+        // the tessellation preparation's arguments, FINDINGS.md; captures
+        // and interpreter checks read them here).
+        let gpu_dispatch_args = super::tune::gpu_indirect() && !super::capture::capturing() && !super::verify::enabled() && !(super::exec::enabled() && super::emucheck::wanted(self));
         // The run's signature: its packet headers (opcode and size), the
         // same when the title records the same pass again.
         let mut sig = 0xcbf2_9ce4_8422_2325u64;
