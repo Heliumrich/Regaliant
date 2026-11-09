@@ -4817,12 +4817,15 @@ impl Cp {
                 let n = ARGS_BEYOND[1].fetch_add(1, Ordering::Relaxed);
                 if n < 16 {
                     crate::warn!(
-                        "gpu[{}]: indexed indirect draw's arguments at {a:#x} (packet {:#x}) ran past its index buffer ({:#x}, {} indices) as {w:?} and read {now:?} after {} us: drawn so",
+                        "gpu[{}]: indexed indirect draw's arguments at {a:#x} (packet {:#x}) ran past its index buffer ({:#x}, {} indices) as {w:?} and read {now:?} after {} us: drawn so (the last wait passed: kind {}, function {}, on a GPU write {})",
                         self.name,
                         self.cur_packet,
                         self.index_base,
                         self.index_count,
-                        t0.elapsed().as_micros()
+                        t0.elapsed().as_micros(),
+                        self.last_wait_kind as char,
+                        self.last_wait_func,
+                        self.last_wait_gpu
                     );
                 }
                 return Some(now);
@@ -4831,11 +4834,14 @@ impl Cp {
         let n = ARGS_BEYOND[0].fetch_add(1, Ordering::Relaxed);
         if n < 16 {
             crate::warn!(
-                "gpu[{}]: indexed indirect draw dropped at packet {:#x}: arguments at {a:#x} {w:?} (after 2 ms {now:?}) run past its index buffer ({:#x}, {} indices)",
+                "gpu[{}]: indexed indirect draw dropped at packet {:#x}: arguments at {a:#x} {w:?} (after 2 ms {now:?}) run past its index buffer ({:#x}, {} indices; the last wait passed: kind {}, function {}, on a GPU write {})",
                 self.name,
                 self.cur_packet,
                 self.index_base,
-                self.index_count
+                self.index_count,
+                self.last_wait_kind as char,
+                self.last_wait_func,
+                self.last_wait_gpu
             );
         }
         None
