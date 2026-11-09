@@ -2473,6 +2473,8 @@ mod fe3_probe {
     static CV: Condvar = Condvar::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
     static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    /// `tune fe3_scan 2`: scans, then `fe2::fe3_scan_dry2`'s sums.
+    static STATS2: [AtomicU64; 23] = [const { AtomicU64::new(0) }; 23];
 
     pub fn note_submission() {
         STARTED.call_once(|| {
@@ -2492,6 +2494,15 @@ mod fe3_probe {
                 }
                 std::mem::take(&mut *g)
             };
+            if super::tune::fe3_scan() == 2 {
+                let v = super::fe2::fe3_scan_dry2();
+                STATS2[0].fetch_add(1, Ordering::Relaxed);
+                for (k, x) in v.into_iter().enumerate() {
+                    STATS2[k + 1].fetch_add(x, Ordering::Relaxed);
+                }
+                STATS[1].fetch_add(n, Ordering::Relaxed);
+                continue;
+            }
             let (runs, queried, written, failed, ns) = super::fe2::fe3_scan_dry();
             for (k, v) in [1, n, runs, queried, written, failed, ns].into_iter().enumerate() {
                 STATS[k].fetch_add(v, Ordering::Relaxed);
@@ -2500,13 +2511,46 @@ mod fe3_probe {
     }
 
     pub fn reset() {
-        for c in &STATS {
+        for c in STATS.iter().chain(STATS2.iter()) {
             c.store(0, Ordering::Relaxed);
         }
     }
 
     pub fn line(flips: u64) -> String {
         let v: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        let w: Vec<u64> = STATS2.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        if w[0] != 0 {
+            let s = w[0] as f64;
+            let mib = |pages: u64| pages as f64 * 4096.0 / 1048576.0 / s;
+            return format!(
+                "    take-per-submission dry run, cheapest calls (`tune fe3_scan 2`): {} scans for {} title submissions; per scan {:.0} calls over {:.1} MiB, {:.0} pages written since their last take, {:.1} failed, {:.1} us; {:.2} ms of scans a flip; valid pages not armed per scan {:.1} MiB: last CPU write found < 2 flips ago {:.1}, < 16 {:.1}, < 128 {:.1}, longer {:.1}, never {:.1}; GPU-written {:.1}; in runs the title's CPU cannot write {:.1}, outside settled imports {:.1}; written within 16 flips in the title's 'batch' mappings {:.1}, elsewhere {:.1}; the rings' spans of pages written within 16 flips {:.1} MiB, a query-only scan of them (one call a ring) {:.1} us; pages written within 2 flips in rings {:.2} MiB over spans of {:.1} MiB in {:.1} rings (by 64 MiB window: spans of {:.1} MiB)\n",
+                w[0],
+                v[1],
+                w[1] as f64 / s,
+                mib(w[2]),
+                w[3] as f64 / s,
+                w[4] as f64 / s,
+                w[5] as f64 / s / 1000.0,
+                w[5] as f64 / 1e6 / flips.max(1) as f64,
+                mib(w[6]),
+                mib(w[7]),
+                mib(w[8]),
+                mib(w[9]),
+                mib(w[10]),
+                mib(w[11]),
+                mib(w[12]),
+                mib(w[13]),
+                mib(w[14]),
+                mib(w[15]),
+                mib(w[16]),
+                mib(w[17]),
+                w[18] as f64 / s / 1000.0,
+                mib(w[20]),
+                mib(w[19]),
+                w[21] as f64 / s,
+                mib(w[22])
+            );
+        }
         if v[0] == 0 {
             return String::new();
         }

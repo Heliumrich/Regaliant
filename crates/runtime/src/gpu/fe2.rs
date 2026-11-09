@@ -2031,6 +2031,175 @@ pub fn fe3_scan_dry() -> (u64, u64, u64, u64, u64) {
     (runs, queried, written, failed, t.elapsed().as_nanos() as u64)
 }
 
+/// `tune fe3_scan 2` (FRONTEND3.md, its blocker): the same dry run with
+/// the cheapest calls (per 64 MiB window one query over the span of its
+/// valid pages not armed, or one per run when that covers fewer pages at
+/// ~2 us a call and ~2.7 ns a page), and those pages by the age of the last
+/// CPU write front end 2 found on them: what a scan per epoch must cover
+/// now, and what arming more of them would leave.
+/// [calls, pages queried, pages written since their last take, failed
+/// queries, ns, pages not armed, of them last written < 2 flips ago, < 16,
+/// < 128, longer, never found written, GPU-written ones; then pages of runs
+/// the title cannot write on the CPU (its mapping's protection), pages of
+/// runs no settled import covers, unarmed pages written within 16 flips in
+/// the title's 'batch' mappings, the same elsewhere, the 'batch' mappings'
+/// pages in the mirror's span, ns of one query-only scan of them whole, the
+/// rings' spans of pages written within 2 flips summed, those pages, rings
+/// holding any, the spans by 64 MiB window summed].
+pub fn fe3_scan_dry2() -> [u64; 22] {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let t = std::time::Instant::now();
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    let mut out = [0u64; 22];
+    // The title's rings: its mappings named 'batch' in the mirror's span.
+    let rings: Vec<(u64, u64)> = {
+        let g = crate::mem::MEM.lock();
+        g.vmas.values().filter(|v| v.name == "batch" && v.start >= MIRROR_BASE && v.end() <= MIRROR_END).map(|v| (v.start, v.end())).collect()
+    };
+    let in_ring = |a: u64| rings.iter().any(|&(s, e)| s <= a && a < e);
+    // (Per ring: the first and last page written within 2 flips, and how
+    // many; per window the same; and within 16 flips.)
+    let mut spans: Vec<(u64, u64, u64)> = vec![(u64::MAX, 0, 0); rings.len()];
+    let mut spans16: Vec<(u64, u64)> = vec![(u64::MAX, 0); rings.len()];
+    let mut wspans: std::collections::HashMap<u64, (u64, u64)> = std::collections::HashMap::new();
+    let mut addrs = [std::ptr::null_mut::<std::ffi::c_void>(); 512];
+    let mut query = |a: u64, e: u64, out: &mut [u64; 22]| {
+        out[0] += 1;
+        out[1] += (e - a) / PAGE;
+        let mut at = a;
+        while at < e {
+            let mut count = addrs.len();
+            let mut gran = 0u32;
+            if unsafe { GetWriteWatch(0, at as _, (e - at) as usize, addrs.as_mut_ptr(), &mut count, &mut gran) } != 0 {
+                out[3] += 1;
+                return;
+            }
+            out[2] += count as u64;
+            if count < addrs.len() {
+                return;
+            }
+            at = addrs[count - 1] as u64 + PAGE;
+        }
+    };
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for (ci, slot) in TABLE.iter().enumerate() {
+        let p = slot.load(Ordering::Acquire);
+        if p.is_null() {
+            continue;
+        }
+        let c = unsafe { &*p };
+        let base = MIRROR_BASE + ((ci as u64) << CHUNK_SHIFT);
+        runs.clear();
+        let mut start: Option<u64> = None;
+        for w in 0..WORDS {
+            let bits = c.valid[w].load(Ordering::Relaxed) & !c.armed[w].load(Ordering::Relaxed);
+            let wa = base + (w as u64) * 64 * PAGE;
+            if bits != 0 {
+                out[5] += bits.count_ones() as u64;
+                out[11] += (bits & c.gpu[w].load(Ordering::Relaxed)).count_ones() as u64;
+                let mut r = bits;
+                while r != 0 {
+                    let k = r.trailing_zeros() as usize;
+                    r &= r - 1;
+                    let wrote = c.wrote[w * 64 + k].load(Ordering::Relaxed) as u64;
+                    let slot = if wrote == 0 {
+                        10
+                    } else {
+                        let age = (frame + 1).saturating_sub(wrote);
+                        if age < 2 { 6 } else if age < 16 { 7 } else if age < 128 { 8 } else { 9 }
+                    };
+                    out[slot] += 1;
+                    if slot == 6 || slot == 7 {
+                        if in_ring(wa + k as u64 * PAGE) {
+                            out[14] += 1;
+                        } else {
+                            out[15] += 1;
+                        }
+                        let pa = wa + k as u64 * PAGE;
+                        if let Some(i) = rings.iter().position(|&(s, e)| s <= pa && pa < e) {
+                            let sp = &mut spans16[i];
+                            sp.0 = sp.0.min(pa);
+                            sp.1 = sp.1.max(pa + PAGE);
+                        }
+                    }
+                    if slot == 6 {
+                        let pa = wa + k as u64 * PAGE;
+                        if let Some(i) = rings.iter().position(|&(s, e)| s <= pa && pa < e) {
+                            let sp = &mut spans[i];
+                            sp.0 = sp.0.min(pa);
+                            sp.1 = sp.1.max(pa + PAGE);
+                            sp.2 += 1;
+                        }
+                        let ws = wspans.entry(pa >> CHUNK_SHIFT).or_insert((u64::MAX, 0));
+                        ws.0 = ws.0.min(pa);
+                        ws.1 = ws.1.max(pa + PAGE);
+                    }
+                }
+            }
+            if bits == u64::MAX {
+                start.get_or_insert(wa);
+                continue;
+            }
+            for k in 0..64u32 {
+                let set = (bits >> k) & 1 != 0;
+                let a = wa + k as u64 * PAGE;
+                match (set, start) {
+                    (true, None) => start = Some(a),
+                    (false, Some(s)) => {
+                        runs.push((s, a));
+                        start = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(s) = start {
+            runs.push((s, base + (1u64 << CHUNK_SHIFT)));
+        }
+        if runs.is_empty() {
+            continue;
+        }
+        for &(a, e) in &runs {
+            if crate::mem::prot_at(a).is_some_and(|p| p & crate::mem::PROT_CPU_WRITE == 0) {
+                out[12] += (e - a) / PAGE;
+            }
+            if super::exec::fe2_settled_over(a, e) != Some(true) {
+                out[13] += (e - a) / PAGE;
+            }
+        }
+        // (Per run, or the window's span once: whichever the model prices
+        // lower, ~2,000 ns a call and ~2.7 ns a page.)
+        let pages: u64 = runs.iter().map(|r| (r.1 - r.0) / PAGE).sum();
+        let (lo, hi) = (runs[0].0, runs[runs.len() - 1].1);
+        let per_run = runs.len() as u64 * 2000 + pages * 27 / 10;
+        let span = 2000 + (hi - lo) / PAGE * 27 / 10;
+        if span <= per_run {
+            query(lo, hi, &mut out);
+        } else {
+            for &(a, e) in runs.iter() {
+                query(a, e, &mut out);
+            }
+        }
+    }
+    out[4] = t.elapsed().as_nanos() as u64;
+    for sp in spans.iter().filter(|sp| sp.2 > 0) {
+        out[18] += (sp.1 - sp.0) / PAGE;
+        out[19] += sp.2;
+        out[20] += 1;
+    }
+    out[21] = wspans.values().map(|w| (w.1 - w.0) / PAGE).sum();
+    // (The rings' spans of pages written within 16 flips, one query each:
+    // what a scan per epoch over the rings would cover.)
+    let tr = std::time::Instant::now();
+    let mut dummy = [0u64; 22];
+    for &(a, e) in spans16.iter().filter(|sp| sp.1 > sp.0) {
+        out[16] += (e - a) / PAGE;
+        query(a, e, &mut dummy);
+    }
+    out[17] = tr.elapsed().as_nanos() as u64;
+    out
+}
+
 fn take_all() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *W.get_or_init(|| std::env::var("DS_FE2_TAKE_ALL").ok().as_deref() == Some("1"))
