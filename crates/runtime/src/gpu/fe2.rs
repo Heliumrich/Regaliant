@@ -3486,8 +3486,13 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
             // (Partly marked lines stored one dword per line in each store
             // instruction: ~6-7x faster into host memory than a line with
             // holes from one instruction, the same dwords; FINDINGS.md
-            // 2026-11-09 "Holey write-backs".)
-            rdna::kernels::mirror_scatter_split()
+            // 2026-11-09 "Holey write-backs". `DS_WB_OLD=1`, diagnosis: the
+            // write-back before, for the bench's comparison.)
+            if std::env::var("DS_WB_OLD").ok().as_deref() == Some("1") {
+                rdna::kernels::mirror_scatter_reset()
+            } else {
+                rdna::kernels::mirror_scatter_split()
+            }
         };
         let make = |code: &[u32], key: u64| -> Result<vk::Pipeline, String> {
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None).map_err(|e| format!("scatter module: {e}"))?;
@@ -3497,7 +3502,7 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
             c.device.destroy_shader_module(module, None);
             Ok(pipeline?[0])
         };
-        let pipeline = make(&code, if wb_buckets() { 27 } else if wb_same_mode() == 1 { 34 } else if HELD_MAP.get().is_some() { 28 } else { 42 })?;
+        let pipeline = make(&code, if wb_buckets() { 27 } else if wb_same_mode() == 1 { 34 } else if HELD_MAP.get().is_some() { 28 } else if std::env::var("DS_WB_OLD").ok().as_deref() == Some("1") { 20 } else { 42 })?;
         if wb_same_mode() == 2 && SAME_SKIP.get().is_none() {
             // (The tables first: zeroed, and the buffer of zeros.)
             let mut tables = Vec::new();
@@ -4737,7 +4742,7 @@ fn scatter_bench() -> Result<String, String> {
         };
         let period = c.limits.timestamp_period as f64;
         let bits_at = 4 * (rdna::kernels::MARK_PAGE_BITS_AT as u64 + p0 / 32);
-        let names = ["an empty list", "pages without marks", "1 dword a page", "32 consecutive dwords a page", "32 dwords a page one in 32", "every dword", "copied whole", "filled", "driver memory filled", "2 of every 3 dwords", "every other dword", "2 of every 3 dwords, one page in 4"];
+        let names = ["an empty list", "pages without marks", "1 dword a page", "32 consecutive dwords a page", "32 dwords a page one in 32", "every dword", "copied whole", "filled", "driver memory filled", "2 of every 3 dwords", "every other dword", "2 of every 3 dwords, one page in 4", "31 of every 32 dwords", "two runs of 15 a line"];
         // (Host memory the driver allocated, for case 8.)
         let (drv, drv_mem, _) = c.host_buffer(bench_pages * PAGE, vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC)?;
         let pattern = |k: usize| -> [u32; 32] {
@@ -4758,6 +4763,8 @@ fn scatter_bench() -> Result<String, String> {
                     }
                 }
                 10 => m = [0x5555_5555; 32],
+                12 => m = [0x7FFF_FFFF; 32],
+                13 => m = [0x7FFF_7FFF; 32],
                 _ => {}
             }
             m
@@ -4815,6 +4822,8 @@ fn scatter_bench() -> Result<String, String> {
                     9 => bench_pages * 683 * 4,
                     10 => bench_pages * 512 * 4,
                     11 => bench_pages / 4 * 683 * 4,
+                    12 => bench_pages * 992 * 4,
+                    13 => bench_pages * 960 * 4,
                     _ => 0,
                 };
                 if stored >= 1 << 20 {

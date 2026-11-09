@@ -544,10 +544,10 @@ pub fn mirror_scatter_same_skip() -> Vec<u32> {
     build_scatter(true, false, false, 2, false).expect("mirror scatter kernel (skipping unchanged pages)")
 }
 
-/// `mirror_scatter_reset` storing a page's partly marked 128-byte lines one
-/// dword per line in each store instruction (invocation l of a subgroup
-/// takes line l, the subgroups the line's dwords in turn), fully marked
-/// lines as before: a store instruction whose marked dwords leave holes in
+/// `mirror_scatter_reset` storing the dwords of 32-byte sectors whose marks
+/// form two runs or more one dword per line in each store instruction
+/// (invocation l of a subgroup takes line l, the subgroups the line's dwords
+/// in turn), sectors with one run (full ones too) as before: a store instruction whose marked dwords leave holes in
 /// one line runs ~100x slower into host memory on the RTX 4090 than one
 /// that writes single dwords of different lines (FINDINGS.md 2026-11-09:
 /// 2 of every 3 dwords marked 66 ms for 2,048 pages, 32 isolated dwords a
@@ -844,8 +844,27 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8, split: bool) ->
         store_ok
     };
     // Dwords lid + 256 r, r = 0..3: marked ones copied (`split`: those of
-    // fully marked lines only; the rest below).
-    let all_ones = c(&mut b, u32::MAX);
+    // lines whose marks form at most one run; the rest below).
+    // Whether the 32-byte sector `sec` (0-3) of a line's mask word holds
+    // two runs of marked dwords or more (a hole between marked ones): its
+    // run starts within the sector (bits set whose lower neighbour in the
+    // sector is clear) number two or more. Such sectors go out of one store
+    // instruction slowly; one run (a full sector too) fast.
+    let c_fe = c(&mut b, 0xFEFE_FEFE);
+    let c_ff = c(&mut b, 0xFF);
+    let c2b = c(&mut b, 2);
+    let c3b = c(&mut b, 3);
+    let multi = |b: &mut Builder, mw: Word, sec: Word| -> Result<Word, rspirv::dr::Error> {
+        let sh = b.shift_left_logical(u32t, None, mw, c1)?;
+        let shm = b.bitwise_and(u32t, None, sh, c_fe)?;
+        let nsh = b.not(u32t, None, shm)?;
+        let starts = b.bitwise_and(u32t, None, mw, nsh)?;
+        let s8 = b.shift_left_logical(u32t, None, sec, c3b)?;
+        let x = b.shift_right_logical(u32t, None, starts, s8)?;
+        let x = b.bitwise_and(u32t, None, x, c_ff)?;
+        let n = b.bit_count(u32t, None, x)?;
+        b.u_greater_than_equal(bool_, None, n, c2b)
+    };
     for r in 0..4u32 {
         let cr = b.constant_bit32(u32t, r * SCATTER_LOCAL_SIZE);
         let d = b.i_add(u32t, None, lid, cr)?;
@@ -856,8 +875,12 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8, split: bool) ->
         let set = b.i_not_equal(bool_, None, bit, c0)?;
         let go = b.logical_and(bool_, None, set, store_ok)?;
         let go = if split {
-            let full = b.i_equal(bool_, None, mw, all_ones)?;
-            b.logical_and(bool_, None, go, full)?
+            // (A dword of a sector with one run: as before, fast; of one
+            // with two or more: below.)
+            let sec = b.shift_right_logical(u32t, None, bit_of, c3b)?;
+            let m = multi(&mut b, mw, sec)?;
+            let single = b.logical_not(bool_, None, m)?;
+            b.logical_and(bool_, None, go, single)?
         } else {
             go
         };
@@ -890,10 +913,6 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8, split: bool) ->
         // lines.
         let line = bit_of;
         let mwl = mask_word(&mut b, line)?;
-        let nz = b.i_not_equal(bool_, None, mwl, c0)?;
-        let nf = b.i_not_equal(bool_, None, mwl, all_ones)?;
-        let partial = b.logical_and(bool_, None, nz, nf)?;
-        let partial = b.logical_and(bool_, None, partial, store_ok)?;
         let warp = b.shift_right_logical(u32t, None, lid, c5)?;
         let line32 = b.shift_left_logical(u32t, None, line, c5)?;
         for k in 0..4u32 {
@@ -902,7 +921,10 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8, split: bool) ->
             let sh = b.shift_right_logical(u32t, None, mwl, j)?;
             let bit = b.bitwise_and(u32t, None, sh, c1)?;
             let set = b.i_not_equal(bool_, None, bit, c0)?;
-            let go = b.logical_and(bool_, None, set, partial)?;
+            let sec = b.shift_right_logical(u32t, None, j, c3b)?;
+            let m = multi(&mut b, mwl, sec)?;
+            let go = b.logical_and(bool_, None, set, m)?;
+            let go = b.logical_and(bool_, None, go, store_ok)?;
             let (l_sp, l_spd) = (b.id(), b.id());
             b.selection_merge(l_spd, SelectionControl::NONE)?;
             b.branch_conditional(go, l_sp, l_spd, [])?;
