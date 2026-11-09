@@ -5298,7 +5298,10 @@ pub(super) const OP_PASS_ENDS: usize = 11;
 pub static SCATTER_SITES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// Front end 2's write-backs (`Exec::fe2_scatter`).
 const OP_FE2_SCATTERS: usize = 12;
-const OPS: usize = 13;
+/// GPU-performed CP writes of labels a command processor of ours waits on
+/// (`cp::cp_waited`; `seg_stamps` names their segments apart).
+const OP_CP_WRITES_WAITED: usize = 13;
+const OPS: usize = 14;
 
 fn ops_line(ops: &[u64; OPS]) -> String {
     let kib = |b: u64| b.div_ceil(1024);
@@ -7043,11 +7046,12 @@ static WB_SIZES: Mutex<([[u64; 4]; 7], [f64; 9])> = Mutex::new(([[0; 4]; 7], [0.
 
 /// What a segment without commands recorded (its operation counts' change).
 fn seg_kind(a: &[u64; OPS], b: &[u64; OPS]) -> &'static str {
-    const KINDS: [(usize, &str); 9] = [
+    const KINDS: [(usize, &str); 10] = [
         (OP_FE2_SCATTERS, "front end 2 write-backs"),
         (OP_MERGES, "shadow merges"),
         (OP_SHADOWS_IN, "shadow copies in"),
         (OP_TIMESTAMPS, "timestamps"),
+        (OP_CP_WRITES_WAITED, "CP writes waited"),
         (OP_CP_WRITES, "CP writes"),
         (OP_FILLS, "buffer fills"),
         (OP_FAST_CLEARS, "fast clears"),
@@ -7146,7 +7150,7 @@ fn collect_segments(pool: vk::QueryPool, shaders: &[u64], segs: &[SegMark], ops_
         let part = if cmds.is_empty() {
             match seg_kind(&w[0].2, &w[1].2) {
                 "front end 2 write-backs" => 1,
-                "CP writes" => 2,
+                "CP writes" | "CP writes waited" => 2,
                 "timestamps" => 3,
                 "barriers only" => 4,
                 _ => 5,
@@ -13366,6 +13370,7 @@ impl Exec {
         self.taint_resident(a, bytes);
         if end_of_pipe {
             self.ops[OP_CP_WRITES] += 1;
+            self.ops[OP_CP_WRITES_WAITED] += waited as u64;
             // An end-of-pipe write (RELEASE_MEM): after the work before it,
             // which it does not hold later work back for (as on the console);
             // later transfers wait for it. A wait on it in this batch orders
@@ -13392,6 +13397,7 @@ impl Exec {
             EOP_LIGHT[0].fetch_add(1, Ordering::Relaxed);
         } else if super::tune::skip_barriers() & 4 != 0 {
             self.ops[OP_CP_WRITES] += 1;
+            self.ops[OP_CP_WRITES_WAITED] += waited as u64;
             unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
             to_mirror(cmd);
         } else {
@@ -13412,6 +13418,7 @@ impl Exec {
             // Counted between its barriers (`seg_stamps` names the segment
             // by it).
             self.ops[OP_CP_WRITES] += 1;
+            self.ops[OP_CP_WRITES_WAITED] += waited as u64;
             unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
             to_mirror(cmd);
             if lazy {
