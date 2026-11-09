@@ -141,7 +141,21 @@ fn memo_raw(t: &Tsharp) -> [u32; 8] {
 
 /// A memo of T# lookups made with room for MEMO_CAP entries.
 fn memo_map<K, V>() -> HashMap<K, V> {
-    HashMap::with_capacity_and_hasher(MEMO_CAP, Default::default())
+    memo_map_of(MEMO_CAP)
+}
+
+fn memo_map_of<K, V>(cap: usize) -> HashMap<K, V> {
+    HashMap::with_capacity_and_hasher(cap, Default::default())
+}
+
+/// The per-thread memos' cap (`Tls::keys`, `Tls::views`): with the LOD
+/// statistics' fields out of their keys they hold a thread's live T#s;
+/// 4,096 and 65,536 measured level at the vista (FINDINGS.md 2026-11-09),
+/// this one a quarter of the latter's memory a thread.
+const TLS_MEMO_CAP: usize = 1 << 14;
+
+fn tls_cap() -> usize {
+    TLS_MEMO_CAP
 }
 
 /// Per-thread memos of the lookups every draw repeats (the recording
@@ -153,6 +167,8 @@ fn memo_map<K, V>() -> HashMap<K, V> {
 #[derive(Default)]
 struct Tls {
     lookup_gen: u64,
+    /// The cap `keys` and `views` were made with (`tls_cap`).
+    cap: usize,
     /// Resolved keys with the generations they hold for (GPU_IMAGES_GEN, the T#'s `base_gen`).
     keys: HashMap<([u32; 8], bool), (Option<ImageKey>, u64, u32)>,
     targets: HashMap<SurfaceKey, Target>,
@@ -168,7 +184,7 @@ struct Tls {
 pub static ANISO: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 thread_local! {
-    static TLS: std::cell::RefCell<Tls> = std::cell::RefCell::new(Tls { keys: memo_map(), views: memo_map(), ..Tls::default() });
+    static TLS: std::cell::RefCell<Tls> = std::cell::RefCell::new(Tls { cap: tls_cap(), keys: memo_map_of(tls_cap()), views: memo_map_of(tls_cap()), ..Tls::default() });
 }
 
 /// `f` on this thread's memos, those valid for one LOOKUP_GEN emptied if
@@ -4167,7 +4183,7 @@ impl Images {
         if let Some(&(k, g, b)) = self.key_memo.get(&(mk, storage)) {
             if g == gpu_gen && b == bgen {
                 tls(|m| {
-                    if m.keys.len() >= MEMO_CAP {
+                    if m.keys.len() >= m.cap {
                         m.keys.clear();
                     }
                     m.keys.insert((mk, storage), (k, g, b));
@@ -4181,7 +4197,7 @@ impl Images {
         }
         self.key_memo.insert((mk, storage), (k, gpu_gen, bgen));
         tls(|m| {
-            if m.keys.len() >= MEMO_CAP {
+            if m.keys.len() >= m.cap {
                 m.keys.clear();
             }
             m.keys.insert((mk, storage), (k, gpu_gen, bgen));
@@ -5371,7 +5387,7 @@ impl Images {
                 // that made the entry took this lock for each lookup (64% of
                 // view lookups missed their memo, run 20261012-073715).
                 tls(|tm| {
-                    if tm.views.len() >= MEMO_CAP {
+                    if tm.views.len() >= tm.cap {
                         tm.views.clear();
                     }
                     tm.views.insert(mk, ViewMemo { frame, ..m });
@@ -5392,7 +5408,7 @@ impl Images {
         }
         self.view_memo.insert(mk, m);
         tls(|tm| {
-            if tm.views.len() >= MEMO_CAP {
+            if tm.views.len() >= tm.cap {
                 tm.views.clear();
             }
             tm.views.insert(mk, m);

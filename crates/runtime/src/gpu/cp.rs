@@ -1325,6 +1325,9 @@ pub static EPOCH_GPU_WAITS: AtomicU64 = AtomicU64::new(0);
 pub static QUIET_WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 pub static MDI_DRAWS: AtomicU64 = AtomicU64::new(0);
 pub static MDI_COUNT_FROM_MEMORY: AtomicU64 = AtomicU64::new(0);
+/// Indexed indirect draws dropped: their arguments ran past the bound index
+/// buffer (`Cp::index_args_beyond`).
+pub static ARGS_BEYOND: AtomicU64 = AtomicU64::new(0);
 
 fn promises_on() -> bool {
     super::tune::promises()
@@ -4783,6 +4786,33 @@ impl Cp {
         crate::hle::libs::agc::instance_offset_slot(super::shaders::ngg_addr(self)).map_or(0, |s| GS_USER_DATA + s)
     }
 
+    /// Whether an indexed indirect draw's arguments (`first` index, `count`
+    /// indices) run past the bound index buffer (INDEX_BUFFER_SIZE, in
+    /// indices; 0: not set, not checked). No draw the title makes does: past
+    /// the buffer the hardware fetches index 0 (degenerate triangles at
+    /// best). Such records are words read before the title or the GPU wrote
+    /// them (0.7-3.2 billion indices with float bit patterns for counts and
+    /// base vertices, every time before a device loss of 2026-11-07 to
+    /// 11-09: FINDINGS.md 2026-11-09), and drawing them runs past the
+    /// driver's timeout; the draw is dropped instead (counted, the first 16
+    /// logged with their words).
+    fn index_args_beyond(&self, w: &[u32; 5]) -> bool {
+        if self.index_count == 0 || w[2] as u64 + w[0] as u64 <= self.index_count as u64 {
+            return false;
+        }
+        let n = ARGS_BEYOND.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            crate::warn!(
+                "gpu[{}]: indexed indirect draw dropped at packet {:#x}: arguments {w:?} run past its index buffer ({:#x}, {} indices)",
+                self.name,
+                self.cur_packet,
+                self.index_base,
+                self.index_count
+            );
+        }
+        true
+    }
+
     /// DRAW_INDIRECT_MULTI / DRAW_INDEX_INDIRECT_MULTI: draws described by
     /// consecutive argument records. gfx9+ layout (Mesa radeonsi and the Agc
     /// builders emit it): data offset; BASE_VTX_LOC; START_INST_LOC;
@@ -4829,6 +4859,9 @@ impl Cp {
             let w = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), if indexed { rd32(a + 16) } else { 0 }] };
             if capturing && subs.len() < 8 {
                 subs.push(format!("{:?}", &w[..rec as usize / 4]));
+            }
+            if indexed && self.index_args_beyond(&w) {
+                continue;
             }
             let (args, bv, si) = if indexed {
                 (super::exec::DrawArgs { count: w[0], instances: w[1], index: Some((self.index_base + w[2] as u64 * sz as u64, sz)), base_vertex: Some(w[3] as i32), first_instance: w[4], base_inst: None }, w[3], w[4])
@@ -5510,7 +5543,7 @@ impl Cp {
                                 indirect = Some(format!("args {w:?} locs {vtx_loc:#x}/{inst_loc:#x}"));
                             }
                             Some((super::exec::DrawArgs { count: w[0], instances: w[1], index: None, base_vertex: Some(w[2] as i32), first_instance: w[3], base_inst: None }, w[2], w[3]))
-                        } else if opcode == op::DRAW_INDEX_INDIRECT && valid(a, 20) {
+                        } else if opcode == op::DRAW_INDEX_INDIRECT && valid(a, 20) && !self.index_args_beyond(&unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), rd32(a + 16)] }) {
                             let w = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), rd32(a + 16)] };
                             if super::capture::capturing() {
                                 let ty = self.reg(Space::Uc, crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE) & 3;
