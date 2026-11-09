@@ -584,6 +584,8 @@ fn reap_spans() {
     reap_dead_spans();
     let t_spans = t.elapsed();
     reap_dead_images();
+    reap_dead_pipes();
+    maybe_evict_pipes();
     let t_images = t.elapsed();
     super::resident::maybe_unback();
     super::images::maybe_evict();
@@ -833,8 +835,160 @@ thread_local! {
 
 /// Compute pipelines by translation key; graphics pipelines by state hash.
 /// Pipelines are created outside these locks.
-static PIPES: Mutex<Option<HashMap<u64, Pipe>>> = Mutex::new(None);
-static GFX_PIPES: Mutex<Option<HashMap<u64, Pipe>>> = Mutex::new(None);
+static PIPES: Mutex<Option<HashMap<u64, PipeEntry>>> = Mutex::new(None);
+static GFX_PIPES: Mutex<Option<HashMap<u64, PipeEntry>>> = Mutex::new(None);
+
+/// A kept pipeline and the flip of its last use by a draw or dispatch (or
+/// of its creation): idle ones go once the maps hold more than the budget
+/// (`maybe_evict_pipes`).
+#[derive(Clone, Copy)]
+struct PipeEntry {
+    pipe: Pipe,
+    last: u32,
+}
+
+fn flip_now() -> u32 {
+    super::FRAMES.load(Ordering::Relaxed) as u32
+}
+
+/// Pipelines unused for this many flips may be evicted (~1-2 minutes).
+const PIPE_IDLE_FLIPS: u32 = 3600;
+
+/// How many pipelines stay alive before idle ones are evicted
+/// (`DS_PIPE_BUDGET`; default a quarter of the physical memory at the
+/// driver's host memory a pipeline: 2.65 MiB made from binaries, 0.47
+/// through cache files; FINDINGS.md 2026-11-09).
+fn pipe_budget() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        if let Some(n) = std::env::var("DS_PIPE_BUDGET").ok().and_then(|v| v.parse::<usize>().ok()) {
+            return n.max(64);
+        }
+        let mut st: windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        st.dwLength = std::mem::size_of::<windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX>() as u32;
+        let phys = if unsafe { windows_sys::Win32::System::SystemInformation::GlobalMemoryStatusEx(&mut st) } != 0 { st.ullTotalPhys } else { 16 << 30 };
+        let each: u64 = if ctx().pbin.is_some() { 2_780_000 } else { 500_000 };
+        ((phys / 4 / each) as usize).clamp(1500, 20_000)
+    })
+}
+
+/// Pipelines taken out of the maps, destroyed once no batch can name them:
+/// the generation is taken 10 s after (a thread that looked one up before
+/// it was taken out records it within its command), then every batch open
+/// at that generation must be submitted and complete (`reap_dead_pipes`).
+struct DeadPipe {
+    pipe: Pipe,
+    at: std::time::Instant,
+    generation: Option<u64>,
+    seq: Option<u64>,
+}
+
+static PIPE_GRAVE: Mutex<Vec<DeadPipe>> = Mutex::new(Vec::new());
+static PIPE_GRAVE_LEN: AtomicU64 = AtomicU64::new(0);
+/// [pipelines evicted, destroyed, eviction rounds, the most alive at once].
+static PIPE_EVICTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Evicts idle pipelines when more than the budget are alive (every 5 s at
+/// most; the completion thread).
+fn maybe_evict_pipes() {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut g = LAST.lock();
+        if g.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(5)) {
+            return;
+        }
+        *g = Some(std::time::Instant::now());
+    }
+    let live = PIPES.lock().as_ref().map_or(0, |m| m.len()) + GFX_PIPES.lock().as_ref().map_or(0, |m| m.len());
+    PIPE_EVICTS[3].fetch_max(live as u64, Ordering::Relaxed);
+    let budget = pipe_budget();
+    if live <= budget {
+        return;
+    }
+    let now = flip_now();
+    // The idle ones, the longest idle first; down to 90% of the budget,
+    // at most 1,000 a round.
+    let mut cands: Vec<(u32, bool, u64)> = Vec::new();
+    for (gfx, map) in [(false, &PIPES), (true, &GFX_PIPES)] {
+        if let Some(m) = map.lock().as_ref() {
+            cands.extend(m.iter().filter(|(_, e)| now.wrapping_sub(e.last) >= PIPE_IDLE_FLIPS).map(|(k, e)| (e.last, gfx, *k)));
+        }
+    }
+    if cands.is_empty() {
+        return;
+    }
+    cands.sort_unstable_by_key(|c| std::cmp::Reverse(now.wrapping_sub(c.0)));
+    let n = (live - budget * 9 / 10).min(cands.len()).min(1000);
+    let mut dead = Vec::with_capacity(n);
+    for &(_, gfx, k) in &cands[..n] {
+        let map = if gfx { &GFX_PIPES } else { &PIPES };
+        let mut g = map.lock();
+        let Some(m) = g.as_mut() else { continue };
+        // (Used since it was picked: kept.)
+        if m.get(&k).is_some_and(|e| now.wrapping_sub(e.last) >= PIPE_IDLE_FLIPS) {
+            if let Some(e) = m.remove(&k) {
+                dead.push(DeadPipe { pipe: e.pipe, at: std::time::Instant::now(), generation: None, seq: None });
+            }
+        }
+    }
+    PIPE_EVICTS[0].fetch_add(dead.len() as u64, Ordering::Relaxed);
+    PIPE_EVICTS[2].fetch_add(1, Ordering::Relaxed);
+    let mut g = PIPE_GRAVE.lock();
+    g.extend(dead);
+    PIPE_GRAVE_LEN.store(g.len() as u64, Ordering::Release);
+}
+
+fn reap_dead_pipes() {
+    if PIPE_GRAVE_LEN.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let oldest_open = EXEC_GENS.lock().iter().map(|g| g.load(Ordering::SeqCst)).min().unwrap_or(u64::MAX);
+    let next = NEXT_SEQ.load(Ordering::SeqCst);
+    let done = done_seq();
+    let free: Vec<Pipe> = {
+        let mut g = PIPE_GRAVE.lock();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < g.len() {
+            let d = &mut g[i];
+            if d.generation.is_none() && d.at.elapsed() >= std::time::Duration::from_secs(10) {
+                d.generation = Some(SPAN_GEN.fetch_add(1, Ordering::AcqRel) + 1);
+            }
+            if d.seq.is_none() && d.generation.is_some_and(|g0| oldest_open >= g0) {
+                d.seq = Some(next - 1);
+            }
+            if out.len() < 200 && d.seq.is_some_and(|s| done >= s) && !DEVICE_LOST.load(Ordering::Relaxed) {
+                out.push(g.swap_remove(i).pipe);
+            } else {
+                i += 1;
+            }
+        }
+        PIPE_GRAVE_LEN.store(g.len() as u64, Ordering::Release);
+        out
+    };
+    for p in &free {
+        unsafe {
+            let d = &ctx().device;
+            d.destroy_pipeline(p.pipeline, None);
+            d.destroy_pipeline_layout(p.layout, None);
+            d.destroy_descriptor_set_layout(p.set_layout, None);
+        }
+    }
+    PIPE_EVICTS[1].fetch_add(free.len() as u64, Ordering::Relaxed);
+}
+
+/// Status line part: pipelines alive, the budget, evicted and destroyed.
+pub(crate) fn pipe_evict_line() -> String {
+    let live = PIPES.lock().as_ref().map_or(0, |m| m.len()) + GFX_PIPES.lock().as_ref().map_or(0, |m| m.len());
+    format!(
+        "pipelines alive {live} (at most {} at once; budget {}), {} evicted idle in {} rounds, {} destroyed",
+        PIPE_EVICTS[3].load(Ordering::Relaxed).max(live as u64),
+        pipe_budget(),
+        PIPE_EVICTS[0].load(Ordering::Relaxed),
+        PIPE_EVICTS[2].load(Ordering::Relaxed),
+        PIPE_EVICTS[1].load(Ordering::Relaxed)
+    )
+}
 
 /// The LOD statistics copied into readback slot `slot` (call once the batch
 /// with its `Exec::lod_stats_copy` completed).
@@ -2290,7 +2444,10 @@ pub fn inflight_stats() -> (u64, u64, u64) {
 /// use noted, `pipeuse`).
 fn cached_compute_pipe(p: &Prepared) -> Option<Pipe> {
     let key = push_key(p.tr.key, push_fits(&[p]));
-    let r = PIPES.lock().as_ref().and_then(|m| m.get(&key)).copied();
+    let r = PIPES.lock().as_mut().and_then(|m| m.get_mut(&key)).map(|e| {
+        e.last = flip_now();
+        e.pipe
+    });
     if r.is_some() {
         super::pipeuse::note(key);
     }
@@ -2573,7 +2730,7 @@ fn compute_pipe_with(tr: &super::shaders::Translated, addr: u64, created: &std::
     let push_mode = push_fits_tr(tr);
     let key = push_key(tr.key, push_mode);
     if let Some(x) = PIPES.lock().as_ref().and_then(|m| m.get(&key)) {
-        return Ok(*x);
+        return Ok(x.pipe);
     }
     let (mine, flight) = {
         let mut g = PIPE_FLIGHTS.lock();
@@ -2608,7 +2765,7 @@ fn compute_pipe_with(tr: &super::shaders::Translated, addr: u64, created: &std::
     }
     // Stored meanwhile by a thread that finished just before this one
     // registered.
-    let stored = PIPES.lock().as_ref().and_then(|m| m.get(&key)).copied();
+    let stored = PIPES.lock().as_ref().and_then(|m| m.get(&key)).map(|e| e.pipe);
     // A panic must not leave the threads waiting for it blocked.
     let r = match stored {
         Some(x) => Ok(x),
@@ -2643,7 +2800,16 @@ fn compute_pipe_create(tr: &super::shaders::Translated, addr: u64, push_mode: bo
 
 /// Graphics pipeline cached under a state hash, if any.
 fn gfx_pipe(hkey: u64) -> Option<Pipe> {
-    GFX_PIPES.lock().as_ref().and_then(|m| m.get(&hkey)).copied()
+    GFX_PIPES.lock().as_ref().and_then(|m| m.get(&hkey)).map(|e| e.pipe)
+}
+
+/// A draw's graphics pipeline cached under a state hash, if any (its last
+/// use stamped: `maybe_evict_pipes`).
+fn gfx_pipe_use(hkey: u64) -> Option<Pipe> {
+    GFX_PIPES.lock().as_mut().and_then(|m| m.get_mut(&hkey)).map(|e| {
+        e.last = flip_now();
+        e.pipe
+    })
 }
 
 fn keep_gfx_pipe(hkey: u64, pipe: Pipe) -> Pipe {
@@ -2652,7 +2818,7 @@ fn keep_gfx_pipe(hkey: u64, pipe: Pipe) -> Pipe {
 
 /// Stores a newly created pipeline unless another queue stored one under
 /// the same key meanwhile (then the new one is destroyed unused).
-fn keep_pipe(map: &Mutex<Option<HashMap<u64, Pipe>>>, key: u64, pipe: Pipe) -> Pipe {
+fn keep_pipe(map: &Mutex<Option<HashMap<u64, PipeEntry>>>, key: u64, pipe: Pipe) -> Pipe {
     let mut g = map.lock();
     let m = g.get_or_insert_with(HashMap::new);
     if let Some(x) = m.get(&key) {
@@ -2662,9 +2828,9 @@ fn keep_pipe(map: &Mutex<Option<HashMap<u64, Pipe>>>, key: u64, pipe: Pipe) -> P
             d.destroy_pipeline_layout(pipe.layout, None);
             d.destroy_descriptor_set_layout(pipe.set_layout, None);
         }
-        return *x;
+        return x.pipe;
     }
-    m.insert(key, pipe);
+    m.insert(key, PipeEntry { pipe, last: flip_now() });
     pipe
 }
 

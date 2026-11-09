@@ -1646,7 +1646,7 @@ impl Exec {
                     });
                     super::push_key(h, push_mode)
                 };
-                let cached = gfx_pipe(hkey);
+                let cached = gfx_pipe_use(hkey);
                 let Pipe { pipeline, layout, set_layout, push } = match cached {
                     Some(x) => x,
                     None => {

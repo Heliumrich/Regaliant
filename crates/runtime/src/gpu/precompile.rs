@@ -1224,14 +1224,15 @@ pub fn status() -> String {
     let made = if super::tune::precompile() >= 2 {
         let l = super::exec::precompile_live();
         format!(
-            "{made}; kept alive (used in a recent session) {} compute, {} graphics; made for the store only {} compute, {} graphics; left to their first use (stored) {} compute, {} graphics; {}",
+            "{made}; kept alive (used in a recent session) {} compute, {} graphics; made for the store only {} compute, {} graphics; left to their first use (stored) {} compute, {} graphics; {}; {}",
             l[0],
             l[3],
             l[1],
             l[4],
             l[2],
             l[5],
-            super::pipeuse::line()
+            super::pipeuse::line(),
+            super::exec::pipe_evict_line()
         )
     } else {
         made
