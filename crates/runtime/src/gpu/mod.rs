@@ -30,7 +30,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 165] = [
+    static ALL: [Tunable; 164] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -193,7 +193,6 @@ pub mod tune {
         Tunable { name: "fe3_scan", env: "DS_FE3_SCAN", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "uncapped", env: "DS_UNCAPPED", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "cpw_lazy", env: "DS_CPW_LAZY", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "fe3_p1", env: "DS_FE3_P1", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "wb_probe", env: "DS_WB_PROBE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "wb_probe_site", env: "DS_WB_PROBE_SITE", default: 0, value: AtomicU64::new(UNSET) },
     ];
@@ -1664,20 +1663,6 @@ pub mod tune {
         get(161) != 0
     }
 
-    /// Front end 3's phase 1, its ring part (experiment, FRONTEND3.md): at
-    /// each title submission a helper takes each of the title's rings' spans
-    /// of pages written within the last 16 flips and stamps them clean at
-    /// the epoch read before the take (`fe2::p1_note_submission`).
-    pub fn fe3_p1() -> bool {
-        get(162) != 0
-    }
-
-    /// `fe3_p1`'s form: 1 whole spans, 2 the granules written lately
-    /// (`fe2::P1_GRANULES`).
-    pub fn fe3_p1_mode() -> u64 {
-        get(162)
-    }
-
     /// Diagnosis (live, exact: only GPU time and order added): after a
     /// write-back's barriers, one workgroup of a ballast kernel running
     /// this many steps of a dependent chain into a buffer of its own,
@@ -1685,7 +1670,7 @@ pub mod tune {
     /// time at write-backs' places in frames (FINDINGS.md 2026-10-31
     /// evening, 2026-11-09).
     pub fn wb_probe() -> u64 {
-        get(163)
+        get(162)
     }
 
     /// Where `wb_probe` adds its work: 0 after every write-back, 1 only at
@@ -1693,7 +1678,7 @@ pub mod tune {
     /// 2 only before their GPU-performed CP writes, 3 only at the workers'
     /// chunk batches' closes (`Exec::fe2_scatter_at`).
     pub fn wb_probe_site() -> u64 {
-        get(164)
+        get(163)
     }
 
     /// Pixel programs that write no memory run their depth and stencil
@@ -2612,9 +2597,6 @@ pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
     if tune::fe3_scan() != 0 && fe2::on() {
         fe3_probe::note_submission();
     }
-    if tune::fe3_p1() && fe2::on() {
-        fe2::p1_note_submission();
-    }
     // A frame replay holds the title at the start and end of the frame it
     // records.
     replay::hold();
@@ -2813,7 +2795,6 @@ pub fn start_profiler() {
 pub fn reset_profile() {
     cp::reset_classes();
     fe3_probe::reset();
-    fe2::p1_reset();
     if let Some(m) = PROFILE.lock().as_mut() {
         m.clear();
     }
@@ -2866,7 +2847,6 @@ pub fn profile_report() -> String {
     s.push_str(&images::tsharp_diff_line());
     s.push_str(&shaders::prep_memo_line());
     s.push_str(&fe3_probe::line(exec::profile_flips()));
-    s.push_str(&fe2::p1_line(exec::profile_flips()));
     s.push_str(&cp::wait_stats());
     s.push_str(&cp::classes_line());
     s.push_str(&cp::cb_census_line());
