@@ -370,6 +370,18 @@ const FIXES: &[Fix] = &[
         why: "the port counts the GPU arena's allocations by their call site (census)",
         only_with: Some("DS_ALLOC_CENSUS"),
     },
+    // The heaps' allocate's one epilogue (eboot+0x802c2a, `mov rax,rbx; add
+    // rsp,28h`, a branch target: rbx the block or 0, r12 the heap or the
+    // heap + 0x20, [rbp-0x40] the size asked for, rbp its frame).
+    Fix {
+        name: "engine map (heap census)",
+        offset: 0x802c2a,
+        from: &[0x48, 0x89, 0xd8, 0x48, 0x83, 0xc4, 0x28],
+        change: Change::Hook { at: 0, handler: crate::engine::heap_census_hook },
+        kind: "engine map (read only)",
+        why: "the port counts the engine heaps' blocks by their call site (census)",
+        only_with: Some("DS_HEAP_CENSUS"),
+    },
 ];
 
 /// Whether the fix of this name was applied.

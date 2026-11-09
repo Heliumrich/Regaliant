@@ -1048,6 +1048,7 @@ pub fn reset() {
     *UP_BY_REC.lock() = None;
     *UP_BY_PROG.lock() = None;
     alloc_census_reset();
+    heap_census_reset();
     let f = crate::gpu::FRAMES.load(Ordering::Relaxed);
     CENSUS_FLIP0.store(if census_on() { f + 1 } else { 0 }, Ordering::Relaxed);
     STATS_FLIP0.store(f, Ordering::Relaxed);
@@ -1055,7 +1056,7 @@ pub fn reset() {
 
 /// `engine report` (control): the census and the bounds' line.
 pub fn report() -> String {
-    census_line() + &bound_line() + &scan_line() + &crate::gpu::fe2::hot_by_owner(2) + &crate::gpu::fe2::hot_by_owner(16) + &alloc_census_lines()
+    census_line() + &bound_line() + &scan_line() + &crate::gpu::fe2::hot_by_owner(2) + &crate::gpu::fe2::hot_by_owner(16) + &alloc_census_lines() + &heap_census_lines()
 }
 
 /// The allocation table's and the bounds' status line (per flip).
@@ -1234,6 +1235,163 @@ fn alloc_census_lines() -> String {
 /// `engine reset`: the census's totals start again (the log stays).
 fn alloc_census_reset() {
     if let Some(c) = ALLOC_CENSUS.lock().as_mut() {
+        for t in c.totals.iter_mut() {
+            *t = [0; 2];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Census of the engine heaps' blocks by the code that asks for them
+// (`DS_HEAP_CENSUS=1`; FRONTEND3.md: front end 3 needs the CPU-type heap's
+// per-frame writers). A title-fix hook at the heaps' allocate's one
+// epilogue (eboot+0x802c2a, the heaps' vtable eboot+0x25ad1e0 +0xa8: rbx the
+// block or 0, r12 the heap or the heap + 0x20, [rbp-0x40] the size asked
+// for, rbp its frame) records each block by four return addresses up the
+// frame chain (the engine's generic allocation wrapper serves only a small
+// heap: 0.8 MiB live). Heap blocks live long, so every block made since the start is kept
+// (one made over others replaces them); the engine report attributes each
+// heap page with a CPU write found within 2 flips to the block holding it.
+// ---------------------------------------------------------------------------
+
+/// The heaps' vtable (module offset).
+const HEAP_VTABLE: u64 = 0x25ad1e0;
+
+pub fn heap_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_HEAP_CENSUS").ok().as_deref() == Some("1"))
+}
+
+/// Blocks by start: (end, site); call sites interned ([4]: the allocator's
+/// ID byte); per site [blocks, bytes] since the last `reset`.
+struct HeapCensus {
+    live: std::collections::BTreeMap<u64, (u64, u32)>,
+    ids: std::collections::HashMap<[u64; 5], u32>,
+    sites: Vec<[u64; 5]>,
+    totals: Vec<[u64; 2]>,
+    owners: Vec<u8>,
+}
+static HEAP_CENSUS: parking_lot::Mutex<Option<HeapCensus>> = parking_lot::Mutex::new(None);
+
+/// The hook at the heaps' allocate's epilogue (eboot+0x802c2a).
+pub extern "sysv64" fn heap_census_hook(regs: *const u64, _arg: u32) {
+    let r = |i: usize| unsafe { *regs.add(i) };
+    let (start, r12, rbp) = (r(3), r(12), r(5));
+    let base = BASE.load(Ordering::Relaxed);
+    if start == 0 || base == 0 {
+        return;
+    }
+    let this = if rd64(r12) == Some(base + HEAP_VTABLE) {
+        r12
+    } else if rd64(r12.wrapping_sub(0x20)) == Some(base + HEAP_VTABLE) {
+        r12 - 0x20
+    } else {
+        return;
+    };
+    let size = rd64(rbp - 0x40).unwrap_or(0);
+    if size == 0 || size > 1 << 32 {
+        return;
+    }
+    let mut key = [0u64; 5];
+    key[4] = rd64(this + 0x30).map_or(0, |v| v & 0xff);
+    let mut f = rbp;
+    for k in key[..4].iter_mut() {
+        *k = rd64(f + 8).unwrap_or(0);
+        f = match rd64(f) {
+            Some(n) if n > f => n,
+            _ => break,
+        };
+    }
+    let end = start + size;
+    let mut g = HEAP_CENSUS.lock();
+    let c = g.get_or_insert_with(|| HeapCensus { live: Default::default(), ids: Default::default(), sites: Vec::new(), totals: Vec::new(), owners: Vec::new() });
+    let id = match c.ids.get(&key) {
+        Some(&id) => id,
+        None => {
+            let id = c.sites.len() as u32;
+            c.ids.insert(key, id);
+            c.sites.push(key);
+            c.totals.push([0; 2]);
+            id
+        }
+    };
+    if !c.owners.contains(&(key[4] as u8)) {
+        c.owners.push(key[4] as u8);
+    }
+    c.totals[id as usize][0] += 1;
+    c.totals[id as usize][1] += size;
+    // (Blocks it overlaps were freed before.)
+    let gone: Vec<u64> = c.live.range(..end).rev().take_while(|(_, v)| v.0 > start).map(|(&s, _)| s).collect();
+    for s in gone {
+        c.live.remove(&s);
+    }
+    if c.live.len() >= 1 << 23 {
+        c.live.clear();
+    }
+    c.live.insert(start, (end, id));
+}
+
+/// The heap census's lines (`engine report`): per heap, its blocks a flip
+/// since the last reset and its pages with a CPU write found within the
+/// last 2 flips by the call site of the block holding them.
+fn heap_census_lines() -> String {
+    if !heap_census_on() {
+        return String::new();
+    }
+    let owners: Vec<u8> = HEAP_CENSUS.lock().as_ref().map(|c| c.owners.clone()).unwrap_or_default();
+    let flips = crate::gpu::FRAMES.load(Ordering::Relaxed).saturating_sub(STATS_FLIP0.load(Ordering::Relaxed)).max(1) as f64;
+    let mut out = String::new();
+    for owner in owners {
+        let hot = crate::gpu::fe2::hot_pages_of(owner, 2);
+        let g = HEAP_CENSUS.lock();
+        let Some(c) = g.as_ref() else { break };
+        let mut written = vec![0u64; c.sites.len()];
+        let mut live_bytes = vec![0u64; c.sites.len()];
+        let mut live_blocks = 0u64;
+        for (&s, &(e, site)) in c.live.iter() {
+            if c.sites[site as usize][4] as u8 == owner {
+                live_bytes[site as usize] += e - s;
+                live_blocks += 1;
+            }
+        }
+        let mut unattributed = 0u64;
+        for &p in &hot {
+            // (The block holding the page's first byte, else a block
+            // starting inside the page.)
+            let site = c.live.range(..=p).next_back().filter(|(_, v)| v.0 > p).map(|(_, v)| v.1).or_else(|| c.live.range(p..p + 4096).next().map(|(_, v)| v.1));
+            match site {
+                Some(s) => written[s as usize] += 1,
+                None => unattributed += 1,
+            }
+        }
+        let mine: Vec<usize> = (0..c.sites.len()).filter(|&i| c.sites[i][4] as u8 == owner).collect();
+        let site = |i: usize| c.sites[i][..4].iter().filter(|&&a| a != 0).map(|&a| eboot_off(a)).collect::<Vec<_>>().join(" <- ");
+        let (n, b): (u64, u64) = mine.iter().fold((0, 0), |x, &i| (x.0 + c.totals[i][0], x.1 + c.totals[i][1]));
+        let mut by_w: Vec<usize> = mine.iter().copied().filter(|&i| written[i] > 0).collect();
+        by_w.sort_by(|&a, &x| written[x].cmp(&written[a]));
+        let mut by_b: Vec<usize> = mine.clone();
+        by_b.sort_by(|&a, &x| c.totals[x][1].cmp(&c.totals[a][1]));
+        let fmt = |i: usize| format!("{}: {} pages written, {:.1} blocks and {:.3} MiB a flip, {:.2} MiB live", site(i), written[i], c.totals[i][0] as f64 / flips, c.totals[i][1] as f64 / flips / 1048576.0, live_bytes[i] as f64 / 1048576.0);
+        out += &format!(
+            "    engine heap census, heap {owner}: {} call sites, {:.1} blocks and {:.3} MiB a flip, {:.1} MiB live in {} blocks; {} pages with a CPU write within 2 flips ({} in no recorded block), {} sites hold them\n      by written pages: {}\n      by bytes a flip: {}\n",
+            mine.len(),
+            n as f64 / flips,
+            b as f64 / flips / 1048576.0,
+            live_bytes.iter().sum::<u64>() as f64 / 1048576.0,
+            live_blocks,
+            hot.len(),
+            unattributed,
+            by_w.len(),
+            by_w.iter().take(24).map(|&i| fmt(i)).collect::<Vec<_>>().join("; "),
+            by_b.iter().take(12).map(|&i| fmt(i)).collect::<Vec<_>>().join("; ")
+        );
+    }
+    out
+}
+
+/// `engine reset`: the heap census's totals start again (the blocks stay).
+fn heap_census_reset() {
+    if let Some(c) = HEAP_CENSUS.lock().as_mut() {
         for t in c.totals.iter_mut() {
             *t = [0; 2];
         }
