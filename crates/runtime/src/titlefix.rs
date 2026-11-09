@@ -391,8 +391,8 @@ const FIXES: &[Fix] = &[
         from: &[0xc7, 0x40, 0x30, 0x00, 0x00, 0x00, 0x00],
         change: Change::Hook { at: 0, handler: crate::engine::cb_init_hook },
         kind: "engine map (read only)",
-        why: "the port learns the command buffers' extents (front end 3's knowledge coherence)",
-        only_with: None,
+        why: "the port learns the command buffers' extents (the GPU arena's coherence census)",
+        only_with: Some("DS_KCO"),
     },
 ];
 
