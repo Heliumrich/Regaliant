@@ -1676,7 +1676,44 @@ fn audit_mirror(buf: vk::Buffer, ptr: *mut u8, round: u64, cpu: &dyn Fn(u64) -> 
                 let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
                 if unsafe { VirtualQuery(p as _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } != 0 { format!("{:#x}", mbi.Protect) } else { "?".into() }
             };
-            let map = format!("{map}; {}; protection {prot}, host armed {}", via.join(", "), crate::hosted::armed(p));
+            // The page's write marks in each family's written-bit map (a
+            // dword marked and not stored: a write-back that never ran over
+            // it; none marked: GPU writes that set no marks, or marks cleared
+            // without their stores).
+            let marks = {
+                let off = p - base;
+                let dword_at = off / 128;
+                let page = off / 4096;
+                let page_word_at = (rdna::kernels::MARK_PAGE_BITS_AT as u64 + page / 32) * 4;
+                let fams: Vec<(&str, Option<vk::Buffer>)> = vec![("main", super::resident::marks_for(false)), ("compute", super::resident::marks_for(true))];
+                let slot = |k: usize| ((2 * AUDIT_SPANS - 4 + k) * 4096) as u64;
+                let ok = super::resident::one_off_now(|cmd| unsafe {
+                    for (k, (_, mb)) in fams.iter().enumerate() {
+                        if let Some(mb) = mb {
+                            ctx().device.cmd_copy_buffer(cmd, *mb, buf, &[vk::BufferCopy { src_offset: dword_at, dst_offset: slot(k), size: 128 }, vk::BufferCopy { src_offset: page_word_at, dst_offset: slot(k) + 128, size: 4 }]);
+                        }
+                    }
+                })
+                .is_ok();
+                if ok {
+                    let first_dw = (at / 4) as usize;
+                    fams.iter()
+                        .enumerate()
+                        .filter(|(_, (_, mb))| mb.is_some())
+                        .map(|(k, (name, _))| {
+                            let bits = unsafe { std::slice::from_raw_parts(ptr.add(slot(k) as usize), 128) };
+                            let n: u32 = bits.iter().map(|b| b.count_ones()).sum();
+                            let first = bits[first_dw / 8] >> (first_dw % 8) & 1;
+                            let pw = unsafe { std::ptr::read_unaligned(ptr.add(slot(k) as usize + 128) as *const u32) };
+                            format!("{name} marks {n} dwords (the first differing one {first}), page bit {}", pw >> (page % 32) & 1)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    "marks unread".to_string()
+                }
+            };
+            let map = format!("{map}; {}; protection {prot}, host armed {}; {marks}", via.join(", "), crate::hosted::armed(p));
             crate::warn!(
                 "gpu: import audit: front end 2's mirror holds page {p:#x} as current and {} but other than guest memory (flip {}): {} bytes differ, the first at +{at:#x} (mirror {:02x?}, guest {:02x?}); mapping {map}; {}; imports over it: {}",
                 if super::fe2::audit_gpu_page(p) { "GPU-written, unarmed" } else { "armed" },
