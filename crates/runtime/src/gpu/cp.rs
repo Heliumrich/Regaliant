@@ -6125,6 +6125,11 @@ impl Cp {
                 for i in 0..(bytes / 4).max(1) {
                     unsafe { wr32(if daic { dst } else { dst + 4 * i }, v) };
                 }
+                // (Front end 2: the mirror no longer holds what it changed, as
+                // `effect` says for the other forms.)
+                if super::fe2::on() {
+                    super::fe2::invalidate(dst, if daic { 4 } else { bytes });
+                }
                 cpw_note(&self.name, dst, if daic { 4 } else { bytes }, self.cur_packet, self.cur_opcode);
             }
         }
