@@ -1635,6 +1635,48 @@ fn audit_mirror(buf: vk::Buffer, ptr: *mut u8, round: u64, cpu: &dyn Fn(u64) -> 
                 None => "page table entry unread".to_string(),
             };
             let map = format!("{map}; {pt}");
+            // Each live import over the page read on the GPU (into the
+            // buffer's second half, past this round's pages): one that reads
+            // the mirror's bytes while the CPU reads others pins pages that
+            // are no longer the guest's (write-backs through it are lost).
+            let m_copy = m.to_vec();
+            let spans: Vec<(u64, u64, u64, vk::Buffer)> = spans_read().iter().filter(|s| s.start <= p && p < s.end).map(|s| (s.start, s.end, s.born, s.buffer)).take(AUDIT_SPANS).collect();
+            let via: Vec<String> = if super::resident::one_off_now(|cmd| unsafe {
+                for (j, sp) in spans.iter().enumerate() {
+                    let r = [vk::BufferCopy { src_offset: p - sp.0, dst_offset: ((AUDIT_SPANS + j) * 4096) as u64, size: 4096 }];
+                    ctx().device.cmd_copy_buffer(cmd, sp.3, buf, &r);
+                }
+            })
+            .is_ok()
+            {
+                let c_now = cpu(p).unwrap_or_default();
+                spans
+                    .iter()
+                    .enumerate()
+                    .map(|(j, sp)| {
+                        let g = unsafe { std::slice::from_raw_parts(ptr.add((AUDIT_SPANS + j) * 4096), 4096) };
+                        let what = if c_now.len() == 4096 && g == c_now.as_slice() {
+                            "as the CPU".to_string()
+                        } else if g == m_copy.as_slice() {
+                            "as the mirror (NOT the CPU's pages)".to_string()
+                        } else {
+                            format!("{} bytes other than the CPU", if c_now.len() == 4096 { (0..4096).filter(|&b| g[b] != c_now[b]).count() } else { 4096 })
+                        };
+                        format!("via {:#x}..{:#x} born {}: {what}", sp.0, sp.1, sp.2)
+                    })
+                    .collect()
+            } else {
+                vec!["imports unread".to_string()]
+            };
+            // The page's protection now and whether the host and front end 2
+            // hold it armed: an armed page that is writable passes CPU writes
+            // unseen.
+            let prot = {
+                use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+                let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                if unsafe { VirtualQuery(p as _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } != 0 { format!("{:#x}", mbi.Protect) } else { "?".into() }
+            };
+            let map = format!("{map}; {}; protection {prot}, host armed {}", via.join(", "), crate::hosted::armed(p));
             crate::warn!(
                 "gpu: import audit: front end 2's mirror holds page {p:#x} as current and {} but other than guest memory (flip {}): {} bytes differ, the first at +{at:#x} (mirror {:02x?}, guest {:02x?}); mapping {map}; {}; imports over it: {}",
                 if super::fe2::audit_gpu_page(p) { "GPU-written, unarmed" } else { "armed" },
