@@ -2593,6 +2593,7 @@ mod fe3_probe {
 }
 
 pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
+    crate::engine::on_submit();
     if buffers.is_empty() {
         return;
     }

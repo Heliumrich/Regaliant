@@ -449,6 +449,69 @@ pub fn arena_tags() -> Vec<(u32, u64, u64, Vec<(u64, u64)>)> {
     out
 }
 
+/// The engine's frame allocators (`TaggedFrameAllocator`) and their arenas,
+/// registered by a title-fix hook at their init (eboot+0x8114a0: rdi the
+/// allocator, rsi its arena).
+static FRAME_ALLOCS: parking_lot::Mutex<Vec<(u64, u64)>> = parking_lot::Mutex::new(Vec::new());
+
+/// The hook at a frame allocator's init (`titlefix`).
+pub extern "sysv64" fn frame_alloc_hook(regs: *const u64, _arg: u32) {
+    let (this, arena) = unsafe { (*regs.add(7), *regs.add(6)) };
+    let mut g = FRAME_ALLOCS.lock();
+    if !g.iter().any(|x| x.0 == this) {
+        g.push((this, arena));
+    }
+}
+
+/// The GPU arena's object once found (0: not yet).
+static GPU_ARENA: AtomicU64 = AtomicU64::new(0);
+/// Each frame allocator slot's cursor and chunk end at the last submission.
+static CURSORS: parking_lot::Mutex<Option<std::collections::HashMap<(u64, u32), (u64, u64)>>> = parking_lot::Mutex::new(None);
+/// At submissions, the GPU arena's frame allocators' cursors: [bytes advanced
+/// within a chunk, chunk switches, bytes left in the old chunks at a switch,
+/// submissions sampled].
+static ADV: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// A title submission is about to be handed to the GPU (`gpu::submit`, on the
+/// title's thread): the census samples the GPU arena's frame allocators'
+/// cursors (C2's measure: what the title wrote there since the last one).
+pub fn on_submit() {
+    if !census_on() {
+        return;
+    }
+    let mut arena = GPU_ARENA.load(Ordering::Relaxed);
+    if arena == 0 {
+        arena = allocators().into_iter().find(|a| a.pool == 1 && a.mtype == 2 && a.name == "Default TaggedArena").map_or(0, |a| a.ptr);
+        if arena == 0 {
+            return;
+        }
+        GPU_ARENA.store(arena, Ordering::Relaxed);
+    }
+    let fas: Vec<u64> = FRAME_ALLOCS.lock().iter().filter(|x| x.1 == arena).map(|x| x.0).collect();
+    let mut g = CURSORS.lock();
+    let m = g.get_or_insert_with(Default::default);
+    for fa in fas {
+        for slot in 0..21u32 {
+            let base = if slot < 20 { fa + 0xb8 + slot as u64 * 0x30 } else { fa + 0x478 };
+            let (Some(cur), Some(rem)) = (rd64(base), rd64(base + 8)) else { continue };
+            if cur == 0 {
+                continue;
+            }
+            let end = cur.saturating_add(rem);
+            if let Some(&(pc, pe)) = m.get(&(fa, slot)) {
+                if cur >= pc && cur <= pe {
+                    ADV[0].fetch_add(cur - pc, Ordering::Relaxed);
+                } else if cur != pc {
+                    ADV[1].fetch_add(1, Ordering::Relaxed);
+                    ADV[2].fetch_add(pe.saturating_sub(pc), Ordering::Relaxed);
+                }
+            }
+            m.insert((fa, slot), (cur, end));
+        }
+    }
+    ADV[3].fetch_add(1, Ordering::Relaxed);
+}
+
 /// For the status report.
 pub fn status() -> String {
     if BASE.load(Ordering::Relaxed) == 0 {
@@ -483,5 +546,21 @@ pub fn status() -> String {
     let tags: Vec<String> = arena_tags().iter().map(|(i, tag, n, runs)| format!("[{i}] tag {tag:#x}: {n} units in {} runs", runs.len())).collect();
     s += &format!("    engine GPU arena tags: {}
 ", tags.join(", "));
+    if census_on() {
+        let fas = FRAME_ALLOCS.lock().clone();
+        let arena = GPU_ARENA.load(Ordering::Relaxed);
+        let flips = crate::gpu::FRAMES.load(Ordering::Relaxed).max(1) as f64;
+        let a: Vec<u64> = ADV.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+        s += &format!(
+            "    engine frame allocators: {} registered ({} on the GPU arena); at {:.1} submissions a flip their cursors advanced {:.2} MiB a flip in place, {:.1} chunk switches a flip (old chunks' rests {:.2} MiB)
+",
+            fas.len(),
+            fas.iter().filter(|x| x.1 == arena).count(),
+            a[3] as f64 / flips,
+            a[0] as f64 / flips / 1048576.0,
+            a[1] as f64 / flips,
+            a[2] as f64 / flips / 1048576.0
+        );
+    }
     s + &census_line()
 }

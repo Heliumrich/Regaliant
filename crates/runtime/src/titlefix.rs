@@ -325,6 +325,17 @@ const FIXES: &[Fix] = &[
         why: "the port keeps and applies the PC settings the menu changes",
         only_with: None,
     },
+    // The engine's frame allocator init (eboot+0x8114a0, `TaggedFrameAllocator`
+    // with its arena: rdi, rsi): `mov byte ptr [rdi+8],1; lea rcx,[rdi+0C8h]`.
+    Fix {
+        name: "engine map (frame allocators)",
+        offset: 0x8114a0,
+        from: &[0xc6, 0x47, 0x08, 0x01, 0x48, 0x8d, 0x8f, 0xc8, 0x00, 0x00, 0x00],
+        change: Change::Hook { at: 0, handler: crate::engine::frame_alloc_hook },
+        kind: "engine map (read only)",
+        why: "the port reads the frame allocators' cursors (front end 4's arena spans)",
+        only_with: Some("DS_ENGINE_CENSUS"),
+    },
 ];
 
 /// `mov dword ptr [rcx+33Ch], -1` after counting the run (rax kept; the
