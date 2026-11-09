@@ -9235,6 +9235,9 @@ pub struct Exec {
     /// Mirror mode: the placement in progress binds an unbounded pointer
     /// (statistics, `mm_place_line`).
     mm_unsized: bool,
+    /// The binding being placed by front end 2 is unbounded (a base
+    /// pointer whose loads the translation cannot bound; census).
+    fe2_unsized: bool,
 }
 
 /// The most gather records a batch's output holds (mirror mode; 34 MB).
@@ -9927,6 +9930,7 @@ impl Exec {
                 pre_after: Vec::new(),
                 mm_cp: Vec::new(),
                 mm_unsized: false,
+                fe2_unsized: false,
                 eager_action: None,
                 batch_count: 0,
             })
@@ -11145,8 +11149,21 @@ impl Exec {
         }
         let t = std::time::Instant::now();
         let r = self.fe2_place_any(base, size, written);
+        let ns = t.elapsed().as_nanos() as u64;
         crate::engine::note_count(crate::engine::C_PLACE, base);
-        crate::engine::note_value(crate::engine::C_PLACE_NS, base, t.elapsed().as_nanos() as u64);
+        crate::engine::note_value(crate::engine::C_PLACE_NS, base, ns);
+        if written {
+            crate::engine::note_count(crate::engine::C_PLACE_W, base);
+            crate::engine::note_value(crate::engine::C_PLACE_W_NS, base, ns);
+        }
+        if self.past_grow {
+            crate::engine::note_count(crate::engine::C_PLACE_PAST, base);
+            crate::engine::note_value(crate::engine::C_PLACE_PAST_NS, base, ns);
+        }
+        if self.fe2_unsized {
+            crate::engine::note_count(crate::engine::C_PLACE_UNB, base);
+            crate::engine::note_value(crate::engine::C_PLACE_UNB_NS, base, ns);
+        }
         r
     }
 
@@ -14782,6 +14799,24 @@ impl Exec {
                             Some(n) => n,
                             None => mapping(base).map(|(_, e)| (e - base).min(UNBOUNDED_MAX)).unwrap_or(0),
                         };
+                        // An unbounded base pointer reads at most to the end of
+                        // the engine allocation it points into: the page
+                        // allocator's record holding it (`engine::record_extent`,
+                        // checked live), not 256 MiB (FINDINGS.md 2026-11-09
+                        // night: the vista x1.023, the swamp level).
+                        if !sized_by && size > 0 && super::tune::unb_bound() {
+                            use crate::engine as en;
+                            match en::record_extent(base) {
+                                Some(e) if e - base < size => {
+                                    en::unb_count(en::UNB_REC_BOUNDED, 1);
+                                    en::unb_count(en::UNB_REC_BEFORE, size);
+                                    en::unb_count(en::UNB_REC_AFTER, e - base);
+                                    size = e - base;
+                                }
+                                Some(_) => {}
+                                None => en::unb_count(en::UNB_LEFT, 1),
+                            }
+                        }
                         if size >= 16 << 20 && trace_large() {
                             note_large_binding(&self.name, p, i, base, size, sized_by);
                         }
@@ -14855,7 +14890,10 @@ impl Exec {
                                     crate::info!("gpu[{}]: front end 2: {:?} shader {:#x} writes {base:#x}+{size:#x}: {what}; atomic {}", self.name, p.stage, p.addr, found.tr.plan.resources[i].atomic);
                                 }
                             }
-                            self.fe2_place(base, size, found.tr.plan.resources[i].written)
+                            self.fe2_unsized = matches!(found.resources[i], Resolved::Global(_, None));
+                            let r = self.fe2_place(base, size, found.tr.plan.resources[i].written);
+                            self.fe2_unsized = false;
+                            r
                         } else if read_only && super::resident::enabled() {
                             self.resident_bind(base, size)
                         } else {

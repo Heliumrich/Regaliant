@@ -41,6 +41,7 @@ pub fn init(base: u64, image: &[u8]) {
     });
     if entry_ok && disp_ok && ref_ok {
         BASE.store(base, Ordering::Relaxed);
+        alloc_table_init();
         crate::info!("engine map: the page allocator's tracking pointer at eboot+{TRACKING_PTR:#x} (title version as expected)");
     } else {
         crate::warn!("engine map: the page allocator's code differs (entry {entry_ok}, table {disp_ok}, pointer {ref_ok}): off");
@@ -104,7 +105,17 @@ pub const C_HOLD_TW: usize = 7;
 /// of them on pages it holds as GPU-written.
 pub const C_ARM_FAULT: usize = 8;
 pub const C_ARM_FAULT_GPU: usize = 9;
-const C_KINDS: usize = 10;
+/// Of the placements: those of ranges bound for GPU writes, and those past
+/// a label wait (count and ns).
+pub const C_PLACE_W: usize = 10;
+pub const C_PLACE_W_NS: usize = 11;
+pub const C_PLACE_PAST: usize = 12;
+pub const C_PLACE_PAST_NS: usize = 13;
+/// Of the placements: unbounded bindings (base pointers whose loads the
+/// translation cannot bound: up to 256 MiB), count and ns.
+pub const C_PLACE_UNB: usize = 14;
+pub const C_PLACE_UNB_NS: usize = 15;
+const C_KINDS: usize = 16;
 static CENSUS: [[AtomicU64; C_KINDS]; 256] = [const { [const { AtomicU64::new(0) }; C_KINDS] }; 256];
 /// The flip the census started at (+1; 0: not started).
 static CENSUS_FLIP0: AtomicU64 = AtomicU64::new(0);
@@ -295,7 +306,8 @@ fn census_line() -> String {
         let name = names.get(&(id as u8)).cloned().unwrap_or_else(|| if id == 0 { "none".into() } else { "?".into() });
         let armf = if c[C_ARM_FAULT] > 0 { format!(", write faults on armed pages {:.2} ({:.2} on GPU-written ones)", c[C_ARM_FAULT] as f64 / flips, c[C_ARM_FAULT_GPU] as f64 / flips) } else { String::new() };
         let held = if c[C_HELD] + c[C_HOLD_TR] + c[C_HOLD_TW] > 0 { format!(", held {:.0} pages, the title faulted on them {:.2} reads / {:.2} writes", c[C_HELD] as f64 / flips, c[C_HOLD_TR] as f64 / flips, c[C_HOLD_TW] as f64 / flips) } else { String::new() };
-        rows.push((c[C_PLACE_NS], format!("{id} {name}: placements {:.0} ({:.2} ms), GPU-written {:.2} MiB, uploaded {:.2} MiB, read waits {:.2}{armf}{held}", c[C_PLACE] as f64 / flips, c[C_PLACE_NS] as f64 / flips / 1e6, c[C_GPU_WRITE] as f64 / flips / 1048576.0, c[C_UPLOAD] as f64 / flips / 1048576.0, c[C_READ_WAIT] as f64 / flips)));
+        let split = if c[C_PLACE_W] + c[C_PLACE_PAST] + c[C_PLACE_UNB] > 0 { format!(" (bound for GPU writes {:.0}, {:.2} ms; past label waits {:.0}, {:.2} ms; unbounded {:.0}, {:.2} ms)", c[C_PLACE_W] as f64 / flips, c[C_PLACE_W_NS] as f64 / flips / 1e6, c[C_PLACE_PAST] as f64 / flips, c[C_PLACE_PAST_NS] as f64 / flips / 1e6, c[C_PLACE_UNB] as f64 / flips, c[C_PLACE_UNB_NS] as f64 / flips / 1e6) } else { String::new() };
+        rows.push((c[C_PLACE_NS], format!("{id} {name}: placements {:.0} ({:.2} ms){split}, GPU-written {:.2} MiB, uploaded {:.2} MiB, read waits {:.2}{armf}{held}", c[C_PLACE] as f64 / flips, c[C_PLACE_NS] as f64 / flips / 1e6, c[C_GPU_WRITE] as f64 / flips / 1048576.0, c[C_UPLOAD] as f64 / flips / 1048576.0, c[C_READ_WAIT] as f64 / flips)));
     }
     rows.sort_by(|a, b| b.0.cmp(&a.0));
     // Uploads by allocation: how many allocations of each allocator take
@@ -522,9 +534,18 @@ static FRAME_ALLOCS: parking_lot::Mutex<Vec<(u64, u64)>> = parking_lot::Mutex::n
 /// The hook at a frame allocator's init (`titlefix`).
 pub extern "sysv64" fn frame_alloc_hook(regs: *const u64, _arg: u32) {
     let (this, arena) = unsafe { (*regs.add(7), *regs.add(6)) };
-    let mut g = FRAME_ALLOCS.lock();
-    if !g.iter().any(|x| x.0 == this) {
-        g.push((this, arena));
+    {
+        let mut g = FRAME_ALLOCS.lock();
+        if !g.iter().any(|x| x.0 == this) {
+            g.push((this, arena));
+        }
+    }
+    // The GPU arena (C2's allocation code compares allocators' arenas with
+    // it): its memory type (+0x18) GPU and its name the default tagged
+    // arena's.
+    if GPU_ARENA.load(Ordering::Relaxed) == 0 && arena != 0 && crate::mem::readable(arena + 0x18, 4) && unsafe { std::ptr::read_volatile((arena + 0x18) as *const u32) } == 2 && rd64(arena + 0x10).and_then(rdstr).as_deref() == Some("Default TaggedArena") {
+        GPU_ARENA.store(arena, Ordering::Release);
+        crate::info!("engine map: the GPU arena at {arena:#x} (a frame allocator's init)");
     }
 }
 
@@ -534,8 +555,10 @@ static GPU_ARENA: AtomicU64 = AtomicU64::new(0);
 static CURSORS: parking_lot::Mutex<Option<std::collections::HashMap<(u64, u32), (u64, u64)>>> = parking_lot::Mutex::new(None);
 /// At submissions, the GPU arena's frame allocators' cursors: [bytes advanced
 /// within a chunk, chunk switches, bytes left in the old chunks at a switch,
-/// submissions sampled].
-static ADV: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// submissions sampled, cursors past their MiB's high-water mark (the
+/// allocation table missed allocations), the largest such excess, cursors
+/// behind it, cursors compared].
+static ADV: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// A title submission is about to be handed to the GPU (`gpu::submit`, on the
 /// title's thread): the census samples the GPU arena's frame allocators'
@@ -563,6 +586,23 @@ pub fn on_submit() {
                 continue;
             }
             let end = cur.saturating_add(rem);
+            // The allocation table's completeness: the slot's cursor (the end
+            // of its last allocation) against the high-water mark of the MiB
+            // holding its last byte. The inserted code stores the mark before
+            // the allocator moves the cursor, so a cursor past it means
+            // allocations the code never saw.
+            {
+                let lm = (cur - 1) >> 20;
+                let hwm = alloc_entry(lm) & 0x1F_FFFF;
+                let off = cur - (lm << 20);
+                if off > hwm {
+                    ADV[4].fetch_add(1, Ordering::Relaxed);
+                    ADV[5].fetch_max(off - hwm, Ordering::Relaxed);
+                } else if off < hwm {
+                    ADV[6].fetch_add(1, Ordering::Relaxed);
+                }
+                ADV[7].fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(&(pc, pe)) = m.get(&(fa, slot)) {
                 if cur >= pc && cur <= pe {
                     ADV[0].fetch_add(cur - pc, Ordering::Relaxed);
@@ -626,6 +666,313 @@ pub fn status() -> String {
             a[1] as f64 / flips,
             a[2] as f64 / flips / 1048576.0
         );
+        s += &format!("    engine allocation table against the cursors: {} compared, {} past their MiB's high-water mark (largest by {:#x}), {} behind it
+", a[7], a[4], a[5], a[6]);
     }
-    s + &census_line()
+    s + &census_line() + &bound_line()
+}
+
+// ---------------------------------------------------------------------------
+// The GPU arena's allocation table (front end 4, docs/FRONTEND4.md). A frame
+// allocator carves its allocations in order from chunks of whole arena units
+// (1 MiB: the arena's granularity, its vtable +0xd0 returning the unit size
+// at +0x88), one chunk per thread slot, and a unit is reused only after its
+// tag was freed (eboot+0x7fe540: every release of the arena's units goes
+// through it). So per MiB of the arena, the allocations of one tag's
+// lifetime only grow, and the allocated bytes are known exactly (the
+// census checks the cursors against it at title submissions). Two uses were
+// priced on 2026-11-09 night and removed (TRIED.md): a memo of uploaded
+// ranges across uses (not exact: a binding's range is not what its shader
+// reads, and bytes inside a range were written after its first use), and
+// unbounded pointers bounded by their frame allocations' extent (the vista
+// level, the swamp x0.98: the graphics queue's uploads moved onto a compute
+// queue's chain). The table stays for the census and front end 3's scope.
+// ---------------------------------------------------------------------------
+
+/// Per MiB of the address space (index address >> 20): the GPU arena's
+/// frame allocations, (generation << 32) | high-water mark within the MiB
+/// (0..=1 MiB). Written by the code inserted into the frame allocator
+/// (`alloc_insert_code`) and the tag-free hook; 0: never allocated.
+static ALLOC: std::sync::atomic::AtomicPtr<u64> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Allocates the allocation table (`init`, before the title fixes).
+fn alloc_table_init() {
+    if !ALLOC.load(Ordering::Relaxed).is_null() {
+        return;
+    }
+    let layout = std::alloc::Layout::array::<u64>(MIB_ENTRIES as usize).expect("layout");
+    let p = unsafe { std::alloc::alloc_zeroed(layout) } as *mut u64;
+    if !p.is_null() {
+        ALLOC.store(p, Ordering::Release);
+    }
+}
+
+/// The table entry of MiB `m` (`ALLOC`).
+#[inline]
+fn alloc_entry(m: u64) -> u64 {
+    let t = ALLOC.load(Ordering::Relaxed);
+    if t.is_null() || m >= MIB_ENTRIES {
+        return 0;
+    }
+    unsafe { std::ptr::read_volatile(t.add(m as usize)) }
+}
+
+/// Code inserted before the frame allocator's `lea rcx,[rax+r12+7]`
+/// (eboot+0x8121b2, where an allocation is placed: rax its start, r12 its
+/// size, r15 the allocator; rcx, rdx and the flags are free there): for an
+/// allocator on the GPU arena, each MiB the allocation [rax, (rax + r12 + 7)
+/// & ~7) touches gets its high-water mark set to the allocation's end in
+/// it, and its generation advanced when the allocation starts below the
+/// mark (the MiB was reused). Plain stores: a MiB belongs to one chunk, one
+/// thread slot (the shared slot is locked).
+pub fn alloc_insert_code(_counter: u64) -> Vec<u8> {
+    use iced_x86::code_asm::*;
+    let table = ALLOC.load(Ordering::Relaxed) as u64;
+    if table == 0 {
+        crate::warn!("engine map: no allocation table; the arena's allocation code left out");
+        return Vec::new();
+    }
+    let arena_cell = &GPU_ARENA as *const AtomicU64 as u64;
+    let build = || -> Result<Vec<u8>, IcedError> {
+        let mut a = CodeAssembler::new(64)?;
+        let mut lp = a.create_label();
+        let mut out = a.create_label();
+        let mut same = a.create_label();
+        a.lea(rsp, ptr(rsp - 0x80))?; // System V red zone
+        for r in [rsi, rdi, r8, r9, r10, r11] {
+            a.push(r)?;
+        }
+        a.mov(rcx, qword_ptr(r15 + 0x88))?;
+        a.mov(rdx, arena_cell)?;
+        a.cmp(rcx, qword_ptr(rdx))?;
+        a.jne(out)?;
+        a.lea(rsi, ptr(rax + r12 + 7))?;
+        a.and(rsi, -8)?;
+        a.mov(rdi, rax)?;
+        a.mov(r8, table)?;
+        a.set_label(&mut lp)?;
+        a.cmp(rdi, rsi)?;
+        a.jae(out)?;
+        a.mov(rcx, rdi)?;
+        a.shr(rcx, 20)?;
+        a.cmp(rcx, MIB_ENTRIES as i32)?;
+        a.jae(out)?;
+        a.lea(r9, ptr(rcx + 1))?;
+        a.shl(r9, 20)?;
+        a.cmp(r9, rsi)?;
+        a.cmova(r9, rsi)?;
+        a.mov(r10, rdi)?;
+        a.and(r10, 0xFFFFF)?;
+        a.mov(rdx, qword_ptr(r8 + rcx * 8))?;
+        a.mov(r11, rdx)?;
+        a.and(r11, 0x1FFFFF)?;
+        a.shr(rdx, 32)?;
+        a.cmp(r10, r11)?;
+        a.jae(same)?;
+        a.inc(edx)?;
+        a.set_label(&mut same)?;
+        a.shl(rdx, 32)?;
+        a.mov(r11, rcx)?;
+        a.shl(r11, 20)?;
+        a.mov(r10, r9)?;
+        a.sub(r10, r11)?;
+        a.or(rdx, r10)?;
+        a.mov(qword_ptr(r8 + rcx * 8), rdx)?;
+        a.mov(rdi, r9)?;
+        a.jmp(lp)?;
+        a.set_label(&mut out)?;
+        for r in [r11, r10, r9, r8, rdi, rsi] {
+            a.pop(r)?;
+        }
+        a.lea(rsp, ptr(rsp + 0x80))?;
+        a.assemble(0)
+    };
+    match build() {
+        Ok(v) => v,
+        Err(e) => {
+            crate::warn!("engine map: the arena's allocation code: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// The GPU arena's tag being freed, its lock held (a title-fix hook at
+/// eboot+0x7fe5d4: r8 the arena, r12 the tag): every MiB of its units gets
+/// a new generation and no allocations.
+pub extern "sysv64" fn arena_free_hook(regs: *const u64, _arg: u32) {
+    let (arena, tag) = unsafe { (*regs.add(8), *regs.add(12)) };
+    if arena == 0 || arena != GPU_ARENA.load(Ordering::Relaxed) {
+        return;
+    }
+    let t = ALLOC.load(Ordering::Relaxed);
+    let (Some(unit), Some(mask)) = (rd64(arena + 0x88), rd64(arena + 0x728)) else { return };
+    if t.is_null() || !unit.is_power_of_two() || !(1 << 20..=1 << 26).contains(&unit) {
+        return;
+    }
+    let Some(i) = (0..64u64).find(|&i| mask >> i & 1 != 0 && rd64(arena + 0x528 + 8 * i) == Some(tag)) else { return };
+    ARENA_FREES[0].fetch_add(1, Ordering::Relaxed);
+    let head = arena + 0x518;
+    let mut g = rd64(head).unwrap_or(0);
+    let mut gn = 0;
+    let mut mibs = 0u64;
+    while g != head && g != 0 && gn < 64 {
+        gn += 1;
+        let used = g + 0x10;
+        let mut d = rd64(used).unwrap_or(0);
+        let mut dn = 0;
+        while d != used && d != 0 && dn < 64 {
+            dn += 1;
+            let (Some(base), Some(b0), Some(b1)) = (rd64(d + 0x10), rd64(d + 0x28 + 16 * i), rd64(d + 0x30 + 16 * i)) else { break };
+            for u in 0..120u64 {
+                if (if u < 64 { b0 >> u & 1 } else { b1 >> (u - 64) & 1 }) == 0 {
+                    continue;
+                }
+                let s = base + u * unit;
+                for m in (s >> 20)..((s + unit) >> 20) {
+                    if m < MIB_ENTRIES {
+                        let p = unsafe { t.add(m as usize) };
+                        let e = unsafe { std::ptr::read_volatile(p) };
+                        unsafe { std::ptr::write_volatile(p, ((e >> 32) + 1) << 32) };
+                        mibs += 1;
+                    }
+                }
+            }
+            d = rd64(d).unwrap_or(0);
+        }
+        g = rd64(g).unwrap_or(0);
+    }
+    ARENA_FREES[1].fetch_add(mibs, Ordering::Relaxed);
+}
+
+/// The page allocator's records by address (both pools): (start, end,
+/// record), sorted, and when they were read (`record_extent`).
+static RECS: parking_lot::RwLock<(Option<std::time::Instant>, Vec<(u64, u64, u64)>)> = parking_lot::RwLock::new((None, Vec::new()));
+/// Record lookups: [found and still linked, rebuilds, misses].
+static REC_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Reads the records anew (the pools' lists, as `allocators`).
+fn recs_rebuild() {
+    let Some(t) = tracking() else { return };
+    let mut v = Vec::new();
+    for head in [t, t + 0xa0] {
+        let Some(mut n) = rd64(head + 0x10) else { continue };
+        let mut steps = 0;
+        while n != head && n != 0 && steps < 50_000 {
+            steps += 1;
+            let rec = n - 0x20;
+            let (Some(size), Some(addr)) = (rd64(rec + 0x58), rd64(rec + 0x60)) else { break };
+            if size != 0 {
+                v.push((addr, addr.saturating_add(size), rec));
+            }
+            let Some(next) = rd64(n + 0x10) else { break };
+            n = next;
+        }
+    }
+    v.sort_unstable();
+    REC_STATS[1].fetch_add(1, Ordering::Relaxed);
+    *RECS.write() = (Some(std::time::Instant::now()), v);
+}
+
+/// Whether record `rec` still describes [start, end) and is linked in its
+/// pool's list (a freed record is unlinked: its neighbours no longer point
+/// at it).
+fn rec_live(rec: u64, start: u64, end: u64) -> bool {
+    let node = rec + 0x20;
+    rd64(rec + 0x60) == Some(start)
+        && rd64(rec + 0x58) == Some(end - start)
+        && rd64(rec + 0x30).and_then(|next| rd64(next + 0x8)) == Some(node)
+        && rd64(rec + 0x28).and_then(|prev| rd64(prev + 0x10)) == Some(node)
+}
+
+/// The end of the page allocator's allocation containing `base` (a record of
+/// the engine's own tracking, checked live: its address, size and links);
+/// None outside every record. The records are read again when the one found
+/// no longer holds, or when an address an allocator owns (the MiB table) has
+/// none (at most every 50 ms).
+pub fn record_extent(base: u64) -> Option<u64> {
+    for attempt in 0..2 {
+        let found = {
+            let g = RECS.read();
+            let i = g.1.partition_point(|r| r.0 <= base);
+            (i > 0).then(|| g.1[i - 1]).filter(|r| base < r.1)
+        };
+        match found {
+            Some((s, e, rec)) if rec_live(rec, s, e) => {
+                REC_STATS[0].fetch_add(1, Ordering::Relaxed);
+                return Some(e);
+            }
+            _ if attempt == 0 && (found.is_some() || owner(base) != 0) && RECS.read().0.is_none_or(|t| t.elapsed().as_millis() >= 50) => recs_rebuild(),
+            _ => break,
+        }
+    }
+    REC_STATS[2].fetch_add(1, Ordering::Relaxed);
+    None
+}
+
+/// The tag-free hook's counts: the GPU arena's tag frees and their MiBs.
+static ARENA_FREES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Unbounded bindings (base pointers whose loads the translation cannot
+/// bound) bounded by the page allocator's records (`Exec`'s stage bindings,
+/// `tune unb_bound`): [bounded, their bytes before, after, left as they
+/// were].
+pub const UNB_REC_BOUNDED: usize = 0;
+pub const UNB_REC_BEFORE: usize = 1;
+pub const UNB_REC_AFTER: usize = 2;
+pub const UNB_LEFT: usize = 3;
+pub static UNB_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+#[inline]
+pub fn unb_count(i: usize, n: u64) {
+    UNB_STATS[i].fetch_add(n, Ordering::Relaxed);
+}
+
+/// The flip the counters below count from (`reset`).
+static STATS_FLIP0: AtomicU64 = AtomicU64::new(0);
+
+/// `engine reset` (control): the census and the counters start again (an
+/// in-run A/B's periods each get their own).
+pub fn reset() {
+    for row in CENSUS.iter() {
+        for x in row.iter() {
+            x.store(0, Ordering::Relaxed);
+        }
+    }
+    for x in UNB_STATS.iter().chain(ARENA_FREES.iter()).chain(REC_STATS.iter()) {
+        x.store(0, Ordering::Relaxed);
+    }
+    *BY_TAG.lock() = None;
+    *UP_BY_REC.lock() = None;
+    *UP_BY_PROG.lock() = None;
+    let f = crate::gpu::FRAMES.load(Ordering::Relaxed);
+    CENSUS_FLIP0.store(if census_on() { f + 1 } else { 0 }, Ordering::Relaxed);
+    STATS_FLIP0.store(f, Ordering::Relaxed);
+}
+
+/// `engine report` (control): the census and the bounds' line.
+pub fn report() -> String {
+    census_line() + &bound_line()
+}
+
+/// The allocation table's and the bounds' status line (per flip).
+pub fn bound_line() -> String {
+    let s: Vec<u64> = UNB_STATS.iter().chain(ARENA_FREES.iter()).map(|x| x.load(Ordering::Relaxed)).collect();
+    if s.iter().all(|&x| x == 0) {
+        return String::new();
+    }
+    let flips = crate::gpu::FRAMES.load(Ordering::Relaxed).saturating_sub(STATS_FLIP0.load(Ordering::Relaxed)).max(1) as f64;
+    let nr = s[UNB_REC_BOUNDED].max(1) as f64;
+    let r: Vec<u64> = REC_STATS.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+    format!(
+        "    engine allocations: unbounded bindings a flip bounded by the page allocator's records {:.1} (on average {:.1} MiB -> {:.2} MiB), left {:.1}; record lookups {} found, {} rebuilds, {} misses; the arena's tag frees {:.1} a flip ({:.1} MiB)\n",
+        s[UNB_REC_BOUNDED] as f64 / flips,
+        s[UNB_REC_BEFORE] as f64 / nr / 1048576.0,
+        s[UNB_REC_AFTER] as f64 / nr / 1048576.0,
+        s[UNB_LEFT] as f64 / flips,
+        r[0],
+        r[1],
+        r[2],
+        s[4] as f64 / flips,
+        s[5] as f64 / flips,
+    )
 }

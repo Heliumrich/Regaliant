@@ -333,10 +333,37 @@ const FIXES: &[Fix] = &[
         from: &[0xc6, 0x47, 0x08, 0x01, 0x48, 0x8d, 0x8f, 0xc8, 0x00, 0x00, 0x00],
         change: Change::Hook { at: 0, handler: crate::engine::frame_alloc_hook },
         kind: "engine map (read only)",
-        why: "the port reads the frame allocators' cursors (front end 4's arena spans)",
-        only_with: Some("DS_ENGINE_CENSUS"),
+        why: "the port learns the frame allocators and the GPU arena (front end 4)",
+        only_with: None,
+    },
+    // The frame allocator's placement of an allocation (eboot+0x8121b2,
+    // `lea rcx,[rax+r12+7]`: rax the start, r12 the size, r15 the allocator).
+    Fix {
+        name: "engine map (arena allocations)",
+        offset: 0x8121b2,
+        from: &[0x4a, 0x8d, 0x4c, 0x20, 0x07],
+        change: Change::Insert { at: 0, code: crate::engine::alloc_insert_code },
+        kind: "engine map (read only)",
+        why: "the port records the GPU arena's allocations per MiB (front end 4's allocation table)",
+        only_with: None,
+    },
+    // The arena's tag free with its lock held (eboot+0x7fe5d4,
+    // `mov rax,[r8+728h]`: r8 the arena, r12 the tag).
+    Fix {
+        name: "engine map (arena tag frees)",
+        offset: 0x7fe5d4,
+        from: &[0x49, 0x8b, 0x80, 0x28, 0x07, 0x00, 0x00],
+        change: Change::Hook { at: 0, handler: crate::engine::arena_free_hook },
+        kind: "engine map (read only)",
+        why: "the port marks the GPU arena's freed units (front end 4's allocation table)",
+        only_with: None,
     },
 ];
+
+/// Whether the fix of this name was applied.
+pub fn applied(name: &str) -> bool {
+    FIXES.iter().position(|f| f.name == name).is_some_and(|i| APPLIED[i].load(Ordering::Relaxed))
+}
 
 /// `mov dword ptr [rcx+33Ch], -1` after counting the run (rax kept; the
 /// System V red zone below rsp skipped; the flags the counter changes are set
@@ -394,7 +421,8 @@ pub fn status() -> String {
     let runs: Vec<String> = FIXES
         .iter()
         .enumerate()
-        .filter(|(i, f)| APPLIED[*i].load(Ordering::Relaxed) && matches!(f.change, Change::Insert { .. }))
+        // (The engine map's inserted code keeps no count: `engine` reports it.)
+        .filter(|(i, f)| APPLIED[*i].load(Ordering::Relaxed) && matches!(f.change, Change::Insert { .. }) && !f.kind.starts_with("engine map"))
         .map(|(i, f)| format!("'{}' ran {} times", f.name, RUNS[i].load(Ordering::Relaxed)))
         .collect();
     let fixes = if runs.is_empty() { String::new() } else { format!("    title fixes: {}\n", runs.join(", ")) };

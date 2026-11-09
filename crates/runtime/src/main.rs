@@ -758,6 +758,21 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 exception::text_reset();
                 Ok(())
             }
+            "engine" => {
+                // `engine reset` restarts the engine census and front end 4's
+                // counters; `engine report` logs them (`engine`).
+                match parts.next() {
+                    Some("reset") => {
+                        engine::reset();
+                        Ok(())
+                    }
+                    Some("report") => {
+                        info!("engine report at flip {flip}:\n{}", engine::report());
+                        Ok(())
+                    }
+                    _ => Err("usage: engine reset|report".into()),
+                }
+            }
             "profile" => {
                 // `profile reset` restarts the DS_PROFILE_GPU sampling and
                 // dispatch timings; `profile report` logs them.
