@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Triggers not yet answered by a pass started after them.
 static PENDING: Mutex<u64> = Mutex::new(0);
+/// Pages found written 2 or more passes after their last allocation or
+/// write, since the last reset (`engine::late_writes_by_site`).
+static LATE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 static CV: Condvar = Condvar::new();
 
 /// [passes, triggers, runs taken, pages taken, written pages found, ns of
@@ -140,6 +143,13 @@ fn run() {
                             9..=32 => 4,
                             _ => 5,
                         }] += 1;
+                        // (Late writes, for their allocations' call sites.)
+                        if age >= 2 && age != u64::MAX {
+                            let mut l = LATE.lock();
+                            if l.len() < 1 << 20 {
+                                l.push(p);
+                            }
+                        }
                         ages.written.insert(p, pass);
                     }
                 } else {
@@ -195,7 +205,7 @@ pub fn status() -> String {
         100.0 * s[S_AGE + 4] as f64 / w,
         100.0 * s[S_AGE + 5] as f64 / w,
         crate::engine::cb_line()
-    )
+    ) + &crate::engine::late_writes_by_site(&LATE.lock())
 }
 
 /// Statistics start again (`profile reset`).
@@ -203,4 +213,5 @@ pub fn reset() {
     for x in STATS.iter() {
         x.store(0, Ordering::Relaxed);
     }
+    LATE.lock().clear();
 }

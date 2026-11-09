@@ -1237,6 +1237,44 @@ fn alloc_census_lines() -> String {
     )
 }
 
+/// The late-written arena pages (`gpu::kco`'s census: found written 2 or
+/// more passes after their last allocation or write) by the call site of the
+/// latest allocation holding them (`DS_ALLOC_CENSUS`'s log; "" without it).
+pub fn late_writes_by_site(pages: &[u64]) -> String {
+    if !alloc_census_on() || pages.is_empty() {
+        return String::new();
+    }
+    let g = ALLOC_CENSUS.lock();
+    let Some(c) = g.as_ref() else { return String::new() };
+    // page -> site of the latest allocation over it (oldest first).
+    let mut by_page: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+    for a in c.log.iter() {
+        let mut p = a.start & !4095;
+        while p < a.end {
+            by_page.insert(p, a.site);
+            p += 4096;
+        }
+    }
+    let mut n = vec![0u64; c.sites.len()];
+    let mut none = 0u64;
+    for p in pages {
+        match by_page.get(p) {
+            Some(&s) => n[s as usize] += 1,
+            None => none += 1,
+        }
+    }
+    let mut order: Vec<usize> = (0..n.len()).filter(|&i| n[i] > 0).collect();
+    order.sort_by(|&a, &b| n[b].cmp(&n[a]));
+    let site = |i: usize| format!("[frame allocator {:#x}] {}", c.sites[i][4], c.sites[i][..4].iter().filter(|&&a| a != 0).map(|&a| eboot_off(a)).collect::<Vec<_>>().join(" <- "));
+    format!(
+        "    arena late writes by call site: {} pages ({} in no logged allocation), {} sites: {}\n",
+        pages.len(),
+        none,
+        order.len(),
+        order.iter().take(16).map(|&i| format!("{}: {}", site(i), n[i])).collect::<Vec<_>>().join("; ")
+    )
+}
+
 /// `engine reset`: the census's totals start again (the log stays).
 fn alloc_census_reset() {
     if let Some(c) = ALLOC_CENSUS.lock().as_mut() {
