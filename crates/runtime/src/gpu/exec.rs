@@ -2687,15 +2687,17 @@ pub(crate) fn precompile_live() -> [u64; 6] {
 }
 
 /// The precompile's compute pipeline: made and kept (`precompile_translation`)
-/// when a recent session used it (`pipeuse`); else, when the store has no
+/// when a recent session used it (`pipeuse`) and the job came with its
+/// shader object (`keep_ok`: not one queued at the session's start); else,
+/// when the store has no
 /// binaries (or cache data) for it, made through the store and let go (a
 /// first use then takes milliseconds, not a compile); else left to its first
 /// use. A pipeline costs the driver ~2.6 MiB of host memory while it lives
 /// (FINDINGS.md 2026-11-09): every learned spec kept alive made ~15,000 a
 /// boot, ~2,000 of them used.
-pub(crate) fn precompile_or_warm(tr: &super::shaders::Translated, addr: u64) -> Option<bool> {
+pub(crate) fn precompile_or_warm(tr: &super::shaders::Translated, addr: u64, keep_ok: bool) -> Option<bool> {
     let key = push_key(tr.key, push_fits_tr(tr));
-    if super::pipeuse::recent(key) {
+    if keep_ok && super::pipeuse::recent(key) {
         PRECOMPILE_LIVE[0].fetch_add(1, Ordering::Relaxed);
         return precompile_translation(tr, addr);
     }

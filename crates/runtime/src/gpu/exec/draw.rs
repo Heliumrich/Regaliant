@@ -602,7 +602,7 @@ pub(crate) struct GfxState {
 /// objects (`gpu::precompile`) with `state`, under the key its draws look
 /// up: Some(true) when created here, Some(false) when it existed or was in
 /// flight, None when creating it failed.
-pub(crate) fn precompile_gfx_translations(vs: StageTr, ps: Option<StageTr>, state: &GfxState) -> Option<bool> {
+pub(crate) fn precompile_gfx_translations(vs: StageTr, ps: Option<StageTr>, state: &GfxState, keep_ok: bool) -> Option<bool> {
     let key = GfxKey {
         vs: vs.0.key,
         ps: ps.map_or(0, |p| p.0.key),
@@ -622,7 +622,7 @@ pub(crate) fn precompile_gfx_translations(vs: StageTr, ps: Option<StageTr>, stat
     }
     // (Kept alive only when a recent session used it; else made through the
     // store and let go when the store lacks it: `precompile_or_warm`.)
-    if !super::super::pipeuse::recent(hkey) {
+    if !(keep_ok && super::super::pipeuse::recent(hkey)) {
         if crate::gpu::pcache::stored_cheap('g', hkey) {
             super::PRECOMPILE_LIVE[5].fetch_add(1, Ordering::Relaxed);
             return Some(false);

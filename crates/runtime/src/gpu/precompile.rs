@@ -552,8 +552,8 @@ fn worker() {
             loop {
                 if let Some(a) = q.fresh.pop_front() {
                     break (Some(a), None);
-                } else if let Some(std::cmp::Reverse((_, j))) = q.ready.pop() {
-                    break (None, Some(j));
+                } else if let Some(std::cmp::Reverse((r, j))) = q.ready.pop() {
+                    break (None, Some((r, j)));
                 }
                 CV.wait(&mut q);
             }
@@ -562,14 +562,16 @@ fn worker() {
             classify(a);
             continue;
         }
+        // (Jobs queued at the session's start make the store's binaries
+        // only: what an area needs alive comes with its objects, `pipeuse`.)
         match job {
             None => {}
-            Some(Job::Addr(a)) => {
+            Some((_, Job::Addr(a))) => {
                 run(a);
                 DONE[5].fetch_add(1, Ordering::Relaxed);
             }
-            Some(Job::Code(h)) => run_code(h),
-            Some(Job::Gfx(i)) => run_gfx(i),
+            Some((_, Job::Code(h))) => run_code(h),
+            Some((r, Job::Gfx(i))) => run_gfx(i, r & STARTUP == 0),
         }
         lower();
     }
@@ -648,7 +650,7 @@ fn classify(addr: u64) {
 
 /// Makes the learned graphics pipeline `i` from the programs of the
 /// objects created for its stages.
-fn run_gfx(i: usize) {
+fn run_gfx(i: usize, keep_ok: bool) {
     let Some(r) = gfx_learned(|g| g.recipes.get(i).map(|e| e.1.clone())) else { return };
     let (vs_addr, ps_addr) = {
         let m = HASH_ADDR.lock();
@@ -673,7 +675,7 @@ fn run_gfx(i: usize) {
             Some(p) if r.ps != 0 => Some((stage(r.ps, ps_addr, ps_spec(p, p.lod_measure))?, ps_addr)),
             _ => None,
         };
-        let made = super::exec::precompile_gfx_translations((&vs_tr, vs_addr), ps_tr.as_ref().map(|(t, a)| (&**t, *a)), &r.state);
+        let made = super::exec::precompile_gfx_translations((&vs_tr, vs_addr), ps_tr.as_ref().map(|(t, a)| (&**t, *a)), &r.state, keep_ok);
         if made == Some(true) && r.ps_seen.as_ref().is_some_and(|p| p.lod_measure) {
             GFX_DONE[4].fetch_add(1, Ordering::Relaxed);
         }
@@ -784,7 +786,7 @@ fn run(addr: u64) {
     }
     for spec in specs {
         let t = std::time::Instant::now();
-        let r = super::shaders::translate_for_spec(addr, spec).and_then(|tr| super::exec::precompile_or_warm(&tr, addr).ok_or_else(|| "pipeline creation failed".to_string()));
+        let r = super::shaders::translate_for_spec(addr, spec).and_then(|tr| super::exec::precompile_or_warm(&tr, addr, true).ok_or_else(|| "pipeline creation failed".to_string()));
         match r {
             Ok(true) => {
                 DONE[0].fetch_add(1, Ordering::Relaxed);
@@ -863,7 +865,7 @@ fn run_code(h: u64) {
             // its learned spec: `DS_CB_HASHES` / `DS_CB_SPEC` of the compile
             // bench.)
             let _g = super::vk::creating(|| format!("cs {h:#018x} learned spec {n}"));
-            let r = super::shaders::translate_code_for_spec(&code, h, spec).and_then(|tr| super::exec::precompile_or_warm(&tr, 0).ok_or_else(|| "pipeline creation failed".to_string()));
+            let r = super::shaders::translate_code_for_spec(&code, h, spec).and_then(|tr| super::exec::precompile_or_warm(&tr, 0, false).ok_or_else(|| "pipeline creation failed".to_string()));
             match r {
                 Ok(true) => {
                     DONE[0].fetch_add(1, Ordering::Relaxed);

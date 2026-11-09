@@ -10,7 +10,7 @@
 //! `push_key(translation key, push mode)`, graphics the pipeline-state
 //! hash), one per pipeline a session used, appended every 10 s by a
 //! background thread. A session's number is the file's highest plus one.
-//! "Recent": used in one of the last `DS_PIPE_RECENT` sessions (default 8).
+//! "Recent": used in one of the last `DS_PIPE_RECENT` sessions (default 16).
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -46,7 +46,7 @@ pub fn set_path(store: &std::path::Path) {
 }
 
 fn keep_sessions() -> u64 {
-    std::env::var("DS_PIPE_RECENT").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
+    std::env::var("DS_PIPE_RECENT").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
 }
 
 fn state() -> &'static State {
