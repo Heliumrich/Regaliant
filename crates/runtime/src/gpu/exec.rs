@@ -11550,6 +11550,7 @@ impl Exec {
                     for &(cx, ce) in &runs {
                         self.pre_copies.push((buf, mbuf, vk::BufferCopy { src_offset: cx - start, dst_offset: cx - MIRROR_BASE, size: ce - cx }));
                         super::fe2::upload_census(cx, ce);
+                        crate::engine::note_upload_prog(cx, ce - cx, self.sync_readers[0], self.sync_readers[1]);
                         match up.last_mut() {
                             Some(l) if l.1 == cx => l.1 = ce,
                             _ => up.push((cx, ce)),

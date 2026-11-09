@@ -180,6 +180,19 @@ fn note_upload_record(a: u64, n: u64) {
     e.2 += n;
 }
 
+/// Bytes uploaded by owner and the programs of the command whose placement
+/// uploaded them (census).
+static UP_BY_PROG: parking_lot::Mutex<Option<std::collections::HashMap<(u8, u64, u64), u64>>> = parking_lot::Mutex::new(None);
+
+/// Census: an upload of [a, a + n) for a command of programs `p0`, `p1`.
+pub fn note_upload_prog(a: u64, n: u64, p0: u64, p1: u64) {
+    if !census_on() || n == 0 {
+        return;
+    }
+    let id = owner(a);
+    *UP_BY_PROG.lock().get_or_insert_with(Default::default).entry((id, p0, p1)).or_insert(0) += n;
+}
+
 /// Counts one event of `kind` at `a`'s owner.
 pub fn note_count(kind: usize, a: u64) {
     note_value(kind, a, 1);
@@ -233,8 +246,20 @@ fn census_line() -> String {
     }
     let ups: Vec<String> = per_id.iter().map(|(id, (k, b))| format!("{id}: {k} allocations, {:.2} MiB", *b as f64 / flips / 1048576.0)).collect();
     let top: Vec<String> = recs.iter().take(16).map(|(start, (id, size, b))| format!("{start:#x}+{size:#x} (id {id}) {:.3} MiB", *b as f64 / flips / 1048576.0)).collect();
+    // Uploads by the programs whose placements made them, for the CPU-type
+    // heap, the arena and the GPU page allocator.
+    let mut progs: Vec<((u8, u64, u64), u64)> = UP_BY_PROG.lock().as_ref().map(|m| m.iter().map(|(k, v)| (*k, *v)).collect()).unwrap_or_default();
+    progs.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut by_prog = String::new();
+    for id in [4u8, 11u8, 9u8] {
+        let v: Vec<String> = progs.iter().filter(|x| x.0 .0 == id).take(10).map(|((_, p0, p1), b)| format!("{p0:#x}/{p1:#x} {:.3} MiB", *b as f64 / flips / 1048576.0)).collect();
+        if !v.is_empty() {
+            by_prog += &format!("    engine census: uploads a flip into {id} by the programs whose placement made them: {}\n", v.join(", "));
+        }
+    }
     format!("    engine census per flip over {flips:.0} flips, by owning allocator: {}\n", rows.into_iter().map(|r| r.1).collect::<Vec<_>>().join("; "))
         + &format!("    engine census: uploads a flip by allocation: {}; largest: {}\n", ups.join(", "), top.join(", "))
+        + &by_prog
 }
 
 /// MiB per owning allocator ID now, with each ID's lowest and highest
