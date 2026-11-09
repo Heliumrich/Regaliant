@@ -1576,12 +1576,22 @@ fn mark_dwords_once(tr: &mut T, r: usize, d0: Word, n: u32) -> R<()> {
 /// a partition by `w`; its lowest lane ORs the partition's bits into the
 /// word (and the next) and touches their pages as the other paths do.
 fn mark_partitioned(tr: &mut T, marks: Word, w: Word, m0: Word, m1: Word, n: u32) -> R<()> {
-    let (u, b) = (tr.t.u32, tr.t.bool_);
     tr.b.capability(spirv::Capability::GroupNonUniform);
     tr.b.capability(spirv::Capability::GroupNonUniformBallot);
     tr.b.capability(spirv::Capability::GroupNonUniformArithmetic);
     tr.b.capability(spirv::Capability::GroupNonUniformPartitionedEXT);
     tr.b.extension("SPV_NV_shader_subgroup_partitioned");
+    if tr.spec.part_twice {
+        // (Ballast: the same reduction and OR once more, the page left
+        // alone; the bits are set already, the map ends the same.)
+        mark_partitioned_or(tr, marks, w, m0, m1, n)?;
+    }
+    mark_part_lanes(tr, marks, w, m0, m1, n)
+}
+
+/// `mark_partitioned` without the page touch (`Spec::part_twice`).
+fn mark_partitioned_or(tr: &mut T, marks: Word, w: Word, m0: Word, m1: Word, n: u32) -> R<()> {
+    let (u, b) = (tr.t.u32, tr.t.bool_);
     let sg = tr.u(spirv::Scope::Subgroup as u32);
     let part = e(tr.b.group_non_uniform_partition_ext(tr.t.v4u, None, w))?;
     let or0 = e(tr.b.group_non_uniform_bitwise_or(u, None, sg, spirv::GroupOperation::PartitionedReduceEXT, m0, Some(part)))?;
@@ -1590,36 +1600,68 @@ fn mark_partitioned(tr: &mut T, marks: Word, w: Word, m0: Word, m1: Word, n: u32
     let me = tr.subgroup_lane()?;
     let is_lead = e(tr.b.i_equal(b, None, me, lead))?;
     tr.guarded(is_lead, &mut |tr| {
-        let (u, b) = (tr.t.u32, tr.t.bool_);
+        let u = tr.t.u32;
         let z = tr.u(0);
         let scope = tr.u(spirv::Scope::Device as u32);
         let sem = tr.u(0);
         let p0 = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, w]))?;
         e(tr.b.atomic_or(u, None, p0, scope, sem, or0))?;
-        touch_page(tr, marks, w)?;
         if let Some(o1) = or1 {
-            let any = e(tr.b.i_not_equal(b, None, o1, z))?;
-            tr.guarded(any, &mut |tr| {
-                let u = tr.t.u32;
-                let one = tr.u(1);
-                let w1 = e(tr.b.i_add(u, None, w, one))?;
-                let z = tr.u(0);
-                let p1 = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, w1]))?;
-                let scope = tr.u(spirv::Scope::Device as u32);
-                let sem = tr.u(0);
-                e(tr.b.atomic_or(u, None, p1, scope, sem, o1))?;
-                if !tr.spec.touch_test {
-                    return touch_page(tr, marks, w1);
-                }
-                // (`Spec::touch_test`: its page only when it is the next.)
-                let k31 = tr.u(31);
-                let lo = e(tr.b.bitwise_and(u, None, w, k31))?;
-                let next = e(tr.b.i_equal(tr.t.bool_, None, lo, k31))?;
-                tr.guarded(next, &mut |tr| touch_page(tr, marks, w1))
-            })?;
+            let one = tr.u(1);
+            let w1 = e(tr.b.i_add(u, None, w, one))?;
+            let p1 = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, w1]))?;
+            e(tr.b.atomic_or(u, None, p1, scope, sem, o1))?;
         }
         Ok(())
     })
+}
+
+/// The partitioned reduction over the active lanes by map word `w`, its
+/// lowest lane the leader (`mark_lead`).
+fn mark_part_lanes(tr: &mut T, marks: Word, w: Word, m0: Word, m1: Word, n: u32) -> R<()> {
+    let (u, b) = (tr.t.u32, tr.t.bool_);
+    let sg = tr.u(spirv::Scope::Subgroup as u32);
+    let part = e(tr.b.group_non_uniform_partition_ext(tr.t.v4u, None, w))?;
+    let or0 = e(tr.b.group_non_uniform_bitwise_or(u, None, sg, spirv::GroupOperation::PartitionedReduceEXT, m0, Some(part)))?;
+    let or1 = if n > 1 { Some(e(tr.b.group_non_uniform_bitwise_or(u, None, sg, spirv::GroupOperation::PartitionedReduceEXT, m1, Some(part)))?) } else { None };
+    let lead = e(tr.b.group_non_uniform_ballot_find_lsb(u, None, sg, part))?;
+    let me = tr.subgroup_lane()?;
+    let is_lead = e(tr.b.i_equal(b, None, me, lead))?;
+    tr.guarded(is_lead, &mut |tr| mark_lead(tr, marks, w, or0, or1))
+}
+
+/// The leader's part of a mark: the OR of the lanes' bits into map word
+/// `w` (and the next for `or1`), and the pages touched.
+fn mark_lead(tr: &mut T, marks: Word, w: Word, or0: Word, or1: Option<Word>) -> R<()> {
+    let (u, b) = (tr.t.u32, tr.t.bool_);
+    let z = tr.u(0);
+    let scope = tr.u(spirv::Scope::Device as u32);
+    let sem = tr.u(0);
+    let p0 = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, w]))?;
+    e(tr.b.atomic_or(u, None, p0, scope, sem, or0))?;
+    touch_page(tr, marks, w)?;
+    if let Some(o1) = or1 {
+        let any = e(tr.b.i_not_equal(b, None, o1, z))?;
+        tr.guarded(any, &mut |tr| {
+            let u = tr.t.u32;
+            let one = tr.u(1);
+            let w1 = e(tr.b.i_add(u, None, w, one))?;
+            let z = tr.u(0);
+            let p1 = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, w1]))?;
+            let scope = tr.u(spirv::Scope::Device as u32);
+            let sem = tr.u(0);
+            e(tr.b.atomic_or(u, None, p1, scope, sem, o1))?;
+            if !tr.spec.touch_test {
+                return touch_page(tr, marks, w1);
+            }
+            // (`Spec::touch_test`: its page only when it is the next.)
+            let k31 = tr.u(31);
+            let lo = e(tr.b.bitwise_and(u, None, w, k31))?;
+            let next = e(tr.b.i_equal(tr.t.bool_, None, lo, k31))?;
+            tr.guarded(next, &mut |tr| touch_page(tr, marks, w1))
+        })?;
+    }
+    Ok(())
 }
 
 /// After marking map word `w`: its page's touched bit, and on the page's
@@ -1644,11 +1686,16 @@ fn touch_page(tr: &mut T, marks: Word, w: Word) -> R<()> {
         // (`Spec::touch_test`: a bit found set was set in this batch, its
         // page listed by the store whose atomic found it clear; bits are
         // cleared only by the write-back, between barriers. A stale clear
-        // read only costs the atomic.)
-        let cur = e(tr.b.load(u, None, pp, None, []))?;
-        let set = e(tr.b.bitwise_and(u, None, cur, pb))?;
-        let clear = e(tr.b.i_equal(b, None, set, z))?;
-        return tr.guarded(clear, &mut |tr| touch_set(tr, marks, pp, page, pb));
+        // read only costs the atomic. `Spec::touch_twice`, ballast: the
+        // test twice, its loads volatile so neither is merged away.)
+        let access = tr.spec.touch_twice.then_some(spirv::MemoryAccess::VOLATILE);
+        for _ in 0..(1 + tr.spec.touch_twice as u32) {
+            let cur = e(tr.b.load(u, None, pp, access, []))?;
+            let set = e(tr.b.bitwise_and(u, None, cur, pb))?;
+            let clear = e(tr.b.i_equal(b, None, set, z))?;
+            tr.guarded(clear, &mut |tr| touch_set(tr, marks, pp, page, pb))?;
+        }
+        return Ok(());
     }
     touch_set(tr, marks, pp, page, pb)
 }

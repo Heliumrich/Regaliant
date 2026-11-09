@@ -400,6 +400,14 @@ pub struct Spec {
     /// is the same and only the marking's cost doubles: what it takes from
     /// live frames prices a leaner form.
     pub mark_twice: bool,
+    /// Exact ballast (diagnosis, the runtime's `tune tr_ballast` bit 2):
+    /// each store's page-touch test (`touch_test`: the load of the page's
+    /// touched bit and the branch on it) done twice, both loads volatile.
+    pub touch_twice: bool,
+    /// Exact ballast (diagnosis, `tune tr_ballast` bit 3): each store's
+    /// partitioned reduction and its leader's OR into the map done twice
+    /// (`marks_part`; not the page touch).
+    pub part_twice: bool,
     /// Exact ballast (diagnosis): two dependent loads of the SGPR data
     /// before the user SGPRs, whose loads then depend on them (zero offsets
     /// at run time): what fetching a stage's descriptors from memory at its
@@ -550,6 +558,13 @@ impl std::hash::Hash for Spec {
         if self.mark_twice {
             0x4D32_5458u32.hash(state);
         }
+        if self.touch_twice {
+            0x5454_5754u32.hash(state);
+        }
+        if self.part_twice {
+            0x5054_5754u32.hash(state);
+        }
+
         if self.dep_loads {
             0x4445_504Cu32.hash(state);
         }
@@ -4120,6 +4135,8 @@ mod tests {
             marks_untouched: false,
             touch_test: false,
             mark_twice: false,
+            touch_twice: false,
+            part_twice: false,
             dep_loads: false,
             marks_part: false,
             sgpr_ubo: 0,

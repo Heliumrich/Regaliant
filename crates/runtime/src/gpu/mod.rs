@@ -1616,7 +1616,9 @@ pub mod tune {
     /// its result unchanged): bit 0, every store's write marks done twice
     /// (`rdna::translate::Spec::mark_twice`); bit 1, two dependent loads
     /// before each stage's user SGPRs (`Spec::dep_loads`: descriptors fetched
-    /// by the shaders at their start). Read when a stage is prepared;
+    /// by the shaders at their start); bit 2, each store's page-touch test
+    /// twice (`Spec::touch_twice`); bit 3, each store's partitioned reduction
+    /// and map OR twice (`Spec::part_twice`). Read when a stage is prepared;
     /// an in-run A/B needs warm pipelines for both values.
     #[inline]
     pub fn tr_ballast() -> u64 {

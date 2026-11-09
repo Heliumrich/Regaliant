@@ -148,6 +148,8 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         marks_untouched: false,
         touch_test: std::env::var_os("RDNA_TOUCH_TEST").is_some(),
         mark_twice: false,
+        touch_twice: false,
+        part_twice: false,
         dep_loads: false,
         marks_part: false,
         // RDNA_SGPR_UBO=<n>: `Spec::sgpr_ubo` (validation).
