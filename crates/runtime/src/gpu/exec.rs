@@ -3034,6 +3034,24 @@ fn batch_miss_line() -> String {
     )
 }
 
+/// `tune cpw_lazy`: [barriers before CP writes left out, after them
+/// left open, recorded later for work touching an open one].
+static CPW_LAZY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Lazy CP-write barriers apply here (front end 2).
+fn cpw_lazy_here() -> bool {
+    super::tune::cpw_lazy() && super::fe2::on()
+}
+
+/// Status line of the lazy CP-write barriers ("" before any).
+pub(super) fn cpw_lazy_line() -> String {
+    let l: Vec<u64> = CPW_LAZY.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if l.iter().all(|&x| x == 0) {
+        return String::new();
+    }
+    format!("    GPU-performed CP writes' barriers (`tune cpw_lazy` {}): {} before left out, {} after left open, {} recorded later for work touching an open one\n", super::tune::cpw_lazy() as u8, l[0], l[1], l[2])
+}
+
 /// Records a command's descriptors: pushed into the command buffer (push
 /// descriptor layouts, `set` None) or its written set bound. `state`: what
 /// this bind point holds; `rebound`: a pipeline was bound for this command
@@ -8685,6 +8703,10 @@ pub struct Exec {
     /// they used the global data share, whether a rendering instance began
     /// (`TITLE_BARRIERS`).
     since_reads: Option<Vec<(u64, u64)>>,
+    /// GPU-performed CP writes recorded without the full barrier after them
+    /// (`tune cpw_lazy`): work recorded before the next full barrier that
+    /// touches one of these ranges records that barrier first.
+    cpw_open: Vec<(u64, u64)>,
     since_img_r: Vec<vk::Image>,
     since_img_w: Vec<vk::Image>,
     since_gds: bool,
@@ -9410,6 +9432,7 @@ impl Exec {
                 batch_c: false,
                 since_barrier: Some(Vec::new()),
                 since_reads: Some(Vec::new()),
+                cpw_open: Vec::new(),
                 since_img_r: Vec::new(),
                 since_img_w: Vec::new(),
                 since_gds: false,
@@ -11709,7 +11732,7 @@ impl Exec {
         }
         self.end_rendering();
         let cmd = self.cmd();
-        if !lazy_barriers() || self.barrier_wanted {
+        if !lazy_barriers() || self.barrier_wanted || self.cpw_overlaps(base, len) {
             self.barrier();
             self.barrier_wanted = false;
             self.dispatched = false;
@@ -12826,26 +12849,39 @@ impl Exec {
             unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
             to_mirror(cmd);
         } else {
+            // (`tune cpw_lazy`: the barrier before it only for the title's
+            // synchronization or this batch's writes of the range since the
+            // last one; the barrier after it left to later work that touches
+            // the range, `cpw_hazard`.)
+            let lazy = cpw_lazy_here();
+            let before = !lazy || self.barrier_wanted || self.written_since_barrier(a, bytes) || self.cpw_overlaps(a, bytes);
             // (Right after front end 2's write-back none: see above.)
             if after_scatter && !seg_stamps() {
                 EOP_LIGHT[3].fetch_add(1, Ordering::Relaxed);
-            } else {
+            } else if before {
                 self.barrier();
+            } else {
+                CPW_LAZY[0].fetch_add(1, Ordering::Relaxed);
             }
             // Counted between its barriers (`seg_stamps` names the segment
             // by it).
             self.ops[OP_CP_WRITES] += 1;
             unsafe { ctx().device.cmd_update_buffer(cmd, buffer, a - start, &raw) };
             to_mirror(cmd);
-            self.barrier();
-            self.barrier_wanted = false;
-            self.dispatched = false;
+            if lazy {
+                self.cpw_open.push((a, bytes));
+                CPW_LAZY[1].fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.barrier();
+                self.barrier_wanted = false;
+                self.dispatched = false;
+            }
         }
         self.note_write(a, bytes);
         if self.held && self.cp_written.len() < 4096 {
             self.cp_written.push((a, bytes));
         }
-        if full {
+        if full && !cpw_lazy_here() {
             // The barrier after it orders it before later work.
             self.ordered_since(a, bytes);
         }
@@ -12972,6 +13008,10 @@ impl Exec {
     fn resolve_timestamps(&mut self) {
         if self.ts_deferred.is_empty() {
             return;
+        }
+        // (Its stores into guest memory after a CP write left open.)
+        if !self.cpw_open.is_empty() {
+            self.end_rendering_then_barrier();
         }
         if super::vk::labels_on() {
             let l = format!("{} timestamp stores", self.name);
@@ -13472,6 +13512,7 @@ impl Exec {
     /// otherwise that order all earlier work before all later work (front
     /// end 2's write-back).
     fn barrier_noted(&mut self) {
+        self.cpw_open.clear();
         self.barrier_wanted = false;
         self.dispatched = false;
         self.args_read = false;
@@ -13596,6 +13637,25 @@ impl Exec {
                 v.pop();
             }
         }
+    }
+
+    /// Whether a GPU-performed CP write left open (no barrier since it,
+    /// `tune cpw_lazy`) overlaps [a, a + n).
+    fn cpw_overlaps(&self, a: u64, n: u64) -> bool {
+        self.cpw_open.iter().any(|&(w, m)| w < a + n && a < w + m)
+    }
+
+    /// Whether one of `ranges` touches a CP write left open: its barrier
+    /// comes first.
+    fn cpw_hazard<'r>(&self, mut ranges: impl Iterator<Item = &'r (u64, u64)>) -> bool {
+        if self.cpw_open.is_empty() {
+            return false;
+        }
+        let hit = ranges.any(|&(b, n)| self.cpw_overlaps(b, n));
+        if hit {
+            CPW_LAZY[2].fetch_add(1, Ordering::Relaxed);
+        }
+        hit
     }
 
     /// Whether this batch wrote into [a, a + n) since its last full barrier.
@@ -15384,6 +15444,12 @@ impl Exec {
                 unsafe { ctx().device.cmd_write_timestamp(stamp_cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, STAMPS * ti + k) };
             }
         };
+        if !self.cpw_open.is_empty() && cpw_lazy_here() {
+            let args = indirect.map(|a| (a, 12u64));
+            if self.cpw_hazard(bound.reads.iter().chain(writes_here.iter()).chain(args.iter())) {
+                self.barrier_wanted = true;
+            }
+        }
         if lazy_barriers() && self.barrier_wanted {
             if profiling() {
                 let class = if self.deferred { 3 } else if self.name == "gpu-acb0x50" { 2 } else if self.compute_cp { 1 } else { 0 };
@@ -15971,6 +16037,7 @@ pub fn status() -> String {
         + &super::compile::status()
         + &async_line()
         + &super::shaders::fmt_line()
+        + &cpw_lazy_line()
         + &xq_line()
         + &super::cp::past_wait_status()
         + &held_own_line()

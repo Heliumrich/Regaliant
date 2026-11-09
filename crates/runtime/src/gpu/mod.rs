@@ -30,7 +30,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 161] = [
+    static ALL: [Tunable; 162] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -192,6 +192,7 @@ pub mod tune {
         Tunable { name: "prep_memo", env: "DS_PREP_MEMO", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "fe3_scan", env: "DS_FE3_SCAN", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "uncapped", env: "DS_UNCAPPED", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "cpw_lazy", env: "DS_CPW_LAZY", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1646,6 +1647,18 @@ pub mod tune {
     #[inline]
     pub fn uncapped() -> bool {
         get(160) != 0
+    }
+
+    /// GPU-performed CP writes (WRITE_DATA) without the full barrier after
+    /// them (front end 2): a later command, fill, CP write or timestamp store
+    /// of the batch whose ranges overlap one records the barrier first; and
+    /// without the one before them unless the title's synchronization is
+    /// pending or the batch wrote the range since its last barrier (the
+    /// console's CP does not wait for earlier work at a WRITE_DATA either).
+    /// 0: a full barrier on both sides (as before 2026-11-09). Live.
+    #[inline]
+    pub fn cpw_lazy() -> bool {
+        get(161) != 0
     }
 
     /// Pixel programs that write no memory run their depth and stencil

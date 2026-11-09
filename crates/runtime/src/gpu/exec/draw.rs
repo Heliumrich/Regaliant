@@ -1086,7 +1086,7 @@ impl Exec {
     fn delta_holds(&self, at: Option<(u64, u64)>, keys: [u64; 2], sig: &[(u32, [u32; 8])], indexed: bool) -> Result<Fixed, usize> {
         let d = &self.delta;
         let Some(f) = d.fixed.filter(|_| self.draw_same && at == Some((self.batch_count, self.cmd_uses.get()))) else { return Err(0) };
-        if !self.recording || sync_mode() || super::super::tune::race_checks() || TINY_ANY.load(Ordering::Relaxed) {
+        if !self.recording || sync_mode() || super::super::tune::race_checks() || TINY_ANY.load(Ordering::Relaxed) || !self.cpw_open.is_empty() {
             return Err(1);
         }
         if d.keys != keys || d.index != indexed {
@@ -1775,6 +1775,19 @@ impl Exec {
             self.write_set(set, &bounds);
         }
         lap.mark(13);
+        // A CP write left open (`tune cpw_lazy`) that this draw's buffers or
+        // indices touch: its barrier first (ending the rendering instance).
+        if !self.cpw_open.is_empty() && super::cpw_lazy_here() {
+            let index = a.index.map(|(addr, size)| (addr, a.count as u64 * size as u64));
+            let hit = self.cpw_hazard(bounds.iter().flat_map(|b| b.reads.iter().chain(b.writes.iter())).chain(index.iter()));
+            if hit {
+                if self.rendering.is_some() {
+                    self.end_rendering();
+                } else {
+                    self.barrier();
+                }
+            }
+        }
         let t_bind = since(t0);
         // (A buffer-delta draw keeps the instance: the draw before it
         // neither sampled nor stored an attachment of it.)
