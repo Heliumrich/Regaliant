@@ -2916,14 +2916,15 @@ pub fn status_ex(with_stacks: bool) -> String {
         }
     }
     s.push_str(&format!(
-        "    gpu totals: {} submits, {} packets, {} draws ({} from {} multi-draw packets, {} of them with a GPU-written count; {} indexed indirect draws dropped, their arguments past the index buffer), {} dispatches, {} EOP interrupts, {} flips, {} label waits latched, {} passed on writes made after their submission, {} on counters past their value, {} passed on promises, {} CP reads waited for another queue\n",
+        "    gpu totals: {} submits, {} packets, {} draws ({} from {} multi-draw packets, {} of them with a GPU-written count; {} indexed indirect draws dropped, their arguments past the index buffer, {} drawn as they read later), {} dispatches, {} EOP interrupts, {} flips, {} label waits latched, {} passed on writes made after their submission, {} on counters past their value, {} passed on promises, {} CP reads waited for another queue\n",
         SUBMITS.load(Ordering::Relaxed),
         cp::PACKETS.load(Ordering::Relaxed),
         cp::DRAWS.load(Ordering::Relaxed),
         cp::MDI_DRAWS.load(Ordering::Relaxed),
         cp::MDI_PACKETS.load(Ordering::Relaxed),
         cp::MDI_COUNT_FROM_MEMORY.load(Ordering::Relaxed),
-        cp::ARGS_BEYOND.load(Ordering::Relaxed),
+        cp::ARGS_BEYOND[0].load(Ordering::Relaxed),
+        cp::ARGS_BEYOND[1].load(Ordering::Relaxed),
         cp::DISPATCHES.load(Ordering::Relaxed),
         cp::EOP_INTERRUPTS.load(Ordering::Relaxed),
         FRAMES.load(Ordering::Relaxed),

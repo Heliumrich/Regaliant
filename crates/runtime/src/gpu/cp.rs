@@ -1325,9 +1325,9 @@ pub static EPOCH_GPU_WAITS: AtomicU64 = AtomicU64::new(0);
 pub static QUIET_WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 pub static MDI_DRAWS: AtomicU64 = AtomicU64::new(0);
 pub static MDI_COUNT_FROM_MEMORY: AtomicU64 = AtomicU64::new(0);
-/// Indexed indirect draws dropped: their arguments ran past the bound index
-/// buffer (`Cp::index_args_beyond`).
-pub static ARGS_BEYOND: AtomicU64 = AtomicU64::new(0);
+/// Indexed indirect draws whose arguments ran past the bound index buffer
+/// (`Cp::checked_index_args`): [dropped, drawn as read again].
+pub static ARGS_BEYOND: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 fn promises_on() -> bool {
     super::tune::promises()
@@ -4790,27 +4790,55 @@ impl Cp {
     /// indices) run past the bound index buffer (INDEX_BUFFER_SIZE, in
     /// indices; 0: not set, not checked). No draw the title makes does: past
     /// the buffer the hardware fetches index 0 (degenerate triangles at
-    /// best). Such records are words read before the title or the GPU wrote
-    /// them (0.7-3.2 billion indices with float bit patterns for counts and
-    /// base vertices, every time before a device loss of 2026-11-07 to
-    /// 11-09: FINDINGS.md 2026-11-09), and drawing them runs past the
-    /// driver's timeout; the draw is dropped instead (counted, the first 16
-    /// logged with their words).
-    fn index_args_beyond(&self, w: &[u32; 5]) -> bool {
-        if self.index_count == 0 || w[2] as u64 + w[0] as u64 <= self.index_count as u64 {
-            return false;
+    /// best).
+    fn index_args_past(&self, w: &[u32; 5]) -> bool {
+        self.index_count != 0 && w[2] as u64 + w[0] as u64 > self.index_count as u64
+    }
+
+    /// An indexed indirect draw's record at `a` as read (`w`), checked: such
+    /// a record running past its index buffer (`index_args_past`) is words
+    /// read before the title or the GPU wrote them (0.7-3.2 billion indices
+    /// with float bit patterns for counts and base vertices, every time
+    /// before a device loss of 2026-11-07 to 11-09: FINDINGS.md 2026-11-09;
+    /// drawing them runs past the driver's timeout). It is read again for up
+    /// to 2 ms (the title's CPU filling it meanwhile: drawn as it then
+    /// reads), else the draw is dropped (None). Both counted, the first 16 of
+    /// each logged.
+    fn checked_index_args(&self, a: u64, w: [u32; 5]) -> Option<[u32; 5]> {
+        if !self.index_args_past(&w) {
+            return Some(w);
         }
-        let n = ARGS_BEYOND.fetch_add(1, Ordering::Relaxed);
+        let t0 = Instant::now();
+        let mut now = w;
+        while t0.elapsed() < std::time::Duration::from_millis(2) {
+            std::hint::spin_loop();
+            now = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), rd32(a + 16)] };
+            if !self.index_args_past(&now) {
+                let n = ARGS_BEYOND[1].fetch_add(1, Ordering::Relaxed);
+                if n < 16 {
+                    crate::warn!(
+                        "gpu[{}]: indexed indirect draw's arguments at {a:#x} (packet {:#x}) ran past its index buffer ({:#x}, {} indices) as {w:?} and read {now:?} after {} us: drawn so",
+                        self.name,
+                        self.cur_packet,
+                        self.index_base,
+                        self.index_count,
+                        t0.elapsed().as_micros()
+                    );
+                }
+                return Some(now);
+            }
+        }
+        let n = ARGS_BEYOND[0].fetch_add(1, Ordering::Relaxed);
         if n < 16 {
             crate::warn!(
-                "gpu[{}]: indexed indirect draw dropped at packet {:#x}: arguments {w:?} run past its index buffer ({:#x}, {} indices)",
+                "gpu[{}]: indexed indirect draw dropped at packet {:#x}: arguments at {a:#x} {w:?} (after 2 ms {now:?}) run past its index buffer ({:#x}, {} indices)",
                 self.name,
                 self.cur_packet,
                 self.index_base,
                 self.index_count
             );
         }
-        true
+        None
     }
 
     /// DRAW_INDIRECT_MULTI / DRAW_INDEX_INDIRECT_MULTI: draws described by
@@ -4860,9 +4888,14 @@ impl Cp {
             if capturing && subs.len() < 8 {
                 subs.push(format!("{:?}", &w[..rec as usize / 4]));
             }
-            if indexed && self.index_args_beyond(&w) {
-                continue;
-            }
+            let w = if indexed {
+                match self.checked_index_args(a, w) {
+                    Some(w) => w,
+                    None => continue,
+                }
+            } else {
+                w
+            };
             let (args, bv, si) = if indexed {
                 (super::exec::DrawArgs { count: w[0], instances: w[1], index: Some((self.index_base + w[2] as u64 * sz as u64, sz)), base_vertex: Some(w[3] as i32), first_instance: w[4], base_inst: None }, w[3], w[4])
             } else {
@@ -5543,8 +5576,7 @@ impl Cp {
                                 indirect = Some(format!("args {w:?} locs {vtx_loc:#x}/{inst_loc:#x}"));
                             }
                             Some((super::exec::DrawArgs { count: w[0], instances: w[1], index: None, base_vertex: Some(w[2] as i32), first_instance: w[3], base_inst: None }, w[2], w[3]))
-                        } else if opcode == op::DRAW_INDEX_INDIRECT && valid(a, 20) && !self.index_args_beyond(&unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), rd32(a + 16)] }) {
-                            let w = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), rd32(a + 16)] };
+                        } else if let Some(w) = (opcode == op::DRAW_INDEX_INDIRECT && valid(a, 20)).then(|| unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), rd32(a + 16)] }).and_then(|w| self.checked_index_args(a, w)) {
                             if super::capture::capturing() {
                                 let ty = self.reg(Space::Uc, crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE) & 3;
                                 indirect = Some(format!("args {w:?} locs {vtx_loc:#x}/{inst_loc:#x} index {:#x} type {ty} size {}{}", self.index_base, self.index_count, self.index_range(w[2], w[0])));
