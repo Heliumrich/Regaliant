@@ -1670,6 +1670,12 @@ pub mod tune {
         get(162) != 0
     }
 
+    /// `fe3_p1`'s form: 1 whole spans, 2 the granules written lately
+    /// (`fe2::P1_GRANULES`).
+    pub fn fe3_p1_mode() -> u64 {
+        get(162)
+    }
+
     /// Pixel programs that write no memory run their depth and stencil
     /// tests before the shader where the draw's state lets them (no kill,
     /// coverage or depth export, or no depth and stencil writes:

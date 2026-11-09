@@ -2207,6 +2207,15 @@ pub fn fe3_scan_dry2() -> [u64; 22] {
 /// them clean at the epoch read before the take: front end 2's checks of
 /// those ranges then pass by their stamps instead of taking them.
 static P1_SPANS: parking_lot::Mutex<Vec<(u64, u64)>> = parking_lot::Mutex::new(Vec::new());
+/// `tune fe3_p1 2`: the 1 MiB granules of the rings written within the
+/// last rounds (granule -> the round it was last found written in), taken
+/// with the granule after each (a ring's cursor moves on), instead of
+/// whole spans.
+static P1_GRANULES: parking_lot::Mutex<Option<std::collections::HashMap<u64, u64>>> = parking_lot::Mutex::new(None);
+/// Rounds a granule stays taken after its last write found.
+const P1_KEEP_ROUNDS: u64 = 8;
+/// Front end 2's takes and their ns at the profile's reset (`p1_line`).
+static P1_BASE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static P1_PENDING: parking_lot::Mutex<u64> = parking_lot::Mutex::new(0);
 static P1_CV: parking_lot::Condvar = parking_lot::Condvar::new();
 /// [rounds, submissions, spans taken, pages taken, written pages found, ns
@@ -2230,6 +2239,7 @@ fn p1_recompute() {
         g.vmas.values().filter(|v| v.name == "batch" && v.start >= MIRROR_BASE && v.end() <= MIRROR_END).map(|v| (v.start, v.end())).collect()
     };
     let mut spans = Vec::new();
+    let mut seeds: Vec<u64> = Vec::new();
     for (lo, hi) in rings {
         let (mut first, mut last) = (u64::MAX, 0u64);
         let mut x = lo & !(64 * PAGE - 1);
@@ -2251,6 +2261,9 @@ fn p1_recompute() {
                         if pa >= lo && pa < hi {
                             first = first.min(pa);
                             last = last.max(pa + PAGE);
+                            if (frame + 1).saturating_sub(wrote) < 2 {
+                                seeds.push(pa >> 20);
+                            }
                         }
                     }
                 }
@@ -2263,6 +2276,14 @@ fn p1_recompute() {
     }
     let pages: u64 = spans.iter().map(|s| (s.1 - s.0) / PAGE).sum();
     *P1_SPANS.lock() = spans;
+    {
+        let round = P1_STATS[0].load(Ordering::Relaxed);
+        let mut g = P1_GRANULES.lock();
+        let m = g.get_or_insert_with(std::collections::HashMap::new);
+        for gr in seeds {
+            m.entry(gr).or_insert(round);
+        }
+    }
     P1_STATS[6].fetch_add(1, Ordering::Relaxed);
     P1_STATS[7].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     P1_STATS[8].fetch_add(pages, Ordering::Relaxed);
@@ -2290,7 +2311,28 @@ fn p1_run() {
         let t = std::time::Instant::now();
         // (The epoch before the takes: what their pages are stamped with.)
         let ep = super::precache::epoch() as u32;
-        let spans = P1_SPANS.lock().clone();
+        let round = P1_STATS[0].load(Ordering::Relaxed);
+        let spans: Vec<(u64, u64)> = if super::tune::fe3_p1_mode() == 2 {
+            // Granules written within the last rounds, and the next one each.
+            let mut g = P1_GRANULES.lock();
+            let m = g.get_or_insert_with(std::collections::HashMap::new);
+            m.retain(|_, r| round.saturating_sub(*r) <= P1_KEEP_ROUNDS);
+            let mut grs: Vec<u64> = m.keys().flat_map(|&k| [k, k + 1]).collect();
+            drop(g);
+            grs.sort_unstable();
+            grs.dedup();
+            let mut v: Vec<(u64, u64)> = Vec::new();
+            for gr in grs {
+                let (a, b) = (gr << 20, (gr + 1) << 20);
+                match v.last_mut() {
+                    Some(l) if l.1 == a => l.1 = b,
+                    _ => v.push((a, b)),
+                }
+            }
+            v
+        } else {
+            P1_SPANS.lock().clone()
+        };
         let (mut pages, mut found) = (0u64, 0u64);
         for &(a, b) in &spans {
             written.clear();
@@ -2299,6 +2341,13 @@ fn p1_run() {
             }
             pages += (b - a) / PAGE;
             found += written.len() as u64;
+            if super::tune::fe3_p1_mode() == 2 && !written.is_empty() {
+                let mut g = P1_GRANULES.lock();
+                let m = g.get_or_insert_with(std::collections::HashMap::new);
+                for &pg in &written {
+                    m.insert(pg >> 20, round);
+                }
+            }
         }
         P1_STATS[0].fetch_add(1, Ordering::Relaxed);
         P1_STATS[1].fetch_add(n, Ordering::Relaxed);
@@ -2312,11 +2361,18 @@ fn p1_run() {
 /// `tune fe3_p1`'s status part ("" while it never ran).
 pub fn p1_line(flips: u64) -> String {
     let v: Vec<u64> = P1_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let takes = STATS[S_TAKES].load(Ordering::Relaxed).saturating_sub(P1_BASE[0].load(Ordering::Relaxed));
+    let take_ns = STATS[S_TAKE_NS].load(Ordering::Relaxed).saturating_sub(P1_BASE[1].load(Ordering::Relaxed));
+    let fe2 = format!(
+        "    front end 2's checks' takes this window: {:.1} a flip, {:.2} ms a flip\n",
+        takes as f64 / flips.max(1) as f64,
+        take_ns as f64 / 1e6 / flips.max(1) as f64
+    );
     if v[0] == 0 {
-        return String::new();
+        return fe2;
     }
     let r = v[0] as f64;
-    format!(
+    fe2 + &format!(
         "    front end 3 phase 1, rings (`tune fe3_p1`): {} rounds for {} title submissions; per round {:.1} spans, {:.1} MiB taken, {:.0} written pages found, {:.1} us; {:.2} ms a flip; span recomputes {} at {:.1} ms, {:.1} MiB of spans each\n",
         v[0],
         v[1],
@@ -2335,6 +2391,8 @@ pub fn p1_reset() {
     for c in &P1_STATS {
         c.store(0, Ordering::Relaxed);
     }
+    P1_BASE[0].store(STATS[S_TAKES].load(Ordering::Relaxed), Ordering::Relaxed);
+    P1_BASE[1].store(STATS[S_TAKE_NS].load(Ordering::Relaxed), Ordering::Relaxed);
 }
 
 fn take_all() -> bool {
