@@ -126,7 +126,9 @@ pub fn note(kind: usize, a: u64, n: u64) {
     let mut x = a;
     while x < end {
         let e = ((x >> 20) + 1).checked_shl(20).unwrap_or(u64::MAX).min(end);
-        CENSUS[owner(x) as usize][kind].fetch_add(e - x, Ordering::Relaxed);
+        let id = owner(x);
+        CENSUS[id as usize][kind].fetch_add(e - x, Ordering::Relaxed);
+        note_tag(kind, x, e - x, id);
         x = e;
     }
     if kind == C_UPLOAD {
@@ -203,7 +205,69 @@ pub fn note_value(kind: usize, a: u64, v: u64) {
     if !census_on() {
         return;
     }
-    CENSUS[owner(a) as usize][kind].fetch_add(v, Ordering::Relaxed);
+    let id = owner(a);
+    CENSUS[id as usize][kind].fetch_add(v, Ordering::Relaxed);
+    note_tag(kind, a, v, id);
+}
+
+/// The GPU arena's allocator ID once known (0: not yet).
+static ARENA_ID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// The GPU arena's tagged unit runs (start, length, tag), sorted, rebuilt at
+/// most every 2 s for the census.
+static TAG_INDEX: parking_lot::Mutex<(Option<std::time::Instant>, Vec<(u64, u64, u64)>)> = parking_lot::Mutex::new((None, Vec::new()));
+/// Census events in the GPU arena by tag (frame allocator ID << 32 | slot):
+/// (tag, kind) -> value.
+static BY_TAG: parking_lot::Mutex<Option<std::collections::HashMap<(u64, usize), u64>>> = parking_lot::Mutex::new(None);
+
+/// The tag owning arena address `a` (census).
+fn arena_tag_of(a: u64) -> Option<u64> {
+    let mut g = TAG_INDEX.lock();
+    if g.0.is_none_or(|t| t.elapsed().as_secs() >= 2) {
+        let mut v: Vec<(u64, u64, u64)> = arena_tags().into_iter().flat_map(|(_, tag, _, runs)| runs.into_iter().map(move |(s, n)| (s, n, tag))).collect();
+        v.sort_unstable();
+        g.1 = v;
+        g.0 = Some(std::time::Instant::now());
+    }
+    let i = g.1.partition_point(|r| r.0 <= a);
+    (i > 0).then(|| g.1[i - 1]).filter(|r| a < r.0 + r.1).map(|r| r.2)
+}
+
+/// Census: an event in the GPU arena counted by its tag too.
+fn note_tag(kind: usize, a: u64, v: u64, id: u8) {
+    let mut aid = ARENA_ID.load(Ordering::Relaxed);
+    if aid == 0 {
+        aid = allocators().into_iter().find(|x| x.pool == 1 && x.mtype == 2 && x.name == "Default TaggedArena").map_or(0, |x| x.id);
+        if aid == 0 {
+            return;
+        }
+        ARENA_ID.store(aid, Ordering::Relaxed);
+    }
+    if id != aid {
+        return;
+    }
+    let tag = arena_tag_of(a).unwrap_or(u64::MAX);
+    *BY_TAG.lock().get_or_insert_with(Default::default).entry((tag, kind)).or_insert(0) += v;
+}
+
+/// The arena-by-tag census line, by frame allocator (tag >> 32).
+fn tag_line(flips: f64) -> String {
+    let m: Vec<((u64, usize), u64)> = BY_TAG.lock().as_ref().map(|m| m.iter().map(|(k, v)| (*k, *v)).collect()).unwrap_or_default();
+    if m.is_empty() {
+        return String::new();
+    }
+    let mut by: std::collections::BTreeMap<u64, [u64; C_KINDS]> = std::collections::BTreeMap::new();
+    for ((tag, kind), v) in m {
+        let k = if tag == u64::MAX { u64::MAX } else { tag >> 32 };
+        by.entry(k).or_insert([0; C_KINDS])[kind] += v;
+    }
+    let parts: Vec<String> = by
+        .iter()
+        .map(|(k, c)| {
+            let who = if *k == u64::MAX { "no tag".to_string() } else { format!("frame allocator {k:#x}") };
+            format!("{who}: uploaded {:.2} MiB, placements {:.0} ({:.2} ms), GPU-written {:.2} MiB, read waits {:.2}", c[C_UPLOAD] as f64 / flips / 1048576.0, c[C_PLACE] as f64 / flips, c[C_PLACE_NS] as f64 / flips / 1e6, c[C_GPU_WRITE] as f64 / flips / 1048576.0, c[C_READ_WAIT] as f64 / flips)
+        })
+        .collect();
+    format!("    engine census: the GPU arena by frame allocator (tag): {}\n", parts.join("; "))
 }
 
 /// Each allocator ID's name and memory type ("name (GPU)").
@@ -260,6 +324,7 @@ fn census_line() -> String {
     format!("    engine census per flip over {flips:.0} flips, by owning allocator: {}\n", rows.into_iter().map(|r| r.1).collect::<Vec<_>>().join("; "))
         + &format!("    engine census: uploads a flip by allocation: {}; largest: {}\n", ups.join(", "), top.join(", "))
         + &by_prog
+        + &tag_line(flips)
 }
 
 /// MiB per owning allocator ID now, with each ID's lowest and highest
