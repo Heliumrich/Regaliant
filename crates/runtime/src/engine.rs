@@ -614,7 +614,9 @@ pub fn on_submit() {
             m.insert((fa, slot), (cur, end));
         }
     }
+    drop(g);
     ADV[3].fetch_add(1, Ordering::Relaxed);
+    arena_scan_census();
 }
 
 /// For the status report.
@@ -844,6 +846,107 @@ pub extern "sysv64" fn arena_free_hook(regs: *const u64, _arg: u32) {
     ARENA_FREES[1].fetch_add(mibs, Ordering::Relaxed);
 }
 
+/// The GPU arena's allocator ID (the byte at its object's +0x30; 0 until
+/// the arena is known).
+pub fn arena_owner() -> u8 {
+    let a = GPU_ARENA.load(Ordering::Relaxed);
+    if a == 0 || !crate::mem::readable(a + 0x30, 1) {
+        return 0;
+    }
+    unsafe { std::ptr::read_volatile((a + 0x30) as *const u8) }
+}
+
+/// Whether `a` lies in the GPU arena's frame allocations of the current
+/// generation (below its MiB's high-water mark in the allocation table).
+pub fn arena_allocated(a: u64) -> bool {
+    (a & 0xF_FFFF) < alloc_entry(a >> 20) & 0x1F_FFFF
+}
+
+/// The GPU arena's address range from the engine map (MiB-aligned lo, hi)
+/// and when it was read.
+static ARENA_SPAN: parking_lot::Mutex<(Option<std::time::Instant>, u64, u64)> = parking_lot::Mutex::new((None, 0, 0));
+/// Front end 3's coherence scoped by the allocation table, priced
+/// (`arena_scan_census`, at title submissions with the census on): [scans,
+/// runs, queries, bytes scanned, pages found written, ns].
+static SCAN: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// At a title submission (census): the GPU arena's live frame allocations
+/// (each MiB's allocated bytes in the current generation, merged into runs)
+/// queried for pages written since their last take, without a reset, timed:
+/// what a coherence per submission confined to them would scan.
+fn arena_scan_census() {
+    let arena = arena_owner();
+    if arena == 0 || ALLOC.load(Ordering::Relaxed).is_null() {
+        return;
+    }
+    let (lo, hi) = {
+        let mut g = ARENA_SPAN.lock();
+        if g.0.is_none_or(|t| t.elapsed().as_secs() >= 2) {
+            let (l, h) = census().into_iter().find(|x| x.0 == arena).map_or((0, 0), |x| (x.2, x.3));
+            *g = (Some(std::time::Instant::now()), l, h);
+        }
+        (g.1, g.2)
+    };
+    if hi <= lo {
+        return;
+    }
+    let t = std::time::Instant::now();
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let mut cur: Option<(u64, u64)> = None;
+    for m in (lo >> 20)..(hi >> 20) {
+        let h = alloc_entry(m) & 0x1F_FFFF;
+        if h == 0 || owner(m << 20) != arena {
+            if let Some(r) = cur.take() {
+                runs.push(r);
+            }
+            continue;
+        }
+        let (s, e) = (m << 20, (m << 20) + h);
+        cur = match cur {
+            Some((a, b)) if b == s => Some((a, e)),
+            other => {
+                if let Some(r) = other {
+                    runs.push(r);
+                }
+                Some((s, e))
+            }
+        };
+        if h < 1 << 20 {
+            runs.extend(cur.take());
+        }
+    }
+    runs.extend(cur.take());
+    let (mut pages, mut calls, mut bytes) = (0u64, 0u64, 0u64);
+    for &(a, b) in &runs {
+        if let Some((p, c)) = crate::mem::query_written(a, b) {
+            pages += p;
+            calls += c;
+        }
+        bytes += b - a;
+    }
+    for (i, v) in [1, runs.len() as u64, calls, bytes, pages, t.elapsed().as_nanos() as u64].into_iter().enumerate() {
+        SCAN[i].fetch_add(v, Ordering::Relaxed);
+    }
+}
+
+/// The scan census's line.
+fn scan_line() -> String {
+    let s: Vec<u64> = SCAN.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+    if s[0] == 0 {
+        return String::new();
+    }
+    let n = s[0] as f64;
+    format!(
+        "    engine census: the GPU arena's live frame allocations queried at title submissions (no reset): {} scans, each {:.1} runs, {:.1} queries, {:.2} MiB, {:.0} pages found written, {:.1} us\n",
+        s[0],
+        s[1] as f64 / n,
+        s[2] as f64 / n,
+        s[3] as f64 / n / 1048576.0,
+        s[4] as f64 / n,
+        s[5] as f64 / n / 1000.0
+    )
+}
+
 /// The page allocator's records by address (both pools): (start, end,
 /// record), sorted, and when they were read (`record_extent`).
 static RECS: parking_lot::RwLock<(Option<std::time::Instant>, Vec<(u64, u64, u64)>)> = parking_lot::RwLock::new((None, Vec::new()));
@@ -938,12 +1041,13 @@ pub fn reset() {
             x.store(0, Ordering::Relaxed);
         }
     }
-    for x in UNB_STATS.iter().chain(ARENA_FREES.iter()).chain(REC_STATS.iter()) {
+    for x in UNB_STATS.iter().chain(ARENA_FREES.iter()).chain(REC_STATS.iter()).chain(SCAN.iter()) {
         x.store(0, Ordering::Relaxed);
     }
     *BY_TAG.lock() = None;
     *UP_BY_REC.lock() = None;
     *UP_BY_PROG.lock() = None;
+    alloc_census_reset();
     let f = crate::gpu::FRAMES.load(Ordering::Relaxed);
     CENSUS_FLIP0.store(if census_on() { f + 1 } else { 0 }, Ordering::Relaxed);
     STATS_FLIP0.store(f, Ordering::Relaxed);
@@ -951,7 +1055,7 @@ pub fn reset() {
 
 /// `engine report` (control): the census and the bounds' line.
 pub fn report() -> String {
-    census_line() + &bound_line()
+    census_line() + &bound_line() + &scan_line() + &crate::gpu::fe2::hot_by_owner(2) + &crate::gpu::fe2::hot_by_owner(16) + &alloc_census_lines()
 }
 
 /// The allocation table's and the bounds' status line (per flip).
@@ -975,4 +1079,163 @@ pub fn bound_line() -> String {
         s[4] as f64 / flips,
         s[5] as f64 / flips,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Census of the GPU arena's frame allocations by the code that makes them
+// (`DS_ALLOC_CENSUS=1`, a title-fix hook at eboot+0x8121b7, in the frame
+// allocator's placement of an allocation): which call sites allocate how
+// much, and how many of their pages the CPU writes (front end 2's found
+// writes). Whether the arena's CPU-written allocations can be told from its
+// GPU-only scratch by their call site (FRONTEND3.md: a per-epoch scan
+// confined to the CPU-written ones).
+// ---------------------------------------------------------------------------
+
+pub fn alloc_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_ALLOC_CENSUS").ok().as_deref() == Some("1"))
+}
+
+/// One allocation: [start, end), its call site (index into `SITES`), the
+/// flip it was made in.
+#[derive(Clone, Copy)]
+struct AllocRec {
+    start: u64,
+    end: u64,
+    site: u32,
+    flip: u32,
+}
+
+/// The last allocations (`ALLOC_LOG_CAP`), call sites interned by their
+/// two return addresses, and per site [allocations, bytes] since the last
+/// `reset`.
+struct AllocCensus {
+    log: std::collections::VecDeque<AllocRec>,
+    ids: std::collections::HashMap<[u64; 5], u32>,
+    sites: Vec<[u64; 5]>,
+    totals: Vec<[u64; 2]>,
+}
+const ALLOC_LOG_CAP: usize = 1 << 19;
+static ALLOC_CENSUS: parking_lot::Mutex<Option<AllocCensus>> = parking_lot::Mutex::new(None);
+
+/// The hook after the frame allocator placed an allocation (rax its start,
+/// r12 its size, r15 the allocator, rbp its frame: [rbp+8] the return into
+/// its caller, [[rbp]+8] the caller's).
+pub extern "sysv64" fn alloc_census_hook(regs: *const u64, _arg: u32) {
+    let r = |i: usize| unsafe { *regs.add(i) };
+    let (start, size, this, rbp) = (r(0), r(12), r(15), r(5));
+    let arena = GPU_ARENA.load(Ordering::Relaxed);
+    if arena == 0 || size == 0 || rd64(this + 0x88) != Some(arena) {
+        return;
+    }
+    // (Four return addresses up the frame chain: the engine reaches the
+    // frame allocator through a generic wrapper and a proxy allocator.)
+    // ([4]: the frame allocator's ID, the byte at its +0x30.)
+    let mut key = [0u64; 5];
+    key[4] = rd64(this + 0x30).map_or(0, |v| v & 0xff);
+    let mut f = rbp;
+    for k in key[..4].iter_mut() {
+        *k = rd64(f + 8).unwrap_or(0);
+        f = match rd64(f) {
+            Some(n) if n > f => n,
+            _ => break,
+        };
+    }
+    let flip = crate::gpu::FRAMES.load(Ordering::Relaxed) as u32;
+    let mut g = ALLOC_CENSUS.lock();
+    let c = g.get_or_insert_with(|| AllocCensus { log: std::collections::VecDeque::new(), ids: Default::default(), sites: Vec::new(), totals: Vec::new() });
+    let id = match c.ids.get(&key) {
+        Some(&id) => id,
+        None => {
+            let id = c.sites.len() as u32;
+            c.ids.insert(key, id);
+            c.sites.push(key);
+            c.totals.push([0; 2]);
+            id
+        }
+    };
+    c.totals[id as usize][0] += 1;
+    c.totals[id as usize][1] += size;
+    if c.log.len() >= ALLOC_LOG_CAP {
+        c.log.pop_front();
+    }
+    c.log.push_back(AllocRec { start, end: start + size, site: id, flip });
+}
+
+/// An executable address as eboot+offset.
+fn eboot_off(a: u64) -> String {
+    let base = BASE.load(Ordering::Relaxed);
+    if a >= base && a < base + 0x4000_0000 {
+        format!("eboot+{:#x}", a - base)
+    } else {
+        format!("{a:#x}")
+    }
+}
+
+/// The census's lines (`engine report`): call sites by bytes allocated since
+/// the last reset, and the arena's pages with a CPU write found within the
+/// last 2 flips attributed to the latest allocation (of the last 8 flips)
+/// holding them.
+fn alloc_census_lines() -> String {
+    if !alloc_census_on() {
+        return String::new();
+    }
+    let arena = arena_owner();
+    let hot = crate::gpu::fe2::hot_pages_of(arena, 2);
+    let g = ALLOC_CENSUS.lock();
+    let Some(c) = g.as_ref() else { return String::new() };
+    let flips = crate::gpu::FRAMES.load(Ordering::Relaxed).saturating_sub(STATS_FLIP0.load(Ordering::Relaxed)).max(1) as f64;
+    let now = crate::gpu::FRAMES.load(Ordering::Relaxed) as u32;
+    // page -> site of the latest allocation over it (oldest first, so later
+    // ones overwrite).
+    let mut by_page: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+    for a in c.log.iter().filter(|a| now.wrapping_sub(a.flip) <= 8) {
+        let mut p = a.start & !4095;
+        while p < a.end {
+            by_page.insert(p, a.site);
+            p += 4096;
+        }
+    }
+    let mut written = vec![0u64; c.sites.len()];
+    let mut unattributed = 0u64;
+    for p in &hot {
+        match by_page.get(p) {
+            Some(&s) => written[s as usize] += 1,
+            None => unattributed += 1,
+        }
+    }
+    let mut order: Vec<usize> = (0..c.sites.len()).collect();
+    order.sort_by(|&a, &b| c.totals[b][1].cmp(&c.totals[a][1]));
+    let site = |i: usize| format!("[frame allocator {:#x}] {}", c.sites[i][4], c.sites[i][..4].iter().filter(|&&a| a != 0).map(|&a| eboot_off(a)).collect::<Vec<_>>().join(" <- "));
+    let total_bytes: u64 = c.totals.iter().map(|t| t[1]).sum();
+    let by_bytes: Vec<String> = order
+        .iter()
+        .take(24)
+        .map(|&i| format!("{}: {:.0} allocations, {:.2} MiB a flip, {} pages written", site(i), c.totals[i][0] as f64 / flips, c.totals[i][1] as f64 / flips / 1048576.0, written[i]))
+        .collect();
+    let mut wo: Vec<usize> = (0..c.sites.len()).filter(|&i| written[i] > 0).collect();
+    wo.sort_by(|&a, &b| written[b].cmp(&written[a]));
+    let by_written: Vec<String> = wo.iter().take(16).map(|&i| format!("{}: {} pages ({:.2} MiB a flip allocated)", site(i), written[i], c.totals[i][1] as f64 / flips / 1048576.0)).collect();
+    let writers = wo.len();
+    let writer_bytes: u64 = wo.iter().map(|&i| c.totals[i][1]).sum();
+    format!(
+        "    engine allocation census: {} call sites, {:.2} MiB a flip allocated in the GPU arena; {} pages with a CPU write within 2 flips ({} not in an allocation of the last 8 flips); the {} sites with written pages allocate {:.2} MiB a flip\n      by bytes: {}\n      by written pages: {}\n",
+        c.sites.len(),
+        total_bytes as f64 / flips / 1048576.0,
+        hot.len(),
+        unattributed,
+        writers,
+        writer_bytes as f64 / flips / 1048576.0,
+        by_bytes.join("; "),
+        by_written.join("; ")
+    )
+}
+
+/// `engine reset`: the census's totals start again (the log stays).
+fn alloc_census_reset() {
+    if let Some(c) = ALLOC_CENSUS.lock().as_mut() {
+        for t in c.totals.iter_mut() {
+            *t = [0; 2];
+        }
+    }
 }

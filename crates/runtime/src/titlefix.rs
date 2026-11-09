@@ -358,6 +358,18 @@ const FIXES: &[Fix] = &[
         why: "the port marks the GPU arena's freed units (front end 4's allocation table)",
         only_with: None,
     },
+    // After the frame allocator placed an allocation (eboot+0x8121b7, `xor
+    // edx,edx; and rcx,-8`: rax the start, r12 the size, r15 the allocator,
+    // rbp its frame).
+    Fix {
+        name: "engine map (arena allocation census)",
+        offset: 0x8121b7,
+        from: &[0x31, 0xd2, 0x48, 0x83, 0xe1, 0xf8],
+        change: Change::Hook { at: 0, handler: crate::engine::alloc_census_hook },
+        kind: "engine map (read only)",
+        why: "the port counts the GPU arena's allocations by their call site (census)",
+        only_with: Some("DS_ALLOC_CENSUS"),
+    },
 ];
 
 /// Whether the fix of this name was applied.

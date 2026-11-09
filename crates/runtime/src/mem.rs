@@ -1447,6 +1447,46 @@ fn take_written_inner(lo: u64, hi: u64, out: &mut Vec<u64>, who: usize) -> Optio
     take_written_query(lo, hi, out, who)
 }
 
+/// Front end 4's census (`engine::arena_scan_census`): pages of [lo, hi)
+/// written since their last take, by write-watch queries that reset nothing
+/// (one per window piece; front end 2's takes see the same pages after it).
+/// (pages, queries); None where the memory is not write-watched.
+pub fn query_written(lo: u64, hi: u64) -> Option<(u64, u64)> {
+    if !write_watched() || crate::sections::on() || hi <= lo {
+        return None;
+    }
+    let mut addrs = vec![std::ptr::null_mut::<std::ffi::c_void>(); 4096];
+    let (mut pages, mut calls) = (0u64, 0u64);
+    let mut query = |a: u64, e: u64| -> Option<()> {
+        let mut at = a;
+        while at < e {
+            let mut count: usize = addrs.len();
+            let mut gran = 0u32;
+            calls += 1;
+            if unsafe { GetWriteWatch(0, at as _, (e - at) as usize, addrs.as_mut_ptr(), &mut count, &mut gran) } != 0 {
+                return None;
+            }
+            pages += count as u64;
+            if count < addrs.len() {
+                break;
+            }
+            at = addrs[count - 1] as u64 + 4096;
+        }
+        Some(())
+    };
+    let (lo, hi) = (lo & !4095, hi.next_multiple_of(4096));
+    if mixed() {
+        for (a, e) in window_pieces(lo, hi) {
+            if !view_window(a) && mixed_made(a) {
+                query(a, e)?;
+            }
+        }
+    } else {
+        query(lo, hi)?;
+    }
+    Some((pages, calls))
+}
+
 /// One write-watch take of [lo, hi) (inside one allocation).
 fn take_written_query(lo: u64, hi: u64, out: &mut Vec<u64>, who: usize) -> Option<()> {
     use std::sync::atomic::Ordering::Relaxed;

@@ -1262,6 +1262,83 @@ fn word_ok(c: &Chunk, a: u64, e: u64, want: u32) -> u64 {
     ok
 }
 
+/// The mirror's pages owned by engine allocator `owner` whose CPU write
+/// front end 2 found within the last `n` flips (`engine`'s allocation census).
+pub fn hot_pages_of(owner: u8, n: u64) -> Vec<u64> {
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    let mut out = Vec::new();
+    for k in 0..CHUNKS {
+        let p = TABLE[k].load(Ordering::Acquire);
+        if p.is_null() {
+            continue;
+        }
+        let c = unsafe { &*p };
+        for i in 0..CHUNK_PAGES {
+            let w = c.wrote[i].load(Ordering::Relaxed) as u64;
+            if w == 0 || frame.saturating_sub(w - 1) >= n {
+                continue;
+            }
+            let a = MIRROR_BASE + ((k as u64) << CHUNK_SHIFT) + i as u64 * PAGE;
+            if crate::engine::owner(a) == owner {
+                out.push(a);
+            }
+        }
+    }
+    out
+}
+
+/// Front end 4's census (`engine report`, docs/FRONTEND3.md's coherence per
+/// epoch): the mirror's pages whose CPU write front end 2 found within the
+/// last `n` flips (`Chunk::wrote`), by the engine allocator owning them
+/// (`engine::owner`): pages, the 1 MiB granules and runs (of pages with one
+/// owner) they form, and for the GPU arena how many lie inside its frame
+/// allocations (`engine::arena_allocated`).
+pub fn hot_by_owner(n: u64) -> String {
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    let arena = crate::engine::arena_owner();
+    // owner -> [pages, granules, runs, pages inside the arena's allocations]
+    let mut by: std::collections::BTreeMap<u8, [u64; 4]> = std::collections::BTreeMap::new();
+    let mut last_mib: std::collections::HashMap<u8, u64> = std::collections::HashMap::new();
+    let mut prev: Option<(u64, u8)> = None;
+    for k in 0..CHUNKS {
+        let p = TABLE[k].load(Ordering::Acquire);
+        if p.is_null() {
+            continue;
+        }
+        let c = unsafe { &*p };
+        for i in 0..CHUNK_PAGES {
+            let w = c.wrote[i].load(Ordering::Relaxed) as u64;
+            if w == 0 || frame.saturating_sub(w - 1) >= n {
+                continue;
+            }
+            let a = MIRROR_BASE + ((k as u64) << CHUNK_SHIFT) + i as u64 * PAGE;
+            let o = crate::engine::owner(a);
+            let e = by.entry(o).or_insert([0; 4]);
+            e[0] += 1;
+            if last_mib.insert(o, a >> 20) != Some(a >> 20) {
+                e[1] += 1;
+            }
+            if prev != Some((a - PAGE, o)) {
+                e[2] += 1;
+            }
+            if o == arena && arena != 0 && crate::engine::arena_allocated(a) {
+                e[3] += 1;
+            }
+            prev = Some((a, o));
+        }
+    }
+    let names = crate::engine::names();
+    let parts: Vec<String> = by
+        .iter()
+        .map(|(o, v)| {
+            let name = names.get(o).cloned().unwrap_or_else(|| if *o == 0 { "none".into() } else { "?".into() });
+            let inside = if *o == arena && arena != 0 { format!(", {} inside its frame allocations", v[3]) } else { String::new() };
+            format!("{o} {name}: {} pages ({:.1} MiB) in {} granules of 1 MiB, {} runs{inside}", v[0], v[0] as f64 / 256.0, v[1], v[2])
+        })
+        .collect();
+    format!("    front end 2's pages with a CPU write found within {n} flips, by owning engine allocator: {}\n", parts.join("; "))
+}
+
 /// The checks' commonest counts, kept per thread and added to STATS and
 /// BY_SIZE every LOCAL_FLUSH checks (shared atomics on every check, from
 /// every recording thread, bounced their cache lines: ~45,000 checks a flip
