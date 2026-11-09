@@ -1,0 +1,295 @@
+//! The engine's own map of its memory (the title's code, PPSA01341
+//! 01.007.000, read with Ghidra on 2026-11-09; FINDINGS.md, ROUTE60.md).
+//!
+//! The engine's page allocator (`bpe::memory::PlatformPageAllocator`) takes
+//! all direct memory at start and hands it out itself: an allocation of
+//! `EMemoryType::CPUMemory` (1) comes from flexible memory in 64 KiB pages,
+//! every other one from direct memory in 1 MiB units. Its tracking
+//! structure (`gMemoryTracking`, a pointer at eboot+0x2ee4d60) keeps one byte
+//! per MiB of the address space (+0x15fa68, indexed by address >> 20) naming
+//! the allocator that owns that MiB (the byte at the allocator object's
+//! +0x30; 0: none). This module reads that table: which engine allocator
+//! owns a guest address (`owner`), and a census of the table (`status`).
+//! Reading only: nothing in the title is changed.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The main executable's base (0: not checked or another title version).
+static BASE: AtomicU64 = AtomicU64::new(0);
+
+/// `RequestVirtualPages_NoThreadSafety` (eboot+0x80d9a0): its first bytes,
+/// the 1 MiB table's displacement in it and a RIP-relative load of the
+/// tracking pointer, checked before the offsets are trusted.
+const RVP: usize = 0x80d9a0;
+const RVP_ENTRY: [u8; 16] = [0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xe4];
+const MIB_TABLE_DISP_AT: usize = 0x80ddd9;
+const TRACKING_REF_AT: usize = 0x80ddb5;
+/// The tracking pointer (module offset) and the per-MiB table in it.
+const TRACKING_PTR: u64 = 0x2ee4d60;
+const MIB_TABLE: u64 = 0x15fa68;
+/// Entries of the per-MiB table (up to 0xFC00000000).
+const MIB_ENTRIES: u64 = 0xFC000;
+
+/// Checks the allocator's code and keeps the base when it is the expected
+/// title version (`titlefix::apply`).
+pub fn init(base: u64, image: &[u8]) {
+    let entry_ok = image.get(RVP..RVP + 16) == Some(&RVP_ENTRY[..]);
+    let disp_ok = image.get(MIB_TABLE_DISP_AT..MIB_TABLE_DISP_AT + 4) == Some(&(MIB_TABLE as u32).to_le_bytes()[..]);
+    let ref_ok = image.get(TRACKING_REF_AT..TRACKING_REF_AT + 4).is_some_and(|b| {
+        let d = i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64;
+        (TRACKING_REF_AT as i64 + 4 + d) as u64 == TRACKING_PTR
+    });
+    if entry_ok && disp_ok && ref_ok {
+        BASE.store(base, Ordering::Relaxed);
+        crate::info!("engine map: the page allocator's tracking pointer at eboot+{TRACKING_PTR:#x} (title version as expected)");
+    } else {
+        crate::warn!("engine map: the page allocator's code differs (entry {entry_ok}, table {disp_ok}, pointer {ref_ok}): off");
+    }
+}
+
+/// The tracking structure's address once the engine set it up.
+pub fn tracking() -> Option<u64> {
+    let base = BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return None;
+    }
+    let p = base + TRACKING_PTR;
+    if !crate::mem::readable(p, 8) {
+        return None;
+    }
+    let t = unsafe { std::ptr::read_volatile(p as *const u64) };
+    (t != 0 && crate::mem::readable(t + MIB_TABLE, MIB_ENTRIES)).then_some(t)
+}
+
+/// The per-MiB table's address once found (it does not move).
+static TABLE: AtomicU64 = AtomicU64::new(0);
+
+/// The engine allocator owning the MiB of `addr` (its ID; 0: none or not
+/// known).
+#[inline]
+pub fn owner(addr: u64) -> u8 {
+    let i = addr >> 20;
+    if i >= MIB_ENTRIES {
+        return 0;
+    }
+    let mut t = TABLE.load(Ordering::Relaxed);
+    if t == 0 {
+        match tracking() {
+            Some(x) => {
+                t = x + MIB_TABLE;
+                TABLE.store(t, Ordering::Relaxed);
+            }
+            None => return 0,
+        }
+    }
+    unsafe { std::ptr::read_volatile((t + i) as *const u8) }
+}
+
+/// The census of front end 2's events by owning allocator
+/// (`DS_ENGINE_CENSUS=1`): ranges bound for GPU writes (`Exec::note_write`),
+/// pages uploaded into the mirror (`fe2::upload_census`), in bytes; command
+/// processors' waits for GPU work before reading guest memory (count).
+pub const C_GPU_WRITE: usize = 0;
+pub const C_UPLOAD: usize = 1;
+pub const C_READ_WAIT: usize = 2;
+/// Front end 2's placements past its memo (`Exec::fe2_place`): count and ns.
+pub const C_PLACE: usize = 3;
+pub const C_PLACE_NS: usize = 4;
+const C_KINDS: usize = 5;
+static CENSUS: [[AtomicU64; C_KINDS]; 256] = [const { [const { AtomicU64::new(0) }; C_KINDS] }; 256];
+/// The flip the census started at (+1; 0: not started).
+static CENSUS_FLIP0: AtomicU64 = AtomicU64::new(0);
+
+pub fn census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_ENGINE_CENSUS").ok().as_deref() == Some("1"))
+}
+
+/// Adds the bytes of [a, a + n) to their owners' `kind` counters.
+pub fn note(kind: usize, a: u64, n: u64) {
+    if !census_on() || n == 0 {
+        return;
+    }
+    if CENSUS_FLIP0.load(Ordering::Relaxed) == 0 {
+        CENSUS_FLIP0.store(crate::gpu::FRAMES.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    }
+    let end = a.saturating_add(n);
+    let mut x = a;
+    while x < end {
+        let e = ((x >> 20) + 1).checked_shl(20).unwrap_or(u64::MAX).min(end);
+        CENSUS[owner(x) as usize][kind].fetch_add(e - x, Ordering::Relaxed);
+        x = e;
+    }
+}
+
+/// Counts one event of `kind` at `a`'s owner.
+pub fn note_count(kind: usize, a: u64) {
+    note_value(kind, a, 1);
+}
+
+/// Adds `v` to `a`'s owner's `kind` counter.
+pub fn note_value(kind: usize, a: u64, v: u64) {
+    if !census_on() {
+        return;
+    }
+    CENSUS[owner(a) as usize][kind].fetch_add(v, Ordering::Relaxed);
+}
+
+/// Each allocator ID's name and memory type ("name (GPU)").
+pub fn names() -> std::collections::HashMap<u8, String> {
+    allocators().into_iter().map(|a| (a.id, format!("{} ({})", a.name, if a.mtype == 1 { "CPU" } else if a.mtype == 2 { "GPU" } else { "?" }))).collect()
+}
+
+/// The census line (per flip since it started).
+fn census_line() -> String {
+    if !census_on() {
+        return String::new();
+    }
+    let f0 = CENSUS_FLIP0.load(Ordering::Relaxed);
+    if f0 == 0 {
+        return String::new();
+    }
+    let flips = (crate::gpu::FRAMES.load(Ordering::Relaxed) + 1).saturating_sub(f0).max(1) as f64;
+    let names = names();
+    let mut rows: Vec<(u64, String)> = Vec::new();
+    for id in 0..256usize {
+        let c: Vec<u64> = CENSUS[id].iter().map(|x| x.load(Ordering::Relaxed)).collect();
+        if c.iter().all(|&x| x == 0) {
+            continue;
+        }
+        let name = names.get(&(id as u8)).cloned().unwrap_or_else(|| if id == 0 { "none".into() } else { "?".into() });
+        rows.push((c[C_PLACE_NS], format!("{id} {name}: placements {:.0} ({:.2} ms), GPU-written {:.2} MiB, uploaded {:.2} MiB, read waits {:.2}", c[C_PLACE] as f64 / flips, c[C_PLACE_NS] as f64 / flips / 1e6, c[C_GPU_WRITE] as f64 / flips / 1048576.0, c[C_UPLOAD] as f64 / flips / 1048576.0, c[C_READ_WAIT] as f64 / flips)));
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    format!("    engine census per flip over {flips:.0} flips, by owning allocator: {}\n", rows.into_iter().map(|r| r.1).collect::<Vec<_>>().join("; "))
+}
+
+/// MiB per owning allocator ID now, with each ID's lowest and highest
+/// address (the census of the table).
+pub fn census() -> Vec<(u8, u64, u64, u64)> {
+    let Some(t) = tracking() else { return Vec::new() };
+    let table = unsafe { std::slice::from_raw_parts((t + MIB_TABLE) as *const u8, MIB_ENTRIES as usize) };
+    let mut per: [(u64, u64, u64); 256] = [(0, u64::MAX, 0); 256];
+    for (i, &id) in table.iter().enumerate() {
+        if id != 0 {
+            let e = &mut per[id as usize];
+            e.0 += 1;
+            e.1 = e.1.min((i as u64) << 20);
+            e.2 = e.2.max(((i as u64) + 1) << 20);
+        }
+    }
+    per.iter().enumerate().filter(|(_, e)| e.0 > 0).map(|(id, e)| (id as u8, e.0, e.1, e.2)).collect()
+}
+
+/// A u64 of guest memory when readable.
+fn rd64(a: u64) -> Option<u64> {
+    (a != 0 && crate::mem::readable(a, 8)).then(|| unsafe { std::ptr::read_volatile(a as *const u64) })
+}
+
+/// A NUL-terminated printable string of guest memory (at most 120 bytes).
+fn rdstr(a: u64) -> Option<String> {
+    if a == 0 || !crate::mem::readable(a, 1) {
+        return None;
+    }
+    let mut s = String::new();
+    for k in 0..120u64 {
+        if !crate::mem::readable(a + k, 1) {
+            return None;
+        }
+        let c = unsafe { std::ptr::read_volatile((a + k) as *const u8) };
+        if c == 0 {
+            return (s.len() >= 2).then_some(s);
+        }
+        if !(0x20..0x7f).contains(&c) {
+            return None;
+        }
+        s.push(c as char);
+    }
+    None
+}
+
+/// One engine allocator seen in the page allocator's records.
+pub struct Allocator {
+    pub ptr: u64,
+    pub id: u8,
+    /// Its name (the base constructor's argument, a pointer at +0x10).
+    pub name: String,
+    /// Its `EMemoryType` (+0x18): 1 CPU memory, 2 GPU memory.
+    pub mtype: u32,
+    pub allocs: u64,
+    pub bytes: u64,
+    pub lo: u64,
+    pub hi: u64,
+    /// The pool: 0 flexible (CPU) memory, 1 direct memory.
+    pub pool: u8,
+}
+
+/// The allocators owning the page allocator's live allocations (the base
+/// constructor `IAllocator(name, type)` keeps the name at +0x10, the memory
+/// type at +0x18; the ID byte is at +0x30), by walking
+/// each pool's record list (records of 0x78 bytes: list node at +0x20 with
+/// its previous and next at +0x28 and +0x30, the allocator at +0x40, size
+/// +0x58, address +0x60; the pools' list heads at the tracking structure's
+/// +0x00 and +0xa0).
+pub fn allocators() -> Vec<Allocator> {
+    let Some(t) = tracking() else { return Vec::new() };
+    let mut by: std::collections::BTreeMap<(u8, u64), Allocator> = std::collections::BTreeMap::new();
+    for (pool, head) in [(0u8, t), (1u8, t + 0xa0)] {
+        let Some(mut n) = rd64(head + 0x10) else { continue };
+        let mut steps = 0;
+        while n != head && n != 0 && steps < 20_000 {
+            steps += 1;
+            let rec = n - 0x20;
+            let (Some(alloc), Some(size), Some(addr)) = (rd64(rec + 0x40), rd64(rec + 0x58), rd64(rec + 0x60)) else { break };
+            let e = by.entry((pool, alloc)).or_insert_with(|| Allocator {
+                ptr: alloc,
+                id: if alloc != 0 && crate::mem::readable(alloc + 0x30, 1) { unsafe { std::ptr::read_volatile((alloc + 0x30) as *const u8) } } else { 0 },
+                name: rd64(alloc + 0x10).and_then(rdstr).unwrap_or_default(),
+                mtype: if alloc != 0 && crate::mem::readable(alloc + 0x18, 4) { unsafe { std::ptr::read_volatile((alloc + 0x18) as *const u32) } } else { 0 },
+                allocs: 0,
+                bytes: 0,
+                lo: u64::MAX,
+                hi: 0,
+                pool,
+            });
+            e.allocs += 1;
+            e.bytes += size;
+            e.lo = e.lo.min(addr);
+            e.hi = e.hi.max(addr + size);
+            let Some(next) = rd64(n + 0x10) else { break };
+            n = next;
+        }
+    }
+    let mut v: Vec<Allocator> = by.into_values().collect();
+    v.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    v
+}
+
+/// For the status report.
+pub fn status() -> String {
+    if BASE.load(Ordering::Relaxed) == 0 {
+        return String::new();
+    }
+    let c = census();
+    if c.is_empty() {
+        return "    engine map: no tracking structure yet\n".into();
+    }
+    let total: u64 = c.iter().map(|x| x.1).sum();
+    let parts: Vec<String> = c.iter().map(|&(id, mib, lo, hi)| format!("{id}: {mib} MiB ({lo:#x}..{hi:#x})")).collect();
+    let mut s = format!("    engine map: {total} MiB of direct memory owned by {} allocators: {}\n", c.len(), parts.join(", "));
+    let a = allocators();
+    let parts: Vec<String> = a
+        .iter()
+        .take(40)
+        .map(|x| {
+            // (The vtable module-relative when in the executable: the
+            // allocator's class through the Ghidra project.)
+            let base = BASE.load(Ordering::Relaxed);
+            let vt = rd64(x.ptr).map(|v| if v >= base && v < base + 0x4000_0000 { format!("eboot+{:#x}", v - base) } else { format!("{v:#x}") }).unwrap_or_default();
+            let obj = if x.ptr >= base && x.ptr < base + 0x4000_0000 { format!("eboot+{:#x}", x.ptr - base) } else { format!("{:#x}", x.ptr) };
+            format!("{} id {} '{}' type {} {} allocations {} MiB ({:#x}..{:#x}) object {obj} vtable {vt}", if x.pool == 0 { "flexible" } else { "direct" }, x.id, x.name, x.mtype, x.allocs, x.bytes >> 20, x.lo, x.hi)
+        })
+        .collect();
+    s += &format!("    engine allocators ({}): {}\n", a.len(), parts.join("; "));
+    s + &census_line()
+}

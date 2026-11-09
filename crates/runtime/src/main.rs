@@ -26,6 +26,7 @@ mod pcsettings;
 mod jobidle;
 mod camhook;
 mod dispmode;
+mod engine;
 mod thread;
 mod titlefix;
 mod titlemem;

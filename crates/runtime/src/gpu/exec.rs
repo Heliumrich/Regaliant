@@ -11112,7 +11112,7 @@ impl Exec {
                 return Some(m.result);
             }
             place_memo_count(false);
-            let r = self.fe2_place_any(base, size, written);
+            let r = self.fe2_place_timed(base, size, written);
             if let Some(result) = r {
                 // (Under the batch it was made in: a placement begins one when
                 // none is being recorded.)
@@ -11124,7 +11124,7 @@ impl Exec {
         }
         let slow = super::fe2::slow_place_us();
         if slow == 0 {
-            return self.fe2_place_any(base, size, written);
+            return self.fe2_place_timed(base, size, written);
         }
         let _ = super::fe2::probe_take();
         let t = std::time::Instant::now();
@@ -11134,6 +11134,19 @@ impl Exec {
         if us >= slow {
             note_slow_place(&self.name, base, size, written, r.map(|x| x.2), us, probe);
         }
+        r
+    }
+
+    /// `fe2_place_any`, counted and timed by the engine allocator owning
+    /// `base` when the engine census is on (`engine::C_PLACE`).
+    fn fe2_place_timed(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
+        if !crate::engine::census_on() {
+            return self.fe2_place_any(base, size, written);
+        }
+        let t = std::time::Instant::now();
+        let r = self.fe2_place_any(base, size, written);
+        crate::engine::note_count(crate::engine::C_PLACE, base);
+        crate::engine::note_value(crate::engine::C_PLACE_NS, base, t.elapsed().as_nanos() as u64);
         r
     }
 
@@ -13010,6 +13023,11 @@ impl Exec {
         };
         let waited = self.sync_for_reads(reads);
         let w = waited.is_some();
+        if w {
+            if let Some(&(a, _)) = reads.first() {
+                crate::engine::note_count(crate::engine::C_READ_WAIT, a);
+            }
+        }
         if let Some(t0) = waited {
             WAIT_NS[0].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             WAIT_NS[1].fetch_add(1, Ordering::Relaxed);
@@ -13239,6 +13257,7 @@ impl Exec {
         }
         super::precache::invalidate_gpu(a, n);
         super::forward::written(a, n);
+        crate::engine::note(crate::engine::C_GPU_WRITE, a, n);
         if super::tune::race_checks() {
             self.note_open_write(a, n);
         }
@@ -16593,6 +16612,7 @@ pub fn status() -> String {
         + &crate::placement::status()
         + &crate::titlemem::status()
         + &crate::titlefix::status()
+        + &crate::engine::status()
         + &super::cp::draw_state_line()
         + &draw::draw_diff_line()
         + &draw::delta_line()

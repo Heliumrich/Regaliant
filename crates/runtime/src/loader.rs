@@ -437,6 +437,9 @@ pub fn finalize(m: &LoadedModule) -> Result<PatchStats, String> {
     }
     if m.is_main {
         crate::exception::install_text_hooks(&mut p, &ranges);
+        // (The engine's memory map: read only, so on with or without the
+        // title fixes.)
+        crate::engine::init(p.base, p.image);
         crate::titlefix::apply(&mut p, &ranges);
     }
     let tramp_used = p.tramp_used;

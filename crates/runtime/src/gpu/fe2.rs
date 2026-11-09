@@ -612,6 +612,7 @@ static UP_FLIPS: Mutex<UpFlips> = Mutex::new(UpFlips { flip: 0, pages: 0, again:
 /// Pages [a, b) are uploaded into the mirror by this thread's batch
 /// (`up_census_on`).
 pub fn upload_census(a: u64, b: u64) {
+    crate::engine::note(crate::engine::C_UPLOAD, a, b.saturating_sub(a));
     if HELD_MAP.get().is_some() {
         // (The hold census: pages uploaded while held.)
         let n = (a & !(PAGE - 1)..b).step_by(PAGE as usize).filter(|&p| crate::hosted::held(p)).count() as u64;
@@ -4212,6 +4213,8 @@ fn wb_buckets_line() -> String {
     // Classes: neither, read by a CP, CPU-written, both: [buckets, dwords, pages].
     let mut cls = [[0u64; 3]; 4];
     let mut quiet: Vec<(u64, u32)> = Vec::new();
+    // (By the engine allocator owning the bucket's MiB: `engine::owner`.)
+    let mut by_owner = [[0u64; 2]; 256];
     let (mut cpu_pages_mixed, mut pages_mixed) = (0u64, 0u64);
     for k in 0..nb {
         let (dw, pg) = (gpu[k], gpu[nb + k]);
@@ -4221,6 +4224,9 @@ fn wb_buckets_line() -> String {
         let cw: u32 = (0..per).map(|j| cpu[k * per + j].load(Ordering::Relaxed).count_ones()).sum();
         let rw: u32 = (0..per).map(|j| rd[k * per + j].load(Ordering::Relaxed).count_ones()).sum();
         let ci = (rw > 0) as usize + 2 * (cw > 0) as usize;
+        let id = crate::engine::owner(MIRROR_BASE + ((k as u64) << (rdna::kernels::WB_BUCKET_SHIFT + 12))) as usize;
+        by_owner[id][0] += dw;
+        by_owner[id][1] += pg;
         cls[ci][0] += 1;
         cls[ci][1] += dw;
         cls[ci][2] += pg;
@@ -4254,7 +4260,12 @@ fn wb_buckets_line() -> String {
     maps.sort_by(|a, b| b.1.cmp(&a.1));
     let top: Vec<String> = maps.iter().take(8).map(|((s, z, n), dw)| format!("{n} {s:#x}+{z:#x} {:.2} M a flip", *dw as f64 / flips / 1e6)).collect();
     let lf: Vec<u64> = WB_LAZY_FAULTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    format!(
+    let anames = crate::engine::names();
+    let mut owners: Vec<(usize, [u64; 2])> = by_owner.iter().copied().enumerate().filter(|x| x.1[0] + x.1[1] > 0).collect();
+    owners.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
+    let owners: Vec<String> = owners.iter().map(|(id, x)| format!("{id} {}: {:.2} M dwords ({:.0}%), {:.0} pages a flip", anames.get(&(*id as u8)).map_or("none", |s| s.as_str()), x[0] as f64 / flips / 1e6, 100.0 * x[0] as f64 / dw_all.max(1) as f64, x[1] as f64 / flips)).collect();
+    let owners = if owners.is_empty() { String::new() } else { format!("    write-backs by owning engine allocator: {}\n", owners.join("; ")) };
+    owners + &format!(
         "    write-back buckets (`DS_WB_BUCKETS`, 1 MiB, over {flips:.0} flips): {:.2} M dwords and {:.0} pages a flip; {}; the CPU wrote {:.1}% of the pages of the buckets it wrote; untouched by mapping: {}; `wbb lazy` pages armed no-access {} ({} runs failed), faults on them so far: the title {} reads / {} writes, ours {} / {}, other code {} / {}\n",
         dw_all as f64 / flips / 1e6,
         pg_all as f64 / flips,
