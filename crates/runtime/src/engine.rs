@@ -95,7 +95,16 @@ pub const C_READ_WAIT: usize = 2;
 /// Front end 2's placements past its memo (`Exec::fe2_place`): count and ns.
 pub const C_PLACE: usize = 3;
 pub const C_PLACE_NS: usize = 4;
-const C_KINDS: usize = 5;
+/// The hold census (`DS_FE2_HOLD=1`): GPU-written pages held, and the
+/// title's reads and writes that faulted on them.
+pub const C_HELD: usize = 5;
+pub const C_HOLD_TR: usize = 6;
+pub const C_HOLD_TW: usize = 7;
+/// CPU write faults on pages front end 2 armed (`fe2` fault loop), and those
+/// of them on pages it holds as GPU-written.
+pub const C_ARM_FAULT: usize = 8;
+pub const C_ARM_FAULT_GPU: usize = 9;
+const C_KINDS: usize = 10;
 static CENSUS: [[AtomicU64; C_KINDS]; 256] = [const { [const { AtomicU64::new(0) }; C_KINDS] }; 256];
 /// The flip the census started at (+1; 0: not started).
 static CENSUS_FLIP0: AtomicU64 = AtomicU64::new(0);
@@ -120,6 +129,55 @@ pub fn note(kind: usize, a: u64, n: u64) {
         CENSUS[owner(x) as usize][kind].fetch_add(e - x, Ordering::Relaxed);
         x = e;
     }
+    if kind == C_UPLOAD {
+        note_upload_record(a, n);
+    }
+}
+
+/// The page allocator's live allocations (start, size, allocator ID), sorted,
+/// rebuilt at most every 2 s for the census.
+static INDEX: parking_lot::Mutex<(Option<std::time::Instant>, Vec<(u64, u64, u8)>)> = parking_lot::Mutex::new((None, Vec::new()));
+/// Bytes uploaded into each allocation (by start): (ID, size, bytes).
+static UP_BY_REC: parking_lot::Mutex<Option<std::collections::HashMap<u64, (u8, u64, u64)>>> = parking_lot::Mutex::new(None);
+
+/// The live allocations of both pools (start, size, allocator ID).
+fn records() -> Vec<(u64, u64, u8)> {
+    let Some(t) = tracking() else { return Vec::new() };
+    let mut v = Vec::new();
+    for head in [t, t + 0xa0] {
+        let Some(mut n) = rd64(head + 0x10) else { continue };
+        let mut steps = 0;
+        while n != head && n != 0 && steps < 20_000 {
+            steps += 1;
+            let rec = n - 0x20;
+            let (Some(alloc), Some(size), Some(addr)) = (rd64(rec + 0x40), rd64(rec + 0x58), rd64(rec + 0x60)) else { break };
+            let id = if alloc != 0 && crate::mem::readable(alloc + 0x30, 1) { unsafe { std::ptr::read_volatile((alloc + 0x30) as *const u8) } } else { 0 };
+            v.push((addr, size, id));
+            let Some(next) = rd64(n + 0x10) else { break };
+            n = next;
+        }
+    }
+    v.sort_unstable();
+    v
+}
+
+/// Census: uploads of [a, a + n) by the allocation holding `a`.
+fn note_upload_record(a: u64, n: u64) {
+    let rec = {
+        let mut g = INDEX.lock();
+        if g.0.is_none_or(|t| t.elapsed().as_secs() >= 2) {
+            g.1 = records();
+            g.0 = Some(std::time::Instant::now());
+        }
+        let i = g.1.partition_point(|r| r.0 <= a);
+        (i > 0).then(|| g.1[i - 1]).filter(|r| a < r.0 + r.1)
+    };
+    // (No record: the MiB, named by its owner in the per-MiB table, as id +
+    // 100 in the report.)
+    let (start, size, id) = rec.unwrap_or((a & !0xFFFFF, 0, owner(a).saturating_add(100)));
+    let mut g = UP_BY_REC.lock();
+    let e = g.get_or_insert_with(Default::default).entry(start).or_insert((id, size, 0));
+    e.2 += n;
 }
 
 /// Counts one event of `kind` at `a`'s owner.
@@ -158,10 +216,25 @@ fn census_line() -> String {
             continue;
         }
         let name = names.get(&(id as u8)).cloned().unwrap_or_else(|| if id == 0 { "none".into() } else { "?".into() });
-        rows.push((c[C_PLACE_NS], format!("{id} {name}: placements {:.0} ({:.2} ms), GPU-written {:.2} MiB, uploaded {:.2} MiB, read waits {:.2}", c[C_PLACE] as f64 / flips, c[C_PLACE_NS] as f64 / flips / 1e6, c[C_GPU_WRITE] as f64 / flips / 1048576.0, c[C_UPLOAD] as f64 / flips / 1048576.0, c[C_READ_WAIT] as f64 / flips)));
+        let armf = if c[C_ARM_FAULT] > 0 { format!(", write faults on armed pages {:.2} ({:.2} on GPU-written ones)", c[C_ARM_FAULT] as f64 / flips, c[C_ARM_FAULT_GPU] as f64 / flips) } else { String::new() };
+        let held = if c[C_HELD] + c[C_HOLD_TR] + c[C_HOLD_TW] > 0 { format!(", held {:.0} pages, the title faulted on them {:.2} reads / {:.2} writes", c[C_HELD] as f64 / flips, c[C_HOLD_TR] as f64 / flips, c[C_HOLD_TW] as f64 / flips) } else { String::new() };
+        rows.push((c[C_PLACE_NS], format!("{id} {name}: placements {:.0} ({:.2} ms), GPU-written {:.2} MiB, uploaded {:.2} MiB, read waits {:.2}{armf}{held}", c[C_PLACE] as f64 / flips, c[C_PLACE_NS] as f64 / flips / 1e6, c[C_GPU_WRITE] as f64 / flips / 1048576.0, c[C_UPLOAD] as f64 / flips / 1048576.0, c[C_READ_WAIT] as f64 / flips)));
     }
     rows.sort_by(|a, b| b.0.cmp(&a.0));
+    // Uploads by allocation: how many allocations of each allocator take
+    // them, and the largest.
+    let mut recs: Vec<(u64, (u8, u64, u64))> = UP_BY_REC.lock().as_ref().map(|m| m.iter().map(|(k, v)| (*k, *v)).collect()).unwrap_or_default();
+    recs.sort_by(|a, b| b.1 .2.cmp(&a.1 .2));
+    let mut per_id: std::collections::BTreeMap<u8, (u64, u64)> = std::collections::BTreeMap::new();
+    for (_, (id, _, bytes)) in &recs {
+        let e = per_id.entry(*id).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += bytes;
+    }
+    let ups: Vec<String> = per_id.iter().map(|(id, (k, b))| format!("{id}: {k} allocations, {:.2} MiB", *b as f64 / flips / 1048576.0)).collect();
+    let top: Vec<String> = recs.iter().take(16).map(|(start, (id, size, b))| format!("{start:#x}+{size:#x} (id {id}) {:.3} MiB", *b as f64 / flips / 1048576.0)).collect();
     format!("    engine census per flip over {flips:.0} flips, by owning allocator: {}\n", rows.into_iter().map(|r| r.1).collect::<Vec<_>>().join("; "))
+        + &format!("    engine census: uploads a flip by allocation: {}; largest: {}\n", ups.join(", "), top.join(", "))
 }
 
 /// MiB per owning allocator ID now, with each ID's lowest and highest

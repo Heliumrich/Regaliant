@@ -2996,6 +2996,12 @@ fn watch() {
             FAULTS[F_SPAN].fetch_add(1, Ordering::Relaxed);
             let (i, w) = (idx(page), idx(page) / 64);
             let bit = 1u64 << (i % 64);
+            if crate::engine::census_on() {
+                crate::engine::note_count(crate::engine::C_ARM_FAULT, page);
+                if c.gpu[w].load(Ordering::Acquire) & bit != 0 {
+                    crate::engine::note_count(crate::engine::C_ARM_FAULT_GPU, page);
+                }
+            }
             // (A take's `note_arming_ended` may have seen it first.)
             if c.armed[w].fetch_and(!bit, Ordering::AcqRel) & bit != 0 {
                 let v = c.level[i].fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some((v + 1).min(ARM_MAX_LEVEL))).unwrap_or(0);
@@ -3265,6 +3271,7 @@ fn hold_part(x: u64, y: u64) {
             HOLD[H_PAGES].fetch_add(n, Ordering::Relaxed);
             HOLD[H_RUNS].fetch_add(1, Ordering::Relaxed);
             HOLD[H_HELD_NOW].fetch_add(n, Ordering::Relaxed);
+            crate::engine::note_value(crate::engine::C_HELD, p, n);
         }
         STATS[S_ARMED].fetch_add((q - p) / PAGE, Ordering::Relaxed);
         p = q;
@@ -3904,6 +3911,9 @@ fn note_hold_fault(page: u64, write: bool, rip: u64) {
     };
     let n = HOLD[H_FAULTS + 2 * origin + write as usize].fetch_add(1, Ordering::Relaxed);
     HOLD[H_HELD_NOW].fetch_sub(1, Ordering::Relaxed);
+    if origin == 0 {
+        crate::engine::note_count(if write { crate::engine::C_HOLD_TW } else { crate::engine::C_HOLD_TR }, page);
+    }
     if hold_once() && (MIRROR_BASE..MIRROR_END).contains(&page) {
         let i = ((page - MIRROR_BASE) / PAGE) as usize;
         if no_hold()[i / 32].fetch_or(1 << (i % 32), Ordering::Relaxed) >> (i % 32) & 1 == 0 {
