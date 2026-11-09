@@ -485,7 +485,7 @@ pub const SCATTER_LOCAL_SIZE: u32 = 256;
 /// map, binding 1 the SCATTER_COUNTERS counters. Push constants `{mirror
 /// (low, high), table (low, high)}`.
 pub fn mirror_scatter() -> Vec<u32> {
-    build_scatter(false, false, false, 0).expect("mirror scatter kernel")
+    build_scatter(false, false, false, 0, false).expect("mirror scatter kernel")
 }
 
 /// `mirror_scatter` emptying the touched-page list itself: workgroup 0's
@@ -495,7 +495,7 @@ pub fn mirror_scatter() -> Vec<u32> {
 /// dispatch made as many as the count), so the write-back needs no fill of
 /// the count and no barrier before one.
 pub fn mirror_scatter_reset() -> Vec<u32> {
-    build_scatter(true, false, false, 0).expect("mirror scatter kernel (emptying the list)")
+    build_scatter(true, false, false, 0, false).expect("mirror scatter kernel (emptying the list)")
 }
 
 /// `mirror_scatter_reset` that also adds, per bucket of 2^WB_BUCKET_SHIFT
@@ -505,7 +505,7 @@ pub fn mirror_scatter_reset() -> Vec<u32> {
 /// of buckets whose bit at WB_LAZY_AT is set (their marks cleared, their
 /// dwords counted as if stored).
 pub fn mirror_scatter_counting() -> Vec<u32> {
-    build_scatter(true, true, false, 0).expect("mirror scatter kernel (counting buckets)")
+    build_scatter(true, true, false, 0, false).expect("mirror scatter kernel (counting buckets)")
 }
 
 /// `mirror_scatter_reset` that also counts what holding pages would leave
@@ -518,7 +518,7 @@ pub fn mirror_scatter_counting() -> Vec<u32> {
 /// i of word MARK_AUX_AT + i / 32: written back since the runtime last read
 /// and cleared them).
 pub fn mirror_scatter_hold_census() -> Vec<u32> {
-    build_scatter(true, false, true, 0).expect("mirror scatter kernel (hold census)")
+    build_scatter(true, false, true, 0, false).expect("mirror scatter kernel (hold census)")
 }
 
 /// `mirror_scatter_reset` that also counts the pages it stores unchanged
@@ -527,7 +527,7 @@ pub fn mirror_scatter_hold_census() -> Vec<u32> {
 /// all equal it adds them to counter 4 and itself to counter 5 (stores
 /// unchanged).
 pub fn mirror_scatter_same_census() -> Vec<u32> {
-    build_scatter(true, false, false, 1).expect("mirror scatter kernel (same-page census)")
+    build_scatter(true, false, false, 1, false).expect("mirror scatter kernel (same-page census)")
 }
 
 /// `mirror_scatter_reset` that leaves out pages it would store unchanged (the
@@ -541,10 +541,22 @@ pub fn mirror_scatter_same_census() -> Vec<u32> {
 /// match needs a 64-bit hash collision. Counters 4 and 5 add the dwords and
 /// pages left out (counter 1 counts those stored).
 pub fn mirror_scatter_same_skip() -> Vec<u32> {
-    build_scatter(true, false, false, 2).expect("mirror scatter kernel (skipping unchanged pages)")
+    build_scatter(true, false, false, 2, false).expect("mirror scatter kernel (skipping unchanged pages)")
 }
 
-fn build_scatter(reset: bool, count: bool, hold: bool, same: u8) -> Result<Vec<u32>, rspirv::dr::Error> {
+/// `mirror_scatter_reset` storing a page's partly marked 128-byte lines one
+/// dword per line in each store instruction (invocation l of a subgroup
+/// takes line l, the subgroups the line's dwords in turn), fully marked
+/// lines as before: a store instruction whose marked dwords leave holes in
+/// one line runs ~100x slower into host memory on the RTX 4090 than one
+/// that writes single dwords of different lines (FINDINGS.md 2026-11-09:
+/// 2 of every 3 dwords marked 66 ms for 2,048 pages, 32 isolated dwords a
+/// page 0.42 ms). The same dwords are stored.
+pub fn mirror_scatter_split() -> Vec<u32> {
+    build_scatter(true, false, false, 0, true).expect("mirror scatter kernel (split lines)")
+}
+
+fn build_scatter(reset: bool, count: bool, hold: bool, same: u8, split: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     let lit = Operand::LiteralBit32;
     let mut b = Builder::new();
     b.set_version(1, 3);
@@ -831,7 +843,9 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8) -> Result<Vec<u
     } else {
         store_ok
     };
-    // Dwords lid + 256 r, r = 0..3: marked ones copied.
+    // Dwords lid + 256 r, r = 0..3: marked ones copied (`split`: those of
+    // fully marked lines only; the rest below).
+    let all_ones = c(&mut b, u32::MAX);
     for r in 0..4u32 {
         let cr = b.constant_bit32(u32t, r * SCATTER_LOCAL_SIZE);
         let d = b.i_add(u32t, None, lid, cr)?;
@@ -841,6 +855,12 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8) -> Result<Vec<u
         let bit = b.bitwise_and(u32t, None, sh, c1)?;
         let set = b.i_not_equal(bool_, None, bit, c0)?;
         let go = b.logical_and(bool_, None, set, store_ok)?;
+        let go = if split {
+            let full = b.i_equal(bool_, None, mw, all_ones)?;
+            b.logical_and(bool_, None, go, full)?
+        } else {
+            go
+        };
         let (l_cp, l_cpd) = (b.id(), b.id());
         b.selection_merge(l_cpd, SelectionControl::NONE)?;
         b.branch_conditional(go, l_cp, l_cpd, [])?;
@@ -862,6 +882,43 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8) -> Result<Vec<u
         b.store(dp, v, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
         b.branch(l_cpd)?;
         b.begin_block(Some(l_cpd))?;
+    }
+    if split {
+        // Partly marked lines: invocation l of each subgroup takes line
+        // l % 32 (its mask word), subgroup w its dwords w, w + 8, w + 16,
+        // w + 24: each store instruction writes single dwords of different
+        // lines.
+        let line = bit_of;
+        let mwl = mask_word(&mut b, line)?;
+        let nz = b.i_not_equal(bool_, None, mwl, c0)?;
+        let nf = b.i_not_equal(bool_, None, mwl, all_ones)?;
+        let partial = b.logical_and(bool_, None, nz, nf)?;
+        let partial = b.logical_and(bool_, None, partial, store_ok)?;
+        let warp = b.shift_right_logical(u32t, None, lid, c5)?;
+        let line32 = b.shift_left_logical(u32t, None, line, c5)?;
+        for k in 0..4u32 {
+            let ck = b.constant_bit32(u32t, 8 * k);
+            let j = b.i_add(u32t, None, warp, ck)?;
+            let sh = b.shift_right_logical(u32t, None, mwl, j)?;
+            let bit = b.bitwise_and(u32t, None, sh, c1)?;
+            let set = b.i_not_equal(bool_, None, bit, c0)?;
+            let go = b.logical_and(bool_, None, set, partial)?;
+            let (l_sp, l_spd) = (b.id(), b.id());
+            b.selection_merge(l_spd, SelectionControl::NONE)?;
+            b.branch_conditional(go, l_sp, l_spd, [])?;
+            b.begin_block(Some(l_sp))?;
+            let d = b.i_add(u32t, None, line32, j)?;
+            let d4 = b.shift_left_logical(u32t, None, d, c2)?;
+            let d64 = b.u_convert(u64t, None, d4)?;
+            let sa = b.i_add(u64t, None, msrc, d64)?;
+            let sp = b.convert_u_to_ptr(p_dev, None, sa)?;
+            let v = b.load(u32t, None, sp, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+            let da = b.i_add(u64t, None, dest, d64)?;
+            let dp = b.convert_u_to_ptr(p_dev, None, da)?;
+            b.store(dp, v, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+            b.branch(l_spd)?;
+            b.begin_block(Some(l_spd))?;
+        }
     }
     if diff_sh.is_some() && same == 1 {
         // (Every invocation's comparisons in before invocation 0 counts.)
@@ -1319,6 +1376,17 @@ mod tests {
         if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
             let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("mirror_scatter_reset.spv"), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn scatter_split_kernel_assembles() {
+        let w = super::mirror_scatter_split();
+        assert_eq!(w[0], 0x0723_0203);
+        assert_ne!(w, super::mirror_scatter_reset());
+        if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("mirror_scatter_split.spv"), bytes).unwrap();
         }
     }
 

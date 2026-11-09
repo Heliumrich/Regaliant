@@ -3483,7 +3483,11 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
         } else if HELD_MAP.get().is_some() {
             rdna::kernels::mirror_scatter_hold_census()
         } else {
-            rdna::kernels::mirror_scatter_reset()
+            // (Partly marked lines stored one dword per line in each store
+            // instruction: ~6-7x faster into host memory than a line with
+            // holes from one instruction, the same dwords; FINDINGS.md
+            // 2026-11-09 "Holey write-backs".)
+            rdna::kernels::mirror_scatter_split()
         };
         let make = |code: &[u32], key: u64| -> Result<vk::Pipeline, String> {
             let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None).map_err(|e| format!("scatter module: {e}"))?;
@@ -3493,7 +3497,7 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
             c.device.destroy_shader_module(module, None);
             Ok(pipeline?[0])
         };
-        let pipeline = make(&code, if wb_buckets() { 27 } else if wb_same_mode() == 1 { 34 } else if HELD_MAP.get().is_some() { 28 } else { 20 })?;
+        let pipeline = make(&code, if wb_buckets() { 27 } else if wb_same_mode() == 1 { 34 } else if HELD_MAP.get().is_some() { 28 } else { 42 })?;
         if wb_same_mode() == 2 && SAME_SKIP.get().is_none() {
             // (The tables first: zeroed, and the buffer of zeros.)
             let mut tables = Vec::new();
@@ -4733,7 +4737,7 @@ fn scatter_bench() -> Result<String, String> {
         };
         let period = c.limits.timestamp_period as f64;
         let bits_at = 4 * (rdna::kernels::MARK_PAGE_BITS_AT as u64 + p0 / 32);
-        let names = ["an empty list", "pages without marks", "1 dword a page", "32 consecutive dwords a page", "32 dwords a page one in 32", "every dword", "copied whole", "filled", "driver memory filled"];
+        let names = ["an empty list", "pages without marks", "1 dword a page", "32 consecutive dwords a page", "32 dwords a page one in 32", "every dword", "copied whole", "filled", "driver memory filled", "2 of every 3 dwords", "every other dword", "2 of every 3 dwords, one page in 4"];
         // (Host memory the driver allocated, for case 8.)
         let (drv, drv_mem, _) = c.host_buffer(bench_pages * PAGE, vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC)?;
         let pattern = |k: usize| -> [u32; 32] {
@@ -4743,6 +4747,17 @@ fn scatter_bench() -> Result<String, String> {
                 3 => m[0] = u32::MAX,
                 4 => m = [1; 32],
                 5 => m = [u32::MAX; 32],
+                // (The swamp's records: dwords 1-2 of 12-byte records.)
+                9 | 11 => {
+                    for (w, x) in m.iter_mut().enumerate() {
+                        for b in 0..32 {
+                            if (w * 32 + b) % 3 != 0 {
+                                *x |= 1 << b;
+                            }
+                        }
+                    }
+                }
+                10 => m = [0x5555_5555; 32],
                 _ => {}
             }
             m
@@ -4750,12 +4765,13 @@ fn scatter_bench() -> Result<String, String> {
         let mut lines = Vec::new();
         let res = (|| {
             for (k, name) in names.iter().enumerate() {
-                // (6 and 7: no write-back; the list stays empty.)
-                let listed = if k == 0 || k >= 6 { 0 } else { bench_pages };
+                // (6-8: no write-back; the list stays empty. 11: a page in 4.)
+                let listed = if k == 0 || (6..=8).contains(&k) { 0 } else if k == 11 { bench_pages / 4 } else { bench_pages };
                 let mask: Vec<u8> = pattern(k).iter().flat_map(|x| x.to_le_bytes()).collect();
                 let masks: Vec<u8> = (0..bench_pages).flat_map(|_| mask.iter().copied()).collect();
                 let touched: Vec<u8> = (0..bench_pages / 32).flat_map(|_| (if listed > 0 { u32::MAX } else { 0u32 }).to_le_bytes()).collect();
-                let list: Vec<u8> = [listed as u32, 1, 1, 0].into_iter().chain((0..listed).map(|i| (p0 + i) as u32)).flat_map(|x| x.to_le_bytes()).collect();
+                let step = if k == 11 { 4 } else { 1 };
+                let list: Vec<u8> = [listed as u32, 1, 1, 0].into_iter().chain((0..listed).map(|i| (p0 + step * i) as u32)).flat_map(|x| x.to_le_bytes()).collect();
                 let bytes = bench_pages * PAGE;
                 super::resident::one_off_now(|cmd| unsafe {
                     c.device.cmd_reset_query_pool(cmd, qp, 0, n);
@@ -4767,7 +4783,7 @@ fn scatter_bench() -> Result<String, String> {
                         let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
                         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
                         c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, 2 * r);
-                        if k < 6 {
+                        if k < 6 || k >= 9 {
                             record_scatter(cmd, false);
                         } else {
                             let all = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
@@ -4796,6 +4812,9 @@ fn scatter_bench() -> Result<String, String> {
                     2 => bench_pages * 4,
                     3 | 4 => bench_pages * 128,
                     5..=8 => bytes,
+                    9 => bench_pages * 683 * 4,
+                    10 => bench_pages * 512 * 4,
+                    11 => bench_pages / 4 * 683 * 4,
                     _ => 0,
                 };
                 if stored >= 1 << 20 {
