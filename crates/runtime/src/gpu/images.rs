@@ -113,6 +113,37 @@ fn surface_key(s: &Surface) -> SurfaceKey {
     (s.base, s.format.as_raw(), s.width, s.height, s.layers, s.levels, s.ty3d, s.mip, s.slice, s.stencil_base, s.meta, s.clear)
 }
 
+/// Entries the memos of T# lookups hold before they are emptied (the
+/// per-thread `Tls::keys` and `Tls::views`, the cache's `key_memo` and
+/// `view_memo`); they are made with room for that many, so an insert never
+/// grows them. Growing one rehashed it under the cache's lock: 1-6 ms on
+/// one recording thread while every other one waited for that lock (the
+/// vista's stalled graphics runs; FINDINGS.md 2026-11-09). Their entries
+/// are T#s, whose words change as the title streams (the memos filled to
+/// this cap within minutes).
+const MEMO_CAP: usize = 1 << 16;
+
+/// A T#'s words as the memos of T# lookups key it: without the hardware LOD
+/// statistics' fields (word 5 bit 25, LOD_HDW_CNT_EN; word 6 bits 0..7, the
+/// counter bank: `lodstats`), which the title's streamer changes every frame
+/// for the textures it lends banks to and which neither the image nor its
+/// view depends on (each preparation reads them from the T# itself). Keyed
+/// with them, 98% of the T#s new to a thread's memo at the vista differed
+/// from one it held only there (~190 a flip; in-run x1.013, FINDINGS.md
+/// 2026-11-09).
+#[inline]
+fn memo_raw(t: &Tsharp) -> [u32; 8] {
+    let mut r = t.raw;
+    r[5] &= !(1 << 25);
+    r[6] &= !0xFF;
+    r
+}
+
+/// A memo of T# lookups made with room for MEMO_CAP entries.
+fn memo_map<K, V>() -> HashMap<K, V> {
+    HashMap::with_capacity_and_hasher(MEMO_CAP, Default::default())
+}
+
 /// Per-thread memos of the lookups every draw repeats (the recording
 /// threads of a parallel run all wanted the cache's one lock, which made
 /// every draw step 1.5-2x slower with three workers). Keys, targets, depth
@@ -137,7 +168,7 @@ struct Tls {
 pub static ANISO: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 thread_local! {
-    static TLS: std::cell::RefCell<Tls> = std::cell::RefCell::new(Tls::default());
+    static TLS: std::cell::RefCell<Tls> = std::cell::RefCell::new(Tls { keys: memo_map(), views: memo_map(), ..Tls::default() });
 }
 
 /// `f` on this thread's memos, those valid for one LOOKUP_GEN emptied if
@@ -205,9 +236,12 @@ pub fn memo_stats_line() -> String {
 /// `Images::view` from this thread's memo (sampled views only).
 pub fn view_hit(t: &Tsharp, frame: u64) -> Option<(vk::ImageView, vk::Image)> {
     let any_frame = scrubbing();
-    let e = tls(|m| m.views.get(&t.raw).copied());
+    let e = tls(|m| m.views.get(&memo_raw(t)).copied());
     let k = e.map_or(1, |e| e.miss(t, frame, any_frame));
     memo_note(k);
+    if k == 1 && tsharp_diff_on() {
+        tsharp_diff(t);
+    }
     if k == 0 {
         e.map(|e| {
             e.used.stamp(frame);
@@ -216,6 +250,61 @@ pub fn view_hit(t: &Tsharp, frame: u64) -> Option<(vk::ImageView, vk::Image)> {
     } else {
         None
     }
+}
+
+/// `DS_TSHARP_DIFF=1` (diagnosis): a T# this thread's view memo did not
+/// hold is compared with the last one it saw at the same base address; the
+/// dwords that differ are counted (`tsharp_diff_line`) and the first 24
+/// pairs logged: which T# words the title changes for one texture.
+fn tsharp_diff_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_TSHARP_DIFF").ok().as_deref() == Some("1"))
+}
+
+/// [misses, misses with an earlier T# at the base, then per dword the
+/// misses where it differed].
+static TSHARP_DIFF: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+/// The bits that differed, per dword (OR of the pairs' XORs).
+static TSHARP_XOR: [std::sync::atomic::AtomicU32; 8] = [const { std::sync::atomic::AtomicU32::new(0) }; 8];
+
+thread_local! {
+    static LAST_AT_BASE: std::cell::RefCell<HashMap<u64, [u32; 8]>> = std::cell::RefCell::new(HashMap::default());
+}
+
+fn tsharp_diff(t: &Tsharp) {
+    use std::sync::atomic::Ordering::Relaxed;
+    TSHARP_DIFF[0].fetch_add(1, Relaxed);
+    let before = LAST_AT_BASE.with(|m| m.borrow_mut().insert(t.base, t.raw));
+    let Some(b) = before.filter(|b| *b != t.raw) else { return };
+    TSHARP_DIFF[1].fetch_add(1, Relaxed);
+    for i in 0..8 {
+        if b[i] != t.raw[i] {
+            TSHARP_DIFF[2 + i].fetch_add(1, Relaxed);
+            TSHARP_XOR[i].fetch_or(b[i] ^ t.raw[i], Relaxed);
+        }
+    }
+    // Pairs that differ only in dwords 5-7 (the first 24 of them too).
+    static LOGGED_HI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if b[..5] == t.raw[..5] && LOGGED_HI.fetch_add(1, Relaxed) < 24 {
+        let w = |r: &[u32; 8]| r.iter().map(|x| format!("{x:08x}")).collect::<Vec<_>>().join(" ");
+        crate::info!("images: T# at {:#x} changed in dwords 5-7: [{}] -> [{}]", t.base, w(&b), w(&t.raw));
+    }
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Relaxed) < 24 {
+        let w = |r: &[u32; 8]| r.iter().map(|x| format!("{x:08x}")).collect::<Vec<_>>().join(" ");
+        crate::info!("images: T# at {:#x} changed: [{}] -> [{}]", t.base, w(&b), w(&t.raw));
+    }
+}
+
+/// The T# change census (`DS_TSHARP_DIFF`; "" when off).
+pub fn tsharp_diff_line() -> String {
+    if !tsharp_diff_on() {
+        return String::new();
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let v: Vec<u64> = TSHARP_DIFF.iter().map(|c| c.load(Relaxed)).collect();
+    let x: Vec<String> = TSHARP_XOR.iter().map(|c| format!("{:08x}", c.load(Relaxed))).collect();
+    format!("    T#s new to a thread's view memo (`DS_TSHARP_DIFF`): {}, {} of them another T# at a base seen before; differing dwords 0-7: {:?}; bits that differed: [{}]\n", v[0], v[1], &v[2..], x.join(" "))
 }
 
 /// `Images::sampler` from this thread's memo.
@@ -227,7 +316,7 @@ pub fn sampler_hit(s: [u32; 4], compare: bool) -> Option<vk::Sampler> {
 /// `Images::resolved_key` from this thread's memo (None: not memoized).
 pub fn key_hit(t: &Tsharp, storage: bool) -> Option<Option<ImageKey>> {
     use std::sync::atomic::Ordering::Acquire;
-    let r = tls(|m| m.keys.get(&(t.raw, storage)).copied()).filter(|e| e.1 == GPU_IMAGES_GEN.load(Acquire) && e.2 == base_gen(t.base).load(Acquire)).map(|e| e.0);
+    let r = tls(|m| m.keys.get(&(memo_raw(t), storage)).copied()).filter(|e| e.1 == GPU_IMAGES_GEN.load(Acquire) && e.2 == base_gen(t.base).load(Acquire)).map(|e| e.0);
     memo_note(if r.is_some() { 5 } else { 6 });
     r
 }
@@ -1695,7 +1784,55 @@ thread_local! {
 
 fn holds_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_IMAGE_HOLDS").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| matches!(std::env::var("DS_IMAGE_HOLDS").ok().as_deref(), Some("1" | "2")))
+}
+
+/// `DS_IMAGE_HOLDS=2` (diagnosis): as 1, and a thread that waited 1 ms for
+/// the image cache's lock samples the holder's stack, logged with the
+/// holder's thread and call site of `with` (the first 200, from flip
+/// `DS_HOLDS_FROM` on).
+fn holder_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_IMAGE_HOLDS").ok().as_deref() == Some("2"))
+}
+
+/// The image cache's holder (`holder_trace`): its host thread id, and its
+/// thread name and call site.
+static HOLDER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static HOLDER_AT: Mutex<(String, &'static str, u32)> = Mutex::new((String::new(), "", 0));
+
+/// Logs the image cache's holder's stack (`holder_trace`).
+fn sample_holder(waiter: &std::panic::Location<'static>) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // (`DS_HOLDS_FROM=<flip>`: from that flip on.)
+    static FROM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let from = *FROM.get_or_init(|| std::env::var("DS_HOLDS_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    let tid = HOLDER.load(std::sync::atomic::Ordering::Acquire);
+    if tid == 0 || super::FRAMES.load(std::sync::atomic::Ordering::Relaxed) < from || N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 200 {
+        return;
+    }
+    let (name, file, line) = HOLDER_AT.lock().clone();
+    let Some((frames, _)) = crate::exception::sample_frames(tid, 0) else { return };
+    let labels: Vec<String> = frames
+        .iter()
+        .enumerate()
+        .take(18)
+        .map(|(i, &a)| {
+            let f = crate::exception::frame_label(a);
+            match crate::exception::host_line(a.saturating_sub((i > 0) as u64)) {
+                Some(l) if f.starts_with("dsport::") => format!("{} ({l})", f.rsplit("::").next().unwrap_or(&f)),
+                _ => f,
+            }
+        })
+        .collect();
+    crate::info!(
+        "images: the cache's lock held over 1 ms at flip {} by {name} (from {file}:{line}; {} waiting at {}:{}): {}",
+        super::FRAMES.load(std::sync::atomic::Ordering::Relaxed),
+        crate::log::thread_name(),
+        waiter.file(),
+        waiter.line(),
+        labels.join(" <- ")
+    );
 }
 
 fn hold_class() -> usize {
@@ -2412,7 +2549,22 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
         }
     });
     let asked = holds_on().then(std::time::Instant::now);
-    let mut g = super::lockstat::IMAGE_CACHE.lock(&IMAGES);
+    let mut g = if holder_trace() {
+        match IMAGES.try_lock_for(std::time::Duration::from_millis(1)) {
+            Some(g) => g,
+            None => {
+                sample_holder(std::panic::Location::caller());
+                super::lockstat::IMAGE_CACHE.lock(&IMAGES)
+            }
+        }
+    } else {
+        super::lockstat::IMAGE_CACHE.lock(&IMAGES)
+    };
+    if holder_trace() {
+        let l = std::panic::Location::caller();
+        *HOLDER_AT.lock() = (crate::log::thread_name(), l.file(), l.line());
+        HOLDER.store(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }, std::sync::atomic::Ordering::Release);
+    }
     let held_from = holds_on().then(std::time::Instant::now);
     if let (Some(a), Some(b)) = (asked, held_from) {
         let ns = (b - a).as_nanos() as u64;
@@ -2437,7 +2589,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
             let qp = upload_stamps();
-            *g = Some(Images { qp, map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: HashMap::default(), key_memo: HashMap::default(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, inflight: Default::default(), spare_cmds: Vec::new(), detile_free: Vec::new(), copy_pool: vk::CommandPool::null(), copy_spare: Vec::new(), copy_timeline: vk::Semaphore::null(), copy_value: 0, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default(), refreshing: HashMap::default() });
+            *g = Some(Images { qp, map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: memo_map(), key_memo: memo_map(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, inflight: Default::default(), spare_cmds: Vec::new(), detile_free: Vec::new(), copy_pool: vk::CommandPool::null(), copy_spare: Vec::new(), copy_timeline: vk::Semaphore::null(), copy_value: 0, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default(), refreshing: HashMap::default() });
         }
     }
     let im = g.as_mut().unwrap();
@@ -2463,6 +2615,9 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
             e.0 += 1;
             e.1 += ns;
         }
+    }
+    if holder_trace() {
+        HOLDER.store(0, std::sync::atomic::Ordering::Release);
     }
     r
 }
@@ -4008,27 +4163,28 @@ impl Images {
         // (Generations read before the lookup; it holds while they do.)
         use std::sync::atomic::Ordering::Acquire;
         let (gpu_gen, bgen) = (GPU_IMAGES_GEN.load(Acquire), base_gen(t.base).load(Acquire));
-        if let Some(&(k, g, b)) = self.key_memo.get(&(t.raw, storage)) {
+        let mk = memo_raw(t);
+        if let Some(&(k, g, b)) = self.key_memo.get(&(mk, storage)) {
             if g == gpu_gen && b == bgen {
                 tls(|m| {
-                    if m.keys.len() >= 1 << 16 {
+                    if m.keys.len() >= MEMO_CAP {
                         m.keys.clear();
                     }
-                    m.keys.insert((t.raw, storage), (k, g, b));
+                    m.keys.insert((mk, storage), (k, g, b));
                 });
                 return k;
             }
         }
         let k = self.lookup(&Self::key_of(t)?, storage).map(|(k, _)| k);
-        if self.key_memo.len() >= 1 << 16 {
+        if self.key_memo.len() >= MEMO_CAP {
             self.key_memo.clear();
         }
-        self.key_memo.insert((t.raw, storage), (k, gpu_gen, bgen));
+        self.key_memo.insert((mk, storage), (k, gpu_gen, bgen));
         tls(|m| {
-            if m.keys.len() >= 1 << 16 {
+            if m.keys.len() >= MEMO_CAP {
                 m.keys.clear();
             }
-            m.keys.insert((t.raw, storage), (k, gpu_gen, bgen));
+            m.keys.insert((mk, storage), (k, gpu_gen, bgen));
         });
         k
     }
@@ -5204,7 +5360,8 @@ impl Images {
         let key = Self::key_of(t);
         let region_before = key.and_then(|k| self.map.get(&k)).and_then(|i| i.source_gen);
         let rgen = region_before.map_or(0, |g| g.load(Acquire));
-        if let Some(m) = self.view_memo.get(&t.raw).copied() {
+        let mk = memo_raw(t);
+        if let Some(m) = self.view_memo.get(&mk).copied() {
             // (An image whose upload a thread left for after the lock goes
             // the full way, whose `refresh` waits for it: a memo another
             // waiting thread made would hand it out unrecorded.)
@@ -5214,10 +5371,10 @@ impl Images {
                 // that made the entry took this lock for each lookup (64% of
                 // view lookups missed their memo, run 20261012-073715).
                 tls(|tm| {
-                    if tm.views.len() >= 1 << 16 {
+                    if tm.views.len() >= MEMO_CAP {
                         tm.views.clear();
                     }
-                    tm.views.insert(t.raw, ViewMemo { frame, ..m });
+                    tm.views.insert(mk, ViewMemo { frame, ..m });
                 });
                 return Ok((m.view, m.image));
             }
@@ -5230,15 +5387,15 @@ impl Images {
         let region = found.and_then(|i| i.source_gen);
         let stale = found.is_none() || region.is_some() && !region.zip(region_before).is_some_and(|(a, b)| std::ptr::eq(a, b));
         let m = ViewMemo { frame, gpu_gen, base_gen: bgen, region, region_gen: rgen, stale, view: r.0, image: r.1, used: r.2 };
-        if self.view_memo.len() >= 1 << 16 {
+        if self.view_memo.len() >= MEMO_CAP {
             self.view_memo.clear();
         }
-        self.view_memo.insert(t.raw, m);
+        self.view_memo.insert(mk, m);
         tls(|tm| {
-            if tm.views.len() >= 1 << 16 {
+            if tm.views.len() >= MEMO_CAP {
                 tm.views.clear();
             }
-            tm.views.insert(t.raw, m);
+            tm.views.insert(mk, m);
         });
         Ok((r.0, r.1))
     }

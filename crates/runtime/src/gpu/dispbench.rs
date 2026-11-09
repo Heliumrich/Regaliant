@@ -111,23 +111,197 @@ fn submit_bench(secs: u64) -> Result<(), String> {
             Ok(bursts)
         })
     });
+    // `DS_SUBMIT_BENCH_US=<us>`: the pause between submissions (default 900; 0: none, the 64
+    // fences pace them): whether the driver's slow submissions come per time or per number.
+    let pause = std::env::var("DS_SUBMIT_BENCH_US").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(900);
+    // `DS_SUBMIT_BENCH_TL=1`: each submission signals a timeline semaphore with its number and
+    // waits for the one before (as front end 2's batches do).
+    let tl = (std::env::var("DS_SUBMIT_BENCH_TL").ok().as_deref() == Some("1"))
+        .then(|| {
+            let mut tci = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
+            unsafe { d.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tci), None) }.map_err(|e| format!("timeline: {e}"))
+        })
+        .transpose()?;
+    // `DS_SUBMIT_BENCH_SHAPE=<shape>`: what one submission holds: `cmds8` (eight command buffers
+    // in one submit info), `infos8` (eight submit infos of one command buffer in one call),
+    // `nofence` (one command buffer, no fence: paced by a timeline semaphore it signals): which
+    // count the driver's slow submissions follow.
+    let shape = std::env::var("DS_SUBMIT_BENCH_SHAPE").unwrap_or_default();
+    let pace = (shape == "nofence")
+        .then(|| {
+            let mut tci = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
+            unsafe { d.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tci), None) }.map_err(|e| format!("timeline: {e}"))
+        })
+        .transpose()?;
+    // `DS_SUBMIT_BENCH_SLOW_US=<us>`: the duration counted as slow (default 2000).
+    let slow_us = std::env::var("DS_SUBMIT_BENCH_SLOW_US").ok().and_then(|v| v.parse::<u128>().ok()).unwrap_or(2000);
+    let alt = if shape == "alt_queue" {
+        let cq = c.compute.as_ref().ok_or("no compute queue")?;
+        let (cbuf, _cmem) = c.device_buffer(4096, vk::BufferUsageFlags::TRANSFER_DST)?;
+        std::mem::forget(_cmem);
+        unsafe {
+            let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(cq.family), None).map_err(|e| format!("pool: {e}"))?;
+            let ccmds = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(K as u32)).map_err(|e| format!("cmds: {e}"))?;
+            for &cb in &ccmds {
+                d.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default()).map_err(|e| format!("begin: {e}"))?;
+                d.cmd_fill_buffer(cb, cbuf, 0, 4, 0);
+                d.end_command_buffer(cb).map_err(|e| format!("end: {e}"))?;
+            }
+            let cfences: Vec<vk::Fence> = (0..K).map(|_| d.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)).collect::<Result<_, _>>().map_err(|e| format!("fence: {e}"))?;
+            Some((&cq.queue, ccmds, cfences))
+        }
+    } else {
+        None
+    };
+    let mut slow_calls: Vec<(u64, u8)> = Vec::new();
+    let mut durs: Vec<u32> = Vec::with_capacity(1 << 20);
     let (mut n, mut slow) = (0u64, Vec::new());
     let mut worst = 0u128;
     while std::time::Instant::now() < end {
         let k = (n as usize) % K;
+        if let Some(sem) = pace {
+            // Command buffer k is free once submission n - K completed.
+            if n >= K as u64 {
+                let v = [n - K as u64 + 1];
+                let sems = [sem];
+                unsafe { d.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&sems).values(&v), u64::MAX) }.map_err(|e| format!("wait: {e}"))?;
+            }
+            let t0 = std::time::Instant::now();
+            // (Raw: `submit_timeline` notes slow calls as hitches, which needs the title's clock.)
+            let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cmds[k])];
+            let sig = [vk::SemaphoreSubmitInfo::default().semaphore(sem).value(n + 1).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+            let info = [vk::SubmitInfo2::default().command_buffer_infos(&cbs).signal_semaphore_infos(&sig)];
+            let q = c.queue.lock();
+            unsafe { d.queue_submit2(*q, &info, vk::Fence::null()) }.map_err(|e| format!("submit: {e}"))?;
+            drop(q);
+            let us = t0.elapsed().as_micros();
+            worst = worst.max(us);
+                durs.push(us as u32);
+            if us >= slow_us {
+                slow.push((start.elapsed().as_secs_f64() * 1000.0, us));
+            }
+            n += 1;
+            if pause > 0 {
+                std::thread::sleep(std::time::Duration::from_micros(pause));
+            }
+            continue;
+        }
+        if shape == "empty_half" || shape == "alt_queue" {
+            // Every other call: an empty submission to the main queue (`empty_half`), or a fill on
+            // the compute family's queue (`alt_queue`): whether those calls count toward the
+            // driver's slow one.
+            let t0 = std::time::Instant::now();
+            if n % 2 == 0 {
+                unsafe {
+                    d.wait_for_fences(&[fences[k]], true, u64::MAX).map_err(|e| format!("wait: {e}"))?;
+                    d.reset_fences(&[fences[k]]).map_err(|e| format!("reset: {e}"))?;
+                }
+                let t0b = std::time::Instant::now();
+                c.submit(cmds[k], &[], &[], fences[k])?;
+                let us = t0b.elapsed().as_micros();
+                worst = worst.max(us);
+                durs.push(us as u32);
+                if us >= slow_us {
+                    slow.push((start.elapsed().as_secs_f64() * 1000.0, us));
+                    slow_calls.push((n, 0u8));
+                }
+            } else if shape == "empty_half" {
+                let info = [vk::SubmitInfo2::default()];
+                let q = c.queue.lock();
+                unsafe { d.queue_submit2(*q, &info, vk::Fence::null()) }.map_err(|e| format!("submit: {e}"))?;
+                drop(q);
+                let us = t0.elapsed().as_micros();
+                worst = worst.max(us);
+                durs.push(us as u32);
+                if us >= slow_us {
+                    slow.push((start.elapsed().as_secs_f64() * 1000.0, us));
+                    slow_calls.push((n, 1u8));
+                }
+            } else {
+                let (cq, ccmds, cfences) = alt.as_ref().ok_or("no compute queue")?;
+                unsafe {
+                    d.wait_for_fences(&[cfences[k]], true, u64::MAX).map_err(|e| format!("wait: {e}"))?;
+                    d.reset_fences(&[cfences[k]]).map_err(|e| format!("reset: {e}"))?;
+                }
+                let t0b = std::time::Instant::now();
+                let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(ccmds[k])];
+                let info = [vk::SubmitInfo2::default().command_buffer_infos(&cbs)];
+                let q = cq.lock();
+                unsafe { d.queue_submit2(*q, &info, cfences[k]) }.map_err(|e| format!("submit: {e}"))?;
+                drop(q);
+                let us = t0b.elapsed().as_micros();
+                worst = worst.max(us);
+                durs.push(us as u32);
+                if us >= slow_us {
+                    slow.push((start.elapsed().as_secs_f64() * 1000.0, us));
+                    slow_calls.push((n, 2u8));
+                }
+            }
+            n += 1;
+            if pause > 0 {
+                std::thread::sleep(std::time::Duration::from_micros(pause));
+            }
+            continue;
+        }
+        if shape == "cmds8" || shape == "infos8" {
+            // Eight command buffers a submission: the fence of group k / 8 guards them.
+            if k % 8 != 0 {
+                n += 1;
+                continue;
+            }
+            unsafe {
+                d.wait_for_fences(&[fences[k]], true, u64::MAX).map_err(|e| format!("wait: {e}"))?;
+                d.reset_fences(&[fences[k]]).map_err(|e| format!("reset: {e}"))?;
+            }
+            let group = &cmds[k..k + 8];
+            let t0 = std::time::Instant::now();
+            if shape == "cmds8" {
+                c.submit_cmds(group, &[], &[], fences[k])?;
+            } else {
+                let cbs: Vec<[vk::CommandBufferSubmitInfo; 1]> = group.iter().map(|&cb| [vk::CommandBufferSubmitInfo::default().command_buffer(cb)]).collect();
+                let infos: Vec<vk::SubmitInfo2> = cbs.iter().map(|cb| vk::SubmitInfo2::default().command_buffer_infos(cb)).collect();
+                let q = c.queue.lock();
+                unsafe { d.queue_submit2(*q, &infos, fences[k]) }.map_err(|e| format!("submit: {e}"))?;
+            }
+            let us = t0.elapsed().as_micros();
+            worst = worst.max(us);
+                durs.push(us as u32);
+            if us >= slow_us {
+                slow.push((start.elapsed().as_secs_f64() * 1000.0, us));
+            }
+            n += 1;
+            if pause > 0 {
+                std::thread::sleep(std::time::Duration::from_micros(pause));
+            }
+            continue;
+        }
         unsafe {
             d.wait_for_fences(&[fences[k]], true, u64::MAX).map_err(|e| format!("wait: {e}"))?;
             d.reset_fences(&[fences[k]]).map_err(|e| format!("reset: {e}"))?;
         }
         let t0 = std::time::Instant::now();
-        c.submit(cmds[k], &[], &[], fences[k])?;
+        match tl {
+            Some(sem) => {
+                let waits: Vec<(vk::Semaphore, u64, vk::PipelineStageFlags2)> = if n > 0 { vec![(sem, n, vk::PipelineStageFlags2::ALL_COMMANDS)] } else { Vec::new() };
+                let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cmds[k])];
+                let ws: Vec<vk::SemaphoreSubmitInfo> = waits.iter().map(|&(s2, v, st)| vk::SemaphoreSubmitInfo::default().semaphore(s2).value(v).stage_mask(st)).collect();
+                let sig = [vk::SemaphoreSubmitInfo::default().semaphore(sem).value(n + 1).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+                let info = [vk::SubmitInfo2::default().command_buffer_infos(&cbs).wait_semaphore_infos(&ws).signal_semaphore_infos(&sig)];
+                let q = c.queue.lock();
+                unsafe { d.queue_submit2(*q, &info, fences[k]) }.map_err(|e| format!("submit: {e}"))?;
+            }
+            None => c.submit(cmds[k], &[], &[], fences[k])?,
+        }
         let us = t0.elapsed().as_micros();
         worst = worst.max(us);
-        if us >= 2000 {
+                durs.push(us as u32);
+        if us >= slow_us {
             slow.push((start.elapsed().as_secs_f64() * 1000.0, us));
         }
         n += 1;
-        std::thread::sleep(std::time::Duration::from_micros(900));
+        if pause > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(pause));
+        }
     }
     if let Some(h) = loader {
         match h.join() {
@@ -142,7 +316,7 @@ fn submit_bench(secs: u64) -> Result<(), String> {
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let q = |f: f64| sorted.get(((sorted.len() as f64 - 1.0) * f) as usize).copied().unwrap_or(0.0);
     crate::info!(
-        "submit bench: {n} submissions in {:.1} s ({:.0} a second), {} took 2 ms or more (worst {} us); gaps between them ms: p10 {:.0}, p50 {:.0}, p90 {:.0}",
+        "submit bench: {n} submissions in {:.1} s ({:.0} a second), {} took {slow_us} us or more (worst {} us); gaps between them ms: p10 {:.0}, p50 {:.0}, p90 {:.0}",
         start.elapsed().as_secs_f64(),
         n as f64 / start.elapsed().as_secs_f64(),
         slow.len(),
@@ -151,6 +325,16 @@ fn submit_bench(secs: u64) -> Result<(), String> {
         q(0.5),
         q(0.9)
     );
+    if !durs.is_empty() {
+        let mut v = durs.clone();
+        v.sort_unstable();
+        let mean = v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64;
+        crate::info!("submit bench: {} timed calls: mean {:.1} us, p10 {} us, p50 {} us, p90 {} us, p99 {} us", v.len(), mean, v[v.len() / 10], v[v.len() / 2], v[v.len() * 9 / 10], v[v.len() * 99 / 100]);
+    }
+    if !slow_calls.is_empty() {
+        let v: Vec<String> = slow_calls.iter().take(24).map(|(i, w)| format!("{i}{}", ["m", "e", "c"][*w as usize])).collect();
+        crate::info!("submit bench: slow calls by index (m main, e empty, c compute): {}", v.join(" "));
+    }
     for (t, us) in slow.iter().take(40) {
         crate::info!("submit bench: slow submission at {t:.0} ms: {us} us");
     }

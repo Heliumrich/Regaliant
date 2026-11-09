@@ -2779,6 +2779,7 @@ pub fn profile_report() -> String {
     s.push_str(&exec::shader_profile());
     s.push_str(&drawcensus::lines(exec::profile_flips()));
     s.push_str(&exec::laps_report());
+    s.push_str(&images::tsharp_diff_line());
     s.push_str(&shaders::prep_memo_line());
     s.push_str(&fe3_probe::line(exec::profile_flips()));
     s.push_str(&cp::wait_stats());
