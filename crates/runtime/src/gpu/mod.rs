@@ -2180,6 +2180,205 @@ fn packet_mix(addr: u64, size: u32) -> (u32, u32, u32) {
     (d, w, o)
 }
 
+/// `DS_PM4_CENSUS=1` (diagnosis): how often the title submits command
+/// buffers whose packets repeat byte for byte (a recorded submission could
+/// then be replayed instead of recorded again). Per title submission, each
+/// buffer's dwords are hashed with the buffers its INDIRECT_BUFFER packets
+/// call (two levels) and compared with earlier submissions of a buffer at
+/// the same address on the same queue (the last four kept); its draws and
+/// dispatches are counted by what matched. The status report has the line;
+/// `profile reset` starts the counts again.
+fn pm4_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_PM4_CENSUS").ok().as_deref() == Some("1"))
+}
+
+/// (queue, buffer address) -> its last submissions: (flip, hash, dwords).
+static PM4_SEEN: Mutex<Option<std::collections::HashMap<(u32, u64), std::collections::VecDeque<(u64, u64, u32)>>>> = Mutex::new(None);
+
+/// [buffers, of them first seen at their address, the same as the last
+/// submission there, the same as an earlier one of the last four (not the
+/// last), different; then the same five classes' draws and dispatches;
+/// then their dwords; the age in flips of the matched submission summed,
+/// matches 0, 1, 2, 3+ flips old].
+static PM4_STATS: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
+
+/// A buffer's dwords hashed with the buffers its INDIRECT_BUFFER packets call
+/// (`depth` levels), and its (dispatches, draws).
+fn pm4_hash(addr: u64, size: u32, depth: u32, h: &mut u64, mix: &mut (u32, u32)) {
+    if !cp::guest_readable(addr, 4 * size as u64) {
+        *h ^= 0x9e37_79b9_7f4a_7c15;
+        return;
+    }
+    let w = unsafe { std::slice::from_raw_parts(addr as *const u32, size as usize) };
+    for &x in w {
+        *h = (*h ^ x as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    let mut i = 0usize;
+    while i < w.len() {
+        let hd = w[i];
+        if hd >> 30 != 3 {
+            i += 1;
+            continue;
+        }
+        let n = ((hd >> 16) & 0x3FFF) as usize + 1;
+        match (hd >> 8) & 0xFF {
+            0x15 | 0x16 => mix.0 += 1,
+            0x24 | 0x25 | 0x27 | 0x2C | 0x2D | 0x30 | 0x35 | 0x38 => mix.1 += 1,
+            0x3F if depth > 0 && i + 3 < w.len() => {
+                let target = (w[i + 1] & !3) as u64 | ((w[i + 2] as u64 & 0xFFFF) << 32);
+                let dw = w[i + 3] & 0xF_FFFF;
+                if target != 0 && dw != 0 {
+                    pm4_hash(target, dw, depth - 1, h, mix);
+                }
+            }
+            _ => {}
+        }
+        i += n + 1;
+    }
+}
+
+/// (queue, address) -> the last submission's dwords there (`pm4_census`).
+static PM4_LAST: Mutex<Option<std::collections::HashMap<(u32, u64), Vec<u32>>>> = Mutex::new(None);
+/// [buffers compared (same size), dwords compared, dwords differing, buffers
+/// of another size], then differing dwords by the opcode of their packet.
+static PM4_DIFF: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static PM4_DIFF_OPS: Mutex<Option<std::collections::HashMap<u32, u64>>> = Mutex::new(None);
+
+fn pm4_diff(queue_id: u32, addr: u64, size: u32) {
+    if !cp::guest_readable(addr, 4 * size as u64) {
+        return;
+    }
+    let w = unsafe { std::slice::from_raw_parts(addr as *const u32, size as usize) };
+    let mut g = PM4_LAST.lock();
+    let m = g.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(prev) = m.get(&(queue_id, addr)) {
+        if prev.len() == w.len() {
+            PM4_DIFF[0].fetch_add(1, Ordering::Relaxed);
+            PM4_DIFF[1].fetch_add(w.len() as u64, Ordering::Relaxed);
+            let mut ops = PM4_DIFF_OPS.lock();
+            let o = ops.get_or_insert_with(std::collections::HashMap::new);
+            let mut i = 0usize;
+            let mut nd = 0u64;
+            while i < w.len() {
+                let hd = w[i];
+                let n = if hd >> 30 == 3 { ((hd >> 16) & 0x3FFF) as usize + 2 } else { 1 };
+                let op = if hd >> 30 == 3 { (hd >> 8) & 0xFF } else { 0x100 };
+                let end = (i + n).min(w.len());
+                let d = (i..end).filter(|&k| w[k] != prev[k]).count() as u64;
+                if d != 0 {
+                    *o.entry(op).or_default() += d;
+                    nd += d;
+                }
+                i = end;
+            }
+            PM4_DIFF[2].fetch_add(nd, Ordering::Relaxed);
+        } else {
+            PM4_DIFF[3].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    m.insert((queue_id, addr), w.to_vec());
+    if m.len() > 4096 {
+        m.clear();
+    }
+}
+
+fn pm4_census(queue_id: u32, buffers: &[(u64, u32)]) {
+    for &(addr, size) in buffers {
+        pm4_diff(queue_id, addr, size);
+    }
+    let flip = FRAMES.load(Ordering::Relaxed);
+    let mut g = PM4_SEEN.lock();
+    let m = g.get_or_insert_with(std::collections::HashMap::new);
+    for &(addr, size) in buffers {
+        let mut h = 0xcbf2_9ce4_8422_2325u64 ^ size as u64;
+        let mut mix = (0u32, 0u32);
+        pm4_hash(addr, size, 2, &mut h, &mut mix);
+        let cmds = (mix.0 + mix.1) as u64;
+        let e = m.entry((queue_id, addr)).or_default();
+        let class = if e.is_empty() {
+            1
+        } else if e.back().is_some_and(|l| l.1 == h && l.2 == size) {
+            2
+        } else if e.iter().any(|l| l.1 == h && l.2 == size) {
+            3
+        } else {
+            4
+        };
+        if class == 2 || class == 3 {
+            let age = e.iter().rev().find(|l| l.1 == h && l.2 == size).map_or(0, |l| flip.saturating_sub(l.0));
+            PM4_STATS[15].fetch_add(age, Ordering::Relaxed);
+            PM4_STATS[16 + (age.min(3) as usize)].fetch_add(1, Ordering::Relaxed);
+        }
+        PM4_STATS[0].fetch_add(1, Ordering::Relaxed);
+        PM4_STATS[class].fetch_add(1, Ordering::Relaxed);
+        PM4_STATS[5 + class - 1].fetch_add(cmds, Ordering::Relaxed);
+        PM4_STATS[10 + class - 1].fetch_add(size as u64, Ordering::Relaxed);
+        if e.len() >= 4 {
+            e.pop_front();
+        }
+        e.push_back((flip, h, size));
+    }
+    if m.len() > 1 << 16 {
+        m.clear();
+    }
+}
+
+/// The census's status line ("" when off).
+pub fn pm4_census_line() -> String {
+    if !pm4_census_on() {
+        return String::new();
+    }
+    let s: Vec<u64> = PM4_STATS.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+    let dd: Vec<u64> = PM4_DIFF.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+    let mut ops: Vec<(u32, u64)> = PM4_DIFF_OPS.lock().as_ref().map(|m| m.iter().map(|(&k, &v)| (k, v)).collect()).unwrap_or_default();
+    ops.sort_by(|a, b| b.1.cmp(&a.1));
+    let diff_line = format!(
+        "    PM4 census, against the last submission at the same address: {} buffers of the same size ({} of another), {} of {} dwords differ ({:.2}%); by the packet holding them: {}\n",
+        dd[0],
+        dd[3],
+        dd[2],
+        dd[1],
+        100.0 * dd[2] as f64 / dd[1].max(1) as f64,
+        ops.iter().take(12).map(|&(op, n)| if op == 0x100 { format!("not a type-3 header {n}") } else { format!("{op:#x} {n}") }).collect::<Vec<_>>().join(", ")
+    );
+    let cmds: u64 = s[5..9].iter().sum::<u64>().max(1);
+    let pct = |x: u64| 100.0 * x as f64 / cmds as f64;
+    let matched = (s[2] + s[3]).max(1);
+    format!(
+        "    PM4 census: {} title command buffers (first at their address {}, as the last there {}, as an earlier one {}, new {}); their draws and dispatches {}: in repeated buffers {:.1}% (as the last {:.1}%, as an earlier one {:.1}%), first seen {:.1}%, new {:.1}%; dwords {} / {} / {} / {}; matched submissions {:.1} flips old on average (0: {}, 1: {}, 2: {}, 3+: {})\n",
+        s[0],
+        s[1],
+        s[2],
+        s[3],
+        s[4],
+        cmds,
+        pct(s[6] + s[7]),
+        pct(s[6]),
+        pct(s[7]),
+        pct(s[5]),
+        pct(s[8]),
+        s[10],
+        s[11],
+        s[12],
+        s[13],
+        s[15] as f64 / matched as f64,
+        s[16],
+        s[17],
+        s[18],
+        s[19]
+    ) + &diff_line
+}
+
+fn pm4_census_reset() {
+    for x in PM4_STATS.iter().chain(PM4_DIFF.iter()) {
+        x.store(0, Ordering::Relaxed);
+    }
+    if let Some(m) = PM4_DIFF_OPS.lock().as_mut() {
+        m.clear();
+    }
+}
+
 /// Whether a submission returns only once its work completed (see `submit`).
 fn waits_for_completion(bufs: &[(u64, u32)]) -> bool {
     static SYNC: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -2612,6 +2811,9 @@ pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
     if tune::fe3_scan() != 0 && fe2::on() {
         fe3_probe::note_submission();
     }
+    if pm4_census_on() {
+        pm4_census(queue_id, &buffers);
+    }
     // A frame replay holds the title at the start and end of the frame it
     // records.
     replay::hold();
@@ -2809,6 +3011,8 @@ pub fn start_profiler() {
 /// Clears the samples and dispatch timings (`profile reset` control command).
 pub fn reset_profile() {
     cp::reset_classes();
+    exec::replay_census_reset();
+    pm4_census_reset();
     fe3_probe::reset();
     if let Some(m) = PROFILE.lock().as_mut() {
         m.clear();
@@ -3028,6 +3232,7 @@ pub fn status_ex(with_stacks: bool) -> String {
         )
     ));
     s.push_str(&format!("    {}\n", throttle_status()));
+    s.push_str(&pm4_census_line());
     s.push_str(&exec::status());
     s.push_str(&pagetable::status());
     s.push_str(&gpures::status());

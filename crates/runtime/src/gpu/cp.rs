@@ -2272,6 +2272,9 @@ impl Cp {
             }
             PACKETS.fetch_add(1, Ordering::Relaxed);
             self.cur_packet = cur;
+            if super::exec::replay_census_on() {
+                super::exec::CUR_PACKET.with(|c| c.set(cur));
+            }
             self.cur_opcode = opcode;
             let p = |i: u64| f.rd(cur + 4 * (1 + i));
             // A timestamp or label wait the run holds (`run_pass`); else it
@@ -5215,6 +5218,9 @@ impl Cp {
                 crate::info!("cb shape: packet {} at {cur:#x}{}", op_name(opcode), self.held_tag());
             }
             self.cur_packet = cur;
+            if super::exec::replay_census_on() {
+                super::exec::CUR_PACKET.with(|c| c.set(cur));
+            }
             self.cur_opcode = opcode;
             if self.main_gfx && !self.compute && super::hscensus::on() {
                 let q = |i: u64| f.rd(cur + 4 * (1 + i));

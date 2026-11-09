@@ -724,6 +724,11 @@ pub struct UserData {
 }
 
 impl UserData {
+    /// Its words.
+    pub fn words(&self) -> &[u32] {
+        &self.w[..self.n as usize]
+    }
+
     pub fn new(s: &[u32]) -> UserData {
         let n = s.len().min(32);
         let mut w = [0u32; 32];

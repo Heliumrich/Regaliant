@@ -9600,6 +9600,117 @@ fn gpu_pages_mapped(items: &[super::gpures::Root], user: &[u32]) -> bool {
     true
 }
 
+/// `DS_REPLAY_CENSUS=1` (diagnosis): whether a command's recording could be
+/// reused (ROUTE60.md 2026-11-09 late night: the title's command buffers
+/// change frame to frame mostly in their user data). At each stage binding,
+/// the inputs its preparation resolved from (the program, its user SGPRs,
+/// the guest ranges it read and their words) are hashed and compared with
+/// the last binding of a stage of that kind for the packet at the same
+/// address. The status report has the counts by recording thread kind;
+/// `profile reset` starts them again.
+pub fn replay_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_REPLAY_CENSUS").ok().as_deref() == Some("1"))
+}
+
+thread_local! {
+    /// The packet the command processor on this thread executes (census).
+    pub static CUR_PACKET: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// (packet, stage kind) -> (hash of its last binding's resolved descriptors,
+/// of its user data), in 16 shards by key.
+static REPLAY_SEEN: [Mutex<Option<std::collections::HashMap<(u64, u8), (u64, u64)>>>; 16] = [const { Mutex::new(None) }; 16];
+/// By thread kind (0 the graphics CP and compute CPs, 1 deferred executors:
+/// parallel workers) and stage kind: [first seen, the same resolved
+/// descriptors as the last, other descriptors, the same user data].
+static REPLAY_STATS: [[[AtomicU64; 4]; 3]; 2] = [const { [const { [const { AtomicU64::new(0) }; 4] }; 3] }; 2];
+
+fn replay_census(p: &Prepared, deferred: bool) {
+    let packet = CUR_PACKET.with(|c| c.get());
+    if packet == 0 {
+        return;
+    }
+    let kind = match p.stage {
+        rdna::translate::Stage::Vertex => 0u8,
+        rdna::translate::Stage::Fragment => 1,
+        rdna::translate::Stage::Compute => 2,
+    };
+    let fnv = |h: u64, x: u64| (h ^ x).wrapping_mul(0x100_0000_01b3);
+    let mut hu = fnv(0xcbf2_9ce4_8422_2325, p.addr);
+    for &w in p.user.words() {
+        hu = fnv(hu, w as u64);
+    }
+    // (The resolved descriptors alone: what a recording binds; the data
+    // words a preparation also reads only fill the SGPR data.)
+    let hd = {
+        use std::hash::{Hash, Hasher};
+        let mut s = std::collections::hash_map::DefaultHasher::new();
+        p.addr.hash(&mut s);
+        for r in &p.found.resources {
+            match r {
+                shaders::Resolved::Buffer(v) => (1u8, v).hash(&mut s),
+                shaders::Resolved::Global(b, _) => (2u8, b).hash(&mut s),
+                shaders::Resolved::Image(t) => (3u8, t).hash(&mut s),
+                shaders::Resolved::ImageTable(v) => (4u8, v).hash(&mut s),
+                shaders::Resolved::Sampler(w) => (5u8, w).hash(&mut s),
+            }
+        }
+        s.finish()
+    };
+    let key = (packet, kind);
+    let shard = ((packet >> 3) ^ (packet >> 13)) as usize & 15;
+    let prev = {
+        let mut g = REPLAY_SEEN[shard].lock();
+        let m = g.get_or_insert_with(std::collections::HashMap::new);
+        if m.len() > 1 << 18 {
+            m.clear();
+        }
+        m.insert(key, (hd, hu))
+    };
+    let st = &REPLAY_STATS[deferred as usize][kind as usize];
+    match prev {
+        None => {
+            st[0].fetch_add(1, Ordering::Relaxed);
+        }
+        Some((ph, pu)) => {
+            st[if ph == hd { 1 } else { 2 }].fetch_add(1, Ordering::Relaxed);
+            if pu == hu {
+                st[3].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// The census's status line ("" when off).
+pub fn replay_census_line() -> String {
+    if !replay_census_on() {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    for (t, tn) in ["command processors", "parallel workers"].iter().enumerate() {
+        for (k, kn) in ["vertex", "pixel", "compute"].iter().enumerate() {
+            let s: Vec<u64> = REPLAY_STATS[t][k].iter().map(|x| x.load(Ordering::Relaxed)).collect();
+            let n = (s[0] + s[1] + s[2]).max(1);
+            if s[0] + s[1] + s[2] == 0 {
+                continue;
+            }
+            parts.push(format!("{tn} {kn}: {} bindings, the same descriptors as the last at that packet {:.1}%, other descriptors {:.1}%, first seen {:.1}%; the same user data {:.1}%", s[0] + s[1] + s[2], 100.0 * s[1] as f64 / n as f64, 100.0 * s[2] as f64 / n as f64, 100.0 * s[0] as f64 / n as f64, 100.0 * s[3] as f64 / n as f64));
+        }
+    }
+    format!("    replay census: {}\n", parts.join("; "))
+}
+
+pub fn replay_census_reset() {
+    for t in REPLAY_STATS.iter() {
+        for k in t.iter() {
+            for x in k.iter() {
+                x.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// Bytes of a batched translation's uniform window of the ring.
 const SGPR_WINDOW_BYTES: u64 = 4 * rdna::translate::SGPR_WINDOW_DWORDS as u64;
 
@@ -14733,6 +14844,9 @@ impl Exec {
     /// Buffer, image and sampler bindings of a stage; fills the resource
     /// info blocks of its SGPR data.
     fn bind_stage(&mut self, p: &mut Prepared, allow_shadow: bool) -> Result<Bound, String> {
+        if replay_census_on() {
+            replay_census(p, self.deferred);
+        }
         // (Its placements counted by where the stage was made, for
         // `DS_FE2_CALLERS`.)
         let _source = super::fe2::StageSource::set(p.ahead);
@@ -16717,6 +16831,7 @@ pub fn status() -> String {
         + &super::homes::status()
         + &super::resident::status()
         + &super::fe2::status()
+        + &replay_census_line()
         + &import_sites_line()
         + &in_place_line()
         + &sync_why_status()
